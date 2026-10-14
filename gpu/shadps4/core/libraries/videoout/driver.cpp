@@ -447,12 +447,14 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         }
 
         // Check if it's time to take a request.
-        // sotc: SOTC_FLIP_LATE=1 counts the flip rate from the last flip instead of fixed vblank
-        // phases: at 30 fps (flip rate 1) a frame ready just after an even vblank went out two
-        // vblanks later (67 ms) instead of at the next one (50 ms).
+        // sotc: the flip rate counts from the last flip instead of fixed vblank phases: at 30 fps
+        // (flip rate 1) a frame ready just after an even vblank went out two vblanks later
+        // (67 ms) instead of at the next one (50 ms). On by default after a 16 min session on a
+        // Radeon RX 6650 XT ("muito melhor"; heavy areas hold a steady 20 fps instead of
+        // stuttering); SOTC_FLIP_LATE=0 restores the fixed phases.
         static const bool flip_late = [] {
             const char* v = std::getenv("SOTC_FLIP_LATE");
-            return v && v[0] == '1';
+            return !v || v[0] != '0';
         }();
         static u64 last_flip_count = 0;
         auto& vblank_status = main_port.vblank_status;

@@ -1,5 +1,21 @@
 # Changelog
 
+## Linux (não lançado)
+- **Port nativo para Linux** (sem Wine/Proton). **Testado numa placa AMD** (Fedora): o jogo abre e
+  renderiza a abertura. **NVIDIA e Intel ainda precisam de teste.**
+- Loader: imagem abaixo de 2 GiB também no Linux (ponteiros de 31 bits do jogo); guarda do heap
+  BPE com `int3`/passo único via `SIGTRAP`; janela de leitura das threads auxiliares com leituras
+  precisas (a proteção volta pelo estado do rastreador de páginas); SSE4a interpretado no
+  `SIGILL`; pilha alternativa de sinal de 512 KiB por thread (pilhas das fibras sem página de
+  guarda); watchdog de diagnóstico desligado por padrão (`BB_TIMEOUT`).
+- Arquivos do jogo achados sem diferenciar maiúsculas e minúsculas (o jogo pede em minúsculas, o
+  dump tem nomes mistos). DLCs lidas com `opendir`. Leituras limpas dos *walkers* no Linux.
+- Build: `build.sh` com LF (`.gitattributes`), correções de portabilidade (GCC 14), xbyak em todas
+  as plataformas, FFmpeg mínimo em `out/ffmpeg` (`packaging/linux/build_ffmpeg.sh`).
+- `sotc.py` multiplataforma e com `SOTC_DATA_DIR`; `sotc.sh`; AppImage
+  (`packaging/linux/build_appimage.sh`) que pede a pasta do jogo na primeira abertura e acha os
+  módulos de som do shadPS4. Opções: `docs/sotc/LINUX.md`.
+
 ## 0.76.1 — 2026-11-17
 - 🌌 **Linhas tracejadas no céu em placas AMD Radeon corrigidas** (#432, #433): um shader do céu trocava valores entre pixels vizinhos de um jeito que o driver da AMD não garante nas arestas dos triângulos, e desenhava uma grade de linhas sobre o céu (tela de título e jogo). Agora usa operações de quad, que todo driver garante. NVIDIA sem mudança. O cache de shaders é refeito na primeira abertura. `SOTC_QUAD_SWIZZLE=0` volta ao antigo.
 

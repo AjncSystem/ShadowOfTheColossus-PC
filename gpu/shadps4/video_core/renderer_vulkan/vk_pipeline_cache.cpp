@@ -291,8 +291,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       desc_heap{instance, scheduler.GetWorkSemaphore(), DescriptorHeapSizes} {
     const auto& vk12_props = instance.GetVk12Properties();
-    Shader::Optimization::SetWave64UniformBranchesDefault(instance.GetDriverID() ==
-                                                          vk::DriverId::eNvidiaProprietary);
+    // Wave64 uniform branches on every driver. Tested on a Radeon RX 6650 XT (32-wide path):
+    // off, the shadows next to the Wander and Agro on grass get horizontal stripes; on, the
+    // image is right and the characters are not black in the shade (save with 5 colossi).
+    Shader::Optimization::SetWave64UniformBranchesDefault(true);
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),
         .max_viewport_height = instance.GetMaxViewportHeight(),

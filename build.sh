@@ -35,6 +35,10 @@ MINGW*|MSYS*)
     exit 0
     ;;
 esac
+# Minimal FFmpeg (packaging/linux/build_ffmpeg.sh), when built: the game's video decoders only.
+if [[ -d out/ffmpeg/lib/pkgconfig ]]; then
+    export PKG_CONFIG_PATH="$PWD/out/ffmpeg/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+fi
 if [[ -z ${CC:-} ]]; then
     CC=$(command -v cc || command -v gcc || true)
     if [[ -z $CC ]]; then

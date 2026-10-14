@@ -1,6 +1,6 @@
 # Shadow of the Colossus — PC (port nativo / native port) · v0.57
 
-**[Português](#português)** · **[English](#english)** · [Releases](../../releases) · [Changelog](CHANGELOG.md)
+**[Português](#português)** · **[English](#english)** · **[Linux](#linux)** · [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
 > **Nenhum arquivo do jogo nem da Sony está incluído / No game or Sony files are included.**
 > Você precisa do seu próprio dump do jogo e, para ter som, de dois módulos do seu próprio
@@ -91,6 +91,36 @@ normalmente, a 30 FPS.
 | Modos | 60 FPS (patch de illusion), filtro anisotrópico 16x, modo PS4 Pro, saída até 4K. |
 | Desempenho | No demo da tela de título, em modo 60 FPS: média de **37–45 → ~67 FPS**, trecho mais pesado (ponte do cânion) **~17 → 29–34 FPS**. |
 
+### Linux
+
+Port nativo para Linux, sem Wine nem Proton: o mesmo jogo e o mesmo núcleo de vídeo, com o
+runtime usando sinais do Linux no lugar das exceções do Windows.
+
+| Placa | Situação |
+|---|---|
+| **AMD** | Funciona (testado no Fedora): o jogo abre e renderiza a abertura. |
+| **NVIDIA** | **Precisa de teste.** |
+| **Intel** | **Precisa de teste.** |
+
+Se você tem NVIDIA ou Intel, abra uma *issue* contando o resultado, com o modelo da placa, a
+versão do driver e o arquivo `~/.local/share/sotc-pc/last_run.log`.
+
+**Uso (AppImage):**
+
+```
+chmod +x SotC-PC-*-linux-x86_64.AppImage
+./SotC-PC-*-linux-x86_64.AppImage            # na primeira vez pede a pasta do jogo
+./SotC-PC-*-linux-x86_64.AppImage --setup    # escolhe de novo a pasta do jogo e a do som
+```
+
+- Requisitos: Linux x86-64 com glibc 2.38 ou mais nova (Fedora 39+, Ubuntu 24.04+), `python3` e
+  um driver Vulkan 1.3 (Mesa ou NVIDIA). Funciona em Wayland e X11.
+- Os módulos de som são achados sozinhos na pasta do shadPS4 (`~/.local/share/shadPS4/sys_modules`).
+- Configurações, saves e o registro ficam em `~/.local/share/sotc-pc/`. As opções do `sotc.ini`
+  (resolução, FSR, tela cheia, idioma, 60 FPS, controles) estão em
+  [docs/sotc/LINUX.md](docs/sotc/LINUX.md).
+- Como compilar e gerar a AppImage: [Compilar / Building](#compilar--building).
+
 ### Perguntas comuns
 
 - **DirectX 11/12?** Não. O núcleo de vídeo traduz a GPU do PS4 para Vulkan (shaders em SPIR-V).
@@ -153,6 +183,36 @@ driver). No Python install needed.
 
 The patch modes (60 FPS, 16x filtering) only apply to EU 1.01; other versions run at 30 FPS.
 
+### Linux
+
+A native Linux port, no Wine or Proton: the same game and video core, with the runtime using
+Linux signals in place of Windows exceptions.
+
+| GPU | Status |
+|---|---|
+| **AMD** | Works (tested on Fedora): the game starts and renders the intro. |
+| **NVIDIA** | **Needs testing.** |
+| **Intel** | **Needs testing.** |
+
+On NVIDIA or Intel, please open an issue with the result, your GPU model, driver version and
+`~/.local/share/sotc-pc/last_run.log`.
+
+**Usage (AppImage):**
+
+```
+chmod +x SotC-PC-*-linux-x86_64.AppImage
+./SotC-PC-*-linux-x86_64.AppImage            # asks for the game folder the first time
+./SotC-PC-*-linux-x86_64.AppImage --setup    # picks the game and sound folders again
+```
+
+- Requirements: x86-64 Linux with glibc 2.38 or newer (Fedora 39+, Ubuntu 24.04+), `python3`
+  and a Vulkan 1.3 driver (Mesa or NVIDIA). Works on Wayland and X11.
+- The sound modules are found automatically in shadPS4's folder (`~/.local/share/shadPS4/sys_modules`).
+- Settings, saves and the log live in `~/.local/share/sotc-pc/`. The `sotc.ini` options
+  (resolution, FSR, fullscreen, language, 60 FPS, controls) are listed in
+  [docs/sotc/LINUX.md](docs/sotc/LINUX.md).
+- Building and making the AppImage: [Compilar / Building](#compilar--building).
+
 ### Launcher features
 
 Game library and automatic search, shadPS4 save import, 720p–4K output (the game renders at
@@ -172,6 +232,8 @@ with `user/last_run.log`.
 
 ## Compilar / Building
 
+### Windows
+
 Windows com / with [MSYS2](https://www.msys2.org/) (CLANG64). Pacotes / packages:
 [packaging/windows/README.md](packaging/windows/README.md). Para congelar o `SotC.exe` / to
 freeze `SotC.exe`: um Python do Windows com PyInstaller e Pillow / a Windows Python with
@@ -181,6 +243,52 @@ PyInstaller and Pillow (`WINPYTHON`).
 bash build.sh                              # out/bb-probe.exe
 bash packaging/windows/package_sotc.sh     # dist/SotC-PC.zip
 ```
+
+### Linux
+
+Precisa de / needs GCC 14+ (C++23), CMake, Ninja, Python 3, glslang, SDL3 e / and Vulkan
+headers 1.4+. O FFmpeg das distribuições não serve / distribution FFmpeg won't do: o do Fedora
+vem sem H.264/HEVC (os vídeos do jogo / the game's videos), e o do Ubuntu arrasta ~100
+bibliotecas para a AppImage / drags ~100 libraries into the AppImage. O
+`packaging/linux/build_ffmpeg.sh` compila um FFmpeg mínimo / builds a minimal one into
+`out/ffmpeg`, que o / which `build.sh` usa sozinho / picks up by itself.
+
+**Fedora (43+):**
+
+```
+sudo dnf install gcc gcc-c++ make cmake ninja-build pkgconf-pkg-config python3 git nasm patchelf \
+    vulkan-headers vulkan-loader-devel glslang VulkanMemoryAllocator-devel SDL3-devel \
+    fmt-devel boost-devel robin-map-devel xxhash-devel zydis-devel libX11-devel
+git submodule update --init --recursive
+bash packaging/linux/build_ffmpeg.sh        # out/ffmpeg (uma vez / once)
+./build.sh                                  # out/bb-probe, out/gpu/libbbgpu.so
+./sotc.sh                                   # roda / runs (sotc.ini: SOTC_GAME_DIR, SOTC_SYS_MODULES)
+bash packaging/linux/build_appimage.sh      # dist/SotC-PC-<versão>-linux-x86_64.AppImage
+```
+
+**Ubuntu 24.04:** o GCC 13, o SDL e os headers do Vulkan do sistema são antigos / the system
+GCC 13, SDL and Vulkan headers are too old:
+
+```
+sudo apt install build-essential gcc-14 g++-14 cmake ninja-build pkg-config python3 git nasm \
+    patchelf libvulkan-dev glslang-tools libvulkan-memory-allocator-dev libfmt-dev libboost-dev \
+    libxxhash-dev libzydis-dev libx11-dev libxext-dev libwayland-dev libxkbcommon-dev \
+    libpulse-dev libasound2-dev
+# SDL3, Vulkan-Headers e / and robin-map da fonte / from source (cmake + install):
+#   https://github.com/libsdl-org/SDL (release-3.2.x), https://github.com/KhronosGroup/Vulkan-Headers,
+#   https://github.com/Tessil/robin-map
+bash packaging/linux/build_ffmpeg.sh
+CC=gcc-14 CXX=g++-14 CPATH=/usr/local/include ./build.sh
+bash packaging/linux/build_appimage.sh
+```
+
+**NixOS:** `./build.sh` entra sozinho no / enters `shell.nix` by itself (FFmpeg do Nix / Nix's FFmpeg).
+
+Testes / tests: `./build.sh --test`. A AppImage leva o loader, a biblioteca de GPU, os scripts e
+as bibliotecas que eles usam, menos o sistema base (glibc, libstdc++, loader do Vulkan) / The
+AppImage carries the loader, GPU library, scripts and their libraries except the base system
+(glibc, libstdc++, Vulkan loader). Precisa de / needs `patchelf`; o `appimagetool` é baixado em /
+is downloaded into `out/tools` (ou / or `APPIMAGETOOL=<caminho / path>`).
 
 O empacotamento recusa qualquer `.sprx`/`.prx` / packaging refuses any `.sprx`/`.prx`: Sony
 firmware never goes into the package. Ferramentas de teste / test tools: `tools/`. Variáveis de

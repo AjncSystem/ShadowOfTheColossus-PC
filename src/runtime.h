@@ -79,6 +79,8 @@ void runtime_audio_report(void);
 uintptr_t runtime_pad_resolve(const char *name);
 uintptr_t runtime_sotc_resolve(const char *name);
 int runtime_thread_is_guest(void);
+/* Alternate signal stack for the calling thread (Linux; no-op on Windows). */
+void runtime_thread_signal_stack(void);
 uintptr_t runtime_fiber_resolve(const char *name);
 void runtime_fiber_report(void);
 void runtime_pad_report(void);

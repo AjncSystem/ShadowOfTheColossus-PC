@@ -1,11 +1,18 @@
 /* Offline AppContent provider for the configured base-game profile.
  * No package/DLC mounting, downloads, entitlement or license emulation. */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "runtime.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <dirent.h>
+#include <strings.h>
+#include <sys/stat.h>
 #endif
 #define INVALID_ID ((int32_t)0x805a1000)
 #define NOT_LOADED ((int32_t)0x805a1001)
@@ -109,7 +116,62 @@ static void scan_addons(void) {
     if (addons_scanned) return;
     addons_scanned=1;
 #ifndef _WIN32
-    return;
+    /* Same rules as the Windows scan below: <root>/CUSA08809 or <root>, one folder per add-on
+     * (sce_sys/param.sfo) or an add-on .pkg. */
+    const char *root=getenv("SOTC_DLC_DIR");
+    if (!root || !*root) return;
+    static char base[1024], path[1400];
+    struct stat st;
+    snprintf(base,sizeof base,"%s/CUSA08809",root);
+    if (stat(base,&st) || !S_ISDIR(st.st_mode)) snprintf(base,sizeof base,"%s",root);
+    DIR *dir=opendir(base);
+    if (!dir) { printf("Runtime: DLC folder %s not found\n",base); return; }
+    struct dirent *entry;
+    while ((entry=readdir(dir))) {
+        if (entry->d_name[0]=='.') continue;
+        snprintf(path,sizeof path,"%s/%s",base,entry->d_name);
+        if (stat(path,&st)) continue;
+        const size_t name_len=strlen(entry->d_name);
+        if (S_ISREG(st.st_mode) && name_len>4 && !strcasecmp(entry->d_name+name_len-4,".pkg")) {
+            FILE *pkg=fopen(path,"rb");
+            static unsigned char header[0x80];
+            const size_t got=pkg ? fread(header,1,sizeof header,pkg) : 0;
+            if (pkg) fclose(pkg);
+            static char content[37];
+            memcpy(content,header+0x40,36); content[36]=0;
+            const uint32_t type=(uint32_t)header[0x74]<<24|header[0x75]<<16|header[0x76]<<8|header[0x77];
+            if (got<sizeof header || memcmp(header,"\x7f" "CNT",4) || type!=0x1b ||
+                !strstr(content,"CUSA08809") || strlen(content)<=20 || addon_count==MAX_ADDONS ||
+                addon_known(content)) continue;
+            AddonInfo *info=&addons[addon_count++];
+            memset(info,0,sizeof *info);
+            snprintf(info->label,sizeof info->label,"%s",content+20);
+            info->status=4;
+            printf("Runtime: DLC %s: entitlement %s\n",entry->d_name,info->label);
+            continue;
+        }
+        if (!S_ISDIR(st.st_mode)) continue;
+        snprintf(path,sizeof path,"%s/%s/sce_sys/param.sfo",base,entry->d_name);
+        FILE *f=fopen(path,"rb");
+        if (!f) continue;
+        static unsigned char data[65536]; /* not on the guest thread's small stack */
+        const size_t size=fread(data,1,sizeof data,f);
+        fclose(f);
+        const char *category=sfo_string(data,size,"CATEGORY");
+        const char *content=sfo_string(data,size,"CONTENT_ID");
+        if (!category || strncmp(category,"ac",2) || !content || strlen(content)<=20) {
+            printf("Runtime: DLC %s skipped (not add-on content)\n",entry->d_name);
+            continue;
+        }
+        if (addon_count==MAX_ADDONS) break;
+        if (addon_known(content)) continue;
+        AddonInfo *info=&addons[addon_count++];
+        memset(info,0,sizeof *info);
+        snprintf(info->label,sizeof info->label,"%s",content+20);
+        info->status=4; /* installed */
+        printf("Runtime: DLC %s: entitlement %s\n",entry->d_name,info->label);
+    }
+    closedir(dir);
 #else
     const char *root=getenv("SOTC_DLC_DIR");
     if (!root || !*root) return;

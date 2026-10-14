@@ -20,6 +20,7 @@
 #else
 #include <sys/syscall.h>
 #include <sys/mman.h>
+#include <signal.h>
 #include <asm/prctl.h>
 #endif
 #define ERR(n) ((int32_t)(UINT32_C(0x80020000)|(n)))
@@ -91,7 +92,22 @@ static void set_gs(void *base) {
 #define tls_block_alloc(size) aligned_alloc(64,size)
 #endif
 /* Build TCB/static TLS for the calling host thread and point GS at it. */
+/* sotc (Linux): signal handlers (GPU page tracking faults, int3/single-step traps) need far
+ * more stack than the game's fiber stacks have, and those are packed back to back without
+ * guard pages: every thread that runs guest code gets a 512 KiB alternate signal stack. */
+void runtime_thread_signal_stack(void) {
+#ifndef _WIN32
+    static __thread void *alt;
+    if (alt) return;
+    const size_t size=512*1024;
+    alt=mmap(NULL,size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    if (alt==MAP_FAILED) { alt=NULL; return; }
+    stack_t ss={.ss_sp=alt,.ss_size=size,.ss_flags=0};
+    if (sigaltstack(&ss,NULL)) { munmap(alt,size); alt=NULL; }
+#endif
+}
 static void attach(GuestThread *t) {
+    runtime_thread_signal_stack();
     uint64_t offset=tls_offset();
     size_t total=offset+256;
     unsigned char *block=tls_block_alloc((total+63)&~(size_t)63);

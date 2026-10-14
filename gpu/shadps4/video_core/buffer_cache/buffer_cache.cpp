@@ -160,7 +160,10 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         const VAddr window_end = std::min<VAddr>(
             std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
         Core::MemoryManager::NoteHostWrite(device_addr, size, 6, window_start);
+        fault_addr = device_addr;
+        fault_size = size;
         DownloadMemory(arena, window_start, window_end - window_start);
+        fault_size = 0;
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
@@ -169,9 +172,12 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         flush_request();
         return;
     }
+    // sotc: on by default (SOTC_RB_ASYNC=0 turns it off). Radeon RX 6650 XT, sanctuary, three
+    // runs each: 25.3-25.8 fps instead of 23.2-23.7, frames over 40 ms 376-424 instead of
+    // 566-594, readback waits 100 ms/s instead of 290 ms/s.
     static const bool async = [] {
         const char* v = std::getenv("SOTC_RB_ASYNC");
-        return v && v[0] == '1';
+        return !v || v[0] != '0';
     }();
     if (!async) {
         liverpool->SendCommand<true>(std::move(flush_request));
@@ -378,6 +384,12 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         SotcStats::readback_ahead.fetch_add(1, std::memory_order_relaxed);
     } else {
         SotcStats::readback_finish.fetch_add(1, std::memory_order_relaxed);
+        // Did the guest ask for bytes the command buffer being built writes, or only a neighbour
+        // in the window (or a hot region) did?
+        if (fault_size != 0 && written_by_current &&
+            current_writes.Intersects(fault_addr, fault_size)) {
+            SotcStats::readback_finish_asked.fetch_add(1, std::memory_order_relaxed);
+        }
         for (const auto& item : pending) {
             runtime.CopyBuffer(item.arena, download.buffer, item.copies);
         }

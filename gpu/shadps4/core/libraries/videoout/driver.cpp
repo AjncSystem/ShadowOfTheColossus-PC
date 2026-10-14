@@ -447,9 +447,23 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         }
 
         // Check if it's time to take a request.
+        // sotc: SOTC_FLIP_LATE=1 counts the flip rate from the last flip instead of fixed vblank
+        // phases: at 30 fps (flip rate 1) a frame ready just after an even vblank went out two
+        // vblanks later (67 ms) instead of at the next one (50 ms).
+        static const bool flip_late = [] {
+            const char* v = std::getenv("SOTC_FLIP_LATE");
+            return v && v[0] == '1';
+        }();
+        static u64 last_flip_count = 0;
         auto& vblank_status = main_port.vblank_status;
-        if (vblank_status.count % (main_port.flip_rate + 1) == 0) {
+        const bool flip_due =
+            flip_late ? vblank_status.count - last_flip_count >= u64(main_port.flip_rate) + 1
+                      : vblank_status.count % (main_port.flip_rate + 1) == 0;
+        if (flip_due) {
             const auto request = receive_request();
+            if (request) {
+                last_flip_count = vblank_status.count;
+            }
             if (!request) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
                     if (!main_port.is_open) {

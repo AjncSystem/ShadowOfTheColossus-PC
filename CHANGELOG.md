@@ -1,5 +1,21 @@
 # Changelog
 
+## Linux (não lançado)
+- **Port nativo para Linux** (sem Wine/Proton). **Testado numa placa AMD** (Fedora): o jogo abre e
+  renderiza a abertura. **NVIDIA e Intel ainda precisam de teste.**
+- Loader: imagem abaixo de 2 GiB também no Linux (ponteiros de 31 bits do jogo); guarda do heap
+  BPE com `int3`/passo único via `SIGTRAP`; janela de leitura das threads auxiliares com leituras
+  precisas (a proteção volta pelo estado do rastreador de páginas); SSE4a interpretado no
+  `SIGILL`; pilha alternativa de sinal de 512 KiB por thread (pilhas das fibras sem página de
+  guarda); watchdog de diagnóstico desligado por padrão (`BB_TIMEOUT`).
+- Arquivos do jogo achados sem diferenciar maiúsculas e minúsculas (o jogo pede em minúsculas, o
+  dump tem nomes mistos). DLCs lidas com `opendir`. Leituras limpas dos *walkers* no Linux.
+- Build: `build.sh` com LF (`.gitattributes`), correções de portabilidade (GCC 14), xbyak em todas
+  as plataformas, FFmpeg mínimo em `out/ffmpeg` (`packaging/linux/build_ffmpeg.sh`).
+- `sotc.py` multiplataforma e com `SOTC_DATA_DIR`; `sotc.sh`; AppImage
+  (`packaging/linux/build_appimage.sh`) que pede a pasta do jogo na primeira abertura e acha os
+  módulos de som do shadPS4. Opções: `docs/sotc/LINUX.md`.
+
 ## 0.75 — 2026-11-12
 - 🔊 **Som sem os módulos do console: os arquivos do PS4 deixam de ser obrigatórios** (Oussama268, a partir do HayatoG/tlg_pc, GPL-2.0): quando faltam o `libSceNgs2.sprx` e o `libSceUlt.sprx`, um mixer NGS2 embutido toca o som do jogo (ATRAC9 pela LibAtrac9). **Ele é o padrão para todos**; quem preferir o som do firmware marca "Usar os módulos de som do meu console" em Jogo e saves. No teste, som normal e o mesmo FPS nos dois casos (69,7 com o mixer, 69,5 com os módulos). `SOTC_NGS2=native` volta ao comportamento antigo.
 - 🎧 **Aba Som no lançador:** saída em **Estéreo 2.0**, **Surround 5.1**, **Surround 7.1** ou Automático (o jogo mistura em 7.1; no 2.0 e no 5.1 o próprio port faz a mistura, coeficientes ITU, sem estourar), graves do subwoofer no estéreo, escolha do **dispositivo de som** (fone, TV, caixas) sem mudar o padrão do Windows, **volume até 500%** (também no menu do jogo, F10; picos suavizados) e o motor de som. `SOTC_AUDIO_CHANNELS`, `SOTC_AUDIO_LFE`, `SOTC_AUDIO_DEVICE`.

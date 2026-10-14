@@ -850,61 +850,28 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         return;
     }
 
-    vk::MemoryAllocateInfo alloc_info = {
-        .allocationSize = resident_blocks << block_shift,
-        .memoryTypeIndex = arena_memory_type_index,
-    };
-    auto [alloc_result, device_memory] = instance.GetDevice().allocateMemory(alloc_info);
-    if (alloc_result == vk::Result::eErrorOutOfDeviceMemory && arena_fallback_memory_type_index) {
-        // Resident arena ranges are never released, so a long session can exhaust video memory.
-        // Keep running from system memory (slower GPU access) instead of aborting.
-        static bool warned = false;
-        if (!std::exchange(warned, true)) {
-            LOG_WARNING(Render, "Video memory exhausted, placing new buffer memory in system RAM");
-        }
-        alloc_info.memoryTypeIndex = *arena_fallback_memory_type_index;
-        const auto retry = instance.GetDevice().allocateMemory(alloc_info);
-        alloc_result = retry.result;
-        device_memory = retry.value;
+    // Memory first: running out of it may submit work (see AllocateArenaBlocks), which must not
+    // happen with half of the binds queued.
+    boost::container::small_vector<std::pair<vk::DeviceMemory, u64>, 8> placements;
+    for (const auto& range : bind_ranges) {
+        placements.push_back(AllocateArenaBlocks(range.end - range.start));
     }
-    if (alloc_result == vk::Result::eErrorOutOfDeviceMemory) {
-        // Video memory is full (sparse arenas cannot use system memory). Drop old cached images,
-        // wait for the GPU so their memory is really released, and try once more.
-        LOG_WARNING(Render,
-                    "Video memory exhausted, collecting cached images (asked {} KB; in use {} MB "
-                    "of {} MB; arenas {} allocations, {} MB)",
-                    alloc_info.allocationSize >> 10, instance.GetDeviceMemoryUsage() >> 20,
-                    SotcStats::vram_budget.load() >> 20, SotcStats::arena_allocs.load(),
-                    SotcStats::arena_bytes.load() >> 20);
-        texture_cache.EmergencyCollect();
-        scheduler.Finish();
-        scheduler.PopPendingOperations();
-        alloc_info.memoryTypeIndex = arena_memory_type_index;
-        const auto retry = instance.GetDevice().allocateMemory(alloc_info);
-        alloc_result = retry.result;
-        device_memory = retry.value;
-    }
-    ASSERT_MSG(alloc_result == vk::Result::eSuccess, "Failed to allocate buffer arena memory: {}",
-               vk::to_string(alloc_result));
-    SotcStats::arena_allocs.fetch_add(1, std::memory_order_relaxed);
-    SotcStats::arena_bytes.fetch_add(alloc_info.allocationSize, std::memory_order_relaxed);
 
     boost::container::small_vector<vk::BufferCopy, 8> copies;
     const auto staging =
         staging_pool.Request(resident_blocks * sizeof(vk::DeviceAddress), MemoryType::HostUncached);
 
-    backing_blocks[static_cast<VkDeviceMemory>(device_memory)] += resident_blocks;
-
-    u64 memory_offset{};
     ArenaBinds* binds = BindsForArena(arena);
     auto* bda_addrs = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
     u64 offset = staging.offset;
+    size_t placement_index = 0;
     for (const auto& range : bind_ranges) {
+        const auto [device_memory, memory_block] = placements[placement_index++];
         Backing backing;
         backing.start = range.start;
         backing.end = range.end;
         backing.memory = device_memory;
-        backing.offset = memory_offset >> block_shift;
+        backing.offset = memory_block;
         resident_ranges.Add(backing);
 
         LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
@@ -913,9 +880,8 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
             .resourceOffset = (range.start << block_shift) - arena->cpu_addr,
             .size = (range.end - range.start) << block_shift,
             .memory = device_memory,
-            .memoryOffset = memory_offset,
+            .memoryOffset = memory_block << block_shift,
         });
-        memory_offset += bind.size;
 
         for (u32 block = 0; block < bind.size; block += block_size) {
             *(bda_addrs++) = arena->BufferDeviceAddress() + bind.resourceOffset + block;
@@ -1010,6 +976,124 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
     return true;
 }
 
+std::pair<vk::DeviceMemory, u64> BufferCache::AllocateArenaBlocks(u64 blocks) {
+    // Room in a chunk of video memory, then in a chunk of system memory.
+    const auto take = [&](u32 memory_type) -> std::optional<std::pair<vk::DeviceMemory, u64>> {
+        for (auto& chunk : arena_chunks) {
+            if (chunk->memory_type != memory_type) {
+                continue;
+            }
+            for (auto it = chunk->free_runs.begin(); it != chunk->free_runs.end(); ++it) {
+                if (it->second < blocks) {
+                    continue;
+                }
+                const auto [start, length] = *it;
+                chunk->free_runs.erase(it);
+                if (length > blocks) {
+                    chunk->free_runs.emplace(start + blocks, length - blocks);
+                }
+                chunk->used_blocks += blocks;
+                return std::make_pair(chunk->memory, start);
+            }
+        }
+        return std::nullopt;
+    };
+    const auto grow = [&](u32 memory_type) -> std::optional<std::pair<vk::DeviceMemory, u64>> {
+        const u64 chunk_blocks = std::max<u64>(ARENA_CHUNK_SIZE >> block_shift, blocks);
+        const vk::MemoryAllocateInfo alloc_info = {
+            .allocationSize = chunk_blocks << block_shift,
+            .memoryTypeIndex = memory_type,
+        };
+        const auto [result, memory] = instance.GetDevice().allocateMemory(alloc_info);
+        if (result != vk::Result::eSuccess) {
+            return std::nullopt;
+        }
+        SotcStats::arena_allocs.fetch_add(1, std::memory_order_relaxed);
+        SotcStats::arena_bytes.fetch_add(alloc_info.allocationSize, std::memory_order_relaxed);
+        auto& chunk = arena_chunks.emplace_back(std::make_unique<ArenaChunk>());
+        chunk->memory = memory;
+        chunk->memory_type = memory_type;
+        chunk->free_runs.emplace(0, chunk_blocks);
+        chunk_by_memory.emplace(static_cast<VkDeviceMemory>(memory), chunk.get());
+        return take(memory_type);
+    };
+    if (auto placed = take(arena_memory_type_index)) {
+        return *placed;
+    }
+    if (auto placed = grow(arena_memory_type_index)) {
+        return *placed;
+    }
+    if (arena_fallback_memory_type_index) {
+        // Keep running from system memory (slower GPU access) instead of aborting.
+        static bool warned = false;
+        if (!std::exchange(warned, true)) {
+            LOG_WARNING(Render, "Video memory exhausted, placing new buffer memory in system RAM");
+        }
+        if (auto placed = take(*arena_fallback_memory_type_index)) {
+            return *placed;
+        }
+        if (auto placed = grow(*arena_fallback_memory_type_index)) {
+            return *placed;
+        }
+    }
+    // Drop old cached images, wait for the GPU so their memory is really released, try again.
+    LOG_WARNING(Render,
+                "Video memory exhausted, collecting cached images (asked {} KB; in use {} MB of {} "
+                "MB; arenas {} chunks, {} MB)",
+                (blocks << block_shift) >> 10, instance.GetDeviceMemoryUsage() >> 20,
+                SotcStats::vram_budget.load() >> 20, SotcStats::arena_allocs.load(),
+                SotcStats::arena_bytes.load() >> 20);
+    texture_cache.EmergencyCollect();
+    scheduler.Finish();
+    scheduler.PopPendingOperations();
+    auto placed = grow(arena_memory_type_index);
+    ASSERT_MSG(placed.has_value(), "Failed to allocate buffer arena memory");
+    return *placed;
+}
+
+void BufferCache::FreeArenaBlocks(vk::DeviceMemory memory, u64 start, u64 blocks) {
+    const auto found = chunk_by_memory.find(static_cast<VkDeviceMemory>(memory));
+    if (found == chunk_by_memory.end()) {
+        return;
+    }
+    ArenaChunk& chunk = *found->second;
+    chunk.used_blocks -= std::min(chunk.used_blocks, blocks);
+    // Give the run back, merged with free neighbours.
+    auto next = chunk.free_runs.lower_bound(start);
+    if (next != chunk.free_runs.end() && next->first == start + blocks) {
+        blocks += next->second;
+        next = chunk.free_runs.erase(next);
+    }
+    if (next != chunk.free_runs.begin()) {
+        const auto prev = std::prev(next);
+        if (prev->first + prev->second == start) {
+            start = prev->first;
+            blocks += prev->second;
+            chunk.free_runs.erase(prev);
+        }
+    }
+    chunk.free_runs.emplace(start, blocks);
+    if (chunk.used_blocks != 0) {
+        return;
+    }
+    // Empty: give the memory back. The unbind is submitted before this tick's work, which
+    // waits for it.
+    SotcStats::arena_allocs.fetch_sub(1, std::memory_order_relaxed);
+    chunk_by_memory.erase(found);
+    std::erase_if(arena_chunks, [&](const auto& c) {
+        if (c->memory != memory) {
+            return false;
+        }
+        u64 size = 0;
+        for (const auto& [run_start, run_blocks] : c->free_runs) {
+            size += run_blocks;
+        }
+        SotcStats::arena_bytes.fetch_sub(size << block_shift, std::memory_order_relaxed);
+        return true;
+    });
+    scheduler.DeferOperation([device = instance.GetDevice(), memory] { device.freeMemory(memory); });
+}
+
 void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
     // Only whole blocks inside the unmapped range can go; partial blocks may back neighbours.
     const u64 first_block = Common::AlignUp(device_addr, u64{block_size}) >> block_shift;
@@ -1051,18 +1135,7 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
         // back in (fault buffer) instead of touching unbound memory.
         runtime.FillBuffer(bda_pagetable_buffer.get(), range.start * sizeof(vk::DeviceAddress),
                            (range.end - range.start) * sizeof(vk::DeviceAddress), 0u);
-        const auto memory = static_cast<VkDeviceMemory>(range.memory);
-        auto it = backing_blocks.find(memory);
-        if (it != backing_blocks.end()) {
-            it->second -= std::min(it->second, range.end - range.start);
-            if (it->second == 0) {
-                backing_blocks.erase(it);
-                // The unbind is submitted before this tick's work, which waits for it.
-                scheduler.DeferOperation([device = instance.GetDevice(), memory = range.memory] {
-                    device.freeMemory(memory);
-                });
-            }
-        }
+        FreeArenaBlocks(range.memory, range.offset, range.end - range.start);
     }
     std::erase_if(hot_readbacks, [&](const HotReadback& hot) {
         return hot.addr < (end_block << block_shift) &&

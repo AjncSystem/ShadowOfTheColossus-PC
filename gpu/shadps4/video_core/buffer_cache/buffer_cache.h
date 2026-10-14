@@ -5,6 +5,8 @@
 
 #include <chrono>
 #include <deque>
+#include <map>
+#include <memory>
 #include <span>
 #include <vector>
 #include <unordered_map>
@@ -285,8 +287,21 @@ public:
 
 private:
 
-    /// Number of resident blocks still bound to each backing allocation.
-    std::unordered_map<VkDeviceMemory, u64> backing_blocks;
+    /// sotc: arena memory is carved out of chunks of ARENA_CHUNK_SIZE. One allocation per
+    /// resident range reached thousands in the open world: the Windows drivers allow 4096 (a
+    /// Radeon then reports out of device memory) and each one is a kernel call mid-frame.
+    static constexpr u64 ARENA_CHUNK_SIZE = 64_MB;
+    struct ArenaChunk {
+        vk::DeviceMemory memory;
+        u32 memory_type{};
+        u64 used_blocks{};
+        std::map<u64, u64> free_runs; ///< first block -> number of free blocks
+    };
+    std::vector<std::unique_ptr<ArenaChunk>> arena_chunks;
+    std::unordered_map<VkDeviceMemory, ArenaChunk*> chunk_by_memory;
+    /// Memory and first block for blocks of arena backing (video memory, else system memory).
+    std::pair<vk::DeviceMemory, u64> AllocateArenaBlocks(u64 blocks);
+    void FreeArenaBlocks(vk::DeviceMemory memory, u64 start, u64 blocks);
 
     u32 arena_memory_type_index{};
     std::optional<u32> arena_fallback_memory_type_index;

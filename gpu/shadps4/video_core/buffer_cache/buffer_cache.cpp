@@ -9,6 +9,7 @@
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
+#include "common/scope_exit.h"
 #include "core/debug_state.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -806,18 +807,51 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
     const auto* last_arena = address_space[last_page];
     if (first_arena == last_arena) {
         if (!first_arena) {
-            const u64 base_block = Common::AlignDownPow2<u64>(first_block, blocks_per_arena_page);
-            const u64 num_pages = last_page - first_page + 1;
+            // sotc: an arena covers a group of SOTC_ARENA_GROUP pages (default 4, 16 GB) when
+            // they are all free. With one page per arena, a buffer across two pages migrated
+            // both arenas into a new one and rebound all their memory: a stall of 0.8-0.9 s,
+            // about once a session. SotC's GPU memory lies in 0x10'0000'0000-0x13'ffff'ffff.
+            static const u64 group = [] {
+                const char* v = std::getenv("SOTC_ARENA_GROUP");
+                const u64 n = v ? std::strtoull(v, nullptr, 10) : 4;
+                return n != 0 && std::has_single_bit(n) ? n : u64{1};
+            }();
+            u64 group_first = first_page & ~(group - 1);
+            u64 group_last = group_first + group - 1;
+            for (u64 page = group_first; page <= group_last; ++page) {
+                if (page >= NUM_ARENA_PAGES || address_space[page]) {
+                    group_first = first_page;
+                    group_last = last_page;
+                    break;
+                }
+            }
+            if (last_page > group_last) {
+                group_first = first_page;
+                group_last = last_page;
+            }
+            const u64 num_pages = group_last - group_first + 1;
             const auto* new_arena =
-                &arenas.emplace_back(instance, base_block << block_shift,
+                &arenas.emplace_back(instance, group_first << ARENA_PAGE_BITS,
                                      num_pages << ARENA_PAGE_BITS, MemoryType::Sparse);
-            address_space[first_page] = new_arena;
-            address_space[last_page] = new_arena;
+            for (u64 page = group_first; page <= group_last; ++page) {
+                address_space[page] = new_arena;
+            }
+            std::fprintf(stderr, "SOTC arena at %#llx, %llu GB\n",
+                         static_cast<unsigned long long>(group_first << ARENA_PAGE_BITS),
+                         static_cast<unsigned long long>(num_pages << (ARENA_PAGE_BITS - 30)));
         }
         return address_space[first_page];
     }
 
-    LOG_WARNING(Render, "Migrating arena");
+    const auto migrate_start = std::chrono::steady_clock::now();
+    SCOPE_EXIT {
+        LOG_WARNING(Render, "Migrating arena: {} + {} MB of address space, {} ms",
+                    (first_arena ? first_arena->size_bytes : ARENA_PAGE_SIZE) >> 20,
+                    (last_arena ? last_arena->size_bytes : ARENA_PAGE_SIZE) >> 20,
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - migrate_start)
+                        .count());
+    };
 
     const u64 first_addr = first_arena ? first_arena->cpu_addr : (first_page << ARENA_PAGE_BITS);
     const u64 first_size = first_arena ? first_arena->size_bytes : ARENA_PAGE_SIZE;
@@ -1193,8 +1227,21 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
     info.AddWait(signal_sema, signal_tick);
     // Queue access is serialized by submit_mutex, which the scheduler no longer holds here.
     std::scoped_lock lk{Vulkan::Scheduler::submit_mutex};
+    const auto bind_start = std::chrono::steady_clock::now();
     auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    // sotc: a bind of many ranges (an arena migration rebinds all of them) can take long.
+    if (const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - bind_start)
+                            .count();
+        ms >= 20) {
+        size_t num_binds = 0;
+        for (const auto& binds : pending_binds) {
+            num_binds += binds.binds.size();
+        }
+        LOG_WARNING(Render, "Sparse bind of {} ranges in {} arenas took {} ms", num_binds,
+                    pending_binds.size(), ms);
+    }
 
     pending_binds.clear();
 }

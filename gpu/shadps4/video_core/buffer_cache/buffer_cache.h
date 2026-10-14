@@ -291,8 +291,8 @@ public:
 private:
 
     /// sotc: arena memory is carved out of chunks of ARENA_CHUNK_SIZE. One allocation per
-    /// resident range reached thousands in the open world: the Windows drivers allow 4096 (a
-    /// Radeon then reports out of device memory) and each one is a kernel call mid-frame.
+    /// resident range reached thousands within minutes, each one a kernel call mid-frame (the
+    /// open world then ran out of video memory).
     static constexpr u64 ARENA_CHUNK_SIZE = 64_MB;
     struct ArenaChunk {
         vk::DeviceMemory memory;

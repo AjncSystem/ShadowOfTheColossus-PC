@@ -830,7 +830,7 @@ void Rasterizer::FlushPeriodic() {
     // submit is on and SOTC_FLUSH_EVERY is not set): the GPU gets work at a steady pace whether
     // a scene has few heavy commands or thousands of light ones. Attract demo: +10-15% in most
     // scenes, canyon bridge +2% (count based: 64 helped the first and hurt the second).
-    static const u64 flush_us = [] {
+    static const u64 flush_us = []() -> u64 {
         if (const char* v = std::getenv("SOTC_FLUSH_US")) {
             return std::strtoull(v, nullptr, 10);
         }

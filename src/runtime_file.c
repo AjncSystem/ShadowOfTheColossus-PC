@@ -82,7 +82,7 @@ static char update_root[512];
 const char *runtime_file_update_dir(void) { return update_root; }
 const char *runtime_file_user_dir(void) { return user_root; }
 void runtime_file_configure(const char *app0,const char *user) {
-    char path[600];
+    char path[512];
     snprintf(user_root,sizeof(user_root),"%s",user);
     runtime_file_mount("/app0",app0);
     runtime_file_mount("/hostapp",app0);
@@ -106,6 +106,67 @@ void runtime_file_configure(const char *app0,const char *user) {
         runtime_file_mount(guest,path);
     }
 }
+#ifndef _WIN32
+/* The PS4 file system, like Windows, ignores letter case, and Shadow of the Colossus asks for
+ * its files in lower case while the dump keeps mixed-case names (CoreData/EngineSupport/...).
+ * A path that does not exist as written is resolved component by component below root,
+ * matching each name without regard to case (the result keeps the same length). A small cache
+ * of resolved directories keeps the repeated lookups of the resource loader cheap. */
+#include <strings.h>
+#define FOLD_CACHE 512
+static struct { char asked[256], found[256]; } fold_cache[FOLD_CACHE];
+static unsigned fold_next;
+static pthread_mutex_t fold_lock=PTHREAD_MUTEX_INITIALIZER;
+static int fold_case(char *path, size_t root) {
+    struct stat st;
+    if (!stat(path,&st)) return 0;
+    size_t length=strlen(path);
+    if (root>=length) return ENOENT;
+    /* Longest cached directory prefix. */
+    pthread_mutex_lock(&fold_lock);
+    size_t done=root;
+    for (unsigned i=0;i<FOLD_CACHE;++i) {
+        const size_t n=strlen(fold_cache[i].asked);
+        if (n>done && n<length && path[n]=='/' && !strncasecmp(path,fold_cache[i].asked,n)) {
+            memcpy(path,fold_cache[i].found,n); done=n;
+        }
+    }
+    pthread_mutex_unlock(&fold_lock);
+    char *component=path+done;
+    while (*component=='/') ++component;
+    while (*component) {
+        char *end=strchr(component,'/');
+        const char saved=end ? *end : 0;
+        if (end) *end=0;
+        if (stat(path,&st)) {
+            /* The parent directory holds a name equal to this one but for case. */
+            char *slash=component-1;
+            *slash=0;
+            DIR *dir=opendir(slash==path ? "/" : path);
+            *slash='/';
+            int matched=0;
+            if (dir) {
+                struct dirent *entry;
+                while ((entry=readdir(dir)))
+                    if (!strcasecmp(entry->d_name,component)) { memcpy(component,entry->d_name,strlen(component)); matched=1; break; }
+                closedir(dir);
+            }
+            if (!matched) { if (end) *end=saved; return ENOENT; }
+        }
+        if (!end) break;
+        *end=saved;
+        if ((size_t)(end-path)<sizeof(fold_cache[0].asked)) {
+            pthread_mutex_lock(&fold_lock);
+            unsigned slot=fold_next++%FOLD_CACHE;
+            memcpy(fold_cache[slot].found,path,(size_t)(end-path)); fold_cache[slot].found[end-path]=0;
+            memcpy(fold_cache[slot].asked,path,(size_t)(end-path)); fold_cache[slot].asked[end-path]=0;
+            pthread_mutex_unlock(&fold_lock);
+        }
+        component=end+1;
+    }
+    return 0;
+}
+#endif
 /* Resolve a guest path to a host path; returns 0 or a host errno. */
 static int translate(const char *guest,char *out,size_t size) {
     if (!guest || !*guest) return ENOENT;
@@ -124,13 +185,24 @@ static int translate(const char *guest,char *out,size_t size) {
     if (!m) result=ENOENT;
     else if ((size_t)snprintf(out,size,"%s%s",m->host,buffer+best)>=size) result=ENAMETOOLONG;
     const int game_path=m && (!strcmp(m->guest,"/app0") || !strcmp(m->guest,"/hostapp"));
+    const size_t host_length=m ? strlen(m->host) : 0;
     pthread_mutex_unlock(&lock);
     if (!result && game_path && update_root[0] && buffer[best]) {
         char updated[1100];
         HostStat st;
-        if ((size_t)snprintf(updated,sizeof(updated),"%s%s",update_root,buffer+best)<sizeof(updated) &&
-            !host_stat(updated,&st) && (size_t)snprintf(out,size,"%s",updated)>=size) result=ENAMETOOLONG;
+        if ((size_t)snprintf(updated,sizeof(updated),"%s%s",update_root,buffer+best)<sizeof(updated)) {
+#ifndef _WIN32
+            fold_case(updated,strlen(update_root));
+#endif
+            if (!host_stat(updated,&st) && (size_t)snprintf(out,size,"%s",updated)>=size) result=ENAMETOOLONG;
+        }
     }
+#ifndef _WIN32
+    /* Game files only: the user's writable folders keep the case the game created them with. */
+    if (!result && game_path) fold_case(out,host_length);
+#else
+    (void)host_length;
+#endif
     if (result==ENOENT) fprintf(stderr,"Runtime: no mount for guest path %s\n",guest);
     return result;
 }

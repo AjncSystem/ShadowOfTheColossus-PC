@@ -29,6 +29,10 @@ void bbgpu_register_guest_stack(uintptr_t address, uint64_t size);
 void bbgpu_register_guest_stack_end(uintptr_t address, uint64_t size);
 /* sotc: readbacks mode (0 disabled, 1 relaxed, 2 precise). */
 int bbgpu_readbacks_mode(void);
+/* sotc (Linux): whether the page tracker read-protects the page holding address, and setting
+ * that page back to the protection the tracker implies (0 when it has no state for it). */
+int bbgpu_page_read_watched(uintptr_t address);
+int bbgpu_page_restore(uintptr_t address);
 /* BB_WRITE_LOG=1: prints the logged GPU-side writes to guest memory near the fault. */
 void bbgpu_dump_guest_writes(void *ucontext);
 /* Keyboard text entry through the game window (IME dialog). begin returns 0 when

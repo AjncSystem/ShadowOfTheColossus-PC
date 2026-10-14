@@ -358,7 +358,7 @@ static ABI int32_t fiber_get_info(Fiber *f, FiberInfo *info) {
     info->entry=f->entry; info->arg_on_initialize=f->arg_on_initialize;
     info->addr_context=f->addr_context; info->size_context=f->size_context;
     memset(info->name,0,sizeof(info->name));
-    strncpy(info->name,f->name,MAX_NAME);
+    memcpy(info->name,f->name,MAX_NAME);
     info->size_context_margin=UINT64_MAX;
     if ((f->flags & FLAG_CONTEXT_SIZE_CHECK) && f->addr_context && *(uint64_t *)f->context_start==STACK_SIGNATURE) {
         uint64_t *p=(uint64_t *)f->context_start+1;

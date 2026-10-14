@@ -914,6 +914,8 @@ void TextureCache::RegisterImage(ImageId image_id) {
     image.flags |= ImageFlagBits::Registered;
     ++image_set_generation;
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
+    SotcStats::cached_images.fetch_add(1, std::memory_order_relaxed);
+    SotcStats::cached_image_bytes.fetch_add(Common::AlignUp(image.info.guest_size, 1024), std::memory_order_relaxed);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
     ForEachPage(image.info.guest_address, image.info.guest_size,
                 [this, image_id](u64 page) { page_table[page].push_back(image_id); });
@@ -927,6 +929,8 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ++image_set_generation;
     lru_cache.Free(image.lru_id);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
+    SotcStats::cached_images.fetch_sub(1, std::memory_order_relaxed);
+    SotcStats::cached_image_bytes.fetch_sub(Common::AlignUp(image.info.guest_size, 1024), std::memory_order_relaxed);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
         const auto page_it = page_table.find(page);
         if (page_it == nullptr) {
@@ -1113,8 +1117,10 @@ void TextureCache::GarbageCollectImages() {
         }
         if (download) {
             DownloadImageMemory(image_id);
+            SotcStats::gc_downloads.fetch_add(1, std::memory_order_relaxed);
         }
         FreeImage(image_id);
+        SotcStats::gc_freed.fetch_add(1, std::memory_order_relaxed);
         if (total_used_memory < critical_gc_memory) {
             if (aggresive) {
                 num_deletions >>= 2;
@@ -1183,6 +1189,7 @@ void TextureCache::GarbageCollectSamplers() {
 void TextureCache::RunGarbageCollector() {
     SCOPE_EXIT {
         ++gc_tick;
+        SotcStats::gc_ticks.fetch_add(1, std::memory_order_relaxed);
     };
 
     GarbageCollectImages();

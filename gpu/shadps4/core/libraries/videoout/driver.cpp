@@ -281,6 +281,18 @@ void VideoOutDriver::Flip(const Request& req) {
                          static_cast<unsigned long long>(SotcStats::vram_budget.load() >> 20),
                          static_cast<unsigned long long>(SotcStats::arena_allocs.load()),
                          static_cast<unsigned long long>(SotcStats::arena_bytes.load() >> 20));
+            static uint64_t last_images_new = 0;
+            const uint64_t images_new = SotcStats::images_new.load();
+            std::fprintf(stderr,
+                         "SOTC GC: %.1f ticks/frame, freed %.0f/s (%llu written back), images new "
+                         "%.0f/s, cached %llu (%llu MB)\n",
+                         flips ? double(SotcStats::gc_ticks.exchange(0)) / flips : 0.0,
+                         SotcStats::gc_freed.exchange(0) / seconds,
+                         static_cast<unsigned long long>(SotcStats::gc_downloads.exchange(0)),
+                         (images_new - last_images_new) / seconds,
+                         static_cast<unsigned long long>(SotcStats::cached_images.load()),
+                         static_cast<unsigned long long>(SotcStats::cached_image_bytes.load() >> 20));
+            last_images_new = images_new;
             static const bool cmd_stats = std::getenv("SOTC_CMD_STATS") != nullptr;
             if (cmd_stats && flips) {
                 double k[6];

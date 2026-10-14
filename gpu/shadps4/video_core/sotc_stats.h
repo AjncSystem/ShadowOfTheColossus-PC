@@ -41,6 +41,10 @@ inline std::atomic<uint64_t> image_query_ns{0}, image_alloc_ns{0}, image_dedicat
 /// Video memory: usage the driver reports (texture cache GC), budget the GC works with, and the
 /// sparse buffer arena memory (never released) as allocations and bytes.
 inline std::atomic<uint64_t> vram_used{0}, vram_budget{0}, arena_allocs{0}, arena_bytes{0};
+/// Texture cache collector: ticks (one per submit with a frame's work), images freed and those
+/// written back to memory first, and the images in the cache with their (guest) size.
+inline std::atomic<uint64_t> gc_ticks{0}, gc_freed{0}, gc_downloads{0};
+inline std::atomic<uint64_t> cached_images{0}, cached_image_bytes{0};
 
 struct ScopedTimer {
     std::atomic<uint64_t>& total;

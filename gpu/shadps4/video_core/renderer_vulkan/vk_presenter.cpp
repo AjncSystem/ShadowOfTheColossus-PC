@@ -1138,12 +1138,13 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             static u64 frames = 0;
             static const auto t0 = std::chrono::steady_clock::now();
             if (++frames % every == 0) {
-                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                                     std::chrono::steady_clock::now() - t0)
                                     .count();
-                std::fprintf(stderr, "SOTCFRAME %llu t=%lldms\n",
+                // us: the same time in microseconds, for frame time percentiles.
+                std::fprintf(stderr, "SOTCFRAME %llu t=%lldms us=%lld\n",
                              static_cast<unsigned long long>(frames),
-                             static_cast<long long>(ms));
+                             static_cast<long long>(us / 1000), static_cast<long long>(us));
                 std::fflush(stderr);
             }
         }

@@ -4,6 +4,8 @@
 
 /* The settings menu of the GPU library restarts through probe.c, which tests do not link. */
 void runtime_restart(void) { abort(); }
+/* sotc: the BPE heap guard lives in probe.c too (no heap in tests). */
+uintptr_t runtime_sotc_heap(void) { return 0; }
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>

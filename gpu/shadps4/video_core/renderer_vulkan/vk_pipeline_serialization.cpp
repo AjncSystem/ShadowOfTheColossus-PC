@@ -334,29 +334,30 @@ void PipelineCache::WarmUp() {
     // Check if cache is compatible
     std::vector<u8> profile_data{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderProfile, "profile", profile_data);
-    if (profile_data.empty()) {
+    // A cache made for another profile (another GPU or driver, a new build) cannot be used. It
+    // used to be ignored and left in place, so every later run started without a cache and saved
+    // nothing: it is set aside and a new one starts with this profile.
+    bool compatible = true;
+    if (!profile_data.empty()) {
+        Shader::Profile cached_profile{};
+        if (profile_data.size() == sizeof(Shader::Profile)) {
+            std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
+        }
+        compatible = profile_data.size() == sizeof(Shader::Profile) && cached_profile == profile;
+        if (!compatible) {
+            LOG_WARNING(Render, "Pipeline cache isn't compatible with current system (profile of "
+                                "{} bytes, expected {}). Starting a new cache",
+                        profile_data.size(), sizeof(Shader::Profile));
+            Storage::DataBase::Instance().Reset();
+        }
+    }
+    if (profile_data.empty() || !compatible) {
         Storage::DataBase::Instance().FinishPreload();
 
         profile_data.resize(sizeof(profile));
         std::memcpy(profile_data.data(), &profile, sizeof(profile));
         Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
                                            std::move(profile_data));
-        return;
-    }
-    if (profile_data.size() != sizeof(Shader::Profile)) {
-        LOG_WARNING(Render,
-                    "Pipeline cache profile has unexpected size ({} != {}). Ignoring the cache",
-                    profile_data.size(), sizeof(Shader::Profile));
-        Storage::DataBase::Instance().Close();
-        return;
-    }
-
-    Shader::Profile cached_profile{};
-    std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
-    if (cached_profile != profile) {
-        LOG_WARNING(Render,
-                    "Pipeline cache isn't compatible with current system. Ignoring the cache");
-        Storage::DataBase::Instance().Close();
         return;
     }
 

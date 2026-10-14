@@ -35,6 +35,9 @@ inline std::atomic<uint64_t> early_flushes{0}; ///< submits right after a write 
 inline std::atomic<uint64_t> pipelines_new{0}, pipeline_ns{0};
 inline std::atomic<uint64_t> shaders_compiled{0}, shader_ns{0};
 inline std::atomic<uint64_t> images_new{0}, image_ns{0};
+/// Parts of an image creation: format query, memory allocation (and how many got memory of
+/// their own instead of a block shared with others).
+inline std::atomic<uint64_t> image_query_ns{0}, image_alloc_ns{0}, image_dedicated{0};
 
 struct ScopedTimer {
     std::atomic<uint64_t>& total;

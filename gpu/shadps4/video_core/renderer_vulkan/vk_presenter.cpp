@@ -1154,22 +1154,27 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 return (v ? std::atoll(v) : 70LL) * 1000;
             }();
             static long long last_us = -1;
-            static u64 last[8]{};
+            static u64 last[11]{};
             const long long now_us = std::chrono::duration_cast<std::chrono::microseconds>(
                                          std::chrono::steady_clock::now() - t0)
                                          .count();
-            const u64 cur[8] = {SotcStats::pipelines_new.load(), SotcStats::pipeline_ns.load(),
+            const u64 cur[11] = {SotcStats::pipelines_new.load(), SotcStats::pipeline_ns.load(),
                                 SotcStats::shaders_compiled.load(), SotcStats::shader_ns.load(),
                                 SotcStats::images_new.load(), SotcStats::image_ns.load(),
-                                SotcStats::readbacks.load(), SotcStats::readback_ns.load()};
+                                SotcStats::readbacks.load(), SotcStats::readback_ns.load(),
+                                SotcStats::image_query_ns.load(), SotcStats::image_alloc_ns.load(),
+                                SotcStats::image_dedicated.load()};
             if (last_us >= 0 && now_us - last_us > stall_us) {
                 std::fprintf(stderr,
                              "SOTCSTALL frame %llu %.0f ms: pipelines %llu (%.0f ms), shaders %llu "
-                             "(%.0f ms), images %llu (%.0f ms), readbacks %llu (%.0f ms)\n",
+                             "(%.0f ms), images %llu (%.0f ms: query %.0f, alloc %.0f, %llu dedicated), "
+                             "readbacks %llu (%.0f ms)\n",
                              static_cast<unsigned long long>(frames), (now_us - last_us) / 1e3,
                              static_cast<unsigned long long>(cur[0] - last[0]), (cur[1] - last[1]) / 1e6,
                              static_cast<unsigned long long>(cur[2] - last[2]), (cur[3] - last[3]) / 1e6,
                              static_cast<unsigned long long>(cur[4] - last[4]), (cur[5] - last[5]) / 1e6,
+                             (cur[8] - last[8]) / 1e6, (cur[9] - last[9]) / 1e6,
+                             static_cast<unsigned long long>(cur[10] - last[10]),
                              static_cast<unsigned long long>(cur[6] - last[6]), (cur[7] - last[7]) / 1e6);
             }
             last_us = now_us;

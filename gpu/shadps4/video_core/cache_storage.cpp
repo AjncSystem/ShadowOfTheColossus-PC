@@ -131,6 +131,19 @@ void DataBase::Close() {
 
     io_worker.request_stop();
     io_worker.join();
+    // sotc: the worker leaves when asked to stop, with writes still queued: pipelines compiled
+    // shortly before the game was closed were dropped and compiled again (a stutter) next time.
+    {
+        std::scoped_lock lock{m_request};
+        while (!req_queue.empty()) {
+            auto request = std::move(req_queue.front());
+            req_queue.pop();
+            if (request.valid()) {
+                request();
+            }
+        }
+        num_requests = 0;
+    }
 
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         mz_zip_writer_finalize_archive(&zip_ar);

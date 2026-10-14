@@ -30,6 +30,11 @@ inline std::atomic<uint64_t> commands{0}; ///< draws and dispatches recorded
 /// empty), dispatches, indirect dispatches.
 inline std::atomic<uint64_t> cmd_kinds[6]{};
 inline std::atomic<uint64_t> early_flushes{0}; ///< submits right after a write to a read-back page
+/// Suspects of long frames, printed for each frame over SOTC_STALL_MS (SOTC_FRAME_LOG runs):
+/// pipelines created, shaders recompiled and images created during the frame, and their time.
+inline std::atomic<uint64_t> pipelines_new{0}, pipeline_ns{0};
+inline std::atomic<uint64_t> shaders_compiled{0}, shader_ns{0};
+inline std::atomic<uint64_t> images_new{0}, image_ns{0};
 
 struct ScopedTimer {
     std::atomic<uint64_t>& total;

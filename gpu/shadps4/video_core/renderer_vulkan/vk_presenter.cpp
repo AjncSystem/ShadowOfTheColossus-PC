@@ -15,6 +15,7 @@
 #include "sdl_window.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
+#include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -1146,6 +1147,34 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                              static_cast<unsigned long long>(frames),
                              static_cast<long long>(us / 1000), static_cast<long long>(us));
                 std::fflush(stderr);
+            }
+            // SOTC_STALL_MS (default 70): for slower frames, what happened since the last one.
+            static const long long stall_us = [] {
+                const char* v = std::getenv("SOTC_STALL_MS");
+                return (v ? std::atoll(v) : 70LL) * 1000;
+            }();
+            static long long last_us = -1;
+            static u64 last[8]{};
+            const long long now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                         std::chrono::steady_clock::now() - t0)
+                                         .count();
+            const u64 cur[8] = {SotcStats::pipelines_new.load(), SotcStats::pipeline_ns.load(),
+                                SotcStats::shaders_compiled.load(), SotcStats::shader_ns.load(),
+                                SotcStats::images_new.load(), SotcStats::image_ns.load(),
+                                SotcStats::readbacks.load(), SotcStats::readback_ns.load()};
+            if (last_us >= 0 && now_us - last_us > stall_us) {
+                std::fprintf(stderr,
+                             "SOTCSTALL frame %llu %.0f ms: pipelines %llu (%.0f ms), shaders %llu "
+                             "(%.0f ms), images %llu (%.0f ms), readbacks %llu (%.0f ms)\n",
+                             static_cast<unsigned long long>(frames), (now_us - last_us) / 1e3,
+                             static_cast<unsigned long long>(cur[0] - last[0]), (cur[1] - last[1]) / 1e6,
+                             static_cast<unsigned long long>(cur[2] - last[2]), (cur[3] - last[3]) / 1e6,
+                             static_cast<unsigned long long>(cur[4] - last[4]), (cur[5] - last[5]) / 1e6,
+                             static_cast<unsigned long long>(cur[6] - last[6]), (cur[7] - last[7]) / 1e6);
+            }
+            last_us = now_us;
+            std::copy(std::begin(cur), std::end(cur), std::begin(last));
+            if (false) {
             }
         }
     }

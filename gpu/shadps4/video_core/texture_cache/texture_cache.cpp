@@ -17,6 +17,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "video_core/sotc_stats.h"
 #include "video_core/texture_cache/tile_manager.h"
 
 namespace VideoCore {
@@ -669,6 +670,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     // Create and register a new image
     if (!image_id) {
+        const SotcStats::ScopedTimer stall_timer{SotcStats::image_ns};
+        SotcStats::images_new.fetch_add(1, std::memory_order_relaxed);
         image_id = slot_images.insert(instance, runtime, slot_image_views, info);
         RegisterImage(image_id);
     }

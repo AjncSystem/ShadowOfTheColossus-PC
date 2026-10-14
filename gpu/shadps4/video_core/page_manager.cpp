@@ -58,6 +58,7 @@ static u64 ImageBaseAddress() {
 #ifdef __linux__
 #include <thread>
 #include <fcntl.h>
+#include <ucontext.h>
 #include <linux/userfaultfd.h>
 #include <poll.h>
 #include <sys/ioctl.h>
@@ -126,6 +127,9 @@ std::unique_lock<StackLock> LockStacksExclusive() {
 boost::icl::interval_map<VAddr, u32> g_guest_stacks;
 // Re-applies the tracker's protection to pages that stop being stack pages.
 std::function<void(VAddr, u64)> g_reapply_protection;
+// sotc (Linux): one-page queries for the loader's helper-thread read window (src/probe.c).
+std::function<bool(VAddr)> g_page_read_watched;
+std::function<bool(VAddr)> g_restore_page;
 } // namespace
 
 // The exception frame is written below the faulting stack pointer, so a nearly full stack also
@@ -313,6 +317,26 @@ struct PageManager::Impl {
         for (const u64 page : locked_pages) {
             locks[page].unlock();
         }
+    }
+
+    /// sotc (Linux): true when the tracker read-protects the page holding address.
+    bool PageReadWatched(VAddr address) {
+        const PageState* state = cached_pages.find(address >> PM_PAGE_BITS);
+        return state && state->num_read_watchers != 0;
+    }
+
+    /// sotc (Linux): sets the page holding address to exactly the protection its watchers imply
+    /// (ReadWrite included, unlike ReapplyProtection). False when the tracker has no state.
+    bool RestorePage(VAddr address) {
+        const u64 page = address >> PM_PAGE_BITS;
+        PageState* state = cached_pages.find(page);
+        if (!state) {
+            return false;
+        }
+        locks[page].lock();
+        Protect(page << PM_PAGE_BITS, PM_PAGE_SIZE, state->Perms());
+        locks[page].unlock();
+        return true;
     }
 
     void EnsurePages(VAddr begin, VAddr end) {
@@ -635,6 +659,8 @@ struct SignalImpl : public PageManager::Impl {
         g_reapply_protection = [this](VAddr address, u64 size) {
             ReapplyProtection(address, size);
         };
+        g_page_read_watched = [this](VAddr address) { return PageReadWatched(address); };
+        g_restore_page = [this](VAddr address) { return RestorePage(address); };
 
         // Should be called first.
         constexpr auto priority = std::numeric_limits<u32>::min();
@@ -733,6 +759,8 @@ struct SignalImpl : public PageManager::Impl {
         static auto last = std::chrono::steady_clock::now();
 #ifdef _WIN32
         const u64 rip = static_cast<EXCEPTION_POINTERS*>(context)->ContextRecord->Rip;
+#elif defined(__linux__)
+        const u64 rip = static_cast<u64>(static_cast<ucontext_t*>(context)->uc_mcontext.gregs[REG_RIP]);
 #else
         const u64 rip = 0;
 #endif
@@ -753,7 +781,7 @@ struct SignalImpl : public PageManager::Impl {
         std::fprintf(stderr, "SOTC readback faults in 10 s: %llu\n", static_cast<unsigned long long>(total));
         for (size_t i = 0; i < sorted.size() && i < 12; ++i) {
             const auto& [count, key] = sorted[i];
-            char where[MAX_PATH] = "?";
+            char where[512] = "?";
 #ifdef _WIN32
             HMODULE module = nullptr;
             if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -928,6 +956,27 @@ struct SignalImpl : public PageManager::Impl {
         default: return nullptr;
         }
     }
+#elif defined(__linux__)
+    static u64* ContextRegister(ucontext_t* ctx, ZydisRegister reg) {
+        auto* g = reinterpret_cast<u64*>(ctx->uc_mcontext.gregs);
+        switch (ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, reg)) {
+        case ZYDIS_REGISTER_RAX: return &g[REG_RAX];
+        case ZYDIS_REGISTER_RCX: return &g[REG_RCX];
+        case ZYDIS_REGISTER_RDX: return &g[REG_RDX];
+        case ZYDIS_REGISTER_RBX: return &g[REG_RBX];
+        case ZYDIS_REGISTER_RSI: return &g[REG_RSI];
+        case ZYDIS_REGISTER_RDI: return &g[REG_RDI];
+        case ZYDIS_REGISTER_R8: return &g[REG_R8];
+        case ZYDIS_REGISTER_R9: return &g[REG_R9];
+        case ZYDIS_REGISTER_R10: return &g[REG_R10];
+        case ZYDIS_REGISTER_R11: return &g[REG_R11];
+        case ZYDIS_REGISTER_R12: return &g[REG_R12];
+        case ZYDIS_REGISTER_R13: return &g[REG_R13];
+        case ZYDIS_REGISTER_R14: return &g[REG_R14];
+        case ZYDIS_REGISTER_R15: return &g[REG_R15];
+        default: return nullptr;
+        }
+    }
 #endif
 
     /// Clean-load callback of the generated walkers (GPU command processor thread).
@@ -950,7 +999,7 @@ struct SignalImpl : public PageManager::Impl {
     /// page stays protected, so reads of the GPU-written bytes still fault and read back.
     /// Idea from srt_walker_clean_reads of Pink-shadPS4 (luizgustavs). SOTC_CLEAN_READS=0 = off.
     static bool TryCleanWalkerLoad(void* context) {
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__linux__)
         static const bool enabled = [] {
             const char* v = std::getenv("SOTC_CLEAN_READS");
             return v ? std::atoi(v) != 0 : true;
@@ -968,21 +1017,27 @@ struct SignalImpl : public PageManager::Impl {
             operands[1].type != ZYDIS_OPERAND_TYPE_MEMORY) {
             return false;
         }
+#ifdef _WIN32
         auto* ctx = static_cast<EXCEPTION_POINTERS*>(context)->ContextRecord;
+        using RegisterValue = DWORD64;
+#else
+        auto* ctx = static_cast<ucontext_t*>(context);
+        using RegisterValue = u64;
+#endif
         const auto& mem = operands[1].mem;
         const u32 size = operands[0].size / 8;
-        DWORD64* dst = ContextRegister(ctx, operands[0].reg.value);
+        RegisterValue* dst = ContextRegister(ctx, operands[0].reg.value);
         if (!dst || (size != 4 && size != 8) || mem.segment != ZYDIS_REGISTER_DS ||
             mem.base == ZYDIS_REGISTER_NONE) {
             return false;
         }
-        const DWORD64* base = ContextRegister(ctx, mem.base);
+        const RegisterValue* base = ContextRegister(ctx, mem.base);
         if (!base) {
             return false;
         }
         VAddr address = *base + static_cast<u64>(mem.disp.value);
         if (mem.index != ZYDIS_REGISTER_NONE) {
-            const DWORD64* index = ContextRegister(ctx, mem.index);
+            const RegisterValue* index = ContextRegister(ctx, mem.index);
             if (!index) {
                 return false;
             }
@@ -998,7 +1053,11 @@ struct SignalImpl : public PageManager::Impl {
         }
         // A 32-bit destination zero-extends into the full register, as the mov would.
         *dst = value;
+#ifdef _WIN32
         ctx->Rip += instruction.length;
+#else
+        ctx->uc_mcontext.gregs[REG_RIP] += instruction.length;
+#endif
         // Later walker loads in this page try the clean path before faulting.
         Shader::MarkSrtCleanPages(address, size);
         return true;
@@ -1046,3 +1105,11 @@ void PageManager::UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bou
 }
 
 } // namespace VideoCore
+
+extern "C" int bbgpu_page_read_watched(uintptr_t address) {
+    return VideoCore::g_page_read_watched && VideoCore::g_page_read_watched(address) ? 1 : 0;
+}
+
+extern "C" int bbgpu_page_restore(uintptr_t address) {
+    return VideoCore::g_restore_page && VideoCore::g_restore_page(address) ? 1 : 0;
+}

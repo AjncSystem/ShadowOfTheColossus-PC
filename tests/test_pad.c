@@ -5,6 +5,8 @@
 
 static int capture;
 int bbgpu_overlay_captures_input(void) { return capture; }
+/* No game window in the test: no mouse camera input. */
+int bbgpu_mouse_take(float *dx, float *dy, unsigned *buttons) { (void)dx; (void)dy; (void)buttons; return 0; }
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *name) {
     (void)table; (void)count; (void)name;
     return 0;

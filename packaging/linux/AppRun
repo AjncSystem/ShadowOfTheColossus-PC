@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Shadow of the Colossus PC (Linux AppImage).
+#   ./SotC-PC-x86_64.AppImage            starts the game (asks for the game folder the first time)
+#   ./SotC-PC-x86_64.AppImage --setup    chooses the game folder and the sound modules again
+# Settings, prepared image, saves and the log of the last run: ~/.local/share/sotc-pc
+set -uo pipefail
+HERE="$(dirname -- "$(readlink -f -- "$0")")"
+APP="$HERE/usr/share/sotc-pc"
+export SOTC_DATA_DIR="${SOTC_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/sotc-pc}"
+mkdir -p "$SOTC_DATA_DIR"
+INI="$SOTC_DATA_DIR/sotc.ini"
+LOG="$SOTC_DATA_DIR/last_run.log"
+
+# Host libraries injected into every program (Steam overlay, ...) do not belong in the game.
+unset LD_PRELOAD
+
+has() { command -v "$1" >/dev/null 2>&1; }
+say() {   # message to the user: a window when started from the desktop, else the terminal
+    if [[ -t 1 ]]; then printf '%s\n' "$1" >&2
+    elif has zenity; then zenity --info --no-wrap --title='Shadow of the Colossus PC' --text="$1" 2>/dev/null
+    elif has kdialog; then kdialog --title 'Shadow of the Colossus PC' --msgbox "$1" 2>/dev/null
+    else printf '%s\n' "$1" >&2; fi
+}
+pick_dir() {  # $1 = title; prints the chosen folder
+    if has zenity; then zenity --file-selection --directory --title="$1" 2>/dev/null
+    elif has kdialog; then kdialog --title "$1" --getexistingdirectory "$HOME" 2>/dev/null
+    elif [[ -t 0 ]]; then read -r -e -p "$1: " dir && printf '%s\n' "${dir/#\~/$HOME}"
+    else return 1; fi
+}
+ini_get() { [[ -f $INI ]] && sed -n "s/^$1=//p" "$INI" | tail -1; }
+ini_set() {  # $1 = name, $2 = value: replaces or appends the line
+    touch "$INI"
+    grep -v "^$1=" "$INI" > "$INI.tmp" || true
+    printf '%s=%s\n' "$1" "$2" >> "$INI.tmp"
+    mv "$INI.tmp" "$INI"
+}
+
+if ! has python3; then
+    say 'Python 3 não encontrado. No Fedora: sudo dnf install python3'
+    exit 1
+fi
+
+setup=0
+if [[ ${1:-} == --setup ]]; then setup=1; shift; fi
+game="${SOTC_GAME_DIR:-$(ini_get SOTC_GAME_DIR)}"
+if (( setup )) || [[ -z $game || ! -f $game/eboot.bin ]]; then
+    say 'Escolha a pasta do dump do jogo (CUSA08809), a que contém eboot.bin, sce_module e sce_sys.'
+    game="$(pick_dir 'Pasta do jogo (CUSA08809)')" || { say 'Nenhuma pasta escolhida.'; exit 1; }
+    if [[ ! -f $game/eboot.bin ]]; then
+        say "Não há eboot.bin em: $game"
+        exit 1
+    fi
+    ini_set SOTC_GAME_DIR "$game"
+fi
+
+modules="${SOTC_SYS_MODULES:-$(ini_get SOTC_SYS_MODULES)}"
+if (( setup )) || [[ -z $modules ]]; then
+    found=''
+    for candidate in "${XDG_DATA_HOME:-$HOME/.local/share}/shadPS4/sys_modules" \
+                     "$HOME/.var/app/net.shadps4.shadPS4/data/shadPS4/sys_modules" \
+                     "$game/../sys_modules"; do
+        if [[ -f $candidate/libSceNgs2.sprx && -f $candidate/libSceUlt.sprx ]]; then
+            found="$(readlink -f -- "$candidate")"; break
+        fi
+    done
+    if [[ -z $found ]]; then
+        say 'Para ter som, escolha a pasta com libSceNgs2.sprx e libSceUlt.sprx do seu console (o user/sys_modules do shadPS4). Cancele para jogar sem som.'
+        found="$(pick_dir 'Pasta dos módulos de som (sys_modules)')" || found=''
+    fi
+    if [[ -n $found && -f $found/libSceNgs2.sprx && -f $found/libSceUlt.sprx ]]; then
+        ini_set SOTC_SYS_MODULES "$found"
+    elif [[ -n $found ]]; then
+        say "libSceNgs2.sprx e libSceUlt.sprx não estão em: $found. O jogo vai rodar sem som."
+    fi
+fi
+
+# Same defaults as the Windows launcher: 16x anisotropic filtering.
+[[ -n "$(ini_get SOTC_MODES)" || -n ${SOTC_MODES:-} ]] || ini_set SOTC_MODES af16
+
+python3 "$APP/sotc.py" "$@" 2>&1 | tee "$LOG"
+status=${PIPESTATUS[0]}
+if (( status != 0 && status != 130 )) && [[ ! -t 1 ]]; then
+    say "O jogo fechou com erro ($status). O registro está em: $LOG"
+fi
+exit "$status"

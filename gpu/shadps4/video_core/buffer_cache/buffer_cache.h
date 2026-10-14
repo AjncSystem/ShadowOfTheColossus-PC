@@ -178,7 +178,7 @@ private:
     void ApplyDownloads(std::span<const ReadbackItem> pending, const u8* mapped,
                         u64 mapped_offset);
 
-    /// sotc (SOTC_RB_ASYNC=1): a readback asked by a guest thread in two steps on the command
+    /// sotc (default, SOTC_RB_ASYNC=0 turns it off): a readback asked by a guest thread in two steps on the command
     /// processor: the copies are recorded and submitted without waiting (the command processor
     /// goes on with its queue), the guest thread waits for the GPU, then the data is applied
     /// unless a later GPU write hit the ranges meanwhile (then it is read back again).
@@ -279,6 +279,9 @@ private:
     RangeSet current_writes;
     u64 current_writes_tick{};
     void RecordCurrentWrite(VAddr addr, u64 size);
+    /// sotc: the range the guest touched, during the DownloadMemory of its window (size 0 else).
+    VAddr fault_addr{};
+    u64 fault_size{};
 
 public:
     /// sotc: true once after the command buffer being built wrote a page the guest reads back:

@@ -281,6 +281,9 @@ void VideoOutDriver::Flip(const Request& req) {
                          static_cast<unsigned long long>(SotcStats::vram_budget.load() >> 20),
                          static_cast<unsigned long long>(SotcStats::arena_allocs.load()),
                          static_cast<unsigned long long>(SotcStats::arena_bytes.load() >> 20));
+            std::fprintf(stderr, "SOTC readback finish: %llu for bytes the guest asked\n",
+                         static_cast<unsigned long long>(
+                             SotcStats::readback_finish_asked.exchange(0)));
             static uint64_t last_images_new = 0;
             const uint64_t images_new = SotcStats::images_new.load();
             std::fprintf(stderr,

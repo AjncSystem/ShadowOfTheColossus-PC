@@ -14,6 +14,7 @@ inline std::atomic<uint64_t> watch_addr{0};     ///< SOTC_CS_WATCH: GPU writes t
 inline std::atomic<uint64_t> current_program{0}; ///< hash of the dispatch being recorded (1 = a draw)
 inline std::atomic<uint64_t> readback_ahead{0};   ///< downloads of already submitted work
 inline std::atomic<uint64_t> readback_finish{0};  ///< downloads that flushed the current work
+inline std::atomic<uint64_t> readback_finish_asked{0}; ///< ... for bytes the guest itself asked
 inline std::atomic<uint64_t> heap_guard_builds{0}; ///< readbacks into the BPE heap
 inline std::atomic<uint64_t> readback_copies{0};          ///< ranges downloaded
 inline std::atomic<uint64_t> readback_copies_changed{0};  ///< ... whose bytes differed from memory

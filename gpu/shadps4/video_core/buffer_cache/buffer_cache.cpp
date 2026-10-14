@@ -870,7 +870,12 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     if (alloc_result == vk::Result::eErrorOutOfDeviceMemory) {
         // Video memory is full (sparse arenas cannot use system memory). Drop old cached images,
         // wait for the GPU so their memory is really released, and try once more.
-        LOG_WARNING(Render, "Video memory exhausted, collecting cached images");
+        LOG_WARNING(Render,
+                    "Video memory exhausted, collecting cached images (asked {} KB; in use {} MB "
+                    "of {} MB; arenas {} allocations, {} MB)",
+                    alloc_info.allocationSize >> 10, instance.GetDeviceMemoryUsage() >> 20,
+                    SotcStats::vram_budget.load() >> 20, SotcStats::arena_allocs.load(),
+                    SotcStats::arena_bytes.load() >> 20);
         texture_cache.EmergencyCollect();
         scheduler.Finish();
         scheduler.PopPendingOperations();
@@ -881,6 +886,8 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     }
     ASSERT_MSG(alloc_result == vk::Result::eSuccess, "Failed to allocate buffer arena memory: {}",
                vk::to_string(alloc_result));
+    SotcStats::arena_allocs.fetch_add(1, std::memory_order_relaxed);
+    SotcStats::arena_bytes.fetch_add(alloc_info.allocationSize, std::memory_order_relaxed);
 
     boost::container::small_vector<vk::BufferCopy, 8> copies;
     const auto staging =

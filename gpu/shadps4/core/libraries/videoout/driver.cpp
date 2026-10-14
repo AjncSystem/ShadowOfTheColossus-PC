@@ -263,7 +263,8 @@ void VideoOutDriver::Flip(const Request& req) {
             const uint64_t bytes_changed = SotcStats::readback_bytes_changed.exchange(0);
             std::fprintf(stderr,
                          "SOTC FPS %.1f at %.0fs; %.0f cmds/frame; readbacks %.0f/s (ahead %llu, finish %llu, heap %llu, early %llu), %.0f ms/s; "
-                         "changed copies %llu/%llu, bytes %llu/%llu\n",
+                         "changed copies %llu/%llu, bytes %llu/%llu; vram %llu/%llu MB, "
+                         "arenas %llu (%llu MB)\n",
                          flips / seconds, std::chrono::duration<double>(now - run_start).count(),
                          flips ? double(SotcStats::commands.exchange(0)) / flips : 0.0,
                          readbacks / seconds,
@@ -275,7 +276,11 @@ void VideoOutDriver::Flip(const Request& req) {
                          static_cast<unsigned long long>(copies_changed),
                          static_cast<unsigned long long>(copies),
                          static_cast<unsigned long long>(bytes_changed),
-                         static_cast<unsigned long long>(bytes));
+                         static_cast<unsigned long long>(bytes),
+                         static_cast<unsigned long long>(SotcStats::vram_used.load() >> 20),
+                         static_cast<unsigned long long>(SotcStats::vram_budget.load() >> 20),
+                         static_cast<unsigned long long>(SotcStats::arena_allocs.load()),
+                         static_cast<unsigned long long>(SotcStats::arena_bytes.load() >> 20));
             static const bool cmd_stats = std::getenv("SOTC_CMD_STATS") != nullptr;
             if (cmd_stats && flips) {
                 double k[6];

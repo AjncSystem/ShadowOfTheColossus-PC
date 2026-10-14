@@ -38,6 +38,9 @@ inline std::atomic<uint64_t> images_new{0}, image_ns{0};
 /// Parts of an image creation: format query, memory allocation (and how many got memory of
 /// their own instead of a block shared with others).
 inline std::atomic<uint64_t> image_query_ns{0}, image_alloc_ns{0}, image_dedicated{0};
+/// Video memory: usage the driver reports (texture cache GC), budget the GC works with, and the
+/// sparse buffer arena memory (never released) as allocations and bytes.
+inline std::atomic<uint64_t> vram_used{0}, vram_budget{0}, arena_allocs{0}, arena_bytes{0};
 
 struct ScopedTimer {
     std::atomic<uint64_t>& total;

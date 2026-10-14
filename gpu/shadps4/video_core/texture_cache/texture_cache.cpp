@@ -77,6 +77,10 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     // 8 GB cards and new allocations failed).
     critical_gc_memory = std::min<u64>(critical_gc_memory, device_local_memory * 6 / 10);
     pressure_gc_memory = std::min<u64>(pressure_gc_memory, critical_gc_memory);
+    SotcStats::vram_budget = static_cast<u64>(device_local_memory);
+    LOG_INFO(Render, "Video memory budget {} MB: collection from {} MB, pressure {} MB, critical {} MB",
+             device_local_memory >> 20, trigger_gc_memory >> 20, pressure_gc_memory >> 20,
+             critical_gc_memory >> 20);
 }
 
 TextureCache::~TextureCache() = default;
@@ -1075,6 +1079,7 @@ void TextureCache::GarbageCollectImages() {
     if (instance.CanReportMemoryUsage()) {
         total_used_memory = instance.GetDeviceMemoryUsage();
     }
+    SotcStats::vram_used.store(total_used_memory, std::memory_order_relaxed);
     if (total_used_memory < trigger_gc_memory) {
         return;
     }

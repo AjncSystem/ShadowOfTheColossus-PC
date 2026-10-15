@@ -827,15 +827,17 @@ void Rasterizer::FlushPeriodic() {
     if (every == 0) {
         return;
     }
-    // sotc: submit by recording time instead (SOTC_FLUSH_US, default 500 where the periodic
+    // sotc: submit by recording time instead (SOTC_FLUSH_US, default 1000 where the periodic
     // submit is on and SOTC_FLUSH_EVERY is not set): the GPU gets work at a steady pace whether
     // a scene has few heavy commands or thousands of light ones. Attract demo: +10-15% in most
     // scenes, canyon bridge +2% (count based: 64 helped the first and hurt the second).
+    // 1000 instead of 500 (2026-10-15, RTX 3060 laptop, idle shrine ~5800 draws/frame): about +8%
+    // on its own (250: no gain, 2000: same as 1000): fewer submits, each one cheaper per draw.
     static const u64 flush_us = [] {
         if (const char* v = std::getenv("SOTC_FLUSH_US")) {
             return std::strtoull(v, nullptr, 10);
         }
-        return std::getenv("SOTC_FLUSH_EVERY") ? u64{0} : u64{500};
+        return std::getenv("SOTC_FLUSH_EVERY") ? u64{0} : u64{1000};
     }();
     const u64 tick = scheduler.CurrentTick();
     if (tick != commands_tick) {

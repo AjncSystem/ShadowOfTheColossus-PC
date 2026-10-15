@@ -591,8 +591,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const u64 last_block = (device_addr + size - 1) >> block_shift;
     const auto* arena = GetArena(first_block, last_block);
     EnsureResident(arena, first_block, last_block);
+    // SynchronizeMemory also syncs read-only texel buffers from an aliasing image (sotc: a second
+    // SynchronizeMemoryFromImage call here repeated that work, re-tiling the image twice).
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
-    if (is_texel_buffer && !is_written) {
+    if (SotcStats::OptOff() && is_texel_buffer && !is_written) {
         SynchronizeMemoryFromImage(arena, device_addr, size);
     }
     if (is_written) {
@@ -965,12 +967,17 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
 }
 
 bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size) {
-    // Either path below writes the arena range from the GPU.
-    RecordCurrentWrite(device_addr, size);
+    // sotc: a current write is recorded only on the two paths that write the arena range. Recording
+    // it unconditionally marked unwritten ranges as written by the command buffer being recorded,
+    // which sent their readbacks to the slower flushing path instead of the ahead path.
+    if (SotcStats::OptOff()) {
+        RecordCurrentWrite(device_addr, size);
+    }
     if (auto type = texture_cache.IsMeta(device_addr)) {
         if (*type == TextureCache::MetaType::HTile) {
             static constexpr u32 ZmaskUncompressed = 0xf;
             runtime.FillBuffer(arena, arena->Offset(device_addr), size, ZmaskUncompressed);
+            RecordCurrentWrite(device_addr, size);
             return true;
         } else {
             LOG_WARNING(Render_Vulkan, "Unhandled metadata type {}", magic_enum::enum_name(*type));
@@ -1013,6 +1020,7 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
     }
     auto& tile_manager = texture_cache.GetTileManager();
     tile_manager.TileImage(image, buffer_copies, arena, arena_offset);
+    RecordCurrentWrite(device_addr, size);
     return true;
 }
 

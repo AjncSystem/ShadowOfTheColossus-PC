@@ -1100,8 +1100,31 @@ void TextureCache::EmergencyCollect(u32 level) {
 }
 
 void TextureCache::GarbageCollectImages() {
-    if (instance.CanReportMemoryUsage()) {
+    // sotc: this runs on every submit (many per frame with periodic flushes), and the usage query
+    // is a kernel call (~2% of the GPU command thread): refresh it at most every 20 ms.
+    static std::chrono::steady_clock::time_point last_usage_query{};
+    const auto now = std::chrono::steady_clock::now();
+    if (instance.CanReportMemoryUsage() &&
+        (SotcStats::OptOff() || now - last_usage_query >= std::chrono::milliseconds{20})) {
+        last_usage_query = now;
         total_used_memory = instance.GetDeviceMemoryUsage();
+        // sotc: shown with the frame rate (SOTC_FPS=1).
+        SotcStats::vram_used.store(total_used_memory, std::memory_order_relaxed);
+        SotcStats::vram_budget.store(instance.GetTotalMemoryBudget(), std::memory_order_relaxed);
+        // What VMA holds in device-local heaps: its blocks against the allocations in them
+        // (the difference is free space VMA keeps, i.e. fragmentation).
+        VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
+        vmaGetHeapBudgets(instance.GetAllocator(), budgets);
+        const auto& memory_properties = instance.GetMemoryProperties();
+        u64 vma_blocks = 0, vma_allocations = 0;
+        for (u32 heap = 0; heap < memory_properties.memoryHeapCount; ++heap) {
+            if (memory_properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+                vma_blocks += budgets[heap].statistics.blockBytes;
+                vma_allocations += budgets[heap].statistics.allocationBytes;
+            }
+        }
+        SotcStats::vma_block_bytes.store(vma_blocks, std::memory_order_relaxed);
+        SotcStats::vma_allocation_bytes.store(vma_allocations, std::memory_order_relaxed);
     }
     if (total_used_memory < trigger_gc_memory) {
         return;

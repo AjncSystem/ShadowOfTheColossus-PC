@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Builds dist/Bloodborne-bbport-x86_64.AppImage: the port's current build (run build.sh first),
-# its scripts and the launcher, bundled with their Nix closure (nix-appimage: the AppImage mounts
+# Builds dist/SotC-x86_64.AppImage: the port's current build (run build.sh first) and its
+# scripts, bundled with their Nix closure (nix-appimage: the AppImage mounts
 # its /nix/store with user namespaces, available on SteamOS and most desktops).
-# Running it opens the launcher; `--play` starts the game with the launcher's saved settings.
+# Running it starts the game through run.sh (settings: the data directory's bbport.ini).
 # Data (generated files, saves, bbport.ini): ~/.local/share/bbport (BB_DATA_DIR).
 set -euo pipefail
 cd -- "$(dirname -- "$0")/.."
@@ -21,5 +21,5 @@ trap 'rm -rf "$work"' EXIT
 (cd "$work" && nix bundle --impure --bundler github:ralismark/nix-appimage \
     --expr "import $root/packaging {}")
 mkdir -p dist
-install -m755 "$work/bbport.AppImage" dist/Bloodborne-bbport-x86_64.AppImage
-ls -lh dist/Bloodborne-bbport-x86_64.AppImage
+install -m755 "$work/bbport.AppImage" dist/SotC-x86_64.AppImage
+ls -lh dist/SotC-x86_64.AppImage

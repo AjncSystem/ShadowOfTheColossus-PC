@@ -91,7 +91,8 @@ struct StageSpecialization {
     Backend::Bindings start{};
 
     StageSpecialization() = default;
-    StageSpecialization(const Info& info_, RuntimeInfo runtime_info_, const Profile& profile_,
+    // sotc: runtime info by reference (one copy into the member instead of three per stage).
+    StageSpecialization(const Info& info_, const RuntimeInfo& runtime_info_, const Profile& profile_,
                         Backend::Bindings start_)
         : info{&info_}, runtime_info{runtime_info_}, start{start_} {
         if (info_.sw_stage == SwStage::Vertex && Gcn::ParseFetchShader(info_, fetch_shader_data)) {

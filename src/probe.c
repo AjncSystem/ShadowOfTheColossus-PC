@@ -290,8 +290,16 @@ static DWORD WINAPI profiler(void *name) {
                 profile_add((uintptr_t)c.Rip,1);
                 const uintptr_t leaf=(uintptr_t)c.Rip;
                 int first_own=1;
+                /* sotc: RtlVirtualUnwind on a snapshot taken mid-prologue can read a garbage
+                 * address; that fault ended the whole game (ntdll, "not ours", unhandled). The
+                 * handler's recovery point resumes here instead and the rest of the stack is
+                 * dropped. depth is volatile: it is read after the jump. */
+                sigjmp_buf unwind_recover;
+                volatile int depth=0;
+                if (sigsetjmp(unwind_recover,0)) depth=32;
+                else runtime_fault_recover=&unwind_recover;
                 /* Callers through the unwind tables (.pdata): system DLLs keep no frame pointers. */
-                for (int depth=0; depth<32; ++depth) {
+                for (; depth<32; ++depth) {
                     DWORD64 base=0;
                     PRUNTIME_FUNCTION fn=RtlLookupFunctionEntry(c.Rip,&base,NULL);
                     if (fn) {
@@ -312,6 +320,7 @@ static DWORD WINAPI profiler(void *name) {
                         profile_pair((uintptr_t)GetModuleHandleA(NULL),leaf,(uintptr_t)c.Rip);
                     }
                 }
+                runtime_fault_recover=NULL;
             }
             ResumeThread(thread);
         }
@@ -514,7 +523,7 @@ __asm__(".text\n.p2align 4\n.globl call_on_stack\ncall_on_stack:\n"
 static _Thread_local unsigned char *alt_stack;
 /* BB_FAULT_RING=<file>: every exception is recorded in a file-backed ring so the last ones
  * survive a process the kernel kills without dispatching (diagnostics). */
-struct fault_entry { uint64_t tick, tid, code, addr, rip, rsp, region, below; }; /* region/below: TEB stack limit/base */
+struct fault_entry { uint64_t tick, tid, code, addr, rip, rsp, region, below, outcome; }; /* region/below: TEB stack limit/base; outcome: handler path << 8 | 1 if execution continued */
 static struct fault_entry *fault_ring;
 static volatile LONG fault_ring_next;
 static void fault_ring_open(const char *path) {
@@ -523,7 +532,7 @@ static void fault_ring_open(const char *path) {
     HANDLE map=CreateFileMappingA(file,NULL,PAGE_READWRITE,0,8192*sizeof(struct fault_entry),NULL);
     if (map) fault_ring=MapViewOfFile(map,FILE_MAP_WRITE,0,0,0);
 }
-static void fault_ring_add(const EXCEPTION_POINTERS *info) {
+static struct fault_entry *fault_ring_add(const EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record=info->ExceptionRecord;
     struct fault_entry *e=&fault_ring[(InterlockedIncrement(&fault_ring_next)-1)&8191];
     const uintptr_t rsp=(uintptr_t)info->ContextRecord->Rsp;
@@ -531,13 +540,21 @@ static void fault_ring_add(const EXCEPTION_POINTERS *info) {
     e->tick=GetTickCount64(); e->tid=GetCurrentThreadId(); e->code=record->ExceptionCode;
     e->addr=record->NumberParameters>=2 ? record->ExceptionInformation[1] : 0;
     e->rip=info->ContextRecord->Rip; e->rsp=rsp;
-    e->region=(uintptr_t)tib->StackLimit; e->below=(uintptr_t)tib->StackBase;
+    e->region=(uintptr_t)tib->StackLimit; e->below=(uintptr_t)tib->StackBase; e->outcome=0;
+    return e;
 }
+/* Which handler path resolved the current exception (fault ring diagnostics). */
+static _Thread_local int fault_path;
 static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     NT_TIB *tib=(NT_TIB *)NtCurrentTeb();
     const uintptr_t sp=(uintptr_t)__builtin_frame_address(0);
-    if (fault_ring) fault_ring_add(info);
-    if (sp>=(uintptr_t)tib->StackLimit && sp<(uintptr_t)tib->StackBase) return vectored_fault_impl(info);
+    struct fault_entry *entry=fault_ring ? fault_ring_add(info) : NULL;
+    fault_path=0;
+    if (sp>=(uintptr_t)tib->StackLimit && sp<(uintptr_t)tib->StackBase) {
+        const LONG own=vectored_fault_impl(info);
+        if (entry) entry->outcome=((uint64_t)fault_path<<8)|(own==EXCEPTION_CONTINUE_EXECUTION);
+        return own;
+    }
     if (!alt_stack) alt_stack=VirtualAlloc(NULL,ALT_STACK_SIZE,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
     if (!alt_stack) return vectored_fault_impl(info);
     void *const base=tib->StackBase, *const limit=tib->StackLimit;
@@ -546,18 +563,22 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     const LONG result=call_on_stack(info,vectored_fault_impl,alt_stack+ALT_STACK_SIZE);
     tib->StackBase=base;
     tib->StackLimit=limit;
+    if (entry) entry->outcome=((uint64_t)fault_path<<8)|(result==EXCEPTION_CONTINUE_EXECUTION)|0x10000;
     return result;
 }
 static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record=info->ExceptionRecord;
     DWORD code=record->ExceptionCode;
-    if ((code==EXCEPTION_BREAKPOINT || code==EXCEPTION_SINGLE_STEP) && heap_hook_trap(info)) return EXCEPTION_CONTINUE_EXECUTION;
-    if (code==EXCEPTION_SINGLE_STEP && helper_single_step(info)) return EXCEPTION_CONTINUE_EXECUTION;
-    if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2 && gpu_enabled && helper_read_fault(info))
+    if ((code==EXCEPTION_BREAKPOINT || code==EXCEPTION_SINGLE_STEP) && heap_hook_trap(info)) { fault_path=1; return EXCEPTION_CONTINUE_EXECUTION; }
+    if (code==EXCEPTION_SINGLE_STEP && helper_single_step(info)) { fault_path=2; return EXCEPTION_CONTINUE_EXECUTION; }
+    if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2 && gpu_enabled && helper_read_fault(info)) {
+        fault_path=3;
         return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2) {
         /* GPU page tracking (write-protected guest pages) is resolved first. */
-        if (gpu_enabled && bbgpu_handle_fault(info,(void *)record->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
+        if (gpu_enabled && bbgpu_handle_fault(info,(void *)record->ExceptionInformation[1])) { fault_path=4; return EXCEPTION_CONTINUE_EXECUTION; }
+        fault_path=10; /* page tracking declined */
         if (runtime_fault_recover) {
             /* A speculative guest memory read (GPU draw preparation) faulted: the thread resumes
              * in bb_longjmp, outside the exception dispatcher, back at its recovery point. */
@@ -568,11 +589,12 @@ static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
             c->Rcx=(DWORD64)(uintptr_t)buffer;
             c->Rdx=1;
             c->Rip=(DWORD64)(uintptr_t)bb_longjmp;
+            fault_path=5;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
     /* sotc: an SSE4a site the load-time patchers could not rewrite is interpreted. */
-    if (code==EXCEPTION_ILLEGAL_INSTRUCTION && image && sotc_handle_illegal(info)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (code==EXCEPTION_ILLEGAL_INSTRUCTION && image && sotc_handle_illegal(info)) { fault_path=6; return EXCEPTION_CONTINUE_EXECUTION; }
     if (code==EXCEPTION_ACCESS_VIOLATION || code==EXCEPTION_ILLEGAL_INSTRUCTION || code==EXCEPTION_PRIV_INSTRUCTION ||
         code==EXCEPTION_STACK_OVERFLOW || code==EXCEPTION_INT_DIVIDE_BY_ZERO || code==EXCEPTION_DATATYPE_MISALIGNMENT) {
         /* Faults in guest code, the loader or the runtime end the process with a report; drivers
@@ -582,7 +604,8 @@ static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
         int ours=(image && rip-(uintptr_t)image<0x20000000) ||
                  (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)rip,&module) && module==self) ||
                  !module;
-        if (ours) return fatal_exception(info);
+        if (ours) { fault_path=7; return fatal_exception(info); }
+        fault_path=fault_path ? fault_path : 9; /* not ours: passed on */
     }
     /* BB_STRICT_HANDLES=1: a closed or invalid handle used anywhere is reported (diagnostics). */
     if (code==0xC0000008 /* STATUS_INVALID_HANDLE */) return fatal_exception(info);
@@ -773,9 +796,9 @@ static int mapped(Segment *segments, uint64_t count, uint64_t address, uint64_t 
             address - segments[i].address <= segments[i].size - bytes) return 1;
     return 0;
 }
-/* BBPATCH2 (patches.py): the patches' image base, then byte writes at image offsets, applied
- * after relocation. A write may replace a whole base-relative pointer slot (60/90 FPS++ swap
- * function pointers): the patch holds the address at the patches' base, rebased here. */
+/* BBPATCH2 (scripts/sotc_modes.py): the patches' image base, then byte writes at image offsets,
+ * applied after relocation. A write may replace a whole base-relative pointer slot (a patch that
+ * swaps function pointers): the patch holds the address at the patches' base, rebased here. */
 static void apply_patches(const char *path, Segment *segments, uint64_t ns, const Reloc *relocs, uint64_t nr) {
     FILE *f=fopen(path,"rb");
     char magic[8];
@@ -809,15 +832,15 @@ static void apply_patches(const char *path, Segment *segments, uint64_t ns, cons
     fclose(f);
     printf("Patches: %" PRIu64 " writes, %" PRIu64 " bytes applied, %" PRIu64 " pointers rebased\n",count,bytes,rebased);
 }
-/* Restarts the game through run.sh (the settings menu: a new render resolution is a patch
- * applied at start). Descriptors are closed first so the old GPU device and its memory are
- * released before the new process opens its own. */
+/* Restarts the game: BB_RESTART_COMMAND on Windows, run.sh on Linux. Descriptors are closed
+ * first so the old GPU device and its memory are released before the new process opens its own. */
 void runtime_restart(void) {
     fflush(NULL);
 #ifdef _WIN32
-    /* run.py sets BB_RESTART_COMMAND: the launch command line, started again (new patches). */
+    /* BB_RESTART_COMMAND: the launch command line, started again (sotc.py and the SotC launcher
+     * do not set it). */
     const char *command=getenv("BB_RESTART_COMMAND");
-    puts("Runtime: restarting through run.py");
+    puts("Runtime: restarting (BB_RESTART_COMMAND)");
     if (!command || !*command) { fputs("runtime_restart: BB_RESTART_COMMAND is not set\n",stderr); _exit(1); }
     char *line=_strdup(command);
     /* Same output handles: a launcher reading the game's log keeps reading the new launch. */
@@ -829,7 +852,7 @@ void runtime_restart(void) {
         fprintf(stderr,"runtime_restart: CreateProcess failed (%lu)\n",GetLastError()); _exit(1);
     }
     CloseHandle(process.hThread); CloseHandle(process.hProcess);
-    /* The new launch waits for this process's GPU device to go away (run.py --after). */
+    /* The command must wait for this process's GPU device to go away before starting the game. */
     TerminateProcess(GetCurrentProcess(),0);
 #else
     puts("Runtime: restarting through run.sh");
@@ -1033,7 +1056,7 @@ int main(int argc, char **argv) {
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
     if (!cpu_only) {
-        char title[128]="Bloodborne", serial[16]="UNKNOWN", sfo[4096];
+        char title[128]="Shadow of the Colossus", serial[16]="UNKNOWN", sfo[4096];
         uint32_t attributes=0;
         snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0 ? app0 : ".");
         sfo_value(sfo,"TITLE",title,sizeof(title),NULL);

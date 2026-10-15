@@ -1,3 +1,7 @@
+> **Note:** this is the original README of the Bloodborne port (bloodborne_pc / bbport) that
+> this project was forked from, kept for its credits and licenses. Its download, play and build
+> instructions do not apply to this repository: see the main `README.md`.
+
 # Bloodborne for Windows
 
 **Bloodborne running natively on Windows 10 and 11, by [Supermedo](https://github.com/Supermedo) Mohammed Albarghouthi.**

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <concepts>
 #include <iterator>
+#include <type_traits>
 #include <vector>
 
 #include "common/types.h"
@@ -83,6 +84,35 @@ public:
         const auto at = std::distance(intervals.begin(), first);
         Splice(first, last, out, m);
         Coalesce(at, m);
+    }
+
+    /// sotc: Add for plain intervals (any two merge, so the list is the canonical union: sorted,
+    /// disjoint, no two touching), in place: a range already covered by one interval returns at
+    /// once, otherwise the overlapped and touching run collapses into its first element. Same
+    /// result as Add, without building pieces and coalescing (barrier tracking adds the same
+    /// ranges again and again per draw).
+    void AddUnion(IV value)
+        requires std::is_same_v<IV, Interval>
+    {
+        if (value.start >= value.end) [[unlikely]] {
+            return;
+        }
+        auto first = std::ranges::lower_bound(intervals, value.start, {}, &IV::end);
+        auto last = first;
+        while (last != intervals.end() && last->start <= value.end) {
+            ++last;
+        }
+        if (first == last) {
+            intervals.insert(first, value);
+            return;
+        }
+        if (std::next(first) == last && first->start <= value.start && value.end <= first->end) {
+            return;
+        }
+        const u64 end = std::max(std::prev(last)->end, value.end);
+        first->start = std::min(first->start, value.start);
+        first->end = end;
+        intervals.erase(std::next(first), last);
     }
 
     /// Removes a range from the interval set, trimming intervals that partially overlap it.

@@ -365,6 +365,17 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     if (!RefreshGraphicsKey()) {
         return nullptr;
     }
+    // sotc: consecutive draws mostly use the same pipeline: when the freshly built key equals the
+    // previous draw's byte for byte, skip the map's hash and probe. The stage state (infos,
+    // modules, fetch shader) was refreshed by RefreshGraphicsKey either way. SOTC_PIPE_MEMO=0.
+    static const bool pipe_memo = [] {
+        const char* v = std::getenv("SOTC_PIPE_MEMO");
+        return !v || v[0] != '0';
+    }();
+    if (pipe_memo && last_graphics_pipeline &&
+        std::memcmp(&graphics_key, &last_graphics_key, sizeof(graphics_key)) == 0) {
+        return last_graphics_pipeline;
+    }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
@@ -387,6 +398,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             }
         }
     }
+    std::memcpy(&last_graphics_key, &graphics_key, sizeof(graphics_key));
+    last_graphics_pipeline = it->second.get();
     return it->second.get();
 }
 
@@ -679,12 +692,14 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
-    auto runtime_info = BuildRuntimeInfo(hw_stage, sw_stage);
+    // sotc: copied only where CompileModule needs a mutable one (it was copied on every call).
+    const auto& rt = BuildRuntimeInfo(hw_stage, sw_stage);
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
     if (new_program) {
         it_pgm.value() = std::make_unique<Program>(hw_stage, sw_stage, params);
         auto& program = it_pgm.value();
         auto start = binding;
+        auto runtime_info = rt;
         const auto module = CompileModule(program->info, runtime_info, params.code, 0, binding);
         auto spec = Shader::StageSpecialization(program->info, runtime_info, profile, start);
         const auto perm_hash = HashCombine(params.hash, 0);
@@ -702,7 +717,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
     info.RefreshFlatBuf();
-    auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
+    auto spec = Shader::StageSpecialization(info, rt, profile, binding);
 
     size_t perm_idx = program->modules.size();
     u64 perm_hash = HashCombine(params.hash, perm_idx);
@@ -712,6 +727,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
     if (it == program->modules.end()) {
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
+        auto runtime_info = rt;
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
@@ -730,6 +746,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,
                                                              std::span<const u32> spv_code) {
+    last_graphics_pipeline = nullptr; // sotc: pipelines may be erased below
     std::optional<vk::ShaderModule> new_module{};
     for (const auto& [_, program] : program_cache) {
         for (auto& m : program->modules) {

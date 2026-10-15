@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Shadow of the Colossus launcher for Windows (Tkinter), modelled on bbport_launcher_win.py.
+"""Shadow of the Colossus launcher for Windows (Tkinter), derived from the bbport launcher.
 
 One window for the port's settings: the game dump, the user's own sound modules, saves, modes
 (16x AF, 60 FPS), display and diagnostics. They go to sotc.py as environment variables.
@@ -287,7 +287,7 @@ def game_environment(s):
         env['BB_DIRECT_MEMORY_ACCESS'] = '0'
     # Periodic submits and readbacks ahead: by default only with NVIDIA (vk_rasterizer.cpp).
     if s.get('gpu_submit') == 'on':
-        env['SOTC_FLUSH_US'], env['SOTC_RB_AHEAD'] = '500', '1'
+        env['SOTC_FLUSH_US'], env['SOTC_RB_AHEAD'] = '1000', '1'
     elif s.get('gpu_submit') == 'off':
         env['SOTC_FLUSH_EVERY'], env['SOTC_RB_AHEAD'] = '0', '0'
     env['SOTC_NEO'] = '1' if s.get('neo') else '0'
@@ -1036,16 +1036,24 @@ class Launcher:
         if source.name != GAME_ID and (source / GAME_ID).is_dir():
             source = source / GAME_ID
         target = user_dir({'user_dir': self.var('user_dir').get()}) / 'savedata' / '1' / GAME_ID
-        if target.exists() and any(target.iterdir()):
-            if not self.messagebox.askyesno('Shadow of the Colossus', _(
-                    'Já há saves em {}. Substituir? (uma cópia fica em {}.bak)',
-                    'There are saves in {} already. Replace them? (a copy stays in {}.bak)').format(target, target.name)):
-                return
-            backup = target.with_name(target.name + '.bak')
-            shutil.rmtree(backup, ignore_errors=True)
-            target.rename(backup)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(source, target)
+        # sotc: one save folder picked (it holds sce_sys/param.sfo): import it as one save. The
+        # runtime creates the port's metadata for saves that come without it.
+        single = (source / 'sce_sys' / 'param.sfo').is_file()
+        try:
+            if not single and target.exists() and any(target.iterdir()):
+                if not self.messagebox.askyesno('Shadow of the Colossus', _(
+                        'Já há saves em {}. Substituir? (uma cópia fica em {}.bak)',
+                        'There are saves in {} already. Replace them? (a copy stays in {}.bak)').format(target, target.name)):
+                    return
+                backup = target.with_name(target.name + '.bak')
+                shutil.rmtree(backup, ignore_errors=True)
+                target.rename(backup)
+            target.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(source, target / source.name if single else target, dirs_exist_ok=True)
+        except OSError as error:
+            self.messagebox.showerror('Shadow of the Colossus', _('Não foi possível importar o save: {}',
+                                                                 'Could not import the save: {}').format(error))
+            return
         self.refresh_status()
         self.messagebox.showinfo('Shadow of the Colossus', _('Save importado para {}.', 'Save imported to {}.').format(target))
 

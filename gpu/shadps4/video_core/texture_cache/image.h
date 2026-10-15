@@ -49,12 +49,17 @@ struct UniqueImage {
     UniqueImage(UniqueImage&& other)
         : allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
           allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
-          image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)} {}
+          image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)},
+          size_bytes{std::exchange(other.size_bytes, 0)} {}
     UniqueImage& operator=(UniqueImage&& other) {
+        // sotc: release an image this one still holds (it was overwritten and leaked before).
+        Destroy();
+        device = other.device;
         image = std::exchange(other.image, VK_NULL_HANDLE);
         allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
         allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
         image_ci = std::move(other.image_ci);
+        size_bytes = std::exchange(other.size_bytes, 0);
         return *this;
     }
 
@@ -140,6 +145,9 @@ public:
     VAddr track_addr = 0;
     VAddr track_addr_end = 0;
     ImageId depth_id{};
+    /// sotc: the depth/colour twin parked by ResolveDepthOverlap (unregistered, untracked, kept
+    /// for the next conversion back); deleted together with this image.
+    ImageId parked_twin{};
     u64 depth_uid{};
 
     vk::ImageUsageFlags usage_flags;
@@ -156,11 +164,20 @@ public:
         boost::container::small_vector<ImageViewInfo, 4> image_view_infos;
         boost::container::small_vector<ImageViewId, 4> image_view_ids;
         u32 num_samples;
+        // sotc: index of the view FindView returned last (SOTC_TEX_BIND_P1). The view lists
+        // only grow and their entries never change, so an index stays valid for the backing's
+        // lifetime; ~0u = none yet.
+        u32 last_view = ~0u;
     };
     std::deque<BackingImage> backing_images;
     BackingImage* backing{};
     boost::container::static_vector<u64, 16> mip_hashes{};
     u64 image_uid{};
+    /// sotc: a new identity for a reused (unparked) image: associations made with the old uid
+    /// (stencil -> depth) no longer match, as with a newly created image.
+    void RenewIdentity() {
+        image_uid = global_image_uid.Next();
+    }
     u64 lru_id{};
     u64 tick_accessed_last{};
     u64 hash{};

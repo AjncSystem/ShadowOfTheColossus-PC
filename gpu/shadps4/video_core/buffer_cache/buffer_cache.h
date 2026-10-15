@@ -4,6 +4,7 @@
 #pragma once
 
 #include <chrono>
+#include <shared_mutex>
 #include <deque>
 #include <span>
 #include <vector>
@@ -222,6 +223,9 @@ private:
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
+    /// sotc: gpu_modified_ranges is changed on the GPU side (the draw thread, see
+    /// Liverpool::IsBackThreaded) and read by the command processor's SRT walkers (ReadClean).
+    std::shared_mutex gpu_modified_mutex;
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;

@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -21,6 +22,15 @@ extern std::unique_ptr<Vulkan::Presenter> presenter;
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
 namespace Libraries::VideoOut {
+
+// sotc: see SubmitFlipInternal. SOTC_EARLY_VO_LABEL=0 restores the upstream behaviour.
+static bool EarlyVoLabel() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_EARLY_VO_LABEL");
+        return !v || std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
 
 constexpr static bool Is32BppPixelFormat(PixelFormat format) {
     switch (format) {
@@ -70,6 +80,7 @@ void VideoOutDriver::Close(s32 handle) {
     main_port.is_open = false;
     main_port.flip_rate = 0;
     main_port.prev_index = -1;
+    main_port.submit_prev_index = -1;
 
     // Clear port information
     std::memset(main_port.buffer_labels.data(), 0, sizeof(main_port.buffer_labels));
@@ -348,6 +359,9 @@ void VideoOutDriver::Flip(const Request& req) {
                              static_cast<unsigned long long>(
                                  SotcStats::vram_emergency.exchange(0)));
             }
+            if (const uint64_t waits = SotcStats::cp_waits.exchange(0)) {
+                std::fprintf(stderr, "SOTC CP waits for the draw thread %.0f/s\n", waits / seconds);
+            }
             const bool cmd_stats = SotcStats::kCmdStats; // sotc: as the counters (sotc_stats.h)
             if (cmd_stats && flips) {
                 double k[6];
@@ -403,7 +417,7 @@ void VideoOutDriver::Flip(const Request& req) {
     }
 
     // Reset prev flip label
-    if (port->prev_index != -1) {
+    if (!EarlyVoLabel() && port->prev_index != -1) {
         port->buffer_labels[port->prev_index] = 0;
         port->SignalVoLabel();
     }
@@ -458,6 +472,19 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         ASSERT_MSG(buffer.group_index >= 0, "Trying to flip an unregistered buffer!");
         const auto& group = port->groups[buffer.group_index];
         frame = presenter->PrepareFrame(group, buffer.address_left);
+    }
+
+    // sotc: the buffer shown before this flip is free once the copy of this one is recorded:
+    // PrepareFrame read it on the GPU timeline, ahead of anything the game renders into the old
+    // buffer next. Upstream frees it only when the present thread takes this flip on a vblank
+    // tick, and the command processor waits for that in the VO label wait at the start of the
+    // next frame.
+    if (EarlyVoLabel()) {
+        if (port->submit_prev_index != -1) {
+            port->buffer_labels[port->submit_prev_index] = 0;
+            port->SignalVoLabel();
+        }
+        port->submit_prev_index = index;
     }
 
     std::scoped_lock lock{mutex};

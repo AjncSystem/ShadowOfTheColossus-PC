@@ -129,7 +129,10 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
 
 void BufferCache::DropGpuModified(VAddr device_addr, u64 size) {
     liverpool->SendCommand<true>([this, device_addr, size] {
-        gpu_modified_ranges.Subtract(device_addr, size);
+        {
+            std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+            gpu_modified_ranges.Subtract(device_addr, size);
+        }
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
         MarkInflightReadbacksDirty(device_addr, size);
         memory_tracker->MarkRegionAsCpuModified(device_addr, size);
@@ -304,6 +307,7 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
     } else {
         download.buffer->Invalidate(download.offset, download.size);
         for (const auto& item : readback.pending) {
+            std::unique_lock gpu_modified_lock{gpu_modified_mutex};
             for (const auto& [address, range_size] : item.gpu_ranges) {
                 gpu_modified_ranges.Subtract(address, range_size);
             }
@@ -479,6 +483,7 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
                 };
                 gpu_modified_ranges.ForEachInRange(address, range_size, add_download);
                 if (subtract) {
+                    std::unique_lock gpu_modified_lock{gpu_modified_mutex};
                     gpu_modified_ranges.Subtract(address, range_size);
                 } else {
                     item.gpu_ranges.emplace_back(address, range_size);
@@ -646,7 +651,11 @@ void BufferCache::AddGpuModified(VAddr addr, u64 size) {
         const char* v = std::getenv("SOTC_GPUMOD_NOGROW_SKIP");
         return !v || v[0] != '0';
     }();
-    const bool grew = gpu_modified_ranges.Add(addr, size);
+    bool grew;
+    {
+        std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+        grew = gpu_modified_ranges.Add(addr, size);
+    }
     if (!clean_pages_used || size == 0 || (!grew && nogrow_skip)) {
         return;
     }
@@ -674,6 +683,20 @@ bool BufferCache::ReadClean(VAddr addr, void* out, u32 size) {
     const VAddr page_addr = addr & ~(CleanPageSize - 1);
     if (addr + size > page_addr + CleanPageSize) {
         return false;
+    }
+    // sotc: the command processor while the draw thread owns the GPU state: no page cache (the
+    // draw thread maintains it), the ranges under the lock.
+    if (liverpool->RunsGpuWorkElsewhere()) {
+        const u8* backing = memory->GetBackingPointer(page_addr);
+        if (!backing) {
+            return false;
+        }
+        std::shared_lock gpu_modified_lock{gpu_modified_mutex};
+        if (gpu_modified_ranges.Intersects(addr, size)) {
+            return false;
+        }
+        std::memcpy(out, backing + (addr - page_addr), size);
+        return true;
     }
     const u64 generation = clean_map_generation.load(std::memory_order_acquire);
     auto& page = clean_pages[(addr >> CleanPageBits) % NumCleanPages];
@@ -771,7 +794,10 @@ bool BufferCache::TryReplaceFromCpu(VAddr addr, const void* data, u64 size) {
     if (foreign) {
         return false;
     }
-    gpu_modified_ranges.Subtract(addr, size);
+    {
+        std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+        gpu_modified_ranges.Subtract(addr, size);
+    }
     memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
     MarkInflightReadbacksDirty(addr, size);
     if (!memory->TryWriteBacking(std::bit_cast<void*>(addr), data, size, 10)) {
@@ -1155,8 +1181,11 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
     });
     resident_ranges.Subtract(first_block, end_block);
     ++resident_version; // sotc: invalidates the merged DMA runs
-    gpu_modified_ranges.Subtract(first_block << block_shift,
-                                 (end_block - first_block) << block_shift);
+    {
+        std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+        gpu_modified_ranges.Subtract(first_block << block_shift,
+                                     (end_block - first_block) << block_shift);
+    }
 }
 
 void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {

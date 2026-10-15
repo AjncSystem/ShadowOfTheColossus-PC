@@ -38,7 +38,9 @@ inline std::atomic<uint64_t> render_breaks{0};  ///< EndRendering that closed a 
 inline std::atomic<uint64_t> fault_writes{0};       ///< guest write faults on tracked pages
 inline std::atomic<uint64_t> fault_walker{0};       ///< SRT walker loads emulated after a fault
 inline std::atomic<uint64_t> fault_gpu_reads{0};    ///< other read faults on the command processor
-inline std::atomic<uint64_t> commands{0}; ///< draws and dispatches recorded
+inline std::atomic<uint64_t> commands{0};
+/// Command processor waits for the draw thread (Liverpool::IsBackThreaded).
+inline std::atomic<uint64_t> cp_waits{0}; ///< draws and dispatches recorded
 /// SOTC_CMD_STATS=1: draws, indirect draws (arguments GPU-written / CPU-side / CPU-side and
 /// empty), dispatches, indirect dispatches.
 inline std::atomic<uint64_t> cmd_kinds[6]{};

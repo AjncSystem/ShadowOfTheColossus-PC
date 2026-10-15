@@ -53,7 +53,7 @@ def main():
     msys = os.environ.get('MSYS2_ROOT', r'I:\msys64')
     env['PATH'] = str(Path(msys) / 'clang64' / 'bin') + os.pathsep + env['PATH']
     env.update(BB_FRAME_DUMP_TRIGGER=str(out / 'dump.trigger'), BB_DUMP_DIR=str(out / 'dump'), BB_PAD_FILE=str(pad),
-               BB_STACKS_TRIGGER=str(out / 'stacks.trigger'))
+               BB_STACKS_TRIGGER=str(out / 'stacks.trigger'), SOTC_SAVE_PROMPT='auto')
     for item in args.env:
         name, value = item.split('=', 1)
         env[name] = value

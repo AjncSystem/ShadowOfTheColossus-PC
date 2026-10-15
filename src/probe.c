@@ -796,9 +796,9 @@ static int mapped(Segment *segments, uint64_t count, uint64_t address, uint64_t 
             address - segments[i].address <= segments[i].size - bytes) return 1;
     return 0;
 }
-/* BBPATCH2 (patches.py): the patches' image base, then byte writes at image offsets, applied
- * after relocation. A write may replace a whole base-relative pointer slot (60/90 FPS++ swap
- * function pointers): the patch holds the address at the patches' base, rebased here. */
+/* BBPATCH2 (scripts/sotc_modes.py): the patches' image base, then byte writes at image offsets,
+ * applied after relocation. A write may replace a whole base-relative pointer slot (a patch that
+ * swaps function pointers): the patch holds the address at the patches' base, rebased here. */
 static void apply_patches(const char *path, Segment *segments, uint64_t ns, const Reloc *relocs, uint64_t nr) {
     FILE *f=fopen(path,"rb");
     char magic[8];
@@ -832,15 +832,15 @@ static void apply_patches(const char *path, Segment *segments, uint64_t ns, cons
     fclose(f);
     printf("Patches: %" PRIu64 " writes, %" PRIu64 " bytes applied, %" PRIu64 " pointers rebased\n",count,bytes,rebased);
 }
-/* Restarts the game through run.sh (the settings menu: a new render resolution is a patch
- * applied at start). Descriptors are closed first so the old GPU device and its memory are
- * released before the new process opens its own. */
+/* Restarts the game: BB_RESTART_COMMAND on Windows, run.sh on Linux. Descriptors are closed
+ * first so the old GPU device and its memory are released before the new process opens its own. */
 void runtime_restart(void) {
     fflush(NULL);
 #ifdef _WIN32
-    /* run.py sets BB_RESTART_COMMAND: the launch command line, started again (new patches). */
+    /* BB_RESTART_COMMAND: the launch command line, started again (sotc.py and the SotC launcher
+     * do not set it). */
     const char *command=getenv("BB_RESTART_COMMAND");
-    puts("Runtime: restarting through run.py");
+    puts("Runtime: restarting (BB_RESTART_COMMAND)");
     if (!command || !*command) { fputs("runtime_restart: BB_RESTART_COMMAND is not set\n",stderr); _exit(1); }
     char *line=_strdup(command);
     /* Same output handles: a launcher reading the game's log keeps reading the new launch. */
@@ -852,7 +852,7 @@ void runtime_restart(void) {
         fprintf(stderr,"runtime_restart: CreateProcess failed (%lu)\n",GetLastError()); _exit(1);
     }
     CloseHandle(process.hThread); CloseHandle(process.hProcess);
-    /* The new launch waits for this process's GPU device to go away (run.py --after). */
+    /* The command must wait for this process's GPU device to go away before starting the game. */
     TerminateProcess(GetCurrentProcess(),0);
 #else
     puts("Runtime: restarting through run.sh");
@@ -1056,7 +1056,7 @@ int main(int argc, char **argv) {
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
     if (!cpu_only) {
-        char title[128]="Bloodborne", serial[16]="UNKNOWN", sfo[4096];
+        char title[128]="Shadow of the Colossus", serial[16]="UNKNOWN", sfo[4096];
         uint32_t attributes=0;
         snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0 ? app0 : ".");
         sfo_value(sfo,"TITLE",title,sizeof(title),NULL);

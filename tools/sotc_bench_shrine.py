@@ -17,8 +17,8 @@ never reached.
 
 Open-world routes recorded by a player (src/runtime_pad.c BB_PAD_RECORD / BB_PAD_REPLAY):
     --record out/route.txt   gets to the idle scene, then hands the game to the player with
-                             recording armed (F9 starts and stops it) and waits for the window
-                             to close.
+                             recording started (F9 stops it) and waits for the window to
+                             close.
     --replay out/route.txt   gets to the idle scene, plays the recording back and measures the
                              whole replay (frames dumped every 15 s).
 """
@@ -48,7 +48,7 @@ def main():
     parser.add_argument('--cmdline', default='out/bench.cmdline')
     parser.add_argument('--shots', type=int, default=3, help='frames dumped during the measurement')
     parser.add_argument('--template', default='out/save-template', help='save folder holding CUSA08809/')
-    parser.add_argument('--record', help='hand over to the player with BB_PAD_RECORD=<file> (F9)')
+    parser.add_argument('--record', help='hand over to the player with BB_PAD_RECORD=<file> (F9 stops)')
     parser.add_argument('--replay', help='measure a replay of a BB_PAD_RECORD file')
     parser.add_argument('--assist', default='auto',
                         help='during a replay, also tap BUTTON every 0.4 s between START and END seconds '
@@ -258,7 +258,7 @@ def main():
     if args.record:
         recorded = Path(args.record)
         count = len(recorded.read_text().splitlines()) if recorded.exists() else 0
-        print(f'recorded {count} pad samples to {args.record}' if count else 'nothing recorded (F9 not pressed?)')
+        print(f'recorded {count} pad samples to {args.record}' if count else 'nothing recorded')
         return 0 if count else 1
     window = [s for s in samples if idle_at + 5 <= s[2] <= idle_at + 5 + args.measure + 1]
     if not window:

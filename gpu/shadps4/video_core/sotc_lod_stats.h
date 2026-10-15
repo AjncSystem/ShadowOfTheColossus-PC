@@ -65,8 +65,6 @@ inline void Collect(u64 (&entries)[256]) {
         const u32 n = uses[i].load(std::memory_order_relaxed); // sotc: single thread, see Mark
         if (n) {
             uses[i].store(0, std::memory_order_relaxed);
-        }
-        if (n) {
             idle[i] = 0;
             last_count[i] = std::min<u32>(n * 256u, 0xffffff);
         } else if (idle[i] < linger) {

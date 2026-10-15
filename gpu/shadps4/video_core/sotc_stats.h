@@ -52,6 +52,8 @@ inline uint64_t TakeDelta(const std::atomic<uint64_t>& counter, uint64_t& seen) 
     seen = now;
     return delta;
 }
+/// Command processor waits for the draw thread (Liverpool::IsBackThreaded).
+inline std::atomic<uint64_t> cp_waits{0};
 /// SOTC_CMD_STATS=1: draws, indirect draws (arguments GPU-written / CPU-side / CPU-side and
 /// empty), dispatches, indirect dispatches.
 inline std::atomic<uint64_t> cmd_kinds[6]{};

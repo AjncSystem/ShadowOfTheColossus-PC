@@ -931,7 +931,6 @@ struct SignalImpl : public PageManager::Impl {
         if (!rasterizer->IsGpuSideThread()) {
             return false;
         }
-        rasterizer->PrepareGpuSideFault();
         *out = 0;
         if (!rasterizer->ReadCleanMemory(address, out, size)) {
             return false;

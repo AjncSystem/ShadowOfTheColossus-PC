@@ -17,6 +17,7 @@ Writes two files for the loader:
                    bb-probe --sotc-cmdline): cvars of the Bluepoint engine, e.g.
                    +r_motionBlurEnable=0. Modes that are only cvars:
                    af16   16x anisotropic filtering on every texture
+                   hdr    the game's HDR rendering (needs the HDR10 output: Windows HDR on)
 The original bytes are checked first: another game version gets neither file's changes.
 """
 import argparse
@@ -51,6 +52,8 @@ CVAR_MODES = {
     'fps60game': ['TargetFramesPerSeconds=1'],  # until the options code runs (MODES above)
     'af16': ['progSamplerAnisoLevel=16', 'progSamplerAnisoLevel_BasePS4=16', 'progSamplerAnisoLevel_Perf=16',
              'progSamplerAnisoLevel_Cinematic=16', 'linearSamplerAnisoLevel=16'],
+    # the game's HDR path (sotc.py also turns on the HDR10 output, BB_HDR)
+    'hdr': ['r_WantsHDR=1'],
 }
 # Render size (PS4 mode; the PS4 Pro values next to them stay): (address, kind, original).
 # 'W'/'H' an integer immediate (the last 4 bytes of the instruction at address), 'w'/'h' a float

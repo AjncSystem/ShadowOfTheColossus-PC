@@ -128,7 +128,7 @@ def windows_language():
 # Settings, passed to sotc.py as environment variables.
 
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
-                'user_dir': '', 'af16': True, 'hq_textures': True, 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
+                'user_dir': '', 'af16': True, 'hq_textures': True, 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'hdr': False, 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
                 'readbacks': '', 'extra_env': '', 'close_on_play': False, 'gamepad': '',
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
@@ -453,6 +453,8 @@ def game_environment(s):
     modes = ['af16'] if s.get('af16') else []
     if fps_mode != '30':
         modes.append('fps60game')
+    if s.get('hdr'):
+        modes.append('hdr')
     env['SOTC_MODES'] = ','.join(modes)
     env['SOTC_FPS_CAP'] = '30' if fps_mode == '30' else 'off'
     env['SOTC_FPS_LIMIT'] = '60' if fps_mode == '60' else '0'
@@ -927,9 +929,10 @@ class Launcher:
         self.row(quick, _('FPS', 'FPS'), self.choice(quick, 'fps_mode', FPS_MODES, 24))
         self.check(quick, 'af16', _('Texturas nítidas (filtro 16x)', 'Sharp textures (16x filtering)'))
         self.check(quick, 'hq_textures', _('Texturas em alta qualidade', 'High quality textures'))
+        self.check(quick, 'hdr', _('HDR (HDR do Windows ligado)', 'HDR (Windows HDR on)'))
         self.check(quick, 'fullscreen', _('Tela cheia', 'Fullscreen'))
         self.check(quick, 'neo', _('Modo PS4 Pro', 'PS4 Pro mode'))
-        for key in ('af16', 'hq_textures', 'fps_mode', 'fullscreen', 'neo', 'output_res', 'upscaler', 'sharpness', 'framegen'):
+        for key in ('af16', 'hq_textures', 'fps_mode', 'hdr', 'fullscreen', 'neo', 'output_res', 'upscaler', 'sharpness', 'framegen'):
             self.vars[key].trace_add('write', lambda *_a: self.refresh_status())
 
     def draw_banner(self):
@@ -1085,6 +1088,9 @@ class Launcher:
                    "FSR 3 is experimental: on an RTX 3060 the game's real frame rate dropped (24-30 FPS instead of "
                    '40-50), with more stutter and image glitches. DLSS-G only works on RTX 40/50: on other cards '
                    'it stays off and F8 switches to FSR 3.'))
+        self.check(f, 'hdr', _('HDR', 'HDR'),
+                   _('Saída HDR10 e a renderização HDR do jogo. Ligue o HDR do Windows antes de jogar.',
+                     'HDR10 output and the game\'s HDR rendering. Turn on Windows HDR before playing.'))
         self.window_icon_row(f)
         self.section(f, _('Resolução', 'Resolution'))
         self.row(f, _('Saída', 'Output'), self.choice(f, 'output_res', OUTPUTS),
@@ -1367,6 +1373,8 @@ class Launcher:
                           'fsr': 'FSR 3'}.get(framegen, framegen))
         if self.var('af16').get():
             parts.append(_('AF 16x', '16x AF'))
+        if self.var('hdr').get():
+            parts.append('HDR')
         if self.var('neo').get():
             parts.append('PS4 Pro' if not is_wide(self.var('output_res').get())
                          else _('PS4 Pro desligado (tela larga)', 'PS4 Pro off (wide screen)'))

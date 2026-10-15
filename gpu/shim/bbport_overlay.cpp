@@ -453,7 +453,9 @@ void SaveListBox() {
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoNav |
                      ImGuiWindowFlags_NoSavedSettings);
     ImGui::SetWindowFontScale(1.25f);
+    ImGui::PushTextWrapPos(0.0f); // sotc: save dialog messages are whole sentences
     ImGui::TextColored(ImVec4(0.85f, 0.72f, 0.45f, 1.0f), "%s", list_title.c_str());
+    ImGui::PopTextWrapPos();
     ImGui::SetWindowFontScale(1.0f);
     ImGui::Separator();
     const float footer = ImGui::GetTextLineHeightWithSpacing() * 2.2f;
@@ -480,6 +482,9 @@ void SaveListBox() {
     if (list_confirm >= 0) {
         ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.35f, 1.0f),
                            "Apagar este save?   Enter / X (A): sim    Esc / O (B): nao");
+    } else if (list_first_deletable >= static_cast<int>(list_items.size())) { // sotc: YES/NO
+        ImGui::TextDisabled("Setas / direcional: escolher    Enter / X (A): confirmar    "
+                            "Esc / O (B): nao");
     } else {
         ImGui::TextDisabled("Setas / direcional: escolher    Enter / X (A): confirmar    "
                             "Esc / O (B): voltar    Del / Triangulo (Y): apagar");

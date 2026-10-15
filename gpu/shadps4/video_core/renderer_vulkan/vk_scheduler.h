@@ -460,7 +460,11 @@ public:
     /// Will be run when submitting or calling PopPendingOperations.
     void DeferOperation(Common::UniqueFunction<void>&& func) {
         std::unique_lock lk(pending_ops_mutex);
-        pending_ops.emplace(std::move(func), CurrentTick());
+        const u64 tick = CurrentTick();
+        if (pending_ops.empty()) {
+            pending_front_tick.store(tick, std::memory_order_release);
+        }
+        pending_ops.emplace(std::move(func), tick);
     }
 
     /// Defers an operation until the gpu has reached the current cpu tick.
@@ -505,6 +509,9 @@ private:
     };
     std::queue<PendingOp> pending_ops;
     std::recursive_mutex pending_ops_mutex;
+    // sotc: tick of the front pending op (UINT64_MAX when none), kept under pending_ops_mutex and
+    // read without it by PopPendingOperations' early-out (SOTC_POP_FAST=0 disables).
+    std::atomic<u64> pending_front_tick{UINT64_MAX};
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;

@@ -89,6 +89,13 @@ struct ImageInfo {
 
     VAddr stencil_addr{};
     u32 stencil_size{};
+
+    // sotc: residency hints of the T# this image was created from, telemetry only (the census in
+    // TextureCache::Census): the first mip a view can sample (base_level, or min_lod if higher)
+    // and whether the T# takes part in the hardware LOD streaming counters. 0 for render targets.
+    u8 sotc_reach_mip{};
+    u8 sotc_minlod_mip{};
+    bool sotc_streamed{};
 };
 
 } // namespace VideoCore

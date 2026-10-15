@@ -21,6 +21,25 @@ static constexpr u32 PipelineKeyVersion = 3u;
 
 namespace Vulkan {
 
+namespace {
+// sotc: where the boot-time preload spends its time (logged with "Preloaded N pipelines").
+struct WarmUpTimes {
+    std::chrono::steady_clock::duration load{}, modules{}, pipelines{};
+} warmup_times;
+
+struct WarmUpTimer {
+    std::chrono::steady_clock::duration& total;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~WarmUpTimer() {
+        total += std::chrono::steady_clock::now() - start;
+    }
+};
+
+long long Ms(std::chrono::steady_clock::duration d) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(d).count();
+}
+} // namespace
+
 void RegisterPipelineData(const ComputePipelineKey& key,
                           ComputePipeline::SerializationSupport& sdata) {
     if (!Storage::DataBase::Instance().IsOpened()) {
@@ -165,9 +184,12 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     ASSERT(is_new);
 
-    it.value() =
-        std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile, *pipeline_cache,
-                                          compute_key, *infos[0], modules[0], sdata, true);
+    {
+        WarmUpTimer timer{warmup_times.pipelines};
+        it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
+                                                       *pipeline_cache, compute_key, *infos[0],
+                                                       modules[0], sdata, true);
+    }
 
     infos.fill(nullptr);
     modules.fill(nullptr);
@@ -245,9 +267,12 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     ASSERT(is_new);
 
-    it.value() = std::make_unique<GraphicsPipeline>(
-        instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-        runtime_infos, fetch_shader, modules, sdata, true);
+    {
+        WarmUpTimer timer{warmup_times.pipelines};
+        it.value() = std::make_unique<GraphicsPipeline>(
+            instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
+            runtime_infos, fetch_shader, modules, sdata, true);
+    }
 
     infos.fill(nullptr);
     modules.fill(nullptr);
@@ -266,9 +291,12 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     }
 
     std::vector<u32> spv{};
-    Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary,
-                                       fmt::format("{:#018x}_{}", program->info.pgm_hash, perm_idx),
-                                       spv);
+    {
+        WarmUpTimer timer{warmup_times.load};
+        Storage::DataBase::Instance().Load(
+            Storage::BlobType::ShaderBinary,
+            fmt::format("{:#018x}_{}", program->info.pgm_hash, perm_idx), spv);
+    }
     if (spv.empty()) {
         return false;
     }
@@ -290,7 +318,10 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
 
     auto [it_pgm, new_program] = program_cache.try_emplace(program->info.pgm_hash);
     if (new_program) {
-        module = CompileSPV(spv, instance.GetDevice());
+        {
+            WarmUpTimer timer{warmup_times.modules};
+            module = CompileSPV(spv, instance.GetDevice());
+        }
         it_pgm.value() = std::move(program);
     } else {
         const auto& it = std::ranges::find(it_pgm.value()->modules, spec, &Program::Module::spec);
@@ -308,6 +339,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
             }
             module = it->module;
         } else {
+            WarmUpTimer timer{warmup_times.modules};
             module = CompileSPV(spv, instance.GetDevice());
         }
     }
@@ -343,20 +375,21 @@ void PipelineCache::WarmUp() {
                                            std::move(profile_data));
         return;
     }
-    if (profile_data.size() != sizeof(Shader::Profile)) {
-        LOG_WARNING(Render,
-                    "Pipeline cache profile has unexpected size ({} != {}). Ignoring the cache",
-                    profile_data.size(), sizeof(Shader::Profile));
-        Storage::DataBase::Instance().Close();
-        return;
-    }
-
     Shader::Profile cached_profile{};
-    std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
-    if (cached_profile != profile) {
-        LOG_WARNING(Render,
-                    "Pipeline cache isn't compatible with current system. Ignoring the cache");
-        Storage::DataBase::Instance().Close();
+    if (profile_data.size() == sizeof(Shader::Profile)) {
+        std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
+    }
+    if (profile_data.size() != sizeof(Shader::Profile) || cached_profile != profile) {
+        // sotc: upstream closed the cache for the session here, so it was never rewritten and
+        // every later session compiled every shader again (stutters in each new area; bbport
+        // had fixed this). Start a fresh cache for this build and GPU instead.
+        LOG_WARNING(Render, "Pipeline cache isn't compatible with current system: rebuilding it");
+        Storage::DataBase::Instance().Clear();
+        Storage::DataBase::Instance().FinishPreload();
+        profile_data.resize(sizeof(profile));
+        std::memcpy(profile_data.data(), &profile, sizeof(profile));
+        Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
+                                           std::move(profile_data));
         return;
     }
 
@@ -399,10 +432,11 @@ void PipelineCache::WarmUp() {
             }
         });
 
-    LOG_INFO(Render, "Preloaded {} pipelines in {} ms", num_pipelines,
-             std::chrono::duration_cast<std::chrono::milliseconds>(
-                 std::chrono::steady_clock::now() - warmup_start)
-                 .count());
+    LOG_INFO(Render,
+             "Preloaded {} pipelines in {} ms (SPIR-V reads {} ms, shader modules {} ms, "
+             "pipeline creation {} ms)",
+             num_pipelines, Ms(std::chrono::steady_clock::now() - warmup_start),
+             Ms(warmup_times.load), Ms(warmup_times.modules), Ms(warmup_times.pipelines));
     if (num_total_pipelines > num_pipelines) {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total_pipelines - num_pipelines);

@@ -47,6 +47,7 @@ typedef struct GuestThread {
     char name[32];
     int detached, finished, joined, host_owned;
 #ifdef _WIN32
+    void *os_handle; /* sotc: set by the thread itself under `lock` (runtime_thread_suspend_others) */
     bb_jmp_buf exit_jump; /* no SEH unwinding through guest frames */
 #else
     jmp_buf exit_jump;
@@ -58,6 +59,34 @@ static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 static ThreadAttr *attributes;
 static GuestThread *threads;
 static _Thread_local GuestThread *current;
+#ifdef _WIN32
+/* sotc: stops every other guest thread (returns once each one is really stopped) while the memory
+ * runtime unmaps and maps again live views of guest memory (runtime_memory.c carve_host): a guest
+ * thread touching the view meanwhile, its own fiber stack included, would fault where Windows
+ * cannot even push the exception frame, and the process died silently at startup. Called under
+ * the memory runtime's write lock. `lock` stays held until runtime_thread_resume: a thread that is
+ * starting blocks in host_start before running guest code. Only OS handles the threads opened
+ * themselves are used (no winpthreads call while others are stopped: one may hold its lock). */
+size_t runtime_thread_suspend_others(void **out, size_t capacity) {
+    size_t n=0;
+    pthread_mutex_lock(&lock);
+    for (GuestThread *t=threads; t && n<capacity; t=t->next) {
+        if (t==current || t->finished || !t->os_handle) continue;
+        HANDLE h=t->os_handle;
+        if (SuspendThread(h)==(DWORD)-1) continue;
+        CONTEXT c;
+        c.ContextFlags=CONTEXT_CONTROL;
+        GetThreadContext(h,&c); /* returns once the thread is really stopped */
+        out[n++]=h;
+    }
+    return n;
+}
+/* Resumes what runtime_thread_suspend_others stopped and releases `lock` (always call it). */
+void runtime_thread_resume(void **handles, size_t n) {
+    for (size_t i=0;i<n;++i) ResumeThread(handles[i]);
+    pthread_mutex_unlock(&lock);
+}
+#endif
 /* sotc: true on threads that run guest code (created by the guest, or the main thread). */
 int runtime_thread_is_guest(void) { return current!=NULL; }
 static _Thread_local int32_t guest_errno;
@@ -261,6 +290,14 @@ static void set_host_name(const char *name) {
 #endif
 static void *host_start(void *p) {
     GuestThread *t=p;
+#ifdef _WIN32
+    /* sotc: an OS handle for runtime_thread_suspend_others, published under `lock`; taking `lock`
+     * also waits out a live view split in progress before any guest code runs. */
+    pthread_mutex_lock(&lock);
+    t->os_handle=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT|THREAD_QUERY_INFORMATION,FALSE,
+                            GetCurrentThreadId());
+    pthread_mutex_unlock(&lock);
+#endif
     attach(t);
     set_host_name(t->name);
 #ifdef _WIN32
@@ -269,7 +306,12 @@ static void *host_start(void *p) {
 #endif
     if (!exit_setjmp(t)) t->result=t->entry(t->argument);
     runtime_thread_keys_cleanup();
-    pthread_mutex_lock(&lock); t->finished=1; ++exited; pthread_mutex_unlock(&lock);
+    pthread_mutex_lock(&lock);
+    t->finished=1; ++exited;
+#ifdef _WIN32
+    if (t->os_handle) { CloseHandle(t->os_handle); t->os_handle=NULL; }
+#endif
+    pthread_mutex_unlock(&lock);
     return t->result;
 }
 static int32_t create(GuestThread **out,ThreadAttr **attr_slot,GuestEntry entry,void *argument,const char *name) {

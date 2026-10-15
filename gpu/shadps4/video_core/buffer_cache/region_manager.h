@@ -3,6 +3,11 @@
 
 #pragma once
 
+#include <algorithm>
+#include <atomic>
+#include <bit>
+#include <chrono>
+#include <cstdlib>
 #include <utility>
 
 #include "common/adaptive_mutex.h"
@@ -10,8 +15,50 @@
 #include "core/emulator_settings.h"
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/page_manager.h"
+#include "video_core/sotc_stats.h"
 
 namespace VideoCore {
+
+/// sotc: repeat-fault grace. The GPU command thread clears a page's CPU bit and write-protects it
+/// again right after uploading it (every DMA draw syncs every resident range), so a guest writing
+/// that page could fault again and again before its instruction completed (thousands of times per
+/// boot, and the startup deaths came out of such storms). A page with a second guest write fault
+/// within 1-2 quanta is "hot" for 1-2 quanta: syncs still collect and upload it but leave its CPU
+/// bit set, so it is not protected again and the write goes through. Nothing CPU-written is ever
+/// hidden from the GPU. SOTC_FAULT_GRACE=0 turns it off.
+struct FaultGrace {
+    static u32 Pages() { // hot pages allowed per quantum, all regions together (0 = off)
+        static const u32 v = [] {
+            const char* e = std::getenv("SOTC_FAULT_GRACE");
+            if (e && e[0] == '0') {
+                return 0u;
+            }
+            const char* p = std::getenv("SOTC_FAULT_GRACE_PAGES");
+            return p ? static_cast<u32>(std::strtoul(p, nullptr, 10)) : 32u;
+        }();
+        return v;
+    }
+    static u32 Now() { // the current quantum (SOTC_FAULT_GRACE_US, default 1000)
+        static const u64 us = [] {
+            const char* e = std::getenv("SOTC_FAULT_GRACE_US");
+            return std::clamp<u64>(e ? std::strtoull(e, nullptr, 10) : 1000ULL, 100, 100000);
+        }();
+        return static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count() /
+                                us);
+    }
+    inline static std::atomic<u32> budget_epoch{0};
+    inline static std::atomic<u32> budget_used{0};
+    static bool TakeBudget(u32 now) { // approximate under races, which is fine for a cap
+        u32 epoch = budget_epoch.load(std::memory_order_relaxed);
+        if (epoch != now &&
+            budget_epoch.compare_exchange_strong(epoch, now, std::memory_order_relaxed)) {
+            budget_used.store(0, std::memory_order_relaxed);
+        }
+        return budget_used.fetch_add(1, std::memory_order_relaxed) < Pages();
+    }
+};
 
 #ifdef PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
 using LockType = Common::AdaptiveMutex;
@@ -30,11 +77,43 @@ public:
           readbacks_mode{EmulatorSettings.GetReadbacksMode()} {
         cpu.Fill(~0ULL);
         gpu.Fill(0ULL);
+        ResetGrace();
     }
     explicit RegionManager() = default;
 
     void SetCpuAddress(VAddr new_cpu_addr) {
         cpu_addr = new_cpu_addr;
+        ResetGrace();
+    }
+
+    /// sotc: a guest write fault on the page at offset (region mutex held, from
+    /// MemoryTracker::InvalidateRegion). The second one within 1-2 quanta makes the page hot.
+    void NoteGuestWriteFaultLocked(u64 offset) {
+        if (FaultGrace::Pages() == 0) {
+            return;
+        }
+        const u64 page = offset / BYTES_PER_PAGE;
+        const u64 index = page / PAGES_PER_WORD;
+        const u64 bit = 1ULL << (page % PAGES_PER_WORD);
+        const u32 now = FaultGrace::Now();
+        if (grace_any) {
+            RotateGraceLocked(now);
+        }
+        if (!grace_any) {
+            grace_epoch = now;
+            grace_any = true;
+        }
+        const bool repeat = ((fault_cur[index] | fault_prev[index]) & bit) != 0;
+        fault_cur[index] |= bit;
+        if (!repeat || ((hot_cur[index] | hot_prev[index]) & bit) != 0) {
+            return;
+        }
+        if (FaultGrace::TakeBudget(now)) {
+            hot_cur[index] |= bit;
+            SotcStats::fault_grace_marks.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            SotcStats::fault_grace_cap_hits.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     static constexpr Bounds GetBounds(u64 offset, u64 size) {
@@ -136,10 +215,30 @@ public:
         if constexpr (locked) {
             mutex.lock();
         }
+        // sotc: uploads (<CPU, Clear, None>) keep the CPU bit of hot pages (FaultGrace). Never for
+        // written bindings (<CPU, Clear, Set>): keeping the bit there would upload CPU data over
+        // GPU results later.
+        constexpr bool grace_op =
+            type == Type::CPU && cpu_op == StateOp::Clear && gpu_op == StateOp::None;
+        if constexpr (grace_op) {
+            if (grace_any) {
+                RotateGraceLocked(FaultGrace::Now());
+            }
+        }
         IterateWords(bounds, [&](u64 index, u64 mask) {
             const u64 base_page = index * PAGES_PER_WORD;
-            const u64 word = state[index] & mask;
-            UpdateStateAndProtection<cpu_op, gpu_op>(write_prot, read_prot, index, mask);
+            const u64 word = state[index] & mask; // collected before the change: hot pages too
+            u64 keep = 0;
+            if constexpr (grace_op) {
+                if (grace_any) {
+                    keep = (hot_cur[index] | hot_prev[index]) & word;
+                    if (keep) {
+                        SotcStats::fault_grace_hot_upload_bytes.fetch_add(
+                            std::popcount(keep) * BYTES_PER_PAGE, std::memory_order_relaxed);
+                    }
+                }
+            }
+            UpdateStateAndProtection<cpu_op, gpu_op>(write_prot, read_prot, index, mask, keep);
             IteratePages(word, [&](u64 pages_offset, u64 pages_size) {
                 if (end_page == base_page + pages_offset) {
                     end_page += pages_size;
@@ -198,13 +297,42 @@ public:
     }
 
 private:
+    void ResetGrace() {
+        fault_cur.Fill(0);
+        fault_prev.Fill(0);
+        hot_cur.Fill(0);
+        hot_prev.Fill(0);
+        grace_epoch = 0;
+        grace_any = false;
+    }
+
+    /// Ages the grace bits to the quantum `now` (region mutex held). Invariant: !grace_any means
+    /// every grace bit is 0.
+    void RotateGraceLocked(u32 now) {
+        if (!grace_any || now == grace_epoch) {
+            return;
+        }
+        const bool adjacent = now - grace_epoch == 1;
+        if (adjacent) {
+            fault_prev = fault_cur;
+            hot_prev = hot_cur;
+        } else {
+            fault_prev.Fill(0);
+            hot_prev.Fill(0);
+        }
+        fault_cur.Fill(0);
+        hot_cur.Fill(0);
+        grace_any = adjacent;
+        grace_epoch = now;
+    }
+
     template <StateOp cpu_op, StateOp gpu_op>
     void UpdateStateAndProtection(RegionBits& write_prot, RegionBits& read_prot, u64 index,
-                                  u64 mask) {
+                                  u64 mask, u64 keep = 0) {
         if constexpr (cpu_op != StateOp::None) {
             const u64 prev = cpu[index];
             if constexpr (cpu_op == StateOp::Clear) {
-                cpu[index] &= ~mask;
+                cpu[index] &= ~(mask & ~keep); // kept bits: no change, so no write Track
             } else {
                 cpu[index] |= mask;
             }
@@ -290,6 +418,13 @@ private:
     u32 readbacks_mode;
     RegionBits cpu;
     RegionBits gpu;
+    // sotc: FaultGrace state (two rotating quanta).
+    RegionBits fault_cur;
+    RegionBits fault_prev;
+    RegionBits hot_cur;
+    RegionBits hot_prev;
+    u32 grace_epoch{};
+    bool grace_any{false};
     LockType mutex;
 };
 

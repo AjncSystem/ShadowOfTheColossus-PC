@@ -115,12 +115,16 @@ void BufferCache::TickFrame() {
     }
 }
 
-void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
+void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks,
+                                   bool guest_fault) {
     Core::MemoryManager::NoteHostWrite(device_addr, size, 9,
                                        reinterpret_cast<u64>(__builtin_return_address(0)));
-    memory_tracker->InvalidateRegion(device_addr, size, [this, device_addr, size, assume_locks] {
-        ReadMemory(device_addr, size, true, assume_locks);
-    });
+    memory_tracker->InvalidateRegion(
+        device_addr, size,
+        [this, device_addr, size, assume_locks] {
+            ReadMemory(device_addr, size, true, assume_locks);
+        },
+        guest_fault);
 }
 
 void BufferCache::DropGpuModified(VAddr device_addr, u64 size) {

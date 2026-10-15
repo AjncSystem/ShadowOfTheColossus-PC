@@ -80,7 +80,8 @@ public:
     void TickFrame();
 
     /// Invalidates any buffer in the logical page range.
-    void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false);
+    void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false,
+                          bool guest_fault = false);
 
     /// sotc: forgets that the GPU wrote this range, without downloading it (unmap test).
     void DropGpuModified(VAddr device_addr, u64 size);

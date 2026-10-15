@@ -25,6 +25,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/buffer_cache/region_manager.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -1731,6 +1732,23 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     }
     buffer_cache.InvalidateMemory(addr, size, assume_locks);
     texture_cache.InvalidateMemory(addr, size);
+    return true;
+}
+
+// sotc: a guest (not command processor) write fault. With the repeat-fault grace on, the texture
+// cache goes first so the page becomes writable last, after any wait on the texture mutex (the GPU
+// thread then has less time to protect it again before the guest retries its write).
+bool Rasterizer::InvalidateMemoryOnGuestFault(VAddr addr, u64 size) {
+    if (!IsMapped(addr, size)) {
+        return false;
+    }
+    if (VideoCore::FaultGrace::Pages() != 0) {
+        texture_cache.InvalidateMemory(addr, size);
+        buffer_cache.InvalidateMemory(addr, size, false, true);
+    } else {
+        buffer_cache.InvalidateMemory(addr, size, false);
+        texture_cache.InvalidateMemory(addr, size);
+    }
     return true;
 }
 

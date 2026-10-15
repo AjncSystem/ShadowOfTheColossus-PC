@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include "common/alignment.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -101,6 +103,12 @@ Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
     memory_barrier.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
     memory_barrier.dstAccessMask =
         vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+    const auto off = [](const char* name) {
+        const char* v = std::getenv(name);
+        return v && v[0] == '0';
+    };
+    access_reuse = !off("SOTC_ACCESS_REUSE");
+    access_union = !off("SOTC_ACCESS_UNION");
 }
 
 void Runtime::TickFrame() {
@@ -450,9 +458,22 @@ void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
             CopyImage(src, dst);
         } else {
             // Perform depth from/to color copy using the intermediate copy buffer.
-            static constexpr size_t COPY_BUFFER_SIZE = 128_MB;
+            // sotc: sized to the copy (was a fixed 128 MiB of video memory, ~8 MiB needed for a
+            // 1080p depth buffer). CopyImageWithBuffer writes level 0 of every source layer with
+            // the source format and reads the same region back with the destination format.
+            // At least 17 MiB: above the staging ring's 16 MiB blocks the request keeps getting a
+            // dedicated, tick-synchronized buffer as before, not a ring slice that unsynchronized
+            // ring users (the tiler) could reuse while this copy is in flight.
+            const vk::BufferImageCopy probe = {
+                .imageSubresource{.layerCount = src->info.resources.layers},
+                .imageExtent = {src->info.size.width, src->info.size.height, src->info.size.depth},
+            };
+            const u64 copy_buffer_size = Common::AlignUp(
+                std::max<u64>({BufferImageCopySize(probe, src->info.pixel_format),
+                               BufferImageCopySize(probe, dst->info.pixel_format), 17_MB}),
+                u64{256});
             const auto copy_ref =
-                staging_pool.Request(COPY_BUFFER_SIZE, VideoCore::MemoryType::DeviceLocal);
+                staging_pool.Request(copy_buffer_size, VideoCore::MemoryType::DeviceLocal);
             CopyImageWithBuffer(src, dst, copy_ref.buffer, copy_ref.offset);
         }
     } else if (src->info.num_samples == 1 && dst->info.num_samples > 1 &&
@@ -719,10 +740,18 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
 
     if (src_access & WRITE_MASK) {
-        resource->write_ranges.Add(range);
+        if (access_union) {
+            resource->write_ranges.AddUnion(range);
+        } else {
+            resource->write_ranges.Add(range);
+        }
     }
     if (src_access & READ_MASK) {
-        resource->read_ranges.Add(range);
+        if (access_union) {
+            resource->read_ranges.AddUnion(range);
+        } else {
+            resource->read_ranges.Add(range);
+        }
     }
 
     memory_barrier.srcStageMask |= src_stage;
@@ -753,11 +782,15 @@ void Runtime::FlushBarriers() {
     memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;
 
     image_barriers.clear();
-    for (auto& resource : resources) {
-        resource.read_ranges.Clear();
-        resource.write_ranges.Clear();
+    for (std::size_t i = 0; i < active_resources; ++i) {
+        resources[i].read_ranges.Clear();
+        resources[i].write_ranges.Clear();
+        resources[i].handle = nullptr;
     }
-    resources.clear();
+    if (!access_reuse) {
+        resources.clear();
+    }
+    active_resources = 0;
     resource = nullptr;
 }
 
@@ -765,12 +798,21 @@ void Runtime::MakeCurrent(const VideoCore::Buffer* handle) {
     if (resource && resource->handle == handle) {
         return;
     }
-    auto it = std::ranges::find(resources, handle, &BufferBarriers::handle);
-    if (it != resources.end()) {
+    const auto live_end = resources.begin() + static_cast<std::ptrdiff_t>(active_resources);
+    auto it = std::find_if(resources.begin(), live_end,
+                           [handle](const BufferBarriers& b) { return b.handle == handle; });
+    if (it != live_end) {
         resource = std::addressof(*it);
         return;
     }
+    if (active_resources < resources.size()) {
+        // A slot kept from before the last barrier: lists empty, capacity kept.
+        resource = &resources[active_resources++];
+        resource->handle = handle;
+        return;
+    }
     resource = &resources.emplace_back(handle);
+    ++active_resources;
 }
 
 } // namespace Vulkan

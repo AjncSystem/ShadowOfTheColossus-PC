@@ -115,12 +115,16 @@ void BufferCache::TickFrame() {
     }
 }
 
-void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
+void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks,
+                                   bool guest_fault) {
     Core::MemoryManager::NoteHostWrite(device_addr, size, 9,
                                        reinterpret_cast<u64>(__builtin_return_address(0)));
-    memory_tracker->InvalidateRegion(device_addr, size, [this, device_addr, size, assume_locks] {
-        ReadMemory(device_addr, size, true, assume_locks);
-    });
+    memory_tracker->InvalidateRegion(
+        device_addr, size,
+        [this, device_addr, size, assume_locks] {
+            ReadMemory(device_addr, size, true, assume_locks);
+        },
+        guest_fault);
 }
 
 void BufferCache::DropGpuModified(VAddr device_addr, u64 size) {
@@ -591,8 +595,10 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const u64 last_block = (device_addr + size - 1) >> block_shift;
     const auto* arena = GetArena(first_block, last_block);
     EnsureResident(arena, first_block, last_block);
+    // SynchronizeMemory also syncs read-only texel buffers from an aliasing image (sotc: a second
+    // SynchronizeMemoryFromImage call here repeated that work, re-tiling the image twice).
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
-    if (is_texel_buffer && !is_written) {
+    if (SotcStats::OptOff() && is_texel_buffer && !is_written) {
         SynchronizeMemoryFromImage(arena, device_addr, size);
     }
     if (is_written) {
@@ -633,8 +639,15 @@ void BufferCache::AddGpuModified(VAddr addr, u64 size) {
                          static_cast<unsigned long long>(SotcStats::current_program.load()));
         }
     }
-    gpu_modified_ranges.Add(addr, size);
-    if (!clean_pages_used || size == 0) {
+    // sotc: gpu_modified_ranges only grows here (every other use subtracts), and the clean page
+    // cache below only has to drop pages whose GPU-written hull grew: when the range was already
+    // contained, no page can have become dirty. SOTC_GPUMOD_NOGROW_SKIP=0 always scans.
+    static const bool nogrow_skip = [] {
+        const char* v = std::getenv("SOTC_GPUMOD_NOGROW_SKIP");
+        return !v || v[0] != '0';
+    }();
+    const bool grew = gpu_modified_ranges.Add(addr, size);
+    if (!clean_pages_used || size == 0 || (!grew && nogrow_skip)) {
         return;
     }
     // The GPU-written hull of these pages grows: drop them from the clean page cache.
@@ -774,11 +787,68 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
 
 void BufferCache::SynchronizeDmaBuffers() {
     fault_process_pending = true;
-    for (const auto& range : resident_ranges) {
-        const u64 page = range.start >> (ARENA_PAGE_BITS - block_shift);
-        const VAddr device_addr = range.start << block_shift;
-        const u64 size = (range.end - range.start) << block_shift;
-        SynchronizeMemory(address_space[page], device_addr, size, false, false);
+    const u64 uploads_before = SotcStats::uploads.load(std::memory_order_relaxed);
+    u64 ranges = 0;
+    // sotc (SOTC_DMA_MERGE=0 disables): the sweep visited ~1200 resident ranges ~100 times a
+    // second, one tracker walk + staging request each. Touching ranges whose start maps to the
+    // same arena are merged into runs (one SynchronizeMemory per run), rebuilt only when
+    // resident_ranges or the arena set changed. Same pages are uploaded into the same arena,
+    // just batched. A run is capped (SOTC_DMA_MERGE_MAX MiB, default 16 = staging ring block,
+    // max 64) so merging never pushes an upload to RequestLarge; a single range larger than the
+    // cap stays one run as before. Runs hold addresses only; the arena is looked up per run at
+    // sync time (a migration merges arenas, so entries sharing one keep sharing one).
+    static const bool dma_merge = [] {
+        const char* v = std::getenv("SOTC_DMA_MERGE");
+        return !(v && v[0] == '0');
+    }();
+    static const u64 dma_merge_max = [] {
+        const char* v = std::getenv("SOTC_DMA_MERGE_MAX");
+        const u64 mib = v ? std::strtoull(v, nullptr, 10) : 0;
+        return std::clamp<u64>(mib ? mib : 16, 1, 64) << 20;
+    }();
+    if (dma_merge) {
+        if (dma_runs_version != resident_version || dma_runs_arenas != arenas.size()) {
+            dma_runs_version = resident_version;
+            dma_runs_arenas = arenas.size();
+            dma_runs_ranges = resident_ranges.Size();
+            dma_runs.clear();
+            for (const auto& range : resident_ranges) {
+                const VAddr device_addr = range.start << block_shift;
+                const u64 size = (range.end - range.start) << block_shift;
+                if (!dma_runs.empty()) {
+                    auto& run = dma_runs.back();
+                    if (run.first + run.second == device_addr &&
+                        run.second + size <= dma_merge_max &&
+                        address_space[run.first >> ARENA_PAGE_BITS] ==
+                            address_space[device_addr >> ARENA_PAGE_BITS]) {
+                        run.second += size;
+                        continue;
+                    }
+                }
+                dma_runs.emplace_back(device_addr, size);
+            }
+        }
+        // sotc: by index with a copied entry, re-reading size(): nothing nested in
+        // SynchronizeMemory may invalidate the iteration even if it touched dma_runs.
+        for (size_t i = 0; i < dma_runs.size(); ++i) {
+            const auto [device_addr, size] = dma_runs[i];
+            SynchronizeMemory(address_space[device_addr >> ARENA_PAGE_BITS], device_addr,
+                              static_cast<u32>(size), false, false);
+        }
+        ranges = dma_runs_ranges;
+    } else {
+        for (const auto& range : resident_ranges) {
+            const u64 page = range.start >> (ARENA_PAGE_BITS - block_shift);
+            const VAddr device_addr = range.start << block_shift;
+            const u64 size = (range.end - range.start) << block_shift;
+            SynchronizeMemory(address_space[page], device_addr, size, false, false);
+            ++ranges;
+        }
+    }
+    SotcStats::dma_sweeps.fetch_add(1, std::memory_order_relaxed);
+    SotcStats::dma_sweep_ranges.fetch_add(ranges, std::memory_order_relaxed);
+    if (SotcStats::uploads.load(std::memory_order_relaxed) != uploads_before) {
+        SotcStats::dma_sweep_uploading.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -865,11 +935,24 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         alloc_result = retry.result;
         device_memory = retry.value;
     }
-    if (alloc_result == vk::Result::eErrorOutOfDeviceMemory) {
-        // Video memory is full (sparse arenas cannot use system memory). Drop old cached images,
-        // wait for the GPU so their memory is really released, and try once more.
-        LOG_WARNING(Render, "Video memory exhausted, collecting cached images");
-        texture_cache.EmergencyCollect();
+    // Video memory is full (sparse arenas cannot use system memory on NVIDIA). Drop cached
+    // images, wait for the GPU so their memory is really released, and try again. sotc: one
+    // shallow round was not enough on 6 GB cards (abort after ~15 min in the open world), so
+    // each further round collects deeper before giving up.
+    bool collect_deferred = false;
+    for (u32 level = 0; alloc_result == vk::Result::eErrorOutOfDeviceMemory && level < 3; ++level) {
+        LOG_WARNING(Render, "Video memory exhausted ({} MiB requested), collecting cached images",
+                    alloc_info.allocationSize >> 20);
+        if (!texture_cache.TryEmergencyCollect(level)) {
+            // Reached from RefreshImage under the texture cache lock: the collection runs at the
+            // next submit. One more try now (memory freed meanwhile by other threads or the GC).
+            collect_deferred = true;
+            alloc_info.memoryTypeIndex = arena_memory_type_index;
+            const auto retry = instance.GetDevice().allocateMemory(alloc_info);
+            alloc_result = retry.result;
+            device_memory = retry.value;
+            break;
+        }
         scheduler.Finish();
         scheduler.PopPendingOperations();
         alloc_info.memoryTypeIndex = arena_memory_type_index;
@@ -877,8 +960,10 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         alloc_result = retry.result;
         device_memory = retry.value;
     }
-    ASSERT_MSG(alloc_result == vk::Result::eSuccess, "Failed to allocate buffer arena memory: {}",
-               vk::to_string(alloc_result));
+    ASSERT_MSG(alloc_result == vk::Result::eSuccess, "Failed to allocate buffer arena memory: {}{}",
+               vk::to_string(alloc_result),
+               collect_deferred ? " (collection deferred: texture cache lock held)" : "");
+    SotcStats::arena_bytes.fetch_add(alloc_info.allocationSize, std::memory_order_relaxed);
 
     boost::container::small_vector<vk::BufferCopy, 8> copies;
     const auto staging =
@@ -897,6 +982,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         backing.memory = device_memory;
         backing.offset = memory_offset >> block_shift;
         resident_ranges.Add(backing);
+        ++resident_version; // sotc: invalidates the merged DMA runs
 
         LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
 
@@ -930,7 +1016,9 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     });
     if (!copies.empty()) {
         SotcStats::uploads.fetch_add(1, std::memory_order_relaxed);
-        SotcStats::upload_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
+        if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer
+            SotcStats::upload_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
+        }
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
         for (auto& copy : copies) {
             memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);
@@ -950,12 +1038,17 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
 }
 
 bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size) {
-    // Either path below writes the arena range from the GPU.
-    RecordCurrentWrite(device_addr, size);
+    // sotc: a current write is recorded only on the two paths that write the arena range. Recording
+    // it unconditionally marked unwritten ranges as written by the command buffer being recorded,
+    // which sent their readbacks to the slower flushing path instead of the ahead path.
+    if (SotcStats::OptOff()) {
+        RecordCurrentWrite(device_addr, size);
+    }
     if (auto type = texture_cache.IsMeta(device_addr)) {
         if (*type == TextureCache::MetaType::HTile) {
             static constexpr u32 ZmaskUncompressed = 0xf;
             runtime.FillBuffer(arena, arena->Offset(device_addr), size, ZmaskUncompressed);
+            RecordCurrentWrite(device_addr, size);
             return true;
         } else {
             LOG_WARNING(Render_Vulkan, "Unhandled metadata type {}", magic_enum::enum_name(*type));
@@ -998,6 +1091,7 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
     }
     auto& tile_manager = texture_cache.GetTileManager();
     tile_manager.TileImage(image, buffer_copies, arena, arena_offset);
+    RecordCurrentWrite(device_addr, size);
     return true;
 }
 
@@ -1060,6 +1154,7 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
                (first_block << block_shift) < hot.addr + hot.size;
     });
     resident_ranges.Subtract(first_block, end_block);
+    ++resident_version; // sotc: invalidates the merged DMA runs
     gpu_modified_ranges.Subtract(first_block << block_shift,
                                  (end_block - first_block) << block_shift);
 }

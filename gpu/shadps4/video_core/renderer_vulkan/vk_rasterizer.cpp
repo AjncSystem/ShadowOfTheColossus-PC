@@ -25,6 +25,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/buffer_cache/region_manager.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -205,7 +206,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const auto& regs = liverpool->regs;
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
     SotcStats::current_program.store(1, std::memory_order_relaxed);
-    SotcStats::cmd_kinds[0].fetch_add(1, std::memory_order_relaxed);
+    if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer (sotc_stats.h)
+        SotcStats::cmd_kinds[0].fetch_add(1, std::memory_order_relaxed);
+    }
     if (!pipeline) {
         SotcStats::Drop(0, regs.color_buffers[0].Address(), regs.stage_enable.raw);
         return;
@@ -262,8 +265,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
 
-    static const bool cmd_stats = std::getenv("SOTC_CMD_STATS") != nullptr;
-    if (cmd_stats) {
+    if (SotcStats::kCmdStats) { // sotc: the shared SOTC_CMD_STATS switch (sotc_stats.h)
         const u64 args_size = u64{stride} * max_count;
         if (buffer_cache.IsRegionGpuModified(arg_address + offset, args_size) ||
             (count_address && buffer_cache.IsRegionGpuModified(count_address, 4))) {
@@ -432,7 +434,9 @@ void Rasterizer::DispatchDirect() {
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     SotcStats::current_program.store(cs.pgm_hash, std::memory_order_relaxed);
-    SotcStats::cmd_kinds[4].fetch_add(1, std::memory_order_relaxed);
+    if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer (sotc_stats.h)
+        SotcStats::cmd_kinds[4].fetch_add(1, std::memory_order_relaxed);
+    }
     // sotc: SOTC_CS_TRACE=<hash>: the buffers of the first 6 dispatches of that compute shader,
     // with the first dwords guest memory holds there (diagnostic for the GPU particle counts).
     static const u64 cs_trace = [] {
@@ -534,7 +538,9 @@ void Rasterizer::DispatchDirect() {
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
-    SotcStats::cmd_kinds[5].fetch_add(1, std::memory_order_relaxed);
+    if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer (sotc_stats.h)
+        SotcStats::cmd_kinds[5].fetch_add(1, std::memory_order_relaxed);
+    }
 
     scheduler.PopPendingOperations();
 
@@ -813,7 +819,9 @@ void Rasterizer::FlushPeriodic() {
     // sotc: the command buffer wrote a page the guest reads back: submit it now, the GPU runs
     // it while the guest gets there, and the readback finds it done (or nearly). SOTC_RB_EARLY=1
     // turns it on; measured within noise on the attract demo, so off by default.
-    SotcStats::commands.fetch_add(1, std::memory_order_relaxed);
+    if (SotcStats::kFpsLog) { // sotc: read only by the SOTC_FPS printer (sotc_stats.h)
+        SotcStats::commands.fetch_add(1, std::memory_order_relaxed);
+    }
     static const bool early = [] {
         const char* v = std::getenv("SOTC_RB_EARLY");
         return v && v[0] == '1';
@@ -826,15 +834,18 @@ void Rasterizer::FlushPeriodic() {
     if (every == 0) {
         return;
     }
-    // sotc: submit by recording time instead (SOTC_FLUSH_US, default 500 where the periodic
+    // sotc: submit by recording time instead (SOTC_FLUSH_US, default 1000 where the periodic
     // submit is on and SOTC_FLUSH_EVERY is not set): the GPU gets work at a steady pace whether
     // a scene has few heavy commands or thousands of light ones. Attract demo: +10-15% in most
     // scenes, canyon bridge +2% (count based: 64 helped the first and hurt the second).
+    // 1000 instead of 500 (2026-10-15, RTX 3060 laptop, idle shrine ~5800 draws/frame): about +8%
+    // in a single unpaired run (250: no gain, 2000: same as 1000): fewer submits, each one
+    // cheaper per draw.
     static const u64 flush_us = [] {
         if (const char* v = std::getenv("SOTC_FLUSH_US")) {
             return std::strtoull(v, nullptr, 10);
         }
-        return std::getenv("SOTC_FLUSH_EVERY") ? u64{0} : u64{500};
+        return std::getenv("SOTC_FLUSH_EVERY") ? u64{0} : u64{1000};
     }();
     const u64 tick = scheduler.CurrentTick();
     if (tick != commands_tick) {
@@ -1185,10 +1196,21 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             // (garbage left in the guest's descriptor memory); bind nothing instead of aborting.
             // Large ranges get clamped to the mapped memory at their start (0 if unmapped);
             // written bindings are checked as well, so garbage cannot become GPU-modified memory.
+            // sotc: the clamp alone is 0 exactly when the base is unmapped or reserved (what the
+            // two is-mapped calls checked), so one runtime call per binding instead of three.
+            // SOTC_BIND_CLAMP1=0 restores the three calls.
+            static const bool clamp1 = [] {
+                const char* v = std::getenv("SOTC_BIND_CLAMP1");
+                return !v || v[0] != '0';
+            }();
             u64 size = 0;
-            if (vsharp.base_address != 0 && vsharp.GetSize() != 0 &&
-                memory->IsValidMapping(vsharp.base_address) &&
-                (!desc.is_written || memory->IsMappedAddress(vsharp.base_address))) {
+            if (clamp1) {
+                if (vsharp.base_address != 0 && vsharp.GetSize() != 0) {
+                    size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                }
+            } else if (vsharp.base_address != 0 && vsharp.GetSize() != 0 &&
+                       memory->IsValidMapping(vsharp.base_address) &&
+                       (!desc.is_written || memory->IsMappedAddress(vsharp.base_address))) {
                 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
             }
             if (size == 0) {
@@ -1490,6 +1512,13 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     attachment_feedback_loop = false;
+    // sotc: SOTC_RT_FAST (default on) drops redundant attachment work: FindRenderTarget repeats
+    // UpdateImage only when the image still needs it, and the CMASK/HTILE clear bit is read and
+    // cleared with one lookup. SOTC_RT_FAST=0 restores the original calls and evaluation order.
+    static const bool rt_fast = [] {
+        const char* v = std::getenv("SOTC_RT_FAST");
+        return !v || v[0] != '0';
+    }();
     const auto& regs = liverpool->regs;
     const auto& key = pipeline->GetGraphicsKey();
     RenderState state;
@@ -1510,13 +1539,19 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         }
         texture_cache.UpdateImage(image_id);
         runtime.SetBackingSamples(image, key.color_samples[cb]);
-        const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
+        const auto& image_view = texture_cache.FindRenderTarget(image_id, desc, !rt_fast);
         const auto slice = image_view.info.range.base.layer;
         const auto mip = image_view.info.range.base.level;
 
         const auto& col_buf = regs.color_buffers[cb];
-        const bool is_clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
-        texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
+        // sotc: SOTC_RT_FAST: test-and-clear the CMASK bit with one lookup.
+        bool is_clear;
+        if (rt_fast) {
+            is_clear = texture_cache.TestAndTouchMeta(col_buf.CmaskAddress(), slice);
+        } else {
+            is_clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
+            texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
+        }
 
         if (image->binding.is_bound) {
             ASSERT_MSG(!image->binding.force_general,
@@ -1564,12 +1599,22 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         auto& image = texture_cache.GetImage(image_id);
 
         const auto slice = image_view.info.range.base.layer;
-        const bool is_depth_clear =
-            (regs.depth_render_control.depth_clear_enable && regs.depth_control.depth_enable &&
-             regs.depth_control.depth_write_enable) ||
-            texture_cache.IsMetaCleared(htile_address, slice);
+        const bool depth_reg_clear = regs.depth_render_control.depth_clear_enable &&
+                                     regs.depth_control.depth_enable &&
+                                     regs.depth_control.depth_write_enable;
+        // sotc: SOTC_RT_FAST: test-and-clear the HTILE bit with one lookup. It is evaluated
+        // unconditionally (no short-circuit) because the original TouchMeta always cleared it.
+        bool is_depth_clear;
+        if (rt_fast) {
+            const bool meta_clear = texture_cache.TestAndTouchMeta(htile_address, slice);
+            is_depth_clear = depth_reg_clear || meta_clear;
+        } else {
+            is_depth_clear = depth_reg_clear || texture_cache.IsMetaCleared(htile_address, slice);
+        }
         const bool is_stencil_clear = regs.depth_render_control.stencil_clear_enable;
-        texture_cache.TouchMeta(htile_address, slice, false);
+        if (!rt_fast) {
+            texture_cache.TouchMeta(htile_address, slice, false);
+        }
         ASSERT(desc.view_info.range.extent.levels == 1 && !image.binding.needs_rebind);
 
         const bool has_stencil = image.info.props.has_stencil;
@@ -1731,6 +1776,23 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     }
     buffer_cache.InvalidateMemory(addr, size, assume_locks);
     texture_cache.InvalidateMemory(addr, size);
+    return true;
+}
+
+// sotc: a guest (not command processor) write fault. With the repeat-fault grace on, the texture
+// cache goes first so the page becomes writable last, after any wait on the texture mutex (the GPU
+// thread then has less time to protect it again before the guest retries its write).
+bool Rasterizer::InvalidateMemoryOnGuestFault(VAddr addr, u64 size) {
+    if (!IsMapped(addr, size)) {
+        return false;
+    }
+    if (VideoCore::FaultGrace::Pages() != 0) {
+        texture_cache.InvalidateMemory(addr, size);
+        buffer_cache.InvalidateMemory(addr, size, false, true);
+    } else {
+        buffer_cache.InvalidateMemory(addr, size, false);
+        texture_cache.InvalidateMemory(addr, size);
+    }
     return true;
 }
 

@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <ranges>
 #include "common/assert.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/sotc_stats.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
 
@@ -87,9 +89,7 @@ static vk::FormatFeatureFlags2 FormatFeatureFlags(const vk::ImageUsageFlags usag
 }
 
 UniqueImage::~UniqueImage() {
-    if (image) {
-        vmaDestroyImage(allocator, image, allocation);
-    }
+    Destroy();
 }
 
 void UniqueImage::Destroy() {
@@ -97,6 +97,9 @@ void UniqueImage::Destroy() {
         vmaDestroyImage(allocator, image, allocation);
         image = vk::Image{};
         allocation = {};
+        SotcStats::image_bytes.fetch_sub(size_bytes, std::memory_order_relaxed);
+        SotcStats::image_count.fetch_sub(1, std::memory_order_relaxed);
+        size_bytes = 0;
     }
 }
 
@@ -133,6 +136,8 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
                vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};
     size_bytes = alloc_info.size;
+    SotcStats::image_bytes.fetch_add(size_bytes, std::memory_order_relaxed);
+    SotcStats::image_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
@@ -220,13 +225,30 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
     if (ensure_guest_samples && backing->num_samples > 1 != info.num_samples > 1) {
         runtime->SetBackingSamples(this, info.num_samples);
     }
+    // sotc: consecutive binds of an image mostly ask for the same view: compare against the
+    // view returned last before the linear search. Exact: views are never duplicated or
+    // removed from a backing, so the first match of the search is that same entry
+    // (SOTC_TEX_BIND_P1=0: always search).
+    static const bool last_view_enabled = [] {
+        const char* v = std::getenv("SOTC_TEX_BIND_P1");
+        return !v || v[0] != '0';
+    }();
     const auto& view_infos = backing->image_view_infos;
+    if (last_view_enabled) {
+        const u32 last = backing->last_view;
+        if (last < view_infos.size() && view_infos[last] == view_info) {
+            return (*slot_image_views)[backing->image_view_ids[last]];
+        }
+    }
     const auto it = std::ranges::find(view_infos, view_info);
     if (it != view_infos.end()) {
-        const auto view_id = backing->image_view_ids[std::distance(view_infos.begin(), it)];
+        const auto index = std::distance(view_infos.begin(), it);
+        backing->last_view = static_cast<u32>(index);
+        const auto view_id = backing->image_view_ids[index];
         return (*slot_image_views)[view_id];
     }
     const auto view_id = slot_image_views->insert(runtime->GetInstance(), view_info, *this);
+    backing->last_view = static_cast<u32>(backing->image_view_infos.size());
     backing->image_view_infos.emplace_back(view_info);
     backing->image_view_ids.emplace_back(view_id);
     return (*slot_image_views)[view_id];

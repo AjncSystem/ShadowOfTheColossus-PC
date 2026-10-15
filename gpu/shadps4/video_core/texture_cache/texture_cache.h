@@ -90,9 +90,15 @@ public:
         return tile_manager;
     }
 
-    /// Frees cached images not used in the last few frames, regardless of memory thresholds.
-    /// Called when a video memory allocation fails.
-    void EmergencyCollect();
+    /// Frees cached images not used in the last few GC ticks (one per submit), regardless of
+    /// memory thresholds. Called when a video memory allocation fails. Higher levels go deeper
+    /// (sotc): level 0 frees up to 512 images last used 4 or more ticks ago, level 1 up to 4096
+    /// last used 2 or more ticks ago, level 2 every image not used in the current tick.
+    void EmergencyCollect(u32 level = 0);
+
+    /// sotc: EmergencyCollect, unless this thread is inside RefreshImage (holding `mutex`): then
+    /// the collection is deferred to the next RunGarbageCollector and false is returned.
+    bool TryEmergencyCollect(u32 level);
 
     /// Invalidates any image in the logical page range.
     void InvalidateMemory(VAddr addr, size_t size);
@@ -116,7 +122,10 @@ public:
     [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
 
     /// Retrieves the render target with specified properties
-    [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc);
+    /// sotc: update=false (BeginRendering, SOTC_RT_FAST) skips the second UpdateImage when the
+    /// caller has just run it and the image needs no upload or re-tracking since.
+    [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc,
+                                              bool update = true);
 
     /// Retrieves the depth target with specified properties
     [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc);
@@ -202,6 +211,20 @@ public:
             return it.value().clear_mask & (1u << slice);
         }
         return false;
+    }
+
+    /// sotc: IsMetaCleared + TouchMeta(address, slice, false) with a single lookup
+    /// (SOTC_RT_FAST): returns the old clear bit of the slice (false when the address is not a
+    /// metadata surface, like IsMetaCleared) and clears it.
+    bool TestAndTouchMeta(VAddr address, u32 slice) {
+        auto it = surface_metas.find(address);
+        if (it == surface_metas.end()) {
+            return false;
+        }
+        auto& clear_mask = it.value().clear_mask;
+        const bool was_clear = (clear_mask & (1u << slice)) != 0;
+        clear_mask &= ~(1u << slice);
+        return was_clear;
     }
 
     /// Clears all slices of the specified metadata surface.
@@ -334,7 +357,16 @@ private:
         DeleteImage(image_id);
     }
 
+    /// sotc: depth/colour twins (ResolveDepthOverlap). Park: what FreeImage does except the
+    /// reclaim of the slot and its Vulkan objects. Unpark: registers it again as if new.
+    void ParkImage(ImageId image_id);
+    void UnparkImage(ImageId image_id);
+    void ReclaimImage(ImageId image_id);
+
     void GarbageCollectImages();
+
+    /// sotc: image memory by class, every 5 s with SOTC_FPS (telemetry only).
+    void Census();
     void GarbageCollectSamplers();
 
 private:
@@ -364,6 +396,10 @@ private:
     const bool readback_linear_images;
     PageTable page_table;
     std::mutex mutex;
+    /// sotc: RefreshImage nesting on this thread (it runs under `mutex`).
+    static inline thread_local u32 refresh_depth = 0;
+    /// sotc: deferred EmergencyCollect level + 1 (0: none).
+    std::atomic<u32> pending_emergency{0};
     /// sotc: FindImage's perfect matches, valid while no image is registered or unregistered.
     struct FindMemo {
         VAddr guest_address{};
@@ -378,7 +414,17 @@ private:
     static constexpr size_t NumFindMemos = 1024;
     std::array<FindMemo, NumFindMemos> find_memos{};
     u64 image_set_generation{};
+    /// sotc: per-address generations for FindMemo. A perfect match needs the same
+    /// guest_address, so only (un)registering an image at that address can change the
+    /// result; bumped in RegisterImage/UnregisterImage at the image's guest_address.
+    static constexpr size_t NumAddrGens = 4096;
+    std::array<u32, NumAddrGens> addr_gens{};
+    static size_t AddrGenSlot(VAddr addr) {
+        return static_cast<size_t>((u64{addr >> 8} * 0x9E3779B97F4A7C15ULL) >> 52);
+    }
     std::mutex samplers_mutex;
+    // sotc: bumped whenever a sampler is erased (GetSampler's per-thread memo).
+    std::atomic<u64> sampler_epoch{0};
     std::mutex download_images_mutex;
     struct MetaDataInfo {
         MetaType type;

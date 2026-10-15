@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // sotc: taken from Pink-shadPS4 0.4.0 (luizgustavs), cp_record_thread; scheduler hooks in vk_scheduler.cpp.
 
+#include <cstdlib>
 #include <chrono>
 #include <cstring>
 
@@ -852,7 +853,12 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
     // The command processor publishes another batch every few microseconds while working
     // Keep the consumer spinning briefly between batches to avoid making the producer wake it for
     // every small update
-    constexpr auto SpinTime = std::chrono::microseconds{250};
+    // sotc: SOTC_REC_SPIN_US overrides the spin (A/B: on a power-limited laptop the spinning
+    // recorder took a whole core, ~2/3 of it waiting, next to the command processor it waits on).
+    static const auto SpinTime = [] {
+        const char* v = std::getenv("SOTC_REC_SPIN_US");
+        return std::chrono::microseconds{v ? std::strtol(v, nullptr, 10) : 250};
+    }();
     constexpr auto SleepTime = std::chrono::microseconds{500};
 
     Chunk* chunk = first_chunk;

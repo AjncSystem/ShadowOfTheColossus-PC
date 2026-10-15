@@ -62,8 +62,6 @@ inline std::atomic<uint64_t> census_below_base{0};   ///< mips below the T# base
 inline std::atomic<uint64_t> census_below_minlod{0}; ///< mips below max(base_level, min_lod)
 inline std::atomic<uint64_t> census_live{0};         ///< images used in the last few ticks
 inline std::atomic<uint64_t> census_count{0};
-// sotc: emergency_deferred removed: written on each deferred collection, never read (the
-// "Emergency texture collection deferred" warning reports it).
 inline std::atomic<uint64_t> desync_repairs{0}; ///< stuck write faults repaired (page_manager)
 inline std::atomic<uint64_t> desync_legit{0}; ///< ... repeats left alone (tracker wants protection)
 inline std::atomic<uint64_t> stack_reg_spins{0}; ///< stack registry writer spins (page_manager)

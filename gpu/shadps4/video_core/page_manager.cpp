@@ -13,6 +13,7 @@
 #include <boost/icl/interval_map.hpp>
 #include <boost/icl/interval_set.hpp>
 #include <mutex>
+#include <shared_mutex>
 #include <atomic>
 #include "common/alignment.h"
 #include "common/adaptive_mutex.h"
@@ -28,7 +29,6 @@
 #include "common/decoder.h"
 #include "core/signals.h"
 #include "shader_recompiler/ir/passes/srt.h"
-#include <shared_mutex>
 #include "video_core/page_manager.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"

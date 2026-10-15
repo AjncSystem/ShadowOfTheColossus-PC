@@ -301,19 +301,67 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
         auto new_info = requested_info;
         new_info.resources = std::max(requested_info.resources, cache_image.info.resources);
         new_info.UpdateSize();
-        const auto new_image_id = slot_images.insert(instance, runtime, slot_image_views, new_info);
-        RegisterImage(new_image_id);
+        // sotc: the game switches some depth buffers between depth and colour use every frame
+        // (~100 conversions/s in the open world): each one created an image and freed the old
+        // one (~3% of the GPU thread). The old image is parked as the new one's twin instead,
+        // and the next conversion back reuses it when it has exactly the requested layout. The
+        // copy stays: the contents move every time. Opt-in (SOTC_DEPTH_TWIN=1) until measured:
+        // the A/B runs so far were all disturbed.
+        static const bool twins = [] {
+            const char* v = std::getenv("SOTC_DEPTH_TWIN");
+            return v && v[0] == '1';
+        }();
+        ImageId new_image_id{};
+        if (const ImageId twin_id = cache_image.parked_twin) {
+            cache_image.parked_twin = {};
+            const auto& twin = slot_images[twin_id].info;
+            const bool same = twin.guest_address == new_info.guest_address &&
+                              twin.guest_size == new_info.guest_size &&
+                              twin.pixel_format == new_info.pixel_format &&
+                              twin.type == new_info.type && twin.size == new_info.size &&
+                              twin.pitch == new_info.pitch &&
+                              !(twin.resources < new_info.resources) &&
+                              !(new_info.resources < twin.resources) &&
+                              twin.num_samples == new_info.num_samples &&
+                              twin.num_bits == new_info.num_bits &&
+                              twin.tile_mode == new_info.tile_mode &&
+                              twin.props.is_depth == new_info.props.is_depth &&
+                              twin.props.has_stencil == new_info.props.has_stencil &&
+                              twin.props.is_tiled == new_info.props.is_tiled;
+            const auto& twin_image = slot_images[twin_id];
+            const bool idle = !twin_image.binding.is_bound && !twin_image.binding.is_target &&
+                              twin_image.backing &&
+                              twin_image.backing->num_samples == new_info.num_samples;
+            if (twins && same && idle) {
+                // Everything that shaped the Vulkan image matched: take the request's metadata
+                // (meta areas, layout details) as a new image would.
+                slot_images[twin_id].info = new_info;
+                UnparkImage(twin_id);
+                new_image_id = twin_id;
+            } else {
+                ReclaimImage(twin_id);
+            }
+        }
+        if (!new_image_id) {
+            new_image_id = slot_images.insert(instance, runtime, slot_image_views, new_info);
+            RegisterImage(new_image_id);
+        }
 
         // Inherit image usage
         auto& new_image = slot_images[new_image_id];
-        new_image.usage = cache_image.usage;
+        auto& old_image = slot_images[cache_image_id];
+        new_image.usage = old_image.usage;
         new_image.flags &= ~ImageFlagBits::Dirty;
         // When creating a depth buffer through overlap resolution don't clear it on first use.
         new_image.info.meta_info.htile_clear_mask = 0;
-        runtime.CopyColorAndDepth(&cache_image, &new_image);
+        runtime.CopyColorAndDepth(&old_image, &new_image);
 
-        // Free the cache image.
-        FreeImage(cache_image_id);
+        if (twins) {
+            ParkImage(cache_image_id);
+            slot_images[new_image_id].parked_twin = cache_image_id;
+        } else {
+            FreeImage(cache_image_id);
+        }
         return new_image_id;
     }
 
@@ -1138,6 +1186,15 @@ bool TextureCache::TryEmergencyCollect(u32 level) {
 
 void TextureCache::EmergencyCollect(u32 level) {
     std::scoped_lock lock{mutex};
+    // sotc: parked depth/colour twins are not in the LRU; under pressure they go first.
+    lru_cache.ForEachItemBelow(gc_tick + 1, [&](ImageId image_id) {
+        auto& image = slot_images[image_id];
+        if (const ImageId twin_id = image.parked_twin) {
+            image.parked_twin = {};
+            ReclaimImage(twin_id);
+        }
+        return false;
+    });
     size_t num_deletions = level == 0 ? 512 : level == 1 ? 4096 : SIZE_MAX;
     size_t freed = 0;
     const u64 ticks = std::min<u64>(level == 0 ? 4 : level == 1 ? 2 : 1, gc_tick);
@@ -1363,13 +1420,78 @@ void TextureCache::RunGarbageCollector() {
 }
 
 void TextureCache::TouchImage(const Image& image) {
-    lru_cache.Touch(image.lru_id, gc_tick);
+    // sotc: an unregistered image (parked twin, or deleted this draw) has no LRU node any more.
+    if (True(image.flags & ImageFlagBits::Registered)) {
+        lru_cache.Touch(image.lru_id, gc_tick);
+    }
+}
+
+void TextureCache::ParkImage(ImageId image_id) {
+    UntrackImage(image_id);
+    UnregisterImage(image_id);
+    Image& image = slot_images[image_id];
+    // As DeleteImage: its meta areas and pending downloads go now.
+    const auto& meta_info = image.info.meta_info;
+    if (meta_info.cmask_addr) {
+        surface_metas.erase(meta_info.cmask_addr);
+    }
+    if (meta_info.fmask_addr) {
+        surface_metas.erase(meta_info.fmask_addr);
+    }
+    if (meta_info.htile_addr) {
+        surface_metas.erase(meta_info.htile_addr);
+    }
+    std::unique_lock lk{download_images_mutex};
+    download_images.erase(image_id);
+}
+
+void TextureCache::UnparkImage(ImageId image_id) {
+    Image& image = slot_images[image_id];
+    // The state of a newly created image (Image::Image), with a new identity.
+    image.flags = ImageFlagBits::Dirty;
+    image.track_addr = 0;
+    image.track_addr_end = 0;
+    image.depth_id = {};
+    image.depth_uid = 0;
+    image.parked_twin = {};
+    std::fill(image.mip_hashes.begin(), image.mip_hashes.end(), u64{0});
+    image.hash = 0;
+    image.tick_accessed_last = 0;
+    image.binding = {};
+    image.usage = {};
+    image.RenewIdentity();
+    {
+        std::unique_lock lk{download_images_mutex};
+        download_images.erase(image_id);
+    }
+    RegisterImage(image_id);
+}
+
+void TextureCache::ReclaimImage(ImageId image_id) {
+    // A parked twin: already untracked and unregistered, metas gone.
+    {
+        std::unique_lock lk{download_images_mutex};
+        download_images.erase(image_id);
+    }
+    scheduler.DeferOperation([this, image_id] {
+        Image& image = slot_images[image_id];
+        for (auto& backing : image.backing_images) {
+            for (const ImageViewId image_view_id : backing.image_view_ids) {
+                slot_image_views.erase(image_view_id);
+            }
+        }
+        slot_images.erase(image_id);
+    });
 }
 
 void TextureCache::DeleteImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(!image.IsTracked(), "Image was not untracked");
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered), "Image was not unregistered");
+    if (const ImageId twin_id = image.parked_twin) {
+        image.parked_twin = {};
+        ReclaimImage(twin_id);
+    }
 
     // Remove any registered meta areas.
     const auto& meta_info = image.info.meta_info;

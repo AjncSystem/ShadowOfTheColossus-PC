@@ -1,5 +1,7 @@
 # Shadow of the Colossus — PC (port nativo / native port) · v0.57
 
+**Alterações locais Codex:** [caches persistentes, instrumentação e executável de teste](docs/sotc/STUTTER-CODEX.md).
+
 **[Português](#português)** · **[English](#english)** · [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
 > **Nenhum arquivo do jogo nem da Sony está incluído / No game or Sony files are included.**

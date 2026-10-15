@@ -103,7 +103,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'user_dir': '', 'af16': True, 'fps60': False, 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
                 'readbacks': '', 'extra_env': '', 'close_on_play': False, 'gamepad': '',
-                'output_res': '1920x1080', 'render_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
+                'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
                 'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'library_dirs': [], 'keys': {},
@@ -178,19 +178,6 @@ SCREENS = [('1920x1080', '16:9, 1080p'), ('2560x1440', '16:9, 1440p'), ('3840x21
            ('3840x1080', '32:9'), ('5120x1440', '32:9')]
 OUTPUTS = [('1280x720', ('1280 × 720 (16:9, 720p)', '1280 × 720 (16:9, 720p)'))] + [
     (size, (f"{size.replace('x', ' × ')} ({label})",) * 2) for size, label in SCREENS]
-# The size the game renders at (SOTC_RENDER_RES, scripts/sotc_modes.py): wider than 16:9 widens
-# the view (Hor+), it is not stretched.
-RENDERS = [('1920x1080', ('1920 × 1080 (16:9, como no PS4)', '1920 × 1080 (16:9, as on PS4)'))] + [
-    (size, (f"{size.replace('x', ' × ')} ({label})",) * 2) for size, label in SCREENS[1:]]
-
-
-def same_aspect(a, b):
-    """WxH sizes a and b have the same aspect (within 1%)."""
-    try:
-        (aw, ah), (bw, bh) = (map(int, a.split('x')), map(int, b.split('x')))
-    except ValueError:
-        return False
-    return abs(aw * bh - ah * bw) <= ah * bw // 100
 UPSCALERS = [('fsr1', ('FSR 1 (AMD, qualquer placa)', 'FSR 1 (AMD, any GPU)')),
              ('bilinear', ('Bilinear (simples)', 'Bilinear (plain)'))]
 SHARPNESS = [('0', ('Alta', 'High')), ('250', ('Média (padrão)', 'Medium (default)')), ('600', ('Baixa', 'Low')),
@@ -311,10 +298,12 @@ def game_environment(s):
         env['SOTC_FLUSH_EVERY'], env['SOTC_RB_AHEAD'] = '0', '0'
     env['SOTC_NEO'] = '1' if s.get('neo') else '0'
     env['SOTC_OUTPUT_RES'] = s.get('output_res') or '1920x1080'
-    # The PS4 Pro path keeps its own sizes: the render size applies to PS4 mode only.
-    render = s.get('render_res') or '1920x1080'
-    if render != '1920x1080' and not s.get('neo'):
-        env['SOTC_RENDER_RES'] = render
+    # The game renders at the output size (sotc.py scales it down above about 4.2 million pixels; the
+    # upscaler takes it to the output). 720p renders at 1080p, as on PS4; the PS4 Pro path keeps its
+    # own sizes.
+    output = env['SOTC_OUTPUT_RES']
+    if output not in ('1280x720', '1920x1080') and not s.get('neo'):
+        env['SOTC_RENDER_RES'] = output
     env['BB_FSR1'] = '1' if s.get('upscaler', 'fsr1') == 'fsr1' else '0'
     if s.get('sharpness') == 'off':
         env['BB_RCAS'] = '0'
@@ -656,25 +645,13 @@ class Launcher:
         quick.grid(row=0, column=1, sticky='nw')
         ttk.Label(quick, text=_('Ajustes rápidos', 'Quick settings'), style='Section.TLabel').grid(
             row=0, column=0, columnspan=2, sticky='w', pady=(0, 2))
-        self.row(quick, _('Renderização', 'Render'), self.choice(quick, 'render_res', RENDERS, 24))
         self.row(quick, _('Saída', 'Output'), self.choice(quick, 'output_res', OUTPUTS, 24))
         self.row(quick, _('Upscaler', 'Upscaler'), self.choice(quick, 'upscaler', UPSCALERS, 24))
         self.check(quick, 'fps60', _('60 FPS (experimental)', '60 FPS (experimental)'))
         self.check(quick, 'af16', _('Texturas nítidas (filtro 16x)', 'Sharp textures (16x filtering)'))
         self.check(quick, 'fullscreen', _('Tela cheia', 'Fullscreen'))
-        for key in ('af16', 'fps60', 'fullscreen', 'output_res', 'render_res', 'upscaler'):
+        for key in ('af16', 'fps60', 'fullscreen', 'output_res', 'upscaler'):
             self.vars[key].trace_add('write', lambda *_a: self.refresh_status())
-        self.vars['render_res'].trace_add('write', lambda *_a: self.follow_render())
-        self.var('neo').trace_add('write', lambda *_a: self.var('neo').get() and self.var('render_res').set('1920x1080'))
-
-    def follow_render(self):
-        """A render size of another aspect takes the output with it (it would be letterboxed); the
-        PS4 Pro path keeps its own sizes, so a render size turns it off."""
-        render, output = self.var('render_res').get(), self.var('output_res')
-        if not same_aspect(render, output.get()):
-            output.set(render if render in [v for v, _t in OUTPUTS] else '1920x1080')
-        if render != '1920x1080' and self.var('neo').get():
-            self.var('neo').set(False)
 
     def draw_banner(self):
         """The dump's own art (sce_sys/pic1.png) under the title."""
@@ -800,18 +777,17 @@ class Launcher:
                    _('Tira o limite de 30 FPS do jogo; o vblank vai a 120 Hz. Mediu 38 FPS no campo e ~25 no templo.',
                      'Removes the game\'s 30 FPS cap; vblank at 120 Hz. Measured 38 FPS in the open world, ~25 at the temple.'))
         self.section(f, _('Resolução', 'Resolution'))
-        self.row(f, _('Renderização', 'Render'), self.choice(f, 'render_res', RENDERS),
-                 _('O tamanho em que o jogo renderiza (no PS4: 1080p). Mais largo que 16:9 (21:9, 32:9) mostra mais '
-                   'dos lados (Hor+), sem esticar. Tamanhos maiores pesam mais na GPU. Desliga o modo PS4 Pro. '
-                   'Testado em 3840 × 1600; menus e vídeos podem ficar esticados.',
-                   'The size the game renders at (PS4: 1080p). Wider than 16:9 (21:9, 32:9) shows more at the '
-                   'sides (Hor+), not stretched. Larger sizes are heavier on the GPU. Turns PS4 Pro mode off. '
-                   'Tested at 3840 × 1600; menus and videos may look stretched.'))
         self.row(f, _('Saída', 'Output'), self.choice(f, 'output_res', OUTPUTS),
-                 _('A imagem é ampliada ou reduzida para a saída, mantendo a proporção da renderização. '
+                 _('O jogo renderiza nesse tamanho; acima de cerca de 4,2 milhões de pixels (4K, 3440 × 1440) num '
+                   'tamanho menor, que o upscaler amplia: maior que isso, os detalhes finos das texturas somem. '
+                   'Mais largo que 16:9 (21:9, 32:9) mostra mais dos lados (Hor+), sem esticar; menus e vídeos '
+                   'podem ficar esticados. 720p renderiza em 1080p; o modo PS4 Pro usa os tamanhos do Pro. '
                    'Num monitor menor que a saída, a janela cabe na tela e a tela cheia usa o monitor todo.',
-                   'The image is scaled to the output, keeping the aspect of the render. On a monitor smaller than '
-                   'the output the window fits the screen and fullscreen uses the whole monitor.'))
+                   'The game renders at this size; above about 4.2 million pixels (4K, 3440 × 1440) at a smaller '
+                   'size that the upscaler enlarges: larger than that, the fine texture detail disappears. Wider '
+                   'than 16:9 (21:9, 32:9) shows more at the sides (Hor+), not stretched; menus and videos may '
+                   'look stretched. 720p renders at 1080p; PS4 Pro mode uses the Pro sizes. On a monitor smaller '
+                   'than the output the window fits the screen and fullscreen uses the whole monitor.'))
         self.row(f, _('Upscaler', 'Upscaler'), self.choice(f, 'upscaler', UPSCALERS),
                  _('FSR 1 amplia com bordas nítidas (acima de 1080p).', 'FSR 1 upscales with sharp edges (above 1080p).'))
         self.row(f, _('Nitidez (RCAS)', 'Sharpening (RCAS)'), self.choice(f, 'sharpness', SHARPNESS))
@@ -1030,8 +1006,6 @@ class Launcher:
     def summary(self):
         parts = [_('60 FPS', '60 FPS') if self.var('fps60').get() else _('30 FPS (como no PS4)', '30 FPS (as on PS4)'),
                  self.var('output_res').get().replace('x', ' × '),
-                 *([_('render ', 'render ') + self.var('render_res').get().replace('x', ' × ')]
-                   if self.var('render_res').get() != '1920x1080' and not self.var('neo').get() else []),
                  'FSR 1' if self.var('upscaler').get() == 'fsr1' else 'bilinear']
         if self.var('af16').get():
             parts.append(_('AF 16x', '16x AF'))

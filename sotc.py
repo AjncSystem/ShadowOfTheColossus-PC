@@ -15,7 +15,8 @@ Settings (environment variables, or sotc.ini beside this script as NAME=value li
     SOTC_DLC_DIR      optional: the game's DLC (one folder per add-on with sce_sys/param.sfo,
                       or shadPS4's addcont folder holding CUSA08809)
     SOTC_MODES        optional, comma-separated: af16 (16x anisotropic filtering),
-                      fps60 (removes the 30 FPS cap; experimental, vblank at 120 Hz)
+                      fps60 (removes the 30 FPS cap; experimental, vblank at 120 Hz),
+                      hdr (HDR10 output and the game's HDR rendering; Windows HDR must be on)
     SOTC_CVARS        engine settings, NAME=VALUE separated by spaces (e.g. r_motionBlurEnable=0)
     BB_GAMEPAD        the gamepad to use (its name or part of it), when several are connected
     key.<input>=Keys, pad.<input>=buttons   remap the controls (README.md, Controles)
@@ -168,6 +169,9 @@ def main():
     if 'fps60' in modes.lower():
         # The game waits for vblanks: at 60 Hz an uncapped frame still rounds up to 30 FPS.
         env.setdefault('BB_VBLANK_HZ', '120')
+    if 'hdr' in modes.lower():
+        # HDR10 swapchain (Rec.2020 PQ, when Windows HDR is on); the game then offers HDR too.
+        env.setdefault('BB_HDR', '1')
 
     probe = find_probe()
     # Development builds run from the MSYS2 tree: its CLANG64 DLLs (SDL3, FFmpeg, ...).

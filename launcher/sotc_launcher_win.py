@@ -100,7 +100,7 @@ def windows_language():
 # Settings, passed to sotc.py as environment variables.
 
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
-                'user_dir': '', 'af16': True, 'fps60': False, 'fullscreen': False,
+                'user_dir': '', 'af16': True, 'fps60': False, 'hdr': False, 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
                 'readbacks': '', 'extra_env': '', 'close_on_play': False, 'gamepad': '',
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
@@ -264,7 +264,7 @@ def game_environment(s):
         env['SOTC_SYS_MODULES'] = s['sys_modules']
     if s.get('dlc_dir'):
         env['SOTC_DLC_DIR'] = s['dlc_dir']
-    env['SOTC_MODES'] = ','.join(m for m in ('af16', 'fps60') if s.get(m))
+    env['SOTC_MODES'] = ','.join(m for m in ('af16', 'fps60', 'hdr') if s.get(m))
     env['BB_FULLSCREEN'] = '1' if s['fullscreen'] else '0'
     env['BB_PRESENT_MODE'] = s['present_mode']
     if s['language']:
@@ -637,8 +637,9 @@ class Launcher:
         self.row(quick, _('Upscaler', 'Upscaler'), self.choice(quick, 'upscaler', UPSCALERS, 24))
         self.check(quick, 'fps60', _('60 FPS (experimental)', '60 FPS (experimental)'))
         self.check(quick, 'af16', _('Texturas nítidas (filtro 16x)', 'Sharp textures (16x filtering)'))
+        self.check(quick, 'hdr', _('HDR (HDR do Windows ligado)', 'HDR (Windows HDR on)'))
         self.check(quick, 'fullscreen', _('Tela cheia', 'Fullscreen'))
-        for key in ('af16', 'fps60', 'fullscreen', 'output_res', 'upscaler'):
+        for key in ('af16', 'fps60', 'hdr', 'fullscreen', 'output_res', 'upscaler'):
             self.vars[key].trace_add('write', lambda *_a: self.refresh_status())
 
     def draw_banner(self):
@@ -764,6 +765,9 @@ class Launcher:
         self.check(f, 'fps60', _('60 FPS (experimental)', '60 FPS (experimental)'),
                    _('Tira o limite de 30 FPS do jogo; o vblank vai a 120 Hz. Mediu 38 FPS no campo e ~25 no templo.',
                      'Removes the game\'s 30 FPS cap; vblank at 120 Hz. Measured 38 FPS in the open world, ~25 at the temple.'))
+        self.check(f, 'hdr', _('HDR', 'HDR'),
+                   _('Saída HDR10 e a renderização HDR do jogo. Ligue o HDR do Windows antes de jogar.',
+                     'HDR10 output and the game\'s HDR rendering. Turn on Windows HDR before playing.'))
         self.section(f, _('Resolução', 'Resolution'))
         self.row(f, _('Saída', 'Output'), self.choice(f, 'output_res', OUTPUTS),
                  _('O jogo renderiza em 1080p, como no PS4; a imagem é ampliada ou reduzida para a saída. '
@@ -991,6 +995,8 @@ class Launcher:
                  'FSR 1' if self.var('upscaler').get() == 'fsr1' else 'bilinear']
         if self.var('af16').get():
             parts.append(_('AF 16x', '16x AF'))
+        if self.var('hdr').get():
+            parts.append('HDR')
         if self.var('neo').get():
             parts.append('PS4 Pro')
         parts.append(_('tela cheia', 'fullscreen') if self.var('fullscreen').get() else _('janela', 'window'))

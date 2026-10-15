@@ -36,7 +36,7 @@ namespace Shader::Gcn {
 
 const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
     const u32* code;
-    std::memcpy(&code, &info.user_data[sgpr_base], sizeof(code));
+    std::memcpy(&code, &info.UserData()[sgpr_base], sizeof(code));
     return code;
 }
 

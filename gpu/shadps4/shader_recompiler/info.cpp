@@ -16,6 +16,7 @@ namespace Shader {
 void Info::RefreshSharpTables() {
     constexpr VAddr AddressMask = 0xFFFFFFFFFFFFULL;
     auto* memory = Core::Memory::Instance();
+    auto& flattened_ud_buf = FlatBuf();
     for (const SharpTable& table : sharp_tables) {
         u32* dst = flattened_ud_buf.data() + table.flatbuf_off;
         const u64 size = u64{table.NumDwords()} * sizeof(u32);

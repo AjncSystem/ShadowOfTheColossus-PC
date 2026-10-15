@@ -13,7 +13,11 @@
 
 #include <miniz.h>
 
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <functional>
 #include <future>
 #include <mutex>
@@ -22,7 +26,9 @@
 namespace {
 
 std::mutex submit_mutex{};
-u32 num_requests{};
+// sotc: atomic. The writer increments under submit_mutex but the IO thread decrements without
+// it; a lost decrement left the IO loop spinning on an empty queue (one core) for the session.
+std::atomic<u32> num_requests{};
 std::condition_variable_any request_cv{};
 std::queue<std::packaged_task<void()>> req_queue{};
 std::mutex m_request{};
@@ -40,7 +46,7 @@ void ProcessIO(const std::stop_token& stoken) {
     while (!stoken.stop_requested()) {
         {
             std::unique_lock lk{submit_mutex};
-            Common::CondvarWait(request_cv, lk, stoken, [&] { return num_requests; });
+            Common::CondvarWait(request_cv, lk, stoken, [&] { return num_requests.load() != 0; });
         }
 
         if (stoken.stop_requested()) {
@@ -118,10 +124,77 @@ void DataBase::Open() {
         if (!std::filesystem::exists(cache_path)) {
             std::filesystem::create_directories(cache_path);
         }
+        Prefetch();
     }
 
     io_worker = std::jthread{ProcessIO};
     opened = true;
+}
+
+// sotc: the boot preload opened ~12k small files one by one (~21 s of a 22 s warm-up on Windows,
+// where each open is slow and scanned). Read them all in parallel first; Load and ForEachBlob
+// take them from memory until FinishPreload.
+void DataBase::Prefetch() {
+    const auto start = std::chrono::steady_clock::now();
+    std::vector<std::filesystem::path> files;
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator{cache_path, ec}) {
+        if (entry.is_regular_file(ec) && entry.path().extension() != ".tmp") {
+            files.push_back(entry.path());
+        }
+    }
+    const u32 num_threads =
+        std::clamp<u32>(std::thread::hardware_concurrency(), 1, 16);
+    std::vector<std::vector<std::pair<std::string, std::vector<u8>>>> results(num_threads);
+    std::atomic<size_t> next{0};
+    {
+        std::vector<std::jthread> workers;
+        for (u32 t = 0; t < num_threads; ++t) {
+            workers.emplace_back([&, t] {
+                using namespace Common::FS;
+                for (size_t i = next++; i < files.size(); i = next++) {
+                    const IOFile file{files[i], FileAccessMode::Read};
+                    if (!file.IsOpen()) {
+                        continue;
+                    }
+                    std::vector<u8> data(file.GetSize());
+                    if (file.Read(data) != data.size()) {
+                        continue;
+                    }
+                    results[t].emplace_back(files[i].filename().string(), std::move(data));
+                }
+            });
+        }
+    }
+    u64 bytes = 0;
+    for (auto& list : results) {
+        for (auto& [name, data] : list) {
+            bytes += data.size();
+            prefetched.emplace(std::move(name), std::move(data));
+        }
+    }
+    prefetch_active = true;
+    LOG_INFO(Render, "Prefetched {} cache files ({} MiB) in {} ms with {} threads",
+             prefetched.size(), bytes >> 20,
+             std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - start)
+                 .count(),
+             num_threads);
+}
+
+bool DataBase::TakePrefetched(const std::filesystem::path& path, std::vector<u8>& data) {
+    if (!prefetch_active) {
+        return false;
+    }
+    const auto it = prefetched.find(path.filename().string());
+    if (it == prefetched.end()) {
+        // Not on disk at prefetch time: the same answer the file system would give.
+        data.clear();
+        return true;
+    }
+    // Copied, not moved: a shader's .meta and .spv are loaded once per pipeline that uses it.
+    data = it->second;
+    return true;
 }
 
 void DataBase::Close() {
@@ -139,6 +212,23 @@ void DataBase::Close() {
 
     opened = false;
     LOG_INFO(Render, "Cache dumped");
+}
+
+// sotc: restored from bbport. Deletes the loose cache files so an incompatible cache (another
+// GPU, a driver or build change) is rebuilt instead of being ignored by every later session.
+void DataBase::Clear() {
+    if (!opened || EmulatorSettings.IsPipelineCacheArchived()) {
+        return;
+    }
+    prefetched.clear();
+    std::error_code ec;
+    u64 removed = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(cache_path, ec)) {
+        if (entry.is_regular_file(ec) && std::filesystem::remove(entry.path(), ec)) {
+            ++removed;
+        }
+    }
+    LOG_WARNING(Render, "Pipeline cache cleared ({} files): it is rebuilt for this build", removed);
 }
 
 template <typename T>
@@ -231,6 +321,11 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u8>& dat
 
     auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
                                                            : cache_path / name;
+    if (prefetch_active) {
+        path.replace_extension(GetBlobFileExtension(type));
+        TakePrefetched(path, data);
+        return;
+    }
     return LoadVector(type, path, data);
 }
 
@@ -241,6 +336,14 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u32>& da
 
     auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
                                                            : cache_path / name;
+    if (prefetch_active) {
+        path.replace_extension(GetBlobFileExtension(type));
+        std::vector<u8> bytes;
+        TakePrefetched(path, bytes);
+        data.resize(bytes.size() / sizeof(u32));
+        std::memcpy(data.data(), bytes.data(), data.size() * sizeof(u32));
+        return;
+    }
     return LoadVector(type, path, data);
 }
 
@@ -260,6 +363,12 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
                 func(std::move(data));
             }
         }
+    } else if (prefetch_active) {
+        for (const auto& [file_name, data] : prefetched) {
+            if (std::filesystem::path{file_name}.extension().string().ends_with(ext)) {
+                func(std::vector<u8>{data});
+            }
+        }
     } else {
         for (const auto& file_name : std::filesystem::directory_iterator{cache_path}) {
             if (file_name.path().extension().string().ends_with(ext)) {
@@ -276,6 +385,8 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
 }
 
 void DataBase::FinishPreload() {
+    prefetch_active = false;
+    prefetched = {};
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         mz_zip_writer_init_from_reader(&zip_ar, cache_path.string().c_str());
         ar_is_read_only = false;

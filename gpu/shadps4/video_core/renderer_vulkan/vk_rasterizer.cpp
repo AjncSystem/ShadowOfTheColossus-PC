@@ -1461,8 +1461,46 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         binding.unified += array_size;
     }
 
+    // sotc: at a render size above 1080 lines the game stretches its 1080p 2D art (splash logos,
+    // UI) itself, with the point sampler meant for 1:1 drawing: hard steps. A draw that samples
+    // one asset texture (never a render target, storage or depth image) magnifies bilinearly
+    // there. SOTC_UI_LINEAR=0/1 overrides, SOTC_UI_LINEAR_TRACE=1 lists the draws it changes.
+    static const bool ui_linear = [] {
+        if (const char* v = std::getenv("SOTC_UI_LINEAR"); v && *v) {
+            return *v != '0';
+        }
+        const char* r = std::getenv("SOTC_RENDER_RES");
+        return r && *r && std::strcmp(r, "1920x1080") != 0;
+    }();
+    const VideoCore::Image* ui_asset = nullptr;
+    if (ui_linear && image_bindings.size() == 1 && image_bindings[0].first &&
+        stage.images.size() == 1 && stage.images[0].array_size == 0) {
+        const auto& image = texture_cache.GetImage(image_bindings[0].first);
+        const auto& u = image.usage;
+        if (!u.render_target && !u.depth_target && !u.storage && !u.vo_surface &&
+            !image.binding.is_target && !image.info.props.is_depth &&
+            !AmdGpu::IsInteger(stage.images[0].GetSharp(stage).GetNumberFmt())) {
+            ui_asset = &image;
+        }
+    }
     for (const auto& sampler : stage.samplers) {
         auto ssharp = sampler.GetSharp(stage);
+        if (ui_asset && ssharp.xy_mag_filter.Value() == AmdGpu::Filter::Point &&
+            !sampler.is_depth) {
+            ssharp.xy_mag_filter.Assign(AmdGpu::Filter::Bilinear);
+            static const bool trace = std::getenv("SOTC_UI_LINEAR_TRACE") != nullptr;
+            if (trace) {
+                static std::mutex m;
+                static std::set<u64> seen;
+                std::scoped_lock lk{m};
+                if (seen.size() < 200 && seen.insert(stage.pgm_hash ^ ui_asset->info.guest_address).second) {
+                    std::fprintf(stderr, "SOTC ui-linear pgm %#llx tex %#llx %ux%u\n",
+                                 static_cast<unsigned long long>(stage.pgm_hash),
+                                 static_cast<unsigned long long>(ui_asset->info.guest_address),
+                                 ui_asset->info.size.width, ui_asset->info.size.height);
+                }
+            }
+        }
         if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
                                 liverpool->regs.ta_bc_base.Address() == 0)) {
             LOG_WARNING(Render_Vulkan,

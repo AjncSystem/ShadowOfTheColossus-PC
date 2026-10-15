@@ -119,7 +119,9 @@ static DWORD win_prot(int prot) {
     if (prot & PROT_WRITE) return PAGE_READWRITE;
     return (prot & PROT_READ) ? PAGE_READONLY : PAGE_NOACCESS;
 }
+static void carve_resume_on_fail(void);
 static void win_fail(const char *what, uintptr_t address, uint64_t size) {
+    carve_resume_on_fail(); /* sotc: no stdio while other guest threads are stopped */
     fprintf(stderr,"STOP: %s failed at %p (+0x%" PRIx64 "), error %lu\n",what,(void *)address,size,GetLastError());
     exit(21);
 }
@@ -128,13 +130,16 @@ static size_t region_index(uintptr_t a) { /* first region with end > a */
     while (lo<hi) { size_t mid=(lo+hi)/2; if (regions[mid].end<=a) lo=mid+1; else hi=mid; }
     return lo;
 }
-static void region_insert(size_t at, HostRegion r) {
-    if (region_count==region_capacity) {
+static void region_reserve(size_t extra) {
+    while (region_count+extra>region_capacity) {
         size_t capacity=region_capacity ? region_capacity*2 : 256;
         HostRegion *next=realloc(regions,capacity*sizeof(*regions));
         if (!next) { fputs("Out of memory (host regions)\n",stderr); exit(1); }
         regions=next; region_capacity=capacity;
     }
+}
+static void region_insert(size_t at, HostRegion r) {
+    region_reserve(1);
     memmove(regions+at+1,regions+at,(region_count-at)*sizeof(*regions));
     regions[at]=r; ++region_count;
 }
@@ -173,6 +178,27 @@ static size_t save_protections(uintptr_t start, uintptr_t end, ProtRun **runs, s
     }
     return count;
 }
+#ifdef _WIN32
+size_t runtime_thread_suspend_others(void **out, size_t capacity); /* runtime_thread.c */
+void runtime_thread_resume(void **handles, size_t n);
+/* sotc: SOTC_CARVE_SUSPEND=0 keeps the other guest threads running while live views are split. */
+static int carve_suspend_enabled(void) {
+    static int v=-1;
+    if (v<0) { const char *e=getenv("SOTC_CARVE_SUSPEND"); v=!(e && e[0]=='0'); }
+    return v;
+}
+static uint64_t carve_splits;
+uint64_t runtime_memory_carve_splits(void) { return __atomic_exchange_n(&carve_splits,0,__ATOMIC_RELAXED); }
+/* The threads carve_host stopped, so win_fail can resume them before reporting. */
+static void *carve_stopped[256];
+static size_t carve_nstopped;
+static int carve_stopping;
+#endif
+static void carve_resume_on_fail(void) {
+#ifdef _WIN32
+    if (carve_stopping) { carve_stopping=0; runtime_thread_resume(carve_stopped,carve_nstopped); }
+#endif
+}
 /* Leaves [a,b) as exactly one unmapped placeholder; returns its region index. */
 static size_t carve_host(uintptr_t a, uintptr_t b) {
     size_t first=region_index(a), last=first;
@@ -186,6 +212,15 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
     ProtRun *runs=NULL; size_t nruns=0, capacity=0, left_runs=0;
     if (keep_left) left_runs=nruns=save_protections(lo,a,&runs,nruns,&capacity);
     if (keep_right) nruns=save_protections(b,hi,&runs,nruns,&capacity);
+    /* sotc: a live view is split: everything in it (fiber stacks included) disappears until it is
+     * mapped again below. Other guest threads stop meanwhile (see runtime_thread_suspend_others).
+     * The region table is grown first: no heap call while they are stopped (one may hold the heap). */
+    if ((keep_left || keep_right) && carve_suspend_enabled()) {
+        region_reserve(3);
+        carve_nstopped=runtime_thread_suspend_others(carve_stopped,256);
+        carve_stopping=1;
+        __atomic_add_fetch(&carve_splits,1,__ATOMIC_RELAXED);
+    }
     for (size_t i=first;i<last;++i) if (regions[i].mapped) {
         if (!UnmapViewOfFile2(GetCurrentProcess(),(void *)regions[i].start,MEM_PRESERVE_PLACEHOLDER))
             win_fail("UnmapViewOfFile2",regions[i].start,regions[i].end-regions[i].start);
@@ -219,6 +254,7 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
         if (runs[i].protect!=PAGE_READWRITE && !VirtualProtect((void *)runs[i].start,runs[i].end-runs[i].start,runs[i].protect,&old))
             win_fail("restoring page protection",runs[i].start,runs[i].end-runs[i].start);
     }
+    if (carve_stopping) { carve_stopping=0; runtime_thread_resume(carve_stopped,carve_nstopped); }
     (void)left_runs;
     free(runs);
     return at;
@@ -870,6 +906,23 @@ int runtime_memory_region(uintptr_t address, uintptr_t *start, uintptr_t *end, i
     return found;
 }
 /* GPU page tracking: restrict host access, never beyond the guest's own protection. */
+/* sotc: diagnostics for page tracking problems: the runtime's view of a page (VMA kind and guest
+ * protection) next to the protection the host really has. */
+void runtime_memory_describe(uintptr_t address, char *out, size_t capacity) {
+    read_lock();
+    const size_t i=vma_index(address);
+    int kind=0, prot=-1;
+    uintptr_t start=0, end=0;
+    if (i<vma_count && vmas[i].start<=address) { kind=vmas[i].kind; prot=vmas[i].prot; start=vmas[i].start; end=vmas[i].end; }
+    read_unlock();
+    unsigned long host=0;
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery((void *)address,&mbi,sizeof(mbi))) host=mbi.Protect;
+#endif
+    snprintf(out,capacity,"vma kind %d prot %#x [%#llx,%#llx), host protect %#lx",kind,prot,
+             (unsigned long long)start,(unsigned long long)end,host);
+}
 void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int write) {
     read_lock();
     for (size_t i=vma_index(address); i<vma_count && vmas[i].start<address+size; ++i) {

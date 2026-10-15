@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
+#include <cpuid.h>
 #include "runtime.h"
 #include "gpu/bbgpu.h"
 #include "gpu/sotc/sotc_patches.h"
@@ -43,6 +44,22 @@ static int gpu_enabled;
 int vulkan_smoke(void);
 
 static void fail(const char *message) { fprintf(stderr, "ERROR: %s\n", message); exit(1); }
+/* The PS4's Jaguar CPU has BMI1/LZCNT/MOVBE and the game uses them (ANDN, BEXTR, TZCNT, ...); older
+   CPUs raise an illegal instruction or silently compute TZCNT/LZCNT wrong. Fail with a clear message. */
+static void require_cpu_features(void) {
+    unsigned a, b, c, d;
+    int bmi1 = __get_cpuid_count(7, 0, &a, &b, &c, &d) && (b & 1u << 3);
+    int lzcnt = __get_cpuid(0x80000001, &a, &b, &c, &d) && (c & 1u << 5);
+    int movbe = __get_cpuid(1, &a, &b, &c, &d) && (c & 1u << 22);
+    if (bmi1 && lzcnt && movbe) return;
+    char msg[160];
+    snprintf(msg, sizeof msg, "This CPU is not supported: it lacks%s%s%s (Intel Haswell / AMD Zen or newer is required).",
+             bmi1 ? "" : " BMI1", lzcnt ? "" : " LZCNT", movbe ? "" : " MOVBE");
+#ifdef _WIN32
+    MessageBoxA(NULL, msg, "Shadow of the Colossus", MB_OK | MB_ICONERROR);
+#endif
+    fail(msg);
+}
 static uint64_t read64(FILE *f) {
     unsigned char b[8];
     if (fread(b, 1, 8, f) != 8) fail("truncated boot file");
@@ -877,6 +894,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Usage: %s boot.bin [--cpu-only] [--strict-imports] [--content-profile file] [--app0 dir] [--user dir] [--patches file] [--timeout seconds] | --vulkan-only\n", argv[0]);
         return 1;
     }
+    require_cpu_features();
     if (content_profile) {
         FILE *profile=fopen(content_profile,"rb");
         unsigned char data[28];

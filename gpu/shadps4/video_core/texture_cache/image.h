@@ -161,6 +161,10 @@ public:
         boost::container::small_vector<ImageViewInfo, 4> image_view_infos;
         boost::container::small_vector<ImageViewId, 4> image_view_ids;
         u32 num_samples;
+        // sotc: index of the view FindView returned last (SOTC_TEX_BIND_P1). The view lists
+        // only grow and their entries never change, so an index stays valid for the backing's
+        // lifetime; ~0u = none yet.
+        u32 last_view = ~0u;
     };
     std::deque<BackingImage> backing_images;
     BackingImage* backing{};

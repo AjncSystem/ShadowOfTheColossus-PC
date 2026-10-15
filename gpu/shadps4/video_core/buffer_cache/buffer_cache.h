@@ -243,6 +243,15 @@ private:
         }
     };
     IntervalList<Backing> resident_ranges;
+    /// sotc: bumped at every resident_ranges.Add/Subtract. SynchronizeDmaBuffers rebuilds its
+    /// merged runs only when this (or the arena count) changed since the last rebuild.
+    u64 resident_version{};
+    u64 dma_runs_version = ~0ULL;
+    size_t dma_runs_arenas{};
+    u64 dma_runs_ranges{};
+    /// sotc (SOTC_DMA_MERGE): touching resident ranges whose start lies in the same arena,
+    /// merged into runs of (device address, bytes). Only rebuilt at the top of a sweep.
+    std::vector<std::pair<VAddr, u64>> dma_runs;
     /// Readback windows requested recently; downloaded together with the next readback.
     struct HotReadback {
         VAddr addr;

@@ -30,8 +30,13 @@ inline std::atomic<u32> uses[256]{};
 /// (allocator fault at guest 0x1a371 in 1 of 3 runs of the attract demo; 0 of 5 without).
 constexpr u32 Linger = 0;
 
+// sotc: Mark (Rasterizer::BindTextures) and Collect (GET_LOD_STATS in Liverpool::ProcessGraphics)
+// both run on the GpuCommandProcessor thread (async compute too: the ProcessCompute coroutines
+// run there), so a relaxed load + store counts exactly like fetch_add without the lock xadd per
+// streamed texture bound. std::atomic stays so the code remains well-defined if that changes.
 inline void Mark(u32 bank) {
-    uses[bank & 0xff].fetch_add(1, std::memory_order_relaxed);
+    auto& c = uses[bank & 0xff];
+    c.store(c.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 }
 
 /// The 256 bank entries the game reads (u64 each): bits 56-59 the finest mip sampled (15: not
@@ -57,7 +62,10 @@ inline void Collect(u64 (&entries)[256]) {
     (void)idle_ready;
     static u32 last_count[256]{};
     for (u32 i = 0; i < 256; ++i) {
-        const u32 n = uses[i].exchange(0, std::memory_order_relaxed);
+        const u32 n = uses[i].load(std::memory_order_relaxed); // sotc: single thread, see Mark
+        if (n) {
+            uses[i].store(0, std::memory_order_relaxed);
+        }
         if (n) {
             idle[i] = 0;
             last_count[i] = std::min<u32>(n * 256u, 0xffffff);

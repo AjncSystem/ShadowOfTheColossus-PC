@@ -85,6 +85,12 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
 TextureCache::~TextureCache() = default;
 
 void TextureCache::ProcessDownloadImages() {
+    // sotc: download_images is only ever filled (FindTexture/FindRenderTarget) under
+    // readback_linear_images, a const member, so without it the set is always empty: skip the
+    // mutex the GPU thread took twice per draw/dispatch for nothing.
+    if (!readback_linear_images) {
+        return;
+    }
     std::unique_lock lk{download_images_mutex};
     for (const ImageId image_id : download_images) {
         DownloadImageMemory(image_id, true);
@@ -580,7 +586,17 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
                           (u64(info.pixel_format) << 7) ^ (u64{info.size.width} << 23) ^
                           (u64{info.size.height} << 41) ^ u64{exact_fmt};
     FindMemo& memo = find_memos[(memo_hash ^ (memo_hash >> 31)) % NumFindMemos];
-    if (memo_enabled && memo.generation == image_set_generation &&
+    // sotc: validate the memo against the generation of its guest_address only: perfect
+    // matches share guest_address (so they share the first page, whose list keeps insertion
+    // order on erase), hence (un)registering images elsewhere cannot change the result.
+    // SOTC_MEMO_ADDR_GEN=0: any register/unregister invalidates every memo.
+    static const bool memo_addr_gen = [] {
+        const char* v = std::getenv("SOTC_MEMO_ADDR_GEN");
+        return !v || v[0] != '0';
+    }();
+    const u64 memo_gen = memo_addr_gen ? u64{addr_gens[AddrGenSlot(info.guest_address)]}
+                                       : image_set_generation;
+    if (memo_enabled && memo.generation == memo_gen &&
         memo.guest_address == info.guest_address && memo.guest_size == info.guest_size &&
         memo.size == info.size && memo.pixel_format == info.pixel_format &&
         memo.type == info.type && memo.exact_fmt == exact_fmt) {
@@ -637,7 +653,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     if (image_id && !(slot_images[image_id].info.resources < info.resources)) {
         memo = {info.guest_address, info.guest_size, info.size, info.pixel_format, info.type,
-                exact_fmt,         image_set_generation, image_id};
+                exact_fmt,         memo_gen, image_id}; // sotc: per-address generation
     }
 
     // Try to resolve overlaps (if any)
@@ -736,7 +752,8 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     return image.FindView(desc.view_info);
 }
 
-ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
+ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc,
+                                          bool update) {
     Image& image = slot_images[image_id];
     image.flags |= ImageFlagBits::GpuModified;
     if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
@@ -744,7 +761,20 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
         download_images.emplace(image_id);
     }
     image.usage.render_target = 1u;
-    UpdateImage(image_id);
+    if (update) {
+        UpdateImage(image_id);
+    } else if (True(image.flags & ImageFlagBits::Dirty) ||
+               (True(image.flags & ImageFlagBits::Registered) &&
+                (image.track_addr != image.info.guest_address ||
+                 image.track_addr_end != image.info.guest_address + image.info.guest_size))) {
+        // sotc: update=false: the caller (BeginRendering) ran UpdateImage just before, so a
+        // second one only matters when the image is still Dirty (RefreshImage's MaybeCpuDirty
+        // hash match clears only MaybeCpuDirty, a GpuDirty upload must still happen, and a CPU
+        // fault may have dirtied it meanwhile) or lost page tracking (TrackImage would re-track).
+        // Otherwise TrackImage, TouchImage (same gc_tick, already most recent) and RefreshImage
+        // would all be no-ops.
+        UpdateImage(image_id);
+    }
 
     // Register meta data for this color buffer
     if (desc.info.meta_info.cmask_addr) {
@@ -946,6 +976,7 @@ void TextureCache::RegisterImage(ImageId image_id) {
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
     ++image_set_generation;
+    ++addr_gens[AddrGenSlot(image.info.guest_address)]; // sotc: FindMemo per-address gen
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
     ForEachPage(image.info.guest_address, image.info.guest_size,
@@ -958,6 +989,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
     ++image_set_generation;
+    ++addr_gens[AddrGenSlot(image.info.guest_address)]; // sotc: FindMemo per-address gen
     lru_cache.Free(image.lru_id);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {

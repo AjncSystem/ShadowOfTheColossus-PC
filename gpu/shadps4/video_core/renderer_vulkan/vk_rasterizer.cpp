@@ -206,7 +206,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const auto& regs = liverpool->regs;
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
     SotcStats::current_program.store(1, std::memory_order_relaxed);
-    SotcStats::cmd_kinds[0].fetch_add(1, std::memory_order_relaxed);
+    if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer (sotc_stats.h)
+        SotcStats::cmd_kinds[0].fetch_add(1, std::memory_order_relaxed);
+    }
     if (!pipeline) {
         SotcStats::Drop(0, regs.color_buffers[0].Address(), regs.stage_enable.raw);
         return;
@@ -263,8 +265,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
 
-    static const bool cmd_stats = std::getenv("SOTC_CMD_STATS") != nullptr;
-    if (cmd_stats) {
+    if (SotcStats::kCmdStats) { // sotc: the shared SOTC_CMD_STATS switch (sotc_stats.h)
         const u64 args_size = u64{stride} * max_count;
         if (buffer_cache.IsRegionGpuModified(arg_address + offset, args_size) ||
             (count_address && buffer_cache.IsRegionGpuModified(count_address, 4))) {
@@ -433,7 +434,9 @@ void Rasterizer::DispatchDirect() {
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     SotcStats::current_program.store(cs.pgm_hash, std::memory_order_relaxed);
-    SotcStats::cmd_kinds[4].fetch_add(1, std::memory_order_relaxed);
+    if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer (sotc_stats.h)
+        SotcStats::cmd_kinds[4].fetch_add(1, std::memory_order_relaxed);
+    }
     // sotc: SOTC_CS_TRACE=<hash>: the buffers of the first 6 dispatches of that compute shader,
     // with the first dwords guest memory holds there (diagnostic for the GPU particle counts).
     static const u64 cs_trace = [] {
@@ -535,7 +538,9 @@ void Rasterizer::DispatchDirect() {
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
-    SotcStats::cmd_kinds[5].fetch_add(1, std::memory_order_relaxed);
+    if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer (sotc_stats.h)
+        SotcStats::cmd_kinds[5].fetch_add(1, std::memory_order_relaxed);
+    }
 
     scheduler.PopPendingOperations();
 
@@ -814,7 +819,9 @@ void Rasterizer::FlushPeriodic() {
     // sotc: the command buffer wrote a page the guest reads back: submit it now, the GPU runs
     // it while the guest gets there, and the readback finds it done (or nearly). SOTC_RB_EARLY=1
     // turns it on; measured within noise on the attract demo, so off by default.
-    SotcStats::commands.fetch_add(1, std::memory_order_relaxed);
+    if (SotcStats::kFpsLog) { // sotc: read only by the SOTC_FPS printer (sotc_stats.h)
+        SotcStats::commands.fetch_add(1, std::memory_order_relaxed);
+    }
     static const bool early = [] {
         const char* v = std::getenv("SOTC_RB_EARLY");
         return v && v[0] == '1';
@@ -1504,6 +1511,13 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     attachment_feedback_loop = false;
+    // sotc: SOTC_RT_FAST (default on) drops redundant attachment work: FindRenderTarget repeats
+    // UpdateImage only when the image still needs it, and the CMASK/HTILE clear bit is read and
+    // cleared with one lookup. SOTC_RT_FAST=0 restores the original calls and evaluation order.
+    static const bool rt_fast = [] {
+        const char* v = std::getenv("SOTC_RT_FAST");
+        return !v || v[0] != '0';
+    }();
     const auto& regs = liverpool->regs;
     const auto& key = pipeline->GetGraphicsKey();
     RenderState state;
@@ -1524,13 +1538,19 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         }
         texture_cache.UpdateImage(image_id);
         runtime.SetBackingSamples(image, key.color_samples[cb]);
-        const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
+        const auto& image_view = texture_cache.FindRenderTarget(image_id, desc, !rt_fast);
         const auto slice = image_view.info.range.base.layer;
         const auto mip = image_view.info.range.base.level;
 
         const auto& col_buf = regs.color_buffers[cb];
-        const bool is_clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
-        texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
+        // sotc: SOTC_RT_FAST: test-and-clear the CMASK bit with one lookup.
+        bool is_clear;
+        if (rt_fast) {
+            is_clear = texture_cache.TestAndTouchMeta(col_buf.CmaskAddress(), slice);
+        } else {
+            is_clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
+            texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
+        }
 
         if (image->binding.is_bound) {
             ASSERT_MSG(!image->binding.force_general,
@@ -1578,12 +1598,22 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         auto& image = texture_cache.GetImage(image_id);
 
         const auto slice = image_view.info.range.base.layer;
-        const bool is_depth_clear =
-            (regs.depth_render_control.depth_clear_enable && regs.depth_control.depth_enable &&
-             regs.depth_control.depth_write_enable) ||
-            texture_cache.IsMetaCleared(htile_address, slice);
+        const bool depth_reg_clear = regs.depth_render_control.depth_clear_enable &&
+                                     regs.depth_control.depth_enable &&
+                                     regs.depth_control.depth_write_enable;
+        // sotc: SOTC_RT_FAST: test-and-clear the HTILE bit with one lookup. It is evaluated
+        // unconditionally (no short-circuit) because the original TouchMeta always cleared it.
+        bool is_depth_clear;
+        if (rt_fast) {
+            const bool meta_clear = texture_cache.TestAndTouchMeta(htile_address, slice);
+            is_depth_clear = depth_reg_clear || meta_clear;
+        } else {
+            is_depth_clear = depth_reg_clear || texture_cache.IsMetaCleared(htile_address, slice);
+        }
         const bool is_stencil_clear = regs.depth_render_control.stencil_clear_enable;
-        texture_cache.TouchMeta(htile_address, slice, false);
+        if (!rt_fast) {
+            texture_cache.TouchMeta(htile_address, slice, false);
+        }
         ASSERT(desc.view_info.range.extent.levels == 1 && !image.binding.needs_rebind);
 
         const bool has_stencil = image.info.props.has_stencil;

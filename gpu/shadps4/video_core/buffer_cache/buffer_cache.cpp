@@ -787,11 +787,68 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
 
 void BufferCache::SynchronizeDmaBuffers() {
     fault_process_pending = true;
-    for (const auto& range : resident_ranges) {
-        const u64 page = range.start >> (ARENA_PAGE_BITS - block_shift);
-        const VAddr device_addr = range.start << block_shift;
-        const u64 size = (range.end - range.start) << block_shift;
-        SynchronizeMemory(address_space[page], device_addr, size, false, false);
+    const u64 uploads_before = SotcStats::uploads.load(std::memory_order_relaxed);
+    u64 ranges = 0;
+    // sotc (SOTC_DMA_MERGE=0 disables): the sweep visited ~1200 resident ranges ~100 times a
+    // second, one tracker walk + staging request each. Touching ranges whose start maps to the
+    // same arena are merged into runs (one SynchronizeMemory per run), rebuilt only when
+    // resident_ranges or the arena set changed. Same pages are uploaded into the same arena,
+    // just batched. A run is capped (SOTC_DMA_MERGE_MAX MiB, default 16 = staging ring block,
+    // max 64) so merging never pushes an upload to RequestLarge; a single range larger than the
+    // cap stays one run as before. Runs hold addresses only; the arena is looked up per run at
+    // sync time (a migration merges arenas, so entries sharing one keep sharing one).
+    static const bool dma_merge = [] {
+        const char* v = std::getenv("SOTC_DMA_MERGE");
+        return !(v && v[0] == '0');
+    }();
+    static const u64 dma_merge_max = [] {
+        const char* v = std::getenv("SOTC_DMA_MERGE_MAX");
+        const u64 mib = v ? std::strtoull(v, nullptr, 10) : 0;
+        return std::clamp<u64>(mib ? mib : 16, 1, 64) << 20;
+    }();
+    if (dma_merge) {
+        if (dma_runs_version != resident_version || dma_runs_arenas != arenas.size()) {
+            dma_runs_version = resident_version;
+            dma_runs_arenas = arenas.size();
+            dma_runs_ranges = resident_ranges.Size();
+            dma_runs.clear();
+            for (const auto& range : resident_ranges) {
+                const VAddr device_addr = range.start << block_shift;
+                const u64 size = (range.end - range.start) << block_shift;
+                if (!dma_runs.empty()) {
+                    auto& run = dma_runs.back();
+                    if (run.first + run.second == device_addr &&
+                        run.second + size <= dma_merge_max &&
+                        address_space[run.first >> ARENA_PAGE_BITS] ==
+                            address_space[device_addr >> ARENA_PAGE_BITS]) {
+                        run.second += size;
+                        continue;
+                    }
+                }
+                dma_runs.emplace_back(device_addr, size);
+            }
+        }
+        // sotc: by index with a copied entry, re-reading size(): nothing nested in
+        // SynchronizeMemory may invalidate the iteration even if it touched dma_runs.
+        for (size_t i = 0; i < dma_runs.size(); ++i) {
+            const auto [device_addr, size] = dma_runs[i];
+            SynchronizeMemory(address_space[device_addr >> ARENA_PAGE_BITS], device_addr,
+                              static_cast<u32>(size), false, false);
+        }
+        ranges = dma_runs_ranges;
+    } else {
+        for (const auto& range : resident_ranges) {
+            const u64 page = range.start >> (ARENA_PAGE_BITS - block_shift);
+            const VAddr device_addr = range.start << block_shift;
+            const u64 size = (range.end - range.start) << block_shift;
+            SynchronizeMemory(address_space[page], device_addr, size, false, false);
+            ++ranges;
+        }
+    }
+    SotcStats::dma_sweeps.fetch_add(1, std::memory_order_relaxed);
+    SotcStats::dma_sweep_ranges.fetch_add(ranges, std::memory_order_relaxed);
+    if (SotcStats::uploads.load(std::memory_order_relaxed) != uploads_before) {
+        SotcStats::dma_sweep_uploading.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -925,6 +982,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         backing.memory = device_memory;
         backing.offset = memory_offset >> block_shift;
         resident_ranges.Add(backing);
+        ++resident_version; // sotc: invalidates the merged DMA runs
 
         LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
 
@@ -958,7 +1016,9 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     });
     if (!copies.empty()) {
         SotcStats::uploads.fetch_add(1, std::memory_order_relaxed);
-        SotcStats::upload_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
+        if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer
+            SotcStats::upload_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
+        }
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
         for (auto& copy : copies) {
             memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);
@@ -1094,6 +1154,7 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
                (first_block << block_shift) < hot.addr + hot.size;
     });
     resident_ranges.Subtract(first_block, end_block);
+    ++resident_version; // sotc: invalidates the merged DMA runs
     gpu_modified_ranges.Subtract(first_block << block_shift,
                                  (end_block - first_block) << block_shift);
 }

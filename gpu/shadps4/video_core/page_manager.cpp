@@ -154,7 +154,8 @@ void UnregisterGuestStack(VAddr address, u64 size) {
     }
 }
 
-void ForEachNonStackRange(VAddr address, u64 size, const std::function<void(VAddr, u64)>& func) {
+// sotc: func is a NonStackRangeFn (non-owning) instead of const std::function&; see page_manager.h.
+void ForEachNonStackRange(VAddr address, u64 size, NonStackRangeFn func) {
     if (size == 0) {
         return;
     }
@@ -823,19 +824,29 @@ struct SignalImpl : public PageManager::Impl {
         const auto is_gpu_thread =
             std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
         if (!Common::IsWriteError(context) && is_gpu_thread && TryCleanWalkerLoad(context)) {
-            SotcStats::fault_walker.fetch_add(1, std::memory_order_relaxed);
+            if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer
+                SotcStats::fault_walker.fetch_add(1, std::memory_order_relaxed);
+            }
             return true;
         }
         if (Common::IsWriteError(context)) {
-            SotcStats::fault_writes.fetch_add(1, std::memory_order_relaxed);
+            // sotc: read only by the SOTC_CMD_STATS printer; every guest thread faults here, and
+            // the counter shared a cache line with command-processor counters.
+            if (SotcStats::kCmdStats) {
+                SotcStats::fault_writes.fetch_add(1, std::memory_order_relaxed);
+            }
             NoteReadFault(context, addr, is_gpu_thread, true);
-            if (!rasterizer->InvalidateMemory(addr, size, is_gpu_thread)) {
+            const bool handled = is_gpu_thread
+                                     ? rasterizer->InvalidateMemory(addr, size, true)
+                                     : rasterizer->InvalidateMemoryOnGuestFault(addr, size);
+            if (!handled) {
                 return false;
             }
             rasterizer->MarkWriteAhead(addr);
+            RepairStuckWriteFault(context, addr);
             return true;
         } else {
-            if (is_gpu_thread) {
+            if (is_gpu_thread && SotcStats::kCmdStats) { // sotc: SOTC_CMD_STATS printer only
                 SotcStats::fault_gpu_reads.fetch_add(1, std::memory_order_relaxed);
             }
             NoteReadFault(context, addr, is_gpu_thread);

@@ -130,7 +130,9 @@ void Scheduler::EndRendering() {
     if (!is_rendering) {
         return;
     }
-    SotcStats::render_breaks.fetch_add(1, std::memory_order_relaxed);
+    if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer (sotc_stats.h)
+        SotcStats::render_breaks.fetch_add(1, std::memory_order_relaxed);
+    }
     is_rendering = false;
     CommandBuffer().endRendering();
 }

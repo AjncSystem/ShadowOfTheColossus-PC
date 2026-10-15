@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include "common/alignment.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -450,9 +452,22 @@ void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
             CopyImage(src, dst);
         } else {
             // Perform depth from/to color copy using the intermediate copy buffer.
-            static constexpr size_t COPY_BUFFER_SIZE = 128_MB;
+            // sotc: sized to the copy (was a fixed 128 MiB of video memory, ~8 MiB needed for a
+            // 1080p depth buffer). CopyImageWithBuffer writes level 0 of every source layer with
+            // the source format and reads the same region back with the destination format.
+            // At least 17 MiB: above the staging ring's 16 MiB blocks the request keeps getting a
+            // dedicated, tick-synchronized buffer as before, not a ring slice that unsynchronized
+            // ring users (the tiler) could reuse while this copy is in flight.
+            const vk::BufferImageCopy probe = {
+                .imageSubresource{.layerCount = src->info.resources.layers},
+                .imageExtent = {src->info.size.width, src->info.size.height, src->info.size.depth},
+            };
+            const u64 copy_buffer_size = Common::AlignUp(
+                std::max<u64>({BufferImageCopySize(probe, src->info.pixel_format),
+                               BufferImageCopySize(probe, dst->info.pixel_format), 17_MB}),
+                u64{256});
             const auto copy_ref =
-                staging_pool.Request(COPY_BUFFER_SIZE, VideoCore::MemoryType::DeviceLocal);
+                staging_pool.Request(copy_buffer_size, VideoCore::MemoryType::DeviceLocal);
             CopyImageWithBuffer(src, dst, copy_ref.buffer, copy_ref.offset);
         }
     } else if (src->info.num_samples == 1 && dst->info.num_samples > 1 &&

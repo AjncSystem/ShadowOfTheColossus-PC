@@ -176,9 +176,12 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         flush_request();
         return;
     }
-    static const bool async = [] {
+    // sotc: on by default with the draw thread (Liverpool::IsBackThreaded): there the synchronous
+    // readback held the draw thread while the GPU caught up (~10% of its time; Shrine 38.9 ->
+    // 40.6 fps). SOTC_RB_ASYNC=0/1 forces it.
+    static const bool async = [this] {
         const char* v = std::getenv("SOTC_RB_ASYNC");
-        return v && v[0] == '1';
+        return v ? v[0] == '1' : liverpool->IsBackThreaded();
     }();
     if (!async) {
         liverpool->SendCommand<true>(std::move(flush_request));

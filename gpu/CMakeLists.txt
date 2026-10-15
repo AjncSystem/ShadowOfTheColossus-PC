@@ -27,7 +27,19 @@ if (BB_LTO)
         message(WARNING "LTO unavailable: ${bb_ipo_error}")
     endif()
 endif()
-if (BB_PGO STREQUAL "generate")
+if (BB_PGO STREQUAL "generate" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # sotc: Clang (Windows/MSYS2) instrumentation. Raw profiles go to BB_PGO_DIR/bbgpu-<id>.profraw
+    # (%m: every dump of every run merges into the same file); `llvm-profdata merge -o
+    # BB_PGO_DIR/bbgpu.profdata BB_PGO_DIR/*.profraw` makes the profile BB_PGO=use reads.
+    add_compile_options(-fprofile-generate=${BB_PGO_DIR} -fprofile-update=atomic)
+    add_link_options(-fprofile-generate=${BB_PGO_DIR})
+    add_compile_definitions(BB_PGO_GENERATE BB_PGO_CLANG)
+elseif (BB_PGO STREQUAL "use" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # Functions changed since the profile was taken are compiled without it (no error).
+    add_compile_options(-fprofile-use=${BB_PGO_DIR}/bbgpu.profdata -Wno-profile-instr-unprofiled
+                        -Wno-profile-instr-out-of-date -Wno-profile-instr-missing
+                        -Wno-backend-plugin)
+elseif (BB_PGO STREQUAL "generate")
     # Atomic counters: the GPU, recording, preparation and copy threads run the same code.
     add_compile_options(-fprofile-generate=${BB_PGO_DIR} -fprofile-update=atomic)
     add_link_options(-fprofile-generate=${BB_PGO_DIR})

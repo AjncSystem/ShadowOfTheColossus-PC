@@ -90,10 +90,10 @@ public:
         return tile_manager;
     }
 
-    /// Frees cached images not used in the last few frames, regardless of memory thresholds.
-    /// Called when a video memory allocation fails. Higher levels go deeper (sotc): level 0
-    /// frees up to 512 images idle for 4 frames, level 1 up to 4096 idle for 2, level 2 every
-    /// image not used by the current or the previous frame.
+    /// Frees cached images not used in the last few GC ticks (one per submit), regardless of
+    /// memory thresholds. Called when a video memory allocation fails. Higher levels go deeper
+    /// (sotc): level 0 frees up to 512 images last used 4 or more ticks ago, level 1 up to 4096
+    /// last used 2 or more ticks ago, level 2 every image not used in the current tick.
     void EmergencyCollect(u32 level = 0);
 
     /// sotc: EmergencyCollect, unless this thread is inside RefreshImage (holding `mutex`): then

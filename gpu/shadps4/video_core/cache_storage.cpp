@@ -341,7 +341,9 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u32>& da
         std::vector<u8> bytes;
         TakePrefetched(path, bytes);
         data.resize(bytes.size() / sizeof(u32));
-        std::memcpy(data.data(), bytes.data(), data.size() * sizeof(u32));
+        if (!data.empty()) {
+            std::memcpy(data.data(), bytes.data(), data.size() * sizeof(u32));
+        }
         return;
     }
     return LoadVector(type, path, data);

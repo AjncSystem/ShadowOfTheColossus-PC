@@ -28,7 +28,7 @@ if (BB_LTO)
     endif()
 endif()
 if (BB_PGO STREQUAL "generate" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    # sotc: Clang (Windows/MSYS2) instrumentation. Raw profiles go to BB_PGO_DIR/bbgpu-<id>.profraw
+    # sotc: Clang (Windows/MSYS2) instrumentation. Raw profiles go to BB_PGO_DIR/default_<id>.profraw
     # (%m: every dump of every run merges into the same file); `llvm-profdata merge -o
     # BB_PGO_DIR/bbgpu.profdata BB_PGO_DIR/*.profraw` makes the profile BB_PGO=use reads.
     add_compile_options(-fprofile-generate=${BB_PGO_DIR} -fprofile-update=atomic)

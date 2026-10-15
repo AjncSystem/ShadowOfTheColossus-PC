@@ -1169,14 +1169,13 @@ bool TextureCache::TryEmergencyCollect(u32 level) {
     // again (self-deadlock), and freeing images there could erase the one being refreshed. Defer
     // the collection to the next RunGarbageCollector (a submit, no lock held) instead.
     if (refresh_depth > 0) {
-        // The caller cannot escalate in place, so ask for the deepest level (2, stored as 3).
-        static_cast<void>(level);
+        // The caller cannot escalate in place, so ask for the deepest level (2, stored as 3)
+        // whatever level it asked for.
         constexpr u32 wanted = 3;
         u32 pending = pending_emergency.load(std::memory_order_relaxed);
         while (pending < wanted &&
                !pending_emergency.compare_exchange_weak(pending, wanted, std::memory_order_relaxed)) {
         }
-        // sotc: no counter here any more (it was never read); the warning reports it.
         LOG_WARNING(Render, "Emergency texture collection deferred (texture cache lock held)");
         return false;
     }
@@ -1264,7 +1263,7 @@ void TextureCache::GarbageCollectImages() {
     const auto clean_up = [&](ImageId image_id) {
         // sotc: kept images (GPU-written tiled ones below) also use up num_deletions, so a pass
         // stops early when they lead the LRU. Charging only freed images was measured worse on
-        // a 6 GB card (attract demo 27.5 -> 18.5 FPS, 28 emergency collections instead of 0):
+        // a 6 GB card (attract demo 27.5 -> 18.5 FPS, 14 emergency collections instead of 0):
         // the extra frees were images needed again a few frames later, and the churn fragmented
         // VMA. Paging the overflow beats evicting the working set.
         if (num_deletions == 0) {

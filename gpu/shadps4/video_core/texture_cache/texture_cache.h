@@ -122,7 +122,10 @@ public:
     [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
 
     /// Retrieves the render target with specified properties
-    [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc);
+    /// sotc: update=false (BeginRendering, SOTC_RT_FAST) skips the second UpdateImage when the
+    /// caller has just run it and the image needs no upload or re-tracking since.
+    [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc,
+                                              bool update = true);
 
     /// Retrieves the depth target with specified properties
     [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc);
@@ -208,6 +211,20 @@ public:
             return it.value().clear_mask & (1u << slice);
         }
         return false;
+    }
+
+    /// sotc: IsMetaCleared + TouchMeta(address, slice, false) with a single lookup
+    /// (SOTC_RT_FAST): returns the old clear bit of the slice (false when the address is not a
+    /// metadata surface, like IsMetaCleared) and clears it.
+    bool TestAndTouchMeta(VAddr address, u32 slice) {
+        auto it = surface_metas.find(address);
+        if (it == surface_metas.end()) {
+            return false;
+        }
+        auto& clear_mask = it.value().clear_mask;
+        const bool was_clear = (clear_mask & (1u << slice)) != 0;
+        clear_mask &= ~(1u << slice);
+        return was_clear;
     }
 
     /// Clears all slices of the specified metadata surface.

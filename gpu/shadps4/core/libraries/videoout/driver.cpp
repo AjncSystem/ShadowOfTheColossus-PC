@@ -248,7 +248,7 @@ void VideoOutDriver::Flip(const Request& req) {
     presenter->Present(req.frame);
 
     // sotc: SOTC_FPS=1 prints the flip rate every five seconds.
-    static const bool fps_log = std::getenv("SOTC_FPS") != nullptr;
+    const bool fps_log = SotcStats::kFpsLog; // sotc: the switch the counters use (sotc_stats.h)
     if (fps_log) {
         static auto window_start = std::chrono::steady_clock::now();
         static const auto run_start = window_start;
@@ -279,7 +279,76 @@ void VideoOutDriver::Flip(const Request& req) {
                          static_cast<unsigned long long>(copies),
                          static_cast<unsigned long long>(bytes_changed),
                          static_cast<unsigned long long>(bytes));
-            static const bool cmd_stats = std::getenv("SOTC_CMD_STATS") != nullptr;
+            if (const uint64_t sweeps = SotcStats::dma_sweeps.exchange(0)) {
+                const uint64_t ranges = SotcStats::dma_sweep_ranges.exchange(0);
+                const uint64_t uploading = SotcStats::dma_sweep_uploading.exchange(0);
+                std::fprintf(stderr, "SOTC DMA sweeps %.0f/s, %.1f ranges each, %.0f/s uploading\n",
+                             sweeps / seconds, double(ranges) / sweeps, uploading / seconds);
+            }
+            if (const uint64_t images = SotcStats::census_count.load(std::memory_order_relaxed)) {
+                const auto mib = [](const std::atomic<uint64_t>& v) {
+                    return static_cast<unsigned long long>(v.load(std::memory_order_relaxed) >> 20);
+                };
+                std::fprintf(stderr,
+                             "SOTC IMAGES %llu: gpu-written tiled %llu MiB, linear %llu MiB; "
+                             "sampled streamed %llu MiB, other %llu MiB; below base mip %llu MiB, "
+                             "below min_lod %llu MiB; live %llu MiB\n",
+                             static_cast<unsigned long long>(images), mib(SotcStats::census_gpu_tiled),
+                             mib(SotcStats::census_gpu_linear), mib(SotcStats::census_streamed),
+                             mib(SotcStats::census_other), mib(SotcStats::census_below_base),
+                             mib(SotcStats::census_below_minlod), mib(SotcStats::census_live));
+            }
+            const uint64_t grace_marks = SotcStats::fault_grace_marks.exchange(0);
+            const uint64_t grace_caps = SotcStats::fault_grace_cap_hits.exchange(0);
+            const uint64_t grace_bytes = SotcStats::fault_grace_hot_upload_bytes.exchange(0);
+            const uint64_t reg_spins = SotcStats::stack_reg_spins.exchange(0);
+            const uint64_t carves = runtime_memory_carve_splits();
+            if (grace_marks || grace_caps || grace_bytes || reg_spins || carves) {
+                std::fprintf(stderr,
+                             "SOTC fault grace: marks %llu, cap hits %llu, hot uploads %llu KiB; "
+                             "stack registry spins %llu; live view splits %llu\n",
+                             static_cast<unsigned long long>(grace_marks),
+                             static_cast<unsigned long long>(grace_caps),
+                             static_cast<unsigned long long>(grace_bytes >> 10),
+                             static_cast<unsigned long long>(reg_spins),
+                             static_cast<unsigned long long>(carves));
+            }
+            const uint64_t repairs = SotcStats::desync_repairs.exchange(0);
+            const uint64_t legit = SotcStats::desync_legit.exchange(0);
+            if (repairs || legit) {
+                std::fprintf(stderr,
+                             "SOTC page tracking desync repairs %llu (repeated faults left alone "
+                             "%llu)\n",
+                             static_cast<unsigned long long>(repairs),
+                             static_cast<unsigned long long>(legit));
+            }
+            // sotc: video memory against the budget the texture cache collects for; emergency
+            // collections mean an allocation already failed (6 GB cards in large areas).
+            if (const uint64_t budget = SotcStats::vram_budget.load(std::memory_order_relaxed)) {
+                std::fprintf(stderr,
+                             "SOTC VRAM %llu/%llu MiB (VMA blocks %llu MiB holding %llu MiB, "
+                             "buffer arenas %llu MiB, images %llu MiB in "
+                             "%llu; GC freed %llu, kept tiled %llu), emergency collections %llu\n",
+                             static_cast<unsigned long long>(
+                                 SotcStats::vram_used.load(std::memory_order_relaxed) >> 20),
+                             static_cast<unsigned long long>(budget >> 20),
+                             static_cast<unsigned long long>(
+                                 SotcStats::vma_block_bytes.load(std::memory_order_relaxed) >> 20),
+                             static_cast<unsigned long long>(
+                                 SotcStats::vma_allocation_bytes.load(std::memory_order_relaxed) >>
+                                 20),
+                             static_cast<unsigned long long>(
+                                 SotcStats::arena_bytes.load(std::memory_order_relaxed) >> 20),
+                             static_cast<unsigned long long>(
+                                 SotcStats::image_bytes.load(std::memory_order_relaxed) >> 20),
+                             static_cast<unsigned long long>(
+                                 SotcStats::image_count.load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(SotcStats::gc_freed.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::gc_kept_tiled.exchange(0)),
+                             static_cast<unsigned long long>(
+                                 SotcStats::vram_emergency.exchange(0)));
+            }
+            const bool cmd_stats = SotcStats::kCmdStats; // sotc: as the counters (sotc_stats.h)
             if (cmd_stats && flips) {
                 double k[6];
                 for (int i = 0; i < 6; ++i) {

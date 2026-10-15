@@ -8,6 +8,17 @@
 #include <cstdlib>
 
 namespace SotcStats {
+/// sotc: the switches of the stats printers in videoout/driver.cpp (SOTC_FPS line; SOTC_CMD_STATS
+/// lines inside it), read once at static initialisation, before any guest thread runs (no
+/// function-local static guard and no getenv inside the vectored fault handler; same pattern as
+/// BbStats::enabled). Counters that only one printer reads are bumped only when that printer is
+/// on: commands (SOTC_FPS) and cmd_kinds, render_breaks, upload_bytes, fault_writes,
+/// fault_walker, fault_gpu_reads (SOTC_CMD_STATS). By default the per-draw lock xadds and the
+/// guest-thread fault counter (which shared cache lines with CP counters) are gone; with the
+/// switches on, the printed numbers are unchanged (the printer reads and resets each counter with
+/// exchange(0) only under the same switch). The variables are never set at run time.
+inline const bool kFpsLog = std::getenv("SOTC_FPS") != nullptr;
+inline const bool kCmdStats = std::getenv("SOTC_CMD_STATS") != nullptr;
 inline std::atomic<uint64_t> readbacks{0};    ///< BufferCache::DownloadMemory calls
 inline std::atomic<uint64_t> readback_ns{0};  ///< time spent in them (copy and wait)
 inline std::atomic<uint64_t> watch_addr{0};     ///< SOTC_CS_WATCH: GPU writes to report

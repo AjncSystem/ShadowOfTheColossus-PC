@@ -279,11 +279,41 @@ void Scheduler::SubmitAheadAndWait() {
 }
 
 void Scheduler::PopPendingOperations() {
+    // sotc: runs for many draws. Nothing can be done when the queue is empty or its front op was
+    // deferred into the command buffer still being recorded (that tick is not submitted yet), so
+    // skip the recursive lock and the semaphore query then. An op is moved out and popped before
+    // its callback runs, so a callback reaching here again does not run it twice.
+    static const bool fast = [] {
+        const char* v = std::getenv("SOTC_POP_FAST");
+        return !v || v[0] != '0';
+    }();
+    if (!fast) {
+        std::unique_lock lk(pending_ops_mutex);
+        work_semaphore.Refresh();
+        while (!pending_ops.empty() && work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
+            pending_ops.front().callback();
+            pending_ops.pop();
+        }
+        pending_front_tick.store(pending_ops.empty() ? UINT64_MAX : pending_ops.front().gpu_tick,
+                                 std::memory_order_release);
+        return;
+    }
+    if (pending_front_tick.load(std::memory_order_acquire) >= CurrentTick()) {
+        return;
+    }
     std::unique_lock lk(pending_ops_mutex);
-    work_semaphore.Refresh();
+    if (pending_ops.empty()) {
+        return;
+    }
+    if (!work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
+        work_semaphore.Refresh();
+    }
     while (!pending_ops.empty() && work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
-        pending_ops.front().callback();
+        PendingOp op = std::move(pending_ops.front());
         pending_ops.pop();
+        pending_front_tick.store(pending_ops.empty() ? UINT64_MAX : pending_ops.front().gpu_tick,
+                                 std::memory_order_release);
+        op.callback();
     }
 }
 

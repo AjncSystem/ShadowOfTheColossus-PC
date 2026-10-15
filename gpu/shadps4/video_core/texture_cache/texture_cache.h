@@ -397,7 +397,17 @@ private:
     static constexpr size_t NumFindMemos = 1024;
     std::array<FindMemo, NumFindMemos> find_memos{};
     u64 image_set_generation{};
+    /// sotc: per-address generations for FindMemo. A perfect match needs the same
+    /// guest_address, so only (un)registering an image at that address can change the
+    /// result; bumped in RegisterImage/UnregisterImage at the image's guest_address.
+    static constexpr size_t NumAddrGens = 4096;
+    std::array<u32, NumAddrGens> addr_gens{};
+    static size_t AddrGenSlot(VAddr addr) {
+        return static_cast<size_t>((u64{addr >> 8} * 0x9E3779B97F4A7C15ULL) >> 52);
+    }
     std::mutex samplers_mutex;
+    // sotc: bumped whenever a sampler is erased (GetSampler's per-thread memo).
+    std::atomic<u64> sampler_epoch{0};
     std::mutex download_images_mutex;
     struct MetaDataInfo {
         MetaType type;

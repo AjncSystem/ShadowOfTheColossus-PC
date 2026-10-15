@@ -5,7 +5,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include "core/memory.h"
 #include "shader_recompiler/info.h"
+#include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
@@ -163,7 +165,9 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
         return false;
     }
     static std::vector<u32> data;
-    data.resize(count);
+    if (data.size() < count) {
+        data.resize(count); // grow only: data[0, count) is all that is read
+    }
     const u32* source = std::bit_cast<const u32*>(src.base_address);
     // The pattern of src_count elements, repeated (no division per element).
     std::memcpy(data.data(), source, src_count * 4);
@@ -173,6 +177,37 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
         done += chunk;
     }
     const VAddr address = dst.base_address;
+    // sotc: the tables are mostly the same every frame. When no byte of the destination is GPU
+    // written (so its pages are not read-protected and the backing is authoritative) and it
+    // already holds this data, the result of the replace below is already in place: skip its
+    // tracking updates, unprotects and invalidations (~9% of the GPU command thread).
+    // Tables larger than one clean page (or straddling one) are compared through the backing
+    // view of their mapping run, under the same condition (no byte GPU-written: the backing is
+    // what the guest sees). SOTC_FILL_HLE_FAST=0 keeps the one-page check only.
+    static const bool fast = [] {
+        const char* v = std::getenv("SOTC_FILL_HLE_FAST");
+        return !v || v[0] != '0';
+    }();
+    if (!SotcStats::OptOff() && !buffer_cache.IsRegionGpuModified(address, count * 4)) {
+        bool same = false;
+        VAddr run_start = 0;
+        u64 run_size = 0;
+        const u8* run = fast ? Core::Memory::Instance()->GetBackingRun(address, &run_start, &run_size)
+                             : nullptr;
+        if (run && run_size && address >= run_start && address + count * 4 <= run_start + run_size) {
+            same = std::memcmp(run + (address - run_start), data.data(), count * 4) == 0;
+        } else {
+            static std::vector<u32> current;
+            if (current.size() < count) {
+                current.resize(count);
+            }
+            same = buffer_cache.ReadClean(address, current.data(), static_cast<u32>(count * 4)) &&
+                   std::memcmp(current.data(), data.data(), count * 4) == 0;
+        }
+        if (same) {
+            return true;
+        }
+    }
     if (!buffer_cache.TryReplaceFromCpu(address, data.data(), count * 4)) {
         return false;
     }

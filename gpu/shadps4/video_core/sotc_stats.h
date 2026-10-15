@@ -20,6 +20,8 @@ inline std::atomic<uint64_t> readback_copies_changed{0};  ///< ... whose bytes d
 inline std::atomic<uint64_t> readback_bytes{0};
 inline std::atomic<uint64_t> readback_bytes_changed{0};
 inline std::atomic<uint64_t> uploads{0};        ///< SynchronizeMemory copies (CPU data to GPU)
+/// DMA sweeps (SynchronizeDmaBuffers): count, resident ranges visited, sweeps that uploaded.
+inline std::atomic<uint64_t> dma_sweeps{0}, dma_sweep_ranges{0}, dma_sweep_uploading{0};
 inline std::atomic<uint64_t> upload_bytes{0};
 inline std::atomic<uint64_t> render_breaks{0};  ///< EndRendering that closed a render pass
 inline std::atomic<uint64_t> fault_writes{0};       ///< guest write faults on tracked pages

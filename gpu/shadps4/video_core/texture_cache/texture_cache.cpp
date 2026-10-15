@@ -895,6 +895,34 @@ void TextureCache::RefreshImage(Image& image) {
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
                                      AmdGpu::BorderColorBuffer border_color_base,
                                      const bool is_depth) {
+    // sotc: per-thread memo of S# -> sampler for the current GC tick: a repeated S# skips the
+    // hash, the lock, the map and the LRU touch (already touched at this tick). Samplers are only
+    // erased by the garbage collector, which bumps sampler_epoch. SOTC_SAMPLER_MEMO=0 disables.
+    static_assert(sizeof(AmdGpu::Sampler) == 16);
+    static const bool sampler_memo = [] {
+        const char* v = std::getenv("SOTC_SAMPLER_MEMO");
+        return !v || v[0] != '0';
+    }();
+    struct SamplerMemo {
+        u64 raw[2];
+        u64 tick = ~0ULL;
+        u64 epoch;
+        bool is_depth;
+        vk::Sampler handle;
+    };
+    thread_local std::array<SamplerMemo, 64> memo{};
+    u64 raw[2];
+    std::memcpy(raw, &sampler, sizeof(raw));
+    const u64 tick = gc_tick;
+    const u64 epoch = sampler_epoch.load(std::memory_order_acquire);
+    SamplerMemo* slot = nullptr;
+    if (sampler_memo) {
+        slot = &memo[((raw[0] * 0x9E3779B97F4A7C15ULL) ^ raw[1] ^ (is_depth ? 1 : 0)) >> 58];
+        if (slot->tick == tick && slot->epoch == epoch && slot->is_depth == is_depth &&
+            slot->raw[0] == raw[0] && slot->raw[1] == raw[1]) {
+            return slot->handle;
+        }
+    }
     // Compare and plain uses of one S# need separate samplers.
     const u64 hash = HashCombine(XXH3_64bits(&sampler, sizeof(sampler)), is_depth);
 
@@ -902,11 +930,13 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     const auto [it, new_sampler] =
         samplers.try_emplace(hash, instance, sampler, border_color_base, is_depth);
     if (new_sampler) {
-        samplers.at(hash).lru_id = sampler_lru_cache.Insert(hash, gc_tick);
+        samplers.at(hash).lru_id = sampler_lru_cache.Insert(hash, tick);
     } else {
-        sampler_lru_cache.Touch(it->second.lru_id, gc_tick);
+        sampler_lru_cache.Touch(it->second.lru_id, tick);
     }
-
+    if (slot) {
+        *slot = SamplerMemo{{raw[0], raw[1]}, tick, epoch, is_depth, it->second.Handle()};
+    }
     return it->second.Handle();
 }
 
@@ -1218,6 +1248,7 @@ void TextureCache::GarbageCollectSamplers() {
         --num_deletions;
         const size_t lru_id = samplers.at(hash).lru_id;
         samplers.erase(hash);
+        sampler_epoch.fetch_add(1, std::memory_order_release);
         sampler_lru_cache.Free(lru_id);
         return false;
     };

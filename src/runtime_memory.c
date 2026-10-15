@@ -860,6 +860,14 @@ static void cache_region(size_t i) {
     const unsigned char *backing=vmas[i].kind!=KIND_RESERVED && backing_base ? backing_base+vmas[i].phys : NULL;
     region_cache[region_cache_next++ % 8]=(CachedRegion){generation,vmas[i].start,vmas[i].end,vmas[i].kind,backing};
 }
+/* sotc: the VMA table generation, for caches of backing pointers outside this file: a pointer
+ * obtained while it was even stays valid until it changes (the invariant cached_region relies
+ * on: only write_lock/write_unlock bump it; page protection takes the read lock). Odd (never
+ * cache) while the table changes or when the GPU caches are disabled. */
+uint64_t runtime_memory_generation(void) {
+    if (runtime_disabled_optimizations & 1) return 1;
+    return __atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
+}
 /* sotc: the GPU reads guest memory through the backing view on every upload; the per-thread
  * region cache spares it the table lock (a winpthread rwlock, slow) and the binary search. */
 const unsigned char *runtime_memory_backing_pointer(uintptr_t address) {

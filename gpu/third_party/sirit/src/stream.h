@@ -11,6 +11,7 @@
 #include <cassert>
 #include <concepts>
 #include <cstddef>
+#include <cstdlib>
 #include <functional>
 #include <string_view>
 #include <unordered_map>

@@ -237,6 +237,9 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
     return 0;
 }
 
+// sotc: src/runtime_memory.c, live view splits since the last call.
+extern "C" uint64_t runtime_memory_carve_splits(void);
+
 void VideoOutDriver::Flip(const Request& req) {
     // Update HDR status before presenting.
     presenter->SetHDR(req.port->is_hdr);

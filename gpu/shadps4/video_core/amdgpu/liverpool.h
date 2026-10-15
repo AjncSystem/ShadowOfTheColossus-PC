@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
@@ -22,6 +24,11 @@
 
 namespace Vulkan {
 class Rasterizer;
+class Pipeline;
+}
+
+namespace Shader {
+struct Info;
 }
 
 namespace Libraries::VideoOut {
@@ -79,12 +86,19 @@ public:
     }
 
     void WaitGpuIdle() noexcept {
-        std::unique_lock lk{submit_mutex};
-        submit_cv.wait(lk, [this] { return num_submits == 0; });
+        {
+            std::unique_lock lk{submit_mutex};
+            submit_cv.wait(lk, [this] { return num_submits == 0; });
+        }
+        // sotc: and until the draw thread ran what the command processor queued.
+        while (back_tail.load(std::memory_order_acquire) != back_head.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
     }
 
     bool IsGpuIdle() const {
-        return num_submits == 0;
+        return num_submits == 0 &&
+               back_tail.load(std::memory_order_acquire) == back_head.load(std::memory_order_acquire);
     }
 
     void SetVoPort(Libraries::VideoOut::VideoOutPort* port) {
@@ -97,6 +111,14 @@ public:
 
     template <bool wait_done = false>
     void SendCommand(auto&& func) {
+        // sotc: from the command processor itself (it forwards the queue to the draw thread).
+        if (back_threaded && std::this_thread::get_id() == gpu_id) {
+            QueueBackFunc(Common::UniqueFunction<void>{std::move(func)}, true);
+            if constexpr (wait_done) {
+                DrainBack();
+            }
+            return;
+        }
         if constexpr (wait_done) {
             std::binary_semaphore sem{0};
             {
@@ -142,6 +164,57 @@ public:
 
     std::thread::id GetGpuCommandProcessorThread() {
         return gpu_id;
+    }
+
+    /// sotc: the draw thread (SOTC_CP_THREADS, on by default). The command processor parses the
+    /// command buffers and resolves the pipeline of every draw and dispatch, and the draw thread
+    /// binds and records them, in the same order: the pipeline lookup (~20% of the command
+    /// processor time) runs while the previous draws are bound. Every other operation that
+    /// touches the GPU state or writes guest memory for the GPU is queued to the draw thread as
+    /// well, so it keeps the command stream order. The draw thread owns copies of the registers
+    /// (updated from the chunks the command processor changed), of the compute registers and of
+    /// the per-draw shader data (Shader::InfoRuntime, slot 1).
+    bool IsBackThreaded() const noexcept {
+        return back_threaded;
+    }
+    bool OnBackThread() const noexcept {
+        return back_threaded && std::this_thread::get_id() == back_id;
+    }
+    /// The command processor or the draw thread: both work on the GPU state.
+    bool IsGpuSideThread() const noexcept {
+        const auto id = std::this_thread::get_id();
+        return id == gpu_id || (back_threaded && id == back_id);
+    }
+    /// A fault on the command processor thread: the draw thread must be idle before the fault
+    /// handler touches the GPU state (it may also produce what the faulting read wants).
+    void PrepareGpuSideFault() {
+        if (back_threaded && std::this_thread::get_id() == gpu_id) {
+            DrainBack();
+        }
+    }
+    /// Registers of the draw or dispatch being bound (the draw thread's copy on that thread).
+    const Regs& DrawRegs() const noexcept {
+        return OnBackThread() ? back_regs : regs;
+    }
+    const ComputeProgram& DrawCsRegs() noexcept {
+        return OnBackThread() ? back_cs : GetCsRegs();
+    }
+    const std::array<CbDbExtent, NUM_COLOR_BUFFERS>& DrawCbExtent() const noexcept {
+        return OnBackThread() ? back_cb_extent : last_cb_extent;
+    }
+    const CbDbExtent& DrawDbExtent() const noexcept {
+        return OnBackThread() ? back_db_extent : last_db_extent;
+    }
+    /// Command processor: waits until the draw thread ran everything queued.
+    void DrainBack();
+    /// True on the command processor thread while the draw thread does the GPU work.
+    bool RunsGpuWorkElsewhere() const noexcept {
+        return back_threaded && std::this_thread::get_id() == gpu_id;
+    }
+    /// Command processor: runs func on the draw thread after what is queued, and waits for it.
+    void RunOnBackThread(Common::UniqueFunction<void>&& func) {
+        QueueBackFunc(std::move(func), true);
+        DrainBack();
     }
 
 #ifdef __linux__
@@ -244,6 +317,102 @@ private:
     u32 gpu_tid;
 #endif
     s32 curr_qid{-1};
+
+    // sotc: the draw thread (see IsBackThreaded).
+    struct BackStage {
+        Shader::Info* info;
+        std::array<u32, 16> user_data; // ShaderParams::NumShaderUserData
+        u32 num_user_data; // ~0u: no user data bound
+        VAddr pgm_base;
+        std::vector<u32> flat;
+    };
+    struct BackOp {
+        enum class Kind : u8 { Func, Draw, DrawIndirect, Dispatch, DispatchIndirect };
+        Kind kind{};
+        bool is_indexed{};
+        u16 vertex_sgpr_offset{};
+        u16 instance_sgpr_offset{};
+        u32 index_offset{};
+        u32 offset{};
+        u32 stride{};
+        u32 max_count{};
+        u32 size{};
+        VAddr address{};
+        VAddr count_address{};
+        const Vulkan::Pipeline* pipeline{};
+        std::vector<u32> reg_chunks; // chunk index followed by its RegChunkDwords dwords
+        std::array<CbDbExtent, NUM_COLOR_BUFFERS> cb_extent{};
+        CbDbExtent db_extent{};
+        ComputeProgram cs{};
+        std::array<BackStage, 5> stages{};
+        u32 num_stages{};
+        Common::UniqueFunction<void> func;
+    };
+    static constexpr u32 RegChunkDwords = 64;
+    static constexpr u32 NumRegChunks = Regs::NumRegs / RegChunkDwords;
+    static constexpr u64 BackRingSize = 512;
+
+    template <typename F>
+    void BackOrRun(F&& func, bool writes_memory = true) {
+        if (!back_threaded) {
+            func();
+            return;
+        }
+        QueueBackFunc(Common::UniqueFunction<void>{std::forward<F>(func)}, writes_memory);
+    }
+    void QueueBackFunc(Common::UniqueFunction<void>&& func, bool writes_memory);
+    void SubmitDraw(bool is_indexed, u32 index_offset);
+    void SubmitDrawIndirect(bool is_indexed, VAddr address, u32 offset, u32 stride, u32 max_count,
+                            VAddr count_address, u16 vertex_sgpr_offset, u16 instance_sgpr_offset);
+    void SubmitDispatch(bool indirect, VAddr address, u32 offset, u32 size);
+    BackOp& BackAlloc();
+    void BackPublish(bool writes_memory);
+    void CaptureBackOp(BackOp& op, const Vulkan::Pipeline* pipeline);
+    /// Before reading guest memory the queued work may write (pipeline lookups read the SRTs).
+    void WaitBackWrites() {
+        if (back_threaded && back_tail.load(std::memory_order_acquire) < back_write_seq) {
+            DrainBack();
+        }
+    }
+    void MarkRegs(u32 first_dword, u32 num_dwords) {
+        if (!back_threaded || num_dwords == 0) {
+            return;
+        }
+        const u32 last = std::min(first_dword + num_dwords - 1, Regs::NumRegs - 1);
+        for (u32 chunk = first_dword / RegChunkDwords; chunk <= last / RegChunkDwords; ++chunk) {
+            const u64 bit = u64{1} << (chunk % 64);
+            if (!(dirty_chunks[chunk / 64] & bit)) {
+                dirty_chunks[chunk / 64] |= bit;
+                dirty_list.push_back(static_cast<u16>(chunk));
+            }
+        }
+    }
+    void MarkRegs(const void* field, size_t bytes) {
+        const auto offset = static_cast<u32>(reinterpret_cast<const u32*>(field) -
+                                             regs.reg_array.data());
+        MarkRegs(offset, static_cast<u32>((bytes + 3) / 4));
+    }
+    void ExecuteBackOp(BackOp& op);
+    void BackLoop(std::stop_token stoken);
+
+    bool back_threaded{};
+    std::thread::id back_id{};
+    std::vector<BackOp> back_ring;
+    std::atomic<u64> back_head{0};
+    std::atomic<u64> back_tail{0};
+    std::atomic<bool> back_sleeping{false};
+    std::atomic<bool> drain_waiting{false};
+    std::mutex back_mutex;
+    std::condition_variable back_cv;
+    std::condition_variable drain_cv;
+    u64 back_write_seq{0};
+    Regs back_regs{};
+    ComputeProgram back_cs{};
+    std::array<CbDbExtent, NUM_COLOR_BUFFERS> back_cb_extent{};
+    CbDbExtent back_db_extent{};
+    std::array<u64, (NumRegChunks + 63) / 64> dirty_chunks{};
+    std::vector<u16> dirty_list;
+    std::jthread back_thread{};
 };
 
 } // namespace AmdGpu

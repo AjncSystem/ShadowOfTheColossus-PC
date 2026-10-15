@@ -51,15 +51,18 @@ def load_ini():
 
 def no_console():
     """Started without a console (the launcher): console programs must not open their own."""
+    if os.name != 'nt':
+        return 0
     import ctypes
     return 0 if ctypes.windll.kernel32.GetConsoleWindow() else subprocess.CREATE_NO_WINDOW
 
 
 def find_probe():
-    for candidate in (PORT / 'bin' / 'bb-probe.exe', PORT / 'out' / 'bb-probe.exe'):
+    name = 'bb-probe.exe' if os.name == 'nt' else 'bb-probe'  # Linux: run.sh builds out/bb-probe
+    for candidate in (PORT / 'bin' / name, PORT / 'out' / name):
         if candidate.is_file():
             return candidate
-    fail('bb-probe.exe not found: build it with build.sh (MSYS2 CLANG64) or use a packaged build.')
+    fail(f'{name} not found: build it with build.sh (MSYS2 CLANG64 on Windows) or use a packaged build.')
 
 
 def run_script(name, *args):
@@ -171,7 +174,7 @@ def main():
 
     probe = find_probe()
     # Development builds run from the MSYS2 tree: its CLANG64 DLLs (SDL3, FFmpeg, ...).
-    if not (probe.parent / 'SDL3.dll').is_file():
+    if os.name == 'nt' and not (probe.parent / 'SDL3.dll').is_file():
         clang64 = Path(env.get('MSYS2_ROOT', r'C:\msys64')) / 'clang64' / 'bin'
         if clang64.is_dir():
             env['PATH'] = f'{clang64}{os.pathsep}{env.get("PATH", "")}'

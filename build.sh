@@ -12,15 +12,9 @@ MINGW*|MSYS*)
     for tool in clang cmake ninja pkg-config; do
         command -v "$tool" >/dev/null || { echo "Need $tool from MSYS2 CLANG64 (packaging/windows/README.md)." >&2; exit 1; }
     done
-    if [[ ! -f gpu/third_party/fsr-vulkan/CMakeLists.txt || ! -f gpu/third_party/imgui/imgui.h ||
-          ! -f gpu/third_party/xbyak/xbyak/xbyak.h ]]; then
+    if [[ ! -f gpu/third_party/imgui/imgui.h || ! -f gpu/third_party/xbyak/xbyak/xbyak.h ]]; then
         git submodule update --init --recursive
     fi
-    for patch in gpu/patches/fsr-vulkan/*.patch; do
-        if ! git -C gpu/third_party/fsr-vulkan apply --reverse --check "$PWD/$patch" 2>/dev/null; then
-            git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
-        fi
-    done
     # sotc: llvm-windres, binutils windres fails on build paths with spaces ("Unable to create
     # temp file").
     # sotc: BB_PGO=generate builds an instrumented exe (Clang profile in pgo/, see
@@ -34,11 +28,11 @@ MINGW*|MSYS*)
         -DBB_PGO_DIR="$PWD/pgo" -DBB_LTO="${BB_LTO:-ON}" -DCMAKE_C_COMPILER=clang \
         -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_RC_COMPILER=llvm-windres >/dev/null
     echo "GPU library and loader: PGO $pgo, LTO ${BB_LTO:-ON}"
-    if ! ninja -C out/gpu bb-probe bb-gpu-capabilities bb-play > out/gpu-build.log 2>&1; then
+    if ! ninja -C out/gpu bb-probe bb-gpu-capabilities > out/gpu-build.log 2>&1; then
         grep -v '^\[' out/gpu-build.log | tail -40 >&2
         echo 'Build failed (full log: out/gpu-build.log)' >&2; exit 1
     fi
-    cp out/gpu/bb-probe.exe out/gpu/bb-gpu-capabilities.exe out/gpu/bb-play.exe out/
+    cp out/gpu/bb-probe.exe out/gpu/bb-gpu-capabilities.exe out/
     echo "Built $PWD/out/bb-probe.exe"
     exit 0
     ;;
@@ -70,16 +64,10 @@ if [[ -z $pgo ]]; then
     if [[ -n $(find pgo -name '*.gcda' -print -quit 2>/dev/null) ]]; then pgo=use; else pgo=off; fi
 fi
 mkdir -p pgo
-# Submodules (git clone --recursive, or: git submodule update --init) and this port's changes
-# to FSR-Vulkan (gpu/patches/fsr-vulkan), applied to its working tree once.
-if [[ ! -f gpu/third_party/fsr-vulkan/CMakeLists.txt || ! -f gpu/third_party/imgui/imgui.h ]]; then
+# Submodules (git clone --recursive, or: git submodule update --init).
+if [[ ! -f gpu/third_party/imgui/imgui.h ]]; then
     git submodule update --init --recursive
 fi
-for patch in gpu/patches/fsr-vulkan/*.patch; do
-    if ! git -C gpu/third_party/fsr-vulkan apply --reverse --check "$PWD/$patch" 2>/dev/null; then
-        git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
-    fi
-done
 cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO="$pgo" \
     -DBB_LTO="${BB_LTO:-ON}" -DBB_PGO_DIR="$PWD/pgo" >/dev/null
 echo "GPU library: PGO $pgo, LTO ${BB_LTO:-ON}"

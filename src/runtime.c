@@ -189,7 +189,7 @@ static ABI __attribute__((noreturn)) void guest_libc_exit(int status) {
 uintptr_t runtime_resolve(const char *scoped, int is_data) {
     if (!(capabilities & 1)) return 0;
     /* sotc: imports are matched by NID alone. The #library#module suffix letters are
-     * assigned per executable, so the Bloodborne spellings do not apply to other games. */
+     * assigned per executable, so they differ from one game to another. */
     char name[16];
     size_t length=strcspn(scoped,"#");
     if (length>=sizeof(name)) return 0;
@@ -200,7 +200,7 @@ uintptr_t runtime_resolve(const char *scoped, int is_data) {
         if (!strcmp(name, "ZT4ODD2Ts9o")) return (uintptr_t)&need_libc_internal;
         return 0;
     }
-    /* Exact scoped imports for CUSA03173; the suffix identifies library/module. */
+    /* libc/runtime imports the loader implements itself (matched by NID). */
     if (!strcmp(name, "bzQExy189ZI")) return (uintptr_t)init_env;
     if (!strcmp(name, "8G2LB+A3rzg")) return (uintptr_t)guest_atexit;
     if (!strcmp(name, "tsvEmnenz48")) return (uintptr_t)guest_cxa_atexit;

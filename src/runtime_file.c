@@ -213,7 +213,7 @@ static File *get(int fd) {
 }
 /* BB_AUDIO_TRACE=1: sound file opens and failed reads (missing game sounds). */
 static int audio_trace(void) { static int v=-1; if (v<0) { const char *e=getenv("BB_AUDIO_TRACE"); v=e && e[0]=='1'; } return v; }
-/* Game mounts (including linked mod overlays) are read-only. Saves use other mounts. */
+/* Game mounts are read-only. Saves use other mounts. */
 static int game_path(const char *p) {
     if (!p || !*p) return 0;
     if (*p!='/') return 1;
@@ -271,17 +271,6 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     ++opens;
     pthread_mutex_unlock(&lock);
     if (audio_trace() && strstr(guest,"sound/")) printf("Audio trace: open(%s) -> fd %d, %lld bytes\n",guest,fd,(long long)s.st_size);
-    const char *mod_trace=getenv("BB_MOD_TRACE"), *mod_root=getenv("BB_MODS_DIR");
-    if (mod_trace && mod_trace[0]=='1' && mod_root) {
-        char actual[PATH_MAX],root[PATH_MAX];
-        static unsigned traced;
-        if (realpath(path,actual) && realpath(mod_root,root)) {
-            size_t n=strlen(root);
-            if (!strncmp(actual,root,n) && (actual[n]=='/' || actual[n]=='\\') &&
-                __atomic_fetch_add(&traced,1,__ATOMIC_RELAXED)<32)
-                printf("Mods: open %s -> %s\n",guest,actual);
-        }
-    }
     return fd;
 }
 static int64_t do_close(int fd) {

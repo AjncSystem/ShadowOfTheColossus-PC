@@ -115,7 +115,7 @@ static SDL_Gamepad *current_gamepad(void) {
     }
     return gamepad;
 }
-/* Controls: what each PS4 input is bound to. Defaults below; bbport.ini (BB_CONFIG) lines
+/* Controls: what each PS4 input is bound to. Defaults below; sotc.ini (BB_CONFIG) lines
  * key.<input>=<SDL key names> and pad.<input>=<SDL gamepad button names>, comma-separated,
  * replace an input's binding (empty: unbound). Inputs: the buttons (cross ... right, touchpad =
  * a left-side click, touchpad_right), and on the keyboard the sticks: move_* (left), look_*

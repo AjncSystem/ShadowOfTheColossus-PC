@@ -1,7 +1,8 @@
 /* System services for an offline, single-user console:
  *   - one local user (id 1) who is logged in but not signed in to PSN;
  *   - network cable unplugged: NetCtl disconnected, sockets unavailable;
- *   - common dialogs complete immediately (no UI is drawn yet);
+ *   - common dialogs complete at once, except the save list and the save YES/NO messages,
+ *     which the overlay shows;
  *   - the whole package is installed (PlayGo reports every chunk local).
  * Every entry here is an explicit contract; unknown functions still stop. */
 #define _GNU_SOURCE
@@ -206,10 +207,10 @@ static int32_t dialog_term(int i) {
     static ABI int32_t tag##_open(const void *p) { (void)p; return dialog_open(i); } \
     static ABI int32_t tag##_status(void) { return dialog_status(i); } \
     static ABI int32_t tag##_term(void) { return dialog_term(i); }
-DIALOG(msg,1) DIALOG(profile,3) DIALOG(commerce,4)
+DIALOG(profile,3) DIALOG(commerce,4)
 /* SaveDataDialog. The list mode (pick the save to write, load or delete) is shown on screen by
  * the overlay (bbgpu_save_list_*) and stays running until a save is chosen or the list is left;
- * the other modes (messages, progress bars) complete at once with OK/Yes.
+ * the other modes (messages, progress bars): see save_message below.
  * OrbisSaveDataDialogParam: base param (48 bytes), size, mode, dispType, then pointers to the
  * animation, items, user message, system message, error code and progress bar params, userData.
  * Items: user, titleId*, dirName*, dirNameNum, newItem*, focusPos, focusPosDirName*.
@@ -218,12 +219,16 @@ DIALOG(msg,1) DIALOG(profile,3) DIALOG(commerce,4)
 static struct {
     int list, has_new, choice; /* choice: -1 open, -2 cancelled, else the item */
     int32_t mode, disp, user; void *user_data;
+    int prompt, button, kind; unsigned seq; char dir[33]; /* a message; prompt: YES/NO on the overlay */
     uint32_t count; char names[SAVE_LIST_MAX][32];
     uint32_t shown; int map[SAVE_LIST_MAX]; /* listed saves: index into names (deleted ones hidden) */
 } save_dialog;
 int runtime_savedata_param(int32_t user, const char *dir, void *param);
 void runtime_savedata_describe(int32_t user, const char *dir, char *out, size_t size, int64_t *mtime);
 int runtime_savedata_remove(int32_t user, const char *dir);
+int runtime_savedata_last_check(const char *dir, unsigned *seq);
+int runtime_savedata_restored(const char *dir);
+int runtime_savedata_quarantine(int32_t user, const char *dir, char *out, size_t size);
 /* Shows save_dialog's items (the new save first when saving); `selected` < 0: by focusPos. */
 static int save_list_show(int selected, uint32_t focus, const char *focus_dir) {
     static char lines[SAVE_LIST_MAX+1][400];
@@ -263,6 +268,147 @@ static int save_list_show(int selected, uint32_t focus, const char *focus_dir) {
                       : save_dialog.disp==2 ? "Carregar jogo  /  Load game" : "Apagar  /  Delete";
     return n && bbgpu_save_list_open(title,line_ptrs,n,selected,first_data);
 }
+/* sotc: SaveDataDialog messages (every mode but the list). What Shadow of the Colossus opens
+ * (EU 1.01 eboot, PS4SaveWorker state machines):
+ *   PROGRESS_BAR (5)  load, save and restore progress                 -> completes at once
+ *   USER_MSG (2) YES/NO "restore the backup?" (CheckBackupData found one)
+ *                     YES -> RestoreBackupData; NO -> the next message
+ *   USER_MSG (2) YES/NO "the data is corrupted" (no backup, or the restore was declined)
+ *                     YES -> sceSaveDataDelete (save and backup); NO -> the load fails
+ *   SYSTEM_MSG (3) OVERWRITE after an existing slot was picked: YES writes, NO goes back
+ *   SYSTEM_MSG (3) NOSPACE_CONTINUABLE, ERROR_CODE (4): a save or load failed, answer ignored
+ * The YES/NO messages are asked on the overlay with the game's own text. SOTC_SAVE_PROMPT=auto
+ * (or no overlay) answers them alone: restore once per save and session (a broken backup would
+ * loop), keep a corrupted save (SOTC_SAVE_CORRUPT=delete lets the game delete it). A save the
+ * game calls corrupted is copied to <title>.quarantine first, whatever the answer. Everything
+ * else completes with OK/YES and is logged with its type. */
+enum { MSG_GENERIC, MSG_RESTORE, MSG_CORRUPTED };
+static const char *const msg_kind_names[]={"yes/no","restore backup?","corrupted data"};
+static unsigned save_answered_seq; /* CheckBackupData number of the last answered message */
+static const char *save_sys_msg_name(uint32_t type) {
+    switch (type) {
+    case 1: return "NODATA"; case 2: return "CONFIRM"; case 3: return "OVERWRITE";
+    case 4: return "NOSPACE"; case 5: return "PROGRESS"; case 6: return "FILE_CORRUPTED";
+    case 7: return "FINISHED"; case 8: return "NOSPACE_CONTINUABLE";
+    case 10: return "CORRUPTED_AND_DELETED"; case 11: return "CORRUPTED_AND_CREATED";
+    case 13: return "CORRUPTED_AND_RESTORE"; case 14: return "TOTAL_SIZE_EXCEEDED";
+    default: return "unknown";
+    }
+}
+static const char *save_error_name(uint32_t code) {
+    switch (code) {
+    case 0x809F0003: return "BUSY"; case 0x809F0004: return "NOT_MOUNTED";
+    case 0x809F0007: return "EXISTS"; case 0x809F0008: return "NOT_FOUND";
+    case 0x809F000A: return "NO_SPACE_FS"; case 0x809F000B: return "INTERNAL";
+    case 0x809F000C: return "MOUNT_FULL"; case 0x809F000D: return "BAD_MOUNTED";
+    case 0x809F000E: return "FILE_NOT_FOUND"; case 0x809F000F: return "BROKEN";
+    default: return "";
+    }
+}
+/* The game's message text on one log line. */
+static const char *one_line(const char *text, char *out, size_t size) {
+    size_t n=0;
+    for (;text && text[n] && n+1<size;++n) out[n]=text[n]=='\n' || text[n]=='\r' ? ' ' : text[n];
+    out[n]=0;
+    return out;
+}
+static void save_answer(int yes, const char *how) {
+    save_dialog.button=yes ? 1 : 2; /* YES / NO */
+    save_dialog.prompt=0; dialogs[2].status=3;
+    if (save_dialog.kind!=MSG_GENERIC) save_answered_seq=save_dialog.seq;
+    printf("Runtime: SaveDataDialog YES/NO (%s) '%s' -> %s (%s)\n",msg_kind_names[save_dialog.kind],
+           save_dialog.dir,yes ? "YES" : "NO",how);
+}
+static void save_yes_no(const char *msg, const char *disp_name) {
+    char text[240];
+    unsigned seq=0;
+    const int check=save_dialog.dir[0] ? runtime_savedata_last_check(save_dialog.dir,&seq) : -1;
+    save_dialog.seq=seq;
+    save_dialog.kind=check<0 ? MSG_GENERIC : check==1 && seq!=save_answered_seq ? MSG_RESTORE : MSG_CORRUPTED;
+    printf("Runtime: SaveDataDialog USER_MSG YES/NO (%s, %s) '%s' \"%s\"\n",msg_kind_names[save_dialog.kind],
+           disp_name,save_dialog.dir,one_line(msg,text,sizeof(text)));
+    char kept[700]="";
+    int copied=-1;
+    if (save_dialog.kind==MSG_CORRUPTED) {
+        copied=runtime_savedata_quarantine(save_dialog.user,save_dialog.dir,kept,sizeof(kept));
+        if (copied) fprintf(stderr,"Runtime: could not copy the corrupted save '%s' aside\n",save_dialog.dir);
+        else printf("Runtime: corrupted save '%s' copied to %s\n",save_dialog.dir,kept);
+    }
+    const char *corrupt=getenv("SOTC_SAVE_CORRUPT");
+    const int yes=save_dialog.kind==MSG_RESTORE ? !runtime_savedata_restored(save_dialog.dir)
+                 : save_dialog.kind==MSG_CORRUPTED ? !copied && corrupt && !strcmp(corrupt,"delete")
+                 : 1;
+    const char *ask=getenv("SOTC_SAVE_PROMPT");
+    if (!ask || strcmp(ask,"auto")) {
+        static char title[1400];
+        const char *fallback=save_dialog.kind==MSG_RESTORE ? "Restaurar o backup deste save?"
+                           : save_dialog.kind==MSG_CORRUPTED ? "Os dados deste save est\xc3\xa3o corrompidos. Apagar?"
+                           : "Continuar?";
+        int n=snprintf(title,sizeof(title),"%s",msg && *msg ? msg : fallback);
+        if (n<0 || (size_t)n>=sizeof(title)) n=0;
+        if (save_dialog.kind==MSG_CORRUPTED && !copied)
+            snprintf(title+n,sizeof(title)-n,"\n\nUma c\xc3\xb3pia foi guardada em:\n%s",kept);
+        else if (save_dialog.kind==MSG_CORRUPTED)
+            snprintf(title+n,sizeof(title)-n,"%s","\n\nN\xc3\xa3o foi poss\xc3\xadvel guardar uma c\xc3\xb3pia: Sim apaga o save.");
+        const char *const choices[2]={"Sim  /  Yes","N\xc3\xa3o  /  No"};
+        if (bbgpu_save_list_open(title,choices,2,yes ? 0 : 1,-1)) {
+            save_dialog.prompt=1; dialogs[2].status=2; /* running until answered (save_status) */
+            return;
+        }
+    }
+    save_answer(yes,"auto");
+}
+/* OrbisSaveDataDialogParam pointers: items +0x48 (user, titleId*, dirName* +0x10, dirNameNum
+ * +0x18), userMsg +0x50 (buttonType, msgType, msg* +8), sysMsg +0x58 (type, value +8),
+ * errorCode +0x60, progressBar +0x68 (barType, msg* +8, sysMsgType +0x10). */
+static void save_message(const unsigned char *b, int32_t mode, int32_t disp) {
+    const char *disp_name=disp==1 ? "save" : disp==2 ? "load" : disp==3 ? "delete" : "?";
+    const unsigned char *items, *user_msg, *sys_msg, *err_msg, *progress;
+    memcpy(&items,b+0x48,8); memcpy(&user_msg,b+0x50,8); memcpy(&sys_msg,b+0x58,8);
+    memcpy(&err_msg,b+0x60,8); memcpy(&progress,b+0x68,8);
+    save_dialog.dir[0]=0; save_dialog.kind=MSG_GENERIC;
+    if (items) {
+        const char *dirs; memcpy(&dirs,items+0x10,8);
+        uint32_t count; memcpy(&count,items+0x18,4);
+        memcpy(&save_dialog.user,items,4);
+        if (dirs && count) snprintf(save_dialog.dir,sizeof(save_dialog.dir),"%.32s",dirs);
+    }
+    dialogs[2].status=3;
+    char text[240];
+    if (mode==2 && user_msg) {
+        uint32_t buttons; memcpy(&buttons,user_msg,4);
+        const char *msg; memcpy(&msg,user_msg+8,8);
+        if (buttons==1 || buttons==3) { save_yes_no(msg,disp_name); return; } /* YES/NO, OK/CANCEL */
+        printf("Runtime: SaveDataDialog USER_MSG %s (%s) '%s' \"%s\" -> OK\n",buttons==2 ? "no buttons" : "OK",
+               disp_name,save_dialog.dir,one_line(msg,text,sizeof(text)));
+        return;
+    }
+    if (mode==3 && sys_msg) {
+        uint32_t type; memcpy(&type,sys_msg,4);
+        uint64_t value; memcpy(&value,sys_msg+8,8);
+        printf("Runtime: SaveDataDialog SYSTEM_MSG %s (%u, %s) '%s' value=%llu -> %s\n",save_sys_msg_name(type),
+               (unsigned)type,disp_name,save_dialog.dir,(unsigned long long)value,type==2 || type==3 ? "YES" : "OK");
+        if (type==4 || type==8 || type==14)
+            fprintf(stderr,"Runtime: the game found no space for save data (%llu blocks of 32 KiB needed): nothing was saved\n",
+                    (unsigned long long)value);
+        else if (type!=2 && type!=3)
+            fprintf(stderr,"Runtime: SaveDataDialog system message %u answered OK unseen (not one SotC uses)\n",(unsigned)type);
+        return;
+    }
+    if (mode==4 && err_msg) {
+        uint32_t code; memcpy(&code,err_msg,4);
+        printf("Runtime: SaveDataDialog ERROR_CODE 0x%x %s (%s) '%s' -> OK\n",(unsigned)code,save_error_name(code),
+               disp_name,save_dialog.dir);
+        return;
+    }
+    if (mode==5) {
+        uint32_t type=0; if (progress) memcpy(&type,progress+0x10,4);
+        printf("Runtime: SaveDataDialog PROGRESS_BAR %s (%s) '%s' -> completed\n",
+               type==2 ? "RESTORE" : type==1 ? "PROGRESS" : "custom text",disp_name,save_dialog.dir);
+        return;
+    }
+    printf("Runtime: SaveDataDialog mode=%d (%s) '%s' -> completed\n",mode,disp_name,save_dialog.dir);
+}
 static ABI int32_t save_init(void) { return dialog_init(2); }
 static ABI int32_t save_open(const void *p) {
     if (!dialogs[2].initialized) return DIALOG_NOT_INITIALIZED;
@@ -271,7 +417,7 @@ static ABI int32_t save_open(const void *p) {
     int32_t mode, disp; memcpy(&mode,b+0x34,4); memcpy(&disp,b+0x38,4);
     const unsigned char *items; memcpy(&items,b+0x48,8);
     memcpy(&save_dialog.user_data,b+0x70,8);
-    save_dialog.mode=mode; save_dialog.list=0;
+    save_dialog.mode=mode; save_dialog.list=0; save_dialog.prompt=0; save_dialog.button=1;
     if (mode==1 && items) {
         int32_t user; memcpy(&user,items,4);
         const char *dirs; memcpy(&dirs,items+0x10,8);
@@ -291,13 +437,22 @@ static ABI int32_t save_open(const void *p) {
             printf("Runtime: SaveDataDialog list (%s): %d item(s)\n",disp==1 ? "save" : disp==2 ? "load" : "delete",n);
             return 0;
         }
+        /* sotc: nothing to show (or the overlay failed): cancelled. Completing with OK and no
+         * item made the game mount a garbage name (NOT_FOUND). */
+        save_dialog.list=1; save_dialog.choice=-2;
+        dialogs[2].status=3;
+        printf("Runtime: SaveDataDialog list (%s): nothing to show, cancelled\n",disp==1 ? "save" : disp==2 ? "load" : "delete");
+        return 0;
     }
-    const int32_t *sys, *err; memcpy(&sys,b+0x58,8); memcpy(&err,b+0x60,8);
-    printf("Runtime: SaveDataDialog mode=%d disp=%d sys=%d err=0x%x completed\n",mode,disp,
-           mode==3 && sys ? sys[0] : -1,mode==4 && err ? (unsigned)err[0] : 0);
-    dialogs[2].status=3; return 0;
+    save_message(b,mode,disp);
+    return 0;
 }
 static ABI int32_t save_status(void) {
+    if (save_dialog.prompt && dialogs[2].status==2) {
+        const int r=bbgpu_save_list_poll(); /* 0 Sim, 1 Nao, -2 Esc (= No) */
+        if (r!=-1) save_answer(r==0,"asked");
+        return dialogs[2].status;
+    }
     if (save_dialog.list && dialogs[2].status==2) {
         const int r=bbgpu_save_list_poll();
         if (r<=-100) { /* delete item -100-r, then show the list again */
@@ -322,21 +477,22 @@ static ABI int32_t save_status(void) {
     return dialogs[2].status;
 }
 static ABI int32_t save_close(void) {
+    if (save_dialog.prompt && dialogs[2].status==2) { bbgpu_save_list_close(); save_answer(0,"closed by the game"); }
     if (save_dialog.list && dialogs[2].status==2) { bbgpu_save_list_close(); save_dialog.choice=-2; dialogs[2].status=3; }
     return 0;
 }
 static ABI int32_t save_term(void) {
-    if (save_dialog.list && dialogs[2].status==2) bbgpu_save_list_close();
-    save_dialog.list=0;
+    if ((save_dialog.list || save_dialog.prompt) && dialogs[2].status==2) bbgpu_save_list_close();
+    save_dialog.list=0; save_dialog.prompt=0;
     return dialog_term(2);
 }
 static ABI int32_t save_result(unsigned char *result) {
     if (!result) return (int32_t)0x80B80006;
-    int32_t mode=save_dialog.mode, res=0, button=1;
+    int32_t mode=save_dialog.mode, res=0, button=save_dialog.list ? 1 : save_dialog.button;
     char *dir; memcpy(&dir,result+0x10,8);
     void *param; memcpy(&param,result+0x18,8);
     if (save_dialog.list) {
-        if (save_dialog.choice<0) { res=1; button=0; }            /* USER_CANCELED */
+        if (save_dialog.choice<0) { res=1; button=0; if (dir) memset(dir,0,32); } /* USER_CANCELED */
         else {
             const int shown=save_dialog.choice-(save_dialog.has_new ? 1 : 0);
             const int index=shown>=0 && (uint32_t)shown<save_dialog.shown ? save_dialog.map[shown] : -1;
@@ -345,7 +501,7 @@ static ABI int32_t save_result(unsigned char *result) {
                 if (param) memset(param,0,1328);
             } else {
                 if (dir) memcpy(dir,save_dialog.names[index],32);
-                if (param && runtime_savedata_param(1,save_dialog.names[index],param)) memset(param,0,1328);
+                if (param && runtime_savedata_param(save_dialog.user,save_dialog.names[index],param)) memset(param,0,1328);
             }
         }
     }
@@ -354,15 +510,51 @@ static ABI int32_t save_result(unsigned char *result) {
     return 0;
 }
 static ABI int32_t profile_result(void *result) { if (result) memset(result,0,4); return 0; }
-/* sotc: the remaining dialog calls of Shadow of the Colossus. Dialogs complete at once with
- * OK/Yes (button 1): result structs start with mode, result, buttonId. */
-DIALOG(error,6)
-static ABI int32_t dialog_close(void) { return 0; }
-static ABI int32_t dialog_result_ok(int32_t *result) {
+/* sotc: MsgDialog and ErrorDialog complete at once with OK and log what was asked. SotC opens
+ * one MsgDialog: USER_MSG with an OK button, the controller-disconnected notice
+ * (TCR_CONTROLLER_DISCONNECT), and waits for OK or for the pad to return; its ErrorDialog
+ * wrapper is never called.
+ * OrbisMsgDialogParam: base (48), size, mode (+0x38: 1 user, 2 progress, 3 system), user message*
+ * (+0x40: buttonType, msg* +8), progress bar* (+0x48), system message* (+0x50: type).
+ * Results start with mode, result, buttonId (1 = OK/YES). */
+static int32_t msg_mode;
+static ABI int32_t msg_init(void) { return dialog_init(1); }
+static ABI int32_t msg_open(const void *p) {
+    if (!dialogs[1].initialized) return DIALOG_NOT_INITIALIZED;
+    if (!p) return (int32_t)0x80B80006;
+    const unsigned char *b=p, *user_msg, *sys_msg;
+    memcpy(&msg_mode,b+0x38,4); memcpy(&user_msg,b+0x40,8); memcpy(&sys_msg,b+0x50,8);
+    if (msg_mode==1 && user_msg) {
+        static const char *const buttons[]={"OK","YES/NO","no buttons","OK/CANCEL","?","WAIT","WAIT/CANCEL",
+                                            "YES/NO (focus NO)","OK/CANCEL (focus CANCEL)","two buttons"};
+        uint32_t type; memcpy(&type,user_msg,4);
+        const char *msg; memcpy(&msg,user_msg+8,8);
+        char text[240];
+        printf("Runtime: MsgDialog USER_MSG %s \"%s\" -> OK\n",type<10 ? buttons[type] : "?",one_line(msg,text,sizeof(text)));
+    } else if (msg_mode==3 && sys_msg) {
+        uint32_t type; memcpy(&type,sys_msg,4);
+        printf("Runtime: MsgDialog SYSTEM_MSG %u -> OK\n",(unsigned)type);
+    } else printf("Runtime: MsgDialog mode %d -> completed\n",msg_mode);
+    dialogs[1].status=3; return 0;
+}
+static ABI int32_t msg_status(void) { return dialog_status(1); }
+static ABI int32_t msg_term(void) { return dialog_term(1); }
+static ABI int32_t msg_result(int32_t *result) {
     if (!result) return (int32_t)0x80B80006;
-    result[1]=0; result[2]=1;
+    result[0]=msg_mode; result[1]=0; result[2]=1;
     return 0;
 }
+/* OrbisErrorDialogParam: size, errorCode, userId, reserved. */
+static ABI int32_t error_init(void) { return dialog_init(6); }
+static ABI int32_t error_open(const int32_t *p) {
+    if (!dialogs[6].initialized) return DIALOG_NOT_INITIALIZED;
+    if (!p) return (int32_t)0x80B80006;
+    printf("Runtime: ErrorDialog error 0x%x (user %d) -> closed\n",(unsigned)p[1],p[2]);
+    dialogs[6].status=3; return 0;
+}
+static ABI int32_t error_status(void) { return dialog_status(6); }
+static ABI int32_t error_term(void) { return dialog_term(6); }
+static ABI int32_t dialog_close(void) { return 0; }
 static ABI int32_t save_ready(void) { return dialogs[2].initialized; }
 static ABI int32_t save_progress(int32_t target, uint32_t rate) { (void)target; (void)rate; return 0; }
 static ABI int32_t common_is_used(void) { return 0; }
@@ -625,7 +817,7 @@ static const RuntimeExport exports[]={
     {"sceSaveDataDialogGetStatus",save_status}, {"sceSaveDataDialogClose",save_close},
     {"sceSaveDataDialogGetResult",save_result}, {"sceSaveDataDialogIsReadyToDisplay",save_ready},
     {"sceSaveDataDialogProgressBarSetValue",save_progress},
-    {"sceMsgDialogClose",dialog_close}, {"sceMsgDialogGetResult",dialog_result_ok},
+    {"sceMsgDialogClose",dialog_close}, {"sceMsgDialogGetResult",msg_result},
     {"sceErrorDialogInitialize",error_init}, {"sceErrorDialogOpen",error_open},
     {"sceErrorDialogUpdateStatus",error_status}, {"sceErrorDialogTerminate",error_term},
     {"sceErrorDialogClose",dialog_close}, {"sceCommonDialogIsUsed",common_is_used},

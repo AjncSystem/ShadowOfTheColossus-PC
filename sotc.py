@@ -16,6 +16,8 @@ Settings (environment variables, or sotc.ini beside this script as NAME=value li
                       or shadPS4's addcont folder holding CUSA08809)
     SOTC_MODES        optional, comma-separated: af16 (16x anisotropic filtering),
                       fps60 (removes the 30 FPS cap; experimental, vblank at 120 Hz)
+    SOTC_RENDER_RES   optional: the game renders at WxH instead of 1920x1080 (e.g. 3840x1600 for
+                      21:9, a wider view); the output follows its aspect; PS4 mode only
     SOTC_CVARS        engine settings, NAME=VALUE separated by spaces (e.g. r_motionBlurEnable=0)
     BB_GAMEPAD        the gamepad to use (its name or part of it), when several are connected
     key.<input>=Keys, pad.<input>=buttons   remap the controls (README.md, Controles)
@@ -164,7 +166,21 @@ def main():
     if cvars is None:
         # Without the launcher: the culling settings of Pink-shadPS4 (same image, fewer GPU waits).
         cvars = 'doIndexBufferCulling=0 doSunShadowIndexBufferCulling=0'
-    run_script('sotc_modes.py', source, '--out', out, '--modes', modes, '--cvars', cvars)
+    render = env.get('SOTC_RENDER_RES', '').strip()
+    run_script('sotc_modes.py', source, '--out', out, '--modes', modes, '--cvars', cvars,
+               *(['--render', render] if render else []))
+    if render:
+        # The output keeps the render size's aspect (a 16:9 output would stretch a 21:9 image).
+        try:
+            rw, rh = map(int, render.split('x'))
+            ow, oh = map(int, env.get('SOTC_OUTPUT_RES', '').split('x'))
+            same_aspect = abs(ow * rh - oh * rw) <= oh * rw // 100
+        except ValueError:
+            same_aspect = False
+        if not same_aspect:
+            env['SOTC_OUTPUT_RES'] = render
+        # Larger render targets: the game's heaps take what direct memory there is (run.sh).
+        env.setdefault('BB_DMEM_MB', '9152')
     if 'fps60' in modes.lower():
         # The game waits for vblanks: at 60 Hz an uncapped frame still rounds up to 30 FPS.
         env.setdefault('BB_VBLANK_HZ', '120')

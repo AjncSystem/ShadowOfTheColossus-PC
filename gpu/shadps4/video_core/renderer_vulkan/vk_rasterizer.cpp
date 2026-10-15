@@ -170,10 +170,10 @@ static std::pair<u32, u32> GetDrawOffsets(const AmdGpu::Regs& regs, const Shader
     u32 instance_offset = 0;
     if (!fetch_shader.Empty()) {
         if (vertex_offset == 0 && fetch_shader.vertex_offset_sgpr != -1) {
-            vertex_offset = info.user_data[fetch_shader.vertex_offset_sgpr];
+            vertex_offset = info.UserData()[fetch_shader.vertex_offset_sgpr];
         }
         if (fetch_shader.instance_offset_sgpr != -1) {
-            instance_offset = info.user_data[fetch_shader.instance_offset_sgpr];
+            instance_offset = info.UserData()[fetch_shader.instance_offset_sgpr];
         }
     }
     return {vertex_offset, instance_offset};
@@ -1131,7 +1131,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     // A stage whose user data was never attached (e.g. a program restored from the pipeline
     // cache that was not refreshed for this draw) would read its SGPRs from a null span.
     for (const auto* stage : pipeline->GetStages()) {
-        if (stage && stage->user_data.data() == nullptr &&
+        if (stage && stage->UserData().data() == nullptr &&
             stage->srt_info.flattened_bufsize_dw != 0) {
             LOG_ERROR(Render_Vulkan,
                       "Skipping draw: shader {:#x} (sw stage {}, hw stage {}, info {}) has no "
@@ -1672,9 +1672,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 bound_buffers.emplace_back(gds_buf, 0, gds_buf->SizeBytes(), desc.is_written);
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
                 auto& vk_buffer = buffer_cache.GetStreamBuffer();
-                const u32 ubo_size = stage.flattened_ud_buf.size() * sizeof(u32);
+                const u32 ubo_size = stage.FlatBuf().size() * sizeof(u32);
                 const u64 offset =
-                    vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
+                    vk_buffer.Copy(stage.FlatBuf().data(), ubo_size, alignment);
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 // Permutations compiled without enabled planes never read the buffer, so the

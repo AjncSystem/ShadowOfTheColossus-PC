@@ -862,8 +862,8 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
 
     auto& program = it_pgm.value();
     auto& info = program->info;
-    info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
-    info.user_data = params.user_data;
+    info.PgmBase() = params.Base(); // Needs to be actualized for inline cbuffer address fixup
+    info.UserData() = params.user_data;
     info.RefreshFlatBuf();
     auto spec = Shader::StageSpecialization(info, rt, profile, binding);
 

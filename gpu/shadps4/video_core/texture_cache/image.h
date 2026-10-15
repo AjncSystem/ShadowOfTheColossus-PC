@@ -145,6 +145,9 @@ public:
     VAddr track_addr = 0;
     VAddr track_addr_end = 0;
     ImageId depth_id{};
+    /// sotc: the depth/colour twin parked by ResolveDepthOverlap (unregistered, untracked, kept
+    /// for the next conversion back); deleted together with this image.
+    ImageId parked_twin{};
     u64 depth_uid{};
 
     vk::ImageUsageFlags usage_flags;
@@ -170,6 +173,11 @@ public:
     BackingImage* backing{};
     boost::container::static_vector<u64, 16> mip_hashes{};
     u64 image_uid{};
+    /// sotc: a new identity for a reused (unparked) image: associations made with the old uid
+    /// (stencil -> depth) no longer match, as with a newly created image.
+    void RenewIdentity() {
+        image_uid = global_image_uid.Next();
+    }
     u64 lru_id{};
     u64 tick_accessed_last{};
     u64 hash{};

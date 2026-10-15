@@ -28,9 +28,13 @@
 #include "common/decoder.h"
 #include "core/signals.h"
 #include "shader_recompiler/ir/passes/srt.h"
+#include <shared_mutex>
 #include "video_core/page_manager.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+
+// src/runtime_memory.c: the runtime's view of a page next to the host protection (diagnostics).
+extern "C" void runtime_memory_describe(uintptr_t address, char* out, size_t capacity);
 
 #ifndef _WIN64
 #include <sys/mman.h>
@@ -52,7 +56,58 @@
 namespace VideoCore {
 
 namespace {
-std::mutex g_guest_stacks_mutex;
+// sotc: the guest stack registry lock. SignalImpl::Protect holds it SHARED across the host
+// protect, so a stack registered meanwhile can never be protected after RegisterGuestStack made it
+// accessible (the old code released the lock before protecting: a just-registered fiber stack could
+// be write-protected by an in-flight GPU protect, and a fault there cannot push its exception frame:
+// silent death at startup). Writers never block to acquire it (LockStacksExclusive spins on try)
+// and only edit the map while holding it, so no wait cycle can include this lock.
+struct StackLock {
+#ifdef _WIN32
+    SRWLOCK l = SRWLOCK_INIT;
+    void lock_shared() { AcquireSRWLockShared(&l); }
+    bool try_lock_shared() { return TryAcquireSRWLockShared(&l) != 0; }
+    void unlock_shared() { ReleaseSRWLockShared(&l); }
+    bool try_lock() { return TryAcquireSRWLockExclusive(&l) != 0; }
+    void unlock() { ReleaseSRWLockExclusive(&l); }
+#else
+    std::shared_mutex m;
+    void lock_shared() { m.lock_shared(); }
+    bool try_lock_shared() { return m.try_lock_shared(); }
+    void unlock_shared() { m.unlock_shared(); }
+    bool try_lock() { return m.try_lock(); }
+    void unlock() { m.unlock(); }
+#endif
+};
+StackLock g_guest_stacks_mutex;
+/// SOTC_STACK_GUARD=0: the old early release in SignalImpl::Protect (A/B).
+int StackGuardMode() {
+    static const int v = [] {
+        const char* e = std::getenv("SOTC_STACK_GUARD");
+        return e ? std::atoi(e) : 1;
+    }();
+    return v;
+}
+/// Exclusive hold of the stack registry, acquired without ever blocking (see StackLock).
+std::unique_lock<StackLock> LockStacksExclusive() {
+    for (u32 spin = 0;; ++spin) {
+        if (g_guest_stacks_mutex.try_lock()) {
+            return std::unique_lock<StackLock>{g_guest_stacks_mutex, std::adopt_lock};
+        }
+        SotcStats::stack_reg_spins.fetch_add(1, std::memory_order_relaxed);
+#ifdef _WIN32
+        if (spin < 64) {
+            YieldProcessor();
+        } else if (spin < 512) {
+            SwitchToThread();
+        } else {
+            Sleep(1);
+        }
+#else
+        std::this_thread::yield();
+#endif
+    }
+}
 // Reference counted: the margin below one stack often covers a neighbouring stack (games pack
 // fiber stacks back to back), so finalizing one must not drop the other's protection.
 boost::icl::interval_map<VAddr, u32> g_guest_stacks;
@@ -73,10 +128,11 @@ void RegisterGuestStack(VAddr address, u64 size) {
     const VAddr begin = Common::AlignDown(address - GuestStackMargin, VAddr{4096});
     const VAddr end = Common::AlignUp(address + size, VAddr{4096});
     {
-        std::scoped_lock lk{g_guest_stacks_mutex};
+        auto lk = LockStacksExclusive(); // in-flight SignalImpl::Protect calls hold it shared
         g_guest_stacks += std::make_pair(boost::icl::interval<VAddr>::right_open(begin, end), 1u);
     }
-    // Memory the guest hands over as a stack may already be tracked; make it accessible now.
+    // Protects that computed their ranges before the insert have finished their host protect
+    // (they held the lock shared); later ones see the range. Make it accessible now.
     Core::Memory::Instance()->GetAddressSpace().Protect(begin, end - begin,
                                                         Core::MemoryPermission::ReadWrite);
 }
@@ -88,7 +144,7 @@ void UnregisterGuestStack(VAddr address, u64 size) {
     const VAddr begin = Common::AlignDown(address - GuestStackMargin, VAddr{4096});
     const VAddr end = Common::AlignUp(address + size, VAddr{4096});
     {
-        std::scoped_lock lk{g_guest_stacks_mutex};
+        auto lk = LockStacksExclusive();
         g_guest_stacks -= std::make_pair(boost::icl::interval<VAddr>::right_open(begin, end), 1u);
     }
     // The pages were left accessible while they were a stack: give the tracker its protection
@@ -106,7 +162,7 @@ void ForEachNonStackRange(VAddr address, u64 size, const std::function<void(VAdd
     const auto window = boost::icl::interval<VAddr>::right_open(address, address + size);
     bool overlaps = false;
     {
-        std::scoped_lock lk{g_guest_stacks_mutex};
+        std::shared_lock lk{g_guest_stacks_mutex};
         const auto [first, last] = g_guest_stacks.equal_range(window);
         if (first != last) {
             overlaps = true;
@@ -590,26 +646,37 @@ struct SignalImpl : public PageManager::Impl {
             }
         };
         if (perms != Core::MemoryPermission::ReadWrite) {
-            // Keep guest stacks accessible, only protect the rest of the range.
-            boost::icl::interval_set<VAddr> ranges;
-            ranges += boost::icl::interval<VAddr>::right_open(address, address + size);
-            {
-                std::scoped_lock lk{g_guest_stacks_mutex};
-                const auto window = boost::icl::interval<VAddr>::right_open(address, address + size);
-                const auto [first, last] = g_guest_stacks.equal_range(window);
-                if (first != last) {
-                    for (auto it = first; it != last; ++it) {
-                        ranges -= it->first;
-                    }
-                    static std::atomic<u32> reported{0};
-                    if (reported++ < 8) {
-                        LOG_ERROR(Render, "Not protecting guest stack pages in {:#x}+{:#x}",
-                                    address, size);
-                    }
+            // Keep guest stacks accessible, only protect the rest of the range. sotc: the
+            // registry stays locked (shared) across the host protect, see StackLock.
+            const auto window = boost::icl::interval<VAddr>::right_open(address, address + size);
+            std::shared_lock lk{g_guest_stacks_mutex};
+            const auto [first, last] = g_guest_stacks.equal_range(window);
+            if (first == last) {
+                // Common case, no stack in the range (and no interval set to allocate).
+                if (StackGuardMode() == 0) {
+                    lk.unlock();
+                }
+                impl.Protect(address, size, perms);
+            } else {
+                boost::icl::interval_set<VAddr> ranges;
+                ranges += window;
+                for (auto it = first; it != last; ++it) {
+                    ranges -= it->first;
+                }
+                static std::atomic<u32> reported{0};
+                if (reported++ < 8) {
+                    LOG_ERROR(Render, "Not protecting guest stack pages in {:#x}+{:#x}", address,
+                              size);
+                }
+                if (StackGuardMode() == 0) {
+                    lk.unlock();
+                }
+                for (const auto& range : ranges) {
+                    impl.Protect(range.lower(), range.upper() - range.lower(), perms);
                 }
             }
-            for (const auto& range : ranges) {
-                impl.Protect(range.lower(), range.upper() - range.lower(), perms);
+            if (lk.owns_lock()) {
+                lk.unlock();
             }
             clear_after();
             return;
@@ -677,6 +744,77 @@ struct SignalImpl : public PageManager::Impl {
                          static_cast<unsigned long long>(std::get<2>(key)));
         }
         counts.clear();
+    }
+
+    // sotc: after a write fault is handled the trackers consider the page writable. The same
+    // thread faulting on the same instruction and page again right away (no other fault in
+    // between) means the OS protection disagrees with them: something protected the page without
+    // the trackers, and the handler would "resolve" the fault forever without changing anything
+    // (seen on cold starts: ~18 rounds, then the process died silently). Make the page writable,
+    // which is what the trackers already believe, and log it.
+    static void RepairStuckWriteFault(void* context, VAddr addr) {
+        // SOTC_DESYNC_REPAIR: 0 off, 1 repair, unset/2 count only. With the repeat-fault grace
+        // the storms this was meant for are gone, and its buffer-bit guard cannot see texture
+        // watchers or a racing GPU sync (it could unprotect a page they just protected), so by
+        // default it only counts and logs.
+        static const int mode = [] {
+            const char* v = std::getenv("SOTC_DESYNC_REPAIR");
+            return v ? std::atoi(v) : 2;
+        }();
+        if (mode == 0) {
+            return;
+        }
+        static thread_local u64 last_rip = 0;
+        static thread_local VAddr last_page = 0;
+        static thread_local u32 repeats = 0;
+        const u64 rip = reinterpret_cast<u64>(Common::GetRip(context));
+        const VAddr page = Common::AlignDown(addr, VAddr{4096});
+        if (rip != last_rip || page != last_page) {
+            last_rip = rip;
+            last_page = page;
+            repeats = 0;
+            return;
+        }
+        if (++repeats < 2) {
+            return;
+        }
+        repeats = 0;
+        // Only a real desync is repaired: the buffer tracker wants the page writable (CPU-modified)
+        // and the host still refuses writes. A tracker that wants it protected means the GPU
+        // thread re-protected it after uploading (legitimate ping-pong): leave it alone, or CPU
+        // writes would be missed and the GPU would keep stale data.
+        if (!rasterizer->GetBufferCache().IsRegionCpuModified(page, 4096)) {
+            SotcStats::desync_legit.fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<u32> logged_legit{0};
+            if (logged_legit.fetch_add(1, std::memory_order_relaxed) < 24) {
+                char state[160];
+                runtime_memory_describe(page, state, sizeof(state));
+                LOG_WARNING(Render, "Repeated write fault at {:#x} (rip {:#x}), tracker wants it "
+                            "protected; {}", addr, rip, state);
+            }
+            return;
+        }
+#ifdef _WIN32
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<void*>(page), &mbi, sizeof(mbi)) &&
+            (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY |
+                            PAGE_EXECUTE_WRITECOPY)) != 0) {
+            return;
+        }
+#endif
+        SotcStats::desync_repairs.fetch_add(1, std::memory_order_relaxed);
+        if (mode != 1) {
+            return;
+        }
+        Core::Memory::Instance()->GetAddressSpace().Protect(page, 4096,
+                                                            Core::MemoryPermission::ReadWrite);
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            char state[160];
+            runtime_memory_describe(page, state, sizeof(state));
+            LOG_WARNING(Render, "Page tracking desync: write fault at {:#x} (rip {:#x}) kept "
+                        "recurring, page made writable; now {}", addr, rip, state);
+        }
     }
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {

@@ -695,7 +695,10 @@ void Instance::CreateAllocator() {
     };
 
     const VmaAllocatorCreateInfo allocator_info = {
-        .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
+        // The driver's budget counts the buffer arena memory allocated outside VMA, so images
+        // stop filling the VRAM the arena still needs and spill to system memory instead
+        .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT |
+                 (supports_memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0u),
         .physicalDevice = physical_device,
         .device = *device,
         .pVulkanFunctions = &functions,

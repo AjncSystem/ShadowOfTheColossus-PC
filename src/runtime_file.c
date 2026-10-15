@@ -244,6 +244,9 @@ static int64_t do_open(const char *guest,int flags,int mode) {
         if (host<0) {
             e=errno;
             if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found %s\n",guest,getenv("SOTC_FILE_DEBUG") ? path : ""); }
+            /* sotc: a save that cannot be written (read-only folder, Controlled Folder Access...) */
+            else if (!strncmp(guest,"/savedata",9))
+                fprintf(stderr,"Runtime: cannot open save file %s (%s): errno %d\n",guest,path,e);
             return -e;
         }
         if (host_fstat(host,&s)) memset(&s,0,sizeof(s));

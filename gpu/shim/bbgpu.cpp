@@ -215,6 +215,8 @@ boost::icl::interval_set<VAddr> AddressSpace::GetUsableRegions() {
 }
 } // namespace Core
 
+extern "C" int runtime_savedata_mounted(void); // src/runtime_savedata.c
+
 // Kernel services the vendored libraries call directly.
 namespace Libraries::Kernel {
 u64 PS4_SYSV_ABI sceKernelGetTscFrequency() { return runtime_tsc_frequency(); }
@@ -299,6 +301,14 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
             SDL_Delay(2);
         }
         LOG_INFO(Frontend, "Window closed by user");
+        // sotc: a save being written (a save directory mounted for writing) gets up to 5 s to
+        // finish: quitting mid-write left a truncated save behind.
+        if (runtime_savedata_mounted() > 0) {
+            std::fprintf(stderr, "Runtime: waiting for the save to finish before quitting\n");
+            for (int i = 0; i < 100 && runtime_savedata_mounted() > 0; ++i) {
+                SDL_Delay(50);
+            }
+        }
         std::fflush(stdout);
         std::_Exit(0);
     });

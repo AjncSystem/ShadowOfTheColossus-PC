@@ -91,8 +91,14 @@ public:
     }
 
     /// Frees cached images not used in the last few frames, regardless of memory thresholds.
-    /// Called when a video memory allocation fails.
-    void EmergencyCollect();
+    /// Called when a video memory allocation fails. Higher levels go deeper (sotc): level 0
+    /// frees up to 512 images idle for 4 frames, level 1 up to 4096 idle for 2, level 2 every
+    /// image not used by the current or the previous frame.
+    void EmergencyCollect(u32 level = 0);
+
+    /// sotc: EmergencyCollect, unless this thread is inside RefreshImage (holding `mutex`): then
+    /// the collection is deferred to the next RunGarbageCollector and false is returned.
+    bool TryEmergencyCollect(u32 level);
 
     /// Invalidates any image in the logical page range.
     void InvalidateMemory(VAddr addr, size_t size);
@@ -334,7 +340,16 @@ private:
         DeleteImage(image_id);
     }
 
+    /// sotc: depth/colour twins (ResolveDepthOverlap). Park: what FreeImage does except the
+    /// reclaim of the slot and its Vulkan objects. Unpark: registers it again as if new.
+    void ParkImage(ImageId image_id);
+    void UnparkImage(ImageId image_id);
+    void ReclaimImage(ImageId image_id);
+
     void GarbageCollectImages();
+
+    /// sotc: image memory by class, every 5 s with SOTC_FPS (telemetry only).
+    void Census();
     void GarbageCollectSamplers();
 
 private:
@@ -364,6 +379,10 @@ private:
     const bool readback_linear_images;
     PageTable page_table;
     std::mutex mutex;
+    /// sotc: RefreshImage nesting on this thread (it runs under `mutex`).
+    static inline thread_local u32 refresh_depth = 0;
+    /// sotc: deferred EmergencyCollect level + 1 (0: none).
+    std::atomic<u32> pending_emergency{0};
     /// sotc: FindImage's perfect matches, valid while no image is registered or unregistered.
     struct FindMemo {
         VAddr guest_address{};

@@ -865,11 +865,24 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         alloc_result = retry.result;
         device_memory = retry.value;
     }
-    if (alloc_result == vk::Result::eErrorOutOfDeviceMemory) {
-        // Video memory is full (sparse arenas cannot use system memory). Drop old cached images,
-        // wait for the GPU so their memory is really released, and try once more.
-        LOG_WARNING(Render, "Video memory exhausted, collecting cached images");
-        texture_cache.EmergencyCollect();
+    // Video memory is full (sparse arenas cannot use system memory on NVIDIA). Drop cached
+    // images, wait for the GPU so their memory is really released, and try again. sotc: one
+    // shallow round was not enough on 6 GB cards (abort after ~15 min in the open world), so
+    // each further round collects deeper before giving up.
+    bool collect_deferred = false;
+    for (u32 level = 0; alloc_result == vk::Result::eErrorOutOfDeviceMemory && level < 3; ++level) {
+        LOG_WARNING(Render, "Video memory exhausted ({} MiB requested), collecting cached images",
+                    alloc_info.allocationSize >> 20);
+        if (!texture_cache.TryEmergencyCollect(level)) {
+            // Reached from RefreshImage under the texture cache lock: the collection runs at the
+            // next submit. One more try now (memory freed meanwhile by other threads or the GC).
+            collect_deferred = true;
+            alloc_info.memoryTypeIndex = arena_memory_type_index;
+            const auto retry = instance.GetDevice().allocateMemory(alloc_info);
+            alloc_result = retry.result;
+            device_memory = retry.value;
+            break;
+        }
         scheduler.Finish();
         scheduler.PopPendingOperations();
         alloc_info.memoryTypeIndex = arena_memory_type_index;
@@ -877,8 +890,10 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         alloc_result = retry.result;
         device_memory = retry.value;
     }
-    ASSERT_MSG(alloc_result == vk::Result::eSuccess, "Failed to allocate buffer arena memory: {}",
-               vk::to_string(alloc_result));
+    ASSERT_MSG(alloc_result == vk::Result::eSuccess, "Failed to allocate buffer arena memory: {}{}",
+               vk::to_string(alloc_result),
+               collect_deferred ? " (collection deferred: texture cache lock held)" : "");
+    SotcStats::arena_bytes.fetch_add(alloc_info.allocationSize, std::memory_order_relaxed);
 
     boost::container::small_vector<vk::BufferCopy, 8> copies;
     const auto staging =

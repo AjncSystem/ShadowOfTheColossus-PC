@@ -30,6 +30,44 @@ inline std::atomic<uint64_t> commands{0}; ///< draws and dispatches recorded
 /// empty), dispatches, indirect dispatches.
 inline std::atomic<uint64_t> cmd_kinds[6]{};
 inline std::atomic<uint64_t> early_flushes{0}; ///< submits right after a write to a read-back page
+inline std::atomic<uint64_t> vram_used{0};      ///< device-local usage (VK_EXT_memory_budget), bytes
+inline std::atomic<uint64_t> vram_budget{0};    ///< device-local budget the texture cache plans for
+inline std::atomic<uint64_t> vram_emergency{0}; ///< emergency texture collections (allocation failed)
+inline std::atomic<uint64_t> arena_bytes{0};    ///< resident buffer arena memory (never released)
+inline std::atomic<uint64_t> image_bytes{0};    ///< live texture cache and host pass images
+inline std::atomic<uint64_t> image_count{0};
+inline std::atomic<uint64_t> gc_freed{0};       ///< images freed by the texture garbage collector
+inline std::atomic<uint64_t> gc_kept_tiled{0};  ///< GC candidates kept: GPU-written tiled images
+inline std::atomic<uint64_t> vma_block_bytes{0};      ///< VMA device-local blocks
+inline std::atomic<uint64_t> vma_allocation_bytes{0}; ///< ... and the allocations inside them
+/// Image census (TextureCache::Census), bytes of host image memory by class.
+inline std::atomic<uint64_t> census_gpu_tiled{0};    ///< GPU-written tiled (the GC keeps them)
+inline std::atomic<uint64_t> census_gpu_linear{0};   ///< GPU-written linear
+inline std::atomic<uint64_t> census_streamed{0};     ///< sampled, T# with LOD streaming counters
+inline std::atomic<uint64_t> census_other{0};        ///< other sampled images
+inline std::atomic<uint64_t> census_below_base{0};   ///< mips below the T# base_level
+inline std::atomic<uint64_t> census_below_minlod{0}; ///< mips below max(base_level, min_lod)
+inline std::atomic<uint64_t> census_live{0};         ///< images used in the last few ticks
+inline std::atomic<uint64_t> census_count{0};
+// sotc: emergency_deferred removed: written on each deferred collection, never read (the
+// "Emergency texture collection deferred" warning reports it).
+inline std::atomic<uint64_t> desync_repairs{0}; ///< stuck write faults repaired (page_manager)
+inline std::atomic<uint64_t> desync_legit{0}; ///< ... repeats left alone (tracker wants protection)
+inline std::atomic<uint64_t> stack_reg_spins{0}; ///< stack registry writer spins (page_manager)
+inline std::atomic<uint64_t> fault_grace_marks{0};    ///< pages made hot (repeat-fault grace)
+inline std::atomic<uint64_t> fault_grace_cap_hits{0}; ///< ... refused by the budget
+inline std::atomic<uint64_t> fault_grace_hot_upload_bytes{0}; ///< hot pages uploaded, kept writable
+
+/// SOTC_OPT_OFF=1: the 2026-10-14 command-processor optimizations are switched off (replicate
+/// HLE no-change skip, single texel-buffer image sync, rate-limited VRAM queries), for A/B runs
+/// on one binary.
+inline bool OptOff() {
+    static const bool off = [] {
+        const char* v = std::getenv("SOTC_OPT_OFF");
+        return v && v[0] == '1';
+    }();
+    return off;
+}
 
 struct ScopedTimer {
     std::atomic<uint64_t>& total;

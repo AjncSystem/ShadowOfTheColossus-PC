@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -15,7 +16,10 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/sotc_stats.h"
 #include "video_core/texture_cache/host_compatibility.h"
+
+#include <vk_mem_alloc.h>
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/texture_cache/tile_manager.h"
 
@@ -801,6 +805,12 @@ void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }
+    // sotc: RefreshImage always runs under `mutex` (UpdateImage, FindImage -> ExpandImage) and can
+    // reach EnsureResident through ObtainBufferForImage; see TryEmergencyCollect.
+    ++refresh_depth;
+    SCOPE_EXIT {
+        --refresh_depth;
+    };
 
     RENDERER_TRACE;
     TRACE_HINT(fmt::format("{:x}:{:x}", image.info.guest_address, image.info.guest_size));
@@ -1044,11 +1054,31 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
     tracker.UpdatePageWatchers(addr, size, PageOp::Untrack);
 }
 
-void TextureCache::EmergencyCollect() {
+bool TextureCache::TryEmergencyCollect(u32 level) {
+    // sotc: inside RefreshImage this thread already holds `mutex`; EmergencyCollect would lock it
+    // again (self-deadlock), and freeing images there could erase the one being refreshed. Defer
+    // the collection to the next RunGarbageCollector (a submit, no lock held) instead.
+    if (refresh_depth > 0) {
+        // The caller cannot escalate in place, so ask for the deepest level (2, stored as 3).
+        static_cast<void>(level);
+        constexpr u32 wanted = 3;
+        u32 pending = pending_emergency.load(std::memory_order_relaxed);
+        while (pending < wanted &&
+               !pending_emergency.compare_exchange_weak(pending, wanted, std::memory_order_relaxed)) {
+        }
+        // sotc: no counter here any more (it was never read); the warning reports it.
+        LOG_WARNING(Render, "Emergency texture collection deferred (texture cache lock held)");
+        return false;
+    }
+    EmergencyCollect(level);
+    return true;
+}
+
+void TextureCache::EmergencyCollect(u32 level) {
     std::scoped_lock lock{mutex};
-    size_t num_deletions = 512;
+    size_t num_deletions = level == 0 ? 512 : level == 1 ? 4096 : SIZE_MAX;
     size_t freed = 0;
-    const u64 ticks = std::min<u64>(4, gc_tick);
+    const u64 ticks = std::min<u64>(level == 0 ? 4 : level == 1 ? 2 : 1, gc_tick);
     lru_cache.ForEachItemBelow(gc_tick - ticks, [&](ImageId image_id) {
         if (num_deletions == 0) {
             return true;
@@ -1065,7 +1095,8 @@ void TextureCache::EmergencyCollect() {
         ++freed;
         return false;
     });
-    LOG_WARNING(Render, "Emergency texture collection freed {} images", freed);
+    LOG_WARNING(Render, "Emergency texture collection (level {}) freed {} images", level, freed);
+    SotcStats::vram_emergency.fetch_add(1, std::memory_order_relaxed);
 }
 
 void TextureCache::GarbageCollectImages() {
@@ -1089,6 +1120,11 @@ void TextureCache::GarbageCollectImages() {
         num_deletions = aggresive ? 128 : pressured ? 20 : 10;
     };
     const auto clean_up = [&](ImageId image_id) {
+        // sotc: kept images (GPU-written tiled ones below) also use up num_deletions, so a pass
+        // stops early when they lead the LRU. Charging only freed images was measured worse on
+        // a 6 GB card (attract demo 27.5 -> 18.5 FPS, 28 emergency collections instead of 0):
+        // the extra frees were images needed again a few frames later, and the churn fragmented
+        // VMA. Paging the overflow beats evicting the working set.
         if (num_deletions == 0) {
             return true;
         }
@@ -1098,6 +1134,7 @@ void TextureCache::GarbageCollectImages() {
         const bool tiled = image.info.IsTiled();
         if (tiled && download) {
             // This is a workaround for now. We can't handle non-linear image downloads.
+            SotcStats::gc_kept_tiled.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
         if (download && !pressured) {
@@ -1107,6 +1144,7 @@ void TextureCache::GarbageCollectImages() {
             DownloadImageMemory(image_id);
         }
         FreeImage(image_id);
+        SotcStats::gc_freed.fetch_add(1, std::memory_order_relaxed);
         if (total_used_memory < critical_gc_memory) {
             if (aggresive) {
                 num_deletions >>= 2;
@@ -1172,11 +1210,68 @@ void TextureCache::GarbageCollectSamplers() {
     }
 }
 
+// sotc: where image memory goes, every 5 s with SOTC_FPS (printed on the "SOTC IMAGES" line):
+// GPU-written tiled images (the GC cannot free them), GPU-written linear, streamed and other
+// sampled images, the bytes below the first mip their T# can sample (what allocating only the
+// reachable mips would save), and the bytes of images used in the last NumFramesBeforeRemoval
+// ticks (the live working set). Recomputed from the live images, telemetry only.
+void TextureCache::Census() {
+    static const bool enabled = std::getenv("SOTC_FPS") != nullptr;
+    static std::chrono::steady_clock::time_point last{};
+    const auto now = std::chrono::steady_clock::now();
+    if (!enabled || now - last < std::chrono::seconds{5}) {
+        return;
+    }
+    last = now;
+    u64 gpu_tiled = 0, gpu_linear = 0, streamed = 0, other = 0, below_base = 0, below_minlod = 0;
+    u64 live = 0, count = 0;
+    const u64 current_tick = scheduler.CurrentTick();
+    std::scoped_lock lock{mutex};
+    lru_cache.ForEachItemBelow(gc_tick, [&](ImageId image_id) {
+        const Image& image = slot_images[image_id];
+        if (!image.backing) {
+            return;
+        }
+        const u64 host = image.GetHostImageSize();
+        ++count;
+        if (current_tick - image.tick_accessed_last <= NumFramesBeforeRemoval) {
+            live += host;
+        }
+        if (True(image.flags & ImageFlagBits::GpuModified)) {
+            (image.info.IsTiled() ? gpu_tiled : gpu_linear) += host;
+            return;
+        }
+        (image.info.sotc_streamed ? streamed : other) += host;
+        const auto& info = image.info;
+        if (info.guest_size != 0) {
+            if (info.sotc_reach_mip > 0) {
+                below_base += host * info.mips_layout[info.sotc_reach_mip].offset / info.guest_size;
+            }
+            if (info.sotc_minlod_mip > 0) {
+                below_minlod +=
+                    host * info.mips_layout[info.sotc_minlod_mip].offset / info.guest_size;
+            }
+        }
+    });
+    SotcStats::census_gpu_tiled.store(gpu_tiled, std::memory_order_relaxed);
+    SotcStats::census_gpu_linear.store(gpu_linear, std::memory_order_relaxed);
+    SotcStats::census_streamed.store(streamed, std::memory_order_relaxed);
+    SotcStats::census_other.store(other, std::memory_order_relaxed);
+    SotcStats::census_below_base.store(below_base, std::memory_order_relaxed);
+    SotcStats::census_below_minlod.store(below_minlod, std::memory_order_relaxed);
+    SotcStats::census_live.store(live, std::memory_order_relaxed);
+    SotcStats::census_count.store(count, std::memory_order_relaxed);
+}
+
 void TextureCache::RunGarbageCollector() {
     SCOPE_EXIT {
         ++gc_tick;
     };
 
+    if (const u32 pending = pending_emergency.exchange(0, std::memory_order_relaxed)) {
+        EmergencyCollect(pending - 1);
+    }
+    Census();
     GarbageCollectImages();
     GarbageCollectSamplers();
 }

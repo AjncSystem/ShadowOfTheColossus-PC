@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <memory>
@@ -169,6 +170,12 @@ ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& de
     guest_address = image.Address();
 
     alt_tile = Libraries::Kernel::sceKernelIsNeoMode() && image.alt_tile_mode;
+    if (resources.levels > 1 && image.base_level <= image.last_level) {
+        sotc_reach_mip = static_cast<u8>(std::min<u32>(image.base_level, resources.levels - 1));
+        sotc_minlod_mip = static_cast<u8>(std::min<u32>(
+            resources.levels - 1, std::max<u32>(image.base_level, u32(image.min_lod) >> 8)));
+    }
+    sotc_streamed = image.lod_hw_cnt_en;
     UpdateSize();
     entry.sharp = sharp;
     entry.is_depth = desc.is_depth;

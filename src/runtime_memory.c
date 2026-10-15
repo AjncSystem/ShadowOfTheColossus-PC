@@ -90,7 +90,11 @@ typedef void (*GpuRange)(uintptr_t address, uint64_t size);
 static GpuRange hook_map, hook_unmap, hook_invalidate;
 enum { HOOK_MAP, HOOK_UNMAP, HOOK_INVALIDATE };
 typedef struct { int kind; uintptr_t address; uint64_t size; } PendingHook;
-static PendingHook pending[64]; static size_t pending_count;
+/* sotc: a ring of 4096 (was 64, drained with memmove). Consumers run the GPU hooks outside the
+ * lock and the unmap hook waits for the GPU, so under video memory pressure other threads queued
+ * past 64 and the game stopped ("GPU hook queue overflow", 6 GB card in the shrine). */
+#define PENDING_HOOKS 4096
+static PendingHook pending[PENDING_HOOKS]; static size_t pending_head, pending_count;
 static size_t allocations, maps, flexible_maps, protects, queries;
 static uint64_t live_bytes, flexible_bytes;
 
@@ -276,16 +280,17 @@ static void host_discard(uint64_t phys, uint64_t size) {
 static void queue_hook(int kind, uintptr_t address, uint64_t size) {
     GpuRange hook = kind==HOOK_MAP ? hook_map : kind==HOOK_UNMAP ? hook_unmap : hook_invalidate;
     if (!hook) return;
-    if (pending_count==sizeof(pending)/sizeof(*pending)) { fputs("STOP: GPU hook queue overflow\n",stderr); exit(21); }
-    pending[pending_count++]=(PendingHook){kind,address,size};
+    if (pending_count==PENDING_HOOKS) { fputs("STOP: GPU hook queue overflow\n",stderr); exit(21); }
+    pending[(pending_head+pending_count++)%PENDING_HOOKS]=(PendingHook){kind,address,size};
 }
 /* Runs queued GPU notifications; callers invoke it after dropping the lock. */
 static void flush_hooks(void) {
     for (;;) {
         write_lock();
         if (!pending_count) { write_unlock(); return; }
-        PendingHook h=pending[0];
-        memmove(pending,pending+1,--pending_count*sizeof(*pending));
+        PendingHook h=pending[pending_head];
+        pending_head=(pending_head+1)%PENDING_HOOKS;
+        --pending_count;
         GpuRange hook = h.kind==HOOK_MAP ? hook_map : h.kind==HOOK_UNMAP ? hook_unmap : hook_invalidate;
         write_unlock();
         if (hook) hook(h.address,h.size);

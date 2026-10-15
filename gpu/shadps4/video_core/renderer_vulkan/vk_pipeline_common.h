@@ -57,6 +57,12 @@ public:
         return is_compute;
     }
 
+    /// sotc: a pipeline built on a worker from a snapshot of the shader infos switches to the
+    /// live Program infos (refreshed per draw) before the command processor uses it.
+    void PublishStages(std::span<const Shader::Info* const, Shader::MaxStageTypes> live) {
+        std::ranges::copy(live, stages.begin());
+    }
+
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
     void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data) const;
 

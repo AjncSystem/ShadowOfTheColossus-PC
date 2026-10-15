@@ -169,13 +169,13 @@ struct Info : InfoPersistent {
         }
     }
 
-    void RefreshFlatBuf() {
+    void RefreshFlatBuf(const SrtWalkerContext* context = GetSrtWalkerContext()) {
         flattened_ud_buf.resize(srt_info.flattened_bufsize_dw);
         ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
         std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());
         if (srt_info.walker_func) {
             srt_info.walker_func(user_data.data(), flattened_ud_buf.data(), &SrtCopyWindow,
-                                 GetSrtWalkerContext());
+                                 context);
         }
         if (!sharp_tables.empty()) {
             RefreshSharpTables();

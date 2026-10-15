@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <optional>
+#include <thread>
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -14,8 +19,8 @@
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 // Above both lines before the upstream merge: generation changed, so old caches are dropped.
-static constexpr u32 ShaderBinaryVersion = 32u;
-static constexpr u32 ShaderMetaVersion = 21u;
+static constexpr u32 ShaderBinaryVersion = 33u;
+static constexpr u32 ShaderMetaVersion = 22u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization
 
@@ -162,6 +167,26 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
         return false;
     }
 
+    if (warmup_pool) {
+        if (compute_pipelines.contains(compute_key) ||
+            !warmup_compute_keys.try_emplace(compute_key, 0).second) {
+            infos.fill(nullptr);
+            modules.fill(nullptr);
+            return false;
+        }
+        warmup_pool->Submit([this, key = compute_key, info = infos[0], module = modules[0],
+                             sdata]() mutable {
+            auto pipeline = std::make_unique<ComputePipeline>(
+                instance, scheduler, desc_heap, profile, *pipeline_cache, key, *info, module,
+                sdata, true);
+            std::scoped_lock lock{warmup_mutex};
+            warmup_compute.emplace_back(key, std::move(pipeline));
+        });
+        infos.fill(nullptr);
+        modules.fill(nullptr);
+        return true;
+    }
+
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     ASSERT(is_new);
 
@@ -240,6 +265,35 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
         if (!LoadPipelineStage(meta_ar, stage_idx)) {
             return false;
         }
+    }
+
+    if (warmup_pool) {
+        if (graphics_pipelines.contains(graphics_key) ||
+            !warmup_graphics_keys.try_emplace(graphics_key, 0).second) {
+            infos.fill(nullptr);
+            modules.fill(nullptr);
+            fetch_shader = nullptr;
+            return false;
+        }
+        // Program infos stay unchanged during the warm-up (later stages only add modules), but
+        // fetch_shader points into a module list that can grow: copy it.
+        std::optional<Shader::Gcn::FetchShaderData> fetch;
+        if (fetch_shader) {
+            fetch = *fetch_shader;
+        }
+        warmup_pool->Submit([this, key = graphics_key, stage_infos = infos,
+                             stage_runtime = runtime_infos, stage_modules = modules,
+                             fetch = std::move(fetch), sdata]() mutable {
+            auto pipeline = std::make_unique<GraphicsPipeline>(
+                instance, scheduler, desc_heap, profile, key, *pipeline_cache, stage_infos,
+                stage_runtime, fetch ? &*fetch : nullptr, stage_modules, sdata, true);
+            std::scoped_lock lock{warmup_mutex};
+            warmup_graphics.emplace_back(key, std::move(pipeline));
+        });
+        infos.fill(nullptr);
+        modules.fill(nullptr);
+        fetch_shader = nullptr;
+        return true;
     }
 
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
@@ -334,24 +388,7 @@ void PipelineCache::WarmUp() {
     // Check if cache is compatible
     std::vector<u8> profile_data{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderProfile, "profile", profile_data);
-    // A cache made for another profile (another GPU or driver, a new build) cannot be used. It
-    // used to be ignored and left in place, so every later run started without a cache and saved
-    // nothing: it is set aside and a new one starts with this profile.
-    bool compatible = true;
-    if (!profile_data.empty()) {
-        Shader::Profile cached_profile{};
-        if (profile_data.size() == sizeof(Shader::Profile)) {
-            std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
-        }
-        compatible = profile_data.size() == sizeof(Shader::Profile) && cached_profile == profile;
-        if (!compatible) {
-            LOG_WARNING(Render, "Pipeline cache isn't compatible with current system (profile of "
-                                "{} bytes, expected {}). Starting a new cache",
-                        profile_data.size(), sizeof(Shader::Profile));
-            Storage::DataBase::Instance().Reset();
-        }
-    }
-    if (profile_data.empty() || !compatible) {
+    if (profile_data.empty()) {
         Storage::DataBase::Instance().FinishPreload();
 
         profile_data.resize(sizeof(profile));
@@ -360,10 +397,48 @@ void PipelineCache::WarmUp() {
                                            std::move(profile_data));
         return;
     }
+    if (profile_data.size() != sizeof(Shader::Profile)) {
+        LOG_WARNING(Render,
+                    "Pipeline cache profile has unexpected size ({} != {}). Rebuilding the cache",
+                    profile_data.size(), sizeof(Shader::Profile));
+        if (Storage::DataBase::Instance().Reset()) {
+            profile_data.resize(sizeof(profile));
+            std::memcpy(profile_data.data(), &profile, sizeof(profile));
+            Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
+                                               std::move(profile_data));
+        }
+        return;
+    }
+
+    Shader::Profile cached_profile{};
+    std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
+    if (cached_profile != profile) {
+        LOG_WARNING(Render,
+                    "Pipeline cache isn't compatible with current system. Rebuilding the cache");
+        if (Storage::DataBase::Instance().Reset()) {
+            profile_data.resize(sizeof(profile));
+            std::memcpy(profile_data.data(), &profile, sizeof(profile));
+            Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
+                                               std::move(profile_data));
+        }
+        return;
+    }
 
     u32 num_pipelines{};
     u32 num_total_pipelines{};
     const auto warmup_start = std::chrono::steady_clock::now();
+
+    // sotc: SOTC_PARALLEL_WARMUP=<threads> (0 = build on this thread, as before). With a cold
+    // driver cache (new driver, cleared cache) each pipeline takes 10-40 ms to compile.
+    const u32 warmup_threads = [] {
+        const char* v = std::getenv("SOTC_PARALLEL_WARMUP");
+        const u32 hw = std::max(1u, std::thread::hardware_concurrency());
+        return v ? static_cast<u32>(std::strtoul(v, nullptr, 10))
+                 : std::clamp<u32>(hw > 2 ? hw - 2 : 1, 1, 12);
+    }();
+    if (warmup_threads > 0) {
+        warmup_pool = std::make_unique<AsyncCompiler>(warmup_threads, size_t{1} << 20);
+    }
 
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
@@ -400,6 +475,26 @@ void PipelineCache::WarmUp() {
             }
         });
 
+    if (warmup_pool) {
+        warmup_pool->Stop(); // drains: every queued pipeline is built
+        warmup_pool.reset();
+        for (auto& [key, pipeline] : warmup_graphics) {
+            graphics_pipelines.try_emplace(key, std::move(pipeline));
+        }
+        for (auto& [key, pipeline] : warmup_compute) {
+            compute_pipelines.try_emplace(key, std::move(pipeline));
+        }
+        warmup_graphics.clear();
+        warmup_compute.clear();
+        warmup_graphics_keys.clear();
+        warmup_compute_keys.clear();
+    }
+    std::fprintf(stderr, "SOTC pipeline cache: preloaded %u pipelines in %lld ms (%u threads)\n",
+                 num_pipelines,
+                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::steady_clock::now() - warmup_start)
+                                            .count()),
+                 warmup_threads);
     LOG_INFO(Render, "Preloaded {} pipelines in {} ms", num_pipelines,
              std::chrono::duration_cast<std::chrono::milliseconds>(
                  std::chrono::steady_clock::now() - warmup_start)
@@ -413,6 +508,7 @@ void PipelineCache::WarmUp() {
 }
 
 void PipelineCache::Sync() {
+    SaveDriverCache(true);
     Storage::DataBase::Instance().Close();
 }
 

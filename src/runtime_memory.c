@@ -809,15 +809,25 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
 
 /* Per-thread cache of recently found regions for the GPU's per-draw queries:
  * entries hold for as long as the table generation they were read at. */
-typedef struct { uint64_t generation; uintptr_t start, end; int kind; const unsigned char *backing; } CachedRegion; /* backing: view of start */
-static __thread CachedRegion region_cache[8];
-static __thread unsigned region_cache_next;
+typedef struct {
+    uint64_t generation; uintptr_t start, end; int kind; const unsigned char *backing; /* backing: view of start */
+    uintptr_t run_end; int run_exact; /* end of the run of adjacent non-reserved VMAs from start (exact unless capped) */
+} CachedRegion;
+#define REGION_CACHE_SLOTS 16
+static __thread CachedRegion region_cache[REGION_CACHE_SLOTS];
+static __thread unsigned region_cache_next, region_cache_last;
 static const CachedRegion *cached_region(uintptr_t address) {
     uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
     if (generation & 1) return NULL;
-    for (unsigned i=0;i<8;++i) {
-        const CachedRegion *c=&region_cache[i];
-        if (c->generation==generation && c->end && c->start<=address && address<c->end) return c;
+    /* Most-recent hit first: per-draw queries repeat the same few regions. */
+    const CachedRegion *c=&region_cache[region_cache_last];
+    if (c->generation==generation && c->end && c->start<=address && address<c->end) return c;
+    for (unsigned i=0;i<REGION_CACHE_SLOTS;++i) {
+        c=&region_cache[i];
+        if (c->generation==generation && c->end && c->start<=address && address<c->end) {
+            region_cache_last=i;
+            return c;
+        }
     }
     return NULL;
 }
@@ -826,7 +836,24 @@ static void cache_region(size_t i) {
     uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
     if (i==vma_count || (generation & 1)) return;
     const unsigned char *backing=vmas[i].kind!=KIND_RESERVED && backing_base ? backing_base+vmas[i].phys : NULL;
-    region_cache[region_cache_next++ % 8]=(CachedRegion){generation,vmas[i].start,vmas[i].end,vmas[i].kind,backing};
+    /* sotc: the mapped run from this VMA, as runtime_memory_clamp's loop walks it, so clamps
+     * of large (unbounded) descriptor ranges hit the cache too. */
+    uintptr_t run_end=vmas[i].end; int run_exact=1;
+    if (vmas[i].kind!=KIND_RESERVED) {
+        size_t j=i, steps=0;
+        while (j+1<vma_count && vmas[j+1].start==vmas[j].end && vmas[j+1].kind!=KIND_RESERVED) {
+            if (++steps>64) { run_exact=0; break; }
+            run_end=vmas[++j].end;
+        }
+    }
+    unsigned slot=region_cache_next++ % REGION_CACHE_SLOTS;
+    region_cache[slot]=(CachedRegion){generation,vmas[i].start,vmas[i].end,vmas[i].kind,backing,run_end,run_exact};
+    region_cache_last=slot;
+}
+/* sotc: generation of the mapping table; even and unchanged means no mapping changed, so
+ * backing pointers obtained at that generation are still valid. */
+uint64_t runtime_memory_table_generation(void) {
+    return __atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
 }
 /* sotc: the GPU reads guest memory through the backing view on every upload; the per-thread
  * region cache spares it the table lock (a winpthread rwlock, slow) and the binary search. */
@@ -846,7 +873,11 @@ const unsigned char *runtime_memory_backing_pointer(uintptr_t address) {
 /* Mapped length from address, up to size, across adjacent mappings. */
 uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size) {
     const CachedRegion *c=(runtime_disabled_optimizations & 1) ? NULL : cached_region(address);
-    if (c && c->kind!=KIND_RESERVED && size<=c->end-address) return size;
+    if (c && c->kind!=KIND_RESERVED) {
+        if (size<=c->end-address) return size;
+        /* The slow loop below stops at the first gap or reserved VMA: the cached run end. */
+        if (c->run_exact) { uint64_t run=c->run_end-address; return size<run ? size : run; }
+    }
     read_lock();
     { size_t i=vma_index(address); if (i<vma_count && vmas[i].start<=address) cache_region(i); }
     uint64_t length=0;
@@ -889,9 +920,11 @@ void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int 
 /* Host view of a guest range, for the GPU backend: the range must be mapped. */
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size) {
     const CachedRegion *c=(runtime_disabled_optimizations & 1) ? NULL : cached_region(address);
-    if (c && c->kind!=KIND_RESERVED && size<=c->end-address) return 1;
+    if (c && c->kind!=KIND_RESERVED && (size<=c->end-address || (c->run_exact && size<=c->run_end-address))) return 1;
     read_lock();
     int result=covered(address,address+size,0);
+    /* sotc: fill the per-thread cache here too; without it this query always took the lock. */
+    { size_t i=vma_index(address); if (i<vma_count && vmas[i].start<=address) cache_region(i); }
     read_unlock();
     return result;
 }

@@ -1,7 +1,21 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
+#include <unordered_map>
+#include <vector>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -9,6 +23,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_recorder.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/sotc_frame_stats.h"
 #include "video_core/sotc_stats.h"
 #include <chrono>
 #include <span>
@@ -57,6 +72,8 @@ void Scheduler::WaitSubmitted(u64 tick, bool kick) {
     if (!recorder || recorded_submit_tick.load(std::memory_order_acquire) >= tick) {
         return;
     }
+    SotcFrameStats::Scope timing{SotcFrameStats::Kind::SubmitWait};
+    const SotcStats::ScopedTimer recorder_timer{SotcStats::recorder_wait_ns};
     if (kick) {
         recorder->Kick();
     }
@@ -103,7 +120,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     };
     const vk::RenderingAttachmentInfo stencil_attachment = {
         .imageView = db.image_view,
-        .imageLayout = db.image_layout,
+        .imageLayout = db.stencil_layout,
         .loadOp = db.stencil_clear ? vk::AttachmentLoadOp::eClear : vk::AttachmentLoadOp::eLoad,
         .storeOp = vk::AttachmentStoreOp::eStore,
         .clearValue = vk::ClearValue{.depthStencil =
@@ -126,11 +143,50 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
     CommandBuffer().beginRendering(rendering_info);
 }
 
+/// sotc: SOTC_BREAK_STATS=1: every 10 s, the call sites that closed render passes (offsets in
+/// bb-probe.exe, for llvm-symbolizer), most frequent first.
+[[gnu::noinline]] static void NoteRenderBreak(uintptr_t caller) {
+    static const bool enabled = std::getenv("SOTC_BREAK_STATS") != nullptr;
+    if (!enabled) {
+        return;
+    }
+    static std::mutex mutex;
+    static std::unordered_map<uintptr_t, u64> counts;
+    static auto last = std::chrono::steady_clock::now();
+    std::scoped_lock lk{mutex};
+    ++counts[caller];
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10)) {
+        return;
+    }
+    last = now;
+    std::vector<std::pair<u64, uintptr_t>> sorted;
+    u64 total = 0;
+    for (const auto& [where, n] : counts) {
+        sorted.emplace_back(n, where);
+        total += n;
+    }
+    std::sort(sorted.rbegin(), sorted.rend());
+#ifdef _WIN32
+    const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+#else
+    const uintptr_t base = 0;
+#endif
+    std::fprintf(stderr, "SOTC render breaks in 10 s: %llu\n",
+                 static_cast<unsigned long long>(total));
+    for (size_t i = 0; i < sorted.size() && i < 12; ++i) {
+        std::fprintf(stderr, "  %7llu exe+%#llx\n", static_cast<unsigned long long>(sorted[i].first),
+                     static_cast<unsigned long long>(sorted[i].second - base + 0x140000000ULL));
+    }
+    counts.clear();
+}
+
 void Scheduler::EndRendering() {
     if (!is_rendering) {
         return;
     }
     SotcStats::render_breaks.fetch_add(1, std::memory_order_relaxed);
+    NoteRenderBreak(reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
     is_rendering = false;
     CommandBuffer().endRendering();
 }
@@ -280,10 +336,90 @@ void Scheduler::SubmitAheadAndWait() {
 
 void Scheduler::PopPendingOperations() {
     std::unique_lock lk(pending_ops_mutex);
-    work_semaphore.Refresh();
+    // sotc: this runs before every draw and dispatch; query the GPU timeline only when a pending
+    // operation is waiting for a tick not yet known to be complete.
+    // SOTC_POP_LAZY=0 refreshes on every call as before (A/B).
+    static const bool lazy = [] {
+        const char* v = std::getenv("SOTC_POP_LAZY");
+        return !v || *v != '0';
+    }();
+    if (lazy && pending_ops.empty()) {
+        return;
+    }
+    if (!lazy || pending_ops.empty() || !work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
+        work_semaphore.Refresh();
+    }
     while (!pending_ops.empty() && work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
         pending_ops.front().callback();
         pending_ops.pop();
+    }
+}
+
+static bool GpuTimeEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_GPU_TIME");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+
+void Scheduler::EnableGpuTime() {
+    gpu_time_on = GpuTimeEnabled();
+}
+
+void Scheduler::GpuTimeBegin(vk::CommandBuffer cmdbuf) {
+    if (!gpu_time_pool) {
+        const vk::QueryPoolCreateInfo pool_info = {
+            .queryType = vk::QueryType::eTimestamp,
+            .queryCount = GpuTimeQueries,
+        };
+        auto [result, pool] = instance.GetDevice().createQueryPoolUnique(pool_info);
+        ASSERT_MSG(result == vk::Result::eSuccess, "SOTC_GPU_TIME: no query pool");
+        gpu_time_pool = std::move(pool);
+        gpu_time_period =
+            instance.GetPhysicalDevice().getProperties().limits.timestampPeriod;
+    }
+    gpu_time_slot = (gpu_time_next++ % (GpuTimeQueries / 2)) * 2;
+    cmdbuf.resetQueryPool(*gpu_time_pool, gpu_time_slot, 2);
+    cmdbuf.writeTimestamp2(vk::PipelineStageFlagBits2::eNone, *gpu_time_pool, gpu_time_slot);
+}
+
+void Scheduler::GpuTimeEnd(vk::CommandBuffer cmdbuf, u64 tick) {
+    if (gpu_time_slot == ~0u) {
+        return;
+    }
+    cmdbuf.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *gpu_time_pool,
+                           gpu_time_slot + 1);
+    gpu_time_pending.emplace(tick, gpu_time_slot);
+    gpu_time_slot = ~0u;
+}
+
+void Scheduler::GpuTimeCollect() {
+    while (!gpu_time_pending.empty() && work_semaphore.IsFree(gpu_time_pending.front().first)) {
+        const u32 slot = gpu_time_pending.front().second;
+        std::array<u64, 2> stamps{};
+        const auto result = instance.GetDevice().getQueryPoolResults(
+            *gpu_time_pool, slot, 2, sizeof(stamps), stamps.data(), sizeof(u64),
+            vk::QueryResultFlagBits::e64);
+        if (result == vk::Result::eNotReady) {
+            break;
+        }
+        gpu_time_pending.pop();
+        if (result != vk::Result::eSuccess || stamps[1] < stamps[0]) {
+            continue;
+        }
+        // Union of the intervals: the next command buffer may start before this one ends.
+        const u64 from = std::max(stamps[0], gpu_time_last_end);
+        if (stamps[1] > from) {
+            SotcStats::gpu_busy_ns.fetch_add(u64((stamps[1] - from) * gpu_time_period),
+                                             std::memory_order_relaxed);
+        }
+        if (gpu_time_last_end != 0 && stamps[0] > gpu_time_last_end) {
+            SotcStats::gpu_gap_ns.fetch_add(u64((stamps[0] - gpu_time_last_end) * gpu_time_period),
+                                            std::memory_order_relaxed);
+        }
+        gpu_time_last_end = std::max(gpu_time_last_end, stamps[1]);
+        SotcStats::gpu_timed.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -305,6 +441,9 @@ void Scheduler::BeginSession() {
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
+    if (gpu_time_on) {
+        GpuTimeBegin(session.primary);
+    }
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();
@@ -392,6 +531,10 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         on_submit(info);
     }
 
+    if (gpu_time_on && !sessions.empty()) {
+        EndRendering();
+        GpuTimeEnd(sessions.back().primary, signal_value);
+    }
     // sotc: the GPU writes this tick to host memory once everything before is visible there.
     if (work_semaphore.HasMarker() && !sessions.empty()) {
         EndRendering();
@@ -431,6 +574,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     }
 
     work_semaphore.Refresh();
+    if (gpu_time_on) {
+        GpuTimeCollect();
+    }
     BeginSession();
 
     // Apply pending operations

@@ -108,6 +108,17 @@ const SrtWalkerContext* GetSrtWalkerContext() {
     return &WalkerContext();
 }
 
+const SrtWalkerContext* GetSrtHelperWalkerContext() {
+    static const SrtWalkerContext context{
+        .clean_pages = WalkerContext().clean_pages,
+        .clean_load = [](u64 address, u32 size, u64* out) {
+            *out = 0;
+            return Core::Memory::Instance()->TryReadBacking(address, out, size);
+        },
+    };
+    return &context;
+}
+
 void SetSrtCleanLoad(bool (*clean_load)(u64, u32, u64*)) {
     WalkerContext().clean_load = clean_load;
 }
@@ -199,6 +210,37 @@ bool SrtWalkerSignalHandler(void* context, void* fault_address) {
     ASSERT(ZYAN_SUCCESS(status) && instruction.mnemonic == ZYDIS_MNEMONIC_MOV &&
            operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
            operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY);
+
+#ifdef _WIN32
+    // sotc: emulate the load instead of rewriting the shared walker code: the destination reads
+    // zero (as the patched xor did) and the walker continues after the mov. The code is never
+    // modified while it runs, so other threads may execute the same walker (draw preparation
+    // helpers), and a walker is never persisted patched. SOTC_WALKER_NOPATCH=0 patches as before.
+    static const bool no_patch = [] {
+        const char* v = std::getenv("SOTC_WALKER_NOPATCH");
+        return !v || *v != '0';
+    }();
+    if (no_patch) {
+        auto* ctx = static_cast<EXCEPTION_POINTERS*>(context)->ContextRecord;
+        switch (operands[0].reg.value) {
+        case ZYDIS_REGISTER_RDI:
+            ctx->Rdi = 0;
+            break;
+        case ZYDIS_REGISTER_R10D:
+            ctx->R10 = 0; // a 32-bit destination zero-extends
+            break;
+        default:
+            return false;
+        }
+        ctx->Rip += instruction.length;
+        static std::atomic<u32> logged{0};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_WARNING(Render_Recompiler, "SRT walker load at {} read zero, fault address {}",
+                        code, fault_address);
+        }
+        return true;
+    }
+#endif
 
     size_t len = instruction.length;
     const size_t patch_size = 3;

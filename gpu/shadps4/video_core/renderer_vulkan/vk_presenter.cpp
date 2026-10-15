@@ -15,9 +15,11 @@
 #include "sdl_window.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
+#include "video_core/sotc_frame_stats.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/image.h"
 #include "bbport_overlay.h"
@@ -473,6 +475,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
       swapchain{instance, window}, runtime{instance, draw_scheduler},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
+    draw_scheduler.EnableGpuTime();
     const u32 num_images = swapchain.GetImageCount();
     const vk::Device device = instance.GetDevice();
 
@@ -775,6 +778,18 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     frame->ready_tick = draw_scheduler.CurrentTick();
     SubmitInfo info{};
     draw_scheduler.Flush(info);
+    static const u32 frames_ahead = [] {
+        const char* value = std::getenv("SOTC_FRAMES_AHEAD");
+        return value ? u32(std::clamp(std::atoi(value), 0, 3)) : 1u;
+    }();
+    if (frames_ahead) {
+        recent_frame_ticks.push_back(frame->ready_tick);
+        while (recent_frame_ticks.size() > frames_ahead) {
+            const auto tick = recent_frame_ticks.front();
+            recent_frame_ticks.pop_front();
+            if (recent_frame_ticks.size() == frames_ahead) draw_scheduler.Wait(tick);
+        }
+    }
     return frame;
 }
 
@@ -1119,16 +1134,23 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     scheduler.Flush(info);
 
     // Present to swapchain.
+    bool present_success{};
+    const auto present_start = SotcFrameStats::Enabled() ? SotcFrameStats::Now() : 0;
     {
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        if (!swapchain.Present()) {
+        present_success = swapchain.Present();
+        if (!present_success) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
     }
 
     free_frame();
+    if (present_success && !is_reusing_frame && is_game_frame) {
+        SotcFrameStats::Presented(present_start ? SotcFrameStats::Now() - present_start : 0);
+    }
     if (!is_reusing_frame && is_game_frame) {
         DebugState.IncFlipFrameNum();
+        SotcStats::flips.fetch_add(1, std::memory_order_relaxed);
         // SOTC_FRAME_LOG=<n> prints the frame count and time to stderr every n frames, for
         // measuring the frame rate of scripted runs.
         static const u64 every = [] {

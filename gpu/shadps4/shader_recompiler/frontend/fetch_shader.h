@@ -72,4 +72,8 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base);
 
 bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data);
 
+/// sotc: parses fetch shader code already copied out of guest memory (at most max_words);
+/// false on anything ParseFetchShader would assert on (draw preparation helpers).
+bool TryParseFetchShader(const u32* code, size_t max_words, FetchShaderData& out_fetch_data);
+
 } // namespace Shader::Gcn

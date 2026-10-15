@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
+#include <cstdlib>
+#include <string>
 #include "core/emulator_settings.h"
 #include "shader_recompiler/ir/program.h"
 #include "shader_recompiler/profile.h"
@@ -16,6 +19,45 @@ static void AddFlatbuf(Info& info) {
         });
         info.has_flatbuf = true;
     }
+}
+
+// sotc: SOTC_DMA_DIAG=1 prints, once per shader, where the address and offset of each read
+// left to direct memory access come from (the SRT walker could not flatten it).
+static void FormatValue(std::string& out, const IR::Value& value, int depth) {
+    if (value.IsImmediate()) {
+        if (value.Type() == IR::Type::U32) {
+            out += fmt::format("{:#x}", value.U32());
+        } else if (value.Type() == IR::Type::U64) {
+            out += fmt::format("{:#x}", value.U64());
+        } else {
+            out += "imm";
+        }
+        return;
+    }
+    const IR::Inst* inst = value.TryInst();
+    if (!inst) {
+        out += "?";
+        return;
+    }
+    out += IR::NameOf(inst->GetOpcode());
+    if (inst->GetOpcode() == IR::Opcode::GetUserData) {
+        out += fmt::format("[{}]", u32(inst->Arg(0).ScalarReg()));
+        return;
+    }
+    if (inst->GetOpcode() == IR::Opcode::ReadConst) {
+        out += fmt::format("{{flags {:#x}}}", inst->Flags<u32>());
+    }
+    if (depth == 0 || inst->NumArgs() == 0) {
+        return;
+    }
+    out += "(";
+    for (size_t i = 0; i < inst->NumArgs(); ++i) {
+        if (i) {
+            out += ", ";
+        }
+        FormatValue(out, inst->Arg(i), depth - 1);
+    }
+    out += ")";
 }
 
 void Visit(Info& info, const IR::Inst& inst) {
@@ -159,6 +201,15 @@ void Visit(Info& info, const IR::Inst& inst) {
             info.readconst_types |= Info::ReadConstType::Immediate;
             info.readconst_types |= Info::ReadConstType::Dynamic;
             info.uses_dma = true;
+            static const bool diag = std::getenv("SOTC_DMA_DIAG") != nullptr;
+            if (diag) {
+                std::string addr, offset;
+                FormatValue(addr, inst.Arg(0), 14);
+                FormatValue(offset, inst.Arg(1), 8);
+                std::fprintf(stderr, "SOTC dma read: shader %#llx stage %u addr %s offset %s\n",
+                             static_cast<unsigned long long>(info.pgm_hash), u32(info.sw_stage),
+                             addr.c_str(), offset.c_str());
+            }
         }
         break;
     case IR::Opcode::PackUfloat10_11_11:

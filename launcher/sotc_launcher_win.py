@@ -24,6 +24,7 @@ import threading
 FROZEN = getattr(sys, 'frozen', False)
 PORT_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PORT_DIR / 'scripts'))
+from sotc_cache import cache_path
 CONFIG_DIR = Path(os.environ.get('APPDATA', Path.home())) / 'sotc-launcher'
 CONFIG_FILE = CONFIG_DIR / 'settings.json'
 GAME_ID, GAME_VERSION = 'CUSA08809', '01.01'
@@ -100,13 +101,13 @@ def windows_language():
 # Settings, passed to sotc.py as environment variables.
 
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
-                'user_dir': '', 'af16': True, 'fps60': False, 'fullscreen': False,
+                'user_dir': '', 'af16': True, 'fps60': False, 'fps_unlimited': False, 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
                 'readbacks': '', 'extra_env': '', 'close_on_play': False, 'gamepad': '',
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
-                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'library_dirs': [], 'keys': {},
+                'perf_record_thread': True, 'perf_draw_prep': True, 'perf_dma': False, 'gpu_submit': 'auto', 'library_dirs': [], 'keys': {},
                 'auto_setup': True, 'dlc_dir': ''}
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
 KEY_INPUTS = [
@@ -265,6 +266,9 @@ def game_environment(s):
     if s.get('dlc_dir'):
         env['SOTC_DLC_DIR'] = s['dlc_dir']
     env['SOTC_MODES'] = ','.join(m for m in ('af16', 'fps60') if s.get(m))
+    if s.get('fps60') and s.get('fps_unlimited'):
+        # No host frame limit: the game is then paced by the 120 Hz vblank (up to 120 FPS).
+        env['BB_FPS_LIMIT'] = '0'
     env['BB_FULLSCREEN'] = '1' if s['fullscreen'] else '0'
     env['BB_PRESENT_MODE'] = s['present_mode']
     if s['language']:
@@ -283,8 +287,9 @@ def game_environment(s):
     cvars += str(s.get('engine_cvars', '')).split()
     env['SOTC_CVARS'] = ' '.join(cvars)
     env['SOTC_RECORD_THREAD'] = '1' if s.get('perf_record_thread', True) else '0'
-    if not s.get('perf_dma', True):
-        env['BB_DIRECT_MEMORY_ACCESS'] = '0'
+    env['SOTC_DRAW_PREP'] = '1' if s.get('perf_draw_prep', True) else '0'
+    # Off by default in the port; the switch sets it either way.
+    env['BB_DIRECT_MEMORY_ACCESS'] = '1' if s.get('perf_dma', False) else '0'
     # Periodic submits and readbacks ahead: by default only with NVIDIA (vk_rasterizer.cpp).
     if s.get('gpu_submit') == 'on':
         env['SOTC_FLUSH_US'], env['SOTC_RB_AHEAD'] = '500', '1'
@@ -740,8 +745,8 @@ class Launcher:
                     on_change=self.refresh_status)
         self.section(f, _('Saves', 'Saves'))
         self.folder(f, 'user_dir', _('Pasta de dados', 'Data folder'), _('Pasta dos saves', 'Saves folder'),
-                    _('Saves, cache de shaders e capturas. Vazio = a pasta user ao lado do port.',
-                      'Saves, shader cache and screenshots. Empty = the user folder next to the port.'),
+                    _('Saves e capturas. Vazio = a pasta user ao lado do port. O cache é compartilhado entre instalações.',
+                      'Saves and screenshots. Empty = the user folder next to the port. The cache is shared across installations.'),
                     on_change=self.refresh_status)
         holder = ttk.Frame(f)
         holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(10, 0))
@@ -764,6 +769,12 @@ class Launcher:
         self.check(f, 'fps60', _('60 FPS (experimental)', '60 FPS (experimental)'),
                    _('Tira o limite de 30 FPS do jogo; o vblank vai a 120 Hz. Mediu 38 FPS no campo e ~25 no templo.',
                      'Removes the game\'s 30 FPS cap; vblank at 120 Hz. Measured 38 FPS in the open world, ~25 at the temple.'))
+        self.check(f, 'fps_unlimited', _('Sem limite de FPS (com 60 FPS ligado, até 120)',
+                                          'No FPS limit (with 60 FPS on, up to 120)'),
+                   _('Tira o limite de 60 do modo 60 FPS: o jogo vai até o vblank de 120 Hz. Experimental: '
+                     'se algo andar rápido ou devagar demais (cavalo, escalada, cenas), volte para 60.',
+                     'Lifts the 60 FPS mode\'s cap: the game runs up to the 120 Hz vblank. Experimental: '
+                     'if anything moves too fast or too slow (horse, climbing, cutscenes), go back to 60.'))
         self.section(f, _('Resolução', 'Resolution'))
         self.row(f, _('Saída', 'Output'), self.choice(f, 'output_res', OUTPUTS),
                  _('O jogo renderiza em 1080p, como no PS4; a imagem é ampliada ou reduzida para a saída. '
@@ -792,6 +803,14 @@ class Launcher:
                      'Ponte do cânion no demo: ~24 → ~28 FPS. Desligue se notar travamentos.',
                      'Records and submits the GPU commands on another thread (cp_record_thread of '
                      'Pink-shadPS4). Canyon bridge in the demo: ~24 → ~28 FPS. Turn it off if the game hangs.'))
+        self.check(f, 'perf_draw_prep', _('Preparar os draws em outra thread (recomendado)',
+                                           'Prepare draws on another thread (recommended)'),
+                   _('Uma thread auxiliar escolhe antes o pipeline de cada draw e o processador de comandos só '
+                     'confere e usa (tudo é conferido, nada é aceito sem prova). Demo: CP ~8% mais leve, '
+                     '+3–4% de FPS. Desligue se notar algo estranho.',
+                     'A helper thread picks each draw\'s pipeline ahead of time and the command processor only '
+                     'checks and uses it (everything is checked, nothing is taken unproven). Demo: command '
+                     'processor ~8% lighter, +3-4% FPS. Turn it off if something looks wrong.'))
         self.check(f, 'perf_dma', _('Reflexos completos da água (acesso direto à memória)',
                                      'Full water reflections (direct memory access)'),
                    _('Deixa os shaders lerem tabelas da memória do jogo direto (como o Pink-shadPS4): o lago ondula '
@@ -1488,8 +1507,10 @@ class Launcher:
     def clear_cache(self):
         if self.process:
             return
-        for name in ('cache', 'shader'):
-            shutil.rmtree(user_dir(self.app) / name, ignore_errors=True)
+        # Remove the legacy root too, so it cannot reseed the cache just cleared.
+        for folder in (cache_path(user_dir(self.app), game_environment(self.app)) / GAME_ID,
+                       user_dir(self.app) / 'cache' / GAME_ID, user_dir(self.app) / 'shader'):
+            shutil.rmtree(folder, ignore_errors=True)
         self.messagebox.showinfo('Shadow of the Colossus', _(
             'Cache de shaders limpo. A próxima partida engasga alguns minutos enquanto ele é refeito.',
             'Shader cache cleared. The next start stutters for a few minutes while it is rebuilt.'))

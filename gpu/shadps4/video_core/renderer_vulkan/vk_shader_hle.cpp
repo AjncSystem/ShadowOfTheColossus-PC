@@ -162,9 +162,43 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
         buffer_cache.IsRegionGpuModified(src.base_address, src_count * 4)) {
         return false;
     }
+    const VAddr address = dst.base_address;
+    const u32* source = std::bit_cast<const u32*>(src.base_address);
+    // sotc: build the pattern directly in the destination's backing (one pass instead of a
+    // scratch vector plus a copy). Falls back when source and destination overlap or the
+    // destination is not one contiguous run. SOTC_FILL_INPLACE=0 always uses the scratch copy.
+    static const bool in_place = [] {
+        const char* v = std::getenv("SOTC_FILL_INPLACE");
+        return !v || *v != '0';
+    }();
+    const bool overlap = src.base_address < address + count * 4 &&
+                         address < src.base_address + src_count * 4;
+    bool replaced = false;
+    if (in_place && !overlap) {
+        replaced = buffer_cache.TryReplaceFromCpuInPlace(address, count * 4, [&](u8* out) {
+            u32* words = reinterpret_cast<u32*>(out);
+            std::memcpy(words, source, src_count * 4);
+            for (u64 done = src_count; done < count;) {
+                const u64 chunk = std::min(done, count - done);
+                std::memcpy(words + done, words, chunk * 4);
+                done += chunk;
+            }
+        });
+    }
+    if (replaced) {
+        static const bool full_invalidate_inplace = [] {
+            const char* v = std::getenv("SOTC_HLE_FULL_INVALIDATE");
+            return v && *v == '1';
+        }();
+        if (full_invalidate_inplace) {
+            rasterizer.InvalidateMemory(address, count * 4);
+        } else {
+            rasterizer.GetTextureCache().InvalidateMemory(address, count * 4);
+        }
+        return true;
+    }
     static std::vector<u32> data;
     data.resize(count);
-    const u32* source = std::bit_cast<const u32*>(src.base_address);
     // The pattern of src_count elements, repeated (no division per element).
     std::memcpy(data.data(), source, src_count * 4);
     for (u64 done = src_count; done < count;) {
@@ -172,11 +206,21 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
         std::memcpy(data.data() + done, data.data(), chunk * 4);
         done += chunk;
     }
-    const VAddr address = dst.base_address;
     if (!buffer_cache.TryReplaceFromCpu(address, data.data(), count * 4)) {
         return false;
     }
-    rasterizer.InvalidateMemory(address, count * 4);
+    // TryReplaceFromCpu already dropped the GPU-written state and marked the pages CPU-modified,
+    // so the buffer half of Rasterizer::InvalidateMemory has nothing left to do; only images
+    // aliasing the range need it. SOTC_HLE_FULL_INVALIDATE=1 restores the full call (A/B).
+    static const bool full_invalidate = [] {
+        const char* v = std::getenv("SOTC_HLE_FULL_INVALIDATE");
+        return v && *v == '1';
+    }();
+    if (full_invalidate) {
+        rasterizer.InvalidateMemory(address, count * 4);
+    } else {
+        rasterizer.GetTextureCache().InvalidateMemory(address, count * 4);
+    }
     return true;
 }
 

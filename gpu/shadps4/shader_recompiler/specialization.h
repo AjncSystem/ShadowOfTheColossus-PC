@@ -4,6 +4,7 @@
 #pragma once
 
 #include <bitset>
+#include <span>
 
 #include "common/types.h"
 #include "shader_recompiler/backend/bindings.h"
@@ -93,11 +94,16 @@ struct StageSpecialization {
     StageSpecialization() = default;
     StageSpecialization(const Info& info_, RuntimeInfo runtime_info_, const Profile& profile_,
                         Backend::Bindings start_)
+        : StageSpecialization(info_, runtime_info_, profile_, start_, nullptr, {}) {}
+    /// sotc: with fetch set (draw preparation helpers), the fetch shader and the V# of each of
+    /// its attributes come from the caller instead of guest memory.
+    StageSpecialization(const Info& info_, RuntimeInfo runtime_info_, const Profile& profile_,
+                        Backend::Bindings start_, const Gcn::FetchShaderData* fetch,
+                        std::span<const AmdGpu::Buffer> fetch_vsharps)
         : info{&info_}, runtime_info{runtime_info_}, start{start_} {
-        if (info_.sw_stage == SwStage::Vertex && Gcn::ParseFetchShader(info_, fetch_shader_data)) {
-            // Specialize shader on VS input number types to follow spec.
-            ForEachSharp(vs_attribs, fetch_shader_data.attributes,
-                         [this](auto& spec, const auto& desc, AmdGpu::Buffer sharp) {
+        // Specialize shader on VS input number types to follow spec.
+        const auto specialize_attrib = [this](auto& spec, const auto& desc,
+                                              AmdGpu::Buffer sharp) {
                              using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
                              if (const auto step_rate = desc.GetStepRate();
                                  step_rate != InstanceIdType::None) {
@@ -109,7 +115,20 @@ struct StageSpecialization {
                              }
                              spec.num_class = AmdGpu::GetNumberClass(sharp.GetNumberFmt());
                              spec.dst_select = sharp.DstSelect();
-                         });
+        };
+        if (fetch) {
+            if (info_.sw_stage == SwStage::Vertex && info_.has_fetch_shader) {
+                fetch_shader_data = *fetch;
+                for (size_t i = 0; i < fetch_shader_data.attributes.size(); ++i) {
+                    auto& spec = vs_attribs.emplace_back();
+                    if (const AmdGpu::Buffer sharp = fetch_vsharps[i]; sharp) {
+                        specialize_attrib(spec, fetch_shader_data.attributes[i], sharp);
+                    }
+                }
+            }
+        } else if (info_.sw_stage == SwStage::Vertex &&
+                   Gcn::ParseFetchShader(info_, fetch_shader_data)) {
+            ForEachSharp(vs_attribs, fetch_shader_data.attributes, specialize_attrib);
         }
         u32 binding{};
         ForEachSharp(binding, buffers, info->buffers,

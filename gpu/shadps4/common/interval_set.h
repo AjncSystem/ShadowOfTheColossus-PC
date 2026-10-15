@@ -5,7 +5,9 @@
 
 #include <algorithm>
 #include <concepts>
+#include <cstdlib>
 #include <iterator>
+#include <type_traits>
 #include <vector>
 
 #include "common/types.h"
@@ -46,6 +48,7 @@ public:
 
     void Clear() {
         intervals.clear();
+        hint = NoHint;
     }
     bool Empty() const {
         return intervals.empty();
@@ -62,7 +65,44 @@ public:
         if (value.start >= value.end) [[unlikely]] {
             return;
         }
-
+        // sotc: plain intervals always merge, so adding a range that is already covered leaves
+        // the list unchanged; skip the splice and coalesce (two vector moves per call).
+        static const bool fast_add = [] {
+            const char* v = std::getenv("SOTC_ACCESS_FASTADD");
+            return !v || *v != '0';
+        }();
+        // SOTC_ACCESS_HINT=0 disables the hint below.
+        static const bool use_hint = [] {
+            const char* v = std::getenv("SOTC_ACCESS_HINT");
+            return !v || *v != '0';
+        }();
+        if constexpr (std::is_same_v<IV, Interval>) {
+            if (fast_add) {
+                // sotc: the buffer access lists get a range per binding per draw, mostly inside
+                // or right after the range the previous call added (per-draw constants laid out
+                // one after the other). Answered at the interval that took the last range: covered,
+                // or extended to the right while it stays clear of the next interval (touching it
+                // must merge, which the general path below does). Without it, a range glued to the
+                // end of an interval costs an insert and an erase, each moving the vector's tail.
+                if (use_hint && hint < intervals.size()) {
+                    IV& h = intervals[hint];
+                    if (h.start <= value.start && value.start <= h.end) {
+                        if (value.end <= h.end) {
+                            return;
+                        }
+                        if (hint + 1 == intervals.size() || value.end < intervals[hint + 1].start) {
+                            h.end = value.end;
+                            return;
+                        }
+                    }
+                }
+                const auto it = std::ranges::upper_bound(intervals, value.start, {}, &IV::end);
+                if (it != intervals.end() && it->start <= value.start && value.end <= it->end) {
+                    hint = static_cast<std::size_t>(std::distance(intervals.begin(), it));
+                    return;
+                }
+            }
+        }
         IV out[3];
         std::size_t m = 0;
 
@@ -83,6 +123,11 @@ public:
         const auto at = std::distance(intervals.begin(), first);
         Splice(first, last, out, m);
         Coalesce(at, m);
+        if constexpr (std::is_same_v<IV, Interval>) {
+            // The interval that now holds value.start (value is covered after the add).
+            hint = static_cast<std::size_t>(std::distance(
+                intervals.begin(), std::ranges::upper_bound(intervals, value.start, {}, &IV::end)));
+        }
     }
 
     /// Removes a range from the interval set, trimming intervals that partially overlap it.
@@ -90,6 +135,7 @@ public:
         if (start >= end) [[unlikely]] {
             return;
         }
+        hint = NoHint;
         auto first = std::ranges::upper_bound(intervals, start, {}, &IV::end);
         auto last = first;
         while (last != intervals.end() && last->start < end) {
@@ -227,4 +273,7 @@ protected:
     }
 
     List intervals;
+    /// sotc: index of the interval the last Add went to (plain intervals only), see Add.
+    static constexpr std::size_t NoHint = ~std::size_t{0};
+    std::size_t hint = NoHint;
 };

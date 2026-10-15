@@ -14,6 +14,7 @@
 #include <boost/icl/interval_set.hpp>
 #include <mutex>
 #include <atomic>
+#include <boost/container/small_vector.hpp>
 #include "common/alignment.h"
 #include "common/adaptive_mutex.h"
 #include "common/assert.h"
@@ -58,6 +59,31 @@ std::mutex g_guest_stacks_mutex;
 boost::icl::interval_map<VAddr, u32> g_guest_stacks;
 // Re-applies the tracker's protection to pages that stop being stack pages.
 std::function<void(VAddr, u64)> g_reapply_protection;
+// sotc: [lo, hi) covering every registered stack (set under g_guest_stacks_mutex). A range
+// outside it skips the interval set and the mutex. A reader seeing an older hull acts as it
+// would have before the stack was registered, which RegisterGuestStack already handles (it
+// unprotects the stack after inserting it). SOTC_PROTECT_FAST=0 always takes the mutex.
+std::atomic<VAddr> g_stacks_lo{~VAddr{0}};
+std::atomic<VAddr> g_stacks_hi{0};
+
+void UpdateStackHull() {
+    if (g_guest_stacks.empty()) {
+        g_stacks_lo.store(~VAddr{0}, std::memory_order_release);
+        g_stacks_hi.store(0, std::memory_order_release);
+        return;
+    }
+    g_stacks_lo.store(g_guest_stacks.begin()->first.lower(), std::memory_order_release);
+    g_stacks_hi.store(g_guest_stacks.rbegin()->first.upper(), std::memory_order_release);
+}
+
+bool MayOverlapGuestStack(VAddr address, u64 size) {
+    static const bool fast = [] {
+        const char* v = std::getenv("SOTC_PROTECT_FAST");
+        return !v || *v != '0';
+    }();
+    return !fast || (address < g_stacks_hi.load(std::memory_order_acquire) &&
+                     g_stacks_lo.load(std::memory_order_acquire) < address + size);
+}
 } // namespace
 
 // The exception frame is written below the faulting stack pointer, so a nearly full stack also
@@ -75,6 +101,7 @@ void RegisterGuestStack(VAddr address, u64 size) {
     {
         std::scoped_lock lk{g_guest_stacks_mutex};
         g_guest_stacks += std::make_pair(boost::icl::interval<VAddr>::right_open(begin, end), 1u);
+        UpdateStackHull();
     }
     // Memory the guest hands over as a stack may already be tracked; make it accessible now.
     Core::Memory::Instance()->GetAddressSpace().Protect(begin, end - begin,
@@ -90,6 +117,7 @@ void UnregisterGuestStack(VAddr address, u64 size) {
     {
         std::scoped_lock lk{g_guest_stacks_mutex};
         g_guest_stacks -= std::make_pair(boost::icl::interval<VAddr>::right_open(begin, end), 1u);
+        UpdateStackHull();
     }
     // The pages were left accessible while they were a stack: give the tracker its protection
     // back, or CPU writes there would go unnoticed (pages still used by another stack stay).
@@ -100,6 +128,10 @@ void UnregisterGuestStack(VAddr address, u64 size) {
 
 void ForEachNonStackRange(VAddr address, u64 size, const std::function<void(VAddr, u64)>& func) {
     if (size == 0) {
+        return;
+    }
+    if (!MayOverlapGuestStack(address, size)) {
+        func(address, size);
         return;
     }
     boost::icl::interval_set<VAddr> ranges;
@@ -349,13 +381,17 @@ struct PageManager::Impl {
             }
         };
 
+        // sotc: the locks taken, unlocked from here instead of a second lookup per page.
+        boost::container::small_vector<decltype(&locks[0]), 128> taken;
         for (u64 page = page_start; page != page_end; ++page) {
             PageState* state = cached_pages.find(base_page + page);
             if (!state) {
                 continue;
             }
 
-            locks[base_page + page].lock();
+            auto& page_lock = locks[base_page + page];
+            page_lock.lock();
+            taken.push_back(&page_lock);
 
             const auto old_perms = state->Perms();
             if (page == page_start) {
@@ -391,10 +427,8 @@ struct PageManager::Impl {
         // Add pending (un)protect action
         release_pending();
 
-        for (u64 page = page_start; page != page_end; ++page) {
-            if (auto* lock = locks.find(base_page + page)) {
-                lock->unlock();
-            }
+        for (auto* page_lock : taken) {
+            page_lock->unlock();
         }
     }
 
@@ -589,7 +623,7 @@ struct SignalImpl : public PageManager::Impl {
                 Shader::SetSrtReadProtectedPages(address, size, false);
             }
         };
-        if (perms != Core::MemoryPermission::ReadWrite) {
+        if (perms != Core::MemoryPermission::ReadWrite && MayOverlapGuestStack(address, size)) {
             // Keep guest stacks accessible, only protect the rest of the range.
             boost::icl::interval_set<VAddr> ranges;
             ranges += boost::icl::interval<VAddr>::right_open(address, address + size);

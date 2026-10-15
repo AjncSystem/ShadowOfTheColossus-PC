@@ -116,6 +116,7 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
         format = image.info.pixel_format;
         aspect = vk::ImageAspectFlagBits::eStencil;
     }
+    aspect_mask = aspect;
 
     vk::ImageViewCreateInfo image_view_ci = {
         .pNext = &usage_ci,

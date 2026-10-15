@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
+#include <deque>
 
 #include <condition_variable>
 
@@ -135,6 +136,7 @@ private:
     std::condition_variable free_cv;
     std::condition_variable_any frame_cv;
     std::vector<VAddr> vo_buffers_addr;
+    std::deque<u64> recent_frame_ticks; // accessed only by the GPU command thread
 };
 
 } // namespace Vulkan

@@ -201,7 +201,23 @@ if (WIN32)
     target_link_options(bb-play PRIVATE -municode)
 endif()
 
-# Explicit test targets; neither launches the game nor needs a Vulkan device.
+# Explicit test targets; none launches the game.
+add_executable(sotc-present-test EXCLUDE_FROM_ALL ../tests/test_sotc_present.cpp)
+target_compile_options(sotc-present-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+target_include_directories(sotc-present-test PRIVATE shadps4)
+target_link_libraries(sotc-present-test PRIVATE bbgpu)
+# SotC cache regression uses a real Vulkan device, with a tiny compute shader.
+add_executable(sotc-cache-test EXCLUDE_FROM_ALL ../tests/test_sotc_cache.cpp)
+target_compile_options(sotc-cache-test PRIVATE -UNDEBUG -Wall -Wextra -Werror -Wno-missing-field-initializers)
+target_compile_definitions(sotc-cache-test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_include_directories(sotc-cache-test PRIVATE shadps4)
+target_link_libraries(sotc-cache-test PRIVATE Vulkan::Vulkan PkgConfig::XXHASH)
+add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/cache-smoke.spv
+    COMMAND ${GLSLANG_COMPILER} --target-env vulkan1.3 -o ${CMAKE_CURRENT_BINARY_DIR}/cache-smoke.spv
+        ${CMAKE_CURRENT_SOURCE_DIR}/../tests/cache_smoke.comp
+    DEPENDS ../tests/cache_smoke.comp)
+add_custom_target(sotc-cache-shader DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/cache-smoke.spv)
+add_dependencies(sotc-cache-test sotc-cache-shader)
 add_executable(motion-history-test EXCLUDE_FROM_ALL ../tests/test_motion_history.cpp)
 target_compile_options(motion-history-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
 target_include_directories(motion-history-test PRIVATE ..)

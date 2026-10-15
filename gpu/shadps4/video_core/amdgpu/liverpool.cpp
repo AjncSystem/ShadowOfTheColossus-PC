@@ -63,6 +63,41 @@ static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 
 std::array<u8, 48_KB> Liverpool::ConstantEngine::constants_heap;
 
+/// sotc: the game's synchronization commands, counted per kind (SotcStats::sync_events): PS, CS
+/// and VS partial flushes, cache flushes, end-of-shader, end-of-pipe, ACQUIRE_MEM, WAIT_REG_MEM.
+static void NoteSync(int kind) {
+    SotcStats::sync_events[kind].fetch_add(1, std::memory_order_relaxed);
+    SotcStats::sync_epoch.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void NoteSyncEvent(EventType type) {
+    switch (type) {
+    case EventType::PsPartialFlush:
+        NoteSync(0);
+        break;
+    case EventType::CsPartialFlush:
+        NoteSync(1);
+        break;
+    case EventType::VsPartialFlush:
+        NoteSync(2);
+        break;
+    case EventType::CacheFlushTs:
+    case EventType::CacheFlush:
+    case EventType::CacheFlushAndInvTsEvent:
+    case EventType::CacheFlushAndInvEvent:
+    case EventType::DbCacheFlushAndInv:
+    case EventType::FlushAndInvDbDataTs:
+    case EventType::FlushAndInvDbMeta:
+    case EventType::FlushAndInvCbDataTs:
+    case EventType::FlushAndInvCbMeta:
+    case EventType::FlushAndInvCbPixelData:
+        NoteSync(3);
+        break;
+    default:
+        break;
+    }
+}
+
 static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset) {
     if (offset > span.size()) {
         LOG_ERROR(
@@ -79,6 +114,9 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
 
 Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
+    if (DrawScan::Enabled()) {
+        draw_scan = std::make_unique<DrawScan>(regs);
+    }
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
 }
 
@@ -115,6 +153,12 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+    // sotc: SOTC_CP_PRIORITY=1 (above normal) / 2 (highest): the command processor limits the
+    // frame rate; a guest or worker thread taking its core delays every frame (A/B, default 0).
+    if (const char* v = std::getenv("SOTC_CP_PRIORITY"); v && (v[0] == '1' || v[0] == '2')) {
+        Common::SetCurrentThreadPriority(v[0] == '2' ? Common::ThreadPriority::VeryHigh
+                                                     : Common::ThreadPriority::High);
+    }
     gpu_id = std::this_thread::get_id();
 #ifdef __linux__
     gpu_tid = gettid();
@@ -122,6 +166,7 @@ void Liverpool::Process(std::stop_token stoken) {
 
     while (!stoken.stop_requested()) {
         {
+            const SotcStats::ScopedTimer idle_timer{SotcStats::cp_idle_ns};
             std::unique_lock lk{submit_mutex};
             Common::CondvarWait(submit_cv, lk, stoken,
                                 [this] { return num_commands || num_submits || submit_done; });
@@ -243,8 +288,13 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
-Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
+Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
+                                           u64 seq) {
     FIBER_ENTER(dcb_task_name);
+    const bool scan_top = draw_scan && seq != ~0ULL;
+    if (scan_top) {
+        draw_scan->Begin(seq);
+    }
 
     cblock.Reset();
 
@@ -280,6 +330,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+            if (draw_scan) {
+                // Every packet applied here, nested command buffers too: whatever the scanner
+                // does not see makes the histories differ.
+                HashStatePacket(header, gfx_reg_hash);
+                if (IsDrawOpcode(opcode)) {
+                    prepared_draw = scan_top ? draw_scan->OnDraw(gfx_reg_hash, regs) : nullptr;
+                }
+            }
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -330,6 +388,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::ClearState: {
                 regs.SetDefaults();
+                ++sel_regs_seq;
                 break;
             }
             case PM4ItOpcode::SetConfigReg: {
@@ -337,6 +396,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto reg_addr = Regs::ConfigRegWordOffset + set_data->reg_offset;
                 const auto* payload = reinterpret_cast<const u32*>(header + 2);
                 std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+                NoteRegWrite(reg_addr, count - 1);
                 break;
             }
             case PM4ItOpcode::SetContextReg: {
@@ -345,6 +405,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* payload = reinterpret_cast<const u32*>(header + 2);
 
                 std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+                NoteRegWrite(reg_addr, count - 1);
 
                 // In the case of HW, render target memory has alignment as color block operates on
                 // tiles. There is no information of actual resource extents stored in CB context
@@ -425,6 +486,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 } else {
                     std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
                                 header + 2, set_size);
+                    NoteRegWrite(Regs::ShRegWordOffset + set_data->reg_offset, count - 1);
                 }
                 break;
             }
@@ -432,6 +494,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
                 std::memcpy(&regs.reg_array[Regs::UconfigRegWordOffset + set_data->reg_offset],
                             header + 2, (count - 1) * sizeof(u32));
+                NoteRegWrite(Regs::UconfigRegWordOffset + set_data->reg_offset, count - 1);
                 break;
             }
             case PM4ItOpcode::SetPredication: {
@@ -662,6 +725,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWrite: {
                 const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+                NoteSyncEvent(event->event_type.Value());
                 LOG_DEBUG(Render, "Encountered EventWrite: event_type = {}, event_index = {}",
                           magic_enum::enum_name(event->event_type.Value()),
                           magic_enum::enum_name(event->event_index.Value()));
@@ -669,6 +733,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     // TODO: handle proper synchronization, for now signal that update is done
                     // immediately
                     regs.cp_strmout_cntl.offset_update_done = 1;
+                    ++sel_regs_seq;
                 } else if (event->event_index.Value() == EventIndex::ZpassDone) {
                     if (event->event_type.Value() == EventType::PixelPipeStatDump) {
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
@@ -690,6 +755,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEos: {
                 const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
+                NoteSync(4);
                 if (rasterizer) {
                     rasterizer->OnFence();
                 }
@@ -708,6 +774,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+                NoteSync(5);
                 if (rasterizer) {
                     rasterizer->OnFence();
                 }
@@ -828,6 +895,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::AcquireMem: {
+                NoteSync(6);
                 // const auto* acquire_mem = reinterpret_cast<PM4CmdAcquireMem*>(header);
                 break;
             }
@@ -842,6 +910,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::WaitRegMem: {
+                NoteSync(7);
                 const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
                 // ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
                 // Optimization: VO label waits are special because the emulator
@@ -851,6 +920,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
                 if (vo_port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
+                    const SotcStats::ScopedTimer vo_timer{SotcStats::cp_vo_wait_ns};
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     break;
                 }
@@ -863,12 +933,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
                 auto task = ProcessGraphics(
                     {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+                ++gfx_ib_depth;
                 RESUME_GFX(task);
 
                 while (!task.handle.done()) {
                     YIELD_GFX();
                     RESUME_GFX(task);
                 }
+                --gfx_ib_depth;
                 break;
             }
             case PM4ItOpcode::IncrementDeCounter: {
@@ -936,6 +1008,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 const auto skip = *cond_exec->Address() == false;
                 if (skip) {
+                    SotcStats::condexec_skips.fetch_add(1, std::memory_order_relaxed);
                     SotcStats::Drop(4, reinterpret_cast<uintptr_t>(cond_exec->Address()),
                                     cond_exec->exec_count.Value());
                     dcb = NextPacket(dcb,
@@ -958,6 +1031,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             RESUME_GFX(ce_task);
         }
         ce_task.handle.destroy();
+    }
+    if (scan_top) {
+        draw_scan->End();
     }
 
     FIBER_EXIT;
@@ -1085,6 +1161,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::AcquireMem: {
+            NoteSync(6);
             break;
         }
         case PM4ItOpcode::Rewind: {
@@ -1110,6 +1187,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             } else {
                 std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
                             header + 2, set_size);
+                NoteRegWrite(Regs::ShRegWordOffset + set_data->reg_offset,
+                             header->type3.NumWords() - 1);
+                SotcStats::asc_gfx_sh_writes.fetch_add(1, std::memory_order_relaxed);
+                if (draw_scan) {
+                    // Graphics registers the scanner cannot see: the histories must differ.
+                    gfx_reg_hash = HashWords(gfx_reg_hash ^ 0xA5C0A5C0A5C0A5C0ULL, &header->raw,
+                                             header->type3.NumWords() + 1);
+                }
             }
             break;
         }
@@ -1192,6 +1277,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::WaitRegMem: {
+            NoteSync(7);
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             while (!wait_reg_mem->Test(regs.reg_array)) {
@@ -1200,6 +1286,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::ReleaseMem: {
+            NoteSync(5);
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
             if (rasterizer) {
                 rasterizer->OnFence();
@@ -1214,7 +1301,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::EventWrite: {
-            // const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+            NoteSyncEvent(reinterpret_cast<const PM4CmdEventWrite*>(header)->event_type.Value());
             break;
         }
         default:
@@ -1272,9 +1359,18 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     if (EmulatorSettings.IsCopyGpuBuffers()) {
         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
     }
+    SotcStats::gfx_submits.fetch_add(1, std::memory_order_relaxed);
+    SotcStats::gfx_submit_words.fetch_add(dcb.size(), std::memory_order_relaxed);
 
-    auto task = ProcessGraphics(dcb, ccb);
-    {
+    if (draw_scan) {
+        // Copied outside the lock; numbered under it, in queue order.
+        auto scan = draw_scan->Build(dcb);
+        std::scoped_lock lock{queue.m_access};
+        const u64 seq = draw_scan->Enqueue(std::move(scan));
+        auto task = ProcessGraphics(dcb, ccb, seq);
+        queue.submits.emplace(task.handle);
+    } else {
+        auto task = ProcessGraphics(dcb, ccb);
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
     }

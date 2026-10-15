@@ -40,10 +40,21 @@ const u32* GetFetchShaderCode(const Info& info, u32 sgpr_base) {
     return code;
 }
 
-bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data) {
-    if (!info.has_fetch_shader) {
-        return false;
-    }
+namespace {
+/// Try = true (draw preparation helpers): reads at most code[0, max_words), checks register
+/// indices and returns false on anything unexpected instead of asserting.
+template <bool Try>
+bool ParseFetchCode(const u32* code, size_t max_words, FetchShaderData& out_fetch_data) {
+#define FETCH_CHECK(cond)                                                                          \
+    do {                                                                                           \
+        if constexpr (Try) {                                                                       \
+            if (!(cond)) {                                                                         \
+                return false;                                                                      \
+            }                                                                                      \
+        } else {                                                                                   \
+            ASSERT(cond);                                                                          \
+        }                                                                                          \
+    } while (0)
 
     out_fetch_data.attributes.clear();
 
@@ -53,29 +64,38 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
     };
     std::array<VsharpLoad, 104> loads{};
 
-    const auto* code = GetFetchShaderCode(info, info.fetch_shader_sgpr_base);
     const u32* ptr = code;
     while (true) {
+        if constexpr (Try) {
+            if (static_cast<size_t>(ptr - code) >= max_words) {
+                return false;
+            }
+        }
         const u32 word0 = *(ptr++);
         const auto encoding = GetInstructionEncoding(word0);
 
         if (encoding == InstEncoding::SOP1) {
             const auto opcode = OpcodeSOP1((word0 >> 8) & 0xff);
-            ASSERT(opcode == OpcodeSOP1::S_SETPC_B64);
+            FETCH_CHECK(opcode == OpcodeSOP1::S_SETPC_B64);
             break;
         } else if (encoding == InstEncoding::SMRD) {
             const auto opcode = OpcodeSMRD((word0 >> 22) & 0x1f);
             const u32 sdst = (word0 >> 15) & 0x7f;
             const u32 sbase = (word0 >> 9) & 0x3f;
             const u32 offset = word0 & 0xff;
-            ASSERT(opcode == OpcodeSMRD::S_LOAD_DWORDX4);
+            FETCH_CHECK(opcode == OpcodeSMRD::S_LOAD_DWORDX4);
+            if constexpr (Try) {
+                if (sdst >= loads.size()) {
+                    return false;
+                }
+            }
             loads[sdst] = VsharpLoad{offset, sbase * 2};
         } else if (encoding == InstEncoding::VOP2) {
             const auto opcode = OpcodeVOP2((word0 >> 25) & 0x3f);
             const u32 src0 = word0 & 0x1ff;
             const u32 vsrc1 = (word0 >> 9) & 0xff;
             const u32 vdst = (word0 >> 17) & 0xff;
-            ASSERT(opcode == OpcodeVOP2::V_ADD_I32 && src0 < 16 && vsrc1 == vdst);
+            FETCH_CHECK(opcode == OpcodeVOP2::V_ADD_I32 && src0 < 16 && vsrc1 == vdst);
             if (vdst == 0) {
                 // V0 is always the vertex offset
                 out_fetch_data.vertex_offset_sgpr = src0;
@@ -83,25 +103,39 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
                 // V3 is always the instance offset
                 out_fetch_data.instance_offset_sgpr = src0;
             } else {
-                UNREACHABLE();
+                if constexpr (Try) {
+                    return false;
+                } else {
+                    UNREACHABLE();
+                }
             }
         } else if (encoding == InstEncoding::MUBUF || encoding == InstEncoding::MTBUF) {
+            if constexpr (Try) {
+                if (static_cast<size_t>(ptr - code) >= max_words) {
+                    return false;
+                }
+            }
             // SRSRC is in units of 4 SPGRs while SBASE is in pairs of SGPRs
             const u32 word1 = *(ptr++);
             const u32 srsrc = ((word1 >> 16) & 0x1f) * 4;
+            if constexpr (Try) {
+                if (srsrc >= loads.size()) {
+                    return false;
+                }
+            }
             auto& attrib = out_fetch_data.attributes.emplace_back();
             attrib.dest_vgpr = (word1 >> 8) & 0xff;
             if (encoding == InstEncoding::MUBUF) {
                 const auto opcode = OpcodeMUBUF((word0 >> 18) & 0x7f);
-                ASSERT(opcode >= OpcodeMUBUF::BUFFER_LOAD_FORMAT_X &&
-                       opcode <= OpcodeMUBUF::BUFFER_LOAD_FORMAT_XYZW);
+                FETCH_CHECK(opcode >= OpcodeMUBUF::BUFFER_LOAD_FORMAT_X &&
+                            opcode <= OpcodeMUBUF::BUFFER_LOAD_FORMAT_XYZW);
                 attrib.num_elements = (std::to_underlying(opcode) -
                                        std::to_underlying(OpcodeMUBUF::BUFFER_LOAD_FORMAT_X)) +
                                       1;
             } else {
                 const auto opcode = OpcodeMTBUF((word0 >> 16) & 0x7);
-                ASSERT(opcode >= OpcodeMTBUF::TBUFFER_LOAD_FORMAT_X &&
-                       opcode <= OpcodeMTBUF::TBUFFER_LOAD_FORMAT_XYZW);
+                FETCH_CHECK(opcode >= OpcodeMTBUF::TBUFFER_LOAD_FORMAT_X &&
+                            opcode <= OpcodeMTBUF::TBUFFER_LOAD_FORMAT_XYZW);
                 attrib.num_elements = (std::to_underlying(opcode) -
                                        std::to_underlying(OpcodeMTBUF::TBUFFER_LOAD_FORMAT_X)) +
                                       1;
@@ -119,22 +153,41 @@ bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data)
             }
         } else if (encoding == InstEncoding::SOPP) {
             const auto opcode = OpcodeSOPP((word0 >> 16) & 0x7f);
-            ASSERT(opcode == OpcodeSOPP::S_WAITCNT);
+            FETCH_CHECK(opcode == OpcodeSOPP::S_WAITCNT);
         } else if (encoding == InstEncoding::VOP1) {
             const auto opcode = OpcodeVOP1((word0 >> 9) & 0xff);
             const u32 src0 = word0 & 0x1ff;
             const u32 vdst = (word0 >> 17) & 0xff;
-            ASSERT(opcode == OpcodeVOP1::V_MOV_B32 && src0 == 242);
+            FETCH_CHECK(opcode == OpcodeVOP1::V_MOV_B32 && src0 == 242);
             // Loads write only their own components, so the constant has to be set too
             // (from Pink-shadPS4, luizgustavs).
             out_fetch_data.one_vgprs.push_back(u8(vdst));
         } else {
-            UNREACHABLE_MSG("Unexpected instruction encoding in fetch shader {}", u32(encoding));
+            if constexpr (Try) {
+                return false;
+            } else {
+                UNREACHABLE_MSG("Unexpected instruction encoding in fetch shader {}",
+                                u32(encoding));
+            }
         }
     }
+#undef FETCH_CHECK
 
     out_fetch_data.size = (ptr - code) * sizeof(u32);
     return true;
+}
+} // namespace
+
+bool ParseFetchShader(const Shader::Info& info, FetchShaderData& out_fetch_data) {
+    if (!info.has_fetch_shader) {
+        return false;
+    }
+    return ParseFetchCode<false>(GetFetchShaderCode(info, info.fetch_shader_sgpr_base),
+                                 0, out_fetch_data);
+}
+
+bool TryParseFetchShader(const u32* code, size_t max_words, FetchShaderData& out_fetch_data) {
+    return ParseFetchCode<true>(code, max_words, out_fetch_data);
 }
 
 } // namespace Shader::Gcn

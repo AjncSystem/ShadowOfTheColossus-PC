@@ -47,7 +47,8 @@ public:
     ComputePipeline(const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
                     const Shader::Profile& profile, vk::PipelineCache pipeline_cache,
                     ComputePipelineKey compute_key, const Shader::Info& info,
-                    vk::ShaderModule module, SerializationSupport& sdata, bool preloading);
+                    vk::ShaderModule module, SerializationSupport& sdata, bool preloading,
+                    bool fast_compile = false);
     ~ComputePipeline();
 
 private:

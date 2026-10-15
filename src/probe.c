@@ -548,28 +548,44 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     tib->StackLimit=limit;
     return result;
 }
+/* A speculative guest memory read faulted: the thread resumes in bb_longjmp, outside the
+ * exception dispatcher, back at its recovery point (runtime_fault_recover). */
+static LONG resume_speculative(EXCEPTION_POINTERS *info) {
+    unsigned long long *buffer=*runtime_fault_recover;
+    runtime_fault_recover=NULL;
+    CONTEXT *c=info->ContextRecord;
+    c->Rsp=((c->Rsp-128)&~(DWORD64)15)-40;
+    c->Rcx=(DWORD64)(uintptr_t)buffer;
+    c->Rdx=1;
+    c->Rip=(DWORD64)(uintptr_t)bb_longjmp;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+/* sotc: faults a speculative section recovered from (draw preparation helpers). */
+volatile long long runtime_speculative_faults;
 static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record=info->ExceptionRecord;
     DWORD code=record->ExceptionCode;
     if ((code==EXCEPTION_BREAKPOINT || code==EXCEPTION_SINGLE_STEP) && heap_hook_trap(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (code==EXCEPTION_SINGLE_STEP && helper_single_step(info)) return EXCEPTION_CONTINUE_EXECUTION;
+    /* sotc: a thread inside a speculative section (draw preparation helpers) that faults on guest
+     * memory only gives up that piece of work. This comes before helper_read_fault, which would
+     * open the page to every thread (a guest read of GPU-written bytes there would then skip its
+     * readback), and before GPU page tracking, which could start a readback on this thread or
+     * patch the SRT walker it is running. Guest addresses are below USER_MAX (0xfc00000000);
+     * anything else (host memory, the null page) stays fatal: a bug, not a speculative read. */
+    if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2 && runtime_fault_recover) {
+        const uintptr_t address=(uintptr_t)record->ExceptionInformation[1];
+        if (address>=0x10000 && address<UINT64_C(0xfc00000000)) {
+            InterlockedIncrement64(&runtime_speculative_faults);
+            return resume_speculative(info);
+        }
+    }
     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2 && gpu_enabled && helper_read_fault(info))
         return EXCEPTION_CONTINUE_EXECUTION;
     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2) {
         /* GPU page tracking (write-protected guest pages) is resolved first. */
         if (gpu_enabled && bbgpu_handle_fault(info,(void *)record->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
-        if (runtime_fault_recover) {
-            /* A speculative guest memory read (GPU draw preparation) faulted: the thread resumes
-             * in bb_longjmp, outside the exception dispatcher, back at its recovery point. */
-            unsigned long long *buffer=*runtime_fault_recover;
-            runtime_fault_recover=NULL;
-            CONTEXT *c=info->ContextRecord;
-            c->Rsp=((c->Rsp-128)&~(DWORD64)15)-40;
-            c->Rcx=(DWORD64)(uintptr_t)buffer;
-            c->Rdx=1;
-            c->Rip=(DWORD64)(uintptr_t)bb_longjmp;
-            return EXCEPTION_CONTINUE_EXECUTION;
-        }
+        if (runtime_fault_recover) return resume_speculative(info);
     }
     /* sotc: an SSE4a site the load-time patchers could not rewrite is interpreted. */
     if (code==EXCEPTION_ILLEGAL_INSTRUCTION && image && sotc_handle_illegal(info)) return EXCEPTION_CONTINUE_EXECUTION;

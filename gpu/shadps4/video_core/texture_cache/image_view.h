@@ -54,6 +54,8 @@ struct ImageView {
 
     ImageViewInfo info;
     vk::UniqueImageView image_view;
+    /// sotc: the aspect the view covers (a depth/stencil image is sampled through one of them).
+    vk::ImageAspectFlags aspect_mask;
 };
 
 } // namespace VideoCore

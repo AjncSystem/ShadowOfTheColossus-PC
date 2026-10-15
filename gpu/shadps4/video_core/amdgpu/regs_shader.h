@@ -243,6 +243,9 @@ static constexpr const BinaryInfo& SearchBinaryInfo(const u32* code) {
 /// sotc: SearchBinaryInfo cached per code address, validated through the backing view
 /// (amdgpu/sotc_bininfo.cpp): no readback when the code shares GPU-written tracking regions.
 const BinaryInfo& SearchBinaryInfoCached(const u32* code);
+/// The same lookup for helper threads: never reads guest memory directly; false when the code's
+/// binary info is not cached (or no longer matches the backing view).
+bool TryBinaryInfoCached(const u32* code, BinaryInfo& out);
 
 static Shader::ShaderParams GetParams(const auto& sh) {
     const auto* code = sh.template Address<u32*>();

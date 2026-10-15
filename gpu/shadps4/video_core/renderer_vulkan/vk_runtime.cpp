@@ -8,7 +8,17 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
+#include "video_core/sotc_stats.h"
 
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <span>
+#include <string>
+#include <vector>
+#include <fmt/format.h>
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Vulkan {
@@ -159,11 +169,52 @@ void Runtime::InlineData(VideoCore::Buffer* dst, u64 offset, u32 value) {
                  vk::AccessFlagBits2::eTransferWrite);
 }
 
+// sotc: SOTC_BARRIER_TRACE=<flips>: from that many flips on, every 10 s, the most frequent image
+// barriers (image, aspect, layouts, accesses) and how many of them came while a render pass was
+// open (each of those breaks it). Read once at startup: Transit runs for every bound image.
+static const char* const g_barrier_trace = std::getenv("SOTC_BARRIER_TRACE");
+static const u64 g_barrier_trace_after =
+    g_barrier_trace ? std::strtoull(g_barrier_trace, nullptr, 10) : 0;
+
 bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                       vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
-                      std::optional<VideoCore::SubresourceRange> subres_range) {
+                      std::optional<VideoCore::SubresourceRange> subres_range,
+                      vk::ImageAspectFlags aspects) {
     const size_t prev_num_barriers = static_cast<size_t>(image_barriers.size());
-    image->GetBarriers(image_barriers, dst_layout, dst_access, dst_stage, subres_range);
+    image->GetBarriers(image_barriers, dst_layout, dst_access, dst_stage, subres_range, aspects);
+    if (g_barrier_trace && image_barriers.size() != prev_num_barriers &&
+        SotcStats::flips.load(std::memory_order_relaxed) >= g_barrier_trace_after) {
+        static std::map<std::string, std::pair<u64, u64>> counts;
+        static auto last = std::chrono::steady_clock::now();
+        const bool rendering = scheduler.IsRendering();
+        for (size_t i = prev_num_barriers; i < image_barriers.size(); ++i) {
+            const auto& b = image_barriers[i];
+            const std::string key = fmt::format(
+                "{:#x} {}x{} {} {} -> {}, {} -> {}", image->info.guest_address,
+                image->info.size.width, image->info.size.height,
+                vk::to_string(b.subresourceRange.aspectMask), vk::to_string(b.oldLayout),
+                vk::to_string(b.newLayout), vk::to_string(b.srcAccessMask),
+                vk::to_string(b.dstAccessMask));
+            auto& [n, open] = counts[key];
+            ++n;
+            open += rendering;
+        }
+        if (const auto now = std::chrono::steady_clock::now(); now - last > std::chrono::seconds(10)) {
+            last = now;
+            std::vector<std::pair<u64, const std::string*>> sorted;
+            for (const auto& [key, n] : counts) {
+                sorted.emplace_back(n.second, &key);
+            }
+            std::sort(sorted.rbegin(), sorted.rend());
+            std::fprintf(stderr, "SOTC image barriers in 10 s (in a render pass first):\n");
+            for (size_t i = 0; i < sorted.size() && i < 10; ++i) {
+                const auto& [n, open] = counts[*sorted[i].second];
+                std::fprintf(stderr, "  %6llu (%6llu open) %s\n", static_cast<unsigned long long>(n),
+                             static_cast<unsigned long long>(open), sorted[i].second->c_str());
+            }
+            counts.clear();
+        }
+    }
     return image_barriers.size() != prev_num_barriers;
 }
 
@@ -682,8 +733,10 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
         new_backing->state.layout = dst_layout;
         new_backing->state.access_mask = dst_access;
         new_backing->state.pl_stage = dst_stage;
+        new_backing->stencil_state = new_backing->state; // the barrier covered both aspects
     }
 
+    ++new_backing->state_version;
     backing = new_backing;
 }
 
@@ -718,15 +771,46 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite |
         vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
 
-    if (src_access & WRITE_MASK) {
-        resource->write_ranges.Add(range);
-    }
-    if (src_access & READ_MASK) {
-        resource->read_ranges.Add(range);
-    }
-
+    const bool write = static_cast<bool>(src_access & WRITE_MASK);
+    const bool read = static_cast<bool>(src_access & READ_MASK);
     memory_barrier.srcStageMask |= src_stage;
     memory_barrier.srcAccessMask |= src_access & WRITE_MASK;
+
+    // sotc: the access lists only grow until FlushBarriers (window), so a range recorded in this
+    // window is covered. SOTC_ACCESS_DEDUP=0 always adds.
+    static const bool dedup = [] {
+        const char* v = std::getenv("SOTC_ACCESS_DEDUP");
+        return !v || v[0] != '0';
+    }();
+    RecordedAccess* recorded = nullptr;
+    if (dedup) {
+        const u64 hash = (reinterpret_cast<uintptr_t>(handle) >> 4) ^ (range.start >> 4) ^
+                         (range.end * 0x9E3779B97F4A7C15ULL >> 40);
+        recorded = &recorded_accesses[hash % NumRecordedAccesses];
+        if (recorded->window == access_window && recorded->handle == handle &&
+            recorded->start == range.start && recorded->end == range.end &&
+            (recorded->write || !write) && (recorded->read || !read)) {
+            SotcStats::Bump(SotcStats::access_adds_skipped);
+            return;
+        }
+    }
+    SotcStats::Bump(SotcStats::access_adds);
+    if (write) {
+        resource->write_ranges.Add(range);
+    }
+    if (read) {
+        resource->read_ranges.Add(range);
+    }
+    if (recorded) {
+        const bool same = recorded->window == access_window && recorded->handle == handle &&
+                          recorded->start == range.start && recorded->end == range.end;
+        *recorded = {handle,
+                     range.start,
+                     range.end,
+                     access_window,
+                     read || (same && recorded->read),
+                     write || (same && recorded->write)};
+    }
 }
 
 void Runtime::FlushBarriers() {
@@ -753,24 +837,38 @@ void Runtime::FlushBarriers() {
     memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;
 
     image_barriers.clear();
-    for (auto& resource : resources) {
+    for (auto& resource : std::span{resources}.first(num_resources)) {
         resource.read_ranges.Clear();
         resource.write_ranges.Clear();
     }
-    resources.clear();
+    // sotc: SOTC_ACCESS_POOL=0 frees the lists here (as before) instead of keeping them.
+    static const bool pool = [] {
+        const char* v = std::getenv("SOTC_ACCESS_POOL");
+        return !v || v[0] != '0';
+    }();
+    if (!pool) {
+        resources.clear();
+    }
+    num_resources = 0;
     resource = nullptr;
+    ++access_window;
 }
 
 void Runtime::MakeCurrent(const VideoCore::Buffer* handle) {
     if (resource && resource->handle == handle) {
         return;
     }
-    auto it = std::ranges::find(resources, handle, &BufferBarriers::handle);
-    if (it != resources.end()) {
+    const auto active = std::span{resources}.first(num_resources);
+    auto it = std::ranges::find(active, handle, &BufferBarriers::handle);
+    if (it != active.end()) {
         resource = std::addressof(*it);
         return;
     }
-    resource = &resources.emplace_back(handle);
+    if (num_resources == resources.size()) {
+        resources.emplace_back();
+    }
+    resource = &resources[num_resources++];
+    resource->handle = handle;
 }
 
 } // namespace Vulkan

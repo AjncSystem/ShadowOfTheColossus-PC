@@ -10,6 +10,7 @@
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
 
+#include <atomic>
 #include <deque>
 #include <optional>
 #include <boost/container/small_vector.hpp>
@@ -123,12 +124,39 @@ struct Image {
         depth_uid = {};
     }
 
+    /// sotc: reuse an unregistered image whose Vulkan image matches new_info: bookkeeping is
+    /// reset to what the constructor sets (new uid, Dirty flags, no hashes or associations);
+    /// the VkImage, its views and its tracked layout are kept.
+    void RenewForReuse(const ImageInfo& new_info);
+    /// The Vulkan usage flags an image created for info gets.
+    static vk::ImageUsageFlags UsageFlagsFor(const Vulkan::Instance& instance,
+                                             const ImageInfo& info);
+
     ImageView& FindView(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
 
     using Barriers = boost::container::small_vector<vk::ImageMemoryBarrier2, 32>;
+    /// Moves `aspects` (all of the image's aspects when empty) of the subresources in
+    /// `subres_range` (all when empty) to `dst_layout` for an access `dst_mask` at `dst_stage`,
+    /// adding the barriers that needs.
     void GetBarriers(Barriers& out_barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                      vk::PipelineStageFlags2 dst_stage,
-                     std::optional<SubresourceRange> subres_range = {});
+                     std::optional<SubresourceRange> subres_range = {},
+                     vk::ImageAspectFlags aspects = {});
+
+    /// sotc: the depth and stencil aspects of a depth/stencil image are tracked separately (own
+    /// layout and accesses, own barriers; separateDepthStencilLayouts), as Vulkan models them.
+    /// Tracked as one block, a draw writing stencil over a read-only depth while another samples
+    /// the depth flipped the whole image between layouts, two barriers and a render pass break
+    /// per draw. SOTC_ASPECT_BARRIERS=0: one state for both aspects and the barrier rule of
+    /// before (see NeedsBarrier in image.cpp).
+    [[nodiscard]] static bool AspectBarriers();
+    [[nodiscard]] bool SplitAspects() const noexcept {
+        return AspectBarriers() && (aspect_mask & vk::ImageAspectFlagBits::eDepth) &&
+               (aspect_mask & vk::ImageAspectFlagBits::eStencil);
+    }
+    /// The layout `aspect` (the depth's for both) of the subresource at `range`'s base is in.
+    [[nodiscard]] vk::ImageLayout LayoutOf(vk::ImageAspectFlags aspect,
+                                           std::optional<SubresourceRange> range = {}) const;
 
 public:
     Vulkan::Runtime* runtime;
@@ -137,6 +165,31 @@ public:
     vk::ImageAspectFlags aspect_mask = vk::ImageAspectFlagBits::eColor;
     vk::SampleCountFlags supported_samples = vk::SampleCountFlagBits::e1;
     ImageFlagBits flags = ImageFlagBits::Dirty;
+    /// sotc: flags are changed by the command processor and by guest fault handlers (under the
+    /// texture cache mutex), and read without it by the UpdateImage fast path: atomic updates
+    /// so one side cannot drop the other's bits.
+    void SetFlags(ImageFlagBits bits) noexcept {
+        std::atomic_ref<u32>(reinterpret_cast<u32&>(flags))
+            .fetch_or(static_cast<u32>(bits), std::memory_order_acq_rel);
+    }
+    void ClearFlags(ImageFlagBits bits) noexcept {
+        std::atomic_ref<u32>(reinterpret_cast<u32&>(flags))
+            .fetch_and(~static_cast<u32>(bits), std::memory_order_acq_rel);
+    }
+    [[nodiscard]] ImageFlagBits LoadFlags() const noexcept {
+        return static_cast<ImageFlagBits>(
+            std::atomic_ref<u32>(const_cast<u32&>(reinterpret_cast<const u32&>(flags)))
+                .load(std::memory_order_acquire));
+    }
+    /// gc tick of the last LRU touch: one touch per tick is enough (the LRU orders by tick).
+    u64 lru_touched_tick = ~0ULL;
+    /// sotc: metadata addresses this image last registered in surface_metas, and the
+    /// metadata generation at that time (see TextureCache::meta_generation).
+    u64 meta_registered_gen = ~0ULL;
+    VAddr meta_registered_cmask = 0;
+    VAddr meta_registered_fmask = 0;
+    u64 meta_registered_gen_depth = ~0ULL;
+    VAddr meta_registered_htile = 0;
     VAddr track_addr = 0;
     VAddr track_addr_end = 0;
     ImageId depth_id{};
@@ -148,14 +201,24 @@ public:
         vk::PipelineStageFlags2 pl_stage = vk::PipelineStageFlagBits2::eAllCommands;
         vk::AccessFlags2 access_mask = vk::AccessFlagBits2::eNone;
         vk::ImageLayout layout = vk::ImageLayout::eUndefined;
+        /// sotc: SotcStats::sync_epoch at the last shader write (see NeedsBarrier, image.cpp).
+        u64 write_epoch = ~0ULL;
     };
     struct BackingImage {
         UniqueImage image;
+        /// Color, or depth (both aspects when not SplitAspects()).
         State state;
         std::vector<State> subresource_states;
+        /// sotc: the stencil aspect when SplitAspects().
+        State stencil_state;
+        std::vector<State> stencil_subresource_states;
         boost::container::small_vector<ImageViewInfo, 4> image_view_infos;
         boost::container::small_vector<ImageViewId, 4> image_view_ids;
         u32 num_samples;
+        u32 last_view = ~0u; ///< Index of the view FindView returned last (search hint).
+        /// sotc: changes whenever the states above may have changed (TransitAspect,
+        /// SetBackingSamples); equal values mean equal states (Rasterizer::BeginRendering).
+        u32 state_version{};
     };
     std::deque<BackingImage> backing_images;
     BackingImage* backing{};

@@ -84,6 +84,8 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
     // sotc: SOTC_CP_THREADS=0 binds and records the draws on the command processor thread.
     const char* threads = std::getenv("SOTC_CP_THREADS");
     back_threaded = !threads || threads[0] != '0';
+    const char* strict = std::getenv("SOTC_CP_STRICT");
+    back_strict = strict && strict[0] == '1';
     if (back_threaded) {
         back_ring.resize(BackRingSize);
         dirty_list.reserve(NumRegChunks);
@@ -149,7 +151,11 @@ void Liverpool::DrainBack() {
     if (!back_threaded || std::this_thread::get_id() == back_id) {
         return;
     }
-    const u64 head = back_head.load(std::memory_order_acquire);
+    WaitBackTail(back_head.load(std::memory_order_acquire));
+}
+
+void Liverpool::WaitBackTail(u64 head) {
+    SotcStats::cp_waits.fetch_add(1, std::memory_order_relaxed);
     for (u32 spin = 0; back_tail.load(std::memory_order_acquire) < head; ++spin) {
         if (spin < 4096) {
             CpuRelax();
@@ -319,7 +325,7 @@ void Liverpool::SubmitDraw(bool is_indexed, u32 index_offset) {
     op.is_indexed = is_indexed;
     op.index_offset = index_offset;
     CaptureBackOp(op, pipeline);
-    BackPublish(PipelineWrites(pipeline));
+    BackPublish(back_strict && PipelineWrites(pipeline));
 }
 
 void Liverpool::SubmitDrawIndirect(bool is_indexed, VAddr address, u32 offset, u32 stride,
@@ -344,7 +350,7 @@ void Liverpool::SubmitDrawIndirect(bool is_indexed, VAddr address, u32 offset, u
     op.vertex_sgpr_offset = vertex_sgpr_offset;
     op.instance_sgpr_offset = instance_sgpr_offset;
     CaptureBackOp(op, pipeline);
-    BackPublish(PipelineWrites(pipeline));
+    BackPublish(back_strict && PipelineWrites(pipeline));
 }
 
 void Liverpool::SubmitDispatch(bool indirect, VAddr address, u32 offset, u32 size) {
@@ -365,7 +371,7 @@ void Liverpool::SubmitDispatch(bool indirect, VAddr address, u32 offset, u32 siz
     op.size = size;
     op.cs = GetCsRegs();
     CaptureBackOp(op, pipeline);
-    BackPublish(true);
+    BackPublish(back_strict);
 }
 
 void Liverpool::WriteFenceValue(void* address, u64 data, u32 num_bytes) {
@@ -392,7 +398,7 @@ void Liverpool::ProcessCommands() {
         }
         // sotc: at this point of the command stream, after the work queued so far.
         if (back_threaded) {
-            QueueBackFunc(std::move(callback), true);
+            QueueBackFunc(std::move(callback), back_strict);
         } else {
             callback();
         }
@@ -584,9 +590,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 case PM4CmdNop::PayloadType::PatchedFlip: {
                     // There is no evidence that GPU CP drives flip events by parsing
                     // special NOP packets. For convenience lets assume that it does.
-                    BackOrRun([] {
-                        Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
-                    });
+                    BackOrRun(
+                        [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip); },
+                        false);
                     break;
                 }
                 case PM4CmdNop::PayloadType::DebugMarkerPush: {
@@ -1020,7 +1026,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             *eos.Address() = value;
                         }
                     }
-                });
+                }, back_strict);
                 break;
             }
             case PM4ItOpcode::EventWriteEop: {
@@ -1070,7 +1076,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         WriteFenceValue(address, data, num_bytes);
                     },
                     [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
-                });
+                }, back_strict);
                 break;
             }
             case PM4ItOpcode::DmaData: {
@@ -1261,7 +1267,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         LOG_WARNING(Render_Vulkan, "sotc GET_LOD_STATS {:#x}+{:#x}: {} banks sampled",
                                     base, size, used);
                     }
-                    });
+                    }, false);
                 }
                 break;
             }
@@ -1570,7 +1576,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                         rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false,
                                                true);
                     });
-            });
+            }, back_strict);
             break;
         }
         case PM4ItOpcode::EventWrite: {

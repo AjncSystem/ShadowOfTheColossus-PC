@@ -368,12 +368,18 @@ private:
     BackOp& BackAlloc();
     void BackPublish(bool writes_memory);
     void CaptureBackOp(BackOp& op, const Vulkan::Pipeline* pipeline);
-    /// Before reading guest memory the queued work may write (pipeline lookups read the SRTs).
+    /// Before reading guest memory the queued work may write (pipeline lookups read the SRTs):
+    /// waits for the last queued op that writes guest memory from the CPU (WRITE_DATA, DMA), or
+    /// with SOTC_CP_STRICT=1 also for GPU writes (dispatches, storage writes, fences). GPU-written
+    /// memory the command processor reads is read-protected once the draw thread recorded the
+    /// writer, and its faults run on the draw thread after that; the SRTs and sharp tables are
+    /// written by the CPU.
     void WaitBackWrites() {
         if (back_threaded && back_tail.load(std::memory_order_acquire) < back_write_seq) {
-            DrainBack();
+            WaitBackTail(back_write_seq);
         }
     }
+    void WaitBackTail(u64 target);
     void MarkRegs(u32 first_dword, u32 num_dwords) {
         if (!back_threaded || num_dwords == 0) {
             return;
@@ -396,6 +402,7 @@ private:
     void BackLoop(std::stop_token stoken);
 
     bool back_threaded{};
+    bool back_strict{};
     std::thread::id back_id{};
     std::vector<BackOp> back_ring;
     std::atomic<u64> back_head{0};

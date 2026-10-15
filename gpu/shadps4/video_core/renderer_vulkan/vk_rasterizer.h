@@ -48,12 +48,29 @@ public:
         return texture_cache;
     }
 
-    void Draw(bool is_indexed, u32 index_offset = 0);
+    /// resolved/use_resolved: the pipeline the command processor looked up for this draw
+    /// (Liverpool::IsBackThreaded), instead of looking it up here.
+    void Draw(bool is_indexed, u32 index_offset = 0, const Pipeline* resolved = nullptr,
+              bool use_resolved = false);
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
-                      VAddr count_address, u16 vertex_sgpr_offset, u16 instance_sgpr_offset);
+                      VAddr count_address, u16 vertex_sgpr_offset, u16 instance_sgpr_offset,
+                      const Pipeline* resolved = nullptr, bool use_resolved = false);
 
-    void DispatchDirect();
-    void DispatchIndirect(VAddr address, u32 offset, u32 size);
+    void DispatchDirect(const Pipeline* resolved = nullptr, bool use_resolved = false);
+    void DispatchIndirect(VAddr address, u32 offset, u32 size, const Pipeline* resolved = nullptr,
+                          bool use_resolved = false);
+
+    /// sotc: the pipeline lookups of the draws and dispatches alone (command processor thread).
+    const Pipeline* LookupGraphicsPipeline(u16 vertex_sgpr_offset, u16 instance_sgpr_offset);
+    const Pipeline* LookupComputePipeline();
+    bool IsGpuSideThread() const;
+    void PrepareGpuSideFault();
+    bool RunsGpuWorkElsewhere() const;
+    template <typename F>
+    void RunOnDrawThread(F&& func) {
+        RunOnDrawThreadImpl(Common::UniqueFunction<void>{std::forward<F>(func)});
+    }
+    void RunOnDrawThreadImpl(Common::UniqueFunction<void>&& func);
 
     void ScopeMarker(fmt::string_view fmt, fmt::format_args args, auto&& func) {
         if (host_markers_enabled) {

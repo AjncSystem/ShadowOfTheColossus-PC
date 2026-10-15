@@ -639,8 +639,15 @@ void BufferCache::AddGpuModified(VAddr addr, u64 size) {
                          static_cast<unsigned long long>(SotcStats::current_program.load()));
         }
     }
-    gpu_modified_ranges.Add(addr, size);
-    if (!clean_pages_used || size == 0) {
+    // sotc: gpu_modified_ranges only grows here (every other use subtracts), and the clean page
+    // cache below only has to drop pages whose GPU-written hull grew: when the range was already
+    // contained, no page can have become dirty. SOTC_GPUMOD_NOGROW_SKIP=0 always scans.
+    static const bool nogrow_skip = [] {
+        const char* v = std::getenv("SOTC_GPUMOD_NOGROW_SKIP");
+        return !v || v[0] != '0';
+    }();
+    const bool grew = gpu_modified_ranges.Add(addr, size);
+    if (!clean_pages_used || size == 0 || (!grew && nogrow_skip)) {
         return;
     }
     // The GPU-written hull of these pages grows: drop them from the clean page cache.

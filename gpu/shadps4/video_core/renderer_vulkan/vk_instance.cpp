@@ -9,6 +9,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/types.h"
+#include "core/emulator_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -101,6 +102,15 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
       physical_devices{EnumeratePhysicalDevices(instance)} {
     if (enable_validation) {
         debug_callback = CreateDebugCallback(*instance);
+    }
+    {
+        // sotc: see object_names_enabled (vk_platform.h); an attached tool turns it on again in
+        // CollectToolingInfo.
+        const char* names = std::getenv("SOTC_VK_NAMES");
+        object_names_enabled = enable_validation || enable_crash_diagnostic ||
+                               EmulatorSettings.IsVkHostMarkersEnabled() ||
+                               EmulatorSettings.IsVkGuestMarkersEnabled() ||
+                               (names && names[0] == '1');
     }
     const std::size_t num_physical_devices = static_cast<u16>(physical_devices.size());
     ASSERT_MSG(num_physical_devices > 0, "No physical devices found");
@@ -852,6 +862,7 @@ void Instance::CollectToolingInfo() const {
     for (const vk::PhysicalDeviceToolProperties& tool : tools) {
         const std::string_view name = tool.name;
         LOG_INFO(Render_Vulkan, "Attached debugging tool: {}", name);
+        object_names_enabled = true;
     }
 }
 

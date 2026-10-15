@@ -1188,10 +1188,21 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             // (garbage left in the guest's descriptor memory); bind nothing instead of aborting.
             // Large ranges get clamped to the mapped memory at their start (0 if unmapped);
             // written bindings are checked as well, so garbage cannot become GPU-modified memory.
+            // sotc: the clamp alone is 0 exactly when the base is unmapped or reserved (what the
+            // two is-mapped calls checked), so one runtime call per binding instead of three.
+            // SOTC_BIND_CLAMP1=0 restores the three calls.
+            static const bool clamp1 = [] {
+                const char* v = std::getenv("SOTC_BIND_CLAMP1");
+                return !v || v[0] != '0';
+            }();
             u64 size = 0;
-            if (vsharp.base_address != 0 && vsharp.GetSize() != 0 &&
-                memory->IsValidMapping(vsharp.base_address) &&
-                (!desc.is_written || memory->IsMappedAddress(vsharp.base_address))) {
+            if (clamp1) {
+                if (vsharp.base_address != 0 && vsharp.GetSize() != 0) {
+                    size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                }
+            } else if (vsharp.base_address != 0 && vsharp.GetSize() != 0 &&
+                       memory->IsValidMapping(vsharp.base_address) &&
+                       (!desc.is_written || memory->IsMappedAddress(vsharp.base_address))) {
                 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
             }
             if (size == 0) {

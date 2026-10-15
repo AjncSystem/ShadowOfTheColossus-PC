@@ -130,13 +130,31 @@ public:
                 ++num_commands;
                 submit_cv.notify_one();
             }
+            WakeBack();
             sem.acquire();
         } else {
-            std::scoped_lock lk{submit_mutex};
-            command_queue.emplace(std::move(func));
-            ++num_commands;
-            submit_cv.notify_one();
+            {
+                std::scoped_lock lk{submit_mutex};
+                command_queue.emplace(std::move(func));
+                ++num_commands;
+                submit_cv.notify_one();
+            }
+            WakeBack();
         }
+    }
+
+    /// sotc: a command that must run at the command processor's point of the command stream,
+    /// after the work it queued so far (SendCommand runs before that work with the draw thread:
+    /// readbacks for guest threads do not wait for the queue).
+    void SendOrderedCommand(Common::UniqueFunction<void>&& func) {
+        if (!back_threaded) {
+            SendCommand(std::move(func));
+            return;
+        }
+        std::scoped_lock lk{submit_mutex};
+        ordered_queue.emplace(std::move(func));
+        ++num_ordered;
+        submit_cv.notify_one();
     }
 
     void ReserveCopyBufferSpace() {
@@ -312,6 +330,8 @@ private:
     std::mutex submit_mutex;
     std::condition_variable_any submit_cv;
     std::queue<Common::UniqueFunction<void>> command_queue{};
+    std::queue<Common::UniqueFunction<void>> ordered_queue{}; // sotc: SendOrderedCommand
+    std::atomic<u32> num_ordered{};
     std::thread::id gpu_id;
 #ifdef __linux__
     u32 gpu_tid;
@@ -400,6 +420,12 @@ private:
     }
     void ExecuteBackOp(BackOp& op);
     void BackLoop(std::stop_token stoken);
+    void WakeBack() {
+        if (back_threaded) {
+            std::scoped_lock lk{back_mutex};
+            back_cv.notify_one();
+        }
+    }
 
     bool back_threaded{};
     bool back_strict{};

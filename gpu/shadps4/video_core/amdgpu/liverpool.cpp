@@ -115,10 +115,14 @@ void Liverpool::BackLoop(std::stop_token stoken) {
     Shader::g_info_slot = 1;
     u64 tail = back_tail.load(std::memory_order_relaxed);
     while (!stoken.stop_requested()) {
+        if (num_commands.load(std::memory_order_acquire)) {
+            ProcessCommands();
+        }
         if (back_head.load(std::memory_order_acquire) == tail) {
             bool ready = false;
             for (u32 spin = 0; spin < 4096; ++spin) {
-                if (back_head.load(std::memory_order_acquire) != tail) {
+                if (back_head.load(std::memory_order_acquire) != tail ||
+                    num_commands.load(std::memory_order_acquire)) {
                     ready = true;
                     break;
                 }
@@ -129,6 +133,7 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                 back_sleeping.store(true, std::memory_order_seq_cst);
                 back_cv.wait_for(lk, std::chrono::milliseconds(1), [&] {
                     return back_head.load(std::memory_order_seq_cst) != tail ||
+                           num_commands.load(std::memory_order_seq_cst) ||
                            stoken.stop_requested();
                 });
                 back_sleeping.store(false, std::memory_order_relaxed);
@@ -387,6 +392,35 @@ void Liverpool::WriteFenceValue(void* address, u64 data, u32 num_bytes) {
 }
 
 void Liverpool::ProcessCommands() {
+    // sotc: with the draw thread, the commands run there between two queued operations (guest
+    // threads waiting for a readback do not wait for the queue), and the ordered ones are queued
+    // here, at this point of the command stream.
+    if (back_threaded) {
+        if (std::this_thread::get_id() == back_id) {
+            while (num_commands) {
+                Common::UniqueFunction<void> callback{};
+                {
+                    std::scoped_lock lk{submit_mutex};
+                    callback = std::move(command_queue.front());
+                    command_queue.pop();
+                    --num_commands;
+                }
+                callback();
+            }
+            return;
+        }
+        while (num_ordered) {
+            Common::UniqueFunction<void> callback{};
+            {
+                std::scoped_lock lk{submit_mutex};
+                callback = std::move(ordered_queue.front());
+                ordered_queue.pop();
+                --num_ordered;
+            }
+            QueueBackFunc(std::move(callback), back_strict);
+        }
+        return;
+    }
     // Process incoming commands with high priority
     while (num_commands) {
         Common::UniqueFunction<void> callback{};
@@ -396,12 +430,7 @@ void Liverpool::ProcessCommands() {
             command_queue.pop();
             --num_commands;
         }
-        // sotc: at this point of the command stream, after the work queued so far.
-        if (back_threaded) {
-            QueueBackFunc(std::move(callback), back_strict);
-        } else {
-            callback();
-        }
+        callback();
     }
 }
 
@@ -416,7 +445,10 @@ void Liverpool::Process(std::stop_token stoken) {
         {
             std::unique_lock lk{submit_mutex};
             Common::CondvarWait(submit_cv, lk, stoken,
-                                [this] { return num_commands || num_submits || submit_done; });
+                                [this] {
+                                    return (num_commands && !back_threaded) || num_ordered ||
+                                           num_submits || submit_done;
+                                });
         }
         if (stoken.stop_requested()) {
             break;
@@ -426,7 +458,7 @@ void Liverpool::Process(std::stop_token stoken) {
 
         curr_qid = -1;
 
-        while (num_submits || num_commands) {
+        while (num_submits || (num_commands && !back_threaded) || num_ordered) {
             ProcessCommands();
 
             curr_qid = (curr_qid + 1) % num_mapped_queues;

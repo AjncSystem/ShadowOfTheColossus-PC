@@ -11,6 +11,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
+#include "video_core/sotc_stats.h"
 
 namespace Vulkan {
 
@@ -64,6 +65,8 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
             best = &ring.blocks[(ring.current + 1) % ring.blocks.size()];
             best_offset = 0;
         } else {
+            const SotcStats::FrameTimer frame_timer{SotcStats::FrameAlloc};
+            const SotcStats::AllocTrace alloc_trace{SotcStats::AllocStagingBlock, BLOCK_SIZE};
             best = &ring.blocks.emplace_back(Block{
                 .buffer = std::make_unique<VideoCore::StreamBuffer>(instance, scheduler, type,
                                                                     BLOCK_SIZE),
@@ -107,6 +110,8 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
     }
 
     if (!best) {
+        const SotcStats::FrameTimer frame_timer{SotcStats::FrameAlloc};
+        const SotcStats::AllocTrace alloc_trace{SotcStats::AllocStagingLarge, RoundAllocationSize(size)};
         best = &cache.emplace_back(LargeBuffer{
             .buffer = std::make_unique<VideoCore::Buffer>(instance, 0, RoundAllocationSize(size),
                                                           type, "StagingBufferPool:Dedicated"),

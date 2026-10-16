@@ -4,6 +4,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <string>
+#include <vector>
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -239,6 +242,8 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
 
 // sotc: src/runtime_memory.c, live view splits since the last call.
 extern "C" uint64_t runtime_memory_carve_splits(void);
+// sotc: src/runtime_file.c, guest file read time since the last call.
+extern "C" uint64_t runtime_file_read_ns_take(void);
 
 void VideoOutDriver::Flip(const Request& req) {
     // Update HDR status before presenting.
@@ -255,8 +260,85 @@ void VideoOutDriver::Flip(const Request& req) {
         static u32 flips = 0;
         ++flips;
         const auto now = std::chrono::steady_clock::now();
+        // sotc: frame times of this window, and where the command processor spent the time of
+        // slow frames (SotcStats::FrameTimer sites) -> the "SOTC FRAMES" line.
+        // Column FrameCauses ("io") is the time guest threads spent in file reads (all threads, so
+        // it can exceed the frame); the last one counts bytes copied to the GPU ("copyMB").
+        constexpr int kColumns = SotcStats::FrameCauses + 2;
+        static auto last_flip = now;
+        static std::vector<float> frame_ms;
+        static double worst_ms = 0.0;
+        static uint64_t worst_ns[kColumns]{}, slow_ns[kColumns]{};
+        static u32 slow_frames = 0;
+        const double interval_ms = std::chrono::duration<double, std::milli>(now - last_flip).count();
+        last_flip = now;
+        uint64_t cause_ns[kColumns];
+        for (int c = 0; c < SotcStats::FrameCauses; ++c) {
+            cause_ns[c] = SotcStats::frame_ns[c].exchange(0, std::memory_order_relaxed);
+        }
+        cause_ns[SotcStats::FrameCauses] = runtime_file_read_ns_take();
+        cause_ns[SotcStats::FrameCauses + 1] = SotcStats::frame_copy_bytes.exchange(0);
+        frame_ms.push_back(static_cast<float>(interval_ms));
+        if (interval_ms > worst_ms) {
+            worst_ms = interval_ms;
+            std::copy(std::begin(cause_ns), std::end(cause_ns), std::begin(worst_ns));
+        }
+        if (interval_ms > 50.0) {
+            ++slow_frames;
+            for (int c = 0; c < kColumns; ++c) {
+                slow_ns[c] += cause_ns[c];
+            }
+        }
         if (now - window_start >= std::chrono::seconds(5)) {
             const double seconds = std::chrono::duration<double>(now - window_start).count();
+            {
+                std::sort(frame_ms.begin(), frame_ms.end());
+                const auto pct = [&](double p) {
+                    return frame_ms[std::min(frame_ms.size() - 1,
+                                             static_cast<size_t>(p * frame_ms.size()))];
+                };
+                const auto columns = [](const uint64_t* ns) {
+                    std::string text;
+                    char item[48];
+                    for (int c = 0; c < kColumns; ++c) {
+                        std::snprintf(item, sizeof(item), "%s%s %.1f", c ? ", " : "",
+                                      c < SotcStats::FrameCauses ? SotcStats::kFrameCauseNames[c]
+                                      : c == SotcStats::FrameCauses ? "io"
+                                                                    : "copyMB",
+                                      ns[c] / 1e6);
+                        text += item;
+                    }
+                    return text;
+                };
+                std::fprintf(stderr,
+                             "SOTC FRAMES p50 %.1f ms, p99 %.1f ms (1%% low %.1f FPS), worst %.1f ms "
+                             "[%s]; >50 ms: %u [%s]; compiled %llu\n",
+                             pct(0.5), pct(0.99), 1000.0 / pct(0.99), worst_ms,
+                             columns(worst_ns).c_str(), slow_frames, columns(slow_ns).c_str(),
+                             static_cast<unsigned long long>(SotcStats::frame_compiles.exchange(0)));
+                std::string allocs;
+                for (int k = 0; k < SotcStats::AllocKinds; ++k) {
+                    const uint64_t count = SotcStats::alloc_count[k].exchange(0);
+                    const uint64_t bytes = SotcStats::alloc_bytes[k].exchange(0);
+                    const uint64_t ns = SotcStats::alloc_ns[k].exchange(0);
+                    if (count) {
+                        char item[96];
+                        std::snprintf(item, sizeof(item), "%s%s %llu (%.1f MiB, %.1f ms)",
+                                      allocs.empty() ? "" : ", ", SotcStats::kAllocKindNames[k],
+                                      static_cast<unsigned long long>(count), bytes / 1048576.0,
+                                      ns / 1e6);
+                        allocs += item;
+                    }
+                }
+                if (!allocs.empty()) {
+                    std::fprintf(stderr, "SOTC ALLOC %s\n", allocs.c_str());
+                }
+                frame_ms.clear();
+                worst_ms = 0.0;
+                std::fill(std::begin(worst_ns), std::end(worst_ns), 0);
+                std::fill(std::begin(slow_ns), std::end(slow_ns), 0);
+                slow_frames = 0;
+            }
             const uint64_t readbacks = SotcStats::readbacks.exchange(0, std::memory_order_relaxed);
             const uint64_t readback_ns =
                 SotcStats::readback_ns.exchange(0, std::memory_order_relaxed);

@@ -146,6 +146,7 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     if (info.pixel_format == vk::Format::eUndefined) {
         return;
     }
+    const SotcStats::FrameTimer frame_timer{SotcStats::FrameImage};
 
     image_uid = global_image_uid.Next();
     mip_hashes.resize(info.resources.levels);

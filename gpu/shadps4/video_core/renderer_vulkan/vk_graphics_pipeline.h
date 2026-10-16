@@ -90,7 +90,7 @@ public:
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
                      const Shader::Gcn::FetchShaderData* fetch_shader,
                      std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
-                     bool preloading);
+                     bool preloading, bool async_build = false);
     ~GraphicsPipeline();
 
     const Shader::Gcn::FetchShaderData& GetFetchShader() const noexcept {

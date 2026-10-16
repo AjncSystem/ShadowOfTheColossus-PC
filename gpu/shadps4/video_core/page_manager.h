@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <type_traits>
 #include "common/alignment.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/region_definitions.h"
@@ -25,7 +26,29 @@ void UnregisterGuestStack(VAddr address, u64 size);
 /// Calls func(address, size) for the parts of the range outside registered guest stacks.
 /// Those pages are never protected, so the CPU may have written them without the tracker
 /// noticing: GPU data read back must not be written over them.
-void ForEachNonStackRange(VAddr address, u64 size, const std::function<void(VAddr, u64)>& func);
+/// sotc: non-owning reference to a void(VAddr, u64) callable, replacing const std::function&
+/// (which type-erased, and could heap-allocate, the caller's lambda on every readback write).
+/// Valid only for the duration of the call; ForEachNonStackRange never stores it.
+class NonStackRangeFn {
+public:
+    template <typename F>
+        requires(!std::is_same_v<std::remove_cvref_t<F>, NonStackRangeFn> &&
+                 std::is_invocable_v<F&, VAddr, u64>)
+    NonStackRangeFn(F&& f) noexcept
+        : obj{const_cast<void*>(static_cast<const void*>(std::addressof(f)))},
+          call{[](void* o, VAddr address, u64 size) {
+              (*static_cast<std::remove_reference_t<F>*>(o))(address, size);
+          }} {}
+
+    void operator()(VAddr address, u64 size) const {
+        call(obj, address, size);
+    }
+
+private:
+    void* obj;
+    void (*call)(void*, VAddr, u64);
+};
+void ForEachNonStackRange(VAddr address, u64 size, NonStackRangeFn func);
 
 struct UffdImpl;
 struct SignalImpl;

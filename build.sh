@@ -3,7 +3,8 @@ set -euo pipefail
 cd -- "$(dirname -- "$0")"
 mkdir -p out
 # Windows: MSYS2 CLANG64 (packages in packaging/windows/README.md). The GPU library is static
-# there and CMake links bb-probe.exe as well; no PGO (GCC-only flags), LTO off by default.
+# there and CMake links bb-probe.exe as well. ThinLTO by default (BB_LTO=OFF disables it);
+# Clang PGO from pgo/bbgpu.profdata when present (tools/pgo_train.sh makes it).
 case $(uname -s) in
 MINGW*|MSYS*)
     # shellcheck source=msys2-env.sh
@@ -22,10 +23,17 @@ MINGW*|MSYS*)
     done
     # sotc: llvm-windres, binutils windres fails on build paths with spaces ("Unable to create
     # temp file").
-    cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO=off \
-        -DBB_LTO="${BB_LTO:-OFF}" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
-        -DCMAKE_RC_COMPILER=llvm-windres >/dev/null
-    echo "GPU library and loader: LTO ${BB_LTO:-OFF}"
+    # sotc: BB_PGO=generate builds an instrumented exe (Clang profile in pgo/, see
+    # gpu/CMakeLists.txt); by default pgo/bbgpu.profdata is used when present.
+    pgo=${BB_PGO:-}
+    if [[ -z $pgo ]]; then
+        if [[ -f pgo/bbgpu.profdata ]]; then pgo=use; else pgo=off; fi
+    fi
+    mkdir -p pgo
+    cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO="$pgo" \
+        -DBB_PGO_DIR="$PWD/pgo" -DBB_LTO="${BB_LTO:-ON}" -DCMAKE_C_COMPILER=clang \
+        -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_RC_COMPILER=llvm-windres >/dev/null
+    echo "GPU library and loader: PGO $pgo, LTO ${BB_LTO:-ON}"
     if ! ninja -C out/gpu bb-probe bb-gpu-capabilities bb-play > out/gpu-build.log 2>&1; then
         grep -v '^\[' out/gpu-build.log | tail -40 >&2
         echo 'Build failed (full log: out/gpu-build.log)' >&2; exit 1

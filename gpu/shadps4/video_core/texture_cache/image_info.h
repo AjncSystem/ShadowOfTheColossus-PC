@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <optional>
 #include "common/types.h"
 #include "video_core/amdgpu/cb_db_extent.h"
 #include "video_core/amdgpu/tiling.h"
@@ -58,6 +59,14 @@ struct ImageInfo {
     bool IsCompatible(const ImageInfo& info) const;
     void UpdateSize();
 
+    /// sotc: turns this info into the tail of its chain from mip `b` (mip b becomes level 0),
+    /// when the tail has exactly the layout the full chain has from mip b. False: unchanged.
+    bool RebaseToMip(u32 b);
+    /// sotc: the T#'s info rebased to its base_level, cached with the T#'s info; nullopt when
+    /// RebaseToMip refuses.
+    static std::optional<ImageInfo> CachedRebase(const AmdGpu::Image& image,
+                                                 const Shader::ImageResource& desc);
+
     struct {
         VAddr cmask_addr;
         VAddr fmask_addr;
@@ -89,6 +98,17 @@ struct ImageInfo {
 
     VAddr stencil_addr{};
     u32 stencil_size{};
+
+    // sotc: residency hints of the T# this image was created from, telemetry only (the census in
+    // TextureCache::Census): the first mip a view can sample (base_level, or min_lod if higher)
+    // and whether the T# takes part in the hardware LOD streaming counters. 0 for render targets.
+    u8 sotc_reach_mip{};
+    u8 sotc_minlod_mip{};
+    bool sotc_streamed{};
+    // sotc: mip-tail images (RebaseToMip): the chain's mip that is level 0 here (0: a full
+    // chain) and the guest bytes of the finer mips left out (the chain starts that much lower).
+    u8 sotc_first_mip{};
+    u32 sotc_dropped_bytes{};
 };
 
 } // namespace VideoCore

@@ -103,6 +103,12 @@ Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
     memory_barrier.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
     memory_barrier.dstAccessMask =
         vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
+    const auto off = [](const char* name) {
+        const char* v = std::getenv(name);
+        return v && v[0] == '0';
+    };
+    access_reuse = !off("SOTC_ACCESS_REUSE");
+    access_union = !off("SOTC_ACCESS_UNION");
 }
 
 void Runtime::TickFrame() {
@@ -319,7 +325,9 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     cmdbuf.copyImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
                      vk::ImageLayout::eTransferDstOptimal, regions);
 
-    dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
+    if (True(src->flags & VideoCore::ImageFlagBits::GpuModified)) {
+        VideoCore::MarkGpuModified(*dst, false); // sotc: see the copy fast path in the rasterizer
+    }
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
@@ -379,7 +387,9 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
     cmdbuf.copyBufferToImage(buffer->Handle(), dst->GetImage(),
                              vk::ImageLayout::eTransferDstOptimal, buffer_copy);
 
-    dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
+    if (True(src->flags & VideoCore::ImageFlagBits::GpuModified)) {
+        VideoCore::MarkGpuModified(*dst, false); // sotc: see the copy fast path in the rasterizer
+    }
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
@@ -431,7 +441,9 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
     cmdbuf.copyImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
                      vk::ImageLayout::eTransferDstOptimal, image_copy);
 
-    dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
+    if (True(src->flags & VideoCore::ImageFlagBits::GpuModified)) {
+        VideoCore::MarkGpuModified(*dst, false); // sotc: see the copy fast path in the rasterizer
+    }
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
@@ -529,7 +541,7 @@ void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
     cmdbuf.copyImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
                      vk::ImageLayout::eTransferDstOptimal, region);
 
-    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
+    VideoCore::MarkGpuModified(*dst); // sotc: moves the mip-tail epoch on a first write
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
@@ -595,7 +607,7 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
                             vk::ImageLayout::eTransferDstOptimal, region);
     }
 
-    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
+    VideoCore::MarkGpuModified(*dst); // sotc: moves the mip-tail epoch on a first write
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
@@ -621,7 +633,7 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
     cmdbuf.clearColorImage(dst->GetImage(), vk::ImageLayout::eTransferDstOptimal, clear_value.color,
                            vk_range);
 
-    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
+    VideoCore::MarkGpuModified(*dst); // sotc: moves the mip-tail epoch on a first write
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
@@ -734,10 +746,18 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
 
     if (src_access & WRITE_MASK) {
-        resource->write_ranges.Add(range);
+        if (access_union) {
+            resource->write_ranges.AddUnion(range);
+        } else {
+            resource->write_ranges.Add(range);
+        }
     }
     if (src_access & READ_MASK) {
-        resource->read_ranges.Add(range);
+        if (access_union) {
+            resource->read_ranges.AddUnion(range);
+        } else {
+            resource->read_ranges.Add(range);
+        }
     }
 
     memory_barrier.srcStageMask |= src_stage;
@@ -768,11 +788,15 @@ void Runtime::FlushBarriers() {
     memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;
 
     image_barriers.clear();
-    for (auto& resource : resources) {
-        resource.read_ranges.Clear();
-        resource.write_ranges.Clear();
+    for (std::size_t i = 0; i < active_resources; ++i) {
+        resources[i].read_ranges.Clear();
+        resources[i].write_ranges.Clear();
+        resources[i].handle = nullptr;
     }
-    resources.clear();
+    if (!access_reuse) {
+        resources.clear();
+    }
+    active_resources = 0;
     resource = nullptr;
 }
 
@@ -780,12 +804,21 @@ void Runtime::MakeCurrent(const VideoCore::Buffer* handle) {
     if (resource && resource->handle == handle) {
         return;
     }
-    auto it = std::ranges::find(resources, handle, &BufferBarriers::handle);
-    if (it != resources.end()) {
+    const auto live_end = resources.begin() + static_cast<std::ptrdiff_t>(active_resources);
+    auto it = std::find_if(resources.begin(), live_end,
+                           [handle](const BufferBarriers& b) { return b.handle == handle; });
+    if (it != live_end) {
         resource = std::addressof(*it);
         return;
     }
+    if (active_resources < resources.size()) {
+        // A slot kept from before the last barrier: lists empty, capacity kept.
+        resource = &resources[active_resources++];
+        resource->handle = handle;
+        return;
+    }
     resource = &resources.emplace_back(handle);
+    ++active_resources;
 }
 
 } // namespace Vulkan

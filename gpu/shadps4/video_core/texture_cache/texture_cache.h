@@ -4,6 +4,8 @@
 #pragma once
 
 #include <condition_variable>
+#include <cstdlib>
+#include <optional>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -33,6 +35,19 @@ namespace VideoCore {
 
 class BufferCache;
 class PageManager;
+
+/// sotc: SOTC_MIP_TAIL: 0 off, 1 mip-tail images for T#s with LOD streaming counters, 2 (default)
+/// for every read-only colour T# whose base_level is above 0 (TextureCache::DecideRebase). Mode 2
+/// left out 2.5 GB of never-sampled mips in the attract demo: peak video memory 6.1 -> 3.3-3.5 GB
+/// on a 6 GB card, frames over 50 ms 150 -> 102-112, the worst streaming frame 460 -> 250-310 ms.
+inline u32 MipTailMode() {
+    static const u32 mode = [] {
+        const char* v = std::getenv("SOTC_MIP_TAIL");
+        return v && (v[0] == '0' || v[0] == '1' || v[0] == '2') ? static_cast<u32>(v[0] - '0')
+                                                                  : 2u;
+    }();
+    return mode;
+}
 
 class TextureCache {
     // Default values for garbage collection
@@ -65,10 +80,21 @@ public:
         ImageViewInfo view_info;
         BindingType type{BindingType::Texture};
 
+        // sotc: mip-tail candidate (SOTC_MIP_TAIL, DecideRebase): the T#'s base_level (0: not a
+        // candidate) and min_lod, whether `info` holds the tail now, and the other info (the
+        // tail while `info` is the full chain, the full chain while `info` is the tail).
+        u8 rebase_mip{};
+        bool rebased_now{};
+        u16 orig_min_lod{};
+        std::optional<ImageInfo> other_info;
+
         ImageDesc() = default;
         ImageDesc(const AmdGpu::Image& image, const Shader::ImageResource& desc)
             : info{image, desc}, view_info{image, desc},
-              type{desc.is_written ? BindingType::Storage : BindingType::Texture} {}
+              type{desc.is_written ? BindingType::Storage : BindingType::Texture} {
+            InitMipTail(image, desc);
+        }
+        void InitMipTail(const AmdGpu::Image& image, const Shader::ImageResource& resource);
         ImageDesc(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint)
             : info{buffer, hint}, view_info{buffer}, type{BindingType::RenderTarget} {}
         ImageDesc(const AmdGpu::DepthBuffer& buffer, AmdGpu::DepthView view,
@@ -90,9 +116,15 @@ public:
         return tile_manager;
     }
 
-    /// Frees cached images not used in the last few frames, regardless of memory thresholds.
-    /// Called when a video memory allocation fails.
-    void EmergencyCollect();
+    /// Frees cached images not used in the last few GC ticks (one per submit), regardless of
+    /// memory thresholds. Called when a video memory allocation fails. Higher levels go deeper
+    /// (sotc): level 0 frees up to 512 images last used 4 or more ticks ago, level 1 up to 4096
+    /// last used 2 or more ticks ago, level 2 every image not used in the current tick.
+    void EmergencyCollect(u32 level = 0);
+
+    /// sotc: EmergencyCollect, unless this thread is inside RefreshImage (holding `mutex`): then
+    /// the collection is deferred to the next RunGarbageCollector and false is returned.
+    bool TryEmergencyCollect(u32 level);
 
     /// Invalidates any image in the logical page range.
     void InvalidateMemory(VAddr addr, size_t size);
@@ -116,7 +148,10 @@ public:
     [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
 
     /// Retrieves the render target with specified properties
-    [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc);
+    /// sotc: update=false (BeginRendering, SOTC_RT_FAST) skips the second UpdateImage when the
+    /// caller has just run it and the image needs no upload or re-tracking since.
+    [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc,
+                                              bool update = true);
 
     /// Retrieves the depth target with specified properties
     [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc);
@@ -202,6 +237,20 @@ public:
             return it.value().clear_mask & (1u << slice);
         }
         return false;
+    }
+
+    /// sotc: IsMetaCleared + TouchMeta(address, slice, false) with a single lookup
+    /// (SOTC_RT_FAST): returns the old clear bit of the slice (false when the address is not a
+    /// metadata surface, like IsMetaCleared) and clears it.
+    bool TestAndTouchMeta(VAddr address, u32 slice) {
+        auto it = surface_metas.find(address);
+        if (it == surface_metas.end()) {
+            return false;
+        }
+        auto& clear_mask = it.value().clear_mask;
+        const bool was_clear = (clear_mask & (1u << slice)) != 0;
+        clear_mask &= ~(1u << slice);
+        return was_clear;
     }
 
     /// Clears all slices of the specified metadata surface.
@@ -334,7 +383,24 @@ private:
         DeleteImage(image_id);
     }
 
+    /// sotc: depth/colour twins (ResolveDepthOverlap). Park: what FreeImage does except the
+    /// reclaim of the slot and its Vulkan objects. Unpark: registers it again as if new.
+    void ParkImage(ImageId image_id);
+    void UnparkImage(ImageId image_id);
+    void ReclaimImage(ImageId image_id);
+
     void GarbageCollectImages();
+
+    /// sotc: image memory by class, every 5 s with SOTC_FPS (telemetry only).
+    void Census();
+
+    /// sotc: mip-tail images (SOTC_MIP_TAIL), see DecideRebase.
+    bool IsSafeToDelete(const Image& image) const;
+    bool DecideRebase(ImageDesc& desc, bool exact_fmt);
+    void MipTailCreated(ImageId image_id, const ImageDesc& desc);
+    void FreeRebased(ImageId image_id, std::atomic<std::uint64_t>& counter);
+    /// First GPU write of a target or storage image (FindTexture/RenderTarget/DepthTarget).
+    void MarkWritten(Image& image);
     void GarbageCollectSamplers();
 
 private:
@@ -364,7 +430,13 @@ private:
     const bool readback_linear_images;
     PageTable page_table;
     std::mutex mutex;
-    /// sotc: FindImage's perfect matches, valid while no image is registered or unregistered.
+    /// sotc: RefreshImage nesting on this thread (it runs under `mutex`).
+    static inline thread_local u32 refresh_depth = 0;
+    /// sotc: deferred EmergencyCollect level + 1 (0: none).
+    std::atomic<u32> pending_emergency{0};
+    /// sotc: FindImage's perfect matches, valid while no image is registered or unregistered
+    /// (a mip-tail image's also while gpu_modified_epoch stays). `writer`: stored by a writer
+    /// lookup (with mip tails on, writers only take those).
     struct FindMemo {
         VAddr guest_address{};
         u64 guest_size{};
@@ -372,13 +444,30 @@ private:
         vk::Format pixel_format{};
         AmdGpu::ImageType type{};
         bool exact_fmt{};
+        bool writer{};
         u64 generation{~0ULL};
         ImageId image_id{};
+        u64 gpu_epoch{};
     };
     static constexpr size_t NumFindMemos = 1024;
     std::array<FindMemo, NumFindMemos> find_memos{};
+    FindMemo& MemoSlot(const ImageInfo& info, bool exact_fmt, bool writer);
+    /// The memoized perfect match for a lookup, or none (SOTC_FIND_MEMO=0: always none).
+    ImageId MemoLookup(const ImageInfo& info, bool exact_fmt, bool writer);
+    /// The generation a memo for `address` is valid in (per-address unless SOTC_MEMO_ADDR_GEN=0).
+    u64 MemoGeneration(VAddr address) const;
     u64 image_set_generation{};
+    /// sotc: per-address generations for FindMemo. A perfect match needs the same
+    /// guest_address, so only (un)registering an image at that address can change the
+    /// result; bumped in RegisterImage/UnregisterImage at the image's guest_address.
+    static constexpr size_t NumAddrGens = 4096;
+    std::array<u32, NumAddrGens> addr_gens{};
+    static size_t AddrGenSlot(VAddr addr) {
+        return static_cast<size_t>((u64{addr >> 8} * 0x9E3779B97F4A7C15ULL) >> 52);
+    }
     std::mutex samplers_mutex;
+    // sotc: bumped whenever a sampler is erased (GetSampler's per-thread memo).
+    std::atomic<u64> sampler_epoch{0};
     std::mutex download_images_mutex;
     struct MetaDataInfo {
         MetaType type;

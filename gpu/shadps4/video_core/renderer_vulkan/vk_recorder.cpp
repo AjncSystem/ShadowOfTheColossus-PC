@@ -16,6 +16,7 @@
 #include "common/perf_stats.h"
 #include "common/thread.h"
 #include "video_core/renderer_vulkan/vk_recorder.h"
+#include "video_core/sotc_stats.h"
 
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
@@ -852,7 +853,11 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
     // The command processor publishes another batch every few microseconds while working
     // Keep the consumer spinning briefly between batches to avoid making the producer wake it for
     // every small update
-    constexpr auto SpinTime = std::chrono::microseconds{250};
+    // sotc: SOTC_RECORDER_SPIN_US changes the spin (A/B).
+    static const auto SpinTime = std::chrono::microseconds{[] {
+        const char* v = std::getenv("SOTC_RECORDER_SPIN_US");
+        return v ? std::strtoll(v, nullptr, 10) : 250LL;
+    }()};
     constexpr auto SleepTime = std::chrono::microseconds{500};
 
     Chunk* chunk = first_chunk;
@@ -885,7 +890,8 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
             }
         }
         const bool perf = Common::PerfStats::Enabled();
-        const auto busy_start = perf ? Clock::now() : Clock::time_point{};
+        const bool phase_time = SotcStats::PhaseTime();
+        const auto busy_start = perf || phase_time ? Clock::now() : Clock::time_point{};
         while (pos < committed) {
             auto* header = reinterpret_cast<BlockHeader*>(chunk->data + pos);
             if (header->kind == BlockKind::End) {
@@ -905,6 +911,12 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
                 header->invoke(header + 1);
             }
             pos += header->size;
+        }
+        if (phase_time) {
+            SotcStats::Bump(SotcStats::recorder_busy_ns,
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() -
+                                                                                 busy_start)
+                                .count());
         }
         if (perf) {
             Common::PerfStats::Add(

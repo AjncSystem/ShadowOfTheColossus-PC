@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "common/sotc_cache_path.h"
 #include "common/scope_exit.h"
 #include "common/types.h"
 
@@ -129,7 +130,32 @@ static auto UserPaths = [] {
     create_path(PathType::MetaDataDir, user_dir / METADATA_DIR);
     create_path(PathType::CustomTrophy, user_dir / CUSTOM_TROPHY);
     create_path(PathType::CustomConfigs, user_dir / CUSTOM_CONFIGS);
-    create_path(PathType::CacheDir, user_dir / CACHE_DIR);
+    auto cache_dir = user_dir / CACHE_DIR;
+    const char* configured_cache = std::getenv("SOTC_CACHE_DIR");
+    const char* portable_cache = std::getenv("SOTC_PORTABLE_CACHE");
+    const bool portable = portable_cache && (portable_cache[0] == '1' ||
+                                            portable_cache[0] == 'y' || portable_cache[0] == 't');
+#ifdef _WIN32
+    const char* local_app_data = std::getenv("LOCALAPPDATA");
+#else
+    const char* local_app_data = nullptr;
+#endif
+    cache_dir = SotcCachePath(user_dir, configured_cache ? configured_cache : "", portable,
+                             local_app_data ? local_app_data : "");
+    std::error_code cache_error;
+    const bool first_cache = !std::filesystem::exists(cache_dir, cache_error);
+    std::filesystem::create_directories(cache_dir, cache_error);
+    if (cache_error) {
+        cache_dir = user_dir / CACHE_DIR;
+        std::filesystem::create_directories(cache_dir);
+    } else if (first_cache && cache_dir != user_dir / CACHE_DIR &&
+               std::filesystem::is_directory(user_dir / CACHE_DIR)) {
+        // Seed only a new cache root; keep the old installation's cache intact.
+        std::filesystem::copy(user_dir / CACHE_DIR, cache_dir,
+            std::filesystem::copy_options::recursive | std::filesystem::copy_options::skip_existing |
+            std::filesystem::copy_options::skip_symlinks, cache_error);
+    }
+    create_path(PathType::CacheDir, cache_dir);
     create_path(PathType::FontsDir, user_dir / FONTS_DIR);
     create_path(PathType::TrophyDir, user_dir / TROPHY_DIR);
     create_path(PathType::HomeDir, user_dir / HOME_DIR);

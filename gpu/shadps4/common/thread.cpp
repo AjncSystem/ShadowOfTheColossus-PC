@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <ctime>
+#include <algorithm>
 #include <string>
 #include <thread>
 
@@ -109,18 +110,31 @@ void SetCurrentThreadPriority(ThreadPriority new_priority) {
 
 bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
                    const bool interruptible) {
-    const auto begin_sleep = std::chrono::high_resolution_clock::now();
+    if (duration.count() <= 0) {
+        if (remaining) *remaining = std::chrono::nanoseconds(0);
+        return true;
+    }
+    const auto begin_sleep = std::chrono::steady_clock::now();
 
     LARGE_INTEGER interval{
         .QuadPart = -1 * (duration.count() / 100u),
     };
-    HANDLE timer = ::CreateWaitableTimer(NULL, TRUE, NULL);
-    SetWaitableTimer(timer, &interval, 0, NULL, NULL, 0);
-    const auto ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);
-    ::CloseHandle(timer);
+    struct Timer {
+        HANDLE handle = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                               TIMER_ALL_ACCESS);
+        Timer() { if (!handle) handle = CreateWaitableTimerW(nullptr, FALSE, nullptr); }
+        ~Timer() { if (handle) CloseHandle(handle); }
+    };
+    static thread_local Timer timer;
+    if (!timer.handle || !SetWaitableTimer(timer.handle, &interval, 0, nullptr, nullptr, FALSE)) {
+        std::this_thread::sleep_for(duration);
+        if (remaining) *remaining = std::chrono::nanoseconds(0);
+        return true;
+    }
+    const auto ret = WaitForSingleObjectEx(timer.handle, INFINITE, interruptible);
 
     if (remaining) {
-        const auto end_sleep = std::chrono::high_resolution_clock::now();
+        const auto end_sleep = std::chrono::steady_clock::now();
         const auto sleep_time = end_sleep - begin_sleep;
         *remaining = duration > sleep_time ? duration - sleep_time : std::chrono::nanoseconds(0);
     }
@@ -228,18 +242,34 @@ AccurateTimer::AccurateTimer(std::chrono::nanoseconds target_interval)
     : target_interval(target_interval) {}
 
 void AccurateTimer::Start() {
-    const auto begin_sleep = std::chrono::high_resolution_clock::now();
+    const auto begin_sleep = std::chrono::steady_clock::now();
     if (total_wait.count() > 0) {
         AccurateSleep(total_wait, nullptr, false);
     }
-    start_time = std::chrono::high_resolution_clock::now();
+    start_time = std::chrono::steady_clock::now();
     total_wait -= std::chrono::duration_cast<std::chrono::nanoseconds>(start_time - begin_sleep);
 }
 
 void AccurateTimer::End() {
-    auto now = std::chrono::high_resolution_clock::now();
+    auto now = std::chrono::steady_clock::now();
     total_wait +=
         target_interval - std::chrono::duration_cast<std::chrono::nanoseconds>(now - start_time);
+    // A long stall must not be repaid with a burst of synthetic vblanks.
+    total_wait = std::max(total_wait, -target_interval);
+}
+
+void PreciseSleepUntil(std::chrono::steady_clock::time_point deadline) {
+    using namespace std::chrono;
+    constexpr auto tail = microseconds(200);
+    auto now = steady_clock::now();
+    if (deadline - now > tail) AccurateSleep(deadline - now - tail, nullptr, false);
+    while (steady_clock::now() < deadline) {
+#ifdef _WIN32
+        YieldProcessor();
+#else
+        std::this_thread::yield();
+#endif
+    }
 }
 
 std::string GetCurrentThreadName() {

@@ -26,6 +26,10 @@ struct SrtWalkerContext {
     bool (*clean_load)(u64 address, u32 size, u64* out); // offset 8
 };
 const SrtWalkerContext* GetSrtWalkerContext();
+/// sotc: for draw preparation helpers: the same clean page bitmap, with loads from those pages
+/// served from the backing view (no readback, no shared cache; the command processor validates
+/// whatever a helper read).
+const SrtWalkerContext* GetSrtHelperWalkerContext();
 void SetSrtCleanLoad(bool (*clean_load)(u64, u32, u64*));
 void MarkSrtCleanPages(u64 address, u32 size);
 /// sotc: keeps clean_pages equal to the pages currently read-protected (page manager), so

@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+
 #include "common/interval_set.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -41,9 +43,12 @@ public:
 
     void InlineData(VideoCore::Buffer* dst, u64 offset, u32 value);
 
+    /// Moves `aspects` (all when empty) of `image` to `dst_layout` for the access; true if that
+    /// needs a barrier (queued until FlushBarriers).
     bool Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                  vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
-                 std::optional<VideoCore::SubresourceRange> subres_range = {});
+                 std::optional<VideoCore::SubresourceRange> subres_range = {},
+                 vk::ImageAspectFlags aspects = {});
 
     void UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                      std::span<const vk::BufferImageCopy> upload_copies);
@@ -91,7 +96,25 @@ private:
         AccessList write_ranges;
     };
     BufferBarriers* resource{};
+    /// sotc: the buffers accessed since the last FlushBarriers are resources[0, num_resources).
+    /// The records after them keep their lists' storage for the next ones: a flush comes every
+    /// few draws, and freeing the lists there made every window allocate and regrow them.
     std::vector<BufferBarriers> resources;
+    size_t num_resources{};
+    /// sotc: ranges recorded since the last FlushBarriers (window), by buffer and range. A draw
+    /// records the ranges of all its buffers after it, mostly ones the draws before it recorded
+    /// in the same window (the same vertex and constant data): those are covered already.
+    struct RecordedAccess {
+        const VideoCore::Buffer* handle{};
+        u64 start{};
+        u64 end{};
+        u64 window{};
+        bool read{};
+        bool write{};
+    };
+    static constexpr size_t NumRecordedAccesses = 256;
+    std::array<RecordedAccess, NumRecordedAccesses> recorded_accesses{};
+    u64 access_window{1};
     VideoCore::Image::Barriers image_barriers;
     vk::MemoryBarrier2 memory_barrier{};
 };

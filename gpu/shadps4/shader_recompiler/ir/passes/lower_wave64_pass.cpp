@@ -198,8 +198,8 @@ void SetWave64UniformBranchesDefault(bool enabled) {
 }
 
 bool Wave64UniformBranchesEnabled() {
-    // SotC only; SOTC_WAVE64_UNIFORM=0/1 overrides. The renderer turns the default off away from
-    // NVIDIA: on AMD (32-wide path) it left the characters black in the shade (issue #7).
+    // SotC only; SOTC_WAVE64_UNIFORM=0/1 overrides; the renderer sets the default
+    // (PipelineCache).
     static const int forced = [] {
         const char* v = std::getenv("SOTC_WAVE64_UNIFORM");
         return v ? (std::atoi(v) != 0 ? 1 : 0) : -1;

@@ -8,6 +8,7 @@
 #include "common/types.h"
 
 #include <functional>
+#include <atomic>
 #include <thread>
 #include <vector>
 
@@ -18,6 +19,7 @@ enum class BlobType : u32 {
     ShaderBinary,
     PipelineKey,
     ShaderProfile,
+    DriverBinary,
 };
 
 class DataBase {
@@ -28,6 +30,8 @@ public:
 
     void Open();
     void Close();
+    // Preserve incompatible blobs in a sibling directory and reopen a writable store.
+    bool Reset();
     [[nodiscard]] bool IsOpened() const {
         return opened;
     }
@@ -44,7 +48,7 @@ public:
 private:
     std::jthread io_worker{};
     std::filesystem::path cache_path{};
-    bool opened{};
+    std::atomic<bool> opened{};
 };
 
 } // namespace Storage

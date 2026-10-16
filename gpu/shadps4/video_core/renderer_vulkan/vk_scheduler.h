@@ -29,6 +29,10 @@ class CommandRecorder;
 struct RenderAttachment {
     vk::ImageView image_view;
     vk::ImageLayout image_layout;
+    /// sotc: the stencil aspect's layout (depth/stencil attachment; depth and stencil have their
+    /// own layouts, see VideoCore::Image::SplitAspects). Undefined for color attachments.
+    vk::ImageLayout stencil_layout;
+    u32 reserved; ///< keeps the struct free of padding (compared with memcmp)
     std::array<u32, 4> clear_value;
     union {
         u32 is_clear;
@@ -392,6 +396,9 @@ public:
     /// Submits the command buffer from BeginAhead after all submitted work and waits for it.
     void SubmitAheadAndWait();
 
+    /// sotc: SOTC_GPU_TIME=1 times this scheduler's command buffers (the command processor's).
+    void EnableGpuTime();
+
     /// Attempts to execute operations whose tick the GPU has caught up with.
     void PopPendingOperations();
 
@@ -498,6 +505,19 @@ private:
         vk::CommandBuffer primary{};
     };
     std::vector<Session> sessions;
+    /// sotc (SOTC_GPU_TIME=1): a timestamp at the start and end of every submitted command
+    /// buffer, read once its tick completes (GPU busy and idle time per frame).
+    vk::UniqueQueryPool gpu_time_pool;
+    static constexpr u32 GpuTimeQueries = 4096;
+    u32 gpu_time_next{};
+    u32 gpu_time_slot{~0u};
+    std::queue<std::pair<u64, u32>> gpu_time_pending;
+    u64 gpu_time_last_end{};
+    double gpu_time_period{};
+    bool gpu_time_on{};
+    void GpuTimeBegin(vk::CommandBuffer cmdbuf);
+    void GpuTimeEnd(vk::CommandBuffer cmdbuf, u64 tick);
+    void GpuTimeCollect();
     std::condition_variable_any event_cv;
     struct PendingOp {
         Common::UniqueFunction<void> callback;

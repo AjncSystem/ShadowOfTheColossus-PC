@@ -33,7 +33,10 @@ Este pacote **não contém o jogo nem firmware da Sony**. Você precisa ter os s
 
 A tela **Jogar** confere tudo antes: a versão do jogo, os módulos de som, os saves e a placa de vídeo.
 Na primeira vez a imagem do jogo é preparada, o que leva alguns segundos. Isso só se repete
-quando o jogo ou os módulos mudam. Os saves e o cache de shaders ficam em `user/`.
+quando o jogo ou os módulos mudam. Saves ficam em `user/`. Nesta cópia local,
+o cache padrão no Windows fica em `%LOCALAPPDATA%/ShadowOfTheColossus-PC/cache`,
+compartilhado entre instalações. `SOTC_PORTABLE_CACHE=1` usa `user/cache`;
+`SOTC_CACHE_DIR` seleciona outro destino.
 
 Sem o lançador, `SotC.bat` faz o mesmo lendo `sotc.ini`. `SotC.exe --play` abre o jogo direto
 com as últimas opções do lançador, o que serve para atalhos e para o Steam.
@@ -134,6 +137,9 @@ Estas variáveis de ambiente ajudam a investigar problemas:
 | `BB_STACKS_TRIGGER=arquivo` | criar o arquivo despeja as pilhas das threads |
 | `BB_READBACKS=0/1/2` | leituras da GPU; o padrão 2 é o exigido pelo jogo |
 | `SOTC_RECORD_THREAD=0` | grava os comandos Vulkan na própria thread de comandos (padrão: thread própria) |
+| `SOTC_PRESENT_THREAD=0` | apresentação síncrona para diagnóstico; padrão: worker separado do vblank |
+| `SOTC_FRAMES_AHEAD=0` | desliga a espera de avanço da GPU; padrão 1, máximo 3 |
+| `BB_FPS_LIMIT=30/40/60` | limite de quadros no host; padrão 30, ou 60 com o modo experimental de 60 FPS; 0 desliga o limite |
 | `SOTC_INDIRECT_DIRECT=0` | mantém indiretos os draws cujos argumentos estão na CPU |
 | `SOTC_WAIT_MARKER=1/2` | esperas pela GPU consultam um marcador escrito por ela (experimental) |
 | `SOTC_CMD_STATS=1/2` | draws e dispatches por quadro (2: shaders de compute mais usados) |

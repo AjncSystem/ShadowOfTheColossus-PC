@@ -19,6 +19,18 @@ using LockType = Common::AdaptiveMutex;
 using LockType = std::mutex;
 #endif
 
+/// sotc: bumped whenever pages become CPU-modified (or a region is created, all CPU-modified).
+/// The bits are set before the bump and the faulting guest store runs after both, so an unchanged
+/// value means no CPU data reached tracked memory unseen since it was read.
+inline std::atomic<u64> g_cpu_dirty_generation{1};
+
+/// sotc: pages left both CPU-modified and GPU-modified by a state change (diagnostic): no page
+/// protection keeps both right (Windows has no write-only pages, and a CPU write there would be
+/// overwritten when the GPU data is read back). Counted; the first ones are reported with the
+/// call stack that made them (buffer_cache.cpp).
+inline std::atomic<u64> g_both_modified_pages{0};
+void ReportBothModified(VAddr page_addr, u64 pages);
+
 /**
  * Allows tracking CPU and GPU modification of pages in a contigious virtual address region.
  * Information is stored in bitsets for spacial locality and fast update of single pages.
@@ -30,6 +42,7 @@ public:
           readbacks_mode{EmulatorSettings.GetReadbacksMode()} {
         cpu.Fill(~0ULL);
         gpu.Fill(0ULL);
+        hot.Fill(0ULL);
     }
     explicit RegionManager() = default;
 
@@ -92,6 +105,9 @@ public:
         IterateWords(bounds, [&](u64 index, u64 mask) {
             UpdateStateAndProtection<cpu_op, gpu_op>(write_prot, read_prot, index, mask);
         });
+        if constexpr (cpu_op == StateOp::Set) {
+            g_cpu_dirty_generation.fetch_add(1, std::memory_order_release);
+        }
         const auto write_op = GetPageOp<Type::CPU>(cpu_op);
         const auto read_op = GetPageOp<Type::GPU>(gpu_op);
         const bool update_watchers = write_op != PageOp::None || read_op != PageOp::None;
@@ -105,7 +121,26 @@ public:
         }
     }
 
-    template <Type type, StateOp cpu_op, StateOp gpu_op, bool locked = true>
+    /// sotc (SOTC_DMA_HOT): pages kept CPU-modified and writable. Marks them hot and
+    /// CPU-modified (which unprotects them for this tracker).
+    void SetHot(u64 offset, u64 size) {
+        mutex.lock();
+        IterateWords(GetBounds(offset, size), [&](u64 index, u64 mask) { hot[index] |= mask; });
+        ChangeRegionState<StateOp::Set, StateOp::None, false>(offset, size);
+        mutex.unlock();
+    }
+
+    /// Ends hot tracking: the pages stay CPU-modified, the next upload protects them again.
+    void ClearHot(u64 offset, u64 size) {
+        mutex.lock();
+        IterateWords(GetBounds(offset, size), [&](u64 index, u64 mask) { hot[index] &= ~mask; });
+        mutex.unlock();
+    }
+
+    /// keep_hot: a CPU Clear leaves hot pages CPU-modified and writable (they are uploaded every
+    /// time instead of protected and faulted again). Any other CPU Clear ends their hot state.
+    template <Type type, StateOp cpu_op, StateOp gpu_op, bool locked = true,
+              bool keep_hot = false>
     void ForEachModifiedRange(u64 offset, s64 size, auto&& func) {
         auto& state = GetRegionBits<type>();
         // sotc: every draw synchronizes its buffers here, and the region mutex is contended by
@@ -139,7 +174,7 @@ public:
         IterateWords(bounds, [&](u64 index, u64 mask) {
             const u64 base_page = index * PAGES_PER_WORD;
             const u64 word = state[index] & mask;
-            UpdateStateAndProtection<cpu_op, gpu_op>(write_prot, read_prot, index, mask);
+            UpdateStateAndProtection<cpu_op, gpu_op, keep_hot>(write_prot, read_prot, index, mask);
             IteratePages(word, [&](u64 pages_offset, u64 pages_size) {
                 if (end_page == base_page + pages_offset) {
                     end_page += pages_size;
@@ -198,13 +233,18 @@ public:
     }
 
 private:
-    template <StateOp cpu_op, StateOp gpu_op>
+    template <StateOp cpu_op, StateOp gpu_op, bool keep_hot = false>
     void UpdateStateAndProtection(RegionBits& write_prot, RegionBits& read_prot, u64 index,
                                   u64 mask) {
         if constexpr (cpu_op != StateOp::None) {
             const u64 prev = cpu[index];
             if constexpr (cpu_op == StateOp::Clear) {
-                cpu[index] &= ~mask;
+                if constexpr (keep_hot) {
+                    cpu[index] &= ~(mask & ~hot[index]);
+                } else {
+                    hot[index] &= ~mask;
+                    cpu[index] &= ~mask;
+                }
             } else {
                 cpu[index] |= mask;
             }
@@ -218,6 +258,11 @@ private:
                 gpu[index] |= mask;
             }
             read_prot[index] = (gpu[index] ^ prev) & mask;
+        }
+        if (const u64 both = cpu[index] & gpu[index] & mask) [[unlikely]] {
+            ReportBothModified(cpu_addr + (index * PAGES_PER_WORD + std::countr_zero(both)) *
+                                              BYTES_PER_PAGE,
+                               std::popcount(both));
         }
     }
 
@@ -290,6 +335,7 @@ private:
     u32 readbacks_mode;
     RegionBits cpu;
     RegionBits gpu;
+    RegionBits hot;
     LockType mutex;
 };
 

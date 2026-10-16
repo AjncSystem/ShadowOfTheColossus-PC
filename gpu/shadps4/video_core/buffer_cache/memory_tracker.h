@@ -101,10 +101,16 @@ public:
     }
 
     /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
-    void ForEachUploadRange(VAddr cpu_addr, u64 size, bool is_written, auto&& func) {
+    void ForEachUploadRange(VAddr cpu_addr, u64 size, bool is_written, auto&& func,
+                            bool keep_hot = false) {
         IteratePages<true>(
-            cpu_addr, size, [&func, is_written](RegionManager* manager, u64 offset, u64 size) {
-                if (is_written) {
+            cpu_addr, size,
+            [&func, is_written, keep_hot](RegionManager* manager, u64 offset, u64 size) {
+                if (keep_hot && !is_written) {
+                    manager->template ForEachModifiedRange<Type::CPU, StateOp::Clear,
+                                                           StateOp::None, true, true>(offset, size,
+                                                                                      func);
+                } else if (is_written) {
                     manager->template ForEachModifiedRange<Type::CPU, StateOp::Clear, StateOp::Set>(
                         offset, size, func);
                 } else {
@@ -113,6 +119,18 @@ public:
                             offset, size, func);
                 }
             });
+    }
+
+    /// sotc (SOTC_DMA_HOT): see RegionManager::SetHot / ClearHot.
+    void SetHot(VAddr cpu_addr, u64 size) {
+        IteratePages<true>(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            manager->SetHot(offset, size);
+        });
+    }
+    void ClearHot(VAddr cpu_addr, u64 size) {
+        IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            manager->ClearHot(offset, size);
+        });
     }
 
     /// Call 'func' for each GPU modified range and unmark those pages as GPU modified
@@ -172,6 +190,7 @@ private:
         }
         auto* new_manager = free_managers.back();
         new_manager->SetCpuAddress(base_cpu_addr);
+        g_cpu_dirty_generation.fetch_add(1, std::memory_order_release);
         free_managers.pop_back();
         top_tier[page_index] = new_manager;
         return new_manager;

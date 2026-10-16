@@ -15,8 +15,11 @@
 #include "sdl_window.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
+#include "video_core/sotc_frame_stats.h"
+#include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/texture_cache/image.h"
 #include "bbport_overlay.h"
@@ -472,6 +475,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
       swapchain{instance, window}, runtime{instance, draw_scheduler},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
+    draw_scheduler.EnableGpuTime();
     const u32 num_images = swapchain.GetImageCount();
     const vk::Device device = instance.GetDevice();
 
@@ -774,6 +778,18 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     frame->ready_tick = draw_scheduler.CurrentTick();
     SubmitInfo info{};
     draw_scheduler.Flush(info);
+    static const u32 frames_ahead = [] {
+        const char* value = std::getenv("SOTC_FRAMES_AHEAD");
+        return value ? u32(std::clamp(std::atoi(value), 0, 3)) : 1u;
+    }();
+    if (frames_ahead) {
+        recent_frame_ticks.push_back(frame->ready_tick);
+        while (recent_frame_ticks.size() > frames_ahead) {
+            const auto tick = recent_frame_ticks.front();
+            recent_frame_ticks.pop_front();
+            if (recent_frame_ticks.size() == frames_ahead) draw_scheduler.Wait(tick);
+        }
+    }
     return frame;
 }
 
@@ -1118,16 +1134,23 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     scheduler.Flush(info);
 
     // Present to swapchain.
+    bool present_success{};
+    const auto present_start = SotcFrameStats::Enabled() ? SotcFrameStats::Now() : 0;
     {
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        if (!swapchain.Present()) {
+        present_success = swapchain.Present();
+        if (!present_success) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
     }
 
     free_frame();
+    if (present_success && !is_reusing_frame && is_game_frame) {
+        SotcFrameStats::Presented(present_start ? SotcFrameStats::Now() - present_start : 0);
+    }
     if (!is_reusing_frame && is_game_frame) {
         DebugState.IncFlipFrameNum();
+        SotcStats::flips.fetch_add(1, std::memory_order_relaxed);
         // SOTC_FRAME_LOG=<n> prints the frame count and time to stderr every n frames, for
         // measuring the frame rate of scripted runs.
         static const u64 every = [] {
@@ -1138,13 +1161,47 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             static u64 frames = 0;
             static const auto t0 = std::chrono::steady_clock::now();
             if (++frames % every == 0) {
-                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                                     std::chrono::steady_clock::now() - t0)
                                     .count();
-                std::fprintf(stderr, "SOTCFRAME %llu t=%lldms\n",
+                // us: the same time in microseconds, for frame time percentiles.
+                std::fprintf(stderr, "SOTCFRAME %llu t=%lldms us=%lld\n",
                              static_cast<unsigned long long>(frames),
-                             static_cast<long long>(ms));
+                             static_cast<long long>(us / 1000), static_cast<long long>(us));
                 std::fflush(stderr);
+            }
+            // SOTC_STALL_MS (default 70): for slower frames, what happened since the last one.
+            static const long long stall_us = [] {
+                const char* v = std::getenv("SOTC_STALL_MS");
+                return (v ? std::atoll(v) : 70LL) * 1000;
+            }();
+            static long long last_us = -1;
+            static u64 last[11]{};
+            const long long now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                         std::chrono::steady_clock::now() - t0)
+                                         .count();
+            const u64 cur[11] = {SotcStats::pipelines_new.load(), SotcStats::pipeline_ns.load(),
+                                SotcStats::shaders_compiled.load(), SotcStats::shader_ns.load(),
+                                SotcStats::images_new.load(), SotcStats::image_ns.load(),
+                                SotcStats::readbacks.load(), SotcStats::readback_ns.load(),
+                                SotcStats::image_query_ns.load(), SotcStats::image_alloc_ns.load(),
+                                SotcStats::image_dedicated.load()};
+            if (last_us >= 0 && now_us - last_us > stall_us) {
+                std::fprintf(stderr,
+                             "SOTCSTALL frame %llu %.0f ms: pipelines %llu (%.0f ms), shaders %llu "
+                             "(%.0f ms), images %llu (%.0f ms: query %.0f, alloc %.0f, %llu dedicated), "
+                             "readbacks %llu (%.0f ms)\n",
+                             static_cast<unsigned long long>(frames), (now_us - last_us) / 1e3,
+                             static_cast<unsigned long long>(cur[0] - last[0]), (cur[1] - last[1]) / 1e6,
+                             static_cast<unsigned long long>(cur[2] - last[2]), (cur[3] - last[3]) / 1e6,
+                             static_cast<unsigned long long>(cur[4] - last[4]), (cur[5] - last[5]) / 1e6,
+                             (cur[8] - last[8]) / 1e6, (cur[9] - last[9]) / 1e6,
+                             static_cast<unsigned long long>(cur[10] - last[10]),
+                             static_cast<unsigned long long>(cur[6] - last[6]), (cur[7] - last[7]) / 1e6);
+            }
+            last_us = now_us;
+            std::copy(std::begin(cur), std::end(cur), std::begin(last));
+            if (false) {
             }
         }
     }

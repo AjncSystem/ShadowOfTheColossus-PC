@@ -12,6 +12,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "video_core/sotc_stats.h"
 
 namespace AmdGpu {
 struct Liverpool;
@@ -117,8 +118,26 @@ public:
 #endif
 
 private:
+    /// sotc: async pipelines. A draw whose pipeline is still compiling may be skipped only when
+    /// nothing the CPU reads back depends on it (see MaySkipForCompile).
+    const GraphicsPipeline* GetDrawPipeline(DrawIndirectParams params = {});
+    bool MaySkipForCompile();
+    void MarkLodBanksOfCurrentStages();
+    void NoteTarget(VAddr address);
+    [[nodiscard]] bool TargetRecurring(VAddr address) const;
+    struct TargetSeen {
+        u64 first_flip;
+        u64 last_flip;
+    };
+    tsl::robin_map<VAddr, TargetSeen> target_history;
+    std::array<std::pair<VAddr, u64>, 64> target_recent{};
+    u64 target_prune_flip = ~0ULL;
+
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
+    RenderState DeriveRenderState(const GraphicsPipeline* pipeline);
+    const RenderState* ReusableRenderState(const GraphicsPipeline* pipeline);
+    void RememberRenderState(const GraphicsPipeline* pipeline, const RenderState& state);
     void Resolve();
     void DepthStencilCopy(bool is_depth, bool is_stencil);
     void EliminateFastClear();
@@ -171,6 +190,63 @@ private:
     using RenderTargetInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     std::array<RenderTargetInfo, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc> db_desc;
+    /// sotc: the registers cb_descs[i] / db_desc were last built from, and the image FindImage
+    /// gave for them (PrepareRenderState). SOTC_RT_MEMO=0 disables.
+    struct ColorTargetMemo {
+        bool valid{};
+        std::array<u8, sizeof(AmdGpu::ColorBuffer)> regs{};
+        u32 hint{};
+        u64 generation{};
+        VideoCore::ImageId image_id{};
+    };
+    struct DepthTargetMemo {
+        bool valid{};
+        std::array<u8, sizeof(AmdGpu::DepthBuffer)> buffer{};
+        std::array<u8, sizeof(AmdGpu::DepthView)> view{};
+        std::array<u8, sizeof(AmdGpu::DepthControl)> control{};
+        VAddr htile{};
+        u32 hint{};
+        u64 generation{};
+        VideoCore::ImageId image_id{};
+    };
+    std::array<ColorTargetMemo, AmdGpu::NUM_COLOR_BUFFERS> cb_memos{};
+    DepthTargetMemo db_memo{};
+    /// sotc: the fast clear state BeginRendering last found for each target slot
+    /// (TextureCache::TakeMetaCleared).
+    std::array<VideoCore::TextureCache::MetaClearMemo, AmdGpu::NUM_COLOR_BUFFERS> cb_meta_memos{};
+    VideoCore::TextureCache::MetaClearMemo db_meta_memo{};
+    /// sotc: every target of the current draw came from its memo in PrepareRenderState (the
+    /// descriptions are the ones built when the memos were filled).
+    bool targets_from_memo{};
+    /// sotc: the render state BeginRendering last derived in full without barriers, and what it
+    /// derived it from: the targets (images, backings and their state versions), the registers
+    /// besides the targets' own, and the texture cache state it read. Equal inputs give an equal
+    /// render state and no barriers (BeginRendering).
+    struct RenderStateMemo {
+        bool valid{};
+        RenderState state{};
+        u32 mrt_mask{};
+        std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> color_samples{};
+        std::array<VideoCore::ImageId, AmdGpu::NUM_COLOR_BUFFERS + 1> ids{};
+        std::array<const void*, AmdGpu::NUM_COLOR_BUFFERS + 1> backings{};
+        std::array<u32, AmdGpu::NUM_COLOR_BUFFERS + 1> versions{};
+        u64 image_set_generation{};
+        u64 meta_generation{};
+        u64 meta_clear_generation{};
+        std::array<u8, 64> depth_regs{};
+    };
+    RenderStateMemo render_state_memo{};
+    /// Barriers NoteBarrier recorded (BeginRendering tells its own from the others).
+    u32 noted_barriers{};
+    /// A target needed FindImage again in BeginRendering (its description may have changed).
+    bool targets_rebound{};
+    static bool RtMemo() {
+        static const bool enabled = [] {
+            const char* v = std::getenv("SOTC_RT_MEMO");
+            return !v || v[0] != '0';
+        }();
+        return enabled;
+    }
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
@@ -191,8 +267,109 @@ private:
 
     using ImageBindingInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
+    /// sotc: BindTextures' texture lookups (T#, the image resource bits that shape the
+    /// description, binding index) -> the description and image FindImage gave, valid while the
+    /// texture cache's image set generation is unchanged (BindTextures).
+    struct TexBindMemo {
+        std::array<u64, 4> sharp{};
+        u32 bits{~0U};
+        u64 generation{~0ULL};
+        VideoCore::ImageId image_id{};
+        VideoCore::TextureCache::ImageDesc desc{};
+    };
+    static constexpr size_t NumTexBindMemos = 512;
+    std::unique_ptr<std::array<TexBindMemo, NumTexBindMemos>> tex_bind_memos =
+        std::make_unique<std::array<TexBindMemo, NumTexBindMemos>>();
+
+    /// sotc: a stage's whole texture block (BindTextures): the resource bits of its images and
+    /// samplers and the T#/S# they read -> the descriptors written, the images bound and the
+    /// bindings taken. BindTextures' result is a function of that key, of the image set (its
+    /// generation) and of the state of each image it binds (backing and state version): the memo
+    /// is used only while all of those are the ones it was stored with (TryTextureBlock).
+    static constexpr u32 MaxBlockImages = 12;
+    static constexpr u32 MaxBlockSamplers = 12;
+    static constexpr u32 MaxBlockInfos = 24;
+    static constexpr u32 MaxBlockKeyWords = 2 + MaxBlockImages * 5 + MaxBlockSamplers * 3;
+    struct TexBlockKey {
+        u32 words{};
+        u64 hash{};
+        std::array<u64, MaxBlockKeyWords> key;
+    };
+    struct TexBlockMemo {
+        u32 key_words{};
+        u64 generation{~0ULL};
+        std::array<u64, MaxBlockKeyWords> key{};
+        u32 num_infos{};
+        u32 num_writes{};
+        u32 num_images{};
+        u32 num_samplers{};
+        u32 num_lod_banks{};
+        u32 unified{};
+        std::array<vk::DescriptorImageInfo, MaxBlockInfos> infos{};
+        struct Write {
+            u16 binding;
+            u16 count;
+            u16 info;
+            vk::DescriptorType type;
+        };
+        std::array<Write, MaxBlockImages + MaxBlockSamplers> writes{};
+        /// found: the image FindImage gave, with the depth image it was linked to then; id: the
+        /// image bound (that depth image, if any), its backing and the backing's state version
+        /// once the whole block was bound.
+        struct Bound {
+            VideoCore::ImageId found;
+            VideoCore::ImageId id;
+            VideoCore::ImageId depth_id;
+            u64 depth_uid;
+            const void* backing;
+            u32 version;
+        };
+        std::array<Bound, MaxBlockInfos> images{};
+        std::array<AmdGpu::Sampler, MaxBlockSamplers> samplers{};
+        std::array<u8, MaxBlockSamplers> sampler_depth{};
+        std::array<u8, MaxBlockSamplers> sampler_info{};
+        std::array<u8, MaxBlockImages> lod_banks{};
+    };
+    static constexpr size_t NumTexBlockMemos = 512;
+    std::unique_ptr<std::array<TexBlockMemo, NumTexBlockMemos>> tex_block_memos =
+        std::make_unique<std::array<TexBlockMemo, NumTexBlockMemos>>();
+    static int TexBlockMode();
+    bool MakeTextureBlockKey(const Shader::Info& stage, TexBlockKey& key) const;
+    bool TryTextureBlock(const Shader::Info& stage, const TexBlockKey& key,
+                         Shader::Backend::Bindings& binding);
+    void BindTexturesSlow(const Shader::Info& stage, Shader::Backend::Bindings& binding,
+                          const TexBlockKey* key);
     bool attachment_feedback_loop{};
     bool needs_barrier{};
+    /// sotc: why needs_barrier was set for the current draw/dispatch (SotcStats::barrier_breaks
+    /// counts them when the barrier closes a render pass).
+    enum BarrierReason : u32 {
+        BarrierIndirectArgs = 1u << 0,
+        BarrierVertex = 1u << 1,
+        BarrierIndex = 1u << 2,
+        BarrierGds = 1u << 3,
+        BarrierBufferRead = 1u << 4,
+        BarrierBufferWrite = 1u << 5,
+        BarrierTexture = 1u << 6,
+        BarrierColorTarget = 1u << 7,
+        BarrierDepthTarget = 1u << 8,
+    };
+    u32 barrier_reasons{};
+    void NoteBarrier(u32 reason, bool needed) {
+        needs_barrier |= needed;
+        barrier_reasons |= needed ? reason : 0u;
+        noted_barriers += needed;
+    }
+    void CountBarrierBreak() {
+        if (!scheduler.IsRendering()) {
+            return;
+        }
+        for (u32 i = 0; i < 9; ++i) {
+            if (barrier_reasons & (1u << i)) {
+                SotcStats::barrier_breaks[i].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
 };
 
 } // namespace Vulkan

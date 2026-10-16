@@ -14,6 +14,9 @@
 #include <queue>
 
 #include "common/assert.h"
+#include "video_core/amdgpu/sotc_draw_scan.h"
+#include "video_core/amdgpu/sotc_sel_regs.h"
+#include "video_core/sotc_stats.h"
 #include "common/slot_vector.h"
 #include "common/types.h"
 #include "common/unique_function.h"
@@ -62,6 +65,25 @@ struct Liverpool {
     Regs regs{};
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
     CbDbExtent last_db_extent{};
+    /// sotc: bumped by every register write graphics pipeline selection may read (all writes
+    /// except the words in SotcSel::IgnoredWords). Unchanged since a selection means the same
+    /// registers reached it (thread-plan 1D).
+    u64 sel_regs_seq = 1;
+    /// sotc: IndirectBuffer nesting of the graphics task being processed (DrawScan stats).
+    u32 gfx_ib_depth = 0;
+    /// sotc: register history of the graphics queue (HashStatePacket over every packet the
+    /// command processor applies) and the scanner that predicts it (SOTC_DRAW_SCAN).
+    u64 gfx_reg_hash = 0;
+    std::unique_ptr<DrawScan> draw_scan;
+    /// sotc: the DrawPreparer record of the draw being processed (null when the scanner's
+    /// register history differs or nothing was prepared). Taken by the pipeline cache.
+    const void* prepared_draw = nullptr;
+    void NoteRegWrite(u32 word, u32 count) {
+        SotcStats::reg_words.fetch_add(count, std::memory_order_relaxed);
+        if (SotcSel::Relevant(word, count)) {
+            ++sel_regs_seq;
+        }
+    }
 
 public:
     explicit Liverpool();
@@ -185,7 +207,8 @@ private:
 
     using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
-    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb);
+    /// seq: the DrawScan number of a top-level command buffer (~0 for nested ones).
+    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, u64 seq = ~0ULL);
     Task ProcessCeUpdate(std::span<const u32> ccb);
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);

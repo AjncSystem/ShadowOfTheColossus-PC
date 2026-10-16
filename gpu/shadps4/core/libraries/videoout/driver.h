@@ -5,9 +5,11 @@
 
 #include "common/debug.h"
 #include "common/polyfill_thread.h"
+#include "common/ordered_work_queue.h"
 #include "core/libraries/videoout/video_out.h"
 
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <queue>
 
@@ -110,11 +112,14 @@ private:
     void DrawLastFrame();  // Used when there is no flip request
     void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
     void PresentThread(std::stop_token token);
+    void RunPresenter(std::function<void()> work, bool only_if_idle = false);
 
     std::mutex mutex;
+    std::condition_variable request_cv;
     VideoOutPort main_port{};
-    std::jthread present_thread;
     std::queue<Request> requests;
+    std::unique_ptr<Common::OrderedWorkQueue> swap_queue;
+    std::jthread present_thread;
 };
 
 } // namespace Libraries::VideoOut

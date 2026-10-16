@@ -3,11 +3,17 @@
 
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <deque>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <span>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <boost/container/small_vector.hpp>
 
 #include "common/interval_set.h"
@@ -82,6 +88,10 @@ public:
     /// Invalidates any buffer in the logical page range.
     void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false);
 
+    /// sotc: like TryReplaceFromCpu, but fill() writes the new contents straight into the
+    /// backing view (contiguous ranges only; false otherwise, nothing written).
+    bool TryReplaceFromCpuInPlace(VAddr addr, u64 size, const std::function<void(u8*)>& fill);
+
     /// sotc: forgets that the GPU wrote this range, without downloading it (unmap test).
     void DropGpuModified(VAddr device_addr, u64 size);
 
@@ -130,6 +140,23 @@ public:
 
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
+    /// sotc: generations at the last full SynchronizeDmaBuffers (SOTC_DMA_SYNC_MEMO).
+    u64 dma_synced_cpu_generation{};
+    u64 dma_synced_resident_generation{~u64{0}};
+    u64 resident_generation{};
+    /// sotc (SOTC_DMA_HOT): pages the direct-memory pass uploaded in consecutive frames are kept
+    /// CPU-modified and writable instead of protected again (no write fault, no VirtualProtect).
+    struct DmaStreak {
+        VAddr page = ~VAddr{0};
+        u64 frame{};
+        u32 streak{};
+        bool hot{};
+    };
+    std::vector<DmaStreak> dma_streaks;
+    std::vector<VAddr> dma_hot_list;
+    size_t dma_hot_cursor{};
+    u64 dma_hot_frame{~u64{0}};
+    void UpdateDmaHotPages(std::span<const std::pair<VAddr, u64>> uploaded);
 
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
@@ -156,6 +183,8 @@ private:
     void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
 
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
+    /// Guest reads fault on GPU-modified memory; the readback copies this window around them.
+    static constexpr u64 ReadbackWindow = 512ULL * 1024;
 
     /// One range to read back: its GPU-modified parts, as copies from the arena.
     struct ReadbackItem {
@@ -170,13 +199,13 @@ private:
     /// it out of the GPU-modified set. Returns the bytes to download.
     u64 GatherDownloads(const Buffer* arena, VAddr device_addr, u64 size,
                         boost::container::small_vector<ReadbackItem, 16>& pending,
-                        bool subtract = true);
+                        bool subtract = true, bool hot_extras = true);
     /// Writes downloaded data (mapped, at the copies' destination offsets minus mapped_offset)
     /// into guest memory and unmarks the ranges as GPU-modified.
     void ApplyDownloads(std::span<const ReadbackItem> pending, const u8* mapped,
                         u64 mapped_offset);
 
-    /// sotc (SOTC_RB_ASYNC=1): a readback asked by a guest thread in two steps on the command
+    /// sotc (default, SOTC_RB_ASYNC=0 turns it off): a readback asked by a guest thread in two steps on the command
     /// processor: the copies are recorded and submitted without waiting (the command processor
     /// goes on with its queue), the guest thread waits for the GPU, then the data is applied
     /// unless a later GPU write hit the ranges meanwhile (then it is read back again).
@@ -201,8 +230,48 @@ private:
     void BeginAsyncReadback(AsyncReadback& readback);
     void FinishAsyncReadback(AsyncReadback& readback);
     AsyncReadback* FindInflightReadback(VAddr addr, u64 size);
+    /// sotc: an asynchronous readback in flight one of whose windows holds [addr, addr + size).
+    AsyncReadback* FindInflightWindow(VAddr addr, u64 size);
+    /// sotc: ends a guest write fault served asynchronously: GPU data written there since the
+    /// readback's copy is read back first, then the bytes become CPU-modified.
+    void GiveToGuestWrite(VAddr device_addr, u64 size);
     void MarkInflightReadbacksDirty(VAddr addr, u64 size);
     std::vector<AsyncReadback*> inflight_readbacks;
+
+    /// sotc (SOTC_RB_EAGER): a read-back window copied to staging right behind the GPU work
+    /// that wrote it, in the same submission. Its readback then only waits for that submission
+    /// instead of for everything submitted until the guest asks (the ahead and finish paths).
+    struct EagerReadback {
+        const Buffer* arena{};
+        VAddr window{};
+        u64 size{};
+        u64 tick{};
+        bool dirty{};
+        std::chrono::steady_clock::time_point recorded_at{};
+        u64 download_offset{};
+        u8* download_mapped{};
+        Buffer* download_buffer{};
+        u64 download_size{};
+        boost::container::small_vector<ReadbackItem, 16> pending;
+    };
+    static constexpr size_t MaxEagerReadbacks = 8;
+    std::vector<EagerReadback> eager_readbacks;
+    /// Hot windows written by the command buffer being built (tick hot_written_tick).
+    boost::container::small_vector<std::pair<VAddr, u64>, 8> hot_written_windows;
+    u64 hot_written_tick{};
+    void DropEagerReadback(size_t index, bool unused);
+    /// Serves the readback of [window, +size) from its eager copy; false: use the usual path.
+    bool TryEagerReadback(VAddr window, u64 size);
+    void NoteHotWindowWrite(VAddr addr, u64 size);
+
+public:
+    /// 0 off, 1 on, 2 on and every hit compared with a fresh readback.
+    static int EagerMode();
+    /// Records the copies of the hot windows written by the command buffer being built; the
+    /// caller submits it next.
+    void RecordEagerReadbacks();
+
+private:
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
@@ -242,6 +311,32 @@ private:
         }
     };
     IntervalList<Backing> resident_ranges;
+    /// Block ranges already proven resident (first block, last block), by hash of the first.
+    struct ResidentMemo {
+        u64 first = ~0ULL;
+        u64 last = 0;
+    };
+    std::array<ResidentMemo, 1024> resident_memo{};
+    /// sotc: texel buffer ranges SynchronizeMemoryFromImage found with no metadata surface and no
+    /// image starting at them, and the image and metadata sets then (TextureCache generations).
+    /// Heavy frames read ~20K texel buffer ranges, none aliasing an image: two lookups each.
+    struct TexelSyncMemo {
+        VAddr address{};
+        u32 size{};
+        u64 image_set_generation{~0ULL};
+        u64 meta_generation{};
+        u64 meta_clear_generation{};
+    };
+    std::array<TexelSyncMemo, 512> texel_sync_memo{};
+    std::unordered_set<VAddr> texel_alias_targets;
+
+public:
+    /// An image at this address was copied into buffer memory (texel-buffer alias).
+    [[nodiscard]] bool IsTexelAliasTarget(VAddr address) const {
+        return texel_alias_targets.contains(address);
+    }
+
+private:
     /// Readback windows requested recently; downloaded together with the next readback.
     struct HotReadback {
         VAddr addr;
@@ -258,6 +353,31 @@ private:
     size_t hot_reads_next{};
     bool hot_write_pending{};
     void NoteHotRead(VAddr addr, u64 size);
+    /// sotc (SOTC_RB_TRACE): the last GPU writes into each read-back window, to measure how far
+    /// the writer is from the request that reads it.
+    struct HotWriter {
+        VAddr window = ~VAddr{0};
+        u64 first_tick{};
+        u64 last_tick{};
+        u64 cmd_seq{};
+        u64 program{};
+        std::chrono::steady_clock::time_point time{};
+        bool in_render{};
+    };
+    std::array<HotWriter, 8> hot_writers{};
+    size_t hot_writers_next{};
+    void NoteHotWriter(VAddr addr, u64 size);
+    HotWriter* FindHotWriter(VAddr window);
+    void TraceReadback(VAddr window, bool finish, bool main_written, bool any_written, u64 bytes);
+    /// sotc (SOTC_RB_DEDUP): guest threads faulting on a window another thread is already
+    /// reading back wait for that readback instead of queueing their own.
+    struct GuestReadSlot {
+        VAddr window = ~VAddr{0};
+        std::atomic<u32> done{0};
+    };
+    static constexpr size_t NumGuestReadSlots = 16;
+    std::array<GuestReadSlot, NumGuestReadSlots> guest_read_slots{};
+    std::mutex guest_read_mutex;
     struct CleanPage {
         VAddr page_addr = ~0ULL;
         u64 map_generation{};
@@ -277,16 +397,36 @@ private:
     RangeSet current_writes;
     u64 current_writes_tick{};
     void RecordCurrentWrite(VAddr addr, u64 size);
+    /// sotc: the range the guest touched, during the DownloadMemory of its window (size 0 else).
+    VAddr fault_addr{};
+    u64 fault_size{};
 
 public:
     /// sotc: true once after the command buffer being built wrote a page the guest reads back:
     /// submitting it now lets the GPU finish it before the guest asks for it.
     bool TakeHotWrite() noexcept;
+    /// sotc: whether TakeHotWrite would return true, without consuming it.
+    [[nodiscard]] bool HotWritePending() const noexcept {
+        return hot_write_pending;
+    }
 
 private:
 
-    /// Number of resident blocks still bound to each backing allocation.
-    std::unordered_map<VkDeviceMemory, u64> backing_blocks;
+    /// sotc: arena memory is carved out of chunks of ARENA_CHUNK_SIZE. One allocation per
+    /// resident range reached thousands within minutes, each one a kernel call mid-frame (the
+    /// open world then ran out of video memory).
+    static constexpr u64 ARENA_CHUNK_SIZE = 64_MB;
+    struct ArenaChunk {
+        vk::DeviceMemory memory;
+        u32 memory_type{};
+        u64 used_blocks{};
+        std::map<u64, u64> free_runs; ///< first block -> number of free blocks
+    };
+    std::vector<std::unique_ptr<ArenaChunk>> arena_chunks;
+    std::unordered_map<VkDeviceMemory, ArenaChunk*> chunk_by_memory;
+    /// Memory and first block for blocks of arena backing (video memory, else system memory).
+    std::pair<vk::DeviceMemory, u64> AllocateArenaBlocks(u64 blocks);
+    void FreeArenaBlocks(vk::DeviceMemory memory, u64 start, u64 blocks);
 
     u32 arena_memory_type_index{};
     std::optional<u32> arena_fallback_memory_type_index;

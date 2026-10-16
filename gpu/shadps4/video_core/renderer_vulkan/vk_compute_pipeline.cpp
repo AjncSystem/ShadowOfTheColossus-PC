@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <boost/container/small_vector.hpp>
 
 #include "shader_recompiler/info.h"
@@ -14,7 +15,8 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
                                  DescriptorHeap& desc_heap, const Shader::Profile& profile,
                                  vk::PipelineCache pipeline_cache, ComputePipelineKey compute_key_,
                                  const Shader::Info& info_, vk::ShaderModule module,
-                                 SerializationSupport& sdata, bool preloading /*=false*/)
+                                 SerializationSupport& sdata, bool preloading /*=false*/,
+                                 bool fast_compile /*=false*/)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache, true},
       compute_key{compute_key_} {
     auto& info = stages[int(Shader::SwStage::Compute)];
@@ -106,7 +108,17 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     pipeline_layout = std::move(layout);
     SetObjectName(device, *pipeline_layout, "Compute PipelineLayout {}", debug_str);
 
+    // sotc: fast_compile asks the driver for an unoptimized build (SOTC_COMPUTE_FAST=1, test;
+    // it did not shorten NVIDIA compute creations with a cold driver cache).
+    // SOTC_COMPUTE_NOOPT=1 keeps every pipeline created during play unoptimized (test).
+    static const bool no_opt = [] {
+        const char* v = std::getenv("SOTC_COMPUTE_NOOPT");
+        return v && *v == '1';
+    }();
     const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
+        .flags = fast_compile || (no_opt && !preloading)
+                     ? vk::PipelineCreateFlagBits::eDisableOptimization
+                     : vk::PipelineCreateFlags{},
         .stage = shader_ci,
         .layout = *pipeline_layout,
     };

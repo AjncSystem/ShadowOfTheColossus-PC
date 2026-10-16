@@ -1418,7 +1418,9 @@ void TextureCache::GarbageCollectSamplers() {
 // reachable mips would save), and the bytes of images used in the last NumFramesBeforeRemoval
 // ticks (the live working set). Recomputed from the live images, telemetry only.
 void TextureCache::Census() {
-    static const bool enabled = std::getenv("SOTC_FPS") != nullptr;
+    // sotc: SOTC_CENSUS=1 only. It walks every cached image under the texture cache lock, a
+    // 116 ms frame every 5 s on a Radeon RX 6650 XT in the shrine, which skewed SOTC_FPS runs.
+    static const bool enabled = std::getenv("SOTC_CENSUS") != nullptr;
     static std::chrono::steady_clock::time_point last{};
     const auto now = std::chrono::steady_clock::now();
     if (!enabled || now - last < std::chrono::seconds{5}) {

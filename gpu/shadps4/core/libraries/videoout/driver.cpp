@@ -331,12 +331,30 @@ void VideoOutDriver::Flip(const Request& req) {
                     }
                     return text;
                 };
+                const uint64_t compiles = SotcStats::frame_compiles.exchange(0);
+                // sotc: frames later than the window's usual pace (median + 10%), whatever the
+                // vblank rate: a missed 30 FPS frame shows at 50 ms at 60 Hz, 41.7 ms at 120 Hz.
+                const double late_ms = pct(0.5) * 1.1;
+                const auto late = std::count_if(frame_ms.begin(), frame_ms.end(),
+                                                [&](float ms) { return ms > late_ms; });
                 ReportPrintf(report,
                              "SOTC FRAMES p50 %.1f ms, p99 %.1f ms (1%% low %.1f FPS), worst %.1f ms "
-                             "[%s]; >50 ms: %u [%s]; compiled %llu\n",
+                             "[%s]; >50 ms: %u [%s]; compiled %llu; late %lld of %zu\n",
                              pct(0.5), pct(0.99), 1000.0 / pct(0.99), worst_ms,
                              columns(worst_ns).c_str(), slow_frames, columns(slow_ns).c_str(),
-                             static_cast<unsigned long long>(SotcStats::frame_compiles.exchange(0)));
+                             static_cast<unsigned long long>(compiles),
+                             static_cast<long long>(late), frame_ms.size());
+                // sotc: the overlay's copy of this window (bbport_overlay.cpp).
+                SotcStats::ov_compiles_window.store(static_cast<uint32_t>(compiles));
+                SotcStats::ov_compiles_total.fetch_add(compiles);
+                int cause = -1;
+                for (int c = 0; c < SotcStats::FrameCauses; ++c) {
+                    if (worst_ns[c] > 2000000 && (cause < 0 || worst_ns[c] > worst_ns[cause])) {
+                        cause = c;
+                    }
+                }
+                SotcStats::ov_worst_cause.store(cause);
+                SotcStats::ov_worst_cause_ms.store(cause < 0 ? 0.0f : float(worst_ns[cause] / 1e6));
                 std::string allocs;
                 for (int k = 0; k < SotcStats::AllocKinds; ++k) {
                     const uint64_t count = SotcStats::alloc_count[k].exchange(0);
@@ -377,13 +395,17 @@ void VideoOutDriver::Flip(const Request& req) {
             const uint64_t copies_changed = SotcStats::readback_copies_changed.exchange(0);
             const uint64_t bytes = SotcStats::readback_bytes.exchange(0);
             const uint64_t bytes_changed = SotcStats::readback_bytes_changed.exchange(0);
+            const double cmds_per_frame =
+                flips ? double(SotcStats::TakeDelta(SotcStats::commands, commands_seen)) / flips : 0.0;
+            SotcStats::ov_cmds_per_frame.store(float(cmds_per_frame));
+            SotcStats::ov_readbacks_per_s.store(float(readbacks / seconds));
+            SotcStats::ov_readback_ms_per_s.store(float(readback_ns / 1e6 / seconds));
             ReportPrintf(report,
                          "SOTC FPS %.1f at %.0fs; %.0f cmds/frame; readbacks %.0f/s (ahead %llu, finish %llu, heap %llu, early %llu), %.0f ms/s; "
                          "changed copies %llu/%llu, bytes %llu/%llu; vram %llu/%llu MB, "
                          "arenas %llu (%llu MB)\n",
                          flips / seconds, std::chrono::duration<double>(now - run_start).count(),
-                         flips ? double(SotcStats::TakeDelta(SotcStats::commands, commands_seen)) / flips : 0.0,
-                         readbacks / seconds,
+                         cmds_per_frame, readbacks / seconds,
                          static_cast<unsigned long long>(SotcStats::readback_ahead.exchange(0)),
                          static_cast<unsigned long long>(SotcStats::readback_finish.exchange(0)),
                          static_cast<unsigned long long>(SotcStats::heap_guard_builds.exchange(0)),
@@ -692,6 +714,21 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
     Common::AccurateTimer timer{vblank_period};
 
+    // sotc: the flip rate is the minimum interval between two flips, counted from the last flip,
+    // as on the console: a 30 FPS frame that misses its vblank is shown one vblank later (50 ms).
+    // Taking requests only on vblanks where count % (rate + 1) == 0 made it wait for the next
+    // even vblank instead: 66.7 ms, the game dropping from 30 to 15 FPS at every late frame. The
+    // interval is in 60 Hz vblanks, scaled to BB_VBLANK_HZ, so a faster vblank only shortens the
+    // wait of a late frame. Rate 0 (60 FPS, the fps60 mode) still flips at every vblank.
+    // SOTC_FLIP_PACING=0 restores the parity rule.
+    static const bool flip_pacing = [] {
+        const char* v = std::getenv("SOTC_FLIP_PACING");
+        return !v || v[0] != '0';
+    }();
+    const u64 vblanks_per_60hz = std::max<u64>(1, EmulatorSettings.GetVblankFrequency() / 60);
+    u64 last_flip_vblank = 0;
+    bool flipped = false;
+
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
         if (!requests.empty()) {
@@ -723,10 +760,16 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         }();
         static u64 last_flip_count = 0;
         auto& vblank_status = main_port.vblank_status;
-        const bool flip_due =
-            flip_late ? vblank_status.count - last_flip_count >= u64(main_port.flip_rate) + 1
-                      : vblank_status.count % (main_port.flip_rate + 1) == 0;
-        if (flip_due) {
+        bool take_request;
+        if (!flip_pacing) {
+            take_request = vblank_status.count % (main_port.flip_rate + 1) == 0;
+        } else if (main_port.flip_rate <= 0 || !flipped) {
+            take_request = true;
+        } else {
+            const u64 interval = u64(main_port.flip_rate + 1) * vblanks_per_60hz;
+            take_request = vblank_status.count - last_flip_vblank >= interval;
+        }
+        if (take_request) {
             const auto request = receive_request();
             if (request) {
                 last_flip_count = vblank_status.count;
@@ -741,6 +784,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 }
             } else {
                 Flip(request);
+                last_flip_vblank = vblank_status.count;
+                flipped = true;
                 FRAME_END;
             }
         }

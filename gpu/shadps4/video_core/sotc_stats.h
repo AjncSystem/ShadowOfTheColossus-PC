@@ -164,6 +164,15 @@ inline constexpr const char* kFrameCauseNames[FrameCauses] = {
 inline std::atomic<uint64_t> frame_copy_bytes{0};
 inline std::atomic<uint64_t> frame_ns[FrameCauses]{};
 inline std::atomic<uint64_t> frame_compiles{0}; ///< shader modules and pipelines created
+/// sotc: what the in-game performance overlay shows (bbport_overlay.cpp, show_fps / F10),
+/// published by the SOTC_FPS printer at the end of each five-second window (videoout/driver.cpp).
+inline std::atomic<float> ov_cmds_per_frame{0.0f};
+inline std::atomic<float> ov_readbacks_per_s{0.0f};
+inline std::atomic<float> ov_readback_ms_per_s{0.0f};
+inline std::atomic<uint32_t> ov_compiles_window{0};
+inline std::atomic<uint64_t> ov_compiles_total{0};
+inline std::atomic<int> ov_worst_cause{-1}; ///< FrameCause that took most of the worst frame
+inline std::atomic<float> ov_worst_cause_ms{0.0f};
 /// Phases of PipelineCache::CompileModule (SOTC_FPS, "SOTC COMPILE" line): translate, emit SPIR-V,
 /// shader patch lookup, vkCreateShaderModule, cache registration.
 inline std::atomic<uint64_t> compile_phase_ns[5]{};

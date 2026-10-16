@@ -16,6 +16,7 @@
 #include "imgui_impl_vulkan.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/sotc_stats.h"
 
 // DejaVu Sans (Cyrillic), embedded (third_party/fonts, Bitstream Vera license).
 #ifdef _WIN32
@@ -133,6 +134,47 @@ ImGuiKey KeyFromGamepad(u8 button) {
     case SDL_GAMEPAD_BUTTON_START: return ImGuiKey_GamepadStart;
     case SDL_GAMEPAD_BUTTON_BACK: return ImGuiKey_GamepadBack;
     default: return ImGuiKey_None;
+    }
+}
+
+// sotc: the performance overlay (show_fps=1 in sotc.ini, or SOTC_FPS / SOTC_OVERLAY=1; F10
+// toggles it). History of present intervals (one per game flip), present thread only.
+constexpr int kHistory = 240;
+float frame_hist[kHistory]{};
+int hist_pos = 0, hist_count = 0;
+uint64_t session_frames = 0, session_late = 0, session_stutters = 0;
+std::atomic<bool> overlay_on{[] {
+    if (const char* v = std::getenv("SOTC_OVERLAY")) {
+        return v[0] != '0';
+    }
+    return std::getenv("SOTC_FPS") != nullptr;
+}()};
+
+// Frame time the game aims for: 33.3 ms (30 FPS) or 16.7 ms (60 FPS), from the median.
+float TargetMs() {
+    if (hist_count < 8) {
+        return 33.3f;
+    }
+    float sorted[kHistory];
+    std::copy(frame_hist, frame_hist + hist_count, sorted);
+    std::nth_element(sorted, sorted + hist_count / 2, sorted + hist_count);
+    return sorted[hist_count / 2] < 25.0f ? 16.7f : 33.3f;
+}
+
+bool OverlayOn() {
+    return BbSettings::Get().show_fps || overlay_on.load(std::memory_order_relaxed);
+}
+
+void RecordFrame(float ms) {
+    frame_hist[hist_pos] = ms;
+    hist_pos = (hist_pos + 1) % kHistory;
+    hist_count = std::min(hist_count + 1, kHistory);
+    ++session_frames;
+    if (ms > TargetMs() * 1.1f) {
+        ++session_late;
+    }
+    if (ms > 50.0f) {
+        ++session_stutters;
     }
 }
 
@@ -503,15 +545,76 @@ void FpsCounter() {
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                      ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
                      ImGuiWindowFlags_NoFocusOnAppearing);
-    const auto& s = BbSettings::Get();
-    ImGui::Text("%.0f FPS  %.1f мс  %s", frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f,
-                frame_ms_avg,
-                s.upscaler == BbSettings::UpscalerFsr3   ? "FSR 3.1"
-                : s.upscaler == BbSettings::UpscalerFsr4 ? "FSR 4"
-                : s.upscaler == BbSettings::UpscalerFsr411 ? "FSR 4.1.1"
-                : s.upscaler == BbSettings::UpscalerTaa ? "TAA"
-                : s.upscaler == BbSettings::UpscalerDlss ? "DLSS"
-                                                         : "");
+    // Latest frames in order, oldest first.
+    float frames[kHistory];
+    for (int i = 0; i < hist_count; ++i) {
+        frames[i] = frame_hist[(hist_pos - hist_count + i + kHistory) % kHistory];
+    }
+    const float target = TargetMs();
+    float sum = 0.0f, worst = 0.0f;
+    int late = 0;
+    for (int i = 0; i < hist_count; ++i) {
+        sum += frames[i];
+        worst = std::max(worst, frames[i]);
+        late += frames[i] > target * 1.1f;
+    }
+    float sorted[kHistory];
+    std::copy(frames, frames + hist_count, sorted);
+    std::sort(sorted, sorted + hist_count);
+    const float p99 = hist_count ? sorted[std::min(hist_count - 1, hist_count * 99 / 100)] : 0.0f;
+    const float avg_fps = sum > 0.0f ? 1000.0f * hist_count / sum : 0.0f;
+    const float seconds = sum / 1000.0f;
+
+    const ImVec4 green(0.45f, 0.9f, 0.45f, 1.0f), yellow(1.0f, 0.82f, 0.3f, 1.0f),
+        red(1.0f, 0.4f, 0.35f, 1.0f), grey(0.7f, 0.7f, 0.7f, 1.0f);
+    const auto rate_color = [&](float ms) {
+        return ms <= target * 1.1f ? green : ms <= target * 1.6f ? yellow : red;
+    };
+    const float now_ms = frame_ms_avg;
+    ImGui::TextColored(rate_color(now_ms), "%.0f FPS", now_ms > 0.0f ? 1000.0f / now_ms : 0.0f);
+    ImGui::SameLine();
+    ImGui::TextColored(grey, "%.1f ms   cible %.0f FPS", now_ms, 1000.0f / target);
+
+    // Frame time graph, 0 to 2.2x the target, with the target line.
+    const float graph_max = target * 2.2f;
+    const ImVec2 graph_size(260.0f * base_scale, 54.0f * base_scale);
+    ImGui::PushStyleColor(ImGuiCol_PlotLines, late ? yellow : green);
+    ImGui::PlotLines("##frametimes", frames, hist_count, 0, nullptr, 0.0f, graph_max, graph_size);
+    ImGui::PopStyleColor();
+    const ImVec2 lo = ImGui::GetItemRectMin(), hi = ImGui::GetItemRectMax();
+    const float y = hi.y - (hi.y - lo.y) * (target / graph_max);
+    ImGui::GetWindowDrawList()->AddLine(ImVec2(lo.x, y), ImVec2(hi.x, y),
+                                        IM_COL32(120, 200, 255, 160), 1.0f);
+
+    ImGui::Text("%.0f s : moy %.1f | 1%% low %.1f | pire %.0f ms", seconds, avg_fps,
+                p99 > 0.0f ? 1000.0f / p99 : 0.0f, worst);
+    ImGui::TextColored(late ? (late > 3 ? red : yellow) : green, "En retard : %d", late);
+    ImGui::SameLine();
+    ImGui::TextColored(grey, "| session %llu (%.1f%%), saccades >50 ms %llu",
+                       static_cast<unsigned long long>(session_late),
+                       session_frames ? 100.0 * session_late / session_frames : 0.0,
+                       static_cast<unsigned long long>(session_stutters));
+    if (SotcStats::kFpsLog) {
+        ImGui::TextColored(grey, "CPU %.0f cmds/image | relectures GPU %.0f/s (%.0f ms/s)",
+                           SotcStats::ov_cmds_per_frame.load(), SotcStats::ov_readbacks_per_s.load(),
+                           SotcStats::ov_readback_ms_per_s.load());
+        const int cause = SotcStats::ov_worst_cause.load();
+        ImGui::TextColored(grey, "Shaders compiles %u (5 s), %llu session",
+                           SotcStats::ov_compiles_window.load(),
+                           static_cast<unsigned long long>(SotcStats::ov_compiles_total.load()));
+        if (cause >= 0) {
+            ImGui::SameLine();
+            ImGui::TextColored(grey, "| pire image : %s %.0f ms",
+                               SotcStats::kFrameCauseNames[cause],
+                               SotcStats::ov_worst_cause_ms.load());
+        }
+    }
+    if (const uint64_t vram = SotcStats::vram_used.load(std::memory_order_relaxed)) {
+        ImGui::TextColored(grey, "VRAM %.1f / %.1f Go", vram / 1073741824.0,
+                           SotcStats::vram_budget.load(std::memory_order_relaxed) / 1073741824.0);
+        ImGui::SameLine();
+    }
+    ImGui::TextDisabled("F10 : masquer");
     ImGui::End();
 }
 
@@ -598,6 +701,13 @@ bool HandleEvent(const SDL_Event& event) {
         return false;
     }
     ImGuiIO& io = ImGui::GetIO();
+    // sotc: F10 shows or hides the performance overlay.
+    if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F10 && !event.key.repeat) {
+        const bool on = !OverlayOn();
+        BbSettings::Get().show_fps = false; // the ini setting only gives the initial state
+        overlay_on.store(on, std::memory_order_relaxed);
+        return true;
+    }
     if (list_active && !menu_open && list_result == -1) {
         const int count = static_cast<int>(list_items.size());
         const auto move = [&](int delta) {
@@ -801,8 +911,7 @@ bool HandleEvent(const SDL_Event& event) {
 }
 
 bool Visible() {
-    return initialized &&
-           (menu_open || text_entry_active || list_active || BbSettings::Get().show_fps);
+    return initialized && (menu_open || text_entry_active || list_active || OverlayOn());
 }
 
 bool CapturesInput() {
@@ -862,6 +971,9 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     if (ms > 0.0f && ms < 1000.0f) {
         frame_ms_avg = frame_ms_avg == 0.0f ? ms : frame_ms_avg * 0.95f + ms * 0.05f;
     }
+    if (ms > 0.0f && ms < 5000.0f) {
+        RecordFrame(ms);
+    }
     if (!Visible()) {
         return;
     }
@@ -883,7 +995,7 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     if (menu_open) {
         Menu();
     }
-    if (BbSettings::Get().show_fps && !menu_open) {
+    if (OverlayOn() && !menu_open) {
         FpsCounter();
     }
     if (text_entry_active) {

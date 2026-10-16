@@ -853,7 +853,15 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
     // Keep the consumer spinning briefly between batches to avoid making the producer wake it for
     // every small update
     constexpr auto SpinTime = std::chrono::microseconds{250};
+#ifdef _WIN32
+    // sotc: Windows condition variables wait in whole milliseconds, so 500 us came out as 0:
+    // the wait returned at once and the thread spun at 100% of a core (half of a hyper-threaded
+    // core the command processor may share). The producer wakes a sleeping consumer for new
+    // work, so a longer timeout adds no latency.
+    constexpr auto SleepTime = std::chrono::milliseconds{2};
+#else
     constexpr auto SleepTime = std::chrono::microseconds{500};
+#endif
 
     Chunk* chunk = first_chunk;
     Chunk* previous = nullptr;

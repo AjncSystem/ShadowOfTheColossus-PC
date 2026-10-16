@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -24,6 +27,14 @@
 #include "video_core/texture_cache/tile_manager.h"
 
 namespace VideoCore {
+
+void ReentrantMutex::AsymmetricBarrier() {
+#ifdef _WIN32
+    FlushProcessWriteBuffers();
+#else
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
+}
 
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
@@ -190,9 +201,27 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
 }
 
 void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
-    std::scoped_lock lock{mutex};
     const auto pages_start = PageManager::GetPageAddr(addr);
     const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
+    // sotc: most guest write faults hit buffer pages without any image: no lock for them (they
+    // made the command processor wait for the lock ~125 times a frame). An image registered
+    // right after this check is uploaded from memory and tracked afterwards, as one registered
+    // right after a locked invalidation would be. SOTC_TC_SKIP_EMPTY=0: always lock.
+    static const bool skip_empty = [] {
+        const char* v = std::getenv("SOTC_TC_SKIP_EMPTY");
+        return !v || v[0] != '0';
+    }();
+    if (skip_empty) {
+        bool any = false;
+        ForEachPage(pages_start, pages_end - pages_start, [&](u64 page) {
+            any = page >= NumImagePages || page_images[page].load(std::memory_order_acquire) != 0;
+            return any;
+        });
+        if (!any) {
+            return;
+        }
+    }
+    std::scoped_lock lock{mutex};
     ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
         const auto image_begin = image.info.guest_address;
         const auto image_end = image.info.guest_address + image.info.guest_size;
@@ -664,7 +693,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     const auto& info = desc.info;
     ASSERT(info.guest_address != 0);
 
-    std::scoped_lock lock{mutex};
+    std::unique_lock lock{mutex, std::defer_lock};
+    LockCounted(lock);
     // sotc: SOTC_MIP_TAIL: `info` may become the T#'s mip tail.
     const bool tail_candidate = desc.rebase_mip != 0 && MipTailMode() != 0;
     if (tail_candidate) {
@@ -1074,7 +1104,11 @@ void TextureCache::RegisterImage(ImageId image_id) {
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
     ForEachPage(image.info.guest_address, image.info.guest_size,
-                [this, image_id](u64 page) { page_table[page].push_back(image_id); });
+                [this, image_id](u64 page) {
+                    // Counted before TrackImage protects the pages (a system call: a barrier).
+                    page_images[page].fetch_add(1, std::memory_order_relaxed);
+                    page_table[page].push_back(image_id);
+                });
 }
 
 void TextureCache::UnregisterImage(ImageId image_id) {
@@ -1099,6 +1133,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
             return;
         }
         image_ids.erase(vector_it);
+        page_images[page].fetch_sub(1, std::memory_order_relaxed);
     });
 }
 

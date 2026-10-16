@@ -33,12 +33,21 @@ inline std::atomic<uint64_t> readback_bytes_changed{0};
 inline std::atomic<uint64_t> uploads{0};        ///< SynchronizeMemory copies (CPU data to GPU)
 /// DMA sweeps (SynchronizeDmaBuffers): count, resident ranges visited, sweeps that uploaded.
 inline std::atomic<uint64_t> dma_sweeps{0}, dma_sweep_ranges{0}, dma_sweep_uploading{0};
+/// ... merged runs visited, and time (ns) in all sweeps and in the ones that uploaded nothing.
+inline std::atomic<uint64_t> dma_sweep_runs{0}, dma_sweep_ns{0}, dma_sweep_idle_ns{0};
 inline std::atomic<uint64_t> upload_bytes{0};
 inline std::atomic<uint64_t> render_breaks{0};  ///< EndRendering that closed a render pass
 inline std::atomic<uint64_t> fault_writes{0};       ///< guest write faults on tracked pages
 inline std::atomic<uint64_t> fault_walker{0};       ///< SRT walker loads emulated after a fault
 inline std::atomic<uint64_t> fault_gpu_reads{0};    ///< other read faults on the command processor
-inline std::atomic<uint64_t> commands{0}; ///< draws and dispatches recorded
+inline std::atomic<uint64_t> commands{0}; ///< draws and dispatches recorded (monotonic, CP only)
+/// Change of a monotonic single-writer counter since the last call (`seen` keeps the last value).
+inline uint64_t TakeDelta(const std::atomic<uint64_t>& counter, uint64_t& seen) {
+    const uint64_t now = counter.load(std::memory_order_relaxed);
+    const uint64_t delta = now - seen;
+    seen = now;
+    return delta;
+}
 /// SOTC_CMD_STATS=1: draws, indirect draws (arguments GPU-written / CPU-side / CPU-side and
 /// empty), dispatches, indirect dispatches.
 inline std::atomic<uint64_t> cmd_kinds[6]{};
@@ -68,6 +77,17 @@ inline std::atomic<uint64_t> stack_reg_spins{0}; ///< stack registry writer spin
 inline std::atomic<uint64_t> fault_grace_marks{0};    ///< pages made hot (repeat-fault grace)
 inline std::atomic<uint64_t> fault_grace_cap_hits{0}; ///< ... refused by the budget
 inline std::atomic<uint64_t> fault_grace_hot_upload_bytes{0}; ///< hot pages uploaded, kept writable
+/// SOTC_CMD_STATS: system calls behind the command processor's time (SOTC sys line): page
+/// protection changes (calls, bytes; made writable), texture cache lock (acquired, contended),
+/// device memory allocations and frees (VMA callbacks).
+inline std::atomic<uint64_t> sys_protects{0}, sys_protect_bytes{0}, sys_unprotects{0};
+inline std::atomic<uint64_t> sys_tc_locks{0}, sys_tc_contended{0}, sys_tc_wait_ns{0};
+inline std::atomic<uint64_t> sys_vk_allocs{0}, sys_vk_frees{0};
+/// ... protect calls from image page watchers (UpdatePageWatchers) and buffer regions.
+inline std::atomic<uint64_t> sys_protect_src[2]{};
+/// ... bytes invalidated: map hook, protect hook (the game's mprotect), HLE fills, all callers
+/// of BufferCache::InvalidateMemory.
+inline std::atomic<uint64_t> inv_map{0}, inv_protect{0}, inv_hle{0}, inv_buffer{0};
 /// Mip-tail images (SOTC_MIP_TAIL, TextureCache::DecideRebase). Census gauges, bytes:
 inline std::atomic<uint64_t> census_rebased{0};         ///< host memory of mip-tail images
 inline std::atomic<uint64_t> census_rebased_count{0};

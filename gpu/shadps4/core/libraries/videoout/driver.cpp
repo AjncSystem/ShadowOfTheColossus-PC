@@ -258,6 +258,7 @@ void VideoOutDriver::Flip(const Request& req) {
         static auto window_start = std::chrono::steady_clock::now();
         static const auto run_start = window_start;
         static u32 flips = 0;
+        static uint64_t commands_seen = 0; // sotc: SotcStats::commands at the last line
         ++flips;
         const auto now = std::chrono::steady_clock::now();
         // sotc: frame times of this window, and where the command processor spent the time of
@@ -360,7 +361,7 @@ void VideoOutDriver::Flip(const Request& req) {
                          "SOTC FPS %.1f at %.0fs; %.0f cmds/frame; readbacks %.0f/s (ahead %llu, finish %llu, heap %llu, early %llu), %.0f ms/s; "
                          "changed copies %llu/%llu, bytes %llu/%llu\n",
                          flips / seconds, std::chrono::duration<double>(now - run_start).count(),
-                         flips ? double(SotcStats::commands.exchange(0)) / flips : 0.0,
+                         flips ? double(SotcStats::TakeDelta(SotcStats::commands, commands_seen)) / flips : 0.0,
                          readbacks / seconds,
                          static_cast<unsigned long long>(SotcStats::readback_ahead.exchange(0)),
                          static_cast<unsigned long long>(SotcStats::readback_finish.exchange(0)),
@@ -374,8 +375,15 @@ void VideoOutDriver::Flip(const Request& req) {
             if (const uint64_t sweeps = SotcStats::dma_sweeps.exchange(0)) {
                 const uint64_t ranges = SotcStats::dma_sweep_ranges.exchange(0);
                 const uint64_t uploading = SotcStats::dma_sweep_uploading.exchange(0);
-                std::fprintf(stderr, "SOTC DMA sweeps %.0f/s, %.1f ranges each, %.0f/s uploading\n",
-                             sweeps / seconds, double(ranges) / sweeps, uploading / seconds);
+                const uint64_t runs = SotcStats::dma_sweep_runs.exchange(0);
+                const uint64_t sweep_ns = SotcStats::dma_sweep_ns.exchange(0);
+                const uint64_t idle_ns = SotcStats::dma_sweep_idle_ns.exchange(0);
+                std::fprintf(stderr,
+                             "SOTC DMA sweeps %.0f/s, %.1f ranges each (%.1f runs), %.0f/s "
+                             "uploading; %.1f ms/s (%.1f in sweeps that uploaded nothing)\n",
+                             sweeps / seconds, double(ranges) / sweeps, double(runs) / sweeps,
+                             uploading / seconds, sweep_ns / 1e6 / seconds,
+                             idle_ns / 1e6 / seconds);
             }
             if (const uint64_t images = SotcStats::census_count.load(std::memory_order_relaxed)) {
                 const auto mib = [](const std::atomic<uint64_t>& v) {
@@ -482,6 +490,25 @@ void VideoOutDriver::Flip(const Request& req) {
                              double(SotcStats::uploads.exchange(0)) / flips,
                              double(SotcStats::upload_bytes.exchange(0)) / 1024.0 / flips,
                              double(SotcStats::render_breaks.exchange(0)) / flips);
+                std::fprintf(stderr,
+                             "SOTC sys/frame: protects %.0f (%.0f writable, %.0f KB), "
+                             "texture cache locks %.0f (%.0f contended, %.3f ms waiting), vk allocs %.1f, frees %.1f; protects from images %.0f, "
+                             "buffers %.0f; invalidated KB: map %.0f, mprotect %.0f, hle %.0f, "
+                             "all %.0f\n",
+                             double(SotcStats::sys_protects.exchange(0)) / flips,
+                             double(SotcStats::sys_unprotects.exchange(0)) / flips,
+                             double(SotcStats::sys_protect_bytes.exchange(0)) / 1024.0 / flips,
+                             double(SotcStats::sys_tc_locks.exchange(0)) / flips,
+                             double(SotcStats::sys_tc_contended.exchange(0)) / flips,
+                             SotcStats::sys_tc_wait_ns.exchange(0) / 1e6 / flips,
+                             double(SotcStats::sys_vk_allocs.exchange(0)) / flips,
+                             double(SotcStats::sys_vk_frees.exchange(0)) / flips,
+                             double(SotcStats::sys_protect_src[0].exchange(0)) / flips,
+                             double(SotcStats::sys_protect_src[1].exchange(0)) / flips,
+                             SotcStats::inv_map.exchange(0) / 1024.0 / flips,
+                             SotcStats::inv_protect.exchange(0) / 1024.0 / flips,
+                             SotcStats::inv_hle.exchange(0) / 1024.0 / flips,
+                             SotcStats::inv_buffer.exchange(0) / 1024.0 / flips);
             }
             flips = 0;
             window_start = now;

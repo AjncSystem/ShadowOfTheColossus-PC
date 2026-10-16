@@ -1034,15 +1034,56 @@ void BufferCache::SynchronizeDmaBuffers() {
                 }
                 dma_runs.emplace_back(device_addr, size);
             }
+            dma_full_pending = true;
         }
-        // sotc: by index with a copied entry, re-reading size(): nothing nested in
-        // SynchronizeMemory may invalidate the iteration even if it touched dma_runs.
-        for (size_t i = 0; i < dma_runs.size(); ++i) {
-            const auto [device_addr, size] = dma_runs[i];
-            SynchronizeMemory(address_space[device_addr >> ARENA_PAGE_BITS], device_addr,
-                              static_cast<u32>(size), false, false);
+        // sotc: incremental sweep (SOTC_DMA_INCR=0: every run, every time). Only the 256 KiB
+        // words where a CPU bit rose since the last sweep can need an upload
+        // (RegionManager::TakeSweepWords; hot pages kept by FaultGrace are marked again on each
+        // upload). After the runs change (pages that became resident may hold old CPU bits) one
+        // full sweep restores that. Each run is still synced once, over the hull of its dirty
+        // words, so the uploads per run stay as before.
+        static const bool dma_incr = [] {
+            const char* v = std::getenv("SOTC_DMA_INCR");
+            return !(v && v[0] == '0');
+        }();
+        if (!dma_incr || std::exchange(dma_full_pending, false)) {
+            if (dma_incr) {
+                memory_tracker->ForEachSweepSpan([](VAddr, u64) {});
+            }
+            // sotc: by index with a copied entry, re-reading size(): nothing nested in
+            // SynchronizeMemory may invalidate the iteration even if it touched dma_runs.
+            for (size_t i = 0; i < dma_runs.size(); ++i) {
+                const auto [device_addr, size] = dma_runs[i];
+                SynchronizeMemory(address_space[device_addr >> ARENA_PAGE_BITS], device_addr,
+                                  static_cast<u32>(size), false, false);
+            }
+            ranges = dma_runs_ranges;
+        } else {
+            dma_spans.clear();
+            memory_tracker->ForEachSweepSpan(
+                [this](VAddr address, u64 size) { dma_spans.emplace_back(address, size); });
+            std::ranges::sort(dma_spans);
+            size_t s = 0;
+            for (size_t i = 0; i < dma_runs.size() && s < dma_spans.size(); ++i) {
+                const auto [run_start, run_size] = dma_runs[i];
+                const VAddr run_end = run_start + run_size;
+                while (s < dma_spans.size() &&
+                       dma_spans[s].first + dma_spans[s].second <= run_start) {
+                    ++s;
+                }
+                VAddr lo = ~0ULL;
+                VAddr hi = 0;
+                for (size_t k = s; k < dma_spans.size() && dma_spans[k].first < run_end; ++k) {
+                    lo = std::min(lo, std::max(run_start, dma_spans[k].first));
+                    hi = std::max(hi, std::min(run_end, dma_spans[k].first + dma_spans[k].second));
+                }
+                if (lo < hi) {
+                    SynchronizeMemory(address_space[run_start >> ARENA_PAGE_BITS], lo,
+                                      static_cast<u32>(hi - lo), false, false);
+                    ++ranges;
+                }
+            }
         }
-        ranges = dma_runs_ranges;
         SotcStats::dma_sweep_runs.fetch_add(dma_runs.size(), std::memory_order_relaxed);
     } else {
         for (const auto& range : resident_ranges) {

@@ -194,8 +194,29 @@ private:
         new_manager->SetCpuAddress(base_cpu_addr);
         free_managers.pop_back();
         top_tier[page_index] = new_manager;
+        live_managers.push_back(new_manager);
         return new_manager;
     }
+
+public:
+    /// sotc: calls f(address, size) for each run of 256 KiB words whose CPU bits rose since the
+    /// last call (RegionManager::TakeSweepWords). GPU command thread only (as CreateRegion).
+    template <typename F>
+    void ForEachSweepSpan(F&& f) {
+        for (size_t i = 0; i < live_managers.size(); ++i) {
+            RegionManager* manager = live_managers[i];
+            u64 words = manager->TakeSweepWords();
+            while (words) {
+                const int first = std::countr_zero(words);
+                const int count = std::countr_one(words >> first);
+                f(manager->CpuAddress() + u64(first) * BYTES_PER_WORD, u64(count) * BYTES_PER_WORD);
+                words = first + count >= 64 ? 0 : words & (~0ULL << (first + count));
+            }
+        }
+    }
+
+private:
+    std::vector<RegionManager*> live_managers;
 
     PageManager* tracker;
     const u32 readbacks_mode;

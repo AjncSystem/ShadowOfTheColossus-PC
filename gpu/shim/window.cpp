@@ -8,6 +8,7 @@
 #include "common/logging/log.h"
 #include "sdl_window.h"
 #include "bbport_overlay.h"
+#include "bbport_settings.h"
 #include "video_core/renderdoc.h"
 
 namespace Frontend {
@@ -211,13 +212,34 @@ bool WindowSDL::PollEvents() {
     return is_open;
 }
 
+void WindowSDL::SetFullscreen(bool fs) {
+    if (window) {
+        SDL_SetWindowFullscreen(window, fs);
+    }
+}
+
+bool WindowSDL::IsFullscreen() const {
+    return window ? (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0 : false;
+}
+
 } // namespace Frontend
 
 // sotc: motion since the last call, the held buttons (bit = SDL button number); 0 while the
 // mouse is not captured.
 extern "C" int bbgpu_mouse_take(float* dx, float* dy, unsigned* buttons) {
-    *dx = Frontend::g_mouse_dx.exchange(0, std::memory_order_relaxed);
-    *dy = Frontend::g_mouse_dy.exchange(0, std::memory_order_relaxed);
+    const auto& s = BbSettings::Get();
+    if (!s.mouse_enabled.load(std::memory_order_relaxed)) {
+        *dx = 0;
+        *dy = 0;
+        *buttons = 0;
+        return 0;
+    }
+    const float raw_dx = Frontend::g_mouse_dx.exchange(0, std::memory_order_relaxed);
+    const float raw_dy = Frontend::g_mouse_dy.exchange(0, std::memory_order_relaxed);
+    const float sens = s.mouse_sens.load(std::memory_order_relaxed);
+    const bool invert = s.mouse_invert.load(std::memory_order_relaxed);
+    *dx = raw_dx * sens;
+    *dy = raw_dy * (invert ? -sens : sens);
     *buttons = Frontend::g_mouse_buttons.load(std::memory_order_relaxed);
     return Frontend::g_mouse_captured.load(std::memory_order_relaxed) ? 1 : 0;
 }

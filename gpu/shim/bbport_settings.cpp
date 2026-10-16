@@ -66,6 +66,14 @@ void Set(Values& v, const std::string& key, const std::string& value) {
                 v.output_res = r;
             }
         }
+    } else if (key == "mouse_enabled" || key == "mouse") {
+        v.mouse_enabled = i != 0;
+    } else if (key == "mouse_sens" || key == "mouse_sensitivity") {
+        v.mouse_sens = Clamp(f, 0.1f, 5.0f);
+    } else if (key == "mouse_invert") {
+        v.mouse_invert = i != 0;
+    } else if (key == "fullscreen") {
+        v.fullscreen = i != 0;
     } else {
         for (int e = 0; e < EffectCount; ++e) {
             if (key == Effects[e].key) {
@@ -113,6 +121,8 @@ void Load() {
         {"BB_REACTIVE", "reactive"},              {"BB_REACTIVE_SCALE", "reactive_scale"},
         {"BB_REACTIVE_THRESHOLD", "reactive_threshold"}, {"BB_REACTIVE_MAX", "reactive_max"},
         {"BB_UPSCALE_PRESET", "preset"},            {"BB_OBJECT_MOTION", "object_motion"},
+        {"SOTC_MOUSE", "mouse_enabled"},             {"SOTC_MOUSE_SENS", "mouse_sens"},
+        {"SOTC_MOUSE_INVERT", "mouse_invert"},       {"BB_FULLSCREEN", "fullscreen"},
     };
     for (const auto& [env, key] : env_keys) {
         if (const char* value = std::getenv(env)) {
@@ -201,6 +211,9 @@ void Save() {
     }
     std::fprintf(file, "model_lod=%d\noutput_res=%dx%d\n", v.model_lod.load(),
                  OutputWidths[v.output_res], OutputHeights[v.output_res]);
+    std::fprintf(file, "mouse=%d\nmouse_sens=%.2f\nmouse_invert=%d\nfullscreen=%d\n",
+                 int(v.mouse_enabled.load()), v.mouse_sens.load(),
+                 int(v.mouse_invert.load()), int(v.fullscreen.load()));
     // Read by run.sh at start.
     std::fprintf(file, "live_resolution=%s\n", v.live_resolution < 0 ? "auto"
                                                   : v.live_resolution ? "1" : "0");

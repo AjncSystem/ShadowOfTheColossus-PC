@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <magic_enum/magic_enum.hpp>
 
+#include "bbport_copy.h"
 #include "common/alignment.h"
 #include "core/debug_state.h"
 #include "core/memory.h"
@@ -922,52 +923,87 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     const SotcStats::FrameTimer frame_timer{SotcStats::FrameAlloc};
     const SotcStats::AllocTrace alloc_trace{SotcStats::AllocArena, u64(resident_blocks) << block_shift};
 
-    vk::MemoryAllocateInfo alloc_info = {
-        .allocationSize = resident_blocks << block_shift,
-        .memoryTypeIndex = arena_memory_type_index,
-    };
-    auto [alloc_result, device_memory] = instance.GetDevice().allocateMemory(alloc_info);
-    if (alloc_result == vk::Result::eErrorOutOfDeviceMemory && arena_fallback_memory_type_index) {
-        // Resident arena ranges are never released, so a long session can exhaust video memory.
-        // Keep running from system memory (slower GPU access) instead of aborting.
-        static bool warned = false;
-        if (!std::exchange(warned, true)) {
-            LOG_WARNING(Render, "Video memory exhausted, placing new buffer memory in system RAM");
+    // sotc: arena memory comes from slabs of SOTC_ARENA_SLAB_MB (default 4, 0 = one allocation per
+    // call): runs of blocks are handed out of the current slab. One vkAllocateMemory per call cost
+    // ~0.2 ms and ran ~15 times a second while the game streamed (5,300 in a 6-minute attract run,
+    // 1 s in total, up to 70 ms within one frame). Large requests, and slabs the driver refuses
+    // under memory pressure, take the exact allocation below with its emergency collections.
+    static const u64 slab_bytes = [] {
+        const char* v = std::getenv("SOTC_ARENA_SLAB_MB");
+        return (v ? std::strtoull(v, nullptr, 10) : 4ull) << 20;
+    }();
+    const u64 want_bytes = u64{resident_blocks} << block_shift;
+    vk::DeviceMemory device_memory{};
+    u64 memory_base{};
+    if (slab_bytes >= u64{block_size} && want_bytes <= slab_bytes / 2) {
+        if (!arena_slab || arena_slab_used + want_bytes > arena_slab_size) {
+            const vk::MemoryAllocateInfo slab_info = {
+                .allocationSize = slab_bytes,
+                .memoryTypeIndex = arena_memory_type_index,
+            };
+            const auto [slab_result, slab_memory] = instance.GetDevice().allocateMemory(slab_info);
+            arena_slab = slab_result == vk::Result::eSuccess ? slab_memory : vk::DeviceMemory{};
+            arena_slab_size = slab_bytes;
+            arena_slab_used = 0;
+            if (arena_slab) {
+                SotcStats::arena_bytes.fetch_add(slab_bytes, std::memory_order_relaxed);
+            }
         }
-        alloc_info.memoryTypeIndex = *arena_fallback_memory_type_index;
-        const auto retry = instance.GetDevice().allocateMemory(alloc_info);
-        alloc_result = retry.result;
-        device_memory = retry.value;
+        if (arena_slab) {
+            device_memory = arena_slab;
+            memory_base = arena_slab_used;
+            arena_slab_used += want_bytes;
+        }
     }
-    // Video memory is full (sparse arenas cannot use system memory on NVIDIA). Drop cached
-    // images, wait for the GPU so their memory is really released, and try again. sotc: one
-    // shallow round was not enough on 6 GB cards (abort after ~15 min in the open world), so
-    // each further round collects deeper before giving up.
-    bool collect_deferred = false;
-    for (u32 level = 0; alloc_result == vk::Result::eErrorOutOfDeviceMemory && level < 3; ++level) {
-        LOG_WARNING(Render, "Video memory exhausted ({} MiB requested), collecting cached images",
-                    alloc_info.allocationSize >> 20);
-        if (!texture_cache.TryEmergencyCollect(level)) {
-            // Reached from RefreshImage under the texture cache lock: the collection runs at the
-            // next submit. One more try now (memory freed meanwhile by other threads or the GC).
-            collect_deferred = true;
+    if (!device_memory) {
+        vk::MemoryAllocateInfo alloc_info = {
+            .allocationSize = resident_blocks << block_shift,
+            .memoryTypeIndex = arena_memory_type_index,
+        };
+        auto [alloc_result, exact_memory] = instance.GetDevice().allocateMemory(alloc_info);
+        if (alloc_result == vk::Result::eErrorOutOfDeviceMemory && arena_fallback_memory_type_index) {
+            // Resident arena ranges are never released, so a long session can exhaust video memory.
+            // Keep running from system memory (slower GPU access) instead of aborting.
+            static bool warned = false;
+            if (!std::exchange(warned, true)) {
+                LOG_WARNING(Render, "Video memory exhausted, placing new buffer memory in system RAM");
+            }
+            alloc_info.memoryTypeIndex = *arena_fallback_memory_type_index;
+            const auto retry = instance.GetDevice().allocateMemory(alloc_info);
+            alloc_result = retry.result;
+            exact_memory = retry.value;
+        }
+        // Video memory is full (sparse arenas cannot use system memory on NVIDIA). Drop cached
+        // images, wait for the GPU so their memory is really released, and try again. sotc: one
+        // shallow round was not enough on 6 GB cards (abort after ~15 min in the open world), so
+        // each further round collects deeper before giving up.
+        bool collect_deferred = false;
+        for (u32 level = 0; alloc_result == vk::Result::eErrorOutOfDeviceMemory && level < 3; ++level) {
+            LOG_WARNING(Render, "Video memory exhausted ({} MiB requested), collecting cached images",
+                        alloc_info.allocationSize >> 20);
+            if (!texture_cache.TryEmergencyCollect(level)) {
+                // Reached from RefreshImage under the texture cache lock: the collection runs at the
+                // next submit. One more try now (memory freed meanwhile by other threads or the GC).
+                collect_deferred = true;
+                alloc_info.memoryTypeIndex = arena_memory_type_index;
+                const auto retry = instance.GetDevice().allocateMemory(alloc_info);
+                alloc_result = retry.result;
+                exact_memory = retry.value;
+                break;
+            }
+            scheduler.Finish();
+            scheduler.PopPendingOperations();
             alloc_info.memoryTypeIndex = arena_memory_type_index;
             const auto retry = instance.GetDevice().allocateMemory(alloc_info);
             alloc_result = retry.result;
-            device_memory = retry.value;
-            break;
+            exact_memory = retry.value;
         }
-        scheduler.Finish();
-        scheduler.PopPendingOperations();
-        alloc_info.memoryTypeIndex = arena_memory_type_index;
-        const auto retry = instance.GetDevice().allocateMemory(alloc_info);
-        alloc_result = retry.result;
-        device_memory = retry.value;
+        ASSERT_MSG(alloc_result == vk::Result::eSuccess, "Failed to allocate buffer arena memory: {}{}",
+                   vk::to_string(alloc_result),
+                   collect_deferred ? " (collection deferred: texture cache lock held)" : "");
+        SotcStats::arena_bytes.fetch_add(alloc_info.allocationSize, std::memory_order_relaxed);
+        device_memory = exact_memory;
     }
-    ASSERT_MSG(alloc_result == vk::Result::eSuccess, "Failed to allocate buffer arena memory: {}{}",
-               vk::to_string(alloc_result),
-               collect_deferred ? " (collection deferred: texture cache lock held)" : "");
-    SotcStats::arena_bytes.fetch_add(alloc_info.allocationSize, std::memory_order_relaxed);
 
     boost::container::small_vector<vk::BufferCopy, 8> copies;
     const auto staging =
@@ -975,7 +1011,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
 
     backing_blocks[static_cast<VkDeviceMemory>(device_memory)] += resident_blocks;
 
-    u64 memory_offset{};
+    u64 memory_offset = memory_base;
     ArenaBinds* binds = BindsForArena(arena);
     auto* bda_addrs = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
     u64 offset = staging.offset;
@@ -1028,8 +1064,37 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             SotcStats::upload_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
         }
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
+        // sotc: a large upload made of several ranges (a streaming burst: 200+ MB in one frame)
+        // is copied in one parallel pass over 512 KiB pieces of all its ranges; per range, only
+        // ranges of 2 MiB and more were split. SOTC_COPY_BATCH=0: per range.
+        static const bool copy_batch = [] {
+            const char* v = std::getenv("SOTC_COPY_BATCH");
+            return !v || v[0] != '0';
+        }();
+        if (copy_batch && copies.size() > 1 && total_size_bytes >= 2_MB && BbCopy::Enabled()) {
+            struct Piece {
+                VAddr source;
+                u8* dest;
+                u64 size;
+            };
+            constexpr u64 PieceSize = 512_KB;
+            boost::container::small_vector<Piece, 64> pieces;
+            for (const auto& copy : copies) {
+                for (u64 done = 0; done < copy.size; done += PieceSize) {
+                    pieces.push_back({copy.dstOffset + done, staging.mapped + copy.srcOffset + done,
+                                      std::min(PieceSize, copy.size - done)});
+                }
+            }
+            BbCopy::ParallelFor(pieces.size(), [&](std::size_t i) {
+                memory->CopySparseMemory(pieces[i].source, pieces[i].dest, pieces[i].size);
+            });
+        } else {
+            for (const auto& copy : copies) {
+                memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset,
+                                         copy.size);
+            }
+        }
         for (auto& copy : copies) {
-            memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);
             copy.srcOffset += staging.offset;
             copy.dstOffset -= arena->cpu_addr;
         }
@@ -1150,6 +1215,9 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
             it->second -= std::min(it->second, range.end - range.start);
             if (it->second == 0) {
                 backing_blocks.erase(it);
+                if (memory == static_cast<VkDeviceMemory>(arena_slab)) {
+                    arena_slab = vk::DeviceMemory{}; // sotc: its free tail goes with it
+                }
                 // The unbind is submitted before this tick's work, which waits for it.
                 scheduler.DeferOperation([device = instance.GetDevice(), memory = range.memory] {
                     device.freeMemory(memory);

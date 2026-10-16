@@ -297,6 +297,10 @@ private:
 
     /// Number of resident blocks still bound to each backing allocation.
     std::unordered_map<VkDeviceMemory, u64> backing_blocks;
+    /// sotc: the arena slab EnsureResident hands block runs out of, its size and use (bytes).
+    vk::DeviceMemory arena_slab{};
+    u64 arena_slab_size{};
+    u64 arena_slab_used{};
 
     u32 arena_memory_type_index{};
     std::optional<u32> arena_fallback_memory_type_index;

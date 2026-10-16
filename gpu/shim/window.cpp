@@ -9,6 +9,15 @@
 #include "sdl_window.h"
 #include "bbport_overlay.h"
 #include "video_core/renderdoc.h"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 namespace Frontend {
 
@@ -19,6 +28,7 @@ namespace {
 std::atomic<float> g_mouse_dx{0}, g_mouse_dy{0};
 std::atomic<u32> g_mouse_buttons{0};
 std::atomic<bool> g_mouse_captured{false};
+void* g_behind_hwnd = nullptr; // sotc: SOTC_WINDOW_BEHIND window (Windows)
 bool MouseEnabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("SOTC_MOUSE");
@@ -50,10 +60,34 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_VULKAN_BOOLEAN, true);
     const char* fullscreen = std::getenv("BB_FULLSCREEN");
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_FULLSCREEN_BOOLEAN, fullscreen && fullscreen[0] == '1');
+    // sotc: SOTC_WINDOW_BEHIND=1 (unattended benchmarks): the window opens without taking the
+    // focus and goes behind the other windows, so a test run never interrupts the desktop.
+    const char* behind_env = std::getenv("SOTC_WINDOW_BEHIND");
+    const bool behind = behind_env && behind_env[0] == '1';
+    if (behind) {
+        SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "0");
+        SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_RAISED, "0");
+        SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_HIDDEN_BOOLEAN, true);
+    }
     base_title = title;
     window = SDL_CreateWindowWithProperties(props);
     SDL_DestroyProperties(props);
     ASSERT_MSG(window, "Failed to create window: {}", SDL_GetError());
+#ifdef _WIN32
+    if (behind) {
+        if (HWND hwnd = static_cast<HWND>(SDL_GetPointerProperty(
+                SDL_GetWindowProperties(window), SDL_PROP_WINDOW_WIN32_HWND_POINTER, nullptr))) {
+            g_behind_hwnd = hwnd;
+            // A WS_EX_NOACTIVATE window never becomes the foreground window, whoever shows it.
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE,
+                              GetWindowLongPtrW(hwnd, GWL_EXSTYLE) | WS_EX_NOACTIVATE);
+            SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+    }
+#endif
 
     const char* driver = SDL_GetCurrentVideoDriver();
     const SDL_PropertiesID wp = SDL_GetWindowProperties(window);
@@ -151,6 +185,14 @@ bool WindowSDL::PollEvents() {
         if (BbOverlay::HandleEvent(event)) {
             continue;
         }
+#ifdef _WIN32
+        // sotc: SOTC_WINDOW_BEHIND: a test window that still gets the focus goes back behind.
+        if (g_behind_hwnd && event.type == SDL_EVENT_WINDOW_FOCUS_GAINED) {
+            SetWindowPos(static_cast<HWND>(g_behind_hwnd), HWND_BOTTOM, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            continue;
+        }
+#endif
         if (std::getenv("SOTC_MOUSE_DEBUG") &&
             (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_MOTION ||
              event.type == SDL_EVENT_WINDOW_FOCUS_GAINED || event.type == SDL_EVENT_WINDOW_FOCUS_LOST)) {

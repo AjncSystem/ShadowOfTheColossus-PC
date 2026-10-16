@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <set>
 #include <tuple>
 #include <unordered_map>
+#include <vector>
+#include <vector>
 #include <algorithm>
 #include <filesystem>
 #include "common/path_util.h"
@@ -195,12 +198,133 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerEnd();
 }
 
+// sotc: SOTC_PASS_TRACE=1: every 300 flips, the render passes of one frame in order (depth
+// target, its size, colour target 0, screen and generic scissors, CB mode, draws) on stderr.
+// A diagnostic for finding which passes are the sun shadow cascades.
+template <typename Regs>
+static void TracePass(const Regs& regs) {
+    static const bool on = std::getenv("SOTC_PASS_TRACE") != nullptr;
+    if (!on) {
+        return;
+    }
+    struct Pass {
+        u64 depth, color;
+        u32 pitch, height, mode, slice0, slice1;
+        s32 sx0, sy0, sx1, sy1, gx0, gy0, gx1, gy1;
+        u32 draws;
+    };
+    static std::vector<Pass> passes;
+    static u64 frame_seen = 0;
+    const u64 frame = SotcStats::flip_count.load(std::memory_order_relaxed);
+    if (frame != frame_seen) {
+        if (frame_seen % 300 == 0 && !passes.empty()) {
+            std::fprintf(stderr, "SOTC PASSES frame %llu: %zu passes\n",
+                         static_cast<unsigned long long>(frame_seen), passes.size());
+            for (const auto& p : passes) {
+                std::fprintf(stderr,
+                             "  depth %#llx %ux%u slices %u-%u color %#llx mode %u screen %d,%d-%d,%d "
+                             "generic %d,%d-%d,%d draws %u\n",
+                             static_cast<unsigned long long>(p.depth), p.pitch, p.height, p.slice0, p.slice1,
+                             static_cast<unsigned long long>(p.color), p.mode, p.sx0, p.sy0,
+                             p.sx1, p.sy1, p.gx0, p.gy0, p.gx1, p.gy1, p.draws);
+            }
+        }
+        passes.clear();
+        frame_seen = frame;
+    }
+    if (frame % 300 != 0) {
+        return;
+    }
+    const Pass p{
+        .depth = regs.depth_buffer.DepthValid() ? regs.depth_buffer.DepthWriteAddress() : 0,
+        .color = regs.color_buffers[0].Address(),
+        .pitch = regs.depth_buffer.Pitch(),
+        .height = regs.depth_buffer.Height(),
+        .mode = static_cast<u32>(regs.color_control.mode),
+        .slice0 = regs.depth_view.slice_start,
+        .slice1 = regs.depth_view.slice_max,
+        .sx0 = regs.screen_scissor.top_left_x,
+        .sy0 = regs.screen_scissor.top_left_y,
+        .sx1 = regs.screen_scissor.bottom_right_x,
+        .sy1 = regs.screen_scissor.bottom_right_y,
+        .gx0 = regs.generic_scissor.top_left_x,
+        .gy0 = regs.generic_scissor.top_left_y,
+        .gx1 = regs.generic_scissor.bottom_right_x,
+        .gy1 = regs.generic_scissor.bottom_right_y,
+        .draws = 1,
+    };
+    if (!passes.empty()) {
+        auto& last = passes.back();
+        if (last.depth == p.depth && last.color == p.color && last.pitch == p.pitch &&
+            last.height == p.height && last.mode == p.mode && last.slice0 == p.slice0 &&
+            last.slice1 == p.slice1 && last.sx0 == p.sx0 &&
+            last.sy0 == p.sy0 && last.sx1 == p.sx1 && last.sy1 == p.sy1 && last.gx0 == p.gx0 &&
+            last.gy0 == p.gy0 && last.gx1 == p.gx1 && last.gy1 == p.gy1) {
+            ++last.draws;
+            return;
+        }
+    }
+    passes.push_back(p);
+}
+
+// sotc: SOTC_SHADOW_STAGGER=1: the two farthest sun shadow cascades are redrawn on alternate
+// frames (slice 2 on odd flips, slice 3 on even ones). A skipped slice starts no render pass, so
+// it is not cleared and keeps the previous frame's shadows. The sun shadow map is the square
+// depth target that got the most draws in the previous frame (SotC: 1024x1024, 5 slices, ~6500
+// draws per frame, 3041 of them in slice 3 and 2049 in slice 2, SOTC_PASS_TRACE). Far shadows
+// then lag one frame behind the camera; the two slices cost half as much.
+template <typename Regs>
+static bool SkipStaggeredShadow(const Regs& regs) {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_SHADOW_STAGGER");
+        return v && v[0] == '1';
+    }();
+    if (!on) {
+        return false;
+    }
+    static u64 frame_seen = 0, sun_map = 0;
+    static std::unordered_map<u64, u32> counts; // draws per square depth target this frame
+    const u64 frame = SotcStats::flip_count.load(std::memory_order_relaxed);
+    if (frame != frame_seen) {
+        u64 most_addr = 0;
+        u32 most = 0;
+        for (const auto& [addr, draws] : counts) {
+            if (draws > most) {
+                most = draws;
+                most_addr = addr;
+            }
+        }
+        sun_map = most >= 500 ? most_addr : 0;
+        counts.clear();
+        frame_seen = frame;
+    }
+    if (!regs.depth_buffer.DepthValid() ||
+        regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Normal) {
+        return false;
+    }
+    const u32 pitch = regs.depth_buffer.Pitch();
+    if (pitch != regs.depth_buffer.Height() || pitch < 512) {
+        return false;
+    }
+    const u64 addr = regs.depth_buffer.DepthWriteAddress();
+    ++counts[addr];
+    if (addr != sun_map) {
+        return false;
+    }
+    const u32 slice = regs.depth_view.slice_start;
+    return slice == 2 ? (frame & 1) != 0 : slice == 3 ? (frame & 1) == 0 : false;
+}
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
+    TracePass(liverpool->regs);
 
     if (!FilterDraw()) {
+        return;
+    }
+    if (SkipStaggeredShadow(liverpool->regs)) {
         return;
     }
 
@@ -261,8 +385,12 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
+    TracePass(liverpool->regs);
 
     if (!FilterDraw()) {
+        return;
+    }
+    if (SkipStaggeredShadow(liverpool->regs)) {
         return;
     }
 

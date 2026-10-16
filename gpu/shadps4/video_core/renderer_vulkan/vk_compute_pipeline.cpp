@@ -14,7 +14,7 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
                                  DescriptorHeap& desc_heap, const Shader::Profile& profile,
                                  vk::PipelineCache pipeline_cache, ComputePipelineKey compute_key_,
                                  const Shader::Info& info_, vk::ShaderModule module,
-                                 SerializationSupport& sdata, bool preloading /*=false*/)
+                                 SerializationSupport& sdata, [[maybe_unused]] bool preloading /*=false*/)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache, true},
       compute_key{compute_key_} {
     auto& info = stages[int(Shader::SwStage::Compute)];
@@ -23,11 +23,12 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
 
     // sotc: 64 where every stage can be pinned to it, otherwise 32 when the device could pick a
     // wider size (AMD): the shaders were lowered for 32 lanes (vk_instance.h).
+    // On Intel the recompiler's lane count (Instance::RequiredSubgroupSize).
+    const u32 required_size = instance.RequiredSubgroupSize(vk::ShaderStageFlagBits::eCompute);
     const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
-        .requiredSubgroupSize = instance.IsSubgroupSize64Supported() ? 64u : 32u,
+        .requiredSubgroupSize = required_size,
     };
-    const bool require_size =
-        instance.IsSubgroupSize64Supported() || instance.IsComputeSubgroupSize32Required();
+    const bool require_size = required_size != 0;
     const vk::PipelineShaderStageCreateInfo shader_ci = {
         .pNext = require_size ? &subgroup_size_ci : nullptr,
         .stage = vk::ShaderStageFlagBits::eCompute,
@@ -37,12 +38,13 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
 
     u32 binding{};
     boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;
-    for (const auto& buffer : info->buffers) {
+    for ([[maybe_unused]] const auto& buffer : info->buffers) {
         // During deserialization, we don't have access to the UD to fetch sharp data. To address
         // this properly we need to track shaprs or portion of them in `sdata`, but since we're
         // interested only in "is storage" flag (which is not even effective atm), we can take a
         // shortcut there.
-        const auto sharp = preloading ? AmdGpu::Buffer{} : buffer.GetSharp(*info);
+        // sotc: the sharp itself was never used; not reading it lets a worker thread build the
+        // pipeline without touching the guest's user data (PipelineCache::GetComputePipeline).
         bindings.push_back({
             .binding = binding++,
             .descriptorType = vk::DescriptorType::eStorageBuffer,

@@ -6,6 +6,7 @@
 #include <xxhash.h>
 
 #include <algorithm>
+#include <unordered_set>
 #include "common/elf_info.h"
 #include "common/hash.h"
 #include "common/io_file.h"
@@ -784,13 +785,26 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
 
+    auto phase_start = std::chrono::steady_clock::now();
+    const auto phase = [&](int i) {
+        if (SotcStats::kFpsLog) {
+            const auto now = std::chrono::steady_clock::now();
+            SotcStats::compile_phase_ns[i].fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(now - phase_start).count(),
+                std::memory_order_relaxed);
+            phase_start = now;
+        }
+    };
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
+    phase(0);
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
+    phase(1);
 
     vk::ShaderModule module;
 
     auto patch = GetShaderPatch(info.pgm_hash, info.hw_stage, perm_idx, "spv", spv);
+    phase(2);
     const bool is_patched = patch && EmulatorSettings.IsPatchShaders();
     if (is_patched) {
         LOG_INFO(Loader, "Loaded patch for {} shader {:#x}", info.hw_stage, info.pgm_hash);
@@ -798,8 +812,10 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     } else {
         module = CompileSPV(spv, instance.GetDevice());
     }
+    phase(3);
 
     RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
+    phase(4);
 
     const auto name = GetShaderName(info.hw_stage, info.pgm_hash, perm_idx);
     Vulkan::SetObjectName(instance.GetDevice(), module, name);
@@ -924,14 +940,24 @@ std::optional<std::vector<u32>> PipelineCache::GetShaderPatch(u64 hash, Shader::
 
     using namespace Common::FS;
     const auto patch_dir = GetUserPath(PathType::ShaderDir) / "patch";
-    if (!std::filesystem::exists(patch_dir)) {
-        std::filesystem::create_directories(patch_dir);
-    }
+    // sotc: the patch folder is listed once; two filesystem checks per compiled shader cost
+    // ~0.34 s over a 200 s attract run with an empty shader cache (7% of the compile time).
+    static const std::unordered_set<std::string> patch_files = [&] {
+        std::unordered_set<std::string> names;
+        std::error_code ec;
+        if (!std::filesystem::exists(patch_dir, ec)) {
+            std::filesystem::create_directories(patch_dir, ec);
+        }
+        for (const auto& entry : std::filesystem::directory_iterator(patch_dir, ec)) {
+            names.insert(entry.path().filename().string());
+        }
+        return names;
+    }();
     const auto filename = fmt::format("{}.{}", GetShaderName(stage, hash, perm_idx), ext);
-    const auto filepath = patch_dir / filename;
-    if (!std::filesystem::exists(filepath)) {
+    if (!patch_files.contains(filename)) {
         return {};
     }
+    const auto filepath = patch_dir / filename;
     const u64 generated_hash = XXH3_64bits(generated.data(), generated.size_bytes());
     auto base_path = filepath;
     base_path += ".base";

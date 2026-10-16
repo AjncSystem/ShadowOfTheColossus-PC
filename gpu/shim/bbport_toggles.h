@@ -133,7 +133,6 @@ inline std::atomic<std::uint64_t> gpu_sys_us{0}, gpu_user_us{0}, gpu_invol_switc
     gpu_vol_switches{0}, gpu_minor_faults{0};
 /// Protection faults (signals) taken by the GPU thread itself.
 inline std::atomic<std::uint64_t> gpu_signal_faults{0};
-/// Protection changes: calls and pages, those removing write access (TLB shootdowns) apart.
-inline std::atomic<std::uint64_t> protect_calls{0}, protect_pages{0}, protect_revoke_calls{0},
-    protect_revoke_pages{0};
+// sotc: protect_calls/protect_pages/protect_revoke_* removed (written in AddressSpace::Protect,
+// never read).
 } // namespace BbStats

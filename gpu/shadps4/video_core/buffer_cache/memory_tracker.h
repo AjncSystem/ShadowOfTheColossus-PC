@@ -79,14 +79,20 @@ public:
     }
 
     /// Removes all protection from a page and ensures GPU data has been flushed if requested
-    void InvalidateRegion(VAddr cpu_addr, u64 size, auto&& on_flush) noexcept {
+    /// sotc: guest_fault (a guest thread's write fault) feeds the repeat-fault grace.
+    void InvalidateRegion(VAddr cpu_addr, u64 size, auto&& on_flush,
+                          bool guest_fault = false) noexcept {
         if (readbacks_mode == GpuReadbacksMode::Disabled) {
             return MarkRegionAsCpuModified(cpu_addr, size);
         }
         bool should_flush = false;
-        IteratePages(cpu_addr, size, [&should_flush](RegionManager* manager, u64 offset, u64 size) {
+        IteratePages(cpu_addr, size, [&should_flush, guest_fault](RegionManager* manager,
+                                                                 u64 offset, u64 size) {
             const auto bounds = manager->GetBounds(offset, size);
             manager->Lock(bounds);
+            if (guest_fault) {
+                manager->NoteGuestWriteFaultLocked(offset);
+            }
             const bool modified = manager->template IsRegionModified<Type::GPU>(offset, size);
             if (!modified) {
                 manager->template ChangeRegionState<StateOp::Set, StateOp::None, false>(offset,

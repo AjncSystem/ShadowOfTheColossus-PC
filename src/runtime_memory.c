@@ -904,14 +904,26 @@ const unsigned char *runtime_memory_backing_pointer(uintptr_t address) {
     return p;
 }
 /* Mapped length from address, up to size, across adjacent mappings. */
+/* sotc: mapped length of [address, address+size) from the cached regions alone, walking
+ * adjacent mappings (buffers that span two VMAs missed the one-region check every time and took
+ * the read lock); 0 when a region on the way is not cached. */
+static uint64_t cached_mapped_length(uintptr_t address, uint64_t size) {
+    if (runtime_disabled_optimizations & 1) return 0;
+    uint64_t length=0;
+    for (unsigned hops=0; length<size && hops<4; ++hops) {
+        const CachedRegion *c=cached_region(address+length);
+        if (!c || c->kind==KIND_RESERVED) return 0;
+        length=c->end-address;
+    }
+    return length>=size ? size : 0;
+}
 uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size) {
-    const CachedRegion *c=(runtime_disabled_optimizations & 1) ? NULL : cached_region(address);
-    if (c && c->kind!=KIND_RESERVED && size<=c->end-address) return size;
+    if (size && cached_mapped_length(address,size)==size) return size;
     read_lock();
-    { size_t i=vma_index(address); if (i<vma_count && vmas[i].start<=address) cache_region(i,address); }
     uint64_t length=0;
     for (size_t i=vma_index(address); i<vma_count && length<size; ++i) {
         if (vmas[i].start>address+length || vmas[i].kind==KIND_RESERVED) break;
+        cache_region(i,vmas[i].start>address ? vmas[i].start : address);
         length=vmas[i].end-address;
     }
     read_unlock();
@@ -965,10 +977,16 @@ void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int 
 }
 /* Host view of a guest range, for the GPU backend: the range must be mapped. */
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size) {
-    const CachedRegion *c=(runtime_disabled_optimizations & 1) ? NULL : cached_region(address);
-    if (c && c->kind!=KIND_RESERVED && size<=c->end-address) return 1;
+    if (size && cached_mapped_length(address,size)==size) return 1;
     read_lock();
     int result=covered(address,address+size,0);
+    if (result) {
+        uintptr_t at=address;
+        for (size_t i=vma_index(address); i<vma_count && at<address+size; ++i) {
+            cache_region(i,at);
+            at=vmas[i].end;
+        }
+    }
     read_unlock();
     return result;
 }

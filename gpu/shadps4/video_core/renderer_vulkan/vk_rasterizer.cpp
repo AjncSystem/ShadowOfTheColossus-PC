@@ -818,8 +818,10 @@ void Rasterizer::FlushPeriodic() {
                    : 0u;
     }();
     // sotc: the command buffer wrote a page the guest reads back: submit it now, the GPU runs
-    // it while the guest gets there, and the readback finds it done (or nearly). SOTC_RB_EARLY=1
-    // turns it on; measured within noise on the attract demo, so off by default.
+    // it while the guest gets there, and the readback finds it done (or nearly). Within noise
+    // when the command processor was slower; on by default since 2026-10-16 (SOTC_RB_EARLY=0
+    // off): attract demo 53.6/54.5 -> 55.3/55.7 FPS (open world: 400-490 readbacks/s waited
+    // ~10% of the thread), Shrine unchanged (34.2 vs 34.1).
     if (SotcStats::kFpsLog) { // sotc: read only by the SOTC_FPS printer (sotc_stats.h)
         // sotc: written by this thread only: a plain add, no lock prefix (an atomic RMW here
         // waits for the thread's pending stores, ~1.8% of it). The printer takes deltas.
@@ -828,7 +830,7 @@ void Rasterizer::FlushPeriodic() {
     }
     static const bool early = [] {
         const char* v = std::getenv("SOTC_RB_EARLY");
-        return v && v[0] == '1';
+        return !v || v[0] != '0';
     }();
     if (early && !scheduler.IsRendering() && buffer_cache.TakeHotWrite()) {
         SotcStats::early_flushes.fetch_add(1, std::memory_order_relaxed);

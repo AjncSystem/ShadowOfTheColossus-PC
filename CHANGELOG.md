@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.57-opt2 — 2026-10-16 (fork Oussama268)
+- **Muito menos engasgos ao entrar em áreas novas (placas de 6 GB):** texturas cujo T# começa num
+  nível de mip acima de 0 nunca usam os mips mais finos, mas o port guardava a cadeia inteira na
+  memória de vídeo. Agora essas texturas só de leitura guardam apenas os mips usados ("mip tail").
+  No demo da tela de título o pico de memória de vídeo caiu de ~6,1 GB para ~3,4 GB numa placa
+  de 6 GB, os quadros acima de 50 ms caíram de 150 para ~105 e o pior quadro ao carregar uma área
+  de 460 ms para ~280 ms. Imagem idêntica. `SOTC_MIP_TAIL=0` desliga.
+- **Leituras da GPU assíncronas por padrão:** quando o jogo lê memória escrita pela GPU (todo
+  quadro), só a thread do jogo espera a GPU; o processador de comandos segue trabalhando. Santuário
+  29,2 → 30,7 FPS; no demo, ~25% menos quadros acima de 50 ms. `SOTC_RB_ASYNC=0` desliga.
+- **Memória de buffers devolvida ao desmapear:** antes ela nunca voltava e a memória de vídeo
+  crescia ~90 MB por minuto (1,6 → 6,0 GB em 48 minutos no demo), até faltar memória. Agora cresce
+  bem mais devagar (24 minutos: 4,1 GB em vez de 4,8–5,0 GB). Era opcional por causa de uma queda
+  antiga ao carregar save, que não se repetiu nos testes (3 carregamentos, 25 minutos de demo).
+  `SOTC_ARENA_RELEASE=0` volta ao comportamento antigo.
+- Com tudo isso ligado, o demo rodou a 49,9 FPS de média com 47 quadros acima de 50 ms (antes:
+  ~47 FPS e 100–150).
+- **Quedas deixam registro:** o lançador guarda os logs das últimas 5 sessões (`last_run.1.log`
+  …) e copia o log de uma sessão que terminou com erro para `user/crashes/`; o bb-probe grava ali
+  um minidump (`.dmp`) quando o jogo cai. `SOTC_MINIDUMP=0` desliga o dump.
+- **Relatório de engasgos para desenvolvedores:** com `SOTC_FPS=1` o log mostra a cada 5 s o
+  tempo de quadro (mediana, 1% low, pior quadro) e onde foi o tempo dos quadros lentos;
+  `tools/frame_report.py` resume um log.
+- Memória de buffers em blocos de 4 MB em vez de uma alocação por pedido (`SOTC_ARENA_SLAB_MB`),
+  cópia de envios grandes em paralelo (`SOTC_COPY_BATCH`).
+- **Ainda não resolvido:** na primeira vez em cada área os shaders são compilados e o jogo engasga
+  (até 1–2 s); da segunda vez em diante fica liso. Compilação em segundo plano é o próximo passo.
+- Na primeira abertura alguns shaders novos são compilados (poucos segundos); o cache existente
+  continua valendo.
+
 ## 0.57 — 2026-10-14
 - **Placas AMD: correção das cores verdes/rosas** na névoa, no Wander e no Agro (issues #6, #7, #9,
   possivelmente #10). A AMD informa grupos de 64 threads, mas só deixa fixar esse tamanho nos

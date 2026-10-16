@@ -245,14 +245,15 @@ GraphicsPipeline::GraphicsPipeline(
         });
     }
 
-    const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
-        .requiredSubgroupSize = 64,
-    };
-    for (auto& stage : shader_stages) {
-        stage.pNext = instance.IsSubgroupSize64Supported() &&
-                              instance.CanRequireSubgroupSize(stage.stage)
-                          ? &subgroup_size_ci
-                          : nullptr;
+    // sotc: 64 where every stage can be pinned to it; on Intel the recompiler's lane count
+    // (Instance::RequiredSubgroupSize).
+    std::array<vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo, MaxShaderStages>
+        subgroup_size_cis{};
+    for (size_t i = 0; i < shader_stages.size(); ++i) {
+        auto& stage = shader_stages[i];
+        const u32 size = instance.RequiredSubgroupSize(stage.stage);
+        subgroup_size_cis[i].requiredSubgroupSize = size;
+        stage.pNext = size != 0 ? &subgroup_size_cis[i] : nullptr;
     }
 
     const auto depth_format =
@@ -489,7 +490,7 @@ template void GraphicsPipeline::GetVertexInputs(
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
     VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1) const;
 
-void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
+void GraphicsPipeline::BuildDescSetLayout([[maybe_unused]] bool preloading) {
     boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;
     u32 binding{};
 
@@ -498,10 +499,9 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             continue;
         }
         const auto stage_bit = LogicalStageToStageBit[u32(stage->sw_stage)];
-        for (const auto& buffer : stage->buffers) {
-            const auto sharp =
-                preloading ? AmdGpu::Buffer{}
-                           : buffer.GetSharp(*stage); // See for the comment in compute PL creation
+        // sotc: the buffer sharp read here was unused (see the comment in compute PL creation);
+        // dropped so that a pipeline built on a worker thread never reads the guest's user data.
+        for ([[maybe_unused]] const auto& buffer : stage->buffers) {
             bindings.push_back({
                 .binding = binding++,
                 .descriptorType = vk::DescriptorType::eStorageBuffer,

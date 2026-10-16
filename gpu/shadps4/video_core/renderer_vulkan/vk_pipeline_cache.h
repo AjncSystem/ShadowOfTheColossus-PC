@@ -3,6 +3,10 @@
 
 #pragma once
 
+#include <atomic>
+#include <functional>
+#include <future>
+#include <optional>
 #include <variant>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
@@ -147,6 +151,53 @@ private:
     tsl::robin_map<vk::ShaderModule,
                    std::vector<std::variant<GraphicsPipelineKey, ComputePipelineKey>>>
         module_related_pipelines;
+
+    // sotc: graphics pipelines compiled on a worker thread (Intel; GetGraphicsPipeline). Their
+    // graphics_pipelines entry stays empty, and the draws using them are skipped, until done.
+    // Declared last: destroying it waits for the jobs, which use the members above.
+    // finished_jobs counts jobs done since InstallFinishedPipelines last looked.
+    std::atomic<u32> finished_jobs{0};
+    struct PendingGraphicsPipeline {
+        std::array<Shader::Info, MaxShaderStages> info_copies{};
+        std::array<const Shader::Info*, MaxShaderStages> live_infos{};
+        std::array<const Shader::Info*, MaxShaderStages> copy_ptrs{};
+        std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+        std::array<vk::ShaderModule, MaxShaderStages> modules{};
+        std::optional<Shader::Gcn::FetchShaderData> fetch_shader;
+        GraphicsPipeline::SerializationSupport sdata{};
+        std::unique_ptr<GraphicsPipeline> pipeline;
+        size_t hash{};
+        std::atomic<bool> done{false};
+        std::future<void> job;
+    };
+    // sotc: during WarmUp on Intel, Load*Pipeline queue the pipeline builds here instead of
+    // building them one after another; WarmUp runs them on several threads (build), then
+    // installs them in the maps on this thread (install).
+    struct PreloadJob {
+        std::function<void()> build;
+        std::function<void()> install;
+    };
+    std::vector<PreloadJob>* preload_jobs{};
+    bool AsyncGraphicsPipelines() const;
+    void StartGraphicsPipeline(size_t pipeline_hash);
+    const GraphicsPipeline* FinishGraphicsPipeline();
+    tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<PendingGraphicsPipeline>> pending_graphics;
+
+    // sotc: the same for compute pipelines (their dispatches are skipped until done).
+    struct PendingComputePipeline {
+        Shader::Info info_copy{};
+        const Shader::Info* live_info{};
+        vk::ShaderModule module{};
+        ComputePipeline::SerializationSupport sdata{};
+        std::unique_ptr<ComputePipeline> pipeline;
+        std::atomic<bool> done{false};
+        std::future<void> job;
+    };
+    bool AsyncComputePipelines() const;
+    void StartComputePipeline();
+    const ComputePipeline* FinishComputePipeline();
+    void InstallFinishedPipelines();
+    tsl::robin_map<ComputePipelineKey, std::unique_ptr<PendingComputePipeline>> pending_compute;
 };
 
 } // namespace Vulkan

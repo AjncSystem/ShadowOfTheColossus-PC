@@ -1,14 +1,19 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <ranges>
+#include <semaphore>
+#include <thread>
 #include <xxhash.h>
 
 #include "common/elf_info.h"
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -365,10 +370,18 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     if (!RefreshGraphicsKey()) {
         return nullptr;
     }
+    InstallFinishedPipelines();
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
+    if (!is_new && !it->second) {
+        return FinishGraphicsPipeline();
+    }
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
+        if (AsyncGraphicsPipelines()) {
+            StartGraphicsPipeline(pipeline_hash);
+            return nullptr;
+        }
 
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
@@ -390,14 +403,194 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     return it->second.get();
 }
 
+// sotc: Intel Arc compiles some of this game's pipelines for seconds to minutes, and built on the
+// command processor thread the game froze meanwhile. On Intel a new graphics pipeline is built on
+// a worker thread from copies of the stage infos, and the draws that need it are skipped until it
+// is ready (an object can show up a few frames late the first time). Compute pipelines: see
+// AsyncComputePipelines. SOTC_ASYNC_PIPELINES=0/1 overrides.
+bool PipelineCache::AsyncGraphicsPipelines() const {
+    static const bool enabled = [this] {
+        // Without dynamic vertex input the pipeline reads the guest's vertex buffers when built.
+        if (!instance.IsVertexInputDynamicState()) {
+            return false;
+        }
+        if (const char* v = std::getenv("SOTC_ASYNC_PIPELINES")) {
+            return std::atoi(v) != 0;
+        }
+        return instance.GetVendorID() == 0x8086;
+    }();
+    return enabled;
+}
+
+// sotc: the worker-thread compiles share a few slots and run at low priority, so the game's own
+// threads keep their cores while a burst of new shaders compiles.
+static std::counting_semaphore<64>& CompileSlots() {
+    static std::counting_semaphore<64> slots{
+        static_cast<std::ptrdiff_t>(std::clamp(std::thread::hardware_concurrency() / 6, 2u, 4u))};
+    return slots;
+}
+
+static void BeginBackgroundCompile() {
+    Common::SetCurrentThreadName("shadPS4:PipelineCompile");
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
+    CompileSlots().acquire();
+}
+
+void PipelineCache::StartGraphicsPipeline(size_t pipeline_hash) {
+    auto pending = std::make_unique<PendingGraphicsPipeline>();
+    auto& p = *pending;
+    p.hash = pipeline_hash;
+    for (size_t i = 0; i < MaxShaderStages; ++i) {
+        p.live_infos[i] = infos[i];
+        if (infos[i]) {
+            p.info_copies[i] = *infos[i];
+            p.copy_ptrs[i] = &p.info_copies[i];
+        }
+    }
+    p.runtime_infos = runtime_infos;
+    p.modules = modules;
+    if (fetch_shader) {
+        p.fetch_shader = *fetch_shader;
+    }
+    p.job = std::async(std::launch::async, [this, key = graphics_key, &p] {
+        BeginBackgroundCompile();
+        struct Release {
+            PendingGraphicsPipeline& p;
+            std::atomic<u32>& finished;
+            ~Release() {
+                CompileSlots().release();
+                p.done.store(true, std::memory_order_release);
+                finished.fetch_add(1, std::memory_order_release);
+            }
+        } release{p, finished_jobs};
+        p.pipeline = std::make_unique<GraphicsPipeline>(
+            instance, scheduler, desc_heap, profile, key, *pipeline_cache, p.copy_ptrs,
+            p.runtime_infos, p.fetch_shader ? &*p.fetch_shader : nullptr, p.modules, p.sdata,
+            false);
+    });
+    pending_graphics.insert_or_assign(graphics_key, std::move(pending));
+}
+
+// The pipeline is still being built (InstallFinishedPipelines installs it once done); restart the
+// job if it went missing.
+const GraphicsPipeline* PipelineCache::FinishGraphicsPipeline() {
+    if (!pending_graphics.contains(graphics_key)) {
+        StartGraphicsPipeline(std::hash<GraphicsPipelineKey>{}(graphics_key));
+    }
+    return nullptr;
+}
+
+// sotc: every finished worker-thread pipeline is installed and saved to the cache here, also the
+// ones the game does not ask for again (a pass drawn or dispatched once): otherwise they never
+// reached the cache and were skipped again on every launch.
+void PipelineCache::InstallFinishedPipelines() {
+    if (finished_jobs.exchange(0, std::memory_order_acq_rel) == 0) {
+        return;
+    }
+    // done is set as a job's last step; get() then only waits for it to return.
+    const auto ready = [](auto& p) { return p.done.load(std::memory_order_acquire); };
+    for (auto pit = pending_graphics.begin(); pit != pending_graphics.end();) {
+        auto& p = *pit.value();
+        if (!ready(p)) {
+            ++pit;
+            continue;
+        }
+        p.job.get();
+        const GraphicsPipelineKey key = pit.key();
+        p.pipeline->SetStages(p.live_infos);
+        graphics_pipelines[key] = std::move(p.pipeline);
+        RegisterPipelineData(key, p.hash, p.sdata);
+        ++num_new_pipelines;
+        if (EmulatorSettings.IsShaderCollect()) {
+            for (size_t stage = 0; stage < MaxShaderStages; ++stage) {
+                if (p.live_infos[stage]) {
+                    module_related_pipelines[p.modules[stage]].emplace_back(key);
+                }
+            }
+        }
+        pit = pending_graphics.erase(pit);
+    }
+    for (auto pit = pending_compute.begin(); pit != pending_compute.end();) {
+        auto& p = *pit.value();
+        if (!ready(p)) {
+            ++pit;
+            continue;
+        }
+        p.job.get();
+        const ComputePipelineKey key = pit.key();
+        std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
+        stages[u32(Shader::SwStage::Compute)] = p.live_info;
+        p.pipeline->SetStages(stages);
+        compute_pipelines[key] = std::move(p.pipeline);
+        RegisterPipelineData(key, p.sdata);
+        ++num_new_pipelines;
+        if (EmulatorSettings.IsShaderCollect()) {
+            module_related_pipelines[p.module].emplace_back(key);
+        }
+        pit = pending_compute.erase(pit);
+    }
+}
+
+// sotc: compute pipelines take Intel's compiler tens of seconds too. On Intel they are also built
+// on a worker thread and their dispatches skipped meanwhile: an effect can be missing for those
+// frames, and the game reads such results back late. SOTC_ASYNC_COMPUTE=0/1 overrides.
+bool PipelineCache::AsyncComputePipelines() const {
+    static const bool enabled = [this] {
+        if (const char* v = std::getenv("SOTC_ASYNC_COMPUTE")) {
+            return std::atoi(v) != 0;
+        }
+        return instance.GetVendorID() == 0x8086;
+    }();
+    return enabled;
+}
+
+void PipelineCache::StartComputePipeline() {
+    auto pending = std::make_unique<PendingComputePipeline>();
+    auto& p = *pending;
+    p.live_info = infos[0];
+    p.info_copy = *infos[0];
+    p.module = modules[0];
+    p.job = std::async(std::launch::async, [this, key = compute_key, &p] {
+        BeginBackgroundCompile();
+        struct Done {
+            PendingComputePipeline& p;
+            std::atomic<u32>& finished;
+            ~Done() {
+                CompileSlots().release();
+                p.done.store(true, std::memory_order_release);
+                finished.fetch_add(1, std::memory_order_release);
+            }
+        } done{p, finished_jobs};
+        p.pipeline = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
+                                                       *pipeline_cache, key, p.info_copy,
+                                                       p.module, p.sdata, false);
+    });
+    pending_compute.insert_or_assign(compute_key, std::move(pending));
+}
+
+const ComputePipeline* PipelineCache::FinishComputePipeline() {
+    if (!pending_compute.contains(compute_key)) {
+        StartComputePipeline();
+    }
+    return nullptr;
+}
+
 const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (!RefreshComputeKey()) {
         return nullptr;
     }
+    InstallFinishedPipelines();
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
+    if (!is_new && !it->second) {
+        return FinishComputePipeline();
+    }
     if (is_new) {
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
+        if (AsyncComputePipelines()) {
+            StartComputePipeline();
+            return nullptr;
+        }
 
         ComputePipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,

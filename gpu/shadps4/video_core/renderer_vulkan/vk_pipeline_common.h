@@ -57,6 +57,14 @@ public:
         return is_compute;
     }
 
+    /// sotc: points the stages at the live shader infos once a worker thread has built the
+    /// pipeline from copies of them (PipelineCache::GetGraphicsPipeline).
+    void SetStages(std::span<const Shader::Info* const> infos) {
+        for (size_t i = 0; i < infos.size() && i < stages.size(); ++i) {
+            stages[i] = infos[i];
+        }
+    }
+
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
     void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data) const;
 

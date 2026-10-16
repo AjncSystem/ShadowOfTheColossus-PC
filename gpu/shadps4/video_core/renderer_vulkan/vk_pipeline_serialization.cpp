@@ -1,7 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <optional>
+#include <thread>
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -165,9 +170,28 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     ASSERT(is_new);
 
-    it.value() =
-        std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile, *pipeline_cache,
-                                          compute_key, *infos[0], modules[0], sdata, true);
+    if (preload_jobs) {
+        struct State {
+            ComputePipelineKey key;
+            const Shader::Info* info;
+            vk::ShaderModule module;
+            ComputePipeline::SerializationSupport sdata;
+            std::unique_ptr<ComputePipeline> pipeline;
+        };
+        auto state = std::make_shared<State>(State{compute_key, infos[0], modules[0], sdata, {}});
+        preload_jobs->push_back({
+            [this, state] {
+                state->pipeline = std::make_unique<ComputePipeline>(
+                    instance, scheduler, desc_heap, profile, *pipeline_cache, state->key,
+                    *state->info, state->module, state->sdata, true);
+            },
+            [this, state] { compute_pipelines[state->key] = std::move(state->pipeline); },
+        });
+    } else {
+        it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
+                                                       *pipeline_cache, compute_key, *infos[0],
+                                                       modules[0], sdata, true);
+    }
 
     infos.fill(nullptr);
     modules.fill(nullptr);
@@ -245,9 +269,37 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     ASSERT(is_new);
 
-    it.value() = std::make_unique<GraphicsPipeline>(
-        instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-        runtime_infos, fetch_shader, modules, sdata, true);
+    if (preload_jobs) {
+        // Copies: the fetch shader data lives in a module list that later loads can grow.
+        struct State {
+            GraphicsPipelineKey key;
+            std::array<const Shader::Info*, MaxShaderStages> infos;
+            std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos;
+            std::optional<Shader::Gcn::FetchShaderData> fetch;
+            std::array<vk::ShaderModule, MaxShaderStages> modules;
+            GraphicsPipeline::SerializationSupport sdata;
+            std::unique_ptr<GraphicsPipeline> pipeline;
+        };
+        std::optional<Shader::Gcn::FetchShaderData> fetch;
+        if (fetch_shader) {
+            fetch = *fetch_shader;
+        }
+        auto state = std::make_shared<State>(
+            State{graphics_key, infos, runtime_infos, std::move(fetch), modules, sdata, {}});
+        preload_jobs->push_back({
+            [this, state] {
+                state->pipeline = std::make_unique<GraphicsPipeline>(
+                    instance, scheduler, desc_heap, profile, state->key, *pipeline_cache,
+                    state->infos, state->runtime_infos, state->fetch ? &*state->fetch : nullptr,
+                    state->modules, state->sdata, true);
+            },
+            [this, state] { graphics_pipelines[state->key] = std::move(state->pipeline); },
+        });
+    } else {
+        it.value() = std::make_unique<GraphicsPipeline>(
+            instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
+            runtime_infos, fetch_shader, modules, sdata, true);
+    }
 
     infos.fill(nullptr);
     modules.fill(nullptr);
@@ -364,6 +416,20 @@ void PipelineCache::WarmUp() {
     u32 num_total_pipelines{};
     const auto warmup_start = std::chrono::steady_clock::now();
 
+    // sotc: on Intel the pipelines are built on several threads: the driver compiles one at a
+    // time per thread, and a cache of ~1300 pipelines took many minutes on one core after a
+    // driver update or a change of compile options. SOTC_PARALLEL_PRELOAD=0/1 overrides.
+    const bool parallel = [this] {
+        if (const char* v = std::getenv("SOTC_PARALLEL_PRELOAD")) {
+            return std::atoi(v) != 0;
+        }
+        return instance.GetVendorID() == 0x8086;
+    }();
+    std::vector<PreloadJob> jobs;
+    if (parallel) {
+        preload_jobs = &jobs;
+    }
+
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
             ++num_total_pipelines;
@@ -398,6 +464,32 @@ void PipelineCache::WarmUp() {
                 ++num_pipelines;
             }
         });
+
+    preload_jobs = nullptr;
+    if (!jobs.empty()) {
+        const u32 hw = std::thread::hardware_concurrency();
+        const u32 num_workers = std::clamp(hw > 2 ? hw - 2 : 1u, 1u, 16u);
+        LOG_INFO(Render, "Preloading pipelines: 0/{} on {} threads", jobs.size(), num_workers);
+        std::atomic<size_t> next{0};
+        std::atomic<size_t> done{0};
+        {
+            std::vector<std::jthread> workers;
+            for (u32 w = 0; w < num_workers; ++w) {
+                workers.emplace_back([&] {
+                    for (size_t i; (i = next.fetch_add(1)) < jobs.size();) {
+                        jobs[i].build();
+                        const size_t n = done.fetch_add(1) + 1;
+                        if (n % 25 == 0 || n == jobs.size()) {
+                            LOG_INFO(Render, "Preloading pipelines: {}/{}", n, jobs.size());
+                        }
+                    }
+                });
+            }
+        }
+        for (auto& job : jobs) {
+            job.install();
+        }
+    }
 
     LOG_INFO(Render, "Preloaded {} pipelines in {} ms", num_pipelines,
              std::chrono::duration_cast<std::chrono::milliseconds>(

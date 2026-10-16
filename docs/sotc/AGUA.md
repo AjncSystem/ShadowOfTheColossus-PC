@@ -1,84 +1,84 @@
-# Água do SotC no port: o que estava errado e como foi achado
+# SotC water in the port: what was wrong and how it was found
 
-Registro das correções da água (outubro de 2026), para não repetir a investigação.
+Record of the water fixes (October 2026), so the investigation does not need to be repeated.
 
-## Sintomas
+## Symptoms
 
-- A água ficava lisa, como espelho, sem ondas. Só ondulava muito perto do Wander.
-- O lago perto da cascata refletia só objetos próximos. Longe, a superfície ficava escura e lisa.
-- Os lagos e rios do mundo aberto, abaixo das cascatas, ficavam totalmente parados.
+- The water was smooth like a mirror, with no waves. It only rippled very close to Wander.
+- The lake near the waterfall reflected only nearby objects. Farther away, the surface was dark and smooth.
+- The open-world lakes and rivers below the waterfalls were completely still.
 
-## Dois tipos de água
+## Two types of water
 
-1. **Água com simulação** (lago perto da cascata, shader `fs 8356` na captura do lago).
-   A CPU atualiza uma textura de simulação de 512×512 em volta do Wander, e o shader de vértices
-   tira a normal dela. Fora desse quadrado, as ondas vêm de mapas de normal.
-2. **Água com mapa de fluxo** (lagos e rios do mundo aberto, `fs 0xc65f86f1`). Não tem
-   simulação: as ondas são mapas de normal BC5 deslocados por um mapa de fluxo e por um relógio
-   (`srt[69]`, tempo × velocidade `srt[184]`, com duas fases `fract`).
+1. **Simulated water** (lake near the waterfall, shader `fs 8356` in the lake capture).
+   The CPU updates a 512×512 simulation texture around Wander, and the vertex shader
+   derives the normal from it. Outside this square, waves come from normal maps.
+2. **Flow-map water** (open-world lakes and rivers, `fs 0xc65f86f1`). It has no
+   simulation: waves are BC5 normal maps offset by a flow map and a clock
+   (`srt[69]`, time × speed `srt[184]`, with two `fract` phases).
 
-## Correção 1: DMA ligado por padrão (`294b68e`)
+## Fix 1: DMA enabled by default (`294b68e`)
 
-O shader de reflexo em espaço de tela (compute) lê, para cada raio, um registro de *probe* de
-224 bytes com índice calculado em tempo de execução. O passo que "achata" as leituras de memória
-do shader não consegue resolver esse índice. Sem DMA, a leitura caía em `srt_flatbuf.data[0]`,
-então todo pixel usava o mesmo registro.
+The screen-space reflection shader (compute) reads a 224-byte *probe* record for each ray,
+using a runtime-computed index. The step that "flattens" shader memory reads cannot resolve
+this index. Without DMA, the read fell back to `srt_flatbuf.data[0]`, so every pixel used the
+same record.
 
-O Pink-shadPS4 liga `direct_memory_access_enabled` no `CUSA08809.json`. Com DMA, essas leituras
-viram acessos diretos à memória do jogo (tabela de páginas BDA). Agora é o padrão do port
-(`BB_DIRECT_MEMORY_ACCESS`, em `gpu/shim/core/emulator_settings.h`). Só uns 4 shaders passam a
-usar DMA, e o custo medido é desprezível.
+Pink-shadPS4 enables `direct_memory_access_enabled` in `CUSA08809.json`. With DMA, these reads
+become direct accesses to game memory (BDA page table). This is now the port default
+(`BB_DIRECT_MEMORY_ACCESS`, in `gpu/shim/core/emulator_settings.h`). Only about 4 shaders start
+using DMA, and the measured cost is negligible.
 
-## Correção 2: `S_WQM_B64` (`debb0c4`)
+## Fix 2: `S_WQM_B64` (`debb0c4`)
 
-No começo do shader da água do mundo aberto:
+At the start of the open-world water shader:
 
 ```
-s_mov_b32  vcc_hi, 0x384        ; o jogo usa vcc_hi como registrador comum
+s_mov_b32  vcc_hi, 0x384        ; the game uses vcc_hi as a general-purpose register
 ...
-s_wqm_b64  vcc, exec            ; VCC = máscara de threads ativas (modo "quad inteiro")
+s_wqm_b64  vcc, exec            ; VCC = active-thread mask ("whole quad" mode)
 ...
 v_cmp_nle_f32 s[12:13], v9, s87 ; s87 = 0.05
 s_and_saveexec_b64 s[88:89], vcc
 ```
 
-O recompilador tratava `S_WQM_B64` como "não faça nada", o que só é seguro em
-`s_wqm_b64 exec, exec`. Aqui o destino é VCC: a metade de baixo de VCC ficava indefinida e a de
-cima valia 0x384 (900). Numa GPU NVIDIA (subgrupos de 32), só a metade indefinida conta, então o
-ramo que aplica o mapa de fluxo nunca rodava. O shader escrevia sempre a mesma normal, reta para
-cima (`0x16ffb801` no G-buffer).
+The recompiler treated `S_WQM_B64` as a "no-op," which is only safe for
+`s_wqm_b64 exec, exec`. Here the destination is VCC: the lower half of VCC was undefined and the
+upper half was 0x384 (900). On an NVIDIA GPU (32-wide subgroups), only the undefined half matters,
+so the branch that applies the flow map never ran. The shader always wrote the same straight-up
+normal (`0x16ffb801` in the G-buffer).
 
-Correção em `shader_recompiler/frontend/translate/scalar_alu.cpp`: quando o destino não é o
-EXEC, `S_WQM_B64` grava a máscara expandida para quads inteiros (um quad 2×2 com qualquer bit
-ligado fica com os quatro) e define o SCC. O Pink tem o mesmo problema.
+Fix in `shader_recompiler/frontend/translate/scalar_alu.cpp`: when the destination is not
+EXEC, `S_WQM_B64` writes the mask expanded to whole quads (a 2×2 quad with any bit set gets all
+four bits set) and sets SCC. Pink has the same issue.
 
-- A primeira versão só copiava a máscara. A água ficou certa, mas as copas das árvores distantes
-  ganharam "lixo colorido". A folhagem usa `s_wqm_b64` no teste de transparência para manter
-  vivos os vizinhos do quad, de que a GPU precisa para calcular o nível de detalhe da textura.
-  Sem a expansão, ela lia mips com lixo.
-- A expansão é feita por thread (cada pixel junta os 4 bits do seu quad com `QuadBroadcast` e
-  depois `Ballot`), não com deslocamentos na máscara de 64 bits. O passo de eliminação de
-  `InverseBallot` trata máscaras como um booleano por thread e aborta com uma constante como
+- The first version only copied the mask. The water looked correct, but distant treetops gained
+  "colored garbage." Foliage uses `s_wqm_b64` in the transparency test to keep neighboring quad
+  lanes active, which the GPU needs to calculate the texture level of detail. Without expansion,
+  it read garbage mips.
+- Expansion is performed per thread (each pixel gathers the 4 bits of its quad with
+  `QuadBroadcast` and then `Ballot`), not with shifts on the 64-bit mask. The `InverseBallot`
+  elimination pass treats masks as one boolean per thread and aborts on a constant such as
   `0x1111111111111111`.
-- Só 9 pixel shaders do jogo usam essa forma (`s_wqm_b64 vcc, exec` ou `vcc, vcc`).
-  `SOTC_WQM_COPY=0` volta ao comportamento antigo, para comparação.
+- Only 9 game pixel shaders use this form (`s_wqm_b64 vcc, exec` or `vcc, vcc`).
+  `SOTC_WQM_COPY=0` restores the old behavior for comparison.
 
-## Método (scripts em `tools/rdoc`; rodar com `qrenderdoc.exe --python <script>` e as variáveis `RD_*`)
+## Method (scripts in `tools/rdoc`; run with `qrenderdoc.exe --python <script>` and the `RD_*` variables)
 
-1. **Captura no RenderDoc:** `SOTC_WRAP` (JSON com `renderdoccmd capture`) +
-   `SOTC_RDOC_SUBMITS=8` + `SOTC_RECORD_THREAD=0`, e F12 no jogo. Abrir a captura exige o jogo
-   fechado, porque não sobra VRAM. O primeiro quadro tem argumentos indiretos com lixo; use os
-   quadros seguintes.
-2. **Achar o draw:** listar os draws por shader e texturas (`rd_findps.py`). O histórico de
-   pixel do G-buffer (`rd_hist.py`) mostra qual draw escreveu cada pixel.
-3. **Conferir as entradas:** views e mips (`rd_views.py`, `rd_mipsminmax.py`), constantes
-   (`rd_flatdump.py`), buffers de vértice (`rd_vsbufs.py`) e saídas (`rd_raw.py`, que salva os
-   bytes do G-buffer para decodificar em Python).
-4. **Instrumentar o shader:** extrair o SPIR-V (`rd_spv.py`), desmontar com `spirv-dis`, trocar
-   o que vai para `frag_color0` por valores intermediários (`spv_probe.py`), montar com
-   `spirv-as`, substituir na captura (`BuildTargetShader` + `ReplaceResource`) e ler o pixel
-   (`rd_probe.py`). Foi assim que apareceu a normal reta e o ramo com `InverseBallot` sobre
+1. **Capture in RenderDoc:** `SOTC_WRAP` (JSON with `renderdoccmd capture`) +
+   `SOTC_RDOC_SUBMITS=8` + `SOTC_RECORD_THREAD=0`, then press F12 in the game. Opening the capture
+   requires the game to be closed because there is not enough VRAM left. The first frame has
+   garbage indirect arguments; use the following frames.
+2. **Find the draw:** list draws by shader and textures (`rd_findps.py`). The G-buffer pixel
+   history (`rd_hist.py`) shows which draw wrote each pixel.
+3. **Check the inputs:** views and mips (`rd_views.py`, `rd_mipsminmax.py`), constants
+   (`rd_flatdump.py`), vertex buffers (`rd_vsbufs.py`), and outputs (`rd_raw.py`, which saves the
+   G-buffer bytes for decoding in Python).
+4. **Instrument the shader:** extract SPIR-V (`rd_spv.py`), disassemble with `spirv-dis`, replace
+   the value sent to `frag_color0` with intermediate values (`spv_probe.py`), assemble with
+   `spirv-as`, replace it in the capture (`BuildTargetShader` + `ReplaceResource`), and read the pixel
+   (`rd_probe.py`). This revealed the straight-up normal and the branch with `InverseBallot` on
    `(Undef, 900)`.
-5. **Ver o código GCN:** `BB_DUMP_SHADERS=1` grava o IR e o binário de cada shader compilado em
-   `user/shader/dumps`. O `tools/rdoc/gcnscan.py` é um decodificador GCN mínimo que marca as
-   instruções que tocam VCC.
+5. **Inspect the GCN code:** `BB_DUMP_SHADERS=1` saves the IR and binary for each compiled shader
+   in `user/shader/dumps`. `tools/rdoc/gcnscan.py` is a minimal GCN decoder that marks
+   instructions that touch VCC.

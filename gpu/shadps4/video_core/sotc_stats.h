@@ -124,6 +124,9 @@ inline constexpr const char* kFrameCauseNames[FrameCauses] = {
 inline std::atomic<uint64_t> frame_copy_bytes{0};
 inline std::atomic<uint64_t> frame_ns[FrameCauses]{};
 inline std::atomic<uint64_t> frame_compiles{0}; ///< shader modules and pipelines created
+/// Phases of PipelineCache::CompileModule (SOTC_FPS, "SOTC COMPILE" line): translate, emit SPIR-V,
+/// shader patch lookup, vkCreateShaderModule, cache registration.
+inline std::atomic<uint64_t> compile_phase_ns[5]{};
 /// Memory allocations on the frame path per kind (SOTC_FPS, "SOTC ALLOC" line every 5 s):
 /// count, bytes and time.
 enum AllocKind { AllocArena, AllocStagingBlock, AllocStagingLarge, AllocKinds };

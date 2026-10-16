@@ -336,11 +336,13 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
         // (~100 conversions/s in the open world): each one created an image and freed the old
         // one (~3% of the GPU thread). The old image is parked as the new one's twin instead,
         // and the next conversion back reuses it when it has exactly the requested layout. The
-        // copy stays: the contents move every time. Opt-in (SOTC_DEPTH_TWIN=1) until measured:
-        // the A/B runs so far were all disturbed.
+        // copy stays: the contents move every time. On by default since 2026-10-16 (SOTC_DEPTH_TWIN=0
+        // off): at the Shrine a 960x540 D32S8/R32F pair was created and freed every frame (two
+        // dedicated allocations); with twins none, 31.8/31.1 -> 33.4/32.8 FPS (interleaved pairs),
+        // attract demo 50.3 -> 52.2 FPS, 1% low 30.0 -> 37.8, frames over 50 ms 53 -> 26.
         static const bool twins = [] {
             const char* v = std::getenv("SOTC_DEPTH_TWIN");
-            return v && v[0] == '1';
+            return !v || v[0] != '0';
         }();
         ImageId new_image_id{};
         if (const ImageId twin_id = cache_image.parked_twin) {

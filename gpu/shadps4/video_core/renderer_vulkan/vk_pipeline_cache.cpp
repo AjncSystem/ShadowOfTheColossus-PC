@@ -5,10 +5,12 @@
 #include <ranges>
 #include <xxhash.h>
 
+#include <algorithm>
 #include "common/elf_info.h"
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
+#include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -287,6 +289,16 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
     return info;
 }
 
+// sotc: SOTC_ASYNC_SHADERS=0 builds every graphics pipeline on the command processor, as
+// before (draws are never skipped for a pipeline being built).
+static bool AsyncShadersEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_ASYNC_SHADERS");
+        return !v || v[0] != '0';
+    }();
+    return enabled;
+}
+
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
@@ -357,9 +369,97 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
+
+    // sotc: pipeline workers for SOTC_ASYNC_SHADERS (see AsyncPipelineJob).
+    if (AsyncShadersEnabled()) {
+        const unsigned count = std::clamp(std::thread::hardware_concurrency() / 4, 1u, 3u);
+        for (unsigned i = 0; i < count; ++i) {
+            async_workers.emplace_back([this](std::stop_token token) { AsyncPipelineWorker(token); });
+        }
+    }
 }
 
 PipelineCache::~PipelineCache() = default;
+
+bool PipelineCache::AsyncPipelineEligible() const {
+    // Off the command processor the guest registers belong to later draws: only pipelines whose
+    // construction reads nothing from them. Vertex inputs are dynamic state (otherwise they are
+    // read from the vertex buffer sharps), and no image needs its sharp for its binding count.
+    if (!instance.IsVertexInputDynamicState() || EmulatorSettings.IsShaderCollect()) {
+        return false;
+    }
+    for (const auto* info : infos) {
+        if (!info) {
+            continue;
+        }
+        for (const auto& image : info->images) {
+            if (image.array_size == 0 &&
+                image.mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void PipelineCache::QueueAsyncPipeline(u64 hash) {
+    auto job = std::make_unique<AsyncPipelineJob>();
+    job->key = graphics_key;
+    job->hash = hash;
+    job->infos = infos;
+    job->runtime_infos = runtime_infos;
+    if (fetch_shader) {
+        job->fetch_shader = *fetch_shader;
+    }
+    job->modules = modules;
+    {
+        std::scoped_lock lock{async_mutex};
+        async_queue.push_back(std::move(job));
+    }
+    async_cv.notify_one();
+}
+
+void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
+    Common::SetCurrentThreadName("shadPS4:PipelineWorker");
+    for (;;) {
+        std::unique_ptr<AsyncPipelineJob> job;
+        {
+            std::unique_lock lock{async_mutex};
+            async_cv.wait(lock, token, [this] { return !async_queue.empty(); });
+            if (token.stop_requested()) {
+                return;
+            }
+            job = std::move(async_queue.front());
+            async_queue.pop_front();
+        }
+        job->pipeline = std::make_unique<GraphicsPipeline>(
+            instance, scheduler, desc_heap, profile, job->key, *pipeline_cache, job->infos,
+            job->runtime_infos, job->fetch_shader ? &*job->fetch_shader : nullptr, job->modules,
+            job->sdata, false, true);
+        SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
+        std::scoped_lock lock{async_mutex};
+        async_done.push_back(std::move(job));
+        async_done_count.fetch_add(1, std::memory_order_release);
+    }
+}
+
+void PipelineCache::CollectAsyncPipelines() {
+    std::vector<std::unique_ptr<AsyncPipelineJob>> done;
+    {
+        std::scoped_lock lock{async_mutex};
+        done.swap(async_done);
+        async_done_count.store(0, std::memory_order_relaxed);
+    }
+    for (auto& job : done) {
+        const auto it = graphics_pipelines.find(job->key);
+        if (it == graphics_pipelines.end()) {
+            continue;
+        }
+        it.value() = std::move(job->pipeline);
+        RegisterPipelineData(job->key, job->hash, job->sdata);
+        ++num_new_pipelines;
+    }
+}
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     draw_indirect_params = params;
@@ -377,10 +477,24 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         std::memcmp(&graphics_key, &last_graphics_key, sizeof(graphics_key)) == 0) {
         return last_graphics_pipeline;
     }
+    if (async_done_count.load(std::memory_order_acquire) != 0) {
+        CollectAsyncPipelines();
+    }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
+    if (!is_new && !it->second) {
+        return nullptr; // sotc: still being built by a pipeline worker (SOTC_ASYNC_SHADERS)
+    }
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
+        // Full-screen passes (post-processing, composition) are tiny draws: skipping one leaves
+        // a black or stale frame, so they still build here. Geometry draws are skipped while
+        // their pipeline is built (a brief pop-in instead of a freeze on first sight).
+        const bool tiny_draw = liverpool->regs.num_indices <= 6;
+        if (!async_workers.empty() && !tiny_draw && AsyncPipelineEligible()) {
+            QueueAsyncPipeline(pipeline_hash);
+            return nullptr; // the draws that need it are skipped until it is ready
+        }
 
         const SotcStats::FrameTimer frame_timer{SotcStats::FramePipeline};
         SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);

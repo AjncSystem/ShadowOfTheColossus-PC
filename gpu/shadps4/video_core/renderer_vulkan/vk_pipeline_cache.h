@@ -3,6 +3,12 @@
 
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <optional>
+#include <thread>
 #include <variant>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
@@ -122,6 +128,25 @@ private:
         return num_new_pipelines > 0;
     }
 
+    /// sotc: SOTC_ASYNC_SHADERS (default on): a new graphics pipeline is built on a worker
+    /// thread, and the draws that need it are skipped until it is ready (GetGraphicsPipeline
+    /// returns nullptr meanwhile; its map entry stays null while pending). Compute pipelines are
+    /// still built synchronously (the game reads compute results back).
+    struct AsyncPipelineJob {
+        GraphicsPipelineKey key;
+        u64 hash{};
+        std::array<const Shader::Info*, MaxShaderStages> infos{};
+        std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+        std::optional<Shader::Gcn::FetchShaderData> fetch_shader;
+        std::array<vk::ShaderModule, MaxShaderStages> modules{};
+        GraphicsPipeline::SerializationSupport sdata{};
+        std::unique_ptr<GraphicsPipeline> pipeline;
+    };
+    bool AsyncPipelineEligible() const;
+    void QueueAsyncPipeline(u64 hash);
+    void CollectAsyncPipelines();
+    void AsyncPipelineWorker(std::stop_token token);
+
 private:
     const Instance& instance;
     Scheduler& scheduler;
@@ -150,6 +175,15 @@ private:
     tsl::robin_map<vk::ShaderModule,
                    std::vector<std::variant<GraphicsPipelineKey, ComputePipelineKey>>>
         module_related_pipelines;
+
+    // sotc: SOTC_ASYNC_SHADERS state (see AsyncPipelineJob). The workers are declared last so
+    // they are stopped and joined before anything they use is destroyed.
+    std::mutex async_mutex;
+    std::condition_variable_any async_cv;
+    std::deque<std::unique_ptr<AsyncPipelineJob>> async_queue;
+    std::vector<std::unique_ptr<AsyncPipelineJob>> async_done;
+    std::atomic<u32> async_done_count{0};
+    std::vector<std::jthread> async_workers;
 };
 
 } // namespace Vulkan

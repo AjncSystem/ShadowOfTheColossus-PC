@@ -406,8 +406,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 // sotc: Intel Arc compiles some of this game's pipelines for seconds to minutes, and built on the
 // command processor thread the game froze meanwhile. On Intel a new graphics pipeline is built on
 // a worker thread from copies of the stage infos, and the draws that need it are skipped until it
-// is ready (an object can show up a few frames late the first time). Compute pipelines stay
-// synchronous: the game reads their results back. SOTC_ASYNC_PIPELINES=0/1 overrides.
+// is ready (an object can show up a few frames late the first time). Compute pipelines: see
+// AsyncComputePipelines. SOTC_ASYNC_PIPELINES=0/1 overrides.
 bool PipelineCache::AsyncGraphicsPipelines() const {
     static const bool enabled = [this] {
         // Without dynamic vertex input the pipeline reads the guest's vertex buffers when built.

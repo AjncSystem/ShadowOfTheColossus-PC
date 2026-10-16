@@ -92,6 +92,76 @@ struct ScopedTimer {
     }
 };
 
+/// sotc: where the time of slow frames goes (SOTC_FPS, "SOTC FRAMES" line in videoout/driver.cpp).
+/// Command-processor time per cause since the last flip; the flip reads and resets them.
+/// shader: shader translation (CompileModule); pipeline: pipeline creation; upload: texture uploads (RefreshImage); gc:
+/// emergency texture collections; readback: GPU-to-CPU downloads; image: new host images; buffer:
+/// CPU-to-GPU buffer uploads of bound ranges; dma: DMA sweeps; alloc: arena and staging memory
+/// allocation; hash: texture content hashes (RefreshImage); idle: waiting for the game to submit
+/// work. A readback inside an upload counts in
+/// both.
+enum FrameCause {
+    FrameCompile, FramePipeline, FrameUpload, FrameGc, FrameReadback, FrameImage, FrameBuffer,
+    FrameDma, FrameAlloc, FrameHash, FrameIdle, FrameCauses
+};
+inline constexpr const char* kFrameCauseNames[FrameCauses] = {
+    "shader", "pipeline", "upload", "gc",   "readback", "image",
+    "buffer", "dma",      "alloc",  "hash", "idle"};
+/// Bytes copied from guest memory to the GPU since the last flip (SynchronizeMemory).
+inline std::atomic<uint64_t> frame_copy_bytes{0};
+inline std::atomic<uint64_t> frame_ns[FrameCauses]{};
+inline std::atomic<uint64_t> frame_compiles{0}; ///< shader modules and pipelines created
+/// Memory allocations on the frame path per kind (SOTC_FPS, "SOTC ALLOC" line every 5 s):
+/// count, bytes and time.
+enum AllocKind { AllocArena, AllocStagingBlock, AllocStagingLarge, AllocKinds };
+inline constexpr const char* kAllocKindNames[AllocKinds] = {"arena", "staging-block",
+                                                            "staging-large"};
+inline std::atomic<uint64_t> alloc_count[AllocKinds]{}, alloc_bytes[AllocKinds]{},
+    alloc_ns[AllocKinds]{};
+struct AllocTrace {
+    AllocKind kind;
+    std::chrono::steady_clock::time_point start{};
+    AllocTrace(AllocKind k, uint64_t bytes) : kind{k} {
+        if (kFpsLog) {
+            alloc_count[k].fetch_add(1, std::memory_order_relaxed);
+            alloc_bytes[k].fetch_add(bytes, std::memory_order_relaxed);
+            start = std::chrono::steady_clock::now();
+        }
+    }
+    ~AllocTrace() {
+        if (kFpsLog) {
+            alloc_ns[kind].fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - start)
+                                         .count(),
+                                     std::memory_order_relaxed);
+        }
+    }
+};
+
+/// Adds the scope's duration to frame_ns[cause]; reads no clock unless SOTC_FPS is set. A timer
+/// nested in one of the same cause on the same thread adds nothing (counted once).
+struct FrameTimer {
+    FrameCause cause;
+    bool outer = false;
+    std::chrono::steady_clock::time_point start{};
+    static inline thread_local bool active[FrameCauses]{};
+    explicit FrameTimer(FrameCause c) : cause{c} {
+        if (kFpsLog && !active[c]) {
+            outer = active[c] = true;
+            start = std::chrono::steady_clock::now();
+        }
+    }
+    ~FrameTimer() {
+        if (outer) {
+            active[cause] = false;
+            frame_ns[cause].fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - start)
+                                          .count(),
+                                      std::memory_order_relaxed);
+        }
+    }
+};
+
 /// SOTC_DROP_TRACE=1: logs the first 80 draws/dispatches of each kind that are dropped.
 inline void Drop(int kind, unsigned long long a, unsigned long long b) {
     static const bool enabled = [] {

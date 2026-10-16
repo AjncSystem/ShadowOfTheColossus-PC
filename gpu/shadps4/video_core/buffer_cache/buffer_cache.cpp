@@ -319,6 +319,7 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
     SotcStats::readbacks.fetch_add(1, std::memory_order_relaxed);
     const SotcStats::ScopedTimer readback_timer{SotcStats::readback_ns};
+    const SotcStats::FrameTimer frame_timer{SotcStats::FrameReadback};
     boost::container::small_vector<ReadbackItem, 16> pending;
     const u64 total_size_bytes = GatherDownloads(arena, device_addr, size, pending);
     if (total_size_bytes == 0) {
@@ -786,6 +787,7 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
 }
 
 void BufferCache::SynchronizeDmaBuffers() {
+    const SotcStats::FrameTimer frame_timer{SotcStats::FrameDma};
     fault_process_pending = true;
     const u64 uploads_before = SotcStats::uploads.load(std::memory_order_relaxed);
     u64 ranges = 0;
@@ -917,6 +919,8 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     if (bind_ranges.Empty()) {
         return;
     }
+    const SotcStats::FrameTimer frame_timer{SotcStats::FrameAlloc};
+    const SotcStats::AllocTrace alloc_trace{SotcStats::AllocArena, u64(resident_blocks) << block_shift};
 
     vk::MemoryAllocateInfo alloc_info = {
         .allocationSize = resident_blocks << block_shift,
@@ -1015,6 +1019,10 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         total_size_bytes += size;
     });
     if (!copies.empty()) {
+        const SotcStats::FrameTimer frame_timer{SotcStats::FrameBuffer};
+        if (SotcStats::kFpsLog) {
+            SotcStats::frame_copy_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
+        }
         SotcStats::uploads.fetch_add(1, std::memory_order_relaxed);
         if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer
             SotcStats::upload_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);

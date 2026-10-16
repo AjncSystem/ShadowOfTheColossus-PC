@@ -14,6 +14,7 @@
 #include <tsl/robin_map.h>
 
 #include "common/lru_cache.h"
+#include "video_core/sotc_stats.h"
 #include "common/multi_level_page_table.h"
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
@@ -47,6 +48,194 @@ inline u32 MipTailMode() {
                                                                   : 2u;
     }();
     return mode;
+}
+
+/// sotc: the texture cache lock, re-entrant on its owner thread. The command processor holds it
+/// over a whole binding pass (Rasterizer::BindTextures, BeginRendering, PrepareRenderState), so the
+/// FindImage and UpdateImage calls inside (two per texture, ~62,000 per frame at the Shrine) only
+/// count their depth. SOTC_TC_BATCH=0 drops the outer holds (every call locks as before).
+///
+/// It is also biased to the command processor (the first thread to take a batch hold): there it
+/// is a plain store and load. Any atomic read-modify-write on that thread waits for its pending
+/// stores to drain (write-combined staging copies among them): the uncontended std::mutex, and
+/// then a spinlock's xchg, each cost ~5% of the thread at ~10,000 holds per frame. Other threads
+/// (guest write faults, ~200 per frame) take a spinlock, announce themselves and run an
+/// asymmetric barrier (FlushProcessWriteBuffers) before waiting for the command processor to
+/// leave: either its store of fast_held is visible to them after the barrier, or its following
+/// load of slow_wants sees theirs. SOTC_TC_BIASED=0: every thread takes the spinlock.
+class alignas(64) ReentrantMutex {
+public:
+    /// Makes the calling thread the biased owner (once).
+    void SetFastThread() {
+        if (!fast_token.load(std::memory_order_relaxed) && Biased() && !HeldByThisThread()) {
+            // Under the spinlock: a thread holding it read fast_token as null and skipped the
+            // announcement, so the biased path must not start before it leaves.
+            RawLock();
+            fast_token.store(Token(), std::memory_order_relaxed);
+            word.store(0, std::memory_order_release);
+        }
+    }
+    void lock() {
+        const void* self = Token();
+        if (owner.load(std::memory_order_relaxed) == self) {
+            ++depth;
+            return;
+        }
+        if (self == fast_token.load(std::memory_order_relaxed)) {
+            if (FastTryAcquire()) {
+                mode = Mode::Fast;
+            } else {
+                RawLock(); // a guest holds it or is waiting for us: queue behind it
+                mode = Mode::FastSlow;
+            }
+        } else {
+            RawLock();
+            AnnounceAndWait();
+            mode = Mode::Slow;
+        }
+        owner.store(self, std::memory_order_relaxed);
+        depth = 1;
+    }
+    bool try_lock() {
+        const void* self = Token();
+        if (owner.load(std::memory_order_relaxed) == self) {
+            ++depth;
+            return true;
+        }
+        if (self == fast_token.load(std::memory_order_relaxed)) {
+            if (!FastTryAcquire()) {
+                return false;
+            }
+            mode = Mode::Fast;
+        } else {
+            if (!RawTryLock()) {
+                return false;
+            }
+            if (!AnnounceAndTry()) {
+                return false;
+            }
+            mode = Mode::Slow;
+        }
+        owner.store(self, std::memory_order_relaxed);
+        depth = 1;
+        return true;
+    }
+    bool HeldByThisThread() const {
+        return owner.load(std::memory_order_relaxed) == Token();
+    }
+    void unlock() {
+        if (--depth != 0) {
+            return;
+        }
+        owner.store(nullptr, std::memory_order_relaxed);
+        switch (mode) {
+        case Mode::Fast:
+            fast_held.store(0, std::memory_order_release);
+            break;
+        case Mode::Slow:
+            slow_wants.store(0, std::memory_order_release);
+            word.store(0, std::memory_order_release);
+            break;
+        case Mode::FastSlow:
+            word.store(0, std::memory_order_release);
+            break;
+        }
+    }
+
+private:
+    enum class Mode : u8 { Fast, Slow, FastSlow };
+
+    static bool Biased() {
+        static const bool on = [] {
+            const char* v = std::getenv("SOTC_TC_BIASED");
+            return !v || v[0] != '0';
+        }();
+        return on;
+    }
+    /// Only the owner stores its own token, and clears it before unlocking, so a thread reads
+    /// its token back exactly while it holds the lock.
+    static const void* Token() {
+        static thread_local char token;
+        return &token;
+    }
+    /// FlushProcessWriteBuffers on Windows, a full fence elsewhere (texture_cache.cpp).
+    static void AsymmetricBarrier();
+    static void Pause(u32& spins) {
+        if (++spins < 4096) {
+            __builtin_ia32_pause();
+        } else {
+            std::this_thread::yield();
+        }
+    }
+    bool FastTryAcquire() {
+        fast_held.store(1, std::memory_order_relaxed);
+#ifdef _WIN32
+        std::atomic_signal_fence(std::memory_order_seq_cst); // the barrier is on the other side
+#else
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
+        if (slow_wants.load(std::memory_order_acquire) == 0) {
+            return true;
+        }
+        fast_held.store(0, std::memory_order_release);
+        return false;
+    }
+    void AnnounceAndWait() {
+        if (!fast_token.load(std::memory_order_relaxed)) {
+            return; // no biased owner (SOTC_TC_BIASED=0, or before the first batch hold)
+        }
+        slow_wants.store(1, std::memory_order_relaxed);
+        AsymmetricBarrier();
+        for (u32 spins = 0; fast_held.load(std::memory_order_acquire);) {
+            Pause(spins);
+        }
+    }
+    bool AnnounceAndTry() {
+        if (!fast_token.load(std::memory_order_relaxed)) {
+            return true;
+        }
+        slow_wants.store(1, std::memory_order_relaxed);
+        AsymmetricBarrier();
+        if (!fast_held.load(std::memory_order_acquire)) {
+            return true;
+        }
+        slow_wants.store(0, std::memory_order_release);
+        word.store(0, std::memory_order_release);
+        return false;
+    }
+    void RawLock() {
+        if (!word.exchange(1, std::memory_order_acquire)) {
+            return;
+        }
+        for (u32 spins = 0;;) {
+            while (word.load(std::memory_order_relaxed)) {
+                Pause(spins);
+            }
+            if (!word.exchange(1, std::memory_order_acquire)) {
+                return;
+            }
+        }
+    }
+    bool RawTryLock() {
+        return !word.load(std::memory_order_relaxed) &&
+               !word.exchange(1, std::memory_order_acquire);
+    }
+    std::atomic<u32> word{0};       ///< spinlock of the other threads (and of the biased owner
+                                    ///< when it had to queue behind them)
+    std::atomic<u32> slow_wants{0}; ///< a thread holding `word` waits for or holds the lock
+    std::atomic<const void*> fast_token{nullptr};
+    std::atomic<const void*> owner{nullptr};
+    u32 depth = 0;
+    Mode mode = Mode::Fast;
+    alignas(64) std::atomic<u32> fast_held{0}; ///< the biased owner holds it (written by it only)
+};
+
+inline bool TextureLockBatching() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_TC_BATCH");
+        return !v || v[0] != '0';
+    }();
+    return on;
 }
 
 class TextureCache {
@@ -153,12 +342,42 @@ public:
     [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc,
                                               bool update = true);
 
+    /// sotc: holds the cache lock over a binding pass (ReentrantMutex); empty with
+    /// SOTC_TC_BATCH=0.
+    [[nodiscard]] std::unique_lock<ReentrantMutex> BatchLock() {
+        mutex.SetFastThread();
+        if (!TextureLockBatching()) {
+            return {};
+        }
+        std::unique_lock lk{mutex, std::defer_lock};
+        LockCounted(lk);
+        return lk;
+    }
+
+    /// sotc: locks `mutex`, counting contention (SOTC_CMD_STATS, SOTC sys line).
+    static void LockCounted(std::unique_lock<ReentrantMutex>& lk) {
+        if (SotcStats::kCmdStats && !lk.mutex()->HeldByThisThread()) {
+            SotcStats::sys_tc_locks.fetch_add(1, std::memory_order_relaxed);
+            if (lk.try_lock()) return;
+            SotcStats::sys_tc_contended.fetch_add(1, std::memory_order_relaxed);
+            const auto start = std::chrono::steady_clock::now();
+            lk.lock();
+            SotcStats::sys_tc_wait_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - start).count(),
+                std::memory_order_relaxed);
+            return;
+        }
+        lk.lock();
+    }
+
     /// Retrieves the depth target with specified properties
     [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc);
 
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
-        std::scoped_lock lk{mutex};
+        std::unique_lock lk{mutex, std::defer_lock};
+        LockCounted(lk);
         Image& image = slot_images[image_id];
         TrackImage(image_id);
         TouchImage(image);
@@ -429,7 +648,11 @@ private:
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     const bool readback_linear_images;
     PageTable page_table;
-    std::mutex mutex;
+    /// sotc: images registered per page_table page (1 MiB), read without the lock by
+    /// InvalidateMemory (guest write faults).
+    static constexpr u64 NumImagePages = u64{1} << (Traits::ADDRESS_SPACE_BITS - Traits::PAGE_BITS);
+    std::unique_ptr<std::atomic<u32>[]> page_images{new std::atomic<u32>[NumImagePages]()};
+    ReentrantMutex mutex;
     /// sotc: RefreshImage nesting on this thread (it runs under `mutex`).
     static inline thread_local u32 refresh_depth = 0;
     /// sotc: deferred EmergencyCollect level + 1 (0: none).

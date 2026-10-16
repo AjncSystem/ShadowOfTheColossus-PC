@@ -117,6 +117,7 @@ bool Rasterizer::FilterDraw() {
 }
 
 void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
+    const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the targets
     // Prefetch render targets to handle overlaps with bound textures (e.g. mipgen)
     const auto& key = pipeline->GetGraphicsKey();
     const auto& regs = liverpool->regs;
@@ -820,7 +821,10 @@ void Rasterizer::FlushPeriodic() {
     // it while the guest gets there, and the readback finds it done (or nearly). SOTC_RB_EARLY=1
     // turns it on; measured within noise on the attract demo, so off by default.
     if (SotcStats::kFpsLog) { // sotc: read only by the SOTC_FPS printer (sotc_stats.h)
-        SotcStats::commands.fetch_add(1, std::memory_order_relaxed);
+        // sotc: written by this thread only: a plain add, no lock prefix (an atomic RMW here
+        // waits for the thread's pending stores, ~1.8% of it). The printer takes deltas.
+        SotcStats::commands.store(SotcStats::commands.load(std::memory_order_relaxed) + 1,
+                                  std::memory_order_relaxed);
     }
     static const bool early = [] {
         const char* v = std::getenv("SOTC_RB_EARLY");
@@ -855,6 +859,11 @@ void Rasterizer::FlushPeriodic() {
     }
     ++commands_since_submit;
     if (flush_us != 0) {
+        // sotc: the clock is read every 8th command (~40 us at the Shrine against 1000 us),
+        // not on every one (~0.5% of the command processor in QueryPerformanceCounter).
+        if ((commands_since_submit & 7) != 0) {
+            return;
+        }
         const auto elapsed = std::chrono::steady_clock::now() - commands_since;
         const auto limit = std::chrono::microseconds(flush_us);
         if (elapsed < limit || (scheduler.IsRendering() && elapsed < limit * 4)) {
@@ -1280,6 +1289,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 }
 
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
+    const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the pass
     image_bindings.clear();
     const u32 first_image_idx = image_infos.size();
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
@@ -1514,6 +1524,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 }
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
+    const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the attachments
     attachment_feedback_loop = false;
     // sotc: SOTC_RT_FAST (default on) drops redundant attachment work: FindRenderTarget repeats
     // UpdateImage only when the image still needs it, and the CMASK/HTILE clear bit is read and

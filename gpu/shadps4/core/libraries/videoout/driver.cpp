@@ -379,6 +379,28 @@ void VideoOutDriver::Flip(const Request& req) {
                              mib(SotcStats::census_gpu_linear), mib(SotcStats::census_streamed),
                              mib(SotcStats::census_other), mib(SotcStats::census_below_base),
                              mib(SotcStats::census_below_minlod), mib(SotcStats::census_live));
+                // sotc: mip-tail images (SOTC_MIP_TAIL): what they hold and leave out, what the
+                // full-chain candidates would save, and the decisions since the last line.
+                const auto take = [](std::atomic<uint64_t>& v) {
+                    return static_cast<unsigned long long>(v.exchange(0));
+                };
+                std::fprintf(
+                    stderr,
+                    "SOTC MIPTAIL rebased %llu MiB in %llu (dropped %llu MiB guest), projected "
+                    "%llu MiB (hwcnt %llu); created %llu, reuse-full %llu, skip gpu %llu "
+                    "live-full %llu layout %llu, writer-freed %llu, dedup-freed %llu, "
+                    "maybe-dirty %llu, VIOLATIONS %llu\n",
+                    mib(SotcStats::census_rebased),
+                    static_cast<unsigned long long>(
+                        SotcStats::census_rebased_count.load(std::memory_order_relaxed)),
+                    mib(SotcStats::census_dropped), mib(SotcStats::census_projected),
+                    mib(SotcStats::census_projected_hwcnt), take(SotcStats::rebase_created),
+                    take(SotcStats::rebase_reuse_full), take(SotcStats::rebase_skip_gpu),
+                    take(SotcStats::rebase_skip_live_full), take(SotcStats::rebase_skip_layout),
+                    take(SotcStats::rebase_writer_freed), take(SotcStats::rebase_dedup_freed),
+                    take(SotcStats::rebase_maybe_dirty),
+                    static_cast<unsigned long long>(
+                        SotcStats::rebase_violations.load(std::memory_order_relaxed)));
             }
             const uint64_t grace_marks = SotcStats::fault_grace_marks.exchange(0);
             const uint64_t grace_caps = SotcStats::fault_grace_cap_hits.exchange(0);

@@ -360,4 +360,14 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
     last_state.pl_stage = dst_stage;
 }
 
+void NoteMipTailWrite(const Image& image) {
+    // The image stays usable: it is GPU-modified now, so it is not freed without a download.
+    SotcStats::rebase_violations.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<int> shown{0};
+    if (shown.fetch_add(1, std::memory_order_relaxed) < 8) {
+        LOG_ERROR(Render_Vulkan, "Mip-tail image {:#x} (from mip {}) written by the GPU",
+                  image.info.guest_address, image.info.sotc_first_mip);
+    }
+}
+
 } // namespace VideoCore

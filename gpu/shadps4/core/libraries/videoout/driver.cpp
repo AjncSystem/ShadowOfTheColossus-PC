@@ -2,10 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
 #include <string>
+#include <thread>
 #include <vector>
 #include "common/assert.h"
 #include "common/debug.h"
@@ -24,6 +26,23 @@ extern std::unique_ptr<Vulkan::Presenter> presenter;
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
 namespace Libraries::VideoOut {
+
+// sotc: printf into the SOTC_FPS report, which is written to stderr in one go.
+[[gnu::format(printf, 2, 3)]] static void ReportPrintf(std::string& out, const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    va_list copy;
+    va_copy(copy, args);
+    const int size = std::vsnprintf(nullptr, 0, format, copy);
+    va_end(copy);
+    if (size > 0) {
+        const size_t at = out.size();
+        out.resize(at + size + 1);
+        std::vsnprintf(out.data() + at, size + 1, format, args);
+        out.resize(at + size);
+    }
+    va_end(args);
+}
 
 constexpr static bool Is32BppPixelFormat(PixelFormat format) {
     switch (format) {
@@ -291,6 +310,7 @@ void VideoOutDriver::Flip(const Request& req) {
         }
         if (now - window_start >= std::chrono::seconds(5)) {
             const double seconds = std::chrono::duration<double>(now - window_start).count();
+            std::string report; // sotc: written at once off this thread (see ReportPrintf)
             {
                 std::sort(frame_ms.begin(), frame_ms.end());
                 const auto pct = [&](double p) {
@@ -310,7 +330,7 @@ void VideoOutDriver::Flip(const Request& req) {
                     }
                     return text;
                 };
-                std::fprintf(stderr,
+                ReportPrintf(report,
                              "SOTC FRAMES p50 %.1f ms, p99 %.1f ms (1%% low %.1f FPS), worst %.1f ms "
                              "[%s]; >50 ms: %u [%s]; compiled %llu\n",
                              pct(0.5), pct(0.99), 1000.0 / pct(0.99), worst_ms,
@@ -331,14 +351,14 @@ void VideoOutDriver::Flip(const Request& req) {
                     }
                 }
                 if (!allocs.empty()) {
-                    std::fprintf(stderr, "SOTC ALLOC %s\n", allocs.c_str());
+                    ReportPrintf(report, "SOTC ALLOC %s\n", allocs.c_str());
                 }
                 if (const uint64_t translate = SotcStats::compile_phase_ns[0].exchange(0)) {
                     const auto take = [](int i) {
                         return SotcStats::compile_phase_ns[i].exchange(0) / 1e6;
                     };
                     const double emit = take(1), patch = take(2), module = take(3), reg = take(4);
-                    std::fprintf(stderr,
+                    ReportPrintf(report,
                                  "SOTC COMPILE translate %.1f, emit %.1f, patch lookup %.1f, "
                                  "module %.1f, register %.1f ms\n",
                                  translate / 1e6, emit, patch, module, reg);
@@ -356,7 +376,7 @@ void VideoOutDriver::Flip(const Request& req) {
             const uint64_t copies_changed = SotcStats::readback_copies_changed.exchange(0);
             const uint64_t bytes = SotcStats::readback_bytes.exchange(0);
             const uint64_t bytes_changed = SotcStats::readback_bytes_changed.exchange(0);
-            std::fprintf(stderr,
+            ReportPrintf(report,
                          "SOTC FPS %.1f at %.0fs; %.0f cmds/frame; readbacks %.0f/s (ahead %llu, finish %llu, heap %llu, early %llu), %.0f ms/s; "
                          "changed copies %llu/%llu, bytes %llu/%llu; vram %llu/%llu MB, "
                          "arenas %llu (%llu MB)\n",
@@ -376,12 +396,12 @@ void VideoOutDriver::Flip(const Request& req) {
                          static_cast<unsigned long long>(SotcStats::vram_budget.load() >> 20),
                          static_cast<unsigned long long>(SotcStats::arena_allocs.load()),
                          static_cast<unsigned long long>(SotcStats::arena_bytes.load() >> 20));
-            std::fprintf(stderr, "SOTC readback finish: %llu for bytes the guest asked\n",
+            ReportPrintf(report, "SOTC readback finish: %llu for bytes the guest asked\n",
                          static_cast<unsigned long long>(
                              SotcStats::readback_finish_asked.exchange(0)));
             static uint64_t last_images_new = 0;
             const uint64_t images_new = SotcStats::images_new.load();
-            std::fprintf(stderr,
+            ReportPrintf(report,
                          "SOTC GC: %.1f ticks/frame, freed %.0f/s (%llu written back), images new "
                          "%.0f/s, cached %llu (%llu MB)\n",
                          flips ? double(SotcStats::gc_ticks.exchange(0)) / flips : 0.0,
@@ -394,14 +414,14 @@ void VideoOutDriver::Flip(const Request& req) {
             if (const uint64_t sweeps = SotcStats::dma_sweeps.exchange(0)) {
                 const uint64_t ranges = SotcStats::dma_sweep_ranges.exchange(0);
                 const uint64_t uploading = SotcStats::dma_sweep_uploading.exchange(0);
-                std::fprintf(stderr, "SOTC DMA sweeps %.0f/s, %.1f ranges each, %.0f/s uploading\n",
+                ReportPrintf(report, "SOTC DMA sweeps %.0f/s, %.1f ranges each, %.0f/s uploading\n",
                              sweeps / seconds, double(ranges) / sweeps, uploading / seconds);
             }
             if (const uint64_t images = SotcStats::census_count.load(std::memory_order_relaxed)) {
                 const auto mib = [](const std::atomic<uint64_t>& v) {
                     return static_cast<unsigned long long>(v.load(std::memory_order_relaxed) >> 20);
                 };
-                std::fprintf(stderr,
+                ReportPrintf(report,
                              "SOTC IMAGES %llu: gpu-written tiled %llu MiB, linear %llu MiB; "
                              "sampled streamed %llu MiB, other %llu MiB; below base mip %llu MiB, "
                              "below min_lod %llu MiB; live %llu MiB\n",
@@ -414,8 +434,8 @@ void VideoOutDriver::Flip(const Request& req) {
                 const auto take = [](std::atomic<uint64_t>& v) {
                     return static_cast<unsigned long long>(v.exchange(0));
                 };
-                std::fprintf(
-                    stderr,
+                ReportPrintf(
+                    report,
                     "SOTC MIPTAIL rebased %llu MiB in %llu (dropped %llu MiB guest), projected "
                     "%llu MiB (hwcnt %llu); created %llu, reuse-full %llu, skip gpu %llu "
                     "live-full %llu layout %llu, writer-freed %llu, dedup-freed %llu, "
@@ -438,7 +458,7 @@ void VideoOutDriver::Flip(const Request& req) {
             const uint64_t reg_spins = SotcStats::stack_reg_spins.exchange(0);
             const uint64_t carves = runtime_memory_carve_splits();
             if (grace_marks || grace_caps || grace_bytes || reg_spins || carves) {
-                std::fprintf(stderr,
+                ReportPrintf(report,
                              "SOTC fault grace: marks %llu, cap hits %llu, hot uploads %llu KiB; "
                              "stack registry spins %llu; live view splits %llu\n",
                              static_cast<unsigned long long>(grace_marks),
@@ -450,7 +470,7 @@ void VideoOutDriver::Flip(const Request& req) {
             const uint64_t repairs = SotcStats::desync_repairs.exchange(0);
             const uint64_t legit = SotcStats::desync_legit.exchange(0);
             if (repairs || legit) {
-                std::fprintf(stderr,
+                ReportPrintf(report,
                              "SOTC page tracking desync repairs %llu (repeated faults left alone "
                              "%llu)\n",
                              static_cast<unsigned long long>(repairs),
@@ -459,7 +479,7 @@ void VideoOutDriver::Flip(const Request& req) {
             // sotc: video memory against the budget the texture cache collects for; emergency
             // collections mean an allocation already failed (6 GB cards in large areas).
             if (const uint64_t budget = SotcStats::vram_budget.load(std::memory_order_relaxed)) {
-                std::fprintf(stderr,
+                ReportPrintf(report,
                              "SOTC VRAM %llu/%llu MiB (VMA blocks %llu MiB holding %llu MiB, "
                              "buffer arenas %llu MiB, images %llu MiB in "
                              "%llu; GC freed %llu, kept tiled %llu), emergency collections %llu\n",
@@ -488,22 +508,27 @@ void VideoOutDriver::Flip(const Request& req) {
                 for (int i = 0; i < 6; ++i) {
                     k[i] = double(SotcStats::cmd_kinds[i].exchange(0)) / flips;
                 }
-                std::fprintf(stderr,
+                ReportPrintf(report,
                              "SOTC cmds/frame: draw %.0f, indirect %.0f gpu-args + %.0f cpu-args "
                              "(%.0f empty), dispatch %.0f, dispatch-indirect %.0f\n",
                              k[0], k[1], k[2], k[3], k[4], k[5]);
-                std::fprintf(stderr,
+                ReportPrintf(report,
                              "SOTC faults/s: guest writes %.0f, walker loads %.0f, CP reads %.0f\n",
                              SotcStats::fault_writes.exchange(0) / seconds,
                              SotcStats::fault_walker.exchange(0) / seconds,
                              SotcStats::fault_gpu_reads.exchange(0) / seconds);
-                std::fprintf(stderr,
+                ReportPrintf(report,
                              "SOTC per frame: uploads %.0f (%.0f KB), render pass breaks %.0f\n",
                              double(SotcStats::uploads.exchange(0)) / flips,
                              double(SotcStats::upload_bytes.exchange(0)) / 1024.0 / flips,
                              double(SotcStats::render_breaks.exchange(0)) / flips);
             }
             flips = 0;
+            // The flip thread does not wait for the log: one stderr write took 7-10 ms (bench log
+            // file, Radeon RX 6650 XT session), ~15 of them a frame of 80-100 ms every 5 s.
+            std::thread([text = std::move(report)] {
+                std::fwrite(text.data(), 1, text.size(), stderr);
+            }).detach();
             window_start = now;
         }
     }

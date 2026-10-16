@@ -70,18 +70,51 @@ _Static_assert(sizeof(BatchEntry)==32,"PS4 batch map entry layout");
  * under the lock may write guest memory, and a GPU-tracked page then faults into
  * runtime_memory_gpu_protect on the same thread. Readers nest because glibc's
  * default rwlock prefers readers; a thread holding it exclusively skips relocking. */
+#ifdef _WIN32
+/* sotc: winpthreads' rwlock queues new readers behind a waiting writer, so a nested read (a
+ * reader faulting into runtime_memory_gpu_protect) deadlocked against a mapping thread
+ * waiting to write: the GPU command processor, two job workers in the fault handler and
+ * sceKernelBatchMap2 all stopped. Each read also took a mutex, thousands of times per frame.
+ * This lock prefers readers like glibc's: a read is one atomic operation and never waits for
+ * a waiting writer; a writer waits until no reader holds it (maps and unmaps are rare). */
+static volatile int64_t lock_state; /* readers, or -1 while a writer holds it */
+static void lock_backoff(unsigned *spins) {
+    if (++*spins < 64) YieldProcessor();
+    else if (*spins < 256) SwitchToThread();
+    else Sleep(0);
+}
+static void rw_rdlock(void) {
+    for (unsigned spins=0;;lock_backoff(&spins)) {
+        int64_t s=__atomic_load_n(&lock_state,__ATOMIC_RELAXED);
+        if (s>=0 && __atomic_compare_exchange_n(&lock_state,&s,s+1,0,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)) return;
+    }
+}
+static void rw_rdunlock(void) { __atomic_sub_fetch(&lock_state,1,__ATOMIC_RELEASE); }
+static void rw_wrlock(void) {
+    for (unsigned spins=0;;lock_backoff(&spins)) {
+        int64_t s=0;
+        if (__atomic_compare_exchange_n(&lock_state,&s,-1,0,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)) return;
+    }
+}
+static void rw_wrunlock(void) { __atomic_store_n(&lock_state,0,__ATOMIC_RELEASE); }
+#else
 static pthread_rwlock_t lock=PTHREAD_RWLOCK_INITIALIZER;
+static void rw_rdlock(void) { pthread_rwlock_rdlock(&lock); }
+static void rw_rdunlock(void) { pthread_rwlock_unlock(&lock); }
+static void rw_wrlock(void) { pthread_rwlock_wrlock(&lock); }
+static void rw_wrunlock(void) { pthread_rwlock_unlock(&lock); }
+#endif
 static __thread unsigned exclusive_depth;
 /* Odd while a writer holds the lock; readers' region caches are valid for one even value. */
 static uint64_t table_generation;
 static void write_lock(void) {
-    if (!exclusive_depth++) { pthread_rwlock_wrlock(&lock); __atomic_add_fetch(&table_generation,1,__ATOMIC_ACQ_REL); }
+    if (!exclusive_depth++) { rw_wrlock(); __atomic_add_fetch(&table_generation,1,__ATOMIC_ACQ_REL); }
 }
 static void write_unlock(void) {
-    if (!--exclusive_depth) { __atomic_add_fetch(&table_generation,1,__ATOMIC_RELEASE); pthread_rwlock_unlock(&lock); }
+    if (!--exclusive_depth) { __atomic_add_fetch(&table_generation,1,__ATOMIC_RELEASE); rw_wrunlock(); }
 }
-static void read_lock(void) { if (!exclusive_depth) pthread_rwlock_rdlock(&lock); }
-static void read_unlock(void) { if (!exclusive_depth) pthread_rwlock_unlock(&lock); }
+static void read_lock(void) { if (!exclusive_depth) rw_rdlock(); }
+static void read_unlock(void) { if (!exclusive_depth) rw_rdunlock(); }
 static Block blocks[LIMIT];
 static Vma *vmas; static size_t vma_count, vma_capacity;
 #ifndef _WIN32

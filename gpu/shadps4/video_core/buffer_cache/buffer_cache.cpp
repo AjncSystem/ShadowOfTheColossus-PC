@@ -174,9 +174,13 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         flush_request();
         return;
     }
+    // sotc: asynchronous readbacks by default (SOTC_RB_ASYNC=0: the command processor waits).
+    // With mip tails freeing video memory, 4 attract runs showed no collapse (the one seen on
+    // 2026-10-15 ran over budget): 48.7-48.8 vs 46.6-48.2 FPS, frames over 50 ms 66-81 vs
+    // 100-112, readback time in slow frames ~0.2 s vs ~1 s; shrine 29.2 -> 30.7 FPS.
     static const bool async = [] {
         const char* v = std::getenv("SOTC_RB_ASYNC");
-        return v && v[0] == '1';
+        return !v || v[0] != '0';
     }();
     if (!async) {
         liverpool->SendCommand<true>(std::move(flush_request));

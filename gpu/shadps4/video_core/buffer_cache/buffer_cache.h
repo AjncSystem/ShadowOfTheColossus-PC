@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+
 #include <chrono>
 #include <deque>
 #include <span>
@@ -252,6 +254,13 @@ private:
     /// sotc: bumped at every resident_ranges.Add/Subtract. SynchronizeDmaBuffers rebuilds its
     /// merged runs only when this (or the arena count) changed since the last rebuild.
     u64 resident_version{};
+    /// sotc: block ranges found resident at a resident_version (EnsureResident).
+    struct ResidentCacheEntry {
+        u64 version{~u64{0}};
+        u64 first{};
+        u64 end{};
+    };
+    std::array<ResidentCacheEntry, 64> resident_cache{};
     u64 dma_runs_version = ~0ULL;
     size_t dma_runs_arenas{};
     u64 dma_runs_ranges{};

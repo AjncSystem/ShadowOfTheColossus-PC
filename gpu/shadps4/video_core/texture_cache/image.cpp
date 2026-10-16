@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
+#include <optional>
 #include <ranges>
+#include <unordered_map>
 #include "common/assert.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -9,6 +12,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
+#include "video_core/sotc_stats.h"
 
 #include <vk_mem_alloc.h>
 
@@ -87,9 +91,7 @@ static vk::FormatFeatureFlags2 FormatFeatureFlags(const vk::ImageUsageFlags usag
 }
 
 UniqueImage::~UniqueImage() {
-    if (image) {
-        vmaDestroyImage(allocator, image, allocation);
-    }
+    Destroy();
 }
 
 void UniqueImage::Destroy() {
@@ -115,6 +117,7 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     const VkImageCreateInfo image_ci_unsafe = static_cast<VkImageCreateInfo>(image_ci);
     VkImage unsafe_image{};
     VmaAllocationInfo alloc_info{};
+    const SotcStats::ScopedTimer alloc_timer{SotcStats::image_alloc_ns};
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
                                      &allocation, &alloc_info);
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
@@ -133,6 +136,44 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
                vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};
     size_bytes = alloc_info.size;
+    VmaAllocationInfo2 alloc_info2{};
+    vmaGetAllocationInfo2(allocator, allocation, &alloc_info2);
+    if (alloc_info2.dedicatedMemory) {
+        SotcStats::image_dedicated.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+// sotc: vkGetPhysicalDeviceImageFormatProperties2 takes about 5 ms per call on a Radeon (driver
+// 32.0.21045), and the game creates dozens of images in a frame when the camera turns: frames of
+// 200-500 ms. The answer only depends on these parameters, so it is asked once per combination
+// (and the unsupported-format error is logged once).
+struct FormatQuery {
+    vk::Result result;
+    vk::SampleCountFlags sample_counts;
+};
+static FormatQuery QueryImageFormat(const Vulkan::Instance& instance,
+                                    const vk::PhysicalDeviceImageFormatInfo2& format_info) {
+    static std::mutex mutex;
+    static std::unordered_map<u64, FormatQuery> answers;
+    const u64 key = (u64(format_info.format) << 40) ^ (u64(format_info.type) << 36) ^
+                    (u64(u32(format_info.flags)) << 20) ^ u64(u32(format_info.usage));
+    std::scoped_lock lock{mutex};
+    if (const auto it = answers.find(key); it != answers.end()) {
+        return it->second;
+    }
+    const SotcStats::ScopedTimer query_timer{SotcStats::image_query_ns};
+    const auto properties = instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
+    if (properties.result == vk::Result::eErrorFormatNotSupported) {
+        LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",
+                  vk::to_string(format_info.format), vk::to_string(format_info.type),
+                  vk::to_string(format_info.flags), vk::to_string(format_info.usage));
+    }
+    const FormatQuery answer{properties.result,
+                             properties.result == vk::Result::eSuccess
+                                 ? properties.value.imageFormatProperties.sampleCounts
+                                 : vk::SampleCountFlags{}};
+    answers.emplace(key, answer);
+    return answer;
 }
 
 Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
@@ -174,15 +215,9 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
         .usage = usage_flags,
         .flags = flags,
     };
-    const auto image_format_properties =
-        instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
-    if (image_format_properties.result == vk::Result::eErrorFormatNotSupported) {
-        LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",
-                  vk::to_string(supported_format), vk::to_string(format_info.type),
-                  vk::to_string(format_info.flags), vk::to_string(format_info.usage));
-    }
-    supported_samples = image_format_properties.result == vk::Result::eSuccess
-                            ? image_format_properties.value.imageFormatProperties.sampleCounts
+    const FormatQuery format_query = QueryImageFormat(instance, format_info);
+    supported_samples = format_query.result == vk::Result::eSuccess
+                            ? format_query.sample_counts
                             : vk::SampleCountFlagBits::e1;
 
     const vk::ImageCreateInfo image_ci = {

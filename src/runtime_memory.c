@@ -90,7 +90,10 @@ typedef void (*GpuRange)(uintptr_t address, uint64_t size);
 static GpuRange hook_map, hook_unmap, hook_invalidate;
 enum { HOOK_MAP, HOOK_UNMAP, HOOK_INVALIDATE };
 typedef struct { int kind; uintptr_t address; uint64_t size; } PendingHook;
-static PendingHook pending[64]; static size_t pending_count;
+/* sotc: grows on demand. With 64 fixed slots, a GPU hook slowed down by an emergency texture
+ * collection (video memory full in the open world) let other threads queue past the end, and
+ * the exit(21) that followed hung the game instead of closing it. */
+static PendingHook *pending; static size_t pending_count, pending_capacity;
 static size_t allocations, maps, flexible_maps, protects, queries;
 static uint64_t live_bytes, flexible_bytes;
 
@@ -276,7 +279,13 @@ static void host_discard(uint64_t phys, uint64_t size) {
 static void queue_hook(int kind, uintptr_t address, uint64_t size) {
     GpuRange hook = kind==HOOK_MAP ? hook_map : kind==HOOK_UNMAP ? hook_unmap : hook_invalidate;
     if (!hook) return;
-    if (pending_count==sizeof(pending)/sizeof(*pending)) { fputs("STOP: GPU hook queue overflow\n",stderr); exit(21); }
+    if (pending_count==pending_capacity) {
+        size_t capacity = pending_capacity ? pending_capacity*2 : 64;
+        PendingHook *grown = realloc(pending, capacity*sizeof(*pending));
+        if (!grown) { fputs("STOP: GPU hook queue out of memory\n",stderr); fflush(stderr); _Exit(21); }
+        pending=grown; pending_capacity=capacity;
+        if (capacity>64) fprintf(stderr,"Runtime: GPU hook queue grew to %zu entries\n",capacity);
+    }
     pending[pending_count++]=(PendingHook){kind,address,size};
 }
 /* Runs queued GPU notifications; callers invoke it after dropping the lock. */

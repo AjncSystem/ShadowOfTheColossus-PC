@@ -23,6 +23,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+#include "video_core/sotc_stats.h"
 
 namespace Vulkan {
 
@@ -291,8 +292,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       desc_heap{instance, scheduler.GetWorkSemaphore(), DescriptorHeapSizes} {
     const auto& vk12_props = instance.GetVk12Properties();
-    Shader::Optimization::SetWave64UniformBranchesDefault(instance.GetDriverID() ==
-                                                          vk::DriverId::eNvidiaProprietary);
+    // Wave64 uniform branches on every driver. Tested on a Radeon RX 6650 XT (32-wide path):
+    // off, the shadows next to the Wander and Agro on grass get horizontal stripes; on, the
+    // image is right and the characters are not black in the shade (save with 5 colossi).
+    Shader::Optimization::SetWave64UniformBranchesDefault(true);
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),
         .max_viewport_height = instance.GetMaxViewportHeight(),
@@ -369,6 +372,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     if (is_new) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
+        const SotcStats::ScopedTimer stall_timer{SotcStats::pipeline_ns};
+        SotcStats::pipelines_new.fetch_add(1, std::memory_order_relaxed);
 
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
@@ -398,6 +403,8 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (is_new) {
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
+        const SotcStats::ScopedTimer stall_timer{SotcStats::pipeline_ns};
+        SotcStats::pipelines_new.fetch_add(1, std::memory_order_relaxed);
 
         ComputePipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
@@ -649,6 +656,8 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
+    const SotcStats::ScopedTimer stall_timer{SotcStats::shader_ns};
+    SotcStats::shaders_compiled.fetch_add(1, std::memory_order_relaxed);
 
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);

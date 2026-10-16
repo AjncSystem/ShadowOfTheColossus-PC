@@ -5,6 +5,8 @@
 
 #include <chrono>
 #include <deque>
+#include <map>
+#include <memory>
 #include <span>
 #include <vector>
 #include <unordered_map>
@@ -176,7 +178,7 @@ private:
     void ApplyDownloads(std::span<const ReadbackItem> pending, const u8* mapped,
                         u64 mapped_offset);
 
-    /// sotc (SOTC_RB_ASYNC=1): a readback asked by a guest thread in two steps on the command
+    /// sotc (default, SOTC_RB_ASYNC=0 turns it off): a readback asked by a guest thread in two steps on the command
     /// processor: the copies are recorded and submitted without waiting (the command processor
     /// goes on with its queue), the guest thread waits for the GPU, then the data is applied
     /// unless a later GPU write hit the ranges meanwhile (then it is read back again).
@@ -277,6 +279,9 @@ private:
     RangeSet current_writes;
     u64 current_writes_tick{};
     void RecordCurrentWrite(VAddr addr, u64 size);
+    /// sotc: the range the guest touched, during the DownloadMemory of its window (size 0 else).
+    VAddr fault_addr{};
+    u64 fault_size{};
 
 public:
     /// sotc: true once after the command buffer being built wrote a page the guest reads back:
@@ -285,8 +290,21 @@ public:
 
 private:
 
-    /// Number of resident blocks still bound to each backing allocation.
-    std::unordered_map<VkDeviceMemory, u64> backing_blocks;
+    /// sotc: arena memory is carved out of chunks of ARENA_CHUNK_SIZE. One allocation per
+    /// resident range reached thousands within minutes, each one a kernel call mid-frame (the
+    /// open world then ran out of video memory).
+    static constexpr u64 ARENA_CHUNK_SIZE = 64_MB;
+    struct ArenaChunk {
+        vk::DeviceMemory memory;
+        u32 memory_type{};
+        u64 used_blocks{};
+        std::map<u64, u64> free_runs; ///< first block -> number of free blocks
+    };
+    std::vector<std::unique_ptr<ArenaChunk>> arena_chunks;
+    std::unordered_map<VkDeviceMemory, ArenaChunk*> chunk_by_memory;
+    /// Memory and first block for blocks of arena backing (video memory, else system memory).
+    std::pair<vk::DeviceMemory, u64> AllocateArenaBlocks(u64 blocks);
+    void FreeArenaBlocks(vk::DeviceMemory memory, u64 start, u64 blocks);
 
     u32 arena_memory_type_index{};
     std::optional<u32> arena_fallback_memory_type_index;

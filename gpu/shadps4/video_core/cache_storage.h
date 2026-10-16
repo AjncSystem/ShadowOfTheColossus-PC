@@ -32,6 +32,8 @@ public:
         return opened;
     }
     void FinishPreload();
+    /// Sets the current cache aside (renamed with ".incompatible") and opens an empty one.
+    void Reset();
 
     bool Save(BlobType type, const std::string& name, std::vector<u8>&& data);
     bool Save(BlobType type, const std::string& name, std::vector<u32>&& data);

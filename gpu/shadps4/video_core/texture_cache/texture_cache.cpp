@@ -17,6 +17,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/texture_cache.h"
+#include "video_core/sotc_stats.h"
 #include "video_core/texture_cache/tile_manager.h"
 
 namespace VideoCore {
@@ -76,6 +77,10 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     // 8 GB cards and new allocations failed).
     critical_gc_memory = std::min<u64>(critical_gc_memory, device_local_memory * 6 / 10);
     pressure_gc_memory = std::min<u64>(pressure_gc_memory, critical_gc_memory);
+    SotcStats::vram_budget = static_cast<u64>(device_local_memory);
+    LOG_INFO(Render, "Video memory budget {} MB: collection from {} MB, pressure {} MB, critical {} MB",
+             device_local_memory >> 20, trigger_gc_memory >> 20, pressure_gc_memory >> 20,
+             critical_gc_memory >> 20);
 }
 
 TextureCache::~TextureCache() = default;
@@ -669,6 +674,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     // Create and register a new image
     if (!image_id) {
+        const SotcStats::ScopedTimer stall_timer{SotcStats::image_ns};
+        SotcStats::images_new.fetch_add(1, std::memory_order_relaxed);
         image_id = slot_images.insert(instance, runtime, slot_image_views, info);
         RegisterImage(image_id);
     }
@@ -907,6 +914,8 @@ void TextureCache::RegisterImage(ImageId image_id) {
     image.flags |= ImageFlagBits::Registered;
     ++image_set_generation;
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
+    SotcStats::cached_images.fetch_add(1, std::memory_order_relaxed);
+    SotcStats::cached_image_bytes.fetch_add(Common::AlignUp(image.info.guest_size, 1024), std::memory_order_relaxed);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
     ForEachPage(image.info.guest_address, image.info.guest_size,
                 [this, image_id](u64 page) { page_table[page].push_back(image_id); });
@@ -920,6 +929,8 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ++image_set_generation;
     lru_cache.Free(image.lru_id);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
+    SotcStats::cached_images.fetch_sub(1, std::memory_order_relaxed);
+    SotcStats::cached_image_bytes.fetch_sub(Common::AlignUp(image.info.guest_size, 1024), std::memory_order_relaxed);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
         const auto page_it = page_table.find(page);
         if (page_it == nullptr) {
@@ -1072,6 +1083,7 @@ void TextureCache::GarbageCollectImages() {
     if (instance.CanReportMemoryUsage()) {
         total_used_memory = instance.GetDeviceMemoryUsage();
     }
+    SotcStats::vram_used.store(total_used_memory, std::memory_order_relaxed);
     if (total_used_memory < trigger_gc_memory) {
         return;
     }
@@ -1105,8 +1117,10 @@ void TextureCache::GarbageCollectImages() {
         }
         if (download) {
             DownloadImageMemory(image_id);
+            SotcStats::gc_downloads.fetch_add(1, std::memory_order_relaxed);
         }
         FreeImage(image_id);
+        SotcStats::gc_freed.fetch_add(1, std::memory_order_relaxed);
         if (total_used_memory < critical_gc_memory) {
             if (aggresive) {
                 num_deletions >>= 2;
@@ -1175,6 +1189,7 @@ void TextureCache::GarbageCollectSamplers() {
 void TextureCache::RunGarbageCollector() {
     SCOPE_EXIT {
         ++gc_tick;
+        SotcStats::gc_ticks.fetch_add(1, std::memory_order_relaxed);
     };
 
     GarbageCollectImages();

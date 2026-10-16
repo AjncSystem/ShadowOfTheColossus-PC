@@ -263,7 +263,8 @@ void VideoOutDriver::Flip(const Request& req) {
             const uint64_t bytes_changed = SotcStats::readback_bytes_changed.exchange(0);
             std::fprintf(stderr,
                          "SOTC FPS %.1f at %.0fs; %.0f cmds/frame; readbacks %.0f/s (ahead %llu, finish %llu, heap %llu, early %llu), %.0f ms/s; "
-                         "changed copies %llu/%llu, bytes %llu/%llu\n",
+                         "changed copies %llu/%llu, bytes %llu/%llu; vram %llu/%llu MB, "
+                         "arenas %llu (%llu MB)\n",
                          flips / seconds, std::chrono::duration<double>(now - run_start).count(),
                          flips ? double(SotcStats::commands.exchange(0)) / flips : 0.0,
                          readbacks / seconds,
@@ -275,7 +276,26 @@ void VideoOutDriver::Flip(const Request& req) {
                          static_cast<unsigned long long>(copies_changed),
                          static_cast<unsigned long long>(copies),
                          static_cast<unsigned long long>(bytes_changed),
-                         static_cast<unsigned long long>(bytes));
+                         static_cast<unsigned long long>(bytes),
+                         static_cast<unsigned long long>(SotcStats::vram_used.load() >> 20),
+                         static_cast<unsigned long long>(SotcStats::vram_budget.load() >> 20),
+                         static_cast<unsigned long long>(SotcStats::arena_allocs.load()),
+                         static_cast<unsigned long long>(SotcStats::arena_bytes.load() >> 20));
+            std::fprintf(stderr, "SOTC readback finish: %llu for bytes the guest asked\n",
+                         static_cast<unsigned long long>(
+                             SotcStats::readback_finish_asked.exchange(0)));
+            static uint64_t last_images_new = 0;
+            const uint64_t images_new = SotcStats::images_new.load();
+            std::fprintf(stderr,
+                         "SOTC GC: %.1f ticks/frame, freed %.0f/s (%llu written back), images new "
+                         "%.0f/s, cached %llu (%llu MB)\n",
+                         flips ? double(SotcStats::gc_ticks.exchange(0)) / flips : 0.0,
+                         SotcStats::gc_freed.exchange(0) / seconds,
+                         static_cast<unsigned long long>(SotcStats::gc_downloads.exchange(0)),
+                         (images_new - last_images_new) / seconds,
+                         static_cast<unsigned long long>(SotcStats::cached_images.load()),
+                         static_cast<unsigned long long>(SotcStats::cached_image_bytes.load() >> 20));
+            last_images_new = images_new;
             static const bool cmd_stats = std::getenv("SOTC_CMD_STATS") != nullptr;
             if (cmd_stats && flips) {
                 double k[6];
@@ -427,9 +447,25 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         }
 
         // Check if it's time to take a request.
+        // sotc: the flip rate counts from the last flip instead of fixed vblank phases: at 30 fps
+        // (flip rate 1) a frame ready just after an even vblank went out two vblanks later
+        // (67 ms) instead of at the next one (50 ms). On by default after a 16 min session on a
+        // Radeon RX 6650 XT ("muito melhor"; heavy areas hold a steady 20 fps instead of
+        // stuttering); SOTC_FLIP_LATE=0 restores the fixed phases.
+        static const bool flip_late = [] {
+            const char* v = std::getenv("SOTC_FLIP_LATE");
+            return !v || v[0] != '0';
+        }();
+        static u64 last_flip_count = 0;
         auto& vblank_status = main_port.vblank_status;
-        if (vblank_status.count % (main_port.flip_rate + 1) == 0) {
+        const bool flip_due =
+            flip_late ? vblank_status.count - last_flip_count >= u64(main_port.flip_rate) + 1
+                      : vblank_status.count % (main_port.flip_rate + 1) == 0;
+        if (flip_due) {
             const auto request = receive_request();
+            if (request) {
+                last_flip_count = vblank_status.count;
+            }
             if (!request) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
                     if (!main_port.is_open) {

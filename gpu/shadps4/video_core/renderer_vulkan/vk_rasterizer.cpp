@@ -803,10 +803,13 @@ void Rasterizer::FlushPeriodic() {
             return 256u;
         }
         // SotC: +20% fps in the open world (14-15 -> 18). Other games keep the upstream behavior.
-        // Only measured on NVIDIA; Pink-shadPS4 advises turning it off on AMD (black screen).
+        // Pink-shadPS4 advises turning it off on AMD (black screen); with readbacks ahead on a
+        // Radeon RX 6650 XT the image is right and the sanctuary goes from 17.4 to 22.4 fps.
         constexpr u32 VendorNvidia = 0x10DE;
+        constexpr u32 VendorAmd = 0x1002;
         return Common::ElfInfo::Instance().GameSerial() == "CUSA08809" &&
-                       instance.GetVendorID() == VendorNvidia
+                       (instance.GetVendorID() == VendorNvidia ||
+                        instance.GetVendorID() == VendorAmd)
                    ? 256u
                    : 0u;
     }();

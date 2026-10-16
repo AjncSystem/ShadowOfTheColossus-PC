@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -694,10 +695,30 @@ void Instance::CreateAllocator() {
         .vkGetDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr,
     };
 
+    // sotc: on cards with 8 GB or less, smaller blocks (default 256 MiB). VMA returns a block to
+    // the driver only once it is empty, and the free space inside its blocks is unusable for the
+    // buffer arenas (their own vkAllocateMemory calls): on a 6 GB card ~1 GB sat free in VMA
+    // blocks while arena allocations failed. The real budget (VK_EXT_memory_budget, which counts
+    // other processes) also replaces VMA's 80%-of-heap estimate for WITHIN_BUDGET allocations.
+    u64 device_local_heap = 0;
+    const auto memory_properties = physical_device.getMemoryProperties();
+    for (u32 i = 0; i < memory_properties.memoryHeapCount; ++i) {
+        if (memory_properties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+            device_local_heap = std::max<u64>(device_local_heap, memory_properties.memoryHeaps[i].size);
+        }
+    }
+    // SOTC_VMA_BLOCK_MB=<n> overrides the block size (0: VMA's default), for A/B measurements.
+    u64 block_size = device_local_heap <= 8_GB ? 64_MB : 0;
+    if (const char* env = std::getenv("SOTC_VMA_BLOCK_MB")) {
+        block_size = static_cast<u64>(std::strtoull(env, nullptr, 10)) << 20;
+    }
     const VmaAllocatorCreateInfo allocator_info = {
-        .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT,
+        .flags = static_cast<VmaAllocatorCreateFlags>(
+            VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT |
+            (supports_memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0)),
         .physicalDevice = physical_device,
         .device = *device,
+        .preferredLargeHeapBlockSize = block_size,
         .pVulkanFunctions = &functions,
         .instance = *instance,
         .vulkanApiVersion = TargetVulkanApiVersion,

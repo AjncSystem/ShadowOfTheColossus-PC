@@ -14,6 +14,7 @@ inline std::atomic<uint64_t> watch_addr{0};     ///< SOTC_CS_WATCH: GPU writes t
 inline std::atomic<uint64_t> current_program{0}; ///< hash of the dispatch being recorded (1 = a draw)
 inline std::atomic<uint64_t> readback_ahead{0};   ///< downloads of already submitted work
 inline std::atomic<uint64_t> readback_finish{0};  ///< downloads that flushed the current work
+inline std::atomic<uint64_t> readback_finish_asked{0}; ///< ... for bytes the guest itself asked
 inline std::atomic<uint64_t> heap_guard_builds{0}; ///< readbacks into the BPE heap
 inline std::atomic<uint64_t> readback_copies{0};          ///< ranges downloaded
 inline std::atomic<uint64_t> readback_copies_changed{0};  ///< ... whose bytes differed from memory
@@ -30,6 +31,21 @@ inline std::atomic<uint64_t> commands{0}; ///< draws and dispatches recorded
 /// empty), dispatches, indirect dispatches.
 inline std::atomic<uint64_t> cmd_kinds[6]{};
 inline std::atomic<uint64_t> early_flushes{0}; ///< submits right after a write to a read-back page
+/// Suspects of long frames, printed for each frame over SOTC_STALL_MS (SOTC_FRAME_LOG runs):
+/// pipelines created, shaders recompiled and images created during the frame, and their time.
+inline std::atomic<uint64_t> pipelines_new{0}, pipeline_ns{0};
+inline std::atomic<uint64_t> shaders_compiled{0}, shader_ns{0};
+inline std::atomic<uint64_t> images_new{0}, image_ns{0};
+/// Parts of an image creation: format query, memory allocation (and how many got memory of
+/// their own instead of a block shared with others).
+inline std::atomic<uint64_t> image_query_ns{0}, image_alloc_ns{0}, image_dedicated{0};
+/// Video memory: usage the driver reports (texture cache GC), budget the GC works with, and the
+/// sparse buffer arena memory (never released) as allocations and bytes.
+inline std::atomic<uint64_t> vram_used{0}, vram_budget{0}, arena_allocs{0}, arena_bytes{0};
+/// Texture cache collector: ticks (one per submit with a frame's work), images freed and those
+/// written back to memory first, and the images in the cache with their (guest) size.
+inline std::atomic<uint64_t> gc_ticks{0}, gc_freed{0}, gc_downloads{0};
+inline std::atomic<uint64_t> cached_images{0}, cached_image_bytes{0};
 
 struct ScopedTimer {
     std::atomic<uint64_t>& total;

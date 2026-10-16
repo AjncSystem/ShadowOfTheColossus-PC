@@ -9,6 +9,7 @@
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
+#include "common/scope_exit.h"
 #include "core/debug_state.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -160,7 +161,10 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         const VAddr window_end = std::min<VAddr>(
             std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
         Core::MemoryManager::NoteHostWrite(device_addr, size, 6, window_start);
+        fault_addr = device_addr;
+        fault_size = size;
         DownloadMemory(arena, window_start, window_end - window_start);
+        fault_size = 0;
         if (is_write) {
             memory_tracker->MarkRegionAsCpuModified(device_addr, size);
         }
@@ -169,9 +173,12 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         flush_request();
         return;
     }
+    // sotc: on by default (SOTC_RB_ASYNC=0 turns it off). Radeon RX 6650 XT, sanctuary, three
+    // runs each: 25.3-25.8 fps instead of 23.2-23.7, frames over 40 ms 376-424 instead of
+    // 566-594, readback waits 100 ms/s instead of 290 ms/s.
     static const bool async = [] {
         const char* v = std::getenv("SOTC_RB_ASYNC");
-        return v && v[0] == '1';
+        return !v || v[0] != '0';
     }();
     if (!async) {
         liverpool->SendCommand<true>(std::move(flush_request));
@@ -340,12 +347,14 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     }
     // Readback ahead (idea from Pink-shadPS4, luizgustavs): when the data was written by work
     // already submitted, copy it in a command buffer of its own instead of submitting and waiting
-    // for everything recorded so far. SOTC_RB_AHEAD=0/1 forces it; by default only on NVIDIA,
-    // Pink-shadPS4 advises turning it off on AMD.
+    // for everything recorded so far. SOTC_RB_AHEAD=0/1 forces it; by default on NVIDIA and AMD
+    // (Pink-shadPS4 advises turning it off on AMD; measured right on a Radeon RX 6650 XT).
     static const bool ahead_enabled = [this] {
         const char* v = std::getenv("SOTC_RB_AHEAD");
         constexpr u32 VendorNvidia = 0x10DE;
-        return v ? std::atoi(v) != 0 : instance.GetVendorID() == VendorNvidia;
+        constexpr u32 VendorAmd = 0x1002;
+        return v ? std::atoi(v) != 0
+                 : instance.GetVendorID() == VendorNvidia || instance.GetVendorID() == VendorAmd;
     }();
     if (ahead_enabled && !written_by_current && pending_binds.empty()) {
         const auto cmdbuf = scheduler.BeginAhead();
@@ -376,6 +385,12 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         SotcStats::readback_ahead.fetch_add(1, std::memory_order_relaxed);
     } else {
         SotcStats::readback_finish.fetch_add(1, std::memory_order_relaxed);
+        // Did the guest ask for bytes the command buffer being built writes, or only a neighbour
+        // in the window (or a hot region) did?
+        if (fault_size != 0 && written_by_current &&
+            current_writes.Intersects(fault_addr, fault_size)) {
+            SotcStats::readback_finish_asked.fetch_add(1, std::memory_order_relaxed);
+        }
         for (const auto& item : pending) {
             runtime.CopyBuffer(item.arena, download.buffer, item.copies);
         }
@@ -792,18 +807,51 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
     const auto* last_arena = address_space[last_page];
     if (first_arena == last_arena) {
         if (!first_arena) {
-            const u64 base_block = Common::AlignDownPow2<u64>(first_block, blocks_per_arena_page);
-            const u64 num_pages = last_page - first_page + 1;
+            // sotc: an arena covers a group of SOTC_ARENA_GROUP pages (default 4, 16 GB) when
+            // they are all free. With one page per arena, a buffer across two pages migrated
+            // both arenas into a new one and rebound all their memory: a stall of 0.8-0.9 s,
+            // about once a session. SotC's GPU memory lies in 0x10'0000'0000-0x13'ffff'ffff.
+            static const u64 group = [] {
+                const char* v = std::getenv("SOTC_ARENA_GROUP");
+                const u64 n = v ? std::strtoull(v, nullptr, 10) : 4;
+                return n != 0 && std::has_single_bit(n) ? n : u64{1};
+            }();
+            u64 group_first = first_page & ~(group - 1);
+            u64 group_last = group_first + group - 1;
+            for (u64 page = group_first; page <= group_last; ++page) {
+                if (page >= NUM_ARENA_PAGES || address_space[page]) {
+                    group_first = first_page;
+                    group_last = last_page;
+                    break;
+                }
+            }
+            if (last_page > group_last) {
+                group_first = first_page;
+                group_last = last_page;
+            }
+            const u64 num_pages = group_last - group_first + 1;
             const auto* new_arena =
-                &arenas.emplace_back(instance, base_block << block_shift,
+                &arenas.emplace_back(instance, group_first << ARENA_PAGE_BITS,
                                      num_pages << ARENA_PAGE_BITS, MemoryType::Sparse);
-            address_space[first_page] = new_arena;
-            address_space[last_page] = new_arena;
+            for (u64 page = group_first; page <= group_last; ++page) {
+                address_space[page] = new_arena;
+            }
+            std::fprintf(stderr, "SOTC arena at %#llx, %llu GB\n",
+                         static_cast<unsigned long long>(group_first << ARENA_PAGE_BITS),
+                         static_cast<unsigned long long>(num_pages << (ARENA_PAGE_BITS - 30)));
         }
         return address_space[first_page];
     }
 
-    LOG_WARNING(Render, "Migrating arena");
+    const auto migrate_start = std::chrono::steady_clock::now();
+    SCOPE_EXIT {
+        LOG_WARNING(Render, "Migrating arena: {} + {} MB of address space, {} ms",
+                    (first_arena ? first_arena->size_bytes : ARENA_PAGE_SIZE) >> 20,
+                    (last_arena ? last_arena->size_bytes : ARENA_PAGE_SIZE) >> 20,
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - migrate_start)
+                        .count());
+    };
 
     const u64 first_addr = first_arena ? first_arena->cpu_addr : (first_page << ARENA_PAGE_BITS);
     const u64 first_size = first_arena ? first_arena->size_bytes : ARENA_PAGE_SIZE;
@@ -848,54 +896,28 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         return;
     }
 
-    vk::MemoryAllocateInfo alloc_info = {
-        .allocationSize = resident_blocks << block_shift,
-        .memoryTypeIndex = arena_memory_type_index,
-    };
-    auto [alloc_result, device_memory] = instance.GetDevice().allocateMemory(alloc_info);
-    if (alloc_result == vk::Result::eErrorOutOfDeviceMemory && arena_fallback_memory_type_index) {
-        // Resident arena ranges are never released, so a long session can exhaust video memory.
-        // Keep running from system memory (slower GPU access) instead of aborting.
-        static bool warned = false;
-        if (!std::exchange(warned, true)) {
-            LOG_WARNING(Render, "Video memory exhausted, placing new buffer memory in system RAM");
-        }
-        alloc_info.memoryTypeIndex = *arena_fallback_memory_type_index;
-        const auto retry = instance.GetDevice().allocateMemory(alloc_info);
-        alloc_result = retry.result;
-        device_memory = retry.value;
+    // Memory first: running out of it may submit work (see AllocateArenaBlocks), which must not
+    // happen with half of the binds queued.
+    boost::container::small_vector<std::pair<vk::DeviceMemory, u64>, 8> placements;
+    for (const auto& range : bind_ranges) {
+        placements.push_back(AllocateArenaBlocks(range.end - range.start));
     }
-    if (alloc_result == vk::Result::eErrorOutOfDeviceMemory) {
-        // Video memory is full (sparse arenas cannot use system memory). Drop old cached images,
-        // wait for the GPU so their memory is really released, and try once more.
-        LOG_WARNING(Render, "Video memory exhausted, collecting cached images");
-        texture_cache.EmergencyCollect();
-        scheduler.Finish();
-        scheduler.PopPendingOperations();
-        alloc_info.memoryTypeIndex = arena_memory_type_index;
-        const auto retry = instance.GetDevice().allocateMemory(alloc_info);
-        alloc_result = retry.result;
-        device_memory = retry.value;
-    }
-    ASSERT_MSG(alloc_result == vk::Result::eSuccess, "Failed to allocate buffer arena memory: {}",
-               vk::to_string(alloc_result));
 
     boost::container::small_vector<vk::BufferCopy, 8> copies;
     const auto staging =
         staging_pool.Request(resident_blocks * sizeof(vk::DeviceAddress), MemoryType::HostUncached);
 
-    backing_blocks[static_cast<VkDeviceMemory>(device_memory)] += resident_blocks;
-
-    u64 memory_offset{};
     ArenaBinds* binds = BindsForArena(arena);
     auto* bda_addrs = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
     u64 offset = staging.offset;
+    size_t placement_index = 0;
     for (const auto& range : bind_ranges) {
+        const auto [device_memory, memory_block] = placements[placement_index++];
         Backing backing;
         backing.start = range.start;
         backing.end = range.end;
         backing.memory = device_memory;
-        backing.offset = memory_offset >> block_shift;
+        backing.offset = memory_block;
         resident_ranges.Add(backing);
 
         LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
@@ -904,9 +926,8 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
             .resourceOffset = (range.start << block_shift) - arena->cpu_addr,
             .size = (range.end - range.start) << block_shift,
             .memory = device_memory,
-            .memoryOffset = memory_offset,
+            .memoryOffset = memory_block << block_shift,
         });
-        memory_offset += bind.size;
 
         for (u32 block = 0; block < bind.size; block += block_size) {
             *(bda_addrs++) = arena->BufferDeviceAddress() + bind.resourceOffset + block;
@@ -1001,6 +1022,124 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
     return true;
 }
 
+std::pair<vk::DeviceMemory, u64> BufferCache::AllocateArenaBlocks(u64 blocks) {
+    // Room in a chunk of video memory, then in a chunk of system memory.
+    const auto take = [&](u32 memory_type) -> std::optional<std::pair<vk::DeviceMemory, u64>> {
+        for (auto& chunk : arena_chunks) {
+            if (chunk->memory_type != memory_type) {
+                continue;
+            }
+            for (auto it = chunk->free_runs.begin(); it != chunk->free_runs.end(); ++it) {
+                if (it->second < blocks) {
+                    continue;
+                }
+                const auto [start, length] = *it;
+                chunk->free_runs.erase(it);
+                if (length > blocks) {
+                    chunk->free_runs.emplace(start + blocks, length - blocks);
+                }
+                chunk->used_blocks += blocks;
+                return std::make_pair(chunk->memory, start);
+            }
+        }
+        return std::nullopt;
+    };
+    const auto grow = [&](u32 memory_type) -> std::optional<std::pair<vk::DeviceMemory, u64>> {
+        const u64 chunk_blocks = std::max<u64>(ARENA_CHUNK_SIZE >> block_shift, blocks);
+        const vk::MemoryAllocateInfo alloc_info = {
+            .allocationSize = chunk_blocks << block_shift,
+            .memoryTypeIndex = memory_type,
+        };
+        const auto [result, memory] = instance.GetDevice().allocateMemory(alloc_info);
+        if (result != vk::Result::eSuccess) {
+            return std::nullopt;
+        }
+        SotcStats::arena_allocs.fetch_add(1, std::memory_order_relaxed);
+        SotcStats::arena_bytes.fetch_add(alloc_info.allocationSize, std::memory_order_relaxed);
+        auto& chunk = arena_chunks.emplace_back(std::make_unique<ArenaChunk>());
+        chunk->memory = memory;
+        chunk->memory_type = memory_type;
+        chunk->free_runs.emplace(0, chunk_blocks);
+        chunk_by_memory.emplace(static_cast<VkDeviceMemory>(memory), chunk.get());
+        return take(memory_type);
+    };
+    if (auto placed = take(arena_memory_type_index)) {
+        return *placed;
+    }
+    if (auto placed = grow(arena_memory_type_index)) {
+        return *placed;
+    }
+    if (arena_fallback_memory_type_index) {
+        // Keep running from system memory (slower GPU access) instead of aborting.
+        static bool warned = false;
+        if (!std::exchange(warned, true)) {
+            LOG_WARNING(Render, "Video memory exhausted, placing new buffer memory in system RAM");
+        }
+        if (auto placed = take(*arena_fallback_memory_type_index)) {
+            return *placed;
+        }
+        if (auto placed = grow(*arena_fallback_memory_type_index)) {
+            return *placed;
+        }
+    }
+    // Drop old cached images, wait for the GPU so their memory is really released, try again.
+    LOG_WARNING(Render,
+                "Video memory exhausted, collecting cached images (asked {} KB; in use {} MB of {} "
+                "MB; arenas {} chunks, {} MB)",
+                (blocks << block_shift) >> 10, instance.GetDeviceMemoryUsage() >> 20,
+                SotcStats::vram_budget.load() >> 20, SotcStats::arena_allocs.load(),
+                SotcStats::arena_bytes.load() >> 20);
+    texture_cache.EmergencyCollect();
+    scheduler.Finish();
+    scheduler.PopPendingOperations();
+    auto placed = grow(arena_memory_type_index);
+    ASSERT_MSG(placed.has_value(), "Failed to allocate buffer arena memory");
+    return *placed;
+}
+
+void BufferCache::FreeArenaBlocks(vk::DeviceMemory memory, u64 start, u64 blocks) {
+    const auto found = chunk_by_memory.find(static_cast<VkDeviceMemory>(memory));
+    if (found == chunk_by_memory.end()) {
+        return;
+    }
+    ArenaChunk& chunk = *found->second;
+    chunk.used_blocks -= std::min(chunk.used_blocks, blocks);
+    // Give the run back, merged with free neighbours.
+    auto next = chunk.free_runs.lower_bound(start);
+    if (next != chunk.free_runs.end() && next->first == start + blocks) {
+        blocks += next->second;
+        next = chunk.free_runs.erase(next);
+    }
+    if (next != chunk.free_runs.begin()) {
+        const auto prev = std::prev(next);
+        if (prev->first + prev->second == start) {
+            start = prev->first;
+            blocks += prev->second;
+            chunk.free_runs.erase(prev);
+        }
+    }
+    chunk.free_runs.emplace(start, blocks);
+    if (chunk.used_blocks != 0) {
+        return;
+    }
+    // Empty: give the memory back. The unbind is submitted before this tick's work, which
+    // waits for it.
+    SotcStats::arena_allocs.fetch_sub(1, std::memory_order_relaxed);
+    chunk_by_memory.erase(found);
+    std::erase_if(arena_chunks, [&](const auto& c) {
+        if (c->memory != memory) {
+            return false;
+        }
+        u64 size = 0;
+        for (const auto& [run_start, run_blocks] : c->free_runs) {
+            size += run_blocks;
+        }
+        SotcStats::arena_bytes.fetch_sub(size << block_shift, std::memory_order_relaxed);
+        return true;
+    });
+    scheduler.DeferOperation([device = instance.GetDevice(), memory] { device.freeMemory(memory); });
+}
+
 void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
     // Only whole blocks inside the unmapped range can go; partial blocks may back neighbours.
     const u64 first_block = Common::AlignUp(device_addr, u64{block_size}) >> block_shift;
@@ -1042,18 +1181,7 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
         // back in (fault buffer) instead of touching unbound memory.
         runtime.FillBuffer(bda_pagetable_buffer.get(), range.start * sizeof(vk::DeviceAddress),
                            (range.end - range.start) * sizeof(vk::DeviceAddress), 0u);
-        const auto memory = static_cast<VkDeviceMemory>(range.memory);
-        auto it = backing_blocks.find(memory);
-        if (it != backing_blocks.end()) {
-            it->second -= std::min(it->second, range.end - range.start);
-            if (it->second == 0) {
-                backing_blocks.erase(it);
-                // The unbind is submitted before this tick's work, which waits for it.
-                scheduler.DeferOperation([device = instance.GetDevice(), memory = range.memory] {
-                    device.freeMemory(memory);
-                });
-            }
-        }
+        FreeArenaBlocks(range.memory, range.offset, range.end - range.start);
     }
     std::erase_if(hot_readbacks, [&](const HotReadback& hot) {
         return hot.addr < (end_block << block_shift) &&
@@ -1099,8 +1227,21 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
     info.AddWait(signal_sema, signal_tick);
     // Queue access is serialized by submit_mutex, which the scheduler no longer holds here.
     std::scoped_lock lk{Vulkan::Scheduler::submit_mutex};
+    const auto bind_start = std::chrono::steady_clock::now();
     auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    // sotc: a bind of many ranges (an arena migration rebinds all of them) can take long.
+    if (const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - bind_start)
+                            .count();
+        ms >= 20) {
+        size_t num_binds = 0;
+        for (const auto& binds : pending_binds) {
+            num_binds += binds.binds.size();
+        }
+        LOG_WARNING(Render, "Sparse bind of {} ranges in {} arenas took {} ms", num_binds,
+                    pending_binds.size(), ms);
+    }
 
     pending_binds.clear();
 }

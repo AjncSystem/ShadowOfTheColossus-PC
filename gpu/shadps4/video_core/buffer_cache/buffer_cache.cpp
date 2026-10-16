@@ -966,6 +966,14 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
 }
 
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
+    // sotc: binds check the same ranges thousands of times a frame, each a search of ~2,600
+    // resident ranges (~2% of the command processor): ranges found resident are remembered
+    // (64 slots by first block) until the resident set changes (resident_version).
+    auto& cached = resident_cache[(first_block * 0x9E3779B97F4A7C15ull) >> 58];
+    if (cached.version == resident_version && first_block >= cached.first &&
+        last_block < cached.end) {
+        return;
+    }
     u32 resident_blocks{};
     IntervalList bind_ranges;
     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
@@ -974,6 +982,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     });
 
     if (bind_ranges.Empty()) {
+        cached = {resident_version, first_block, last_block + 1};
         return;
     }
     const SotcStats::FrameTimer frame_timer{SotcStats::FrameAlloc};

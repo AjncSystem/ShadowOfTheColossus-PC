@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.57-opt3 — 2026-10-16 (fork Oussama268)
+- **Menos travadas na primeira visita a uma área:** os pipelines gráficos novos agora são
+  montados em threads separadas, e o objeto que precisa de um pipeline ainda em montagem não é
+  desenhado por alguns quadros (aparece um instante depois) em vez de o jogo inteiro parar. Com o
+  cache de shaders vazio, no demo da tela de título: quadros acima de 50 ms 235 → 156, 1% low
+  23,9 → 29,1 FPS. Passes de tela cheia (pós-processamento) continuam sendo montados na hora,
+  para não aparecer quadro preto. `SOTC_ASYNC_SHADERS=0` volta ao comportamento antigo.
+- A tradução dos shaders (a maior parte do que sobrou da travada) ainda roda na thread principal
+  de comandos; levá-la para segundo plano é o próximo passo.
+- A pasta de patches de shader é listada uma vez só, em vez de duas consultas ao disco por shader.
+- Diagnóstico: com `SOTC_FPS=1`, a linha `SOTC COMPILE` mostra onde vai o tempo de compilação.
+- Testado: 15 minutos de demo com cache vazio sem erro; com cache cheio, santuário 32,4 FPS e
+  demo 50,0 FPS (sem perda).
+
 ## 0.57-opt2 — 2026-10-16 (fork Oussama268)
 - **Muito menos engasgos ao entrar em áreas novas (placas de 6 GB):** texturas cujo T# começa num
   nível de mip acima de 0 nunca usam os mips mais finos, mas o port guardava a cadeia inteira na

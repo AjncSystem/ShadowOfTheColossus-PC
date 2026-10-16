@@ -105,7 +105,13 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
 StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool deferred,
                                                  bool unsynchronized) {
     auto& cache = large_caches[u32(type)];
-    const u64 max_size = std::max(size + size / 4, RoundAllocationSize(size));
+    // sotc: deferred requests (asynchronous readbacks, one per guest read of GPU-written memory)
+    // come in slightly different sizes; matched within 1.25x they rarely found a free buffer and
+    // allocated a new one ~1,100 times in a 6-minute attract run. They get power-of-two sizes
+    // instead, and reuse any free buffer of that size class.
+    const u64 alloc_size =
+        deferred ? std::bit_ceil(std::max(size, LARGE_MIN_GRANULARITY)) : RoundAllocationSize(size);
+    const u64 max_size = deferred ? alloc_size : std::max(size + size / 4, RoundAllocationSize(size));
 
     LargeBuffer* best{};
     for (LargeBuffer& entry : cache) {
@@ -121,10 +127,10 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
 
     if (!best) {
         const SotcStats::FrameTimer frame_timer{SotcStats::FrameAlloc};
-        const SotcStats::AllocTrace alloc_trace{SotcStats::AllocStagingLarge, RoundAllocationSize(size)};
+        const SotcStats::AllocTrace alloc_trace{SotcStats::AllocStagingLarge, alloc_size};
         best = &cache.emplace_back(LargeBuffer{
-            .buffer = std::make_unique<VideoCore::Buffer>(instance, 0, RoundAllocationSize(size),
-                                                          type, "StagingBufferPool:Dedicated"),
+            .buffer = std::make_unique<VideoCore::Buffer>(instance, 0, alloc_size, type,
+                                                          "StagingBufferPool:Dedicated"),
             .tick = 0,
             .last_used_frame = frame,
             .held = false,

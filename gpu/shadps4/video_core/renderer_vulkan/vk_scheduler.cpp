@@ -220,6 +220,7 @@ void Scheduler::Flush() {
 }
 
 void Scheduler::Finish() {
+    SotcStats::cp_drains[0].fetch_add(1, std::memory_order_relaxed);
     // When finishing, we need to wait for the submission to have executed on the device.
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
@@ -228,6 +229,7 @@ void Scheduler::Finish() {
 }
 
 void Scheduler::FinishHostRead() {
+    SotcStats::cp_drains[1].fetch_add(1, std::memory_order_relaxed);
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
     SubmitExecution(info);
@@ -236,6 +238,7 @@ void Scheduler::FinishHostRead() {
 }
 
 void Scheduler::Wait(u64 tick) {
+    SotcStats::cp_drains[3].fetch_add(1, std::memory_order_relaxed);
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};
@@ -286,6 +289,7 @@ vk::CommandBuffer Scheduler::BeginAhead() {
 }
 
 void Scheduler::SubmitAheadAndWait() {
+    SotcStats::cp_drains[2].fetch_add(1, std::memory_order_relaxed);
     if (work_semaphore.HasMarker()) {
         work_semaphore.RecordMarker(ahead_cmdbuf, Semaphore::MarkerSlot::Ahead,
                                     static_cast<u32>(++ahead_sequence));

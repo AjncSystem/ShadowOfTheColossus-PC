@@ -280,6 +280,65 @@ private:
     static constexpr size_t NumTexBindMemos = 512;
     std::unique_ptr<std::array<TexBindMemo, NumTexBindMemos>> tex_bind_memos =
         std::make_unique<std::array<TexBindMemo, NumTexBindMemos>>();
+
+    /// sotc: a stage's whole texture block (BindTextures): the resource bits of its images and
+    /// samplers and the T#/S# they read -> the descriptors written, the images bound and the
+    /// bindings taken. BindTextures' result is a function of that key, of the image set (its
+    /// generation) and of the state of each image it binds (backing and state version): the memo
+    /// is used only while all of those are the ones it was stored with (TryTextureBlock).
+    static constexpr u32 MaxBlockImages = 12;
+    static constexpr u32 MaxBlockSamplers = 12;
+    static constexpr u32 MaxBlockInfos = 24;
+    static constexpr u32 MaxBlockKeyWords = 2 + MaxBlockImages * 5 + MaxBlockSamplers * 3;
+    struct TexBlockKey {
+        u32 words{};
+        u64 hash{};
+        std::array<u64, MaxBlockKeyWords> key;
+    };
+    struct TexBlockMemo {
+        u32 key_words{};
+        u64 generation{~0ULL};
+        std::array<u64, MaxBlockKeyWords> key{};
+        u32 num_infos{};
+        u32 num_writes{};
+        u32 num_images{};
+        u32 num_samplers{};
+        u32 num_lod_banks{};
+        u32 unified{};
+        std::array<vk::DescriptorImageInfo, MaxBlockInfos> infos{};
+        struct Write {
+            u16 binding;
+            u16 count;
+            u16 info;
+            vk::DescriptorType type;
+        };
+        std::array<Write, MaxBlockImages + MaxBlockSamplers> writes{};
+        /// found: the image FindImage gave, with the depth image it was linked to then; id: the
+        /// image bound (that depth image, if any), its backing and the backing's state version
+        /// once the whole block was bound.
+        struct Bound {
+            VideoCore::ImageId found;
+            VideoCore::ImageId id;
+            VideoCore::ImageId depth_id;
+            u64 depth_uid;
+            const void* backing;
+            u32 version;
+        };
+        std::array<Bound, MaxBlockInfos> images{};
+        std::array<AmdGpu::Sampler, MaxBlockSamplers> samplers{};
+        std::array<u8, MaxBlockSamplers> sampler_depth{};
+        std::array<u8, MaxBlockSamplers> sampler_info{};
+        std::array<u8, MaxBlockImages> lod_banks{};
+    };
+    static constexpr size_t NumTexBlockMemos = 512;
+    std::unique_ptr<std::array<TexBlockMemo, NumTexBlockMemos>> tex_block_memos =
+        std::make_unique<std::array<TexBlockMemo, NumTexBlockMemos>>();
+    static int TexBlockMode();
+    bool MakeTextureBlockKey(const Shader::Info& stage, TexBlockKey& key) const;
+    bool TryTextureBlock(const Shader::Info& stage, const TexBlockKey& key,
+                         Shader::Backend::Bindings& binding);
+    void BindTexturesSlow(const Shader::Info& stage, Shader::Backend::Bindings& binding,
+                          const TexBlockKey* key);
     bool attachment_feedback_loop{};
     bool needs_barrier{};
     /// sotc: why needs_barrier was set for the current draw/dispatch (SotcStats::barrier_breaks

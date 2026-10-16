@@ -230,6 +230,11 @@ private:
     void BeginAsyncReadback(AsyncReadback& readback);
     void FinishAsyncReadback(AsyncReadback& readback);
     AsyncReadback* FindInflightReadback(VAddr addr, u64 size);
+    /// sotc: an asynchronous readback in flight one of whose windows holds [addr, addr + size).
+    AsyncReadback* FindInflightWindow(VAddr addr, u64 size);
+    /// sotc: ends a guest write fault served asynchronously: GPU data written there since the
+    /// readback's copy is read back first, then the bytes become CPU-modified.
+    void GiveToGuestWrite(VAddr device_addr, u64 size);
     void MarkInflightReadbacksDirty(VAddr addr, u64 size);
     std::vector<AsyncReadback*> inflight_readbacks;
 

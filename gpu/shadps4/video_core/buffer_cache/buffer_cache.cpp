@@ -10,6 +10,8 @@
 
 #include "common/alignment.h"
 #include "common/scope_exit.h"
+#include "common/thread.h"
+#include <fmt/format.h>
 #include "core/debug_state.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -32,7 +34,34 @@ extern "C" uintptr_t runtime_sotc_heap(void);
 
 #include <vk_mem_alloc.h>
 
+#ifdef _WIN32
+extern "C" __declspec(dllimport) unsigned short __stdcall RtlCaptureStackBackTrace(
+    unsigned long frames_to_skip, unsigned long frames_to_capture, void** back_trace,
+    unsigned long* back_trace_hash);
+#endif
+
 namespace VideoCore {
+
+void ReportBothModified(VAddr page_addr, u64 pages) {
+    const u64 seen = g_both_modified_pages.fetch_add(pages, std::memory_order_relaxed);
+    static std::atomic<int> shown{0};
+    if (shown.fetch_add(1, std::memory_order_relaxed) >= 24) {
+        return;
+    }
+    std::string frames;
+#ifdef _WIN32
+    void* stack[12]{};
+    const unsigned n = RtlCaptureStackBackTrace(1, 12, stack, nullptr);
+    for (unsigned i = 0; i < n; ++i) {
+        frames += fmt::format(" {:#x}", reinterpret_cast<uintptr_t>(stack[i]));
+    }
+#endif
+    std::fprintf(stderr, "SOTC page both CPU- and GPU-modified: %#llx (+%llu pages, %llu so far), "
+                         "thread %s; stack%s\n",
+                 static_cast<unsigned long long>(page_addr), static_cast<unsigned long long>(pages),
+                 static_cast<unsigned long long>(seen + pages),
+                 Common::GetCurrentThreadName().c_str(), frames.c_str());
+}
 
 namespace {
 /// SOTC_TEXEL_SYNC_LEGACY=1: texel buffers synchronized twice per bind and always recorded as
@@ -287,6 +316,19 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
 void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
     SotcStats::readbacks.fetch_add(1, std::memory_order_relaxed);
     NoteHotRead(readback.device_addr, readback.size);
+    // sotc: the job threads fault on the same windows at once (the culling bitsets). Waiting, the
+    // command processor served them one after another and the later ones found the window read
+    // back already; asynchronous, they arrive while the first copy is in flight, and each recorded
+    // a copy of its own: twice the readbacks (copies, submits, GPU syncs). A window in flight holds
+    // every GPU-modified byte it had when copied, and a GPU write recorded since makes it dirty
+    // (FinishAsyncReadback then reads it back again): waiting for it gives these bytes too.
+    if (const AsyncReadback* other = FindInflightWindow(readback.device_addr, readback.size)) {
+        readback.tick = other->tick;
+        readback.waiting = true;
+        readback.dependent = true;
+        SotcStats::readback_joined.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     const u32 first_block = readback.device_addr >> block_shift;
     const u32 last_block = (readback.device_addr + readback.size - 1) >> block_shift;
     const auto* arena = GetArena(first_block, last_block);
@@ -569,6 +611,17 @@ bool BufferCache::TryEagerReadback(VAddr window, u64 size) {
     return true;
 }
 
+BufferCache::AsyncReadback* BufferCache::FindInflightWindow(VAddr addr, u64 size) {
+    for (AsyncReadback* readback : inflight_readbacks) {
+        for (const auto& item : readback->pending) {
+            if (item.addr <= addr && addr + size <= item.addr + item.size) {
+                return readback;
+            }
+        }
+    }
+    return nullptr;
+}
+
 BufferCache::AsyncReadback* BufferCache::FindInflightReadback(VAddr addr, u64 size) {
     for (AsyncReadback* readback : inflight_readbacks) {
         for (const auto& item : readback->pending) {
@@ -583,20 +636,47 @@ BufferCache::AsyncReadback* BufferCache::FindInflightReadback(VAddr addr, u64 si
     return nullptr;
 }
 
+void BufferCache::GiveToGuestWrite(VAddr device_addr, u64 size) {
+    // sotc: a guest write fault on GPU data is served by reading the data back and then letting
+    // the guest write (the page becomes CPU-modified). Waiting, both happen at one point of the
+    // command stream. Asynchronously, the command processor goes on between the copy and this
+    // point and may have bound these bytes for a GPU write again: the copy is stale for them, and
+    // making the page CPU-modified now would leave it GPU-modified as well (no protection fits:
+    // Windows has no write-only pages, and the readback of the new GPU data would overwrite the
+    // guest's write). Read them back now, as the waiting path would have, first.
+    if (memory_tracker->IsRegionGpuModified(device_addr, size)) {
+        SotcStats::readback_write_refresh.fetch_add(1, std::memory_order_relaxed);
+        const u32 first_block = device_addr >> block_shift;
+        const u32 last_block = (device_addr + size - 1) >> block_shift;
+        const auto* arena = GetArena(first_block, last_block);
+        const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
+        const VAddr window_start =
+            std::max<VAddr>(Common::AlignDown(device_addr, ReadbackWindow), arena->cpu_addr);
+        const VAddr window_end = std::min<VAddr>(
+            std::max<VAddr>(window_start + ReadbackWindow, device_addr + size), arena_end);
+        DownloadMemory(arena, window_start, window_end - window_start);
+    }
+    memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+}
+
 void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
     if (readback.dependent) {
-        // Finish the readbacks this one waited for (owners still blocked keep them alive).
+        // Finish the readbacks this one waited for (owners still blocked keep them alive): the
+        // ones whose window holds its bytes, and the ones copying any of them.
+        while (AsyncReadback* other = FindInflightWindow(readback.device_addr, readback.size)) {
+            FinishAsyncReadback(*other);
+        }
         while (AsyncReadback* other = FindInflightReadback(readback.device_addr, readback.size)) {
             FinishAsyncReadback(*other);
         }
         if (readback.is_write) {
-            memory_tracker->MarkRegionAsCpuModified(readback.device_addr, readback.size);
+            GiveToGuestWrite(readback.device_addr, readback.size);
         }
         return;
     }
     if (readback.finished) {
         if (readback.is_write) {
-            memory_tracker->MarkRegionAsCpuModified(readback.device_addr, readback.size);
+            GiveToGuestWrite(readback.device_addr, readback.size);
         }
         return;
     }
@@ -626,7 +706,7 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
         staging_pool.FreeDeferred(download);
     }
     if (readback.is_write) {
-        memory_tracker->MarkRegionAsCpuModified(readback.device_addr, readback.size);
+        GiveToGuestWrite(readback.device_addr, readback.size);
     }
 }
 

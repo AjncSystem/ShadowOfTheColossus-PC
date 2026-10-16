@@ -24,6 +24,13 @@ using LockType = std::mutex;
 /// value means no CPU data reached tracked memory unseen since it was read.
 inline std::atomic<u64> g_cpu_dirty_generation{1};
 
+/// sotc: pages left both CPU-modified and GPU-modified by a state change (diagnostic): no page
+/// protection keeps both right (Windows has no write-only pages, and a CPU write there would be
+/// overwritten when the GPU data is read back). Counted; the first ones are reported with the
+/// call stack that made them (buffer_cache.cpp).
+inline std::atomic<u64> g_both_modified_pages{0};
+void ReportBothModified(VAddr page_addr, u64 pages);
+
 /**
  * Allows tracking CPU and GPU modification of pages in a contigious virtual address region.
  * Information is stored in bitsets for spacial locality and fast update of single pages.
@@ -251,6 +258,11 @@ private:
                 gpu[index] |= mask;
             }
             read_prot[index] = (gpu[index] ^ prev) & mask;
+        }
+        if (const u64 both = cpu[index] & gpu[index] & mask) [[unlikely]] {
+            ReportBothModified(cpu_addr + (index * PAGES_PER_WORD + std::countr_zero(both)) *
+                                              BYTES_PER_PAGE,
+                               std::popcount(both));
         }
     }
 

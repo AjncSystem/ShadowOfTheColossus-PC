@@ -428,7 +428,41 @@ void VideoOutDriver::Flip(const Request& req) {
                                  "SOTC prepared selection ms/frame: program params %.2f, walker "
                                  "%.2f, spec inputs %.2f, fetch shader %.2f, rest %.2f\n",
                                  ms[32], ms[33], ms[34], ms[35], ms[36]);
+                    std::fprintf(stderr,
+                                 "SOTC texture blocks ms/frame %.2f; recorder busy ms/frame %.2f\n",
+                                 ms[37],
+                                 double(SotcStats::recorder_busy_ns.exchange(0)) / 1e6 / flips);
                 }
+                std::fprintf(stderr,
+                             "SOTC split/frame: finish %.2f, host-read finish %.2f, ahead waits "
+                             "%.2f, tick waits %.2f; CP invalidations %.1f (over images %.1f)\n",
+                             double(SotcStats::cp_drains[0].exchange(0)) / flips,
+                             double(SotcStats::cp_drains[1].exchange(0)) / flips,
+                             double(SotcStats::cp_drains[2].exchange(0)) / flips,
+                             double(SotcStats::cp_drains[3].exchange(0)) / flips,
+                             double(SotcStats::cp_invalidations[0].exchange(0)) / flips,
+                             double(SotcStats::cp_invalidations[1].exchange(0)) / flips);
+                std::fprintf(stderr,
+                             "SOTC tex blocks/frame: reused %.0f, bound %.0f, not keyed %.0f, "
+                             "stored %.0f (not stored: other binding %.0f, image set %.0f, size "
+                             "%.0f, write %.0f; missed: key %.0f, image set %.0f, image %.0f, "
+                             "upload %.0f), VERIFY MISMATCHES %llu; image state changes %.0f "
+                             "whole, %.0f per subresource\n",
+                             double(SotcStats::tex_block[0].exchange(0)) / flips,
+                             double(SotcStats::tex_block[1].exchange(0)) / flips,
+                             double(SotcStats::tex_block[2].exchange(0)) / flips,
+                             double(SotcStats::tex_block[3].exchange(0)) / flips,
+                             double(SotcStats::tex_block_reject[0].exchange(0)) / flips,
+                             double(SotcStats::tex_block_reject[1].exchange(0)) / flips,
+                             double(SotcStats::tex_block_reject[2].exchange(0)) / flips,
+                             double(SotcStats::tex_block_reject[3].exchange(0)) / flips,
+                             double(SotcStats::tex_block_miss[0].exchange(0)) / flips,
+                             double(SotcStats::tex_block_miss[1].exchange(0)) / flips,
+                             double(SotcStats::tex_block_miss[2].exchange(0)) / flips,
+                             double(SotcStats::tex_block_miss[3].exchange(0)) / flips,
+                             static_cast<unsigned long long>(SotcStats::tex_block[4].load()),
+                             double(SotcStats::image_state_changes[0].exchange(0)) / flips,
+                             double(SotcStats::image_state_changes[1].exchange(0)) / flips);
                 {
                     double b[9];
                     for (int i = 0; i < 9; ++i) {
@@ -459,7 +493,8 @@ void VideoOutDriver::Flip(const Request& req) {
                              "SOTC rb/frame: calls %.2f, real %.2f (ahead %.2f, finish %.2f; "
                              "extra-forced %.2f, rewritten %.2f), noop %.2f, dedup %.2f (miss %.2f), "
                              "fence flushes %.2f, extras deferred %.2f; wait %.0f ms/s; "
-                             "gap %.0f us %.0f cmds; recorder %.0f ms/s\n",
+                             "gap %.0f us %.0f cmds; recorder %.0f ms/s; async joined %.2f, "
+                             "write refreshes %.2f\n",
                              readbacks / f, (rb_ahead + rb_finish) / f, rb_ahead / f,
                              rb_finish / f, SotcStats::readback_finish_extra.exchange(0) / f,
                              SotcStats::readback_rewritten.exchange(0) / f,
@@ -470,7 +505,9 @@ void VideoOutDriver::Flip(const Request& req) {
                              SotcStats::readback_extra_deferred.exchange(0) / f,
                              readback_wait_ms / seconds,
                              traced ? gap_us / traced : 0.0, traced ? gap_cmds / traced : 0.0,
-                             SotcStats::recorder_wait_ns.exchange(0) / 1e6 / seconds);
+                             SotcStats::recorder_wait_ns.exchange(0) / 1e6 / seconds,
+                             SotcStats::readback_joined.exchange(0) / f,
+                             SotcStats::readback_write_refresh.exchange(0) / f);
                 // Command processor time per frame: what is left after its waits is the work
                 // (unaffected by the vblank rounding of the frame rate).
                 const double ms_frame = 1000.0 * seconds / f;

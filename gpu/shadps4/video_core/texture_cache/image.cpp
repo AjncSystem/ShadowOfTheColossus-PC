@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <cstdlib>
 #include <mutex>
 #include <optional>
@@ -389,14 +390,47 @@ static void TransitAspect(Image& image, Image::State& last_state,
     // The common case (every binding of every draw): the aspect is in dst_layout with these
     // accesses already recorded and needs no barrier. Nothing changes, and a partial range need
     // not split the state into subresources that would all be equal.
-    if (subresource_states.empty() && last_state.layout == dst_layout &&
-        (last_state.access_mask & dst_mask) == dst_mask &&
-        (last_state.pl_stage & dst_stage) == dst_stage &&
-        (!(dst_mask & shader_write) || last_state.write_epoch == epoch) &&
-        !NeedsBarrier(last_state, dst_layout, dst_mask)) {
+    const auto unchanged = [&](const Image::State& state) {
+        return state.layout == dst_layout && (state.access_mask & dst_mask) == dst_mask &&
+               (state.pl_stage & dst_stage) == dst_stage &&
+               (!(dst_mask & shader_write) || state.write_epoch == epoch) &&
+               !NeedsBarrier(state, dst_layout, dst_mask);
+    };
+    const bool needs_partial_transition =
+        subres_range &&
+        (subres_range->base != SubresourceBase{} || subres_range->extent != resources);
+    const bool partially_transited = !subresource_states.empty();
+    if (!partially_transited && unchanged(last_state)) {
         return;
     }
+    const u32 mip_begin = needs_partial_transition ? subres_range->base.level : 0;
+    const u32 mip_end =
+        needs_partial_transition ? mip_begin + subres_range->extent.levels : resources.levels;
+    const u32 layer_begin = needs_partial_transition ? subres_range->base.layer : 0;
+    const u32 layer_end =
+        needs_partial_transition ? layer_begin + subres_range->extent.layers : resources.layers;
+    // sotc: the same for an image tracked per subresource (one sampled through a view of some of
+    // its mips while the others are in another layout): when every subresource of the range is
+    // already where this access needs it, nothing changes either. Before, every such binding took
+    // the per-subresource walk and changed the state version though the state stayed the same.
+    if (partially_transited) {
+        bool all_unchanged = true;
+        for (u32 mip = mip_begin; all_unchanged && mip < mip_end; ++mip) {
+            for (u32 layer = layer_begin; layer < layer_end; ++layer) {
+                const auto subres_idx = mip * resources.layers + layer;
+                if (subres_idx >= subresource_states.size() ||
+                    !unchanged(subresource_states[subres_idx])) {
+                    all_unchanged = false;
+                    break;
+                }
+            }
+        }
+        if (all_unchanged) {
+            return;
+        }
+    }
     ++image.backing->state_version;
+    SotcStats::Bump(SotcStats::image_state_changes[partially_transited ? 1 : 0]);
     const auto apply = [&](Image::State& state, u32 mip, u32 levels, u32 layer, u32 layers) {
         if (!NeedsBarrier(state, dst_layout, dst_mask)) {
             // No transition and no hazard: later accesses must wait for these ones as well. The
@@ -436,10 +470,6 @@ static void TransitAspect(Image& image, Image::State& last_state,
         state.write_epoch = (dst_mask & shader_write) ? epoch : ~0ULL;
     };
 
-    const bool needs_partial_transition =
-        subres_range &&
-        (subres_range->base != SubresourceBase{} || subres_range->extent != resources);
-    const bool partially_transited = !subresource_states.empty();
     if (!needs_partial_transition && !partially_transited) {
         apply(last_state, 0, VK_REMAINING_MIP_LEVELS, 0, VK_REMAINING_ARRAY_LAYERS);
         return;
@@ -450,12 +480,6 @@ static void TransitAspect(Image& image, Image::State& last_state,
     }
     // A partial transition changes the given subresources only; a full one brings them all to
     // the same state, after which one state stands for the whole image again.
-    const u32 mip_begin = needs_partial_transition ? subres_range->base.level : 0;
-    const u32 mip_end =
-        needs_partial_transition ? mip_begin + subres_range->extent.levels : resources.levels;
-    const u32 layer_begin = needs_partial_transition ? subres_range->base.layer : 0;
-    const u32 layer_end =
-        needs_partial_transition ? layer_begin + subres_range->extent.layers : resources.layers;
     for (u32 mip = mip_begin; mip < mip_end; ++mip) {
         for (u32 layer = layer_begin; layer < layer_end; ++layer) {
             // NOTE: these loops may produce a lot of small barriers.
@@ -479,6 +503,19 @@ static void TransitAspect(Image& image, Image::State& last_state,
             }
         }
         last_state = whole;
+        subresource_states.clear();
+    } else if (std::all_of(subresource_states.begin() + 1, subresource_states.end(),
+                           [&](const Image::State& state) {
+                               const auto& first = subresource_states.front();
+                               return state.layout == first.layout &&
+                                      state.access_mask == first.access_mask &&
+                                      state.pl_stage == first.pl_stage &&
+                                      state.write_epoch == first.write_epoch;
+                           })) {
+        // sotc: a partial transition that brought the last different subresources to the state
+        // of the others: one state stands for the whole image again (the same state, so nothing
+        // a later access sees changes).
+        last_state = subresource_states.front();
         subresource_states.clear();
     }
 }

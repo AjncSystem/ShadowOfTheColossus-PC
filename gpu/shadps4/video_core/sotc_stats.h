@@ -57,6 +57,8 @@ inline std::atomic<uint64_t> readback_extra_deferred{0}; ///< hot windows left o
 inline std::atomic<uint64_t> readback_rewritten{0};      ///< finish: writer submitted, window written again
 inline std::atomic<uint64_t> readback_dedup{0};          ///< guest read faults that waited for another's
 inline std::atomic<uint64_t> readback_dedup_miss{0};     ///< SOTC_RB_DEDUP=2: the retried load faults again
+inline std::atomic<uint64_t> readback_joined{0};         ///< async readbacks served by one in flight
+inline std::atomic<uint64_t> readback_write_refresh{0};  ///< async write faults whose bytes the GPU wrote again
 inline std::atomic<uint64_t> fence_flushes{0};           ///< label submits (SOTC_RB_FENCE_FLUSH)
 inline std::atomic<uint64_t> readback_gap_us{0};         ///< SOTC_RB_TRACE: last hot write -> request
 inline std::atomic<uint64_t> readback_gap_cmds{0};
@@ -129,6 +131,25 @@ inline void Bump(std::atomic<uint64_t>& counter, uint64_t amount = 1) {
 }
 /// Texture bindings answered from Rasterizer::BindTextures' memo (no description, no FindImage).
 inline std::atomic<uint64_t> tex_bind_memo_hits{0}, tex_bind_memo_mismatch{0};
+/// Texture blocks of a stage (Rasterizer::TryTextureBlock): answered by the memo, bound the usual
+/// way, not answerable (storage images, descriptor arrays, too many), stored, SOTC_TEX_BLOCK_MEMO=2
+/// mismatches.
+inline std::atomic<uint64_t> tex_block[5]{};
+/// Texture blocks bound the usual way and not stored, by reason: a binding of another kind (null
+/// by the memory map, rebound, feedback loop, storage), the image set changed meanwhile, too many
+/// descriptors or images, an image holding a write.
+inline std::atomic<uint64_t> tex_block_reject[4]{};
+/// Texture blocks the memo did not answer, by reason: another key in the slot, the image set
+/// changed, an image changed (state, backing, link or binding flags), an image was uploaded.
+inline std::atomic<uint64_t> tex_block_miss[4]{};
+/// Image state transitions that changed (or may have changed) the state, of images tracked as one
+/// block and of images tracked per subresource (TransitAspect).
+inline std::atomic<uint64_t> image_state_changes[2]{};
+/// Where the command processor waits for recorded work (Scheduler: Finish, FinishHostRead,
+/// SubmitAheadAndWait, Wait), and its own memory invalidations (all, over image memory): the sync
+/// points a two-stage command processor would have (SOTC split line).
+inline std::atomic<uint64_t> cp_drains[4]{};
+inline std::atomic<uint64_t> cp_invalidations[2]{};
 /// Render/depth targets answered from Rasterizer::PrepareRenderState's memo.
 inline std::atomic<uint64_t> rt_memo_hits{0};
 /// Buffer access ranges added to the barrier lists, and ones skipped as recorded already in the
@@ -155,9 +176,13 @@ inline std::atomic<uint64_t> texel_syncs[3]{};
 /// ranges invalidated, 29 hazard check and descriptor, 30 special buffers. 31 BindResources'
 /// checks for compute dispatches done another way (image copy, metadata clear, image clear).
 /// PipelineCache::TryPreparedSelection: 32 program parameters, 33 walker, 34 specialization
-/// inputs compared, 35 fetch shader, 36 the rest.
-inline constexpr int NumPhases = 37;
+/// inputs compared, 35 fetch shader, 36 the rest. 37 texture blocks keyed and looked up in the
+/// memo (Rasterizer::BindTextures).
+inline constexpr int NumPhases = 38;
 inline std::atomic<uint64_t> phase_cycles[NumPhases]{};
+/// SOTC_PHASE_TIME=1: time the recording thread spends running queued Vulkan commands
+/// (CommandRecorder::ConsumerLoop), not spinning or sleeping between them.
+inline std::atomic<uint64_t> recorder_busy_ns{0};
 inline bool PhaseTime() {
     static const bool enabled = std::getenv("SOTC_PHASE_TIME") != nullptr;
     return enabled;

@@ -87,7 +87,7 @@ constexpr std::string GetBlobFileExtension(BlobType type) {
     }
 }
 
-void DataBase::Open() {
+void DataBase::Open(const std::string_view cache_variant) {
     if (opened) {
         return;
     }
@@ -99,7 +99,9 @@ void DataBase::Open() {
         mz_zip_zero_struct(&zip_ar);
 
         cache_path = GetUserPath(PathType::CacheDir) /
-                     std::filesystem::path{game_info.GameSerial()}.replace_extension(".zip");
+                     std::filesystem::path{std::string{game_info.GameSerial()} +
+                                            std::string{cache_variant}}
+                         .replace_extension(".zip");
 
         if (!mz_zip_reader_init_file(&zip_ar, cache_path.string().c_str(),
                                      MZ_ZIP_FLAG_READ_ALLOW_WRITING) ||
@@ -114,7 +116,8 @@ void DataBase::Open() {
         // do not tell them apart: the launcher's DMA switch gets its own cache folder.
         cache_path = GetUserPath(PathType::CacheDir) /
                      (std::string{game_info.GameSerial()} +
-                      (EmulatorSettings.IsDirectMemoryAccessEnabled() ? "" : "_nodma"));
+                      (EmulatorSettings.IsDirectMemoryAccessEnabled() ? "" : "_nodma") +
+                      std::string{cache_variant});
         if (!std::filesystem::exists(cache_path)) {
             std::filesystem::create_directories(cache_path);
         }

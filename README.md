@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC (port nativo / native port) · v0.57
+# Shadow of the Colossus — PC (port nativo / native port) · v0.58-rc1
 
 **[Português](#português)** · **[English](#english)** · [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
@@ -21,6 +21,7 @@ de que o jogo precisa, no estilo do [bloodborne_pc](https://github.com/Supermedo
 
 | Versão | Melhorias e correções |
 |---|---|
+| **0.58-rc1 (prévia AMD)** | Consultas de capacidade de formato Vulkan agora são mantidas em cache, seguindo relatos de chamadas repetidas lentas em AMD; ainda não medidas numa Radeon. `SOTC_WAVE64_UNIFORM=0/1` agora faz parte do perfil e usa cache separado. **Testes AMD pendentes; a corrupção gráfica RDNA3 da [#43](../../issues/43) não está corrigida nesta prévia.** |
 | **0.57** | **Placas AMD:** correção das cores verdes/rosas na névoa e nos personagens (as AMD passam a usar o caminho de 32 threads da NVIDIA; diagnóstico da issue #7, ainda não testado numa AMD). **Opção nova** no lançador para desligar o acesso direto à memória: ~10% mais FPS, água distante mais lisa. |
 | **0.56** | **Água do mundo aberto com ondas:** lagos e rios abaixo das cascatas não ficam mais lisos como espelho (uma instrução de shader, `S_WQM_B64`, era ignorada). **Lago de cima ondula e reflete até longe** (acesso direto à memória ligado por padrão, como no Pink-shadPS4). Árvores distantes sem "lixo colorido". |
 | **0.0.13** | **Sem quedas:** corrigida a queda na abertura/menu da 0.0.12 (o jogo pedia mais texturas do que cabe no pool). Testado ~40 min pelo mapa, com dois carregamentos de save. **Reflexos do lago** em quase toda a superfície, com ondulação (uma trava de laços dos shaders cortava os raios do reflexo). |
@@ -33,8 +34,9 @@ Detalhes de cada versão no [CHANGELOG](CHANGELOG.md).
 
 - Na primeira abertura depois de atualizar, os shaders são compilados de novo: o primeiro
   carregamento demora e engasga.
-- Placas **AMD**: a 0.57 traz a correção das cores verdes/rosas ([#7](../../issues/7)), ainda sem
-  teste numa AMD. Se continuar, mande o seu `user/last_run.log` na issue.
+- Placas **AMD**: a correção da 0.57 e as otimizações da prévia 0.58-rc1 ainda precisam
+  de teste numa Radeon. A corrupção gráfica RDNA3 da [#43](../../issues/43) segue sem solução
+  confirmada; anexe `user/last_run.log` e informe modelo/driver.
 - Com 8 GB de memória de vídeo, o uso fica perto do limite em áreas grandes.
 
 ### Download e uso
@@ -116,6 +118,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.58-rc1 (AMD preview)** | Vulkan image-format capability queries are cached, based on reports of repeated slow calls on AMD; not measured on Radeon. `SOTC_WAVE64_UNIFORM=0/1` is part of the shader profile and uses a separate cache. **AMD testing remains required; RDNA3 graphics corruption in [#43](../../issues/43) is not fixed in this preview.** |
 | **0.57** | **AMD cards:** fix for the green/pink fog and characters (AMD now uses the NVIDIA 32-lane path; diagnosis from issue #7, not yet tested on an AMD card). **New launcher option** to turn off direct memory access: ~10% more FPS, flatter distant water. |
 | **0.56** | **Open-world water with waves:** lakes and rivers below the waterfalls are no longer flat as a mirror (a shader instruction, `S_WQM_B64`, was ignored). **The upper lake ripples and reflects far away** (direct memory access on by default, as in Pink-shadPS4). Distant trees without "colored garbage". |
 | **0.0.13** | **No more crashes:** fixed the 0.0.12 crash in the intro/menu (the game asked for more textures than its pool holds). Tested ~40 min across the map with two save loads. **Lake reflections** over almost the whole surface, with ripples (a shader loop guard cut the reflection rays short). |
@@ -127,8 +130,9 @@ Full details in the [CHANGELOG](CHANGELOG.md) (in Portuguese).
 ### Known issues
 
 - The first start after updating rebuilds the shaders: the first load is slow and stutters.
-- **AMD** GPUs: 0.57 has the fix for the green/pink tint ([#7](../../issues/7)), not yet tested
-  on an AMD card. If it persists, attach your `user/last_run.log` to the issue.
+- **AMD** GPUs: the 0.57 color fix and 0.58-rc1 optimizations still need Radeon testing. The
+  RDNA3 graphics corruption in [#43](../../issues/43) has no confirmed fix; attach
+  `user/last_run.log` and include GPU model/driver when reporting.
 - With 8 GB of video memory, usage gets close to the limit in large areas.
 
 ### Download and use

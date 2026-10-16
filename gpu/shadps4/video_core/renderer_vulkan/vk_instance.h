@@ -3,9 +3,11 @@
 
 #pragma once
 
-#include <string>
+#include <mutex>
 #include <span>
+#include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "video_core/renderer_vulkan/vk_platform.h"
 
@@ -22,6 +24,11 @@ namespace Vulkan {
 
 class Instance {
 public:
+    struct ImageFormatSupport {
+        vk::Result result;
+        vk::SampleCountFlags sample_counts;
+    };
+
     explicit Instance(bool validation = false, bool crash_diagnostic = false);
     explicit Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                       bool enable_validation = false, bool enable_crash_diagnostic = false);
@@ -33,6 +40,9 @@ public:
     /// Gets a compatibility format if the format is not supported.
     [[nodiscard]] vk::Format GetSupportedFormat(vk::Format format,
                                                 vk::FormatFeatureFlags2 flags) const;
+    [[nodiscard]] ImageFormatSupport GetImageFormatSupport(
+        vk::Format format, vk::ImageType type, vk::ImageTiling tiling,
+        vk::ImageUsageFlags usage, vk::ImageCreateFlags flags) const;
 
     /// Returns the Vulkan instance
     vk::Instance GetInstance() const {
@@ -537,6 +547,16 @@ private:
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;
+    struct ImageFormatSupportCacheEntry {
+        vk::Format format;
+        vk::ImageType type;
+        vk::ImageTiling tiling;
+        vk::ImageUsageFlags usage;
+        vk::ImageCreateFlags flags;
+        ImageFormatSupport support;
+    };
+    mutable std::mutex image_format_support_mutex;
+    mutable std::vector<ImageFormatSupportCacheEntry> image_format_support_cache;
     TracyVkCtx profiler_context{};
     u32 queue_family_index{0};
     bool custom_border_color{};

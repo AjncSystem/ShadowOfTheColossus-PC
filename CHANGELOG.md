@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.58-rc1 - 2026-10-15 (prévia AMD; testes necessários)
+- Consultas Vulkan de capacidade de formato de imagem agora são armazenadas em cache por formato,
+  tipo de imagem, tiling, uso e flags. Responde ao relato AMD de travadas por chamadas repetidas
+  lentas durante a criação de texturas; não foi medida numa Radeon e não promete ganho sem teste.
+- `SOTC_WAVE64_UNIFORM=0/1` passa a integrar o perfil do shader, e cada modo usa uma variante
+  separada do cache de pipelines para não reutilizar shaders compilados com a outra configuração.
+- **Pendente:** testar cores, sombras, stutter e estabilidade em AMD. A corrupção visual RDNA3 da
+  [issue #43](https://github.com/AjncSystem/ShadowOfTheColossus-PC/issues/43) segue sem correção confirmada.
+
 ## 0.57 — 2026-10-14
 - **Placas AMD: correção das cores verdes/rosas** na névoa, no Wander e no Agro (issues #6, #7, #9,
   possivelmente #10). A AMD informa grupos de 64 threads, mas só deixa fixar esse tamanho nos

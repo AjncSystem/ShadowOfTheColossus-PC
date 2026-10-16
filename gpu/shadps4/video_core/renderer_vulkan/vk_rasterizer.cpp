@@ -1851,9 +1851,16 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
         buffer_cache.DropGpuModified(addr, size);
     }
     // Give the arena memory back; it runs on the GPU thread, ordered before later draws.
-    // Releasing arena memory on unmap still races with in-flight GPU work during loads
-    // (device lost, silent crashes loading a save), so it is opt-in for now.
-    static const bool release_enabled = std::getenv("SOTC_ARENA_RELEASE") != nullptr;
+    // sotc: on by default since 2026-10-16 (SOTC_ARENA_RELEASE=0: never released). It was
+    // opt-in because it raced with in-flight GPU work during loads (device lost loading a save,
+    // seen before ReleaseMemory finished the GPU work first). Never releasing grew video memory
+    // ~90 MB a minute in the attract demo (1.6 -> 6.0 GB in 48 minutes on a 6 GB card) until an
+    // arena allocation failed (ASSERT). Released, the 25-minute curve stays ~0.7-0.9 GB lower;
+    // no device loss in that run nor in three shrine runs that each load a save.
+    static const bool release_enabled = [] {
+        const char* v = std::getenv("SOTC_ARENA_RELEASE");
+        return !v || v[0] != '0';
+    }();
     if (release_enabled) {
         liverpool->SendCommand<false>(
             [this, addr, size] { buffer_cache.ReleaseMemory(addr, size); });

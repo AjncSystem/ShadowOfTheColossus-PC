@@ -333,6 +333,16 @@ void VideoOutDriver::Flip(const Request& req) {
                 if (!allocs.empty()) {
                     std::fprintf(stderr, "SOTC ALLOC %s\n", allocs.c_str());
                 }
+                if (const uint64_t translate = SotcStats::compile_phase_ns[0].exchange(0)) {
+                    const auto take = [](int i) {
+                        return SotcStats::compile_phase_ns[i].exchange(0) / 1e6;
+                    };
+                    const double emit = take(1), patch = take(2), module = take(3), reg = take(4);
+                    std::fprintf(stderr,
+                                 "SOTC COMPILE translate %.1f, emit %.1f, patch lookup %.1f, "
+                                 "module %.1f, register %.1f ms\n",
+                                 translate / 1e6, emit, patch, module, reg);
+                }
                 frame_ms.clear();
                 worst_ms = 0.0;
                 std::fill(std::begin(worst_ns), std::end(worst_ns), 0);

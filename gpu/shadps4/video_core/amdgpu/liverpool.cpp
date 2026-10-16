@@ -119,6 +119,14 @@ void Liverpool::BackLoop(std::stop_token stoken) {
             ProcessCommands();
         }
         if (back_head.load(std::memory_order_acquire) == tail) {
+            const u64 idle_start = SotcStats::NowNs();
+            struct IdleTime {
+                u64 start;
+                ~IdleTime() {
+                    SotcStats::draw_idle_ns.fetch_add(SotcStats::NowNs() - start,
+                                                      std::memory_order_relaxed);
+                }
+            } idle_time{idle_start};
             bool ready = false;
             for (u32 spin = 0; spin < 4096; ++spin) {
                 if (back_head.load(std::memory_order_acquire) != tail ||
@@ -474,7 +482,10 @@ void Liverpool::Process(std::stop_token stoken) {
                 }
                 task = queue.submits.front();
             }
+            const u64 parse_start = SotcStats::NowNs();
             task.resume();
+            SotcStats::cp_parse_ns.fetch_add(SotcStats::NowNs() - parse_start,
+                                             std::memory_order_relaxed);
 
             if (task.done()) {
                 task.destroy();

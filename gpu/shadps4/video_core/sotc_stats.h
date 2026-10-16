@@ -54,6 +54,16 @@ inline uint64_t TakeDelta(const std::atomic<uint64_t>& counter, uint64_t& seen) 
 }
 /// Command processor waits for the draw thread (Liverpool::IsBackThreaded).
 inline std::atomic<uint64_t> cp_waits{0};
+/// Busy time of the two command processor threads (SOTC_FPS): the draw thread minus the time it
+/// waits for work, the parser as the time inside the command buffer coroutines (not the polling
+/// loop around them, which spins while a queue waits).
+inline std::atomic<uint64_t> draw_idle_ns{0};
+inline std::atomic<uint64_t> cp_parse_ns{0};
+inline uint64_t NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 /// SOTC_CMD_STATS=1: draws, indirect draws (arguments GPU-written / CPU-side / CPU-side and
 /// empty), dispatches, indirect dispatches.
 inline std::atomic<uint64_t> cmd_kinds[6]{};

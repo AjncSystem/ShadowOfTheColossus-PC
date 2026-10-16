@@ -4,6 +4,8 @@
 #pragma once
 
 #include <condition_variable>
+#include <cstdlib>
+#include <optional>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -33,6 +35,19 @@ namespace VideoCore {
 
 class BufferCache;
 class PageManager;
+
+/// sotc: SOTC_MIP_TAIL: 0 off, 1 mip-tail images for T#s with LOD streaming counters, 2 (default)
+/// for every read-only colour T# whose base_level is above 0 (TextureCache::DecideRebase). Mode 2
+/// left out 2.5 GB of never-sampled mips in the attract demo: peak video memory 6.1 -> 3.3-3.5 GB
+/// on a 6 GB card, frames over 50 ms 150 -> 102-112, the worst streaming frame 460 -> 250-310 ms.
+inline u32 MipTailMode() {
+    static const u32 mode = [] {
+        const char* v = std::getenv("SOTC_MIP_TAIL");
+        return v && (v[0] == '0' || v[0] == '1' || v[0] == '2') ? static_cast<u32>(v[0] - '0')
+                                                                  : 2u;
+    }();
+    return mode;
+}
 
 class TextureCache {
     // Default values for garbage collection
@@ -65,10 +80,21 @@ public:
         ImageViewInfo view_info;
         BindingType type{BindingType::Texture};
 
+        // sotc: mip-tail candidate (SOTC_MIP_TAIL, DecideRebase): the T#'s base_level (0: not a
+        // candidate) and min_lod, whether `info` holds the tail now, and the other info (the
+        // tail while `info` is the full chain, the full chain while `info` is the tail).
+        u8 rebase_mip{};
+        bool rebased_now{};
+        u16 orig_min_lod{};
+        std::optional<ImageInfo> other_info;
+
         ImageDesc() = default;
         ImageDesc(const AmdGpu::Image& image, const Shader::ImageResource& desc)
             : info{image, desc}, view_info{image, desc},
-              type{desc.is_written ? BindingType::Storage : BindingType::Texture} {}
+              type{desc.is_written ? BindingType::Storage : BindingType::Texture} {
+            InitMipTail(image, desc);
+        }
+        void InitMipTail(const AmdGpu::Image& image, const Shader::ImageResource& resource);
         ImageDesc(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint)
             : info{buffer, hint}, view_info{buffer}, type{BindingType::RenderTarget} {}
         ImageDesc(const AmdGpu::DepthBuffer& buffer, AmdGpu::DepthView view,
@@ -367,6 +393,14 @@ private:
 
     /// sotc: image memory by class, every 5 s with SOTC_FPS (telemetry only).
     void Census();
+
+    /// sotc: mip-tail images (SOTC_MIP_TAIL), see DecideRebase.
+    bool IsSafeToDelete(const Image& image) const;
+    bool DecideRebase(ImageDesc& desc, bool exact_fmt);
+    void MipTailCreated(ImageId image_id, const ImageDesc& desc);
+    void FreeRebased(ImageId image_id, std::atomic<std::uint64_t>& counter);
+    /// First GPU write of a target or storage image (FindTexture/RenderTarget/DepthTarget).
+    void MarkWritten(Image& image);
     void GarbageCollectSamplers();
 
 private:
@@ -400,7 +434,9 @@ private:
     static inline thread_local u32 refresh_depth = 0;
     /// sotc: deferred EmergencyCollect level + 1 (0: none).
     std::atomic<u32> pending_emergency{0};
-    /// sotc: FindImage's perfect matches, valid while no image is registered or unregistered.
+    /// sotc: FindImage's perfect matches, valid while no image is registered or unregistered
+    /// (a mip-tail image's also while gpu_modified_epoch stays). `writer`: stored by a writer
+    /// lookup (with mip tails on, writers only take those).
     struct FindMemo {
         VAddr guest_address{};
         u64 guest_size{};
@@ -408,11 +444,18 @@ private:
         vk::Format pixel_format{};
         AmdGpu::ImageType type{};
         bool exact_fmt{};
+        bool writer{};
         u64 generation{~0ULL};
         ImageId image_id{};
+        u64 gpu_epoch{};
     };
     static constexpr size_t NumFindMemos = 1024;
     std::array<FindMemo, NumFindMemos> find_memos{};
+    FindMemo& MemoSlot(const ImageInfo& info, bool exact_fmt, bool writer);
+    /// The memoized perfect match for a lookup, or none (SOTC_FIND_MEMO=0: always none).
+    ImageId MemoLookup(const ImageInfo& info, bool exact_fmt, bool writer);
+    /// The generation a memo for `address` is valid in (per-address unless SOTC_MEMO_ADDR_GEN=0).
+    u64 MemoGeneration(VAddr address) const;
     u64 image_set_generation{};
     /// sotc: per-address generations for FindMemo. A perfect match needs the same
     /// guest_address, so only (un)registering an image at that address can change the

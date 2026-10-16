@@ -10,6 +10,7 @@
 #include "core/libraries/videoout/buffer.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/sotc_stats.h"
 #include "video_core/texture_cache/host_compatibility.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/tile.h"
@@ -122,26 +123,47 @@ ImageInfo::ImageInfo(const AmdGpu::DepthBuffer& buffer, u32 num_slices, VAddr ht
     }
 }
 
-ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& desc) noexcept {
-    // sotc: every texture of every draw describes its image again, mip layout included (a few
-    // thousand per frame in SotC's open world), mostly the same few hundred T#s. The result only
-    // depends on the T# and is_depth: answered from a small per-thread cache.
-    struct Entry {
-        std::array<u64, 4> sharp;
-        bool is_depth;
-        bool valid;
-        ImageInfo info;
-    };
+namespace {
+// sotc: every texture of every draw describes its image again, mip layout included (a few
+// thousand per frame in SotC's open world), mostly the same few hundred T#s. The result only
+// depends on the T# and is_depth: answered from a small per-thread cache, which also keeps the
+// mip-tail form of the info (ImageInfo::CachedRebase; rebase_state 0 not computed, 1 `rebased`
+// is valid, 2 RebaseToMip refused).
+struct TsharpInfoEntry {
+    std::array<u64, 4> sharp;
+    bool is_depth;
+    bool valid;
+    u8 rebase_state;
+    ImageInfo info;
+    ImageInfo rebased;
+};
+
+/// The cache slot of a T#; on a miss it is reset for this T# (valid stays false until filled).
+TsharpInfoEntry& TsharpInfoSlot(const AmdGpu::Image& image, bool is_depth, bool& hit) {
     static constexpr size_t NumEntries = 512;
-    static thread_local std::unique_ptr<std::array<Entry, NumEntries>> cache =
-        std::make_unique<std::array<Entry, NumEntries>>();
+    static thread_local std::unique_ptr<std::array<TsharpInfoEntry, NumEntries>> cache =
+        std::make_unique<std::array<TsharpInfoEntry, NumEntries>>();
     std::array<u64, 4> sharp;
     std::memcpy(sharp.data(), &image, sizeof(sharp));
     const u64 hash = (sharp[0] * 0x9E3779B97F4A7C15ULL) ^ (sharp[1] * 0xC2B2AE3D27D4EB4FULL) ^
                      (sharp[2] * 0x165667B19E3779F9ULL) ^ (sharp[3] * 0x27D4EB2F165667C5ULL) ^
-                     u64{desc.is_depth};
-    Entry& entry = (*cache)[(hash ^ (hash >> 29)) % NumEntries];
-    if (entry.valid && entry.is_depth == desc.is_depth && entry.sharp == sharp) {
+                     u64{is_depth};
+    TsharpInfoEntry& entry = (*cache)[(hash ^ (hash >> 29)) % NumEntries];
+    hit = entry.valid && entry.is_depth == is_depth && entry.sharp == sharp;
+    if (!hit) {
+        entry.sharp = sharp;
+        entry.is_depth = is_depth;
+        entry.valid = false;
+        entry.rebase_state = 0;
+    }
+    return entry;
+}
+} // namespace
+
+ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& desc) noexcept {
+    bool hit;
+    TsharpInfoEntry& entry = TsharpInfoSlot(image, desc.is_depth, hit);
+    if (hit) {
         *this = entry.info;
         return;
     }
@@ -177,10 +199,70 @@ ImageInfo::ImageInfo(const AmdGpu::Image& image, const Shader::ImageResource& de
     }
     sotc_streamed = image.lod_hw_cnt_en;
     UpdateSize();
-    entry.sharp = sharp;
-    entry.is_depth = desc.is_depth;
     entry.info = *this;
     entry.valid = true;
+}
+
+std::optional<ImageInfo> ImageInfo::CachedRebase(const AmdGpu::Image& image,
+                                                 const Shader::ImageResource& desc) {
+    bool hit;
+    TsharpInfoEntry& entry = TsharpInfoSlot(image, desc.is_depth, hit);
+    if (!hit) {
+        // Not expected (ImageDesc describes the T# just before): fills the same slot.
+        static_cast<void>(ImageInfo{image, desc});
+    }
+    if (entry.rebase_state == 0) {
+        entry.rebased = entry.info;
+        const bool ok = entry.rebased.RebaseToMip(image.base_level);
+        entry.rebase_state = ok ? 1 : 2;
+        if (!ok) {
+            SotcStats::rebase_skip_layout.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (entry.rebase_state == 1) {
+        return entry.rebased;
+    }
+    return std::nullopt;
+}
+
+bool ImageInfo::RebaseToMip(u32 b) {
+    // Mip m's size comes from pitch >> m, height >> m and depth >> m (UpdateSize), so the chain
+    // from mip b is a chain of its own with every dimension shifted by b. Not for macro tiling,
+    // whose per-mip layout depends on the mip index (ImageSizeMacroTiled), nor for the cases
+    // whose tiler/upload behaviour was not checked (volume, depth, MSAA, sub-byte formats).
+    if (b == 0 || b >= resources.levels || AmdGpu::IsMacroTiled(array_mode) || alt_tile ||
+        bank_swizzle != 0 || props.is_volume || props.is_depth || num_samples != 1 ||
+        num_bits < 8) {
+        return false;
+    }
+    const ImageInfo full = *this;
+    const u32 dropped = full.mips_layout[b].offset;
+    guest_address += dropped;
+    size.width = std::max(size.width >> b, 1u);
+    size.height = std::max(size.height >> b, 1u);
+    size.depth = std::max(size.depth >> b, 1u);
+    pitch = std::max(pitch >> b, 1u);
+    resources.levels -= b;
+    UpdateSize();
+    // Accept only exactly the full chain's layout from mip b; whole 64-element groups when
+    // tiled (DetileImage dispatches whole groups).
+    bool same = guest_size == full.guest_size - dropped;
+    for (u32 i = 0; same && i < u32(resources.levels); ++i) {
+        const auto& tail_mip = mips_layout[i];
+        const auto& full_mip = full.mips_layout[b + i];
+        same = tail_mip.size == full_mip.size && tail_mip.pitch == full_mip.pitch &&
+               tail_mip.height == full_mip.height && tail_mip.offset == full_mip.offset - dropped;
+    }
+    if (!same || (props.is_tiled && (guest_size / (num_bits / 8)) % 64 != 0)) {
+        *this = full;
+        return false;
+    }
+    sotc_first_mip = static_cast<u8>(b);
+    sotc_dropped_bytes = dropped;
+    // Census hints are mip indices of this image now.
+    sotc_reach_mip = 0;
+    sotc_minlod_mip = sotc_minlod_mip > b ? static_cast<u8>(sotc_minlod_mip - b) : u8{0};
+    return true;
 }
 
 bool ImageInfo::IsCompatible(const ImageInfo& info) const {

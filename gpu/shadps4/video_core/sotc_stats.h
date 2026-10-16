@@ -68,6 +68,19 @@ inline std::atomic<uint64_t> stack_reg_spins{0}; ///< stack registry writer spin
 inline std::atomic<uint64_t> fault_grace_marks{0};    ///< pages made hot (repeat-fault grace)
 inline std::atomic<uint64_t> fault_grace_cap_hits{0}; ///< ... refused by the budget
 inline std::atomic<uint64_t> fault_grace_hot_upload_bytes{0}; ///< hot pages uploaded, kept writable
+/// Mip-tail images (SOTC_MIP_TAIL, TextureCache::DecideRebase). Census gauges, bytes:
+inline std::atomic<uint64_t> census_rebased{0};         ///< host memory of mip-tail images
+inline std::atomic<uint64_t> census_rebased_count{0};
+inline std::atomic<uint64_t> census_dropped{0};         ///< guest bytes of the mips they leave out
+inline std::atomic<uint64_t> census_projected{0};       ///< what full-chain candidates would save
+inline std::atomic<uint64_t> census_projected_hwcnt{0}; ///< ... of it, T#s with LOD counters
+/// ... and counters (per stats line): tails created, refused (a full chain memoized, a GPU-written
+/// overlap, a full chain in use, a layout RebaseToMip cannot reproduce), tails freed (a writer
+/// overlapped them, an older tail of the same chain), tails re-uploaded instead of hashed
+/// (MaybeCpuDirty), and broken never-written rules (cumulative).
+inline std::atomic<uint64_t> rebase_created{0}, rebase_reuse_full{0}, rebase_skip_gpu{0},
+    rebase_skip_live_full{0}, rebase_skip_layout{0}, rebase_writer_freed{0},
+    rebase_dedup_freed{0}, rebase_maybe_dirty{0}, rebase_violations{0};
 
 /// SOTC_OPT_OFF=1: the 2026-10-14 command-processor optimizations are switched off (replicate
 /// HLE no-change skip, single texel-buffer image sync, rate-limited VRAM queries), for A/B runs

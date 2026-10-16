@@ -1075,6 +1075,9 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     // Perform image copy
     VideoCore::Image& src_image = desc0.is_written ? image1 : image0;
     VideoCore::Image& dst_image = desc0.is_written ? image0 : image1;
+    // sotc: the destination was found by address, not by a writer lookup: its first GPU write
+    // moves the mip-tail epoch (CopyColorAndDepth only passes the flag on).
+    VideoCore::MarkGpuModified(dst_image);
     runtime.CopyColorAndDepth(&src_image, &dst_image);
     return true;
 }

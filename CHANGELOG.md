@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.57-opt4 — 2026-10-16 (fork Oussama268)
+- **Mais FPS em todo lugar:** a thread que transforma os comandos do jogo em comandos Vulkan (o
+  gargalo do port) gastava ~42% do tempo dentro do Windows e da biblioteca C: travas, mudanças de
+  proteção de página, cópias e alocações. Medido contra a 0.57-opt3, no mesmo PC e na mesma hora
+  (RTX 3060 Laptop, pares intercalados):
+  - Santuário: 29,3 / 29,1 → **35,0 / 34,1 FPS** (+18%).
+  - Demo da tela de título: 47,4 → **53,5 FPS**, 1% low 29,4 → **37,9**, quadros acima de 50 ms
+    129 → **26**.
+- **O que mudou:**
+  - A trava do cache de texturas é pega uma vez por grupo de texturas, não duas por textura (62
+    mil vezes por quadro), e do lado da thread de comandos ficou sem instrução atômica. Falhas de
+    escrita do jogo em páginas sem textura nem passam pela trava. `SOTC_TC_BATCH=0`,
+    `SOTC_TC_BIASED=0` e `SOTC_TC_SKIP_EMPTY=0` desligam as partes.
+  - As tabelas que o jogo preenche todo quadro com um shader de cópia (feito na CPU pelo port) são
+    comparadas página por página, e só as páginas que mudaram são escritas, direto na memória da
+    GPU, sem marcar a memória como alterada: os envios de buffers por quadro caíram de 21 para
+    ~13 MB. `SOTC_FILL_HLE_PAGES=0` volta ao jeito antigo.
+  - Um par de imagens de profundidade 960x540 era criado e destruído todo quadro; agora é
+    reaproveitado ("depth twin", que já existia como opção e passou a ser o padrão).
+    `SOTC_DEPTH_TWIN=0` desliga.
+  - Buscas de memória mais rápidas: cache maior das regiões de memória do jogo por thread
+    (`SOTC_REGION_DIRECT=0` desliga), cache das faixas de buffer já residentes, relógio lido a cada
+    8 comandos.
+  - Perfil PGO refeito para o código novo.
+- Diagnóstico: com `SOTC_CMD_STATS=1` o log mostra a linha `SOTC sys/frame` (proteções de página,
+  travas, alocações de memória de vídeo por quadro).
+- Testado: santuário e demo sem erro, imagens iguais (folha de capturas), 15 minutos de demo.
 ## 0.57-opt3 — 2026-10-16 (fork Oussama268)
 - **Menos travadas na primeira visita a uma área:** os pipelines gráficos novos agora são
   montados em threads separadas, e o objeto que precisa de um pipeline ainda em montagem não é

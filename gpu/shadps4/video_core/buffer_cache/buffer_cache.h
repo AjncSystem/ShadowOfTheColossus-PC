@@ -112,6 +112,12 @@ public:
     /// back costs no readback. False (nothing done) otherwise.
     bool TryReplaceFromCpu(VAddr addr, const void* data, u64 size);
 
+    /// sotc: TryReplaceFromCpu that also copies `data` into the resident arena right away, so
+    /// the range is not marked CPU-written: no unprotect, upload and protect again later (two
+    /// page protection system calls per replaced range). Data the guest never writes itself
+    /// (fill-shader tables written by the command processor). Not resident: TryReplaceFromCpu.
+    bool TryWriteThroughFromCpu(VAddr addr, const void* data, u64 size);
+
     /// Byte-precise: true when a written binding covered any byte of the range since its last
     /// readback. Readbacks copy only these bytes, so the backing holds every other byte.
     /// Command processor thread only.

@@ -82,6 +82,7 @@ static Vma *vmas; static size_t vma_count, vma_capacity;
 #ifndef _WIN32
 static int pool_fd=-1;
 #endif
+static void region_direct_init(void); /* sotc: SOTC_REGION_DIRECT, read before any fault */
 static unsigned char *backing_base; /* second view of the pool: host writes bypass guest/GPU page protection */
 #define FLEX_SPAN (UINT64_C(1024) * 1024 * 1024)
 static uint64_t flex_bitmap[FLEX_SPAN/PAGE/64];
@@ -282,6 +283,7 @@ static void host_discard(uint64_t phys, uint64_t size) { memset(backing_base+phy
 /* Direct memory occupies [0,POOL_SIZE) of the section, flexible memory [POOL_SIZE,+FLEX_SPAN). */
 static int pool(void) {
     if (backing_base) return 0;
+    region_direct_init();
     runtime_memory_reserve();
     uint64_t bytes=POOL_SIZE+FLEX_SPAN;
     section=CreateFileMapping2(INVALID_HANDLE_VALUE,NULL,FILE_MAP_ALL_ACCESS,PAGE_EXECUTE_READWRITE,SEC_COMMIT,bytes,NULL,NULL,0);
@@ -293,6 +295,7 @@ static int pool(void) {
 /* Direct memory occupies [0,POOL_SIZE) of the memfd, flexible memory [POOL_SIZE,+FLEX_SPAN). */
 static int pool(void) {
     if (pool_fd>=0) return 0;
+    region_direct_init();
     pool_fd=memfd_create("bb-guest-memory", MFD_CLOEXEC);
     if (pool_fd<0 || ftruncate(pool_fd,(off_t)(POOL_SIZE+FLEX_SPAN))) return -1;
     void *view=mmap(NULL,POOL_SIZE+FLEX_SPAN,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_NORESERVE,pool_fd,0);
@@ -844,9 +847,24 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
 typedef struct { uint64_t generation; uintptr_t start, end; int kind; const unsigned char *backing; } CachedRegion; /* backing: view of start */
 static __thread CachedRegion region_cache[8];
 static __thread unsigned region_cache_next;
+/* sotc: plus 512 direct-mapped entries by 16 KiB of address. The command processor's buffer binds
+ * touch more regions than the 8 recent ones, so most lookups took the read lock and a binary
+ * search (~4.5% of that thread: libwinpthread, vma_index). SOTC_REGION_DIRECT=0: ring only. */
+#define REGION_DIRECT_SLOTS 512
+static __thread CachedRegion region_direct[REGION_DIRECT_SLOTS];
+static int region_direct_on=-1; /* -1 until pool(): lookups only, no fills */
+static void region_direct_init(void) {
+    const char *v=getenv("SOTC_REGION_DIRECT");
+    region_direct_on=!(v && v[0]=='0');
+}
+static size_t region_direct_slot(uintptr_t address) { return (address>>14)&(REGION_DIRECT_SLOTS-1); }
 static const CachedRegion *cached_region(uintptr_t address) {
     uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
     if (generation & 1) return NULL;
+    if (region_direct_on) {
+        const CachedRegion *d=&region_direct[region_direct_slot(address)];
+        if (d->generation==generation && d->end && d->start<=address && address<d->end) return d;
+    }
     for (unsigned i=0;i<8;++i) {
         const CachedRegion *c=&region_cache[i];
         if (c->generation==generation && c->end && c->start<=address && address<c->end) return c;
@@ -854,11 +872,13 @@ static const CachedRegion *cached_region(uintptr_t address) {
     return NULL;
 }
 /* Called under the read lock after a lookup of address. */
-static void cache_region(size_t i) {
+static void cache_region(size_t i, uintptr_t address) {
     uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
     if (i==vma_count || (generation & 1)) return;
     const unsigned char *backing=vmas[i].kind!=KIND_RESERVED && backing_base ? backing_base+vmas[i].phys : NULL;
-    region_cache[region_cache_next++ % 8]=(CachedRegion){generation,vmas[i].start,vmas[i].end,vmas[i].kind,backing};
+    const CachedRegion entry={generation,vmas[i].start,vmas[i].end,vmas[i].kind,backing};
+    region_cache[region_cache_next++ % 8]=entry;
+    if (region_direct_on>0) region_direct[region_direct_slot(address)]=entry;
 }
 /* sotc: the VMA table generation, for caches of backing pointers outside this file: a pointer
  * obtained while it was even stays valid until it changes (the invariant cached_region relies
@@ -877,7 +897,7 @@ const unsigned char *runtime_memory_backing_pointer(uintptr_t address) {
     size_t i=vma_index(address);
     const unsigned char *p=NULL;
     if (i<vma_count && vmas[i].start<=address) {
-        cache_region(i);
+        cache_region(i,address);
         if (vmas[i].kind!=KIND_RESERVED && backing_base) p=backing_base+vmas[i].phys+(address-vmas[i].start);
     }
     read_unlock();
@@ -888,7 +908,7 @@ uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size) {
     const CachedRegion *c=(runtime_disabled_optimizations & 1) ? NULL : cached_region(address);
     if (c && c->kind!=KIND_RESERVED && size<=c->end-address) return size;
     read_lock();
-    { size_t i=vma_index(address); if (i<vma_count && vmas[i].start<=address) cache_region(i); }
+    { size_t i=vma_index(address); if (i<vma_count && vmas[i].start<=address) cache_region(i,address); }
     uint64_t length=0;
     for (size_t i=vma_index(address); i<vma_count && length<size; ++i) {
         if (vmas[i].start>address+length || vmas[i].kind==KIND_RESERVED) break;
@@ -905,7 +925,7 @@ int runtime_memory_region(uintptr_t address, uintptr_t *start, uintptr_t *end, i
     size_t i=vma_index(address);
     int found=i<vma_count;
     if (found && vmas[i].start<=address) {
-        cache_region(i);
+        cache_region(i,address);
         *start=vmas[i].start; *end=vmas[i].end; *mapped=vmas[i].kind!=KIND_RESERVED;
     } else if (found) {
         *start=i ? vmas[i-1].end : 0; *end=vmas[i].start; *mapped=0;

@@ -321,6 +321,7 @@ struct PageManager::Impl {
 
         const auto release_pending = [&] {
             if (range_pages > 0) {
+                if (SotcStats::kCmdStats) SotcStats::sys_protect_src[0].fetch_add(1, std::memory_order_relaxed);
                 Protect(range_begin << PM_PAGE_BITS, range_pages << PM_PAGE_BITS, perms);
                 range_pages = 0;
                 potential_pages = 0;
@@ -400,6 +401,7 @@ struct PageManager::Impl {
 
         const auto release_pending = [&] {
             if (range_pages > 0) {
+                if (SotcStats::kCmdStats) SotcStats::sys_protect_src[1].fetch_add(1, std::memory_order_relaxed);
                 Protect(range_begin << PM_PAGE_BITS, range_pages << PM_PAGE_BITS, perms);
                 range_pages = 0;
                 potential_pages = 0;

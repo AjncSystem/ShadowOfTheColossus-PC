@@ -329,9 +329,8 @@ static void flush_hooks(void) {
     for (;;) {
         write_lock();
         if (!pending_count) { write_unlock(); return; }
-        PendingHook h=pending[pending_head];
-        pending_head=(pending_head+1)%PENDING_HOOKS;
-        --pending_count;
+        PendingHook h=pending[0];
+        memmove(pending,pending+1,--pending_count*sizeof(*pending));
         GpuRange hook = h.kind==HOOK_MAP ? hook_map : h.kind==HOOK_UNMAP ? hook_unmap : hook_invalidate;
         write_unlock();
         if (hook) hook(h.address,h.size);

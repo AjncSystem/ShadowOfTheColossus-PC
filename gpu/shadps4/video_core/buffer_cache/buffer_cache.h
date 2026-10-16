@@ -256,6 +256,8 @@ private:
     /// sotc (SOTC_DMA_MERGE): touching resident ranges whose start lies in the same arena,
     /// merged into runs of (device address, bytes). Only rebuilt at the top of a sweep.
     std::vector<std::pair<VAddr, u64>> dma_runs;
+    bool dma_full_pending{}; // sotc: the next DMA sweep visits every run (see SynchronizeDmaBuffers)
+    std::vector<std::pair<VAddr, u64>> dma_spans;
     /// Readback windows requested recently; downloaded together with the next readback.
     struct HotReadback {
         VAddr addr;

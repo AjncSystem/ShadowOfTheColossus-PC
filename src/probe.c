@@ -13,6 +13,7 @@
 #endif
 #ifdef _WIN32
 #include <windows.h>
+#include <dbghelp.h>
 #include <tlhelp32.h>
 #include <wchar.h>
 #include <mmsystem.h>
@@ -370,6 +371,39 @@ static DWORD WINAPI stacks_watcher(void *path) {
     }
     return 0;
 }
+/* sotc: a fatal fault also writes a minidump (threads, stacks and registers, no guest memory) to
+ * <user>/crashes/, where the launcher keeps the session log of a crash. dbghelp is loaded at
+ * start-up, not in the handler. SOTC_MINIDUMP=0 turns it off. */
+typedef BOOL (WINAPI *MiniDumpWriteDumpFn)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE,
+                                           PMINIDUMP_EXCEPTION_INFORMATION,
+                                           PMINIDUMP_USER_STREAM_INFORMATION,
+                                           PMINIDUMP_CALLBACK_INFORMATION);
+static MiniDumpWriteDumpFn minidump_write;
+static char crash_dump_dir[MAX_PATH];
+static void minidump_prepare(const char *user_dir) {
+    const char *v=getenv("SOTC_MINIDUMP");
+    if (v && v[0]=='0') return;
+    HMODULE dbghelp=LoadLibraryA("dbghelp.dll");
+    if (dbghelp) minidump_write=(MiniDumpWriteDumpFn)(void *)GetProcAddress(dbghelp,"MiniDumpWriteDump");
+    snprintf(crash_dump_dir,sizeof(crash_dump_dir),"%s/crashes",user_dir);
+}
+static void minidump_write_now(EXCEPTION_POINTERS *info) {
+    if (!minidump_write || !crash_dump_dir[0]) return;
+    CreateDirectoryA(crash_dump_dir,NULL);
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    char path[MAX_PATH+64];
+    snprintf(path,sizeof(path),"%s/%04u-%02u-%02u_%02u-%02u-%02u_bb-probe.dmp",crash_dump_dir,
+             t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond);
+    HANDLE file=CreateFileA(path,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
+    if (file==INVALID_HANDLE_VALUE) return;
+    MINIDUMP_EXCEPTION_INFORMATION exception={GetCurrentThreadId(),info,FALSE};
+    const BOOL ok=minidump_write(GetCurrentProcess(),GetCurrentProcessId(),file,
+                                 (MINIDUMP_TYPE)(MiniDumpWithThreadInfo|MiniDumpWithUnloadedModules),
+                                 &exception,NULL,NULL);
+    CloseHandle(file);
+    fprintf(stderr,ok ? "Crash dump: %s\n" : "Crash dump failed: %s\n",path);
+}
 static int fatal_reported;
 static LONG fatal_exception(EXCEPTION_POINTERS *info) {
     if (__atomic_exchange_n(&fatal_reported,1,__ATOMIC_ACQ_REL)) { Sleep(INFINITE); }
@@ -396,6 +430,8 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
         fprintf(stderr,"  #%d %s\n",depth,where);
         rbp=frame[0];
     }
+    fflush(NULL);
+    minidump_write_now(info);
     fflush(NULL);
     TerminateProcess(GetCurrentProcess(),3);
     return EXCEPTION_CONTINUE_SEARCH;
@@ -913,6 +949,9 @@ int main(int argc, char **argv) {
         }
         runtime_content_configure(values);
     }
+#ifdef _WIN32
+    minidump_prepare(user_dir ? user_dir : "user");
+#endif
     if (app0) {
         runtime_file_configure(app0, user_dir ? user_dir : "user");
         char sfo[4096], id[16]="";

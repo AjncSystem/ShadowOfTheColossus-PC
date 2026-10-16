@@ -883,6 +883,7 @@ void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }
+    const SotcStats::FrameTimer frame_timer{SotcStats::FrameUpload};
     // sotc: RefreshImage always runs under `mutex` (UpdateImage, FindImage -> ExpandImage) and can
     // reach EnsureResident through ObtainBufferForImage; see TryEmergencyCollect.
     ++refresh_depth;
@@ -905,7 +906,10 @@ void TextureCache::RefreshImage(Image& image) {
         const u32 s_w = image.info.props.is_block ? Common::DivCeil(w, 4u) : w;
         const u32 s_h = image.info.props.is_block ? Common::DivCeil(h, 4u) : h;
         const u32 size = s_w * s_h * (image.info.num_bits / 8);
-        const u64 hash = XXH3_64bits(addr, size);
+        const u64 hash = [&] {
+            const SotcStats::FrameTimer hash_timer{SotcStats::FrameHash};
+            return XXH3_64bits(addr, size);
+        }();
         if (image.hash == hash) {
             image.flags &= ~ImageFlagBits::MaybeCpuDirty;
             return;
@@ -929,7 +933,10 @@ void TextureCache::RefreshImage(Image& image) {
         // Protect GPU modified resources from accidental CPU reuploads.
         if (is_gpu_modified && !is_gpu_dirty) {
             const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
-            const u64 hash = XXH3_64bits(addr + mip_offset, mip_size);
+            const u64 hash = [&] {
+                const SotcStats::FrameTimer hash_timer{SotcStats::FrameHash};
+                return XXH3_64bits(addr + mip_offset, mip_size);
+            }();
             if (image.mip_hashes[m] == hash) {
                 continue;
             }
@@ -1184,6 +1191,7 @@ bool TextureCache::TryEmergencyCollect(u32 level) {
 }
 
 void TextureCache::EmergencyCollect(u32 level) {
+    const SotcStats::FrameTimer frame_timer{SotcStats::FrameGc};
     std::scoped_lock lock{mutex};
     // sotc: parked depth/colour twins are not in the LRU; under pressure they go first.
     lru_cache.ForEachItemBelow(gc_tick + 1, [&](ImageId image_id) {

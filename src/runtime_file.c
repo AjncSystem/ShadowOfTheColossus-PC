@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
 #ifdef _WIN32
@@ -53,6 +54,16 @@ static File files[MAX_FILES];
 static Mount mounts[MAX_MOUNTS];
 static size_t mount_count, opens, reads, writes, missing;
 static uint64_t bytes_read;
+/* sotc: time guest threads spend in host reads (SOTC_FPS frame report, videoout/driver.cpp). */
+static uint64_t read_ns;
+static uint64_t read_clock_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC,&ts);
+    return (uint64_t)ts.tv_sec*1000000000u+(uint64_t)ts.tv_nsec;
+}
+#define TIMED_READ(expr) ({ uint64_t t0_=read_clock_ns(); ssize_t r_=(expr); \
+    __atomic_add_fetch(&read_ns,read_clock_ns()-t0_,__ATOMIC_RELAXED); r_; })
+uint64_t runtime_file_read_ns_take(void) { return __atomic_exchange_n(&read_ns,0,__ATOMIC_RELAXED); }
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 
 int runtime_file_mount(const char *guest,const char *host) {
@@ -331,14 +342,14 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
     if (h<0) return -EBADF;
     unsigned char *staging=bounce_buffer(size);
     if (staging) {
-        ssize_t n=host_read(h,staging,size);
+        ssize_t n=TIMED_READ(host_read(h,staging,size));
         if (n<0) return -errno;
         memcpy(buffer,staging,(size_t)n);
         __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
         return n;
     }
     touch_for_write(buffer,size);
-    ssize_t n=host_read(h,buffer,size);
+    ssize_t n=TIMED_READ(host_read(h,buffer,size));
     if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
@@ -348,14 +359,14 @@ static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     if (h<0) return -EBADF;
     unsigned char *staging=bounce_buffer(size);
     if (staging) {
-        ssize_t n=pread(h,staging,size,offset);
+        ssize_t n=TIMED_READ(pread(h,staging,size,offset));
         if (n<0) return -errno;
         memcpy(buffer,staging,(size_t)n);
         __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
         return n;
     }
     touch_for_write(buffer,size);
-    ssize_t n=pread(h,buffer,size,offset);
+    ssize_t n=TIMED_READ(pread(h,buffer,size,offset));
     if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;

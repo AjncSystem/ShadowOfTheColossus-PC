@@ -705,6 +705,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     auto image_view = *image.FindView(view_info).image_view;
     const vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
     // sotc: this frame's depth, motion vectors and camera for DLSS Frame Generation.
+    SotcStats::cp_frame.fetch_add(1, std::memory_order_relaxed);
     Dlssg::PrepareInputs(frame->id, cmdbuf, texture_cache, runtime, image_size.width,
                          image_size.height);
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);

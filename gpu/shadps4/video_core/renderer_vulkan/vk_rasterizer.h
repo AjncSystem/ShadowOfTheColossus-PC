@@ -133,6 +133,11 @@ private:
 
     bool FilterDraw();
 
+    /// sotc: SOTC_SHADOW_REUSE: true when this draw's far sun shadow cascade is reused (moved
+    /// by whole texels) instead of drawn this frame (vk_shadow_scroll.h).
+    bool ReuseShadowCascade();
+    std::unique_ptr<class ShadowScroll> shadow_scroll;
+
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);

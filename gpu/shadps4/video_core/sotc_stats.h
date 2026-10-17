@@ -165,6 +165,9 @@ inline std::atomic<uint64_t> frame_copy_bytes{0};
 inline std::atomic<uint64_t> frame_ns[FrameCauses]{};
 inline std::atomic<uint64_t> frame_compiles{0}; ///< shader modules and pipelines created
 inline std::atomic<uint64_t> flip_count{0};     ///< game flips (videoout/driver.cpp Flip)
+/// Game frames prepared by the command processor (vk_presenter.cpp PrepareFrame): unlike
+/// flip_count, in step with the draws the command processor is processing.
+inline std::atomic<uint64_t> cp_frame{0};
 /// sotc: what the in-game performance overlay shows (bbport_overlay.cpp, show_fps / F10),
 /// published by the SOTC_FPS printer at the end of each five-second window (videoout/driver.cpp).
 inline std::atomic<float> ov_cmds_per_frame{0.0f};

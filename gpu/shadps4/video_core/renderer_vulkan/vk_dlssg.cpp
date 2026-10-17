@@ -424,6 +424,20 @@ bool MakeConstants(const Pending& p, u32 width, u32 height, sl::Constants& out) 
         reset = Dot3(d, d) > 50.0 * 50.0 || Dot3(fwd, prev_fwd) < 0.8;
     }
     out.reset = reset ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+    // SOTC_CAM_LOG=1: the camera position every 10 frames with a millisecond clock, for scripted
+    // runs (gameplay_bench --horse tells riding from walking by the speed).
+    static const bool cam_log = [] {
+        const char* v = std::getenv("SOTC_CAM_LOG");
+        return v && v[0] == '1';
+    }();
+    if (cam_log && next_index % 10 == 0) {
+        LARGE_INTEGER t, f;
+        QueryPerformanceCounter(&t);
+        QueryPerformanceFrequency(&f);
+        std::fprintf(stderr, "SOTC CAM %lld %.2f %.2f %.2f\n",
+                     static_cast<long long>(t.QuadPart * 1000 / f.QuadPart), p.cam.pos[0],
+                     p.cam.pos[1], p.cam.pos[2]);
+    }
     have_prev = true;
     std::memcpy(prev_pos, p.cam.pos, sizeof(prev_pos));
     std::memcpy(prev_fwd, fwd, sizeof(prev_fwd));
@@ -768,8 +782,12 @@ bool Enabled() {
     return supported;
 }
 
+// Streamline asks for vsync off with Vulkan, but DLSS-G generates and paces its frames in
+// Mailbox mode too (measured: 2 frames shown per game frame), without tearing when G-SYNC is
+// off. The requested mode is kept; SOTC_DLSSG_IMMEDIATE=1 switches to Immediate.
 bool WantsImmediatePresent() {
-    return supported && vsync_off && !std::getenv("SOTC_DLSSG_KEEP_PRESENT_MODE");
+    const char* v = std::getenv("SOTC_DLSSG_IMMEDIATE");
+    return supported && vsync_off && v && v[0] == '1';
 }
 
 void NoteDraw(const AmdGpu::Regs& regs, u32 mrt_mask, VideoCore::ImageId depth_id,

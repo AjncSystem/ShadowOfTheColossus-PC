@@ -29,6 +29,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_dlssg.h"
+#include "video_core/renderer_vulkan/vk_shadow_scroll.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/buffer_cache/region_manager.h"
@@ -338,6 +339,40 @@ static void TraceGbufferShaders(const Regs& regs, const Pipe* pipeline) {
     ++counts[key];
 }
 
+// sotc: SOTC_PASS_TRACE: the shader hashes of the draws into square depth targets of 512+ texels
+// (the sun shadow map's cascades) per slice, every 300 flips.
+template <typename Regs, typename Pipe>
+static void TraceShadowShaders(const Regs& regs, const Pipe* pipeline) {
+    static const bool on = std::getenv("SOTC_PASS_TRACE") != nullptr;
+    if (!on || !pipeline || !regs.depth_buffer.DepthValid()) {
+        return;
+    }
+    static std::map<std::pair<u32, u64>, u32> counts;
+    static u64 frame_seen = 0;
+    const u64 frame = SotcStats::flip_count.load(std::memory_order_relaxed);
+    if (frame != frame_seen) {
+        if (frame_seen % 300 == 0 && !counts.empty()) {
+            std::fprintf(stderr, "SOTC SHADOW SHADERS frame %llu:\n",
+                         static_cast<unsigned long long>(frame_seen));
+            for (const auto& [key, draws] : counts) {
+                std::fprintf(stderr, "  slice %u vs %#018llx draws %u\n", key.first,
+                             static_cast<unsigned long long>(key.second), draws);
+            }
+        }
+        counts.clear();
+        frame_seen = frame;
+    }
+    if (frame % 300 != 0) {
+        return;
+    }
+    const u32 pitch = regs.depth_buffer.Pitch();
+    if (pitch != regs.depth_buffer.Height() || pitch < 512) {
+        return;
+    }
+    const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
+    ++counts[{regs.depth_view.slice_start, vs.pgm_hash}];
+}
+
 // sotc: SOTC_SHADOW_STAGGER=1: the two farthest sun shadow cascades are redrawn on alternate
 // frames (slice 2 on odd flips, slice 3 on even ones). A skipped slice starts no render pass, so
 // it is not cleared and keeps the previous frame's shadows. The sun shadow map is the square
@@ -386,6 +421,203 @@ static bool SkipStaggeredShadow(const Regs& regs) {
     return slice == 2 ? (frame & 1) != 0 : slice == 3 ? (frame & 1) == 0 : false;
 }
 
+// sotc: SOTC_SHADOW_REUSE (default 1; 0 = off, check = verify once and save the result): the far
+// sun shadow cascades (slices 2 and 3 of the sun shadow map, the square depth target with the
+// most draws in the previous frame; ~2000 draws each) are drawn on alternate frames, and on the
+// other frames last frame's cascade is moved instead (vk_shadow_scroll.h). The engine snaps its
+// cascades to texels: between two frames only the translation of a cascade's (orthographic)
+// light matrix changes, by whole texels in x and y. Moving last frame's texels by that many
+// texels, and their depths by the z change, gives the cascade a redraw would (except for things
+// that moved since, whose far shadows update every other frame, and the few texels entering at
+// the edge). The light matrix is the shadow view's world -> clip at +0x80 of the view
+// constants, as for the camera (*(*(VS user data 0..1) + 8), vk_dlssg.cpp). Any other change
+// (rotation, scale, viewport, a non-whole-texel or large move): the cascade is drawn. Unlike
+// SOTC_SHADOW_STAGGER (texels of another matrix: shadows jumping as the camera moved), a reused
+// cascade always matches the matrix the lighting uses.
+namespace {
+struct ShadowReuseState {
+    static constexpr u32 kSlices = 8;
+    u64 frame_seen = 0, sun_map = 0;
+    std::unordered_map<u64, u32> counts; // draws per square depth target this frame
+    std::array<std::array<float, 16>, kSlices> last_vp{};
+    std::array<std::array<float, 3>, kSlices> last_scale{};
+    std::array<bool, kSlices> have_vp{}, decided{}, skip{}, drawn_prev{}, drawn_now{};
+    u64 drawn = 0, scrolled = 0, refused = 0, invalid = 0;
+    s32 check_slice = -1; // verification: the slice scrolled into the scratch image
+    bool check_done = false;
+};
+} // namespace
+
+bool Rasterizer::ReuseShadowCascade() {
+    static const int mode = [] {
+        const char* v = std::getenv("SOTC_SHADOW_REUSE");
+        if (!v) {
+            return 1;
+        }
+        return v[0] == '0' ? 0 : (v[0] == 'c' ? 2 : 1);
+    }();
+    if (mode == 0) {
+        return false;
+    }
+    static ShadowReuseState s;
+    const auto& regs = liverpool->regs;
+    const u64 frame = SotcStats::cp_frame.load(std::memory_order_relaxed);
+    if (frame != s.frame_seen) {
+        u64 most_addr = 0;
+        u32 most = 0;
+        for (const auto& [addr, draws] : s.counts) {
+            if (draws > most) {
+                most = draws;
+                most_addr = addr;
+            }
+        }
+        if ((most >= 500 ? most_addr : 0) != s.sun_map) {
+            s.have_vp.fill(false); // another shadow map: nothing to reuse
+        }
+        s.sun_map = most >= 500 ? most_addr : 0;
+        s.counts.clear();
+        s.drawn_prev = s.drawn_now;
+        s.drawn_now.fill(false);
+        s.decided.fill(false);
+        s.frame_seen = frame;
+        static const bool stats = std::getenv("SOTC_SHADOW_REUSE_STATS") != nullptr;
+        if (stats && frame % 300 == 0) {
+            std::fprintf(stderr,
+                         "SOTC SHADOW REUSE: far cascades drawn %llu, moved %llu, refused %llu, "
+                         "unreadable %llu\n",
+                         static_cast<unsigned long long>(s.drawn),
+                         static_cast<unsigned long long>(s.scrolled),
+                         static_cast<unsigned long long>(s.refused),
+                         static_cast<unsigned long long>(s.invalid));
+            s.drawn = s.scrolled = s.refused = s.invalid = 0;
+        }
+    }
+    if (!regs.depth_buffer.DepthValid() ||
+        regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Normal) {
+        return false;
+    }
+    const u32 pitch = regs.depth_buffer.Pitch();
+    if (pitch != regs.depth_buffer.Height() || pitch < 512) {
+        return false;
+    }
+    const u64 addr = regs.depth_buffer.DepthWriteAddress();
+    ++s.counts[addr];
+    const u32 slice = regs.depth_view.slice_start;
+    if (addr != s.sun_map || (slice != 2 && slice != 3)) {
+        return false;
+    }
+    if (s.decided[slice]) {
+        return s.skip[slice];
+    }
+    s.decided[slice] = true;
+    s.skip[slice] = false;
+
+    // The cascade's light matrix (rows at +0x80 of the shadow view's constants).
+    constexpr u64 kMask48 = 0xFFFFFFFFFFFFull;
+    const u64 ud =
+        (u64(regs.vs_program.user_data[0]) | (u64(regs.vs_program.user_data[1]) << 32)) & kMask48;
+    u64 cb = 0;
+    std::array<float, 16> vp{};
+    bool valid = ud && memory->TryReadBacking(ud + 8, &cb, sizeof(cb)) && (cb &= kMask48) &&
+                 memory->TryReadBacking(cb + 0x80, vp.data(), sizeof(vp));
+    if (valid) {
+        for (float f : vp) {
+            valid &= std::isfinite(f);
+        }
+        // Orthographic (sun light): the w row is (0, 0, 0, 1).
+        valid &= vp[12] == 0.0f && vp[13] == 0.0f && vp[14] == 0.0f && vp[15] == 1.0f;
+    }
+    const auto& viewport = regs.viewports[0];
+    const std::array<float, 3> scale{
+        regs.viewport_control.xscale_enable ? viewport.xscale : 1.0f,
+        regs.viewport_control.yscale_enable ? viewport.yscale : 1.0f,
+        regs.viewport_control.zscale_enable ? viewport.zscale : 1.0f};
+
+    // Verification: the scratch image scrolled last frame against the cascade then drawn.
+    if (mode == 2 && s.check_slice >= 0 && !s.check_done && shadow_scroll) {
+        const auto texture_lock = texture_cache.BatchLock();
+        const auto htile = regs.depth_htile_data_base.GetAddress();
+        VideoCore::TextureCache::ImageDesc desc(regs.depth_buffer, regs.depth_view,
+                                                regs.depth_control, htile,
+                                                liverpool->last_db_extent);
+        auto& image = texture_cache.GetImage(texture_cache.FindImage(desc));
+        const char* dump_dir = std::getenv("BB_DUMP_DIR");
+        const auto dir = std::filesystem::path(dump_dir ? dump_dir : ".");
+        shadow_scroll->SaveCheck(
+            image, static_cast<u32>(s.check_slice),
+            (dir / ("shadow_check_slice" + std::to_string(s.check_slice))).string());
+        s.check_done = true;
+    }
+
+    bool moved = false;
+    const bool phase = (frame + slice) % 2 == 1; // each far cascade drawn every other frame
+    if (!valid) {
+        ++s.invalid;
+    } else if (s.have_vp[slice] && s.drawn_prev[slice] && phase) {
+        const auto& prev = s.last_vp[slice];
+        bool same_basis = s.last_scale[slice] == scale;
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                same_basis &= vp[r * 4 + c] == prev[r * 4 + c];
+            }
+        }
+        const double fx = double(scale[0]) * (double(vp[3]) - prev[3]);
+        const double fy = double(scale[1]) * (double(vp[7]) - prev[7]);
+        const float dz = static_cast<float>(double(scale[2]) * (double(vp[11]) - prev[11]));
+        const double rx = std::round(fx), ry = std::round(fy);
+        const bool whole = std::abs(fx - rx) < 0.02 && std::abs(fy - ry) < 0.02 &&
+                           std::abs(rx) <= 128 && std::abs(ry) <= 128;
+        static u32 logged = 0;
+        if ((!same_basis || !whole) && std::getenv("SOTC_SHADOW_REUSE_STATS") && logged < 20) {
+            ++logged;
+            std::fprintf(stderr,
+                         "SOTC SHADOW REUSE refused slice %u: basis %s, move %.4f,%.4f texels, dz "
+                         "%g, scale %g %g %g (was %g %g %g)\n",
+                         slice, same_basis ? "same" : "changed", fx, fy, dz, scale[0], scale[1],
+                         scale[2], s.last_scale[slice][0], s.last_scale[slice][1],
+                         s.last_scale[slice][2]);
+        }
+        if (same_basis && whole) {
+            if (!shadow_scroll) {
+                shadow_scroll = std::make_unique<ShadowScroll>(instance, scheduler, runtime);
+            }
+            const auto texture_lock = texture_cache.BatchLock();
+            const auto htile = regs.depth_htile_data_base.GetAddress();
+            VideoCore::TextureCache::ImageDesc desc(regs.depth_buffer, regs.depth_view,
+                                                    regs.depth_control, htile,
+                                                    liverpool->last_db_extent);
+            auto& image = texture_cache.GetImage(texture_cache.FindImage(desc));
+            const bool check = mode == 2;
+            if (check && (s.check_slice >= 0 || (rx == 0 && ry == 0))) {
+                // Verification done or pending: draw as usual.
+            } else if (shadow_scroll->Scroll(image, slice, static_cast<s32>(rx),
+                                             static_cast<s32>(ry), dz, regs.depth_clear, check)) {
+                if (check) {
+                    s.check_slice = static_cast<s32>(slice);
+                    std::fprintf(stderr,
+                                 "SOTC SHADOW CHECK slice %u frame %llu shift %d,%d dz %g "
+                                 "(scale %g %g %g, clear %g, format %d)\n",
+                                 slice, static_cast<unsigned long long>(frame), int(rx), int(ry),
+                                 dz, scale[0], scale[1], scale[2], regs.depth_clear,
+                                 static_cast<int>(image.info.pixel_format));
+                } else {
+                    moved = true;
+                }
+            }
+        }
+        if (!moved && mode != 2) {
+            ++s.refused;
+        }
+    }
+    s.last_vp[slice] = vp;
+    s.last_scale[slice] = scale;
+    s.have_vp[slice] = valid;
+    s.skip[slice] = moved;
+    s.drawn_now[slice] = !moved;
+    ++(moved ? s.scrolled : s.drawn);
+    return moved;
+}
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
 
@@ -395,7 +627,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (!FilterDraw()) {
         return;
     }
-    if (SkipStaggeredShadow(liverpool->regs)) {
+    if (SkipStaggeredShadow(liverpool->regs) || ReuseShadowCascade()) {
         return;
     }
 
@@ -410,6 +642,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
     TraceGbufferShaders(regs, pipeline);
+    TraceShadowShaders(regs, pipeline);
 
     PrepareRenderState(pipeline);
     if (Dlssg::Enabled()) { // sotc: camera and inputs of DLSS Frame Generation
@@ -466,7 +699,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (!FilterDraw()) {
         return;
     }
-    if (SkipStaggeredShadow(liverpool->regs)) {
+    if (SkipStaggeredShadow(liverpool->regs) || ReuseShadowCascade()) {
         return;
     }
 
@@ -493,6 +726,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         SotcStats::Drop(0, liverpool->regs.color_buffers[0].Address(), 1);
         return;
     }
+    TraceShadowShaders(liverpool->regs, pipeline);
 
     PrepareRenderState(pipeline);
     if (Dlssg::Enabled()) { // sotc: camera and inputs of DLSS Frame Generation

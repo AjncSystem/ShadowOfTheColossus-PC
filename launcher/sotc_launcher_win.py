@@ -22,6 +22,8 @@ import sys
 import threading
 import time
 
+import sotc_update
+
 FROZEN = getattr(sys, 'frozen', False)
 PORT_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PORT_DIR / 'scripts'))
@@ -127,7 +129,8 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
                 'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'volume': '100', 'library_dirs': [], 'keys': {},
-                'auto_setup': True, 'dlc_dir': '', 'framegen': 'off'}
+                'auto_setup': True, 'dlc_dir': '', 'framegen': 'off',
+                'check_updates': True, 'skip_version': ''}
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
 KEY_INPUTS = [
     ('move_up', 'W', ('Andar para frente', 'Move forward')), ('move_down', 'S', ('Andar para trás', 'Move back')),
@@ -535,6 +538,16 @@ class Launcher:
         root.protocol('WM_DELETE_WINDOW', self.close)
         root.after(100, self.drain_output)
         threading.Thread(target=self.detect_gpu, daemon=True).start()
+        # sotc: self-update (sotc_update.py): the result of an update that just ran, then a check.
+        self.updating = False
+        if FROZEN:
+            error = sotc_update.cleanup(PORT_DIR)
+            if error:
+                root.after(500, lambda: messagebox.showerror('Shadow of the Colossus', _(
+                    'A atualização falhou e a versão anterior foi mantida:\n{}',
+                    'The update failed and the previous version was kept:\n{}').format(error)))
+        if self.app.get('check_updates', True) and (FROZEN or os.environ.get('SOTC_UPDATE_URL')):
+            root.after(2000, lambda: self.check_updates(False))
 
     def px(self, size):
         return int(size * self.dpi)
@@ -763,6 +776,7 @@ class Launcher:
             self.nav[name] = item
         tk.Frame(side, bg=BG).pack(fill='both', expand=True)
         for text, command in ((_('Registro do jogo', 'Game log'), lambda: self.show('log')),
+                              (_('Procurar atualização', 'Check for updates'), lambda: self.check_updates(True)),
                               (_('Configurar de novo', 'Set up again'), self.show_setup)):
             link = tk.Label(side, text=text, bg=BG, fg=MUTED, font=(ui_font(), 9, 'underline'), cursor='hand2')
             link.pack(anchor='w', padx=22, pady=(0, 6))
@@ -1155,6 +1169,9 @@ class Launcher:
         self.row(f, _('Idioma do lançador', 'Launcher language'), self.choice(f, 'ui_language', UI_LANGUAGES),
                  _('Vale na próxima vez que o lançador abrir.', 'Applies when the launcher opens again.'))
         self.check(f, 'close_on_play', _('Fechar o lançador quando o jogo abrir', 'Close the launcher when the game starts'))
+        self.check(f, 'check_updates', _('Procurar atualizações ao abrir', 'Check for updates at startup'),
+                   _('Pergunta antes de baixar. Saves, cache de shaders e sotc.ini são mantidos.',
+                     'Asks before downloading. Saves, shader cache and sotc.ini are kept.'))
         holder = ttk.Frame(f)
         holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(10, 0))
         ttk.Button(holder, text=_('Atalho na área de trabalho', 'Desktop shortcut'), command=self.shortcut).pack(side='left')
@@ -1664,7 +1681,7 @@ class Launcher:
 
     # ---- game process ------------------------------------------------------------------------
     def play(self):
-        if self.process:
+        if self.process or self.updating:
             return
         self.collect()
         if not game_info(self.app['game_dir']):
@@ -1803,6 +1820,91 @@ class Launcher:
         else:
             self.messagebox.showerror('Shadow of the Colossus', result.stderr.decode(errors='replace')[:400])
 
+    # sotc: self-update from the GitHub releases (sotc_update.py).
+    def check_updates(self, manual):
+        if self.updating:
+            return
+        self.updating = True
+        if manual:
+            self.status.configure(text=_('Procurando atualização…', 'Checking for updates…'), fg=MUTED)
+
+        def work():
+            try:
+                release, error = sotc_update.latest_release(), None
+            except Exception as problem:  # offline or rate-limited: only a manual check says so
+                release, error = None, problem
+            self.ui_calls.put(lambda: self.offer_update(release, error, manual))
+        threading.Thread(target=work, daemon=True).start()
+
+    def offer_update(self, release, error, manual):
+        self.updating = False
+        if manual:
+            self.refresh_status()
+        if error or not sotc_update.is_newer(release, VERSION):
+            if manual and error:
+                self.messagebox.showwarning('Shadow of the Colossus', _(
+                    'Não foi possível procurar atualização:\n{}', 'Could not check for updates:\n{}').format(error))
+            elif manual:
+                self.messagebox.showinfo('Shadow of the Colossus', _(
+                    'Você já tem a versão mais recente (v{}).', 'You have the latest version (v{}).').format(VERSION))
+            return
+        if not manual and release['version'] == self.app.get('skip_version'):
+            return
+        notes = release['notes'].strip()
+        if len(notes) > 900:
+            notes = notes[:900].rsplit('\n', 1)[0] + '\n…'
+        question = _('Há uma versão nova: v{new} (você tem v{cur}).\n\n{notes}\n\n',
+                     'A new version is available: v{new} (you have v{cur}).\n\n{notes}\n\n').format(
+            new=release['version'], cur=VERSION, notes=notes)
+        if not FROZEN:  # running from the sources: nothing to replace, show the release
+            if self.messagebox.askyesno('Shadow of the Colossus', question + _('Abrir a página?', 'Open the page?')):
+                os.startfile(release['page'])
+            return
+        if self.messagebox.askyesno('Shadow of the Colossus', question + _(
+                'Baixar e instalar agora? Saves, cache de shaders e sotc.ini são mantidos, e o lançador abre '
+                'de novo sozinho.',
+                'Download and install now? Saves, shader cache and sotc.ini are kept, and the launcher opens '
+                'again by itself.')):
+            self.install_update(release)
+        else:
+            self.app['skip_version'] = release['version']  # no question at startup for this one again
+
+    def install_update(self, release):
+        if self.process:
+            self.messagebox.showinfo('Shadow of the Colossus', _('Feche o jogo antes de atualizar.',
+                                                                 'Close the game before updating.'))
+            return
+        self.updating = True
+        self.play_button.configure(state='disabled')
+
+        def progress(done, total):
+            text = _('Baixando a atualização: {} de {} MB', 'Downloading the update: {} of {} MB').format(
+                done >> 20, (total >> 20) or '?')
+            self.ui_calls.put(lambda: self.status.configure(text=text, fg=GOLD))
+
+        def work():
+            try:
+                new_root, error = sotc_update.download(release, PORT_DIR / 'update', progress), None
+            except Exception as problem:
+                new_root, error = None, problem
+            self.ui_calls.put(lambda: self.finish_update(new_root, error))
+        threading.Thread(target=work, daemon=True).start()
+
+    def finish_update(self, new_root, error):
+        if not error:
+            try:
+                sotc_update.start_applier(new_root, PORT_DIR)
+            except Exception as problem:
+                error = problem
+        if error:
+            self.updating = False
+            self.refresh_status()
+            self.messagebox.showerror('Shadow of the Colossus', _(
+                'A atualização não foi instalada:\n{}', 'The update was not installed:\n{}').format(error))
+            return
+        self.status.configure(text=_('Instalando a atualização…', 'Installing the update…'), fg=GOLD)
+        self.root.after(300, self.close)  # the applier waits for this process to end
+
     def close(self):
         try:
             self.collect()
@@ -1862,6 +1964,22 @@ def main():
     args = sys.argv[1:]
     if args and args[0] in ('--run', '--script'):
         sys.exit(run_role(args))
+    # sotc: --apply-update <new folder> <port folder> <launcher pid>: the copied launcher that
+    # installs an update (sotc_update.py). --update-now: check, download and install without
+    # the window (scripted tests; SOTC_UPDATE_URL can point at a test release).
+    if args and args[0] == '--apply-update' and len(args) == 4:
+        sys.exit(0 if sotc_update.apply_update(args[1], args[2], int(args[3])) else 1)
+    if args and args[0] == '--update-now':
+        attach_stdio()
+        release = sotc_update.latest_release()
+        if not sotc_update.is_newer(release, VERSION):
+            print(f'up to date (v{VERSION}, latest {release and release["version"]})')
+            sys.exit(0)
+        print(f'updating v{VERSION} -> v{release["version"]}')
+        new_root = sotc_update.download(release, PORT_DIR / 'update')
+        if FROZEN:
+            sotc_update.start_applier(new_root, PORT_DIR)
+        sys.exit(0)
     settings = load_settings()
     LANG = settings.get('ui_language') or windows_language()
     if '--play' in args and (Path(settings['game_dir'] or '.') / 'eboot.bin').is_file():

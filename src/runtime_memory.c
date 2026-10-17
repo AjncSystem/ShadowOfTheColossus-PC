@@ -24,13 +24,18 @@
 #include <unistd.h>
 #endif
 /* sceKernelGetDirectMemorySize on retail PS4: 5056 MiB. BB_DMEM_MB raises it (the resolution
- * patches above 1080p need about 4 GiB more; run.sh sets it). */
+ * patches above 1080p need about 4 GiB more; run.sh sets it). A PS4 Pro (SOTC_NEO=1) gives games
+ * 640 MiB more (shadPS4: 5888 vs 5248 MiB in total); with the base size the game's 64 KiB page
+ * bitmap filled up when a save loaded in Pro mode and its allocator read past it (guest offset
+ * 0x1a371, read of -1). */
+int runtime_sotc_neo(void);
 static uint64_t pool_size_bytes(void) {
     static uint64_t size;
     if (!size) {
         const char *env = getenv("BB_DMEM_MB");
+        const uint64_t base = runtime_sotc_neo() ? 5056 + 640 : 5056;
         uint64_t mb = env ? strtoull(env, NULL, 10) : 0;
-        if (mb < 5056 || mb > 16384) mb = 5056;
+        if (mb < base || mb > 16384) mb = base;
         size = mb * 1024 * 1024;
     }
     return size;

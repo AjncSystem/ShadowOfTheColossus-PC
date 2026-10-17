@@ -176,7 +176,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         Core::MemoryManager::NoteHostWrite(device_addr, size, 6, window_start);
         DownloadMemory(arena, window_start, window_end - window_start);
         if (is_write) {
-            memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+            MarkWrittenByGuest(device_addr, size);
         }
     };
     if (assume_locks) {
@@ -204,6 +204,26 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     scheduler.WaitSubmitted(readback.tick, false);
     scheduler.GetWorkSemaphore()->Wait(readback.tick);
     liverpool->SendCommand<true>([this, &readback] { FinishAsyncReadback(readback); });
+}
+
+void BufferCache::MarkWrittenByGuest(VAddr addr, u64 size) {
+    // sotc: a page both CPU- and GPU-modified loses its write watcher but keeps its read
+    // watcher: "write-only" protection, an assertion that ended the game (opt4, ~1 in 12 Shrine
+    // runs). After a write fault's readback the requested pages can still be GPU-modified: GPU
+    // data recorded since (left protected: the write faults again and the next readback brings
+    // it) or a page bit no GPU-written byte backs any more (cleared, or the write would fault
+    // forever).
+    if (memory_tracker->IsRegionGpuModified(addr, size)) {
+        const VAddr lo = Common::AlignDown(addr, VAddr{4096});
+        const VAddr hi = Common::AlignUp(addr + size, VAddr{4096});
+        if (gpu_modified_ranges.Intersects(lo, hi - lo)) {
+            SotcStats::write_fault_gpu_pending.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        SotcStats::write_fault_stale_gpu.fetch_add(1, std::memory_order_relaxed);
+        memory_tracker->UnmarkRegionAsGpuModified(lo, hi - lo, false);
+    }
+    memory_tracker->MarkRegionAsCpuModified(addr, size);
 }
 
 void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
@@ -234,7 +254,7 @@ void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
             return;
         }
         if (readback.is_write) {
-            memory_tracker->MarkRegionAsCpuModified(readback.device_addr, readback.size);
+            MarkWrittenByGuest(readback.device_addr, readback.size);
         }
         return;
     }
@@ -290,13 +310,13 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
             FinishAsyncReadback(*other);
         }
         if (readback.is_write) {
-            memory_tracker->MarkRegionAsCpuModified(readback.device_addr, readback.size);
+            MarkWrittenByGuest(readback.device_addr, readback.size);
         }
         return;
     }
     if (readback.finished) {
         if (readback.is_write) {
-            memory_tracker->MarkRegionAsCpuModified(readback.device_addr, readback.size);
+            MarkWrittenByGuest(readback.device_addr, readback.size);
         }
         return;
     }
@@ -326,7 +346,7 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
         staging_pool.FreeDeferred(download);
     }
     if (readback.is_write) {
-        memory_tracker->MarkRegionAsCpuModified(readback.device_addr, readback.size);
+        MarkWrittenByGuest(readback.device_addr, readback.size);
     }
 }
 

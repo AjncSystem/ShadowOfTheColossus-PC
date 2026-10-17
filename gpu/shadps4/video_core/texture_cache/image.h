@@ -10,6 +10,7 @@
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
 
+#include <atomic>
 #include <deque>
 #include <optional>
 #include <boost/container/small_vector.hpp>
@@ -181,6 +182,8 @@ public:
     u64 lru_id{};
     u64 tick_accessed_last{};
     u64 hash{};
+    /// sotc: host bytes this full chain would save as a mip tail (census "projected" only).
+    u64 sotc_shadow_saving{};
 
     struct {
         u32 texture : 1;
@@ -200,5 +203,25 @@ public:
 private:
     static Common::IncrementalIdProvider<u64> global_image_uid;
 };
+
+/// sotc: moves when an image first gains GPU writes outside a writer FindImage (copy and clear
+/// fast paths): memoized mip-tail decisions are made again (TextureCache::MemoLookup), since
+/// they refuse a tail that a GPU-written image overlaps.
+inline std::atomic<u64> gpu_modified_epoch{0};
+
+/// sotc: counts and reports a GPU write to a mip-tail image (they must never be written).
+void NoteMipTailWrite(const Image& image);
+
+inline void MarkGpuModified(Image& image, bool bump_epoch = true) {
+    if (False(image.flags & ImageFlagBits::GpuModified)) {
+        if (bump_epoch) {
+            gpu_modified_epoch.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (image.info.sotc_first_mip) {
+            NoteMipTailWrite(image);
+        }
+    }
+    image.flags |= ImageFlagBits::GpuModified;
+}
 
 } // namespace VideoCore

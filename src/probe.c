@@ -14,6 +14,7 @@
 #endif
 #ifdef _WIN32
 #include <windows.h>
+#include <dbghelp.h>
 #include <tlhelp32.h>
 #include <wchar.h>
 #include <mmsystem.h>
@@ -387,6 +388,39 @@ static DWORD WINAPI stacks_watcher(void *path) {
     }
     return 0;
 }
+/* sotc: a fatal fault also writes a minidump (threads, stacks and registers, no guest memory) to
+ * <user>/crashes/, where the launcher keeps the session log of a crash. dbghelp is loaded at
+ * start-up, not in the handler. SOTC_MINIDUMP=0 turns it off. */
+typedef BOOL (WINAPI *MiniDumpWriteDumpFn)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE,
+                                           PMINIDUMP_EXCEPTION_INFORMATION,
+                                           PMINIDUMP_USER_STREAM_INFORMATION,
+                                           PMINIDUMP_CALLBACK_INFORMATION);
+static MiniDumpWriteDumpFn minidump_write;
+static char crash_dump_dir[MAX_PATH];
+static void minidump_prepare(const char *user_dir) {
+    const char *v=getenv("SOTC_MINIDUMP");
+    if (v && v[0]=='0') return;
+    HMODULE dbghelp=LoadLibraryA("dbghelp.dll");
+    if (dbghelp) minidump_write=(MiniDumpWriteDumpFn)(void *)GetProcAddress(dbghelp,"MiniDumpWriteDump");
+    snprintf(crash_dump_dir,sizeof(crash_dump_dir),"%s/crashes",user_dir);
+}
+static void minidump_write_now(EXCEPTION_POINTERS *info) {
+    if (!minidump_write || !crash_dump_dir[0]) return;
+    CreateDirectoryA(crash_dump_dir,NULL);
+    SYSTEMTIME t;
+    GetLocalTime(&t);
+    char path[MAX_PATH+64];
+    snprintf(path,sizeof(path),"%s/%04u-%02u-%02u_%02u-%02u-%02u_bb-probe.dmp",crash_dump_dir,
+             t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond);
+    HANDLE file=CreateFileA(path,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
+    if (file==INVALID_HANDLE_VALUE) return;
+    MINIDUMP_EXCEPTION_INFORMATION exception={GetCurrentThreadId(),info,FALSE};
+    const BOOL ok=minidump_write(GetCurrentProcess(),GetCurrentProcessId(),file,
+                                 (MINIDUMP_TYPE)(MiniDumpWithThreadInfo|MiniDumpWithUnloadedModules),
+                                 &exception,NULL,NULL);
+    CloseHandle(file);
+    fprintf(stderr,ok ? "Crash dump: %s\n" : "Crash dump failed: %s\n",path);
+}
 static int fatal_reported;
 static LONG fatal_exception(EXCEPTION_POINTERS *info) {
     if (__atomic_exchange_n(&fatal_reported,1,__ATOMIC_ACQ_REL)) { Sleep(INFINITE); }
@@ -413,6 +447,8 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
         fprintf(stderr,"  #%d %s\n",depth,where);
         rbp=frame[0];
     }
+    fflush(NULL);
+    minidump_write_now(info);
     fflush(NULL);
     TerminateProcess(GetCurrentProcess(),3);
     return EXCEPTION_CONTINUE_SEARCH;
@@ -813,9 +849,9 @@ static int mapped(Segment *segments, uint64_t count, uint64_t address, uint64_t 
             address - segments[i].address <= segments[i].size - bytes) return 1;
     return 0;
 }
-/* BBPATCH2 (patches.py): the patches' image base, then byte writes at image offsets, applied
- * after relocation. A write may replace a whole base-relative pointer slot (60/90 FPS++ swap
- * function pointers): the patch holds the address at the patches' base, rebased here. */
+/* BBPATCH2 (scripts/sotc_modes.py): the patches' image base, then byte writes at image offsets,
+ * applied after relocation. A write may replace a whole base-relative pointer slot (a patch that
+ * swaps function pointers): the patch holds the address at the patches' base, rebased here. */
 static void apply_patches(const char *path, Segment *segments, uint64_t ns, const Reloc *relocs, uint64_t nr) {
     FILE *f=fopen(path,"rb");
     char magic[8];
@@ -849,15 +885,15 @@ static void apply_patches(const char *path, Segment *segments, uint64_t ns, cons
     fclose(f);
     printf("Patches: %" PRIu64 " writes, %" PRIu64 " bytes applied, %" PRIu64 " pointers rebased\n",count,bytes,rebased);
 }
-/* Restarts the game through run.sh (the settings menu: a new render resolution is a patch
- * applied at start). Descriptors are closed first so the old GPU device and its memory are
- * released before the new process opens its own. */
+/* Restarts the game: BB_RESTART_COMMAND on Windows, run.sh on Linux. Descriptors are closed
+ * first so the old GPU device and its memory are released before the new process opens its own. */
 void runtime_restart(void) {
     fflush(NULL);
 #ifdef _WIN32
-    /* run.py sets BB_RESTART_COMMAND: the launch command line, started again (new patches). */
+    /* BB_RESTART_COMMAND: the launch command line, started again (sotc.py and the SotC launcher
+     * do not set it). */
     const char *command=getenv("BB_RESTART_COMMAND");
-    puts("Runtime: restarting through run.py");
+    puts("Runtime: restarting (BB_RESTART_COMMAND)");
     if (!command || !*command) { fputs("runtime_restart: BB_RESTART_COMMAND is not set\n",stderr); _exit(1); }
     char *line=_strdup(command);
     /* Same output handles: a launcher reading the game's log keeps reading the new launch. */
@@ -869,7 +905,7 @@ void runtime_restart(void) {
         fprintf(stderr,"runtime_restart: CreateProcess failed (%lu)\n",GetLastError()); _exit(1);
     }
     CloseHandle(process.hThread); CloseHandle(process.hProcess);
-    /* The new launch waits for this process's GPU device to go away (run.py --after). */
+    /* The command must wait for this process's GPU device to go away before starting the game. */
     TerminateProcess(GetCurrentProcess(),0);
 #else
     puts("Runtime: restarting through run.sh");
@@ -931,6 +967,9 @@ int main(int argc, char **argv) {
         }
         runtime_content_configure(values);
     }
+#ifdef _WIN32
+    minidump_prepare(user_dir ? user_dir : "user");
+#endif
     if (app0) {
         runtime_file_configure(app0, user_dir ? user_dir : "user");
         char sfo[4096], id[16]="";
@@ -1074,7 +1113,7 @@ int main(int argc, char **argv) {
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
     if (!cpu_only) {
-        char title[128]="Bloodborne", serial[16]="UNKNOWN", sfo[4096];
+        char title[128]="Shadow of the Colossus", serial[16]="UNKNOWN", sfo[4096];
         uint32_t attributes=0;
         snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0 ? app0 : ".");
         sfo_value(sfo,"TITLE",title,sizeof(title),NULL);

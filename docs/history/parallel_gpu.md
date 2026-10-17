@@ -1,5 +1,9 @@
 # Parallel GPU command processing — design notes
 
+> **History:** written for bbport's Bloodborne video core and measured on Bloodborne. The SotC
+> port replaced that core (see `docs/sotc/CAMINHO-B.md`); the switches and functions named here
+> (`bb:DrawRec`, `BB_DCB_STATS`, ...) no longer exist. Kept as a reference for porting the ideas.
+
 Goal: remove the single-core bottleneck of the emulated GPU command processor
 (`shadPS4:GpuCommandProcessor`, ~100% of one core while the rest of the CPU idles).
 

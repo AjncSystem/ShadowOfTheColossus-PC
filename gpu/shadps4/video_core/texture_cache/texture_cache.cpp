@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -24,6 +27,14 @@
 #include "video_core/texture_cache/tile_manager.h"
 
 namespace VideoCore {
+
+void ReentrantMutex::AsymmetricBarrier() {
+#ifdef _WIN32
+    FlushProcessWriteBuffers();
+#else
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
+}
 
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
@@ -190,9 +201,27 @@ void TextureCache::MarkAsMaybeDirty(ImageId image_id, Image& image) {
 }
 
 void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
-    std::scoped_lock lock{mutex};
     const auto pages_start = PageManager::GetPageAddr(addr);
     const auto pages_end = PageManager::GetNextPageAddr(addr + size - 1);
+    // sotc: most guest write faults hit buffer pages without any image: no lock for them (they
+    // made the command processor wait for the lock ~125 times a frame). An image registered
+    // right after this check is uploaded from memory and tracked afterwards, as one registered
+    // right after a locked invalidation would be. SOTC_TC_SKIP_EMPTY=0: always lock.
+    static const bool skip_empty = [] {
+        const char* v = std::getenv("SOTC_TC_SKIP_EMPTY");
+        return !v || v[0] != '0';
+    }();
+    if (skip_empty) {
+        bool any = false;
+        ForEachPage(pages_start, pages_end - pages_start, [&](u64 page) {
+            any = page >= NumImagePages || page_images[page].load(std::memory_order_acquire) != 0;
+            return any;
+        });
+        if (!any) {
+            return;
+        }
+    }
+    std::scoped_lock lock{mutex};
     ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
         const auto image_begin = image.info.guest_address;
         const auto image_end = image.info.guest_address + image.info.guest_size;
@@ -231,7 +260,9 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
     }();
     ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
         // Only consider images that match base address.
+        // sotc: a mip tail counts as written when its chain's base address is.
         if (image.info.guest_address != address &&
+            image.info.guest_address - image.info.sotc_dropped_bytes != address &&
             !(overlap && image.info.guest_address >= address &&
               image.info.guest_address + image.info.guest_size <= address + max_size)) {
             return;
@@ -305,11 +336,13 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
         // (~100 conversions/s in the open world): each one created an image and freed the old
         // one (~3% of the GPU thread). The old image is parked as the new one's twin instead,
         // and the next conversion back reuses it when it has exactly the requested layout. The
-        // copy stays: the contents move every time. Opt-in (SOTC_DEPTH_TWIN=1) until measured:
-        // the A/B runs so far were all disturbed.
+        // copy stays: the contents move every time. On by default since 2026-10-16 (SOTC_DEPTH_TWIN=0
+        // off): at the Shrine a 960x540 D32S8/R32F pair was created and freed every frame (two
+        // dedicated allocations); with twins none, 31.8/31.1 -> 33.4/32.8 FPS (interleaved pairs),
+        // attract demo 50.3 -> 52.2 FPS, 1% low 30.0 -> 37.8, frames over 50 ms 53 -> 26.
         static const bool twins = [] {
             const char* v = std::getenv("SOTC_DEPTH_TWIN");
-            return v && v[0] == '1';
+            return !v || v[0] != '0';
         }();
         ImageId new_image_id{};
         if (const ImageId twin_id = cache_image.parked_twin) {
@@ -374,8 +407,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                                                            ImageId cache_image_id,
                                                            ImageId merged_image_id) {
     auto& cache_image = slot_images[cache_image_id];
-    const bool safe_to_delete =
-        scheduler.CurrentTick() - cache_image.tick_accessed_last > NumFramesBeforeRemoval;
+    const bool safe_to_delete = IsSafeToDelete(cache_image);
 
     // Equal address
     if (image_info.guest_address == cache_image.info.guest_address) {
@@ -619,42 +651,72 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     return new_image_id;
 }
 
+// sotc: FindImage's perfect-match test (DecideRebase uses it for mip tails too).
+static bool IsPerfectMatch(const ImageInfo& cached, const ImageInfo& info, bool exact_fmt) {
+    return cached.guest_address == info.guest_address && cached.guest_size == info.guest_size &&
+           cached.size == info.size &&
+           IsVulkanFormatCompatible(cached.pixel_format, info.pixel_format) &&
+           (cached.type == info.type || info.size == Extent3D{1, 1, 1}) &&
+           (!exact_fmt || info.pixel_format == cached.pixel_format);
+}
+
+// sotc: the view of a mip-tail candidate, derived from its T# on every lookup (the second-pass
+// re-find must not shift it twice). In a tail the T#'s base mip is level 0 and min_lod moves
+// down with it; found as mip `view_mip` of a larger image, levels shift by what is left.
+static void SetMipTailView(TextureCache::ImageDesc& desc, int view_mip) {
+    const u32 b = desc.rebase_mip;
+    const u32 base = view_mip > 0 ? u32(view_mip) : desc.rebased_now ? 0u : b;
+    const u32 shift = desc.rebased_now && b > base ? b - base : 0u;
+    desc.view_info.range.base.level = base;
+    desc.view_info.min_lod =
+        desc.orig_min_lod > 256 * shift ? desc.orig_min_lod - 256 * shift : 0u;
+}
+
+void TextureCache::ImageDesc::InitMipTail(const AmdGpu::Image& image,
+                                          const Shader::ImageResource& resource) {
+    // sotc: read-only colour T#s with base_level above 0; mode 1 only those with LOD streaming
+    // counters. With SOTC_MIP_TAIL=0 the mode 2 candidates are marked for the census only.
+    const u32 mode = MipTailMode();
+    const auto image_type = image.GetType();
+    if (type != BindingType::Texture || resource.is_depth ||
+        resource.mip_fallback_mode != Shader::MipStorageFallbackMode::None ||
+        image_type == AmdGpu::ImageType::Color3D || image_type == AmdGpu::ImageType::Color2DMsaa ||
+        image_type == AmdGpu::ImageType::Color2DMsaaArray || image.base_level == 0 ||
+        image.base_level > image.last_level || (mode == 1 && !image.lod_hw_cnt_en)) {
+        return;
+    }
+    rebase_mip = static_cast<u8>(image.base_level);
+    orig_min_lod = static_cast<u16>(image.min_lod);
+    if (mode != 0) {
+        other_info = ImageInfo::CachedRebase(image, resource);
+    }
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     const auto& info = desc.info;
     ASSERT(info.guest_address != 0);
 
-    std::scoped_lock lock{mutex};
+    std::unique_lock lock{mutex, std::defer_lock};
+    LockCounted(lock);
+    // sotc: SOTC_MIP_TAIL: `info` may become the T#'s mip tail.
+    const bool tail_candidate = desc.rebase_mip != 0 && MipTailMode() != 0;
+    if (tail_candidate) {
+        DecideRebase(desc, exact_fmt);
+    }
+    // sotc: writers free the mip tails they overlap (below); with mip tails on, a writer only
+    // takes a perfect match memoized by a writer lookup, i.e. after that freeing.
+    const bool writer = desc.type != BindingType::Texture;
+    const bool memo_writer = writer && MipTailMode() != 0;
     // sotc: thousands of lookups per frame find the same images; a perfect match stays one
     // until an image is registered or unregistered (SOTC_FIND_MEMO=0: always search).
-    static const bool memo_enabled = [] {
-        const char* v = std::getenv("SOTC_FIND_MEMO");
-        return !v || v[0] != '0';
-    }();
-    const u64 memo_hash = (info.guest_address * 0x9E3779B97F4A7C15ULL) ^
-                          (u64{info.guest_size} * 0xC2B2AE3D27D4EB4FULL) ^
-                          (u64(info.pixel_format) << 7) ^ (u64{info.size.width} << 23) ^
-                          (u64{info.size.height} << 41) ^ u64{exact_fmt};
-    FindMemo& memo = find_memos[(memo_hash ^ (memo_hash >> 31)) % NumFindMemos];
-    // sotc: validate the memo against the generation of its guest_address only: perfect
-    // matches share guest_address (so they share the first page, whose list keeps insertion
-    // order on erase), hence (un)registering images elsewhere cannot change the result.
-    // SOTC_MEMO_ADDR_GEN=0: any register/unregister invalidates every memo.
-    static const bool memo_addr_gen = [] {
-        const char* v = std::getenv("SOTC_MEMO_ADDR_GEN");
-        return !v || v[0] != '0';
-    }();
-    const u64 memo_gen = memo_addr_gen ? u64{addr_gens[AddrGenSlot(info.guest_address)]}
-                                       : image_set_generation;
-    if (memo_enabled && memo.generation == memo_gen &&
-        memo.guest_address == info.guest_address && memo.guest_size == info.guest_size &&
-        memo.size == info.size && memo.pixel_format == info.pixel_format &&
-        memo.type == info.type && memo.exact_fmt == exact_fmt) {
-        Image& image = slot_images[memo.image_id];
-        if (!(image.info.resources < info.resources)) {
-            image.tick_accessed_last = scheduler.CurrentTick();
-            TouchImage(image);
-            return memo.image_id;
+    if (const ImageId memo_id = MemoLookup(info, exact_fmt, memo_writer)) {
+        Image& image = slot_images[memo_id];
+        image.tick_accessed_last = scheduler.CurrentTick();
+        TouchImage(image);
+        if (tail_candidate) {
+            SetMipTailView(desc, -1);
         }
+        return memo_id;
     }
     // sotc: SOTC_IMG_WATCH=<address>: every lookup (texture, storage, render target) that
     // overlaps it, first 200 (diagnostic for the empty AO input behind the black shadows).
@@ -674,35 +736,32 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         }
     }
     ImageIds image_ids;
-    ForEachImageInRegion(info.guest_address, info.guest_size,
-                         [&](ImageId image_id, Image& image) { image_ids.push_back(image_id); });
+    ImageIds tails; // sotc: mip tails under a writer: freed (never written, so nothing is lost)
+    ForEachImageInRegion(info.guest_address, info.guest_size, [&](ImageId image_id, Image& image) {
+        if (writer && image.info.sotc_first_mip &&
+            False(image.flags & ImageFlagBits::GpuModified)) {
+            tails.push_back(image_id);
+        } else {
+            image_ids.push_back(image_id);
+        }
+    });
+    for (const ImageId tail_id : tails) {
+        FreeRebased(tail_id, SotcStats::rebase_writer_freed);
+    }
 
     ImageId image_id{};
 
     // Check for a perfect match first
     for (const auto& cache_id : image_ids) {
-        auto& cache_image = slot_images[cache_id];
-        if (cache_image.info.guest_address != info.guest_address) {
-            continue;
+        if (IsPerfectMatch(slot_images[cache_id].info, info, exact_fmt)) {
+            image_id = cache_id;
         }
-        if (cache_image.info.guest_size != info.guest_size) {
-            continue;
-        }
-        if (cache_image.info.size != info.size) {
-            continue;
-        }
-        if (!IsVulkanFormatCompatible(cache_image.info.pixel_format, info.pixel_format) ||
-            (cache_image.info.type != info.type && info.size != Extent3D{1, 1, 1})) {
-            continue;
-        }
-        if (exact_fmt && info.pixel_format != cache_image.info.pixel_format) {
-            continue;
-        }
-        image_id = cache_id;
     }
     if (image_id && !(slot_images[image_id].info.resources < info.resources)) {
-        memo = {info.guest_address, info.guest_size, info.size, info.pixel_format, info.type,
-                exact_fmt,         memo_gen, image_id}; // sotc: per-address generation
+        MemoSlot(info, exact_fmt, memo_writer) = FindMemo{
+            info.guest_address, info.guest_size, info.size, info.pixel_format, info.type, exact_fmt,
+            memo_writer,        MemoGeneration(info.guest_address),
+            image_id,           gpu_modified_epoch.load(std::memory_order_relaxed)};
     }
 
     // Try to resolve overlaps (if any)
@@ -740,6 +799,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     if (!image_id) {
         image_id = slot_images.insert(instance, runtime, slot_image_views, info);
         RegisterImage(image_id);
+        if (desc.rebase_mip) {
+            MipTailCreated(image_id, desc);
+        }
     }
 
     Image& image = slot_images[image_id];
@@ -747,7 +809,9 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     TouchImage(image);
 
     // If the image requested is a subresource of the image from cache record its location.
-    if (view_mip > 0) {
+    if (tail_candidate) {
+        SetMipTailView(desc, view_mip);
+    } else if (view_mip > 0) {
         desc.view_info.range.base.level = view_mip;
     }
     if (view_slice > 0) {
@@ -760,7 +824,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
     ImageIds image_ids;
     ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
-        if (image.info.guest_address != address) {
+        // sotc: mip tails are never written (the copy and clear fast paths write what this finds).
+        if (image.info.guest_address != address || image.info.sotc_first_mip) {
             return;
         }
         if (ensure_valid && !image.SafeToDownload()) {
@@ -790,7 +855,7 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
     if (desc.type == BindingType::Storage) {
-        image.flags |= ImageFlagBits::GpuModified;
+        MarkWritten(image);
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
             image.info.guest_address != 0) {
             std::unique_lock lk{download_images_mutex};
@@ -804,7 +869,7 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc,
                                           bool update) {
     Image& image = slot_images[image_id];
-    image.flags |= ImageFlagBits::GpuModified;
+    MarkWritten(image);
     if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
         std::unique_lock lk{download_images_mutex};
         download_images.emplace(image_id);
@@ -843,7 +908,7 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
 
 ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
     Image& image = slot_images[image_id];
-    image.flags |= ImageFlagBits::GpuModified;
+    MarkWritten(image);
     image.usage.depth_target = 1u;
     UpdateImage(image_id);
 
@@ -860,7 +925,8 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
         ImageId stencil_id{};
         ForEachImageInRegion(desc.info.stencil_addr, desc.info.stencil_size,
                              [&](ImageId image_id, Image& image) {
-                                 if (image.info.guest_address == desc.info.stencil_addr) {
+                                 if (image.info.guest_address == desc.info.stencil_addr &&
+                                     !image.info.sotc_first_mip) {
                                      stencil_id = image_id;
                                  }
                              });
@@ -884,6 +950,7 @@ void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }
+    const SotcStats::FrameTimer frame_timer{SotcStats::FrameUpload};
     // sotc: RefreshImage always runs under `mutex` (UpdateImage, FindImage -> ExpandImage) and can
     // reach EnsureResident through ObtainBufferForImage; see TryEmergencyCollect.
     ++refresh_depth;
@@ -894,8 +961,13 @@ void TextureCache::RefreshImage(Image& image) {
     RENDERER_TRACE;
     TRACE_HINT(fmt::format("{:x}:{:x}", image.info.guest_address, image.info.guest_size));
 
-    if (True(image.flags & ImageFlagBits::MaybeCpuDirty) &&
-        False(image.flags & ImageFlagBits::CpuDirty)) {
+    const bool maybe_cpu_dirty = True(image.flags & ImageFlagBits::MaybeCpuDirty) &&
+                                 False(image.flags & ImageFlagBits::CpuDirty);
+    if (maybe_cpu_dirty && image.info.sotc_first_mip) {
+        // sotc: mip tails are small enough to land here often, and the hash below only sees the
+        // first texels of the first mip: a CPU write to another mip would be missed. Re-upload.
+        SotcStats::rebase_maybe_dirty.fetch_add(1, std::memory_order_relaxed);
+    } else if (maybe_cpu_dirty) {
         // The image size should be less than page size to be considered MaybeCpuDirty
         // So this calculation should be very uncommon and reasonably fast
         // For now we'll just check up to 64 first pixels
@@ -906,7 +978,10 @@ void TextureCache::RefreshImage(Image& image) {
         const u32 s_w = image.info.props.is_block ? Common::DivCeil(w, 4u) : w;
         const u32 s_h = image.info.props.is_block ? Common::DivCeil(h, 4u) : h;
         const u32 size = s_w * s_h * (image.info.num_bits / 8);
-        const u64 hash = XXH3_64bits(addr, size);
+        const u64 hash = [&] {
+            const SotcStats::FrameTimer hash_timer{SotcStats::FrameHash};
+            return XXH3_64bits(addr, size);
+        }();
         if (image.hash == hash) {
             image.flags &= ~ImageFlagBits::MaybeCpuDirty;
             return;
@@ -930,7 +1005,10 @@ void TextureCache::RefreshImage(Image& image) {
         // Protect GPU modified resources from accidental CPU reuploads.
         if (is_gpu_modified && !is_gpu_dirty) {
             const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
-            const u64 hash = XXH3_64bits(addr + mip_offset, mip_size);
+            const u64 hash = [&] {
+                const SotcStats::FrameTimer hash_timer{SotcStats::FrameHash};
+                return XXH3_64bits(addr + mip_offset, mip_size);
+            }();
             if (image.mip_hashes[m] == hash) {
                 continue;
             }
@@ -1029,7 +1107,11 @@ void TextureCache::RegisterImage(ImageId image_id) {
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
     ForEachPage(image.info.guest_address, image.info.guest_size,
-                [this, image_id](u64 page) { page_table[page].push_back(image_id); });
+                [this, image_id](u64 page) {
+                    // Counted before TrackImage protects the pages (a system call: a barrier).
+                    page_images[page].fetch_add(1, std::memory_order_relaxed);
+                    page_table[page].push_back(image_id);
+                });
 }
 
 void TextureCache::UnregisterImage(ImageId image_id) {
@@ -1054,6 +1136,7 @@ void TextureCache::UnregisterImage(ImageId image_id) {
             return;
         }
         image_ids.erase(vector_it);
+        page_images[page].fetch_sub(1, std::memory_order_relaxed);
     });
 }
 
@@ -1185,6 +1268,7 @@ bool TextureCache::TryEmergencyCollect(u32 level) {
 }
 
 void TextureCache::EmergencyCollect(u32 level) {
+    const SotcStats::FrameTimer frame_timer{SotcStats::FrameGc};
     std::scoped_lock lock{mutex};
     // sotc: parked depth/colour twins are not in the LRU; under pressure they go first.
     lru_cache.ForEachItemBelow(gc_tick + 1, [&](ImageId image_id) {
@@ -1368,6 +1452,7 @@ void TextureCache::Census() {
     last = now;
     u64 gpu_tiled = 0, gpu_linear = 0, streamed = 0, other = 0, below_base = 0, below_minlod = 0;
     u64 live = 0, count = 0;
+    u64 rebased = 0, rebased_count = 0, dropped = 0, projected = 0, projected_hwcnt = 0;
     const u64 current_tick = scheduler.CurrentTick();
     std::scoped_lock lock{mutex};
     lru_cache.ForEachItemBelow(gc_tick, [&](ImageId image_id) {
@@ -1385,6 +1470,15 @@ void TextureCache::Census() {
             return;
         }
         (image.info.sotc_streamed ? streamed : other) += host;
+        if (image.info.sotc_first_mip) {
+            rebased += host;
+            ++rebased_count;
+            dropped += image.info.sotc_dropped_bytes;
+        }
+        projected += image.sotc_shadow_saving;
+        if (image.info.sotc_streamed) {
+            projected_hwcnt += image.sotc_shadow_saving;
+        }
         const auto& info = image.info;
         if (info.guest_size != 0) {
             if (info.sotc_reach_mip > 0) {
@@ -1404,6 +1498,196 @@ void TextureCache::Census() {
     SotcStats::census_below_minlod.store(below_minlod, std::memory_order_relaxed);
     SotcStats::census_live.store(live, std::memory_order_relaxed);
     SotcStats::census_count.store(count, std::memory_order_relaxed);
+    SotcStats::census_rebased.store(rebased, std::memory_order_relaxed);
+    SotcStats::census_rebased_count.store(rebased_count, std::memory_order_relaxed);
+    SotcStats::census_dropped.store(dropped, std::memory_order_relaxed);
+    SotcStats::census_projected.store(projected, std::memory_order_relaxed);
+    SotcStats::census_projected_hwcnt.store(projected_hwcnt, std::memory_order_relaxed);
+}
+
+bool TextureCache::IsSafeToDelete(const Image& image) const {
+    return scheduler.CurrentTick() - image.tick_accessed_last > NumFramesBeforeRemoval;
+}
+
+TextureCache::FindMemo& TextureCache::MemoSlot(const ImageInfo& info, bool exact_fmt,
+                                               bool writer) {
+    const u64 memo_hash = (info.guest_address * 0x9E3779B97F4A7C15ULL) ^
+                          (u64{info.guest_size} * 0xC2B2AE3D27D4EB4FULL) ^
+                          (u64(info.pixel_format) << 7) ^ (u64{info.size.width} << 23) ^
+                          (u64{info.size.height} << 41) ^ u64{exact_fmt} ^ (u64{writer} << 1);
+    return find_memos[(memo_hash ^ (memo_hash >> 31)) % NumFindMemos];
+}
+
+// sotc: a memo is validated against the generation of its guest_address only: perfect matches
+// share guest_address (so they share the first page, whose list keeps insertion order on erase),
+// hence (un)registering images elsewhere cannot change the result. SOTC_MEMO_ADDR_GEN=0: any
+// register/unregister invalidates every memo.
+u64 TextureCache::MemoGeneration(VAddr address) const {
+    static const bool memo_addr_gen = [] {
+        const char* v = std::getenv("SOTC_MEMO_ADDR_GEN");
+        return !v || v[0] != '0';
+    }();
+    return memo_addr_gen ? u64{addr_gens[AddrGenSlot(address)]} : image_set_generation;
+}
+
+ImageId TextureCache::MemoLookup(const ImageInfo& info, bool exact_fmt, bool writer) {
+    static const bool memo_enabled = [] {
+        const char* v = std::getenv("SOTC_FIND_MEMO");
+        return !v || v[0] != '0';
+    }();
+    const FindMemo& memo = MemoSlot(info, exact_fmt, writer);
+    if (!memo_enabled || memo.generation != MemoGeneration(info.guest_address) ||
+        memo.guest_address != info.guest_address || memo.guest_size != info.guest_size ||
+        !(memo.size == info.size) || memo.pixel_format != info.pixel_format ||
+        memo.type != info.type || memo.exact_fmt != exact_fmt || memo.writer != writer) {
+        return {};
+    }
+    const Image& image = slot_images[memo.image_id];
+    // A mip tail's decision also depends on which images overlapping it are GPU-written.
+    if (image.info.resources < info.resources ||
+        (image.info.sotc_first_mip &&
+         memo.gpu_epoch != gpu_modified_epoch.load(std::memory_order_relaxed))) {
+        return {};
+    }
+    return memo.image_id;
+}
+
+// sotc: mip-tail images (SOTC_MIP_TAIL). A read-only T# with base_level b > 0 never samples mips
+// 0..b-1, yet its image held the whole chain (the census counts these bytes as "below base
+// mip"). A candidate gets an image of mips b.. only (its tail, ImageInfo::RebaseToMip) unless
+// that is unsafe. The rule: a tail image is never written by the GPU. Writer lookups free the
+// tails they overlap (FindImage), FindImageFromRange and the stencil search skip them, and a
+// tail is refused while an image overlapping it is GPU-written (the data is in that image, not
+// in memory). A full chain still in use keeps being used (no duplicate of a live texture); an
+// idle one is freed by the overlap resolution as a chance overlap. Decided on every lookup
+// from the saved infos (the memo makes it one probe in the steady state). Returns whether
+// `desc.info` is the tail.
+bool TextureCache::DecideRebase(ImageDesc& desc, bool exact_fmt) {
+    if (desc.rebased_now) {
+        // A re-find of the same binding (second pass): start from the full chain again.
+        std::swap(desc.info, *desc.other_info);
+        desc.rebased_now = false;
+    }
+    if (!desc.other_info) {
+        return false;
+    }
+    const auto use_tail = [&desc] {
+        std::swap(desc.info, *desc.other_info);
+        desc.rebased_now = true;
+        return true;
+    };
+    const ImageInfo& tail = *desc.other_info;
+    if (MemoLookup(tail, exact_fmt, false)) {
+        return use_tail();
+    }
+    if (MemoLookup(desc.info, exact_fmt, false)) {
+        SotcStats::rebase_reuse_full.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    ImageIds ids;
+    ForEachImageInRegion(tail.guest_address, tail.guest_size,
+                         [&](ImageId image_id, Image&) { ids.push_back(image_id); });
+    ImageId match{};
+    for (const ImageId image_id : ids) {
+        if (IsPerfectMatch(slot_images[image_id].info, tail, exact_fmt)) {
+            match = image_id;
+        }
+    }
+    bool any_gpu = false;
+    for (const ImageId image_id : ids) {
+        any_gpu |= image_id != match &&
+                   True(slot_images[image_id].flags & ImageFlagBits::GpuModified);
+    }
+    if (any_gpu) {
+        SotcStats::rebase_skip_gpu.fetch_add(1, std::memory_order_relaxed);
+        // A tail made before the GPU wrote over it is stale now.
+        if (match && slot_images[match].info.sotc_first_mip &&
+            False(slot_images[match].flags & ImageFlagBits::GpuModified)) {
+            FreeRebased(match, SotcStats::rebase_writer_freed);
+        }
+        return false;
+    }
+    if (match) {
+        return use_tail();
+    }
+    const VAddr full_address = desc.info.guest_address;
+    bool live_full = false;
+    ForEachImageInRegion(full_address, 1, [&](ImageId, Image& image) {
+        live_full |= image.info.guest_address == full_address && !IsSafeToDelete(image);
+    });
+    if (live_full) {
+        SotcStats::rebase_skip_live_full.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    return use_tail();
+}
+
+void TextureCache::MipTailCreated(ImageId image_id, const ImageDesc& desc) {
+    Image& image = slot_images[image_id];
+    const ImageInfo& info = image.info;
+    if (info.sotc_first_mip) {
+        // A new tail: older idle tails of the same chain go (the T#'s base_level moved, and
+        // nothing merges multi-level images, so they would pile up).
+        SotcStats::rebase_created.fetch_add(1, std::memory_order_relaxed);
+        const VAddr chain = info.guest_address - info.sotc_dropped_bytes;
+        ImageIds stale;
+        ForEachImageInRegion(chain, info.guest_size + info.sotc_dropped_bytes,
+                             [&](ImageId other_id, Image& other) {
+                                 if (other_id != image_id && other.info.sotc_first_mip &&
+                                     other.info.guest_address - other.info.sotc_dropped_bytes ==
+                                         chain &&
+                                     IsSafeToDelete(other) &&
+                                     False(other.flags & ImageFlagBits::GpuModified)) {
+                                     stale.push_back(other_id);
+                                 }
+                             });
+        for (const ImageId stale_id : stale) {
+            FreeRebased(stale_id, SotcStats::rebase_dedup_freed);
+        }
+        return;
+    }
+    // A full chain for a candidate: what its tail would save (census "projected"), unless an
+    // image overlapping the tail is GPU-written (the tail would be refused).
+    ImageInfo tail = info;
+    if (info.guest_size == 0 || !tail.RebaseToMip(desc.rebase_mip)) {
+        return;
+    }
+    bool gpu = false;
+    ForEachImageInRegion(tail.guest_address, tail.guest_size, [&](ImageId other_id, Image& other) {
+        gpu |= other_id != image_id && True(other.flags & ImageFlagBits::GpuModified);
+    });
+    if (!gpu) {
+        image.sotc_shadow_saving =
+            image.GetHostImageSize() * tail.sotc_dropped_bytes / info.guest_size;
+    }
+}
+
+void TextureCache::FreeRebased(ImageId image_id, std::atomic<std::uint64_t>& counter) {
+    Image& image = slot_images[image_id];
+    if (image.binding.is_bound || image.binding.is_target) {
+        image.binding.needs_rebind = 1u;
+    }
+    FreeImage(image_id);
+    counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+void TextureCache::MarkWritten(Image& image) {
+    // sotc: the writer's FindImage freed the mip tails it overlapped, but another binding of the
+    // same draw can create one after it. On an image's first GPU write over a tail, memoized
+    // tail decisions are made again (they refuse GPU-written overlaps). Writes found otherwise
+    // (twins converted every frame) leave the epoch alone.
+    if (MipTailMode() != 0 && False(image.flags & ImageFlagBits::GpuModified)) {
+        std::scoped_lock lk{mutex};
+        bool over_tail = false;
+        ForEachImageInRegion(image.info.guest_address, image.info.guest_size,
+                             [&](ImageId, Image& other) {
+                                 over_tail |= &other != &image && other.info.sotc_first_mip != 0;
+                             });
+        if (over_tail) {
+            gpu_modified_epoch.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    MarkGpuModified(image, false);
 }
 
 void TextureCache::RunGarbageCollector() {

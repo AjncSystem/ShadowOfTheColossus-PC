@@ -7,6 +7,7 @@
 #include <sys/resource.h>
 #endif
 #include "bbport_toggles.h"
+#include "video_core/sotc_stats.h"
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -106,10 +107,12 @@ void MemoryManager::SetRasterizer(Vulkan::Rasterizer* rasterizer_) {
                 const char* v = std::getenv("SOTC_MAP_INVALIDATE");
                 return !v || v[0] != '0';
             }();
+            if (SotcStats::kCmdStats) SotcStats::inv_map.fetch_add(size, std::memory_order_relaxed);
             if (map_invalidate) r->InvalidateMemory(address, size);
         },
         [](uintptr_t address, uint64_t size) { Memory::Instance()->GetRasterizer()->UnmapMemory(address, size); },
         [](uintptr_t address, uint64_t size) {
+            if (SotcStats::kCmdStats) SotcStats::inv_protect.fetch_add(size, std::memory_order_relaxed);
             Memory::Instance()->GetRasterizer()->InvalidateMemory(address, size);
         });
 }
@@ -199,7 +202,15 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size, u
 void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms) {
     BbStats::Timer timer{BbStats::t_protect};
     // sotc: no protect call/page counters: nothing read them, and every protect (CP re-protects
-    // and guest-thread fault unprotects) paid 2-4 lock xadds on shared cache lines.
+    // and guest-thread fault unprotects) paid 2-4 lock xadds on shared cache lines. Counted
+    // only for the SOTC sys line (SOTC_CMD_STATS).
+    if (SotcStats::kCmdStats) {
+        SotcStats::sys_protects.fetch_add(1, std::memory_order_relaxed);
+        SotcStats::sys_protect_bytes.fetch_add(size, std::memory_order_relaxed);
+        if (True(perms & MemoryPermission::Write)) {
+            SotcStats::sys_unprotects.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     runtime_memory_gpu_protect(virtual_addr, size, True(perms & MemoryPermission::Read),
                                True(perms & MemoryPermission::Write));
 }
@@ -290,7 +301,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
     if (config->user_dir) setenv("BB_GPU_USER_DIR", config->user_dir, 0);
 #endif
     Core::Emulator::FillElfInfo(*config);
-    const std::string title = config->title ? config->title : "Bloodborne";
+    const std::string title = config->title ? config->title : "Shadow of the Colossus";
     const s32 width = config->width, height = config->height;
     g_window_thread = std::thread([title, width, height] {
         Common::SetCurrentThreadName("bb:window");

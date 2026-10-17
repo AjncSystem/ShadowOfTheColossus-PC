@@ -41,6 +41,19 @@ extern "C" void runtime_memory_describe(uintptr_t address, char* out, size_t cap
 #else
 #include <windows.h>
 #endif
+#include <string>
+
+// sotc: image base for module-relative addresses in logs (0 where unknown).
+#ifdef _WIN64
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+static u64 ImageBaseAddress() {
+    return reinterpret_cast<u64>(&__ImageBase);
+}
+#else
+static u64 ImageBaseAddress() {
+    return 0;
+}
+#endif
 
 #ifdef __linux__
 #include <thread>
@@ -321,6 +334,7 @@ struct PageManager::Impl {
 
         const auto release_pending = [&] {
             if (range_pages > 0) {
+                if (SotcStats::kCmdStats) SotcStats::sys_protect_src[0].fetch_add(1, std::memory_order_relaxed);
                 Protect(range_begin << PM_PAGE_BITS, range_pages << PM_PAGE_BITS, perms);
                 range_pages = 0;
                 potential_pages = 0;
@@ -400,6 +414,7 @@ struct PageManager::Impl {
 
         const auto release_pending = [&] {
             if (range_pages > 0) {
+                if (SotcStats::kCmdStats) SotcStats::sys_protect_src[1].fetch_add(1, std::memory_order_relaxed);
                 Protect(range_begin << PM_PAGE_BITS, range_pages << PM_PAGE_BITS, perms);
                 range_pages = 0;
                 potential_pages = 0;
@@ -633,8 +648,28 @@ struct SignalImpl : public PageManager::Impl {
         RENDERER_TRACE;
         auto* memory = Core::Memory::Instance();
         auto& impl = memory->GetAddressSpace();
-        ASSERT_MSG(perms != Core::MemoryPermission::Write,
-                   "Attempted to protect region as write-only which is not a valid permission");
+        // sotc: write-only means pages both CPU- and GPU-modified (the asserting opt4 crash, ~1 in
+        // 12 Shrine runs). Protect them fully instead: an access faults, the fault reads the GPU
+        // data back, and the state settles. The first occurrences log who asked.
+        if (perms == Core::MemoryPermission::Write) [[unlikely]] {
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 8) {
+                void* frames[12]{};
+                u32 count = 0;
+#ifdef _WIN64
+                count = CaptureStackBackTrace(1, 12, frames, nullptr);
+#endif
+                std::string where;
+                for (u32 i = 0; i < count; ++i) {
+                    where += fmt::format(" {:#x}", reinterpret_cast<u64>(frames[i]) -
+                                                       ImageBaseAddress());
+                }
+                LOG_ERROR(Render, "Write-only protection of {:#x}+{:#x} (CPU- and GPU-modified "
+                          "pages), protected fully; stack (image offsets):{}", address, size,
+                          where);
+            }
+            perms = Core::MemoryPermission::None;
+        }
         // sotc: the walker's clean-load bitmap follows the read protection: set before
         // protecting, cleared after unprotecting (a stale bit only costs a clean load).
         const bool read_protected = False(perms & Core::MemoryPermission::Read);

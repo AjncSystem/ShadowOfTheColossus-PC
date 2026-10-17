@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+
 #include <chrono>
 #include <shared_mutex>
 #include <deque>
@@ -113,6 +115,12 @@ public:
     /// back costs no readback. False (nothing done) otherwise.
     bool TryReplaceFromCpu(VAddr addr, const void* data, u64 size);
 
+    /// sotc: TryReplaceFromCpu that also copies `data` into the resident arena right away, so
+    /// the range is not marked CPU-written: no unprotect, upload and protect again later (two
+    /// page protection system calls per replaced range). Data the guest never writes itself
+    /// (fill-shader tables written by the command processor). Not resident: TryReplaceFromCpu.
+    bool TryWriteThroughFromCpu(VAddr addr, const void* data, u64 size);
+
     /// Byte-precise: true when a written binding covered any byte of the range since its last
     /// readback. Readbacks copy only these bytes, so the backing holds every other byte.
     /// Command processor thread only.
@@ -138,6 +146,15 @@ public:
 
     /// Releases the arena memory backing a range the guest unmapped. GPU thread only.
     void ReleaseMemory(VAddr device_addr, u64 size);
+
+    /// sotc: gives back arena allocations whose blocks were not bound for a while and hold no
+    /// GPU-written data, once resident arena memory passes SOTC_ARENA_EVICT_MB. Called between
+    /// commands outside a render pass; true when it submitted (it waits for the GPU).
+    bool MaybeEvictCold(std::chrono::steady_clock::time_point now);
+
+    /// sotc: a shader reached [addr, addr + size) through a pointer and faulted: blocks of it
+    /// that MaybeEvictCold gave back stay resident from now on. Before the rebind.
+    void NoteFaultRebind(VAddr addr, u64 size);
 
 private:
     struct ArenaBinds {
@@ -201,6 +218,9 @@ private:
         boost::container::small_vector<ReadbackItem, 16> pending;
     };
     void BeginAsyncReadback(AsyncReadback& readback);
+    /// sotc: marks bytes a guest write fault asked for CPU-modified, unless pages of them
+    /// still hold GPU data (see the definition).
+    void MarkWrittenByGuest(VAddr addr, u64 size);
     void FinishAsyncReadback(AsyncReadback& readback);
     AsyncReadback* FindInflightReadback(VAddr addr, u64 size);
     void MarkInflightReadbacksDirty(VAddr addr, u64 size);
@@ -250,6 +270,14 @@ private:
     /// sotc: bumped at every resident_ranges.Add/Subtract. SynchronizeDmaBuffers rebuilds its
     /// merged runs only when this (or the arena count) changed since the last rebuild.
     u64 resident_version{};
+    /// sotc: block ranges found resident at a resident_version (EnsureResident).
+    struct ResidentCacheEntry {
+        u64 version{~u64{0}};
+        u64 first{};
+        u64 end{};
+        u16 epoch{}; ///< sotc: use epoch its blocks were last stamped with
+    };
+    std::array<ResidentCacheEntry, 64> resident_cache{};
     u64 dma_runs_version = ~0ULL;
     size_t dma_runs_arenas{};
     u64 dma_runs_ranges{};
@@ -303,6 +331,32 @@ private:
 
     /// Number of resident blocks still bound to each backing allocation.
     std::unordered_map<VkDeviceMemory, u64> backing_blocks;
+    /// sotc: size of each backing allocation (resident arena memory accounting).
+    std::unordered_map<VkDeviceMemory, u64> backing_bytes;
+    /// sotc: unbinds resident block ranges (zeroing their page table entries) and frees the
+    /// allocations left without blocks. The GPU must no longer use them.
+    void UnbindResident(std::span<const Backing> released);
+    /// sotc: per arena block, the use epoch (seconds, wrapping, 0 = never) of its last bind.
+    u16* block_last_use{};
+    /// sotc: blocks MaybeEvictCold gave back and nothing bound again yet.
+    IntervalList<> evicted_ranges;
+    /// sotc: evicted blocks a shader faulted back in; never evicted again.
+    IntervalList<> pinned_ranges;
+    /// sotc: allocations whose read-back did not match guest memory, tried again after this.
+    std::unordered_map<VkDeviceMemory, std::chrono::steady_clock::time_point> evict_retry;
+    u16 use_epoch{1};
+    /// sotc: sets use_epoch from the clock (once per submit and per eviction check).
+    void AdvanceUseEpoch(std::chrono::steady_clock::time_point now) noexcept {
+        const auto seconds =
+            std::chrono::duration_cast<std::chrono::seconds>(now - epoch_start).count();
+        use_epoch = static_cast<u16>(seconds % 65535 + 1); // 0 = never bound
+    }
+    std::chrono::steady_clock::time_point epoch_start{};
+    std::chrono::steady_clock::time_point next_evict_check{};
+    /// sotc: the arena slab EnsureResident hands block runs out of, its size and use (bytes).
+    vk::DeviceMemory arena_slab{};
+    u64 arena_slab_size{};
+    u64 arena_slab_used{};
 
     u32 arena_memory_type_index{};
     std::optional<u32> arena_fallback_memory_type_index;

@@ -268,6 +268,7 @@ private:
         u64 version{~u64{0}};
         u64 first{};
         u64 end{};
+        u16 epoch{}; ///< sotc: use epoch its blocks were last stamped with
     };
     std::array<ResidentCacheEntry, 64> resident_cache{};
     u64 dma_runs_version = ~0ULL;
@@ -335,6 +336,12 @@ private:
     /// sotc: allocations whose read-back did not match guest memory, tried again after this.
     std::unordered_map<VkDeviceMemory, std::chrono::steady_clock::time_point> evict_retry;
     u16 use_epoch{1};
+    /// sotc: sets use_epoch from the clock (once per submit and per eviction check).
+    void AdvanceUseEpoch(std::chrono::steady_clock::time_point now) noexcept {
+        const auto seconds =
+            std::chrono::duration_cast<std::chrono::seconds>(now - epoch_start).count();
+        use_epoch = static_cast<u16>(seconds % 65535 + 1); // 0 = never bound
+    }
     std::chrono::steady_clock::time_point epoch_start{};
     std::chrono::steady_clock::time_point next_evict_check{};
     /// sotc: the arena slab EnsureResident hands block runs out of, its size and use (bytes).

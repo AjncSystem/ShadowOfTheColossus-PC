@@ -977,15 +977,23 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     // sotc: binds check the same ranges thousands of times a frame, each a search of ~2,600
     // resident ranges (~2% of the command processor): ranges found resident are remembered
     // (64 slots by first block) until the resident set changes (resident_version).
-    // sotc: the bind keeps its blocks out of MaybeEvictCold for SOTC_ARENA_EVICT_IDLE_S.
-    for (u64 block = first_block; block <= last_block; ++block) {
-        block_last_use[block] = use_epoch;
-    }
+    // sotc: the bind keeps its blocks out of MaybeEvictCold for SOTC_ARENA_EVICT_IDLE_S. A
+    // cached range is stamped as a whole once per epoch (a 64 MiB binding is 1,024 blocks).
+    const auto stamp = [this](u64 first, u64 end) {
+        for (u64 block = first; block < end; ++block) {
+            block_last_use[block] = use_epoch;
+        }
+    };
     auto& cached = resident_cache[(first_block * 0x9E3779B97F4A7C15ull) >> 58];
     if (cached.version == resident_version && first_block >= cached.first &&
         last_block < cached.end) {
+        if (cached.epoch != use_epoch) {
+            stamp(cached.first, cached.end);
+            cached.epoch = use_epoch;
+        }
         return;
     }
+    stamp(first_block, last_block + 1);
     u32 resident_blocks{};
     IntervalList bind_ranges;
     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
@@ -994,7 +1002,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     });
 
     if (bind_ranges.Empty()) {
-        cached = {resident_version, first_block, last_block + 1};
+        cached = {resident_version, first_block, last_block + 1, use_epoch};
         return;
     }
     if (!evicted_ranges.Empty()) {
@@ -1265,14 +1273,20 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
     if (first_block >= end_block) {
         return;
     }
+    evicted_ranges.Subtract(first_block, end_block);
+    pinned_ranges.Subtract(first_block, end_block);
     boost::container::small_vector<Backing, 16> released;
-    resident_ranges.ForEachInRange(first_block, end_block, [&](const Backing& backing) {
-        const u64 start = std::max(first_block, backing.start);
-        const u64 end = std::min(end_block, backing.end);
-        if (start < end) {
-            released.push_back(backing.SubRange(start, end));
-        }
-    });
+    const auto collect = [&] {
+        released.clear();
+        resident_ranges.ForEachInRange(first_block, end_block, [&](const Backing& backing) {
+            const u64 start = std::max(first_block, backing.start);
+            const u64 end = std::min(end_block, backing.end);
+            if (start < end) {
+                released.push_back(backing.SubRange(start, end));
+            }
+        });
+    };
+    collect();
     if (released.empty()) {
         return;
     }
@@ -1280,14 +1294,18 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
     // ordered against earlier submissions: finish that work before unbinding, or the GPU
     // writes to unbound memory (WriteInvalid, device lost). Unmaps are rare, the sync is cheap.
     scheduler.Finish();
+    // sotc: the deferred operations Finish ran (fault buffer rebinds) may have bound more of
+    // the range, and their binds must not share the unbind's sparse batch.
+    collect();
+    if (!pending_binds.empty()) {
+        scheduler.Flush();
+    }
     UnbindResident(released);
     std::erase_if(hot_readbacks, [&](const HotReadback& hot) {
         return hot.addr < (end_block << block_shift) &&
                (first_block << block_shift) < hot.addr + hot.size;
     });
     resident_ranges.Subtract(first_block, end_block);
-    evicted_ranges.Subtract(first_block, end_block);
-    pinned_ranges.Subtract(first_block, end_block);
     ++resident_version; // sotc: invalidates the merged DMA runs
     gpu_modified_ranges.Subtract(first_block << block_shift,
                                  (end_block - first_block) << block_shift);
@@ -1371,10 +1389,7 @@ bool BufferCache::MaybeEvictCold(std::chrono::steady_clock::time_point now) {
         return false;
     }
     next_evict_check = now + std::chrono::seconds(2);
-    // Epoch 0 marks blocks never bound; it is skipped when the counter wraps.
-    const auto seconds =
-        std::chrono::duration_cast<std::chrono::seconds>(now - epoch_start).count();
-    use_epoch = static_cast<u16>(seconds % 65535 + 1);
+    AdvanceUseEpoch(now);
     const u64 resident = SotcStats::arena_bytes.load(std::memory_order_relaxed);
     if (limit == 0 || resident <= limit) {
         return false;
@@ -1413,6 +1428,9 @@ bool BufferCache::MaybeEvictCold(std::chrono::steady_clock::time_point now) {
         }
         const auto bytes = backing_bytes.find(memory);
         candidate.bytes = bytes != backing_bytes.end() ? bytes->second : 0;
+        if (candidate.bytes > step) {
+            continue; // one read-back and compare per check stays within `step`
+        }
         order.emplace_back(candidate.age, memory);
     }
     if (order.empty()) {
@@ -1475,8 +1493,10 @@ bool BufferCache::MaybeEvictCold(std::chrono::steady_clock::time_point now) {
                 if (memory_tracker->IsRegionCpuModified(addr, guest.size())) {
                     continue; // uploaded at the next bind anyway
                 }
-                equal = memory->TryCopySparseMemory(addr, guest.data(), guest.size()) &&
-                        std::memcmp(download.mapped + piece.offset + at, guest.data(),
+                if (!memory->TryCopySparseMemory(addr, guest.data(), guest.size())) {
+                    continue; // unmapped: nothing can read it
+                }
+                equal = std::memcmp(download.mapped + piece.offset + at, guest.data(),
                                     guest.size()) == 0;
             }
         }
@@ -1490,6 +1510,19 @@ bool BufferCache::MaybeEvictCold(std::chrono::steady_clock::time_point now) {
         released.insert(released.end(), ranges.begin(), ranges.end());
     }
     staging_pool.FreeDeferred(download);
+    // Binds queued by Finish's deferred operations (fault rebinds, arena migration) must not
+    // share the unbind's sparse batch; the chosen ranges must still be resident as chosen.
+    if (!pending_binds.empty()) {
+        scheduler.Flush();
+    }
+    std::erase_if(released, [&](const Backing& range) {
+        bool same = false;
+        resident_ranges.ForEachInRange(range.start, range.end, [&](const Backing& now_range) {
+            same |= now_range.start <= range.start && range.end <= now_range.end &&
+                    now_range.memory == range.memory;
+        });
+        return !same;
+    });
     for (const Backing& range : released) {
         const VAddr addr = range.start << block_shift;
         const u64 size = (range.end - range.start) << block_shift;
@@ -1524,6 +1557,8 @@ void BufferCache::NoteFaultRebind(VAddr addr, u64 size) {
 }
 
 void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
+    // sotc: binds stamp blocks with use_epoch; keep it current even when no eviction check runs.
+    AdvanceUseEpoch(std::chrono::steady_clock::now());
     if (pending_binds.empty()) {
         return;
     }

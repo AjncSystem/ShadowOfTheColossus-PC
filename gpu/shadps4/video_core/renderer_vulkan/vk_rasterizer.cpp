@@ -838,6 +838,10 @@ void Rasterizer::FlushPeriodic() {
         return;
     }
     if (every == 0) {
+        // sotc: without periodic submits, look for cold arena memory every 1024 commands.
+        if ((++evict_poll & 1023) == 0 && !scheduler.IsRendering()) {
+            buffer_cache.MaybeEvictCold(std::chrono::steady_clock::now());
+        }
         return;
     }
     // sotc: submit by recording time instead (SOTC_FLUSH_US, default 1000 where the periodic

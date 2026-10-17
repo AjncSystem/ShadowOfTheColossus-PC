@@ -530,6 +530,11 @@ void VideoOutDriver::Flip(const Request& req) {
                         SotcStats::async_compute_waits.load(std::memory_order_relaxed)),
                     SotcStats::async_compute_wait_ns.load(std::memory_order_relaxed) / 1e6);
             }
+            if (const uint64_t faults =
+                    SotcStats::srt_walker_faults.load(std::memory_order_relaxed)) {
+                std::fprintf(stderr, "SOTC SRT walker loads that read zero: %llu\n",
+                             static_cast<unsigned long long>(faults));
+            }
             const bool cmd_stats = SotcStats::kCmdStats; // sotc: as the counters (sotc_stats.h)
             if (cmd_stats && flips) {
                 double k[6];

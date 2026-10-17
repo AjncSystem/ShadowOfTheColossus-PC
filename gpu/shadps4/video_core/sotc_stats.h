@@ -81,6 +81,8 @@ inline std::atomic<uint64_t> async_compute_built{0};
 inline std::atomic<uint64_t> async_compute_build_ns{0}; ///< worker time building them
 inline std::atomic<uint64_t> async_compute_waits{0};    ///< binds the recording thread waited for
 inline std::atomic<uint64_t> async_compute_wait_ns{0};
+/// sotc: SRT walker loads that faulted (null or unmapped table pointer) and read zero, total.
+inline std::atomic<uint64_t> srt_walker_faults{0};
 inline std::atomic<uint64_t> image_bytes{0};    ///< live texture cache and host pass images
 inline std::atomic<uint64_t> image_count{0};
 inline std::atomic<uint64_t> gc_freed{0};       ///< images freed by the texture garbage collector

@@ -15,7 +15,8 @@ namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 // Above both lines before the upstream merge: generation changed, so old caches are dropped.
 static constexpr u32 ShaderBinaryVersion = 31u;
-static constexpr u32 ShaderMetaVersion = 20u;
+// sotc: 21 drops metas whose walker code a fault had patched (draw thread builds before it).
+static constexpr u32 ShaderMetaVersion = 21u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization
 

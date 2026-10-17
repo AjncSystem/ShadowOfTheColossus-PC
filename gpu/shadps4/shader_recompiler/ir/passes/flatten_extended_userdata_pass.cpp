@@ -227,8 +227,13 @@ bool SrtWalkerSignalHandler(void* context, void* fault_address) {
     // Fill nops
     memset(code_patch + patch_size, 0x90, len - patch_size);
 
-    LOG_WARNING(Render_Recompiler, "Patched SRT walker at {}, fault address {}", code,
-                fault_address);
+    // sotc: first few only: hundreds per session while a save loads, each a stderr line (a pipe to
+    // the launcher, milliseconds each) from the faulting guest thread.
+    static std::atomic<u32> patched_shown{0};
+    if (patched_shown.fetch_add(1, std::memory_order_relaxed) < 4) {
+        LOG_WARNING(Render_Recompiler, "Patched SRT walker at {}, fault address {}", code,
+                    fault_address);
+    }
 
     return true;
 }
@@ -689,8 +694,12 @@ static bool ComputeOffset(Xbyak::CodeGenerator& c, Xbyak::Reg32 reg, PassInfo& p
         ABORT_ON_FAILURE(EmitComputeOffsetBitFieldUExtract(c, reg, pass_info, inst));
         return true;
     default:
-        LOG_ERROR(Render_Recompiler, "Unexpected instruction for offset computation, {}",
-                  magic_enum::enum_name(inst->GetOpcode()));
+        // sotc: first few only: ~1000 per session while shaders translate on the draw path (the
+        // walker falls back), each a stderr line costing milliseconds there.
+        if (static std::atomic<u32> shown{0}; shown.fetch_add(1, std::memory_order_relaxed) < 4) {
+            LOG_ERROR(Render_Recompiler, "Unexpected instruction for offset computation, {}",
+                      magic_enum::enum_name(inst->GetOpcode()));
+        }
         return false;
     }
 }

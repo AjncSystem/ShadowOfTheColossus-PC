@@ -217,6 +217,9 @@ private:
         boost::container::small_vector<ReadbackItem, 16> pending;
     };
     void BeginAsyncReadback(AsyncReadback& readback);
+    /// sotc: marks bytes a guest write fault asked for CPU-modified, unless pages of them
+    /// still hold GPU data (see the definition).
+    void MarkWrittenByGuest(VAddr addr, u64 size);
     void FinishAsyncReadback(AsyncReadback& readback);
     AsyncReadback* FindInflightReadback(VAddr addr, u64 size);
     void MarkInflightReadbacksDirty(VAddr addr, u64 size);

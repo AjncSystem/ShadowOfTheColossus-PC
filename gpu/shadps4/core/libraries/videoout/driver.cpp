@@ -470,6 +470,16 @@ void VideoOutDriver::Flip(const Request& req) {
                              static_cast<unsigned long long>(
                                  SotcStats::vram_emergency.exchange(0)));
             }
+            // sotc: write-fault readbacks whose pages were still GPU-modified (totals).
+            if (const uint64_t pending = SotcStats::write_fault_gpu_pending.load(),
+                stale = SotcStats::write_fault_stale_gpu.load();
+                pending || stale) {
+                std::fprintf(stderr,
+                             "SOTC write faults over GPU data: left protected %llu, stale page "
+                             "bits cleared %llu\n",
+                             static_cast<unsigned long long>(pending),
+                             static_cast<unsigned long long>(stale));
+            }
             // sotc: cold buffer arena memory given back (BufferCache::MaybeEvictCold), totals.
             if (const uint64_t runs = SotcStats::arena_evict_runs.load(std::memory_order_relaxed)) {
                 std::fprintf(

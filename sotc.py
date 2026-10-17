@@ -168,9 +168,9 @@ def main():
         # Without the launcher: the culling settings of Pink-shadPS4 (same image, fewer GPU waits).
         cvars = 'doIndexBufferCulling=0 doSunShadowIndexBufferCulling=0'
     run_script('sotc_modes.py', source, '--out', out, '--modes', modes, '--cvars', cvars)
-    if 'fps60' in modes.lower():
-        # The game waits for vblanks: at 60 Hz an uncapped frame still rounds up to 30 FPS.
-        env.setdefault('BB_VBLANK_HZ', '120')
+    # The game waits for vblanks: at 60 Hz an uncapped frame (fps60, or F7 in game) still rounds
+    # up to 30 FPS. With the cap, 120 Hz only shows a late frame sooner.
+    env.setdefault('BB_VBLANK_HZ', '120')
 
     probe = find_probe()
     # Development builds run from the MSYS2 tree: its CLANG64 DLLs (SDL3, FFmpeg, ...).

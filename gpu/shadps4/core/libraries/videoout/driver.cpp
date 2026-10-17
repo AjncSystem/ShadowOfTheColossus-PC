@@ -21,6 +21,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/vk_framegen.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/sotc_fps_cap.h"
 #include "video_core/sotc_stats.h"
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
@@ -826,13 +827,15 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         }();
         static u64 last_flip_count = 0;
         auto& vblank_status = main_port.vblank_status;
+        // sotc: the game's rate, or none when uncapped (F7, sotc_fps_cap.h).
+        const int flip_rate = SotcFpsCap::EffectiveRate();
         bool take_request;
         if (!flip_pacing) {
-            take_request = vblank_status.count % (main_port.flip_rate + 1) == 0;
-        } else if (main_port.flip_rate <= 0 || !flipped) {
+            take_request = vblank_status.count % (flip_rate + 1) == 0;
+        } else if (flip_rate <= 0 || !flipped) {
             take_request = true;
         } else {
-            const u64 interval = u64(main_port.flip_rate + 1) * vblanks_per_60hz;
+            const u64 interval = u64(flip_rate + 1) * vblanks_per_60hz;
             take_request = vblank_status.count - last_flip_vblank >= interval;
         }
         if (take_request) {

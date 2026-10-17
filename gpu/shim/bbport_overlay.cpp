@@ -17,6 +17,7 @@
 #include "video_core/renderer_vulkan/vk_framegen.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/sotc_fps_cap.h"
 #include "video_core/sotc_stats.h"
 
 // DejaVu Sans (Cyrillic), embedded (third_party/fonts, Bitstream Vera license).
@@ -657,7 +658,8 @@ void FpsCounter() {
                            SotcStats::vram_budget.load(std::memory_order_relaxed) / 1073741824.0);
         ImGui::SameLine();
     }
-    ImGui::TextDisabled("F10 : masquer   F8 : génération d'images");
+    ImGui::TextDisabled("F7 : %s   F8 : génération d'images   F10 : masquer",
+                        SotcFpsCap::uncapped ? "FPS débloqués" : "bloqué à 30");
     ImGui::End();
 }
 
@@ -760,6 +762,12 @@ bool HandleEvent(const SDL_Event& event) {
         return false;
     }
     ImGuiIO& io = ImGui::GetIO();
+    // sotc: F7 caps the game at 30 FPS or uncaps it (sotc_fps_cap.h).
+    // The new state is shown at the next frame (Render).
+    if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F7 && !event.key.repeat) {
+        SotcFpsCap::Toggle();
+        return true;
+    }
     // sotc: F8 switches the frame generation mode (off, DLSS-G, FSR 3; vk_framegen.h).
     // The new mode is shown at the next frame (Render).
     if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F8 && !event.key.repeat) {
@@ -1060,6 +1068,14 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
         shown_mode = mode;
         std::scoped_lock lock{imgui_mutex};
         toast_text = std::string("Génération d'images : ") + Vulkan::FrameGen::Name(mode);
+        toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
+    }
+    // The 30 FPS cap was switched (F7).
+    static bool shown_uncapped = SotcFpsCap::uncapped;
+    if (const bool uncapped = SotcFpsCap::uncapped; uncapped != shown_uncapped) {
+        shown_uncapped = uncapped;
+        std::scoped_lock lock{imgui_mutex};
+        toast_text = uncapped ? "FPS débloqués" : "FPS bloqués à 30";
         toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
     }
     if (!Visible()) {

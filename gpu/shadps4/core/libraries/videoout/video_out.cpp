@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
+
 #include "common/assert.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
@@ -10,6 +12,7 @@
 #include "core/libraries/videoout/driver.h"
 #include "core/libraries/videoout/video_out.h"
 #include "core/libraries/videoout/videoout_error.h"
+#include "video_core/sotc_fps_cap.h"
 #include "core/platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
@@ -141,6 +144,11 @@ s32 PS4_SYSV_ABI sceVideoOutRegisterBuffers(s32 handle, s32 startIndex, void* co
 s32 PS4_SYSV_ABI sceVideoOutSetFlipRate(s32 handle, s32 rate) {
     LOG_TRACE(Lib_VideoOut, "called");
     driver->GetPort(handle)->flip_rate = rate;
+    // sotc: applied by the vblank thread unless uncapped (sotc_fps_cap.h).
+    if (SotcFpsCap::game_rate.exchange(rate) != rate) {
+        std::fprintf(stderr, "SOTC FPS CAP: the game asks flip rate %d (%s)\n", rate,
+                     SotcFpsCap::uncapped ? "uncapped" : "applied");
+    }
     return ORBIS_OK;
 }
 

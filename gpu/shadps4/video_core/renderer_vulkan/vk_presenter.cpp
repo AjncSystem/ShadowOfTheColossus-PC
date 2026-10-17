@@ -18,6 +18,7 @@
 #include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_framegen.h"
 #include "video_core/renderer_vulkan/vk_fsrfg.h"
+#include "video_core/sotc_fps_cap.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -887,6 +888,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // this one half a frame later.
     if (is_game_frame && !is_reusing_frame) {
         FrameGen::TestTick();
+        SotcFpsCap::TestTick();
         FsrFg::NoteGameFrame();
         if (FrameGen::Current() == FrameGen::Mode::Fsr && PresentGenerated(frame)) {
             // SOTC_FSRFG_ONLY_GENERATED=1: the game frames are not shown (checking the others).

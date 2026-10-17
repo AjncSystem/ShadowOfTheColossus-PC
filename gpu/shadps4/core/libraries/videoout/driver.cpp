@@ -470,6 +470,23 @@ void VideoOutDriver::Flip(const Request& req) {
                              static_cast<unsigned long long>(
                                  SotcStats::vram_emergency.exchange(0)));
             }
+            // sotc: cold buffer arena memory given back (BufferCache::MaybeEvictCold), totals.
+            if (const uint64_t runs = SotcStats::arena_evict_runs.load(std::memory_order_relaxed)) {
+                std::fprintf(
+                    stderr,
+                    "SOTC ARENA evicted %llu MiB in %llu runs (%.1f ms), rebound %llu MiB, "
+                    "faulted back %llu MiB, kept unequal %llu MiB\n",
+                    static_cast<unsigned long long>(
+                        SotcStats::arena_evicted.load(std::memory_order_relaxed) >> 20),
+                    static_cast<unsigned long long>(runs),
+                    SotcStats::arena_evict_ns.load(std::memory_order_relaxed) / 1e6,
+                    static_cast<unsigned long long>(
+                        SotcStats::arena_rebound.load(std::memory_order_relaxed) >> 20),
+                    static_cast<unsigned long long>(
+                        SotcStats::arena_pinned.load(std::memory_order_relaxed) >> 20),
+                    static_cast<unsigned long long>(
+                        SotcStats::arena_evict_mismatch.load(std::memory_order_relaxed) >> 20));
+            }
             const bool cmd_stats = SotcStats::kCmdStats; // sotc: as the counters (sotc_stats.h)
             if (cmd_stats && flips) {
                 double k[6];

@@ -55,7 +55,13 @@ inline std::atomic<uint64_t> early_flushes{0}; ///< submits right after a write 
 inline std::atomic<uint64_t> vram_used{0};      ///< device-local usage (VK_EXT_memory_budget), bytes
 inline std::atomic<uint64_t> vram_budget{0};    ///< device-local budget the texture cache plans for
 inline std::atomic<uint64_t> vram_emergency{0}; ///< emergency texture collections (allocation failed)
-inline std::atomic<uint64_t> arena_bytes{0};    ///< resident buffer arena memory (never released)
+inline std::atomic<uint64_t> arena_bytes{0};    ///< resident buffer arena memory
+inline std::atomic<uint64_t> arena_evicted{0};  ///< arena bytes given back by MaybeEvictCold
+inline std::atomic<uint64_t> arena_rebound{0};  ///< ... bound again afterwards
+inline std::atomic<uint64_t> arena_pinned{0};   ///< ... faulted back in by shaders (kept since)
+inline std::atomic<uint64_t> arena_evict_mismatch{0}; ///< read back unequal to guest memory: kept
+inline std::atomic<uint64_t> arena_evict_runs{0};
+inline std::atomic<uint64_t> arena_evict_ns{0}; ///< time in MaybeEvictCold (scan, GPU wait, unbind)
 inline std::atomic<uint64_t> image_bytes{0};    ///< live texture cache and host pass images
 inline std::atomic<uint64_t> image_count{0};
 inline std::atomic<uint64_t> gc_freed{0};       ///< images freed by the texture garbage collector

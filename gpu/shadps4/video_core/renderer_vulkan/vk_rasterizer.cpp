@@ -866,9 +866,14 @@ void Rasterizer::FlushPeriodic() {
         if ((commands_since_submit & 7) != 0) {
             return;
         }
-        const auto elapsed = std::chrono::steady_clock::now() - commands_since;
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed = now - commands_since;
         const auto limit = std::chrono::microseconds(flush_us);
         if (elapsed < limit || (scheduler.IsRendering() && elapsed < limit * 4)) {
+            return;
+        }
+        // sotc: cold arena memory goes back at a submit point outside a render pass.
+        if (!scheduler.IsRendering() && buffer_cache.MaybeEvictCold(now)) {
             return;
         }
         scheduler.Flush();
@@ -876,6 +881,10 @@ void Rasterizer::FlushPeriodic() {
     }
     if (commands_since_submit < every ||
         (scheduler.IsRendering() && commands_since_submit < u64{every} * 4)) {
+        return;
+    }
+    if (!scheduler.IsRendering() &&
+        buffer_cache.MaybeEvictCold(std::chrono::steady_clock::now())) {
         return;
     }
     scheduler.Flush();

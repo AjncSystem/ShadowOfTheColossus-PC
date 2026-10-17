@@ -2,6 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <condition_variable>
+#include <cstdarg>
+#include <mutex>
+#include <string>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include "common/assert.h"
@@ -16,6 +21,57 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/sotc_stats.h"
+
+// sotc: the SOTC_FPS stats lines (a dozen every five seconds) are formatted into a buffer and
+// written by a writer thread. Flip printed them itself, before the flip status and events: stderr
+// is a pipe to the launcher, and each line took milliseconds, so one frame every five seconds took
+// ~130-150 ms (shown as the "worst" frame of nearly every window).
+namespace {
+void StatsPrintf(std::string& out, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    va_list ap2;
+    va_copy(ap2, ap);
+    const int n = std::vsnprintf(nullptr, 0, fmt, ap);
+    va_end(ap);
+    if (n > 0) {
+        const size_t old = out.size();
+        out.resize(old + n + 1);
+        std::vsnprintf(out.data() + old, n + 1, fmt, ap2);
+        out.resize(old + n);
+    }
+    va_end(ap2);
+}
+void WriteStatsAsync(std::string&& text) {
+    struct Queue {
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::string pending;
+    };
+    static Queue* const queue = [] { // never destroyed: the detached writer may outlive exit
+        auto* q = new Queue;
+        std::thread([q] {
+            Common::SetCurrentThreadName("shadPS4:StatsLog");
+            for (;;) {
+                std::string chunk;
+                {
+                    std::unique_lock lk{q->mutex};
+                    q->cv.wait(lk, [q] { return !q->pending.empty(); });
+                    chunk.swap(q->pending);
+                }
+                std::fwrite(chunk.data(), 1, chunk.size(), stderr);
+                std::fflush(stderr);
+            }
+        }).detach();
+        return q;
+    }();
+    {
+        std::scoped_lock lk{queue->mutex};
+        queue->pending += text;
+    }
+    queue->cv.notify_one();
+}
+} // namespace
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
@@ -253,6 +309,7 @@ void VideoOutDriver::Flip(const Request& req) {
         ++flips;
         const auto now = std::chrono::steady_clock::now();
         if (now - window_start >= std::chrono::seconds(5)) {
+            std::string out; // sotc: written by the stats writer thread (WriteStatsAsync)
             const double seconds = std::chrono::duration<double>(now - window_start).count();
             const uint64_t readbacks = SotcStats::readbacks.exchange(0, std::memory_order_relaxed);
             const uint64_t readback_ns =
@@ -261,7 +318,7 @@ void VideoOutDriver::Flip(const Request& req) {
             const uint64_t copies_changed = SotcStats::readback_copies_changed.exchange(0);
             const uint64_t bytes = SotcStats::readback_bytes.exchange(0);
             const uint64_t bytes_changed = SotcStats::readback_bytes_changed.exchange(0);
-            std::fprintf(stderr,
+            StatsPrintf(out,
                          "SOTC FPS %.1f at %.0fs; %.0f cmds/frame; readbacks %.0f/s (ahead %llu, finish %llu, heap %llu, early %llu), %.0f ms/s; "
                          "changed copies %llu/%llu, bytes %llu/%llu\n",
                          flips / seconds, std::chrono::duration<double>(now - run_start).count(),
@@ -282,21 +339,22 @@ void VideoOutDriver::Flip(const Request& req) {
                 for (int i = 0; i < 6; ++i) {
                     k[i] = double(SotcStats::cmd_kinds[i].exchange(0)) / flips;
                 }
-                std::fprintf(stderr,
+                StatsPrintf(out,
                              "SOTC cmds/frame: draw %.0f, indirect %.0f gpu-args + %.0f cpu-args "
                              "(%.0f empty), dispatch %.0f, dispatch-indirect %.0f\n",
                              k[0], k[1], k[2], k[3], k[4], k[5]);
-                std::fprintf(stderr,
+                StatsPrintf(out,
                              "SOTC faults/s: guest writes %.0f, walker loads %.0f, CP reads %.0f\n",
                              SotcStats::fault_writes.exchange(0) / seconds,
                              SotcStats::fault_walker.exchange(0) / seconds,
                              SotcStats::fault_gpu_reads.exchange(0) / seconds);
-                std::fprintf(stderr,
+                StatsPrintf(out,
                              "SOTC per frame: uploads %.0f (%.0f KB), render pass breaks %.0f\n",
                              double(SotcStats::uploads.exchange(0)) / flips,
                              double(SotcStats::upload_bytes.exchange(0)) / 1024.0 / flips,
                              double(SotcStats::render_breaks.exchange(0)) / flips);
             }
+            WriteStatsAsync(std::move(out));
             flips = 0;
             window_start = now;
         }

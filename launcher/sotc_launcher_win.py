@@ -52,6 +52,32 @@ def attach_stdio():
             except OSError:
                 stream = None
         setattr(sys, name, stream or open(os.devnull, 'w'))
+    # An inherited handle can exist and still refuse writes ("[Errno 22] Invalid argument" from a
+    # print in link_modules.py, issue #104 upstream): this output is informational, so a failed
+    # write drops the stream instead of aborting the preparation.
+    for name in ('stdout', 'stderr'):
+        setattr(sys, name, _TolerantStream(getattr(sys, name)))
+
+
+class _TolerantStream:
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, text):
+        try:
+            return self._stream.write(text)
+        except (OSError, ValueError):
+            self._stream = open(os.devnull, 'w')
+            return len(text)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except (OSError, ValueError):
+            pass
+
+    def __getattr__(self, attr):
+        return getattr(self._stream, attr)
 
 
 def run_role(argv):

@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <chrono>
+#include <mutex>
+#include <unordered_set>
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -38,11 +41,30 @@ struct WarmUpTimer {
 long long Ms(std::chrono::steady_clock::duration d) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(d).count();
 }
+
+// sotc: a shader permutation is stored under its index in the program ({pgm}_{idx}.spv, and a
+// meta named after a hash of the same pair). The index is the order in which this session met the
+// permutations, so a session that did not preload all of them can give an index already used on
+// disk by another permutation. Writing over it paired the pipelines saved earlier with the wrong
+// shader: the driver refused them at the next start (ErrorUnknown on AMD). Such a permutation is
+// now left out of the cache, along with every pipeline that uses it; they compile each session.
+std::mutex collided_mutex;
+std::unordered_set<u64> collided_bins;      // BinaryId of the permutations left out
+std::unordered_set<size_t> collided_perms; // perm hashes, as in the pipeline keys
+
+u64 BinaryId(u64 pgm_hash, size_t perm_idx) {
+    return pgm_hash ^ (u64(perm_idx) << 56);
+}
+
+bool IsCollidedPerm(size_t perm_hash) {
+    std::scoped_lock lock{collided_mutex};
+    return collided_perms.contains(perm_hash);
+}
 } // namespace
 
 void RegisterPipelineData(const ComputePipelineKey& key,
                           ComputePipeline::SerializationSupport& sdata) {
-    if (!Storage::DataBase::Instance().IsOpened()) {
+    if (!Storage::DataBase::Instance().IsOpened() || IsCollidedPerm(key.value)) {
         return;
     }
 
@@ -64,6 +86,11 @@ void RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,
     if (!Storage::DataBase::Instance().IsOpened()) {
         return;
     }
+    for (const auto stage_hash : key.stage_hashes) {
+        if (stage_hash && IsCollidedPerm(stage_hash)) {
+            return;
+        }
+    }
 
     Serialization::Archive ar{};
     Serialization::Writer pldata{ar};
@@ -84,6 +111,13 @@ void RegisterShaderMeta(const Shader::Info& info,
                         size_t perm_idx) {
     if (!Storage::DataBase::Instance().IsOpened()) {
         return;
+    }
+    {
+        std::scoped_lock lock{collided_mutex};
+        if (collided_bins.contains(BinaryId(info.pgm_hash, perm_idx))) {
+            collided_perms.insert(perm_hash);
+            return;
+        }
     }
 
     Serialization::Archive ar;
@@ -107,9 +141,22 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
         return;
     }
 
-    Storage::DataBase::Instance().Save(Storage::BlobType::ShaderBinary,
-                                       fmt::format("{:#018x}_{}", pgm_hash, perm_idx),
-                                       std::move(spv));
+    const auto name = fmt::format("{:#018x}_{}", pgm_hash, perm_idx);
+    if (!EmulatorSettings.IsPipelineCacheArchived()) {
+        std::vector<u32> stored;
+        Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary, name, stored);
+        if (!stored.empty() && stored != spv) {
+            static std::atomic<u32> reported{0};
+            if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+                LOG_WARNING(Render_Vulkan,
+                            "Shader permutation {} is another one on disk: not cached", name);
+            }
+            std::scoped_lock lock{collided_mutex};
+            collided_bins.insert(BinaryId(pgm_hash, perm_idx));
+            return;
+        }
+    }
+    Storage::DataBase::Instance().Save(Storage::BlobType::ShaderBinary, name, std::move(spv));
 }
 
 bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,

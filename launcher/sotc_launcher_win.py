@@ -79,13 +79,22 @@ def run_command():
 
 
 # ---------------------------------------------------------------------------------------------
-# Texts: Portuguese first, English for every other Windows language.
+# Texts: Portuguese first; Spanish is looked up by the Portuguese text (launcher/sotc_i18n_es.py,
+# falling back to English); English for every other Windows language.
 
 LANG = 'pt'
+try:
+    from sotc_i18n_es import ES
+except ImportError:
+    ES = {}
 
 
 def _(pt, en):
-    return pt if LANG == 'pt' else en
+    if LANG == 'pt':
+        return pt
+    if LANG == 'es':
+        return ES.get(pt, en)
+    return en
 
 
 def windows_language():
@@ -93,7 +102,7 @@ def windows_language():
         primary = ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3ff
     except (AttributeError, OSError):
         primary = 0
-    return 'pt' if primary == 0x16 else 'en'
+    return {0x16: 'pt', 0x0a: 'es'}.get(primary, 'en')
 
 
 # ---------------------------------------------------------------------------------------------
@@ -188,7 +197,8 @@ LANGUAGES = [('', ('Automático (o do jogo)', 'Automatic (the game\'s)')),
              ('4', ('Alemão', 'German')), ('5', ('Italiano', 'Italian')), ('0', ('Japonês', 'Japanese'))]
 READBACKS = [('', ('Precisas (padrão; o jogo precisa)', 'Precise (default; the game needs them)')),
              ('1', ('Relaxadas (pode travar)', 'Relaxed (may hang)'))]
-UI_LANGUAGES = [('', ('Automático', 'Automatic')), ('pt', ('Português', 'Portuguese')), ('en', ('Inglês', 'English'))]
+UI_LANGUAGES = [('', ('Automático', 'Automatic')), ('pt', ('Português', 'Portuguese')), ('en', ('Inglês', 'English')),
+                ('es', ('Espanhol', 'Spanish'))]
 CONTROLS = [('W A S D', ('analógico esquerdo', 'left stick')), (('setas', 'arrows'), ('analógico direito (câmera)', 'right stick (camera)')),
             ('Espaço / Space', '✕'), ('Shift', '○'), ('E', '□'), ('Q', '△'), ('1 / 3', 'L1 / R1'), ('R / F', 'L2 / R2'),
             ('Z / C', 'L3 / R3'), ('Enter', 'Options'), ('I J K L', ('direcional', 'd-pad')),
@@ -287,7 +297,7 @@ def game_environment(s):
         env['BB_DIRECT_MEMORY_ACCESS'] = '0'
     # Periodic submits and readbacks ahead: by default only with NVIDIA (vk_rasterizer.cpp).
     if s.get('gpu_submit') == 'on':
-        env['SOTC_FLUSH_US'], env['SOTC_RB_AHEAD'] = '500', '1'
+        env['SOTC_FLUSH_US'], env['SOTC_RB_AHEAD'] = '1000', '1'
     elif s.get('gpu_submit') == 'off':
         env['SOTC_FLUSH_EVERY'], env['SOTC_RB_AHEAD'] = '0', '0'
     env['SOTC_NEO'] = '1' if s.get('neo') else '0'
@@ -345,7 +355,8 @@ class Launcher:
         self.ui_calls = queue.Queue()
         self.gpu_text = _('• Verificando a placa de vídeo…', '• Checking the graphics card…')
         self.banner_source = self.banner_image = None
-        root.title('Shadow of the Colossus — port nativo' if LANG == 'pt' else 'Shadow of the Colossus — native port')
+        root.title({'pt': 'Shadow of the Colossus — port nativo',
+                'es': 'Shadow of the Colossus — port nativo'}.get(LANG, 'Shadow of the Colossus — native port'))
         root.configure(bg=BG)
         self.dpi = root.winfo_fpixels('1i') / 96.0
         root.geometry(f'{self.px(1080)}x{self.px(700)}')

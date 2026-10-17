@@ -174,15 +174,16 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
         .usage = usage_flags,
         .flags = flags,
     };
-    const auto image_format_properties =
-        instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
+    const auto image_format_properties = instance.GetImageFormatSupport(
+        format_info.format, format_info.type, format_info.tiling, format_info.usage,
+        format_info.flags);
     if (image_format_properties.result == vk::Result::eErrorFormatNotSupported) {
         LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",
                   vk::to_string(supported_format), vk::to_string(format_info.type),
                   vk::to_string(format_info.flags), vk::to_string(format_info.usage));
     }
     supported_samples = image_format_properties.result == vk::Result::eSuccess
-                            ? image_format_properties.value.imageFormatProperties.sampleCounts
+                            ? image_format_properties.sample_counts
                             : vk::SampleCountFlagBits::e1;
 
     const vk::ImageCreateInfo image_ci = {

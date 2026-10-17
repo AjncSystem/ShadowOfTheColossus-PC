@@ -269,7 +269,7 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
     // In a one-wave workgroup, branches on lowered values are uniform, so lower their ReadLane and
     // Ballot too, expanding the uniform blocks until stable. From Pink-shadPS4 (luizgustavs),
     // wave64_uniform_branches.
-    if (num_threads <= 64 && Wave64UniformBranchesEnabled()) {
+    if (num_threads <= 64 && profile.needs_wave64_uniform_branches) {
         std::unordered_set<const IR::Inst*> uniform_insts;
         while (true) {
             const size_t known = uniform_insts.size();

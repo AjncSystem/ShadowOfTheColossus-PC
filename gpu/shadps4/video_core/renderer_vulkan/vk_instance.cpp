@@ -894,4 +894,47 @@ vk::Format Instance::GetSupportedFormat(const vk::Format format,
     return format;
 }
 
+Instance::ImageFormatSupport Instance::GetImageFormatSupport(
+    const vk::Format format, const vk::ImageType type, const vk::ImageTiling tiling,
+    const vk::ImageUsageFlags usage, const vk::ImageCreateFlags flags) const {
+    const auto matches = [&](const ImageFormatSupportCacheEntry& entry) {
+        return entry.format == format && entry.type == type && entry.tiling == tiling &&
+               entry.usage == usage && entry.flags == flags;
+    };
+    {
+        const std::scoped_lock lock{image_format_support_mutex};
+        const auto entry = std::ranges::find_if(image_format_support_cache, matches);
+        if (entry != image_format_support_cache.end()) {
+            return entry->support;
+        }
+    }
+
+    const vk::PhysicalDeviceImageFormatInfo2 format_info{
+        .format = format,
+        .type = type,
+        .tiling = tiling,
+        .usage = usage,
+        .flags = flags,
+    };
+    const auto properties = physical_device.getImageFormatProperties2(format_info);
+    const ImageFormatSupport support{
+        .result = properties.result,
+        .sample_counts = properties.result == vk::Result::eSuccess
+                             ? properties.value.imageFormatProperties.sampleCounts
+                             : vk::SampleCountFlagBits::e1,
+    };
+    if (support.result != vk::Result::eSuccess &&
+        support.result != vk::Result::eErrorFormatNotSupported) {
+        return support;
+    }
+
+    const std::scoped_lock lock{image_format_support_mutex};
+    const auto existing = std::ranges::find_if(image_format_support_cache, matches);
+    if (existing != image_format_support_cache.end()) {
+        return existing->support;
+    }
+    image_format_support_cache.push_back({format, type, tiling, usage, flags, support});
+    return support;
+}
+
 } // namespace Vulkan

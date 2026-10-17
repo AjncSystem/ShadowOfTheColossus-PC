@@ -224,7 +224,7 @@ void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_in
     DivergenceContext ctx;
     ctx.subgroup = multi_wave;
     // A ReadLane is uniform within one wave, not across the waves of a larger workgroup.
-    if (!multi_wave && Wave64UniformBranchesEnabled()) {
+    if (!multi_wave && profile.needs_wave64_uniform_branches) {
         const auto blocks = FindWave64UniformBlocks(program);
         ctx.uniform_readlane_blocks.insert(blocks.begin(), blocks.end());
     }

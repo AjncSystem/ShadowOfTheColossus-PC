@@ -329,7 +329,10 @@ void PipelineCache::WarmUp() {
         return;
     }
 
-    Storage::DataBase::Instance().Open();
+    // The wave64 mode changes shader lowering and barrier analysis, so keep its cache separate.
+    Storage::DataBase::Instance().Open(profile.needs_wave64_uniform_branches
+                                          ? "_wave64_uniform_on"
+                                          : "_wave64_uniform_off");
 
     // Check if cache is compatible
     std::vector<u8> profile_data{};

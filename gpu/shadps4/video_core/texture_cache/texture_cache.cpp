@@ -922,6 +922,10 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 
     // If there is a stencil attachment, link depth and stencil.
     if (desc.info.stencil_addr != 0) {
+        // sotc: the lookup and RegisterImage need `mutex` like FindImage (only depth when the
+        // caller's batch hold already has it; SOTC_TC_BATCH=0 has none).
+        std::unique_lock lk{mutex, std::defer_lock};
+        LockCounted(lk);
         ImageId stencil_id{};
         ForEachImageInRegion(desc.info.stencil_addr, desc.info.stencil_size,
                              [&](ImageId image_id, Image& image) {

@@ -62,6 +62,10 @@ public:
 
     /// sotc: the pipeline lookups of the draws and dispatches alone (command processor thread).
     const Pipeline* LookupGraphicsPipeline(u16 vertex_sgpr_offset, u16 instance_sgpr_offset);
+    /// sotc: the register-only test of FilterDraw: true when it will not record the draw. With
+    /// the draw thread the command processor then skips the pipeline lookup (a pipeline for
+    /// PrimitiveType::None would not even build).
+    bool IsDrawFilteredOut() const;
     const Pipeline* LookupComputePipeline();
     bool IsGpuSideThread() const;
     void PrepareGpuSideFault();

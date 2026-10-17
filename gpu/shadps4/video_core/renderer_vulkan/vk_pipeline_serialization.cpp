@@ -457,7 +457,7 @@ void Info::Serialize(Serialization::Archive& ar) const {
     Serialization::Writer info{ar};
 
     info.Write(this, sizeof(InfoPersistent));
-    info.Write(flattened_ud_buf);
+    info.Write(FlatBuf());
     srt_info.Serialize(ar);
 }
 
@@ -465,7 +465,7 @@ bool Info::Deserialize(Serialization::Archive& ar) {
     Serialization::Reader info{ar};
 
     info.Read(this, sizeof(Shader::InfoPersistent));
-    info.Read(flattened_ud_buf);
+    info.Read(FlatBuf());
 
     return srt_info.Deserialize(ar);
 }

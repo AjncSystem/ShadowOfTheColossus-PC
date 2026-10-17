@@ -6,6 +6,7 @@
 #include <array>
 
 #include <chrono>
+#include <shared_mutex>
 #include <deque>
 #include <span>
 #include <vector>
@@ -242,6 +243,9 @@ private:
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
+    /// sotc: gpu_modified_ranges is changed on the GPU side (the draw thread, see
+    /// Liverpool::IsBackThreaded) and read by the command processor's SRT walkers (ReadClean).
+    std::shared_mutex gpu_modified_mutex;
 
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
@@ -280,6 +284,8 @@ private:
     /// sotc (SOTC_DMA_MERGE): touching resident ranges whose start lies in the same arena,
     /// merged into runs of (device address, bytes). Only rebuilt at the top of a sweep.
     std::vector<std::pair<VAddr, u64>> dma_runs;
+    bool dma_full_pending{}; // sotc: the next DMA sweep visits every run (see SynchronizeDmaBuffers)
+    std::vector<std::pair<VAddr, u64>> dma_spans;
     /// Readback windows requested recently; downloaded together with the next readback.
     struct HotReadback {
         VAddr addr;

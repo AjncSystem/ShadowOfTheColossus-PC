@@ -182,14 +182,19 @@ private:
         VAddr addr;
         u64 size;
         boost::container::small_vector<vk::BufferCopy, 4> copies;
-        /// The GPU-modified ranges downloaded, when GatherDownloads leaves them in the set.
+        /// The GPU-modified ranges downloaded; they stay in the set until SubtractDownloaded.
         boost::container::small_vector<std::pair<VAddr, u64>, 4> gpu_ranges;
     };
-    /// Collects what a readback of [device_addr, +size) and the hot readbacks must copy, taking
-    /// it out of the GPU-modified set. Returns the bytes to download.
+    /// Collects what a readback of [device_addr, +size) and the hot readbacks must copy. Returns
+    /// the bytes to download. sotc: the ranges stay in the GPU-modified set until the caller
+    /// applied the data and called SubtractDownloaded (the command processor reads clean ranges
+    /// from the backing meanwhile, with the draw thread); subtract: ranges with nothing bound
+    /// to copy leave the set right away.
     u64 GatherDownloads(const Buffer* arena, VAddr device_addr, u64 size,
                         boost::container::small_vector<ReadbackItem, 16>& pending,
                         bool subtract = true);
+    /// sotc: takes the downloaded ranges of items out of the GPU-modified set.
+    void SubtractDownloaded(std::span<const ReadbackItem> items);
     /// Writes downloaded data (mapped, at the copies' destination offsets minus mapped_offset)
     /// into guest memory and unmarks the ranges as GPU-modified.
     void ApplyDownloads(std::span<const ReadbackItem> pending, const u8* mapped,

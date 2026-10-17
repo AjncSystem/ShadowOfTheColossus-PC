@@ -2268,6 +2268,10 @@ std::thread::id Rasterizer::GetGpuCommandProcessorThread() {
 u32 Rasterizer::GetGpuCommandProcessorThreadId() {
     return liverpool->GetGpuCommandProcessorThreadId();
 }
+
+bool Rasterizer::IsGpuSideThreadId(u32 tid) const {
+    return liverpool->IsGpuSideThreadId(tid);
+}
 #endif
 
 } // namespace Vulkan

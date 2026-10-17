@@ -341,13 +341,10 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
         DownloadMemory(readback.arena, readback.window_start, readback.window_size);
     } else {
         download.buffer->Invalidate(download.offset, download.size);
-        for (const auto& item : readback.pending) {
-            std::unique_lock gpu_modified_lock{gpu_modified_mutex};
-            for (const auto& [address, range_size] : item.gpu_ranges) {
-                gpu_modified_ranges.Subtract(address, range_size);
-            }
-        }
+        // sotc: the ranges leave the GPU-modified set only once the backing holds their data:
+        // the command processor's clean reads (ReadClean) would read the stale backing before.
         ApplyDownloads(readback.pending, download.mapped, download.offset);
+        SubtractDownloaded(readback.pending);
         staging_pool.FreeDeferred(download);
     }
     if (readback.is_write) {
@@ -435,6 +432,16 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     // headers are followed through the physical chain on every write anyway. Only the command
     // processor thread downloads memory.
     ApplyDownloads(pending, download.mapped, download.offset);
+    SubtractDownloaded(pending); // sotc: after the backing holds the data (see FinishAsyncReadback)
+}
+
+void BufferCache::SubtractDownloaded(std::span<const ReadbackItem> items) {
+    std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+    for (const auto& item : items) {
+        for (const auto& [address, range_size] : item.gpu_ranges) {
+            gpu_modified_ranges.Subtract(address, range_size);
+        }
+    }
 }
 
 u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 size,
@@ -518,14 +525,12 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
                         });
                 };
                 gpu_modified_ranges.ForEachInRange(address, range_size, add_download);
-                if (subtract) {
-                    std::unique_lock gpu_modified_lock{gpu_modified_mutex};
-                    gpu_modified_ranges.Subtract(address, range_size);
-                } else {
-                    item.gpu_ranges.emplace_back(address, range_size);
-                }
+                item.gpu_ranges.emplace_back(address, range_size);
             });
         if (item.copies.empty()) {
+            if (subtract) {
+                SubtractDownloaded({&item, 1}); // nothing bound to read back
+            }
             continue;
         }
         // Large modified regions (render targets and the like) are left to their own readback.
@@ -535,12 +540,7 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
             item_bytes += copy.size;
         }
         if (hot_mode == 1 && !pending.empty() && item_bytes > MaxHotBytes) {
-            // Not downloaded now: give the range back to the modified set.
-            for (const auto& copy : item.copies) {
-                if (subtract) {
-                    AddGpuModified(arena_base + copy.srcOffset, copy.size);
-                }
-            }
+            // Not downloaded now: its ranges stay in the modified set.
             total_size_bytes = total_before;
             continue;
         }
@@ -869,7 +869,11 @@ bool BufferCache::TryWriteThroughFromCpu(VAddr addr, const void* data, u64 size)
     if (foreign) {
         return false;
     }
-    gpu_modified_ranges.Subtract(addr, size);
+    {
+        // sotc: the command processor reads the set under the shared lock (ReadClean).
+        std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+        gpu_modified_ranges.Subtract(addr, size);
+    }
     memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
     MarkInflightReadbacksDirty(addr, size);
     if (!memory->TryWriteBacking(std::bit_cast<void*>(addr), data, size, 10)) {

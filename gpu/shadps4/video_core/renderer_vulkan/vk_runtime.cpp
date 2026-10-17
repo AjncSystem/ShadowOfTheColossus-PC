@@ -325,7 +325,9 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     cmdbuf.copyImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
                      vk::ImageLayout::eTransferDstOptimal, regions);
 
-    dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
+    if (True(src->flags & VideoCore::ImageFlagBits::GpuModified)) {
+        VideoCore::MarkGpuModified(*dst, false); // sotc: see the copy fast path in the rasterizer
+    }
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
@@ -385,7 +387,9 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
     cmdbuf.copyBufferToImage(buffer->Handle(), dst->GetImage(),
                              vk::ImageLayout::eTransferDstOptimal, buffer_copy);
 
-    dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
+    if (True(src->flags & VideoCore::ImageFlagBits::GpuModified)) {
+        VideoCore::MarkGpuModified(*dst, false); // sotc: see the copy fast path in the rasterizer
+    }
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
@@ -437,7 +441,9 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
     cmdbuf.copyImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
                      vk::ImageLayout::eTransferDstOptimal, image_copy);
 
-    dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
+    if (True(src->flags & VideoCore::ImageFlagBits::GpuModified)) {
+        VideoCore::MarkGpuModified(*dst, false); // sotc: see the copy fast path in the rasterizer
+    }
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
@@ -535,7 +541,7 @@ void Runtime::CopyDepthStencil(VideoCore::Image* src, VideoCore::Image* dst,
     cmdbuf.copyImage(src->GetImage(), vk::ImageLayout::eTransferSrcOptimal, dst->GetImage(),
                      vk::ImageLayout::eTransferDstOptimal, region);
 
-    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
+    VideoCore::MarkGpuModified(*dst); // sotc: moves the mip-tail epoch on a first write
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
@@ -601,7 +607,7 @@ void Runtime::ResolveImage(VideoCore::Image* src, VideoCore::Image* dst,
                             vk::ImageLayout::eTransferDstOptimal, region);
     }
 
-    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
+    VideoCore::MarkGpuModified(*dst); // sotc: moves the mip-tail epoch on a first write
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
@@ -627,7 +633,7 @@ void Runtime::ClearImage(VideoCore::Image* dst, const VideoCore::SubresourceRang
     cmdbuf.clearColorImage(dst->GetImage(), vk::ImageLayout::eTransferDstOptimal, clear_value.color,
                            vk_range);
 
-    dst->flags |= VideoCore::ImageFlagBits::GpuModified;
+    VideoCore::MarkGpuModified(*dst); // sotc: moves the mip-tail epoch on a first write
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Shadow of the Colossus launcher for Windows (Tkinter), modelled on bbport_launcher_win.py.
+"""Shadow of the Colossus launcher for Windows (Tkinter), derived from the bbport launcher.
 
 One window for the port's settings: the game dump, the user's own sound modules, saves, modes
 (16x AF, 60 FPS), display and diagnostics. They go to sotc.py as environment variables.
@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 
 FROZEN = getattr(sys, 'frozen', False)
 PORT_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent.parent
@@ -28,7 +29,7 @@ CONFIG_DIR = Path(os.environ.get('APPDATA', Path.home())) / 'sotc-launcher'
 CONFIG_FILE = CONFIG_DIR / 'settings.json'
 GAME_ID, GAME_VERSION = 'CUSA08809', '01.01'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.57'
+VERSION = '0.57-opt5'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -248,6 +249,43 @@ def user_dir(s):
     return folder
 
 
+LOGS_KEPT = 5      # last_run.log and last_run.1.log ... last_run.4.log
+CRASH_LOGS_KEPT = 20
+
+
+def open_session_log(log_dir):
+    """Opens a fresh user/last_run.log; the previous sessions' logs move to last_run.1.log (the
+    one before) ... last_run.4.log, so a crash is not lost when the game is started again."""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(LOGS_KEPT - 1, 0, -1):
+        older = log_dir / ('last_run.log' if i == 1 else f'last_run.{i - 1}.log')
+        if older.is_file():
+            try:
+                os.replace(older, log_dir / f'last_run.{i}.log')
+            except OSError:
+                pass
+    return open(log_dir / 'last_run.log', 'w', encoding='utf-8', buffering=1)
+
+
+def keep_crash_log(log_dir, code):
+    """After a session that ended with an error code, copies its log to
+    user/crashes/<date>_<time>_<code>.log (the last 20 are kept)."""
+    if code == 0:
+        return
+    crashes = log_dir / 'crashes'
+    try:
+        crashes.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime('%Y-%m-%d_%H-%M-%S')
+        shutil.copy2(log_dir / 'last_run.log', crashes / f'{stamp}_{code & 0xffffffff:#x}.log')
+        for old in sorted(crashes.glob('*.log'))[:-CRASH_LOGS_KEPT]:
+            old.unlink()
+        # Minidumps written by bb-probe on a fatal fault (src/probe.c): the last 5.
+        for old in sorted(crashes.glob('*.dmp'))[:-5]:
+            old.unlink()
+    except OSError:
+        pass
+
+
 def short_path(path):
     """A path for display: relative to the port folder when inside it, else as is."""
     try:
@@ -341,6 +379,7 @@ class Launcher:
         self.app = {**APP_DEFAULTS, **load_json(CONFIG_FILE, {})}
         self.vars = {}
         self.process = self.job = None
+        self.stopping = False
         self.output = queue.Queue()
         self.ui_calls = queue.Queue()
         self.gpu_text = _('• Verificando a placa de vídeo…', '• Checking the graphics card…')
@@ -1420,10 +1459,9 @@ class Launcher:
 
     def read_output(self, process):
         # The output also goes to user/last_run.log, so a crash can be looked at afterwards.
+        log_dir = user_dir(self.app)
         try:
-            log_dir = user_dir(self.app)
-            log_dir.mkdir(parents=True, exist_ok=True)
-            log = open(log_dir / 'last_run.log', 'w', encoding='utf-8', buffering=1)
+            log = open_session_log(log_dir)
         except OSError:
             log = None
         for raw in iter(process.stdout.readline, b''):
@@ -1441,6 +1479,9 @@ class Launcher:
                 log.close()
             except (OSError, ValueError):
                 pass
+            if not self.stopping:
+                keep_crash_log(log_dir, code)
+        self.stopping = False
         self.output.put((code,))
 
     def drain_output(self):
@@ -1466,6 +1507,7 @@ class Launcher:
 
     def stop(self):
         if self.job:
+            self.stopping = True  # stopped from the launcher: not a crash
             self.job.terminate()
 
     def append(self, text):
@@ -1560,7 +1602,7 @@ def play_without_window(settings):
         write_key_bindings(settings.get('keys'))
     except OSError:
         pass
-    with open(log_dir / 'last_run.log', 'w', encoding='utf-8', buffering=1) as log:
+    with open_session_log(log_dir) as log:
         process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=game_environment(settings),
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
@@ -1571,7 +1613,10 @@ def play_without_window(settings):
                 sys.stdout.write(text)
             except (OSError, ValueError):
                 pass
-        return process.wait()
+        code = process.wait()
+        log.write(f'[exit code {code} = {code & 0xffffffff:#x}]\n')
+    keep_crash_log(log_dir, code)
+    return code
 
 
 def main():

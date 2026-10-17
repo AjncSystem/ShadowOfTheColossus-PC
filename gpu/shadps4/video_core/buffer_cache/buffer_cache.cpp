@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <magic_enum/magic_enum.hpp>
 
+#include "bbport_copy.h"
 #include "common/alignment.h"
 #include "core/debug_state.h"
 #include "core/memory.h"
@@ -83,6 +84,12 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     block_shift = std::bit_width(block_size) - 1;
     blocks_per_arena_page = ARENA_PAGE_SIZE / block_size;
     blocks_per_arena_page_shift = ARENA_PAGE_BITS - block_shift;
+    // sotc: one u16 per block of the address space (32 MiB for 64 KiB blocks); calloc leaves
+    // the pages nothing touches uncommitted.
+    block_last_use =
+        static_cast<u16*>(std::calloc(blocks_per_arena_page * NUM_ARENA_PAGES, sizeof(u16)));
+    ASSERT_MSG(block_last_use, "No memory for the arena block use table");
+    epoch_start = std::chrono::steady_clock::now();
     arena_memory_type_index =
         FindMemoryType(instance.GetMemoryProperties(), vk::MemoryPropertyFlagBits::eDeviceLocal,
                        reqs.memoryTypeBits)
@@ -107,7 +114,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     runtime.FillBuffer(bda_pagetable_buffer.get(), 0u, bda_pagetable_size, 0u);
 }
 
-BufferCache::~BufferCache() = default;
+BufferCache::~BufferCache() {
+    std::free(block_last_use);
+}
 
 void BufferCache::TickFrame() {
     if (std::exchange(fault_process_pending, false)) {
@@ -117,6 +126,7 @@ void BufferCache::TickFrame() {
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks,
                                    bool guest_fault) {
+    if (SotcStats::kCmdStats) SotcStats::inv_buffer.fetch_add(size, std::memory_order_relaxed);
     Core::MemoryManager::NoteHostWrite(device_addr, size, 9,
                                        reinterpret_cast<u64>(__builtin_return_address(0)));
     memory_tracker->InvalidateRegion(
@@ -169,7 +179,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         Core::MemoryManager::NoteHostWrite(device_addr, size, 6, window_start);
         DownloadMemory(arena, window_start, window_end - window_start);
         if (is_write) {
-            memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+            MarkWrittenByGuest(device_addr, size);
         }
     };
     if (assume_locks) {
@@ -197,6 +207,26 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     scheduler.WaitSubmitted(readback.tick, false);
     scheduler.GetWorkSemaphore()->Wait(readback.tick);
     liverpool->SendCommand<true>([this, &readback] { FinishAsyncReadback(readback); });
+}
+
+void BufferCache::MarkWrittenByGuest(VAddr addr, u64 size) {
+    // sotc: a page both CPU- and GPU-modified loses its write watcher but keeps its read
+    // watcher: "write-only" protection, an assertion that ended the game (opt4, ~1 in 12 Shrine
+    // runs). After a write fault's readback the requested pages can still be GPU-modified: GPU
+    // data recorded since (left protected: the write faults again and the next readback brings
+    // it) or a page bit no GPU-written byte backs any more (cleared, or the write would fault
+    // forever).
+    if (memory_tracker->IsRegionGpuModified(addr, size)) {
+        const VAddr lo = Common::AlignDown(addr, VAddr{4096});
+        const VAddr hi = Common::AlignUp(addr + size, VAddr{4096});
+        if (gpu_modified_ranges.Intersects(lo, hi - lo)) {
+            SotcStats::write_fault_gpu_pending.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        SotcStats::write_fault_stale_gpu.fetch_add(1, std::memory_order_relaxed);
+        memory_tracker->UnmarkRegionAsGpuModified(lo, hi - lo, false);
+    }
+    memory_tracker->MarkRegionAsCpuModified(addr, size);
 }
 
 void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
@@ -227,7 +257,7 @@ void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
             return;
         }
         if (readback.is_write) {
-            memory_tracker->MarkRegionAsCpuModified(readback.device_addr, readback.size);
+            MarkWrittenByGuest(readback.device_addr, readback.size);
         }
         return;
     }
@@ -283,13 +313,13 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
             FinishAsyncReadback(*other);
         }
         if (readback.is_write) {
-            memory_tracker->MarkRegionAsCpuModified(readback.device_addr, readback.size);
+            MarkWrittenByGuest(readback.device_addr, readback.size);
         }
         return;
     }
     if (readback.finished) {
         if (readback.is_write) {
-            memory_tracker->MarkRegionAsCpuModified(readback.device_addr, readback.size);
+            MarkWrittenByGuest(readback.device_addr, readback.size);
         }
         return;
     }
@@ -320,13 +350,14 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
         staging_pool.FreeDeferred(download);
     }
     if (readback.is_write) {
-        memory_tracker->MarkRegionAsCpuModified(readback.device_addr, readback.size);
+        MarkWrittenByGuest(readback.device_addr, readback.size);
     }
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
     SotcStats::readbacks.fetch_add(1, std::memory_order_relaxed);
     const SotcStats::ScopedTimer readback_timer{SotcStats::readback_ns};
+    const SotcStats::FrameTimer frame_timer{SotcStats::FrameReadback};
     boost::container::small_vector<ReadbackItem, 16> pending;
     const u64 total_size_bytes = GatherDownloads(arena, device_addr, size, pending);
     if (total_size_bytes == 0) {
@@ -811,13 +842,58 @@ bool BufferCache::TryReplaceFromCpu(VAddr addr, const void* data, u64 size) {
     return true;
 }
 
+bool BufferCache::TryWriteThroughFromCpu(VAddr addr, const void* data, u64 size) {
+    if (size == 0) {
+        return true;
+    }
+    const u64 first_block = addr >> block_shift;
+    const u64 last_block = (addr + size - 1) >> block_shift;
+    bool resident = true;
+    resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64, u64) { resident = false; });
+    const Buffer* arena =
+        resident ? address_space[first_block >> blocks_per_arena_page_shift] : nullptr;
+    if (!arena || arena != address_space[last_block >> blocks_per_arena_page_shift]) {
+        return TryReplaceFromCpu(addr, data, size);
+    }
+    if (!memory->GetBackingPointer(addr) || !memory->GetBackingPointer(addr + size - 1)) {
+        return false;
+    }
+    // Page tracking is page granular: other GPU-written bytes on these pages would be lost.
+    const VAddr lo = Common::AlignDown(addr, VAddr{4096});
+    const VAddr hi = Common::AlignUp(addr + size, VAddr{4096});
+    bool foreign = false;
+    gpu_modified_ranges.ForEachInRange(lo, hi - lo, [&](VAddr start, VAddr end) {
+        foreign |= start < addr || end > addr + size;
+    });
+    if (foreign) {
+        return false;
+    }
+    gpu_modified_ranges.Subtract(addr, size);
+    memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
+    MarkInflightReadbacksDirty(addr, size);
+    if (!memory->TryWriteBacking(std::bit_cast<void*>(addr), data, size, 10)) {
+        return false;
+    }
+    // The arena gets the same bytes now, in stream order, so the CPU bits stay as they are: a
+    // clean page stays clean and write-protected, a dirty one uploads the same bytes later.
+    const auto staging = staging_pool.Request(size, MemoryType::HostUncached);
+    std::memcpy(staging.mapped, data, size);
+    staging.Flush();
+    const vk::BufferCopy copy{staging.offset, arena->Offset(addr), size};
+    runtime.CopyBuffer(staging.buffer, arena, std::span{&copy, 1});
+    RecordCurrentWrite(addr, size);
+    return true;
+}
+
 bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
     return memory_tracker->IsRegionGpuModified(addr, size);
 }
 
 void BufferCache::SynchronizeDmaBuffers() {
+    const SotcStats::FrameTimer frame_timer{SotcStats::FrameDma};
     fault_process_pending = true;
     const u64 uploads_before = SotcStats::uploads.load(std::memory_order_relaxed);
+    const auto sweep_start = std::chrono::steady_clock::now();
     u64 ranges = 0;
     // sotc (SOTC_DMA_MERGE=0 disables): the sweep visited ~1200 resident ranges ~100 times a
     // second, one tracker walk + staging request each. Touching ranges whose start maps to the
@@ -907,6 +983,7 @@ void BufferCache::SynchronizeDmaBuffers() {
                 }
             }
         }
+        SotcStats::dma_sweep_runs.fetch_add(dma_runs.size(), std::memory_order_relaxed);
     } else {
         for (const auto& range : resident_ranges) {
             const u64 page = range.start >> (ARENA_PAGE_BITS - block_shift);
@@ -918,8 +995,14 @@ void BufferCache::SynchronizeDmaBuffers() {
     }
     SotcStats::dma_sweeps.fetch_add(1, std::memory_order_relaxed);
     SotcStats::dma_sweep_ranges.fetch_add(ranges, std::memory_order_relaxed);
+    const u64 sweep_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - sweep_start)
+                             .count();
+    SotcStats::dma_sweep_ns.fetch_add(sweep_ns, std::memory_order_relaxed);
     if (SotcStats::uploads.load(std::memory_order_relaxed) != uploads_before) {
         SotcStats::dma_sweep_uploading.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        SotcStats::dma_sweep_idle_ns.fetch_add(sweep_ns, std::memory_order_relaxed);
     }
 }
 
@@ -978,6 +1061,26 @@ const Buffer* BufferCache::GetArena(u64 first_block, u64 last_block) {
 }
 
 void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_block) {
+    // sotc: binds check the same ranges thousands of times a frame, each a search of ~2,600
+    // resident ranges (~2% of the command processor): ranges found resident are remembered
+    // (64 slots by first block) until the resident set changes (resident_version).
+    // sotc: the bind keeps its blocks out of MaybeEvictCold for SOTC_ARENA_EVICT_IDLE_S. A
+    // cached range is stamped as a whole once per epoch (a 64 MiB binding is 1,024 blocks).
+    const auto stamp = [this](u64 first, u64 end) {
+        for (u64 block = first; block < end; ++block) {
+            block_last_use[block] = use_epoch;
+        }
+    };
+    auto& cached = resident_cache[(first_block * 0x9E3779B97F4A7C15ull) >> 58];
+    if (cached.version == resident_version && first_block >= cached.first &&
+        last_block < cached.end) {
+        if (cached.epoch != use_epoch) {
+            stamp(cached.first, cached.end);
+            cached.epoch = use_epoch;
+        }
+        return;
+    }
+    stamp(first_block, last_block + 1);
     u32 resident_blocks{};
     IntervalList bind_ranges;
     resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64 start, u64 end) {
@@ -986,55 +1089,106 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     });
 
     if (bind_ranges.Empty()) {
+        cached = {resident_version, first_block, last_block + 1, use_epoch};
         return;
     }
-
-    vk::MemoryAllocateInfo alloc_info = {
-        .allocationSize = resident_blocks << block_shift,
-        .memoryTypeIndex = arena_memory_type_index,
-    };
-    auto [alloc_result, device_memory] = instance.GetDevice().allocateMemory(alloc_info);
-    if (alloc_result == vk::Result::eErrorOutOfDeviceMemory && arena_fallback_memory_type_index) {
-        // Resident arena ranges are never released, so a long session can exhaust video memory.
-        // Keep running from system memory (slower GPU access) instead of aborting.
-        static bool warned = false;
-        if (!std::exchange(warned, true)) {
-            LOG_WARNING(Render, "Video memory exhausted, placing new buffer memory in system RAM");
+    if (!evicted_ranges.Empty()) {
+        for (const auto& range : bind_ranges) {
+            evicted_ranges.ForEachInRange(range.start, range.end, [&](const Interval& evicted) {
+                const u64 start = std::max(range.start, evicted.start);
+                const u64 end = std::min(range.end, evicted.end);
+                SotcStats::arena_rebound.fetch_add((end - start) << block_shift,
+                                                   std::memory_order_relaxed);
+            });
+            evicted_ranges.Subtract(range.start, range.end);
         }
-        alloc_info.memoryTypeIndex = *arena_fallback_memory_type_index;
-        const auto retry = instance.GetDevice().allocateMemory(alloc_info);
-        alloc_result = retry.result;
-        device_memory = retry.value;
     }
-    // Video memory is full (sparse arenas cannot use system memory on NVIDIA). Drop cached
-    // images, wait for the GPU so their memory is really released, and try again. sotc: one
-    // shallow round was not enough on 6 GB cards (abort after ~15 min in the open world), so
-    // each further round collects deeper before giving up.
-    bool collect_deferred = false;
-    for (u32 level = 0; alloc_result == vk::Result::eErrorOutOfDeviceMemory && level < 3; ++level) {
-        LOG_WARNING(Render, "Video memory exhausted ({} MiB requested), collecting cached images",
-                    alloc_info.allocationSize >> 20);
-        if (!texture_cache.TryEmergencyCollect(level)) {
-            // Reached from RefreshImage under the texture cache lock: the collection runs at the
-            // next submit. One more try now (memory freed meanwhile by other threads or the GC).
-            collect_deferred = true;
+    const SotcStats::FrameTimer frame_timer{SotcStats::FrameAlloc};
+    const SotcStats::AllocTrace alloc_trace{SotcStats::AllocArena, u64(resident_blocks) << block_shift};
+
+    // sotc: arena memory comes from slabs of SOTC_ARENA_SLAB_MB (default 4, 0 = one allocation per
+    // call): runs of blocks are handed out of the current slab. One vkAllocateMemory per call cost
+    // ~0.2 ms and ran ~15 times a second while the game streamed (5,300 in a 6-minute attract run,
+    // 1 s in total, up to 70 ms within one frame). Large requests, and slabs the driver refuses
+    // under memory pressure, take the exact allocation below with its emergency collections.
+    static const u64 slab_bytes = [] {
+        const char* v = std::getenv("SOTC_ARENA_SLAB_MB");
+        return (v ? std::strtoull(v, nullptr, 10) : 4ull) << 20;
+    }();
+    const u64 want_bytes = u64{resident_blocks} << block_shift;
+    vk::DeviceMemory device_memory{};
+    u64 memory_base{};
+    if (slab_bytes >= u64{block_size} && want_bytes <= slab_bytes / 2) {
+        if (!arena_slab || arena_slab_used + want_bytes > arena_slab_size) {
+            const vk::MemoryAllocateInfo slab_info = {
+                .allocationSize = slab_bytes,
+                .memoryTypeIndex = arena_memory_type_index,
+            };
+            const auto [slab_result, slab_memory] = instance.GetDevice().allocateMemory(slab_info);
+            arena_slab = slab_result == vk::Result::eSuccess ? slab_memory : vk::DeviceMemory{};
+            arena_slab_size = slab_bytes;
+            arena_slab_used = 0;
+            if (arena_slab) {
+                SotcStats::arena_bytes.fetch_add(slab_bytes, std::memory_order_relaxed);
+                backing_bytes[static_cast<VkDeviceMemory>(arena_slab)] = slab_bytes;
+            }
+        }
+        if (arena_slab) {
+            device_memory = arena_slab;
+            memory_base = arena_slab_used;
+            arena_slab_used += want_bytes;
+        }
+    }
+    if (!device_memory) {
+        vk::MemoryAllocateInfo alloc_info = {
+            .allocationSize = resident_blocks << block_shift,
+            .memoryTypeIndex = arena_memory_type_index,
+        };
+        auto [alloc_result, exact_memory] = instance.GetDevice().allocateMemory(alloc_info);
+        if (alloc_result == vk::Result::eErrorOutOfDeviceMemory && arena_fallback_memory_type_index) {
+            // Resident arena ranges are never released, so a long session can exhaust video memory.
+            // Keep running from system memory (slower GPU access) instead of aborting.
+            static bool warned = false;
+            if (!std::exchange(warned, true)) {
+                LOG_WARNING(Render, "Video memory exhausted, placing new buffer memory in system RAM");
+            }
+            alloc_info.memoryTypeIndex = *arena_fallback_memory_type_index;
+            const auto retry = instance.GetDevice().allocateMemory(alloc_info);
+            alloc_result = retry.result;
+            exact_memory = retry.value;
+        }
+        // Video memory is full (sparse arenas cannot use system memory on NVIDIA). Drop cached
+        // images, wait for the GPU so their memory is really released, and try again. sotc: one
+        // shallow round was not enough on 6 GB cards (abort after ~15 min in the open world), so
+        // each further round collects deeper before giving up.
+        bool collect_deferred = false;
+        for (u32 level = 0; alloc_result == vk::Result::eErrorOutOfDeviceMemory && level < 3; ++level) {
+            LOG_WARNING(Render, "Video memory exhausted ({} MiB requested), collecting cached images",
+                        alloc_info.allocationSize >> 20);
+            if (!texture_cache.TryEmergencyCollect(level)) {
+                // Reached from RefreshImage under the texture cache lock: the collection runs at the
+                // next submit. One more try now (memory freed meanwhile by other threads or the GC).
+                collect_deferred = true;
+                alloc_info.memoryTypeIndex = arena_memory_type_index;
+                const auto retry = instance.GetDevice().allocateMemory(alloc_info);
+                alloc_result = retry.result;
+                exact_memory = retry.value;
+                break;
+            }
+            scheduler.Finish();
+            scheduler.PopPendingOperations();
             alloc_info.memoryTypeIndex = arena_memory_type_index;
             const auto retry = instance.GetDevice().allocateMemory(alloc_info);
             alloc_result = retry.result;
-            device_memory = retry.value;
-            break;
+            exact_memory = retry.value;
         }
-        scheduler.Finish();
-        scheduler.PopPendingOperations();
-        alloc_info.memoryTypeIndex = arena_memory_type_index;
-        const auto retry = instance.GetDevice().allocateMemory(alloc_info);
-        alloc_result = retry.result;
-        device_memory = retry.value;
+        ASSERT_MSG(alloc_result == vk::Result::eSuccess, "Failed to allocate buffer arena memory: {}{}",
+                   vk::to_string(alloc_result),
+                   collect_deferred ? " (collection deferred: texture cache lock held)" : "");
+        SotcStats::arena_bytes.fetch_add(alloc_info.allocationSize, std::memory_order_relaxed);
+        backing_bytes[static_cast<VkDeviceMemory>(exact_memory)] = alloc_info.allocationSize;
+        device_memory = exact_memory;
     }
-    ASSERT_MSG(alloc_result == vk::Result::eSuccess, "Failed to allocate buffer arena memory: {}{}",
-               vk::to_string(alloc_result),
-               collect_deferred ? " (collection deferred: texture cache lock held)" : "");
-    SotcStats::arena_bytes.fetch_add(alloc_info.allocationSize, std::memory_order_relaxed);
 
     boost::container::small_vector<vk::BufferCopy, 8> copies;
     const auto staging =
@@ -1042,7 +1196,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
 
     backing_blocks[static_cast<VkDeviceMemory>(device_memory)] += resident_blocks;
 
-    u64 memory_offset{};
+    u64 memory_offset = memory_base;
     ArenaBinds* binds = BindsForArena(arena);
     auto* bda_addrs = reinterpret_cast<vk::DeviceAddress*>(staging.mapped);
     u64 offset = staging.offset;
@@ -1086,13 +1240,46 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         total_size_bytes += size;
     });
     if (!copies.empty()) {
+        const SotcStats::FrameTimer frame_timer{SotcStats::FrameBuffer};
+        if (SotcStats::kFpsLog) {
+            SotcStats::frame_copy_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
+        }
         SotcStats::uploads.fetch_add(1, std::memory_order_relaxed);
         if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer
             SotcStats::upload_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
         }
         const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
+        // sotc: a large upload made of several ranges (a streaming burst: 200+ MB in one frame)
+        // is copied in one parallel pass over 512 KiB pieces of all its ranges; per range, only
+        // ranges of 2 MiB and more were split. SOTC_COPY_BATCH=0: per range.
+        static const bool copy_batch = [] {
+            const char* v = std::getenv("SOTC_COPY_BATCH");
+            return !v || v[0] != '0';
+        }();
+        if (copy_batch && copies.size() > 1 && total_size_bytes >= 2_MB && BbCopy::Enabled()) {
+            struct Piece {
+                VAddr source;
+                u8* dest;
+                u64 size;
+            };
+            constexpr u64 PieceSize = 512_KB;
+            boost::container::small_vector<Piece, 64> pieces;
+            for (const auto& copy : copies) {
+                for (u64 done = 0; done < copy.size; done += PieceSize) {
+                    pieces.push_back({copy.dstOffset + done, staging.mapped + copy.srcOffset + done,
+                                      std::min(PieceSize, copy.size - done)});
+                }
+            }
+            BbCopy::ParallelFor(pieces.size(), [&](std::size_t i) {
+                memory->CopySparseMemory(pieces[i].source, pieces[i].dest, pieces[i].size);
+            });
+        } else {
+            for (const auto& copy : copies) {
+                memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset,
+                                         copy.size);
+            }
+        }
         for (auto& copy : copies) {
-            memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);
             copy.srcOffset += staging.offset;
             copy.dstOffset -= arena->cpu_addr;
         }
@@ -1173,14 +1360,20 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
     if (first_block >= end_block) {
         return;
     }
+    evicted_ranges.Subtract(first_block, end_block);
+    pinned_ranges.Subtract(first_block, end_block);
     boost::container::small_vector<Backing, 16> released;
-    resident_ranges.ForEachInRange(first_block, end_block, [&](const Backing& backing) {
-        const u64 start = std::max(first_block, backing.start);
-        const u64 end = std::min(end_block, backing.end);
-        if (start < end) {
-            released.push_back(backing.SubRange(start, end));
-        }
-    });
+    const auto collect = [&] {
+        released.clear();
+        resident_ranges.ForEachInRange(first_block, end_block, [&](const Backing& backing) {
+            const u64 start = std::max(first_block, backing.start);
+            const u64 end = std::min(end_block, backing.end);
+            if (start < end) {
+                released.push_back(backing.SubRange(start, end));
+            }
+        });
+    };
+    collect();
     if (released.empty()) {
         return;
     }
@@ -1188,6 +1381,31 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
     // ordered against earlier submissions: finish that work before unbinding, or the GPU
     // writes to unbound memory (WriteInvalid, device lost). Unmaps are rare, the sync is cheap.
     scheduler.Finish();
+    // sotc: the deferred operations Finish ran (fault buffer rebinds) may have bound more of
+    // the range, and their binds must not share the unbind's sparse batch.
+    collect();
+    if (!pending_binds.empty()) {
+        scheduler.Flush();
+    }
+    UnbindResident(released);
+    std::erase_if(hot_readbacks, [&](const HotReadback& hot) {
+        return hot.addr < (end_block << block_shift) &&
+               (first_block << block_shift) < hot.addr + hot.size;
+    });
+    resident_ranges.Subtract(first_block, end_block);
+    ++resident_version; // sotc: invalidates the merged DMA runs
+    {
+        std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+        gpu_modified_ranges.Subtract(first_block << block_shift,
+                                     (end_block - first_block) << block_shift);
+    }
+    // sotc: a bind of the same blocks (the guest maps them again) must not share the unbind's
+    // sparse bind batch: binds of one range within a batch are not ordered (the evicted blocks
+    // of MaybeEvictCold came back unbound: black scenes).
+    scheduler.Flush();
+}
+
+void BufferCache::UnbindResident(std::span<const Backing> released) {
     for (const Backing& range : released) {
         // Split at arena page boundaries, each page may belong to a different arena.
         for (u64 start = range.start; start < range.end;) {
@@ -1213,6 +1431,13 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
             it->second -= std::min(it->second, range.end - range.start);
             if (it->second == 0) {
                 backing_blocks.erase(it);
+                if (memory == static_cast<VkDeviceMemory>(arena_slab)) {
+                    arena_slab = vk::DeviceMemory{}; // sotc: its free tail goes with it
+                }
+                if (auto bytes = backing_bytes.find(memory); bytes != backing_bytes.end()) {
+                    SotcStats::arena_bytes.fetch_sub(bytes->second, std::memory_order_relaxed);
+                    backing_bytes.erase(bytes);
+                }
                 // The unbind is submitted before this tick's work, which waits for it.
                 scheduler.DeferOperation([device = instance.GetDevice(), memory = range.memory] {
                     device.freeMemory(memory);
@@ -1220,20 +1445,210 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
             }
         }
     }
-    std::erase_if(hot_readbacks, [&](const HotReadback& hot) {
-        return hot.addr < (end_block << block_shift) &&
-               (first_block << block_shift) < hot.addr + hot.size;
-    });
-    resident_ranges.Subtract(first_block, end_block);
-    ++resident_version; // sotc: invalidates the merged DMA runs
-    {
-        std::unique_lock gpu_modified_lock{gpu_modified_mutex};
-        gpu_modified_ranges.Subtract(first_block << block_shift,
-                                     (end_block - first_block) << block_shift);
+}
+
+bool BufferCache::MaybeEvictCold(std::chrono::steady_clock::time_point now) {
+    // sotc: the game keeps its 4 GiB direct memory pool mapped and hands its addresses out
+    // again and again, so arena blocks became resident once and stayed: ~45 MB/min in the
+    // attract demo, over the 6 GB card's budget after ~40 minutes. Once resident arena memory
+    // passes SOTC_ARENA_EVICT_MB (default 1536, 0 = never), allocations (4 MiB slabs or exact
+    // ones) whose blocks were not bound for SOTC_ARENA_EVICT_IDLE_S (default 30) seconds and
+    // hold no GPU-modified data go back, coldest first, up to SOTC_ARENA_EVICT_STEP_MB (default
+    // 64) per check (every 2 s). Their guest pages are marked CPU-modified, so the next bind
+    // uploads them again.
+    // The arena does not always match guest memory on pages the tracker calls clean (attract
+    // demo: 0-13,000 of 2,000-65,000 pages per run; mostly not image memory). Uploading guest
+    // memory over those blanked whole scenes, so each allocation is read back first and goes
+    // only when every page that is not CPU-modified is equal (a mismatch is tried again after
+    // 60 s). Shaders reading arena memory through pointers fault an evicted block back in (one
+    // frame of zeros); blocks that came back that way stay resident from then on.
+    static const u64 limit = [] {
+        const char* v = std::getenv("SOTC_ARENA_EVICT_MB");
+        return (v ? std::strtoull(v, nullptr, 10) : 1536ull) << 20;
+    }();
+    static const u64 step = [] {
+        const char* v = std::getenv("SOTC_ARENA_EVICT_STEP_MB");
+        return std::max<u64>(v ? std::strtoull(v, nullptr, 10) : 64ull, 1) << 20;
+    }();
+    static const u16 idle_epochs = [] {
+        const char* v = std::getenv("SOTC_ARENA_EVICT_IDLE_S");
+        return static_cast<u16>(std::clamp<unsigned long>(v ? std::strtoul(v, nullptr, 10) : 30ul,
+                                                          2ul, 30000ul));
+    }();
+    if (now < next_evict_check) {
+        return false;
     }
+    next_evict_check = now + std::chrono::seconds(2);
+    AdvanceUseEpoch(now);
+    const u64 resident = SotcStats::arena_bytes.load(std::memory_order_relaxed);
+    if (limit == 0 || resident <= limit) {
+        return false;
+    }
+    const SotcStats::ScopedTimer evict_timer{SotcStats::arena_evict_ns};
+    struct Candidate {
+        u16 age{0xFFFF}; // youngest block
+        bool keep{};
+        u64 bytes{};
+        boost::container::small_vector<Backing, 4> ranges;
+    };
+    std::unordered_map<VkDeviceMemory, Candidate> candidates;
+    for (const Backing& range : resident_ranges) {
+        auto& candidate = candidates[static_cast<VkDeviceMemory>(range.memory)];
+        if (candidate.keep) {
+            continue;
+        }
+        for (u64 block = range.start; block < range.end && !candidate.keep; ++block) {
+            const u16 age = static_cast<u16>(use_epoch - block_last_use[block]);
+            candidate.age = std::min(candidate.age, age);
+            candidate.keep = age < idle_epochs;
+        }
+        const VAddr addr = range.start << block_shift;
+        const u64 size = (range.end - range.start) << block_shift;
+        candidate.keep = candidate.keep || pinned_ranges.Overlaps(range.start, range.end) ||
+                         memory_tracker->IsRegionGpuModified(addr, size) ||
+                         gpu_modified_ranges.Intersects(addr, size);
+        candidate.ranges.push_back(range);
+    }
+    std::erase_if(evict_retry, [&](const auto& entry) { return entry.second <= now; });
+    std::vector<std::pair<u16, VkDeviceMemory>> order;
+    for (auto& [memory, candidate] : candidates) {
+        if (candidate.keep || memory == static_cast<VkDeviceMemory>(arena_slab) ||
+            evict_retry.contains(memory)) {
+            continue;
+        }
+        const auto bytes = backing_bytes.find(memory);
+        candidate.bytes = bytes != backing_bytes.end() ? bytes->second : 0;
+        if (candidate.bytes > step) {
+            continue; // one read-back and compare per check stays within `step`
+        }
+        order.emplace_back(candidate.age, memory);
+    }
+    if (order.empty()) {
+        next_evict_check = now + std::chrono::seconds(10); // all of it in use: look again later
+        return false;
+    }
+    std::ranges::sort(order, std::greater{});
+
+    // Read the coldest allocations back, up to `step` bytes of blocks.
+    struct Piece {
+        VAddr addr;
+        u64 size;
+        u64 offset; // in the download
+    };
+    struct Chosen {
+        VkDeviceMemory memory;
+        std::vector<Piece> pieces;
+    };
+    std::vector<Chosen> chosen;
+    u64 total = 0;
+    for (const auto& [age, memory] : order) {
+        if (total >= step || resident - total <= limit / 8 * 7) {
+            break;
+        }
+        Chosen& pick = chosen.emplace_back(Chosen{memory, {}});
+        for (const Backing& range : candidates[memory].ranges) {
+            // Split at arena page boundaries, each page may belong to a different arena.
+            for (u64 start = range.start; start < range.end;) {
+                const u64 page = start >> blocks_per_arena_page_shift;
+                const u64 end = std::min(range.end, (page + 1) << blocks_per_arena_page_shift);
+                pick.pieces.push_back({start << block_shift, (end - start) << block_shift, total});
+                total += (end - start) << block_shift;
+                start = end;
+            }
+        }
+    }
+    const auto download = staging_pool.Request(total, MemoryType::HostCached, 0, true);
+    for (const Chosen& pick : chosen) {
+        for (const Piece& piece : pick.pieces) {
+            const Buffer* arena = address_space[piece.addr >> ARENA_PAGE_BITS];
+            if (!arena) {
+                continue; // never resident: the comparison fails and the allocation stays
+            }
+            const vk::BufferCopy copy{arena->Offset(piece.addr), download.offset + piece.offset,
+                                      piece.size};
+            runtime.CopyBuffer(arena, download.buffer, std::span{&copy, 1});
+        }
+    }
+    // Also lets work already recorded finish reading these blocks before they are unbound.
+    scheduler.Finish();
+    download.buffer->Invalidate(download.offset, download.size);
+
+    std::vector<Backing> released;
+    std::array<u8, 4096> guest;
+    for (const Chosen& pick : chosen) {
+        bool equal = true;
+        for (const Piece& piece : pick.pieces) {
+            for (u64 at = 0; at < piece.size && equal; at += guest.size()) {
+                const VAddr addr = piece.addr + at;
+                if (memory_tracker->IsRegionCpuModified(addr, guest.size())) {
+                    continue; // uploaded at the next bind anyway
+                }
+                if (!memory->TryCopySparseMemory(addr, guest.data(), guest.size())) {
+                    continue; // unmapped: nothing can read it
+                }
+                equal = std::memcmp(download.mapped + piece.offset + at, guest.data(),
+                                    guest.size()) == 0;
+            }
+        }
+        const u64 bytes = candidates[pick.memory].bytes;
+        if (!equal) {
+            evict_retry.emplace(pick.memory, now + std::chrono::seconds(60));
+            SotcStats::arena_evict_mismatch.fetch_add(bytes, std::memory_order_relaxed);
+            continue;
+        }
+        const auto& ranges = candidates[pick.memory].ranges;
+        released.insert(released.end(), ranges.begin(), ranges.end());
+    }
+    staging_pool.FreeDeferred(download);
+    // Binds queued by Finish's deferred operations (fault rebinds, arena migration) must not
+    // share the unbind's sparse batch; the chosen ranges must still be resident as chosen.
+    if (!pending_binds.empty()) {
+        scheduler.Flush();
+    }
+    std::erase_if(released, [&](const Backing& range) {
+        bool same = false;
+        resident_ranges.ForEachInRange(range.start, range.end, [&](const Backing& now_range) {
+            same |= now_range.start <= range.start && range.end <= now_range.end &&
+                    now_range.memory == range.memory;
+        });
+        return !same;
+    });
+    for (const Backing& range : released) {
+        const VAddr addr = range.start << block_shift;
+        const u64 size = (range.end - range.start) << block_shift;
+        memory_tracker->MarkRegionAsCpuModified(addr, size);
+        evicted_ranges.Add({range.start, range.end});
+        SotcStats::arena_evicted.fetch_add(size, std::memory_order_relaxed);
+        std::erase_if(hot_readbacks, [&](const HotReadback& hot) {
+            return hot.addr < addr + size && addr < hot.addr + hot.size;
+        });
+        resident_ranges.Subtract(range.start, range.end);
+    }
+    if (!released.empty()) {
+        UnbindResident(released);
+        ++resident_version; // sotc: invalidates the merged DMA runs and the resident cache
+        // A bind of the same blocks recorded before the next submit would share one sparse
+        // bind batch with the unbind; submit the unbind on its own.
+        scheduler.Flush();
+    }
+    SotcStats::arena_evict_runs.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void BufferCache::NoteFaultRebind(VAddr addr, u64 size) {
+    const u64 first_block = addr >> block_shift;
+    const u64 end_block = (addr + size + block_size - 1) >> block_shift;
+    evicted_ranges.ForEachInRange(first_block, end_block, [&](const Interval& evicted) {
+        const u64 start = std::max(first_block, evicted.start);
+        const u64 end = std::min(end_block, evicted.end);
+        pinned_ranges.Add({start, end});
+        SotcStats::arena_pinned.fetch_add((end - start) << block_shift, std::memory_order_relaxed);
+    });
 }
 
 void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
+    // sotc: binds stamp blocks with use_epoch; keep it current even when no eviction check runs.
+    AdvanceUseEpoch(std::chrono::steady_clock::now());
     if (pending_binds.empty()) {
         return;
     }

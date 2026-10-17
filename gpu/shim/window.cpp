@@ -116,9 +116,6 @@ bool WindowSDL::PollEvents() {
             UpdateTextTitle();
         }
     }
-    if (!text_active) {
-        BbOverlay::UpdateTextInput(window);
-    }
     SDL_Event event;
     while (SDL_PollEvent(&event)) {
         if (text_active && (event.type == SDL_EVENT_TEXT_INPUT || event.type == SDL_EVENT_KEY_DOWN)) {

@@ -117,6 +117,7 @@ bool Rasterizer::FilterDraw() {
 }
 
 void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
+    const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the targets
     // Prefetch render targets to handle overlaps with bound textures (e.g. mipgen)
     const auto& key = pipeline->GetGraphicsKey();
     const auto& regs = liverpool->DrawRegs();
@@ -826,14 +827,19 @@ void Rasterizer::FlushPeriodic() {
                    : 0u;
     }();
     // sotc: the command buffer wrote a page the guest reads back: submit it now, the GPU runs
-    // it while the guest gets there, and the readback finds it done (or nearly). SOTC_RB_EARLY=1
-    // turns it on; measured within noise on the attract demo, so off by default.
+    // it while the guest gets there, and the readback finds it done (or nearly). Within noise
+    // when the command processor was slower; on by default since 2026-10-16 (SOTC_RB_EARLY=0
+    // off): attract demo 53.6/54.5 -> 55.3/55.7 FPS (open world: 400-490 readbacks/s waited
+    // ~10% of the thread), Shrine unchanged (34.2 vs 34.1).
     if (SotcStats::kFpsLog) { // sotc: read only by the SOTC_FPS printer (sotc_stats.h)
-        SotcStats::commands.fetch_add(1, std::memory_order_relaxed);
+        // sotc: written by this thread only: a plain add, no lock prefix (an atomic RMW here
+        // waits for the thread's pending stores, ~1.8% of it). The printer takes deltas.
+        SotcStats::commands.store(SotcStats::commands.load(std::memory_order_relaxed) + 1,
+                                  std::memory_order_relaxed);
     }
     static const bool early = [] {
         const char* v = std::getenv("SOTC_RB_EARLY");
-        return v && v[0] == '1';
+        return !v || v[0] != '0';
     }();
     if (early && !scheduler.IsRendering() && buffer_cache.TakeHotWrite()) {
         SotcStats::early_flushes.fetch_add(1, std::memory_order_relaxed);
@@ -841,6 +847,10 @@ void Rasterizer::FlushPeriodic() {
         return;
     }
     if (every == 0) {
+        // sotc: without periodic submits, look for cold arena memory every 1024 commands.
+        if ((++evict_poll & 1023) == 0 && !scheduler.IsRendering()) {
+            buffer_cache.MaybeEvictCold(std::chrono::steady_clock::now());
+        }
         return;
     }
     // sotc: submit by recording time instead (SOTC_FLUSH_US, default 1000 where the periodic
@@ -864,9 +874,19 @@ void Rasterizer::FlushPeriodic() {
     }
     ++commands_since_submit;
     if (flush_us != 0) {
-        const auto elapsed = std::chrono::steady_clock::now() - commands_since;
+        // sotc: the clock is read every 8th command (~40 us at the Shrine against 1000 us),
+        // not on every one (~0.5% of the command processor in QueryPerformanceCounter).
+        if ((commands_since_submit & 7) != 0) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed = now - commands_since;
         const auto limit = std::chrono::microseconds(flush_us);
         if (elapsed < limit || (scheduler.IsRendering() && elapsed < limit * 4)) {
+            return;
+        }
+        // sotc: cold arena memory goes back at a submit point outside a render pass.
+        if (!scheduler.IsRendering() && buffer_cache.MaybeEvictCold(now)) {
             return;
         }
         scheduler.Flush();
@@ -874,6 +894,10 @@ void Rasterizer::FlushPeriodic() {
     }
     if (commands_since_submit < every ||
         (scheduler.IsRendering() && commands_since_submit < u64{every} * 4)) {
+        return;
+    }
+    if (!scheduler.IsRendering() &&
+        buffer_cache.MaybeEvictCold(std::chrono::steady_clock::now())) {
         return;
     }
     scheduler.Flush();
@@ -1084,6 +1108,9 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     // Perform image copy
     VideoCore::Image& src_image = desc0.is_written ? image1 : image0;
     VideoCore::Image& dst_image = desc0.is_written ? image0 : image1;
+    // sotc: the destination was found by address, not by a writer lookup: its first GPU write
+    // moves the mip-tail epoch (CopyColorAndDepth only passes the flag on).
+    VideoCore::MarkGpuModified(dst_image);
     runtime.CopyColorAndDepth(&src_image, &dst_image);
     return true;
 }
@@ -1286,6 +1313,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 }
 
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
+    const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the pass
     image_bindings.clear();
     const u32 first_image_idx = image_infos.size();
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
@@ -1520,6 +1548,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 }
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
+    const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the attachments
     attachment_feedback_loop = false;
     // sotc: SOTC_RT_FAST (default on) drops redundant attachment work: FindRenderTarget repeats
     // UpdateImage only when the image still needs it, and the CMASK/HTILE clear bit is read and
@@ -1857,9 +1886,16 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
         buffer_cache.DropGpuModified(addr, size);
     }
     // Give the arena memory back; it runs on the GPU thread, ordered before later draws.
-    // Releasing arena memory on unmap still races with in-flight GPU work during loads
-    // (device lost, silent crashes loading a save), so it is opt-in for now.
-    static const bool release_enabled = std::getenv("SOTC_ARENA_RELEASE") != nullptr;
+    // sotc: on by default since 2026-10-16 (SOTC_ARENA_RELEASE=0: never released). It was
+    // opt-in because it raced with in-flight GPU work during loads (device lost loading a save,
+    // seen before ReleaseMemory finished the GPU work first). Never releasing grew video memory
+    // ~90 MB a minute in the attract demo (1.6 -> 6.0 GB in 48 minutes on a 6 GB card) until an
+    // arena allocation failed (ASSERT). Released, the 25-minute curve stays ~0.7-0.9 GB lower;
+    // no device loss in that run nor in three shrine runs that each load a save.
+    static const bool release_enabled = [] {
+        const char* v = std::getenv("SOTC_ARENA_RELEASE");
+        return !v || v[0] != '0';
+    }();
     if (release_enabled) {
         liverpool->SendCommand<false>(
             [this, addr, size] { buffer_cache.ReleaseMemory(addr, size); });

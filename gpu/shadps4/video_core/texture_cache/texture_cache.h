@@ -4,6 +4,8 @@
 #pragma once
 
 #include <condition_variable>
+#include <cstdlib>
+#include <optional>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -12,6 +14,7 @@
 #include <tsl/robin_map.h>
 
 #include "common/lru_cache.h"
+#include "video_core/sotc_stats.h"
 #include "common/multi_level_page_table.h"
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
@@ -33,6 +36,207 @@ namespace VideoCore {
 
 class BufferCache;
 class PageManager;
+
+/// sotc: SOTC_MIP_TAIL: 0 off, 1 mip-tail images for T#s with LOD streaming counters, 2 (default)
+/// for every read-only colour T# whose base_level is above 0 (TextureCache::DecideRebase). Mode 2
+/// left out 2.5 GB of never-sampled mips in the attract demo: peak video memory 6.1 -> 3.3-3.5 GB
+/// on a 6 GB card, frames over 50 ms 150 -> 102-112, the worst streaming frame 460 -> 250-310 ms.
+inline u32 MipTailMode() {
+    static const u32 mode = [] {
+        const char* v = std::getenv("SOTC_MIP_TAIL");
+        return v && (v[0] == '0' || v[0] == '1' || v[0] == '2') ? static_cast<u32>(v[0] - '0')
+                                                                  : 2u;
+    }();
+    return mode;
+}
+
+/// sotc: the texture cache lock, re-entrant on its owner thread. The command processor holds it
+/// over a whole binding pass (Rasterizer::BindTextures, BeginRendering, PrepareRenderState), so the
+/// FindImage and UpdateImage calls inside (two per texture, ~62,000 per frame at the Shrine) only
+/// count their depth. SOTC_TC_BATCH=0 drops the outer holds (every call locks as before).
+///
+/// It is also biased to the command processor (the first thread to take a batch hold): there it
+/// is a plain store and load. Any atomic read-modify-write on that thread waits for its pending
+/// stores to drain (write-combined staging copies among them): the uncontended std::mutex, and
+/// then a spinlock's xchg, each cost ~5% of the thread at ~10,000 holds per frame. Other threads
+/// (guest write faults, ~200 per frame) take a spinlock, announce themselves and run an
+/// asymmetric barrier (FlushProcessWriteBuffers) before waiting for the command processor to
+/// leave: either its store of fast_held is visible to them after the barrier, or its following
+/// load of slow_wants sees theirs. SOTC_TC_BIASED=0: every thread takes the spinlock.
+class alignas(64) ReentrantMutex {
+public:
+    /// Makes the calling thread the biased owner (once).
+    void SetFastThread() {
+        if (!fast_token.load(std::memory_order_relaxed) && Biased() && !HeldByThisThread()) {
+            // Under the spinlock: a thread holding it read fast_token as null and skipped the
+            // announcement, so the biased path must not start before it leaves.
+            RawLock();
+            fast_token.store(Token(), std::memory_order_relaxed);
+            word.store(0, std::memory_order_release);
+        }
+    }
+    void lock() {
+        const void* self = Token();
+        if (owner.load(std::memory_order_relaxed) == self) {
+            ++depth;
+            return;
+        }
+        if (self == fast_token.load(std::memory_order_relaxed)) {
+            if (FastTryAcquire()) {
+                mode = Mode::Fast;
+            } else {
+                RawLock(); // a guest holds it or is waiting for us: queue behind it
+                mode = Mode::FastSlow;
+            }
+        } else {
+            RawLock();
+            AnnounceAndWait();
+            mode = Mode::Slow;
+        }
+        owner.store(self, std::memory_order_relaxed);
+        depth = 1;
+    }
+    bool try_lock() {
+        const void* self = Token();
+        if (owner.load(std::memory_order_relaxed) == self) {
+            ++depth;
+            return true;
+        }
+        if (self == fast_token.load(std::memory_order_relaxed)) {
+            if (!FastTryAcquire()) {
+                return false;
+            }
+            mode = Mode::Fast;
+        } else {
+            if (!RawTryLock()) {
+                return false;
+            }
+            if (!AnnounceAndTry()) {
+                return false;
+            }
+            mode = Mode::Slow;
+        }
+        owner.store(self, std::memory_order_relaxed);
+        depth = 1;
+        return true;
+    }
+    bool HeldByThisThread() const {
+        return owner.load(std::memory_order_relaxed) == Token();
+    }
+    void unlock() {
+        if (--depth != 0) {
+            return;
+        }
+        owner.store(nullptr, std::memory_order_relaxed);
+        switch (mode) {
+        case Mode::Fast:
+            fast_held.store(0, std::memory_order_release);
+            break;
+        case Mode::Slow:
+            slow_wants.store(0, std::memory_order_release);
+            word.store(0, std::memory_order_release);
+            break;
+        case Mode::FastSlow:
+            word.store(0, std::memory_order_release);
+            break;
+        }
+    }
+
+private:
+    enum class Mode : u8 { Fast, Slow, FastSlow };
+
+    static bool Biased() {
+        static const bool on = [] {
+            const char* v = std::getenv("SOTC_TC_BIASED");
+            return !v || v[0] != '0';
+        }();
+        return on;
+    }
+    /// Only the owner stores its own token, and clears it before unlocking, so a thread reads
+    /// its token back exactly while it holds the lock.
+    static const void* Token() {
+        static thread_local char token;
+        return &token;
+    }
+    /// FlushProcessWriteBuffers on Windows, a full fence elsewhere (texture_cache.cpp).
+    static void AsymmetricBarrier();
+    static void Pause(u32& spins) {
+        if (++spins < 4096) {
+            __builtin_ia32_pause();
+        } else {
+            std::this_thread::yield();
+        }
+    }
+    bool FastTryAcquire() {
+        fast_held.store(1, std::memory_order_relaxed);
+#ifdef _WIN32
+        std::atomic_signal_fence(std::memory_order_seq_cst); // the barrier is on the other side
+#else
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
+        if (slow_wants.load(std::memory_order_acquire) == 0) {
+            return true;
+        }
+        fast_held.store(0, std::memory_order_release);
+        return false;
+    }
+    void AnnounceAndWait() {
+        if (!fast_token.load(std::memory_order_relaxed)) {
+            return; // no biased owner (SOTC_TC_BIASED=0, or before the first batch hold)
+        }
+        slow_wants.store(1, std::memory_order_relaxed);
+        AsymmetricBarrier();
+        for (u32 spins = 0; fast_held.load(std::memory_order_acquire);) {
+            Pause(spins);
+        }
+    }
+    bool AnnounceAndTry() {
+        if (!fast_token.load(std::memory_order_relaxed)) {
+            return true;
+        }
+        slow_wants.store(1, std::memory_order_relaxed);
+        AsymmetricBarrier();
+        if (!fast_held.load(std::memory_order_acquire)) {
+            return true;
+        }
+        slow_wants.store(0, std::memory_order_release);
+        word.store(0, std::memory_order_release);
+        return false;
+    }
+    void RawLock() {
+        if (!word.exchange(1, std::memory_order_acquire)) {
+            return;
+        }
+        for (u32 spins = 0;;) {
+            while (word.load(std::memory_order_relaxed)) {
+                Pause(spins);
+            }
+            if (!word.exchange(1, std::memory_order_acquire)) {
+                return;
+            }
+        }
+    }
+    bool RawTryLock() {
+        return !word.load(std::memory_order_relaxed) &&
+               !word.exchange(1, std::memory_order_acquire);
+    }
+    std::atomic<u32> word{0};       ///< spinlock of the other threads (and of the biased owner
+                                    ///< when it had to queue behind them)
+    std::atomic<u32> slow_wants{0}; ///< a thread holding `word` waits for or holds the lock
+    std::atomic<const void*> fast_token{nullptr};
+    std::atomic<const void*> owner{nullptr};
+    u32 depth = 0;
+    Mode mode = Mode::Fast;
+    alignas(64) std::atomic<u32> fast_held{0}; ///< the biased owner holds it (written by it only)
+};
+
+inline bool TextureLockBatching() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_TC_BATCH");
+        return !v || v[0] != '0';
+    }();
+    return on;
+}
 
 class TextureCache {
     // Default values for garbage collection
@@ -65,10 +269,21 @@ public:
         ImageViewInfo view_info;
         BindingType type{BindingType::Texture};
 
+        // sotc: mip-tail candidate (SOTC_MIP_TAIL, DecideRebase): the T#'s base_level (0: not a
+        // candidate) and min_lod, whether `info` holds the tail now, and the other info (the
+        // tail while `info` is the full chain, the full chain while `info` is the tail).
+        u8 rebase_mip{};
+        bool rebased_now{};
+        u16 orig_min_lod{};
+        std::optional<ImageInfo> other_info;
+
         ImageDesc() = default;
         ImageDesc(const AmdGpu::Image& image, const Shader::ImageResource& desc)
             : info{image, desc}, view_info{image, desc},
-              type{desc.is_written ? BindingType::Storage : BindingType::Texture} {}
+              type{desc.is_written ? BindingType::Storage : BindingType::Texture} {
+            InitMipTail(image, desc);
+        }
+        void InitMipTail(const AmdGpu::Image& image, const Shader::ImageResource& resource);
         ImageDesc(const AmdGpu::ColorBuffer& buffer, AmdGpu::CbDbExtent hint)
             : info{buffer, hint}, view_info{buffer}, type{BindingType::RenderTarget} {}
         ImageDesc(const AmdGpu::DepthBuffer& buffer, AmdGpu::DepthView view,
@@ -127,12 +342,42 @@ public:
     [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc,
                                               bool update = true);
 
+    /// sotc: holds the cache lock over a binding pass (ReentrantMutex); empty with
+    /// SOTC_TC_BATCH=0.
+    [[nodiscard]] std::unique_lock<ReentrantMutex> BatchLock() {
+        mutex.SetFastThread();
+        if (!TextureLockBatching()) {
+            return {};
+        }
+        std::unique_lock lk{mutex, std::defer_lock};
+        LockCounted(lk);
+        return lk;
+    }
+
+    /// sotc: locks `mutex`, counting contention (SOTC_CMD_STATS, SOTC sys line).
+    static void LockCounted(std::unique_lock<ReentrantMutex>& lk) {
+        if (SotcStats::kCmdStats && !lk.mutex()->HeldByThisThread()) {
+            SotcStats::sys_tc_locks.fetch_add(1, std::memory_order_relaxed);
+            if (lk.try_lock()) return;
+            SotcStats::sys_tc_contended.fetch_add(1, std::memory_order_relaxed);
+            const auto start = std::chrono::steady_clock::now();
+            lk.lock();
+            SotcStats::sys_tc_wait_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - start).count(),
+                std::memory_order_relaxed);
+            return;
+        }
+        lk.lock();
+    }
+
     /// Retrieves the depth target with specified properties
     [[nodiscard]] ImageView& FindDepthTarget(ImageId image_id, const ImageDesc& desc);
 
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
-        std::scoped_lock lk{mutex};
+        std::unique_lock lk{mutex, std::defer_lock};
+        LockCounted(lk);
         Image& image = slot_images[image_id];
         TrackImage(image_id);
         TouchImage(image);
@@ -367,6 +612,14 @@ private:
 
     /// sotc: image memory by class, every 5 s with SOTC_FPS (telemetry only).
     void Census();
+
+    /// sotc: mip-tail images (SOTC_MIP_TAIL), see DecideRebase.
+    bool IsSafeToDelete(const Image& image) const;
+    bool DecideRebase(ImageDesc& desc, bool exact_fmt);
+    void MipTailCreated(ImageId image_id, const ImageDesc& desc);
+    void FreeRebased(ImageId image_id, std::atomic<std::uint64_t>& counter);
+    /// First GPU write of a target or storage image (FindTexture/RenderTarget/DepthTarget).
+    void MarkWritten(Image& image);
     void GarbageCollectSamplers();
 
 private:
@@ -395,12 +648,18 @@ private:
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     const bool readback_linear_images;
     PageTable page_table;
-    std::mutex mutex;
+    /// sotc: images registered per page_table page (1 MiB), read without the lock by
+    /// InvalidateMemory (guest write faults).
+    static constexpr u64 NumImagePages = u64{1} << (Traits::ADDRESS_SPACE_BITS - Traits::PAGE_BITS);
+    std::unique_ptr<std::atomic<u32>[]> page_images{new std::atomic<u32>[NumImagePages]()};
+    ReentrantMutex mutex;
     /// sotc: RefreshImage nesting on this thread (it runs under `mutex`).
     static inline thread_local u32 refresh_depth = 0;
     /// sotc: deferred EmergencyCollect level + 1 (0: none).
     std::atomic<u32> pending_emergency{0};
-    /// sotc: FindImage's perfect matches, valid while no image is registered or unregistered.
+    /// sotc: FindImage's perfect matches, valid while no image is registered or unregistered
+    /// (a mip-tail image's also while gpu_modified_epoch stays). `writer`: stored by a writer
+    /// lookup (with mip tails on, writers only take those).
     struct FindMemo {
         VAddr guest_address{};
         u64 guest_size{};
@@ -408,11 +667,18 @@ private:
         vk::Format pixel_format{};
         AmdGpu::ImageType type{};
         bool exact_fmt{};
+        bool writer{};
         u64 generation{~0ULL};
         ImageId image_id{};
+        u64 gpu_epoch{};
     };
     static constexpr size_t NumFindMemos = 1024;
     std::array<FindMemo, NumFindMemos> find_memos{};
+    FindMemo& MemoSlot(const ImageInfo& info, bool exact_fmt, bool writer);
+    /// The memoized perfect match for a lookup, or none (SOTC_FIND_MEMO=0: always none).
+    ImageId MemoLookup(const ImageInfo& info, bool exact_fmt, bool writer);
+    /// The generation a memo for `address` is valid in (per-address unless SOTC_MEMO_ADDR_GEN=0).
+    u64 MemoGeneration(VAddr address) const;
     u64 image_set_generation{};
     /// sotc: per-address generations for FindMemo. A perfect match needs the same
     /// guest_address, so only (un)registering an image at that address can change the

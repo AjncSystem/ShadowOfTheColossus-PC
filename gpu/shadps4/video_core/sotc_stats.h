@@ -33,12 +33,14 @@ inline std::atomic<uint64_t> readback_bytes_changed{0};
 inline std::atomic<uint64_t> uploads{0};        ///< SynchronizeMemory copies (CPU data to GPU)
 /// DMA sweeps (SynchronizeDmaBuffers): count, resident ranges visited, sweeps that uploaded.
 inline std::atomic<uint64_t> dma_sweeps{0}, dma_sweep_ranges{0}, dma_sweep_uploading{0};
+/// ... merged runs visited, and time (ns) in all sweeps and in the ones that uploaded nothing.
+inline std::atomic<uint64_t> dma_sweep_runs{0}, dma_sweep_ns{0}, dma_sweep_idle_ns{0};
 inline std::atomic<uint64_t> upload_bytes{0};
 inline std::atomic<uint64_t> render_breaks{0};  ///< EndRendering that closed a render pass
 inline std::atomic<uint64_t> fault_writes{0};       ///< guest write faults on tracked pages
 inline std::atomic<uint64_t> fault_walker{0};       ///< SRT walker loads emulated after a fault
 inline std::atomic<uint64_t> fault_gpu_reads{0};    ///< other read faults on the command processor
-inline std::atomic<uint64_t> commands{0};
+inline std::atomic<uint64_t> commands{0}; ///< draws and dispatches recorded (monotonic, CP only)
 /// Command processor waits for the draw thread (Liverpool::IsBackThreaded).
 inline std::atomic<uint64_t> cp_waits{0};
 /// Busy time of the two command processor threads (SOTC_FPS): the draw thread minus the time it
@@ -50,7 +52,14 @@ inline uint64_t NowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
-} ///< draws and dispatches recorded
+}
+/// Change of a monotonic single-writer counter since the last call (`seen` keeps the last value).
+inline uint64_t TakeDelta(const std::atomic<uint64_t>& counter, uint64_t& seen) {
+    const uint64_t now = counter.load(std::memory_order_relaxed);
+    const uint64_t delta = now - seen;
+    seen = now;
+    return delta;
+}
 /// SOTC_CMD_STATS=1: draws, indirect draws (arguments GPU-written / CPU-side / CPU-side and
 /// empty), dispatches, indirect dispatches.
 inline std::atomic<uint64_t> cmd_kinds[6]{};
@@ -58,7 +67,15 @@ inline std::atomic<uint64_t> early_flushes{0}; ///< submits right after a write 
 inline std::atomic<uint64_t> vram_used{0};      ///< device-local usage (VK_EXT_memory_budget), bytes
 inline std::atomic<uint64_t> vram_budget{0};    ///< device-local budget the texture cache plans for
 inline std::atomic<uint64_t> vram_emergency{0}; ///< emergency texture collections (allocation failed)
-inline std::atomic<uint64_t> arena_bytes{0};    ///< resident buffer arena memory (never released)
+inline std::atomic<uint64_t> write_fault_gpu_pending{0}; ///< write-fault readbacks left protected
+inline std::atomic<uint64_t> write_fault_stale_gpu{0};   ///< ... that cleared a stale GPU page bit
+inline std::atomic<uint64_t> arena_bytes{0};    ///< resident buffer arena memory
+inline std::atomic<uint64_t> arena_evicted{0};  ///< arena bytes given back by MaybeEvictCold
+inline std::atomic<uint64_t> arena_rebound{0};  ///< ... bound again afterwards
+inline std::atomic<uint64_t> arena_pinned{0};   ///< ... faulted back in by shaders (kept since)
+inline std::atomic<uint64_t> arena_evict_mismatch{0}; ///< read back unequal to guest memory: kept
+inline std::atomic<uint64_t> arena_evict_runs{0};
+inline std::atomic<uint64_t> arena_evict_ns{0}; ///< time in MaybeEvictCold (scan, GPU wait, unbind)
 inline std::atomic<uint64_t> image_bytes{0};    ///< live texture cache and host pass images
 inline std::atomic<uint64_t> image_count{0};
 inline std::atomic<uint64_t> gc_freed{0};       ///< images freed by the texture garbage collector
@@ -80,6 +97,30 @@ inline std::atomic<uint64_t> stack_reg_spins{0}; ///< stack registry writer spin
 inline std::atomic<uint64_t> fault_grace_marks{0};    ///< pages made hot (repeat-fault grace)
 inline std::atomic<uint64_t> fault_grace_cap_hits{0}; ///< ... refused by the budget
 inline std::atomic<uint64_t> fault_grace_hot_upload_bytes{0}; ///< hot pages uploaded, kept writable
+/// SOTC_CMD_STATS: system calls behind the command processor's time (SOTC sys line): page
+/// protection changes (calls, bytes; made writable), texture cache lock (acquired, contended),
+/// device memory allocations and frees (VMA callbacks).
+inline std::atomic<uint64_t> sys_protects{0}, sys_protect_bytes{0}, sys_unprotects{0};
+inline std::atomic<uint64_t> sys_tc_locks{0}, sys_tc_contended{0}, sys_tc_wait_ns{0};
+inline std::atomic<uint64_t> sys_vk_allocs{0}, sys_vk_frees{0};
+/// ... protect calls from image page watchers (UpdatePageWatchers) and buffer regions.
+inline std::atomic<uint64_t> sys_protect_src[2]{};
+/// ... bytes invalidated: map hook, protect hook (the game's mprotect), HLE fills, all callers
+/// of BufferCache::InvalidateMemory.
+inline std::atomic<uint64_t> inv_map{0}, inv_protect{0}, inv_hle{0}, inv_buffer{0};
+/// Mip-tail images (SOTC_MIP_TAIL, TextureCache::DecideRebase). Census gauges, bytes:
+inline std::atomic<uint64_t> census_rebased{0};         ///< host memory of mip-tail images
+inline std::atomic<uint64_t> census_rebased_count{0};
+inline std::atomic<uint64_t> census_dropped{0};         ///< guest bytes of the mips they leave out
+inline std::atomic<uint64_t> census_projected{0};       ///< what full-chain candidates would save
+inline std::atomic<uint64_t> census_projected_hwcnt{0}; ///< ... of it, T#s with LOD counters
+/// ... and counters (per stats line): tails created, refused (a full chain memoized, a GPU-written
+/// overlap, a full chain in use, a layout RebaseToMip cannot reproduce), tails freed (a writer
+/// overlapped them, an older tail of the same chain), tails re-uploaded instead of hashed
+/// (MaybeCpuDirty), and broken never-written rules (cumulative).
+inline std::atomic<uint64_t> rebase_created{0}, rebase_reuse_full{0}, rebase_skip_gpu{0},
+    rebase_skip_live_full{0}, rebase_skip_layout{0}, rebase_writer_freed{0},
+    rebase_dedup_freed{0}, rebase_maybe_dirty{0}, rebase_violations{0};
 
 /// SOTC_OPT_OFF=1: the 2026-10-14 command-processor optimizations are switched off (replicate
 /// HLE no-change skip, single texel-buffer image sync, rate-limited VRAM queries), for A/B runs
@@ -101,6 +142,79 @@ struct ScopedTimer {
                             std::chrono::steady_clock::now() - start)
                             .count(),
                         std::memory_order_relaxed);
+    }
+};
+
+/// sotc: where the time of slow frames goes (SOTC_FPS, "SOTC FRAMES" line in videoout/driver.cpp).
+/// Command-processor time per cause since the last flip; the flip reads and resets them.
+/// shader: shader translation (CompileModule); pipeline: pipeline creation; upload: texture uploads (RefreshImage); gc:
+/// emergency texture collections; readback: GPU-to-CPU downloads; image: new host images; buffer:
+/// CPU-to-GPU buffer uploads of bound ranges; dma: DMA sweeps; alloc: arena and staging memory
+/// allocation; hash: texture content hashes (RefreshImage); idle: waiting for the game to submit
+/// work. A readback inside an upload counts in
+/// both.
+enum FrameCause {
+    FrameCompile, FramePipeline, FrameUpload, FrameGc, FrameReadback, FrameImage, FrameBuffer,
+    FrameDma, FrameAlloc, FrameHash, FrameIdle, FrameCauses
+};
+inline constexpr const char* kFrameCauseNames[FrameCauses] = {
+    "shader", "pipeline", "upload", "gc",   "readback", "image",
+    "buffer", "dma",      "alloc",  "hash", "idle"};
+/// Bytes copied from guest memory to the GPU since the last flip (SynchronizeMemory).
+inline std::atomic<uint64_t> frame_copy_bytes{0};
+inline std::atomic<uint64_t> frame_ns[FrameCauses]{};
+inline std::atomic<uint64_t> frame_compiles{0}; ///< shader modules and pipelines created
+/// Phases of PipelineCache::CompileModule (SOTC_FPS, "SOTC COMPILE" line): translate, emit SPIR-V,
+/// shader patch lookup, vkCreateShaderModule, cache registration.
+inline std::atomic<uint64_t> compile_phase_ns[5]{};
+/// Memory allocations on the frame path per kind (SOTC_FPS, "SOTC ALLOC" line every 5 s):
+/// count, bytes and time.
+enum AllocKind { AllocArena, AllocStagingBlock, AllocStagingLarge, AllocKinds };
+inline constexpr const char* kAllocKindNames[AllocKinds] = {"arena", "staging-block",
+                                                            "staging-large"};
+inline std::atomic<uint64_t> alloc_count[AllocKinds]{}, alloc_bytes[AllocKinds]{},
+    alloc_ns[AllocKinds]{};
+struct AllocTrace {
+    AllocKind kind;
+    std::chrono::steady_clock::time_point start{};
+    AllocTrace(AllocKind k, uint64_t bytes) : kind{k} {
+        if (kFpsLog) {
+            alloc_count[k].fetch_add(1, std::memory_order_relaxed);
+            alloc_bytes[k].fetch_add(bytes, std::memory_order_relaxed);
+            start = std::chrono::steady_clock::now();
+        }
+    }
+    ~AllocTrace() {
+        if (kFpsLog) {
+            alloc_ns[kind].fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - start)
+                                         .count(),
+                                     std::memory_order_relaxed);
+        }
+    }
+};
+
+/// Adds the scope's duration to frame_ns[cause]; reads no clock unless SOTC_FPS is set. A timer
+/// nested in one of the same cause on the same thread adds nothing (counted once).
+struct FrameTimer {
+    FrameCause cause;
+    bool outer = false;
+    std::chrono::steady_clock::time_point start{};
+    static inline thread_local bool active[FrameCauses]{};
+    explicit FrameTimer(FrameCause c) : cause{c} {
+        if (kFpsLog && !active[c]) {
+            outer = active[c] = true;
+            start = std::chrono::steady_clock::now();
+        }
+    }
+    ~FrameTimer() {
+        if (outer) {
+            active[cause] = false;
+            frame_ns[cause].fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - start)
+                                          .count(),
+                                      std::memory_order_relaxed);
+        }
     }
 };
 

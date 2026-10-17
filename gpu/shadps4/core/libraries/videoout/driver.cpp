@@ -639,6 +639,11 @@ void VideoOutDriver::Flip(const Request& req) {
                 std::fprintf(stderr, "SOTC threads per frame: draw busy %.2f ms, command parse %.2f ms\n",
                              (seconds * 1000.0 - idle_ms) / flips, parse_ms / flips);
             }
+            if (const uint64_t faults =
+                    SotcStats::srt_walker_faults.load(std::memory_order_relaxed)) {
+                std::fprintf(stderr, "SOTC SRT walker loads that read zero: %llu\n",
+                             static_cast<unsigned long long>(faults));
+            }
             const bool cmd_stats = SotcStats::kCmdStats; // sotc: as the counters (sotc_stats.h)
             if (cmd_stats && flips) {
                 double k[6];

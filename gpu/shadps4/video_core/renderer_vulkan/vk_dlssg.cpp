@@ -2,6 +2,8 @@
 // sotc: DLSS Frame Generation through NVIDIA Streamline, see vk_dlssg.h.
 
 #include "video_core/renderer_vulkan/vk_dlssg.h"
+#include "video_core/renderer_vulkan/vk_framegen.h"
+#include "video_core/renderer_vulkan/vk_fsrfg.h"
 
 #include <windows.h>
 
@@ -66,15 +68,17 @@ struct Pending {
 };
 
 /// The inputs of one presentation frame (vk_presenter.h Frame, by id).
-struct FrameInputs {
+struct FrameSlot {
     VmaAllocation depth_alloc{}, mvec_alloc{};
     vk::Image depth, mvec;
     vk::ImageView depth_view, mvec_view;
     VkDeviceMemory depth_memory{}, mvec_memory{};
     vk::Format depth_format{}, mvec_format{};
     u32 width{}, height{};
-    u32 index{};  ///< Streamline frame index, 0: no game frame
-    bool valid{}; ///< depth, motion vectors and constants are set for this frame
+    u32 index{};     ///< Streamline frame index, 0: no game frame
+    bool valid{};    ///< depth, motion vectors and constants are set for this frame
+    bool sl_valid{}; ///< ... and given to Streamline
+    sl::Constants constants{};
     /// Streamline's timeline semaphore and value: DLSS-G is done reading this frame's inputs.
     VkSemaphore inputs_done{};
     u64 inputs_done_value{};
@@ -89,7 +93,7 @@ bool vsync_off = true;  // eVSyncOffRequired
 int log_level = 0;      // SOTC_DLSSG_LOG
 const Instance* g_instance{};
 Pending pending;                     // command processor thread
-std::array<FrameInputs, kMaxFrames> frames;
+std::array<FrameSlot, kMaxFrames> frames;
 u32 next_index = 0;                  // command processor thread
 bool have_prev = false;              // command processor thread
 double prev_pos[3]{}, prev_fwd[3]{}; // command processor thread
@@ -462,7 +466,7 @@ bool MakeConstants(const Pending& p, u32 width, u32 height, sl::Constants& out) 
 
 // ---------------------------------------------------------------------------------------------
 
-void DestroyImages(FrameInputs& f) {
+void DestroyImages(FrameSlot& f) {
     const vk::Device device = g_instance->GetDevice();
     if (f.depth_view) {
         device.destroyImageView(f.depth_view);
@@ -476,7 +480,7 @@ void DestroyImages(FrameInputs& f) {
     if (f.mvec) {
         vmaDestroyImage(g_instance->GetAllocator(), f.mvec, f.mvec_alloc);
     }
-    f = FrameInputs{};
+    f = FrameSlot{};
 }
 
 bool CreateImage(vk::Format format, u32 width, u32 height, bool depth, vk::Image& image,
@@ -529,7 +533,7 @@ bool CreateImage(vk::Format format, u32 width, u32 height, bool depth, vk::Image
     return true;
 }
 
-bool EnsureImages(FrameInputs& f, vk::Format depth_format, vk::Format mvec_format, u32 width,
+bool EnsureImages(FrameSlot& f, vk::Format depth_format, vk::Format mvec_format, u32 width,
                   u32 height) {
     if (f.depth && f.depth_format == depth_format && f.mvec_format == mvec_format &&
         f.width == width && f.height == height) {
@@ -560,6 +564,18 @@ bool Parallel() {
         return !v || v[0] != '0';
     }();
     return parallel;
+}
+
+/// Inputs are captured while DLSS-G or FSR 3 is the frame generation mode.
+bool Capturing() {
+    switch (FrameGen::Current()) {
+    case FrameGen::Mode::Dlss:
+        return supported;
+    case FrameGen::Mode::Fsr:
+        return g_instance != nullptr;
+    default:
+        return false;
+    }
 }
 
 // SOTC_DLSSG_ASSUME_FOCUS=1 (background test runs only): DLSS-G pauses while the game window
@@ -659,8 +675,7 @@ void SetOptions(bool on) {
 } // namespace
 
 PFN_vkGetInstanceProcAddr LoadInterposer() {
-    const char* v = std::getenv("SOTC_DLSSG");
-    if (!v || v[0] != '1') {
+    if (!FrameGen::WantStreamline()) {
         return nullptr;
     }
     if (const char* l = std::getenv("SOTC_DLSSG_LOG")) {
@@ -732,10 +747,16 @@ PFN_vkGetInstanceProcAddr LoadInterposer() {
 }
 
 void OnDeviceCreated(const Instance& instance) {
+    g_instance = &instance;
+    FsrFg::Init(instance);
+    struct ResolveMode {
+        ~ResolveMode() {
+            FrameGen::SetAvailable(supported, FsrFg::Supported());
+        }
+    } resolve_mode; // on every return
     if (!loaded) {
         return;
     }
-    g_instance = &instance;
     sl::AdapterInfo adapter{};
     adapter.vkPhysicalDevice = static_cast<VkPhysicalDevice>(instance.GetPhysicalDevice());
     const sl::Result dlssg = api.is_supported(sl::kFeatureDLSS_G, adapter);
@@ -792,7 +813,7 @@ bool WantsImmediatePresent() {
 
 void NoteDraw(const AmdGpu::Regs& regs, u32 mrt_mask, VideoCore::ImageId depth_id,
               VideoCore::ImageId mvec_id, VideoCore::TextureCache& texture_cache) {
-    if (!supported || pending.captured || !(mrt_mask & (1u << 4)) || !depth_id || !mvec_id) {
+    if (pending.captured || !(mrt_mask & (1u << 4)) || !depth_id || !mvec_id || !Capturing()) {
         return;
     }
     const auto& cb4 = regs.color_buffers[4];
@@ -827,17 +848,26 @@ void NoteDraw(const AmdGpu::Regs& regs, u32 mrt_mask, VideoCore::ImageId depth_i
 
 void PrepareInputs(u32 frame_id, vk::CommandBuffer cmdbuf, VideoCore::TextureCache& texture_cache,
                    Runtime& runtime, u32 game_width, u32 game_height) {
-    if (!supported || frame_id >= kMaxFrames) {
+    if (frame_id >= kMaxFrames) {
         return;
     }
-    FrameInputs& f = frames[frame_id];
+    FrameSlot& f = frames[frame_id];
     f.valid = false;
-    f.index = ++next_index;
-    if (next_index == 1) {
-        Marker(sl::PCLMarker::eSimulationStart, f.index);
+    f.sl_valid = false;
+    FsrFg::NoDepth(frame_id);
+    const bool fsr = FrameGen::Current() == FrameGen::Mode::Fsr;
+    if (!supported && !fsr) {
+        pending = Pending{};
+        return;
     }
-    Marker(sl::PCLMarker::eSimulationEnd, f.index);
-    Marker(sl::PCLMarker::eRenderSubmitStart, f.index);
+    f.index = ++next_index;
+    if (supported) {
+        if (next_index == 1) {
+            Marker(sl::PCLMarker::eSimulationStart, f.index);
+        }
+        Marker(sl::PCLMarker::eSimulationEnd, f.index);
+        Marker(sl::PCLMarker::eRenderSubmitStart, f.index);
+    }
 
     const Pending p = std::exchange(pending, Pending{});
     if (!p.captured) {
@@ -957,6 +987,16 @@ void PrepareInputs(u32 frame_id, vk::CommandBuffer cmdbuf, VideoCore::TextureCac
         .pImageMemoryBarriers = to_read.data(),
     });
 
+    f.constants = constants;
+    f.valid = true;
+    if (fsr) {
+        // FSR 3 reads depth as R32F: from the copy, now ShaderReadOnlyOptimal.
+        FsrFg::ConvertDepth(frame_id, cmdbuf, f.depth_view, width, height,
+                            constants.depthInverted == sl::Boolean::eTrue);
+    }
+    if (!supported || FrameGen::Current() != FrameGen::Mode::Dlss) {
+        return;
+    }
     if (sl::FrameToken* token = Token(f.index)) {
         const sl::Result r = api.set_constants(constants, *token, sl::ViewportHandle{0});
         if (r != sl::Result::eOk) {
@@ -967,7 +1007,7 @@ void PrepareInputs(u32 frame_id, vk::CommandBuffer cmdbuf, VideoCore::TextureCac
             }
             return;
         }
-        f.valid = true;
+        f.sl_valid = true;
     }
 }
 
@@ -994,16 +1034,18 @@ void FrameSubmitted(u32 frame_id) {
 void NoInputs(u32 frame_id) {
     if (frame_id < kMaxFrames) {
         frames[frame_id].valid = false;
+        frames[frame_id].sl_valid = false;
         frames[frame_id].index = 0;
     }
+    FsrFg::NoDepth(frame_id);
 }
 
 void BeforePresent(u32 frame_id, vk::Rect2D rect, vk::Extent2D extent) {
     if (!supported || frame_id >= kMaxFrames) {
         return;
     }
-    FrameInputs& f = frames[frame_id];
-    valid_streak = f.valid ? valid_streak + 1 : 0;
+    FrameSlot& f = frames[frame_id];
+    valid_streak = f.sl_valid ? valid_streak + 1 : 0;
     const bool want = valid_streak >= 2;
     if (want != fg_on || !options_set) {
         SetOptions(want);
@@ -1015,7 +1057,7 @@ void BeforePresent(u32 frame_id, vk::Rect2D rect, vk::Extent2D extent) {
     if (!token) {
         return;
     }
-    if (f.valid) {
+    if (f.sl_valid) {
         sl::Resource depth{sl::ResourceType::eTex2d, static_cast<VkImage>(f.depth), f.depth_memory,
                            static_cast<VkImageView>(f.depth_view),
                            static_cast<u32>(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)};
@@ -1090,7 +1132,7 @@ void AfterPresent(u32 frame_id) {
     }
     Marker(sl::PCLMarker::ePresentEnd, index);
     const bool stats = ++presents % 60 == 0;
-    const bool track = Parallel() && fg_on && index != 0 && frames[frame_id].valid;
+    const bool track = Parallel() && fg_on && index != 0 && frames[frame_id].sl_valid;
     if (!stats && !track) {
         return;
     }
@@ -1130,6 +1172,34 @@ void Suspend() {
         SetOptions(false);
     }
     valid_streak = 0;
+}
+
+bool GetFrameInputs(u32 frame_id, FrameInputs& out) {
+    if (frame_id >= kMaxFrames || !frames[frame_id].valid) {
+        return false;
+    }
+    const FrameSlot& f = frames[frame_id];
+    const sl::Constants& c = f.constants;
+    out.mvec = f.mvec;
+    out.mvec_usage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc |
+                     vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage;
+    out.width = f.width;
+    out.height = f.height;
+    out.jitter[0] = c.jitterOffset.x;
+    out.jitter[1] = c.jitterOffset.y;
+    out.z_near = c.cameraNear;
+    out.z_far = c.cameraFar;
+    out.fov_y = c.cameraFOV;
+    const sl::float3* vectors[] = {&c.cameraPos, &c.cameraUp, &c.cameraRight, &c.cameraFwd};
+    float* outs[] = {out.pos, out.up, out.right, out.fwd};
+    for (int i = 0; i < 4; ++i) {
+        outs[i][0] = vectors[i]->x;
+        outs[i][1] = vectors[i]->y;
+        outs[i][2] = vectors[i]->z;
+    }
+    out.depth_inverted = c.depthInverted == sl::Boolean::eTrue;
+    out.reset = c.reset == sl::Boolean::eTrue;
+    return true;
 }
 
 } // namespace Vulkan::Dlssg

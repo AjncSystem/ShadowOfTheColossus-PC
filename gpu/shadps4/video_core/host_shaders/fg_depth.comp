@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// sotc: FSR 3 frame generation (vk_fsrfg.cpp) reads depth as an R32F image. The game's depth
+// (a copy of its D32 buffer) is reversed-Z: 1 - d is the usual depth with the same near and far
+// planes (0 at the near plane), which FSR 3 takes without its inverted-depth option.
+
+#version 450 core
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout (local_size_x = 8, local_size_y = 8) in;
+
+layout (binding = 0, set = 0) uniform texture2D depth_in;
+layout (binding = 1, set = 0, r32f) uniform writeonly image2D depth_out;
+
+layout (push_constant) uniform Params {
+    uvec2 size;
+    uint invert;
+} pc;
+
+void main() {
+    const uvec2 at = gl_GlobalInvocationID.xy;
+    if (at.x >= pc.size.x || at.y >= pc.size.y) {
+        return;
+    }
+    const float depth = texelFetch(depth_in, ivec2(at), 0).r;
+    imageStore(depth_out, ivec2(at), vec4(pc.invert != 0u ? 1.0 - depth : depth));
+}

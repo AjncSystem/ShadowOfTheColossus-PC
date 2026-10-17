@@ -16,6 +16,8 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_dlssg.h"
+#include "video_core/renderer_vulkan/vk_framegen.h"
+#include "video_core/renderer_vulkan/vk_fsrfg.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -478,9 +480,11 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     const vk::Device device = instance.GetDevice();
 
     // Create presentation frames.
-    // sotc: with DLSS Frame Generation Streamline keeps 2 swapchain images; 4 frames in flight
-    // so that the command processor does not wait for the presenter.
-    const u32 num_frames = Dlssg::Enabled() ? std::max(num_images, 4u) : num_images;
+    // sotc: with DLSS Frame Generation Streamline keeps 2 swapchain images, FSR 3 holds a frame
+    // for half a frame: 4 frames in flight so that the command processor does not wait for the
+    // presenter.
+    const u32 num_frames =
+        Dlssg::Enabled() || FrameGen::AskedAtStart() ? std::max(num_images, 4u) : num_images;
     present_frames.resize(num_frames);
     for (u32 i = 0; i < num_frames; i++) {
         Frame& frame = present_frames[i];
@@ -879,6 +883,30 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }
 
+    // sotc: FSR 3 frame generation: the frame between the last game frame and this one first,
+    // this one half a frame later.
+    if (is_game_frame && !is_reusing_frame) {
+        FrameGen::TestTick();
+        FsrFg::NoteGameFrame();
+        if (FrameGen::Current() == FrameGen::Mode::Fsr && PresentGenerated(frame)) {
+            // SOTC_FSRFG_ONLY_GENERATED=1: the game frames are not shown (checking the others).
+            static const bool only_generated = [] {
+                const char* v = std::getenv("SOTC_FSRFG_ONLY_GENERATED");
+                return v && v[0] == '1';
+            }();
+            if (only_generated) {
+                Check(instance.GetDevice().resetFences(frame->present_done));
+                SubmitInfo info{};
+                info.AddWait(frame->ready_semaphore, frame->ready_tick);
+                info.AddSignal(frame->present_done);
+                present_scheduler.Flush(info);
+                free_frame();
+                return;
+            }
+            FsrFg::WaitForGameFrame();
+        }
+    }
+
     if (!swapchain.AcquireNextImage()) {
         Dlssg::Suspend();
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
@@ -1038,8 +1066,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             // sceSaveDataDialog); draws nothing while it has nothing to show.
             static bool overlay_ready = false;
             if (!std::exchange(overlay_ready, true)) {
+                // Up to 2 overlay draws per game frame with FSR 3: a deeper buffer ring.
                 BbOverlay::Init(instance, swapchain.GetSurfaceFormat().format,
-                                swapchain.GetImageCount());
+                                std::max(swapchain.GetImageCount(), 8u));
             }
             BbOverlay::Render(cmdbuf, swapchain_image_view, extent);
         }
@@ -1141,6 +1170,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
         const bool presented = swapchain.Present();
         Dlssg::AfterPresent(frame->id);
+        if (FrameGen::Current() == FrameGen::Mode::Fsr) {
+            FsrFg::NotePresent();
+        }
         if (!presented) {
             Dlssg::Suspend();
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
@@ -1204,6 +1236,107 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             }
         }
     }
+}
+
+bool Presenter::PresentGenerated(Frame* frame) {
+    auto& scheduler = present_scheduler;
+    const auto cmdbuf = scheduler.CommandBuffer();
+    const vk::Image generated =
+        FsrFg::Generate(cmdbuf, frame->id, frame->image, frame->width, frame->height);
+
+    // FSR 3 reads the game frame and its inputs: after the frame's own commands.
+    if (frame->ready_semaphore == draw_scheduler.GetWorkSemaphore()->Handle()) {
+        draw_scheduler.WaitSubmitted(frame->ready_tick, false);
+    }
+    SubmitInfo info{};
+    info.AddWait(frame->ready_semaphore, frame->ready_tick);
+    const auto submit = [&] {
+        const u64 tick = scheduler.CurrentTick();
+        scheduler.Flush(info);
+        FsrFg::Submitted(scheduler, tick);
+    };
+    if (!generated) {
+        submit(); // FSR 3 history only (first frame, after a cut)
+        return false;
+    }
+    if (!swapchain.AcquireNextImage()) {
+        submit();
+        Dlssg::Suspend();
+        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+        return false;
+    }
+
+    const vk::Image swapchain_image = swapchain.Image();
+    const vk::Extent2D extent = swapchain.GetExtent();
+    const auto color_range = vk::ImageSubresourceRange{
+        .aspectMask = vk::ImageAspectFlagBits::eColor,
+        .baseMipLevel = 0,
+        .levelCount = 1,
+        .baseArrayLayer = 0,
+        .layerCount = 1,
+    };
+    const auto swapchain_barrier = [&](vk::AccessFlags src, vk::AccessFlags dst,
+                                       vk::ImageLayout from, vk::ImageLayout to) {
+        return vk::ImageMemoryBarrier{
+            .srcAccessMask = src,
+            .dstAccessMask = dst,
+            .oldLayout = from,
+            .newLayout = to,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = swapchain_image,
+            .subresourceRange = color_range,
+        };
+    };
+    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                           vk::PipelineStageFlagBits::eTransfer, vk::DependencyFlagBits::eByRegion,
+                           {}, {},
+                           swapchain_barrier(vk::AccessFlagBits::eNone,
+                                             vk::AccessFlagBits::eTransferWrite,
+                                             vk::ImageLayout::eUndefined,
+                                             vk::ImageLayout::eTransferDstOptimal));
+    cmdbuf.clearColorImage(swapchain_image, vk::ImageLayout::eTransferDstOptimal,
+                           vk::ClearColorValue{std::array<float, 4>{0.f, 0.f, 0.f, 1.f}},
+                           color_range);
+    const auto rect = FitImage(frame->width, frame->height, extent.width, extent.height);
+    const vk::ImageBlit blit{
+        .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
+                                 vk::Offset3D{static_cast<s32>(frame->width),
+                                              static_cast<s32>(frame->height), 1}},
+        .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .dstOffsets =
+            std::array{vk::Offset3D{rect.offset.x, rect.offset.y, 0},
+                       vk::Offset3D{rect.offset.x + static_cast<s32>(rect.extent.width),
+                                    rect.offset.y + static_cast<s32>(rect.extent.height), 1}},
+    };
+    cmdbuf.blitImage(generated, vk::ImageLayout::eGeneral, swapchain_image,
+                     vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eLinear);
+    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                           vk::PipelineStageFlagBits::eAllCommands,
+                           vk::DependencyFlagBits::eByRegion, {}, {},
+                           swapchain_barrier(vk::AccessFlagBits::eTransferWrite,
+                                             vk::AccessFlagBits::eColorAttachmentWrite,
+                                             vk::ImageLayout::eTransferDstOptimal,
+                                             vk::ImageLayout::eColorAttachmentOptimal));
+    BbOverlay::Render(cmdbuf, swapchain.ImageView(), extent, false);
+    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                           vk::PipelineStageFlagBits::eAllCommands,
+                           vk::DependencyFlagBits::eByRegion, {}, {},
+                           swapchain_barrier(vk::AccessFlagBits::eColorAttachmentWrite,
+                                             vk::AccessFlagBits::eNone,
+                                             vk::ImageLayout::eColorAttachmentOptimal,
+                                             vk::ImageLayout::ePresentSrcKHR));
+    info.AddWait(swapchain.GetImageAcquiredSemaphore());
+    info.AddSignal(swapchain.GetPresentReadySemaphore());
+    submit();
+    std::scoped_lock submit_lock{Scheduler::submit_mutex};
+    if (!swapchain.Present()) {
+        Dlssg::Suspend();
+        swapchain.Recreate(window.GetWidth(), window.GetHeight());
+    }
+    FsrFg::NotePresent();
+    return true;
 }
 
 Frame* Presenter::GetRenderFrame() {

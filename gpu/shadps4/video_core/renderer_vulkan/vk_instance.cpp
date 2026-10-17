@@ -478,6 +478,9 @@ bool Instance::CreateDevice() {
                 .shaderImageGatherExtended = features.shaderImageGatherExtended,
                 .shaderStorageImageExtendedFormats = features.shaderStorageImageExtendedFormats,
                 .shaderStorageImageMultisample = features.shaderStorageImageMultisample,
+                // sotc: FSR 3 frame generation (vk_fsrfg.cpp) writes untyped storage images.
+                .shaderStorageImageReadWithoutFormat = features.shaderStorageImageReadWithoutFormat,
+                .shaderStorageImageWriteWithoutFormat = features.shaderStorageImageWriteWithoutFormat,
                 // Descriptor arrays of dynamic_tsharp_array_size (shader_recompiler/info.cpp)
                 .shaderSampledImageArrayDynamicIndexing =
                     features.shaderSampledImageArrayDynamicIndexing,

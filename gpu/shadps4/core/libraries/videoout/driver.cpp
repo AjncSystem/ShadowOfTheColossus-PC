@@ -19,6 +19,7 @@
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/renderer_vulkan/vk_framegen.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/sotc_stats.h"
 
@@ -270,12 +271,19 @@ extern "C" uint64_t runtime_file_read_ns_take(void);
 
 // sotc: SOTC_ASYNC_PRESENT=1. Measured with DLSS-G: Streamline's present returns in 0.1 ms
 // (its pacer presents on a thread of its own), so the vblank thread keeps presenting by default.
+// FSR 3 frame generation presents the game frame half a frame after the generated one: from
+// the first FSR 3 frame on, the presenter has a thread of its own (vblank thread only).
 bool VideoOutDriver::AsyncPresent() {
     static const bool async = [] {
         const char* v = std::getenv("SOTC_ASYNC_PRESENT");
         return v && v[0] == '1';
     }();
-    return async;
+    static bool fsr = false;
+    if (!fsr && Vulkan::FrameGen::Current() == Vulkan::FrameGen::Mode::Fsr) {
+        fsr = true;
+        std::fprintf(stderr, "SOTC FRAMEGEN: FSR 3, presenting on the presenter thread\n");
+    }
+    return async || fsr;
 }
 
 void VideoOutDriver::RunPresentJob(std::function<void()> job, bool droppable) {

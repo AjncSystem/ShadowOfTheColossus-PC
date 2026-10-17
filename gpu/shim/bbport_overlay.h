@@ -30,8 +30,10 @@ void UpdateTextInput(SDL_Window* window);
 /// Whether anything is drawn this frame (menu open or FPS counter on).
 bool Visible();
 
-/// Present thread: draws into `view` (layout ColorAttachmentOptimal).
-void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent);
+/// Present thread: draws into `view` (layout ColorAttachmentOptimal). `game_frame` false: a
+/// generated frame (FSR 3), not counted by the FPS readout.
+void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
+            bool game_frame = true);
 
 /// The menu is open or a text entry is shown: the game's input is held neutral.
 bool CapturesInput();

@@ -126,6 +126,7 @@ add_host_shader(fsr.comp fsr_easu_comp SAMPLE_EASU=1)
 add_host_shader(fsr.comp fsr_rcas_comp SAMPLE_RCAS=1)
 add_host_shader(post_process.frag post_process_frag)
 add_host_shader(shadow_scroll.frag shadow_scroll_frag)
+add_host_shader(fg_depth.comp fg_depth_comp)
 foreach(BPP IN ITEMS 8 16 32 64 96 128)
     add_host_shader(tiling.comp tiling_micro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=0)
     add_host_shader(tiling.comp tiling_macro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=1)
@@ -171,6 +172,61 @@ target_include_directories(bbgpu PRIVATE third_party/stb)
 # DLSS Frame Generation (vk_dlssg.cpp): NVIDIA Streamline SDK headers (MIT); the DLLs are
 # loaded at run time from the executable's folder.
 target_include_directories(bbgpu PRIVATE third_party/streamline/include)
+# AMD FSR 3 frame generation (vk_fsrfg.cpp): the FidelityFX SDK 2.3 frame interpolation and
+# optical flow, natively on Vulkan (third_party/fsr-vulkan, MIT); any GPU with Vulkan 1.3.
+set(FFX_VK_PORTABLE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(FFX_VK_PORTABLE_BUILD_PROBE OFF CACHE BOOL "" FORCE)
+set(FFX_VK_PORTABLE_BUILD_FSR3_HOST OFF CACHE BOOL "" FORCE)
+set(FFX_VK_PORTABLE_BUILD_FSR3_VK_BACKEND OFF CACHE BOOL "" FORCE)
+set(FFX_VK_PORTABLE_BUILD_FSR3_3_1_5_SCAFFOLD ON CACHE BOOL "" FORCE)
+set(FFX_VK_PORTABLE_BUILD_FSR4_V07_VULKAN OFF CACHE BOOL "" FORCE)
+set(FFX_VK_PORTABLE_INSTALL OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/fsr-vulkan EXCLUDE_FROM_ALL)
+target_link_libraries(bbgpu PRIVATE ffx-vulkan::fsr3-vk-framegeneration-3.1.6)
+# The module's 3.1.6 frame generation never starts a frame on its bridge: the constant buffers
+# and descriptor sets of every dispatch are then kept until the context is destroyed (~3 MB of
+# video memory per frame, out of memory within a minute). Its source is built from a copy that
+# starts a bridge frame in RecordPrepare and retires the bridge frames in RetireFrame.
+set(FSR_FG_SRC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fsr-vulkan/src/ffx_vk_fsr3_3_1_6_framegen.cpp)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${FSR_FG_SRC})
+file(READ ${FSR_FG_SRC} fsr_fg_source)
+string(REPLACE "\r\n" "\n" fsr_fg_source "${fsr_fg_source}")
+set(fsr_fg_patched "${fsr_fg_source}")
+string(REPLACE "    context->frameId = info->frameId;\n"
+    "    context->frameId = info->frameId;\n    ffxVkFsr3_3_1_5BridgeBeginFrame(context->bridge, info->frameId); /* sotc */\n"
+    fsr_fg_patched "${fsr_fg_patched}")
+string(REPLACE [=[
+    return FFX_VK_FSR3_3_1_6_FRAMEGEN_OK;
+}
+
+extern "C" void ffxVkFsr3_3_1_6FrameGenerationContextDestroy(]=] [=[
+    ffxVkFsr3_3_1_5BridgeRetireFrame(context->bridge, completedFrameId); /* sotc */
+    return FFX_VK_FSR3_3_1_6_FRAMEGEN_OK;
+}
+
+extern "C" void ffxVkFsr3_3_1_6FrameGenerationContextDestroy(]=]
+    fsr_fg_patched "${fsr_fg_patched}")
+string(REGEX MATCHALL "/\\* sotc \\*/" fsr_fg_marks "${fsr_fg_patched}")
+list(LENGTH fsr_fg_marks fsr_fg_mark_count)
+if (NOT fsr_fg_mark_count EQUAL 2)
+    message(FATAL_ERROR "fsr-vulkan changed: update the frame generation fix in gpu/CMakeLists.txt")
+endif()
+set(FSR_FG_PATCHED ${CMAKE_CURRENT_BINARY_DIR}/sotc_fsr3_framegen.cpp)
+if (EXISTS ${FSR_FG_PATCHED})
+    file(READ ${FSR_FG_PATCHED} fsr_fg_existing)
+endif()
+if (NOT "${fsr_fg_existing}" STREQUAL "${fsr_fg_patched}")
+    file(WRITE ${FSR_FG_PATCHED} "${fsr_fg_patched}")
+endif()
+get_target_property(fsr_fg_sources ffx_vulkan_fsr3_vk_framegeneration_3_1_6 SOURCES)
+list(LENGTH fsr_fg_sources fsr_fg_count)
+list(REMOVE_ITEM fsr_fg_sources src/ffx_vk_fsr3_3_1_6_framegen.cpp)
+list(LENGTH fsr_fg_sources fsr_fg_count_after)
+if (fsr_fg_count EQUAL fsr_fg_count_after)
+    message(FATAL_ERROR "fsr-vulkan: ffx_vk_fsr3_3_1_6_framegen.cpp not in its target")
+endif()
+list(APPEND fsr_fg_sources ${FSR_FG_PATCHED})
+set_property(TARGET ffx_vulkan_fsr3_vk_framegeneration_3_1_6 PROPERTY SOURCES ${fsr_fg_sources})
 target_include_directories(bbgpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include)
 target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)

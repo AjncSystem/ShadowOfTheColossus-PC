@@ -14,6 +14,7 @@
 #include "bbport_settings.h"
 #include "imgui.h"
 #include "imgui_impl_vulkan.h"
+#include "video_core/renderer_vulkan/vk_framegen.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_stats.h"
@@ -135,6 +136,21 @@ ImGuiKey KeyFromGamepad(u8 button) {
     case SDL_GAMEPAD_BUTTON_BACK: return ImGuiKey_GamepadBack;
     default: return ImGuiKey_None;
     }
+}
+
+// sotc: a short message at the top of the screen (F8: the frame generation mode): its text
+// (under imgui_mutex) and until when, in steady clock milliseconds.
+std::string toast_text;
+std::atomic<long long> toast_until_ms{0};
+
+long long NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+bool ToastShown() {
+    return NowMs() < toast_until_ms.load(std::memory_order_relaxed);
 }
 
 // sotc: the performance overlay (show_fps=1 in sotc.ini, or SOTC_FPS / SOTC_OVERLAY=1; F10
@@ -609,25 +625,55 @@ void FpsCounter() {
                                SotcStats::ov_worst_cause_ms.load());
         }
     }
-    // DLSS Frame Generation (SOTC_DLSSG=1, vk_dlssg.cpp).
-    if (const int fg = SotcStats::ov_fg_state.load(std::memory_order_relaxed); fg >= 0) {
-        const uint32_t shown = SotcStats::ov_fg_frames.load(std::memory_order_relaxed);
-        if (fg == 1) {
+    // Frame generation (vk_framegen.h): DLSS-G (vk_dlssg.cpp) or FSR 3 (vk_fsrfg.cpp).
+    switch (Vulkan::FrameGen::Current()) {
+    case Vulkan::FrameGen::Mode::Off:
+        ImGui::TextColored(grey, "Génération d'images : désactivée");
+        break;
+    case Vulkan::FrameGen::Mode::Dlss:
+        if (const int fg = SotcStats::ov_fg_state.load(std::memory_order_relaxed); fg == 1) {
+            const uint32_t shown = SotcStats::ov_fg_frames.load(std::memory_order_relaxed);
             const uint32_t n = shown ? shown : 2;
             ImGui::TextColored(green, "DLSS-G x%u : ~%.0f FPS affichées", n, avg_fps * n);
-        } else if (fg == 0) {
-            ImGui::TextColored(grey, "DLSS-G : en attente (pas de scène 3D)");
-        } else {
+        } else if (fg == 2) {
             ImGui::TextColored(red, "DLSS-G : erreur (statut %#x)",
                                SotcStats::ov_fg_status.load(std::memory_order_relaxed));
+        } else {
+            ImGui::TextColored(grey, "DLSS-G : en attente (pas de scène 3D)");
         }
+        break;
+    case Vulkan::FrameGen::Mode::Fsr:
+        if (const int fg = SotcStats::ov_fsr_state.load(std::memory_order_relaxed); fg == 1) {
+            ImGui::TextColored(green, "FSR 3 x2 : ~%.0f FPS affichées", avg_fps * 2);
+        } else if (fg == 2) {
+            ImGui::TextColored(red, "FSR 3 : erreur (voir le journal)");
+        } else {
+            ImGui::TextColored(grey, "FSR 3 : en attente (pas de scène 3D)");
+        }
+        break;
     }
     if (const uint64_t vram = SotcStats::vram_used.load(std::memory_order_relaxed)) {
         ImGui::TextColored(grey, "VRAM %.1f / %.1f Go", vram / 1073741824.0,
                            SotcStats::vram_budget.load(std::memory_order_relaxed) / 1073741824.0);
         ImGui::SameLine();
     }
-    ImGui::TextDisabled("F10 : masquer");
+    ImGui::TextDisabled("F10 : masquer   F8 : génération d'images");
+    ImGui::End();
+}
+
+void Toast() {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
+                                   viewport->WorkPos.y + 24.0f * base_scale),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.7f);
+    ImGui::Begin("##toast", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoFocusOnAppearing);
+    ImGui::SetWindowFontScale(1.3f);
+    ImGui::TextUnformatted(toast_text.c_str());
+    ImGui::SetWindowFontScale(1.0f);
     ImGui::End();
 }
 
@@ -714,6 +760,18 @@ bool HandleEvent(const SDL_Event& event) {
         return false;
     }
     ImGuiIO& io = ImGui::GetIO();
+    // sotc: F8 switches the frame generation mode (off, DLSS-G, FSR 3; vk_framegen.h).
+    // The new mode is shown at the next frame (Render).
+    if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F8 && !event.key.repeat) {
+        const Vulkan::FrameGen::Mode mode = Vulkan::FrameGen::Cycle();
+        if (mode == Vulkan::FrameGen::Mode::Off &&
+            !Vulkan::FrameGen::Available(Vulkan::FrameGen::Mode::Fsr) &&
+            !Vulkan::FrameGen::Available(Vulkan::FrameGen::Mode::Dlss)) {
+            toast_text = "Génération d'images : indisponible sur ce GPU";
+            toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
+        }
+        return true;
+    }
     // sotc: F10 shows or hides the performance overlay.
     if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F10 && !event.key.repeat) {
         const bool on = !OverlayOn();
@@ -924,7 +982,8 @@ bool HandleEvent(const SDL_Event& event) {
 }
 
 bool Visible() {
-    return initialized && (menu_open || text_entry_active || list_active || OverlayOn());
+    return initialized && (menu_open || text_entry_active || list_active || OverlayOn() ||
+                           ToastShown());
 }
 
 bool CapturesInput() {
@@ -976,16 +1035,32 @@ void SetTextEntry(bool active, const std::string& prompt, const std::string& tex
     text_entry_text = text;
 }
 
-void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
-    // Present interval for the FPS readout (measured also while nothing is drawn).
+void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
+            bool game_frame) {
+    // Present interval for the FPS readout (measured also while nothing is drawn), game frames
+    // only: a generated frame (FSR 3) is drawn half a frame later.
     const auto now = std::chrono::steady_clock::now();
-    const float ms = std::chrono::duration<float, std::milli>(now - last_present).count();
-    last_present = now;
-    if (ms > 0.0f && ms < 1000.0f) {
-        frame_ms_avg = frame_ms_avg == 0.0f ? ms : frame_ms_avg * 0.95f + ms * 0.05f;
+    static auto last_draw = now;
+    const float draw_ms = std::chrono::duration<float, std::milli>(now - last_draw).count();
+    last_draw = now;
+    if (game_frame) {
+        const float ms = std::chrono::duration<float, std::milli>(now - last_present).count();
+        last_present = now;
+        if (ms > 0.0f && ms < 1000.0f) {
+            frame_ms_avg = frame_ms_avg == 0.0f ? ms : frame_ms_avg * 0.95f + ms * 0.05f;
+        }
+        if (ms > 0.0f && ms < 5000.0f) {
+            RecordFrame(ms);
+        }
     }
-    if (ms > 0.0f && ms < 5000.0f) {
-        RecordFrame(ms);
+    const float ms = draw_ms;
+    // The frame generation mode changed (F8): shown for 2.5 s.
+    static Vulkan::FrameGen::Mode shown_mode = Vulkan::FrameGen::Current();
+    if (const Vulkan::FrameGen::Mode mode = Vulkan::FrameGen::Current(); mode != shown_mode) {
+        shown_mode = mode;
+        std::scoped_lock lock{imgui_mutex};
+        toast_text = std::string("Génération d'images : ") + Vulkan::FrameGen::Name(mode);
+        toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
     }
     if (!Visible()) {
         return;
@@ -1010,6 +1085,9 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     }
     if (OverlayOn() && !menu_open) {
         FpsCounter();
+    }
+    if (ToastShown()) {
+        Toast();
     }
     if (text_entry_active) {
         TextEntryBox();

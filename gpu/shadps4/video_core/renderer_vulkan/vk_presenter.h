@@ -106,6 +106,10 @@ private:
 
     void RecreateFrame(Frame* frame, u32 width, u32 height);
 
+    /// sotc: FSR 3 frame generation: presents the frame between the last game frame and
+    /// `frame`. False when there is none.
+    bool PresentGenerated(Frame* frame);
+
     void SetExpectedGameSize(s32 width, s32 height);
 
 private:

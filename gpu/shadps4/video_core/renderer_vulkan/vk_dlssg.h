@@ -7,6 +7,9 @@
 // Streamline its depth, its motion vectors and its camera, and DLSS-G inserts a generated
 // frame between two presented ones. The inputs come from the game's G-buffer pass (the draws
 // with an R16G16 float target in MRT 4: curUV - prevUV per pixel) and its view constants.
+//
+// The same inputs feed AMD FSR 3 frame generation (vk_fsrfg.cpp); vk_framegen.h chooses which
+// one runs. They are captured only while a frame generation mode is on.
 
 #pragma once
 
@@ -28,11 +31,11 @@ class Runtime;
 
 namespace Vulkan::Dlssg {
 
-/// Before any Vulkan call: with SOTC_DLSSG=1, loads sl.interposer.dll and initialises
-/// Streamline. Its vkGetInstanceProcAddr, or nullptr to use the Vulkan loader.
+/// Before any Vulkan call: when FrameGen::WantStreamline(), loads sl.interposer.dll and
+/// initialises Streamline. Its vkGetInstanceProcAddr, or nullptr to use the Vulkan loader.
 PFN_vkGetInstanceProcAddr LoadInterposer();
 
-/// After vkCreateDevice: support checks, Reflex options. Disables DLSS-G when unsupported.
+/// After vkCreateDevice: support checks, Reflex options, FSR 3, the frame generation mode.
 void OnDeviceCreated(const Instance& instance);
 
 /// Streamline is loaded and DLSS-G is supported on this device.
@@ -67,5 +70,21 @@ void AfterPresent(u32 frame_id);
 
 /// Before the swapchain is recreated or the device destroyed: DLSS-G off.
 void Suspend();
+
+/// A frame's inputs for FSR 3 frame generation, from the camera like Streamline's constants.
+struct FrameInputs {
+    vk::Image mvec;      ///< R16G16 float, curUV - prevUV, layout ShaderReadOnlyOptimal
+    vk::ImageUsageFlags mvec_usage;
+    u32 width, height;   ///< of the depth and motion vectors (the game's render size)
+    float jitter[2];     ///< pixels, y down
+    float z_near, z_far; ///< view distances
+    float fov_y;         ///< radians
+    float pos[3], up[3], right[3], fwd[3];
+    bool depth_inverted; ///< 1 at the near plane
+    bool reset;          ///< a camera cut
+};
+
+/// Present thread: the inputs of presentation frame `frame_id`, false when it has none.
+bool GetFrameInputs(u32 frame_id, FrameInputs& out);
 
 } // namespace Vulkan::Dlssg

@@ -108,7 +108,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
                 'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'library_dirs': [], 'keys': {},
-                'auto_setup': True, 'dlc_dir': ''}
+                'auto_setup': True, 'dlc_dir': '', 'framegen': 'off'}
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
 KEY_INPUTS = [
     ('move_up', 'W', ('Andar para frente', 'Move forward')), ('move_down', 'S', ('Andar para trás', 'Move back')),
@@ -175,6 +175,11 @@ OUTPUTS = [('1280x720', ('1280 × 720 (720p)', '1280 × 720 (720p)')), ('1920x10
            ('2560x1440', ('2560 × 1440 (1440p)', '2560 × 1440 (1440p)')), ('3840x2160', ('3840 × 2160 (4K)', '3840 × 2160 (4K)'))]
 UPSCALERS = [('fsr1', ('FSR 1 (AMD, qualquer placa)', 'FSR 1 (AMD, any GPU)')),
              ('bilinear', ('Bilinear (simples)', 'Bilinear (plain)'))]
+# Frame generation (bb-probe: SOTC_FRAMEGEN; F8 in game switches off / DLSS-G / FSR 3).
+FRAMEGEN = [('off', ('Desligada', 'Off')),
+            ('auto', ('Automática (DLSS-G ou FSR 3)', 'Automatic (DLSS-G or FSR 3)')),
+            ('dlss', ('NVIDIA DLSS-G (RTX 40/50)', 'NVIDIA DLSS-G (RTX 40/50)')),
+            ('fsr', ('AMD FSR 3 (qualquer placa)', 'AMD FSR 3 (any GPU)'))]
 SHARPNESS = [('0', ('Alta', 'High')), ('250', ('Média (padrão)', 'Medium (default)')), ('600', ('Baixa', 'Low')),
              ('off', ('Desligada', 'Off'))]
 MOUSE_SENS = [('0.5', ('0,5 (lenta)', '0.5 (slow)')), ('0.75', ('0,75', '0.75')), ('1.0', ('1,0 (padrão)', '1.0 (default)')),
@@ -294,6 +299,19 @@ def short_path(path):
         return str(path)
 
 
+def load_settings():
+    """Saved settings over the defaults. Older settings that turned DLSS-G on with SOTC_DLSSG=1 in
+    the extra variables get the frame generation setting instead."""
+    saved = load_json(CONFIG_FILE, {})
+    settings = {**APP_DEFAULTS, **saved}
+    if 'framegen' not in saved:
+        extra = str(settings.get('extra_env', '')).split()
+        if 'SOTC_DLSSG=1' in extra:
+            settings['framegen'] = 'auto'
+            settings['extra_env'] = ' '.join(item for item in extra if item != 'SOTC_DLSSG=1')
+    return settings
+
+
 def game_environment(s):
     env = dict(os.environ)
     env['SOTC_GAME_DIR'] = s['game_dir']
@@ -330,6 +348,7 @@ def game_environment(s):
         env['SOTC_FLUSH_EVERY'], env['SOTC_RB_AHEAD'] = '0', '0'
     env['SOTC_NEO'] = '1' if s.get('neo') else '0'
     env['SOTC_OUTPUT_RES'] = s.get('output_res') or '1920x1080'
+    env['SOTC_FRAMEGEN'] = s.get('framegen') or 'off'
     env['BB_FSR1'] = '1' if s.get('upscaler', 'fsr1') == 'fsr1' else '0'
     if s.get('sharpness') == 'off':
         env['BB_RCAS'] = '0'
@@ -376,7 +395,7 @@ class Launcher:
     def __init__(self, root, tk, ttk, filedialog, messagebox):
         self.tk, self.ttk, self.filedialog, self.messagebox = tk, ttk, filedialog, messagebox
         self.root = root
-        self.app = {**APP_DEFAULTS, **load_json(CONFIG_FILE, {})}
+        self.app = load_settings()
         self.vars = {}
         self.process = self.job = None
         self.stopping = False
@@ -674,10 +693,11 @@ class Launcher:
             row=0, column=0, columnspan=2, sticky='w', pady=(0, 2))
         self.row(quick, _('Saída', 'Output'), self.choice(quick, 'output_res', OUTPUTS, 24))
         self.row(quick, _('Upscaler', 'Upscaler'), self.choice(quick, 'upscaler', UPSCALERS, 24))
+        self.row(quick, _('Geração de quadros', 'Frame generation'), self.choice(quick, 'framegen', FRAMEGEN, 24))
         self.check(quick, 'fps60', _('60 FPS (experimental)', '60 FPS (experimental)'))
         self.check(quick, 'af16', _('Texturas nítidas (filtro 16x)', 'Sharp textures (16x filtering)'))
         self.check(quick, 'fullscreen', _('Tela cheia', 'Fullscreen'))
-        for key in ('af16', 'fps60', 'fullscreen', 'output_res', 'upscaler'):
+        for key in ('af16', 'fps60', 'fullscreen', 'output_res', 'upscaler', 'framegen'):
             self.vars[key].trace_add('write', lambda *_a: self.refresh_status())
 
     def draw_banner(self):
@@ -803,6 +823,15 @@ class Launcher:
         self.check(f, 'fps60', _('60 FPS (experimental)', '60 FPS (experimental)'),
                    _('Tira o limite de 30 FPS do jogo; o vblank vai a 120 Hz. Mediu 38 FPS no campo e ~25 no templo.',
                      'Removes the game\'s 30 FPS cap; vblank at 120 Hz. Measured 38 FPS in the open world, ~25 at the temple.'))
+        self.row(f, _('Geração de quadros', 'Frame generation'), self.choice(f, 'framegen', FRAMEGEN),
+                 _('Uma imagem gerada entre duas do jogo: com 30 FPS (sem "60 FPS") a tela mostra 60. DLSS-G: '
+                   'NVIDIA RTX 40/50. FSR 3: qualquer placa (RTX 20/30, AMD, Intel). Automática: DLSS-G se a '
+                   'placa tiver, senão FSR 3. No jogo, F8 troca o modo (desligada, DLSS-G, FSR 3). Melhor com '
+                   'a tela a 60 ou 120 Hz, ou G-SYNC/FreeSync.',
+                   'One generated frame between two game frames: at 30 FPS (without "60 FPS") the screen shows '
+                   '60. DLSS-G: NVIDIA RTX 40/50. FSR 3: any GPU (RTX 20/30, AMD, Intel). Automatic: DLSS-G when '
+                   'the GPU has it, else FSR 3. In game, F8 switches the mode (off, DLSS-G, FSR 3). Best with the '
+                   'screen at 60 or 120 Hz, or G-SYNC/FreeSync.'))
         self.section(f, _('Resolução', 'Resolution'))
         self.row(f, _('Saída', 'Output'), self.choice(f, 'output_res', OUTPUTS),
                  _('O jogo renderiza em 1080p, como no PS4; a imagem é ampliada ou reduzida para a saída. '
@@ -1028,6 +1057,10 @@ class Launcher:
         parts = [_('60 FPS', '60 FPS') if self.var('fps60').get() else _('30 FPS (como no PS4)', '30 FPS (as on PS4)'),
                  self.var('output_res').get().replace('x', ' × '),
                  'FSR 1' if self.var('upscaler').get() == 'fsr1' else 'bilinear']
+        framegen = self.var('framegen').get()
+        if framegen != 'off':
+            parts.append({'auto': _('geração de quadros', 'frame generation'), 'dlss': 'DLSS-G',
+                          'fsr': 'FSR 3'}.get(framegen, framegen))
         if self.var('af16').get():
             parts.append(_('AF 16x', '16x AF'))
         if self.var('neo').get():
@@ -1624,7 +1657,7 @@ def main():
     args = sys.argv[1:]
     if args and args[0] in ('--run', '--script'):
         sys.exit(run_role(args))
-    settings = {**APP_DEFAULTS, **load_json(CONFIG_FILE, {})}
+    settings = load_settings()
     LANG = settings.get('ui_language') or windows_language()
     if '--play' in args and (Path(settings['game_dir'] or '.') / 'eboot.bin').is_file():
         sys.exit(play_without_window(settings))

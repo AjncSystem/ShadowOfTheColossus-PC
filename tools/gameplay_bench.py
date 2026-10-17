@@ -40,6 +40,9 @@ def main():
     parser.add_argument('--pan', type=int, default=0,
                         help='right stick x (0-255, 128 = centre) held during the measurement: turns the camera')
     parser.add_argument('--walk', action='store_true', help='the character walks around during the run')
+    parser.add_argument('--save', default='out/save-template', help='folder with the CUSA08809 save to load')
+    parser.add_argument('--explore', type=float, default=0,
+                        help='run straight ahead after turning the camera this many seconds (heading)')
     parser.add_argument('--ride-speed', type=float, default=9.0,
                         help='camera speed (units/s) above which Wander is taken to be riding')
     parser.add_argument('--mount-rise', type=float, default=0.3,
@@ -53,7 +56,7 @@ def main():
     args = parser.parse_args()
     os.chdir(ROOT)
     out = Path('out')
-    template = out / 'save-template' / 'CUSA08809'
+    template = Path(args.save) / 'CUSA08809'
     target = Path(args.user) / 'savedata' / '1' / 'CUSA08809'
     shutil.rmtree(target, ignore_errors=True)
     shutil.copytree(template, target)
@@ -260,6 +263,36 @@ def main():
                         return
         pad.write_text('')
 
+    # --explore SECONDS: turn the camera right for SECONDS (the heading: ~90 degrees a second at
+    # full stick), then run straight ahead; when the camera (SOTC_CAM_LOG, needs SOTC_DLSSG=1)
+    # barely moves for 2 s, Wander is blocked: turn the camera a little and go on.
+    explore_cam = re.compile(r'SOTC CAM (\d+) (-?[\d.]+) (-?[\d.]+) (-?[\d.]+)')
+
+    def explore():
+        while alive() and state['gameplay_at'] is None:
+            time.sleep(0.1)
+        if not wait_until(state['gameplay_at'] + 2):
+            return
+        pad.write_text('rx=255')
+        if not wait_until(now() + args.explore):
+            return
+        turns = 0
+        while alive():
+            pad.write_text('ly=0')
+            if not wait_until(now() + 2.0):
+                return
+            pts = [(int(m[1]), float(m[2]), float(m[4])) for m in explore_cam.finditer(log_text())]
+            recent = [p for p in pts if pts and p[0] >= pts[-1][0] - 2000]
+            if len(recent) >= 2:
+                a, b = recent[0], recent[-1]
+                if ((b[1] - a[1]) ** 2 + (b[2] - a[2]) ** 2) ** 0.5 < 2.0:
+                    turns += 1
+                    pad.write_text('rx=255 ly=0' if turns % 2 else 'rx=0 ly=0')
+                    if not wait_until(now() + 0.6 + 0.2 * (turns % 4)):
+                        return
+
+    if args.explore:
+        threading.Thread(target=explore, daemon=True).start()
     if args.walk:
         threading.Thread(target=walk, daemon=True).start()
     threading.Thread(target=route, daemon=True).start()

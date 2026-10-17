@@ -182,6 +182,8 @@ inline std::atomic<float> ov_worst_cause_ms{0.0f};
 inline std::atomic<int> ov_fg_state{-1};
 inline std::atomic<uint32_t> ov_fg_frames{0};
 inline std::atomic<uint32_t> ov_fg_status{0};
+/// FSR 3 frame generation (vk_fsrfg.cpp): 0 waiting for a 3D scene, 1 generating, 2 error.
+inline std::atomic<int> ov_fsr_state{0};
 /// Phases of PipelineCache::CompileModule (SOTC_FPS, "SOTC COMPILE" line): translate, emit SPIR-V,
 /// shader patch lookup, vkCreateShaderModule, cache registration.
 inline std::atomic<uint64_t> compile_phase_ns[5]{};

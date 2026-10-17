@@ -803,6 +803,10 @@ bool Enabled() {
     return supported;
 }
 
+bool CapturingInputs() {
+    return Capturing();
+}
+
 // Streamline asks for vsync off with Vulkan, but DLSS-G generates and paces its frames in
 // Mailbox mode too (measured: 2 frames shown per game frame), without tearing when G-SYNC is
 // off. The requested mode is kept; SOTC_DLSSG_IMMEDIATE=1 switches to Immediate.

@@ -41,6 +41,10 @@ void OnDeviceCreated(const Instance& instance);
 /// Streamline is loaded and DLSS-G is supported on this device.
 bool Enabled();
 
+/// The current frame generation mode needs the game's inputs (DLSS-G, or FSR 3 on any GPU):
+/// the rasterizer then calls NoteDraw.
+bool CapturingInputs();
+
 /// The present mode DLSS-G needs (Vulkan: no vsync), when Enabled().
 bool WantsImmediatePresent();
 

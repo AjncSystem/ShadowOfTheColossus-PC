@@ -442,7 +442,12 @@ struct ShadowReuseState {
     std::array<std::array<float, 16>, kSlices> last_vp{};
     std::array<std::array<float, 3>, kSlices> last_scale{};
     std::array<bool, kSlices> have_vp{}, decided{}, skip{}, drawn_prev{}, drawn_now{};
-    u64 drawn = 0, scrolled = 0, refused = 0, invalid = 0;
+    // The light matrix a slice was decided for this frame, and the image it was drawn into.
+    std::array<std::array<float, 16>, kSlices> decided_vp{};
+    std::array<VideoCore::ImageId, kSlices> last_image{};
+    std::array<u64, kSlices> last_image_uid{};
+    u64 prev_key = 0; // target of the previous draw (address * 8 + slice), 0: another kind
+    u64 drawn = 0, scrolled = 0, refused = 0, invalid = 0, rendered_again = 0, image_changed = 0;
     s32 check_slice = -1; // verification: the slice scrolled into the scratch image
     bool check_done = false;
 };
@@ -480,37 +485,40 @@ bool Rasterizer::ReuseShadowCascade() {
         s.drawn_now.fill(false);
         s.decided.fill(false);
         s.frame_seen = frame;
+        // Every ~60 s in the log (every 300 frames with SOTC_SHADOW_REUSE_STATS).
         static const bool stats = std::getenv("SOTC_SHADOW_REUSE_STATS") != nullptr;
-        if (stats && frame % 300 == 0) {
+        if (frame % (stats ? 300 : 1800) == 0) {
             std::fprintf(stderr,
                          "SOTC SHADOW REUSE: far cascades drawn %llu, moved %llu, refused %llu, "
-                         "unreadable %llu\n",
+                         "unreadable %llu, drawn twice in a frame %llu, image changed %llu\n",
                          static_cast<unsigned long long>(s.drawn),
                          static_cast<unsigned long long>(s.scrolled),
                          static_cast<unsigned long long>(s.refused),
-                         static_cast<unsigned long long>(s.invalid));
-            s.drawn = s.scrolled = s.refused = s.invalid = 0;
+                         static_cast<unsigned long long>(s.invalid),
+                         static_cast<unsigned long long>(s.rendered_again),
+                         static_cast<unsigned long long>(s.image_changed));
+            s.drawn = s.scrolled = s.refused = s.invalid = s.rendered_again = s.image_changed = 0;
         }
     }
-    if (!regs.depth_buffer.DepthValid() ||
-        regs.color_control.mode != AmdGpu::ColorControl::OperationMode::Normal) {
-        return false;
-    }
-    const u32 pitch = regs.depth_buffer.Pitch();
-    if (pitch != regs.depth_buffer.Height() || pitch < 512) {
-        return false;
-    }
-    const u64 addr = regs.depth_buffer.DepthWriteAddress();
-    ++s.counts[addr];
+    const bool square_depth =
+        regs.depth_buffer.DepthValid() &&
+        regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Normal &&
+        regs.depth_buffer.Pitch() == regs.depth_buffer.Height() && regs.depth_buffer.Pitch() >= 512;
+    const u64 addr = square_depth ? regs.depth_buffer.DepthWriteAddress() : 0;
     const u32 slice = regs.depth_view.slice_start;
+    const u64 key = square_depth ? addr * 8 + (slice & 7) : 0;
+    const bool new_run = key != s.prev_key; // first draw after draws into another target
+    s.prev_key = key;
+    if (!square_depth) {
+        return false;
+    }
+    ++s.counts[addr];
     if (addr != s.sun_map || (slice != 2 && slice != 3)) {
         return false;
     }
-    if (s.decided[slice]) {
+    if (s.decided[slice] && !new_run) {
         return s.skip[slice];
     }
-    s.decided[slice] = true;
-    s.skip[slice] = false;
 
     // The cascade's light matrix (rows at +0x80 of the shadow view's constants).
     constexpr u64 kMask48 = 0xFFFFFFFFFFFFull;
@@ -532,6 +540,40 @@ bool Rasterizer::ReuseShadowCascade() {
         regs.viewport_control.xscale_enable ? viewport.xscale : 1.0f,
         regs.viewport_control.yscale_enable ? viewport.yscale : 1.0f,
         regs.viewport_control.zscale_enable ? viewport.zscale : 1.0f};
+    // The image the cascade goes to: a moved cascade needs last frame's texels in the same image.
+    VideoCore::ImageId image_id{};
+    u64 image_uid = 0;
+    if (valid) {
+        const auto texture_lock = texture_cache.BatchLock();
+        const auto htile = regs.depth_htile_data_base.GetAddress();
+        VideoCore::TextureCache::ImageDesc desc(regs.depth_buffer, regs.depth_view,
+                                                regs.depth_control, htile,
+                                                liverpool->last_db_extent);
+        image_id = texture_cache.FindImage(desc);
+        image_uid = texture_cache.GetImage(image_id).image_uid;
+    }
+    if (s.decided[slice]) {
+        // Another run of draws into this slice in the same frame.
+        if (valid && vp == s.decided_vp[slice]) {
+            return s.skip[slice]; // the same cascade, drawn in several runs
+        }
+        // Drawn again with another light matrix before the flip (a second scene in one frame, as
+        // a slower machine may render): drawn as the game does, and a valid source next frame.
+        ++s.rendered_again;
+        ++s.drawn;
+        s.skip[slice] = false;
+        s.decided_vp[slice] = vp;
+        s.last_vp[slice] = vp;
+        s.last_scale[slice] = scale;
+        s.have_vp[slice] = valid;
+        s.drawn_now[slice] = true;
+        s.last_image[slice] = image_id;
+        s.last_image_uid[slice] = image_uid;
+        return false;
+    }
+    s.decided[slice] = true;
+    s.skip[slice] = false;
+    s.decided_vp[slice] = vp;
 
     // Verification: the scratch image scrolled last frame against the cascade then drawn.
     if (mode == 2 && s.check_slice >= 0 && !s.check_done && shadow_scroll) {
@@ -555,7 +597,13 @@ bool Rasterizer::ReuseShadowCascade() {
         ++s.invalid;
     } else if (s.have_vp[slice] && s.drawn_prev[slice] && phase) {
         const auto& prev = s.last_vp[slice];
-        bool same_basis = s.last_scale[slice] == scale;
+        // Last frame's texels are in the image only if it is the same one (not recreated).
+        const bool same_image =
+            image_id == s.last_image[slice] && image_uid == s.last_image_uid[slice];
+        if (!same_image) {
+            ++s.image_changed;
+        }
+        bool same_basis = same_image && s.last_scale[slice] == scale;
         for (int r = 0; r < 3; ++r) {
             for (int c = 0; c < 3; ++c) {
                 same_basis &= vp[r * 4 + c] == prev[r * 4 + c];
@@ -612,6 +660,8 @@ bool Rasterizer::ReuseShadowCascade() {
     s.last_vp[slice] = vp;
     s.last_scale[slice] = scale;
     s.have_vp[slice] = valid;
+    s.last_image[slice] = image_id;
+    s.last_image_uid[slice] = image_uid;
     s.skip[slice] = moved;
     s.drawn_now[slice] = !moved;
     ++(moved ? s.scrolled : s.drawn);
@@ -645,7 +695,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     TraceShadowShaders(regs, pipeline);
 
     PrepareRenderState(pipeline);
-    if (Dlssg::Enabled()) { // sotc: camera and inputs of DLSS Frame Generation
+    if (Dlssg::CapturingInputs()) { // sotc: camera and inputs of frame generation
         Dlssg::NoteDraw(regs, pipeline->GetGraphicsKey().mrt_mask, db_desc.first,
                         cb_descs[4].first, texture_cache);
     }
@@ -729,7 +779,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     TraceShadowShaders(liverpool->regs, pipeline);
 
     PrepareRenderState(pipeline);
-    if (Dlssg::Enabled()) { // sotc: camera and inputs of DLSS Frame Generation
+    if (Dlssg::CapturingInputs()) { // sotc: camera and inputs of frame generation
         Dlssg::NoteDraw(liverpool->regs, pipeline->GetGraphicsKey().mrt_mask, db_desc.first,
                         cb_descs[4].first, texture_cache);
     }

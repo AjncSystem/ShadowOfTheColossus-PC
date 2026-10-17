@@ -430,6 +430,13 @@ GraphicsPipeline::GraphicsPipeline(
 
     auto [pipeline_result, pipe] =
         device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+    if (pipeline_result != vk::Result::eSuccess && preloading) {
+        // sotc: the driver can refuse a pipeline rebuilt from the cache (ErrorUnknown on AMD).
+        // Left without a handle, the preload drops it and the game compiles it when it is drawn.
+        LOG_WARNING(Render_Vulkan, "Cached graphics pipeline {} failed to build: {}", debug_str,
+                    vk::to_string(pipeline_result));
+        return;
+    }
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);

@@ -7,6 +7,7 @@
 #include <sys/resource.h>
 #endif
 #include "bbport_toggles.h"
+#include "video_core/sotc_stats.h"
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -106,10 +107,12 @@ void MemoryManager::SetRasterizer(Vulkan::Rasterizer* rasterizer_) {
                 const char* v = std::getenv("SOTC_MAP_INVALIDATE");
                 return !v || v[0] != '0';
             }();
+            if (SotcStats::kCmdStats) SotcStats::inv_map.fetch_add(size, std::memory_order_relaxed);
             if (map_invalidate) r->InvalidateMemory(address, size);
         },
         [](uintptr_t address, uint64_t size) { Memory::Instance()->GetRasterizer()->UnmapMemory(address, size); },
         [](uintptr_t address, uint64_t size) {
+            if (SotcStats::kCmdStats) SotcStats::inv_protect.fetch_add(size, std::memory_order_relaxed);
             Memory::Instance()->GetRasterizer()->InvalidateMemory(address, size);
         });
 }
@@ -198,12 +201,15 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size, u
 }
 void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms) {
     BbStats::Timer timer{BbStats::t_protect};
-    const u64 pages = (size + 4095) / 4096;
-    BbStats::protect_calls.fetch_add(1, std::memory_order_relaxed);
-    BbStats::protect_pages.fetch_add(pages, std::memory_order_relaxed);
-    if (!True(perms & MemoryPermission::Write)) {
-        BbStats::protect_revoke_calls.fetch_add(1, std::memory_order_relaxed);
-        BbStats::protect_revoke_pages.fetch_add(pages, std::memory_order_relaxed);
+    // sotc: no protect call/page counters: nothing read them, and every protect (CP re-protects
+    // and guest-thread fault unprotects) paid 2-4 lock xadds on shared cache lines. Counted
+    // only for the SOTC sys line (SOTC_CMD_STATS).
+    if (SotcStats::kCmdStats) {
+        SotcStats::sys_protects.fetch_add(1, std::memory_order_relaxed);
+        SotcStats::sys_protect_bytes.fetch_add(size, std::memory_order_relaxed);
+        if (True(perms & MemoryPermission::Write)) {
+            SotcStats::sys_unprotects.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     runtime_memory_gpu_protect(virtual_addr, size, True(perms & MemoryPermission::Read),
                                True(perms & MemoryPermission::Write));
@@ -214,6 +220,8 @@ boost::icl::interval_set<VAddr> AddressSpace::GetUsableRegions() {
     return set;
 }
 } // namespace Core
+
+extern "C" int runtime_savedata_mounted(void); // src/runtime_savedata.c
 
 // Kernel services the vendored libraries call directly.
 namespace Libraries::Kernel {
@@ -253,9 +261,18 @@ u32 BbDisplayRefreshHz() {
     return hz;
 }
 
-#ifdef BB_PGO_GENERATE
+#if defined(BB_PGO_GENERATE) && defined(BB_PGO_CLANG)
+// sotc: Clang instrumentation (compiler-rt profile runtime): write (merging into the %m file)
+// and reset, so the file sums the intervals like the GCC path below.
+extern "C" int __llvm_profile_write_file(void);
+extern "C" void __llvm_profile_reset_counters(void);
+static void __gcov_dump(void) { __llvm_profile_write_file(); }
+static void __gcov_reset(void) { __llvm_profile_reset_counters(); }
+#elif defined(BB_PGO_GENERATE)
 extern "C" void __gcov_dump(void);
 extern "C" void __gcov_reset(void);
+#endif
+#ifdef BB_PGO_GENERATE
 // Instrumented build (BB_PGO=generate): the game often ends through _exit (watchdog, guest
 // exit), which skips the profile write at exit. Write every 30 s and reset: the files sum the
 // intervals.
@@ -299,6 +316,14 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
             SDL_Delay(2);
         }
         LOG_INFO(Frontend, "Window closed by user");
+        // sotc: a save being written (a save directory mounted for writing) gets up to 5 s to
+        // finish: quitting mid-write left a truncated save behind.
+        if (runtime_savedata_mounted() > 0) {
+            std::fprintf(stderr, "Runtime: waiting for the save to finish before quitting\n");
+            for (int i = 0; i < 100 && runtime_savedata_mounted() > 0; ++i) {
+                SDL_Delay(50);
+            }
+        }
         std::fflush(stdout);
         std::_Exit(0);
     });

@@ -75,6 +75,7 @@ public:
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
+    bool InvalidateMemoryOnGuestFault(VAddr addr, u64 size);
     /// sotc: after a guest write fault at addr (BufferCache::MarkWriteAhead).
     void MarkWriteAhead(VAddr addr) {
         buffer_cache.MarkWriteAhead(addr);
@@ -145,6 +146,7 @@ private:
     void FlushPeriodic();
     u64 commands_tick{};
     u64 commands_since_submit{};
+    u64 evict_poll{}; ///< sotc: FlushPeriodic commands without periodic submits
     std::chrono::steady_clock::time_point commands_since{};
 
     bool IsComputeMetaClear(const Pipeline* pipeline);

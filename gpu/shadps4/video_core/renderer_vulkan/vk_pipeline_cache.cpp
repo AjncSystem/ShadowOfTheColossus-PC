@@ -6,6 +6,9 @@
 #include <xxhash.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <unordered_set>
 #include "common/elf_info.h"
 #include "common/hash.h"
@@ -387,6 +390,28 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 
 PipelineCache::~PipelineCache() = default;
 
+// sotc: a pipeline built on the command processor that took longer than 30 ms is logged with
+// the reason it was not built on a pipeline worker (SOTC_SYNC_PIPELINE_MS changes the limit).
+static void LogSyncPipeline(const char* kind, const char* reason,
+                            std::chrono::steady_clock::time_point start, u64 hash_a, u64 hash_b) {
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+            .count();
+    static const double min_ms = [] {
+        const char* v = std::getenv("SOTC_SYNC_PIPELINE_MS");
+        return v ? std::atof(v) : 30.0;
+    }();
+    static const auto t0 = start;
+    static std::atomic<int> logged{0};
+    if (ms < min_ms || logged.fetch_add(1, std::memory_order_relaxed) >= 2000) {
+        return;
+    }
+    const double at = std::chrono::duration<double, std::milli>(start - t0).count();
+    std::fprintf(stderr, "SOTC SYNC PIPELINE %s (%s) %.0f ms, shaders %016llx %016llx, at %.1f\n",
+                 kind, reason, ms, static_cast<unsigned long long>(hash_a),
+                 static_cast<unsigned long long>(hash_b), at);
+}
+
 bool PipelineCache::AsyncPipelineEligible() const {
     // Off the command processor the guest registers belong to later draws: only pipelines whose
     // construction reads nothing from them. Vertex inputs are dynamic state (otherwise they are
@@ -497,12 +522,14 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         // a black or stale frame, so they still build here. Geometry draws are skipped while
         // their pipeline is built (a brief pop-in instead of a freeze on first sight).
         const bool tiny_draw = liverpool->regs.num_indices <= 6;
-        if (!async_workers.empty() && !tiny_draw && AsyncPipelineEligible()) {
+        const bool eligible = AsyncPipelineEligible();
+        if (!async_workers.empty() && !tiny_draw && eligible) {
             QueueAsyncPipeline(pipeline_hash);
             return nullptr; // the draws that need it are skipped until it is ready
         }
         const SotcStats::ScopedTimer stall_timer{SotcStats::pipeline_ns};
         SotcStats::pipelines_new.fetch_add(1, std::memory_order_relaxed);
+        const auto sync_start = std::chrono::steady_clock::now();
 
         const SotcStats::FrameTimer frame_timer{SotcStats::FramePipeline};
         SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
@@ -510,6 +537,12 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
             runtime_infos, fetch_shader, modules, sdata, false);
+        LogSyncPipeline("graphics",
+                        async_workers.empty() ? "async off"
+                        : tiny_draw           ? "tiny draw"
+                                              : "not eligible",
+                        sync_start, infos[3] ? infos[3]->pgm_hash : 0, // vertex
+                        infos[0] ? infos[0]->pgm_hash : 0);              // fragment
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
@@ -542,9 +575,11 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         const SotcStats::FrameTimer frame_timer{SotcStats::FramePipeline};
         SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
         ComputePipeline::SerializationSupport sdata{};
+        const auto sync_start = std::chrono::steady_clock::now();
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
                                                        *pipeline_cache, compute_key, *infos[0],
                                                        modules[0], sdata, false);
+        LogSyncPipeline("compute", "never async", sync_start, infos[0]->pgm_hash, 0);
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
 

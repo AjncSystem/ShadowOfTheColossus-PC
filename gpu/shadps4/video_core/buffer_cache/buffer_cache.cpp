@@ -186,13 +186,14 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         flush_request();
         return;
     }
-    // sotc: SOTC_RB_ASYNC=1: with the draw thread (Liverpool::IsBackThreaded) the synchronous
-    // readback holds it while the GPU catches up (~10% of its time; Shrine 38.9 -> 40.6 fps). Off
-    // by default: the attract demo of another branch (DUDUYG, PR 69) and one boot of this one
-    // stopped on the page_manager.cpp "protect region as write-only" assertion with it.
-    static const bool async = [this] {
+    // sotc: asynchronous readbacks by default (SOTC_RB_ASYNC=0: the waiting thread waits). With
+    // the draw thread (Liverpool::IsBackThreaded) the synchronous readback holds it while the GPU
+    // catches up (~10% of its time): Shrine 34.6 -> 37.0 FPS. #99 had made it opt-in after the
+    // "protect region as write-only" assertion; MarkWrittenByGuest (fork PR #31) removes that
+    // cause, and SignalImpl::Protect no longer stops the game on it.
+    static const bool async = [] {
         const char* v = std::getenv("SOTC_RB_ASYNC");
-        return v && v[0] == '1';
+        return !v || v[0] != '0';
     }();
     if (!async) {
         liverpool->SendCommand<true>(std::move(flush_request));

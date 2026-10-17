@@ -33,6 +33,7 @@ struct VideoOutPort {
     std::condition_variable vblank_cv;
     int flip_rate = 0;
     int prev_index = -1;
+    int submit_prev_index = -1; ///< sotc: prev_index as seen by SubmitFlipInternal
     bool is_open = false;
     bool is_hdr = false;
 

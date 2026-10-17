@@ -79,14 +79,20 @@ public:
     }
 
     /// Removes all protection from a page and ensures GPU data has been flushed if requested
-    void InvalidateRegion(VAddr cpu_addr, u64 size, auto&& on_flush) noexcept {
+    /// sotc: guest_fault (a guest thread's write fault) feeds the repeat-fault grace.
+    void InvalidateRegion(VAddr cpu_addr, u64 size, auto&& on_flush,
+                          bool guest_fault = false) noexcept {
         if (readbacks_mode == GpuReadbacksMode::Disabled) {
             return MarkRegionAsCpuModified(cpu_addr, size);
         }
         bool should_flush = false;
-        IteratePages(cpu_addr, size, [&should_flush](RegionManager* manager, u64 offset, u64 size) {
+        IteratePages(cpu_addr, size, [&should_flush, guest_fault](RegionManager* manager,
+                                                                 u64 offset, u64 size) {
             const auto bounds = manager->GetBounds(offset, size);
             manager->Lock(bounds);
+            if (guest_fault) {
+                manager->NoteGuestWriteFaultLocked(offset);
+            }
             const bool modified = manager->template IsRegionModified<Type::GPU>(offset, size);
             if (!modified) {
                 manager->template ChangeRegionState<StateOp::Set, StateOp::None, false>(offset,
@@ -174,8 +180,29 @@ private:
         new_manager->SetCpuAddress(base_cpu_addr);
         free_managers.pop_back();
         top_tier[page_index] = new_manager;
+        live_managers.push_back(new_manager);
         return new_manager;
     }
+
+public:
+    /// sotc: calls f(address, size) for each run of 256 KiB words whose CPU bits rose since the
+    /// last call (RegionManager::TakeSweepWords). GPU command thread only (as CreateRegion).
+    template <typename F>
+    void ForEachSweepSpan(F&& f) {
+        for (size_t i = 0; i < live_managers.size(); ++i) {
+            RegionManager* manager = live_managers[i];
+            u64 words = manager->TakeSweepWords();
+            while (words) {
+                const int first = std::countr_zero(words);
+                const int count = std::countr_one(words >> first);
+                f(manager->CpuAddress() + u64(first) * BYTES_PER_WORD, u64(count) * BYTES_PER_WORD);
+                words = first + count >= 64 ? 0 : words & (~0ULL << (first + count));
+            }
+        }
+    }
+
+private:
+    std::vector<RegionManager*> live_managers;
 
     PageManager* tracker;
     const u32 readbacks_mode;

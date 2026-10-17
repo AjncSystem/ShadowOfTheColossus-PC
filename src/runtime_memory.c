@@ -23,14 +23,19 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
-/* sceKernelGetDirectMemorySize on retail PS4: 5056 MiB. BB_DMEM_MB raises it (the resolution
- * patches above 1080p need about 4 GiB more; run.sh sets it). */
+/* sceKernelGetDirectMemorySize on retail PS4: 5056 MiB. BB_DMEM_MB=<MiB> raises it (more room
+ * for GPU memory than the console has). A PS4 Pro (SOTC_NEO=1) gives games 640 MiB more
+ * (shadPS4: 5888 vs 5248 MiB in total); with the base size the game's 64 KiB page bitmap filled
+ * up when a save loaded in Pro mode and its allocator read past it (guest offset 0x1a371, read
+ * of -1). */
+int runtime_sotc_neo(void);
 static uint64_t pool_size_bytes(void) {
     static uint64_t size;
     if (!size) {
         const char *env = getenv("BB_DMEM_MB");
+        const uint64_t base = runtime_sotc_neo() ? 5056 + 640 : 5056;
         uint64_t mb = env ? strtoull(env, NULL, 10) : 0;
-        if (mb < 5056 || mb > 16384) mb = 5056;
+        if (mb < base || mb > 16384) mb = base;
         size = mb * 1024 * 1024;
     }
     return size;
@@ -82,6 +87,7 @@ static Vma *vmas; static size_t vma_count, vma_capacity;
 #ifndef _WIN32
 static int pool_fd=-1;
 #endif
+static void region_direct_init(void); /* sotc: SOTC_REGION_DIRECT, read before any fault */
 static unsigned char *backing_base; /* second view of the pool: host writes bypass guest/GPU page protection */
 #define FLEX_SPAN (UINT64_C(1024) * 1024 * 1024)
 static uint64_t flex_bitmap[FLEX_SPAN/PAGE/64];
@@ -90,7 +96,11 @@ typedef void (*GpuRange)(uintptr_t address, uint64_t size);
 static GpuRange hook_map, hook_unmap, hook_invalidate;
 enum { HOOK_MAP, HOOK_UNMAP, HOOK_INVALIDATE };
 typedef struct { int kind; uintptr_t address; uint64_t size; } PendingHook;
-static PendingHook pending[64]; static size_t pending_count;
+/* sotc: a ring of 4096 (was 64, drained with memmove). Consumers run the GPU hooks outside the
+ * lock and the unmap hook waits for the GPU, so under video memory pressure other threads queued
+ * past 64 and the game stopped ("GPU hook queue overflow", 6 GB card in the shrine). */
+#define PENDING_HOOKS 4096
+static PendingHook pending[PENDING_HOOKS]; static size_t pending_head, pending_count;
 static size_t allocations, maps, flexible_maps, protects, queries;
 static uint64_t live_bytes, flexible_bytes;
 
@@ -115,7 +125,9 @@ static DWORD win_prot(int prot) {
     if (prot & PROT_WRITE) return PAGE_READWRITE;
     return (prot & PROT_READ) ? PAGE_READONLY : PAGE_NOACCESS;
 }
+static void carve_resume_on_fail(void);
 static void win_fail(const char *what, uintptr_t address, uint64_t size) {
+    carve_resume_on_fail(); /* sotc: no stdio while other guest threads are stopped */
     fprintf(stderr,"STOP: %s failed at %p (+0x%" PRIx64 "), error %lu\n",what,(void *)address,size,GetLastError());
     exit(21);
 }
@@ -124,13 +136,16 @@ static size_t region_index(uintptr_t a) { /* first region with end > a */
     while (lo<hi) { size_t mid=(lo+hi)/2; if (regions[mid].end<=a) lo=mid+1; else hi=mid; }
     return lo;
 }
-static void region_insert(size_t at, HostRegion r) {
-    if (region_count==region_capacity) {
+static void region_reserve(size_t extra) {
+    while (region_count+extra>region_capacity) {
         size_t capacity=region_capacity ? region_capacity*2 : 256;
         HostRegion *next=realloc(regions,capacity*sizeof(*regions));
         if (!next) { fputs("Out of memory (host regions)\n",stderr); exit(1); }
         regions=next; region_capacity=capacity;
     }
+}
+static void region_insert(size_t at, HostRegion r) {
+    region_reserve(1);
     memmove(regions+at+1,regions+at,(region_count-at)*sizeof(*regions));
     regions[at]=r; ++region_count;
 }
@@ -169,6 +184,27 @@ static size_t save_protections(uintptr_t start, uintptr_t end, ProtRun **runs, s
     }
     return count;
 }
+#ifdef _WIN32
+size_t runtime_thread_suspend_others(void **out, size_t capacity); /* runtime_thread.c */
+void runtime_thread_resume(void **handles, size_t n);
+/* sotc: SOTC_CARVE_SUSPEND=0 keeps the other guest threads running while live views are split. */
+static int carve_suspend_enabled(void) {
+    static int v=-1;
+    if (v<0) { const char *e=getenv("SOTC_CARVE_SUSPEND"); v=!(e && e[0]=='0'); }
+    return v;
+}
+static uint64_t carve_splits;
+uint64_t runtime_memory_carve_splits(void) { return __atomic_exchange_n(&carve_splits,0,__ATOMIC_RELAXED); }
+/* The threads carve_host stopped, so win_fail can resume them before reporting. */
+static void *carve_stopped[256];
+static size_t carve_nstopped;
+static int carve_stopping;
+#endif
+static void carve_resume_on_fail(void) {
+#ifdef _WIN32
+    if (carve_stopping) { carve_stopping=0; runtime_thread_resume(carve_stopped,carve_nstopped); }
+#endif
+}
 /* Leaves [a,b) as exactly one unmapped placeholder; returns its region index. */
 static size_t carve_host(uintptr_t a, uintptr_t b) {
     size_t first=region_index(a), last=first;
@@ -182,6 +218,15 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
     ProtRun *runs=NULL; size_t nruns=0, capacity=0, left_runs=0;
     if (keep_left) left_runs=nruns=save_protections(lo,a,&runs,nruns,&capacity);
     if (keep_right) nruns=save_protections(b,hi,&runs,nruns,&capacity);
+    /* sotc: a live view is split: everything in it (fiber stacks included) disappears until it is
+     * mapped again below. Other guest threads stop meanwhile (see runtime_thread_suspend_others).
+     * The region table is grown first: no heap call while they are stopped (one may hold the heap). */
+    if ((keep_left || keep_right) && carve_suspend_enabled()) {
+        region_reserve(3);
+        carve_nstopped=runtime_thread_suspend_others(carve_stopped,256);
+        carve_stopping=1;
+        __atomic_add_fetch(&carve_splits,1,__ATOMIC_RELAXED);
+    }
     for (size_t i=first;i<last;++i) if (regions[i].mapped) {
         if (!UnmapViewOfFile2(GetCurrentProcess(),(void *)regions[i].start,MEM_PRESERVE_PLACEHOLDER))
             win_fail("UnmapViewOfFile2",regions[i].start,regions[i].end-regions[i].start);
@@ -215,6 +260,7 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
         if (runs[i].protect!=PAGE_READWRITE && !VirtualProtect((void *)runs[i].start,runs[i].end-runs[i].start,runs[i].protect,&old))
             win_fail("restoring page protection",runs[i].start,runs[i].end-runs[i].start);
     }
+    if (carve_stopping) { carve_stopping=0; runtime_thread_resume(carve_stopped,carve_nstopped); }
     (void)left_runs;
     free(runs);
     return at;
@@ -242,6 +288,7 @@ static void host_discard(uint64_t phys, uint64_t size) { memset(backing_base+phy
 /* Direct memory occupies [0,POOL_SIZE) of the section, flexible memory [POOL_SIZE,+FLEX_SPAN). */
 static int pool(void) {
     if (backing_base) return 0;
+    region_direct_init();
     runtime_memory_reserve();
     uint64_t bytes=POOL_SIZE+FLEX_SPAN;
     section=CreateFileMapping2(INVALID_HANDLE_VALUE,NULL,FILE_MAP_ALL_ACCESS,PAGE_EXECUTE_READWRITE,SEC_COMMIT,bytes,NULL,NULL,0);
@@ -253,6 +300,7 @@ static int pool(void) {
 /* Direct memory occupies [0,POOL_SIZE) of the memfd, flexible memory [POOL_SIZE,+FLEX_SPAN). */
 static int pool(void) {
     if (pool_fd>=0) return 0;
+    region_direct_init();
     pool_fd=memfd_create("bb-guest-memory", MFD_CLOEXEC);
     if (pool_fd<0 || ftruncate(pool_fd,(off_t)(POOL_SIZE+FLEX_SPAN))) return -1;
     void *view=mmap(NULL,POOL_SIZE+FLEX_SPAN,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_NORESERVE,pool_fd,0);
@@ -276,16 +324,17 @@ static void host_discard(uint64_t phys, uint64_t size) {
 static void queue_hook(int kind, uintptr_t address, uint64_t size) {
     GpuRange hook = kind==HOOK_MAP ? hook_map : kind==HOOK_UNMAP ? hook_unmap : hook_invalidate;
     if (!hook) return;
-    if (pending_count==sizeof(pending)/sizeof(*pending)) { fputs("STOP: GPU hook queue overflow\n",stderr); exit(21); }
-    pending[pending_count++]=(PendingHook){kind,address,size};
+    if (pending_count==PENDING_HOOKS) { fputs("STOP: GPU hook queue overflow\n",stderr); exit(21); }
+    pending[(pending_head+pending_count++)%PENDING_HOOKS]=(PendingHook){kind,address,size};
 }
 /* Runs queued GPU notifications; callers invoke it after dropping the lock. */
 static void flush_hooks(void) {
     for (;;) {
         write_lock();
         if (!pending_count) { write_unlock(); return; }
-        PendingHook h=pending[0];
-        memmove(pending,pending+1,--pending_count*sizeof(*pending));
+        PendingHook h=pending[pending_head];
+        pending_head=(pending_head+1)%PENDING_HOOKS;
+        --pending_count;
         GpuRange hook = h.kind==HOOK_MAP ? hook_map : h.kind==HOOK_UNMAP ? hook_unmap : hook_invalidate;
         write_unlock();
         if (hook) hook(h.address,h.size);
@@ -803,9 +852,24 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
 typedef struct { uint64_t generation; uintptr_t start, end; int kind; const unsigned char *backing; } CachedRegion; /* backing: view of start */
 static __thread CachedRegion region_cache[8];
 static __thread unsigned region_cache_next;
+/* sotc: plus 512 direct-mapped entries by 16 KiB of address. The command processor's buffer binds
+ * touch more regions than the 8 recent ones, so most lookups took the read lock and a binary
+ * search (~4.5% of that thread: libwinpthread, vma_index). SOTC_REGION_DIRECT=0: ring only. */
+#define REGION_DIRECT_SLOTS 512
+static __thread CachedRegion region_direct[REGION_DIRECT_SLOTS];
+static int region_direct_on=-1; /* -1 until pool(): lookups only, no fills */
+static void region_direct_init(void) {
+    const char *v=getenv("SOTC_REGION_DIRECT");
+    region_direct_on=!(v && v[0]=='0');
+}
+static size_t region_direct_slot(uintptr_t address) { return (address>>14)&(REGION_DIRECT_SLOTS-1); }
 static const CachedRegion *cached_region(uintptr_t address) {
     uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
     if (generation & 1) return NULL;
+    if (region_direct_on) {
+        const CachedRegion *d=&region_direct[region_direct_slot(address)];
+        if (d->generation==generation && d->end && d->start<=address && address<d->end) return d;
+    }
     for (unsigned i=0;i<8;++i) {
         const CachedRegion *c=&region_cache[i];
         if (c->generation==generation && c->end && c->start<=address && address<c->end) return c;
@@ -813,11 +877,21 @@ static const CachedRegion *cached_region(uintptr_t address) {
     return NULL;
 }
 /* Called under the read lock after a lookup of address. */
-static void cache_region(size_t i) {
+static void cache_region(size_t i, uintptr_t address) {
     uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
     if (i==vma_count || (generation & 1)) return;
     const unsigned char *backing=vmas[i].kind!=KIND_RESERVED && backing_base ? backing_base+vmas[i].phys : NULL;
-    region_cache[region_cache_next++ % 8]=(CachedRegion){generation,vmas[i].start,vmas[i].end,vmas[i].kind,backing};
+    const CachedRegion entry={generation,vmas[i].start,vmas[i].end,vmas[i].kind,backing};
+    region_cache[region_cache_next++ % 8]=entry;
+    if (region_direct_on>0) region_direct[region_direct_slot(address)]=entry;
+}
+/* sotc: the VMA table generation, for caches of backing pointers outside this file: a pointer
+ * obtained while it was even stays valid until it changes (the invariant cached_region relies
+ * on: only write_lock/write_unlock bump it; page protection takes the read lock). Odd (never
+ * cache) while the table changes or when the GPU caches are disabled. */
+uint64_t runtime_memory_generation(void) {
+    if (runtime_disabled_optimizations & 1) return 1;
+    return __atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
 }
 /* sotc: the GPU reads guest memory through the backing view on every upload; the per-thread
  * region cache spares it the table lock (a winpthread rwlock, slow) and the binary search. */
@@ -828,21 +902,33 @@ const unsigned char *runtime_memory_backing_pointer(uintptr_t address) {
     size_t i=vma_index(address);
     const unsigned char *p=NULL;
     if (i<vma_count && vmas[i].start<=address) {
-        cache_region(i);
+        cache_region(i,address);
         if (vmas[i].kind!=KIND_RESERVED && backing_base) p=backing_base+vmas[i].phys+(address-vmas[i].start);
     }
     read_unlock();
     return p;
 }
 /* Mapped length from address, up to size, across adjacent mappings. */
+/* sotc: mapped length of [address, address+size) from the cached regions alone, walking
+ * adjacent mappings (buffers that span two VMAs missed the one-region check every time and took
+ * the read lock); 0 when a region on the way is not cached. */
+static uint64_t cached_mapped_length(uintptr_t address, uint64_t size) {
+    if (runtime_disabled_optimizations & 1) return 0;
+    uint64_t length=0;
+    for (unsigned hops=0; length<size && hops<4; ++hops) {
+        const CachedRegion *c=cached_region(address+length);
+        if (!c || c->kind==KIND_RESERVED) return 0;
+        length=c->end-address;
+    }
+    return length>=size ? size : 0;
+}
 uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size) {
-    const CachedRegion *c=(runtime_disabled_optimizations & 1) ? NULL : cached_region(address);
-    if (c && c->kind!=KIND_RESERVED && size<=c->end-address) return size;
+    if (size && cached_mapped_length(address,size)==size) return size;
     read_lock();
-    { size_t i=vma_index(address); if (i<vma_count && vmas[i].start<=address) cache_region(i); }
     uint64_t length=0;
     for (size_t i=vma_index(address); i<vma_count && length<size; ++i) {
         if (vmas[i].start>address+length || vmas[i].kind==KIND_RESERVED) break;
+        cache_region(i,vmas[i].start>address ? vmas[i].start : address);
         length=vmas[i].end-address;
     }
     read_unlock();
@@ -856,7 +942,7 @@ int runtime_memory_region(uintptr_t address, uintptr_t *start, uintptr_t *end, i
     size_t i=vma_index(address);
     int found=i<vma_count;
     if (found && vmas[i].start<=address) {
-        cache_region(i);
+        cache_region(i,address);
         *start=vmas[i].start; *end=vmas[i].end; *mapped=vmas[i].kind!=KIND_RESERVED;
     } else if (found) {
         *start=i ? vmas[i-1].end : 0; *end=vmas[i].start; *mapped=0;
@@ -865,6 +951,23 @@ int runtime_memory_region(uintptr_t address, uintptr_t *start, uintptr_t *end, i
     return found;
 }
 /* GPU page tracking: restrict host access, never beyond the guest's own protection. */
+/* sotc: diagnostics for page tracking problems: the runtime's view of a page (VMA kind and guest
+ * protection) next to the protection the host really has. */
+void runtime_memory_describe(uintptr_t address, char *out, size_t capacity) {
+    read_lock();
+    const size_t i=vma_index(address);
+    int kind=0, prot=-1;
+    uintptr_t start=0, end=0;
+    if (i<vma_count && vmas[i].start<=address) { kind=vmas[i].kind; prot=vmas[i].prot; start=vmas[i].start; end=vmas[i].end; }
+    read_unlock();
+    unsigned long host=0;
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery((void *)address,&mbi,sizeof(mbi))) host=mbi.Protect;
+#endif
+    snprintf(out,capacity,"vma kind %d prot %#x [%#llx,%#llx), host protect %#lx",kind,prot,
+             (unsigned long long)start,(unsigned long long)end,host);
+}
 void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int write) {
     read_lock();
     for (size_t i=vma_index(address); i<vma_count && vmas[i].start<address+size; ++i) {
@@ -879,10 +982,16 @@ void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int 
 }
 /* Host view of a guest range, for the GPU backend: the range must be mapped. */
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size) {
-    const CachedRegion *c=(runtime_disabled_optimizations & 1) ? NULL : cached_region(address);
-    if (c && c->kind!=KIND_RESERVED && size<=c->end-address) return 1;
+    if (size && cached_mapped_length(address,size)==size) return 1;
     read_lock();
     int result=covered(address,address+size,0);
+    if (result) {
+        uintptr_t at=address;
+        for (size_t i=vma_index(address); i<vma_count && at<address+size; ++i) {
+            cache_region(i,at);
+            at=vmas[i].end;
+        }
+    }
     read_unlock();
     return result;
 }

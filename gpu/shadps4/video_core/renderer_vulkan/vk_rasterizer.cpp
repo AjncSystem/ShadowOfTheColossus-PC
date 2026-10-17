@@ -25,6 +25,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/buffer_cache/region_manager.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -69,7 +70,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
 Rasterizer::~Rasterizer() = default;
 
 bool Rasterizer::FilterDraw() {
-    const auto& regs = liverpool->regs;
+    const auto& regs = liverpool->DrawRegs();
     if (regs.color_control.mode == AmdGpu::ColorControl::OperationMode::EliminateFastClear) {
         // Clears the render target if FCE is launched before any draws
         EliminateFastClear();
@@ -116,9 +117,10 @@ bool Rasterizer::FilterDraw() {
 }
 
 void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
+    const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the targets
     // Prefetch render targets to handle overlaps with bound textures (e.g. mipgen)
     const auto& key = pipeline->GetGraphicsKey();
-    const auto& regs = liverpool->regs;
+    const auto& regs = liverpool->DrawRegs();
     if (regs.color_control.degamma_enable) {
         LOG_WARNING(Render_Vulkan, "Color buffers require gamma correction");
     }
@@ -133,7 +135,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             image_id = {};
             continue;
         }
-        const auto& hint = liverpool->last_cb_extent[cb];
+        const auto& hint = liverpool->DrawCbExtent()[cb];
         std::construct_at(&desc, col_buf, hint);
         image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
         auto& image = texture_cache.GetImage(image_id);
@@ -143,7 +145,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     if ((regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) ||
         (regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid())) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
-        const auto& hint = liverpool->last_db_extent;
+        const auto& hint = liverpool->DrawDbExtent();
         auto& [image_id, desc] = db_desc;
         std::construct_at(&desc, regs.depth_buffer, regs.depth_view, regs.depth_control,
                           htile_address, hint);
@@ -161,21 +163,21 @@ static std::pair<u32, u32> GetDrawOffsets(const AmdGpu::Regs& regs, const Shader
     u32 instance_offset = 0;
     if (!fetch_shader.Empty()) {
         if (vertex_offset == 0 && fetch_shader.vertex_offset_sgpr != -1) {
-            vertex_offset = info.user_data[fetch_shader.vertex_offset_sgpr];
+            vertex_offset = info.UserData()[fetch_shader.vertex_offset_sgpr];
         }
         if (fetch_shader.instance_offset_sgpr != -1) {
-            instance_offset = info.user_data[fetch_shader.instance_offset_sgpr];
+            instance_offset = info.UserData()[fetch_shader.instance_offset_sgpr];
         }
     }
     return {vertex_offset, instance_offset};
 }
 
 void Rasterizer::EliminateFastClear() {
-    auto& col_buf = liverpool->regs.color_buffers[0];
+    auto& col_buf = liverpool->DrawRegs().color_buffers[0];
     if (!col_buf || !col_buf.info.fast_clear) {
         return;
     }
-    VideoCore::TextureCache::ImageDesc desc(col_buf, liverpool->last_cb_extent[0]);
+    VideoCore::TextureCache::ImageDesc desc(col_buf, liverpool->DrawCbExtent()[0]);
     const auto image_id = texture_cache.FindImage(desc);
     const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
     if (!texture_cache.IsMetaCleared(col_buf.CmaskAddress(), col_buf.view.slice_start)) {
@@ -193,7 +195,8 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerEnd();
 }
 
-void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
+void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolved,
+                      bool use_resolved) {
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
@@ -202,10 +205,14 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
 
-    const auto& regs = liverpool->regs;
-    const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
+    const auto& regs = liverpool->DrawRegs();
+    const GraphicsPipeline* pipeline =
+        use_resolved ? static_cast<const GraphicsPipeline*>(resolved)
+                     : pipeline_cache.GetGraphicsPipeline();
     SotcStats::current_program.store(1, std::memory_order_relaxed);
-    SotcStats::cmd_kinds[0].fetch_add(1, std::memory_order_relaxed);
+    if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer (sotc_stats.h)
+        SotcStats::cmd_kinds[0].fetch_add(1, std::memory_order_relaxed);
+    }
     if (!pipeline) {
         SotcStats::Drop(0, regs.color_buffers[0].Address(), regs.stage_enable.raw);
         return;
@@ -253,7 +260,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
                               u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
-                              u16 instance_sgpr_offset) {
+                              u16 instance_sgpr_offset, const Pipeline* resolved,
+                              bool use_resolved) {
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
@@ -262,8 +270,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
 
-    static const bool cmd_stats = std::getenv("SOTC_CMD_STATS") != nullptr;
-    if (cmd_stats) {
+    if (SotcStats::kCmdStats) { // sotc: the shared SOTC_CMD_STATS switch (sotc_stats.h)
         const u64 args_size = u64{stride} * max_count;
         if (buffer_cache.IsRegionGpuModified(arg_address + offset, args_size) ||
             (count_address && buffer_cache.IsRegionGpuModified(count_address, 4))) {
@@ -281,15 +288,17 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         .vertex_sgpr_offset = vertex_sgpr_offset,
         .instance_sgpr_offset = instance_sgpr_offset,
     };
-    const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params);
+    const GraphicsPipeline* pipeline =
+        use_resolved ? static_cast<const GraphicsPipeline*>(resolved)
+                     : pipeline_cache.GetGraphicsPipeline(params);
     if (!pipeline) {
-        SotcStats::Drop(0, liverpool->regs.color_buffers[0].Address(), 1);
+        SotcStats::Drop(0, liverpool->DrawRegs().color_buffers[0].Address(), 1);
         return;
     }
 
     PrepareRenderState(pipeline);
     if (!BindResources(pipeline)) {
-        SotcStats::Drop(1, liverpool->regs.color_buffers[0].Address(), 1);
+        SotcStats::Drop(1, liverpool->DrawRegs().color_buffers[0].Address(), 1);
         return;
     }
     const auto state = BeginRendering(pipeline);
@@ -356,7 +365,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                          max_count, static_cast<unsigned long long>(count_address), first[0],
                          first[1], first[2], first[3],
                          static_cast<unsigned long long>(
-                             liverpool->regs.vs_program.Address<uintptr_t>()));
+                             liverpool->DrawRegs().vs_program.Address<uintptr_t>()));
         }
     }
     const auto [buffer, base] =
@@ -418,13 +427,14 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     FlushPeriodic();
 }
 
-void Rasterizer::DispatchDirect() {
+void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
 
-    const auto& cs_program = liverpool->GetCsRegs();
-    const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
+    const auto& cs_program = liverpool->DrawCsRegs();
+    const ComputePipeline* pipeline = use_resolved ? static_cast<const ComputePipeline*>(resolved)
+                                                   : pipeline_cache.GetComputePipeline();
     if (!pipeline) {
         SotcStats::Drop(2, cs_program.Address<uintptr_t>(), 0);
         return;
@@ -432,7 +442,9 @@ void Rasterizer::DispatchDirect() {
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     SotcStats::current_program.store(cs.pgm_hash, std::memory_order_relaxed);
-    SotcStats::cmd_kinds[4].fetch_add(1, std::memory_order_relaxed);
+    if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer (sotc_stats.h)
+        SotcStats::cmd_kinds[4].fetch_add(1, std::memory_order_relaxed);
+    }
     // sotc: SOTC_CS_TRACE=<hash>: the buffers of the first 6 dispatches of that compute shader,
     // with the first dwords guest memory holds there (diagnostic for the GPU particle counts).
     static const u64 cs_trace = [] {
@@ -505,7 +517,7 @@ void Rasterizer::DispatchDirect() {
             counts.clear();
         }
     }
-    if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
+    if (ExecuteShaderHLE(cs, liverpool->DrawRegs(), cs_program, *this)) {
         SotcStats::Drop(5, cs_program.Address<uintptr_t>(), 0);
         return;
     }
@@ -532,14 +544,18 @@ void Rasterizer::DispatchDirect() {
     FlushPeriodic();
 }
 
-void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
+void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pipeline* resolved,
+                                  bool use_resolved) {
     RENDERER_TRACE;
-    SotcStats::cmd_kinds[5].fetch_add(1, std::memory_order_relaxed);
+    if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer (sotc_stats.h)
+        SotcStats::cmd_kinds[5].fetch_add(1, std::memory_order_relaxed);
+    }
 
     scheduler.PopPendingOperations();
 
-    const auto& cs_program = liverpool->GetCsRegs();
-    const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
+    const auto& cs_program = liverpool->DrawCsRegs();
+    const ComputePipeline* pipeline = use_resolved ? static_cast<const ComputePipeline*>(resolved)
+                                                   : pipeline_cache.GetComputePipeline();
     if (!pipeline) {
         SotcStats::Drop(2, cs_program.Address<uintptr_t>(), 0);
         return;
@@ -632,7 +648,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     // A stage whose user data was never attached (e.g. a program restored from the pipeline
     // cache that was not refreshed for this draw) would read its SGPRs from a null span.
     for (const auto* stage : pipeline->GetStages()) {
-        if (stage && stage->user_data.data() == nullptr &&
+        if (stage && stage->UserData().data() == nullptr &&
             stage->srt_info.flattened_bufsize_dw != 0) {
             LOG_ERROR(Render_Vulkan,
                       "Skipping draw: shader {:#x} (sw stage {}, hw stage {}, info {}) has no "
@@ -645,7 +661,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
-    push_data = MakeUserData(liverpool->regs);
+    push_data = MakeUserData(liverpool->DrawRegs());
     for (const auto* stage : pipeline->GetStages()) {
         if (!stage) {
             continue;
@@ -665,7 +681,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 }
 
 void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
-    const auto& regs = liverpool->regs;
+    const auto& regs = liverpool->DrawRegs();
     VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
     VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
@@ -768,7 +784,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
 }
 
 void Rasterizer::BindIndexBuffer(u32 index_offset) {
-    const auto& regs = liverpool->regs;
+    const auto& regs = liverpool->DrawRegs();
 
     // Figure out index type and size.
     const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
@@ -811,12 +827,19 @@ void Rasterizer::FlushPeriodic() {
                    : 0u;
     }();
     // sotc: the command buffer wrote a page the guest reads back: submit it now, the GPU runs
-    // it while the guest gets there, and the readback finds it done (or nearly). SOTC_RB_EARLY=1
-    // turns it on; measured within noise on the attract demo, so off by default.
-    SotcStats::commands.fetch_add(1, std::memory_order_relaxed);
+    // it while the guest gets there, and the readback finds it done (or nearly). Within noise
+    // when the command processor was slower; on by default since 2026-10-16 (SOTC_RB_EARLY=0
+    // off): attract demo 53.6/54.5 -> 55.3/55.7 FPS (open world: 400-490 readbacks/s waited
+    // ~10% of the thread), Shrine unchanged (34.2 vs 34.1).
+    if (SotcStats::kFpsLog) { // sotc: read only by the SOTC_FPS printer (sotc_stats.h)
+        // sotc: written by this thread only: a plain add, no lock prefix (an atomic RMW here
+        // waits for the thread's pending stores, ~1.8% of it). The printer takes deltas.
+        SotcStats::commands.store(SotcStats::commands.load(std::memory_order_relaxed) + 1,
+                                  std::memory_order_relaxed);
+    }
     static const bool early = [] {
         const char* v = std::getenv("SOTC_RB_EARLY");
-        return v && v[0] == '1';
+        return !v || v[0] != '0';
     }();
     if (early && !scheduler.IsRendering() && buffer_cache.TakeHotWrite()) {
         SotcStats::early_flushes.fetch_add(1, std::memory_order_relaxed);
@@ -824,17 +847,24 @@ void Rasterizer::FlushPeriodic() {
         return;
     }
     if (every == 0) {
+        // sotc: without periodic submits, look for cold arena memory every 1024 commands.
+        if ((++evict_poll & 1023) == 0 && !scheduler.IsRendering()) {
+            buffer_cache.MaybeEvictCold(std::chrono::steady_clock::now());
+        }
         return;
     }
-    // sotc: submit by recording time instead (SOTC_FLUSH_US, default 500 where the periodic
+    // sotc: submit by recording time instead (SOTC_FLUSH_US, default 1000 where the periodic
     // submit is on and SOTC_FLUSH_EVERY is not set): the GPU gets work at a steady pace whether
     // a scene has few heavy commands or thousands of light ones. Attract demo: +10-15% in most
     // scenes, canyon bridge +2% (count based: 64 helped the first and hurt the second).
+    // 1000 instead of 500 (2026-10-15, RTX 3060 laptop, idle shrine ~5800 draws/frame): about +8%
+    // in a single unpaired run (250: no gain, 2000: same as 1000): fewer submits, each one
+    // cheaper per draw.
     static const u64 flush_us = [] {
         if (const char* v = std::getenv("SOTC_FLUSH_US")) {
             return std::strtoull(v, nullptr, 10);
         }
-        return std::getenv("SOTC_FLUSH_EVERY") ? u64{0} : u64{500};
+        return std::getenv("SOTC_FLUSH_EVERY") ? u64{0} : u64{1000};
     }();
     const u64 tick = scheduler.CurrentTick();
     if (tick != commands_tick) {
@@ -844,9 +874,19 @@ void Rasterizer::FlushPeriodic() {
     }
     ++commands_since_submit;
     if (flush_us != 0) {
-        const auto elapsed = std::chrono::steady_clock::now() - commands_since;
+        // sotc: the clock is read every 8th command (~40 us at the Shrine against 1000 us),
+        // not on every one (~0.5% of the command processor in QueryPerformanceCounter).
+        if ((commands_since_submit & 7) != 0) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed = now - commands_since;
         const auto limit = std::chrono::microseconds(flush_us);
         if (elapsed < limit || (scheduler.IsRendering() && elapsed < limit * 4)) {
+            return;
+        }
+        // sotc: cold arena memory goes back at a submit point outside a render pass.
+        if (!scheduler.IsRendering() && buffer_cache.MaybeEvictCold(now)) {
             return;
         }
         scheduler.Flush();
@@ -854,6 +894,10 @@ void Rasterizer::FlushPeriodic() {
     }
     if (commands_since_submit < every ||
         (scheduler.IsRendering() && commands_since_submit < u64{every} * 4)) {
+        return;
+    }
+    if (!scheduler.IsRendering() &&
+        buffer_cache.MaybeEvictCold(std::chrono::steady_clock::now())) {
         return;
     }
     scheduler.Flush();
@@ -1021,7 +1065,7 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     }
 
     // Ensure shader only has 2 bound buffers
-    const auto& cs_pgm = liverpool->GetCsRegs();
+    const auto& cs_pgm = liverpool->DrawCsRegs();
     const auto& info = pipeline->GetStage(Shader::SwStage::Compute);
     if (cs_pgm.num_thread_x.full != 64 || info.buffers.size() != 2 || !info.images.empty()) {
         return false;
@@ -1064,6 +1108,9 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     // Perform image copy
     VideoCore::Image& src_image = desc0.is_written ? image1 : image0;
     VideoCore::Image& dst_image = desc0.is_written ? image0 : image1;
+    // sotc: the destination was found by address, not by a writer lookup: its first GPU write
+    // moves the mip-tail epoch (CopyColorAndDepth only passes the flag on).
+    VideoCore::MarkGpuModified(dst_image);
     runtime.CopyColorAndDepth(&src_image, &dst_image);
     return true;
 }
@@ -1074,7 +1121,7 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     }
 
     // Ensure shader only has 2 bound buffers
-    const auto& cs_pgm = liverpool->GetCsRegs();
+    const auto& cs_pgm = liverpool->DrawCsRegs();
     const auto& info = pipeline->GetStage(Shader::SwStage::Compute);
     if (cs_pgm.num_thread_x.full != 64 || info.buffers.size() != 2 || !info.images.empty()) {
         return false;
@@ -1139,20 +1186,20 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 bound_buffers.emplace_back(gds_buf, 0, gds_buf->SizeBytes(), desc.is_written);
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
                 auto& vk_buffer = buffer_cache.GetStreamBuffer();
-                const u32 ubo_size = stage.flattened_ud_buf.size() * sizeof(u32);
+                const u32 ubo_size = stage.FlatBuf().size() * sizeof(u32);
                 const u64 offset =
-                    vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
+                    vk_buffer.Copy(stage.FlatBuf().data(), ubo_size, alignment);
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 // Permutations compiled without enabled planes never read the buffer, so the
                 // declared binding is satisfied with a null descriptor instead of a copy.
-                if (liverpool->regs.clipper_control.user_clip_plane_enable == 0) {
+                if (liverpool->DrawRegs().clipper_control.user_clip_plane_enable == 0) {
                     buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
                 } else {
                     auto& vk_buffer = buffer_cache.GetStreamBuffer();
                     std::array<float, AmdGpu::NUM_CLIP_PLANES * 4> planes{};
                     for (u32 i = 0; i < AmdGpu::NUM_CLIP_PLANES; ++i) {
-                        const auto& plane = liverpool->regs.clip_user_data[i];
+                        const auto& plane = liverpool->DrawRegs().clip_user_data[i];
                         planes[i * 4 + 0] = std::bit_cast<float>(plane.data_x);
                         planes[i * 4 + 1] = std::bit_cast<float>(plane.data_y);
                         planes[i * 4 + 2] = std::bit_cast<float>(plane.data_z);
@@ -1170,7 +1217,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 buffer_infos.emplace_back(fault_buffer->Handle(), 0, fault_buffer->SizeBytes());
             } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
                 auto& lds_buffer = buffer_cache.GetStreamBuffer();
-                const auto& cs_program = liverpool->GetCsRegs();
+                const auto& cs_program = liverpool->DrawCsRegs();
                 const auto lds_size = cs_program.SharedMemSize() * cs_program.NumWorkgroups();
                 const auto [data, offset] = lds_buffer.Map(lds_size, alignment);
                 std::memset(data, 0, lds_size);
@@ -1185,10 +1232,21 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             // (garbage left in the guest's descriptor memory); bind nothing instead of aborting.
             // Large ranges get clamped to the mapped memory at their start (0 if unmapped);
             // written bindings are checked as well, so garbage cannot become GPU-modified memory.
+            // sotc: the clamp alone is 0 exactly when the base is unmapped or reserved (what the
+            // two is-mapped calls checked), so one runtime call per binding instead of three.
+            // SOTC_BIND_CLAMP1=0 restores the three calls.
+            static const bool clamp1 = [] {
+                const char* v = std::getenv("SOTC_BIND_CLAMP1");
+                return !v || v[0] != '0';
+            }();
             u64 size = 0;
-            if (vsharp.base_address != 0 && vsharp.GetSize() != 0 &&
-                memory->IsValidMapping(vsharp.base_address) &&
-                (!desc.is_written || memory->IsMappedAddress(vsharp.base_address))) {
+            if (clamp1) {
+                if (vsharp.base_address != 0 && vsharp.GetSize() != 0) {
+                    size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                }
+            } else if (vsharp.base_address != 0 && vsharp.GetSize() != 0 &&
+                       memory->IsValidMapping(vsharp.base_address) &&
+                       (!desc.is_written || memory->IsMappedAddress(vsharp.base_address))) {
                 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
             }
             if (size == 0) {
@@ -1255,6 +1313,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
 }
 
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
+    const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the pass
     image_bindings.clear();
     const u32 first_image_idx = image_infos.size();
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
@@ -1328,7 +1387,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                              u32(tsharp.counter_bank_id));
             }
         }
-        if (texture_cache.IsMeta(tsharp.Address())) {
+        // sotc: first few only (per-draw warning; see BufferCache::SynchronizeMemoryFromImage).
+        if (static u32 shown = 0; shown < 4 && texture_cache.IsMeta(tsharp.Address())) {
+            ++shown;
             LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
         }
 
@@ -1464,7 +1525,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     for (const auto& sampler : stage.samplers) {
         auto ssharp = sampler.GetSharp(stage);
         if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
-                                liverpool->regs.ta_bc_base.Address() == 0)) {
+                                liverpool->DrawRegs().ta_bc_base.Address() == 0)) {
             LOG_WARNING(Render_Vulkan,
                         "Rejecting invalid S# max_aniso={}, filter_mode={}, mip_filter={}, "
                         "border_color_type={}, border_color_base={:#x}",
@@ -1472,11 +1533,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         static_cast<u32>(ssharp.filter_mode.Value()),
                         static_cast<u32>(ssharp.mip_filter.Value()),
                         static_cast<u32>(ssharp.border_color_type.Value()),
-                        liverpool->regs.ta_bc_base.Address());
+                        liverpool->DrawRegs().ta_bc_base.Address());
             ssharp = AmdGpu::Sampler{};
         }
         const auto vk_sampler =
-            texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base, sampler.is_depth);
+            texture_cache.GetSampler(ssharp, liverpool->DrawRegs().ta_bc_base, sampler.is_depth);
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
@@ -1489,8 +1550,16 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 }
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
+    const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the attachments
     attachment_feedback_loop = false;
-    const auto& regs = liverpool->regs;
+    // sotc: SOTC_RT_FAST (default on) drops redundant attachment work: FindRenderTarget repeats
+    // UpdateImage only when the image still needs it, and the CMASK/HTILE clear bit is read and
+    // cleared with one lookup. SOTC_RT_FAST=0 restores the original calls and evaluation order.
+    static const bool rt_fast = [] {
+        const char* v = std::getenv("SOTC_RT_FAST");
+        return !v || v[0] != '0';
+    }();
+    const auto& regs = liverpool->DrawRegs();
     const auto& key = pipeline->GetGraphicsKey();
     RenderState state;
     state.width = instance.GetMaxFramebufferWidth();
@@ -1510,13 +1579,19 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         }
         texture_cache.UpdateImage(image_id);
         runtime.SetBackingSamples(image, key.color_samples[cb]);
-        const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
+        const auto& image_view = texture_cache.FindRenderTarget(image_id, desc, !rt_fast);
         const auto slice = image_view.info.range.base.layer;
         const auto mip = image_view.info.range.base.level;
 
         const auto& col_buf = regs.color_buffers[cb];
-        const bool is_clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
-        texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
+        // sotc: SOTC_RT_FAST: test-and-clear the CMASK bit with one lookup.
+        bool is_clear;
+        if (rt_fast) {
+            is_clear = texture_cache.TestAndTouchMeta(col_buf.CmaskAddress(), slice);
+        } else {
+            is_clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
+            texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
+        }
 
         if (image->binding.is_bound) {
             ASSERT_MSG(!image->binding.force_general,
@@ -1564,12 +1639,22 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         auto& image = texture_cache.GetImage(image_id);
 
         const auto slice = image_view.info.range.base.layer;
-        const bool is_depth_clear =
-            (regs.depth_render_control.depth_clear_enable && regs.depth_control.depth_enable &&
-             regs.depth_control.depth_write_enable) ||
-            texture_cache.IsMetaCleared(htile_address, slice);
+        const bool depth_reg_clear = regs.depth_render_control.depth_clear_enable &&
+                                     regs.depth_control.depth_enable &&
+                                     regs.depth_control.depth_write_enable;
+        // sotc: SOTC_RT_FAST: test-and-clear the HTILE bit with one lookup. It is evaluated
+        // unconditionally (no short-circuit) because the original TouchMeta always cleared it.
+        bool is_depth_clear;
+        if (rt_fast) {
+            const bool meta_clear = texture_cache.TestAndTouchMeta(htile_address, slice);
+            is_depth_clear = depth_reg_clear || meta_clear;
+        } else {
+            is_depth_clear = depth_reg_clear || texture_cache.IsMetaCleared(htile_address, slice);
+        }
         const bool is_stencil_clear = regs.depth_render_control.stencil_clear_enable;
-        texture_cache.TouchMeta(htile_address, slice, false);
+        if (!rt_fast) {
+            texture_cache.TouchMeta(htile_address, slice, false);
+        }
         ASSERT(desc.view_info.range.extent.levels == 1 && !image.binding.needs_rebind);
 
         const bool has_stencil = image.info.props.has_stencil;
@@ -1624,37 +1709,37 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
 }
 
 void Rasterizer::Resolve() {
-    const auto& mrt0_hint = liverpool->last_cb_extent[0];
-    const auto& mrt1_hint = liverpool->last_cb_extent[1];
-    VideoCore::TextureCache::ImageDesc mrt0_desc{liverpool->regs.color_buffers[0], mrt0_hint};
-    VideoCore::TextureCache::ImageDesc mrt1_desc{liverpool->regs.color_buffers[1], mrt1_hint};
+    const auto& mrt0_hint = liverpool->DrawCbExtent()[0];
+    const auto& mrt1_hint = liverpool->DrawCbExtent()[1];
+    VideoCore::TextureCache::ImageDesc mrt0_desc{liverpool->DrawRegs().color_buffers[0], mrt0_hint};
+    VideoCore::TextureCache::ImageDesc mrt1_desc{liverpool->DrawRegs().color_buffers[1], mrt1_hint};
     auto& mrt0_image = texture_cache.GetImage(texture_cache.FindImage(mrt0_desc, true));
     auto& mrt1_image = texture_cache.GetImage(texture_cache.FindImage(mrt1_desc, true));
 
     ScopeMarkerBegin(fmt::format("Resolve:MRT0={:#x}:MRT1={:#x}",
-                                 liverpool->regs.color_buffers[0].Address(),
-                                 liverpool->regs.color_buffers[1].Address()));
+                                 liverpool->DrawRegs().color_buffers[0].Address(),
+                                 liverpool->DrawRegs().color_buffers[1].Address()));
     runtime.ResolveImage(&mrt0_image, &mrt1_image, mrt0_desc.view_info.range,
                          mrt1_desc.view_info.range);
     ScopeMarkerEnd();
 }
 
 void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
-    auto& regs = liverpool->regs;
+    auto& regs = liverpool->DrawRegs();
 
     auto read_desc = VideoCore::TextureCache::ImageDesc(
         regs.depth_buffer, regs.depth_view, regs.depth_control,
-        regs.depth_htile_data_base.GetAddress(), liverpool->last_db_extent, false);
+        regs.depth_htile_data_base.GetAddress(), liverpool->DrawDbExtent(), false);
     auto write_desc = VideoCore::TextureCache::ImageDesc(
         regs.depth_buffer, regs.depth_view, regs.depth_control,
-        regs.depth_htile_data_base.GetAddress(), liverpool->last_db_extent, true);
+        regs.depth_htile_data_base.GetAddress(), liverpool->DrawDbExtent(), true);
 
     auto& read_image = texture_cache.GetImage(texture_cache.FindImage(read_desc));
     auto& write_image = texture_cache.GetImage(texture_cache.FindImage(write_desc));
 
     VideoCore::SubresourceRange sub_range;
-    sub_range.base.layer = liverpool->regs.depth_view.slice_start;
-    sub_range.extent.layers = liverpool->regs.depth_view.NumSlices() - sub_range.base.layer;
+    sub_range.base.layer = liverpool->DrawRegs().depth_view.slice_start;
+    sub_range.extent.layers = liverpool->DrawRegs().depth_view.NumSlices() - sub_range.base.layer;
 
     ScopeMarkerBegin(fmt::format(
         "DepthStencilCopy:DR={:#x}:SR={:#x}:DW={:#x}:SW={:#x}", regs.depth_buffer.DepthAddress(),
@@ -1734,6 +1819,23 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     return true;
 }
 
+// sotc: a guest (not command processor) write fault. With the repeat-fault grace on, the texture
+// cache goes first so the page becomes writable last, after any wait on the texture mutex (the GPU
+// thread then has less time to protect it again before the guest retries its write).
+bool Rasterizer::InvalidateMemoryOnGuestFault(VAddr addr, u64 size) {
+    if (!IsMapped(addr, size)) {
+        return false;
+    }
+    if (VideoCore::FaultGrace::Pages() != 0) {
+        texture_cache.InvalidateMemory(addr, size);
+        buffer_cache.InvalidateMemory(addr, size, false, true);
+    } else {
+        buffer_cache.InvalidateMemory(addr, size, false);
+        texture_cache.InvalidateMemory(addr, size);
+    }
+    return true;
+}
+
 bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
@@ -1786,9 +1888,16 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
         buffer_cache.DropGpuModified(addr, size);
     }
     // Give the arena memory back; it runs on the GPU thread, ordered before later draws.
-    // Releasing arena memory on unmap still races with in-flight GPU work during loads
-    // (device lost, silent crashes loading a save), so it is opt-in for now.
-    static const bool release_enabled = std::getenv("SOTC_ARENA_RELEASE") != nullptr;
+    // sotc: on by default since 2026-10-16 (SOTC_ARENA_RELEASE=0: never released). It was
+    // opt-in because it raced with in-flight GPU work during loads (device lost loading a save,
+    // seen before ReleaseMemory finished the GPU work first). Never releasing grew video memory
+    // ~90 MB a minute in the attract demo (1.6 -> 6.0 GB in 48 minutes on a 6 GB card) until an
+    // arena allocation failed (ASSERT). Released, the 25-minute curve stays ~0.7-0.9 GB lower;
+    // no device loss in that run nor in three shrine runs that each load a save.
+    static const bool release_enabled = [] {
+        const char* v = std::getenv("SOTC_ARENA_RELEASE");
+        return !v || v[0] != '0';
+    }();
     if (release_enabled) {
         liverpool->SendCommand<false>(
             [this, addr, size] { buffer_cache.ReleaseMemory(addr, size); });
@@ -1812,7 +1921,7 @@ void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool
 }
 
 void Rasterizer::UpdateViewportScissorState() const {
-    const auto& regs = liverpool->regs;
+    const auto& regs = liverpool->DrawRegs();
 
     const auto combined_scissor_value_tl = [](s16 scr, s16 win, s16 gen, s16 win_offset) {
         return std::max({scr, s16(win + win_offset), s16(gen + win_offset)});
@@ -1943,7 +2052,7 @@ void Rasterizer::UpdateViewportScissorState() const {
 }
 
 void Rasterizer::UpdateDepthStencilState() const {
-    const auto& regs = liverpool->regs;
+    const auto& regs = liverpool->DrawRegs();
     auto& dynamic_state = scheduler.GetDynamicState();
 
     const auto depth_test_enabled =
@@ -2027,7 +2136,7 @@ void Rasterizer::UpdateDepthStencilState() const {
 }
 
 void Rasterizer::UpdatePrimitiveState(const bool is_indexed) const {
-    const auto& regs = liverpool->regs;
+    const auto& regs = liverpool->DrawRegs();
     auto& dynamic_state = scheduler.GetDynamicState();
 
     const auto is_list_topology = [](const AmdGpu::PrimitiveType type) {
@@ -2064,13 +2173,13 @@ void Rasterizer::UpdatePrimitiveState(const bool is_indexed) const {
 }
 
 void Rasterizer::UpdateRasterizationState() const {
-    const auto& regs = liverpool->regs;
+    const auto& regs = liverpool->DrawRegs();
     auto& dynamic_state = scheduler.GetDynamicState();
     dynamic_state.SetLineWidth(regs.line_control.Width());
 }
 
 void Rasterizer::UpdateColorBlendingState(const GraphicsPipeline* pipeline) const {
-    const auto& regs = liverpool->regs;
+    const auto& regs = liverpool->DrawRegs();
     auto& dynamic_state = scheduler.GetDynamicState();
     dynamic_state.SetBlendConstants(regs.blend_constants);
     dynamic_state.SetColorWriteMasks(pipeline->GetGraphicsKey().write_masks);
@@ -2120,6 +2229,35 @@ void Rasterizer::ScopedMarkerInsertColor(const std::string_view& str, const u32 
         .color = std::array<f32, 4>(
             {(f32)((color >> 16) & 0xff) / 255.0f, (f32)((color >> 8) & 0xff) / 255.0f,
              (f32)(color & 0xff) / 255.0f, (f32)((color >> 24) & 0xff) / 255.0f})});
+}
+
+const Pipeline* Rasterizer::LookupGraphicsPipeline(u16 vertex_sgpr_offset,
+                                                   u16 instance_sgpr_offset) {
+    const DrawIndirectParams params = {
+        .vertex_sgpr_offset = vertex_sgpr_offset,
+        .instance_sgpr_offset = instance_sgpr_offset,
+    };
+    return pipeline_cache.GetGraphicsPipeline(params);
+}
+
+const Pipeline* Rasterizer::LookupComputePipeline() {
+    return pipeline_cache.GetComputePipeline();
+}
+
+bool Rasterizer::IsGpuSideThread() const {
+    return liverpool->IsGpuSideThread();
+}
+
+void Rasterizer::PrepareGpuSideFault() {
+    liverpool->PrepareGpuSideFault();
+}
+
+bool Rasterizer::RunsGpuWorkElsewhere() const {
+    return liverpool->RunsGpuWorkElsewhere();
+}
+
+void Rasterizer::RunOnDrawThreadImpl(Common::UniqueFunction<void>&& func) {
+    liverpool->RunOnBackThread(std::move(func));
 }
 
 std::thread::id Rasterizer::GetGpuCommandProcessorThread() {

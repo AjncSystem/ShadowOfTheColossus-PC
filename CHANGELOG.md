@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.57-opt5 — 2026-10-17 (fork Oussama268)
+- **Sessões longas sem a memória de vídeo crescer:** o jogo mantém mapeado o seu bloco de 4 GB
+  de memória e reaproveita os endereços o tempo todo, então a memória de buffers na GPU só
+  crescia (~45 MB por minuto no demo da tela de título: 1,6 → 4,3–4,4 GB em 30 minutos). Numa
+  placa de 6 GB isso passava do orçamento depois de ~40 minutos de jogo e os engasgos voltavam.
+  Agora, quando a memória de buffers passa de 1,5 GB, os blocos que não foram usados há 30
+  segundos e não têm dados escritos pela GPU são devolvidos (no máximo 64 MB a cada 2 segundos,
+  ~20 ms cada vez). Antes de devolver, o port lê o bloco de volta e compara com a memória do jogo,
+  então a imagem não muda. Em 30 minutos de demo: pico de memória de vídeo **3,4 GB, estável**
+  (antes 4,3–4,4 GB e subindo), nenhuma coleta de emergência. `SOTC_ARENA_EVICT_MB=0` desliga;
+  `SOTC_ARENA_EVICT_MB`, `SOTC_ARENA_EVICT_IDLE_S` e `SOTC_ARENA_EVICT_STEP_MB` ajustam.
+- **Mundo aberto um pouco mais rápido:** quando um comando escreve numa página que o jogo vai ler
+  de volta, o port já manda o trabalho para a GPU (`SOTC_RB_EARLY`, agora padrão). Demo: 55,0 →
+  56,2 FPS (+2%); santuário igual.
+- **Correção de queda rara:** a 0.57-opt4 às vezes fechava ao carregar o save com o erro
+  "Attempted to protect region as write-only" (2 vezes em ~16 testes no santuário). A causa
+  provável foi corrigida e, se ainda acontecer, a página é protegida por inteiro e o jogo segue;
+  o log (`user/last_run.log`) registra a linha "Write-only protection" para investigação.
+- Perfil PGO refeito para o código novo.
+- Diagnóstico: com `SOTC_FPS=1` o log mostra a linha `SOTC ARENA` (memória devolvida).
+- Testado: 30 minutos de demo (memória estável), 15 minutos com o build final, demo e santuário
+  sem erro (pares intercalados contra a 0.57-opt4), imagens iguais (folha de capturas).
+
 ## 0.57-opt4 — 2026-10-16 (fork Oussama268)
 - **Mais FPS em todo lugar:** a thread que transforma os comandos do jogo em comandos Vulkan (o
   gargalo do port) gastava ~42% do tempo dentro do Windows e da biblioteca C: travas, mudanças de

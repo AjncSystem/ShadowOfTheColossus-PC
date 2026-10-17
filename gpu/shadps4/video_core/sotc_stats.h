@@ -55,6 +55,8 @@ inline std::atomic<uint64_t> early_flushes{0}; ///< submits right after a write 
 inline std::atomic<uint64_t> vram_used{0};      ///< device-local usage (VK_EXT_memory_budget), bytes
 inline std::atomic<uint64_t> vram_budget{0};    ///< device-local budget the texture cache plans for
 inline std::atomic<uint64_t> vram_emergency{0}; ///< emergency texture collections (allocation failed)
+inline std::atomic<uint64_t> write_fault_gpu_pending{0}; ///< write-fault readbacks left protected
+inline std::atomic<uint64_t> write_fault_stale_gpu{0};   ///< ... that cleared a stale GPU page bit
 inline std::atomic<uint64_t> arena_bytes{0};    ///< resident buffer arena memory
 inline std::atomic<uint64_t> arena_evicted{0};  ///< arena bytes given back by MaybeEvictCold
 inline std::atomic<uint64_t> arena_rebound{0};  ///< ... bound again afterwards

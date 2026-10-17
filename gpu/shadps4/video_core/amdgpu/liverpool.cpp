@@ -83,9 +83,7 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
     num_counter_pairs = Libraries::Kernel::sceKernelIsNeoMode() ? 16 : 8;
     // sotc: SOTC_CP_THREADS=0 binds and records the draws on the command processor thread.
     const char* threads = std::getenv("SOTC_CP_THREADS");
-    // sotc: with SOTC_NEO=1 the draw thread crashes when a save loads (guest read of -1 after
-    // "starting game", 4/4); off by default there until the race is found. SOTC_CP_THREADS=1 forces it.
-    back_threaded = threads ? threads[0] != '0' : !Libraries::Kernel::sceKernelIsNeoMode();
+    back_threaded = !threads || threads[0] != '0';
     const char* strict = std::getenv("SOTC_CP_STRICT");
     back_strict = strict && strict[0] == '1';
     if (back_threaded) {

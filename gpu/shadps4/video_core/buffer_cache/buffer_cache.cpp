@@ -957,8 +957,13 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
             static constexpr u32 ZmaskUncompressed = 0xf;
             runtime.FillBuffer(arena, arena->Offset(device_addr), size, ZmaskUncompressed);
             return true;
-        } else {
-            LOG_WARNING(Render_Vulkan, "Unhandled metadata type {}", magic_enum::enum_name(*type));
+        } else if (static u32 shown = 0; shown < 4) {
+            // sotc: first few only. In PS4 Pro performance mode the game reads CMask surfaces as
+            // texel buffers hundreds of times a second; each stderr line (piped to the launcher)
+            // took milliseconds on the draw thread: 28 vs 16 ms per frame in the same scene.
+            ++shown;
+            LOG_WARNING(Render_Vulkan, "Unhandled metadata type {} (logged {} of 4)",
+                        magic_enum::enum_name(*type), shown);
         }
     }
     const ImageId image_id = texture_cache.FindImageFromRange(device_addr, size);

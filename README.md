@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC (port nativo / native port) · v0.57-opt5
+# Shadow of the Colossus — PC (port nativo / native port) · v0.64-cp-mt
 
 **[Português](#português)** · **[English](#english)** · [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
@@ -21,6 +21,13 @@ de que o jogo precisa, no estilo do [bloodborne_pc](https://github.com/Supermedo
 
 | Versão | Melhorias e correções |
 |---|---|
+| **0.64-cp-mt** | **+10% de FPS** (build com PGO; Santuário 41 → 45 FPS). |
+| **0.63-cp-mt** | **Primeira visita a cada área bem mais lisa** (tradução de shaders 15,6 → 3,0 s por sessão; travada ao carregar o save 7,8 → 1,4 s). |
+| **0.62-cp-mt** | **Fim do solavanco a cada 5 s** com "mostrar FPS" ligado (pior quadro ~125 → ~34 ms). |
+| **0.61-cp-mt** | **Modo PS4 Pro muito mais rápido** (cena pós-colosso: cinemático 22,5 → 39,3 FPS). |
+| **0.60-cp-mt** | Integra a fork de Oussama268 (0.57-opt5) e corrige duas corridas no cache de texturas. |
+| **0.59-cp-mt** | **Modo PS4 Pro:** fim do crash ao carregar o save e da tela preta ao desligar o Pro. |
+| **0.58-cp-mt** | **Processador de comandos em duas threads** (Santuário ~29 → ~40 FPS). |
 | **0.57-opt5** | **Sessões longas estáveis:** memória de buffers sem uso devolvida à GPU (30 minutos de demo: pico 3,4 GB estável, antes 4,3–4,4 GB e subindo). **Mundo aberto ~2% mais rápido** (envio antecipado). **Correção de queda rara** ao carregar o save ("write-only"). |
 | **0.57-opt4** | **Mais FPS:** a thread de comandos gasta bem menos tempo em travas, proteções de página, cópias e alocações (santuário 29 → 35 FPS; demo 47 → 53,5 FPS, 1% low 29 → 38, quadros acima de 50 ms 129 → 26). |
 | **0.57-opt3** | **Menos travadas na primeira visita a uma área:** pipelines gráficos montados em segundo plano; o objeto novo aparece um instante depois em vez de o jogo parar (cache vazio: 1% low 23,9 → 29,1 FPS, quadros acima de 50 ms 235 → 156). |
@@ -120,6 +127,13 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.64-cp-mt** | **+10% FPS** (PGO build; Shrine 41 → 45 FPS). |
+| **0.63-cp-mt** | **Much smoother first visit to each area** (shader translation 15.6 → 3.0 s per session; save-load stall 7.8 → 1.4 s). |
+| **0.62-cp-mt** | **No more hitch every 5 s** with the FPS display on (worst frame ~125 → ~34 ms). |
+| **0.61-cp-mt** | **PS4 Pro mode much faster** (post-colossus scene: cinematic 22.5 → 39.3 FPS). |
+| **0.60-cp-mt** | Merges Oussama268's fork (0.57-opt5) and fixes two texture-cache races. |
+| **0.59-cp-mt** | **PS4 Pro mode:** no more crash when the save loads, no black picture after turning Pro off. |
+| **0.58-cp-mt** | **Command processor on two threads** (Shrine ~29 → ~40 FPS). |
 | **0.57-opt5** | **Stable long sessions:** unused buffer memory is given back to the GPU (30-minute demo: peak 3.4 GB and flat, before 4.3–4.4 GB and rising). **Open world ~2% faster** (early submit). **Fix for a rare crash** while loading the save ("write-only"). |
 | **0.57-opt4** | **More FPS:** the command thread spends far less time in locks, page protection, copies and allocations (shrine 29 → 35 FPS; demo 47 → 53.5 FPS, 1% low 29 → 38, frames over 50 ms 129 → 26). |
 | **0.57-opt3** | **Less freezing on the first visit to an area:** graphics pipelines are built in the background; a new object appears a moment later instead of the game stopping (empty cache: 1% low 23.9 → 29.1 FPS, frames over 50 ms 235 → 156). |

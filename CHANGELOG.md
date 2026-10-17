@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.64-cp-mt — 2026-10-17 (fork Lucas-blip-png, branch cp-mt)
+- **Motor compilado com otimização guiada por perfil (PGO)**, treinado no Santuário (modo normal) e
+  com um save após o 1º colosso no modo PS4 Pro (cinemático e desempenho). Mesmo código da 0.63.
+  Santuário: 40,8 / 41,4 → **42,9 / 47,3 FPS** (média +9,7%).
+
+## 0.63-cp-mt — 2026-10-17
+- **Primeira passagem por cada área muito mais lisa:** dois avisos do tradutor de shaders
+  (`Unexpected instruction for offset computation, Phi` ~1000 vezes por sessão e `Patched SRT
+  walker` até ~500) eram escritos no log na hora da tradução e do carregamento; cada linha vai por
+  pipe até o lançador e levava milissegundos. Agora só as 4 primeiras. Cache vazio: tradução
+  15,6 → **3,0 s** por sessão; travada ao carregar o save 7,8 → **1,4 s**; a da abertura sumiu.
+
+## 0.62-cp-mt — 2026-10-17
+- **Fim do solavanco a cada 5 segundos** com "mostrar FPS" ligado (`SOTC_FPS=1`): as linhas de
+  estatística eram escritas durante o flip do quadro. Agora uma thread própria escreve o log.
+  Santuário: pior quadro a cada 5 s ~125 → **~34 ms**, FPS igual.
+
+## 0.61-cp-mt — 2026-10-17
+- **Modo PS4 Pro muito mais rápido em várias cenas:** com o Pro o jogo lê metadados da GPU (CMask)
+  como buffer/textura centenas de vezes por segundo, e cada leitura escrevia um aviso no log a
+  partir da thread de desenho. Agora só os 4 primeiros. Cena pós-colosso: cinemático 22,5 →
+  **39,3 FPS**; desempenho 28–44 → **40–46 FPS**.
+
+## 0.60-cp-mt — 2026-10-17
+- Integra o `main` da fork de Oussama268 (0.57-opt5, entradas abaixo): pipelines em segundo plano,
+  cortes por draw na CP, mip tails, memória de buffers devolvida em sessões longas.
+- Corrige duas corridas no cache de texturas: o toque no LRU de `GetImage` só acontece com o lock,
+  e a busca do stencil em `FindDepthTarget` pega o lock.
+
+## 0.59-cp-mt — 2026-10-17
+- **Modo PS4 Pro: fim do crash ao carregar o save.** Um PS4 Pro dá 640 MiB a mais aos jogos; com
+  o tamanho do PS4 normal o alocador do próprio jogo ficava sem páginas (leitura de -1 em guest
+  offset 0x1a371). Com `SOTC_NEO=1` o port informa 5696 MiB.
+- **Modo PS4 Pro: fim da tela preta ao desligar o Pro.** O cache de shaders feito com o Pro deixava o
+  modo normal preto; o Pro agora usa a pasta `CUSA08809_neo`.
+
+## 0.58-cp-mt — 2026-10-16
+- **Processador de comandos em duas threads** (`SOTC_CP_THREADS=0` desliga): uma lê os comandos do
+  jogo e escolhe os pipelines, a outra (`shadPS4:GpuDraw`) liga recursos e grava os comandos
+  Vulkan. Varredura DMA incremental. Santuário ~29 → ~40 FPS (com os PRs #46/#47/#48/#52/#53/#59).
+
 ## 0.57-opt5 — 2026-10-17 (fork Oussama268)
 - **Sessões longas sem a memória de vídeo crescer:** o jogo mantém mapeado o seu bloco de 4 GB
   de memória e reaproveita os endereços o tempo todo, então a memória de buffers na GPU só

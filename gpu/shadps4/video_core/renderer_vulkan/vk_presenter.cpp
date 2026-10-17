@@ -1025,6 +1025,22 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             cmdbuf.clearColorImage(swapchain_image, vk::ImageLayout::eTransferDstOptimal,
                                    vk::ClearColorValue{std::array<float, 4>{0.f, 0.f, 0.f, 1.f}},
                                    color_range);
+            // sotc: the clear and the blit both write the swapchain image; without a barrier
+            // between them AMD let the clear land after the blit on part of the image: black
+            // tiles over the lower left of the screen, UI included (issue #43).
+            const vk::ImageMemoryBarrier clear_to_blit{
+                .srcAccessMask = vk::AccessFlagBits::eTransferWrite,
+                .dstAccessMask = vk::AccessFlagBits::eTransferWrite,
+                .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+                .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                .image = swapchain_image,
+                .subresourceRange = color_range,
+            };
+            cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                   vk::PipelineStageFlagBits::eTransfer, {}, {}, {},
+                                   clear_to_blit);
             const auto rect = FitImage(frame->width, frame->height, extent.width, extent.height);
             const vk::ImageBlit blit{
                 .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},

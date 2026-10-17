@@ -609,6 +609,19 @@ void FpsCounter() {
                                SotcStats::ov_worst_cause_ms.load());
         }
     }
+    // DLSS Frame Generation (SOTC_DLSSG=1, vk_dlssg.cpp).
+    if (const int fg = SotcStats::ov_fg_state.load(std::memory_order_relaxed); fg >= 0) {
+        const uint32_t shown = SotcStats::ov_fg_frames.load(std::memory_order_relaxed);
+        if (fg == 1) {
+            const uint32_t n = shown ? shown : 2;
+            ImGui::TextColored(green, "DLSS-G x%u : ~%.0f FPS affichées", n, avg_fps * n);
+        } else if (fg == 0) {
+            ImGui::TextColored(grey, "DLSS-G : en attente (pas de scène 3D)");
+        } else {
+            ImGui::TextColored(red, "DLSS-G : erreur (statut %#x)",
+                               SotcStats::ov_fg_status.load(std::memory_order_relaxed));
+        }
+    }
     if (const uint64_t vram = SotcStats::vram_used.load(std::memory_order_relaxed)) {
         ImGui::TextColored(grey, "VRAM %.1f / %.1f Go", vram / 1073741824.0,
                            SotcStats::vram_budget.load(std::memory_order_relaxed) / 1073741824.0);

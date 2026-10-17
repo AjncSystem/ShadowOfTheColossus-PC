@@ -74,7 +74,11 @@ VideoOutDriver::VideoOutDriver(u32 width, u32 height) {
     present_thread = std::jthread([&](std::stop_token token) { PresentThread(token); });
 }
 
-VideoOutDriver::~VideoOutDriver() = default;
+VideoOutDriver::~VideoOutDriver() {
+    // sotc: the vblank thread queues present jobs; stop it before the presenter thread.
+    present_thread = {};
+    present_job_thread = {};
+}
 
 int VideoOutDriver::Open(const ServiceThreadParams* params) {
     if (main_port.is_open) {
@@ -264,12 +268,57 @@ extern "C" uint64_t runtime_memory_carve_splits(void);
 // sotc: src/runtime_file.c, guest file read time since the last call.
 extern "C" uint64_t runtime_file_read_ns_take(void);
 
-void VideoOutDriver::Flip(const Request& req) {
-    // Update HDR status before presenting.
-    presenter->SetHDR(req.port->is_hdr);
+// sotc: SOTC_ASYNC_PRESENT=1. Measured with DLSS-G: Streamline's present returns in 0.1 ms
+// (its pacer presents on a thread of its own), so the vblank thread keeps presenting by default.
+bool VideoOutDriver::AsyncPresent() {
+    static const bool async = [] {
+        const char* v = std::getenv("SOTC_ASYNC_PRESENT");
+        return v && v[0] == '1';
+    }();
+    return async;
+}
 
-    // Present the frame.
-    presenter->Present(req.frame);
+void VideoOutDriver::RunPresentJob(std::function<void()> job, bool droppable) {
+    if (!AsyncPresent()) {
+        job();
+        return;
+    }
+    {
+        std::scoped_lock lock{present_job_mutex};
+        if (droppable && !present_jobs.empty()) {
+            return; // a blank or repeated frame while the presenter is still busy
+        }
+        if (!present_job_thread.joinable()) {
+            present_job_thread =
+                std::jthread([this](std::stop_token token) { PresentJobThread(token); });
+        }
+        present_jobs.push(std::move(job));
+    }
+    present_job_cv.notify_one();
+}
+
+void VideoOutDriver::PresentJobThread(std::stop_token token) {
+    Common::SetCurrentThreadName("shadPS4:Presenter");
+    while (!token.stop_requested()) {
+        std::function<void()> job;
+        {
+            std::unique_lock lock{present_job_mutex};
+            if (!present_job_cv.wait(lock, token, [this] { return !present_jobs.empty(); })) {
+                return;
+            }
+            job = std::move(present_jobs.front());
+            present_jobs.pop();
+        }
+        job();
+    }
+}
+
+void VideoOutDriver::Flip(const Request& req) {
+    // Update HDR status before presenting, and present the frame.
+    RunPresentJob([frame = req.frame, hdr = req.port->is_hdr] {
+        presenter->SetHDR(hdr);
+        presenter->Present(frame);
+    });
     SotcStats::flip_count.fetch_add(1, std::memory_order_relaxed);
 
     // sotc: SOTC_FPS=1 prints the flip rate every five seconds.
@@ -648,15 +697,23 @@ void VideoOutDriver::Flip(const Request& req) {
 }
 
 void VideoOutDriver::DrawBlankFrame() {
-    const auto empty_frame = presenter->PrepareBlankFrame(true);
-    presenter->Present(empty_frame, false, false);
+    RunPresentJob(
+        [] {
+            const auto empty_frame = presenter->PrepareBlankFrame(true);
+            presenter->Present(empty_frame, false, false);
+        },
+        true);
 }
 
 void VideoOutDriver::DrawLastFrame() {
-    const auto frame = presenter->PrepareLastFrame();
-    if (frame != nullptr) {
-        presenter->Present(frame, true);
-    }
+    RunPresentJob(
+        [] {
+            const auto frame = presenter->PrepareLastFrame();
+            if (frame != nullptr) {
+                presenter->Present(frame, true);
+            }
+        },
+        true);
 }
 
 bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,

@@ -21,6 +21,7 @@
 #include "common/path_util.h"
 #include "core/emulator_settings.h"
 #include "sdl_window.h"
+#include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #ifdef __APPLE__
@@ -271,8 +272,13 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
 #endif
 
     static vk::detail::DynamicLoader dl;
-    VULKAN_HPP_DEFAULT_DISPATCHER.init(
-        dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr"));
+    // sotc: SOTC_DLSSG=1 loads Vulkan through Streamline's interposer (DLSS Frame Generation).
+    PFN_vkGetInstanceProcAddr get_instance_proc_addr = Dlssg::LoadInterposer();
+    if (!get_instance_proc_addr) {
+        get_instance_proc_addr =
+            dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
+    }
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 
     const auto [available_version_result, available_version] =
         VULKAN_HPP_DEFAULT_DISPATCHER.vkEnumerateInstanceVersion

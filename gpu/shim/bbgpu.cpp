@@ -491,9 +491,23 @@ static bool ShotWithOverlay() {
     static const bool with = std::getenv("SOTC_SHOT_OVERLAY") != nullptr;
     return with;
 }
+// SOTC_SHOT_COUNT=<n>: the trigger saves the next n game frames in a row (checking flicker).
 u32 ConsumeGameOnlyScreenshotRequests() {
     static const char* trigger = std::getenv("BB_FRAME_DUMP_TRIGGER");
-    return !ShotWithOverlay() && trigger && std::remove(trigger) == 0 ? 1 : 0;
+    static const int count = [] {
+        const char* v = std::getenv("SOTC_SHOT_COUNT");
+        return v ? std::max(1, std::atoi(v)) : 1;
+    }();
+    static int remaining = 0;
+    if (remaining > 0) {
+        --remaining;
+        return 1;
+    }
+    if (!ShotWithOverlay() && trigger && std::remove(trigger) == 0) {
+        remaining = count - 1;
+        return 1;
+    }
+    return 0;
 }
 bool ConsumeImageDumpRequest() { return false; } // sotc: SOTC_DUMP needs RenderDoc hooks
 u32 ConsumeWithOverlaysScreenshotRequests() {

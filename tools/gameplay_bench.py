@@ -36,11 +36,17 @@ def main():
     parser.add_argument('--env', action='append', default=[])
     parser.add_argument('--patches', default='out/bench.patches')
     parser.add_argument('--cmdline', default='out/bench.cmdline')
+    parser.add_argument('--user', default='out/user', help='game user folder (saves, shader cache)')
+    parser.add_argument('--pan', type=int, default=0,
+                        help='right stick x (0-255, 128 = centre) held during the measurement: turns the camera')
+    parser.add_argument('--walk', action='store_true', help='the character walks around during the run')
+    parser.add_argument('--capture', type=int, default=0,
+                        help='window captures (PrintWindow, window stays behind) in the middle of the measurement')
     args = parser.parse_args()
     os.chdir(ROOT)
     out = Path('out')
     template = out / 'save-template' / 'CUSA08809'
-    target = out / 'user' / 'savedata' / '1' / 'CUSA08809'
+    target = Path(args.user) / 'savedata' / '1' / 'CUSA08809'
     shutil.rmtree(target, ignore_errors=True)
     shutil.copytree(template, target)
     pad = out / 'pad.txt'
@@ -56,7 +62,7 @@ def main():
         name, value = item.split('=', 1)
         env[name] = value
     command = [str(out / 'bb-probe.exe'), str(out / 'boot-linked.bin'), '--content-profile', str(out / 'content.bin'),
-               '--sotc-cpu', str(out / 'sotc-cpu.bin'), '--app0', GAME, '--user', str(out / 'user')]
+               '--sotc-cpu', str(out / 'sotc-cpu.bin'), '--app0', GAME, '--user', str(Path(args.user))]
     if Path(args.patches).exists():
         command += ['--patches', args.patches]
     if Path(args.cmdline).exists():
@@ -106,12 +112,39 @@ def main():
                 press('cross', 0.3)
             at += 3
 
+    # --walk: the character walks around from the start of gameplay (left stick, camera turning
+    # with the right stick, changes of direction so that walls do not stop it for long).
+    walk_route = (('ly=0', 4.0), ('ly=0 rx=210', 2.5), ('ly=0', 4.0), ('lx=40 ly=0', 3.0),
+                  ('ly=0 rx=50', 2.5), ('ly=0', 3.0), ('lx=220 ly=30', 3.0), ('ly=0 rx=200 ry=100', 2.0),
+                  ('ly=255', 2.0), ('ly=0 rx=60', 3.0))
+
+    def walk():
+        while alive() and state['gameplay_at'] is None:
+            time.sleep(0.1)
+        if not wait_until(state['gameplay_at'] + 2):
+            return
+        while alive():
+            for what, hold in walk_route:
+                pad.write_text(what)
+                if not wait_until(now() + hold):
+                    return
+        pad.write_text('')
+
+    if args.walk:
+        threading.Thread(target=walk, daemon=True).start()
     threading.Thread(target=route, daemon=True).start()
     shot = False
+    panning = False
     while alive() and now() < args.timeout:
         g = state['gameplay_at']
+        if g is not None and args.pan and not panning and now() >= g + args.settle - 3:
+            pad.write_text(f'rx={args.pan}')
+            panning = True
         if g is not None and not shot and now() >= g + args.settle + args.measure / 2:
             (out / 'dump.trigger').touch()
+            if args.capture:
+                subprocess.Popen([sys.executable, str(ROOT / 'tools' / 'wincap.py'), str(process.pid),
+                                  str(out / 'dump' / 'win_'), str(args.capture), '30'])
             shot = True
         if g is not None and now() >= g + args.settle + args.measure + 1:
             break

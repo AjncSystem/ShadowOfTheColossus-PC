@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <chrono>
 #include <cstdio>
+#include <map>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -26,6 +28,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/buffer_cache/region_manager.h"
@@ -212,6 +215,8 @@ static void TracePass(const Regs& regs) {
         u32 pitch, height, mode, slice0, slice1;
         s32 sx0, sy0, sx1, sy1, gx0, gy0, gx1, gy1;
         u32 draws;
+        u64 mrt_key; // the bound colour targets (address and format of each)
+        char mrts[320];
     };
     static std::vector<Pass> passes;
     static u64 frame_seen = 0;
@@ -223,10 +228,10 @@ static void TracePass(const Regs& regs) {
             for (const auto& p : passes) {
                 std::fprintf(stderr,
                              "  depth %#llx %ux%u slices %u-%u color %#llx mode %u screen %d,%d-%d,%d "
-                             "generic %d,%d-%d,%d draws %u\n",
+                             "generic %d,%d-%d,%d draws %u | mrt %s\n",
                              static_cast<unsigned long long>(p.depth), p.pitch, p.height, p.slice0, p.slice1,
                              static_cast<unsigned long long>(p.color), p.mode, p.sx0, p.sy0,
-                             p.sx1, p.sy1, p.gx0, p.gy0, p.gx1, p.gy1, p.draws);
+                             p.sx1, p.sy1, p.gx0, p.gy0, p.gx1, p.gy1, p.draws, p.mrts);
             }
         }
         passes.clear();
@@ -235,7 +240,7 @@ static void TracePass(const Regs& regs) {
     if (frame % 300 != 0) {
         return;
     }
-    const Pass p{
+    Pass p{
         .depth = regs.depth_buffer.DepthValid() ? regs.depth_buffer.DepthWriteAddress() : 0,
         .color = regs.color_buffers[0].Address(),
         .pitch = regs.depth_buffer.Pitch(),
@@ -252,10 +257,20 @@ static void TracePass(const Regs& regs) {
         .gx1 = regs.generic_scissor.bottom_right_x,
         .gy1 = regs.generic_scissor.bottom_right_y,
         .draws = 1,
+        .mrt_key = 0,
+        .mrts = {},
     };
+    for (u32 i = 0; i < 8; ++i) {
+        const auto& cb = regs.color_buffers[i];
+        if (cb) {
+            p.mrt_key = p.mrt_key * 0x100000001b3ull ^ cb.Address() ^
+                        (u64(cb.info.format) << 56) ^ (u64(i) << 60);
+        }
+    }
     if (!passes.empty()) {
         auto& last = passes.back();
         if (last.depth == p.depth && last.color == p.color && last.pitch == p.pitch &&
+            last.mrt_key == p.mrt_key &&
             last.height == p.height && last.mode == p.mode && last.slice0 == p.slice0 &&
             last.slice1 == p.slice1 && last.sx0 == p.sx0 &&
             last.sy0 == p.sy0 && last.sx1 == p.sx1 && last.sy1 == p.sy1 && last.gx0 == p.gx0 &&
@@ -264,7 +279,63 @@ static void TracePass(const Regs& regs) {
             return;
         }
     }
+    int at = 0;
+    for (u32 i = 0; i < 8 && at < int(sizeof(p.mrts)) - 64; ++i) {
+        const auto& cb = regs.color_buffers[i];
+        if (cb) {
+            at += std::snprintf(p.mrts + at, sizeof(p.mrts) - at, "%u:%#llx d%u n%u %ux%u ", i,
+                                static_cast<unsigned long long>(cb.Address()),
+                                static_cast<u32>(cb.GetDataFmt()), static_cast<u32>(cb.GetNumberFmt()),
+                                cb.Pitch(), cb.Height());
+        }
+    }
     passes.push_back(p);
+}
+
+// sotc: SOTC_PASS_TRACE: with the pass list, the shader hashes (all stages, as the dump file
+// names) of the G-buffer draws, recognised by their R16G16 float target in MRT 4.
+template <typename Regs, typename Pipe>
+static void TraceGbufferShaders(const Regs& regs, const Pipe* pipeline) {
+    static const bool on = std::getenv("SOTC_PASS_TRACE") != nullptr;
+    if (!on || !pipeline) {
+        return;
+    }
+    static std::map<std::array<u64, 6>, u32> counts;
+    static u64 frame_seen = 0;
+    const u64 frame = SotcStats::flip_count.load(std::memory_order_relaxed);
+    if (frame != frame_seen) {
+        if (frame_seen % 300 == 0 && !counts.empty()) {
+            std::fprintf(stderr, "SOTC GBUFFER SHADERS frame %llu:\n",
+                         static_cast<unsigned long long>(frame_seen));
+            for (const auto& [key, draws] : counts) {
+                std::fprintf(stderr, "  draws %4u:", draws);
+                for (u64 hash : key) {
+                    if (hash) {
+                        std::fprintf(stderr, " %#018llx", static_cast<unsigned long long>(hash));
+                    }
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
+        counts.clear();
+        frame_seen = frame;
+    }
+    if (frame % 300 != 0) {
+        return;
+    }
+    const auto& cb4 = regs.color_buffers[4];
+    if (!cb4 || cb4.GetDataFmt() != AmdGpu::DataFormat::Format16_16 ||
+        cb4.GetNumberFmt() != AmdGpu::NumberFormat::Float) {
+        return;
+    }
+    std::array<u64, 6> key{};
+    size_t n = 0;
+    for (const auto* info : pipeline->GetStages()) {
+        if (info && n < key.size()) {
+            key[n++] = info->pgm_hash;
+        }
+    }
+    ++counts[key];
 }
 
 // sotc: SOTC_SHADOW_STAGGER=1: the two farthest sun shadow cascades are redrawn on alternate
@@ -338,8 +409,13 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         SotcStats::Drop(0, regs.color_buffers[0].Address(), regs.stage_enable.raw);
         return;
     }
+    TraceGbufferShaders(regs, pipeline);
 
     PrepareRenderState(pipeline);
+    if (Dlssg::Enabled()) { // sotc: camera and inputs of DLSS Frame Generation
+        Dlssg::NoteDraw(regs, pipeline->GetGraphicsKey().mrt_mask, db_desc.first,
+                        cb_descs[4].first, texture_cache);
+    }
     if (!BindResources(pipeline)) {
         SotcStats::Drop(1, regs.color_buffers[0].Address(), 0);
         return;
@@ -419,6 +495,10 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
 
     PrepareRenderState(pipeline);
+    if (Dlssg::Enabled()) { // sotc: camera and inputs of DLSS Frame Generation
+        Dlssg::NoteDraw(liverpool->regs, pipeline->GetGraphicsKey().mrt_mask, db_desc.first,
+                        cb_descs[4].first, texture_cache);
+    }
     if (!BindResources(pipeline)) {
         SotcStats::Drop(1, liverpool->regs.color_buffers[0].Address(), 1);
         return;

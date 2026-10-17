@@ -174,6 +174,11 @@ inline std::atomic<uint32_t> ov_compiles_window{0};
 inline std::atomic<uint64_t> ov_compiles_total{0};
 inline std::atomic<int> ov_worst_cause{-1}; ///< FrameCause that took most of the worst frame
 inline std::atomic<float> ov_worst_cause_ms{0.0f};
+/// DLSS Frame Generation (vk_dlssg.cpp): -1 not loaded, 0 off, 1 on, 2 error; frames shown per
+/// game frame; sl::DLSSGStatus bits.
+inline std::atomic<int> ov_fg_state{-1};
+inline std::atomic<uint32_t> ov_fg_frames{0};
+inline std::atomic<uint32_t> ov_fg_status{0};
 /// Phases of PipelineCache::CompileModule (SOTC_FPS, "SOTC COMPILE" line): translate, emit SPIR-V,
 /// shader patch lookup, vkCreateShaderModule, cache registration.
 inline std::atomic<uint64_t> compile_phase_ns[5]{};

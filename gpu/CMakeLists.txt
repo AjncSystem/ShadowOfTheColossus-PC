@@ -167,6 +167,9 @@ target_compile_definitions(bbgpu PRIVATE IMGUI_IMPL_VULKAN_NO_PROTOTYPES
 set_source_files_properties(shim/bbport_overlay.cpp PROPERTIES
     OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf)
 target_include_directories(bbgpu PRIVATE third_party/stb)
+# DLSS Frame Generation (vk_dlssg.cpp): NVIDIA Streamline SDK headers (MIT); the DLLs are
+# loaded at run time from the executable's folder.
+target_include_directories(bbgpu PRIVATE third_party/streamline/include)
 target_include_directories(bbgpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include)
 target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)

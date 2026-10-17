@@ -412,6 +412,18 @@ public:
         return image;
     }
 
+    /// sotc: the image with this id if it is still the registered image `uid`, else nullptr.
+    [[nodiscard]] Image* TryGetImage(ImageId id, u64 uid) {
+        if (!id || !slot_images.is_allocated(id)) {
+            return nullptr;
+        }
+        auto& image = slot_images[id];
+        if (image.image_uid != uid || !(image.flags & ImageFlagBits::Registered)) {
+            return nullptr;
+        }
+        return &image;
+    }
+
     /// Retrieves the image view with the specified id.
     [[nodiscard]] ImageView& GetImageView(ImageId id) {
         return slot_image_views[id];

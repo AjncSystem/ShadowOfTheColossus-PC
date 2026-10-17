@@ -15,6 +15,7 @@
 #include "sdl_window.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -477,8 +478,11 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     const vk::Device device = instance.GetDevice();
 
     // Create presentation frames.
-    present_frames.resize(num_images);
-    for (u32 i = 0; i < num_images; i++) {
+    // sotc: with DLSS Frame Generation Streamline keeps 2 swapchain images; 4 frames in flight
+    // so that the command processor does not wait for the presenter.
+    const u32 num_frames = Dlssg::Enabled() ? std::max(num_images, 4u) : num_images;
+    present_frames.resize(num_frames);
+    for (u32 i = 0; i < num_frames; i++) {
         Frame& frame = present_frames[i];
         frame.id = i;
         auto fence = Check<"create present done fence">(
@@ -637,6 +641,7 @@ Frame* Presenter::PrepareLastFrame() {
     frame->ready_tick = scheduler.CurrentTick();
     SubmitInfo info{};
     scheduler.Flush(info);
+    Dlssg::NoInputs(frame->id); // sotc: a repeated frame, no frame generation
     return frame;
 }
 
@@ -699,6 +704,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     auto& image = texture_cache.GetImage(image_id);
     auto image_view = *image.FindView(view_info).image_view;
     const vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
+    // sotc: this frame's depth, motion vectors and camera for DLSS Frame Generation.
+    Dlssg::PrepareInputs(frame->id, cmdbuf, texture_cache, runtime, image_size.width,
+                         image_size.height);
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
     // sotc: SOTC_OUTPUT_RES=WxH (1280x720 ... 3840x2160): the presented frame has this size, the
     // game's 1080p image is scaled to it (FSR 1 + RCAS with BB_FSR1=1, else bilinear).
@@ -775,6 +783,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     frame->ready_tick = draw_scheduler.CurrentTick();
     SubmitInfo info{};
     draw_scheduler.Flush(info);
+    Dlssg::FrameSubmitted(frame->id);
     return frame;
 }
 
@@ -848,6 +857,7 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     frame->ready_tick = scheduler.CurrentTick();
     SubmitInfo info{};
     scheduler.Flush(info);
+    Dlssg::NoInputs(frame->id); // sotc: no game image, no frame generation
     return frame;
 }
 
@@ -864,10 +874,12 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
     // Recreate the swapchain if the window was resized.
     if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
+        Dlssg::Suspend(); // sotc: frame generation off while the swapchain changes
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }
 
     if (!swapchain.AcquireNextImage()) {
+        Dlssg::Suspend();
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
         if (!swapchain.AcquireNextImage()) {
             // User resizes the window too fast and GPU can't keep up. Skip this frame.
@@ -1120,8 +1132,16 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
     // Present to swapchain.
     {
+        // sotc: DLSS Frame Generation inputs of this frame, and Reflex present markers.
+        const vk::Extent2D extent = swapchain.GetExtent();
+        Dlssg::BeforePresent(frame->id,
+                             FitImage(frame->width, frame->height, extent.width, extent.height),
+                             extent);
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        if (!swapchain.Present()) {
+        const bool presented = swapchain.Present();
+        Dlssg::AfterPresent(frame->id);
+        if (!presented) {
+            Dlssg::Suspend();
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
     }

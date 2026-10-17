@@ -437,6 +437,16 @@ public:
         return sessions.back().primary;
     }
 
+    /// sotc: calls func with the real current command buffer at this point of the command
+    /// stream: on the recording thread when there is one (func may wait there without holding
+    /// up the command processor), otherwise right away.
+    void RecordDeferred(Common::UniqueFunction<void, vk::CommandBuffer>&& func);
+
+    /// sotc: true when Vulkan commands are recorded on a thread of their own.
+    [[nodiscard]] bool HasRecordThread() const noexcept {
+        return recorder != nullptr;
+    }
+
     /// Returns the current command buffer tick.
     [[nodiscard]] u64 CurrentTick() const noexcept {
         return work_semaphore.CurrentTick();

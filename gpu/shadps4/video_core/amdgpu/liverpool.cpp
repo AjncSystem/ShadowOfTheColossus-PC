@@ -113,6 +113,9 @@ static inline void CpuRelax() {
 void Liverpool::BackLoop(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuDraw");
     Shader::g_info_slot = 1;
+#ifdef __linux__
+    back_tid = gettid();
+#endif
     u64 tail = back_tail.load(std::memory_order_relaxed);
     while (!stoken.stop_requested()) {
         if (num_commands.load(std::memory_order_acquire)) {

@@ -239,6 +239,12 @@ public:
     u32 GetGpuCommandProcessorThreadId() {
         return gpu_tid;
     }
+    /// sotc: IsGpuSideThread by Linux thread id (the userfaultfd handler thread asks for the
+    /// faulting thread): a draw-thread write fault handled as a guest one would wait for the
+    /// draw thread itself.
+    bool IsGpuSideThreadId(u32 tid) const noexcept {
+        return tid == gpu_tid || (back_threaded && tid == back_tid);
+    }
 #endif
 
 private:
@@ -335,6 +341,7 @@ private:
     std::thread::id gpu_id;
 #ifdef __linux__
     u32 gpu_tid;
+    u32 back_tid{}; // sotc: the draw thread's (IsGpuSideThreadId)
 #endif
     s32 curr_qid{-1};
 

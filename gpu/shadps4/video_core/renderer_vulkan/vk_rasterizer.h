@@ -132,6 +132,7 @@ public:
     std::thread::id GetGpuCommandProcessorThread();
 #ifdef __linux__
     u32 GetGpuCommandProcessorThreadId();
+    bool IsGpuSideThreadId(u32 tid) const;
 #endif
 
 private:

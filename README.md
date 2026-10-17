@@ -75,7 +75,8 @@ modules are not supported.
 Game library and automatic search, shadPS4 save import, 720p–4K output (the game renders at
 1080p, upscaled with FSR 1 + RCAS), PS4 Pro mode, 60 FPS and 16x AF modes, controller support
 (DualShock 4, DualSense, Xbox) with mouse camera, key remapping, Bluepoint engine cvars, desktop
-shortcut and a session log in `user/last_run.log`.
+shortcut, launcher language selector (Automatic, Portuguese, English, Spanish) and a session log in
+`user/last_run.log`.
 
 In 60 FPS mode the title-screen attract demo averages ~67 FPS on an RTX 2060 SUPER, with
 29–34 FPS in its heaviest section. Vulkan only (no DirectX). AMD and Intel can enable the

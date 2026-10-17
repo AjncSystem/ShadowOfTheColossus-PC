@@ -6,6 +6,7 @@
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/kernel/process.h"
 
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -117,10 +118,12 @@ void DataBase::Open() {
         }
     } else {
         // sotc: shaders compiled with and without direct memory access differ, and the cache keys
-        // do not tell them apart: the launcher's DMA switch gets its own cache folder.
+        // do not tell them apart: the launcher's DMA switch gets its own cache folder. The same
+        // for SOTC_NEO: a cache filled in PS4 Pro mode gave a black picture in the normal mode.
         cache_path = GetUserPath(PathType::CacheDir) /
                      (std::string{game_info.GameSerial()} +
-                      (EmulatorSettings.IsDirectMemoryAccessEnabled() ? "" : "_nodma"));
+                      (EmulatorSettings.IsDirectMemoryAccessEnabled() ? "" : "_nodma") +
+                      (Libraries::Kernel::sceKernelIsNeoMode() ? "_neo" : ""));
         if (!std::filesystem::exists(cache_path)) {
             std::filesystem::create_directories(cache_path);
         }

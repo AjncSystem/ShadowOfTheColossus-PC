@@ -386,11 +386,13 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 
     // sotc: pipeline workers for SOTC_ASYNC_SHADERS (see AsyncPipelineJob).
     if (AsyncShadersEnabled()) {
-        // SOTC_PIPELINE_WORKERS=<n> sets the number of workers.
+        // SOTC_PIPELINE_WORKERS=<n> sets the number of workers. Default: half the hardware
+        // threads less two, 1 to 6 (cold driver cache into the Shrine, 16 threads: worst frame
+        // 8.1 s with 3 workers, 6.3 s with 6; the game's own threads mostly wait).
         const char* workers = std::getenv("SOTC_PIPELINE_WORKERS");
-        const unsigned count =
-            workers ? std::clamp(std::atoi(workers), 1, 16)
-                    : std::clamp(std::thread::hardware_concurrency() / 4, 1u, 3u);
+        const int threads = static_cast<int>(std::thread::hardware_concurrency());
+        const unsigned count = static_cast<unsigned>(
+            workers ? std::clamp(std::atoi(workers), 1, 16) : std::clamp(threads / 2 - 2, 1, 6));
         for (unsigned i = 0; i < count; ++i) {
             async_workers.emplace_back([this](std::stop_token token) { AsyncPipelineWorker(token); });
         }

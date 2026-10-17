@@ -146,6 +146,15 @@ public:
     /// Releases the arena memory backing a range the guest unmapped. GPU thread only.
     void ReleaseMemory(VAddr device_addr, u64 size);
 
+    /// sotc: gives back arena allocations whose blocks were not bound for a while and hold no
+    /// GPU-written data, once resident arena memory passes SOTC_ARENA_EVICT_MB. Called between
+    /// commands outside a render pass; true when it submitted (it waits for the GPU).
+    bool MaybeEvictCold(std::chrono::steady_clock::time_point now);
+
+    /// sotc: a shader reached [addr, addr + size) through a pointer and faulted: blocks of it
+    /// that MaybeEvictCold gave back stay resident from now on. Before the rebind.
+    void NoteFaultRebind(VAddr addr, u64 size);
+
 private:
     struct ArenaBinds {
         const Buffer* arena;
@@ -259,6 +268,7 @@ private:
         u64 version{~u64{0}};
         u64 first{};
         u64 end{};
+        u16 epoch{}; ///< sotc: use epoch its blocks were last stamped with
     };
     std::array<ResidentCacheEntry, 64> resident_cache{};
     u64 dma_runs_version = ~0ULL;
@@ -312,6 +322,28 @@ private:
 
     /// Number of resident blocks still bound to each backing allocation.
     std::unordered_map<VkDeviceMemory, u64> backing_blocks;
+    /// sotc: size of each backing allocation (resident arena memory accounting).
+    std::unordered_map<VkDeviceMemory, u64> backing_bytes;
+    /// sotc: unbinds resident block ranges (zeroing their page table entries) and frees the
+    /// allocations left without blocks. The GPU must no longer use them.
+    void UnbindResident(std::span<const Backing> released);
+    /// sotc: per arena block, the use epoch (seconds, wrapping, 0 = never) of its last bind.
+    u16* block_last_use{};
+    /// sotc: blocks MaybeEvictCold gave back and nothing bound again yet.
+    IntervalList<> evicted_ranges;
+    /// sotc: evicted blocks a shader faulted back in; never evicted again.
+    IntervalList<> pinned_ranges;
+    /// sotc: allocations whose read-back did not match guest memory, tried again after this.
+    std::unordered_map<VkDeviceMemory, std::chrono::steady_clock::time_point> evict_retry;
+    u16 use_epoch{1};
+    /// sotc: sets use_epoch from the clock (once per submit and per eviction check).
+    void AdvanceUseEpoch(std::chrono::steady_clock::time_point now) noexcept {
+        const auto seconds =
+            std::chrono::duration_cast<std::chrono::seconds>(now - epoch_start).count();
+        use_epoch = static_cast<u16>(seconds % 65535 + 1); // 0 = never bound
+    }
+    std::chrono::steady_clock::time_point epoch_start{};
+    std::chrono::steady_clock::time_point next_evict_check{};
     /// sotc: the arena slab EnsureResident hands block runs out of, its size and use (bytes).
     vk::DeviceMemory arena_slab{};
     u64 arena_slab_size{};

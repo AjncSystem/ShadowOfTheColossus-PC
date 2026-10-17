@@ -45,6 +45,18 @@ void Scheduler::ClaimRecorder() {
     }
 }
 
+void Scheduler::RecordDeferred(Common::UniqueFunction<void, vk::CommandBuffer>&& func) {
+    const vk::CommandBuffer cmdbuf = CommandBuffer();
+    if (!recorder || !CommandRecorder::IsFake(cmdbuf)) {
+        func(vk::CommandBuffer{cmdbuf});
+        return;
+    }
+    recorder->CountCommand();
+    recorder->Run([this, cmdbuf, func = std::move(func)] {
+        func(vk::CommandBuffer{recorder->Real(cmdbuf)});
+    });
+}
+
 void Scheduler::BeginRecorded(vk::CommandBuffer fake) {
     const vk::CommandBuffer real = command_pool.Commit();
     Check(real.begin(vk::CommandBufferBeginInfo{

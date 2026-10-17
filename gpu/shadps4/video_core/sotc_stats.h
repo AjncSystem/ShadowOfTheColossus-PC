@@ -64,6 +64,11 @@ inline std::atomic<uint64_t> arena_pinned{0};   ///< ... faulted back in by shad
 inline std::atomic<uint64_t> arena_evict_mismatch{0}; ///< read back unequal to guest memory: kept
 inline std::atomic<uint64_t> arena_evict_runs{0};
 inline std::atomic<uint64_t> arena_evict_ns{0}; ///< time in MaybeEvictCold (scan, GPU wait, unbind)
+// sotc: compute pipelines built by pipeline workers (SOTC_ASYNC_COMPUTE), totals.
+inline std::atomic<uint64_t> async_compute_built{0};
+inline std::atomic<uint64_t> async_compute_build_ns{0}; ///< worker time building them
+inline std::atomic<uint64_t> async_compute_waits{0};    ///< binds the recording thread waited for
+inline std::atomic<uint64_t> async_compute_wait_ns{0};
 inline std::atomic<uint64_t> image_bytes{0};    ///< live texture cache and host pass images
 inline std::atomic<uint64_t> image_count{0};
 inline std::atomic<uint64_t> gc_freed{0};       ///< images freed by the texture garbage collector

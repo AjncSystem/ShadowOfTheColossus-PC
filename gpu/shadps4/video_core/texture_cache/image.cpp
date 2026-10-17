@@ -1,14 +1,20 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
+#include <optional>
+#include <cstdlib>
 #include <ranges>
+#include <unordered_map>
 #include "common/assert.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/sotc_stats.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
+#include "video_core/sotc_stats.h"
 
 #include <vk_mem_alloc.h>
 
@@ -87,9 +93,7 @@ static vk::FormatFeatureFlags2 FormatFeatureFlags(const vk::ImageUsageFlags usag
 }
 
 UniqueImage::~UniqueImage() {
-    if (image) {
-        vmaDestroyImage(allocator, image, allocation);
-    }
+    Destroy();
 }
 
 void UniqueImage::Destroy() {
@@ -97,6 +101,9 @@ void UniqueImage::Destroy() {
         vmaDestroyImage(allocator, image, allocation);
         image = vk::Image{};
         allocation = {};
+        SotcStats::image_bytes.fetch_sub(size_bytes, std::memory_order_relaxed);
+        SotcStats::image_count.fetch_sub(1, std::memory_order_relaxed);
+        size_bytes = 0;
     }
 }
 
@@ -115,6 +122,7 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     const VkImageCreateInfo image_ci_unsafe = static_cast<VkImageCreateInfo>(image_ci);
     VkImage unsafe_image{};
     VmaAllocationInfo alloc_info{};
+    const SotcStats::ScopedTimer alloc_timer{SotcStats::image_alloc_ns};
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
                                      &allocation, &alloc_info);
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
@@ -133,6 +141,46 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
                vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};
     size_bytes = alloc_info.size;
+    SotcStats::image_bytes.fetch_add(size_bytes, std::memory_order_relaxed);
+    SotcStats::image_count.fetch_add(1, std::memory_order_relaxed);
+    VmaAllocationInfo2 alloc_info2{};
+    vmaGetAllocationInfo2(allocator, allocation, &alloc_info2);
+    if (alloc_info2.dedicatedMemory) {
+        SotcStats::image_dedicated.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+// sotc: vkGetPhysicalDeviceImageFormatProperties2 takes about 5 ms per call on a Radeon (driver
+// 32.0.21045), and the game creates dozens of images in a frame when the camera turns: frames of
+// 200-500 ms. The answer only depends on these parameters, so it is asked once per combination
+// (and the unsupported-format error is logged once).
+struct FormatQuery {
+    vk::Result result;
+    vk::SampleCountFlags sample_counts;
+};
+static FormatQuery QueryImageFormat(const Vulkan::Instance& instance,
+                                    const vk::PhysicalDeviceImageFormatInfo2& format_info) {
+    static std::mutex mutex;
+    static std::unordered_map<u64, FormatQuery> answers;
+    const u64 key = (u64(format_info.format) << 40) ^ (u64(format_info.type) << 36) ^
+                    (u64(u32(format_info.flags)) << 20) ^ u64(u32(format_info.usage));
+    std::scoped_lock lock{mutex};
+    if (const auto it = answers.find(key); it != answers.end()) {
+        return it->second;
+    }
+    const SotcStats::ScopedTimer query_timer{SotcStats::image_query_ns};
+    const auto properties = instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
+    if (properties.result == vk::Result::eErrorFormatNotSupported) {
+        LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",
+                  vk::to_string(format_info.format), vk::to_string(format_info.type),
+                  vk::to_string(format_info.flags), vk::to_string(format_info.usage));
+    }
+    const FormatQuery answer{properties.result,
+                             properties.result == vk::Result::eSuccess
+                                 ? properties.value.imageFormatProperties.sampleCounts
+                                 : vk::SampleCountFlags{}};
+    answers.emplace(key, answer);
+    return answer;
 }
 
 Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
@@ -141,6 +189,7 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     if (info.pixel_format == vk::Format::eUndefined) {
         return;
     }
+    const SotcStats::FrameTimer frame_timer{SotcStats::FrameImage};
 
     image_uid = global_image_uid.Next();
     mip_hashes.resize(info.resources.levels);
@@ -174,15 +223,9 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
         .usage = usage_flags,
         .flags = flags,
     };
-    const auto image_format_properties =
-        instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
-    if (image_format_properties.result == vk::Result::eErrorFormatNotSupported) {
-        LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",
-                  vk::to_string(supported_format), vk::to_string(format_info.type),
-                  vk::to_string(format_info.flags), vk::to_string(format_info.usage));
-    }
-    supported_samples = image_format_properties.result == vk::Result::eSuccess
-                            ? image_format_properties.value.imageFormatProperties.sampleCounts
+    const FormatQuery format_query = QueryImageFormat(instance, format_info);
+    supported_samples = format_query.result == vk::Result::eSuccess
+                            ? format_query.sample_counts
                             : vk::SampleCountFlagBits::e1;
 
     const vk::ImageCreateInfo image_ci = {
@@ -220,13 +263,30 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
     if (ensure_guest_samples && backing->num_samples > 1 != info.num_samples > 1) {
         runtime->SetBackingSamples(this, info.num_samples);
     }
+    // sotc: consecutive binds of an image mostly ask for the same view: compare against the
+    // view returned last before the linear search. Exact: views are never duplicated or
+    // removed from a backing, so the first match of the search is that same entry
+    // (SOTC_TEX_BIND_P1=0: always search).
+    static const bool last_view_enabled = [] {
+        const char* v = std::getenv("SOTC_TEX_BIND_P1");
+        return !v || v[0] != '0';
+    }();
     const auto& view_infos = backing->image_view_infos;
+    if (last_view_enabled) {
+        const u32 last = backing->last_view;
+        if (last < view_infos.size() && view_infos[last] == view_info) {
+            return (*slot_image_views)[backing->image_view_ids[last]];
+        }
+    }
     const auto it = std::ranges::find(view_infos, view_info);
     if (it != view_infos.end()) {
-        const auto view_id = backing->image_view_ids[std::distance(view_infos.begin(), it)];
+        const auto index = std::distance(view_infos.begin(), it);
+        backing->last_view = static_cast<u32>(index);
+        const auto view_id = backing->image_view_ids[index];
         return (*slot_image_views)[view_id];
     }
     const auto view_id = slot_image_views->insert(runtime->GetInstance(), view_info, *this);
+    backing->last_view = static_cast<u32>(backing->image_view_infos.size());
     backing->image_view_infos.emplace_back(view_info);
     backing->image_view_ids.emplace_back(view_id);
     return (*slot_image_views)[view_id];
@@ -335,6 +395,16 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
     last_state.layout = dst_layout;
     last_state.access_mask = dst_mask;
     last_state.pl_stage = dst_stage;
+}
+
+void NoteMipTailWrite(const Image& image) {
+    // The image stays usable: it is GPU-modified now, so it is not freed without a download.
+    SotcStats::rebase_violations.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<int> shown{0};
+    if (shown.fetch_add(1, std::memory_order_relaxed) < 8) {
+        LOG_ERROR(Render_Vulkan, "Mip-tail image {:#x} (from mip {}) written by the GPU",
+                  image.info.guest_address, image.info.sotc_first_mip);
+    }
 }
 
 } // namespace VideoCore

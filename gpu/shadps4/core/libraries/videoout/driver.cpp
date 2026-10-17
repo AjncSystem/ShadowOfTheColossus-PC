@@ -2,8 +2,13 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
+#include <string>
+#include <thread>
+#include <vector>
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -21,6 +26,23 @@ extern std::unique_ptr<Vulkan::Presenter> presenter;
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
 namespace Libraries::VideoOut {
+
+// sotc: printf into the SOTC_FPS report, which is written to stderr in one go.
+[[gnu::format(printf, 2, 3)]] static void ReportPrintf(std::string& out, const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    va_list copy;
+    va_copy(copy, args);
+    const int size = std::vsnprintf(nullptr, 0, format, copy);
+    va_end(copy);
+    if (size > 0) {
+        const size_t at = out.size();
+        out.resize(at + size + 1);
+        std::vsnprintf(out.data() + at, size + 1, format, args);
+        out.resize(at + size);
+    }
+    va_end(args);
+}
 
 constexpr static bool Is32BppPixelFormat(PixelFormat format) {
     switch (format) {
@@ -237,6 +259,11 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
     return 0;
 }
 
+// sotc: src/runtime_memory.c, live view splits since the last call.
+extern "C" uint64_t runtime_memory_carve_splits(void);
+// sotc: src/runtime_file.c, guest file read time since the last call.
+extern "C" uint64_t runtime_file_read_ns_take(void);
+
 void VideoOutDriver::Flip(const Request& req) {
     // Update HDR status before presenting.
     presenter->SetHDR(req.port->is_hdr);
@@ -245,15 +272,103 @@ void VideoOutDriver::Flip(const Request& req) {
     presenter->Present(req.frame);
 
     // sotc: SOTC_FPS=1 prints the flip rate every five seconds.
-    static const bool fps_log = std::getenv("SOTC_FPS") != nullptr;
+    const bool fps_log = SotcStats::kFpsLog; // sotc: the switch the counters use (sotc_stats.h)
     if (fps_log) {
         static auto window_start = std::chrono::steady_clock::now();
         static const auto run_start = window_start;
         static u32 flips = 0;
         ++flips;
         const auto now = std::chrono::steady_clock::now();
+        // sotc: frame times of this window, and where the command processor spent the time of
+        // slow frames (SotcStats::FrameTimer sites) -> the "SOTC FRAMES" line.
+        // Column FrameCauses ("io") is the time guest threads spent in file reads (all threads, so
+        // it can exceed the frame); the last one counts bytes copied to the GPU ("copyMB").
+        constexpr int kColumns = SotcStats::FrameCauses + 2;
+        static auto last_flip = now;
+        static std::vector<float> frame_ms;
+        static double worst_ms = 0.0;
+        static uint64_t worst_ns[kColumns]{}, slow_ns[kColumns]{};
+        static u32 slow_frames = 0;
+        const double interval_ms = std::chrono::duration<double, std::milli>(now - last_flip).count();
+        last_flip = now;
+        uint64_t cause_ns[kColumns];
+        for (int c = 0; c < SotcStats::FrameCauses; ++c) {
+            cause_ns[c] = SotcStats::frame_ns[c].exchange(0, std::memory_order_relaxed);
+        }
+        cause_ns[SotcStats::FrameCauses] = runtime_file_read_ns_take();
+        cause_ns[SotcStats::FrameCauses + 1] = SotcStats::frame_copy_bytes.exchange(0);
+        frame_ms.push_back(static_cast<float>(interval_ms));
+        if (interval_ms > worst_ms) {
+            worst_ms = interval_ms;
+            std::copy(std::begin(cause_ns), std::end(cause_ns), std::begin(worst_ns));
+        }
+        if (interval_ms > 50.0) {
+            ++slow_frames;
+            for (int c = 0; c < kColumns; ++c) {
+                slow_ns[c] += cause_ns[c];
+            }
+        }
         if (now - window_start >= std::chrono::seconds(5)) {
             const double seconds = std::chrono::duration<double>(now - window_start).count();
+            std::string report; // sotc: written at once off this thread (see ReportPrintf)
+            {
+                std::sort(frame_ms.begin(), frame_ms.end());
+                const auto pct = [&](double p) {
+                    return frame_ms[std::min(frame_ms.size() - 1,
+                                             static_cast<size_t>(p * frame_ms.size()))];
+                };
+                const auto columns = [](const uint64_t* ns) {
+                    std::string text;
+                    char item[48];
+                    for (int c = 0; c < kColumns; ++c) {
+                        std::snprintf(item, sizeof(item), "%s%s %.1f", c ? ", " : "",
+                                      c < SotcStats::FrameCauses ? SotcStats::kFrameCauseNames[c]
+                                      : c == SotcStats::FrameCauses ? "io"
+                                                                    : "copyMB",
+                                      ns[c] / 1e6);
+                        text += item;
+                    }
+                    return text;
+                };
+                ReportPrintf(report,
+                             "SOTC FRAMES p50 %.1f ms, p99 %.1f ms (1%% low %.1f FPS), worst %.1f ms "
+                             "[%s]; >50 ms: %u [%s]; compiled %llu\n",
+                             pct(0.5), pct(0.99), 1000.0 / pct(0.99), worst_ms,
+                             columns(worst_ns).c_str(), slow_frames, columns(slow_ns).c_str(),
+                             static_cast<unsigned long long>(SotcStats::frame_compiles.exchange(0)));
+                std::string allocs;
+                for (int k = 0; k < SotcStats::AllocKinds; ++k) {
+                    const uint64_t count = SotcStats::alloc_count[k].exchange(0);
+                    const uint64_t bytes = SotcStats::alloc_bytes[k].exchange(0);
+                    const uint64_t ns = SotcStats::alloc_ns[k].exchange(0);
+                    if (count) {
+                        char item[96];
+                        std::snprintf(item, sizeof(item), "%s%s %llu (%.1f MiB, %.1f ms)",
+                                      allocs.empty() ? "" : ", ", SotcStats::kAllocKindNames[k],
+                                      static_cast<unsigned long long>(count), bytes / 1048576.0,
+                                      ns / 1e6);
+                        allocs += item;
+                    }
+                }
+                if (!allocs.empty()) {
+                    ReportPrintf(report, "SOTC ALLOC %s\n", allocs.c_str());
+                }
+                if (const uint64_t translate = SotcStats::compile_phase_ns[0].exchange(0)) {
+                    const auto take = [](int i) {
+                        return SotcStats::compile_phase_ns[i].exchange(0) / 1e6;
+                    };
+                    const double emit = take(1), patch = take(2), module = take(3), reg = take(4);
+                    ReportPrintf(report,
+                                 "SOTC COMPILE translate %.1f, emit %.1f, patch lookup %.1f, "
+                                 "module %.1f, register %.1f ms\n",
+                                 translate / 1e6, emit, patch, module, reg);
+                }
+                frame_ms.clear();
+                worst_ms = 0.0;
+                std::fill(std::begin(worst_ns), std::end(worst_ns), 0);
+                std::fill(std::begin(slow_ns), std::end(slow_ns), 0);
+                slow_frames = 0;
+            }
             const uint64_t readbacks = SotcStats::readbacks.exchange(0, std::memory_order_relaxed);
             const uint64_t readback_ns =
                 SotcStats::readback_ns.exchange(0, std::memory_order_relaxed);
@@ -261,9 +376,10 @@ void VideoOutDriver::Flip(const Request& req) {
             const uint64_t copies_changed = SotcStats::readback_copies_changed.exchange(0);
             const uint64_t bytes = SotcStats::readback_bytes.exchange(0);
             const uint64_t bytes_changed = SotcStats::readback_bytes_changed.exchange(0);
-            std::fprintf(stderr,
+            ReportPrintf(report,
                          "SOTC FPS %.1f at %.0fs; %.0f cmds/frame; readbacks %.0f/s (ahead %llu, finish %llu, heap %llu, early %llu), %.0f ms/s; "
-                         "changed copies %llu/%llu, bytes %llu/%llu\n",
+                         "changed copies %llu/%llu, bytes %llu/%llu; vram %llu/%llu MB, "
+                         "arenas %llu (%llu MB)\n",
                          flips / seconds, std::chrono::duration<double>(now - run_start).count(),
                          flips ? double(SotcStats::commands.exchange(0)) / flips : 0.0,
                          readbacks / seconds,
@@ -275,29 +391,144 @@ void VideoOutDriver::Flip(const Request& req) {
                          static_cast<unsigned long long>(copies_changed),
                          static_cast<unsigned long long>(copies),
                          static_cast<unsigned long long>(bytes_changed),
-                         static_cast<unsigned long long>(bytes));
-            static const bool cmd_stats = std::getenv("SOTC_CMD_STATS") != nullptr;
+                         static_cast<unsigned long long>(bytes),
+                         static_cast<unsigned long long>(SotcStats::vram_used.load() >> 20),
+                         static_cast<unsigned long long>(SotcStats::vram_budget.load() >> 20),
+                         static_cast<unsigned long long>(SotcStats::arena_allocs.load()),
+                         static_cast<unsigned long long>(SotcStats::arena_bytes.load() >> 20));
+            ReportPrintf(report, "SOTC readback finish: %llu for bytes the guest asked\n",
+                         static_cast<unsigned long long>(
+                             SotcStats::readback_finish_asked.exchange(0)));
+            static uint64_t last_images_new = 0;
+            const uint64_t images_new = SotcStats::images_new.load();
+            ReportPrintf(report,
+                         "SOTC GC: %.1f ticks/frame, freed %.0f/s (%llu written back), images new "
+                         "%.0f/s, cached %llu (%llu MB)\n",
+                         flips ? double(SotcStats::gc_ticks.exchange(0)) / flips : 0.0,
+                         SotcStats::gc_freed.exchange(0) / seconds,
+                         static_cast<unsigned long long>(SotcStats::gc_downloads.exchange(0)),
+                         (images_new - last_images_new) / seconds,
+                         static_cast<unsigned long long>(SotcStats::cached_images.load()),
+                         static_cast<unsigned long long>(SotcStats::cached_image_bytes.load() >> 20));
+            last_images_new = images_new;
+            if (const uint64_t sweeps = SotcStats::dma_sweeps.exchange(0)) {
+                const uint64_t ranges = SotcStats::dma_sweep_ranges.exchange(0);
+                const uint64_t uploading = SotcStats::dma_sweep_uploading.exchange(0);
+                ReportPrintf(report, "SOTC DMA sweeps %.0f/s, %.1f ranges each, %.0f/s uploading\n",
+                             sweeps / seconds, double(ranges) / sweeps, uploading / seconds);
+            }
+            if (const uint64_t images = SotcStats::census_count.load(std::memory_order_relaxed)) {
+                const auto mib = [](const std::atomic<uint64_t>& v) {
+                    return static_cast<unsigned long long>(v.load(std::memory_order_relaxed) >> 20);
+                };
+                ReportPrintf(report,
+                             "SOTC IMAGES %llu: gpu-written tiled %llu MiB, linear %llu MiB; "
+                             "sampled streamed %llu MiB, other %llu MiB; below base mip %llu MiB, "
+                             "below min_lod %llu MiB; live %llu MiB\n",
+                             static_cast<unsigned long long>(images), mib(SotcStats::census_gpu_tiled),
+                             mib(SotcStats::census_gpu_linear), mib(SotcStats::census_streamed),
+                             mib(SotcStats::census_other), mib(SotcStats::census_below_base),
+                             mib(SotcStats::census_below_minlod), mib(SotcStats::census_live));
+                // sotc: mip-tail images (SOTC_MIP_TAIL): what they hold and leave out, what the
+                // full-chain candidates would save, and the decisions since the last line.
+                const auto take = [](std::atomic<uint64_t>& v) {
+                    return static_cast<unsigned long long>(v.exchange(0));
+                };
+                ReportPrintf(
+                    report,
+                    "SOTC MIPTAIL rebased %llu MiB in %llu (dropped %llu MiB guest), projected "
+                    "%llu MiB (hwcnt %llu); created %llu, reuse-full %llu, skip gpu %llu "
+                    "live-full %llu layout %llu, writer-freed %llu, dedup-freed %llu, "
+                    "maybe-dirty %llu, VIOLATIONS %llu\n",
+                    mib(SotcStats::census_rebased),
+                    static_cast<unsigned long long>(
+                        SotcStats::census_rebased_count.load(std::memory_order_relaxed)),
+                    mib(SotcStats::census_dropped), mib(SotcStats::census_projected),
+                    mib(SotcStats::census_projected_hwcnt), take(SotcStats::rebase_created),
+                    take(SotcStats::rebase_reuse_full), take(SotcStats::rebase_skip_gpu),
+                    take(SotcStats::rebase_skip_live_full), take(SotcStats::rebase_skip_layout),
+                    take(SotcStats::rebase_writer_freed), take(SotcStats::rebase_dedup_freed),
+                    take(SotcStats::rebase_maybe_dirty),
+                    static_cast<unsigned long long>(
+                        SotcStats::rebase_violations.load(std::memory_order_relaxed)));
+            }
+            const uint64_t grace_marks = SotcStats::fault_grace_marks.exchange(0);
+            const uint64_t grace_caps = SotcStats::fault_grace_cap_hits.exchange(0);
+            const uint64_t grace_bytes = SotcStats::fault_grace_hot_upload_bytes.exchange(0);
+            const uint64_t reg_spins = SotcStats::stack_reg_spins.exchange(0);
+            const uint64_t carves = runtime_memory_carve_splits();
+            if (grace_marks || grace_caps || grace_bytes || reg_spins || carves) {
+                ReportPrintf(report,
+                             "SOTC fault grace: marks %llu, cap hits %llu, hot uploads %llu KiB; "
+                             "stack registry spins %llu; live view splits %llu\n",
+                             static_cast<unsigned long long>(grace_marks),
+                             static_cast<unsigned long long>(grace_caps),
+                             static_cast<unsigned long long>(grace_bytes >> 10),
+                             static_cast<unsigned long long>(reg_spins),
+                             static_cast<unsigned long long>(carves));
+            }
+            const uint64_t repairs = SotcStats::desync_repairs.exchange(0);
+            const uint64_t legit = SotcStats::desync_legit.exchange(0);
+            if (repairs || legit) {
+                ReportPrintf(report,
+                             "SOTC page tracking desync repairs %llu (repeated faults left alone "
+                             "%llu)\n",
+                             static_cast<unsigned long long>(repairs),
+                             static_cast<unsigned long long>(legit));
+            }
+            // sotc: video memory against the budget the texture cache collects for; emergency
+            // collections mean an allocation already failed (6 GB cards in large areas).
+            if (const uint64_t budget = SotcStats::vram_budget.load(std::memory_order_relaxed)) {
+                ReportPrintf(report,
+                             "SOTC VRAM %llu/%llu MiB (VMA blocks %llu MiB holding %llu MiB, "
+                             "buffer arenas %llu MiB, images %llu MiB in "
+                             "%llu; GC freed %llu, kept tiled %llu), emergency collections %llu\n",
+                             static_cast<unsigned long long>(
+                                 SotcStats::vram_used.load(std::memory_order_relaxed) >> 20),
+                             static_cast<unsigned long long>(budget >> 20),
+                             static_cast<unsigned long long>(
+                                 SotcStats::vma_block_bytes.load(std::memory_order_relaxed) >> 20),
+                             static_cast<unsigned long long>(
+                                 SotcStats::vma_allocation_bytes.load(std::memory_order_relaxed) >>
+                                 20),
+                             static_cast<unsigned long long>(
+                                 SotcStats::arena_bytes.load(std::memory_order_relaxed) >> 20),
+                             static_cast<unsigned long long>(
+                                 SotcStats::image_bytes.load(std::memory_order_relaxed) >> 20),
+                             static_cast<unsigned long long>(
+                                 SotcStats::image_count.load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(SotcStats::gc_freed.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::gc_kept_tiled.exchange(0)),
+                             static_cast<unsigned long long>(
+                                 SotcStats::vram_emergency.exchange(0)));
+            }
+            const bool cmd_stats = SotcStats::kCmdStats; // sotc: as the counters (sotc_stats.h)
             if (cmd_stats && flips) {
                 double k[6];
                 for (int i = 0; i < 6; ++i) {
                     k[i] = double(SotcStats::cmd_kinds[i].exchange(0)) / flips;
                 }
-                std::fprintf(stderr,
+                ReportPrintf(report,
                              "SOTC cmds/frame: draw %.0f, indirect %.0f gpu-args + %.0f cpu-args "
                              "(%.0f empty), dispatch %.0f, dispatch-indirect %.0f\n",
                              k[0], k[1], k[2], k[3], k[4], k[5]);
-                std::fprintf(stderr,
+                ReportPrintf(report,
                              "SOTC faults/s: guest writes %.0f, walker loads %.0f, CP reads %.0f\n",
                              SotcStats::fault_writes.exchange(0) / seconds,
                              SotcStats::fault_walker.exchange(0) / seconds,
                              SotcStats::fault_gpu_reads.exchange(0) / seconds);
-                std::fprintf(stderr,
+                ReportPrintf(report,
                              "SOTC per frame: uploads %.0f (%.0f KB), render pass breaks %.0f\n",
                              double(SotcStats::uploads.exchange(0)) / flips,
                              double(SotcStats::upload_bytes.exchange(0)) / 1024.0 / flips,
                              double(SotcStats::render_breaks.exchange(0)) / flips);
             }
             flips = 0;
+            // The flip thread does not wait for the log: one stderr write took 7-10 ms (bench log
+            // file, Radeon RX 6650 XT session), ~15 of them a frame of 80-100 ms every 5 s.
+            std::thread([text = std::move(report)] {
+                std::fwrite(text.data(), 1, text.size(), stderr);
+            }).detach();
             window_start = now;
         }
     }
@@ -427,9 +658,25 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         }
 
         // Check if it's time to take a request.
+        // sotc: the flip rate counts from the last flip instead of fixed vblank phases: at 30 fps
+        // (flip rate 1) a frame ready just after an even vblank went out two vblanks later
+        // (67 ms) instead of at the next one (50 ms). On by default after a 16 min session on a
+        // Radeon RX 6650 XT ("muito melhor"; heavy areas hold a steady 20 fps instead of
+        // stuttering); SOTC_FLIP_LATE=0 restores the fixed phases.
+        static const bool flip_late = [] {
+            const char* v = std::getenv("SOTC_FLIP_LATE");
+            return !v || v[0] != '0';
+        }();
+        static u64 last_flip_count = 0;
         auto& vblank_status = main_port.vblank_status;
-        if (vblank_status.count % (main_port.flip_rate + 1) == 0) {
+        const bool flip_due =
+            flip_late ? vblank_status.count - last_flip_count >= u64(main_port.flip_rate) + 1
+                      : vblank_status.count % (main_port.flip_rate + 1) == 0;
+        if (flip_due) {
             const auto request = receive_request();
+            if (request) {
+                last_flip_count = vblank_status.count;
+            }
             if (!request) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
                     if (!main_port.is_open) {

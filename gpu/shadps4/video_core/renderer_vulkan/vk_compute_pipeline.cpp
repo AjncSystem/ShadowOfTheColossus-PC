@@ -112,6 +112,12 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     };
     auto [pipeline_result, pipe] =
         instance.GetDevice().createComputePipelineUnique(pipeline_cache, compute_pipeline_ci);
+    if (pipeline_result != vk::Result::eSuccess && preloading) {
+        // sotc: as for graphics pipelines, a cached one the driver refuses is dropped.
+        LOG_WARNING(Render_Vulkan, "Cached compute pipeline {} failed to build: {}", debug_str,
+                    vk::to_string(pipeline_result));
+        return;
+    }
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create compute pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);

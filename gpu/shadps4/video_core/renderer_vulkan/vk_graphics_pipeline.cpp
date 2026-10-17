@@ -33,7 +33,7 @@ GraphicsPipeline::GraphicsPipeline(
     vk::PipelineCache pipeline_cache, std::span<const Shader::Info*, MaxShaderStages> infos,
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
     const Shader::Gcn::FetchShaderData* fetch_shader_, std::span<const vk::ShaderModule> modules,
-    SerializationSupport& sdata, bool preloading)
+    SerializationSupport& sdata, bool preloading, bool async_build)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_} {
     if (fetch_shader_) {
         fetch_shader = *fetch_shader_;
@@ -41,7 +41,9 @@ GraphicsPipeline::GraphicsPipeline(
 
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
-    BuildDescSetLayout(preloading);
+    // sotc: built on a pipeline worker (SOTC_ASYNC_SHADERS), the guest registers already belong
+    // to later draws: skip the buffer sharp reads, whose result is unused (as when preloading).
+    BuildDescSetLayout(preloading || async_build);
     const auto debug_str = GetDebugString();
 
     const vk::PushConstantRange push_constants = {
@@ -428,6 +430,13 @@ GraphicsPipeline::GraphicsPipeline(
 
     auto [pipeline_result, pipe] =
         device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+    if (pipeline_result != vk::Result::eSuccess && preloading) {
+        // sotc: the driver can refuse a pipeline rebuilt from the cache (ErrorUnknown on AMD).
+        // Left without a handle, the preload drops it and the game compiles it when it is drawn.
+        LOG_WARNING(Render_Vulkan, "Cached graphics pipeline {} failed to build: {}", debug_str,
+                    vk::to_string(pipeline_result));
+        return;
+    }
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);

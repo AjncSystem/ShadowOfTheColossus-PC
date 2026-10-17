@@ -361,6 +361,9 @@ static void sample_host(PadData *d) {
  * the sticks. An empty file releases everything. */
 static struct { uint32_t buttons; int stick[4]; int touch_side; } injected={0,{-1,-1,-1,-1},-1};
 static int replay_armed;      /* 1 while a BB_PAD_REPLAY recording plays, 2 once it ended */
+/* sotc: the token "record" starts a BB_PAD_RECORD recording (once), so a scripted run starts it
+ * at the same point a later replay will start (F9 still stops it). 1: asked, 2: done. */
+static int record_requested;
 static uint64_t replay_start; /* 0: (re)start at the next sample */
 static void read_inject(void) {
     static const char *path; static int checked; static uint64_t last_check; static struct timespec mtime;
@@ -394,6 +397,7 @@ static void read_inject(void) {
     char token[64];
     while (fscanf(f,"%63s",token)==1) {
         if (!strcmp(token,"replay") && replay_armed!=1) { replay_armed=1; replay_start=0; } /* BB_PAD_REPLAY */
+        if (!strcmp(token,"record") && !record_requested) record_requested=1;
         if (!strcmp(token,"touchpad_left") || !strcmp(token,"touchpad_right")) {
             injected.buttons|=BTN_TOUCHPAD;
             injected.touch_side=!strcmp(token,"touchpad_right");
@@ -419,7 +423,9 @@ static void record_sample(const PadData *d) {
     if (!path || !*path || !sdl_ready) return;
     const bool *k=SDL_GetKeyboardState(NULL);
     const int f9=k && k[SDL_SCANCODE_F9];
-    if (f9 && !f9_was_down) {
+    const int requested=record_requested==1 && !record_file;
+    if (record_requested==1) record_requested=2;
+    if ((f9 && !f9_was_down) || requested) {
         if (record_file) {
             fclose(record_file); record_file=NULL;
             printf("Runtime: pad recording stopped (%s)\n",path);

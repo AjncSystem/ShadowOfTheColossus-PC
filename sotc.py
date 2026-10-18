@@ -17,6 +17,8 @@ Settings (environment variables, or sotc.ini beside this script as NAME=value li
     SOTC_MODES        optional, comma-separated: af16 (16x anisotropic filtering),
                       fps60 (removes the 30 FPS cap; experimental, vblank at 120 Hz)
     SOTC_CVARS        engine settings, NAME=VALUE separated by spaces (e.g. r_motionBlurEnable=0)
+    SOTC_FG           1: FSR 3 frame generation, one generated frame between each pair of game
+                      frames (experimental, forces FIFO; docs/sotc/FRAMEGEN.md)
     BB_GAMEPAD        the gamepad to use (its name or part of it), when several are connected
     key.<input>=Keys, pad.<input>=buttons   remap the controls (README.md, Controles)
 The image is prepared again only when the game, the modules or the scripts change.

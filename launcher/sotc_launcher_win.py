@@ -29,7 +29,7 @@ CONFIG_DIR = Path(os.environ.get('APPDATA', Path.home())) / 'sotc-launcher'
 CONFIG_FILE = CONFIG_DIR / 'settings.json'
 GAME_ID, GAME_VERSION = 'CUSA08809', '01.01'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.65-cp-mt'
+VERSION = '0.66-cp-mt'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -132,7 +132,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'readbacks': '', 'extra_env': '', 'close_on_play': False, 'gamepad': '',
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
-                'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True, 'perf_sun_shadows': True,
+                'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True, 'perf_sun_shadows': True, 'frame_gen': False,
                 'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'library_dirs': [], 'keys': {},
                 'auto_setup': True, 'dlc_dir': ''}
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
@@ -357,6 +357,9 @@ def game_environment(s):
         env['SOTC_FLUSH_US'], env['SOTC_RB_AHEAD'] = '1000', '1'
     elif s.get('gpu_submit') == 'off':
         env['SOTC_FLUSH_EVERY'], env['SOTC_RB_AHEAD'] = '0', '0'
+    if s.get('frame_gen'):
+        # FSR 3.1.6 frame interpolation on its own present thread (vk_frame_pacer.cpp); forces FIFO.
+        env['SOTC_FG'] = '1'
     env['SOTC_NEO'] = '1' if s.get('neo') else '0'
     env['SOTC_OUTPUT_RES'] = s.get('output_res') or '1920x1080'
     env['BB_FSR1'] = '1' if s.get('upscaler', 'fsr1') == 'fsr1' else '0'
@@ -841,6 +844,16 @@ class Launcher:
         self.row(f, _('Upscaler', 'Upscaler'), self.choice(f, 'upscaler', UPSCALERS),
                  _('FSR 1 amplia com bordas nítidas (acima de 1080p).', 'FSR 1 upscales with sharp edges (above 1080p).'))
         self.row(f, _('Nitidez (RCAS)', 'Sharpening (RCAS)'), self.choice(f, 'sharpness', SHARPNESS))
+        self.check(f, 'frame_gen', _('Geração de quadros FSR 3 (experimental)', 'FSR 3 frame generation (experimental)'),
+                   _('Cria um quadro intermediário entre cada par de quadros do jogo: no modo 30 FPS a tela mostra 60. '
+                     'Custa ~1 ms de GPU por quadro gerado e não tira FPS do jogo. Melhor com "60 FPS" desligado. '
+                     'Usa VSync (FIFO) e ignora a opção Apresentação. Ainda sem os vetores de movimento do jogo: '
+                     'bordas de objetos rápidos, HUD e legendas podem tremer. Monitores de 120 Hz ou com G-Sync/FreeSync '
+                     'ficam mais lisos.',
+                     'Creates an in-between frame for each pair of game frames: in 30 FPS mode the screen shows 60. '
+                     'Costs ~1 ms of GPU per generated frame and takes no FPS from the game. Best with "60 FPS" off. '
+                     'Uses VSync (FIFO) and ignores the Presentation option. No game motion vectors yet: edges of '
+                     'fast objects, the HUD and subtitles may shimmer. 120 Hz or G-Sync/FreeSync monitors look smoother.'))
         self.section(f, _('Modo PS4 Pro', 'PS4 Pro mode'))
         self.check(f, 'neo', _('Apresentar-se como PS4 Pro', 'Present as a PS4 Pro'),
                    _('O jogo passa a oferecer, no menu Opções > Apresentação, o Modo Grafismo do PS4 Pro: '

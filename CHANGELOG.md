@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.66-cp-mt — 2026-10-18
+- **Geração de quadros FSR 3 (experimental):** nova opção no lançador (Gráficos > Resolução,
+  "Geração de quadros FSR 3"; ou `SOTC_FG=1`). Cria um quadro intermediário entre cada par de
+  quadros do jogo com a interpolação FSR 3.1.6 (fsr-vulkan, MIT): no modo 30 FPS a tela passa a
+  mostrar **60 quadros por segundo**. Os quadros vão para a tela por uma thread própria
+  (`shadPS4:FramePacer`), fora da thread de desenho. Santuário (RTX 5060 Ti): o jogo continua em
+  30,0 FPS, 30 quadros gerados por segundo, ~1,1 ms de GPU cada; com "60 FPS" ligado o jogo fica
+  igual (46,5 → 46,3) e ~35 quadros por segundo são gerados. Força VSync (FIFO). Ainda sem os
+  vetores de movimento do jogo: bordas de objetos rápidos, HUD e legendas podem tremer. Precisa
+  de Vulkan com `VK_KHR_present_wait` e `VK_KHR_compute_shader_derivatives` (NVIDIA RTX recente,
+  AMD RDNA); sem eles o jogo roda como antes. `SOTC_FG_DEBUG=gen` mostra só os quadros gerados.
+  Detalhes em `docs/sotc/FRAMEGEN.md`; licenças em `licenses/`.
+
 ## 0.65-cp-mt — 2026-10-18
 - **+4% de FPS: janela de readback menor** (`SOTC_RB_NARROW`, padrão 64 KiB). Quando o jogo lê um
   dado que a GPU escreveu, o motor baixava e desprotegia 512 KiB em volta; depois a GPU protegia

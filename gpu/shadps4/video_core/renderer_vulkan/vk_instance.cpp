@@ -446,7 +446,10 @@ bool Instance::CreateDevice() {
         // The embedded SPIR-V is the wave32 permutation. NVIDIA always runs 32 wide; devices
         // with a wider range (AMD wave64, Intel SIMD16) must be able to require 32 for compute.
         const bool fixed32 = vk13_props.minSubgroupSize == 32 && vk13_props.maxSubgroupSize == 32;
-        const bool pin32 = !fixed32 && vk13_features.subgroupSizeControl &&
+        // vk13_features is only filled further down: read the queried chain.
+        const bool size_control =
+            feature_chain.get<vk::PhysicalDeviceVulkan13Features>().subgroupSizeControl;
+        const bool pin32 = !fixed32 && size_control &&
                            (vk13_props.requiredSubgroupSizeStages &
                             vk::ShaderStageFlagBits::eCompute) &&
                            vk13_props.minSubgroupSize <= 32 && vk13_props.maxSubgroupSize >= 32;

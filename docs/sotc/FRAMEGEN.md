@@ -110,12 +110,76 @@ mesmas extensões e recursos, e nenhum código do FSR é chamado.
 - **Teste** sem jogo: `ninja -C out/gpu frame-pacer-test && out/gpu/frame-pacer-test.exe` confere a estimativa
   de refresh e a trava do vblank (`tests/test_frame_pacer.cpp`).
 
+### Fase 3 (interpolação FSR 3.1.6 só com optical flow, entradas neutras)
+
+- **Novo `video_core/renderer_vulkan/host_passes/fg_pass.{h,cpp}`** (`HostPasses::FgPass`), criado pelo pacer
+  quando `SOTC_FG=1`, o device passa em `FrameGenSupported()` e não é `passthrough`. Grava
+  `RecordPrepare` (optical flow + preparação do FI) e `RecordDispatch` (o quadro gerado) da ponte 3.1.6 nos
+  command buffers **do `present_scheduler`, na thread do pacer** (command buffers reais; nunca na GpuDraw, cujo
+  recorder usa handles falsos), num submit próprio que espera o `ready_tick` do quadro real.
+- **Imagens**:
+  - os `Frame` do pool passam a ser `R8G8B8A8_UNORM` quando o FG pode rodar (`fg_frames`), e o pp pass é
+    criado nesse formato. O FI lê o `frame->image` **direto** (importado com `SAMPLED|TRANSFER_SRC`, em
+    `General`, que é onde o pp pass deixa o quadro); não há anel de cópias. O blit para a swapchain BGRA já
+    converte. Com `SOTC_FG` desligado o formato continua o da surface;
+  - próprias do FG: 2 saídas RGBA8 no tamanho do quadro (`SAMPLED|STORAGE|TRANSFER_SRC`, alternadas: a gerada
+    de N fica válida até o N+2), uma profundidade `R32_SFLOAT` constante (0,5) e um MV `R16G16_SFLOAT` zerado,
+    no tamanho de render (≤ 1920 de largura), limpos uma vez a cada (re)criação.
+- **Parâmetros neutros** (todos finitos e positivos, como a ponte exige): `cameraNear 0,1`, `cameraFar 10000`,
+  `FOV 1,0`, `viewSpaceToMeters 1`, câmera na origem com up (0,1,0), right (1,0,0), forward (0,0,−1), escala de
+  MV = tamanho de render, jitter 0 (o perfil fixo do 3.1.6 não tem jitter), transferência sRGB, luminância 0-1,
+  `frameTimeMilliseconds` = EMA `D`.
+- **Contexto**: criado no primeiro quadro e recriado quando o tamanho de saída muda (as extensões são fixas).
+  Antes de criar, `ffxVkSotcSetRequiredSubgroupSize(instance.FrameGenSubgroupSize())`. Uma linha no log a
+  cada criação, com `ContextGetMemoryUsage`:
+  `Frame generation (SOTC_FG): FSR 3.1.6 frame interpolation 1920x1080 (neutral depth and motion 1920x1080),
+  FI/OF memory 95.9 MiB + own images 31.6 MiB, subgroup 0, timestamps true` (valores esperados na RTX 5060 Ti a 1080p).
+- **Ordem no pacer** (por quadro real N): `Generate(N)` → present do gerado N−1→N logo em seguida → espera
+  `D/2 − P/2` → present do real N. Ou seja, as duas cópias do passthrough da Fase 2 viram gerado + real.
+  `RetireFrame(id)` só depois que o tick do submit terminou (lido sem bloquear no `Generate` seguinte).
+- **Sem gerar (só o real, e a história recomeça com `reset`)**: primeiro quadro; quadro em branco; intervalo
+  ≥ 100 ms ou > 2×EMA (carregamento, compilação de shader); HDR ligado (`frame->is_hdr`, o perfil do 3.1.6 é
+  sRGB); mudança de tamanho; `D < SOTC_FG_MIN_RATIO × P` (sem lugar para duas apresentações; ex. 60 FPS reais em
+  60 Hz); e depois de um `late` (o real seguinte chegou antes do real atual ir para a tela: o real atual é
+  mostrado na hora e o próximo não ganha gerado, para a fila não atrasar). O detector de corte de cena do
+  próprio OF cobre cortes de câmera. Se uma chamada da ponte falhar, o FG desliga na sessão (log de erro) e só
+  os reais são mostrados.
+- **Sincronização**: depois do FI, uma barreira de memória compute/transfer → all commands no mesmo command
+  buffer. Ela ordena as leituras do quadro real (e a cópia para o histórico do FI) antes da transição de layout
+  do present e antes de a GpuDraw reescrever o quadro (mesma fila, submit posterior); o present do gerado espera
+  o semáforo do submit do FI.
+- **Tempo de GPU**: 2 timestamps por interpolação (query pool próprio, lidos sem esperar quando o submit já
+  terminou), se a fila tiver `timestampComputeAndGraphics`.
+- **Estatística**: a linha `SOTC FG pacer` (com `SOTC_FPS=1`) ganha no fim
+  `; FG generated X/s, interpolations X/s (new history N), fi gpu avg X max X ms`. `generated` = gerados que
+  foram para a tela; `new history` = interpolações que recomeçaram a história (não mostram nada). A linha
+  `SOTC FPS` não muda (continua contando só quadros reais).
+- **`SOTC_FG_DEBUG=gen`**: cada gerado é apresentado duas vezes e nenhum real (para inspecionar o FI; capturas
+  da janela só mostram gerados).
+- **`fg-bench` corrigido e com verificação de movimento**: o bench antigo limpava a imagem de MV com
+  (0, 1, 0, 1), ou seja, um MV de uma tela inteira na vertical, e o "gerado" saía como o quadro atual
+  deslocado meia tela. Isso fazia parecer que o FI não interpolava. Agora o bench usa as entradas neutras do
+  port (MV 0, profundidade 0,5, quadro em `General`, mesmos usos de imagem) e quadros reais de verdade: uma
+  barra com textura andando 32 px por quadro sobre ruído estático. No último gerado a barra tem que estar no
+  meio do caminho entre os dois reais. Resultado na RTX 5060 Ti:
+
+  | Saída | Barra anterior / atual / gerada | GPU p50 | GPU p95 | Memória FI/OF |
+  |---|---|---|---|---|
+  | 1920x1080 | 799,5 / 831,5 / 813,0 (meio 815,5) | 1,09 ms | 1,10 ms | 96 MiB |
+  | 2560x1440 | 1119,5 / 1151,5 / 1136,5 (meio 1135,5) | 1,6-4,2 ms | 2,1-7,9 ms | 112 MiB |
+  | 3840x2160 | 1759,5 / 1791,5 / 1779,0 (meio 1775,5) | 3,1-4,0 ms | 3,8-9,4 ms | 160 MiB |
+
+  Ou seja: **o optical flow interpola de verdade com entradas neutras**. A 1080p (saída padrão do jogo) o custo
+  é ~1,1 ms. Acima de 1080p o tempo ficou bem maior e instável com conteúdo real (antes, com imagens limpas,
+  era 1,2-1,6 ms); pode ser a upload de 16-33 MB por quadro do próprio bench disputando a GPU/clocks, mas não
+  foi isolado. Conferir a linha `fi gpu` no jogo com `SOTC_OUTPUT_RES`.
+
 ## Variáveis
 
 | Variável | Valores (padrão) | Efeito hoje |
 |---|---|---|
-| `SOTC_FG` | 0/1 (0) | Com 1: confere e liga os recursos de device do FG e escreve a linha no log. Com present_wait, os quadros passam pelo pacer (FIFO, 1 present por real). Ainda não gera quadros. |
-| `SOTC_FG_DEBUG` | passthrough (vazio) | `passthrough`: cada real é apresentado duas vezes, a 2ª meio intervalo depois. |
+| `SOTC_FG` | 0/1 (0) | Com 1: confere e liga os recursos de device do FG e escreve a linha no log. Com present_wait, os quadros passam pelo pacer (FIFO). Se o device suporta o FI, gera 1 quadro interpolado (FSR 3.1.6, só optical flow) entre cada par de reais; senão, 1 present por real. |
+| `SOTC_FG_DEBUG` | passthrough / gen (vazio) | `passthrough`: sem FI, cada real é apresentado duas vezes, a 2ª meio intervalo depois. `gen`: cada gerado duas vezes e nenhum real (inspeção). |
 | `SOTC_FG_MIN_RATIO` | número (1.9) | Mínimo de refreshes por intervalo real para fazer a 2ª apresentação. |
 | `SOTC_FG_VBLANK_LOCK` | 0/1 (1) | Prende o vblank do guest a um múltiplo do refresh medido quando ficam a < 0,5%. |
 
@@ -152,12 +216,54 @@ fps60) é o alvo principal.
 7. PresentMon (opcional): ~2× presents em passthrough; `MsBetweenDisplayChange` alternando 13,9/20,8 ms
    em 144 Hz.
 
+### Fase 3 (interpolação)
+
+Sempre `SOTC_FPS=1`, modo padrão (30 FPS) primeiro. Com `SOTC_FG=1` (sem `SOTC_FG_DEBUG`) o FI já está
+ligado.
+
+1. **Log**: `Frame pacer (SOTC_FG): frame interpolation (optical flow, neutral depth and motion), ...` e, no
+   primeiro quadro do jogo, `Frame generation (SOTC_FG): FSR 3.1.6 frame interpolation WxH ..., FI/OF memory
+   X MiB + own images Y MiB, subgroup 0, timestamps true`. Nenhum `interpolation failed` / `context ... failed`.
+2. **Linha `SOTC FG pacer`** no Santuário/attract a 30 FPS em 144 Hz: `real` ≈ 30, `presents` ≈ 60,
+   `second` ≈ 30, `FG generated` ≈ 30/s, `interpolations` ≈ 30/s, `new history` só em carregamentos/cortes,
+   `fi gpu avg` ~1-1,5 ms a 1080p, `late`/`ratio`/`dropped` ~0, `present lock max` < 1 ms.
+3. **FPS real**: `SOTC FPS` no ruído (±3%) de `SOTC_FG=0 BB_PRESENT_MODE=Fifo`. Se cair mais, a causa provável é
+   a fila única (o FI na frente dos readbacks da GpuDraw): anotar e partir para a fila compute (6a).
+4. **Imagem**: tem que parecer 60 fps, sem cores trocadas (BGRA/RGBA), sem tela preta/piscando, sem meia tela
+   deslocada. Pan de câmera, Agro galopando, escalada. Artefatos esperados: bordas de objetos em movimento e o
+   HUD (medidor, legendas) "arrastando", porque o MV é zero e o HUD está queimado na imagem.
+5. **`SOTC_FG_DEBUG=gen`**: só gerados na tela (cada um duas vezes). Bom para ver os artefatos do FI isolados e
+   para capturas (`shot_garbage.ps1`).
+6. **fps60** (secundário, VRR): `SOTC_MODES=…,fps60` em 144 Hz: `FG generated` ≈ `real`. Em 60 Hz fixo o FI se
+   desliga sozinho (`ratio` sobe, `interpolations` 0).
+7. **Robustez**: os mesmos testes da Fase 2 (redimensionar, minimizar, tela cheia, diálogo de save,
+   carregar). Mudar `SOTC_OUTPUT_RES` recria o contexto (1 linha nova no log). `port_soak.ps1` 10 min: memória
+   estável (prova o `RetireFrame`).
+8. **Sem jogo**: `ninja -C out/gpu fg-bench && out/gpu/fg-bench.exe` tem que imprimir `interpolated` nas três
+   saídas e terminar com código 0.
+
 ## Pendências e riscos
 
-- **Fase 2 não foi rodada com o jogo** (regra: só o dono roda). O build liga e o `frame-pacer-test` passa.
+- **Fases 2 e 3 não foram rodadas com o jogo** (regra: só o dono roda). O build liga, o `frame-pacer-test`
+  passa e o `fg-bench` mostra a interpolação funcionando com as entradas neutras do port.
+- **Qualidade só com optical flow é desconhecida no jogo**: com MV zero o FI ainda monta o campo de vetores do
+  "jogo" (tudo parado) e escolhe, pixel a pixel, entre ele e o OF pela similaridade de cor. No bench a barra
+  sai no meio do caminho; em cena real (folhagem, pelo do colosso, partículas, HUD) pode haver "ghosting".
+  É o 0.D da revisão: o dono avalia; se ficar ruim, a Fase 4 (MV/profundidade do jogo) é que resolve.
+- **Custo acima de 1080p**: no bench o FI a 1440p/4K deu 1,6-4 ms (p95 até 9 ms, variando muito entre execuções) com conteúdo real; a 1080p,
+  1,1 ms. Pode ser artefato do bench (upload grande por quadro), mas se a linha `fi gpu` no jogo com
+  `SOTC_OUTPUT_RES` alto confirmar, limitar o FG a ≤ 1440p.
+- **Fila única**: o FI (≈1 ms × 30/s) entra na mesma VkQueue dos readbacks da GpuDraw. A 30 FPS sobra GPU e
+  tempo, mas medir o `SOTC FPS` (passo 3 acima).
+- **Latência**: em 30 → 60 o real N vai para a tela ~D/2 = 16,7 ms depois de chegar (o gerado vai antes), mais
+  o FI (~1 ms) e o FIFO. Total esperado +20-35 ms em relação ao Mailbox padrão.
+- **HDR** desliga o FI (só reais) enquanto estiver ligado; os `Frame` ficam RGBA8 com FG (como já eram 8 bits
+  no formato da surface, não há perda nova).
+- **CPU de gravação** ~1,3-2,2 ms por quadro real (bench), na thread do pacer, que dorme o resto do tempo.
+  Não afeta a GpuDraw, mas é a ponte criando/destruindo descriptor sets por pass.
 - **VRR**: não é detectado. Com G-Sync a cópia 2 aparece meio refresh antes do meio do intervalo (o "−P/2"
   só vale com refresh fixo), e a estimativa de `P` vira o intervalo de present (a trava do vblank não liga,
-  pela guarda de 1%). Fase 3: detectar VRR (intervalos que não são múltiplos) e mirar `D/2` direto.
+  pela guarda de 1%). Ainda pendente (Fase 3 também não faz): detectar VRR (intervalos que não são múltiplos) e mirar `D/2` direto.
 - **Precisão do sono**: a espera da cópia 2 é `condition_variable::wait_until` (≈1 ms com o `timeBeginPeriod(1)`
   do `probe.c`). Basta para FIFO (o present é submetido meio refresh antes); se o `pace err` pedir, trocar por
   `CreateWaitableTimerExW(HIGH_RESOLUTION)`.
@@ -173,17 +279,14 @@ fps60) é o alvo principal.
 - O pacer só faz present quando chega quadro (ou pedido de quadro em branco); com o guest pausado
   (`IsGuestThreadsPaused`, depurador) a tela fica parada, e o `BbOverlay` só atualiza com quadros novos (o
   jogo continua dando flip com o diálogo de save aberto, mas conferir).
-- **Ainda não gera quadros**: o `bb-probe.exe` não referencia o FSR, então o linker não puxa os objetos (o
-  `fg-bench` prova que o fechamento inteiro liga com CLANG64). A Fase 3 (FI só com optical flow, 30 → 60
-  primeiro) entra nas duas cópias do passthrough: cópia 1 = gerada N-1→N, cópia 2 = real N.
-- **Exports**: o SDK 2.3 marca `ffxCreateContext` etc. com `__declspec(dllexport)` no Windows, então quando o
-  código for puxado esses símbolos vão aparecer como exports do `bb-probe.exe`. Inofensivo, mas impede a ThinLTO
-  de internalizá-los. Não testei LTO/PGO com o FSR referenciado (build deste worktree é `BB_LTO=OFF`, `BB_PGO=off`).
-- **Validação**: sem a camada de validação instalada, nenhum teste do FSR rodou com validação. Instalar o
-  Vulkan SDK (ou `mingw-w64-clang-x86_64-vulkan-validation-layers`) antes da Fase 3.
-- **CPU de gravação ~1 ms por quadro real** na thread que gravar o FG (pacer). Aceitável para 30 → 60;
-  boa parte deve ser criação de descriptor sets por pass (a ponte ainda cria e destrói descriptor sets por
-  quadro). Medir de novo na Fase 3.
+- **Exports**: o SDK 2.3 marca `ffxCreateContext` etc. com `__declspec(dllexport)` no Windows; agora que o
+  `bb-probe.exe` usa o FI (Fase 3), esses símbolos são exports do exe. Inofensivo, mas impede a ThinLTO de
+  internalizá-los. Não testei LTO/PGO com o FSR referenciado (build deste worktree é `BB_LTO=OFF`, `BB_PGO=off`).
+- **Validação**: sem a camada de validação instalada, nem o FSR nem o pacer/FI rodaram com validação. Instalar
+  o Vulkan SDK (ou `mingw-w64-clang-x86_64-vulkan-validation-layers`) e rodar uma vez com `BB_VK_VALIDATION=1
+  SOTC_FG=1` (procurar erros de layout/sincronização nas imagens "FG output", "Frame image #").
+- **Sem `SOTC_FG_DEBUG=tint`** (o plano citava): o `gen` já serve para inspecionar. Sem `SOTC_FG_INPUTS`: só
+  existe `flow` até a Fase 4.
 - **AMD**: o pin de subgroup 32 está implementado mas não foi testado em AMD.
 - **Créditos no pacote** (LICENSE/NOTICE do fsr-vulkan e avisos MIT da AMD) ficam para quando o recurso for
   entregue (Fase 6). Não chamar de "FSR 3"/"FSR4" no launcher.

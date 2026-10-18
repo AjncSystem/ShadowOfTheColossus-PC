@@ -137,6 +137,9 @@ void ComputePipeline::CreatePipeline() {
 }
 
 void ComputePipeline::Build() {
+    if (claimed.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
     CreatePipeline();
     ready.store(true, std::memory_order_release);
     ready.notify_all();
@@ -150,6 +153,10 @@ void ComputePipeline::BindWhenReady() const {
     scheduler.RecordDeferred([this](vk::CommandBuffer cmdbuf) {
         if (!ready.load(std::memory_order_acquire)) {
             const auto start = std::chrono::steady_clock::now();
+            if (!claimed.load(std::memory_order_acquire)) {
+                const_cast<ComputePipeline*>(this)->Build();
+                SotcStats::async_compute_self_built.fetch_add(1, std::memory_order_relaxed);
+            }
             ready.wait(false, std::memory_order_acquire);
             SotcStats::async_compute_wait_ns.fetch_add(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(

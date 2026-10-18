@@ -602,6 +602,11 @@ void PipelineCache::RunAsyncTranslate(AsyncPipelineJob::Translate& t) {
         auto new_info = Shader::Info(t.hw_stage, t.sw_stage, params);
         t.module = CompileModule(new_info, runtime_info, params.code, t.perm_idx, binding,
                                  &worker_pools, &t.spv);
+        // The command processor made spec from the tables of its draw; the module was made from
+        // what the tables hold now. Different: installing it under spec would bind wrong code.
+        const Shader::StageSpecialization worker_spec{new_info, t.runtime_info, profile,
+                                                      t.start};
+        t.stale = !(worker_spec == *t.spec);
     }
     SotcStats::async_translate_built.fetch_add(1, std::memory_order_relaxed);
     SotcStats::async_translate_ns.fetch_add(
@@ -634,6 +639,12 @@ void PipelineCache::InstallTranslation(AsyncPipelineJob::Translate& t) {
     if (const auto pending = std::ranges::find(program.pending_specs, *t.spec);
         pending != program.pending_specs.end()) {
         program.pending_specs.erase(pending);
+    }
+    if (t.stale) {
+        SotcStats::async_translate_stale.fetch_add(1, std::memory_order_relaxed);
+        program.translate_in_place = true;
+        instance.GetDevice().destroyShaderModule(t.module);
+        return;
     }
     if (std::ranges::find(program.modules, *t.spec, &Program::Module::spec) !=
         program.modules.end()) {
@@ -1115,7 +1126,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     vk::ShaderModule module{};
 
     const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
-    if (it == program->modules.end() && async_ok) {
+    if (it == program->modules.end() && async_ok && !program->translate_in_place) {
         if (std::ranges::find(program->pending_specs, spec) == program->pending_specs.end()) {
             QueueAsyncTranslate(hw_stage, sw_stage, params, rt, binding, program.get(), &spec,
                                 perm_idx);

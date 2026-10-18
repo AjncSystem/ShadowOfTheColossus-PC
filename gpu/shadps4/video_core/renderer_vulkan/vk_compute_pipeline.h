@@ -55,7 +55,10 @@ public:
                     bool deferred = false);
     ~ComputePipeline();
 
-    /// sotc: makes the pipeline of a deferred construction (pipeline worker).
+    /// sotc: makes the pipeline of a deferred construction, unless another thread claimed it
+    /// first (pipeline worker, or the recording thread when it needs it before any worker
+    /// started it: workers may be waiting for GPU work queued behind that bind, since shader
+    /// translation reads guest memory on them).
     void Build();
 
     /// sotc: binds the pipeline in the current command buffer. A deferred pipeline still being
@@ -70,6 +73,7 @@ private:
     vk::PipelineCache cache;
     vk::ShaderModule module;
     std::atomic<bool> ready{true};
+    std::atomic<bool> claimed{false};
 };
 
 } // namespace Vulkan

@@ -57,6 +57,9 @@ struct Program {
     ModuleList modules{};
     /// sotc: permutations being translated by a pipeline worker (SOTC_ASYNC_TRANSLATE).
     std::vector<Shader::StageSpecialization> pending_specs;
+    /// sotc: a worker read other tables than the draw that asked (the game reused them before
+    /// the worker ran): this program's later permutations are translated in place.
+    bool translate_in_place{};
 
     Program() = default;
     Program(Shader::HwStage stage, Shader::SwStage l_stage, Shader::ShaderParams params)
@@ -174,6 +177,7 @@ private:
             std::unique_ptr<Program> new_program;
             vk::ShaderModule module{};
             std::vector<u32> spv;
+            bool stale{}; ///< the worker's specialization differs from spec (permutation)
         };
         std::unique_ptr<Translate> translate; ///< a translation job
     };

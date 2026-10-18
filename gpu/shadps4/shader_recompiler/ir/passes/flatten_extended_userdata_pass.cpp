@@ -901,6 +901,12 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
     }
 
     std::scoped_lock lock{g_srt_codegen_mutex};
+    struct LabelReset {
+        PassInfo& pass_info;
+        ~LabelReset() {
+            pass_info.clean_load_stub.reset();
+        }
+    } label_reset{pass_info}; // destroyed before the lock (declared after it)
     EnsureSrtWalkerFaultHandler();
     // A walker is at most a few hundred KB; without that much room left, skip it (the shader
     // then reads zeros from its flattened user data) rather than overflow the buffer.
@@ -941,7 +947,6 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
     }
 
     info.srt_info.flattened_bufsize_dw = pass_info.dst_off_dw;
-    pass_info.clean_load_stub.reset();
 }
 
 static bool IsReadConstSource(const IR::Value base) {

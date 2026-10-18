@@ -178,6 +178,7 @@ private:
             vk::ShaderModule module{};
             std::vector<u32> spv;
             bool stale{}; ///< the worker's specialization differs from spec (permutation)
+            bool failed{}; ///< translation asserted (tables reused by the game meanwhile)
         };
         std::unique_ptr<Translate> translate; ///< a translation job
     };
@@ -188,6 +189,9 @@ private:
                              const Shader::Backend::Bindings& start, Program* program,
                              const Shader::StageSpecialization* spec, size_t perm_idx);
     void RunAsyncTranslate(AsyncPipelineJob::Translate& job);
+    void TranslateOnWorker(AsyncPipelineJob::Translate& job, const Shader::ShaderParams& params,
+                           Shader::Backend::Bindings& binding, Shader::RuntimeInfo& runtime_info,
+                           Shader::Pools& worker_pools);
     void InstallTranslation(AsyncPipelineJob::Translate& job);
     void CollectAsyncPipelines();
     void AsyncPipelineWorker(std::stop_token token);
@@ -229,6 +233,7 @@ private:
     size_t async_compute_queued{}; ///< compute jobs at the head of async_queue, oldest first
     size_t async_translate_queued{}; ///< translation jobs right after them, oldest first
     std::unordered_set<u64> pending_programs; ///< new programs being translated (CP only)
+    std::unordered_set<u64> in_place_programs; ///< failed on a worker: translated here (CP only)
     bool async_translate_ok{};  ///< this draw may queue its translations (CP only)
     bool translation_pending{}; ///< a stage of this draw is being translated (CP only)
     std::vector<std::unique_ptr<AsyncPipelineJob>> async_done;

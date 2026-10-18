@@ -57,6 +57,9 @@ public:
     bool IsDirectMemoryAccessEnabled() { static const auto value = Flag("BB_DIRECT_MEMORY_ACCESS", true); return value; }
     bool IsDumpShaders() { static const auto value = Flag("BB_DUMP_SHADERS", false); return value; }
     bool IsFsrEnabled() { static const auto value = Flag("BB_FSR1", false); return value; }
+    // sotc: frame generation (FSR 3.1.6 frame interpolation, docs/sotc/FRAMEGEN.md). Off: the
+    // device is created and frames are presented exactly as without it.
+    bool IsFrameGenEnabled() { static const auto value = Flag("SOTC_FG", false); return value; }
     bool IsHdrAllowed() { static const auto value = Flag("BB_HDR", false); return value; }
     bool IsNullGPU() { static const auto value = Flag("BB_NULL_GPU", false); return value; }
     bool IsPatchShaders() { return false; }

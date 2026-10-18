@@ -250,6 +250,25 @@ public:
                (vk13_props.requiredSubgroupSizeStages & vk::ShaderStageFlagBits::eCompute);
     }
 
+    /// sotc: frame generation (SOTC_FG) can run on this device: the FSR 3.1.6 shaders need
+    /// VK_KHR_compute_shader_derivatives (linear groups), storage images without format, and
+    /// quad/arithmetic subgroup operations in compute, run 32 wide. Always false with SOTC_FG off.
+    bool FrameGenSupported() const {
+        return frame_gen_supported;
+    }
+
+    /// sotc: required compute subgroup size for the frame generation pipelines (0 = the device
+    /// already runs compute 32 wide).
+    u32 FrameGenSubgroupSize() const {
+        return frame_gen_subgroup_size;
+    }
+
+    /// sotc: VK_KHR_present_id + VK_KHR_present_wait enabled (only with SOTC_FG), so a present
+    /// can be waited for outside Scheduler::submit_mutex.
+    bool IsPresentWaitSupported() const {
+        return present_wait;
+    }
+
     /// sotc: whether a required subgroup size may be given for this stage.
     bool CanRequireSubgroupSize(vk::ShaderStageFlagBits stage) const {
         return bool(vk13_props.requiredSubgroupSizeStages & stage);
@@ -568,6 +587,9 @@ private:
     bool device_fault{};
     bool device_fault_vendor_binary{};
     bool supports_block_texel_view{};
+    bool frame_gen_supported{};    // sotc
+    u32 frame_gen_subgroup_size{}; // sotc
+    bool present_wait{};           // sotc
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;
 };

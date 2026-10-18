@@ -142,6 +142,9 @@ def main():
     # A complete update (shadPS4's <game>-UPDATE): the image comes from its eboot, and its files
     # take the place of the base game's while the game runs (src/runtime_file.c).
     update = game_update(game)
+    for folder in (game, update):
+        if folder and (folder / 'eboot.bin').is_file() and (folder / 'eboot.bin').stat().st_size == 0:
+            fail(f'{folder / "eboot.bin"} is empty (0 bytes): the copy was interrupted. Copy the file again.')
     source = game
     if update:
         print(f'Game update: {update}')

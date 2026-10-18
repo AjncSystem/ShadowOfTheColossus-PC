@@ -41,6 +41,18 @@ inline std::atomic<uint64_t> fault_writes{0};       ///< guest write faults on t
 inline std::atomic<uint64_t> fault_walker{0};       ///< SRT walker loads emulated after a fault
 inline std::atomic<uint64_t> fault_gpu_reads{0};    ///< other read faults on the command processor
 inline std::atomic<uint64_t> commands{0}; ///< draws and dispatches recorded (monotonic, CP only)
+/// Command processor waits for the draw thread (Liverpool::IsBackThreaded).
+inline std::atomic<uint64_t> cp_waits{0};
+/// Busy time of the two command processor threads (SOTC_FPS): the draw thread minus the time it
+/// waits for work, the parser as the time inside the command buffer coroutines (not the polling
+/// loop around them, which spins while a queue waits).
+inline std::atomic<uint64_t> draw_idle_ns{0};
+inline std::atomic<uint64_t> cp_parse_ns{0};
+inline uint64_t NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
 /// Change of a monotonic single-writer counter since the last call (`seen` keeps the last value).
 inline uint64_t TakeDelta(const std::atomic<uint64_t>& counter, uint64_t& seen) {
     const uint64_t now = counter.load(std::memory_order_relaxed);
@@ -69,6 +81,8 @@ inline std::atomic<uint64_t> async_compute_built{0};
 inline std::atomic<uint64_t> async_compute_build_ns{0}; ///< worker time building them
 inline std::atomic<uint64_t> async_compute_waits{0};    ///< binds the recording thread waited for
 inline std::atomic<uint64_t> async_compute_wait_ns{0};
+/// sotc: SRT walker loads that faulted (null or unmapped table pointer) and read zero, total.
+inline std::atomic<uint64_t> srt_walker_faults{0};
 inline std::atomic<uint64_t> image_bytes{0};    ///< live texture cache and host pass images
 inline std::atomic<uint64_t> image_count{0};
 inline std::atomic<uint64_t> gc_freed{0};       ///< images freed by the texture garbage collector

@@ -462,8 +462,9 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         }
 
         // Size is greater but resources are not, because the tiling mode is different.
-        // Likely the address is reused for a image with a different tiling mode.
-        if (image_info.tile_mode != cache_image.info.tile_mode) {
+        // Likely the address is reused for a image with a different tiling mode or alternate tiling.
+        if (image_info.tile_mode != cache_image.info.tile_mode ||
+            image_info.alt_tile != cache_image.info.alt_tile) {
             if (safe_to_delete) {
                 FreeImage(cache_image_id);
             }
@@ -921,6 +922,10 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 
     // If there is a stencil attachment, link depth and stencil.
     if (desc.info.stencil_addr != 0) {
+        // sotc: the lookup and RegisterImage need `mutex` like FindImage (only depth when the
+        // caller's batch hold already has it; SOTC_TC_BATCH=0 has none).
+        std::unique_lock lk{mutex, std::defer_lock};
+        LockCounted(lk);
         ImageId stencil_id{};
         ForEachImageInRegion(desc.info.stencil_addr, desc.info.stencil_size,
                              [&](ImageId image_id, Image& image) {

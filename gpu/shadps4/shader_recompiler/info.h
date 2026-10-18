@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <span>
 #include <vector>
 #include <boost/container/static_vector.hpp>
@@ -24,6 +25,19 @@ struct Archive;
 }
 
 namespace Shader {
+
+/// sotc: which copy of the per-draw shader data (InfoRuntime) this thread uses. The command
+/// processor fills copy 0 when it resolves a pipeline; with SOTC_CP_THREADS the draw thread
+/// (liverpool.h) binds the draw from copy 1, which it fills from what the command processor
+/// captured, so the command processor can resolve the next draws meanwhile.
+inline thread_local u32 g_info_slot = 0;
+
+/// sotc: the per-draw part of Info (changes with every draw of the same shader).
+struct InfoRuntime {
+    std::span<const u32> user_data;
+    std::vector<u32> flattened_ud_buf;
+    VAddr pgm_base{};
+};
 
 enum class Qualifier : u8 {
     None,
@@ -101,8 +115,7 @@ struct Info : InfoPersistent {
         Qualifier auxiliary;
     };
 
-    std::span<const u32> user_data;
-    std::vector<u32> flattened_ud_buf;
+    std::array<InfoRuntime, 2> runtime{}; // sotc: see g_info_slot
     PersistentSrtInfo srt_info;
 
     AttributeFlags loads{};
@@ -112,7 +125,6 @@ struct Info : InfoPersistent {
     CopyShaderData gs_copy_data;
     u32 uses_patches{};
 
-    VAddr pgm_base;
     bool has_storage_images{};
     bool has_discard{};
     bool has_image_gather{};
@@ -140,17 +152,39 @@ struct Info : InfoPersistent {
 
     Info() = default;
     Info(HwStage stage_, SwStage l_stage_, ShaderParams params)
-        : InfoPersistent(stage_, l_stage_, params.hash), pgm_base{params.Base()},
-          user_data{params.user_data} {}
+        : InfoPersistent(stage_, l_stage_, params.hash) {
+        PgmBase() = params.Base();
+        UserData() = params.user_data;
+    }
+
+    std::span<const u32>& UserData() noexcept {
+        return runtime[g_info_slot].user_data;
+    }
+    const std::span<const u32>& UserData() const noexcept {
+        return runtime[g_info_slot].user_data;
+    }
+    std::vector<u32>& FlatBuf() noexcept {
+        return runtime[g_info_slot].flattened_ud_buf;
+    }
+    const std::vector<u32>& FlatBuf() const noexcept {
+        return runtime[g_info_slot].flattened_ud_buf;
+    }
+    VAddr& PgmBase() noexcept {
+        return runtime[g_info_slot].pgm_base;
+    }
+    VAddr PgmBase() const noexcept {
+        return runtime[g_info_slot].pgm_base;
+    }
 
     template <typename T>
     inline T ReadUdSharp(u32 sharp_idx) const noexcept {
-        return *reinterpret_cast<const T*>(&flattened_ud_buf[sharp_idx]);
+        return *reinterpret_cast<const T*>(&FlatBuf()[sharp_idx]);
     }
 
     template <typename T>
     T ReadUdReg(u32 ptr_index, u32 dword_offset) const noexcept {
         T data;
+        const auto& user_data = UserData();
         const u32* base = user_data.data();
         if (ptr_index != IR::NumScalarRegs) {
             std::memcpy(&base, &user_data[ptr_index], sizeof(base));
@@ -170,6 +204,8 @@ struct Info : InfoPersistent {
     }
 
     void RefreshFlatBuf() {
+        const auto& user_data = UserData();
+        auto& flattened_ud_buf = FlatBuf();
         flattened_ud_buf.resize(srt_info.flattened_bufsize_dw);
         ASSERT(user_data.size() <= NUM_USER_DATA_REGS);
         std::memcpy(flattened_ud_buf.data(), user_data.data(), user_data.size_bytes());

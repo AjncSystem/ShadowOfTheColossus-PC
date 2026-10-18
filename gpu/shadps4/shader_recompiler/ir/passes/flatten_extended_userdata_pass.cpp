@@ -26,6 +26,7 @@
 #include "shader_recompiler/ir/reg.h"
 #include "shader_recompiler/ir/srt_gvn_table.h"
 #include "shader_recompiler/ir/value.h"
+#include "video_core/sotc_stats.h"
 
 #ifdef ARCH_X86_64
 
@@ -190,7 +191,11 @@ bool SrtWalkerSignalHandler(void* context, void* fault_address) {
         return false; // Not in SRT code range
     }
 
-    // Patch instruction to zero register
+    // sotc: the load reads zero, this time only. Upstream patched the instruction to zero the
+    // register for good, which broke the shader for the rest of the session when its SRT
+    // pointer was only null for a while (a table the command processor read before it was
+    // written, with the draw thread) and went into the pipeline cache with the walker code,
+    // so every later session rendered with it (black frames at the Shrine of Worship).
     ZydisDecodedInstruction instruction;
     ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
     ZyanStatus status = Common::Decoder::Instance()->decodeInstruction(instruction, operands,
@@ -200,36 +205,27 @@ bool SrtWalkerSignalHandler(void* context, void* fault_address) {
            operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
            operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY);
 
-    size_t len = instruction.length;
-    const size_t patch_size = 3;
-    u8* code_patch = const_cast<u8*>(reinterpret_cast<const u8*>(code));
-
     // We can only encounter rdi or r10d as the first operand in a
     // fault memory access for SRT walker.
     switch (operands[0].reg.value) {
     case ZYDIS_REGISTER_RDI:
-        // mov rdi, [rdi + (off_dw << 2)] -> xor rdi, rdi
-        code_patch[0] = 0x48;
-        code_patch[1] = 0x31;
-        code_patch[2] = 0xFF;
+        Common::SkipLoadAsZero(context, 7, instruction.length);
         break;
     case ZYDIS_REGISTER_R10D:
-        // mov r10d, [rdi + (off_dw << 2)] -> xor r10d, r10d
-        code_patch[0] = 0x45;
-        code_patch[1] = 0x31;
-        code_patch[2] = 0xD2;
+        Common::SkipLoadAsZero(context, 10, instruction.length);
         break;
     default:
-        UNREACHABLE_MSG("Unsupported register for SRT walker patch");
+        UNREACHABLE_MSG("Unsupported register for SRT walker fault");
         return false;
     }
 
-    // Fill nops
-    memset(code_patch + patch_size, 0x90, len - patch_size);
-
-    LOG_WARNING(Render_Recompiler, "Patched SRT walker at {}, fault address {}", code,
-                fault_address);
-
+    // sotc: rate-limited, a pointer that stays null faults on every draw now.
+    static std::atomic<u32> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+        LOG_WARNING(Render_Recompiler, "SRT walker read zero at {}, fault address {}", code,
+                    fault_address);
+    }
+    SotcStats::srt_walker_faults.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 

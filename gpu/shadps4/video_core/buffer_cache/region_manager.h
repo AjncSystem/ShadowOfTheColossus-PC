@@ -83,7 +83,20 @@ public:
 
     void SetCpuAddress(VAddr new_cpu_addr) {
         cpu_addr = new_cpu_addr;
+        sweep_words.store(~0ULL, std::memory_order_relaxed);
         ResetGrace();
+    }
+
+    /// sotc: the 256 KiB words where a CPU bit rose (or FaultGrace kept one) since the DMA sweep
+    /// last took them (BufferCache::SynchronizeDmaBuffers sweeps only those).
+    u64 TakeSweepWords() noexcept {
+        return sweep_words.load(std::memory_order_relaxed)
+                   ? sweep_words.exchange(0, std::memory_order_acq_rel)
+                   : 0;
+    }
+
+    VAddr CpuAddress() const noexcept {
+        return cpu_addr;
     }
 
     /// sotc: a guest write fault on the page at offset (region mutex held, from
@@ -168,9 +181,20 @@ public:
         if constexpr (locked) {
             mutex.lock();
         }
+        [[maybe_unused]] u64 raised = 0;
         IterateWords(bounds, [&](u64 index, u64 mask) {
             UpdateStateAndProtection<cpu_op, gpu_op>(write_prot, read_prot, index, mask);
+            if constexpr (cpu_op == StateOp::Set) {
+                if (write_prot[index]) { // CPU bits that went 0 -> 1
+                    raised |= 1ULL << index;
+                }
+            }
         });
+        if constexpr (cpu_op == StateOp::Set) {
+            if (raised) {
+                sweep_words.fetch_or(raised, std::memory_order_release);
+            }
+        }
         const auto write_op = GetPageOp<Type::CPU>(cpu_op);
         const auto read_op = GetPageOp<Type::GPU>(gpu_op);
         const bool update_watchers = write_op != PageOp::None || read_op != PageOp::None;
@@ -186,6 +210,8 @@ public:
 
     template <Type type, StateOp cpu_op, StateOp gpu_op, bool locked = true>
     void ForEachModifiedRange(u64 offset, s64 size, auto&& func) {
+        // sotc: CPU bits rise only in ChangeRegionState (it marks sweep_words).
+        static_assert(!(type == Type::CPU && cpu_op == StateOp::Set));
         auto& state = GetRegionBits<type>();
         // sotc: every draw synchronizes its buffers here, and the region mutex is contended by
         // the guest threads' write faults. Nothing CPU-modified and no GPU state to change is the
@@ -225,6 +251,7 @@ public:
                 RotateGraceLocked(FaultGrace::Now());
             }
         }
+        [[maybe_unused]] u64 kept_words = 0;
         IterateWords(bounds, [&](u64 index, u64 mask) {
             const u64 base_page = index * PAGES_PER_WORD;
             const u64 word = state[index] & mask; // collected before the change: hot pages too
@@ -232,6 +259,9 @@ public:
             if constexpr (grace_op) {
                 if (grace_any) {
                     keep = (hot_cur[index] | hot_prev[index]) & word;
+                    if (keep) {
+                        kept_words |= 1ULL << index;
+                    }
                     if (keep) {
                         SotcStats::fault_grace_hot_upload_bytes.fetch_add(
                             std::popcount(keep) * BYTES_PER_PAGE, std::memory_order_relaxed);
@@ -254,6 +284,12 @@ public:
         });
         if (end_page) {
             func(cpu_addr + start_page * BYTES_PER_PAGE, (end_page - start_page) * BYTES_PER_PAGE);
+        }
+        if constexpr (grace_op) {
+            // Hot pages keep their CPU bit without a new fault: the next sweep uploads them again.
+            if (kept_words) {
+                sweep_words.fetch_or(kept_words, std::memory_order_release);
+            }
         }
         const auto write_op = GetPageOp<Type::CPU>(cpu_op);
         const auto read_op = GetPageOp<Type::GPU>(gpu_op);
@@ -297,6 +333,8 @@ public:
     }
 
 private:
+    static_assert(NUM_REGION_WORDS == 64);
+    std::atomic<u64> sweep_words{~0ULL}; // sotc: see TakeSweepWords
     void ResetGrace() {
         fault_cur.Fill(0);
         fault_prev.Fill(0);

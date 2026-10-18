@@ -139,7 +139,10 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
 
 void BufferCache::DropGpuModified(VAddr device_addr, u64 size) {
     liverpool->SendCommand<true>([this, device_addr, size] {
-        gpu_modified_ranges.Subtract(device_addr, size);
+        {
+            std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+            gpu_modified_ranges.Subtract(device_addr, size);
+        }
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
         MarkInflightReadbacksDirty(device_addr, size);
         memory_tracker->MarkRegionAsCpuModified(device_addr, size);
@@ -183,10 +186,11 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         flush_request();
         return;
     }
-    // sotc: asynchronous readbacks by default (SOTC_RB_ASYNC=0: the command processor waits).
-    // With mip tails freeing video memory, 4 attract runs showed no collapse (the one seen on
-    // 2026-10-15 ran over budget): 48.7-48.8 vs 46.6-48.2 FPS, frames over 50 ms 66-81 vs
-    // 100-112, readback time in slow frames ~0.2 s vs ~1 s; shrine 29.2 -> 30.7 FPS.
+    // sotc: asynchronous readbacks by default (SOTC_RB_ASYNC=0: the waiting thread waits). With
+    // the draw thread (Liverpool::IsBackThreaded) the synchronous readback holds it while the GPU
+    // catches up (~10% of its time): Shrine 34.6 -> 37.0 FPS. #99 had made it opt-in after the
+    // "protect region as write-only" assertion; MarkWrittenByGuest (fork PR #31) removes that
+    // cause, and SignalImpl::Protect no longer stops the game on it.
     static const bool async = [] {
         const char* v = std::getenv("SOTC_RB_ASYNC");
         return !v || v[0] != '0';
@@ -337,12 +341,10 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
         DownloadMemory(readback.arena, readback.window_start, readback.window_size);
     } else {
         download.buffer->Invalidate(download.offset, download.size);
-        for (const auto& item : readback.pending) {
-            for (const auto& [address, range_size] : item.gpu_ranges) {
-                gpu_modified_ranges.Subtract(address, range_size);
-            }
-        }
+        // sotc: the ranges leave the GPU-modified set only once the backing holds their data:
+        // the command processor's clean reads (ReadClean) would read the stale backing before.
         ApplyDownloads(readback.pending, download.mapped, download.offset);
+        SubtractDownloaded(readback.pending);
         staging_pool.FreeDeferred(download);
     }
     if (readback.is_write) {
@@ -430,6 +432,16 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     // headers are followed through the physical chain on every write anyway. Only the command
     // processor thread downloads memory.
     ApplyDownloads(pending, download.mapped, download.offset);
+    SubtractDownloaded(pending); // sotc: after the backing holds the data (see FinishAsyncReadback)
+}
+
+void BufferCache::SubtractDownloaded(std::span<const ReadbackItem> items) {
+    std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+    for (const auto& item : items) {
+        for (const auto& [address, range_size] : item.gpu_ranges) {
+            gpu_modified_ranges.Subtract(address, range_size);
+        }
+    }
 }
 
 u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 size,
@@ -513,13 +525,12 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
                         });
                 };
                 gpu_modified_ranges.ForEachInRange(address, range_size, add_download);
-                if (subtract) {
-                    gpu_modified_ranges.Subtract(address, range_size);
-                } else {
-                    item.gpu_ranges.emplace_back(address, range_size);
-                }
+                item.gpu_ranges.emplace_back(address, range_size);
             });
         if (item.copies.empty()) {
+            if (subtract) {
+                SubtractDownloaded({&item, 1}); // nothing bound to read back
+            }
             continue;
         }
         // Large modified regions (render targets and the like) are left to their own readback.
@@ -529,12 +540,7 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
             item_bytes += copy.size;
         }
         if (hot_mode == 1 && !pending.empty() && item_bytes > MaxHotBytes) {
-            // Not downloaded now: give the range back to the modified set.
-            for (const auto& copy : item.copies) {
-                if (subtract) {
-                    AddGpuModified(arena_base + copy.srcOffset, copy.size);
-                }
-            }
+            // Not downloaded now: its ranges stay in the modified set.
             total_size_bytes = total_before;
             continue;
         }
@@ -681,7 +687,11 @@ void BufferCache::AddGpuModified(VAddr addr, u64 size) {
         const char* v = std::getenv("SOTC_GPUMOD_NOGROW_SKIP");
         return !v || v[0] != '0';
     }();
-    const bool grew = gpu_modified_ranges.Add(addr, size);
+    bool grew;
+    {
+        std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+        grew = gpu_modified_ranges.Add(addr, size);
+    }
     if (!clean_pages_used || size == 0 || (!grew && nogrow_skip)) {
         return;
     }
@@ -709,6 +719,20 @@ bool BufferCache::ReadClean(VAddr addr, void* out, u32 size) {
     const VAddr page_addr = addr & ~(CleanPageSize - 1);
     if (addr + size > page_addr + CleanPageSize) {
         return false;
+    }
+    // sotc: the command processor while the draw thread owns the GPU state: no page cache (the
+    // draw thread maintains it), the ranges under the lock.
+    if (liverpool->RunsGpuWorkElsewhere()) {
+        const u8* backing = memory->GetBackingPointer(page_addr);
+        if (!backing) {
+            return false;
+        }
+        std::shared_lock gpu_modified_lock{gpu_modified_mutex};
+        if (gpu_modified_ranges.Intersects(addr, size)) {
+            return false;
+        }
+        std::memcpy(out, backing + (addr - page_addr), size);
+        return true;
     }
     const u64 generation = clean_map_generation.load(std::memory_order_acquire);
     auto& page = clean_pages[(addr >> CleanPageBits) % NumCleanPages];
@@ -806,7 +830,10 @@ bool BufferCache::TryReplaceFromCpu(VAddr addr, const void* data, u64 size) {
     if (foreign) {
         return false;
     }
-    gpu_modified_ranges.Subtract(addr, size);
+    {
+        std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+        gpu_modified_ranges.Subtract(addr, size);
+    }
     memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
     MarkInflightReadbacksDirty(addr, size);
     if (!memory->TryWriteBacking(std::bit_cast<void*>(addr), data, size, 10)) {
@@ -842,7 +869,11 @@ bool BufferCache::TryWriteThroughFromCpu(VAddr addr, const void* data, u64 size)
     if (foreign) {
         return false;
     }
-    gpu_modified_ranges.Subtract(addr, size);
+    {
+        // sotc: the command processor reads the set under the shared lock (ReadClean).
+        std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+        gpu_modified_ranges.Subtract(addr, size);
+    }
     memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
     MarkInflightReadbacksDirty(addr, size);
     if (!memory->TryWriteBacking(std::bit_cast<void*>(addr), data, size, 10)) {
@@ -907,15 +938,56 @@ void BufferCache::SynchronizeDmaBuffers() {
                 }
                 dma_runs.emplace_back(device_addr, size);
             }
+            dma_full_pending = true;
         }
-        // sotc: by index with a copied entry, re-reading size(): nothing nested in
-        // SynchronizeMemory may invalidate the iteration even if it touched dma_runs.
-        for (size_t i = 0; i < dma_runs.size(); ++i) {
-            const auto [device_addr, size] = dma_runs[i];
-            SynchronizeMemory(address_space[device_addr >> ARENA_PAGE_BITS], device_addr,
-                              static_cast<u32>(size), false, false);
+        // sotc: incremental sweep (SOTC_DMA_INCR=0: every run, every time). Only the 256 KiB
+        // words where a CPU bit rose since the last sweep can need an upload
+        // (RegionManager::TakeSweepWords; hot pages kept by FaultGrace are marked again on each
+        // upload). After the runs change (pages that became resident may hold old CPU bits) one
+        // full sweep restores that. Each run is still synced once, over the hull of its dirty
+        // words, so the uploads per run stay as before.
+        static const bool dma_incr = [] {
+            const char* v = std::getenv("SOTC_DMA_INCR");
+            return !(v && v[0] == '0');
+        }();
+        if (!dma_incr || std::exchange(dma_full_pending, false)) {
+            if (dma_incr) {
+                memory_tracker->ForEachSweepSpan([](VAddr, u64) {});
+            }
+            // sotc: by index with a copied entry, re-reading size(): nothing nested in
+            // SynchronizeMemory may invalidate the iteration even if it touched dma_runs.
+            for (size_t i = 0; i < dma_runs.size(); ++i) {
+                const auto [device_addr, size] = dma_runs[i];
+                SynchronizeMemory(address_space[device_addr >> ARENA_PAGE_BITS], device_addr,
+                                  static_cast<u32>(size), false, false);
+            }
+            ranges = dma_runs_ranges;
+        } else {
+            dma_spans.clear();
+            memory_tracker->ForEachSweepSpan(
+                [this](VAddr address, u64 size) { dma_spans.emplace_back(address, size); });
+            std::ranges::sort(dma_spans);
+            size_t s = 0;
+            for (size_t i = 0; i < dma_runs.size() && s < dma_spans.size(); ++i) {
+                const auto [run_start, run_size] = dma_runs[i];
+                const VAddr run_end = run_start + run_size;
+                while (s < dma_spans.size() &&
+                       dma_spans[s].first + dma_spans[s].second <= run_start) {
+                    ++s;
+                }
+                VAddr lo = ~0ULL;
+                VAddr hi = 0;
+                for (size_t k = s; k < dma_spans.size() && dma_spans[k].first < run_end; ++k) {
+                    lo = std::min(lo, std::max(run_start, dma_spans[k].first));
+                    hi = std::max(hi, std::min(run_end, dma_spans[k].first + dma_spans[k].second));
+                }
+                if (lo < hi) {
+                    SynchronizeMemory(address_space[run_start >> ARENA_PAGE_BITS], lo,
+                                      static_cast<u32>(hi - lo), false, false);
+                    ++ranges;
+                }
+            }
         }
-        ranges = dma_runs_ranges;
         SotcStats::dma_sweep_runs.fetch_add(dma_runs.size(), std::memory_order_relaxed);
     } else {
         for (const auto& range : resident_ranges) {
@@ -1241,8 +1313,13 @@ bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_a
             runtime.FillBuffer(arena, arena->Offset(device_addr), size, ZmaskUncompressed);
             RecordCurrentWrite(device_addr, size);
             return true;
-        } else {
-            LOG_WARNING(Render_Vulkan, "Unhandled metadata type {}", magic_enum::enum_name(*type));
+        } else if (static u32 shown = 0; shown < 4) {
+            // sotc: first few only. In PS4 Pro performance mode the game reads CMask surfaces as
+            // texel buffers hundreds of times a second; each stderr line (piped to the launcher)
+            // took milliseconds on the draw thread: 28 vs 16 ms per frame in the same scene.
+            ++shown;
+            LOG_WARNING(Render_Vulkan, "Unhandled metadata type {} (logged {} of 4)",
+                        magic_enum::enum_name(*type), shown);
         }
     }
     const ImageId image_id = texture_cache.FindImageFromRange(device_addr, size);
@@ -1327,8 +1404,11 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
     });
     resident_ranges.Subtract(first_block, end_block);
     ++resident_version; // sotc: invalidates the merged DMA runs
-    gpu_modified_ranges.Subtract(first_block << block_shift,
-                                 (end_block - first_block) << block_shift);
+    {
+        std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+        gpu_modified_ranges.Subtract(first_block << block_shift,
+                                     (end_block - first_block) << block_shift);
+    }
     // sotc: a bind of the same blocks (the guest maps them again) must not share the unbind's
     // sparse bind batch: binds of one range within a batch are not ordered (the evicted blocks
     // of MaybeEvictCold came back unbound: black scenes).

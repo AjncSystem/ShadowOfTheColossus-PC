@@ -8,3 +8,8 @@ Backported from upstream after b4e7ae7 (2026-10-02), recompiler correctness fixe
   mode (#5126), e518a6515 S_SUBB_U32 SCC wrap (#5031), 282e5c792 S_ADDC_U32 SCC carry-out (#5030),
   fb6367d29 32-bit literals in the high dword of 64-bit floats (#5114), 94e217781 V_BFM_B32 (#5185),
   d1cb90dbb ADDC (#5200), dd43d1cac V_CVT_PK_U8_F32 (#5194), ef08b1e1f V_ALIGNBIT/ALIGNBYTE (#5186).
+sotc: third_party/fsr-vulkan (submodule, MIT, Q2RTX FSR Vulkan contributors + AMD FidelityFX SDK 2.3
+  files under their per-file MIT notices): only the FSR 3.1.6 frame interpolation/optical flow library
+  and the presenter policy are built (gpu/CMakeLists.txt). Its ffx_vk_fsr3_3_1_5_bridge.cpp is replaced
+  by the local copy gpu/sotc/fsr/ffx_vk_fsr3_3_1_5_bridge.cpp (recycled constant buffers, optional
+  32-wide subgroup pin; edits marked "sotc:"). Used only with SOTC_FG=1 (docs/sotc/FRAMEGEN.md).

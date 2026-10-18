@@ -12,7 +12,9 @@ MINGW*|MSYS*)
     for tool in clang cmake ninja pkg-config; do
         command -v "$tool" >/dev/null || { echo "Need $tool from MSYS2 CLANG64 (packaging/windows/README.md)." >&2; exit 1; }
     done
-    if [[ ! -f gpu/third_party/imgui/imgui.h || ! -f gpu/third_party/xbyak/xbyak/xbyak.h ]]; then
+    # sotc: fsr-vulkan (frame generation, SOTC_FG) is a submodule too.
+    if [[ ! -f gpu/third_party/imgui/imgui.h || ! -f gpu/third_party/xbyak/xbyak/xbyak.h ||
+          ! -f gpu/third_party/fsr-vulkan/CMakeLists.txt ]]; then
         git submodule update --init --recursive
     fi
     # sotc: llvm-windres, binutils windres fails on build paths with spaces ("Unable to create
@@ -65,7 +67,7 @@ if [[ -z $pgo ]]; then
 fi
 mkdir -p pgo
 # Submodules (git clone --recursive, or: git submodule update --init).
-if [[ ! -f gpu/third_party/imgui/imgui.h ]]; then
+if [[ ! -f gpu/third_party/imgui/imgui.h || ! -f gpu/third_party/fsr-vulkan/CMakeLists.txt ]]; then
     git submodule update --init --recursive
 fi
 cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO="$pgo" \

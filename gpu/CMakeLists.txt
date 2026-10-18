@@ -95,6 +95,23 @@ find_program(GLSLANG_COMPILER NAMES glslang glslangValidator REQUIRED)
 set(SIRIT_USE_SYSTEM_SPIRV_HEADERS OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/sirit EXCLUDE_FROM_ALL)
 
+# sotc: frame generation backend (third_party/fsr-vulkan, MIT): only the FSR 3.1.6 frame
+# interpolation + optical flow library and the presenter policy are built and linked, statically.
+# The 3.1.6 target lives inside the SDK 2.3 scaffold block, so that option stays on; the 1.1.4
+# host/backend, FSR4, probe, tests and install rules are off. Nothing calls it unless SOTC_FG=1.
+foreach(opt FFX_VK_PORTABLE_BUILD_TESTS FFX_VK_PORTABLE_BUILD_PROBE FFX_VK_PORTABLE_BUILD_FSR3_HOST
+            FFX_VK_PORTABLE_BUILD_FSR3_VK_BACKEND FFX_VK_PORTABLE_BUILD_FSR4_V07_VULKAN
+            FFX_VK_PORTABLE_INSTALL)
+    set(${opt} OFF CACHE BOOL "" FORCE)
+endforeach()
+set(FFX_VK_PORTABLE_BUILD_FSR3_3_1_5_SCAFFOLD ON CACHE BOOL "" FORCE)
+add_subdirectory(third_party/fsr-vulkan EXCLUDE_FROM_ALL)
+# sotc: constant buffers are recycled instead of allocated per dispatch (see the file header).
+get_target_property(bb_fg_sources ffx_vulkan_fsr3_vk_framegeneration_3_1_6 SOURCES)
+list(TRANSFORM bb_fg_sources REPLACE "^src/ffx_vk_fsr3_3_1_5_bridge\\.cpp$"
+     "${CMAKE_CURRENT_SOURCE_DIR}/sotc/fsr/ffx_vk_fsr3_3_1_5_bridge.cpp")
+set_property(TARGET ffx_vulkan_fsr3_vk_framegeneration_3_1_6 PROPERTY SOURCES ${bb_fg_sources})
+
 # Host shaders -> headers (same scheme as shadPS4's host_shaders/CMakeLists.txt).
 set(SHADER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/host_shaders)
 set(SHADER_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/include)
@@ -171,6 +188,9 @@ if (NOT WIN32)
 endif()
 target_link_libraries(bbgpu PUBLIC Vulkan::Headers fmt::fmt Boost::headers magic_enum::magic_enum
     tsl::robin_map GPUOpen::VulkanMemoryAllocator PkgConfig::XXHASH PkgConfig::SDL3 PkgConfig::FFMPEG miniz::miniz Zydis::Zydis sirit)
+# sotc: frame generation (SOTC_FG), see the fsr-vulkan block above.
+target_link_libraries(bbgpu PRIVATE ffx-vulkan::fsr3-vk-framegeneration-3.1.6
+    ffx-vulkan::framegeneration-presenter-policy)
 if (WIN32)
     # Guest code is entered with the System V ABI; NOMINMAX/WIN32_LEAN_AND_MEAN keep
     # <windows.h> out of the way of std::min/max and the Vulkan/SDL headers.
@@ -242,3 +262,7 @@ add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_sup
 target_include_directories(upscaler-support-test PRIVATE shim)
 target_compile_options(upscaler-support-test PRIVATE -UNDEBUG)
 
+# sotc: GPU cost of the FSR 3.1.6 frame generation step at 1080p/1440p/2160p output (needs a
+# Vulkan device with VK_KHR_compute_shader_derivatives; does not start the game).
+add_executable(fg-bench EXCLUDE_FROM_ALL ../tools/fg_bench.cpp)
+target_link_libraries(fg-bench PRIVATE ffx-vulkan::fsr3-vk-framegeneration-3.1.6)

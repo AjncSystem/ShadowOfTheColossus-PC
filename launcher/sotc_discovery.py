@@ -16,7 +16,7 @@ SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
 SKIP = {'windows', '$recycle.bin', 'system volume information', 'programdata', 'recovery',
         'perflogs', 'msocache', '$windows.~bt', '$windows.~ws', 'windows.old', 'node_modules',
         '.git', '__pycache__', 'winsxs', 'microsoft', 'nvidia corporation', 'intel', 'amd',
-        'appdata', 'steamapps', 'system32', 'syswow64', 'driverstore', 'installer'}
+        'appdata', 'steamapps', 'system32', 'syswow64', 'driverstore', 'installer','wpsystem'}
 
 
 def game_record(folder):

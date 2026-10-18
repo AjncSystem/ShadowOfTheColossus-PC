@@ -12,6 +12,9 @@
 #include <vector>
 #include "ffx_vk_fsr3_3_1_5_bridge.h"
 
+// gpu/sotc/fsr/ffx_vk_fsr3_3_1_5_bridge.cpp: live constant buffers and descriptor sets.
+extern "C" void ffxVkSotcBridgeLiveObjects(uint32_t* constantBuffers, uint32_t* descriptorSets);
+
 namespace {
 
 struct Image {
@@ -303,6 +306,7 @@ int main() {
         FfxVkFsr3_3_1_6FrameGenerationMemoryUsage usage{};
         if (ok) ffxVkFsr3_3_1_6FrameGenerationContextGetMemoryUsage(context, &usage);
         std::vector<double> gpu, cpu;
+        uint32_t live_cb[2]{}, live_ds[2]{};
         const VkImageLayout read = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         const VkImageLayout general = VK_IMAGE_LAYOUT_GENERAL;
         for (uint64_t frame = 1; ok && frame <= kFrames; ++frame) {
@@ -375,6 +379,18 @@ int main() {
                 gpu.push_back(double(ts[1] - ts[0]) * props.limits.timestampPeriod * 1e-6);
                 cpu.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
             }
+            // Retired frames must give their constant buffers and descriptor sets back: the
+            // live counts after the warm-up may not grow (they did by ~12 and ~1 per job/frame).
+            if (frame == 10) ffxVkSotcBridgeLiveObjects(&live_cb[0], &live_ds[0]);
+        }
+        ffxVkSotcBridgeLiveObjects(&live_cb[1], &live_ds[1]);
+        if (ok) {
+            const bool flat = live_cb[1] <= live_cb[0] && live_ds[1] <= live_ds[0];
+            std::printf("bridge live objects after frame 10 / %llu: constant buffers %u / %u, "
+                        "descriptor sets %u / %u: %s\n",
+                        static_cast<unsigned long long>(kFrames), live_cb[0], live_cb[1],
+                        live_ds[0], live_ds[1], flat ? "recycled" : "LEAKING");
+            if (!flat) status = 1;
         }
         // Motion check on the last generated frame: the previous real frame has its bar at
         // bar_x[(kFrames - 1) % 8], the current one a step further; an interpolated frame has it

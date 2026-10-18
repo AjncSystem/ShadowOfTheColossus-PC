@@ -106,10 +106,13 @@ foreach(opt FFX_VK_PORTABLE_BUILD_TESTS FFX_VK_PORTABLE_BUILD_PROBE FFX_VK_PORTA
 endforeach()
 set(FFX_VK_PORTABLE_BUILD_FSR3_3_1_5_SCAFFOLD ON CACHE BOOL "" FORCE)
 add_subdirectory(third_party/fsr-vulkan EXCLUDE_FROM_ALL)
-# sotc: constant buffers are recycled instead of allocated per dispatch (see the file header).
+# sotc: constant buffers are recycled instead of allocated per dispatch, and the 3.1.6 wrapper
+# drives the bridge's per-frame retire (see both file headers).
 get_target_property(bb_fg_sources ffx_vulkan_fsr3_vk_framegeneration_3_1_6 SOURCES)
 list(TRANSFORM bb_fg_sources REPLACE "^src/ffx_vk_fsr3_3_1_5_bridge\\.cpp$"
      "${CMAKE_CURRENT_SOURCE_DIR}/sotc/fsr/ffx_vk_fsr3_3_1_5_bridge.cpp")
+list(TRANSFORM bb_fg_sources REPLACE "^src/ffx_vk_fsr3_3_1_6_framegen\\.cpp$"
+     "${CMAKE_CURRENT_SOURCE_DIR}/sotc/fsr/ffx_vk_fsr3_3_1_6_framegen.cpp")
 set_property(TARGET ffx_vulkan_fsr3_vk_framegeneration_3_1_6 PROPERTY SOURCES ${bb_fg_sources})
 
 # Host shaders -> headers (same scheme as shadPS4's host_shaders/CMakeLists.txt).

@@ -24,6 +24,7 @@
 #include "ffx_interface.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -38,6 +39,16 @@ static uint32_t g_sotcRequiredSubgroupSize = 0u;
 extern "C" void ffxVkSotcSetRequiredSubgroupSize(uint32_t size)
 {
     g_sotcRequiredSubgroupSize = size;
+}
+
+// sotc: live constant buffers (one VkDeviceMemory each, free list included) and descriptor sets
+// (one VkDescriptorPool each), over every bridge. tools/fg_bench.cpp checks they stay flat.
+static std::atomic<uint32_t> g_sotcLiveConstantBuffers{0u};
+static std::atomic<uint32_t> g_sotcLiveDescriptorSets{0u};
+extern "C" void ffxVkSotcBridgeLiveObjects(uint32_t* constantBuffers, uint32_t* descriptorSets)
+{
+    *constantBuffers = g_sotcLiveConstantBuffers.load();
+    *descriptorSets = g_sotcLiveDescriptorSets.load();
 }
 
 namespace {
@@ -269,12 +280,16 @@ static void destroy_constant_buffer(FfxVkFsr3_3_1_5Bridge* bridge,
         vkDestroyBuffer(bridge->device, constantBuffer->buffer, bridge->allocationCallbacks);
     if (constantBuffer->memory != VK_NULL_HANDLE)
         vkFreeMemory(bridge->device, constantBuffer->memory, bridge->allocationCallbacks);
+    if (constantBuffer->capacity) // sotc: counted once fully created
+        --g_sotcLiveConstantBuffers;
 }
 
 static void destroy_descriptor_set(BridgeDescriptorSet* descriptorSet)
 {
-    if (descriptorSet)
+    if (descriptorSet) {
         ffxVkFsr3_3_1_5DestroyDescriptorSet(&descriptorSet->descriptorSet);
+        --g_sotcLiveDescriptorSets; // sotc
+    }
 }
 
 static int32_t allocate_resource_slot(FfxVkFsr3_3_1_5Bridge* bridge,
@@ -511,6 +526,7 @@ static bool record_compute_job(FfxVkFsr3_3_1_5Bridge* bridge,
             &pipeline->pipeline, descriptorResources, descriptorCount,
             &descriptorSet->descriptorSet) != FFX_VK_PORTABLE_OK)
         return false;
+    ++g_sotcLiveDescriptorSets; // sotc
     vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline.pipeline);
     vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                             pipeline->pipeline.pipelineLayout, 0u, 1u,
@@ -895,6 +911,7 @@ extern "C" FfxErrorCode ffxVkFsr3_3_1_5BridgeStageConstantBufferData(
             (memoryProperties.memoryTypes[allocationInfo.memoryTypeIndex].propertyFlags &
              VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0u;
         constantBuffer->capacity = size;
+        ++g_sotcLiveConstantBuffers; // sotc
     }
     std::memcpy(constantBuffer->mapped, data, size);
     if (!constantBuffer->coherent) {

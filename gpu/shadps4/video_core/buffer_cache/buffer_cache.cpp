@@ -36,6 +36,21 @@ namespace VideoCore {
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
 
+/// sotc: SOTC_RB_NARROW=1 (64 KiB) or =<KiB> (power of two, 4-512): the readback window, in
+/// bytes; 0 (unset) keeps the 512 KiB one. A readback unprotects every GPU-written page of its
+/// window and the next GPU writes of those pages protect them again one binding at a time (most of
+/// the draw thread's VirtualProtect calls), every frame; a smaller window leaves the pages the
+/// guest does not read protected and GPU-modified. Read once, at static initialisation (no
+/// function-local guard in the fault paths); BufferCache::rb_narrow_window applies it.
+static const u64 rb_narrow_env = [] {
+    const char* v = std::getenv("SOTC_RB_NARROW");
+    const u64 kib = v ? std::strtoull(v, nullptr, 10) : 0;
+    if (kib == 0) {
+        return u64{0};
+    }
+    return std::bit_floor(kib == 1 ? u64{64} : std::clamp<u64>(kib, 4, 512)) * 1_KB;
+}();
+
 static constexpr auto ARENA_USAGE =
     vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
     vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eStorageBuffer |
@@ -90,6 +105,13 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         static_cast<u16*>(std::calloc(blocks_per_arena_page * NUM_ARENA_PAGES, sizeof(u16)));
     ASSERT_MSG(block_last_use, "No memory for the arena block use table");
     epoch_start = std::chrono::steady_clock::now();
+    // sotc: SOTC_RB_NARROW only in the precise readback mode, where every GPU-modified page is
+    // read-protected: the relaxed mode reads back only on write faults, and the wide window is
+    // all that refreshes the data around them.
+    if (rb_narrow_env && memory_tracker->ReadbacksMode() == GpuReadbacksMode::Precise) {
+        rb_narrow_window = rb_narrow_env;
+        SotcStats::rb_narrow_kib.store(rb_narrow_window / 1_KB, std::memory_order_relaxed);
+    }
     arena_memory_type_index =
         FindMemoryType(instance.GetMemoryProperties(), vk::MemoryPropertyFlagBits::eDeviceLocal,
                        reqs.memoryTypeBits)
@@ -161,21 +183,49 @@ void BufferCache::MarkWriteAhead(VAddr addr) {
     memory_tracker->MarkAheadAsCpuModified(next_page, ahead);
 }
 
+std::pair<VAddr, VAddr> BufferCache::ReadbackWindow(const Buffer* arena, VAddr device_addr,
+                                                    u64 size) {
+    // GPU-modified ranges come as many small scattered islands,
+    // so the download is widened to a window around the request
+    constexpr u64 WindowSize = 512_KB;
+    const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
+    const auto window = [&](u64 window_size) {
+        const VAddr start =
+            std::max<VAddr>(Common::AlignDown(device_addr, window_size), arena->cpu_addr);
+        const VAddr end =
+            std::min<VAddr>(std::max<VAddr>(start + window_size, device_addr + size), arena_end);
+        return std::pair<VAddr, VAddr>{start, end};
+    };
+    if (rb_narrow_window == 0) {
+        return window(WindowSize);
+    }
+    // sotc: SOTC_RB_NARROW. The window is the aligned granule (or granules) of the request, so
+    // the same reads ask for the same window every frame and the hot readbacks (GatherDownloads)
+    // bring the other granules the guest reads along with the first readback, as the wide window
+    // did. Everything the guest reads is still downloaded: a page outside the window keeps its
+    // GPU bit and read protection, and its own fault reads it back.
+    const auto narrow = window(rb_narrow_window);
+    if (SotcStats::kFpsLog) {
+        // The narrow window lies inside the wide one (both power-of-two aligned around the request,
+        // clipped to the same arena): count what the wide one would also have taken.
+        const auto wide = window(WindowSize);
+        const VAddr narrow_end =
+            std::min<VAddr>(Common::AlignUp(narrow.second, BYTES_PER_PAGE), wide.second);
+        const u64 kept =
+            memory_tracker->CountGpuModifiedPages(wide.first, narrow.first - wide.first) +
+            memory_tracker->CountGpuModifiedPages(narrow_end, wide.second - narrow_end);
+        SotcStats::rb_narrow_kept_bytes.fetch_add(kept * BYTES_PER_PAGE, std::memory_order_relaxed);
+    }
+    return narrow;
+}
+
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
     const auto flush_request = [this, device_addr, size, is_write] {
         NoteHotRead(device_addr, size);
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
         const auto* arena = GetArena(first_block, last_block);
-
-        // GPU-modified ranges come as many small scattered islands,
-        // so the download is widened to a window around the request
-        constexpr u64 WindowSize = 512_KB;
-        const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
-        const VAddr window_start =
-            std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena->cpu_addr);
-        const VAddr window_end = std::min<VAddr>(
-            std::max<VAddr>(window_start + WindowSize, device_addr + size), arena_end);
+        const auto [window_start, window_end] = ReadbackWindow(arena, device_addr, size);
         Core::MemoryManager::NoteHostWrite(device_addr, size, 6, window_start);
         DownloadMemory(arena, window_start, window_end - window_start);
         if (is_write) {
@@ -235,13 +285,8 @@ void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
     const u32 first_block = readback.device_addr >> block_shift;
     const u32 last_block = (readback.device_addr + readback.size - 1) >> block_shift;
     const auto* arena = GetArena(first_block, last_block);
-    constexpr u64 WindowSize = 512_KB;
-    const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
-    const VAddr window_start =
-        std::max<VAddr>(Common::AlignDown(readback.device_addr, WindowSize), arena->cpu_addr);
-    const VAddr window_end = std::min<VAddr>(
-        std::max<VAddr>(window_start + WindowSize, readback.device_addr + readback.size),
-        arena_end);
+    const auto [window_start, window_end] =
+        ReadbackWindow(arena, readback.device_addr, readback.size);
     readback.arena = arena;
     readback.window_start = window_start;
     readback.window_size = window_end - window_start;
@@ -479,13 +524,21 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
             }
             regions.push_back({hot_arena, hot.addr, hot.size});
         }
+        // sotc: SOTC_RB_NARROW: the reads one wide window covered ask for several narrow ones;
+        // room for up to 4 times as many.
+        const size_t max_hot =
+            rb_narrow_window ? MaxHotReadbacks * std::min<u64>(4, 512_KB / rb_narrow_window)
+                             : MaxHotReadbacks;
         if (!known) {
-            if (hot_readbacks.size() < MaxHotReadbacks) {
+            if (hot_readbacks.size() < max_hot) {
                 hot_readbacks.push_back({device_addr, size, now});
             } else {
                 auto oldest = std::ranges::min_element(hot_readbacks, {}, &HotReadback::last_request);
                 *oldest = {device_addr, size, now};
             }
+        }
+        if (rb_narrow_window && SotcStats::kFpsLog) {
+            SotcStats::rb_hot_entries.store(hot_readbacks.size(), std::memory_order_relaxed);
         }
     }
 

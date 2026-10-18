@@ -23,9 +23,27 @@ mesmas extensões e recursos, e nenhum código do FSR é chamado.
     `vkCreateBuffer` + `vkAllocateMemory` + map a cada um (12 por quadro);
   - `ffxVkSotcSetRequiredSubgroupSize(32)` recria cada pipeline compute com subgroup fixo em 32 (para AMD,
     ver abaixo). O host tem que chamar antes de criar o contexto, com `Instance::FrameGenSubgroupSize()`.
-  - Medição no `fg-bench` (RTX 5060 Ti): o tempo de CPU de gravação ficou igual dentro do ruído com e sem a
-    reciclagem (~1,0-1,1 ms a 1440p/4K). O ganho esperado é não disputar o kernel do WDDM com as outras
-    threads, coisa que o bench isolado não mostra.
+  - ~~Medição no `fg-bench`: CPU igual com e sem reciclagem~~. Errado: a reciclagem **nunca rodava** (ver
+    "Correção: vazamento por quadro na ponte" abaixo); o "igual" era o mesmo código vazando nas duas medições.
+- **Correção: vazamento por quadro na ponte** (revisão): o wrapper 3.1.6 do fsr-vulkan nunca chamava
+  `ffxVkFsr3_3_1_5BridgeBeginFrame`/`BridgeRetireFrame` (só o upscaler 3.1.5 chama). Então todo buffer
+  constante e todo descriptor set (um `VkDescriptorPool` por job compute) ficava com `frameId` 0, que o retire
+  da ponte nunca libera: ~13 `vkAllocateMemory` + ~34 pools por interpolação, até destruir o contexto. A 30 → 60
+  isso passa do `maxMemoryAllocationCount` (4096 na NVIDIA) em ~10 s; quando a alocação falha, o `FgPass` marca
+  `failed` e o FG desliga pelo resto da sessão (antes disso a memória e a CPU de gravação só crescem).
+  - Correção: cópia local `gpu/sotc/fsr/ffx_vk_fsr3_3_1_6_framegen.cpp` (trocada no CMake como a ponte). O
+    `RecordPrepare` abre o quadro na ponte com o `frameId` (antes dos jobs de layout do primeiro uso; recusa
+    `frameId` 0) e o `ContextRetireFrame` chama `ffxVkFsr3_3_1_5BridgeRetireFrame`: buffers voltam para a lista
+    livre, pools são destruídos. O `FgPass` já chamava o `ContextRetireFrame` depois do tick, nada mudou nele.
+  - A ponte conta os objetos vivos (`ffxVkSotcBridgeLiveObjects`) e o `fg-bench` falha (`LEAKING`, código 1)
+    se a contagem crescer depois do quadro 10. RTX 5060 Ti, 130 quadros:
+
+    | | Buffers constantes (quadro 10 / 130) | Descriptor sets (10 / 130) | CPU gravação p50 |
+    |---|---|---|---|
+    | antes (wrapper do submódulo) | 129 / 1689 | 335 / 4415 | 1,1-1,8 ms |
+    | depois | 14 / 14 | 0 / 0 | 0,18 ms |
+
+    A interpolação e o tempo de GPU não mudaram (barra no meio nas três saídas; 1,07 / 1,61 / 3,11 ms p50).
 - **Recursos de dispositivo** (`vk_instance.cpp`, só com `SOTC_FG=1`):
   - `Instance::FrameGenSupported()` exige `VK_KHR_compute_shader_derivatives` com `computeDerivativeGroupLinear`
     (só a KHR: os SPIR-V usam `SPV_KHR_compute_shader_derivatives`, a variante NV não serve),
@@ -237,10 +255,11 @@ ligado.
 6. **fps60** (secundário, VRR): `SOTC_MODES=…,fps60` em 144 Hz: `FG generated` ≈ `real`. Em 60 Hz fixo o FI se
    desliga sozinho (`ratio` sobe, `interpolations` 0).
 7. **Robustez**: os mesmos testes da Fase 2 (redimensionar, minimizar, tela cheia, diálogo de save,
-   carregar). Mudar `SOTC_OUTPUT_RES` recria o contexto (1 linha nova no log). `port_soak.ps1` 10 min: memória
-   estável (prova o `RetireFrame`).
-8. **Sem jogo**: `ninja -C out/gpu fg-bench && out/gpu/fg-bench.exe` tem que imprimir `interpolated` nas três
-   saídas e terminar com código 0.
+   carregar). Mudar `SOTC_OUTPUT_RES` recria o contexto (1 linha nova no log). `port_soak.ps1` 10 min com
+   `SOTC_FG=1`: memória estável e o FG ainda ligado no fim (`FG generated` subindo, nenhuma linha
+   `interpolation failed` no log). Sem a correção da ponte a memória crescia sem parar e o FG podia se desligar sozinho.
+8. **Sem jogo**: `ninja -C out/gpu fg-bench && out/gpu/fg-bench.exe` tem que imprimir `interpolated` e
+   `recycled` nas três saídas e terminar com código 0.
 
 ## Pendências e riscos
 
@@ -259,8 +278,9 @@ ligado.
   o FI (~1 ms) e o FIFO. Total esperado +20-35 ms em relação ao Mailbox padrão.
 - **HDR** desliga o FI (só reais) enquanto estiver ligado; os `Frame` ficam RGBA8 com FG (como já eram 8 bits
   no formato da surface, não há perda nova).
-- **CPU de gravação** ~1,3-2,2 ms por quadro real (bench), na thread do pacer, que dorme o resto do tempo.
-  Não afeta a GpuDraw, mas é a ponte criando/destruindo descriptor sets por pass.
+- **CPU de gravação** ~0,18 ms por quadro real (bench, depois da correção do retire da ponte; antes era
+  1,1-2,2 ms e crescendo). Ainda cria um `VkDescriptorPool` por job compute e o destrói no retire (~34 por
+  quadro); um pool reciclado seria o próximo passo se a linha de CPU no jogo pedir.
 - **VRR**: não é detectado. Com G-Sync a cópia 2 aparece meio refresh antes do meio do intervalo (o "−P/2"
   só vale com refresh fixo), e a estimativa de `P` vira o intervalo de present (a trava do vblank não liga,
   pela guarda de 1%). Ainda pendente (Fase 3 também não faz): detectar VRR (intervalos que não são múltiplos) e mirar `D/2` direto.

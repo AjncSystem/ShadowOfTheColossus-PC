@@ -1,8 +1,10 @@
 // sotc: GPU cost of one FSR 3.1.6 frame generation step (RecordPrepare + RecordDispatch) at the
 // port's sizes: render (depth/motion) 1920x1080, display (color/output) 1080p, 1440p and 2160p.
 // Standalone: own Vulkan device, no window, no game. Build: ninja -C out/gpu fg-bench.
-// Inputs are cleared images (the passes have fixed dispatch sizes, so content barely changes
-// the cost); the numbers are GPU timestamps around both calls, median and p95 over 120 frames.
+// Inputs are the port's neutral ones (zero motion, constant depth, host_passes/fg_pass.cpp) with
+// real frames of a textured bar moving 32 px per frame; the numbers are GPU timestamps around
+// both calls, median and p95 over 120 frames, and the last generated frame is checked: its bar
+// has to be midway between the two real frames (optical flow interpolation at work).
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -62,10 +64,117 @@ void DestroyImage(Image& image) {
     image = {};
 }
 
-FfxVkFsr3_3_1_6FrameGenerationImage Desc(const Image& image, VkImageLayout layout) {
-    return {image.image, image.format, image.width, image.height, layout,
-            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
-                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+// The usage each image is described with, as in the port (host_passes/fg_pass.cpp): the real
+// frame and the neutral inputs without STORAGE (the bridge then makes no storage views of them).
+constexpr VkImageUsageFlags kReadUsage =
+    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+constexpr VkImageUsageFlags kOutputUsage =
+    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+
+FfxVkFsr3_3_1_6FrameGenerationImage Desc(const Image& image, VkImageLayout layout,
+                                         VkImageUsageFlags usage) {
+    return {image.image, image.format, image.width, image.height, layout, usage};
+}
+
+struct HostBuffer {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    uint32_t* data = nullptr;
+};
+
+HostBuffer CreateHostBuffer(VkDeviceSize size, VkBufferUsageFlags usage) {
+    HostBuffer out;
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = size;
+    bci.usage = usage;
+    vkCreateBuffer(g_device, &bci, nullptr, &out.buffer);
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(g_device, out.buffer, &req);
+    VkPhysicalDeviceMemoryProperties mem{};
+    vkGetPhysicalDeviceMemoryProperties(g_physical, &mem);
+    const VkMemoryPropertyFlags host =
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    VkMemoryAllocateInfo alloc{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    alloc.allocationSize = req.size;
+    for (uint32_t i = 0; i < mem.memoryTypeCount; ++i)
+        if ((req.memoryTypeBits & (1u << i)) && (mem.memoryTypes[i].propertyFlags & host) == host) {
+            alloc.memoryTypeIndex = i;
+            break;
+        }
+    vkAllocateMemory(g_device, &alloc, nullptr, &out.memory);
+    vkBindBufferMemory(g_device, out.buffer, out.memory, 0);
+    vkMapMemory(g_device, out.memory, 0, size, 0, reinterpret_cast<void**>(&out.data));
+    return out;
+}
+
+void DestroyHostBuffer(HostBuffer& buffer) {
+    vkDestroyBuffer(g_device, buffer.buffer, nullptr);
+    vkFreeMemory(g_device, buffer.memory, nullptr);
+    buffer = {};
+}
+
+// Real frames of the bench: a bright bar 128 px wide over a static dim noise background, its left
+// edge `kStep` px further right each frame (8 positions, then back): block matching optical flow
+// needs texture to find the motion.
+constexpr uint32_t kStep = 32;
+constexpr uint64_t kFrames = 130;
+
+void DrawBar(uint32_t* pixels, uint32_t w, uint32_t h, uint32_t bar_x) {
+    for (uint32_t y = 0; y < h; ++y)
+        for (uint32_t x = 0; x < w; ++x) {
+            uint32_t n = (x * 73856093u) ^ (y * 19349663u);
+            n = (n ^ (n >> 13)) * 0x5bd1e995u;
+            const uint32_t v = (x >= bar_x && x < bar_x + 128 ? 192u : 0u) + ((n >> 24) & 0x3Fu);
+            pixels[size_t(y) * w + x] = 0xFF000000u | v << 16 | v << 8 | v;
+        }
+}
+
+void Barrier(VkCommandBuffer cmd, const Image& image, VkImageLayout from, VkImageLayout to);
+
+// Copies a pattern into an image and leaves it in `layout` for the FFX calls.
+void Upload(VkCommandBuffer cmd, const Image& image, const HostBuffer& pattern,
+            VkImageLayout from, VkImageLayout layout) {
+    Barrier(cmd, image, from, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkBufferImageCopy copy{};
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageExtent = {image.width, image.height, 1};
+    vkCmdCopyBufferToImage(cmd, pattern.buffer, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           1, &copy);
+    Barrier(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, layout);
+}
+
+// Reads row `y` of an RGBA8 image (General layout) back to the host.
+std::vector<uint32_t> ReadRow(VkCommandBuffer cmd, VkQueue queue, VkFence fence,
+                              const Image& image, uint32_t y) {
+    HostBuffer buffer = CreateHostBuffer(image.width * 4ull, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    vkBeginCommandBuffer(cmd, &begin);
+    VkBufferImageCopy copy{};
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageOffset = {0, static_cast<int32_t>(y), 0};
+    copy.imageExtent = {image.width, 1, 1};
+    vkCmdCopyImageToBuffer(cmd, image.image, VK_IMAGE_LAYOUT_GENERAL, buffer.buffer, 1, &copy);
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cmd;
+    vkQueueSubmit(queue, 1, &submit, fence);
+    vkWaitForFences(g_device, 1, &fence, VK_TRUE, 5'000'000'000ull);
+    vkResetFences(g_device, 1, &fence);
+    std::vector<uint32_t> row(buffer.data, buffer.data + image.width);
+    DestroyHostBuffer(buffer);
+    return row;
+}
+
+// Centre of the bright bar in a row (red channel above the noise), -1 when there is none.
+double BarCentre(const std::vector<uint32_t>& row) {
+    double sum = 0.0, count = 0.0;
+    for (size_t x = 0; x < row.size(); ++x)
+        if ((row[x] & 0xFFu) >= 160u) {
+            sum += double(x);
+            count += 1.0;
+        }
+    return count > 0.0 ? sum / count : -1.0;
 }
 
 void Barrier(VkCommandBuffer cmd, const Image& image, VkImageLayout from, VkImageLayout to) {
@@ -85,7 +194,7 @@ void Barrier(VkCommandBuffer cmd, const Image& image, VkImageLayout from, VkImag
 void Fill(VkCommandBuffer cmd, const Image& image, float v, VkImageLayout from,
           VkImageLayout layout) {
     Barrier(cmd, image, from, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    const VkClearColorValue color{{v, 1.0f - v, 0.5f * v, 1.0f}};
+    const VkClearColorValue color{{v, v, v, v}};
     const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdClearColorImage(cmd, image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
     Barrier(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, layout);
@@ -171,6 +280,15 @@ int main() {
     int status = 0;
     for (const auto& d : displays) {
         Image color[2], depth, motion, output;
+        // The real frames: the bar a step further each frame (see DrawBar).
+        uint32_t bar_x[8];
+        for (uint32_t i = 0; i < 8; ++i) bar_x[i] = d[0] / 2 - 256 + i * kStep;
+        HostBuffer pattern[8];
+        for (int i = 0; i < 8; ++i) {
+            pattern[i] = CreateHostBuffer(VkDeviceSize{d[0]} * d[1] * 4,
+                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            DrawBar(pattern[i].data, d[0], d[1], bar_x[i]);
+        }
         bool ok = CreateImage(d[0], d[1], colorFormat, &color[0]) &&
                   CreateImage(d[0], d[1], colorFormat, &color[1]) &&
                   CreateImage(rw, rh, VK_FORMAT_R32_SFLOAT, &depth) &&
@@ -186,12 +304,13 @@ int main() {
         if (ok) ffxVkFsr3_3_1_6FrameGenerationContextGetMemoryUsage(context, &usage);
         std::vector<double> gpu, cpu;
         const VkImageLayout read = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        for (uint64_t frame = 1; ok && frame <= 130; ++frame) {
+        const VkImageLayout general = VK_IMAGE_LAYOUT_GENERAL;
+        for (uint64_t frame = 1; ok && frame <= kFrames; ++frame) {
             const Image& src = color[frame & 1];
             VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
             vkBeginCommandBuffer(cmd, &begin);
-            const VkImageLayout from = frame <= 2 ? VK_IMAGE_LAYOUT_UNDEFINED : read;
-            Fill(cmd, src, (frame % 7) / 7.0f, from, read);
+            // The port's frames are left in General by its post process pass.
+            Upload(cmd, src, pattern[frame % 8], VK_IMAGE_LAYOUT_UNDEFINED, general);
             if (frame == 1) {
                 Fill(cmd, depth, 0.5f, VK_IMAGE_LAYOUT_UNDEFINED, read);
                 Fill(cmd, motion, 0.0f, VK_IMAGE_LAYOUT_UNDEFINED, read);
@@ -201,9 +320,9 @@ int main() {
             vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, queries, 0);
             FfxVkFsr3_3_1_6FrameGenerationPrepareInfo prep{};
             prep.commandBuffer = cmd;
-            prep.color = Desc(src, read);
-            prep.depth = Desc(depth, read);
-            prep.motionVectors = Desc(motion, read);
+            prep.color = Desc(src, general, kReadUsage);
+            prep.depth = Desc(depth, read, kReadUsage);
+            prep.motionVectors = Desc(motion, read, kReadUsage);
             prep.renderWidth = rw;
             prep.renderHeight = rh;
             prep.motionVectorScaleX = float(rw);
@@ -221,7 +340,7 @@ int main() {
             FfxVkFsr3_3_1_6FrameGenerationDispatchInfo disp{};
             disp.commandBuffer = cmd;
             disp.color = prep.color;
-            disp.output = Desc(output, VK_IMAGE_LAYOUT_GENERAL);
+            disp.output = Desc(output, general, kOutputUsage);
             disp.displayWidth = d[0];
             disp.displayHeight = d[1];
             disp.frameTimeMilliseconds = prep.frameTimeMilliseconds;
@@ -257,6 +376,20 @@ int main() {
                 cpu.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
             }
         }
+        // Motion check on the last generated frame: the previous real frame has its bar at
+        // bar_x[(kFrames - 1) % 8], the current one a step further; an interpolated frame has it
+        // midway (a copy of either frame means no interpolation).
+        if (ok) {
+            const std::vector<uint32_t> row = ReadRow(cmd, queue, fence, output, d[1] / 2);
+            const double previous = bar_x[(kFrames - 1) % 8] + 63.5;
+            const double current = bar_x[kFrames % 8] + 63.5;
+            const double generated = BarCentre(row);
+            const bool midway = std::abs(generated - (previous + current) / 2.0) < kStep / 4.0;
+            std::printf("motion check: bar centre previous %.1f, current %.1f, generated %.1f: "
+                        "%s\n",
+                        previous, current, generated, midway ? "interpolated" : "NOT interpolated");
+            if (!midway) status = 1;
+        }
         if (ok) {
             std::sort(gpu.begin(), gpu.end());
             std::sort(cpu.begin(), cpu.end());
@@ -268,6 +401,7 @@ int main() {
         } else {
             status = 1;
         }
+        for (HostBuffer& buffer : pattern) DestroyHostBuffer(buffer);
         vkDeviceWaitIdle(g_device);
         ffxVkFsr3_3_1_6FrameGenerationContextDestroy(context);
         for (Image* image : {&color[0], &color[1], &depth, &motion, &output})

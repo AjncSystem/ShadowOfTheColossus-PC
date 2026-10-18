@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <unordered_set>
 #include "common/elf_info.h"
+#include "common/assert_scope.h"
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -401,13 +402,14 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 
     // sotc: pipeline workers for SOTC_ASYNC_SHADERS (see AsyncPipelineJob).
     if (AsyncShadersEnabled()) {
-        // SOTC_PIPELINE_WORKERS=<n> sets the number of workers. Default: half the hardware
-        // threads less two, 1 to 6 (cold driver cache into the Shrine, 16 threads: worst frame
-        // 8.1 s with 3 workers, 6.3 s with 6; the game's own threads mostly wait).
+        // SOTC_PIPELINE_WORKERS=<n> sets the number of workers. Default: the hardware threads
+        // less four, 2 to 12. They are busy only on a first visit, while the game's own threads
+        // mostly wait for them (cold caches, attract demo, 16 threads: worst frame 4.8 s with 6
+        // workers, 3.4 s with 12; one worker, the old default on 4 threads: 18 s).
         const char* workers = std::getenv("SOTC_PIPELINE_WORKERS");
         const int threads = static_cast<int>(std::thread::hardware_concurrency());
         const unsigned count = static_cast<unsigned>(
-            workers ? std::clamp(std::atoi(workers), 1, 16) : std::clamp(threads / 2 - 2, 1, 6));
+            workers ? std::clamp(std::atoi(workers), 1, 16) : std::clamp(threads - 4, 2, 12));
         for (unsigned i = 0; i < count; ++i) {
             async_workers.emplace_back([this](std::stop_token token) { AsyncPipelineWorker(token); });
         }
@@ -593,6 +595,33 @@ void PipelineCache::RunAsyncTranslate(AsyncPipelineJob::Translate& t) {
     };
     auto binding = t.start;
     auto runtime_info = t.runtime_info;
+    // The tables the user data points to may already hold the game's next data: a translation
+    // that asserts on what it read gives the shader back to the command processor.
+    Common::g_assert_throws = true;
+    try {
+        TranslateOnWorker(t, params, binding, runtime_info, worker_pools);
+    } catch (const Common::AssertFailure&) {
+        t.failed = true;
+        t.new_program.reset();
+        if (t.module) {
+            instance.GetDevice().destroyShaderModule(t.module);
+            t.module = vk::ShaderModule{};
+        }
+    }
+    Common::g_assert_throws = false;
+    SotcStats::async_translate_built.fetch_add(1, std::memory_order_relaxed);
+    SotcStats::async_translate_ns.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                             start_time)
+            .count(),
+        std::memory_order_relaxed);
+}
+
+void PipelineCache::TranslateOnWorker(AsyncPipelineJob::Translate& t,
+                                      const Shader::ShaderParams& params,
+                                      Shader::Backend::Bindings& binding,
+                                      Shader::RuntimeInfo& runtime_info,
+                                      Shader::Pools& worker_pools) {
     if (!t.program) {
         t.new_program = std::make_unique<Program>(t.hw_stage, t.sw_stage, params);
         t.module = CompileModule(t.new_program->info, runtime_info, params.code, 0, binding,
@@ -608,17 +637,16 @@ void PipelineCache::RunAsyncTranslate(AsyncPipelineJob::Translate& t) {
                                                       t.start};
         t.stale = !(worker_spec == *t.spec);
     }
-    SotcStats::async_translate_built.fetch_add(1, std::memory_order_relaxed);
-    SotcStats::async_translate_ns.fetch_add(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
-                                                             start_time)
-            .count(),
-        std::memory_order_relaxed);
 }
 
 void PipelineCache::InstallTranslation(AsyncPipelineJob::Translate& t) {
     if (!t.program) {
         pending_programs.erase(t.hash);
+        if (t.failed) {
+            SotcStats::async_translate_stale.fetch_add(1, std::memory_order_relaxed);
+            in_place_programs.insert(t.hash);
+            return;
+        }
         auto [it, is_new] = program_cache.try_emplace(t.hash);
         if (!is_new) {
             // Translated meanwhile on the command processor (by a draw that may not wait).
@@ -640,7 +668,7 @@ void PipelineCache::InstallTranslation(AsyncPipelineJob::Translate& t) {
         pending != program.pending_specs.end()) {
         program.pending_specs.erase(pending);
     }
-    if (t.stale) {
+    if (t.stale || t.failed) {
         SotcStats::async_translate_stale.fetch_add(1, std::memory_order_relaxed);
         program.translate_in_place = true;
         instance.GetDevice().destroyShaderModule(t.module);
@@ -1088,7 +1116,8 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
                                                 bool async_ok) {
     // sotc: copied only where CompileModule needs a mutable one (it was copied on every call).
     const auto& rt = BuildRuntimeInfo(hw_stage, sw_stage);
-    if (async_ok && !program_cache.contains(params.hash)) {
+    if (async_ok && !program_cache.contains(params.hash) &&
+        !in_place_programs.contains(params.hash)) {
         if (pending_programs.insert(params.hash).second) {
             QueueAsyncTranslate(hw_stage, sw_stage, params, rt, binding, nullptr, nullptr, 0);
         }

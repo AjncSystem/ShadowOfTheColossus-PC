@@ -1,5 +1,6 @@
 // bbport: SDL3 window for the Vulkan swapchain (X11 or Wayland).
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,6 +26,53 @@ bool MouseEnabled() {
         return !v || v[0] != '0';
     }();
     return enabled;
+}
+// sotc: the present thread flips on a 60 Hz timer (the PS4 vblank), so a 30 FPS frame should stay
+// on screen for the same number of refreshes every time. Borderless fullscreen keeps the desktop
+// rate: at 74 or 144 Hz the frames alternate between 2 and 3 refreshes and the motion judders.
+// When the desktop rate is not a multiple of 60, fullscreen becomes exclusive at the desktop size
+// and the highest multiple of 60 the display offers. BB_FULLSCREEN_HZ=<Hz> asks for that rate
+// instead; BB_FULLSCREEN_HZ=0 keeps the desktop mode.
+bool IsMultipleOf60(float hz) {
+    const int n = static_cast<int>(hz / 60.0f + 0.5f);
+    return n >= 1 && std::fabs(hz - 60.0f * n) < 0.5f;
+}
+void PickFullscreenMode(SDL_Window* window) {
+    const char* wanted_env = std::getenv("BB_FULLSCREEN_HZ");
+    const float wanted = wanted_env && wanted_env[0] ? static_cast<float>(std::atof(wanted_env)) : -1.0f;
+    if (wanted == 0.0f) {
+        return;
+    }
+    const SDL_DisplayID display = SDL_GetDisplayForWindow(window);
+    const SDL_DisplayMode* desktop = SDL_GetDesktopDisplayMode(display);
+    if (!desktop || (wanted < 0.0f && IsMultipleOf60(desktop->refresh_rate))) {
+        return;
+    }
+    int count = 0;
+    SDL_DisplayMode** modes = SDL_GetFullscreenDisplayModes(display, &count);
+    const SDL_DisplayMode* best = nullptr;
+    for (int i = 0; modes && i < count; i++) {
+        const SDL_DisplayMode* mode = modes[i];
+        if (mode->w != desktop->w || mode->h != desktop->h) {
+            continue;
+        }
+        if (wanted > 0.0f) {
+            if (!best || std::fabs(mode->refresh_rate - wanted) < std::fabs(best->refresh_rate - wanted)) {
+                best = mode;
+            }
+        } else if (IsMultipleOf60(mode->refresh_rate) && (!best || mode->refresh_rate > best->refresh_rate)) {
+            best = mode;
+        }
+    }
+    if (best && SDL_SetWindowFullscreenMode(window, best)) {
+        SDL_SyncWindow(window);
+        std::fprintf(stderr, "Display: exclusive fullscreen %dx%d @ %.2f Hz (desktop %.2f Hz; BB_FULLSCREEN_HZ=0 keeps it)\n",
+                     best->w, best->h, best->refresh_rate, desktop->refresh_rate);
+    } else {
+        std::fprintf(stderr, "Display: desktop %dx%d @ %.2f Hz kept (no %s mode at that size)\n", desktop->w,
+                     desktop->h, desktop->refresh_rate, wanted > 0.0f ? "matching" : "60 Hz multiple");
+    }
+    SDL_free(modes);
 }
 void AddMotion(std::atomic<float>& total, float delta) {
     float old = total.load(std::memory_order_relaxed);
@@ -73,6 +121,9 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
         window_info.render_surface = SDL_GetPointerProperty(wp, SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, nullptr);
     } else {
         UNREACHABLE_MSG("Unsupported SDL video driver {}", driver ? driver : "(none)");
+    }
+    if (fullscreen && fullscreen[0] == '1') {
+        PickFullscreenMode(window);
     }
     int w = 0, h = 0;
     SDL_GetWindowSizeInPixels(window, &w, &h);

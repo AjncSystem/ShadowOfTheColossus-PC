@@ -36,15 +36,16 @@ namespace VideoCore {
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
 
-/// sotc: SOTC_RB_NARROW=1 (64 KiB) or =<KiB> (power of two, 4-512): the readback window, in
-/// bytes; 0 (unset) keeps the 512 KiB one. A readback unprotects every GPU-written page of its
+/// sotc: SOTC_RB_NARROW=<KiB> (power of two, 4-512; 1 or unset = 64 KiB): the readback window,
+/// in bytes; 0 keeps the 512 KiB one (Shrine: 46.0 FPS at 512 KiB, 47.9-48.8 at 64, 47.5 at 128,
+/// 42.9 at 32, where the readbacks double). A readback unprotects every GPU-written page of its
 /// window and the next GPU writes of those pages protect them again one binding at a time (most of
 /// the draw thread's VirtualProtect calls), every frame; a smaller window leaves the pages the
 /// guest does not read protected and GPU-modified. Read once, at static initialisation (no
 /// function-local guard in the fault paths); BufferCache::rb_narrow_window applies it.
 static const u64 rb_narrow_env = [] {
     const char* v = std::getenv("SOTC_RB_NARROW");
-    const u64 kib = v ? std::strtoull(v, nullptr, 10) : 0;
+    const u64 kib = v ? std::strtoull(v, nullptr, 10) : 1;
     if (kib == 0) {
         return u64{0};
     }

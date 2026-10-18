@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
+#include <memory>
 
 #include "core/libraries/videoout/buffer.h"
 #include <imgui.h> // sotc port: ImTextureID only
@@ -47,6 +49,7 @@ enum SchedulerType {
 };
 
 class Rasterizer;
+class FramePacer;
 
 class Presenter {
 public:
@@ -101,7 +104,23 @@ public:
     void Present(Frame* frame, bool is_reusing_frame = false, bool is_game_frame = true);
     Frame* PrepareLastFrame();
 
+    /// sotc: the host presentation thread of SOTC_FG (vk_frame_pacer.h), null without it. When it
+    /// exists it owns the swapchain: frames go to it instead of Present.
+    FramePacer* Pacer() const {
+        return pacer.get();
+    }
+
 private:
+    friend class FramePacer;
+
+    /// sotc: Present without giving the frame back: acquire, blit, overlay, queue present. False
+    /// when the swapchain had no image (frame skipped).
+    bool PresentImage(Frame* frame);
+    /// sotc: gives the frame back to the pool (GetRenderFrame).
+    void ReleaseFrame(Frame* frame);
+    /// sotc: counts a shown game frame (DebugState, SOTC_FRAME_LOG).
+    void CountGameFrame();
+
     Frame* GetRenderFrame();
 
     void RecreateFrame(Frame* frame, u32 width, u32 height);
@@ -135,6 +154,8 @@ private:
     std::condition_variable free_cv;
     std::condition_variable_any frame_cv;
     std::vector<VAddr> vo_buffers_addr;
+    std::chrono::nanoseconds present_lock_time{}; // sotc: last swapchain present (pacer only)
+    std::unique_ptr<FramePacer> pacer;           // sotc: SOTC_FG
 };
 
 } // namespace Vulkan

@@ -34,6 +34,15 @@ public:
     /// Presents the current image and move to the next one
     bool Present();
 
+    /// sotc: id of the last present, 0 without VK_KHR_present_wait (it is enabled only by SOTC_FG).
+    u64 LastPresentId() const {
+        return last_present_id;
+    }
+
+    /// sotc: waits up to timeout_ns until present `id` is on screen; false on timeout or error.
+    /// Presents of an earlier swapchain count as shown.
+    bool WaitPresented(u64 id, u64 timeout_ns) const;
+
     vk::SurfaceKHR GetSurface() const {
         return surface;
     }
@@ -131,6 +140,8 @@ private:
     u32 image_count = 0;
     u32 image_index = 0;
     u32 frame_index = 0;
+    u64 last_present_id = 0;  // sotc: VK_KHR_present_id
+    u64 first_present_id = 1; // sotc: first id given to this swapchain
     bool needs_recreation = true;
     bool needs_hdr = false;    // The game requested HDR swapchain
     bool supports_hdr = false; // SC supports HDR output

@@ -22,6 +22,7 @@
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/renderer_vulkan/vk_frame_pacer.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/sotc_stats.h"
 
@@ -312,11 +313,17 @@ extern "C" uint64_t runtime_memory_carve_splits(void);
 extern "C" uint64_t runtime_file_read_ns_take(void);
 
 void VideoOutDriver::Flip(const Request& req) {
-    // Update HDR status before presenting.
-    presenter->SetHDR(req.port->is_hdr);
+    if (auto* pacer = presenter->Pacer()) {
+        // sotc: SOTC_FG: the frame pacer thread presents (vk_frame_pacer.h); this thread keeps
+        // the guest half of the flip (stats, flip status, events, label).
+        pacer->Enqueue(req.frame, req.port->is_hdr);
+    } else {
+        // Update HDR status before presenting.
+        presenter->SetHDR(req.port->is_hdr);
 
-    // Present the frame.
-    presenter->Present(req.frame);
+        // Present the frame.
+        presenter->Present(req.frame);
+    }
 
     // sotc: SOTC_FPS=1 prints the flip rate every five seconds.
     const bool fps_log = SotcStats::kFpsLog; // sotc: the switch the counters use (sotc_stats.h)
@@ -624,6 +631,9 @@ void VideoOutDriver::Flip(const Request& req) {
                              SotcStats::inv_hle.exchange(0) / 1024.0 / flips,
                              SotcStats::inv_buffer.exchange(0) / 1024.0 / flips);
             }
+            if (auto* pacer = presenter->Pacer()) {
+                out += pacer->TakeStats(seconds); // sotc: SOTC_FG
+            }
             WriteStatsAsync(std::move(out));
             flips = 0;
             window_start = now;
@@ -668,11 +678,18 @@ void VideoOutDriver::Flip(const Request& req) {
 }
 
 void VideoOutDriver::DrawBlankFrame() {
+    if (auto* pacer = presenter->Pacer()) {
+        pacer->RequestBlank(); // sotc: SOTC_FG, the pacer owns the present scheduler
+        return;
+    }
     const auto empty_frame = presenter->PrepareBlankFrame(true);
     presenter->Present(empty_frame, false, false);
 }
 
 void VideoOutDriver::DrawLastFrame() {
+    if (presenter->Pacer()) {
+        return; // sotc: SOTC_FG, FIFO keeps the last frame on screen
+    }
     const auto frame = presenter->PrepareLastFrame();
     if (frame != nullptr) {
         presenter->Present(frame, true);
@@ -760,6 +777,11 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     };
 
     while (!token.stop_requested()) {
+        // sotc: SOTC_FG: the guest vblank may follow the display's measured refresh, so real
+        // frames do not drift against the screen (FramePacer::GuestVblankPeriod).
+        if (auto* pacer = presenter->Pacer()) {
+            timer.SetTargetInterval(pacer->GuestVblankPeriod(vblank_period));
+        }
         timer.Start();
 
         if (DebugState.IsGuestThreadsPaused()) {

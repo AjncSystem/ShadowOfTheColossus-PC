@@ -45,6 +45,11 @@ public:
     std::chrono::nanoseconds GetTotalWait() const {
         return total_wait;
     }
+
+    /// sotc: changes the period (SOTC_FG locks the guest vblank to the display's measured rate).
+    void SetTargetInterval(std::chrono::nanoseconds interval) {
+        target_interval = interval;
+    }
 };
 
 std::string GetCurrentThreadName();

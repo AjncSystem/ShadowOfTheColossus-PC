@@ -262,6 +262,11 @@ add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_sup
 target_include_directories(upscaler-support-test PRIVATE shim)
 target_compile_options(upscaler-support-test PRIVATE -UNDEBUG)
 
+# sotc: display refresh estimate and guest vblank lock of the SOTC_FG frame pacer.
+add_executable(frame-pacer-test EXCLUDE_FROM_ALL ../tests/test_frame_pacer.cpp)
+target_include_directories(frame-pacer-test PRIVATE shadps4)
+target_compile_options(frame-pacer-test PRIVATE -UNDEBUG)
+
 # sotc: GPU cost of the FSR 3.1.6 frame generation step at 1080p/1440p/2160p output (needs a
 # Vulkan device with VK_KHR_compute_shader_derivatives; does not start the game).
 add_executable(fg-bench EXCLUDE_FROM_ALL ../tools/fg_bench.cpp)

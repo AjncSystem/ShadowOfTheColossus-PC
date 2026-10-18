@@ -38,6 +38,7 @@ void Swapchain::Create(u32 width_, u32 height_) {
     needs_recreation = false;
 
     Destroy();
+    first_present_id = last_present_id + 1; // sotc: ids of an old swapchain count as shown
 
     SetSurfaceProperties();
 
@@ -128,7 +129,15 @@ bool Swapchain::AcquireNextImage() {
 }
 
 bool Swapchain::Present() {
+    // sotc: with VK_KHR_present_wait (only under SOTC_FG) each present gets an id, so the frame
+    // pacer can wait for it to be shown outside Scheduler::submit_mutex (WaitPresented).
+    const u64 present_id = last_present_id + 1;
+    const vk::PresentIdKHR present_id_info = {
+        .swapchainCount = 1,
+        .pPresentIds = &present_id,
+    };
     const vk::PresentInfoKHR present_info = {
+        .pNext = instance.IsPresentWaitSupported() ? &present_id_info : nullptr,
         .waitSemaphoreCount = 1,
         .pWaitSemaphores = &present_ready[image_index],
         .swapchainCount = 1,
@@ -137,6 +146,9 @@ bool Swapchain::Present() {
     };
 
     auto result = instance.GetPresentQueue().presentKHR(present_info);
+    if (instance.IsPresentWaitSupported()) {
+        last_present_id = present_id;
+    }
     if (result == vk::Result::eErrorOutOfDateKHR || result == vk::Result::eSuboptimalKHR) {
         needs_recreation = true;
     } else {
@@ -147,6 +159,14 @@ bool Swapchain::Present() {
     frame_index = (frame_index + 1) % image_count;
 
     return !needs_recreation;
+}
+
+bool Swapchain::WaitPresented(u64 id, u64 timeout_ns) const {
+    if (id < first_present_id) {
+        return true;
+    }
+    return instance.GetDevice().waitForPresentKHR(swapchain, id, timeout_ns) ==
+           vk::Result::eSuccess;
 }
 
 void Swapchain::FindPresentFormat() {
@@ -198,6 +218,15 @@ void Swapchain::FindPresentMode() {
         return;
     }
 
+    // sotc: the frame pacer (SOTC_FG, vk_frame_pacer.h) needs every present shown, one per vblank
+    // or later (FIFO, the only mode guaranteed to exist; what ffxVkFrameGenerationSelectPresentMode
+    // picks with frame generation on).
+    if (instance.IsPresentWaitSupported()) {
+        present_mode = vk::PresentModeKHR::eFifo;
+        LOG_INFO(Render_Vulkan, "Frame pacer (SOTC_FG): Fifo present mode");
+        return;
+    }
+
     const auto requested_mode = EmulatorSettings.GetPresentMode();
     if (requested_mode == "Mailbox") {
         present_mode = vk::PresentModeKHR::eMailbox;
@@ -236,6 +265,11 @@ void Swapchain::SetSurfaceProperties() {
 
     // Select number of images in swap chain, we prefer one buffer in the background to work on
     image_count = capabilities.minImageCount + 1;
+    // sotc: the frame pacer keeps up to two presents queued while it records the next one
+    // (ffxVkFrameGenerationRequestedImageCount gives the same minImageCount + 2).
+    if (instance.IsPresentWaitSupported()) {
+        image_count = capabilities.minImageCount + 2;
+    }
     if (capabilities.maxImageCount > 0) {
         image_count = std::min(image_count, capabilities.maxImageCount);
     }

@@ -15,6 +15,7 @@
 #include "sdl_window.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/vk_frame_pacer.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -472,7 +473,12 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
       swapchain{instance, window}, runtime{instance, draw_scheduler},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
-    const u32 num_images = swapchain.GetImageCount();
+    // sotc: with the frame pacer (SOTC_FG) it keeps a frame for its second present while the
+    // next waits in its queue, one may wait in the flip queue and the draw thread prepares
+    // another, so the pool needs at least four.
+    const u32 num_images = instance.IsPresentWaitSupported()
+                               ? std::max(swapchain.GetImageCount(), 4u)
+                               : swapchain.GetImageCount();
     const vk::Device device = instance.GetDevice();
 
     // Create presentation frames.
@@ -494,9 +500,18 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
 
+    // sotc: SOTC_FG presents through its own thread. VK_KHR_present_wait is only enabled with
+    // SOTC_FG, and the pacer needs it to keep its presents from blocking the single queue's lock.
+    if (instance.IsPresentWaitSupported()) {
+        pacer = std::make_unique<FramePacer>(*this);
+    } else if (EmulatorSettings.IsFrameGenEnabled()) {
+        LOG_WARNING(Render_Vulkan, "SOTC_FG: no VK_KHR_present_wait, frames are presented as "
+                                   "without SOTC_FG");
+    }
 }
 
 Presenter::~Presenter() {
+    pacer.reset(); // sotc: stops the pacer thread before what it uses goes away
     // This thread records the last commands of the rasterizer scheduler.
     draw_scheduler.ClaimRecorder();
     draw_scheduler.Finish();
@@ -851,16 +866,23 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
-    // Free the frame for reuse
-    const auto free_frame = [&] {
-        if (!is_reusing_frame) {
-            last_submit_frame = frame;
-            std::scoped_lock fl{free_mutex};
-            free_queue.push(frame);
-            free_cv.notify_one();
+    const bool shown = PresentImage(frame);
+    if (!is_reusing_frame) {
+        ReleaseFrame(frame);
+        if (shown && is_game_frame) {
+            CountGameFrame();
         }
-    };
+    }
+}
 
+void Presenter::ReleaseFrame(Frame* frame) {
+    last_submit_frame = frame;
+    std::scoped_lock fl{free_mutex};
+    free_queue.push(frame);
+    free_cv.notify_one();
+}
+
+bool Presenter::PresentImage(Frame* frame) {
     // Recreate the swapchain if the window was resized.
     if (window.GetWidth() != swapchain.GetWidth() || window.GetHeight() != swapchain.GetHeight()) {
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
@@ -871,8 +893,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         if (!swapchain.AcquireNextImage()) {
             // User resizes the window too fast and GPU can't keep up. Skip this frame.
             LOG_WARNING(Render_Vulkan, "Skipping frame!");
-            free_frame();
-            return;
+            return false;
         }
     }
 
@@ -1120,32 +1141,38 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // Present to swapchain.
     {
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        if (!swapchain.Present()) {
+        // sotc: how long the present holds the queue lock, checked by the frame pacer.
+        const auto start = pacer ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
+        const bool ok = swapchain.Present();
+        if (pacer) {
+            present_lock_time = std::chrono::steady_clock::now() - start;
+        }
+        if (!ok) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
     }
+    return true;
+}
 
-    free_frame();
-    if (!is_reusing_frame && is_game_frame) {
-        DebugState.IncFlipFrameNum();
-        // SOTC_FRAME_LOG=<n> prints the frame count and time to stderr every n frames, for
-        // measuring the frame rate of scripted runs.
-        static const u64 every = [] {
-            const char* v = std::getenv("SOTC_FRAME_LOG");
-            return v ? std::strtoull(v, nullptr, 10) : 0ULL;
-        }();
-        if (every != 0) {
-            static u64 frames = 0;
-            static const auto t0 = std::chrono::steady_clock::now();
-            if (++frames % every == 0) {
-                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    std::chrono::steady_clock::now() - t0)
-                                    .count();
-                std::fprintf(stderr, "SOTCFRAME %llu t=%lldms\n",
-                             static_cast<unsigned long long>(frames),
-                             static_cast<long long>(ms));
-                std::fflush(stderr);
-            }
+void Presenter::CountGameFrame() {
+    DebugState.IncFlipFrameNum();
+    // SOTC_FRAME_LOG=<n> prints the frame count and time to stderr every n frames, for
+    // measuring the frame rate of scripted runs.
+    static const u64 every = [] {
+        const char* v = std::getenv("SOTC_FRAME_LOG");
+        return v ? std::strtoull(v, nullptr, 10) : 0ULL;
+    }();
+    if (every != 0) {
+        static u64 frames = 0;
+        static const auto t0 = std::chrono::steady_clock::now();
+        if (++frames % every == 0) {
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - t0)
+                                .count();
+            std::fprintf(stderr, "SOTCFRAME %llu t=%lldms\n",
+                         static_cast<unsigned long long>(frames), static_cast<long long>(ms));
+            std::fflush(stderr);
         }
     }
 }

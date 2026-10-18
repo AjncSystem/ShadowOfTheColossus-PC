@@ -535,11 +535,15 @@ void VideoOutDriver::Flip(const Request& req) {
                     SotcStats::async_translate_built.load(std::memory_order_relaxed)) {
                 std::fprintf(stderr,
                              "SOTC ASYNC TRANSLATE %llu stages (%.0f ms on workers), %llu draws "
-                             "skipped\n",
+                             "skipped, %llu stale; compute built by the recorder %llu\n",
                              static_cast<unsigned long long>(built),
                              SotcStats::async_translate_ns.load(std::memory_order_relaxed) / 1e6,
                              static_cast<unsigned long long>(
-                                 SotcStats::async_translate_skips.load(std::memory_order_relaxed)));
+                                 SotcStats::async_translate_skips.load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(
+                                 SotcStats::async_translate_stale.load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(SotcStats::async_compute_self_built.load(
+                                 std::memory_order_relaxed)));
             }
             if (const uint64_t faults =
                     SotcStats::srt_walker_faults.load(std::memory_order_relaxed)) {

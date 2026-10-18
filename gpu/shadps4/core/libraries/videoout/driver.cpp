@@ -530,6 +530,17 @@ void VideoOutDriver::Flip(const Request& req) {
                         SotcStats::async_compute_waits.load(std::memory_order_relaxed)),
                     SotcStats::async_compute_wait_ns.load(std::memory_order_relaxed) / 1e6);
             }
+            // sotc: graphics shaders translated by workers (SOTC_ASYNC_TRANSLATE), totals.
+            if (const uint64_t built =
+                    SotcStats::async_translate_built.load(std::memory_order_relaxed)) {
+                std::fprintf(stderr,
+                             "SOTC ASYNC TRANSLATE %llu stages (%.0f ms on workers), %llu draws "
+                             "skipped\n",
+                             static_cast<unsigned long long>(built),
+                             SotcStats::async_translate_ns.load(std::memory_order_relaxed) / 1e6,
+                             static_cast<unsigned long long>(
+                                 SotcStats::async_translate_skips.load(std::memory_order_relaxed)));
+            }
             if (const uint64_t faults =
                     SotcStats::srt_walker_faults.load(std::memory_order_relaxed)) {
                 std::fprintf(stderr, "SOTC SRT walker loads that read zero: %llu\n",

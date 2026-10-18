@@ -498,7 +498,10 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
         static_cast<float>(EmulatorSettings.GetRcasAttenuation() / 1000.f);
 
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
-    pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
+    // sotc: FrameGenSupported is only true with SOTC_FG, present wait means the frame pacer.
+    fg_frames = instance.IsPresentWaitSupported() && instance.FrameGenSupported();
+    pp_pass.Create(device, fg_frames ? vk::Format::eR8G8B8A8Unorm
+                                     : swapchain.GetSurfaceFormat().format);
 
     // sotc: SOTC_FG presents through its own thread. VK_KHR_present_wait is only enabled with
     // SOTC_FG, and the pacer needs it to keep its presents from blocking the single queue's lock.
@@ -544,7 +547,9 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
         vmaDestroyImage(instance.GetAllocator(), frame->image, frame->allocation);
     }
 
-    const vk::Format format = swapchain.GetSurfaceFormat().format;
+    // sotc: R8G8B8A8 for SOTC_FG frame interpolation (fg_frames).
+    const vk::Format format =
+        fg_frames ? vk::Format::eR8G8B8A8Unorm : swapchain.GetSurfaceFormat().format;
     const vk::ImageCreateInfo image_info = {
         .flags = vk::ImageCreateFlagBits::eMutableFormat,
         .imageType = vk::ImageType::e2D,
@@ -1031,7 +1036,11 @@ bool Presenter::PresentImage(Frame* frame) {
                     .srcAccessMask = vk::AccessFlagBits::eTransferRead,
                     .dstAccessMask = vk::AccessFlagBits::eShaderRead,
                     .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
-                    .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                    // sotc: the frame pacer presents a frame more than once and frame
+                    // interpolation reads frames in General, the layout the next present
+                    // starts from (pre_barriers).
+                    .newLayout = pacer ? vk::ImageLayout::eGeneral
+                                       : vk::ImageLayout::eShaderReadOnlyOptimal,
                     .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                     .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
                     .image = frame->image,

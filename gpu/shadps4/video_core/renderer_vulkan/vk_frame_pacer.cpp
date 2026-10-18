@@ -9,12 +9,14 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #ifdef _WIN32
 #include <windows.h>
 #endif
 #include "common/logging/log.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
+#include "video_core/renderer_vulkan/host_passes/fg_pass.h"
 #include "video_core/renderer_vulkan/vk_frame_pacer.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
@@ -28,6 +30,16 @@ bool Passthrough() {
     static const bool value = [] {
         const char* v = std::getenv("SOTC_FG_DEBUG");
         return v && std::strcmp(v, "passthrough") == 0;
+    }();
+    return value;
+}
+
+// SOTC_FG_DEBUG=gen: each generated frame is presented twice and no real frame is (inspection of
+// the interpolation; screenshots of the window then only show generated frames).
+bool GenOnly() {
+    static const bool value = [] {
+        const char* v = std::getenv("SOTC_FG_DEBUG");
+        return v && std::strcmp(v, "gen") == 0;
     }();
     return value;
 }
@@ -73,7 +85,10 @@ FramePacer::FramePacer(Presenter& presenter_)
       thread{[this](std::stop_token token) { Run(token); }} {
     LOG_INFO(Render_Vulkan,
              "Frame pacer (SOTC_FG): {}, display seed {} Hz, guest vblank {} Hz, vblank lock {}",
-             Passthrough() ? "passthrough (each real frame shown twice)" : "real frames only",
+             Passthrough()                ? "passthrough (each real frame shown twice)"
+             : !presenter.instance.FrameGenSupported() ? "real frames only"
+             : GenOnly() ? "frame interpolation, debug: generated frames only (each shown twice)"
+                         : "frame interpolation (optical flow, neutral depth and motion)",
              BbDisplayRefreshHz(), EmulatorSettings.GetVblankFrequency(), VblankLock());
 }
 
@@ -172,6 +187,13 @@ void FramePacer::Run(std::stop_token token) {
     const vk::Device device = presenter.instance.GetDevice();
     bool last_was_second = false;
     std::vector<Frame*> dropped;
+    // sotc: frame interpolation (phase 3), recorded on the present scheduler that this thread owns.
+    std::unique_ptr<HostPasses::FgPass> fg;
+    if (presenter.instance.FrameGenSupported() && !Passthrough()) {
+        fg = std::make_unique<HostPasses::FgPass>(presenter.instance, presenter.present_scheduler,
+                                                  presenter.draw_scheduler);
+    }
+    bool skip_generated = false;
 
     while (!token.stop_requested()) {
         Item item{};
@@ -208,15 +230,21 @@ void FramePacer::Run(std::stop_token token) {
             Show(frame, shown);
             presenter.ReleaseFrame(frame);
             have_last_shown = false;
+            if (fg) {
+                fg->Reset();
+            }
             continue;
         }
         if (!item.frame) {
             continue;
         }
 
-        // D: EMA of the real frame intervals, as handed over at the guest's vblank ticks.
+        // D: EMA of the real frame intervals, as handed over at the guest's vblank ticks. A much
+        // longer interval (loading, shader compile, hitch) starts a new interpolation history.
+        bool hitch = false;
         if (last_arrival != Clock::time_point{}) {
             const double ms = Ms(item.arrival - last_arrival);
+            hitch = ms >= kMaxIntervalMs || (interval_ema_ms > 0.0 && ms > 2.0 * interval_ema_ms);
             if (ms < kMaxIntervalMs) {
                 interval_ema_ms = interval_ema_ms > 0.0 ? interval_ema_ms + 0.1 * (ms - interval_ema_ms)
                                                         : ms;
@@ -224,10 +252,36 @@ void FramePacer::Run(std::stop_token token) {
         }
         last_arrival = item.arrival;
         const double interval_ms = interval_ema_ms;
+        // Two presents per real frame need the real interval to span enough refreshes.
+        const bool two_presents = interval_ms > 0.0 && interval_ms >= MinRatio() * refresh_ms;
 
         presenter.SetHDR(item.hdr);
+
+        // The frame between the previous real frame and this one, shown first.
+        Frame* generated = nullptr;
+        if (fg && !fg->Failed()) {
+            if (!two_presents) {
+                fg->Reset(); // no interpolation work while it could not be shown
+            } else {
+                if (hitch || std::exchange(skip_generated, false)) {
+                    fg->Reset();
+                }
+                generated = fg->Generate(*item.frame, interval_ms);
+                std::scoped_lock lk{stats_mutex};
+                ++stats.interpolated;
+                stats.resets += generated ? 0 : 1;
+                for (const float ms : fg->TakeGpuTimes()) {
+                    stats.fi_gpu_sum_ms += ms;
+                    stats.fi_gpu_max_ms = std::max(stats.fi_gpu_max_ms, double(ms));
+                    ++stats.fi_gpu_count;
+                }
+            }
+        }
+
         Clock::time_point shown_first;
-        if (!Show(item.frame, shown_first)) {
+        // No swapchain image (resize): the frame is skipped. An interpolation that read it is
+        // ahead of the draw thread's next use of it on the queue (FgPass::Generate's barrier).
+        if (!Show(generated ? generated : item.frame, shown_first)) {
             presenter.ReleaseFrame(item.frame);
             continue;
         }
@@ -237,15 +291,25 @@ void FramePacer::Run(std::stop_token token) {
         {
             std::scoped_lock lk{stats_mutex};
             ++stats.real;
+            stats.generated += generated ? 1 : 0;
             stats.interval_ms = interval_ms;
             stats.refresh_ms = refresh_ms;
+            if (!two_presents && interval_ms > 0.0 && (fg || Passthrough())) {
+                ++stats.ratio;
+            }
         }
 
-        if (Passthrough() && interval_ms > 0.0 && shown_first != Clock::time_point{}) {
-            if (interval_ms < MinRatio() * refresh_ms) {
-                std::scoped_lock lk{stats_mutex};
-                ++stats.ratio;
-            } else {
+        // The second present: the real frame after the generated one (the generated one again
+        // with SOTC_FG_DEBUG=gen), or the real frame again in passthrough.
+        Frame* second = generated ? (GenOnly() ? generated : item.frame)
+                        : Passthrough() && two_presents ? item.frame
+                                                        : nullptr;
+        // After a generated frame the real one has to be shown, even late.
+        const bool real_due = second == item.frame && generated;
+        if (second) {
+            const bool timed_out = shown_first == Clock::time_point{}; // no time to aim at
+            bool newer = false;
+            if (!timed_out) {
                 // Aim the second present at the vblank nearest to the middle of the interval:
                 // FIFO shows it at the first vblank after it is submitted, so submit half a
                 // refresh early. ponytail: right for fixed refresh; with VRR it shows half a
@@ -254,30 +318,32 @@ void FramePacer::Run(std::stop_token token) {
                     shown_first + std::chrono::duration_cast<Clock::duration>(
                                       std::chrono::duration<double, std::milli>(
                                           interval_ms / 2.0 - refresh_ms / 2.0));
-                bool newer;
-                {
-                    std::unique_lock lk{mutex};
-                    newer = cv.wait_until(lk, due, [&] {
-                        return token.stop_requested() || !queue.empty();
-                    });
-                }
-                if (newer) {
-                    // The next real frame is here first: it goes on screen now instead.
+                std::unique_lock lk{mutex};
+                newer = cv.wait_until(lk, due, [&] {
+                    return token.stop_requested() || !queue.empty();
+                });
+            }
+            if (newer) {
+                // The next real frame is here first: it goes on screen next instead. A real
+                // frame after a generated one is still shown (now), and the next real frame
+                // gets no generated frame, so the queue does not fall behind.
+                std::scoped_lock lk{stats_mutex};
+                ++stats.late;
+            }
+            if ((!newer && !timed_out) || real_due) {
+                // A frame shown before has its blit done (its image is on screen), so its fence
+                // may be reset for the second present.
+                (void)device.waitForFences(second->present_done, true,
+                                           std::numeric_limits<u64>::max());
+                Clock::time_point shown_second;
+                if (Show(second, shown_second)) {
+                    const bool on_time = !newer && !timed_out;
+                    OnShown(shown_second, on_time ? interval_ms / 2.0 : 0.0);
+                    last_was_second = on_time;
                     std::scoped_lock lk{stats_mutex};
-                    ++stats.late;
-                } else {
-                    // The first present's blit is done (its image is on screen), so the frame's
-                    // fence may be reset for the second one.
-                    (void)device.waitForFences(item.frame->present_done, true,
-                                               std::numeric_limits<u64>::max());
-                    Clock::time_point shown_second;
-                    if (Show(item.frame, shown_second)) {
-                        OnShown(shown_second, interval_ms / 2.0);
-                        last_was_second = true;
-                        std::scoped_lock lk{stats_mutex};
-                        ++stats.second;
-                    }
+                    ++stats.second;
                 }
+                skip_generated = newer;
             }
         }
         presenter.ReleaseFrame(item.frame);
@@ -301,17 +367,28 @@ std::string FramePacer::TakeStats(double seconds) {
                                                    static_cast<size_t>(p * s.pace_err_ms.size()))]);
     };
     const s64 locked = locked_vblank_ns.load(std::memory_order_relaxed);
-    char line[512];
+    // Frame interpolation: generated frames shown, interpolations run (the ones that started a
+    // new history show nothing) and their GPU time.
+    char fi[192] = "";
+    if (presenter.instance.FrameGenSupported() && !Passthrough()) {
+        std::snprintf(fi, sizeof(fi),
+                      "; FG generated %.1f/s, interpolations %.1f/s (new history %u), fi gpu avg "
+                      "%.2f max %.2f ms",
+                      s.generated / seconds, s.interpolated / seconds, s.resets,
+                      s.fi_gpu_count ? s.fi_gpu_sum_ms / s.fi_gpu_count : 0.0, s.fi_gpu_max_ms);
+    }
+    char line[768];
     std::snprintf(line, sizeof(line),
                   "SOTC FG pacer%s: real %.1f/s, presents %.1f/s, second %.1f/s (skipped: late "
                   "%u, ratio %u), dropped %u; display %.3f Hz (%u rejected), real interval "
                   "%.2f ms, guest vblank %.3f Hz%s; pace err p50 %.2f p99 %.2f ms; present lock "
-                  "max %.2f ms, timeouts %u\n",
-                  Passthrough() ? " passthrough" : "", s.real / seconds, s.presents / seconds,
+                  "max %.2f ms, timeouts %u%s\n",
+                  Passthrough() ? " passthrough" : GenOnly() ? " gen" : "", s.real / seconds,
+                  s.presents / seconds,
                   s.second / seconds, s.late, s.ratio, s.dropped,
                   s.refresh_ms > 0.0 ? 1000.0 / s.refresh_ms : 0.0, s.rejected, s.interval_ms,
                   1e9 / double(locked ? locked : nominal_vblank_ns), locked ? " (locked)" : "",
-                  pct(0.5), pct(0.99), s.lock_max_ms, s.timeouts);
+                  pct(0.5), pct(0.99), s.lock_max_ms, s.timeouts, fi);
     return line;
 }
 

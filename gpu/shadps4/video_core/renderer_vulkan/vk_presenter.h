@@ -155,6 +155,10 @@ private:
     std::condition_variable_any frame_cv;
     std::vector<VAddr> vo_buffers_addr;
     std::chrono::nanoseconds present_lock_time{}; // sotc: last swapchain present (pacer only)
+    /// sotc: SOTC_FG frame interpolation may run: frame images are R8G8B8A8_UNORM, the fixed
+    /// color format of FSR 3.1.6 FI, which reads them directly (the blit to the swapchain
+    /// converts to its BGRA format).
+    bool fg_frames{};
     std::unique_ptr<FramePacer> pacer;           // sotc: SOTC_FG
 };
 

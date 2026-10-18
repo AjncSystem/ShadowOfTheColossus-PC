@@ -11,8 +11,13 @@
 // another: vkQueuePresentKHR cannot block inside the single queue's lock, and the wake-up times
 // measure the display's real refresh. Real frames are paced by the EMA of their intervals.
 //
-// SOTC_FG_DEBUG=passthrough presents each real frame a second time half an interval later, in
-// the slot where frame interpolation will put the generated frame (Phase 3).
+// With frame interpolation (the device has what FSR 3.1.6 FI needs, host_passes/fg_pass.h), each
+// real frame N first generates the frame between N-1 and N, which goes on screen when N arrives;
+// N follows half a real interval later.
+//
+// SOTC_FG_DEBUG=passthrough presents each real frame twice instead (pacing test, no
+// interpolation); SOTC_FG_DEBUG=gen presents each generated frame twice and no real frame (to
+// inspect the interpolation).
 
 #pragma once
 
@@ -114,6 +119,9 @@ private:
 
     struct Stats {
         u32 real{}, presents{}, second{}, late{}, ratio{}, dropped{}, timeouts{}, rejected{};
+        u32 interpolated{}, generated{}, resets{}; // frame interpolation
+        double fi_gpu_sum_ms{}, fi_gpu_max_ms{};
+        u32 fi_gpu_count{};
         double lock_max_ms{};
         double interval_ms{}, refresh_ms{}; // last D and P, for the stats line
         std::vector<float> pace_err_ms;

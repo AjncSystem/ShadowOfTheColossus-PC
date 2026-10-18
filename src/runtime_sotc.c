@@ -1,5 +1,6 @@
 /* Shadow of the Colossus (CUSA08809) imports that Bloodborne never calls.
  * Each function follows the PS4 contract as implemented by shadPS4 (GPL-2.0-or-later). */
+#define _GNU_SOURCE
 #define _CRT_RAND_S
 #include "runtime.h"
 #include <errno.h>

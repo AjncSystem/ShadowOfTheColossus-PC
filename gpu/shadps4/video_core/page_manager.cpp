@@ -15,6 +15,12 @@
 #include <mutex>
 #include <shared_mutex>
 #include <atomic>
+// bbport: MAX_PATH is a Windows constant (260); on POSIX it is not defined.
+// The shadPS4 common/pathUtil.cpp uses the same guard. page_manager.cpp uses it
+// outside #ifdef _WIN32 (the readback-fault report buffer), so define it here.
+#ifndef MAX_PATH
+#define MAX_PATH 1024
+#endif
 #include "common/alignment.h"
 #include "common/adaptive_mutex.h"
 #include "common/assert.h"

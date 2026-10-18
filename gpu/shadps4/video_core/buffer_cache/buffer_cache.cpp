@@ -21,7 +21,14 @@
 #include "video_core/buffer_cache/bpe_heap_guard.h"
 #include <optional>
 
+// runtime_sotc_heap is defined in src/probe.c (inside #ifdef _WIN32: the heap hook
+// patches the eboot via VirtualProtect). On Linux there is no heap hook, so the GPU
+// buffer cache gets 0 (its heap != 0 guard then skips the chosen-heap path).
+#ifndef _WIN32
+extern "C" uintptr_t runtime_sotc_heap(void) { return 0; }
+#else
 extern "C" uintptr_t runtime_sotc_heap(void);
+#endif
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"

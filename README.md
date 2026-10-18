@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC (port nativo / native port) · v0.64-cp-mt
+# Shadow of the Colossus — PC (port nativo / native port) · v0.65-cp-mt
 
 **[Português](#português)** · **[English](#english)** · [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
@@ -21,6 +21,7 @@ de que o jogo precisa, no estilo do [bloodborne_pc](https://github.com/Supermedo
 
 | Versão | Melhorias e correções |
 |---|---|
+| **0.65-cp-mt** | **+4% de FPS** (janela de readback menor; Santuário 46 → 48 FPS). Opção "Sombras do sol" no lançador (desligada: +6% FPS, sem sombras do sol). Lançador não fecha mais quando o console recusa escrita. |
 | **0.64-cp-mt** | **+10% de FPS** (build com PGO; Santuário 41 → 45 FPS). |
 | **0.63-cp-mt** | **Primeira visita a cada área bem mais lisa** (tradução de shaders 15,6 → 3,0 s por sessão; travada ao carregar o save 7,8 → 1,4 s). |
 | **0.62-cp-mt** | **Fim do solavanco a cada 5 s** com "mostrar FPS" ligado (pior quadro ~125 → ~34 ms). |
@@ -127,6 +128,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.65-cp-mt** | **+4% FPS** (smaller readback window; Shrine 46 → 48 FPS). "Sun shadows" launcher option (off: +6% FPS, no sun shadows). Launcher no longer quits when the console refuses writes. |
 | **0.64-cp-mt** | **+10% FPS** (PGO build; Shrine 41 → 45 FPS). |
 | **0.63-cp-mt** | **Much smoother first visit to each area** (shader translation 15.6 → 3.0 s per session; save-load stall 7.8 → 1.4 s). |
 | **0.62-cp-mt** | **No more hitch every 5 s** with the FPS display on (worst frame ~125 → ~34 ms). |

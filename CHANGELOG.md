@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.65-cp-mt — 2026-10-18
+- **+4% de FPS: janela de readback menor** (`SOTC_RB_NARROW`, padrão 64 KiB). Quando o jogo lê um
+  dado que a GPU escreveu, o motor baixava e desprotegia 512 KiB em volta; depois a GPU protegia
+  tudo de novo, página por página, a cada quadro. Agora só 64 KiB. Santuário (mesmo exe, chave
+  desligada/ligada): 46,4 / 46,4 → **48,1 / 48,8 FPS**. `SOTC_RB_NARROW=0` volta ao antigo.
+- Lançador: nova opção **"Sombras do sol"** (Gráficos > Desempenho, ligada por padrão). Desligada, o
+  jogo não desenha as sombras do sol (cvar `r_enableCascadeShadows=0`): ~1000 draws a menos por
+  quadro, Santuário 48 → **50,7 FPS** (+6%), mas a cena fica mais clara e lisa.
+- Lançador: os scripts de preparação não fecham mais quando o console recusa escrita (issue #104
+  do repositório oficial).
+
 ## 0.64-cp-mt — 2026-10-17 (fork Lucas-blip-png, branch cp-mt)
 - **Motor compilado com otimização guiada por perfil (PGO)**, treinado no Santuário (modo normal) e
   com um save após o 1º colosso no modo PS4 Pro (cinemático e desempenho). Mesmo código da 0.63.

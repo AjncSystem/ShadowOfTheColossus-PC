@@ -497,6 +497,19 @@ void VideoOutDriver::Flip(const Request& req) {
                     static_cast<unsigned long long>(
                         SotcStats::arena_evict_mismatch.load(std::memory_order_relaxed) >> 20));
             }
+            // sotc: compute pipelines built by workers (SOTC_ASYNC_COMPUTE), totals.
+            if (const uint64_t built =
+                    SotcStats::async_compute_built.load(std::memory_order_relaxed)) {
+                std::fprintf(
+                    stderr,
+                    "SOTC ASYNC COMPUTE built %llu (%.0f ms on workers), recorder waited %llu "
+                    "times (%.0f ms)\n",
+                    static_cast<unsigned long long>(built),
+                    SotcStats::async_compute_build_ns.load(std::memory_order_relaxed) / 1e6,
+                    static_cast<unsigned long long>(
+                        SotcStats::async_compute_waits.load(std::memory_order_relaxed)),
+                    SotcStats::async_compute_wait_ns.load(std::memory_order_relaxed) / 1e6);
+            }
             const bool cmd_stats = SotcStats::kCmdStats; // sotc: as the counters (sotc_stats.h)
             if (cmd_stats && flips) {
                 double k[6];

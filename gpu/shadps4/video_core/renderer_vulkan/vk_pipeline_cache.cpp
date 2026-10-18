@@ -6,6 +6,9 @@
 #include <xxhash.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <unordered_set>
 #include "common/elf_info.h"
 #include "common/hash.h"
@@ -300,6 +303,16 @@ static bool AsyncShadersEnabled() {
     return enabled;
 }
 
+// sotc: SOTC_ASYNC_COMPUTE=0 builds compute pipelines on the command processor (see
+// AsyncPipelineJob).
+static bool AsyncComputeEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_ASYNC_COMPUTE");
+        return !v || v[0] != '0';
+    }();
+    return enabled;
+}
+
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
@@ -373,7 +386,13 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 
     // sotc: pipeline workers for SOTC_ASYNC_SHADERS (see AsyncPipelineJob).
     if (AsyncShadersEnabled()) {
-        const unsigned count = std::clamp(std::thread::hardware_concurrency() / 4, 1u, 3u);
+        // SOTC_PIPELINE_WORKERS=<n> sets the number of workers. Default: half the hardware
+        // threads less two, 1 to 6 (cold driver cache into the Shrine, 16 threads: worst frame
+        // 8.1 s with 3 workers, 6.3 s with 6; the game's own threads mostly wait).
+        const char* workers = std::getenv("SOTC_PIPELINE_WORKERS");
+        const int threads = static_cast<int>(std::thread::hardware_concurrency());
+        const unsigned count = static_cast<unsigned>(
+            workers ? std::clamp(std::atoi(workers), 1, 16) : std::clamp(threads / 2 - 2, 1, 6));
         for (unsigned i = 0; i < count; ++i) {
             async_workers.emplace_back([this](std::stop_token token) { AsyncPipelineWorker(token); });
         }
@@ -381,6 +400,28 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 }
 
 PipelineCache::~PipelineCache() = default;
+
+// sotc: a pipeline built on the command processor that took longer than 30 ms is logged with
+// the reason it was not built on a pipeline worker (SOTC_SYNC_PIPELINE_MS changes the limit).
+static void LogSyncPipeline(const char* kind, const char* reason,
+                            std::chrono::steady_clock::time_point start, u64 hash_a, u64 hash_b) {
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+            .count();
+    static const double min_ms = [] {
+        const char* v = std::getenv("SOTC_SYNC_PIPELINE_MS");
+        return v ? std::atof(v) : 30.0;
+    }();
+    static const auto t0 = start;
+    static std::atomic<int> logged{0};
+    if (ms < min_ms || logged.fetch_add(1, std::memory_order_relaxed) >= 2000) {
+        return;
+    }
+    const double at = std::chrono::duration<double, std::milli>(start - t0).count();
+    std::fprintf(stderr, "SOTC SYNC PIPELINE %s (%s) %.0f ms, shaders %016llx %016llx, at %.1f\n",
+                 kind, reason, ms, static_cast<unsigned long long>(hash_a),
+                 static_cast<unsigned long long>(hash_b), at);
+}
 
 bool PipelineCache::AsyncPipelineEligible() const {
     // Off the command processor the guest registers belong to later draws: only pipelines whose
@@ -428,10 +469,33 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
             std::unique_lock lock{async_mutex};
             async_cv.wait(lock, token, [this] { return !async_queue.empty(); });
             if (token.stop_requested()) {
+                // A queued compute pipeline may be waited for by the recording thread: build
+                // those before leaving.
+                while (!async_queue.empty()) {
+                    job = std::move(async_queue.front());
+                    async_queue.pop_front();
+                    if (job->compute) {
+                        job->compute->Build();
+                    }
+                }
                 return;
             }
             job = std::move(async_queue.front());
             async_queue.pop_front();
+            if (job->compute) {
+                --async_compute_queued;
+            }
+        }
+        if (job->compute) {
+            const auto start = std::chrono::steady_clock::now();
+            job->compute->Build();
+            SotcStats::async_compute_built.fetch_add(1, std::memory_order_relaxed);
+            SotcStats::async_compute_build_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - start)
+                    .count(),
+                std::memory_order_relaxed);
+            continue;
         }
         job->pipeline = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, job->key, *pipeline_cache, job->infos,
@@ -492,10 +556,12 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         // a black or stale frame, so they still build here. Geometry draws are skipped while
         // their pipeline is built (a brief pop-in instead of a freeze on first sight).
         const bool tiny_draw = liverpool->regs.num_indices <= 6;
-        if (!async_workers.empty() && !tiny_draw && AsyncPipelineEligible()) {
+        const bool eligible = AsyncPipelineEligible();
+        if (!async_workers.empty() && !tiny_draw && eligible) {
             QueueAsyncPipeline(pipeline_hash);
             return nullptr; // the draws that need it are skipped until it is ready
         }
+        const auto sync_start = std::chrono::steady_clock::now();
 
         const SotcStats::FrameTimer frame_timer{SotcStats::FramePipeline};
         SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
@@ -503,6 +569,12 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
             runtime_infos, fetch_shader, modules, sdata, false);
+        LogSyncPipeline("graphics",
+                        async_workers.empty() ? "async off"
+                        : tiny_draw           ? "tiny draw"
+                                              : "not eligible",
+                        sync_start, infos[3] ? infos[3]->pgm_hash : 0, // vertex
+                        infos[0] ? infos[0]->pgm_hash : 0);              // fragment
 
         RegisterPipelineData(graphics_key, pipeline_hash, sdata);
         ++num_new_pipelines;
@@ -533,9 +605,29 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         const SotcStats::FrameTimer frame_timer{SotcStats::FramePipeline};
         SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
         ComputePipeline::SerializationSupport sdata{};
+        // Shader collection replaces modules and erases their pipelines: built here then.
+        // Without a recording thread the command processor itself would wait for the worker.
+        // The presenter's Finish at shutdown runs every deferred bind before the workers stop.
+        const bool deferred = !async_workers.empty() && AsyncComputeEnabled() &&
+                              scheduler.HasRecordThread() && !EmulatorSettings.IsShaderCollect();
+        const auto sync_start = std::chrono::steady_clock::now();
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
                                                        *pipeline_cache, compute_key, *infos[0],
-                                                       modules[0], sdata, false);
+                                                       modules[0], sdata, false, deferred);
+        if (deferred) {
+            auto job = std::make_unique<AsyncPipelineJob>();
+            job->compute = it.value().get();
+            {
+                std::scoped_lock lock{async_mutex};
+                // Ahead of the graphics jobs, after the older compute ones: the recording
+                // thread binds them in this order.
+                async_queue.insert(async_queue.begin() + async_compute_queued++, std::move(job));
+            }
+            async_cv.notify_one();
+        } else {
+            LogSyncPipeline("compute", async_workers.empty() ? "async off" : "not deferred",
+                            sync_start, infos[0]->pgm_hash, 0);
+        }
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
 

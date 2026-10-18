@@ -505,6 +505,17 @@ void VideoOutDriver::Flip(const Request& req) {
                          static_cast<unsigned long long>(SotcStats::cached_images.load()),
                          static_cast<unsigned long long>(SotcStats::cached_image_bytes.load() >> 20));
             last_images_new = images_new;
+            // sotc: SOTC_RB_NARROW: GPU-written pages that the wide readback window would have
+            // downloaded and unprotected (and the GPU protected again), left protected instead.
+            if (const uint64_t kib = SotcStats::rb_narrow_kib.load(std::memory_order_relaxed)) {
+                ReportPrintf(report,
+                             "SOTC RB narrow %llu KiB windows: %.0f KiB/s of GPU-written pages "
+                             "left protected, %llu hot readbacks\n",
+                             static_cast<unsigned long long>(kib),
+                             SotcStats::rb_narrow_kept_bytes.exchange(0) / 1024.0 / seconds,
+                             static_cast<unsigned long long>(
+                                 SotcStats::rb_hot_entries.load(std::memory_order_relaxed)));
+            }
             if (const uint64_t sweeps = SotcStats::dma_sweeps.exchange(0)) {
                 const uint64_t ranges = SotcStats::dma_sweep_ranges.exchange(0);
                 const uint64_t uploading = SotcStats::dma_sweep_uploading.exchange(0);

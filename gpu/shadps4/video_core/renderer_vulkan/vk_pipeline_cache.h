@@ -9,6 +9,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <unordered_set>
 #include <variant>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
@@ -54,6 +55,8 @@ struct Program {
 
     Shader::Info info;
     ModuleList modules{};
+    /// sotc: permutations being translated by a pipeline worker (SOTC_ASYNC_TRANSLATE).
+    std::vector<Shader::StageSpecialization> pending_specs;
 
     Program() = default;
     Program(Shader::HwStage stage, Shader::SwStage l_stage, Shader::ShaderParams params)
@@ -93,8 +96,11 @@ public:
     const ComputePipeline* GetComputePipeline();
 
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule, u64>;
+    /// sotc: async_ok: a stage that needs translating is queued for a pipeline worker instead
+    /// (SOTC_ASYNC_TRANSLATE); it returns a null Info and sets translation_pending meanwhile.
     Result GetProgram(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
-                      const Shader::ShaderParams& params, Shader::Backend::Bindings& binding);
+                      const Shader::ShaderParams& params, Shader::Backend::Bindings& binding,
+                      bool async_ok = false);
 
     std::optional<vk::ShaderModule> ReplaceShader(vk::ShaderModule module,
                                                   std::span<const u32> spv_code);
@@ -119,9 +125,14 @@ private:
     std::optional<std::vector<u32>> GetShaderPatch(u64 hash, Shader::HwStage stage, size_t perm_idx,
                                                    std::string_view ext,
                                                    std::span<const u32> generated);
+    /// sotc: on a pipeline worker, worker_pools replaces the command processor's pools and the
+    /// SPIR-V is returned in spv_out instead of being stored (the permutation index is only
+    /// known when the command processor installs the module).
     vk::ShaderModule CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                    const std::span<const u32>& code, size_t perm_idx,
-                                   Shader::Backend::Bindings& binding);
+                                   Shader::Backend::Bindings& binding,
+                                   Shader::Pools* worker_pools = nullptr,
+                                   std::vector<u32>* spv_out = nullptr);
     const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::HwStage stage, Shader::SwStage l_stage);
 
     [[nodiscard]] bool IsPipelineCacheDirty() const {
@@ -144,9 +155,36 @@ private:
         std::array<vk::ShaderModule, MaxShaderStages> modules{};
         GraphicsPipeline::SerializationSupport sdata{};
         std::unique_ptr<GraphicsPipeline> pipeline;
+
+        /// sotc: SOTC_ASYNC_TRANSLATE (default on): a graphics shader stage seen for the first
+        /// time (or a new permutation of one) is translated by a worker, queued after the compute
+        /// jobs and ahead of the pipeline jobs; the draws that need it are skipped meanwhile, as
+        /// for a pipeline being built. The command processor installs the result.
+        struct Translate {
+            Shader::HwStage hw_stage{};
+            Shader::SwStage sw_stage{};
+            u64 hash{};
+            std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
+            std::span<const u32> code;
+            Shader::RuntimeInfo runtime_info{};
+            Shader::Backend::Bindings start{};
+            Program* program{}; ///< set for a new permutation of an existing program
+            size_t perm_idx{};  ///< provisional (patch file name only)
+            std::optional<Shader::StageSpecialization> spec;
+            std::unique_ptr<Program> new_program;
+            vk::ShaderModule module{};
+            std::vector<u32> spv;
+        };
+        std::unique_ptr<Translate> translate; ///< a translation job
     };
     bool AsyncPipelineEligible() const;
     void QueueAsyncPipeline(u64 hash);
+    void QueueAsyncTranslate(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
+                             const Shader::ShaderParams& params, const Shader::RuntimeInfo& rt,
+                             const Shader::Backend::Bindings& start, Program* program,
+                             const Shader::StageSpecialization* spec, size_t perm_idx);
+    void RunAsyncTranslate(AsyncPipelineJob::Translate& job);
+    void InstallTranslation(AsyncPipelineJob::Translate& job);
     void CollectAsyncPipelines();
     void AsyncPipelineWorker(std::stop_token token);
 
@@ -185,6 +223,10 @@ private:
     std::condition_variable_any async_cv;
     std::deque<std::unique_ptr<AsyncPipelineJob>> async_queue;
     size_t async_compute_queued{}; ///< compute jobs at the head of async_queue, oldest first
+    size_t async_translate_queued{}; ///< translation jobs right after them, oldest first
+    std::unordered_set<u64> pending_programs; ///< new programs being translated (CP only)
+    bool async_translate_ok{};  ///< this draw may queue its translations (CP only)
+    bool translation_pending{}; ///< a stage of this draw is being translated (CP only)
     std::vector<std::unique_ptr<AsyncPipelineJob>> async_done;
     std::atomic<u32> async_done_count{0};
     std::vector<std::jthread> async_workers;

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <mutex>
 #include <cstdlib>
 #include <optional>
 #include <unordered_map>
@@ -37,6 +38,9 @@ using namespace Xbyak::util;
 // throws, the emulator died at boot). Untouched pages of the buffer are never used.
 static constexpr size_t SrtCodegenSize = 256_MB;
 static Xbyak::CodeGenerator g_srt_codegen(SrtCodegenSize);
+// sotc: graphics shaders are also translated on pipeline workers (SOTC_ASYNC_TRANSLATE): one
+// walker is generated at a time. Running walkers only read code that is already complete.
+static std::mutex g_srt_codegen_mutex;
 
 /// True when size more bytes fit in the walker buffer; logs the first overflow.
 static bool SrtCodeFits(size_t size) {
@@ -143,6 +147,7 @@ void MarkSrtCleanPages(u64 address, u32 size) {
 }
 
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
+    std::scoped_lock lock{g_srt_codegen_mutex};
     EnsureSrtWalkerFaultHandler();
     if (!SrtCodeFits(size)) {
         return nullptr;
@@ -281,7 +286,9 @@ struct PassInfo {
 
     // Walker loads test the clean-page bitmap (SrtWalkerContext in r13)
     bool clean_loads = false;
-    Xbyak::Label clean_load_stub;
+    // sotc: emplaced and reset under g_srt_codegen_mutex: a used label unregisters itself from
+    // the shared code generator when destroyed.
+    std::optional<Xbyak::Label> clean_load_stub;
     bool uses_clean_load_stub = false;
 
     PtrUserList* GetUsesAsPointer(IR::Inst* inst) {
@@ -722,7 +729,7 @@ static void EmitGuestLoad(Xbyak::CodeGenerator& c, PassInfo& pass_info, GuestLoa
     c.bt(qword[r9], rax);
     c.jnc(plain, Xbyak::CodeGenerator::T_NEAR);
     c.mov(eax, size);
-    c.call(pass_info.clean_load_stub);
+    c.call(*pass_info.clean_load_stub);
     pass_info.uses_clean_load_stub = true;
     c.test(al, al);
     c.jz(plain, Xbyak::CodeGenerator::T_NEAR);
@@ -745,7 +752,7 @@ static void EmitGuestLoad(Xbyak::CodeGenerator& c, PassInfo& pass_info, GuestLoa
 /// independent: calls clean_load(r11, eax, &value) with the walker registers saved and the stack
 /// aligned. Returns the result in al and the value in r9.
 static void EmitCleanLoadStub(Xbyak::CodeGenerator& c, PassInfo& pass_info) {
-    c.L(pass_info.clean_load_stub);
+    c.L(*pass_info.clean_load_stub);
     c.push(rcx);
     c.push(rdx);
     c.push(rsi);
@@ -893,6 +900,7 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
         return;
     }
 
+    std::scoped_lock lock{g_srt_codegen_mutex};
     EnsureSrtWalkerFaultHandler();
     // A walker is at most a few hundred KB; without that much room left, skip it (the shader
     // then reads zeros from its flattened user data) rather than overflow the buffer.
@@ -900,6 +908,7 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
         return;
     }
 
+    pass_info.clean_load_stub.emplace();
     info.srt_info.walker_func = c.getCurr<PFN_SrtWalker>();
     // Keep the copy helper (third argument) and the walker context (fourth) in registers the
     // generated code does not use.
@@ -932,6 +941,7 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
     }
 
     info.srt_info.flattened_bufsize_dw = pass_info.dst_off_dw;
+    pass_info.clean_load_stub.reset();
 }
 
 static bool IsReadConstSource(const IR::Value base) {

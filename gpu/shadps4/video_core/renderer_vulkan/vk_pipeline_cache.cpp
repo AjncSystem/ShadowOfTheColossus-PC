@@ -303,6 +303,16 @@ static bool AsyncShadersEnabled() {
     return enabled;
 }
 
+// sotc: SOTC_ASYNC_TRANSLATE=0 translates every graphics shader on the command processor (see
+// AsyncPipelineJob::Translate).
+static bool AsyncTranslateEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_ASYNC_TRANSLATE");
+        return !v || v[0] != '0';
+    }();
+    return enabled;
+}
+
 // sotc: SOTC_ASYNC_COMPUTE=0 builds compute pipelines on the command processor (see
 // AsyncPipelineJob).
 static bool AsyncComputeEnabled() {
@@ -489,7 +499,16 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
             async_queue.pop_front();
             if (job->compute) {
                 --async_compute_queued;
+            } else if (job->translate) {
+                --async_translate_queued;
             }
+        }
+        if (job->translate) {
+            RunAsyncTranslate(*job->translate);
+            std::scoped_lock lock{async_mutex};
+            async_done.push_back(std::move(job));
+            async_done_count.fetch_add(1, std::memory_order_release);
+            continue;
         }
         if (job->compute) {
             const auto start = std::chrono::steady_clock::now();
@@ -521,6 +540,10 @@ void PipelineCache::CollectAsyncPipelines() {
         async_done_count.store(0, std::memory_order_relaxed);
     }
     for (auto& job : done) {
+        if (job->translate) {
+            InstallTranslation(*job->translate);
+            continue;
+        }
         const auto it = graphics_pipelines.find(job->key);
         if (it == graphics_pipelines.end()) {
             continue;
@@ -531,9 +554,115 @@ void PipelineCache::CollectAsyncPipelines() {
     }
 }
 
+void PipelineCache::QueueAsyncTranslate(HwStage hw_stage, SwStage sw_stage,
+                                        const Shader::ShaderParams& params,
+                                        const Shader::RuntimeInfo& rt,
+                                        const Shader::Backend::Bindings& start, Program* program,
+                                        const Shader::StageSpecialization* spec, size_t perm_idx) {
+    auto job = std::make_unique<AsyncPipelineJob>();
+    auto& t = *(job->translate = std::make_unique<AsyncPipelineJob::Translate>());
+    t.hw_stage = hw_stage;
+    t.sw_stage = sw_stage;
+    t.hash = params.hash;
+    // The user data registers change with the next draws: the worker reads a copy. The code
+    // stays in guest memory (inline constants are addressed from it).
+    std::ranges::copy(params.user_data, t.user_data.begin());
+    t.code = params.code;
+    t.runtime_info = rt;
+    t.start = start;
+    t.program = program;
+    t.perm_idx = perm_idx;
+    if (spec) {
+        t.spec = *spec;
+    }
+    {
+        std::scoped_lock lock{async_mutex};
+        async_queue.insert(async_queue.begin() + async_compute_queued + async_translate_queued++,
+                           std::move(job));
+    }
+    async_cv.notify_one();
+}
+
+void PipelineCache::RunAsyncTranslate(AsyncPipelineJob::Translate& t) {
+    static thread_local Shader::Pools worker_pools;
+    const auto start_time = std::chrono::steady_clock::now();
+    const Shader::ShaderParams params{
+        .user_data = std::span<const u32, Shader::ShaderParams::NumShaderUserData>{t.user_data},
+        .code = t.code,
+        .hash = t.hash,
+    };
+    auto binding = t.start;
+    auto runtime_info = t.runtime_info;
+    if (!t.program) {
+        t.new_program = std::make_unique<Program>(t.hw_stage, t.sw_stage, params);
+        t.module = CompileModule(t.new_program->info, runtime_info, params.code, 0, binding,
+                                 &worker_pools, &t.spv);
+        t.spec.emplace(t.new_program->info, runtime_info, profile, t.start);
+    } else {
+        auto new_info = Shader::Info(t.hw_stage, t.sw_stage, params);
+        t.module = CompileModule(new_info, runtime_info, params.code, t.perm_idx, binding,
+                                 &worker_pools, &t.spv);
+    }
+    SotcStats::async_translate_built.fetch_add(1, std::memory_order_relaxed);
+    SotcStats::async_translate_ns.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                             start_time)
+            .count(),
+        std::memory_order_relaxed);
+}
+
+void PipelineCache::InstallTranslation(AsyncPipelineJob::Translate& t) {
+    if (!t.program) {
+        pending_programs.erase(t.hash);
+        auto [it, is_new] = program_cache.try_emplace(t.hash);
+        if (!is_new) {
+            // Translated meanwhile on the command processor (by a draw that may not wait).
+            instance.GetDevice().destroyShaderModule(t.module);
+            return;
+        }
+        it.value() = std::move(t.new_program);
+        auto& program = it.value();
+        RegisterShaderBinary(std::move(t.spv), t.hash, 0);
+        RegisterShaderMeta(program->info, t.spec->fetch_shader_data, *t.spec,
+                           HashCombine(t.hash, 0), 0);
+        program->AddPermut(t.module, std::move(*t.spec));
+        // The user data seen by the worker goes away with the job; every lookup sets its own.
+        program->info.UserData() = {};
+        return;
+    }
+    auto& program = *t.program;
+    if (const auto pending = std::ranges::find(program.pending_specs, *t.spec);
+        pending != program.pending_specs.end()) {
+        program.pending_specs.erase(pending);
+    }
+    if (std::ranges::find(program.modules, *t.spec, &Program::Module::spec) !=
+        program.modules.end()) {
+        instance.GetDevice().destroyShaderModule(t.module);
+        return;
+    }
+    const size_t perm_idx = program.modules.size();
+    RegisterShaderBinary(std::move(t.spv), t.hash, perm_idx);
+    RegisterShaderMeta(program.info, t.spec->fetch_shader_data, *t.spec,
+                       HashCombine(t.hash, perm_idx), perm_idx);
+    program.AddPermut(t.module, std::move(*t.spec));
+}
+
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     draw_indirect_params = params;
+    // sotc: finished translations must be installed before the stages are looked up.
+    if (async_done_count.load(std::memory_order_acquire) != 0) {
+        CollectAsyncPipelines();
+    }
+    // sotc: full-screen passes (tiny draws, see below) are never skipped, so their shaders are
+    // translated here. Without dynamic vertex input the key needs the vertex shader's sharps.
+    async_translate_ok = !async_workers.empty() && AsyncTranslateEnabled() &&
+                         liverpool->regs.num_indices > 6 && instance.IsVertexInputDynamicState() &&
+                         !EmulatorSettings.IsShaderCollect();
+    translation_pending = false;
     if (!RefreshGraphicsKey()) {
+        if (translation_pending) {
+            SotcStats::async_translate_skips.fetch_add(1, std::memory_order_relaxed);
+        }
         return nullptr;
     }
     // sotc: consecutive draws mostly use the same pipeline: when the freshly built key equals the
@@ -546,9 +675,6 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     if (pipe_memo && last_graphics_pipeline &&
         std::memcmp(&graphics_key, &last_graphics_key, sizeof(graphics_key)) == 0) {
         return last_graphics_pipeline;
-    }
-    if (async_done_count.load(std::memory_order_acquire) != 0) {
-        CollectAsyncPipelines();
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (!is_new && !it->second) {
@@ -758,7 +884,8 @@ bool PipelineCache::RefreshGraphicsStages() {
     const auto bind_stage = [&](HwStage stage_in, SwStage stage_out) -> bool {
         const auto stage_in_idx = static_cast<u32>(stage_in);
         const auto stage_out_idx = static_cast<u32>(stage_out);
-        if (!regs.stage_enable.IsStageEnabled(stage_in_idx)) {
+        // sotc: the bindings of the later stages follow from this one's: they wait for it.
+        if (translation_pending || !regs.stage_enable.IsStageEnabled(stage_in_idx)) {
             key.stage_hashes[stage_out_idx] = 0;
             infos[stage_out_idx] = nullptr;
             return false;
@@ -773,8 +900,8 @@ bool PipelineCache::RefreshGraphicsStages() {
 
         const auto params = AmdGpu::GetParams(*pgm);
         std::tie(infos[stage_out_idx], modules[stage_out_idx], key.stage_hashes[stage_out_idx]) =
-            GetProgram(stage_in, stage_out, params, binding);
-        return true;
+            GetProgram(stage_in, stage_out, params, binding, async_translate_ok);
+        return !translation_pending;
     };
 
     infos.fill(nullptr);
@@ -850,6 +977,10 @@ bool PipelineCache::RefreshGraphicsStages() {
         return false;
     }
 
+    if (translation_pending) {
+        return false;
+    }
+
     const auto* vs_info = infos[static_cast<u32>(SwStage::Vertex)];
     if (vs_info && fetch_shader && !instance.IsVertexInputDynamicState()) {
         // Without vertex input dynamic state, the pipeline needs to specialize on format.
@@ -879,11 +1010,17 @@ bool PipelineCache::RefreshComputeKey() {
 
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
-                                              Shader::Backend::Bindings& binding) {
+                                              Shader::Backend::Bindings& binding,
+                                              Shader::Pools* worker_pools,
+                                              std::vector<u32>* spv_out) {
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
-    const SotcStats::FrameTimer frame_timer{SotcStats::FrameCompile};
-    SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
+    // sotc: the frame columns are command-processor time; worker time is counted apart.
+    std::optional<SotcStats::FrameTimer> frame_timer;
+    if (!worker_pools) {
+        frame_timer.emplace(SotcStats::FrameCompile);
+        SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
+    }
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
     const SotcStats::ScopedTimer stall_timer{SotcStats::shader_ns};
     SotcStats::shaders_compiled.fetch_add(1, std::memory_order_relaxed);
@@ -898,7 +1035,8 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
             phase_start = now;
         }
     };
-    const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
+    const auto ir_program = Shader::TranslateProgram(code, worker_pools ? *worker_pools : pools,
+                                                     info, runtime_info, profile);
     phase(0);
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
@@ -917,7 +1055,11 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     }
     phase(3);
 
-    RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
+    if (spv_out) {
+        *spv_out = std::move(spv);
+    } else {
+        RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
+    }
     phase(4);
 
     const auto name = GetShaderName(info.hw_stage, info.pgm_hash, perm_idx);
@@ -931,9 +1073,17 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 
 PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
-                                                Shader::Backend::Bindings& binding) {
+                                                Shader::Backend::Bindings& binding,
+                                                bool async_ok) {
     // sotc: copied only where CompileModule needs a mutable one (it was copied on every call).
     const auto& rt = BuildRuntimeInfo(hw_stage, sw_stage);
+    if (async_ok && !program_cache.contains(params.hash)) {
+        if (pending_programs.insert(params.hash).second) {
+            QueueAsyncTranslate(hw_stage, sw_stage, params, rt, binding, nullptr, nullptr, 0);
+        }
+        translation_pending = true;
+        return {nullptr, vk::ShaderModule{}, 0};
+    }
     auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
     if (new_program) {
         it_pgm.value() = std::make_unique<Program>(hw_stage, sw_stage, params);
@@ -965,6 +1115,15 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     vk::ShaderModule module{};
 
     const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
+    if (it == program->modules.end() && async_ok) {
+        if (std::ranges::find(program->pending_specs, spec) == program->pending_specs.end()) {
+            QueueAsyncTranslate(hw_stage, sw_stage, params, rt, binding, program.get(), &spec,
+                                perm_idx);
+            program->pending_specs.push_back(spec);
+        }
+        translation_pending = true;
+        return {nullptr, vk::ShaderModule{}, 0};
+    }
     if (it == program->modules.end()) {
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
         auto runtime_info = rt;

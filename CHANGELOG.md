@@ -1,5 +1,43 @@
 # Changelog
 
+## 0.57-opt6 — 2026-10-18 (fork Oussama268)
+- **Mais FPS com uma thread só para desenhar:** a thread de comandos (o gargalo do port) agora só
+  lê os comandos do jogo e escolhe os pipelines; outra thread grava os desenhos no Vulkan. Ideia e
+  código de **Lucas-blip-png** (PR #99 do repositório principal), revisados e com correções aqui.
+  Medido contra a 0.57-opt5, no mesmo PC (RTX 3060 Laptop, pares intercalados):
+  - Santuário: 34,7 → **38,2 FPS** (+10%), 1% low 24 → **29**.
+  - Demo da tela de título: 55,8 → **57,0 FPS**; no trecho mais pesado do mundo aberto
+    34,0 → **36,1 FPS** (+6%).
+  - `SOTC_CP_THREADS=0` volta para uma thread só. As leituras da GPU assíncronas voltaram a ser o
+    padrão (`SOTC_RB_ASYNC=0` desliga).
+- **Menos travadas longas na primeira visita a uma área:** os pipelines de compute (a maior
+  parte das travadas com o cache vazio, por exemplo depois de atualizar o driver) agora são
+  montados em várias threads, e só o desenho que precisa deles espera. Com o cache vazio, no
+  santuário: pior travada 22 s → **6 s**; jogável em 88 s em vez de 110 s. Demo: 17,7 s → 7,5 s.
+  `SOTC_ASYNC_COMPUTE=0` desliga; `SOTC_PIPELINE_WORKERS` muda o número de threads.
+- **Correção: o jogo fechava ao carregar o save no modo PS4 Pro** (issue #35, erro em
+  `guest offset 0x1a371`): no modo Pro o jogo precisa de mais memória direta (+640 MB), que agora
+  é dada. Testado: o save que fechava na opt5 carrega e roda normalmente.
+- **Atualização pelo lançador** (issue #37): ao abrir, o lançador procura uma versão nova no
+  GitHub e pergunta antes de baixar. O arquivo é conferido (tamanho e SHA-256) e instalado por
+  cima da pasta, sem mexer em `user/` (saves e cache de shaders) nem no seu `sotc.ini`; se algo
+  der errado, os arquivos antigos voltam. Dá para desligar em Avançado, e o link "Procurar
+  atualização" faz a busca na hora.
+- **Correção de tela preta que ficava salva no cache de shaders** (encontrada nos testes desta
+  versão, só acontecia com a thread de desenho): nos primeiros segundos do jogo um shader podia
+  ler um ponteiro ainda vazio, e o port "remendava" esse shader para sempre e o gravava assim no
+  cache; nas sessões seguintes o santuário ficava preto. Agora a leitura vale zero só naquela
+  vez e nada é remendado.
+- **O cache de shaders é refeito na primeira abertura** (a primeira sessão tem mais travadas).
+- Perfil PGO refeito para o código novo.
+- Diagnóstico: com `SOTC_FPS=1` o log mostra o tempo por quadro da thread de desenho, as linhas
+  `SOTC ASYNC COMPUTE` e `SOTC SYNC PIPELINE` (pipelines montados na thread de comandos) e
+  `SOTC SRT walker loads that read zero`.
+- Testado: santuário e demo (pares intercalados contra a 0.57-opt5), cache vazio, sessão de 45
+  minutos de demo, saves no modo normal e no modo Pro, imagens iguais (folha de capturas),
+  atualização pelo lançador de ponta a ponta (com uma versão de teste, incluindo a volta dos
+  arquivos quando a instalação falha).
+
 ## 0.57-opt5 — 2026-10-17 (fork Oussama268)
 - **Sessões longas sem a memória de vídeo crescer:** o jogo mantém mapeado o seu bloco de 4 GB
   de memória e reaproveita os endereços o tempo todo, então a memória de buffers na GPU só

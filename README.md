@@ -1,6 +1,9 @@
 # Shadow of the Colossus — PC (port nativo / native port) · v0.66-cp-mt
 
 **The fastest build of the native PC port of Shadow of the Colossus (PS4).**
+
+![Shrine of Worship, 60 FPS mode, RTX 5060 Ti (FPS from RTSS)](docs/img/sotc-fork.gif)
+
 The game's own code runs on your CPU, and the PS4 GPU is translated to Vulkan. This fork adds:
 
 | | Original 0.57 | **This fork (0.66-cp-mt)** |
@@ -237,6 +240,11 @@ diagnóstico / diagnostic variables: [docs/sotc/README-SotC.md](docs/sotc/README
   constants, `V_ALIGNBIT`, `V_CVT_PK_U8_F32`), tabelas de texturas indexadas / dynamic T# tables
   (`dynamic_tsharp_array_size`), a abordagem das estatísticas de LOD / the LOD statistics
   approach e o acesso direto à memória para o SotC / and direct memory access for SotC.
+- [Oussama268](https://github.com/Oussama268): otimizações 0.57-opt1…opt5 (pipelines em segundo
+  plano, mip tails, memória de buffers devolvida) / 0.57-opt1…opt5 optimizations (background
+  pipelines, mip tails, buffer memory given back).
+- [Anthonypc23](https://github.com/Anthonypc23): tela cheia num múltiplo de 60 Hz quando o monitor
+  não está num / fullscreen at a 60 Hz multiple when the desktop rate is not one.
 - Patch de 60 FPS / 60 FPS patch: illusion (GoldHEN cheats).
 
 Licença / License: **GPL-2.0-or-later** ([LICENSE](LICENSE)).

@@ -981,7 +981,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         ProcessCommands();
 
         auto* header = reinterpret_cast<const PM4Header*>(acb.data());
-        u32 next_dw_off = header->type3.NumWords() + 1;
+        // Type-2 padding is a single dword; its count bits are meaningless. Sizing it as type-3
+        // makes padding at the end of a submission look split, which corrupts the next packet.
+        u32 next_dw_off = header->type == 2 ? 1 : header->type3.NumWords() + 1;
 
         // If we have a buffered packet, use it.
         if (queue.tmp_dwords > 0) [[unlikely]] {

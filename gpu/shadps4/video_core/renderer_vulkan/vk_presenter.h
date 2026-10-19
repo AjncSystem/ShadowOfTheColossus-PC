@@ -36,6 +36,8 @@ struct Frame {
     u64 ready_tick;
     bool is_hdr{false};
     u8 id{};
+    /// sotc: this frame without the HUD (Rasterizer::TakeHudless) for frame generation, or null.
+    Frame* hudless{};
 
     ImTextureID imgui_texture;
 };
@@ -133,6 +135,7 @@ private:
     VideoCore::TextureCache& texture_cache;
     vk::UniqueCommandPool command_pool;
     std::vector<Frame> present_frames;
+    std::vector<Frame> hudless_frames; ///< sotc: Frame::hudless, one per present frame
     std::queue<Frame*> free_queue;
     Frame* last_submit_frame;
     std::mutex free_mutex;

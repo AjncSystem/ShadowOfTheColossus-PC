@@ -24,6 +24,10 @@
 
 #include "video_core/host_shaders/fg_depth_comp.h"
 
+// sotc: the HUD-less input of the next RecordPrepare/RecordDispatch (gpu/CMakeLists.txt adds it to
+// the module's frame generation source; a null image: none).
+extern "C" FfxVkFsr3_3_1_6FrameGenerationImage sotc_fsrfg_hudless;
+
 namespace Vulkan::FsrFg {
 
 namespace {
@@ -62,7 +66,7 @@ std::array<DepthSlot, kMaxFrames> depth_slots;
 // Present thread.
 FfxVkFsr3_3_1_6FrameGenerationContext* context{};
 u32 ctx_display_w{}, ctx_display_h{}, ctx_render_w{}, ctx_render_h{};
-OwnedImage color, output;
+OwnedImage color, output, hudless_color;
 bool output_initialised = false;
 bool failed = false;
 u64 fsr_frame = 0;              // FSR 3 frame id of the last Generate
@@ -182,6 +186,7 @@ void DestroyContext() {
     context = nullptr;
     DestroyImage(color);
     DestroyImage(output);
+    DestroyImage(hudless_color);
     output_initialised = false;
 }
 
@@ -210,7 +215,8 @@ bool EnsureContext(u32 display_w, u32 display_h, u32 render_w, u32 render_h) {
         return false;
     }
     if (!CreateImage(color, kColorFormat, display_w, display_h) ||
-        !CreateImage(output, kColorFormat, display_w, display_h)) {
+        !CreateImage(output, kColorFormat, display_w, display_h) ||
+        !CreateImage(hudless_color, kColorFormat, display_w, display_h)) {
         std::fprintf(stderr, "SOTC FSR3 FG: cannot create the %ux%u images\n", display_w, display_h);
         DestroyContext();
         return false;
@@ -225,7 +231,7 @@ bool EnsureContext(u32 display_w, u32 display_h, u32 render_w, u32 render_h) {
     std::fprintf(stderr,
                  "SOTC FSR3 FG: context %ux%u (render %ux%u), %.0f MB, created in %.0f ms\n",
                  display_w, display_h, render_w, render_h,
-                 (usage.totalUsageInBytes + 2ull * display_w * display_h * 4) / 1048576.0,
+                 (usage.totalUsageInBytes + 3ull * display_w * display_h * 4) / 1048576.0,
                  std::chrono::duration<double, std::milli>(Clock::now() - start).count());
     return true;
 }
@@ -436,7 +442,7 @@ void NoteGameFrame() {
 }
 
 vk::Image Generate(vk::CommandBuffer cmdbuf, u32 frame_id, vk::Image frame_image, u32 width,
-                   u32 height) {
+                   u32 height, vk::Image hudless_image) {
     if (!Supported()) {
         return {};
     }
@@ -509,6 +515,44 @@ vk::Image Generate(vk::CommandBuffer cmdbuf, u32 frame_id, vk::Image frame_image
         .imageMemoryBarrierCount = static_cast<u32>(post.size()),
         .pImageMemoryBarriers = post.data(),
     });
+    // sotc: the frame without the HUD (Rasterizer::TakeHudless): FSR 3 interpolates the scene from
+    // it and keeps the real frame's HUD where the two differ, instead of moving the HUD with the
+    // scene (the health and stamina bars shook). Same conversion as the game frame.
+    sotc_fsrfg_hudless = {};
+    if (hudless_image) {
+        const std::array hudless_pre{
+            Barrier(hudless_image, vk::PipelineStageFlagBits2::eAllCommands,
+                    vk::AccessFlagBits2::eMemoryWrite, vk::ImageLayout::eGeneral,
+                    vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferRead,
+                    vk::ImageLayout::eTransferSrcOptimal),
+            Barrier(hudless_color.image, vk::PipelineStageFlagBits2::eAllCommands,
+                    vk::AccessFlagBits2::eNone, vk::ImageLayout::eUndefined,
+                    vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferWrite,
+                    vk::ImageLayout::eTransferDstOptimal),
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .imageMemoryBarrierCount = static_cast<u32>(hudless_pre.size()),
+            .pImageMemoryBarriers = hudless_pre.data(),
+        });
+        cmdbuf.blitImage(hudless_image, vk::ImageLayout::eTransferSrcOptimal, hudless_color.image,
+                         vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eNearest);
+        const std::array hudless_post{
+            Barrier(hudless_image, vk::PipelineStageFlagBits2::eBlit,
+                    vk::AccessFlagBits2::eTransferRead, vk::ImageLayout::eTransferSrcOptimal,
+                    vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eMemoryRead,
+                    vk::ImageLayout::eGeneral),
+            Barrier(hudless_color.image, vk::PipelineStageFlagBits2::eBlit,
+                    vk::AccessFlagBits2::eTransferWrite, vk::ImageLayout::eTransferDstOptimal,
+                    vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead,
+                    vk::ImageLayout::eGeneral),
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .imageMemoryBarrierCount = static_cast<u32>(hudless_post.size()),
+            .pImageMemoryBarriers = hudless_post.data(),
+        });
+        sotc_fsrfg_hudless = FgImage(hudless_color.image, kColorFormat, width, height,
+                                     vk::ImageLayout::eGeneral, kImageUsage);
+    }
 
     const auto color_in = FgImage(color.image, kColorFormat, width, height,
                                   vk::ImageLayout::eGeneral, kImageUsage);
@@ -545,6 +589,7 @@ vk::Image Generate(vk::CommandBuffer cmdbuf, u32 frame_id, vk::Image frame_image
     recorded = true;
     FfxVkFsr3_3_1_6FrameGenerationResult r =
         ffxVkFsr3_3_1_6FrameGenerationContextRecordPrepare(context, &prepare);
+    sotc_fsrfg_hudless = {}; // imported by RecordPrepare, for its dispatch too
     if (r == FFX_VK_FSR3_3_1_6_FRAMEGEN_OK) {
         FfxVkFsr3_3_1_6FrameGenerationDispatchInfo dispatch{};
         dispatch.commandBuffer = static_cast<VkCommandBuffer>(cmdbuf);

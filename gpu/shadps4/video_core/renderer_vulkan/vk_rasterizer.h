@@ -4,6 +4,7 @@
 #pragma once
 
 #include <chrono>
+#include <unordered_map>
 
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
@@ -139,6 +140,14 @@ public:
     bool IsGpuSideThreadId(u32 tid) const;
 #endif
 
+    /// sotc: frame generation without the HUD. The game composes its UI layer (an R8G8B8A8 sRGB
+    /// render target) over the fp16 scene in one draw into the video out image; while FSR 3 frame
+    /// generation runs, that draw is repeated into an image of its own with a transparent UI
+    /// texture (SOTC_FG_HUDLESS=0 turns it off). Thread of PrepareFrame: that image for the video
+    /// out image at `address`, viewed as `format` (layout ShaderReadOnlyOptimal), when it was
+    /// drawn since the last call; else a null view.
+    vk::ImageView TakeHudless(VAddr address, vk::Format format);
+
 private:
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
@@ -222,6 +231,26 @@ private:
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
     bool attachment_feedback_loop{};
     bool needs_barrier{};
+
+    /// sotc: TakeHudless. BeginHudless starts the redraw of this draw (the final composite) into
+    /// its HUD-less image; false when this draw is not the composite.
+    bool BeginHudless(const GraphicsPipeline* pipeline, const RenderState& state);
+    struct HudlessImage {
+        vk::Image image;
+        vk::ImageView rt_view;   ///< in the composite's attachment format
+        vk::ImageView read_view; ///< in the format TakeHudless asked
+        vk::Format rt_format{}, read_format{};
+        struct VmaAllocation_T* allocation{};
+        u32 width{}, height{};
+        bool fresh{};
+    };
+    void DestroyHudless(HudlessImage& image);
+    std::unordered_map<VAddr, HudlessImage> hudless_images; ///< by video out address
+    HudlessImage hudless_clear;  ///< 1x1, all zero: the UI layer of the redraw
+    s32 hudless_ui_info{-1};     ///< this draw: image_infos index of the UI texture, -1 none
+    VAddr hudless_vo{};          ///< this draw: the video out image it renders to, 0 none
+    vk::Format hudless_vo_format{};
+    u32 hudless_vo_width{}, hudless_vo_height{};
 };
 
 } // namespace Vulkan

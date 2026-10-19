@@ -46,20 +46,23 @@ int vulkan_smoke(void);
 
 static void fail(const char *message) { fprintf(stderr, "ERROR: %s\n", message); exit(1); }
 /* The PS4's Jaguar CPU has BMI1/LZCNT/MOVBE and the game uses them (ANDN, BEXTR, TZCNT, ...); older
-   CPUs raise an illegal instruction or silently compute TZCNT/LZCNT wrong. Fail with a clear message. */
+   CPUs raise an illegal instruction or silently compute TZCNT/LZCNT wrong. sotc: on Windows the CPU
+   patches replace them (gpu/sotc/cpu_patches_bmi.inc, issue #49); elsewhere fail with a message. */
 static void require_cpu_features(void) {
     unsigned a, b, c, d;
     int bmi1 = __get_cpuid_count(7, 0, &a, &b, &c, &d) && (b & 1u << 3);
     int lzcnt = __get_cpuid(0x80000001, &a, &b, &c, &d) && (c & 1u << 5);
     int movbe = __get_cpuid(1, &a, &b, &c, &d) && (c & 1u << 22);
     if (bmi1 && lzcnt && movbe) return;
+#ifdef _WIN32
+    printf("CPU without%s%s%s: the game's uses of them are emulated\n",
+           bmi1 ? "" : " BMI1", lzcnt ? "" : " LZCNT", movbe ? "" : " MOVBE");
+#else
     char msg[160];
     snprintf(msg, sizeof msg, "This CPU is not supported: it lacks%s%s%s (Intel Haswell / AMD Zen or newer is required).",
              bmi1 ? "" : " BMI1", lzcnt ? "" : " LZCNT", movbe ? "" : " MOVBE");
-#ifdef _WIN32
-    MessageBoxA(NULL, msg, "Shadow of the Colossus", MB_OK | MB_ICONERROR);
-#endif
     fail(msg);
+#endif
 }
 static uint64_t read64(FILE *f) {
     unsigned char b[8];
@@ -756,24 +759,36 @@ static uint64_t patch_tcb_loads(const Segment *segments, uint64_t count) {
 static void apply_sotc_cpu_patches(const char *path, const Segment *segments, uint64_t count, uint64_t size) {
     FILE *f=fopen(path,"rb");
     char magic[8];
-    if (!f || fread(magic,1,8,f)!=8 || memcmp(magic,"SOTCCPU1",8)) fail("bad --sotc-cpu file (run scripts/sotc_cpu.py)");
+    if (!f || fread(magic,1,8,f)!=8 || (memcmp(magic,"SOTCCPU1",8) && memcmp(magic,"SOTCCPU2",8)))
+        fail("bad --sotc-cpu file (run scripts/sotc_cpu.py)");
     uint64_t eh=read64(f), eh_size=read64(f), functions=read64(f), offsets[16];
     if (functions>16) fail("too many red-zone functions");
     for (uint64_t i=0;i<functions;++i) offsets[i]=read64(f);
+    /* SOTCCPU2: the linked modules' function tables (BMI1/LZCNT/MOVBE patches of their code). */
+    SotcCodeSegment tables[16]; uint64_t table_count=0;
+    if (!memcmp(magic,"SOTCCPU2",8)) {
+        table_count=read64(f);
+        if (table_count>16) fail("too many module function tables");
+        for (uint64_t i=0;i<table_count;++i) {
+            tables[i].offset=read64(f); tables[i].size=read64(f);
+            if (tables[i].offset>=size || tables[i].size>size-tables[i].offset) fail("module function table outside the image");
+        }
+    }
     fclose(f);
     uint64_t eboot_end=module_count ? modules[0].base : size;
     if (eh_size && (eh>=eboot_end || eh_size>eboot_end-eh)) fail("eh_frame_hdr outside the eboot");
-    SotcCodeSegment code[16]; uint32_t n=0;
-    for (uint64_t s=0;s<count && n<16;++s)
-        if ((segments[s].flags&1) && segments[s].address<eboot_end)
+    SotcCodeSegment code[32]; uint32_t n=0;
+    for (uint64_t s=0;s<count && n<32;++s)
+        if (segments[s].flags&1)
             code[n++]=(SotcCodeSegment){segments[s].address,segments[s].size};
-    SotcPatchRequest request={image,eboot_end,image+round_page(size),SOTC_TRAMPOLINE_SIZE,eh,eh_size,
-                              code,n,offsets,(uint32_t)functions};
+    SotcPatchRequest request={image,size,image+round_page(size),SOTC_TRAMPOLINE_SIZE,eh,eh_size,
+                              code,n,offsets,(uint32_t)functions,tables,(uint32_t)table_count,eboot_end};
     SotcPatchResult result;
     if (sotc_patch_eboot(&request,&result)) fail("CPU patches: cannot decode the eboot function table");
-    printf("CPU patches: SSE4a %s, %" PRIu64 " functions, %" PRIu64 " short SSE4a relocated, "
+    printf("CPU patches: SSE4a %s, BMI1/LZCNT/MOVBE %s, %" PRIu64 " functions, %" PRIu64 " short SSE4a/BMI relocated, "
            "red zone: %" PRIu64 " functions / %" PRIu64 " instructions\n",
-           result.needs_sse4a ? "emulated" : "native", result.function_starts, result.short_sse4a,
+           result.needs_sse4a ? "emulated" : "native", result.needs_bmi ? "emulated" : "native",
+           result.function_starts, result.short_sse4a,
            result.red_zone_functions, result.red_zone_instructions);
 }
 /* sotc: extra engine command line (cvars such as +r_motionBlurEnable=0), described by

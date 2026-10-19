@@ -43,7 +43,7 @@ public:
 
     /// The in-use block whose user area holds `addr` (its header address and the next block's), found by
     /// following the physical chain from the closest free block below it
-    bool FindUsedBlock(VAddr addr, VAddr& block, VAddr& next) const;
+    bool FindUsedBlock(VAddr addr, VAddr& block, VAddr& next, int* why = nullptr) const;
 
 private:
     using Span = std::pair<VAddr, VAddr>;
@@ -86,15 +86,25 @@ public:
     explicit BpeUsedBlocks(Core::MemoryManager* memory_) : memory{memory_} {}
 
     /// True when [addr, end) lies in the user area of a remembered block that is still in use
-    bool Covers(VAddr heap, VAddr addr, VAddr end);
+    bool Covers(VAddr heap, VAddr addr, VAddr end, int* why = nullptr);
 
     void Add(VAddr block, VAddr next);
+
+    /// The in-use, size-0 block that ends the chain: nothing above it is allocator metadata
+    void SetFence(VAddr block) {
+        fence = block;
+    }
+
+    size_t Size() const {
+        return blocks.size();
+    }
 
 private:
     bool StillUsed(VAddr heap, VAddr block, VAddr next) const;
 
     Core::MemoryManager* memory;
     std::vector<std::pair<VAddr, VAddr>> blocks; // sorted [header, next header)
+    VAddr fence = 0;
 };
 
 } // namespace VideoCore

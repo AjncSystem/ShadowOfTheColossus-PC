@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "core/memory.h"
@@ -219,24 +221,47 @@ u64 BpeHeapGuard::Write(VAddr addr, const u8* data, u64 size) {
     return differing;
 }
 
-bool BpeHeapGuard::FindUsedBlock(VAddr addr, VAddr& block, VAddr& next) const {
+bool BpeHeapGuard::FindUsedBlock(VAddr addr, VAddr& block, VAddr& next, int* why) const {
+    int no_why = 0;
+    why = why ? why : &no_why;
     const auto it = std::upper_bound(free_blocks.begin(), free_blocks.end(), addr);
+    // why: 1 no free block below, 2 broken chain, 3 too many steps, 4 in a header, 5 free block,
+    // 6 past the fence that ends the chain (`block` is the fence)
     if (it == free_blocks.begin()) {
+        *why = 1;
         return false;
     }
     block = *std::prev(it);
     for (size_t step = 0; step < MaxChainSteps; ++step) {
         if (!NextBlock(block, next)) {
+            // An in-use block of size 0 ends the chain: the heap's last 1 MiB ([heap+0xd0]) after it is
+            // not split into blocks, and the culling readbacks land there
+            u64 size_flags = 0;
+            if (addr >= block + HeaderSize && Read(block + 8, &size_flags, sizeof(size_flags)) &&
+                size_flags == InUse) {
+                *why = 6;
+                next = block + HeaderSize;
+                return false;
+            }
+            *why = 2;
             return false;
         }
         if (addr < next) {
             u64 size_flags = 0;
-            return addr >= block + HeaderSize && Read(block + 8, &size_flags, sizeof(size_flags)) &&
-                   (size_flags & InUse) &&
-                   !std::binary_search(free_blocks.begin(), free_blocks.end(), block);
+            if (addr < block + HeaderSize) {
+                *why = 4;
+                return false;
+            }
+            if (!Read(block + 8, &size_flags, sizeof(size_flags)) || !(size_flags & InUse) ||
+                std::binary_search(free_blocks.begin(), free_blocks.end(), block)) {
+                *why = 5;
+                return false;
+            }
+            return true;
         }
         block = next;
     }
+    *why = 3;
     return false;
 }
 
@@ -251,17 +276,34 @@ bool BpeUsedBlocks::StillUsed(VAddr heap, VAddr block, VAddr next) const {
            memory->TryReadBacking(next, &prev, sizeof(prev)) && prev == block;
 }
 
-bool BpeUsedBlocks::Covers(VAddr heap, VAddr addr, VAddr end) {
+bool BpeUsedBlocks::Covers(VAddr heap, VAddr addr, VAddr end, int* why) {
+    int no_why = 0;
+    why = why ? why : &no_why;
+    if (fence && addr >= fence + HeaderSize) {
+        u64 size_flags = 0;
+        if (memory->TryReadBacking(fence + 8, &size_flags, sizeof(size_flags)) && size_flags == InUse) {
+            return true;
+        }
+        fence = 0;
+    }
     auto it = std::upper_bound(blocks.begin(), blocks.end(), std::pair{addr, ~VAddr{0}});
+    // why: 1 no block remembered there, 2 the write leaves the block, 3 block no longer in use
     if (it == blocks.begin()) {
+        *why = 1;
         return false;
     }
     --it;
     const auto [block, next] = *it;
+    if (addr >= next) {
+        *why = 1;
+        return false;
+    }
     if (addr < block + HeaderSize || end > next) {
+        *why = 2;
         return false;
     }
     if (!StillUsed(heap, block, next)) {
+        *why = 3;
         blocks.erase(it);
         return false;
     }

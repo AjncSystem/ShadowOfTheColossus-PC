@@ -672,27 +672,43 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
             ForEachNonStackRange(dst_addr, copy.size, [&](VAddr addr, u64 size) {
                 if (heap_fast && touches_heap && addr < heap_base + heap_size &&
                     heap_base < addr + size) {
-                    if (used_blocks.Covers(heap, addr, addr + size)) {
+                    // SOTC_HEAP_FAST=2/3: why writes miss the remembered blocks (3 skips the check)
+                    static std::array<u64, 4> cover_why{};
+                    static std::array<u64, 7> find_why{};
+                    if (heap_fast >= 2 && (fast_writes + guarded_writes) % 5000 == 4999) {
+                        std::fprintf(stderr,
+                                     "SOTC HEAP FAST skipped %llu guarded %llu wrong %llu remembered %zu "
+                                     "miss(none %llu leaves %llu freed %llu) find(ok %llu nofree %llu "
+                                     "chain %llu steps %llu header %llu free %llu fence %llu)\n",
+                                     (unsigned long long)fast_writes, (unsigned long long)guarded_writes,
+                                     (unsigned long long)fast_wrong, used_blocks.Size(),
+                                     (unsigned long long)cover_why[1], (unsigned long long)cover_why[2],
+                                     (unsigned long long)cover_why[3], (unsigned long long)find_why[0],
+                                     (unsigned long long)find_why[1], (unsigned long long)find_why[2],
+                                     (unsigned long long)find_why[3], (unsigned long long)find_why[4],
+                                     (unsigned long long)find_why[5], (unsigned long long)find_why[6]);
+                    }
+                    int why = 0;
+                    if (used_blocks.Covers(heap, addr, addr + size, &why)) {
+                        ++fast_writes;
                         if (heap_fast == 2) {
                             fast_wrong += get_guard() && heap_guard->HasMetadata(addr, addr + size);
-                            if (++fast_writes % 20000 == 0) {
-                                std::fprintf(stderr,
-                                             "SOTC HEAP FAST skipped %llu guarded %llu wrong %llu\n",
-                                             (unsigned long long)fast_writes,
-                                             (unsigned long long)guarded_writes,
-                                             (unsigned long long)fast_wrong);
-                            }
                         }
                         memory->TryWriteBacking(std::bit_cast<u8*>(addr),
                                                 src + (addr - dst_addr), size, 1);
                         return;
                     }
+                    ++cover_why[why];
                     if (get_guard()) {
                         ++guarded_writes;
+                        int find = 0;
                         if (VAddr block = 0, next = 0;
-                            heap_guard->FindUsedBlock(addr, block, next)) {
+                            heap_guard->FindUsedBlock(addr, block, next, &find)) {
                             used_blocks.Add(block, next);
+                        } else if (find == 6) {
+                            used_blocks.SetFence(block);
                         }
+                        ++find_why[find];
                     }
                 }
                 if (heap_guard) {

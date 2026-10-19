@@ -332,8 +332,30 @@ def load_settings():
     return settings
 
 
+def window_icon_file(s):
+    """icon0.png of the player's dump as a 64x64 BMP in the data folder, for the game window's
+    icon (bb-probe: SOTC_WINDOW_ICON). Nothing of the game is packaged: it comes from the dump."""
+    try:
+        from PIL import Image
+        source = Path(s['game_dir'] or '.') / 'sce_sys' / 'icon0.png'
+        target = user_dir(s) / 'game_icon.bmp'
+        if not target.is_file() or target.stat().st_mtime < source.stat().st_mtime:
+            with Image.open(source) as image:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                image.convert('RGBA').resize((64, 64), Image.LANCZOS).save(target)
+        return target
+    except (ImportError, OSError, ValueError):
+        return None
+
+
 def game_environment(s):
     env = dict(os.environ)
+    info = game_info(s['game_dir'])
+    if info and info[1] != '?':
+        env['SOTC_GAME_VERSION'] = info[1]  # window title (with the frame rate)
+    icon = window_icon_file(s)
+    if icon:
+        env['SOTC_WINDOW_ICON'] = str(icon)
     env['SOTC_GAME_DIR'] = s['game_dir']
     env['SOTC_USER_DIR'] = str(user_dir(s))
     if s['sys_modules']:

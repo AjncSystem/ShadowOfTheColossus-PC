@@ -9,6 +9,7 @@
 #include "sdl_window.h"
 #include "bbport_overlay.h"
 #include "video_core/renderdoc.h"
+#include "video_core/sotc_stats.h"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -73,6 +74,18 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     window = SDL_CreateWindowWithProperties(props);
     SDL_DestroyProperties(props);
     ASSERT_MSG(window, "Failed to create window: {}", SDL_GetError());
+    // sotc: the game's own icon (sce_sys/icon0.png of the player's dump, as a BMP the launcher
+    // writes: SOTC_WINDOW_ICON) instead of the executable's.
+    if (const char* icon_path = std::getenv("SOTC_WINDOW_ICON"); icon_path && *icon_path) {
+        if (SDL_Surface* icon = SDL_LoadBMP(icon_path)) {
+            SDL_SetWindowIcon(window, icon);
+            SDL_DestroySurface(icon);
+        }
+    }
+    if (const char* version = std::getenv("SOTC_GAME_VERSION"); version && *version) {
+        title_suffix = std::string(" · v") + version;
+        UpdateTextTitle();
+    }
 #ifdef _WIN32
     if (behind) {
         if (HWND hwnd = static_cast<HWND>(SDL_GetPointerProperty(
@@ -133,9 +146,29 @@ int WindowSDL::PollTextInput(std::string& out) {
     return text_state;
 }
 
+// sotc: the window title shows the game version and the frame rate, refreshed once a second.
+void WindowSDL::UpdateTitleStats() {
+    const u64 now = SDL_GetTicks();
+    if (now - title_ticks < 1000) {
+        return;
+    }
+    const u64 flips = SotcStats::flip_count.load(std::memory_order_relaxed);
+    if (title_ticks != 0) {
+        const double fps = double(flips - title_flips) * 1000.0 / double(now - title_ticks);
+        const char* version = std::getenv("SOTC_GAME_VERSION");
+        char suffix[64];
+        std::snprintf(suffix, sizeof(suffix), "%s%s · %.0f FPS",
+                      version && *version ? " · v" : "", version ? version : "", fps);
+        title_suffix = suffix;
+        UpdateTextTitle();
+    }
+    title_ticks = now;
+    title_flips = flips;
+}
+
 void WindowSDL::UpdateTextTitle() {
     const std::string title = text_active ? base_title + " \u2014 " + text_prompt + ": " + text + "_  (Enter = OK, Esc = cancel)"
-                                          : base_title;
+                                          : base_title + title_suffix;
     SDL_SetWindowTitle(window, title.c_str());
     BbOverlay::SetTextEntry(text_active, text_prompt, text);
 }
@@ -152,6 +185,7 @@ bool WindowSDL::PollEvents() {
     }
     if (!text_active) {
         BbOverlay::UpdateTextInput(window);
+        UpdateTitleStats();
     }
     SDL_Event event;
     while (SDL_PollEvent(&event)) {

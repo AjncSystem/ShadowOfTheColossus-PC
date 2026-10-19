@@ -42,6 +42,10 @@ private:
     bool text_requested{}, text_active{};
     int text_state{};
     std::string text, text_prompt, base_title;
+    std::string title_suffix; ///< sotc: " · v01.01 · 60 FPS" (game version and frame rate)
+    u64 title_flips{};
+    u64 title_ticks{};
+    void UpdateTitleStats();
     void UpdateTextTitle();
     SDL_Window* window{};
     WindowSystemInfo window_info{};

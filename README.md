@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC (port nativo / native port) · v0.66-cp-mt
+# Shadow of the Colossus — PC (port nativo / native port) · v0.67-cp-mt
 
 **The fastest build of the native PC port of Shadow of the Colossus (PS4).**
 
@@ -6,7 +6,7 @@
 
 The game's own code runs on your CPU, and the PS4 GPU is translated to Vulkan. This fork adds:
 
-| | Original 0.57 | **This fork (0.66-cp-mt)** |
+| | Original 0.57 | **This fork (0.67-cp-mt)** |
 |---|---|---|
 | Shrine of Worship, 60 FPS mode (RTX 5060 Ti) | ~29 FPS | **~40–49 FPS** |
 | Frame generation | — | **FSR 3** (optional): 30 FPS mode shows 60 |
@@ -36,7 +36,8 @@ de que o jogo precisa, no estilo do [bloodborne_pc](https://github.com/Supermedo
 
 | Versão | Melhorias e correções |
 |---|---|
-| **0.66-cp-mt** | **Geração de quadros FSR 3** (experimental, opção no lançador): no modo 30 FPS a tela mostra 60, sem tirar FPS do jogo. |
+| **0.67-cp-mt** | **+4,6% de FPS** (o "heap guard" não é mais montado a cada quadro; Santuário 47,5 → 49,6 FPS). **Tela cheia a 120 Hz** em monitores de 144/165 Hz, para os quadros ficarem o mesmo tempo na tela (correção de Anthonypc23). |
+| 0.66-cp-mt | **Geração de quadros FSR 3** (experimental, opção no lançador): no modo 30 FPS a tela mostra 60, sem tirar FPS do jogo. |
 | 0.65-cp-mt | **+4% de FPS** (janela de readback menor; Santuário 46 → 48 FPS). Opção "Sombras do sol" no lançador (desligada: +6% FPS, sem sombras do sol). Lançador não fecha mais quando o console recusa escrita. |
 | **0.64-cp-mt** | **+10% de FPS** (build com PGO; Santuário 41 → 45 FPS). |
 | **0.63-cp-mt** | **Primeira visita a cada área bem mais lisa** (tradução de shaders 15,6 → 3,0 s por sessão; travada ao carregar o save 7,8 → 1,4 s). |
@@ -144,7 +145,8 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
-| **0.66-cp-mt** | **FSR 3 frame generation** (experimental, launcher option): in 30 FPS mode the screen shows 60, with no FPS taken from the game. |
+| **0.67-cp-mt** | **+4.6% FPS** (the "heap guard" is no longer built every frame; Shrine 47.5 → 49.6 FPS). **120 Hz fullscreen** on 144/165 Hz monitors, so every frame stays on screen the same time (fix by Anthonypc23). |
+| 0.66-cp-mt | **FSR 3 frame generation** (experimental, launcher option): in 30 FPS mode the screen shows 60, with no FPS taken from the game. |
 | 0.65-cp-mt | **+4% FPS** (smaller readback window; Shrine 46 → 48 FPS). "Sun shadows" launcher option (off: +6% FPS, no sun shadows). Launcher no longer quits when the console refuses writes. |
 | **0.64-cp-mt** | **+10% FPS** (PGO build; Shrine 41 → 45 FPS). |
 | **0.63-cp-mt** | **Much smoother first visit to each area** (shader translation 15.6 → 3.0 s per session; save-load stall 7.8 → 1.4 s). |

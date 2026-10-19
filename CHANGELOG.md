@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.67-cp-mt — em preparação (ainda não lançada)
+## 0.67-cp-mt — 2026-10-19
 - **+4,6% de FPS: o "BPE heap guard" deixa de ser montado a cada quadro.** O guard protege os
   metadados do alocador do jogo quando um readback escreve no heap, e para isso percorria a árvore
   inteira de blocos livres, ~1 vez por quadro (~6% da thread de desenho). As máscaras de culling

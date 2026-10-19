@@ -223,7 +223,22 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
         .usage = usage_flags,
         .flags = flags,
     };
-    const FormatQuery format_query = QueryImageFormat(instance, format_info);
+    FormatQuery format_query = QueryImageFormat(instance, format_info);
+    // sotc: storage usage is speculative (see ImageUsageFlags). AMD's Windows driver refuses it for
+    // BC5/BC6H; creating that combination anyway corrupts the texture or loses the device later,
+    // so such images are created without storage when the driver accepts them that way (as in
+    // gow3_pc).
+    if (format_query.result == vk::Result::eErrorFormatNotSupported &&
+        (usage_flags & vk::ImageUsageFlagBits::eStorage)) {
+        auto without_storage = format_info;
+        without_storage.usage = usage_flags & ~vk::ImageUsageFlagBits::eStorage;
+        const FormatQuery retry = QueryImageFormat(instance, without_storage);
+        if (retry.result == vk::Result::eSuccess) {
+            usage_flags = without_storage.usage;
+            format_features = FormatFeatureFlags(usage_flags);
+            format_query = retry;
+        }
+    }
     supported_samples = format_query.result == vk::Result::eSuccess
                             ? format_query.sample_counts
                             : vk::SampleCountFlagBits::e1;

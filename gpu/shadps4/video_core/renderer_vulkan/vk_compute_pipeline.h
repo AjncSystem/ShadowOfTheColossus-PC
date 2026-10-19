@@ -66,6 +66,10 @@ public:
     /// processor goes on (and other new pipelines build meanwhile).
     void BindWhenReady() const;
 
+    /// sotc: waits until a deferred construction has made its pipeline (building it here if no
+    /// worker started it yet). Handle() is then the result, null if the driver refused it.
+    void WaitBuilt();
+
 private:
     void CreatePipeline();
 

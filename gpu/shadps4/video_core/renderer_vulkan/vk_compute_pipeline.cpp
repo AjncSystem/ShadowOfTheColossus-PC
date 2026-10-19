@@ -146,6 +146,13 @@ void ComputePipeline::Build() {
     ready.notify_all();
 }
 
+void ComputePipeline::WaitBuilt() {
+    if (!claimed.load(std::memory_order_acquire)) {
+        Build();
+    }
+    ready.wait(false, std::memory_order_acquire);
+}
+
 void ComputePipeline::BindWhenReady() const {
     if (ready.load(std::memory_order_acquire)) {
         scheduler.CommandBuffer().bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline);

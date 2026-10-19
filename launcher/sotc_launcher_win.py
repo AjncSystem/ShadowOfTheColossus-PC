@@ -83,10 +83,28 @@ def run_command():
 # Texts: Portuguese first, English for every other Windows language.
 
 LANG = 'pt'
+# Spanish, Chinese (Simplified), Korean and Russian are looked up by the Portuguese text
+# (launcher/sotc_i18n.py); a text missing there shows in English.
+try:
+    from sotc_i18n import TRANSLATIONS
+except ImportError:
+    TRANSLATIONS = {}
 
 
 def _(pt, en):
-    return pt if LANG == 'pt' else en
+    if LANG == 'pt':
+        return pt
+    table = TRANSLATIONS.get(LANG)
+    return table.get(pt, en) if table else en
+
+
+def ui_font():
+    """Interface font: Segoe UI has no Chinese or Korean characters."""
+    return {'zh': 'Microsoft YaHei UI', 'ko': 'Malgun Gothic'}.get(LANG, 'Segoe UI')
+
+
+def title_font():
+    return {'zh': 'Microsoft YaHei UI', 'ko': 'Malgun Gothic'}.get(LANG, 'Georgia')
 
 
 def windows_language():
@@ -94,7 +112,7 @@ def windows_language():
         primary = ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3ff
     except (AttributeError, OSError):
         primary = 0
-    return 'pt' if primary == 0x16 else 'en'
+    return {0x16: 'pt', 0x0a: 'es', 0x04: 'zh', 0x12: 'ko', 0x19: 'ru'}.get(primary, 'en')
 
 
 # ---------------------------------------------------------------------------------------------
@@ -194,7 +212,9 @@ LANGUAGES = [('', ('Automático (o do jogo)', 'Automatic (the game\'s)')),
              ('4', ('Alemão', 'German')), ('5', ('Italiano', 'Italian')), ('0', ('Japonês', 'Japanese'))]
 READBACKS = [('', ('Precisas (padrão; o jogo precisa)', 'Precise (default; the game needs them)')),
              ('1', ('Relaxadas (pode travar)', 'Relaxed (may hang)'))]
-UI_LANGUAGES = [('', ('Automático', 'Automatic')), ('pt', ('Português', 'Portuguese')), ('en', ('Inglês', 'English'))]
+UI_LANGUAGES = [('', ('Automático', 'Automatic')), ('pt', ('Português', 'Português')), ('en', ('English', 'English')),
+                ('es', ('Español', 'Español')), ('zh', ('简体中文', '简体中文')), ('ko', ('한국어', '한국어')),
+                ('ru', ('Русский', 'Русский'))]
 CONTROLS = [('W A S D', ('analógico esquerdo', 'left stick')), (('setas', 'arrows'), ('analógico direito (câmera)', 'right stick (camera)')),
             ('Espaço / Space', '✕'), ('Shift', '○'), ('E', '□'), ('Q', '△'), ('1 / 3', 'L1 / R1'), ('R / F', 'L2 / R2'),
             ('Z / C', 'L3 / R3'), ('Enter', 'Options'), ('I J K L', ('direcional', 'd-pad')),
@@ -408,7 +428,7 @@ class Launcher:
         self.ui_calls = queue.Queue()
         self.gpu_text = _('• Verificando a placa de vídeo…', '• Checking the graphics card…')
         self.banner_source = self.banner_image = None
-        root.title('Shadow of the Colossus — port nativo' if LANG == 'pt' else 'Shadow of the Colossus — native port')
+        root.title('Shadow of the Colossus — ' + _('port nativo', 'native port'))
         root.configure(bg=BG)
         self.dpi = root.winfo_fpixels('1i') / 96.0
         root.geometry(f'{self.px(1080)}x{self.px(700)}')
@@ -487,7 +507,7 @@ class Launcher:
             ('Sotc.indicator', {'side': 'left', 'sticky': ''}),
             ('Checkbutton.focus', {'side': 'left', 'sticky': 'w', 'children': [
                 ('Checkbutton.label', {'sticky': 'nswe'})]})]})])
-        base = ('Segoe UI', 10)
+        base = (ui_font(), 10)
         self.root.option_add('*TCombobox*Listbox.background', CARD)
         self.root.option_add('*TCombobox*Listbox.foreground', TEXT)
         self.root.option_add('*TCombobox*Listbox.selectBackground', ACCENT)
@@ -496,8 +516,8 @@ class Launcher:
                     lightcolor=LINE, darkcolor=LINE, troughcolor=CARD, focuscolor=GOLD, font=base)
         s.configure('TFrame', background=PANEL)
         s.configure('TLabel', background=PANEL, foreground=TEXT)
-        s.configure('Muted.TLabel', background=PANEL, foreground=MUTED, font=('Segoe UI', 9))
-        s.configure('Section.TLabel', background=PANEL, foreground=GOLD, font=('Georgia', 13))
+        s.configure('Muted.TLabel', background=PANEL, foreground=MUTED, font=(ui_font(), 9))
+        s.configure('Section.TLabel', background=PANEL, foreground=GOLD, font=(title_font(), 13))
         s.configure('TCheckbutton', background=PANEL, foreground=TEXT, padding=(0, 3), indicatorbackground=CARD,
                     indicatorforeground=GOLD)
         s.map('TCheckbutton', background=[('active', PANEL)], indicatorbackground=[('selected', ACCENT)])
@@ -508,7 +528,7 @@ class Launcher:
         s.configure('TEntry', foreground=TEXT, insertcolor=TEXT, padding=4)
         s.configure('TButton', background=CARD, foreground=TEXT, padding=(12, 6), borderwidth=1)
         s.map('TButton', background=[('active', LINE), ('disabled', PANEL)], foreground=[('disabled', MUTED)])
-        s.configure('Play.TButton', background=ACCENT, foreground='#f4f1ea', font=('Georgia', 15, 'bold'),
+        s.configure('Play.TButton', background=ACCENT, foreground='#f4f1ea', font=(title_font(), 15, 'bold'),
                     padding=(36, 10), borderwidth=0)
         s.map('Play.TButton', background=[('active', ACCENT_HI), ('disabled', '#263038')],
               foreground=[('disabled', '#7d858c')])
@@ -589,7 +609,7 @@ class Launcher:
         outer = ttk.Frame(self.content)
         head = ttk.Frame(outer, padding=(28, 22, 28, 6))
         head.pack(fill='x')
-        ttk.Label(head, text=title, background=PANEL, foreground=TEXT, font=('Georgia', 20)).pack(anchor='w')
+        ttk.Label(head, text=title, background=PANEL, foreground=TEXT, font=(title_font(), 20)).pack(anchor='w')
         ttk.Label(head, text=subtitle, style='Muted.TLabel').pack(anchor='w')
         canvas = tk.Canvas(outer, bg=PANEL, highlightthickness=0, bd=0)
         bar = ttk.Scrollbar(outer, orient='vertical', command=canvas.yview)
@@ -611,15 +631,15 @@ class Launcher:
         side = tk.Frame(self.root, bg=BG, width=self.px(220))
         side.pack(side='left', fill='y')
         side.pack_propagate(False)
-        tk.Label(side, text='SHADOW OF\nTHE COLOSSUS', bg=BG, fg=GOLD, font=('Georgia', 15), justify='left').pack(
+        tk.Label(side, text='SHADOW OF\nTHE COLOSSUS', bg=BG, fg=GOLD, font=(title_font(), 15), justify='left').pack(
             anchor='w', padx=22, pady=(24, 0))
         tk.Label(side, text=_('port nativo · Windows', 'native port · Windows') + f'  ·  v{VERSION}', bg=BG, fg=MUTED,
-                 font=('Segoe UI', 9)).pack(anchor='w', padx=22, pady=(2, 20))
+                 font=(ui_font(), 9)).pack(anchor='w', padx=22, pady=(2, 20))
         self.nav, self.current_page = {}, None
         for name, title in (('play', _('Jogar', 'Play')), ('game', _('Jogo e saves', 'Game & saves')),
                             ('graphics', _('Imagem e FPS', 'Display & FPS')), ('controls', _('Controles', 'Controls')),
                             ('advanced', _('Avançado', 'Advanced'))):
-            item = tk.Label(side, text='    ' + title, bg=BG, fg=TEXT, anchor='w', font=('Segoe UI', 11),
+            item = tk.Label(side, text='    ' + title, bg=BG, fg=TEXT, anchor='w', font=(ui_font(), 11),
                             pady=10, cursor='hand2')
             item.pack(fill='x')
             item.bind('<Button-1>', lambda _e, n=name: self.show(n))
@@ -629,7 +649,7 @@ class Launcher:
         tk.Frame(side, bg=BG).pack(fill='both', expand=True)
         for text, command in ((_('Registro do jogo', 'Game log'), lambda: self.show('log')),
                               (_('Configurar de novo', 'Set up again'), self.show_setup)):
-            link = tk.Label(side, text=text, bg=BG, fg=MUTED, font=('Segoe UI', 9, 'underline'), cursor='hand2')
+            link = tk.Label(side, text=text, bg=BG, fg=MUTED, font=(ui_font(), 9, 'underline'), cursor='hand2')
             link.pack(anchor='w', padx=22, pady=(0, 6))
             link.bind('<Button-1>', lambda _e, c=command: c())
         tk.Frame(side, bg=BG, height=12).pack()
@@ -639,7 +659,7 @@ class Launcher:
         bar = tk.Frame(right, bg=BG, height=72)
         bar.pack(fill='x', side='bottom')
         bar.pack_propagate(False)
-        self.status = tk.Label(bar, text='', bg=BG, fg=MUTED, font=('Segoe UI', 10), anchor='w', justify='left')
+        self.status = tk.Label(bar, text='', bg=BG, fg=MUTED, font=(ui_font(), 10), anchor='w', justify='left')
         self.status.pack(side='left', padx=24)
         self.play_button = ttk.Button(bar, text=_('JOGAR', 'PLAY'), style='Play.TButton', command=self.play)
         self.play_button.pack(side='right', padx=(10, 24), pady=11)
@@ -725,14 +745,14 @@ class Launcher:
                 c.create_rectangle(0, h - 120 + i * 24, w, h - 96 + i * 24, fill=PANEL, outline='', stipple=stipple)
             c.create_rectangle(0, h - 24, w, h, fill=PANEL, outline='')
         else:
-            c.create_text(30, h - 80, text='Shadow of the Colossus', anchor='w', fill='#f2ead9', font=('Georgia', 32))
+            c.create_text(30, h - 80, text='Shadow of the Colossus', anchor='w', fill='#f2ead9', font=(title_font(), 32))
             c.create_text(w // 2, h // 2 - 40, text=_('Escolha a pasta do jogo (Jogo e saves)',
                                                        'Choose your game folder (Game & saves)'),
-                          fill=MUTED, font=('Segoe UI', 11))
+                          fill=MUTED, font=(ui_font(), 11))
         info = game_info(self.var('game_dir').get())
         sub = (_('{} · versão do jogo {}', '{} · game version {}').format(*info) if info
                else _('Pasta do jogo não escolhida', 'Game folder not set'))
-        c.create_text(33, h - 30, text=sub, anchor='w', fill=GOLD, font=('Segoe UI', 11))
+        c.create_text(33, h - 30, text=sub, anchor='w', fill=GOLD, font=(ui_font(), 11))
 
     def scaled_art(self, path, width):
         try:
@@ -953,7 +973,7 @@ class Launcher:
         window.resizable(False, False)
         label = next(_(*l) for n, _d, l in KEY_INPUTS if n == name)
         ttk.Label(window, text=_('Aperte a tecla para: {}', 'Press the key for: {}').format(label),
-                  font=('Segoe UI', 12)).pack(padx=30, pady=(24, 6))
+                  font=(ui_font(), 12)).pack(padx=30, pady=(24, 6))
         hint = ttk.Label(window, text=_('Esc cancela', 'Esc cancels'), style='Muted.TLabel')
         hint.pack(padx=30, pady=(0, 22))
 
@@ -1010,7 +1030,7 @@ class Launcher:
         self.pages['log'] = page
         top = ttk.Frame(page)
         top.pack(fill='x', pady=(0, 8))
-        ttk.Label(top, text=_('Registro', 'Log'), font=('Georgia', 20)).pack(side='left')
+        ttk.Label(top, text=_('Registro', 'Log'), font=(title_font(), 20)).pack(side='left')
         ttk.Button(top, text=_('Copiar', 'Copy'), command=self.copy_log).pack(side='right')
         ttk.Button(top, text=_('Limpar', 'Clear'), command=lambda: self.set_log('')).pack(side='right', padx=6)
         self.log = tk.Text(page, wrap='none', bg='#090a0b', fg='#c9ccd0', insertbackground=TEXT, relief='flat',
@@ -1152,10 +1172,10 @@ class Launcher:
         frame.lift()
         inner = tk.Frame(frame, bg=BG)
         inner.place(relx=0.5, rely=0.45, anchor='center')
-        tk.Label(inner, text='SHADOW OF THE COLOSSUS', bg=BG, fg=GOLD, font=('Georgia', 26)).pack()
+        tk.Label(inner, text='SHADOW OF THE COLOSSUS', bg=BG, fg=GOLD, font=(title_font(), 26)).pack()
         tk.Label(inner, text=_('Bem-vindo. Só falta dizer onde está o jogo.',
                                'Welcome. Just tell us where the game is.'),
-                 bg=BG, fg=TEXT, font=('Segoe UI', 13)).pack(pady=(8, 26))
+                 bg=BG, fg=TEXT, font=(ui_font(), 13)).pack(pady=(8, 26))
         self.setup_button = ttk.Button(inner, text=_('Escolher a pasta do jogo…', 'Choose the game folder…'),
                                        style='Play.TButton', command=self.choose_game_for_setup)
         self.setup_button.pack(ipadx=18)
@@ -1163,8 +1183,8 @@ class Launcher:
                                'atualização (-UPDATE/-patch) e das DLCs são encontradas sozinhas.',
                                "The game's main folder, as in shadPS4: the game (CUSA08809), update (-UPDATE/-patch) "
                                'and DLC subfolders are found on their own.'),
-                 bg=BG, fg=MUTED, font=('Segoe UI', 10), wraplength=self.px(560), justify='center').pack(pady=(10, 0))
-        self.setup_hint = tk.Label(inner, text='', bg=BG, fg=MUTED, font=('Segoe UI', 10), cursor='hand2',
+                 bg=BG, fg=MUTED, font=(ui_font(), 10), wraplength=self.px(560), justify='center').pack(pady=(10, 0))
+        self.setup_hint = tk.Label(inner, text='', bg=BG, fg=MUTED, font=(ui_font(), 10), cursor='hand2',
                                    wraplength=self.px(640), justify='center')
         self.setup_hint.pack(pady=(18, 0))
         self.setup_results = tk.Frame(inner, bg=BG)
@@ -1290,8 +1310,8 @@ class Launcher:
             color = GOLD if mark == '✓' else '#d9b441' if mark == '⚠' else MUTED
             row = tk.Frame(self.setup_results, bg=BG)
             row.pack(anchor='w', pady=2)
-            tk.Label(row, text=mark, bg=BG, fg=color, font=('Segoe UI', 12), width=2).pack(side='left')
-            tk.Label(row, text=text, bg=BG, fg=TEXT, font=('Segoe UI', 11)).pack(side='left')
+            tk.Label(row, text=mark, bg=BG, fg=color, font=(ui_font(), 12), width=2).pack(side='left')
+            tk.Label(row, text=text, bg=BG, fg=TEXT, font=(ui_font(), 11)).pack(side='left')
         buttons = tk.Frame(self.setup_results, bg=BG)
         buttons.pack(pady=(20, 0))
         if not result['sound']:

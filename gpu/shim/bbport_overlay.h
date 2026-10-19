@@ -53,5 +53,8 @@ int PollSaveList();
 void CloseSaveList();
 /// sotc: pictures (PNG paths, empty: none) for the next OpenSaveList, item by item.
 void SetSaveListIcons(std::vector<std::string> paths);
+/// sotc: true while the game has not shown a frame for a second (boot, long loads): the overlay
+/// draws a loading screen and the video out thread keeps presenting. Any thread.
+bool LoadingShown();
 
 } // namespace BbOverlay

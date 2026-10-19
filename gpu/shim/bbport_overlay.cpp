@@ -609,6 +609,60 @@ void SaveListBox() {
     ImGui::End();
 }
 
+// sotc: the port's loading screen while the game shows nothing (boot, shader cache, long loads):
+// the title, a turning arc and "Loading…" in the launcher's language, over a dark backdrop.
+void LoadingScreen() {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(viewport->WorkPos);
+    ImGui::SetNextWindowSize(viewport->WorkSize);
+    ImGui::SetNextWindowBgAlpha(0.88f);
+    ImGui::Begin("##loading", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
+                     ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing |
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus);
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImVec2 size = viewport->WorkSize;
+    const ImVec2 origin = viewport->WorkPos;
+    const float unit = size.y / 1080.0f;
+    const ImU32 gold = IM_COL32(214, 184, 120, 255), dim = IM_COL32(150, 150, 150, 255);
+    const char* title = "SHADOW OF THE COLOSSUS";
+    const float title_px = 46.0f * unit;
+    const ImVec2 title_size = ImGui::GetFont()->CalcTextSizeA(title_px, FLT_MAX, 0.0f, title);
+    draw->AddText(ImGui::GetFont(), title_px,
+                  ImVec2(origin.x + (size.x - title_size.x) * 0.5f, origin.y + size.y * 0.42f),
+                  gold, title);
+    // Turning arc in the lower right corner, like a console's loading mark.
+    const float t = float(NowMs() % 100000) / 1000.0f;
+    const ImVec2 centre(origin.x + size.x - 90.0f * unit, origin.y + size.y - 90.0f * unit);
+    const float radius = 26.0f * unit;
+    draw->PathArcTo(centre, radius, t * 4.0f, t * 4.0f + 4.4f, 40);
+    draw->PathStroke(gold, 0, 4.0f * unit);
+    const char* text = SotcUi::T("Carregando…", "Loading…");
+    const float text_px = 24.0f * unit;
+    const ImVec2 text_size = ImGui::GetFont()->CalcTextSizeA(text_px, FLT_MAX, 0.0f, text);
+    draw->AddText(ImGui::GetFont(), text_px,
+                  ImVec2(centre.x - radius - 18.0f * unit - text_size.x, centre.y - text_size.y * 0.5f),
+                  dim, text);
+    // While the shader cache is read at boot: a bar with the percentage.
+    const u32 total = SotcStats::warmup_total.load(std::memory_order_relaxed);
+    if (total > 0) {
+        const u32 done = std::min(SotcStats::warmup_done.load(std::memory_order_relaxed), total);
+        const float frac = float(done) / float(total);
+        const float bar_w = size.x * 0.4f, bar_h = 10.0f * unit;
+        const ImVec2 bar0(origin.x + (size.x - bar_w) * 0.5f, origin.y + size.y * 0.42f + title_px + 40.0f * unit);
+        draw->AddRectFilled(bar0, ImVec2(bar0.x + bar_w, bar0.y + bar_h), IM_COL32(60, 60, 64, 255), bar_h * 0.5f);
+        draw->AddRectFilled(bar0, ImVec2(bar0.x + bar_w * frac, bar0.y + bar_h), gold, bar_h * 0.5f);
+        char line[128];
+        std::snprintf(line, sizeof(line), "%s %d%%  (%u / %u)", SotcUi::T("Carregando shaders…", "Loading shaders…"),
+                      int(frac * 100.0f + 0.5f), done, total);
+        const float line_px = 22.0f * unit;
+        const ImVec2 line_size = ImGui::GetFont()->CalcTextSizeA(line_px, FLT_MAX, 0.0f, line);
+        draw->AddText(ImGui::GetFont(), line_px,
+                      ImVec2(origin.x + (size.x - line_size.x) * 0.5f, bar0.y + bar_h + 14.0f * unit), dim, line);
+    }
+    ImGui::End();
+}
+
 void FpsCounter() {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     const float pad = 12.0f * base_scale;
@@ -1047,9 +1101,23 @@ bool HandleEvent(const SDL_Event& event) {
     }
 }
 
+bool LoadingShown() {
+    // sotc: a second without a game flip. Read from the presenter and the video out threads: the
+    // races only move the moment by a frame.
+    static std::atomic<u64> seen{~u64{0}};
+    static std::atomic<long long> since{0};
+    const u64 flips = SotcStats::flip_count.load(std::memory_order_relaxed);
+    const long long now = NowMs();
+    if (seen.exchange(flips, std::memory_order_relaxed) != flips) {
+        since.store(now, std::memory_order_relaxed);
+        return false;
+    }
+    return now - since.load(std::memory_order_relaxed) >= 1000;
+}
+
 bool Visible() {
     return initialized && (menu_open || text_entry_active || list_active || OverlayOn() ||
-                           ToastShown());
+                           ToastShown() || LoadingShown());
 }
 
 bool CapturesInput() {
@@ -1161,6 +1229,22 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
 
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
+    const bool loading = LoadingShown() && !list_active && !text_entry_active;
+    static bool was_loading = false;
+    static long long loading_since = 0;
+    if (loading != was_loading) { // sotc: one log line when it appears and when it goes away
+        was_loading = loading;
+        if (loading) {
+            loading_since = NowMs();
+            std::fprintf(stderr, "SOTC loading screen: shown\n");
+        } else {
+            std::fprintf(stderr, "SOTC loading screen: hidden after %.1f s\n",
+                         double(NowMs() - loading_since) / 1000.0);
+        }
+    }
+    if (loading) {
+        LoadingScreen();
+    }
     if (menu_open) {
         Menu();
     }

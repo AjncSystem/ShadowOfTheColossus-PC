@@ -164,6 +164,8 @@ inline constexpr const char* kFrameCauseNames[FrameCauses] = {
 inline std::atomic<uint64_t> frame_copy_bytes{0};
 inline std::atomic<uint64_t> frame_ns[FrameCauses]{};
 inline std::atomic<uint64_t> frame_compiles{0}; ///< shader modules and pipelines created
+/// sotc: shader cache preload at boot (loading screen bar): pipelines to load and loaded.
+inline std::atomic<uint32_t> warmup_total{0}, warmup_done{0};
 inline std::atomic<uint64_t> flip_count{0};     ///< game flips (videoout/driver.cpp Flip)
 /// Game frames prepared by the command processor (vk_presenter.cpp PrepareFrame): unlike
 /// flip_count, in step with the draws the command processor is processing.

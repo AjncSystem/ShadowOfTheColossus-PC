@@ -9,6 +9,7 @@
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
+#include "video_core/sotc_stats.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -451,10 +452,16 @@ void PipelineCache::WarmUp() {
     u32 num_pipelines{};
     u32 num_total_pipelines{};
     const auto warmup_start = std::chrono::steady_clock::now();
+    // sotc: progress for the loading screen's bar.
+    SotcStats::warmup_done.store(0, std::memory_order_relaxed);
+    SotcStats::warmup_total.store(
+        static_cast<u32>(Storage::DataBase::Instance().CountBlobs(Storage::BlobType::PipelineKey)),
+        std::memory_order_relaxed);
 
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
             ++num_total_pipelines;
+            SotcStats::warmup_done.fetch_add(1, std::memory_order_relaxed);
 
             bool result{};
             try {
@@ -492,6 +499,7 @@ void PipelineCache::WarmUp() {
              "pipeline creation {} ms)",
              num_pipelines, Ms(std::chrono::steady_clock::now() - warmup_start),
              Ms(warmup_times.load), Ms(warmup_times.modules), Ms(warmup_times.pipelines));
+    SotcStats::warmup_total.store(0, std::memory_order_relaxed); // the bar goes away
     if (num_total_pipelines > num_pipelines) {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total_pipelines - num_pipelines);

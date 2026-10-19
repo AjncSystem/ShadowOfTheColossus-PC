@@ -20,6 +20,7 @@
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/vk_framegen.h"
+#include "bbport_overlay.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/sotc_fps_cap.h"
 #include "video_core/sotc_stats.h"
@@ -857,7 +858,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
                     if (!main_port.is_open) {
                         DrawBlankFrame();
-                    } else if (ImGui::Core::MustKeepDrawing()) {
+                    } else if (ImGui::Core::MustKeepDrawing() || BbOverlay::LoadingShown()) {
+                        // sotc: also the port's loading screen while the game shows nothing.
                         DrawLastFrame();
                     }
                 }

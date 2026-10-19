@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.58 — 2026-10-19
+Versão da comunidade: junta as pull requests e forks de várias pessoas, revisados e testados juntos.
+Obrigado a **Lucas-blip-png, Gabriell-os, Oussama268, jownatan, xeodeo, nakaionyt/y7ngboy e tabnul**.
+
+**Estabilidade**
+- **Quedas por falta de memória de vídeo** (`EnsureResident: Assertion Failed`, placas AMD e de
+  4–6 GB): a memória dos buffers vem em blocos de 64 MB (antes milhares de alocações, acima do
+  limite dos drivers) e a memória parada é devolvida com o uso, conferindo os dados antes
+  (Gabriell-os #98, Oussama268 #59/#83/#103).
+- **Jogo congelando** ("GPU hook queue overflow"): a fila de avisos de memória cresce sob demanda.
+- **Queda depois do 1º e do 2º colosso no modo PS4 Pro** (`0x1a371`): o modo Pro recebe a
+  memória de um PS4 Pro (Lucas-blip-png #106).
+- Pacote de preenchimento na fila de compute que corrompia o pacote seguinte; arredondamento RTZ
+  desligado na NVIDIA (o driver travava); trava de regiões sem deadlock no Windows (jownatan #81).
+
+**Desempenho:** demo da tela de título 54–55 → **62 FPS de média**, mínima 26 → 31; memória de
+vídeo ~4,3 → ~2,7 GB (cortes no processador de comandos, pipelines compilados em segundo plano,
+caches lidos em paralelo, sombras distantes reaproveitadas).
+
+**AMD:** bloco preto no canto da tela nas RDNA3/RDNA4 (#43) e texturas BC5/BC6H (xeodeo);
+ramos uniformes de wave64 e envio periódico ligados na AMD (Gabriell-os #98). Ainda sem teste
+numa AMD aqui: conte nas issues.
+
+**Novidades**
+- **Widescreen / ultrawide:** 16:10, 21:9 e 32:9 com imagem mais larga, sem esticar (tabnul #54).
+- **FPS: 30 / 60 / ilimitado** no lançador.
+- **Ícones dos botões Xbox** no jogo (A B X Y, RB, LT/RT, Menu, View), desenhados para o port;
+  opção PlayStation / Xbox em Controles (mecanismo de troca de texturas do xeodeo).
+- **Geração de quadros (experimental):** FSR 3 em qualquer placa e DLSS-G nas RTX 40/50 (runtime
+  oficial da NVIDIA no pacote, com as licenças), com o jogo a 30 → 60 na tela (nakaionyt/y7ngboy).
+  Só faz diferença com o FPS em 30, e a barra de vida/stamina pode tremer.
+- Overlay de desempenho (F10), F7 liga/desliga o limite de 30, F8 troca a geração de quadros.
+- **Lançador em espanhol, chinês, coreano e russo.**
+- Janela com o ícone do jogo e, no título, a versão e o FPS.
+- O cache de shaders é refeito na primeira abertura.
+
 ## 0.57 — 2026-10-14
 - **Placas AMD: correção das cores verdes/rosas** na névoa, no Wander e no Agro (issues #6, #7, #9,
   possivelmente #10). A AMD informa grupos de 64 threads, mas só deixa fixar esse tamanho nos

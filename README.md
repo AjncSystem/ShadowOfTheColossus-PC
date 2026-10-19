@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC (port nativo / native port) · v0.57
+# Shadow of the Colossus — PC (port nativo / native port) · v0.58
 
 **[Português](#português)** · **[English](#english)** · [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
@@ -21,6 +21,7 @@ de que o jogo precisa, no estilo do [bloodborne_pc](https://github.com/Supermedo
 
 | Versão | Melhorias e correções |
 |---|---|
+| **0.58** | **Versão da comunidade** (Lucas-blip-png, Gabriell-os, Oussama268, jownatan, xeodeo, nakaionyt/y7ngboy, tabnul): **menos quedas** (falta de memória de vídeo, jogo congelando, queda pós-colosso no modo PS4 Pro), **+15% de FPS** e menos memória de vídeo, correções AMD (bloco preto RDNA3/4), **widescreen 21:9/32:9**, **FPS 30/60/ilimitado**, **ícones Xbox**, geração de quadros FSR 3 / DLSS-G (experimental), lançador em espanhol, chinês, coreano e russo. |
 | **0.57** | **Placas AMD:** correção das cores verdes/rosas na névoa e nos personagens (as AMD passam a usar o caminho de 32 threads da NVIDIA; diagnóstico da issue #7, ainda não testado numa AMD). **Opção nova** no lançador para desligar o acesso direto à memória: ~10% mais FPS, água distante mais lisa. |
 | **0.56** | **Água do mundo aberto com ondas:** lagos e rios abaixo das cascatas não ficam mais lisos como espelho (uma instrução de shader, `S_WQM_B64`, era ignorada). **Lago de cima ondula e reflete até longe** (acesso direto à memória ligado por padrão, como no Pink-shadPS4). Árvores distantes sem "lixo colorido". |
 | **0.0.13** | **Sem quedas:** corrigida a queda na abertura/menu da 0.0.12 (o jogo pedia mais texturas do que cabe no pool). Testado ~40 min pelo mapa, com dois carregamentos de save. **Reflexos do lago** em quase toda a superfície, com ondulação (uma trava de laços dos shaders cortava os raios do reflexo). |
@@ -33,8 +34,12 @@ Detalhes de cada versão no [CHANGELOG](CHANGELOG.md).
 
 - Na primeira abertura depois de atualizar, os shaders são compilados de novo: o primeiro
   carregamento demora e engasga.
-- Placas **AMD**: a 0.57 traz a correção das cores verdes/rosas ([#7](../../issues/7)), ainda sem
-  teste numa AMD. Se continuar, mande o seu `user/last_run.log` na issue.
+- Placas **AMD**: as correções da 0.57 e da 0.58 ainda não foram testadas aqui numa AMD. Se algo
+  continuar errado, mande o seu `user/last_run.log` na issue.
+- **Geração de quadros** (experimental): a barra de vida/stamina pode tremer, e ela só faz
+  diferença com o FPS em 30.
+- **60 FPS / ilimitado:** sem o limite de 30 do jogo, algumas cenas se comportam diferente (a
+  parede do 2º colosso, colossos "voando"); para essas partes use 30 FPS.
 - Com 8 GB de memória de vídeo, o uso fica perto do limite em áreas grandes.
 
 ### Download e uso
@@ -117,6 +122,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.58** | **Community release** (Lucas-blip-png, Gabriell-os, Oussama268, jownatan, xeodeo, nakaionyt/y7ngboy, tabnul): **fewer crashes** (out of video memory, game freezing, post-colossus crash in PS4 Pro mode), **+15% FPS** and less video memory, AMD fixes (RDNA3/4 black tiles), **21:9/32:9 widescreen**, **FPS 30/60/unlimited**, **Xbox button icons**, FSR 3 / DLSS-G frame generation (experimental), launcher in Spanish, Chinese, Korean and Russian. |
 | **0.57** | **AMD cards:** fix for the green/pink fog and characters (AMD now uses the NVIDIA 32-lane path; diagnosis from issue #7, not yet tested on an AMD card). **New launcher option** to turn off direct memory access: ~10% more FPS, flatter distant water. |
 | **0.56** | **Open-world water with waves:** lakes and rivers below the waterfalls are no longer flat as a mirror (a shader instruction, `S_WQM_B64`, was ignored). **The upper lake ripples and reflects far away** (direct memory access on by default, as in Pink-shadPS4). Distant trees without "colored garbage". |
 | **0.0.13** | **No more crashes:** fixed the 0.0.12 crash in the intro/menu (the game asked for more textures than its pool holds). Tested ~40 min across the map with two save loads. **Lake reflections** over almost the whole surface, with ripples (a shader loop guard cut the reflection rays short). |
@@ -128,8 +134,12 @@ Full details in the [CHANGELOG](CHANGELOG.md) (in Portuguese).
 ### Known issues
 
 - The first start after updating rebuilds the shaders: the first load is slow and stutters.
-- **AMD** GPUs: 0.57 has the fix for the green/pink tint ([#7](../../issues/7)), not yet tested
-  on an AMD card. If it persists, attach your `user/last_run.log` to the issue.
+- **AMD** GPUs: the 0.57 and 0.58 fixes are not yet tested here on an AMD card. If something is
+  still wrong, attach your `user/last_run.log` to the issue.
+- **Frame generation** (experimental): the health/stamina bars may shake, and it only matters at
+  30 FPS.
+- **60 FPS / unlimited:** without the game's 30 FPS cap some scenes behave differently (the 2nd
+  colossus' wall, colossi "flying"); use 30 FPS there.
 - With 8 GB of video memory, usage gets close to the limit in large areas.
 
 ### Download and use

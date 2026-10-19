@@ -3,7 +3,9 @@
 
 #include "video_core/renderer_vulkan/vk_fsrfg.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -11,6 +13,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <immintrin.h>
+#include <thread>
 #include <utility>
 #include <vk_mem_alloc.h>
 
@@ -256,17 +260,20 @@ FfxVkFsr3_3_1_6FrameGenerationImage FgImage(vk::Image image, vk::Format format, 
     };
 }
 
-/// Sleeps until `due`: a high resolution waitable timer, then a short spin.
+/// Sleeps until `due`: a high resolution timer, then a short spin.
 void SleepUntil(Clock::time_point due) {
+#ifdef _WIN32
     static HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr,
                                                  CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
                                                  TIMER_ALL_ACCESS);
+#endif
     using namespace std::chrono_literals;
     for (;;) {
         const auto left = due - Clock::now();
         if (left <= 0ns) {
             return;
         }
+#ifdef _WIN32
         if (left > 1500us && timer) {
             LARGE_INTEGER when;
             when.QuadPart = -std::chrono::duration_cast<std::chrono::nanoseconds>(left - 1000us)
@@ -277,7 +284,14 @@ void SleepUntil(Clock::time_point due) {
                 continue;
             }
         }
-        YieldProcessor();
+#else
+        // Linux sleeps are high resolution already (hrtimers).
+        if (left > 1500us) {
+            std::this_thread::sleep_for(left - 1000us);
+            continue;
+        }
+#endif
+        _mm_pause();
     }
 }
 

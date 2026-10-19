@@ -6,6 +6,7 @@
 #include <atomic>
 #include <bitset>
 #include <climits>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -43,6 +44,9 @@ using namespace Xbyak::util;
 namespace Core {
 
 static Xbyak::Reg ZydisToXbyakRegister(const ZydisRegister reg) {
+    if (reg >= ZYDIS_REGISTER_AX && reg <= ZYDIS_REGISTER_R15W) { // sotc: MOVBE, TZCNT, LZCNT
+        return Xbyak::Reg16(reg - ZYDIS_REGISTER_AX + Xbyak::Operand::AX);
+    }
     if (reg >= ZYDIS_REGISTER_EAX && reg <= ZYDIS_REGISTER_R15D) {
         return Xbyak::Reg32(reg - ZYDIS_REGISTER_EAX + Xbyak::Operand::EAX);
     }
@@ -515,6 +519,13 @@ static void ReplaceMOVNTSD(void* address, const ZydisDecodedOperand*, Xbyak::Cod
     ReplaceMOVNT(address, 0xF2);
 }
 
+#include "cpu_patches_bmi.inc"
+
+/// sotc: the BMI1 form of BEXTR (the TBM one, with an immediate, is not on the PS4's CPU).
+static bool FilterNoBMI1Bextr(const ZydisDecodedOperand* operands) {
+    return operands[2].type == ZYDIS_OPERAND_TYPE_REGISTER && FilterNoBMI1(operands);
+}
+
 using PatchFilter = bool (*)(const ZydisDecodedOperand*);
 using InstructionGenerator = void (*)(void*, const ZydisDecodedOperand*, Xbyak::CodeGenerator&);
 struct PatchInfo {
@@ -542,6 +553,16 @@ static const std::unordered_map<ZydisMnemonic, std::vector<PatchInfo>> Patches =
     {ZYDIS_MNEMONIC_INSERTQ, {{FilterNoSSE4a, GenerateINSERTQ, true}}},
     {ZYDIS_MNEMONIC_MOVNTSS, {{FilterNoSSE4a, ReplaceMOVNTSS, false}}},
     {ZYDIS_MNEMONIC_MOVNTSD, {{FilterNoSSE4a, ReplaceMOVNTSD, false}}},
+
+    // sotc: BMI1, LZCNT and MOVBE (cpu_patches_bmi.inc)
+    {ZYDIS_MNEMONIC_ANDN, {{FilterNoBMI1, GenerateANDN, true}}},
+    {ZYDIS_MNEMONIC_BEXTR, {{FilterNoBMI1Bextr, GenerateBEXTR, true}}},
+    {ZYDIS_MNEMONIC_BLSI, {{FilterNoBMI1, GenerateBLSI, true}}},
+    {ZYDIS_MNEMONIC_BLSMSK, {{FilterNoBMI1, GenerateBLSMSK, true}}},
+    {ZYDIS_MNEMONIC_BLSR, {{FilterNoBMI1, GenerateBLSR, true}}},
+    {ZYDIS_MNEMONIC_TZCNT, {{FilterNoBMI1, GenerateTZCNT, true}}},
+    {ZYDIS_MNEMONIC_LZCNT, {{FilterNoLZCNT, GenerateLZCNT, true}}},
+    {ZYDIS_MNEMONIC_MOVBE, {{FilterNoMOVBE, GenerateMOVBE, true}}},
 
 #if 0 // sotc: the loader already redirects `mov reg, fs:[0]` to the TEB TLS slot
     // FS segment patches
@@ -759,6 +780,71 @@ static void IncrementRip(void* ctx, u64 length) {
     ((ucontext_t*)ctx)->uc_mcontext.gregs[REG_RIP] += length;
 #endif
 }
+
+#if defined(_WIN32)
+/// sotc: a MOVBE the patchers could not rewrite (a short form whose following instructions
+/// cannot move), on a CPU without MOVBE: done here from the exception.
+static bool TryEmulateMovbe(void* ctx, void* code_address,
+                            const ZydisDecodedInstruction& instruction,
+                            const ZydisDecodedOperand* operands) {
+    auto* context = static_cast<EXCEPTION_POINTERS*>(ctx)->ContextRecord;
+    const auto gpr = [context](ZydisRegister reg) -> DWORD64& {
+        return (&context->Rax)[GprIndex(reg)];
+    };
+    const bool load = operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER;
+    const auto& mem = operands[load ? 1 : 0].mem;
+    const auto& reg = operands[load ? 0 : 1];
+    u64 address = 0;
+    if (mem.base == ZYDIS_REGISTER_RIP) {
+        address = reinterpret_cast<u64>(code_address) + instruction.length;
+    } else if (mem.base != ZYDIS_REGISTER_NONE) {
+        address = gpr(mem.base);
+    }
+    if (mem.index != ZYDIS_REGISTER_NONE) {
+        address += gpr(mem.index) * (mem.scale != 0 ? mem.scale : 1);
+    }
+    address += mem.disp.has_displacement ? mem.disp.value : 0;
+    auto* memory = reinterpret_cast<void*>(address);
+    DWORD64& value = gpr(reg.reg.value);
+    switch (reg.size) {
+    case 16: {
+        u16 data;
+        if (load) {
+            std::memcpy(&data, memory, sizeof(data));
+            value = (value & ~u64{0xFFFF}) | __builtin_bswap16(data);
+        } else {
+            data = __builtin_bswap16(static_cast<u16>(value));
+            std::memcpy(memory, &data, sizeof(data));
+        }
+        break;
+    }
+    case 32: {
+        u32 data;
+        if (load) {
+            std::memcpy(&data, memory, sizeof(data));
+            value = __builtin_bswap32(data);
+        } else {
+            data = __builtin_bswap32(static_cast<u32>(value));
+            std::memcpy(memory, &data, sizeof(data));
+        }
+        break;
+    }
+    default: {
+        u64 data;
+        if (load) {
+            std::memcpy(&data, memory, sizeof(data));
+            value = __builtin_bswap64(data);
+        } else {
+            data = __builtin_bswap64(value);
+            std::memcpy(memory, &data, sizeof(data));
+        }
+        break;
+    }
+    }
+    IncrementRip(ctx, instruction.length);
+    return true;
+}
+#endif
 
 static bool TryExecuteIllegalInstruction(void* ctx, void* code_address) {
     // We need to decode the instruction to find out what it is. Normally we'd use a fully fleshed
@@ -2131,10 +2217,17 @@ bool NeedsSse4aEmulation() {
     return !cpu.has(Cpu::tSSE4a);
 }
 
+bool NeedsBmiEmulation() {
+    return EmulatesCpuFeature(Cpu::tBMI1) || EmulatesCpuFeature(Cpu::tLZCNT) ||
+           EmulatesCpuFeature(Cpu::tMOVBE);
+}
+
 u64 PatchShortSse4aInstructions(u64 segment_addr, u64 segment_size,
                                 std::span<const uintptr_t> function_starts) {
     auto* module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
-    if (module == nullptr || function_starts.empty() || !NeedsSse4aEmulation()) {
+    const bool sse4a = NeedsSse4aEmulation();
+    const bool bmi = NeedsBmiEmulation();
+    if (module == nullptr || function_starts.empty() || (!sse4a && !bmi)) {
         return 0;
     }
 
@@ -2149,23 +2242,54 @@ u64 PatchShortSse4aInstructions(u64 segment_addr, u64 segment_size,
     starts.erase(std::ranges::unique(starts).begin(), starts.end());
 
     // Register-form EXTRQ (66 0F 79 /r) and INSERTQ (F2 0F 79 /r) without REX are 4 bytes long.
-    const auto contains_short_sse4a = [](uintptr_t begin, uintptr_t end) {
+    // sotc: with BMI emulation every function with a BMI1/LZCNT/MOVBE byte pattern is decoded
+    // (VEX C4 for ANDN/BEXTR/BLS*, 0F BC/BD for TZCNT/LZCNT, 0F 38 F0/F1 for MOVBE).
+    const auto contains_short_sse4a = [sse4a, bmi](uintptr_t begin, uintptr_t end) {
         const u8* bytes = reinterpret_cast<const u8*>(begin);
         for (uintptr_t i = 0; i + 4 <= end - begin; ++i) {
-            if ((bytes[i] == 0x66 || bytes[i] == 0xF2) && bytes[i + 1] == 0x0F &&
+            if (sse4a && (bytes[i] == 0x66 || bytes[i] == 0xF2) && bytes[i + 1] == 0x0F &&
                 bytes[i + 2] == 0x79 && (bytes[i + 3] & 0xC0) == 0xC0) {
+                return true;
+            }
+            if (bmi && ((bytes[i] == 0xC4 && (bytes[i + 1] & 0x1F) == 0x02 &&
+                         (bytes[i + 3] == 0xF2 || bytes[i + 3] == 0xF3 || bytes[i + 3] == 0xF7)) ||
+                        (bytes[i] == 0x0F && (bytes[i + 1] == 0xBC || bytes[i + 1] == 0xBD)) ||
+                        (bytes[i] == 0x0F && bytes[i + 1] == 0x38 &&
+                         (bytes[i + 2] == 0xF0 || bytes[i + 2] == 0xF1)))) {
                 return true;
             }
         }
         return false;
     };
-    const auto is_short_sse4a = [](const DecodedCodeInstruction& decoded) {
-        return decoded.instruction.length < NearJumpSize &&
-               (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_EXTRQ ||
-                decoded.instruction.mnemonic == ZYDIS_MNEMONIC_INSERTQ);
+    const auto is_bmi = [bmi](const DecodedCodeInstruction& decoded) {
+        if (!bmi) {
+            return false;
+        }
+        switch (decoded.instruction.mnemonic) {
+        case ZYDIS_MNEMONIC_ANDN:
+        case ZYDIS_MNEMONIC_BEXTR:
+        case ZYDIS_MNEMONIC_BLSI:
+        case ZYDIS_MNEMONIC_BLSMSK:
+        case ZYDIS_MNEMONIC_BLSR:
+        case ZYDIS_MNEMONIC_TZCNT:
+        case ZYDIS_MNEMONIC_LZCNT:
+        case ZYDIS_MNEMONIC_MOVBE:
+            return FindMatchingPatch(decoded) != nullptr;
+        default:
+            return false;
+        }
+    };
+    const auto is_short_sse4a = [sse4a, &is_bmi](const DecodedCodeInstruction& decoded) {
+        if (decoded.instruction.length >= NearJumpSize) {
+            return false;
+        }
+        return (sse4a && (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_EXTRQ ||
+                          decoded.instruction.mnemonic == ZYDIS_MNEMONIC_INSERTQ)) ||
+               is_bmi(decoded);
     };
 
     u64 patched_count = 0;
+    u64 short_bitcount_left = 0;
     std::unique_lock lock{module->mutex};
     for (size_t index = 0; index < starts.size(); ++index) {
         const uintptr_t function_start = starts[index];
@@ -2178,8 +2302,17 @@ u64 PatchShortSse4aInstructions(u64 segment_addr, u64 segment_size,
             DecodeFunction(function_start, function_end, segment_addr, segment_end);
         uintptr_t covered_until = 0;
         for (const auto& [site, site_decoded] : function.instructions) {
-            if (site < covered_until || !is_short_sse4a(site_decoded) ||
-                module->patched.contains(reinterpret_cast<u8*>(site))) {
+            if (site < covered_until || module->patched.contains(reinterpret_cast<u8*>(site))) {
+                continue;
+            }
+            if (site_decoded.instruction.length >= NearJumpSize && is_bmi(site_decoded)) {
+                // Long enough for the jump: patched in place, at a decoded instruction boundary.
+                if (TryPatch(reinterpret_cast<u8*>(site), module).first) {
+                    ++patched_count;
+                }
+                continue;
+            }
+            if (!is_short_sse4a(site_decoded)) {
                 continue;
             }
 
@@ -2212,8 +2345,14 @@ u64 PatchShortSse4aInstructions(u64 segment_addr, u64 segment_size,
                 continuation += it->second.instruction.length;
             }
             if (!valid) {
-                LOG_WARNING(Core, "Short SSE4a at {:#x} left to the trap handler: {}", site,
+                LOG_WARNING(Core, "Short {} at {:#x} left to the trap handler: {}",
+                            ZydisMnemonicGetString(site_decoded.instruction.mnemonic), site,
                             reason);
+                if (site_decoded.instruction.mnemonic == ZYDIS_MNEMONIC_TZCNT ||
+                    site_decoded.instruction.mnemonic == ZYDIS_MNEMONIC_LZCNT) {
+                    // An old CPU runs these as BSF / BSR without a fault: wrong results.
+                    ++short_bitcount_left;
+                }
                 continue;
             }
 
@@ -2261,6 +2400,10 @@ u64 PatchShortSse4aInstructions(u64 segment_addr, u64 segment_size,
             covered_until = continuation;
             ++patched_count;
         }
+    }
+    if (short_bitcount_left) {
+        LOG_ERROR(Core, "{} short TZCNT/LZCNT could not be relocated: they compute BSF/BSR on "
+                  "this CPU", short_bitcount_left);
     }
     return patched_count;
 }
@@ -2446,6 +2589,10 @@ bool NeedsSse4aEmulation() {
     return false;
 }
 
+bool NeedsBmiEmulation() {
+    return false;
+}
+
 u64 PatchShortSse4aInstructions(u64, u64, std::span<const uintptr_t>) {
     return 0;
 }
@@ -2481,6 +2628,12 @@ static bool PatchesIllegalInstructionHandler(void* context) {
             ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
             const auto status =
                 Common::Decoder::Instance()->decodeInstruction(instruction, operands, code_address);
+#if defined(_WIN32)
+            if (ZYAN_SUCCESS(status) && instruction.mnemonic == ZYDIS_MNEMONIC_MOVBE &&
+                FilterNoMOVBE(operands)) {
+                return TryEmulateMovbe(context, code_address, instruction, operands);
+            }
+#endif
             if (ZYAN_SUCCESS(status)) {
                 const auto disassembled = Common::Decoder::Instance()->disassembleInst(
                     instruction, operands, std::bit_cast<u64>(code_address));

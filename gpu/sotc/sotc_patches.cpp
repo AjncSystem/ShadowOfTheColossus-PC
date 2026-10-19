@@ -17,18 +17,28 @@
 extern "C" int sotc_patch_eboot(const SotcPatchRequest* request, SotcPatchResult* result) {
     *result = {};
     result->needs_sse4a = Core::NeedsSse4aEmulation() ? 1 : 0;
+    result->needs_bmi = Core::NeedsBmiEmulation() ? 1 : 0;
     Core::RegisterPatchModule(request->image, request->module_size, request->trampoline,
                               request->trampoline_size);
     const auto base = reinterpret_cast<uintptr_t>(request->image);
 
     std::vector<uintptr_t> function_starts;
-    if (request->eh_frame_hdr_size) {
-        const uintptr_t hdr_start = base + request->eh_frame_hdr;
-        const uintptr_t hdr_end = hdr_start + request->eh_frame_hdr_size;
+    const auto add_table = [&](uint64_t offset, uint64_t size) {
+        const uintptr_t hdr_start = base + offset;
+        const uintptr_t hdr_end = hdr_start + size;
         Dwarf::EHHeaderInfo info;
-        if (!Dwarf::DecodeEHHdr(hdr_start, hdr_end, info) ||
-            !Dwarf::DecodeEHHdrTable(info, hdr_end, function_starts)) {
-            return -1;
+        return Dwarf::DecodeEHHdr(hdr_start, hdr_end, info) &&
+               Dwarf::DecodeEHHdrTable(info, hdr_end, function_starts);
+    };
+    if (request->eh_frame_hdr_size && !add_table(request->eh_frame_hdr, request->eh_frame_hdr_size)) {
+        return -1;
+    }
+    // sotc: the linked modules' code (libc, Fios2, the user's audio modules) is only patched for
+    // BMI1/LZCNT/MOVBE; a table that does not decode leaves that module to the linear sweep.
+    for (uint32_t i = 0; i < request->module_table_count; ++i) {
+        if (!add_table(request->module_tables[i].offset, request->module_tables[i].size)) {
+            LOG_WARNING(Core, "Module function table at {:#x} does not decode",
+                        request->module_tables[i].offset);
         }
     }
     result->function_starts = function_starts.size();
@@ -40,7 +50,11 @@ extern "C" int sotc_patch_eboot(const SotcPatchRequest* request, SotcPatchResult
     for (uint32_t i = 0; i < request->segment_count; ++i) {
         const uint64_t address = base + request->segments[i].offset;
         const uint64_t size = request->segments[i].size;
-        if (result->needs_sse4a) {
+        // sotc: module code only for BMI emulation; unchanged elsewhere (SSE4a: eboot only).
+        if (request->segments[i].offset >= request->eboot_size && !result->needs_bmi) {
+            continue;
+        }
+        if (result->needs_sse4a || result->needs_bmi) {
             result->short_sse4a += Core::PatchShortSse4aInstructions(address, size, function_starts);
         }
         if (!selected.empty()) {

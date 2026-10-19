@@ -198,10 +198,14 @@ def link(game, out, module_names=DEFAULT_MODULES):
                 by_nid[(s['identity'][0], s['identity'][1][0])].append(entry_value)
                 count += 1
         fs_patched += patch_fs_loads(image, m['ph'], base)
+        # sotc: the module's function table, for the CPU patches of its code (sotc_cpu.py).
+        eh = next((p for p in m['ph'] if p['type'] == 0x6474e550), None)
+        eh_frame_hdr = [base + eh['vaddr'], eh['memsz']] if eh and mapped(eh['vaddr'], eh['memsz']) else [0, 0]
         table.append(dict(file=filename, base=base, size=modsize, init=base + m['tags'].get(12, 0),
                           tls_address=base + tls['vaddr'] if tls else 0, tls_memsz=tls['memsz'] if tls else 0,
                           tls_filesz=tls['filesz'] if tls else 0, tls_module=module_id,
-                          tls_relocations=tls_relocations, exports=count, sha256=m['sha256']))
+                          tls_relocations=tls_relocations, exports=count, sha256=m['sha256'],
+                          eh_frame_hdr=eh_frame_hdr))
         base = (base + modsize + 65535) & ~65535
 
     bindings, unresolved = [], []

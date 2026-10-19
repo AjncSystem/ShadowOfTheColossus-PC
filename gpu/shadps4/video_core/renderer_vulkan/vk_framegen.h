@@ -31,7 +31,7 @@ bool Available(Mode mode);
 /// F8 (window thread): the next available mode, which it returns.
 Mode Cycle();
 
-/// For the overlay: "désactivée", "DLSS-G", "FSR 3".
+/// For the overlay: "off" (in the launcher's language), "DLSS-G", "FSR 3".
 const char* Name(Mode mode);
 
 /// Present thread, at each game frame: SOTC_FRAMEGEN_TEST_CYCLE=<seconds> switches the mode

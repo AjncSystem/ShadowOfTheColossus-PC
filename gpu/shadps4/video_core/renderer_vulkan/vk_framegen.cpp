@@ -2,6 +2,7 @@
 // sotc: the frame generation mode, see vk_framegen.h.
 
 #include "video_core/renderer_vulkan/vk_framegen.h"
+#include "video_core/sotc_ui_lang.h"
 
 #include <windows.h>
 #include <dxgi.h>
@@ -156,7 +157,7 @@ void TestTick() {
 const char* Name(Mode mode) {
     switch (mode) {
     case Mode::Off:
-        return "désactivée";
+        return SotcUi::T("desligada", "off");
     case Mode::Dlss:
         return "DLSS-G";
     case Mode::Fsr:

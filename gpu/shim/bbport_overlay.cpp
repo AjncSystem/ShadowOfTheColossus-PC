@@ -18,6 +18,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_fps_cap.h"
+#include "video_core/sotc_ui_lang.h"
 #include "video_core/sotc_stats.h"
 
 // DejaVu Sans (Cyrillic), embedded (third_party/fonts, Bitstream Vera license).
@@ -590,7 +591,7 @@ void FpsCounter() {
     const float now_ms = frame_ms_avg;
     ImGui::TextColored(rate_color(now_ms), "%.0f FPS", now_ms > 0.0f ? 1000.0f / now_ms : 0.0f);
     ImGui::SameLine();
-    ImGui::TextColored(grey, "%.1f ms   cible %.0f FPS", now_ms, 1000.0f / target);
+    ImGui::TextColored(grey, SotcUi::T("%.1f ms   alvo %.0f FPS", "%.1f ms   target %.0f FPS"), now_ms, 1000.0f / target);
 
     // Frame time graph, 0 to 2.2x the target, with the target line.
     const float graph_max = target * 2.2f;
@@ -603,11 +604,11 @@ void FpsCounter() {
     ImGui::GetWindowDrawList()->AddLine(ImVec2(lo.x, y), ImVec2(hi.x, y),
                                         IM_COL32(120, 200, 255, 160), 1.0f);
 
-    ImGui::Text("%.0f s : moy %.1f | 1%% low %.1f | pire %.0f ms", seconds, avg_fps,
+    ImGui::Text(SotcUi::T("%.0f s: média %.1f | 1%% low %.1f | pior %.0f ms", "%.0f s: avg %.1f | 1%% low %.1f | worst %.0f ms"), seconds, avg_fps,
                 p99 > 0.0f ? 1000.0f / p99 : 0.0f, worst);
-    ImGui::TextColored(late ? (late > 3 ? red : yellow) : green, "En retard : %d", late);
+    ImGui::TextColored(late ? (late > 3 ? red : yellow) : green, SotcUi::T("Atrasados: %d", "Late: %d"), late);
     ImGui::SameLine();
-    ImGui::TextColored(grey, "| session %llu (%.1f%%), saccades >50 ms %llu",
+    ImGui::TextColored(grey, SotcUi::T("| sessão %llu (%.1f%%), travadas >50 ms %llu", "| session %llu (%.1f%%), stutters >50 ms %llu"),
                        static_cast<unsigned long long>(session_late),
                        session_frames ? 100.0 * session_late / session_frames : 0.0,
                        static_cast<unsigned long long>(session_stutters));
@@ -621,7 +622,7 @@ void FpsCounter() {
                            static_cast<unsigned long long>(SotcStats::ov_compiles_total.load()));
         if (cause >= 0) {
             ImGui::SameLine();
-            ImGui::TextColored(grey, "| pire image : %s %.0f ms",
+            ImGui::TextColored(grey, SotcUi::T("| pior quadro: %s %.0f ms", "| worst frame: %s %.0f ms"),
                                SotcStats::kFrameCauseNames[cause],
                                SotcStats::ov_worst_cause_ms.load());
         }
@@ -629,27 +630,27 @@ void FpsCounter() {
     // Frame generation (vk_framegen.h): DLSS-G (vk_dlssg.cpp) or FSR 3 (vk_fsrfg.cpp).
     switch (Vulkan::FrameGen::Current()) {
     case Vulkan::FrameGen::Mode::Off:
-        ImGui::TextColored(grey, "Génération d'images : désactivée");
+        ImGui::TextColored(grey, SotcUi::T("Geração de quadros: desligada", "Frame generation: off"));
         break;
     case Vulkan::FrameGen::Mode::Dlss:
         if (const int fg = SotcStats::ov_fg_state.load(std::memory_order_relaxed); fg == 1) {
             const uint32_t shown = SotcStats::ov_fg_frames.load(std::memory_order_relaxed);
             const uint32_t n = shown ? shown : 2;
-            ImGui::TextColored(green, "DLSS-G x%u : ~%.0f FPS affichées", n, avg_fps * n);
+            ImGui::TextColored(green, SotcUi::T("DLSS-G x%u: ~%.0f FPS na tela", "DLSS-G x%u: ~%.0f FPS shown"), n, avg_fps * n);
         } else if (fg == 2) {
             ImGui::TextColored(red, "DLSS-G : erreur (statut %#x)",
                                SotcStats::ov_fg_status.load(std::memory_order_relaxed));
         } else {
-            ImGui::TextColored(grey, "DLSS-G : en attente (pas de scène 3D)");
+            ImGui::TextColored(grey, SotcUi::T("DLSS-G: aguardando (sem cena 3D)", "DLSS-G: waiting (no 3D scene)"));
         }
         break;
     case Vulkan::FrameGen::Mode::Fsr:
         if (const int fg = SotcStats::ov_fsr_state.load(std::memory_order_relaxed); fg == 1) {
-            ImGui::TextColored(green, "FSR 3 x2 : ~%.0f FPS affichées", avg_fps * 2);
+            ImGui::TextColored(green, SotcUi::T("FSR 3 x2: ~%.0f FPS na tela", "FSR 3 x2: ~%.0f FPS shown"), avg_fps * 2);
         } else if (fg == 2) {
             ImGui::TextColored(red, "FSR 3 : erreur (voir le journal)");
         } else {
-            ImGui::TextColored(grey, "FSR 3 : en attente (pas de scène 3D)");
+            ImGui::TextColored(grey, SotcUi::T("FSR 3: aguardando (sem cena 3D)", "FSR 3: waiting (no 3D scene)"));
         }
         break;
     }
@@ -658,8 +659,8 @@ void FpsCounter() {
                            SotcStats::vram_budget.load(std::memory_order_relaxed) / 1073741824.0);
         ImGui::SameLine();
     }
-    ImGui::TextDisabled("F7 : %s   F8 : génération d'images   F10 : masquer",
-                        SotcFpsCap::uncapped ? "FPS débloqués" : "bloqué à 30");
+    ImGui::TextDisabled(SotcUi::T("F7: %s   F8: geração de quadros   F10: esconder", "F7: %s   F8: frame generation   F10: hide"),
+                        SotcFpsCap::uncapped ? SotcUi::T("FPS livres", "FPS uncapped") : SotcUi::T("travado em 30", "capped at 30"));
     ImGui::End();
 }
 
@@ -775,7 +776,7 @@ bool HandleEvent(const SDL_Event& event) {
         if (mode == Vulkan::FrameGen::Mode::Off &&
             !Vulkan::FrameGen::Available(Vulkan::FrameGen::Mode::Fsr) &&
             !Vulkan::FrameGen::Available(Vulkan::FrameGen::Mode::Dlss)) {
-            toast_text = "Génération d'images : indisponible sur ce GPU";
+            toast_text = SotcUi::T("Geração de quadros: indisponível nesta placa", "Frame generation: not available on this GPU");
             toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
         }
         return true;
@@ -1067,7 +1068,7 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
     if (const Vulkan::FrameGen::Mode mode = Vulkan::FrameGen::Current(); mode != shown_mode) {
         shown_mode = mode;
         std::scoped_lock lock{imgui_mutex};
-        toast_text = std::string("Génération d'images : ") + Vulkan::FrameGen::Name(mode);
+        toast_text = std::string(SotcUi::T("Geração de quadros: ", "Frame generation: ")) + Vulkan::FrameGen::Name(mode);
         toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
     }
     // The 30 FPS cap was switched (F7).
@@ -1075,7 +1076,7 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
     if (const bool uncapped = SotcFpsCap::uncapped; uncapped != shown_uncapped) {
         shown_uncapped = uncapped;
         std::scoped_lock lock{imgui_mutex};
-        toast_text = uncapped ? "FPS débloqués" : "FPS bloqués à 30";
+        toast_text = uncapped ? SotcUi::T("FPS livres", "FPS uncapped") : SotcUi::T("FPS travados em 30", "FPS capped at 30");
         toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
     }
     if (!Visible()) {

@@ -119,8 +119,8 @@ public:
 #endif
 
     /// sotc: frame generation without the HUD. The game composes its UI layer (an R8G8B8A8 sRGB
-    /// render target) over the fp16 scene in one draw into the video out image; while FSR 3 frame
-    /// generation runs, that draw is repeated into an image of its own with a transparent UI
+    /// render target) over the fp16 scene in one draw into the video out image; while frame
+    /// generation (FSR 3 or DLSS-G) runs, that draw is repeated into an image of its own with a transparent UI
     /// texture (SOTC_FG_HUDLESS=0 turns it off). Thread of PrepareFrame: that image for the video
     /// out image at `address`, viewed as `format` (layout ShaderReadOnlyOptimal), when it was
     /// drawn since the last call; else a null view.

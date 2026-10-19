@@ -497,10 +497,27 @@ bool PipelineCache::AsyncPipelineEligible() const {
     return true;
 }
 
-void PipelineCache::QueueAsyncPipeline(u64 hash) {
+// sotc: SOTC_ASYNC_PRELOAD=0 builds the cached pipelines at boot on the command processor, one
+// after the other, as before. With an empty driver cache (a driver update) that took ~100 s of
+// black window; the workers now build them while the game starts, and a draw whose pipeline is
+// not built yet is skipped (a compute bind waits for it, as for any deferred compute pipeline).
+bool PipelineCache::AsyncPreloadEnabled() const {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_ASYNC_PRELOAD");
+        return !v || v[0] != '0';
+    }();
+    return enabled && !async_workers.empty() && !EmulatorSettings.IsShaderCollect();
+}
+
+void PipelineCache::QueueAsyncPipeline(u64 hash,
+                                       const GraphicsPipeline::SerializationSupport* preloaded) {
     auto job = std::make_unique<AsyncPipelineJob>();
     job->key = graphics_key;
     job->hash = hash;
+    if (preloaded) {
+        job->preloaded = true;
+        job->sdata = *preloaded; // the cached vertex layout the pipeline is built from
+    }
     job->infos = infos;
     job->runtime_infos = runtime_infos;
     if (fetch_shader) {
@@ -562,7 +579,7 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
         job->pipeline = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, job->key, *pipeline_cache, job->infos,
             job->runtime_infos, job->fetch_shader ? &*job->fetch_shader : nullptr, job->modules,
-            job->sdata, false, true);
+            job->sdata, job->preloaded, true);
         SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
         std::scoped_lock lock{async_mutex};
         async_done.push_back(std::move(job));
@@ -584,6 +601,16 @@ void PipelineCache::CollectAsyncPipelines() {
         }
         const auto it = graphics_pipelines.find(job->key);
         if (it == graphics_pipelines.end()) {
+            continue;
+        }
+        if (job->preloaded) {
+            // Already in the cache. One the driver refused is dropped: the next draw that needs
+            // it compiles it, as when WarmUp builds it itself and it fails.
+            if (job->pipeline->Handle()) {
+                it.value() = std::move(job->pipeline);
+            } else {
+                graphics_pipelines.erase(it);
+            }
             continue;
         }
         it.value() = std::move(job->pipeline);

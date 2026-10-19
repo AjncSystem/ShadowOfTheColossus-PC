@@ -13,6 +13,7 @@
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Serialization {
@@ -235,14 +236,29 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
 
     {
         WarmUpTimer timer{warmup_times.pipelines};
+        // sotc: built by the pipeline workers (SOTC_ASYNC_PRELOAD); WarmUp waits for them.
+        const bool deferred = AsyncPreloadEnabled();
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
                                                        *pipeline_cache, compute_key, *infos[0],
-                                                       modules[0], sdata, true);
+                                                       modules[0], sdata, true, deferred);
+        if (deferred) {
+            auto job = std::make_unique<AsyncPipelineJob>();
+            job->compute = it.value().get();
+            {
+                std::scoped_lock lock{async_mutex};
+                async_queue.insert(async_queue.begin() + async_compute_queued++, std::move(job));
+            }
+            async_cv.notify_one();
+            preload_computes.push_back(compute_key);
+        }
     }
 
     infos.fill(nullptr);
     modules.fill(nullptr);
 
+    if (AsyncPreloadEnabled()) {
+        return true; // checked by WarmUp once built
+    }
     if (!it.value()->Handle()) {
         compute_pipelines.erase(compute_key);
         return false;
@@ -326,7 +342,11 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     ASSERT(is_new);
 
-    {
+    if (AsyncPreloadEnabled()) {
+        // sotc: built by a pipeline worker; the map entry stays null (draws skipped) until the
+        // command processor collects it (SOTC_ASYNC_PRELOAD).
+        QueueAsyncPipeline(std::hash<GraphicsPipelineKey>{}(graphics_key), &sdata);
+    } else {
         WarmUpTimer timer{warmup_times.pipelines};
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
@@ -337,6 +357,9 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     modules.fill(nullptr);
     fetch_shader = nullptr;
 
+    if (AsyncPreloadEnabled()) {
+        return true; // a refused one is dropped when collected (CollectAsyncPipelines)
+    }
     if (!it.value()->Handle()) {
         graphics_pipelines.erase(graphics_key);
         return false;
@@ -504,6 +527,21 @@ void PipelineCache::WarmUp() {
                 ++num_pipelines;
             }
         });
+
+    // sotc: the compute pipelines the workers built (SOTC_ASYNC_PRELOAD); the graphics ones
+    // are still being built while the game starts.
+    for (const auto& key : preload_computes) {
+        const auto it = compute_pipelines.find(key);
+        if (it == compute_pipelines.end()) {
+            continue;
+        }
+        it.value()->WaitBuilt();
+        if (!it.value()->Handle()) {
+            compute_pipelines.erase(it);
+            --num_pipelines;
+        }
+    }
+    preload_computes.clear();
 
     LOG_INFO(Render,
              "Preloaded {} pipelines in {} ms (SPIR-V reads {} ms, shader modules {} ms, "

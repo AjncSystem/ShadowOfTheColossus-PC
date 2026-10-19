@@ -2225,7 +2225,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     }();
     if (hudless_on && stage.sw_stage == Shader::SwStage::Fragment && image_bindings.size() == 2 &&
         image_bindings[0].first && image_bindings[1].first &&
-        FrameGen::Current() == FrameGen::Mode::Fsr) {
+        FrameGen::Current() != FrameGen::Mode::Off) {
         const auto& ui = texture_cache.GetImage(image_bindings[0].first);
         const auto& scene = texture_cache.GetImage(image_bindings[1].first);
         if (ui.usage.render_target && ui.info.pixel_format == vk::Format::eR8G8B8A8Srgb &&

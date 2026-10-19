@@ -79,6 +79,13 @@ struct FrameSlot {
     bool valid{};    ///< depth, motion vectors and constants are set for this frame
     bool sl_valid{}; ///< ... and given to Streamline
     sl::Constants constants{};
+    /// The presenter's HUD-less copy of this frame (NoteHudless), null when it has none.
+    struct Hudless {
+        vk::Image image;
+        vk::ImageView view;
+        vk::Format format{};
+        u32 width{}, height{};
+    } hudless;
     /// Streamline's timeline semaphore and value: DLSS-G is done reading this frame's inputs.
     VkSemaphore inputs_done{};
     u64 inputs_done_value{};
@@ -858,6 +865,7 @@ void PrepareInputs(u32 frame_id, vk::CommandBuffer cmdbuf, VideoCore::TextureCac
     FrameSlot& f = frames[frame_id];
     f.valid = false;
     f.sl_valid = false;
+    f.hudless = {};
     FsrFg::NoDepth(frame_id);
     const bool fsr = FrameGen::Current() == FrameGen::Mode::Fsr;
     if (!supported && !fsr) {
@@ -871,6 +879,21 @@ void PrepareInputs(u32 frame_id, vk::CommandBuffer cmdbuf, VideoCore::TextureCac
         }
         Marker(sl::PCLMarker::eSimulationEnd, f.index);
         Marker(sl::PCLMarker::eRenderSubmitStart, f.index);
+    }
+    // Streamline may still be reading this frame's images from its last present (sotc: also
+    // the presenter's HUD-less image, rewritten after this call even without a G-buffer pass).
+    if (f.inputs_done && f.inputs_done_value) {
+        const vk::Semaphore semaphore{f.inputs_done};
+        const vk::SemaphoreWaitInfo wait{
+            .semaphoreCount = 1, .pSemaphores = &semaphore, .pValues = &f.inputs_done_value};
+        if (g_instance->GetDevice().waitSemaphores(wait, 100'000'000) != vk::Result::eSuccess) {
+            static u32 timeouts = 0;
+            if (timeouts++ < 5) {
+                std::fprintf(stderr, "SOTC DLSSG: inputs still in use after 100 ms\n");
+            }
+        }
+        f.inputs_done = {};
+        f.inputs_done_value = 0;
     }
 
     const Pending p = std::exchange(pending, Pending{});
@@ -893,20 +916,6 @@ void PrepareInputs(u32 frame_id, vk::CommandBuffer cmdbuf, VideoCore::TextureCac
             std::fprintf(stderr, "SOTC DLSSG: camera matrix not understood\n");
         }
         return;
-    }
-    // Streamline may still be reading this frame's images from its last present.
-    if (f.inputs_done && f.inputs_done_value) {
-        const vk::Semaphore semaphore{f.inputs_done};
-        const vk::SemaphoreWaitInfo wait{
-            .semaphoreCount = 1, .pSemaphores = &semaphore, .pValues = &f.inputs_done_value};
-        if (g_instance->GetDevice().waitSemaphores(wait, 100'000'000) != vk::Result::eSuccess) {
-            static u32 timeouts = 0;
-            if (timeouts++ < 5) {
-                std::fprintf(stderr, "SOTC DLSSG: inputs still in use after 100 ms\n");
-            }
-        }
-        f.inputs_done = {};
-        f.inputs_done_value = 0;
     }
     if (!EnsureImages(f, depth->info.pixel_format, mvec->info.pixel_format, width, height)) {
         return;
@@ -1015,6 +1024,13 @@ void PrepareInputs(u32 frame_id, vk::CommandBuffer cmdbuf, VideoCore::TextureCac
     }
 }
 
+void NoteHudless(u32 frame_id, vk::Image image, vk::ImageView view, vk::Format format, u32 width,
+                 u32 height) {
+    if (frame_id < kMaxFrames) {
+        frames[frame_id].hudless = {image, view, format, width, height};
+    }
+}
+
 void FrameSubmitted(u32 frame_id) {
     if (!supported || frame_id >= kMaxFrames || frames[frame_id].index == 0) {
         return;
@@ -1084,21 +1100,42 @@ void BeforePresent(u32 frame_id, vk::Rect2D rect, vk::Extent2D extent) {
         mvec.flags = 0;
         mvec.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+        // sotc: the frame without its HUD (NoteHudless): DLSS-G then keeps the HUD still instead
+        // of moving it with the scene. It must have the size of the game's area in the back
+        // buffer (no scaling in the blit); otherwise, or when the frame has none, a null tag so
+        // that an earlier frame's is not used.
+        const FrameSlot::Hudless& h = f.hudless;
+        const bool hudless_ok =
+            h.image && h.width == rect.extent.width && h.height == rect.extent.height;
+        sl::Resource hudless{sl::ResourceType::eTex2d, static_cast<VkImage>(h.image), nullptr,
+                             static_cast<VkImageView>(h.view),
+                             static_cast<u32>(VK_IMAGE_LAYOUT_GENERAL)};
+        hudless.width = h.width;
+        hudless.height = h.height;
+        hudless.nativeFormat = static_cast<u32>(h.format);
+        hudless.mipLevels = 1;
+        hudless.arrayLayers = 1;
+        hudless.flags = 0;
+        hudless.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
         const sl::Extent full{0, 0, f.width, f.height};
+        const sl::Extent hudless_full{0, 0, h.width, h.height};
         sl::Extent back{static_cast<u32>(std::max(rect.offset.y, 0)),
                         static_cast<u32>(std::max(rect.offset.x, 0)), rect.extent.width,
                         rect.extent.height};
         const bool whole = back.left == 0 && back.top == 0 && back.width == extent.width &&
                            back.height == extent.height;
-        std::array<sl::ResourceTag, 3> tags{
+        std::array<sl::ResourceTag, 4> tags{
             sl::ResourceTag{&depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent,
                             &full},
             sl::ResourceTag{&mvec, sl::kBufferTypeMotionVectors,
                             sl::ResourceLifecycle::eValidUntilPresent, &full},
+            sl::ResourceTag{hudless_ok ? &hudless : nullptr, sl::kBufferTypeHUDLessColor,
+                            sl::ResourceLifecycle::eValidUntilPresent, &hudless_full},
             sl::ResourceTag{nullptr, sl::kBufferTypeBackbuffer,
                             sl::ResourceLifecycle::eValidUntilPresent, &back},
         };
-        const u32 count = whole ? 2 : 3;
+        const u32 count = whole ? 3 : 4;
         const sl::Result r = api.set_tag(*token, sl::ViewportHandle{0}, tags.data(), count, nullptr);
         if (r != sl::Result::eOk) {
             static u32 errors = 0;
@@ -1108,12 +1145,14 @@ void BeforePresent(u32 frame_id, vk::Rect2D rect, vk::Extent2D extent) {
             }
         }
     } else {
-        std::array<sl::ResourceTag, 2> tags{
+        std::array<sl::ResourceTag, 3> tags{
             sl::ResourceTag{nullptr, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent},
             sl::ResourceTag{nullptr, sl::kBufferTypeMotionVectors,
                             sl::ResourceLifecycle::eValidUntilPresent},
+            sl::ResourceTag{nullptr, sl::kBufferTypeHUDLessColor,
+                            sl::ResourceLifecycle::eValidUntilPresent},
         };
-        api.set_tag(*token, sl::ViewportHandle{0}, tags.data(), 2, nullptr);
+        api.set_tag(*token, sl::ViewportHandle{0}, tags.data(), 3, nullptr);
     }
     api.pcl_marker(sl::PCLMarker::ePresentStart, *token);
     QueryPerformanceCounter(&present_start);

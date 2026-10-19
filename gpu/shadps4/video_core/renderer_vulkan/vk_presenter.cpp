@@ -802,6 +802,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         });
         pp_pass.Render(cmdbuf, hudless_view, image_size, hudless, pp_settings);
         frame->hudless = &hudless;
+        Dlssg::NoteHudless(frame->id, hudless.image, hudless.image_view,
+                           swapchain.GetSurfaceFormat().format, hudless.width, hudless.height);
     }
 
 

@@ -34,6 +34,20 @@ done
 ldd "$dest/bin/bb-probe.exe" "$dest/bin/bb-gpu-capabilities.exe" | awk '/\/clang64\/bin\// {print $3}' | sort -u | while read -r dll; do
     cp -u "$dll" "$dest/bin/"
 done
+# DLSS Frame Generation (RTX 40/50): the official NVIDIA Streamline runtime next to bb-probe.exe,
+# with NVIDIA's licenses (redistributable under the NVIDIA RTX SDKs license and Streamline's MIT
+# license). Not in git: STREAMLINE_DIR (default ../SotC-deps/streamline-2.14.16) holds the files
+# taken from github.com/NVIDIA-RTX/Streamline releases v2.14.16 (bin/x64). Without it the package
+# still works; frame generation then offers FSR 3 only.
+streamline=${STREAMLINE_DIR:-../SotC-deps/streamline-2.14.16}
+if [[ -f "$streamline/sl.interposer.dll" ]]; then
+    cp "$streamline"/*.dll "$dest/bin/"
+    mkdir -p "$dest/bin/licenses-nvidia"
+    cp "$streamline"/licenses-nvidia/* "$dest/bin/licenses-nvidia/"
+    echo "DLSS-G: NVIDIA Streamline runtime included"
+else
+    echo "DLSS-G: no Streamline runtime in $streamline (FSR 3 only)" >&2
+fi
 cp scripts/prepare.py scripts/link_libc.py scripts/link_modules.py scripts/content_profile.py \
    scripts/sotc_cpu.py scripts/sotc_modes.py "$dest/scripts/"
 cp sotc.py SotC.bat LICENSE CHANGELOG.md "$dest/"

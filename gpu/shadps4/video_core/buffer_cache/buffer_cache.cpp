@@ -558,29 +558,50 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                                  u64 mapped_offset) {
     static std::optional<BpeHeapGuard> cached_guard;
     static std::array<u64, 3> cached_signature{};
-    BpeHeapGuard* heap_guard = nullptr;
-    if (const VAddr heap = runtime_sotc_heap(); heap != 0) {
+    // sotc: writes into an in-use block the guard found before skip it (BpeUsedBlocks); the guard is
+    // built only for the others. SOTC_HEAP_FAST=0 builds it for every readback batch into the heap,
+    // SOTC_HEAP_FAST=2 also checks each skipped write against a fresh guard (SOTC_FPS log).
+    static const int heap_fast = [] {
+        const char* v = std::getenv("SOTC_HEAP_FAST");
+        return v ? std::atoi(v) : 1;
+    }();
+    static BpeUsedBlocks used_blocks{memory};
+    static u64 fast_writes = 0, guarded_writes = 0, fast_wrong = 0;
+    const VAddr heap = runtime_sotc_heap();
+    VAddr heap_base = 0;
+    u64 heap_size = 0;
+    bool touches_heap = false;
+    if (heap != 0) {
         // Only readbacks into the heap's own memory ([heap+0x28], [heap+0x30] bytes) need it:
         // building the guard walks the free tree, too costly for every readback.
-        const VAddr heap_base = *std::bit_cast<const VAddr*>(heap + 0x28);
-        const u64 heap_size = *std::bit_cast<const u64*>(heap + 0x30);
-        bool touches_heap = false;
+        heap_base = *std::bit_cast<const VAddr*>(heap + 0x28);
+        heap_size = *std::bit_cast<const u64*>(heap + 0x30);
         for (const auto& item : pending) {
             touches_heap |= item.addr < heap_base + heap_size && heap_base < item.addr + item.size;
         }
-        if (touches_heap) {
-            const std::array<u64, 3> signature = {*std::bit_cast<const u64*>(heap + 0x80),
-                                                   *std::bit_cast<const u64*>(heap + 0xa8),
-                                                   *std::bit_cast<const u64*>(heap + 0xc0)};
-            if (!cached_guard || signature != cached_signature) {
-                SotcStats::heap_guard_builds.fetch_add(1, std::memory_order_relaxed);
-                cached_guard.emplace(memory, heap);
-                cached_signature = signature;
-            }
-            if (cached_guard->IsValid()) {
-                heap_guard = &*cached_guard;
-            }
+    }
+    BpeHeapGuard* heap_guard = nullptr;
+    bool guard_tried = false;
+    const auto get_guard = [&]() -> BpeHeapGuard* {
+        if (guard_tried) {
+            return heap_guard;
         }
+        guard_tried = true;
+        const std::array<u64, 3> signature = {*std::bit_cast<const u64*>(heap + 0x80),
+                                               *std::bit_cast<const u64*>(heap + 0xa8),
+                                               *std::bit_cast<const u64*>(heap + 0xc0)};
+        if (!cached_guard || signature != cached_signature) {
+            SotcStats::heap_guard_builds.fetch_add(1, std::memory_order_relaxed);
+            cached_guard.emplace(memory, heap);
+            cached_signature = signature;
+        }
+        if (cached_guard->IsValid()) {
+            heap_guard = &*cached_guard;
+        }
+        return heap_guard;
+    };
+    if (touches_heap && heap_fast == 0) {
+        get_guard();
     }
     for (const auto& item : pending) {
         for (const auto& copy : item.copies) {
@@ -601,6 +622,47 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                 }
             }
             ForEachNonStackRange(dst_addr, copy.size, [&](VAddr addr, u64 size) {
+                if (heap_fast && touches_heap && addr < heap_base + heap_size &&
+                    heap_base < addr + size) {
+                    // SOTC_HEAP_FAST=2/3: why writes miss the remembered blocks (3 skips the check)
+                    static std::array<u64, 4> cover_why{};
+                    static std::array<u64, 7> find_why{};
+                    if (heap_fast >= 2 && (fast_writes + guarded_writes) % 5000 == 4999) {
+                        std::fprintf(stderr,
+                                     "SOTC HEAP FAST skipped %llu guarded %llu wrong %llu remembered %zu "
+                                     "miss(none %llu leaves %llu freed %llu) find(ok %llu nofree %llu "
+                                     "chain %llu steps %llu header %llu free %llu fence %llu)\n",
+                                     (unsigned long long)fast_writes, (unsigned long long)guarded_writes,
+                                     (unsigned long long)fast_wrong, used_blocks.Size(),
+                                     (unsigned long long)cover_why[1], (unsigned long long)cover_why[2],
+                                     (unsigned long long)cover_why[3], (unsigned long long)find_why[0],
+                                     (unsigned long long)find_why[1], (unsigned long long)find_why[2],
+                                     (unsigned long long)find_why[3], (unsigned long long)find_why[4],
+                                     (unsigned long long)find_why[5], (unsigned long long)find_why[6]);
+                    }
+                    int why = 0;
+                    if (used_blocks.Covers(heap, addr, addr + size, &why)) {
+                        ++fast_writes;
+                        if (heap_fast == 2) {
+                            fast_wrong += get_guard() && heap_guard->HasMetadata(addr, addr + size);
+                        }
+                        memory->TryWriteBacking(std::bit_cast<u8*>(addr),
+                                                src + (addr - dst_addr), size, 1);
+                        return;
+                    }
+                    ++cover_why[why];
+                    if (get_guard()) {
+                        ++guarded_writes;
+                        int find = 0;
+                        if (VAddr block = 0, next = 0;
+                            heap_guard->FindUsedBlock(addr, block, next, &find)) {
+                            used_blocks.Add(block, next);
+                        } else if (find == 6) {
+                            used_blocks.SetFence(block);
+                        }
+                        ++find_why[find];
+                    }
+                }
                 if (heap_guard) {
                     if (const u64 kept = heap_guard->Write(addr, src + (addr - dst_addr), size)) {
                         static u64 reported = 0;

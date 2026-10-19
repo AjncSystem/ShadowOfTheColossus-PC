@@ -36,6 +36,15 @@ public:
     /// skipped bytes whose GPU value differed from the CPU value (0 when harmless)
     u64 Write(VAddr addr, const u8* data, u64 size);
 
+    /// True when [addr, end) overlaps allocator metadata
+    bool HasMetadata(VAddr addr, VAddr end) {
+        return !CollectSpans(addr, end).empty();
+    }
+
+    /// The in-use block whose user area holds `addr` (its header address and the next block's), found by
+    /// following the physical chain from the closest free block below it
+    bool FindUsedBlock(VAddr addr, VAddr& block, VAddr& next, int* why = nullptr) const;
+
 private:
     using Span = std::pair<VAddr, VAddr>;
 
@@ -63,6 +72,39 @@ private:
         const u8* ptr;
     };
     mutable std::vector<Run> runs;
+};
+
+/**
+ * sotc: in-use heap blocks that readbacks write into. A write inside the user area of a block that is
+ * still in use holds no allocator metadata (headers sit between blocks, tree links only in free
+ * ones), so it needs no guard, whose build walks the whole free tree. The heap changes every frame,
+ * which rebuilt the guard about once per frame (~6% of the draw thread in the Shrine). Each hit
+ * re-reads the block's header and the next block's back link, so a block freed since is not trusted.
+ */
+class BpeUsedBlocks {
+public:
+    explicit BpeUsedBlocks(Core::MemoryManager* memory_) : memory{memory_} {}
+
+    /// True when [addr, end) lies in the user area of a remembered block that is still in use
+    bool Covers(VAddr heap, VAddr addr, VAddr end, int* why = nullptr);
+
+    void Add(VAddr block, VAddr next);
+
+    /// The in-use, size-0 block that ends the chain: nothing above it is allocator metadata
+    void SetFence(VAddr block) {
+        fence = block;
+    }
+
+    size_t Size() const {
+        return blocks.size();
+    }
+
+private:
+    bool StillUsed(VAddr heap, VAddr block, VAddr next) const;
+
+    Core::MemoryManager* memory;
+    std::vector<std::pair<VAddr, VAddr>> blocks; // sorted [header, next header)
+    VAddr fence = 0;
 };
 
 } // namespace VideoCore

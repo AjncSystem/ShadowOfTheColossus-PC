@@ -75,6 +75,9 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 
 | 22 | Tela de carregamento e barra de % dos shaders | ✅ | `2eb2f7e`. Aparece quando o jogo passa 1 s sem desenhar (boot, cache de shaders, cargas longas); barra com % enquanto o cache é lido. Com o cache pronto dura ~0,3 s; o preto que vem depois é o próprio jogo carregando os logos. |
 
+| 23 | Ícone próprio da janela do jogo (menino com a espada; ou o do jogo, ou imagem do jogador) | ✅ | `83ecb1c`. |
+| 24 | Release v0.58.1 | ✅ | Publicada em 19/10 (texturas em alta qualidade + ícone da janela). Releases públicas: 0.58.1, 0.58, 0.57 (0.56 removida; tag mantida). |
+
 ## Fora do roteiro
 
 - Issue #138 é golpe (malware: `iex(irm gitrm.sbs)` como admin) — apagar e denunciar a conta.

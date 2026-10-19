@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.68-cp-mt — em preparação
+- **Contador de FPS na tela.** A opção de FPS do lançador (Diagnóstico) agora também mostra o
+  contador no canto da tela (`BB_SHOW_FPS=1`). Com a geração de quadros ligada ele mostra o ritmo
+  do próprio jogo ao lado do total, ex.: **"60 FPS (jogo 30)  33.3 ms"**: o total é o que vai para
+  a tela, o "jogo" é o que a resolução e as opções gráficas mudam. Sem custo medido (Santuário
+  50,3 → 50,1 FPS, dentro do ruído). Ideia do contador do bloodborne_pc de Supermedo.
+
 ## 0.67-cp-mt — 2026-10-19
 - **+4,6% de FPS: o "BPE heap guard" deixa de ser montado a cada quadro.** O guard protege os
   metadados do alocador do jogo quando um readback escreve no heap, e para isso percorria a árvore

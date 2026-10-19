@@ -119,7 +119,7 @@ def windows_language():
 # Settings, passed to sotc.py as environment variables.
 
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
-                'user_dir': '', 'af16': True, 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
+                'user_dir': '', 'af16': True, 'hq_textures': True, 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
                 'readbacks': '', 'extra_env': '', 'close_on_play': False, 'gamepad': '',
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
@@ -414,6 +414,11 @@ def game_environment(s):
     env['SOTC_NEO'] = '1' if s.get('neo') else '0'
     env['SOTC_OUTPUT_RES'] = s.get('output_res') or '1920x1080'
     env['SOTC_FRAMEGEN'] = s.get('framegen') or 'off'
+    # sotc: high quality textures: the texture banks sampled since the last report read as sampled
+    # (sotc_lod_stats.h; before, none ever did and the game never streamed its fine mips: blurry
+    # leaves and rocks). Off: the old behaviour, for cards short of video memory.
+    if s.get('hq_textures', True):
+        env.setdefault('SOTC_LOD_LINGER', '1')
     if s.get('button_icons') == 'xbox' and (PORT_DIR / 'glyphs' / 'xbox').is_dir():
         env['SOTC_TEX_REPLACE'] = str(PORT_DIR / 'glyphs' / 'xbox')
     env['SOTC_UI_LANG'] = s.get('ui_language') or windows_language()  # overlay and F7/F8 texts
@@ -771,9 +776,10 @@ class Launcher:
         self.row(quick, _('Geração de quadros', 'Frame generation'), self.choice(quick, 'framegen', FRAMEGEN, 24))
         self.row(quick, _('FPS', 'FPS'), self.choice(quick, 'fps_mode', FPS_MODES, 24))
         self.check(quick, 'af16', _('Texturas nítidas (filtro 16x)', 'Sharp textures (16x filtering)'))
+        self.check(quick, 'hq_textures', _('Texturas em alta qualidade', 'High quality textures'))
         self.check(quick, 'fullscreen', _('Tela cheia', 'Fullscreen'))
         self.check(quick, 'neo', _('Modo PS4 Pro', 'PS4 Pro mode'))
-        for key in ('af16', 'fps_mode', 'fullscreen', 'neo', 'output_res', 'upscaler', 'sharpness', 'framegen'):
+        for key in ('af16', 'hq_textures', 'fps_mode', 'fullscreen', 'neo', 'output_res', 'upscaler', 'sharpness', 'framegen'):
             self.vars[key].trace_add('write', lambda *_a: self.refresh_status())
 
     def draw_banner(self):

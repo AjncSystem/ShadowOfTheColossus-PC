@@ -28,7 +28,7 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 | 2 | Limite de alocações de VRAM (`EnsureResident: Assertion Failed`, AMD) | ✅ | Na #98 (blocos de 64 MiB, `9563b7d`); igual ao meu `c69befb`. |
 | 3 | Liberar VRAM sem uso (placas de 4–6 GB) | ✅ | Da #103, adaptada aos blocos (0.3). Meu `1b62560` fica de fora: não comparava a arena com a memória do jogo antes de liberar (risco de cenas apagadas, achado do Oussama). |
 | 4 | Fault 0x1a371 no modo PS4 Pro (após 1º/2º colosso) | ✅ | PR #106 (+640 MiB no modo Pro); mesma conclusão que a minha (`c2614b0`/`7d9ee11`). |
-| 4b | Streaming de texturas desligado sem querer desde a v0.0.13 | ⏳ | `sotc_lod_stats.h`: `idle < linger` com `linger = 0` nunca é verdadeiro. Com `<=`: 10+15 min normal e 7,5 min Pro sem queda; falta carregar um save com ele ligado. |
+| 4b | Streaming de texturas desligado sem querer desde a v0.0.13 | ✅ | Opção "Texturas em alta qualidade" nos Ajustes rápidos, **ligada por padrão** (`SOTC_LOD_LINGER=1`: os bancos usados desde o último relatório contam como amostrados). Comparação na árvore da abertura: folhas borradas → nítidas. Testes anteriores equivalentes: 10+15 min normal e 7,5 min Pro sem queda; carregar save com ela ligada ainda sem teste automático. |
 | 5 | Queda na intro final | ⏳ | Aguardando log/cena do usuário. |
 | 6 | Release v0.58 | ✅ | **Publicada em 19/10** (tag `v0.58` = `0ac9252`, SotC-PC.zip 84 MB, Latest). Releases públicas: 0.58, 0.57, 0.56. O rascunho antigo 0.58-rc1 (AMD preview, não público) ficou. |
 

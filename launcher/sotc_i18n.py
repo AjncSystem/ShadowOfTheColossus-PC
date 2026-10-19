@@ -935,3 +935,7 @@ TRANSLATIONS['es']["Os ícones que o jogo mostra nas dicas: os do PlayStation ou
 TRANSLATIONS['zh']["Os ícones que o jogo mostra nas dicas: os do PlayStation ou os do Xbox (A B X Y, LB/RB, LT/RT, Menu, View), desenhados para o port. Vale na próxima vez que o jogo abrir."] = "游戏提示中显示的图标：PlayStation 或 Xbox（A B X Y、LB/RB、LT/RT、菜单、视图），为本移植绘制。下次启动游戏时生效。"
 TRANSLATIONS['ko']["Os ícones que o jogo mostra nas dicas: os do PlayStation ou os do Xbox (A B X Y, LB/RB, LT/RT, Menu, View), desenhados para o port. Vale na próxima vez que o jogo abrir."] = "게임 안내에 표시되는 아이콘: PlayStation 또는 Xbox (A B X Y, LB/RB, LT/RT, 메뉴, 보기), 포트용으로 그린 것. 다음 게임 실행 시 적용됩니다."
 TRANSLATIONS['ru']["Os ícones que o jogo mostra nas dicas: os do PlayStation ou os do Xbox (A B X Y, LB/RB, LT/RT, Menu, View), desenhados para o port. Vale na próxima vez que o jogo abrir."] = "Значки, которые игра показывает в подсказках: PlayStation или Xbox (A B X Y, LB/RB, LT/RT, Меню, Просмотр), нарисованные для порта. Применяется при следующем запуске игры."
+TRANSLATIONS['es']["Texturas em alta qualidade"] = "Texturas de alta calidad"
+TRANSLATIONS['zh']["Texturas em alta qualidade"] = "高质量纹理"
+TRANSLATIONS['ko']["Texturas em alta qualidade"] = "고품질 텍스처"
+TRANSLATIONS['ru']["Texturas em alta qualidade"] = "Текстуры высокого качества"

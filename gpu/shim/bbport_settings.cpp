@@ -102,6 +102,7 @@ void Load() {
         {"BB_REACTIVE", "reactive"},              {"BB_REACTIVE_SCALE", "reactive_scale"},
         {"BB_REACTIVE_THRESHOLD", "reactive_threshold"}, {"BB_REACTIVE_MAX", "reactive_max"},
         {"BB_UPSCALE_PRESET", "preset"},            {"BB_OBJECT_MOTION", "object_motion"},
+        {"BB_SHOW_FPS", "show_fps"}, // sotc: the launcher's FPS option (on-screen counter)
     };
     for (const auto& [env, key] : env_keys) {
         if (const char* value = std::getenv(env)) {

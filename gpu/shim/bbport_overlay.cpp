@@ -64,6 +64,10 @@ float base_scale = 1.0f;
 // Present rate for the FPS counter.
 std::chrono::steady_clock::time_point last_present{};
 float frame_ms_avg = 0.0f;
+// sotc: the game's own frame rate (GameFrame), shown beside the present rate when they differ
+// (frame generation, or a frame presented twice).
+std::chrono::steady_clock::time_point last_game_frame{};
+std::atomic<float> game_ms_avg{0.0f};
 
 float PixelDensity(SDL_WindowID id) {
     SDL_Window* window = SDL_GetWindowFromID(id);
@@ -158,8 +162,14 @@ void FpsCounter() {
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                      ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
                      ImGuiWindowFlags_NoFocusOnAppearing);
-    ImGui::Text("%.0f FPS  %.1f ms", frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f,
-                frame_ms_avg);
+    const float game_ms = game_ms_avg.load(std::memory_order_relaxed);
+    if (frame_ms_avg > 0.0f && game_ms > frame_ms_avg * 1.15f) {
+        ImGui::Text("%.0f FPS (jogo %.0f)  %.1f ms", 1000.0f / frame_ms_avg, 1000.0f / game_ms,
+                    game_ms);
+    } else {
+        ImGui::Text("%.0f FPS  %.1f ms", frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f,
+                    frame_ms_avg);
+    }
     ImGui::End();
 }
 
@@ -403,6 +413,16 @@ void SetTextEntry(bool active, const std::string& prompt, const std::string& tex
     text_entry_active = active;
     text_entry_prompt = prompt;
     text_entry_text = text;
+}
+
+void GameFrame() {
+    const auto now = std::chrono::steady_clock::now();
+    const float ms = std::chrono::duration<float, std::milli>(now - last_game_frame).count();
+    last_game_frame = now;
+    if (ms > 0.0f && ms < 1000.0f) {
+        const float avg = game_ms_avg.load(std::memory_order_relaxed);
+        game_ms_avg.store(avg == 0.0f ? ms : avg * 0.95f + ms * 0.05f, std::memory_order_relaxed);
+    }
 }
 
 void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {

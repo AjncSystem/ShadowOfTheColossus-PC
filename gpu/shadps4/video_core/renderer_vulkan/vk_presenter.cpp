@@ -1166,6 +1166,7 @@ bool Presenter::PresentImage(Frame* frame) {
 
 void Presenter::CountGameFrame() {
     DebugState.IncFlipFrameNum();
+    BbOverlay::GameFrame();
     // SOTC_FRAME_LOG=<n> prints the frame count and time to stderr every n frames, for
     // measuring the frame rate of scripted runs.
     static const u64 every = [] {

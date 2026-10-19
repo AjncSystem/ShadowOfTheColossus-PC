@@ -28,6 +28,9 @@ bool HandleEvent(const SDL_Event& event);
 /// Whether anything is drawn this frame (a game dialog or the FPS counter).
 bool Visible();
 
+/// For each game frame shown (present or pacer thread): the game's own rate for the FPS counter.
+void GameFrame();
+
 /// Present thread: draws into `view` (layout ColorAttachmentOptimal).
 void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent);
 

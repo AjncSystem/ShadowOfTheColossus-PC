@@ -335,6 +335,8 @@ def game_environment(s):
         env['BB_LANGUAGE'] = s['language']
     if str(s['player_name']).strip():
         env['BB_USER_NAME'] = str(s['player_name']).strip()
+    # On-screen counter (bbport_overlay.cpp; beside the game's own FPS with frame generation).
+    env['BB_SHOW_FPS'] = '1' if s['show_fps'] else '0'
     if s['show_fps']:
         env['SOTC_FPS'] = '1'
     if s['readbacks']:
@@ -1002,7 +1004,8 @@ class Launcher:
         ttk.Button(holder, text=_('Pasta do port', 'Port folder'), command=lambda: self.open_path(PORT_DIR)).pack(side='left', padx=6)
         ttk.Button(holder, text=_('Limpar cache de shaders', 'Clear shader cache'), command=self.clear_cache).pack(side='left')
         self.section(f, _('Diagnóstico', 'Diagnostics'))
-        self.check(f, 'show_fps', _('FPS no registro (a cada 5 s)', 'FPS in the log (every 5 s)'))
+        self.check(f, 'show_fps', _('Contador de FPS na tela (e no registro a cada 5 s)',
+                                    'On-screen FPS counter (and in the log every 5 s)'))
         self.row(f, _('Leituras da GPU', 'GPU readbacks'), self.choice(f, 'readbacks', READBACKS))
         self.row(f, _('Cvars do motor', 'Engine cvars'), ttk.Entry(f, textvariable=self.var('engine_cvars'), width=58),
                  _('Avançado: NOME=valor separados por espaço, acrescentados à linha de comando do jogo.',

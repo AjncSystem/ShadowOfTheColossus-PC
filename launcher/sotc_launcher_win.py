@@ -106,7 +106,7 @@ def windows_language():
 # Settings, passed to sotc.py as environment variables.
 
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
-                'user_dir': '', 'af16': True, 'fps60': False, 'fullscreen': False,
+                'user_dir': '', 'af16': True, 'fps60': False, 'fps_unlocked': False, 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
                 'readbacks': '', 'extra_env': '', 'close_on_play': False, 'gamepad': '',
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
@@ -307,7 +307,11 @@ def game_environment(s):
         env['SOTC_SYS_MODULES'] = s['sys_modules']
     if s.get('dlc_dir'):
         env['SOTC_DLC_DIR'] = s['dlc_dir']
-    env['SOTC_MODES'] = ','.join(m for m in ('af16', 'fps60') if s.get(m))
+    fps60 = s.get('fps60') or s.get('fps_unlocked')
+    env['SOTC_MODES'] = ','.join(m for m, on in (('af16', s.get('af16')), ('fps60', fps60)) if on)
+    if fps60:
+        # sotc.py caps the 60 FPS mode at 60; unlocked runs up to the 120 Hz vblank.
+        env['SOTC_FPS_CAP'] = '0' if s.get('fps_unlocked') else '60'
     env['BB_FULLSCREEN'] = '1' if s['fullscreen'] else '0'
     env['BB_PRESENT_MODE'] = s['present_mode']
     if s['language']:
@@ -691,10 +695,15 @@ class Launcher:
         self.row(quick, _('Saída', 'Output'), self.choice(quick, 'output_res', OUTPUTS, 24))
         self.row(quick, _('Upscaler', 'Upscaler'), self.choice(quick, 'upscaler', UPSCALERS, 24))
         self.check(quick, 'fps60', _('60 FPS (experimental)', '60 FPS (experimental)'))
+        self.check(quick, 'fps_unlocked', _('FPS livre (experimental)', 'Unlocked FPS (experimental)'))
         self.check(quick, 'af16', _('Texturas nítidas (filtro 16x)', 'Sharp textures (16x filtering)'))
         self.check(quick, 'fullscreen', _('Tela cheia', 'Fullscreen'))
-        for key in ('af16', 'fps60', 'fullscreen', 'output_res', 'upscaler'):
+        for key in ('af16', 'fps60', 'fps_unlocked', 'fullscreen', 'output_res', 'upscaler'):
             self.vars[key].trace_add('write', lambda *_a: self.refresh_status())
+        # 60 FPS and unlocked FPS are two variants of the same mode: checking one clears the other.
+        for key, other in (('fps60', 'fps_unlocked'), ('fps_unlocked', 'fps60')):
+            self.vars[key].trace_add('write', lambda *_a, k=key, o=other:
+                                     self.vars[k].get() and self.vars[o].get() and self.vars[o].set(False))
 
     def draw_banner(self):
         """The dump's own art (sce_sys/pic1.png) under the title."""
@@ -817,8 +826,13 @@ class Launcher:
                    _('Chão, grama e rochas ficam nítidos à distância, quase sem custo.',
                      'Ground, grass and rocks stay sharp at a distance, at almost no cost.'))
         self.check(f, 'fps60', _('60 FPS (experimental)', '60 FPS (experimental)'),
-                   _('Tira o limite de 30 FPS do jogo; o vblank vai a 120 Hz. Mediu 38 FPS no campo e ~25 no templo.',
-                     'Removes the game\'s 30 FPS cap; vblank at 120 Hz. Measured 38 FPS in the open world, ~25 at the temple.'))
+                   _('Tira o limite de 30 FPS do jogo e limita a 60 FPS, como no PS4 Pro.',
+                     'Removes the game\'s 30 FPS cap and limits it to 60 FPS, as on PS4 Pro.'))
+        self.check(f, 'fps_unlocked', _('FPS livre (experimental)', 'Unlocked FPS (experimental)'),
+                   _('Sem limite (até 120 FPS). O jogo nunca rodou acima de 60: pode quebrar algumas lutas '
+                     '(o 5º colosso que sai voando, a cena do 2º colosso que não começa).',
+                     'No limit (up to 120 FPS). The game never ran above 60: it can break some fights '
+                     '(the 5th colossus flying away, the 2nd colossus cutscene that never starts).'))
         self.section(f, _('Resolução', 'Resolution'))
         self.row(f, _('Saída', 'Output'), self.choice(f, 'output_res', OUTPUTS),
                  _('O jogo renderiza em 1080p, como no PS4; a imagem é ampliada ou reduzida para a saída. '
@@ -1044,7 +1058,8 @@ class Launcher:
                                                                      'Choose the game folder first.'), fg=MUTED)
 
     def summary(self):
-        parts = [_('60 FPS', '60 FPS') if self.var('fps60').get() else _('30 FPS (como no PS4)', '30 FPS (as on PS4)'),
+        parts = [_('FPS livre', 'unlocked FPS') if self.var('fps_unlocked').get() else
+                 _('60 FPS', '60 FPS') if self.var('fps60').get() else _('30 FPS (como no PS4)', '30 FPS (as on PS4)'),
                  self.var('output_res').get().replace('x', ' × '),
                  'FSR 1' if self.var('upscaler').get() == 'fsr1' else 'bilinear']
         if self.var('af16').get():

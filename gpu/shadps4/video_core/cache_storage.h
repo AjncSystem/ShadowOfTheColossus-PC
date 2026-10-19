@@ -8,6 +8,8 @@
 #include "common/types.h"
 
 #include <functional>
+#include <map>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -28,10 +30,13 @@ public:
 
     void Open();
     void Close();
+    void Clear();
     [[nodiscard]] bool IsOpened() const {
         return opened;
     }
     void FinishPreload();
+    /// Sets the current cache aside (renamed with ".incompatible") and opens an empty one.
+    void Reset();
 
     bool Save(BlobType type, const std::string& name, std::vector<u8>&& data);
     bool Save(BlobType type, const std::string& name, std::vector<u32>&& data);
@@ -42,9 +47,16 @@ public:
     void ForEachBlob(BlobType type, const std::function<void(std::vector<u8>&& data)>& func);
 
 private:
+    void Prefetch();
+    bool TakePrefetched(const std::filesystem::path& path, std::vector<u8>& data);
+
     std::jthread io_worker{};
     std::filesystem::path cache_path{};
     bool opened{};
+    /// sotc: every loose cache file read up front (in parallel) for the boot preload, by file
+    /// name; ordered like an NTFS directory listing. Emptied by FinishPreload.
+    std::map<std::string, std::vector<u8>> prefetched{};
+    bool prefetch_active{};
 };
 
 } // namespace Storage

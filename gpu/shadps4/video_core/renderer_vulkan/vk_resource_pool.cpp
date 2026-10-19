@@ -153,6 +153,11 @@ vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout set_layout) {
                    result == vk::Result::eErrorFragmentedPool,
                "Unexpected error during descriptor set allocation: {}", vk::to_string(result));
     pending_pools.emplace_back(curr_pool, work_semaphore->CurrentTick());
+    // sotc: the known GPU tick is refreshed less often now (PopPendingOperations' early-out), so
+    // query it before creating another pool.
+    if (!work_semaphore->IsFree(pending_pools.front().second)) {
+        work_semaphore->Refresh();
+    }
     if (const auto [pool, tick] = pending_pools.front(); work_semaphore->IsFree(tick)) {
         curr_pool = pool;
         pending_pools.pop_front();

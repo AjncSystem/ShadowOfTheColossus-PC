@@ -5,6 +5,8 @@
 
 #include <chrono>
 #include <deque>
+#include <map>
+#include <memory>
 #include <span>
 #include <vector>
 #include <unordered_map>
@@ -80,7 +82,8 @@ public:
     void TickFrame();
 
     /// Invalidates any buffer in the logical page range.
-    void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false);
+    void InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks = false,
+                          bool guest_fault = false);
 
     /// sotc: forgets that the GPU wrote this range, without downloading it (unmap test).
     void DropGpuModified(VAddr device_addr, u64 size);
@@ -176,7 +179,7 @@ private:
     void ApplyDownloads(std::span<const ReadbackItem> pending, const u8* mapped,
                         u64 mapped_offset);
 
-    /// sotc (SOTC_RB_ASYNC=1): a readback asked by a guest thread in two steps on the command
+    /// sotc (default, SOTC_RB_ASYNC=0 turns it off): a readback asked by a guest thread in two steps on the command
     /// processor: the copies are recorded and submitted without waiting (the command processor
     /// goes on with its queue), the guest thread waits for the GPU, then the data is applied
     /// unless a later GPU write hit the ranges meanwhile (then it is read back again).
@@ -242,6 +245,15 @@ private:
         }
     };
     IntervalList<Backing> resident_ranges;
+    /// sotc: bumped at every resident_ranges.Add/Subtract. SynchronizeDmaBuffers rebuilds its
+    /// merged runs only when this (or the arena count) changed since the last rebuild.
+    u64 resident_version{};
+    u64 dma_runs_version = ~0ULL;
+    size_t dma_runs_arenas{};
+    u64 dma_runs_ranges{};
+    /// sotc (SOTC_DMA_MERGE): touching resident ranges whose start lies in the same arena,
+    /// merged into runs of (device address, bytes). Only rebuilt at the top of a sweep.
+    std::vector<std::pair<VAddr, u64>> dma_runs;
     /// Readback windows requested recently; downloaded together with the next readback.
     struct HotReadback {
         VAddr addr;
@@ -277,6 +289,9 @@ private:
     RangeSet current_writes;
     u64 current_writes_tick{};
     void RecordCurrentWrite(VAddr addr, u64 size);
+    /// sotc: the range the guest touched, during the DownloadMemory of its window (size 0 else).
+    VAddr fault_addr{};
+    u64 fault_size{};
 
 public:
     /// sotc: true once after the command buffer being built wrote a page the guest reads back:
@@ -285,8 +300,21 @@ public:
 
 private:
 
-    /// Number of resident blocks still bound to each backing allocation.
-    std::unordered_map<VkDeviceMemory, u64> backing_blocks;
+    /// sotc: arena memory is carved out of chunks of ARENA_CHUNK_SIZE. One allocation per
+    /// resident range reached thousands within minutes, each one a kernel call mid-frame (the
+    /// open world then ran out of video memory).
+    static constexpr u64 ARENA_CHUNK_SIZE = 64_MB;
+    struct ArenaChunk {
+        vk::DeviceMemory memory;
+        u32 memory_type{};
+        u64 used_blocks{};
+        std::map<u64, u64> free_runs; ///< first block -> number of free blocks
+    };
+    std::vector<std::unique_ptr<ArenaChunk>> arena_chunks;
+    std::unordered_map<VkDeviceMemory, ArenaChunk*> chunk_by_memory;
+    /// Memory and first block for blocks of arena backing (video memory, else system memory).
+    std::pair<vk::DeviceMemory, u64> AllocateArenaBlocks(u64 blocks);
+    void FreeArenaBlocks(vk::DeviceMemory memory, u64 start, u64 blocks);
 
     u32 arena_memory_type_index{};
     std::optional<u32> arena_fallback_memory_type_index;

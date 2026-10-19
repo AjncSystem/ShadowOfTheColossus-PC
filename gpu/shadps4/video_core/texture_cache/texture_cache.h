@@ -576,6 +576,10 @@ public:
     /// Diagnostic (SOTC_DUMP): copies every layer/slice of mip 0 to a raw file once the GPU is done.
     void DumpImage(ImageId image_id, const std::filesystem::path& path);
 
+    /// sotc: SOTC_TEX_DUMP=1 saves each small sampled texture once (user/texdump), keyed by the
+    /// hash of its guest bytes, to find the game's controller glyphs.
+    void SotcGlyphHook(Image& image);
+
 private:
 
     /// Thread function for copying downloaded images out to CPU memory.

@@ -34,6 +34,9 @@ numa AMD aqui: conte nas issues.
 - Overlay de desempenho (F10), F7 liga/desliga o limite de 30, F8 troca a geração de quadros.
 - **Lançador em espanhol, chinês, coreano e russo.**
 - Janela com o ícone do jogo e, no título, a versão e o FPS.
+- **Lista de saves com a imagem de cada save**, como no PS4 / shadPS4.
+- **Tela de carregamento** com barra de porcentagem enquanto o cache de shaders é lido.
+- Idioma escolhido já na primeira tela do lançador; Modo PS4 Pro e Nitidez (RCAS) nos Ajustes rápidos.
 - O cache de shaders é refeito na primeira abertura.
 
 ## 0.57 — 2026-10-14

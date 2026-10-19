@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.58.1 — 2026-10-19
+- **Texturas em alta qualidade** (ligada por padrão nos Ajustes rápidos): desde a 0.0.13 o port
+  nunca informava ao jogo quais texturas estavam em uso, e ele não carregava as versões de alta
+  resolução (folhas da árvore da abertura e pedras borradas). Desligada, volta ao comportamento
+  antigo, para placas com pouca memória de vídeo.
+- **Ícone da janela do jogo:** um desenho do port (o menino erguendo a espada), para não ficar igual
+  ao do lançador na barra de tarefas. Em Imagem e FPS: padrão, o ícone do jogo ou uma imagem sua.
+
 ## 0.58 — 2026-10-19
 Versão da comunidade: junta as pull requests e forks de várias pessoas, revisados e testados juntos.
 Obrigado a **Lucas-blip-png, Gabriell-os, Oussama268, jownatan, xeodeo, nakaionyt/y7ngboy e tabnul**.

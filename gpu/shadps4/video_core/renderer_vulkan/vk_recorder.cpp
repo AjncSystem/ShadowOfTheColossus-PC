@@ -859,15 +859,13 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
         const char* v = std::getenv("SOTC_REC_SPIN_US");
         return std::chrono::microseconds{v ? std::strtol(v, nullptr, 10) : 250};
     }();
-#ifdef _WIN32
-    // sotc: Windows condition variables wait in whole milliseconds, so 500 us came out as 0:
-    // the wait returned at once and the thread spun at 100% of a core (half of a hyper-threaded
-    // core the command processor may share). The producer wakes a sleeping consumer for new
-    // work, so a longer timeout adds no latency.
-    constexpr auto SleepTime = std::chrono::milliseconds{2};
-#else
-    constexpr auto SleepTime = std::chrono::microseconds{500};
-#endif
+    // sotc: SOTC_REC_SLEEP_US sets the idle wait. On Windows the default 500 us rounds to 0 and the
+    // thread spins: 61.1 vs 57.7 FPS on the attract demo (i9-13900K + RTX 2060 SUPER) against a
+    // 2 ms sleep (PR #81, jownatan), which frees the core on laptops and APUs (set 2000 there).
+    static const auto SleepTime = [] {
+        const char* v = std::getenv("SOTC_REC_SLEEP_US");
+        return std::chrono::microseconds{v ? std::strtol(v, nullptr, 10) : 500};
+    }();
 
     Chunk* chunk = first_chunk;
     Chunk* previous = nullptr;

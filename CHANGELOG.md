@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.67-cp-mt — em preparação (ainda não lançada)
+- **+4,6% de FPS: o "BPE heap guard" deixa de ser montado a cada quadro.** O guard protege os
+  metadados do alocador do jogo quando um readback escreve no heap, e para isso percorria a árvore
+  inteira de blocos livres, ~1 vez por quadro (~6% da thread de desenho). As máscaras de culling
+  lidas de volta caem todas no último 1 MiB do heap, depois do bloco que fecha a cadeia, onde não há
+  metadados: agora o guard acha esse limite uma vez e as escritas acima dele só conferem que ele
+  continua lá. Santuário (mesmo exe, chave desligada/ligada): 47,5 / 47,5 → **49,5 / 49,7 FPS**.
+  Verificado contra o guard completo nos saves (normal e PS4 Pro): ~395 mil escritas, nenhuma sobre
+  metadados. `SOTC_HEAP_FAST=0` volta ao antigo; `SOTC_HEAP_FAST=2` confere cada escrita (log).
+- **Tela cheia num múltiplo de 60 Hz** (correção de [Anthonypc23](https://github.com/Anthonypc23)):
+  quando o monitor não está num múltiplo de 60 Hz (74, 144, 165 Hz...), a tela cheia passa para o
+  modo exclusivo na maior taxa múltipla de 60 que o monitor oferece (ex.: 144 → 120 Hz), e os
+  quadros de 30/60 FPS ficam o mesmo tempo na tela. `BB_FULLSCREEN_HZ=<Hz>` escolhe a taxa;
+  `BB_FULLSCREEN_HZ=0` mantém a do desktop.
+
 ## 0.66-cp-mt — 2026-10-18
 - **Geração de quadros FSR 3 (experimental):** nova opção no lançador (Gráficos > Resolução,
   "Geração de quadros FSR 3"; ou `SOTC_FG=1`). Cria um quadro intermediário entre cada par de

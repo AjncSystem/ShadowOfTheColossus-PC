@@ -268,15 +268,18 @@ void SleepUntil(Clock::time_point due) {
                                                  TIMER_ALL_ACCESS);
 #endif
     using namespace std::chrono_literals;
+    // Shorter waits are spun; a sleep ends this early so that oversleeping never makes it late.
+    constexpr auto kMinSleep = 1500us;
+    constexpr auto kSleepMargin = 1000us;
     for (;;) {
         const auto left = due - Clock::now();
         if (left <= 0ns) {
             return;
         }
 #ifdef _WIN32
-        if (left > 1500us && timer) {
+        if (left > kMinSleep && timer) {
             LARGE_INTEGER when;
-            when.QuadPart = -std::chrono::duration_cast<std::chrono::nanoseconds>(left - 1000us)
+            when.QuadPart = -std::chrono::duration_cast<std::chrono::nanoseconds>(left - kSleepMargin)
                                  .count() /
                             100;
             if (SetWaitableTimer(timer, &when, 0, nullptr, nullptr, FALSE)) {
@@ -286,8 +289,8 @@ void SleepUntil(Clock::time_point due) {
         }
 #else
         // Linux sleeps are high resolution already (hrtimers).
-        if (left > 1500us) {
-            std::this_thread::sleep_for(left - 1000us);
+        if (left > kMinSleep) {
+            std::this_thread::sleep_for(left - kSleepMargin);
             continue;
         }
 #endif

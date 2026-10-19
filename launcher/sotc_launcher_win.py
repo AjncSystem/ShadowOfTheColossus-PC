@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import runpy
 import shutil
 import subprocess
@@ -30,6 +31,8 @@ CONFIG_FILE = CONFIG_DIR / 'settings.json'
 GAME_ID, GAME_VERSION = 'CUSA08809', '01.01'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
 VERSION = '0.58.1'
+# GitHub repository whose latest release the launcher compares with VERSION (a fork changes this line).
+RELEASES_REPO = 'AjncSystem/ShadowOfTheColossus-PC'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -152,7 +155,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
                 'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'library_dirs': [], 'keys': {},
-                'auto_setup': True, 'dlc_dir': '', 'framegen': 'off'}
+                'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'update_check': True}
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
 KEY_INPUTS = [
     ('move_up', 'W', ('Andar para frente', 'Move forward')), ('move_down', 'S', ('Andar para trás', 'Move back')),
@@ -267,6 +270,35 @@ def load_json(path, default):
         return json.loads(Path(path).read_text(encoding='utf-8'))
     except (OSError, ValueError):
         return default
+
+
+def is_newer_release(tag, current=VERSION):
+    """True when a release tag ('v0.59', '0.58.2') is newer than this launcher. Only the dotted
+    numbers count, so with equal numbers a fork's suffix (0.58.1-plus, 0.67-cp-mt) on either side
+    is not newer; 0.58 and 0.58.0 are equal."""
+    def numbers(text):
+        match = re.match(r'v?(\d+(?:\.\d+)*)', text.strip(), re.I)
+        parts = [int(n) for n in match.group(1).split('.')] if match else []
+        while parts and not parts[-1]:
+            parts.pop()
+        return parts
+    return numbers(tag) > numbers(current)
+
+
+def latest_release():
+    """(tag, page) of the latest GitHub release of RELEASES_REPO, or None on any error."""
+    try:
+        import urllib.request
+        request = urllib.request.Request(f'https://api.github.com/repos/{RELEASES_REPO}/releases/latest',
+                                         headers={'User-Agent': f'sotc-launcher/{VERSION}',
+                                                  'Accept': 'application/vnd.github+json'})
+        with urllib.request.urlopen(request, timeout=5) as response:
+            release = json.load(response)
+        tag, page = str(release['tag_name']), str(release['html_url'])
+    except Exception:  # offline, rate limited, no release: no notice
+        return None
+    # The page is opened in the browser: GitHub addresses only.
+    return (tag, page) if page.startswith('https://github.com/') else None
 
 
 _EBOOT_VERSIONS = {}
@@ -538,6 +570,8 @@ class Launcher:
         root.protocol('WM_DELETE_WINDOW', self.close)
         root.after(100, self.drain_output)
         threading.Thread(target=self.detect_gpu, daemon=True).start()
+        if self.app.get('update_check'):
+            threading.Thread(target=self.check_update, daemon=True).start()
 
     def px(self, size):
         return int(size * self.dpi)
@@ -751,8 +785,9 @@ class Launcher:
         side.pack_propagate(False)
         tk.Label(side, text='SHADOW OF\nTHE COLOSSUS', bg=BG, fg=GOLD, font=(title_font(), 15), justify='left').pack(
             anchor='w', padx=22, pady=(24, 0))
-        tk.Label(side, text=_('port nativo · Windows', 'native port · Windows') + f'  ·  v{VERSION}', bg=BG, fg=MUTED,
-                 font=(ui_font(), 9)).pack(anchor='w', padx=22, pady=(2, 20))
+        self.version_label = tk.Label(side, text=_('port nativo · Windows', 'native port · Windows') + f'  ·  v{VERSION}',
+                                      bg=BG, fg=MUTED, font=(ui_font(), 9))
+        self.version_label.pack(anchor='w', padx=22, pady=(2, 20))
         self.nav, self.current_page = {}, None
         for name, title in (('play', _('Jogar', 'Play')), ('game', _('Jogo e saves', 'Game & saves')),
                             ('graphics', _('Imagem e FPS', 'Display & FPS')), ('controls', _('Controles', 'Controls')),
@@ -1146,6 +1181,9 @@ class Launcher:
         self.row(f, _('Idioma do lançador', 'Launcher language'), self.choice(f, 'ui_language', UI_LANGUAGES),
                  _('Vale na próxima vez que o lançador abrir.', 'Applies when the launcher opens again.'))
         self.check(f, 'close_on_play', _('Fechar o lançador quando o jogo abrir', 'Close the launcher when the game starts'))
+        self.check(f, 'update_check', _('Avisar quando sair uma versão nova', 'Tell me when a new version is out'),
+                   _('Ao abrir, o lançador consulta as versões do port no GitHub. Nada é baixado.',
+                     "On start the launcher looks up the port's releases on GitHub. Nothing is downloaded."))
         holder = ttk.Frame(f)
         holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(10, 0))
         ttk.Button(holder, text=_('Atalho na área de trabalho', 'Desktop shortcut'), command=self.shortcut).pack(side='left')
@@ -1258,6 +1296,21 @@ class Launcher:
             pass
         self.gpu_text = text
         self.ui_calls.put(self.refresh_status)
+
+    def check_update(self):
+        """Background thread: GitHub's latest release, shown in the side bar when newer (issue #136)."""
+        release = latest_release()
+        if release and is_newer_release(release[0]):
+            self.ui_calls.put(lambda: self.show_update(*release))
+
+    def show_update(self, tag, page):
+        """A link under the version that opens the release page; nothing is downloaded."""
+        import webbrowser
+        link = self.tk.Label(self.version_label.master, text=_('Nova versão {} disponível', 'New version {} available').format(tag),
+                             bg=BG, fg=GOLD, font=(ui_font(), 9, 'underline'), cursor='hand2')
+        self.version_label.pack_configure(pady=(2, 4))
+        link.pack(anchor='w', padx=22, pady=(0, 16), after=self.version_label)
+        link.bind('<Button-1>', lambda _e: webbrowser.open(page))
 
     def restart(self):
         """Opens the launcher again (after a language change) and closes this one."""

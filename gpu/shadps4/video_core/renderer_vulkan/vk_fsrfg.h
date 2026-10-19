@@ -39,9 +39,10 @@ void NoteGameFrame();
 /// Present thread: records the interpolation between the last game frame and this one
 /// (`frame_image`, layout General before and after, `width` x `height`). Returns the generated
 /// image (RGBA8, layout General, same size) to present now, or a null image when there is none
-/// (first frame, after a cut or a frame without inputs).
+/// (first frame, after a cut or a frame without inputs). `hudless_image`: the same frame without
+/// the HUD (layout General before and after, same size), or a null image.
 vk::Image Generate(vk::CommandBuffer cmdbuf, u32 frame_id, vk::Image frame_image, u32 width,
-                   u32 height);
+                   u32 height, vk::Image hudless_image);
 
 /// Present thread: the commands of Generate were submitted at `tick` of `scheduler`.
 void Submitted(Scheduler& scheduler, u64 tick);

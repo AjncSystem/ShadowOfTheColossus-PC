@@ -174,6 +174,9 @@ def main():
     if 'fps60' in modes.lower():
         # The game waits for vblanks: at 60 Hz an uncapped frame still rounds up to 30 FPS.
         env.setdefault('BB_VBLANK_HZ', '120')
+        # At most 60 FPS, as on a PS4 Pro: the game was never made to run faster (SOTC_FPS_CAP=0
+        # removes the cap).
+        env.setdefault('SOTC_FPS_CAP', '60')
 
     probe = find_probe()
     # Development builds run from the MSYS2 tree: its CLANG64 DLLs (SDL3, FFmpeg, ...).

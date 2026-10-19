@@ -59,9 +59,12 @@ def attach_stdio():
 def run_role(argv):
     """--run [args]: sotc.py; --script <file> [args]: a preparation script. Returns an exit code."""
     attach_stdio()
+    # The launcher reads this output as UTF-8. An inherited pipe is otherwise in the ANSI code
+    # page, where characters of the game's title fail (GBK on Chinese Windows: "'gbk' codec can't
+    # encode character '™'", issue #45); the frozen executable ignores PYTHONIOENCODING.
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(line_buffering=True)
+            stream.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
         except (AttributeError, ValueError):
             pass
     if argv[0] == '--script':

@@ -61,7 +61,7 @@ class SelfTests(unittest.TestCase):
         for flag in (2, 8):
             data = fixture()
             struct.pack_into('<Q', data, 32, 0x800 | flag)
-            with self.assertRaisesRegex(ValueError, 'encrypted/compressed'):
+            with self.assertRaisesRegex(ValueError, 'still encrypted'):
                 parse_self(data)
 
     def test_missing_required_segment_rejected(self):

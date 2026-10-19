@@ -119,7 +119,7 @@ def windows_language():
 # Settings, passed to sotc.py as environment variables.
 
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
-                'user_dir': '', 'af16': True, 'hq_textures': True, 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
+                'user_dir': '', 'af16': True, 'hq_textures': True, 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
                 'readbacks': '', 'extra_env': '', 'close_on_play': False, 'gamepad': '',
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
@@ -350,16 +350,30 @@ def load_settings():
 
 
 def window_icon_file(s):
-    """icon0.png of the player's dump as a 64x64 BMP in the data folder, for the game window's
-    icon (bb-probe: SOTC_WINDOW_ICON). Nothing of the game is packaged: it comes from the dump."""
+    """The game window's icon as a 64x64 BMP in the data folder (bb-probe: SOTC_WINDOW_ICON):
+    empty setting = the port's own (launcher/window_icon.png, original art: the swordsman), 'game'
+    = icon0.png of the player's dump, else a picture the player chose (cropped to a centred
+    square). Nothing of the game or of anyone's art is packaged."""
     try:
         from PIL import Image
-        source = Path(s['game_dir'] or '.') / 'sce_sys' / 'icon0.png'
-        target = user_dir(s) / 'game_icon.bmp'
-        if not target.is_file() or target.stat().st_mtime < source.stat().st_mtime:
+        choice = s.get('window_icon_file') or ''
+        custom = Path(choice) if choice not in ('', 'game') else Path('')
+        if choice == 'game':
+            source, target = Path(s['game_dir'] or '.') / 'sce_sys' / 'icon0.png', user_dir(s) / 'game_icon.bmp'
+        elif choice and custom.is_file():
+            source, target = custom, user_dir(s) / 'window_icon_custom.bmp'
+        else:
+            source, target = PORT_DIR / 'launcher' / 'window_icon.png', user_dir(s) / 'window_icon_port.bmp'
+        if (not target.is_file() or target.stat().st_mtime < source.stat().st_mtime
+                or source == custom):
             with Image.open(source) as image:
+                image = image.convert('RGBA')
+                side = min(image.size)
+                left, top = (image.width - side) // 2, (image.height - side) // 2
+                if source == custom:
+                    image = image.crop((left, top, left + side, top + side))
                 target.parent.mkdir(parents=True, exist_ok=True)
-                image.convert('RGBA').resize((64, 64), Image.LANCZOS).save(target)
+                image.resize((64, 64), Image.LANCZOS).save(target)
         return target
     except (ImportError, OSError, ValueError):
         return None
@@ -640,6 +654,30 @@ class Launcher:
     def section(self, parent, title, top=18):
         self.ttk.Label(parent, text=title, style='Section.TLabel').grid(
             row=self.next_row(parent), column=0, columnspan=2, sticky='w', pady=(top, 2))
+
+    def window_icon_row(self, parent):
+        """The game window's icon: the game's (empty) or a picture of the player's choice."""
+        ttk = self.ttk
+        var = self.var('window_icon_file')
+        holder = ttk.Frame(parent)
+        ttk.Entry(holder, textvariable=var, width=40).pack(side='left')
+
+        def browse():
+            chosen = self.filedialog.askopenfilename(
+                title=_('Imagem para o ícone da janela do jogo', "Picture for the game window's icon"),
+                filetypes=[(_('Imagens', 'Pictures'), '*.png *.jpg *.jpeg *.bmp *.webp'), ('*', '*.*')])
+            if chosen:
+                var.set(str(Path(chosen)))
+        ttk.Button(holder, text=_('Escolher imagem…', 'Choose picture…'), command=browse).pack(side='left', padx=(6, 0))
+        ttk.Button(holder, text=_('Usar o do jogo', "Use the game's"), command=lambda: var.set('game')).pack(side='left', padx=(6, 0))
+        ttk.Button(holder, text=_('Padrão', 'Default'), command=lambda: var.set('')).pack(side='left', padx=(6, 0))
+        return self.row(parent, _('Ícone da janela do jogo', "Game window's icon"), holder,
+                        _('Padrão: o desenho do port (o menino erguendo a espada). "game": o ícone do próprio jogo. '
+                          'Ou escolha uma imagem sua (PNG/JPG): ela é recortada em quadrado no centro. Vale na '
+                          'próxima vez que o jogo abrir.',
+                          'Default: the port\'s drawing (the boy raising his sword). "game": the game\'s own icon. '
+                          'Or choose a picture of yours (PNG/JPG): it is cropped to a centred square. Applies the '
+                          'next time the game starts.'))
 
     def folder(self, parent, key, title, prompt, hint=None, on_change=None):
         ttk = self.ttk
@@ -924,6 +962,7 @@ class Launcher:
                    'health and stamina bars may shake (the generated frame includes the interface). '
                    'In game, F8 switches the mode (off, DLSS-G, FSR 3). Best with the '
                    'screen at 60 or 120 Hz, or G-SYNC/FreeSync.'))
+        self.window_icon_row(f)
         self.section(f, _('Resolução', 'Resolution'))
         self.row(f, _('Saída', 'Output'), self.choice(f, 'output_res', OUTPUTS),
                  _('O jogo renderiza nesse tamanho; acima de cerca de 4,2 milhões de pixels (4K, 3440 × 1440) num '

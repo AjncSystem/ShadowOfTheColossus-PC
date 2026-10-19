@@ -59,6 +59,13 @@ void NoteDraw(const AmdGpu::Regs& regs, u32 mrt_mask, VideoCore::ImageId depth_i
 void PrepareInputs(u32 frame_id, vk::CommandBuffer cmdbuf, VideoCore::TextureCache& texture_cache,
                    Runtime& runtime, u32 game_width, u32 game_height);
 
+/// sotc: command processor thread, in PrepareFrame after PrepareInputs: presentation frame
+/// `frame_id` without its HUD (the game's composite redrawn with a transparent UI, through the
+/// same post-process pass), layout General until the frame is reused; a null image when it has
+/// none. DLSS-G gets it as the HUD-less color so that it does not move the HUD with the scene.
+void NoteHudless(u32 frame_id, vk::Image image, vk::ImageView view, vk::Format format, u32 width,
+                 u32 height);
+
 /// Command processor thread, after the frame's commands are flushed.
 void FrameSubmitted(u32 frame_id);
 

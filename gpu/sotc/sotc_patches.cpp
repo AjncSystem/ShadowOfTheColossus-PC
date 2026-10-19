@@ -26,8 +26,13 @@ extern "C" int sotc_patch_eboot(const SotcPatchRequest* request, SotcPatchResult
         const uintptr_t hdr_start = base + offset;
         const uintptr_t hdr_end = hdr_start + size;
         Dwarf::EHHeaderInfo info;
-        return Dwarf::DecodeEHHdr(hdr_start, hdr_end, info) &&
-               Dwarf::DecodeEHHdrTable(info, hdr_end, function_starts);
+        std::vector<uintptr_t> starts; // DecodeEHHdrTable replaces the vector's contents
+        if (!Dwarf::DecodeEHHdr(hdr_start, hdr_end, info) ||
+            !Dwarf::DecodeEHHdrTable(info, hdr_end, starts)) {
+            return false;
+        }
+        function_starts.insert(function_starts.end(), starts.begin(), starts.end());
+        return true;
     };
     if (request->eh_frame_hdr_size && !add_table(request->eh_frame_hdr, request->eh_frame_hdr_size)) {
         return -1;

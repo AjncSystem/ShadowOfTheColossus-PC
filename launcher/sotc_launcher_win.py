@@ -1187,6 +1187,15 @@ class Launcher:
         self.gpu_text = text
         self.ui_calls.put(self.refresh_status)
 
+    def restart(self):
+        """Opens the launcher again (after a language change) and closes this one."""
+        command = [sys.executable] if FROZEN else [sys.executable, str(Path(__file__).resolve())]
+        try:
+            subprocess.Popen(command + [a for a in sys.argv[1:] if a != '--play'], cwd=str(PORT_DIR))
+        except OSError:
+            return
+        self.root.destroy()
+
     def collect(self):
         for key, var in self.vars.items():
             self.app[key] = var.get()
@@ -1235,6 +1244,24 @@ class Launcher:
         frame = self.setup_frame = tk.Frame(self.root, bg=BG)
         frame.place(relx=0, rely=0, relwidth=1, relheight=1)
         frame.lift()
+        # The launcher's language, first thing (names in their own language); the launcher opens
+        # again in it.
+        lang_box = tk.Frame(frame, bg=BG)
+        lang_box.place(relx=1.0, rely=0.0, anchor='ne', x=-self.px(20), y=self.px(16))
+        tk.Label(lang_box, text='🌐', bg=BG, fg=MUTED, font=(ui_font(), 13)).pack(side='left', padx=(0, 6))
+        names = [(code, labels[0]) for code, labels in UI_LANGUAGES if code]
+        lang_var = tk.StringVar(value=dict(names).get(LANG, 'English'))
+        lang_combo = ttk.Combobox(lang_box, textvariable=lang_var, values=[name for _c, name in names],
+                                  state='readonly', width=14, font=(ui_font(), 11))
+        lang_combo.pack(side='left')
+
+        def language_chosen(_event=None):
+            code = next((c for c, name in names if name == lang_var.get()), '')
+            if code and code != LANG:
+                self.var('ui_language').set(code)
+                self.collect()
+                self.restart()
+        lang_combo.bind('<<ComboboxSelected>>', language_chosen)
         inner = tk.Frame(frame, bg=BG)
         inner.place(relx=0.5, rely=0.45, anchor='center')
         tk.Label(inner, text='SHADOW OF THE COLOSSUS', bg=BG, fg=GOLD, font=(title_font(), 26)).pack()

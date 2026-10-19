@@ -51,5 +51,7 @@ bool OpenSaveList(const std::string& title, const std::vector<std::string>& item
 /// item. Closes the list when it returns anything but -1.
 int PollSaveList();
 void CloseSaveList();
+/// sotc: pictures (PNG paths, empty: none) for the next OpenSaveList, item by item.
+void SetSaveListIcons(std::vector<std::string> paths);
 
 } // namespace BbOverlay

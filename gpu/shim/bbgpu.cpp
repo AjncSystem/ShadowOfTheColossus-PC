@@ -530,6 +530,13 @@ extern "C" int bbgpu_save_list_open(const char* title, const char* const* items,
     }
     return BbOverlay::OpenSaveList(title ? title : "", list, focus, first_deletable) ? 1 : 0;
 }
+extern "C" void bbgpu_save_list_icons(const char* const* paths, int count) {
+    std::vector<std::string> list;
+    for (int i = 0; i < count; ++i) {
+        list.emplace_back(paths && paths[i] ? paths[i] : "");
+    }
+    BbOverlay::SetSaveListIcons(std::move(list));
+}
 extern "C" int bbgpu_save_list_poll(void) {
     return BbOverlay::PollSaveList();
 }

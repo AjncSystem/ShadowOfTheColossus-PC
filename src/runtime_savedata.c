@@ -677,6 +677,15 @@ static ABI int32_t save_mount_info(const MountPoint *mount_point, uint64_t *info
 }
 /* sotc: for the save/load slot list (runtime_services.c). The param of a save (zeroed when it
  * has none) and a display line: subtitle, detail and date, or the directory name. */
+/* sotc: the save's own picture (<dir>.sce_sys/icon0.png, written by sceSaveDataSaveIcon), for the
+ * save list; 0 when it exists. */
+int runtime_savedata_icon(int32_t user, const char *dir, char *out, size_t size) {
+    char base[600];
+    struct stat st;
+    root(user,NULL,base,sizeof(base));
+    snprintf(out,size,"%s/%.32s.sce_sys/icon0.png",base,dir);
+    return stat(out,&st) ? -1 : 0;
+}
 int runtime_savedata_param(int32_t user, const char *dir, void *param) {
     char base[600], meta[700];
     root(user,NULL,base,sizeof(base));

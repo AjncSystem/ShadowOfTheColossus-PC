@@ -40,6 +40,8 @@ int bbgpu_save_list_open(const char *title, const char *const *items, int count,
                          int first_deletable);
 int bbgpu_save_list_poll(void);
 void bbgpu_save_list_close(void);
+/* sotc: pictures for the next save list (PNG paths, NULL: none), item by item. */
+void bbgpu_save_list_icons(const char *const *paths, int count);
 int bbgpu_text_input_poll(char *out_utf8, uint64_t size);
 /* sotc: mouse motion since the last call and held buttons (bit = SDL button); 0 when not captured. */
 int bbgpu_mouse_take(float *dx, float *dy, unsigned *buttons);

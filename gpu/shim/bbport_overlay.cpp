@@ -13,6 +13,9 @@
 #include <SDL3/SDL.h>
 #include "bbport_settings.h"
 #include "imgui.h"
+#include "imgui_internal.h"
+#include "stb_image.h"
+#include <unordered_map>
 #include "imgui_impl_vulkan.h"
 #include "video_core/renderer_vulkan/vk_framegen.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -64,6 +67,30 @@ std::string text_entry_prompt, text_entry_text;
 bool list_active = false;
 std::string list_title;
 std::vector<std::string> list_items;
+// sotc: each save's picture (icon0.png of its sce_sys), shown to the left of its text as in the
+// PS4 and shadPS4 lists. Loaded once per file, kept for the session.
+std::vector<std::string> list_icons, pending_icons;
+std::unordered_map<std::string, ImTextureData*> icon_textures;
+
+ImTextureData* IconTexture(const std::string& path) {
+    if (path.empty()) {
+        return nullptr;
+    }
+    if (const auto it = icon_textures.find(path); it != icon_textures.end()) {
+        return it->second;
+    }
+    ImTextureData* tex = nullptr;
+    int w = 0, h = 0, n = 0;
+    if (unsigned char* pixels = stbi_load(path.c_str(), &w, &h, &n, 4)) {
+        tex = IM_NEW(ImTextureData)();
+        tex->Create(ImTextureFormat_RGBA32, w, h);
+        std::memcpy(tex->GetPixels(), pixels, size_t(w) * h * 4);
+        stbi_image_free(pixels);
+        ImGui::RegisterUserTexture(tex);
+    }
+    icon_textures[path] = tex;
+    return tex;
+}
 int list_selected = 0, list_result = -1;
 int list_confirm = -1;  // item waiting for the delete confirmation, or -1
 int list_first_deletable = 0;
@@ -520,15 +547,45 @@ void SaveListBox() {
     ImGui::Separator();
     const float footer = ImGui::GetTextLineHeightWithSpacing() * 2.2f;
     ImGui::BeginChild("##items", ImVec2(0.0f, -footer));
+    // sotc: rows with the save's picture on the left (16:9 of 228x128) and its text on the right.
+    const bool any_icon = std::any_of(list_icons.begin(), list_icons.end(),
+                                      [](const std::string& p) { return !p.empty(); });
+    const float row_h = any_icon ? ImGui::GetTextLineHeightWithSpacing() * 4.2f : 0.0f;
     for (int i = 0; i < static_cast<int>(list_items.size()); ++i) {
         ImGui::PushID(i);
         const bool selected = i == list_selected;
-        if (ImGui::Selectable(list_items[i].c_str(), selected,
-                              ImGuiSelectableFlags_AllowDoubleClick)) {
+        ImTextureData* icon = i < static_cast<int>(list_icons.size()) ? IconTexture(list_icons[i]) : nullptr;
+        const ImVec2 start = ImGui::GetCursorPos();
+        const bool clicked =
+            any_icon ? ImGui::Selectable("##row", selected,
+                                         ImGuiSelectableFlags_AllowDoubleClick |
+                                             ImGuiSelectableFlags_AllowOverlap,
+                                         ImVec2(0.0f, row_h))
+                     : ImGui::Selectable(list_items[i].c_str(), selected,
+                                         ImGuiSelectableFlags_AllowDoubleClick);
+        if (clicked) {
             list_selected = i;
             if (ImGui::IsMouseDoubleClicked(0)) {
                 list_result = i;
             }
+        }
+        if (any_icon) {
+            const ImVec2 end = ImGui::GetCursorPos();
+            const float pad = row_h * 0.06f;
+            const float img_h = row_h - pad * 2.0f;
+            const float img_w = icon ? img_h * float(icon->Width) / float(std::max(icon->Height, 1))
+                                     : img_h * 228.0f / 128.0f;
+            ImGui::SetCursorPos(ImVec2(start.x + pad, start.y + pad));
+            if (icon) {
+                ImGui::Image(icon->GetTexRef(), ImVec2(img_w, img_h));
+            } else {
+                ImGui::Dummy(ImVec2(img_w, img_h));
+            }
+            const float text_x = start.x + pad * 3.0f + img_w;
+            const float text_h = ImGui::CalcTextSize(list_items[i].c_str()).y;
+            ImGui::SetCursorPos(ImVec2(text_x, start.y + std::max(pad, (row_h - text_h) * 0.5f)));
+            ImGui::TextUnformatted(list_items[i].c_str());
+            ImGui::SetCursorPos(end);
         }
         if (selected && list_scroll) {
             ImGui::SetScrollHereY(0.5f);
@@ -1007,6 +1064,8 @@ bool OpenSaveList(const std::string& title, const std::vector<std::string>& item
     }
     list_title = title;
     list_items = items;
+    list_icons = std::move(pending_icons); // sotc: the pictures sent just before (or none)
+    pending_icons.clear();
     list_selected = items.empty() ? 0 : std::clamp(focus, 0, static_cast<int>(items.size()) - 1);
     list_result = -1;
     list_confirm = -1;
@@ -1015,6 +1074,11 @@ bool OpenSaveList(const std::string& title, const std::vector<std::string>& item
     list_active = true;
     ImGui::GetIO().MouseDrawCursor = true;
     return true;
+}
+
+void SetSaveListIcons(std::vector<std::string> paths) {
+    std::scoped_lock lock{imgui_mutex};
+    pending_icons = std::move(paths);
 }
 
 int PollSaveList() {

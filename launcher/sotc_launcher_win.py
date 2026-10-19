@@ -177,7 +177,7 @@ UPSCALERS = [('fsr1', ('FSR 1 (AMD, qualquer placa)', 'FSR 1 (AMD, any GPU)')),
              ('bilinear', ('Bilinear (simples)', 'Bilinear (plain)'))]
 # Frame generation (bb-probe: SOTC_FRAMEGEN; F8 in game switches off / DLSS-G / FSR 3).
 FRAMEGEN = [('off', ('Desligada', 'Off')),
-            ('auto', ('Automática (DLSS-G ou FSR 3)', 'Automatic (DLSS-G or FSR 3)')),
+            ('auto', ('Automática (DLSS-G ou FSR 3, experimental)', 'Automatic (DLSS-G or FSR 3, experimental)')),
             ('dlss', ('NVIDIA DLSS-G (RTX 40/50)', 'NVIDIA DLSS-G (RTX 40/50)')),
             ('fsr', ('AMD FSR 3 (qualquer placa)', 'AMD FSR 3 (any GPU)'))]
 SHARPNESS = [('0', ('Alta', 'High')), ('250', ('Média (padrão)', 'Medium (default)')), ('600', ('Baixa', 'Low')),
@@ -832,11 +832,15 @@ class Launcher:
         self.row(f, _('Geração de quadros', 'Frame generation'), self.choice(f, 'framegen', FRAMEGEN),
                  _('Uma imagem gerada entre duas do jogo: com 30 FPS (limite ligado) a tela mostra 60. DLSS-G: '
                    'NVIDIA RTX 40/50. FSR 3: qualquer placa (RTX 20/30, AMD, Intel). Automática: DLSS-G se a '
-                   'placa tiver, senão FSR 3. No jogo, F8 troca o modo (desligada, DLSS-G, FSR 3). Melhor com '
+                   'placa tiver, senão FSR 3. Experimental: só faz diferença com o modo 60 FPS desligado, e a '
+                   'barra de vida e de stamina pode tremer (a imagem gerada inclui a interface). '
+                   'No jogo, F8 troca o modo (desligada, DLSS-G, FSR 3). Melhor com '
                    'a tela a 60 ou 120 Hz, ou G-SYNC/FreeSync.',
                    'One generated frame between two game frames: at 30 FPS (capped) the screen shows '
                    '60. DLSS-G: NVIDIA RTX 40/50. FSR 3: any GPU (RTX 20/30, AMD, Intel). Automatic: DLSS-G when '
-                   'the GPU has it, else FSR 3. In game, F8 switches the mode (off, DLSS-G, FSR 3). Best with the '
+                   'the GPU has it, else FSR 3. Experimental: it only matters with the 60 FPS mode off, and the '
+                   'health and stamina bars may shake (the generated frame includes the interface). '
+                   'In game, F8 switches the mode (off, DLSS-G, FSR 3). Best with the '
                    'screen at 60 or 120 Hz, or G-SYNC/FreeSync.'))
         self.section(f, _('Resolução', 'Resolution'))
         self.row(f, _('Saída', 'Output'), self.choice(f, 'output_res', OUTPUTS),

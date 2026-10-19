@@ -38,6 +38,9 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
+#include "video_core/renderer_vulkan/vk_framegen.h"
+// After vk_common.h (via the headers above), which sets the Vulkan header defines first.
+#include <vk_mem_alloc.h>
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
@@ -74,7 +77,12 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     });
 }
 
-Rasterizer::~Rasterizer() = default;
+Rasterizer::~Rasterizer() {
+    for (auto& [address, image] : hudless_images) {
+        DestroyHudless(image);
+    }
+    DestroyHudless(hudless_clear);
+}
 
 bool Rasterizer::FilterDraw() {
     const auto& regs = liverpool->DrawRegs();
@@ -668,6 +676,182 @@ bool Rasterizer::ReuseShadowCascade() {
     return moved;
 }
 
+// sotc: TakeHudless (vk_rasterizer.h). An image of the video out size, created once per video out
+// address in the format of the composite's attachment (mutable: the presenter reads it in the
+// video out format).
+static bool CreateHudlessImage(const Instance& instance, vk::Format format, u32 width, u32 height,
+                               vk::ImageUsageFlags usage, vk::Image& image, vk::ImageView& view,
+                               VmaAllocation& allocation) {
+    const VkImageCreateInfo info = static_cast<VkImageCreateInfo>(vk::ImageCreateInfo{
+        .flags = vk::ImageCreateFlagBits::eMutableFormat,
+        .imageType = vk::ImageType::e2D,
+        .format = format,
+        .extent = {width, height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .tiling = vk::ImageTiling::eOptimal,
+        .usage = usage,
+        .initialLayout = vk::ImageLayout::eUndefined,
+    });
+    const VmaAllocationCreateInfo alloc_info = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    VkImage raw{};
+    if (vmaCreateImage(instance.GetAllocator(), &info, &alloc_info, &raw, &allocation, nullptr) !=
+        VK_SUCCESS) {
+        return false;
+    }
+    image = vk::Image{raw};
+    auto [result, created] = instance.GetDevice().createImageView(vk::ImageViewCreateInfo{
+        .image = image,
+        .viewType = vk::ImageViewType::e2D,
+        .format = format,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    });
+    if (result != vk::Result::eSuccess) {
+        vmaDestroyImage(instance.GetAllocator(), image, allocation);
+        image = vk::Image{};
+        return false;
+    }
+    view = created;
+    return true;
+}
+
+void Rasterizer::DestroyHudless(HudlessImage& hudless) {
+    const vk::Device device = instance.GetDevice();
+    if (hudless.read_view) {
+        device.destroyImageView(hudless.read_view);
+    }
+    if (hudless.rt_view) {
+        device.destroyImageView(hudless.rt_view);
+    }
+    if (hudless.image) {
+        vmaDestroyImage(instance.GetAllocator(), hudless.image, hudless.allocation);
+    }
+    hudless = {};
+}
+
+bool Rasterizer::BeginHudless(const GraphicsPipeline* pipeline, const RenderState& state) {
+    // ponytail: one image per video out address, never resized: a video out of another size or
+    // format (a resolution change) gets no HUD-less image; recreate it after a Finish if needed.
+    auto& target = hudless_images[hudless_vo];
+    if (!target.image) {
+        if (!CreateHudlessImage(instance, hudless_vo_format, hudless_vo_width, hudless_vo_height,
+                                vk::ImageUsageFlagBits::eColorAttachment |
+                                    vk::ImageUsageFlagBits::eSampled,
+                                target.image, target.rt_view, target.allocation)) {
+            return false;
+        }
+        target.rt_format = hudless_vo_format;
+        target.width = hudless_vo_width;
+        target.height = hudless_vo_height;
+    }
+    if (target.rt_format != hudless_vo_format || target.width != hudless_vo_width ||
+        target.height != hudless_vo_height) {
+        return false;
+    }
+    scheduler.EndRendering();
+    const auto cmdbuf = scheduler.CommandBuffer();
+    const vk::ImageSubresourceRange color_range{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+    if (!hudless_clear.image) {
+        if (!CreateHudlessImage(instance, vk::Format::eR8G8B8A8Unorm, 1, 1,
+                                vk::ImageUsageFlagBits::eSampled |
+                                    vk::ImageUsageFlagBits::eTransferDst,
+                                hudless_clear.image, hudless_clear.rt_view,
+                                hudless_clear.allocation)) {
+            return false;
+        }
+        const auto to_clear = vk::ImageMemoryBarrier2{
+            .dstStageMask = vk::PipelineStageFlagBits2::eClear,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eTransferDstOptimal,
+            .image = hudless_clear.image,
+            .subresourceRange = color_range,
+        };
+        cmdbuf.pipelineBarrier2(
+            vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_clear});
+        cmdbuf.clearColorImage(hudless_clear.image, vk::ImageLayout::eTransferDstOptimal,
+                               vk::ClearColorValue{}, color_range);
+        const auto to_read = vk::ImageMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eClear,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+            .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+            .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+            .image = hudless_clear.image,
+            .subresourceRange = color_range,
+        };
+        cmdbuf.pipelineBarrier2(
+            vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_read});
+    }
+    // The composite writes every pixel: the last frame's content (read by the presenter) can go.
+    const auto to_target = vk::ImageMemoryBarrier2{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderRead,
+        .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+        .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+        .oldLayout = vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+        .image = target.image,
+        .subresourceRange = color_range,
+    };
+    cmdbuf.pipelineBarrier2(
+        vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_target});
+    auto& ui = image_infos[hudless_ui_info];
+    ui.imageView = hudless_clear.rt_view;
+    ui.imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    pipeline->BindResources(set_writes, push_data);
+    RenderState hudless_state = state;
+    auto& attachment = hudless_state.color_attachments[0];
+    attachment.image_view = target.rt_view;
+    attachment.image_layout = vk::ImageLayout::eColorAttachmentOptimal;
+    attachment.is_clear = 0;
+    scheduler.BeginRendering(hudless_state);
+    target.fresh = true;
+    return true;
+}
+
+vk::ImageView Rasterizer::TakeHudless(VAddr address, vk::Format format) {
+    const auto it = hudless_images.find(address);
+    if (it == hudless_images.end() || !std::exchange(it->second.fresh, false)) {
+        return {};
+    }
+    auto& target = it->second;
+    if (!target.read_view) {
+        // As the presenter's view of the video out image: alpha excluded.
+        auto [result, view] = instance.GetDevice().createImageView(vk::ImageViewCreateInfo{
+            .image = target.image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = format,
+            .components = {.a = vk::ComponentSwizzle::eOne},
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        });
+        if (result != vk::Result::eSuccess) {
+            return {};
+        }
+        target.read_view = view;
+        target.read_format = format;
+    }
+    if (target.read_format != format) {
+        return {}; // ponytail: one read format per video out image (its pixel format is fixed)
+    }
+    scheduler.EndRendering();
+    const auto to_read = vk::ImageMemoryBarrier2{
+        .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+        .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+        .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+        .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+        .image = target.image,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    };
+    scheduler.CommandBuffer().pipelineBarrier2(
+        vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_read});
+    return target.read_view;
+}
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolved,
                       bool use_resolved) {
     RENDERER_TRACE;
@@ -698,6 +882,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
     TraceShadowShaders(regs, pipeline);
 
     PrepareRenderState(pipeline);
+    hudless_ui_info = -1; // sotc: TakeHudless, set by BindTextures and BeginRendering
+    hudless_vo = 0;
     if (Dlssg::CapturingInputs()) { // sotc: camera and inputs of frame generation
         Dlssg::NoteDraw(regs, pipeline->GetGraphicsKey().mrt_mask, db_desc.first,
                         cb_descs[4].first, texture_cache);
@@ -734,6 +920,17 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
     } else {
         cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
                     instance_offset);
+    }
+    // sotc: the final composite again, without the UI layer (TakeHudless).
+    if (hudless_ui_info >= 0 && hudless_vo && BeginHudless(pipeline, state)) {
+        const auto hudless_cmdbuf = scheduler.CommandBuffer();
+        if (is_indexed) {
+            hudless_cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
+                                       s32(vertex_offset), instance_offset);
+        } else {
+            hudless_cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(),
+                                vertex_offset, instance_offset);
+        }
     }
     DebugState.IncDrawCall();
 
@@ -1998,6 +2195,23 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
     }
 
+    // sotc: TakeHudless: the final composite samples the UI layer (an sRGB render target) and the
+    // fp16 scene, nothing else.
+    static const bool hudless_on = [] {
+        const char* v = std::getenv("SOTC_FG_HUDLESS");
+        return !v || v[0] != '0';
+    }();
+    if (hudless_on && stage.sw_stage == Shader::SwStage::Fragment && image_bindings.size() == 2 &&
+        image_bindings[0].first && image_bindings[1].first &&
+        FrameGen::Current() == FrameGen::Mode::Fsr) {
+        const auto& ui = texture_cache.GetImage(image_bindings[0].first);
+        const auto& scene = texture_cache.GetImage(image_bindings[1].first);
+        if (ui.usage.render_target && ui.info.pixel_format == vk::Format::eR8G8B8A8Srgb &&
+            scene.info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
+            hudless_ui_info = static_cast<s32>(first_image_idx);
+        }
+    }
+
     u32 image_info_idx = first_image_idx;
     u32 image_binding_idx = 0;
     for (u32 array_size : image_descriptor_array_sizes) {
@@ -2160,6 +2374,12 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         attachment.is_clear = is_clear;
 
         image->usage.render_target = 1u;
+        if (cb == 0 && image->usage.vo_surface) { // sotc: TakeHudless
+            hudless_vo = image->info.guest_address;
+            hudless_vo_format = image_view.info.format;
+            hudless_vo_width = image->info.size.width;
+            hudless_vo_height = image->info.size.height;
+        }
     }
     for (u32 cb = state.num_color_attachments; cb < state.color_attachments.size(); ++cb) {
         state.color_attachments[cb] = {};

@@ -487,9 +487,11 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     const u32 num_frames =
         Dlssg::Enabled() || FrameGen::AskedAtStart() ? std::max(num_images, 4u) : num_images;
     present_frames.resize(num_frames);
+    hudless_frames.resize(num_frames);
     for (u32 i = 0; i < num_frames; i++) {
         Frame& frame = present_frames[i];
         frame.id = i;
+        hudless_frames[i].id = i;
         auto fence = Check<"create present done fence">(
             device.createFence({.flags = vk::FenceCreateFlagBits::eSignaled}));
         frame.present_done = fence;
@@ -521,6 +523,12 @@ Presenter::~Presenter() {
         vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation);
         device.destroyImageView(frame.image_view);
         device.destroyFence(frame.present_done);
+    }
+    for (auto& frame : hudless_frames) {
+        if (frame.image) {
+            vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation);
+            device.destroyImageView(frame.image_view);
+        }
     }
 }
 
@@ -775,6 +783,26 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
     pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+
+    // sotc: the game frame without the HUD, through the same pass (frame generation keeps the
+    // HUD of the real frame instead of interpolating it). Not with FSR 1 scaling, whose images
+    // are a ring meant for one frame each.
+    if (const vk::ImageView hudless_view = rasterizer->TakeHudless(cpu_address, view_info.format);
+        hudless_view && !DebugState.is_using_fsr) {
+        Frame& hudless = hudless_frames[frame->id];
+        if (hudless.width != frame->width || hudless.height != frame->height ||
+            hudless.is_hdr != frame->is_hdr || !hudless.image) {
+            RecreateFrame(&hudless, frame->width, frame->height);
+        }
+        auto hudless_barrier = pre_barrier;
+        hudless_barrier.image = hudless.image;
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &hudless_barrier,
+        });
+        pp_pass.Render(cmdbuf, hudless_view, image_size, hudless, pp_settings);
+        frame->hudless = &hudless;
+    }
 
 
     if (pending_screenshot) {
@@ -1260,7 +1288,8 @@ bool Presenter::PresentGenerated(Frame* frame) {
     auto& scheduler = present_scheduler;
     const auto cmdbuf = scheduler.CommandBuffer();
     const vk::Image generated =
-        FsrFg::Generate(cmdbuf, frame->id, frame->image, frame->width, frame->height);
+        FsrFg::Generate(cmdbuf, frame->id, frame->image, frame->width, frame->height,
+                        frame->hudless ? frame->hudless->image : vk::Image{});
 
     // FSR 3 reads the game frame and its inputs: after the frame's own commands.
     if (frame->ready_semaphore == draw_scheduler.GetWorkSemaphore()->Handle()) {
@@ -1330,6 +1359,38 @@ bool Presenter::PresentGenerated(Frame* frame) {
     };
     cmdbuf.blitImage(generated, vk::ImageLayout::eGeneral, swapchain_image,
                      vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eLinear);
+    // sotc: SOTC_SHOT_GENERATED=<file>: when the file appears it is removed and the next generated
+    // frame is saved as a screenshot ("hud" file name, without the overlay): checking frame
+    // generation (BB_FRAME_DUMP_TRIGGER saves the game frames).
+    static const char* shot_generated = std::getenv("SOTC_SHOT_GENERATED");
+    std::optional<ScreenshotReadback> pending_screenshot;
+    if (shot_generated && std::remove(shot_generated) == 0) {
+        auto& readback = pending_screenshot.emplace(
+            instance, ScreenshotKind::WithOverlays,
+            BuildScreenshotPaths(ScreenshotKind::WithOverlays, 1), extent.width, extent.height,
+            swapchain.GetHDR() ? vk::Format::eA2B10G10R10UnormPack32
+                               : swapchain.GetSurfaceFormat().format,
+            swapchain.GetHDR());
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                               vk::PipelineStageFlagBits::eTransfer,
+                               vk::DependencyFlagBits::eByRegion, {}, {},
+                               swapchain_barrier(vk::AccessFlagBits::eTransferWrite,
+                                                 vk::AccessFlagBits::eTransferRead,
+                                                 vk::ImageLayout::eTransferDstOptimal,
+                                                 vk::ImageLayout::eTransferSrcOptimal));
+        CopyImageToReadback(cmdbuf, swapchain_image, vk::ImageLayout::eTransferSrcOptimal,
+                            readback);
+        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                               vk::PipelineStageFlagBits::eTransfer,
+                               vk::DependencyFlagBits::eByRegion, {}, {},
+                               swapchain_barrier(vk::AccessFlagBits::eTransferRead,
+                                                 vk::AccessFlagBits::eTransferWrite,
+                                                 vk::ImageLayout::eTransferSrcOptimal,
+                                                 vk::ImageLayout::eTransferDstOptimal));
+        scheduler.DeferPriorityOperation([deferred_screenshot = std::move(pending_screenshot)]() {
+            SavePendingScreenshot(deferred_screenshot.value());
+        });
+    }
     cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
                            vk::PipelineStageFlagBits::eAllCommands,
                            vk::DependencyFlagBits::eByRegion, {}, {},
@@ -1392,6 +1453,7 @@ Frame* Presenter::GetRenderFrame() {
         frame->is_hdr != swapchain.GetHDR()) {
         RecreateFrame(frame, expected_frame_width, expected_frame_height);
     }
+    frame->hudless = nullptr;
 
     return frame;
 }

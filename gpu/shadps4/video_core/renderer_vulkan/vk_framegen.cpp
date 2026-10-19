@@ -4,8 +4,12 @@
 #include "video_core/renderer_vulkan/vk_framegen.h"
 #include "video_core/sotc_ui_lang.h"
 
+#ifdef _WIN32
 #include <windows.h>
 #include <dxgi.h>
+#else
+#include <strings.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -19,19 +23,27 @@ namespace {
 
 enum class Asked { Off, Auto, Dlss, Fsr };
 
+bool SameIgnoringCase(const char* a, const char* b) {
+#ifdef _WIN32
+    return _stricmp(a, b) == 0;
+#else
+    return strcasecmp(a, b) == 0;
+#endif
+}
+
 Asked AskedMode() {
     static const Asked asked = [] {
         if (const char* v = std::getenv("SOTC_FRAMEGEN"); v && v[0]) {
-            if (_stricmp(v, "auto") == 0) {
+            if (SameIgnoringCase(v, "auto")) {
                 return Asked::Auto;
             }
-            if (_stricmp(v, "dlss") == 0 || _stricmp(v, "dlssg") == 0) {
+            if (SameIgnoringCase(v, "dlss") || SameIgnoringCase(v, "dlssg")) {
                 return Asked::Dlss;
             }
-            if (_stricmp(v, "fsr") == 0 || _stricmp(v, "fsr3") == 0) {
+            if (SameIgnoringCase(v, "fsr") || SameIgnoringCase(v, "fsr3")) {
                 return Asked::Fsr;
             }
-            if (_stricmp(v, "off") != 0 && v[0] != '0') {
+            if (!SameIgnoringCase(v, "off") && v[0] != '0') {
                 std::fprintf(stderr, "SOTC FRAMEGEN: unknown SOTC_FRAMEGEN=%s, off\n", v);
             }
             return Asked::Off;
@@ -42,6 +54,7 @@ Asked AskedMode() {
     return asked;
 }
 
+#ifdef _WIN32
 /// An NVIDIA GPU in the system (DXGI, before Vulkan): Streamline is for those only.
 bool HasNvidiaGpu() {
     HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
@@ -65,6 +78,7 @@ bool HasNvidiaGpu() {
     }
     return found;
 }
+#endif
 
 std::atomic<int> current{static_cast<int>(Mode::Off)};
 std::atomic<bool> have_dlss{false}, have_fsr{false};
@@ -76,11 +90,16 @@ bool WantStreamline() {
     if (AskedMode() == Asked::Off) {
         return false;
     }
+#ifndef _WIN32
+    std::fprintf(stderr, "SOTC FRAMEGEN: DLSS-G is Windows only (Streamline), FSR 3 possible\n");
+    return false;
+#else
     if (!HasNvidiaGpu()) {
         std::fprintf(stderr, "SOTC FRAMEGEN: no NVIDIA GPU, DLSS-G unavailable (FSR 3 possible)\n");
         return false;
     }
     return true;
+#endif
 }
 
 bool HasNvidia() {

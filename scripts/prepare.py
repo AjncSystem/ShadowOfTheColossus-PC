@@ -37,6 +37,14 @@ def parse_elf(data):
     return bytearray(span(data, 0, end)), header, ph, [], []
 
 
+def parse_named_self(path, data):
+    """parse_self of a file's bytes; errors name the file (an encrypted eboot or module, issue #52)."""
+    try:
+        return parse_self(data)
+    except ValueError as error:
+        raise ValueError(f'{path}: {error}') from None
+
+
 def parse_self(data):
     if span(data, 0, 4) == b'\x7fELF':
         return parse_elf(data)
@@ -66,7 +74,8 @@ def parse_self(data):
         if not flags & 0x800:
             continue
         if flags & 10:
-            raise ValueError("encrypted/compressed SELF segment is unsupported")
+            raise ValueError("the file is still encrypted (or compressed): the game dump and the "
+                             "firmware modules must be decrypted copies")
         index = (flags >> 20) & 4095
         if index >= len(ph):
             raise ValueError("invalid segment index")
@@ -107,7 +116,7 @@ def nid(name):
 def inspect_libc(path):
     """Prove that this dump's _init_env is exactly RET; never assume it."""
     source = path.read_bytes()
-    elf, header, ph, _, missing = parse_self(source)
+    elf, header, ph, _, missing = parse_named_self(path, source)
     dynamic = next(p for p in ph if p['type'] == 2)
     tags = dict(unpack('<QQ', elf, pos) for pos in
                 range(dynamic['offset'], dynamic['offset'] + dynamic['filesz'], 16))
@@ -138,7 +147,7 @@ def inspect_libc(path):
 
 def prepare(game, out):
     source = (game / 'eboot.bin').read_bytes()
-    elf, header, ph, segments, missing = parse_self(source)
+    elf, header, ph, segments, missing = parse_named_self(game / 'eboot.bin', source)
     loads = [p for p in ph if p['type'] in (1, 0x61000010)]
     def mapped(addr, size=8):
         return any(p['vaddr'] <= addr and addr + size <= p['vaddr'] + p['memsz'] for p in loads)

@@ -119,7 +119,7 @@ def windows_language():
 # Settings, passed to sotc.py as environment variables.
 
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
-                'user_dir': '', 'af16': True, 'fps60': False, 'fps_mode': '30', 'fullscreen': False,
+                'user_dir': '', 'af16': True, 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
                 'readbacks': '', 'extra_env': '', 'close_on_play': False, 'gamepad': '',
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
@@ -199,6 +199,10 @@ OUTPUTS = [('1280x720', ('1280 × 720 (16:9, 720p)', '1280 × 720 (16:9, 720p)')
     (size, (f"{size.replace('x', ' × ')} ({label})",) * 2) for size, label in SCREENS]
 UPSCALERS = [('fsr1', ('FSR 1 (AMD, qualquer placa)', 'FSR 1 (AMD, any GPU)')),
              ('bilinear', ('Bilinear (simples)', 'Bilinear (plain)'))]
+# Button icons in the game: the PlayStation prompts, or Xbox ones drawn for the port
+# (tools/make_button_icons.py, glyphs/xbox) put in place of the game's textures.
+BUTTON_ICONS = [('ps', ('PlayStation (do jogo)', 'PlayStation (the game\'s)')),
+                ('xbox', ('Xbox (A B X Y)', 'Xbox (A B X Y)'))]
 # Frame rate: 30 (the game's cap, as on PS4), 60 (the cap off, at most one frame per two 120 Hz
 # vblanks: SOTC_FPS_LIMIT=60) or unlimited.
 FPS_MODES = [('30', ('30 FPS (como no PS4)', '30 FPS (as on PS4)')),
@@ -410,6 +414,8 @@ def game_environment(s):
     env['SOTC_NEO'] = '1' if s.get('neo') else '0'
     env['SOTC_OUTPUT_RES'] = s.get('output_res') or '1920x1080'
     env['SOTC_FRAMEGEN'] = s.get('framegen') or 'off'
+    if s.get('button_icons') == 'xbox' and (PORT_DIR / 'glyphs' / 'xbox').is_dir():
+        env['SOTC_TEX_REPLACE'] = str(PORT_DIR / 'glyphs' / 'xbox')
     env['SOTC_UI_LANG'] = s.get('ui_language') or windows_language()  # overlay and F7/F8 texts
     # The game renders at the output size (sotc.py scales it down above about 4.2 million pixels; the
     # upscaler takes it to the output). 720p renders at 1080p, as on PS4; the PS4 Pro path keeps its
@@ -974,6 +980,11 @@ class Launcher:
                                _('Um controle (DualShock 4, DualSense, Xbox…) é usado automaticamente.',
                                  'A gamepad (DualShock 4, DualSense, Xbox…) is used automatically.'))
         self.section(f, _('Controle', 'Gamepad'), top=4)
+        self.row(f, _('Ícones dos botões', 'Button icons'), self.choice(f, 'button_icons', BUTTON_ICONS),
+                 _('Os ícones que o jogo mostra nas dicas: os do PlayStation ou os do Xbox (A B X Y, LB/RB, '
+                   'LT/RT, Menu, View), desenhados para o port. Vale na próxima vez que o jogo abrir.',
+                   'The icons the game shows in its prompts: PlayStation ones or Xbox ones (A B X Y, LB/RB, '
+                   'LT/RT, Menu, View), drawn for the port. Applies the next time the game starts.'))
         self.row(f, _('Controle preferido', 'Preferred gamepad'), ttk.Entry(f, textvariable=self.var('gamepad'), width=30),
                  _('Nome (ou parte) do controle a usar quando houver vários; vazio = o primeiro.',
                    'Name (or part of it) of the gamepad to use when several are connected; empty = the first.'))

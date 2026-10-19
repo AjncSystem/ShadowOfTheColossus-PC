@@ -26,6 +26,8 @@ rm -rf -- out/stage
 mkdir -p "$dest/bin" "$dest/scripts" "$dest/launcher"
 cp -r out/pyi-dist/SotC/. "$dest/"
 cp launcher/sotc.ico launcher/sotc.png "$dest/launcher/"
+# Xbox-style button icons drawn for the port (tools/make_button_icons.py).
+cp -r glyphs "$dest/"
 # Without debug information (out/ keeps the symbols for crash reports).
 for exe in bb-probe.exe bb-gpu-capabilities.exe; do
     llvm-strip --strip-debug -o "$dest/bin/$exe" "out/$exe"

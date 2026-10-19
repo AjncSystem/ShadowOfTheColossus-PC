@@ -1,5 +1,17 @@
 # Shadow of the Colossus — PC (port nativo / native port) · v0.66-cp-mt
 
+**The fastest build of the native PC port of Shadow of the Colossus (PS4).**
+The game's own code runs on your CPU, and the PS4 GPU is translated to Vulkan. This fork adds:
+
+| | Original 0.57 | **This fork (0.66-cp-mt)** |
+|---|---|---|
+| Shrine of Worship, 60 FPS mode (RTX 5060 Ti) | ~29 FPS | **~48–49 FPS** |
+| Frame generation | — | **FSR 3** (optional): 30 FPS mode shows 60 |
+| PS4 Pro mode | crash when the save loads | **works**, cinematic 22.5 → 39.3 FPS |
+| First visit to an area (shader translation) | 15.6 s | **3.0 s** |
+
+**[⬇ Download the latest release](../../releases/latest)** · bring your own game dump · Windows 10/11, Vulkan 1.3
+
 **[Português](#português)** · **[English](#english)** · [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
 > **Nenhum arquivo do jogo nem da Sony está incluído / No game or Sony files are included.**

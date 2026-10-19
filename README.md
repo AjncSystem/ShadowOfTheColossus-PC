@@ -69,7 +69,8 @@ normalmente, a 30 FPS.
 - **Jogar:** confere a versão do jogo, o som, os saves e a placa de vídeo antes de abrir;
   opções rápidas de saída, upscaler, 60 FPS, filtro 16x e tela cheia.
 - **Jogo e saves:** biblioteca de jogos, busca automática no PC, importação de saves do shadPS4.
-- **Imagem e FPS:** saída 720p a 4K (o jogo renderiza em 1080p e o FSR 1 + RCAS amplia),
+- **Imagem e FPS:** saída 720p a 4K, também 16:10, 21:9 e 32:9 (o jogo renderiza no tamanho da saída, até 1080 linhas
+  de altura, e o FSR 1 + RCAS amplia o resto),
   modo PS4 Pro (o jogo oferece Cinematográfico/Desempenho no próprio menu), efeitos (vinheta,
   névoa, SSAO) e opções de desempenho.
 - **Controles:** controle (DualShock 4, DualSense, Xbox) automático; câmera no mouse;

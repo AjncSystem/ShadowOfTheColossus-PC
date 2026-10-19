@@ -1402,9 +1402,9 @@ void Presenter::SetExpectedGameSize(s32 width, s32 height) {
     expected_frame_height = height;
     expected_frame_width = width;
     if (ratio > expected_ratio) {
-        expected_frame_width = static_cast<s32>(height * expected_ratio);
+        expected_frame_width = static_cast<s32>(std::lround(height * expected_ratio));
     } else {
-        expected_frame_height = static_cast<s32>(width / expected_ratio);
+        expected_frame_height = static_cast<s32>(std::lround(width / expected_ratio));
     }
 }
 

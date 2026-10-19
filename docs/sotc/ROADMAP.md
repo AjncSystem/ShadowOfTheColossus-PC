@@ -67,7 +67,7 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 | 15 | DLSS-G (RTX 40/50) no pacote | ✅ | `0ab2ff7`. Runtime oficial NVIDIA Streamline 2.14.16 (11 MB, assinaturas verificadas) + licenças em `bin/licenses-nvidia`, fora do git (`../SotC-deps`). Na RTX 2060 a DLSS-G é recusada e a FSR 3 assume. Não testada em RTX 40/50 (outros projetos já testaram numa 4080). |
 | 16 | Overlay F10 e mensagens F7/F8 no idioma do lançador | ✅ | `9656fa4` (os textos do fork de geração de quadros estavam em francês). |
 | 17 | Widescreen / ultrawide (16:10, 21:9, 32:9, Hor+) | ✅ | PR #54 (tabnul), `72d2a69`. Testado em 2560x1080: imagem mais larga, sem esticar, sem erros. |
-| 18 | Ícones de botões Xbox no jogo | ⏳ | O fork xeodeo tem o mecanismo, mas os ícones dele vêm das texturas do jogo (material da Sony): desenhar ícones próprios ou gerá-los no PC do jogador. |
+| 18 | Ícones de botões Xbox no jogo (opção PlayStation / Xbox) | ✅ | Mecanismo de troca de texturas do xeodeo (`5cfd8ea`); 12 ícones desenhados do zero (`tools/make_button_icons.py`, `glyphs/xbox`): A B X Y, RB, LT/RT, LS/RS, Menu, View. Opção em Controles no lançador. Conferido no menu: B = retroceder, A = confirmar. |
 
 ## Fora do roteiro
 

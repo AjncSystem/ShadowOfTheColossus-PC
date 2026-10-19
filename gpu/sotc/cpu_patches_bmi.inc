@@ -13,17 +13,68 @@ static bool EmulatesCpuFeature(Cpu::Type type) {
     return forced || !cpu.has(type);
 }
 
-static bool FilterNoBMI1(const ZydisDecodedOperand*) {
-    return EmulatesCpuFeature(Cpu::tBMI1);
+/// The trampolines handle 64-bit addressing without segment overrides and never rsp as a
+/// register operand (compilers do not emit those forms here).
+static bool FilterSupportedOperands(const ZydisDecodedOperand* operands) {
+    for (u32 i = 0; i < 3; ++i) {
+        const auto& op = operands[i];
+        if (op.type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, op.reg.value) ==
+                ZYDIS_REGISTER_RSP) {
+            return false;
+        }
+        if (op.type != ZYDIS_OPERAND_TYPE_MEMORY) {
+            continue;
+        }
+        if (op.mem.segment == ZYDIS_REGISTER_FS || op.mem.segment == ZYDIS_REGISTER_GS) {
+            return false;
+        }
+        for (const ZydisRegister reg : {op.mem.base, op.mem.index}) {
+            if (reg != ZYDIS_REGISTER_NONE && reg != ZYDIS_REGISTER_RIP &&
+                ZydisRegisterGetWidth(ZYDIS_MACHINE_MODE_LONG_64, reg) != 64) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
-static bool FilterNoLZCNT(const ZydisDecodedOperand*) {
-    return EmulatesCpuFeature(Cpu::tLZCNT);
+static bool FilterNoBMI1(const ZydisDecodedOperand* operands) {
+    return EmulatesCpuFeature(Cpu::tBMI1) && FilterSupportedOperands(operands);
 }
 
-static bool FilterNoMOVBE(const ZydisDecodedOperand*) {
-    return EmulatesCpuFeature(Cpu::tMOVBE);
+static bool FilterNoLZCNT(const ZydisDecodedOperand* operands) {
+    return EmulatesCpuFeature(Cpu::tLZCNT) && FilterSupportedOperands(operands);
 }
+
+static bool FilterNoMOVBE(const ZydisDecodedOperand* operands) {
+    return EmulatesCpuFeature(Cpu::tMOVBE) && FilterSupportedOperands(operands);
+}
+
+static bool IsBmiMnemonic(ZydisMnemonic mnemonic) {
+    switch (mnemonic) {
+    case ZYDIS_MNEMONIC_ANDN:
+    case ZYDIS_MNEMONIC_BEXTR:
+    case ZYDIS_MNEMONIC_BLSI:
+    case ZYDIS_MNEMONIC_BLSMSK:
+    case ZYDIS_MNEMONIC_BLSR:
+    case ZYDIS_MNEMONIC_TZCNT:
+    case ZYDIS_MNEMONIC_LZCNT:
+    case ZYDIS_MNEMONIC_MOVBE:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/// A short TZCNT/LZCNT/MOVBE that could not be relocated: its first two bytes became UD2 and
+/// the illegal instruction handler runs the original from here (EmulateBmiTrapSite). Filled
+/// while the image is patched, before the game runs; read only afterwards.
+struct BmiTrapSite {
+    ZydisDecodedInstruction instruction;
+    std::array<ZydisDecodedOperand, ZYDIS_MAX_OPERAND_COUNT> operands;
+};
+static std::unordered_map<u64, BmiTrapSite> g_bmi_trap_sites;
 
 namespace {
 
@@ -363,7 +414,7 @@ static void GenerateMOVBE(void* address, const ZydisDecodedOperand* operands,
             c.popfq();
             c.lea(rsp, ptr[rsp + GuestRedZone]);
         } else {
-            c.bswap(dst);
+            c.bswap(Xbyak::Reg32e(dst.getIdx(), dst.getBit()));
         }
         return;
     }
@@ -381,7 +432,7 @@ static void GenerateMOVBE(void* address, const ZydisDecodedOperand* operands,
     if (bits == 16) {
         c.rol(value, 8);
     } else {
-        c.bswap(value);
+        c.bswap(Xbyak::Reg32e(value.getIdx(), value.getBit()));
     }
     c.mov(GuestMemory(operands[0], address, shift), value);
     c.pop(t);

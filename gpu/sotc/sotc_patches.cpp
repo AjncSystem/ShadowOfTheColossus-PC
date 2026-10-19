@@ -62,7 +62,10 @@ extern "C" int sotc_patch_eboot(const SotcPatchRequest* request, SotcPatchResult
             result->red_zone_instructions += red.patched_memory_instruction_count;
         }
         // Long forms last: the linear sweep sees the jumps written above as plain instructions.
-        Core::PrePatchInstructions(address, size);
+        // sotc: not over module code (only patched for BMI, at decoded boundaries above).
+        if (request->segments[i].offset < request->eboot_size) {
+            Core::PrePatchInstructions(address, size);
+        }
     }
     return 0;
 }

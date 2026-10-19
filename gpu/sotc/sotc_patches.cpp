@@ -69,7 +69,10 @@ extern "C" int sotc_patch_eboot(const SotcPatchRequest* request, SotcPatchResult
             result->rdtsc_unpatched += unpatched;
         }
         // Long forms last: the linear sweep sees the jumps written above as plain instructions.
-        Core::PrePatchInstructions(address, size);
+        // sotc: not over module code (only patched for BMI, at decoded boundaries above).
+        if (request->segments[i].offset < request->eboot_size) {
+            Core::PrePatchInstructions(address, size);
+        }
     }
     return 0;
 }

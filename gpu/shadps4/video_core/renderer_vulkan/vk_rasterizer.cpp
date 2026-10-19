@@ -1356,7 +1356,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                              u32(tsharp.counter_bank_id));
             }
         }
-        if (texture_cache.IsMeta(tsharp.Address())) {
+        // sotc: first few only (per-draw warning; see BufferCache::SynchronizeMemoryFromImage).
+        if (static u32 shown = 0; shown < 4 && texture_cache.IsMeta(tsharp.Address())) {
+            ++shown;
             LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
         }
 

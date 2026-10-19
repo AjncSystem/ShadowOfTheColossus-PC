@@ -16,7 +16,7 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 | 0.4 | #81 (jownatan): Intel Arc B580 | ✅ | Só as partes exclusivas (a compilação em segundo plano e a pré-carga já vieram, para todas as GPUs, pela #83): trava de regiões sem deadlock no Windows, `SotC-Shaders.ps1`, e a espera da thread de gravação como opção `SOTC_REC_SLEEP_US` (2 ms fixos custavam 6% no desktop: 57,7 vs 61,1 FPS; notebooks/APUs: `2000`). |
 | 0.5 | #69 (DUDUYG): menos CPU por draw, thread de preparação de draws | ⏳ decisão | Conflita com a linha do Oussama em 31 arquivos (~110 trechos). A medição anterior (56,9 / 41,2) **não vale**: no build da #69 o jogo pula a intro e cai num demo diferente (Wander montado, dicas de tutorial), mais leve na ponte. Mesmo demo sem DMA no `comunidade`: 61 / 26–27 (DMA não muda o pior trecho). Ganho documentado pelo autor (PC dele): preparação de draws +3,6% média / +10% trecho pesado; memos −6 a −11% de CPU por comando; parte se sobrepõe aos cortes do Oussama. |
 | 0.6 | Fork xeodeo `v0.57-fixed.1`: bloco preto da AMD RDNA3/4 (#43), BC5/BC6H sem storage, gravação Vulkan sem girar 100% | ⏳ | github.com/xeodeo/ShadowOfTheColossus-PC-FIXED |
-| 0.7 | Fork nakaionyt `v0.57-fg2`: geração de quadros (DLSS-G / FSR 3, jogo a 30 → 60 na tela), sombras distantes reaproveitadas (+17–22%), ritmo de quadros | ⏳ | github.com/nakaionyt/ShadowOfTheColossus-PC-FrameGen. Alternativa ao modo 60 FPS (fase 2) sem quebrar a física. |
+| 0.7 | Fork nakaionyt `v0.57-fg2` (y7ngboy): geração de quadros, sombras distantes reaproveitadas, ritmo de quadros, overlay F10, trava F7 | ✅ | Commits próprios aplicados (fora versão/README e textos fixos em inglês); conflitos resolvidos (menu + overlay, ritmo de quadros do fork no lugar do `SOTC_FLIP_LATE` da #98, `fsr-vulkan` adicionado uma vez). **FSR 3 testada na RTX 2060**: 30 quadros gerados por segundo com o jogo a 33,3 ms → 60 na tela. DLSS-G (RTX 40/50) entra no código mas precisa das DLLs oficiais da NVIDIA ao lado do exe (não baixadas; não testada). Sombras reaproveitadas: ~650–1.270 cascatas por janela, 0 recusadas, imagens corretas; FPS 62–63 (antes 61–62: aqui o limite é a CPU). Lançador: com 60 FPS desligado, trava em 30; geração de quadros nova em "Automático" para quem atualiza. |
 | 0.8 | Demais PRs (#94 menu, #54 widescreen, #118 F11, #130/#39 Linux, #99/#132 refatoração grande do CP) | ⏳ | Avaliar uma a uma. |
 | 0.9 | Corrigir autor dos commits 1bb9dd5/83f88ff (branch `ajncsystem-estabilidade-fps`, PR #93) | ⏳ | |
 
@@ -36,7 +36,7 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 
 | # | Item | Estado | Notas |
 |---|---|---|---|
-| 7 | Física/tempo no dobro: parede do 2º colosso (#120), colossos voando (#100), queda na ponte (#63) | ⏳ | Ver 0.7 (30 FPS + geração de quadros). |
+| 7 | Física/tempo no dobro: parede do 2º colosso (#120), colossos voando (#100), queda na ponte (#63) | 🔧 | Alternativa pronta (0.7): jogo a 30 + geração de quadros = 60 na tela sem mexer na física. O modo 60 FPS nativo continua com os defeitos. |
 
 ## Fase 3 — AMD e outras GPUs
 

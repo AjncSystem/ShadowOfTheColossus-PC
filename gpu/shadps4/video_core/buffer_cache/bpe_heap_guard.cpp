@@ -25,6 +25,8 @@ constexpr u64 MaxBlockSize = 0x100000000ULL;
 constexpr size_t MaxTreeNodes = 1 << 16;
 constexpr size_t MaxListNodes = 1 << 10;
 constexpr size_t MaxChainSteps = 1 << 12;
+constexpr u64 InUse = 1; // size | flags bit 0: set on allocated blocks, clear on free ones
+constexpr size_t MaxUsedBlocks = 1 << 12;
 } // namespace
 
 BpeHeapGuard::BpeHeapGuard(Core::MemoryManager* memory_, VAddr heap_)
@@ -215,6 +217,67 @@ u64 BpeHeapGuard::Write(VAddr addr, const u8* data, u64 size) {
     }
     write(cursor, end);
     return differing;
+}
+
+bool BpeHeapGuard::FindUsedBlock(VAddr addr, VAddr& block, VAddr& next) const {
+    const auto it = std::upper_bound(free_blocks.begin(), free_blocks.end(), addr);
+    if (it == free_blocks.begin()) {
+        return false;
+    }
+    block = *std::prev(it);
+    for (size_t step = 0; step < MaxChainSteps; ++step) {
+        if (!NextBlock(block, next)) {
+            return false;
+        }
+        if (addr < next) {
+            u64 size_flags = 0;
+            return addr >= block + HeaderSize && Read(block + 8, &size_flags, sizeof(size_flags)) &&
+                   (size_flags & InUse) &&
+                   !std::binary_search(free_blocks.begin(), free_blocks.end(), block);
+        }
+        block = next;
+    }
+    return false;
+}
+
+bool BpeUsedBlocks::StillUsed(VAddr heap, VAddr block, VAddr next) const {
+    // The block being freed is kept at [heap+0xc0] before it joins the tree
+    const VAddr pending = *std::bit_cast<const VAddr*>(heap + 0xc0);
+    u64 size_flags = 0;
+    VAddr prev = 0;
+    return pending != block && pending != block + HeaderSize &&
+           memory->TryReadBacking(block + 8, &size_flags, sizeof(size_flags)) &&
+           (size_flags & InUse) && block + (size_flags & SizeMask) + HeaderSize == next &&
+           memory->TryReadBacking(next, &prev, sizeof(prev)) && prev == block;
+}
+
+bool BpeUsedBlocks::Covers(VAddr heap, VAddr addr, VAddr end) {
+    auto it = std::upper_bound(blocks.begin(), blocks.end(), std::pair{addr, ~VAddr{0}});
+    if (it == blocks.begin()) {
+        return false;
+    }
+    --it;
+    const auto [block, next] = *it;
+    if (addr < block + HeaderSize || end > next) {
+        return false;
+    }
+    if (!StillUsed(heap, block, next)) {
+        blocks.erase(it);
+        return false;
+    }
+    return true;
+}
+
+void BpeUsedBlocks::Add(VAddr block, VAddr next) {
+    if (blocks.size() >= MaxUsedBlocks) {
+        blocks.clear();
+    }
+    const auto it = std::lower_bound(blocks.begin(), blocks.end(), std::pair{block, VAddr{0}});
+    if (it != blocks.end() && it->first == block) {
+        it->second = next;
+    } else {
+        blocks.insert(it, {block, next});
+    }
 }
 
 } // namespace VideoCore

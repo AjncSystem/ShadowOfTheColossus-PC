@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.57-opt7 — 2026-10-19 (fork Oussama268)
+- **Bem menos travadas na primeira vez que se joga** (pasta nova, cache vazio, ou depois de
+  atualizar o driver): os shaders novos dos desenhos agora são traduzidos em várias threads, e o
+  desenho que precisa de um shader ainda não pronto é pulado por um instante (o objeto aparece
+  uma fração de segundo depois) em vez de travar o jogo. Medido com os caches vazios (do port e
+  do driver NVIDIA), mesmo PC (RTX 3060 Laptop), contra a 0.57-opt6:
+  - Demo da tela de título (16 minutos): pior travada 4,6–5,2 s → **3,4–3,9 s**; 1% low
+    29,4 → **38,7 FPS**; tempo de tradução de shaders nos quadros lentos 8,7 s → 3,6 s.
+  - Santuário: pior travada 6,0 s → **3,9 s**.
+  - `SOTC_ASYNC_TRANSLATE=0` desliga.
+- **Mais threads para montar shaders:** agora o número de threads do processador menos 4 (de 2 a
+  12; antes metade menos 2, de 1 a 6). Em processadores de 4 a 8 threads isso evita travadas
+  muito longas na primeira visita (com 1 thread, uma travada chegava a 18 s).
+  `SOTC_PIPELINE_WORKERS` muda o número.
+- **Modo 60 FPS limitado a 60 FPS:** o modo tirava o limite do jogo, que em cenas leves passava
+  de 100 FPS — mais rápido do que o jogo roda em qualquer PS4. Os relatos do 5º colosso que sai
+  voando em pose de T (issue #34) e da cena do 2º colosso que não começa (issue #48) acontecem só
+  no modo 60 FPS; com o limite o jogo fica no máximo em 60, como no PS4 Pro. Um quadro mais lento
+  ainda sai no próximo vblank (40 FPS em vez de cair para 30). `SOTC_FPS_CAP=0` tira o limite.
+- **Correção: o jogo não abria no Windows em chinês** (issue #45, erro "'gbk' codec can't encode
+  character '\u2122'"): o símbolo ™ do nome do jogo quebrava a preparação. Agora a saída é
+  sempre UTF-8.
+- **Mensagem clara para jogo ou módulos ainda criptografados** (issue #52): diz qual arquivo e
+  que o dump e os módulos do firmware precisam estar descriptografados.
+- O cache de shaders **não** é refeito.
+- Perfil PGO refeito para o código novo.
+- Diagnóstico: com `SOTC_FPS=1` o log mostra a linha `SOTC ASYNC TRANSLATE` (estágios traduzidos
+  nas threads, desenhos pulados).
+- Testado: santuário e demo com cache (pares intercalados contra a 0.57-opt6: mesmo FPS), caches
+  vazios (duas sessões de 16 minutos e uma de 45, sem falhas), save no modo PS4 Pro, imagens iguais.
+
 ## 0.57-opt6 — 2026-10-18 (fork Oussama268)
 - **Mais FPS com uma thread só para desenhar:** a thread de comandos (o gargalo do port) agora só
   lê os comandos do jogo e escolhe os pipelines; outra thread grava os desenhos no Vulkan. Ideia e

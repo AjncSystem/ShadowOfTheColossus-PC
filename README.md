@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC (port nativo / native port) · v0.57-opt6
+# Shadow of the Colossus — PC (port nativo / native port) · v0.57-opt7
 
 **[Português](#português)** · **[English](#english)** · [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
@@ -21,6 +21,7 @@ de que o jogo precisa, no estilo do [bloodborne_pc](https://github.com/Supermedo
 
 | Versão | Melhorias e correções |
 |---|---|
+| **0.57-opt7** | **Bem menos travadas na primeira vez que se joga:** shaders novos traduzidos em várias threads (caches vazios, demo: pior travada 4,6–5,2 s → 3,4–3,9 s, 1% low 29 → 39 FPS; santuário 6,0 → 3,9 s). **Modo 60 FPS limitado a 60** (relatos do 5º colosso, #34, e da cena do 2º colosso, #48). **Correções:** Windows em chinês (#45), mensagem para jogo criptografado (#52). O cache de shaders não é refeito. |
 | **0.57-opt6** | **Mais FPS com uma thread só para desenhar** (ideia e código de Lucas-blip-png): santuário 34,7 → 38,2 FPS, trecho pesado do mundo aberto 34,0 → 36,1 FPS. **Primeira visita a uma área:** pipelines de compute montados em várias threads (cache vazio: pior travada 22 s → 6 s). **Correção** do fechamento ao carregar o save no modo PS4 Pro (#35). **Atualização pelo lançador** (#37). O cache de shaders é refeito na primeira abertura. |
 | **0.57-opt5** | **Sessões longas estáveis:** memória de buffers sem uso devolvida à GPU (30 minutos de demo: pico 3,4 GB estável, antes 4,3–4,4 GB e subindo). **Mundo aberto ~2% mais rápido** (envio antecipado). **Correção de queda rara** ao carregar o save ("write-only"). |
 | **0.57-opt4** | **Mais FPS:** a thread de comandos gasta bem menos tempo em travas, proteções de página, cópias e alocações (santuário 29 → 35 FPS; demo 47 → 53,5 FPS, 1% low 29 → 38, quadros acima de 50 ms 129 → 26). |
@@ -121,6 +122,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.57-opt7** | **Far fewer freezes the first time you play:** new shaders translated on several threads (empty caches, demo: worst freeze 4.6–5.2 s → 3.4–3.9 s, 1% low 29 → 39 FPS; shrine 6.0 → 3.9 s). **60 FPS mode capped at 60** (reports of the 5th colossus, #34, and the 2nd colossus cutscene, #48). **Fixes:** Chinese Windows (#45), message for an encrypted game (#52). The shader cache is kept. |
 | **0.57-opt6** | **More FPS with a thread of its own for drawing** (idea and code by Lucas-blip-png): shrine 34.7 → 38.2 FPS, heavy open-world stretch 34.0 → 36.1 FPS. **First visit to an area:** compute pipelines built on several threads (empty cache: worst freeze 22 s → 6 s). **Fix** for the crash when loading a save in PS4 Pro mode (#35). **Updates from the launcher** (#37). The shader cache is rebuilt on first launch. |
 | **0.57-opt5** | **Stable long sessions:** unused buffer memory is given back to the GPU (30-minute demo: peak 3.4 GB and flat, before 4.3–4.4 GB and rising). **Open world ~2% faster** (early submit). **Fix for a rare crash** while loading the save ("write-only"). |
 | **0.57-opt4** | **More FPS:** the command thread spends far less time in locks, page protection, copies and allocations (shrine 29 → 35 FPS; demo 47 → 53.5 FPS, 1% low 29 → 38, frames over 50 ms 129 → 26). |

@@ -81,6 +81,12 @@ inline std::atomic<uint64_t> async_compute_built{0};
 inline std::atomic<uint64_t> async_compute_build_ns{0}; ///< worker time building them
 inline std::atomic<uint64_t> async_compute_waits{0};    ///< binds the recording thread waited for
 inline std::atomic<uint64_t> async_compute_wait_ns{0};
+inline std::atomic<uint64_t> async_compute_self_built{0}; ///< built by the recording thread itself
+inline std::atomic<uint64_t> async_translate_stale{0}; ///< permutations whose tables changed
+// sotc: graphics shader stages translated by pipeline workers (SOTC_ASYNC_TRANSLATE), totals.
+inline std::atomic<uint64_t> async_translate_built{0};
+inline std::atomic<uint64_t> async_translate_ns{0};    ///< worker time translating them
+inline std::atomic<uint64_t> async_translate_skips{0}; ///< draws skipped while waiting for one
 /// sotc: SRT walker loads that faulted (null or unmapped table pointer) and read zero, total.
 inline std::atomic<uint64_t> srt_walker_faults{0};
 inline std::atomic<uint64_t> image_bytes{0};    ///< live texture cache and host pass images

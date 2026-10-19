@@ -31,7 +31,7 @@ CONFIG_DIR = Path(os.environ.get('APPDATA', Path.home())) / 'sotc-launcher'
 CONFIG_FILE = CONFIG_DIR / 'settings.json'
 GAME_ID, GAME_VERSION = 'CUSA08809', '01.01'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.57-opt6'
+VERSION = '0.57-opt7'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -59,9 +59,12 @@ def attach_stdio():
 def run_role(argv):
     """--run [args]: sotc.py; --script <file> [args]: a preparation script. Returns an exit code."""
     attach_stdio()
+    # The launcher reads this output as UTF-8. An inherited pipe is otherwise in the ANSI code
+    # page, where characters of the game's title fail (GBK on Chinese Windows: "'gbk' codec can't
+    # encode character '™'", issue #45); the frozen executable ignores PYTHONIOENCODING.
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(line_buffering=True)
+            stream.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
         except (AttributeError, ValueError):
             pass
     if argv[0] == '--script':

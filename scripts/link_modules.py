@@ -26,7 +26,10 @@ FS_LOAD = bytes.fromhex('64488b042500000000')  # mov rax, fs:[0]
 
 def module(path):
     source = path.read_bytes()
-    elf, header, ph, _, missing = parse_self(source)
+    try:
+        elf, header, ph, _, missing = parse_self(source)
+    except ValueError as error:
+        raise ValueError(f'{path}: {error}') from None
     dp = next(p for p in ph if p['type'] == 2)
     dynamic = []
     for pos in range(dp['offset'], dp['offset'] + dp['filesz'], 16):
@@ -260,4 +263,8 @@ if __name__ == '__main__':
     modules = list(a.modules)
     if a.sys_modules:
         modules += [str((a.sys_modules / name).resolve()) for name in SYS_MODULES]
-    link(a.game, a.out, modules)
+    try:
+        link(a.game, a.out, modules)
+    except (ValueError, OSError) as error:
+        # sotc: a message for the launcher's log instead of a traceback (issue #52)
+        p.exit(1, f'link failed: {error}\n')

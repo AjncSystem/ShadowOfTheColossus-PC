@@ -530,6 +530,21 @@ void VideoOutDriver::Flip(const Request& req) {
                         SotcStats::async_compute_waits.load(std::memory_order_relaxed)),
                     SotcStats::async_compute_wait_ns.load(std::memory_order_relaxed) / 1e6);
             }
+            // sotc: graphics shaders translated by workers (SOTC_ASYNC_TRANSLATE), totals.
+            if (const uint64_t built =
+                    SotcStats::async_translate_built.load(std::memory_order_relaxed)) {
+                std::fprintf(stderr,
+                             "SOTC ASYNC TRANSLATE %llu stages (%.0f ms on workers), %llu draws "
+                             "skipped, %llu stale; compute built by the recorder %llu\n",
+                             static_cast<unsigned long long>(built),
+                             SotcStats::async_translate_ns.load(std::memory_order_relaxed) / 1e6,
+                             static_cast<unsigned long long>(
+                                 SotcStats::async_translate_skips.load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(
+                                 SotcStats::async_translate_stale.load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(SotcStats::async_compute_self_built.load(
+                                 std::memory_order_relaxed)));
+            }
             if (const uint64_t faults =
                     SotcStats::srt_walker_faults.load(std::memory_order_relaxed)) {
                 std::fprintf(stderr, "SOTC SRT walker loads that read zero: %llu\n",
@@ -699,6 +714,19 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
     Common::AccurateTimer timer{vblank_period};
 
+    // sotc: SOTC_FPS_CAP=<fps>: at least vblank Hz / fps vblanks between two flips. The 60 FPS
+    // mode removes the game's flip rate and runs the vblank at 120 Hz (a frame that misses one
+    // vblank then waits 8 ms, not 16); the cap keeps the game at or below 60 FPS, the most it
+    // ever runs on a PS4 Pro, while a slower frame still flips on the next vblank (40 FPS, not 30).
+    const u64 min_flip_vblanks = [] {
+        const char* v = std::getenv("SOTC_FPS_CAP");
+        const int cap = v ? std::atoi(v) : 0;
+        const int hz = static_cast<int>(EmulatorSettings.GetVblankFrequency());
+        return cap > 0 ? static_cast<u64>(std::max(1, (hz + cap - 1) / cap)) : u64{1};
+    }();
+    u64 last_flip_vblank = 0;
+    bool flipped_once = false;
+
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
         if (!requests.empty()) {
@@ -720,7 +748,9 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
         // Check if it's time to take a request.
         auto& vblank_status = main_port.vblank_status;
-        if (vblank_status.count % (main_port.flip_rate + 1) == 0) {
+        const bool flip_allowed =
+            !flipped_once || vblank_status.count - last_flip_vblank >= min_flip_vblanks;
+        if (vblank_status.count % (main_port.flip_rate + 1) == 0 && flip_allowed) {
             const auto request = receive_request();
             if (!request) {
                 if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
@@ -732,6 +762,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 }
             } else {
                 Flip(request);
+                last_flip_vblank = vblank_status.count;
+                flipped_once = true;
                 FRAME_END;
             }
         }

@@ -129,6 +129,90 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
 // in stream order, so the tables stay CPU-side. SOTC_FILL_HLE=0 runs the shader on the GPU.
 static constexpr u64 REPLICATE_SHADER_HASH = 0x50784801;
 
+// sotc: SOTC_FILL_HLE_PAGES (default on, 0 replaces whole tables): a changed table usually
+// differs in a few of its 4 KiB pages (at the Shrine 1.5 of the 8.4 MB of changed tables per
+// frame). Only the pages that differ are replaced, so only they are invalidated, marked
+// CPU-written and uploaded again. The caller checked that no byte of the table is GPU-written,
+// so `current` (the backing) is what the guest sees, and the unchanged pages already hold the
+// result: the same state as a table that did not change at all. If a replace is refused (other
+// GPU-written bytes on a page), false runs the shader on the GPU, which writes the whole table.
+// The bytes a fill writes: `direct` (contiguous), or `pattern` repeated with `period` (the buffer
+// holds period + 4 KiB bytes, so At(o) is valid for the rest of o's 4 KiB page).
+struct TableData {
+    const u8* direct = nullptr;
+    const u8* pattern = nullptr;
+    u64 period = 0;
+    const u8* At(u64 offset) const {
+        return direct ? direct + offset : pattern + offset % period;
+    }
+    const u8* Run(u64 offset, u64 size) const { // contiguous bytes of [offset, offset + size)
+        if (direct) {
+            return direct + offset;
+        }
+        static std::vector<u8> run;
+        run.resize(size);
+        for (u64 done = 0; done < size;) {
+            const u64 chunk = std::min<u64>(size - done, 4096 - (offset + done) % 4096);
+            std::memcpy(run.data() + done, At(offset + done), chunk);
+            done += chunk;
+        }
+        return run.data();
+    }
+};
+
+static bool ReplaceChangedPages(Rasterizer& rasterizer, VAddr address, const u8* current,
+                                const TableData& data, u64 size) {
+    auto& buffer_cache = rasterizer.GetBufferCache();
+    VAddr run_start = 0;
+    VAddr run_end = 0; // the pending run of changed pages, empty while run_end == run_start
+    const auto flush = [&] {
+        if (run_end == run_start) {
+            return true;
+        }
+        const u64 offset = run_start - address;
+        const u64 run_size = run_end - run_start;
+        run_start = run_end;
+        if (!buffer_cache.TryWriteThroughFromCpu(address + offset, data.Run(offset, run_size),
+                                                 run_size)) {
+            return false;
+        }
+        if (SotcStats::kCmdStats) {
+            SotcStats::inv_hle.fetch_add(run_size, std::memory_order_relaxed);
+        }
+        rasterizer.GetTextureCache().InvalidateMemory(address + offset, run_size);
+        return true;
+    };
+    const VAddr end = address + size;
+    for (VAddr lo = address; lo < end;) {
+        const VAddr hi = std::min<VAddr>((lo & ~VAddr{4095}) + 4096, end);
+        if (std::memcmp(current + (lo - address), data.At(lo - address), hi - lo) != 0) {
+            if (run_end != lo && !flush()) {
+                return false;
+            }
+            if (run_end == run_start) {
+                run_start = lo;
+            }
+            run_end = hi;
+        }
+        lo = hi;
+    }
+    return flush();
+}
+
+// The whole table: the pattern of src_count elements, repeated (no division per element).
+static std::vector<u32> data;
+static void BuildTable(const u32* source, u64 src_count, u64 count) {
+    if (data.size() < count) {
+        data.resize(count); // grow only: data[0, count) is all that is read
+    }
+    std::memcpy(data.data(), source, src_count * 4);
+    for (u64 done = src_count; done < count;) {
+        const u64 chunk = std::min(done, count - done);
+        std::memcpy(data.data() + done, data.data(), chunk * 4);
+        done += chunk;
+    }
+}
+
 static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
                                       const AmdGpu::ComputeProgram& cs_program,
                                       Rasterizer& rasterizer) {
@@ -164,18 +248,7 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
         buffer_cache.IsRegionGpuModified(src.base_address, src_count * 4)) {
         return false;
     }
-    static std::vector<u32> data;
-    if (data.size() < count) {
-        data.resize(count); // grow only: data[0, count) is all that is read
-    }
     const u32* source = std::bit_cast<const u32*>(src.base_address);
-    // The pattern of src_count elements, repeated (no division per element).
-    std::memcpy(data.data(), source, src_count * 4);
-    for (u64 done = src_count; done < count;) {
-        const u64 chunk = std::min(done, count - done);
-        std::memcpy(data.data() + done, data.data(), chunk * 4);
-        done += chunk;
-    }
     const VAddr address = dst.base_address;
     // sotc: the tables are mostly the same every frame. When no byte of the destination is GPU
     // written (so its pages are not read-protected and the backing is authoritative) and it
@@ -188,14 +261,52 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
         const char* v = std::getenv("SOTC_FILL_HLE_FAST");
         return !v || v[0] != '0';
     }();
+    static const bool page_replace = [] {
+        const char* v = std::getenv("SOTC_FILL_HLE_PAGES");
+        return !v || v[0] != '0';
+    }();
     if (!SotcStats::OptOff() && !buffer_cache.IsRegionGpuModified(address, count * 4)) {
         bool same = false;
         VAddr run_start = 0;
         u64 run_size = 0;
         const u8* run = fast ? Core::Memory::Instance()->GetBackingRun(address, &run_start, &run_size)
                              : nullptr;
-        if (run && run_size && address >= run_start && address + count * 4 <= run_start + run_size) {
-            same = std::memcmp(run + (address - run_start), data.data(), count * 4) == 0;
+        const bool in_run =
+            run && run_size && address >= run_start && address + count * 4 <= run_start + run_size;
+        // sotc: with page replaces, the table is compared page by page against its source (a
+        // copy: the source itself; a repeated pattern of up to 64 KiB: one page past one
+        // period of it), without building it first: ~15 MB of copying per frame at the Shrine.
+        const u64 period = src_count * 4;
+        const bool overlap = src.base_address < address + count * 4 &&
+                             address < src.base_address + period;
+        if (in_run && page_replace && !overlap && (src_count == count || period <= 64_KB)) {
+            TableData table{};
+            if (src_count == count) {
+                table.direct = reinterpret_cast<const u8*>(source);
+            } else {
+                static std::vector<u8> pattern;
+                pattern.resize(period + 4096);
+                std::memcpy(pattern.data(), source, period);
+                for (u64 done = period; done < pattern.size();) {
+                    const u64 chunk = std::min<u64>(done, pattern.size() - done);
+                    std::memcpy(pattern.data() + done, pattern.data(), chunk);
+                    done += chunk;
+                }
+                table.pattern = pattern.data();
+                table.period = period;
+            }
+            return ReplaceChangedPages(rasterizer, address, run + (address - run_start), table,
+                                       count * 4);
+        }
+        BuildTable(source, src_count, count);
+        if (in_run) {
+            const u8* current = run + (address - run_start);
+            same = std::memcmp(current, data.data(), count * 4) == 0;
+            if (!same && page_replace) {
+                return ReplaceChangedPages(rasterizer, address, current,
+                                           TableData{reinterpret_cast<const u8*>(data.data())},
+                                           count * 4);
+            }
         } else {
             static std::vector<u32> current;
             if (current.size() < count) {
@@ -207,10 +318,13 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
         if (same) {
             return true;
         }
+    } else {
+        BuildTable(source, src_count, count);
     }
     if (!buffer_cache.TryReplaceFromCpu(address, data.data(), count * 4)) {
         return false;
     }
+    if (SotcStats::kCmdStats) SotcStats::inv_hle.fetch_add(count * 4, std::memory_order_relaxed);
     rasterizer.InvalidateMemory(address, count * 4);
     return true;
 }

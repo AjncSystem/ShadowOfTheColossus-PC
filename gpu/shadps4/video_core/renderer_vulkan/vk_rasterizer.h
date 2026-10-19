@@ -146,6 +146,7 @@ private:
     void FlushPeriodic();
     u64 commands_tick{};
     u64 commands_since_submit{};
+    u64 evict_poll{}; ///< sotc: FlushPeriodic commands without periodic submits
     std::chrono::steady_clock::time_point commands_since{};
 
     bool IsComputeMetaClear(const Pipeline* pipeline);

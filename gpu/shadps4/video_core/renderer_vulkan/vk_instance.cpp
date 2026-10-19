@@ -15,6 +15,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/sotc_stats.h"
 
 #include <vk_mem_alloc.h>
 
@@ -722,6 +723,15 @@ void Instance::CreateAllocator() {
     if (const char* env = std::getenv("SOTC_VMA_BLOCK_MB")) {
         block_size = static_cast<u64>(std::strtoull(env, nullptr, 10)) << 20;
     }
+    // sotc: SOTC_CMD_STATS counts device memory allocations (SOTC sys line).
+    static const VmaDeviceMemoryCallbacks memory_callbacks = {
+        .pfnAllocate = [](VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize, void*) {
+            SotcStats::sys_vk_allocs.fetch_add(1, std::memory_order_relaxed);
+        },
+        .pfnFree = [](VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize, void*) {
+            SotcStats::sys_vk_frees.fetch_add(1, std::memory_order_relaxed);
+        },
+    };
     const VmaAllocatorCreateInfo allocator_info = {
         .flags = static_cast<VmaAllocatorCreateFlags>(
             VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT |
@@ -729,6 +739,7 @@ void Instance::CreateAllocator() {
         .physicalDevice = physical_device,
         .device = *device,
         .preferredLargeHeapBlockSize = block_size,
+        .pDeviceMemoryCallbacks = SotcStats::kCmdStats ? &memory_callbacks : nullptr,
         .pVulkanFunctions = &functions,
         .instance = *instance,
         .vulkanApiVersion = TargetVulkanApiVersion,

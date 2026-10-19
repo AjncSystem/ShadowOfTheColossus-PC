@@ -172,6 +172,7 @@ void FaultManager::ProcessFaultBuffer() {
         fault_ranges.ForEach([&](VAddr start, VAddr end) {
             ASSERT_MSG((end - start) <= std::numeric_limits<u32>::max(),
                        "Buffer size is too large");
+            buffer_cache.NoteFaultRebind(start, end - start); // sotc: before the rebind
             (void)buffer_cache.ObtainBuffer(start, end - start, false);
         });
         fault_areas[area] = 0;

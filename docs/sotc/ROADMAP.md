@@ -30,7 +30,7 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 | 4 | Fault 0x1a371 no modo PS4 Pro (após 1º/2º colosso) | ✅ | PR #106 (+640 MiB no modo Pro); mesma conclusão que a minha (`c2614b0`/`7d9ee11`). |
 | 4b | Streaming de texturas desligado sem querer desde a v0.0.13 | ⏳ | `sotc_lod_stats.h`: `idle < linger` com `linger = 0` nunca é verdadeiro. Com `<=`: 10+15 min normal e 7,5 min Pro sem queda; falta carregar um save com ele ligado. |
 | 5 | Queda na intro final | ⏳ | Aguardando log/cena do usuário. |
-| 6 | Release v0.58 | ⏳ | Precisa de aprovação. |
+| 6 | Release v0.58 | 🔧 | Código no GitHub (`main` = `24be318`, 19/10); PRs #32 #46 #47 #52 #53 #54 #59 #83 #98 #103 #106 #108 marcadas como mescladas pelo GitHub. Release v0.58 criada como **rascunho** (SotC-PC.zip 88 MB, com DLSS e ícones Xbox): falta publicar (aprovação) e apagar a mais antiga (ficam 3). #81 (partes) e #69 continuam abertas. |
 
 ## Fase 2 — Modo 60 FPS
 

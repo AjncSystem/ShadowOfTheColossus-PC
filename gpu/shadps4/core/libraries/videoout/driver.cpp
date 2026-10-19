@@ -793,6 +793,14 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         return !v || v[0] != '0';
     }();
     const u64 vblanks_per_60hz = std::max<u64>(1, EmulatorSettings.GetVblankFrequency() / 60);
+    // sotc: SOTC_FPS_LIMIT=<fps> (the launcher's 60 FPS mode) limits the uncapped game to at least
+    // vblank_hz / fps vblanks between flips; a late frame still goes out at the next vblank (at
+    // 120 Hz a 20 ms frame shows at 25 ms, not at 33 ms as with 60 Hz vblanks).
+    const u64 limit_vblanks = [] {
+        const char* v = std::getenv("SOTC_FPS_LIMIT");
+        const long fps = v ? std::strtol(v, nullptr, 10) : 0;
+        return fps > 0 ? std::max<u64>(1, EmulatorSettings.GetVblankFrequency() / u64(fps)) : u64{0};
+    }();
     u64 last_flip_vblank = 0;
     bool flipped = false;
 
@@ -832,8 +840,10 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         bool take_request;
         if (!flip_pacing) {
             take_request = vblank_status.count % (flip_rate + 1) == 0;
-        } else if (flip_rate <= 0 || !flipped) {
+        } else if (!flipped) {
             take_request = true;
+        } else if (flip_rate <= 0) {
+            take_request = limit_vblanks == 0 || vblank_status.count - last_flip_vblank >= limit_vblanks;
         } else {
             const u64 interval = u64(flip_rate + 1) * vblanks_per_60hz;
             take_request = vblank_status.count - last_flip_vblank >= interval;

@@ -119,7 +119,7 @@ def windows_language():
 # Settings, passed to sotc.py as environment variables.
 
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
-                'user_dir': '', 'af16': True, 'fps60': False, 'fullscreen': False,
+                'user_dir': '', 'af16': True, 'fps60': False, 'fps_mode': '30', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
                 'readbacks': '', 'extra_env': '', 'close_on_play': False, 'gamepad': '',
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
@@ -193,6 +193,11 @@ OUTPUTS = [('1280x720', ('1280 × 720 (720p)', '1280 × 720 (720p)')), ('1920x10
            ('2560x1440', ('2560 × 1440 (1440p)', '2560 × 1440 (1440p)')), ('3840x2160', ('3840 × 2160 (4K)', '3840 × 2160 (4K)'))]
 UPSCALERS = [('fsr1', ('FSR 1 (AMD, qualquer placa)', 'FSR 1 (AMD, any GPU)')),
              ('bilinear', ('Bilinear (simples)', 'Bilinear (plain)'))]
+# Frame rate: 30 (the game's cap, as on PS4), 60 (the cap off, at most one frame per two 120 Hz
+# vblanks: SOTC_FPS_LIMIT=60) or unlimited.
+FPS_MODES = [('30', ('30 FPS (como no PS4)', '30 FPS (as on PS4)')),
+             ('60', ('60 FPS (sem o limite do jogo)', '60 FPS (game cap off)')),
+             ('unlimited', ('Ilimitado (acima de 60)', 'Unlimited (above 60)'))]
 # Frame generation (bb-probe: SOTC_FRAMEGEN; F8 in game switches off / DLSS-G / FSR 3).
 FRAMEGEN = [('off', ('Desligada', 'Off')),
             ('auto', ('Automática (DLSS-G ou FSR 3, experimental)', 'Automatic (DLSS-G or FSR 3, experimental)')),
@@ -324,6 +329,8 @@ def load_settings():
     the extra variables get the frame generation setting instead."""
     saved = load_json(CONFIG_FILE, {})
     settings = {**APP_DEFAULTS, **saved}
+    if 'fps_mode' not in saved:  # before the choice: the "uncapped FPS" box
+        settings['fps_mode'] = '60' if saved.get('fps60') else '30'
     if 'framegen' not in saved:
         extra = str(settings.get('extra_env', '')).split()
         if 'SOTC_DLSSG=1' in extra:
@@ -364,8 +371,10 @@ def game_environment(s):
         env['SOTC_DLC_DIR'] = s['dlc_dir']
     env['SOTC_MODES'] = 'af16' if s.get('af16') else ''
     # The 30 FPS cap is applied or not by bb-probe (sotc_fps_cap.h), F7 switches it in game: no
-    # fps60 code patch, vblanks at 120 Hz in both cases.
-    env['SOTC_FPS_CAP'] = 'off' if s.get('fps60') else '30'
+    # fps60 code patch, vblanks at 120 Hz in every mode; 60 FPS limits the uncapped game.
+    fps_mode = s.get('fps_mode') or '30'
+    env['SOTC_FPS_CAP'] = '30' if fps_mode == '30' else 'off'
+    env['SOTC_FPS_LIMIT'] = '60' if fps_mode == '60' else '0'
     env['BB_VBLANK_HZ'] = '120'
     env['BB_FULLSCREEN'] = '1' if s['fullscreen'] else '0'
     env['BB_PRESENT_MODE'] = s['present_mode']
@@ -741,10 +750,10 @@ class Launcher:
         self.row(quick, _('Saída', 'Output'), self.choice(quick, 'output_res', OUTPUTS, 24))
         self.row(quick, _('Upscaler', 'Upscaler'), self.choice(quick, 'upscaler', UPSCALERS, 24))
         self.row(quick, _('Geração de quadros', 'Frame generation'), self.choice(quick, 'framegen', FRAMEGEN, 24))
-        self.check(quick, 'fps60', _('FPS desbloqueados (F7 no jogo)', 'Uncapped FPS (F7 in game)'))
+        self.row(quick, _('FPS', 'FPS'), self.choice(quick, 'fps_mode', FPS_MODES, 24))
         self.check(quick, 'af16', _('Texturas nítidas (filtro 16x)', 'Sharp textures (16x filtering)'))
         self.check(quick, 'fullscreen', _('Tela cheia', 'Fullscreen'))
-        for key in ('af16', 'fps60', 'fullscreen', 'output_res', 'upscaler', 'framegen'):
+        for key in ('af16', 'fps_mode', 'fullscreen', 'output_res', 'upscaler', 'framegen'):
             self.vars[key].trace_add('write', lambda *_a: self.refresh_status())
 
     def draw_banner(self):
@@ -867,11 +876,15 @@ class Launcher:
         self.check(f, 'af16', _('Texturas nítidas (filtro anisotrópico 16x)', 'Sharp textures (16x anisotropic filtering)'),
                    _('Chão, grama e rochas ficam nítidos à distância, quase sem custo.',
                      'Ground, grass and rocks stay sharp at a distance, at almost no cost.'))
-        self.check(f, 'fps60', _('FPS desbloqueados (F7 no jogo)', 'Uncapped FPS (F7 in game)'),
-                   _('Começa sem o limite de 30 FPS do jogo (40 a 60 FPS conforme a região, num processador '
-                     'rápido). No jogo, F7 liga e desliga o limite a qualquer momento.',
-                     'Starts without the game\'s 30 FPS cap (40 to 60 FPS depending on the area, with a fast '
-                     'CPU). In game, F7 turns the cap on and off at any time.'))
+        self.row(f, _('FPS', 'FPS'), self.choice(f, 'fps_mode', FPS_MODES),
+                 _('30: o limite do próprio jogo, como no PS4 (a física é feita para ele). 60: sem o limite do '
+                   'jogo, no máximo 60 (40 a 60 conforme a região, num processador rápido). Ilimitado: acima de '
+                   '60 em telas rápidas. Sem o limite, algumas cenas podem se comportar diferente. No jogo, F7 '
+                   'liga e desliga o limite de 30 a qualquer momento.',
+                   '30: the game\'s own cap, as on PS4 (its physics are made for it). 60: the game\'s cap off, at '
+                   'most 60 (40 to 60 depending on the area, with a fast CPU). Unlimited: above 60 on fast '
+                   'screens. Without the cap some scenes may behave differently. In game, F7 turns the 30 FPS '
+                   'cap on and off at any time.'))
         self.row(f, _('Geração de quadros', 'Frame generation'), self.choice(f, 'framegen', FRAMEGEN),
                  _('Uma imagem gerada entre duas do jogo: com 30 FPS (limite ligado) a tela mostra 60. DLSS-G: '
                    'NVIDIA RTX 40/50. FSR 3: qualquer placa (RTX 20/30, AMD, Intel). Automática: DLSS-G se a '
@@ -1107,7 +1120,7 @@ class Launcher:
                                                                      'Choose the game folder first.'), fg=MUTED)
 
     def summary(self):
-        parts = [_('FPS desbloqueados', 'uncapped FPS') if self.var('fps60').get() else _('30 FPS (como no PS4)', '30 FPS (as on PS4)'),
+        parts = [dict((k, _(*v)) for k, v in FPS_MODES).get(self.var('fps_mode').get(), '30 FPS'),
                  self.var('output_res').get().replace('x', ' × '),
                  'FSR 1' if self.var('upscaler').get() == 'fsr1' else 'bilinear']
         framegen = self.var('framegen').get()

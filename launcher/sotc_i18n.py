@@ -909,3 +909,17 @@ TRANSLATIONS = {
         "O jogo está rodando.": "Игра запущена.",
     },
 }
+
+# Added after the first translation pass.
+TRANSLATIONS['es']["60 FPS (sem o limite do jogo)"] = "60 FPS (sin el límite del juego)"
+TRANSLATIONS['zh']["60 FPS (sem o limite do jogo)"] = "60 FPS（取消游戏限制）"
+TRANSLATIONS['ko']["60 FPS (sem o limite do jogo)"] = "60 FPS (게임 제한 해제)"
+TRANSLATIONS['ru']["60 FPS (sem o limite do jogo)"] = "60 FPS (без ограничения игры)"
+TRANSLATIONS['es']["Ilimitado (acima de 60)"] = "Ilimitado (más de 60)"
+TRANSLATIONS['zh']["Ilimitado (acima de 60)"] = "不限（高于 60）"
+TRANSLATIONS['ko']["Ilimitado (acima de 60)"] = "무제한 (60 이상)"
+TRANSLATIONS['ru']["Ilimitado (acima de 60)"] = "Без ограничения (выше 60)"
+TRANSLATIONS['es']["30: o limite do próprio jogo, como no PS4 (a física é feita para ele). 60: sem o limite do jogo, no máximo 60 (40 a 60 conforme a região, num processador rápido). Ilimitado: acima de 60 em telas rápidas. Sem o limite, algumas cenas podem se comportar diferente. No jogo, F7 liga e desliga o limite de 30 a qualquer momento."] = "30: el límite del propio juego, como en PS4 (su física está hecha para él). 60: sin el límite del juego, como máximo 60 (40 a 60 según la zona, con un procesador rápido). Ilimitado: más de 60 en pantallas rápidas. Sin el límite, algunas escenas pueden comportarse distinto. En el juego, F7 activa y desactiva el límite de 30 en cualquier momento."
+TRANSLATIONS['zh']["30: o limite do próprio jogo, como no PS4 (a física é feita para ele). 60: sem o limite do jogo, no máximo 60 (40 a 60 conforme a região, num processador rápido). Ilimitado: acima de 60 em telas rápidas. Sem o limite, algumas cenas podem se comportar diferente. No jogo, F7 liga e desliga o limite de 30 a qualquer momento."] = "30：游戏自身的限制，与 PS4 相同（物理效果按此设计）。60：取消游戏限制，最高 60（取决于区域，在快速处理器上为 40 到 60）。不限：在高刷新率屏幕上高于 60。取消限制后，某些场景的表现可能不同。游戏中可随时按 F7 开关 30 FPS 限制。"
+TRANSLATIONS['ko']["30: o limite do próprio jogo, como no PS4 (a física é feita para ele). 60: sem o limite do jogo, no máximo 60 (40 a 60 conforme a região, num processador rápido). Ilimitado: acima de 60 em telas rápidas. Sem o limite, algumas cenas podem se comportar diferente. No jogo, F7 liga e desliga o limite de 30 a qualquer momento."] = "30: 게임 자체 제한, PS4와 동일 (물리가 이에 맞춰져 있음). 60: 게임 제한 해제, 최대 60 (빠른 CPU에서 지역에 따라 40~60). 무제한: 빠른 화면에서 60 이상. 제한이 없으면 일부 장면이 다르게 동작할 수 있습니다. 게임 중 F7로 30 제한을 언제든지 켜고 끌 수 있습니다."
+TRANSLATIONS['ru']["30: o limite do próprio jogo, como no PS4 (a física é feita para ele). 60: sem o limite do jogo, no máximo 60 (40 a 60 conforme a região, num processador rápido). Ilimitado: acima de 60 em telas rápidas. Sem o limite, algumas cenas podem se comportar diferente. No jogo, F7 liga e desliga o limite de 30 a qualquer momento."] = "30: собственное ограничение игры, как на PS4 (под него сделана физика). 60: без ограничения игры, не больше 60 (от 40 до 60 в зависимости от места, на быстром процессоре). Без ограничения: выше 60 на быстрых экранах. Без ограничения некоторые сцены могут вести себя иначе. В игре F7 в любой момент включает и выключает ограничение 30."

@@ -59,7 +59,8 @@ def run_role(argv):
     attach_stdio()
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(line_buffering=True)
+            # UTF-8 whatever the Windows code page (gbk etc. cannot print the game title's ™).
+            stream.reconfigure(line_buffering=True, encoding='utf-8', errors='replace')
         except (AttributeError, ValueError):
             pass
     if argv[0] == '--script':

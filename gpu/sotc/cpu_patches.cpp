@@ -2265,11 +2265,181 @@ u64 PatchShortSse4aInstructions(u64 segment_addr, u64 segment_size,
     return patched_count;
 }
 
+// sotc: rdtsc reads `clock` (host Win64 ABI) instead. The 2-byte rdtsc and the instructions
+// after it move to a trampoline that steps over the guest red zone, keeps every register the
+// host call may clobber (flags and xmm0-5 included) and returns the value in edx:eax as rdtsc.
+static void GenerateClockCall(Xbyak::CodeGenerator& c, void* clock) {
+    c.lea(rsp, ptr[rsp - GuestRedZoneSize]);
+    c.pushfq();
+    c.push(rcx);
+    c.push(r8);
+    c.push(r9);
+    c.push(r10);
+    c.push(r11);
+    c.push(rbx);
+    c.mov(rbx, rsp);
+    c.and_(rsp, -16);
+    c.sub(rsp, 32 + 6 * 16);
+    for (int i = 0; i < 6; ++i) {
+        c.movdqu(ptr[rsp + 32 + i * 16], Xbyak::Xmm(i));
+    }
+    c.mov(rax, reinterpret_cast<uintptr_t>(clock));
+    c.call(rax);
+    for (int i = 0; i < 6; ++i) {
+        c.movdqu(Xbyak::Xmm(i), ptr[rsp + 32 + i * 16]);
+    }
+    c.mov(rsp, rbx);
+    c.mov(rdx, rax);
+    c.shr(rdx, 32);
+    c.mov(eax, eax);
+    c.pop(rbx);
+    c.pop(r11);
+    c.pop(r10);
+    c.pop(r9);
+    c.pop(r8);
+    c.pop(rcx);
+    c.popfq();
+    c.lea(rsp, ptr[rsp + GuestRedZoneSize]);
+}
+
+u64 PatchRdtscInstructions(u64 segment_addr, u64 segment_size,
+                           std::span<const uintptr_t> function_starts, void* clock,
+                           u64* unpatched) {
+    *unpatched = 0;
+    auto* module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
+    if (module == nullptr || function_starts.empty() || clock == nullptr) {
+        return 0;
+    }
+
+    const uintptr_t segment_end = segment_addr + segment_size;
+    std::vector<uintptr_t> starts;
+    for (const uintptr_t start : function_starts) {
+        if (start >= segment_addr && start < segment_end) {
+            starts.push_back(start);
+        }
+    }
+    std::ranges::sort(starts);
+    starts.erase(std::ranges::unique(starts).begin(), starts.end());
+
+    const auto contains_rdtsc = [](uintptr_t begin, uintptr_t end) {
+        const u8* bytes = reinterpret_cast<const u8*>(begin);
+        for (uintptr_t i = 0; i + 2 <= end - begin; ++i) {
+            if (bytes[i] == 0x0F && bytes[i + 1] == 0x31) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    u64 patched_count = 0;
+    std::unique_lock lock{module->mutex};
+    for (size_t index = 0; index < starts.size(); ++index) {
+        const uintptr_t function_start = starts[index];
+        const uintptr_t function_end = index + 1 < starts.size() ? starts[index + 1] : segment_end;
+        if (function_end <= function_start || !contains_rdtsc(function_start, function_end)) {
+            continue;
+        }
+
+        const auto function =
+            DecodeFunction(function_start, function_end, segment_addr, segment_end);
+        uintptr_t covered_until = 0;
+        for (const auto& [site, site_decoded] : function.instructions) {
+            if (site < covered_until || site_decoded.instruction.mnemonic != ZYDIS_MNEMONIC_RDTSC ||
+                module->patched.contains(reinterpret_cast<u8*>(site))) {
+                continue;
+            }
+
+            // Same span rules as the short SSE4a patch: no branch target after the first
+            // instruction and no control flow inside.
+            std::vector<const DecodedCodeInstruction*> span;
+            uintptr_t continuation = site;
+            const char* reason = "";
+            while (continuation - site < NearJumpSize) {
+                const auto it = function.instructions.find(continuation);
+                if (it == function.instructions.end()) {
+                    reason = "not decoded";
+                } else if (continuation != site &&
+                           function.branch_targets.contains(continuation)) {
+                    reason = "branch target inside span";
+                } else if (it->second.instruction.meta.category == ZYDIS_CATEGORY_CALL ||
+                           IsControlFlowTerminator(it->second.instruction) ||
+                           it->second.instruction.meta.category == ZYDIS_CATEGORY_COND_BR) {
+                    reason = "control flow inside span";
+                } else if (continuation != site &&
+                           (it->second.instruction.mnemonic == ZYDIS_MNEMONIC_RDTSC ||
+                            FindMatchingPatch(it->second) != nullptr)) {
+                    reason = "another patched instruction inside span";
+                } else if (module->patched.contains(reinterpret_cast<u8*>(continuation))) {
+                    reason = "already patched";
+                }
+                if (*reason != '\0') {
+                    break;
+                }
+                span.push_back(&it->second);
+                continuation += it->second.instruction.length;
+            }
+            if (*reason != '\0') {
+                LOG_WARNING(Core, "rdtsc at {:#x} left on the host TSC: {}", site, reason);
+                ++*unpatched;
+                continue;
+            }
+
+            auto& trampoline_gen = module->trampoline_gen;
+            const size_t trampoline_offset = trampoline_gen.getSize();
+            if (module->trampoline_exhausted) {
+                ++*unpatched;
+                continue;
+            }
+            const auto* trampoline = trampoline_gen.getCurr();
+            bool valid = true;
+            try {
+                GenerateClockCall(trampoline_gen, clock);
+                for (size_t i = 1; i < span.size() && valid; ++i) {
+                    valid = EncodeRelocatedInstruction(*span[i], trampoline_gen);
+                }
+                if (valid) {
+                    trampoline_gen.jmp(reinterpret_cast<void*>(continuation));
+                }
+            } catch (const Xbyak::Error& error) {
+                trampoline_gen.setSize(trampoline_offset);
+                if (HandleTrampolineError(module, error)) {
+                    ++*unpatched;
+                    continue;
+                }
+                throw;
+            }
+            if (!valid) {
+                trampoline_gen.setSize(trampoline_offset);
+                LOG_WARNING(Core, "rdtsc at {:#x} left on the host TSC: cannot relocate", site);
+                ++*unpatched;
+                continue;
+            }
+
+            auto& patch_gen = module->patch_gen;
+            patch_gen.reset();
+            patch_gen.setSize(site - reinterpret_cast<uintptr_t>(patch_gen.getCode()));
+            patch_gen.jmp(trampoline, Xbyak::CodeGenerator::LabelType::T_NEAR);
+            patch_gen.nop(continuation - site - NearJumpSize);
+            for (const auto* decoded : span) {
+                module->patched.insert(reinterpret_cast<u8*>(decoded->address));
+            }
+            covered_until = continuation;
+            ++patched_count;
+        }
+    }
+    return patched_count;
+}
+
 #else
 
 RedZonePatchResult PatchRedZoneMemoryInstructions(u64, u64, std::span<const uintptr_t>,
                                                   std::span<const uintptr_t>) {
     return {};
+}
+
+u64 PatchRdtscInstructions(u64, u64, std::span<const uintptr_t>, void*, u64* unpatched) {
+    *unpatched = 0;
+    return 0;
 }
 
 bool NeedsSse4aEmulation() {

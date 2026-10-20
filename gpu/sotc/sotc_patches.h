@@ -16,10 +16,12 @@ typedef struct {
     uint32_t segment_count;
     const uint64_t *red_zone_functions; /* function offsets to protect */
     uint32_t red_zone_count;
+    void *tsc_clock;          /* non-null: rdtsc reads this host function (cores disagree on the TSC) */
 } SotcPatchRequest;
 typedef struct {
     int needs_sse4a;
     uint64_t function_starts, short_sse4a, red_zone_functions, red_zone_instructions;
+    uint64_t rdtsc, rdtsc_unpatched;
 } SotcPatchResult;
 int sotc_patch_eboot(const SotcPatchRequest *request, SotcPatchResult *result);
 int sotc_handle_illegal(void *exception_pointers);

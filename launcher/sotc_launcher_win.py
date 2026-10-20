@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import runpy
 import shutil
 import subprocess
@@ -1712,6 +1713,38 @@ class Launcher:
                              'cached': cached, 'seen': cached, 'done': None}
         self.root.after(1000, self.precompile_tick)
 
+    def last_save(self):
+        """(title, modified time) of the newest progress save, from its param.bin (the text the
+        game's load menu shows, e.g. "Shrine of Worship - 1 Defeated - Normal"), or None."""
+        saves = sorted(self.saves_folder().glob('SAVEDATA0ShadowProgress*.sce_sys/param.bin'),
+                       key=lambda p: p.stat().st_mtime)
+        if not saves:
+            return None
+        text = saves[-1].read_bytes().decode('utf-8', errors='replace')
+        found = re.search(r'[^\x00�]{3,}\d+ Defeated[^\x00�]*', text)
+        return (found.group(0).strip() if found else saves[-1].parent.name.replace('.sce_sys', ''),
+                saves[-1].stat().st_mtime)
+
+    def report_crash(self, code):
+        """The game ended on an error: what was kept (the last save) and where the logs are."""
+        try:
+            save = self.last_save()
+        except OSError:
+            save = None
+        if save:
+            minutes = max(0, int((time.time() - save[1]) // 60))
+            kept = _('O progresso fica como no último save: "{}", gravado às {} (há {} min).',
+                     'Your progress is as of the last save: "{}", written at {} ({} min ago).').format(
+                         save[0], time.strftime('%H:%M', time.localtime(save[1])), minutes)
+        else:
+            kept = _('Não há save de progresso ainda.', 'There is no progress save yet.')
+        self.messagebox.showwarning('Shadow of the Colossus', _(
+            'O jogo fechou por um erro (código {:#x}).\n\n{}\n\nO registro e o dump da queda ficam em '
+            '{}; anexe-os numa issue para ajudar a corrigir.',
+            'The game closed because of an error (code {:#x}).\n\n{}\n\nThe log and the crash dump '
+            'are in {}; attach them to an issue to help fix it.').format(
+                code & 0xffffffff, kept, user_dir(self.app) / 'crashes'))
+
     def offer_precompile(self):
         if self.messagebox.askyesno('Shadow of the Colossus', _(
                 'O cache de shaders foi refeito nesta partida (versão nova do port, do driver ou outra '
@@ -1794,8 +1827,8 @@ class Launcher:
                 pass
             if not self.stopping:
                 keep_crash_log(log_dir, code)
-        self.stopping = False
-        self.output.put((code,))
+        stopped, self.stopping = self.stopping, False
+        self.output.put((code, stopped))
 
     def drain_output(self):
         while not self.ui_calls.empty():
@@ -1810,9 +1843,12 @@ class Launcher:
                         self.job.close()
                     self.stop_button.configure(state='disabled')
                     self.refresh_status()
+                    code, stopped = item
                     if self.precompiling:
-                        self.precompile_finished(item[0])
-                    elif self.cache_rebuilt:
+                        self.precompile_finished(code)
+                    elif code != 0 and not stopped:
+                        self.report_crash(code)
+                    elif self.cache_rebuilt and code == 0:
                         self.offer_precompile()
                     self.cache_rebuilt = False
                 else:

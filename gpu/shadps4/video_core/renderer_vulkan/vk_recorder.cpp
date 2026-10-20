@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // sotc: taken from Pink-shadPS4 0.4.0 (luizgustavs), cp_record_thread; scheduler hooks in vk_scheduler.cpp.
 
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -865,9 +866,24 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
     // sotc: SOTC_REC_SLEEP_US sets the idle wait. On Windows the default 500 us rounds to 0 and the
     // thread spins: 61.1 vs 57.7 FPS on the attract demo (i9-13900K + RTX 2060 SUPER) against a
     // 2 ms sleep (PR #81, jownatan), which frees the core on laptops and APUs (set 2000 there).
+    // With 8 logical processors or fewer the default is that 2 ms sleep: the spinning recorder took
+    // a whole core the game needs. Attract demo on a Ryzen 7 5700X held to 4 logical processors:
+    // stuck loading while it spun, 77 FPS sleeping; at 8 and 16 the two were even.
     static const auto SleepTime = [] {
         const char* v = std::getenv("SOTC_REC_SLEEP_US");
-        return std::chrono::microseconds{v ? std::strtol(v, nullptr, 10) : 500};
+        u32 logical = std::thread::hardware_concurrency();
+#ifdef _WIN32
+        DWORD_PTR process_mask = 0, system_mask = 0;
+        if (GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask) &&
+            process_mask) {
+            logical = std::popcount(static_cast<u64>(process_mask));
+        }
+#endif
+        const auto sleep = std::chrono::microseconds{
+            v ? std::strtol(v, nullptr, 10) : (logical && logical <= 8 ? 2000 : 500)};
+        LOG_WARNING(Render_Vulkan, "GPU recorder: {} logical processors, idle wait {} us", logical,
+                    sleep.count());
+        return sleep;
     }();
 
     Chunk* chunk = first_chunk;

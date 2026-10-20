@@ -78,6 +78,10 @@ public:
         std::vector<u32> tcs{};
         std::vector<u32> tes{};
         std::vector<u32> fragment{};
+        /// sotc: Profile::barycentric_via_gs (EmitBarycentricGeometryShader). Stored only in the
+        /// caches of that profile (with_gs), so the other caches keep their format.
+        std::vector<u32> gs{};
+        static inline bool with_gs{};
 
         void Serialize(Serialization::Archive& ar) const;
         bool Deserialize(Serialization::Archive& ar);

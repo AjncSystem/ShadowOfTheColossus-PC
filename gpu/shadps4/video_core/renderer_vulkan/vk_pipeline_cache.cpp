@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdlib>
+#include <cstring>
 #include <ranges>
 #include <xxhash.h>
 
@@ -336,6 +337,26 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // off, the shadows next to the Wander and Agro on grass get horizontal stripes; on, the
     // image is right and the characters are not black in the shade (save with 5 colossi).
     Shader::Optimization::SetWave64UniformBranchesDefault(true);
+    // sotc: SotC interpolates most pixel shader inputs by hand from their three vertex values.
+    // Without fragment shader barycentrics (NVIDIA GTX 10xx: no textures, black geometry, issues
+    // #57/#68/#102) an auxiliary geometry shader provides them (SOTC_BARYCENTRIC_GS=0 turns it
+    // off). SOTC_NO_BARYCENTRIC=1 acts as if the GPU had neither extension, to test that path.
+    const auto env_is = [](const char* name, const char* value) {
+        const char* v = std::getenv(name);
+        return v && std::strcmp(v, value) == 0;
+    };
+    const bool no_barycentric = env_is("SOTC_NO_BARYCENTRIC", "1");
+    const bool khr_barycentric = instance_.IsFragmentShaderBarycentricSupported() && !no_barycentric;
+    const bool amd_explicit_vertex =
+        instance_.IsAmdShaderExplicitVertexParameterSupported() && !no_barycentric;
+    const bool barycentric_via_gs = !khr_barycentric && !amd_explicit_vertex &&
+                                    instance.IsGeometryStageSupported() &&
+                                    instance.GetDriverID() == vk::DriverId::eNvidiaProprietary &&
+                                    !env_is("SOTC_BARYCENTRIC_GS", "0");
+    if (barycentric_via_gs) {
+        LOG_WARNING(Render_Vulkan, "No fragment shader barycentrics: emulated by a geometry shader");
+    }
+    GraphicsPipeline::SerializationSupport::with_gs = barycentric_via_gs;
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),
         .max_viewport_height = instance.GetMaxViewportHeight(),
@@ -377,11 +398,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supports_shared_int64_atomics = instance_.IsSharedInt64AtomicsSupported(),
         .supports_workgroup_explicit_memory_layout =
             instance_.IsWorkgroupMemoryExplicitLayoutSupported(),
-        .supports_amd_shader_explicit_vertex_parameter =
-            instance_.IsAmdShaderExplicitVertexParameterSupported(),
-        .supports_fragment_shader_barycentric = instance_.IsFragmentShaderBarycentricSupported(),
+        .supports_amd_shader_explicit_vertex_parameter = amd_explicit_vertex,
+        .supports_fragment_shader_barycentric = khr_barycentric || barycentric_via_gs,
         .supports_shader_subgroup_clock = instance_.IsShaderSubgroupClockSupported(),
-        .needs_manual_interpolation = instance.IsFragmentShaderBarycentricSupported() &&
+        .needs_manual_interpolation = khr_barycentric &&
                                       instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         // sotc: also whenever the shaders are lowered for fewer than 64 lanes (AMD on the 32-wide
         // path): without the barriers the GPU hung ~2 min into the intro (issue #7).
@@ -392,6 +412,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
+        .barycentric_via_gs = barycentric_via_gs,
     };
     WarmUp();
 

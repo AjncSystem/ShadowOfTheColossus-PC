@@ -16,9 +16,21 @@
 namespace Vulkan::HostPasses {
 
 void PostProcessingPass::Create(vk::Device device, const vk::Format surface_format) {
-    boost::container::static_vector<vk::DescriptorSetLayoutBinding, 2> bindings{
+    boost::container::static_vector<vk::DescriptorSetLayoutBinding, 3> bindings{
         {
             .binding = 0,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eFragment,
+        },
+        {
+            .binding = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eFragment,
+        },
+        {
+            .binding = 2,
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
             .descriptorCount = 1,
             .stageFlags = vk::ShaderStageFlagBits::eFragment,
@@ -182,7 +194,8 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
 }
 
 void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
-                                vk::Extent2D input_size, Frame& frame, Settings settings) {
+                                vk::Extent2D input_size, Frame& frame, Settings settings,
+                                vk::ImageView ui, vk::ImageView sky) {
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
             .pLabelName = "Host/Post processing",
@@ -219,6 +232,19 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         .imageView = input,
         .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
     };
+    vk::DescriptorImageInfo ui_info{
+        .sampler = *sampler,
+        .imageView = ui ? ui : input,
+        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+    };
+    vk::DescriptorImageInfo sky_info{
+        .sampler = *sampler,
+        .imageView = sky ? sky : input,
+        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+    };
+    if (!sky) {
+        settings.sky_sharpen = 0.0f;
+    }
 
     const std::array set_writes{
         vk::WriteDescriptorSet{
@@ -228,6 +254,22 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
             .descriptorCount = 1,
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
             .pImageInfo = &image_info,
+        },
+        vk::WriteDescriptorSet{
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 1,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &ui_info,
+        },
+        vk::WriteDescriptorSet{
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 2,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &sky_info,
         },
     };
 

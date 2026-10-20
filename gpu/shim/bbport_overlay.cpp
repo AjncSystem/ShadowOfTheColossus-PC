@@ -739,7 +739,26 @@ void LoadingScreen() {
     ImGui::End();
 }
 
-void FpsCounter() {
+std::atomic<const char*> upscaler_label{nullptr};
+
+// sotc: the upscaler shown while comparing DLSS with FSR1 (F9, vk_dlssg.cpp), top right,
+// below the FPS counter when it is shown (fps_bottom: its lower edge this frame, else 0).
+void UpscalerLabel(const char* label, float fps_bottom) {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float pad = 12.0f * base_scale;
+    const float top = fps_bottom > 0.0f ? fps_bottom + pad * 0.5f : viewport->WorkPos.y + pad;
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - pad, top),
+                            ImGuiCond_Always, ImVec2(1.0f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.5f);
+    ImGui::Begin("##upscaler", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoFocusOnAppearing);
+    ImGui::Text("%s  (F9)", label);
+    ImGui::End();
+}
+
+float FpsCounter() {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     const float pad = 12.0f * base_scale;
     ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - pad,
@@ -848,7 +867,9 @@ void FpsCounter() {
     }
     ImGui::TextDisabled(SotcUi::T("F7: %s   F8: geração de quadros   F10: esconder", "F7: %s   F8: frame generation   F10: hide"),
                         SotcFpsCap::uncapped ? SotcUi::T("FPS livres", "FPS uncapped") : SotcUi::T("travado em 30", "capped at 30"));
+    const float bottom = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y;
     ImGui::End();
+    return bottom;
 }
 
 void Toast() {
@@ -1195,7 +1216,12 @@ bool LoadingShown() {
 
 bool Visible() {
     return initialized && (menu_open || text_entry_active || list_active || OverlayOn() ||
-                           ToastShown() || LoadingShown());
+                           ToastShown() || LoadingShown() ||
+                           upscaler_label.load(std::memory_order_relaxed));
+}
+
+void SetUpscalerLabel(const char* label) {
+    upscaler_label.store(label, std::memory_order_relaxed);
 }
 
 bool CapturesInput() {
@@ -1326,11 +1352,15 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
     if (menu_open) {
         Menu();
     }
+    float fps_bottom = 0.0f;
     if (OverlayOn() && !menu_open) {
-        FpsCounter();
+        fps_bottom = FpsCounter();
     }
     if (ToastShown()) {
         Toast();
+    }
+    if (const char* label = upscaler_label.load(std::memory_order_relaxed)) {
+        UpscalerLabel(label, fps_bottom);
     }
     if (text_entry_active) {
         TextEntryBox();

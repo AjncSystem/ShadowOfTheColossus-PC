@@ -295,10 +295,6 @@ if (WIN32)
     target_link_options(bb-probe PRIVATE -Wl,--disable-high-entropy-va "SHELL:-Xlinker --stack -Xlinker 16777216,16777216")
     add_executable(bb-gpu-capabilities ../tools/gpu_capabilities.c ../packaging/windows/bb-gpu-capabilities.rc)
     target_link_libraries(bb-gpu-capabilities PRIVATE Vulkan::Vulkan)
-    # "Play Bloodborne.exe": the game with the launcher's saved settings, no launcher window.
-    add_executable(bb-play WIN32 ../packaging/windows/play.c ../packaging/windows/play.rc)
-    target_compile_options(bb-play PRIVATE -municode)
-    target_link_options(bb-play PRIVATE -municode)
 endif()
 
 # Explicit test targets; neither launches the game nor needs a Vulkan device.
@@ -339,7 +335,6 @@ target_include_directories(barycentric-gs-test PRIVATE shim shadps4 third_party/
 target_compile_options(barycentric-gs-test PRIVATE -UNDEBUG -fPIC)
 target_link_libraries(barycentric-gs-test PRIVATE bbgpu)
 
-# bbport: FSR 4 benchmark outside the game (tools/fsr4_bench.cpp): ninja -C out/gpu fsr4-bench.
 add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_support.cpp
     shim/bbport_settings.cpp)
 target_include_directories(upscaler-support-test PRIVATE shim)

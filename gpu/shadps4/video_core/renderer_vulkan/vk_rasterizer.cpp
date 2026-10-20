@@ -439,7 +439,11 @@ static bool SkipStaggeredShadow(const Regs& regs) {
     return slice == 2 ? (frame & 1) != 0 : slice == 3 ? (frame & 1) == 0 : false;
 }
 
-// sotc: SOTC_SHADOW_REUSE (default 1; 0 = off, check = verify once and save the result): the far
+// sotc: SOTC_SHADOW_REUSE (default 0 = off; 1 = on, check = verify once and save the result). Off
+// by default: with it, far shadows on the ground blink at 15 Hz with a still camera (the Shrine:
+// a rock's shadow there on drawn frames, gone on moved ones; 0.36% of the pixels flicker per
+// frame against 0.01% off). SOTC_SHADOW_STAGGER, which only skips, blinks the same, so the game
+// does not keep a skipped cascade's texels until the next frame. When on: the far
 // sun shadow cascades (slices 2 and 3 of the sun shadow map, the square depth target with the
 // most draws in the previous frame; ~2000 draws each) are drawn on alternate frames, and on the
 // other frames last frame's cascade is moved instead (vk_shadow_scroll.h). The engine snaps its
@@ -475,7 +479,7 @@ bool Rasterizer::ReuseShadowCascade() {
     static const int mode = [] {
         const char* v = std::getenv("SOTC_SHADOW_REUSE");
         if (!v) {
-            return 1;
+            return 0;
         }
         return v[0] == '0' ? 0 : (v[0] == 'c' ? 2 : 1);
     }();

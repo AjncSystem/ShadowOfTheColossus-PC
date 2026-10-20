@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
 #include <cstdlib>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
@@ -117,6 +118,18 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
     ASSERT_MSG(num_physical_devices > 0, "No physical devices found");
     LOG_INFO(Render_Vulkan, "Found {} physical devices", num_physical_devices);
 
+    // sotc: SOTC_GPU_VENDOR=<PCI vendor id, hex> picks the first device of that vendor
+    // (8086 Intel, 10de NVIDIA, 1002 AMD); laptops enumerate their GPUs in no fixed order.
+    if (const char* vendor = std::getenv("SOTC_GPU_VENDOR"); vendor && physical_device_index < 0) {
+        const u32 id = static_cast<u32>(std::strtoul(vendor, nullptr, 16));
+        for (size_t i = 0; i < num_physical_devices; ++i) {
+            if (physical_devices[i].getProperties().vendorID == id) {
+                physical_device_index = static_cast<s32>(i);
+                break;
+            }
+        }
+    }
+
     if (physical_device_index < 0) {
         std::vector<
             std::tuple<size_t, vk::PhysicalDeviceProperties2, vk::PhysicalDeviceMemoryProperties>>
@@ -177,6 +190,15 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
     format_properties = GetFormatProperties(physical_device);
     properties = physical_device.getProperties();
     memory_properties = physical_device.getMemoryProperties();
+    // sotc: in the session log, so that issue reports show the GPU and driver.
+    std::fprintf(stderr, "GPU sparse: binding %d, residency buffer %d, non-resident strict %d\n",
+                 int(physical_device.getFeatures().sparseBinding),
+                 int(physical_device.getFeatures().sparseResidencyBuffer),
+                 int(properties.sparseProperties.residencyNonResidentStrict));
+    std::fprintf(stderr, "GPU: %s (vendor %04x, driver %s, Vulkan %u.%u)\n",
+                 properties.deviceName.data(), properties.vendorID,
+                 GetDriverVersionName().c_str(), VK_VERSION_MAJOR(properties.apiVersion),
+                 VK_VERSION_MINOR(properties.apiVersion));
     CollectDeviceParameters();
     ASSERT_MSG(properties.apiVersion >= TargetVulkanApiVersion,
                "Vulkan {}.{} is required, but only {}.{} is supported by device!",
@@ -276,6 +298,11 @@ bool Instance::CreateDevice() {
     vk13_props = properties_chain.get<vk::PhysicalDeviceVulkan13Properties>();
     push_descriptor_props = properties_chain.get<vk::PhysicalDevicePushDescriptorPropertiesKHR>();
     LOG_INFO(Render_Vulkan, "Physical device subgroup size {}", vk11_props.subgroupSize);
+    // sotc: in the session log; the wave64 lowering depends on it.
+    std::fprintf(stderr, "GPU subgroups: size %u, min %u, max %u, control %d, required stages %#x\n",
+                 vk11_props.subgroupSize, vk13_props.minSubgroupSize, vk13_props.maxSubgroupSize,
+                 int(vk13_features.subgroupSizeControl),
+                 u32(vk13_props.requiredSubgroupSizeStages));
 
     if (available_extensions.empty()) {
         LOG_CRITICAL(Render_Vulkan, "No extensions supported by device.");

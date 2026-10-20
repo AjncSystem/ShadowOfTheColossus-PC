@@ -42,6 +42,9 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 | 0.29 | PRs da comunidade (20/10) | ✅ | #169 texturas GTX 10xx (Lucas), #174 relógio por QPC (Einar), #177 FSR 3 RX 7000 (KingJhoss), #168 guardas sem reconstruir (+6%), #183 60 FPS pelo modo Desempenho do jogo (fps60game), #171 botão JOGAR, #175 log pelo SotC.bat, #181 ferramentas de medição, #154 geração de quadros sem HUD (desligada, `SOTC_FG_HUDLESS=1`). Conflito só na #154 (base antiga, antes da thread de desenhos). Demo: 62,6 / 37,2 e 63,0 / 37,3. Uma rodada travou aos 165 s (`PS4SyncEvent`), trava intermitente do demo que já acontecia antes. |
 | 0.30 | #186: "Texturas em alta qualidade" esgota a memória do jogo em vistas amplas (`0x1a371`) | 🔍 | Achado do Lucas: com SOTC_LOD_LINGER todo banco visto pede mip 2, até os distantes; com a espada erguida o jogo tenta carregar o mapa inteiro. Provável causa da queda no final (#146) com a opção ligada. Lucas trabalhando em relatar mips mais grossos quando o pool enche. |
 | 0.31 | **Publicar v0.60** | ✅ | |
+| 0.32 | PRs #94 (menu no jogo, nosekefik), #110 (pasta WpSystem fora da busca), #121 (docs) | ✅ | #94: o menu do Bloodborne (Insert / F1 / L3+R3) passa a ser do SotC e **ligado por padrão** (`BB_OVERLAY_MENU=0` desliga): FPS, GPU e VRAM, tela cheia, resolução, escala e nitidez, câmera e mouse, efeitos. Conflito resolvido mantendo os textos traduzidos da lista de saves. Testado abrindo o menu no demo (foto): 72,5 FPS, sem falha. |
+| 0.33 | README só em inglês (objetivo da #93) | ✅ | `7e7cc1b`. Problemas conhecidos atualizados (#186, GCN, 60 FPS, geração de quadros). Créditos da comunidade. |
+| 0.34 | #60 (Oussama268): remover sobras do Bloodborne | ⏳ próximo | −12 mil linhas; manter o menu (#94). |
 
 ## Fase 1 — Estabilidade (quedas e travamentos)
 

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.59-plus5 — 2026-10-20 (fork Lucas-blip-png)
+- **Queda com texturas em alta no modo PS4 Pro** (issue #186 do original, `read access to
+  ffffffffffffffff at guest offset 0x1a371`): o port pede o mip 2 de toda textura amostrada,
+  inclusive as distantes, e o jogo carregava mais detalhe do que o pool de páginas dele comporta
+  (10% livre depois de carregar, 0% uns 40 s depois). Agora, quando o pool fica abaixo de 8% livre,
+  as texturas pedem um mip a menos (abaixo de 4%, dois) e o jogo libera memória. No Santuário, em
+  modo Pro: antes caiu nas 3 rodadas; agora rodou 3 minutos sem cair, com o pool estável em 4% e o
+  chão e a grama com a mesma nitidez. `SOTC_LOD_POOL_LOW=0` desliga.
+- **CPUs sem BMI1 (Sandy/Ivy Bridge, AMD FX) travavam na primeira tela de carregamento** (issue
+  #88 do original, numa CPU dessas de verdade): a tradução das instruções seguia só o caminho de
+  cada função e deixava de fora trechos alcançados por tabelas de salto. Um TZCNT/LZCNT esquecido
+  ali roda como BSF/BSR sem dar erro e devolve outro valor. Agora esses trechos também são
+  traduzidos (89 instruções a mais). Testado forçando a emulação numa CPU moderna: Santuário e
+  demo de abertura inteiro sem falhas. Falta a confirmação numa CPU dessas. Nas CPUs
+  modernas nada muda.
+
 ## 0.59-plus4 — 2026-10-20 (fork Lucas-blip-png)
 - A 0.59-plus3 em cima da **0.59.1** do original: **listras da AMD** nas sombras e na água (o
   acesso direto à memória vem desligado nas AMD, do Oussama268), correções para Intel, opção

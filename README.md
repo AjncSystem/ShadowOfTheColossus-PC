@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC (port nativo / native port) · v0.59-plus4
+# Shadow of the Colossus — PC (port nativo / native port) · v0.59-plus5
 
 **The original 0.59.1, plus 60 FPS through the game's own 60 FPS mode, a smaller readback
 window, 120 Hz fullscreen, textures on GTX 10xx cards and CPUs without BMI1 (pre-Haswell): about
@@ -10,7 +10,7 @@ this fork's 0.58.1-plus are part of the original since 0.59, and the far shadows
 
 ![Shrine of Worship, 60 FPS mode, RTX 5060 Ti (FPS from RTSS)](docs/img/sotc-fork.gif)
 
-| | Original 0.59.1 | **This fork (0.59-plus4)** |
+| | Original 0.59.1 | **This fork (0.59-plus5)** |
 |---|---|---|
 | Shrine of Worship, unlimited FPS (RTX 5060 Ti, Ryzen 7 5700X; median of 3 runs) | 45.7 FPS | **48.8 FPS (+7%)** |
 
@@ -64,6 +64,7 @@ de que o jogo precisa, no estilo do [bloodborne_pc](https://github.com/Supermedo
 
 | Versão | Melhorias e correções |
 |---|---|
+| **0.59-plus5** | **Fork Lucas-blip-png:** sem a **queda com texturas em alta no modo PS4 Pro** (0x1a371: o jogo enchia o pool de memória dele; agora pede menos detalhe quando ele fica quase cheio) e correção para **CPUs sem BMI1** que travavam na primeira tela de carregamento. |
 | **0.59-plus4** | **Fork Lucas-blip-png:** a 0.59-plus3 em cima da **0.59.1** do original: **listras da AMD** nas sombras e na água corrigidas, correções para Intel, opção **Sombras distantes** no lançador e o registro mostra a placa e o driver (Oussama268 e AjncSystem). |
 | **0.59-plus3** | **Fork Lucas-blip-png:** **60 FPS pelo modo 60 do próprio jogo** (o do Desempenho do PS4 Pro): o tempo do jogo acompanha os 60 FPS, o que deve corrigir o colosso pássaro que voa para o céu, a parede do 2º colosso e o dano no ponto fraco; o F7 troca o alvo do jogo entre 30 e 60. Texturas nas GTX 10xx confirmadas numa GTX 1080 Ti. |
 | **0.59-plus2** | **Fork Lucas-blip-png:** a 0.59-plus mais **processadores sem BMI1/LZCNT/MOVBE** (Intel de 2ª e 3ª geração, Xeon E3 v1/v2, AMD FX; do Oussama268), que antes não abriam o jogo, **sem blocos pretos nos quadros gerados pelo FSR 3 nas AMD RX 7000** (KingJhoss), e o botão JOGAR do lançador não é mais cortado com a escala do Windows acima de 100%. |
@@ -174,6 +175,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.59-plus5** | **Lucas-blip-png fork:** no more **crash with high quality textures in PS4 Pro mode** (0x1a371: the game filled its own memory pool; now it asks for less detail when the pool is nearly full) and a fix for **CPUs without BMI1** that hung on the first loading screen. |
 | **0.59-plus4** | **Lucas-blip-png fork:** 0.59-plus3 on top of the original's **0.59.1**: **AMD stripes** on shadows and water fixed, Intel fixes, a **Far shadows** launcher option, and the log shows the GPU and driver (Oussama268 and AjncSystem). |
 | **0.59-plus3** | **Lucas-blip-png fork:** **60 FPS through the game's own 60 FPS mode** (the PS4 Pro Performance one): the game's timing follows 60 FPS, which should fix the bird colossus flying away, the 2nd colossus' wall and weak point damage; F7 switches the game's target between 30 and 60. Textures on GTX 10xx confirmed on a GTX 1080 Ti. |
 | **0.59-plus2** | **Lucas-blip-png fork:** 0.59-plus plus **CPUs without BMI1/LZCNT/MOVBE** (2nd/3rd generation Intel Core, Xeon E3 v1/v2, AMD FX; by Oussama268), which could not start the game, **no black tiles on FSR 3 generated frames on AMD RX 7000** (KingJhoss), and the launcher's PLAY button is no longer cut off above 100% display scale. |

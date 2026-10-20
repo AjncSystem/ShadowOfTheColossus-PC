@@ -373,9 +373,21 @@ static DWORD WINAPI profiler(void *name) {
     profile_slots=calloc(PROFILE_SLOTS,sizeof(*profile_slots));
     if (!thread || !profile_slots) return 0;
     const ULONGLONG end=GetTickCount64()+(ULONGLONG)(seconds ? atoi(seconds) : 15)*1000;
-    unsigned samples=0;
+    unsigned samples=0, idle=0;
+    /* SOTC_PROFILE_CPU=1: only samples after the thread ran in the last interval (cycle count
+     * moved by 200k or more), so blocked waits do not hide where its CPU time goes. */
+    const int cpu_only=getenv("SOTC_PROFILE_CPU")!=NULL;
+    ULONG64 last_cycles=0;
+    if (cpu_only) QueryThreadCycleTime(thread,&last_cycles);
     timeBeginPeriod(1);
     while (GetTickCount64()<end) {
+        if (cpu_only) {
+            ULONG64 cycles=last_cycles;
+            QueryThreadCycleTime(thread,&cycles);
+            const int ran=cycles-last_cycles>=200000;
+            last_cycles=cycles;
+            if (!ran) { ++idle; Sleep(1); continue; }
+        }
         if (SuspendThread(thread)!=(DWORD)-1) {
             CONTEXT c={.ContextFlags=CONTEXT_CONTROL|CONTEXT_INTEGER};
             if (GetThreadContext(thread,&c)) {
@@ -421,7 +433,7 @@ static DWORD WINAPI profiler(void *name) {
     }
     timeEndPeriod(1);
     char where[MAX_PATH+64];
-    fprintf(stderr,"SOTC profile of %s: %u samples\n",(const char *)name,samples);
+    fprintf(stderr,"SOTC profile of %s: %u samples (%u skipped idle)\n",(const char *)name,samples,idle);
     /* SOTC_PROFILE_OUT=<file>: every sampled address (module offset, leaf, inclusive), for
      * per-function totals offline (tools/profile_sym.py --functions). */
     if (getenv("SOTC_PROFILE_OUT")) {

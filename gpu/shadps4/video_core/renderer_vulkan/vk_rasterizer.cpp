@@ -242,6 +242,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
         return;
     }
     const auto state = BeginRendering(pipeline);
+    RefreshImageLayouts();
 
     BindVertexBuffers(pipeline);
     if (is_indexed) {
@@ -320,6 +321,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
     const auto state = BeginRendering(pipeline);
+    RefreshImageLayouts();
 
     BindVertexBuffers(pipeline);
     if (is_indexed) {
@@ -626,6 +628,19 @@ void Rasterizer::OnSubmit() {
 
 void Rasterizer::OnFence() {
     texture_cache.ProcessDownloadImages();
+}
+
+// sotc: the descriptors take each image's layout when its texture is bound, but BeginRendering may
+// move a sampled image to another layout afterwards: a depth buffer both sampled and bound with
+// stencil writes goes to DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL while its descriptor still said
+// DEPTH_STENCIL_READ_ONLY_OPTIMAL (Vulkan validation; harmless on NVIDIA, wrong on GPUs that
+// compress depth by layout). The descriptors are written after this, with the layouts in force.
+void Rasterizer::RefreshImageLayouts() {
+    for (size_t i = 0; i < image_infos.size(); ++i) {
+        if (const VideoCore::Image* image = image_info_images[i]) {
+            image_infos[i].imageLayout = image->backing->state.layout;
+        }
+    }
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
@@ -1470,6 +1485,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     for (auto& [image_id, desc] : image_bindings) {
         bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
         if (!image_id) {
+            image_info_images[image_infos.size()] = nullptr;
             image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         } else {
             if (auto& old_image = texture_cache.GetImage(image_id);
@@ -1516,6 +1532,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             image.usage.storage |= is_storage;
             image.usage.texture |= !is_storage;
 
+            image_info_images[image_infos.size()] = &image;
             image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view,
                                      image.backing->state.layout);
         }
@@ -1594,6 +1611,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
         const auto vk_sampler =
             texture_cache.GetSampler(ssharp, liverpool->DrawRegs().ta_bc_base, sampler.is_depth);
+        image_info_images[image_infos.size()] = nullptr;
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;

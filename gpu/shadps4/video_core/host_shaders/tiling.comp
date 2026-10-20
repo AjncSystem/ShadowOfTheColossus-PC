@@ -424,8 +424,14 @@ uint GetMipLevel(inout uint texel) {
     return mip;
 }
 
+// sotc: a dispatch above the device's group count limit comes as x * y groups (Instance::Dispatch1D).
+uint GlobalIndex() {
+    return gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+}
+
 void main() {
-    uint texel = gl_GlobalInvocationID.x;
+    const uint texel_index = GlobalIndex();
+    uint texel = texel_index;
     uint mip = GetMipLevel(texel);
     uint pitch = info.mips[mip].pitch;
     uint height = info.mips[mip].height;
@@ -441,8 +447,8 @@ void main() {
 #endif
 
     if (IS_TILER != 0) {
-        tiled_data[tiled_offset / BYTES_PER_PIXEL] = linear_data[gl_GlobalInvocationID.x];
+        tiled_data[tiled_offset / BYTES_PER_PIXEL] = linear_data[texel_index];
     } else {
-        linear_data[gl_GlobalInvocationID.x] = tiled_data[tiled_offset / BYTES_PER_PIXEL];
+        linear_data[texel_index] = tiled_data[tiled_offset / BYTES_PER_PIXEL];
     }
 }

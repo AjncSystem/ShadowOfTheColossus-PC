@@ -319,6 +319,25 @@ public:
         return properties.vendorID;
     }
 
+    /// sotc: a one-dimensional dispatch of `groups` workgroups for a host shader that reads its
+    /// index as x + y * NumWorkGroups.x * WorkGroupSize.x. Above maxComputeWorkGroupCount[0]
+    /// (Intel: 65535; NVIDIA and AMD allow 2^31 and more) it is sent as x * y groups with
+    /// x * y == groups exactly (the counts are page or texel counts: powers of two times small
+    /// factors), as a larger dispatch is invalid and hung Intel GPUs: the texture detiler
+    /// dispatches one group per 64 texels, 81920 for a 2048x2560 32-bit texture (issue #59).
+    void Dispatch1D(vk::CommandBuffer cmdbuf, u32 groups) const {
+        const auto& max = properties.limits.maxComputeWorkGroupCount;
+        if (groups > max[0]) {
+            for (u32 y = (groups + max[0] - 1) / max[0]; y <= max[1] && y <= groups; ++y) {
+                if (groups % y == 0 && groups / y <= max[0]) {
+                    cmdbuf.dispatch(groups / y, y, 1);
+                    return;
+                }
+            }
+        }
+        cmdbuf.dispatch(groups, 1, 1);
+    }
+
     /// Returns the device ID of the physical device
     u32 GetDeviceID() const {
         return properties.deviceID;

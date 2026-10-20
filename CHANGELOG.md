@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.59-plus — 2026-10-20 (fork Lucas-blip-png)
+A 0.59 do AjncSystem inteira, mais o que ainda é só deste fork. A thread de desenho, a varredura
+de DMA incremental e as correções pequenas da 0.58.1-plus entraram no original na 0.59.
+Santuário, FPS ilimitado (RTX 5060 Ti, Ryzen 7 5700X): 0.59 47 FPS → 0.59-plus 50,6 FPS (+7%).
+- **Heap guards sem remontar a cada quadro** (+6% no Santuário, `SOTC_HEAP_FAST=0` desliga): os
+  readbacks que caem em blocos em uso dos heaps do jogo não passam mais pela guarda do alocador,
+  que era refeita cerca de uma vez por quadro. Refeito em cima da guarda de todos os heaps da 0.59.
+- **Texturas nas GTX 10xx (Pascal)** (`SOTC_BARYCENTRIC_GS=0` desliga): sem
+  `VK_KHR_fragment_shader_barycentric`, pedras e chão saíam pretos, facetados ou com ruído. Um
+  geometry shader pequeno passa ao fragment shader os valores dos três vértices. Nessas placas o
+  cache de shaders é refeito na primeira abertura. Testado forçando o modo numa RTX 5060 Ti; falta
+  a confirmação de quem tem uma GTX 10xx.
+- **Sombras distantes sem piscar** (`SOTC_SHADOW_REUSE=1` religa): o reaproveitamento de sombras
+  desenha as cascatas distantes em quadros alternados, mas o jogo não guarda a cascata pulada, e a
+  sombra no chão pisca a 15 Hz (issue #157 do original).
+- **Janela de readback menor**, 64 KiB (+3% no Santuário, `SOTC_RB_NARROW=0`).
+- **Tela cheia a 120 Hz** em monitores de 144/165 Hz (Anthonypc23).
+- **Geração de quadros sem o HUD, agora opcional e desligada** (`SOTC_FG_HUDLESS=1` liga): com a UI
+  na tela, os quadros gerados pelo FSR 3 saem com o logo desbotado e, nas telas de carregamento,
+  com a cena velha que fica atrás da UI. Na 0.58.1-plus ela vinha ligada com o FG.
+- **Atualização automática** (da 0.59) apontando para as releases deste fork.
+- O lançador não para mais quando o console dele recusa escrita (`[Errno 22]`, issue #104).
+- Fora desta versão: o aviso de versão nova da 0.58.1-plus (a 0.59 já se atualiza sozinha).
+
 ## 0.59 — 2026-10-20
 Obrigado a **Oussama268, Lucas-blip-png e EdouardSence**.
 

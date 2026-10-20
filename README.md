@@ -1,4 +1,40 @@
-# Shadow of the Colossus — PC (port nativo / native port) · v0.59
+# Shadow of the Colossus — PC (port nativo / native port) · v0.59-plus
+
+**The original 0.59, plus far shadows that no longer blink, a smaller readback window, 120 Hz
+fullscreen and textures on GTX 10xx cards: about 7% more FPS at the Shrine.** Everything in
+[AjncSystem's 0.59](https://github.com/AjncSystem/ShadowOfTheColossus-PC) (the ending crash fix,
+F11, video memory and volume options, launcher self-update), with this fork's work on top. The
+draw thread and the incremental DMA sweep from this fork's 0.58.1-plus are part of the original
+since 0.59.
+
+![Shrine of Worship, 60 FPS mode, RTX 5060 Ti (FPS from RTSS)](docs/img/sotc-fork.gif)
+
+| | Original 0.59 | **This fork (0.59-plus)** |
+|---|---|---|
+| Shrine of Worship, unlimited FPS (RTX 5060 Ti, Ryzen 7 5700X) | 47 FPS | **50.6 FPS (+7%)** |
+
+What it adds (each piece has a switch to turn it off):
+- **Heap guards no longer rebuilt every frame** (+6% at the Shrine): readbacks that land in
+  in-use blocks of the game's heaps skip the allocator guard, which was rebuilt about once per
+  frame (`SOTC_HEAP_FAST=0`).
+- **Textures on GTX 10xx (Pascal) cards:** without `VK_KHR_fragment_shader_barycentric` the
+  rocks and ground came out black, faceted or noisy; a small geometry shader now hands the
+  fragment shader the three vertices' values (`SOTC_BARYCENTRIC_GS=0`). The shader cache is
+  rebuilt on the first launch on those cards only. Tested by forcing it on an RTX 5060 Ti; not
+  yet confirmed on a real GTX 10xx.
+- **Far shadows no longer blink:** the original redraws the far shadow cascades every other
+  frame and reuses the last one in between; the game does not keep it, so far shadows on the
+  ground blink at 15 Hz (issue #157). Off by default (`SOTC_SHADOW_REUSE=1` turns it back on).
+- **Smaller readback window**, 64 KiB (+3% at the Shrine): fewer GPU-written pages are downloaded and unprotected
+  for nothing (`SOTC_RB_NARROW=0`).
+- **Fullscreen at 120 Hz** on 144/165 Hz monitors, so every frame stays on screen as long (Anthonypc23).
+- **Frame generation without the HUD (experimental, off):** with `SOTC_FG_HUDLESS=1`, FSR 3 and
+  DLSS-G get the frame drawn again without the UI. With UI on screen FSR 3 still shows artifacts,
+  so it stays off (PR #154 of the original).
+- The launcher's self-update follows this fork's releases; the launcher no longer stops when its
+  console refuses writes (issue #104).
+
+**[⬇ Download the latest release](../../releases/latest)** · bring your own game dump · Windows 10/11, Vulkan 1.3
 
 **[Português](#português)** · **[English](#english)** · [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
@@ -21,6 +57,8 @@ de que o jogo precisa, no estilo do [bloodborne_pc](https://github.com/Supermedo
 
 | Versão | Melhorias e correções |
 |---|---|
+| **0.59-plus** | **Fork Lucas-blip-png:** a 0.59 inteira, mais **~7% de FPS** no Santuário (47 → 50,6 FPS: heap guard sem remontar a cada quadro e janela de readback menor), **texturas nas GTX 10xx**, **sombras distantes sem piscar**, **tela cheia a 120 Hz** em monitores de 144/165 Hz (Anthonypc23) e geração de quadros sem o HUD como opção experimental (desligada). A atualização automática do lançador segue as releases deste fork. A thread de desenho e a varredura de DMA da 0.58.1-plus agora fazem parte do original. |
+| **0.58.1-plus** | **Fork Lucas-blip-png:** a 0.58.1 inteira, **sem a queda de um jogo novo** (as texturas em alta, que a causam, vêm desligadas), **sombras distantes sem piscar**, **geração de quadros sem o HUD** (FSR 3/DLSS-G) e aviso de versão nova no lançador, mais **~19% de FPS** no Santuário (42 → 50 FPS, FPS ilimitado): thread de desenho separada do processador de comandos, heap guard sem remontar a cada readback, janela de readback menor e varredura de DMA incremental. **Tela cheia a 120 Hz** em monitores de 144/165 Hz (Anthonypc23). Cache de shaders próprio do modo PS4 Pro. |
 | **0.59** | **Mais FPS** (fork do Oussama268: thread de desenhos, shaders traduzidos em paralelo; ponte 30 → 37–40 FPS), **correção para a queda no final do jogo e ao carregar saves** (em teste: conte nas issues), **F11 tela cheia**, opções de **uso de memória de vídeo** e **volume**, **atualização automática** no lançador, ultrawide com o modo PS4 Pro, correções para placas de 6 GB e Windows em chinês. |
 | **0.58.1** | **Texturas em alta qualidade** (folhas e pedras nítidas; o jogo não carregava as versões de alta resolução desde a 0.0.13) e **ícone próprio da janela do jogo** (ou o do jogo, ou uma imagem sua). |
 | **0.58** | **Versão da comunidade** (Lucas-blip-png, Gabriell-os, Oussama268, jownatan, xeodeo, nakaionyt/y7ngboy, tabnul): **menos quedas** (falta de memória de vídeo, jogo congelando, queda pós-colosso no modo PS4 Pro), **+15% de FPS** e menos memória de vídeo, correções AMD (bloco preto RDNA3/4), **widescreen 21:9/32:9**, **FPS 30/60/ilimitado**, **ícones Xbox**, geração de quadros FSR 3 / DLSS-G (experimental), lançador em espanhol, chinês, coreano e russo. |
@@ -124,6 +162,8 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.59-plus** | **Lucas-blip-png fork:** all of 0.59, plus **~7% more FPS** in the Shrine (47 → 50.6 FPS: heap guards no longer rebuilt every frame and a smaller readback window), **textures on GTX 10xx cards**, **far shadows that no longer blink**, **120 Hz fullscreen** on 144/165 Hz monitors (Anthonypc23) and frame generation without the HUD as an experimental option (off). The launcher self-update follows this fork's releases. The draw thread and DMA sweep of 0.58.1-plus are now part of the original. |
+| **0.58.1-plus** | **Lucas-blip-png fork:** all of 0.58.1, **no crash a minute into a new game** (high quality textures, which cause it, off by default), **far shadows that no longer blink**, **frame generation without the HUD** (FSR 3/DLSS-G) and an update notice in the launcher, plus **~19% more FPS** in the Shrine (42 → 50 FPS, unlimited FPS): a draw thread separate from the command processor, the heap guard no longer rebuilt per readback, a smaller readback window and an incremental DMA sweep. **120 Hz fullscreen** on 144/165 Hz monitors (Anthonypc23). Its own shader cache for PS4 Pro mode. |
 | **0.59** | **More FPS** (Oussama268's fork: draw thread, shaders translated in parallel; bridge 30 → 37–40 FPS), **fix for the ending and save-load crash** (still being tested: report in the issues), **F11 fullscreen**, **video memory use** and **volume** options, launcher **self-update**, ultrawide with PS4 Pro mode, fixes for 6 GB cards and Chinese Windows. |
 | **0.58.1** | **High quality textures** (sharp leaves and rocks; the game had not streamed its high resolution versions since 0.0.13) and the **game window's own icon** (or the game's, or a picture of yours). |
 | **0.58** | **Community release** (Lucas-blip-png, Gabriell-os, Oussama268, jownatan, xeodeo, nakaionyt/y7ngboy, tabnul): **fewer crashes** (out of video memory, game freezing, post-colossus crash in PS4 Pro mode), **+15% FPS** and less video memory, AMD fixes (RDNA3/4 black tiles), **21:9/32:9 widescreen**, **FPS 30/60/unlimited**, **Xbox button icons**, FSR 3 / DLSS-G frame generation (experimental), launcher in Spanish, Chinese, Korean and Russian. |

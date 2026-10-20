@@ -7,6 +7,7 @@
 #include <sys/resource.h>
 #endif
 #include "bbport_toggles.h"
+#include "video_core/sotc_fps_cap.h"
 #include "video_core/sotc_stats.h"
 #include <algorithm>
 #include <atomic>
@@ -380,6 +381,10 @@ extern "C" int bbgpu_readbacks_mode(void) {
 
 extern "C" int bbgpu_handle_fault(void* ucontext, void* address) {
     return Core::Signals::Instance()->DispatchAccessViolation(ucontext, address) ? 1 : 0;
+}
+
+extern "C" void bbgpu_set_fps_target_slot(void* slot) {
+    SotcFpsCap::target_slot.store(slot, std::memory_order_relaxed);
 }
 
 extern "C" unsigned bbgpu_symbol_count(void) {

@@ -15,7 +15,9 @@ Settings (environment variables, or sotc.ini beside this script as NAME=value li
     SOTC_DLC_DIR      optional: the game's DLC (one folder per add-on with sce_sys/param.sfo,
                       or shadPS4's addcont folder holding CUSA08809)
     SOTC_MODES        optional, comma-separated: af16 (16x anisotropic filtering),
-                      fps60 (removes the 30 FPS cap; experimental, vblank at 120 Hz)
+                      fps60 (removes the 30 FPS cap; experimental, vblank at 120 Hz),
+                      fps60game (the game's own 60 FPS target, as the PS4 Pro Performance mode;
+                      with SOTC_FPS_CAP=off)
     SOTC_RENDER_RES   optional: the game renders at WxH instead of 1920x1080 (e.g. 2560x1080 for
                       21:9, a wider view); the output follows its aspect; PS4 mode only; at most 1080
                       lines tall and 4.2 million pixels, larger sizes are scaled down

@@ -49,6 +49,9 @@ int bbgpu_mouse_take(float *dx, float *dy, unsigned *buttons);
 int bbgpu_overlay_captures_input(void);
 /* Number of symbols registered by the vendored libraries (diagnostics). */
 unsigned bbgpu_symbol_count(void);
+/* sotc: where the engine keeps the pointer to its TargetFramesPerSeconds value (fps60game mode):
+ * F7 then switches the game's own frame rate target instead of only its cap. */
+void bbgpu_set_fps_target_slot(void *slot);
 #ifdef __cplusplus
 }
 #endif

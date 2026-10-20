@@ -2370,6 +2370,7 @@ u64 PatchShortSse4aInstructions(u64 segment_addr, u64 segment_size,
 
     u64 patched_count = 0;
     u64 trap_count = 0;
+    u64 gap_count = 0;
     std::unique_lock lock{module->mutex};
     for (size_t index = 0; index < starts.size(); ++index) {
         const uintptr_t function_start = starts[index];
@@ -2522,10 +2523,75 @@ u64 PatchShortSse4aInstructions(u64 segment_addr, u64 segment_size,
             covered_until = continuation;
             ++patched_count;
         }
+
+        // sotc: code no decoded path reaches (cases behind a jump table that was not resolved, a
+        // function without its own eh_frame entry) is decoded linearly, gap by gap; a gap counts
+        // only when that decode ends exactly where the decoded code resumes. On a real CPU
+        // without BMI1 the trap handler met a BEXTR there (eboot+0x96e1a), and a TZCNT/LZCNT left
+        // there runs as BSF/BSR without any fault: the game hung on its first loading screen
+        // (issue #88). Long sites are patched in place; short ones become UD2 traps, since a jump
+        // would cover instructions no decoded path vouches for.
+        if (!bmi || module->trampoline_exhausted) {
+            continue;
+        }
+        const auto patch_gap = [&](uintptr_t begin, uintptr_t end) {
+            std::vector<DecodedCodeInstruction> sites;
+            uintptr_t at = begin;
+            while (at < end) {
+                const auto decoded = DecodeCodeInstruction(at, end);
+                if (decoded.instruction.length == 0) {
+                    return; // data, or not an instruction boundary
+                }
+                if (is_bmi(decoded)) {
+                    sites.push_back(decoded);
+                }
+                at += decoded.instruction.length;
+            }
+            for (const auto& decoded : sites) {
+                auto* bytes = reinterpret_cast<u8*>(decoded.address);
+                if (module->patched.contains(bytes)) {
+                    continue;
+                }
+                if (gap_count < 8) {
+                    LOG_WARNING(Core, "{} at {:#x} (segment +{:#x}) in code no decoded path reaches",
+                                ZydisMnemonicGetString(decoded.instruction.mnemonic),
+                                decoded.address, decoded.address - segment_addr);
+                }
+                if (decoded.instruction.length >= NearJumpSize) {
+                    if (TryPatch(bytes, module).first) {
+                        ++patched_count;
+                        ++gap_count;
+                    }
+                    continue;
+                }
+                BmiTrapSite trap{decoded.instruction, {}};
+                std::copy_n(decoded.operands.begin(), trap.operands.size(), trap.operands.begin());
+                g_bmi_trap_sites.emplace(decoded.address, trap);
+                bytes[0] = 0x0F;
+                bytes[1] = 0x0B;
+                module->patched.insert(bytes);
+                ++trap_count;
+                ++gap_count;
+            }
+        };
+        uintptr_t cursor = function_start;
+        for (const auto& [address, decoded] : function.instructions) {
+            if (address > cursor) {
+                patch_gap(cursor, address);
+            }
+            cursor = std::max(cursor, address + decoded.instruction.length);
+        }
+        if (cursor < function_end) {
+            patch_gap(cursor, function_end);
+        }
     }
     if (trap_count) {
         LOG_WARNING(Core, "{} short BMI1/LZCNT/MOVBE sites run from the illegal instruction "
                     "handler (not relocatable)", trap_count);
+    }
+    if (gap_count) {
+        LOG_WARNING(Core, "{} BMI1/LZCNT/MOVBE sites patched in code no decoded path reaches",
+                    gap_count);
     }
     return patched_count;
 }

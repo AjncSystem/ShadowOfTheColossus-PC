@@ -13,6 +13,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
+#include <math.h>
 #include <SDL3/SDL.h>
 
 #define PORTS 25
@@ -147,6 +148,28 @@ static ABI int32_t audio_close(int32_t handle) {
     pthread_mutex_unlock(&table_lock);
     return p ? 0 : error;
 }
+/* SOTC_VOLUME: master volume in percent (default 100, 25-400; #95, the game is quiet). Above
+ * 100 the peaks go through a soft limiter instead of clipping hard. */
+static float master_volume(void) {
+    static float v=-1.0f;
+    if (v<0.0f) {
+        const char *e=getenv("SOTC_VOLUME");
+        double pct=e && e[0] ? atof(e) : 100.0;
+        if (pct<25.0) pct=25.0;
+        if (pct>400.0) pct=400.0;
+        v=(float)(pct/100.0);
+    }
+    return v;
+}
+
+/* Linear up to 0.8 of full scale, then a tanh knee that never reaches 1. */
+static inline float soft_limit(float v) {
+    float a=fabsf(v);
+    if (a<=0.8f) return v;
+    float o=0.8f+0.2f*tanhf((a-0.8f)/0.2f);
+    return v<0.0f ? -o : o;
+}
+
 /* `pace`: wait for this port's next period. sceAudioOutOutputs waits once for all its ports. */
 static int32_t output_port(int32_t handle, const void *data, int pace) {
     int32_t error=0;
@@ -161,12 +184,22 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
         /* Apply per-channel volume and map PS4 8ch (L R C LFE SL SR BL BR) to SDL 7.1 order. */
         unsigned char converted[2048*8*4];
         static const int remap[8]={0,1,2,3,6,7,4,5};
+        const float master=master_volume();
+        const int limit=master>1.0f;
         for (size_t f=0;f<(size_t)p->frames;++f) for (int c=0;c<p->channels;++c) {
             int target=p->channels==8 && !p->std_layout ? remap[c] : c;
             size_t from=f*(size_t)p->channels+(size_t)c, to=f*(size_t)p->channels+(size_t)target;
-            float gain=(float)p->volume[c]/VOLUME_0DB;
-            if (p->is_float) { float v; memcpy(&v,(const char *)data+from*4,4); v*=gain; memcpy(converted+to*4,&v,4); }
-            else { int16_t v; memcpy(&v,(const char *)data+from*2,2); v=(int16_t)((float)v*gain); memcpy(converted+to*2,&v,2); }
+            float gain=(float)p->volume[c]/VOLUME_0DB*master;
+            if (p->is_float) {
+                float v; memcpy(&v,(const char *)data+from*4,4); v*=gain;
+                if (limit) v=soft_limit(v);
+                memcpy(converted+to*4,&v,4);
+            } else {
+                int16_t s16; memcpy(&s16,(const char *)data+from*2,2);
+                float v=(float)s16*gain/32768.0f;
+                if (limit) v=soft_limit(v);
+                s16=(int16_t)(v*32767.0f); memcpy(converted+to*2,&s16,2);
+            }
         }
         if (p->dump) fwrite(converted,1,bytes,p->dump);
         if (p->stats) {

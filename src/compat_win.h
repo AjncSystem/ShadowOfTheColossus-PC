@@ -79,6 +79,12 @@ int compat_tsc_skew(unsigned *worst_core, double *worst_us);
 /* A TSC replacement that agrees across cores: QPC scaled to about 1 GHz, and its frequency. */
 uint64_t compat_qpc_tsc(void);
 uint64_t compat_qpc_tsc_frequency(void);
+/* On a CPU with SMT and at least min_cores physical cores, runs the process's threads on the first
+ * logical processor of each core (cores without SMT, such as Intel E-cores, are kept whole):
+ * 2 through a default CPU set (threads may select the siblings again: BbThreads::UseAllCpus),
+ * 1 through the affinity mask (CPU sets refused), 0 when nothing was to change, -1 when neither
+ * could be set; logical and cores give what the process had. Call before other threads start. */
+int compat_one_thread_per_core(int min_cores, int *logical, int *cores);
 /* setjmp/longjmp without SEH unwinding (guest frames have no unwind data) that saves every
  * Win64 callee-saved register, xmm6-15 included. clang's __builtin_longjmp restores a wrong
  * frame pointer on Win64. bb_longjmp may also be entered from the exception handler. */

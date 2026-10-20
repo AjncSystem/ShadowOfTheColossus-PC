@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <unordered_set>
 #include "common/elf_info.h"
+#include "bbport_threads.h"
 #include "common/assert_scope.h"
 #include "common/hash.h"
 #include "common/io_file.h"
@@ -502,6 +503,7 @@ void PipelineCache::QueueAsyncPipeline(u64 hash) {
 
 void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
     Common::SetCurrentThreadName("shadPS4:PipelineWorker");
+    BbThreads::UseAllCpus(); // sotc: SMT siblings too (src/probe.c choose_smt)
     for (;;) {
         std::unique_ptr<AsyncPipelineJob> job;
         {

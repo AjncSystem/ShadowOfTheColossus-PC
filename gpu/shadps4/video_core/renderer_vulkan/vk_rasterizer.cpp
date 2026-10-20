@@ -2192,10 +2192,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     }
 
     // sotc: TakeHudless: the final composite samples the UI layer (an sRGB render target) and the
-    // fp16 scene, nothing else.
+    // fp16 scene, nothing else. Off unless SOTC_FG_HUDLESS=1: with FSR 3 the generated frames of
+    // the title screen (faded logo) and of loading screens (the scene left behind the opaque UI
+    // layer shows through) came out wrong, the real frame's UI not put back over them.
     static const bool hudless_on = [] {
         const char* v = std::getenv("SOTC_FG_HUDLESS");
-        return !v || v[0] != '0';
+        return v && v[0] == '1';
     }();
     if (hudless_on && stage.sw_stage == Shader::SwStage::Fragment && image_bindings.size() == 2 &&
         image_bindings[0].first && image_bindings[1].first &&

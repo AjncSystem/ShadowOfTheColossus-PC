@@ -1349,8 +1349,10 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateArenaBlocks(u64 blocks) {
         }
         return std::nullopt;
     };
-    const auto grow = [&](u32 memory_type) -> std::optional<std::pair<vk::DeviceMemory, u64>> {
-        const u64 chunk_blocks = std::max<u64>(ARENA_CHUNK_SIZE >> block_shift, blocks);
+    const auto grow = [&](u32 memory_type, bool exact = false)
+        -> std::optional<std::pair<vk::DeviceMemory, u64>> {
+        // exact: only the asked size, for a nearly full card that has no 64 MiB left (#137).
+        const u64 chunk_blocks = exact ? blocks : std::max<u64>(ARENA_CHUNK_SIZE >> block_shift, blocks);
         const vk::MemoryAllocateInfo alloc_info = {
             .allocationSize = chunk_blocks << block_shift,
             .memoryTypeIndex = memory_type,
@@ -1397,9 +1399,23 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateArenaBlocks(u64 blocks) {
     texture_cache.EmergencyCollect();
     scheduler.Finish();
     scheduler.PopPendingOperations();
-    auto placed = grow(arena_memory_type_index);
-    ASSERT_MSG(placed.has_value(), "Failed to allocate buffer arena memory");
-    return *placed;
+    if (auto placed = grow(arena_memory_type_index)) {
+        return *placed;
+    }
+    // sotc: still no room for a whole chunk (#137: 6 GB cards): the asked size alone, then
+    // system memory, before giving up.
+    if (auto placed = grow(arena_memory_type_index, true)) {
+        return *placed;
+    }
+    if (arena_fallback_memory_type_index) {
+        if (auto placed = grow(*arena_fallback_memory_type_index, true)) {
+            return *placed;
+        }
+    }
+    LOG_CRITICAL(Render, "Out of video and system memory for buffers; lower the video memory use "
+                         "setting in the launcher (Economy)");
+    ASSERT_MSG(false, "Failed to allocate buffer arena memory");
+    return {};
 }
 
 u64 BufferCache::ArenaUsedBytes() const noexcept {

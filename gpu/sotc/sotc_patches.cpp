@@ -6,7 +6,13 @@
 //    touching memory the GPU page tracker may fault on (Windows exception dispatch writes
 //    below rsp).
 // Both come from the shadPS4 SotC fork (cpu_patches.cpp, module.cpp).
+#include <atomic>
+#include <cstdint>
+#include <cstdio>
 #include <vector>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 #include "common/logging/log.h"
 #include "core/signals.h"
 #include "cpu_patches.h"
@@ -78,5 +84,47 @@ extern "C" int sotc_patch_eboot(const SotcPatchRequest* request, SotcPatchResult
 // Fallback for a site the patchers could not rewrite: the shadPS4 interpreter executes it
 // from the exception (the red zone is not safe there, but the game keeps running).
 extern "C" int sotc_handle_illegal(void* context) {
+#if defined(_WIN32)
+    // sotc: the first distinct illegal instructions are listed in the session log. A handler that
+    // reports success without moving past the instruction expects it to run again patched; if the
+    // same address faults again right after that, the game would spin there silently forever, so
+    // it ends with a report instead (issue #49).
+    const auto* pointers = static_cast<const EXCEPTION_POINTERS*>(context);
+    const auto rip = static_cast<uintptr_t>(pointers->ContextRecord->Rip);
+    static std::atomic<int> listed{0};
+    static thread_local uintptr_t retry_rip = 0; // handled without moving past it
+    static thread_local unsigned retries = 0;
+    static thread_local uintptr_t last_listed = 0;
+    const auto dump = [rip](const char* what) {
+        const auto* b = reinterpret_cast<const unsigned char*>(rip);
+        std::fprintf(stderr,
+                     "SOTC illegal instruction %s at %#llx: %02x %02x %02x %02x %02x %02x %02x %02x "
+                     "%02x %02x %02x %02x\n",
+                     what, static_cast<unsigned long long>(rip), b[0], b[1], b[2], b[3], b[4], b[5],
+                     b[6], b[7], b[8], b[9], b[10], b[11]);
+        std::fflush(stderr);
+    };
+    if (rip == retry_rip) {
+        if (++retries == 16) {
+            dump("still faulting after being patched");
+            return 0;
+        }
+    } else {
+        retry_rip = 0;
+        retries = 0;
+    }
+    if (rip != last_listed) {
+        last_listed = rip;
+        if (listed.fetch_add(1, std::memory_order_relaxed) < 32) {
+            dump("handled");
+        }
+    }
+    const bool handled = Core::Signals::Instance()->DispatchIllegalInstruction(context);
+    if (handled && static_cast<uintptr_t>(pointers->ContextRecord->Rip) == rip) {
+        retry_rip = rip;
+    }
+    return handled ? 1 : 0;
+#else
     return Core::Signals::Instance()->DispatchIllegalInstruction(context) ? 1 : 0;
+#endif
 }

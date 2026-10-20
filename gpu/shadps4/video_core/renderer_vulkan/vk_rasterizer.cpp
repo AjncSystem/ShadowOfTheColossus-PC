@@ -1139,8 +1139,8 @@ void Rasterizer::OnFence() {
 // compress depth by layout). The descriptors are written after this, with the layouts in force.
 void Rasterizer::RefreshImageLayouts() {
     for (size_t i = 0; i < image_infos.size(); ++i) {
-        if (const VideoCore::Image* image = image_info_images[i]) {
-            image_infos[i].imageLayout = image->backing->state.layout;
+        if (const VideoCore::ImageId id = image_info_images[i]) {
+            image_infos[i].imageLayout = texture_cache.GetImage(id).backing->state.layout;
         }
     }
 }
@@ -1990,8 +1990,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     for (auto& [image_id, desc] : image_bindings) {
         bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
         if (!image_id) {
-            image_info_images[image_infos.size()] = nullptr;
             image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
+            image_info_images[image_infos.size() - 1] = {};
         } else {
             if (auto& old_image = texture_cache.GetImage(image_id);
                 old_image.binding.needs_rebind) {
@@ -2037,9 +2037,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             image.usage.storage |= is_storage;
             image.usage.texture |= !is_storage;
 
-            image_info_images[image_infos.size()] = &image;
             image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view,
                                      image.backing->state.layout);
+            image_info_images[image_infos.size() - 1] = image_id;
         }
     }
 
@@ -2116,8 +2116,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
         const auto vk_sampler =
             texture_cache.GetSampler(ssharp, liverpool->DrawRegs().ta_bc_base, sampler.is_depth);
-        image_info_images[image_infos.size()] = nullptr;
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
+        image_info_images[image_infos.size() - 1] = {};
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = binding.unified++;

@@ -191,15 +191,6 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
     format_properties = GetFormatProperties(physical_device);
     properties = physical_device.getProperties();
     memory_properties = physical_device.getMemoryProperties();
-    // sotc: in the session log, so that issue reports show the GPU and driver.
-    std::fprintf(stderr, "GPU sparse: binding %d, residency buffer %d, non-resident strict %d\n",
-                 int(physical_device.getFeatures().sparseBinding),
-                 int(physical_device.getFeatures().sparseResidencyBuffer),
-                 int(properties.sparseProperties.residencyNonResidentStrict));
-    std::fprintf(stderr, "GPU: %s (vendor %04x, driver %s, Vulkan %u.%u)\n",
-                 properties.deviceName.data(), properties.vendorID,
-                 GetDriverVersionName().c_str(), VK_VERSION_MAJOR(properties.apiVersion),
-                 VK_VERSION_MINOR(properties.apiVersion));
     // sotc: direct memory access (the launcher's "full water reflections") drew stripes over
     // shadows and water on AMD (issues #57, #28; the players confirmed that turning it off fixes
     // them): off there unless BB_DIRECT_MEMORY_ACCESS asks for it.
@@ -214,6 +205,16 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
         EmulatorSettings.SetDirectMemoryAccessDefault(false);
     }
     CollectDeviceParameters();
+    // sotc: in the session log, so that issue reports show the GPU and driver (after
+    // CollectDeviceParameters: the driver version decoding needs the driver id).
+    std::fprintf(stderr, "GPU sparse: binding %d, residency buffer %d, non-resident strict %d\n",
+                 int(physical_device.getFeatures().sparseBinding),
+                 int(physical_device.getFeatures().sparseResidencyBuffer),
+                 int(properties.sparseProperties.residencyNonResidentStrict));
+    std::fprintf(stderr, "GPU: %s (vendor %04x, driver %s, Vulkan %u.%u)\n",
+                 properties.deviceName.data(), properties.vendorID,
+                 GetDriverVersionName().c_str(), VK_VERSION_MAJOR(properties.apiVersion),
+                 VK_VERSION_MINOR(properties.apiVersion));
     ASSERT_MSG(properties.apiVersion >= TargetVulkanApiVersion,
                "Vulkan {}.{} is required, but only {}.{} is supported by device!",
                VK_VERSION_MAJOR(TargetVulkanApiVersion), VK_VERSION_MINOR(TargetVulkanApiVersion),

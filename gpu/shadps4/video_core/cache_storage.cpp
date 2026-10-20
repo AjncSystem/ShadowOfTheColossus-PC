@@ -123,6 +123,7 @@ void DataBase::Open() {
         cache_path = GetUserPath(PathType::CacheDir) /
                      (std::string{game_info.GameSerial()} +
                       (EmulatorSettings.IsDirectMemoryAccessEnabled() ? "" : "_nodma") +
+                      (EmulatorSettings.IsNoInt64() ? "_noi64" : "") +
                       (Libraries::Kernel::sceKernelIsNeoMode() ? "_neo" : ""));
         if (!std::filesystem::exists(cache_path)) {
             std::filesystem::create_directories(cache_path);

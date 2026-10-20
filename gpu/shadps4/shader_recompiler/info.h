@@ -140,6 +140,8 @@ struct Info : InfoPersistent {
     IR::Type shared_types{};
     bool uses_fp16{};
     bool uses_fp64{};
+    /// sotc: the SPIR-V needs 64-bit integers (Int64 capability); see CollectShaderInfoPass.
+    bool uses_int64{};
     bool uses_pack_10_11_11{};
     bool uses_unpack_10_11_11{};
     bool uses_buffer_int64_atomics{};

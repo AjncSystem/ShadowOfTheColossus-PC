@@ -77,6 +77,9 @@ Id EmitPackUint2x32(EmitContext& ctx, Id value) {
 }
 
 Id EmitUnpackUint2x32(EmitContext& ctx, Id value) {
+    if (!Sirit::ValidId(ctx.U64)) {
+        return value; // sotc: a ballot kept as uvec2 (EmitBallot)
+    }
     return ctx.OpBitcast(ctx.U32[2], value);
 }
 

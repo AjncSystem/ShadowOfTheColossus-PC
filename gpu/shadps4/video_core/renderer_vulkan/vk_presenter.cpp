@@ -1347,6 +1347,14 @@ bool Presenter::PresentGenerated(Frame* frame) {
     cmdbuf.clearColorImage(swapchain_image, vk::ImageLayout::eTransferDstOptimal,
                            vk::ClearColorValue{std::array<float, 4>{0.f, 0.f, 0.f, 1.f}},
                            color_range);
+    // sotc: the same clear-to-blit barrier as the game frames (issue #43): without it AMD RX 7000
+    // showed the black tiles on the generated frames (KingJhoss).
+    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                           vk::PipelineStageFlagBits::eTransfer, {}, {}, {},
+                           swapchain_barrier(vk::AccessFlagBits::eTransferWrite,
+                                             vk::AccessFlagBits::eTransferWrite,
+                                             vk::ImageLayout::eTransferDstOptimal,
+                                             vk::ImageLayout::eTransferDstOptimal));
     const auto rect = FitImage(frame->width, frame->height, extent.width, extent.height);
     const vk::ImageBlit blit{
         .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},

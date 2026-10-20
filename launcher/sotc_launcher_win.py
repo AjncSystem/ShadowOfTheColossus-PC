@@ -126,7 +126,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
-                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'library_dirs': [], 'keys': {},
+                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'library_dirs': [], 'keys': {},
                 'auto_setup': True, 'dlc_dir': '', 'framegen': 'off'}
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
 KEY_INPUTS = [
@@ -156,6 +156,12 @@ TK_TO_SDL = {
 GPU_SUBMIT = [('auto', ('Automático (ligado em NVIDIA)', 'Automatic (on with NVIDIA)')),
               ('on', ('Ligado em qualquer placa (AMD/Intel: experimental)', 'On with any card (AMD/Intel: experimental)')),
               ('off', ('Desligado', 'Off'))]
+# Video memory use (#143): (texture collection from % of the card's budget, arena release from MB; 0 = never).
+VRAM_USE = [('low', ('Econômico (placas de 4–6 GB)', 'Economy (4–6 GB cards)')),
+            ('normal', ('Padrão', 'Default')),
+            ('high', ('Alto (placas de 8–12 GB)', 'High (8–12 GB cards)')),
+            ('max', ('Máximo (placas de 16 GB ou mais)', 'Maximum (16 GB cards or more)'))]
+VRAM_LIMITS = {'low': ('50', '1024'), 'normal': ('60', '1536'), 'high': ('75', '4096'), 'max': ('85', '0')}
 
 
 def sdl_key_name(keysym):
@@ -426,6 +432,7 @@ def game_environment(s):
         env['SOTC_FLUSH_US'], env['SOTC_RB_AHEAD'] = '1000', '1'
     elif s.get('gpu_submit') == 'off':
         env['SOTC_FLUSH_EVERY'], env['SOTC_RB_AHEAD'] = '0', '0'
+    env['SOTC_VRAM_GC_PERCENT'], env['SOTC_ARENA_EVICT_MB'] = VRAM_LIMITS.get(s.get('vram_use'), VRAM_LIMITS['normal'])
     env['SOTC_OUTPUT_RES'] = s.get('output_res') or '1920x1080'
     # The PS4 Pro path keeps its 16:9 sizes: a wider screen (21:9, 32:9) wins over it (#142).
     env['SOTC_NEO'] = '1' if s.get('neo') and not is_wide(env['SOTC_OUTPUT_RES']) else '0'
@@ -1025,6 +1032,13 @@ class Launcher:
                    'Sends work to the GPU every 0.5 ms and reads results through a shortcut (Pink-shadPS4 '
                    'techniques). Measured on NVIDIA (+10–15%); on AMD/Intel pick "On" to try it and go back to '
                    '"Automatic" if the screen turns black.'))
+        self.row(f, _('Uso de memória de vídeo', 'Video memory use'), self.choice(f, 'vram_use', VRAM_USE),
+                 _('Até onde o jogo enche a memória da placa antes de liberar texturas e buffers. Padrão: '
+                   'libera a partir de 60%. Em placas de 8 GB ou mais, "Alto" ou "Máximo" evita recarregar '
+                   'texturas (menos engasgos). Se aparecer erro de falta de memória, volte um nível.',
+                   'How far the game fills the card memory before it frees textures and buffers. Default: '
+                   'frees from 60%. On 8 GB cards or more, "High" or "Maximum" avoids reloading textures '
+                   '(less stutter). On an out-of-memory error, go back one level.'))
         self.section(f, _('Efeitos', 'Effects'))
         for key, title, _off in EFFECTS:
             self.check(f, key, _(*title))

@@ -971,3 +971,29 @@ TRANSLATIONS['es']["Padrão: o desenho do port (o menino erguendo a espada). \"g
 TRANSLATIONS['zh']["Padrão: o desenho do port (o menino erguendo a espada). \"game\": o ícone do próprio jogo. Ou escolha uma imagem sua (PNG/JPG): ela é recortada em quadrado no centro. Vale na próxima vez que o jogo abrir."] = "默认：本移植的图画（举剑的少年）。\"game\"：游戏自身的图标。或选择你自己的图片（PNG/JPG）：会居中裁剪为正方形。下次启动游戏时生效。"
 TRANSLATIONS['ko']["Padrão: o desenho do port (o menino erguendo a espada). \"game\": o ícone do próprio jogo. Ou escolha uma imagem sua (PNG/JPG): ela é recortada em quadrado no centro. Vale na próxima vez que o jogo abrir."] = "기본값: 포트의 그림 (검을 든 소년). \"game\": 게임 자체 아이콘. 또는 직접 이미지를 선택 (PNG/JPG): 가운데를 정사각형으로 자릅니다. 다음 게임 실행 시 적용됩니다."
 TRANSLATIONS['ru']["Padrão: o desenho do port (o menino erguendo a espada). \"game\": o ícone do próprio jogo. Ou escolha uma imagem sua (PNG/JPG): ela é recortada em quadrado no centro. Vale na próxima vez que o jogo abrir."] = "По умолчанию: рисунок порта (мальчик, поднимающий меч). \"game\": значок самой игры. Или выберите своё изображение (PNG/JPG): оно обрезается до квадрата по центру. Применяется при следующем запуске игры."
+
+# Video memory use, wide screen vs PS4 Pro
+TRANSLATIONS['es']['Econômico (placas de 4–6 GB)'] = 'Económico (tarjetas de 4–6 GB)'
+TRANSLATIONS['zh']['Econômico (placas de 4–6 GB)'] = '节省（4–6 GB 显卡）'
+TRANSLATIONS['ko']['Econômico (placas de 4–6 GB)'] = '절약 (4–6GB 그래픽카드)'
+TRANSLATIONS['ru']['Econômico (placas de 4–6 GB)'] = 'Экономный (видеокарты 4–6 ГБ)'
+TRANSLATIONS['es']['Alto (placas de 8–12 GB)'] = 'Alto (tarjetas de 8–12 GB)'
+TRANSLATIONS['zh']['Alto (placas de 8–12 GB)'] = '高（8–12 GB 显卡）'
+TRANSLATIONS['ko']['Alto (placas de 8–12 GB)'] = '높음 (8–12GB 그래픽카드)'
+TRANSLATIONS['ru']['Alto (placas de 8–12 GB)'] = 'Высокий (видеокарты 8–12 ГБ)'
+TRANSLATIONS['es']['Máximo (placas de 16 GB ou mais)'] = 'Máximo (tarjetas de 16 GB o más)'
+TRANSLATIONS['zh']['Máximo (placas de 16 GB ou mais)'] = '最大（16 GB 及以上显卡）'
+TRANSLATIONS['ko']['Máximo (placas de 16 GB ou mais)'] = '최대 (16GB 이상 그래픽카드)'
+TRANSLATIONS['ru']['Máximo (placas de 16 GB ou mais)'] = 'Максимальный (видеокарты от 16 ГБ)'
+TRANSLATIONS['es']['Uso de memória de vídeo'] = 'Uso de memoria de vídeo'
+TRANSLATIONS['zh']['Uso de memória de vídeo'] = '显存使用'
+TRANSLATIONS['ko']['Uso de memória de vídeo'] = '비디오 메모리 사용'
+TRANSLATIONS['ru']['Uso de memória de vídeo'] = 'Использование видеопамяти'
+TRANSLATIONS['es']['PS4 Pro desligado (tela larga)'] = 'PS4 Pro desactivado (pantalla ancha)'
+TRANSLATIONS['zh']['PS4 Pro desligado (tela larga)'] = 'PS4 Pro 已关闭（宽屏）'
+TRANSLATIONS['ko']['PS4 Pro desligado (tela larga)'] = 'PS4 Pro 꺼짐 (와이드 화면)'
+TRANSLATIONS['ru']['PS4 Pro desligado (tela larga)'] = 'PS4 Pro выключен (широкий экран)'
+TRANSLATIONS['es']['Até onde o jogo enche a memória da placa antes de liberar texturas e buffers. Padrão: libera a partir de 60%. Em placas de 8 GB ou mais, "Alto" ou "Máximo" evita recarregar texturas (menos engasgos). Se aparecer erro de falta de memória, volte um nível.'] = 'Hasta dónde el juego llena la memoria de la tarjeta antes de liberar texturas y búferes. Predeterminado: libera desde el 60%. En tarjetas de 8 GB o más, "Alto" o "Máximo" evita recargar texturas (menos tirones). Si aparece un error de falta de memoria, baja un nivel.'
+TRANSLATIONS['zh']['Até onde o jogo enche a memória da placa antes de liberar texturas e buffers. Padrão: libera a partir de 60%. Em placas de 8 GB ou mais, "Alto" ou "Máximo" evita recarregar texturas (menos engasgos). Se aparecer erro de falta de memória, volte um nível.'] = '游戏在释放纹理和缓冲区之前可占用显存的程度。默认：从 60% 开始释放。8 GB 及以上显卡选"高"或"最大"可避免重复加载纹理（更少卡顿）。如出现显存不足错误，请降低一级。'
+TRANSLATIONS['ko']['Até onde o jogo enche a memória da placa antes de liberar texturas e buffers. Padrão: libera a partir de 60%. Em placas de 8 GB ou mais, "Alto" ou "Máximo" evita recarregar texturas (menos engasgos). Se aparecer erro de falta de memória, volte um nível.'] = '텍스처와 버퍼를 해제하기 전에 게임이 그래픽카드 메모리를 얼마나 채울지 정합니다. 기본: 60%부터 해제. 8GB 이상 카드에서는 "높음" 또는 "최대"가 텍스처 재로딩을 줄입니다(끊김 감소). 메모리 부족 오류가 나면 한 단계 낮추세요.'
+TRANSLATIONS['ru']['Até onde o jogo enche a memória da placa antes de liberar texturas e buffers. Padrão: libera a partir de 60%. Em placas de 8 GB ou mais, "Alto" ou "Máximo" evita recarregar texturas (menos engasgos). Se aparecer erro de falta de memória, volte um nível.'] = 'Насколько игра заполняет память видеокарты, прежде чем освобождать текстуры и буферы. По умолчанию: с 60%. На картах от 8 ГБ «Высокий» или «Максимальный» избавляет от повторной загрузки текстур (меньше рывков). При ошибке нехватки памяти понизьте на один уровень.'

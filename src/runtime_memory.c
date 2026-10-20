@@ -80,7 +80,7 @@ static volatile int64_t lock_state; /* readers, or -1 while a writer holds it */
 static void lock_backoff(unsigned *spins) {
     if (++*spins < 64) YieldProcessor();
     else if (*spins < 256) SwitchToThread();
-    else Sleep(0);
+    else Sleep(1); /* Sleep(0) only yields to equal or higher priority: a preempted lower-priority holder could wait seconds */
 }
 static void rw_rdlock(void) {
     for (unsigned spins=0;;lock_backoff(&spins)) {

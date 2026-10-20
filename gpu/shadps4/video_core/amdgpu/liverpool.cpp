@@ -1307,15 +1307,22 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         runtime_memory_write_backing(base + 0x40 + half * sizeof(entries), entries,
                                                      sizeof(entries));
                     }
-                    static const bool lod_trace = std::getenv("SOTC_LOD_TRACE") != nullptr;
+                    // SOTC_LOD_TRACE=<packets> (any other value: 600) between trace lines.
+                    static const u64 lod_trace = [] {
+                        const char* v = std::getenv("SOTC_LOD_TRACE");
+                        const u64 n = v ? std::strtoull(v, nullptr, 0) : 0;
+                        return v ? (n > 1 ? n : 600) : 0;
+                    }();
                     static u64 packets = 0;
-                    if (lod_trace && packets++ % 600 == 0) {
+                    if (lod_trace && packets++ % lod_trace == 0) {
                         u32 used = 0;
                         for (const u64 e : entries) {
                             used += (e >> 56) != 0xf;
                         }
-                        LOG_WARNING(Render_Vulkan, "sotc GET_LOD_STATS {:#x}+{:#x}: {} banks sampled",
-                                    base, size, used);
+                        LOG_WARNING(Render_Vulkan,
+                                    "sotc GET_LOD_STATS {:#x}+{:#x}: {} banks sampled, page pool "
+                                    "{}% free",
+                                    base, size, used, SotcLod::PoolFreePercent());
                     }
                     }, false);
                 }

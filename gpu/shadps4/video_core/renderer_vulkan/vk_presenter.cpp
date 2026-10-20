@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <thread>
 #include <cctype>
 #include <chrono>
 #include <cmath>
@@ -506,6 +507,20 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
 
+    // sotc: the pipeline cache is read here, once frames can be presented, and blank frames with
+    // the loading screen (moving, with the shader bar) are shown meanwhile. It used to be read in
+    // the PipelineCache constructor with nothing on screen: a still window for seconds, minutes
+    // after a driver update.
+    std::atomic<bool> warming{true};
+    std::thread painter([this, &warming] {
+        while (warming.load(std::memory_order_relaxed)) {
+            Present(PrepareBlankFrame(true), false, false);
+            std::this_thread::sleep_for(std::chrono::milliseconds(33));
+        }
+    });
+    rasterizer->GetPipelineCache().WarmUp();
+    warming.store(false, std::memory_order_relaxed);
+    painter.join();
 }
 
 Presenter::~Presenter() {

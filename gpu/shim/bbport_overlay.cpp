@@ -683,7 +683,8 @@ void LoadingScreen() {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
     ImGui::SetNextWindowSize(viewport->WorkSize);
-    ImGui::SetNextWindowBgAlpha(0.88f);
+    // sotc: opaque, so the game's last frame does not show through looking frozen.
+    ImGui::SetNextWindowBgAlpha(1.0f);
     ImGui::Begin("##loading", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
                      ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing |
@@ -692,32 +693,39 @@ void LoadingScreen() {
     const ImVec2 size = viewport->WorkSize;
     const ImVec2 origin = viewport->WorkPos;
     const float unit = size.y / 1080.0f;
-    const ImU32 gold = IM_COL32(214, 184, 120, 255), dim = IM_COL32(150, 150, 150, 255);
+    const ImU32 dim = IM_COL32(150, 150, 150, 255);
+    const float t = float(NowMs() % 1000000) / 1000.0f;
+    // The title breathes slowly (gold, 65-100%).
     const char* title = "SHADOW OF THE COLOSSUS";
     const float title_px = 46.0f * unit;
     const ImVec2 title_size = ImGui::GetFont()->CalcTextSizeA(title_px, FLT_MAX, 0.0f, title);
+    const int glow = int(255.0f * (0.825f + 0.175f * std::sin(t * 2.0f)));
+    const ImU32 gold = IM_COL32(214, 184, 120, glow);
+    const float title_y = origin.y + size.y * 0.40f;
     draw->AddText(ImGui::GetFont(), title_px,
-                  ImVec2(origin.x + (size.x - title_size.x) * 0.5f, origin.y + size.y * 0.42f),
-                  gold, title);
-    // Turning arc in the lower right corner, like a console's loading mark.
-    const float t = float(NowMs() % 100000) / 1000.0f;
-    const ImVec2 centre(origin.x + size.x - 90.0f * unit, origin.y + size.y - 90.0f * unit);
-    const float radius = 26.0f * unit;
-    draw->PathArcTo(centre, radius, t * 4.0f, t * 4.0f + 4.4f, 40);
-    draw->PathStroke(gold, 0, 4.0f * unit);
-    const char* text = SotcUi::T("Carregando…", "Loading…");
+                  ImVec2(origin.x + (size.x - title_size.x) * 0.5f, title_y), gold, title);
+    // A turning arc under the title, with a faint full ring behind it.
+    const ImVec2 centre(origin.x + size.x * 0.5f, title_y + title_px + 70.0f * unit);
+    const float radius = 22.0f * unit;
+    draw->AddCircle(centre, radius, IM_COL32(214, 184, 120, 50), 48, 3.0f * unit);
+    draw->PathArcTo(centre, radius, t * 5.0f, t * 5.0f + 1.6f, 32);
+    draw->PathStroke(IM_COL32(214, 184, 120, 255), 0, 3.5f * unit);
+    // "Loading" with moving dots.
+    char text[64];
+    const int dots = int(t * 2.5f) % 4;
+    std::snprintf(text, sizeof(text), "%s%.*s", SotcUi::T("Carregando", "Loading"), dots, "...");
     const float text_px = 24.0f * unit;
-    const ImVec2 text_size = ImGui::GetFont()->CalcTextSizeA(text_px, FLT_MAX, 0.0f, text);
+    const ImVec2 full = ImGui::GetFont()->CalcTextSizeA(
+        text_px, FLT_MAX, 0.0f, SotcUi::T("Carregando...", "Loading..."));
     draw->AddText(ImGui::GetFont(), text_px,
-                  ImVec2(centre.x - radius - 18.0f * unit - text_size.x, centre.y - text_size.y * 0.5f),
-                  dim, text);
+                  ImVec2(centre.x - full.x * 0.5f, centre.y + radius + 22.0f * unit), dim, text);
     // While the shader cache is read at boot: a bar with the percentage.
     const u32 total = SotcStats::warmup_total.load(std::memory_order_relaxed);
     if (total > 0) {
         const u32 done = std::min(SotcStats::warmup_done.load(std::memory_order_relaxed), total);
         const float frac = float(done) / float(total);
         const float bar_w = size.x * 0.4f, bar_h = 10.0f * unit;
-        const ImVec2 bar0(origin.x + (size.x - bar_w) * 0.5f, origin.y + size.y * 0.42f + title_px + 40.0f * unit);
+        const ImVec2 bar0(origin.x + (size.x - bar_w) * 0.5f, centre.y + radius + 70.0f * unit);
         draw->AddRectFilled(bar0, ImVec2(bar0.x + bar_w, bar0.y + bar_h), IM_COL32(60, 60, 64, 255), bar_h * 0.5f);
         draw->AddRectFilled(bar0, ImVec2(bar0.x + bar_w * frac, bar0.y + bar_h), gold, bar_h * 0.5f);
         char line[128];

@@ -128,7 +128,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
-                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'volume': '100', 'library_dirs': [], 'keys': {},
+                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'volume': '100', 'shadow_reuse': '0', 'library_dirs': [], 'keys': {},
                 'auto_setup': True, 'dlc_dir': '', 'framegen': 'off',
                 'check_updates': True, 'skip_version': ''}
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
@@ -164,6 +164,10 @@ VRAM_USE = [('low', ('Econômico (placas de 4–6 GB)', 'Economy (4–6 GB cards
             ('normal', ('Padrão', 'Default')),
             ('high', ('Alto (placas de 8–12 GB)', 'High (8–12 GB cards)')),
             ('max', ('Máximo (placas de 16 GB ou mais)', 'Maximum (16 GB cards or more)'))]
+# Far sun shadows drawn on alternate frames (SOTC_SHADOW_REUSE): more FPS, but they may blink (#178).
+SHADOW_REUSE = [('0', ('Desligado (sombras sem piscar)', 'Off (no blinking shadows)')),
+                ('1', ('Ligado (mais FPS; sombras distantes podem piscar)', 'On (more FPS; far shadows may blink)')),
+                ('auto', ('Automático (ligado na NVIDIA, desligado na AMD/Intel)', 'Automatic (on with NVIDIA, off on AMD/Intel)'))]
 VOLUME = [('100', ('100% (original)', '100% (original)')), ('150', ('150%', '150%')),
           ('200', ('200%', '200%')), ('300', ('300% (máximo)', '300% (maximum)'))]
 VRAM_LIMITS = {'low': ('50', '1024'), 'normal': ('60', '1536'), 'high': ('75', '4096'), 'max': ('85', '0')}
@@ -439,6 +443,7 @@ def game_environment(s):
         env['SOTC_FLUSH_EVERY'], env['SOTC_RB_AHEAD'] = '0', '0'
     env['SOTC_VRAM_GC_PERCENT'], env['SOTC_ARENA_EVICT_MB'] = VRAM_LIMITS.get(s.get('vram_use'), VRAM_LIMITS['normal'])
     env['SOTC_VOLUME'] = str(s.get('volume') or '100')
+    env['SOTC_SHADOW_REUSE'] = str(s.get('shadow_reuse') or '0')
     env['SOTC_OUTPUT_RES'] = s.get('output_res') or '1920x1080'
     # The PS4 Pro path keeps its 16:9 sizes: a wider screen (21:9, 32:9) wins over it (#142).
     env['SOTC_NEO'] = '1' if s.get('neo') and not is_wide(env['SOTC_OUTPUT_RES']) else '0'
@@ -1054,6 +1059,13 @@ class Launcher:
                    'Sends work to the GPU every 0.5 ms and reads results through a shortcut (Pink-shadPS4 '
                    'techniques). Measured on NVIDIA (+10–15%); on AMD/Intel pick "On" to try it and go back to '
                    '"Automatic" if the screen turns black.'))
+        self.row(f, _('Sombras distantes', 'Far shadows'), self.choice(f, 'shadow_reuse', SHADOW_REUSE),
+                 _('Redesenha as sombras distantes do sol só a cada dois quadros e reaproveita no outro: um '
+                   'pouco mais de FPS (~0,5%), mas elas piscam ao longe (AMD e NVIDIA GTX 1080, RTX 40/50). '
+                   'Por isso vem desligado.',
+                   'Draws the far sun shadows only every other frame and reuses them in between: a little more '
+                   'FPS (~0.5%), but they blink in the distance (AMD and NVIDIA GTX 1080, RTX 40/50). Hence off '
+                   'by default.'))
         self.row(f, _('Uso de memória de vídeo', 'Video memory use'), self.choice(f, 'vram_use', VRAM_USE),
                  _('Até onde o jogo enche a memória da placa antes de liberar texturas e buffers. Padrão: '
                    'libera a partir de 60%. Em placas de 8 GB ou mais, "Alto" ou "Máximo" evita recarregar '

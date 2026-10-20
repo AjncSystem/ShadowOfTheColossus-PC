@@ -476,10 +476,16 @@ struct ShadowReuseState {
 } // namespace
 
 bool Rasterizer::ReuseShadowCascade() {
-    static const int mode = [] {
+    // sotc: SOTC_SHADOW_REUSE=auto (the launcher's default): on with NVIDIA, as in 0.58/0.59, off
+    // on AMD and Intel (#178). Unset: off.
+    static const int mode = [this] {
         const char* v = std::getenv("SOTC_SHADOW_REUSE");
         if (!v) {
             return 0;
+        }
+        if (v[0] == 'a') {
+            constexpr u32 VendorNvidia = 0x10DE;
+            return instance.GetVendorID() == VendorNvidia ? 1 : 0;
         }
         return v[0] == '0' ? 0 : (v[0] == 'c' ? 2 : 1);
     }();

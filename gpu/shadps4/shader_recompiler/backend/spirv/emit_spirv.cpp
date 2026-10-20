@@ -432,8 +432,10 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
         if (profile.supports_amd_shader_explicit_vertex_parameter) {
             ctx.AddExtension("SPV_AMD_shader_explicit_vertex_parameter");
         } else if (profile.supports_fragment_shader_barycentric) {
-            ctx.AddExtension("SPV_KHR_fragment_shader_barycentric");
-            ctx.AddCapability(spv::Capability::FragmentBarycentricKHR);
+            if (!profile.barycentric_via_gs) { // sotc: plain inputs from the geometry shader
+                ctx.AddExtension("SPV_KHR_fragment_shader_barycentric");
+                ctx.AddCapability(spv::Capability::FragmentBarycentricKHR);
+            }
             ctx.AddCapability(spv::Capability::InterpolationFunction);
         }
         if (info.loads.Get(IR::Attribute::SampleIndex) ||

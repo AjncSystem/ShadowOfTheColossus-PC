@@ -1,11 +1,12 @@
-# Shadow of the Colossus — PC native port · v0.60.1-plus
+# Shadow of the Colossus — PC native port · v0.60.3-plus
 
-**The original 0.60.1, plus CPUs without BMI1 (pre-Haswell), no crash with high quality textures, a
-smaller readback window and 120 Hz fullscreen.** Everything in
-[AjncSystem's 0.60.1](https://github.com/AjncSystem/ShadowOfTheColossus-PC) (the in-game menu,
-textures on GTX 10xx cards, 60 FPS through the game's own 60 FPS mode, heap guards no longer
-rebuilt every frame and HUD-less frame generation as an option, the last four from this fork; the
-title-screen hang fix, low-memory PCs, a `user` folder per copy), with this fork's work on top.
+**The original 0.60.3, plus CPUs without BMI1 (pre-Haswell), CPUs with 4 threads and 120 Hz
+fullscreen.** Everything in [AjncSystem's 0.60.3](https://github.com/AjncSystem/ShadowOfTheColossus-PC)
+(the game can be finished from start to end; the in-game menu with quick settings; textures on
+GTX 10xx cards, 60 FPS through the game's own 60 FPS mode, faster heap guards, HUD-less frame
+generation as an option, no crash with high quality textures and the smaller readback window, all
+from this fork; the title-screen hang fix, low-memory PCs, a `user` folder per copy), with this
+fork's work on top.
 
 ![Shrine of Worship, 60 FPS mode, RTX 5060 Ti (FPS from RTSS)](docs/img/sotc-fork.gif)
 
@@ -15,11 +16,10 @@ What it adds:
   by equivalent routines at startup, only on those CPUs (Oussama268), also in code reached only
   through jump tables (a hang on the first loading screen on a real one). AVX is still required.
   Confirmed on a real one (issue #88 of the original: played up to the first colossus).
-- **No crash with high quality textures** (`guest offset 0x1a371`, issue #186 of the original):
-  when the game's page pool runs low, textures ask for less detail and the game frees memory
-  (`SOTC_LOD_POOL_LOW=0` turns it off; sent to the original as [PR #191](https://github.com/AjncSystem/ShadowOfTheColossus-PC/pull/191)).
-- **Smaller readback window**, 64 KiB: fewer GPU-written pages are downloaded and unprotected
-  for nothing (`SOTC_RB_NARROW=0`).
+- **CPUs with 4 threads** (4 cores without SMT, 2 cores with SMT): two of the port's GPU threads no
+  longer spin on a core while they wait, so the game's threads get it. A Ryzen 7 held to 4 logical
+  processors stayed stuck loading the attract demo; now it runs at 76 FPS (60 FPS mode). With more
+  than 8 logical processors nothing changes.
 - **Fullscreen at 120 Hz** on 144/165 Hz monitors, so every frame stays on screen as long (Anthonypc23).
 - The launcher's self-update follows this fork's releases; the launcher no longer stops when its
   console refuses writes (issue #104).
@@ -48,6 +48,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.60.3-plus** | **Lucas-blip-png fork:** all of the original's **0.60.3** (the game can be finished; quick settings in the in-game menu), plus **CPUs with 4 threads** (the GPU threads no longer spin on a core the game needs: from stuck loading to 76 FPS on 4 logical processors), **CPUs without BMI1** and **120 Hz fullscreen**. |
 | **0.60.3** | **The game can be finished from start to end** (played from the last colossus through the ending and credits): fix for the high quality textures crash in wide views (#186), fix for the crash on the load after the credits, +2.7% FPS at the Shrine. |
 | **0.60.2** | **Quick settings in the in-game menu** (60 FPS, frame generation, high quality textures, far shadows, volume: apply at once and are kept), **the mouse works in the menu**, **animated loading screen while the shaders are prepared** at start. |
 | **0.60.1-plus** | **Lucas-blip-png fork:** all of the original's **0.60.1** (which already has this fork's GTX 10xx textures, 60 FPS through the game's own mode, faster heap guards and HUD-less frame generation), plus **CPUs without BMI1** (Oussama268, with the fix for the hang on the first loading screen), **no crash with high quality textures** (0x1a371), a smaller readback window and **120 Hz fullscreen** (Anthonypc23). |

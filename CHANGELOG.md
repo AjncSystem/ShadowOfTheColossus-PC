@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.60.3-plus — 2026-10-20 (fork Lucas-blip-png)
+- A 0.60.1-plus em cima da **0.60.3** do original: o jogo é zerável do início ao fim, o **ajuste
+  rápido no menu dentro do jogo** (60 FPS, geração de quadros, texturas em alta, sombras distantes
+  e volume sem sair do jogo), o mouse solto no menu e a tela de carregamento animada na montagem
+  dos shaders. A válvula das texturas em alta (#191) e a janela de readback de 64 KiB (#196), que
+  eram só deste fork, agora fazem parte do original.
+- **CPUs com 4 threads** (4 núcleos sem SMT ou 2 com SMT): o gravador de comandos da GPU dorme 2 ms
+  quando o processo tem até 8 processadores lógicos, em vez de girar num núcleo inteiro, e o
+  processador de comandos cede a vez quando todas as filas estão esperando (`SOTC_CP_YIELD=0`
+  desliga). Demo de abertura, modo 60 FPS, Ryzen 7 5700X preso a 4 processadores lógicos: antes
+  ficava parado no carregamento, agora 76 FPS (mínima 65). Com 16 processadores lógicos, igual
+  (94 FPS). O log mostra `GPU recorder: N logical processors, idle wait N us`;
+  `SOTC_REC_SLEEP_US` continua mandando.
+- **A emulação de BMI1 não pesa no mundo aberto:** demo de abertura no modo 60 FPS, todos os
+  núcleos, com a emulação forçada (`SOTC_EMULATE_BMI=1`) 93,3 e 93,4 FPS contra 91,2 e 92,2 sem
+  ela. Nas CPUs sem BMI1 o FPS baixo no mundo aberto vem da CPU, não da emulação.
+- Testado: demo de abertura com 4 processadores lógicos 77,1 FPS (mínima 68,5); Santuário com a
+  emulação, o relógio do Windows e as texturas em alta forçados (`SOTC_EMULATE_BMI=1`,
+  `SOTC_TSC=qpc`, `SOTC_LOD_LINGER=1`): sem falhas, imagem normal, 46 FPS.
+
 ## 0.60.3 — 2026-10-20
 **O jogo é zerável do início ao fim.** Jogado do save antes do último colosso até a luta com o
 Malus, as cenas finais e os créditos, com "Texturas em alta qualidade", modo PS4 Pro e 60 FPS
@@ -25,6 +45,7 @@ ligados. Obrigado a **Lucas-blip-png**.
   ficava parada, às vezes por minutos depois de atualizar o driver), com fundo preto opaco e
   animação no centro (círculo girando, título pulsando, "Carregando…").
 - Menu com título e Ajuste rápido no idioma do lançador.
+
 ## 0.60.1-plus — 2026-10-20 (fork Lucas-blip-png)
 - A 0.59-plus5 em cima da **0.60.1** do original. Da 0.60.1: o **menu dentro do jogo** (Insert, F1
   ou L3+R3; nosekefik) e as sobras do Bloodborne removidas (Oussama268). Da 0.60: o relógio do jogo

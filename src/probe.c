@@ -823,7 +823,7 @@ static void apply_sotc_cpu_patches(const char *path, const Segment *segments, ui
             code[n++]=(SotcCodeSegment){segments[s].address,segments[s].size};
     /* The last 16 KiB of the trampoline area hold the engine command line (apply_sotc_cmdline). */
     SotcPatchRequest request={image,size,image+round_page(size),SOTC_TRAMPOLINE_SIZE-16384,eh,eh_size,
-                              code,n,offsets,(uint32_t)functions,tables,(uint32_t)table_count,eboot_end};
+                              code,n,offsets,(uint32_t)functions,tables,(uint32_t)table_count,eboot_end,NULL};
 #ifdef _WIN32
     request.tsc_clock=tsc_clock;
 #endif

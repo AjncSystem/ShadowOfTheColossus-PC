@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <iterator>
 #include "common/types.h"
+#include "video_core/sotc_live.h"
 
 namespace SotcLod {
 
@@ -54,6 +55,9 @@ inline void Collect(u64 (&entries)[256]) {
         const char* v = std::getenv("SOTC_LOD_LEVEL");
         return v ? std::strtoull(v, nullptr, 0) & 0xf : 2;
     }();
+    // The in-game menu can switch high quality textures while playing (sotc_live.h).
+    const int live = SotcLive::lod_linger.load(std::memory_order_relaxed);
+    const u32 linger_now = live >= 0 ? static_cast<u32>(live) : linger;
     static u32 idle[256] = {}; // reports since the bank's last use (never used: all ones)
     static const bool idle_ready = [] {
         std::fill(std::begin(idle), std::end(idle), 0xffffffffu);
@@ -67,14 +71,14 @@ inline void Collect(u64 (&entries)[256]) {
             uses[i].store(0, std::memory_order_relaxed);
             idle[i] = 0;
             last_count[i] = std::min<u32>(n * 256u, 0xffffff);
-        } else if (idle[i] < linger) {
+        } else if (idle[i] < linger_now) {
             ++idle[i];
         }
         // Banks not seen lately read as not sampled (15), as on the hardware: the game may then
         // drop their fine mips. SOTC_LOD_KEEP=1 reports them as sampled with no samples instead
         // (what the zeroed buffer said before; not soak-tested with the streaming).
         static const bool keep = std::getenv("SOTC_LOD_KEEP") != nullptr;
-        entries[i] = idle[i] < linger ? (level << 56) | (u64{std::max<u32>(last_count[i], 1)} << 32)
+        entries[i] = idle[i] < linger_now ? (level << 56) | (u64{std::max<u32>(last_count[i], 1)} << 32)
                      : keep           ? level << 56
                                       : u64{0xf} << 56;
     }

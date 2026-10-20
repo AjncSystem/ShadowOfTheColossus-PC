@@ -150,17 +150,28 @@ static ABI int32_t audio_close(int32_t handle) {
 }
 /* SOTC_VOLUME: master volume in percent (default 100, 25-400; #95, the game is quiet). Above
  * 100 the peaks go through a soft limiter instead of clipping hard. */
+static volatile float master_volume_value=-1.0f;
 static float master_volume(void) {
-    static float v=-1.0f;
+    float v=master_volume_value;
     if (v<0.0f) {
         const char *e=getenv("SOTC_VOLUME");
         double pct=e && e[0] ? atof(e) : 100.0;
         if (pct<25.0) pct=25.0;
         if (pct>400.0) pct=400.0;
         v=(float)(pct/100.0);
+        master_volume_value=v;
     }
     return v;
 }
+/* The in-game menu's volume (bbport_overlay.cpp): percent, applied from the next buffer. */
+void runtime_audio_set_volume_percent(int pct);
+int runtime_audio_volume_percent(void);
+void runtime_audio_set_volume_percent(int pct) {
+    if (pct<25) pct=25;
+    if (pct>400) pct=400;
+    master_volume_value=(float)pct/100.0f;
+}
+int runtime_audio_volume_percent(void) { return (int)(master_volume()*100.0f+0.5f); }
 
 /* Linear up to 0.8 of full scale, then a tanh knee that never reaches 1. */
 static inline float soft_limit(float v) {

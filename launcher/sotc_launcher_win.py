@@ -176,8 +176,14 @@ EFFECTS = [('fx_vignette', ('Vinheta (cantos escurecidos)', 'Vignette (darkened 
             'r_vignetteOverrideEnable=1 r_vignetteEnable=0'),
            ('fx_fog', ('Névoa atmosférica', 'Atmospheric fog'), 'fog_enable=0'),
            ('fx_ssao', ('Oclusão ambiente (SSAO)', 'Ambient occlusion (SSAO)'), 'AO_Mode=0')]
-OUTPUTS = [('1280x720', ('1280 × 720 (720p)', '1280 × 720 (720p)')), ('1920x1080', ('1920 × 1080 (1080p)', '1920 × 1080 (1080p)')),
-           ('2560x1440', ('2560 × 1440 (1440p)', '2560 × 1440 (1440p)')), ('3840x2160', ('3840 × 2160 (4K)', '3840 × 2160 (4K)'))]
+# Common screen sizes: 16:9, 16:10, 21:9 (ultrawide) and 32:9 (super ultrawide).
+# 5120x2160 is left out: the game faults at start (memory), 3840x2160 runs.
+SCREENS = [('1920x1080', '16:9, 1080p'), ('2560x1440', '16:9, 1440p'), ('3840x2160', '16:9, 4K'),
+           ('1920x1200', '16:10'), ('2560x1600', '16:10'),
+           ('2560x1080', '21:9'), ('3440x1440', '21:9'), ('3840x1600', '21:9'),
+           ('3840x1080', '32:9'), ('5120x1440', '32:9')]
+OUTPUTS = [('1280x720', ('1280 × 720 (16:9, 720p)', '1280 × 720 (16:9, 720p)'))] + [
+    (size, (f"{size.replace('x', ' × ')} ({label})",) * 2) for size, label in SCREENS]
 UPSCALERS = [('fsr1', ('FSR 1 (AMD, qualquer placa)', 'FSR 1 (AMD, any GPU)')),
              ('bilinear', ('Bilinear (simples)', 'Bilinear (plain)'))]
 SHARPNESS = [('0', ('Alta', 'High')), ('250', ('Média (padrão)', 'Medium (default)')), ('600', ('Baixa', 'Low')),
@@ -339,6 +345,12 @@ def game_environment(s):
         env['SOTC_FLUSH_EVERY'], env['SOTC_RB_AHEAD'] = '0', '0'
     env['SOTC_NEO'] = '1' if s.get('neo') else '0'
     env['SOTC_OUTPUT_RES'] = s.get('output_res') or '1920x1080'
+    # The game renders at the output size (sotc.py scales it down above about 4.2 million pixels; the
+    # upscaler takes it to the output). 720p renders at 1080p, as on PS4; the PS4 Pro path keeps its
+    # own sizes.
+    output = env['SOTC_OUTPUT_RES']
+    if output not in ('1280x720', '1920x1080') and not s.get('neo'):
+        env['SOTC_RENDER_RES'] = output
     env['BB_FSR1'] = '1' if s.get('upscaler', 'fsr1') == 'fsr1' else '0'
     if s.get('sharpness') == 'off':
         env['BB_RCAS'] = '0'
@@ -835,10 +847,16 @@ class Launcher:
                      '(the 5th colossus flying away, the 2nd colossus cutscene that never starts).'))
         self.section(f, _('Resolução', 'Resolution'))
         self.row(f, _('Saída', 'Output'), self.choice(f, 'output_res', OUTPUTS),
-                 _('O jogo renderiza em 1080p, como no PS4; a imagem é ampliada ou reduzida para a saída. '
+                 _('O jogo renderiza nesse tamanho; acima de cerca de 4,2 milhões de pixels (4K, 3440 × 1440) num '
+                   'tamanho menor, que o upscaler amplia: maior que isso, os detalhes finos das texturas somem. '
+                   'Mais largo que 16:9 (21:9, 32:9) mostra mais dos lados (Hor+), sem esticar; menus e vídeos '
+                   'podem ficar esticados. 720p renderiza em 1080p; o modo PS4 Pro usa os tamanhos do Pro. '
                    'Num monitor menor que a saída, a janela cabe na tela e a tela cheia usa o monitor todo.',
-                   'The game renders at 1080p, as on PS4; the image is scaled to the output. On a monitor '
-                   'smaller than the output the window fits the screen and fullscreen uses the whole monitor.'))
+                   'The game renders at this size; above about 4.2 million pixels (4K, 3440 × 1440) at a smaller '
+                   'size that the upscaler enlarges: larger than that, the fine texture detail disappears. Wider '
+                   'than 16:9 (21:9, 32:9) shows more at the sides (Hor+), not stretched; menus and videos may '
+                   'look stretched. 720p renders at 1080p; PS4 Pro mode uses the Pro sizes. On a monitor smaller '
+                   'than the output the window fits the screen and fullscreen uses the whole monitor.'))
         self.row(f, _('Upscaler', 'Upscaler'), self.choice(f, 'upscaler', UPSCALERS),
                  _('FSR 1 amplia com bordas nítidas (acima de 1080p).', 'FSR 1 upscales with sharp edges (above 1080p).'))
         self.row(f, _('Nitidez (RCAS)', 'Sharpening (RCAS)'), self.choice(f, 'sharpness', SHARPNESS))

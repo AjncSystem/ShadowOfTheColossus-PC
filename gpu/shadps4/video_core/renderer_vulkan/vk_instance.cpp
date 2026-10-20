@@ -206,6 +206,12 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
     if (properties.vendorID == VendorAmd) {
         EmulatorSettings.SetDirectMemoryAccessDefault(false);
     }
+    // sotc: without shaderInt64 (Intel Iris Xe) the shaders avoid 64-bit integers where they can,
+    // and direct memory access (64-bit page table lookups in every access) is off by default.
+    if (!physical_device.getFeatures().shaderInt64) {
+        EmulatorSettings.SetNoInt64(true);
+        EmulatorSettings.SetDirectMemoryAccessDefault(false);
+    }
     CollectDeviceParameters();
     ASSERT_MSG(properties.apiVersion >= TargetVulkanApiVersion,
                "Vulkan {}.{} is required, but only {}.{} is supported by device!",

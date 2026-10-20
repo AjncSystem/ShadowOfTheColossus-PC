@@ -1,7 +1,7 @@
 # Changelog
 
 ## 0.59-plus2 — 2026-10-20 (fork Lucas-blip-png)
-Obrigado a **Oussama268**.
+Obrigado a **Oussama268** e **KingJhoss**.
 - **Processadores sem BMI1/LZCNT/MOVBE** (Intel Core i3/i5/i7 de 2ª e 3ª geração, Xeon E3 v1/v2
   e outros anteriores ao Haswell; AMD FX), que antes recebiam "This CPU is not supported". O jogo
   usa ~5.000 instruções dessas do processador do PS4; nessas CPUs elas são trocadas por rotinas
@@ -12,6 +12,9 @@ Obrigado a **Oussama268**.
   (`SOTC_EMULATE_BMI=1`): no Santuário 50 FPS com e sem emulação, e o demo de abertura inteiro até a
   tela título com a imagem igual, sem nenhuma falha. Falta a confirmação de quem tem uma CPU
   dessas (issues #70, #88, #89 e #164–#166 do original).
+- **Blocos pretos nos quadros gerados pelo FSR 3** nas AMD RX 7000: a mesma barreira entre limpar e
+  copiar a imagem que corrigiu os quadros do jogo (issue #43 do original) agora vale também para os
+  gerados. Feito e testado numa RX 7600 pelo KingJhoss (PR #1 deste fork).
 - **Botão JOGAR cortado** com a escala do Windows acima de 100%: a barra de baixo do lançador
   agora cresce junto (PR #171 do original).
 - Nas GTX 10xx, a linha "No fragment shader barycentrics: emulated by a geometry shader" agora

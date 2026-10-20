@@ -444,7 +444,7 @@ void EmitContext::DefineInputs() {
             }
         }
 
-        // Without a barycentric extension the generated geometry shader provides them
+        // sotc: without a barycentric extension the generated geometry shader provides them
         // (emit_spirv_bary_gs.cpp), at the locations of this layout.
         const auto bary_layout =
             ComputeBaryEmulationLayout(info, runtime_info.hw.fs, profile);
@@ -482,7 +482,7 @@ void EmitContext::DefineInputs() {
             const u32 num_components = info.loads.NumComponents(param);
             const auto [primary, auxiliary] = info.fs_interpolation[i];
             const Id type = F32[num_components];
-            // Emulation fallback: per-vertex inputs are single flat values (P10 = P20 = 0).
+            // sotc: emulation fallback: per-vertex inputs are single flat values (P10 = P20 = 0).
             const bool per_vertex_array =
                 primary == Qualifier::PerVertex && !bary_emulation_fallback;
             const Id attr_id = [&] {
@@ -626,8 +626,8 @@ void EmitContext::DefineVertexBlock() {
     const std::array<Id, 8> zero{f32_zero_value, f32_zero_value, f32_zero_value, f32_zero_value,
                                  f32_zero_value, f32_zero_value, f32_zero_value, f32_zero_value};
     output_position = DefineVariable(F32[4], spv::BuiltIn::Position, spv::StorageClass::Output);
-    // Barycentric emulation adds a geometry stage to some pipelines only: the same vertex shader
-    // must give the same positions with and without it (depth pre-pass, equal depth tests).
+    // sotc: barycentric emulation adds a geometry stage to some pipelines only: the same vertex
+    // shader must give the same positions with and without it (depth pre-pass, equal depth tests).
     if (profile.emulate_fragment_barycentrics) {
         Decorate(output_position, spv::Decoration::Invariant);
     }

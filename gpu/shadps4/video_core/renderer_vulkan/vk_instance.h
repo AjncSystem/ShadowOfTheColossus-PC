@@ -370,7 +370,7 @@ public:
         return properties.limits.maxComputeSharedMemorySize;
     }
 
-    /// Returns the number of vec4 locations a geometry shader can pass to the fragment shader.
+    /// sotc: the number of vec4 locations a geometry shader can pass to the fragment shader.
     u32 MaxGeometryToFragmentLocations() const {
         const auto& limits = properties.limits;
         // Every one of the up to 3 vertices emitted also carries gl_Position.

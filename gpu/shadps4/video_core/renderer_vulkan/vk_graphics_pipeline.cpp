@@ -28,9 +28,9 @@ static constexpr std::array LogicalStageToStageBit = {
     vk::ShaderStageFlagBits::eCompute,
 };
 
-// No fragment shader barycentrics (NVIDIA Pascal, issue #57): a generated geometry shader gives
-// the fragment shader the vertex values and barycentrics it interpolates with. Empty when the
-// fragment shader does not need one.
+// sotc: no fragment shader barycentrics (NVIDIA Pascal, issue #57): a generated geometry shader
+// gives the fragment shader the vertex values and barycentrics it interpolates with. Empty when
+// the fragment shader does not need one.
 static std::vector<u32> BuildBaryEmulationGs(
     const Shader::Profile& profile, const GraphicsPipelineKey& key,
     std::span<const Shader::Info*, MaxShaderStages> infos,

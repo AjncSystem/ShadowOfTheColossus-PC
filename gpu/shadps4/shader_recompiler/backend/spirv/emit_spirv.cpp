@@ -436,7 +436,7 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
             ctx.AddCapability(spv::Capability::FragmentBarycentricKHR);
             ctx.AddCapability(spv::Capability::InterpolationFunction);
         } else if (profile.emulate_fragment_barycentrics) {
-            // Centroid/sample barycentrics interpolate the emulated input at that position.
+            // sotc: centroid/sample barycentrics interpolate the emulated input there.
             ctx.AddCapability(spv::Capability::InterpolationFunction);
         }
         if (info.loads.Get(IR::Attribute::SampleIndex) ||

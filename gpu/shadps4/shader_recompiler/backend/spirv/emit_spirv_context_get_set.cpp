@@ -110,6 +110,8 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
         }();
         return param.is_integer ? ctx.OpBitcast(ctx.F32[1], value) : value;
     }
+    // sotc: emulated barycentrics are a vec3 input like BaryCoordKHR; without their geometry
+    // shader (fallback) they read as 0.
     if ((IR::IsBarycentricCoord(attr) || attr == IR::Attribute::BaryCoordPullModel) &&
         ctx.bary_emulation_fallback) {
         return ctx.f32_zero_value;

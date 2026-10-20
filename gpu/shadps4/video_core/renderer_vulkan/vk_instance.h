@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <string>
 #include <span>
 #include <unordered_map>
@@ -253,6 +254,31 @@ public:
     /// sotc: whether a required subgroup size may be given for this stage.
     bool CanRequireSubgroupSize(vk::ShaderStageFlagBits stage) const {
         return bool(vk13_props.requiredSubgroupSizeStages & stage);
+    }
+
+    /// sotc: the subgroup size a pipeline stage is created with, or 0 to leave it to the driver.
+    /// Intel runs 8, 16 or 32 lanes: left free, its compiler builds each shader for several SIMD
+    /// widths, and first-time compiles took from seconds to minutes (the screen froze meanwhile),
+    /// while the recompiler lowered wave64 code for SubgroupSize() lanes anyway. Intel stages are
+    /// pinned to that size; SOTC_INTEL_PIN_SUBGROUP=0 turns it off. From AjncSystem#81 (jownatan).
+    u32 RequiredSubgroupSize(vk::ShaderStageFlagBits stage) const {
+        if (IsSubgroupSize64Supported()) {
+            return CanRequireSubgroupSize(stage) ? 64u : 0u;
+        }
+        if (stage == vk::ShaderStageFlagBits::eCompute && IsComputeSubgroupSize32Required()) {
+            return 32u;
+        }
+        static const bool pin_intel = [] {
+            const char* v = std::getenv("SOTC_INTEL_PIN_SUBGROUP");
+            return !v || std::atoi(v) != 0;
+        }();
+        const u32 size = SubgroupSize();
+        if (pin_intel && GetVendorID() == 0x8086 && vk13_features.subgroupSizeControl &&
+            CanRequireSubgroupSize(stage) && size >= vk13_props.minSubgroupSize &&
+            size <= vk13_props.maxSubgroupSize) {
+            return size;
+        }
+        return 0u;
     }
 
     /// Returns true when VK_KHR_workgroup_memory_explicit_layout is supported.

@@ -200,6 +200,13 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                  properties.deviceName.data(), properties.vendorID,
                  GetDriverVersionName().c_str(), VK_VERSION_MAJOR(properties.apiVersion),
                  VK_VERSION_MINOR(properties.apiVersion));
+    // sotc: direct memory access (the launcher's "full water reflections") drew stripes over
+    // shadows and water on AMD (issues #57, #28; the players confirmed that turning it off fixes
+    // them): off there unless BB_DIRECT_MEMORY_ACCESS asks for it.
+    constexpr u32 VendorAmd = 0x1002;
+    if (properties.vendorID == VendorAmd) {
+        EmulatorSettings.SetDirectMemoryAccessDefault(false);
+    }
     CollectDeviceParameters();
     ASSERT_MSG(properties.apiVersion >= TargetVulkanApiVersion,
                "Vulkan {}.{} is required, but only {}.{} is supported by device!",

@@ -6,6 +6,7 @@
 #include <boost/container/small_vector.hpp>
 
 #include "common/assert.h"
+#include "shader_recompiler/backend/spirv/emit_spirv_bary_gs.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_discard_frag.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -26,6 +27,76 @@ static constexpr std::array LogicalStageToStageBit = {
     vk::ShaderStageFlagBits::eGeometry,
     vk::ShaderStageFlagBits::eCompute,
 };
+
+// sotc: no fragment shader barycentrics (NVIDIA Pascal, issue #57): a generated geometry shader
+// gives the fragment shader the vertex values and barycentrics it interpolates with. Empty when
+// the fragment shader does not need one.
+static std::vector<u32> BuildBaryEmulationGs(
+    const Shader::Profile& profile, const GraphicsPipelineKey& key,
+    std::span<const Shader::Info*, MaxShaderStages> infos,
+    std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos) {
+    using namespace Shader::Backend::SPIRV;
+    const auto* fs_info = infos[u32(Shader::SwStage::Fragment)];
+    if (!profile.emulate_fragment_barycentrics || !fs_info) {
+        return {};
+    }
+    const auto& fs = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
+    const auto layout = ComputeBaryEmulationLayout(*fs_info, fs, profile);
+    if (!layout.active) {
+        return {};
+    }
+    if (infos[u32(Shader::SwStage::Geometry)] || infos[u32(Shader::SwStage::TessellationEval)]) {
+        LOG_WARNING(Render_Vulkan,
+                    "Barycentric emulation after a guest geometry/tessellation stage is not "
+                    "supported (fs {:#x})",
+                    fs_info->pgm_hash);
+        return {};
+    }
+
+    BaryGsParams params{};
+    switch (key.prim_type) {
+    case AmdGpu::PrimitiveType::PointList:
+        params.input = BaryGsInput::Points;
+        break;
+    case AmdGpu::PrimitiveType::LineList:
+    case AmdGpu::PrimitiveType::LineStrip:
+    case AmdGpu::PrimitiveType::LineLoop:
+        params.input = BaryGsInput::Lines;
+        break;
+    case AmdGpu::PrimitiveType::AdjLineList:
+    case AmdGpu::PrimitiveType::AdjLineStrip:
+    case AmdGpu::PrimitiveType::AdjTriangleList:
+    case AmdGpu::PrimitiveType::AdjTriangleStrip:
+        LOG_WARNING(Render_Vulkan, "Barycentric emulation with adjacency primitives (fs {:#x})",
+                    fs_info->pgm_hash);
+        return {};
+    default:
+        // Triangles, and rect/quad lists after their generated tessellation stages.
+        params.input = BaryGsInput::Triangles;
+        break;
+    }
+    const bool aux_tess = key.prim_type == AmdGpu::PrimitiveType::RectList ||
+                          key.prim_type == AmdGpu::PrimitiveType::QuadList;
+    params.clip_distance_attr = fs.clip_distance_emulation;
+    // The generated tessellation stages keep the inputs at param_index.
+    params.input_location_offset = !aux_tess && fs.clip_distance_emulation ? 1U : 0U;
+    if (const auto* vs_info = infos[u32(Shader::SwStage::Vertex)]; vs_info && !aux_tess) {
+        if (vs_info->stores.GetAny(Shader::IR::Attribute::ClipDistance) &&
+            !profile.needs_clip_distance_emulation) {
+            params.num_clip_distances = 8;
+        }
+        if (vs_info->stores.GetAny(Shader::IR::Attribute::CullDistance)) {
+            params.num_cull_distances = 8;
+        }
+        if (vs_info->stores.GetAny(Shader::IR::Attribute::RenderTargetIndex) ||
+            vs_info->stores.GetAny(Shader::IR::Attribute::ViewportIndex)) {
+            LOG_WARNING(Render_Vulkan,
+                        "Barycentric emulation drops the vertex shader layer/viewport (vs {:#x})",
+                        vs_info->pgm_hash);
+        }
+    }
+    return EmitBaryEmulationGeometryShader(layout, fs, params);
+}
 
 GraphicsPipeline::GraphicsPipeline(
     const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
@@ -188,6 +259,17 @@ GraphicsPipeline::GraphicsPipeline(
             .module = modules[stage],
             .pName = "main",
         });
+    } else {
+        if (!preloading) {
+            sdata.gs = BuildBaryEmulationGs(profile, key, infos, runtime_infos);
+        }
+        if (!sdata.gs.empty()) {
+            shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
+                .stage = vk::ShaderStageFlagBits::eGeometry,
+                .module = CompileSPV(sdata.gs, instance.GetDevice()),
+                .pName = "main",
+            });
+        }
     }
     stage = u32(Shader::SwStage::TessellationControl);
     if (infos[stage]) {

@@ -52,6 +52,10 @@ struct Profile {
     bool needs_unorm_fixup{};
     bool needs_clip_distance_emulation{};
     bool supports_shader_stencil_export{};
+    /// sotc: no barycentric extension: per-vertex inputs and barycentrics come from a generated
+    /// geometry shader (emit_spirv_bary_gs.h).
+    bool emulate_fragment_barycentrics{};
+    u32 max_fragment_input_locations{};
 
     bool operator==(const Profile&) const = default;
 };

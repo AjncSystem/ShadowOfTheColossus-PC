@@ -9,8 +9,10 @@
 
 #include <functional>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace Storage {
@@ -59,6 +61,15 @@ private:
     /// name; ordered like an NTFS directory listing. Emptied by FinishPreload.
     std::map<std::string, std::vector<u8>> prefetched{};
     bool prefetch_active{};
+    /// sotc: names of the loose cache files on disk (listed by Prefetch, added by Save). A Load
+    /// of a file not in it returns nothing without touching the disk: every new shader's
+    /// collision check (RegisterShaderBinary) opened a missing file on the command processor,
+    /// ~28 ms each on Windows (31 s of stalls in 7 minutes of the attract demo, empty cache).
+    bool MayExist(const std::filesystem::path& path);
+    void AddKnown(const std::filesystem::path& path);
+    std::unordered_set<std::string> known_files{};
+    std::mutex known_mutex{};
+    bool known_valid{};
 };
 
 } // namespace Storage

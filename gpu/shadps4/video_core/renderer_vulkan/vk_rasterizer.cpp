@@ -472,10 +472,15 @@ struct ShadowReuseState {
 } // namespace
 
 bool Rasterizer::ReuseShadowCascade() {
-    static const int mode = [] {
+    static const int mode = [this] {
         const char* v = std::getenv("SOTC_SHADOW_REUSE");
         if (!v) {
-            return 1;
+            // sotc: off by default without fragment shader barycentrics (GTX 1080 Ti, issue #57
+            // fork): the far end of the shrine hall switched between lit and shadowed every few
+            // frames with reuse on, and was steady with it off. SOTC_SHADOW_REUSE=1 forces it.
+            const bool barycentrics = instance.IsFragmentShaderBarycentricSupported() ||
+                                      instance.IsAmdShaderExplicitVertexParameterSupported();
+            return barycentrics ? 1 : 0;
         }
         return v[0] == '0' ? 0 : (v[0] == 'c' ? 2 : 1);
     }();

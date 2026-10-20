@@ -304,6 +304,16 @@ static bool AsyncShadersEnabled() {
     return enabled;
 }
 
+// sotc: SOTC_BARY_GS=0 turns off the barycentric emulation on GPUs without the extension
+// (NVIDIA Pascal, issue #57); per-vertex inputs then read as flat, as before.
+static bool BaryEmulationEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_BARY_GS");
+        return !v || v[0] != '0';
+    }();
+    return enabled;
+}
+
 // sotc: SOTC_ASYNC_TRANSLATE=0 translates every graphics shader on the command processor (see
 // AsyncPipelineJob::Translate).
 static bool AsyncTranslateEnabled() {
@@ -392,7 +402,19 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
+        .emulate_fragment_barycentrics = !instance_.IsAmdShaderExplicitVertexParameterSupported() &&
+                                         !instance_.IsFragmentShaderBarycentricSupported() &&
+                                         instance_.IsGeometryStageSupported() &&
+                                         BaryEmulationEnabled(),
+        .max_fragment_input_locations = instance_.MaxGeometryToFragmentLocations(),
     };
+    SotcStats::bary_emulated.store(profile.emulate_fragment_barycentrics);
+    if (profile.emulate_fragment_barycentrics) {
+        LOG_WARNING(Render_Vulkan,
+                    "No fragment shader barycentrics: emulated with a geometry shader ({} "
+                    "locations)",
+                 profile.max_fragment_input_locations);
+    }
     WarmUp();
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});

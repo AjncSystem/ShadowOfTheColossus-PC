@@ -1,5 +1,20 @@
 # Changelog
 
+## Próxima versão
+Correções para placas NVIDIA GTX 10xx (Pascal), testadas numa GTX 1080 Ti (fork de JihedMrouki).
+- **Texturas nas placas sem `VK_KHR_fragment_shader_barycentric`** (issue #57): o SotC interpola
+  à mão quase todas as entradas dos fragment shaders; sem a extensão elas ficavam constantes por
+  triângulo (superfícies sem textura). Um geometry shader gerado entrega ao fragment shader os
+  valores dos três vértices e as coordenadas baricêntricas. `SOTC_BARY_GS=0` desliga.
+- **Sombras distantes sem piscar** nessas placas: o reaproveitamento das cascatas distantes
+  (`SOTC_SHADOW_REUSE`) vem desligado nelas; `SOTC_SHADOW_REUSE=1` liga.
+- **Menos engasgos ao compilar shaders:** cada shader novo abria um arquivo inexistente do cache
+  (~28 ms no Windows). Demo da tela de título com cache vazio: 32 → 4 s de engasgos de shaders.
+- **Lançador:** botão **Pré-compilar shaders** (o demo da tela de título roda sozinho numa janela
+  atrás das outras e enche o cache, ~10 min), oferecido também quando o cache foi refeito;
+  opção **Tela de carregamento durante o jogo**; **Contador de FPS no jogo** (só o número).
+- O cache de shaders é refeito na primeira abertura.
+
 ## 0.59 — 2026-10-20
 Obrigado a **Oussama268, Lucas-blip-png e EdouardSence**.
 

@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/div_ceil.h"
+#include "shader_recompiler/backend/spirv/emit_spirv_bary_gs.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/ir/attribute.h"
@@ -443,6 +444,31 @@ void EmitContext::DefineInputs() {
             }
         }
 
+        // sotc: without a barycentric extension the generated geometry shader provides them
+        // (emit_spirv_bary_gs.cpp), at the locations of this layout.
+        const auto bary_layout =
+            ComputeBaryEmulationLayout(info, runtime_info.hw.fs, profile);
+        const bool bary_emulated = profile.emulate_fragment_barycentrics && bary_layout.active;
+        bary_emulation_fallback = profile.emulate_fragment_barycentrics && !bary_layout.active;
+        if (bary_emulated) {
+            if (bary_layout.bary_smooth != BaryEmulationLayout::Unused) {
+                bary_coord = Name(DefineInput(F32[3], u32(bary_layout.bary_smooth)),
+                                  "bary_emu_smooth");
+            }
+            if (bary_layout.bary_nopersp != BaryEmulationLayout::Unused) {
+                bary_coord_nopersp = Name(DefineInput(F32[3], u32(bary_layout.bary_nopersp)),
+                                          "bary_emu_nopersp");
+                Decorate(bary_coord_nopersp, spv::Decoration::NoPerspective);
+                bary_coord_nopersp_sample = bary_coord_nopersp;
+            }
+            if (info.loads.GetAny(IR::Attribute::BaryCoordSmoothSample) &&
+                !ValidId(sample_index)) {
+                sample_index =
+                    DefineVariable(U32[1], spv::BuiltIn::SampleId, spv::StorageClass::Input);
+                Decorate(sample_index, spv::Decoration::Flat);
+            }
+        }
+
         const bool has_clip_distance_inputs = runtime_info.hw.fs.clip_distance_emulation;
         // Clip distances attribute vector is the last in inputs array
         const auto num_inputs = runtime_info.hw.fs.num_inputs - (has_clip_distance_inputs ? 1 : 0);
@@ -456,19 +482,29 @@ void EmitContext::DefineInputs() {
             const u32 num_components = info.loads.NumComponents(param);
             const auto [primary, auxiliary] = info.fs_interpolation[i];
             const Id type = F32[num_components];
+            // sotc: emulation fallback: per-vertex inputs are single flat values (P10 = P20 = 0).
+            const bool per_vertex_array =
+                primary == Qualifier::PerVertex && !bary_emulation_fallback;
             const Id attr_id = [&] {
-                const auto bind_location = input.param_index + (has_clip_distance_inputs ? 1 : 0);
-                if (primary == Qualifier::PerVertex &&
-                    profile.supports_fragment_shader_barycentric) {
+                const auto bind_location =
+                    profile.emulate_fragment_barycentrics
+                        ? u32(bary_layout.location[i])
+                        : input.param_index + (has_clip_distance_inputs ? 1 : 0);
+                if (per_vertex_array && (profile.supports_fragment_shader_barycentric ||
+                                         bary_emulated)) {
                     return Name(DefineInput(TypeArray(type, ConstU32(3U)), bind_location),
                                 fmt::format("fs_in_attr{}_p", i));
                 }
                 return Name(DefineInput(type, bind_location), fmt::format("fs_in_attr{}", i));
             }();
             if (primary == Qualifier::PerVertex) {
-                Decorate(attr_id, profile.supports_amd_shader_explicit_vertex_parameter
-                                      ? spv::Decoration::ExplicitInterpAMD
-                                      : spv::Decoration::PerVertexKHR);
+                if (profile.supports_amd_shader_explicit_vertex_parameter) {
+                    Decorate(attr_id, spv::Decoration::ExplicitInterpAMD);
+                } else if (profile.supports_fragment_shader_barycentric) {
+                    Decorate(attr_id, spv::Decoration::PerVertexKHR);
+                } else {
+                    Decorate(attr_id, spv::Decoration::Flat);
+                }
             } else if (primary != Qualifier::Smooth) {
                 Decorate(attr_id, primary == Qualifier::Flat ? spv::Decoration::Flat
                                                              : spv::Decoration::NoPerspective);
@@ -478,7 +514,7 @@ void EmitContext::DefineInputs() {
                                                                    : spv::Decoration::Sample);
             }
             input_params[i] = GetAttributeInfo(AmdGpu::NumberFormat::Float, attr_id, num_components,
-                                               false, false, primary == Qualifier::PerVertex);
+                                               false, false, per_vertex_array);
         }
 
         if (has_clip_distance_inputs) {
@@ -590,6 +626,11 @@ void EmitContext::DefineVertexBlock() {
     const std::array<Id, 8> zero{f32_zero_value, f32_zero_value, f32_zero_value, f32_zero_value,
                                  f32_zero_value, f32_zero_value, f32_zero_value, f32_zero_value};
     output_position = DefineVariable(F32[4], spv::BuiltIn::Position, spv::StorageClass::Output);
+    // sotc: barycentric emulation adds a geometry stage to some pipelines only: the same vertex
+    // shader must give the same positions with and without it (depth pre-pass, equal depth tests).
+    if (profile.emulate_fragment_barycentrics) {
+        Decorate(output_position, spv::Decoration::Invariant);
+    }
     const bool needs_clip_distance_emulation = sw_stage == SwStage::Vertex &&
                                                hw_stage == HwStage::Vertex &&
                                                profile.needs_clip_distance_emulation;

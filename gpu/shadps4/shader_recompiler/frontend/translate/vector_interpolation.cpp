@@ -102,11 +102,12 @@ void Translator::V_INTERP_MOV_F32(const GcnInst& inst) {
     auto& interp = info.fs_interpolation[attr_index];
     const u32 src_select = inst.src[0].code;
     ASSERT_MSG(src_select < 3, "Invalid V_INTERP_MOV_F32 selector {}", src_select);
-    ASSERT(attr.is_flat || src_select == 2 ||
-           profile.supports_amd_shader_explicit_vertex_parameter ||
-           profile.supports_fragment_shader_barycentric);
-    if (profile.supports_amd_shader_explicit_vertex_parameter ||
-        profile.supports_fragment_shader_barycentric) {
+    // sotc: emulate_fragment_barycentrics reads the vertex values like the KHR path (issue #57).
+    const bool per_vertex_inputs = profile.supports_amd_shader_explicit_vertex_parameter ||
+                                   profile.supports_fragment_shader_barycentric ||
+                                   profile.emulate_fragment_barycentrics;
+    ASSERT(attr.is_flat || src_select == 2 || per_vertex_inputs);
+    if (per_vertex_inputs) {
         // VSRC 0=P10, 1=P20, 2=P0
         interp.primary = Qualifier::PerVertex;
         IR::F32 result = ir.GetAttribute(attrib, inst.control.vintrp.chan, (src_select + 1) % 3);

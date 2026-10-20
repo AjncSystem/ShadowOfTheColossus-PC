@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import re
 import runpy
 import shutil
 import subprocess
@@ -129,8 +130,8 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
                 'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'volume': '100', 'library_dirs': [], 'keys': {},
-                'auto_setup': True, 'dlc_dir': '', 'framegen': 'off',
-                'check_updates': True, 'skip_version': ''}
+                'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'loading_screen': True,
+                'fps_counter': False, 'check_updates': True, 'skip_version': ''}
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
 KEY_INPUTS = [
     ('move_up', 'W', ('Andar para frente', 'Move forward')), ('move_down', 'S', ('Andar para trás', 'Move back')),
@@ -465,6 +466,11 @@ def game_environment(s):
     else:
         env['BB_RCAS'] = '1'
         env['BB_RCAS_ATTENUATION'] = str(s.get('sharpness') or '250')
+    # The port's loading screen over the game when it stops presenting frames for a second; off,
+    # only at startup (first frame, shader cache preload). The FPS counter is the compact overlay.
+    env['SOTC_LOADING_SCREEN'] = '1' if s.get('loading_screen', True) else '0'
+    if s.get('fps_counter'):
+        env['SOTC_OVERLAY'] = 'fps'
     env['SOTC_MOUSE'] = '1' if s.get('mouse', True) else '0'
     env['SOTC_MOUSE_SENS'] = str(s.get('mouse_sens') or '1.0')
     env['SOTC_MOUSE_INVERT'] = '1' if s.get('mouse_invert') else '0'
@@ -518,6 +524,8 @@ class Launcher:
         self.vars = {}
         self.process = self.job = None
         self.stopping = False
+        self.precompiling = None  # state of a "Precompile shaders" run (see precompile)
+        self.cache_rebuilt = False  # this session started a new shader cache (offer_precompile)
         self.output = queue.Queue()
         self.ui_calls = queue.Queue()
         self.gpu_text = _('• Verificando a placa de vídeo…', '• Checking the graphics card…')
@@ -794,6 +802,9 @@ class Launcher:
         self.play_button.pack(side='right', padx=(10, 24), pady=11)
         self.stop_button = ttk.Button(bar, text=_('Parar', 'Stop'), command=self.stop, state='disabled')
         self.stop_button.pack(side='right', pady=11)
+        self.precompile_button = ttk.Button(bar, text=_('Pré-compilar shaders', 'Precompile shaders'),
+                                            command=self.precompile)
+        self.precompile_button.pack(side='right', padx=(0, 10), pady=11)
         self.content = tk.Frame(right, bg=PANEL)
         self.content.pack(fill='both', expand=True)
 
@@ -1047,6 +1058,37 @@ class Launcher:
                      'Lets shaders read tables straight from game memory (as Pink-shadPS4 does): the lake ripples '
                      'and reflects far away. Off gains ~10% FPS, but distant water is flatter. After a change '
                      'the shaders are compiled again the first time.'))
+        self.check(f, 'fps_counter', _('Contador de FPS no jogo', 'In-game FPS counter'),
+                   _('Mostra os FPS no canto da imagem (por exemplo "55 FPS"). F10 mostra e esconde.',
+                     'Shows the frame rate in the corner of the picture (for example "55 FPS"). F10 shows '
+                     'and hides it.'))
+        self.section(f, _('Shaders', 'Shaders'))
+        ttk = self.ttk
+        holder = ttk.Frame(f)
+        ttk.Button(holder, text=_('Pré-compilar shaders', 'Precompile shaders'), command=self.precompile).pack(side='left')
+        self.row(f, _('Pré-compilar', 'Precompile'), holder,
+                 _('Cada shader que o jogo usa pela primeira vez é compilado na hora, e o jogo para um '
+                   'instante (engasgos). O port guarda os compilados e os carrega quando o jogo abre, então '
+                   'cada um só engasga uma vez. Pré-compilar roda o demo da tela de título sozinho (10 a 15 '
+                   'min, numa janela atrás das outras): a abertura, a floresta e o cânion ficam prontos antes '
+                   'de jogar. O resto compila na primeira visita. Depois de atualizar o port, rode de novo.',
+                   'Each shader the game uses for the first time is compiled on the spot, and the game stops '
+                   'for a moment (stutter). The port keeps the compiled ones and loads them when the game '
+                   'starts, so each one stutters only once. Precompiling plays the title screen\'s demo by '
+                   'itself (10 to 15 min, in a window behind the others): the intro, the forest and the '
+                   'canyon are ready before you play. The rest compiles on the first visit. Run it again '
+                   'after updating the port.'))
+        self.check(f, 'loading_screen', _('Tela de carregamento durante o jogo', 'Loading screen during play'),
+                   _('Quando o jogo para de mostrar imagens por mais de um segundo (um shader compilando, um '
+                     'carregamento longo), o port cobre a imagem com "Carregando…" para mostrar que o jogo não '
+                     'travou. Desligado, a última imagem fica parada na tela até o jogo voltar, mais imersivo. '
+                     'A tela de carregamento da abertura do jogo (carregando shaders) aparece sempre. A tela não '
+                     'deixa o jogo mais suave: quem faz isso é pré-compilar.',
+                     'When the game stops showing frames for more than a second (a shader compiling, a long '
+                     'load), the port covers the picture with "Loading…" to show the game did not hang. Off, '
+                     'the last frame stays on screen until the game goes on, which is more immersive. The '
+                     'loading screen at startup (loading shaders) always shows. The screen does not make the '
+                     'game smoother: precompiling does.'))
         self.row(f, _('Envio de trabalho à GPU', 'GPU work submission'), self.choice(f, 'gpu_submit', GPU_SUBMIT),
                  _('Manda trabalho à GPU a cada 0,5 ms e lê resultados por um atalho (técnicas do Pink-shadPS4). '
                    'Medido em NVIDIA (+10–15%); em AMD/Intel use "Ligado" para testar e volte para "Automático" '
@@ -1244,6 +1286,7 @@ class Launcher:
                                        '#d9b441' if text.startswith('⚠') else '#d36b5c' if text.startswith('✗') else TEXT)
         if not self.process:
             self.play_button.configure(state='normal' if info else 'disabled')
+            self.precompile_button.configure(state='normal' if info else 'disabled')
             self.status.configure(text=self.summary() if info else _('Escolha primeiro a pasta do jogo.',
                                                                      'Choose the game folder first.'), fg=MUTED)
 
@@ -1680,15 +1723,15 @@ class Launcher:
         shutil.copytree(source, target, dirs_exist_ok=True)
 
     # ---- game process ------------------------------------------------------------------------
-    def play(self):
+    def play(self, env=None):
         if self.process or self.updating:
-            return
+            return False
         self.collect()
         if not game_info(self.app['game_dir']):
             self.messagebox.showerror('Shadow of the Colossus', _('Escolha a pasta do jogo com eboot.bin (CUSA08809).',
                                                                   'Choose the game folder with eboot.bin (CUSA08809).'))
             self.show('game')
-            return
+            return False
         self.set_log('')
         try:
             write_key_bindings(self.app.get('keys'))
@@ -1696,21 +1739,166 @@ class Launcher:
             self.append(_('Não foi possível gravar as teclas no sotc.ini: {}',
                           'Could not write the keys to sotc.ini: {}').format(error) + '\n')
         try:
-            self.process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=game_environment(self.app),
+            self.process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=env or game_environment(self.app),
                                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                             stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
         except OSError as error:
             self.append(_('Não foi possível iniciar: {}', 'Could not start: {}').format(error) + '\n')
             self.process = None
-            return
+            return False
         self.job = GameJob(self.process)
         threading.Thread(target=self.read_output, args=(self.process,), daemon=True).start()
         self.play_button.configure(state='disabled')
+        self.precompile_button.configure(state='disabled')
         self.stop_button.configure(state='normal')
         self.status.configure(text=_('Preparando o jogo; ele abre na própria janela…',
                                      'Preparing the game; it opens in its own window…'), fg=GOLD)
-        if self.app.get('close_on_play'):
+        if self.app.get('close_on_play') and env is None:
             self.root.after(5000, self.root.destroy)
+        return True
+
+    # Shader precompilation: the title screen's attract demo plays by itself when nothing is pressed
+    # (intro flight, forest, forest temple, canyon bridge; then the title and the same scenes again:
+    # a second pass added no pipeline in a 9-minute test). The game runs in a window kept behind
+    # the others (SOTC_WINDOW_BEHIND), muted, with the player's own settings, so the pipelines it
+    # compiles are the ones a normal start preloads ("Preloaded N pipelines"). New pipelines are
+    # counted as files in the cache folder (an info-level GPU log for "Compiling" lines slowed the
+    # game to ~3 FPS). It stops after PRECOMPILE_MIN_S once no pipeline came for PRECOMPILE_QUIET_S,
+    # or after PRECOMPILE_MAX_S: a quiet stretch alone also happens while the demo replays scenes
+    # already in the cache.
+    PRECOMPILE_MIN_S = 9 * 60
+    PRECOMPILE_QUIET_S = 180
+    PRECOMPILE_MAX_S = 20 * 60
+
+    def precompile(self):
+        if self.process or self.updating:
+            return
+        self.collect()
+        if not game_info(self.app['game_dir']):
+            self.play()  # shows the missing game folder
+            return
+        if not (self.saves_folder() / 'SAVEDATA0ShadowProfile0').is_dir():
+            # Without a profile the game waits on its language menu and the demo never starts.
+            self.messagebox.showinfo('Shadow of the Colossus', _(
+                'Abra o jogo uma vez até o menu principal (escolhendo o idioma) e feche. '
+                'Depois disso a pré-compilação funciona.',
+                'Start the game once until the main menu (choosing the language), then close it. '
+                'Precompiling works after that.'))
+            return
+        if not self.messagebox.askokcancel('Shadow of the Colossus', _(
+                'O jogo abre numa janela atrás das outras, sem som, e o demo da tela de título passa '
+                'pela abertura, pela floresta e pelo cânion compilando os shaders. Leva uns 10 a 15 '
+                'minutos; dá para usar o PC enquanto isso. Não clique na janela do jogo. Ele fecha '
+                'sozinho quando terminar.\n\n'
+                'O que o demo não mostra (os colossos, as outras regiões, as cenas) ainda compila na '
+                'primeira vez que você chegar lá.',
+                'The game opens in a window behind the others, without sound, and the title screen\'s '
+                'demo goes through the intro, the forest and the canyon compiling the shaders. It takes '
+                'about 10 to 15 minutes; you can use the PC meanwhile. Do not click the game window. It '
+                'closes by itself when done.\n\n'
+                'What the demo does not show (the colossi, the other regions, the cutscenes) still '
+                'compiles the first time you get there.')):
+            return
+        env = game_environment(self.app)
+        env.update(BB_FULLSCREEN='0', SOTC_WINDOW_BEHIND='1', SDL_WINDOW_ACTIVATE_WHEN_SHOWN='0',
+                   SOTC_MOUSE='0', BB_AUDIO='none')
+        if not self.play(env):
+            return
+        now = time.monotonic()
+        cached = self.cached_pipelines()
+        self.precompiling = {'start': now, 'last_new': now, 'last_check': now, 'running': None,
+                             'cached': cached, 'seen': cached, 'done': None}
+        self.root.after(1000, self.precompile_tick)
+
+    def last_save(self):
+        """(title, modified time) of the newest progress save, from its param.bin (the text the
+        game's load menu shows, e.g. "Shrine of Worship - 1 Defeated - Normal"), or None."""
+        saves = sorted(self.saves_folder().glob('SAVEDATA0ShadowProgress*.sce_sys/param.bin'),
+                       key=lambda p: p.stat().st_mtime)
+        if not saves:
+            return None
+        text = saves[-1].read_bytes().decode('utf-8', errors='replace')
+        found = re.search(r'[^\x00�]{3,}\d+ Defeated[^\x00�]*', text)
+        return (found.group(0).strip() if found else saves[-1].parent.name.replace('.sce_sys', ''),
+                saves[-1].stat().st_mtime)
+
+    def report_crash(self, code):
+        """The game ended on an error: what was kept (the last save) and where the logs are."""
+        try:
+            save = self.last_save()
+        except OSError:
+            save = None
+        if save:
+            minutes = max(0, int((time.time() - save[1]) // 60))
+            kept = _('O progresso fica como no último save: "{}", gravado às {} (há {} min).',
+                     'Your progress is as of the last save: "{}", written at {} ({} min ago).').format(
+                         save[0], time.strftime('%H:%M', time.localtime(save[1])), minutes)
+        else:
+            kept = _('Não há save de progresso ainda.', 'There is no progress save yet.')
+        self.messagebox.showwarning('Shadow of the Colossus', _(
+            'O jogo fechou por um erro (código {:#x}).\n\n{}\n\nO registro e o dump da queda ficam em '
+            '{}; anexe-os numa issue para ajudar a corrigir.',
+            'The game closed because of an error (code {:#x}).\n\n{}\n\nThe log and the crash dump '
+            'are in {}; attach them to an issue to help fix it.').format(
+                code & 0xffffffff, kept, user_dir(self.app) / 'crashes'))
+
+    def offer_precompile(self):
+        if self.messagebox.askyesno('Shadow of the Colossus', _(
+                'O cache de shaders foi refeito nesta partida (versão nova do port, do driver ou outra '
+                'placa), então os primeiros minutos em cada área engasgam. Pré-compilar os shaders '
+                'agora?',
+                'The shader cache was rebuilt in this session (a new port version, driver or graphics '
+                'card), so the first minutes in each area stutter. Precompile the shaders now?')):
+            self.precompile()
+
+    def cached_pipelines(self):
+        cache = user_dir(self.app) / 'cache'
+        return sum(1 for _p in cache.glob('*/*.key')) if cache.is_dir() else 0
+
+    def precompile_line(self, text):
+        if 'Entering original x86-64 code' in text and not self.precompiling['running']:
+            self.precompiling['running'] = self.precompiling['last_new'] = time.monotonic()
+
+    def precompile_tick(self):
+        state = self.precompiling
+        if not state or not self.process:
+            return
+        now = time.monotonic()
+        if state['running'] and now - state['last_check'] >= 5:
+            state['last_check'] = now
+            count = self.cached_pipelines()
+            if count > state['seen']:
+                state['seen'], state['last_new'] = count, now
+        if state['running']:
+            quiet, elapsed = now - state['last_new'], now - state['running']
+            self.status.configure(fg=GOLD, text=_(
+                'Pré-compilando: {} pipelines novos · último há {} s · {} min',
+                'Precompiling: {} new pipelines · last one {} s ago · {} min').format(
+                    state['seen'] - state['cached'], int(quiet), int(elapsed // 60)))
+            if elapsed >= self.PRECOMPILE_MAX_S or (elapsed >= self.PRECOMPILE_MIN_S and
+                                                    quiet >= self.PRECOMPILE_QUIET_S):
+                state['done'] = 'time' if quiet < self.PRECOMPILE_QUIET_S else 'quiet'
+                self.stop()
+                return
+        self.root.after(1000, self.precompile_tick)
+
+    def precompile_finished(self, code):
+        state, self.precompiling = self.precompiling, None
+        added = max(0, self.cached_pipelines() - state['cached'])
+        if state['done']:
+            text = _('Pré-compilação concluída: {} pipelines novos no cache ({} no total).',
+                     'Precompiling done: {} new pipelines in the cache ({} in all).').format(
+                         added, state['cached'] + added)
+            if state['done'] == 'time':
+                text += ' ' + _('Parou no limite de tempo; rodar de novo pode adicionar mais.',
+                                'It stopped at the time limit; running it again may add more.')
+            self.messagebox.showinfo('Shadow of the Colossus', text)
+        else:
+            self.messagebox.showwarning('Shadow of the Colossus', _(
+                'A pré-compilação parou antes do fim (código {}). O que já foi compilado fica no cache; '
+                'veja o registro do jogo.',
+                'Precompiling stopped early (code {}). What was compiled stays in the cache; see the '
+                'game log.').format(code))
 
     def read_output(self, process):
         # The output also goes to user/last_run.log, so a crash can be looked at afterwards.
@@ -1736,8 +1924,8 @@ class Launcher:
                 pass
             if not self.stopping:
                 keep_crash_log(log_dir, code)
-        self.stopping = False
-        self.output.put((code,))
+        stopped, self.stopping = self.stopping, False
+        self.output.put((code, stopped))
 
     def drain_output(self):
         while not self.ui_calls.empty():
@@ -1752,7 +1940,21 @@ class Launcher:
                         self.job.close()
                     self.stop_button.configure(state='disabled')
                     self.refresh_status()
+                    code, stopped = item
+                    if self.precompiling:
+                        self.precompile_finished(code)
+                    elif code != 0 and not stopped:
+                        self.report_crash(code)
+                    elif self.cache_rebuilt and code == 0:
+                        self.offer_precompile()
+                    self.cache_rebuilt = False
                 else:
+                    # The game set its shader cache aside (a new port version, driver or GPU) or
+                    # found entries of an older version: everything compiles again while playing.
+                    if 'Starting a new cache' in item or 'stale pipelines were found' in item:
+                        self.cache_rebuilt = True
+                    if self.precompiling:
+                        self.precompile_line(item)
                     if 'Entering original x86-64 code' in item:
                         self.status.configure(text=_('O jogo está rodando.', 'The game is running.'), fg=GOLD)
                     self.append(item)
@@ -1876,6 +2078,7 @@ class Launcher:
             return
         self.updating = True
         self.play_button.configure(state='disabled')
+        self.precompile_button.configure(state='disabled')
 
         def progress(done, total):
             text = _('Baixando a atualização: {} de {} MB', 'Downloading the update: {} of {} MB').format(

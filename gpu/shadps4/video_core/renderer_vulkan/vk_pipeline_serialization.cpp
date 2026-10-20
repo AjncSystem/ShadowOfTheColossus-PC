@@ -18,10 +18,11 @@
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 // Above both lines before the upstream merge: generation changed, so old caches are dropped.
-static constexpr u32 ShaderBinaryVersion = 33u;
+static constexpr u32 ShaderBinaryVersion = 34u;
 // sotc: 33 = the draw thread merge (SRT walker faults read zero instead of patching).
+// sotc: 34 = invariant position (barycentric emulation, issue #57).
 static constexpr u32 ShaderMetaVersion = 21u;
-static constexpr u32 PipelineKeyVersion = 3u;
+static constexpr u32 PipelineKeyVersion = 4u; // 4: generated geometry shader (sdata.gs)
 } // namespace Serialization
 
 namespace Vulkan {
@@ -272,6 +273,7 @@ void GraphicsPipeline::SerializationSupport::Serialize(Serialization::Archive& a
     sdata.Write(multisampling);
     sdata.Write(tcs);
     sdata.Write(tes);
+    sdata.Write(gs);
 }
 
 bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive& ar) {
@@ -283,6 +285,7 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
     sdata.Read(multisampling);
     sdata.Read(tcs);
     sdata.Read(tes);
+    sdata.Read(gs);
     return true;
 }
 

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <string>
 #include <span>
 #include <unordered_map>
@@ -367,6 +368,17 @@ public:
     /// Returns the maximum size of compute shared memory.
     u32 MaxComputeSharedMemorySize() const {
         return properties.limits.maxComputeSharedMemorySize;
+    }
+
+    /// sotc: the number of vec4 locations a geometry shader can pass to the fragment shader.
+    u32 MaxGeometryToFragmentLocations() const {
+        const auto& limits = properties.limits;
+        // Every one of the up to 3 vertices emitted also carries gl_Position.
+        const u32 total_per_vertex = limits.maxGeometryTotalOutputComponents / 3;
+        const u32 components =
+            std::min({limits.maxFragmentInputComponents, limits.maxGeometryOutputComponents,
+                      total_per_vertex > 4 ? total_per_vertex - 4 : 0U});
+        return components / 4;
     }
 
     /// Returns the maximum sampler LOD bias.

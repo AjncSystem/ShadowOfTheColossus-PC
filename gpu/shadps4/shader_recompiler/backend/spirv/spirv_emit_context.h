@@ -297,6 +297,8 @@ public:
     Id bary_coord_pull_model{};
     Id bary_coord_nopersp{};
     Id bary_coord_nopersp_sample{};
+    /// sotc: barycentric emulation without its geometry shader (layout too large): reads give 0.
+    bool bary_emulation_fallback{};
 
     struct TextureDefinition {
         const VectorIds* data_types;

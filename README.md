@@ -19,7 +19,8 @@ What it adds:
 - **CPUs with 4 threads** (4 cores without SMT, 2 cores with SMT): two of the port's GPU threads no
   longer spin on a core while they wait, so the game's threads get it. A Ryzen 7 held to 4 logical
   processors stayed stuck loading the attract demo; now it runs at 76 FPS (60 FPS mode). With more
-  than 8 logical processors nothing changes.
+  than 8 logical processors nothing changes (sent to the original as
+  [PR #198](https://github.com/AjncSystem/ShadowOfTheColossus-PC/pull/198)).
 - **Fullscreen at 120 Hz** on 144/165 Hz monitors, so every frame stays on screen as long (Anthonypc23).
 - The launcher's self-update follows this fork's releases; the launcher no longer stops when its
   console refuses writes (issue #104).

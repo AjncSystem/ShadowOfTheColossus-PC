@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.59-plus4 — 2026-10-20 (fork Lucas-blip-png)
+- A 0.59-plus3 em cima da **0.59.1** do original: **listras da AMD** nas sombras e na água (o
+  acesso direto à memória vem desligado nas AMD, do Oussama268), correções para Intel, opção
+  **Sombras distantes** no lançador (desligada por padrão, como já era aqui), linha `GPU:` com a
+  placa e o driver no `user/last_run.log` e `SOTC_GPU_VENDOR` para notebooks com duas GPUs.
+- Santuário, FPS ilimitado, modo 60 (RTX 5060 Ti, mesma cena, 3 rodadas alternadas): 0.59.1 45,7 /
+  45,6 / 46,7 FPS, 0.59-plus4 48,1 / 48,8 / 50,1 (+7% pela mediana), sem falhas.
+
 ## 0.59-plus3 — 2026-10-20 (fork Lucas-blip-png)
 - **60 FPS pelo modo 60 do próprio jogo** (o do Desempenho do PS4 Pro). O modo 60 do lançador
   ignorava a taxa de 30 que o jogo pede, mas o jogo continuava se cronometrando para 30 (alvo

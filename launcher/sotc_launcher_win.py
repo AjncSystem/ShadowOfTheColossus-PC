@@ -148,7 +148,7 @@ def windows_language():
 # Settings, passed to sotc.py as environment variables.
 
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
-                'user_dir': '', 'af16': True, 'hq_textures': True, 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
+                'user_dir': '', 'af16': True, 'hq_textures': False, 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
                 'readbacks': '', 'extra_env': '', 'close_on_play': False, 'gamepad': '',
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
@@ -488,8 +488,10 @@ def game_environment(s):
     env['SOTC_FRAMEGEN'] = s.get('framegen') or 'off'
     # sotc: high quality textures: the texture banks sampled since the last report read as sampled
     # (sotc_lod_stats.h; before, none ever did and the game never streamed its fine mips: blurry
-    # leaves and rocks). Off: the old behaviour, for cards short of video memory.
-    if s.get('hq_textures', True):
+    # leaves and rocks). Off: the old behaviour, for cards short of video memory. Off by default in
+    # this fork: on, a new game stops about a minute after reaching the Shrine (the game's page pool
+    # runs out: fault at guest 0x1a371, 7 of 7 runs on 0.58.1).
+    if s.get('hq_textures', False):
         env.setdefault('SOTC_LOD_LINGER', '1')
     if s.get('button_icons') == 'xbox' and (PORT_DIR / 'glyphs' / 'xbox').is_dir():
         env['SOTC_TEX_REPLACE'] = str(PORT_DIR / 'glyphs' / 'xbox')

@@ -300,9 +300,8 @@ bool Instance::CreateDevice() {
     push_descriptor_props = properties_chain.get<vk::PhysicalDevicePushDescriptorPropertiesKHR>();
     LOG_INFO(Render_Vulkan, "Physical device subgroup size {}", vk11_props.subgroupSize);
     // sotc: in the session log; the wave64 lowering depends on it.
-    std::fprintf(stderr, "GPU subgroups: size %u, min %u, max %u, control %d, required stages %#x\n",
+    std::fprintf(stderr, "GPU subgroups: size %u, min %u, max %u, required stages %#x\n",
                  vk11_props.subgroupSize, vk13_props.minSubgroupSize, vk13_props.maxSubgroupSize,
-                 int(vk13_features.subgroupSizeControl),
                  u32(vk13_props.requiredSubgroupSizeStages));
 
     if (available_extensions.empty()) {

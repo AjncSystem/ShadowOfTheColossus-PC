@@ -142,6 +142,7 @@ public:
 private:
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
+    void RefreshImageLayouts();
     void Resolve();
     void DepthStencilCopy(bool is_depth, bool is_stencil);
     void EliminateFastClear();
@@ -201,6 +202,8 @@ private:
     std::array<RenderTargetInfo, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc> db_desc;
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
+    /// sotc: the image of each image_infos entry (null for samplers and empty slots).
+    std::array<const VideoCore::Image*, Shader::NUM_IMAGES> image_info_images{};
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
     struct BoundBuffer {

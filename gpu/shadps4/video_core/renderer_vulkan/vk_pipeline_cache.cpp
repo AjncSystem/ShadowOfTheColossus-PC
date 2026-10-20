@@ -333,6 +333,20 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // NVIDIA's shader compiler (seen on 617.14) hits a breakpoint on any OpFDiv in a shader
     // with RoundingModeRTZ for that width, killing the process. Prefer default rounding there.
     const bool rtz_usable = instance.GetDriverID() != vk::DriverId::eNvidiaProprietary;
+    // sotc: the LDS barriers are also needed on AMD running the shaders 64 wide. GCN (RX 470-590,
+    // Vega) has no 32-wide waves, so the 32-wide path never engages there, and its compiler may
+    // move LDS reads before other lanes' writes just the same: white, flickering characters and
+    // smoke, fog colours that changed every run (issues #152, #187, #201). The unofficial
+    // SotC-AMD-Fix layer (raulbezerro-dev) fixed it there by reporting the NVIDIA driver, which
+    // turns these barriers on. SOTC_AMD64_LDS=0 turns it off.
+    const bool amd64_lds = [&] {
+        const char* v = std::getenv("SOTC_AMD64_LDS");
+        return (!v || std::atoi(v) != 0) && instance.GetVendorID() == 0x1002 &&
+               instance.SubgroupSize() >= 64;
+    }();
+    if (amd64_lds) {
+        std::fprintf(stderr, "GPU: LDS barriers on for 64-wide AMD (SOTC_AMD64_LDS=0: off)\n");
+    }
     // Wave64 uniform branches on every driver. Tested on a Radeon RX 6650 XT (32-wide path):
     // off, the shadows next to the Wander and Agro on grass get horizontal stripes; on, the
     // image is right and the characters are not black in the shade (save with 5 colossi).
@@ -407,7 +421,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         // path): without the barriers the GPU hung ~2 min into the intro (issue #7).
         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
                               instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp ||
-                              instance.SubgroupSize() < 64,
+                              instance.SubgroupSize() < 64 || amd64_lds,
         .needs_buffer_offsets = instance.StorageMinAlignment() > 4,
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,

@@ -20,6 +20,7 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 | 0.8 | Demais PRs (#94 menu, #54 widescreen, #118 F11, #130/#39 Linux, #99/#132 refatoração grande do CP) | ⏳ | Avaliar uma a uma. |
 | 0.9 | Corrigir autor dos commits 1bb9dd5/83f88ff (branch `ajncsystem-estabilidade-fps`, PR #93) | ⏳ | |
 | 0.10 | Fork do Oussama268 (opt5–opt7): thread de draws (#99 Lucas-blip-png + correções), DMA incremental, tradução de shaders e pipelines de compute em threads auxiliares, cache separado do modo Pro | ✅ | Branch `oussama-int`, juntado ao `comunidade`. Conflitos resolvidos (sombras do nakaionyt usam `DrawRegs()` da thread de draws; mutex de `gpu_modified_ranges`; versão do cache 33). Pré-carga em threads auxiliares (`e8e304f`) **revertida**: com o nosso cache de pipelines derrubava o driver NVIDIA no boot. Demo: média 63 → 65–67, mínima 30 → 34–37, ponte 30–32 → 37–40. Teste do usuário na cascata: "FPS muito melhor". Observação: o demo da tela de título às vezes sai do trilho (já acontecia antes). |
+| 0.11 | #118 (EdouardSence): **F11 alterna janela / tela cheia**; ícone da janela no Linux | ✅ | `f059064`. O ícone escolhido no lançador (desenho do menino / imagem própria) continua valendo por cima do da PR. |
 
 ## Fase 1 — Estabilidade (quedas e travamentos)
 

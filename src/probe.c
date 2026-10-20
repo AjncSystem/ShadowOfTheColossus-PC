@@ -20,6 +20,7 @@
 #include <mmsystem.h>
 #else
 #include <sys/mman.h>
+#include <errno.h>
 #include <malloc.h>
 #include <unistd.h>
 #include <signal.h>
@@ -69,7 +70,6 @@ static uint64_t read64(FILE *f) {
     return n;
 }
 static size_t round_page(size_t size) { return (size + page_size - 1) & ~(page_size - 1); }
-#ifdef _WIN32
 /* sotc: the PS4 maps the executable at 0x400000, and Shadow of the Colossus packs pointers
  * to its static data into 31 bits (bit 31 selects a heap-relative form). Windows already
  * uses 0x400000 before main, so, as shadPS4 does, the image goes to the first free range
@@ -79,6 +79,7 @@ static size_t round_page(size_t size) { return (size + page_size - 1) & ~(page_s
 #define EBOOT_LIMIT UINT64_C(0x80000000)
 #define EBOOT_RESERVATION (UINT64_C(256) << 20)
 static void *eboot_reservation;
+#ifdef _WIN32
 static void reserve_eboot_range(void) {
     for (uintptr_t at=EBOOT_MIN; at+EBOOT_RESERVATION<=EBOOT_LIMIT;) {
         MEMORY_BASIC_INFORMATION m;
@@ -91,16 +92,36 @@ static void reserve_eboot_range(void) {
         at=end;
     }
 }
+#else
+/* The same contract on POSIX: the image must end below 2 GiB or the game's
+ * 31-bit static-data pointers address unmapped memory (observed: with the
+ * kernel-chosen 0x800000000 the guest faults in LoadInitialWorld dereferencing
+ * a packed pointer). Probe 64 MiB-aligned candidates with MAP_FIXED_NOREPLACE
+ * (EEXIST instead of replacing); start at 256 MiB to leave the non-PIE loader
+ * and its brk heap room to grow. */
+static void reserve_eboot_range(void) {
+    for (uintptr_t at=UINT64_C(0x10000000); at+EBOOT_RESERVATION<=EBOOT_LIMIT; at+=UINT64_C(64)<<20) {
+        void *p=mmap((void *)at,EBOOT_RESERVATION,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED_NOREPLACE,-1,0);
+        if (p!=MAP_FAILED) { eboot_reservation=p; return; }
+        if (errno!=EEXIST) return;
+    }
+}
+#endif
 /* The image (eboot, linked modules, patch trampolines) below 2 GiB. */
 static void *allocate_image(size_t size) {
     if (!eboot_reservation) fail("no free 256 MiB range below 2 GiB for the eboot");
     if (size > EBOOT_RESERVATION) fail("the image does not fit the eboot reservation");
+#ifdef _WIN32
     void *p=VirtualAlloc(eboot_reservation, size, MEM_COMMIT, PAGE_READWRITE);
     if (!p) fail("cannot commit the eboot range");
     printf("Image at %p (below 2 GiB, as the game's 31-bit pointers need); loader at %p\n",p,(void *)GetModuleHandleA(NULL));
+#else
+    void *p=mmap(eboot_reservation,size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0);
+    if (p==MAP_FAILED) fail("cannot commit the eboot range");
+    printf("Image at %p (below 2 GiB, as the game's 31-bit pointers need)\n",p);
+#endif
     return p;
 }
-#endif
 static void *allocate(size_t size) {
     void *low=runtime_low_map(size,PROT_READ|PROT_WRITE);
     if (low) return low;
@@ -918,9 +939,7 @@ void runtime_restart(void) {
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
-#ifdef _WIN32
     reserve_eboot_range();
-#endif
 #ifndef _WIN32
     /* Keep host heap objects handed to the guest (thread handles, TLS) in the
        non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits. */
@@ -1105,11 +1124,7 @@ int main(int argc, char **argv) {
         }
     }
     /* sotc: the CPU patch trampolines follow the image (rel32 jumps reach them). */
-#ifdef _WIN32
     image = allocate_image(round_page(size) + SOTC_TRAMPOLINE_SIZE);
-#else
-    image = allocate(round_page(size) + SOTC_TRAMPOLINE_SIZE);
-#endif
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
     if (!cpu_only) {
@@ -1189,7 +1204,9 @@ int main(int argc, char **argv) {
 #endif
     if (sotc_cpu) apply_sotc_cpu_patches(sotc_cpu, segments, ns, size);
     if (sotc_cmdline) apply_sotc_cmdline(sotc_cmdline, size);
+#ifdef _WIN32
     if (sotc_cpu) install_heap_hook();
+#endif
     protect(traps, round_page((import_count + 1) * 32), 5);
     protect(image, round_page(size), 0);
     int executable_entry = 0;

@@ -1348,7 +1348,7 @@ void Rasterizer::FlushPeriodic() {
     // cheaper per draw.
     static const u64 flush_us = [] {
         if (const char* v = std::getenv("SOTC_FLUSH_US")) {
-            return std::strtoull(v, nullptr, 10);
+            return static_cast<u64>(std::strtoull(v, nullptr, 10));
         }
         return std::getenv("SOTC_FLUSH_EVERY") ? u64{0} : u64{1000};
     }();

@@ -84,6 +84,7 @@ typedef struct { char label[17]; char padding[3]; uint32_t status; } AddonInfo; 
 static AddonInfo addons[MAX_ADDONS];
 static unsigned addons_scanned;
 /* The string value of key in a param.sfo image, or NULL. */
+__attribute__((unused))
 static const char *sfo_string(const unsigned char *data, size_t size, const char *key) {
     if (size<20 || memcmp(data,"\0PSF",4)) return NULL;
     uint32_t keys, values, count;
@@ -101,6 +102,7 @@ static const char *sfo_string(const unsigned char *data, size_t size, const char
     return NULL;
 }
 /* True when the entitlement of content ID is listed already (a package and its installed folder). */
+__attribute__((unused))
 static int addon_known(const char *content) {
     for (unsigned i=0;i<addon_count;++i) if (!strncmp(addons[i].label,content+20,16)) return 1;
     return 0;

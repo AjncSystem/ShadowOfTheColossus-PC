@@ -5,6 +5,7 @@
 #include "video_core/renderer_vulkan/vk_framegen.h"
 #include "video_core/renderer_vulkan/vk_fsrfg.h"
 
+#ifdef _WIN32
 #include <windows.h>
 
 #include <algorithm>
@@ -1207,3 +1208,26 @@ bool GetFrameInputs(u32 frame_id, FrameInputs& out) {
 }
 
 } // namespace Vulkan::Dlssg
+
+#else // !_WIN32: Streamline loads Windows DLLs (sl.interposer/nvngx); on POSIX DLSS-G stays off.
+
+namespace Vulkan::Dlssg {
+
+PFN_vkGetInstanceProcAddr LoadInterposer() { return nullptr; }
+void OnDeviceCreated(const Instance&) {}
+bool Enabled() { return false; }
+bool CapturingInputs() { return false; }
+bool WantsImmediatePresent() { return false; }
+void NoteDraw(const AmdGpu::Regs&, u32, VideoCore::ImageId, VideoCore::ImageId,
+              VideoCore::TextureCache&) {}
+void PrepareInputs(u32, vk::CommandBuffer, VideoCore::TextureCache&, Runtime&, u32, u32) {}
+void FrameSubmitted(u32) {}
+void NoInputs(u32) {}
+void BeforePresent(u32, vk::Rect2D, vk::Extent2D) {}
+void AfterPresent(u32) {}
+void Suspend() {}
+bool GetFrameInputs(u32, FrameInputs&) { return false; }
+
+} // namespace Vulkan::Dlssg
+
+#endif // _WIN32

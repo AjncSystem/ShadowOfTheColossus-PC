@@ -44,12 +44,16 @@ Id EmitWriteLane(EmitContext& ctx, Id value, Id write_value, u32 lane) {
 
 Id EmitBallot(EmitContext& ctx, Id bit) {
     const Id ballot{ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), bit)};
-    return ctx.OpBitcast(ctx.U64, ctx.OpVectorShuffle(ctx.U32[2], ballot, ballot, 0, 1));
+    const Id halves{ctx.OpVectorShuffle(ctx.U32[2], ballot, ballot, 0, 1)};
+    // sotc: without a 64-bit type (Info::uses_int64), a ballot stays a uvec2: its only uses
+    // are UnpackUint2x32 and BallotFindLsb, which take it as is.
+    return Sirit::ValidId(ctx.U64) ? ctx.OpBitcast(ctx.U64, halves) : halves;
 }
 
 Id EmitBallotFindLsb(EmitContext& ctx, Id mask) {
-    const Id value{ctx.OpCompositeConstruct(ctx.U32[4], ctx.OpBitcast(ctx.U32[2], mask),
-                                            ctx.u32_zero_value, ctx.u32_zero_value)};
+    const Id halves{Sirit::ValidId(ctx.U64) ? ctx.OpBitcast(ctx.U32[2], mask) : mask};
+    const Id value{ctx.OpCompositeConstruct(ctx.U32[4], halves, ctx.u32_zero_value,
+                                            ctx.u32_zero_value)};
     return ctx.OpGroupNonUniformBallotFindLSB(ctx.U32[1], SubgroupScope(ctx), value);
 }
 

@@ -130,7 +130,11 @@ void EmitContext::DefineArithmeticTypes() {
     F32[1] = Name(TypeFloat(32), "f32_id");
     S32[1] = Name(TypeSInt(32), "i32_id");
     U32[1] = Name(TypeUInt(32), "u32_id");
-    U64 = Name(TypeUInt(64), "u64_id");
+    // sotc: no 64-bit integer type where the device lacks shaderInt64 and the shader does not
+    // need one (Info::uses_int64): declaring it requires the Int64 capability.
+    if (profile.support_int64 || info.uses_int64) {
+        U64 = Name(TypeUInt(64), "u64_id");
+    }
 
     for (u32 i = 2; i <= 4; i++) {
         if (info.uses_fp16) {
@@ -153,8 +157,10 @@ void EmitContext::DefineArithmeticTypes() {
     u32_one_value = ConstU32(1U);
     u32_zero_value = ConstU32(0U);
     f32_zero_value = ConstF32(0.0f);
-    u64_one_value = Constant(U64, 1ULL);
-    u64_zero_value = Constant(U64, 0ULL);
+    if (Sirit::ValidId(U64)) {
+        u64_one_value = Constant(U64, 1ULL);
+        u64_zero_value = Constant(U64, 0ULL);
+    }
 
     pi_x2 = ConstF32(2.0f * float{std::numbers::pi});
 

@@ -12,6 +12,7 @@ enum GpuReadbacksMode : int { Disabled, Relaxed, Precise };
 
 class EmulatorSettingsImpl {
     bool dma_default = true;
+    bool no_int64 = false;
 
 public:
     static EmulatorSettingsImpl* GetInstance() { static EmulatorSettingsImpl s; return &s; }
@@ -64,6 +65,10 @@ public:
         return value >= 0 ? value != 0 : dma_default;
     }
     void SetDirectMemoryAccessDefault(bool enabled) { dma_default = enabled; }
+    /// sotc: the device has no shaderInt64, so shaders are built without 64-bit integers where
+    /// they can be (Info::uses_int64): they get a shader cache folder of their own.
+    void SetNoInt64(bool value) { no_int64 = value; }
+    bool IsNoInt64() const { return no_int64; }
     bool IsDumpShaders() { static const auto value = Flag("BB_DUMP_SHADERS", false); return value; }
     bool IsFsrEnabled() { static const auto value = Flag("BB_FSR1", false); return value; }
     bool IsHdrAllowed() { static const auto value = Flag("BB_HDR", false); return value; }

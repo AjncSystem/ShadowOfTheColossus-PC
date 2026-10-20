@@ -20,7 +20,7 @@ namespace Serialization {
 // Above both lines before the upstream merge: generation changed, so old caches are dropped.
 static constexpr u32 ShaderBinaryVersion = 32u;
 static constexpr u32 ShaderMetaVersion = 21u;
-static constexpr u32 PipelineKeyVersion = 3u;
+static constexpr u32 PipelineKeyVersion = 4u; // 4: generated geometry shader (sdata.gs)
 } // namespace Serialization
 
 namespace Vulkan {
@@ -271,6 +271,7 @@ void GraphicsPipeline::SerializationSupport::Serialize(Serialization::Archive& a
     sdata.Write(multisampling);
     sdata.Write(tcs);
     sdata.Write(tes);
+    sdata.Write(gs);
 }
 
 bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive& ar) {
@@ -282,6 +283,7 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
     sdata.Read(multisampling);
     sdata.Read(tcs);
     sdata.Read(tes);
+    sdata.Read(gs);
     return true;
 }
 

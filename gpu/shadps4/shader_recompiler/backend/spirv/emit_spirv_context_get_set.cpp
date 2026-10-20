@@ -110,8 +110,13 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
         }();
         return param.is_integer ? ctx.OpBitcast(ctx.F32[1], value) : value;
     }
+    if ((IR::IsBarycentricCoord(attr) || attr == IR::Attribute::BaryCoordPullModel) &&
+        ctx.bary_emulation_fallback) {
+        return ctx.f32_zero_value;
+    }
     if (IR::IsBarycentricCoord(attr) && attr != IR::Attribute::BaryCoordPullModel &&
-        ctx.profile.supports_fragment_shader_barycentric) {
+        (ctx.profile.supports_fragment_shader_barycentric ||
+         ctx.profile.emulate_fragment_barycentrics)) {
         ++comp;
     }
     switch (attr) {

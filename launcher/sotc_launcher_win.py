@@ -426,8 +426,11 @@ def game_environment(s):
         env['SOTC_FLUSH_US'], env['SOTC_RB_AHEAD'] = '1000', '1'
     elif s.get('gpu_submit') == 'off':
         env['SOTC_FLUSH_EVERY'], env['SOTC_RB_AHEAD'] = '0', '0'
-    env['SOTC_NEO'] = '1' if s.get('neo') else '0'
     env['SOTC_OUTPUT_RES'] = s.get('output_res') or '1920x1080'
+    # The PS4 Pro path keeps its 16:9 sizes: a wider screen (21:9, 32:9) wins over it (#142).
+    env['SOTC_NEO'] = '1' if s.get('neo') and not is_wide(env['SOTC_OUTPUT_RES']) else '0'
+    if s.get('neo') and env['SOTC_NEO'] == '0':
+        env['SOTC_NOTE'] = f"{env['SOTC_OUTPUT_RES']} is wider than 16:9: PS4 Pro mode off (it renders 16:9 only)"
     env['SOTC_FRAMEGEN'] = s.get('framegen') or 'off'
     # sotc: high quality textures: the texture banks sampled since the last report read as sampled
     # (sotc_lod_stats.h; before, none ever did and the game never streamed its fine mips: blurry
@@ -441,7 +444,7 @@ def game_environment(s):
     # upscaler takes it to the output). 720p renders at 1080p, as on PS4; the PS4 Pro path keeps its
     # own sizes.
     output = env['SOTC_OUTPUT_RES']
-    if output not in ('1280x720', '1920x1080') and not s.get('neo'):
+    if output not in ('1280x720', '1920x1080') and env['SOTC_NEO'] == '0':
         env['SOTC_RENDER_RES'] = output
     env['BB_FSR1'] = '1' if s.get('upscaler', 'fsr1') == 'fsr1' else '0'
     if s.get('sharpness') == 'off':
@@ -462,6 +465,15 @@ def game_environment(s):
     env['PYTHONUNBUFFERED'] = '1'
     env['PYTHONIOENCODING'] = 'utf-8'
     return env
+
+
+def is_wide(size):
+    """True for a WxH wider than 16:9 (by more than 2%)."""
+    try:
+        w, h = map(int, str(size).split('x'))
+    except ValueError:
+        return False
+    return w * 9 > h * 16 * 1.02
 
 
 def shadps4_saves():
@@ -1207,7 +1219,8 @@ class Launcher:
         if self.var('af16').get():
             parts.append(_('AF 16x', '16x AF'))
         if self.var('neo').get():
-            parts.append('PS4 Pro')
+            parts.append('PS4 Pro' if not is_wide(self.var('output_res').get())
+                         else _('PS4 Pro desligado (tela larga)', 'PS4 Pro off (wide screen)'))
         parts.append(_('tela cheia', 'fullscreen') if self.var('fullscreen').get() else _('janela', 'window'))
         return '   ·   '.join(parts)
 

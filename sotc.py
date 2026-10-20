@@ -194,6 +194,8 @@ def main():
     if cvars is None:
         # Without the launcher: the culling settings of Pink-shadPS4 (same image, fewer GPU waits).
         cvars = 'doIndexBufferCulling=0 doSunShadowIndexBufferCulling=0'
+    if env.get('SOTC_NOTE'):
+        print(f"sotc: {env['SOTC_NOTE']}", file=sys.stderr)
     render = cap_render(env.get('SOTC_RENDER_RES', '').strip())
     run_script('sotc_modes.py', source, '--out', out, '--modes', modes, '--cvars', cvars,
                *(['--render', render] if render else []))

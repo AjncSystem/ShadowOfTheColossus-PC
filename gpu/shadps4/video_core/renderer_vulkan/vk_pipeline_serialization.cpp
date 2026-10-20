@@ -18,7 +18,7 @@
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 // Above both lines before the upstream merge: generation changed, so old caches are dropped.
-static constexpr u32 ShaderBinaryVersion = 32u;
+static constexpr u32 ShaderBinaryVersion = 33u; // 33: invariant position (bary emulation)
 static constexpr u32 ShaderMetaVersion = 21u;
 static constexpr u32 PipelineKeyVersion = 4u; // 4: generated geometry shader (sdata.gs)
 } // namespace Serialization

@@ -111,6 +111,7 @@ struct BaryGsEmitter : public Sirit::Module {
         Decorate(per_vertex_type, spv::Decoration::Block);
         MemberDecorate(per_vertex_type, 0U, spv::Decoration::BuiltIn,
                        static_cast<u32>(spv::BuiltIn::Position));
+        MemberDecorate(per_vertex_type, 0U, spv::Decoration::Invariant);
         if (params.num_clip_distances > 0) {
             MemberDecorate(per_vertex_type, clip_member, spv::Decoration::BuiltIn,
                            static_cast<u32>(spv::BuiltIn::ClipDistance));

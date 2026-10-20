@@ -227,6 +227,30 @@ GraphicsPipeline::GraphicsPipeline(
             .pName = "main",
         });
     }
+    // sotc: Profile::barycentric_via_gs: the geometry shader that hands the pixel shader its
+    // per-vertex inputs and barycentrics, on triangles without a guest geometry/tess stage.
+    const Shader::Info* fs_stage_info = infos[u32(Shader::SwStage::Fragment)];
+    const bool triangles = topology == vk::PrimitiveTopology::eTriangleList ||
+                           topology == vk::PrimitiveTopology::eTriangleStrip ||
+                           topology == vk::PrimitiveTopology::eTriangleFan || is_rect_list ||
+                           is_quad_list;
+    // Preloaded pipelines take it from the cache: the interpolation data it needs is not stored.
+    if (!preloading && profile.barycentric_via_gs && fs_stage_info && triangles &&
+        !infos[u32(Shader::SwStage::Geometry)] &&
+        !infos[u32(Shader::SwStage::TessellationEval)]) {
+        const auto& fs_runtime = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
+        if (Shader::Backend::SPIRV::NeedsBarycentricGs(fs_runtime, *fs_stage_info)) {
+            sdata.gs = Shader::Backend::SPIRV::EmitBarycentricGeometryShader(fs_runtime,
+                                                                             *fs_stage_info);
+        }
+    }
+    if (!sdata.gs.empty()) {
+        shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
+            .stage = vk::ShaderStageFlagBits::eGeometry,
+            .module = CompileSPV(sdata.gs, instance.GetDevice()),
+            .pName = "main",
+        });
+    }
     stage = u32(Shader::SwStage::Fragment);
     if (infos[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{

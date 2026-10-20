@@ -305,6 +305,11 @@ target_compile_options(camera-motion-test PRIVATE -UNDEBUG -fPIC)
 target_link_libraries(camera-motion-test PRIVATE bbgpu)
 add_dependencies(camera-motion-test host_shaders)
 
+add_executable(barycentric-gs-test EXCLUDE_FROM_ALL ../tests/test_barycentric_gs.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(barycentric-gs-test PRIVATE shim shadps4 third_party/gcn/include)
+target_compile_options(barycentric-gs-test PRIVATE -UNDEBUG -fPIC)
+target_link_libraries(barycentric-gs-test PRIVATE bbgpu)
+
 # bbport: FSR 4 benchmark outside the game (tools/fsr4_bench.cpp): ninja -C out/gpu fsr4-bench.
 add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_support.cpp
     shim/bbport_settings.cpp)

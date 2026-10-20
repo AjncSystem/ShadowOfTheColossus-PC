@@ -9,10 +9,11 @@
   as de antes). As texturas nas GTX 10xx, os 60 FPS pelo modo do próprio jogo, o heap guard sem
   remontar a cada quadro e a geração de quadros sem o HUD, que vieram deste fork, agora fazem parte
   do original.
+- **CPUs sem BMI1 confirmadas numa de verdade:** com a 0.59-plus5, o ta955995-cmd (issue #88 do
+  original) jogou até o primeiro colosso. No mundo aberto o FPS ainda fica baixo nessas CPUs.
 - Continua só aqui: CPUs sem BMI1/LZCNT/MOVBE (Oussama268, com as lacunas da 0.59-plus5), a
-  válvula das texturas em alta (#186 do original; enviada como PR #191 do original), a janela de readback
-  menor e a tela cheia a 120 Hz.
-- @PERF@
+  válvula das texturas em alta (#186 do original; enviada como PR #191 do original), a janela de
+  readback menor e a tela cheia a 120 Hz.
 
 ## 0.60.1 — 2026-10-20
 Obrigado a **nosekefik, Oussama268, plassardewen-cpu e lunar-me**.

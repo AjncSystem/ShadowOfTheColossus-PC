@@ -9,16 +9,12 @@ title-screen hang fix, low-memory PCs, a `user` folder per copy), with this fork
 
 ![Shrine of Worship, 60 FPS mode, RTX 5060 Ti (FPS from RTSS)](docs/img/sotc-fork.gif)
 
-| | Original 0.60.1 | **This fork (0.60.1-plus)** |
-|---|---|---|
-| Shrine of Worship, unlimited FPS (RTX 5060 Ti, Ryzen 7 5700X; median of 3 runs) | @BASE@ FPS | **@PLUS@ FPS (@GAIN@)** |
-
 What it adds:
 - **CPUs without BMI1/LZCNT/MOVBE** (Intel before Haswell: 2nd/3rd generation Core, Xeon E3 v1/v2;
   AMD FX), which got "This CPU is not supported": the game's ~5,000 such instructions are replaced
   by equivalent routines at startup, only on those CPUs (Oussama268), also in code reached only
   through jump tables (a hang on the first loading screen on a real one). AVX is still required.
-  Not yet confirmed on a real one.
+  Confirmed on a real one (issue #88 of the original: played up to the first colossus).
 - **No crash with high quality textures** (`guest offset 0x1a371`, issue #186 of the original):
   when the game's page pool runs low, textures ask for less detail and the game frees memory
   (`SOTC_LOD_POOL_LOW=0` turns it off; sent to the original as [PR #191](https://github.com/AjncSystem/ShadowOfTheColossus-PC/pull/191)).

@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.57-opt8 — 2026-10-20 (fork Oussama268)
+- **Sem tela preta depois de atualizar o driver de vídeo:** com o cache do driver vazio, o port
+  montava todos os pipelines guardados um por um antes de mostrar o jogo (98 s de janela preta,
+  medido). Agora eles são montados nas threads de pipelines enquanto o jogo abre: **0,4 s**.
+  `SOTC_ASYNC_PRELOAD=0` volta ao jeito antigo.
+- **Opção "FPS livre" no lançador**, ao lado do "60 FPS" (que continua limitado a 60): sem limite,
+  até 120 FPS. O aviso diz que pode quebrar algumas lutas (o 5º colosso que sai voando, issue #34;
+  a cena do 2º colosso, issue #48).
+- **Telas widescreen e ultrawide** (issues #58 e #42): saídas 16:10, 21:9 (2560 × 1080,
+  3440 × 1440, 3840 × 1600) e 32:9 (3840 × 1080, 5120 × 1440). O jogo renderiza no formato da
+  tela e mostra mais dos lados, sem esticar (Hor+), até 1080 linhas de altura; acima disso o
+  upscaler amplia. Menus e vídeos podem ficar esticados. Código de **tabnul** (PR #54 do
+  repositório principal). Saídas 16:9 continuam iguais.
+- **AMD: listras nas sombras e na água** (issues #57 e #28): o acesso direto à memória ("reflexos
+  completos da água") desenhava listras em placas AMD; jogadores confirmaram que desligá-lo
+  resolve. Agora ele fica desligado por padrão em AMD (`BB_DIRECT_MEMORY_ACCESS=1` liga).
+- **Windows: travamento raro corrigido.** A trava da tabela de memória (winpthreads) podia
+  travar o jogo para sempre quando uma leitura aninhada esperava uma escrita; a thread de
+  gravação de comandos girava a 100% de um núcleo sem trabalho. Correções de **jownatan** (PR #81
+  do repositório principal). Santuário ~2% mais rápido.
+- **Intel (issue #59), correções parciais:** o port pedia à GPU mais grupos de compute do que a
+  Intel aceita (detiler de texturas), usava um layout errado num depth sampleado, e todos os
+  shaders declaravam inteiros de 64 bits, que a Iris Xe não suporta. Tudo isso foi corrigido
+  (achado com as camadas de validação do Vulkan), mas a Iris Xe ainda trava depois de ~30 s
+  (a GPU para); ainda não sabemos o motivo. Quem tiver Intel Arc, por favor teste e mande o
+  `user/last_run.log`.
+- **O registro mostra a placa de vídeo e o driver** (linha `GPU:`), para os relatos de problemas.
+  `SOTC_GPU_VENDOR=8086|10de|1002` escolhe a GPU pelo fabricante (notebooks com duas GPUs).
+- Perfil PGO refeito para o código novo.
+- **Desempenho:** igual à 0.57-opt7 com cache cheio (santuário ~40 FPS, demo ~60 FPS, mesmos
+  quadros lentos); primeira sessão com caches vazios: pior travada 3,4 s no demo.
+- **Cache de shaders:** igual em NVIDIA; refeito na primeira abertura em placas AMD e Intel.
+- Testado (RTX 3060 Laptop): pares intercalados contra a 0.57-opt7 (santuário 40,1/39,3/40,5 →
+  40,2/39,6/40,9; demo 59,5/59,7 → 59,9/61,3), caches vazios (santuário e demo), sessão de
+  45 minutos sem falhas (pico de memória de vídeo 3,4 GB), save no modo PS4 Pro, 21:9 no demo.
+
 ## 0.57-opt7 — 2026-10-19 (fork Oussama268)
 - **Bem menos travadas na primeira vez que se joga** (pasta nova, cache vazio, ou depois de
   atualizar o driver): os shaders novos dos desenhos agora são traduzidos em várias threads, e o

@@ -10,7 +10,7 @@
   remontar a cada quadro e a geração de quadros sem o HUD, que vieram deste fork, agora fazem parte
   do original.
 - Continua só aqui: CPUs sem BMI1/LZCNT/MOVBE (Oussama268, com as lacunas da 0.59-plus5), a
-  válvula das texturas em alta (#186 do original; enviada como PR @PR@), a janela de readback
+  válvula das texturas em alta (#186 do original; enviada como PR #191 do original), a janela de readback
   menor e a tela cheia a 120 Hz.
 - @PERF@
 

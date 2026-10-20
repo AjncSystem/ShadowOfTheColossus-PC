@@ -21,7 +21,7 @@ What it adds:
   Not yet confirmed on a real one.
 - **No crash with high quality textures** (`guest offset 0x1a371`, issue #186 of the original):
   when the game's page pool runs low, textures ask for less detail and the game frees memory
-  (`SOTC_LOD_POOL_LOW=0` turns it off; sent to the original as PR @PR@).
+  (`SOTC_LOD_POOL_LOW=0` turns it off; sent to the original as [PR #191](https://github.com/AjncSystem/ShadowOfTheColossus-PC/pull/191)).
 - **Smaller readback window**, 64 KiB: fewer GPU-written pages are downloaded and unprotected
   for nothing (`SOTC_RB_NARROW=0`).
 - **Fullscreen at 120 Hz** on 144/165 Hz monitors, so every frame stays on screen as long (Anthonypc23).

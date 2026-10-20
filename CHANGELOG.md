@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.59.1 — 2026-10-20
+Obrigado a **Lucas-blip-png e Oussama268**.
+
+- **Sombras distantes piscando** (#178, #157, #163; AMD e NVIDIA GTX 1080, RTX 40/50): a
+  reutilização de sombras (desde a 0.58) redesenhava as sombras distantes só a cada dois quadros e
+  o jogo não guarda a do quadro pulado. Agora vem desligada (PR #170, Lucas-blip-png). Medido no
+  demo inteiro: desligada 61,8 FPS de média / 37,2 de mínima, ligada 59,5 / 35,6, ou seja não
+  ganhava FPS. Nova opção **Sombras distantes** no lançador (Desligado / Ligado / Automático).
+- **AMD: listras nas sombras e na água** (fork do Oussama268, opt8): o acesso direto à memória
+  vem desligado por padrão em placas AMD (dá para ligar no lançador).
+- **Intel, correções parciais** (Oussama268): tamanhos de dispatch e layouts válidos, sem
+  inteiros de 64 bits quando a GPU não tem, tamanho de subgroup fixo.
+- **O registro mostra a placa de vídeo e o driver** (linha `GPU:`), para os relatos nas issues;
+  `SOTC_GPU_VENDOR=10de|1002|8086` escolhe a GPU em notebooks com duas (Oussama268).
+- Correções menores de revisão (Oussama268).
+
 ## 0.59 — 2026-10-20
 Obrigado a **Oussama268, Lucas-blip-png e EdouardSence**.
 

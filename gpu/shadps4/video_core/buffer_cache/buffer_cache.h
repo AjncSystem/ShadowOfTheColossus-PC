@@ -178,6 +178,10 @@ private:
 
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
 
+    /// sotc: the range [first, second) of the arena that a readback of [device_addr, +size)
+    /// downloads and unmarks as GPU-modified: 512 KiB around it, smaller with SOTC_RB_NARROW.
+    std::pair<VAddr, VAddr> ReadbackWindow(const Buffer* arena, VAddr device_addr, u64 size);
+
     /// One range to read back: its GPU-modified parts, as copies from the arena.
     struct ReadbackItem {
         const Buffer* arena;
@@ -300,6 +304,8 @@ private:
         std::chrono::steady_clock::time_point last_request;
     };
     static constexpr size_t MaxHotReadbacks = 64;
+    /// sotc: the SOTC_RB_NARROW readback window in bytes, 0 for the 512 KiB one (ReadbackWindow).
+    u64 rb_narrow_window{};
     static constexpr auto HotReadbackLifetime = std::chrono::seconds(2);
     std::vector<HotReadback> hot_readbacks;
     /// sotc: pages the guest read back recently (the faulting ranges, not the windows). A GPU

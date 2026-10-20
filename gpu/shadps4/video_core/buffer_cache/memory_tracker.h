@@ -37,6 +37,20 @@ public:
         });
     }
 
+    /// sotc: BB_READBACKS (GpuReadbacksMode)
+    u32 ReadbacksMode() const noexcept {
+        return readbacks_mode;
+    }
+
+    /// sotc: number of GPU-modified pages in a region (statistics only, SOTC_RB_NARROW)
+    u64 CountGpuModifiedPages(VAddr cpu_addr, u64 size) noexcept {
+        u64 pages = 0;
+        IteratePages(cpu_addr, size, [&pages](RegionManager* manager, u64 offset, u64 size) {
+            pages += manager->CountGpuModifiedPages(offset, size);
+        });
+        return pages;
+    }
+
     /// Unmark region as modified from the host GPU
     void UnmarkRegionAsGpuModified(VAddr cpu_addr, u64 size, bool is_write) noexcept {
         IteratePages(cpu_addr, size, [is_write](RegionManager* manager, u64 offset, u64 size) {

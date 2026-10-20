@@ -27,8 +27,14 @@ import sotc_update
 FROZEN = getattr(sys, 'frozen', False)
 PORT_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PORT_DIR / 'scripts'))
-CONFIG_DIR = Path(os.environ.get('APPDATA', Path.home())) / 'sotc-launcher'
-CONFIG_FILE = CONFIG_DIR / 'settings.json'
+# Settings of the copy the launcher runs from, in its user folder (kept by updates): each copy
+# of the port has its own saves, caches and logs. Before 0.59.2 every copy shared
+# %APPDATA%\sotc-launcher\settings.json, so a new copy went on using the data folder of the one
+# set up first.
+LEGACY_CONFIG_DIR = Path(os.environ.get('APPDATA', Path.home())) / 'sotc-launcher'
+LEGACY_CONFIG_FILE = LEGACY_CONFIG_DIR / 'settings.json'
+CONFIG_DIR = PORT_DIR / 'user'
+CONFIG_FILE = CONFIG_DIR / 'launcher_settings.json'
 GAME_ID, GAME_VERSION = 'CUSA08809', '01.01'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
 VERSION = '0.59.1'
@@ -354,6 +360,21 @@ def load_settings():
     """Saved settings over the defaults. Older settings that turned DLSS-G on with SOTC_DLSSG=1 in
     the extra variables get the frame generation setting instead."""
     saved = load_json(CONFIG_FILE, {})
+    if not saved and LEGACY_CONFIG_FILE.is_file():
+        # First start of this copy: the shared settings of older versions, but its own data
+        # folder when the old one is another copy's user folder.
+        saved = load_json(LEGACY_CONFIG_FILE, {})
+        old = Path(str(saved.get('user_dir') or ''))
+        if str(old) not in ('', '.') and old.name.lower() == 'user' and                 (old.parent / 'SotC.exe').is_file() and old.parent.resolve() != PORT_DIR.resolve():
+            saved['user_dir'] = ''
+            # Its saves and the user's sound modules come along (copied; the old copy keeps them).
+            for name in ('savedata', 'sys_modules'):
+                source, target = old / name, PORT_DIR / 'user' / name
+                if source.is_dir() and not target.exists():
+                    try:
+                        shutil.copytree(source, target)
+                    except OSError:
+                        pass
     settings = {**APP_DEFAULTS, **saved}
     if 'fps_mode' not in saved:  # before the choice: the "uncapped FPS" box
         settings['fps_mode'] = '60' if saved.get('fps60') else '30'
@@ -1312,8 +1333,13 @@ class Launcher:
     def collect(self):
         for key, var in self.vars.items():
             self.app[key] = var.get()
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        CONFIG_FILE.write_text(json.dumps(self.app, indent=2, ensure_ascii=False), encoding='utf-8')
+        text = json.dumps(self.app, indent=2, ensure_ascii=False)
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            CONFIG_FILE.write_text(text, encoding='utf-8')
+        except OSError:  # a read-only port folder (Program Files): the shared settings
+            LEGACY_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            LEGACY_CONFIG_FILE.write_text(text, encoding='utf-8')
 
     def import_save(self):
         found = shadps4_saves()

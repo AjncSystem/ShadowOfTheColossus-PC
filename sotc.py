@@ -211,6 +211,11 @@ def main():
             env['SOTC_OUTPUT_RES'] = render
         # Larger render targets: the game's heaps take what direct memory there is (run.sh).
         env.setdefault('BB_DMEM_MB', '9152')
+    if env.get('SOTC_NEO') == '1':
+        # PS4 Pro mode: its larger render targets filled the game's 64 KiB page bitmap even with
+        # 5696 MiB (the runtime's Pro size) when a save loaded (user logs, 19 Oct); the
+        # allocator then read past the bitmap (guest offset 0x1a371, read of -1).
+        env.setdefault('BB_DMEM_MB', '9152')
     # The game waits for vblanks: at 60 Hz an uncapped frame (fps60, or F7 in game) still rounds
     # up to 30 FPS. With the cap, 120 Hz only shows a late frame sooner (and SOTC_FPS_LIMIT counts
     # in 120 Hz vblanks).

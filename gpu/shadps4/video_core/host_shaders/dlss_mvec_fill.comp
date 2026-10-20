@@ -1,0 +1,47 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+
+// sotc: camera motion for pixels without a motion vector (the sky writes none), so DLSS can
+// reproject them. Motion vectors are curUV - prevUV like the game's G-buffer.
+// Also writes DLSS's current-colour bias hint: the sky's clouds drift on their own, so camera
+// motion does not reproject them and the history smears them; DLSS should favour this frame.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D depth_tex;
+layout(binding = 1, rg16f) uniform image2D mvec;
+layout(binding = 2, rgba8) uniform writeonly image2D bias;
+
+layout(push_constant) uniform Params {
+    mat4 clip_to_prev; // clip x right, y up, z = stored depth
+    uvec2 size;
+    uint fill_all;     // 1: every pixel gets camera motion (debug)
+    uint inverted;     // depth 0 at the far plane
+    float sky_bias;    // bias hint for the sky (0..1)
+    float sky_depth;   // the sky's depth is this near the far plane
+} pc;
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(p), pc.size))) {
+        return;
+    }
+    const vec2 mv = imageLoad(mvec, p).xy;
+    const float depth = texelFetch(depth_tex, p, 0).x;
+    const bool sky = pc.inverted != 0u ? depth <= pc.sky_depth : depth >= 1.0 - pc.sky_depth;
+    const float b = sky ? pc.sky_bias : 0.0;
+    imageStore(bias, p, vec4(b, sky ? 1.0 : 0.0, 0.0, 0.0)); // g: sky mask (post process)
+    if (pc.fill_all == 0u && (mv.x != 0.0 || mv.y != 0.0)) {
+        return;
+    }
+    const vec2 uv = (vec2(p) + 0.5) / vec2(pc.size);
+    const vec4 prev = pc.clip_to_prev * vec4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    if (prev.w <= 0.0) {
+        return;
+    }
+    const vec2 prev_ndc = prev.xy / prev.w;
+    const vec2 prev_uv = vec2(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
+    imageStore(mvec, p, vec4(uv - prev_uv, 0.0, 0.0));
+}

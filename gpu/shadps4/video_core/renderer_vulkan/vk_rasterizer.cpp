@@ -1010,9 +1010,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
     PrepareRenderState(pipeline);
     hudless_ui_info = -1; // sotc: TakeHudless, set by BindTextures and BeginRendering
     hudless_vo = 0;
-    if (Dlssg::CapturingInputs()) { // sotc: camera and inputs of frame generation
+    if (Dlssg::CapturingInputs()) { // sotc: camera and inputs of DLSS (frame generation, SR)
         Dlssg::NoteDraw(regs, pipeline->GetGraphicsKey().mrt_mask, db_desc.first,
-                        cb_descs[4].first, texture_cache);
+                        cb_descs[4].first, texture_cache, runtime, scheduler);
     }
     if (!BindResources(pipeline)) {
         SotcStats::Drop(1, regs.color_buffers[0].Address(), 0);
@@ -1111,9 +1111,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     TraceShadowShaders(liverpool->DrawRegs(), pipeline);
 
     PrepareRenderState(pipeline);
-    if (Dlssg::CapturingInputs()) { // sotc: camera and inputs of frame generation
+    if (Dlssg::CapturingInputs()) { // sotc: camera and inputs of DLSS (frame generation, SR)
         Dlssg::NoteDraw(liverpool->DrawRegs(), pipeline->GetGraphicsKey().mrt_mask, db_desc.first,
-                        cb_descs[4].first, texture_cache);
+                        cb_descs[4].first, texture_cache, runtime, scheduler);
     }
     if (!BindResources(pipeline)) {
         SotcStats::Drop(1, liverpool->DrawRegs().color_buffers[0].Address(), 1);
@@ -1281,6 +1281,26 @@ static std::array<float, 5> VegetationScales() {
         }
     }
     return s;
+}
+
+// sotc: while DLSS takes the jittered frame (or SOTC_TAA_OFF=1), the game's TAA resolve runs
+// with its history blend off: bit 0 of SRT dword 42. Its other work stays: exposure (the input
+// colour times a scalar from a buffer) and the stencil mask in the output's alpha.
+constexpr u64 kTaaResolveHash = 0xa402ddac;
+constexpr u32 kTaaEnableDword = 42;
+// sotc: the tonemap applies a screen space vignette: 1 + strength * (smoothstep(t) - 1),
+// t = (scale * |uv - 0.5| - start) / (end - start), from flatbuf dwords 51..54. DLSS would drag
+// it along with the scene (dark nested screen borders), so it is applied after upscaling.
+constexpr u64 kTonemapHash = 0x291dbcd0;
+constexpr u32 kVignetteDword = 51;
+
+bool Rasterizer::TaaOff() {
+    static const int forced = [] { // SOTC_TAA_OFF=1/0 forces; unset follows DLSS
+        const char* v = std::getenv("SOTC_TAA_OFF");
+        return v && *v ? (v[0] == '1' ? 1 : 0) : -1;
+    }();
+    // TAA comes back if super resolution is switched or turns itself off
+    return forced < 0 ? Dlssg::SuperResolution() : forced == 1;
 }
 
 void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
@@ -2232,6 +2252,37 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 auto& vk_buffer = buffer_cache.GetStreamBuffer();
                 const u32 ubo_size = stage.FlatBuf().size() * sizeof(u32);
                 const u32* flat = stage.FlatBuf().data();
+                static std::vector<u32> taa_flat;
+                if (stage.pgm_hash == kTaaResolveHash && stage.FlatBuf().size() > kTaaEnableDword &&
+                    TaaOff()) {
+                    taa_flat.assign(stage.FlatBuf().begin(), stage.FlatBuf().end());
+                    taa_flat[kTaaEnableDword] &= ~1u;
+                    flat = taa_flat.data();
+                    static bool reported = false;
+                    if (!std::exchange(reported, true)) {
+                        std::fprintf(stderr, "SOTC TAA off: resolve without history blend\n");
+                    }
+                }
+                static std::vector<u32> tonemap_flat;
+                static const bool vignette_after = [] {
+                    const char* v = std::getenv("SOTC_DLSS_VIGNETTE");
+                    return !v || v[0] != '0';
+                }();
+                if (stage.pgm_hash == kTonemapHash && stage.FlatBuf().size() > kVignetteDword + 3 &&
+                    vignette_after && Dlssg::SuperResolution()) {
+                    tonemap_flat.assign(stage.FlatBuf().begin(), stage.FlatBuf().end());
+                    float params[4];
+                    std::memcpy(params, &tonemap_flat[kVignetteDword], sizeof(params));
+                    Dlssg::NoteVignette(params);
+                    tonemap_flat[kVignetteDword + 3] = 0; // strength 0.0f
+                    flat = tonemap_flat.data();
+                    static bool reported = false;
+                    if (!std::exchange(reported, true)) {
+                        std::fprintf(stderr,
+                                     "SOTC DLSS: vignette after upscaling (%g %g %g %g)\n",
+                                     params[0], params[1], params[2], params[3]);
+                    }
+                }
                 const auto veg_scales = VegetationScales();
                 for (size_t v = 0; v < kVegetation.size(); ++v) {
                     const auto& veg = kVegetation[v];
@@ -2621,6 +2672,25 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         if (ui.usage.render_target && ui.info.pixel_format == vk::Format::eR8G8B8A8Srgb &&
             scene.info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
             hudless_ui_info = static_cast<s32>(first_image_idx);
+        }
+    }
+
+    // sotc: DLSS super resolution: the game's final composite samples the UI layer (an sRGB render
+    // target) and the tonemapped fp16 scene, nothing else, into a video out surface.
+    if (stage.sw_stage == Shader::SwStage::Fragment && image_bindings.size() == 2 &&
+        image_bindings[0].first && image_bindings[1].first && cb_descs[0].first &&
+        Dlssg::SuperResolution()) {
+        const auto& ui = texture_cache.GetImage(image_bindings[0].first);
+        const auto& scene = texture_cache.GetImage(image_bindings[1].first);
+        if (texture_cache.GetImage(cb_descs[0].first).usage.vo_surface &&
+            ui.usage.render_target && ui.info.pixel_format == vk::Format::eR8G8B8A8Srgb &&
+            scene.info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
+            Dlssg::NoteComposite(image_bindings[1].first, image_bindings[0].first, texture_cache);
+            static bool logged = false;
+            if (!std::exchange(logged, true)) {
+                std::fprintf(stderr, "SOTC DLSS: composite shader %#llx\n",
+                             static_cast<unsigned long long>(stage.pgm_hash));
+            }
         }
     }
 

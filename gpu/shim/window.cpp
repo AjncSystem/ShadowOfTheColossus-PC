@@ -23,6 +23,7 @@
 #endif
 #include <windows.h>
 #endif
+#include "video_core/renderer_vulkan/vk_dlssg.h"
 
 namespace Frontend {
 
@@ -320,6 +321,9 @@ bool WindowSDL::PollEvents() {
         }
         if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F12 && !event.key.repeat) {
             VideoCore::TriggerCapture(); // only does something when running under RenderDoc
+        }
+        if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F9 && !event.key.repeat) {
+            Vulkan::Dlssg::ToggleSuperResolution(); // compare DLSS with FSR1 in game
         }
         switch (event.type) {
         case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:

@@ -1,0 +1,34 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#version 450
+
+// sotc: DLSS colour input in place: NaN/Inf -> 0, the rest clamped to 0..1 (tonemapped, LDR).
+// One bad value spreads through DLSS's history as dark blocks; the game's own path clamps.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0, rgba16f) uniform image2D color;
+
+layout(push_constant) uniform Params {
+    uvec2 size;
+    uint mark; // 1: NaN/Inf magenta, out of range cyan (debug)
+} pc;
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(p), pc.size))) {
+        return;
+    }
+    vec3 c = imageLoad(color, p).rgb;
+    // Exponent bits, not isnan(): drivers may assume no NaN in float math.
+    const uvec3 bits = floatBitsToUint(c) & 0x7f800000u;
+    const bool bad = any(equal(bits, uvec3(0x7f800000u)));
+    const bool out_of_range = !bad && (any(lessThan(c, vec3(0.0))) || any(greaterThan(c, vec3(1.0))));
+    if (pc.mark != 0u && (bad || out_of_range)) {
+        c = bad ? vec3(1.0, 0.0, 1.0) : vec3(0.0, 1.0, 1.0);
+    } else {
+        c = bad ? vec3(0.0) : clamp(c, 0.0, 1.0);
+    }
+    imageStore(color, p, vec4(c, 1.0));
+}

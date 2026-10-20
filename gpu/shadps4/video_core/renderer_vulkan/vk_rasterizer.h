@@ -185,6 +185,7 @@ private:
 
     void ResetBindings(bool is_compute);
     void CaptureTextures();
+    static bool TaaOff(); ///< sotc: DLSS on or SOTC_TAA_OFF=1, vk_rasterizer.cpp
     void MaybeDumpImages(u64 pgm_hash);
     void FlushPeriodic();
     u64 commands_tick{};

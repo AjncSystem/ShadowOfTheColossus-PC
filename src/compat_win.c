@@ -271,4 +271,52 @@ uint64_t compat_qpc_tsc_frequency(void) {
     LARGE_INTEGER f; QueryPerformanceFrequency(&f);
     return (uint64_t)f.QuadPart * qpc_scale();
 }
+
+int compat_one_thread_per_core(int min_cores, int *logical, int *cores) {
+    *logical = *cores = 0;
+    HANDLE self = GetCurrentProcess();
+    DWORD_PTR process, system;
+    if (!GetProcessAffinityMask(self, &process, &system) || !process) return 0;
+    USHORT group = 0, count = 1;
+    if (GetProcessGroupAffinity(self, &count, &group) && count != 1) return 0;
+    ULONG size = 0;
+    GetSystemCpuSetInformation(NULL, 0, &size, self, 0);
+    char *buffer = size ? malloc(size) : NULL;
+    if (!buffer || !GetSystemCpuSetInformation((PSYSTEM_CPU_SET_INFORMATION)buffer, size, &size, self, 0)) {
+        free(buffer);
+        return 0;
+    }
+    /* Per core (CoreIndex) the logical processor with the lowest index: its CPU set id. */
+    ULONG first_id[64], ids[64];
+    BYTE first_lp[64];
+    int threads[64] = {0};
+    for (ULONG at = 0; at < size;) {
+        const SYSTEM_CPU_SET_INFORMATION *info = (const SYSTEM_CPU_SET_INFORMATION *)(buffer + at);
+        at += info->Size;
+        if (info->Type != CpuSetInformation || info->CpuSet.Group != group) continue;
+        const BYTE lp = info->CpuSet.LogicalProcessorIndex, core = info->CpuSet.CoreIndex;
+        if (lp >= 64 || core >= 64 || !(process >> lp & 1)) continue;
+        ++*logical;
+        if (!threads[core]++ || lp < first_lp[core]) {
+            first_lp[core] = lp;
+            first_id[core] = info->CpuSet.Id;
+        }
+    }
+    free(buffer);
+    int smt = 0;
+    ULONG n = 0;
+    DWORD_PTR keep = 0;
+    for (int core = 0; core < 64; ++core) {
+        if (!threads[core]) continue;
+        ++*cores;
+        if (threads[core] > 1) smt = 1;
+        ids[n++] = first_id[core];
+        keep |= (DWORD_PTR)1 << first_lp[core];
+    }
+    if (!smt || *cores < min_cores) return 0;
+    /* A default CPU set, not an affinity mask: threads that select other CPU sets (the shader
+     * compilers, BbThreads::UseAllCpus) may still run on the SMT siblings. */
+    if (SetProcessDefaultCpuSets(self, ids, n)) return 2;
+    return SetProcessAffinityMask(self, keep) ? 1 : -1;
+}
 #endif

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <thread>
+#include <vector>
 #ifdef _WIN32
 #include <bit>
 #include <windows.h>
@@ -31,6 +32,34 @@ inline unsigned Available() {
 inline void MakeBackground() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
 }
+
+/// sotc: the calling thread may run on every logical processor of the process, SMT siblings
+/// included, although the process defaults to one per core (src/probe.c choose_smt). For
+/// throughput threads such as the shader compilers.
+inline void UseAllCpus() {
+    HANDLE self = GetCurrentProcess();
+    ULONG size = 0;
+    GetSystemCpuSetInformation(nullptr, 0, &size, self, 0);
+    if (!size) {
+        return;
+    }
+    std::vector<char> buffer(size);
+    auto* first = reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(buffer.data());
+    if (!GetSystemCpuSetInformation(first, size, &size, self, 0)) {
+        return;
+    }
+    std::vector<ULONG> ids;
+    for (ULONG at = 0; at < size;) {
+        const auto* info = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION*>(buffer.data() + at);
+        at += info->Size;
+        if (info->Type == CpuSetInformation) {
+            ids.push_back(info->CpuSet.Id);
+        }
+    }
+    if (!ids.empty()) {
+        SetThreadSelectedCpuSets(GetCurrentThread(), ids.data(), static_cast<ULONG>(ids.size()));
+    }
+}
 #else
 
 /// Hardware threads available to the process.
@@ -42,6 +71,9 @@ inline unsigned Available() {
     }
     return std::max(1u, std::thread::hardware_concurrency());
 }
+
+/// Linux: the process affinity is left alone, nothing to undo.
+inline void UseAllCpus() {}
 
 /// The calling thread only runs on otherwise idle cores (falls back to the lowest nice level).
 inline void MakeBackground() {

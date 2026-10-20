@@ -774,6 +774,25 @@ static void choose_tsc(void) {
     tsc_clock=(void *)compat_qpc_tsc;
     runtime_tsc_use_qpc();
 }
+
+/* The command processor, draw and Vulkan recording threads are each busy most of a frame; when
+ * two of them share a physical core (SMT siblings) the frame rate drops by up to a fifth, at
+ * random from run to run (attract demo on a Ryzen 9 5900X: 64-67 or 77-80 FPS; one logical
+ * processor per core: 80.2-80.6 every run). With 6 or more cores the process's threads default
+ * to one logical processor per core (a CPU set); the shader compilers select every logical
+ * processor again (BbThreads::UseAllCpus), so first visits compile as fast as before. Below 6
+ * cores the game's job workers need the siblings. SOTC_SMT=all keeps every logical processor. */
+static void choose_smt(void) {
+    const char *mode=getenv("SOTC_SMT");
+    if (mode && !strcmp(mode,"all")) return;
+    int logical, cores;
+    const int changed=compat_one_thread_per_core(6,&logical,&cores);
+    if (changed>0)
+        printf("Runtime: one thread per CPU core: %d of %d logical processors (%d cores; %s; SOTC_SMT=all keeps them all)\n",
+               cores,logical,cores,changed==2 ? "shader compilers use all" : "affinity mask");
+    else if (changed<0)
+        printf("Runtime: SetProcessAffinityMask failed (%lu); all %d logical processors kept\n",GetLastError(),logical);
+}
 #endif
 /* sotc: SSE4a and red-zone patches of the eboot (gpu/sotc), described by scripts/sotc_cpu.py. */
 #define SOTC_TRAMPOLINE_SIZE (UINT64_C(16) << 20)
@@ -1055,6 +1074,7 @@ int main(int argc, char **argv) {
     }
     require_cpu_features();
 #ifdef _WIN32
+    choose_smt();
     choose_tsc();
 #endif
     if (content_profile) {

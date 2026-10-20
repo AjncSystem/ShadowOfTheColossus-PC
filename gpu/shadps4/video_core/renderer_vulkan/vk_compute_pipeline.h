@@ -72,6 +72,7 @@ private:
     ComputePipelineKey compute_key;
     vk::PipelineCache cache;
     vk::ShaderModule module;
+    bool from_cache{}; ///< sotc: preloaded from the cache (a refused one is dropped)
     std::atomic<bool> ready{true};
     std::atomic<bool> claimed{false};
 };

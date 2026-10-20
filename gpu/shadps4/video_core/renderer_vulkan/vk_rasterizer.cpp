@@ -809,6 +809,11 @@ bool Rasterizer::BeginHudless(const GraphicsPipeline* pipeline, const RenderStat
     attachment.is_clear = 0;
     scheduler.BeginRendering(hudless_state);
     target.fresh = true;
+    static bool reported = false;
+    if (!std::exchange(reported, true)) {
+        std::fprintf(stderr, "SOTC FG HUD-less: final composite into %#llx (%ux%u) redrawn without UI\n",
+                     static_cast<unsigned long long>(hudless_vo), target.width, target.height);
+    }
     return true;
 }
 

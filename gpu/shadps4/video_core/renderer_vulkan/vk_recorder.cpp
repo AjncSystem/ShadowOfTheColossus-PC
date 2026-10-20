@@ -743,6 +743,9 @@ void CommandRecorder::Publish() {
 void CommandRecorder::PublishAll() {
     unpublished = 0;
     write_chunk->committed.store(write_pos, std::memory_order_release);
+    // sotc: pairs with the consumer's "sleeping, fence, re-check": without it the store and the
+    // sleeping-flag load could reorder and a wake be missed (2 ms on Windows, SleepTime).
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     WakeIfSleeping();
 }
 

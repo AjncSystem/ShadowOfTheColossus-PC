@@ -211,6 +211,12 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
             if (info.uses_int64) {
                 break;
             }
+            // A 64-bit immediate argument (InverseBallot of a partial exec mask, FindILsb64 of a
+            // constant) is emitted as a 64-bit constant too.
+            for (size_t i = 0; i < inst.NumArgs(); ++i) {
+                const IR::Value arg = inst.Arg(i);
+                info.uses_int64 |= arg.IsImmediate() && arg.Type() == IR::Type::U64;
+            }
             if (inst.Type() != IR::Type::U64) {
                 continue;
             }

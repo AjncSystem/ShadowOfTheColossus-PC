@@ -1,4 +1,37 @@
-# Shadow of the Colossus — PC (port nativo / native port) · v0.58.1
+# Shadow of the Colossus — PC (port nativo / native port) · v0.58.1-plus
+
+**The original 0.58.1, plus a faster command processor, frame generation without the HUD, far
+shadows that no longer blink and no crash a minute into a new game.** Everything in
+[AjncSystem's 0.58.1](https://github.com/AjncSystem/ShadowOfTheColossus-PC) (frame generation on
+F8, high quality textures, widescreen, new launcher languages), with this fork's work on top.
+
+![Shrine of Worship, 60 FPS mode, RTX 5060 Ti (FPS from RTSS)](docs/img/sotc-fork.gif)
+
+| | Original 0.58.1 | **This fork (0.58.1-plus)** |
+|---|---|---|
+| Shrine of Worship, unlimited FPS (RTX 5060 Ti, Ryzen 7 5700X) | ~42 FPS | **~50 FPS** |
+
+What it adds (each piece has a switch to turn it off):
+- **No crash a minute into a new game:** with "High quality textures" on (0.58.1's default) a new
+  game stops about a minute after reaching the Shrine (fault at guest 0x1a371: the game's page
+  pool runs out, 7 of 7 runs). They are off by default here; turn them on in the quick settings
+  if you want to try.
+- **Far shadows no longer blink:** 0.58.1 redraws the far shadow cascades every other frame and
+  reuses the last one in between; the game does not keep it, so far shadows on the ground blink
+  at 15 Hz. Off by default (`SOTC_SHADOW_REUSE=1` turns it back on).
+- **Frame generation without the HUD:** FSR 3 and DLSS-G get the frame drawn again without the
+  UI, so the UI is no longer interpolated with the scene (`SOTC_FG_HUDLESS=0` turns it off).
+- **Update notice:** the launcher shows a link when a newer release of this fork is out.
+- **Draw thread:** the command processor reads the game's command buffers while a second thread
+  binds and records the draws (`SOTC_CP_THREADS=0` turns it off).
+- **BPE heap guard** no longer rebuilt for every readback (`SOTC_HEAP_FAST=0`).
+- **Smaller readback window**, 64 KiB (`SOTC_RB_NARROW=0`).
+- **Incremental DMA sweep:** only the memory the CPU changed is checked (`SOTC_DMA_INCR=0`).
+- **Fullscreen at 120 Hz** on 144/165 Hz monitors, so every frame stays on screen as long (Anthonypc23).
+- PS4 Pro mode keeps its own shader cache (no black screen after turning Pro off); the launcher
+  no longer stops when its console refuses writes (issue #104); a texture cache race fixed.
+
+**[⬇ Download the latest release](../../releases/latest)** · bring your own game dump · Windows 10/11, Vulkan 1.3
 
 **[Português](#português)** · **[English](#english)** · [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
@@ -21,6 +54,7 @@ de que o jogo precisa, no estilo do [bloodborne_pc](https://github.com/Supermedo
 
 | Versão | Melhorias e correções |
 |---|---|
+| **0.58.1-plus** | **Fork Lucas-blip-png:** a 0.58.1 inteira, **sem a queda de um jogo novo** (as texturas em alta, que a causam, vêm desligadas), **sombras distantes sem piscar**, **geração de quadros sem o HUD** (FSR 3/DLSS-G) e aviso de versão nova no lançador, mais **~19% de FPS** no Santuário (42 → 50 FPS, FPS ilimitado): thread de desenho separada do processador de comandos, heap guard sem remontar a cada readback, janela de readback menor e varredura de DMA incremental. **Tela cheia a 120 Hz** em monitores de 144/165 Hz (Anthonypc23). Cache de shaders próprio do modo PS4 Pro. |
 | **0.58.1** | **Texturas em alta qualidade** (folhas e pedras nítidas; o jogo não carregava as versões de alta resolução desde a 0.0.13) e **ícone próprio da janela do jogo** (ou o do jogo, ou uma imagem sua). |
 | **0.58** | **Versão da comunidade** (Lucas-blip-png, Gabriell-os, Oussama268, jownatan, xeodeo, nakaionyt/y7ngboy, tabnul): **menos quedas** (falta de memória de vídeo, jogo congelando, queda pós-colosso no modo PS4 Pro), **+15% de FPS** e menos memória de vídeo, correções AMD (bloco preto RDNA3/4), **widescreen 21:9/32:9**, **FPS 30/60/ilimitado**, **ícones Xbox**, geração de quadros FSR 3 / DLSS-G (experimental), lançador em espanhol, chinês, coreano e russo. |
 | **0.57** | **Placas AMD:** correção das cores verdes/rosas na névoa e nos personagens (as AMD passam a usar o caminho de 32 threads da NVIDIA; diagnóstico da issue #7, ainda não testado numa AMD). **Opção nova** no lançador para desligar o acesso direto à memória: ~10% mais FPS, água distante mais lisa. |
@@ -123,6 +157,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.58.1-plus** | **Lucas-blip-png fork:** all of 0.58.1, **no crash a minute into a new game** (high quality textures, which cause it, off by default), **far shadows that no longer blink**, **frame generation without the HUD** (FSR 3/DLSS-G) and an update notice in the launcher, plus **~19% more FPS** in the Shrine (42 → 50 FPS, unlimited FPS): a draw thread separate from the command processor, the heap guard no longer rebuilt per readback, a smaller readback window and an incremental DMA sweep. **120 Hz fullscreen** on 144/165 Hz monitors (Anthonypc23). Its own shader cache for PS4 Pro mode. |
 | **0.58.1** | **High quality textures** (sharp leaves and rocks; the game had not streamed its high resolution versions since 0.0.13) and the **game window's own icon** (or the game's, or a picture of yours). |
 | **0.58** | **Community release** (Lucas-blip-png, Gabriell-os, Oussama268, jownatan, xeodeo, nakaionyt/y7ngboy, tabnul): **fewer crashes** (out of video memory, game freezing, post-colossus crash in PS4 Pro mode), **+15% FPS** and less video memory, AMD fixes (RDNA3/4 black tiles), **21:9/32:9 widescreen**, **FPS 30/60/unlimited**, **Xbox button icons**, FSR 3 / DLSS-G frame generation (experimental), launcher in Spanish, Chinese, Korean and Russian. |
 | **0.57** | **AMD cards:** fix for the green/pink fog and characters (AMD now uses the NVIDIA 32-lane path; diagnosis from issue #7, not yet tested on an AMD card). **New launcher option** to turn off direct memory access: ~10% more FPS, flatter distant water. |
@@ -213,5 +248,7 @@ diagnóstico / diagnostic variables: [docs/sotc/README-SotC.md](docs/sotc/README
   (`dynamic_tsharp_array_size`), a abordagem das estatísticas de LOD / the LOD statistics
   approach e o acesso direto à memória para o SotC / and direct memory access for SotC.
 - Patch de 60 FPS / 60 FPS patch: illusion (GoldHEN cheats).
+- Este fork / this fork: Lucas-blip-png (thread de desenho / draw thread, heap guard, readback,
+  DMA); Anthonypc23 (tela cheia em múltiplo de 60 Hz / fullscreen at a 60 Hz multiple).
 
 Licença / License: **GPL-2.0-or-later** ([LICENSE](LICENSE)).

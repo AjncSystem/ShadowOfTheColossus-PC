@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.58.1-plus — 2026-10-19 (fork Lucas-blip-png)
+A 0.58.1 do AjncSystem inteira, mais o trabalho de desempenho deste fork. Santuário, FPS
+ilimitado (RTX 5060 Ti, Ryzen 7 5700X): 42 → **50 FPS**. Cada peça tem uma chave para
+desligar:
+- **Sem a queda de um jogo novo:** com as "Texturas em alta qualidade" ligadas (o padrão da 0.58.1),
+  um jogo novo fecha cerca de um minuto depois de chegar ao Santuário (`Fault ... at guest offset
+  0x1a371`; 7 de 7 rodadas aqui, e a issue #149 do original parece ser a mesma coisa). O port pede o
+  mip 2 de toda textura usada; o pool de páginas do jogo enche (as páginas livres caem ~200 por
+  segundo) e o alocador dele lê fora do bitmap. Mais memória direta (`BB_DMEM_MB`) não resolve.
+  Neste fork elas vêm **desligadas**; quem quiser pode ligar nos Ajustes rápidos.
+- **Sombras distantes sem piscar** (`SOTC_SHADOW_REUSE=1` religa): o reaproveitamento de sombras da
+  0.58 desenha as cascatas distantes em quadros alternados e reaproveita a anterior no meio, mas o
+  jogo não guarda a cascata pulada: com a câmera parada, a sombra de uma rocha aparece num quadro e
+  some no outro (15 Hz). Desligado por padrão: 0,36% → 0,01% de pixels piscando por quadro.
+- **Geração de quadros sem o HUD** (`SOTC_FG_HUDLESS=0` desliga): a composição final do jogo (UI +
+  cena) é desenhada de novo sem a UI, e o FSR 3 e o DLSS-G recebem essa imagem (`currentBackBuffer_HUDLess`,
+  `kBufferTypeHUDLessColor`). Assim a UI não é interpolada junto com a cena. Testado com o FSR 3;
+  o DLSS-G ainda não foi testado aqui.
+- **Aviso de versão nova** no lançador (issue #136 do original): um link aparece embaixo da versão
+  quando sai uma release mais nova deste fork. Nada é baixado sozinho; desliga em Avançado.
+- **Thread de desenho** (`SOTC_CP_THREADS=0` desliga): o processador de comandos lê os buffers de
+  comando do jogo e procura os pipelines; uma segunda thread liga os recursos e grava os draws na
+  mesma ordem. O reaproveitamento de sombras, a captura do FG e os shaders em segundo plano da
+  0.58 rodam junto com ela.
+- **Heap guard sem remontar a cada readback** (`SOTC_HEAP_FAST=0`): as escritas em blocos já
+  conferidos do heap do jogo pulam a guarda.
+- **Janela de readback menor**, 64 KiB (`SOTC_RB_NARROW=0`): menos páginas escritas pela GPU são
+  baixadas e desprotegidas à toa.
+- **Varredura de DMA incremental** (`SOTC_DMA_INCR=0`): só os trechos que a CPU mudou desde a
+  última varredura são conferidos.
+- **Tela cheia a 120 Hz** em monitores de 144/165 Hz, para todo quadro ficar o mesmo tempo na tela
+  (Anthonypc23).
+- **Modo PS4 Pro com cache de shaders próprio:** desligar o Pro não deixa mais a tela preta.
+- O lançador não para mais quando o console dele recusa escrita (`[Errno 22]`, issue #104);
+  corrida no cache de texturas corrigida (LRU e busca de stencil sob a trava).
+
 ## 0.58.1 — 2026-10-19
 - **Texturas em alta qualidade** (ligada por padrão nos Ajustes rápidos): desde a 0.0.13 o port
   nunca informava ao jogo quais texturas estavam em uso, e ele não carregava as versões de alta

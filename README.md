@@ -1,8 +1,8 @@
-# Shadow of the Colossus — PC (port nativo / native port) · v0.59-plus2
+# Shadow of the Colossus — PC (port nativo / native port) · v0.59-plus3
 
-**The original 0.59, plus far shadows that no longer blink, a smaller readback window, 120 Hz
-fullscreen, textures on GTX 10xx cards and CPUs without BMI1 (pre-Haswell): about 7% more FPS at
-the Shrine.** Everything in
+**The original 0.59, plus 60 FPS through the game's own 60 FPS mode, far shadows that no longer
+blink, a smaller readback window, 120 Hz fullscreen, textures on GTX 10xx cards and CPUs without
+BMI1 (pre-Haswell): about 7% more FPS at the Shrine.** Everything in
 [AjncSystem's 0.59](https://github.com/AjncSystem/ShadowOfTheColossus-PC) (the ending crash fix,
 F11, video memory and volume options, launcher self-update), with this fork's work on top. The
 draw thread and the incremental DMA sweep from this fork's 0.58.1-plus are part of the original
@@ -10,11 +10,16 @@ since 0.59.
 
 ![Shrine of Worship, 60 FPS mode, RTX 5060 Ti (FPS from RTSS)](docs/img/sotc-fork.gif)
 
-| | Original 0.59 | **This fork (0.59-plus2)** |
+| | Original 0.59 | **This fork (0.59-plus3)** |
 |---|---|---|
 | Shrine of Worship, unlimited FPS (RTX 5060 Ti, Ryzen 7 5700X) | 47 FPS | **50.6 FPS (+7%)** |
 
 What it adds (each piece has a switch to turn it off):
+- **60 FPS through the game's own 60 FPS mode** (the PS4 Pro Performance one): the 60 FPS mode
+  used to ignore the 30 FPS rate the game asks while the game still timed itself for 30, so parts
+  of its logic ran twice as fast (likely the bird colossus flying away, the 2nd colossus' wall,
+  weak point damage). Now the game targets 60 itself and its timing follows; F7 switches its
+  target between 30 and 60. Not yet confirmed at colossi 2 and 5 (`SOTC_MODES=af16` goes back).
 - **CPUs without BMI1/LZCNT/MOVBE** (Intel before Haswell: 2nd/3rd generation Core, Xeon E3 v1/v2;
   AMD FX), which got "This CPU is not supported": the game's ~5,000 such instructions are replaced
   by equivalent routines at startup, only on those CPUs (Oussama268). AVX is still required. Not
@@ -25,8 +30,8 @@ What it adds (each piece has a switch to turn it off):
 - **Textures on GTX 10xx (Pascal) cards:** without `VK_KHR_fragment_shader_barycentric` the
   rocks and ground came out black, faceted or noisy; a small geometry shader now hands the
   fragment shader the three vertices' values (`SOTC_BARYCENTRIC_GS=0`). The shader cache is
-  rebuilt on the first launch on those cards only. Tested by forcing it on an RTX 5060 Ti; not
-  yet confirmed on a real GTX 10xx.
+  rebuilt on the first launch on those cards only. Confirmed on a GTX 1080 Ti; one terrain
+  blend layer in front of the Shrine is still wrong there.
 - **Far shadows no longer blink:** the original redraws the far shadow cascades every other
   frame and reuses the last one in between; the game does not keep it, so far shadows on the
   ground blink at 15 Hz (issue #157). Off by default (`SOTC_SHADOW_REUSE=1` turns it back on).
@@ -62,6 +67,7 @@ de que o jogo precisa, no estilo do [bloodborne_pc](https://github.com/Supermedo
 
 | Versão | Melhorias e correções |
 |---|---|
+| **0.59-plus3** | **Fork Lucas-blip-png:** **60 FPS pelo modo 60 do próprio jogo** (o do Desempenho do PS4 Pro): o tempo do jogo acompanha os 60 FPS, o que deve corrigir o colosso pássaro que voa para o céu, a parede do 2º colosso e o dano no ponto fraco; o F7 troca o alvo do jogo entre 30 e 60. Texturas nas GTX 10xx confirmadas numa GTX 1080 Ti. |
 | **0.59-plus2** | **Fork Lucas-blip-png:** a 0.59-plus mais **processadores sem BMI1/LZCNT/MOVBE** (Intel de 2ª e 3ª geração, Xeon E3 v1/v2, AMD FX; do Oussama268), que antes não abriam o jogo, **sem blocos pretos nos quadros gerados pelo FSR 3 nas AMD RX 7000** (KingJhoss), e o botão JOGAR do lançador não é mais cortado com a escala do Windows acima de 100%. |
 | **0.59-plus** | **Fork Lucas-blip-png:** a 0.59 inteira, mais **~7% de FPS** no Santuário (47 → 50,6 FPS: heap guard sem remontar a cada quadro e janela de readback menor), **texturas nas GTX 10xx**, **sombras distantes sem piscar**, **tela cheia a 120 Hz** em monitores de 144/165 Hz (Anthonypc23) e geração de quadros sem o HUD como opção experimental (desligada). A atualização automática do lançador segue as releases deste fork. A thread de desenho e a varredura de DMA da 0.58.1-plus agora fazem parte do original. |
 | **0.58.1-plus** | **Fork Lucas-blip-png:** a 0.58.1 inteira, **sem a queda de um jogo novo** (as texturas em alta, que a causam, vêm desligadas), **sombras distantes sem piscar**, **geração de quadros sem o HUD** (FSR 3/DLSS-G) e aviso de versão nova no lançador, mais **~19% de FPS** no Santuário (42 → 50 FPS, FPS ilimitado): thread de desenho separada do processador de comandos, heap guard sem remontar a cada readback, janela de readback menor e varredura de DMA incremental. **Tela cheia a 120 Hz** em monitores de 144/165 Hz (Anthonypc23). Cache de shaders próprio do modo PS4 Pro. |
@@ -84,8 +90,9 @@ Detalhes de cada versão no [CHANGELOG](CHANGELOG.md).
   continuar errado, mande o seu `user/last_run.log` na issue.
 - **Geração de quadros** (experimental): a barra de vida/stamina pode tremer, e ela só faz
   diferença com o FPS em 30.
-- **60 FPS / ilimitado:** sem o limite de 30 do jogo, algumas cenas se comportam diferente (a
-  parede do 2º colosso, colossos "voando"); para essas partes use 30 FPS.
+- **60 FPS / ilimitado:** desde a 0.59-plus3 o jogo usa o próprio modo 60 (o do Desempenho do PS4
+  Pro), o que deve corrigir a parede do 2º colosso e os colossos "voando"; ainda não confirmado
+  nesses pontos. Se acontecer, use 30 FPS ali (F7) e conte nas issues.
 - Com 8 GB de memória de vídeo, o uso fica perto do limite em áreas grandes.
 
 ### Download e uso
@@ -168,6 +175,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.59-plus3** | **Lucas-blip-png fork:** **60 FPS through the game's own 60 FPS mode** (the PS4 Pro Performance one): the game's timing follows 60 FPS, which should fix the bird colossus flying away, the 2nd colossus' wall and weak point damage; F7 switches the game's target between 30 and 60. Textures on GTX 10xx confirmed on a GTX 1080 Ti. |
 | **0.59-plus2** | **Lucas-blip-png fork:** 0.59-plus plus **CPUs without BMI1/LZCNT/MOVBE** (2nd/3rd generation Intel Core, Xeon E3 v1/v2, AMD FX; by Oussama268), which could not start the game, **no black tiles on FSR 3 generated frames on AMD RX 7000** (KingJhoss), and the launcher's PLAY button is no longer cut off above 100% display scale. |
 | **0.59-plus** | **Lucas-blip-png fork:** all of 0.59, plus **~7% more FPS** in the Shrine (47 → 50.6 FPS: heap guards no longer rebuilt every frame and a smaller readback window), **textures on GTX 10xx cards**, **far shadows that no longer blink**, **120 Hz fullscreen** on 144/165 Hz monitors (Anthonypc23) and frame generation without the HUD as an experimental option (off). The launcher self-update follows this fork's releases. The draw thread and DMA sweep of 0.58.1-plus are now part of the original. |
 | **0.58.1-plus** | **Lucas-blip-png fork:** all of 0.58.1, **no crash a minute into a new game** (high quality textures, which cause it, off by default), **far shadows that no longer blink**, **frame generation without the HUD** (FSR 3/DLSS-G) and an update notice in the launcher, plus **~19% more FPS** in the Shrine (42 → 50 FPS, unlimited FPS): a draw thread separate from the command processor, the heap guard no longer rebuilt per readback, a smaller readback window and an incremental DMA sweep. **120 Hz fullscreen** on 144/165 Hz monitors (Anthonypc23). Its own shader cache for PS4 Pro mode. |
@@ -189,8 +197,9 @@ Full details in the [CHANGELOG](CHANGELOG.md) (in Portuguese).
   still wrong, attach your `user/last_run.log` to the issue.
 - **Frame generation** (experimental): the health/stamina bars may shake, and it only matters at
   30 FPS.
-- **60 FPS / unlimited:** without the game's 30 FPS cap some scenes behave differently (the 2nd
-  colossus' wall, colossi "flying"); use 30 FPS there.
+- **60 FPS / unlimited:** since 0.59-plus3 the game uses its own 60 FPS mode (the PS4 Pro
+  Performance one), which should fix the 2nd colossus' wall and the "flying" colossi; not yet
+  confirmed there. If it happens, use 30 FPS there (F7) and report it.
 - With 8 GB of video memory, usage gets close to the limit in large areas.
 
 ### Download and use

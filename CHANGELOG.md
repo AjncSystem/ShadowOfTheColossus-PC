@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.59-plus3 — 2026-10-20 (fork Lucas-blip-png)
+- **60 FPS pelo modo 60 do próprio jogo** (o do Desempenho do PS4 Pro). O modo 60 do lançador
+  ignorava a taxa de 30 que o jogo pede, mas o jogo continuava se cronometrando para 30 (alvo
+  29,97), e partes da lógica que andam por esse alvo corriam no dobro da velocidade: a causa
+  provável do colosso pássaro que sobe para o céu (#100 do original), da parede do 2º colosso
+  (#120) e do dano no ponto fraco (#49). Agora o jogo mira 60 sozinho (`TargetFramesPerSeconds` 1,
+  onde ele gravava 2) e o tempo dele acompanha. Vale para 60 FPS e ilimitado. O F7 troca o alvo
+  do próprio jogo entre 30 e 60, e a taxa e o tempo mudam juntos. Mesmo desempenho (Santuário
+  35,8 FPS nos dois modos, mesma cena). Ainda não testado nos colossos 2 e 5: quem tiver um save
+  ali, conte. Para voltar ao modo antigo: `SOTC_MODES=af16` em Avançado → Variáveis extras.
+- **Texturas nas GTX 10xx** confirmadas numa GTX 1080 Ti (JustS73, issue #57 do original): voltaram
+  quase em todo lugar, a 30 FPS. Resta uma camada de terreno em frente ao Santuário, em análise.
+
 ## 0.59-plus2 — 2026-10-20 (fork Lucas-blip-png)
 Obrigado a **Oussama268** e **KingJhoss**.
 - **Processadores sem BMI1/LZCNT/MOVBE** (Intel Core i3/i5/i7 de 2ª e 3ª geração, Xeon E3 v1/v2

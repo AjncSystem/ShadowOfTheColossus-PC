@@ -143,6 +143,14 @@ void DataBase::Prefetch() {
             files.push_back(entry.path());
         }
     }
+    {
+        std::scoped_lock lock{known_mutex};
+        known_files.clear();
+        for (const auto& file : files) {
+            known_files.insert(file.filename().string());
+        }
+        known_valid = !ec;
+    }
     const u32 num_threads =
         std::clamp<u32>(std::thread::hardware_concurrency(), 1, 16);
     std::vector<std::vector<std::pair<std::string, std::vector<u8>>>> results(num_threads);
@@ -234,6 +242,10 @@ void DataBase::Clear() {
         return;
     }
     prefetched.clear();
+    {
+        std::scoped_lock lock{known_mutex};
+        known_files.clear();
+    }
     std::error_code ec;
     u64 removed = 0;
     for (const auto& entry : std::filesystem::directory_iterator(cache_path, ec)) {
@@ -307,6 +319,16 @@ void LoadVector(BlobType type, std::filesystem::path& path, std::vector<T>& v) {
     }
 }
 
+bool DataBase::MayExist(const std::filesystem::path& path) {
+    std::scoped_lock lock{known_mutex};
+    return !known_valid || known_files.contains(path.filename().string());
+}
+
+void DataBase::AddKnown(const std::filesystem::path& path) {
+    std::scoped_lock lock{known_mutex};
+    known_files.insert(path.filename().string());
+}
+
 bool DataBase::Save(BlobType type, const std::string& name, std::vector<u8>&& data) {
     if (!opened) {
         return false;
@@ -314,6 +336,7 @@ bool DataBase::Save(BlobType type, const std::string& name, std::vector<u8>&& da
 
     auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
                                                            : cache_path / name;
+    AddKnown(std::filesystem::path{path}.replace_extension(GetBlobFileExtension(type)));
     return WriteVector(type, std::move(path), std::move(data));
 }
 
@@ -324,6 +347,7 @@ bool DataBase::Save(BlobType type, const std::string& name, std::vector<u32>&& d
 
     auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
                                                            : cache_path / name;
+    AddKnown(std::filesystem::path{path}.replace_extension(GetBlobFileExtension(type)));
     return WriteVector(type, std::move(path), std::move(data));
 }
 
@@ -339,6 +363,11 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u8>& dat
         TakePrefetched(path, data);
         return;
     }
+    if (!EmulatorSettings.IsPipelineCacheArchived() &&
+        !MayExist(std::filesystem::path{path}.replace_extension(GetBlobFileExtension(type)))) {
+        data.clear();
+        return;
+    }
     return LoadVector(type, path, data);
 }
 
@@ -349,6 +378,11 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u32>& da
 
     auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
                                                            : cache_path / name;
+    if (!prefetch_active && !EmulatorSettings.IsPipelineCacheArchived() &&
+        !MayExist(std::filesystem::path{path}.replace_extension(GetBlobFileExtension(type)))) {
+        data.clear();
+        return;
+    }
     if (prefetch_active) {
         path.replace_extension(GetBlobFileExtension(type));
         std::vector<u8> bytes;

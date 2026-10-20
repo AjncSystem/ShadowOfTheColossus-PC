@@ -14,6 +14,9 @@
 - Continua só aqui: CPUs sem BMI1/LZCNT/MOVBE (Oussama268, com as lacunas da 0.59-plus5), a
   válvula das texturas em alta (#186 do original; enviada como PR #191 do original), a janela de
   readback menor e a tela cheia a 120 Hz.
+- Testado no Santuário com a emulação de CPU antiga, o relógio do Windows e as texturas em alta
+  forçados ao mesmo tempo (`SOTC_EMULATE_BMI=1`, `SOTC_TSC=qpc`, `SOTC_LOD_LINGER=1`): sem falhas,
+  imagem normal, 47 FPS.
 
 ## 0.60.1 — 2026-10-20
 Obrigado a **nosekefik, Oussama268, plassardewen-cpu e lunar-me**.

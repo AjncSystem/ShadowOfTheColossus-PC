@@ -24,7 +24,7 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 | 0.12 | #151: lançador quebrava no Windows em chinês (codec gbk e o "™" do título) | ✅ | `bd45855`. Saída dos scripts sempre em UTF-8. Testado simulando console gbk. |
 | 0.13 | #142/#145: 21:9 e 32:9 com bordas pretas | ✅ | `5245180`. Com o modo PS4 Pro ligado o tamanho largo era ignorado sem aviso (o caminho Pro só tem tamanhos 16:9). Agora a tela larga tem prioridade; o log e o resumo do lançador avisam "PS4 Pro desligado (tela larga)". Jogo que não é EU 1.01 continua sem tela larga (já avisava no log). |
 | 0.14 | #143: "limite de 6 GB de VRAM" | ✅ | `988dc52`. A limpeza agressiva de texturas começava em 60% da memória da placa e a arena liberava a partir de 1,5 GB. Nova opção **Uso de memória de vídeo**: Econômico 50%/1 GB, Padrão 60%/1,5 GB, Alto 75%/4 GB, Máximo 85%/nunca (`SOTC_VRAM_GC_PERCENT`, `SOTC_ARENA_EVICT_MB`). Teste de 150 s no Máximo: estável, 0 coletas de emergência. O "limite de 16 GB de RAM" não existe no código (é a memória do PS4 emulado). |
-| 0.15 | #49: em 60 FPS o golpe da espada dá pouco dano | 🔍 | Lógica do jogo presa a 30 FPS em algum ponto. O jogo tem 60 FPS oficial só no modo Desempenho do PS4 Pro: testar se nele o dano fica normal; se sim, a correção é usar esse caminho. |
+| 0.15 | #49: em 60 FPS o golpe da espada dá pouco dano | ❎ não é bug | Avaliação do mantenedor: modo Difícil (dano menor) ou golpe num ponto fraco que já apagou. Responder na issue pedindo para conferir. |
 
 ## Fase 1 — Estabilidade (quedas e travamentos)
 

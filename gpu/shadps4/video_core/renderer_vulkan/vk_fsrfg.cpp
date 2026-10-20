@@ -3,14 +3,16 @@
 
 #include "video_core/renderer_vulkan/vk_fsrfg.h"
 
-#include <windows.h>
-
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#ifndef _WIN32
+#include <ctime>
+#include <thread>
+#endif
 #include <utility>
 #include <vk_mem_alloc.h>
 
@@ -245,10 +247,11 @@ FfxVkFsr3_3_1_6FrameGenerationImage FgImage(vk::Image image, vk::Format format, 
 
 /// Sleeps until `due`: a high resolution waitable timer, then a short spin.
 void SleepUntil(Clock::time_point due) {
+    using namespace std::chrono_literals;
+#ifdef _WIN32
     static HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr,
                                                  CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
                                                  TIMER_ALL_ACCESS);
-    using namespace std::chrono_literals;
     for (;;) {
         const auto left = due - Clock::now();
         if (left <= 0ns) {
@@ -266,6 +269,27 @@ void SleepUntil(Clock::time_point due) {
         }
         YieldProcessor();
     }
+#else
+    // Same shape with clock_nanosleep (like src/runtime_audio.c): absolute monotonic
+    // sleep until 1 ms before `due`, then yield-spin the rest.
+    for (;;) {
+        const auto left = due - Clock::now();
+        if (left <= 0ns) {
+            return;
+        }
+        if (left > 1500us) {
+            const auto wake = (due - 1000us).time_since_epoch();
+            const auto secs = std::chrono::duration_cast<std::chrono::seconds>(wake);
+            const timespec t{secs.count(),
+                             std::chrono::duration_cast<std::chrono::nanoseconds>(wake - secs)
+                                 .count()};
+            while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &t, nullptr)) {
+            }
+            continue;
+        }
+        std::this_thread::yield();
+    }
+#endif
 }
 
 } // namespace

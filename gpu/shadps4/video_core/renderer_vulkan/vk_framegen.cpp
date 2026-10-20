@@ -4,8 +4,13 @@
 #include "video_core/renderer_vulkan/vk_framegen.h"
 #include "video_core/sotc_ui_lang.h"
 
+#ifdef _WIN32
 #include <windows.h>
 #include <dxgi.h>
+#else
+#include <strings.h>
+#define _stricmp strcasecmp
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -44,6 +49,7 @@ Asked AskedMode() {
 
 /// An NVIDIA GPU in the system (DXGI, before Vulkan): Streamline is for those only.
 bool HasNvidiaGpu() {
+#ifdef _WIN32
     HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
     if (!dxgi) {
         return false;
@@ -64,6 +70,9 @@ bool HasNvidiaGpu() {
         factory->Release();
     }
     return found;
+#else
+    return false; // Streamline/DLSS-G are Windows-only; FSR 3 needs no DXGI probe.
+#endif
 }
 
 std::atomic<int> current{static_cast<int>(Mode::Off)};

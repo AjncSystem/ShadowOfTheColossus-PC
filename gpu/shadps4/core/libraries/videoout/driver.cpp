@@ -267,7 +267,13 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
 }
 
 // sotc: src/runtime_memory.c, live view splits since the last call.
+#ifdef _WIN32
 extern "C" uint64_t runtime_memory_carve_splits(void);
+#else
+// src/runtime_memory.c defines it only under _WIN32 (the carve path suspends the other
+// guest threads through the Win32 API); on POSIX there are no carve splits to report.
+extern "C" uint64_t runtime_memory_carve_splits(void) { return 0; }
+#endif
 // sotc: src/runtime_file.c, guest file read time since the last call.
 extern "C" uint64_t runtime_file_read_ns_take(void);
 

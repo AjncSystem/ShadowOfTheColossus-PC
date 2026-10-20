@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <cstring>
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -45,6 +46,15 @@ namespace Libraries::VideoOut {
         out.resize(at + size);
     }
     va_end(args);
+}
+
+// sotc: see SubmitFlipInternal. SOTC_EARLY_VO_LABEL=0 restores the upstream behaviour.
+static bool EarlyVoLabel() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_EARLY_VO_LABEL");
+        return !v || std::strcmp(v, "0") != 0;
+    }();
+    return on;
 }
 
 constexpr static bool Is32BppPixelFormat(PixelFormat format) {
@@ -99,6 +109,7 @@ void VideoOutDriver::Close(s32 handle) {
     main_port.is_open = false;
     main_port.flip_rate = 0;
     main_port.prev_index = -1;
+    main_port.submit_prev_index = -1;
 
     // Clear port information
     std::memset(main_port.buffer_labels.data(), 0, sizeof(main_port.buffer_labels));
@@ -619,6 +630,48 @@ void VideoOutDriver::Flip(const Request& req) {
                     static_cast<unsigned long long>(
                         SotcStats::arena_evict_mismatch.load(std::memory_order_relaxed) >> 20));
             }
+            if (const uint64_t waits = SotcStats::cp_waits.exchange(0)) {
+                ReportPrintf(report, "SOTC CP waits for the draw thread %.0f/s\n", waits / seconds);
+            }
+            if (flips) {
+                const double idle_ms = SotcStats::draw_idle_ns.exchange(0) / 1e6;
+                const double parse_ms = SotcStats::cp_parse_ns.exchange(0) / 1e6;
+                std::fprintf(stderr, "SOTC threads per frame: draw busy %.2f ms, command parse %.2f ms\n",
+                             (seconds * 1000.0 - idle_ms) / flips, parse_ms / flips);
+            }
+            if (const uint64_t faults =
+                    SotcStats::srt_walker_faults.load(std::memory_order_relaxed)) {
+                std::fprintf(stderr, "SOTC SRT walker loads that read zero: %llu\n",
+                             static_cast<unsigned long long>(faults));
+            }
+            // sotc: compute pipelines built by workers (SOTC_ASYNC_COMPUTE), totals.
+            if (const uint64_t built =
+                    SotcStats::async_compute_built.load(std::memory_order_relaxed)) {
+                std::fprintf(
+                    stderr,
+                    "SOTC ASYNC COMPUTE built %llu (%.0f ms on workers), recorder waited %llu "
+                    "times (%.0f ms)\n",
+                    static_cast<unsigned long long>(built),
+                    SotcStats::async_compute_build_ns.load(std::memory_order_relaxed) / 1e6,
+                    static_cast<unsigned long long>(
+                        SotcStats::async_compute_waits.load(std::memory_order_relaxed)),
+                    SotcStats::async_compute_wait_ns.load(std::memory_order_relaxed) / 1e6);
+            }
+            // sotc: graphics shaders translated by workers (SOTC_ASYNC_TRANSLATE), totals.
+            if (const uint64_t built =
+                    SotcStats::async_translate_built.load(std::memory_order_relaxed)) {
+                std::fprintf(stderr,
+                             "SOTC ASYNC TRANSLATE %llu stages (%.0f ms on workers), %llu draws "
+                             "skipped, %llu stale; compute built by the recorder %llu\n",
+                             static_cast<unsigned long long>(built),
+                             SotcStats::async_translate_ns.load(std::memory_order_relaxed) / 1e6,
+                             static_cast<unsigned long long>(
+                                 SotcStats::async_translate_skips.load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(
+                                 SotcStats::async_translate_stale.load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(SotcStats::async_compute_self_built.load(
+                                 std::memory_order_relaxed)));
+            }
             const bool cmd_stats = SotcStats::kCmdStats; // sotc: as the counters (sotc_stats.h)
             if (cmd_stats && flips) {
                 double k[6];
@@ -698,7 +751,7 @@ void VideoOutDriver::Flip(const Request& req) {
     }
 
     // Reset prev flip label
-    if (port->prev_index != -1) {
+    if (!EarlyVoLabel() && port->prev_index != -1) {
         port->buffer_labels[port->prev_index] = 0;
         port->SignalVoLabel();
     }
@@ -744,7 +797,8 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
 
     if (!is_eop) {
         // Non EOP flips can arrive from any thread so ask GPU thread to perform them
-        liverpool->SendCommand([=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
+        liverpool->SendOrderedCommand(
+            [=, this]() { SubmitFlipInternal(port, index, flip_arg, is_eop); });
     } else {
         SubmitFlipInternal(port, index, flip_arg, is_eop);
     }
@@ -761,6 +815,19 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         ASSERT_MSG(buffer.group_index >= 0, "Trying to flip an unregistered buffer!");
         const auto& group = port->groups[buffer.group_index];
         frame = presenter->PrepareFrame(group, buffer.address_left);
+    }
+
+    // sotc: the buffer shown before this flip is free once the copy of this one is recorded:
+    // PrepareFrame read it on the GPU timeline, ahead of anything the game renders into the old
+    // buffer next. Upstream frees it only when the present thread takes this flip on a vblank
+    // tick, and the command processor waits for that in the VO label wait at the start of the
+    // next frame.
+    if (EarlyVoLabel()) {
+        if (port->submit_prev_index != -1) {
+            port->buffer_labels[port->submit_prev_index] = 0;
+            port->SignalVoLabel();
+        }
+        port->submit_prev_index = index;
     }
 
     std::scoped_lock lock{mutex};

@@ -363,9 +363,7 @@ extern "C" uintptr_t bbgpu_resolve(const char* scoped_nid) {
 
 extern "C" int bbgpu_is_gpu_side_thread(void) {
     auto* rasterizer = Core::Memory::Instance()->GetRasterizer();
-    return rasterizer && std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread()
-               ? 1
-               : 0;
+    return rasterizer && rasterizer->IsGpuSideThread() ? 1 : 0;
 }
 
 extern "C" void bbgpu_register_guest_stack(uintptr_t address, uint64_t size) {

@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <SDL3/SDL.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -42,6 +43,24 @@ void AddMotion(std::atomic<float>& total, float delta) {
     while (!total.compare_exchange_weak(old, old + delta, std::memory_order_relaxed)) {
     }
 }
+
+#if !defined(_WIN32) && SDL_VERSION_ATLEAST(3, 4, 0)
+// The window icon from launcher/sotc.png (on Windows the executable's icon resource gives it).
+void SetWindowIcon(SDL_Window* window) {
+    const char* base = SDL_GetBasePath(); // out/ in a source tree
+    const std::string paths[] = {std::string(base ? base : "") + "../launcher/sotc.png",
+                                 "launcher/sotc.png"};
+    for (const std::string& path : paths) {
+        if (SDL_Surface* icon = SDL_LoadPNG(path.c_str())) {
+            SDL_SetWindowIcon(window, icon);
+            SDL_DestroySurface(icon);
+            return;
+        }
+    }
+}
+#else
+void SetWindowIcon(SDL_Window*) {}
+#endif
 } // namespace
 
 WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}, height{height_} {
@@ -74,6 +93,7 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     window = SDL_CreateWindowWithProperties(props);
     SDL_DestroyProperties(props);
     ASSERT_MSG(window, "Failed to create window: {}", SDL_GetError());
+    SetWindowIcon(window); // Linux: launcher/sotc.png (PR #118); the launcher's icon below wins
     // sotc: the game's own icon (sce_sys/icon0.png of the player's dump, as a BMP the launcher
     // writes: SOTC_WINDOW_ICON) instead of the executable's.
     if (const char* icon_path = std::getenv("SOTC_WINDOW_ICON"); icon_path && *icon_path) {
@@ -263,6 +283,10 @@ bool WindowSDL::PollEvents() {
                     capture(false);
                 }
             }
+        }
+        // F11: fullscreen on/off (BB_FULLSCREEN only sets the state at start).
+        if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F11 && !event.key.repeat) {
+            SDL_SetWindowFullscreen(window, !(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN));
         }
         if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F12 && !event.key.repeat) {
             VideoCore::TriggerCapture(); // only does something when running under RenderDoc

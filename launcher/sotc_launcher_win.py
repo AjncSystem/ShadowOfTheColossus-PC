@@ -23,6 +23,8 @@ import sys
 import threading
 import time
 
+import sotc_update
+
 FROZEN = getattr(sys, 'frozen', False)
 PORT_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PORT_DIR / 'scripts'))
@@ -30,7 +32,7 @@ CONFIG_DIR = Path(os.environ.get('APPDATA', Path.home())) / 'sotc-launcher'
 CONFIG_FILE = CONFIG_DIR / 'settings.json'
 GAME_ID, GAME_VERSION = 'CUSA08809', '01.01'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.58-pascal.1'
+VERSION = '0.59'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -60,7 +62,8 @@ def run_role(argv):
     attach_stdio()
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(line_buffering=True)
+            # UTF-8 whatever the Windows code page (gbk etc. cannot print the game title's ™).
+            stream.reconfigure(line_buffering=True, encoding='utf-8', errors='replace')
         except (AttributeError, ValueError):
             pass
     if argv[0] == '--script':
@@ -120,15 +123,15 @@ def windows_language():
 # Settings, passed to sotc.py as environment variables.
 
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
-                'user_dir': '', 'af16': True, 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
+                'user_dir': '', 'af16': True, 'hq_textures': True, 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
                 'readbacks': '', 'extra_env': '', 'close_on_play': False, 'gamepad': '',
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
-                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'library_dirs': [], 'keys': {},
+                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'volume': '100', 'library_dirs': [], 'keys': {},
                 'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'loading_screen': True,
-                'fps_counter': False}
+                'fps_counter': False, 'check_updates': True, 'skip_version': ''}
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
 KEY_INPUTS = [
     ('move_up', 'W', ('Andar para frente', 'Move forward')), ('move_down', 'S', ('Andar para trás', 'Move back')),
@@ -157,6 +160,14 @@ TK_TO_SDL = {
 GPU_SUBMIT = [('auto', ('Automático (ligado em NVIDIA)', 'Automatic (on with NVIDIA)')),
               ('on', ('Ligado em qualquer placa (AMD/Intel: experimental)', 'On with any card (AMD/Intel: experimental)')),
               ('off', ('Desligado', 'Off'))]
+# Video memory use (#143): (texture collection from % of the card's budget, arena release from MB; 0 = never).
+VRAM_USE = [('low', ('Econômico (placas de 4–6 GB)', 'Economy (4–6 GB cards)')),
+            ('normal', ('Padrão', 'Default')),
+            ('high', ('Alto (placas de 8–12 GB)', 'High (8–12 GB cards)')),
+            ('max', ('Máximo (placas de 16 GB ou mais)', 'Maximum (16 GB cards or more)'))]
+VOLUME = [('100', ('100% (original)', '100% (original)')), ('150', ('150%', '150%')),
+          ('200', ('200%', '200%')), ('300', ('300% (máximo)', '300% (maximum)'))]
+VRAM_LIMITS = {'low': ('50', '1024'), 'normal': ('60', '1536'), 'high': ('75', '4096'), 'max': ('85', '0')}
 
 
 def sdl_key_name(keysym):
@@ -352,16 +363,30 @@ def load_settings():
 
 
 def window_icon_file(s):
-    """icon0.png of the player's dump as a 64x64 BMP in the data folder, for the game window's
-    icon (bb-probe: SOTC_WINDOW_ICON). Nothing of the game is packaged: it comes from the dump."""
+    """The game window's icon as a 64x64 BMP in the data folder (bb-probe: SOTC_WINDOW_ICON):
+    empty setting = the port's own (launcher/window_icon.png, original art: the swordsman), 'game'
+    = icon0.png of the player's dump, else a picture the player chose (cropped to a centred
+    square). Nothing of the game or of anyone's art is packaged."""
     try:
         from PIL import Image
-        source = Path(s['game_dir'] or '.') / 'sce_sys' / 'icon0.png'
-        target = user_dir(s) / 'game_icon.bmp'
-        if not target.is_file() or target.stat().st_mtime < source.stat().st_mtime:
+        choice = s.get('window_icon_file') or ''
+        custom = Path(choice) if choice not in ('', 'game') else Path('')
+        if choice == 'game':
+            source, target = Path(s['game_dir'] or '.') / 'sce_sys' / 'icon0.png', user_dir(s) / 'game_icon.bmp'
+        elif choice and custom.is_file():
+            source, target = custom, user_dir(s) / 'window_icon_custom.bmp'
+        else:
+            source, target = PORT_DIR / 'launcher' / 'window_icon.png', user_dir(s) / 'window_icon_port.bmp'
+        if (not target.is_file() or target.stat().st_mtime < source.stat().st_mtime
+                or source == custom):
             with Image.open(source) as image:
+                image = image.convert('RGBA')
+                side = min(image.size)
+                left, top = (image.width - side) // 2, (image.height - side) // 2
+                if source == custom:
+                    image = image.crop((left, top, left + side, top + side))
                 target.parent.mkdir(parents=True, exist_ok=True)
-                image.convert('RGBA').resize((64, 64), Image.LANCZOS).save(target)
+                image.resize((64, 64), Image.LANCZOS).save(target)
         return target
     except (ImportError, OSError, ValueError):
         return None
@@ -413,9 +438,19 @@ def game_environment(s):
         env['SOTC_FLUSH_US'], env['SOTC_RB_AHEAD'] = '1000', '1'
     elif s.get('gpu_submit') == 'off':
         env['SOTC_FLUSH_EVERY'], env['SOTC_RB_AHEAD'] = '0', '0'
-    env['SOTC_NEO'] = '1' if s.get('neo') else '0'
+    env['SOTC_VRAM_GC_PERCENT'], env['SOTC_ARENA_EVICT_MB'] = VRAM_LIMITS.get(s.get('vram_use'), VRAM_LIMITS['normal'])
+    env['SOTC_VOLUME'] = str(s.get('volume') or '100')
     env['SOTC_OUTPUT_RES'] = s.get('output_res') or '1920x1080'
+    # The PS4 Pro path keeps its 16:9 sizes: a wider screen (21:9, 32:9) wins over it (#142).
+    env['SOTC_NEO'] = '1' if s.get('neo') and not is_wide(env['SOTC_OUTPUT_RES']) else '0'
+    if s.get('neo') and env['SOTC_NEO'] == '0':
+        env['SOTC_NOTE'] = f"{env['SOTC_OUTPUT_RES']} is wider than 16:9: PS4 Pro mode off (it renders 16:9 only)"
     env['SOTC_FRAMEGEN'] = s.get('framegen') or 'off'
+    # sotc: high quality textures: the texture banks sampled since the last report read as sampled
+    # (sotc_lod_stats.h; before, none ever did and the game never streamed its fine mips: blurry
+    # leaves and rocks). Off: the old behaviour, for cards short of video memory.
+    if s.get('hq_textures', True):
+        env.setdefault('SOTC_LOD_LINGER', '1')
     if s.get('button_icons') == 'xbox' and (PORT_DIR / 'glyphs' / 'xbox').is_dir():
         env['SOTC_TEX_REPLACE'] = str(PORT_DIR / 'glyphs' / 'xbox')
     env['SOTC_UI_LANG'] = s.get('ui_language') or windows_language()  # overlay and F7/F8 texts
@@ -423,7 +458,7 @@ def game_environment(s):
     # upscaler takes it to the output). 720p renders at 1080p, as on PS4; the PS4 Pro path keeps its
     # own sizes.
     output = env['SOTC_OUTPUT_RES']
-    if output not in ('1280x720', '1920x1080') and not s.get('neo'):
+    if output not in ('1280x720', '1920x1080') and env['SOTC_NEO'] == '0':
         env['SOTC_RENDER_RES'] = output
     env['BB_FSR1'] = '1' if s.get('upscaler', 'fsr1') == 'fsr1' else '0'
     if s.get('sharpness') == 'off':
@@ -449,6 +484,15 @@ def game_environment(s):
     env['PYTHONUNBUFFERED'] = '1'
     env['PYTHONIOENCODING'] = 'utf-8'
     return env
+
+
+def is_wide(size):
+    """True for a WxH wider than 16:9 (by more than 2%)."""
+    try:
+        w, h = map(int, str(size).split('x'))
+    except ValueError:
+        return False
+    return w * 9 > h * 16 * 1.02
 
 
 def shadps4_saves():
@@ -502,6 +546,16 @@ class Launcher:
         root.protocol('WM_DELETE_WINDOW', self.close)
         root.after(100, self.drain_output)
         threading.Thread(target=self.detect_gpu, daemon=True).start()
+        # sotc: self-update (sotc_update.py): the result of an update that just ran, then a check.
+        self.updating = False
+        if FROZEN:
+            error = sotc_update.cleanup(PORT_DIR)
+            if error:
+                root.after(500, lambda: messagebox.showerror('Shadow of the Colossus', _(
+                    'A atualização falhou e a versão anterior foi mantida:\n{}',
+                    'The update failed and the previous version was kept:\n{}').format(error)))
+        if self.app.get('check_updates', True) and (FROZEN or os.environ.get('SOTC_UPDATE_URL')):
+            root.after(2000, lambda: self.check_updates(False))
 
     def px(self, size):
         return int(size * self.dpi)
@@ -645,6 +699,30 @@ class Launcher:
         self.ttk.Label(parent, text=title, style='Section.TLabel').grid(
             row=self.next_row(parent), column=0, columnspan=2, sticky='w', pady=(top, 2))
 
+    def window_icon_row(self, parent):
+        """The game window's icon: the game's (empty) or a picture of the player's choice."""
+        ttk = self.ttk
+        var = self.var('window_icon_file')
+        holder = ttk.Frame(parent)
+        ttk.Entry(holder, textvariable=var, width=40).pack(side='left')
+
+        def browse():
+            chosen = self.filedialog.askopenfilename(
+                title=_('Imagem para o ícone da janela do jogo', "Picture for the game window's icon"),
+                filetypes=[(_('Imagens', 'Pictures'), '*.png *.jpg *.jpeg *.bmp *.webp'), ('*', '*.*')])
+            if chosen:
+                var.set(str(Path(chosen)))
+        ttk.Button(holder, text=_('Escolher imagem…', 'Choose picture…'), command=browse).pack(side='left', padx=(6, 0))
+        ttk.Button(holder, text=_('Usar o do jogo', "Use the game's"), command=lambda: var.set('game')).pack(side='left', padx=(6, 0))
+        ttk.Button(holder, text=_('Padrão', 'Default'), command=lambda: var.set('')).pack(side='left', padx=(6, 0))
+        return self.row(parent, _('Ícone da janela do jogo', "Game window's icon"), holder,
+                        _('Padrão: o desenho do port (o menino erguendo a espada). "game": o ícone do próprio jogo. '
+                          'Ou escolha uma imagem sua (PNG/JPG): ela é recortada em quadrado no centro. Vale na '
+                          'próxima vez que o jogo abrir.',
+                          'Default: the port\'s drawing (the boy raising his sword). "game": the game\'s own icon. '
+                          'Or choose a picture of yours (PNG/JPG): it is cropped to a centred square. Applies the '
+                          'next time the game starts.'))
+
     def folder(self, parent, key, title, prompt, hint=None, on_change=None):
         ttk = self.ttk
         var = self.var(key)
@@ -706,6 +784,7 @@ class Launcher:
             self.nav[name] = item
         tk.Frame(side, bg=BG).pack(fill='both', expand=True)
         for text, command in ((_('Registro do jogo', 'Game log'), lambda: self.show('log')),
+                              (_('Procurar atualização', 'Check for updates'), lambda: self.check_updates(True)),
                               (_('Configurar de novo', 'Set up again'), self.show_setup)):
             link = tk.Label(side, text=text, bg=BG, fg=MUTED, font=(ui_font(), 9, 'underline'), cursor='hand2')
             link.pack(anchor='w', padx=22, pady=(0, 6))
@@ -783,9 +862,10 @@ class Launcher:
         self.row(quick, _('Geração de quadros', 'Frame generation'), self.choice(quick, 'framegen', FRAMEGEN, 24))
         self.row(quick, _('FPS', 'FPS'), self.choice(quick, 'fps_mode', FPS_MODES, 24))
         self.check(quick, 'af16', _('Texturas nítidas (filtro 16x)', 'Sharp textures (16x filtering)'))
+        self.check(quick, 'hq_textures', _('Texturas em alta qualidade', 'High quality textures'))
         self.check(quick, 'fullscreen', _('Tela cheia', 'Fullscreen'))
         self.check(quick, 'neo', _('Modo PS4 Pro', 'PS4 Pro mode'))
-        for key in ('af16', 'fps_mode', 'fullscreen', 'neo', 'output_res', 'upscaler', 'sharpness', 'framegen'):
+        for key in ('af16', 'hq_textures', 'fps_mode', 'fullscreen', 'neo', 'output_res', 'upscaler', 'sharpness', 'framegen'):
             self.vars[key].trace_add('write', lambda *_a: self.refresh_status())
 
     def draw_banner(self):
@@ -878,6 +958,11 @@ class Launcher:
                       'a shadPS4 installed on this PC (user/sys_modules) and copies them to the port\'s data folder. '
                       'They are Sony firmware and never come with the port. Without them the game is silent.'),
                     on_change=self.refresh_status)
+        self.row(f, _('Volume', 'Volume'), self.choice(f, 'volume', VOLUME),
+                 _('Aumenta o som do jogo, que sai baixo. Acima de 100% os picos são suavizados em vez de '
+                   'estourar. No jogo, o modo de alto-falante "TV" também deixa o som mais alto.',
+                   'Raises the game sound, which is quiet. Above 100% the peaks are softened instead of '
+                   'clipping. In game, the "TV" speaker mode is louder too.'))
         self.section(f, _('DLC', 'DLC'))
         self.folder(f, 'dlc_dir', _('Pasta de DLC', 'DLC folder'), _('Pasta com as DLCs do jogo', "Folder with the game's DLC"),
                     _('Como no shadPS4: uma pasta com uma subpasta por DLC (cada uma com sce_sys/param.sfo), ou a '
@@ -930,6 +1015,7 @@ class Launcher:
                    'health and stamina bars may shake (the generated frame includes the interface). '
                    'In game, F8 switches the mode (off, DLSS-G, FSR 3). Best with the '
                    'screen at 60 or 120 Hz, or G-SYNC/FreeSync.'))
+        self.window_icon_row(f)
         self.section(f, _('Resolução', 'Resolution'))
         self.row(f, _('Saída', 'Output'), self.choice(f, 'output_res', OUTPUTS),
                  _('O jogo renderiza nesse tamanho; acima de cerca de 4,2 milhões de pixels (4K, 3440 × 1440) num '
@@ -1010,6 +1096,13 @@ class Launcher:
                    'Sends work to the GPU every 0.5 ms and reads results through a shortcut (Pink-shadPS4 '
                    'techniques). Measured on NVIDIA (+10–15%); on AMD/Intel pick "On" to try it and go back to '
                    '"Automatic" if the screen turns black.'))
+        self.row(f, _('Uso de memória de vídeo', 'Video memory use'), self.choice(f, 'vram_use', VRAM_USE),
+                 _('Até onde o jogo enche a memória da placa antes de liberar texturas e buffers. Padrão: '
+                   'libera a partir de 60%. Em placas de 8 GB ou mais, "Alto" ou "Máximo" evita recarregar '
+                   'texturas (menos engasgos). Se aparecer erro de falta de memória, volte um nível.',
+                   'How far the game fills the card memory before it frees textures and buffers. Default: '
+                   'frees from 60%. On 8 GB cards or more, "High" or "Maximum" avoids reloading textures '
+                   '(less stutter). On an out-of-memory error, go back one level.'))
         self.section(f, _('Efeitos', 'Effects'))
         for key, title, _off in EFFECTS:
             self.check(f, key, _(*title))
@@ -1118,6 +1211,9 @@ class Launcher:
         self.row(f, _('Idioma do lançador', 'Launcher language'), self.choice(f, 'ui_language', UI_LANGUAGES),
                  _('Vale na próxima vez que o lançador abrir.', 'Applies when the launcher opens again.'))
         self.check(f, 'close_on_play', _('Fechar o lançador quando o jogo abrir', 'Close the launcher when the game starts'))
+        self.check(f, 'check_updates', _('Procurar atualizações ao abrir', 'Check for updates at startup'),
+                   _('Pergunta antes de baixar. Saves, cache de shaders e sotc.ini são mantidos.',
+                     'Asks before downloading. Saves, shader cache and sotc.ini are kept.'))
         holder = ttk.Frame(f)
         holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(10, 0))
         ttk.Button(holder, text=_('Atalho na área de trabalho', 'Desktop shortcut'), command=self.shortcut).pack(side='left')
@@ -1205,7 +1301,8 @@ class Launcher:
         if self.var('af16').get():
             parts.append(_('AF 16x', '16x AF'))
         if self.var('neo').get():
-            parts.append('PS4 Pro')
+            parts.append('PS4 Pro' if not is_wide(self.var('output_res').get())
+                         else _('PS4 Pro desligado (tela larga)', 'PS4 Pro off (wide screen)'))
         parts.append(_('tela cheia', 'fullscreen') if self.var('fullscreen').get() else _('janela', 'window'))
         return '   ·   '.join(parts)
 
@@ -1627,7 +1724,7 @@ class Launcher:
 
     # ---- game process ------------------------------------------------------------------------
     def play(self, env=None):
-        if self.process:
+        if self.process or self.updating:
             return False
         self.collect()
         if not game_info(self.app['game_dir']):
@@ -1674,7 +1771,7 @@ class Launcher:
     PRECOMPILE_MAX_S = 20 * 60
 
     def precompile(self):
-        if self.process:
+        if self.process or self.updating:
             return
         self.collect()
         if not game_info(self.app['game_dir']):
@@ -1925,6 +2022,92 @@ class Launcher:
         else:
             self.messagebox.showerror('Shadow of the Colossus', result.stderr.decode(errors='replace')[:400])
 
+    # sotc: self-update from the GitHub releases (sotc_update.py).
+    def check_updates(self, manual):
+        if self.updating:
+            return
+        self.updating = True
+        if manual:
+            self.status.configure(text=_('Procurando atualização…', 'Checking for updates…'), fg=MUTED)
+
+        def work():
+            try:
+                release, error = sotc_update.latest_release(), None
+            except Exception as problem:  # offline or rate-limited: only a manual check says so
+                release, error = None, problem
+            self.ui_calls.put(lambda: self.offer_update(release, error, manual))
+        threading.Thread(target=work, daemon=True).start()
+
+    def offer_update(self, release, error, manual):
+        self.updating = False
+        if manual:
+            self.refresh_status()
+        if error or not sotc_update.is_newer(release, VERSION):
+            if manual and error:
+                self.messagebox.showwarning('Shadow of the Colossus', _(
+                    'Não foi possível procurar atualização:\n{}', 'Could not check for updates:\n{}').format(error))
+            elif manual:
+                self.messagebox.showinfo('Shadow of the Colossus', _(
+                    'Você já tem a versão mais recente (v{}).', 'You have the latest version (v{}).').format(VERSION))
+            return
+        if not manual and release['version'] == self.app.get('skip_version'):
+            return
+        notes = release['notes'].strip()
+        if len(notes) > 900:
+            notes = notes[:900].rsplit('\n', 1)[0] + '\n…'
+        question = _('Há uma versão nova: v{new} (você tem v{cur}).\n\n{notes}\n\n',
+                     'A new version is available: v{new} (you have v{cur}).\n\n{notes}\n\n').format(
+            new=release['version'], cur=VERSION, notes=notes)
+        if not FROZEN:  # running from the sources: nothing to replace, show the release
+            if self.messagebox.askyesno('Shadow of the Colossus', question + _('Abrir a página?', 'Open the page?')):
+                os.startfile(release['page'])
+            return
+        if self.messagebox.askyesno('Shadow of the Colossus', question + _(
+                'Baixar e instalar agora? Saves, cache de shaders e sotc.ini são mantidos, e o lançador abre '
+                'de novo sozinho.',
+                'Download and install now? Saves, shader cache and sotc.ini are kept, and the launcher opens '
+                'again by itself.')):
+            self.install_update(release)
+        else:
+            self.app['skip_version'] = release['version']  # no question at startup for this one again
+
+    def install_update(self, release):
+        if self.process:
+            self.messagebox.showinfo('Shadow of the Colossus', _('Feche o jogo antes de atualizar.',
+                                                                 'Close the game before updating.'))
+            return
+        self.updating = True
+        self.play_button.configure(state='disabled')
+        self.precompile_button.configure(state='disabled')
+
+        def progress(done, total):
+            text = _('Baixando a atualização: {} de {} MB', 'Downloading the update: {} of {} MB').format(
+                done >> 20, (total >> 20) or '?')
+            self.ui_calls.put(lambda: self.status.configure(text=text, fg=GOLD))
+
+        def work():
+            try:
+                new_root, error = sotc_update.download(release, PORT_DIR / 'update', progress), None
+            except Exception as problem:
+                new_root, error = None, problem
+            self.ui_calls.put(lambda: self.finish_update(new_root, error))
+        threading.Thread(target=work, daemon=True).start()
+
+    def finish_update(self, new_root, error):
+        if not error:
+            try:
+                sotc_update.start_applier(new_root, PORT_DIR)
+            except Exception as problem:
+                error = problem
+        if error:
+            self.updating = False
+            self.refresh_status()
+            self.messagebox.showerror('Shadow of the Colossus', _(
+                'A atualização não foi instalada:\n{}', 'The update was not installed:\n{}').format(error))
+            return
+        self.status.configure(text=_('Instalando a atualização…', 'Installing the update…'), fg=GOLD)
+        self.root.after(300, self.close)  # the applier waits for this process to end
+
     def close(self):
         try:
             self.collect()
@@ -1984,6 +2167,22 @@ def main():
     args = sys.argv[1:]
     if args and args[0] in ('--run', '--script'):
         sys.exit(run_role(args))
+    # sotc: --apply-update <new folder> <port folder> <launcher pid>: the copied launcher that
+    # installs an update (sotc_update.py). --update-now: check, download and install without
+    # the window (scripted tests; SOTC_UPDATE_URL can point at a test release).
+    if args and args[0] == '--apply-update' and len(args) == 4:
+        sys.exit(0 if sotc_update.apply_update(args[1], args[2], int(args[3])) else 1)
+    if args and args[0] == '--update-now':
+        attach_stdio()
+        release = sotc_update.latest_release()
+        if not sotc_update.is_newer(release, VERSION):
+            print(f'up to date (v{VERSION}, latest {release and release["version"]})')
+            sys.exit(0)
+        print(f'updating v{VERSION} -> v{release["version"]}')
+        new_root = sotc_update.download(release, PORT_DIR / 'update')
+        if FROZEN:
+            sotc_update.start_applier(new_root, PORT_DIR)
+        sys.exit(0)
     settings = load_settings()
     LANG = settings.get('ui_language') or windows_language()
     if '--play' in args and (Path(settings['game_dir'] or '.') / 'eboot.bin').is_file():

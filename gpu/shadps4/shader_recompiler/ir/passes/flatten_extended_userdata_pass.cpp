@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <atomic>
+#include <mutex>
 #include <cstdlib>
 #include <optional>
 #include <unordered_map>
@@ -26,6 +27,7 @@
 #include "shader_recompiler/ir/reg.h"
 #include "shader_recompiler/ir/srt_gvn_table.h"
 #include "shader_recompiler/ir/value.h"
+#include "video_core/sotc_stats.h"
 
 #ifdef ARCH_X86_64
 
@@ -36,6 +38,9 @@ using namespace Xbyak::util;
 // throws, the emulator died at boot). Untouched pages of the buffer are never used.
 static constexpr size_t SrtCodegenSize = 256_MB;
 static Xbyak::CodeGenerator g_srt_codegen(SrtCodegenSize);
+// sotc: graphics shaders are also translated on pipeline workers (SOTC_ASYNC_TRANSLATE): one
+// walker is generated at a time. Running walkers only read code that is already complete.
+static std::mutex g_srt_codegen_mutex;
 
 /// True when size more bytes fit in the walker buffer; logs the first overflow.
 static bool SrtCodeFits(size_t size) {
@@ -142,6 +147,7 @@ void MarkSrtCleanPages(u64 address, u32 size) {
 }
 
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
+    std::scoped_lock lock{g_srt_codegen_mutex};
     EnsureSrtWalkerFaultHandler();
     if (!SrtCodeFits(size)) {
         return nullptr;
@@ -190,7 +196,11 @@ bool SrtWalkerSignalHandler(void* context, void* fault_address) {
         return false; // Not in SRT code range
     }
 
-    // Patch instruction to zero register
+    // sotc: the load reads zero, this time only. Upstream patched the instruction to zero the
+    // register for good, which broke the shader for the rest of the session when its SRT
+    // pointer was only null for a while (a table the command processor read before it was
+    // written, with the draw thread) and went into the pipeline cache with the walker code,
+    // so every later session rendered with it (black frames at the Shrine of Worship).
     ZydisDecodedInstruction instruction;
     ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
     ZyanStatus status = Common::Decoder::Instance()->decodeInstruction(instruction, operands,
@@ -200,41 +210,27 @@ bool SrtWalkerSignalHandler(void* context, void* fault_address) {
            operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
            operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY);
 
-    size_t len = instruction.length;
-    const size_t patch_size = 3;
-    u8* code_patch = const_cast<u8*>(reinterpret_cast<const u8*>(code));
-
     // We can only encounter rdi or r10d as the first operand in a
     // fault memory access for SRT walker.
     switch (operands[0].reg.value) {
     case ZYDIS_REGISTER_RDI:
-        // mov rdi, [rdi + (off_dw << 2)] -> xor rdi, rdi
-        code_patch[0] = 0x48;
-        code_patch[1] = 0x31;
-        code_patch[2] = 0xFF;
+        Common::SkipLoadAsZero(context, 7, instruction.length);
         break;
     case ZYDIS_REGISTER_R10D:
-        // mov r10d, [rdi + (off_dw << 2)] -> xor r10d, r10d
-        code_patch[0] = 0x45;
-        code_patch[1] = 0x31;
-        code_patch[2] = 0xD2;
+        Common::SkipLoadAsZero(context, 10, instruction.length);
         break;
     default:
-        UNREACHABLE_MSG("Unsupported register for SRT walker patch");
+        UNREACHABLE_MSG("Unsupported register for SRT walker fault");
         return false;
     }
 
-    // Fill nops
-    memset(code_patch + patch_size, 0x90, len - patch_size);
-
-    // sotc: first few only: hundreds per session while a save loads, each a stderr line (a pipe to
-    // the launcher, milliseconds each) from the faulting guest thread.
-    static std::atomic<u32> patched_shown{0};
-    if (patched_shown.fetch_add(1, std::memory_order_relaxed) < 4) {
-        LOG_WARNING(Render_Recompiler, "Patched SRT walker at {}, fault address {}", code,
+    // sotc: rate-limited, a pointer that stays null faults on every draw now.
+    static std::atomic<u32> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+        LOG_WARNING(Render_Recompiler, "SRT walker read zero at {}, fault address {}", code,
                     fault_address);
     }
-
+    SotcStats::srt_walker_faults.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
@@ -290,7 +286,9 @@ struct PassInfo {
 
     // Walker loads test the clean-page bitmap (SrtWalkerContext in r13)
     bool clean_loads = false;
-    Xbyak::Label clean_load_stub;
+    // sotc: emplaced and reset under g_srt_codegen_mutex: a used label unregisters itself from
+    // the shared code generator when destroyed.
+    std::optional<Xbyak::Label> clean_load_stub;
     bool uses_clean_load_stub = false;
 
     PtrUserList* GetUsesAsPointer(IR::Inst* inst) {
@@ -731,7 +729,7 @@ static void EmitGuestLoad(Xbyak::CodeGenerator& c, PassInfo& pass_info, GuestLoa
     c.bt(qword[r9], rax);
     c.jnc(plain, Xbyak::CodeGenerator::T_NEAR);
     c.mov(eax, size);
-    c.call(pass_info.clean_load_stub);
+    c.call(*pass_info.clean_load_stub);
     pass_info.uses_clean_load_stub = true;
     c.test(al, al);
     c.jz(plain, Xbyak::CodeGenerator::T_NEAR);
@@ -754,7 +752,7 @@ static void EmitGuestLoad(Xbyak::CodeGenerator& c, PassInfo& pass_info, GuestLoa
 /// independent: calls clean_load(r11, eax, &value) with the walker registers saved and the stack
 /// aligned. Returns the result in al and the value in r9.
 static void EmitCleanLoadStub(Xbyak::CodeGenerator& c, PassInfo& pass_info) {
-    c.L(pass_info.clean_load_stub);
+    c.L(*pass_info.clean_load_stub);
     c.push(rcx);
     c.push(rdx);
     c.push(rsi);
@@ -902,6 +900,13 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
         return;
     }
 
+    std::scoped_lock lock{g_srt_codegen_mutex};
+    struct LabelReset {
+        PassInfo& pass_info;
+        ~LabelReset() {
+            pass_info.clean_load_stub.reset();
+        }
+    } label_reset{pass_info}; // destroyed before the lock (declared after it)
     EnsureSrtWalkerFaultHandler();
     // A walker is at most a few hundred KB; without that much room left, skip it (the shader
     // then reads zeros from its flattened user data) rather than overflow the buffer.
@@ -909,6 +914,7 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
         return;
     }
 
+    pass_info.clean_load_stub.emplace();
     info.srt_info.walker_func = c.getCurr<PFN_SrtWalker>();
     // Keep the copy helper (third argument) and the walker context (fourth) in registers the
     // generated code does not use.

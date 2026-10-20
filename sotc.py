@@ -194,6 +194,8 @@ def main():
     if cvars is None:
         # Without the launcher: the culling settings of Pink-shadPS4 (same image, fewer GPU waits).
         cvars = 'doIndexBufferCulling=0 doSunShadowIndexBufferCulling=0'
+    if env.get('SOTC_NOTE'):
+        print(f"sotc: {env['SOTC_NOTE']}", file=sys.stderr)
     render = cap_render(env.get('SOTC_RENDER_RES', '').strip())
     run_script('sotc_modes.py', source, '--out', out, '--modes', modes, '--cvars', cvars,
                *(['--render', render] if render else []))
@@ -209,6 +211,12 @@ def main():
             env['SOTC_OUTPUT_RES'] = render
         # Larger render targets: the game's heaps take what direct memory there is (run.sh).
         env.setdefault('BB_DMEM_MB', '9152')
+    # The game's direct memory allocator (a 64 KiB page bitmap over all of it) filled up and read
+    # past the bitmap (guest offset 0x1a371, read of -1): in PS4 Pro mode with 5696 MiB when a save
+    # loaded, and in PS4 mode with 5056 MiB on loading the last colossus' area (user logs, 19
+    # Oct; high quality textures keep more fine mips resident than on a PS4). Every mode gets the
+    # 9152 MiB the wide render sizes already used.
+    env.setdefault('BB_DMEM_MB', '9152')
     # The game waits for vblanks: at 60 Hz an uncapped frame (fps60, or F7 in game) still rounds
     # up to 30 FPS. With the cap, 120 Hz only shows a late frame sooner (and SOTC_FPS_LIMIT counts
     # in 120 Hz vblanks).

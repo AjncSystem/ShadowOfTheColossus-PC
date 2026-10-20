@@ -408,7 +408,12 @@ public:
     /// Retrieves the image with the specified id.
     [[nodiscard]] Image& GetImage(ImageId id) {
         auto& image = slot_images[id];
-        TouchImage(image);
+        // sotc: the LRU is only safe under `mutex`: unlocked, a guest unmap can unregister the
+        // image (freeing its LRU node) between TouchImage's Registered check and the touch. Calls
+        // outside a batch hold skip it; the locked FindImage/UpdateImage of a bound image touch it.
+        if (mutex.HeldByThisThread()) {
+            TouchImage(image);
+        }
         return image;
     }
 

@@ -610,8 +610,7 @@ public:
             // Notify rasterizer about the fault.
             const VAddr addr = msg.arg.pagefault.address;
             const auto ptid = msg.arg.pagefault.feat.ptid;
-            rasterizer->InvalidateMemory(addr, 1,
-                                         ptid == rasterizer->GetGpuCommandProcessorThreadId());
+            rasterizer->InvalidateMemory(addr, 1, rasterizer->IsGpuSideThreadId(ptid));
 
             // Some calls to InvalidateMemory never reach the UFFDIO_WRITEPROTECT ioctl in
             // ::Protect, therefore we use MODE_DONTWAKE and wake the thread with UFFDIO_WAKE here
@@ -854,10 +853,29 @@ struct SignalImpl : public PageManager::Impl {
     }
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
+        // sotc: a fault of the command processor while the draw thread binds the draws
+        // (Liverpool::IsBackThreaded) is handled on the draw thread, after what is queued: that
+        // work may produce the bytes this read wants, and a readback records commands, which only
+        // the draw thread may do.
+        // sotc: a walker load through a null SRT pointer (address below 64 KiB, never mapped) is
+        // left to SrtWalkerSignalHandler (reads zero) without waiting for the draw thread: a
+        // pointer that stays null faults on every draw since the walker is no longer patched.
+        if (reinterpret_cast<VAddr>(fault_address) < 0x10000 && !Common::IsWriteError(context) &&
+            Shader::IsSrtWalkerCode(Common::GetRip(context))) {
+            return false;
+        }
+        if (rasterizer->RunsGpuWorkElsewhere()) {
+            bool handled = false;
+            rasterizer->RunOnDrawThread(
+                [&] { handled = HandleGuestFault(context, fault_address, true); });
+            return handled;
+        }
+        return HandleGuestFault(context, fault_address, rasterizer->IsGpuSideThread());
+    }
+
+    static bool HandleGuestFault(void* context, void* fault_address, bool is_gpu_thread) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
-        const auto is_gpu_thread =
-            std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
         if (!Common::IsWriteError(context) && is_gpu_thread && TryCleanWalkerLoad(context)) {
             if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer
                 SotcStats::fault_walker.fetch_add(1, std::memory_order_relaxed);
@@ -916,7 +934,7 @@ struct SignalImpl : public PageManager::Impl {
     static bool SrtWalkerCleanLoad(u64 address, u32 size, u64* out) {
         // No GPU mapping check: without one the page is not protected and the backing holds
         // what a plain load would read.
-        if (std::this_thread::get_id() != rasterizer->GetGpuCommandProcessorThread()) {
+        if (!rasterizer->IsGpuSideThread()) {
             return false;
         }
         *out = 0;

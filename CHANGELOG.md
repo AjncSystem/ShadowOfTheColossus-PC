@@ -1,7 +1,7 @@
 # Changelog
 
-## 0.58-pascal.1 — 2026-10-20
-Fork com correções para placas NVIDIA GTX 10xx (Pascal), testadas numa GTX 1080 Ti.
+## Próxima versão
+Correções para placas NVIDIA GTX 10xx (Pascal), testadas numa GTX 1080 Ti (fork de JihedMrouki).
 - **Texturas nas placas sem `VK_KHR_fragment_shader_barycentric`** (issue #57): o SotC interpola
   à mão quase todas as entradas dos fragment shaders; sem a extensão elas ficavam constantes por
   triângulo (superfícies sem textura). Um geometry shader gerado entrega ao fragment shader os
@@ -14,6 +14,45 @@ Fork com correções para placas NVIDIA GTX 10xx (Pascal), testadas numa GTX 108
   atrás das outras e enche o cache, ~10 min), oferecido também quando o cache foi refeito;
   opção **Tela de carregamento durante o jogo**; **Contador de FPS no jogo** (só o número).
 - O cache de shaders é refeito na primeira abertura.
+
+## 0.59 — 2026-10-20
+Obrigado a **Oussama268, Lucas-blip-png e EdouardSence**.
+
+**Desempenho**
+- **Mais FPS e menos travadas** (fork do Oussama268, opt5–opt7): os desenhos são preparados numa
+  thread própria (#99 Lucas-blip-png), a memória direta é enviada aos poucos e os shaders e
+  pipelines de compute são traduzidos em threads auxiliares (o objeto espera alguns quadros em vez
+  de a tela travar). Demo da tela de título: média 63 → 65–67 FPS, mínima 30 → 34–37, ponte
+  30–32 → 37–40.
+
+**Estabilidade**
+- **Queda no final do jogo e ao carregar saves** (`0x1a371` / `0x49500`): a GPU às vezes devolvia
+  dados velhos para memória que o jogo já tinha liberado, corrompendo o alocador. A proteção do
+  Pink-shadPS4 cuidava de um só dos reservatórios de memória do jogo; agora cobre todos os do
+  mesmo tipo, inclusive os criados quando o mundo carrega (área do último colosso). O jogo também
+  recebe 9152 MB de memória direta em todos os modos (#146, #149). Causa achada com logs de
+  quedas reais; a passagem completa até os créditos ainda está em teste.
+- **Placas de 6 GB** fechando por falta de memória de vídeo: tenta o tamanho exato e a RAM do PC
+  antes de desistir (#137).
+- **Lançador em Windows chinês** quebrava com o "™" do título (#151).
+
+**Novidades**
+- **F11** alterna janela / tela cheia (#118, EdouardSence).
+- **Uso de memória de vídeo:** Econômico, Padrão, Alto e Máximo (antes o jogo limpava texturas a
+  partir de 60% da placa, o "limite de 6 GB" das placas de 8–16 GB) (#143).
+- **Volume:** 100 a 300%, sem estourar (#95).
+- **Atualização automática:** o lançador avisa quando sai versão nova e instala sozinho, mantendo
+  saves, cache de shaders e sotc.ini (#136, Oussama268). Vale a partir desta versão.
+- **Ultrawide com o modo PS4 Pro:** 21:9 e 32:9 ficavam com bordas pretas com o modo Pro ligado;
+  agora a tela larga tem prioridade (#142, #145).
+
+## 0.58.1 — 2026-10-19
+- **Texturas em alta qualidade** (ligada por padrão nos Ajustes rápidos): desde a 0.0.13 o port
+  nunca informava ao jogo quais texturas estavam em uso, e ele não carregava as versões de alta
+  resolução (folhas da árvore da abertura e pedras borradas). Desligada, volta ao comportamento
+  antigo, para placas com pouca memória de vídeo.
+- **Ícone da janela do jogo:** um desenho do port (o menino erguendo a espada), para não ficar igual
+  ao do lançador na barra de tarefas. Em Imagem e FPS: padrão, o ícone do jogo ou uma imagem sua.
 
 ## 0.58 — 2026-10-19
 Versão da comunidade: junta as pull requests e forks de várias pessoas, revisados e testados juntos.

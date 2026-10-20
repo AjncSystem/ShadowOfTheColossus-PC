@@ -49,6 +49,18 @@ inline uint64_t TakeDelta(const std::atomic<uint64_t>& counter, uint64_t& seen) 
     seen = now;
     return delta;
 }
+/// Command processor waits for the draw thread (Liverpool::IsBackThreaded).
+inline std::atomic<uint64_t> cp_waits{0};
+/// Busy time of the two command processor threads (SOTC_FPS): the draw thread minus the time it
+/// waits for work, the parser as the time inside the command buffer coroutines (not the polling
+/// loop around them, which spins while a queue waits).
+inline std::atomic<uint64_t> draw_idle_ns{0};
+inline std::atomic<uint64_t> cp_parse_ns{0};
+inline uint64_t NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+} ///< draws and dispatches recorded
 /// SOTC_CMD_STATS=1: draws, indirect draws (arguments GPU-written / CPU-side / CPU-side and
 /// empty), dispatches, indirect dispatches.
 inline std::atomic<uint64_t> cmd_kinds[6]{};
@@ -81,6 +93,19 @@ inline std::atomic<uint64_t> arena_pinned{0};   ///< ... faulted back in by shad
 inline std::atomic<uint64_t> arena_evict_mismatch{0}; ///< read back unequal to guest memory: kept
 inline std::atomic<uint64_t> arena_evict_runs{0};
 inline std::atomic<uint64_t> arena_evict_ns{0}; ///< time in MaybeEvictCold (scan, GPU wait, unbind)
+// sotc: compute pipelines built by pipeline workers (SOTC_ASYNC_COMPUTE), totals.
+inline std::atomic<uint64_t> async_compute_built{0};
+inline std::atomic<uint64_t> async_compute_build_ns{0}; ///< worker time building them
+inline std::atomic<uint64_t> async_compute_waits{0};    ///< binds the recording thread waited for
+inline std::atomic<uint64_t> async_compute_wait_ns{0};
+inline std::atomic<uint64_t> async_compute_self_built{0}; ///< built by the recording thread itself
+inline std::atomic<uint64_t> async_translate_stale{0}; ///< permutations whose tables changed
+// sotc: graphics shader stages translated by pipeline workers (SOTC_ASYNC_TRANSLATE), totals.
+inline std::atomic<uint64_t> async_translate_built{0};
+inline std::atomic<uint64_t> async_translate_ns{0};    ///< worker time translating them
+inline std::atomic<uint64_t> async_translate_skips{0}; ///< draws skipped while waiting for one
+/// sotc: SRT walker loads that faulted (null or unmapped table pointer) and read zero, total.
+inline std::atomic<uint64_t> srt_walker_faults{0};
 inline std::atomic<uint64_t> image_bytes{0};    ///< live texture cache and host pass images
 inline std::atomic<uint64_t> image_count{0};
 inline std::atomic<uint64_t> gc_kept_tiled{0};  ///< GC candidates kept: GPU-written tiled images

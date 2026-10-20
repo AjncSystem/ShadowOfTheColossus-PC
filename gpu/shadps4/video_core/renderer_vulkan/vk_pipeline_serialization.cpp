@@ -18,7 +18,9 @@
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 // Above both lines before the upstream merge: generation changed, so old caches are dropped.
-static constexpr u32 ShaderBinaryVersion = 33u; // 33: invariant position (bary emulation)
+static constexpr u32 ShaderBinaryVersion = 34u;
+// sotc: 33 = the draw thread merge (SRT walker faults read zero instead of patching).
+// sotc: 34 = invariant position (barycentric emulation, issue #57).
 static constexpr u32 ShaderMetaVersion = 21u;
 static constexpr u32 PipelineKeyVersion = 4u; // 4: generated geometry shader (sdata.gs)
 } // namespace Serialization
@@ -522,7 +524,7 @@ void Info::Serialize(Serialization::Archive& ar) const {
     Serialization::Writer info{ar};
 
     info.Write(this, sizeof(InfoPersistent));
-    info.Write(flattened_ud_buf);
+    info.Write(FlatBuf());
     srt_info.Serialize(ar);
 }
 
@@ -530,7 +532,7 @@ bool Info::Deserialize(Serialization::Archive& ar) {
     Serialization::Reader info{ar};
 
     info.Read(this, sizeof(Shader::InfoPersistent));
-    info.Read(flattened_ud_buf);
+    info.Read(FlatBuf());
 
     return srt_info.Deserialize(ar);
 }

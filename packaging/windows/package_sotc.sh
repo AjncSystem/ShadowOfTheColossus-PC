@@ -25,7 +25,7 @@ dest=out/stage/SotC-PC
 rm -rf -- out/stage
 mkdir -p "$dest/bin" "$dest/scripts" "$dest/launcher"
 cp -r out/pyi-dist/SotC/. "$dest/"
-cp launcher/sotc.ico launcher/sotc.png "$dest/launcher/"
+cp launcher/sotc.ico launcher/sotc.png launcher/window_icon.png "$dest/launcher/"
 # Xbox-style button icons drawn for the port (tools/make_button_icons.py).
 cp -r glyphs "$dest/"
 # Without debug information (out/ keeps the symbols for crash reports).

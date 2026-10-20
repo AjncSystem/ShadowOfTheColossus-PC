@@ -96,7 +96,13 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     // Buffer arena residency is never released and competes for the same budget, so start
     // aggressive collection well before the budget is reached (80% left too little room on
     // 8 GB cards and new allocations failed).
-    critical_gc_memory = std::min<u64>(critical_gc_memory, device_local_memory * 6 / 10);
+    // sotc: SOTC_VRAM_GC_PERCENT (default 60, 30-95) moves that point: higher keeps more
+    // textures resident on 8-16 GB cards (#143), lower helps 4-6 GB ones.
+    static const u64 gc_percent = [] {
+        const char* v = std::getenv("SOTC_VRAM_GC_PERCENT");
+        return std::clamp<u64>(v ? std::strtoull(v, nullptr, 10) : 60ull, 30ull, 95ull);
+    }();
+    critical_gc_memory = std::min<u64>(critical_gc_memory, device_local_memory * gc_percent / 100);
     pressure_gc_memory = std::min<u64>(pressure_gc_memory, critical_gc_memory);
     SotcStats::vram_budget = static_cast<u64>(device_local_memory);
     LOG_INFO(Render, "Video memory budget {} MB: collection from {} MB, pressure {} MB, critical {} MB",
@@ -935,6 +941,10 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 
     // If there is a stencil attachment, link depth and stencil.
     if (desc.info.stencil_addr != 0) {
+        // sotc: the lookup and RegisterImage need `mutex` like FindImage (only depth when the
+        // caller's batch hold already has it; SOTC_TC_BATCH=0 has none).
+        std::unique_lock lk{mutex, std::defer_lock};
+        LockCounted(lk);
         ImageId stencil_id{};
         ForEachImageInRegion(desc.info.stencil_addr, desc.info.stencil_size,
                              [&](ImageId image_id, Image& image) {

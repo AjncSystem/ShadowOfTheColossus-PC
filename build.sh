@@ -34,11 +34,11 @@ MINGW*|MSYS*)
         -DBB_PGO_DIR="$PWD/pgo" -DBB_LTO="${BB_LTO:-ON}" -DCMAKE_C_COMPILER=clang \
         -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_RC_COMPILER=llvm-windres >/dev/null
     echo "GPU library and loader: PGO $pgo, LTO ${BB_LTO:-ON}"
-    if ! ninja -C out/gpu bb-probe bb-gpu-capabilities bb-play > out/gpu-build.log 2>&1; then
+    if ! ninja -C out/gpu bb-probe bb-gpu-capabilities > out/gpu-build.log 2>&1; then
         grep -v '^\[' out/gpu-build.log | tail -40 >&2
         echo 'Build failed (full log: out/gpu-build.log)' >&2; exit 1
     fi
-    cp out/gpu/bb-probe.exe out/gpu/bb-gpu-capabilities.exe out/gpu/bb-play.exe out/
+    cp out/gpu/bb-probe.exe out/gpu/bb-gpu-capabilities.exe out/
     echo "Built $PWD/out/bb-probe.exe"
     exit 0
     ;;

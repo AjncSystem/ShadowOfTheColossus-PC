@@ -1,16 +1,31 @@
 # Changelog
 
-## 0.60-plus — 2026-10-20 (fork Lucas-blip-png)
-- A 0.59-plus5 em cima da **0.60** do original. Da 0.60: o relógio do jogo vem do Windows quando os
-  núcleos da CPU discordam (Einar; o jogo travava na tela de título), o jogo abre em PCs com pouca
-  memória e cada cópia do port tem a própria pasta `user` (as configurações do lançador ficam em
-  `user\launcher_settings.json`; na primeira vez a cópia herda as de antes). As texturas nas GTX
-  10xx, os 60 FPS pelo modo do próprio jogo, o heap guard sem remontar a cada quadro e a geração de
-  quadros sem o HUD, que vieram deste fork, agora fazem parte do original.
+## 0.60.1-plus — 2026-10-20 (fork Lucas-blip-png)
+- A 0.59-plus5 em cima da **0.60.1** do original. Da 0.60.1: o **menu dentro do jogo** (Insert, F1
+  ou L3+R3; nosekefik) e as sobras do Bloodborne removidas (Oussama268). Da 0.60: o relógio do jogo
+  vem do Windows quando os núcleos da CPU discordam (Einar; o jogo travava na tela de título), o
+  jogo abre em PCs com pouca memória e cada cópia do port tem a própria pasta `user` (as
+  configurações do lançador ficam em `user\launcher_settings.json`; na primeira vez a cópia herda
+  as de antes). As texturas nas GTX 10xx, os 60 FPS pelo modo do próprio jogo, o heap guard sem
+  remontar a cada quadro e a geração de quadros sem o HUD, que vieram deste fork, agora fazem parte
+  do original.
 - Continua só aqui: CPUs sem BMI1/LZCNT/MOVBE (Oussama268, com as lacunas da 0.59-plus5), a
   válvula das texturas em alta (#186 do original; enviada como PR @PR@), a janela de readback
   menor e a tela cheia a 120 Hz.
 - @PERF@
+
+## 0.60.1 — 2026-10-20
+Obrigado a **nosekefik, Oussama268, plassardewen-cpu e lunar-me**.
+
+- **Menu dentro do jogo** (Insert, F1 ou L3+R3): FPS, placa e memória de vídeo, tela cheia,
+  resolução, escala e nitidez, câmera e mouse, efeitos (névoa, vinheta, oclusão, reflexos da
+  água). Era o menu do Bloodborne, escondido no port; agora é do SotC e vem ligado
+  (`BB_OVERLAY_MENU=0` desliga). Textos em inglês (PR #94, nosekefik).
+- **Sobras do Bloodborne removidas** (~11.700 linhas: lançador antigo, patches e mods do
+  Bloodborne, ícones, documentos), a partir da PR #60 do Oussama268. O executável do jogo
+  (`bb-probe.exe`) passa a ter o ícone do SotC.
+- A busca pelo jogo ignora a pasta `WpSystem` do Windows (PR #110, plassardewen-cpu).
+- Página do GitHub só em inglês.
 
 ## 0.60 — 2026-10-20
 Obrigado a **Lucas-blip-png, Einar e KingJhoss**.

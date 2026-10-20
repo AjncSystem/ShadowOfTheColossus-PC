@@ -420,7 +420,7 @@ The GPU (RX 7800 XT) now limits more than the CPU. Presets change it little:
 The reduced scene targets are used (1160 of ~1530 scene draws per frame), but rasterizing the
 scene costs little on this GPU: a ninth of the pixels saves ~0.3 ms. The rest does not depend on
 the preset (shadow maps, full-resolution post-processing and UI, FSR itself — FSR 4 costs
-~1.1-1.4 ms more than FSR 3 —, and emulation overhead: barriers, copies, resampling). FSR 4 at
+~1.1-1.4 ms more than FSR 3 — and emulation overhead: barriers, copies, resampling). FSR 4 at
 Native AA fails to start ("no free provider frame").
 
 ### GPU profile (`BB_GPU_PROFILE=1`, `vk_gpu_profiler.h`)

@@ -1,15 +1,15 @@
-# Shadow of the Colossus — PC (port nativo / native port) · v0.60-plus
+# Shadow of the Colossus — PC native port · v0.60.1-plus
 
-**The original 0.60, plus CPUs without BMI1 (pre-Haswell), no crash with high quality textures, a
+**The original 0.60.1, plus CPUs without BMI1 (pre-Haswell), no crash with high quality textures, a
 smaller readback window and 120 Hz fullscreen.** Everything in
-[AjncSystem's 0.60](https://github.com/AjncSystem/ShadowOfTheColossus-PC) (textures on GTX 10xx
-cards, 60 FPS through the game's own 60 FPS mode, heap guards no longer rebuilt every frame and
-HUD-less frame generation as an option, all four from this fork; the title-screen hang fix,
-low-memory PCs, a `user` folder per copy), with this fork's work on top.
+[AjncSystem's 0.60.1](https://github.com/AjncSystem/ShadowOfTheColossus-PC) (the in-game menu,
+textures on GTX 10xx cards, 60 FPS through the game's own 60 FPS mode, heap guards no longer
+rebuilt every frame and HUD-less frame generation as an option, the last four from this fork; the
+title-screen hang fix, low-memory PCs, a `user` folder per copy), with this fork's work on top.
 
 ![Shrine of Worship, 60 FPS mode, RTX 5060 Ti (FPS from RTSS)](docs/img/sotc-fork.gif)
 
-| | Original 0.60 | **This fork (0.60-plus)** |
+| | Original 0.60.1 | **This fork (0.60.1-plus)** |
 |---|---|---|
 | Shrine of Worship, unlimited FPS (RTX 5060 Ti, Ryzen 7 5700X; median of 3 runs) | @BASE@ FPS | **@PLUS@ FPS (@GAIN@)** |
 
@@ -30,130 +30,15 @@ What it adds:
 
 **[⬇ Download the latest release](../../releases/latest)** · bring your own game dump · Windows 10/11, Vulkan 1.3
 
-**[Português](#português)** · **[English](#english)** · [Releases](../../releases) · [Changelog](CHANGELOG.md)
-
-> **Nenhum arquivo do jogo nem da Sony está incluído / No game or Sony files are included.**
-> Você precisa do seu próprio dump do jogo e, para ter som, de dois módulos do seu próprio
-> console. / You need your own game dump and, for sound, two modules from your own console.
-> Este projeto não tem ligação com a Sony Interactive Entertainment nem com a Bluepoint Games. /
-> This project is not affiliated with Sony Interactive Entertainment or Bluepoint Games.
-
 ---
 
-## Português
+[Releases](../../releases) · [Changelog](CHANGELOG.md)
 
-Port nativo do **Shadow of the Colossus** de PS4 (Bluepoint, 2018; CUSA08809, versão EU 1.01)
-para **Windows 10/11**. O código x86-64 do próprio jogo roda direto na CPU do PC e a GPU do PS4
-é traduzida para Vulkan. Não é um emulador completo: é um carregador com as funções de sistema
-de que o jogo precisa, no estilo do [bloodborne_pc](https://github.com/Supermedo/bloodborne_pc).
-
-### Novidades
-
-| Versão | Melhorias e correções |
-|---|---|
-| **0.60-plus** | **Fork Lucas-blip-png:** a **0.60** do original inteira (que já traz as texturas nas GTX 10xx, os 60 FPS pelo modo do jogo, o heap guard mais rápido e o FG sem HUD deste fork), mais **CPUs sem BMI1** (Oussama268, com a correção do travamento na primeira tela de carregamento), **sem a queda das texturas em alta** (0x1a371), janela de readback menor e **tela cheia a 120 Hz** (Anthonypc23). |
-| **0.60** | **Texturas nas GTX 10xx**, sem travar na tela de título, **abre em PCs com pouca memória**, **60 FPS pelo modo Desempenho do jogo** (física certa), **pasta `user` própria de cada cópia**, +6% de FPS no templo, FSR 3 sem quadrados pretos na RX 7000. |
-| **0.59-plus5** | **Fork Lucas-blip-png:** sem a **queda com texturas em alta no modo PS4 Pro** (0x1a371: o jogo enchia o pool de memória dele; agora pede menos detalhe quando ele fica quase cheio) e correção para **CPUs sem BMI1** que travavam na primeira tela de carregamento. |
-| **0.59-plus4** | **Fork Lucas-blip-png:** a 0.59-plus3 em cima da **0.59.1** do original: **listras da AMD** nas sombras e na água corrigidas, correções para Intel, opção **Sombras distantes** no lançador e o registro mostra a placa e o driver (Oussama268 e AjncSystem). |
-| **0.59-plus3** | **Fork Lucas-blip-png:** **60 FPS pelo modo 60 do próprio jogo** (o do Desempenho do PS4 Pro): o tempo do jogo acompanha os 60 FPS, o que deve corrigir o colosso pássaro que voa para o céu, a parede do 2º colosso e o dano no ponto fraco; o F7 troca o alvo do jogo entre 30 e 60. Texturas nas GTX 10xx confirmadas numa GTX 1080 Ti. |
-| **0.59-plus2** | **Fork Lucas-blip-png:** a 0.59-plus mais **processadores sem BMI1/LZCNT/MOVBE** (Intel de 2ª e 3ª geração, Xeon E3 v1/v2, AMD FX; do Oussama268), que antes não abriam o jogo, **sem blocos pretos nos quadros gerados pelo FSR 3 nas AMD RX 7000** (KingJhoss), e o botão JOGAR do lançador não é mais cortado com a escala do Windows acima de 100%. |
-| **0.59-plus** | **Fork Lucas-blip-png:** a 0.59 inteira, mais **~7% de FPS** no Santuário (47 → 50,6 FPS: heap guard sem remontar a cada quadro e janela de readback menor), **texturas nas GTX 10xx**, **sombras distantes sem piscar**, **tela cheia a 120 Hz** em monitores de 144/165 Hz (Anthonypc23) e geração de quadros sem o HUD como opção experimental (desligada). A atualização automática do lançador segue as releases deste fork. A thread de desenho e a varredura de DMA da 0.58.1-plus agora fazem parte do original. |
-| **0.58.1-plus** | **Fork Lucas-blip-png:** a 0.58.1 inteira, **sem a queda de um jogo novo** (as texturas em alta, que a causam, vêm desligadas), **sombras distantes sem piscar**, **geração de quadros sem o HUD** (FSR 3/DLSS-G) e aviso de versão nova no lançador, mais **~19% de FPS** no Santuário (42 → 50 FPS, FPS ilimitado): thread de desenho separada do processador de comandos, heap guard sem remontar a cada readback, janela de readback menor e varredura de DMA incremental. **Tela cheia a 120 Hz** em monitores de 144/165 Hz (Anthonypc23). Cache de shaders próprio do modo PS4 Pro. |
-| **0.59.1** | **Sombras distantes sem piscar** (AMD e NVIDIA; opção nova no lançador), **listras da AMD** nas sombras e na água corrigidas, correções para Intel, registro mostra placa e driver. |
-| **0.59** | **Mais FPS** (fork do Oussama268: thread de desenhos, shaders traduzidos em paralelo; ponte 30 → 37–40 FPS), **correção para a queda no final do jogo e ao carregar saves** (em teste: conte nas issues), **F11 tela cheia**, opções de **uso de memória de vídeo** e **volume**, **atualização automática** no lançador, ultrawide com o modo PS4 Pro, correções para placas de 6 GB e Windows em chinês. |
-| **0.58.1** | **Texturas em alta qualidade** (folhas e pedras nítidas; o jogo não carregava as versões de alta resolução desde a 0.0.13) e **ícone próprio da janela do jogo** (ou o do jogo, ou uma imagem sua). |
-| **0.58** | **Versão da comunidade** (Lucas-blip-png, Gabriell-os, Oussama268, jownatan, xeodeo, nakaionyt/y7ngboy, tabnul): **menos quedas** (falta de memória de vídeo, jogo congelando, queda pós-colosso no modo PS4 Pro), **+15% de FPS** e menos memória de vídeo, correções AMD (bloco preto RDNA3/4), **widescreen 21:9/32:9**, **FPS 30/60/ilimitado**, **ícones Xbox**, geração de quadros FSR 3 / DLSS-G (experimental), lançador em espanhol, chinês, coreano e russo. |
-| **0.57** | **Placas AMD:** correção das cores verdes/rosas na névoa e nos personagens (as AMD passam a usar o caminho de 32 threads da NVIDIA; diagnóstico da issue #7, ainda não testado numa AMD). **Opção nova** no lançador para desligar o acesso direto à memória: ~10% mais FPS, água distante mais lisa. |
-| **0.56** | **Água do mundo aberto com ondas:** lagos e rios abaixo das cascatas não ficam mais lisos como espelho (uma instrução de shader, `S_WQM_B64`, era ignorada). **Lago de cima ondula e reflete até longe** (acesso direto à memória ligado por padrão, como no Pink-shadPS4). Árvores distantes sem "lixo colorido". |
-| **0.0.13** | **Sem quedas:** corrigida a queda na abertura/menu da 0.0.12 (o jogo pedia mais texturas do que cabe no pool). Testado ~40 min pelo mapa, com dois carregamentos de save. **Reflexos do lago** em quase toda a superfície, com ondulação (uma trava de laços dos shaders cortava os raios do reflexo). |
-| **0.0.12** | **Texturas nítidas de volta, sem o jogo fechar:** a corrupção de memória que derrubava o jogo depois de carregar um save foi corrigida, e o streaming de texturas voltou (pedras e paredes bem mais nítidas). **Água:** respingos, anéis e espuma ao nadar; o lago reflete o céu e o brilho do sol; reflexos de ambiente com o *cubemap* certo de cada *probe* (correção do Pink-shadPS4). |
-| **0.0.11** | Corrigida a grama com textura de "lixo colorido" da 0.0.10. |
-
-Detalhes de cada versão no [CHANGELOG](CHANGELOG.md).
-
-### Problemas conhecidos
-
-- Na primeira abertura depois de atualizar, os shaders são compilados de novo: o primeiro
-  carregamento demora e engasga.
-- Placas **AMD**: as correções da 0.57 e da 0.58 ainda não foram testadas aqui numa AMD. Se algo
-  continuar errado, mande o seu `user/last_run.log` na issue.
-- **Geração de quadros** (experimental): a barra de vida/stamina pode tremer, e ela só faz
-  diferença com o FPS em 30.
-- **60 FPS / ilimitado:** desde a 0.59-plus3 o jogo usa o próprio modo 60 (o do Desempenho do PS4
-  Pro), o que deve corrigir a parede do 2º colosso e os colossos "voando"; ainda não confirmado
-  nesses pontos. Se acontecer, use 30 FPS ali (F7) e conte nas issues.
-- Com 8 GB de memória de vídeo, o uso fica perto do limite em áreas grandes.
-
-### Download e uso
-
-1. Baixe o `SotC-PC.zip` da página [Releases](../../releases) e descompacte numa pasta.
-2. Abra o **`SotC.exe`**. Na primeira vez o lançador procura sozinho, nos discos do PC:
-   - a pasta do jogo (o dump CUSA08809, com `eboot.bin`, `sce_module` e `sce_sys`);
-   - os módulos de som (`libSceNgs2.sprx` e `libSceUlt.sprx`) de um shadPS4 que você já
-     tenha, na pasta `user/sys_modules`, e copia para a pasta de dados do port;
-   - um save do jogo no shadPS4, que ele oferece importar;
-   - as DLCs do jogo, se houver: a pasta `addcont` do shadPS4, ou uma pasta com uma subpasta por DLC.
-     Também dá para escolher em **Jogo e saves > Pasta de DLC**.
-3. Confira a página **Jogo e saves**. A **biblioteca de jogos** funciona como a do shadPS4:
-   adicione as pastas dos seus jogos e escolha o jogo na lista.
-4. Clique em **JOGAR**.
-
-Requisitos: Windows 10/11 64-bit, placa de vídeo com **Vulkan 1.3** (NVIDIA, AMD ou Intel
-com driver recente). Não precisa instalar Python.
-
-#### Os arquivos que você precisa ter
-
-| O quê | De onde | Para quê |
-|---|---|---|
-| Dump do jogo CUSA08809 (EU 1.01 de preferência) | o seu PS4, pelo GoldHEN | o jogo |
-| `libSceNgs2.sprx`, `libSceUlt.sprx` decriptados | o seu PS4 (`/system/common/lib/`, FTP do GoldHEN), ou o `user/sys_modules` do shadPS4 | som (sem eles o jogo roda mudo) |
-
-Os modos de patch (60 FPS, filtro 16x) só valem para a versão EU 1.01; nas outras o jogo roda
-normalmente, a 30 FPS.
-
-### O lançador
-
-- **Jogar:** confere a versão do jogo, o som, os saves e a placa de vídeo antes de abrir;
-  opções rápidas de saída, upscaler, 60 FPS, filtro 16x e tela cheia.
-- **Jogo e saves:** biblioteca de jogos, busca automática no PC, importação de saves do shadPS4.
-- **Imagem e FPS:** saída 720p a 4K, também 16:10, 21:9 e 32:9 (o jogo renderiza no tamanho da saída, até 1080 linhas
-  de altura, e o FSR 1 + RCAS amplia o resto),
-  modo PS4 Pro (o jogo oferece Cinematográfico/Desempenho no próprio menu), efeitos (vinheta,
-  névoa, SSAO) e opções de desempenho.
-- **Controles:** controle (DualShock 4, DualSense, Xbox) automático; câmera no mouse;
-  **troca de teclas** clicando na ação e apertando a tecla nova.
-- **Avançado:** cvars do motor Bluepoint, diagnóstico, atalho na área de trabalho (com o ícone
-  do seu jogo). O registro de cada sessão fica em `user/last_run.log`.
-
-### O que foi feito
-
-| Área | Resultado |
-|---|---|
-| Boot | O jogo inicia com o carregador do bbport: imports por NID, fibras, patches de CPU (SSE4a), imagem abaixo de 2 GiB (o jogo guarda ponteiros em 31 bits). |
-| Vídeo | Núcleo de vídeo do fork shadPS4 SotC dentro do port: logos, abertura, menus, campo aberto sem polígonos pretos, sombras com iluminação correta. |
-| Texturas | Streaming de texturas (o jogo carrega os mips mais finos), sem corrupção de memória. |
-| Água | Reflexos em espaço de tela, reflexos de ambiente por *probe*, respingos e anéis ao nadar. |
-| Saves | Gravação, carregamento e exclusão pela lista de saves na tela. |
-| Som | Áudio real com os módulos Ngs2/Ult do próprio usuário. |
-| Controles | Teclado e controle juntos, câmera no mouse, troca de teclas no lançador. |
-| Modos | 60 FPS (patch de illusion), filtro anisotrópico 16x, modo PS4 Pro, saída até 4K. |
-| Desempenho | No demo da tela de título, em modo 60 FPS: média de **37–45 → ~67 FPS**, trecho mais pesado (ponte do cânion) **~17 → 29–34 FPS**. |
-
-### Perguntas comuns
-
-- **DirectX 11/12?** Não. O núcleo de vídeo traduz a GPU do PS4 para Vulkan (shaders em SPIR-V).
-  Toda placa com DirectX 12 moderno também tem Vulkan 1.3: basta o driver atualizado.
-- **AMD e Intel?** Quase todas as otimizações valem para qualquer placa. Duas só ligam
-  sozinhas na NVIDIA: o envio periódico à GPU e as leituras antecipadas. Em **Imagem e FPS >
-  Envio de trabalho à GPU**, escolha **Ligado** para usá-las numa AMD ou Intel. Se a tela ficar
-  preta, volte para **Automático**.
-- **Por que não vem o som pronto?** Os dois `.sprx` são firmware da Sony; distribuí-los não é
-  permitido. O lançador acha e copia os seus automaticamente.
-- **O jogo fechou sozinho.** Abra uma *issue* com o arquivo `user/last_run.log`.
+> **No game or Sony files are included.** You need your own game dump and, for sound, two
+> modules from your own console. This project is not affiliated with Sony Interactive
+> Entertainment or Bluepoint Games.
 
 ---
-
-## English
 
 A native Windows port of the PS4 **Shadow of the Colossus** (Bluepoint, 2018; CUSA08809, EU 1.01)
 for **Windows 10/11**. The game's own x86-64 code runs directly on the PC's CPU and the PS4 GPU
@@ -164,7 +49,8 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
-| **0.60-plus** | **Lucas-blip-png fork:** all of the original's **0.60** (which already has this fork's GTX 10xx textures, 60 FPS through the game's own mode, faster heap guards and HUD-less frame generation), plus **CPUs without BMI1** (Oussama268, with the fix for the hang on the first loading screen), **no crash with high quality textures** (0x1a371), a smaller readback window and **120 Hz fullscreen** (Anthonypc23). |
+| **0.60.1-plus** | **Lucas-blip-png fork:** all of the original's **0.60.1** (which already has this fork's GTX 10xx textures, 60 FPS through the game's own mode, faster heap guards and HUD-less frame generation), plus **CPUs without BMI1** (Oussama268, with the fix for the hang on the first loading screen), **no crash with high quality textures** (0x1a371), a smaller readback window and **120 Hz fullscreen** (Anthonypc23). |
+| **0.60.1** | **In-game menu** (Insert / F1 / L3+R3: FPS, GPU and VRAM, fullscreen, resolution, sharpening, mouse camera, effects), **Bloodborne leftovers removed** (~11,700 lines), the game exe has the SotC icon. |
 | **0.60** | **Textures on GTX 10xx**, no title-screen hang, **starts on low-memory PCs**, **60 FPS through the game's own Performance mode** (right physics), **each copy has its own `user` folder**, +6% FPS at the Shrine, FSR 3 without black tiles on RX 7000. |
 | **0.59-plus5** | **Lucas-blip-png fork:** no more **crash with high quality textures in PS4 Pro mode** (0x1a371: the game filled its own memory pool; now it asks for less detail when the pool is nearly full) and a fix for **CPUs without BMI1** that hung on the first loading screen. |
 | **0.59-plus4** | **Lucas-blip-png fork:** 0.59-plus3 on top of the original's **0.59.1**: **AMD stripes** on shadows and water fixed, Intel fixes, a **Far shadows** launcher option, and the log shows the GPU and driver (Oussama268 and AjncSystem). |
@@ -187,14 +73,16 @@ Full details in the [CHANGELOG](CHANGELOG.md) (in Portuguese).
 ### Known issues
 
 - The first start after updating rebuilds the shaders: the first load is slow and stutters.
-- **AMD** GPUs: the 0.57 and 0.58 fixes are not yet tested here on an AMD card. If something is
-  still wrong, attach your `user/last_run.log` to the issue.
-- **Frame generation** (experimental): the health/stamina bars may shake, and it only matters at
-  30 FPS.
-- **60 FPS / unlimited:** since 0.59-plus3 the game uses its own 60 FPS mode (the PS4 Pro
-  Performance one), which should fix the 2nd colossus' wall and the "flying" colossi; not yet
-  confirmed there. If it happens, use 30 FPS there (F7) and report it.
-- With 8 GB of video memory, usage gets close to the limit in large areas.
+- **High quality textures** could close the game in very wide views (sword raised against the
+  sun, the last colossus' area; #186). Fixed in this fork; on the original, turn the option off.
+- **AMD GCN** cards (RX 470–590, Vega, APUs on the legacy driver): characters and Agro may glow
+  white (#152, #158, #187). Under investigation; newer AMD cards (RDNA) are not affected.
+- **60 FPS:** since 0.60 the game targets 60 FPS itself (its PS4 Pro Performance mode), which
+  should fix the 60 FPS physics (the 2nd colossus' wall, colossi "flying"); still being tested
+  there. `SOTC_MODES=af16` in the extra variables goes back to the old mode.
+- **Frame generation** (experimental): the health/stamina bars may shake (`SOTC_FG_HUDLESS=1`
+  tries a HUD-less image), and it only matters at 30 FPS.
+- With 8 GB of video memory or less, pick a lower **Video memory use** level if the game runs out.
 
 ### Download and use
 
@@ -235,35 +123,32 @@ with `user/last_run.log`.
 
 ---
 
-## Compilar / Building
+## Building
 
-Windows com / with [MSYS2](https://www.msys2.org/) (CLANG64). Pacotes / packages:
-[packaging/windows/README.md](packaging/windows/README.md). Para congelar o `SotC.exe` / to
-freeze `SotC.exe`: um Python do Windows com PyInstaller e Pillow / a Windows Python with
-PyInstaller and Pillow (`WINPYTHON`).
+Windows with [MSYS2](https://www.msys2.org/) (CLANG64); packages:
+[packaging/windows/README.md](packaging/windows/README.md). To freeze `SotC.exe`: a Windows
+Python with PyInstaller and Pillow (`WINPYTHON`).
 
 ```
 bash build.sh                              # out/bb-probe.exe
 bash packaging/windows/package_sotc.sh     # dist/SotC-PC.zip
 ```
 
-O empacotamento recusa qualquer `.sprx`/`.prx` / packaging refuses any `.sprx`/`.prx`: Sony
-firmware never goes into the package. Ferramentas de teste / test tools: `tools/`. Variáveis de
-diagnóstico / diagnostic variables: [docs/sotc/README-SotC.md](docs/sotc/README-SotC.md).
+Packaging refuses any `.sprx`/`.prx`: Sony firmware never goes into the package. Test tools:
+`tools/`. Diagnostic variables: [docs/sotc/README-SotC.md](docs/sotc/README-SotC.md).
 
-## Créditos / Credits
+## Credits
 
 - [bloodborne_pc](https://github.com/Supermedo/bloodborne_pc) (Supermedo, deadinside28 and
-  forks): carregador, runtime nativo e lançador / loader, native runtime and launcher. README
-  original: [docs/bbport](docs/bbport/README.md).
-- [shadPS4](https://github.com/shadps4-emu/shadPS4) e o fork / and the shadPS4 SotC fork:
-  núcleo de vídeo Vulkan / Vulkan video core.
-- [Pink-shadPS4](https://github.com/luizgustavs/Pink-shadPS4) (luizgustavs): cvars de culling /
-  culling cvars, BPE heap guard, envio periódico / periodic submission, gravador de comandos em
-  thread própria / command recording thread, correções de shader / shader fixes (fetch-shader
-  constants, `V_ALIGNBIT`, `V_CVT_PK_U8_F32`), tabelas de texturas indexadas / dynamic T# tables
-  (`dynamic_tsharp_array_size`), a abordagem das estatísticas de LOD / the LOD statistics
-  approach e o acesso direto à memória para o SotC / and direct memory access for SotC.
-- Patch de 60 FPS / 60 FPS patch: illusion (GoldHEN cheats).
+  forks): loader, native runtime and launcher. Original README: [docs/bbport](docs/bbport/README.md).
+- [shadPS4](https://github.com/shadps4-emu/shadPS4) and the shadPS4 SotC fork: Vulkan video core.
+- [Pink-shadPS4](https://github.com/luizgustavs/Pink-shadPS4) (luizgustavs): culling cvars, BPE
+  heap guard, periodic submission, command recording thread, shader fixes (fetch-shader
+  constants, `V_ALIGNBIT`, `V_CVT_PK_U8_F32`), dynamic T# tables (`dynamic_tsharp_array_size`),
+  the LOD statistics approach and direct memory access for SotC.
+- Community pull requests and forks: **Oussama268**, **Lucas-blip-png**, **Gabriell-os**,
+  **jownatan**, **xeodeo**, **nakaionyt / y7ngboy**, **tabnul**, **EdouardSence**, **Einar**,
+  **KingJhoss**, **nosekefik**, **raulbezerro-dev** and everyone who reports issues with logs.
+- 60 FPS patch: illusion (GoldHEN cheats).
 
-Licença / License: **GPL-2.0-or-later** ([LICENSE](LICENSE)).
+License: **GPL-2.0-or-later** ([LICENSE](LICENSE)).

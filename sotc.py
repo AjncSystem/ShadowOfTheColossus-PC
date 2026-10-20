@@ -82,6 +82,8 @@ def cap_render(size):
         w, h = map(int, size.split('x'))
     except ValueError:
         return size  # sotc_modes.py reports it
+    if w <= 0 or h <= 0:
+        return size  # sotc_modes.py reports it
     scale = min(1.0, MAX_RENDER_HEIGHT / h, (MAX_RENDER_PIXELS / (w * h)) ** 0.5)
     if scale == 1.0:
         return size
@@ -199,6 +201,13 @@ def main():
     if env.get('SOTC_NOTE'):
         print(f"sotc: {env['SOTC_NOTE']}", file=sys.stderr)
     render = cap_render(env.get('SOTC_RENDER_RES', '').strip())
+    if render == '1920x1080':
+        # A 16:9 output above 1080p renders at 1080p as before: no patches, no extra memory.
+        render = ''
+    if render:
+        env['SOTC_RENDER_RES'] = render  # the GPU library reads it (bilinear 2D art above 1080p)
+    else:
+        env.pop('SOTC_RENDER_RES', None)
     run_script('sotc_modes.py', source, '--out', out, '--modes', modes, '--cvars', cvars,
                *(['--render', render] if render else []))
     if render:

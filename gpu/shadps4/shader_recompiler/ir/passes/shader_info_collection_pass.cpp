@@ -198,6 +198,40 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
         });
         LOG_ERROR(Render, "Enabling DMA for shader {:#x}", info.pgm_hash);
     }
+
+    // sotc: whether the SPIR-V needs 64-bit integers. GPUs without shaderInt64 (Intel Iris Xe)
+    // must not get the Int64 capability, and most shaders keep no 64-bit value after the
+    // optimization passes: a ballot whose uses are all 32-bit unpacks or BallotFindLsb is
+    // emitted as a uvec2 instead (EmitBallot).
+    info.uses_int64 = info.uses_dma || info.readconst_types != Info::ReadConstType::None ||
+                      info.uses_buffer_int64_atomics ||
+                      info.uses_shared_int64_atomics || True(info.shared_types & IR::Type::U64);
+    for (IR::Block* const block : program.post_order_blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            if (info.uses_int64) {
+                break;
+            }
+            // A 64-bit immediate argument (InverseBallot of a partial exec mask, FindILsb64 of a
+            // constant) is emitted as a 64-bit constant too.
+            for (size_t i = 0; i < inst.NumArgs(); ++i) {
+                const IR::Value arg = inst.Arg(i);
+                info.uses_int64 |= arg.IsImmediate() && arg.Type() == IR::Type::U64;
+            }
+            if (inst.Type() != IR::Type::U64) {
+                continue;
+            }
+            const bool ballot_halves =
+                inst.GetOpcode() == IR::Opcode::Ballot &&
+                std::ranges::all_of(inst.Uses(), [](const IR::Use& use) {
+                    const auto op = use.user->GetOpcode();
+                    return op == IR::Opcode::UnpackUint2x32 || op == IR::Opcode::BallotFindLsb;
+                });
+            info.uses_int64 |= !ballot_halves;
+        }
+    }
+    for (const auto& buffer : info.buffers) {
+        info.uses_int64 |= True(buffer.used_types & IR::Type::U64);
+    }
 }
 
 } // namespace Shader::Optimization

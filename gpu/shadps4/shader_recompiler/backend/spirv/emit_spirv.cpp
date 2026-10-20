@@ -369,7 +369,9 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
     ctx.AddCapability(spv::Capability::ImageQuery);
     ctx.AddCapability(spv::Capability::Int8);
     ctx.AddCapability(spv::Capability::Int16);
-    ctx.AddCapability(spv::Capability::Int64);
+    if (profile.support_int64 || info.uses_int64) { // sotc: Info::uses_int64
+        ctx.AddCapability(spv::Capability::Int64);
+    }
     ctx.AddCapability(spv::Capability::StorageBuffer8BitAccess);
     ctx.AddCapability(spv::Capability::StorageBuffer16BitAccess);
     if (info.uses_fp16) {

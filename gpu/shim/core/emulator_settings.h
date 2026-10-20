@@ -11,6 +11,9 @@ u32 BbDisplayRefreshHz(); // bbgpu.cpp: primary display refresh rate, 60 when un
 enum GpuReadbacksMode : int { Disabled, Relaxed, Precise };
 
 class EmulatorSettingsImpl {
+    bool dma_default = true;
+    bool no_int64 = false;
+
 public:
     static EmulatorSettingsImpl* GetInstance() { static EmulatorSettingsImpl s; return &s; }
     static bool Flag(const char* name, bool fallback) {
@@ -56,7 +59,18 @@ public:
     // sotc: on, as in Pink-shadPS4's CUSA08809 config. Shader reads from a table at a runtime
     // index (the SSR/water probe records, 224 bytes each) cannot be flattened; without DMA every
     // lane read record 0 and distant water lost its ripples and reflections.
-    bool IsDirectMemoryAccessEnabled() { static const auto value = Flag("BB_DIRECT_MEMORY_ACCESS", true); return value; }
+    // sotc: without BB_DIRECT_MEMORY_ACCESS, the default the renderer picked for the GPU
+    // (SetDirectMemoryAccessDefault: off on AMD, where it drew stripes over shadows and water,
+    // issues #57 and #28). Read only after the Vulkan device was chosen.
+    bool IsDirectMemoryAccessEnabled() {
+        static const int value = std::getenv("BB_DIRECT_MEMORY_ACCESS") ? int(Flag("BB_DIRECT_MEMORY_ACCESS", true)) : -1;
+        return value >= 0 ? value != 0 : dma_default;
+    }
+    void SetDirectMemoryAccessDefault(bool enabled) { dma_default = enabled; }
+    /// sotc: the device has no shaderInt64, so shaders are built without 64-bit integers where
+    /// they can be (Info::uses_int64): they get a shader cache folder of their own.
+    void SetNoInt64(bool value) { no_int64 = value; }
+    bool IsNoInt64() const { return no_int64; }
     bool IsDumpShaders() { static const auto value = Flag("BB_DUMP_SHADERS", false); return value; }
     bool IsFsrEnabled() { static const auto value = Flag("BB_FSR1", false); return value; }
     bool IsHdrAllowed() { static const auto value = Flag("BB_HDR", false); return value; }

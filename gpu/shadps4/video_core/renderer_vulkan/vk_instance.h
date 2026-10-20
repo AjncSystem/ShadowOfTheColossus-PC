@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <string>
 #include <span>
 #include <unordered_map>
@@ -255,6 +256,31 @@ public:
         return bool(vk13_props.requiredSubgroupSizeStages & stage);
     }
 
+    /// sotc: the subgroup size a pipeline stage is created with, or 0 to leave it to the driver.
+    /// Intel runs 8, 16 or 32 lanes: left free, its compiler builds each shader for several SIMD
+    /// widths, and first-time compiles took from seconds to minutes (the screen froze meanwhile),
+    /// while the recompiler lowered wave64 code for SubgroupSize() lanes anyway. Intel stages are
+    /// pinned to that size; SOTC_INTEL_PIN_SUBGROUP=0 turns it off. From AjncSystem#81 (jownatan).
+    u32 RequiredSubgroupSize(vk::ShaderStageFlagBits stage) const {
+        if (IsSubgroupSize64Supported()) {
+            return CanRequireSubgroupSize(stage) ? 64u : 0u;
+        }
+        if (stage == vk::ShaderStageFlagBits::eCompute && IsComputeSubgroupSize32Required()) {
+            return 32u;
+        }
+        static const bool pin_intel = [] {
+            const char* v = std::getenv("SOTC_INTEL_PIN_SUBGROUP");
+            return !v || std::atoi(v) != 0;
+        }();
+        const u32 size = SubgroupSize();
+        if (pin_intel && GetVendorID() == 0x8086 && vk13_features.subgroupSizeControl &&
+            CanRequireSubgroupSize(stage) && size >= vk13_props.minSubgroupSize &&
+            size <= vk13_props.maxSubgroupSize) {
+            return size;
+        }
+        return 0u;
+    }
+
     /// Returns true when VK_KHR_workgroup_memory_explicit_layout is supported.
     bool IsWorkgroupMemoryExplicitLayoutSupported() const {
         return workgroup_memory_explicit_layout &&
@@ -291,6 +317,25 @@ public:
     /// Returns the vendor ID of the physical device
     u32 GetVendorID() const {
         return properties.vendorID;
+    }
+
+    /// sotc: a one-dimensional dispatch of `groups` workgroups for a host shader that reads its
+    /// index as x + y * NumWorkGroups.x * WorkGroupSize.x. Above maxComputeWorkGroupCount[0]
+    /// (Intel: 65535; NVIDIA and AMD allow 2^31 and more) it is sent as x * y groups with
+    /// x * y == groups exactly (the counts are page or texel counts: powers of two times small
+    /// factors), as a larger dispatch is invalid and hung Intel GPUs: the texture detiler
+    /// dispatches one group per 64 texels, 81920 for a 2048x2560 32-bit texture (issue #59).
+    void Dispatch1D(vk::CommandBuffer cmdbuf, u32 groups) const {
+        const auto& max = properties.limits.maxComputeWorkGroupCount;
+        if (groups > max[0]) {
+            for (u32 y = (groups + max[0] - 1) / max[0]; y <= max[1] && y <= groups; ++y) {
+                if (groups % y == 0 && groups / y <= max[0]) {
+                    cmdbuf.dispatch(groups / y, y, 1);
+                    return;
+                }
+            }
+        }
+        cmdbuf.dispatch(groups, 1, 1);
     }
 
     /// Returns the device ID of the physical device

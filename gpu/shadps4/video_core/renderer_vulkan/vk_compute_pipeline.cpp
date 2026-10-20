@@ -106,12 +106,13 @@ ComputePipeline::~ComputePipeline() = default;
 
 void ComputePipeline::CreatePipeline() {
     // sotc: 64 where every stage can be pinned to it, otherwise 32 when the device could pick a
-    // wider size (AMD): the shaders were lowered for 32 lanes (vk_instance.h).
+    // wider size (AMD): the shaders were lowered for 32 lanes (vk_instance.h). On Intel the
+    // recompiler's lane count (Instance::RequiredSubgroupSize).
+    const u32 required_size = instance.RequiredSubgroupSize(vk::ShaderStageFlagBits::eCompute);
     const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
-        .requiredSubgroupSize = instance.IsSubgroupSize64Supported() ? 64u : 32u,
+        .requiredSubgroupSize = required_size,
     };
-    const bool require_size =
-        instance.IsSubgroupSize64Supported() || instance.IsComputeSubgroupSize32Required();
+    const bool require_size = required_size != 0;
     const vk::PipelineShaderStageCreateInfo shader_ci = {
         .pNext = require_size ? &subgroup_size_ci : nullptr,
         .stage = vk::ShaderStageFlagBits::eCompute,

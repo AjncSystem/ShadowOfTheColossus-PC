@@ -24,6 +24,7 @@ public:
     void ProcessFaultBuffer();
 
 private:
+    const Vulkan::Instance& instance; // sotc: Instance::Dispatch
     Vulkan::Scheduler& scheduler;
     BufferCache& buffer_cache;
     RangeSet fault_ranges;

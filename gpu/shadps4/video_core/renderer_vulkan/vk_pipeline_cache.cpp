@@ -384,6 +384,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                                          BaryEmulationEnabled(),
         .max_fragment_input_locations = instance_.MaxGeometryToFragmentLocations(),
     };
+    SotcStats::bary_emulated.store(profile.emulate_fragment_barycentrics);
     if (profile.emulate_fragment_barycentrics) {
         LOG_WARNING(Render_Vulkan,
                     "No fragment shader barycentrics: emulated with a geometry shader ({} "

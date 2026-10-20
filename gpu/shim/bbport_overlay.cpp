@@ -776,6 +776,14 @@ void FpsCounter() {
         }
         break;
     }
+    // sotc: the GPU, and the barycentric emulation of GPUs without the extension (issue #57).
+    if (SotcStats::gpu_name[0]) {
+        ImGui::TextColored(grey, "%s", SotcStats::gpu_name);
+        if (SotcStats::bary_emulated.load(std::memory_order_relaxed)) {
+            ImGui::TextColored(green, SotcUi::T("Baricêntricas emuladas (geometry shader)",
+                                                "Barycentrics emulated (geometry shader)"));
+        }
+    }
     if (const uint64_t vram = SotcStats::vram_used.load(std::memory_order_relaxed)) {
         ImGui::TextColored(grey, "VRAM %.1f / %.1f Go", vram / 1073741824.0,
                            SotcStats::vram_budget.load(std::memory_order_relaxed) / 1073741824.0);

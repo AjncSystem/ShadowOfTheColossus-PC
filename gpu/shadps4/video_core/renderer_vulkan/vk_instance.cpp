@@ -773,6 +773,9 @@ void Instance::CollectDeviceParameters() {
     const std::string api_version = GetReadableVersion(properties.apiVersion);
     const std::string extensions = fmt::format("{}", fmt::join(available_extensions, ", "));
 
+    // sotc: shown by the full performance overlay.
+    fmt::format_to_n(SotcStats::gpu_name, sizeof(SotcStats::gpu_name) - 1, "{} ({})", model_name,
+                     driver_name);
     LOG_INFO(Render_Vulkan, "GPU_Vendor: {}", vendor_name);
     LOG_INFO(Render_Vulkan, "GPU_Model: {}", model_name);
     LOG_INFO(Render_Vulkan, "GPU_Integrated: {}", IsIntegrated() ? "Yes" : "No");

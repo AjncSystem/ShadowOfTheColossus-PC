@@ -64,6 +64,10 @@ inline std::atomic<uint64_t> image_query_ns{0}, image_alloc_ns{0}, image_dedicat
 /// Video memory: usage the driver reports (texture cache GC), budget the GC works with, and the
 /// sparse buffer arena memory (never released) as allocations and bytes.
 inline std::atomic<uint64_t> vram_used{0}, vram_budget{0}, arena_allocs{0}, arena_bytes{0};
+/// sotc: the GPU and driver for the full performance overlay (written once by Vulkan::Instance
+/// before the first frame), and whether fragment shader barycentrics are emulated (issue #57).
+inline char gpu_name[160]{};
+inline std::atomic<bool> bary_emulated{false};
 /// Texture cache collector: ticks (one per submit with a frame's work), images freed and those
 /// written back to memory first, and the images in the cache with their (guest) size.
 inline std::atomic<uint64_t> gc_ticks{0}, gc_freed{0}, gc_downloads{0};

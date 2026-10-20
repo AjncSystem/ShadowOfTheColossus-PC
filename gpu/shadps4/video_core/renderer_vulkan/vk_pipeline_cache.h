@@ -158,9 +158,6 @@ private:
         std::array<vk::ShaderModule, MaxShaderStages> modules{};
         GraphicsPipeline::SerializationSupport sdata{};
         std::unique_ptr<GraphicsPipeline> pipeline;
-        /// sotc: a pipeline of the boot preload (SOTC_ASYNC_PRELOAD): built from the cached
-        /// state, and already in the cache (not registered again).
-        bool preloaded{};
 
         /// sotc: SOTC_ASYNC_TRANSLATE (default on): a graphics shader stage seen for the first
         /// time (or a new permutation of one) is translated by a worker, queued after the compute
@@ -186,9 +183,7 @@ private:
         std::unique_ptr<Translate> translate; ///< a translation job
     };
     bool AsyncPipelineEligible() const;
-    void QueueAsyncPipeline(u64 hash,
-                            const GraphicsPipeline::SerializationSupport* preloaded = nullptr);
-    bool AsyncPreloadEnabled() const;
+    void QueueAsyncPipeline(u64 hash);
     void QueueAsyncTranslate(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
                              const Shader::ShaderParams& params, const Shader::RuntimeInfo& rt,
                              const Shader::Backend::Bindings& start, Program* program,

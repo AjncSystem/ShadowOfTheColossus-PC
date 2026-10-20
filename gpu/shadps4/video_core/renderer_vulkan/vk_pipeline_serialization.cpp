@@ -13,7 +13,6 @@
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
-#include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 
 namespace Serialization {
@@ -236,20 +235,9 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
 
     {
         WarmUpTimer timer{warmup_times.pipelines};
-        // sotc: built by a pipeline worker (SOTC_ASYNC_PRELOAD); a bind waits for it.
-        const bool deferred = AsyncPreloadEnabled() && scheduler.HasRecordThread();
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
                                                        *pipeline_cache, compute_key, *infos[0],
-                                                       modules[0], sdata, true, deferred);
-        if (deferred) {
-            auto job = std::make_unique<AsyncPipelineJob>();
-            job->compute = it.value().get();
-            {
-                std::scoped_lock lock{async_mutex};
-                async_queue.insert(async_queue.begin() + async_compute_queued++, std::move(job));
-            }
-            async_cv.notify_one();
-        }
+                                                       modules[0], sdata, true);
     }
 
     infos.fill(nullptr);
@@ -332,11 +320,7 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     ASSERT(is_new);
 
-    if (AsyncPreloadEnabled()) {
-        // sotc: built by a pipeline worker; the map entry stays null (draws skipped) until the
-        // command processor collects it (SOTC_ASYNC_PRELOAD).
-        QueueAsyncPipeline(std::hash<GraphicsPipelineKey>{}(graphics_key), &sdata);
-    } else {
+    {
         WarmUpTimer timer{warmup_times.pipelines};
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,

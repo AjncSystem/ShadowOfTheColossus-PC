@@ -79,7 +79,7 @@ Detalhes de cada versão no [CHANGELOG](CHANGELOG.md).
 
 ### Download e uso
 
-1. Baixe o `SotC-PC.zip` da página [Releases](../../releases) e descompacte numa pasta.
+1. Baixe o `SotC-PC-0.58.1-plus.zip` da [última versão](../../releases/latest) e descompacte numa pasta.
 2. Abra o **`SotC.exe`**. Na primeira vez o lançador procura sozinho, nos discos do PC:
    - a pasta do jogo (o dump CUSA08809, com `eboot.bin`, `sce_module` e `sce_sys`);
    - os módulos de som (`libSceNgs2.sprx` e `libSceUlt.sprx`) de um shadPS4 que você já
@@ -181,7 +181,7 @@ Full details in the [CHANGELOG](CHANGELOG.md) (in Portuguese).
 
 ### Download and use
 
-1. Download `SotC-PC.zip` from [Releases](../../releases) and unzip it into a folder.
+1. Download `SotC-PC-0.58.1-plus.zip` from the [latest release](../../releases/latest) and unzip it into a folder.
 2. Run **`SotC.exe`**. On first start the launcher searches the PC's drives for:
    - the game folder (the CUSA08809 dump with `eboot.bin`, `sce_module` and `sce_sys`);
    - the sound modules (`libSceNgs2.sprx` and `libSceUlt.sprx`) of an installed shadPS4

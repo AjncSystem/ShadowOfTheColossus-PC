@@ -354,7 +354,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                                     instance.GetDriverID() == vk::DriverId::eNvidiaProprietary &&
                                     !env_is("SOTC_BARYCENTRIC_GS", "0");
     if (barycentric_via_gs) {
-        LOG_INFO(Render_Vulkan, "No fragment shader barycentrics: emulated by a geometry shader");
+        LOG_WARNING(Render_Vulkan, "No fragment shader barycentrics: emulated by a geometry shader");
     }
     GraphicsPipeline::SerializationSupport::with_gs = barycentric_via_gs;
     profile = Shader::Profile{

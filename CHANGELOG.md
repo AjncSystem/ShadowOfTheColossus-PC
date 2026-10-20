@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.60.3 — 2026-10-20
+**O jogo é zerável do início ao fim.** Jogado do save antes do último colosso até a luta com o
+Malus, as cenas finais e os créditos, com "Texturas em alta qualidade", modo PS4 Pro e 60 FPS
+ligados. Obrigado a **Lucas-blip-png**.
+
+- **Queda com "Texturas em alta qualidade" em vistas amplas** (espada erguida contra o sol, área
+  do último colosso; `0x1a371`, #186): quando a memória de texturas do jogo começa a acabar, as
+  texturas vistas pedem um nível de detalhe a menos (dois quando está quase cheia) e o jogo libera
+  espaço antes de travar. Continua mais nítido que com a opção desligada (PR #191, Lucas-blip-png).
+- **Queda no carregamento depois dos créditos** (`0x49500`): a proteção da memória do jogo não
+  enxergava os reservatórios que o mundo cria, porque eles crescem em pedaços de 1 MB espalhados;
+  agora cada um é protegido onde estão os seus blocos livres (#146).
+- **+2,7% de FPS no templo:** leituras da GPU em janelas de 64 KB (PR #196, Lucas-blip-png).
+
 ## 0.60.2 — 2026-10-20
 - **Ajuste rápido dentro do jogo:** no menu (Insert, F1 ou L3+R3), sem sair do jogo: 60 FPS,
   geração de quadros (desligada / DLSS-G / FSR 3), texturas em alta qualidade, reaproveitar

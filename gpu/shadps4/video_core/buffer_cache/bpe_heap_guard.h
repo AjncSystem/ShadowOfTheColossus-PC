@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <utility>
 #include <vector>
 
@@ -35,6 +36,20 @@ public:
     /// Writes `size` bytes of `data` to guest `addr`, skipping allocator metadata. Returns the number of
     /// skipped bytes whose GPU value differed from the CPU value (0 when harmless)
     u64 Write(VAddr addr, const u8* data, u64 size);
+
+    /// sotc: from the lowest to the highest free block's metadata found by the walk ({0, 0}: none).
+    /// The heaps a world creates grow in 1 MiB pieces spread over direct memory, so this, not
+    /// [heap+0x28] (a pointer all heaps share), tells where their metadata is.
+    std::pair<VAddr, VAddr> FreeExtent() const {
+        if (free_spans.empty()) {
+            return {0, 0};
+        }
+        VAddr hi = 0;
+        for (const auto& span : free_spans) {
+            hi = std::max(hi, span.second);
+        }
+        return {free_spans.front().first, hi};
+    }
 
     /// True when [addr, end) overlaps allocator metadata
     bool HasMetadata(VAddr addr, VAddr end) {

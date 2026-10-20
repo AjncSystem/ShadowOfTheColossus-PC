@@ -126,7 +126,8 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
                 'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'library_dirs': [], 'keys': {},
-                'auto_setup': True, 'dlc_dir': '', 'framegen': 'off'}
+                'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'loading_screen': True,
+                'fps_counter': False}
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
 KEY_INPUTS = [
     ('move_up', 'W', ('Andar para frente', 'Move forward')), ('move_down', 'S', ('Andar para trás', 'Move back')),
@@ -429,6 +430,11 @@ def game_environment(s):
     else:
         env['BB_RCAS'] = '1'
         env['BB_RCAS_ATTENUATION'] = str(s.get('sharpness') or '250')
+    # The port's loading screen over the game when it stops presenting frames for a second; off,
+    # only at startup (first frame, shader cache preload). The FPS counter is the compact overlay.
+    env['SOTC_LOADING_SCREEN'] = '1' if s.get('loading_screen', True) else '0'
+    if s.get('fps_counter'):
+        env['SOTC_OVERLAY'] = 'fps'
     env['SOTC_MOUSE'] = '1' if s.get('mouse', True) else '0'
     env['SOTC_MOUSE_SENS'] = str(s.get('mouse_sens') or '1.0')
     env['SOTC_MOUSE_INVERT'] = '1' if s.get('mouse_invert') else '0'
@@ -965,6 +971,37 @@ class Launcher:
                      'Lets shaders read tables straight from game memory (as Pink-shadPS4 does): the lake ripples '
                      'and reflects far away. Off gains ~10% FPS, but distant water is flatter. After a change '
                      'the shaders are compiled again the first time.'))
+        self.check(f, 'fps_counter', _('Contador de FPS no jogo', 'In-game FPS counter'),
+                   _('Mostra os FPS no canto da imagem (por exemplo "55 FPS"). F10 mostra e esconde.',
+                     'Shows the frame rate in the corner of the picture (for example "55 FPS"). F10 shows '
+                     'and hides it.'))
+        self.section(f, _('Shaders', 'Shaders'))
+        ttk = self.ttk
+        holder = ttk.Frame(f)
+        ttk.Button(holder, text=_('Pré-compilar shaders', 'Precompile shaders'), command=self.precompile).pack(side='left')
+        self.row(f, _('Pré-compilar', 'Precompile'), holder,
+                 _('Cada shader que o jogo usa pela primeira vez é compilado na hora, e o jogo para um '
+                   'instante (engasgos). O port guarda os compilados e os carrega quando o jogo abre, então '
+                   'cada um só engasga uma vez. Pré-compilar roda o demo da tela de título sozinho (10 a 15 '
+                   'min, numa janela atrás das outras): a abertura, a floresta e o cânion ficam prontos antes '
+                   'de jogar. O resto compila na primeira visita. Depois de atualizar o port, rode de novo.',
+                   'Each shader the game uses for the first time is compiled on the spot, and the game stops '
+                   'for a moment (stutter). The port keeps the compiled ones and loads them when the game '
+                   'starts, so each one stutters only once. Precompiling plays the title screen\'s demo by '
+                   'itself (10 to 15 min, in a window behind the others): the intro, the forest and the '
+                   'canyon are ready before you play. The rest compiles on the first visit. Run it again '
+                   'after updating the port.'))
+        self.check(f, 'loading_screen', _('Tela de carregamento durante o jogo', 'Loading screen during play'),
+                   _('Quando o jogo para de mostrar imagens por mais de um segundo (um shader compilando, um '
+                     'carregamento longo), o port cobre a imagem com "Carregando…" para mostrar que o jogo não '
+                     'travou. Desligado, a última imagem fica parada na tela até o jogo voltar, mais imersivo. '
+                     'A tela de carregamento da abertura do jogo (carregando shaders) aparece sempre. A tela não '
+                     'deixa o jogo mais suave: quem faz isso é pré-compilar.',
+                     'When the game stops showing frames for more than a second (a shader compiling, a long '
+                     'load), the port covers the picture with "Loading…" to show the game did not hang. Off, '
+                     'the last frame stays on screen until the game goes on, which is more immersive. The '
+                     'loading screen at startup (loading shaders) always shows. The screen does not make the '
+                     'game smoother: precompiling does.'))
         self.row(f, _('Envio de trabalho à GPU', 'GPU work submission'), self.choice(f, 'gpu_submit', GPU_SUBMIT),
                  _('Manda trabalho à GPU a cada 0,5 ms e lê resultados por um atalho (técnicas do Pink-shadPS4). '
                    'Medido em NVIDIA (+10–15%); em AMD/Intel use "Ligado" para testar e volte para "Automático" '

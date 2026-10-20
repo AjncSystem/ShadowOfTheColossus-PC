@@ -183,7 +183,8 @@ bool ToastShown() {
 }
 
 // sotc: the performance overlay (show_fps=1 in sotc.ini, or SOTC_FPS / SOTC_OVERLAY=1; F10
-// toggles it). History of present intervals (one per game flip), present thread only.
+// toggles it; SOTC_OVERLAY=fps: only the frame rate, e.g. "55 FPS", the launcher's "In-game FPS
+// counter"). History of present intervals (one per game flip), present thread only.
 constexpr int kHistory = 240;
 float frame_hist[kHistory]{};
 int hist_pos = 0, hist_count = 0;
@@ -194,6 +195,10 @@ std::atomic<bool> overlay_on{[] {
     }
     return std::getenv("SOTC_FPS") != nullptr;
 }()};
+const bool overlay_compact = [] {
+    const char* v = std::getenv("SOTC_OVERLAY");
+    return v && (v[0] == 'f' || v[0] == 'F');
+}();
 
 // Frame time the game aims for: 33.3 ms (30 FPS) or 16.7 ms (60 FPS), from the median.
 float TargetMs() {
@@ -669,11 +674,17 @@ void FpsCounter() {
     ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x - pad,
                                    viewport->WorkPos.y + pad),
                             ImGuiCond_Always, ImVec2(1.0f, 0.0f));
-    ImGui::SetNextWindowBgAlpha(0.5f);
+    ImGui::SetNextWindowBgAlpha(overlay_compact ? 0.35f : 0.5f);
     ImGui::Begin("##fps", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                      ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
                      ImGuiWindowFlags_NoFocusOnAppearing);
+    if (overlay_compact) {
+        const float ms = frame_ms_avg;
+        ImGui::Text("%.0f FPS", ms > 0.0f ? 1000.0f / ms : 0.0f);
+        ImGui::End();
+        return;
+    }
     // Latest frames in order, oldest first.
     float frames[kHistory];
     for (int i = 0; i < hist_count; ++i) {
@@ -1106,13 +1117,24 @@ bool LoadingShown() {
     // races only move the moment by a frame.
     static std::atomic<u64> seen{~u64{0}};
     static std::atomic<long long> since{0};
+    // sotc: SOTC_LOADING_SCREEN=0 (launcher: "Loading screen during play" off): only before the
+    // game's first frame and while the shader cache preloads; a pause while playing (a shader
+    // compiling, a long load) keeps the last frame on screen instead.
+    static const bool during_play = [] {
+        const char* v = std::getenv("SOTC_LOADING_SCREEN");
+        return !v || v[0] != '0';
+    }();
     const u64 flips = SotcStats::flip_count.load(std::memory_order_relaxed);
     const long long now = NowMs();
     if (seen.exchange(flips, std::memory_order_relaxed) != flips) {
         since.store(now, std::memory_order_relaxed);
         return false;
     }
-    return now - since.load(std::memory_order_relaxed) >= 1000;
+    if (now - since.load(std::memory_order_relaxed) < 1000) {
+        return false;
+    }
+    return during_play || flips == 0 ||
+           SotcStats::warmup_total.load(std::memory_order_relaxed) != 0;
 }
 
 bool Visible() {

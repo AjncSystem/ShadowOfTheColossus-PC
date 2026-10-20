@@ -34,10 +34,20 @@ inline int EffectiveRate() {
     return rate >= 0 ? rate : 1;
 }
 
-/// F7: capped <-> uncapped. Returns true when now uncapped.
+/// fps60game mode (scripts/sotc_modes.py): where the engine keeps the pointer to its
+/// TargetFramesPerSeconds value (1 = 60 FPS, 2 = 30), set by the loader.
+inline std::atomic<void*> target_slot{};
+
+/// F7: capped <-> uncapped. Returns true when now uncapped. With fps60game the game targets 60 FPS
+/// itself, so F7 sets its target: the rate it asks and its timing (60 Hz or 30 Hz steps) follow.
 inline bool Toggle() {
     const bool now = !uncapped.load(std::memory_order_relaxed);
     uncapped.store(now, std::memory_order_relaxed);
+    if (void* slot = target_slot.load(std::memory_order_relaxed)) {
+        if (int* value = *static_cast<int**>(slot)) {
+            *value = now ? 1 : 2;
+        }
+    }
     std::fprintf(stderr, "SOTC FPS CAP: %s\n", now ? "uncapped" : "capped");
     return now;
 }

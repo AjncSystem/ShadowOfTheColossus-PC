@@ -1286,6 +1286,12 @@ int main(int argc, char **argv) {
         _exit(0);
     }
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
+    {   /* sotc: fps60game applied (EU 1.01, scripts/sotc_modes.py): F7 sets the engine's own frame
+         * rate target, the TargetFramesPerSeconds cvar (object 0x2eed7a0, value pointer at +0x60). */
+        static const unsigned char fps60game[]={0xc7,0x45,0x84,0x01,0x00,0x00,0x00};
+        if (size>0x2eed800 && !memcmp(image+0x49a47f,fps60game,sizeof fps60game))
+            bbgpu_set_fps_target_slot(image+0x2eed7a0+0x60);
+    }
 #ifdef _WIN32
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
 #endif

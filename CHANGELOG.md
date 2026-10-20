@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.60.2 — 2026-10-20
+- **Ajuste rápido dentro do jogo:** no menu (Insert, F1 ou L3+R3), sem sair do jogo: 60 FPS,
+  geração de quadros (desligada / DLSS-G / FSR 3), texturas em alta qualidade, reaproveitar
+  sombras distantes e volume. Valem na hora e ficam salvos no lançador para a próxima vez. AF 16x,
+  modo PS4 Pro, resolução e uso de memória de vídeo continuam no lançador (precisam reiniciar).
+- **Mouse no menu:** com o menu aberto o mouse fica solto e visível para clicar; ao fechar, volta
+  a controlar a câmera.
+- **Tela de carregamento animada também na montagem dos shaders** ao abrir o jogo (antes a janela
+  ficava parada, às vezes por minutos depois de atualizar o driver), com fundo preto opaco e
+  animação no centro (círculo girando, título pulsando, "Carregando…").
+- Menu com título e Ajuste rápido no idioma do lançador.
 ## 0.60.1-plus — 2026-10-20 (fork Lucas-blip-png)
 - A 0.59-plus5 em cima da **0.60.1** do original. Da 0.60.1: o **menu dentro do jogo** (Insert, F1
   ou L3+R3; nosekefik) e as sobras do Bloodborne removidas (Oussama268). Da 0.60: o relógio do jogo

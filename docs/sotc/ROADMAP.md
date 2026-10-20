@@ -46,6 +46,10 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 | 0.33 | README só em inglês (objetivo da #93) | ✅ | `7e7cc1b`. Problemas conhecidos atualizados (#186, GCN, 60 FPS, geração de quadros). Créditos da comunidade. |
 | 0.34 | #60 (Oussama268): remover sobras do Bloodborne | ✅ | `d6cb6da`, refeito sobre o código atual (a PR era da 0.57): −11.700 linhas. Mantidos o FSR-Vulkan (geração de quadros FSR 3) e o menu da #94. Ícone do SotC no bb-probe.exe. Demo 71,7 / 61,3, sem falhas; testes passam (exceto test_packaged_vulkan, só Linux, que já falhava). |
 | 0.35 | **Publicar v0.60.1** | ✅ | Menu no jogo, limpeza do Bloodborne, README em inglês. |
+| 0.36 | Menu no jogo: mouse solto enquanto aberto | ✅ | `8856f67`. Ficava no modo relativo da câmera (escondido, preso no centro). |
+| 0.37 | Ajuste rápido dentro do jogo (pedido do usuário) | ✅ | `f1aa65d`. 60 FPS (F7), geração de quadros (Set), texturas HQ e reaproveitamento de sombras ao vivo (`sotc_live.h`), volume (`runtime_audio_set_volume_percent`). Grava no `launcher_settings.json` (`SOTC_LAUNCHER_SETTINGS`); o lançador relê ao fim do jogo. Foto do menu em português conferida; cliques testados pelo usuário. |
+| 0.38 | Tela de carregamento animada durante a montagem dos shaders | ✅ | `c405137`. WarmUp saiu do construtor do PipelineCache para o fim do Presenter, com uma thread apresentando quadros em branco com a tela de carregamento. Tela opaca, animação no centro. |
+| 0.39 | **Publicar v0.60.2** | ✅ | |
 
 ## Fase 1 — Estabilidade (quedas e travamentos)
 

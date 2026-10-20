@@ -8,7 +8,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
+#include <regex>
+#include <string>
 
 #include <SDL3/SDL.h>
 #include "bbport_settings.h"
@@ -22,11 +26,16 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_fps_cap.h"
+#include "video_core/sotc_live.h"
 #include "video_core/sotc_ui_lang.h"
 #include "video_core/sotc_stats.h"
 
 extern Frontend::WindowSDL* g_window;
 static const Vulkan::Instance* s_instance = nullptr;
+// sotc: the volume of the runtime's audio output (src/runtime_audio.c); weak, so builds without the
+// runtime (tests) still link.
+extern "C" __attribute__((weak)) void runtime_audio_set_volume_percent(int pct);
+extern "C" __attribute__((weak)) int runtime_audio_volume_percent(void);
 
 // DejaVu Sans (Cyrillic), embedded (third_party/fonts, Bitstream Vera license).
 #ifdef _WIN32
@@ -261,6 +270,134 @@ void Hint(const char* text) {
     }
 }
 
+// sotc: the launcher's settings file (SOTC_LAUNCHER_SETTINGS, user/launcher_settings.json), so a
+// quick setting changed in the menu is also the launcher's choice next time. Only keys already in
+// the file are replaced.
+void SaveLauncherSetting(const char* key, const std::string& json_value) {
+#ifdef _WIN32
+    const wchar_t* wpath = _wgetenv(L"SOTC_LAUNCHER_SETTINGS");
+    if (!wpath || !wpath[0]) {
+        return;
+    }
+    const std::filesystem::path path{wpath};
+#else
+    const char* cpath = std::getenv("SOTC_LAUNCHER_SETTINGS");
+    if (!cpath || !cpath[0]) {
+        return;
+    }
+    const std::filesystem::path path{cpath};
+#endif
+    std::string text;
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            return;
+        }
+        text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    const std::regex re("(\"" + std::string(key) +
+                        "\"\\s*:\\s*)(\"[^\"]*\"|true|false|-?[0-9.]+)");
+    std::smatch m;
+    if (!std::regex_search(text, m, re)) {
+        return;
+    }
+    text = m.prefix().str() + m[1].str() + json_value + m.suffix().str();
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out << text;
+}
+
+// sotc: "Quick settings": the launcher's quick settings that can change while playing.
+void QuickSettings() {
+    using SotcUi::T;
+    ImGui::SeparatorText(T("Ajuste rápido (vale na hora)", "Quick settings (apply at once)"));
+
+    bool uncapped = SotcFpsCap::uncapped.load(std::memory_order_relaxed);
+    if (ImGui::Checkbox(T("60 FPS (sem o limite de 30)  [F7]", "60 FPS (no 30 FPS cap)  [F7]"),
+                        &uncapped)) {
+        SotcFpsCap::Toggle();
+        SaveLauncherSetting("fps_mode", uncapped ? "\"60\"" : "\"30\"");
+    }
+
+    using Vulkan::FrameGen::Mode;
+    const Mode fg = Vulkan::FrameGen::Current();
+    const char* fg_names[] = {T("Desligada", "Off"), "NVIDIA DLSS-G", "AMD FSR 3"};
+    const char* fg_keys[] = {"\"off\"", "\"dlss\"", "\"fsr\""};
+    if (ImGui::BeginCombo(T("Geração de quadros  [F8]", "Frame generation  [F8]"),
+                          fg_names[static_cast<int>(fg)])) {
+        for (int i = 0; i < 3; ++i) {
+            const Mode mode = static_cast<Mode>(i);
+            const bool available = Vulkan::FrameGen::Available(mode);
+            if (!available) {
+                ImGui::BeginDisabled();
+            }
+            if (ImGui::Selectable(fg_names[i], mode == fg) && available &&
+                Vulkan::FrameGen::Set(mode)) {
+                SaveLauncherSetting("framegen", fg_keys[i]);
+            }
+            if (!available) {
+                ImGui::EndDisabled();
+            }
+        }
+        ImGui::EndCombo();
+    }
+
+    static const int env_linger = [] {
+        const char* v = std::getenv("SOTC_LOD_LINGER");
+        return v ? std::atoi(v) : 0;
+    }();
+    const int live_linger = SotcLive::lod_linger.load(std::memory_order_relaxed);
+    bool hq = (live_linger >= 0 ? live_linger : env_linger) > 0;
+    if (ImGui::Checkbox(T("Texturas em alta qualidade", "High quality textures"), &hq)) {
+        SotcLive::lod_linger.store(hq ? 1 : 0, std::memory_order_relaxed);
+        SaveLauncherSetting("hq_textures", hq ? "true" : "false");
+    }
+    Hint(T("Folhas e pedras nítidas. Se o jogo fechar em vistas muito amplas, desligue.",
+           "Sharp leaves and rocks. If the game closes in very wide views, turn it off."));
+
+    static const int env_reuse = [] {
+        const char* v = std::getenv("SOTC_SHADOW_REUSE");
+        if (!v) {
+            return 0;
+        }
+        if (v[0] == 'a') {
+            return s_instance && s_instance->GetVendorID() == 0x10DE ? 1 : 0;
+        }
+        return v[0] == '0' ? 0 : 1;
+    }();
+    const int live_reuse = SotcLive::shadow_reuse.load(std::memory_order_relaxed);
+    bool reuse = (live_reuse >= 0 ? live_reuse : env_reuse) > 0;
+    if (ImGui::Checkbox(T("Reaproveitar sombras distantes (podem piscar)",
+                          "Reuse far shadows (they may blink)"),
+                        &reuse)) {
+        SotcLive::shadow_reuse.store(reuse ? 1 : 0, std::memory_order_relaxed);
+        SaveLauncherSetting("shadow_reuse", reuse ? "\"1\"" : "\"0\"");
+    }
+
+    if (runtime_audio_volume_percent && runtime_audio_set_volume_percent) {
+        static const int volumes[] = {100, 150, 200, 300};
+        const int now = runtime_audio_volume_percent();
+        char label[16];
+        std::snprintf(label, sizeof(label), "%d%%", now);
+        if (ImGui::BeginCombo(T("Volume", "Volume"), label)) {
+            for (const int v : volumes) {
+                char item[16];
+                std::snprintf(item, sizeof(item), "%d%%", v);
+                if (ImGui::Selectable(item, v == now)) {
+                    runtime_audio_set_volume_percent(v);
+                    SaveLauncherSetting("volume", "\"" + std::to_string(v) + "\"");
+                }
+            }
+            ImGui::EndCombo();
+        }
+    }
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextWrapped("%s", T("AF 16x, modo PS4 Pro, resolução e uso de memória de vídeo: no "
+                                "lançador (valem ao abrir o jogo de novo).",
+                                "16x AF, PS4 Pro mode, resolution and video memory use: in the "
+                                "launcher (they apply when the game starts again)."));
+    ImGui::PopStyleColor();
+}
+
 void Menu() {
     auto& s = BbSettings::Get();
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
@@ -269,7 +406,9 @@ void Menu() {
                             ImGuiCond_Appearing);
     ImGui::SetNextWindowSize(ImVec2(660.0f * base_scale, 0.0f), ImGuiCond_Appearing);
     bool keep_open = true;
-    if (!ImGui::Begin("Shadow of the Colossus — Settings  (Insert / F1 / L3+R3)", &keep_open,
+    const std::string title = std::string("Shadow of the Colossus — ") +
+                              SotcUi::T("Configurações", "Settings") + "  (Insert / F1 / L3+R3)###menu";
+    if (!ImGui::Begin(title.c_str(), &keep_open,
                       ImGuiWindowFlags_NoCollapse)) {
         ImGui::End();
         return;
@@ -287,6 +426,8 @@ void Menu() {
                             static_cast<unsigned long>(used_mb),
                             static_cast<unsigned long>(budget_mb));
     }
+
+    QuickSettings();
 
     // --- 1. Display & Window ---
     ImGui::SeparatorText("Display & Window");
@@ -542,7 +683,8 @@ void LoadingScreen() {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
     ImGui::SetNextWindowSize(viewport->WorkSize);
-    ImGui::SetNextWindowBgAlpha(0.88f);
+    // sotc: opaque, so the game's last frame does not show through looking frozen.
+    ImGui::SetNextWindowBgAlpha(1.0f);
     ImGui::Begin("##loading", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
                      ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing |
@@ -551,32 +693,39 @@ void LoadingScreen() {
     const ImVec2 size = viewport->WorkSize;
     const ImVec2 origin = viewport->WorkPos;
     const float unit = size.y / 1080.0f;
-    const ImU32 gold = IM_COL32(214, 184, 120, 255), dim = IM_COL32(150, 150, 150, 255);
+    const ImU32 dim = IM_COL32(150, 150, 150, 255);
+    const float t = float(NowMs() % 1000000) / 1000.0f;
+    // The title breathes slowly (gold, 65-100%).
     const char* title = "SHADOW OF THE COLOSSUS";
     const float title_px = 46.0f * unit;
     const ImVec2 title_size = ImGui::GetFont()->CalcTextSizeA(title_px, FLT_MAX, 0.0f, title);
+    const int glow = int(255.0f * (0.825f + 0.175f * std::sin(t * 2.0f)));
+    const ImU32 gold = IM_COL32(214, 184, 120, glow);
+    const float title_y = origin.y + size.y * 0.40f;
     draw->AddText(ImGui::GetFont(), title_px,
-                  ImVec2(origin.x + (size.x - title_size.x) * 0.5f, origin.y + size.y * 0.42f),
-                  gold, title);
-    // Turning arc in the lower right corner, like a console's loading mark.
-    const float t = float(NowMs() % 100000) / 1000.0f;
-    const ImVec2 centre(origin.x + size.x - 90.0f * unit, origin.y + size.y - 90.0f * unit);
-    const float radius = 26.0f * unit;
-    draw->PathArcTo(centre, radius, t * 4.0f, t * 4.0f + 4.4f, 40);
-    draw->PathStroke(gold, 0, 4.0f * unit);
-    const char* text = SotcUi::T("Carregando…", "Loading…");
+                  ImVec2(origin.x + (size.x - title_size.x) * 0.5f, title_y), gold, title);
+    // A turning arc under the title, with a faint full ring behind it.
+    const ImVec2 centre(origin.x + size.x * 0.5f, title_y + title_px + 70.0f * unit);
+    const float radius = 22.0f * unit;
+    draw->AddCircle(centre, radius, IM_COL32(214, 184, 120, 50), 48, 3.0f * unit);
+    draw->PathArcTo(centre, radius, t * 5.0f, t * 5.0f + 1.6f, 32);
+    draw->PathStroke(IM_COL32(214, 184, 120, 255), 0, 3.5f * unit);
+    // "Loading" with moving dots.
+    char text[64];
+    const int dots = int(t * 2.5f) % 4;
+    std::snprintf(text, sizeof(text), "%s%.*s", SotcUi::T("Carregando", "Loading"), dots, "...");
     const float text_px = 24.0f * unit;
-    const ImVec2 text_size = ImGui::GetFont()->CalcTextSizeA(text_px, FLT_MAX, 0.0f, text);
+    const ImVec2 full = ImGui::GetFont()->CalcTextSizeA(
+        text_px, FLT_MAX, 0.0f, SotcUi::T("Carregando...", "Loading..."));
     draw->AddText(ImGui::GetFont(), text_px,
-                  ImVec2(centre.x - radius - 18.0f * unit - text_size.x, centre.y - text_size.y * 0.5f),
-                  dim, text);
+                  ImVec2(centre.x - full.x * 0.5f, centre.y + radius + 22.0f * unit), dim, text);
     // While the shader cache is read at boot: a bar with the percentage.
     const u32 total = SotcStats::warmup_total.load(std::memory_order_relaxed);
     if (total > 0) {
         const u32 done = std::min(SotcStats::warmup_done.load(std::memory_order_relaxed), total);
         const float frac = float(done) / float(total);
         const float bar_w = size.x * 0.4f, bar_h = 10.0f * unit;
-        const ImVec2 bar0(origin.x + (size.x - bar_w) * 0.5f, origin.y + size.y * 0.42f + title_px + 40.0f * unit);
+        const ImVec2 bar0(origin.x + (size.x - bar_w) * 0.5f, centre.y + radius + 70.0f * unit);
         draw->AddRectFilled(bar0, ImVec2(bar0.x + bar_w, bar0.y + bar_h), IM_COL32(60, 60, 64, 255), bar_h * 0.5f);
         draw->AddRectFilled(bar0, ImVec2(bar0.x + bar_w * frac, bar0.y + bar_h), gold, bar_h * 0.5f);
         char line[128];

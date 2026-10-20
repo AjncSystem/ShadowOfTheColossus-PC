@@ -31,6 +31,9 @@ bool Available(Mode mode);
 /// F8 (window thread): the next available mode, which it returns.
 Mode Cycle();
 
+/// sotc: switches to this mode when available (the in-game menu); false otherwise.
+bool Set(Mode mode);
+
 /// For the overlay: "off" (in the launcher's language), "DLSS-G", "FSR 3".
 const char* Name(Mode mode);
 

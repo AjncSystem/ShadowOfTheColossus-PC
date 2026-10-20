@@ -255,6 +255,27 @@ bool WindowSDL::PollEvents() {
             UpdateTextTitle();
         }
     }
+    // sotc: while the in-game menu (or the save list, the text box) is open the mouse is free and
+    // visible, so the menu can be clicked; it was left in the camera's relative mode, hidden and
+    // held at the window centre. Closing the menu captures it again for the camera.
+    {
+        static bool released_for_menu = false;
+        const bool menu = BbOverlay::CapturesInput();
+        if (menu && g_mouse_captured) {
+            SDL_SetWindowRelativeMouseMode(window, false);
+            g_mouse_captured = false;
+            g_mouse_buttons = 0;
+            g_mouse_dx = 0;
+            g_mouse_dy = 0;
+            released_for_menu = true;
+        } else if (!menu && released_for_menu) {
+            released_for_menu = false;
+            if (MouseEnabled() && (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS)) {
+                SDL_SetWindowRelativeMouseMode(window, true);
+                g_mouse_captured = true;
+            }
+        }
+    }
     if (!text_active) {
         BbOverlay::UpdateTextInput(window);
         UpdateTitleStats();

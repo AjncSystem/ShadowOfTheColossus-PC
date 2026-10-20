@@ -25,6 +25,7 @@
 #include <cstring>
 #include <iterator>
 #include "common/types.h"
+#include "video_core/sotc_live.h"
 
 extern "C" const unsigned char* runtime_memory_backing_pointer(uintptr_t address);
 
@@ -93,6 +94,9 @@ inline void Collect(u64 (&entries)[256]) {
         const char* v = std::getenv("SOTC_LOD_LEVEL");
         return v ? std::strtoull(v, nullptr, 0) & 0xf : 2;
     }();
+    // The in-game menu can switch high quality textures while playing (sotc_live.h).
+    const int live = SotcLive::lod_linger.load(std::memory_order_relaxed);
+    const u32 linger_now = live >= 0 ? static_cast<u32>(live) : linger;
     // sotc: every sampled bank asks for `level`, the distant ones too, where the hardware would
     // report a coarse mip. In PS4 Pro mode at the Shrine the game then streams more fine mips
     // than its page pool holds: about 10% free after loading, 0% some 40 s later and the fault
@@ -105,7 +109,7 @@ inline void Collect(u64 (&entries)[256]) {
     }();
     static u64 coarser = 0;
     static u32 reports = 0;
-    if (linger && pool_low > 0 && reports++ % 30 == 0) {
+    if (linger_now && pool_low > 0 && reports++ % 30 == 0) {
         const int free = PoolFreePercent();
         const u64 want = free < 0 ? coarser : free < pool_low / 2 ? 2 : free < pool_low ? 1 : 0;
         if (want != coarser) {
@@ -128,14 +132,14 @@ inline void Collect(u64 (&entries)[256]) {
             uses[i].store(0, std::memory_order_relaxed);
             idle[i] = 0;
             last_count[i] = std::min<u32>(n * 256u, 0xffffff);
-        } else if (idle[i] < linger) {
+        } else if (idle[i] < linger_now) {
             ++idle[i];
         }
         // Banks not seen lately read as not sampled (15), as on the hardware: the game may then
         // drop their fine mips. SOTC_LOD_KEEP=1 reports them as sampled with no samples instead
         // (what the zeroed buffer said before; not soak-tested with the streaming).
         static const bool keep = std::getenv("SOTC_LOD_KEEP") != nullptr;
-        entries[i] = idle[i] < linger ? (mip << 56) | (u64{std::max<u32>(last_count[i], 1)} << 32)
+        entries[i] = idle[i] < linger_now ? (mip << 56) | (u64{std::max<u32>(last_count[i], 1)} << 32)
                      : keep           ? level << 56
                                       : u64{0xf} << 56;
     }

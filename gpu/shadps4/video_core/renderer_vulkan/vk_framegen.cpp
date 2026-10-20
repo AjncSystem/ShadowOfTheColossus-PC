@@ -125,6 +125,15 @@ bool Available(Mode mode) {
     return false;
 }
 
+bool Set(Mode mode) {
+    if (!Available(mode)) {
+        return false;
+    }
+    current = static_cast<int>(mode);
+    std::fprintf(stderr, "SOTC FRAMEGEN: switched to %s\n", Name(mode));
+    return true;
+}
+
 Mode Cycle() {
     Mode mode = Current();
     for (int i = 0; i < 3; ++i) {

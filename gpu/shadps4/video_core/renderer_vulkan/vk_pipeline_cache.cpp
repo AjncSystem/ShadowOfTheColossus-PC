@@ -414,7 +414,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
         .barycentric_via_gs = barycentric_via_gs,
     };
-    WarmUp();
+    // sotc: the cache is read by the Presenter once it can draw (Presenter::Presenter), with
+    // the loading screen on meanwhile.
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",

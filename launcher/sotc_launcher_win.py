@@ -495,6 +495,8 @@ def game_environment(s):
         env['SOTC_FLUSH_EVERY'], env['SOTC_RB_AHEAD'] = '0', '0'
     env['SOTC_VRAM_GC_PERCENT'], env['SOTC_ARENA_EVICT_MB'] = VRAM_LIMITS.get(s.get('vram_use'), VRAM_LIMITS['normal'])
     env['SOTC_VOLUME'] = str(s.get('volume') or '100')
+    # The in-game menu's quick settings are written back here (bbport_overlay.cpp).
+    env['SOTC_LAUNCHER_SETTINGS'] = str(CONFIG_FILE)
     env['SOTC_SHADOW_REUSE'] = str(s.get('shadow_reuse') or '0')
     env['SOTC_OUTPUT_RES'] = s.get('output_res') or '1920x1080'
     # The PS4 Pro path keeps its 16:9 sizes: a wider screen (21:9, 32:9) wins over it (#142).
@@ -1810,6 +1812,19 @@ class Launcher:
         self.stopping = False
         self.output.put((code,))
 
+    # Quick settings the in-game menu may have changed (it writes them to the settings file).
+    LIVE_KEYS = ('fps_mode', 'framegen', 'hq_textures', 'shadow_reuse', 'volume')
+
+    def reload_live_settings(self):
+        saved = load_json(CONFIG_FILE, {})
+        for key in self.LIVE_KEYS:
+            if key in saved and key in self.vars and saved[key] != self.vars[key].get():
+                try:
+                    self.vars[key].set(saved[key])
+                except Exception:  # noqa: BLE001 - a value the widget does not take
+                    continue
+                self.app[key] = saved[key]
+
     def drain_output(self):
         while not self.ui_calls.empty():
             self.ui_calls.get_nowait()()
@@ -1819,6 +1834,7 @@ class Launcher:
                 if isinstance(item, tuple):
                     self.append(_('\n— o jogo terminou (código {}) —\n', '\n— the game exited (code {}) —\n').format(item[0]))
                     self.process = None
+                    self.reload_live_settings()
                     if self.job:
                         self.job.close()
                     self.stop_button.configure(state='disabled')

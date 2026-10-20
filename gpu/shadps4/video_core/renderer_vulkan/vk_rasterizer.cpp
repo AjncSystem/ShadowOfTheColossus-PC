@@ -33,6 +33,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/buffer_cache/region_manager.h"
+#include "video_core/sotc_live.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -486,7 +487,7 @@ struct ShadowReuseState {
 bool Rasterizer::ReuseShadowCascade() {
     // sotc: SOTC_SHADOW_REUSE=auto (the launcher's default): on with NVIDIA, as in 0.58/0.59, off
     // on AMD and Intel (#178). Unset: off.
-    static const int mode = [this] {
+    static const int env_mode = [this] {
         const char* v = std::getenv("SOTC_SHADOW_REUSE");
         if (!v) {
             return 0;
@@ -497,6 +498,9 @@ bool Rasterizer::ReuseShadowCascade() {
         }
         return v[0] == '0' ? 0 : (v[0] == 'c' ? 2 : 1);
     }();
+    // The in-game menu can switch it while playing (sotc_live.h).
+    const int live = SotcLive::shadow_reuse.load(std::memory_order_relaxed);
+    const int mode = live >= 0 ? live : env_mode;
     if (mode == 0) {
         return false;
     }

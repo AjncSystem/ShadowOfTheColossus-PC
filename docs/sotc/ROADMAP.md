@@ -33,6 +33,7 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 | 0.21 | #95: som baixo | ✅ | `c102242`. Opção **Volume** (Configurações > Som): 100/150/200/300%, com suavização dos picos acima de 100% (`SOTC_VOLUME`). Medido gravando o som do demo: 200% dobra o nível exato (pico 0,23 → 0,46); o jogo usa menos de 1/4 da escala, então 300% quase não precisa suavizar. |
 | 0.22 | #136: atualização automática no lançador | ✅ | `8f91784`, do Oussama268 (2a560cd), apontando para o nosso GitHub. Procura ao abrir (opção) e pelo link "Procurar atualização"; pergunta antes de baixar, confere tamanho/SHA-256/estrutura do zip, mantém user/, update/ e sotc.ini, desfaz se der erro. 9 testes dele passam; o exe compilado consulta o GitHub e responde "em dia (0.58.1)". Instalação de verdade só dá para ver quando sair a 0.59. |
 | 0.23 | **Publicar v0.59** | ✅ | Thread de desenhos do Oussama, F11, ultrawide+Pro, memória de vídeo, volume, atualização automática, #151, #137, #146 (em teste). |
+| 0.24 | #178/#157/#163: sombras distantes piscando (qualquer placa) | ✅ | PR #170 (Lucas-blip-png) juntada: reutilização de sombras (nakaionyt, desde a 0.58) desligada por padrão; ela desenhava as cascatas distantes em quadros alternados e o jogo não guarda a pulada (0,36% → 0,01% de pixels piscando, −0,5% de FPS). O fork do Oussama não tem essa reutilização. Demo: média 65,6, mínima 50,1, sem falhas. `SOTC_SHADOW_REUSE=1` religa. |
 
 ## Fase 1 — Estabilidade (quedas e travamentos)
 

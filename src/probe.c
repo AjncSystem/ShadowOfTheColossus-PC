@@ -770,6 +770,30 @@ static uint64_t patch_tcb_loads(const Segment *segments, uint64_t count) {
     return patched;
 }
 #endif
+#ifdef _WIN32
+/* The engine times itself with inline rdtsc ((now - start) / frequency, unsigned). Some
+ * systems do not keep the cores' TSCs in step (a Ryzen 9 5900X under Hyper-V: each core about
+ * 1.4 ms behind the previous one, core 0 three seconds ahead), so a thread that changes core
+ * sees time run backwards: timers wrap to hundreds of hours, a keyframe lookup indexes before
+ * its array (fault at 0x28b133 on the title screen) or a wait never ends. There every rdtsc of
+ * the eboot and sceKernelReadTsc read QPC instead. SOTC_TSC=qpc forces that, =native skips the
+ * check. */
+static void *tsc_clock;
+static void choose_tsc(void) {
+    const char *mode=getenv("SOTC_TSC");
+    if (mode && !strcmp(mode,"native")) return;
+    if (!mode || strcmp(mode,"qpc")) {
+        unsigned core; double offset_us;
+        int skew=compat_tsc_skew(&core,&offset_us);
+        if (skew<0) { puts("Runtime: TSC check across cores failed; using the TSC"); return; }
+        if (!skew) return;
+        printf("Runtime: the CPU cores disagree on the TSC (core %u is %+.3f ms from core 0); "
+               "the game's clock reads QPC instead (SOTC_TSC=native keeps the TSC)\n",core,offset_us/1000);
+    } else puts("Runtime: SOTC_TSC=qpc: the game's clock reads QPC instead of the TSC");
+    tsc_clock=(void *)compat_qpc_tsc;
+    runtime_tsc_use_qpc();
+}
+#endif
 /* sotc: SSE4a and red-zone patches of the eboot (gpu/sotc), described by scripts/sotc_cpu.py. */
 #define SOTC_TRAMPOLINE_SIZE (UINT64_C(16) << 20)
 static void apply_sotc_cpu_patches(const char *path, const Segment *segments, uint64_t count, uint64_t size) {
@@ -800,6 +824,9 @@ static void apply_sotc_cpu_patches(const char *path, const Segment *segments, ui
     /* The last 16 KiB of the trampoline area hold the engine command line (apply_sotc_cmdline). */
     SotcPatchRequest request={image,size,image+round_page(size),SOTC_TRAMPOLINE_SIZE-16384,eh,eh_size,
                               code,n,offsets,(uint32_t)functions,tables,(uint32_t)table_count,eboot_end};
+#ifdef _WIN32
+    request.tsc_clock=tsc_clock;
+#endif
     SotcPatchResult result;
     if (sotc_patch_eboot(&request,&result)) fail("CPU patches: cannot decode the eboot function table");
     printf("CPU patches: SSE4a %s, BMI1/LZCNT/MOVBE %s, %" PRIu64 " functions, %" PRIu64 " short SSE4a/BMI relocated, "
@@ -807,6 +834,9 @@ static void apply_sotc_cpu_patches(const char *path, const Segment *segments, ui
            result.needs_sse4a ? "emulated" : "native", result.needs_bmi ? "emulated" : "native",
            result.function_starts, result.short_sse4a,
            result.red_zone_functions, result.red_zone_instructions);
+    if (request.tsc_clock)
+        printf("CPU patches: %" PRIu64 " rdtsc read QPC, %" PRIu64 " left on the TSC\n",
+               result.rdtsc, result.rdtsc_unpatched);
 }
 /* sotc: extra engine command line (cvars such as +r_motionBlurEnable=0), described by
  * scripts/sotc_modes.py: SOTCCMD1, the image offset of the `lea rsi,[rip+x]` that loads the
@@ -1056,6 +1086,9 @@ int main(int argc, char **argv) {
         return 1;
     }
     require_cpu_features();
+#ifdef _WIN32
+    choose_tsc();
+#endif
     if (content_profile) {
         FILE *profile=fopen(content_profile,"rb");
         unsigned char data[28];

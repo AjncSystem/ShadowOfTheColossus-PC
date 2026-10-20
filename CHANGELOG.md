@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.60-plus — 2026-10-20 (fork Lucas-blip-png)
+- A 0.59-plus5 em cima da **0.60** do original. Da 0.60: o relógio do jogo vem do Windows quando os
+  núcleos da CPU discordam (Einar; o jogo travava na tela de título), o jogo abre em PCs com pouca
+  memória e cada cópia do port tem a própria pasta `user` (as configurações do lançador ficam em
+  `user\launcher_settings.json`; na primeira vez a cópia herda as de antes). As texturas nas GTX
+  10xx, os 60 FPS pelo modo do próprio jogo, o heap guard sem remontar a cada quadro e a geração de
+  quadros sem o HUD, que vieram deste fork, agora fazem parte do original.
+- Continua só aqui: CPUs sem BMI1/LZCNT/MOVBE (Oussama268, com as lacunas da 0.59-plus5), a
+  válvula das texturas em alta (#186 do original; enviada como PR @PR@), a janela de readback
+  menor e a tela cheia a 120 Hz.
+- @PERF@
+
+## 0.60 — 2026-10-20
+Obrigado a **Lucas-blip-png, Einar e KingJhoss**.
+
+**Correções**
+- **Texturas nas GTX 1060/1070/1080 (Pascal):** superfícies sem textura, cores chapadas ou quase
+  pretas (#57, #68, #102). A Pascal não tem o recurso de interpolação que o jogo usa; ele é
+  imitado com um geometry shader (PR #169, Lucas-blip-png).
+- **Jogo travando ou fechando na tela de título** em alguns PCs (núcleos da CPU com relógios
+  diferentes): o relógio do jogo passa a vir do Windows (PR #174, Einar).
+- **Não abria em PCs com pouca memória** (regressão da 0.59): se o Windows recusar os 9152 MB,
+  o jogo usa o tamanho do console e avisa no registro.
+- **FSR 3: quadrados pretos nos quadros gerados** em AMD RX 7000 (PR #177, KingJhoss).
+- **Botão JOGAR cortado** com escala do Windows acima de 100% (PR #171).
+- Correção no código herdado do shadPS4: mínimo/máximo atômico com decimais em placas sem
+  `VK_EXT_shader_atomic_float2` executava duas operações em vez de uma.
+
+**Novidades**
+- **Modo 60 FPS usando o modo Desempenho do próprio jogo** (o do PS4 Pro): o jogo passa a mirar
+  60 FPS, então o tempo dele acompanha. Deve corrigir física errada em 60 FPS (#100, #120); ainda
+  em teste nesses colossos (PR #183, Lucas-blip-png). `SOTC_MODES=af16` volta ao modo antigo.
+- **Cada cópia do port tem a própria pasta `user`** (saves, cache, registros e configurações do
+  lançador em `user\launcher_settings.json`). Antes todas usavam a pasta da primeira cópia. Na
+  primeira vez, a cópia nova herda as configurações e **copia** os saves e módulos de som.
+- **+6% de FPS no templo:** a proteção da memória do jogo não é mais refeita a cada quadro
+  (PR #168, Lucas-blip-png).
+- Geração de quadros sem a interface (barra de vida sem tremer), **experimental e desligada**:
+  `SOTC_FG_HUDLESS=1` (PR #154, Lucas-blip-png).
+- Jogando pelo `SotC.bat` o registro também vai para `user\last_run.log` (PR #175, Einar);
+  ferramentas de medição corrigidas (PR #181, Einar).
+
+**Conhecido:** "Texturas em alta qualidade" ainda pode fechar o jogo em vistas muito amplas
+(espada erguida contra o sol, área do último colosso; #186): desligue-a se acontecer. Personagens
+brancos em AMD GCN (RX 470–590, Vega, APUs): em investigação.
+
 ## 0.59-plus5 — 2026-10-20 (fork Lucas-blip-png)
 - **Queda com texturas em alta no modo PS4 Pro** (issue #186 do original, `read access to
   ffffffffffffffff at guest offset 0x1a371`): o port pede o mip 2 de toda textura amostrada,

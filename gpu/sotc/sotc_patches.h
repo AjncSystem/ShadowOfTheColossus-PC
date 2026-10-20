@@ -19,10 +19,12 @@ typedef struct {
     const SotcCodeSegment *module_tables; /* linked modules' PT_GNU_EH_FRAME (offset, size) */
     uint32_t module_table_count;
     uint64_t eboot_size;      /* segments past it (modules) are only patched for BMI emulation */
+    void *tsc_clock;          /* non-null: rdtsc reads this host function (cores disagree on the TSC) */
 } SotcPatchRequest;
 typedef struct {
     int needs_sse4a, needs_bmi;
     uint64_t function_starts, short_sse4a, red_zone_functions, red_zone_instructions;
+    uint64_t rdtsc, rdtsc_unpatched;
 } SotcPatchResult;
 int sotc_patch_eboot(const SotcPatchRequest *request, SotcPatchResult *result);
 int sotc_handle_illegal(void *exception_pointers);

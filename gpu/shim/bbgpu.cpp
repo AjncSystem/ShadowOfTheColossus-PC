@@ -53,6 +53,7 @@ typedef void (*RuntimeGpuRange)(uintptr_t address, uint64_t size);
 uint64_t runtime_process_time_us(void);
 uint64_t runtime_process_time_counter(void);
 uint64_t runtime_tsc_frequency(void);
+uint64_t runtime_read_tsc(void);
 int32_t* runtime_errno(void);
 void runtime_memory_set_gpu_hooks(RuntimeGpuRange map, RuntimeGpuRange unmap, RuntimeGpuRange invalidate);
 }
@@ -228,7 +229,8 @@ extern "C" int runtime_savedata_mounted(void); // src/runtime_savedata.c
 // Kernel services the vendored libraries call directly.
 namespace Libraries::Kernel {
 u64 PS4_SYSV_ABI sceKernelGetTscFrequency() { return runtime_tsc_frequency(); }
-u64 PS4_SYSV_ABI sceKernelReadTsc() { return Common::FencedRDTSC(); }
+// bbport: the runtime's TSC, which is QPC when the cores disagree on the TSC.
+u64 PS4_SYSV_ABI sceKernelReadTsc() { return runtime_read_tsc(); }
 u64 PS4_SYSV_ABI sceKernelGetProcessTime() { return runtime_process_time_us(); }
 u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounter() { return runtime_process_time_counter(); }
 u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounterFrequency() { return 1'000'000'000; }

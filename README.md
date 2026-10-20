@@ -1,43 +1,30 @@
-# Shadow of the Colossus — PC (port nativo / native port) · v0.59-plus5
+# Shadow of the Colossus — PC (port nativo / native port) · v0.60-plus
 
-**The original 0.59.1, plus 60 FPS through the game's own 60 FPS mode, a smaller readback
-window, 120 Hz fullscreen, textures on GTX 10xx cards and CPUs without BMI1 (pre-Haswell): about
-7% more FPS at the Shrine.** Everything in
-[AjncSystem's 0.59.1](https://github.com/AjncSystem/ShadowOfTheColossus-PC) (the ending crash fix,
-F11, video memory and volume options, launcher self-update, AMD shadow/water stripes fix, Far
-shadows option), with this fork's work on top. The draw thread and the incremental DMA sweep from
-this fork's 0.58.1-plus are part of the original since 0.59, and the far shadows fix since 0.59.1.
+**The original 0.60, plus CPUs without BMI1 (pre-Haswell), no crash with high quality textures, a
+smaller readback window and 120 Hz fullscreen.** Everything in
+[AjncSystem's 0.60](https://github.com/AjncSystem/ShadowOfTheColossus-PC) (textures on GTX 10xx
+cards, 60 FPS through the game's own 60 FPS mode, heap guards no longer rebuilt every frame and
+HUD-less frame generation as an option, all four from this fork; the title-screen hang fix,
+low-memory PCs, a `user` folder per copy), with this fork's work on top.
 
 ![Shrine of Worship, 60 FPS mode, RTX 5060 Ti (FPS from RTSS)](docs/img/sotc-fork.gif)
 
-| | Original 0.59.1 | **This fork (0.59-plus5)** |
+| | Original 0.60 | **This fork (0.60-plus)** |
 |---|---|---|
-| Shrine of Worship, unlimited FPS (RTX 5060 Ti, Ryzen 7 5700X; median of 3 runs) | 45.7 FPS | **48.8 FPS (+7%)** |
+| Shrine of Worship, unlimited FPS (RTX 5060 Ti, Ryzen 7 5700X; median of 3 runs) | @BASE@ FPS | **@PLUS@ FPS (@GAIN@)** |
 
-What it adds (each piece has a switch to turn it off):
-- **60 FPS through the game's own 60 FPS mode** (the PS4 Pro Performance one): the 60 FPS mode
-  used to ignore the 30 FPS rate the game asks while the game still timed itself for 30, so parts
-  of its logic ran twice as fast (likely the bird colossus flying away, the 2nd colossus' wall,
-  weak point damage). Now the game targets 60 itself and its timing follows; F7 switches its
-  target between 30 and 60. Not yet confirmed at colossi 2 and 5 (`SOTC_MODES=af16` goes back).
+What it adds:
 - **CPUs without BMI1/LZCNT/MOVBE** (Intel before Haswell: 2nd/3rd generation Core, Xeon E3 v1/v2;
   AMD FX), which got "This CPU is not supported": the game's ~5,000 such instructions are replaced
-  by equivalent routines at startup, only on those CPUs (Oussama268). AVX is still required. Not
-  yet confirmed on a real one.
-- **Heap guards no longer rebuilt every frame** (+6% at the Shrine): readbacks that land in
-  in-use blocks of the game's heaps skip the allocator guard, which was rebuilt about once per
-  frame (`SOTC_HEAP_FAST=0`).
-- **Textures on GTX 10xx (Pascal) cards:** without `VK_KHR_fragment_shader_barycentric` the
-  rocks and ground came out black, faceted or noisy; a small geometry shader now hands the
-  fragment shader the three vertices' values (`SOTC_BARYCENTRIC_GS=0`). The shader cache is
-  rebuilt on the first launch on those cards only. Confirmed on a GTX 1080 Ti; one terrain
-  blend layer in front of the Shrine is still wrong there.
-- **Smaller readback window**, 64 KiB (+3% at the Shrine): fewer GPU-written pages are downloaded and unprotected
+  by equivalent routines at startup, only on those CPUs (Oussama268), also in code reached only
+  through jump tables (a hang on the first loading screen on a real one). AVX is still required.
+  Not yet confirmed on a real one.
+- **No crash with high quality textures** (`guest offset 0x1a371`, issue #186 of the original):
+  when the game's page pool runs low, textures ask for less detail and the game frees memory
+  (`SOTC_LOD_POOL_LOW=0` turns it off; sent to the original as PR @PR@).
+- **Smaller readback window**, 64 KiB: fewer GPU-written pages are downloaded and unprotected
   for nothing (`SOTC_RB_NARROW=0`).
 - **Fullscreen at 120 Hz** on 144/165 Hz monitors, so every frame stays on screen as long (Anthonypc23).
-- **Frame generation without the HUD (experimental, off):** with `SOTC_FG_HUDLESS=1`, FSR 3 and
-  DLSS-G get the frame drawn again without the UI. With UI on screen FSR 3 still shows artifacts,
-  so it stays off (PR #154 of the original).
 - The launcher's self-update follows this fork's releases; the launcher no longer stops when its
   console refuses writes (issue #104).
 
@@ -64,6 +51,8 @@ de que o jogo precisa, no estilo do [bloodborne_pc](https://github.com/Supermedo
 
 | Versão | Melhorias e correções |
 |---|---|
+| **0.60-plus** | **Fork Lucas-blip-png:** a **0.60** do original inteira (que já traz as texturas nas GTX 10xx, os 60 FPS pelo modo do jogo, o heap guard mais rápido e o FG sem HUD deste fork), mais **CPUs sem BMI1** (Oussama268, com a correção do travamento na primeira tela de carregamento), **sem a queda das texturas em alta** (0x1a371), janela de readback menor e **tela cheia a 120 Hz** (Anthonypc23). |
+| **0.60** | **Texturas nas GTX 10xx**, sem travar na tela de título, **abre em PCs com pouca memória**, **60 FPS pelo modo Desempenho do jogo** (física certa), **pasta `user` própria de cada cópia**, +6% de FPS no templo, FSR 3 sem quadrados pretos na RX 7000. |
 | **0.59-plus5** | **Fork Lucas-blip-png:** sem a **queda com texturas em alta no modo PS4 Pro** (0x1a371: o jogo enchia o pool de memória dele; agora pede menos detalhe quando ele fica quase cheio) e correção para **CPUs sem BMI1** que travavam na primeira tela de carregamento. |
 | **0.59-plus4** | **Fork Lucas-blip-png:** a 0.59-plus3 em cima da **0.59.1** do original: **listras da AMD** nas sombras e na água corrigidas, correções para Intel, opção **Sombras distantes** no lançador e o registro mostra a placa e o driver (Oussama268 e AjncSystem). |
 | **0.59-plus3** | **Fork Lucas-blip-png:** **60 FPS pelo modo 60 do próprio jogo** (o do Desempenho do PS4 Pro): o tempo do jogo acompanha os 60 FPS, o que deve corrigir o colosso pássaro que voa para o céu, a parede do 2º colosso e o dano no ponto fraco; o F7 troca o alvo do jogo entre 30 e 60. Texturas nas GTX 10xx confirmadas numa GTX 1080 Ti. |
@@ -175,6 +164,8 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.60-plus** | **Lucas-blip-png fork:** all of the original's **0.60** (which already has this fork's GTX 10xx textures, 60 FPS through the game's own mode, faster heap guards and HUD-less frame generation), plus **CPUs without BMI1** (Oussama268, with the fix for the hang on the first loading screen), **no crash with high quality textures** (0x1a371), a smaller readback window and **120 Hz fullscreen** (Anthonypc23). |
+| **0.60** | **Textures on GTX 10xx**, no title-screen hang, **starts on low-memory PCs**, **60 FPS through the game's own Performance mode** (right physics), **each copy has its own `user` folder**, +6% FPS at the Shrine, FSR 3 without black tiles on RX 7000. |
 | **0.59-plus5** | **Lucas-blip-png fork:** no more **crash with high quality textures in PS4 Pro mode** (0x1a371: the game filled its own memory pool; now it asks for less detail when the pool is nearly full) and a fix for **CPUs without BMI1** that hung on the first loading screen. |
 | **0.59-plus4** | **Lucas-blip-png fork:** 0.59-plus3 on top of the original's **0.59.1**: **AMD stripes** on shadows and water fixed, Intel fixes, a **Far shadows** launcher option, and the log shows the GPU and driver (Oussama268 and AjncSystem). |
 | **0.59-plus3** | **Lucas-blip-png fork:** **60 FPS through the game's own 60 FPS mode** (the PS4 Pro Performance one): the game's timing follows 60 FPS, which should fix the bird colossus flying away, the 2nd colossus' wall and weak point damage; F7 switches the game's target between 30 and 60. Textures on GTX 10xx confirmed on a GTX 1080 Ti. |

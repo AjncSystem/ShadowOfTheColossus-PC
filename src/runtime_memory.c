@@ -29,16 +29,17 @@
  * bitmap filled up when a save loaded in Pro mode and its allocator read past it (guest offset
  * 0x1a371, read of -1). */
 int runtime_sotc_neo(void);
+static uint64_t pool_size_mb;
+static uint64_t pool_base_mb(void) { return runtime_sotc_neo() ? 5056 + 640 : 5056; }
 static uint64_t pool_size_bytes(void) {
-    static uint64_t size;
-    if (!size) {
+    if (!pool_size_mb) {
         const char *env = getenv("BB_DMEM_MB");
-        const uint64_t base = runtime_sotc_neo() ? 5056 + 640 : 5056;
+        const uint64_t base = pool_base_mb();
         uint64_t mb = env ? strtoull(env, NULL, 10) : 0;
         if (mb < base || mb > 16384) mb = base;
-        size = mb * 1024 * 1024;
+        pool_size_mb = mb;
     }
-    return size;
+    return pool_size_mb * 1024 * 1024;
 }
 #define POOL_SIZE pool_size_bytes()
 #define FLEXIBLE_SIZE (UINT64_C(448) * 1024 * 1024)
@@ -324,6 +325,16 @@ static int pool(void) {
     runtime_memory_reserve();
     uint64_t bytes=POOL_SIZE+FLEX_SPAN;
     section=CreateFileMapping2(INVALID_HANDLE_VALUE,NULL,FILE_MAP_ALL_ACCESS,PAGE_EXECUTE_READWRITE,SEC_COMMIT,bytes,NULL,NULL,0);
+    if (!section && pool_size_mb>pool_base_mb()) {
+        /* sotc: the larger pool (BB_DMEM_MB, 9152 MiB by default since 0.59) is committed at once;
+         * with little RAM and a small page file Windows refuses it (error 1450) and the game
+         * stopped at boot. Fall back to the console's size. */
+        fprintf(stderr,"Runtime: %" PRIu64 " MiB of guest memory refused (error %lu): using %" PRIu64 " MiB; a larger page file allows more\n",
+                bytes>>20,GetLastError(),pool_base_mb());
+        pool_size_mb=pool_base_mb();
+        bytes=POOL_SIZE+FLEX_SPAN;
+        section=CreateFileMapping2(INVALID_HANDLE_VALUE,NULL,FILE_MAP_ALL_ACCESS,PAGE_EXECUTE_READWRITE,SEC_COMMIT,bytes,NULL,NULL,0);
+    }
     if (!section) { fprintf(stderr,"Runtime: cannot create %" PRIu64 " MiB of guest memory (error %lu); is the page file large enough?\n",bytes>>20,GetLastError()); return -1; }
     backing_base=MapViewOfFile3(section,GetCurrentProcess(),NULL,0,bytes,0,PAGE_READWRITE,NULL,0);
     return backing_base ? 0 : -1;

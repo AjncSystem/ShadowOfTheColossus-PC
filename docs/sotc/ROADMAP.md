@@ -30,6 +30,8 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 | 0.18 | #149: modo PS4 Pro derruba o jogo na RX 9060 XT | 🔍 AMD | O log para sem falha (queda do driver). Aqui (NVIDIA) o modo Pro rodou 240 s sem cair, média 63,8. Precisa de testador com AMD. |
 | 0.19 | #141/#148: tela/quadrados pretos piscando com FSR 3 na AMD (RX 7800 XT) | 🔍 AMD | Some ao desligar a geração de quadros. O fork do nakaionyt (origem do FSR 3) não tem correção mais nova. Precisa de placa AMD para testar. |
 | 0.20 | #146: queda nas cenas finais depois do Malus | ⏳ log | É a "queda na intro final". Falta um log (user/last_run.log) ou um save logo antes do Malus. |
+| 0.21 | #95: som baixo | ✅ | `c102242`. Opção **Volume** (Configurações > Som): 100/150/200/300%, com suavização dos picos acima de 100% (`SOTC_VOLUME`). Medido gravando o som do demo: 200% dobra o nível exato (pico 0,23 → 0,46); o jogo usa menos de 1/4 da escala, então 300% quase não precisa suavizar. |
+| 0.22 | #136: atualização automática no lançador | ✅ | `8f91784`, do Oussama268 (2a560cd), apontando para o nosso GitHub. Procura ao abrir (opção) e pelo link "Procurar atualização"; pergunta antes de baixar, confere tamanho/SHA-256/estrutura do zip, mantém user/, update/ e sotc.ini, desfaz se der erro. 9 testes dele passam; o exe compilado consulta o GitHub e responde "em dia (0.58.1)". Instalação de verdade só dá para ver quando sair a 0.59. |
 
 ## Fase 1 — Estabilidade (quedas e travamentos)
 

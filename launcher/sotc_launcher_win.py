@@ -219,10 +219,10 @@ UPSCALERS = [('fsr1', ('FSR 1 (AMD, qualquer placa)', 'FSR 1 (AMD, any GPU)')),
 # (tools/make_button_icons.py, glyphs/xbox) put in place of the game's textures.
 BUTTON_ICONS = [('ps', ('PlayStation (do jogo)', 'PlayStation (the game\'s)')),
                 ('xbox', ('Xbox (A B X Y)', 'Xbox (A B X Y)'))]
-# Frame rate: 30 (the game's cap, as on PS4), 60 (the cap off, at most one frame per two 120 Hz
-# vblanks: SOTC_FPS_LIMIT=60) or unlimited.
+# Frame rate: 30 (the game's cap, as on PS4), 60 (the game's own 60 FPS mode, that of the PS4 Pro
+# Performance mode, at most one frame per two 120 Hz vblanks: SOTC_FPS_LIMIT=60) or unlimited.
 FPS_MODES = [('30', ('30 FPS (como no PS4)', '30 FPS (as on PS4)')),
-             ('60', ('60 FPS (sem o limite do jogo)', '60 FPS (game cap off)')),
+             ('60', ('60 FPS (modo 60 do jogo)', "60 FPS (the game's 60 FPS mode)")),
              ('unlimited', ('Ilimitado (acima de 60)', 'Unlimited (above 60)'))]
 # Frame generation (bb-probe: SOTC_FRAMEGEN; F8 in game switches off / DLSS-G / FSR 3).
 FRAMEGEN = [('off', ('Desligada', 'Off')),
@@ -409,10 +409,15 @@ def game_environment(s):
         env['SOTC_SYS_MODULES'] = s['sys_modules']
     if s.get('dlc_dir'):
         env['SOTC_DLC_DIR'] = s['dlc_dir']
-    env['SOTC_MODES'] = 'af16' if s.get('af16') else ''
     # The 30 FPS cap is applied or not by bb-probe (sotc_fps_cap.h), F7 switches it in game: no
-    # fps60 code patch, vblanks at 120 Hz in every mode; 60 FPS limits the uncapped game.
+    # fps60 code patch, vblanks at 120 Hz in every mode; 60 FPS limits the uncapped game. Above 30
+    # the game also targets 60 FPS itself (fps60game), so its timing follows: ignoring its 30 FPS
+    # target ran some physics and timers twice as fast (AjncSystem #100, #120, #49).
     fps_mode = s.get('fps_mode') or '30'
+    modes = ['af16'] if s.get('af16') else []
+    if fps_mode != '30':
+        modes.append('fps60game')
+    env['SOTC_MODES'] = ','.join(modes)
     env['SOTC_FPS_CAP'] = '30' if fps_mode == '30' else 'off'
     env['SOTC_FPS_LIMIT'] = '60' if fps_mode == '60' else '0'
     env['BB_VBLANK_HZ'] = '120'

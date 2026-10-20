@@ -8,6 +8,8 @@ Writes two files for the loader:
   out/patches.bin  code patches (BBPATCH2, bb-probe --patches):
                    fps60  removes the game's 30 FPS cap (illusion's GoldHEN patch, the shadPS4
                           SotC fork's "SotC-Modes")
+                   fps60game  the game's own 60 FPS target (PS4 Pro Performance mode): it asks for
+                          60 FPS and its timing follows
                    --render WxH (e.g. 3840x1600)  the game renders at this size instead of
                           1920x1080, with its aspect for the cameras (Hor+: a wider view, not a
                           stretched one); PS4 mode only, the PS4 Pro path keeps its sizes
@@ -33,9 +35,20 @@ MODES = {
         # the frame limiter's import stub (sceVideoOutSetFlipRate) returns 0
         (0x01390090, bytes.fromhex('ff25a20567'), bytes.fromhex('31c0c3')),
     ],
+    # The engine's own 60 FPS target, the one of the PS4 Pro Performance mode: TargetFramesPerSeconds
+    # 1 (60 FPS) where the game sets 2 (30 FPS), i.e. the graphics mode code on a PS4 (0x70a6d0) and
+    # the options code without the Performance mode (0x49a2d8). The game then asks flip rate 0 itself
+    # and its timing code (display+0x28: 59.94 instead of 29.97) keeps step: without it, some physics
+    # and timers run twice as fast at 60 FPS (AjncSystem #100, #120, #49).
+    'fps60game': [
+        (0x00b0a7a6, bytes.fromhex('c745b802000000'), bytes.fromhex('c745b801000000')),
+        (0x0089a47f, bytes.fromhex('c7458402000000'), bytes.fromhex('c7458401000000')),
+        (0x0089a499, bytes.fromhex('c7458002000000'), bytes.fromhex('c7458001000000')),
+    ],
 }
 # Modes made of cvars only.
 CVAR_MODES = {
+    'fps60game': ['TargetFramesPerSeconds=1'],  # until the options code runs (MODES above)
     'af16': ['progSamplerAnisoLevel=16', 'progSamplerAnisoLevel_BasePS4=16', 'progSamplerAnisoLevel_Perf=16',
              'progSamplerAnisoLevel_Cinematic=16', 'linearSamplerAnisoLevel=16'],
 }

@@ -630,6 +630,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
     struct GuardSlot {
         VAddr heap = 0;
         std::array<u64, 3> signature{};
+        std::chrono::steady_clock::time_point built{};
         std::optional<BpeHeapGuard> guard;
         std::optional<BpeUsedBlocks> used;
     };
@@ -663,12 +664,74 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
             }
         }
     }
+    const auto find_slot = [&](VAddr heap) -> GuardSlot* {
+        for (auto& candidate : slots) {
+            if (candidate.heap == heap) {
+                return &candidate;
+            }
+        }
+        for (auto& candidate : slots) { // a free slot, else one of a heap not seen now
+            if (candidate.heap == 0 ||
+                std::find(heaps.begin(), heaps.begin() + heap_count, candidate.heap) ==
+                    heaps.begin() + heap_count) {
+                candidate.heap = heap;
+                candidate.guard.reset();
+                candidate.used.reset();
+                return &candidate;
+            }
+        }
+        return nullptr;
+    };
+    const auto signature_of = [](VAddr heap) -> std::array<u64, 3> {
+        return {*std::bit_cast<const u64*>(heap + 0x80), *std::bit_cast<const u64*>(heap + 0xa8),
+                *std::bit_cast<const u64*>(heap + 0xc0)};
+    };
     for (size_t h = 0; h < heap_count; ++h) {
         const VAddr heap = heaps[h];
-        // Only readbacks into the heap's own memory ([heap+0x28], [heap+0x30] bytes) need it:
-        // building the guard walks the free tree, too costly for every readback.
-        const VAddr heap_base = *std::bit_cast<const VAddr*>(heap + 0x28);
-        const u64 heap_size = *std::bit_cast<const u64*>(heap + 0x30);
+        // Only readbacks into the heap's own memory need it: building the guard walks the free
+        // tree, too costly for every readback. The heap picked at boot lives in [heap+0x28],
+        // [heap+0x30] bytes (flexible memory). sotc (#146): the heaps a world creates (the last
+        // colossus' area, after the ending) grow in 1 MiB pieces over direct memory and share that
+        // +0x28 pointer, so readbacks into them were never guarded and the ending still crashed
+        // in their free lists (eboot+0x49500): their range comes from their own guard's free
+        // blocks, refreshed every 2 s while their free tree changes.
+        VAddr heap_base = *std::bit_cast<const VAddr*>(heap + 0x28);
+        u64 heap_size = *std::bit_cast<const u64*>(heap + 0x30);
+        GuardSlot* known = nullptr;
+        if (h != 0) {
+            known = find_slot(heap);
+            if (!known) {
+                continue;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            const auto signature = signature_of(heap);
+            if (!known->guard ||
+                (signature != known->signature && now - known->built > std::chrono::seconds(2))) {
+                SotcStats::heap_guard_builds.fetch_add(1, std::memory_order_relaxed);
+                known->guard.emplace(memory, heap);
+                known->signature = signature;
+                known->built = now;
+            }
+            const auto [lo, hi] = known->guard->IsValid() ? known->guard->FreeExtent()
+                                                          : std::pair<VAddr, VAddr>{0, 0};
+            if (hi <= lo) {
+                continue;
+            }
+            constexpr u64 Margin = 1ULL << 20; // headers of the used blocks next to the free ones
+            heap_base = lo > Margin ? lo - Margin : 0;
+            heap_size = hi - heap_base + Margin;
+            static std::array<VAddr, 16> reported{};
+            if (std::find(reported.begin(), reported.end(), heap) == reported.end()) {
+                if (auto free = std::find(reported.begin(), reported.end(), VAddr{0});
+                    free != reported.end()) {
+                    *free = heap;
+                    std::fprintf(stderr, "SOTC heap guard: heap %#llx guarded in %#llx..%#llx\n",
+                                 static_cast<unsigned long long>(heap),
+                                 static_cast<unsigned long long>(lo),
+                                 static_cast<unsigned long long>(hi));
+                }
+            }
+        }
         bool touches_heap = false;
         for (const auto& item : pending) {
             touches_heap |= item.addr < heap_base + heap_size && heap_base < item.addr + item.size;
@@ -676,7 +739,14 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
         if (!touches_heap) {
             continue;
         }
-        GuardSlot* slot = nullptr;
+        GuardSlot* slot = known;
+        if (slot) {
+            if (!slot->used) {
+                slot->used.emplace(memory);
+            }
+            active[active_count++] = {slot, heap_base, heap_size, false};
+            continue;
+        }
         for (auto& candidate : slots) {
             if (candidate.heap == heap) {
                 slot = &candidate;

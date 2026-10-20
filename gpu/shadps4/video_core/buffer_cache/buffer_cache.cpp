@@ -619,13 +619,28 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
     // sotc (#146): every heap of the guarded heap's class, not only the one picked at boot: the
     // heaps a world creates when it loads (the last colossus' area) crashed the same way
     // (eboot+0x49500, freed blocks overwritten). They come from the engine's heap table.
+    // sotc: SOTC_HEAP_FAST (default on): a write into an in-use block a guard found before, or
+    // above the in-use, size-0 block that ends the heap's block chain (BpeUsedBlocks), skips the
+    // guard, so a guard (its build walks the whole free tree) is built only for the other writes.
+    // SOTC_HEAP_FAST=0 builds every touched heap's guard for each readback batch.
+    static const bool heap_fast = [] {
+        const char* v = std::getenv("SOTC_HEAP_FAST");
+        return !v || std::atoi(v) != 0;
+    }();
     struct GuardSlot {
         VAddr heap = 0;
         std::array<u64, 3> signature{};
         std::optional<BpeHeapGuard> guard;
+        std::optional<BpeUsedBlocks> used;
     };
     static std::array<GuardSlot, 8> slots;
-    std::array<std::pair<VAddr, BpeHeapGuard*>, 8> active{};
+    struct Active {
+        GuardSlot* slot;
+        VAddr base;
+        u64 size;
+        bool checked; ///< the guard was checked against the heap's signature in this batch
+    };
+    std::array<Active, 8> active{};
     size_t active_count = 0;
     std::array<VAddr, 8> heaps{};
     size_t heap_count = 0;
@@ -661,9 +676,6 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
         if (!touches_heap) {
             continue;
         }
-        const std::array<u64, 3> signature = {*std::bit_cast<const u64*>(heap + 0x80),
-                                               *std::bit_cast<const u64*>(heap + 0xa8),
-                                               *std::bit_cast<const u64*>(heap + 0xc0)};
         GuardSlot* slot = nullptr;
         for (auto& candidate : slots) {
             if (candidate.heap == heap) {
@@ -679,6 +691,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                     slot = &candidate;
                     slot->heap = heap;
                     slot->guard.reset();
+                    slot->used.reset();
                     break;
                 }
             }
@@ -686,25 +699,40 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
         if (!slot) {
             continue;
         }
-        if (!slot->guard || signature != slot->signature) {
-            SotcStats::heap_guard_builds.fetch_add(1, std::memory_order_relaxed);
-            slot->guard.emplace(memory, heap);
-            slot->signature = signature;
+        if (!slot->used) {
+            slot->used.emplace(memory);
         }
-        if (slot->guard->IsValid()) {
-            active[active_count++] = {heap, &*slot->guard};
-        }
+        active[active_count++] = {slot, heap_base, heap_size, false};
     }
-    const auto guard_for = [&](VAddr addr, u64 size) -> BpeHeapGuard* {
-        for (size_t a = 0; a < active_count; ++a) {
-            const VAddr heap = active[a].first;
-            const VAddr heap_base = *std::bit_cast<const VAddr*>(heap + 0x28);
-            const u64 heap_size = *std::bit_cast<const u64*>(heap + 0x30);
-            if (addr < heap_base + heap_size && heap_base < addr + size) {
-                return active[a].second;
+    // The heap's guard, built again when its free tree changed (signature) since the last build
+    const auto guard_of = [&](Active& a) -> BpeHeapGuard* {
+        GuardSlot& slot = *a.slot;
+        if (!a.checked) {
+            a.checked = true;
+            const VAddr heap = slot.heap;
+            const std::array<u64, 3> signature = {*std::bit_cast<const u64*>(heap + 0x80),
+                                                   *std::bit_cast<const u64*>(heap + 0xa8),
+                                                   *std::bit_cast<const u64*>(heap + 0xc0)};
+            if (!slot.guard || signature != slot.signature) {
+                SotcStats::heap_guard_builds.fetch_add(1, std::memory_order_relaxed);
+                slot.guard.emplace(memory, heap);
+                slot.signature = signature;
             }
         }
-        return active_count == 1 ? active[0].second : nullptr;
+        return slot.guard->IsValid() ? &*slot.guard : nullptr;
+    };
+    if (!heap_fast) {
+        for (size_t a = 0; a < active_count; ++a) {
+            guard_of(active[a]);
+        }
+    }
+    const auto active_for = [&](VAddr addr, u64 size) -> Active* {
+        for (size_t a = 0; a < active_count; ++a) {
+            if (addr < active[a].base + active[a].size && active[a].base < addr + size) {
+                return &active[a];
+            }
+        }
+        return nullptr;
     };
     for (const auto& item : pending) {
         for (const auto& copy : item.copies) {
@@ -725,7 +753,28 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                 }
             }
             ForEachNonStackRange(dst_addr, copy.size, [&](VAddr addr, u64 size) {
-                if (BpeHeapGuard* heap_guard = active_count ? guard_for(addr, size) : nullptr) {
+                BpeHeapGuard* heap_guard = nullptr;
+                if (Active* a = active_for(addr, size)) {
+                    BpeUsedBlocks& used = *a->slot->used;
+                    if (heap_fast && used.Covers(a->slot->heap, addr, addr + size)) {
+                        memory->TryWriteBacking(std::bit_cast<u8*>(addr), src + (addr - dst_addr),
+                                                size, 1);
+                        return;
+                    }
+                    heap_guard = guard_of(*a);
+                    int find = 0;
+                    if (VAddr block = 0, next = 0;
+                        heap_fast && heap_guard &&
+                        heap_guard->FindUsedBlock(addr, block, next, &find)) {
+                        used.Add(block, next);
+                    } else if (find == 6) {
+                        used.SetFence(block);
+                    }
+                } else if (active_count == 1 && active[0].checked) {
+                    // Outside the heap: its guard when this batch built it, as before
+                    heap_guard = guard_of(active[0]);
+                }
+                if (heap_guard) {
                     if (const u64 kept = heap_guard->Write(addr, src + (addr - dst_addr), size)) {
                         static u64 reported = 0;
                         if (reported++ < 8) {

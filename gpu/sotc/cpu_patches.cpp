@@ -573,6 +573,21 @@ static const std::unordered_map<ZydisMnemonic, std::vector<PatchInfo>> Patches =
 #endif
 };
 
+bool EmitCpuEmulationForTest(void* code, Xbyak::CodeGenerator& c) {
+    ZydisDecodedInstruction instruction;
+    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+    if (!ZYAN_SUCCESS(
+            Common::Decoder::Instance()->decodeInstruction(instruction, operands, code))) {
+        return false;
+    }
+    const auto patches = Patches.find(instruction.mnemonic);
+    if (patches == Patches.end() || !patches->second.front().trampoline) {
+        return false;
+    }
+    patches->second.front().generator(code, operands, c);
+    return true;
+}
+
 static std::once_flag init_flag;
 
 struct PatchModule {

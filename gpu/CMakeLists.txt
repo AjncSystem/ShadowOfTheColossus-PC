@@ -346,6 +346,12 @@ target_include_directories(barycentric-gs-test PRIVATE shim shadps4 third_party/
 target_compile_options(barycentric-gs-test PRIVATE -UNDEBUG -fPIC)
 target_link_libraries(barycentric-gs-test PRIVATE bbgpu)
 
+# sotc: BMI1/LZCNT/MOVBE emulation against the real instructions (needs a CPU that has them).
+add_executable(cpu-emulation-test EXCLUDE_FROM_ALL ../tests/test_cpu_emulation.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(cpu-emulation-test PRIVATE shadps4 sotc third_party/xbyak)
+target_compile_options(cpu-emulation-test PRIVATE -UNDEBUG)
+target_link_libraries(cpu-emulation-test PRIVATE bbgpu)
+
 add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_support.cpp
     shim/bbport_settings.cpp)
 target_include_directories(upscaler-support-test PRIVATE shim)

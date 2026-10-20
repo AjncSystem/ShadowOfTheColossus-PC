@@ -101,6 +101,62 @@ static void *allocate_image(size_t size) {
     return p;
 }
 #endif
+#ifdef _WIN32
+/* sotc: SOTC_HEAP_WATCH=1 (#146): every 5 s, the engine's heaps (the table at image+0x2dfaab0,
+ * indexed by heap id) with their 64 KiB page bitmaps (set bit = free page: +0x50 bitmap, +0x58
+ * words, +0x60 pages; +0x30 bytes in use). The ending crashed when one bitmap had no free page
+ * left (guest offset 0x1a371). Reads go through ReadProcessMemory, so a wrong guess is harmless. */
+static unsigned char *heap_watch_image;
+static int heap_read(uint64_t address, void *out, size_t size) {
+    SIZE_T done=0;
+    return ReadProcessMemory(GetCurrentProcess(),(const void *)(uintptr_t)address,out,size,&done) && done==size;
+}
+static DWORD WINAPI heap_watch(void *unused) {
+    (void)unused;
+    enum { HEAPS=48 };
+    uint64_t last_free[HEAPS]={0};
+    for (unsigned tick=0;;++tick) {
+        Sleep(5000);
+        uint64_t table[HEAPS];
+        if (!heap_read((uint64_t)(uintptr_t)(heap_watch_image+0x2dfaab0),table,sizeof(table))) continue;
+        if (tick%12==1) {  /* raw layout, to check the guessed offsets */
+            char raw[4096]; int r=snprintf(raw,sizeof(raw),"SOTC HEAP TABLE");
+            for (int i=0;i<HEAPS && r<(int)sizeof(raw)-24;++i) r+=snprintf(raw+r,sizeof(raw)-r," %d:%llx",i,(unsigned long long)table[i]);
+            puts(raw);
+            for (int i=0;i<HEAPS;++i) {
+                uint64_t q[24];
+                if (!table[i] || !heap_read(table[i],q,sizeof(q))) continue;
+                r=snprintf(raw,sizeof(raw),"SOTC HEAP %d @%llx:",i,(unsigned long long)table[i]);
+                for (int k=0;k<24;++k) r+=snprintf(raw+r,sizeof(raw)-r," %llx",(unsigned long long)q[k]);
+                puts(raw);
+            }
+            fflush(stdout);
+        }
+        char line[2048]; int n=0, changed=0;
+        for (int i=0;i<HEAPS;++i) {
+            uint64_t bitmap=0, used=0, pages=0; uint32_t words=0;
+            if (!table[i] || !heap_read(table[i]+0x50,&bitmap,8) || !heap_read(table[i]+0x58,&words,4) ||
+                !heap_read(table[i]+0x60,&pages,8) || !heap_read(table[i]+0x30,&used,8)) continue;
+            if (!bitmap || !words || words>(1u<<20) || pages>(uint64_t)words*64) continue;
+            uint64_t free_pages=0, chunk[512];
+            for (uint32_t w=0;w<words;w+=512) {
+                uint32_t count=words-w<512 ? words-w : 512;
+                if (!heap_read(bitmap+(uint64_t)w*8,chunk,count*8)) { free_pages=UINT64_MAX; break; }
+                for (uint32_t k=0;k<count;++k) free_pages+=(uint64_t)__builtin_popcountll(chunk[k]);
+            }
+            if (free_pages==UINT64_MAX) continue;
+            if (free_pages!=last_free[i]) changed=1;
+            last_free[i]=free_pages;
+            if (n<(int)sizeof(line)-80)
+                n+=snprintf(line+n,sizeof(line)-n," h%d %llu/%llu MB free (in use %llu MB)",i,
+                            (unsigned long long)(free_pages>>4),(unsigned long long)(pages>>4),
+                            (unsigned long long)(used>>20));
+        }
+        if (n && (changed || tick%12==0)) { printf("SOTC HEAPS%s\n",line); fflush(stdout); }
+    }
+    return 0;
+}
+#endif
 static void *allocate(size_t size) {
     void *low=runtime_low_map(size,PROT_READ|PROT_WRITE);
     if (low) return low;
@@ -436,6 +492,8 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
         fprintf(stderr,"Fault: exception 0x%08lx at %s (thread %lu)\n",record->ExceptionCode,where,GetCurrentThreadId());
     fprintf(stderr,"  rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n  rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n",
             c->Rax,c->Rbx,c->Rcx,c->Rdx,c->Rsi,c->Rdi,c->Rbp,c->Rsp);
+    fprintf(stderr,"  r8=%016llx r9=%016llx r10=%016llx r11=%016llx\n  r12=%016llx r13=%016llx r14=%016llx r15=%016llx\n",
+            c->R8,c->R9,c->R10,c->R11,c->R12,c->R13,c->R14,c->R15);
     if (gpu_enabled) bbgpu_dump_guest_writes(info);
     /* rbp chain (guest and host code keep frame pointers). */
     uintptr_t rbp=(uintptr_t)c->Rbp;
@@ -445,6 +503,13 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
         if (!ReadProcessMemory(GetCurrentProcess(),(void *)rbp,frame,sizeof(frame),&got) || got!=sizeof(frame) || frame[0]<=rbp) break;
         describe_address(where,sizeof(where),frame[1]);
         fprintf(stderr,"  #%d %s\n",depth,where);
+        /* The frame's locals and saved registers (rbp-0x80..rbp), for the arguments. */
+        uintptr_t locals[16];
+        if (depth<8 && ReadProcessMemory(GetCurrentProcess(),(void *)(rbp-0x80),locals,sizeof(locals),&got) && got==sizeof(locals)) {
+            fprintf(stderr,"     rbp-80:");
+            for (int k=0;k<16;++k) fprintf(stderr," %llx",(unsigned long long)locals[k]);
+            fprintf(stderr,"\n");
+        }
         rbp=frame[0];
     }
     fflush(NULL);
@@ -534,6 +599,11 @@ static void choose_heap(void) {
     }
 }
 uintptr_t runtime_sotc_heap(void) { return heap_chosen; }
+/* sotc (#146): the engine's heap table (heap id -> heap object, eboot EU 1.01). The world's own
+ * heaps (created when a world loads, e.g. the last colossus' area) include more heaps of the
+ * guarded heap's class; the GPU side guards those too. 0 until the guarded heap is chosen. */
+#define HEAP_TABLE_OFFSET 0x2dfaab0
+uintptr_t runtime_sotc_heap_table(void) { return heap_chosen ? (uintptr_t)(image+HEAP_TABLE_OFFSET) : 0; }
 static int heap_hook_trap(EXCEPTION_POINTERS *info) {
     CONTEXT *c=info->ContextRecord;
     if (info->ExceptionRecord->ExceptionCode==EXCEPTION_SINGLE_STEP) {
@@ -1224,6 +1294,12 @@ int main(int argc, char **argv) {
     }
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
     entered_game=1;
+#ifdef _WIN32
+    if (getenv("SOTC_HEAP_WATCH") && getenv("SOTC_HEAP_WATCH")[0]=='1') {
+        heap_watch_image=image;
+        CloseHandle(CreateThread(NULL,0,heap_watch,NULL,0,NULL));
+    }
+#endif
     struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};
 #ifdef _WIN32
     typedef void (ABI *Entry)(void *, void (ABI *)(void));

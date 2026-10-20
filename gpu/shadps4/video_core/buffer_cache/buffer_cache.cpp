@@ -22,6 +22,7 @@
 #include <optional>
 
 extern "C" uintptr_t runtime_sotc_heap(void);
+extern "C" uintptr_t runtime_sotc_heap_table(void);
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -561,10 +562,40 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
 
 void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8* mapped,
                                  u64 mapped_offset) {
-    static std::optional<BpeHeapGuard> cached_guard;
-    static std::array<u64, 3> cached_signature{};
-    BpeHeapGuard* heap_guard = nullptr;
-    if (const VAddr heap = runtime_sotc_heap(); heap != 0) {
+    // sotc (#146): every heap of the guarded heap's class, not only the one picked at boot: the
+    // heaps a world creates when it loads (the last colossus' area) crashed the same way
+    // (eboot+0x49500, freed blocks overwritten). They come from the engine's heap table.
+    struct GuardSlot {
+        VAddr heap = 0;
+        std::array<u64, 3> signature{};
+        std::optional<BpeHeapGuard> guard;
+    };
+    static std::array<GuardSlot, 8> slots;
+    std::array<std::pair<VAddr, BpeHeapGuard*>, 8> active{};
+    size_t active_count = 0;
+    std::array<VAddr, 8> heaps{};
+    size_t heap_count = 0;
+    if (const VAddr chosen = runtime_sotc_heap(); chosen != 0) {
+        heaps[heap_count++] = chosen;
+        const u64 heap_class = *std::bit_cast<const u64*>(chosen);
+        if (const VAddr table = runtime_sotc_heap_table(); table != 0) {
+            for (u32 id = 1; id < 48 && heap_count < heaps.size(); ++id) {
+                const VAddr other = std::bit_cast<const VAddr*>(table)[id];
+                if (other == 0 || other == chosen || !(other >= 0x10000 && other < 0x10000000000ULL)) {
+                    continue;
+                }
+                const bool in_image = other - table < 0x20000000;
+                if (!in_image && !memory->GetBackingPointer(other)) {
+                    continue;
+                }
+                if (*std::bit_cast<const u64*>(other) == heap_class) {
+                    heaps[heap_count++] = other;
+                }
+            }
+        }
+    }
+    for (size_t h = 0; h < heap_count; ++h) {
+        const VAddr heap = heaps[h];
         // Only readbacks into the heap's own memory ([heap+0x28], [heap+0x30] bytes) need it:
         // building the guard walks the free tree, too costly for every readback.
         const VAddr heap_base = *std::bit_cast<const VAddr*>(heap + 0x28);
@@ -573,20 +604,54 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
         for (const auto& item : pending) {
             touches_heap |= item.addr < heap_base + heap_size && heap_base < item.addr + item.size;
         }
-        if (touches_heap) {
-            const std::array<u64, 3> signature = {*std::bit_cast<const u64*>(heap + 0x80),
-                                                   *std::bit_cast<const u64*>(heap + 0xa8),
-                                                   *std::bit_cast<const u64*>(heap + 0xc0)};
-            if (!cached_guard || signature != cached_signature) {
-                SotcStats::heap_guard_builds.fetch_add(1, std::memory_order_relaxed);
-                cached_guard.emplace(memory, heap);
-                cached_signature = signature;
-            }
-            if (cached_guard->IsValid()) {
-                heap_guard = &*cached_guard;
+        if (!touches_heap) {
+            continue;
+        }
+        const std::array<u64, 3> signature = {*std::bit_cast<const u64*>(heap + 0x80),
+                                               *std::bit_cast<const u64*>(heap + 0xa8),
+                                               *std::bit_cast<const u64*>(heap + 0xc0)};
+        GuardSlot* slot = nullptr;
+        for (auto& candidate : slots) {
+            if (candidate.heap == heap) {
+                slot = &candidate;
+                break;
             }
         }
+        if (!slot) {
+            for (auto& candidate : slots) {  // a free slot, else one of a heap not seen now
+                if (candidate.heap == 0 ||
+                    std::find(heaps.begin(), heaps.begin() + heap_count, candidate.heap) ==
+                        heaps.begin() + heap_count) {
+                    slot = &candidate;
+                    slot->heap = heap;
+                    slot->guard.reset();
+                    break;
+                }
+            }
+        }
+        if (!slot) {
+            continue;
+        }
+        if (!slot->guard || signature != slot->signature) {
+            SotcStats::heap_guard_builds.fetch_add(1, std::memory_order_relaxed);
+            slot->guard.emplace(memory, heap);
+            slot->signature = signature;
+        }
+        if (slot->guard->IsValid()) {
+            active[active_count++] = {heap, &*slot->guard};
+        }
     }
+    const auto guard_for = [&](VAddr addr, u64 size) -> BpeHeapGuard* {
+        for (size_t a = 0; a < active_count; ++a) {
+            const VAddr heap = active[a].first;
+            const VAddr heap_base = *std::bit_cast<const VAddr*>(heap + 0x28);
+            const u64 heap_size = *std::bit_cast<const u64*>(heap + 0x30);
+            if (addr < heap_base + heap_size && heap_base < addr + size) {
+                return active[a].second;
+            }
+        }
+        return active_count == 1 ? active[0].second : nullptr;
+    };
     for (const auto& item : pending) {
         for (const auto& copy : item.copies) {
             const VAddr dst_addr = item.arena->cpu_addr + copy.srcOffset;
@@ -606,7 +671,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                 }
             }
             ForEachNonStackRange(dst_addr, copy.size, [&](VAddr addr, u64 size) {
-                if (heap_guard) {
+                if (BpeHeapGuard* heap_guard = active_count ? guard_for(addr, size) : nullptr) {
                     if (const u64 kept = heap_guard->Write(addr, src + (addr - dst_addr), size)) {
                         static u64 reported = 0;
                         if (reported++ < 8) {

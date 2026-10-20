@@ -35,7 +35,7 @@ def main():
     parser.add_argument('--env', action='append', default=[], help='NAME=VALUE for the game')
     parser.add_argument('--patches', help='BBPATCH2 file (scripts/sotc_modes.py)')
     parser.add_argument('--cmdline', help='SOTCCMD1 file (scripts/sotc_modes.py)')
-    args = parser.parse_args()
+    args = parser.parse_intermixed_args()  # events may follow options (the bench scripts' --env)
     os.chdir(ROOT)
     out = Path('out')
     template = out / 'save-template' / 'CUSA08809'
@@ -50,7 +50,8 @@ def main():
     pad = out / 'pad.txt'
     pad.write_text('')
     env = dict(os.environ)
-    msys = os.environ.get('MSYS2_ROOT', r'I:\msys64')
+    msys = os.environ.get('MSYS2_ROOT') or next((p for p in (r'C:\msys64', r'I:\msys64') if Path(p).is_dir()),
+                                                r'C:\msys64')
     env['PATH'] = str(Path(msys) / 'clang64' / 'bin') + os.pathsep + env['PATH']
     env.update(BB_FRAME_DUMP_TRIGGER=str(out / 'dump.trigger'), BB_DUMP_DIR=str(out / 'dump'), BB_PAD_FILE=str(pad),
                BB_STACKS_TRIGGER=str(out / 'stacks.trigger'), SOTC_SAVE_PROMPT='auto')

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.60.3-plus2 — 2026-10-20 (fork Lucas-blip-png)
+- **Placas AMD GCN (RX 470–590, Vega, APUs mais antigas), para testar:** personagens piscando em
+  branco, verde ou rosa, fumaça branca e névoa com cores que mudam a cada execução (#152, #187 e
+  #201 do original). Essas placas rodam os shaders com 64 lanes, e nesse caso o port não punha as
+  barreiras de LDS que o jogo precisa; agora põe. A camada não oficial SotC-AMD-Fix (raulbezerro-dev)
+  resolvia numa RX 570 justamente por ligar essas barreiras. O log mostra
+  `GPU: LDS barriers on for 64-wide AMD`; `SOTC_AMD64_LDS=0` desliga. Não testado numa GCN (não
+  temos a placa): conte na #152 ou na #201 do original. O cache de shaders é refeito na primeira
+  abertura nessas placas. Nada muda em NVIDIA, Intel ou nas AMD RDNA no Windows. Enviado ao
+  original como PR #205.
+- **CPUs com 4 threads:** o gravador de comandos da GPU também não gira entre um lote e outro
+  quando o processo tem até 8 processadores lógicos. Demo de abertura, modo 60 FPS, Ryzen 7 5700X
+  preso a 4 processadores lógicos: 2 núcleos com SMT 66,9 FPS (antes 64,3), 4 núcleos sem SMT
+  81,8 (antes 79,9); com todos, igual (95 FPS). O log mostra
+  `GPU recorder: N logical processors, spin N us, idle wait N us`.
+
 ## 0.60.3-plus — 2026-10-20 (fork Lucas-blip-png)
 - A 0.60.1-plus em cima da **0.60.3** do original: o jogo é zerável do início ao fim, o **ajuste
   rápido no menu dentro do jogo** (60 FPS, geração de quadros, texturas em alta, sombras distantes

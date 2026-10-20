@@ -1,7 +1,7 @@
-# Shadow of the Colossus — PC native port · v0.60.3-plus
+# Shadow of the Colossus — PC native port · v0.60.3-plus2
 
-**The original 0.60.3, plus CPUs without BMI1 (pre-Haswell), CPUs with 4 threads and 120 Hz
-fullscreen.** Everything in [AjncSystem's 0.60.3](https://github.com/AjncSystem/ShadowOfTheColossus-PC)
+**The original 0.60.3, plus CPUs without BMI1 (pre-Haswell), CPUs with 4 threads, 120 Hz
+fullscreen and a fix to test for AMD GCN cards (RX 470–590).** Everything in [AjncSystem's 0.60.3](https://github.com/AjncSystem/ShadowOfTheColossus-PC)
 (the game can be finished from start to end; the in-game menu with quick settings; textures on
 GTX 10xx cards, 60 FPS through the game's own 60 FPS mode, faster heap guards, HUD-less frame
 generation as an option, no crash with high quality textures and the smaller readback window, all
@@ -21,6 +21,11 @@ What it adds:
   processors stayed stuck loading the attract demo; now it runs at 76 FPS (60 FPS mode). With more
   than 8 logical processors nothing changes (sent to the original as
   [PR #198](https://github.com/AjncSystem/ShadowOfTheColossus-PC/pull/198)).
+- **AMD GCN cards (RX 470–590, Vega), to test:** white, flickering characters and smoke and fog
+  colours that change every run. These cards run the shaders 64 wide, and the port did not add the
+  LDS barriers the game needs there; now it does (`SOTC_AMD64_LDS=0` turns it off). Not tested on
+  a GCN card yet: tell us in issue #152 or #201 of the original (sent as
+  [PR #205](https://github.com/AjncSystem/ShadowOfTheColossus-PC/pull/205)).
 - **Fullscreen at 120 Hz** on 144/165 Hz monitors, so every frame stays on screen as long (Anthonypc23).
 - The launcher's self-update follows this fork's releases; the launcher no longer stops when its
   console refuses writes (issue #104).
@@ -49,6 +54,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.60.3-plus2** | **Lucas-blip-png fork:** a fix to test for **AMD GCN cards** (RX 470–590, Vega: white, flickering characters and smoke) and a little more FPS on **CPUs with 4 threads** (+4% on 2 cores with SMT). |
 | **0.60.3-plus** | **Lucas-blip-png fork:** all of the original's **0.60.3** (the game can be finished; quick settings in the in-game menu), plus **CPUs with 4 threads** (the GPU threads no longer spin on a core the game needs: from stuck loading to 76 FPS on 4 logical processors), **CPUs without BMI1** and **120 Hz fullscreen**. |
 | **0.60.3** | **The game can be finished from start to end** (played from the last colossus through the ending and credits): fix for the high quality textures crash in wide views (#186), fix for the crash on the load after the credits, +2.7% FPS at the Shrine. |
 | **0.60.2** | **Quick settings in the in-game menu** (60 FPS, frame generation, high quality textures, far shadows, volume: apply at once and are kept), **the mouse works in the menu**, **animated loading screen while the shaders are prepared** at start. |

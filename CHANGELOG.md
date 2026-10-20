@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.59-plus2 — 2026-10-20 (fork Lucas-blip-png)
+Obrigado a **Oussama268**.
+- **Processadores sem BMI1/LZCNT/MOVBE** (Intel Core i3/i5/i7 de 2ª e 3ª geração, Xeon E3 v1/v2
+  e outros anteriores ao Haswell; AMD FX), que antes recebiam "This CPU is not supported". O jogo
+  usa ~5.000 instruções dessas do processador do PS4; nessas CPUs elas são trocadas por rotinas
+  equivalentes ao abrir, no executável do jogo e nos módulos (libc, Fios2, áudio). Nas outras CPUs
+  nada muda. AVX continua obrigatório (Sandy Bridge / Bulldozer ou mais novo). Feito pelo
+  Oussama268 (PR #55 do fork dele); aqui ganhou um teste que compara cada instrução emulada com a
+  real (39 formas, 200 mil entradas cada). Testado forçando a emulação numa CPU moderna
+  (`SOTC_EMULATE_BMI=1`): no Santuário 50 FPS com e sem emulação, e o demo de abertura inteiro até a
+  tela título com a imagem igual, sem nenhuma falha. Falta a confirmação de quem tem uma CPU
+  dessas (issues #70, #88, #89 e #164–#166 do original).
+- **Botão JOGAR cortado** com a escala do Windows acima de 100%: a barra de baixo do lançador
+  agora cresce junto (PR #171 do original).
+- Nas GTX 10xx, a linha "No fragment shader barycentrics: emulated by a geometry shader" agora
+  aparece no `user/last_run.log`.
+
 ## 0.59-plus — 2026-10-20 (fork Lucas-blip-png)
 A 0.59 do AjncSystem inteira, mais o que ainda é só deste fork. A thread de desenho, a varredura
 de DMA incremental e as correções pequenas da 0.58.1-plus entraram no original na 0.59.

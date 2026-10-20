@@ -859,7 +859,14 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
         const char* v = std::getenv("SOTC_REC_SPIN_US");
         return std::chrono::microseconds{v ? std::strtol(v, nullptr, 10) : 250};
     }();
+#ifdef _WIN32
+    // sotc: Windows condition variables wait in whole milliseconds, so 500 us came out as 0: the
+    // wait returned at once and the thread spun on a core. The producer wakes a sleeping consumer
+    // for new work, so a longer timeout adds no latency. From AjncSystem#81 (jownatan).
+    constexpr auto SleepTime = std::chrono::milliseconds{2};
+#else
     constexpr auto SleepTime = std::chrono::microseconds{500};
+#endif
 
     Chunk* chunk = first_chunk;
     Chunk* previous = nullptr;

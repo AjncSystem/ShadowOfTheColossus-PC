@@ -247,14 +247,15 @@ GraphicsPipeline::GraphicsPipeline(
         });
     }
 
-    const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
-        .requiredSubgroupSize = 64,
-    };
-    for (auto& stage : shader_stages) {
-        stage.pNext = instance.IsSubgroupSize64Supported() &&
-                              instance.CanRequireSubgroupSize(stage.stage)
-                          ? &subgroup_size_ci
-                          : nullptr;
+    // sotc: 64 where every stage can be pinned to it; on Intel the recompiler's lane count
+    // (Instance::RequiredSubgroupSize).
+    std::array<vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo, MaxShaderStages>
+        subgroup_size_cis{};
+    for (size_t i = 0; i < shader_stages.size(); ++i) {
+        auto& stage = shader_stages[i];
+        const u32 size = instance.RequiredSubgroupSize(stage.stage);
+        subgroup_size_cis[i].requiredSubgroupSize = size;
+        stage.pNext = size != 0 ? &subgroup_size_cis[i] : nullptr;
     }
 
     const auto depth_format =

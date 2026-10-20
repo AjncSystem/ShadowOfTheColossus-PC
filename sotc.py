@@ -23,7 +23,9 @@ Settings (environment variables, or sotc.ini beside this script as NAME=value li
     BB_GAMEPAD        the gamepad to use (its name or part of it), when several are connected
     key.<input>=Keys, pad.<input>=buttons   remap the controls (README.md, Controles)
 The image is prepared again only when the game, the modules or the scripts change.
-Extra arguments go to bb-probe.exe.
+Extra arguments go to bb-probe.exe. Run from a console, the session is also saved to
+<user>/last_run.log (the 4 before it as last_run.1.log ... last_run.4.log; a crash's log is
+copied to <user>/crashes).
 """
 import hashlib
 import os
@@ -252,7 +254,58 @@ def main():
     if env.get('SOTC_WRAP'):
         import json
         command = json.loads(env['SOTC_WRAP']) + command
-    return subprocess.run(command, stdin=subprocess.DEVNULL, creationflags=no_console()).returncode
+    # In a console the session also goes to user/last_run.log (as the launcher does; the launcher
+    # reads this script's output into its own log, so a pipe means it is not written here).
+    if not sys.stdout.isatty():
+        return subprocess.run(command, stdin=subprocess.DEVNULL, creationflags=no_console()).returncode
+    with open_session_log(user) as log:
+        game = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+        try:
+            for line in game.stdout:
+                sys.stdout.buffer.write(line)
+                sys.stdout.buffer.flush()
+                log.write(line)
+        finally:
+            code = game.wait()
+    keep_crash_log(user, code)
+    return code
+
+
+LOGS_KEPT = 5        # last_run.log and last_run.1.log ... last_run.4.log
+CRASH_LOGS_KEPT = 20
+
+
+def open_session_log(user):
+    """A fresh user/last_run.log; the previous sessions' logs move to last_run.1.log (the one
+    before) ... last_run.4.log. Same files as the launcher (launcher/sotc_launcher_win.py)."""
+    for i in range(LOGS_KEPT - 1, 0, -1):
+        older = user / ('last_run.log' if i == 1 else f'last_run.{i - 1}.log')
+        if older.is_file():
+            try:
+                os.replace(older, user / f'last_run.{i}.log')
+            except OSError:
+                pass
+    return open(user / 'last_run.log', 'wb', buffering=0)
+
+
+def keep_crash_log(user, code):
+    """After a session that ended with an error code, copies its log to
+    user/crashes/<date>_<time>_<code>.log (the last 20, and the last 5 minidumps, are kept)."""
+    if code == 0:
+        return
+    import time
+    crashes = user / 'crashes'
+    try:
+        crashes.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime('%Y-%m-%d_%H-%M-%S')
+        shutil.copy2(user / 'last_run.log', crashes / f'{stamp}_{code & 0xffffffff:#x}.log')
+        for old in sorted(crashes.glob('*.log'))[:-CRASH_LOGS_KEPT]:
+            old.unlink()
+        for old in sorted(crashes.glob('*.dmp'))[:-5]:
+            old.unlink()
+    except OSError:
+        pass
 
 
 if __name__ == '__main__':

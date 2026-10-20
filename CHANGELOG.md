@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.60.1 — 2026-10-20
+Obrigado a **nosekefik, Oussama268, plassardewen-cpu e lunar-me**.
+
+- **Menu dentro do jogo** (Insert, F1 ou L3+R3): FPS, placa e memória de vídeo, tela cheia,
+  resolução, escala e nitidez, câmera e mouse, efeitos (névoa, vinheta, oclusão, reflexos da
+  água). Era o menu do Bloodborne, escondido no port; agora é do SotC e vem ligado
+  (`BB_OVERLAY_MENU=0` desliga). Textos em inglês (PR #94, nosekefik).
+- **Sobras do Bloodborne removidas** (~11.700 linhas: lançador antigo, patches e mods do
+  Bloodborne, ícones, documentos), a partir da PR #60 do Oussama268. O executável do jogo
+  (`bb-probe.exe`) passa a ter o ícone do SotC.
+- A busca pelo jogo ignora a pasta `WpSystem` do Windows (PR #110, plassardewen-cpu).
+- Página do GitHub só em inglês.
+
 ## 0.60 — 2026-10-20
 Obrigado a **Lucas-blip-png, Einar e KingJhoss**.
 

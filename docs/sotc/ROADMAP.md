@@ -44,7 +44,8 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 | 0.31 | **Publicar v0.60** | ✅ | |
 | 0.32 | PRs #94 (menu no jogo, nosekefik), #110 (pasta WpSystem fora da busca), #121 (docs) | ✅ | #94: o menu do Bloodborne (Insert / F1 / L3+R3) passa a ser do SotC e **ligado por padrão** (`BB_OVERLAY_MENU=0` desliga): FPS, GPU e VRAM, tela cheia, resolução, escala e nitidez, câmera e mouse, efeitos. Conflito resolvido mantendo os textos traduzidos da lista de saves. Testado abrindo o menu no demo (foto): 72,5 FPS, sem falha. |
 | 0.33 | README só em inglês (objetivo da #93) | ✅ | `7e7cc1b`. Problemas conhecidos atualizados (#186, GCN, 60 FPS, geração de quadros). Créditos da comunidade. |
-| 0.34 | #60 (Oussama268): remover sobras do Bloodborne | ⏳ próximo | −12 mil linhas; manter o menu (#94). |
+| 0.34 | #60 (Oussama268): remover sobras do Bloodborne | ✅ | `d6cb6da`, refeito sobre o código atual (a PR era da 0.57): −11.700 linhas. Mantidos o FSR-Vulkan (geração de quadros FSR 3) e o menu da #94. Ícone do SotC no bb-probe.exe. Demo 71,7 / 61,3, sem falhas; testes passam (exceto test_packaged_vulkan, só Linux, que já falhava). |
+| 0.35 | **Publicar v0.60.1** | ✅ | Menu no jogo, limpeza do Bloodborne, README em inglês. |
 
 ## Fase 1 — Estabilidade (quedas e travamentos)
 

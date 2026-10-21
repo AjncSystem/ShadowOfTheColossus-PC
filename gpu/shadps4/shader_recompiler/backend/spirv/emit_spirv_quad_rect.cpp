@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <optional>
 #include <sirit/sirit.h>
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
+#include "shader_recompiler/info.h"
 #include "shader_recompiler/runtime_info.h"
 
 namespace Shader::Backend::SPIRV {
@@ -333,6 +336,150 @@ std::vector<u32> EmitAuxilaryTessShader(AuxShaderType type, const HwFragmentRunt
         break;
     }
     return ctx.Assemble();
+}
+
+namespace {
+
+// sotc: pixel shader inputs as the SPIR-V backend declares them: clip distances (emulated) first.
+u32 NumParams(const HwFragmentRuntimeInfo& fs) {
+    return fs.num_inputs - (fs.clip_distance_emulation ? 1 : 0);
+}
+
+u32 BindLocation(const HwFragmentRuntimeInfo& fs, u32 input) {
+    return fs.inputs[input].param_index + (fs.clip_distance_emulation ? 1 : 0);
+}
+
+} // Anonymous namespace
+
+BarycentricGsLayout MakeBarycentricGsLayout(const HwFragmentRuntimeInfo& fs_runtime,
+                                            const Info& fs_info) {
+    BarycentricGsLayout layout{fs_runtime.clip_distance_emulation ? 1u : 0u, 0};
+    for (u32 i = 0; i < NumParams(fs_runtime); ++i) {
+        if (fs_runtime.inputs[i].IsDefault()) {
+            continue;
+        }
+        layout.base = std::max(layout.base, BindLocation(fs_runtime, i) + 1);
+        if (fs_info.fs_interpolation[i].primary == Qualifier::PerVertex) {
+            layout.per_vertex_mask |= 1u << i;
+        }
+    }
+    return layout;
+}
+
+bool NeedsBarycentricGs(const HwFragmentRuntimeInfo& fs_runtime, const Info& fs_info) {
+    for (u32 attr = u32(IR::Attribute::BaryCoordNoPersp);
+         attr <= u32(IR::Attribute::BaryCoordPullModel); ++attr) {
+        if (fs_info.loads.GetAny(IR::Attribute(attr))) {
+            return true;
+        }
+    }
+    return MakeBarycentricGsLayout(fs_runtime, fs_info).per_vertex_mask != 0;
+}
+
+std::vector<u32> EmitBarycentricGeometryShader(const HwFragmentRuntimeInfo& fs_runtime,
+                                               const Info& fs_info) {
+    const BarycentricGsLayout layout = MakeBarycentricGsLayout(fs_runtime, fs_info);
+    Sirit::Module m{SPIRV_VERSION_1_5};
+    m.AddCapability(spv::Capability::Shader);
+    m.AddCapability(spv::Capability::Geometry);
+    const Id void_id{m.TypeVoid()};
+    const Id float_id{m.TypeFloat(32)};
+    const Id uint_id{m.TypeUInt(32U)};
+    const Id int_id{m.TypeInt(32U, true)};
+    const Id vec3_id{m.TypeVector(float_id, 3)};
+    const Id vec4_id{m.TypeVector(float_id, 4)};
+    const Id vec4_arr3{m.TypeArray(vec4_id, m.Constant(uint_id, 3U))};
+    const Id in_vec4{m.TypePointer(spv::StorageClass::Input, vec4_id)};
+    const Id out_vec4{m.TypePointer(spv::StorageClass::Output, vec4_id)};
+    const auto index = [&](s32 value) { return m.Constant(int_id, value); };
+
+    const Id float_arr{m.TypeArray(float_id, m.Constant(uint_id, 1U))};
+    const Id per_vertex{m.TypeStruct(vec4_id, float_id, float_arr, float_arr)};
+    m.Decorate(per_vertex, spv::Decoration::Block);
+    m.MemberDecorate(per_vertex, 0U, spv::Decoration::BuiltIn, u32(spv::BuiltIn::Position));
+    m.MemberDecorate(per_vertex, 1U, spv::Decoration::BuiltIn, u32(spv::BuiltIn::PointSize));
+    m.MemberDecorate(per_vertex, 2U, spv::Decoration::BuiltIn, u32(spv::BuiltIn::ClipDistance));
+    m.MemberDecorate(per_vertex, 3U, spv::Decoration::BuiltIn, u32(spv::BuiltIn::CullDistance));
+
+    std::vector<Id> interfaces;
+    const auto variable = [&](spv::StorageClass storage, Id type, std::optional<u32> location) {
+        const Id id{m.AddGlobalVariable(m.TypePointer(storage, type), storage)};
+        if (location) {
+            m.Decorate(id, spv::Decoration::Location, *location);
+        }
+        interfaces.push_back(id);
+        return id;
+    };
+    const Id gl_in{variable(spv::StorageClass::Input,
+                            m.TypeArray(per_vertex, m.Constant(uint_id, 3U)), std::nullopt)};
+    const Id gl_out{variable(spv::StorageClass::Output, per_vertex, std::nullopt)};
+
+    // Inputs as the vertex shader writes them; outputs as the pixel shader reads them.
+    struct Param {
+        Id in, out;
+        bool per_vertex;
+    };
+    std::vector<Param> params;
+    if (fs_runtime.clip_distance_emulation) {
+        params.push_back({variable(spv::StorageClass::Input, vec4_arr3, 0U),
+                          variable(spv::StorageClass::Output, vec4_id, 0U), false});
+    }
+    for (u32 i = 0; i < NumParams(fs_runtime); ++i) {
+        if (fs_runtime.inputs[i].IsDefault()) {
+            continue;
+        }
+        const Id in{variable(spv::StorageClass::Input, vec4_arr3, BindLocation(fs_runtime, i))};
+        const auto primary = fs_info.fs_interpolation[i].primary;
+        if (layout.per_vertex_mask & (1u << i)) {
+            const Id out{variable(spv::StorageClass::Output, vec4_arr3, layout.Location(i))};
+            m.Decorate(out, spv::Decoration::Flat);
+            params.push_back({in, out, true});
+            continue;
+        }
+        const Id out{variable(spv::StorageClass::Output, vec4_id, BindLocation(fs_runtime, i))};
+        if (primary != Qualifier::Smooth) { // as the pixel shader decorates it
+            m.Decorate(out, primary == Qualifier::Flat ? spv::Decoration::Flat
+                                                       : spv::Decoration::NoPerspective);
+        }
+        params.push_back({in, out, false});
+    }
+    const Id bary_smooth{variable(spv::StorageClass::Output, vec3_id, layout.Smooth())};
+    const Id bary_nopersp{variable(spv::StorageClass::Output, vec3_id, layout.NoPerspective())};
+    m.Decorate(bary_nopersp, spv::Decoration::NoPerspective);
+
+    const Id main{m.OpFunction(void_id, spv::FunctionControlMask::MaskNone, m.TypeFunction(void_id))};
+    m.AddExecutionMode(main, spv::ExecutionMode::Triangles);
+    m.AddExecutionMode(main, spv::ExecutionMode::OutputTriangleStrip);
+    m.AddExecutionMode(main, spv::ExecutionMode::OutputVertices, 3U);
+    m.AddExecutionMode(main, spv::ExecutionMode::Invocations, 1U);
+    m.AddEntryPoint(spv::ExecutionModel::Geometry, main, "main", interfaces);
+    m.AddLabel(m.OpLabel());
+    const Id zero{m.Constant(float_id, 0.0f)};
+    const Id one{m.Constant(float_id, 1.0f)};
+    for (s32 v = 0; v < 3; ++v) {
+        const Id position{m.OpLoad(vec4_id, m.OpAccessChain(in_vec4, gl_in, index(v), index(0)))};
+        m.OpStore(m.OpAccessChain(out_vec4, gl_out, index(0)), position);
+        for (const Param& param : params) {
+            if (param.per_vertex) {
+                for (s32 k = 0; k < 3; ++k) {
+                    m.OpStore(m.OpAccessChain(out_vec4, param.out, index(k)),
+                              m.OpLoad(vec4_id, m.OpAccessChain(in_vec4, param.in, index(k))));
+                }
+            } else {
+                m.OpStore(param.out,
+                          m.OpLoad(vec4_id, m.OpAccessChain(in_vec4, param.in, index(v))));
+            }
+        }
+        const Id bary{m.ConstantComposite(vec3_id, v == 0 ? one : zero, v == 1 ? one : zero,
+                                          v == 2 ? one : zero)};
+        m.OpStore(bary_smooth, bary);
+        m.OpStore(bary_nopersp, bary);
+        m.OpEmitVertex();
+    }
+    m.OpEndPrimitive();
+    m.OpReturn();
+    m.OpFunctionEnd();
+    return m.Assemble();
 }
 
 } // namespace Shader::Backend::SPIRV

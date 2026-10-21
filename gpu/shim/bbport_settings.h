@@ -18,6 +18,19 @@ inline bool IsFsr4(int upscaler) {
 enum Preset : int { NativeAA = 0, Quality, Balanced, Performance, UltraPerformance, PresetCount };
 enum DebugView : int { DebugNone = 0, DebugReactive = 1, DebugMotion = 2, DebugViewCount };
 
+/// Game effects and cvars (SotC): ini key, menu label, default.
+struct Effect {
+    const char* key;
+    const char* label;
+    bool default_on;
+};
+inline constexpr Effect Effects[] = {
+    {"fx_fog", "Atmospheric Fog", true},
+    {"fx_vignette", "Screen Vignette", true},
+    {"fx_ssao", "Ambient Occlusion (SSAO)", true},
+    {"perf_dma", "Water Reflections (DMA)", true},
+};
+inline constexpr int EffectCount = int(sizeof(Effects) / sizeof(Effects[0]));
 /// Live output resolutions: the upscaler's output and the UI host targets.
 inline constexpr int OutputWidths[] = {1280, 1920, 2560, 3840};
 inline constexpr int OutputHeights[] = {720, 1080, 1440, 2160};
@@ -37,13 +50,22 @@ struct Values {
     std::atomic<float> reactive_max{0.9f};
     std::atomic<int> debug_view{DebugNone};
     std::atomic<bool> show_fps{false};
+    // Camera & Mouse
+    std::atomic<bool> mouse_enabled{true};
+    std::atomic<float> mouse_sens{1.0f};
+    std::atomic<bool> mouse_invert{false};
+    // Window & Display
+    std::atomic<bool> fullscreen{false};
     // FSR 4 checks (menu): the provider's auto exposure, the jitter sign it is given.
     std::atomic<bool> fsr4_auto_exposure{true};
     std::atomic<bool> fsr4_invert_jitter{false};
     std::atomic<int> active_render_width{1920}, active_render_height{1080};
+    /// Applied at start (patches.py); the menu shows when a restart is needed.
+    std::atomic<bool> effects[EffectCount]{};
+    std::atomic<int> model_lod{0}; ///< -2 highest .. 2 lowest, 0 the game's
     std::atomic<int> output_res{OutputDefault}; ///< index into OutputWidths
-    /// Live resolution and preset changes: 0 off by default (startup patch), -1 auto (strong
-    /// discrete GPUs), 1 on. On restart.
+    /// Live resolution and preset changes (run.sh): 0 off by default (startup patch, fastest
+    /// on the Steam Deck and older GPUs), -1 auto (strong discrete GPUs), 1 on. On restart.
     std::atomic<int> live_resolution{0};
     /// Why FSR 4 cannot run (assets, device features), or null. Set by the renderer.
     std::atomic<const char*> fsr4_problem{nullptr};
@@ -56,6 +78,8 @@ struct Values {
     int startup_preset = NativeAA;
     int startup_upscaler = UpscalerFsr3;
     bool startup_object_motion = true;
+    bool startup_effects[EffectCount]{};
+    int startup_model_lod = 0;
     int startup_output_res = OutputDefault;
     int startup_live_resolution = 0;
 };
@@ -68,7 +92,7 @@ void Load();
 void ConfigureUpscalerSupport(bool fsr4, bool fsr411);
 /// After device creation: DLSS availability; a DLSS setting falls back to FSR 3.1 without it.
 void ConfigureDlssSupport(bool available, const char* problem);
-/// BB_RENDER_RES: the scene size was patched at start and cannot change in this session.
+/// Startup-patched scene dimensions cannot change until run.sh prepares a new image.
 bool FixedRenderSession();
 int RenderPreset();
 bool ResolutionNeedsRestart();

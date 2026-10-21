@@ -324,6 +324,16 @@ public:
         }
     }
 
+    /// sotc: GPU-modified pages in the range, from an unlocked look at the bits (statistics only,
+    /// SOTC_RB_NARROW).
+    u64 CountGpuModifiedPages(u64 offset, u64 size) noexcept {
+        u64 pages = 0;
+        IterateWords(GetBounds(offset, size), [&](u64 index, u64 mask) {
+            pages += std::popcount(__atomic_load_n(&gpu[index], __ATOMIC_RELAXED) & mask);
+        });
+        return pages;
+    }
+
     void Lock(const Bounds& bounds) noexcept {
         mutex.lock();
     }

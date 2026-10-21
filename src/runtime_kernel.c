@@ -85,9 +85,22 @@ static ABI uint64_t process_time_counter(void) {
     return (uint64_t)(t.tv_sec-process_start.tv_sec)*1000000000+(uint64_t)(t.tv_nsec-process_start.tv_nsec);
 }
 static ABI uint64_t process_time_frequency(void) { return 1000000000; }
-static ABI uint64_t read_tsc(void) { return __rdtsc(); }
+/* The guest TSC is the host TSC unless the cores disagree on it (probe.c checks at startup);
+ * then it is QPC, and the eboot's own rdtsc instructions are patched to read QPC too. */
+static int tsc_from_qpc;
+void runtime_tsc_use_qpc(void) { tsc_from_qpc=1; }
+static uint64_t host_tsc(void) {
+#ifdef _WIN32
+    if (tsc_from_qpc) return compat_qpc_tsc();
+#endif
+    return __rdtsc();
+}
+static ABI uint64_t read_tsc(void) { return host_tsc(); }
 static uint64_t tsc_hz;
 static ABI uint64_t tsc_frequency(void) {
+#ifdef _WIN32
+    if (tsc_from_qpc) return compat_qpc_tsc_frequency();
+#endif
     if (!tsc_hz) {
         struct timespec a,b,nap={0,20000000};
         clock_gettime(CLOCK_MONOTONIC,&a); uint64_t t0=__rdtsc();
@@ -106,6 +119,7 @@ static ABI uint64_t tsc_frequency(void) {
 uint64_t runtime_process_time_us(void) { return process_time(); }
 uint64_t runtime_process_time_counter(void) { return process_time_counter(); }
 uint64_t runtime_tsc_frequency(void) { return tsc_frequency(); }
+uint64_t runtime_read_tsc(void) { return host_tsc(); }
 static int sleep_ns(uint64_t ns) {
 #ifdef _WIN32
     compat_sleep_ns(ns);

@@ -56,12 +56,28 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.fsr4_auto_exposure = i != 0;
     } else if (key == "fsr4_invert_jitter") {
         v.fsr4_invert_jitter = i != 0;
+    } else if (key == "model_lod") {
+        v.model_lod = std::clamp(i, -2, 2);
     } else if (key == "live_resolution") {
         v.live_resolution = value == "auto" ? -1 : std::clamp(i, 0, 1);
     } else if (key == "output_res") {
         for (int r = 0; r < OutputCount; ++r) {
             if (value == std::to_string(OutputWidths[r]) + "x" + std::to_string(OutputHeights[r])) {
                 v.output_res = r;
+            }
+        }
+    } else if (key == "mouse_enabled" || key == "mouse") {
+        v.mouse_enabled = i != 0;
+    } else if (key == "mouse_sens" || key == "mouse_sensitivity") {
+        v.mouse_sens = Clamp(f, 0.1f, 5.0f);
+    } else if (key == "mouse_invert") {
+        v.mouse_invert = i != 0;
+    } else if (key == "fullscreen") {
+        v.fullscreen = i != 0;
+    } else {
+        for (int e = 0; e < EffectCount; ++e) {
+            if (key == Effects[e].key) {
+                v.effects[e] = i != 0;
             }
         }
     }
@@ -76,6 +92,9 @@ Values& Get() {
 
 void Load() {
     auto& v = Get();
+    for (int e = 0; e < EffectCount; ++e) {
+        v.effects[e] = Effects[e].default_on;
+    }
     if (FILE* file = std::fopen(Path(), "r")) {
         char line[256];
         while (std::fgets(line, sizeof(line), file)) {
@@ -102,6 +121,8 @@ void Load() {
         {"BB_REACTIVE", "reactive"},              {"BB_REACTIVE_SCALE", "reactive_scale"},
         {"BB_REACTIVE_THRESHOLD", "reactive_threshold"}, {"BB_REACTIVE_MAX", "reactive_max"},
         {"BB_UPSCALE_PRESET", "preset"},            {"BB_OBJECT_MOTION", "object_motion"},
+        {"SOTC_MOUSE", "mouse_enabled"},             {"SOTC_MOUSE_SENS", "mouse_sens"},
+        {"SOTC_MOUSE_INVERT", "mouse_invert"},       {"BB_FULLSCREEN", "fullscreen"},
     };
     for (const auto& [env, key] : env_keys) {
         if (const char* value = std::getenv(env)) {
@@ -111,6 +132,10 @@ void Load() {
     v.startup_preset = v.preset;
     v.startup_upscaler = v.upscaler;
     v.startup_object_motion = v.object_motion;
+    for (int e = 0; e < EffectCount; ++e) {
+        v.startup_effects[e] = v.effects[e];
+    }
+    v.startup_model_lod = v.model_lod;
     v.startup_output_res = v.output_res;
     v.startup_live_resolution = v.live_resolution;
 }
@@ -137,7 +162,7 @@ void ConfigureDlssSupport(bool available, const char* problem) {
     v.dlss_problem = available || kept.empty() ? nullptr : kept.c_str();
     if (v.upscaler == UpscalerDlss && !available) {
         std::printf("Upscaler: DLSS unavailable (%s); falling back to FSR 3.1\n",
-                    kept.empty() ? "no DLSS runtime" : kept.c_str());
+                    kept.empty() ? "bbport_dlss.dll or nvngx_dlss.dll missing" : kept.c_str());
         v.upscaler = UpscalerFsr3;
     }
 }
@@ -155,7 +180,7 @@ int RenderPreset() {
 
 bool ResolutionNeedsRestart() {
     const auto& v = Get();
-    // TAA needs the live path (native guest targets).
+    // TAA needs the live path (native guest targets): run.sh selects it on restart.
     return FixedRenderSession() &&
         (v.preset != v.startup_preset || v.output_res != v.startup_output_res ||
          (v.upscaler == UpscalerOff) != (v.startup_upscaler == UpscalerOff) ||
@@ -170,7 +195,7 @@ void Save() {
         return;
     }
     std::fprintf(file,
-                 "# bbport settings\n"
+                 "# bbport settings (in-game menu: Insert / L3+R3)\n"
                  "upscaler=%s\npreset=%d\nsharpen=%d\nsharpness=%.2f\njitter=%d\n"
                  "reactive=%d\nobject_motion=%d\nreactive_scale=%.2f\nreactive_threshold=%.2f\nreactive_max=%.2f\n"
                  "debug_view=%d\nshow_fps=%d\nfsr4_auto_exposure=%d\nfsr4_invert_jitter=%d\n",
@@ -180,8 +205,16 @@ void Save() {
                  v.reactive_scale.load(), v.reactive_threshold.load(), v.reactive_max.load(),
                  v.debug_view.load(), int(v.show_fps.load()),
                  int(v.fsr4_auto_exposure.load()), int(v.fsr4_invert_jitter.load()));
-    std::fprintf(file, "output_res=%dx%d\n", OutputWidths[v.output_res],
-                 OutputHeights[v.output_res]);
+    // Read by patches.py at start.
+    for (int e = 0; e < EffectCount; ++e) {
+        std::fprintf(file, "%s=%d\n", Effects[e].key, int(v.effects[e].load()));
+    }
+    std::fprintf(file, "model_lod=%d\noutput_res=%dx%d\n", v.model_lod.load(),
+                 OutputWidths[v.output_res], OutputHeights[v.output_res]);
+    std::fprintf(file, "mouse=%d\nmouse_sens=%.2f\nmouse_invert=%d\nfullscreen=%d\n",
+                 int(v.mouse_enabled.load()), v.mouse_sens.load(),
+                 int(v.mouse_invert.load()), int(v.fullscreen.load()));
+    // Read by run.sh at start.
     std::fprintf(file, "live_resolution=%s\n", v.live_resolution < 0 ? "auto"
                                                   : v.live_resolution ? "1" : "0");
     std::fclose(file);

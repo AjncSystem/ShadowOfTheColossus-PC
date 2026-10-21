@@ -35,6 +35,8 @@ public:
         return opened;
     }
     void FinishPreload();
+    /// Sets the current cache aside (renamed with ".incompatible") and opens an empty one.
+    void Reset();
 
     bool Save(BlobType type, const std::string& name, std::vector<u8>&& data);
     bool Save(BlobType type, const std::string& name, std::vector<u32>&& data);
@@ -43,6 +45,8 @@ public:
     void Load(BlobType type, const std::string& name, std::vector<u32>& data);
 
     void ForEachBlob(BlobType type, const std::function<void(std::vector<u8>&& data)>& func);
+    /// sotc: how many blobs of a type there are (the loading screen's progress).
+    size_t CountBlobs(BlobType type);
 
 private:
     void Prefetch();

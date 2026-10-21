@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-// bbport: overlay (Dear ImGui) drawn by the presenter into the swapchain image after the game
-// frame, at display resolution: the game's dialogs (save list, text entry) and the FPS counter.
-// While a dialog is shown the game gets no pad/keyboard input.
+// bbport: in-game settings menu (Dear ImGui), drawn by the presenter into the swapchain image
+// after the game frame, at display resolution. Insert (keyboard) or L3+R3 (gamepad) opens it;
+// while it is open the game gets no pad/keyboard input. Settings live in bbport_settings.h.
 
 #pragma once
 
@@ -22,16 +22,20 @@ namespace BbOverlay {
 /// Present thread, once: the ImGui context and its Vulkan backend.
 void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count);
 
-/// Window thread, for every SDL event: true when the save list consumed it.
+/// Window thread, for every SDL event: true when the menu consumed it.
 bool HandleEvent(const SDL_Event& event);
+/// Turns SDL text input on while the menu edits a value (window thread, once per poll).
+void UpdateTextInput(SDL_Window* window);
 
-/// Whether anything is drawn this frame (a game dialog or the FPS counter).
+/// Whether anything is drawn this frame (menu open or FPS counter on).
 bool Visible();
 
-/// Present thread: draws into `view` (layout ColorAttachmentOptimal).
-void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent);
+/// Present thread: draws into `view` (layout ColorAttachmentOptimal). `game_frame` false: a
+/// generated frame (FSR 3), not counted by the FPS readout.
+void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
+            bool game_frame = true);
 
-/// A text entry or the save list is shown: the game's input is held neutral.
+/// The menu is open or a text entry is shown: the game's input is held neutral.
 bool CapturesInput();
 
 /// Window thread: the game's text dialog (sceImeDialog). Shown as a box on screen until
@@ -47,5 +51,10 @@ bool OpenSaveList(const std::string& title, const std::vector<std::string>& item
 /// item. Closes the list when it returns anything but -1.
 int PollSaveList();
 void CloseSaveList();
+/// sotc: pictures (PNG paths, empty: none) for the next OpenSaveList, item by item.
+void SetSaveListIcons(std::vector<std::string> paths);
+/// sotc: true while the game has not shown a frame for a second (boot, long loads): the overlay
+/// draws a loading screen and the video out thread keeps presenting. Any thread.
+bool LoadingShown();
 
 } // namespace BbOverlay

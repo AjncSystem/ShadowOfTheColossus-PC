@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdlib>
+#include <cstring>
 #include <ranges>
 #include <xxhash.h>
 
@@ -332,8 +333,30 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // NVIDIA's shader compiler (seen on 617.14) hits a breakpoint on any OpFDiv in a shader
     // with RoundingModeRTZ for that width, killing the process. Prefer default rounding there.
     const bool rtz_usable = instance.GetDriverID() != vk::DriverId::eNvidiaProprietary;
-    Shader::Optimization::SetWave64UniformBranchesDefault(instance.GetDriverID() ==
-                                                          vk::DriverId::eNvidiaProprietary);
+    // Wave64 uniform branches on every driver. Tested on a Radeon RX 6650 XT (32-wide path):
+    // off, the shadows next to the Wander and Agro on grass get horizontal stripes; on, the
+    // image is right and the characters are not black in the shade (save with 5 colossi).
+    Shader::Optimization::SetWave64UniformBranchesDefault(true);
+    // sotc: SotC interpolates most pixel shader inputs by hand from their three vertex values.
+    // Without fragment shader barycentrics (NVIDIA GTX 10xx: no textures, black geometry, issues
+    // #57/#68/#102) an auxiliary geometry shader provides them (SOTC_BARYCENTRIC_GS=0 turns it
+    // off). SOTC_NO_BARYCENTRIC=1 acts as if the GPU had neither extension, to test that path.
+    const auto env_is = [](const char* name, const char* value) {
+        const char* v = std::getenv(name);
+        return v && std::strcmp(v, value) == 0;
+    };
+    const bool no_barycentric = env_is("SOTC_NO_BARYCENTRIC", "1");
+    const bool khr_barycentric = instance_.IsFragmentShaderBarycentricSupported() && !no_barycentric;
+    const bool amd_explicit_vertex =
+        instance_.IsAmdShaderExplicitVertexParameterSupported() && !no_barycentric;
+    const bool barycentric_via_gs = !khr_barycentric && !amd_explicit_vertex &&
+                                    instance.IsGeometryStageSupported() &&
+                                    instance.GetDriverID() == vk::DriverId::eNvidiaProprietary &&
+                                    !env_is("SOTC_BARYCENTRIC_GS", "0");
+    if (barycentric_via_gs) {
+        LOG_WARNING(Render_Vulkan, "No fragment shader barycentrics: emulated by a geometry shader");
+    }
+    GraphicsPipeline::SerializationSupport::with_gs = barycentric_via_gs;
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),
         .max_viewport_height = instance.GetMaxViewportHeight(),
@@ -375,11 +398,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supports_shared_int64_atomics = instance_.IsSharedInt64AtomicsSupported(),
         .supports_workgroup_explicit_memory_layout =
             instance_.IsWorkgroupMemoryExplicitLayoutSupported(),
-        .supports_amd_shader_explicit_vertex_parameter =
-            instance_.IsAmdShaderExplicitVertexParameterSupported(),
-        .supports_fragment_shader_barycentric = instance_.IsFragmentShaderBarycentricSupported(),
+        .supports_amd_shader_explicit_vertex_parameter = amd_explicit_vertex,
+        .supports_fragment_shader_barycentric = khr_barycentric || barycentric_via_gs,
         .supports_shader_subgroup_clock = instance_.IsShaderSubgroupClockSupported(),
-        .needs_manual_interpolation = instance.IsFragmentShaderBarycentricSupported() &&
+        .needs_manual_interpolation = khr_barycentric &&
                                       instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         // sotc: also whenever the shaders are lowered for fewer than 64 lanes (AMD on the 32-wide
         // path): without the barriers the GPU hung ~2 min into the intro (issue #7).
@@ -390,7 +412,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
+        .barycentric_via_gs = barycentric_via_gs,
     };
+    // sotc: the cache is read by the Presenter once it can draw (Presenter::Presenter), with
+    // the loading screen on meanwhile.
 
     auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
@@ -411,8 +436,6 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
             async_workers.emplace_back([this](std::stop_token token) { AsyncPipelineWorker(token); });
         }
     }
-    // sotc: after the workers start, which build the preloaded pipelines (SOTC_ASYNC_PRELOAD).
-    WarmUp();
 }
 
 PipelineCache::~PipelineCache() = default;
@@ -566,10 +589,26 @@ void PipelineCache::CollectAsyncPipelines() {
         if (it == graphics_pipelines.end()) {
             continue;
         }
-        it.value() = std::move(job->pipeline);
-        if (job->preloaded) {
-            continue; // already in the cache
+        if (it.value()) {
+            // A full-screen pass built it on the command processor meanwhile (that one may be
+            // in use): the worker's copy is dropped.
+            if (!job->preloaded) {
+                RegisterPipelineData(job->key, job->hash, job->sdata);
+                ++num_new_pipelines;
+            }
+            continue;
         }
+        if (job->preloaded) {
+            // Already in the cache. One the driver refused is dropped: the next draw that needs
+            // it compiles it, as when WarmUp builds it itself and it fails.
+            if (job->pipeline->Handle()) {
+                it.value() = std::move(job->pipeline);
+            } else {
+                graphics_pipelines.erase(it);
+            }
+            continue;
+        }
+        it.value() = std::move(job->pipeline);
         RegisterPipelineData(job->key, job->hash, job->sdata);
         ++num_new_pipelines;
     }
@@ -735,10 +774,14 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         return last_graphics_pipeline;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
-    if (!is_new && !it->second) {
-        return nullptr; // sotc: still being built by a pipeline worker (SOTC_ASYNC_SHADERS)
+    // sotc: still being built by a pipeline worker (SOTC_ASYNC_SHADERS, SOTC_ASYNC_PRELOAD). A
+    // full-screen pass is not skipped: it builds the pipeline here, and the worker's copy is
+    // dropped when collected.
+    const bool queued = !is_new && !it->second;
+    if (queued && liverpool->regs.num_indices > 6) {
+        return nullptr;
     }
-    if (is_new) {
+    if (is_new || queued) {
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
         // Full-screen passes (post-processing, composition) are tiny draws: skipping one leaves
@@ -746,10 +789,12 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         // their pipeline is built (a brief pop-in instead of a freeze on first sight).
         const bool tiny_draw = liverpool->regs.num_indices <= 6;
         const bool eligible = AsyncPipelineEligible();
-        if (!async_workers.empty() && !tiny_draw && eligible) {
+        if (!async_workers.empty() && !tiny_draw && eligible && !queued) {
             QueueAsyncPipeline(pipeline_hash);
             return nullptr; // the draws that need it are skipped until it is ready
         }
+        const SotcStats::ScopedTimer stall_timer{SotcStats::pipeline_ns};
+        SotcStats::pipelines_new.fetch_add(1, std::memory_order_relaxed);
         const auto sync_start = std::chrono::steady_clock::now();
 
         const SotcStats::FrameTimer frame_timer{SotcStats::FramePipeline};
@@ -765,8 +810,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                         sync_start, infos[3] ? infos[3]->pgm_hash : 0, // vertex
                         infos[0] ? infos[0]->pgm_hash : 0);              // fragment
 
-        RegisterPipelineData(graphics_key, pipeline_hash, sdata);
-        ++num_new_pipelines;
+        if (!queued) { // a queued one registers when collected (or was preloaded)
+            RegisterPipelineData(graphics_key, pipeline_hash, sdata);
+            ++num_new_pipelines;
+        }
 
         if (EmulatorSettings.IsShaderCollect()) {
             for (auto stage = 0; stage < MaxShaderStages; ++stage) {
@@ -790,6 +837,8 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (is_new) {
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
+        const SotcStats::ScopedTimer stall_timer{SotcStats::pipeline_ns};
+        SotcStats::pipelines_new.fetch_add(1, std::memory_order_relaxed);
 
         const SotcStats::FrameTimer frame_timer{SotcStats::FramePipeline};
         SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
@@ -1076,6 +1125,8 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
         SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
     }
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
+    const SotcStats::ScopedTimer stall_timer{SotcStats::shader_ns};
+    SotcStats::shaders_compiled.fetch_add(1, std::memory_order_relaxed);
 
     auto phase_start = std::chrono::steady_clock::now();
     const auto phase = [&](int i) {

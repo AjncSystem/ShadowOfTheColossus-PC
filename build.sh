@@ -12,9 +12,15 @@ MINGW*|MSYS*)
     for tool in clang cmake ninja pkg-config; do
         command -v "$tool" >/dev/null || { echo "Need $tool from MSYS2 CLANG64 (packaging/windows/README.md)." >&2; exit 1; }
     done
-    if [[ ! -f gpu/third_party/imgui/imgui.h || ! -f gpu/third_party/xbyak/xbyak/xbyak.h ]]; then
+    if [[ ! -f gpu/third_party/fsr-vulkan/CMakeLists.txt || ! -f gpu/third_party/imgui/imgui.h ||
+          ! -f gpu/third_party/xbyak/xbyak/xbyak.h ]]; then
         git submodule update --init --recursive
     fi
+    for patch in gpu/patches/fsr-vulkan/*.patch; do
+        if ! git -C gpu/third_party/fsr-vulkan apply --reverse --check "$PWD/$patch" 2>/dev/null; then
+            git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
+        fi
+    done
     # sotc: llvm-windres, binutils windres fails on build paths with spaces ("Unable to create
     # temp file").
     # sotc: BB_PGO=generate builds an instrumented exe (Clang profile in pgo/, see
@@ -64,10 +70,16 @@ if [[ -z $pgo ]]; then
     if [[ -n $(find pgo -name '*.gcda' -print -quit 2>/dev/null) ]]; then pgo=use; else pgo=off; fi
 fi
 mkdir -p pgo
-# Submodules (git clone --recursive, or: git submodule update --init).
-if [[ ! -f gpu/third_party/imgui/imgui.h ]]; then
+# Submodules (git clone --recursive, or: git submodule update --init) and this port's changes
+# to FSR-Vulkan (gpu/patches/fsr-vulkan), applied to its working tree once.
+if [[ ! -f gpu/third_party/fsr-vulkan/CMakeLists.txt || ! -f gpu/third_party/imgui/imgui.h ]]; then
     git submodule update --init --recursive
 fi
+for patch in gpu/patches/fsr-vulkan/*.patch; do
+    if ! git -C gpu/third_party/fsr-vulkan apply --reverse --check "$PWD/$patch" 2>/dev/null; then
+        git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
+    fi
+done
 cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO="$pgo" \
     -DBB_LTO="${BB_LTO:-ON}" -DBB_PGO_DIR="$PWD/pgo" >/dev/null
 echo "GPU library: PGO $pgo, LTO ${BB_LTO:-ON}"

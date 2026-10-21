@@ -8,6 +8,7 @@
 #include "core/libraries/videoout/video_out.h"
 
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <queue>
 
@@ -111,11 +112,20 @@ private:
     void DrawLastFrame();  // Used when there is no flip request
     void SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
     void PresentThread(std::stop_token token);
+    /// sotc: with DLSS Frame Generation, presenting waits for Streamline's pacing; the frames are
+    /// then presented on a thread of their own so that the vblank clock keeps its rate.
+    bool AsyncPresent();
+    void RunPresentJob(std::function<void()> job, bool droppable = false);
+    void PresentJobThread(std::stop_token token);
 
     std::mutex mutex;
     VideoOutPort main_port{};
     std::jthread present_thread;
     std::queue<Request> requests;
+    std::mutex present_job_mutex;
+    std::condition_variable_any present_job_cv;
+    std::queue<std::function<void()>> present_jobs;
+    std::jthread present_job_thread;
 };
 
 } // namespace Libraries::VideoOut

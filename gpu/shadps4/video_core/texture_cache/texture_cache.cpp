@@ -2,6 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
+#include <cstdio>
+#include <unordered_set>
+#include <stb_image.h>
+#include "common/path_util.h"
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -24,6 +30,7 @@
 
 #include <vk_mem_alloc.h>
 #include "video_core/texture_cache/texture_cache.h"
+#include "video_core/sotc_stats.h"
 #include "video_core/texture_cache/tile_manager.h"
 
 namespace VideoCore {
@@ -89,8 +96,18 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     // Buffer arena residency is never released and competes for the same budget, so start
     // aggressive collection well before the budget is reached (80% left too little room on
     // 8 GB cards and new allocations failed).
-    critical_gc_memory = std::min<u64>(critical_gc_memory, device_local_memory * 6 / 10);
+    // sotc: SOTC_VRAM_GC_PERCENT (default 60, 30-95) moves that point: higher keeps more
+    // textures resident on 8-16 GB cards (#143), lower helps 4-6 GB ones.
+    static const u64 gc_percent = [] {
+        const char* v = std::getenv("SOTC_VRAM_GC_PERCENT");
+        return std::clamp<u64>(v ? std::strtoull(v, nullptr, 10) : 60ull, 30ull, 95ull);
+    }();
+    critical_gc_memory = std::min<u64>(critical_gc_memory, device_local_memory * gc_percent / 100);
     pressure_gc_memory = std::min<u64>(pressure_gc_memory, critical_gc_memory);
+    SotcStats::vram_budget = static_cast<u64>(device_local_memory);
+    LOG_INFO(Render, "Video memory budget {} MB: collection from {} MB, pressure {} MB, critical {} MB",
+             device_local_memory >> 20, trigger_gc_memory >> 20, pressure_gc_memory >> 20,
+             critical_gc_memory >> 20);
 }
 
 TextureCache::~TextureCache() = default;
@@ -797,6 +814,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
     // Create and register a new image
     if (!image_id) {
+        const SotcStats::ScopedTimer stall_timer{SotcStats::image_ns};
+        SotcStats::images_new.fetch_add(1, std::memory_order_relaxed);
         image_id = slot_images.insert(instance, runtime, slot_image_views, info);
         RegisterImage(image_id);
         if (desc.rebase_mip) {
@@ -1051,6 +1070,249 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     runtime.UploadImage(&image, buffer, image_copies);
+    SotcGlyphHook(image);
+}
+
+namespace {
+/// sotc: SOTC_TEX_REPLACE=<dir> holds <hash16>.png files (RGBA, the size of mip 0) that replace the
+/// RGBA8 game textures whose guest bytes hash to that value: the controller glyphs of the
+/// launcher's in-game icon style. Loaded once, with a box-filtered mip chain.
+struct GlyphReplacement {
+    u32 width{}, height{};
+    std::vector<u8> mips; // every level, tightly packed
+    std::vector<u64> offsets;
+};
+
+const std::unordered_map<u64, std::filesystem::path>& GlyphFiles() {
+    static const std::unordered_map<u64, std::filesystem::path> files = [] {
+        std::unordered_map<u64, std::filesystem::path> found;
+        const char* dir = std::getenv("SOTC_TEX_REPLACE");
+        std::error_code ec;
+        if (!dir || !*dir || !std::filesystem::is_directory(dir, ec)) {
+            return found;
+        }
+        for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+            const auto stem = entry.path().stem().string();
+            if (entry.path().extension() == ".png" && stem.size() == 16) {
+                found.emplace(std::strtoull(stem.c_str(), nullptr, 16), entry.path());
+            }
+        }
+        std::fprintf(stderr, "SOTC glyphs: %zu replacement textures from %s\n", found.size(), dir);
+        return found;
+    }();
+    return files;
+}
+
+/// True when every page of [addr, addr + size) is committed and readable now: guest memory the
+/// port has read-protected (page tracking) or not mapped is never hashed here.
+bool GuestReadable(const void* addr, size_t size) {
+#ifdef _WIN32
+    auto p = static_cast<const u8*>(addr);
+    const u8* end = p + size;
+    while (p < end) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) || mbi.Protect == 0) {
+            return false;
+        }
+        p = static_cast<const u8*>(mbi.BaseAddress) + mbi.RegionSize;
+    }
+    return true;
+#else
+    (void)addr;
+    (void)size;
+    return true;
+#endif
+}
+
+
+const GlyphReplacement* LoadGlyph(u64 hash, u32 levels) {
+    static std::unordered_map<u64, std::unique_ptr<GlyphReplacement>> cache;
+    if (const auto it = cache.find(hash); it != cache.end()) {
+        return it->second.get();
+    }
+    auto& slot = cache[hash];
+    const auto& files = GlyphFiles();
+    const auto file = files.find(hash);
+    if (file == files.end()) {
+        return nullptr;
+    }
+    int w = 0, h = 0, n = 0;
+    u8* pixels = stbi_load(file->second.string().c_str(), &w, &h, &n, 4);
+    if (!pixels) {
+        std::fprintf(stderr, "SOTC glyphs: cannot read %s\n", file->second.string().c_str());
+        return nullptr;
+    }
+    auto glyph = std::make_unique<GlyphReplacement>();
+    glyph->width = u32(w);
+    glyph->height = u32(h);
+    std::vector<u8> level(pixels, pixels + size_t(w) * h * 4);
+    stbi_image_free(pixels);
+    u32 lw = u32(w), lh = u32(h);
+    for (u32 m = 0; m < std::max(levels, 1u); ++m) {
+        glyph->offsets.push_back(glyph->mips.size());
+        glyph->mips.insert(glyph->mips.end(), level.begin(), level.end());
+        const u32 nw = std::max(lw / 2, 1u), nh = std::max(lh / 2, 1u);
+        std::vector<u8> next(size_t(nw) * nh * 4);
+        for (u32 y = 0; y < nh; ++y) {
+            for (u32 x = 0; x < nw; ++x) {
+                for (u32 c = 0; c < 4; ++c) {
+                    u32 sum = 0;
+                    for (u32 dy = 0; dy < 2; ++dy) {
+                        for (u32 dx = 0; dx < 2; ++dx) {
+                            const u32 sx = std::min(x * 2 + dx, lw - 1), sy = std::min(y * 2 + dy, lh - 1);
+                            sum += level[(size_t(sy) * lw + sx) * 4 + c];
+                        }
+                    }
+                    next[(size_t(y) * nw + x) * 4 + c] = u8((sum + 2) / 4);
+                }
+            }
+        }
+        level.swap(next);
+        lw = nw;
+        lh = nh;
+    }
+    slot = std::move(glyph);
+    return slot.get();
+}
+const std::unordered_set<u32>& GlyphSizes() {
+    static const std::unordered_set<u32> sizes = [] {
+        std::unordered_set<u32> found;
+        for (const auto& [hash, path] : GlyphFiles()) {
+            int w = 0, h = 0, n = 0;
+            if (stbi_info(path.string().c_str(), &w, &h, &n)) {
+                found.insert(u32(w) << 16 | u32(h));
+            }
+        }
+        return found;
+    }();
+    return sizes;
+}
+} // namespace
+
+void TextureCache::SotcGlyphHook(Image& image) {
+    static const bool dump = [] {
+        const char* v = std::getenv("SOTC_TEX_DUMP");
+        return v && v[0] == '1';
+    }();
+    const bool replace = !GlyphFiles().empty();
+    if (!dump && !replace) {
+        return;
+    }
+    const auto& info = image.info;
+    if (info.props.is_depth || True(image.flags & ImageFlagBits::GpuModified) ||
+        info.size.width < 16 || info.size.height < 16 || info.size.width > 1024 ||
+        info.size.height > 1024 || info.size.depth != 1 || info.guest_size == 0) {
+        return;
+    }
+    const bool rgba8 = info.pixel_format == vk::Format::eR8G8B8A8Srgb ||
+                       info.pixel_format == vk::Format::eR8G8B8A8Unorm;
+    if (!dump && (!rgba8 || !GlyphSizes().contains(info.size.width << 16 | info.size.height))) {
+        return;
+    }
+    const auto* guest = std::bit_cast<const u8*>(info.guest_address);
+    bool readable = GuestReadable(guest, info.guest_size);
+    // sotc: pages the port read-protects (page tracking) are read from their backing instead, so
+    // a glyph uploaded while its page is protected is still recognised (it stayed PlayStation).
+    std::vector<u8> backing;
+    if (!readable && info.guest_size <= 4_MB) {
+        backing.resize(info.guest_size);
+        readable = Core::Memory::Instance()->TryReadBacking(info.guest_address, backing.data(),
+                                                            info.guest_size);
+        if (readable) {
+            guest = backing.data();
+        }
+    }
+    const u64 hash = readable ? XXH3_64bits(guest, info.guest_size) : 0;
+    // sotc: SOTC_GLYPH_LOG=1 prints each distinct RGBA8 glyph-sized texture the hook sees.
+    static const bool glyph_log = std::getenv("SOTC_GLYPH_LOG") != nullptr;
+    if (glyph_log && rgba8) {
+        static std::unordered_set<u64> logged;
+        const u64 key = readable ? hash : (info.guest_address ^ 0xdead);
+        if (logged.size() < 64 && logged.insert(key).second) {
+            std::fprintf(stderr, "SOTC GLYPH %016llx %ux%u mips %u guest_size %llu readable %d known %d\n",
+                         static_cast<unsigned long long>(hash), info.size.width, info.size.height,
+                         info.resources.levels, static_cast<unsigned long long>(info.guest_size),
+                         readable ? 1 : 0, GlyphFiles().contains(hash) ? 1 : 0);
+        }
+    }
+    if (!readable) {
+        return;
+    }
+    if (replace && rgba8 && info.resources.layers == 1) {
+        const GlyphReplacement* glyph = LoadGlyph(hash, info.resources.levels);
+        if (glyph && glyph->width == info.size.width && glyph->height == info.size.height) {
+            const auto upload =
+                runtime.GetStagingPool().Request(glyph->mips.size(), MemoryType::HostUncached, 16);
+            std::memcpy(upload.mapped, glyph->mips.data(), glyph->mips.size());
+            upload.Flush();
+            boost::container::small_vector<vk::BufferImageCopy, 14> copies;
+            for (u32 m = 0; m < info.resources.levels && m < glyph->offsets.size(); ++m) {
+                copies.push_back({
+                    .bufferOffset = upload.offset + glyph->offsets[m],
+                    .bufferRowLength = 0,
+                    .bufferImageHeight = 0,
+                    .imageSubresource{
+                        .aspectMask = vk::ImageAspectFlagBits::eColor,
+                        .mipLevel = m,
+                        .baseArrayLayer = 0,
+                        .layerCount = 1,
+                    },
+                    .imageOffset = {0, 0, 0},
+                    .imageExtent = {std::max(glyph->width >> m, 1u), std::max(glyph->height >> m, 1u), 1},
+                });
+            }
+            runtime.UploadImage(&image, upload.buffer, copies);
+            return;
+        }
+    }
+    if (!dump) {
+        return;
+    }
+    static std::unordered_set<u64> seen;
+    static u32 count = 0;
+    if (count >= 6000 || !seen.insert(hash).second) {
+        return;
+    }
+    ++count;
+    static const std::filesystem::path dir = [] {
+        auto d = Common::FS::GetUserPath(Common::FS::PathType::LogDir).parent_path() / "texdump";
+        std::filesystem::create_directories(d);
+        return d;
+    }();
+    const bool is_block = info.props.is_block;
+    const u32 w = info.size.width, h = info.size.height;
+    const u32 bw = is_block ? (w + 3) / 4 : w, bh = is_block ? (h + 3) / 4 : h;
+    const u32 bytes = bw * bh * std::max(1u, info.num_bits / 8);
+    if (bytes == 0 || bytes > 16_MB) {
+        return;
+    }
+    const auto download = runtime.GetStagingPool().Request(bytes, MemoryType::HostCached, 16, true);
+    const vk::BufferImageCopy copy = {
+        .bufferOffset = download.offset,
+        .bufferRowLength = 0,
+        .bufferImageHeight = 0,
+        .imageSubresource{
+            .aspectMask = vk::ImageAspectFlagBits::eColor,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+        .imageOffset = {0, 0, 0},
+        .imageExtent = {w, h, 1},
+    };
+    runtime.DownloadImage(&image, download.buffer, std::span{&copy, 1});
+    const auto name = (dir / fmt::format("{:016x}_{}x{}_m{}_{}.raw", hash, w, h, info.resources.levels,
+                                         vk::to_string(info.pixel_format)))
+                          .string();
+    scheduler.DeferPriorityOperation([this, download, bytes, name] {
+        download.Invalidate();
+        if (auto* f = std::fopen(name.c_str(), "wb")) {
+            std::fwrite(download.mapped, 1, bytes, f);
+            std::fclose(f);
+        }
+        runtime.GetStagingPool().FreeDeferred(download);
+    });
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
@@ -1109,6 +1371,8 @@ void TextureCache::RegisterImage(ImageId image_id) {
     ++image_set_generation;
     ++addr_gens[AddrGenSlot(image.info.guest_address)]; // sotc: FindMemo per-address gen
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
+    SotcStats::cached_images.fetch_add(1, std::memory_order_relaxed);
+    SotcStats::cached_image_bytes.fetch_add(Common::AlignUp(image.info.guest_size, 1024), std::memory_order_relaxed);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
     ForEachPage(image.info.guest_address, image.info.guest_size,
                 [this, image_id](u64 page) {
@@ -1127,6 +1391,8 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ++addr_gens[AddrGenSlot(image.info.guest_address)]; // sotc: FindMemo per-address gen
     lru_cache.Free(image.lru_id);
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
+    SotcStats::cached_images.fetch_sub(1, std::memory_order_relaxed);
+    SotcStats::cached_image_bytes.fetch_sub(Common::AlignUp(image.info.guest_size, 1024), std::memory_order_relaxed);
     ForEachPage(image.info.guest_address, image.info.guest_size, [this, image_id](u64 page) {
         const auto page_it = page_table.find(page);
         if (page_it == nullptr) {
@@ -1333,6 +1599,7 @@ void TextureCache::GarbageCollectImages() {
         SotcStats::vma_block_bytes.store(vma_blocks, std::memory_order_relaxed);
         SotcStats::vma_allocation_bytes.store(vma_allocations, std::memory_order_relaxed);
     }
+    SotcStats::vram_used.store(total_used_memory, std::memory_order_relaxed);
     if (total_used_memory < trigger_gc_memory) {
         return;
     }
@@ -1372,6 +1639,7 @@ void TextureCache::GarbageCollectImages() {
         }
         if (download) {
             DownloadImageMemory(image_id);
+            SotcStats::gc_downloads.fetch_add(1, std::memory_order_relaxed);
         }
         FreeImage(image_id);
         SotcStats::gc_freed.fetch_add(1, std::memory_order_relaxed);
@@ -1447,7 +1715,9 @@ void TextureCache::GarbageCollectSamplers() {
 // reachable mips would save), and the bytes of images used in the last NumFramesBeforeRemoval
 // ticks (the live working set). Recomputed from the live images, telemetry only.
 void TextureCache::Census() {
-    static const bool enabled = std::getenv("SOTC_FPS") != nullptr;
+    // sotc: SOTC_CENSUS=1 only. It walks every cached image under the texture cache lock, a
+    // 116 ms frame every 5 s on a Radeon RX 6650 XT in the shrine, which skewed SOTC_FPS runs.
+    static const bool enabled = std::getenv("SOTC_CENSUS") != nullptr;
     static std::chrono::steady_clock::time_point last{};
     const auto now = std::chrono::steady_clock::now();
     if (!enabled || now - last < std::chrono::seconds{5}) {
@@ -1697,6 +1967,7 @@ void TextureCache::MarkWritten(Image& image) {
 void TextureCache::RunGarbageCollector() {
     SCOPE_EXIT {
         ++gc_tick;
+        SotcStats::gc_ticks.fetch_add(1, std::memory_order_relaxed);
     };
 
     if (const u32 pending = pending_emergency.exchange(0, std::memory_order_relaxed)) {

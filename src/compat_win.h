@@ -72,6 +72,13 @@ int compat_remove_tree(const char *path);
 int compat_errno_from_win32(unsigned long error);
 /* User and kernel CPU time of the process (who=0) or calling thread (who=1), microseconds. */
 int compat_cpu_times(int who, int64_t *user_us, int64_t *kernel_us);
+/* 1 when the TSC runs backwards between two cores (some Ryzen systems under Hyper-V/VBS),
+ * 0 when the cores agree, -1 when it could not be measured. Also gives the core furthest from
+ * the first one and its offset. Takes about 15 ms; call before other threads start. */
+int compat_tsc_skew(unsigned *worst_core, double *worst_us);
+/* A TSC replacement that agrees across cores: QPC scaled to about 1 GHz, and its frequency. */
+uint64_t compat_qpc_tsc(void);
+uint64_t compat_qpc_tsc_frequency(void);
 /* setjmp/longjmp without SEH unwinding (guest frames have no unwind data) that saves every
  * Win64 callee-saved register, xmm6-15 included. clang's __builtin_longjmp restores a wrong
  * frame pointer on Win64. bb_longjmp may also be entered from the exception handler. */

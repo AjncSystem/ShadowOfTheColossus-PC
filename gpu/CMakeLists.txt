@@ -95,6 +95,17 @@ find_program(GLSLANG_COMPILER NAMES glslang glslangValidator REQUIRED)
 set(SIRIT_USE_SYSTEM_SPIRV_HEADERS OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/sirit EXCLUDE_FROM_ALL)
 
+# bbport: FSR 3.1 temporal upscaling / frame generation, native Vulkan (MIT, FireBurn/FSR-Vulkan).
+# sotc: one add_subdirectory for the upscaler and the frame generation (vk_fsrfg.cpp) below.
+set(FFX_VK_PORTABLE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(FFX_VK_PORTABLE_BUILD_PROBE OFF CACHE BOOL "" FORCE)
+set(FFX_VK_PORTABLE_BUILD_FSR3_HOST OFF CACHE BOOL "" FORCE)
+set(FFX_VK_PORTABLE_BUILD_FSR3_VK_BACKEND OFF CACHE BOOL "" FORCE)
+set(FFX_VK_PORTABLE_BUILD_FSR3_3_1_5_SCAFFOLD ON CACHE BOOL "" FORCE)
+set(FFX_VK_PORTABLE_BUILD_FSR4_V07_VULKAN OFF CACHE BOOL "" FORCE)
+set(FFX_VK_PORTABLE_INSTALL OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/fsr-vulkan EXCLUDE_FROM_ALL)
+
 # Host shaders -> headers (same scheme as shadPS4's host_shaders/CMakeLists.txt).
 set(SHADER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/shadps4/video_core/host_shaders)
 set(SHADER_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/include)
@@ -120,6 +131,8 @@ add_host_shader(fs_tri.vert fs_tri_vert)
 add_host_shader(fsr.comp fsr_easu_comp SAMPLE_EASU=1)
 add_host_shader(fsr.comp fsr_rcas_comp SAMPLE_RCAS=1)
 add_host_shader(post_process.frag post_process_frag)
+add_host_shader(shadow_scroll.frag shadow_scroll_frag)
+add_host_shader(fg_depth.comp fg_depth_comp)
 foreach(BPP IN ITEMS 8 16 32 64 96 128)
     add_host_shader(tiling.comp tiling_micro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=0)
     add_host_shader(tiling.comp tiling_macro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=1)
@@ -151,8 +164,8 @@ add_library(bbgpu ${BBGPU_KIND} ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOU
     shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}
     shadps4/core/libraries/videodec/video_utils.cpp)
 add_dependencies(bbgpu host_shaders)
-# Overlay for the game's dialogs (save list, text entry) and the FPS counter: Dear ImGui
-# (third_party/imgui, MIT) with its Vulkan backend, and an embedded font (third_party/fonts).
+# In-game settings menu: Dear ImGui (third_party/imgui, MIT) with its Vulkan backend, and an
+# embedded Cyrillic font (third_party/fonts).
 target_sources(bbgpu PRIVATE third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
     third_party/imgui/imgui_tables.cpp third_party/imgui/imgui_widgets.cpp
     third_party/imgui/backends/imgui_impl_vulkan.cpp)
@@ -162,6 +175,86 @@ target_compile_definitions(bbgpu PRIVATE IMGUI_IMPL_VULKAN_NO_PROTOTYPES
 set_source_files_properties(shim/bbport_overlay.cpp PROPERTIES
     OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fonts/DejaVuSans.ttf)
 target_include_directories(bbgpu PRIVATE third_party/stb)
+# DLSS Frame Generation (vk_dlssg.cpp): NVIDIA Streamline SDK headers (MIT); the DLLs are
+# loaded at run time from the executable's folder.
+target_include_directories(bbgpu PRIVATE third_party/streamline/include)
+# AMD FSR 3 frame generation (vk_fsrfg.cpp): the FidelityFX SDK 2.3 frame interpolation and
+# optical flow, natively on Vulkan (third_party/fsr-vulkan, MIT); any GPU with Vulkan 1.3.
+# (fsr-vulkan is added once above, with the frame generation options.)
+target_link_libraries(bbgpu PRIVATE ffx-vulkan::fsr3-vk-framegeneration-3.1.6)
+# The module's 3.1.6 frame generation never starts a frame on its bridge: the constant buffers
+# and descriptor sets of every dispatch are then kept until the context is destroyed (~3 MB of
+# video memory per frame, out of memory within a minute). Its source is built from a copy that
+# starts a bridge frame in RecordPrepare and retires the bridge frames in RetireFrame.
+set(FSR_FG_SRC ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fsr-vulkan/src/ffx_vk_fsr3_3_1_6_framegen.cpp)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${FSR_FG_SRC})
+file(READ ${FSR_FG_SRC} fsr_fg_source)
+string(REPLACE "\r\n" "\n" fsr_fg_source "${fsr_fg_source}")
+set(fsr_fg_patched "${fsr_fg_source}")
+string(REPLACE "    context->frameId = info->frameId;\n"
+    "    context->frameId = info->frameId;\n    ffxVkFsr3_3_1_5BridgeBeginFrame(context->bridge, info->frameId); /* sotc */\n"
+    fsr_fg_patched "${fsr_fg_patched}")
+string(REPLACE [=[
+    return FFX_VK_FSR3_3_1_6_FRAMEGEN_OK;
+}
+
+extern "C" void ffxVkFsr3_3_1_6FrameGenerationContextDestroy(]=] [=[
+    ffxVkFsr3_3_1_5BridgeRetireFrame(context->bridge, completedFrameId); /* sotc */
+    return FFX_VK_FSR3_3_1_6_FRAMEGEN_OK;
+}
+
+extern "C" void ffxVkFsr3_3_1_6FrameGenerationContextDestroy(]=]
+    fsr_fg_patched "${fsr_fg_patched}")
+# Frame generation without the HUD (vk_fsrfg.cpp sets sotc_fsrfg_hudless before RecordPrepare):
+# the HUD-less frame feeds the optical flow and is the interpolation source; FSR 3 then keeps the
+# real frame's pixels where the two differ (the HUD).
+string(REPLACE "#include <vector>\n"
+    "#include <vector>\n/* sotc */ extern \"C\" { FfxVkFsr3_3_1_6FrameGenerationImage sotc_fsrfg_hudless{}; }\nstatic FfxApiResource sotc_hudless_resource{};\n"
+    fsr_fg_patched "${fsr_fg_patched}")
+string(REPLACE [=[
+    flow.color = context->color;
+]=] [=[
+    flow.color = context->color;
+    sotc_hudless_resource = {}; /* sotc */
+    if (sotc_fsrfg_hudless.image != VK_NULL_HANDLE) {
+        const FfxVkFsr3_3_1_5Resource hudless =
+            import_frame_image(context->bridge, sotc_fsrfg_hudless, false);
+        sotc_hudless_resource = ffxVkFsr3_3_1_5BridgeResolveResource(context->bridge, hudless);
+        if (sotc_hudless_resource.resource) {
+            context->pendingImports.push_back(hudless);
+            flow.color = sotc_hudless_resource;
+        } else {
+            ffxVkFsr3_3_1_5BridgeReleaseImportedImage(context->bridge, hudless);
+        }
+    }
+]=] fsr_fg_patched "${fsr_fg_patched}")
+string(REPLACE [=[
+    dispatch.currentBackBuffer = context->color;
+]=] [=[
+    dispatch.currentBackBuffer = context->color;
+    dispatch.currentBackBuffer_HUDLess = sotc_hudless_resource; /* sotc */
+]=] fsr_fg_patched "${fsr_fg_patched}")
+string(REGEX MATCHALL "/\\* sotc \\*/" fsr_fg_marks "${fsr_fg_patched}")
+list(LENGTH fsr_fg_marks fsr_fg_mark_count)
+if (NOT fsr_fg_mark_count EQUAL 5)
+    message(FATAL_ERROR "fsr-vulkan changed: update the frame generation fix in gpu/CMakeLists.txt")
+endif()
+set(FSR_FG_PATCHED ${CMAKE_CURRENT_BINARY_DIR}/sotc_fsr3_framegen.cpp)
+if (EXISTS ${FSR_FG_PATCHED})
+    file(READ ${FSR_FG_PATCHED} fsr_fg_existing)
+endif()
+if (NOT "${fsr_fg_existing}" STREQUAL "${fsr_fg_patched}")
+    file(WRITE ${FSR_FG_PATCHED} "${fsr_fg_patched}")
+endif()
+get_target_property(fsr_fg_sources ffx_vulkan_fsr3_vk_framegeneration_3_1_6 SOURCES)
+list(LENGTH fsr_fg_sources fsr_fg_count)
+list(REMOVE_ITEM fsr_fg_sources src/ffx_vk_fsr3_3_1_6_framegen.cpp)
+list(LENGTH fsr_fg_sources fsr_fg_count_after)
+if (fsr_fg_count EQUAL fsr_fg_count_after)
+    message(FATAL_ERROR "fsr-vulkan: ffx_vk_fsr3_3_1_6_framegen.cpp not in its target")
+endif()
+list(APPEND fsr_fg_sources ${FSR_FG_PATCHED})
+set_property(TARGET ffx_vulkan_fsr3_vk_framegeneration_3_1_6 PROPERTY SOURCES ${fsr_fg_sources})
 target_include_directories(bbgpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include)
 target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
 target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
@@ -236,6 +329,11 @@ target_include_directories(camera-motion-test PRIVATE shim shadps4 ${SHADER_INCL
 target_compile_options(camera-motion-test PRIVATE -UNDEBUG -fPIC)
 target_link_libraries(camera-motion-test PRIVATE bbgpu)
 add_dependencies(camera-motion-test host_shaders)
+
+add_executable(barycentric-gs-test EXCLUDE_FROM_ALL ../tests/test_barycentric_gs.cpp ../tests/test_gpu_runtime_stubs.cpp)
+target_include_directories(barycentric-gs-test PRIVATE shim shadps4 third_party/gcn/include)
+target_compile_options(barycentric-gs-test PRIVATE -UNDEBUG -fPIC)
+target_link_libraries(barycentric-gs-test PRIVATE bbgpu)
 
 add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_support.cpp
     shim/bbport_settings.cpp)

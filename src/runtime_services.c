@@ -57,7 +57,7 @@ static ABI int32_t user_list(int32_t *ids) {
 }
 static ABI int32_t user_name(int32_t id,char *name,uint64_t size) {
     if (id!=USER_ID || !name) return USER_INVALID_ARGUMENT;
-    const char *value=getenv("BB_USER_NAME") ? getenv("BB_USER_NAME") : "Wander";
+    const char *value=getenv("BB_USER_NAME") ? getenv("BB_USER_NAME") : "Hunter";
     if (strlen(value)+1>size) return (int32_t)0x8096000a; /* BUFFER_TOO_SHORT */
     strcpy(name,value); return 0;
 }
@@ -187,7 +187,8 @@ typedef struct { const char *name; int initialized, status; } Dialog;
 static Dialog dialogs[]={{"CommonDialog",0,0},{"MsgDialog",0,0},{"SaveDataDialog",0,0},
                          {"NpProfileDialog",0,0},{"NpCommerceDialog",0,0},{"ImeDialog",0,0},
                          {"ErrorDialog",0,0}};
-static ABI int32_t common_init(void) { return 0; }
+static int common_initialized __attribute__((unused));
+static ABI int32_t common_init(void) { common_initialized=1; return 0; }
 static int32_t dialog_init(int i) {
     if (dialogs[i].initialized) return (int32_t)0x80B80004;
     dialogs[i].initialized=1; dialogs[i].status=1; return 0;
@@ -230,13 +231,17 @@ int runtime_savedata_last_check(const char *dir, unsigned *seq);
 int runtime_savedata_restored(const char *dir);
 int runtime_savedata_quarantine(int32_t user, const char *dir, char *out, size_t size);
 /* Shows save_dialog's items (the new save first when saving); `selected` < 0: by focusPos. */
+int runtime_savedata_icon(int32_t user, const char *dir, char *out, size_t size);
 static int save_list_show(int selected, uint32_t focus, const char *focus_dir) {
     static char lines[SAVE_LIST_MAX+1][400];
+    static char icons[SAVE_LIST_MAX+1][720];
     const char *line_ptrs[SAVE_LIST_MAX+1];
+    const char *icon_ptrs[SAVE_LIST_MAX+1];
     int n=0, latest=-1, oldest=-1, named=-1;
     int64_t latest_time=INT64_MIN, oldest_time=INT64_MAX;
     if (save_dialog.has_new) {
         snprintf(lines[n],sizeof(lines[n]),"%s","+  Nova grava\xc3\xa7\xc3\xa3o");
+        icon_ptrs[n]=NULL;
         line_ptrs[n]=lines[n]; ++n;
     }
     save_dialog.shown=0;
@@ -250,6 +255,9 @@ static int save_list_show(int selected, uint32_t focus, const char *focus_dir) {
         if (when>latest_time) { latest_time=when; latest=n; }
         if (when<oldest_time) { oldest_time=when; oldest=n; }
         if (focus_dir && !strncmp(focus_dir,save_dialog.names[i],32)) named=n;
+        /* sotc: the save's picture next to its name, as in the PS4 list. */
+        icon_ptrs[n]=runtime_savedata_icon(save_dialog.user,save_dialog.names[i],icons[n],sizeof(icons[n]))
+                     ? NULL : icons[n];
         line_ptrs[n]=lines[n]; ++n;
     }
     const int first_data=save_dialog.has_new ? 1 : 0;
@@ -266,6 +274,7 @@ static int save_list_show(int selected, uint32_t focus, const char *focus_dir) {
     }
     const char *title=save_dialog.disp==1 ? "Gravar jogo  /  Save game"
                       : save_dialog.disp==2 ? "Carregar jogo  /  Load game" : "Apagar  /  Delete";
+    bbgpu_save_list_icons(icon_ptrs,n);
     return n && bbgpu_save_list_open(title,line_ptrs,n,selected,first_data);
 }
 /* sotc: SaveDataDialog messages (every mode but the list). What Shadow of the Colossus opens
@@ -608,10 +617,10 @@ static ABI int32_t ime_init(const ImeParam *param, const void *extended) {
     utf16_to_utf8(param->title,128,prompt,sizeof(prompt));
     const char *preset=getenv("BB_IME_TEXT");
     if (preset) { ime_complete(0,preset); return 0; }
-    /* An empty field starts with the player name (launcher) or "Wander": a controller alone
+    /* An empty field starts with the player name (launcher) or "Hunter": a controller alone
      * can accept it (the port has no on-screen keyboard). */
     const char *name=getenv("BB_USER_NAME");
-    const char *start=initial[0] ? initial : name && *name ? name : "Wander";
+    const char *start=initial[0] ? initial : name && *name ? name : "Hunter";
     if (!bbgpu_text_input_begin(start,prompt[0] ? prompt : "Text")) ime_complete(0,start);
     else printf("Runtime: ImeDialog opened: shown on screen; keyboard Enter or Cross accepts, Esc or Circle cancels\n");
     return 0;

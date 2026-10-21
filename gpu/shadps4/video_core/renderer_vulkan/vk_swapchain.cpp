@@ -8,6 +8,7 @@
 #include "core/emulator_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
+#include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 
@@ -217,6 +218,11 @@ void Swapchain::FindPresentMode() {
         LOG_WARNING(Render, "Requested present mode {} is not supported, falling back to {}.",
                     vk::to_string(present_mode), vk::to_string(fallback));
         present_mode = fallback;
+    }
+    // sotc: DLSS Frame Generation on Vulkan needs vsync off (Streamline paces the frames).
+    if (Dlssg::WantsImmediatePresent() &&
+        std::ranges::find(modes, vk::PresentModeKHR::eImmediate) != modes.cend()) {
+        present_mode = vk::PresentModeKHR::eImmediate;
     }
 }
 

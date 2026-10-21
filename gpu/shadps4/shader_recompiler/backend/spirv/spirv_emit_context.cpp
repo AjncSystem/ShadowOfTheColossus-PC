@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/div_ceil.h"
+#include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/ir/attribute.h"
@@ -360,6 +361,26 @@ void EmitContext::DefineInputs() {
         break;
     }
     case SwStage::Fragment: {
+        // sotc: Profile::barycentric_via_gs: the barycentrics and per-vertex inputs come from the
+        // auxiliary geometry shader as plain inputs (EmitBarycentricGeometryShader).
+        const auto gs_layout = MakeBarycentricGsLayout(runtime_info.hw.fs, info);
+        std::array<Id, 2> gs_bary{};
+        const auto define_bary = [&](bool nopersp) -> Id {
+            if (!profile.barycentric_via_gs) {
+                return DefineVariable(F32[3],
+                                      nopersp ? spv::BuiltIn::BaryCoordNoPerspKHR
+                                              : spv::BuiltIn::BaryCoordKHR,
+                                      spv::StorageClass::Input);
+            }
+            Id& id = gs_bary[nopersp ? 1 : 0];
+            if (!ValidId(id)) {
+                id = DefineInput(F32[3], nopersp ? gs_layout.NoPerspective() : gs_layout.Smooth());
+                if (nopersp) {
+                    Decorate(id, spv::Decoration::NoPerspective);
+                }
+            }
+            return id;
+        };
         if (info.loads.GetAny(IR::Attribute::FragCoord) ||
             (info.loads.GetAny(IR::Attribute::BaryCoordPullModel) &&
              !profile.supports_amd_shader_explicit_vertex_parameter)) {
@@ -391,7 +412,7 @@ void EmitContext::DefineInputs() {
                                                    spv::StorageClass::Input);
             } else if (profile.supports_fragment_shader_barycentric && !ValidId(bary_coord)) {
                 bary_coord =
-                    DefineVariable(F32[3], spv::BuiltIn::BaryCoordKHR, spv::StorageClass::Input);
+                    define_bary(false);
             }
         }
         if (info.loads.GetAny(IR::Attribute::BaryCoordPullModel)) {
@@ -400,7 +421,7 @@ void EmitContext::DefineInputs() {
                                                        spv::StorageClass::Input);
             } else if (profile.supports_fragment_shader_barycentric && !ValidId(bary_coord)) {
                 bary_coord =
-                    DefineVariable(F32[3], spv::BuiltIn::BaryCoordKHR, spv::StorageClass::Input);
+                    define_bary(false);
             }
         }
         if (info.loads.GetAny(IR::Attribute::BaryCoordSmoothCentroid)) {
@@ -409,7 +430,7 @@ void EmitContext::DefineInputs() {
                     F32[2], spv::BuiltIn::BaryCoordSmoothCentroidAMD, spv::StorageClass::Input);
             } else if (profile.supports_fragment_shader_barycentric && !ValidId(bary_coord)) {
                 bary_coord =
-                    DefineVariable(F32[3], spv::BuiltIn::BaryCoordKHR, spv::StorageClass::Input);
+                    define_bary(false);
             }
         }
         if (info.loads.GetAny(IR::Attribute::BaryCoordSmoothSample)) {
@@ -418,8 +439,7 @@ void EmitContext::DefineInputs() {
                     F32[2], spv::BuiltIn::BaryCoordSmoothSampleAMD, spv::StorageClass::Input);
             } else if (profile.supports_fragment_shader_barycentric) {
                 if (!ValidId(bary_coord)) {
-                    bary_coord = DefineVariable(F32[3], spv::BuiltIn::BaryCoordKHR,
-                                                spv::StorageClass::Input);
+                    bary_coord = define_bary(false);
                 }
                 // we would need sample_index to interpolate the bary_coord later
                 if (!ValidId(sample_index)) {
@@ -434,8 +454,7 @@ void EmitContext::DefineInputs() {
                 bary_coord_nopersp = DefineVariable(F32[2], spv::BuiltIn::BaryCoordNoPerspAMD,
                                                     spv::StorageClass::Input);
             } else if (profile.supports_fragment_shader_barycentric) {
-                bary_coord_nopersp = DefineVariable(F32[3], spv::BuiltIn::BaryCoordNoPerspKHR,
-                                                    spv::StorageClass::Input);
+                bary_coord_nopersp = define_bary(true);
             }
         }
         if (info.loads.GetAny(IR::Attribute::BaryCoordNoPerspSample)) {
@@ -443,8 +462,7 @@ void EmitContext::DefineInputs() {
                 bary_coord_nopersp_sample = DefineVariable(
                     F32[2], spv::BuiltIn::BaryCoordNoPerspSampleAMD, spv::StorageClass::Input);
             } else if (profile.supports_fragment_shader_barycentric) {
-                bary_coord_nopersp_sample = DefineVariable(
-                    F32[3], spv::BuiltIn::BaryCoordNoPerspKHR, spv::StorageClass::Input);
+                bary_coord_nopersp_sample = define_bary(true);
                 // Decorate(bary_coord_nopersp_sample, spv::Decoration::Sample);
             }
         }
@@ -459,19 +477,24 @@ void EmitContext::DefineInputs() {
                 continue;
             }
             const IR::Attribute param = IR::Attribute::Param0 + i;
-            const u32 num_components = info.loads.NumComponents(param);
             const auto [primary, auxiliary] = info.fs_interpolation[i];
+            // sotc: the geometry shader writes the three vertex values as vec4s.
+            const bool gs_per_vertex = primary == Qualifier::PerVertex && profile.barycentric_via_gs;
+            const u32 num_components = gs_per_vertex ? 4 : info.loads.NumComponents(param);
             const Id type = F32[num_components];
             const Id attr_id = [&] {
                 const auto bind_location = input.param_index + (has_clip_distance_inputs ? 1 : 0);
                 if (primary == Qualifier::PerVertex &&
                     profile.supports_fragment_shader_barycentric) {
-                    return Name(DefineInput(TypeArray(type, ConstU32(3U)), bind_location),
+                    return Name(DefineInput(TypeArray(type, ConstU32(3U)),
+                                            gs_per_vertex ? gs_layout.Location(i) : bind_location),
                                 fmt::format("fs_in_attr{}_p", i));
                 }
                 return Name(DefineInput(type, bind_location), fmt::format("fs_in_attr{}", i));
             }();
-            if (primary == Qualifier::PerVertex) {
+            if (gs_per_vertex) {
+                Decorate(attr_id, spv::Decoration::Flat);
+            } else if (primary == Qualifier::PerVertex) {
                 Decorate(attr_id, profile.supports_amd_shader_explicit_vertex_parameter
                                       ? spv::Decoration::ExplicitInterpAMD
                                       : spv::Decoration::PerVertexKHR);

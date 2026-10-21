@@ -101,6 +101,62 @@ static void *allocate_image(size_t size) {
     return p;
 }
 #endif
+#ifdef _WIN32
+/* sotc: SOTC_HEAP_WATCH=1 (#146): every 5 s, the engine's heaps (the table at image+0x2dfaab0,
+ * indexed by heap id) with their 64 KiB page bitmaps (set bit = free page: +0x50 bitmap, +0x58
+ * words, +0x60 pages; +0x30 bytes in use). The ending crashed when one bitmap had no free page
+ * left (guest offset 0x1a371). Reads go through ReadProcessMemory, so a wrong guess is harmless. */
+static unsigned char *heap_watch_image;
+static int heap_read(uint64_t address, void *out, size_t size) {
+    SIZE_T done=0;
+    return ReadProcessMemory(GetCurrentProcess(),(const void *)(uintptr_t)address,out,size,&done) && done==size;
+}
+static DWORD WINAPI heap_watch(void *unused) {
+    (void)unused;
+    enum { HEAPS=48 };
+    uint64_t last_free[HEAPS]={0};
+    for (unsigned tick=0;;++tick) {
+        Sleep(5000);
+        uint64_t table[HEAPS];
+        if (!heap_read((uint64_t)(uintptr_t)(heap_watch_image+0x2dfaab0),table,sizeof(table))) continue;
+        if (tick%12==1) {  /* raw layout, to check the guessed offsets */
+            char raw[4096]; int r=snprintf(raw,sizeof(raw),"SOTC HEAP TABLE");
+            for (int i=0;i<HEAPS && r<(int)sizeof(raw)-24;++i) r+=snprintf(raw+r,sizeof(raw)-r," %d:%llx",i,(unsigned long long)table[i]);
+            puts(raw);
+            for (int i=0;i<HEAPS;++i) {
+                uint64_t q[24];
+                if (!table[i] || !heap_read(table[i],q,sizeof(q))) continue;
+                r=snprintf(raw,sizeof(raw),"SOTC HEAP %d @%llx:",i,(unsigned long long)table[i]);
+                for (int k=0;k<24;++k) r+=snprintf(raw+r,sizeof(raw)-r," %llx",(unsigned long long)q[k]);
+                puts(raw);
+            }
+            fflush(stdout);
+        }
+        char line[2048]; int n=0, changed=0;
+        for (int i=0;i<HEAPS;++i) {
+            uint64_t bitmap=0, used=0, pages=0; uint32_t words=0;
+            if (!table[i] || !heap_read(table[i]+0x50,&bitmap,8) || !heap_read(table[i]+0x58,&words,4) ||
+                !heap_read(table[i]+0x60,&pages,8) || !heap_read(table[i]+0x30,&used,8)) continue;
+            if (!bitmap || !words || words>(1u<<20) || pages>(uint64_t)words*64) continue;
+            uint64_t free_pages=0, chunk[512];
+            for (uint32_t w=0;w<words;w+=512) {
+                uint32_t count=words-w<512 ? words-w : 512;
+                if (!heap_read(bitmap+(uint64_t)w*8,chunk,count*8)) { free_pages=UINT64_MAX; break; }
+                for (uint32_t k=0;k<count;++k) free_pages+=(uint64_t)__builtin_popcountll(chunk[k]);
+            }
+            if (free_pages==UINT64_MAX) continue;
+            if (free_pages!=last_free[i]) changed=1;
+            last_free[i]=free_pages;
+            if (n<(int)sizeof(line)-80)
+                n+=snprintf(line+n,sizeof(line)-n," h%d %llu/%llu MB free (in use %llu MB)",i,
+                            (unsigned long long)(free_pages>>4),(unsigned long long)(pages>>4),
+                            (unsigned long long)(used>>20));
+        }
+        if (n && (changed || tick%12==0)) { printf("SOTC HEAPS%s\n",line); fflush(stdout); }
+    }
+    return 0;
+}
+#endif
 static void *allocate(size_t size) {
     void *low=runtime_low_map(size,PROT_READ|PROT_WRITE);
     if (low) return low;
@@ -436,6 +492,8 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
         fprintf(stderr,"Fault: exception 0x%08lx at %s (thread %lu)\n",record->ExceptionCode,where,GetCurrentThreadId());
     fprintf(stderr,"  rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n  rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n",
             c->Rax,c->Rbx,c->Rcx,c->Rdx,c->Rsi,c->Rdi,c->Rbp,c->Rsp);
+    fprintf(stderr,"  r8=%016llx r9=%016llx r10=%016llx r11=%016llx\n  r12=%016llx r13=%016llx r14=%016llx r15=%016llx\n",
+            c->R8,c->R9,c->R10,c->R11,c->R12,c->R13,c->R14,c->R15);
     if (gpu_enabled) bbgpu_dump_guest_writes(info);
     /* rbp chain (guest and host code keep frame pointers). */
     uintptr_t rbp=(uintptr_t)c->Rbp;
@@ -445,6 +503,13 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
         if (!ReadProcessMemory(GetCurrentProcess(),(void *)rbp,frame,sizeof(frame),&got) || got!=sizeof(frame) || frame[0]<=rbp) break;
         describe_address(where,sizeof(where),frame[1]);
         fprintf(stderr,"  #%d %s\n",depth,where);
+        /* The frame's locals and saved registers (rbp-0x80..rbp), for the arguments. */
+        uintptr_t locals[16];
+        if (depth<8 && ReadProcessMemory(GetCurrentProcess(),(void *)(rbp-0x80),locals,sizeof(locals),&got) && got==sizeof(locals)) {
+            fprintf(stderr,"     rbp-80:");
+            for (int k=0;k<16;++k) fprintf(stderr," %llx",(unsigned long long)locals[k]);
+            fprintf(stderr,"\n");
+        }
         rbp=frame[0];
     }
     fflush(NULL);
@@ -534,6 +599,11 @@ static void choose_heap(void) {
     }
 }
 uintptr_t runtime_sotc_heap(void) { return heap_chosen; }
+/* sotc (#146): the engine's heap table (heap id -> heap object, eboot EU 1.01). The world's own
+ * heaps (created when a world loads, e.g. the last colossus' area) include more heaps of the
+ * guarded heap's class; the GPU side guards those too. 0 until the guarded heap is chosen. */
+#define HEAP_TABLE_OFFSET 0x2dfaab0
+uintptr_t runtime_sotc_heap_table(void) { return heap_chosen ? (uintptr_t)(image+HEAP_TABLE_OFFSET) : 0; }
 static int heap_hook_trap(EXCEPTION_POINTERS *info) {
     CONTEXT *c=info->ContextRecord;
     if (info->ExceptionRecord->ExceptionCode==EXCEPTION_SINGLE_STEP) {
@@ -681,6 +751,30 @@ static uint64_t patch_tcb_loads(const Segment *segments, uint64_t count) {
     return patched;
 }
 #endif
+#ifdef _WIN32
+/* The engine times itself with inline rdtsc ((now - start) / frequency, unsigned). Some
+ * systems do not keep the cores' TSCs in step (a Ryzen 9 5900X under Hyper-V: each core about
+ * 1.4 ms behind the previous one, core 0 three seconds ahead), so a thread that changes core
+ * sees time run backwards: timers wrap to hundreds of hours, a keyframe lookup indexes before
+ * its array (fault at 0x28b133 on the title screen) or a wait never ends. There every rdtsc of
+ * the eboot and sceKernelReadTsc read QPC instead. SOTC_TSC=qpc forces that, =native skips the
+ * check. */
+static void *tsc_clock;
+static void choose_tsc(void) {
+    const char *mode=getenv("SOTC_TSC");
+    if (mode && !strcmp(mode,"native")) return;
+    if (!mode || strcmp(mode,"qpc")) {
+        unsigned core; double offset_us;
+        int skew=compat_tsc_skew(&core,&offset_us);
+        if (skew<0) { puts("Runtime: TSC check across cores failed; using the TSC"); return; }
+        if (!skew) return;
+        printf("Runtime: the CPU cores disagree on the TSC (core %u is %+.3f ms from core 0); "
+               "the game's clock reads QPC instead (SOTC_TSC=native keeps the TSC)\n",core,offset_us/1000);
+    } else puts("Runtime: SOTC_TSC=qpc: the game's clock reads QPC instead of the TSC");
+    tsc_clock=(void *)compat_qpc_tsc;
+    runtime_tsc_use_qpc();
+}
+#endif
 /* sotc: SSE4a and red-zone patches of the eboot (gpu/sotc), described by scripts/sotc_cpu.py. */
 #define SOTC_TRAMPOLINE_SIZE (UINT64_C(16) << 20)
 static void apply_sotc_cpu_patches(const char *path, const Segment *segments, uint64_t count, uint64_t size) {
@@ -698,13 +792,19 @@ static void apply_sotc_cpu_patches(const char *path, const Segment *segments, ui
         if ((segments[s].flags&1) && segments[s].address<eboot_end)
             code[n++]=(SotcCodeSegment){segments[s].address,segments[s].size};
     SotcPatchRequest request={image,eboot_end,image+round_page(size),SOTC_TRAMPOLINE_SIZE,eh,eh_size,
-                              code,n,offsets,(uint32_t)functions};
+                              code,n,offsets,(uint32_t)functions,NULL};
+#ifdef _WIN32
+    request.tsc_clock=tsc_clock;
+#endif
     SotcPatchResult result;
     if (sotc_patch_eboot(&request,&result)) fail("CPU patches: cannot decode the eboot function table");
     printf("CPU patches: SSE4a %s, %" PRIu64 " functions, %" PRIu64 " short SSE4a relocated, "
            "red zone: %" PRIu64 " functions / %" PRIu64 " instructions\n",
            result.needs_sse4a ? "emulated" : "native", result.function_starts, result.short_sse4a,
            result.red_zone_functions, result.red_zone_instructions);
+    if (request.tsc_clock)
+        printf("CPU patches: %" PRIu64 " rdtsc read QPC, %" PRIu64 " left on the TSC\n",
+               result.rdtsc, result.rdtsc_unpatched);
 }
 /* sotc: extra engine command line (cvars such as +r_motionBlurEnable=0), described by
  * scripts/sotc_modes.py: SOTCCMD1, the image offset of the `lea rsi,[rip+x]` that loads the
@@ -849,9 +949,9 @@ static int mapped(Segment *segments, uint64_t count, uint64_t address, uint64_t 
             address - segments[i].address <= segments[i].size - bytes) return 1;
     return 0;
 }
-/* BBPATCH2 (scripts/sotc_modes.py): the patches' image base, then byte writes at image offsets,
- * applied after relocation. A write may replace a whole base-relative pointer slot (a patch that
- * swaps function pointers): the patch holds the address at the patches' base, rebased here. */
+/* BBPATCH2 (patches.py): the patches' image base, then byte writes at image offsets, applied
+ * after relocation. A write may replace a whole base-relative pointer slot (60/90 FPS++ swap
+ * function pointers): the patch holds the address at the patches' base, rebased here. */
 static void apply_patches(const char *path, Segment *segments, uint64_t ns, const Reloc *relocs, uint64_t nr) {
     FILE *f=fopen(path,"rb");
     char magic[8];
@@ -885,15 +985,15 @@ static void apply_patches(const char *path, Segment *segments, uint64_t ns, cons
     fclose(f);
     printf("Patches: %" PRIu64 " writes, %" PRIu64 " bytes applied, %" PRIu64 " pointers rebased\n",count,bytes,rebased);
 }
-/* Restarts the game: BB_RESTART_COMMAND on Windows, run.sh on Linux. Descriptors are closed
- * first so the old GPU device and its memory are released before the new process opens its own. */
+/* Restarts the game through run.sh (the settings menu: a new render resolution is a patch
+ * applied at start). Descriptors are closed first so the old GPU device and its memory are
+ * released before the new process opens its own. */
 void runtime_restart(void) {
     fflush(NULL);
 #ifdef _WIN32
-    /* BB_RESTART_COMMAND: the launch command line, started again (sotc.py and the SotC launcher
-     * do not set it). */
+    /* run.py sets BB_RESTART_COMMAND: the launch command line, started again (new patches). */
     const char *command=getenv("BB_RESTART_COMMAND");
-    puts("Runtime: restarting (BB_RESTART_COMMAND)");
+    puts("Runtime: restarting through run.py");
     if (!command || !*command) { fputs("runtime_restart: BB_RESTART_COMMAND is not set\n",stderr); _exit(1); }
     char *line=_strdup(command);
     /* Same output handles: a launcher reading the game's log keeps reading the new launch. */
@@ -905,7 +1005,7 @@ void runtime_restart(void) {
         fprintf(stderr,"runtime_restart: CreateProcess failed (%lu)\n",GetLastError()); _exit(1);
     }
     CloseHandle(process.hThread); CloseHandle(process.hProcess);
-    /* The command must wait for this process's GPU device to go away before starting the game. */
+    /* The new launch waits for this process's GPU device to go away (run.py --after). */
     TerminateProcess(GetCurrentProcess(),0);
 #else
     puts("Runtime: restarting through run.sh");
@@ -954,6 +1054,9 @@ int main(int argc, char **argv) {
         return 1;
     }
     require_cpu_features();
+#ifdef _WIN32
+    choose_tsc();
+#endif
     if (content_profile) {
         FILE *profile=fopen(content_profile,"rb");
         unsigned char data[28];
@@ -1113,7 +1216,7 @@ int main(int argc, char **argv) {
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
     if (!cpu_only) {
-        char title[128]="Shadow of the Colossus", serial[16]="UNKNOWN", sfo[4096];
+        char title[128]="Bloodborne", serial[16]="UNKNOWN", sfo[4096];
         uint32_t attributes=0;
         snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0 ? app0 : ".");
         sfo_value(sfo,"TITLE",title,sizeof(title),NULL);
@@ -1184,6 +1287,12 @@ int main(int argc, char **argv) {
         _exit(0);
     }
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
+    {   /* sotc: fps60game applied (EU 1.01, scripts/sotc_modes.py): F7 sets the engine's own frame
+         * rate target, the TargetFramesPerSeconds cvar (object 0x2eed7a0, value pointer at +0x60). */
+        static const unsigned char fps60game[]={0xc7,0x45,0x84,0x01,0x00,0x00,0x00};
+        if (size>0x2eed800 && !memcmp(image+0x49a47f,fps60game,sizeof fps60game))
+            bbgpu_set_fps_target_slot(image+0x2eed7a0+0x60);
+    }
 #ifdef _WIN32
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
 #endif
@@ -1224,6 +1333,12 @@ int main(int argc, char **argv) {
     }
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
     entered_game=1;
+#ifdef _WIN32
+    if (getenv("SOTC_HEAP_WATCH") && getenv("SOTC_HEAP_WATCH")[0]=='1') {
+        heap_watch_image=image;
+        CloseHandle(CreateThread(NULL,0,heap_watch,NULL,0,NULL));
+    }
+#endif
     struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};
 #ifdef _WIN32
     typedef void (ABI *Entry)(void *, void (ABI *)(void));

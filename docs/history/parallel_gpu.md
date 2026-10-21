@@ -1,9 +1,5 @@
 # Parallel GPU command processing — design notes
 
-> **History:** written for bbport's Bloodborne video core and measured on Bloodborne. The SotC
-> port replaced that core (see `docs/sotc/CAMINHO-B.md`); the switches and functions named here
-> (`bb:DrawRec`, `BB_DCB_STATS`, ...) no longer exist. Kept as a reference for porting the ideas.
-
 Goal: remove the single-core bottleneck of the emulated GPU command processor
 (`shadPS4:GpuCommandProcessor`, ~100% of one core while the rest of the CPU idles).
 
@@ -424,7 +420,7 @@ The GPU (RX 7800 XT) now limits more than the CPU. Presets change it little:
 The reduced scene targets are used (1160 of ~1530 scene draws per frame), but rasterizing the
 scene costs little on this GPU: a ninth of the pixels saves ~0.3 ms. The rest does not depend on
 the preset (shadow maps, full-resolution post-processing and UI, FSR itself — FSR 4 costs
-~1.1-1.4 ms more than FSR 3 —, and emulation overhead: barriers, copies, resampling). FSR 4 at
+~1.1-1.4 ms more than FSR 3 — and emulation overhead: barriers, copies, resampling). FSR 4 at
 Native AA fails to start ("no free provider frame").
 
 ### GPU profile (`BB_GPU_PROFILE=1`, `vk_gpu_profiler.h`)

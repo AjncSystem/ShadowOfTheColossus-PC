@@ -23,22 +23,23 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
-/* sceKernelGetDirectMemorySize on retail PS4: 5056 MiB. BB_DMEM_MB=<MiB> raises it (more room
- * for GPU memory than the console has). A PS4 Pro (SOTC_NEO=1) gives games 640 MiB more
- * (shadPS4: 5888 vs 5248 MiB in total); with the base size the game's 64 KiB page bitmap filled
- * up when a save loaded in Pro mode and its allocator read past it (guest offset 0x1a371, read
- * of -1). */
+/* sceKernelGetDirectMemorySize on retail PS4: 5056 MiB. BB_DMEM_MB raises it (the resolution
+ * patches above 1080p need about 4 GiB more; run.sh sets it). A PS4 Pro (SOTC_NEO=1) gives games
+ * 640 MiB more (shadPS4: 5888 vs 5248 MiB in total); with the base size the game's 64 KiB page
+ * bitmap filled up when a save loaded in Pro mode and its allocator read past it (guest offset
+ * 0x1a371, read of -1). */
 int runtime_sotc_neo(void);
+static uint64_t pool_size_mb;
+static uint64_t pool_base_mb(void) { return runtime_sotc_neo() ? 5056 + 640 : 5056; }
 static uint64_t pool_size_bytes(void) {
-    static uint64_t size;
-    if (!size) {
+    if (!pool_size_mb) {
         const char *env = getenv("BB_DMEM_MB");
-        const uint64_t base = runtime_sotc_neo() ? 5056 + 640 : 5056;
+        const uint64_t base = pool_base_mb();
         uint64_t mb = env ? strtoull(env, NULL, 10) : 0;
         if (mb < base || mb > 16384) mb = base;
-        size = mb * 1024 * 1024;
+        pool_size_mb = mb;
     }
-    return size;
+    return pool_size_mb * 1024 * 1024;
 }
 #define POOL_SIZE pool_size_bytes()
 #define FLEXIBLE_SIZE (UINT64_C(448) * 1024 * 1024)
@@ -72,10 +73,11 @@ _Static_assert(sizeof(BatchEntry)==32,"PS4 batch map entry layout");
  * default rwlock prefers readers; a thread holding it exclusively skips relocking. */
 #ifdef _WIN32
 /* sotc: winpthreads' rwlock queues new readers behind a waiting writer, so a nested read (a
- * reader faulting into runtime_memory_gpu_protect) can deadlock against a mapping thread waiting
- * to write, and every read also takes a mutex. This lock prefers readers like glibc's: a read is
- * one atomic operation and never waits for a waiting writer; a writer waits until no reader
- * holds it (maps and unmaps are rare). From AjncSystem/ShadowOfTheColossus-PC#81 (jownatan). */
+ * reader faulting into runtime_memory_gpu_protect) deadlocked against a mapping thread
+ * waiting to write: the GPU command processor, two job workers in the fault handler and
+ * sceKernelBatchMap2 all stopped. Each read also took a mutex, thousands of times per frame.
+ * This lock prefers readers like glibc's: a read is one atomic operation and never waits for
+ * a waiting writer; a writer waits until no reader holds it (maps and unmaps are rare). */
 static volatile int64_t lock_state; /* readers, or -1 while a writer holds it */
 static void lock_backoff(unsigned *spins) {
     if (++*spins < 64) YieldProcessor();
@@ -128,11 +130,10 @@ typedef void (*GpuRange)(uintptr_t address, uint64_t size);
 static GpuRange hook_map, hook_unmap, hook_invalidate;
 enum { HOOK_MAP, HOOK_UNMAP, HOOK_INVALIDATE };
 typedef struct { int kind; uintptr_t address; uint64_t size; } PendingHook;
-/* sotc: a ring of 4096 (was 64, drained with memmove). Consumers run the GPU hooks outside the
- * lock and the unmap hook waits for the GPU, so under video memory pressure other threads queued
- * past 64 and the game stopped ("GPU hook queue overflow", 6 GB card in the shrine). */
-#define PENDING_HOOKS 4096
-static PendingHook pending[PENDING_HOOKS]; static size_t pending_head, pending_count;
+/* sotc: grows on demand. With 64 fixed slots, a GPU hook slowed down by an emergency texture
+ * collection (video memory full in the open world) let other threads queue past the end, and
+ * the exit(21) that followed hung the game instead of closing it. */
+static PendingHook *pending; static size_t pending_count, pending_capacity;
 static size_t allocations, maps, flexible_maps, protects, queries;
 static uint64_t live_bytes, flexible_bytes;
 
@@ -324,6 +325,16 @@ static int pool(void) {
     runtime_memory_reserve();
     uint64_t bytes=POOL_SIZE+FLEX_SPAN;
     section=CreateFileMapping2(INVALID_HANDLE_VALUE,NULL,FILE_MAP_ALL_ACCESS,PAGE_EXECUTE_READWRITE,SEC_COMMIT,bytes,NULL,NULL,0);
+    if (!section && pool_size_mb>pool_base_mb()) {
+        /* sotc: the larger pool (BB_DMEM_MB, 9152 MiB by default since 0.59) is committed at once;
+         * with little RAM and a small page file Windows refuses it (error 1450) and the game
+         * stopped at boot. Fall back to the console's size. */
+        fprintf(stderr,"Runtime: %" PRIu64 " MiB of guest memory refused (error %lu): using %" PRIu64 " MiB; a larger page file allows more\n",
+                bytes>>20,GetLastError(),pool_base_mb());
+        pool_size_mb=pool_base_mb();
+        bytes=POOL_SIZE+FLEX_SPAN;
+        section=CreateFileMapping2(INVALID_HANDLE_VALUE,NULL,FILE_MAP_ALL_ACCESS,PAGE_EXECUTE_READWRITE,SEC_COMMIT,bytes,NULL,NULL,0);
+    }
     if (!section) { fprintf(stderr,"Runtime: cannot create %" PRIu64 " MiB of guest memory (error %lu); is the page file large enough?\n",bytes>>20,GetLastError()); return -1; }
     backing_base=MapViewOfFile3(section,GetCurrentProcess(),NULL,0,bytes,0,PAGE_READWRITE,NULL,0);
     return backing_base ? 0 : -1;
@@ -356,17 +367,22 @@ static void host_discard(uint64_t phys, uint64_t size) {
 static void queue_hook(int kind, uintptr_t address, uint64_t size) {
     GpuRange hook = kind==HOOK_MAP ? hook_map : kind==HOOK_UNMAP ? hook_unmap : hook_invalidate;
     if (!hook) return;
-    if (pending_count==PENDING_HOOKS) { fputs("STOP: GPU hook queue overflow\n",stderr); exit(21); }
-    pending[(pending_head+pending_count++)%PENDING_HOOKS]=(PendingHook){kind,address,size};
+    if (pending_count==pending_capacity) {
+        size_t capacity = pending_capacity ? pending_capacity*2 : 64;
+        PendingHook *grown = realloc(pending, capacity*sizeof(*pending));
+        if (!grown) { fputs("STOP: GPU hook queue out of memory\n",stderr); fflush(stderr); _Exit(21); }
+        pending=grown; pending_capacity=capacity;
+        if (capacity>64) fprintf(stderr,"Runtime: GPU hook queue grew to %zu entries\n",capacity);
+    }
+    pending[pending_count++]=(PendingHook){kind,address,size};
 }
 /* Runs queued GPU notifications; callers invoke it after dropping the lock. */
 static void flush_hooks(void) {
     for (;;) {
         write_lock();
         if (!pending_count) { write_unlock(); return; }
-        PendingHook h=pending[pending_head];
-        pending_head=(pending_head+1)%PENDING_HOOKS;
-        --pending_count;
+        PendingHook h=pending[0];
+        memmove(pending,pending+1,--pending_count*sizeof(*pending));
         GpuRange hook = h.kind==HOOK_MAP ? hook_map : h.kind==HOOK_UNMAP ? hook_unmap : hook_invalidate;
         write_unlock();
         if (hook) hook(h.address,h.size);

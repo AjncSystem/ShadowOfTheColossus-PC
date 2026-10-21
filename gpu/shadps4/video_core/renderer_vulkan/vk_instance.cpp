@@ -14,6 +14,7 @@
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/sotc_stats.h"
@@ -517,6 +518,9 @@ bool Instance::CreateDevice() {
                 .shaderImageGatherExtended = features.shaderImageGatherExtended,
                 .shaderStorageImageExtendedFormats = features.shaderStorageImageExtendedFormats,
                 .shaderStorageImageMultisample = features.shaderStorageImageMultisample,
+                // sotc: FSR 3 frame generation (vk_fsrfg.cpp) writes untyped storage images.
+                .shaderStorageImageReadWithoutFormat = features.shaderStorageImageReadWithoutFormat,
+                .shaderStorageImageWriteWithoutFormat = features.shaderStorageImageWriteWithoutFormat,
                 // Descriptor arrays of dynamic_tsharp_array_size (shader_recompiler/info.cpp)
                 .shaderSampledImageArrayDynamicIndexing =
                     features.shaderSampledImageArrayDynamicIndexing,
@@ -737,6 +741,7 @@ bool Instance::CreateDevice() {
     }
 
     CreateAllocator();
+    Dlssg::OnDeviceCreated(*this); // sotc: DLSS Frame Generation (SOTC_DLSSG=1)
     return true;
 }
 
@@ -773,8 +778,6 @@ void Instance::CreateAllocator() {
         },
     };
     const VmaAllocatorCreateInfo allocator_info = {
-        // The driver's budget counts the buffer arena memory allocated outside VMA, so images
-        // stop filling the VRAM the arena still needs and spill to system memory instead
         .flags = static_cast<VmaAllocatorCreateFlags>(
             VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT |
             (supports_memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0)),

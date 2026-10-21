@@ -227,6 +227,30 @@ GraphicsPipeline::GraphicsPipeline(
             .pName = "main",
         });
     }
+    // sotc: Profile::barycentric_via_gs: the geometry shader that hands the pixel shader its
+    // per-vertex inputs and barycentrics, on triangles without a guest geometry/tess stage.
+    const Shader::Info* fs_stage_info = infos[u32(Shader::SwStage::Fragment)];
+    const bool triangles = topology == vk::PrimitiveTopology::eTriangleList ||
+                           topology == vk::PrimitiveTopology::eTriangleStrip ||
+                           topology == vk::PrimitiveTopology::eTriangleFan || is_rect_list ||
+                           is_quad_list;
+    // Preloaded pipelines take it from the cache: the interpolation data it needs is not stored.
+    if (!preloading && profile.barycentric_via_gs && fs_stage_info && triangles &&
+        !infos[u32(Shader::SwStage::Geometry)] &&
+        !infos[u32(Shader::SwStage::TessellationEval)]) {
+        const auto& fs_runtime = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
+        if (Shader::Backend::SPIRV::NeedsBarycentricGs(fs_runtime, *fs_stage_info)) {
+            sdata.gs = Shader::Backend::SPIRV::EmitBarycentricGeometryShader(fs_runtime,
+                                                                             *fs_stage_info);
+        }
+    }
+    if (!sdata.gs.empty()) {
+        shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
+            .stage = vk::ShaderStageFlagBits::eGeometry,
+            .module = CompileSPV(sdata.gs, instance.GetDevice()),
+            .pName = "main",
+        });
+    }
     stage = u32(Shader::SwStage::Fragment);
     if (infos[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
@@ -431,6 +455,13 @@ GraphicsPipeline::GraphicsPipeline(
 
     auto [pipeline_result, pipe] =
         device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+    if (pipeline_result != vk::Result::eSuccess && preloading) {
+        // sotc: the driver can refuse a pipeline rebuilt from the cache (ErrorUnknown on AMD).
+        // Left without a handle, the preload drops it and the game compiles it when it is drawn.
+        LOG_WARNING(Render_Vulkan, "Cached graphics pipeline {} failed to build: {}", debug_str,
+                    vk::to_string(pipeline_result));
+        return;
+    }
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);

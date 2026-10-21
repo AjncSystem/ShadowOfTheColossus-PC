@@ -211,13 +211,25 @@ public:
     /// VK_EXT_shader_atomic_float2 is supported.
     bool IsShaderAtomicFloatBuffer32MinMaxSupported() const {
         return shader_atomic_float2 &&
-               shader_atomic_float2_features.shaderBufferFloat32AtomicMinMax;
+               shader_atomic_float2_features.shaderBufferFloat32AtomicMinMax &&
+               !ForceFloatAtomicFallback();
+    }
+
+    /// sotc: SOTC_FLOAT_ATOMIC_FALLBACK=1 uses the integer fallback for float atomic min/max
+    /// even where the device has them (to test the GCN path on another card).
+    static bool ForceFloatAtomicFallback() {
+        static const bool forced = [] {
+            const char* v = std::getenv("SOTC_FLOAT_ATOMIC_FALLBACK");
+            return v && v[0] == '1';
+        }();
+        return forced;
     }
 
     /// Returns true when the shaderImageFloat32AtomicMinMax feature of
     /// VK_EXT_shader_atomic_float2 is supported.
     bool IsShaderAtomicFloatImage32MinMaxSupported() const {
-        return shader_atomic_float2 && shader_atomic_float2_features.shaderImageFloat32AtomicMinMax;
+        return shader_atomic_float2 && shader_atomic_float2_features.shaderImageFloat32AtomicMinMax &&
+               !ForceFloatAtomicFallback();
     }
 
     /// Returns true if 64-bit integer atomic operations can be used on buffers

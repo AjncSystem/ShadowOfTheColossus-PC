@@ -19,7 +19,7 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
                                  SerializationSupport& sdata, bool preloading /*=false*/,
                                  bool deferred /*=false*/)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache, true},
-      compute_key{compute_key_}, cache{pipeline_cache}, module{module_} {
+      compute_key{compute_key_}, cache{pipeline_cache}, module{module_}, from_cache{preloading} {
     auto& info = stages[int(Shader::SwStage::Compute)];
     info = &info_;
     const auto debug_str = GetDebugString();
@@ -125,6 +125,12 @@ void ComputePipeline::CreatePipeline() {
     };
     auto [pipeline_result, pipe] =
         instance.GetDevice().createComputePipelineUnique(cache, compute_pipeline_ci);
+    if (pipeline_result != vk::Result::eSuccess && from_cache) {
+        // sotc: as for graphics pipelines, a cached one the driver refuses is dropped.
+        LOG_WARNING(Render_Vulkan, "Cached compute pipeline {} failed to build: {}", GetDebugString(),
+                    vk::to_string(pipeline_result));
+        return;
+    }
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create compute pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
@@ -138,6 +144,13 @@ void ComputePipeline::Build() {
     CreatePipeline();
     ready.store(true, std::memory_order_release);
     ready.notify_all();
+}
+
+void ComputePipeline::WaitBuilt() {
+    if (!claimed.load(std::memory_order_acquire)) {
+        Build();
+    }
+    ready.wait(false, std::memory_order_acquire);
 }
 
 void ComputePipeline::BindWhenReady() const {

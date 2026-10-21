@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <numeric>
 
 #include "common/alignment.h"
@@ -108,7 +109,22 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
             result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &over_budget_ci,
                                      &unsafe_buffer, &allocation, out_alloc_info);
         }
-        ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
+        if (result != VK_SUCCESS) {
+            const VkPhysicalDeviceMemoryProperties* props{};
+            vmaGetMemoryProperties(allocator, &props);
+            std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+            vmaGetHeapBudgets(allocator, budgets.data());
+            for (u32 heap = 0; heap < props->memoryHeapCount; ++heap) {
+                LOG_CRITICAL(Render, "Heap {} ({}): usage {} MB, budget {} MB, ours {} MB", heap,
+                             props->memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT
+                                 ? "video"
+                                 : "system",
+                             budgets[heap].usage >> 20, budgets[heap].budget >> 20,
+                             budgets[heap].statistics.blockBytes >> 20);
+            }
+        }
+        ASSERT_MSG(result == VK_SUCCESS, "Failed allocating {} buffer of {} KB with error {}",
+                   BufferTypeName(mem_type), buffer_ci.size >> 10,
                    vk::to_string(vk::Result{result}));
         buffer = vk::Buffer{unsafe_buffer};
     } else {

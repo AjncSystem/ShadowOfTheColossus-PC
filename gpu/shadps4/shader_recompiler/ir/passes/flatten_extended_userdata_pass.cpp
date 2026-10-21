@@ -692,8 +692,12 @@ static bool ComputeOffset(Xbyak::CodeGenerator& c, Xbyak::Reg32 reg, PassInfo& p
         ABORT_ON_FAILURE(EmitComputeOffsetBitFieldUExtract(c, reg, pass_info, inst));
         return true;
     default:
-        LOG_ERROR(Render_Recompiler, "Unexpected instruction for offset computation, {}",
-                  magic_enum::enum_name(inst->GetOpcode()));
+        // sotc: first few only: ~1000 per session while shaders translate on the draw path (the
+        // walker falls back), each a stderr line costing milliseconds there.
+        if (static std::atomic<u32> shown{0}; shown.fetch_add(1, std::memory_order_relaxed) < 4) {
+            LOG_ERROR(Render_Recompiler, "Unexpected instruction for offset computation, {}",
+                      magic_enum::enum_name(inst->GetOpcode()));
+        }
         return false;
     }
 }

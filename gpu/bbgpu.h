@@ -40,6 +40,8 @@ int bbgpu_save_list_open(const char *title, const char *const *items, int count,
                          int first_deletable);
 int bbgpu_save_list_poll(void);
 void bbgpu_save_list_close(void);
+/* sotc: pictures for the next save list (PNG paths, NULL: none), item by item. */
+void bbgpu_save_list_icons(const char *const *paths, int count);
 int bbgpu_text_input_poll(char *out_utf8, uint64_t size);
 /* sotc: mouse motion since the last call and held buttons (bit = SDL button); 0 when not captured. */
 int bbgpu_mouse_take(float *dx, float *dy, unsigned *buttons);
@@ -47,6 +49,9 @@ int bbgpu_mouse_take(float *dx, float *dy, unsigned *buttons);
 int bbgpu_overlay_captures_input(void);
 /* Number of symbols registered by the vendored libraries (diagnostics). */
 unsigned bbgpu_symbol_count(void);
+/* sotc: where the engine keeps the pointer to its TargetFramesPerSeconds value (fps60game mode):
+ * F7 then switches the game's own frame rate target instead of only its cap. */
+void bbgpu_set_fps_target_slot(void *slot);
 #ifdef __cplusplus
 }
 #endif

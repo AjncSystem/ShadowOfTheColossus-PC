@@ -417,6 +417,18 @@ public:
         return image;
     }
 
+    /// sotc: the image with this id if it is still the registered image `uid`, else nullptr.
+    [[nodiscard]] Image* TryGetImage(ImageId id, u64 uid) {
+        if (!id || !slot_images.is_allocated(id)) {
+            return nullptr;
+        }
+        auto& image = slot_images[id];
+        if (image.image_uid != uid || !(image.flags & ImageFlagBits::Registered)) {
+            return nullptr;
+        }
+        return &image;
+    }
+
     /// Retrieves the image view with the specified id.
     [[nodiscard]] ImageView& GetImageView(ImageId id) {
         return slot_image_views[id];
@@ -568,6 +580,10 @@ private:
 public:
     /// Diagnostic (SOTC_DUMP): copies every layer/slice of mip 0 to a raw file once the GPU is done.
     void DumpImage(ImageId image_id, const std::filesystem::path& path);
+
+    /// sotc: SOTC_TEX_DUMP=1 saves each small sampled texture once (user/texdump), keyed by the
+    /// hash of its guest bytes, to find the game's controller glyphs.
+    void SotcGlyphHook(Image& image);
 
 private:
 

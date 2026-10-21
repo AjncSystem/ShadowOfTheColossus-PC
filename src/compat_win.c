@@ -5,6 +5,8 @@
 #endif
 #include <windows.h>
 #include <bcrypt.h>
+#include <intrin.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include "compat_win.h"
@@ -158,5 +160,115 @@ int compat_cpu_times(int who, int64_t *user_us, int64_t *kernel_us) {
     *user_us = (int64_t)(((uint64_t)user.dwHighDateTime << 32 | user.dwLowDateTime) / 10);
     *kernel_us = (int64_t)(((uint64_t)kernel.dwHighDateTime << 32 | kernel.dwLowDateTime) / 10);
     return 0;
+}
+
+/* Cross-core TSC check. A helper thread on the first core and this thread on each other core
+ * take turns publishing rdtsc: a value read after the other core published a larger one means
+ * the TSC ran backwards between the two cores. QPC is not used for the comparison, since on
+ * many systems it is the TSC itself. */
+static volatile LONG64 skew_stamp;
+static volatile LONG skew_state, skew_quit;
+static int64_t skew_back;
+static int pin_to(unsigned core) {
+    if (!SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)1 << core)) return 0;
+    for (int i = 0; i < 1000 && GetCurrentProcessorNumber() != core; ++i) SwitchToThread();
+    return GetCurrentProcessorNumber() == core;
+}
+static int skew_wait(LONG state) {
+    for (uint64_t spins = 0; skew_state != state; ++spins) {
+        if (spins > (UINT64_C(1) << 28)) return 0;
+        _mm_pause();
+    }
+    return 1;
+}
+static DWORD WINAPI skew_helper(void *core) {
+    pin_to((unsigned)(uintptr_t)core);
+    for (;;) {
+        LONG state;
+        while ((state = skew_state) != 1 && state != 3) {
+            if (skew_quit) return 0;
+            _mm_pause();
+        }
+        if (state == 1) {
+            skew_stamp = (LONG64)__rdtsc();
+            skew_state = 2;
+        } else {
+            _mm_lfence();
+            const int64_t d = (int64_t)(__rdtsc() - (uint64_t)skew_stamp);
+            if (d < skew_back) skew_back = d;
+            skew_state = 0;
+        }
+    }
+}
+
+int compat_tsc_skew(unsigned *worst_core, double *worst_us) {
+    *worst_core = 0; *worst_us = 0;
+    HANDLE thread = GetCurrentThread();
+    DWORD_PTR process, system;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &process, &system) || !process) return -1;
+    unsigned cores[64]; int n = 0;
+    for (unsigned i = 0; i < 64; ++i) if (process >> i & 1) cores[n++] = i;
+    if (n < 2) return 0;
+    DWORD_PTR saved = SetThreadAffinityMask(thread, (DWORD_PTR)1 << cores[0]);
+    if (!saved) return -1;
+    /* TSC frequency on one core, to report the offsets in microseconds. */
+    LARGE_INTEGER frequency, q0, q1;
+    QueryPerformanceFrequency(&frequency);
+    int result = -1;
+    if (!pin_to(cores[0])) goto done;
+    QueryPerformanceCounter(&q0); uint64_t t0 = __rdtsc();
+    compat_sleep_ns(10000000);
+    QueryPerformanceCounter(&q1); uint64_t t1 = __rdtsc();
+    if (q1.QuadPart <= q0.QuadPart || t1 <= t0) goto done;
+    const double ticks_per_us = (double)(t1 - t0) * (double)frequency.QuadPart /
+                                (double)(q1.QuadPart - q0.QuadPart) / 1e6;
+    skew_state = 0; skew_quit = 0;
+    HANDLE helper = CreateThread(NULL, 0, skew_helper, (void *)(uintptr_t)cores[0], 0, NULL);
+    if (!helper) goto done;
+    result = 0;
+    for (int c = 1; c < n && result >= 0; ++c) {
+        if (!pin_to(cores[c])) continue;
+        int64_t forward = INT64_MAX;
+        skew_back = INT64_MAX;
+        for (int round = 0; round < 64; ++round) {
+            skew_state = 1;
+            if (!skew_wait(2)) { result = -1; break; }
+            _mm_lfence();
+            const int64_t d = (int64_t)(__rdtsc() - (uint64_t)skew_stamp);
+            if (d < forward) forward = d;
+            skew_stamp = (LONG64)__rdtsc();
+            skew_state = 3;
+            if (!skew_wait(0)) { result = -1; break; }
+        }
+        if (result < 0) break;
+        /* forward = latency + (offset_c - offset_0), skew_back = latency + (offset_0 - offset_c). */
+        if (forward < -(int64_t)ticks_per_us || skew_back < -(int64_t)ticks_per_us) result = 1;
+        const double offset_us = ((double)forward - (double)skew_back) / 2 / ticks_per_us;
+        if (fabs(offset_us) > fabs(*worst_us)) { *worst_us = offset_us; *worst_core = cores[c]; }
+    }
+    skew_quit = 1;
+    WaitForSingleObject(helper, INFINITE);
+    CloseHandle(helper);
+done:
+    SetThreadAffinityMask(thread, saved);
+    return result;
+}
+
+/* QPC scaled to about 1 GHz: the same on every core. */
+static uint64_t qpc_scale(void) {
+    static uint64_t scale;
+    if (!scale) {
+        LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+        scale = f.QuadPart > 0 && f.QuadPart < 1000000000 ? 1000000000 / (uint64_t)f.QuadPart : 1;
+    }
+    return scale;
+}
+uint64_t compat_qpc_tsc(void) {
+    LARGE_INTEGER q; QueryPerformanceCounter(&q);
+    return (uint64_t)q.QuadPart * qpc_scale();
+}
+uint64_t compat_qpc_tsc_frequency(void) {
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    return (uint64_t)f.QuadPart * qpc_scale();
 }
 #endif

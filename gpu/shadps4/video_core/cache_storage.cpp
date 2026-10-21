@@ -208,6 +208,19 @@ void DataBase::Close() {
 
     io_worker.request_stop();
     io_worker.join();
+    // sotc: the worker leaves when asked to stop, with writes still queued: pipelines compiled
+    // shortly before the game was closed were dropped and compiled again (a stutter) next time.
+    {
+        std::scoped_lock lock{m_request};
+        while (!req_queue.empty()) {
+            auto request = std::move(req_queue.front());
+            req_queue.pop();
+            if (request.valid()) {
+                request();
+            }
+        }
+        num_requests = 0;
+    }
 
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         mz_zip_writer_finalize_archive(&zip_ar);
@@ -388,6 +401,46 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
             }
         }
     }
+}
+
+size_t DataBase::CountBlobs(BlobType type) {
+    const auto& ext = GetBlobFileExtension(type);
+    size_t count = 0;
+    if (EmulatorSettings.IsPipelineCacheArchived()) {
+        const auto num_files = mz_zip_reader_get_num_files(&zip_ar);
+        for (int index = 0; index < num_files; ++index) {
+            std::array<char, MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE> file_name{};
+            mz_zip_reader_get_filename(&zip_ar, index, file_name.data(), file_name.size());
+            count += std::string{file_name.data()}.ends_with(ext);
+        }
+    } else if (prefetch_active) {
+        for (const auto& [file_name, data] : prefetched) {
+            count += std::filesystem::path{file_name}.extension().string().ends_with(ext);
+        }
+    } else {
+        std::error_code ec;
+        for (const auto& file_name : std::filesystem::directory_iterator{cache_path, ec}) {
+            count += file_name.path().extension().string().ends_with(ext);
+        }
+    }
+    return count;
+}
+
+void DataBase::Reset() {
+    Close();
+    // Open() sets cache_path: a cache that was never opened has nothing to set aside.
+    if (!cache_path.empty()) {
+        auto old_path = cache_path;
+        old_path += ".incompatible";
+        std::error_code error;
+        std::filesystem::remove_all(old_path, error);
+        std::filesystem::rename(cache_path, old_path, error);
+        if (error) {
+            // Could not be renamed (e.g. a file in use): an empty cache matters more than the copy.
+            std::filesystem::remove_all(cache_path, error);
+        }
+    }
+    Open();
 }
 
 void DataBase::FinishPreload() {

@@ -5,7 +5,8 @@
 //  - Selective red-zone protection for three functions that keep live data below rsp while
 //    touching memory the GPU page tracker may fault on (Windows exception dispatch writes
 //    below rsp).
-// Both come from the shadPS4 SotC fork (cpu_patches.cpp, module.cpp).
+//  - rdtsc redirected to a host clock when the cores disagree on the TSC (src/compat_win.c).
+// The first two come from the shadPS4 SotC fork (cpu_patches.cpp, module.cpp).
 #include <vector>
 #include "common/logging/log.h"
 #include "core/signals.h"
@@ -46,6 +47,12 @@ extern "C" int sotc_patch_eboot(const SotcPatchRequest* request, SotcPatchResult
             const auto red = Core::PatchRedZoneMemoryInstructions(address, size, function_starts, selected);
             result->red_zone_functions += red.function_count;
             result->red_zone_instructions += red.patched_memory_instruction_count;
+        }
+        if (request->tsc_clock) {
+            u64 unpatched = 0;
+            result->rdtsc += Core::PatchRdtscInstructions(address, size, function_starts,
+                                                          request->tsc_clock, &unpatched);
+            result->rdtsc_unpatched += unpatched;
         }
         // Long forms last: the linear sweep sees the jumps written above as plain instructions.
         Core::PrePatchInstructions(address, size);

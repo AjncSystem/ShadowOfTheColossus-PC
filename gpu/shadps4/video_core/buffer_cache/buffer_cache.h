@@ -8,6 +8,8 @@
 #include <chrono>
 #include <shared_mutex>
 #include <deque>
+#include <map>
+#include <memory>
 #include <span>
 #include <vector>
 #include <unordered_map>
@@ -176,6 +178,10 @@ private:
 
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
 
+    /// sotc: the range [first, second) of the arena that a readback of [device_addr, +size)
+    /// downloads and unmarks as GPU-modified: 512 KiB around it, smaller with SOTC_RB_NARROW.
+    std::pair<VAddr, VAddr> ReadbackWindow(const Buffer* arena, VAddr device_addr, u64 size);
+
     /// One range to read back: its GPU-modified parts, as copies from the arena.
     struct ReadbackItem {
         const Buffer* arena;
@@ -200,7 +206,7 @@ private:
     void ApplyDownloads(std::span<const ReadbackItem> pending, const u8* mapped,
                         u64 mapped_offset);
 
-    /// sotc (SOTC_RB_ASYNC=1): a readback asked by a guest thread in two steps on the command
+    /// sotc (default, SOTC_RB_ASYNC=0 turns it off): a readback asked by a guest thread in two steps on the command
     /// processor: the copies are recorded and submitted without waiting (the command processor
     /// goes on with its queue), the guest thread waits for the GPU, then the data is applied
     /// unless a later GPU write hit the ranges meanwhile (then it is read back again).
@@ -298,6 +304,8 @@ private:
         std::chrono::steady_clock::time_point last_request;
     };
     static constexpr size_t MaxHotReadbacks = 64;
+    /// sotc: the SOTC_RB_NARROW readback window in bytes, 0 for the 512 KiB one (ReadbackWindow).
+    u64 rb_narrow_window{};
     static constexpr auto HotReadbackLifetime = std::chrono::seconds(2);
     std::vector<HotReadback> hot_readbacks;
     /// sotc: pages the guest read back recently (the faulting ranges, not the windows). A GPU
@@ -326,6 +334,9 @@ private:
     RangeSet current_writes;
     u64 current_writes_tick{};
     void RecordCurrentWrite(VAddr addr, u64 size);
+    /// sotc: the range the guest touched, during the DownloadMemory of its window (size 0 else).
+    VAddr fault_addr{};
+    u64 fault_size{};
 
 public:
     /// sotc: true once after the command buffer being built wrote a page the guest reads back:
@@ -334,10 +345,21 @@ public:
 
 private:
 
-    /// Number of resident blocks still bound to each backing allocation.
-    std::unordered_map<VkDeviceMemory, u64> backing_blocks;
-    /// sotc: size of each backing allocation (resident arena memory accounting).
-    std::unordered_map<VkDeviceMemory, u64> backing_bytes;
+    /// sotc: arena memory is carved out of chunks of ARENA_CHUNK_SIZE. One allocation per
+    /// resident range reached thousands within minutes, each one a kernel call mid-frame (the
+    /// open world then ran out of video memory).
+    static constexpr u64 ARENA_CHUNK_SIZE = 64_MB;
+    struct ArenaChunk {
+        vk::DeviceMemory memory;
+        u32 memory_type{};
+        u64 used_blocks{};
+        std::map<u64, u64> free_runs; ///< first block -> number of free blocks
+    };
+    std::vector<std::unique_ptr<ArenaChunk>> arena_chunks;
+    std::unordered_map<VkDeviceMemory, ArenaChunk*> chunk_by_memory;
+    /// Memory and first block for blocks of arena backing (video memory, else system memory).
+    std::pair<vk::DeviceMemory, u64> AllocateArenaBlocks(u64 blocks);
+    void FreeArenaBlocks(vk::DeviceMemory memory, u64 start, u64 blocks);
     /// sotc: unbinds resident block ranges (zeroing their page table entries) and frees the
     /// allocations left without blocks. The GPU must no longer use them.
     void UnbindResident(std::span<const Backing> released);
@@ -347,8 +369,11 @@ private:
     IntervalList<> evicted_ranges;
     /// sotc: evicted blocks a shader faulted back in; never evicted again.
     IntervalList<> pinned_ranges;
-    /// sotc: allocations whose read-back did not match guest memory, tried again after this.
-    std::unordered_map<VkDeviceMemory, std::chrono::steady_clock::time_point> evict_retry;
+    /// sotc: resident ranges (by first block) whose read-back did not match guest memory,
+    /// tried again after this.
+    std::unordered_map<u64, std::chrono::steady_clock::time_point> evict_retry;
+    /// sotc: arena memory in use (blocks handed out of the chunks), in bytes.
+    u64 ArenaUsedBytes() const noexcept;
     u16 use_epoch{1};
     /// sotc: sets use_epoch from the clock (once per submit and per eviction check).
     void AdvanceUseEpoch(std::chrono::steady_clock::time_point now) noexcept {
@@ -358,10 +383,6 @@ private:
     }
     std::chrono::steady_clock::time_point epoch_start{};
     std::chrono::steady_clock::time_point next_evict_check{};
-    /// sotc: the arena slab EnsureResident hands block runs out of, its size and use (bytes).
-    vk::DeviceMemory arena_slab{};
-    u64 arena_slab_size{};
-    u64 arena_slab_used{};
 
     u32 arena_memory_type_index{};
     std::optional<u32> arena_fallback_memory_type_index;

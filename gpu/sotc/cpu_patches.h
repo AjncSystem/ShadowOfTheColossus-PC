@@ -71,4 +71,11 @@ bool NeedsSse4aEmulation();
 u64 PatchShortSse4aInstructions(u64 segment_addr, u64 segment_size,
                                 std::span<const uintptr_t> function_starts);
 
+/// sotc: points every rdtsc at `clock` (a host function returning the TSC replacement), for
+/// systems whose cores disagree on the TSC. Returns the number of sites patched; `unpatched`
+/// counts the sites that could not be (they keep reading the host TSC). Windows only.
+u64 PatchRdtscInstructions(u64 segment_addr, u64 segment_size,
+                           std::span<const uintptr_t> function_starts, void* clock,
+                           u64* unpatched);
+
 } // namespace Core

@@ -66,12 +66,17 @@ public:
     /// processor goes on (and other new pipelines build meanwhile).
     void BindWhenReady() const;
 
+    /// sotc: waits until a deferred construction has made its pipeline (building it here if no
+    /// worker started it yet). Handle() is then the result, null if the driver refused it.
+    void WaitBuilt();
+
 private:
     void CreatePipeline();
 
     ComputePipelineKey compute_key;
     vk::PipelineCache cache;
     vk::ShaderModule module;
+    bool from_cache{}; ///< sotc: preloaded from the cache (a refused one is dropped)
     std::atomic<bool> ready{true};
     std::atomic<bool> claimed{false};
 };

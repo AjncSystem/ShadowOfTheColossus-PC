@@ -15,8 +15,9 @@ Settings (environment variables, or sotc.ini beside this script as NAME=value li
     SOTC_DLC_DIR      optional: the game's DLC (one folder per add-on with sce_sys/param.sfo,
                       or shadPS4's addcont folder holding CUSA08809)
     SOTC_MODES        optional, comma-separated: af16 (16x anisotropic filtering),
-                      fps60 (removes the 30 FPS cap; experimental, vblank at 120 Hz, at most
-                      60 FPS unless SOTC_FPS_CAP=0: the launcher's "Unlocked FPS")
+                      fps60 (removes the 30 FPS cap; experimental, vblank at 120 Hz),
+                      fps60game (the game's own 60 FPS target, as the PS4 Pro Performance mode;
+                      with SOTC_FPS_CAP=off)
     SOTC_RENDER_RES   optional: the game renders at WxH instead of 1920x1080 (e.g. 2560x1080 for
                       21:9, a wider view); the output follows its aspect; PS4 mode only; at most 1080
                       lines tall and 4.2 million pixels, larger sizes are scaled down
@@ -24,7 +25,9 @@ Settings (environment variables, or sotc.ini beside this script as NAME=value li
     BB_GAMEPAD        the gamepad to use (its name or part of it), when several are connected
     key.<input>=Keys, pad.<input>=buttons   remap the controls (README.md, Controles)
 The image is prepared again only when the game, the modules or the scripts change.
-Extra arguments go to bb-probe.exe.
+Extra arguments go to bb-probe.exe. Run from a console, the session is also saved to
+<user>/last_run.log (the 4 before it as last_run.1.log ... last_run.4.log; a crash's log is
+copied to <user>/crashes).
 """
 import hashlib
 import os
@@ -55,18 +58,15 @@ def load_ini():
 
 def no_console():
     """Started without a console (the launcher): console programs must not open their own."""
-    if os.name != 'nt':
-        return 0
     import ctypes
     return 0 if ctypes.windll.kernel32.GetConsoleWindow() else subprocess.CREATE_NO_WINDOW
 
 
 def find_probe():
-    name = 'bb-probe.exe' if os.name == 'nt' else 'bb-probe'  # Linux: run.sh builds out/bb-probe
-    for candidate in (PORT / 'bin' / name, PORT / 'out' / name):
+    for candidate in (PORT / 'bin' / 'bb-probe.exe', PORT / 'out' / 'bb-probe.exe'):
         if candidate.is_file():
             return candidate
-    fail(f'{name} not found: build it with build.sh (MSYS2 CLANG64 on Windows) or use a packaged build.')
+    fail('bb-probe.exe not found: build it with build.sh (MSYS2 CLANG64) or use a packaged build.')
 
 
 # Above about 4.2 million rendered pixels the fine detail textures (ground, cloth) shimmer, flicker
@@ -200,6 +200,8 @@ def main():
     if cvars is None:
         # Without the launcher: the culling settings of Pink-shadPS4 (same image, fewer GPU waits).
         cvars = 'doIndexBufferCulling=0 doSunShadowIndexBufferCulling=0'
+    if env.get('SOTC_NOTE'):
+        print(f"sotc: {env['SOTC_NOTE']}", file=sys.stderr)
     render = cap_render(env.get('SOTC_RENDER_RES', '').strip())
     if render == '1920x1080':
         # A 16:9 output above 1080p renders at 1080p as before: no patches, no extra memory.
@@ -222,16 +224,20 @@ def main():
             env['SOTC_OUTPUT_RES'] = render
         # Larger render targets: the game's heaps take what direct memory there is (run.sh).
         env.setdefault('BB_DMEM_MB', '9152')
-    if 'fps60' in modes.lower():
-        # The game waits for vblanks: at 60 Hz an uncapped frame still rounds up to 30 FPS.
-        env.setdefault('BB_VBLANK_HZ', '120')
-        # At most 60 FPS, as on a PS4 Pro: the game was never made to run faster (SOTC_FPS_CAP=0
-        # removes the cap).
-        env.setdefault('SOTC_FPS_CAP', '60')
+    # The game's direct memory allocator (a 64 KiB page bitmap over all of it) filled up and read
+    # past the bitmap (guest offset 0x1a371, read of -1): in PS4 Pro mode with 5696 MiB when a save
+    # loaded, and in PS4 mode with 5056 MiB on loading the last colossus' area (user logs, 19
+    # Oct; high quality textures keep more fine mips resident than on a PS4). Every mode gets the
+    # 9152 MiB the wide render sizes already used.
+    env.setdefault('BB_DMEM_MB', '9152')
+    # The game waits for vblanks: at 60 Hz an uncapped frame (fps60, or F7 in game) still rounds
+    # up to 30 FPS. With the cap, 120 Hz only shows a late frame sooner (and SOTC_FPS_LIMIT counts
+    # in 120 Hz vblanks).
+    env.setdefault('BB_VBLANK_HZ', '120')
 
     probe = find_probe()
     # Development builds run from the MSYS2 tree: its CLANG64 DLLs (SDL3, FFmpeg, ...).
-    if os.name == 'nt' and not (probe.parent / 'SDL3.dll').is_file():
+    if not (probe.parent / 'SDL3.dll').is_file():
         clang64 = Path(env.get('MSYS2_ROOT', r'C:\msys64')) / 'clang64' / 'bin'
         if clang64.is_dir():
             env['PATH'] = f'{clang64}{os.pathsep}{env.get("PATH", "")}'
@@ -250,7 +256,58 @@ def main():
     if env.get('SOTC_WRAP'):
         import json
         command = json.loads(env['SOTC_WRAP']) + command
-    return subprocess.run(command, stdin=subprocess.DEVNULL, creationflags=no_console()).returncode
+    # In a console the session also goes to user/last_run.log (as the launcher does; the launcher
+    # reads this script's output into its own log, so a pipe means it is not written here).
+    if not sys.stdout.isatty():
+        return subprocess.run(command, stdin=subprocess.DEVNULL, creationflags=no_console()).returncode
+    with open_session_log(user) as log:
+        game = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+        try:
+            for line in game.stdout:
+                sys.stdout.buffer.write(line)
+                sys.stdout.buffer.flush()
+                log.write(line)
+        finally:
+            code = game.wait()
+    keep_crash_log(user, code)
+    return code
+
+
+LOGS_KEPT = 5        # last_run.log and last_run.1.log ... last_run.4.log
+CRASH_LOGS_KEPT = 20
+
+
+def open_session_log(user):
+    """A fresh user/last_run.log; the previous sessions' logs move to last_run.1.log (the one
+    before) ... last_run.4.log. Same files as the launcher (launcher/sotc_launcher_win.py)."""
+    for i in range(LOGS_KEPT - 1, 0, -1):
+        older = user / ('last_run.log' if i == 1 else f'last_run.{i - 1}.log')
+        if older.is_file():
+            try:
+                os.replace(older, user / f'last_run.{i}.log')
+            except OSError:
+                pass
+    return open(user / 'last_run.log', 'wb', buffering=0)
+
+
+def keep_crash_log(user, code):
+    """After a session that ended with an error code, copies its log to
+    user/crashes/<date>_<time>_<code>.log (the last 20, and the last 5 minidumps, are kept)."""
+    if code == 0:
+        return
+    import time
+    crashes = user / 'crashes'
+    try:
+        crashes.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime('%Y-%m-%d_%H-%M-%S')
+        shutil.copy2(user / 'last_run.log', crashes / f'{stamp}_{code & 0xffffffff:#x}.log')
+        for old in sorted(crashes.glob('*.log'))[:-CRASH_LOGS_KEPT]:
+            old.unlink()
+        for old in sorted(crashes.glob('*.dmp'))[:-5]:
+            old.unlink()
+    except OSError:
+        pass
 
 
 if __name__ == '__main__':

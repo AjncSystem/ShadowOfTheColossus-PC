@@ -792,9 +792,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     const auto upscaled = Dlssg::Upscale(frame->id, draw_scheduler, texture_cache, runtime,
                                          frame->width, frame->height);
     if (Dlssg::SuperResolutionAvailable() && Dlssg::CompareMode()) {
-        BbOverlay::SetUpscalerLabel(upscaled.scene     ? Dlssg::ModeName()
-                                    : fsr_settings.enable ? "FSR1"
-                                                          : "Bilinear");
+        BbOverlay::SetUpscalerLabel(upscaled.scene && !upscaled.scene_low ? Dlssg::ModeName()
+                                    : fsr_settings.enable                 ? "FSR1"
+                                                                          : "Bilinear");
     }
     vk::ImageView upscaled_scene; // sotc: the sharpened DLSS output, for the HUD-less frame too
     if (upscaled.scene) {
@@ -813,7 +813,17 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         static const float ui_sharpen = std::max(env("SOTC_DLSS_UI_SHARPEN", 3.0f), 0.0f);
         static const float sky_sharpen = std::max(env("SOTC_DLSS_SKY_SHARPEN", 2.0f), 0.0f);
         vk::ImageView scene = upscaled.scene;
-        if (sharpness >= 0.0f) {
+        vk::Extent2D scene_size{frame->width, frame->height};
+        if (upscaled.scene_low) {
+            // sotc: no DLSS inputs (splash, menus): the scene as FSR1 would scale the frame, only
+            // the UI layer is drawn at the output size.
+            scene_size = {upscaled.scene_width, upscaled.scene_height};
+            scene = fsr_pass.Render(cmdbuf, scene, scene_size, {frame->width, frame->height},
+                                    fsr_settings, false);
+            if (DebugState.is_using_fsr) {
+                scene_size = {frame->width, frame->height};
+            }
+        } else if (sharpness >= 0.0f) {
             scene = fsr_pass.Sharpen(cmdbuf, scene, {frame->width, frame->height}, sharpness);
         }
         pp_settings.srgb_input = 0;
@@ -821,11 +831,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         if (!Dlssg::Vignette(pp_settings.vignette.data())) {
             pp_settings.vignette = {};
         }
-        pp_settings.ui_sharpen = ui_sharpen;
+        pp_settings.ui_sharpen = upscaled.ui_full ? 0.0f : ui_sharpen; // sotc: drawn at this size
         pp_settings.sky_sharpen = sky_sharpen;
-        pp_pass.Render(cmdbuf, scene, {frame->width, frame->height}, *frame, pp_settings,
-                       upscaled.ui, upscaled.sky);
-        upscaled_scene = scene;
+        pp_pass.Render(cmdbuf, scene, scene_size, *frame, pp_settings, upscaled.ui, upscaled.sky);
+        upscaled_scene = upscaled.scene_low ? vk::ImageView{} : scene;
     } else {
         runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
                         vk::PipelineStageFlagBits2::eFragmentShader,

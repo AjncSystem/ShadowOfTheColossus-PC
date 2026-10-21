@@ -101,10 +101,22 @@ bool Vignette(float out[4]);
 void NoteComposite(VideoCore::ImageId scene_id, VideoCore::ImageId ui_id,
                    VideoCore::TextureCache& texture_cache);
 
+/// sotc: SOTC_UI_HIRES (default on, 0 off) with super resolution: the draws into the game's UI
+/// layer (the image at `address` of the composite's UI size) are drawn again by the rasterizer
+/// into an image of the output size, given back here. False, or the output size.
+bool UiTarget(VAddr address, u32 width, u32 height, u32& out_width, u32& out_height);
+
+/// Command processor thread, after NoteComposite: the UI layer drawn at the output size, in layout
+/// ColorAttachmentOptimal; a null image when some draw into it could not be redrawn.
+void NoteUiShadow(vk::Image image, u32 width, u32 height);
+
 struct Upscaled {
     vk::ImageView scene; ///< linear colour at the output size, shader read only
     vk::ImageView ui;    ///< the game's UI layer (premultiplied, sRGB view), render size
     vk::ImageView sky;   ///< render size, g = 1 in the sky; empty without camera motion fill
+    bool ui_full{};      ///< ui is at the output size (UiTarget)
+    bool scene_low{};    ///< scene is the render size scene (no DLSS inputs): scale it
+    u32 scene_width{}, scene_height{};
 };
 
 /// Command processor thread, in PrepareFrame after PrepareInputs: DLSS upscales this frame's

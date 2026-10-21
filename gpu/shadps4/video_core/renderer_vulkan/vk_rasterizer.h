@@ -256,6 +256,23 @@ private:
     VAddr hudless_vo{};          ///< this draw: the video out image it renders to, 0 none
     vk::Format hudless_vo_format{};
     u32 hudless_vo_width{}, hudless_vo_height{};
+
+    /// sotc: DLSS super resolution draws the game's UI layer at the output size: each draw into
+    /// it (Dlssg::UiTarget) is drawn again into ui_shadow with its viewport and scissor scaled,
+    /// and the composite hands that to the presenter (Dlssg::NoteUiShadow). BeginUiShadow
+    /// starts the redraw of this draw, EndUiShadow restores the dynamic state.
+    bool BeginUiShadow(const GraphicsPipeline* pipeline, const RenderState& state);
+    void EndUiShadow();
+    void NoteUiShadow(); ///< at the composite: hands the shadow over, starts the next frame's
+    HudlessImage ui_shadow; ///< R8G8B8A8: rt_view sRGB, read_view UNORM
+    u32 ui_shadow_draws{};  ///< since the last composite
+    bool ui_shadow_broken{}; ///< a draw into the UI layer was not redrawn since then
+    bool ui_shadow_hit{};    ///< this draw renders into the UI layer
+    vk::Format ui_shadow_format{};
+    u32 ui_shadow_src_width{}, ui_shadow_src_height{}; ///< this draw: the UI layer size
+    u32 ui_shadow_width{}, ui_shadow_height{};         ///< this draw: the output size
+    Viewports ui_shadow_viewports;
+    Scissors ui_shadow_scissors;
 };
 
 } // namespace Vulkan

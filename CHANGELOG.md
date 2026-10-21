@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.60.3-plus4 — 2026-10-21 (fork Lucas-blip-png)
+- **Placas AMD GCN (RX 470–590, Vega, APUs mais antigas):** o flicker branco/verde/rosa de
+  personagens, fumaça e névoa (#152, #187, #201 do original) **sumiu numa RX 570** com a nova
+  conversão para 32 lanes (a que a camada SotC-AMD-Fix fazia): os shaders passam pela conversão de
+  wave64 e os pipelines de compute exigem subgrupo de 32. Agora é o padrão nessas placas (AMD com
+  subgrupo mínimo e máximo de 64); `SOTC_AMD_WAVE32=0` desliga e `=1` força em qualquer AMD. O log
+  mostra `GPU: AMD wave32 on`. O cache de shaders é refeito na primeira abertura. **Um relato de
+  queda** (GPU travada, `ErrorDeviceLost`) logo após derrotar o 1º colosso e carregar a cena
+  seguinte: se acontecer com você, mande o `last_run.log` e teste com `SOTC_AMD_WAVE32=0`.
+  Nada muda em NVIDIA, Intel nem nas AMD RDNA.
+
 ## 0.60.3-plus3 — 2026-10-20 (fork Lucas-blip-png)
 - **Queda ao abrir em PCs com pouca memória virtual:** quando o Windows recusa os 9152 MiB de
   memória do jogo (erro 1450, arquivo de paginação pequeno ou RAM ocupada), o port já caía para

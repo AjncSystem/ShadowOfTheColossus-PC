@@ -3,7 +3,8 @@
 
 #version 450
 
-// sotc: DLSS colour input in place: NaN/Inf -> 0, the rest clamped to 0..1 (tonemapped, LDR).
+// sotc: DLSS colour input in place: NaN/Inf -> 0, the rest clamped to 0..1 (tonemapped, LDR;
+// 0..64 with HDR output, where the scene keeps its highlights).
 // One bad value spreads through DLSS's history as dark blocks; the game's own path clamps.
 
 layout(local_size_x = 8, local_size_y = 8) in;
@@ -13,6 +14,7 @@ layout(binding = 0, rgba16f) uniform image2D color;
 layout(push_constant) uniform Params {
     uvec2 size;
     uint mark; // 1: NaN/Inf magenta, out of range cyan (debug)
+    float limit;
 } pc;
 
 void main() {
@@ -24,11 +26,11 @@ void main() {
     // Exponent bits, not isnan(): drivers may assume no NaN in float math.
     const uvec3 bits = floatBitsToUint(c) & 0x7f800000u;
     const bool bad = any(equal(bits, uvec3(0x7f800000u)));
-    const bool out_of_range = !bad && (any(lessThan(c, vec3(0.0))) || any(greaterThan(c, vec3(1.0))));
+    const bool out_of_range = !bad && (any(lessThan(c, vec3(0.0))) || any(greaterThan(c, vec3(pc.limit))));
     if (pc.mark != 0u && (bad || out_of_range)) {
         c = bad ? vec3(1.0, 0.0, 1.0) : vec3(0.0, 1.0, 1.0);
     } else {
-        c = bad ? vec3(0.0) : clamp(c, 0.0, 1.0);
+        c = bad ? vec3(0.0) : clamp(c, 0.0, pc.limit);
     }
     imageStore(color, p, vec4(c, 1.0));
 }

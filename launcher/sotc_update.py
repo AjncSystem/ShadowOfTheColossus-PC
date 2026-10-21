@@ -27,7 +27,7 @@ import time
 import urllib.request
 import zipfile
 
-RELEASES_URL = 'https://api.github.com/repos/AjncSystem/ShadowOfTheColossus-PC/releases/latest'
+RELEASES_URL = 'https://api.github.com/repos/Oussama268/ShadowOfTheColossus-PC/releases/latest'
 ASSET_NAME = 'SotC-PC.zip'
 TOP = 'SotC-PC'
 KEEP = ('user', 'update')  # top-level names an update never writes into

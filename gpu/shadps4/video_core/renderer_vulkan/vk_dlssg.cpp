@@ -625,6 +625,9 @@ struct Composite {
     bool copy_ok{};
     VideoCore::ImageId scene_id, ui_id;
     u64 scene_uid{}, ui_uid{};
+    vk::Image ui_shadow; ///< NoteUiShadow
+    u32 shadow_width{}, shadow_height{};
+    bool ui_full_ok{}; ///< the UI shadow is in sr_ui_full
 };
 /// An image of ours. One set: the presenter's command buffers run in order on one queue.
 struct SrImage {
@@ -637,6 +640,10 @@ struct SrImage {
 };
 Composite composite;            // command processor thread
 SrImage sr_color, sr_ui, sr_out; // command processor thread
+SrImage sr_ui_full;              // the UI layer at the output size (UiTarget)
+std::array<VAddr, 2> ui_addresses{}; // of the composite's UI layer (it may alternate)
+u32 ui_width{}, ui_height{};    // of the composite's UI layer
+u32 out_width{}, out_height{};  // of the last upscale
 bool sr_prev = false;           // the previous frame was upscaled (DLSS history is current)
 std::atomic<bool> sr_user_off{false}; // toggled by a key on the window thread
 std::atomic<u32> sr_errors{0};  // failed evaluates (recording thread); 3 turn super resolution off
@@ -1069,6 +1076,36 @@ void NoteComposite(VideoCore::ImageId scene_id, VideoCore::ImageId ui_id,
     composite.scene_uid = texture_cache.GetImage(scene_id).image_uid;
     composite.ui_id = ui_id;
     composite.ui_uid = texture_cache.GetImage(ui_id).image_uid;
+    const auto& ui = texture_cache.GetImage(ui_id);
+    if (ui.info.guest_address != ui_addresses[0]) {
+        ui_addresses[1] = std::exchange(ui_addresses[0], ui.info.guest_address);
+    }
+    ui_width = ui.info.size.width;
+    ui_height = ui.info.size.height;
+}
+
+bool UiTarget(VAddr address, u32 width, u32 height, u32& out_w, u32& out_h) {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_UI_HIRES");
+        return !v || v[0] != '0';
+    }();
+    if (!on || !SuperResolution() || !address || width != ui_width || height != ui_height ||
+        (address != ui_addresses[0] && address != ui_addresses[1]) ||
+        (out_width <= width && out_height <= height)) {
+        return false;
+    }
+    out_w = out_width;
+    out_h = out_height;
+    return true;
+}
+
+void NoteUiShadow(vk::Image image, u32 width, u32 height) {
+    if (!composite.captured) {
+        return;
+    }
+    composite.ui_shadow = image;
+    composite.shadow_width = width;
+    composite.shadow_height = height;
 }
 
 /// sr_color in place (shader read layout): NaN/Inf -> 0, clamp to 0..1 (dlss_color_sanitize.comp).
@@ -1233,6 +1270,38 @@ void CopyComposite(vk::CommandBuffer cmdbuf, VideoCore::TextureCache& texture_ca
 
     SanitizeColor(cmdbuf);
     composite.copy_ok = true;
+
+    // The UI layer drawn at the output size, left in TransferSrcOptimal (its next draw starts
+    // from Undefined).
+    composite.ui_full_ok = false;
+    if (!composite.ui_shadow || !EnsureSrImage(sr_ui_full, vk::Format::eR8G8B8A8Srgb,
+                                               composite.shadow_width, composite.shadow_height)) {
+        return;
+    }
+    const std::array to_copy{
+        barrier(composite.ui_shadow, Layout::eColorAttachmentOptimal, Layout::eTransferSrcOptimal,
+                Stage::eColorAttachmentOutput, Access::eColorAttachmentWrite, Stage::eCopy,
+                Access::eTransferRead),
+        barrier(sr_ui_full.image, Layout::eUndefined, Layout::eTransferDstOptimal,
+                Stage::eAllCommands, Access::eNone, Stage::eCopy, Access::eTransferWrite),
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = static_cast<u32>(to_copy.size()),
+        .pImageMemoryBarriers = to_copy.data(),
+    });
+    const vk::ImageCopy full_region{
+        .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .extent = {composite.shadow_width, composite.shadow_height, 1},
+    };
+    cmdbuf.copyImage(composite.ui_shadow, Layout::eTransferSrcOptimal, sr_ui_full.image,
+                     Layout::eTransferDstOptimal, full_region);
+    const auto full_to_read =
+        barrier(sr_ui_full.image, Layout::eTransferDstOptimal, Layout::eShaderReadOnlyOptimal,
+                Stage::eCopy, Access::eTransferWrite, Stage::eFragmentShader, Access::eShaderRead);
+    cmdbuf.pipelineBarrier2(
+        vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &full_to_read});
+    composite.ui_full_ok = true;
 }
 
 Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& texture_cache,
@@ -1245,6 +1314,8 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
         sr_prev = false;
         return {};
     }
+    out_width = width;
+    out_height = height;
     const vk::CommandBuffer cmdbuf = scheduler.CommandBuffer();
     const FrameSlot& f = frames[frame_id];
     if (c.captured && !c.copied) { // no draw since the composite: copy now
@@ -1253,6 +1324,14 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
         c = std::exchange(composite, Composite{});
     }
     const bool copied = c.copy_ok && sr_color.width == f.width && sr_color.height == f.height;
+    const bool ui_full = c.copy_ok && c.ui_full_ok && sr_ui_full.width == width &&
+                         sr_ui_full.height == height;
+    const vk::ImageView ui_view = ui_full ? sr_ui_full.view : sr_ui.view;
+    if (ui_full && (!f.sl_valid || !copied)) {
+        // No DLSS inputs (splash, menus): the scene at the render size, the UI at the output size.
+        sr_prev = false;
+        return {sr_color.view, ui_view, {}, true, true, sr_color.width, sr_color.height};
+    }
     if (!f.sl_valid || !copied) {
         static u32 skipped = 0;
         if (c.captured && f.sl_valid && skipped++ < 5) {
@@ -1368,9 +1447,9 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
         return v && v[0] == 'i';
     }();
     if (view_input) {
-        return {sr_color.view, sr_ui.view};
+        return {sr_color.view, ui_view, {}, ui_full};
     }
-    return {sr_out.view, sr_ui.view, sky_bias_written ? f.bias_view : vk::ImageView{}};
+    return {sr_out.view, ui_view, sky_bias_written ? f.bias_view : vk::ImageView{}, ui_full};
 }
 
 // Streamline asks for vsync off with Vulkan, but DLSS-G generates and paces its frames in

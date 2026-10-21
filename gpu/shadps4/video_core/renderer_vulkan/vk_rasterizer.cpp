@@ -2321,9 +2321,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
     // sotc: DLSS super resolution: the game's final composite samples the UI layer (an sRGB render
     // target) and the tonemapped fp16 scene, nothing else, into a video out surface.
-    if (stage.sw_stage == Shader::SwStage::Fragment && image_bindings.size() == 2 &&
-        image_bindings[0].first && image_bindings[1].first && cb_descs[0].first &&
-        Dlssg::SuperResolution()) {
+    if (Dlssg::SuperResolution() && stage.sw_stage == Shader::SwStage::Fragment &&
+        image_bindings.size() == 2 && image_bindings[0].first && image_bindings[1].first &&
+        cb_descs[0].first) {
         const auto& ui = texture_cache.GetImage(image_bindings[0].first);
         const auto& scene = texture_cache.GetImage(image_bindings[1].first);
         if (texture_cache.GetImage(cb_descs[0].first).usage.vo_surface &&

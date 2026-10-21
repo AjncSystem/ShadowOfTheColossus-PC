@@ -240,6 +240,9 @@ private:
     /// WarmUp waits for them and drops the ones the driver refused, as it does when it builds
     /// them itself.
     std::vector<ComputePipelineKey> preload_computes;
+    /// sotc: preloaded compute pipelines the driver refused, out of the map but kept alive: their
+    /// worker job may still be queued (it returns at once, the pipeline being claimed).
+    std::vector<std::unique_ptr<ComputePipeline>> preload_refused;
     size_t async_translate_queued{}; ///< translation jobs right after them, oldest first
     std::unordered_set<u64> pending_programs; ///< new programs being translated (CP only)
     std::unordered_set<u64> in_place_programs; ///< failed on a worker: translated here (CP only)

@@ -342,9 +342,11 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     ASSERT(is_new);
 
-    if (AsyncPreloadEnabled()) {
-        // sotc: built by a pipeline worker; the map entry stays null (draws skipped) until the
-        // command processor collects it (SOTC_ASYNC_PRELOAD).
+    // sotc: built by a pipeline worker; the map entry stays null (draws skipped, full-screen
+    // passes built on the command processor) until the command processor collects it
+    // (SOTC_ASYNC_PRELOAD). Not the ones whose construction reads per-draw state.
+    const bool async = AsyncPreloadEnabled() && AsyncPipelineEligible();
+    if (async) {
         QueueAsyncPipeline(std::hash<GraphicsPipelineKey>{}(graphics_key), &sdata);
     } else {
         WarmUpTimer timer{warmup_times.pipelines};
@@ -357,7 +359,7 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     modules.fill(nullptr);
     fetch_shader = nullptr;
 
-    if (AsyncPreloadEnabled()) {
+    if (async) {
         return true; // a refused one is dropped when collected (CollectAsyncPipelines)
     }
     if (!it.value()->Handle()) {
@@ -537,6 +539,7 @@ void PipelineCache::WarmUp() {
         }
         it.value()->WaitBuilt();
         if (!it.value()->Handle()) {
+            preload_refused.push_back(std::move(it.value()));
             compute_pipelines.erase(it);
             --num_pipelines;
         }

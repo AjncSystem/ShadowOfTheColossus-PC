@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC native port · v0.60.3-plus2
+# Shadow of the Colossus — PC native port · v0.60.3-plus3
 
 **The original 0.60.3, plus CPUs without BMI1 (pre-Haswell), CPUs with 4 threads, 120 Hz
 fullscreen and a fix to test for AMD GCN cards (RX 470–590).** Everything in [AjncSystem's 0.60.3](https://github.com/AjncSystem/ShadowOfTheColossus-PC)
@@ -54,6 +54,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.60.3-plus3** | **Lucas-blip-png fork:** fixes two crashes: at boot when Windows refuses the 9152 MiB of game memory (small page file), and with **frame generation on PCs with an AMD and an NVIDIA card**; FSR 1 barriers. |
 | **0.60.3-plus2** | **Lucas-blip-png fork:** a fix to test for **AMD GCN cards** (RX 470–590, Vega: white, flickering characters and smoke) and a little more FPS on **CPUs with 4 threads** (+4% on 2 cores with SMT). |
 | **0.60.3-plus** | **Lucas-blip-png fork:** all of the original's **0.60.3** (the game can be finished; quick settings in the in-game menu), plus **CPUs with 4 threads** (the GPU threads no longer spin on a core the game needs: from stuck loading to 76 FPS on 4 logical processors), **CPUs without BMI1** and **120 Hz fullscreen**. |
 | **0.60.3** | **The game can be finished from start to end** (played from the last colossus through the ending and credits): fix for the high quality textures crash in wide views (#186), fix for the crash on the load after the credits, +2.7% FPS at the Shrine. |

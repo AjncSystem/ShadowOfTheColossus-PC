@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.60.3-plus3 — 2026-10-20 (fork Lucas-blip-png)
+- **Queda ao abrir em PCs com pouca memória virtual:** quando o Windows recusa os 9152 MiB de
+  memória do jogo (erro 1450, arquivo de paginação pequeno ou RAM ocupada), o port já caía para
+  5056 MiB, mas só depois de o jogo ter perguntado o tamanho. O jogo então alocava perto dos 9 GiB,
+  não recebia nada e caía no boot (guest offset 0x18cae, #194 do original). Agora a memória é criada
+  antes de o tamanho ser informado. O log mostra `guest memory refused ... using 5056 MiB`, e um
+  arquivo de paginação maior devolve os 9152 MiB.
+- **Queda ao ligar a geração de quadros com uma AMD e uma NVIDIA no mesmo PC:** o Streamline
+  (DLSS-G) era carregado se houvesse qualquer placa NVIDIA, mas o jogo roda na placa de mais memória
+  (uma RX 9070, no relato), e a criação do dispositivo falhava (`VK_NV_low_latency2`, #194). Agora o
+  Streamline só carrega quando a placa usada é NVIDIA (`SOTC_GPU_VENDOR` também é respeitado).
+- **FSR 1:** a imagem do jogo agora espera pelo compute shader do EASU, e a imagem de saída espera
+  pelos últimos leitores. Pela especificação do Vulkan faltavam essas duas barreiras. É candidata a
+  causa de falhas do FSR 1 em algumas AMD (#209), mas não está confirmada.
+
 ## 0.60.3-plus2 — 2026-10-20 (fork Lucas-blip-png)
 - **Placas AMD GCN (RX 470–590, Vega, APUs mais antigas), para testar:** personagens piscando em
   branco, verde ou rosa, fumaça branca e névoa com cores que mudam a cada execução (#152, #187 e

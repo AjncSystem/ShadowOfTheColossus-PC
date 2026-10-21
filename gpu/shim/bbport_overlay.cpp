@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -183,6 +184,9 @@ ImGuiKey KeyFromGamepad(u8 button) {
 std::string toast_text;
 std::atomic<long long> toast_until_ms{0};
 
+// sotc: when the last game flip came (steady clock milliseconds), kept by LoadingShown.
+std::atomic<long long> last_flip_ms{0};
+
 long long NowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
@@ -315,7 +319,13 @@ void QuickSettings() {
     if (ImGui::Checkbox(T("60 FPS (sem o limite de 30)  [F7]", "60 FPS (no 30 FPS cap)  [F7]"),
                         &uncapped)) {
         SotcFpsCap::Toggle();
-        SaveLauncherSetting("fps_mode", uncapped ? "\"60\"" : "\"30\"");
+        // Without the cap the launcher's limit stays as started: SOTC_FPS_LIMIT=0 is its
+        // "unlimited", which must not turn into "60" when the box is switched off and on again.
+        static const bool unlimited = [] {
+            const char* v = std::getenv("SOTC_FPS_LIMIT");
+            return v && std::strcmp(v, "0") == 0;
+        }();
+        SaveLauncherSetting("fps_mode", !uncapped ? "\"30\"" : unlimited ? "\"unlimited\"" : "\"60\"");
     }
 
     using Vulkan::FrameGen::Mode;
@@ -683,8 +693,11 @@ void LoadingScreen() {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
     ImGui::SetNextWindowSize(viewport->WorkSize);
-    // sotc: opaque, so the game's last frame does not show through looking frozen.
-    ImGui::SetNextWindowBgAlpha(1.0f);
+    // sotc: a hitch of a second or two in play only dims the picture; after 3 s without a game
+    // frame (boot, shader cache, long loads) the backdrop turns opaque within half a second, so the
+    // game's last frame does not show through looking frozen.
+    const long long stall = NowMs() - last_flip_ms.load(std::memory_order_relaxed);
+    ImGui::SetNextWindowBgAlpha(std::clamp(0.55f + float(stall - 3000) / 500.0f * 0.45f, 0.55f, 1.0f));
     ImGui::Begin("##loading", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
                      ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing |
@@ -1183,14 +1196,13 @@ bool LoadingShown() {
     // sotc: a second without a game flip. Read from the presenter and the video out threads: the
     // races only move the moment by a frame.
     static std::atomic<u64> seen{~u64{0}};
-    static std::atomic<long long> since{0};
     const u64 flips = SotcStats::flip_count.load(std::memory_order_relaxed);
     const long long now = NowMs();
     if (seen.exchange(flips, std::memory_order_relaxed) != flips) {
-        since.store(now, std::memory_order_relaxed);
+        last_flip_ms.store(now, std::memory_order_relaxed);
         return false;
     }
-    return now - since.load(std::memory_order_relaxed) >= 1000;
+    return now - last_flip_ms.load(std::memory_order_relaxed) >= 1000;
 }
 
 bool Visible() {

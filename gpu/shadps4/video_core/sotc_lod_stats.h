@@ -111,7 +111,25 @@ inline void Collect(u64 (&entries)[256]) {
     static u32 reports = 0;
     if (linger_now && pool_low > 0 && reports++ % 30 == 0) {
         const int free = PoolFreePercent();
-        const u64 want = free < 0 ? coarser : free < pool_low / 2 ? 2 : free < pool_low ? 1 : 0;
+        // sotc: with hysteresis. The pool hovers at 0-14% free in large areas (9152 MiB), and
+        // switching at one threshold changed the mip every second or two (4, 3, 2, 3, 2...): each
+        // switch makes the game drop or stream fine mips while they are drawn, and the ending
+        // showed cyan, speckled blocks on carved stone. Coarser below pool_low (two levels below
+        // pool_low * 3 / 8), finer again only above twice pool_low (one level back above
+        // pool_low * 3 / 4).
+        u64 want = coarser;
+        if (free >= 0) {
+            if (free < pool_low * 3 / 8) {
+                want = 2;
+            } else if (free < pool_low) {
+                want = std::max<u64>(coarser, 1);
+            } else if (coarser == 2 && free > pool_low * 3 / 4) {
+                want = 1;
+            }
+            if (want == 1 && coarser == 1 && free > pool_low * 2) {
+                want = 0;
+            }
+        }
         if (want != coarser) {
             coarser = want;
             std::fprintf(stderr, "SOTC LOD: game page pool %d%% free, sampled textures ask for mip %u\n",

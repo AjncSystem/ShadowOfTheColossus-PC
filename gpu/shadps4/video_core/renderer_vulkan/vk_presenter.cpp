@@ -786,24 +786,70 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     // Continue with host-side passes that draw the displayed (scaled) frame.
 
-    runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
-                    vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderRead);
-    runtime.FlushBarriers();
+    // sotc: DLSS super resolution (SOTC_UPSCALER=dlss): the game's scene before its UI, upscaled
+    // to the frame's size; the post process pass puts the UI layer back over it. Frames without
+    // that scene (menus, loading screens) are presented as before.
+    const auto upscaled = Dlssg::Upscale(frame->id, draw_scheduler, texture_cache, runtime,
+                                         frame->width, frame->height);
+    if (Dlssg::SuperResolutionAvailable() && Dlssg::CompareMode()) {
+        BbOverlay::SetUpscalerLabel(upscaled.scene     ? Dlssg::ModeName()
+                                    : fsr_settings.enable ? "FSR1"
+                                                          : "Bilinear");
+    }
+    vk::ImageView upscaled_scene; // sotc: the sharpened DLSS output, for the HUD-less frame too
+    if (upscaled.scene) {
+        // DLSS has no sharpening of its own: full-strength RCAS (needed to match FSR1 detail),
+        // unless SOTC_DLSS_SHARPEN (attenuation in stops, 0 = sharpest) or "off" says otherwise.
+        // SOTC_DLSS_UI_SHARPEN and SOTC_DLSS_SKY_SHARPEN: unsharp amounts of the upscaled UI
+        // and of the sky (0 = none).
+        static const auto env = [](const char* name, float fallback) {
+            const char* v = std::getenv(name);
+            if (!v || !*v) {
+                return fallback;
+            }
+            return v[0] == 'o' ? -1.0f : static_cast<float>(std::atof(v));
+        };
+        static const float sharpness = env("SOTC_DLSS_SHARPEN", 0.0f);
+        static const float ui_sharpen = std::max(env("SOTC_DLSS_UI_SHARPEN", 3.0f), 0.0f);
+        static const float sky_sharpen = std::max(env("SOTC_DLSS_SKY_SHARPEN", 2.0f), 0.0f);
+        vk::ImageView scene = upscaled.scene;
+        if (sharpness >= 0.0f) {
+            scene = fsr_pass.Sharpen(cmdbuf, scene, {frame->width, frame->height}, sharpness);
+        }
+        pp_settings.srgb_input = 0;
+        pp_settings.ui = 1;
+        if (!Dlssg::Vignette(pp_settings.vignette.data())) {
+            pp_settings.vignette = {};
+        }
+        pp_settings.ui_sharpen = ui_sharpen;
+        pp_settings.sky_sharpen = sky_sharpen;
+        pp_pass.Render(cmdbuf, scene, {frame->width, frame->height}, *frame, pp_settings,
+                       upscaled.ui, upscaled.sky);
+        upscaled_scene = scene;
+    } else {
+        runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
+                        vk::PipelineStageFlagBits2::eFragmentShader,
+                        vk::AccessFlagBits2::eShaderRead);
+        runtime.FlushBarriers();
 
-    image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
-                                 fsr_settings, frame->is_hdr);
+        image_view = fsr_pass.Render(cmdbuf, image_view, image_size,
+                                     {frame->width, frame->height}, fsr_settings, frame->is_hdr);
 
-    // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
-    // the post process pass still sRGB encoded and has to be decoded there instead.
-    pp_settings.srgb_input =
-        attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
-    pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+        // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
+        // the post process pass still sRGB encoded and has to be decoded there instead.
+        pp_settings.srgb_input =
+            attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
+        pp_settings.ui = 0;
+        pp_settings.vignette = {};
+        pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+    }
 
     // sotc: the game frame without the HUD, through the same pass (frame generation keeps the
     // HUD of the real frame instead of interpolating it). Not with FSR 1 scaling, whose images
-    // are a ring meant for one frame each.
+    // are a ring meant for one frame each. With DLSS super resolution the DLSS output is the
+    // frame without its HUD (the UI layer is only put over it here), so it is used instead.
     if (const vk::ImageView hudless_view = rasterizer->TakeHudless(cpu_address, view_info.format);
-        hudless_view && !DebugState.is_using_fsr) {
+        hudless_view && (upscaled_scene || !DebugState.is_using_fsr)) {
         Frame& hudless = hudless_frames[frame->id];
         if (hudless.width != frame->width || hudless.height != frame->height ||
             hudless.is_hdr != frame->is_hdr || !hudless.image) {
@@ -815,7 +861,14 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             .imageMemoryBarrierCount = 1,
             .pImageMemoryBarriers = &hudless_barrier,
         });
-        pp_pass.Render(cmdbuf, hudless_view, image_size, hudless, pp_settings);
+        if (upscaled_scene) {
+            auto scene_only = pp_settings;
+            scene_only.ui = 2; // the vignette, without the UI layer
+            pp_pass.Render(cmdbuf, upscaled_scene, {frame->width, frame->height}, hudless,
+                           scene_only, upscaled.ui, upscaled.sky);
+        } else {
+            pp_pass.Render(cmdbuf, hudless_view, image_size, hudless, pp_settings);
+        }
         frame->hudless = &hudless;
         Dlssg::NoteHudless(frame->id, hudless.image, hudless.image_view,
                            swapchain.GetSurfaceFormat().format, hudless.width, hudless.height);

@@ -133,6 +133,8 @@ add_host_shader(fsr.comp fsr_rcas_comp SAMPLE_RCAS=1)
 add_host_shader(post_process.frag post_process_frag)
 add_host_shader(shadow_scroll.frag shadow_scroll_frag)
 add_host_shader(fg_depth.comp fg_depth_comp)
+add_host_shader(dlss_mvec_fill.comp dlss_mvec_fill_comp)
+add_host_shader(dlss_color_sanitize.comp dlss_color_sanitize_comp)
 foreach(BPP IN ITEMS 8 16 32 64 96 128)
     add_host_shader(tiling.comp tiling_micro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=0)
     add_host_shader(tiling.comp tiling_macro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=1)
@@ -293,6 +295,14 @@ if (WIN32)
     # The PS4 range (64 GiB - 1 TiB) must stay free: no high-entropy ASLR for heaps and stacks.
     # The guest main thread runs on the process stack: 16 MiB, committed (no stack probes).
     target_link_options(bb-probe PRIVATE -Wl,--disable-high-entropy-va "SHELL:-Xlinker --stack -Xlinker 16777216,16777216")
+    # sotc: leak hunting build (SOTC_HEAP_TRACK=<file>, see shim/bbport_heap_track.cpp).
+    option(BB_HEAP_TRACK "Wrap malloc/new and record live allocations by call stack" OFF)
+    if (BB_HEAP_TRACK)
+        target_sources(bb-probe PRIVATE shim/bbport_heap_track.cpp)
+        target_compile_definitions(bb-probe PRIVATE BB_HEAP_TRACK)
+        target_link_options(bb-probe PRIVATE
+            -Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free)
+    endif()
     add_executable(bb-gpu-capabilities ../tools/gpu_capabilities.c ../packaging/windows/bb-gpu-capabilities.rc)
     target_link_libraries(bb-gpu-capabilities PRIVATE Vulkan::Vulkan)
 endif()

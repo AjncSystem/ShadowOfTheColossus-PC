@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.60.4 — 2026-10-20
+- **Blocos ciano nas pedras e flores piscando** (com "Texturas em alta qualidade"): o ajuste da
+  0.60.3 que evita a queda trocava o nível de detalhe das texturas a cada um ou dois segundos nas
+  áreas grandes (4, 3, 2, 3, 2…), e cada troca fazia o jogo descartar ou recarregar texturas que
+  estavam sendo desenhadas. Agora ele só baixa o detalhe com menos de 8% de memória livre e só
+  volta acima de 16%. Testado do Novo Jogo+ até o 2º colosso: 3 trocas em vez de ~8, sem blocos
+  ciano, sem flores piscando e sem quedas.
+
 ## 0.60.3 — 2026-10-20
 **O jogo é zerável do início ao fim.** Jogado do save antes do último colosso até a luta com o
 Malus, as cenas finais e os créditos, com "Texturas em alta qualidade", modo PS4 Pro e 60 FPS

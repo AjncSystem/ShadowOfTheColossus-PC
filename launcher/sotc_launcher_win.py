@@ -37,7 +37,7 @@ CONFIG_DIR = PORT_DIR / 'user'
 CONFIG_FILE = CONFIG_DIR / 'launcher_settings.json'
 GAME_ID, GAME_VERSION = 'CUSA08809', '01.01'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.60.3-opt9'
+VERSION = '0.60.4-opt9'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -136,6 +136,8 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
                 'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'volume': '100', 'shadow_reuse': '0', 'library_dirs': [], 'keys': {},
                 'auto_setup': True, 'dlc_dir': '', 'framegen': 'off',
+                'dlss_mode': 'quality', 'dlss_sharpen': '0', 'dlss_ui_sharpen': '3', 'dlss_sky_sharpen': '2',
+                'dlss_compare': False,
                 'check_updates': True, 'skip_version': ''}
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
 KEY_INPUTS = [
@@ -220,6 +222,7 @@ SCREENS = [('1920x1080', '16:9, 1080p'), ('2560x1440', '16:9, 1440p'), ('3840x21
 OUTPUTS = [('1280x720', ('1280 × 720 (16:9, 720p)', '1280 × 720 (16:9, 720p)'))] + [
     (size, (f"{size.replace('x', ' × ')} ({label})",) * 2) for size, label in SCREENS]
 UPSCALERS = [('fsr1', ('FSR 1 (AMD, qualquer placa)', 'FSR 1 (AMD, any GPU)')),
+             ('dlss', ('NVIDIA DLSS (RTX)', 'NVIDIA DLSS (RTX)')),
              ('bilinear', ('Bilinear (simples)', 'Bilinear (plain)'))]
 # Button icons in the game: the PlayStation prompts, or Xbox ones drawn for the port
 # (tools/make_button_icons.py, glyphs/xbox) put in place of the game's textures.
@@ -235,6 +238,18 @@ FRAMEGEN = [('off', ('Desligada', 'Off')),
             ('auto', ('Automática (DLSS-G ou FSR 3, experimental)', 'Automatic (DLSS-G or FSR 3, experimental)')),
             ('dlss', ('NVIDIA DLSS-G (RTX 40/50)', 'NVIDIA DLSS-G (RTX 40/50)')),
             ('fsr', ('AMD FSR 3 (qualquer placa)', 'AMD FSR 3 (any GPU)'))]
+# DLSS super resolution (bb-probe: SOTC_UPSCALER=dlss): the game renders at the output size
+# divided by the mode's factor and DLSS picks its mode from that ratio (vk_dlssg.cpp).
+DLSS_MODES = [('quality', ('Qualidade (1,5×)', 'Quality (1.5×)')),
+              ('balanced', ('Equilibrado (1,72×)', 'Balanced (1.72×)')),
+              ('performance', ('Desempenho (2×)', 'Performance (2×)'))]
+DLSS_FACTORS = {'quality': 1.5, 'balanced': 1.724, 'performance': 2.0}
+# RCAS after DLSS (SOTC_DLSS_SHARPEN, attenuation in stops: 0 = sharpest).
+DLSS_SHARPNESS = [('0', ('Alta (padrão)', 'High (default)')), ('0.5', ('Média', 'Medium')), ('1', ('Baixa', 'Low')),
+                  ('off', ('Desligada', 'Off'))]
+# Unsharp amounts of the upscaled text/UI and of the sky (SOTC_DLSS_UI_SHARPEN / _SKY_SHARPEN).
+DLSS_UI_SHARPNESS = [('3', ('Alta (padrão)', 'High (default)')), ('1.5', ('Média', 'Medium')), ('0', ('Desligada', 'Off'))]
+DLSS_SKY_SHARPNESS = [('2', ('Alta (padrão)', 'High (default)')), ('1', ('Média', 'Medium')), ('0', ('Desligada', 'Off'))]
 SHARPNESS = [('0', ('Alta', 'High')), ('250', ('Média (padrão)', 'Medium (default)')), ('600', ('Baixa', 'Low')),
              ('off', ('Desligada', 'Off'))]
 MOUSE_SENS = [('0.5', ('0,5 (lenta)', '0.5 (slow)')), ('0.75', ('0,75', '0.75')), ('1.0', ('1,0 (padrão)', '1.0 (default)')),
@@ -490,9 +505,21 @@ def game_environment(s):
     # upscaler takes it to the output). 720p renders at 1080p, as on PS4; the PS4 Pro path keeps its
     # own sizes.
     output = env['SOTC_OUTPUT_RES']
-    if output not in ('1280x720', '1920x1080') and env['SOTC_NEO'] == '0':
+    upscaler = s.get('upscaler', 'fsr1')
+    if upscaler == 'dlss' and env['SOTC_NEO'] == '0':
+        env['SOTC_RENDER_RES'] = dlss_render(output, s.get('dlss_mode'))
+    elif output not in ('1280x720', '1920x1080') and env['SOTC_NEO'] == '0':
         env['SOTC_RENDER_RES'] = output
-    env['BB_FSR1'] = '1' if s.get('upscaler', 'fsr1') == 'fsr1' else '0'
+    # DLSS: FSR 1 stays the upscaler of frames without the game's scene (menus) and the fallback
+    # without an RTX card or the NVIDIA DLLs.
+    env['BB_FSR1'] = '1' if upscaler in ('fsr1', 'dlss') else '0'
+    if upscaler == 'dlss':
+        env['SOTC_UPSCALER'] = 'dlss'
+        env['SOTC_DLSS_SHARPEN'] = str(s.get('dlss_sharpen') or '0')
+        env['SOTC_DLSS_UI_SHARPEN'] = str(s.get('dlss_ui_sharpen') or '3')
+        env['SOTC_DLSS_SKY_SHARPEN'] = str(s.get('dlss_sky_sharpen') or '2')
+        if s.get('dlss_compare'):
+            env['SOTC_DLSS_COMPARE'] = '1'
     if s.get('sharpness') == 'off':
         env['BB_RCAS'] = '0'
     else:
@@ -511,6 +538,21 @@ def game_environment(s):
     env['PYTHONUNBUFFERED'] = '1'
     env['PYTHONIOENCODING'] = 'utf-8'
     return env
+
+
+def dlss_render(output, mode):
+    """The render size for DLSS mode at output WxH: multiples of 8, at least 640x360 (sotc.py still
+    caps it at 1080 lines). The exact aspect when a size within 6% of the factor has it: the
+    presenter keeps the render's aspect, so 2552x1064 for 3840x1600 gave a 3838 wide output."""
+    try:
+        w, h = map(int, output.split('x'))
+    except ValueError:
+        return output
+    target = h / DLSS_FACTORS.get(mode, 1.5)
+    exact = [rh for rh in range(360, h + 1, 8) if rh * w % (h * 8) == 0 and abs(rh - target) <= target * 0.06]
+    rh = min(exact, key=lambda rh: abs(rh - target)) if exact else max(360, round(target / 8) * 8)
+    rw = max(640, round(rh * w / h / 8) * 8)
+    return f'{rw}x{rh}'
 
 
 def is_wide(size):
@@ -1053,6 +1095,21 @@ class Launcher:
         self.row(f, _('Upscaler', 'Upscaler'), self.choice(f, 'upscaler', UPSCALERS),
                  _('FSR 1 amplia com bordas nítidas (acima de 1080p).', 'FSR 1 upscales with sharp edges (above 1080p).'))
         self.row(f, _('Nitidez (RCAS)', 'Sharpening (RCAS)'), self.choice(f, 'sharpness', SHARPNESS))
+        self.section(f, _('NVIDIA DLSS', 'NVIDIA DLSS'))
+        self.note(f, _('Com o upscaler DLSS (placas RTX): o jogo renderiza menor e o DLSS amplia com detalhe '
+                       'reconstruído dos quadros anteriores. Sem placa RTX ou sem os arquivos da NVIDIA, o FSR 1 '
+                       'amplia a mesma imagem menor.',
+                       'With the DLSS upscaler (RTX cards): the game renders smaller and DLSS enlarges it with '
+                       'detail rebuilt from earlier frames. Without an RTX card or the NVIDIA files, FSR 1 '
+                       'enlarges the same smaller image.'), top=2)
+        self.row(f, _('Modo', 'Mode'), self.choice(f, 'dlss_mode', DLSS_MODES),
+                 _('Fator entre a saída e o tamanho renderizado. O jogo renderiza no máximo 1080 linhas: '
+                   'acima de 1620p (Qualidade) ou 1860p (Equilibrado) o DLSS amplia mais que o fator.',
+                   'Factor between the output and the render size. The game renders at most 1080 lines: '
+                   'above 1620p (Quality) or 1860p (Balanced) DLSS enlarges more than the factor.'))
+        self.row(f, _('Nitidez da cena', 'Scene sharpening'), self.choice(f, 'dlss_sharpen', DLSS_SHARPNESS))
+        self.row(f, _('Nitidez do texto', 'Text sharpening'), self.choice(f, 'dlss_ui_sharpen', DLSS_UI_SHARPNESS))
+        self.row(f, _('Nitidez do céu', 'Sky sharpening'), self.choice(f, 'dlss_sky_sharpen', DLSS_SKY_SHARPNESS))
         self.section(f, _('Modo PS4 Pro', 'PS4 Pro mode'))
         self.check(f, 'neo', _('Apresentar-se como PS4 Pro', 'Present as a PS4 Pro'),
                    _('O jogo passa a oferecer, no menu Opções > Apresentação, o Modo Grafismo do PS4 Pro: '
@@ -1076,11 +1133,11 @@ class Launcher:
                                      'Full water reflections (direct memory access)'),
                    _('Deixa os shaders lerem tabelas da memória do jogo direto (como o Pink-shadPS4): o lago ondula '
                      'e reflete até longe. Desligado ganha ~10% de FPS, mas a água longe fica mais lisa. '
-                     'Ao trocar, os shaders são compilados de novo na primeira vez. Em placas AMD fica '
+                     'Ao trocar, os shaders são compilados de novo na primeira vez. Em placas AMD e Intel fica '
                      'desligado (desenhava listras nas sombras e na água).',
                      'Lets shaders read tables straight from game memory (as Pink-shadPS4 does): the lake ripples '
                      'and reflects far away. Off gains ~10% FPS, but distant water is flatter. After a change '
-                     'the shaders are compiled again the first time. Off on AMD cards (it drew stripes over '
+                     'the shaders are compiled again the first time. Off on AMD and Intel cards (it drew stripes over '
                      'shadows and water).'))
         self.row(f, _('Envio de trabalho à GPU', 'GPU work submission'), self.choice(f, 'gpu_submit', GPU_SUBMIT),
                  _('Manda trabalho à GPU a cada 0,5 ms e lê resultados por um atalho (técnicas do Pink-shadPS4). '
@@ -1221,6 +1278,11 @@ class Launcher:
         ttk.Button(holder, text=_('Limpar cache de shaders', 'Clear shader cache'), command=self.clear_cache).pack(side='left')
         self.section(f, _('Diagnóstico', 'Diagnostics'))
         self.check(f, 'show_fps', _('FPS no registro (a cada 5 s)', 'FPS in the log (every 5 s)'))
+        self.check(f, 'dlss_compare', _('Comparar DLSS com FSR 1 (F9)', 'Compare DLSS with FSR 1 (F9)'),
+                   _('Com o upscaler DLSS: F9 no jogo troca entre DLSS e FSR 1, e o upscaler em uso aparece no '
+                     'canto superior direito.',
+                     'With the DLSS upscaler: F9 in game switches between DLSS and FSR 1, and the upscaler in '
+                     'use shows in the top right corner.'))
         self.row(f, _('Leituras da GPU', 'GPU readbacks'), self.choice(f, 'readbacks', READBACKS))
         self.row(f, _('Cvars do motor', 'Engine cvars'), ttk.Entry(f, textvariable=self.var('engine_cvars'), width=58),
                  _('Avançado: NOME=valor separados por espaço, acrescentados à linha de comando do jogo.',
@@ -1292,7 +1354,7 @@ class Launcher:
     def summary(self):
         parts = [dict((k, _(*v)) for k, v in FPS_MODES).get(self.var('fps_mode').get(), '30 FPS'),
                  self.var('output_res').get().replace('x', ' × '),
-                 'FSR 1' if self.var('upscaler').get() == 'fsr1' else 'bilinear']
+                 {'fsr1': 'FSR 1', 'dlss': 'DLSS'}.get(self.var('upscaler').get(), 'bilinear')]
         framegen = self.var('framegen').get()
         if framegen != 'off':
             parts.append({'auto': _('geração de quadros', 'frame generation'), 'dlss': 'DLSS-G',

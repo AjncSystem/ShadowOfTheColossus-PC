@@ -35,6 +35,10 @@ bool Visible();
 void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
             bool game_frame = true);
 
+/// sotc: any thread, every frame: the upscaler label in the top right corner (a static string;
+/// nullptr: none).
+void SetUpscalerLabel(const char* label);
+
 /// The menu is open or a text entry is shown: the game's input is held neutral.
 bool CapturesInput();
 

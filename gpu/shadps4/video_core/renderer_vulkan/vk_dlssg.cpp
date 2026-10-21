@@ -1043,6 +1043,41 @@ bool CapturingInputs() {
     return Capturing() || sr_supported;
 }
 
+bool CameraLogOnly() {
+    // sotc: tools/gameplay_bench.py --horse tells riding from walking by the camera speed; the
+    // camera came only from DLSS-G's inputs, so the riding benchmark needed an RTX 40 card.
+    static const bool cam_log = [] {
+        const char* v = std::getenv("SOTC_CAM_LOG");
+        return v && v[0] == '1';
+    }();
+    return cam_log && !CapturingInputs();
+}
+
+void NoteCamera(const AmdGpu::Regs& regs, u32 mrt_mask) {
+    if (!(mrt_mask & (1u << 4))) {
+        return;
+    }
+    const auto& cb4 = regs.color_buffers[4];
+    if (!cb4 || cb4.GetDataFmt() != AmdGpu::DataFormat::Format16_16 ||
+        cb4.GetNumberFmt() != AmdGpu::NumberFormat::Float || !regs.depth_buffer.DepthValid()) {
+        return;
+    }
+    static long long last_ms = 0;
+    LARGE_INTEGER t, f;
+    QueryPerformanceCounter(&t);
+    QueryPerformanceFrequency(&f);
+    const long long ms = static_cast<long long>(t.QuadPart * 1000 / f.QuadPart);
+    if (ms - last_ms < 160) {
+        return;
+    }
+    Camera cam{};
+    if (!ReadCamera(regs, cam)) {
+        return;
+    }
+    last_ms = ms;
+    std::fprintf(stderr, "SOTC CAM %lld %.2f %.2f %.2f\n", ms, cam.pos[0], cam.pos[1], cam.pos[2]);
+}
+
 std::mutex vignette_mutex;
 float vignette_params[4]{};
 bool vignette_valid = false;

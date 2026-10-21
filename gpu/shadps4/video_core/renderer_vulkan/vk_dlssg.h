@@ -46,6 +46,14 @@ bool Enabled();
 /// DLSS super resolution is on: the rasterizer then calls NoteDraw.
 bool CapturingInputs();
 
+/// SOTC_CAM_LOG=1 while CapturingInputs() is false (no DLSS or frame generation, e.g. any card
+/// without DLSS-G): the rasterizer calls NoteCamera instead of NoteDraw.
+bool CameraLogOnly();
+
+/// Command processor thread, at each draw: logs the camera position of G-buffer draws
+/// ("SOTC CAM <ms> x y z", the line NoteDraw's frames print) at most every 160 ms.
+void NoteCamera(const AmdGpu::Regs& regs, u32 mrt_mask);
+
 /// The present mode DLSS-G needs (Vulkan: no vsync), when Enabled().
 bool WantsImmediatePresent();
 

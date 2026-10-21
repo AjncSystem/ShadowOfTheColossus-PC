@@ -118,7 +118,8 @@ bool loaded = false;    // sl.interposer.dll loaded, slInit done
 bool supported = false; // DLSS-G supported on the device
 bool fg_wanted = false;    // FrameGen::WantStreamline() (SOTC_FRAMEGEN, SOTC_DLSSG=1)
 bool sr_wanted = false;    // SOTC_UPSCALER=dlss
-bool sr_supported = false; // DLSS super resolution supported on the device
+// DLSS super resolution supported on the device (atomic: F9 reads it on the window thread)
+std::atomic<bool> sr_supported{false};
 bool vsync_off = true;  // eVSyncOffRequired
 int log_level = 0;      // SOTC_DLSSG_LOG
 const Instance* g_instance{};
@@ -1763,7 +1764,8 @@ void PrepareInputs(u32 frame_id, vk::CommandBuffer cmdbuf, VideoCore::TextureCac
     SwapImages(f, snap);
     FillCameraMotion(cmdbuf, f, constants);
 
-    if (sr_supported && !sr_prev) {
+    // sotc: only while SR upscales (not with F9 on FSR 1): the reset also stops frame generation.
+    if (SuperResolution() && !sr_prev) {
         constants.reset = sl::Boolean::eTrue; // DLSS SR has no history to build on
     }
     f.constants = constants;

@@ -3,11 +3,12 @@
 # route every time), 60 FPS mode, no input. Prints FPS per 5 s, the average and the minimum
 # from 60 s on, and saves a shot every 30 s (out/dump/sheet.png). Extra arguments: --env X=Y.
 # Environment: SOTC_GAME_DIR, BENCH_SECONDS (default 360), and PY / BENCH_CVARS (bench_common.sh).
+# BENCH_RENDER=WxH: the game renders at that size (sotc_modes.py --render), e.g. for DLSS.
 cd "$(dirname "$0")/.."
 source tools/bench_common.sh
 G=${SOTC_GAME_DIR:-"$(dirname "$0")/../../CUSA08809"}
 SECONDS_TOTAL=${BENCH_SECONDS:-360}
-$PY scripts/sotc_modes.py "$G" --out out --modes fps60,af16 --cvars "$BENCH_CVARS" >/dev/null
+$PY scripts/sotc_modes.py "$G" --out out --modes fps60,af16 ${BENCH_RENDER:+--render "$BENCH_RENDER"} --cvars "$BENCH_CVARS" >/dev/null
 cp out/patches.bin out/bench.patches; cp out/cmdline.bin out/bench.cmdline
 bench_env fps60,af16
 shots=(); for t in $(seq 60 30 $((SECONDS_TOTAL - 5))); do shots+=("$t:shot"); done

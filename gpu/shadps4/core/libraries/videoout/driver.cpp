@@ -21,6 +21,7 @@
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/renderer_vulkan/vk_framegen.h"
+#include "bbport_mem_report.h"
 #include "bbport_overlay.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/sotc_fps_cap.h"
@@ -442,6 +443,13 @@ void VideoOutDriver::Flip(const Request& req) {
                 }
                 if (!allocs.empty()) {
                     ReportPrintf(report, "SOTC ALLOC %s\n", allocs.c_str());
+                }
+                // sotc: heaps vs other private memory, every 12th report (a minute at 5 s).
+                static u32 mem_reports = 0;
+                if (mem_reports++ % 12 == 0) {
+                    if (const std::string mem = BbMemReport::Line(); !mem.empty()) {
+                        ReportPrintf(report, "SOTC MEM %s\n", mem.c_str());
+                    }
                 }
                 if (const uint64_t translate = SotcStats::compile_phase_ns[0].exchange(0)) {
                     const auto take = [](int i) {

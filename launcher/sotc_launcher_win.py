@@ -222,7 +222,7 @@ SCREENS = [('1920x1080', '16:9, 1080p'), ('2560x1440', '16:9, 1440p'), ('3840x21
 OUTPUTS = [('1280x720', ('1280 × 720 (16:9, 720p)', '1280 × 720 (16:9, 720p)'))] + [
     (size, (f"{size.replace('x', ' × ')} ({label})",) * 2) for size, label in SCREENS]
 UPSCALERS = [('fsr1', ('FSR 1 (AMD, qualquer placa)', 'FSR 1 (AMD, any GPU)')),
-             ('dlss', ('NVIDIA DLSS (RTX)', 'NVIDIA DLSS (RTX)')),
+             ('dlss', ('NVIDIA DLSS (experimental)', 'NVIDIA DLSS (experimental)')),
              ('bilinear', ('Bilinear (simples)', 'Bilinear (plain)'))]
 # Button icons in the game: the PlayStation prompts, or Xbox ones drawn for the port
 # (tools/make_button_icons.py, glyphs/xbox) put in place of the game's textures.

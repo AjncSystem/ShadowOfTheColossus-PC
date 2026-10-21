@@ -1250,6 +1250,39 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     FlushPeriodic();
 }
 
+// sotc: the two grass compute shaders (grass blades; taller weeds). Their flatbufs hold the blade
+// height scale and 7 view distances that thin the grass out in bands.
+struct Vegetation {
+    u64 hash;
+    u32 height_dword;
+    u32 bands_dword;
+};
+constexpr std::array<Vegetation, 2> kVegetation{{{0xfeaef49e, 32, 53}, {0x287f5d44, 30, 35}}};
+constexpr u32 kVegetationBands = 7;
+// sotc: the grass patch compute picks each patch's blade LOD from floor(k * ln(scale * size / area));
+// a smaller scale gives the patches near the camera their full blade count sooner.
+constexpr u64 kGrassPatchHash = 0x6172cbb0;
+constexpr u32 kGrassPatchLodDword = 30;
+
+// SOTC_GRASS="<grass distance> <grass height> <weed distance> <weed height> <patch LOD scale>"
+// multipliers (launcher); the in-game menu overrides them live (SotcLive::grass).
+static std::array<float, 5> VegetationScales() {
+    static const std::array<float, 5> env = [] {
+        std::array<float, 5> s{1.f, 1.f, 1.f, 1.f, 1.f};
+        if (const char* v = std::getenv("SOTC_GRASS")) {
+            std::sscanf(v, "%f %f %f %f %f", &s[0], &s[1], &s[2], &s[3], &s[4]);
+        }
+        return s;
+    }();
+    std::array<float, 5> s = env;
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (const float live = SotcLive::grass[i].load(std::memory_order_relaxed); live >= 0.f) {
+            s[i] = live;
+        }
+    }
+    return s;
+}
+
 void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
     RENDERER_TRACE;
 
@@ -2198,8 +2231,36 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
                 auto& vk_buffer = buffer_cache.GetStreamBuffer();
                 const u32 ubo_size = stage.FlatBuf().size() * sizeof(u32);
-                const u64 offset =
-                    vk_buffer.Copy(stage.FlatBuf().data(), ubo_size, alignment);
+                const u32* flat = stage.FlatBuf().data();
+                const auto veg_scales = VegetationScales();
+                for (size_t v = 0; v < kVegetation.size(); ++v) {
+                    const auto& veg = kVegetation[v];
+                    const float dist = veg_scales[v * 2], height = veg_scales[v * 2 + 1];
+                    if (stage.pgm_hash != veg.hash || (dist == 1.f && height == 1.f) ||
+                        stage.FlatBuf().size() < veg.bands_dword + kVegetationBands) {
+                        continue;
+                    }
+                    static std::vector<u32> veg_flat;
+                    veg_flat.assign(flat, flat + stage.FlatBuf().size());
+                    const auto scale = [&](u32 dword, float m) {
+                        veg_flat[dword] = std::bit_cast<u32>(std::bit_cast<float>(veg_flat[dword]) * m);
+                    };
+                    scale(veg.height_dword, height);
+                    for (u32 i = 0; i < kVegetationBands; ++i) {
+                        scale(veg.bands_dword + i, dist);
+                    }
+                    flat = veg_flat.data();
+                }
+                if (const float lod = veg_scales[4]; stage.pgm_hash == kGrassPatchHash &&
+                                                             lod != 1.f &&
+                                                             stage.FlatBuf().size() > kGrassPatchLodDword) {
+                    static std::vector<u32> patch_flat;
+                    patch_flat.assign(flat, flat + stage.FlatBuf().size());
+                    patch_flat[kGrassPatchLodDword] =
+                        std::bit_cast<u32>(std::bit_cast<float>(patch_flat[kGrassPatchLodDword]) * lod);
+                    flat = patch_flat.data();
+                }
+                const u64 offset = vk_buffer.Copy(flat, ubo_size, alignment);
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 // Permutations compiled without enabled planes never read the buffer, so the

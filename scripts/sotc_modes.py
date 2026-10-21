@@ -36,6 +36,17 @@ MODES = {
         # the frame limiter's import stub (sceVideoOutSetFlipRate) returns 0
         (0x01390090, bytes.fromhex('ff25a20567'), bytes.fromhex('31c0c3')),
     ],
+    # Room for 4x the grass, for the longer grass distances: the virtual geometry buffers (80-byte
+    # blades and their index list) hold 0x18000; the grass compute drops every blade past that, the
+    # farthest patches first: a band of grass pops in and out ahead once the grass distance is raised.
+    'grassbuf': [
+        (0x004d92b9, bytes.fromhex('b900800100'), bytes.fromhex('b900000600')),
+        (0x004d92e5, bytes.fromhex('b900800100'), bytes.fromhex('b900000600')),
+        # the patch chunks (up to 64 blades each) the grass compute fills: 0x8000 of 16 bytes
+        (0x004d928d, bytes.fromhex('b900800000'), bytes.fromhex('b900000200')),
+        # the weed blades (80 bytes): 0x24000
+        (0x004d9311, bytes.fromhex('b900400200'), bytes.fromhex('b900000900')),
+    ],
     # The engine's own 60 FPS target, the one of the PS4 Pro Performance mode: TargetFramesPerSeconds
     # 1 (60 FPS) where the game sets 2 (30 FPS), i.e. the graphics mode code on a PS4 (0x70a6d0) and
     # the options code without the Performance mode (0x49a2d8). The game then asks flip rate 0 itself

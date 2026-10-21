@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
@@ -273,37 +274,162 @@ void Hint(const char* text) {
 // sotc: the launcher's settings file (SOTC_LAUNCHER_SETTINGS, user/launcher_settings.json), so a
 // quick setting changed in the menu is also the launcher's choice next time. Only keys already in
 // the file are replaced.
-void SaveLauncherSetting(const char* key, const std::string& json_value) {
+std::filesystem::path LauncherSettingsPath() {
 #ifdef _WIN32
     const wchar_t* wpath = _wgetenv(L"SOTC_LAUNCHER_SETTINGS");
-    if (!wpath || !wpath[0]) {
-        return;
-    }
-    const std::filesystem::path path{wpath};
+    return wpath ? std::filesystem::path{wpath} : std::filesystem::path{};
 #else
     const char* cpath = std::getenv("SOTC_LAUNCHER_SETTINGS");
-    if (!cpath || !cpath[0]) {
-        return;
-    }
-    const std::filesystem::path path{cpath};
+    return cpath ? std::filesystem::path{cpath} : std::filesystem::path{};
 #endif
-    std::string text;
-    {
-        std::ifstream in(path, std::ios::binary);
-        if (!in) {
-            return;
-        }
-        text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+std::string ReadLauncherSettings() {
+    const auto path = LauncherSettingsPath();
+    if (path.empty()) {
+        return {};
     }
-    const std::regex re("(\"" + std::string(key) +
-                        "\"\\s*:\\s*)(\"[^\"]*\"|true|false|-?[0-9.]+)");
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        return {};
+    }
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+}
+
+std::regex LauncherSettingRegex(const char* key) {
+    return std::regex("(\"" + std::string(key) + "\"\\s*:\\s*)(\"[^\"]*\"|true|false|-?[0-9.]+)");
+}
+
+// The value of a key (a string without its quotes), or "" when it is not in the file.
+std::string LoadLauncherSetting(const char* key) {
+    const std::string text = ReadLauncherSettings();
     std::smatch m;
-    if (!std::regex_search(text, m, re)) {
+    if (!std::regex_search(text, m, LauncherSettingRegex(key))) {
+        return {};
+    }
+    std::string v = m[2].str();
+    return v.size() >= 2 && v.front() == '"' ? v.substr(1, v.size() - 2) : v;
+}
+
+void SaveLauncherSetting(const char* key, const std::string& json_value) {
+    std::string text = ReadLauncherSettings();
+    std::smatch m;
+    if (text.empty() || !std::regex_search(text, m, LauncherSettingRegex(key))) {
         return;
     }
     text = m.prefix().str() + m[1].str() + json_value + m.suffix().str();
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    std::ofstream out(LauncherSettingsPath(), std::ios::binary | std::ios::trunc);
     out << text;
+}
+
+// sotc: one of the launcher's grass choice lists as a combo. With a live value (SotcLive::grass)
+// a pick applies at once; without, it is only saved for the next start.
+struct GrassChoice {
+    const char* value;
+    const char* pt;
+    const char* en;
+};
+
+template <size_t N>
+void GrassCombo(const char* label, const char* key, const GrassChoice (&choices)[N],
+                std::atomic<float>* live, float env_value) {
+    using SotcUi::T;
+    static std::unordered_map<std::string, float> saved; // restart-only picks
+    float now;
+    if (live) {
+        const float v = live->load(std::memory_order_relaxed);
+        now = v >= 0.f ? v : env_value;
+    } else if (const auto it = saved.find(key); it != saved.end()) {
+        now = it->second;
+    } else {
+        now = saved[key] = std::strtof(LoadLauncherSetting(key).c_str(), nullptr);
+    }
+    char preview[16];
+    std::snprintf(preview, sizeof(preview), "%g", now);
+    const char* shown = preview;
+    for (const auto& c : choices) {
+        if (std::strtof(c.value, nullptr) == now) {
+            shown = T(c.pt, c.en);
+        }
+    }
+    if (ImGui::BeginCombo(label, shown)) {
+        for (const auto& c : choices) {
+            const float v = std::strtof(c.value, nullptr);
+            if (ImGui::Selectable(T(c.pt, c.en), v == now)) {
+                if (live) {
+                    live->store(v, std::memory_order_relaxed);
+                } else {
+                    saved[key] = v;
+                }
+                SaveLauncherSetting(key, "\"" + std::string(c.value) + "\"");
+            }
+        }
+        ImGui::EndCombo();
+    }
+}
+
+// sotc: the launcher's grass options. Distance, height and detail are constants of the grass
+// compute shaders, so they apply at once; shadows and fade are engine settings read at start.
+void GrassSettings() {
+    using SotcUi::T;
+    static const std::array<float, 5> env = [] {
+        std::array<float, 5> s{1.f, 1.f, 1.f, 1.f, 1.f};
+        if (const char* v = std::getenv("SOTC_GRASS")) {
+            std::sscanf(v, "%f %f %f %f %f", &s[0], &s[1], &s[2], &s[3], &s[4]);
+        }
+        return s;
+    }();
+    static const GrassChoice detail[] = {{"1", "Como no PS4", "As on PS4"},
+                                         {"0.25", "Alto", "High"},
+                                         {"0.15", "Mais alto", "Higher"},
+                                         {"0.1", "Muito alto", "Very high"}};
+    static const GrassChoice distance[] = {{"1", "Como no PS4", "As on PS4"},
+                                           {"2", "2x mais longe", "2x farther"},
+                                           {"3", "3x mais longe", "3x farther"},
+                                           {"5", "5x mais longe", "5x farther"}};
+    static const GrassChoice weed_distance[] = {
+        {"1", "Como no PS4", "As on PS4"},
+        {"2", "2x mais longe", "2x farther"},
+        {"3", "3x mais longe", "3x farther"},
+        {"5", "5x mais longe", "5x farther"},
+        {"10", "10x mais longe (campo denso)", "10x farther (dense field)"}};
+    static const GrassChoice height[] = {{"0.75", "75%", "75%"},
+                                         {"1", "Como no PS4", "As on PS4"},
+                                         {"1.5", "150%", "150%"},
+                                         {"2", "200% (arbustos)", "200% (bushes)"}};
+    static const GrassChoice shadows[] = {
+        {"1", "Perto (~3 m, mais leve)", "Near (~3 m, lighter)"},
+        {"2", "Como no PS4 (~8 m)", "As on PS4 (~8 m)"},
+        {"3", "Longe (~24 m, mais pesado)", "Far (~24 m, heavier)"}};
+    static const GrassChoice fade[] = {{"0.5", "50%", "50%"},
+                                       {"0.75", "75%", "75%"},
+                                       {"1", "Como no PS4", "As on PS4"},
+                                       {"2", "200%", "200%"},
+                                       {"3", "300%", "300%"}};
+
+    ImGui::SeparatorText(T("Grama", "Grass"));
+    GrassCombo(T("Detalhe da grama", "Grass detail"), "grass_detail", detail, &SotcLive::grass[4],
+               env[4]);
+    Hint(T("Lâminas completas mais longe: a grama e a sombra perto de você não surgem tarde.",
+           "Full blades farther out: grass and its shadow near you no longer pop in late."));
+    GrassCombo(T("Distância da grama", "Grass distance"), "grass_distance", distance,
+               &SotcLive::grass[0], env[0]);
+    GrassCombo(T("Altura da grama", "Grass height"), "grass_height", height, &SotcLive::grass[1],
+               env[1]);
+    Hint(T("Recomendado: como no PS4, ou 150% se gosta de mais grama; 200% vira arbusto.",
+           "Recommended: as on PS4, or 150% if you like more grass; 200% turns it into bushes."));
+    GrassCombo(T("Distância do mato", "Weed distance"), "weed_distance", weed_distance,
+               &SotcLive::grass[2], env[2]);
+    GrassCombo(T("Altura do mato", "Weed height"), "weed_height", height, &SotcLive::grass[3],
+               env[3]);
+    GrassCombo(T("Sombras da grama (ao reiniciar)", "Grass shadows (on restart)"), "grass_shadows",
+               shadows, nullptr, 0.f);
+    GrassCombo(T("Esmaecimento da grama (ao reiniciar)", "Grass fade (on restart)"), "grass_fade",
+               fade, nullptr, 0.f);
+    Hint(T("Abaixo de 100% a sombra da grama também some (50%: quase sem sombra). Menos grama "
+           "alivia um pouco a GPU.",
+           "Below 100% the grass shadow fades too (50%: almost no shadow). Less grass is a little "
+           "lighter on the GPU."));
 }
 
 // sotc: "Quick settings": the launcher's quick settings that can change while playing.
@@ -396,6 +522,7 @@ void QuickSettings() {
                                 "16x AF, PS4 Pro mode, resolution and video memory use: in the "
                                 "launcher (they apply when the game starts again)."));
     ImGui::PopStyleColor();
+    GrassSettings();
 }
 
 void Menu() {

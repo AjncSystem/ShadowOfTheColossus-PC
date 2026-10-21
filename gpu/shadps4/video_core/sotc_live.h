@@ -13,4 +13,8 @@ inline std::atomic<int> lod_linger{-1};
 /// Far sun shadow cascades drawn on alternate frames (SOTC_SHADOW_REUSE): 0 off, 1 on.
 inline std::atomic<int> shadow_reuse{-1};
 
+/// Grass multipliers (SOTC_GRASS): grass distance, grass height, weed distance, weed height,
+/// grass detail. Below 0: the environment's.
+inline std::atomic<float> grass[5]{-1.f, -1.f, -1.f, -1.f, -1.f};
+
 } // namespace SotcLive

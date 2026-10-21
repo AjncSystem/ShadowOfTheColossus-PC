@@ -67,7 +67,7 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 
 | # | Item | Estado | Notas |
 |---|---|---|---|
-| T1 | PR #219 (Oussama268): vazamento de memória, ~60 MB/min | ⏳ integrar 1º | 7 linhas: os quadros das corrotinas de buffers indiretos nunca eram liberados (756 → 1706 MiB em 15 min; >7 GB em meia hora). Provável parte de #220 (6 GB, memória sobe até cair), dos engasgos em sessões longas e talvez do "fechou do nada". |
+| T1 | PR #219 (Oussama268): vazamento de memória, ~60 MB/min | ✅ `c9be814` | 10 min com a configuração completa: memória privada sobe na carga (4,5 → 5,8 GB nos 4 primeiros min, áreas do demo) e depois fica em 5,7–6,0 GB nos 6 min seguintes; 0 quedas, média 56,6 / mínima 35,6. `final_suspend` é `suspend_always`, então o `destroy()` é necessário e seguro. 7 linhas: os quadros das corrotinas de buffers indiretos nunca eram liberados (756 → 1706 MiB em 15 min; >7 GB em meia hora). Provável parte de #220 (6 GB, memória sobe até cair), dos engasgos em sessões longas e talvez do "fechou do nada". |
 | T2 | PR #232 (Tadomikaari312-Hy): reaproveitar binds de descritores entre draws iguais | ⏳ integrar + medir | Santuário RX 6600M: 24–25 → 29,6–30 FPS. `SOTC_FAST_BIND=0` desliga. Medir aqui na NVIDIA e procurar artefatos. |
 | T3 | PR #205 (Lucas): barreiras LDS na AMD GCN (wave64) | ⏳ integrar | Causa provável dos personagens brancos/verdes/rosa na RX 470–590/Vega (0.28; #152, #158, #162, #187, #201): `needs_lds_barriers` ficava falso com subgroup 64. Sem efeito na NVIDIA; teste em GCN pelos jogadores. |
 | T4 | PR #198 (Lucas): CPUs com 4 threads (gravador dorme, CP cede) | ⏳ integrar + medir | 4 threads: preso no loading → 73 FPS. Conferir que não perde FPS em 16 threads. |

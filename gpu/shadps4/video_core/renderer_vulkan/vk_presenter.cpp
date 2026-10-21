@@ -789,6 +789,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // sotc: DLSS super resolution (SOTC_UPSCALER=dlss): the game's scene before its UI, upscaled
     // to the frame's size; the post process pass puts the UI layer back over it. Frames without
     // that scene (menus, loading screens) are presented as before.
+    Dlssg::SetHdr(pp_settings.hdr != 0);
     const auto upscaled = Dlssg::Upscale(frame->id, draw_scheduler, texture_cache, runtime,
                                          frame->width, frame->height);
     if (Dlssg::SuperResolutionAvailable() && Dlssg::CompareMode()) {
@@ -822,6 +823,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             pp_settings.vignette = {};
         }
         pp_settings.ui_sharpen = ui_sharpen;
+        pp_settings.hdr_curve = Dlssg::HdrCurve();
         pp_settings.sky_sharpen = sky_sharpen;
         pp_pass.Render(cmdbuf, scene, {frame->width, frame->height}, *frame, pp_settings,
                        upscaled.ui, upscaled.sky);

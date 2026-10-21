@@ -26,6 +26,8 @@ public:
         std::array<float, 4> vignette{};
         float ui_sharpen = 0.0f; ///< sotc: sharpening of the upscaled ui (0 = none)
         float sky_sharpen = 0.0f; ///< sotc: sharpening where Render's sky mask is set
+        float hdr_white = 200.0f; ///< sotc: HDR paper white in nits (SOTC_HDR_WHITE)
+        float hdr_curve = 1.0f; ///< sotc: exponent of the game's HDR composite
     };
 
     void Create(vk::Device device, vk::Format surface_format);

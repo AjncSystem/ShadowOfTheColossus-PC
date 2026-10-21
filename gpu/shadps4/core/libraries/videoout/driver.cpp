@@ -839,6 +839,9 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         const auto& buffer = port->buffer_slots[index];
         ASSERT_MSG(buffer.group_index >= 0, "Trying to flip an unregistered buffer!");
         const auto& group = port->groups[buffer.group_index];
+        // sotc: the game configures the output mode as BT.2020 PQ and then as Any, so the
+        // buffer format decides (A2R10G10B10 BT.2020 PQ when its HDR option is on).
+        port->is_hdr = group.attrib.pixel_format == PixelFormat::A2R10G10B10Bt2020Pq;
         frame = presenter->PrepareFrame(group, buffer.address_left);
     }
 

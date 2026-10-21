@@ -42,28 +42,37 @@ Asked AskedMode() {
     return asked;
 }
 
-/// An NVIDIA GPU in the system (DXGI, before Vulkan): Streamline is for those only.
+/// Whether the GPU the port will run on is NVIDIA (DXGI, before Vulkan): Streamline is for those
+/// only. Any NVIDIA adapter was enough before, and on a PC with an RX 9070 next to an NVIDIA card
+/// Streamline wrapped the AMD device, whose creation then failed (VK_NV_low_latency2, #194). This
+/// follows Instance's choice: SOTC_GPU_VENDOR, else the most dedicated memory (discrete first).
 bool HasNvidiaGpu() {
+    if (const char* vendor = std::getenv("SOTC_GPU_VENDOR")) {
+        return std::strtoul(vendor, nullptr, 16) == 0x10DE;
+    }
     HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
     if (!dxgi) {
         return false;
     }
     using CreateFactory = HRESULT(WINAPI*)(REFIID, void**);
     const auto create = reinterpret_cast<CreateFactory>(GetProcAddress(dxgi, "CreateDXGIFactory1"));
-    bool found = false;
+    bool nvidia = false;
+    SIZE_T best = 0;
     IDXGIFactory1* factory = nullptr;
     if (create && SUCCEEDED(create(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory)))) {
         IDXGIAdapter1* adapter = nullptr;
-        for (UINT i = 0; !found && factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+        for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
             DXGI_ADAPTER_DESC1 desc{};
-            if (SUCCEEDED(adapter->GetDesc1(&desc)) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
-                found = desc.VendorId == 0x10DE;
+            if (SUCCEEDED(adapter->GetDesc1(&desc)) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+                desc.DedicatedVideoMemory > best) {
+                best = desc.DedicatedVideoMemory;
+                nvidia = desc.VendorId == 0x10DE;
             }
             adapter->Release();
         }
         factory->Release();
     }
-    return found;
+    return nvidia;
 }
 
 std::atomic<int> current{static_cast<int>(Mode::Off)};

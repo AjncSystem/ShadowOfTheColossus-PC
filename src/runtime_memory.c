@@ -317,7 +317,9 @@ static int host_protect(uintptr_t address, uint64_t size, int prot) {
     return 0;
 }
 /* Released pages read as zero when reused, like the memfd's punched holes. */
-static void host_discard(uint64_t phys, uint64_t size) { memset(backing_base+phys,0,size); }
+static uint64_t discarded_bytes;
+uint64_t runtime_memory_discarded(void) { return __atomic_exchange_n(&discarded_bytes,0,__ATOMIC_RELAXED); }
+static void host_discard(uint64_t phys, uint64_t size) { __atomic_add_fetch(&discarded_bytes,size,__ATOMIC_RELAXED); memset(backing_base+phys,0,size); }
 /* Direct memory occupies [0,POOL_SIZE) of the section, flexible memory [POOL_SIZE,+FLEX_SPAN). */
 static int pool(void) {
     if (backing_base) return 0;

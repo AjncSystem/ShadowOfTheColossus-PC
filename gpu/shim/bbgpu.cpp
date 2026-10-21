@@ -3,6 +3,7 @@
 #include "bbport_overlay.h"
 #include "bbport_settings.h"
 #include "bbport_copy.h"
+#include "bbport_mem_report.h"
 #ifndef _WIN32
 #include <sys/resource.h>
 #endif
@@ -137,7 +138,15 @@ static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
         // readbacks GPU-written pages are read-protected, and a fault on a copy thread or the
         // recording thread would wait for the command processor, which waits for them.
         const u8* backing = mapped ? runtime_memory_backing_pointer(source) : nullptr;
-        if (backing) std::memcpy(dest, backing, n);
+        if (backing && BbMemReport::WsDiagEnabled()) {
+            const uint64_t before = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count());
+            BbMemReport::WsDiagCopy(backing, dest, n);
+            std::memcpy(dest, backing, n);
+            BbMemReport::WsDiagCopyDone(before, n);
+        } else if (backing) std::memcpy(dest, backing, n);
         else if (mapped) std::memcpy(dest, reinterpret_cast<const void*>(source), n);
         else std::memset(dest, 0, n);
         source += n; dest += n; size -= n;

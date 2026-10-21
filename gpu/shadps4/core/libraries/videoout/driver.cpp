@@ -444,6 +444,12 @@ void VideoOutDriver::Flip(const Request& req) {
                 if (!allocs.empty()) {
                     ReportPrintf(report, "SOTC ALLOC %s\n", allocs.c_str());
                 }
+                if (const std::string ws = BbMemReport::WsDiagLine(); !ws.empty()) {
+                    ReportPrintf(report, "SOTC WS %s; host heap %llu MiB (VMA blocks %llu MiB)\n",
+                                 ws.c_str(),
+                                 static_cast<unsigned long long>(SotcStats::host_heap_usage.load() >> 20),
+                                 static_cast<unsigned long long>(SotcStats::host_vma_block_bytes.load() >> 20));
+                }
                 // sotc: heaps vs other private memory, every 12th report (a minute at 5 s).
                 static u32 mem_reports = 0;
                 if (mem_reports++ % 12 == 0) {

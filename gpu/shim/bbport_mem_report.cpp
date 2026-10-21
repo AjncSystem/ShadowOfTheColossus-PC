@@ -6,11 +6,17 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <psapi.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <unordered_map>
+#include <utility>
 #endif
 
 namespace BbMemReport {
@@ -64,6 +70,114 @@ std::string Line() {
                   bytes[1] / MiB, static_cast<unsigned long long>(number[1]), bytes[2] / MiB,
                   static_cast<unsigned long long>(number[2]), bytes[3] / MiB,
                   static_cast<unsigned long long>(number[3]), mapped / MiB);
+    return line;
+#else
+    return {};
+#endif
+}
+
+extern "C" uint64_t runtime_memory_discarded(void);
+
+#ifdef _WIN32
+namespace {
+std::atomic<uint64_t> ws_copies, ws_bytes, ws_ns, ws_src_pages, ws_src_out, ws_dst_pages, ws_dst_out,
+    ws_cold_copies, ws_cold_ns, ws_query_ns;
+uint64_t NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+// Pages of [start, start + size) that are not valid in the working set.
+uint64_t PagesOut(const void* start, size_t size, uint64_t* pages) {
+    constexpr uintptr_t Page = 4096;
+    const uintptr_t first = reinterpret_cast<uintptr_t>(start) & ~(Page - 1);
+    const uintptr_t end = reinterpret_cast<uintptr_t>(start) + size;
+    PSAPI_WORKING_SET_EX_INFORMATION info[256];
+    uint64_t out = 0;
+    for (uintptr_t at = first; at < end;) {
+        DWORD n = 0;
+        for (; n < 256 && at < end; ++n, at += Page) {
+            info[n].VirtualAddress = reinterpret_cast<void*>(at);
+        }
+        if (!QueryWorkingSetEx(GetCurrentProcess(), info, n * sizeof(info[0]))) {
+            return out;
+        }
+        *pages += n;
+        for (DWORD i = 0; i < n; ++i) {
+            out += !info[i].VirtualAttributes.Valid;
+        }
+    }
+    return out;
+}
+thread_local bool ws_cold;
+} // namespace
+#endif
+
+bool WsDiagEnabled() {
+#ifdef _WIN32
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_WS_DIAG");
+        return v && v[0] == '1';
+    }();
+    return on;
+#else
+    return false;
+#endif
+}
+
+void WsDiagCopy(const void* source, const void* dest, size_t size) {
+#ifdef _WIN32
+    const uint64_t start = NowNs();
+    uint64_t src_pages = 0, dst_pages = 0;
+    const uint64_t src_out = PagesOut(source, size, &src_pages);
+    const uint64_t dst_out = PagesOut(dest, size, &dst_pages);
+    ws_src_pages += src_pages;
+    ws_src_out += src_out;
+    ws_dst_pages += dst_pages;
+    ws_dst_out += dst_out;
+    ws_cold = src_out || dst_out;
+    ws_query_ns += NowNs() - start;
+#endif
+}
+
+void WsDiagCopyDone(uint64_t ns_before, size_t size) {
+#ifdef _WIN32
+    const uint64_t ns = NowNs() - ns_before;
+    ++ws_copies;
+    ws_bytes += size;
+    ws_ns += ns;
+    if (ws_cold) {
+        ++ws_cold_copies;
+        ws_cold_ns += ns;
+    }
+#endif
+}
+
+std::string WsDiagLine() {
+#ifdef _WIN32
+    if (!WsDiagEnabled()) {
+        return {};
+    }
+    static uint64_t last_faults = 0;
+    PROCESS_MEMORY_COUNTERS counters{};
+    GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters));
+    const uint64_t faults = counters.PageFaultCount - std::exchange(last_faults, counters.PageFaultCount);
+    // ws_ns includes the queries; subtract them for the copy time.
+    const uint64_t query = ws_query_ns.exchange(0);
+    char line[480];
+    std::snprintf(line, sizeof(line),
+                  "copies %llu (%.0f MiB, %.1f ms copying, %.1f ms querying); source pages out of "
+                  "the working set %llu of %llu, staging pages %llu of %llu; copies touching them "
+                  "%llu (%.1f ms); process page faults %llu, working set %.0f MiB; guest memory zeroed on release %.0f MiB",
+                  static_cast<unsigned long long>(ws_copies.exchange(0)), ws_bytes.exchange(0) / 1048576.0,
+                  ws_ns.exchange(0) / 1e6 - query / 1e6, query / 1e6,
+                  static_cast<unsigned long long>(ws_src_out.exchange(0)),
+                  static_cast<unsigned long long>(ws_src_pages.exchange(0)),
+                  static_cast<unsigned long long>(ws_dst_out.exchange(0)),
+                  static_cast<unsigned long long>(ws_dst_pages.exchange(0)),
+                  static_cast<unsigned long long>(ws_cold_copies.exchange(0)), ws_cold_ns.exchange(0) / 1e6,
+                  static_cast<unsigned long long>(faults), counters.WorkingSetSize / 1048576.0,
+                  runtime_memory_discarded() / 1048576.0);
     return line;
 #else
     return {};

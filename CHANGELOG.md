@@ -1,5 +1,16 @@
 # Changelog
 
+## Não lançado — binds de descritores reaproveitados
+- **Fast bind no Vulkan (padrão ligado):** quando o desenho seguinte usa o mesmo pipeline,
+  push constants, buffers, imagens e samplers, o port pula a remontagem dos descritores.
+  Desenhos com compute, feedback loop, clip planes, storage images, FMasks, shared memory ou
+  recursos escritos continuam no caminho normal; buffers de stream e imagens têm guarda de
+  geração/wrap. Acerto de 59–75% dos draws elegíveis no demo.
+- **Ganho medido no Santuário:** 24,0–25,0 → 29,6–30,0 FPS; `draw busy` 39–40 → 32,5–33,1 ms;
+  `parse` 22–23 → 18–20 ms. No caminho completo até o primeiro colosso: 30 FPS travados,
+  frametime 33,2–33,5 ms, sem artefatos de textura ou sombra observados.
+- `SOTC_FAST_BIND=0` desliga; com `SOTC_FPS=1` o log mostra o acerto por janela.
+
 ## 0.60.4 — 2026-10-20
 - **Blocos ciano nas pedras e flores piscando** (com "Texturas em alta qualidade"): o ajuste da
   0.60.3 que evita a queda trocava o nível de detalhe das texturas a cada um ou dois segundos nas

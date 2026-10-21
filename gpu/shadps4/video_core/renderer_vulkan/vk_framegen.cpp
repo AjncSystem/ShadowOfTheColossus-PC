@@ -83,6 +83,10 @@ bool WantStreamline() {
     return true;
 }
 
+bool HasNvidia() {
+    return HasNvidiaGpu();
+}
+
 void SetAvailable(bool dlss, bool fsr) {
     have_dlss = dlss;
     have_fsr = fsr;

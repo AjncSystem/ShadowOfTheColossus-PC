@@ -17,6 +17,10 @@ enum class Mode : int { Off = 0, Dlss = 1, Fsr = 2 };
 /// Before the Vulkan instance is created: whether to load Streamline.
 bool WantStreamline();
 
+/// sotc: an NVIDIA GPU in the system (DXGI, before Vulkan); DLSS super resolution loads
+/// Streamline only then.
+bool HasNvidia();
+
 /// After the device is created: what this GPU can do. Resolves auto.
 void SetAvailable(bool dlss, bool fsr);
 

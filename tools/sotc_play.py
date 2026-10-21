@@ -114,8 +114,10 @@ def main():
     raws = sorted((out / 'dump').glob('output_*.raw'))
     if raws:
         subprocess.run([sys.executable, str(ROOT / 'tools' / 'raw2png.py'), *map(str, raws)], stdout=subprocess.DEVNULL)
-    # Presenters without the raw dump save PNG screenshots (user/screenshots) instead.
-    shots = sorted(p for p in (ROOT / 'user' / 'screenshots').glob('*.png') if p.stat().st_mtime >= started)
+    # Presenters without the raw dump save PNG screenshots instead, in user/screenshots or, with
+    # BB_GPU_USER_DIR set (benchmarks with their own shader cache), in its screenshots folder.
+    shot_dir = Path(env['BB_GPU_USER_DIR']) if env.get('BB_GPU_USER_DIR') else ROOT / 'user'
+    shots = sorted(p for p in (shot_dir / 'screenshots').glob('*.png') if p.stat().st_mtime >= started)
     for i, shot in enumerate(shots):
         shutil.copy(shot, out / 'dump' / f'output_{i:03d}_shot.png')
     pngs = sorted((out / 'dump').glob('output_*.png'))

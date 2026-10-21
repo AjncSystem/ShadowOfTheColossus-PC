@@ -1589,13 +1589,18 @@ void TextureCache::GarbageCollectImages() {
         VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
         vmaGetHeapBudgets(instance.GetAllocator(), budgets);
         const auto& memory_properties = instance.GetMemoryProperties();
-        u64 vma_blocks = 0, vma_allocations = 0;
+        u64 vma_blocks = 0, vma_allocations = 0, host_usage = 0, host_blocks = 0;
         for (u32 heap = 0; heap < memory_properties.memoryHeapCount; ++heap) {
             if (memory_properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
                 vma_blocks += budgets[heap].statistics.blockBytes;
                 vma_allocations += budgets[heap].statistics.allocationBytes;
+            } else {
+                host_usage += budgets[heap].usage;
+                host_blocks += budgets[heap].statistics.blockBytes;
             }
         }
+        SotcStats::host_heap_usage.store(host_usage, std::memory_order_relaxed);
+        SotcStats::host_vma_block_bytes.store(host_blocks, std::memory_order_relaxed);
         SotcStats::vma_block_bytes.store(vma_blocks, std::memory_order_relaxed);
         SotcStats::vma_allocation_bytes.store(vma_allocations, std::memory_order_relaxed);
     }

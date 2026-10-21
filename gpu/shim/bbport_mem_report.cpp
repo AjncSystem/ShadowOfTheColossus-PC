@@ -28,8 +28,8 @@ std::string Line() {
             heap_largest = std::max<uint64_t>(heap_largest, summary.cbCommitted);
         }
     }
-    // Committed private memory per allocation (VirtualAlloc reservation); the heaps' segments
-    // are among them and are subtracted as a whole below.
+    // Committed private memory per allocation (VirtualAlloc reservation). The heaps' segments
+    // are among them: a growing heap also adds allocations of up to 16 MiB.
     std::unordered_map<uintptr_t, uint64_t> allocations;
     uint64_t privately = 0, mapped = 0;
     MEMORY_BASIC_INFORMATION info;
@@ -55,10 +55,12 @@ std::string Line() {
     constexpr double MiB = 1048576.0;
     char line[320];
     std::snprintf(line, sizeof(line),
-                  "private %.0f MiB (heaps %.0f MiB in %lu, largest %.0f; allocations <1M %.0f MiB in "
-                  "%llu, <16M %.0f in %llu, <64M %.0f in %llu, larger %.0f in %llu), mapped %.0f MiB",
+                  "private %.0f MiB (heaps %.0f MiB in %lu, largest %.0f; other %.0f; allocations <1M "
+                  "%.0f MiB in %llu, <16M %.0f in %llu, <64M %.0f in %llu, larger %.0f in %llu), mapped "
+                  "%.0f MiB",
                   privately / MiB, heap_committed / MiB, static_cast<unsigned long>(count),
-                  heap_largest / MiB, bytes[0] / MiB, static_cast<unsigned long long>(number[0]),
+                  heap_largest / MiB, (privately - std::min(privately, heap_committed)) / MiB,
+                  bytes[0] / MiB, static_cast<unsigned long long>(number[0]),
                   bytes[1] / MiB, static_cast<unsigned long long>(number[1]), bytes[2] / MiB,
                   static_cast<unsigned long long>(number[2]), bytes[3] / MiB,
                   static_cast<unsigned long long>(number[3]), mapped / MiB);

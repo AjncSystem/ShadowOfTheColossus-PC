@@ -22,6 +22,8 @@ layout (push_constant) uniform settings {
     vec4 vignette; // sotc: start, end, radius scale, strength (the game's tonemap, after DLSS)
     float ui_sharpen; // sotc: unsharp amount for the upscaled ui
     float sky_sharpen; // sotc: unsharp amount in the sky
+    float hdr_white; // sotc: HDR paper white in nits
+    float hdr_curve; // sotc: exponent of the game's HDR composite
 } pp;
 
 const float cutoff = 0.0031308, a = 1.055, b = 0.055, d = 12.92;
@@ -42,6 +44,18 @@ vec3 degamma(vec3 rgb) {
         lessThan(rgb, vec3(d * cutoff))
     );
 }
+
+// sotc: SMPTE ST 2084 (PQ), in nits.
+const float m1 = 0.1593017578125, m2 = 78.84375, c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;
+vec3 pqDecode(vec3 e) {
+    const vec3 p = pow(clamp(e, 0.0, 1.0), vec3(1.0 / m2));
+    return 10000.0 * pow(max(p - c1, 0.0) / (c2 - c3 * p), vec3(1.0 / m1));
+}
+vec3 pqEncode(vec3 nits) {
+    const vec3 y = pow(clamp(nits / 10000.0, 0.0, 1.0), vec3(m1));
+    return pow((c1 + c2 * y) / (1.0 + c3 * y), vec3(m2));
+}
+const mat3 rec709to2020 = mat3(0.6274, 0.0691, 0.0164, 0.3293, 0.9195, 0.0880, 0.0433, 0.0114, 0.8956);
 
 // sotc: the UI layer is at render size; Catmull-Rom (9 bilinear taps) keeps its text sharper
 // than a bilinear stretch. Clamped: the filter overshoots at hard edges.
@@ -110,10 +124,21 @@ void main() {
             ui = clamp(ui + pp.ui_sharpen * (ui - 0.25 * (n + s + w + e)), lo, hi);
             ui.rgb = min(ui.rgb, vec3(ui.a));
         }
+        if (pp.hdr) {
+            // The game's HDR composite: UI over scene, ^k (its constant), Rec.2020, PQ with
+            // 1.0 at 300 nits; scaled to the paper white like below.
+            const vec3 c = abs(color_linear.rgb * (1.0 - ui.a) + ui.rgb);
+            const vec3 nits = 3.0 * pp.hdr_white * (rec709to2020 * pow(c, vec3(pp.hdr_curve)));
+            color = vec4(pqEncode(nits), 1.0);
+            return;
+        }
         color_linear = vec4(clamp(color_linear.rgb, 0.0, 1.0) * (1.0 - ui.a) + ui.rgb, 1.0);
     }
     if (pp.hdr) {
-        color = color_linear;
+        // The game's own BT.2020 PQ output has its white at about 100 nits, too dim next to
+        // the desktop; scaled to the paper white.
+        color = vec4(pqEncode(pqDecode(color_linear.rgb) * (pp.hdr_white / 100.0)),
+                     color_linear.a);
     } else {
         if (pp.srgb_input) color_linear.rgb = degamma(color_linear.rgb);
         color = vec4(gamma(color_linear.rgb), color_linear.a);

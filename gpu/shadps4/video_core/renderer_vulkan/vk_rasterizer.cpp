@@ -1462,6 +1462,9 @@ constexpr u32 kTaaEnableDword = 42;
 // t = (scale * |uv - 0.5| - start) / (end - start), from flatbuf dwords 51..54. DLSS would drag
 // it along with the scene (dark nested screen borders), so it is applied after upscaling.
 constexpr u64 kTonemapHash = 0x291dbcd0;
+// sotc: the game's HDR composite (UI over scene, ^k, Rec.2020, PQ at 300 nits).
+constexpr u64 kHdrCompositeHash = 0xdfd767b6;
+constexpr u32 kHdrCurveDword = 20; // its exponent k
 constexpr u32 kVignetteDword = 51;
 
 bool Rasterizer::TaaOff() {
@@ -2491,6 +2494,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     patch_flat[kGrassPatchLodDword] =
                         std::bit_cast<u32>(std::bit_cast<float>(patch_flat[kGrassPatchLodDword]) * lod);
                     flat = patch_flat.data();
+                }
+                if (stage.pgm_hash == kHdrCompositeHash &&
+                    stage.FlatBuf().size() > kHdrCurveDword) {
+                    Dlssg::NoteHdrCurve(std::bit_cast<float>(flat[kHdrCurveDword]));
                 }
                 const u64 offset = vk_buffer.Copy(flat, ubo_size, alignment);
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);

@@ -172,6 +172,9 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         .levelCount = 1,
         .layerCount = 1,
     };
+    // sotc: the output image too, on both paths: without RCAS it was written in the layout the
+    // last frame left it in (shader read only), and its earlier readers (the post process pass)
+    // must be done before it is written again.
     const std::array enter_barrier{
         vk::ImageMemoryBarrier2{
             .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
@@ -181,6 +184,16 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
             .oldLayout = vk::ImageLayout::eUndefined,
             .newLayout = vk::ImageLayout::eGeneral,
             .image = img.intermediary_image,
+            .subresourceRange = simple_subresource,
+        },
+        vk::ImageMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eNone,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+            .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+            .oldLayout = vk::ImageLayout::eUndefined,
+            .newLayout = vk::ImageLayout::eGeneral,
+            .image = img.output_image,
             .subresourceRange = simple_subresource,
         },
     };
@@ -252,16 +265,6 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                 .oldLayout = vk::ImageLayout::eGeneral,
                 .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
                 .image = img.intermediary_image,
-                .subresourceRange = simple_subresource,
-            },
-            vk::ImageMemoryBarrier2{
-                .srcStageMask = vk::PipelineStageFlagBits2::eTopOfPipe,
-                .srcAccessMask = vk::AccessFlagBits2::eNone,
-                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
-                .dstAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
-                .oldLayout = vk::ImageLayout::eUndefined,
-                .newLayout = vk::ImageLayout::eGeneral,
-                .image = img.output_image,
                 .subresourceRange = simple_subresource,
             },
         };

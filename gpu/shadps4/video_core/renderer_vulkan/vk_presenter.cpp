@@ -786,8 +786,14 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     // Continue with host-side passes that draw the displayed (scaled) frame.
 
+    // sotc: FSR 1 reads the frame in compute shaders (EASU), not in the fragment shader of the
+    // post process pass: a barrier for the fragment stage alone let it read the frame before the
+    // game finished writing it, and the game's next frame write over it while it still read
+    // (torn, blocky image with FSR 1 on AMD cards, fine with bilinear, #209).
     runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
-                    vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderRead);
+                    vk::PipelineStageFlagBits2::eFragmentShader |
+                        vk::PipelineStageFlagBits2::eComputeShader,
+                    vk::AccessFlagBits2::eShaderRead);
     runtime.FlushBarriers();
 
     image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},

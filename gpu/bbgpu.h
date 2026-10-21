@@ -24,6 +24,8 @@ uintptr_t bbgpu_resolve(const char *scoped_nid);
 int bbgpu_handle_fault(void *ucontext, void *address);
 /* sotc: the GPU command thread or the draw recording thread (faults handled inline). */
 int bbgpu_is_gpu_side_thread(void);
+/* sotc: game flips so far (the loader's hang watchdog). */
+uint64_t bbgpu_flip_count(void);
 /* sotc: guest fiber stacks; the page tracker keeps them accessible while registered. */
 void bbgpu_register_guest_stack(uintptr_t address, uint64_t size);
 void bbgpu_register_guest_stack_end(uintptr_t address, uint64_t size);

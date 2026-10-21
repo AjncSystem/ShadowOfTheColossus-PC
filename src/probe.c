@@ -293,6 +293,26 @@ static void dump_thread_stacks(void) {
     fprintf(stderr,"STACKS: end\n");
     fflush(stderr);
 }
+/* sotc: hang watchdog (SOTC_WATCHDOG=0 turns it off). Now and then the game stops presenting for
+ * good: no flip, PS4SyncEvent waits growing, the player has to close it (user, 20 Oct). It could
+ * not be caught on purpose (8 attract runs without one), so after 15 s without a game frame the
+ * thread stacks go to the log once per stall, like BB_STACKS_TRIGGER. */
+static DWORD WINAPI hang_watchdog(void *unused) {
+    (void)unused;
+    uint64_t last=0;
+    int still=0, dumped=0;
+    for (;;) {
+        Sleep(1000);
+        const uint64_t flips=bbgpu_flip_count();
+        if (flips!=last || flips<100) { last=flips; still=0; dumped=0; continue; }
+        if (++still>=15 && !dumped) {
+            dumped=1;
+            fprintf(stderr,"SOTC WATCHDOG: no game frame for %d s (flips %llu); thread stacks:\n",still,(unsigned long long)flips);
+            dump_thread_stacks();
+        }
+    }
+    return 0;
+}
 /* sotc: SOTC_PROFILE=<thread name part>: samples that thread every ~1 ms (SuspendThread +
  * GetThreadContext) from SOTC_PROFILE_DELAY (default 20) s for SOTC_PROFILE_SECONDS (default 15)
  * s, then prints the hottest instructions (leaf) and the hottest frames anywhere on the
@@ -1334,6 +1354,8 @@ int main(int argc, char **argv) {
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
     entered_game=1;
 #ifdef _WIN32
+    if (gpu_enabled && !(getenv("SOTC_WATCHDOG") && getenv("SOTC_WATCHDOG")[0]=='0'))
+        CloseHandle(CreateThread(NULL,0,hang_watchdog,NULL,0,NULL));
     if (getenv("SOTC_HEAP_WATCH") && getenv("SOTC_HEAP_WATCH")[0]=='1') {
         heap_watch_image=image;
         CloseHandle(CreateThread(NULL,0,heap_watch,NULL,0,NULL));

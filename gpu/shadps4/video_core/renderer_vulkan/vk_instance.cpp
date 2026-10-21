@@ -193,9 +193,11 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
     memory_properties = physical_device.getMemoryProperties();
     // sotc: direct memory access (the launcher's "full water reflections") drew stripes over
     // shadows and water on AMD (issues #57, #28; the players confirmed that turning it off fixes
-    // them): off there unless BB_DIRECT_MEMORY_ACCESS asks for it.
+    // them): off there unless BB_DIRECT_MEMORY_ACCESS asks for it. The same stripes on Intel Arc
+    // (B580, issue #59: turning it off fixes them), so off there too.
     constexpr u32 VendorAmd = 0x1002;
-    if (properties.vendorID == VendorAmd) {
+    constexpr u32 VendorIntel = 0x8086;
+    if (properties.vendorID == VendorAmd || properties.vendorID == VendorIntel) {
         EmulatorSettings.SetDirectMemoryAccessDefault(false);
     }
     // sotc: without shaderInt64 (Intel Iris Xe) the shaders avoid 64-bit integers where they can,

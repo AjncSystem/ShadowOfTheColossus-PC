@@ -237,7 +237,7 @@ FPS_MODES = [('30', ('30 FPS (como no PS4)', '30 FPS (as on PS4)')),
 FRAMEGEN = [('off', ('Desligada', 'Off')),
             ('auto', ('Automática (DLSS-G ou FSR 3, experimental)', 'Automatic (DLSS-G or FSR 3, experimental)')),
             ('dlss', ('NVIDIA DLSS-G (RTX 40/50)', 'NVIDIA DLSS-G (RTX 40/50)')),
-            ('fsr', ('AMD FSR 3 (não recomendada)', 'AMD FSR 3 (not recommended)'))]
+            ('fsr', ('AMD FSR 3 (experimental)', 'AMD FSR 3 (experimental)'))]
 # DLSS super resolution (bb-probe: SOTC_UPSCALER=dlss): the game renders at the output size
 # divided by the mode's factor and DLSS picks its mode from that ratio (vk_dlssg.cpp).
 DLSS_MODES = [('quality', ('Qualidade (1,5×)', 'Quality (1.5×)')),
@@ -1079,10 +1079,10 @@ class Launcher:
                    'health and stamina bars may shake (the generated frame includes the interface). '
                    'In game, F8 switches the mode (off, DLSS-G, FSR 3). Best with the '
                    'screen at 60 or 120 Hz, or G-SYNC/FreeSync.') + ' ' +
-                 _('FSR 3 não é recomendada: numa RTX 3060 a taxa real do jogo caiu (24-30 FPS em vez de 40-50), '
+                 _('FSR 3 é experimental: numa RTX 3060 a taxa real do jogo caiu (24-30 FPS em vez de 40-50), '
                    'com mais travadas e falhas na imagem. DLSS-G só funciona nas RTX 40/50: nas outras placas '
                    'ela fica desligada e o F8 passa para FSR 3.',
-                   "FSR 3 is not recommended: on an RTX 3060 the game's real frame rate dropped (24-30 FPS instead of "
+                   "FSR 3 is experimental: on an RTX 3060 the game's real frame rate dropped (24-30 FPS instead of "
                    '40-50), with more stutter and image glitches. DLSS-G only works on RTX 40/50: on other cards '
                    'it stays off and F8 switches to FSR 3.'))
         self.window_icon_row(f)

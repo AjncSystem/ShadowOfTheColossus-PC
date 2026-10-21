@@ -516,6 +516,14 @@ void VideoOutDriver::Flip(const Request& req) {
                              static_cast<unsigned long long>(
                                  SotcStats::rb_hot_entries.load(std::memory_order_relaxed)));
             }
+            if (SotcStats::kFastBind) {
+                const uint64_t eligible = SotcStats::fast_bind_eligible.exchange(0);
+                const uint64_t hits = SotcStats::fast_bind_hits.exchange(0);
+                std::fprintf(stderr, "SOTC FASTBIND hits %llu/%llu (%.1f%%)\n",
+                             static_cast<unsigned long long>(hits),
+                             static_cast<unsigned long long>(eligible),
+                             100.0 * double(hits) / double(std::max<u64>(eligible, 1)));
+            }
             if (const uint64_t sweeps = SotcStats::dma_sweeps.exchange(0)) {
                 const uint64_t ranges = SotcStats::dma_sweep_ranges.exchange(0);
                 const uint64_t uploading = SotcStats::dma_sweep_uploading.exchange(0);

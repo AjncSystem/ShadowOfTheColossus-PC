@@ -297,6 +297,25 @@ static void dump_thread_stacks(void) {
  * good: no flip, PS4SyncEvent waits growing, the player has to close it (user, 20 Oct). It could
  * not be caught on purpose (8 attract runs without one), so after 15 s without a game frame the
  * thread stacks go to the log once per stall, like BB_STACKS_TRIGGER. */
+/* sotc: SOTC_PEEK=<image offset>[,<offset>...]: after SOTC_PEEK_DELAY s (default 40) prints
+ * 0xd8 bytes at each offset as 32-bit words (reading engine globals such as cvars). */
+static DWORD WINAPI peek_thread(void *list) {
+    const char *d=getenv("SOTC_PEEK_DELAY");
+    Sleep((DWORD)(d ? atoi(d) : 40)*1000u);
+    char buffer[512];
+    snprintf(buffer,sizeof(buffer),"%s",(const char *)list);
+    for (char *item=strtok(buffer,","); item; item=strtok(NULL,",")) {
+        const uintptr_t at=(uintptr_t)image+(uintptr_t)strtoull(item,NULL,16);
+        uint32_t words[0xd8/4];
+        SIZE_T n=0;
+        if (!ReadProcessMemory(GetCurrentProcess(),(const void *)at,words,sizeof(words),&n) || n!=sizeof(words)) continue;
+        fprintf(stderr,"SOTC PEEK %s:",item);
+        for (size_t k=0;k<sizeof(words)/4;++k) fprintf(stderr," %x",words[k]);
+        fprintf(stderr,"\n");
+    }
+    fflush(stderr);
+    return 0;
+}
 static DWORD WINAPI hang_watchdog(void *unused) {
     (void)unused;
     uint64_t last=0;
@@ -1356,6 +1375,7 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
     if (gpu_enabled && !(getenv("SOTC_WATCHDOG") && getenv("SOTC_WATCHDOG")[0]=='0'))
         CloseHandle(CreateThread(NULL,0,hang_watchdog,NULL,0,NULL));
+    if (getenv("SOTC_PEEK")) CloseHandle(CreateThread(NULL,0,peek_thread,(void *)getenv("SOTC_PEEK"),0,NULL));
     if (getenv("SOTC_HEAP_WATCH") && getenv("SOTC_HEAP_WATCH")[0]=='1') {
         heap_watch_image=image;
         CloseHandle(CreateThread(NULL,0,heap_watch,NULL,0,NULL));

@@ -109,6 +109,14 @@ inline void Collect(u64 (&entries)[256]) {
     }();
     static u64 coarser = 0;
     static u32 reports = 0;
+    // SOTC_LOD_POOL_LOG=1: the pool's free share at every check (measuring texture budgets).
+    static const bool pool_log = std::getenv("SOTC_LOD_POOL_LOG") != nullptr;
+    if (pool_log && reports % 30 == 0) {
+        std::fprintf(stderr, "SOTC LOD POOL: %d%% free\n", PoolFreePercent());
+    }
+    if (pool_log && (!linger_now || pool_low <= 0)) {
+        ++reports;
+    }
     if (linger_now && pool_low > 0 && reports++ % 30 == 0) {
         const int free = PoolFreePercent();
         // sotc: with hysteresis. The pool hovers at 0-14% free in large areas (9152 MiB), and
@@ -123,7 +131,7 @@ inline void Collect(u64 (&entries)[256]) {
                 want = 2;
             } else if (free < pool_low) {
                 want = std::max<u64>(coarser, 1);
-            } else if (coarser == 2 && free > pool_low * 3 / 4) {
+            } else if (coarser == 2) {
                 want = 1;
             }
             if (want == 1 && coarser == 1 && free > pool_low * 2) {

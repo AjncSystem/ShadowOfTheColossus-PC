@@ -1104,3 +1104,7 @@ TRANSLATIONS['ko']['AMD FSR 3 (não recomendada)'] = 'AMD FSR 3 (권장하지 �
 TRANSLATIONS['ko']['FSR 3 não é recomendada: numa RTX 3060 a taxa real do jogo caiu (24-30 FPS em vez de 40-50), com mais travadas e falhas na imagem. DLSS-G só funciona nas RTX 40/50: nas outras placas ela fica desligada e o F8 passa para FSR 3.'] = 'FSR 3은 권장하지 않습니다: RTX 3060에서 게임의 실제 프레임이 떨어졌고(40-50 대신 24-30 FPS) 끊김과 화면 오류가 늘었습니다. DLSS-G는 RTX 40/50에서만 작동합니다: 다른 그래픽카드에서는 꺼진 상태로 남고 F8은 FSR 3으로 바뀝니다.'
 TRANSLATIONS['ru']['AMD FSR 3 (não recomendada)'] = 'AMD FSR 3 (не рекомендуется)'
 TRANSLATIONS['ru']['FSR 3 não é recomendada: numa RTX 3060 a taxa real do jogo caiu (24-30 FPS em vez de 40-50), com mais travadas e falhas na imagem. DLSS-G só funciona nas RTX 40/50: nas outras placas ela fica desligada e o F8 passa para FSR 3.'] = 'FSR 3 не рекомендуется: на RTX 3060 реальная частота кадров игры упала (24-30 FPS вместо 40-50), рывков и ошибок изображения стало больше. DLSS-G работает только на RTX 40/50: на других видеокартах она остаётся выключенной, а F8 переключает на FSR 3.'
+TRANSLATIONS['es']['NVIDIA DLSS (experimental)'] = 'NVIDIA DLSS (experimental)'
+TRANSLATIONS['zh']['NVIDIA DLSS (experimental)'] = 'NVIDIA DLSS（实验性）'
+TRANSLATIONS['ko']['NVIDIA DLSS (experimental)'] = 'NVIDIA DLSS (실험적)'
+TRANSLATIONS['ru']['NVIDIA DLSS (experimental)'] = 'NVIDIA DLSS (экспериментально)'

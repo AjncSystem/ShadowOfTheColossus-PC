@@ -143,7 +143,7 @@ static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now().time_since_epoch())
                     .count());
-            BbMemReport::WsDiagCopy(backing, dest, n);
+            BbMemReport::WsDiagCopy(backing, reinterpret_cast<const void*>(source), dest, n);
             std::memcpy(dest, backing, n);
             BbMemReport::WsDiagCopyDone(before, n);
         } else if (backing) std::memcpy(dest, backing, n);

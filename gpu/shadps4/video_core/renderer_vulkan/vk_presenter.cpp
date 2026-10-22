@@ -23,6 +23,7 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/sotc_live.h"
 #include "video_core/texture_cache/image.h"
 #include "bbport_overlay.h"
 
@@ -790,6 +791,16 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                     vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderRead);
     runtime.FlushBarriers();
 
+    // sotc: upscaler and sharpening as the in-game menu set them (sotc_live.h)
+    if (const int live = SotcLive::fsr1.load(std::memory_order_relaxed); live >= 0) {
+        fsr_settings.enable = live != 0;
+    }
+    if (const int live = SotcLive::rcas.load(std::memory_order_relaxed); live != -1) {
+        fsr_settings.use_rcas = live >= 0;
+        if (live >= 0) {
+            fsr_settings.rcas_attenuation = static_cast<float>(live) / 1000.f;
+        }
+    }
     image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
                                  fsr_settings, frame->is_hdr);
 

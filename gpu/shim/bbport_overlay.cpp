@@ -330,22 +330,109 @@ void SetTextureLevel(int level) {
     SaveLauncherSetting("textures", keys[level]);
 }
 
+// sotc: FPS mode 0 = 30 (the game's cap), 1 = 60, 2 = unlimited, as the launcher's.
+void SetFpsMode(int mode) {
+    if (mode > 0) {
+        SotcFpsCap::limit_fps.store(mode == 1 ? 60 : 0, std::memory_order_relaxed);
+    }
+    if ((mode > 0) != SotcFpsCap::uncapped.load(std::memory_order_relaxed)) {
+        SotcFpsCap::Toggle();
+    }
+    const char* keys[] = {"\"30\"", "\"60\"", "\"unlimited\""};
+    SaveLauncherSetting("fps_mode", keys[mode]);
+}
+
+// sotc: upscaler 0 = FSR 1, 1 = bilinear; applied at the next frame (vk_presenter.cpp).
+void SetUpscaler(int mode) {
+    SotcLive::fsr1.store(mode == 0 ? 1 : 0, std::memory_order_relaxed);
+    SaveLauncherSetting("upscaler", mode == 0 ? "\"fsr1\"" : "\"bilinear\"");
+}
+
+// sotc: RCAS sharpening 0 high, 1 medium, 2 low, 3 off (the launcher's SHARPNESS values).
+constexpr int RcasValues[] = {0, 250, 600, -2};
+void SetRcas(int mode) {
+    SotcLive::rcas.store(RcasValues[mode], std::memory_order_relaxed);
+    const char* keys[] = {"\"0\"", "\"250\"", "\"600\"", "\"off\""};
+    SaveLauncherSetting("sharpness", keys[mode]);
+}
+
 // sotc: "Quick settings": the launcher's quick settings that can change while playing.
 void QuickSettings() {
     using SotcUi::T;
     ImGui::SeparatorText(T("Ajuste rápido (vale na hora)", "Quick settings (apply at once)"));
 
-    bool uncapped = SotcFpsCap::uncapped.load(std::memory_order_relaxed);
-    if (ImGui::Checkbox(T("60 FPS (sem o limite de 30)  [F7]", "60 FPS (no 30 FPS cap)  [F7]"),
-                        &uncapped)) {
-        SotcFpsCap::Toggle();
-        // Without the cap the launcher's limit stays as started: SOTC_FPS_LIMIT=0 is its
-        // "unlimited", which must not turn into "60" when the box is switched off and on again.
-        static const bool unlimited = [] {
-            const char* v = std::getenv("SOTC_FPS_LIMIT");
-            return v && std::strcmp(v, "0") == 0;
-        }();
-        SaveLauncherSetting("fps_mode", !uncapped ? "\"30\"" : unlimited ? "\"unlimited\"" : "\"60\"");
+    // sotc: FPS as the launcher's: 30 (the game's cap), 60 or unlimited. F7 switches the cap.
+    static const int env_limit = [] {
+        const char* v = std::getenv("SOTC_FPS_LIMIT");
+        return v ? std::atoi(v) : 0;
+    }();
+    const bool uncapped = SotcFpsCap::uncapped.load(std::memory_order_relaxed);
+    const int live_limit = SotcFpsCap::limit_fps.load(std::memory_order_relaxed);
+    const int fps_mode = !uncapped ? 0 : (live_limit >= 0 ? live_limit : env_limit) > 0 ? 1 : 2;
+    const char* fps_names[] = {T("30 FPS (como no PS4)", "30 FPS (as on PS4)"), "60 FPS",
+                               T("Ilimitado", "Unlimited")};
+    if (ImGui::BeginCombo("FPS  [F7]", fps_names[fps_mode])) {
+        for (int i = 0; i < 3; ++i) {
+            if (ImGui::Selectable(fps_names[i], i == fps_mode) && i != fps_mode) {
+                SetFpsMode(i);
+            }
+        }
+        ImGui::EndCombo();
+    }
+    // Started at 30 FPS the game is not in its own 60 FPS mode (fps60game, chosen at start):
+    // uncapped it runs faster, but some physics may be off (the 2nd colossus' wall).
+    if (uncapped && !SotcFpsCap::target_slot.load(std::memory_order_relaxed)) {
+        Hint(T("Aberto em 30 FPS: o modo 60 do próprio jogo (física certa) só entra abrindo o jogo "
+               "com 60 FPS no lançador.",
+               "Started at 30 FPS: the game's own 60 FPS mode (right physics) only applies when the "
+               "game starts with 60 FPS in the launcher."));
+    }
+
+    // sotc: upscaler and sharpening, applied at the next frame (vk_presenter.cpp, sotc_live.h).
+    static const int env_fsr1 = [] {
+        const char* v = std::getenv("BB_FSR1");
+        return v && v[0] != '0' ? 1 : 0;
+    }();
+    const int live_fsr1 = SotcLive::fsr1.load(std::memory_order_relaxed);
+    const int up_mode = (live_fsr1 >= 0 ? live_fsr1 : env_fsr1) ? 0 : 1;
+    const char* up_names[] = {T("FSR 1 (AMD, qualquer placa)", "FSR 1 (AMD, any GPU)"),
+                              T("Bilinear (simples)", "Bilinear (plain)")};
+    if (ImGui::BeginCombo("Upscaler", up_names[up_mode])) {
+        for (int i = 0; i < 2; ++i) {
+            if (ImGui::Selectable(up_names[i], i == up_mode) && i != up_mode) {
+                SetUpscaler(i);
+            }
+        }
+        ImGui::EndCombo();
+    }
+    static const int env_rcas = [] {
+        const char* on = std::getenv("BB_RCAS");
+        if (on && on[0] == '0') {
+            return -2;
+        }
+        const char* v = std::getenv("BB_RCAS_ATTENUATION");
+        return v ? std::atoi(v) : 250;
+    }();
+    const int live_rcas = SotcLive::rcas.load(std::memory_order_relaxed);
+    const int rcas_now = live_rcas != -1 ? live_rcas : env_rcas;
+    const char* rcas_names[] = {T("Alta", "High"), T("Média (padrão)", "Medium (default)"),
+                                T("Baixa", "Low"), T("Desligada", "Off")};
+    int rcas_mode = 1;
+    for (int i = 0; i < 4; ++i) {
+        if (RcasValues[i] == rcas_now) {
+            rcas_mode = i;
+        }
+    }
+    if (ImGui::BeginCombo(T("Nitidez (RCAS)", "Sharpening (RCAS)"), rcas_names[rcas_mode])) {
+        for (int i = 0; i < 4; ++i) {
+            if (ImGui::Selectable(rcas_names[i], i == rcas_mode) && i != rcas_mode) {
+                SetRcas(i);
+            }
+        }
+        ImGui::EndCombo();
+    }
+    if (!(live_fsr1 >= 0 ? live_fsr1 : env_fsr1)) {
+        Hint(T("A nitidez vale com o FSR 1.", "Sharpening applies with FSR 1."));
     }
 
     using Vulkan::FrameGen::Mode;
@@ -435,12 +522,11 @@ void QuickSettings() {
         }
     }
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-    ImGui::TextWrapped("%s", T("Resolução, upscaler, nitidez, efeitos (névoa, vinheta, SSAO), AF 16x, "
-                                "modo PS4 Pro e memória de vídeo: no lançador (valem ao abrir o jogo "
-                                "de novo).",
-                                "Resolution, upscaler, sharpening, effects (fog, vignette, SSAO), 16x "
-                                "AF, PS4 Pro mode and video memory use: in the launcher (they apply "
-                                "when the game starts again)."));
+    ImGui::TextWrapped("%s", T("Resolução, efeitos (névoa, vinheta, SSAO), AF 16x, modo PS4 Pro e "
+                                "memória de vídeo: no lançador (valem ao abrir o jogo de novo).",
+                                "Resolution, effects (fog, vignette, SSAO), 16x AF, PS4 Pro mode and "
+                                "video memory use: in the launcher (they apply when the game starts "
+                                "again)."));
     ImGui::PopStyleColor();
 }
 
@@ -1271,16 +1357,29 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
     if (menu_trigger && MenuAllowed() && std::remove(menu_trigger) == 0) {
         SetOpen(!menu_open);
     }
-    // sotc: SOTC_TEX_TRIGGER=<file>: "off", "high" or "max" in the file sets the texture level as
-    // the menu does, then the file is removed (the "tex=" event of tools/sotc_play.py).
-    static const char* tex_trigger = std::getenv("SOTC_TEX_TRIGGER");
-    if (tex_trigger) {
-        if (std::FILE* f = std::fopen(tex_trigger, "rb")) {
-            char word[8] = {};
-            std::fread(word, 1, sizeof(word) - 1, f);
+    // sotc: SOTC_SET_TRIGGER=<file>: "tex=off|high|max", "fps=30|60|unlimited",
+    // "up=fsr1|bilinear" or "rcas=high|medium|low|off" in the file sets that quick setting as the
+    // menu does, then the file is removed (scripted tests: tools/sotc_play.py).
+    static const char* set_trigger = std::getenv("SOTC_SET_TRIGGER");
+    if (set_trigger) {
+        if (std::FILE* f = std::fopen(set_trigger, "rb")) {
+            char line[32] = {};
+            std::fread(line, 1, sizeof(line) - 1, f);
             std::fclose(f);
-            std::remove(tex_trigger);
-            SetTextureLevel(word[0] == 'o' ? 0 : word[0] == 'm' ? 2 : 1);
+            std::remove(set_trigger);
+            const std::string text{line};
+            const std::string key = text.substr(0, text.find('='));
+            const char v = text.size() > key.size() + 1 ? text[key.size() + 1] : 0;
+            if (key == "tex") {
+                SetTextureLevel(v == 'o' ? 0 : v == 'm' ? 2 : 1);
+            } else if (key == "fps") {
+                SetFpsMode(v == '3' ? 0 : v == '6' ? 1 : 2);
+            } else if (key == "up") {
+                SetUpscaler(v == 'f' ? 0 : 1);
+            } else if (key == "rcas") {
+                SetRcas(v == 'h' ? 0 : v == 'm' ? 1 : v == 'l' ? 2 : 3);
+            }
+            std::fprintf(stderr, "SOTC SET: %s\n", line);
         }
     }
     if (menu_open) {

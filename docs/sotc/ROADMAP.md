@@ -95,6 +95,7 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 | T32 | Log de eventos `user/events.log` (pedido do usuário) | ✅ | `b637772`. Configuração por extenso, sistema (CPU, RAM, HD/SSD), menu F1, teclas, controle, carregamentos, texturas, desempenho por minuto, erros explicados, fim da sessão; idioma do lançador; 5 últimas sessões + cópia em crashes. |
 | T33 | Travadas em lugares novos (FPS a 5) no HD do usuário | ✅ | Leitura antecipada dos `.psarc` (13,7 GB em ~70 s, depois da pré-carga de shaders) e limpeza de texturas a cada carregamento (`b73c44e`, `104a836`). Máxima desativada no modo Pro. |
 | T34 | Boot de ~2 min a cada executável novo (driver NVIDIA recompila; também após cada atualização dos jogadores) | ⏳ | Próximo: gravar o VkPipelineCache do port em disco (hoje começa vazio). |
+| T35 | **Publicar v0.60.6** | ✅ | Leituras quentes desligadas, #219 e #232 desligadas por padrão, menu F1 limpo e ao vivo, leitura antecipada, limpeza no carregamento, events.log. |
 | T11 | #226: queda na cena final (RTX 5070, log anexado) | 🔍 | Baixar o log (pedir aprovação) e ver se é o 0x49500 já corrigido na 0.60.3 ou outra coisa. |
 | T12 | #228: colosso 5 (Avion) não aparece depois do 4 (modo Difícil, save da 0.59) | 🔍 | Ver se o save passa de versão; pedir o save. |
 | T13 | #202: barra de vida/stamina aparece cheia (fundo preto) em 3440x1440 + Pro | 🔍 | Só no ultrawide; em 16:9 normal. HUD do patch de tela larga (#54). |

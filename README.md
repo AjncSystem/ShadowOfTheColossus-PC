@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC native port · v0.60.5
+# Shadow of the Colossus — PC native port · v0.60.6
 
 [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
@@ -20,6 +20,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.60.6** | **No more rainbow garbage on textures and far fewer "closed out of nowhere" crashes** (the cause: speculative GPU readbacks written over memory the game had reused, after loading a save or a new area), **no more black dots on sandy ground**, **in-game menu cleaned up** (FPS, upscaler and sharpening now change at once; Bloodborne leftovers removed), **hard disk read-ahead** (fewer stalls in new areas on HDDs), textures refreshed on every load, a readable session event log (`user/events.log`). |
 | **0.60.5** | **Texture quality selector: Off / High / Maximum** (#235: sharp again), **memory leak fixed** (~60 MB/min, long-session stutter), **+3% average and +12% minimum FPS** (descriptor binds reused), **loading after a GPU driver update: 106 s → 7 s**, possible fix for **white characters on AMD GCN** (RX 470–590, Vega), **4-thread CPUs** no longer stuck loading, a hang watchdog, short hitches no longer flash a black loading screen, code review fixes. |
 | **0.60.4** | **No more cyan blocks on stone or blinking flowers** with high quality textures (the 0.60.3 crash protection switched the texture detail every second or two; now with hysteresis). |
 | **0.60.3** | **The game can be finished from start to end** (played from the last colossus through the ending and credits): fix for the high quality textures crash in wide views (#186), fix for the crash on the load after the credits, +2.7% FPS at the Shrine. |
@@ -76,7 +77,10 @@ In the launcher (**Quick settings → Textures**) and in the in-game menu (chang
 
 - The first start after updating rebuilds the shaders: the first load is slow and stutters.
 - **Texture quality "Maximum"** can close the game in very wide views (sword raised against the
-  sun, the last colossus' area; #186), mostly in PS4 Pro mode. Use **High** if it happens.
+  sun, the last colossus' area; #186). Since 0.60.6 it is not available in PS4 Pro mode, where it
+  closed within minutes.
+- The first start after an update rebuilds the GPU driver's shader cache: about 2 minutes of
+  loading screen, and short stalls the first time each area is visited.
 - **AMD GCN** cards (RX 470–590, Vega, APUs on the legacy driver): characters and Agro may glow
   white (#152, #158, #187). 0.60.5 adds the LDS barriers these cards were missing (PR #205), which
   is the likely fix: please report whether it helps. `SOTC_AMD64_LDS=0` turns it off.

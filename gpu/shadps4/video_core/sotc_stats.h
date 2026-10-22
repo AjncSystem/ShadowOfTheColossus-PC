@@ -20,10 +20,12 @@ namespace SotcStats {
 inline const bool kFpsLog = std::getenv("SOTC_FPS") != nullptr;
 inline const bool kCmdStats = std::getenv("SOTC_CMD_STATS") != nullptr;
 /// sotc: skip BindResources on consecutive draws whose pipeline, push data and resource
-/// handles did not change. On by default; SOTC_FAST_BIND=0 disables it.
+/// handles did not change. Off by default since 0.60.6 (SOTC_FAST_BIND=1 turns it on): in 0.60.5
+/// it left black dots in a grid on sandy ground (new constants at the same address); the fix
+/// (mem_epoch below) waits for a check on that ground.
 inline const bool kFastBind = [] {
     const char* v = std::getenv("SOTC_FAST_BIND");
-    return !v || v[0] != '0';
+    return v && v[0] == '1';
 }();
 inline std::atomic<uint64_t> fast_bind_eligible{0};
 inline std::atomic<uint64_t> fast_bind_hits{0};

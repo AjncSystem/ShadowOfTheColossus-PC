@@ -166,6 +166,7 @@ void ComputePipeline::BindWhenReady() const {
                 SotcStats::async_compute_self_built.fetch_add(1, std::memory_order_relaxed);
             }
             ready.wait(false, std::memory_order_acquire);
+            LogSlowBuild("compute wait (recorder)", start);
             SotcStats::async_compute_wait_ns.fetch_add(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - start)

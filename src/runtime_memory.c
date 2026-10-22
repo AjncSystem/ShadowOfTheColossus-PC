@@ -325,10 +325,20 @@ static int pool(void) {
     runtime_memory_reserve();
     uint64_t bytes=POOL_SIZE+FLEX_SPAN;
     section=CreateFileMapping2(INVALID_HANDLE_VALUE,NULL,FILE_MAP_ALL_ACCESS,PAGE_EXECUTE_READWRITE,SEC_COMMIT,bytes,NULL,NULL,0);
+    /* sotc: when Windows refuses the larger pool (error 1450: small page file, RAM in use), try
+     * the sizes between the console's and the requested one first. Going straight to the base size
+     * is what made saves in Pro mode read past the page bitmap (guest offset 0x1a371, #194), so the
+     * base is the last choice. */
+    static const uint64_t fallback_mb[] = {8192, 7168, 6144};
+    for (size_t i=0; !section && i<sizeof fallback_mb/sizeof fallback_mb[0]; ++i) {
+        if (fallback_mb[i] >= pool_size_mb || fallback_mb[i] <= pool_base_mb()) continue;
+        fprintf(stderr,"Runtime: %" PRIu64 " MiB of guest memory refused (error %lu): trying %" PRIu64 " MiB\n",
+                pool_size_mb,GetLastError(),fallback_mb[i]);
+        pool_size_mb=fallback_mb[i];
+        bytes=POOL_SIZE+FLEX_SPAN;
+        section=CreateFileMapping2(INVALID_HANDLE_VALUE,NULL,FILE_MAP_ALL_ACCESS,PAGE_EXECUTE_READWRITE,SEC_COMMIT,bytes,NULL,NULL,0);
+    }
     if (!section && pool_size_mb>pool_base_mb()) {
-        /* sotc: the larger pool (BB_DMEM_MB, 9152 MiB by default since 0.59) is committed at once;
-         * with little RAM and a small page file Windows refuses it (error 1450) and the game
-         * stopped at boot. Fall back to the console's size. */
         fprintf(stderr,"Runtime: %" PRIu64 " MiB of guest memory refused (error %lu): using %" PRIu64 " MiB; a larger page file allows more\n",
                 bytes>>20,GetLastError(),pool_base_mb());
         pool_size_mb=pool_base_mb();

@@ -468,22 +468,39 @@ void QuickSettings() {
     const int tex_level = !hq ? 0 : (live_low >= 0 ? live_low : EnvPoolLow()) > 0 ? 1 : 2;
     const char* tex_names[] = {T("Desligada", "Off"), T("Alta (estável)", "High (stable)"),
                                T("Máxima (nítida)", "Maximum (sharp)")};
+    // sotc: no "Maximum" in PS4 Pro mode: there it exhausted the game's page pool within minutes
+    // at the Shrine (0x1a371, user, 22 Oct).
+    static const bool neo = [] {
+        const char* v = std::getenv("SOTC_NEO");
+        return v && v[0] == '1';
+    }();
     if (ImGui::BeginCombo(T("Qualidade das texturas", "Texture quality"), tex_names[tex_level])) {
         for (int i = 0; i < 3; ++i) {
-            if (ImGui::Selectable(tex_names[i], i == tex_level) && i != tex_level) {
+            const bool blocked = neo && i == 2;
+            if (blocked) {
+                ImGui::BeginDisabled();
+            }
+            if (ImGui::Selectable(tex_names[i], i == tex_level) && i != tex_level && !blocked) {
                 SetTextureLevel(i);
+            }
+            if (blocked) {
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", T("— não no modo PS4 Pro", "— not in PS4 Pro mode"));
             }
         }
         ImGui::EndCombo();
     }
     Hint(T("Alta: folhas e pedras nítidas, um pouco menos em vistas amplas. Máxima: sempre "
-           "nítida, mas pode fechar em vistas muito amplas no modo PS4 Pro. Alta e Máxima valem "
-           "na hora (o jogo leva alguns segundos para carregar as texturas); Desligada só "
-           "aparece ao abrir o jogo de novo (o jogo não descarta o que já carregou).",
+           "nítida, mas pode fechar em vistas muito amplas (fora do modo PS4 Pro, onde fechava "
+           "em minutos). Alta e Máxima valem na hora (o jogo leva alguns segundos para carregar "
+           "as texturas); Desligada só aparece ao abrir o jogo de novo (o jogo não descarta o "
+           "que já carregou).",
            "High: sharp leaves and rocks, a little less in wide views. Maximum: always sharp, "
-           "but it may close in very wide views in PS4 Pro mode. High and Maximum apply at once "
-           "(the game takes a few seconds to load the textures); Off only shows when the game "
-           "starts again (the game keeps what it already loaded)."));
+           "but it may close in very wide views (not in PS4 Pro mode, where it closed within "
+           "minutes). High and Maximum apply at once (the game takes a few seconds to load the "
+           "textures); Off only shows when the game starts again (the game keeps what it already "
+           "loaded)."));
 
     static const int env_reuse = [] {
         const char* v = std::getenv("SOTC_SHADOW_REUSE");

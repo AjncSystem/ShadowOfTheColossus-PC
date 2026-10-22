@@ -520,6 +520,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
         }
     });
     rasterizer->GetPipelineCache().WarmUp();
+    SotcStats::warmup_finished.store(true, std::memory_order_relaxed);
     warming.store(false, std::memory_order_relaxed);
     painter.join();
 }

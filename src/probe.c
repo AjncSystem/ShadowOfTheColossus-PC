@@ -335,8 +335,11 @@ static char prefetch_dir[1024];
 static DWORD WINAPI prefetch_thread(void *unused) {
     (void)unused;
     /* Not while the shader cache loads (thousands of small files, on the same disk as a rule: the
-     * boot's loading screen took 125 s instead of 2 with both): after 20 s of game frames. */
-    while (bbgpu_flip_count()<1200) Sleep(1000);
+     * boot's loading screen took 2 minutes instead of 2 s with both; the game's logos already
+     * flip then): once the preload is over and 20 s of game frames came after it. */
+    while (!bbgpu_warmup_finished()) Sleep(500);
+    const uint64_t after=bbgpu_flip_count()+1200;
+    while (bbgpu_flip_count()<after) Sleep(1000);
     char pattern[1100];
     snprintf(pattern,sizeof(pattern),"%s\\*.psarc",prefetch_dir);
     WIN32_FIND_DATAA found;

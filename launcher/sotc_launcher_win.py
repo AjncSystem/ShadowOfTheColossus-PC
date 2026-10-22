@@ -517,6 +517,11 @@ def game_environment(s):
     textures = s.get('textures') or 'high'
     if textures != 'off':
         env.setdefault('SOTC_LOD_LINGER', '1')
+    if textures == 'max' and env['SOTC_NEO'] == '1':
+        # sotc: in PS4 Pro mode "Maximum" exhausted the game's page pool within minutes at the
+        # Shrine (0x1a371, user, 22 Oct): High there.
+        textures = 'high'
+        env['SOTC_NOTE'] = 'Texture quality Maximum is not used in PS4 Pro mode: High'
     if textures == 'max':  # sotc: without the page pool switch (sotc_lod_stats.h)
         env.setdefault('SOTC_LOD_POOL_LOW', '0')
     if s.get('button_icons') == 'xbox' and (PORT_DIR / 'glyphs' / 'xbox').is_dir():

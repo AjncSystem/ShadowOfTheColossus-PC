@@ -1,15 +1,38 @@
 # Changelog
 
-## Não lançado — binds de descritores reaproveitados
-- **Fast bind no Vulkan (padrão ligado):** quando o desenho seguinte usa o mesmo pipeline,
-  push constants, buffers, imagens e samplers, o port pula a remontagem dos descritores.
-  Desenhos com compute, feedback loop, clip planes, storage images, FMasks, shared memory ou
-  recursos escritos continuam no caminho normal; buffers de stream e imagens têm guarda de
-  geração/wrap. Acerto de 59–75% dos draws elegíveis no demo.
-- **Ganho medido no Santuário:** 24,0–25,0 → 29,6–30,0 FPS; `draw busy` 39–40 → 32,5–33,1 ms;
-  `parse` 22–23 → 18–20 ms. No caminho completo até o primeiro colosso: 30 FPS travados,
-  frametime 33,2–33,5 ms, sem artefatos de textura ou sombra observados.
-- `SOTC_FAST_BIND=0` desliga; com `SOTC_FPS=1` o log mostra o acerto por janela.
+## 0.60.5 — 2026-10-21
+- **Seletor de qualidade das texturas: Desligada / Alta / Máxima** (#235), no lançador
+  (Ajustes rápidos → Texturas) e no menu do jogo (muda na hora). **Alta (estável)**, o padrão,
+  mantém a proteção da 0.60.3/0.60.4 (texturas um nível mais grossas quando a memória de texturas
+  do jogo está acabando); como essa memória fica quase sempre cheia nas áreas grandes, a 0.60.4
+  ficava menos nítida que a 0.60.3. **Máxima (nítida)** tira a proteção: sempre o nível mais fino,
+  mas **pode fechar em vistas muito amplas** (espada contra o sol, Santuário, área do último
+  colosso; `0x1a371`, #186), principalmente no modo PS4 Pro; se acontecer, volte para Alta.
+  **Desligada** = só as versões 256×256 do jogo. A antiga caixa "Texturas em alta qualidade" vira
+  Alta (ou Desligada).
+- **Vazamento de memória** (~60 MB por minuto, mais de 7 GB em meia hora; engasgos em sessões
+  longas): cada buffer de comandos aninhado deixava a sua corrotina na memória (PR #219,
+  Oussama268).
+- **Mais FPS:** os descritores do desenho anterior são reaproveitados quando o desenho seguinte usa
+  o mesmo pipeline e os mesmos recursos (PR #232, Tadomikaari312-Hy): demo +3,3% na média, +12% na
+  mínima (72,8 / 37,1 → 75,2 / 41,7). `SOTC_FAST_BIND=0` desliga.
+- **Carregamento depois de atualizar o driver da placa: 106 s → 7 s** (os pipelines guardados são
+  montados pelas threads auxiliares; PR #215, Oussama268). `SOTC_ASYNC_PRELOAD=0` volta ao antigo.
+- **AMD GCN** (RX 470–590, Vega, APUs): barreiras de memória compartilhada que essas placas não
+  recebiam, provável correção dos personagens e da fumaça brancos (PR #205, Lucas-blip-png; teste
+  em placas GCN pelos jogadores). `SOTC_AMD64_LDS=0` desliga.
+- **CPUs com 4 threads:** o gravador de comandos e o processador de comandos não ocupam mais um
+  núcleo inteiro esperando (preso no carregamento → 73 FPS; PR #198, Lucas-blip-png).
+- **Lançador:** não para quando o console recusa escrita (#104, PR #207); dump ou módulos ainda
+  criptografados dizem qual arquivo é (PR #212).
+- **Tela de carregamento:** engasgos curtos no jogo só escurecem a imagem; fica opaca depois de 3 s
+  sem quadro (antes piscava preto em travadas de 1 s).
+- **Vigia de travamento:** depois de 15 s sem quadro do jogo, as pilhas das threads vão para o log
+  (`SOTC_WATCHDOG=0` desliga), para achar o "fechou do nada".
+- **Revisão de código:** a proteção dos heaps do mundo pulava a guarda nas peças seguintes do heap
+  e deixava peças novas sem guarda por até 2 s; PCs com pouca RAM recebiam o tamanho da memória
+  antes da redução; o botão 60 FPS do menu trocava "Ilimitado" por "60".
+- Menu do jogo e atalhos (F1, F7, F8, F10, F11) explicados no README, com imagem.
 
 ## 0.60.4 — 2026-10-20
 - **Blocos ciano nas pedras e flores piscando** (com "Texturas em alta qualidade"): o ajuste da

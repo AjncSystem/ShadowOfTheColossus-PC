@@ -1355,6 +1355,12 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
     if (loading) {
         LoadingScreen();
     }
+    // sotc: SOTC_MENU_TRIGGER=<file>: when the file appears it is removed and the menu opens or
+    // closes (scripted pictures of the menu: the "menu" event of tools/sotc_play.py).
+    static const char* menu_trigger = std::getenv("SOTC_MENU_TRIGGER");
+    if (menu_trigger && MenuAllowed() && std::remove(menu_trigger) == 0) {
+        SetOpen(!menu_open);
+    }
     if (menu_open) {
         Menu();
     }

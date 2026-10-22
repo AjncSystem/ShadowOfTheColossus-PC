@@ -59,7 +59,7 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 | 0.46 | Texturas "Máxima" nítidas sem queda | ⏳ | Precisa reproduzir a queda (espada no sol no Santuário, modo Pro) com o gatilho desligado e `SOTC_LOD_POOL_LOG=1`; depois detectar a liberação de páginas que falha (0x1abf0) em vez de olhar páginas livres. |
 | 0.47 | GTX 1080 (live): texturas arco-íris e vértices explodindo | 🔍 | Não reproduz aqui forçando o caminho da #169. Pedir ao streamer: `SOTC_BARYCENTRIC_GS=0`, `SOTC_RB_NARROW=0`, `SOTC_LOD_POOL_LOW=0`, um por vez. |
 | 0.48 | Retângulo cinza no céu (foto do usuário) | ⏳ | |
-| 0.49 | **Publicar v0.60.5** (revisão + vigia) | ⏳ aprovação | |
+| 0.49 | **Publicar v0.60.5** | ✅ | Revisão + vigia, PRs #219, #232, #215, #205, #198, #207, #212, seletor de texturas. Notas e README com o menu F1 (imagem), atalhos F1/F7/F8/F10/F11 e os níveis de textura com os problemas possíveis. |
 
 ## Triagem de 21/10 (12 PRs e 103 issues abertas)
 

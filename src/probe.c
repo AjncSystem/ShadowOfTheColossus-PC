@@ -325,6 +325,67 @@ static DWORD WINAPI peek_thread(void *list) {
     fflush(stderr);
     return 0;
 }
+/* sotc: read-ahead of the game's archives (SOTC_PREFETCH=0 turns it off). A new area makes the
+ * game read many scattered pieces of pakN.psarc (12 GB); on a hard disk each waits for a seek and
+ * the frame stalls (54 ms of 83 in "io" on the user's HDD, FPS down to 5). Once the game has
+ * shown 20 s of frames the *.psarc files are read once, in order (~150 MB/s on a HDD), with a low
+ * I/O priority hint so the game's own reads go first; Windows keeps them in its file cache (RAM), and later
+ * reads of the game come from memory. Skipped when they are more than half the RAM. */
+static char prefetch_dir[1024];
+static DWORD WINAPI prefetch_thread(void *unused) {
+    (void)unused;
+    /* Not while the shader cache loads (thousands of small files, on the same disk as a rule: the
+     * boot's loading screen took 125 s instead of 2 with both): after 20 s of game frames. */
+    while (bbgpu_flip_count()<1200) Sleep(1000);
+    char pattern[1100];
+    snprintf(pattern,sizeof(pattern),"%s\\*.psarc",prefetch_dir);
+    WIN32_FIND_DATAA found;
+    HANDLE find=FindFirstFileA(pattern,&found);
+    if (find==INVALID_HANDLE_VALUE) return 0;
+    char names[64][MAX_PATH]; unsigned long long sizes[64]; int count=0;
+    unsigned long long total=0;
+    do {
+        if (count<64 && !(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            snprintf(names[count],MAX_PATH,"%s",found.cFileName);
+            sizes[count]=((unsigned long long)found.nFileSizeHigh<<32)|found.nFileSizeLow;
+            total+=sizes[count++];
+        }
+    } while (FindNextFileA(find,&found));
+    FindClose(find);
+    MEMORYSTATUSEX mem={.dwLength=sizeof(mem)};
+    if (!GlobalMemoryStatusEx(&mem) || total>mem.ullTotalPhys/2) {
+        fprintf(stderr,"SOTC prefetch: skipped (%llu MiB of archives, %llu MiB of RAM)\n",total>>20,
+                (unsigned long long)(mem.ullTotalPhys>>20));
+        return 0;
+    }
+    /* The small archives first (boot and common data), then the big one. */
+    for (int i=0;i<count;++i) for (int j=i+1;j<count;++j) if (sizes[j]<sizes[i]) {
+        unsigned long long s=sizes[i]; sizes[i]=sizes[j]; sizes[j]=s;
+        char t[MAX_PATH]; memcpy(t,names[i],MAX_PATH); memcpy(names[i],names[j],MAX_PATH); memcpy(names[j],t,MAX_PATH);
+    }
+    SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_LOWEST);
+    const DWORD chunk=4u<<20;
+    void *buffer=VirtualAlloc(NULL,chunk,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
+    if (!buffer) return 0;
+    const DWORD start=GetTickCount();
+    unsigned long long done=0;
+    for (int i=0;i<count;++i) {
+        char path[1400];
+        snprintf(path,sizeof(path),"%s\\%s",prefetch_dir,names[i]);
+        HANDLE f=CreateFileA(path,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,
+                             OPEN_EXISTING,FILE_FLAG_SEQUENTIAL_SCAN,NULL);
+        if (f==INVALID_HANDLE_VALUE) continue;
+        FILE_IO_PRIORITY_HINT_INFO hint={.PriorityHint=IoPriorityHintLow};
+        SetFileInformationByHandle(f,FileIoPriorityHintInfo,&hint,sizeof(hint));
+        DWORD n=0;
+        while (ReadFile(f,buffer,chunk,&n,NULL) && n) done+=n;
+        CloseHandle(f);
+    }
+    VirtualFree(buffer,0,MEM_RELEASE);
+    fprintf(stderr,"SOTC prefetch: %d archives, %llu MiB read ahead in %.1f s\n",count,done>>20,
+            (GetTickCount()-start)/1000.0);
+    return 0;
+}
 /* sotc: hang watchdog (SOTC_WATCHDOG=0 turns it off). Now and then the game stops presenting for
  * good: no flip, PS4SyncEvent waits growing, the player has to close it (user, 20 Oct). It could
  * not be caught on purpose (8 attract runs without one), so after 15 s without a game frame the
@@ -1389,6 +1450,10 @@ int main(int argc, char **argv) {
     if (gpu_enabled && !(getenv("SOTC_WATCHDOG") && getenv("SOTC_WATCHDOG")[0]=='0'))
         CloseHandle(CreateThread(NULL,0,hang_watchdog,NULL,0,NULL));
     if (getenv("SOTC_PEEK")) CloseHandle(CreateThread(NULL,0,peek_thread,(void *)getenv("SOTC_PEEK"),0,NULL));
+    if (app0 && !(getenv("SOTC_PREFETCH") && getenv("SOTC_PREFETCH")[0]=='0')) {
+        snprintf(prefetch_dir,sizeof(prefetch_dir),"%s",app0);
+        CloseHandle(CreateThread(NULL,0,prefetch_thread,NULL,0,NULL));
+    }
     if (getenv("SOTC_HEAP_WATCH") && getenv("SOTC_HEAP_WATCH")[0]=='1') {
         heap_watch_image=image;
         CloseHandle(CreateThread(NULL,0,heap_watch,NULL,0,NULL));

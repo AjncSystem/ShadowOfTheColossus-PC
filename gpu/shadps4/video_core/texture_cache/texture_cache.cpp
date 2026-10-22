@@ -1973,6 +1973,9 @@ void TextureCache::RunGarbageCollector() {
     if (const u32 pending = pending_emergency.exchange(0, std::memory_order_relaxed)) {
         EmergencyCollect(pending - 1);
     }
+    if (SotcStats::load_flush.exchange(false, std::memory_order_relaxed)) {
+        EmergencyCollect(2); // sotc: a load began (sotc_stats.h)
+    }
     Census();
     GarbageCollectImages();
     GarbageCollectSamplers();

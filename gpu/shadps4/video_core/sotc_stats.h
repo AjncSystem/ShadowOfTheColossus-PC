@@ -33,6 +33,11 @@ inline std::atomic<uint64_t> fast_bind_hits{0};
 /// next draw may have the same descriptors over new constants at the same address, and skipping
 /// BindResources skipped their upload (black dots in a grid on the sand, user, 0.60.5).
 inline std::atomic<uint64_t> mem_epoch{0};
+/// sotc: the game started loading a save or a new area ("st_gameflow() starting game",
+/// runtime_file.c): the texture cache drops every image not in use (TextureCache::
+/// RunGarbageCollector), so stale images over reused texture memory go away (green blocks after
+/// long sessions and many loads, user, 22 Oct). SOTC_LOAD_FLUSH=0 turns it off.
+inline std::atomic<bool> load_flush{false};
 inline std::atomic<uint64_t> readbacks{0};    ///< BufferCache::DownloadMemory calls
 inline std::atomic<uint64_t> readback_ns{0};  ///< time spent in them (copy and wait)
 inline std::atomic<uint64_t> watch_addr{0};     ///< SOTC_CS_WATCH: GPU writes to report

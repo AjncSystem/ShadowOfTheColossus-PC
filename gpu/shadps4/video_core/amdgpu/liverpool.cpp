@@ -599,17 +599,10 @@ void* Liverpool::Task::promise_type::operator new(std::size_t size) {
 void Liverpool::Task::promise_type::operator delete(void* frame, std::size_t size) {
 #ifdef _WIN32
     if (TaskGuard()) {
-        // Inaccessible from now on; the oldest 64k of them are given back (a few hundred MiB).
-        static std::mutex mutex;
-        static std::deque<void*> quarantine;
-        DWORD old = 0;
-        VirtualProtect(frame, size, PAGE_NOACCESS, &old);
-        std::scoped_lock lock{mutex};
-        quarantine.push_back(frame);
-        if (quarantine.size() > 65536) {
-            VirtualFree(quarantine.front(), 0, MEM_RELEASE);
-            quarantine.pop_front();
-        }
+        // The pages are decommitted (inaccessible, memory given back) but the address range stays
+        // reserved for good: no later frame, nor anything else, ever gets the same address
+        // (telling a stale read from a cache keyed by a reused address).
+        VirtualFree(frame, size, MEM_DECOMMIT);
         return;
     }
 #endif

@@ -382,9 +382,29 @@ static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
 }
+/* sotc: the game logs "st_gameflow() starting game" on stdout when it loads a save or a new area;
+ * the texture cache then drops its unused images (bbgpu_request_texture_flush, sotc_stats.h:
+ * stale images over reused texture memory, green blocks). SOTC_LOAD_FLUSH=0 turns it off. */
+void bbgpu_request_texture_flush(void) __attribute__((weak));
+static void note_game_load(const void *buffer,uint64_t size) {
+    static int on=-1;
+    if (on<0) { const char *v=getenv("SOTC_LOAD_FLUSH"); on=!v || v[0]!='0'; }
+    static const char key[]="st_gameflow() starting game";
+    const uint64_t n=sizeof(key)-1;
+    if (!on || !bbgpu_request_texture_flush || size<n) return;
+    const char *b=buffer;
+    for (uint64_t i=0;i+n<=size;++i) {
+        if (b[i]=='s' && !memcmp(b+i,key,n)) {
+            printf("SOTC load: the texture cache drops unused images\n");
+            bbgpu_request_texture_flush();
+            return;
+        }
+    }
+}
 static int64_t do_write(int fd,const void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
+    if (fd==1 || fd==2) note_game_load(buffer,size);
     ssize_t n=host_write(h,buffer,size);
     if (n<0) return -errno;
     __atomic_add_fetch(&writes,1,__ATOMIC_RELAXED);

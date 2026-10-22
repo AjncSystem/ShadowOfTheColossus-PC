@@ -26,6 +26,8 @@ int bbgpu_handle_fault(void *ucontext, void *address);
 int bbgpu_is_gpu_side_thread(void);
 /* sotc: game flips so far (the loader's hang watchdog). */
 uint64_t bbgpu_flip_count(void);
+/* sotc: the game began a load; the texture cache drops unused images at the next submit. */
+void bbgpu_request_texture_flush(void);
 /* sotc: guest fiber stacks; the page tracker keeps them accessible while registered. */
 void bbgpu_register_guest_stack(uintptr_t address, uint64_t size);
 void bbgpu_register_guest_stack_end(uintptr_t address, uint64_t size);

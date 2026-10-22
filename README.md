@@ -54,6 +54,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.60.5-plus1** | **Lucas-blip-png fork:** the original's 0.60.5 merged into the fork (texture quality selector, memory leak fix, faster loading after a driver update), with the fork's AMD GCN 32-lane path, memory fallback and FSR 1 fixes kept. Not tested on a GCN card with both LDS barriers on yet. |
 | **0.60.5** | **Texture quality selector: Off / High / Maximum** (#235: sharp again), **memory leak fixed** (~60 MB/min, long-session stutter), **+3% average and +12% minimum FPS** (descriptor binds reused), **loading after a GPU driver update: 106 s → 7 s**, possible fix for **white characters on AMD GCN** (RX 470–590, Vega), **4-thread CPUs** no longer stuck loading, a hang watchdog, short hitches no longer flash a black loading screen, code review fixes. |
 | **0.60.4** | **No more cyan blocks on stone or blinking flowers** with high quality textures (the 0.60.3 crash protection switched the texture detail every second or two; now with hysteresis). |
 | **0.60.3-plus6** | **Lucas-blip-png fork:** fixes a crash after the first colossus in Pro-mode saves when Windows refuses the game memory (the fallback tries 8, 7 and 6 GiB first). |

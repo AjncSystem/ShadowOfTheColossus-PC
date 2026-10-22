@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.60.5-plus1 — 2026-10-22 (fork Lucas-blip-png)
+- **Junção com a 0.60.5 do original:** a seleção de texturas (Desligada / Alta / Máxima), o vazamento
+  de memória, os descritores reaproveitados, o carregamento mais rápido depois de atualizar o driver
+  e as barreiras de LDS para AMD de 64 lanes vêm da 0.60.5. Nada disso foi removido do fork.
+- **Mantido do fork:** a conversão para 32 lanes nas AMD GCN (`GPU: AMD wave32 on`), com a
+  proteção para o RADV, a correção de memória (8/7/6 GiB antes do mínimo), o Streamline só em NVIDIA
+  e as barreiras do FSR 1.
+- **Atenção:** as barreiras de LDS da 0.60.5 e a conversão para 32 lanes ficam ligadas juntas nas
+  AMD GCN. Ainda não foi testado em uma RX 570; quem testar, mande o `last_run.log` (o relato de
+  perda de dispositivo ainda não está resolvido: teste com `SOTC_AMD_WAVE32=0`).
+
 ## 0.60.3-plus6 — 2026-10-22 (fork Lucas-blip-png)
 - **Queda depois do primeiro colosso com saves em modo Pro (#194 do original):** quando o Windows
   recusava os 9152 MiB de memória do jogo, a plus3 caía direto para 5056/5696 MiB, e isso fazia o

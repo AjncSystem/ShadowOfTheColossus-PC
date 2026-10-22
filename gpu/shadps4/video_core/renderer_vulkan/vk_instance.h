@@ -281,7 +281,11 @@ public:
         if (env >= 0) {
             return env != 0;
         }
-        return vk13_props.minSubgroupSize >= 64 && vk13_props.maxSubgroupSize >= 64;
+        // Only where the driver lets compute pipelines require a size (Windows RX 570: stages
+        // 0x20). RADV reports 0 there, and the 32-lane lowering then mismatched the 64-wide
+        // shaders (crash 30-90 s into the intro, albaruzz #201).
+        return vk13_props.minSubgroupSize >= 64 && vk13_props.maxSubgroupSize >= 64 &&
+               (vk13_props.requiredSubgroupSizeStages & vk::ShaderStageFlagBits::eCompute);
     }
 
     /// sotc: whether a required subgroup size may be given for this stage.

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.60.3-plus5 — 2026-10-21 (fork Lucas-blip-png)
+- **Correção urgente da plus4 no Linux (RADV):** a conversão para 32 lanes ligava por padrão em
+  qualquer AMD com subgrupo 64, mas o RADV não exige o tamanho nos shaders de compute, e o jogo
+  travava 30–90 s na introdução (#201 do original). Agora o padrão só liga onde o driver exige o
+  tamanho nos shaders de compute (Windows, RX 570: o flicker sumiu com isso). `SOTC_AMD_WAVE32=1`
+  continua forçando, mas no RADV dá falha: não use lá.
+
 ## 0.60.3-plus4 — 2026-10-21 (fork Lucas-blip-png)
 - **Placas AMD GCN (RX 470–590, Vega, APUs mais antigas):** o flicker branco/verde/rosa de
   personagens, fumaça e névoa (#152, #187, #201 do original) **sumiu numa RX 570** com a nova

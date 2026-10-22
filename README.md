@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC native port · v0.60.3-plus4
+# Shadow of the Colossus — PC native port · v0.60.3-plus5
 
 **The original 0.60.3, plus CPUs without BMI1 (pre-Haswell), CPUs with 4 threads, 120 Hz
 fullscreen and a fix to test for AMD GCN cards (RX 470–590).** Everything in [AjncSystem's 0.60.3](https://github.com/AjncSystem/ShadowOfTheColossus-PC)
@@ -54,6 +54,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.60.3-plus5** | **Lucas-blip-png fork:** hotfix: the AMD GCN 32-lane conversion is on by default only where the driver requires it (fixes a crash in the intro on Linux RADV). |
 | **0.60.3-plus4** | **Lucas-blip-png fork:** **AMD GCN cards (RX 470–590, Vega): the white/green flicker is gone** (confirmed on an RX 570) with the 32-lane conversion on by default there; `SOTC_AMD_WAVE32=0` turns it off. |
 | **0.60.3-plus3** | **Lucas-blip-png fork:** fixes two crashes: at boot when Windows refuses the 9152 MiB of game memory (small page file), and with **frame generation on PCs with an AMD and an NVIDIA card**; FSR 1 barriers. |
 | **0.60.3-plus2** | **Lucas-blip-png fork:** a fix to test for **AMD GCN cards** (RX 470–590, Vega: white, flickering characters and smoke) and a little more FPS on **CPUs with 4 threads** (+4% on 2 cores with SMT). |

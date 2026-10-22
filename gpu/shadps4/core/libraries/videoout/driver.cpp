@@ -24,7 +24,9 @@
 #include "bbport_overlay.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/sotc_fps_cap.h"
+#include "video_core/sotc_event.h"
 #include "video_core/sotc_stats.h"
+#include "video_core/sotc_ui_lang.h"
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
@@ -341,6 +343,38 @@ void VideoOutDriver::Flip(const Request& req) {
         presenter->Present(frame);
     });
     SotcStats::flip_count.fetch_add(1, std::memory_order_relaxed);
+    {
+        // sotc: a performance line in the event log every minute (average FPS, frames slower
+        // than 50 ms, the slowest, video memory in use).
+        using Clock = std::chrono::steady_clock;
+        static Clock::time_point minute_start = Clock::now(), last_flip = minute_start;
+        static u32 minute_flips = 0, slow = 0;
+        static double worst_ms = 0.0;
+        const Clock::time_point now = Clock::now();
+        const double gap_ms = std::chrono::duration<double, std::milli>(now - last_flip).count();
+        last_flip = now;
+        ++minute_flips;
+        worst_ms = std::max(worst_ms, gap_ms);
+        slow += gap_ms > 50.0;
+        const double seconds = std::chrono::duration<double>(now - minute_start).count();
+        if (seconds >= 60.0) {
+            SotcEvent::Log("PERF",
+                           SotcUi::T("Último minuto: %.1f FPS médio, %u quadros acima de 50 ms, pior %.0f ms, memória de vídeo %llu MB",
+                                     "Last minute: %.1f FPS average, %u frames over 50 ms, worst %.0f ms, video memory %llu MB"),
+                           minute_flips / seconds, slow, worst_ms,
+                           static_cast<unsigned long long>(SotcStats::vram_used.load(std::memory_order_relaxed) >> 20));
+            if (const u64 skipped = SotcStats::rb_hot_cpu_skipped.exchange(0, std::memory_order_relaxed)) {
+                SotcEvent::Log("MEMORY",
+                               SotcUi::T("Leituras da GPU não aplicadas sobre memória que o jogo reescreveu: %llu KB",
+                                         "GPU readbacks not applied over memory the game rewrote: %llu KB"),
+                               static_cast<unsigned long long>(skipped >> 10));
+            }
+            minute_start = now;
+            minute_flips = 0;
+            slow = 0;
+            worst_ms = 0.0;
+        }
+    }
 
     // sotc: SOTC_FPS=1 prints the flip rate every five seconds.
     const bool fps_log = SotcStats::kFpsLog; // sotc: the switch the counters use (sotc_stats.h)
@@ -883,10 +917,13 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     // sotc: SOTC_FPS_LIMIT=<fps> (the launcher's 60 FPS mode) limits the uncapped game to at least
     // vblank_hz / fps vblanks between flips; a late frame still goes out at the next vblank (at
     // 120 Hz a 20 ms frame shows at 25 ms, not at 33 ms as with 60 Hz vblanks).
-    const u64 limit_vblanks = [] {
-        const char* v = std::getenv("SOTC_FPS_LIMIT");
-        const long fps = v ? std::strtol(v, nullptr, 10) : 0;
+    // The in-game menu changes it while playing (SotcFpsCap::limit_fps: 60 or unlimited).
+    const auto vblanks_for = [](long fps) {
         return fps > 0 ? std::max<u64>(1, EmulatorSettings.GetVblankFrequency() / u64(fps)) : u64{0};
+    };
+    const u64 start_limit_vblanks = [&] {
+        const char* v = std::getenv("SOTC_FPS_LIMIT");
+        return vblanks_for(v ? std::strtol(v, nullptr, 10) : 0);
     }();
     u64 last_flip_vblank = 0;
     bool flipped = false;
@@ -930,6 +967,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         } else if (!flipped) {
             take_request = true;
         } else if (flip_rate <= 0) {
+            const int live_limit = SotcFpsCap::limit_fps.load(std::memory_order_relaxed);
+            const u64 limit_vblanks = live_limit >= 0 ? vblanks_for(live_limit) : start_limit_vblanks;
             take_request = limit_vblanks == 0 || vblank_status.count - last_flip_vblank >= limit_vblanks;
         } else {
             const u64 interval = u64(flip_rate + 1) * vblanks_per_60hz;

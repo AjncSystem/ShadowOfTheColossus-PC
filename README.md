@@ -1,7 +1,7 @@
-# Shadow of the Colossus — PC native port · v0.60.5-plus1
+# Shadow of the Colossus — PC native port · v0.60.6-plus1
 
-**The original 0.60.5, plus CPUs without BMI1 (pre-Haswell), CPUs with 4 threads, 120 Hz
-fullscreen and a 32-lane fix for AMD GCN cards (RX 470–590, to test).** Everything in [AjncSystem's 0.60.5](https://github.com/AjncSystem/ShadowOfTheColossus-PC)
+**The original 0.60.6, plus CPUs without BMI1 (pre-Haswell), CPUs with 4 threads, 120 Hz
+fullscreen and a 32-lane fix for AMD GCN cards (RX 470–590, to test).** Everything in [AjncSystem's 0.60.6](https://github.com/AjncSystem/ShadowOfTheColossus-PC)
 (the game can be finished from start to end; the in-game menu with quick settings; textures on
 GTX 10xx cards, 60 FPS through the game's own 60 FPS mode, faster heap guards, HUD-less frame
 generation as an option, no crash with high quality textures and the smaller readback window, all
@@ -56,6 +56,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.60.6** | **No more rainbow garbage on textures and far fewer "closed out of nowhere" crashes** (the cause: speculative GPU readbacks written over memory the game had reused, after loading a save or a new area), **no more black dots on sandy ground**, **in-game menu cleaned up** (FPS, upscaler and sharpening now change at once; Bloodborne leftovers removed), **hard disk read-ahead** (fewer stalls in new areas on HDDs), textures refreshed on every load, a readable session event log (`user/events.log`). |
 | **0.60.5-plus1** | **Lucas-blip-png fork:** the original's 0.60.5 merged into the fork (texture quality selector, memory leak fix, faster loading after a driver update), with the fork's AMD GCN 32-lane path, memory fallback and FSR 1 fixes kept. Not tested on a GCN card with both LDS barriers on yet. |
 | **0.60.5** | **Texture quality selector: Off / High / Maximum** (#235: sharp again), **memory leak fixed** (~60 MB/min, long-session stutter), **+3% average and +12% minimum FPS** (descriptor binds reused), **loading after a GPU driver update: 106 s → 7 s**, possible fix for **white characters on AMD GCN** (RX 470–590, Vega), **4-thread CPUs** no longer stuck loading, a hang watchdog, short hitches no longer flash a black loading screen, code review fixes. |
 | **0.60.4** | **No more cyan blocks on stone or blinking flowers** with high quality textures (the 0.60.3 crash protection switched the texture detail every second or two; now with hysteresis). |
@@ -95,14 +96,14 @@ the menu is open; **Esc** or F1 closes it.
 
 ![In-game menu (F1)](docs/images/sotc-menu-f1-en.png)
 
-- **Quick settings (apply at once):** 60 FPS, frame generation, **texture quality**, far shadow
-  reuse, volume. They are also saved as the launcher's choice for the next start.
-- **Display & Window:** fullscreen, FPS counter, output resolution.
-- **Upscaler & sharpening:** upscaler, render preset, RCAS sharpening strength.
-- **Camera & Mouse:** mouse camera on/off, sensitivity, invert Y.
-- **Engine visuals:** atmospheric fog, vignette, ambient occlusion (SSAO), water reflections (these
-  apply on the next start).
-- The header shows FPS, frame time, the GPU and its video memory in use.
+- **Quick settings (apply at once):** FPS (30 / 60 / unlimited), upscaler (FSR 1 / bilinear),
+  sharpening (RCAS), frame generation, **texture quality**, far shadow reuse, volume. They are
+  also saved as the launcher's choice for the next start.
+- **Display:** fullscreen, FPS counter.
+- **Camera & mouse:** mouse camera on/off, sensitivity, invert Y.
+- The header shows FPS, frame time, the GPU and its video memory in use. Output resolution,
+  effects (fog, vignette, SSAO), 16x AF, PS4 Pro mode and video memory use stay in the launcher
+  (they apply when the game starts).
 
 | Key | What it does |
 |---|---|
@@ -126,7 +127,10 @@ In the launcher (**Quick settings → Textures**) and in the in-game menu (chang
 
 - The first start after updating rebuilds the shaders: the first load is slow and stutters.
 - **Texture quality "Maximum"** can close the game in very wide views (sword raised against the
-  sun, the last colossus' area; #186), mostly in PS4 Pro mode. Use **High** if it happens.
+  sun, the last colossus' area; #186). Since 0.60.6 it is not available in PS4 Pro mode, where it
+  closed within minutes.
+- The first start after an update rebuilds the GPU driver's shader cache: about 2 minutes of
+  loading screen, and short stalls the first time each area is visited.
 - **AMD GCN** cards (RX 470–590, Vega, APUs on the legacy driver): characters and Agro may glow
   white (#152, #158, #187). 0.60.5 adds the LDS barriers these cards were missing (PR #205), which
   is the likely fix: please report whether it helps. `SOTC_AMD64_LDS=0` turns it off.

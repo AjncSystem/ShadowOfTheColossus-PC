@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.60.6 — 2026-10-22
+- **Fim do ruído arco-íris nas texturas e das quedas "do nada" (`0x49500`).** A causa eram as
+  leituras "quentes" da GPU (`SOTC_RB_HOT`): junto com cada leitura, o port escrevia na memória do
+  jogo, por especulação, regiões lidas antes; depois de carregar um save ou uma área nova o jogo já
+  tinha reaproveitado essa memória para texturas novas e para os seus heaps, e o desenho antigo da
+  GPU caía por cima. Agora vêm desligadas (o FPS médio do demo cai ~4%). Achado com a receita do
+  usuário: área nova → esperar → sair → recarregar o save.
+- **Pontos pretos em grade no chão de areia** (0.60.5): a otimização de binds da PR #232 sai
+  desligada por padrão (`SOTC_FAST_BIND=1` liga; a correção dela aguarda teste).
+- **PR #219 (vazamento de memória) desligada por padrão**: com ela, ruído colorido e polígonos
+  pretos gigantes ("explosão de vértices") apareciam com muito mais frequência
+  (`SOTC_CP_FREE_TASKS=1` liga).
+- **Menu do jogo (F1):** só o que funciona no SotC (as opções de upscaler, preset, resolução e
+  efeitos herdadas do Bloodborne não faziam nada); **FPS (30/60/ilimitado), Upscaler e Nitidez**
+  mudam na hora; textura **Máxima** desativada no modo PS4 Pro (fechava em minutos); dica explica
+  o que vale na hora.
+- **Disco rígido:** depois que o jogo carrega, os arquivos do jogo (13,7 GB) são lidos uma vez em
+  ordem e ficam na RAM: lugares novos não travam mais esperando o HD (`SOTC_PREFETCH=0` desliga).
+- **Carregamentos:** a cada save ou área nova, as texturas sem uso são descartadas
+  (`SOTC_LOAD_FLUSH=0` desliga).
+- **Log de eventos `user/events.log`:** configuração por extenso, sistema (CPU, RAM, HD/SSD), menu,
+  teclas, controle, carregamentos, texturas, desempenho por minuto, erros explicados; idioma do
+  lançador; as 5 últimas sessões e uma cópia em `user/crashes` após uma queda.
+- PRs: #215 (pré-carga de pipelines nos workers: driver novo 106 s → 7 s), #198 (CPUs de 4
+  threads), #205 (barreiras LDS na AMD GCN), #207, #212.
+- Revisão de código: guarda dos heaps do mundo, vigia de travamento, memória em PC com pouca RAM,
+  "Ilimitado" do lançador preservado, tela de carregamento translúcida em engasgos curtos.
+
+## 0.60.6-plus1 — fork Lucas-blip-png
+- Junção com a 0.60.6 do original (AjncSystem). Nenhuma mudança própria nesta versão ainda;
+  as correções do fork (wave32 nas AMD GCN, memória, Streamline só em NVIDIA, barreiras do FSR 1)
+  seguem como estavam na 0.60.5-plus1.
+
 ## 0.60.5-plus1 — 2026-10-22 (fork Lucas-blip-png)
 - **Junção com a 0.60.5 do original:** a seleção de texturas (Desligada / Alta / Máxima), o vazamento
   de memória, os descritores reaproveitados, o carregamento mais rápido depois de atualizar o driver

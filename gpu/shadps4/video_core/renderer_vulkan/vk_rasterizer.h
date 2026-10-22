@@ -266,6 +266,7 @@ private:
         u64 buffer_generation{};
         u64 texture_generation{};
         u64 stream_generation{};
+        u64 mem_epoch{}; ///< SotcStats::mem_epoch: guest memory unchanged since
         u64 tick{};
         bool uses_dma{};
         bool valid{};

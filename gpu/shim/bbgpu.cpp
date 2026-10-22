@@ -235,6 +235,14 @@ u64 PS4_SYSV_ABI sceKernelGetProcessTime() { return runtime_process_time_us(); }
 u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounter() { return runtime_process_time_counter(); }
 u64 PS4_SYSV_ABI sceKernelGetProcessTimeCounterFrequency() { return 1'000'000'000; }
 extern "C" int runtime_sotc_neo(void);
+extern "C" int bbgpu_warmup_finished(void) {
+    return SotcStats::warmup_finished.load(std::memory_order_relaxed) ? 1 : 0;
+}
+
+extern "C" void bbgpu_request_texture_flush(void) {
+    SotcStats::load_flush.store(true, std::memory_order_relaxed);
+}
+
 extern "C" uint64_t bbgpu_flip_count(void) {
     return SotcStats::flip_count.load(std::memory_order_relaxed);
 }

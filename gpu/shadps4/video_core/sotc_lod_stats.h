@@ -25,7 +25,9 @@
 #include <cstring>
 #include <iterator>
 #include "common/types.h"
+#include "video_core/sotc_event.h"
 #include "video_core/sotc_live.h"
+#include "video_core/sotc_ui_lang.h"
 
 extern "C" const unsigned char* runtime_memory_backing_pointer(uintptr_t address);
 
@@ -126,6 +128,17 @@ inline void Collect(u64 (&entries)[256]) {
     // The texture level (launcher, in-game menu): "High" keeps the switch, "Maximum" sets 0.
     const int live_low = SotcLive::lod_pool_low.load(std::memory_order_relaxed);
     const int pool_low = live_low >= 0 ? live_low : env_pool_low;
+    static u32 last_linger = ~0u;
+    static int last_pool_low = -1;
+    if (linger_now != last_linger || pool_low != last_pool_low) {
+        last_linger = linger_now;
+        last_pool_low = pool_low;
+        SotcEvent::Log("TEXTURE", SotcUi::T("Nível de textura em uso: %s", "Texture level in use: %s"),
+                       !linger_now ? SotcUi::T("Desligada", "Off")
+                       : pool_low > 0 ? SotcUi::T("Alta", "High") : SotcUi::T("Máxima", "Maximum"));
+        std::fprintf(stderr, "SOTC LOD: texture level %s\n",
+                     !linger_now ? "off" : pool_low > 0 ? "high" : "maximum");
+    }
     static u64 coarser = 0;
     static u32 reports = 0;
     // SOTC_LOD_POOL_LOG=1: the pool's free share at every check (measuring texture budgets).
@@ -166,6 +179,10 @@ inline void Collect(u64 (&entries)[256]) {
         }
         if (want != coarser) {
             coarser = want;
+            SotcEvent::Log("TEXTURE",
+                           SotcUi::T("Memória de texturas do jogo com %d%% livre: detalhe das texturas vistas no nível %u (2 = o mais fino)",
+                                     "Game texture memory %d%% free: seen textures at detail level %u (2 = finest)"),
+                           free, static_cast<unsigned>(level + want));
             std::fprintf(stderr, "SOTC LOD: game page pool %d%% free, sampled textures ask for mip %u\n",
                          free, static_cast<unsigned>(level + coarser));
         }

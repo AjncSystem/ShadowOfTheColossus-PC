@@ -13,6 +13,7 @@ so a packaged port needs no Python installation.
 import ctypes
 import json
 import os
+import platform
 from pathlib import Path
 import queue
 import runpy
@@ -37,7 +38,7 @@ CONFIG_DIR = PORT_DIR / 'user'
 CONFIG_FILE = CONFIG_DIR / 'launcher_settings.json'
 GAME_ID, GAME_VERSION = 'CUSA08809', '01.01'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.60.5-plus1'
+VERSION = '0.60.6-plus1'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -379,6 +380,71 @@ def keep_crash_log(log_dir, code):
         pass
 
 
+def start_event_log(log_dir, settings, env):
+    """user/events.log: one line per event of the session (src/runtime_event.h), for players and
+    developers to read. The launcher writes the header (date, version, system, every setting in
+    words) and the game appends its events (SOTC_EVENT_LOG). The last 5 sessions are kept."""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(LOGS_KEPT - 1, 0, -1):
+        older = log_dir / ('events.log' if i == 1 else f'events.{i - 1}.log')
+        if older.is_file():
+            try:
+                os.replace(older, log_dir / f'events.{i}.log')
+            except OSError:
+                pass
+    path = log_dir / 'events.log'
+    words = lambda table, key, default='': dict((k, _(*v)) for k, v in table).get(settings.get(key) or default, str(settings.get(key)))
+    on_off = lambda value: _('ligado', 'on') if value else _('desligado', 'off')
+    lines = [
+        _('Shadow of the Colossus PC {} - sessão de {}', 'Shadow of the Colossus PC {} - session of {}').format(
+            VERSION, time.strftime('%Y-%m-%d %H:%M:%S')),
+        _('Windows {} | jogo: {}', 'Windows {} | game: {}').format(platform.version(), settings.get('game_dir') or '?'),
+        _('Saída: {} | Upscaler: {} | Nitidez: {}', 'Output: {} | Upscaler: {} | Sharpening: {}').format(
+            words(OUTPUTS, 'output_res', '1920x1080'), words(UPSCALERS, 'upscaler', 'fsr1'), words(SHARPNESS, 'sharpness', '250')),
+        _('FPS: {} | Texturas: {} | Filtro 16x: {} | Modo PS4 Pro: {}', 'FPS: {} | Textures: {} | 16x filtering: {} | PS4 Pro mode: {}').format(
+            words(FPS_MODES, 'fps_mode', '30'), words(TEXTURES, 'textures', 'high'), on_off(settings.get('af16')),
+            on_off(env.get('SOTC_NEO') == '1')),
+        _('Geração de quadros: {} | Memória de vídeo: {} | Sombras distantes: {} | Volume: {}%',
+          'Frame generation: {} | Video memory use: {} | Far shadows: {} | Volume: {}%').format(
+            words(FRAMEGEN, 'framegen', 'off'), words(VRAM_USE, 'vram_use', 'normal'),
+            on_off(str(settings.get('shadow_reuse') or '0') != '0'), settings.get('volume') or '100'),
+        _('Tela cheia: {} | Câmera pelo mouse: {} | Controle preferido: {} | Variáveis extras: {}',
+          'Fullscreen: {} | Mouse camera: {} | Preferred controller: {} | Extra variables: {}').format(
+            on_off(settings.get('fullscreen')), on_off(settings.get('mouse', True)),
+            settings.get('gamepad') or _('qualquer', 'any'), settings.get('extra_env') or _('nenhuma', 'none')),
+    ]
+    if env.get('SOTC_NOTE'):
+        lines.append(_('Aviso: {}', 'Note: {}').format(env['SOTC_NOTE']))
+    try:
+        with open(path, 'w', encoding='utf-8') as out:
+            for line in lines:
+                out.write(f'[00:00:00.000] [CONFIG  ] {line}' + chr(10))
+    except OSError:
+        return ''
+    return str(path)
+
+
+def end_event_log(log_dir, code, stopped=False):
+    """The end of the session in user/events.log; after a crash its copy goes to user/crashes."""
+    path = log_dir / 'events.log'
+    if code == 0 or stopped:
+        text = _('Jogo fechado normalmente', 'Game closed normally') if code == 0 else _('Jogo parado pelo lançador', 'Game stopped by the launcher')
+    elif code & 0xffffffff == 3:
+        text = _('O jogo caiu (código 3): o motivo está na linha ERROR acima e no log da sessão',
+                 'The game crashed (code 3): the reason is in the ERROR line above and in the session log')
+    else:
+        text = _('O jogo terminou com erro (código {:#x})', 'The game ended with an error (code {:#x})').format(code & 0xffffffff)
+    try:
+        with open(path, 'a', encoding='utf-8') as out:
+            out.write(f'[--:--:--.---] [SESSION ] {text}' + chr(10))
+        if code != 0 and not stopped:
+            crashes = log_dir / 'crashes'
+            crashes.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, crashes / (time.strftime('%Y-%m-%d_%H-%M-%S') + f'_{code & 0xffffffff:#x}_events.log'))
+    except OSError:
+        pass
+
+
 def short_path(path):
     """A path for display: relative to the port folder when inside it, else as is."""
     try:
@@ -517,6 +583,11 @@ def game_environment(s):
     textures = s.get('textures') or 'high'
     if textures != 'off':
         env.setdefault('SOTC_LOD_LINGER', '1')
+    if textures == 'max' and env['SOTC_NEO'] == '1':
+        # sotc: in PS4 Pro mode "Maximum" exhausted the game's page pool within minutes at the
+        # Shrine (0x1a371, user, 22 Oct): High there.
+        textures = 'high'
+        env['SOTC_NOTE'] = 'Texture quality Maximum is not used in PS4 Pro mode: High'
     if textures == 'max':  # sotc: without the page pool switch (sotc_lod_stats.h)
         env.setdefault('SOTC_LOD_POOL_LOW', '0')
     if s.get('button_icons') == 'xbox' and (PORT_DIR / 'glyphs' / 'xbox').is_dir():
@@ -1779,7 +1850,9 @@ class Launcher:
             self.append(_('Não foi possível gravar as teclas no sotc.ini: {}',
                           'Could not write the keys to sotc.ini: {}').format(error) + '\n')
         try:
-            self.process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=game_environment(self.app),
+            env = game_environment(self.app)
+            env['SOTC_EVENT_LOG'] = start_event_log(user_dir(self.app), self.app, env)
+            self.process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=env,
                                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                             stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
         except OSError as error:
@@ -1819,11 +1892,12 @@ class Launcher:
                 pass
             if not self.stopping:
                 keep_crash_log(log_dir, code)
+            end_event_log(log_dir, code, self.stopping)
         self.stopping = False
         self.output.put((code,))
 
     # Quick settings the in-game menu may have changed (it writes them to the settings file).
-    LIVE_KEYS = ('fps_mode', 'framegen', 'textures', 'shadow_reuse', 'volume')
+    LIVE_KEYS = ('fps_mode', 'framegen', 'textures', 'shadow_reuse', 'volume', 'upscaler', 'sharpness')
 
     def reload_live_settings(self):
         saved = load_json(CONFIG_FILE, {})
@@ -2039,8 +2113,10 @@ def play_without_window(settings):
         write_key_bindings(settings.get('keys'))
     except OSError:
         pass
+    env = game_environment(settings)
+    env['SOTC_EVENT_LOG'] = start_event_log(log_dir, settings, env)
     with open_session_log(log_dir) as log:
-        process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=game_environment(settings),
+        process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=env,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
         for raw in iter(process.stdout.readline, b''):
@@ -2053,6 +2129,7 @@ def play_without_window(settings):
         code = process.wait()
         log.write(f'[exit code {code} = {code & 0xffffffff:#x}]\n')
     keep_crash_log(log_dir, code)
+    end_event_log(log_dir, code)
     return code
 
 

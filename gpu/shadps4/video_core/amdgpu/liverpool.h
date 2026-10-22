@@ -225,6 +225,9 @@ public:
     }
     /// Command processor: waits until the draw thread ran everything queued.
     void DrainBack();
+    /// sotc: frees a finished nested command buffer task's frame once the draw thread has run
+    /// the work queued until now (PR #219 freed it at once: garbage textures, heap corruption).
+    void FreeTaskFrame(std::coroutine_handle<> frame);
     /// True on the command processor thread while the draw thread does the GPU work.
     bool RunsGpuWorkElsewhere() const noexcept {
         return back_threaded && std::this_thread::get_id() == gpu_id;
@@ -270,6 +273,11 @@ private:
                 }
             }
             void return_void() {}
+            /// sotc: SOTC_TASK_GUARD=1 gives every task frame pages of its own that become
+            /// inaccessible when it is freed (and stay so for a while): a later read of a freed
+            /// frame faults where it happens (hunting the garbage textures of PR #219).
+            static void* operator new(std::size_t size);
+            static void operator delete(void* frame, std::size_t size);
             struct empty {};
             std::suspend_always yield_value(empty&&) {
                 return {};
@@ -440,6 +448,8 @@ private:
     std::vector<BackOp> back_ring;
     std::atomic<u64> back_head{0};
     std::atomic<u64> back_tail{0};
+    /// sotc: finished task frames and the back_head they wait for (FreeTaskFrame)
+    std::vector<std::pair<std::coroutine_handle<>, u64>> finished_frames;
     std::atomic<bool> back_sleeping{false};
     std::atomic<bool> drain_waiting{false};
     std::mutex back_mutex;

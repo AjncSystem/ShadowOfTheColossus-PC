@@ -4,6 +4,12 @@
 #include <atomic>
 #include <utility>
 #include <cstdlib>
+#include <deque>
+#include <mutex>
+#include <new>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <boost/preprocessor/stringize.hpp>
 
 #include "common/assert.h"
@@ -548,6 +554,87 @@ void Liverpool::Process(std::stop_token stoken) {
     }
 }
 
+// sotc: the frames of finished nested command buffer tasks (an indirect buffer each: ~700 a
+// second in the compute queues) were never freed, ~60 MB a minute (PR #219). Freed at once, as
+// that PR did, the game showed speckled, rainbow-coloured textures on the Shrine's floor and
+// walls and then crashed in its heap (0x49500), with that change alone on (user, 22 Oct): the
+// draw thread still ran work queued from them. A frame is freed once the draw thread has run
+// everything queued until it finished (back_tail >= the back_head then); the user still saw a
+// huge black polygon over the Shrine with that (vertex garbage, the GTX 1080 streamer's "vertex
+// explosion"): something else keeps using freed memory, and the leak hid it (frames were never
+// reused). Off until that is found, as before #219: SOTC_CP_FREE_TASKS=1 frees them.
+static bool FreeNestedTasks() {
+    static const bool free_tasks = [] {
+        const char* v = std::getenv("SOTC_CP_FREE_TASKS");
+        return v && v[0] == '1';
+    }();
+    return free_tasks;
+}
+
+static bool TaskGuard() {
+    static const bool guard = [] {
+        const char* v = std::getenv("SOTC_TASK_GUARD");
+        const bool on = v && v[0] == '1';
+        if (on) {
+            std::fprintf(stderr, "SOTC TASK GUARD: freed task frames become inaccessible\n");
+        }
+        return on;
+    }();
+    return guard;
+}
+
+void* Liverpool::Task::promise_type::operator new(std::size_t size) {
+#ifdef _WIN32
+    if (TaskGuard()) {
+        void* frame = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!frame) {
+            throw std::bad_alloc{};
+        }
+        return frame;
+    }
+#endif
+    return ::operator new(size);
+}
+
+void Liverpool::Task::promise_type::operator delete(void* frame, std::size_t size) {
+#ifdef _WIN32
+    if (TaskGuard()) {
+        // Inaccessible from now on; the oldest 64k of them are given back (a few hundred MiB).
+        static std::mutex mutex;
+        static std::deque<void*> quarantine;
+        DWORD old = 0;
+        VirtualProtect(frame, size, PAGE_NOACCESS, &old);
+        std::scoped_lock lock{mutex};
+        quarantine.push_back(frame);
+        if (quarantine.size() > 65536) {
+            VirtualFree(quarantine.front(), 0, MEM_RELEASE);
+            quarantine.pop_front();
+        }
+        return;
+    }
+#endif
+    ::operator delete(frame);
+}
+
+void Liverpool::FreeTaskFrame(std::coroutine_handle<> frame) {
+    if (!FreeNestedTasks()) {
+        return;
+    }
+    // SOTC_CP_FREE_NOW=1: at once, as PR #219 did (reproducing its garbage for tests)
+    static const bool free_now = std::getenv("SOTC_CP_FREE_NOW") != nullptr;
+    if (!back_threaded || free_now) {
+        frame.destroy();
+        return;
+    }
+    finished_frames.emplace_back(frame, back_head.load(std::memory_order_acquire));
+    const u64 tail = back_tail.load(std::memory_order_acquire);
+    size_t done = 0;
+    while (done < finished_frames.size() && finished_frames[done].second <= tail) {
+        finished_frames[done++].first.destroy();
+    }
+    finished_frames.erase(finished_frames.begin(), finished_frames.begin() + done);
+}
+
 Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_ENTER(ccb_task_name);
 
@@ -603,8 +690,8 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
                 YIELD_CE();
                 RESUME_CE(task);
             }
-            // sotc: the nested task's frame is not freed by Task (it was leaked per IB).
-            task.handle.destroy();
+            // sotc: the nested task's frame is not freed by Task (FreeTaskFrame).
+            FreeTaskFrame(task.handle);
             break;
         }
         default:
@@ -1286,7 +1373,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     RESUME_GFX(task);
                 }
                 // sotc: free the nested task's frame (Task does not; it was leaked per IB).
-                task.handle.destroy();
+                FreeTaskFrame(task.handle);
                 break;
             }
             case PM4ItOpcode::IncrementDeCounter: {
@@ -1471,7 +1558,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             }
             // sotc: free the nested task's frame. Task does not, and SotC's compute queues run
             // an indirect buffer per dispatch batch: ~1 KiB leaked hundreds of times a second.
-            task.handle.destroy();
+            FreeTaskFrame(task.handle);
             break;
         }
         case PM4ItOpcode::DmaData: {

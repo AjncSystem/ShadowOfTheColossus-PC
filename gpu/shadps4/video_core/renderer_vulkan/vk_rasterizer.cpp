@@ -1424,6 +1424,7 @@ void Rasterizer::CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dm
     fast_bind.buffer_generation = buffer_cache.BindGeneration();
     fast_bind.texture_generation = texture_cache.BindGeneration();
     fast_bind.stream_generation = buffer_cache.StreamGeneration();
+    fast_bind.mem_epoch = SotcStats::mem_epoch.load(std::memory_order_relaxed);
     fast_bind.tick = scheduler.CurrentTick();
     fast_bind.uses_dma = uses_dma;
     fast_bind.valid = true;
@@ -1494,6 +1495,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             fast_bind.buffer_generation == buffer_cache.BindGeneration() &&
             fast_bind.texture_generation == texture_cache.BindGeneration() &&
             fast_bind.stream_generation == buffer_cache.StreamGeneration() &&
+            fast_bind.mem_epoch == SotcStats::mem_epoch.load(std::memory_order_relaxed) &&
             fast_bind.hash == fast_hash) {
             fast_bind_hit = true;
             SotcStats::fast_bind_hits.fetch_add(1, std::memory_order_relaxed);

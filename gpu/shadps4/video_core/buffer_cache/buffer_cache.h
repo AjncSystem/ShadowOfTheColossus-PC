@@ -82,6 +82,17 @@ public:
         return block_shift;
     }
 
+    /// sotc: changes whenever a resident arena range is added or removed, i.e. whenever a
+    /// previously bound buffer handle or offset may have moved (SOTC_FAST_BIND).
+    u64 BindGeneration() const noexcept {
+        return resident_version;
+    }
+
+    /// sotc: stream-buffer wrap count (flat buffers and other per-draw uploads live there).
+    u64 StreamGeneration() const noexcept {
+        return stream_buffer.WrapGeneration();
+    }
+
     void TickFrame();
 
     /// Invalidates any buffer in the logical page range.

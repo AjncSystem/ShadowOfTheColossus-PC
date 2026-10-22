@@ -603,6 +603,8 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
                 YIELD_CE();
                 RESUME_CE(task);
             }
+            // sotc: the nested task's frame is not freed by Task (it was leaked per IB).
+            task.handle.destroy();
             break;
         }
         default:
@@ -1283,6 +1285,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     YIELD_GFX();
                     RESUME_GFX(task);
                 }
+                // sotc: free the nested task's frame (Task does not; it was leaked per IB).
+                task.handle.destroy();
                 break;
             }
             case PM4ItOpcode::IncrementDeCounter: {
@@ -1465,6 +1469,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 YIELD_ASC(vqid);
                 RESUME_ASC(task, vqid);
             }
+            // sotc: free the nested task's frame. Task does not, and SotC's compute queues run
+            // an indirect buffer per dispatch batch: ~1 KiB leaked hundreds of times a second.
+            task.handle.destroy();
             break;
         }
         case PM4ItOpcode::DmaData: {

@@ -19,6 +19,14 @@ namespace SotcStats {
 /// exchange(0) only under the same switch). The variables are never set at run time.
 inline const bool kFpsLog = std::getenv("SOTC_FPS") != nullptr;
 inline const bool kCmdStats = std::getenv("SOTC_CMD_STATS") != nullptr;
+/// sotc: skip BindResources on consecutive draws whose pipeline, push data and resource
+/// handles did not change. On by default; SOTC_FAST_BIND=0 disables it.
+inline const bool kFastBind = [] {
+    const char* v = std::getenv("SOTC_FAST_BIND");
+    return !v || v[0] != '0';
+}();
+inline std::atomic<uint64_t> fast_bind_eligible{0};
+inline std::atomic<uint64_t> fast_bind_hits{0};
 inline std::atomic<uint64_t> readbacks{0};    ///< BufferCache::DownloadMemory calls
 inline std::atomic<uint64_t> readback_ns{0};  ///< time spent in them (copy and wait)
 inline std::atomic<uint64_t> watch_addr{0};     ///< SOTC_CS_WATCH: GPU writes to report

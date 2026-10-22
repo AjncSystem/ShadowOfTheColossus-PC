@@ -694,7 +694,8 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
         // colossus' area, after the ending) grow in 1 MiB pieces over direct memory and share that
         // +0x28 pointer, so readbacks into them were never guarded and the ending still crashed
         // in their free lists (eboot+0x49500): their range comes from their own guard's free
-        // blocks, refreshed every 2 s while their free tree changes.
+        // blocks, refreshed every 2 s while their free tree changes, and after 250 ms already when
+        // a readback lands outside the range (a piece the heap may have added since).
         VAddr heap_base = *std::bit_cast<const VAddr*>(heap + 0x28);
         u64 heap_size = *std::bit_cast<const u64*>(heap + 0x30);
         GuardSlot* known = nullptr;
@@ -705,8 +706,21 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
             }
             const auto now = std::chrono::steady_clock::now();
             const auto signature = signature_of(heap);
+            const auto outside_extent = [&] {
+                if (!known->guard || !known->guard->IsValid()) {
+                    return true;
+                }
+                const auto [lo, hi] = known->guard->FreeExtent();
+                constexpr u64 Margin = 1ULL << 20;
+                return std::any_of(pending.begin(), pending.end(), [&](const ReadbackItem& item) {
+                    return item.addr + Margin < lo || item.addr + item.size > hi + Margin;
+                });
+            };
+            const auto age = now - known->built;
             if (!known->guard ||
-                (signature != known->signature && now - known->built > std::chrono::seconds(2))) {
+                (signature != known->signature &&
+                 (age > std::chrono::seconds(2) ||
+                  (age > std::chrono::milliseconds(250) && outside_extent())))) {
                 SotcStats::heap_guard_builds.fetch_add(1, std::memory_order_relaxed);
                 known->guard.emplace(memory, heap);
                 known->signature = signature;

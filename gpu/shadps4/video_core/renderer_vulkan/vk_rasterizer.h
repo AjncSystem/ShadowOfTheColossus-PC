@@ -174,6 +174,9 @@ private:
                      Shader::PushData& push_data);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline);
+    bool FastBindEligible(const Pipeline* pipeline) const;
+    u64 FastBindHash(const Pipeline* pipeline, const Shader::PushData& push_data) const;
+    void CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dma);
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
     void BindIndexBuffer(u32 index_offset = 0);
@@ -255,6 +258,20 @@ private:
     VAddr hudless_vo{};          ///< this draw: the video out image it renders to, 0 none
     vk::Format hudless_vo_format{};
     u32 hudless_vo_width{}, hudless_vo_height{};
+    /// sotc: descriptor state of the previous graphics draw (SOTC_FAST_BIND). Valid only while
+    /// the same command buffer, pipeline, push data and resource generations are current.
+    struct FastBindState {
+        const Pipeline* pipeline{};
+        u64 hash{};
+        u64 buffer_generation{};
+        u64 texture_generation{};
+        u64 stream_generation{};
+        u64 tick{};
+        bool uses_dma{};
+        bool valid{};
+    };
+    FastBindState fast_bind{};
+    bool fast_bind_hit{};
 };
 
 } // namespace Vulkan

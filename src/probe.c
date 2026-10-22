@@ -272,45 +272,97 @@ static void dump_thread_stacks(void) {
             WideCharToMultiByte(CP_UTF8,0,wide,-1,name,sizeof(name),NULL,NULL);
             LocalFree(wide);
         }
+        /* sotc: only registers and raw stack words are read while the thread is suspended
+         * (syscalls, no locks); describing and printing wait until it runs again. stdio, the heap
+         * or the loader lock (GetModuleHandleEx) held by the suspended thread would otherwise
+         * block this one for good, and the watchdog would freeze the game it reports on. */
+        static uintptr_t chain[24], words[0x3000/8];
+        int chain_count=0, word_count=0, captured=0;
+        CONTEXT c={.ContextFlags=CONTEXT_CONTROL|CONTEXT_INTEGER};
         if (SuspendThread(thread)!=(DWORD)-1) {
-            CONTEXT c={.ContextFlags=CONTEXT_CONTROL|CONTEXT_INTEGER};
             if (GetThreadContext(thread,&c)) {
-                char where[MAX_PATH+64];
-                describe_address(where,sizeof(where),(uintptr_t)c.Rip);
-                fprintf(stderr,"thread %lu '%s': rip %s rsp=%016llx\n",entry.th32ThreadID,name,where,c.Rsp);
+                captured=1;
                 uintptr_t rbp=(uintptr_t)c.Rbp, frame[2];
-                for (int depth=0;depth<24 && rbp;++depth) {
+                while (chain_count<24 && rbp) {
                     if (!read_word(rbp,&frame[0]) || !read_word(rbp+8,&frame[1]) || !frame[1]) break;
-                    describe_address(where,sizeof(where),frame[1]);
-                    fprintf(stderr,"    #%d %s\n",depth,where);
+                    chain[chain_count++]=frame[1];
                     if (frame[0]<=rbp) break;
                     rbp=frame[0];
                 }
-                /* Guest and loader return addresses near the top of the stack (frames without
-                 * rbp); loader ones as exe offsets for llvm-addr2line (ImageBase 0x140000000). */
-                int found=0, host=0;
-                const uintptr_t exe=(uintptr_t)GetModuleHandleA(NULL);
-                for (uintptr_t at=(uintptr_t)c.Rsp; at<(uintptr_t)c.Rsp+0x3000 && found<14+host; at+=8) {
-                    uintptr_t value;
-                    if (!read_word(at,&value)) break;
-                    if (image && value-(uintptr_t)image<0x4000000) {
-                        fprintf(stderr,"    [rsp+0x%llx] guest 0x%llx\n",(unsigned long long)(at-c.Rsp),
-                                (unsigned long long)(value-(uintptr_t)image));
-                        ++found;
-                    } else if (host<24 && value-exe>0x1000 && value-exe<0x4000000) {
-                        fprintf(stderr,"    [rsp+0x%llx] exe 0x%llx\n",(unsigned long long)(at-c.Rsp),
-                                (unsigned long long)(value-exe+0x140000000ull));
-                        ++host;
-                    }
-                }
+                while (word_count<(int)(sizeof(words)/sizeof(words[0])) &&
+                       read_word((uintptr_t)c.Rsp+(uintptr_t)word_count*8,&words[word_count])) ++word_count;
             }
             ResumeThread(thread);
+        }
+        if (captured) {
+            char where[MAX_PATH+64];
+            describe_address(where,sizeof(where),(uintptr_t)c.Rip);
+            fprintf(stderr,"thread %lu '%s': rip %s rsp=%016llx\n",entry.th32ThreadID,name,where,c.Rsp);
+            for (int depth=0;depth<chain_count;++depth) {
+                describe_address(where,sizeof(where),chain[depth]);
+                fprintf(stderr,"    #%d %s\n",depth,where);
+            }
+            /* Guest and loader return addresses near the top of the stack (frames without
+             * rbp); loader ones as exe offsets for llvm-addr2line (ImageBase 0x140000000). */
+            int found=0, host=0;
+            const uintptr_t exe=(uintptr_t)GetModuleHandleA(NULL);
+            for (int k=0; k<word_count && found<14+host; ++k) {
+                const uintptr_t value=words[k];
+                if (image && value-(uintptr_t)image<0x4000000) {
+                    fprintf(stderr,"    [rsp+0x%llx] guest 0x%llx\n",(unsigned long long)k*8,
+                            (unsigned long long)(value-(uintptr_t)image));
+                    ++found;
+                } else if (host<24 && value-exe>0x1000 && value-exe<0x4000000) {
+                    fprintf(stderr,"    [rsp+0x%llx] exe 0x%llx\n",(unsigned long long)k*8,
+                            (unsigned long long)(value-exe+0x140000000ull));
+                    ++host;
+                }
+            }
         }
         CloseHandle(thread);
     }
     CloseHandle(snapshot);
     fprintf(stderr,"STACKS: end\n");
     fflush(stderr);
+}
+/* sotc: SOTC_PEEK=<image offset>[,<offset>...]: after SOTC_PEEK_DELAY s (default 40) prints
+ * 0xd8 bytes at each offset as 32-bit words (reading engine globals such as cvars). */
+static DWORD WINAPI peek_thread(void *list) {
+    const char *d=getenv("SOTC_PEEK_DELAY");
+    Sleep((DWORD)(d ? atoi(d) : 40)*1000u);
+    char buffer[512];
+    snprintf(buffer,sizeof(buffer),"%s",(const char *)list);
+    for (char *item=strtok(buffer,","); item; item=strtok(NULL,",")) {
+        const uintptr_t at=(uintptr_t)image+(uintptr_t)strtoull(item,NULL,16);
+        uint32_t words[0xd8/4];
+        SIZE_T n=0;
+        if (!ReadProcessMemory(GetCurrentProcess(),(const void *)at,words,sizeof(words),&n) || n!=sizeof(words)) continue;
+        fprintf(stderr,"SOTC PEEK %s:",item);
+        for (size_t k=0;k<sizeof(words)/4;++k) fprintf(stderr," %x",words[k]);
+        fprintf(stderr,"\n");
+    }
+    fflush(stderr);
+    return 0;
+}
+/* sotc: hang watchdog (SOTC_WATCHDOG=0 turns it off). Now and then the game stops presenting for
+ * good: no flip, PS4SyncEvent waits growing, the player has to close it (user, 20 Oct). It could
+ * not be caught on purpose (8 attract runs without one), so after 15 s without a game frame the
+ * thread stacks go to the log once per stall, like BB_STACKS_TRIGGER. */
+static DWORD WINAPI hang_watchdog(void *unused) {
+    (void)unused;
+    uint64_t last=0;
+    int still=0, dumped=0;
+    for (;;) {
+        Sleep(1000);
+        const uint64_t flips=bbgpu_flip_count();
+        if (flips!=last || flips<100) { last=flips; still=0; dumped=0; continue; }
+        if (++still>=15 && !dumped) {
+            dumped=1;
+            fprintf(stderr,"SOTC WATCHDOG: no game frame for %d s (flips %llu); thread stacks:\n",still,(unsigned long long)flips);
+            dump_thread_stacks();
+        }
+    }
+    return 0;
 }
 /* sotc: SOTC_PROFILE=<thread name part>: samples that thread every ~1 ms (SuspendThread +
  * GetThreadContext) from SOTC_PROFILE_DELAY (default 20) s for SOTC_PROFILE_SECONDS (default 15)
@@ -1379,6 +1431,9 @@ int main(int argc, char **argv) {
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
     entered_game=1;
 #ifdef _WIN32
+    if (gpu_enabled && !(getenv("SOTC_WATCHDOG") && getenv("SOTC_WATCHDOG")[0]=='0'))
+        CloseHandle(CreateThread(NULL,0,hang_watchdog,NULL,0,NULL));
+    if (getenv("SOTC_PEEK")) CloseHandle(CreateThread(NULL,0,peek_thread,(void *)getenv("SOTC_PEEK"),0,NULL));
     if (getenv("SOTC_HEAP_WATCH") && getenv("SOTC_HEAP_WATCH")[0]=='1') {
         heap_watch_image=image;
         CloseHandle(CreateThread(NULL,0,heap_watch,NULL,0,NULL));

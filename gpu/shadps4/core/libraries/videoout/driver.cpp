@@ -24,7 +24,9 @@
 #include "bbport_overlay.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/sotc_fps_cap.h"
+#include "video_core/sotc_event.h"
 #include "video_core/sotc_stats.h"
+#include "video_core/sotc_ui_lang.h"
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
@@ -341,6 +343,32 @@ void VideoOutDriver::Flip(const Request& req) {
         presenter->Present(frame);
     });
     SotcStats::flip_count.fetch_add(1, std::memory_order_relaxed);
+    {
+        // sotc: a performance line in the event log every minute (average FPS, frames slower
+        // than 50 ms, the slowest, video memory in use).
+        using Clock = std::chrono::steady_clock;
+        static Clock::time_point minute_start = Clock::now(), last_flip = minute_start;
+        static u32 minute_flips = 0, slow = 0;
+        static double worst_ms = 0.0;
+        const Clock::time_point now = Clock::now();
+        const double gap_ms = std::chrono::duration<double, std::milli>(now - last_flip).count();
+        last_flip = now;
+        ++minute_flips;
+        worst_ms = std::max(worst_ms, gap_ms);
+        slow += gap_ms > 50.0;
+        const double seconds = std::chrono::duration<double>(now - minute_start).count();
+        if (seconds >= 60.0) {
+            SotcEvent::Log("PERF",
+                           SotcUi::T("Último minuto: %.1f FPS médio, %u quadros acima de 50 ms, pior %.0f ms, memória de vídeo %llu MB",
+                                     "Last minute: %.1f FPS average, %u frames over 50 ms, worst %.0f ms, video memory %llu MB"),
+                           minute_flips / seconds, slow, worst_ms,
+                           static_cast<unsigned long long>(SotcStats::vram_used.load(std::memory_order_relaxed) >> 20));
+            minute_start = now;
+            minute_flips = 0;
+            slow = 0;
+            worst_ms = 0.0;
+        }
+    }
 
     // sotc: SOTC_FPS=1 prints the flip rate every five seconds.
     const bool fps_log = SotcStats::kFpsLog; // sotc: the switch the counters use (sotc_stats.h)

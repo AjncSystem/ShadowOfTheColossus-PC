@@ -7,6 +7,7 @@
 #include <inttypes.h>
 #include <cpuid.h>
 #include "runtime.h"
+#include "runtime_event.h"
 #include "gpu/bbgpu.h"
 #include "gpu/sotc/sotc_patches.h"
 #if !defined(__x86_64__) || !defined(__GNUC__)
@@ -14,6 +15,7 @@
 #endif
 #ifdef _WIN32
 #include <windows.h>
+#include <winioctl.h>
 #include <dbghelp.h>
 #include <tlhelp32.h>
 #include <wchar.h>
@@ -325,6 +327,42 @@ static DWORD WINAPI peek_thread(void *list) {
     fflush(stderr);
     return 0;
 }
+/* sotc: the session's system in the event log: CPU, RAM, threads and whether the game's folder is
+ * on a hard disk (seek penalty: new areas stall on scattered reads there) or an SSD. */
+static void event_session_start(const char *app0) {
+    unsigned regs[12]={0};
+    char cpu[49]="?";
+    unsigned max_ext=0;
+    __cpuid(0x80000000,max_ext,regs[1],regs[2],regs[3]);
+    if (max_ext>=0x80000004) {
+        for (unsigned i=0;i<3;++i) __cpuid(0x80000002+i,regs[i*4],regs[i*4+1],regs[i*4+2],regs[i*4+3]);
+        memcpy(cpu,regs,48); cpu[48]=0;
+        char *p=cpu; while (*p==' ') ++p;
+        memmove(cpu,p,strlen(p)+1);
+    }
+    MEMORYSTATUSEX mem={.dwLength=sizeof(mem)};
+    GlobalMemoryStatusEx(&mem);
+    const char *disk=SOTC_T("desconhecido","unknown");
+    if (app0 && app0[0] && app0[1]==':') {
+        char volume[16];
+        snprintf(volume,sizeof(volume),"\\\\.\\%c:",app0[0]);
+        HANDLE h=CreateFileA(volume,0,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_EXISTING,0,NULL);
+        if (h!=INVALID_HANDLE_VALUE) {
+            STORAGE_PROPERTY_QUERY query={.PropertyId=StorageDeviceSeekPenaltyProperty,.QueryType=PropertyStandardQuery};
+            DEVICE_SEEK_PENALTY_DESCRIPTOR seek={0};
+            DWORD got=0;
+            if (DeviceIoControl(h,IOCTL_STORAGE_QUERY_PROPERTY,&query,sizeof(query),&seek,sizeof(seek),&got,NULL) &&
+                got>=sizeof(seek))
+                disk=seek.IncursSeekPenalty ? SOTC_T("HD (disco mecânico: lugares novos podem travar)",
+                                                     "HDD (spinning disk: new areas may stall)") : "SSD";
+            CloseHandle(h);
+        }
+    }
+    sotc_event("SESSION",SOTC_T("CPU: %s | %lu threads | RAM: %llu GB | pasta do jogo: %s (%s)",
+                                "CPU: %s | %lu threads | RAM: %llu GB | game folder: %s (%s)"),
+               cpu,(unsigned long)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS),
+               (unsigned long long)((mem.ullTotalPhys+(1ull<<29))>>30),app0 ? app0 : "?",disk);
+}
 /* sotc: read-ahead of the game's archives (SOTC_PREFETCH=0 turns it off). A new area makes the
  * game read many scattered pieces of pakN.psarc (12 GB); on a hard disk each waits for a seek and
  * the frame stalls (54 ms of 83 in "io" on the user's HDD, FPS down to 5). Once the game has
@@ -385,8 +423,9 @@ static DWORD WINAPI prefetch_thread(void *unused) {
         CloseHandle(f);
     }
     VirtualFree(buffer,0,MEM_RELEASE);
-    fprintf(stderr,"SOTC prefetch: %d archives, %llu MiB read ahead in %.1f s\n",count,done>>20,
-            (GetTickCount()-start)/1000.0);
+    sotc_event("DISK",SOTC_T("Arquivos do jogo lidos antecipadamente: %llu MiB em %.1f s (agora vêm da RAM)",
+                             "Game archives read ahead: %llu MiB in %.1f s (now served from RAM)"),done>>20,
+               (GetTickCount()-start)/1000.0);
     return 0;
 }
 /* sotc: hang watchdog (SOTC_WATCHDOG=0 turns it off). Now and then the game stops presenting for
@@ -403,6 +442,8 @@ static DWORD WINAPI hang_watchdog(void *unused) {
         if (flips!=last || flips<100) { last=flips; still=0; dumped=0; continue; }
         if (++still>=15 && !dumped) {
             dumped=1;
+            sotc_event("ERROR",SOTC_T("Jogo parado: nenhum quadro há %d s (pilhas das threads no log da sessão)",
+                                      "Game stalled: no frame for %d s (thread stacks in the session log)"),still);
             fprintf(stderr,"SOTC WATCHDOG: no game frame for %d s (flips %llu); thread stacks:\n",still,(unsigned long long)flips);
             dump_thread_stacks();
         }
@@ -606,6 +647,22 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
                 (void *)record->ExceptionInformation[1],where,GetCurrentThreadId());
     else
         fprintf(stderr,"Fault: exception 0x%08lx at %s (thread %lu)\n",record->ExceptionCode,where,GetCurrentThreadId());
+    {
+        /* sotc: the event log names the known faults (runtime_event.h). */
+        const uintptr_t offset=(uintptr_t)c->Rip-(uintptr_t)image;
+        const char *meaning=NULL;
+        if (image && offset==0x1a371)
+            meaning=SOTC_T("memória de páginas de textura do jogo esgotada (texturas Máxima ou vistas muito amplas)",
+                           "the game's texture page pool ran out (Maximum textures or very wide views)");
+        else if (image && (offset==0x49500 || offset==0x12c2b))
+            meaning=SOTC_T("lista de memória livre de um heap do jogo corrompida (escrita da GPU sobre memória reaproveitada)",
+                           "a game heap's free list was corrupted (a GPU write over reused memory)");
+        else if (image && offset==0xa5d064)
+            meaning=SOTC_T("o jogo não achou um arquivo dele ao iniciar (abra de novo)",
+                           "the game did not find one of its files at start (start it again)");
+        sotc_event("ERROR",SOTC_T("Queda em %s%s%s (código 0x%08lx)","Crash at %s%s%s (code 0x%08lx)"),where,
+                   meaning ? ": " : "",meaning ? meaning : "",record->ExceptionCode);
+    }
     fprintf(stderr,"  rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n  rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n",
             c->Rax,c->Rbx,c->Rcx,c->Rdx,c->Rsi,c->Rdi,c->Rbp,c->Rsp);
     fprintf(stderr,"  r8=%016llx r9=%016llx r10=%016llx r11=%016llx\n  r12=%016llx r13=%016llx r14=%016llx r15=%016llx\n",
@@ -1191,6 +1248,9 @@ int main(int argc, char **argv) {
 #endif
     if (app0) {
         runtime_file_configure(app0, user_dir ? user_dir : "user");
+#ifdef _WIN32
+        event_session_start(app0);
+#endif
         char sfo[4096], id[16]="";
         snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0);
         if (sfo_value(sfo,"INSTALL_DIR_SAVEDATA",id,sizeof(id),NULL) || sfo_value(sfo,"TITLE_ID",id,sizeof(id),NULL))

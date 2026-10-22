@@ -27,6 +27,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_fps_cap.h"
+#include "video_core/sotc_event.h"
 #include "video_core/sotc_live.h"
 #include "video_core/sotc_ui_lang.h"
 #include "video_core/sotc_stats.h"
@@ -127,6 +128,8 @@ void SetOpen(bool value) {
     if (menu_open.exchange(value) == value) {
         return;
     }
+    SotcEvent::Log("KEY", "%s", value ? SotcUi::T("Menu do jogo aberto", "In-game menu opened")
+                                      : SotcUi::T("Menu do jogo fechado", "In-game menu closed"));
     ImGui::GetIO().MouseDrawCursor = value;
     if (!value && dirty) {
         dirty = false;
@@ -328,6 +331,9 @@ void SetTextureLevel(int level) {
                                  std::memory_order_relaxed);
     const char* keys[] = {"\"off\"", "\"high\"", "\"max\""};
     SaveLauncherSetting("textures", keys[level]);
+    const char* names[] = {SotcUi::T("Desligada", "Off"), SotcUi::T("Alta", "High"),
+                           SotcUi::T("Máxima", "Maximum")};
+    SotcEvent::Log("MENU", SotcUi::T("Qualidade das texturas: %s", "Texture quality: %s"), names[level]);
 }
 
 // sotc: FPS mode 0 = 30 (the game's cap), 1 = 60, 2 = unlimited, as the launcher's.
@@ -340,12 +346,15 @@ void SetFpsMode(int mode) {
     }
     const char* keys[] = {"\"30\"", "\"60\"", "\"unlimited\""};
     SaveLauncherSetting("fps_mode", keys[mode]);
+    const char* names[] = {"30", "60", SotcUi::T("ilimitado", "unlimited")};
+    SotcEvent::Log("MENU", "FPS: %s", names[mode]);
 }
 
 // sotc: upscaler 0 = FSR 1, 1 = bilinear; applied at the next frame (vk_presenter.cpp).
 void SetUpscaler(int mode) {
     SotcLive::fsr1.store(mode == 0 ? 1 : 0, std::memory_order_relaxed);
     SaveLauncherSetting("upscaler", mode == 0 ? "\"fsr1\"" : "\"bilinear\"");
+    SotcEvent::Log("MENU", "Upscaler: %s", mode == 0 ? "FSR 1" : "Bilinear");
 }
 
 // sotc: RCAS sharpening 0 high, 1 medium, 2 low, 3 off (the launcher's SHARPNESS values).
@@ -354,6 +363,9 @@ void SetRcas(int mode) {
     SotcLive::rcas.store(RcasValues[mode], std::memory_order_relaxed);
     const char* keys[] = {"\"0\"", "\"250\"", "\"600\"", "\"off\""};
     SaveLauncherSetting("sharpness", keys[mode]);
+    const char* names[] = {SotcUi::T("Alta", "High"), SotcUi::T("Média", "Medium"),
+                           SotcUi::T("Baixa", "Low"), SotcUi::T("Desligada", "Off")};
+    SotcEvent::Log("MENU", SotcUi::T("Nitidez (RCAS): %s", "Sharpening (RCAS): %s"), names[mode]);
 }
 
 // sotc: "Quick settings": the launcher's quick settings that can change while playing.
@@ -450,6 +462,8 @@ void QuickSettings() {
             if (ImGui::Selectable(fg_names[i], mode == fg) && available &&
                 Vulkan::FrameGen::Set(mode)) {
                 SaveLauncherSetting("framegen", fg_keys[i]);
+                SotcEvent::Log("MENU", SotcUi::T("Geração de quadros: %s", "Frame generation: %s"),
+                               fg_names[i]);
             }
             if (!available) {
                 ImGui::EndDisabled();
@@ -519,6 +533,8 @@ void QuickSettings() {
                         &reuse)) {
         SotcLive::shadow_reuse.store(reuse ? 1 : 0, std::memory_order_relaxed);
         SaveLauncherSetting("shadow_reuse", reuse ? "\"1\"" : "\"0\"");
+        SotcEvent::Log("MENU", SotcUi::T("Reaproveitar sombras distantes: %s", "Reuse far shadows: %s"),
+                       reuse ? SotcUi::T("ligado", "on") : SotcUi::T("desligado", "off"));
     }
 
     if (runtime_audio_volume_percent && runtime_audio_set_volume_percent) {
@@ -533,6 +549,7 @@ void QuickSettings() {
                 if (ImGui::Selectable(item, v == now)) {
                     runtime_audio_set_volume_percent(v);
                     SaveLauncherSetting("volume", "\"" + std::to_string(v) + "\"");
+                    SotcEvent::Log("MENU", "Volume: %d%%", v);
                 }
             }
             ImGui::EndCombo();
@@ -588,15 +605,23 @@ void Menu() {
         if (g_window) {
             g_window->SetFullscreen(fs);
         }
+        SotcEvent::Log("MENU", SotcUi::T("Tela cheia: %s", "Fullscreen: %s"),
+                       fs ? SotcUi::T("ligada", "on") : SotcUi::T("desligada", "off"));
     }
     ImGui::SameLine();
     Checkbox(SotcUi::T("Mostrar FPS  [F10]", "Show FPS  [F10]"), s.show_fps);
 
     ImGui::SeparatorText(SotcUi::T("Câmera e mouse", "Camera & mouse"));
-    Checkbox(SotcUi::T("Câmera pelo mouse", "Mouse camera"), s.mouse_enabled);
+    if (const bool was = s.mouse_enabled.load(); Checkbox(SotcUi::T("Câmera pelo mouse", "Mouse camera"), s.mouse_enabled), was != s.mouse_enabled.load()) {
+        SotcEvent::Log("MENU", SotcUi::T("Câmera pelo mouse: %s", "Mouse camera: %s"),
+                       s.mouse_enabled.load() ? SotcUi::T("ligada", "on") : SotcUi::T("desligada", "off"));
+    }
     ImGui::BeginDisabled(!s.mouse_enabled);
     Slider(SotcUi::T("Sensibilidade do mouse", "Mouse sensitivity"), s.mouse_sens, 0.1f, 3.0f);
-    Checkbox(SotcUi::T("Inverter eixo vertical (Y)", "Invert vertical axis (Y)"), s.mouse_invert);
+    if (const bool was = s.mouse_invert.load(); Checkbox(SotcUi::T("Inverter eixo vertical (Y)", "Invert vertical axis (Y)"), s.mouse_invert), was != s.mouse_invert.load()) {
+        SotcEvent::Log("MENU", SotcUi::T("Inverter eixo Y do mouse: %s", "Invert mouse Y axis: %s"),
+                       s.mouse_invert.load() ? SotcUi::T("ligado", "on") : SotcUi::T("desligado", "off"));
+    }
     ImGui::EndDisabled();
 
     ImGui::Spacing();
@@ -1000,13 +1025,18 @@ bool HandleEvent(const SDL_Event& event) {
     // sotc: F7 caps the game at 30 FPS or uncaps it (sotc_fps_cap.h).
     // The new state is shown at the next frame (Render).
     if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F7 && !event.key.repeat) {
-        SotcFpsCap::Toggle();
+        const bool uncapped = SotcFpsCap::Toggle();
+        SotcEvent::Log("KEY", "%s", uncapped ? SotcUi::T("F7: limite de 30 FPS desligado", "F7: 30 FPS cap off")
+                                             : SotcUi::T("F7: limite de 30 FPS ligado", "F7: 30 FPS cap on"));
         return true;
     }
     // sotc: F8 switches the frame generation mode (off, DLSS-G, FSR 3; vk_framegen.h).
     // The new mode is shown at the next frame (Render).
     if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F8 && !event.key.repeat) {
         const Vulkan::FrameGen::Mode mode = Vulkan::FrameGen::Cycle();
+        const char* fg_event_names[] = {SotcUi::T("desligada", "off"), "NVIDIA DLSS-G", "AMD FSR 3"};
+        SotcEvent::Log("KEY", SotcUi::T("F8: geração de quadros %s", "F8: frame generation %s"),
+                       fg_event_names[static_cast<int>(mode)]);
         if (mode == Vulkan::FrameGen::Mode::Off &&
             !Vulkan::FrameGen::Available(Vulkan::FrameGen::Mode::Fsr) &&
             !Vulkan::FrameGen::Available(Vulkan::FrameGen::Mode::Dlss)) {
@@ -1020,6 +1050,8 @@ bool HandleEvent(const SDL_Event& event) {
         const bool on = !OverlayOn();
         BbSettings::Get().show_fps = false; // the ini setting only gives the initial state
         overlay_on.store(on, std::memory_order_relaxed);
+        SotcEvent::Log("KEY", "%s", on ? SotcUi::T("F10: painel de desempenho mostrado", "F10: performance overlay shown")
+                                       : SotcUi::T("F10: painel de desempenho escondido", "F10: performance overlay hidden"));
         return true;
     }
     if (list_active && !menu_open && list_result == -1) {
@@ -1368,9 +1400,13 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
         if (loading) {
             loading_since = NowMs();
             std::fprintf(stderr, "SOTC loading screen: shown\n");
+            SotcEvent::Log("GAME", "%s", SotcUi::T("Tela de carregamento (o jogo parou de mostrar quadros)",
+                                                   "Loading screen (the game stopped showing frames)"));
         } else {
             std::fprintf(stderr, "SOTC loading screen: hidden after %.1f s\n",
                          double(NowMs() - loading_since) / 1000.0);
+            SotcEvent::Log("GAME", SotcUi::T("Fim da tela de carregamento (%.1f s)", "Loading screen over (%.1f s)"),
+                           double(NowMs() - loading_since) / 1000.0);
         }
     }
     if (loading) {

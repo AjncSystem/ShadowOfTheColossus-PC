@@ -5,6 +5,7 @@
  * Paths containing ".." components are rejected rather than normalized. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "runtime_event.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -395,7 +396,8 @@ static void note_game_load(const void *buffer,uint64_t size) {
     const char *b=buffer;
     for (uint64_t i=0;i+n<=size;++i) {
         if (b[i]=='s' && !memcmp(b+i,key,n)) {
-            printf("SOTC load: the texture cache drops unused images\n");
+            sotc_event("GAME",SOTC_T("Carregando um save ou uma área nova (texturas sem uso descartadas)",
+                                     "Loading a save or a new area (unused textures dropped)"));
             bbgpu_request_texture_flush();
             return;
         }

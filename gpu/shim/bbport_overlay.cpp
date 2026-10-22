@@ -310,6 +310,26 @@ void SaveLauncherSetting(const char* key, const std::string& json_value) {
     out << text;
 }
 
+// sotc: SOTC_LOD_POOL_LOW at start (8 when unset): the page pool switch of texture level "High".
+int EnvPoolLow() {
+    static const int value = [] {
+        const char* v = std::getenv("SOTC_LOD_POOL_LOW");
+        return v ? std::atoi(v) : 8;
+    }();
+    return value;
+}
+
+// sotc: texture level (#235): 0 off; 1 high, with the page pool switch (coarser mips while the
+// game's page pool is low, sotc_lod_stats.h); 2 maximum, without it. Applies at once
+// (sotc_live.h) and is kept as the launcher's choice.
+void SetTextureLevel(int level) {
+    SotcLive::lod_linger.store(level > 0 ? 1 : 0, std::memory_order_relaxed);
+    SotcLive::lod_pool_low.store(level == 2 ? 0 : (EnvPoolLow() > 0 ? EnvPoolLow() : 8),
+                                 std::memory_order_relaxed);
+    const char* keys[] = {"\"off\"", "\"high\"", "\"max\""};
+    SaveLauncherSetting("textures", keys[level]);
+}
+
 // sotc: "Quick settings": the launcher's quick settings that can change while playing.
 void QuickSettings() {
     using SotcUi::T;
@@ -355,34 +375,28 @@ void QuickSettings() {
         const char* v = std::getenv("SOTC_LOD_LINGER");
         return v ? std::atoi(v) : 0;
     }();
-    static const int env_pool_low = [] {
-        const char* v = std::getenv("SOTC_LOD_POOL_LOW");
-        return v ? std::atoi(v) : 8;
-    }();
-    // sotc: texture level (#235): off; high, with the page pool switch (coarser mips while the
-    // game's page pool is low, sotc_lod_stats.h); maximum, without it.
     const int live_linger = SotcLive::lod_linger.load(std::memory_order_relaxed);
     const int live_low = SotcLive::lod_pool_low.load(std::memory_order_relaxed);
     const bool hq = (live_linger >= 0 ? live_linger : env_linger) > 0;
-    const int tex_level = !hq ? 0 : (live_low >= 0 ? live_low : env_pool_low) > 0 ? 1 : 2;
+    const int tex_level = !hq ? 0 : (live_low >= 0 ? live_low : EnvPoolLow()) > 0 ? 1 : 2;
     const char* tex_names[] = {T("Desligada", "Off"), T("Alta (estável)", "High (stable)"),
                                T("Máxima (nítida)", "Maximum (sharp)")};
-    const char* tex_keys[] = {"\"off\"", "\"high\"", "\"max\""};
     if (ImGui::BeginCombo(T("Qualidade das texturas", "Texture quality"), tex_names[tex_level])) {
         for (int i = 0; i < 3; ++i) {
             if (ImGui::Selectable(tex_names[i], i == tex_level) && i != tex_level) {
-                SotcLive::lod_linger.store(i > 0 ? 1 : 0, std::memory_order_relaxed);
-                SotcLive::lod_pool_low.store(i == 2 ? 0 : (env_pool_low > 0 ? env_pool_low : 8),
-                                             std::memory_order_relaxed);
-                SaveLauncherSetting("textures", tex_keys[i]);
+                SetTextureLevel(i);
             }
         }
         ImGui::EndCombo();
     }
     Hint(T("Alta: folhas e pedras nítidas, um pouco menos em vistas amplas. Máxima: sempre "
-           "nítida, mas pode fechar em vistas muito amplas no modo PS4 Pro.",
+           "nítida, mas pode fechar em vistas muito amplas no modo PS4 Pro. Alta e Máxima valem "
+           "na hora (o jogo leva alguns segundos para carregar as texturas); Desligada só "
+           "aparece ao abrir o jogo de novo (o jogo não descarta o que já carregou).",
            "High: sharp leaves and rocks, a little less in wide views. Maximum: always sharp, "
-           "but it may close in very wide views in PS4 Pro mode."));
+           "but it may close in very wide views in PS4 Pro mode. High and Maximum apply at once "
+           "(the game takes a few seconds to load the textures); Off only shows when the game "
+           "starts again (the game keeps what it already loaded)."));
 
     static const int env_reuse = [] {
         const char* v = std::getenv("SOTC_SHADOW_REUSE");
@@ -421,10 +435,12 @@ void QuickSettings() {
         }
     }
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-    ImGui::TextWrapped("%s", T("AF 16x, modo PS4 Pro, resolução e uso de memória de vídeo: no "
-                                "lançador (valem ao abrir o jogo de novo).",
-                                "16x AF, PS4 Pro mode, resolution and video memory use: in the "
-                                "launcher (they apply when the game starts again)."));
+    ImGui::TextWrapped("%s", T("Resolução, upscaler, nitidez, efeitos (névoa, vinheta, SSAO), AF 16x, "
+                                "modo PS4 Pro e memória de vídeo: no lançador (valem ao abrir o jogo "
+                                "de novo).",
+                                "Resolution, upscaler, sharpening, effects (fog, vignette, SSAO), 16x "
+                                "AF, PS4 Pro mode and video memory use: in the launcher (they apply "
+                                "when the game starts again)."));
     ImGui::PopStyleColor();
 }
 
@@ -459,141 +475,35 @@ void Menu() {
 
     QuickSettings();
 
-    // --- 1. Display & Window ---
-    ImGui::SeparatorText("Display & Window");
+    // sotc: only what the SotC port reads. Bloodborne's output resolution, temporal upscalers
+    // (FSR 3.1/4, DLSS, TAA, presets), RCAS strength and engine effects were shown here but never
+    // applied: those are the launcher's (environment and engine cvars at start).
+    ImGui::SeparatorText(SotcUi::T("Tela", "Display"));
     bool fs = s.fullscreen.load();
-    if (ImGui::Checkbox("Fullscreen mode", &fs)) {
+    if (ImGui::Checkbox(SotcUi::T("Tela cheia  [F11]", "Fullscreen  [F11]"), &fs)) {
         Store(s.fullscreen, fs, true);
         if (g_window) {
             g_window->SetFullscreen(fs);
         }
     }
     ImGui::SameLine();
-    Checkbox("Show FPS on screen", s.show_fps);
+    Checkbox(SotcUi::T("Mostrar FPS  [F10]", "Show FPS  [F10]"), s.show_fps);
 
-    static const char* outputs[] = {"1280 x 720 (720p)", "1920 x 1080 (1080p)", "2560 x 1440 (1440p)", "3840 x 2160 (4K)"};
-    int output = s.output_res;
-    if (ImGui::BeginCombo("Output Resolution", outputs[output])) {
-        for (int i = 0; i < BbSettings::OutputCount; ++i) {
-            if (ImGui::Selectable(outputs[i], i == output)) {
-                Store(s.output_res, i, true);
-            }
-        }
-        ImGui::EndCombo();
-    }
-
-    // --- 2. Temporal Upscaler & Anti-Aliasing ---
-    ImGui::SeparatorText("Temporal Upscaler & Anti-Aliasing");
-    static const char* upscalers[] = {"Off", "FSR 3.1", "FSR 4 (INT8)", "FSR 4.1.1 (INT8)",
-                                     "TAA (Native AA)", "DLSS (NVIDIA RTX)"};
-    static const char* later[] = {"XeSS"};
-    int upscaler = s.upscaler;
-    if (ImGui::BeginCombo("Upscaler", upscalers[upscaler])) {
-        for (int i = 0; i < BbSettings::UpscalerCount; ++i) {
-            const bool supported = i == BbSettings::UpscalerFsr4 ? s.fsr4_supported.load()
-                : i == BbSettings::UpscalerFsr411 ? s.fsr411_supported.load()
-                : i == BbSettings::UpscalerDlss   ? s.dlss_supported.load() : true;
-            ImGui::BeginDisabled(!supported);
-            if (ImGui::Selectable(upscalers[i], i == upscaler)) {
-                Store(s.upscaler, i, true);
-            }
-            ImGui::EndDisabled();
-            if (!supported) {
-                ImGui::SameLine();
-                ImGui::TextDisabled("— not supported by GPU");
-            }
-        }
-        for (const char* name : later) {
-            ImGui::BeginDisabled();
-            ImGui::Selectable(name, false);
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            ImGui::TextDisabled("— in development");
-        }
-        ImGui::EndCombo();
-    }
-    if (const char* problem = s.dlss_problem.load(); problem && upscaler == BbSettings::UpscalerDlss) {
-        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "DLSS: %s", problem);
-    }
-    if (const char* problem = s.fsr4_problem.load()) {
-        ImGui::PushTextWrapPos();
-        ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.3f, 1.0f), "FSR 4 unavailable: %s", problem);
-        if (!BbSettings::IsFsr4(s.upscaler))
-            ImGui::TextUnformatted("Active mode chosen above. FSR 4 can be selected again.");
-        ImGui::PopTextWrapPos();
-    }
-    if (BbSettings::IsFsr4(s.upscaler)) {
-        if (s.upscaler == BbSettings::UpscalerFsr411) {
-            Hint("FSR 4.1.1 in INT8 mode: AMD 4.1.1 model running in Vulkan.");
-        } else {
-            Hint("FSR 4 in INT8 mode (v07 model from AMD FidelityFX SDK).");
-        }
-        Checkbox("FSR 4: auto exposure", s.fsr4_auto_exposure);
-        Checkbox("FSR 4: invert jitter", s.fsr4_invert_jitter);
-    }
-    const bool upscaler_on = s.upscaler != BbSettings::UpscalerOff;
-    const bool taa = s.upscaler == BbSettings::UpscalerTaa;
-    ImGui::BeginDisabled(!upscaler_on);
-    ImGui::BeginDisabled(taa);
-    int preset = taa ? BbSettings::NativeAA : s.preset.load();
-    char preset_label[64];
-    std::snprintf(preset_label, sizeof(preset_label), "%s (x%.1f)", BbSettings::PresetName(preset),
-                  BbSettings::PresetScale(preset));
-    if (ImGui::BeginCombo("Render Preset", preset_label)) {
-        for (int i = 0; i < BbSettings::PresetCount; ++i) {
-            char label[64];
-            const float scale = BbSettings::PresetScale(i);
-            const int out_idx = s.output_res;
-            std::snprintf(label, sizeof(label), "%s (x%.1f, render %dx%d)",
-                          BbSettings::PresetName(i), scale,
-                          int(std::lround(BbSettings::OutputWidths[out_idx] / scale / 2) * 2),
-                          int(std::lround(BbSettings::OutputHeights[out_idx] / scale / 2) * 2));
-            if (ImGui::Selectable(label, i == preset)) {
-                Store(s.preset, i, true);
-            }
-        }
-        ImGui::EndCombo();
-    }
-    ImGui::EndDisabled();
-    if (taa) {
-        ImGui::TextWrapped("TAA antialiases the scene at output resolution without FSR upscaling.");
-    }
-    ImGui::Text("Active scene render: %d x %d", s.active_render_width.load(),
-                s.active_render_height.load());
-    Checkbox("Sharpening (RCAS)", s.sharpen);
-    ImGui::BeginDisabled(!s.sharpen);
-    Slider("Sharpening strength", s.sharpness, 0.0f, 2.0f);
-    ImGui::EndDisabled();
-    ImGui::EndDisabled();
-
-    // --- 3. Camera & Mouse Control ---
-    ImGui::SeparatorText("Camera & Mouse Control");
-    Checkbox("Enable mouse camera control", s.mouse_enabled);
+    ImGui::SeparatorText(SotcUi::T("Câmera e mouse", "Camera & mouse"));
+    Checkbox(SotcUi::T("Câmera pelo mouse", "Mouse camera"), s.mouse_enabled);
     ImGui::BeginDisabled(!s.mouse_enabled);
-    Slider("Mouse sensitivity", s.mouse_sens, 0.1f, 3.0f);
-    Checkbox("Invert vertical axis (Y)", s.mouse_invert);
+    Slider(SotcUi::T("Sensibilidade do mouse", "Mouse sensitivity"), s.mouse_sens, 0.1f, 3.0f);
+    Checkbox(SotcUi::T("Inverter eixo vertical (Y)", "Invert vertical axis (Y)"), s.mouse_invert);
     ImGui::EndDisabled();
 
-    // --- 4. Engine Visuals & Features ---
-    ImGui::SeparatorText("Engine Visuals & Features");
-    for (int e = 0; e < BbSettings::EffectCount; ++e) {
-        Checkbox(BbSettings::Effects[e].label, s.effects[e]);
-    }
-    ImGui::TextDisabled("Note: Visual effects and DMA reflect in sotc.ini and apply on restart.");
-
-    // --- Footer ---
     ImGui::Spacing();
     ImGui::Separator();
-    if (ImGui::Button("Save to sotc.ini")) {
-        BbSettings::Save();
-        dirty = false;
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Close")) {
+    if (ImGui::Button(SotcUi::T("Fechar", "Close"))) {
         keep_open = false;
     }
     ImGui::SameLine();
-    ImGui::TextDisabled("Settings auto-save on close");
+    ImGui::TextDisabled("%s", SotcUi::T("Esc / F1 fecha; tudo fica salvo",
+                                        "Esc / F1 closes; everything is kept"));
 
     ImGui::End();
     if (!keep_open) {
@@ -1360,6 +1270,18 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
     static const char* menu_trigger = std::getenv("SOTC_MENU_TRIGGER");
     if (menu_trigger && MenuAllowed() && std::remove(menu_trigger) == 0) {
         SetOpen(!menu_open);
+    }
+    // sotc: SOTC_TEX_TRIGGER=<file>: "off", "high" or "max" in the file sets the texture level as
+    // the menu does, then the file is removed (the "tex=" event of tools/sotc_play.py).
+    static const char* tex_trigger = std::getenv("SOTC_TEX_TRIGGER");
+    if (tex_trigger) {
+        if (std::FILE* f = std::fopen(tex_trigger, "rb")) {
+            char word[8] = {};
+            std::fread(word, 1, sizeof(word) - 1, f);
+            std::fclose(f);
+            std::remove(tex_trigger);
+            SetTextureLevel(word[0] == 'o' ? 0 : word[0] == 'm' ? 2 : 1);
+        }
     }
     if (menu_open) {
         Menu();

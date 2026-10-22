@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC native port · v0.60.4
+# Shadow of the Colossus — PC native port · v0.60.5
 
 [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
@@ -20,6 +20,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.60.5** | **Texture quality selector: Off / High / Maximum** (#235: sharp again), **memory leak fixed** (~60 MB/min, long-session stutter), **+3% average and +12% minimum FPS** (descriptor binds reused), **loading after a GPU driver update: 106 s → 7 s**, possible fix for **white characters on AMD GCN** (RX 470–590, Vega), **4-thread CPUs** no longer stuck loading, a hang watchdog, short hitches no longer flash a black loading screen, code review fixes. |
 | **0.60.4** | **No more cyan blocks on stone or blinking flowers** with high quality textures (the 0.60.3 crash protection switched the texture detail every second or two; now with hysteresis). |
 | **0.60.3** | **The game can be finished from start to end** (played from the last colossus through the ending and credits): fix for the high quality textures crash in wide views (#186), fix for the crash on the load after the credits, +2.7% FPS at the Shrine. |
 | **0.60.2** | **Quick settings in the in-game menu** (60 FPS, frame generation, high quality textures, far shadows, volume: apply at once and are kept), **the mouse works in the menu**, **animated loading screen while the shaders are prepared** at start. |
@@ -37,13 +38,48 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 Full details in the [CHANGELOG](CHANGELOG.md) (in Portuguese).
 
+### In-game menu and shortcuts
+
+Press **F1** (or **Insert**, or **L3+R3** on the controller) while playing. The mouse is free while
+the menu is open; **Esc** or F1 closes it.
+
+![In-game menu (F1)](docs/images/sotc-menu-f1-en.png)
+
+- **Quick settings (apply at once):** 60 FPS, frame generation, **texture quality**, far shadow
+  reuse, volume. They are also saved as the launcher's choice for the next start.
+- **Display & Window:** fullscreen, FPS counter, output resolution.
+- **Upscaler & sharpening:** upscaler, render preset, RCAS sharpening strength.
+- **Camera & Mouse:** mouse camera on/off, sensitivity, invert Y.
+- **Engine visuals:** atmospheric fog, vignette, ambient occlusion (SSAO), water reflections (these
+  apply on the next start).
+- The header shows FPS, frame time, the GPU and its video memory in use.
+
+| Key | What it does |
+|---|---|
+| **F1** / Insert / L3+R3 | Opens or closes the in-game menu |
+| **F7** | 30 FPS cap on/off (60 FPS without the cap) |
+| **F8** | Frame generation: off → DLSS-G → FSR 3 (when the GPU supports it) |
+| **F10** | Performance overlay (FPS and frame time) |
+| **F11** | Window / fullscreen |
+
+### Texture quality
+
+In the launcher (**Quick settings → Textures**) and in the in-game menu (changes at once):
+
+| Level | What it does | Possible problems |
+|---|---|---|
+| **Off** | The game's 256×256 versions only (the behaviour before 0.58.1). | Blurry ground, rocks and leaves. For GPUs short of video memory. |
+| **High (stable)** — default | The game streams its high resolution textures. When the game's texture memory runs low, the textures ask for a coarser level so the game frees space before it runs out. | A little less sharp in large, wide areas (the game's texture memory is almost always full there, so it stays on the coarser level; #235). |
+| **Maximum (sharp)** | High resolution textures always, without that protection. | It **may close the game in very wide views** (sword raised against the sun, the Shrine, the last colossus' area; fault `0x1a371`, #186), mostly in **PS4 Pro mode**. Not seen in our 5–10 minute runs, but reported before. If it happens, go back to **High**. Uses more video memory. |
+
 ### Known issues
 
 - The first start after updating rebuilds the shaders: the first load is slow and stutters.
-- **High quality textures** can still close the game in very wide views (sword raised against the
-  sun, the last colossus' area; #186). Turn the option off if it happens.
+- **Texture quality "Maximum"** can close the game in very wide views (sword raised against the
+  sun, the last colossus' area; #186), mostly in PS4 Pro mode. Use **High** if it happens.
 - **AMD GCN** cards (RX 470–590, Vega, APUs on the legacy driver): characters and Agro may glow
-  white (#152, #158, #187). Under investigation; newer AMD cards (RDNA) are not affected.
+  white (#152, #158, #187). 0.60.5 adds the LDS barriers these cards were missing (PR #205), which
+  is the likely fix: please report whether it helps. `SOTC_AMD64_LDS=0` turns it off.
 - **60 FPS:** since 0.60 the game targets 60 FPS itself (its PS4 Pro Performance mode), which
   should fix the 60 FPS physics (the 2nd colossus' wall, colossi "flying"); still being tested
   there. `SOTC_MODES=af16` in the extra variables goes back to the old mode.

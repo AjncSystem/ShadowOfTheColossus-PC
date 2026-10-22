@@ -305,6 +305,13 @@ public:
         return tile_manager;
     }
 
+    /// sotc: changes when an image is registered/unregistered or a sampler is destroyed, i.e.
+    /// when a previously bound texture descriptor may hold a stale handle (SOTC_FAST_BIND).
+    u64 BindGeneration() const noexcept {
+        return image_set_generation ^
+               (sampler_epoch.load(std::memory_order_acquire) * 0x9E3779B97F4A7C15ULL);
+    }
+
     /// Frees cached images not used in the last few GC ticks (one per submit), regardless of
     /// memory thresholds. Called when a video memory allocation fails. Higher levels go deeper
     /// (sotc): level 0 frees up to 512 images last used 4 or more ticks ago, level 1 up to 4096

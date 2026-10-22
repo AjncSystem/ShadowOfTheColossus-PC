@@ -279,7 +279,13 @@ bool BpeUsedBlocks::StillUsed(VAddr heap, VAddr block, VAddr next) const {
 bool BpeUsedBlocks::Covers(VAddr heap, VAddr addr, VAddr end, int* why) {
     int no_why = 0;
     why = why ? why : &no_why;
-    if (fence && addr >= fence + HeaderSize) {
+    // Only the unsplit tail right after the fence ([heap+0xd0], 1 MiB) is free of metadata: the
+    // world heaps span many 1 MiB pieces, and the free blocks of the later ones lie above it too
+    u64 tail = *std::bit_cast<const u64*>(heap + 0xd0);
+    if (tail < (64ULL << 10) || tail > (16ULL << 20)) {
+        tail = 1ULL << 20;
+    }
+    if (fence && addr >= fence + HeaderSize && end <= fence + HeaderSize + tail) {
         u64 size_flags = 0;
         if (memory->TryReadBacking(fence + 8, &size_flags, sizeof(size_flags)) && size_flags == InUse) {
             return true;

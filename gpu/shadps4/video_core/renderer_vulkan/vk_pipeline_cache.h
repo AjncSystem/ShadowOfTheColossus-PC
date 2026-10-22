@@ -158,6 +158,9 @@ private:
         std::array<vk::ShaderModule, MaxShaderStages> modules{};
         GraphicsPipeline::SerializationSupport sdata{};
         std::unique_ptr<GraphicsPipeline> pipeline;
+        /// sotc: a pipeline of the boot preload (SOTC_ASYNC_PRELOAD): built from the cached
+        /// state, and already in the cache (not registered again).
+        bool preloaded{};
 
         /// sotc: SOTC_ASYNC_TRANSLATE (default on): a graphics shader stage seen for the first
         /// time (or a new permutation of one) is translated by a worker, queued after the compute
@@ -183,7 +186,9 @@ private:
         std::unique_ptr<Translate> translate; ///< a translation job
     };
     bool AsyncPipelineEligible() const;
-    void QueueAsyncPipeline(u64 hash);
+    void QueueAsyncPipeline(u64 hash,
+                            const GraphicsPipeline::SerializationSupport* preloaded = nullptr);
+    bool AsyncPreloadEnabled() const;
     void QueueAsyncTranslate(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
                              const Shader::ShaderParams& params, const Shader::RuntimeInfo& rt,
                              const Shader::Backend::Bindings& start, Program* program,
@@ -231,6 +236,13 @@ private:
     std::condition_variable_any async_cv;
     std::deque<std::unique_ptr<AsyncPipelineJob>> async_queue;
     size_t async_compute_queued{}; ///< compute jobs at the head of async_queue, oldest first
+    /// sotc: compute pipelines of the boot preload built by the workers (SOTC_ASYNC_PRELOAD);
+    /// WarmUp waits for them and drops the ones the driver refused, as it does when it builds
+    /// them itself.
+    std::vector<ComputePipelineKey> preload_computes;
+    /// sotc: preloaded compute pipelines the driver refused, out of the map but kept alive: their
+    /// worker job may still be queued (it returns at once, the pipeline being claimed).
+    std::vector<std::unique_ptr<ComputePipeline>> preload_refused;
     size_t async_translate_queued{}; ///< translation jobs right after them, oldest first
     std::unordered_set<u64> pending_programs; ///< new programs being translated (CP only)
     std::unordered_set<u64> in_place_programs; ///< failed on a worker: translated here (CP only)

@@ -473,11 +473,26 @@ void Liverpool::Process(std::stop_token stoken) {
         VideoCore::StartCapture();
 
         curr_qid = -1;
+        // sotc: SOTC_CP_YIELD (default 1). Every YIELD sits in a wait loop (WaitRegMem,
+        // MemSemaphore, Rewind, the CE/DE counters, or a child buffer's wait), so a resumed task
+        // that is not done is waiting. When a whole round over the mapped queues finishes no task
+        // and runs no command, the thread gives up its time slice instead of spinning: with few
+        // cores the spin took a core from the game's threads and the draw thread. With a core to
+        // spare, yield returns at once.
+        static const bool cp_yield = [] {
+            const char* v = std::getenv("SOTC_CP_YIELD");
+            return !v || std::atoi(v) != 0;
+        }();
+        u32 since_progress = 0;
 
         while (num_submits || (num_commands && !back_threaded) || num_ordered) {
+            if (num_commands && !back_threaded) {
+                since_progress = 0;
+            }
             ProcessCommands();
 
             curr_qid = (curr_qid + 1) % num_mapped_queues;
+            ++since_progress;
 
             auto& queue = mapped_queues[curr_qid];
 
@@ -495,12 +510,21 @@ void Liverpool::Process(std::stop_token stoken) {
                 }
                 task = queue.submits.front();
             }
-            const u64 parse_start = SotcStats::NowNs();
+            // sotc: timed only for the SOTC_FPS line (two clock reads per resume of the spin).
+            const u64 parse_start = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
             task.resume();
-            SotcStats::cp_parse_ns.fetch_add(SotcStats::NowNs() - parse_start,
-                                             std::memory_order_relaxed);
+            if (SotcStats::kFpsLog) {
+                SotcStats::cp_parse_ns.fetch_add(SotcStats::NowNs() - parse_start,
+                                                 std::memory_order_relaxed);
+            }
 
-            if (task.done()) {
+            if (!task.done()) {
+                if (cp_yield && since_progress >= num_mapped_queues) {
+                    since_progress = 0;
+                    std::this_thread::yield();
+                }
+            } else {
+                since_progress = 0;
                 task.destroy();
 
                 std::scoped_lock lock{queue.m_access};
@@ -586,6 +610,8 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
                 YIELD_CE();
                 RESUME_CE(task);
             }
+            // sotc: the nested task's frame is not freed by Task (it was leaked per IB).
+            task.handle.destroy();
             break;
         }
         default:
@@ -1266,6 +1292,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     YIELD_GFX();
                     RESUME_GFX(task);
                 }
+                // sotc: free the nested task's frame (Task does not; it was leaked per IB).
+                task.handle.destroy();
                 break;
             }
             case PM4ItOpcode::IncrementDeCounter: {
@@ -1448,6 +1476,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 YIELD_ASC(vqid);
                 RESUME_ASC(task, vqid);
             }
+            // sotc: free the nested task's frame. Task does not, and SotC's compute queues run
+            // an indirect buffer per dispatch batch: ~1 KiB leaked hundreds of times a second.
+            task.handle.destroy();
             break;
         }
         case PM4ItOpcode::DmaData: {

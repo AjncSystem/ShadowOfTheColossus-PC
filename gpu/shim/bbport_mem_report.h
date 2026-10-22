@@ -13,7 +13,7 @@ std::string Line();
 /// SOTC_WS_DIAG=1: buffer upload copies check how many of their source (guest backing view) and
 /// destination (staging) pages are outside the working set before copying, i.e. will fault.
 bool WsDiagEnabled();
-void WsDiagCopy(const void* source, const void* dest, size_t size);
+void WsDiagCopy(const void* source, const void* guest, const void* dest, size_t size);
 void WsDiagCopyDone(uint64_t ns_before, size_t size);
 /// The window's line without the "SOTC WS " prefix (also resets it); empty when disabled.
 std::string WsDiagLine();

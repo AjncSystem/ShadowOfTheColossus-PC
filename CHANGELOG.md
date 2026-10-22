@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.60.3-plus6 — 2026-10-22 (fork Lucas-blip-png)
+- **Queda depois do primeiro colosso com saves em modo Pro (#194 do original):** quando o Windows
+  recusava os 9152 MiB de memória do jogo, a plus3 caía direto para 5056/5696 MiB, e isso fazia o
+  save carregar em modo Pro ler além do bitmap de páginas (`guest offset 0x1a371`). Agora o port
+  tenta 8, 7 e 6 GiB antes de cair para o mínimo. O log mostra `trying N MiB`.
+
 ## 0.60.3-plus5 — 2026-10-21 (fork Lucas-blip-png)
 - **Correção urgente da plus4 no Linux (RADV):** a conversão para 32 lanes ligava por padrão em
   qualquer AMD com subgrupo 64, mas o RADV não exige o tamanho nos shaders de compute, e o jogo

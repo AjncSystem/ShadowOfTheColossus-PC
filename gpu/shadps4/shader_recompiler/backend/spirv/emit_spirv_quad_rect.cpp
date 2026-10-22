@@ -397,6 +397,9 @@ std::vector<u32> EmitBarycentricGeometryShader(const HwFragmentRuntimeInfo& fs_r
     const Id per_vertex{m.TypeStruct(vec4_id, float_id, float_arr, float_arr)};
     m.Decorate(per_vertex, spv::Decoration::Block);
     m.MemberDecorate(per_vertex, 0U, spv::Decoration::BuiltIn, u32(spv::BuiltIn::Position));
+    // sotc: matches the Invariant on the vertex shader's own position output
+    // (EmitContext::DefineVertexBlock) - see the comment there.
+    m.MemberDecorate(per_vertex, 0U, spv::Decoration::Invariant);
     m.MemberDecorate(per_vertex, 1U, spv::Decoration::BuiltIn, u32(spv::BuiltIn::PointSize));
     m.MemberDecorate(per_vertex, 2U, spv::Decoration::BuiltIn, u32(spv::BuiltIn::ClipDistance));
     m.MemberDecorate(per_vertex, 3U, spv::Decoration::BuiltIn, u32(spv::BuiltIn::CullDistance));

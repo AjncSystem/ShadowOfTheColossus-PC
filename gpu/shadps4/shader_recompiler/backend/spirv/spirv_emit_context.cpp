@@ -619,6 +619,15 @@ void EmitContext::DefineVertexBlock() {
     const std::array<Id, 8> zero{f32_zero_value, f32_zero_value, f32_zero_value, f32_zero_value,
                                  f32_zero_value, f32_zero_value, f32_zero_value, f32_zero_value};
     output_position = DefineVariable(F32[4], spv::BuiltIn::Position, spv::StorageClass::Output);
+    // sotc: barycentric emulation adds a geometry stage to some pipelines only (profile.h,
+    // barycentric_via_gs): the same vertex shader must give the same position with and without
+    // it, since the depth pre-pass and colour pass can pick different pipelines and still need
+    // an equal depth test. Without this, ground-level surfaces can show as untextured or black
+    // on GPUs that take this path (no VK_KHR_fragment_shader_barycentric /
+    // VK_AMD_shader_explicit_vertex_parameter).
+    if (profile.barycentric_via_gs) {
+        Decorate(output_position, spv::Decoration::Invariant);
+    }
     const bool needs_clip_distance_emulation = sw_stage == SwStage::Vertex &&
                                                hw_stage == HwStage::Vertex &&
                                                profile.needs_clip_distance_emulation;

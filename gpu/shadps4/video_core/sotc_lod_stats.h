@@ -119,10 +119,13 @@ inline void Collect(u64 (&entries)[256]) {
     // when nothing could be released and no bit is set; so a low free count is the game's normal
     // state and this switch, at any threshold, keeps sampled textures coarser in large areas. The
     // signal it needs is a failed release; that waits for a repro of the fault.
-    static const int pool_low = [] {
+    static const int env_pool_low = [] {
         const char* v = std::getenv("SOTC_LOD_POOL_LOW");
         return v ? std::atoi(v) : 8;
     }();
+    // The texture level (launcher, in-game menu): "High" keeps the switch, "Maximum" sets 0.
+    const int live_low = SotcLive::lod_pool_low.load(std::memory_order_relaxed);
+    const int pool_low = live_low >= 0 ? live_low : env_pool_low;
     static u64 coarser = 0;
     static u32 reports = 0;
     // SOTC_LOD_POOL_LOG=1: the pool's free share at every check (measuring texture budgets).
@@ -134,6 +137,11 @@ inline void Collect(u64 (&entries)[256]) {
     }
     if (pool_log && (!linger_now || pool_low <= 0)) {
         ++reports;
+    }
+    if (pool_low <= 0 && coarser != 0) { // switched to "Maximum" while coarser
+        coarser = 0;
+        std::fprintf(stderr, "SOTC LOD: page pool switch off, sampled textures ask for mip %u\n",
+                     static_cast<unsigned>(level));
     }
     if (linger_now && pool_low > 0 && reports++ % 30 == 0) {
         const int free = PoolFreePercent();

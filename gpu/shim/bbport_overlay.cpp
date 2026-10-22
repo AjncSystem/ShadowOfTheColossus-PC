@@ -355,14 +355,34 @@ void QuickSettings() {
         const char* v = std::getenv("SOTC_LOD_LINGER");
         return v ? std::atoi(v) : 0;
     }();
+    static const int env_pool_low = [] {
+        const char* v = std::getenv("SOTC_LOD_POOL_LOW");
+        return v ? std::atoi(v) : 8;
+    }();
+    // sotc: texture level (#235): off; high, with the page pool switch (coarser mips while the
+    // game's page pool is low, sotc_lod_stats.h); maximum, without it.
     const int live_linger = SotcLive::lod_linger.load(std::memory_order_relaxed);
-    bool hq = (live_linger >= 0 ? live_linger : env_linger) > 0;
-    if (ImGui::Checkbox(T("Texturas em alta qualidade", "High quality textures"), &hq)) {
-        SotcLive::lod_linger.store(hq ? 1 : 0, std::memory_order_relaxed);
-        SaveLauncherSetting("hq_textures", hq ? "true" : "false");
+    const int live_low = SotcLive::lod_pool_low.load(std::memory_order_relaxed);
+    const bool hq = (live_linger >= 0 ? live_linger : env_linger) > 0;
+    const int tex_level = !hq ? 0 : (live_low >= 0 ? live_low : env_pool_low) > 0 ? 1 : 2;
+    const char* tex_names[] = {T("Desligada", "Off"), T("Alta (estável)", "High (stable)"),
+                               T("Máxima (nítida)", "Maximum (sharp)")};
+    const char* tex_keys[] = {"\"off\"", "\"high\"", "\"max\""};
+    if (ImGui::BeginCombo(T("Qualidade das texturas", "Texture quality"), tex_names[tex_level])) {
+        for (int i = 0; i < 3; ++i) {
+            if (ImGui::Selectable(tex_names[i], i == tex_level) && i != tex_level) {
+                SotcLive::lod_linger.store(i > 0 ? 1 : 0, std::memory_order_relaxed);
+                SotcLive::lod_pool_low.store(i == 2 ? 0 : (env_pool_low > 0 ? env_pool_low : 8),
+                                             std::memory_order_relaxed);
+                SaveLauncherSetting("textures", tex_keys[i]);
+            }
+        }
+        ImGui::EndCombo();
     }
-    Hint(T("Folhas e pedras nítidas. Se o jogo fechar em vistas muito amplas, desligue.",
-           "Sharp leaves and rocks. If the game closes in very wide views, turn it off."));
+    Hint(T("Alta: folhas e pedras nítidas, um pouco menos em vistas amplas. Máxima: sempre "
+           "nítida, mas pode fechar em vistas muito amplas no modo PS4 Pro.",
+           "High: sharp leaves and rocks, a little less in wide views. Maximum: always sharp, "
+           "but it may close in very wide views in PS4 Pro mode."));
 
     static const int env_reuse = [] {
         const char* v = std::getenv("SOTC_SHADOW_REUSE");

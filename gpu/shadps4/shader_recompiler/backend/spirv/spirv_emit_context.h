@@ -361,6 +361,7 @@ public:
     size_t flatbuf_index{};
     size_t bda_pagetable_index{};
     size_t fault_buffer_index{};
+    size_t lod_feedback_index{};
     Id physical_pointer_type_u32;
 
     Id sampler_type{};
@@ -394,6 +395,9 @@ public:
     Id read_const{};
     Id read_const_dynamic{};
 
+    /// sotc: void lod_feedback(u32 tsharp_dw2, u32 tsharp_dw3, u32 tsharp_dw6, vec2 uv)
+    Id lod_feedback{};
+
 private:
     void DefineArithmeticTypes();
     void DefineInterfaces();
@@ -418,6 +422,8 @@ private:
     Id DefineGetBdaPointer();
 
     Id DefineReadConst(bool dynamic);
+
+    Id DefineLodFeedback();
 
     Id GetBufferSize(u32 sharp_idx);
 };

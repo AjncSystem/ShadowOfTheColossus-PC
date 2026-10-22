@@ -326,7 +326,8 @@ public:
     void InvalidateMemory(VAddr addr, size_t size);
 
     /// Marks an image as dirty if it exists at the provided address.
-    void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
+    /// sotc: any_overlap marks every image overlapping the range (DMA copies and fills).
+    void InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool any_overlap = false);
 
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);

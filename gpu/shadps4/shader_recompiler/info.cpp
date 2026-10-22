@@ -34,6 +34,16 @@ void Info::RefreshSharpTables() {
     }
 }
 
+bool LodFeedbackEnabled() {
+    static const bool enabled = [] {
+        // Off by default: using the measured mips made the game's streaming churn (one 150 s
+        // run at 21 FPS average, 22 Oct). SOTC_LOD_FEEDBACK=1 turns it on for tests.
+        const char* v = std::getenv("SOTC_LOD_FEEDBACK");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+
 // SOTC_TSHARP_ARRAY=<n> (0 = off); SotC defaults to 16 like Pink's preset.
 u32 DynamicTsharpArraySize() {
     static const u32 size = [] {

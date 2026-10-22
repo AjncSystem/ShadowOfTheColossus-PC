@@ -35,6 +35,28 @@ namespace SotcLod {
 
 inline std::atomic<u32> uses[256]{};
 
+/// sotc: the finest mip + 1 each bank was sampled at since the last report, measured by the
+/// fragment shaders (Rasterizer::SotcLodFeedbackCycle; 0: no sample). The hardware counts
+/// exactly this; without it every sampled bank asked for one fixed mip, distant ones too, and
+/// with texture level "Maximum" in PS4 Pro mode the game's page pool stayed full until the game
+/// overwrote textures still in use (colour garbage on the Shrine after some loads, 22 Oct; the
+/// F9 reload from guest memory left it as it was).
+inline std::atomic<u32> gpu_mip[256]{};
+
+/// Merges one host copy of the feedback buffer (u32 per bank, ~0u: not sampled).
+inline void MergeGpu(const u32* banks) {
+    for (u32 i = 0; i < 256; ++i) {
+        if (banks[i] > 14) {
+            continue;
+        }
+        const u32 want = banks[i] + 1;
+        u32 cur = gpu_mip[i].load(std::memory_order_relaxed);
+        while ((cur == 0 || want < cur) &&
+               !gpu_mip[i].compare_exchange_weak(cur, want, std::memory_order_relaxed)) {
+        }
+    }
+}
+
 struct PoolPages {
     s64 free = -1; ///< -1: the pool is not there
     u64 total = 0;
@@ -188,6 +210,53 @@ inline void Collect(u64 (&entries)[256]) {
         }
     }
     const u64 mip = std::min<u64>(level + coarser, 14);
+    // sotc: the measured mips (gpu_mip). Without SOTC_LOD_FEEDBACK=1: the fixed mip above for every
+    // sampled bank. SOTC_LOD_FB_BIAS=<n> asks n mips coarser (negative: finer), SOTC_LOD_FB_MIN
+    // the finest mip ever asked for. A bank keeps its last measured mip for SOTC_LOD_FB_KEEP
+    // reports (default 60) after its last sample; the page pool switch still adds `coarser`.
+    static const bool feedback = [] { // Shader::LodFeedbackEnabled: off unless =1
+        const char* v = std::getenv("SOTC_LOD_FEEDBACK");
+        return v && v[0] == '1';
+    }();
+    static const int fb_bias = [] {
+        const char* v = std::getenv("SOTC_LOD_FB_BIAS");
+        return v ? std::atoi(v) : 0;
+    }();
+    // Default: the fixed mip (level). Measured near textures asking for mip 0 made the game
+    // stream far more than its page pool and the disk give (9 FPS, stalls of 7-9 s and the
+    // allocator fault at 0x1a371 within 6 minutes, PS4 Pro + Maximum, 22 Oct): near textures keep
+    // the old detail and only the distant ones ask for less.
+    static const int fb_min = [] {
+        const char* v = std::getenv("SOTC_LOD_FB_MIN");
+        return v ? std::atoi(v) : int(level);
+    }();
+    static const u32 fb_keep = [] {
+        const char* v = std::getenv("SOTC_LOD_FB_KEEP");
+        return v ? static_cast<u32>(std::strtoul(v, nullptr, 0)) : 60u;
+    }();
+    // SOTC_LOD_FB_HOLD=<reports> (default 120, about 2 s): a bank asks for a finer mip at once
+    // but for a coarser one only after measuring it that long. Measured mips move between
+    // neighbours from one report to the next (a texture at the edge of a mip boundary), and every
+    // switch makes the game drop or stream mips: stalls down to 0.1 FPS without this (22 Oct).
+    static const u32 fb_hold = [] {
+        const char* v = std::getenv("SOTC_LOD_FB_HOLD");
+        return v ? static_cast<u32>(std::strtoul(v, nullptr, 0)) : 120u;
+    }();
+    // SOTC_LOD_FB_USE=0: measure (and log) without changing what the game reads (shader cost).
+    static const bool fb_use = [] {
+        const char* v = std::getenv("SOTC_LOD_FB_USE");
+        return !v || v[0] != '0';
+    }();
+    static u8 gpu_last[256];
+    static u32 gpu_age[256];
+    static u32 gpu_coarse_for[256];
+    static const bool gpu_ready = [] {
+        std::fill(std::begin(gpu_last), std::end(gpu_last), u8{0xff});
+        std::fill(std::begin(gpu_age), std::end(gpu_age), 0xffffffffu);
+        return true;
+    }();
+    (void)gpu_ready;
+    u32 measured = 0, mip_hist[4] = {};
     static u32 idle[256] = {}; // reports since the bank's last use (never used: all ones)
     static const bool idle_ready = [] {
         std::fill(std::begin(idle), std::end(idle), 0xffffffffu);
@@ -208,9 +277,44 @@ inline void Collect(u64 (&entries)[256]) {
         // drop their fine mips. SOTC_LOD_KEEP=1 reports them as sampled with no samples instead
         // (what the zeroed buffer said before; not soak-tested with the streaming).
         static const bool keep = std::getenv("SOTC_LOD_KEEP") != nullptr;
-        entries[i] = idle[i] < linger_now ? (mip << 56) | (u64{std::max<u32>(last_count[i], 1)} << 32)
+        u64 bank_mip = mip;
+        bool gpu_fresh = false;
+        if (feedback) {
+            if (const u32 g = gpu_mip[i].exchange(0, std::memory_order_relaxed)) {
+                const u8 now = static_cast<u8>(g - 1);
+                if (gpu_last[i] == 0xff || now <= gpu_last[i]) {
+                    gpu_last[i] = now;
+                    gpu_coarse_for[i] = 0;
+                } else if (++gpu_coarse_for[i] >= fb_hold) {
+                    gpu_last[i] = now;
+                    gpu_coarse_for[i] = 0;
+                }
+                gpu_age[i] = 0;
+                gpu_fresh = true;
+            } else if (gpu_age[i] != 0xffffffffu) {
+                ++gpu_age[i];
+            }
+            // Only banks the binds marked count as sampled, as before: the measurement makes a
+            // sampled bank coarser, never adds one.
+            if (gpu_last[i] != 0xff && gpu_age[i] <= fb_keep) {
+                const int m = std::max(int(gpu_last[i]) + fb_bias, fb_min) + int(coarser);
+                const u64 measured_mip = static_cast<u64>(std::clamp(m, 0, 14));
+                ++measured;
+                ++mip_hist[std::min<u64>(measured_mip, 3)];
+                if (fb_use) {
+                    bank_mip = measured_mip;
+                }
+            }
+            (void)gpu_fresh;
+        }
+        entries[i] = idle[i] < linger_now ? (bank_mip << 56) | (u64{std::max<u32>(last_count[i], 1)} << 32)
                      : keep           ? level << 56
                                       : u64{0xf} << 56;
+    }
+    static u32 fb_reports = 0;
+    if (pool_log && feedback && fb_reports++ % 30 == 0) {
+        std::fprintf(stderr, "SOTC LOD FEEDBACK: %u banks measured, mips 0/1/2/3+: %u/%u/%u/%u\n",
+                     measured, mip_hist[0], mip_hist[1], mip_hist[2], mip_hist[3]);
     }
 }
 

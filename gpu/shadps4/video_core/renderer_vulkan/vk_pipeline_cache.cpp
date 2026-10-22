@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 #include <unordered_set>
 #include "common/elf_info.h"
 #include "common/assert_scope.h"
@@ -34,6 +35,22 @@
 #include "video_core/sotc_stats.h"
 
 namespace Vulkan {
+
+// sotc: the saved driver pipeline cache (PipelineCache::SaveDriverCache).
+static bool DriverCacheEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_DRIVER_CACHE");
+        return !v || v[0] != '0';
+    }();
+    return enabled;
+}
+
+static std::filesystem::path DriverCachePath() {
+    const auto dir = Common::FS::GetUserPath(Common::FS::PathType::CacheDir);
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir / "sotc_vk_pipelines.bin";
+}
 
 using Shader::HwStage;
 using Shader::Output;
@@ -431,10 +448,63 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // sotc: the cache is read by the Presenter once it can draw (Presenter::Presenter), with
     // the loading screen on meanwhile.
 
-    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
+    // sotc: the VkPipelineCache starts from the copy saved on disk (SaveDriverCache). Without it
+    // every start after an update of the port recompiled all ~3000 pipelines in the driver: about
+    // 2 minutes of loading screen, since the driver's own cache is tied to the executable. The
+    // driver checks the header (vendor, device, driver version) and ignores a stale copy.
+    // SOTC_DRIVER_CACHE=0 turns it off.
+    std::vector<u8> driver_cache_data;
+    if (DriverCacheEnabled()) {
+        const auto path = DriverCachePath();
+        if (std::FILE* f = _wfopen(path.c_str(), L"rb")) {
+            std::fseek(f, 0, SEEK_END);
+            const long size = std::ftell(f);
+            std::fseek(f, 0, SEEK_SET);
+            if (size > 0) {
+                driver_cache_data.resize(static_cast<size_t>(size));
+                if (std::fread(driver_cache_data.data(), 1, driver_cache_data.size(), f) !=
+                    driver_cache_data.size()) {
+                    driver_cache_data.clear();
+                }
+            }
+            std::fclose(f);
+        }
+    }
+    vk::PipelineCacheCreateInfo cache_ci{
+        .initialDataSize = driver_cache_data.size(),
+        .pInitialData = driver_cache_data.empty() ? nullptr : driver_cache_data.data(),
+    };
+    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique(cache_ci);
+    if (cache_result != vk::Result::eSuccess && !driver_cache_data.empty()) {
+        std::fprintf(stderr, "SOTC driver cache: saved copy rejected (%s), starting empty\n",
+                     vk::to_string(cache_result).c_str());
+        driver_cache_data.clear();
+        auto retry = instance.GetDevice().createPipelineCacheUnique({});
+        cache_result = retry.result;
+        cache = std::move(retry.value);
+    }
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
+    saved_driver_cache_size = driver_cache_data.size();
+    if (!driver_cache_data.empty()) {
+        std::fprintf(stderr, "SOTC driver cache: %zu KB loaded\n", driver_cache_data.size() >> 10);
+    }
+    if (DriverCacheEnabled()) {
+        // New pipelines (first visits) are saved every minute while playing: the game is often
+        // closed by killing the process, which skips the destructor.
+        driver_cache_saver = std::jthread([this](std::stop_token stop) {
+            std::mutex m;
+            std::condition_variable_any cv;
+            while (!stop.stop_requested()) {
+                std::unique_lock lk{m};
+                cv.wait_for(lk, stop, std::chrono::seconds{60}, [] { return false; });
+                if (!stop.stop_requested()) {
+                    SaveDriverCache();
+                }
+            }
+        });
+    }
 
     // sotc: pipeline workers for SOTC_ASYNC_SHADERS (see AsyncPipelineJob).
     if (AsyncShadersEnabled()) {
@@ -452,7 +522,52 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     }
 }
 
-PipelineCache::~PipelineCache() = default;
+PipelineCache::~PipelineCache() {
+    if (driver_cache_saver.joinable()) {
+        driver_cache_saver.request_stop();
+        driver_cache_saver.join();
+        SaveDriverCache();
+    }
+}
+
+void PipelineCache::SaveDriverCache() {
+    if (!DriverCacheEnabled() || !pipeline_cache) {
+        return;
+    }
+    std::scoped_lock lk{driver_cache_save_mutex};
+    size_t size = 0;
+    const vk::Device device = instance.GetDevice();
+    if (device.getPipelineCacheData(*pipeline_cache, &size, nullptr) != vk::Result::eSuccess ||
+        size == 0 || size == saved_driver_cache_size) {
+        return;
+    }
+    std::vector<u8> data(size);
+    if (device.getPipelineCacheData(*pipeline_cache, &size, data.data()) !=
+        vk::Result::eSuccess) {
+        return;
+    }
+    data.resize(size);
+    // Written next to it and renamed: a crash while writing keeps the old copy.
+    const auto path = DriverCachePath();
+    auto tmp = path;
+    tmp += L".tmp";
+    std::FILE* f = _wfopen(tmp.c_str(), L"wb");
+    if (!f) {
+        return;
+    }
+    const bool ok = std::fwrite(data.data(), 1, data.size(), f) == data.size();
+    std::fclose(f);
+    std::error_code ec;
+    if (ok) {
+        std::filesystem::rename(tmp, path, ec);
+    }
+    if (ok && !ec) {
+        saved_driver_cache_size = size;
+        std::fprintf(stderr, "SOTC driver cache: %zu KB saved\n", size >> 10);
+    } else {
+        std::filesystem::remove(tmp, ec);
+    }
+}
 
 // sotc: a pipeline built on the command processor that took longer than 30 ms is logged with
 // the reason it was not built on a pipeline worker (SOTC_SYNC_PIPELINE_MS changes the limit).

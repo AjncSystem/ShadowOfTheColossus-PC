@@ -119,6 +119,8 @@ public:
     u64 Flush();
     void Finish();
     void OnSubmit();
+    /// sotc: copies the LOD feedback buffer to the host and clears it (sotc_lod_stats.h)
+    void SotcLodFeedbackCycle();
     void OnFence();
 
     PipelineCache& GetPipelineCache() {
@@ -202,6 +204,16 @@ private:
     VideoCore::PageManager page_manager;
     VideoCore::BufferCache buffer_cache;
     VideoCore::TextureCache texture_cache;
+    // sotc: the finest mip per texture counter bank written by fragment shaders (device local),
+    // and the host copies read when the GPU reaches them (one per area in flight).
+    static constexpr u32 SotcLodFeedbackBytes = 256 * sizeof(u32); ///< + the gate word
+    static constexpr u32 SotcLodFeedbackAreas = 4;
+    u32 sotc_lod_cycles{};
+    std::unique_ptr<VideoCore::Buffer> sotc_lod_feedback;
+    std::unique_ptr<VideoCore::Buffer> sotc_lod_download;
+    std::array<std::atomic<bool>, SotcLodFeedbackAreas> sotc_lod_pending{};
+    u32 sotc_lod_area{};
+    std::chrono::steady_clock::time_point sotc_lod_last{};
     AmdGpu::Liverpool* liverpool;
     Core::MemoryManager* memory;
     boost::icl::interval_set<VAddr> mapped_ranges;

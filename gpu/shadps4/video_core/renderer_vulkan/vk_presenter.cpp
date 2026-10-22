@@ -519,7 +519,12 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
             std::this_thread::sleep_for(std::chrono::milliseconds(33));
         }
     });
+    const auto warm_start = std::chrono::steady_clock::now();
     rasterizer->GetPipelineCache().WarmUp();
+    std::fprintf(stderr, "SOTC warm-up: %lld ms\n",
+                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - warm_start).count()));
+    rasterizer->GetPipelineCache().SaveDriverCache();
     SotcStats::warmup_finished.store(true, std::memory_order_relaxed);
     warming.store(false, std::memory_order_relaxed);
     painter.join();

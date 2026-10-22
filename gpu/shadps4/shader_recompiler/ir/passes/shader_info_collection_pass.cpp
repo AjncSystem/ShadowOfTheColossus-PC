@@ -161,6 +161,12 @@ void Visit(Info& info, const IR::Inst& inst) {
             info.uses_dma = true;
         }
         break;
+    case IR::Opcode::ImageSampleImplicitLod:
+    case IR::Opcode::ImageSampleDrefImplicitLod:
+        if (info.sw_stage == SwStage::Fragment && LodFeedbackEnabled()) {
+            info.uses_lod_feedback = true;
+        }
+        break;
     case IR::Opcode::PackUfloat10_11_11:
         info.uses_pack_10_11_11 = true;
         break;
@@ -183,6 +189,16 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
     if (!EmulatorSettings.IsDirectMemoryAccessEnabled()) {
         info.uses_dma = false;
         info.readconst_types = Info::ReadConstType::None;
+    }
+
+    if (info.uses_lod_feedback) {
+        // The T#s are read from the flat buffer at run time: the bank and size change per draw.
+        AddFlatbuf(info);
+        info.buffers.push_back({
+            .used_types = IR::Type::U32,
+            .buffer_type = BufferType::LodFeedback,
+            .is_written = true,
+        });
     }
 
     if (info.uses_dma) {

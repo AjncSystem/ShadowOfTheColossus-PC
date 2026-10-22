@@ -531,13 +531,14 @@ void VideoOutDriver::Flip(const Request& req) {
             const uint64_t images_new = SotcStats::images_new.load();
             ReportPrintf(report,
                          "SOTC GC: %.1f ticks/frame, freed %.0f/s (%llu written back), images new "
-                         "%.0f/s, cached %llu (%llu MB)\n",
+                         "%.0f/s, cached %llu (%llu MB), reused slots %llu\n",
                          flips ? double(SotcStats::gc_ticks.exchange(0)) / flips : 0.0,
                          SotcStats::gc_freed.exchange(0) / seconds,
                          static_cast<unsigned long long>(SotcStats::gc_downloads.exchange(0)),
                          (images_new - last_images_new) / seconds,
                          static_cast<unsigned long long>(SotcStats::cached_images.load()),
-                         static_cast<unsigned long long>(SotcStats::cached_image_bytes.load() >> 20));
+                         static_cast<unsigned long long>(SotcStats::cached_image_bytes.load() >> 20),
+                         static_cast<unsigned long long>(SotcStats::reuse_size_frees.exchange(0)));
             last_images_new = images_new;
             // sotc: SOTC_RB_NARROW: GPU-written pages that the wide readback window would have
             // downloaded and unprotected (and the GPU protected again), left protected instead.

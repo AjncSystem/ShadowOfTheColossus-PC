@@ -19,8 +19,9 @@
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 // Above both lines before the upstream merge: generation changed, so old caches are dropped.
-static constexpr u32 ShaderBinaryVersion = 33u;
-// sotc: 33 = the draw thread merge (SRT walker faults read zero instead of patching).
+// sotc: 33 = the draw thread merge (SRT walker faults read zero instead of patching). 34 = the
+// LOD feedback (sotc_lod_stats.h); binaries built with SOTC_LOD_FEEDBACK=0 are another version.
+static const u32 ShaderBinaryVersion = Shader::LodFeedbackEnabled() ? 36u : 134u;
 static constexpr u32 ShaderMetaVersion = 21u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization

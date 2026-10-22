@@ -583,7 +583,7 @@ def game_environment(s):
     textures = s.get('textures') or 'high'
     if textures != 'off':
         env.setdefault('SOTC_LOD_LINGER', '1')
-    if textures == 'max' and env['SOTC_NEO'] == '1':
+    if textures == 'max' and env['SOTC_NEO'] == '1' and 'SOTC_MAX_IN_PRO=1' not in str(s.get('extra_env', '')):
         # sotc: in PS4 Pro mode "Maximum" exhausted the game's page pool within minutes at the
         # Shrine (0x1a371, user, 22 Oct): High there.
         textures = 'high'

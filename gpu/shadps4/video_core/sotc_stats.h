@@ -40,6 +40,12 @@ inline std::atomic<uint64_t> mem_epoch{0};
 /// RunGarbageCollector), so stale images over reused texture memory go away (green blocks after
 /// long sessions and many loads, user, 22 Oct). SOTC_LOAD_FLUSH=0 turns it off.
 inline std::atomic<bool> load_flush{false};
+/// sotc: F9 (diagnostic): every cached texture not drawn by the GPU is uploaded again from guest
+/// memory. Garbage that stays was written there by the game; garbage that goes was a stale copy.
+inline std::atomic<bool> reload_all{false};
+inline std::atomic<uint64_t> reuse_size_frees{0}; ///< ResolveOverlap: slot reused by another size
+inline std::atomic<uint64_t> gc_downloads_skipped{0}; ///< SOTC_GC_DOWNLOAD=0
+inline std::atomic<uint64_t> f9_gpu_copies{0}; ///< F9 uploads whose memory the GPU had written
 /// sotc: bytes of hot readbacks not applied because the guest may have written them since.
 inline std::atomic<uint64_t> rb_hot_cpu_skipped{0};
 inline std::atomic<uint64_t> readbacks{0};    ///< BufferCache::DownloadMemory calls

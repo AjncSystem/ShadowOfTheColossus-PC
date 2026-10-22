@@ -484,9 +484,11 @@ void QuickSettings() {
                                T("Máxima (nítida)", "Maximum (sharp)")};
     // sotc: no "Maximum" in PS4 Pro mode: there it exhausted the game's page pool within minutes
     // at the Shrine (0x1a371, user, 22 Oct).
+    // SOTC_MAX_IN_PRO=1 allows it there (testing whether it still closes).
     static const bool neo = [] {
         const char* v = std::getenv("SOTC_NEO");
-        return v && v[0] == '1';
+        const char* allow = std::getenv("SOTC_MAX_IN_PRO");
+        return v && v[0] == '1' && !(allow && allow[0] == '1');
     }();
     if (ImGui::BeginCombo(T("Qualidade das texturas", "Texture quality"), tex_names[tex_level])) {
         for (int i = 0; i < 3; ++i) {
@@ -1043,6 +1045,14 @@ bool HandleEvent(const SDL_Event& event) {
             toast_text = SotcUi::T("Geração de quadros: indisponível nesta placa", "Frame generation: not available on this GPU");
             toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
         }
+        return true;
+    }
+    // sotc: F9 (diagnostic) uploads every cached texture again from guest memory (sotc_stats.h).
+    if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F9 && !event.key.repeat) {
+        SotcStats::reload_all.store(true, std::memory_order_relaxed);
+        SotcEvent::Log("KEY", "%s", SotcUi::T("F9: recarregar texturas", "F9: reload textures"));
+        toast_text = SotcUi::T("F9: texturas recarregadas", "F9: textures reloaded");
+        toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
         return true;
     }
     // sotc: F10 shows or hides the performance overlay.

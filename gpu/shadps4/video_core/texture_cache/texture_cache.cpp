@@ -133,6 +133,17 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     if (False(image.flags & ImageFlagBits::GpuModified)) {
         return;
     }
+    // sotc: SOTC_GC_DOWNLOAD=0: images freed by the collector are not written back to guest
+    // memory. Asynchronous: the copy lands later, maybe over memory the game reused for a new
+    // texture in the meantime (hunting the garbage on the Shrine altar, Maximum + PS4 Pro).
+    static const bool gc_download = [] {
+        const char* v = std::getenv("SOTC_GC_DOWNLOAD");
+        return !v || v[0] != '0';
+    }();
+    if (!sync && !gc_download) {
+        SotcStats::gc_downloads_skipped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
                               image.info.resources.layers * (image.info.num_bits / 8);
     ASSERT(download_size <= image.info.guest_size);
@@ -268,7 +279,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     });
 }
 
-void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
+void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool any_overlap) {
     std::scoped_lock lock{mutex};
     // sotc: SOTC_IMG_GPU_OVERLAP=1 also reuploads images inside a range a shader wrote as a
     // buffer, not only an image at its exact base (test for the empty 960x540 A2B10G10R10
@@ -277,6 +288,21 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
         const char* v = std::getenv("SOTC_IMG_GPU_OVERLAP");
         return v && v[0] == '1';
     }();
+    // sotc: a DMA copy or fill moves a whole block (the game's texture streaming pool): textures
+    // inside it but not at its start kept their old picture (garbage blocks on the Shrine altar
+    // with Maximum textures in PS4 Pro mode, after many loads). SOTC_DMA_OVERLAP=0: base only.
+    static const bool dma_overlap = [] {
+        const char* v = std::getenv("SOTC_DMA_OVERLAP");
+        return !v || v[0] != '0';
+    }();
+    if (any_overlap && dma_overlap) {
+        ForEachImageInRegion(address, max_size, [&](ImageId, Image& image) {
+            if (image.Overlaps(address, max_size)) {
+                image.flags |= ImageFlagBits::GpuDirty;
+            }
+        });
+        return;
+    }
     ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
         // Only consider images that match base address.
         // sotc: a mip tail counts as written when its chain's base address is.
@@ -463,6 +489,27 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             image_info.pitch == cache_image.info.pitch && image_info.resources.levels == 1 &&
             cache_image.info.resources.levels == 1 && image_info.resources.layers == 1 &&
             cache_image.info.resources.layers == 1;
+
+        // sotc: a CPU-written texture of another size at the same address is another texture in a
+        // reused slot of the game's texture pool, not a view of the cached one: viewed through the
+        // old image, its texels were read with the old size (colour blocks on the Shrine after a
+        // save or a battle loaded, Maximum textures in PS4 Pro mode; reloading did not help, the
+        // reload used the same old size). SOTC_REUSE_SIZE_CHECK=0: the old view, as before.
+        static const bool size_check = [] {
+            const char* v = std::getenv("SOTC_REUSE_SIZE_CHECK");
+            return !v || v[0] != '0';
+        }();
+        if (size_check && binding == BindingType::Texture &&
+            False(cache_image.flags & ImageFlagBits::GpuModified) &&
+            image_info.props.is_block == cache_image.info.props.is_block &&
+            (image_info.size.width != cache_image.info.size.width ||
+             image_info.size.height != cache_image.info.size.height)) {
+            SotcStats::reuse_size_frees.fetch_add(1, std::memory_order_relaxed);
+            if (safe_to_delete) {
+                FreeImage(cache_image_id);
+            }
+            return {merged_image_id, -1, -1};
+        }
 
         // Size and resources are less than or equal, use image view.
         if (image_info.pixel_format != cache_image.info.pixel_format ||
@@ -658,8 +705,18 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     auto& src_image = slot_images[image_id];
     auto& new_image = slot_images[new_image_id];
 
+    // sotc: from upstream shadPS4 #5444. The old contents are carried over only when they hold
+    // GPU-written data guest memory lacks. A CPU-dirty source is stale (a streamed texture
+    // rewritten in a reused pool slot): copying it overwrote the fresh upload with the old texture
+    // (garbage patches on stone and grass with Maximum textures in PS4 Pro mode, where the game's
+    // texture pool is always full and its slots are reused all the time).
+    // SOTC_EXPAND_COPY_STALE=1: always copy, as before (A/B tests).
+    static const bool copy_stale = std::getenv("SOTC_EXPAND_COPY_STALE") != nullptr;
+    const bool src_has_gpu_data = copy_stale || src_image.SafeToDownload();
     RefreshImage(new_image);
-    runtime.CopyImage(&src_image, &new_image);
+    if (src_has_gpu_data) {
+        runtime.CopyImage(&src_image, &new_image);
+    }
 
     if (src_image.binding.is_bound || src_image.binding.is_target) {
         src_image.binding.needs_rebind = 1u;
@@ -1073,8 +1130,15 @@ void TextureCache::RefreshImage(Image& image) {
 
     scheduler.EndRendering();
 
+    const bool from_guest = std::exchange(image.sotc_upload_from_guest, false);
+    if (from_guest &&
+        buffer_cache.IsRegionGpuModified(image.info.guest_address, image.info.guest_size)) {
+        SotcStats::f9_gpu_copies.fetch_add(1, std::memory_order_relaxed);
+    }
     const auto [in_buffer, in_offset] =
-        buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
+        from_guest
+            ? buffer_cache.ObtainGuestCopyForImage(image.info.guest_address, image.info.guest_size)
+            : buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
     const auto [buffer, offset] = tile_manager.DetileImage(in_buffer, in_offset, image.info);
     for (auto& copy : image_copies) {
         copy.bufferOffset += offset;
@@ -1990,6 +2054,42 @@ void TextureCache::RunGarbageCollector() {
     }
     if (SotcStats::load_flush.exchange(false, std::memory_order_relaxed)) {
         EmergencyCollect(2); // sotc: a load began (sotc_stats.h)
+    }
+    if (SotcStats::reload_all.exchange(false, std::memory_order_relaxed)) {
+        // Textures marked GPU-written although no draw targets them (copies, ExpandImage) are
+        // reloaded too and counted apart: a stale picture that sticks would be one of them.
+        u64 marked = 0, gpu_only_copies = 0, targets = 0;
+        std::scoped_lock lock{mutex};
+        lru_cache.ForEachItemBelow(gc_tick + 1, [&](ImageId image_id) {
+            Image& image = slot_images[image_id];
+            if (!image.backing) {
+                return;
+            }
+            if (True(image.flags & ImageFlagBits::GpuModified)) {
+                if (image.usage.render_target || image.usage.depth_target || image.usage.storage ||
+                    image.usage.vo_surface) {
+                    ++targets;
+                    return;
+                }
+                image.flags &= ~ImageFlagBits::GpuModified;
+                ++gpu_only_copies;
+            }
+            image.flags |= ImageFlagBits::CpuDirty;
+            image.sotc_upload_from_guest = true;
+            UntrackImage(image_id);
+            ++marked;
+        });
+        // The images of the previous F9 that were in GPU-written memory: their upload used to
+        // come from the buffer cache's copy, which may hold stale data the CPU replaced.
+        const u64 gpu_copies = SotcStats::f9_gpu_copies.exchange(0, std::memory_order_relaxed);
+        SotcEvent::Log("TEXTURE", "F9 anterior: %llu texturas estavam em memória escrita pela GPU",
+                       static_cast<unsigned long long>(gpu_copies));
+        SotcEvent::Log("TEXTURE",
+                       "F9: %llu texturas recarregadas direto da memória do jogo (%llu marcadas "
+                       "como escritas pela GPU sem serem alvo de desenho; %llu alvos mantidos)",
+                       static_cast<unsigned long long>(marked),
+                       static_cast<unsigned long long>(gpu_only_copies),
+                       static_cast<unsigned long long>(targets));
     }
     Census();
     GarbageCollectImages();

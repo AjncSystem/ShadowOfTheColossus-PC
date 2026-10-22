@@ -1095,6 +1095,14 @@ void BufferCache::RecordCurrentWrite(VAddr addr, u64 size) {
     current_writes.Add(addr, size);
 }
 
+std::pair<const Buffer*, u64> BufferCache::ObtainGuestCopyForImage(VAddr device_addr, u32 size) {
+    const auto staging = staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
+                                              instance.StorageMinAlignment());
+    memory->CopySparseMemory(device_addr, staging.mapped, staging.size);
+    staging.Flush();
+    return {staging.buffer, staging.offset};
+}
+
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
     if (IsRegionGpuModified(device_addr, size)) {
         return ObtainBuffer(device_addr, size, false);

@@ -184,6 +184,8 @@ public:
     u64 hash{};
     /// sotc: host bytes this full chain would save as a mip tail (census "projected" only).
     u64 sotc_shadow_saving{};
+    /// sotc: F9: the next upload reads guest memory itself, not the buffer cache's GPU copy.
+    bool sotc_upload_from_guest{};
 
     struct {
         u32 texture : 1;

@@ -77,6 +77,94 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         runtime.FlushBarriers();
         buffer_cache.SubmitPendingArenaBinds(info);
     });
+
+    if (Shader::LodFeedbackEnabled()) {
+        sotc_lod_feedback = std::make_unique<VideoCore::Buffer>(
+            instance, 0, SotcLodFeedbackBytes + sizeof(u32), VideoCore::MemoryType::DeviceLocal,
+            "SotC LOD Feedback");
+        runtime.FillBuffer(sotc_lod_feedback.get(), SotcLodFeedbackBytes, sizeof(u32), 1u);
+        sotc_lod_download = std::make_unique<VideoCore::Buffer>(
+            instance, 0, SotcLodFeedbackBytes * SotcLodFeedbackAreas,
+            VideoCore::MemoryType::HostCached, "SotC LOD Feedback Download");
+        runtime.FillBuffer(sotc_lod_feedback.get(), 0u, SotcLodFeedbackBytes, ~0u);
+    }
+}
+
+void Rasterizer::SotcLodFeedbackCycle() {
+    if (!sotc_lod_feedback) {
+        return;
+    }
+    // Every 8 ms is plenty: the game asks for the statistics about once a frame and the banks
+    // stay sampled for a while (SotcLod::Collect).
+    const auto now = std::chrono::steady_clock::now();
+    if (now - sotc_lod_last < std::chrono::milliseconds{8} ||
+        sotc_lod_pending[sotc_lod_area].load(std::memory_order_acquire)) {
+        return;
+    }
+    sotc_lod_last = now;
+    const u32 area = sotc_lod_area;
+    sotc_lod_area = (sotc_lod_area + 1) % SotcLodFeedbackAreas;
+    const vk::Buffer feedback = sotc_lod_feedback->Handle();
+    const auto barrier = [&](vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
+                             vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
+        const vk::BufferMemoryBarrier2 buffer_barrier = {
+            .srcStageMask = src_stage,
+            .srcAccessMask = src_access,
+            .dstStageMask = dst_stage,
+            .dstAccessMask = dst_access,
+            .buffer = feedback,
+            .offset = 0,
+            .size = SotcLodFeedbackBytes + sizeof(u32),
+        };
+        scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers = &buffer_barrier,
+        });
+    };
+    scheduler.EndRendering();
+    const auto cmdbuf = scheduler.CommandBuffer();
+    barrier(vk::PipelineStageFlagBits2::eAllCommands,
+            vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+            vk::PipelineStageFlagBits2::eTransfer,
+            vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite);
+    const vk::BufferCopy copy = {
+        .srcOffset = 0,
+        .dstOffset = area * SotcLodFeedbackBytes,
+        .size = SotcLodFeedbackBytes,
+    };
+    cmdbuf.copyBuffer(feedback, sotc_lod_download->Handle(), copy);
+    barrier(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead,
+            vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+    cmdbuf.fillBuffer(feedback, 0, SotcLodFeedbackBytes, ~0u);
+    // The next cycle measures only when this is the fourth (gate word, DefineLodFeedback).
+    // SOTC_LOD_FB_EVERY=<n>: one cycle in n (1: always).
+    static const u32 every = [] {
+        const char* v = std::getenv("SOTC_LOD_FB_EVERY");
+        const u32 n = v ? static_cast<u32>(std::strtoul(v, nullptr, 0)) : 4u;
+        return n ? n : 1u;
+    }();
+    cmdbuf.fillBuffer(feedback, SotcLodFeedbackBytes, sizeof(u32),
+                      ++sotc_lod_cycles % every == 0 ? 1u : 0u);
+    barrier(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+            vk::PipelineStageFlagBits2::eAllCommands,
+            vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+    const vk::MemoryBarrier2 host_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &host_barrier,
+    });
+    sotc_lod_pending[area].store(true, std::memory_order_release);
+    scheduler.DeferOperation([this, area] {
+        sotc_lod_download->Invalidate(area * SotcLodFeedbackBytes, SotcLodFeedbackBytes);
+        SotcLod::MergeGpu(reinterpret_cast<const u32*>(sotc_lod_download->mapped_data.data() +
+                                                       area * SotcLodFeedbackBytes));
+        sotc_lod_pending[area].store(false, std::memory_order_release);
+    });
 }
 
 Rasterizer::~Rasterizer() {
@@ -1335,6 +1423,7 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
+    SotcLodFeedbackCycle();
     buffer_cache.TickFrame();
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
@@ -2071,6 +2160,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             } else if (desc.buffer_type == Shader::BufferType::FaultBuffer) {
                 const auto* fault_buffer = buffer_cache.GetFaultBuffer();
                 buffer_infos.emplace_back(fault_buffer->Handle(), 0, fault_buffer->SizeBytes());
+            } else if (desc.buffer_type == Shader::BufferType::LodFeedback) {
+                buffer_infos.emplace_back(sotc_lod_feedback->Handle(), 0,
+                                          SotcLodFeedbackBytes + sizeof(u32));
             } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
                 auto& lds_buffer = buffer_cache.GetStreamBuffer();
                 const auto& cs_program = liverpool->DrawCsRegs();
@@ -2690,6 +2782,9 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
         }
         return buffer_cache.ObtainBuffer(address, num_bytes, true);
     }();
+    if (!is_gds) {
+        texture_cache.InvalidateMemoryFromGPU(address, num_bytes, true);
+    }
     runtime.FillBuffer(buffer, offset, num_bytes, value);
 }
 
@@ -2702,7 +2797,9 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
             return;
         }
     }
-    texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);
+    if (!dst_gds) {
+        texture_cache.InvalidateMemoryFromGPU(dst, num_bytes, true);
+    }
     const auto* gds_buffer = buffer_cache.GetGdsBuffer();
     const auto [src_buffer, src_offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {
         if (src_gds) {

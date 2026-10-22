@@ -862,6 +862,9 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_cohere
     case BufferType::FaultBuffer:
         Name(id, "fault_buffer");
         break;
+    case BufferType::LodFeedback:
+        Name(id, "lod_feedback");
+        break;
     case BufferType::SharedMemory:
         Name(id, "ssbo_shmem");
         break;
@@ -888,6 +891,8 @@ void EmitContext::DefineBuffers() {
             bda_pagetable_index = buffers.size();
         } else if (desc.buffer_type == BufferType::FaultBuffer) {
             fault_buffer_index = buffers.size();
+        } else if (desc.buffer_type == BufferType::LodFeedback) {
+            lod_feedback_index = buffers.size();
         }
 
         // Define aliases depending on the shader usage.
@@ -1305,6 +1310,90 @@ Id EmitContext::DefineReadConst(bool dynamic) {
     return func;
 }
 
+// sotc: the hardware LOD counters (sotc_lod_stats.h) from the sample's derivatives. lambda =
+// log2 of the longest texel footprint axis over the T#'s mip 0 size (isotropic: an anisotropic
+// sample may read a finer mip, which is the bias knob's job on the CPU side). The finest mip of
+// every enabled bank (T# dword 6: counter_bank_id 12-19, lod_hw_cnt_en 20) is kept with an atomic
+// min, skipped when the bank already holds this mip or a finer one (one load, few atomics).
+// Word 256 of the buffer says whether this frame measures at all (Rasterizer::
+// SotcLodFeedbackCycle measures one cycle in four): a draw-uniform branch, so the derivatives
+// below stay in uniform control flow; measuring every frame cost ~15% of the frame rate.
+Id EmitContext::DefineLodFeedback() {
+    const auto func_type{TypeFunction(void_id, U32[1], U32[1], U32[1], F32[2])};
+    const auto func{OpFunction(void_id, spv::FunctionControlMask::MaskNone, func_type)};
+    const auto dw2{OpFunctionParameter(U32[1])};
+    const auto dw3{OpFunctionParameter(U32[1])};
+    const auto dw6{OpFunctionParameter(U32[1])};
+    const auto uv{OpFunctionParameter(F32[2])};
+    Name(func, "lod_feedback");
+    AddLabel();
+
+    const auto measure_label{OpLabel()};
+    const auto write_label{OpLabel()};
+    const auto merge_label{OpLabel()};
+    const auto end_label{OpLabel()};
+
+    const auto& feedback{buffers[lod_feedback_index]};
+    const auto [feedback_id, feedback_pointer_type] = feedback.Alias(PointerType::U32);
+    const auto gate_ptr{
+        OpAccessChain(feedback_pointer_type, feedback_id, u32_zero_value, ConstU32(256U))};
+    const auto measuring{OpINotEqual(U1[1], OpLoad(U32[1], gate_ptr), u32_zero_value)};
+    OpSelectionMerge(end_label, spv::SelectionControlMask::MaskNone);
+    OpBranchConditional(measuring, measure_label, end_label);
+
+    AddLabel(measure_label);
+    const auto ddx{OpDPdx(F32[2], uv)};
+    const auto ddy{OpDPdy(F32[2], uv)};
+
+    const auto enabled{OpINotEqual(U1[1], OpBitwiseAnd(U32[1], dw6, ConstU32(1U << 20)),
+                                   u32_zero_value)};
+    const auto bank{OpBitwiseAnd(U32[1], OpShiftRightLogical(U32[1], dw6, ConstU32(12U)),
+                                 ConstU32(0xffU))};
+    const auto width{OpConvertUToF(
+        F32[1], OpIAdd(U32[1], OpBitwiseAnd(U32[1], dw2, ConstU32(0x3fffU)), u32_one_value))};
+    const auto height{OpConvertUToF(
+        F32[1], OpIAdd(U32[1],
+                       OpBitwiseAnd(U32[1], OpShiftRightLogical(U32[1], dw2, ConstU32(14U)),
+                                    ConstU32(0x3fffU)),
+                       u32_one_value))};
+    const auto size{OpCompositeConstruct(F32[2], width, height)};
+    const auto tx{OpFMul(F32[2], ddx, size)};
+    const auto ty{OpFMul(F32[2], ddy, size)};
+    const auto footprint{
+        OpFMax(F32[1], OpFMax(F32[1], OpDot(F32[1], tx, tx), OpDot(F32[1], ty, ty)),
+               ConstF32(1e-20f))};
+    const auto lambda{OpFMul(F32[1], OpLog2(F32[1], footprint), ConstF32(0.5f))};
+    // NaN derivatives (helper lanes at triangle edges) report nothing
+    const auto valid{OpLogicalAnd(U1[1], enabled, OpLogicalNot(U1[1], OpIsNan(U1[1], lambda)))};
+    // Never coarser than the texture's last mip (T# dword 3 bits 16-19): the game waits, while
+    // loading, until every bank's mip is resident, and a mip the texture lacks never is (loading
+    // screens of ~100 s instead of ~1 s, 22 Oct).
+    const auto last_level{OpConvertUToF(
+        F32[1], OpBitwiseAnd(U32[1], OpShiftRightLogical(U32[1], dw3, ConstU32(16U)),
+                             ConstU32(0xfU)))};
+    const auto mip_f{OpFClamp(F32[1], OpFloor(F32[1], lambda), f32_zero_value, last_level)};
+    const auto mip{OpConvertFToU(U32[1], mip_f)};
+
+    const auto ptr{OpAccessChain(feedback_pointer_type, feedback_id, u32_zero_value, bank)};
+    const auto finer{OpULessThan(U1[1], mip, OpLoad(U32[1], ptr))};
+    const auto write{OpLogicalAnd(U1[1], valid, finer)}; // before the merge: last two in block
+    OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    OpBranchConditional(write, write_label, merge_label);
+
+    AddLabel(write_label);
+    OpAtomicUMin(U32[1], ptr, ConstU32(static_cast<u32>(spv::Scope::Device)), u32_zero_value,
+                 mip);
+    OpBranch(merge_label);
+
+    AddLabel(merge_label);
+    OpBranch(end_label);
+
+    AddLabel(end_label);
+    OpReturn();
+    OpFunctionEnd();
+    return func;
+}
+
 void EmitContext::DefineFunctions() {
     if (info.uses_pack_10_11_11) {
         f32_to_uf11 = DefineFloat32ToUfloatM5(6, "f32_to_uf11");
@@ -1316,6 +1405,9 @@ void EmitContext::DefineFunctions() {
     }
     if (info.uses_dma) {
         get_bda_pointer = DefineGetBdaPointer();
+    }
+    if (info.uses_lod_feedback) {
+        lod_feedback = DefineLodFeedback();
     }
 
     if (True(info.readconst_types & Info::ReadConstType::Immediate)) {

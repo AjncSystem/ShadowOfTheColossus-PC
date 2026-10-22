@@ -88,6 +88,10 @@ public:
     ~PipelineCache();
 
     void WarmUp();
+
+    /// sotc: writes the driver's compiled pipelines to disk (sotc_vk_pipelines.bin), so the next
+    /// start, also after an update of the port, does not compile them again.
+    void SaveDriverCache();
     void Sync();
 
     bool LoadComputePipeline(Serialization::Archive& ar);
@@ -207,6 +211,9 @@ private:
     AmdGpu::Liverpool* liverpool;
     DescriptorHeap desc_heap;
     vk::UniquePipelineCache pipeline_cache;
+    size_t saved_driver_cache_size{};
+    std::mutex driver_cache_save_mutex;
+    std::jthread driver_cache_saver;
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};
     Shader::Pools pools;

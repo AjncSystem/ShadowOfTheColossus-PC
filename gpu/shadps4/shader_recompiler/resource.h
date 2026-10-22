@@ -103,6 +103,7 @@ enum class BufferType : u8 {
     GdsBuffer,
     SharedMemory,
     ClipPlanes,
+    LodFeedback, ///< sotc: finest mip each texture counter bank was sampled at (sotc_lod_stats.h)
 };
 
 struct BufferResource {

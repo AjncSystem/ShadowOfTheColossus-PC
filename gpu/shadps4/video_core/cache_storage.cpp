@@ -16,6 +16,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <thread>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -135,18 +137,130 @@ void DataBase::Open() {
     opened = true;
 }
 
+// sotc: all cache files in one file (cache.sotcpack in the cache folder), read in one go. On
+// a hard disk the ~12k small files took 30-100 s whenever Windows had dropped them from its file
+// cache (the game's 13.7 GB of archives read into memory push them out): the loading screen
+// changed between 1 s and 100 s from one start to the next. The loose files stay the cache
+// (written as before, whole or not at all); the pack is a copy, rewritten in the background
+// when files were missing from it. Format: "SOTCPK1" + NUL, u32 count, then per file u16 name
+// length, name, u32 size, data. SOTC_CACHE_PACK=0 turns it off.
+static bool CachePackEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_CACHE_PACK");
+        return !v || v[0] != '0';
+    }();
+    return enabled;
+}
+
+static constexpr char PackMagic[8] = {'S', 'O', 'T', 'C', 'P', 'K', '1', '\0'};
+
+static void ReadCachePack(const std::filesystem::path& path,
+                          std::map<std::string, std::vector<u8>>& out) {
+    std::FILE* f = _wfopen(path.c_str(), L"rb");
+    if (!f) {
+        return;
+    }
+    std::vector<u8> all;
+    std::fseek(f, 0, SEEK_END);
+    const long size = std::ftell(f);
+    std::fseek(f, 0, SEEK_SET);
+    if (size > 12) {
+        all.resize(static_cast<size_t>(size));
+        if (std::fread(all.data(), 1, all.size(), f) != all.size()) {
+            all.clear();
+        }
+    }
+    std::fclose(f);
+    if (all.size() < 12 || std::memcmp(all.data(), PackMagic, 8) != 0) {
+        return;
+    }
+    size_t pos = 8;
+    const auto take = [&](void* dst, size_t n) {
+        if (pos + n > all.size()) {
+            return false;
+        }
+        std::memcpy(dst, all.data() + pos, n);
+        pos += n;
+        return true;
+    };
+    u32 count = 0;
+    take(&count, 4);
+    for (u32 i = 0; i < count; ++i) {
+        u16 name_len = 0;
+        u32 data_len = 0;
+        std::string name;
+        if (!take(&name_len, 2) || pos + name_len > all.size()) {
+            break;
+        }
+        name.assign(reinterpret_cast<const char*>(all.data() + pos), name_len);
+        pos += name_len;
+        if (!take(&data_len, 4) || pos + data_len > all.size()) {
+            break;
+        }
+        out.emplace(std::move(name),
+                    std::vector<u8>(all.begin() + pos, all.begin() + pos + data_len));
+        pos += data_len;
+    }
+}
+
+static void WriteCachePack(std::filesystem::path path,
+                           std::vector<std::pair<std::string, std::vector<u8>>> files) {
+    auto tmp = path;
+    tmp += L".tmp";
+    std::FILE* f = _wfopen(tmp.c_str(), L"wb");
+    if (!f) {
+        return;
+    }
+    bool ok = std::fwrite(PackMagic, 1, 8, f) == 8;
+    const u32 count = static_cast<u32>(files.size());
+    ok = ok && std::fwrite(&count, 4, 1, f) == 1;
+    for (const auto& [name, data] : files) {
+        const u16 name_len = static_cast<u16>(name.size());
+        const u32 data_len = static_cast<u32>(data.size());
+        ok = ok && std::fwrite(&name_len, 2, 1, f) == 1 &&
+             std::fwrite(name.data(), 1, name.size(), f) == name.size() &&
+             std::fwrite(&data_len, 4, 1, f) == 1 &&
+             (data.empty() || std::fwrite(data.data(), 1, data.size(), f) == data.size());
+    }
+    ok = (std::fclose(f) == 0) && ok;
+    std::error_code ec;
+    if (ok) {
+        std::filesystem::rename(tmp, path, ec);
+    }
+    if (!ok || ec) {
+        std::filesystem::remove(tmp, ec);
+    }
+}
+
 // sotc: the boot preload opened ~12k small files one by one (~21 s of a 22 s warm-up on Windows,
 // where each open is slow and scanned). Read them all in parallel first; Load and ForEachBlob
 // take them from memory until FinishPreload.
 void DataBase::Prefetch() {
     const auto start = std::chrono::steady_clock::now();
+    const auto pack_path = cache_path / "cache.sotcpack";
+    std::map<std::string, std::vector<u8>> packed;
+    if (CachePackEnabled()) {
+        ReadCachePack(pack_path, packed);
+    }
     std::vector<std::filesystem::path> files;
     std::error_code ec;
+    size_t in_pack = 0, on_disk = 0;
     for (const auto& entry : std::filesystem::directory_iterator{cache_path, ec}) {
-        if (entry.is_regular_file(ec) && entry.path().extension() != ".tmp") {
+        const auto ext = entry.path().extension();
+        if (!entry.is_regular_file(ec) || ext == ".tmp" || ext == ".sotcpack") {
+            continue;
+        }
+        ++on_disk;
+        const auto it = packed.find(entry.path().filename().string());
+        if (it != packed.end()) {
+            ++in_pack;
+            prefetched.emplace(it->first, std::move(it->second));
+            packed.erase(it);
+        } else {
             files.push_back(entry.path());
         }
     }
+    // Pack entries whose loose file is gone (a cleared cache) are dropped with `packed`.
     const u32 num_threads =
         std::clamp<u32>(std::thread::hardware_concurrency(), 1, 16);
     std::vector<std::vector<std::pair<std::string, std::vector<u8>>>> results(num_threads);
@@ -178,6 +292,16 @@ void DataBase::Prefetch() {
         }
     }
     prefetch_active = true;
+    if (CachePackEnabled() && (!files.empty() || !packed.empty())) {
+        std::vector<std::pair<std::string, std::vector<u8>>> copy;
+        copy.reserve(prefetched.size());
+        for (const auto& [name, data] : prefetched) {
+            copy.emplace_back(name, data);
+        }
+        std::thread{WriteCachePack, pack_path, std::move(copy)}.detach();
+    }
+    std::fprintf(stderr, "SOTC shader cache: %zu files, %zu from the pack, %zu read one by one\n",
+                 on_disk, in_pack, files.size());
     LOG_INFO(Render, "Prefetched {} cache files ({} MiB) in {} ms with {} threads",
              prefetched.size(), bytes >> 20,
              std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -343,6 +467,14 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u8>& dat
         TakePrefetched(path, data);
         return;
     }
+    if (!prefetched.empty()) {
+        auto file = path;
+        file.replace_extension(GetBlobFileExtension(type));
+        if (const auto it = prefetched.find(file.filename().string()); it != prefetched.end()) {
+            data = it->second;
+            return;
+        }
+    }
     return LoadVector(type, path, data);
 }
 
@@ -362,6 +494,17 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u32>& da
             std::memcpy(data.data(), bytes.data(), data.size() * sizeof(u32));
         }
         return;
+    }
+    if (!prefetched.empty()) {
+        auto file = path;
+        file.replace_extension(GetBlobFileExtension(type));
+        if (const auto it = prefetched.find(file.filename().string()); it != prefetched.end()) {
+            data.resize(it->second.size() / sizeof(u32));
+            if (!data.empty()) {
+                std::memcpy(data.data(), it->second.data(), data.size() * sizeof(u32));
+            }
+            return;
+        }
     }
     return LoadVector(type, path, data);
 }
@@ -444,8 +587,10 @@ void DataBase::Reset() {
 }
 
 void DataBase::FinishPreload() {
+    // sotc: the preloaded files stay in memory for the session (~220 MB): a load reads them from
+    // there. Dropping them sent every later lookup to the disk, one small file at a time, while
+    // the game loaded a save from the same hard disk: the game stood still for 27 s (22 Oct).
     prefetch_active = false;
-    prefetched = {};
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         mz_zip_writer_init_from_reader(&zip_ar, cache_path.string().c_str());
         ar_is_read_only = false;

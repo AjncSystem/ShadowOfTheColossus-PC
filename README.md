@@ -1,7 +1,7 @@
 # Shadow of the Colossus — PC native port · v0.60.5-plus1
 
-**The original 0.60.3, plus CPUs without BMI1 (pre-Haswell), CPUs with 4 threads, 120 Hz
-fullscreen and a fix to test for AMD GCN cards (RX 470–590).** Everything in [AjncSystem's 0.60.3](https://github.com/AjncSystem/ShadowOfTheColossus-PC)
+**The original 0.60.5, plus CPUs without BMI1 (pre-Haswell), CPUs with 4 threads, 120 Hz
+fullscreen and a 32-lane fix for AMD GCN cards (RX 470–590, to test).** Everything in [AjncSystem's 0.60.5](https://github.com/AjncSystem/ShadowOfTheColossus-PC)
 (the game can be finished from start to end; the in-game menu with quick settings; textures on
 GTX 10xx cards, 60 FPS through the game's own 60 FPS mode, faster heap guards, HUD-less frame
 generation as an option, no crash with high quality textures and the smaller readback window, all
@@ -22,10 +22,12 @@ What it adds:
   than 8 logical processors nothing changes (sent to the original as
   [PR #198](https://github.com/AjncSystem/ShadowOfTheColossus-PC/pull/198)).
 - **AMD GCN cards (RX 470–590, Vega), to test:** white, flickering characters and smoke and fog
-  colours that change every run. These cards run the shaders 64 wide, and the port did not add the
-  LDS barriers the game needs there; now it does (`SOTC_AMD64_LDS=0` turns it off). Not tested on
-  a GCN card yet: tell us in issue #152 or #201 of the original (sent as
-  [PR #205](https://github.com/AjncSystem/ShadowOfTheColossus-PC/pull/205)).
+  colours that change every run. These cards run the shaders 64 wide. The port now lowers them to 32
+  lanes where the driver requires a 32-lane compute subgroup (`GPU: AMD wave32 on` in the log;
+  `SOTC_AMD_WAVE32=0` turns it off, `=1` forces it), and the LDS barriers are on for 64-wide AMD
+  (`SOTC_AMD64_LDS=0` turns them off). On an RX 570 on Windows the flicker went away. **Open:** some
+  GCN runs stop with a lost GPU device right after the first colossus (issues #187, #123 and #41 of
+  the original). If that happens to you, try `SOTC_AMD_WAVE32=0` and send `last_run.log`.
 - **Fullscreen at 120 Hz** on 144/165 Hz monitors, so every frame stays on screen as long (Anthonypc23).
 - The launcher's self-update follows this fork's releases; the launcher no longer stops when its
   console refuses writes (issue #104).

@@ -508,11 +508,17 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
     // frame, one after another, so while the GPU is idle anyway also bring along the other
     // regions read back recently ("hot" readbacks) that the GPU has modified since. The reads
     // that follow then find their data already on the CPU instead of each needing a sync.
-    // SOTC_RB_HOT=0: off, 1: same arena and small regions only, 2 (default): any existing arena,
-    // any size. Mode 2 halves the readback syncs in SotC's open world (~+20% fps).
+    // SOTC_RB_HOT=0 (default): off, 1: same arena and small regions only, 2: any existing arena,
+    // any size. sotc: off since 22 Oct. Those speculative copies land on memory the game may have
+    // reused since: rainbow, striped garbage on the Shrine's stones after loading a save again, and
+    // heap free lists corrupted (0x49500, the game closing "out of nowhere", once after 23 min idle
+    // in the title demo); with them off the user's recipe (a new area, then reload the save, 3
+    // times) stayed clean. Attract demo, full settings: 54.8 / 36.4 FPS off against ~57 / 40 with
+    // mode 2. Keeping the hot data aside until the guest reads it (no speculative writes) cost more
+    // than it saved (42.7 / 23.5): copying it on the command processor thread.
     static const int hot_mode = [] {
         const char* v = std::getenv("SOTC_RB_HOT");
-        return v ? std::atoi(v) : 2;
+        return v ? std::atoi(v) : 0;
     }();
     const bool hot_enabled = hot_mode != 0;
     const auto now = std::chrono::steady_clock::now();
@@ -563,7 +569,14 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
     }
 
     u64 total_size_bytes = 0;
-    for (const Region& region : regions) {
+    for (size_t region_index = 0; region_index < regions.size(); ++region_index) {
+        const Region& region = regions[region_index];
+        // sotc: a hot region (brought along, not asked for) skips the pages whose CPU bit is set:
+        // the guest may have written them since (repeat-fault grace leaves hot pages writable),
+        // and its bytes are the right ones. Applying the GPU copy there wrote what the GPU drew
+        // before the game reused the memory over new textures (rainbow garbage on the Shrine's
+        // stones after a save reload, 22 Oct; SOTC_RB_HOT=0 made it go away).
+        const bool hot_region = region_index > 0;
         ReadbackItem item{region.arena, region.addr, region.size, {}};
         const u64 total_before = total_size_bytes;
         const VAddr arena_base = region.arena->cpu_addr;
@@ -589,8 +602,30 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
                             total_size_bytes += Common::AlignUp(b - a, align);
                         });
                 };
-                gpu_modified_ranges.ForEachInRange(address, range_size, add_download);
-                item.gpu_ranges.emplace_back(address, range_size);
+                if (!hot_region) {
+                    gpu_modified_ranges.ForEachInRange(address, range_size, add_download);
+                    item.gpu_ranges.emplace_back(address, range_size);
+                    return;
+                }
+                // Page by page: runs of pages the CPU has not touched.
+                VAddr run_start = address;
+                const VAddr range_end = address + range_size;
+                const auto flush_run = [&](VAddr end) {
+                    if (end > run_start) {
+                        gpu_modified_ranges.ForEachInRange(run_start, end - run_start, add_download);
+                        item.gpu_ranges.emplace_back(run_start, end - run_start);
+                    }
+                };
+                for (VAddr page = address; page < range_end;) {
+                    const VAddr next = std::min(Common::AlignDown(page, 4_KB) + 4_KB, range_end);
+                    if (memory_tracker->IsRegionCpuModified(page, next - page)) {
+                        flush_run(page);
+                        run_start = next;
+                        SotcStats::rb_hot_cpu_skipped.fetch_add(next - page, std::memory_order_relaxed);
+                    }
+                    page = next;
+                }
+                flush_run(range_end);
             });
         if (item.copies.empty()) {
             if (subtract) {

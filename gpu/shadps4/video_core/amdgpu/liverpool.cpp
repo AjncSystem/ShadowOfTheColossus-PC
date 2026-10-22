@@ -496,6 +496,12 @@ void Liverpool::Process(std::stop_token stoken) {
 
             auto& queue = mapped_queues[curr_qid];
 
+            // sotc: skip the lock entirely for a queue that almost certainly has nothing queued
+            // (see GpuQueue::has_work) instead of taking m_access on every queue every pass.
+            if (!queue.has_work.load(std::memory_order_acquire)) {
+                continue;
+            }
+
             Task::Handle task{};
             {
                 std::scoped_lock lock{queue.m_access};
@@ -523,6 +529,7 @@ void Liverpool::Process(std::stop_token stoken) {
 
                 std::scoped_lock lock{queue.m_access};
                 queue.submits.pop();
+                queue.has_work.store(!queue.submits.empty(), std::memory_order_release);
 
                 --num_submits;
                 std::scoped_lock lock2{submit_mutex};
@@ -1734,6 +1741,7 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
+        queue.has_work.store(true, std::memory_order_release);
     }
 
     std::scoped_lock lk{submit_mutex};
@@ -1750,6 +1758,7 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
+        queue.has_work.store(true, std::memory_order_release);
     }
 
     std::scoped_lock lk{submit_mutex};

@@ -300,6 +300,19 @@ private:
         std::vector<u32> ccb_buffer;
         std::queue<Task::Handle> submits{};
         ComputeProgram cs_state{};
+        // sotc: lock-free hint for Process()'s round-robin so it can skip m_access entirely for
+        // queues with nothing queued, instead of locking every queue every pass just to find
+        // most of them empty. Set true under the lock on push, re-synced under the lock on pop;
+        // read without the lock as a hint only (a stale false just defers that queue to the next
+        // pass - num_submits keeps the outer loop going - a stale true costs one wasted lock).
+        //
+        // A single shared bitmask + bit-scan (std::countr_zero) to jump straight to the next
+        // queue with work, instead of this per-queue flag, measured *worse* here: it drains each
+        // batch faster, so submit_cv parks and wakes this thread more often for the same work,
+        // and each wake is a costlier kernel round-trip on Windows than the iterations it saves
+        // (own-code share 23.3%->16%, but ntdll wait share 37%->45%, reproduced over 2 runs).
+        // Keep the simpler per-queue hint; see git history for the bitmask version and numbers.
+        std::atomic<bool> has_work{false};
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
     u32 num_mapped_queues{1u}; // GFX is always available

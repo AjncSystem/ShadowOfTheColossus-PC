@@ -1221,9 +1221,17 @@ bool LoadingShown() {
     return now - last_flip_ms.load(std::memory_order_relaxed) >= 1000;
 }
 
+// sotc: a SOTC_MENU_TRIGGER / SOTC_SET_TRIGGER file waits (scripted tests): Render handles it.
+bool TriggerPending() {
+    static const char* menu = std::getenv("SOTC_MENU_TRIGGER");
+    static const char* set = std::getenv("SOTC_SET_TRIGGER");
+    std::error_code ec;
+    return (menu && std::filesystem::exists(menu, ec)) || (set && std::filesystem::exists(set, ec));
+}
+
 bool Visible() {
     return initialized && (menu_open || text_entry_active || list_active || OverlayOn() ||
-                           ToastShown() || LoadingShown());
+                           ToastShown() || LoadingShown() || TriggerPending());
 }
 
 bool CapturesInput() {

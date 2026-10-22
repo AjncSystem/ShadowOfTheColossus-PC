@@ -45,14 +45,14 @@ the menu is open; **Esc** or F1 closes it.
 
 ![In-game menu (F1)](docs/images/sotc-menu-f1-en.png)
 
-- **Quick settings (apply at once):** 60 FPS, frame generation, **texture quality**, far shadow
-  reuse, volume. They are also saved as the launcher's choice for the next start.
-- **Display & Window:** fullscreen, FPS counter, output resolution.
-- **Upscaler & sharpening:** upscaler, render preset, RCAS sharpening strength.
-- **Camera & Mouse:** mouse camera on/off, sensitivity, invert Y.
-- **Engine visuals:** atmospheric fog, vignette, ambient occlusion (SSAO), water reflections (these
-  apply on the next start).
-- The header shows FPS, frame time, the GPU and its video memory in use.
+- **Quick settings (apply at once):** FPS (30 / 60 / unlimited), upscaler (FSR 1 / bilinear),
+  sharpening (RCAS), frame generation, **texture quality**, far shadow reuse, volume. They are
+  also saved as the launcher's choice for the next start.
+- **Display:** fullscreen, FPS counter.
+- **Camera & mouse:** mouse camera on/off, sensitivity, invert Y.
+- The header shows FPS, frame time, the GPU and its video memory in use. Output resolution,
+  effects (fog, vignette, SSAO), 16x AF, PS4 Pro mode and video memory use stay in the launcher
+  (they apply when the game starts).
 
 | Key | What it does |
 |---|---|

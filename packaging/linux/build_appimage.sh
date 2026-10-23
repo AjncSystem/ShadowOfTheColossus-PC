@@ -22,7 +22,7 @@ app=$appdir/usr/share/sotc-pc
 mkdir -p "$app/bin/gpu" "$app/lib"
 install -m755 packaging/linux/AppRun "$appdir/AppRun"
 install -m644 sotc.py LICENSE "$app/"
-cp -r scripts patches "$app/"
+cp -r scripts "$app/"
 find "$app/scripts" -name __pycache__ -prune -exec rm -rf {} +
 install -m755 out/bb-probe "$app/bin/"
 install -m755 out/gpu/libbbgpu.so "$app/bin/gpu/"

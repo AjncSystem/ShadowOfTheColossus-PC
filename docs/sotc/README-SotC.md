@@ -1,6 +1,7 @@
 # Shadow of the Colossus — PC (port nativo)
 
-Port nativo do **Shadow of the Colossus** de PS4 (CUSA08809, versão EU 1.01) para Windows.
+Port nativo do **Shadow of the Colossus** de PS4 (CUSA08809, versão EU 1.01, ou CUSA08034,
+versão US 1.00) para Windows.
 O código do jogo roda direto na CPU. Isto não é um emulador completo: há um carregador e as
 funções de sistema de que o jogo precisa. A GPU usa o núcleo de vídeo Vulkan do fork
 shadPS4 SotC. A base é o [bloodborne_pc](https://github.com/Supermedo/bloodborne_pc) (GPL-2.0).
@@ -12,7 +13,7 @@ Este pacote **não contém o jogo nem firmware da Sony**. Você precisa ter os s
 - Windows 10/11 64-bit e GPU com Vulkan 1.3.
 - Python não é necessário para o `SotC.exe`; só o `SotC.bat` precisa de
   [Python 3](https://www.python.org/downloads/).
-- O **seu dump** do jogo CUSA08809 (pasta com `eboot.bin`, `sce_module`, `sce_sys`...).
+- O **seu dump** do jogo CUSA08809 ou CUSA08034 (pasta com `eboot.bin`, `sce_module`, `sce_sys`...).
 - Para ter som, `libSceNgs2.sprx` e `libSceUlt.sprx` do **seu próprio console**, decriptados.
   São os mesmos arquivos da pasta `user/sys_modules` do shadPS4; num PS4 com GoldHEN ficam em
   `/system/common/lib/` (FTP na porta 2121). Sem eles o jogo funciona, mas sem som.
@@ -21,7 +22,7 @@ Este pacote **não contém o jogo nem firmware da Sony**. Você precisa ter os s
 
 1. Abra `SotC.exe`, o lançador.
 2. Na primeira vez ele **procura sozinho** nos discos do PC:
-   - a pasta do jogo (CUSA08809);
+   - a pasta do jogo (CUSA08809 ou CUSA08034);
    - os dois `.sprx` de som de um shadPS4 instalado (pasta `user/sys_modules`), que ele copia
      para a pasta de dados do port;
    - um save do jogo no shadPS4, que ele oferece importar;
@@ -60,7 +61,9 @@ Tudo isto está no lançador, na página **Imagem e FPS** (e os principais em **
 - **Cvars do motor** (Avançado): variáveis do motor Bluepoint, `NOME=valor`, para quem quer
   experimentar.
 
-Os modos de patch só valem para a versão EU 1.01; em outra versão eles não são aplicados.
+Os modos de patch valem para a versão EU 1.01 e para a US 1.00 (o executável é o mesmo); em
+outra versão eles não são aplicados. Cada versão tem os seus saves (`user/savedata/1/CUSA08809`
+ou `CUSA08034`) e só usa DLCs da mesma região.
 
 ## Controles
 

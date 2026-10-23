@@ -11,8 +11,8 @@
 **Status: the game can be finished from start to end** (v0.60.3: played through the last
 colossus, the ending and the credits, with high quality textures, PS4 Pro mode and 60 FPS on).
 
-A native Windows port of the PS4 **Shadow of the Colossus** (Bluepoint, 2018; CUSA08809, EU 1.01)
-for **Windows 10/11**. The game's own x86-64 code runs directly on the PC's CPU and the PS4 GPU
+A native Windows port of the PS4 **Shadow of the Colossus** (Bluepoint, 2018; CUSA08809 EU 1.01 or
+CUSA08034 US 1.00) for **Windows 10/11**. The game's own x86-64 code runs directly on the PC's CPU and the PS4 GPU
 is translated to Vulkan. It is not a full emulator: it is a loader with the system functions the
 game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodborne_pc).
 
@@ -95,7 +95,7 @@ In the launcher (**Quick settings → Textures**) and in the in-game menu (chang
 
 1. Download `SotC-PC.zip` from [Releases](../../releases) and unzip it into a folder.
 2. Run **`SotC.exe`**. On first start the launcher searches the PC's drives for:
-   - the game folder (the CUSA08809 dump with `eboot.bin`, `sce_module` and `sce_sys`);
+   - the game folder (the CUSA08809 or CUSA08034 dump with `eboot.bin`, `sce_module` and `sce_sys`);
    - the sound modules (`libSceNgs2.sprx` and `libSceUlt.sprx`) of an installed shadPS4
      (`user/sys_modules`), which it copies to the port's data folder;
    - a shadPS4 save of the game, which it offers to import;
@@ -108,10 +108,12 @@ driver). No Python install needed.
 
 | What | Where from | What for |
 |---|---|---|
-| CUSA08809 game dump (EU 1.01 preferred) | your PS4, through GoldHEN | the game |
+| CUSA08809 (EU 1.01) or CUSA08034 (US 1.00) game dump | your PS4, through GoldHEN | the game |
 | decrypted `libSceNgs2.sprx`, `libSceUlt.sprx` | your PS4 (`/system/common/lib/`, GoldHEN FTP), or shadPS4's `user/sys_modules` | sound (silent without them) |
 
-The patch modes (60 FPS, 16x filtering) only apply to EU 1.01; other versions run at 30 FPS.
+The patch modes (60 FPS, 16x filtering) apply to EU 1.01 and US 1.00 (the same executable);
+other versions run at 30 FPS. Each release keeps its own saves (`user/savedata/1/<title ID>`),
+and only DLC of the same region is used.
 
 ### Launcher features
 

@@ -81,6 +81,11 @@ bool SuperResolution();
 
 /// DLSS Super Resolution works on this device, also while F9 has it switched off.
 bool SuperResolutionAvailable();
+/// sotc: HDR output: the composite's scene keeps highlights above 1.0 (presenter thread).
+void SetHdr(bool hdr);
+/// sotc: the exponent of the game's HDR composite (1.0 on the splash and menus, 1.42 in game).
+void NoteHdrCurve(float k);
+float HdrCurve();
 
 /// SOTC_DLSS_COMPARE=1 (launcher debug option): F9 compares DLSS with FSR1, a label shows which.
 bool CompareMode();

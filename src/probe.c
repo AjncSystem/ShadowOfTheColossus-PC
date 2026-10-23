@@ -1163,6 +1163,9 @@ static void choose_heap(void) {
     fprintf(stderr,"Runtime: BPE heap guard on heap %p (%d of %d frees)\n",(void *)best,best_count,HEAP_HOOK_CALLS);
 }
 uintptr_t runtime_sotc_heap(void) { return heap_chosen; }
+/* The engine's heap table (#146, see the Windows version). */
+#define HEAP_TABLE_OFFSET 0x2dfaab0
+uintptr_t runtime_sotc_heap_table(void) { return heap_chosen ? (uintptr_t)(image+HEAP_TABLE_OFFSET) : 0; }
 static int heap_hook_trap(ucontext_t *uc) {
     greg_t *g=uc->uc_mcontext.gregs;
     /* The single step comes first: after the restored push rbp (1 byte) RIP is the hook + 1,

@@ -13,6 +13,7 @@ so a packaged port needs no Python installation.
 import ctypes
 import json
 import os
+import platform
 from pathlib import Path
 import queue
 import runpy
@@ -37,7 +38,7 @@ CONFIG_DIR = PORT_DIR / 'user'
 CONFIG_FILE = CONFIG_DIR / 'launcher_settings.json'
 GAME_ID, GAME_VERSION = 'CUSA08809', '01.01'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.60.4-opt9'
+VERSION = '0.60.6-opt10'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -60,6 +61,32 @@ def attach_stdio():
             except OSError:
                 stream = None
         setattr(sys, name, stream or open(os.devnull, 'w'))
+    # An inherited handle can exist and still refuse writes ("[Errno 22] Invalid argument" from a
+    # print in link_modules.py, issue #104 upstream): this output is informational, so a failed
+    # write drops the stream instead of aborting the preparation.
+    for name in ('stdout', 'stderr'):
+        setattr(sys, name, _TolerantStream(getattr(sys, name)))
+
+
+class _TolerantStream:
+    def __init__(self, stream):
+        self._stream = stream
+
+    def write(self, text):
+        try:
+            return self._stream.write(text)
+        except (OSError, ValueError):
+            self._stream = open(os.devnull, 'w')
+            return len(text)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except (OSError, ValueError):
+            pass
+
+    def __getattr__(self, attr):
+        return getattr(self._stream, attr)
 
 
 def run_role(argv):
@@ -128,7 +155,7 @@ def windows_language():
 # Settings, passed to sotc.py as environment variables.
 
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
-                'user_dir': '', 'af16': True, 'hq_textures': True, 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
+                'user_dir': '', 'af16': True, 'textures': 'high', 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
                 'readbacks': '', 'extra_env': '', 'close_on_play': False, 'gamepad': '',
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
@@ -233,6 +260,11 @@ BUTTON_ICONS = [('ps', ('PlayStation (do jogo)', 'PlayStation (the game\'s)')),
 FPS_MODES = [('30', ('30 FPS (como no PS4)', '30 FPS (as on PS4)')),
              ('60', ('60 FPS (modo 60 do jogo)', "60 FPS (the game's 60 FPS mode)")),
              ('unlimited', ('Ilimitado (acima de 60)', 'Unlimited (above 60)'))]
+# Texture level (#235): off (the game's 256x256 mips), high (fine mips streamed, coarser while the
+# game's page pool is low) or maximum (always fine; may close in very wide views in PS4 Pro mode).
+TEXTURES = [('off', ('Desligada', 'Off')),
+            ('high', ('Alta (estável)', 'High (stable)')),
+            ('max', ('Máxima (nítida, pode fechar no modo Pro)', 'Maximum (sharp, may close in Pro mode)'))]
 # Frame generation (bb-probe: SOTC_FRAMEGEN; F8 in game switches off / DLSS-G / FSR 3).
 FRAMEGEN = [('off', ('Desligada', 'Off')),
             ('auto', ('Automática (DLSS-G ou FSR 3, experimental)', 'Automatic (DLSS-G or FSR 3, experimental)')),
@@ -363,6 +395,71 @@ def keep_crash_log(log_dir, code):
         pass
 
 
+def start_event_log(log_dir, settings, env):
+    """user/events.log: one line per event of the session (src/runtime_event.h), for players and
+    developers to read. The launcher writes the header (date, version, system, every setting in
+    words) and the game appends its events (SOTC_EVENT_LOG). The last 5 sessions are kept."""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(LOGS_KEPT - 1, 0, -1):
+        older = log_dir / ('events.log' if i == 1 else f'events.{i - 1}.log')
+        if older.is_file():
+            try:
+                os.replace(older, log_dir / f'events.{i}.log')
+            except OSError:
+                pass
+    path = log_dir / 'events.log'
+    words = lambda table, key, default='': dict((k, _(*v)) for k, v in table).get(settings.get(key) or default, str(settings.get(key)))
+    on_off = lambda value: _('ligado', 'on') if value else _('desligado', 'off')
+    lines = [
+        _('Shadow of the Colossus PC {} - sessão de {}', 'Shadow of the Colossus PC {} - session of {}').format(
+            VERSION, time.strftime('%Y-%m-%d %H:%M:%S')),
+        _('Windows {} | jogo: {}', 'Windows {} | game: {}').format(platform.version(), settings.get('game_dir') or '?'),
+        _('Saída: {} | Upscaler: {} | Nitidez: {}', 'Output: {} | Upscaler: {} | Sharpening: {}').format(
+            words(OUTPUTS, 'output_res', '1920x1080'), words(UPSCALERS, 'upscaler', 'fsr1'), words(SHARPNESS, 'sharpness', '250')),
+        _('FPS: {} | Texturas: {} | Filtro 16x: {} | Modo PS4 Pro: {}', 'FPS: {} | Textures: {} | 16x filtering: {} | PS4 Pro mode: {}').format(
+            words(FPS_MODES, 'fps_mode', '30'), words(TEXTURES, 'textures', 'high'), on_off(settings.get('af16')),
+            on_off(env.get('SOTC_NEO') == '1')),
+        _('Geração de quadros: {} | Memória de vídeo: {} | Sombras distantes: {} | Volume: {}%',
+          'Frame generation: {} | Video memory use: {} | Far shadows: {} | Volume: {}%').format(
+            words(FRAMEGEN, 'framegen', 'off'), words(VRAM_USE, 'vram_use', 'normal'),
+            on_off(str(settings.get('shadow_reuse') or '0') != '0'), settings.get('volume') or '100'),
+        _('Tela cheia: {} | Câmera pelo mouse: {} | Controle preferido: {} | Variáveis extras: {}',
+          'Fullscreen: {} | Mouse camera: {} | Preferred controller: {} | Extra variables: {}').format(
+            on_off(settings.get('fullscreen')), on_off(settings.get('mouse', True)),
+            settings.get('gamepad') or _('qualquer', 'any'), settings.get('extra_env') or _('nenhuma', 'none')),
+    ]
+    if env.get('SOTC_NOTE'):
+        lines.append(_('Aviso: {}', 'Note: {}').format(env['SOTC_NOTE']))
+    try:
+        with open(path, 'w', encoding='utf-8') as out:
+            for line in lines:
+                out.write(f'[00:00:00.000] [CONFIG  ] {line}' + chr(10))
+    except OSError:
+        return ''
+    return str(path)
+
+
+def end_event_log(log_dir, code, stopped=False):
+    """The end of the session in user/events.log; after a crash its copy goes to user/crashes."""
+    path = log_dir / 'events.log'
+    if code == 0 or stopped:
+        text = _('Jogo fechado normalmente', 'Game closed normally') if code == 0 else _('Jogo parado pelo lançador', 'Game stopped by the launcher')
+    elif code & 0xffffffff == 3:
+        text = _('O jogo caiu (código 3): o motivo está na linha ERROR acima e no log da sessão',
+                 'The game crashed (code 3): the reason is in the ERROR line above and in the session log')
+    else:
+        text = _('O jogo terminou com erro (código {:#x})', 'The game ended with an error (code {:#x})').format(code & 0xffffffff)
+    try:
+        with open(path, 'a', encoding='utf-8') as out:
+            out.write(f'[--:--:--.---] [SESSION ] {text}' + chr(10))
+        if code != 0 and not stopped:
+            crashes = log_dir / 'crashes'
+            crashes.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, crashes / (time.strftime('%Y-%m-%d_%H-%M-%S') + f'_{code & 0xffffffff:#x}_events.log'))
+    except OSError:
+        pass
+
+
 def short_path(path):
     """A path for display: relative to the port folder when inside it, else as is."""
     try:
@@ -393,6 +490,8 @@ def load_settings():
     settings = {**APP_DEFAULTS, **saved}
     if 'fps_mode' not in saved:  # before the choice: the "uncapped FPS" box
         settings['fps_mode'] = '60' if saved.get('fps60') else '30'
+    if 'textures' not in saved:  # before the levels: the "high quality textures" box
+        settings['textures'] = 'high' if saved.get('hq_textures', True) else 'off'
     if 'framegen' not in saved:
         extra = str(settings.get('extra_env', '')).split()
         if 'SOTC_DLSSG=1' in extra:
@@ -496,8 +595,16 @@ def game_environment(s):
     # sotc: high quality textures: the texture banks sampled since the last report read as sampled
     # (sotc_lod_stats.h; before, none ever did and the game never streamed its fine mips: blurry
     # leaves and rocks). Off: the old behaviour, for cards short of video memory.
-    if s.get('hq_textures', True):
+    textures = s.get('textures') or 'high'
+    if textures != 'off':
         env.setdefault('SOTC_LOD_LINGER', '1')
+    if textures == 'max' and env['SOTC_NEO'] == '1':
+        # sotc: in PS4 Pro mode "Maximum" exhausted the game's page pool within minutes at the
+        # Shrine (0x1a371, user, 22 Oct): High there.
+        textures = 'high'
+        env['SOTC_NOTE'] = 'Texture quality Maximum is not used in PS4 Pro mode: High'
+    if textures == 'max':  # sotc: without the page pool switch (sotc_lod_stats.h)
+        env.setdefault('SOTC_LOD_POOL_LOW', '0')
     if s.get('button_icons') == 'xbox' and (PORT_DIR / 'glyphs' / 'xbox').is_dir():
         env['SOTC_TEX_REPLACE'] = str(PORT_DIR / 'glyphs' / 'xbox')
     env['SOTC_UI_LANG'] = s.get('ui_language') or windows_language()  # overlay and F7/F8 texts
@@ -925,11 +1032,11 @@ class Launcher:
         self.row(quick, _('Nitidez (RCAS)', 'Sharpening (RCAS)'), self.choice(quick, 'sharpness', SHARPNESS, 24))
         self.row(quick, _('Geração de quadros', 'Frame generation'), self.choice(quick, 'framegen', FRAMEGEN, 24))
         self.row(quick, _('FPS', 'FPS'), self.choice(quick, 'fps_mode', FPS_MODES, 24))
+        self.row(quick, _('Texturas', 'Textures'), self.choice(quick, 'textures', TEXTURES, 24))
         self.check(quick, 'af16', _('Texturas nítidas (filtro 16x)', 'Sharp textures (16x filtering)'))
-        self.check(quick, 'hq_textures', _('Texturas em alta qualidade', 'High quality textures'))
         self.check(quick, 'fullscreen', _('Tela cheia', 'Fullscreen'))
         self.check(quick, 'neo', _('Modo PS4 Pro', 'PS4 Pro mode'))
-        for key in ('af16', 'hq_textures', 'fps_mode', 'fullscreen', 'neo', 'output_res', 'upscaler', 'sharpness', 'framegen'):
+        for key in ('af16', 'textures', 'fps_mode', 'fullscreen', 'neo', 'output_res', 'upscaler', 'sharpness', 'framegen'):
             self.vars[key].trace_add('write', lambda *_a: self.refresh_status())
 
     def draw_banner(self):
@@ -1811,7 +1918,9 @@ class Launcher:
             self.append(_('Não foi possível gravar as teclas no sotc.ini: {}',
                           'Could not write the keys to sotc.ini: {}').format(error) + '\n')
         try:
-            self.process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=game_environment(self.app),
+            env = game_environment(self.app)
+            env['SOTC_EVENT_LOG'] = start_event_log(user_dir(self.app), self.app, env)
+            self.process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=env,
                                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                             stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
         except OSError as error:
@@ -1851,11 +1960,12 @@ class Launcher:
                 pass
             if not self.stopping:
                 keep_crash_log(log_dir, code)
+            end_event_log(log_dir, code, self.stopping)
         self.stopping = False
         self.output.put((code,))
 
     # Quick settings the in-game menu may have changed (it writes them to the settings file).
-    LIVE_KEYS = ('fps_mode', 'framegen', 'hq_textures', 'shadow_reuse', 'volume')
+    LIVE_KEYS = ('fps_mode', 'framegen', 'textures', 'shadow_reuse', 'volume', 'upscaler', 'sharpness')
 
     def reload_live_settings(self):
         saved = load_json(CONFIG_FILE, {})
@@ -2071,8 +2181,10 @@ def play_without_window(settings):
         write_key_bindings(settings.get('keys'))
     except OSError:
         pass
+    env = game_environment(settings)
+    env['SOTC_EVENT_LOG'] = start_event_log(log_dir, settings, env)
     with open_session_log(log_dir) as log:
-        process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=game_environment(settings),
+        process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=env,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
         for raw in iter(process.stdout.readline, b''):
@@ -2085,6 +2197,7 @@ def play_without_window(settings):
         code = process.wait()
         log.write(f'[exit code {code} = {code & 0xffffffff:#x}]\n')
     keep_crash_log(log_dir, code)
+    end_event_log(log_dir, code)
     return code
 
 

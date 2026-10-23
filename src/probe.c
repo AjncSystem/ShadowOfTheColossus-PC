@@ -7,6 +7,7 @@
 #include <inttypes.h>
 #include <cpuid.h>
 #include "runtime.h"
+#include "runtime_event.h"
 #include "gpu/bbgpu.h"
 #include "gpu/sotc/sotc_patches.h"
 #if !defined(__x86_64__) || !defined(__GNUC__)
@@ -14,6 +15,7 @@
 #endif
 #ifdef _WIN32
 #include <windows.h>
+#include <winioctl.h>
 #include <dbghelp.h>
 #include <tlhelp32.h>
 #include <wchar.h>
@@ -253,45 +255,200 @@ static void dump_thread_stacks(void) {
             WideCharToMultiByte(CP_UTF8,0,wide,-1,name,sizeof(name),NULL,NULL);
             LocalFree(wide);
         }
+        /* sotc: only registers and raw stack words are read while the thread is suspended
+         * (syscalls, no locks); describing and printing wait until it runs again. stdio, the heap
+         * or the loader lock (GetModuleHandleEx) held by the suspended thread would otherwise
+         * block this one for good, and the watchdog would freeze the game it reports on. */
+        static uintptr_t chain[24], words[0x3000/8];
+        int chain_count=0, word_count=0, captured=0;
+        CONTEXT c={.ContextFlags=CONTEXT_CONTROL|CONTEXT_INTEGER};
         if (SuspendThread(thread)!=(DWORD)-1) {
-            CONTEXT c={.ContextFlags=CONTEXT_CONTROL|CONTEXT_INTEGER};
             if (GetThreadContext(thread,&c)) {
-                char where[MAX_PATH+64];
-                describe_address(where,sizeof(where),(uintptr_t)c.Rip);
-                fprintf(stderr,"thread %lu '%s': rip %s rsp=%016llx\n",entry.th32ThreadID,name,where,c.Rsp);
+                captured=1;
                 uintptr_t rbp=(uintptr_t)c.Rbp, frame[2];
-                for (int depth=0;depth<24 && rbp;++depth) {
+                while (chain_count<24 && rbp) {
                     if (!read_word(rbp,&frame[0]) || !read_word(rbp+8,&frame[1]) || !frame[1]) break;
-                    describe_address(where,sizeof(where),frame[1]);
-                    fprintf(stderr,"    #%d %s\n",depth,where);
+                    chain[chain_count++]=frame[1];
                     if (frame[0]<=rbp) break;
                     rbp=frame[0];
                 }
-                /* Guest and loader return addresses near the top of the stack (frames without
-                 * rbp); loader ones as exe offsets for llvm-addr2line (ImageBase 0x140000000). */
-                int found=0, host=0;
-                const uintptr_t exe=(uintptr_t)GetModuleHandleA(NULL);
-                for (uintptr_t at=(uintptr_t)c.Rsp; at<(uintptr_t)c.Rsp+0x3000 && found<14+host; at+=8) {
-                    uintptr_t value;
-                    if (!read_word(at,&value)) break;
-                    if (image && value-(uintptr_t)image<0x4000000) {
-                        fprintf(stderr,"    [rsp+0x%llx] guest 0x%llx\n",(unsigned long long)(at-c.Rsp),
-                                (unsigned long long)(value-(uintptr_t)image));
-                        ++found;
-                    } else if (host<24 && value-exe>0x1000 && value-exe<0x4000000) {
-                        fprintf(stderr,"    [rsp+0x%llx] exe 0x%llx\n",(unsigned long long)(at-c.Rsp),
-                                (unsigned long long)(value-exe+0x140000000ull));
-                        ++host;
-                    }
-                }
+                while (word_count<(int)(sizeof(words)/sizeof(words[0])) &&
+                       read_word((uintptr_t)c.Rsp+(uintptr_t)word_count*8,&words[word_count])) ++word_count;
             }
             ResumeThread(thread);
+        }
+        if (captured) {
+            char where[MAX_PATH+64];
+            describe_address(where,sizeof(where),(uintptr_t)c.Rip);
+            fprintf(stderr,"thread %lu '%s': rip %s rsp=%016llx\n",entry.th32ThreadID,name,where,c.Rsp);
+            for (int depth=0;depth<chain_count;++depth) {
+                describe_address(where,sizeof(where),chain[depth]);
+                fprintf(stderr,"    #%d %s\n",depth,where);
+            }
+            /* Guest and loader return addresses near the top of the stack (frames without
+             * rbp); loader ones as exe offsets for llvm-addr2line (ImageBase 0x140000000). */
+            int found=0, host=0;
+            const uintptr_t exe=(uintptr_t)GetModuleHandleA(NULL);
+            for (int k=0; k<word_count && found<14+host; ++k) {
+                const uintptr_t value=words[k];
+                if (image && value-(uintptr_t)image<0x4000000) {
+                    fprintf(stderr,"    [rsp+0x%llx] guest 0x%llx\n",(unsigned long long)k*8,
+                            (unsigned long long)(value-(uintptr_t)image));
+                    ++found;
+                } else if (host<24 && value-exe>0x1000 && value-exe<0x4000000) {
+                    fprintf(stderr,"    [rsp+0x%llx] exe 0x%llx\n",(unsigned long long)k*8,
+                            (unsigned long long)(value-exe+0x140000000ull));
+                    ++host;
+                }
+            }
         }
         CloseHandle(thread);
     }
     CloseHandle(snapshot);
     fprintf(stderr,"STACKS: end\n");
     fflush(stderr);
+}
+/* sotc: SOTC_PEEK=<image offset>[,<offset>...]: after SOTC_PEEK_DELAY s (default 40) prints
+ * 0xd8 bytes at each offset as 32-bit words (reading engine globals such as cvars). */
+static DWORD WINAPI peek_thread(void *list) {
+    const char *d=getenv("SOTC_PEEK_DELAY");
+    Sleep((DWORD)(d ? atoi(d) : 40)*1000u);
+    char buffer[512];
+    snprintf(buffer,sizeof(buffer),"%s",(const char *)list);
+    for (char *item=strtok(buffer,","); item; item=strtok(NULL,",")) {
+        const uintptr_t at=(uintptr_t)image+(uintptr_t)strtoull(item,NULL,16);
+        uint32_t words[0xd8/4];
+        SIZE_T n=0;
+        if (!ReadProcessMemory(GetCurrentProcess(),(const void *)at,words,sizeof(words),&n) || n!=sizeof(words)) continue;
+        fprintf(stderr,"SOTC PEEK %s:",item);
+        for (size_t k=0;k<sizeof(words)/4;++k) fprintf(stderr," %x",words[k]);
+        fprintf(stderr,"\n");
+    }
+    fflush(stderr);
+    return 0;
+}
+/* sotc: the session's system in the event log: CPU, RAM, threads and whether the game's folder is
+ * on a hard disk (seek penalty: new areas stall on scattered reads there) or an SSD. */
+static void event_session_start(const char *app0) {
+    unsigned regs[12]={0};
+    char cpu[49]="?";
+    unsigned max_ext=0;
+    __cpuid(0x80000000,max_ext,regs[1],regs[2],regs[3]);
+    if (max_ext>=0x80000004) {
+        for (unsigned i=0;i<3;++i) __cpuid(0x80000002+i,regs[i*4],regs[i*4+1],regs[i*4+2],regs[i*4+3]);
+        memcpy(cpu,regs,48); cpu[48]=0;
+        char *p=cpu; while (*p==' ') ++p;
+        memmove(cpu,p,strlen(p)+1);
+    }
+    MEMORYSTATUSEX mem={.dwLength=sizeof(mem)};
+    GlobalMemoryStatusEx(&mem);
+    const char *disk=SOTC_T("desconhecido","unknown");
+    if (app0 && app0[0] && app0[1]==':') {
+        char volume[16];
+        snprintf(volume,sizeof(volume),"\\\\.\\%c:",app0[0]);
+        HANDLE h=CreateFileA(volume,0,FILE_SHARE_READ|FILE_SHARE_WRITE,NULL,OPEN_EXISTING,0,NULL);
+        if (h!=INVALID_HANDLE_VALUE) {
+            STORAGE_PROPERTY_QUERY query={.PropertyId=StorageDeviceSeekPenaltyProperty,.QueryType=PropertyStandardQuery};
+            DEVICE_SEEK_PENALTY_DESCRIPTOR seek={0};
+            DWORD got=0;
+            if (DeviceIoControl(h,IOCTL_STORAGE_QUERY_PROPERTY,&query,sizeof(query),&seek,sizeof(seek),&got,NULL) &&
+                got>=sizeof(seek))
+                disk=seek.IncursSeekPenalty ? SOTC_T("HD (disco mecânico: lugares novos podem travar)",
+                                                     "HDD (spinning disk: new areas may stall)") : "SSD";
+            CloseHandle(h);
+        }
+    }
+    sotc_event("SESSION",SOTC_T("CPU: %s | %lu threads | RAM: %llu GB | pasta do jogo: %s (%s)",
+                                "CPU: %s | %lu threads | RAM: %llu GB | game folder: %s (%s)"),
+               cpu,(unsigned long)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS),
+               (unsigned long long)((mem.ullTotalPhys+(1ull<<29))>>30),app0 ? app0 : "?",disk);
+}
+/* sotc: read-ahead of the game's archives (SOTC_PREFETCH=0 turns it off). A new area makes the
+ * game read many scattered pieces of pakN.psarc (12 GB); on a hard disk each waits for a seek and
+ * the frame stalls (54 ms of 83 in "io" on the user's HDD, FPS down to 5). Once the game has
+ * shown 20 s of frames the *.psarc files are read once, in order (~150 MB/s on a HDD), with a low
+ * I/O priority hint so the game's own reads go first; Windows keeps them in its file cache (RAM), and later
+ * reads of the game come from memory. Skipped when they are more than half the RAM. */
+static char prefetch_dir[1024];
+static DWORD WINAPI prefetch_thread(void *unused) {
+    (void)unused;
+    /* Not while the shader cache loads (thousands of small files, on the same disk as a rule: the
+     * boot's loading screen took 2 minutes instead of 2 s with both; the game's logos already
+     * flip then): once the preload is over and 20 s of game frames came after it. */
+    while (!bbgpu_warmup_finished()) Sleep(500);
+    const uint64_t after=bbgpu_flip_count()+1200;
+    while (bbgpu_flip_count()<after) Sleep(1000);
+    char pattern[1100];
+    snprintf(pattern,sizeof(pattern),"%s\\*.psarc",prefetch_dir);
+    WIN32_FIND_DATAA found;
+    HANDLE find=FindFirstFileA(pattern,&found);
+    if (find==INVALID_HANDLE_VALUE) return 0;
+    char names[64][MAX_PATH]; unsigned long long sizes[64]; int count=0;
+    unsigned long long total=0;
+    do {
+        if (count<64 && !(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            snprintf(names[count],MAX_PATH,"%s",found.cFileName);
+            sizes[count]=((unsigned long long)found.nFileSizeHigh<<32)|found.nFileSizeLow;
+            total+=sizes[count++];
+        }
+    } while (FindNextFileA(find,&found));
+    FindClose(find);
+    MEMORYSTATUSEX mem={.dwLength=sizeof(mem)};
+    if (!GlobalMemoryStatusEx(&mem) || total>mem.ullTotalPhys/2) {
+        fprintf(stderr,"SOTC prefetch: skipped (%llu MiB of archives, %llu MiB of RAM)\n",total>>20,
+                (unsigned long long)(mem.ullTotalPhys>>20));
+        return 0;
+    }
+    /* The small archives first (boot and common data), then the big one. */
+    for (int i=0;i<count;++i) for (int j=i+1;j<count;++j) if (sizes[j]<sizes[i]) {
+        unsigned long long s=sizes[i]; sizes[i]=sizes[j]; sizes[j]=s;
+        char t[MAX_PATH]; memcpy(t,names[i],MAX_PATH); memcpy(names[i],names[j],MAX_PATH); memcpy(names[j],t,MAX_PATH);
+    }
+    SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_LOWEST);
+    const DWORD chunk=4u<<20;
+    void *buffer=VirtualAlloc(NULL,chunk,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
+    if (!buffer) return 0;
+    const DWORD start=GetTickCount();
+    unsigned long long done=0;
+    for (int i=0;i<count;++i) {
+        char path[1400];
+        snprintf(path,sizeof(path),"%s\\%s",prefetch_dir,names[i]);
+        HANDLE f=CreateFileA(path,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,
+                             OPEN_EXISTING,FILE_FLAG_SEQUENTIAL_SCAN,NULL);
+        if (f==INVALID_HANDLE_VALUE) continue;
+        FILE_IO_PRIORITY_HINT_INFO hint={.PriorityHint=IoPriorityHintLow};
+        SetFileInformationByHandle(f,FileIoPriorityHintInfo,&hint,sizeof(hint));
+        DWORD n=0;
+        while (ReadFile(f,buffer,chunk,&n,NULL) && n) done+=n;
+        CloseHandle(f);
+    }
+    VirtualFree(buffer,0,MEM_RELEASE);
+    sotc_event("DISK",SOTC_T("Arquivos do jogo lidos antecipadamente: %llu MiB em %.1f s (agora vêm da RAM)",
+                             "Game archives read ahead: %llu MiB in %.1f s (now served from RAM)"),done>>20,
+               (GetTickCount()-start)/1000.0);
+    return 0;
+}
+/* sotc: hang watchdog (SOTC_WATCHDOG=0 turns it off). Now and then the game stops presenting for
+ * good: no flip, PS4SyncEvent waits growing, the player has to close it (user, 20 Oct). It could
+ * not be caught on purpose (8 attract runs without one), so after 15 s without a game frame the
+ * thread stacks go to the log once per stall, like BB_STACKS_TRIGGER. */
+static DWORD WINAPI hang_watchdog(void *unused) {
+    (void)unused;
+    uint64_t last=0;
+    int still=0, dumped=0;
+    for (;;) {
+        Sleep(1000);
+        const uint64_t flips=bbgpu_flip_count();
+        if (flips!=last || flips<100) { last=flips; still=0; dumped=0; continue; }
+        if (++still>=15 && !dumped) {
+            dumped=1;
+            sotc_event("ERROR",SOTC_T("Jogo parado: nenhum quadro há %d s (pilhas das threads no log da sessão)",
+                                      "Game stalled: no frame for %d s (thread stacks in the session log)"),still);
+            fprintf(stderr,"SOTC WATCHDOG: no game frame for %d s (flips %llu); thread stacks:\n",still,(unsigned long long)flips);
+            dump_thread_stacks();
+        }
+    }
+    return 0;
 }
 /* sotc: SOTC_PROFILE=<thread name part>: samples that thread every ~1 ms (SuspendThread +
  * GetThreadContext) from SOTC_PROFILE_DELAY (default 20) s for SOTC_PROFILE_SECONDS (default 15)
@@ -490,6 +647,22 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
                 (void *)record->ExceptionInformation[1],where,GetCurrentThreadId());
     else
         fprintf(stderr,"Fault: exception 0x%08lx at %s (thread %lu)\n",record->ExceptionCode,where,GetCurrentThreadId());
+    {
+        /* sotc: the event log names the known faults (runtime_event.h). */
+        const uintptr_t offset=(uintptr_t)c->Rip-(uintptr_t)image;
+        const char *meaning=NULL;
+        if (image && offset==0x1a371)
+            meaning=SOTC_T("memória de páginas de textura do jogo esgotada (texturas Máxima ou vistas muito amplas)",
+                           "the game's texture page pool ran out (Maximum textures or very wide views)");
+        else if (image && (offset==0x49500 || offset==0x12c2b))
+            meaning=SOTC_T("lista de memória livre de um heap do jogo corrompida (escrita da GPU sobre memória reaproveitada)",
+                           "a game heap's free list was corrupted (a GPU write over reused memory)");
+        else if (image && offset==0xa5d064)
+            meaning=SOTC_T("o jogo não achou um arquivo dele ao iniciar (abra de novo)",
+                           "the game did not find one of its files at start (start it again)");
+        sotc_event("ERROR",SOTC_T("Queda em %s%s%s (código 0x%08lx)","Crash at %s%s%s (code 0x%08lx)"),where,
+                   meaning ? ": " : "",meaning ? meaning : "",record->ExceptionCode);
+    }
     fprintf(stderr,"  rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n  rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n",
             c->Rax,c->Rbx,c->Rcx,c->Rdx,c->Rsi,c->Rdi,c->Rbp,c->Rsp);
     fprintf(stderr,"  r8=%016llx r9=%016llx r10=%016llx r11=%016llx\n  r12=%016llx r13=%016llx r14=%016llx r15=%016llx\n",
@@ -1075,6 +1248,9 @@ int main(int argc, char **argv) {
 #endif
     if (app0) {
         runtime_file_configure(app0, user_dir ? user_dir : "user");
+#ifdef _WIN32
+        event_session_start(app0);
+#endif
         char sfo[4096], id[16]="";
         snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0);
         if (sfo_value(sfo,"INSTALL_DIR_SAVEDATA",id,sizeof(id),NULL) || sfo_value(sfo,"TITLE_ID",id,sizeof(id),NULL))
@@ -1334,6 +1510,13 @@ int main(int argc, char **argv) {
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
     entered_game=1;
 #ifdef _WIN32
+    if (gpu_enabled && !(getenv("SOTC_WATCHDOG") && getenv("SOTC_WATCHDOG")[0]=='0'))
+        CloseHandle(CreateThread(NULL,0,hang_watchdog,NULL,0,NULL));
+    if (getenv("SOTC_PEEK")) CloseHandle(CreateThread(NULL,0,peek_thread,(void *)getenv("SOTC_PEEK"),0,NULL));
+    if (app0 && !(getenv("SOTC_PREFETCH") && getenv("SOTC_PREFETCH")[0]=='0')) {
+        snprintf(prefetch_dir,sizeof(prefetch_dir),"%s",app0);
+        CloseHandle(CreateThread(NULL,0,prefetch_thread,NULL,0,NULL));
+    }
     if (getenv("SOTC_HEAP_WATCH") && getenv("SOTC_HEAP_WATCH")[0]=='1') {
         heap_watch_image=image;
         CloseHandle(CreateThread(NULL,0,heap_watch,NULL,0,NULL));

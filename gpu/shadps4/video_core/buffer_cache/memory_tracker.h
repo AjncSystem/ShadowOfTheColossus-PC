@@ -9,6 +9,7 @@
 
 #include "common/types.h"
 #include "video_core/buffer_cache/region_manager.h"
+#include "video_core/sotc_stats.h"
 
 namespace VideoCore {
 
@@ -87,6 +88,7 @@ public:
 
     /// Mark region as modified from the CPU
     void MarkRegionAsCpuModified(VAddr cpu_addr, u64 size) noexcept {
+        SotcStats::mem_epoch.fetch_add(1, std::memory_order_relaxed); // reused binds
         IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
             manager->template ChangeRegionState<StateOp::Set, StateOp::None>(offset, size);
         });
@@ -96,6 +98,7 @@ public:
     /// sotc: guest_fault (a guest thread's write fault) feeds the repeat-fault grace.
     void InvalidateRegion(VAddr cpu_addr, u64 size, auto&& on_flush,
                           bool guest_fault = false) noexcept {
+        SotcStats::mem_epoch.fetch_add(1, std::memory_order_relaxed); // reused binds
         if (readbacks_mode == GpuReadbacksMode::Disabled) {
             return MarkRegionAsCpuModified(cpu_addr, size);
         }

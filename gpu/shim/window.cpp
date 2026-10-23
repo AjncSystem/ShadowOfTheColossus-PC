@@ -11,7 +11,9 @@
 #include "bbport_overlay.h"
 #include "bbport_settings.h"
 #include "video_core/renderdoc.h"
+#include "video_core/sotc_event.h"
 #include "video_core/sotc_stats.h"
+#include "video_core/sotc_ui_lang.h"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -285,6 +287,9 @@ bool WindowSDL::PollEvents() {
                 g_mouse_buttons = 0;
                 g_mouse_dx = 0;
                 g_mouse_dy = 0;
+                SotcEvent::Log("INPUT", "%s", on ? SotcUi::T("Mouse preso na câmera (Esc solta)",
+                                                             "Mouse captured for the camera (Esc releases it)")
+                                                : SotcUi::T("Mouse solto", "Mouse released"));
                 std::fprintf(stderr, "Runtime: mouse %s\n",
                              on ? "captured for the camera (Esc releases it)" : "released");
             };
@@ -309,7 +314,10 @@ bool WindowSDL::PollEvents() {
         }
         // F11: fullscreen on/off (BB_FULLSCREEN only sets the state at start).
         if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F11 && !event.key.repeat) {
-            SDL_SetWindowFullscreen(window, !(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN));
+            const bool fullscreen = !(SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN);
+            SDL_SetWindowFullscreen(window, fullscreen);
+            SotcEvent::Log("KEY", "%s", fullscreen ? SotcUi::T("F11: tela cheia", "F11: fullscreen")
+                                                   : SotcUi::T("F11: janela", "F11: windowed"));
         }
         if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F12 && !event.key.repeat) {
             VideoCore::TriggerCapture(); // only does something when running under RenderDoc

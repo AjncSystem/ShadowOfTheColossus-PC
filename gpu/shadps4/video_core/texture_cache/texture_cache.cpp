@@ -30,6 +30,8 @@
 
 #include <vk_mem_alloc.h>
 #include "video_core/texture_cache/texture_cache.h"
+#include "video_core/sotc_event.h"
+#include "video_core/sotc_ui_lang.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/texture_cache/tile_manager.h"
 
@@ -986,7 +988,16 @@ void TextureCache::RefreshImage(Image& image) {
 
     const bool maybe_cpu_dirty = True(image.flags & ImageFlagBits::MaybeCpuDirty) &&
                                  False(image.flags & ImageFlagBits::CpuDirty);
-    if (maybe_cpu_dirty && image.info.sotc_first_mip) {
+    // sotc: SOTC_MAYBE_DIRTY_HASH=0 re-uploads every "maybe dirty" image instead of trusting a
+    // hash of its first 8x8 texels (a CPU write past them would leave stale texels: hunting the
+    // rainbow garbage on the Shrine's stones after many loads, 22 Oct).
+    static const bool trust_hash = [] {
+        const char* v = std::getenv("SOTC_MAYBE_DIRTY_HASH");
+        return !v || v[0] != '0';
+    }();
+    if (maybe_cpu_dirty && !trust_hash) {
+        SotcStats::rebase_maybe_dirty.fetch_add(1, std::memory_order_relaxed);
+    } else if (maybe_cpu_dirty && image.info.sotc_first_mip) {
         // sotc: mip tails are small enough to land here often, and the hash below only sees the
         // first texels of the first mip: a CPU write to another mip would be missed. Re-upload.
         SotcStats::rebase_maybe_dirty.fetch_add(1, std::memory_order_relaxed);
@@ -1569,6 +1580,10 @@ void TextureCache::EmergencyCollect(u32 level) {
         return false;
     });
     LOG_WARNING(Render, "Emergency texture collection (level {}) freed {} images", level, freed);
+    SotcEvent::Log("TEXTURE",
+                   SotcUi::T("Limpeza de texturas (nível %u de 2): %zu descartadas, memória de vídeo em uso %llu MB",
+                             "Texture cleanup (level %u of 2): %zu dropped, video memory in use %llu MB"),
+                   level, freed, static_cast<unsigned long long>(total_used_memory >> 20));
     SotcStats::vram_emergency.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -1977,6 +1992,9 @@ void TextureCache::RunGarbageCollector() {
 
     if (const u32 pending = pending_emergency.exchange(0, std::memory_order_relaxed)) {
         EmergencyCollect(pending - 1);
+    }
+    if (SotcStats::load_flush.exchange(false, std::memory_order_relaxed)) {
+        EmergencyCollect(2); // sotc: a load began (sotc_stats.h)
     }
     Census();
     GarbageCollectImages();

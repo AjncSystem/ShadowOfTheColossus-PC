@@ -25,7 +25,9 @@
 #include <cstring>
 #include <iterator>
 #include "common/types.h"
+#include "video_core/sotc_event.h"
 #include "video_core/sotc_live.h"
+#include "video_core/sotc_ui_lang.h"
 
 extern "C" const unsigned char* runtime_memory_backing_pointer(uintptr_t address);
 
@@ -33,12 +35,16 @@ namespace SotcLod {
 
 inline std::atomic<u32> uses[256]{};
 
-/// sotc: free share (percent) of the game's 64 KiB page pool in direct memory, or -1 when it is
-/// not there. The pool object is what the game's page allocator gets in rdi (guest 0x1a660) and
+struct PoolPages {
+    s64 free = -1; ///< -1: the pool is not there
+    u64 total = 0;
+};
+
+/// sotc: free and total pages of the game's 64 KiB page pool in direct memory. The pool object is what the game's page allocator gets in rdi (guest 0x1a660) and
 /// the crash reports in r14: +0x50 the bitmap (set bit: free page), +0x58 its u64 words, +0x60
 /// the pages. When no bit is left the allocator indexes the bitmap with -1 (read fault at guest
 /// 0x1a371, #186). Read through the backing view, so the GPU's page protection does not matter.
-inline int PoolFreePercent() {
+inline PoolPages PoolFree() {
     constexpr uintptr_t Pool = 0x1000000140; // in the game's first direct memory mapping
     const auto view = [](uintptr_t address, u64 size) -> const u8* {
         const u8* first = runtime_memory_backing_pointer(address);
@@ -47,7 +53,7 @@ inline int PoolFreePercent() {
     };
     const u8* pool = view(Pool, 0x68);
     if (!pool) {
-        return -1;
+        return {};
     }
     u64 bitmap, words, pages;
     std::memcpy(&bitmap, pool + 0x50, 8);
@@ -55,7 +61,7 @@ inline int PoolFreePercent() {
     std::memcpy(&pages, pool + 0x60, 8);
     const u8* bits = words && words <= 0x10000 ? view(bitmap, words * 8) : nullptr;
     if (!bits || pages == 0 || pages > words * 64) {
-        return -1;
+        return {};
     }
     u64 free = 0;
     for (u64 i = 0; i < words; ++i) {
@@ -63,7 +69,13 @@ inline int PoolFreePercent() {
         std::memcpy(&word, bits + i * 8, 8);
         free += std::popcount(word);
     }
-    return static_cast<int>(std::min<u64>(free, pages) * 100 / pages);
+    return {static_cast<s64>(std::min<u64>(free, pages)), pages};
+}
+
+/// Free share (percent) of the page pool, or -1 when it is not there
+inline int PoolFreePercent() {
+    const PoolPages p = PoolFree();
+    return p.free < 0 ? -1 : static_cast<int>(p.free * 100 / static_cast<s64>(p.total));
 }
 /// Reports a bank stays sampled after its last use. 0, like Pink-shadPS4: only the banks used
 /// since the last report. 180 (about 3 s) made the game ask for more than its streaming pool holds
@@ -103,12 +115,47 @@ inline void Collect(u64 (&entries)[256]) {
     // at 0x1a371 (#186, 5696 and 9152 MiB pools alike). Below SOTC_LOD_POOL_LOW percent free
     // (default 8; 0 turns this off) sampled banks ask for one mip coarser, below half of it two,
     // so the game drops fine mips (checked every 30 reports).
-    static const int pool_low = [] {
+    // Measured on 21 Oct (SOTC_LOD_POOL_LOG, switch off, PS4 Pro, 9152 MiB, 5 min attract): the
+    // pool (146416 pages) sits at 0-15 free pages for minutes, 0 at times, without a fault. The
+    // allocator first lets the game release pages (call 0x1abf0 from 0x1a2f0) and only faults
+    // when nothing could be released and no bit is set; so a low free count is the game's normal
+    // state and this switch, at any threshold, keeps sampled textures coarser in large areas. The
+    // signal it needs is a failed release; that waits for a repro of the fault.
+    static const int env_pool_low = [] {
         const char* v = std::getenv("SOTC_LOD_POOL_LOW");
         return v ? std::atoi(v) : 8;
     }();
+    // The texture level (launcher, in-game menu): "High" keeps the switch, "Maximum" sets 0.
+    const int live_low = SotcLive::lod_pool_low.load(std::memory_order_relaxed);
+    const int pool_low = live_low >= 0 ? live_low : env_pool_low;
+    static u32 last_linger = ~0u;
+    static int last_pool_low = -1;
+    if (linger_now != last_linger || pool_low != last_pool_low) {
+        last_linger = linger_now;
+        last_pool_low = pool_low;
+        SotcEvent::Log("TEXTURE", SotcUi::T("Nível de textura em uso: %s", "Texture level in use: %s"),
+                       !linger_now ? SotcUi::T("Desligada", "Off")
+                       : pool_low > 0 ? SotcUi::T("Alta", "High") : SotcUi::T("Máxima", "Maximum"));
+        std::fprintf(stderr, "SOTC LOD: texture level %s\n",
+                     !linger_now ? "off" : pool_low > 0 ? "high" : "maximum");
+    }
     static u64 coarser = 0;
     static u32 reports = 0;
+    // SOTC_LOD_POOL_LOG=1: the pool's free share at every check (measuring texture budgets).
+    static const bool pool_log = std::getenv("SOTC_LOD_POOL_LOG") != nullptr;
+    if (pool_log && reports % 30 == 0) {
+        const PoolPages p = PoolFree();
+        std::fprintf(stderr, "SOTC LOD POOL: %d%% free (%lld of %llu pages)\n", PoolFreePercent(),
+                     static_cast<long long>(p.free), static_cast<unsigned long long>(p.total));
+    }
+    if (pool_log && (!linger_now || pool_low <= 0)) {
+        ++reports;
+    }
+    if (pool_low <= 0 && coarser != 0) { // switched to "Maximum" while coarser
+        coarser = 0;
+        std::fprintf(stderr, "SOTC LOD: page pool switch off, sampled textures ask for mip %u\n",
+                     static_cast<unsigned>(level));
+    }
     if (linger_now && pool_low > 0 && reports++ % 30 == 0) {
         const int free = PoolFreePercent();
         // sotc: with hysteresis. The pool hovers at 0-14% free in large areas (9152 MiB), and
@@ -123,7 +170,7 @@ inline void Collect(u64 (&entries)[256]) {
                 want = 2;
             } else if (free < pool_low) {
                 want = std::max<u64>(coarser, 1);
-            } else if (coarser == 2 && free > pool_low * 3 / 4) {
+            } else if (coarser == 2) {
                 want = 1;
             }
             if (want == 1 && coarser == 1 && free > pool_low * 2) {
@@ -132,6 +179,10 @@ inline void Collect(u64 (&entries)[256]) {
         }
         if (want != coarser) {
             coarser = want;
+            SotcEvent::Log("TEXTURE",
+                           SotcUi::T("Memória de texturas do jogo com %d%% livre: detalhe das texturas vistas no nível %u (2 = o mais fino)",
+                                     "Game texture memory %d%% free: seen textures at detail level %u (2 = finest)"),
+                           free, static_cast<unsigned>(level + want));
             std::fprintf(stderr, "SOTC LOD: game page pool %d%% free, sampled textures ask for mip %u\n",
                          free, static_cast<unsigned>(level + coarser));
         }

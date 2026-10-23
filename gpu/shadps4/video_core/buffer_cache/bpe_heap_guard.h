@@ -105,7 +105,7 @@ public:
 
     void Add(VAddr block, VAddr next);
 
-    /// The in-use, size-0 block that ends the chain: nothing above it is allocator metadata
+    /// The in-use, size-0 block that ends the chain: the heap's tail after it holds no metadata
     void SetFence(VAddr block) {
         fence = block;
     }

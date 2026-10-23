@@ -20,13 +20,28 @@ namespace SotcStats {
 inline const bool kFpsLog = std::getenv("SOTC_FPS") != nullptr;
 inline const bool kCmdStats = std::getenv("SOTC_CMD_STATS") != nullptr;
 /// sotc: skip BindResources on consecutive draws whose pipeline, push data and resource
-/// handles did not change. On by default; SOTC_FAST_BIND=0 disables it.
+/// handles did not change. Off by default since 0.60.6 (SOTC_FAST_BIND=1 turns it on): in 0.60.5
+/// it left black dots in a grid on sandy ground (new constants at the same address); the fix
+/// (mem_epoch below) waits for a check on that ground.
 inline const bool kFastBind = [] {
     const char* v = std::getenv("SOTC_FAST_BIND");
-    return !v || v[0] != '0';
+    return v && v[0] == '1';
 }();
 inline std::atomic<uint64_t> fast_bind_eligible{0};
 inline std::atomic<uint64_t> fast_bind_hits{0};
+/// sotc: bumped whenever guest memory changes outside the GPU's own draws: a write by the command
+/// processor (constant RAM dumps, WRITE_DATA, DMA: MemoryManager::NoteHostWrite) or a CPU write
+/// the page tracking sees (MemoryTracker). A reused bind (SOTC_FAST_BIND) needs it unchanged: the
+/// next draw may have the same descriptors over new constants at the same address, and skipping
+/// BindResources skipped their upload (black dots in a grid on the sand, user, 0.60.5).
+inline std::atomic<uint64_t> mem_epoch{0};
+/// sotc: the game started loading a save or a new area ("st_gameflow() starting game",
+/// runtime_file.c): the texture cache drops every image not in use (TextureCache::
+/// RunGarbageCollector), so stale images over reused texture memory go away (green blocks after
+/// long sessions and many loads, user, 22 Oct). SOTC_LOAD_FLUSH=0 turns it off.
+inline std::atomic<bool> load_flush{false};
+/// sotc: bytes of hot readbacks not applied because the guest may have written them since.
+inline std::atomic<uint64_t> rb_hot_cpu_skipped{0};
 inline std::atomic<uint64_t> readbacks{0};    ///< BufferCache::DownloadMemory calls
 inline std::atomic<uint64_t> readback_ns{0};  ///< time spent in them (copy and wait)
 inline std::atomic<uint64_t> watch_addr{0};     ///< SOTC_CS_WATCH: GPU writes to report
@@ -204,6 +219,9 @@ inline std::atomic<uint64_t> frame_ns[FrameCauses]{};
 inline std::atomic<uint64_t> frame_compiles{0}; ///< shader modules and pipelines created
 /// sotc: shader cache preload at boot (loading screen bar): pipelines to load and loaded.
 inline std::atomic<uint32_t> warmup_total{0}, warmup_done{0};
+/// sotc: the boot's shader cache preload is over (the archive read-ahead waits for it: both
+/// on one hard disk made the loading screen last 2 minutes).
+inline std::atomic<bool> warmup_finished{false};
 inline std::atomic<uint64_t> flip_count{0};     ///< game flips (videoout/driver.cpp Flip)
 /// Game frames prepared by the command processor (vk_presenter.cpp PrepareFrame): unlike
 /// flip_count, in step with the draws the command processor is processing.

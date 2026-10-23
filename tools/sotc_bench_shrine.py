@@ -21,8 +21,8 @@ Open-world routes recorded by a player (src/runtime_pad.c BB_PAD_RECORD / BB_PAD
                              close.
     --replay out/route.txt   gets to the idle scene, plays the recording back and measures the
                              whole replay (frames dumped every 15 s).
-    --turn SECONDS           at the idle scene, holds the right stick for SECONDS (turns the
-                             camera, e.g. away from Mono on the altar), then measures.
+    --turn SECONDS           at the idle scene, holds --turn-pad (default rx=255, the right
+                             stick) for SECONDS, then measures (e.g. Mono on the altar out of view).
 """
 import argparse
 import os
@@ -54,7 +54,8 @@ def main():
     parser.add_argument('--replay', help='measure a replay of a BB_PAD_RECORD file')
     parser.add_argument('--turn', type=float, default=0,
                         help='at the idle scene, turn the camera (right stick) for this many seconds, then measure')
-    parser.add_argument('--turn-rx', type=int, default=255, help='right stick x held while turning (0-255)')
+    parser.add_argument('--turn-pad', default='rx=255',
+                        help='pad file tokens held during --turn (default rx=255: camera right; e.g. "ly=255" walks)')
     parser.add_argument('--assist', default='auto',
                         help='during a replay, also tap BUTTON every 0.4 s between START and END seconds '
                              '(START:END:BUTTON; "" for none). Agro, an AI character, does not stop at '
@@ -201,7 +202,7 @@ def main():
             # Turn first; the measured window and the shots start once the stick is released.
             now = time.monotonic() - start
             if 'turn_end' not in state:
-                pad.write_text(f'rx={args.turn_rx}')
+                pad.write_text(args.turn_pad)
                 state['turn_end'] = now + args.turn
             if now < state['turn_end']:
                 time.sleep(0.05)

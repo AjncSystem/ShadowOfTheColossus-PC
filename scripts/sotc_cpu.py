@@ -4,22 +4,24 @@
 
 The eboot's PT_GNU_EH_FRAME search table gives the function starts that the SSE4a and
 red-zone patchers decode (gpu/sotc/sotc_patches.cpp). The red-zone functions are the ones
-the shadPS4 SotC fork protects for Shadow of the Colossus EU 1.01 (CUSA08809).
+the shadPS4 SotC fork protects for Shadow of the Colossus EU 1.01 (CUSA08809); the US 1.00 eboot
+(CUSA08034) is the same build, so they apply to it too.
 """
 import argparse
 import struct
 from pathlib import Path
 from prepare import parse_self, sfo
+from sotc_modes import GAMES
 
 PT_GNU_EH_FRAME = 0x6474e550
-RED_ZONE_FUNCTIONS = {
+SOTC_RED_ZONE = (
     # Keeps pointers at [rsp-0x8..-0x18] across a loop.
-    'CUSA08809': (0xEDFB30,
-                  # A tracked-page write at +0xF67EF7 clobbers a pointer kept below rsp.
-                  0xF67D2B,
-                  # Leaf keeps its output pointer at [rsp-0x10] while reading tracked memory.
-                  0xF52530),
-}
+    0xEDFB30,
+    # A tracked-page write at +0xF67EF7 clobbers a pointer kept below rsp.
+    0xF67D2B,
+    # Leaf keeps its output pointer at [rsp-0x10] while reading tracked memory.
+    0xF52530)
+RED_ZONE_FUNCTIONS = {serial: SOTC_RED_ZONE for serial in GAMES}
 
 
 def main():

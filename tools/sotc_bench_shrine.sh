@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # sotc: Shrine of Worship benchmark (wrapper for tools/sotc_bench_shrine.py, which drives the game
 # from the log so varying load times do not matter): Wander idle at the altar, ~5900 draws per
-# frame, 60 FPS mode. Needs out/save-template/CUSA08809 (a save after colossus 1).
+# frame, 60 FPS mode. Needs out/save-template/CUSA08809 or CUSA08034 (the US release's folder), a
+# save after colossus 1.
 # Environment: SOTC_GAME_DIR, PY and BENCH_CVARS (bench_common.sh), MSYS2_ROOT,
 # BENCH_MEASURE (seconds measured after the idle scene is reached, default 40), BENCH_MODES
 # (default fps60,af16; af16 alone measures the game's 30 FPS cap).

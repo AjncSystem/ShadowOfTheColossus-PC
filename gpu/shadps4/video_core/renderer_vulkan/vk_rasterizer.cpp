@@ -84,6 +84,7 @@ Rasterizer::~Rasterizer() {
         DestroyHudless(image);
     }
     DestroyHudless(hudless_clear);
+    DestroyHudless(ui_shadow);
 }
 
 // Games may disable color buffer and enable force depth/stencil dirty and valid to do a copy from
@@ -890,6 +891,159 @@ vk::ImageView Rasterizer::TakeHudless(VAddr address, vk::Format format) {
     return target.read_view;
 }
 
+bool Rasterizer::BeginUiShadow(const GraphicsPipeline* pipeline, const RenderState& state) {
+    const u32 width = ui_shadow_width;
+    const u32 height = ui_shadow_height;
+    const float sx = static_cast<float>(width) / static_cast<float>(ui_shadow_src_width);
+    const float sy = static_cast<float>(height) / static_cast<float>(ui_shadow_src_height);
+    auto& dynamic = scheduler.GetDynamicState();
+    ui_shadow_viewports = dynamic.viewports;
+    ui_shadow_scissors = dynamic.scissors;
+    Viewports viewports = dynamic.viewports;
+    bool fits = true;
+    for (auto& vp : viewports) {
+        vp.x *= sx;
+        vp.y *= sy;
+        vp.width *= sx;
+        vp.height *= sy;
+        // Clipping off: the shader maps a 16K window, which scaled may exceed the limits.
+        fits &= std::abs(vp.width) <= static_cast<float>(instance.GetMaxViewportWidth()) &&
+                std::abs(vp.height) <= static_cast<float>(instance.GetMaxViewportHeight());
+    }
+    const bool one_sample = pipeline->GetGraphicsKey().color_samples[0] <= 1;
+    if (!fits || !one_sample || attachment_feedback_loop || state.num_layers != 1) {
+        static u32 reported = 0;
+        if (reported++ < 5) {
+            std::fprintf(stderr,
+                         "SOTC UI: a draw into the UI layer cannot be redrawn (viewport fits %d, "
+                         "1 sample %d, feedback loop %d, layers %u)\n",
+                         fits, one_sample, attachment_feedback_loop, state.num_layers);
+        }
+        ui_shadow_broken = true;
+        return false;
+    }
+    if (ui_shadow.width != width || ui_shadow.height != height) {
+        if (ui_shadow.image) {
+            (void)instance.GetDevice().waitIdle(); // earlier frames may still copy it
+            DestroyHudless(ui_shadow);
+        }
+        ui_shadow_broken = true; // this frame's earlier draws are not in it
+        if (!CreateHudlessImage(instance, vk::Format::eR8G8B8A8Srgb, width, height,
+                                vk::ImageUsageFlagBits::eColorAttachment |
+                                    vk::ImageUsageFlagBits::eTransferSrc,
+                                ui_shadow.image, ui_shadow.rt_view, ui_shadow.allocation)) {
+            return false;
+        }
+        auto [result, unorm_view] = instance.GetDevice().createImageView(vk::ImageViewCreateInfo{
+            .image = ui_shadow.image,
+            .viewType = vk::ImageViewType::e2D,
+            .format = vk::Format::eR8G8B8A8Unorm,
+            .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+        });
+        if (result != vk::Result::eSuccess) {
+            DestroyHudless(ui_shadow);
+            return false;
+        }
+        ui_shadow.read_view = unorm_view;
+        ui_shadow.width = width;
+        ui_shadow.height = height;
+        std::fprintf(stderr, "SOTC UI: drawing the UI layer (%ux%u) at %ux%u\n",
+                     ui_shadow_src_width, ui_shadow_src_height, width, height);
+    }
+    vk::ImageView view;
+    if (ui_shadow_format == vk::Format::eR8G8B8A8Srgb) {
+        view = ui_shadow.rt_view;
+    } else if (ui_shadow_format == vk::Format::eR8G8B8A8Unorm) {
+        view = ui_shadow.read_view;
+    } else {
+        ui_shadow_broken = true;
+        return false;
+    }
+    scheduler.EndRendering();
+    // The first draw of a frame starts it (the composite copied the last one); later ones blend
+    // over the earlier ones.
+    const bool first = ui_shadow_draws++ == 0;
+    const auto to_target = vk::ImageMemoryBarrier2{
+        .srcStageMask = first ? vk::PipelineStageFlagBits2::eAllCommands
+                              : vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+        .srcAccessMask =
+            first ? vk::AccessFlagBits2::eNone : vk::AccessFlagBits2::eColorAttachmentWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+        .dstAccessMask =
+            vk::AccessFlagBits2::eColorAttachmentWrite | vk::AccessFlagBits2::eColorAttachmentRead,
+        .oldLayout = first ? vk::ImageLayout::eUndefined : vk::ImageLayout::eColorAttachmentOptimal,
+        .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+        .image = ui_shadow.image,
+        .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+    };
+    scheduler.CommandBuffer().pipelineBarrier2(
+        vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_target});
+    RenderState shadow = state;
+    auto& color = shadow.color_attachments[0];
+    if (first) {
+        static u32 reported = 0;
+        if (reported++ < 3) {
+            const vk::Viewport vp = viewports.empty() ? vk::Viewport{} : viewports[0];
+            std::fprintf(stderr,
+                         "SOTC UI: first UI draw: clear %u, %u attachments, depth %d, "
+                         "viewport %.0f,%.0f %.0fx%.0f\n",
+                         color.is_clear, state.num_color_attachments,
+                         state.depth_stencil_attachment.has_depth, vp.x, vp.y, vp.width,
+                         vp.height);
+        }
+        if (!color.is_clear) {
+            color.is_clear = 1;
+            color.clear_value = {};
+        }
+    }
+    color.image_view = view;
+    color.image_layout = vk::ImageLayout::eColorAttachmentOptimal;
+    for (u32 cb = 1; cb < shadow.num_color_attachments; ++cb) {
+        shadow.color_attachments[cb].image_view = vk::ImageView{}; // of the render size
+    }
+    auto& depth = shadow.depth_stencil_attachment;
+    depth.image_view = vk::ImageView{};
+    depth.depth_clear = false;
+    depth.stencil_clear = false;
+    shadow.width = static_cast<u16>(width);
+    shadow.height = static_cast<u16>(height);
+    scheduler.BeginRendering(shadow);
+
+    Scissors scissors = dynamic.scissors;
+    for (auto& sc : scissors) {
+        const s64 x0 = static_cast<s64>(std::floor(sc.offset.x * sx));
+        const s64 y0 = static_cast<s64>(std::floor(sc.offset.y * sy));
+        const s64 x1 = static_cast<s64>(std::ceil((sc.offset.x + s64(sc.extent.width)) * sx));
+        const s64 y1 = static_cast<s64>(std::ceil((sc.offset.y + s64(sc.extent.height)) * sy));
+        sc.offset = vk::Offset2D{static_cast<s32>(x0), static_cast<s32>(y0)};
+        sc.extent = vk::Extent2D{static_cast<u32>(std::min<s64>(x1 - x0, 0x7fffffff - x0)),
+                                 static_cast<u32>(std::min<s64>(y1 - y0, 0x7fffffff - y0))};
+    }
+    dynamic.SetViewports(viewports);
+    dynamic.SetScissors(scissors);
+    dynamic.Commit(instance, scheduler.CommandBuffer());
+    return true;
+}
+
+void Rasterizer::EndUiShadow() {
+    auto& dynamic = scheduler.GetDynamicState();
+    dynamic.SetViewports(ui_shadow_viewports);
+    dynamic.SetScissors(ui_shadow_scissors);
+    dynamic.Commit(instance, scheduler.CommandBuffer());
+}
+
+void Rasterizer::NoteUiShadow() {
+    static u32 reported = 0;
+    if (ui_shadow_draws && reported++ < 5) {
+        std::fprintf(stderr, "SOTC UI: composite after %u UI draws%s\n", ui_shadow_draws,
+                     ui_shadow_broken ? ", not all redrawn: render size UI" : "");
+    }
+    const bool ok = ui_shadow_draws && !ui_shadow_broken;
+    Dlssg::NoteUiShadow(ok ? ui_shadow.image : vk::Image{}, ui_shadow.width, ui_shadow.height);
+    ui_shadow_draws = 0;
+    ui_shadow_broken = false;
+}
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolved,
                       bool use_resolved) {
     RENDERER_TRACE;
@@ -975,6 +1129,18 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
                                 vertex_offset, instance_offset);
         }
     }
+    // sotc: a draw into the UI layer again, at the output size (BeginUiShadow).
+    if (ui_shadow_hit && BeginUiShadow(pipeline, state)) {
+        const auto shadow_cmdbuf = scheduler.CommandBuffer();
+        if (is_indexed) {
+            shadow_cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
+                                      s32(vertex_offset), instance_offset);
+        } else {
+            shadow_cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
+                               instance_offset);
+        }
+        EndUiShadow();
+    }
     DebugState.IncDrawCall();
 
     ResetBindings(false);
@@ -1036,6 +1202,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
     const auto state = BeginRendering(pipeline);
+    ui_shadow_broken |= ui_shadow_hit; // sotc: indirect draws are not redrawn (BeginUiShadow)
     RefreshImageLayouts();
 
     BindVertexBuffers(pipeline);
@@ -2446,6 +2613,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             ui.usage.render_target && ui.info.pixel_format == vk::Format::eR8G8B8A8Srgb &&
             scene.info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
             Dlssg::NoteComposite(image_bindings[1].first, image_bindings[0].first, texture_cache);
+            NoteUiShadow();
             static bool logged = false;
             if (!std::exchange(logged, true)) {
                 std::fprintf(stderr, "SOTC DLSS: composite shader %#llx\n",
@@ -2552,6 +2720,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     const auto& regs = liverpool->DrawRegs();
     const auto& key = pipeline->GetGraphicsKey();
     RenderState state;
+    ui_shadow_hit = false; // sotc: BeginUiShadow
     state.width = instance.GetMaxFramebufferWidth();
     state.height = instance.GetMaxFramebufferHeight();
     state.num_layers = std::numeric_limits<u16>::max();
@@ -2622,6 +2791,14 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             hudless_vo_format = image_view.info.format;
             hudless_vo_width = image->info.size.width;
             hudless_vo_height = image->info.size.height;
+        }
+        if (cb == 0 && mip == 0 && slice == 0 && // sotc: BeginUiShadow
+            Dlssg::UiTarget(image->info.guest_address, image->info.size.width,
+                            image->info.size.height, ui_shadow_width, ui_shadow_height)) {
+            ui_shadow_hit = true;
+            ui_shadow_format = image_view.info.format;
+            ui_shadow_src_width = image->info.size.width;
+            ui_shadow_src_height = image->info.size.height;
         }
     }
     for (u32 cb = state.num_color_attachments; cb < state.color_attachments.size(); ++cb) {

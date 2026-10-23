@@ -1911,6 +1911,11 @@ class Launcher:
                                                                   'Choose the game folder with eboot.bin (CUSA08809).'))
             self.show('game')
             return
+        free = free_commit_gb()
+        if free is not None and free < MIN_FREE_COMMIT_GB and not self.messagebox.askyesno(
+                'Shadow of the Colossus', _('O Windows só tem {:.1f} GB livres para programas (RAM + arquivo de paginação). O jogo reserva cerca de 6 GB ao abrir e precisa de mais alguns GB depois; com menos, ele fecha logo no início (erro 1455 no log).\n\nPara resolver: Iniciar → "Ajustar a aparência e o desempenho do Windows" → Avançado → Memória virtual → Alterar… → marque "Gerenciar automaticamente o tamanho do arquivo de paginação" (ou defina pelo menos 16 GB) e reinicie o PC. Fechar navegadores e outros programas grandes também ajuda.\n\nAbrir o jogo mesmo assim?',
+                                            'Windows has only {:.1f} GB free for programs (RAM + page file). The game reserves about 6 GB when it starts and needs a few GB more after that; with less it closes right at the start (error 1455 in the log).\n\nTo fix it: Start → "Adjust the appearance and performance of Windows" → Advanced → Virtual memory → Change… → tick "Automatically manage paging file size for all drives" (or set at least 16 GB) and restart the PC. Closing browsers and other big programs also helps.\n\nStart the game anyway?').format(free)):
+            return
         self.set_log('')
         try:
             write_key_bindings(self.app.get('keys'))
@@ -2170,6 +2175,29 @@ class GameJob:
         if self.handle:
             ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(self.handle))
             self.handle = None
+
+
+def free_commit_gb():
+    """Commit memory Windows can still give programs (RAM + page file), in GB; None if unknown."""
+    class MemoryStatus(ctypes.Structure):
+        _fields_ = [('length', ctypes.c_uint32), ('load', ctypes.c_uint32),
+                    ('total_phys', ctypes.c_uint64), ('avail_phys', ctypes.c_uint64),
+                    ('total_commit', ctypes.c_uint64), ('avail_commit', ctypes.c_uint64),
+                    ('total_virtual', ctypes.c_uint64), ('avail_virtual', ctypes.c_uint64),
+                    ('avail_extended', ctypes.c_uint64)]
+    status = MemoryStatus()
+    status.length = ctypes.sizeof(status)
+    try:
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return None
+    except (AttributeError, OSError):
+        return None
+    return status.avail_commit / 1e9
+
+
+# The guest memory pool (~6 GB, committed at once when the game starts) plus the process itself:
+# below this the game stops at boot with error 1455 (issue #95).
+MIN_FREE_COMMIT_GB = 8.0
 
 
 def play_without_window(settings):

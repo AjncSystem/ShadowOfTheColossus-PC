@@ -722,12 +722,12 @@ static int helper_single_step(EXCEPTION_POINTERS *info) {
     info->ContextRecord->EFlags&=~(DWORD)0x100;
     return 1;
 }
-/* sotc: the BPE heap of Shadow of the Colossus (EU 1.01). GPU writes of dispatches on stale
- * descriptors land in freed heap blocks and readbacks then overwrite the allocator's metadata
- * (access violations in eboot+0x48xxx/0x49xxx). The GPU side keeps that metadata
- * (video_core/buffer_cache/bpe_heap_guard.cpp, from Pink-shadPS4) but needs the heap object: a
- * breakpoint on the heap's free function (eboot+0x495e0) records its first argument for the
- * first calls, then is removed. SOTC_HEAP_GUARD=0 leaves it off. */
+/* sotc: the BPE heap of Shadow of the Colossus (EU 1.01 / US 1.00, the same eboot). GPU writes
+ * of dispatches on stale descriptors land in freed heap blocks and readbacks then overwrite the
+ * allocator's metadata (access violations in eboot+0x48xxx/0x49xxx). The GPU side keeps that
+ * metadata (video_core/buffer_cache/bpe_heap_guard.cpp, from Pink-shadPS4) but needs the heap
+ * object: a breakpoint on the heap's free function (eboot+0x495e0) records its first argument for
+ * the first calls, then is removed. SOTC_HEAP_GUARD=0 leaves it off. */
 #define HEAP_FREE_OFFSET 0x495e0
 const unsigned char *runtime_memory_backing_pointer(uintptr_t address);
 #define HEAP_HOOK_CALLS 2000
@@ -772,7 +772,7 @@ static void choose_heap(void) {
     }
 }
 uintptr_t runtime_sotc_heap(void) { return heap_chosen; }
-/* sotc (#146): the engine's heap table (heap id -> heap object, eboot EU 1.01). The world's own
+/* sotc (#146): the engine's heap table (heap id -> heap object, eboot EU 1.01 / US 1.00). The world's own
  * heaps (created when a world loads, e.g. the last colossus' area) include more heaps of the
  * guarded heap's class; the GPU side guards those too. 0 until the guarded heap is chosen. */
 #define HEAP_TABLE_OFFSET 0x2dfaab0
@@ -1255,6 +1255,8 @@ int main(int argc, char **argv) {
         snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0);
         if (sfo_value(sfo,"INSTALL_DIR_SAVEDATA",id,sizeof(id),NULL) || sfo_value(sfo,"TITLE_ID",id,sizeof(id),NULL))
             runtime_savedata_configure(id);
+        char title_id[16]="";
+        if (sfo_value(sfo,"TITLE_ID",title_id,sizeof(title_id),NULL)) runtime_content_title(title_id);
     }
     bbgpu_register_kernel();
 #ifdef _WIN32
@@ -1463,7 +1465,7 @@ int main(int argc, char **argv) {
         _exit(0);
     }
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
-    {   /* sotc: fps60game applied (EU 1.01, scripts/sotc_modes.py): F7 sets the engine's own frame
+    {   /* sotc: fps60game applied (EU 1.01 / US 1.00, scripts/sotc_modes.py): F7 sets the engine's own frame
          * rate target, the TargetFramesPerSeconds cvar (object 0x2eed7a0, value pointer at +0x60). */
         static const unsigned char fps60game[]={0xc7,0x45,0x84,0x01,0x00,0x00,0x00};
         if (size>0x2eed800 && !memcmp(image+0x49a47f,fps60game,sizeof fps60game))

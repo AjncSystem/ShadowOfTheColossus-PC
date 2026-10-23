@@ -161,7 +161,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
-                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'volume': '100', 'shadow_reuse': '0', 'library_dirs': [], 'keys': {},
+                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'volume': '100', 'shadow_reuse': '0', 'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1', 'weed_distance': '1', 'weed_height': '1', 'grass_fade': '1', 'grass_detail': '0.25', 'library_dirs': [], 'keys': {},
                 'auto_setup': True, 'dlc_dir': '', 'framegen': 'off',
                 'dlss_mode': 'quality', 'dlss_sharpen': '0', 'dlss_ui_sharpen': '3', 'dlss_sky_sharpen': '2',
                 'dlss_compare': False,
@@ -203,6 +203,38 @@ VRAM_USE = [('low', ('Econômico (placas de 4–6 GB)', 'Economy (4–6 GB cards
 SHADOW_REUSE = [('0', ('Desligado (sombras sem piscar)', 'Off (no blinking shadows)')),
                 ('1', ('Ligado (mais FPS; sombras distantes podem piscar)', 'On (more FPS; far shadows may blink)')),
                 ('auto', ('Automático (ligado na NVIDIA, desligado na AMD/Intel)', 'Automatic (on with NVIDIA, off on AMD/Intel)'))]
+# Sun shadow cascades the grass casts shadows in (r_virtualGeometryNumShadowCascades): the PS4
+# value 2 ends them at 8 m, a band of grass darkens ~10 m ahead while riding; 3 reaches 24 m (4 would
+# reach 100 m, but there a blade is far below a shadow-map texel: no visible gain, only cost); 1 = 2.6 m.
+GRASS_SHADOWS = [('1', ('Perto (até ~3 m, mais leve)', 'Near (to ~3 m, lighter)')),
+                 ('2', ('Como no PS4 (até ~8 m)', 'As on PS4 (to ~8 m)')),
+                 ('3', ('Longe (até ~24 m, mais pesado)', 'Far (to ~24 m, heavier)'))]
+# Grass and weed view distance: the grass shaders thin the grass out in distance bands; these
+# multiply the band distances (more grass far away, blades the same height).
+VEG_DISTANCE = [('1', ('Como no PS4', 'As on PS4')),
+                ('2', ('2x mais longe', '2x farther')),
+                ('3', ('3x mais longe', '3x farther')),
+                ('5', ('5x mais longe', '5x farther'))]
+# The weeds take much larger multipliers without bands (10x tested): denser fields, like early autumn.
+WEED_DISTANCE = VEG_DISTANCE + [('10', ('10x mais longe (campo denso)', '10x farther (dense field)'))]
+VEG_HEIGHT = [('0.75', ('Mais baixa (75%)', 'Lower (75%)')),
+              ('1', ('Como no PS4', 'As on PS4')),
+              ('1.5', ('Mais alta (150%)', 'Taller (150%)')),
+              ('2', ('Bem mais alta (200%)', 'Much taller (200%)'))]
+# Fade (r_virtualGeometryFadeMultiplier) does not change the height: away from 1 it thins the grass,
+# and 0.3 also drops its shadows.
+GRASS_FADE = [('0.5', ('0.5 (grama rala, menos sombra)', '0.5 (sparse grass, less shadow)')),
+              ('0.75', ('0.75 (grama mais rala)', '0.75 (sparser grass)')),
+              ('1', ('Como no PS4', 'As on PS4')),
+              ('2', ('2 (menos grama)', '2 (less grass)')),
+              ('3', ('3 (pouca grama)', '3 (little grass)'))]
+# Grass detail: scales the distance at which a grass patch gets its full blade count (the shader's LOD
+# scale; smaller = full grass farther out). On PS4 the grass near the camera fills in late, and its
+# shadow pops in with it; 0.01 distorts.
+GRASS_DETAIL = [('1', ('Como no PS4', 'As on PS4')),
+                ('0.25', ('Alto', 'High')),
+                ('0.15', ('Mais alto', 'Higher')),
+                ('0.1', ('Muito alto', 'Very high'))]
 VOLUME = [('100', ('100% (original)', '100% (original)')), ('150', ('150%', '150%')),
           ('200', ('200%', '200%')), ('300', ('300% (máximo)', '300% (maximum)'))]
 VRAM_LIMITS = {'low': ('50', '1024'), 'normal': ('60', '1536'), 'high': ('75', '4096'), 'max': ('85', '0')}
@@ -552,6 +584,9 @@ def game_environment(s):
     modes = ['af16'] if s.get('af16') else []
     if fps_mode != '30':
         modes.append('fps60game')
+    # At this resolution the grass overflows the game's grass buffers: the farthest grass then pops
+    # in and out in patches, in a band ahead with longer grass distances. grassbuf makes them 4x larger.
+    modes.append('grassbuf')
     env['SOTC_MODES'] = ','.join(modes)
     env['SOTC_FPS_CAP'] = '30' if fps_mode == '30' else 'off'
     env['SOTC_FPS_LIMIT'] = '60' if fps_mode == '60' else '0'
@@ -573,8 +608,19 @@ def game_environment(s):
         cvars += ['doIndexBufferCulling=0', 'doSunShadowIndexBufferCulling=0']
     if s.get('skip_logos'):
         cvars.append('skipSplash=1')
+    grass = str(s.get('grass_shadows') or '2')
+    if grass in ('3', '4'):
+        # Every mode's copy: the game takes the one of its graphics mode (PS4 Pro Cinematic has 3).
+        cvars += [f'r_virtualGeometryNumShadowCascades{mode}={grass}'
+                  for mode in ('', '_BasePS4', '_Perf', '_Cinematic')]
+    fade = str(s.get('grass_fade') or '1')
+    if fade in ('0.5', '0.75', '2', '3'):
+        cvars.append(f'r_virtualGeometryFadeMultiplier={fade}')
     cvars += str(s.get('engine_cvars', '')).split()
     env['SOTC_CVARS'] = ' '.join(cvars)
+    # Multipliers for the grass shaders' view distances and blade height (vk_rasterizer.cpp).
+    env['SOTC_GRASS'] = ' '.join(str(s.get(k) or '1') for k in
+                                 ('grass_distance', 'grass_height', 'weed_distance', 'weed_height', 'grass_detail'))
     env['SOTC_RECORD_THREAD'] = '1' if s.get('perf_record_thread', True) else '0'
     if not s.get('perf_dma', True):
         env['BB_DIRECT_MEMORY_ACCESS'] = '0'
@@ -1278,6 +1324,48 @@ class Launcher:
                    'How far the game fills the card memory before it frees textures and buffers. Default: '
                    'frees from 60%. On 8 GB cards or more, "High" or "Maximum" avoids reloading textures '
                    '(less stutter). On an out-of-memory error, go back one level.'))
+        self.section(f, _('Grama', 'Grass'))
+        self.row(f, _('Sombras da grama', 'Grass shadows'), self.choice(f, 'grass_shadows', GRASS_SHADOWS),
+                 _('Até onde a grama projeta sombra. No PS4 só até ~8 m: ao cavalgar, uma faixa de grama '
+                   'escurece logo à frente. "Longe" leva até ~24 m, com algum custo de FPS; "Perto" é mais leve, '
+                   'para PCs fracos. Vale ao iniciar o jogo.',
+                   'How far the grass casts shadows. On PS4 only to ~8 m: while riding, a band of grass '
+                   'darkens just ahead. "Far" takes it to ~24 m, at some FPS cost; "Near" is lighter, for slow '
+                   'PCs. Applies when the game starts.'))
+        self.row(f, _('Distância da grama', 'Grass distance'), self.choice(f, 'grass_distance', VEG_DISTANCE),
+                 _('Até onde a grama fica cheia. No PS4 ela rareia em faixas a poucos metros; mais longe '
+                   'mantém a grama densa ao longe, sem deixá-la mais alta. Também no menu do jogo (vale na hora).',
+                   'How far the grass stays full. On PS4 it thins out in bands a few metres ahead; farther '
+                   'keeps the grass dense in the distance without making it taller. Also in the in-game '
+                   'menu (applies at once).'))
+        self.row(f, _('Altura da grama', 'Grass height'), self.choice(f, 'grass_height', VEG_HEIGHT),
+                 _('Altura das folhas de grama. Recomendado: como no PS4, ou 150% para mais grama; 200% '
+                   'vira quase um arbusto. Também no menu do jogo (vale na hora).',
+                   'Height of the grass blades. Recommended: as on PS4, or 150% if you like more grass; 200% '
+                   'turns it into bushes. Also in the in-game menu (applies at once).'))
+        self.row(f, _('Distância do mato', 'Weed distance'), self.choice(f, 'weed_distance', WEED_DISTANCE),
+                 _('O mesmo que a distância da grama, para as plantas mais altas entre a grama. Também no '
+                   'menu do jogo (vale na hora).',
+                   'The same as grass distance, for the taller weeds among the grass. Also in the in-game '
+                   'menu (applies at once).'))
+        self.row(f, _('Altura do mato', 'Weed height'), self.choice(f, 'weed_height', VEG_HEIGHT),
+                 _('Altura das plantas mais altas entre a grama: "Bem mais alta" vira arbusto. Também no '
+                   'menu do jogo (vale na hora).',
+                   'Height of the taller weeds among the grass: "Much taller" turns them into shrubs. Also in '
+                   'the in-game menu (applies at once).'))
+        self.row(f, _('Detalhe da grama', 'Grass detail'), self.choice(f, 'grass_detail', GRASS_DETAIL),
+                 _('A que distância a grama fica completa. No PS4 a grama (e sua sombra) perto da câmera '
+                   'aparece tarde, quase em cima do jogador. Também no menu do jogo (vale na hora).',
+                   'How far out the grass is drawn complete. On PS4 the grass near the camera (and its '
+                   'shadow) appears late, almost on top of the player. Also in the in-game menu (applies at '
+                   'once).'))
+        self.row(f, _('Esmaecimento da grama', 'Grass fade'), self.choice(f, 'grass_fade', GRASS_FADE),
+                 _('Como a grama some com a distância. Fora do valor do PS4 a grama fica mais rala; abaixo dele a '
+                   'sombra da grama também some (0.5: quase sem sombra). Menos grama é um pouco mais leve para a '
+                   'placa de vídeo, útil em PCs fracos. Vale ao iniciar o jogo.',
+                   'How the grass fades out with distance. Away from the PS4 value the grass gets sparser; below it '
+                   'the grass shadow fades too (0.5: almost no shadow). Less grass is a little lighter on the GPU, '
+                   'useful on slow PCs. Applies when the game starts.'))
         self.section(f, _('Efeitos', 'Effects'))
         for key, title, _off in EFFECTS:
             self.check(f, key, _(*title))

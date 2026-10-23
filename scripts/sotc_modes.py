@@ -17,6 +17,7 @@ Writes two files for the loader:
                    bb-probe --sotc-cmdline): cvars of the Bluepoint engine, e.g.
                    +r_motionBlurEnable=0. Modes that are only cvars:
                    af16   16x anisotropic filtering on every texture
+                   hdr    the game's HDR rendering (needs the HDR10 output: Windows HDR on)
 The original bytes are checked first: another game version gets neither file's changes.
 """
 import argparse
@@ -35,6 +36,17 @@ MODES = {
         # the frame limiter's import stub (sceVideoOutSetFlipRate) returns 0
         (0x01390090, bytes.fromhex('ff25a20567'), bytes.fromhex('31c0c3')),
     ],
+    # Room for 4x the grass, for the longer grass distances: the virtual geometry buffers (80-byte
+    # blades and their index list) hold 0x18000; the grass compute drops every blade past that, the
+    # farthest patches first: a band of grass pops in and out ahead once the grass distance is raised.
+    'grassbuf': [
+        (0x004d92b9, bytes.fromhex('b900800100'), bytes.fromhex('b900000600')),
+        (0x004d92e5, bytes.fromhex('b900800100'), bytes.fromhex('b900000600')),
+        # the patch chunks (up to 64 blades each) the grass compute fills: 0x8000 of 16 bytes
+        (0x004d928d, bytes.fromhex('b900800000'), bytes.fromhex('b900000200')),
+        # the weed blades (80 bytes): 0x24000
+        (0x004d9311, bytes.fromhex('b900400200'), bytes.fromhex('b900000900')),
+    ],
     # The engine's own 60 FPS target, the one of the PS4 Pro Performance mode: TargetFramesPerSeconds
     # 1 (60 FPS) where the game sets 2 (30 FPS), i.e. the graphics mode code on a PS4 (0x70a6d0) and
     # the options code without the Performance mode (0x49a2d8). The game then asks flip rate 0 itself
@@ -51,6 +63,9 @@ CVAR_MODES = {
     'fps60game': ['TargetFramesPerSeconds=1'],  # until the options code runs (MODES above)
     'af16': ['progSamplerAnisoLevel=16', 'progSamplerAnisoLevel_BasePS4=16', 'progSamplerAnisoLevel_Perf=16',
              'progSamplerAnisoLevel_Cinematic=16', 'linearSamplerAnisoLevel=16'],
+    # the game's HDR path (sotc.py also turns on the HDR10 output, BB_HDR): r_WantsHDR_Game is
+    # its menu option (2 = on); r_WantsHDR=0 leaves the switch to that menu
+    'hdr': ['r_WantsHDR=0', 'r_WantsHDR_Game=2'],
 }
 # Render size (PS4 mode; the PS4 Pro values next to them stay): (address, kind, original).
 # 'W'/'H' an integer immediate (the last 4 bytes of the instruction at address), 'w'/'h' a float

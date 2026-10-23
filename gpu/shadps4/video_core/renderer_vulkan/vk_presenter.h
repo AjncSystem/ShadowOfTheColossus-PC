@@ -4,6 +4,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <cstdlib>
 
 #include "core/libraries/videoout/buffer.h"
 #include <imgui.h> // sotc port: ImTextureID only
@@ -81,6 +82,9 @@ public:
         }
         swapchain.SetHDR(enable);
         pp_settings.hdr = enable ? 1 : 0;
+        if (const char* white = std::getenv("SOTC_HDR_WHITE"); white && std::atof(white) > 0) {
+            pp_settings.hdr_white = static_cast<float>(std::atof(white));
+        }
     }
 
     VideoCore::Image& RegisterVideoOutSurface(

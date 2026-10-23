@@ -625,6 +625,9 @@ struct Composite {
     bool copy_ok{};
     VideoCore::ImageId scene_id, ui_id;
     u64 scene_uid{}, ui_uid{};
+    vk::Image ui_shadow; ///< NoteUiShadow
+    u32 shadow_width{}, shadow_height{};
+    bool ui_full_ok{}; ///< the UI shadow is in sr_ui_full
 };
 /// An image of ours. One set: the presenter's command buffers run in order on one queue.
 struct SrImage {
@@ -637,6 +640,10 @@ struct SrImage {
 };
 Composite composite;            // command processor thread
 SrImage sr_color, sr_ui, sr_out; // command processor thread
+SrImage sr_ui_full;              // the UI layer at the output size (UiTarget)
+std::array<VAddr, 2> ui_addresses{}; // of the composite's UI layer (it may alternate)
+u32 ui_width{}, ui_height{};    // of the composite's UI layer
+u32 out_width{}, out_height{};  // of the last upscale
 bool sr_prev = false;           // the previous frame was upscaled (DLSS history is current)
 std::atomic<bool> sr_user_off{false}; // toggled by a key on the window thread
 std::atomic<u32> sr_errors{0};  // failed evaluates (recording thread); 3 turn super resolution off
@@ -685,6 +692,8 @@ sl::Resource SlImage(vk::Image image, VkDeviceMemory memory, vk::ImageView view,
     return r;
 }
 
+bool sr_hdr = false; // presenter thread
+
 /// DLSS options for this input and output size: DLAA at 1:1, else the mode whose optimal render
 /// height is closest to the input's.
 bool SetSrOptions(u32 in_w, u32 in_h, u32 out_w, u32 out_h) {
@@ -695,7 +704,8 @@ bool SetSrOptions(u32 in_w, u32 in_h, u32 out_w, u32 out_h) {
     sl::DLSSOptions options{};
     options.outputWidth = out_w;
     options.outputHeight = out_h;
-    options.colorBuffersHDR = sl::Boolean::eFalse; // tonemapped, 0..1
+    // Tonemapped, 0..1; with HDR output the game's scene goes above 1.0.
+    options.colorBuffersHDR = sr_hdr ? sl::Boolean::eTrue : sl::Boolean::eFalse;
     sl::DLSSMode best = sl::DLSSMode::eMaxQuality;
     if (in_w >= out_w && in_h >= out_h) {
         best = sl::DLSSMode::eDLAA;
@@ -854,6 +864,14 @@ void SetOptions(bool on) {
 }
 
 } // namespace
+
+void SetHdr(bool hdr) {
+    if (sr_hdr != hdr) {
+        sr_hdr = hdr;
+        sr_mode_in_w = 0; // new DLSS options
+        std::fprintf(stderr, "SOTC DLSS: %s colour input\n", hdr ? "HDR" : "tonemapped");
+    }
+}
 
 PFN_vkGetInstanceProcAddr LoadInterposer() {
     const char* u = std::getenv("SOTC_UPSCALER");
@@ -1088,6 +1106,16 @@ void NoteVignette(const float params[4]) {
     vignette_valid = true;
 }
 
+std::atomic<float> hdr_curve{1.0f};
+
+void NoteHdrCurve(float k) {
+    hdr_curve.store(k, std::memory_order_relaxed);
+}
+
+float HdrCurve() {
+    return hdr_curve.load(std::memory_order_relaxed);
+}
+
 bool Vignette(float out[4]) {
     std::scoped_lock lock{vignette_mutex};
     std::memcpy(out, vignette_params, sizeof(vignette_params));
@@ -1104,6 +1132,36 @@ void NoteComposite(VideoCore::ImageId scene_id, VideoCore::ImageId ui_id,
     composite.scene_uid = texture_cache.GetImage(scene_id).image_uid;
     composite.ui_id = ui_id;
     composite.ui_uid = texture_cache.GetImage(ui_id).image_uid;
+    const auto& ui = texture_cache.GetImage(ui_id);
+    if (ui.info.guest_address != ui_addresses[0]) {
+        ui_addresses[1] = std::exchange(ui_addresses[0], ui.info.guest_address);
+    }
+    ui_width = ui.info.size.width;
+    ui_height = ui.info.size.height;
+}
+
+bool UiTarget(VAddr address, u32 width, u32 height, u32& out_w, u32& out_h) {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_UI_HIRES");
+        return !v || v[0] != '0';
+    }();
+    if (!on || !SuperResolution() || !address || width != ui_width || height != ui_height ||
+        (address != ui_addresses[0] && address != ui_addresses[1]) ||
+        (out_width <= width && out_height <= height)) {
+        return false;
+    }
+    out_w = out_width;
+    out_h = out_height;
+    return true;
+}
+
+void NoteUiShadow(vk::Image image, u32 width, u32 height) {
+    if (!composite.captured) {
+        return;
+    }
+    composite.ui_shadow = image;
+    composite.shadow_width = width;
+    composite.shadow_height = height;
 }
 
 /// sr_color in place (shader read layout): NaN/Inf -> 0, clamp to 0..1 (dlss_color_sanitize.comp).
@@ -1120,6 +1178,7 @@ void SanitizeColor(vk::CommandBuffer cmdbuf) {
     }
     struct Params {
         u32 width, height, mark;
+        float limit;
     };
     static vk::DescriptorSetLayout set_layout;
     static vk::PipelineLayout layout;
@@ -1182,7 +1241,8 @@ void SanitizeColor(vk::CommandBuffer cmdbuf) {
                                        .descriptorCount = 1,
                                        .descriptorType = vk::DescriptorType::eStorageImage,
                                        .pImageInfo = &image};
-    const Params params{sr_color.width, sr_color.height, mode == 2 ? 1u : 0u};
+    const Params params{sr_color.width, sr_color.height, mode == 2 ? 1u : 0u,
+                        sr_hdr ? 64.0f : 1.0f};
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, write);
     cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(Params), &params);
@@ -1268,6 +1328,38 @@ void CopyComposite(vk::CommandBuffer cmdbuf, VideoCore::TextureCache& texture_ca
 
     SanitizeColor(cmdbuf);
     composite.copy_ok = true;
+
+    // The UI layer drawn at the output size, left in TransferSrcOptimal (its next draw starts
+    // from Undefined).
+    composite.ui_full_ok = false;
+    if (!composite.ui_shadow || !EnsureSrImage(sr_ui_full, vk::Format::eR8G8B8A8Srgb,
+                                               composite.shadow_width, composite.shadow_height)) {
+        return;
+    }
+    const std::array to_copy{
+        barrier(composite.ui_shadow, Layout::eColorAttachmentOptimal, Layout::eTransferSrcOptimal,
+                Stage::eColorAttachmentOutput, Access::eColorAttachmentWrite, Stage::eCopy,
+                Access::eTransferRead),
+        barrier(sr_ui_full.image, Layout::eUndefined, Layout::eTransferDstOptimal,
+                Stage::eAllCommands, Access::eNone, Stage::eCopy, Access::eTransferWrite),
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = static_cast<u32>(to_copy.size()),
+        .pImageMemoryBarriers = to_copy.data(),
+    });
+    const vk::ImageCopy full_region{
+        .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+        .extent = {composite.shadow_width, composite.shadow_height, 1},
+    };
+    cmdbuf.copyImage(composite.ui_shadow, Layout::eTransferSrcOptimal, sr_ui_full.image,
+                     Layout::eTransferDstOptimal, full_region);
+    const auto full_to_read =
+        barrier(sr_ui_full.image, Layout::eTransferDstOptimal, Layout::eShaderReadOnlyOptimal,
+                Stage::eCopy, Access::eTransferWrite, Stage::eFragmentShader, Access::eShaderRead);
+    cmdbuf.pipelineBarrier2(
+        vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &full_to_read});
+    composite.ui_full_ok = true;
 }
 
 Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& texture_cache,
@@ -1280,6 +1372,8 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
         sr_prev = false;
         return {};
     }
+    out_width = width;
+    out_height = height;
     const vk::CommandBuffer cmdbuf = scheduler.CommandBuffer();
     const FrameSlot& f = frames[frame_id];
     if (c.captured && !c.copied) { // no draw since the composite: copy now
@@ -1288,6 +1382,14 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
         c = std::exchange(composite, Composite{});
     }
     const bool copied = c.copy_ok && sr_color.width == f.width && sr_color.height == f.height;
+    const bool ui_full = c.copy_ok && c.ui_full_ok && sr_ui_full.width == width &&
+                         sr_ui_full.height == height;
+    const vk::ImageView ui_view = ui_full ? sr_ui_full.view : sr_ui.view;
+    if (ui_full && (!f.sl_valid || !copied)) {
+        // No DLSS inputs (splash, menus): the scene at the render size, the UI at the output size.
+        sr_prev = false;
+        return {sr_color.view, ui_view, {}, true, true, sr_color.width, sr_color.height};
+    }
     if (!f.sl_valid || !copied) {
         static u32 skipped = 0;
         if (c.captured && f.sl_valid && skipped++ < 5) {
@@ -1403,9 +1505,9 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
         return v && v[0] == 'i';
     }();
     if (view_input) {
-        return {sr_color.view, sr_ui.view};
+        return {sr_color.view, ui_view, {}, ui_full};
     }
-    return {sr_out.view, sr_ui.view, sky_bias_written ? f.bias_view : vk::ImageView{}};
+    return {sr_out.view, ui_view, sky_bias_written ? f.bias_view : vk::ImageView{}, ui_full};
 }
 
 // Streamline asks for vsync off with Vulkan, but DLSS-G generates and paces its frames in

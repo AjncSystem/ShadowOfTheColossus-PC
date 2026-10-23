@@ -81,6 +81,11 @@ bool SuperResolution();
 
 /// DLSS Super Resolution works on this device, also while F9 has it switched off.
 bool SuperResolutionAvailable();
+/// sotc: HDR output: the composite's scene keeps highlights above 1.0 (presenter thread).
+void SetHdr(bool hdr);
+/// sotc: the exponent of the game's HDR composite (1.0 on the splash and menus, 1.42 in game).
+void NoteHdrCurve(float k);
+float HdrCurve();
 
 /// SOTC_DLSS_COMPARE=1 (launcher debug option): F9 compares DLSS with FSR1, a label shows which.
 bool CompareMode();
@@ -101,10 +106,22 @@ bool Vignette(float out[4]);
 void NoteComposite(VideoCore::ImageId scene_id, VideoCore::ImageId ui_id,
                    VideoCore::TextureCache& texture_cache);
 
+/// sotc: SOTC_UI_HIRES (default on, 0 off) with super resolution: the draws into the game's UI
+/// layer (the image at `address` of the composite's UI size) are drawn again by the rasterizer
+/// into an image of the output size, given back here. False, or the output size.
+bool UiTarget(VAddr address, u32 width, u32 height, u32& out_width, u32& out_height);
+
+/// Command processor thread, after NoteComposite: the UI layer drawn at the output size, in layout
+/// ColorAttachmentOptimal; a null image when some draw into it could not be redrawn.
+void NoteUiShadow(vk::Image image, u32 width, u32 height);
+
 struct Upscaled {
     vk::ImageView scene; ///< linear colour at the output size, shader read only
     vk::ImageView ui;    ///< the game's UI layer (premultiplied, sRGB view), render size
     vk::ImageView sky;   ///< render size, g = 1 in the sky; empty without camera motion fill
+    bool ui_full{};      ///< ui is at the output size (UiTarget)
+    bool scene_low{};    ///< scene is the render size scene (no DLSS inputs): scale it
+    u32 scene_width{}, scene_height{};
 };
 
 /// Command processor thread, in PrepareFrame after PrepareInputs: DLSS upscales this frame's

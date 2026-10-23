@@ -204,6 +204,8 @@ private:
         boost::container::small_vector<vk::BufferCopy, 4> copies;
         /// The GPU-modified ranges downloaded; they stay in the set until SubtractDownloaded.
         boost::container::small_vector<std::pair<VAddr, u64>, 4> gpu_ranges;
+        /// sotc: brought along by the hot readbacks (SOTC_RB_HOT), not asked for.
+        bool hot = false;
     };
     /// Collects what a readback of [device_addr, +size) and the hot readbacks must copy. Returns
     /// the bytes to download. sotc: the ranges stay in the GPU-modified set until the caller

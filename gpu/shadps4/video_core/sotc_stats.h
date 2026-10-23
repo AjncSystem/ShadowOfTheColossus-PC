@@ -61,6 +61,8 @@ inline std::atomic<uint64_t> gc_downloads_skipped{0}; ///< SOTC_GC_DOWNLOAD=0
 inline std::atomic<uint64_t> f9_gpu_copies{0}; ///< F9 uploads whose memory the GPU had written
 /// sotc: bytes of hot readbacks not applied because the guest may have written them since.
 inline std::atomic<uint64_t> rb_hot_cpu_skipped{0};
+/// sotc: bytes of hot readbacks not applied because the guest wrote them during the GPU wait.
+inline std::atomic<uint64_t> rb_hot_late_skipped{0};
 inline std::atomic<uint64_t> readbacks{0};    ///< BufferCache::DownloadMemory calls
 inline std::atomic<uint64_t> readback_ns{0};  ///< time spent in them (copy and wait)
 inline std::atomic<uint64_t> watch_addr{0};     ///< SOTC_CS_WATCH: GPU writes to report

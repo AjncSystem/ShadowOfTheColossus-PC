@@ -157,7 +157,7 @@ def windows_language():
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
                 'user_dir': '', 'af16': True, 'textures': 'high', 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
-                'readbacks': '', 'extra_env': '', 'close_on_play': False, 'gamepad': '',
+                'readbacks': '', 'extra_env': '', 'close_on_play': False, 'skip_logos': False, 'gamepad': '',
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
@@ -571,6 +571,8 @@ def game_environment(s):
         # From Pink-shadPS4: no GPU index-buffer culling (always both), same image, far fewer
         # GPU results the CPU has to wait for.
         cvars += ['doIndexBufferCulling=0', 'doSunShadowIndexBufferCulling=0']
+    if s.get('skip_logos'):
+        cvars.append('skipSplash=1')
     cvars += str(s.get('engine_cvars', '')).split()
     env['SOTC_CVARS'] = ' '.join(cvars)
     env['SOTC_RECORD_THREAD'] = '1' if s.get('perf_record_thread', True) else '0'
@@ -1155,6 +1157,9 @@ class Launcher:
         self.row(f, _('Idioma do sistema', 'System language'), self.choice(f, 'language', LANGUAGES),
                  _('O idioma que o jogo vê no "console".', 'The language the game sees on the "console".'))
         self.row(f, _('Nome do jogador', 'Player name'), ttk.Entry(f, textvariable=self.var('player_name'), width=30))
+        self.check(f, 'skip_logos', _('Pular os logotipos de abertura', 'Skip the opening logos'),
+                   _('O jogo abre direto no menu, sem os logotipos de abertura e o aviso de salvamento automático.',
+                     'The game opens straight to the menu, without the opening logos and the autosave notice.'))
 
     def build_graphics(self):
         f = self.scrolled_page('graphics', _('Imagem e FPS', 'Display & FPS'),

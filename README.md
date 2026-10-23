@@ -180,6 +180,78 @@ with `user/last_run.log`.
 
 ---
 
+## Roadmap
+
+Public plan for this fork, updated as work lands (last update: 22/10/2026). Issue numbers refer to
+the original repository.
+
+**Part 1: upscalers (more FPS on weaker GPUs, sharper 1440p/4K output)**
+- [x] FSR 1 with RCAS (in place since 0.60.x)
+- [ ] Phase 0: test rendering below 1080p (e.g. 720p and 540p) with the game's own patches
+- [ ] Phase 1: keep the temporal inputs (depth, motion vectors, jitter, camera) available without frame generation
+- [ ] Phase 2: FSR 3.1 temporal upscaler (source already vendored, build flag off for now)
+- [ ] Phase 3: launcher and in-game options: upscaler and quality preset (restart needed to apply)
+- [ ] Phase 4: DLSS Super Resolution through Streamline, NVIDIA only (needs the user's own NVIDIA DLLs)
+- [ ] Phase 5: documentation
+
+**Part 2: up to 120 FPS in game, without frame generation**
+- Where we are: the Shrine of Worship runs at ~42 FPS on 0.60.6 with the safe defaults (~54 FPS with
+  the two readback options that caused rainbow noise, `0x49500` crashes and black sand dots turned
+  back on, so they stay off). The render thread needs ~20 ms per frame; 120 FPS means 8.3 ms.
+- [ ] T0: measure the current ceiling in the attract demo and the Shrine, per thread
+- [ ] T1: find out how the game simulates above 60 FPS (its clock is tied to the 60 FPS target today)
+- [ ] T2: reduce CPU work per draw: skip repeated register state, make the fast descriptor reuse safe,
+      move pure precomputation off the render thread; splitting the render thread is the last resort
+- [ ] T3: every change must pass the rainbow-noise and sand-dot checks before it becomes default
+- [ ] T4: 120 Hz presentation options in the launcher and the in-game menu
+- Milestones: M1 attract demo ≥ 100 FPS · M2 open world ≥ 90 · M3 Shrine ≥ 60 stable with safe
+  defaults · M4 Shrine 90 · M5 all scenes up to 120. Each one is marked only with a measured number.
+
+**Open items from the 0.60.6 release**
+- [ ] GCN cards: some runs end with a lost GPU device after the first colossus (issues #187, #123, #41).
+      The 32-lane change is not the cause; the event log from 0.60.6 is needed to continue.
+- [ ] FSR 1 on RDNA4 (#208, #209): fix in 0.60.5-plus3 not yet confirmed on hardware.
+- [ ] Upstream pull requests #198, #205 and #207: content already in 0.60.6; open decision on closing them.
+
+---
+
+## Roteiro (português)
+
+Plano público deste fork, atualizado conforme o trabalho avança (última atualização: 22/10/2026).
+Os números de issue se referem ao repositório original.
+
+**Parte 1: upscalers (mais FPS em GPUs mais fracas, saída 1440p/4K mais nítida)**
+- [x] FSR 1 com RCAS (já presente desde a 0.60.x)
+- [ ] Fase 0: teste de renderização abaixo de 1080p (ex.: 720p e 540p) com os ajustes do próprio jogo
+- [ ] Fase 1: manter as entradas temporais (profundidade, vetores de movimento, jitter, câmera) disponíveis sem geração de quadros
+- [ ] Fase 2: upscaler temporal FSR 3.1 (código-fonte já incluído, flag de build desligada por enquanto)
+- [ ] Fase 3: opções no launcher e no menu do jogo: upscaler e preset de qualidade (exige reiniciar para aplicar)
+- [ ] Fase 4: DLSS Super Resolution via Streamline, só NVIDIA (exige as DLLs NVIDIA fornecidas pelo usuário)
+- [ ] Fase 5: documentação
+
+**Parte 2: até 120 FPS no jogo, sem geração de quadros**
+- Onde estamos: o Santuário de Culto roda a ~42 FPS na 0.60.6 com os padrões seguros (~54 FPS
+  com as duas opções de leitura que causavam ruído colorido, crashes `0x49500` e pontos pretos na
+  areia religadas, então elas continuam desligadas). A thread de desenho gasta ~20 ms por quadro;
+  120 FPS significam 8,3 ms.
+- [ ] T0: medir o teto atual na demo de atração e no Santuário, por thread
+- [ ] T1: descobrir como o jogo simula acima de 60 FPS (hoje o relógio do jogo está ligado à meta de 60)
+- [ ] T2: reduzir o trabalho de CPU por desenho: pular estado de registradores repetido, tornar seguro o
+      reaproveitamento de descritores, mover pré-cálculo puro para fora da thread de desenho; dividir a
+      thread de desenho é o último recurso
+- [ ] T3: cada mudança precisa passar pelos testes de ruído colorido e de pontos pretos antes de virar padrão
+- [ ] T4: opções de apresentação a 120 Hz no launcher e no menu do jogo
+- Marcos: M1 demo de atração ≥ 100 FPS · M2 mundo aberto ≥ 90 · M3 Santuário ≥ 60 estável com os padrões
+  seguros · M4 Santuário 90 · M5 todas as cenas até 120. Cada marco só é marcado com um número medido.
+
+**Pendências da versão 0.60.6**
+- [ ] Placas GCN: algumas sessões terminam com a perda do dispositivo gráfico após o primeiro colosso
+      (issues #187, #123, #41). A conversão para 32 lanes não é a causa; é preciso o log de eventos da 0.60.6.
+- [ ] FSR 1 em RDNA4 (#208, #209): correção da 0.60.5-plus3 ainda não confirmada em hardware.
+- [ ] Pull requests do original #198, #205 e #207: o conteúdo já está na 0.60.6; decisão pendente sobre fechá-los.
+
+---
+
 ## Building
 
 Windows with [MSYS2](https://www.msys2.org/) (CLANG64); packages:

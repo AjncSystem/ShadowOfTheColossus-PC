@@ -4,6 +4,7 @@
 #include "common/types.h"
 #include "common/singleton.h"
 #include "core/address_space.h"
+#include "video_core/sotc_stats.h"
 
 namespace Vulkan { class Rasterizer; }
 
@@ -30,7 +31,9 @@ public:
     bool TryReadBacking(VAddr address, void* out, u64 size) {
         return TryCopySparseMemory(address, static_cast<u8*>(out), size);
     }
-    static void NoteHostWrite(VAddr, u64, u32, u64 = ~0ULL) {}
+    static void NoteHostWrite(VAddr, u64, u32, u64 = ~0ULL) {
+        SotcStats::mem_epoch.fetch_add(1, std::memory_order_relaxed); // reused binds (sotc_stats.h)
+    }
     /// CPU wrote guest memory outside page tracking (e.g. decoded video frames).
     void InvalidateMemory(VAddr address, u64 size);
     Vulkan::Rasterizer* GetRasterizer() const { return rasterizer; }

@@ -22,6 +22,9 @@ inline std::atomic<bool> uncapped{[] {
     return v && (v[0] == 'o' || v[0] == 'O' || v[0] == '0');
 }()};
 
+/// Uncapped frame limit set by the in-game menu: 60, 0 (unlimited), -1 the start's (SOTC_FPS_LIMIT).
+inline std::atomic<int> limit_fps{-1};
+
 /// The flip rate the game asked, -1 while it asked none (with the fps60 code patch it never does).
 inline std::atomic<int> game_rate{-1};
 

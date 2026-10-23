@@ -578,6 +578,7 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
         // stones after a save reload, 22 Oct; SOTC_RB_HOT=0 made it go away).
         const bool hot_region = region_index > 0;
         ReadbackItem item{region.arena, region.addr, region.size, {}};
+        item.hot = hot_region;
         const u64 total_before = total_size_bytes;
         const VAddr arena_base = region.arena->cpu_addr;
         memory_tracker->ForEachDownloadRange<false>(
@@ -871,7 +872,35 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                     SotcStats::readback_bytes_changed.fetch_add(changed, std::memory_order_relaxed);
                 }
             }
-            ForEachNonStackRange(dst_addr, copy.size, [&](VAddr addr, u64 size) {
+            // sotc: hot data is applied only to pages the guest has not written since the
+            // gather: a write fault during the GPU wait (the range was still GPU-modified, or
+            // its page left writable by the fault grace) set the CPU bit, and the guest's bytes
+            // are the right ones. Checked again here, page by page, right before the copy.
+            const auto write_pages = [&](VAddr start, u64 size, auto&& write) {
+                if (!item.hot) {
+                    write(start, size);
+                    return;
+                }
+                VAddr run = start;
+                const VAddr end = start + size;
+                for (VAddr page = start; page < end;) {
+                    const VAddr next = std::min(Common::AlignDown(page, 4_KB) + 4_KB, end);
+                    if (memory_tracker->IsRegionCpuModified(page, next - page)) {
+                        if (page > run) {
+                            write(run, page - run);
+                        }
+                        run = next;
+                        SotcStats::rb_hot_late_skipped.fetch_add(next - page,
+                                                                 std::memory_order_relaxed);
+                    }
+                    page = next;
+                }
+                if (end > run) {
+                    write(run, end - run);
+                }
+            };
+            write_pages(dst_addr, copy.size, [&](VAddr part_addr, u64 part_size) {
+            ForEachNonStackRange(part_addr, part_size, [&](VAddr addr, u64 size) {
                 BpeHeapGuard* heap_guard = nullptr;
                 if (Active* a = active_for(addr, size)) {
                     BpeUsedBlocks& used = *a->slot->used;
@@ -905,6 +934,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                 }
                 memory->TryWriteBacking(std::bit_cast<u8*>(addr), src + (addr - dst_addr), size,
                                         1);
+            });
             });
         }
         memory_tracker->UnmarkRegionAsGpuModified(item.addr, item.size, false);

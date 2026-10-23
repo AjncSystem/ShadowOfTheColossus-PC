@@ -364,7 +364,14 @@ void VideoOutDriver::Flip(const Request& req) {
                                      "Last minute: %.1f FPS average, %u frames over 50 ms, worst %.0f ms, video memory %llu MB"),
                            minute_flips / seconds, slow, worst_ms,
                            static_cast<unsigned long long>(SotcStats::vram_used.load(std::memory_order_relaxed) >> 20));
-            if (const u64 skipped = SotcStats::rb_hot_cpu_skipped.exchange(0, std::memory_order_relaxed)) {
+            const u64 skipped_cpu = SotcStats::rb_hot_cpu_skipped.exchange(0, std::memory_order_relaxed);
+            const u64 skipped_late = SotcStats::rb_hot_late_skipped.exchange(0, std::memory_order_relaxed);
+            if (skipped_cpu || skipped_late) {
+                std::fprintf(stderr, "SOTC RBHOT skipped: %llu KB at gather, %llu KB at apply\n",
+                             static_cast<unsigned long long>(skipped_cpu >> 10),
+                             static_cast<unsigned long long>(skipped_late >> 10));
+            }
+            if (const u64 skipped = skipped_cpu + skipped_late) {
                 SotcEvent::Log("MEMORY",
                                SotcUi::T("Leituras da GPU não aplicadas sobre memória que o jogo reescreveu: %llu KB",
                                          "GPU readbacks not applied over memory the game rewrote: %llu KB"),

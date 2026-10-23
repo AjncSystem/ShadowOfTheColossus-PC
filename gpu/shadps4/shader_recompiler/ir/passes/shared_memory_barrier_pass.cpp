@@ -180,7 +180,7 @@ static bool MultiWaveLdsBarriersEnabled() {
         if (const char* v = std::getenv("SOTC_LDS_BARRIERS")) {
             return std::atoi(v) != 0;
         }
-        return Common::ElfInfo::Instance().GameSerial() == "CUSA08809";
+        return Common::ElfInfo::Instance().IsSotc();
     }();
     return enabled;
 }
@@ -195,7 +195,7 @@ static bool SmallGroupLdsBarriersEnabled() {
         if (const char* v = std::getenv("SOTC_LDS_SMALL")) {
             return std::atoi(v) != 0;
         }
-        return Common::ElfInfo::Instance().GameSerial() == "CUSA08809";
+        return Common::ElfInfo::Instance().IsSotc();
     }();
     return enabled;
 }

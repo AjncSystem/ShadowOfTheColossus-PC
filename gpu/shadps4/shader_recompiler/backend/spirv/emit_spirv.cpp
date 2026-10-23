@@ -190,7 +190,7 @@ static u32 PerLoopIterationBudget() {
         if (const char* value = std::getenv("SHADPS4_LOOP_LIMIT_PER_LOOP")) {
             return static_cast<u32>(std::strtoul(value, nullptr, 0));
         }
-        return Common::ElfInfo::Instance().GameSerial() == "CUSA08809" ? (1U << 13) : 0U;
+        return Common::ElfInfo::Instance().IsSotc() ? (1U << 13) : 0U;
     }();
     return budget;
 }

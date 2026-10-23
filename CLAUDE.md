@@ -4,7 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Native Windows port of PS4 *Shadow of the Colossus* (CUSA08809, EU 1.01). Not an emulator: the game's
+Native Windows port of PS4 *Shadow of the Colossus* (CUSA08809 EU 1.01 and CUSA08034 US 1.00, the same
+eboot build; GPU workarounds gate on `ElfInfo::IsSotc()`, never on one serial). Not an emulator: the game's
 own x86-64 code runs directly on the host CPU, a C loader/runtime implements the PS4 system functions
 it imports, and a vendored shadPS4 video core translates the PS4 GPU (GCN command streams + shaders)
 to Vulkan/SPIR-V. Forked from bloodborne_pc ("bbport"): engine names (`bb-probe`, `bbgpu`, `bb_setjmp`,
@@ -47,7 +48,7 @@ Tests:
 Dev/bench helpers in `tools/` (bash, CLANG64): `sotc_run.sh [seconds] [log]` (rebuild + timed run),
 `sotc_bench_attract.sh` (title-screen attract demo FPS benchmark, used for numbers in CHANGELOG),
 `sotc_play.py`, `sotc_hangtest.py`, `sotc_bench_shrine.sh` (idle Shrine of Worship scene, ~5800 draws/frame;
-needs `out/save-template/CUSA08809`, a save after colossus 1 whose profile has the language set; the attract
+needs `out/save-template/CUSA08809` (or `CUSA08034`), a save after colossus 1 whose profile has the language set; the attract
 benchmark restores the same template and sits on the language menu without it). Profiling: `SOTC_PROFILE=<thread
 name part>` (e.g. `GpuCommandProcessor`, sampler in `src/probe.c`) with `SOTC_PROFILE_OUT=<file>`, then
 `tools/profile_functions.py <file> out/gpu/bb-probe.exe 60 --inlines --qualified`. At the benchmark scenes the
@@ -63,7 +64,7 @@ via `SOTC_WRAP` (JSON command prefix, see `sotc.py`) + F12.
      PRXs (+ user's sys modules) into one image with a shared import table → `out/boot-linked.bin` (BBPROBE5).
    - `content_profile.py` → `out/content.bin`; `sotc_cpu.py` → `out/sotc-cpu.bin` (function starts
      from `PT_GNU_EH_FRAME` for SSE4a / red-zone CPU patches).
-   - `sotc_modes.py` (every launch) → `out/patches.bin` (60 FPS etc., EU 1.01 only) and
+   - `sotc_modes.py` (every launch) → `out/patches.bin` (60 FPS etc., EU 1.01 / US 1.00 only) and
      `out/cmdline.bin` (Bluepoint engine cvars).
    - Packaged builds: `SotC.exe --script` runs these scripts, so any new stdlib import in a script
      may need a `--hidden-import` in `package_sotc.sh`, and new scripts must be copied there.

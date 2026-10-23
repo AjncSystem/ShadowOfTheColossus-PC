@@ -198,12 +198,12 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         // that; without it the writes of failing fragments land too (SotC deferred decals paint
         // their whole box footprint into the G-buffer: rectangles on the ground). Not with a
         // depth, stencil ref or sample mask export (mrtz_mask bits 0-2), the tests need them.
-        // From Pink-shadPS4 (luizgustavs). SotC only; SOTC_EARLY_Z=0/1 overrides.
+        // From Pink-shadPS4 (luizgustavs). SotC only (EU and US); SOTC_EARLY_Z=0/1 overrides.
         static const bool early_z_enabled = [] {
-            if (const char* v = std::getenv("SOTC_EARLY_Z")) {
-                return std::atoi(v) != 0;
-            }
-            return Common::ElfInfo::Instance().GameSerial() == "CUSA08809";
+            const char* v = std::getenv("SOTC_EARLY_Z");
+            const bool on = v ? std::atoi(v) != 0 : Common::ElfInfo::Instance().IsSotc();
+            std::fprintf(stderr, "SOTC early fragment tests: %s\n", on ? "on" : "off");
+            return on;
         }();
         const auto z_order = regs.depth_shader_control.z_order;
         info.hw.fs.early_fragment_tests =
@@ -1343,7 +1343,7 @@ std::optional<std::vector<u32>> PipelineCache::GetShaderPatch(u64 hash, Shader::
     base_path += ".base";
     if (std::filesystem::exists(base_path)) {
         const auto base_file = IOFile{base_path, FileAccessMode::Read};
-        std::string text(base_file.GetSize(), ' ');
+        std::string text(base_file.GetSize(), '\0');
         base_file.ReadSpan(std::span<char>{text});
         const u64 base_hash = std::strtoull(text.c_str(), nullptr, 16);
         if (base_hash != generated_hash) {

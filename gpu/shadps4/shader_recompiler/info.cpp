@@ -40,7 +40,7 @@ u32 DynamicTsharpArraySize() {
         if (const char* v = std::getenv("SOTC_TSHARP_ARRAY")) {
             return static_cast<u32>(std::strtoul(v, nullptr, 10));
         }
-        return Common::ElfInfo::Instance().GameSerial() == "CUSA08809" ? 16u : 0u;
+        return Common::ElfInfo::Instance().IsSotc() ? 16u : 0u;
     }();
     return std::min(size, MAX_TSHARP_ARRAY_SIZE);
 }

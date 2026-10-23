@@ -6,7 +6,7 @@
 #   SotC-Play.bat    : starts the game normally and shows the same live status, so a pause is
 #                      shown as "COMPILING" (first time a shader is seen) instead of a mystery.
 #
-# How it works: the port saves every pipeline it builds (user\cache\CUSA08809[_nodma]\*.key) and
+# How it works: the port saves every pipeline it builds (user\cache\<CUSA08809 EU or CUSA08034 US>[_nodma]\*.key) and
 # rebuilds all of them at startup ("Preloaded N pipelines"); Intel's driver keeps the compiled
 # code in %USERPROFILE%\AppData\LocalLow\Intel\ShaderCache, so known shaders load fast. Only
 # shaders never seen before compile during play, and on Intel Arc that can take minutes each.
@@ -37,8 +37,11 @@ if (-not (Test-Path $Exe)) { Say "SotC.exe not found next to this script ($Port)
 if (-not (Test-Path $SettingsPath)) { Say "Open SotC.exe once first (no launcher settings yet)." Red; exit 1 }
 
 $settings = (ReadSettings) | ConvertFrom-Json
-$cacheName = if ($settings.perf_dma -eq $false) { 'CUSA08809_nodma' } else { 'CUSA08809' }
-$CacheDir = Join-Path $Port "user\cache\$cacheName"
+$cacheSuffix = if ($settings.perf_dma -eq $false) { '_nodma' } else { '' }
+# The EU (CUSA08809) or US (CUSA08034) release: the cache folder written last, EU when none exists yet.
+$CacheDir = @('CUSA08809', 'CUSA08034') | ForEach-Object { Join-Path $Port "user\cache\$_$cacheSuffix" } |
+    Where-Object { Test-Path $_ } | Sort-Object { (Get-Item $_).LastWriteTime } -Descending | Select-Object -First 1
+if (-not $CacheDir) { $CacheDir = Join-Path $Port "user\cache\CUSA08809$cacheSuffix" }
 function CachedPipelines {
     if (-not (Test-Path $CacheDir)) { return 0 }
     return @(Get-ChildItem $CacheDir -Filter '*.key' -File -ErrorAction SilentlyContinue).Count

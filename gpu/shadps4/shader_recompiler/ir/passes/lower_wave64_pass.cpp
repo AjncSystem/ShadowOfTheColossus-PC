@@ -207,7 +207,7 @@ bool Wave64UniformBranchesEnabled() {
     if (forced >= 0) {
         return forced != 0;
     }
-    static const bool sotc = Common::ElfInfo::Instance().GameSerial() == "CUSA08809";
+    static const bool sotc = Common::ElfInfo::Instance().IsSotc();
     return sotc && wave64_uniform_default != 0;
 }
 

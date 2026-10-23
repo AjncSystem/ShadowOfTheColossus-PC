@@ -14,7 +14,11 @@ holds a FNV-1a 32 hash of everything after its 16 bytes (at offset 4) and that s
 import argparse
 import shutil
 import struct
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
+from sotc_modes import GAMES  # noqa: E402
 
 WANDER_ID, AGRO_ID = 0x60, 0x78
 
@@ -47,7 +51,10 @@ def main():
     x, y, z = args.x, args.y, (-args.z if args.render else args.z)
     shutil.rmtree(args.dest, ignore_errors=True)
     shutil.copytree(args.source, args.dest)
-    root = Path(args.dest) / 'CUSA08809'
+    # The save folder of the EU (CUSA08809) or US (CUSA08034) release, whichever the copy holds.
+    root = next((Path(args.dest) / s for s in GAMES if (Path(args.dest) / s).is_dir()), None)
+    if root is None:
+        raise SystemExit(f'no {" or ".join(GAMES)} save folder in {args.source}')
     for path in (root / 'SAVEDATA0ShadowProgress0' / 'USR-DATA',
                  root / 'SAVEDATA0ShadowProgress0.sce_backup' / 'data' / 'USR-DATA'):
         data = bytearray(path.read_bytes())

@@ -9,7 +9,10 @@ from pathlib import Path
 import string
 import time
 
-GAME_ID = 'CUSA08809'
+from sotc_modes import GAMES
+
+# The supported releases (EU CUSA08809 first, then US CUSA08034): the same eboot build.
+GAME_IDS = tuple(GAMES)
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
 
 # Folders never worth entering on a drive scan.
@@ -41,14 +44,23 @@ def game_record(folder):
     }
 
 
-def is_game_dlc(folder):
-    """True for an add-on content folder of the game (param.sfo: CATEGORY ac, CONTENT_ID of it)."""
+def dlc_serial(folder):
+    """The supported title ID an add-on content folder belongs to (param.sfo: CATEGORY ac, the
+    title ID inside CONTENT_ID), or None."""
     try:
         from prepare import sfo
         values = sfo((Path(folder) / 'sce_sys' / 'param.sfo').read_bytes())
     except (OSError, ValueError, ImportError):
-        return False
-    return str(values.get('CATEGORY', '')).startswith('ac') and GAME_ID in str(values.get('CONTENT_ID', ''))
+        return None
+    if not str(values.get('CATEGORY', '')).startswith('ac'):
+        return None
+    content = str(values.get('CONTENT_ID', ''))
+    return next((serial for serial in GAME_IDS if serial in content), None)
+
+
+def is_game_dlc(folder, serial):
+    """True for an add-on content folder of the game serial (the same region only)."""
+    return dlc_serial(folder) == serial
 
 
 def _walk_dirs(root, depth):
@@ -68,39 +80,51 @@ def _walk_dirs(root, depth):
             pass
 
 
-def is_dlc_pkg(path):
-    """True for an add-on package of the game not installed (header: content type 0x1b, a
-    content ID of the game). The runtime lists these without extracting them."""
+def is_dlc_pkg(path, serial):
+    """True for an add-on package of the game serial not installed (header: content type 0x1b, a
+    content ID of that title). The runtime lists these without extracting them."""
     try:
         with open(path, 'rb') as f:
             header = f.read(0x80)
     except OSError:
         return False
     return (len(header) == 0x80 and header[:4] == b'\x7fCNT' and header[0x74:0x78] == b'\0\0\0\x1b'
-            and GAME_ID.encode() in header[0x40:0x64])
+            and serial.encode() in header[0x40:0x64])
 
 
-def _dlc_entries(folder):
-    """The DLC in one folder: add-on folders (sce_sys/param.sfo) and add-on packages."""
+def _dlc_entries(folder, serial):
+    """The DLC of the game serial in one folder: add-on folders (sce_sys/param.sfo) and add-on
+    packages. DLC of the other region is left out, as the runtime does."""
     found = []
     try:
         entries = list(os.scandir(folder))
     except OSError:
         return found
     for entry in entries:
-        if entry.is_dir(follow_symlinks=False):
-            if (Path(entry.path) / 'sce_sys' / 'param.sfo').is_file() and is_game_dlc(entry.path):
+        try:
+            if entry.is_dir(follow_symlinks=False):
+                if (Path(entry.path) / 'sce_sys' / 'param.sfo').is_file() and is_game_dlc(entry.path, serial):
+                    found.append(entry.path)
+            elif entry.name.lower().endswith('.pkg') and is_dlc_pkg(entry.path, serial):
                 found.append(entry.path)
-        elif entry.name.lower().endswith('.pkg') and is_dlc_pkg(entry.path):
-            found.append(entry.path)
+        except OSError:  # a folder this user can't read
+            pass
     return found
 
 
+def game_serial(game_dir):
+    """The title ID of a game folder, CUSA08809 (the EU release) when it can't be read."""
+    record = game_record(game_dir) if game_dir else None
+    return record['id'] if record and record['id'] in GAME_IDS else GAME_IDS[0]
+
+
 def find_dlc_root(game_dir, chosen=None):
-    """The folder to give the runtime as SOTC_DLC_DIR: where the most DLC (installed folders or
-    .pkg files) is, looking inside the game folder, in the main folder that holds it and in the
-    folders next to that one (a "DLC pack" folder beside the game). '' without any."""
+    """The folder to give the runtime as SOTC_DLC_DIR: where the most DLC of the game's region
+    (installed folders or .pkg files) is, looking inside the game folder, in the main folder that
+    holds it and in the folders next to that one (a "DLC pack" folder beside the game). '' without
+    any."""
     game_dir = Path(game_dir)
+    serial = game_serial(game_dir)
     counts = {}
     roots = [(game_dir, 2), (game_dir.parent, 3), (game_dir.parent.parent, 2)]
     if chosen:  # the folder the user picked holds the game and, likely, the DLC too
@@ -109,38 +133,40 @@ def find_dlc_root(game_dir, chosen=None):
         for path in _walk_dirs(root, depth):
             if os.path.normcase(path) == os.path.normcase(str(game_dir)):
                 continue  # the game's own folders are big and hold no DLC
-            entries = _dlc_entries(path)
+            entries = _dlc_entries(path, serial)
             if entries:
                 counts[path] = len(entries)
     if not counts:
         return ''
     best = Path(max(counts, key=counts.get))
-    # shadPS4 layout: <addcont>/CUSA08809/<dlc>; the runtime looks in the CUSA08809 subfolder.
-    return str(best.parent if best.name.upper() == GAME_ID else best)
+    # shadPS4 layout: <addcont>/<title id>/<dlc>; the runtime looks in the <title id> subfolder.
+    return str(best.parent if best.name.upper() == serial else best)
 
 
-def dlc_count(root):
-    """How many DLC the runtime will list for SOTC_DLC_DIR root."""
+def dlc_count(root, serial):
+    """How many DLC the runtime will list for SOTC_DLC_DIR root when the game serial runs."""
     if not root or not Path(root).is_dir():
         return 0
-    base = Path(root) / GAME_ID if (Path(root) / GAME_ID).is_dir() else Path(root)
-    return len(_dlc_entries(base))
+    base = Path(root) / serial if (Path(root) / serial).is_dir() else Path(root)
+    return len(_dlc_entries(base, serial))
 
 
 UPDATE_SUFFIXES = ('-UPDATE', '-patch')
 
 
 def find_game_in(folder):
-    """The GAME_ID base game folder: folder itself or one below it (depth 3), as shadPS4 finds it
-    from the main folder; update folders (<game>-UPDATE, <game>-patch) only when nothing else."""
+    """A supported base game folder (EU or US): folder itself or one below it (depth 3), as
+    shadPS4 finds it from the main folder; update folders (<game>-UPDATE, <game>-patch) only when
+    nothing else; the EU release before the US one."""
     games = []
     for path in _walk_dirs(folder, 3):
         if (Path(path) / 'eboot.bin').is_file():
             record = game_record(path)
-            if record and record['id'] == GAME_ID:
-                games.append(path)
-    games.sort(key=lambda p: Path(p).name.lower().endswith(tuple(s.lower() for s in UPDATE_SUFFIXES)))
-    return games[0] if games else None
+            if record and record['id'] in GAME_IDS:
+                games.append((path, record['id']))
+    games.sort(key=lambda g: (Path(g[0]).name.lower().endswith(tuple(s.lower() for s in UPDATE_SUFFIXES)),
+                              GAME_IDS.index(g[1])))
+    return games[0][0] if games else None
 
 
 def find_update(game_dir):
@@ -178,7 +204,7 @@ def library_games(folders, depth=3):
     for folder in folders:
         if folder and Path(folder).is_dir():
             visit(folder, 0)
-    return sorted(games, key=lambda g: (g['id'] != GAME_ID, g['title'].lower()))
+    return sorted(games, key=lambda g: (g['id'] not in GAME_IDS, g['title'].lower()))
 
 
 def local_drives():
@@ -199,7 +225,8 @@ def local_drives():
 
 def scan(seconds=25.0, depth=5, extra_roots=()):
     """Walks the drives (the likely places first) for the game, sound modules and saves.
-    Returns {'games': [records of GAME_ID], 'sys_modules': [folders], 'saves': [folders]}."""
+    Returns {'games': [records of a supported title], 'sys_modules': [folders],
+    'saves': [folders, each named after its title ID], 'dlc': [(folder, title ID)]}."""
     found = {'games': [], 'sys_modules': [], 'saves': [], 'dlc': []}
     seen = set()
     deadline = time.monotonic() + seconds
@@ -223,23 +250,25 @@ def scan(seconds=25.0, depth=5, extra_roots=()):
         names = {e.name.lower(): e for e in entries}
         if 'eboot.bin' in names:
             record = game_record(path)
-            if record and record['id'] == GAME_ID:
+            if record and record['id'] in GAME_IDS:
                 found['games'].append(record)
             return
         if all(m.lower() in names for m in SYS_MODULES):
             found['sys_modules'].append(path)
-        if 'sce_sys' in names and is_game_dlc(path):
+        serial = dlc_serial(path) if 'sce_sys' in names else None
+        if serial:
             parent = os.path.dirname(path)
-            if os.path.basename(parent).upper() == GAME_ID:  # shadPS4's addcont/CUSA08809/<dlc>
+            if os.path.basename(parent).upper() == serial:  # shadPS4's addcont/<title id>/<dlc>
                 parent = os.path.dirname(parent)
-            if parent not in found['dlc']:
-                found['dlc'].append(parent)
+            if (parent, serial) not in found['dlc']:
+                found['dlc'].append((parent, serial))
             return
         base = os.path.basename(path).lower()
         if base == 'savedata':
-            for sub in (Path(path) / GAME_ID, *Path(path).glob('*/' + GAME_ID)):
-                if sub.is_dir() and any(sub.iterdir()):
-                    found['saves'].append(str(sub))
+            for serial in GAME_IDS:
+                for sub in (Path(path) / serial, *Path(path).glob('*/' + serial)):
+                    if sub.is_dir() and any(sub.iterdir()):
+                        found['saves'].append(str(sub))
         if level >= depth:
             return
         for entry in entries:

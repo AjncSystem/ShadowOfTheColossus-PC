@@ -1,5 +1,26 @@
 # Changelog
 
+## Não lançado — versão americana (CUSA08034)
+- **O dump americano CUSA08034 (1.00, a única versão americana) funciona.** O executável é o
+  mesmo da versão europeia 1.01 (código e dados idênticos byte a byte; os arquivos `.psarc`
+  também), então todas as correções, os modos de patch (60 FPS, filtro 16x, tamanho de
+  renderização) e a proteção da red zone valem para os dois. Só os logos e telas legais mudam
+  (o jogo escolhe a região pelo `gameversion.txt`). Testado até o segundo colosso.
+- As correções da GPU antes restritas ao CUSA08809 (barreiras LDS, wave64, tabelas de T#,
+  testes de profundidade antecipados dos decalques, flush periódico) agora valem para os dois
+  seriais (`IsSotc()`). Sem os testes antecipados, os decalques atrás de um objeto pintavam a
+  caixa inteira por cima dele (bordas e texturas do fundo na frente). O log mostra
+  `SOTC early fragment tests: on`.
+- **Saves separados por versão** (`user/savedata/1/CUSA08034`) e cache de shaders próprio
+  (`user/cache/CUSA08034`). **DLCs só da mesma região** (pasta `addcont/CUSA08034`, content ID
+  `UP9000-CUSA08034_00-...`).
+- **Lançador:** acha o dump americano pelo `TITLE_ID` do `param.sfo`, com qualquer nome de pasta
+  (como `CUSA08034-app`), mostra "✓ CUSA08034 versão 01.00: todos os modos disponíveis" e não
+  marca mais o dump como não suportado. Com os dois dumps, o europeu vem primeiro.
+- Ferramentas (`tools/`) e o modelo de save dos benchmarks aceitam os dois seriais. Testes novos
+  (`tests/test_games.py`) falham se algum código voltar a testar um serial só.
+- A versão americana não tem os 3 textos em árabe da atualização europeia 1.01.
+
 ## 0.60.6 — 2026-10-22
 - **Fim do ruído arco-íris nas texturas e das quedas "do nada" (`0x49500`).** A causa eram as
   leituras "quentes" da GPU (`SOTC_RB_HOT`): junto com cada leitura, o port escrevia na memória do

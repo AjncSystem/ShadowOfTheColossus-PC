@@ -36,7 +36,10 @@ LEGACY_CONFIG_DIR = Path(os.environ.get('APPDATA', Path.home())) / 'sotc-launche
 LEGACY_CONFIG_FILE = LEGACY_CONFIG_DIR / 'settings.json'
 CONFIG_DIR = PORT_DIR / 'user'
 CONFIG_FILE = CONFIG_DIR / 'launcher_settings.json'
-GAME_ID, GAME_VERSION = 'CUSA08809', '01.01'
+# The supported releases (title ID -> region, version) share one eboot build; scripts/ is on
+# sys.path above. The EU one (CUSA08809) is the default game folder.
+from sotc_modes import GAMES  # noqa: E402
+GAME_ID = 'CUSA08809'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
 VERSION = '0.60.6-opt10'
 MAX_LOG_LINES = 6000
@@ -344,30 +347,32 @@ def load_json(path, default):
         return default
 
 
-_EBOOT_VERSIONS = {}
+_EBOOT_SUPPORTED = {}
 
 
-def eboot_version(eboot):
-    """'01.01' when the eboot holds the EU 1.01 code the modes patch (dumps often keep the base
-    game's param.sfo next to the updated eboot), else None. Cached per file state."""
+def eboot_supported(eboot):
+    """True when the eboot holds the code the modes patch (EU 1.01 and US 1.00 are the same
+    build; dumps often keep the base game's param.sfo next to the updated eboot). Cached per file
+    state."""
     try:
         stat = eboot.stat()
     except OSError:
-        return None
+        return False
     key = (str(eboot), stat.st_size, stat.st_mtime_ns)
-    if key not in _EBOOT_VERSIONS:
+    if key not in _EBOOT_SUPPORTED:
         try:
             from prepare import parse_self
             from sotc_modes import is_supported
             elf, _h, ph, _s, _m = parse_self(eboot.read_bytes())
-            _EBOOT_VERSIONS[key] = GAME_VERSION if is_supported(elf, ph) else None
+            _EBOOT_SUPPORTED[key] = is_supported(elf, ph)
         except (OSError, ValueError, ImportError):
-            _EBOOT_VERSIONS[key] = None
-    return _EBOOT_VERSIONS[key]
+            _EBOOT_SUPPORTED[key] = False
+    return _EBOOT_SUPPORTED[key]
 
 
 def game_info(folder):
-    """(title id, game version) of a game folder, or None without eboot.bin."""
+    """(title id, game version) of a game folder, or None without eboot.bin. A supported release
+    shows its version (EU 01.01, US 01.00) whatever its param.sfo says."""
     folder = Path(folder or '.')
     if not (folder / 'eboot.bin').is_file():
         return None
@@ -377,12 +382,32 @@ def game_info(folder):
         title, version = values.get('TITLE_ID', '?'), values.get('APP_VER', '?')
     except (OSError, ValueError, ImportError):
         title, version = '?', '?'
-    return title, eboot_version(folder / 'eboot.bin') or version
+    if title in GAMES and eboot_supported(folder / 'eboot.bin'):
+        version = GAMES[title][1]
+    return title, version
+
+
+def game_supported(folder):
+    """True for a supported release (EU or US) whose eboot the modes patch."""
+    info = game_info(folder)
+    return bool(info) and info[0] in GAMES and eboot_supported(Path(folder) / 'eboot.bin')
+
+
+def game_serial(folder):
+    """The title ID of the game folder, for its saves and DLC; CUSA08809 (EU) when unknown."""
+    info = game_info(folder) if folder else None
+    return info[0] if info and info[0] in GAMES else GAME_ID
+
+
+def supported_games():
+    """'CUSA08809 01.01, CUSA08034 01.00' for messages."""
+    return ', '.join(f'{serial} {version}' for serial, (_region, version) in GAMES.items())
 
 
 def user_dir(s):
-    """The data folder (saves in savedata/1/CUSA08809 below it). A folder picked one level too
-    deep (savedata itself, or a save folder) is taken back up to the data folder."""
+    """The data folder (saves in savedata/1/<title id> below it: CUSA08809 EU, CUSA08034 US). A
+    folder picked one level too deep (savedata itself, or a save folder) is taken back up to the
+    data folder."""
     folder = Path(s.get('user_dir') or PORT_DIR / 'user')
     parts = [p.lower() for p in folder.parts]
     if 'savedata' in parts:
@@ -721,13 +746,14 @@ def is_wide(size):
     return w * 9 > h * 16 * 1.02
 
 
-def shadps4_saves():
-    """Save folders of shadPS4 installations next to the port or in the usual places."""
+def shadps4_saves(serial):
+    """Save folders of the game serial in shadPS4 installations next to the port or in the usual
+    places."""
     roots = [PORT_DIR.parent, Path.home(), Path(os.environ.get('APPDATA', Path.home()))]
     found = []
     for root in roots:
-        for pattern in ('*/user/home/*/savedata/' + GAME_ID, '*/*/user/home/*/savedata/' + GAME_ID,
-                        'shadPS4/savedata/*/' + GAME_ID):
+        for pattern in ('*/user/home/*/savedata/' + serial, '*/*/user/home/*/savedata/' + serial,
+                        'shadPS4/savedata/*/' + serial):
             try:
                 found += [p for p in root.glob(pattern) if p.is_dir()]
             except OSError:
@@ -1167,8 +1193,10 @@ class Launcher:
         self.library_label.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(4, 0))
         self.section(f, _('Jogo', 'Game'))
         self.folder(f, 'game_dir', _('Pasta do jogo', 'Game folder'), _('Pasta com eboot.bin', 'Folder with eboot.bin'),
-                    _('O dump CUSA08809 (versão europeia 1.01), com eboot.bin, sce_module e sce_sys.',
-                      'The CUSA08809 dump (EU version 1.01) with eboot.bin, sce_module and sce_sys.'),
+                    _('O dump CUSA08809 (versão europeia 1.01) ou CUSA08034 (versão americana 1.00), com eboot.bin, '
+                      'sce_module e sce_sys.',
+                      'The CUSA08809 dump (EU version 1.01) or CUSA08034 dump (US version 1.00) with eboot.bin, '
+                      'sce_module and sce_sys.'),
                     on_change=self.game_changed)
         self.section(f, _('Som', 'Sound'))
         self.folder(f, 'sys_modules', _('Módulos de som', 'Sound modules'),
@@ -1188,9 +1216,11 @@ class Launcher:
         self.section(f, _('DLC', 'DLC'))
         self.folder(f, 'dlc_dir', _('Pasta de DLC', 'DLC folder'), _('Pasta com as DLCs do jogo', "Folder with the game's DLC"),
                     _('Como no shadPS4: uma pasta com uma subpasta por DLC (cada uma com sce_sys/param.sfo), ou a '
-                      'pasta addcont do shadPS4 (que tem a subpasta CUSA08809). Vazio = sem DLC.',
+                      'pasta addcont do shadPS4 (que tem a subpasta CUSA08809 ou CUSA08034). Só valem as DLCs da '
+                      'região do jogo. Vazio = sem DLC.',
                       "As in shadPS4: a folder with one subfolder per DLC (each with sce_sys/param.sfo), or "
-                      "shadPS4's addcont folder (which holds the CUSA08809 subfolder). Empty = no DLC."),
+                      "shadPS4's addcont folder (which holds the CUSA08809 or CUSA08034 subfolder). Only DLC of the "
+                      "game's region counts. Empty = no DLC."),
                     on_change=self.refresh_status)
         self.section(f, _('Saves', 'Saves'))
         self.folder(f, 'user_dir', _('Pasta de dados', 'Data folder'), _('Pasta dos saves', 'Saves folder'),
@@ -1200,8 +1230,9 @@ class Launcher:
         holder = ttk.Frame(f)
         holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(10, 0))
         ttk.Button(holder, text=_('Importar save do shadPS4…', 'Import a shadPS4 save…'), command=self.import_save).pack(side='left')
-        ttk.Label(holder, text=_('Copia a pasta savedata/CUSA08809 do shadPS4 para cá.',
-                                 'Copies shadPS4\'s savedata/CUSA08809 folder here.'), style='Muted.TLabel').pack(side='left', padx=10)
+        ttk.Label(holder, text=_('Copia a pasta savedata/CUSA08809 (ou CUSA08034) do shadPS4 para cá.',
+                                 'Copies shadPS4\'s savedata/CUSA08809 (or CUSA08034) folder here.'),
+                  style='Muted.TLabel').pack(side='left', padx=10)
         self.section(f, _('Sistema', 'System'))
         self.row(f, _('Idioma do sistema', 'System language'), self.choice(f, 'language', LANGUAGES),
                  _('O idioma que o jogo vê no "console".', 'The language the game sees on the "console".'))
@@ -1212,8 +1243,9 @@ class Launcher:
 
     def build_graphics(self):
         f = self.scrolled_page('graphics', _('Imagem e FPS', 'Display & FPS'),
-                               _('Os modos vêm do fork shadPS4 SotC e valem para a versão EU 1.01.',
-                                 'The modes come from the shadPS4 SotC fork and apply to EU version 1.01.'))
+                               _('Os modos vêm do fork shadPS4 SotC e valem para as versões EU 1.01 e US 1.00.',
+                                 'The modes come from the shadPS4 SotC fork and apply to EU version 1.01 and US '
+                                 'version 1.00.'))
         self.section(f, _('Modos', 'Modes'), top=4)
         self.check(f, 'af16', _('Texturas nítidas (filtro anisotrópico 16x)', 'Sharp textures (16x anisotropic filtering)'),
                    _('Chão, grama e rochas ficam nítidos à distância, quase sem custo.',
@@ -1536,11 +1568,11 @@ class Launcher:
         info = game_info(self.var('game_dir').get())
         if not info:
             game = _('✗ Não há eboot.bin na pasta do jogo (Jogo e saves)', '✗ No eboot.bin in the game folder (Game & saves)')
-        elif info == (GAME_ID, GAME_VERSION):
+        elif game_supported(self.var('game_dir').get()):
             game = _('✓ {} versão {}: todos os modos disponíveis', '✓ {} version {}: every mode available').format(*info)
         else:
-            game = _('⚠ {} versão {}: o port foi feito para {} {}; os modos não se aplicam',
-                     '⚠ {} version {}: the port targets {} {}; the modes do not apply').format(*info, GAME_ID, GAME_VERSION)
+            game = _('⚠ {} versão {}: o port foi feito para {}; os modos não se aplicam',
+                     '⚠ {} version {}: the port targets {}; the modes do not apply').format(*info, supported_games())
         modules = Path(self.var('sys_modules').get() or '.')
         if self.var('sys_modules').get() and all((modules / m).is_file() for m in SYS_MODULES):
             sound = _('✓ Módulos de som encontrados', '✓ Sound modules found')
@@ -1548,11 +1580,12 @@ class Launcher:
             sound = _('⚠ Sem os módulos de som do seu console: o jogo fica mudo (Jogo e saves)',
                       '⚠ No sound modules from your console: the game is silent (Game & saves)')
         user = user_dir({'user_dir': self.var('user_dir').get()})
-        saves = user / 'savedata' / '1' / GAME_ID
+        serial = game_serial(self.var('game_dir').get())
+        saves = user / 'savedata' / '1' / serial
         save = (_('✓ Saves em {}', '✓ Saves in {}').format(saves) if saves.is_dir() and any(saves.iterdir())
                 else _('• Ainda sem saves: o jogo cria em {}', '• No saves yet: the game creates them in {}').format(saves))
         from sotc_discovery import dlc_count
-        count = dlc_count(self.var('dlc_dir').get())
+        count = dlc_count(self.var('dlc_dir').get(), serial)
         dlc = (_('✓ DLC: {} instalada(s)', '✓ DLC: {} installed').format(count) if count
                else _('• Sem DLC', '• No DLC'))
         for key, text in (('game', game), ('dlc', dlc), ('sound', sound), ('saves', save), ('gpu', self.gpu_text)):
@@ -1625,16 +1658,19 @@ class Launcher:
             LEGACY_CONFIG_FILE.write_text(text, encoding='utf-8')
 
     def import_save(self):
-        found = shadps4_saves()
+        serial = game_serial(self.var('game_dir').get())
+        found = shadps4_saves(serial)
         initial = str(found[0]) if found else str(PORT_DIR.parent)
-        chosen = self.filedialog.askdirectory(title=_('Pasta savedata/CUSA08809 do shadPS4', "shadPS4's savedata/CUSA08809 folder"),
+        chosen = self.filedialog.askdirectory(title=_('Pasta savedata/{} do shadPS4', "shadPS4's savedata/{} folder").format(serial),
                                               initialdir=initial)
         if not chosen:
             return
         source = Path(chosen)
-        if source.name != GAME_ID and (source / GAME_ID).is_dir():
-            source = source / GAME_ID
-        target = user_dir({'user_dir': self.var('user_dir').get()}) / 'savedata' / '1' / GAME_ID
+        # A savedata folder: its subfolder of this game, else of the other release (EU and US
+        # saves are of the same game build). The save goes to this game's folder.
+        if source.name not in GAMES:
+            source = next((source / s for s in (serial, *GAMES) if (source / s).is_dir()), source)
+        target = user_dir({'user_dir': self.var('user_dir').get()}) / 'savedata' / '1' / serial
         # sotc: one save folder picked (it holds sce_sys/param.sfo): import it as one save. The
         # runtime creates the port's metadata for saves that come without it.
         single = (source / 'sce_sys' / 'param.sfo').is_file()
@@ -1693,10 +1729,10 @@ class Launcher:
         self.setup_button = ttk.Button(inner, text=_('Escolher a pasta do jogo…', 'Choose the game folder…'),
                                        style='Play.TButton', command=self.choose_game_for_setup)
         self.setup_button.pack(ipadx=18)
-        tk.Label(inner, text=_('A pasta principal do jogo, como no shadPS4: as subpastas do jogo (CUSA08809), da '
-                               'atualização (-UPDATE/-patch) e das DLCs são encontradas sozinhas.',
-                               "The game's main folder, as in shadPS4: the game (CUSA08809), update (-UPDATE/-patch) "
-                               'and DLC subfolders are found on their own.'),
+        tk.Label(inner, text=_('A pasta principal do jogo, como no shadPS4: as subpastas do jogo (CUSA08809 ou '
+                               'CUSA08034), da atualização (-UPDATE/-patch) e das DLCs são encontradas sozinhas.',
+                               "The game's main folder, as in shadPS4: the game (CUSA08809 or CUSA08034), update "
+                               '(-UPDATE/-patch) and DLC subfolders are found on their own.'),
                  bg=BG, fg=MUTED, font=(ui_font(), 10), wraplength=self.px(560), justify='center').pack(pady=(10, 0))
         self.setup_hint = tk.Label(inner, text='', bg=BG, fg=MUTED, font=(ui_font(), 10), cursor='hand2',
                                    wraplength=self.px(640), justify='center')
@@ -1738,8 +1774,9 @@ class Launcher:
         game = find_game_in(chosen)
         if not game:
             self.messagebox.showerror('Shadow of the Colossus', _(
-                'Não achei o jogo (eboot.bin do CUSA08809) em\n{}\n\nEscolha a pasta do seu dump.',
-                'The game (eboot.bin of CUSA08809) is not in\n{}\n\nChoose the folder of your dump.').format(chosen))
+                'Não achei o jogo (eboot.bin do CUSA08809 ou CUSA08034) em\n{}\n\nEscolha a pasta do seu dump.',
+                'The game (eboot.bin of CUSA08809 or CUSA08034) is not in\n{}\n\nChoose the folder of your dump.')
+                .format(chosen))
             return
         self.configure_from_game(game, chosen)
 
@@ -1754,10 +1791,11 @@ class Launcher:
             from sotc_discovery import find_dlc_root, find_update, dlc_count, scan, SYS_MODULES as modules
             result = {'game': game, 'dlc': find_dlc_root(game, chosen), 'update': find_update(game), 'sound': None,
                       'save': None}
-            result['dlc_count'] = dlc_count(result['dlc'])
+            serial = game_serial(game)
+            result['dlc_count'] = dlc_count(result['dlc'], serial)
             sound_ready = self.app.get('sys_modules') and all(
                 (Path(self.app['sys_modules']) / m).is_file() for m in modules)
-            saves = user / 'savedata' / '1' / GAME_ID
+            saves = user / 'savedata' / '1' / serial
             has_saves = saves.is_dir() and any(saves.iterdir())
             found = {'sys_modules': [], 'saves': []}
             if not sound_ready or not has_saves:
@@ -1778,7 +1816,8 @@ class Launcher:
                     pass
             if not has_saves:
                 own = user.resolve()
-                outside = [p for p in found['saves'] if not Path(p).resolve().is_relative_to(own)]
+                outside = [p for p in found['saves']
+                           if Path(p).name == serial and not Path(p).resolve().is_relative_to(own)]
                 if outside:
                     try:
                         saves.parent.mkdir(parents=True, exist_ok=True)
@@ -1921,7 +1960,7 @@ class Launcher:
         return bool(folder) and all((Path(folder) / m).is_file() for m in SYS_MODULES)
 
     def saves_folder(self):
-        return user_dir({'user_dir': self.var('user_dir').get()}) / 'savedata' / '1' / GAME_ID
+        return user_dir({'user_dir': self.var('user_dir').get()}) / 'savedata' / '1' / game_serial(self.var('game_dir').get())
 
     def has_saves(self):
         saves = self.saves_folder()
@@ -1954,8 +1993,7 @@ class Launcher:
             if parent not in folders:
                 folders.append(parent)
         if found['games'] and not game_info(self.var('game_dir').get()):
-            best = min(found['games'],
-                       key=lambda g: eboot_version(Path(g['path']) / 'eboot.bin') != GAME_VERSION)
+            best = min(found['games'], key=lambda g: not game_supported(g['path']))
             self.var('game_dir').set(best['path'])
             done.append(_('jogo em {}', 'game in {}').format(best['path']))
         if not self.sound_ready() and found['sys_modules']:
@@ -1969,12 +2007,15 @@ class Launcher:
                 done.append(_('som (de {})', 'sound (from {})').format(found['sys_modules'][0]))
             except OSError:
                 pass
-        if not self.var('dlc_dir').get() and found.get('dlc'):
-            self.var('dlc_dir').set(found['dlc'][0])
-            done.append(_('DLC em {}', 'DLC in {}').format(found['dlc'][0]))
+        serial = game_serial(self.var('game_dir').get())
+        dlc = next((path for path, dlc_serial in found.get('dlc', []) if dlc_serial == serial), None)
+        if not self.var('dlc_dir').get() and dlc:
+            self.var('dlc_dir').set(dlc)
+            done.append(_('DLC em {}', 'DLC in {}').format(dlc))
         if not self.has_saves():
             own = user_dir({'user_dir': self.var('user_dir').get()}).resolve()
-            outside = [p for p in found['saves'] if not Path(p).resolve().is_relative_to(own)]
+            outside = [p for p in found['saves']
+                       if Path(p).name == serial and not Path(p).resolve().is_relative_to(own)]
             if outside and self.messagebox.askyesno('Shadow of the Colossus', _(
                     'Encontrei um save do jogo em\n{}\nImportar para o port?',
                     'Found a save of the game in\n{}\nImport it into the port?').format(outside[0])):
@@ -2008,8 +2049,8 @@ class Launcher:
             return
         self.collect()
         if not game_info(self.app['game_dir']):
-            self.messagebox.showerror('Shadow of the Colossus', _('Escolha a pasta do jogo com eboot.bin (CUSA08809).',
-                                                                  'Choose the game folder with eboot.bin (CUSA08809).'))
+            self.messagebox.showerror('Shadow of the Colossus', _('Escolha a pasta do jogo com eboot.bin (CUSA08809 ou CUSA08034).',
+                                                                  'Choose the game folder with eboot.bin (CUSA08809 or CUSA08034).'))
             self.show('game')
             return
         free = free_commit_gb()

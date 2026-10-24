@@ -189,8 +189,9 @@ the original repository.
 - [x] FSR 1 with RCAS (in place since 0.60.x)
 - [x] Phase 0: rendering below 1080p works with the game's own patches (23/10: Shrine, 3840x2160 output with FSR 1:
       1080p 38.7 FPS, 720p 46.9, 576p 49.7; clean image, no device lost)
-- [ ] Phase 1: keep the temporal inputs (depth, motion vectors, jitter, camera) available without frame generation
-- [ ] Phase 2: FSR 3.1 temporal upscaler (source already vendored, build flag off for now)
+- [x] Phase 1: the temporal inputs (depth, motion vectors, jitter, camera) are captured without frame generation
+- [x] Phase 2: FSR 3.1 temporal upscaler, off by default (`SOTC_UPSCALER=fsr3`, with `SOTC_RENDER_RES` below 1080p and
+      `SOTC_OUTPUT_RES`; 23/10: Shrine 720p to 4K, clean image, ~48 FPS like FSR 1; HUD still goes through it)
 - [ ] Phase 3: launcher and in-game options: upscaler and quality preset (restart needed to apply)
 - [ ] Phase 4: DLSS Super Resolution through Streamline, NVIDIA only (needs the user's own NVIDIA DLLs)
 - [ ] Phase 5: documentation
@@ -225,8 +226,9 @@ Os números de issue se referem ao repositório original.
 - [x] FSR 1 com RCAS (já presente desde a 0.60.x)
 - [x] Fase 0: renderizar abaixo de 1080p funciona com os ajustes do próprio jogo (23/10: Santuário, saída 3840x2160 com FSR 1:
       1080p 38,7 FPS, 720p 46,9, 576p 49,7; imagem limpa, sem perda de dispositivo)
-- [ ] Fase 1: manter as entradas temporais (profundidade, vetores de movimento, jitter, câmera) disponíveis sem geração de quadros
-- [ ] Fase 2: upscaler temporal FSR 3.1 (código-fonte já incluído, flag de build desligada por enquanto)
+- [x] Fase 1: as entradas temporais (profundidade, vetores de movimento, jitter, câmera) são capturadas sem geração de quadros
+- [x] Fase 2: upscaler temporal FSR 3.1, desligado por padrão (`SOTC_UPSCALER=fsr3`, com `SOTC_RENDER_RES` abaixo de 1080p e
+      `SOTC_OUTPUT_RES`; 23/10: Santuário 720p para 4K, imagem limpa, ~48 FPS como o FSR 1; a interface também passa por ele)
 - [ ] Fase 3: opções no launcher e no menu do jogo: upscaler e preset de qualidade (exige reiniciar para aplicar)
 - [ ] Fase 4: DLSS Super Resolution via Streamline, só NVIDIA (exige as DLLs NVIDIA fornecidas pelo usuário)
 - [ ] Fase 5: documentação

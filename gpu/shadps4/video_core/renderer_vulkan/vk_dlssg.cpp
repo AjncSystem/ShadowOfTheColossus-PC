@@ -3,6 +3,7 @@
 
 #include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_framegen.h"
+#include "video_core/renderer_vulkan/vk_fsr3up.h"
 #include "video_core/renderer_vulkan/vk_fsrfg.h"
 
 #include <windows.h>
@@ -575,6 +576,9 @@ bool Parallel() {
 
 /// Inputs are captured while DLSS-G or FSR 3 is the frame generation mode.
 bool Capturing() {
+    if (Fsr3Up::Wanted()) { // sotc: the FSR 3.1 upscaler needs the same inputs
+        return g_instance != nullptr;
+    }
     switch (FrameGen::Current()) {
     case FrameGen::Mode::Dlss:
         return supported;
@@ -756,6 +760,7 @@ PFN_vkGetInstanceProcAddr LoadInterposer() {
 void OnDeviceCreated(const Instance& instance) {
     g_instance = &instance;
     FsrFg::Init(instance);
+    Fsr3Up::Init(instance);
     struct ResolveMode {
         ~ResolveMode() {
             FrameGen::SetAvailable(supported, FsrFg::Supported());
@@ -867,7 +872,7 @@ void PrepareInputs(u32 frame_id, vk::CommandBuffer cmdbuf, VideoCore::TextureCac
     f.sl_valid = false;
     f.hudless = {};
     FsrFg::NoDepth(frame_id);
-    const bool fsr = FrameGen::Current() == FrameGen::Mode::Fsr;
+    const bool fsr = FrameGen::Current() == FrameGen::Mode::Fsr || Fsr3Up::Wanted();
     if (!supported && !fsr) {
         pending = Pending{};
         return;

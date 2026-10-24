@@ -182,6 +182,12 @@ target_include_directories(bbgpu PRIVATE third_party/streamline/include)
 # optical flow, natively on Vulkan (third_party/fsr-vulkan, MIT); any GPU with Vulkan 1.3.
 # (fsr-vulkan is added once above, with the frame generation options.)
 target_link_libraries(bbgpu PRIVATE ffx-vulkan::fsr3-vk-framegeneration-3.1.6)
+# AMD FSR 3.1 temporal upscaler (vk_fsr3up.cpp): its backend shares the bridge and the SDK core with the
+# frame generation above, linked after it so that those objects are taken from there.
+target_link_libraries(bbgpu PRIVATE ffx-vulkan::fsr3-vk-backend-3.1.5)
+set(FFX_2_3_0_KIT ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fsr-vulkan/upstream/ffx-2.3.0/Kits/FidelityFX)
+set_source_files_properties(sotc/sotc_fsr3up_blobs.cpp PROPERTIES INCLUDE_DIRECTORIES
+    "${FFX_2_3_0_KIT}/api/include;${FFX_2_3_0_KIT}/api/internal;${FFX_2_3_0_KIT}/upscalers/include;${FFX_2_3_0_KIT}/upscalers/fsr3/include;${FFX_2_3_0_KIT}/upscalers/fsr3/internal")
 # The module's 3.1.6 frame generation never starts a frame on its bridge: the constant buffers
 # and descriptor sets of every dispatch are then kept until the context is destroyed (~3 MB of
 # video memory per frame, out of memory within a minute). Its source is built from a copy that

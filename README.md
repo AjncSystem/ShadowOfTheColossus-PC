@@ -202,8 +202,11 @@ the original repository.
 - Where we are: the Shrine of Worship runs at ~42 FPS on 0.60.6 with the safe defaults (~54 FPS with
   the two readback options that caused rainbow noise, `0x49500` crashes and black sand dots turned
   back on, so they stay off). The render thread needs ~20 ms per frame; 120 FPS means 8.3 ms.
-- [ ] T0: measure the current ceiling in the attract demo and the Shrine, per thread
-- [ ] T1: find out how the game simulates above 60 FPS (its clock is tied to the 60 FPS target today)
+- [x] T0: ceiling measured 23/10 (0.60.6 + this fork, 1080p, safe defaults): attract demo 71.2 FPS average (min 48.4,
+      draw thread busy 13-14 ms per frame); Shrine 41.6 FPS (draw thread ~20 ms). M1 needs 100, M3 needs 60
+- [x] T1: the game clock follows real time: in the attract demo the camera covers the same path in the same real
+      seconds at 30 FPS (capped), 74.6 FPS (60 FPS mode) and 71.7 FPS with a 240 Hz vblank. Physics and animation
+      above 60 FPS are not checked yet (needs a frame rate above what the PC reaches today)
 - [ ] T2: reduce CPU work per draw: skip repeated register state, make the fast descriptor reuse safe,
       move pure precomputation off the render thread; splitting the render thread is the last resort
 - [ ] T3: every change must pass the rainbow-noise and sand-dot checks before it becomes default
@@ -242,8 +245,11 @@ Os números de issue se referem ao repositório original.
   com as duas opções de leitura que causavam ruído colorido, crashes `0x49500` e pontos pretos na
   areia religadas, então elas continuam desligadas). A thread de desenho gasta ~20 ms por quadro;
   120 FPS significam 8,3 ms.
-- [ ] T0: medir o teto atual na demo de atração e no Santuário, por thread
-- [ ] T1: descobrir como o jogo simula acima de 60 FPS (hoje o relógio do jogo está ligado à meta de 60)
+- [x] T0: teto medido em 23/10 (0.60.6 + este fork, 1080p, padrões seguros): demo de atração 71,2 FPS de média (mínima
+      48,4, thread de desenho ocupada 13-14 ms por quadro); Santuário 41,6 FPS (thread de desenho ~20 ms). M1 pede 100, M3 pede 60
+- [x] T1: o relógio do jogo segue o tempo real: na demo de atração a câmera percorre o mesmo caminho nos mesmos segundos
+      reais a 30 FPS (travado), 74,6 FPS (modo 60) e 71,7 FPS com vblank de 240 Hz. Física e animação acima de 60 FPS
+      ainda não foram conferidas (precisa de uma taxa que este PC ainda não alcança)
 - [ ] T2: reduzir o trabalho de CPU por desenho: pular estado de registradores repetido, tornar seguro o
       reaproveitamento de descritores, mover pré-cálculo puro para fora da thread de desenho; dividir a
       thread de desenho é o último recurso

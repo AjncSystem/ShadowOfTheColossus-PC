@@ -1,6 +1,28 @@
 # Changelog
 
-## Não lançado
+## 0.60.6-plus2 — 2026-10-24 (fork Lucas-blip-png)
+- **DLSS Super Resolution (modelo DLSS 4.5), só em placas NVIDIA RTX.** No lançador: Upscaler > DLSS
+  Super Resolution; com as DLLs `sl.interposer.dll`, `sl.common.dll`, `sl.dlss.dll` e `nvngx_dlss.dll`
+  (Streamline 2.14.16, `nvngx_dlss.dll` 310.9.16) na pasta `bin`. Usa os presets M (DLAA, Qualidade,
+  Equilibrado, Desempenho) e L (Ultra desempenho), a segunda geração do modelo transformer; `SOTC_DLSS_PRESET=k`
+  volta ao modelo do DLSS 4 nos três primeiros. Sem as DLLs ou sem RTX, o jogo usa o FSR 3.1 (verificado). Testado
+  na RTX 5060 Ti: imagem e cores corretas, sem quedas. O Streamline intercepta as chamadas do Vulkan e custa uns
+  5% de FPS nesta CPU (FSR 3.1 49,6 → 46,7 só com ele carregado; o DLSS em si mais ~1 FPS), então o ganho do DLSS é
+  de qualidade de imagem; onde a placa de vídeo é o limite (saída 1440p/4K em placas menores) o FPS sobe como no FSR.
+- **Modos de qualidade do FSR 3.1 e do DLSS no lançador:** Nativa (DLAA), Qualidade (1,5x), Equilibrado (1,7x),
+  Desempenho (2,0x) e Ultra desempenho (3,0x); o modo do DLSS segue o fator. A dica avisa que, com a CPU como
+  limite, renderizar menor quase não muda o FPS (Santuário em 4K: 1080p 39 FPS, 720p 47 a 50).
+- **Viés de LOD das texturas com o upscaler ligado** (`log2(render/saída) - 1`, o que o FSR e o DLSS pedem ao jogo):
+  pedra, roupa e rosto ficam mais nítidos ao renderizar abaixo da saída (720p → 4K: -2,58). Pode reabrir o chiado em
+  texturas finas; `SOTC_MIP_BIAS=0` desliga, ou outro valor o troca. Aceito o risco de pontos pretos na areia, a
+  corrigir depois.
+- **Menu do jogo (F1):** mostra "DLSS Super Resolution" quando é o upscaler e não troca a escolha do lançador por FSR 3.1.
+- `SetSrtReadProtectedPages` com uma operação atômica por palavra de 64 páginas (equivalente, dentro do ruído).
+- Diagnósticos: `SOTC_RB_STATS=1` marca se os bytes lidos são do GPU e `SOTC_RB_STATS_CODE=1` despeja o código do
+  leitor; `SOTC_PROTECT_STATS=1`; `SOTC_STREAMLINE_FORCE=1` (carrega o Streamline com qualquer upscaler).
+- Medido e descartado (24/10, sem mudança de código no jogo): trava do cache de texturas com a thread de desenho
+  como dona (-5%), leitura sem readback para bytes que o GPU nunca escreveu (60% menos faltas, FPS igual) e
+  `SOTC_RB_EARLY=0`. Detalhes no README.
 - **Imagens sem alocação de memória de vídeo por quadro (+4% no Santuário, +6% na demo).** O driver
   da NVIDIA pede memória dedicada para imagens, então a cada imagem criada o port chamava
   `vkAllocateMemory` e, quando ela morria, `vkFreeMemory`: 4 de cada por quadro com a cena parada, uns

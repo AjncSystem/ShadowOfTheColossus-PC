@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC native port · v0.60.6
+# Shadow of the Colossus — PC native port · v0.60.6-opt11
 
 [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
@@ -20,6 +20,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.60.6-opt11** | **US version (CUSA08034) supported** (same eboot as EU 1.01; own saves and shader cache), **+25% FPS at the Shrine and steadier frame times** (speculative GPU readbacks back on, now with a safety check and per-page locking, so no rainbow textures), descriptor binds reused by default, grass, HDR and DLSS menu fixes, logo skip, low-memory warning in the launcher, shader cache file check and invariant positions (GTX 10xx). The shader cache is rebuilt on first start. Riding stutter is still there. |
 | **0.60.6** | **No more rainbow garbage on textures and far fewer "closed out of nowhere" crashes** (the cause: speculative GPU readbacks written over memory the game had reused, after loading a save or a new area), **no more black dots on sandy ground**, **in-game menu cleaned up** (FPS, upscaler and sharpening now change at once; Bloodborne leftovers removed), **hard disk read-ahead** (fewer stalls in new areas on HDDs), textures refreshed on every load, a readable session event log (`user/events.log`). |
 | **0.60.5** | **Texture quality selector: Off / High / Maximum** (#235: sharp again), **memory leak fixed** (~60 MB/min, long-session stutter), **+3% average and +12% minimum FPS** (descriptor binds reused), **loading after a GPU driver update: 106 s → 7 s**, possible fix for **white characters on AMD GCN** (RX 470–590, Vega), **4-thread CPUs** no longer stuck loading, a hang watchdog, short hitches no longer flash a black loading screen, code review fixes. |
 | **0.60.4** | **No more cyan blocks on stone or blinking flowers** with high quality textures (the 0.60.3 crash protection switched the texture detail every second or two; now with hysteresis). |

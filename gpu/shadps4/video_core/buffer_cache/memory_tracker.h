@@ -86,6 +86,49 @@ public:
         });
     }
 
+    /// sotc: calls write(address, size) for the runs of [cpu_addr, cpu_addr + size) whose pages
+    /// are not CPU-modified, with their region's lock held. Those pages are write-protected, so
+    /// a guest write to them faults into InvalidateRegion and waits for this lock: the guest's
+    /// bytes land after the written ones, never under them (hot readbacks; checking first and
+    /// writing after the lock was released could overwrite a write made in between). Untracked
+    /// pages are written. Returns the bytes skipped.
+    template <typename Func>
+    u64 WriteUnlessCpuModified(VAddr cpu_addr, u64 size, Func&& write) {
+        u64 skipped = 0;
+        u64 page_index = cpu_addr >> HIGHER_PAGE_BITS;
+        u64 offset = cpu_addr & HIGHER_PAGE_MASK;
+        for (u64 remaining = size; remaining > 0; ++page_index, offset = 0) {
+            const u64 len = std::min(HIGHER_PAGE_SIZE - offset, remaining);
+            const VAddr base = page_index << HIGHER_PAGE_BITS;
+            remaining -= len;
+            RegionManager* manager = top_tier[page_index];
+            if (!manager) {
+                write(base + offset, len);
+                continue;
+            }
+            const auto bounds = manager->GetBounds(offset, len);
+            manager->Lock(bounds);
+            const u64 end = offset + len;
+            u64 run = offset;
+            for (u64 page = offset; page < end;) {
+                const u64 next = std::min((page & ~(BYTES_PER_PAGE - 1)) + BYTES_PER_PAGE, end);
+                if (manager->template IsRegionModified<Type::CPU>(page, next - page)) {
+                    if (page > run) {
+                        write(base + run, page - run);
+                    }
+                    run = next;
+                    skipped += next - page;
+                }
+                page = next;
+            }
+            if (end > run) {
+                write(base + run, end - run);
+            }
+            manager->Unlock(bounds);
+        }
+        return skipped;
+    }
+
     /// Mark region as modified from the CPU
     void MarkRegionAsCpuModified(VAddr cpu_addr, u64 size) noexcept {
         SotcStats::mem_epoch.fetch_add(1, std::memory_order_relaxed); // reused binds

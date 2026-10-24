@@ -18,6 +18,7 @@ Settings (environment variables, or sotc.ini beside this script as NAME=value li
                       fps60 (removes the 30 FPS cap; experimental, vblank at 120 Hz),
                       fps60game (the game's own 60 FPS target, as the PS4 Pro Performance mode;
                       with SOTC_FPS_CAP=off)
+                      hdr (HDR10 output and the game's HDR rendering; Windows HDR must be on)
     SOTC_RENDER_RES   optional: the game renders at WxH instead of 1920x1080 (e.g. 2560x1080 for
                       21:9, a wider view); the output follows its aspect; PS4 mode only; at most 1080
                       lines tall and 4.2 million pixels, larger sizes are scaled down
@@ -234,6 +235,9 @@ def main():
     # up to 30 FPS. With the cap, 120 Hz only shows a late frame sooner (and SOTC_FPS_LIMIT counts
     # in 120 Hz vblanks).
     env.setdefault('BB_VBLANK_HZ', '120')
+    if 'hdr' in modes.lower():
+        # HDR10 swapchain (Rec.2020 PQ, when Windows HDR is on); the game then offers HDR too.
+        env.setdefault('BB_HDR', '1')
 
     probe = find_probe()
     # Development builds run from the MSYS2 tree: its CLANG64 DLLs (SDL3, FFmpeg, ...).

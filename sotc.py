@@ -20,7 +20,7 @@ Settings (environment variables, or sotc.ini beside this script as NAME=value li
                       with SOTC_FPS_CAP=off)
     SOTC_RENDER_RES   optional: the game renders at WxH instead of 1920x1080 (e.g. 2560x1080 for
                       21:9, a wider view); the output follows its aspect; PS4 mode only; at most 1080
-                      lines tall and 4.2 million pixels, larger sizes are scaled down
+                      lines tall, larger sizes are scaled down
     SOTC_CVARS        engine settings, NAME=VALUE separated by spaces (e.g. r_motionBlurEnable=0)
     BB_GAMEPAD        the gamepad to use (its name or part of it), when several are connected
     key.<input>=Keys, pad.<input>=buttons   remap the controls (README.md, Controles)
@@ -69,29 +69,25 @@ def find_probe():
     fail('bb-probe.exe not found: build it with build.sh (MSYS2 CLANG64) or use a packaged build.')
 
 
-# Above about 4.2 million rendered pixels the fine detail textures (ground, cloth) shimmer, flicker
-# and then disappear (2736x1536 is fine, 3008x1696 shimmers, 3840x2160 has none); cause unknown.
 # The game itself never renders more than 1080 lines in PS4 mode, so the render height stays at
-# most 1080 (3840x1080 for 32:9 is tested fine) and the pixel limit covers wider aspects.
+# most 1080. (The former 4.2 million pixel limit is gone: sotc_modes.py turns off the game's
+# low-memory texture eviction above that size and fixes the page allocator crash it exposed.)
 MAX_RENDER_HEIGHT = 1080
-MAX_RENDER_PIXELS = 4_200_000
 
 
 def cap_render(size):
-    """SOTC_RENDER_RES WxH, scaled down (same aspect, multiples of 8) to MAX_RENDER_HEIGHT lines
-    and MAX_RENDER_PIXELS."""
+    """SOTC_RENDER_RES WxH, scaled down (same aspect, multiples of 8) to MAX_RENDER_HEIGHT lines."""
     try:
         w, h = map(int, size.split('x'))
     except ValueError:
         return size  # sotc_modes.py reports it
     if w <= 0 or h <= 0:
         return size  # sotc_modes.py reports it
-    scale = min(1.0, MAX_RENDER_HEIGHT / h, (MAX_RENDER_PIXELS / (w * h)) ** 0.5)
+    scale = min(1.0, MAX_RENDER_HEIGHT / h)
     if scale == 1.0:
         return size
     capped = f'{int(w * scale) // 8 * 8}x{int(h * scale) // 8 * 8}'
-    print(f'sotc: render size {size} is above {MAX_RENDER_HEIGHT} lines or {MAX_RENDER_PIXELS:,} pixels '
-          f'(fine textures disappear), rendering at {capped}', file=sys.stderr)
+    print(f'sotc: render size {size} is above {MAX_RENDER_HEIGHT} lines, rendering at {capped}', file=sys.stderr)
     return capped
 
 

@@ -1770,7 +1770,7 @@ void Rasterizer::FlushPeriodic() {
         // Radeon RX 6650 XT the image is right and the sanctuary goes from 17.4 to 22.4 fps.
         constexpr u32 VendorNvidia = 0x10DE;
         constexpr u32 VendorAmd = 0x1002;
-        return Common::ElfInfo::Instance().GameSerial() == "CUSA08809" &&
+        return Common::ElfInfo::Instance().IsSotc() &&
                        (instance.GetVendorID() == VendorNvidia ||
                         instance.GetVendorID() == VendorAmd)
                    ? 256u

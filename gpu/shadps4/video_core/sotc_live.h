@@ -17,6 +17,9 @@ inline std::atomic<int> lod_pool_low{-1};
 /// Upscaler: 1 FSR 1, 0 bilinear (BB_FSR1). RCAS sharpening: attenuation in thousandths (0 high,
 /// 250 medium, 600 low), -2 off (BB_RCAS=0). -1: the launcher's at start.
 inline std::atomic<int> fsr1{-1};
+
+/// FSR 3.1 upscaler (SOTC_UPSCALER=fsr3 at start): 1 on, 0 off (FSR 1 or bilinear instead). -1: as started.
+inline std::atomic<int> fsr3{-1};
 inline std::atomic<int> rcas{-1};
 
 /// Far sun shadow cascades drawn on alternate frames (SOTC_SHADOW_REUSE): 0 off, 1 on.

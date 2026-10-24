@@ -192,9 +192,9 @@ the original repository.
 - [x] Phase 1: the temporal inputs (depth, motion vectors, jitter, camera) are captured without frame generation
 - [x] Phase 2: FSR 3.1 temporal upscaler, off by default (`SOTC_UPSCALER=fsr3`, with `SOTC_RENDER_RES` below 1080p and
       `SOTC_OUTPUT_RES`; 23/10: Shrine 720p to 4K, clean image, ~48 FPS like FSR 1; HUD still goes through it)
-- [ ] Phase 3: launcher and in-game options: upscaler and quality preset (restart needed to apply)
-- [ ] Phase 4: DLSS Super Resolution through Streamline, NVIDIA only (needs the user's own NVIDIA DLLs)
-- [ ] Phase 5: documentation
+- [x] Phase 3: launcher option (upscaler FSR 3.1 + quality preset) and the in-game F1 menu switch
+- [ ] Phase 4: DLSS Super Resolution through Streamline, NVIDIA only (blocked: needs sl.dlss.dll and nvngx_dlss.dll, not in the repository; untested code is not shipped)
+- [x] Phase 5: documentation (CHANGELOG, this roadmap)
 
 **Part 2: up to 120 FPS in game, without frame generation**
 - Where we are: the Shrine of Worship runs at ~42 FPS on 0.60.6 with the safe defaults (~54 FPS with
@@ -229,9 +229,9 @@ Os números de issue se referem ao repositório original.
 - [x] Fase 1: as entradas temporais (profundidade, vetores de movimento, jitter, câmera) são capturadas sem geração de quadros
 - [x] Fase 2: upscaler temporal FSR 3.1, desligado por padrão (`SOTC_UPSCALER=fsr3`, com `SOTC_RENDER_RES` abaixo de 1080p e
       `SOTC_OUTPUT_RES`; 23/10: Santuário 720p para 4K, imagem limpa, ~48 FPS como o FSR 1; a interface também passa por ele)
-- [ ] Fase 3: opções no launcher e no menu do jogo: upscaler e preset de qualidade (exige reiniciar para aplicar)
-- [ ] Fase 4: DLSS Super Resolution via Streamline, só NVIDIA (exige as DLLs NVIDIA fornecidas pelo usuário)
-- [ ] Fase 5: documentação
+- [x] Fase 3: opção no launcher (upscaler FSR 3.1 + preset de qualidade) e a troca no menu F1 do jogo
+- [ ] Fase 4: DLSS Super Resolution via Streamline, só NVIDIA (bloqueada: faltam sl.dlss.dll e nvngx_dlss.dll, que não ficam no repositório; código sem teste não é publicado)
+- [x] Fase 5: documentação (CHANGELOG, este roteiro)
 
 **Parte 2: até 120 FPS no jogo, sem geração de quadros**
 - Onde estamos: o Santuário de Culto roda a ~42 FPS na 0.60.6 com os padrões seguros (~54 FPS

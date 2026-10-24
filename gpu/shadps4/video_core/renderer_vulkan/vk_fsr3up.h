@@ -24,6 +24,9 @@ void Init(const Instance& instance);
 /// then captured (Dlssg::CapturingInputs).
 bool Wanted();
 
+/// SOTC_UPSCALER=fsr3 was set at start (the in-game menu then offers it).
+bool AskedAtStart();
+
 /// Command processor thread (PrepareFrame, no rendering active on `cmdbuf`): copies the game image
 /// `game_image` (layout TransferSrcOptimal, `width` x `height`) of presentation frame `frame_id`
 /// to the upscaler's colour input of that frame. The SDK bridge makes raw Vulkan calls, which

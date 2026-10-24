@@ -17,6 +17,7 @@
 #include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_fsrfg.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/sotc_live.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Vulkan::Fsr3Up {
@@ -271,7 +272,11 @@ void Init(const Instance& instance) {
 }
 
 bool Wanted() {
-    return supported && !failed;
+    return supported && !failed && SotcLive::fsr3.load(std::memory_order_relaxed) != 0;
+}
+
+bool AskedAtStart() {
+    return wanted;
 }
 
 void Prepare(vk::CommandBuffer cmdbuf, u32 frame_id, vk::Image game_image, u32 width, u32 height,

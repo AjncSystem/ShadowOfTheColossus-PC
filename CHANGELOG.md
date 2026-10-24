@@ -1,5 +1,16 @@
 # Changelog
 
+## Não lançado
+- **Upscaler FSR 3.1 (temporal), desligado por padrão.** O jogo renderiza abaixo da saída (720p, 576p...)
+  e o FSR 3.1 da AMD (qualquer placa com Vulkan 1.3) reconstrói a imagem com a profundidade, os vetores
+  de movimento, o jitter e a câmera do próprio jogo, as mesmas entradas da geração de quadros. No
+  lançador: Upscaler > FSR 3.1 e "Qualidade do FSR 3.1" (nativa, 1,5x, 1,7x, 2,0x, 3,0x); no menu F1 a
+  opção aparece quando o jogo abriu com ele e liga/desliga na hora. `SOTC_UPSCALER=fsr3` liga sem o
+  lançador (com `SOTC_RENDER_RES` e `SOTC_OUTPUT_RES`); `SOTC_FSR3UP_LOG=1` mostra o estado. No Santuário,
+  720p para 4K: 38,7 FPS a 1080p, 46,9 a 720p com FSR 1 e ~48 FPS com FSR 3.1 (o PC de teste é limitado
+  pela CPU; o ganho aparece onde a placa de vídeo é o limite). Limitações: a interface (HUD) também passa
+  pelo upscaler; desliga o modo PS4 Pro. O cache de shaders não muda.
+
 ## 0.60.6 — 2026-10-22
 - **Fim do ruído arco-íris nas texturas e das quedas "do nada" (`0x49500`).** A causa eram as
   leituras "quentes" da GPU (`SOTC_RB_HOT`): junto com cada leitura, o port escrevia na memória do

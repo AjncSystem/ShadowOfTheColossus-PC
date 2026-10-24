@@ -182,12 +182,13 @@ with `user/last_run.log`.
 
 ## Roadmap
 
-Public plan for this fork, updated as work lands (last update: 22/10/2026). Issue numbers refer to
+Public plan for this fork, updated as work lands (last update: 23/10/2026). Issue numbers refer to
 the original repository.
 
 **Part 1: upscalers (more FPS on weaker GPUs, sharper 1440p/4K output)**
 - [x] FSR 1 with RCAS (in place since 0.60.x)
-- [ ] Phase 0: test rendering below 1080p (e.g. 720p and 540p) with the game's own patches
+- [x] Phase 0: rendering below 1080p works with the game's own patches (23/10: Shrine, 3840x2160 output with FSR 1:
+      1080p 38.7 FPS, 720p 46.9, 576p 49.7; clean image, no device lost)
 - [ ] Phase 1: keep the temporal inputs (depth, motion vectors, jitter, camera) available without frame generation
 - [ ] Phase 2: FSR 3.1 temporal upscaler (source already vendored, build flag off for now)
 - [ ] Phase 3: launcher and in-game options: upscaler and quality preset (restart needed to apply)
@@ -217,12 +218,13 @@ the original repository.
 
 ## Roteiro (português)
 
-Plano público deste fork, atualizado conforme o trabalho avança (última atualização: 22/10/2026).
+Plano público deste fork, atualizado conforme o trabalho avança (última atualização: 23/10/2026).
 Os números de issue se referem ao repositório original.
 
 **Parte 1: upscalers (mais FPS em GPUs mais fracas, saída 1440p/4K mais nítida)**
 - [x] FSR 1 com RCAS (já presente desde a 0.60.x)
-- [ ] Fase 0: teste de renderização abaixo de 1080p (ex.: 720p e 540p) com os ajustes do próprio jogo
+- [x] Fase 0: renderizar abaixo de 1080p funciona com os ajustes do próprio jogo (23/10: Santuário, saída 3840x2160 com FSR 1:
+      1080p 38,7 FPS, 720p 46,9, 576p 49,7; imagem limpa, sem perda de dispositivo)
 - [ ] Fase 1: manter as entradas temporais (profundidade, vetores de movimento, jitter, câmera) disponíveis sem geração de quadros
 - [ ] Fase 2: upscaler temporal FSR 3.1 (código-fonte já incluído, flag de build desligada por enquanto)
 - [ ] Fase 3: opções no launcher e no menu do jogo: upscaler e preset de qualidade (exige reiniciar para aplicar)

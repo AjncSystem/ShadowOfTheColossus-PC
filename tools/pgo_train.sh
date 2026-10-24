@@ -26,7 +26,7 @@ trap restore EXIT
 cp out/gpu-pgogen/bb-probe.exe out/bb-probe.exe
 # Training: the instrumented exe writes (and merges) its profile every 30 s.
 BENCH_SECONDS=330 bash tools/sotc_bench_attract.sh || true
-if [[ -d out/save-template/CUSA08809 ]]; then
+if [[ -d out/save-template/CUSA08809 || -d out/save-template/CUSA08034 ]]; then
     BENCH_MEASURE=60 bash tools/sotc_bench_shrine.sh --timeout 400 || true
 fi
 ls pgo/*.profraw >/dev/null 2>&1 || { echo 'No profile was written' >&2; exit 1; }

@@ -108,6 +108,13 @@ public:
         return Instance().game_serial;
     }
 
+    // sotc: Shadow of the Colossus, EU (CUSA08809) or US (CUSA08034). Both releases share the
+    // same eboot build, so every SotC workaround applies to either.
+    [[nodiscard]] bool IsSotc() const {
+        const std::string_view serial = GameSerial();
+        return serial == "CUSA08809" || serial == "CUSA08034";
+    }
+
     [[nodiscard]] std::string_view Title() const {
         ASSERT(initialized);
         return title;

@@ -21,6 +21,8 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / 'scripts'))
+from sotc_modes import game_serial, save_template  # noqa: E402
 GAME = os.environ.get('SOTC_GAME_DIR', str(Path(__file__).resolve().parents[2] / 'CUSA08809'))
 
 
@@ -38,11 +40,12 @@ def main():
     args = parser.parse_intermixed_args()  # events may follow options (the bench scripts' --env)
     os.chdir(ROOT)
     out = Path('out')
-    template = out / 'save-template' / 'CUSA08809'
+    serial = game_serial(GAME)  # CUSA08809 (EU) or CUSA08034 (US): the folder the game saves in
+    template = save_template(out / 'save-template', serial)
     if args.fresh:
         shutil.rmtree(out / 'user' / 'savedata', ignore_errors=True)
-    elif template.is_dir() and not args.keep_save:
-        target = out / 'user' / 'savedata' / '1' / 'CUSA08809'
+    elif template and not args.keep_save:
+        target = out / 'user' / 'savedata' / '1' / serial
         shutil.rmtree(target, ignore_errors=True)
         shutil.copytree(template, target)
     shutil.rmtree(out / 'dump', ignore_errors=True)

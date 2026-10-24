@@ -22,6 +22,8 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / 'scripts'))
+from sotc_modes import game_serial, save_template  # noqa: E402
 GAME = os.environ.get('SOTC_GAME_DIR', str(ROOT.parent / 'CUSA08809'))
 FPS_LINE = re.compile(r'SOTC FPS ([\d.]+) at (\d+)s; (\d+) cmds/frame')
 FRAMES_LINE = re.compile(r'SOTC FRAMES p50 ([\d.]+) ms, p99 ([\d.]+) ms.*?worst ([\d.]+) ms')
@@ -40,7 +42,7 @@ def main():
     parser.add_argument('--pan', type=int, default=0,
                         help='right stick x (0-255, 128 = centre) held during the measurement: turns the camera')
     parser.add_argument('--walk', action='store_true', help='the character walks around during the run')
-    parser.add_argument('--save', default='out/save-template', help='folder with the CUSA08809 save to load')
+    parser.add_argument('--save', default='out/save-template', help='folder with the CUSA08809 (or CUSA08034) save to load')
     parser.add_argument('--explore', type=float, default=0,
                         help='run straight ahead after turning the camera this many seconds (heading)')
     parser.add_argument('--ride-speed', type=float, default=9.0,
@@ -56,8 +58,12 @@ def main():
     args = parser.parse_args()
     os.chdir(ROOT)
     out = Path('out')
-    template = Path(args.save) / 'CUSA08809'
-    target = Path(args.user) / 'savedata' / '1' / 'CUSA08809'
+    serial = game_serial(GAME)  # CUSA08809 (EU) or CUSA08034 (US): the folder the game saves in
+    template = save_template(args.save, serial)
+    if not template:
+        print(f'INVALID: need {Path(args.save) / serial}')
+        return 1
+    target = Path(args.user) / 'savedata' / '1' / serial
     shutil.rmtree(target, ignore_errors=True)
     shutil.copytree(template, target)
     pad = out / 'pad.txt'

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""Shadow of the Colossus (CUSA08809, EU 1.01) on PC: prepares the game image and starts it.
+"""Shadow of the Colossus (CUSA08809 EU 1.01 or CUSA08034 US 1.00) on PC: prepares the game image
+and starts it.
 
     python sotc.py                      (or double-click SotC.bat)
 
 Settings (environment variables, or sotc.ini beside this script as NAME=value lines):
-    SOTC_GAME_DIR     the dumped game folder (the one with eboot.bin); default ../CUSA08809
+    SOTC_GAME_DIR     the dumped game folder (the one with eboot.bin); default ../CUSA08809,
+                      else ../CUSA08034
     SOTC_SYS_MODULES  folder with YOUR OWN console's decrypted libSceNgs2.sprx and
                       libSceUlt.sprx (shadPS4's user/sys_modules). Without it the game is silent.
                       These files are Sony firmware: they are never distributed with the port.
@@ -13,7 +15,8 @@ Settings (environment variables, or sotc.ini beside this script as NAME=value li
     SOTC_UPDATE_DIR   optional: the game update; by default <game>-UPDATE or <game>-patch next to
                       the dump (as shadPS4); its files take the place of the base game's
     SOTC_DLC_DIR      optional: the game's DLC (one folder per add-on with sce_sys/param.sfo,
-                      or shadPS4's addcont folder holding CUSA08809)
+                      or shadPS4's addcont folder holding CUSA08809 / CUSA08034); only DLC of the
+                      game's own region is listed
     SOTC_MODES        optional, comma-separated: af16 (16x anisotropic filtering),
                       fps60 (removes the 30 FPS cap; experimental, vblank at 120 Hz),
                       fps60game (the game's own 60 FPS target, as the PS4 Pro Performance mode;
@@ -155,9 +158,13 @@ def main():
     os.chdir(PORT)
     out = PORT / 'out'
     out.mkdir(exist_ok=True)
-    game = Path(env.get('SOTC_GAME_DIR', PORT.parent / 'CUSA08809')).resolve()
+    # The EU dump (CUSA08809) next to the port, else the US one (CUSA08034).
+    default = next((PORT.parent / g for g in ('CUSA08809', 'CUSA08034') if (PORT.parent / g / 'eboot.bin').is_file()),
+                   PORT.parent / 'CUSA08809')
+    game = Path(env.get('SOTC_GAME_DIR', default)).resolve()
     if not (game / 'eboot.bin').is_file():
-        fail(f'No eboot.bin in {game}: set SOTC_GAME_DIR (environment or sotc.ini).')
+        fail(f'No eboot.bin in {game}: set SOTC_GAME_DIR (environment or sotc.ini) to the CUSA08809 (EU) '
+             'or CUSA08034 (US) dump.')
 
     modules = []
     sys_modules = env.get('SOTC_SYS_MODULES')

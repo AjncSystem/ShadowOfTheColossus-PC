@@ -35,6 +35,8 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / 'scripts'))
+from sotc_modes import game_serial, save_template  # noqa: E402
 GAME = os.environ.get('SOTC_GAME_DIR', str(Path(__file__).resolve().parents[2] / 'CUSA08809'))
 IDLE_LOW, IDLE_HIGH, IDLE_SPREAD, IDLE_SAMPLES = 5500, 6400, 300, 3
 FPS_LINE = re.compile(r'SOTC FPS ([\d.]+) at (\d+)s; (\d+) cmds/frame')
@@ -49,7 +51,7 @@ def main():
     parser.add_argument('--patches', default='out/bench.patches')
     parser.add_argument('--cmdline', default='out/bench.cmdline')
     parser.add_argument('--shots', type=int, default=3, help='frames dumped during the measurement')
-    parser.add_argument('--template', default='out/save-template', help='save folder holding CUSA08809/')
+    parser.add_argument('--template', default='out/save-template', help='save folder holding CUSA08809/ or CUSA08034/')
     parser.add_argument('--record', help='hand over to the player with BB_PAD_RECORD=<file> (F9 stops)')
     parser.add_argument('--replay', help='measure a replay of a BB_PAD_RECORD file')
     parser.add_argument('--turn', type=float, default=0,
@@ -80,11 +82,12 @@ def main():
         args.timeout = max(args.timeout, 3600)
     os.chdir(ROOT)
     out = Path('out')
-    template = Path(args.template) / 'CUSA08809'
-    if not template.is_dir():
-        print(f'INVALID: need {template}')
+    serial = game_serial(GAME)  # CUSA08809 (EU) or CUSA08034 (US): the folder the game saves in
+    template = save_template(args.template, serial)
+    if not template:
+        print(f'INVALID: need {Path(args.template) / serial}')
         return 1
-    target = out / 'user' / 'savedata' / '1' / 'CUSA08809'
+    target = out / 'user' / 'savedata' / '1' / serial
     shutil.rmtree(target, ignore_errors=True)
     shutil.copytree(template, target)
     shutil.rmtree(out / 'dump', ignore_errors=True)

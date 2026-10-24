@@ -793,7 +793,7 @@ struct SignalImpl : public PageManager::Impl {
             return;
         }
         static std::mutex stats_mutex;
-        static std::map<std::tuple<bool, u64, VAddr>, u64> counts;
+        static std::map<std::tuple<bool, u64, VAddr, bool>, u64> counts;
         static auto last = std::chrono::steady_clock::now();
 #ifdef _WIN32
         const u64 rip = static_cast<EXCEPTION_POINTERS*>(context)->ContextRecord->Rip;
@@ -801,13 +801,16 @@ struct SignalImpl : public PageManager::Impl {
         const u64 rip = 0;
 #endif
         std::scoped_lock lk{stats_mutex};
-        ++counts[{is_gpu_thread, rip, addr & ~VAddr{0xFFFF}}];
+        // sotc: the last field (does the GPU hold this byte?) reads the command processor's ranges
+        // from the faulting thread without a lock: a diagnostic that may be a read behind, no more.
+        ++counts[{is_gpu_thread, rip, addr & ~VAddr{0xFFFF},
+                  !write && rasterizer->IsRangeGpuWritten(addr, 1)}];
         const auto now = std::chrono::steady_clock::now();
         if (now - last < std::chrono::seconds(10)) {
             return;
         }
         last = now;
-        std::vector<std::pair<u64, std::tuple<bool, u64, VAddr>>> sorted;
+        std::vector<std::pair<u64, std::tuple<bool, u64, VAddr, bool>>> sorted;
         u64 total = 0;
         for (const auto& [key, count] : counts) {
             sorted.emplace_back(count, key);
@@ -837,10 +840,22 @@ struct SignalImpl : public PageManager::Impl {
                                   std::get<1>(key) - reinterpret_cast<u64>(info.AllocationBase)));
             }
 #endif
-            std::fprintf(stderr, "  %6llu %s rip=%#llx (%s) region=%#llx\n",
+            std::fprintf(stderr, "  %6llu %s %s rip=%#llx (%s) region=%#llx\n",
                          static_cast<unsigned long long>(count), std::get<0>(key) ? "gpu  " : "guest",
+                         std::get<3>(key) ? "bytes-gpu" : "clean-bytes",
                          static_cast<unsigned long long>(std::get<1>(key)), where,
                          static_cast<unsigned long long>(std::get<2>(key)));
+            // SOTC_RB_STATS_CODE=1: the 128 bytes before and 32 after the faulting instruction of
+            // guest readers, as hex, to disassemble offline (llvm-mc --disassemble).
+            static const bool code = std::getenv("SOTC_RB_STATS_CODE") != nullptr;
+            if (code && !std::get<0>(key) && std::get<1>(key) >= 128) {
+                const u8* bytes = reinterpret_cast<const u8*>(std::get<1>(key) - 128);
+                std::fprintf(stderr, "    code@%#llx:", static_cast<unsigned long long>(std::get<1>(key) - 128));
+                for (int b = 0; b < 160; ++b) {
+                    std::fprintf(stderr, " %02x", bytes[b]);
+                }
+                std::fprintf(stderr, "\n");
+            }
         }
         counts.clear();
     }

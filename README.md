@@ -81,7 +81,12 @@ the original repository.
       What is left in the draw thread is the CPU-GPU traffic of the scene itself, per frame: 45 readbacks (~10% of
       the time, 6% waiting on the GPU), 230 guest write faults, 108 uploads (11.7 MB, the `memmove`) and 737 page
       protects (6%). Each is the tracking that keeps the game's memory and the GPU's in step, so cutting it means
-      changing what is tracked, not how fast it runs.
+      changing what is tracked, not how fast it runs. Tried on that traffic (24/10): half of the guest read
+      faults (28,600 of 55,000 over a run) hit bytes the GPU never wrote, on pages that share them with game
+      objects (`SOTC_RB_STATS=1`, `SOTC_RB_STATS_CODE=1` dumps the code around each reader); finishing such a load
+      from the backing without a readback removed 60% of those faults and changed nothing (42.9 / 40.8 against
+      43.7 / 41.9), so it was dropped. `SOTC_RB_EARLY=0` (43 early submits a frame) is the same: 42.6 / 41.9
+      against 43.1 / 42.0. The Shrine does not move with any single piece of this traffic.
       A split of the draw thread was measured earlier at 6.7% of its time (no-go). The other T2 items are each
       expected to give a few percent, so the Shrine at 60 FPS (+44%) is not in reach by these alone.
 - [ ] T3: every change must pass the rainbow-noise and sand-dot checks before it becomes default
@@ -142,7 +147,12 @@ Os números de issue se referem ao repositório original.
       ser equivalente e mais barata. O que sobra na thread de desenho é o tráfego CPU-GPU da própria cena, por
       quadro: 45 readbacks (~10% do tempo, 6% esperando o GPU), 230 faltas de escrita do jogo, 108 uploads (11,7 MB,
       o `memmove`) e 737 proteções de página (6%). Cada um é o rastreamento que mantém a memória do jogo e a do GPU
-      em dia, então reduzir é mudar o que se rastreia, não a velocidade com que roda.
+      em dia, então reduzir é mudar o que se rastreia, não a velocidade com que roda. Testado nesse tráfego
+      (24/10): metade das faltas de leitura do jogo (28.600 de 55.000 numa rodada) cai em bytes que o GPU nunca
+      escreveu, em páginas que os dividem com objetos do jogo (`SOTC_RB_STATS=1`; `SOTC_RB_STATS_CODE=1` despeja o
+      código em volta de cada leitor); terminar essa leitura pelo backing, sem readback, tirou 60% dessas faltas e
+      não mudou nada (42,9 / 40,8 contra 43,7 / 41,9), então saiu. `SOTC_RB_EARLY=0` (43 envios antecipados por
+      quadro) é igual: 42,6 / 41,9 contra 43,1 / 42,0. O Santuário não se mexe com nenhuma peça isolada desse tráfego.
       Mover trabalho para a thread do processador de comandos (perfil de 24/10 da thread de desenho, Santuário): ligar
       recursos é 43% dela (texturas 19%, buffers 15%) e depende de estado dos caches que só ela possui; as proteções
       de página que ela pede custam 1,6 ms por quadro (14.800 chamadas/s, `SOTC_PROTECT_STATS=1`); o pré-cálculo puro

@@ -25,7 +25,7 @@ inline const bool kCmdStats = std::getenv("SOTC_CMD_STATS") != nullptr;
 /// (mem_epoch below) waits for a check on that ground.
 inline const bool kFastBind = [] {
     const char* v = std::getenv("SOTC_FAST_BIND");
-    return v && v[0] == '1';
+    return !v || v[0] != '0'; // on by default since 0.60.6-plus3; SOTC_FAST_BIND=0 turns it off
 }();
 inline std::atomic<uint64_t> fast_bind_eligible{0};
 inline std::atomic<uint64_t> fast_bind_hits{0};
@@ -57,6 +57,12 @@ inline std::atomic<uint64_t> readback_bytes_changed{0};
 /// SOTC_RB_NARROW: readback window (KiB, 0 = off), GPU-modified bytes of the 512 KiB window left
 /// outside the narrow one (not downloaded nor unprotected), live hot readbacks (gauge).
 inline std::atomic<uint64_t> rb_narrow_kib{0}, rb_narrow_kept_bytes{0}, rb_hot_entries{0};
+/// graphics push descriptors / push constants overwritten by a helper pass (shadow scroll, blit, post
+/// process): a reused bind (SOTC_FAST_BIND) must push its descriptors again
+inline std::atomic<uint64_t> push_clobbers{0};
+inline std::atomic<uint64_t> image_refreshes{0}; ///< RefreshImage calls on a dirty image
+/// buffer uploads and dirty-image refreshes made by this thread (SOTC_FAST_BIND_VERIFY)
+inline thread_local uint64_t thread_data_events = 0;
 inline std::atomic<uint64_t> uploads{0};        ///< SynchronizeMemory copies (CPU data to GPU)
 /// DMA sweeps (SynchronizeDmaBuffers): count, resident ranges visited, sweeps that uploaded.
 inline std::atomic<uint64_t> dma_sweeps{0}, dma_sweep_ranges{0}, dma_sweep_uploading{0};

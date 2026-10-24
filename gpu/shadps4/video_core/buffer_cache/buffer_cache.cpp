@@ -160,6 +160,7 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
             ReadMemory(device_addr, size, true, assume_locks);
         },
         guest_fault);
+    SotcStats::mem_epoch.fetch_add(1, std::memory_order_release); // after the marks (reused binds)
 }
 
 void BufferCache::DropGpuModified(VAddr device_addr, u64 size) {
@@ -1501,6 +1502,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             SotcStats::frame_copy_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
         }
         SotcStats::uploads.fetch_add(1, std::memory_order_relaxed);
+        ++SotcStats::thread_data_events;
         if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer
             SotcStats::upload_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
         }

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -114,6 +115,7 @@ void BlitHelper::ReinterpretColorAsMsDepth(u32 width, u32 height, u32 num_sample
         .descriptorType = vk::DescriptorType::eSampledImage,
         .pImageInfo = &image_info,
     };
+    SotcStats::push_clobbers.fetch_add(1, std::memory_order_relaxed); // sotc: reused binds repush
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *single_texture_pl_layout, 0U,
                                 texture_write);
 
@@ -215,6 +217,7 @@ void BlitHelper::CopyBetweenMsImages(u32 width, u32 height, u32 num_samples,
         .descriptorType = vk::DescriptorType::eSampledImage,
         .pImageInfo = &image_info,
     };
+    SotcStats::push_clobbers.fetch_add(1, std::memory_order_relaxed); // sotc: reused binds repush
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *single_texture_pl_layout, 0U,
                                 texture_write);
 

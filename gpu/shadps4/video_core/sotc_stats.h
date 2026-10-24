@@ -202,6 +202,12 @@ inline std::atomic<uint64_t> readback_bytes_changed{0};
 inline std::atomic<uint64_t> rb_narrow_kib{0}, rb_narrow_kept_bytes{0}, rb_hot_entries{0};
 /// sotc: readbacks with a streaming window (SOTC_RB_STREAM, BufferCache::ReadMemory)
 inline std::atomic<uint64_t> rb_stream_windows{0};
+/// graphics push descriptors / push constants overwritten by a helper pass (shadow scroll, blit, post
+/// process): a reused bind (SOTC_FAST_BIND) must push its descriptors again
+inline std::atomic<uint64_t> push_clobbers{0};
+inline std::atomic<uint64_t> image_refreshes{0}; ///< RefreshImage calls on a dirty image
+/// buffer uploads and dirty-image refreshes made by this thread (SOTC_FAST_BIND_VERIFY)
+inline thread_local uint64_t thread_data_events = 0;
 inline std::atomic<uint64_t> uploads{0};        ///< SynchronizeMemory copies (CPU data to GPU)
 /// DMA sweeps (SynchronizeDmaBuffers): count, resident ranges visited, sweeps that uploaded.
 inline std::atomic<uint64_t> dma_sweeps{0}, dma_sweep_ranges{0}, dma_sweep_uploading{0};

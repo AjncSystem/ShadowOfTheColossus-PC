@@ -1150,6 +1150,8 @@ void TextureCache::RefreshImage(Image& image) {
     }
     const SotcStats::FrameTimer frame_timer{SotcStats::FrameUpload};
     const SotcStats::SplitTimer refresh_split{SotcStats::SplitTexRefresh};
+    SotcStats::image_refreshes.fetch_add(1, std::memory_order_relaxed);
+    ++SotcStats::thread_data_events;
     // sotc: RefreshImage always runs under `mutex` (UpdateImage, FindImage -> ExpandImage) and can
     // reach EnsureResident through ObtainBufferForImage; see TryEmergencyCollect.
     ++refresh_depth;

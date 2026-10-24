@@ -274,7 +274,8 @@ private:
     bool BindResources(const Pipeline* pipeline);
     bool FastBindEligible(const Pipeline* pipeline) const;
     u64 FastBindHash(const Pipeline* pipeline, const Shader::PushData& push_data) const;
-    void CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dma);
+    void CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dma, u64 pre_epoch,
+                        u64 pre_clobbers);
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
     void BindIndexBuffer(u32 index_offset = 0);
@@ -564,6 +565,7 @@ private:
         u64 texture_generation{};
         u64 stream_generation{};
         u64 mem_epoch{}; ///< SotcStats::mem_epoch: guest memory unchanged since
+        u64 clobbers{};  ///< SotcStats::push_clobbers when the bind started
         u64 tick{};
         bool uses_dma{};
         bool valid{};
@@ -571,6 +573,10 @@ private:
     };
     boost::container::small_vector<u32, 8> lod_marks; ///< banks marked by the bind in progress
     FastBindState fast_bind{};
+    bool verify_pending{};
+    u64 verify_uploads{};
+    std::vector<vk::DescriptorBufferInfo> verify_buffers;
+    std::vector<vk::DescriptorImageInfo> verify_images;
     bool fast_bind_hit{};
 
     /// sotc: DLSS super resolution draws the game's UI layer at the output size: each draw into

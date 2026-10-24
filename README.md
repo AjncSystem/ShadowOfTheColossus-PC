@@ -136,6 +136,13 @@ Os números de issue se referem ao repositório original.
       Achado no lugar: 4 alocações e 4 liberações de memória de vídeo por quadro (o driver quer memória dedicada
       para imagens), ~5% da thread de desenho. Um pool de imagens as elimina: Santuário 40,3 para 42,0 FPS (+4%),
       demo de atração 71,2 para 75,5 (+6%), mesmo uso de memória de vídeo, `SOTC_IMAGE_POOL=0` desliga.
+      Testado e descartado (24/10, Santuário, duas rodadas cada): tornar a thread de desenho a dona privilegiada da
+      trava do cache de texturas deu 40,8 / 40,9 FPS contra 43,1 / 43,8 com a dona antiga (-5%); uma atômica por
+      palavra de 64 páginas em `SetSrtReadProtectedPages` fica dentro do ruído (43,0 em quatro rodadas), mantida por
+      ser equivalente e mais barata. O que sobra na thread de desenho é o tráfego CPU-GPU da própria cena, por
+      quadro: 45 readbacks (~10% do tempo, 6% esperando o GPU), 230 faltas de escrita do jogo, 108 uploads (11,7 MB,
+      o `memmove`) e 737 proteções de página (6%). Cada um é o rastreamento que mantém a memória do jogo e a do GPU
+      em dia, então reduzir é mudar o que se rastreia, não a velocidade com que roda.
       Mover trabalho para a thread do processador de comandos (perfil de 24/10 da thread de desenho, Santuário): ligar
       recursos é 43% dela (texturas 19%, buffers 15%) e depende de estado dos caches que só ela possui; as proteções
       de página que ela pede custam 1,6 ms por quadro (14.800 chamadas/s, `SOTC_PROTECT_STATS=1`); o pré-cálculo puro

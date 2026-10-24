@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.60.6-plus3 — 2026-10-24 (fork Lucas-blip-png)
+- **Reuso de descritores ligado por padrão (`SOTC_FAST_BIND`, desligue com `SOTC_FAST_BIND=0`):** quando um desenho usa o
+  mesmo pipeline, as mesmas constantes e os mesmos recursos do anterior, os descritores já enviados são reaproveitados.
+  Santuário: de 43,5 para 47,1 FPS (+8%, três rodadas de cada); demo de atração 69,5 FPS. Ficou desligado desde a 0.60.6
+  porque na 0.60.5 deixou pontos pretos em grade na areia. Revisão independente do código achou as corridas que
+  deixavam isso passar e elas foram corrigidas: o contador de mudanças de memória agora sobe depois das marcações e é lido
+  antes do bind, páginas "quentes" e marcações adiantadas também o fazem subir, cópias e HLE de shaders invalidam o
+  reuso, e os passes que sobrescrevem os descritores (scroll de sombra, blit, troca de backing MSAA) forçam um novo envio.
+  `SOTC_FAST_BIND_VERIFY=1` refaz o bind completo em cada acerto e compara: 0 descritores diferentes em 5,6 milhões de
+  acertos simulados, 6 casos de dado novo (corrida com escrita do jogo para o quadro seguinte).
+  **A areia do mundo aberto não foi testada** (o roteiro automático só chega ao Santuário): se aparecerem pontos pretos
+  no chão, `SOTC_FAST_BIND=0` desliga e uma nota na issue ajuda.
+
 ## 0.60.6-plus2 — 2026-10-24 (fork Lucas-blip-png)
 - **DLSS Super Resolution (modelo DLSS 4.5), só em placas NVIDIA RTX.** No lançador: Upscaler > DLSS
   Super Resolution; com as DLLs `sl.interposer.dll`, `sl.common.dll`, `sl.dlss.dll` e `nvngx_dlss.dll`

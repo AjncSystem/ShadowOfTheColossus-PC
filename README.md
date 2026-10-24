@@ -75,6 +75,13 @@ the original repository.
       Found instead: 4 video memory allocations and 4 frees per frame (the driver wants dedicated memory for
       images), ~5% of the draw thread. An image pool removes them: Shrine 40.3 to 42.0 FPS (+4%), attract demo
       71.2 to 75.5 (+6%), same video memory use, `SOTC_IMAGE_POOL=0` turns it off.
+      Tried and dropped (24/10, Shrine, two runs each): making the draw thread the biased owner of the texture
+      cache lock gave 40.8 / 40.9 FPS against 43.1 / 43.8 with the old owner (-5%); one atomic per 64-page word in
+      `SetSrtReadProtectedPages` is within noise (43.0 over four runs), kept because it is equivalent and cheaper.
+      What is left in the draw thread is the CPU-GPU traffic of the scene itself, per frame: 45 readbacks (~10% of
+      the time, 6% waiting on the GPU), 230 guest write faults, 108 uploads (11.7 MB, the `memmove`) and 737 page
+      protects (6%). Each is the tracking that keeps the game's memory and the GPU's in step, so cutting it means
+      changing what is tracked, not how fast it runs.
       A split of the draw thread was measured earlier at 6.7% of its time (no-go). The other T2 items are each
       expected to give a few percent, so the Shrine at 60 FPS (+44%) is not in reach by these alone.
 - [ ] T3: every change must pass the rainbow-noise and sand-dot checks before it becomes default

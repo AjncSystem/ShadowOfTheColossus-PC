@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC native port · v0.60.6-plus3
+# Shadow of the Colossus — PC native port · v0.60.6-plus4
 
 **The original 0.60.6, plus CPUs without BMI1 (pre-Haswell), CPUs with 4 threads, 120 Hz
 fullscreen, a 32-lane fix for AMD GCN cards (RX 470–590, to test), and the FSR 3.1 and DLSS 4.5 upscalers (NVIDIA RTX).** Everything in [AjncSystem's 0.60.6](https://github.com/AjncSystem/ShadowOfTheColossus-PC)
@@ -190,6 +190,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.60.6-plus4** | **Lucas-blip-png fork:** hot readbacks (`SOTC_RB_HOT`) are on by default again: about +14% in the Shrine (rainbow noise and the 0x49500 crash fixed by Oussama268's late checks; 26 min soak, 0 faults); GPU, launcher (HDR, skip logos, grass options, low-memory warning) and US-release (CUSA08034) work from Oussama268's fork. `SOTC_RB_HOT=0` turns it off. |
 | **0.60.6-plus3** | **Lucas-blip-png fork:** descriptor reuse (`SOTC_FAST_BIND`) is on by default again: +8% in the Shrine (43.5 → 47.1 FPS) after an independent review fixed the races behind the black dots on sand of 0.60.5; `SOTC_FAST_BIND=0` turns it off. Open-world sand not tested yet. |
 | **0.60.6-plus2** | **Lucas-blip-png fork:** **FSR 3.1 and DLSS Super Resolution (DLSS 4.5 model, NVIDIA RTX) upscalers** with the DLAA / Quality / Balanced / Performance / Ultra performance modes in the launcher, a texture LOD bias for them (sharper textures below the output size), images taken from a pool (no video memory allocation per frame: +4% in the Shrine, +6% in the attract demo), and many measured dead ends of the 120 FPS roadmap documented. DLSS needs the NVIDIA DLLs next to the game; without them FSR 3.1 is used. |
 | **0.60.6** | **No more rainbow garbage on textures and far fewer "closed out of nowhere" crashes** (the cause: speculative GPU readbacks written over memory the game had reused, after loading a save or a new area), **no more black dots on sandy ground**, **in-game menu cleaned up** (FPS, upscaler and sharpening now change at once; Bloodborne leftovers removed), **hard disk read-ahead** (fewer stalls in new areas on HDDs), textures refreshed on every load, a readable session event log (`user/events.log`). |

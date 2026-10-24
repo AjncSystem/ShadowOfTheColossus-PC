@@ -1,6 +1,25 @@
 # Changelog
 
-## Não lançado — versão americana (CUSA08034, do fork do Oussama268; sem dump americano aqui, só os testes de código)
+## 0.60.6-plus4 — 2026-10-24 (fork Lucas-blip-png)
+- **Leituras de volta "quentes" ligadas por padrão (`SOTC_RB_HOT`, desligue com `SOTC_RB_HOT=0`):** o que a GPU escreve
+  e o jogo logo lê volta pela CPU sem esperar o fim do quadro. Santuário: cerca de +14% (44,0 / 47,4 para 53,3 / 50,3 FPS).
+  A 0.60.6 as desligou por causa de ruído colorido e do travamento 0x49500. As correções do Oussama268 resolvem as
+  duas causas: o jogo é reconferido logo antes de aplicar a leitura e cada página é gravada sob o lock da sua região.
+  Validado aqui: 3 roteiros de save (30 FPS) mais 1 sem limite (49 FPS) com 0 falhas e sem ruído, e 26 minutos de
+  demo de atração (média 71,0 FPS, mínimo 39,6, 0 falhas; o travamento antigo vinha aos 23 minutos).
+- **Melhorias da GPU vindas do fork do Oussama268:** a fila de comandos sem nada pendente não toma mais o lock;
+  arquivos de cache de shader que não existem não são lidos do disco; a posição fica invariante nos pipelines que emulam
+  coordenadas baricêntricas (o cache de shaders é refeito na primeira abertura); a remoção de arenas do cache de buffers
+  não espera mais a GPU.
+- **Lançador:** aviso antes de iniciar quando o Windows não tem memória de commit para o jogo (#95), opção de pular os
+  logos, opções de grama (cascatas de sombra, tamanho e desvanecimento) e modo **HDR** (saída HDR10 mais a renderização HDR do jogo).
+- **Diagnóstico:** `SOTC_PROFILE_SLOW_MS` perfila só os quadros mais longos que o valor; o bench do Santuário ganhou
+  `--turn`/`--turn-pad` e o da demo aceita `BENCH_MODES`.
+- Medições desta rodada que **não** viraram mudança: reaproveitar descritores em compute (quase todo dispatch escreve),
+  cortar o custo do preenchimento HLE (ganho de 2 a 3%) e reduzir os `Protect` (12 MB por quadro realmente reescritos
+  pelo jogo). O Santuário fica em 50 a 53 FPS sem limite.
+
+### Versão americana (CUSA08034, do fork do Oussama268; sem dump americano aqui, só os testes de código)
 - **O dump americano CUSA08034 (1.00, a única versão americana) funciona.** O executável é o
   mesmo da versão europeia 1.01 (código e dados idênticos byte a byte; os arquivos `.psarc`
   também), então todas as correções, os modos de patch (60 FPS, filtro 16x, tamanho de

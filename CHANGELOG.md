@@ -1,5 +1,58 @@
 # Changelog
 
+## 0.60.6-plus3 — 2026-10-24 (fork Lucas-blip-png)
+- **Reuso de descritores ligado por padrão (`SOTC_FAST_BIND`, desligue com `SOTC_FAST_BIND=0`):** quando um desenho usa o
+  mesmo pipeline, as mesmas constantes e os mesmos recursos do anterior, os descritores já enviados são reaproveitados.
+  Santuário: de 43,5 para 47,1 FPS (+8%, três rodadas de cada); demo de atração 69,5 FPS. Ficou desligado desde a 0.60.6
+  porque na 0.60.5 deixou pontos pretos em grade na areia. Revisão independente do código achou as corridas que
+  deixavam isso passar e elas foram corrigidas: o contador de mudanças de memória agora sobe depois das marcações e é lido
+  antes do bind, páginas "quentes" e marcações adiantadas também o fazem subir, cópias e HLE de shaders invalidam o
+  reuso, e os passes que sobrescrevem os descritores (scroll de sombra, blit, troca de backing MSAA) forçam um novo envio.
+  `SOTC_FAST_BIND_VERIFY=1` refaz o bind completo em cada acerto e compara: 0 descritores diferentes em 5,6 milhões de
+  acertos simulados, 6 casos de dado novo (corrida com escrita do jogo para o quadro seguinte).
+  **A areia do mundo aberto não foi testada** (o roteiro automático só chega ao Santuário): se aparecerem pontos pretos
+  no chão, `SOTC_FAST_BIND=0` desliga e uma nota na issue ajuda.
+
+## 0.60.6-plus2 — 2026-10-24 (fork Lucas-blip-png)
+- **DLSS Super Resolution (modelo DLSS 4.5), só em placas NVIDIA RTX.** No lançador: Upscaler > DLSS
+  Super Resolution; com as DLLs `sl.interposer.dll`, `sl.common.dll`, `sl.dlss.dll` e `nvngx_dlss.dll`
+  (Streamline 2.14.16, `nvngx_dlss.dll` 310.9.16) na pasta `bin`. Usa os presets M (DLAA, Qualidade,
+  Equilibrado, Desempenho) e L (Ultra desempenho), a segunda geração do modelo transformer; `SOTC_DLSS_PRESET=k`
+  volta ao modelo do DLSS 4 nos três primeiros. Sem as DLLs ou sem RTX, o jogo usa o FSR 3.1 (verificado). Testado
+  na RTX 5060 Ti: imagem e cores corretas, sem quedas. O Streamline intercepta as chamadas do Vulkan e custa uns
+  5% de FPS nesta CPU (FSR 3.1 49,6 → 46,7 só com ele carregado; o DLSS em si mais ~1 FPS), então o ganho do DLSS é
+  de qualidade de imagem; onde a placa de vídeo é o limite (saída 1440p/4K em placas menores) o FPS sobe como no FSR.
+- **Modos de qualidade do FSR 3.1 e do DLSS no lançador:** Nativa (DLAA), Qualidade (1,5x), Equilibrado (1,7x),
+  Desempenho (2,0x) e Ultra desempenho (3,0x); o modo do DLSS segue o fator. A dica avisa que, com a CPU como
+  limite, renderizar menor quase não muda o FPS (Santuário em 4K: 1080p 39 FPS, 720p 47 a 50).
+- **Viés de LOD das texturas com o upscaler ligado** (`log2(render/saída) - 1`, o que o FSR e o DLSS pedem ao jogo):
+  pedra, roupa e rosto ficam mais nítidos ao renderizar abaixo da saída (720p → 4K: -2,58). Pode reabrir o chiado em
+  texturas finas; `SOTC_MIP_BIAS=0` desliga, ou outro valor o troca. Aceito o risco de pontos pretos na areia, a
+  corrigir depois.
+- **Menu do jogo (F1):** mostra "DLSS Super Resolution" quando é o upscaler e não troca a escolha do lançador por FSR 3.1.
+- `SetSrtReadProtectedPages` com uma operação atômica por palavra de 64 páginas (equivalente, dentro do ruído).
+- Diagnósticos: `SOTC_RB_STATS=1` marca se os bytes lidos são do GPU e `SOTC_RB_STATS_CODE=1` despeja o código do
+  leitor; `SOTC_PROTECT_STATS=1`; `SOTC_STREAMLINE_FORCE=1` (carrega o Streamline com qualquer upscaler).
+- Medido e descartado (24/10, sem mudança de código no jogo): trava do cache de texturas com a thread de desenho
+  como dona (-5%), leitura sem readback para bytes que o GPU nunca escreveu (60% menos faltas, FPS igual) e
+  `SOTC_RB_EARLY=0`. Detalhes no README.
+- **Imagens sem alocação de memória de vídeo por quadro (+4% no Santuário, +6% na demo).** O driver
+  da NVIDIA pede memória dedicada para imagens, então a cada imagem criada o port chamava
+  `vkAllocateMemory` e, quando ela morria, `vkFreeMemory`: 4 de cada por quadro com a cena parada, uns
+  5% do tempo da thread de desenho no Windows. Agora as imagens saem de um pool de blocos de 64 MiB que
+  não permite alocação dedicada (as maiores que um bloco seguem o caminho antigo). Santuário 40,3 →
+  42,0 FPS, demo de atração 71,2 → 75,5; o uso de memória de vídeo ficou igual. `SOTC_IMAGE_POOL=0`
+  desliga. Diagnóstico novo: `SOTC_VK_ALLOC_TRACE=1` (com `SOTC_CMD_STATS=1`) mostra quem aloca.
+- **Upscaler FSR 3.1 (temporal), desligado por padrão.** O jogo renderiza abaixo da saída (720p, 576p...)
+  e o FSR 3.1 da AMD (qualquer placa com Vulkan 1.3) reconstrói a imagem com a profundidade, os vetores
+  de movimento, o jitter e a câmera do próprio jogo, as mesmas entradas da geração de quadros. No
+  lançador: Upscaler > FSR 3.1 e "Qualidade do FSR 3.1" (nativa, 1,5x, 1,7x, 2,0x, 3,0x); no menu F1 a
+  opção aparece quando o jogo abriu com ele e liga/desliga na hora. `SOTC_UPSCALER=fsr3` liga sem o
+  lançador (com `SOTC_RENDER_RES` e `SOTC_OUTPUT_RES`); `SOTC_FSR3UP_LOG=1` mostra o estado. No Santuário,
+  720p para 4K: 38,7 FPS a 1080p, 46,9 a 720p com FSR 1 e ~48 FPS com FSR 3.1 (o PC de teste é limitado
+  pela CPU; o ganho aparece onde a placa de vídeo é o limite). Limitações: a interface (HUD) também passa
+  pelo upscaler; desliga o modo PS4 Pro. O cache de shaders não muda.
+
 ## 0.60.6 — 2026-10-22
 - **Fim do ruído arco-íris nas texturas e das quedas "do nada" (`0x49500`).** A causa eram as
   leituras "quentes" da GPU (`SOTC_RB_HOT`): junto com cada leitura, o port escrevia na memória do
@@ -28,6 +81,96 @@
 - Revisão de código: guarda dos heaps do mundo, vigia de travamento, memória em PC com pouca RAM,
   "Ilimitado" do lançador preservado, tela de carregamento translúcida em engasgos curtos.
 
+## 0.60.6-plus1 — fork Lucas-blip-png
+- Junção com a 0.60.6 do original (AjncSystem). Nenhuma mudança própria nesta versão ainda;
+  as correções do fork (wave32 nas AMD GCN, memória, Streamline só em NVIDIA, barreiras do FSR 1)
+  seguem como estavam na 0.60.5-plus1.
+
+## 0.60.5-plus1 — 2026-10-22 (fork Lucas-blip-png)
+- **Junção com a 0.60.5 do original:** a seleção de texturas (Desligada / Alta / Máxima), o vazamento
+  de memória, os descritores reaproveitados, o carregamento mais rápido depois de atualizar o driver
+  e as barreiras de LDS para AMD de 64 lanes vêm da 0.60.5. Nada disso foi removido do fork.
+- **Mantido do fork:** a conversão para 32 lanes nas AMD GCN (`GPU: AMD wave32 on`), com a
+  proteção para o RADV, a correção de memória (8/7/6 GiB antes do mínimo), o Streamline só em NVIDIA
+  e as barreiras do FSR 1.
+- **Atenção:** as barreiras de LDS da 0.60.5 e a conversão para 32 lanes ficam ligadas juntas nas
+  AMD GCN. Ainda não foi testado em uma RX 570; quem testar, mande o `last_run.log` (o relato de
+  perda de dispositivo ainda não está resolvido: teste com `SOTC_AMD_WAVE32=0`).
+
+## 0.60.3-plus6 — 2026-10-22 (fork Lucas-blip-png)
+- **Queda depois do primeiro colosso com saves em modo Pro (#194 do original):** quando o Windows
+  recusava os 9152 MiB de memória do jogo, a plus3 caía direto para 5056/5696 MiB, e isso fazia o
+  save carregar em modo Pro ler além do bitmap de páginas (`guest offset 0x1a371`). Agora o port
+  tenta 8, 7 e 6 GiB antes de cair para o mínimo. O log mostra `trying N MiB`.
+
+## 0.60.3-plus5 — 2026-10-21 (fork Lucas-blip-png)
+- **Correção urgente da plus4 no Linux (RADV):** a conversão para 32 lanes ligava por padrão em
+  qualquer AMD com subgrupo 64, mas o RADV não exige o tamanho nos shaders de compute, e o jogo
+  travava 30–90 s na introdução (#201 do original). Agora o padrão só liga onde o driver exige o
+  tamanho nos shaders de compute (Windows, RX 570: o flicker sumiu com isso). `SOTC_AMD_WAVE32=1`
+  continua forçando, mas no RADV dá falha: não use lá.
+
+## 0.60.3-plus4 — 2026-10-21 (fork Lucas-blip-png)
+- **Placas AMD GCN (RX 470–590, Vega, APUs mais antigas):** o flicker branco/verde/rosa de
+  personagens, fumaça e névoa (#152, #187, #201 do original) **sumiu numa RX 570** com a nova
+  conversão para 32 lanes (a que a camada SotC-AMD-Fix fazia): os shaders passam pela conversão de
+  wave64 e os pipelines de compute exigem subgrupo de 32. Agora é o padrão nessas placas (AMD com
+  subgrupo mínimo e máximo de 64); `SOTC_AMD_WAVE32=0` desliga e `=1` força em qualquer AMD. O log
+  mostra `GPU: AMD wave32 on`. O cache de shaders é refeito na primeira abertura. **Um relato de
+  queda** (GPU travada, `ErrorDeviceLost`) logo após derrotar o 1º colosso e carregar a cena
+  seguinte: se acontecer com você, mande o `last_run.log` e teste com `SOTC_AMD_WAVE32=0`.
+  Nada muda em NVIDIA, Intel nem nas AMD RDNA.
+
+## 0.60.3-plus3 — 2026-10-20 (fork Lucas-blip-png)
+- **Queda ao abrir em PCs com pouca memória virtual:** quando o Windows recusa os 9152 MiB de
+  memória do jogo (erro 1450, arquivo de paginação pequeno ou RAM ocupada), o port já caía para
+  5056 MiB, mas só depois de o jogo ter perguntado o tamanho. O jogo então alocava perto dos 9 GiB,
+  não recebia nada e caía no boot (guest offset 0x18cae, #194 do original). Agora a memória é criada
+  antes de o tamanho ser informado. O log mostra `guest memory refused ... using 5056 MiB`, e um
+  arquivo de paginação maior devolve os 9152 MiB.
+- **Queda ao ligar a geração de quadros com uma AMD e uma NVIDIA no mesmo PC:** o Streamline
+  (DLSS-G) era carregado se houvesse qualquer placa NVIDIA, mas o jogo roda na placa de mais memória
+  (uma RX 9070, no relato), e a criação do dispositivo falhava (`VK_NV_low_latency2`, #194). Agora o
+  Streamline só carrega quando a placa usada é NVIDIA (`SOTC_GPU_VENDOR` também é respeitado).
+- **FSR 1:** a imagem do jogo agora espera pelo compute shader do EASU, e a imagem de saída espera
+  pelos últimos leitores. Pela especificação do Vulkan faltavam essas duas barreiras. É candidata a
+  causa de falhas do FSR 1 em algumas AMD (#209), mas não está confirmada.
+
+## 0.60.3-plus2 — 2026-10-20 (fork Lucas-blip-png)
+- **Placas AMD GCN (RX 470–590, Vega, APUs mais antigas), para testar:** personagens piscando em
+  branco, verde ou rosa, fumaça branca e névoa com cores que mudam a cada execução (#152, #187 e
+  #201 do original). Essas placas rodam os shaders com 64 lanes, e nesse caso o port não punha as
+  barreiras de LDS que o jogo precisa; agora põe. A camada não oficial SotC-AMD-Fix (raulbezerro-dev)
+  resolvia numa RX 570 justamente por ligar essas barreiras. O log mostra
+  `GPU: LDS barriers on for 64-wide AMD`; `SOTC_AMD64_LDS=0` desliga. Não testado numa GCN (não
+  temos a placa): conte na #152 ou na #201 do original. O cache de shaders é refeito na primeira
+  abertura nessas placas. Nada muda em NVIDIA, Intel ou nas AMD RDNA no Windows. Enviado ao
+  original como PR #205.
+- **CPUs com 4 threads:** o gravador de comandos da GPU também não gira entre um lote e outro
+  quando o processo tem até 8 processadores lógicos. Demo de abertura, modo 60 FPS, Ryzen 7 5700X
+  preso a 4 processadores lógicos: 2 núcleos com SMT 66,9 FPS (antes 64,3), 4 núcleos sem SMT
+  81,8 (antes 79,9); com todos, igual (95 FPS). O log mostra
+  `GPU recorder: N logical processors, spin N us, idle wait N us`.
+
+## 0.60.3-plus — 2026-10-20 (fork Lucas-blip-png)
+- A 0.60.1-plus em cima da **0.60.3** do original: o jogo é zerável do início ao fim, o **ajuste
+  rápido no menu dentro do jogo** (60 FPS, geração de quadros, texturas em alta, sombras distantes
+  e volume sem sair do jogo), o mouse solto no menu e a tela de carregamento animada na montagem
+  dos shaders. A válvula das texturas em alta (#191) e a janela de readback de 64 KiB (#196), que
+  eram só deste fork, agora fazem parte do original.
+- **CPUs com 4 threads** (4 núcleos sem SMT ou 2 com SMT): o gravador de comandos da GPU dorme 2 ms
+  quando o processo tem até 8 processadores lógicos, em vez de girar num núcleo inteiro, e o
+  processador de comandos cede a vez quando todas as filas estão esperando (`SOTC_CP_YIELD=0`
+  desliga). Demo de abertura, modo 60 FPS, Ryzen 7 5700X preso a 4 processadores lógicos: antes
+  ficava parado no carregamento, agora 76 FPS (mínima 65). Com 16 processadores lógicos, igual
+  (94 FPS). O log mostra `GPU recorder: N logical processors, idle wait N us`;
+  `SOTC_REC_SLEEP_US` continua mandando.
+- **A emulação de BMI1 não pesa no mundo aberto:** demo de abertura no modo 60 FPS, todos os
+  núcleos, com a emulação forçada (`SOTC_EMULATE_BMI=1`) 93,3 e 93,4 FPS contra 91,2 e 92,2 sem
+  ela. Nas CPUs sem BMI1 o FPS baixo no mundo aberto vem da CPU, não da emulação.
+- Testado: demo de abertura com 4 processadores lógicos 77,1 FPS (mínima 68,5); Santuário com a
+  emulação, o relógio do Windows e as texturas em alta forçados (`SOTC_EMULATE_BMI=1`,
+  `SOTC_TSC=qpc`, `SOTC_LOD_LINGER=1`): sem falhas, imagem normal, 46 FPS.
 ## 0.60.5 — 2026-10-21
 - **Seletor de qualidade das texturas: Desligada / Alta / Máxima** (#235), no lançador
   (Ajustes rápidos → Texturas) e no menu do jogo (muda na hora). **Alta (estável)**, o padrão,
@@ -96,6 +239,24 @@ ligados. Obrigado a **Lucas-blip-png**.
   animação no centro (círculo girando, título pulsando, "Carregando…").
 - Menu com título e Ajuste rápido no idioma do lançador.
 
+## 0.60.1-plus — 2026-10-20 (fork Lucas-blip-png)
+- A 0.59-plus5 em cima da **0.60.1** do original. Da 0.60.1: o **menu dentro do jogo** (Insert, F1
+  ou L3+R3; nosekefik) e as sobras do Bloodborne removidas (Oussama268). Da 0.60: o relógio do jogo
+  vem do Windows quando os núcleos da CPU discordam (Einar; o jogo travava na tela de título), o
+  jogo abre em PCs com pouca memória e cada cópia do port tem a própria pasta `user` (as
+  configurações do lançador ficam em `user\launcher_settings.json`; na primeira vez a cópia herda
+  as de antes). As texturas nas GTX 10xx, os 60 FPS pelo modo do próprio jogo, o heap guard sem
+  remontar a cada quadro e a geração de quadros sem o HUD, que vieram deste fork, agora fazem parte
+  do original.
+- **CPUs sem BMI1 confirmadas numa de verdade:** com a 0.59-plus5, o ta955995-cmd (issue #88 do
+  original) jogou até o primeiro colosso. No mundo aberto o FPS ainda fica baixo nessas CPUs.
+- Continua só aqui: CPUs sem BMI1/LZCNT/MOVBE (Oussama268, com as lacunas da 0.59-plus5), a
+  válvula das texturas em alta (#186 do original; enviada como PR #191 do original), a janela de
+  readback menor e a tela cheia a 120 Hz.
+- Testado no Santuário com a emulação de CPU antiga, o relógio do Windows e as texturas em alta
+  forçados ao mesmo tempo (`SOTC_EMULATE_BMI=1`, `SOTC_TSC=qpc`, `SOTC_LOD_LINGER=1`): sem falhas,
+  imagem normal, 47 FPS.
+
 ## 0.60.1 — 2026-10-20
 Obrigado a **nosekefik, Oussama268, plassardewen-cpu e lunar-me**.
 
@@ -143,6 +304,86 @@ Obrigado a **Lucas-blip-png, Einar e KingJhoss**.
 (espada erguida contra o sol, área do último colosso; #186): desligue-a se acontecer. Personagens
 brancos em AMD GCN (RX 470–590, Vega, APUs): em investigação.
 
+## 0.59-plus5 — 2026-10-20 (fork Lucas-blip-png)
+- **Queda com texturas em alta no modo PS4 Pro** (issue #186 do original, `read access to
+  ffffffffffffffff at guest offset 0x1a371`): o port pede o mip 2 de toda textura amostrada,
+  inclusive as distantes, e o jogo carregava mais detalhe do que o pool de páginas dele comporta
+  (10% livre depois de carregar, 0% uns 40 s depois). Agora, quando o pool fica abaixo de 8% livre,
+  as texturas pedem um mip a menos (abaixo de 4%, dois) e o jogo libera memória. No Santuário, em
+  modo Pro: antes caiu nas 3 rodadas; agora rodou 3 minutos sem cair, com o pool estável em 4% e o
+  chão e a grama com a mesma nitidez. `SOTC_LOD_POOL_LOW=0` desliga.
+- **CPUs sem BMI1 (Sandy/Ivy Bridge, AMD FX) travavam na primeira tela de carregamento** (issue
+  #88 do original, numa CPU dessas de verdade): a tradução das instruções seguia só o caminho de
+  cada função e deixava de fora trechos alcançados por tabelas de salto. Um TZCNT/LZCNT esquecido
+  ali roda como BSF/BSR sem dar erro e devolve outro valor. Agora esses trechos também são
+  traduzidos (89 instruções a mais). Testado forçando a emulação numa CPU moderna: Santuário e
+  demo de abertura inteiro sem falhas. Falta a confirmação numa CPU dessas. Nas CPUs
+  modernas nada muda.
+
+## 0.59-plus4 — 2026-10-20 (fork Lucas-blip-png)
+- A 0.59-plus3 em cima da **0.59.1** do original: **listras da AMD** nas sombras e na água (o
+  acesso direto à memória vem desligado nas AMD, do Oussama268), correções para Intel, opção
+  **Sombras distantes** no lançador (desligada por padrão, como já era aqui), linha `GPU:` com a
+  placa e o driver no `user/last_run.log` e `SOTC_GPU_VENDOR` para notebooks com duas GPUs.
+- Santuário, FPS ilimitado, modo 60 (RTX 5060 Ti, mesma cena, 3 rodadas alternadas): 0.59.1 45,7 /
+  45,6 / 46,7 FPS, 0.59-plus4 48,1 / 48,8 / 50,1 (+7% pela mediana), sem falhas.
+
+## 0.59-plus3 — 2026-10-20 (fork Lucas-blip-png)
+- **60 FPS pelo modo 60 do próprio jogo** (o do Desempenho do PS4 Pro). O modo 60 do lançador
+  ignorava a taxa de 30 que o jogo pede, mas o jogo continuava se cronometrando para 30 (alvo
+  29,97), e partes da lógica que andam por esse alvo corriam no dobro da velocidade: a causa
+  provável do colosso pássaro que sobe para o céu (#100 do original), da parede do 2º colosso
+  (#120) e do dano no ponto fraco (#49). Agora o jogo mira 60 sozinho (`TargetFramesPerSeconds` 1,
+  onde ele gravava 2) e o tempo dele acompanha. Vale para 60 FPS e ilimitado. O F7 troca o alvo
+  do próprio jogo entre 30 e 60, e a taxa e o tempo mudam juntos. Mesmo desempenho (Santuário
+  35,8 FPS nos dois modos, mesma cena). Ainda não testado nos colossos 2 e 5: quem tiver um save
+  ali, conte. Para voltar ao modo antigo: `SOTC_MODES=af16` em Avançado → Variáveis extras.
+- **Texturas nas GTX 10xx** confirmadas numa GTX 1080 Ti (JustS73, issue #57 do original): voltaram
+  quase em todo lugar, a 30 FPS. Resta uma camada de terreno em frente ao Santuário, em análise.
+
+## 0.59-plus2 — 2026-10-20 (fork Lucas-blip-png)
+Obrigado a **Oussama268** e **KingJhoss**.
+- **Processadores sem BMI1/LZCNT/MOVBE** (Intel Core i3/i5/i7 de 2ª e 3ª geração, Xeon E3 v1/v2
+  e outros anteriores ao Haswell; AMD FX), que antes recebiam "This CPU is not supported". O jogo
+  usa ~5.000 instruções dessas do processador do PS4; nessas CPUs elas são trocadas por rotinas
+  equivalentes ao abrir, no executável do jogo e nos módulos (libc, Fios2, áudio). Nas outras CPUs
+  nada muda. AVX continua obrigatório (Sandy Bridge / Bulldozer ou mais novo). Feito pelo
+  Oussama268 (PR #55 do fork dele); aqui ganhou um teste que compara cada instrução emulada com a
+  real (39 formas, 200 mil entradas cada). Testado forçando a emulação numa CPU moderna
+  (`SOTC_EMULATE_BMI=1`): no Santuário 50 FPS com e sem emulação, e o demo de abertura inteiro até a
+  tela título com a imagem igual, sem nenhuma falha. Falta a confirmação de quem tem uma CPU
+  dessas (issues #70, #88, #89 e #164–#166 do original).
+- **Blocos pretos nos quadros gerados pelo FSR 3** nas AMD RX 7000: a mesma barreira entre limpar e
+  copiar a imagem que corrigiu os quadros do jogo (issue #43 do original) agora vale também para os
+  gerados. Feito e testado numa RX 7600 pelo KingJhoss (PR #1 deste fork).
+- **Botão JOGAR cortado** com a escala do Windows acima de 100%: a barra de baixo do lançador
+  agora cresce junto (PR #171 do original).
+- Nas GTX 10xx, a linha "No fragment shader barycentrics: emulated by a geometry shader" agora
+  aparece no `user/last_run.log`.
+
+## 0.59-plus — 2026-10-20 (fork Lucas-blip-png)
+A 0.59 do AjncSystem inteira, mais o que ainda é só deste fork. A thread de desenho, a varredura
+de DMA incremental e as correções pequenas da 0.58.1-plus entraram no original na 0.59.
+Santuário, FPS ilimitado (RTX 5060 Ti, Ryzen 7 5700X): 0.59 47 FPS → 0.59-plus 50,6 FPS (+7%).
+- **Heap guards sem remontar a cada quadro** (+6% no Santuário, `SOTC_HEAP_FAST=0` desliga): os
+  readbacks que caem em blocos em uso dos heaps do jogo não passam mais pela guarda do alocador,
+  que era refeita cerca de uma vez por quadro. Refeito em cima da guarda de todos os heaps da 0.59.
+- **Texturas nas GTX 10xx (Pascal)** (`SOTC_BARYCENTRIC_GS=0` desliga): sem
+  `VK_KHR_fragment_shader_barycentric`, pedras e chão saíam pretos, facetados ou com ruído. Um
+  geometry shader pequeno passa ao fragment shader os valores dos três vértices. Nessas placas o
+  cache de shaders é refeito na primeira abertura. Testado forçando o modo numa RTX 5060 Ti; falta
+  a confirmação de quem tem uma GTX 10xx.
+- **Sombras distantes sem piscar** (`SOTC_SHADOW_REUSE=1` religa): o reaproveitamento de sombras
+  desenha as cascatas distantes em quadros alternados, mas o jogo não guarda a cascata pulada, e a
+  sombra no chão pisca a 15 Hz (issue #157 do original).
+- **Janela de readback menor**, 64 KiB (+3% no Santuário, `SOTC_RB_NARROW=0`).
+- **Tela cheia a 120 Hz** em monitores de 144/165 Hz (Anthonypc23).
+- **Geração de quadros sem o HUD, agora opcional e desligada** (`SOTC_FG_HUDLESS=1` liga): com a UI
+  na tela, os quadros gerados pelo FSR 3 saem com o logo desbotado e, nas telas de carregamento,
+  com a cena velha que fica atrás da UI. Na 0.58.1-plus ela vinha ligada com o FG.
+- **Atualização automática** (da 0.59) apontando para as releases deste fork.
+- O lançador não para mais quando o console dele recusa escrita (`[Errno 22]`, issue #104).
+- Fora desta versão: o aviso de versão nova da 0.58.1-plus (a 0.59 já se atualiza sozinha).
 ## 0.59.1 — 2026-10-20
 Obrigado a **Lucas-blip-png e Oussama268**.
 

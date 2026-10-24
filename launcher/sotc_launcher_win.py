@@ -38,7 +38,7 @@ CONFIG_DIR = PORT_DIR / 'user'
 CONFIG_FILE = CONFIG_DIR / 'launcher_settings.json'
 GAME_ID, GAME_VERSION = 'CUSA08809', '01.01'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.60.6'
+VERSION = '0.60.6-plus3'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -158,7 +158,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'user_dir': '', 'af16': True, 'textures': 'high', 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
                 'readbacks': '', 'extra_env': '', 'close_on_play': False, 'gamepad': '',
-                'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
+                'output_res': '1920x1080', 'upscaler': 'fsr1', 'render_preset': 'quality', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
                 'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'volume': '100', 'shadow_reuse': '0', 'library_dirs': [], 'keys': {},
@@ -247,7 +247,18 @@ SCREENS = [('1920x1080', '16:9, 1080p'), ('2560x1440', '16:9, 1440p'), ('3840x21
 OUTPUTS = [('1280x720', ('1280 × 720 (16:9, 720p)', '1280 × 720 (16:9, 720p)'))] + [
     (size, (f"{size.replace('x', ' × ')} ({label})",) * 2) for size, label in SCREENS]
 UPSCALERS = [('fsr1', ('FSR 1 (AMD, qualquer placa)', 'FSR 1 (AMD, any GPU)')),
+             ('fsr3', ('FSR 3.1 (temporal, qualquer placa)', 'FSR 3.1 (temporal, any GPU)')),
+             ('dlss', ('DLSS Super Resolution (NVIDIA RTX)', 'DLSS Super Resolution (NVIDIA RTX)')),
              ('bilinear', ('Bilinear (simples)', 'Bilinear (plain)'))]
+# With the FSR 3.1 or DLSS upscaler: the game renders at the output size divided by this factor (the
+# upscaler brings it back; the DLSS mode follows it). Native keeps the output size (FSR 3.1 Native AA,
+# DLSS DLAA: anti-aliasing only).
+RENDER_PRESETS = [('native', ('Nativa (1,0x: DLAA, só suavização)', 'Native (1.0x: DLAA, anti-aliasing only)')),
+                  ('quality', ('Qualidade (1,5x)', 'Quality (1.5x)')),
+                  ('balanced', ('Equilibrado (1,7x)', 'Balanced (1.7x)')),
+                  ('performance', ('Desempenho (2,0x)', 'Performance (2.0x)')),
+                  ('ultra', ('Ultra desempenho (3,0x)', 'Ultra performance (3.0x)'))]
+PRESET_SCALE = {'native': 1.0, 'quality': 1.5, 'balanced': 1.7, 'performance': 2.0, 'ultra': 3.0}
 # Button icons in the game: the PlayStation prompts, or Xbox ones drawn for the port
 # (tools/make_button_icons.py, glyphs/xbox) put in place of the game's textures.
 BUTTON_ICONS = [('ps', ('PlayStation (do jogo)', 'PlayStation (the game\'s)')),
@@ -600,6 +611,16 @@ def game_environment(s):
     if output not in ('1280x720', '1920x1080') and env['SOTC_NEO'] == '0':
         env['SOTC_RENDER_RES'] = output
     env['BB_FSR1'] = '1' if s.get('upscaler', 'fsr1') == 'fsr1' else '0'
+    if s.get('upscaler') in ('fsr3', 'dlss'):
+        # FSR 3.1 and DLSS need the game's own render size, below the output: the PS4 Pro path keeps
+        # its sizes. Without the DLSS DLLs the port falls back to FSR 3.1.
+        env['SOTC_UPSCALER'] = s['upscaler']
+        env['SOTC_NEO'] = '0'
+        render = render_size(env['SOTC_OUTPUT_RES'], PRESET_SCALE.get(s.get('render_preset'), 1.5))
+        if render:
+            env['SOTC_RENDER_RES'] = render
+        else:
+            env.pop('SOTC_RENDER_RES', None)
     if s.get('sharpness') == 'off':
         env['BB_RCAS'] = '0'
     else:
@@ -618,6 +639,18 @@ def game_environment(s):
     env['PYTHONUNBUFFERED'] = '1'
     env['PYTHONIOENCODING'] = 'utf-8'
     return env
+
+
+def render_size(output, scale):
+    """The render size for the FSR 3.1 upscaler: `output` (WxH) divided by `scale`, multiples of 8, at
+    least 640x360 (what the game's patches take); '' when it is the 1080p the game renders by default."""
+    try:
+        w, h = map(int, output.split('x'))
+    except ValueError:
+        return ''
+    w = max(640, int(w / scale) // 8 * 8)
+    h = max(360, int(h / scale) // 8 * 8)
+    return '' if (w, h) == (1920, 1080) else f'{w}x{h}'
 
 
 def is_wide(size):
@@ -1158,7 +1191,26 @@ class Launcher:
                    'look stretched. 720p renders at 1080p; PS4 Pro mode uses the Pro sizes. On a monitor smaller '
                    'than the output the window fits the screen and fullscreen uses the whole monitor.'))
         self.row(f, _('Upscaler', 'Upscaler'), self.choice(f, 'upscaler', UPSCALERS),
-                 _('FSR 1 amplia com bordas nítidas (acima de 1080p).', 'FSR 1 upscales with sharp edges (above 1080p).'))
+                 _('FSR 1 amplia com bordas nítidas (acima de 1080p). DLSS exige uma placa NVIDIA RTX e as DLLs do '
+                   'DLSS e do Streamline na pasta bin do jogo; sem elas o jogo usa o FSR 3.1.',
+                   'FSR 1 upscales with sharp edges (above 1080p). DLSS needs an NVIDIA RTX card and the DLSS and '
+                   'Streamline DLLs in the bin folder of the game; without them the game uses FSR 3.1.'))
+        self.row(f, _('Qualidade do upscaler (FSR 3.1 / DLSS)', 'Upscaler quality (FSR 3.1 / DLSS)'),
+                 self.choice(f, 'render_preset', RENDER_PRESETS),
+                 _('Só com os upscalers FSR 3.1 e DLSS: o jogo renderiza num tamanho menor que a saída e o upscaler o '
+                   'amplia, o que dá mais FPS onde a placa de vídeo é o limite (saída 1440p/4K). Exige reiniciar o jogo. '
+                   'Desliga o modo PS4 Pro. A interface também passa pelo upscaler.\n'
+                   'Quando o limite é o processador, renderizar menor quase não muda o FPS: no Santuário '
+                   '(saída 4K, placa de vídeo folgada) 1080p deu 39 FPS e 720p deu 47 a 50, e ali o gargalo é o '
+                   'processador (cerca de 5.800 desenhos por quadro). Nesse caso a vantagem do FSR 3.1 é a '
+                   'imagem mais limpa, não o FPS.',
+                   'Only with the FSR 3.1 and DLSS upscalers: the game renders below the output size and the upscaler enlarges '
+                   'it, giving more FPS where the graphics card is the limit (1440p/4K output). Restart the game '
+                   'to apply. Turns PS4 Pro mode off. The interface goes through the upscaler too.\n'
+                   'When the processor is the limit, rendering smaller barely changes the FPS: in the Shrine '
+                   '(4K output, graphics card with room to spare) 1080p gave 39 FPS and 720p gave 47 to 50, and '
+                   'there the bottleneck is the processor (about 5,800 draws per frame). Then the advantage of '
+                   'FSR 3.1 is a cleaner image, not FPS.'))
         self.row(f, _('Nitidez (RCAS)', 'Sharpening (RCAS)'), self.choice(f, 'sharpness', SHARPNESS))
         self.section(f, _('Modo PS4 Pro', 'PS4 Pro mode'))
         self.check(f, 'neo', _('Apresentar-se como PS4 Pro', 'Present as a PS4 Pro'),
@@ -1399,7 +1451,7 @@ class Launcher:
     def summary(self):
         parts = [dict((k, _(*v)) for k, v in FPS_MODES).get(self.var('fps_mode').get(), '30 FPS'),
                  self.var('output_res').get().replace('x', ' × '),
-                 'FSR 1' if self.var('upscaler').get() == 'fsr1' else 'bilinear']
+                 {'fsr1': 'FSR 1', 'fsr3': 'FSR 3.1', 'dlss': 'DLSS'}.get(self.var('upscaler').get(), 'bilinear')]
         framegen = self.var('framegen').get()
         if framegen != 'off':
             parts.append({'auto': _('geração de quadros', 'frame generation'), 'dlss': 'DLSS-G',

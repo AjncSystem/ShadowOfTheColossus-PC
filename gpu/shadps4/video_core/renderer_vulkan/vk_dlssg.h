@@ -82,6 +82,17 @@ void AfterPresent(u32 frame_id);
 /// Before the swapchain is recreated or the device destroyed: DLSS-G off.
 void Suspend();
 
+/// sotc: DLSS Super Resolution (SOTC_UPSCALER=dlss, NVIDIA with sl.dlss.dll and nvngx_dlss.dll next to
+/// bb-probe.exe): Streamline loaded and the feature supported on this device.
+bool SuperResReady();
+
+/// Present thread, `cmdbuf` a real command buffer: upscales `color` (`width` x `height`, layout
+/// ShaderReadOnlyOptimal) of presentation frame `frame_id` with its depth, motion vectors and camera
+/// into `out` (`out_width` x `out_height`, layout General). False when it cannot (no inputs, an error).
+bool SuperResEvaluate(vk::CommandBuffer cmdbuf, u32 frame_id, vk::Image color, vk::ImageView color_view,
+                      vk::Format color_format, u32 width, u32 height, vk::Image out, vk::ImageView out_view,
+                      vk::Format out_format, u32 out_width, u32 out_height);
+
 /// A frame's inputs for FSR 3 frame generation, from the camera like Streamline's constants.
 struct FrameInputs {
     vk::Image mvec;      ///< R16G16 float, curUV - prevUV, layout ShaderReadOnlyOptimal

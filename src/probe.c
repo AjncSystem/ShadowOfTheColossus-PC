@@ -48,20 +48,39 @@ int vulkan_smoke(void);
 
 static void fail(const char *message) { fprintf(stderr, "ERROR: %s\n", message); exit(1); }
 /* The PS4's Jaguar CPU has BMI1/LZCNT/MOVBE and the game uses them (ANDN, BEXTR, TZCNT, ...); older
-   CPUs raise an illegal instruction or silently compute TZCNT/LZCNT wrong. Fail with a clear message. */
+   CPUs raise an illegal instruction or silently compute TZCNT/LZCNT wrong. sotc: on Windows the CPU
+   patches replace them (gpu/sotc/cpu_patches_bmi.inc, issue #49); elsewhere fail with a message. */
+static int cpu_needs_bmi_emulation;
 static void require_cpu_features(void) {
     unsigned a, b, c, d;
+    /* The game's code is AVX throughout (VEX encoded): that is not emulated. */
+    int avx = __get_cpuid(1, &a, &b, &c, &d) && (c & 1u << 28) && (c & 1u << 27);
+    if (avx) { /* the OS saves the YMM state (XCR0 bits 1 and 2) */
+        unsigned xcr0, xcr0_hi;
+        __asm__ volatile("xgetbv" : "=a"(xcr0), "=d"(xcr0_hi) : "c"(0));
+        avx = (xcr0 & 6) == 6;
+    }
+    if (!avx) {
+        const char *msg = "This CPU is not supported: it lacks AVX (Intel Sandy Bridge / AMD Bulldozer or newer is required).";
+#ifdef _WIN32
+        MessageBoxA(NULL, msg, "Shadow of the Colossus", MB_OK | MB_ICONERROR);
+#endif
+        fail(msg);
+    }
     int bmi1 = __get_cpuid_count(7, 0, &a, &b, &c, &d) && (b & 1u << 3);
     int lzcnt = __get_cpuid(0x80000001, &a, &b, &c, &d) && (c & 1u << 5);
     int movbe = __get_cpuid(1, &a, &b, &c, &d) && (c & 1u << 22);
     if (bmi1 && lzcnt && movbe) return;
+#ifdef _WIN32
+    printf("CPU without%s%s%s: the game's uses of them are emulated\n",
+           bmi1 ? "" : " BMI1", lzcnt ? "" : " LZCNT", movbe ? "" : " MOVBE");
+    cpu_needs_bmi_emulation = 1;
+#else
     char msg[160];
     snprintf(msg, sizeof msg, "This CPU is not supported: it lacks%s%s%s (Intel Haswell / AMD Zen or newer is required).",
              bmi1 ? "" : " BMI1", lzcnt ? "" : " LZCNT", movbe ? "" : " MOVBE");
-#ifdef _WIN32
-    MessageBoxA(NULL, msg, "Shadow of the Colossus", MB_OK | MB_ICONERROR);
-#endif
     fail(msg);
+#endif
 }
 static uint64_t read64(FILE *f) {
     unsigned char b[8];
@@ -511,9 +530,21 @@ static DWORD WINAPI profiler(void *name) {
     profile_slots=calloc(PROFILE_SLOTS,sizeof(*profile_slots));
     if (!thread || !profile_slots) return 0;
     const ULONGLONG end=GetTickCount64()+(ULONGLONG)(seconds ? atoi(seconds) : 15)*1000;
-    unsigned samples=0;
+    unsigned samples=0, idle=0;
+    /* SOTC_PROFILE_CPU=1: only samples after the thread ran in the last interval (cycle count
+     * moved by 200k or more), so blocked waits do not hide where its CPU time goes. */
+    const int cpu_only=getenv("SOTC_PROFILE_CPU")!=NULL;
+    ULONG64 last_cycles=0;
+    if (cpu_only) QueryThreadCycleTime(thread,&last_cycles);
     timeBeginPeriod(1);
     while (GetTickCount64()<end) {
+        if (cpu_only) {
+            ULONG64 cycles=last_cycles;
+            QueryThreadCycleTime(thread,&cycles);
+            const int ran=cycles-last_cycles>=200000;
+            last_cycles=cycles;
+            if (!ran) { ++idle; Sleep(1); continue; }
+        }
         if (SuspendThread(thread)!=(DWORD)-1) {
             CONTEXT c={.ContextFlags=CONTEXT_CONTROL|CONTEXT_INTEGER};
             if (GetThreadContext(thread,&c)) {
@@ -559,7 +590,7 @@ static DWORD WINAPI profiler(void *name) {
     }
     timeEndPeriod(1);
     char where[MAX_PATH+64];
-    fprintf(stderr,"SOTC profile of %s: %u samples\n",(const char *)name,samples);
+    fprintf(stderr,"SOTC profile of %s: %u samples (%u skipped idle)\n",(const char *)name,samples,idle);
     /* SOTC_PROFILE_OUT=<file>: every sampled address (module offset, leaf, inclusive), for
      * per-function totals offline (tools/profile_sym.py --functions). */
     if (getenv("SOTC_PROFILE_OUT")) {
@@ -953,27 +984,40 @@ static void choose_tsc(void) {
 static void apply_sotc_cpu_patches(const char *path, const Segment *segments, uint64_t count, uint64_t size) {
     FILE *f=fopen(path,"rb");
     char magic[8];
-    if (!f || fread(magic,1,8,f)!=8 || memcmp(magic,"SOTCCPU1",8)) fail("bad --sotc-cpu file (run scripts/sotc_cpu.py)");
+    if (!f || fread(magic,1,8,f)!=8 || (memcmp(magic,"SOTCCPU1",8) && memcmp(magic,"SOTCCPU2",8)))
+        fail("bad --sotc-cpu file (run scripts/sotc_cpu.py)");
     uint64_t eh=read64(f), eh_size=read64(f), functions=read64(f), offsets[16];
     if (functions>16) fail("too many red-zone functions");
     for (uint64_t i=0;i<functions;++i) offsets[i]=read64(f);
+    /* SOTCCPU2: the linked modules' function tables (BMI1/LZCNT/MOVBE patches of their code). */
+    SotcCodeSegment tables[16]; uint64_t table_count=0;
+    if (!memcmp(magic,"SOTCCPU2",8)) {
+        table_count=read64(f);
+        if (table_count>16) fail("too many module function tables");
+        for (uint64_t i=0;i<table_count;++i) {
+            tables[i].offset=read64(f); tables[i].size=read64(f);
+            if (tables[i].offset>=size || tables[i].size>size-tables[i].offset) fail("module function table outside the image");
+        }
+    }
     fclose(f);
     uint64_t eboot_end=module_count ? modules[0].base : size;
     if (eh_size && (eh>=eboot_end || eh_size>eboot_end-eh)) fail("eh_frame_hdr outside the eboot");
-    SotcCodeSegment code[16]; uint32_t n=0;
-    for (uint64_t s=0;s<count && n<16;++s)
-        if ((segments[s].flags&1) && segments[s].address<eboot_end)
+    SotcCodeSegment code[32]; uint32_t n=0;
+    for (uint64_t s=0;s<count && n<32;++s)
+        if (segments[s].flags&1)
             code[n++]=(SotcCodeSegment){segments[s].address,segments[s].size};
-    SotcPatchRequest request={image,eboot_end,image+round_page(size),SOTC_TRAMPOLINE_SIZE,eh,eh_size,
-                              code,n,offsets,(uint32_t)functions,NULL};
+    /* The last 16 KiB of the trampoline area hold the engine command line (apply_sotc_cmdline). */
+    SotcPatchRequest request={image,size,image+round_page(size),SOTC_TRAMPOLINE_SIZE-16384,eh,eh_size,
+                              code,n,offsets,(uint32_t)functions,tables,(uint32_t)table_count,eboot_end,NULL};
 #ifdef _WIN32
     request.tsc_clock=tsc_clock;
 #endif
     SotcPatchResult result;
     if (sotc_patch_eboot(&request,&result)) fail("CPU patches: cannot decode the eboot function table");
-    printf("CPU patches: SSE4a %s, %" PRIu64 " functions, %" PRIu64 " short SSE4a relocated, "
+    printf("CPU patches: SSE4a %s, BMI1/LZCNT/MOVBE %s, %" PRIu64 " functions, %" PRIu64 " short SSE4a/BMI relocated, "
            "red zone: %" PRIu64 " functions / %" PRIu64 " instructions\n",
-           result.needs_sse4a ? "emulated" : "native", result.function_starts, result.short_sse4a,
+           result.needs_sse4a ? "emulated" : "native", result.needs_bmi ? "emulated" : "native",
+           result.function_starts, result.short_sse4a,
            result.red_zone_functions, result.red_zone_instructions);
     if (request.tsc_clock)
         printf("CPU patches: %" PRIu64 " rdtsc read QPC, %" PRIu64 " left on the TSC\n",
@@ -1473,6 +1517,7 @@ int main(int argc, char **argv) {
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
 #endif
     if (sotc_cpu) apply_sotc_cpu_patches(sotc_cpu, segments, ns, size);
+    else if (cpu_needs_bmi_emulation) fail("this CPU needs the CPU patches (--sotc-cpu, run scripts/sotc_cpu.py)");
     if (sotc_cmdline) apply_sotc_cmdline(sotc_cmdline, size);
     if (sotc_cpu) install_heap_hook();
     protect(traps, round_page((import_count + 1) * 32), 5);

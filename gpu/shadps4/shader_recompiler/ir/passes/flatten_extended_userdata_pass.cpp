@@ -123,13 +123,18 @@ void SetSrtReadProtectedPages(u64 address, u64 size, bool read_protected) {
         return;
     }
     const u64 last = std::min<u64>((address + size - 1) >> 12, (SrtCleanPageLimit >> 12) - 1);
-    for (u64 page = address >> 12; page <= last; ++page) {
-        u64* word = &context.clean_pages[page >> 6];
-        const u64 bit = 1ULL << (page & 63);
+    // sotc: one atomic per 64-page word (a mask of the pages of the range inside it) instead of one
+    // per page; the draw thread calls this ~15,000 times a second.
+    const u64 first = address >> 12;
+    for (u64 base = first & ~63ULL; base <= last; base += 64) {
+        const u64 lo = std::max(first, base) - base;
+        const u64 hi = std::min(last, base + 63) - base;
+        const u64 mask = (~0ULL >> (63 - (hi - lo))) << lo;
+        u64* word = &context.clean_pages[base >> 6];
         if (read_protected) {
-            __atomic_fetch_or(word, bit, __ATOMIC_RELAXED);
+            __atomic_fetch_or(word, mask, __ATOMIC_RELAXED);
         } else {
-            __atomic_fetch_and(word, ~bit, __ATOMIC_RELAXED);
+            __atomic_fetch_and(word, ~mask, __ATOMIC_RELAXED);
         }
     }
 }

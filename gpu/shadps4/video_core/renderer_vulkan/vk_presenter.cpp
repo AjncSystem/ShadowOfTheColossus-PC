@@ -16,6 +16,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_dlssg.h"
+#include "video_core/renderer_vulkan/vk_fsr3up.h"
 #include "video_core/renderer_vulkan/vk_framegen.h"
 #include "video_core/renderer_vulkan/vk_fsrfg.h"
 #include "video_core/sotc_fps_cap.h"
@@ -788,8 +789,39 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     // Continue with host-side passes that draw the displayed (scaled) frame.
 
+    // sotc: FSR 3.1 temporal upscaler (SOTC_UPSCALER=fsr3): the game image goes to its colour input
+    // here; the present thread upscales it (Presenter::Present) over the bilinear frame made below.
+    if (Fsr3Up::Wanted()) {
+        runtime.Transit(&image, vk::ImageLayout::eTransferSrcOptimal,
+                        vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferRead);
+        runtime.FlushBarriers();
+        const vk::Format native = image.info.pixel_format;
+        // The image's channel order is not the one the frame is shown with (B10G10R10 vs R10G10B10).
+        const auto is_bgr = [](vk::Format f) {
+            return f == vk::Format::eB8G8R8A8Srgb || f == vk::Format::eA2R10G10B10UnormPack32;
+        };
+        const auto is_rgb = [](vk::Format f) {
+            return f == vk::Format::eR8G8B8A8Srgb || f == vk::Format::eA2B10G10R10UnormPack32;
+        };
+        const bool swap = (is_rgb(native) && is_bgr(view_info.format)) ||
+                          (is_bgr(native) && is_rgb(view_info.format));
+        static bool logged_formats = false;
+        if (!std::exchange(logged_formats, true)) {
+            std::fprintf(stderr, "SOTC FSR3 upscaler: game image %s, shown as %s\n",
+                         vk::to_string(native).c_str(), vk::to_string(view_info.format).c_str());
+        }
+        Fsr3Up::Prepare(cmdbuf, frame->id, image.GetImage(), image_size.width, image_size.height,
+                        swap);
+    }
+
+    // sotc: FSR 1 reads the frame in compute shaders (EASU), not in the fragment shader of the
+    // post process pass: a barrier for the fragment stage alone let it read the frame before the
+    // game finished writing it, and the game's next frame write over it while it still read
+    // (torn, blocky image with FSR 1 on AMD cards, fine with bilinear, #209).
     runtime.Transit(&image, vk::ImageLayout::eShaderReadOnlyOptimal,
-                    vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderRead);
+                    vk::PipelineStageFlagBits2::eFragmentShader |
+                        vk::PipelineStageFlagBits2::eComputeShader,
+                    vk::AccessFlagBits2::eShaderRead);
     runtime.FlushBarriers();
 
     // sotc: upscaler and sharpening as the in-game menu set them (sotc_live.h)
@@ -990,6 +1022,42 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
     auto& scheduler = present_scheduler;
     const auto cmdbuf = scheduler.CommandBuffer();
+
+    // sotc: FSR 3.1 upscaler: the game frame was drawn bilinear at PrepareFrame; this draws it again
+    // from the upscaler's result (a frame without its inputs keeps the bilinear one).
+    if (Fsr3Up::Wanted() && is_game_frame && !is_reusing_frame) {
+        if (const vk::ImageView up =
+                Fsr3Up::Dispatch(cmdbuf, scheduler, frame->id, frame->width, frame->height)) {
+            const vk::ImageSubresourceRange all{vk::ImageAspectFlagBits::eColor, 0, 1, 0,
+                                                VK_REMAINING_ARRAY_LAYERS};
+            const auto to_target = vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask =
+                    vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+                .oldLayout = vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                .image = frame->image,
+                .subresourceRange = all,
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                                       .pImageMemoryBarriers = &to_target});
+            pp_pass.Render(cmdbuf, up, {frame->width, frame->height}, *frame, pp_settings);
+            const auto to_general = vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .dstAccessMask = vk::AccessFlagBits2::eMemoryRead,
+                .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                .newLayout = vk::ImageLayout::eGeneral,
+                .image = frame->image,
+                .subresourceRange = all,
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                                       .pImageMemoryBarriers = &to_general});
+        }
+    }
     const u32 capture_with_overlays_count = VideoCore::ConsumeWithOverlaysScreenshotRequests();
     std::optional<ScreenshotReadback> pending_screenshot;
 

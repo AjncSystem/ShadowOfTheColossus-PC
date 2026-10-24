@@ -942,6 +942,12 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
         runtime.FlushBarriers();
     }
 
+    if (fast_bind_hit && fast_bind.clobbers != SotcStats::push_clobbers.load(std::memory_order_relaxed)) {
+
+        fast_bind_hit = false; // sotc: a helper pass overwrote the pushed descriptors
+
+    }
+
     if (!fast_bind_hit) {
         pipeline->BindResources(set_writes, push_data);
     }
@@ -1061,6 +1067,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         if (needs_barrier) {
             runtime.FlushBarriers();
         }
+        if (fast_bind_hit && fast_bind.clobbers != SotcStats::push_clobbers.load(std::memory_order_relaxed)) {
+            fast_bind_hit = false; // sotc: a helper pass overwrote the pushed descriptors
+        }
         if (!fast_bind_hit) {
             pipeline->BindResources(set_writes, push_data);
         }
@@ -1114,6 +1123,12 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     if (needs_barrier) {
         runtime.FlushBarriers();
+    }
+
+    if (fast_bind_hit && fast_bind.clobbers != SotcStats::push_clobbers.load(std::memory_order_relaxed)) {
+
+        fast_bind_hit = false; // sotc: a helper pass overwrote the pushed descriptors
+
     }
 
     if (!fast_bind_hit) {
@@ -1253,6 +1268,7 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
         }
     }
     if (ExecuteShaderHLE(cs, liverpool->DrawRegs(), cs_program, *this)) {
+        fast_bind.valid = false; // sotc: wrote guest memory through the buffer cache
         SotcStats::Drop(5, cs_program.Address<uintptr_t>(), 0);
         return;
     }
@@ -1418,16 +1434,25 @@ u64 Rasterizer::FastBindHash(const Pipeline* pipeline, const Shader::PushData& p
     return hash;
 }
 
-void Rasterizer::CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dma) {
+void Rasterizer::CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dma, u64 pre_epoch,
+                                u64 pre_clobbers) {
     fast_bind.pipeline = pipeline;
     fast_bind.hash = hash;
     fast_bind.buffer_generation = buffer_cache.BindGeneration();
     fast_bind.texture_generation = texture_cache.BindGeneration();
     fast_bind.stream_generation = buffer_cache.StreamGeneration();
-    fast_bind.mem_epoch = SotcStats::mem_epoch.load(std::memory_order_relaxed);
+    // sotc: the epoch and clobber count from BEFORE the bind: a write or helper pass that landed
+    // during it is not covered by what the bind uploaded or pushed.
+    fast_bind.mem_epoch = pre_epoch;
+    fast_bind.clobbers = pre_clobbers;
     fast_bind.tick = scheduler.CurrentTick();
     fast_bind.uses_dma = uses_dma;
     fast_bind.valid = true;
+    static const bool verify_env = std::getenv("SOTC_FAST_BIND_VERIFY") != nullptr;
+    if (verify_env) {
+        verify_buffers.assign(buffer_infos.begin(), buffer_infos.end());
+        verify_images.assign(image_infos.begin(), image_infos.end());
+    }
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
@@ -1456,6 +1481,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
                 }
             }
         }
+        fast_bind.valid = false; // sotc: this pass changed images and left barriers pending
         return false;
     }
 
@@ -1465,6 +1491,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     image_infos.clear();
 
     bool uses_dma = false;
+    const u64 pre_epoch = SotcStats::mem_epoch.load(std::memory_order_acquire);
+    const u64 pre_clobbers = SotcStats::push_clobbers.load(std::memory_order_relaxed);
 
     // A stage whose user data was never attached (e.g. a program restored from the pipeline
     // cache that was not refreshed for this draw) would read its SGPRs from a null span.
@@ -1495,14 +1523,22 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             fast_bind.buffer_generation == buffer_cache.BindGeneration() &&
             fast_bind.texture_generation == texture_cache.BindGeneration() &&
             fast_bind.stream_generation == buffer_cache.StreamGeneration() &&
-            fast_bind.mem_epoch == SotcStats::mem_epoch.load(std::memory_order_relaxed) &&
+            fast_bind.mem_epoch == SotcStats::mem_epoch.load(std::memory_order_acquire) &&
+            fast_bind.clobbers == SotcStats::push_clobbers.load(std::memory_order_relaxed) &&
             fast_bind.hash == fast_hash) {
-            fast_bind_hit = true;
-            SotcStats::fast_bind_hits.fetch_add(1, std::memory_order_relaxed);
-            if (fast_bind.uses_dma) {
-                buffer_cache.SynchronizeDmaBuffers();
+            static const bool verify = std::getenv("SOTC_FAST_BIND_VERIFY") != nullptr;
+            if (!verify) {
+                fast_bind_hit = true;
+                SotcStats::fast_bind_hits.fetch_add(1, std::memory_order_relaxed);
+                if (fast_bind.uses_dma) {
+                    buffer_cache.SynchronizeDmaBuffers();
+                }
+                return true;
             }
-            return true;
+            // sotc: SOTC_FAST_BIND_VERIFY=1 does the full bind anyway and compares it with the
+            // descriptors the previous draw left (what a hit would have reused).
+            verify_pending = true;
+            verify_uploads = SotcStats::thread_data_events;
         }
         push_data = input_push;
     } else {
@@ -1526,8 +1562,66 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         buffer_cache.SynchronizeDmaBuffers();
     }
 
+    if (verify_pending) {
+        verify_pending = false;
+        bool same = verify_buffers.size() == buffer_infos.size() &&
+                    verify_images.size() == image_infos.size();
+        for (size_t i = 0; same && i < buffer_infos.size(); ++i) {
+            // The stream ring hands out a new offset for identical data (the hash matched).
+            const bool stream = buffer_infos[i].buffer == buffer_cache.GetStreamBuffer().Handle();
+            same = verify_buffers[i].buffer == buffer_infos[i].buffer &&
+                   (stream || verify_buffers[i].offset == buffer_infos[i].offset) &&
+                   verify_buffers[i].range == buffer_infos[i].range;
+        }
+        for (size_t i = 0; same && i < image_infos.size(); ++i) {
+            same = verify_images[i].imageView == image_infos[i].imageView &&
+                   verify_images[i].sampler == image_infos[i].sampler;
+        }
+        static u64 hits = 0, bad = 0, content = 0;
+        ++hits;
+        // A reused bind skips the uploads the full bind did: same handles, new bytes.
+        if (same && verify_uploads != SotcStats::thread_data_events) {
+            ++content;
+        }
+        if (!same && bad < 6) {
+            for (size_t i = 0; i < buffer_infos.size() && i < verify_buffers.size(); ++i) {
+                std::fprintf(stderr, "  buf%zu old %p+%llu/%llu new %p+%llu/%llu%s\n", i,
+                             (void*)(uintptr_t)(VkBuffer)verify_buffers[i].buffer,
+                             (unsigned long long)verify_buffers[i].offset,
+                             (unsigned long long)verify_buffers[i].range,
+                             (void*)(uintptr_t)(VkBuffer)buffer_infos[i].buffer,
+                             (unsigned long long)buffer_infos[i].offset,
+                             (unsigned long long)buffer_infos[i].range,
+                             verify_buffers[i].buffer == buffer_infos[i].buffer &&
+                                     verify_buffers[i].offset == buffer_infos[i].offset &&
+                                     verify_buffers[i].range == buffer_infos[i].range
+                                 ? ""
+                                 : " DIFF");
+            }
+            for (size_t i = 0; i < image_infos.size() && i < verify_images.size(); ++i) {
+                if (verify_images[i].imageView != image_infos[i].imageView ||
+                    verify_images[i].sampler != image_infos[i].sampler) {
+                    std::fprintf(stderr, "  img%zu DIFF\n", i);
+                }
+            }
+        }
+        if (!same && ++bad <= 20) {
+            std::fprintf(stderr, "SOTC FAST_BIND_VERIFY stale: pgm %#llx buffers %zu/%zu images %zu/%zu\n",
+                         static_cast<unsigned long long>(pipeline->GetStages()[0]
+                                                             ? pipeline->GetStages()[0]->pgm_hash
+                                                             : 0),
+                         verify_buffers.size(), buffer_infos.size(), verify_images.size(),
+                         image_infos.size());
+        }
+        if (hits % 20000 == 0) {
+            std::fprintf(stderr, "SOTC FAST_BIND_VERIFY: %llu would-be hits, %llu stale, %llu with new data\n",
+                         static_cast<unsigned long long>(hits), static_cast<unsigned long long>(bad),
+                         static_cast<unsigned long long>(content));
+        }
+    }
+
     if (fast_eligible) {
-        CommitFastBind(pipeline, fast_hash, uses_dma);
+        CommitFastBind(pipeline, fast_hash, uses_dma, pre_epoch, pre_clobbers);
     }
 
     return true;

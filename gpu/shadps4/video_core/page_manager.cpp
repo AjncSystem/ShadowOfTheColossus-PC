@@ -14,6 +14,7 @@
 #include <boost/icl/interval_set.hpp>
 #include <mutex>
 #include <shared_mutex>
+#include <array>
 #include <atomic>
 #include "common/alignment.h"
 #include "common/adaptive_mutex.h"
@@ -625,6 +626,13 @@ public:
 };
 #endif // __linux__
 
+// sotc: SOTC_PROTECT_STATS (SignalImpl::NoteProtect): host protect calls per thread.
+struct ProtectSlot {
+    std::atomic<u32> tid{0};
+    std::atomic<u64> calls{0}, pages{0}, ns{0};
+};
+inline std::array<ProtectSlot, 32> protect_slots;
+
 struct SignalImpl : public PageManager::Impl {
     SignalImpl(Vulkan::Rasterizer* rasterizer_) : Impl() {
         rasterizer = rasterizer_;
@@ -643,7 +651,63 @@ struct SignalImpl : public PageManager::Impl {
         Shader::SetSrtCleanLoad(&SrtWalkerCleanLoad);
     }
 
+    /// sotc: SOTC_PROTECT_STATS=1 prints, every 5 s, the host protect calls per thread: count,
+    /// pages and the time they took (which thread pays for the page tracking).
+    static void NoteProtect(size_t size, u64 ns) {
+        const u32 tid = GetCurrentThreadId();
+        for (auto& slot : protect_slots) {
+            u32 expected = 0;
+            if (slot.tid.load(std::memory_order_relaxed) == tid ||
+                slot.tid.compare_exchange_strong(expected, tid) || expected == tid) {
+                slot.calls.fetch_add(1, std::memory_order_relaxed);
+                slot.pages.fetch_add(size >> 12, std::memory_order_relaxed);
+                slot.ns.fetch_add(ns, std::memory_order_relaxed);
+                break;
+            }
+        }
+        static std::atomic<u64> last_print{0};
+        const u64 now = GetTickCount64();
+        u64 last = last_print.load(std::memory_order_relaxed);
+        if (now - last < 5000 || !last_print.compare_exchange_strong(last, now)) {
+            return;
+        }
+        for (auto& slot : protect_slots) {
+            const u64 calls = slot.calls.exchange(0);
+            const u64 pages = slot.pages.exchange(0);
+            const u64 spent = slot.ns.exchange(0);
+            if (!calls) {
+                continue;
+            }
+            wchar_t* name = nullptr;
+            char text[64] = "?";
+            if (HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, slot.tid.load())) {
+                if (SUCCEEDED(GetThreadDescription(h, &name)) && name) {
+                    WideCharToMultiByte(CP_UTF8, 0, name, -1, text, sizeof(text) - 1, nullptr, nullptr);
+                    LocalFree(name);
+                }
+                CloseHandle(h);
+            }
+            std::fprintf(stderr, "SOTC PROTECT %s: %llu calls/s, %llu pages/s, %.1f ms/s\n", text,
+                         static_cast<unsigned long long>(calls / 5),
+                         static_cast<unsigned long long>(pages / 5), spent / 5.0e6);
+        }
+    }
+
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
+        static const bool protect_stats = std::getenv("SOTC_PROTECT_STATS") != nullptr;
+        if (protect_stats) [[unlikely]] {
+            LARGE_INTEGER t0, t1, f;
+            QueryPerformanceCounter(&t0);
+            ProtectImpl(address, size, perms);
+            QueryPerformanceCounter(&t1);
+            QueryPerformanceFrequency(&f);
+            NoteProtect(size, static_cast<u64>((t1.QuadPart - t0.QuadPart) * 1000000000ull / f.QuadPart));
+            return;
+        }
+        ProtectImpl(address, size, perms);
+    }
+
+    void ProtectImpl(VAddr address, size_t size, Core::MemoryPermission perms) {
         RENDERER_TRACE;
         auto* memory = Core::Memory::Instance();
         auto& impl = memory->GetAddressSpace();
@@ -729,7 +793,7 @@ struct SignalImpl : public PageManager::Impl {
             return;
         }
         static std::mutex stats_mutex;
-        static std::map<std::tuple<bool, u64, VAddr>, u64> counts;
+        static std::map<std::tuple<bool, u64, VAddr, bool>, u64> counts;
         static auto last = std::chrono::steady_clock::now();
 #ifdef _WIN32
         const u64 rip = static_cast<EXCEPTION_POINTERS*>(context)->ContextRecord->Rip;
@@ -737,13 +801,16 @@ struct SignalImpl : public PageManager::Impl {
         const u64 rip = 0;
 #endif
         std::scoped_lock lk{stats_mutex};
-        ++counts[{is_gpu_thread, rip, addr & ~VAddr{0xFFFF}}];
+        // sotc: the last field (does the GPU hold this byte?) reads the command processor's ranges
+        // from the faulting thread without a lock: a diagnostic that may be a read behind, no more.
+        ++counts[{is_gpu_thread, rip, addr & ~VAddr{0xFFFF},
+                  !write && rasterizer->IsRangeGpuWritten(addr, 1)}];
         const auto now = std::chrono::steady_clock::now();
         if (now - last < std::chrono::seconds(10)) {
             return;
         }
         last = now;
-        std::vector<std::pair<u64, std::tuple<bool, u64, VAddr>>> sorted;
+        std::vector<std::pair<u64, std::tuple<bool, u64, VAddr, bool>>> sorted;
         u64 total = 0;
         for (const auto& [key, count] : counts) {
             sorted.emplace_back(count, key);
@@ -773,10 +840,22 @@ struct SignalImpl : public PageManager::Impl {
                                   std::get<1>(key) - reinterpret_cast<u64>(info.AllocationBase)));
             }
 #endif
-            std::fprintf(stderr, "  %6llu %s rip=%#llx (%s) region=%#llx\n",
+            std::fprintf(stderr, "  %6llu %s %s rip=%#llx (%s) region=%#llx\n",
                          static_cast<unsigned long long>(count), std::get<0>(key) ? "gpu  " : "guest",
+                         std::get<3>(key) ? "bytes-gpu" : "clean-bytes",
                          static_cast<unsigned long long>(std::get<1>(key)), where,
                          static_cast<unsigned long long>(std::get<2>(key)));
+            // SOTC_RB_STATS_CODE=1: the 128 bytes before and 32 after the faulting instruction of
+            // guest readers, as hex, to disassemble offline (llvm-mc --disassemble).
+            static const bool code = std::getenv("SOTC_RB_STATS_CODE") != nullptr;
+            if (code && !std::get<0>(key) && std::get<1>(key) >= 128) {
+                const u8* bytes = reinterpret_cast<const u8*>(std::get<1>(key) - 128);
+                std::fprintf(stderr, "    code@%#llx:", static_cast<unsigned long long>(std::get<1>(key) - 128));
+                for (int b = 0; b < 160; ++b) {
+                    std::fprintf(stderr, " %02x", bytes[b]);
+                }
+                std::fprintf(stderr, "\n");
+            }
         }
         counts.clear();
     }

@@ -258,8 +258,33 @@ public:
     /// sotc: true when compute shaders must be pinned to 32-wide subgroups: the device could run
     /// them wider, but the recompiler lowers wave64 code for 32 lanes (the NVIDIA path).
     bool IsComputeSubgroupSize32Required() const {
+        if (IsAmdWave32Forced()) {
+            return true;
+        }
         return !IsSubgroupSize64Supported() && vk13_features.subgroupSizeControl &&
                vk13_props.minSubgroupSize <= 32 && vk13_props.maxSubgroupSize > 32 &&
+               (vk13_props.requiredSubgroupSizeStages & vk::ShaderStageFlagBits::eCompute);
+    }
+
+    /// sotc: AMD GCN (RX 470-590, Vega: subgroups of 64 only) runs the shaders lowered for 32
+    /// lanes and compute pipelines requiring 32, as the unofficial SotC-AMD-Fix layer does. The
+    /// LDS barriers alone did not stop the white/green flicker (#152, #187, #201); this did, on an
+    /// RX 570 (brxzzi). SOTC_AMD_WAVE32=0 turns it off, =1 forces it on any AMD card.
+    bool IsAmdWave32Forced() const {
+        if (GetVendorID() != 0x1002) {
+            return false;
+        }
+        static const int env = [] {
+            const char* v = std::getenv("SOTC_AMD_WAVE32");
+            return v ? std::atoi(v) : -1;
+        }();
+        if (env >= 0) {
+            return env != 0;
+        }
+        // Only where the driver lets compute pipelines require a size (Windows RX 570: stages
+        // 0x20). RADV reports 0 there, and the 32-lane lowering then mismatched the 64-wide
+        // shaders (crash 30-90 s into the intro, albaruzz #201).
+        return vk13_props.minSubgroupSize >= 64 && vk13_props.maxSubgroupSize >= 64 &&
                (vk13_props.requiredSubgroupSizeStages & vk::ShaderStageFlagBits::eCompute);
     }
 
@@ -274,6 +299,9 @@ public:
     /// while the recompiler lowered wave64 code for SubgroupSize() lanes anyway. Intel stages are
     /// pinned to that size; SOTC_INTEL_PIN_SUBGROUP=0 turns it off. From AjncSystem#81 (jownatan).
     u32 RequiredSubgroupSize(vk::ShaderStageFlagBits stage) const {
+        if (IsAmdWave32Forced()) {
+            return stage == vk::ShaderStageFlagBits::eCompute ? 32u : 0u;
+        }
         if (IsSubgroupSize64Supported()) {
             return CanRequireSubgroupSize(stage) ? 64u : 0u;
         }
@@ -412,6 +440,9 @@ public:
 
     /// Returns the subgroup size the recompiler targets (64 or 32 when it can be required).
     u32 SubgroupSize() const {
+        if (IsAmdWave32Forced()) {
+            return 32;
+        }
         if (IsSubgroupSize64Supported()) {
             return 64;
         }

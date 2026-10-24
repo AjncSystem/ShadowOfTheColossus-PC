@@ -7,6 +7,10 @@
 
 #include "common/types.h"
 
+namespace Xbyak {
+class CodeGenerator;
+}
+
 // ============================================================================
 // Windows static guest red-zone protection
 // ============================================================================
@@ -63,6 +67,12 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 
 /// Returns true when the host CPU lacks SSE4a and EXTRQ/INSERTQ must be emulated.
 bool NeedsSse4aEmulation();
+
+/// sotc: tests (cpu-emulation-test): emits the trampoline emulation of the instruction at `code`
+/// into `c`, whatever the CPU supports. False when there is none.
+bool EmitCpuEmulationForTest(void* code, Xbyak::CodeGenerator& c);
+/// sotc: BMI1, LZCNT or MOVBE missing (or SOTC_EMULATE_BMI=1): trampolines replace them.
+bool NeedsBmiEmulation();
 
 /// Relocates 4-byte EXTRQ/INSERTQ (too short for a near jump) together with the following
 /// instructions into trampolines, so they never reach the illegal-instruction handler. On Windows

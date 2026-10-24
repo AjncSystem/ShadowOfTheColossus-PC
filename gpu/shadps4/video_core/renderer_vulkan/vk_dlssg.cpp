@@ -3,6 +3,7 @@
 
 #include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_framegen.h"
+#include "video_core/renderer_vulkan/vk_fsr3up.h"
 #include "video_core/renderer_vulkan/vk_fsrfg.h"
 
 #include <windows.h>
@@ -19,6 +20,7 @@
 
 #include <sl.h>
 #include <sl_consts.h>
+#include <sl_dlss.h>
 #include <sl_dlss_g.h>
 #include <sl_pcl.h>
 #include <sl_reflex.h>
@@ -44,6 +46,8 @@ struct Api {
     PFun_slSetConstants* set_constants{};
     PFun_slSetTagForFrame* set_tag{};
     PFun_slDLSSGSetOptions* dlssg_set_options{};
+    PFun_slEvaluateFeature* evaluate{};
+    PFun_slDLSSSetOptions* dlss_set_options{};
     PFun_slDLSSGGetState* dlssg_get_state{};
     PFun_slReflexSetOptions* reflex_set_options{};
     PFun_slReflexSleep* reflex_sleep{};
@@ -96,6 +100,7 @@ constexpr u64 kMask48 = 0xFFFFFFFFFFFFull;
 
 bool loaded = false;    // sl.interposer.dll loaded, slInit done
 bool supported = false; // DLSS-G supported on the device
+bool sr_supported = false; // DLSS Super Resolution supported on the device
 bool vsync_off = true;  // eVSyncOffRequired
 int log_level = 0;      // SOTC_DLSSG_LOG
 const Instance* g_instance{};
@@ -140,6 +145,11 @@ bool Resolve(T*& out, const char* name) {
         std::fprintf(stderr, "SOTC DLSSG: %s missing in sl.interposer.dll\n", name);
     }
     return out != nullptr;
+}
+
+template <typename T>
+void GetProcAddressInto(T*& out, const char* name) {
+    out = reinterpret_cast<T*>(GetProcAddress(api.dll, name));
 }
 
 template <typename T>
@@ -575,6 +585,9 @@ bool Parallel() {
 
 /// Inputs are captured while DLSS-G or FSR 3 is the frame generation mode.
 bool Capturing() {
+    if (Fsr3Up::Wanted()) { // sotc: the FSR 3.1 upscaler needs the same inputs
+        return g_instance != nullptr;
+    }
     switch (FrameGen::Current()) {
     case FrameGen::Mode::Dlss:
         return supported;
@@ -719,8 +732,17 @@ PFN_vkGetInstanceProcAddr LoadInterposer() {
     }
 
     static const wchar_t* plugin_paths[] = {dir.c_str()};
-    static const sl::Feature features[] = {sl::kFeatureDLSS_G, sl::kFeatureReflex,
-                                           sl::kFeaturePCL};
+    // sotc: DLSS Super Resolution (SOTC_UPSCALER=dlss) needs its plugin loaded too.
+    static const bool want_sr = [] {
+        const char* v = std::getenv("SOTC_UPSCALER");
+        return v && _stricmp(v, "dlss") == 0;
+    }();
+    static const sl::Feature features_sr[] = {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL,
+                                              sl::kFeatureDLSS};
+    static const sl::Feature features_fg[] = {sl::kFeatureDLSS_G, sl::kFeatureReflex,
+                                              sl::kFeaturePCL};
+    const sl::Feature* features = want_sr ? features_sr : features_fg;
+    const size_t feature_count = want_sr ? std::size(features_sr) : std::size(features_fg);
     sl::Preferences pref{};
     pref.showConsole = false;
     pref.logLevel = log_level >= 2 ? sl::LogLevel::eVerbose : sl::LogLevel::eDefault;
@@ -732,7 +754,7 @@ PFN_vkGetInstanceProcAddr LoadInterposer() {
     pref.flags = sl::PreferenceFlags::eDisableCLStateTracking |
                  sl::PreferenceFlags::eUseFrameBasedResourceTagging;
     pref.featuresToLoad = features;
-    pref.numFeaturesToLoad = static_cast<u32>(std::size(features));
+    pref.numFeaturesToLoad = static_cast<u32>(feature_count);
     pref.engine = sl::EngineType::eCustom;
     pref.engineVersion = "1.0.0";
     pref.projectId = "7d6c0a52-3f1e-4b8a-9c2d-5e0f8a1b2c3d";
@@ -744,6 +766,7 @@ PFN_vkGetInstanceProcAddr LoadInterposer() {
         return nullptr;
     }
     loaded = true;
+    GetProcAddressInto(api.evaluate, "slEvaluateFeature");
     if (const char* f = std::getenv("SOTC_DLSSG_ASSUME_FOCUS"); f && f[0] == '1') {
         PatchForegroundWindow(L"sl.common.dll");
         PatchForegroundWindow(L"sl.dlss_g.dll");
@@ -756,6 +779,7 @@ PFN_vkGetInstanceProcAddr LoadInterposer() {
 void OnDeviceCreated(const Instance& instance) {
     g_instance = &instance;
     FsrFg::Init(instance);
+    Fsr3Up::Init(instance);
     struct ResolveMode {
         ~ResolveMode() {
             FrameGen::SetAvailable(supported, FsrFg::Supported());
@@ -766,6 +790,13 @@ void OnDeviceCreated(const Instance& instance) {
     }
     sl::AdapterInfo adapter{};
     adapter.vkPhysicalDevice = static_cast<VkPhysicalDevice>(instance.GetPhysicalDevice());
+    if (const char* v = std::getenv("SOTC_UPSCALER"); v && _stricmp(v, "dlss") == 0) {
+        const sl::Result sr = api.is_supported(sl::kFeatureDLSS, adapter);
+        sr_supported = sr == sl::Result::eOk && api.evaluate &&
+                       ResolveFeature(api.dlss_set_options, sl::kFeatureDLSS, "slDLSSSetOptions");
+        std::fprintf(stderr, "SOTC DLSS Super Resolution: %s (%d)\n",
+                     sr_supported ? "available" : "not available, FSR 3.1 instead", static_cast<int>(sr));
+    }
     const sl::Result dlssg = api.is_supported(sl::kFeatureDLSS_G, adapter);
     const sl::Result reflex = api.is_supported(sl::kFeatureReflex, adapter);
     sl::FeatureRequirements req{};
@@ -808,6 +839,111 @@ void OnDeviceCreated(const Instance& instance) {
 
 bool Enabled() {
     return supported;
+}
+
+bool SuperResReady() {
+    return sr_supported;
+}
+
+bool SuperResEvaluate(vk::CommandBuffer cmdbuf, u32 frame_id, vk::Image color, vk::ImageView color_view,
+                      vk::Format color_format, u32 width, u32 height, vk::Image out, vk::ImageView out_view,
+                      vk::Format out_format, u32 out_width, u32 out_height) {
+    if (!sr_supported || frame_id >= kMaxFrames || !frames[frame_id].valid ||
+        frames[frame_id].index == 0 || frames[frame_id].width != width ||
+        frames[frame_id].height != height) {
+        return false;
+    }
+    FrameSlot& f = frames[frame_id];
+    sl::FrameToken* token = Token(f.index);
+    if (!token) {
+        return false;
+    }
+    const sl::ViewportHandle viewport{0};
+    const sl::Result constants_result = api.set_constants(f.constants, *token, viewport);
+    // The mode follows the scale: 1.5x quality, 1.7x balanced, 2x performance, 3x ultra performance.
+    const float scale = static_cast<float>(out_width) / static_cast<float>(width);
+    sl::DLSSOptions options{};
+    options.mode = scale < 1.1f    ? sl::DLSSMode::eDLAA
+                   : scale < 1.6f  ? sl::DLSSMode::eMaxQuality
+                   : scale < 1.85f ? sl::DLSSMode::eBalanced
+                   : scale < 2.5f  ? sl::DLSSMode::eMaxPerformance
+                                   : sl::DLSSMode::eUltraPerformance;
+    options.outputWidth = out_width;
+    options.outputHeight = out_height;
+    // DLSS 4.5 (second generation transformer model, nvngx_dlss.dll 310.5 and later): preset M in
+    // every mode but Ultra Performance, which has its own (L). SOTC_DLSS_PRESET=k is the DLSS 4
+    // model (K) for DLAA, Quality and Balanced, and what the SDK picks for the other two.
+    static const bool dlss4 = [] {
+        const char* v = std::getenv("SOTC_DLSS_PRESET");
+        return v && (v[0] == 'k' || v[0] == 'K');
+    }();
+    options.dlaaPreset = dlss4 ? sl::DLSSPreset::ePresetK : sl::DLSSPreset::ePresetM;
+    options.qualityPreset = dlss4 ? sl::DLSSPreset::ePresetK : sl::DLSSPreset::ePresetM;
+    options.balancedPreset = dlss4 ? sl::DLSSPreset::ePresetK : sl::DLSSPreset::ePresetM;
+    options.performancePreset = sl::DLSSPreset::ePresetM;
+    options.ultraPerformancePreset = sl::DLSSPreset::ePresetL;
+    options.preExposure = 1.0f;
+    options.colorBuffersHDR = sl::Boolean::eFalse; // the frame is display referred, not HDR
+    options.useAutoExposure = sl::Boolean::eTrue;
+    const sl::Result options_result = api.dlss_set_options(viewport, options);
+    if (constants_result != sl::Result::eOk || options_result != sl::Result::eOk) {
+        static u32 errors = 0;
+        if (errors++ < 5) {
+            std::fprintf(stderr, "SOTC DLSS SR: constants %d, options %d\n",
+                         static_cast<int>(constants_result), static_cast<int>(options_result));
+        }
+        return false;
+    }
+    const auto make = [](vk::Image image, vk::ImageView view, vk::Format format, u32 w, u32 h,
+                         vk::ImageLayout layout, VkDeviceMemory memory, VkImageUsageFlags usage) {
+        sl::Resource r{sl::ResourceType::eTex2d, static_cast<VkImage>(image), memory,
+                       static_cast<VkImageView>(view), static_cast<u32>(layout)};
+        r.width = w;
+        r.height = h;
+        r.nativeFormat = static_cast<u32>(format);
+        r.mipLevels = 1;
+        r.arrayLayers = 1;
+        r.flags = 0;
+        r.usage = usage;
+        return r;
+    };
+    constexpr VkImageUsageFlags kInUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    constexpr VkImageUsageFlags kOutUsage = kInUsage | VK_IMAGE_USAGE_STORAGE_BIT;
+    sl::Resource depth_r = make(f.depth, f.depth_view, f.depth_format, f.width, f.height,
+                                vk::ImageLayout::eShaderReadOnlyOptimal, f.depth_memory, kInUsage);
+    sl::Resource mvec_r = make(f.mvec, f.mvec_view, f.mvec_format, f.width, f.height,
+                               vk::ImageLayout::eShaderReadOnlyOptimal, f.mvec_memory, kOutUsage);
+    sl::Resource color_r = make(color, color_view, color_format, width, height,
+                                vk::ImageLayout::eShaderReadOnlyOptimal, nullptr, kOutUsage);
+    sl::Resource out_r = make(out, out_view, out_format, out_width, out_height,
+                              vk::ImageLayout::eGeneral, nullptr, kOutUsage);
+    const sl::Extent in_extent{0, 0, width, height};
+    const sl::Extent out_extent{0, 0, out_width, out_height};
+    std::array<sl::ResourceTag, 4> tags{
+        sl::ResourceTag{&depth_r, sl::kBufferTypeDepth, sl::eValidUntilEvaluate, &in_extent},
+        sl::ResourceTag{&mvec_r, sl::kBufferTypeMotionVectors, sl::eValidUntilEvaluate, &in_extent},
+        sl::ResourceTag{&color_r, sl::kBufferTypeScalingInputColor, sl::eValidUntilEvaluate,
+                        &in_extent},
+        sl::ResourceTag{&out_r, sl::kBufferTypeScalingOutputColor, sl::eValidUntilEvaluate,
+                        &out_extent},
+    };
+    auto* command = reinterpret_cast<sl::CommandBuffer*>(static_cast<VkCommandBuffer>(cmdbuf));
+    const sl::Result tag_result = api.set_tag(*token, viewport, tags.data(),
+                                              static_cast<u32>(tags.size()), command);
+    const sl::BaseStructure* inputs[] = {&viewport};
+    const sl::Result eval_result = tag_result == sl::Result::eOk
+                                       ? api.evaluate(sl::kFeatureDLSS, *token, inputs, 1, command)
+                                       : tag_result;
+    if (eval_result != sl::Result::eOk) {
+        static u32 errors = 0;
+        if (errors++ < 5) {
+            std::fprintf(stderr, "SOTC DLSS SR: tag/evaluate failed (%d)\n",
+                         static_cast<int>(eval_result));
+        }
+        return false;
+    }
+    return true;
 }
 
 bool CapturingInputs() {
@@ -867,7 +1003,7 @@ void PrepareInputs(u32 frame_id, vk::CommandBuffer cmdbuf, VideoCore::TextureCac
     f.sl_valid = false;
     f.hudless = {};
     FsrFg::NoDepth(frame_id);
-    const bool fsr = FrameGen::Current() == FrameGen::Mode::Fsr;
+    const bool fsr = FrameGen::Current() == FrameGen::Mode::Fsr || Fsr3Up::Wanted();
     if (!supported && !fsr) {
         pending = Pending{};
         return;

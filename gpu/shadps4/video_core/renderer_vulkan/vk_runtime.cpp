@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "video_core/sotc_stats.h"
 #include <algorithm>
 #include "common/alignment.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -711,6 +712,7 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
         new_backing->state.pl_stage = dst_stage;
     }
 
+    SotcStats::push_clobbers.fetch_add(1, std::memory_order_relaxed); // sotc: reused binds repush
     backing = new_backing;
 }
 

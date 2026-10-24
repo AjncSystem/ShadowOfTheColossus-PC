@@ -84,6 +84,9 @@ public:
             manager->Unlock(bounds);
             return run < size;
         });
+        // sotc: after the marks, not before: a reused bind that read the epoch in between must
+        // not keep a stale view (SOTC_FAST_BIND review, 24 Oct).
+        SotcStats::mem_epoch.fetch_add(1, std::memory_order_release);
     }
 
     /// Mark region as modified from the CPU
@@ -92,6 +95,7 @@ public:
         IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
             manager->template ChangeRegionState<StateOp::Set, StateOp::None>(offset, size);
         });
+        SotcStats::mem_epoch.fetch_add(1, std::memory_order_release); // after the marks
     }
 
     /// Removes all protection from a page and ensures GPU data has been flushed if requested

@@ -289,6 +289,9 @@ public:
             // Hot pages keep their CPU bit without a new fault: the next sweep uploads them again.
             if (kept_words) {
                 sweep_words.fetch_or(kept_words, std::memory_order_release);
+                // sotc: the guest writes these pages without a fault, so no later bump will
+                // announce it: draws that bound them never reuse their binds.
+                SotcStats::mem_epoch.fetch_add(1, std::memory_order_release);
             }
         }
         const auto write_op = GetPageOp<Type::CPU>(cpu_op);

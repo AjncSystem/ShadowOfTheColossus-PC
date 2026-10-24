@@ -19,8 +19,7 @@ Settings (environment variables, or sotc.ini beside this script as NAME=value li
                       fps60game (the game's own 60 FPS target, as the PS4 Pro Performance mode;
                       with SOTC_FPS_CAP=off)
     SOTC_RENDER_RES   optional: the game renders at WxH instead of 1920x1080 (e.g. 2560x1080 for
-                      21:9, a wider view); the output follows its aspect; PS4 mode only; at most 1080
-                      lines tall, larger sizes are scaled down
+                      21:9, a wider view); the output follows its aspect; PS4 mode only
     SOTC_CVARS        engine settings, NAME=VALUE separated by spaces (e.g. r_motionBlurEnable=0)
     BB_GAMEPAD        the gamepad to use (its name or part of it), when several are connected
     key.<input>=Keys, pad.<input>=buttons   remap the controls (README.md, Controles)
@@ -67,28 +66,6 @@ def find_probe():
         if candidate.is_file():
             return candidate
     fail('bb-probe.exe not found: build it with build.sh (MSYS2 CLANG64) or use a packaged build.')
-
-
-# The game itself never renders more than 1080 lines in PS4 mode, so the render height stays at
-# most 1080. (The former 4.2 million pixel limit is gone: sotc_modes.py turns off the game's
-# low-memory texture eviction above that size and fixes the page allocator crash it exposed.)
-MAX_RENDER_HEIGHT = 1080
-
-
-def cap_render(size):
-    """SOTC_RENDER_RES WxH, scaled down (same aspect, multiples of 8) to MAX_RENDER_HEIGHT lines."""
-    try:
-        w, h = map(int, size.split('x'))
-    except ValueError:
-        return size  # sotc_modes.py reports it
-    if w <= 0 or h <= 0:
-        return size  # sotc_modes.py reports it
-    scale = min(1.0, MAX_RENDER_HEIGHT / h)
-    if scale == 1.0:
-        return size
-    capped = f'{int(w * scale) // 8 * 8}x{int(h * scale) // 8 * 8}'
-    print(f'sotc: render size {size} is above {MAX_RENDER_HEIGHT} lines, rendering at {capped}', file=sys.stderr)
-    return capped
 
 
 def run_script(name, *args):
@@ -198,7 +175,7 @@ def main():
         cvars = 'doIndexBufferCulling=0 doSunShadowIndexBufferCulling=0'
     if env.get('SOTC_NOTE'):
         print(f"sotc: {env['SOTC_NOTE']}", file=sys.stderr)
-    render = cap_render(env.get('SOTC_RENDER_RES', '').strip())
+    render = env.get('SOTC_RENDER_RES', '').strip()
     if render == '1920x1080':
         # A 16:9 output above 1080p renders at 1080p as before: no patches, no extra memory.
         render = ''

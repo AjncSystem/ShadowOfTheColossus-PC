@@ -23,6 +23,7 @@
 #include "stb_image.h"
 #include <unordered_map>
 #include "imgui_impl_vulkan.h"
+#include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_framegen.h"
 #include "video_core/renderer_vulkan/vk_fsr3up.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -358,8 +359,12 @@ void SetUpscaler(int mode) {
     if (mode != 2) {
         SotcLive::fsr1.store(mode == 0 ? 1 : 0, std::memory_order_relaxed);
     }
-    SaveLauncherSetting("upscaler", mode == 0 ? "\"fsr1\"" : mode == 2 ? "\"fsr3\"" : "\"bilinear\"");
-    SotcEvent::Log("MENU", "Upscaler: %s", mode == 0 ? "FSR 1" : mode == 2 ? "FSR 3.1" : "Bilinear");
+    // Mode 2 is DLSS when the game started with it and Streamline has it ready (else FSR 3.1).
+    const bool dlss = mode == 2 && Vulkan::Dlssg::SuperResReady();
+    SaveLauncherSetting("upscaler", mode == 0 ? "\"fsr1\"" : mode == 2 ? (dlss ? "\"dlss\"" : "\"fsr3\"")
+                                                                       : "\"bilinear\"");
+    SotcEvent::Log("MENU", "Upscaler: %s",
+                   mode == 0 ? "FSR 1" : mode == 2 ? (dlss ? "DLSS" : "FSR 3.1") : "Bilinear");
 }
 
 // sotc: RCAS sharpening 0 high, 1 medium, 2 low, 3 off (the launcher's SHARPNESS values).
@@ -417,7 +422,9 @@ void QuickSettings() {
                             : (live_fsr1 >= 0 ? live_fsr1 : env_fsr1) ? 0 : 1;
     const char* up_names[] = {T("FSR 1 (AMD, qualquer placa)", "FSR 1 (AMD, any GPU)"),
                               T("Bilinear (simples)", "Bilinear (plain)"),
-                              T("FSR 3.1 (temporal)", "FSR 3.1 (temporal)")};
+                              Vulkan::Dlssg::SuperResReady()
+                                  ? T("DLSS Super Resolution (NVIDIA RTX)", "DLSS Super Resolution (NVIDIA RTX)")
+                                  : T("FSR 3.1 (temporal)", "FSR 3.1 (temporal)")};
     if (ImGui::BeginCombo("Upscaler", up_names[up_mode])) {
         for (int i = 0; i < (has_fsr3 ? 3 : 2); ++i) {
             if (ImGui::Selectable(up_names[i], i == up_mode) && i != up_mode) {

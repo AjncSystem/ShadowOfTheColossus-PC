@@ -158,7 +158,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'user_dir': '', 'af16': True, 'textures': 'high', 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
                 'readbacks': '', 'extra_env': '', 'close_on_play': False, 'gamepad': '',
-                'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
+                'output_res': '1920x1080', 'upscaler': 'fsr1', 'render_preset': 'quality', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
                 'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'volume': '100', 'shadow_reuse': '0', 'library_dirs': [], 'keys': {},
@@ -247,7 +247,16 @@ SCREENS = [('1920x1080', '16:9, 1080p'), ('2560x1440', '16:9, 1440p'), ('3840x21
 OUTPUTS = [('1280x720', ('1280 × 720 (16:9, 720p)', '1280 × 720 (16:9, 720p)'))] + [
     (size, (f"{size.replace('x', ' × ')} ({label})",) * 2) for size, label in SCREENS]
 UPSCALERS = [('fsr1', ('FSR 1 (AMD, qualquer placa)', 'FSR 1 (AMD, any GPU)')),
+             ('fsr3', ('FSR 3.1 (temporal, qualquer placa)', 'FSR 3.1 (temporal, any GPU)')),
              ('bilinear', ('Bilinear (simples)', 'Bilinear (plain)'))]
+# With the FSR 3.1 upscaler: the game renders at the output size divided by this factor (the
+# upscaler brings it back). Native keeps the output size (FSR 3.1 as anti-aliasing only).
+RENDER_PRESETS = [('native', ('Nativa (1,0x, só suavização)', 'Native (1.0x, anti-aliasing only)')),
+                  ('quality', ('Qualidade (1,5x)', 'Quality (1.5x)')),
+                  ('balanced', ('Equilibrado (1,7x)', 'Balanced (1.7x)')),
+                  ('performance', ('Desempenho (2,0x)', 'Performance (2.0x)')),
+                  ('ultra', ('Desempenho máximo (3,0x)', 'Ultra performance (3.0x)'))]
+PRESET_SCALE = {'native': 1.0, 'quality': 1.5, 'balanced': 1.7, 'performance': 2.0, 'ultra': 3.0}
 # Button icons in the game: the PlayStation prompts, or Xbox ones drawn for the port
 # (tools/make_button_icons.py, glyphs/xbox) put in place of the game's textures.
 BUTTON_ICONS = [('ps', ('PlayStation (do jogo)', 'PlayStation (the game\'s)')),
@@ -600,6 +609,15 @@ def game_environment(s):
     if output not in ('1280x720', '1920x1080') and env['SOTC_NEO'] == '0':
         env['SOTC_RENDER_RES'] = output
     env['BB_FSR1'] = '1' if s.get('upscaler', 'fsr1') == 'fsr1' else '0'
+    if s.get('upscaler') == 'fsr3':
+        # FSR 3.1 needs the game's own render size, below the output: the PS4 Pro path keeps its sizes.
+        env['SOTC_UPSCALER'] = 'fsr3'
+        env['SOTC_NEO'] = '0'
+        render = render_size(env['SOTC_OUTPUT_RES'], PRESET_SCALE.get(s.get('render_preset'), 1.5))
+        if render:
+            env['SOTC_RENDER_RES'] = render
+        else:
+            env.pop('SOTC_RENDER_RES', None)
     if s.get('sharpness') == 'off':
         env['BB_RCAS'] = '0'
     else:
@@ -618,6 +636,18 @@ def game_environment(s):
     env['PYTHONUNBUFFERED'] = '1'
     env['PYTHONIOENCODING'] = 'utf-8'
     return env
+
+
+def render_size(output, scale):
+    """The render size for the FSR 3.1 upscaler: `output` (WxH) divided by `scale`, multiples of 8, at
+    least 640x360 (what the game's patches take); '' when it is the 1080p the game renders by default."""
+    try:
+        w, h = map(int, output.split('x'))
+    except ValueError:
+        return ''
+    w = max(640, int(w / scale) // 8 * 8)
+    h = max(360, int(h / scale) // 8 * 8)
+    return '' if (w, h) == (1920, 1080) else f'{w}x{h}'
 
 
 def is_wide(size):
@@ -1159,6 +1189,13 @@ class Launcher:
                    'than the output the window fits the screen and fullscreen uses the whole monitor.'))
         self.row(f, _('Upscaler', 'Upscaler'), self.choice(f, 'upscaler', UPSCALERS),
                  _('FSR 1 amplia com bordas nítidas (acima de 1080p).', 'FSR 1 upscales with sharp edges (above 1080p).'))
+        self.row(f, _('Qualidade do FSR 3.1', 'FSR 3.1 quality'), self.choice(f, 'render_preset', RENDER_PRESETS),
+                 _('Só com o upscaler FSR 3.1: o jogo renderiza num tamanho menor que a saída e o FSR 3.1 o '
+                   'amplia, o que dá mais FPS onde a placa de vídeo é o limite (saída 1440p/4K). Exige reiniciar o jogo. '
+                   'Desliga o modo PS4 Pro. A interface também passa pelo upscaler.',
+                   'Only with the FSR 3.1 upscaler: the game renders below the output size and FSR 3.1 enlarges '
+                   'it, giving more FPS where the graphics card is the limit (1440p/4K output). Restart the game '
+                   'to apply. Turns PS4 Pro mode off. The interface goes through the upscaler too.'))
         self.row(f, _('Nitidez (RCAS)', 'Sharpening (RCAS)'), self.choice(f, 'sharpness', SHARPNESS))
         self.section(f, _('Modo PS4 Pro', 'PS4 Pro mode'))
         self.check(f, 'neo', _('Apresentar-se como PS4 Pro', 'Present as a PS4 Pro'),
@@ -1399,7 +1436,7 @@ class Launcher:
     def summary(self):
         parts = [dict((k, _(*v)) for k, v in FPS_MODES).get(self.var('fps_mode').get(), '30 FPS'),
                  self.var('output_res').get().replace('x', ' × '),
-                 'FSR 1' if self.var('upscaler').get() == 'fsr1' else 'bilinear']
+                 {'fsr1': 'FSR 1', 'fsr3': 'FSR 3.1'}.get(self.var('upscaler').get(), 'bilinear')]
         framegen = self.var('framegen').get()
         if framegen != 'off':
             parts.append({'auto': _('geração de quadros', 'frame generation'), 'dlss': 'DLSS-G',

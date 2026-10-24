@@ -161,7 +161,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'render_preset': 'quality', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
-                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'volume': '100', 'shadow_reuse': '0', 'library_dirs': [], 'keys': {},
+                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'volume': '100', 'shadow_reuse': '0', 'grass_shadows': '3', 'grass_size': '1', 'grass_fade': '1', 'library_dirs': [], 'keys': {},
                 'auto_setup': True, 'dlc_dir': '', 'framegen': 'off',
                 'check_updates': True, 'skip_version': ''}
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
@@ -201,6 +201,23 @@ VRAM_USE = [('low', ('Econômico (placas de 4–6 GB)', 'Economy (4–6 GB cards
 SHADOW_REUSE = [('0', ('Desligado (sombras sem piscar)', 'Off (no blinking shadows)')),
                 ('1', ('Ligado (mais FPS; sombras distantes podem piscar)', 'On (more FPS; far shadows may blink)')),
                 ('auto', ('Automático (ligado na NVIDIA, desligado na AMD/Intel)', 'Automatic (on with NVIDIA, off on AMD/Intel)'))]
+# Sun shadow cascades the grass casts shadows in (r_virtualGeometryNumShadowCascades): the PS4
+# value 2 ends them at 8 m, a band of grass darkens ~10 m ahead while riding; 3 reaches 24 m, 4 100 m.
+GRASS_SHADOWS = [('2', ('Como no PS4 (até ~8 m)', 'As on PS4 (to ~8 m)')),
+                 ('3', ('Longe (até ~24 m)', 'Far (to ~24 m)')),
+                 ('4', ('Muito longe (até ~100 m, mais pesado)', 'Very far (to ~100 m, heavier)'))]
+# Grass size (r_virtualGeometryScaleMultiplier): the grass is drawn as far as it stays big enough on
+# screen, so bigger grass also pops in farther ahead (2: mostly out of sight, 3: none, but bush-high).
+# Fade (r_virtualGeometryFadeMultiplier) does not change the height: away from 1 it thins the grass,
+# and 0.3 also drops its shadows.
+GRASS_SIZE = [('1', ('Como no PS4 (grama surge a ~10-15 m)', 'As on PS4 (grass pops in ~10-15 m ahead)')),
+              ('1.5', ('Um pouco mais longe', 'A bit farther')),
+              ('2', ('Longe', 'Far')),
+              ('3', ('Muito longe (sem grama surgindo)', 'Very far (no grass pop-in)'))]
+GRASS_FADE = [('0.3', ('0.3 (grama rala, sem sombra)', '0.3 (sparse grass, no shadow)')),
+              ('0.6', ('0.6 (grama mais rala)', '0.6 (sparser grass)')),
+              ('1', ('Como no PS4', 'As on PS4')),
+              ('2', ('2 (pouca grama)', '2 (little grass)'))]
 VOLUME = [('100', ('100% (original)', '100% (original)')), ('150', ('150%', '150%')),
           ('200', ('200%', '200%')), ('300', ('300% (máximo)', '300% (maximum)'))]
 VRAM_LIMITS = {'low': ('50', '1024'), 'normal': ('60', '1536'), 'high': ('75', '4096'), 'max': ('85', '0')}
@@ -569,6 +586,16 @@ def game_environment(s):
         cvars += ['doIndexBufferCulling=0', 'doSunShadowIndexBufferCulling=0']
     if s.get('skip_logos'):
         cvars.append('skipSplash=1')
+    grass = str(s.get('grass_shadows') or '3')
+    if grass in ('3', '4'):
+        # Every mode's copy: the game takes the one of its graphics mode (PS4 Pro Cinematic has 3).
+        cvars += [f'r_virtualGeometryNumShadowCascades{mode}={grass}'
+                  for mode in ('', '_BasePS4', '_Perf', '_Cinematic')]
+    size, fade = str(s.get('grass_size') or '1'), str(s.get('grass_fade') or '1')
+    if size in ('1.5', '2', '3'):
+        cvars.append(f'r_virtualGeometryScaleMultiplier={size}')
+    if fade in ('0.3', '0.6', '2'):
+        cvars.append(f'r_virtualGeometryFadeMultiplier={fade}')
     cvars += str(s.get('engine_cvars', '')).split()
     env['SOTC_CVARS'] = ' '.join(cvars)
     env['SOTC_RECORD_THREAD'] = '1' if s.get('perf_record_thread', True) else '0'
@@ -1260,6 +1287,25 @@ class Launcher:
                    'Draws the far sun shadows only every other frame and reuses them in between: a little more '
                    'FPS (~0.5%), but they blink in the distance (AMD and NVIDIA GTX 1080, RTX 40/50). Hence off '
                    'by default.'))
+        self.row(f, _('Sombras da grama', 'Grass shadows'), self.choice(f, 'grass_shadows', GRASS_SHADOWS),
+                 _('Até onde a grama projeta sombra. No PS4 só até ~8 m: ao cavalgar, uma faixa de grama '
+                   'escurece logo à frente. "Longe" leva até ~24 m; "Muito longe" até ~100 m, com algum custo '
+                   'de FPS. Vale ao iniciar o jogo.',
+                   'How far the grass casts shadows. On PS4 only to ~8 m: while riding, a band of grass '
+                   'darkens just ahead. "Far" takes it to ~24 m; "Very far" to ~100 m, at some FPS cost. '
+                   'Applies when the game starts.'))
+        self.row(f, _('Distância da grama', 'Grass distance'), self.choice(f, 'grass_size', GRASS_SIZE),
+                 _('A grama só é desenhada enquanto parece grande o bastante na tela: no PS4, ao cavalgar, ela '
+                   'surge numa onda a ~10-15 m à frente. Mais longe também deixa a grama mais alta: "Muito '
+                   'longe" vira arbusto. Vale ao iniciar o jogo.',
+                   'The grass is only drawn while it looks big enough on screen: on PS4, while riding, it pops '
+                   'in as a wave ~10-15 m ahead. Farther also makes the grass taller: "Very far" turns it into '
+                   'bushes. Applies when the game starts.'))
+        self.row(f, _('Esmaecimento da grama', 'Grass fade'), self.choice(f, 'grass_fade', GRASS_FADE),
+                 _('Como a grama some com a distância. Fora do valor do PS4 a grama fica mais rala; 0.3 também '
+                   'tira a sombra da grama. Vale ao iniciar o jogo.',
+                   'How the grass fades out with distance. Away from the PS4 value the grass gets sparser; 0.3 '
+                   'also removes the grass shadow. Applies when the game starts.'))
         self.row(f, _('Uso de memória de vídeo', 'Video memory use'), self.choice(f, 'vram_use', VRAM_USE),
                  _('Até onde o jogo enche a memória da placa antes de liberar texturas e buffers. Padrão: '
                    'libera a partir de 60%. Em placas de 8 GB ou mais, "Alto" ou "Máximo" evita recarregar '

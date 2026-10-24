@@ -10,6 +10,7 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <optional>
 #include <span>
 #include <vector>
 #include <unordered_map>
@@ -21,6 +22,7 @@
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
+#include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 
 namespace AmdGpu {
 struct Liverpool;
@@ -162,7 +164,8 @@ public:
 
     /// sotc: gives back arena allocations whose blocks were not bound for a while and hold no
     /// GPU-written data, once resident arena memory passes SOTC_ARENA_EVICT_MB. Called between
-    /// commands outside a render pass; true when it submitted (it waits for the GPU).
+    /// commands outside a render pass. A check records the read-back of the coldest ones; a
+    /// later call, once the GPU has done it, compares and unbinds. True when it submitted.
     bool MaybeEvictCold(std::chrono::steady_clock::time_point now);
 
     /// sotc: a shader reached [addr, addr + size) through a pointer and faulted: blocks of it
@@ -394,6 +397,26 @@ private:
     }
     std::chrono::steady_clock::time_point epoch_start{};
     std::chrono::steady_clock::time_point next_evict_check{};
+    /// sotc: an eviction whose read-back is recorded; compared and unbound once the GPU is done.
+    struct EvictPiece {
+        VAddr addr;
+        u64 size;
+        u64 offset; ///< in the download
+    };
+    struct EvictChoice {
+        u64 key; ///< first block of the resident range
+        u64 bytes;
+        std::vector<EvictPiece> pieces;
+        boost::container::small_vector<Backing, 4> ranges;
+    };
+    struct PendingEviction {
+        std::vector<EvictChoice> chosen;
+        Vulkan::StagingBufferRef download;
+        u64 tick{};
+        std::chrono::steady_clock::time_point deadline{};
+    };
+    std::optional<PendingEviction> pending_eviction;
+    bool FinishEviction(std::chrono::steady_clock::time_point now, u16 idle_epochs, bool wait);
 
     u32 arena_memory_type_index{};
     std::optional<u32> arena_fallback_memory_type_index;

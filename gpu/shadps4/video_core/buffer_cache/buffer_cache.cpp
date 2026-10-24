@@ -1862,6 +1862,10 @@ bool BufferCache::MaybeEvictCold(std::chrono::steady_clock::time_point now) {
         return static_cast<u16>(std::clamp<unsigned long>(v ? std::strtoul(v, nullptr, 10) : 30ul,
                                                           2ul, 30000ul));
     }();
+    if (pending_eviction) {
+        AdvanceUseEpoch(now);
+        return FinishEviction(now, idle_epochs, false);
+    }
     if (now < next_evict_check) {
         return false;
     }
@@ -1912,23 +1916,15 @@ bool BufferCache::MaybeEvictCold(std::chrono::steady_clock::time_point now) {
     std::ranges::sort(order, std::greater{});
 
     // Read the coldest allocations back, up to `step` bytes of blocks.
-    struct Piece {
-        VAddr addr;
-        u64 size;
-        u64 offset; // in the download
-    };
-    struct Chosen {
-        u64 key; // first block of the resident range
-        std::vector<Piece> pieces;
-    };
-    std::vector<Chosen> chosen;
+    std::vector<EvictChoice> chosen;
     u64 total = 0;
     for (const auto& [age, key] : order) {
         if (total >= step || resident - total <= limit / 8 * 7) {
             break;
         }
-        Chosen& pick = chosen.emplace_back(Chosen{key, {}});
-        for (const Backing& range : candidates[key].ranges) {
+        const Candidate& candidate = candidates[key];
+        EvictChoice& pick = chosen.emplace_back(EvictChoice{key, candidate.bytes, {}, candidate.ranges});
+        for (const Backing& range : candidate.ranges) {
             // Split at arena page boundaries, each page may belong to a different arena.
             for (u64 start = range.start; start < range.end;) {
                 const u64 page = start >> blocks_per_arena_page_shift;
@@ -1940,8 +1936,8 @@ bool BufferCache::MaybeEvictCold(std::chrono::steady_clock::time_point now) {
         }
     }
     const auto download = staging_pool.Request(total, MemoryType::HostCached, 0, true);
-    for (const Chosen& pick : chosen) {
-        for (const Piece& piece : pick.pieces) {
+    for (const EvictChoice& pick : chosen) {
+        for (const EvictPiece& piece : pick.pieces) {
             const Buffer* arena = address_space[piece.addr >> ARENA_PAGE_BITS];
             if (!arena) {
                 continue; // never resident: the comparison fails and the allocation stays
@@ -1951,15 +1947,55 @@ bool BufferCache::MaybeEvictCold(std::chrono::steady_clock::time_point now) {
             runtime.CopyBuffer(arena, download.buffer, std::span{&copy, 1});
         }
     }
-    // Also lets work already recorded finish reading these blocks before they are unbound.
-    scheduler.Finish();
+    pending_eviction = PendingEviction{std::move(chosen), download, scheduler.CurrentTick(),
+                                       now + std::chrono::seconds(5)};
+    // sotc: SOTC_EVICT_ASYNC=0 waits for the read-back here, as before: scheduler.Finish() on the
+    // command processor, ~50 ms per 64 MiB run, one late frame each.
+    static const bool async = [] {
+        const char* v = std::getenv("SOTC_EVICT_ASYNC");
+        return !v || v[0] != '0';
+    }();
+    return async ? false : FinishEviction(now, idle_epochs, true);
+}
+
+bool BufferCache::FinishEviction(std::chrono::steady_clock::time_point now, u16 idle_epochs,
+                                 bool wait) {
+    // sotc: the unbind's sparse batch does not wait for earlier submits, so it goes only once
+    // every command buffer submitted so far (the read-back's included) is done. The GPU catches
+    // up within a frame or two at the benchmark scenes; after 5 s, or with `wait`, Finish() it.
+    PendingEviction& pending = *pending_eviction;
+    if (!scheduler.IsFree(pending.tick) || !scheduler.IsFree(scheduler.CurrentTick() - 1)) {
+        if (!wait && now < pending.deadline) {
+            return false;
+        }
+        scheduler.Finish();
+    }
+    const SotcStats::ScopedTimer evict_timer{SotcStats::arena_evict_ns};
+    const auto& download = pending.download;
     download.buffer->Invalidate(download.offset, download.size);
 
     std::vector<Backing> released;
     std::array<u8, 4096> guest;
-    for (const Chosen& pick : chosen) {
+    for (const EvictChoice& pick : pending.chosen) {
+        // Bound again, or written by the GPU, after the read-back was recorded: stays.
+        bool keep = false;
+        for (const Backing& range : pick.ranges) {
+            for (u64 block = range.start; block < range.end && !keep; ++block) {
+                keep = static_cast<u16>(use_epoch - block_last_use[block]) < idle_epochs;
+            }
+            const VAddr addr = range.start << block_shift;
+            const u64 size = (range.end - range.start) << block_shift;
+            keep = keep || pinned_ranges.Overlaps(range.start, range.end) ||
+                   memory_tracker->IsRegionGpuModified(addr, size) || [&] {
+                       std::shared_lock gpu_modified_lock{gpu_modified_mutex};
+                       return gpu_modified_ranges.Intersects(addr, size);
+                   }();
+        }
+        if (keep) {
+            continue;
+        }
         bool equal = true;
-        for (const Piece& piece : pick.pieces) {
+        for (const EvictPiece& piece : pick.pieces) {
             for (u64 at = 0; at < piece.size && equal; at += guest.size()) {
                 const VAddr addr = piece.addr + at;
                 if (memory_tracker->IsRegionCpuModified(addr, guest.size())) {
@@ -1972,16 +2008,15 @@ bool BufferCache::MaybeEvictCold(std::chrono::steady_clock::time_point now) {
                                     guest.size()) == 0;
             }
         }
-        const u64 bytes = candidates[pick.key].bytes;
         if (!equal) {
             evict_retry.emplace(pick.key, now + std::chrono::seconds(60));
-            SotcStats::arena_evict_mismatch.fetch_add(bytes, std::memory_order_relaxed);
+            SotcStats::arena_evict_mismatch.fetch_add(pick.bytes, std::memory_order_relaxed);
             continue;
         }
-        const auto& ranges = candidates[pick.key].ranges;
-        released.insert(released.end(), ranges.begin(), ranges.end());
+        released.insert(released.end(), pick.ranges.begin(), pick.ranges.end());
     }
     staging_pool.FreeDeferred(download);
+    pending_eviction.reset();
     // Binds queued by Finish's deferred operations (fault rebinds, arena migration) must not
     // share the unbind's sparse batch; the chosen ranges must still be resident as chosen.
     if (!pending_binds.empty()) {

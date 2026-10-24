@@ -68,6 +68,10 @@ the original repository.
 - [~] T2 so far: `SOTC_FAST_BIND=1` (descriptor reuse, 59% hits) gives +7% in the Shrine (45.3 and 43.9 FPS against
       42.3 and 41.0, 24/10). It stays off: its fix (`mem_epoch`) still needs a check on sandy ground in the open
       world, which the scripted save walk does not reach. Players can try it with `SOTC_FAST_BIND=1`.
+      Moving work to the command processor thread (24/10 profile of the draw thread, Shrine): binding resources is
+      43% of it (textures 19%, buffers 15%) and depends on cache state that only that thread owns; the host
+      page protects it issues cost 1.6 ms per frame (14,800 calls/s, `SOTC_PROTECT_STATS=1`); pure precomputation
+      (user data, sharps, hashes) is a few percent. Not worth the risk of stale textures.
       A split of the draw thread was measured earlier at 6.7% of its time (no-go). The other T2 items are each
       expected to give a few percent, so the Shrine at 60 FPS (+44%) is not in reach by these alone.
 - [ ] T3: every change must pass the rainbow-noise and sand-dot checks before it becomes default
@@ -119,6 +123,10 @@ Os números de issue se referem ao repositório original.
       em chão de areia no mundo aberto, que a caminhada automática do save não alcança. Quem joga pode testar com
       `SOTC_FAST_BIND=1`. Dividir a thread de desenho foi medido antes em 6,7% do tempo dela (inviável). Os outros
       itens do T2 devem dar poucos por cento cada, então o Santuário a 60 FPS (+44%) não vem só deles.
+      Mover trabalho para a thread do processador de comandos (perfil de 24/10 da thread de desenho, Santuário): ligar
+      recursos é 43% dela (texturas 19%, buffers 15%) e depende de estado dos caches que só ela possui; as proteções
+      de página que ela pede custam 1,6 ms por quadro (14.800 chamadas/s, `SOTC_PROTECT_STATS=1`); o pré-cálculo puro
+      (dados de usuário, sharps, hashes) é poucos por cento. Não compensa o risco de texturas velhas.
 - [ ] T3: cada mudança precisa passar pelos testes de ruído colorido e de pontos pretos antes de virar padrão
 - [ ] T4: opções de apresentação a 120 Hz no launcher e no menu do jogo
 - Marcos: M1 demo de atração ≥ 100 FPS · M2 mundo aberto ≥ 90 · M3 Santuário ≥ 60 estável com os padrões

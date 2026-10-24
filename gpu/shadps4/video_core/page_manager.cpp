@@ -14,6 +14,7 @@
 #include <boost/icl/interval_set.hpp>
 #include <mutex>
 #include <shared_mutex>
+#include <array>
 #include <atomic>
 #include "common/alignment.h"
 #include "common/adaptive_mutex.h"
@@ -625,6 +626,13 @@ public:
 };
 #endif // __linux__
 
+// sotc: SOTC_PROTECT_STATS (SignalImpl::NoteProtect): host protect calls per thread.
+struct ProtectSlot {
+    std::atomic<u32> tid{0};
+    std::atomic<u64> calls{0}, pages{0}, ns{0};
+};
+inline std::array<ProtectSlot, 32> protect_slots;
+
 struct SignalImpl : public PageManager::Impl {
     SignalImpl(Vulkan::Rasterizer* rasterizer_) : Impl() {
         rasterizer = rasterizer_;
@@ -643,7 +651,63 @@ struct SignalImpl : public PageManager::Impl {
         Shader::SetSrtCleanLoad(&SrtWalkerCleanLoad);
     }
 
+    /// sotc: SOTC_PROTECT_STATS=1 prints, every 5 s, the host protect calls per thread: count,
+    /// pages and the time they took (which thread pays for the page tracking).
+    static void NoteProtect(size_t size, u64 ns) {
+        const u32 tid = GetCurrentThreadId();
+        for (auto& slot : protect_slots) {
+            u32 expected = 0;
+            if (slot.tid.load(std::memory_order_relaxed) == tid ||
+                slot.tid.compare_exchange_strong(expected, tid) || expected == tid) {
+                slot.calls.fetch_add(1, std::memory_order_relaxed);
+                slot.pages.fetch_add(size >> 12, std::memory_order_relaxed);
+                slot.ns.fetch_add(ns, std::memory_order_relaxed);
+                break;
+            }
+        }
+        static std::atomic<u64> last_print{0};
+        const u64 now = GetTickCount64();
+        u64 last = last_print.load(std::memory_order_relaxed);
+        if (now - last < 5000 || !last_print.compare_exchange_strong(last, now)) {
+            return;
+        }
+        for (auto& slot : protect_slots) {
+            const u64 calls = slot.calls.exchange(0);
+            const u64 pages = slot.pages.exchange(0);
+            const u64 spent = slot.ns.exchange(0);
+            if (!calls) {
+                continue;
+            }
+            wchar_t* name = nullptr;
+            char text[64] = "?";
+            if (HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, slot.tid.load())) {
+                if (SUCCEEDED(GetThreadDescription(h, &name)) && name) {
+                    WideCharToMultiByte(CP_UTF8, 0, name, -1, text, sizeof(text) - 1, nullptr, nullptr);
+                    LocalFree(name);
+                }
+                CloseHandle(h);
+            }
+            std::fprintf(stderr, "SOTC PROTECT %s: %llu calls/s, %llu pages/s, %.1f ms/s\n", text,
+                         static_cast<unsigned long long>(calls / 5),
+                         static_cast<unsigned long long>(pages / 5), spent / 5.0e6);
+        }
+    }
+
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
+        static const bool protect_stats = std::getenv("SOTC_PROTECT_STATS") != nullptr;
+        if (protect_stats) [[unlikely]] {
+            LARGE_INTEGER t0, t1, f;
+            QueryPerformanceCounter(&t0);
+            ProtectImpl(address, size, perms);
+            QueryPerformanceCounter(&t1);
+            QueryPerformanceFrequency(&f);
+            NoteProtect(size, static_cast<u64>((t1.QuadPart - t0.QuadPart) * 1000000000ull / f.QuadPart));
+            return;
+        }
+        ProtectImpl(address, size, perms);
+    }
+
+    void ProtectImpl(VAddr address, size_t size, Core::MemoryPermission perms) {
         RENDERER_TRACE;
         auto* memory = Core::Memory::Instance();
         auto& impl = memory->GetAddressSpace();

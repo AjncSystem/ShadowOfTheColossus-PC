@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <windows.h>
 #include <cstdio>
 #include <cstdlib>
 #include <boost/container/static_vector.hpp>
@@ -769,9 +770,25 @@ void Instance::CreateAllocator() {
         block_size = static_cast<u64>(std::strtoull(env, nullptr, 10)) << 20;
     }
     // sotc: SOTC_CMD_STATS counts device memory allocations (SOTC sys line).
+    // SOTC_VK_ALLOC_TRACE=1 (with SOTC_CMD_STATS): the first allocations after the 3000th, with the
+    // size, memory type and the caller chain (image offsets), to find per-frame allocations.
     static const VmaDeviceMemoryCallbacks memory_callbacks = {
-        .pfnAllocate = [](VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize, void*) {
+        .pfnAllocate = [](VmaAllocator, uint32_t type, VkDeviceMemory, VkDeviceSize size, void*) {
             SotcStats::sys_vk_allocs.fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<u64> seen{0};
+            const u64 n = seen.fetch_add(1, std::memory_order_relaxed);
+            static const bool trace = std::getenv("SOTC_VK_ALLOC_TRACE") != nullptr;
+            if (trace && n >= 3000 && n < 3040) {
+                void* frames[16]{};
+                const u32 count = CaptureStackBackTrace(1, 16, frames, nullptr);
+                std::string where;
+                for (u32 i = 0; i < count; ++i) {
+                    where += fmt::format(" {:#x}", reinterpret_cast<u64>(frames[i]) - reinterpret_cast<u64>(GetModuleHandleW(nullptr)));
+                }
+                std::fprintf(stderr, "SOTC VKALLOC #%llu type %u size %llu KiB:%s\n",
+                             static_cast<unsigned long long>(n), type,
+                             static_cast<unsigned long long>(size >> 10), where.c_str());
+            }
         },
         .pfnFree = [](VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize, void*) {
             SotcStats::sys_vk_frees.fetch_add(1, std::memory_order_relaxed);

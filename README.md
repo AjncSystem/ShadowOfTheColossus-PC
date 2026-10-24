@@ -72,6 +72,9 @@ the original repository.
       43% of it (textures 19%, buffers 15%) and depends on cache state that only that thread owns; the host
       page protects it issues cost 1.6 ms per frame (14,800 calls/s, `SOTC_PROTECT_STATS=1`); pure precomputation
       (user data, sharps, hashes) is a few percent. Not worth the risk of stale textures.
+      Found instead: 4 video memory allocations and 4 frees per frame (the driver wants dedicated memory for
+      images), ~5% of the draw thread. An image pool removes them: Shrine 40.3 to 42.0 FPS (+4%), attract demo
+      71.2 to 75.5 (+6%), same video memory use, `SOTC_IMAGE_POOL=0` turns it off.
       A split of the draw thread was measured earlier at 6.7% of its time (no-go). The other T2 items are each
       expected to give a few percent, so the Shrine at 60 FPS (+44%) is not in reach by these alone.
 - [ ] T3: every change must pass the rainbow-noise and sand-dot checks before it becomes default
@@ -123,6 +126,9 @@ Os números de issue se referem ao repositório original.
       em chão de areia no mundo aberto, que a caminhada automática do save não alcança. Quem joga pode testar com
       `SOTC_FAST_BIND=1`. Dividir a thread de desenho foi medido antes em 6,7% do tempo dela (inviável). Os outros
       itens do T2 devem dar poucos por cento cada, então o Santuário a 60 FPS (+44%) não vem só deles.
+      Achado no lugar: 4 alocações e 4 liberações de memória de vídeo por quadro (o driver quer memória dedicada
+      para imagens), ~5% da thread de desenho. Um pool de imagens as elimina: Santuário 40,3 para 42,0 FPS (+4%),
+      demo de atração 71,2 para 75,5 (+6%), mesmo uso de memória de vídeo, `SOTC_IMAGE_POOL=0` desliga.
       Mover trabalho para a thread do processador de comandos (perfil de 24/10 da thread de desenho, Santuário): ligar
       recursos é 43% dela (texturas 19%, buffers 15%) e depende de estado dos caches que só ela possui; as proteções
       de página que ela pede custam 1,6 ms por quadro (14.800 chamadas/s, `SOTC_PROTECT_STATS=1`); o pré-cálculo puro

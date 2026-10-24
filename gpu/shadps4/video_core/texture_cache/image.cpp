@@ -107,6 +107,53 @@ void UniqueImage::Destroy() {
     }
 }
 
+// sotc: SOTC_IMAGE_POOL=0 turns off the image pool below. The driver (NVIDIA) prefers dedicated memory
+// for images, so VMA called vkAllocateMemory for every image of a few MiB and vkFreeMemory when it
+// died: 4 of each per frame with the Shrine standing still (win32u NtGdiDdDDICreateAllocation /
+// DestroyAllocation, ~5% of the draw thread). A pool with an explicit block size cannot make
+// dedicated allocations: its images are sub-allocated from blocks that stay. An image the pool cannot
+// hold (larger than a block, another memory type, no memory) takes the old path.
+static VmaPool ImagePool(VmaAllocator allocator) {
+    static const VmaPool pool = [allocator]() -> VmaPool {
+        const char* v = std::getenv("SOTC_IMAGE_POOL");
+        if (v && v[0] == '0') {
+            return VK_NULL_HANDLE;
+        }
+        VkImageCreateInfo sample = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = VK_FORMAT_R8G8B8A8_UNORM,
+            .extent = {64, 64, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                     VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        };
+        const VmaAllocationCreateInfo sample_ci = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        uint32_t type_index = 0;
+        if (vmaFindMemoryTypeIndexForImageInfo(allocator, &sample, &sample_ci, &type_index) !=
+            VK_SUCCESS) {
+            return VK_NULL_HANDLE;
+        }
+        const VmaPoolCreateInfo pool_ci = {
+            .memoryTypeIndex = type_index,
+            .blockSize = 64ull << 20,
+            .minBlockCount = 0,
+            .maxBlockCount = 0,
+        };
+        VmaPool created = VK_NULL_HANDLE;
+        if (vmaCreatePool(allocator, &pool_ci, &created) != VK_SUCCESS) {
+            return VK_NULL_HANDLE;
+        }
+        return created;
+    }();
+    return pool;
+}
+
 void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     this->image_ci = image_ci;
     ASSERT(!image);
@@ -123,8 +170,17 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     VkImage unsafe_image{};
     VmaAllocationInfo alloc_info{};
     const SotcStats::ScopedTimer alloc_timer{SotcStats::image_alloc_ns};
-    VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
-                                     &allocation, &alloc_info);
+    VkResult result = VK_ERROR_FEATURE_NOT_PRESENT;
+    if (const VmaPool pool = ImagePool(allocator)) {
+        VmaAllocationCreateInfo pool_alloc_ci = alloc_ci;
+        pool_alloc_ci.pool = pool;
+        result = vmaCreateImage(allocator, &image_ci_unsafe, &pool_alloc_ci, &unsafe_image,
+                                &allocation, &alloc_info);
+    }
+    if (result != VK_SUCCESS) {
+        result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image, &allocation,
+                                &alloc_info);
+    }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
         // Over the video memory budget (loading screens peak before the cache collects old
         // images). Going over budget lets the driver page memory out instead of aborting.

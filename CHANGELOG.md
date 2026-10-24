@@ -1,6 +1,13 @@
 # Changelog
 
 ## Não lançado
+- **Imagens sem alocação de memória de vídeo por quadro (+4% no Santuário, +6% na demo).** O driver
+  da NVIDIA pede memória dedicada para imagens, então a cada imagem criada o port chamava
+  `vkAllocateMemory` e, quando ela morria, `vkFreeMemory`: 4 de cada por quadro com a cena parada, uns
+  5% do tempo da thread de desenho no Windows. Agora as imagens saem de um pool de blocos de 64 MiB que
+  não permite alocação dedicada (as maiores que um bloco seguem o caminho antigo). Santuário 40,3 →
+  42,0 FPS, demo de atração 71,2 → 75,5; o uso de memória de vídeo ficou igual. `SOTC_IMAGE_POOL=0`
+  desliga. Diagnóstico novo: `SOTC_VK_ALLOC_TRACE=1` (com `SOTC_CMD_STATS=1`) mostra quem aloca.
 - **Upscaler FSR 3.1 (temporal), desligado por padrão.** O jogo renderiza abaixo da saída (720p, 576p...)
   e o FSR 3.1 da AMD (qualquer placa com Vulkan 1.3) reconstrói a imagem com a profundidade, os vetores
   de movimento, o jitter e a câmera do próprio jogo, as mesmas entradas da geração de quadros. No

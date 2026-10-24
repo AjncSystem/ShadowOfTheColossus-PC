@@ -1192,10 +1192,18 @@ class Launcher:
         self.row(f, _('Qualidade do FSR 3.1', 'FSR 3.1 quality'), self.choice(f, 'render_preset', RENDER_PRESETS),
                  _('Só com o upscaler FSR 3.1: o jogo renderiza num tamanho menor que a saída e o FSR 3.1 o '
                    'amplia, o que dá mais FPS onde a placa de vídeo é o limite (saída 1440p/4K). Exige reiniciar o jogo. '
-                   'Desliga o modo PS4 Pro. A interface também passa pelo upscaler.',
+                   'Desliga o modo PS4 Pro. A interface também passa pelo upscaler.\n'
+                   'Quando o limite é o processador, renderizar menor quase não muda o FPS: no Santuário '
+                   '(saída 4K, placa de vídeo folgada) 1080p deu 39 FPS e 720p deu 47 a 50, e ali o gargalo é o '
+                   'processador (cerca de 5.800 desenhos por quadro). Nesse caso a vantagem do FSR 3.1 é a '
+                   'imagem mais limpa, não o FPS.',
                    'Only with the FSR 3.1 upscaler: the game renders below the output size and FSR 3.1 enlarges '
                    'it, giving more FPS where the graphics card is the limit (1440p/4K output). Restart the game '
-                   'to apply. Turns PS4 Pro mode off. The interface goes through the upscaler too.'))
+                   'to apply. Turns PS4 Pro mode off. The interface goes through the upscaler too.\n'
+                   'When the processor is the limit, rendering smaller barely changes the FPS: in the Shrine '
+                   '(4K output, graphics card with room to spare) 1080p gave 39 FPS and 720p gave 47 to 50, and '
+                   'there the bottleneck is the processor (about 5,800 draws per frame). Then the advantage of '
+                   'FSR 3.1 is a cleaner image, not FPS.'))
         self.row(f, _('Nitidez (RCAS)', 'Sharpening (RCAS)'), self.choice(f, 'sharpness', SHARPNESS))
         self.section(f, _('Modo PS4 Pro', 'PS4 Pro mode'))
         self.check(f, 'neo', _('Apresentar-se como PS4 Pro', 'Present as a PS4 Pro'),

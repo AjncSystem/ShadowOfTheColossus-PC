@@ -1,6 +1,22 @@
 # Changelog
 
-## Não lançado — versão americana (CUSA08034)
+## 0.60.6-opt11 — 2026-10-24 (fork do Oussama268)
+- **+25% de FPS no Santuário e quadros mais estáveis:** as leituras antecipadas da GPU
+  ("hot readbacks", da fusão de 8/10) voltam ligadas por padrão (`SOTC_RB_HOT=1`; `=0` desliga).
+  Antes de escrever, cada página é conferida sob a trava da sua região: se o jogo já escreveu
+  nela, a cópia é pulada. Era a corrida que deixava o arco-íris nas texturas na 0.60.5.
+  Santuário 34,6 → 43,3 FPS, demonstração da tela título 54 → 60,7.
+- Descritores reaproveitados ligados por padrão (`SOTC_FAST_BIND`, `=0` desliga).
+- Correções do tabnul: grama, HDR, menu do DLSS, pular os logos (#91, #92, #94, #96).
+- Lançador: aviso de pouca memória (#95).
+- Do upstream #258 (JihedMrouki): o cache de shaders confere se o arquivo existe, dica de
+  trabalho na fila do Liverpool, posição invariante nos shaders de vértice (GTX 10xx).
+  **O cache de shaders é refeito na primeira abertura.**
+- Diagnóstico: `SOTC_PROFILE_SLOW_MS=<ms>` só guarda amostras dos quadros mais longos que isso.
+- A travada ao cavalgar continua: nos quadros lentos as threads do jogo esperam umas pelas
+  outras (mutex e event flags do próprio jogo) e há cópias de ~200 MB nas trocas de cena.
+
+### Versão americana (CUSA08034)
 - **O dump americano CUSA08034 (1.00, a única versão americana) funciona.** O executável é o
   mesmo da versão europeia 1.01 (código e dados idênticos byte a byte; os arquivos `.psarc`
   também), então todas as correções, os modos de patch (60 FPS, filtro 16x, tamanho de

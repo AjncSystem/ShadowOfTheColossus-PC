@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-or-later
-"""sotc: game modes and engine settings for Shadow of the Colossus EU 1.01 (CUSA08809).
+"""sotc: game modes and engine settings for Shadow of the Colossus EU 1.01 (CUSA08809) and US 1.00
+(CUSA08034), the same eboot build.
 
     python scripts/sotc_modes.py GAME --out out --modes af16,fps60 --cvars "r_motionBlurEnable=0 ..."
 
@@ -24,8 +25,12 @@ import argparse
 import re
 from pathlib import Path
 import struct
-from prepare import parse_self
+from prepare import parse_self, sfo
 
+# The supported releases: title ID -> (region, version shown). The EU 1.01 update has no eboot
+# (only Arabic text), so both run the same eboot, byte for byte in code and data.
+GAMES = {'CUSA08809': ('EU', '01.01'), 'CUSA08034': ('US', '01.00')}
+SUPPORTED = 'EU 1.01 / US 1.00'
 BASE = 0x400000
 # The lea that loads the string the game appends to its command line ("+VSyncWindow=10%").
 CMDLINE_LEA = 0x009367b9
@@ -95,7 +100,7 @@ RENDER_SITES = [
     (0x0166633c, 'a', '398ee33f'),
 ]
 RT_POOL = 0x14280000
-# EU 1.01: the command line lea and the fps60 site.
+# EU 1.01 / US 1.00: the command line lea and the fps60 site.
 VERSION_CHECKS = [(CMDLINE_LEA, bytes.fromhex('488d352debad00')), (0x01390090, bytes.fromhex('ff25a20567'))]
 CVAR = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*(=[-+.0-9A-Za-z_%]+)?$')  # NAME=VALUE or a flag such as nointro
 
@@ -105,6 +110,29 @@ def image_bytes(elf, ph, vaddr, length):
         if p['type'] in (1, 0x61000010) and p['vaddr'] <= vaddr and vaddr + length <= p['vaddr'] + p['filesz']:
             offset = p['offset'] + vaddr - p['vaddr']
             return bytes(elf[offset:offset + length])
+    return None
+
+
+def title_id(game):
+    """TITLE_ID of the game folder's sce_sys/param.sfo, '' without one."""
+    try:
+        return str(sfo((Path(game) / 'sce_sys' / 'param.sfo').read_bytes()).get('TITLE_ID', ''))
+    except (OSError, ValueError):
+        return ''
+
+
+def game_serial(game):
+    """The supported title ID of a game folder; CUSA08809 (EU) when it can't be read."""
+    serial = title_id(game)
+    return serial if serial in GAMES else next(iter(GAMES))
+
+
+def save_template(root, serial):
+    """The save folder of the game serial in root (<root>/<serial>), else the other release's
+    (EU and US run the same build, so their saves are expected to load in either); None."""
+    for candidate in (serial, *GAMES):
+        if (Path(root) / candidate).is_dir():
+            return Path(root) / candidate
     return None
 
 
@@ -154,7 +182,7 @@ def main():
         if mode not in MODES and mode not in CVAR_MODES:
             raise SystemExit(f'unknown mode {mode!r} (known: {", ".join([*MODES, *CVAR_MODES])})')
         if not supported:
-            print(f'Mode {mode}: this eboot is not EU 1.01, not applied')
+            print(f'Mode {mode}: this eboot is not {SUPPORTED}, not applied')
             continue
         writes += [(address - BASE, data) for address, _, data in MODES.get(mode, [])]
         cvars += CVAR_MODES.get(mode, [])
@@ -164,7 +192,7 @@ def main():
             writes += render_patches(elf, ph, args.render)
             print(f'Render size {args.render}: on')
         else:
-            print(f'Render size {args.render}: this eboot is not EU 1.01, not applied')
+            print(f'Render size {args.render}: this eboot is not {SUPPORTED}, not applied')
     for item in args.cvars.split():
         item = item.lstrip('+')
         if not CVAR.match(item):

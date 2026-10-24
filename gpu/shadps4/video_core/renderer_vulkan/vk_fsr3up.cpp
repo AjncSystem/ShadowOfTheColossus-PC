@@ -261,7 +261,7 @@ void Init(const Instance& instance) {
         log_level = std::atoi(l);
     }
     const char* v = std::getenv("SOTC_UPSCALER");
-    wanted = v && (_stricmp(v, "fsr3") == 0 || _stricmp(v, "fsr") == 0);
+    wanted = v && (_stricmp(v, "fsr3") == 0 || _stricmp(v, "fsr") == 0 || _stricmp(v, "dlss") == 0);
     // The depth conversion pipeline of the frame generation does the depth for both.
     supported = wanted && FsrFg::Supported() &&
                 (instance.GetPhysicalDevice().getFormatProperties(kColorFormat).optimalTilingFeatures &
@@ -354,6 +354,7 @@ vk::ImageView Dispatch(vk::CommandBuffer cmdbuf, Scheduler& scheduler, u32 frame
     }
     Retire(false);
     OwnedImage& out = outputs[frame_id];
+    const bool dlss = Dlssg::SuperResReady();
     if (out.width != out_width || out.height != out_height) {
         DestroyImage(out);
         if (!CreateImage(out, kColorFormat, out_width, out_height) ||
@@ -405,6 +406,21 @@ vk::ImageView Dispatch(vk::CommandBuffer cmdbuf, Scheduler& scheduler, u32 frame
         .pImageMemoryBarriers = pre.data(),
     });
 
+    if (dlss) {
+        // sotc: DLSS Super Resolution (Streamline) instead of FSR 3.1 when asked and available.
+        if (Dlssg::SuperResEvaluate(cmdbuf, frame_id, color.image, color.view, kColorFormat, width, height,
+                                    out.image, out.view, kColorFormat, out_width, out_height)) {
+            const auto to_sample_dlss = Barrier(
+                out.image, vk::PipelineStageFlagBits2::eAllCommands,
+                vk::AccessFlagBits2::eMemoryWrite, vk::ImageLayout::eGeneral,
+                vk::PipelineStageFlagBits2::eFragmentShader | vk::PipelineStageFlagBits2::eComputeShader,
+                vk::AccessFlagBits2::eShaderRead, vk::ImageLayout::eShaderReadOnlyOptimal);
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
+                                                       .pImageMemoryBarriers = &to_sample_dlss});
+            return color_swapped[frame_id] && out.swapped_view ? out.swapped_view : out.view;
+        }
+        return {};
+    }
     // The frame's colour (fp16, ShaderReadOnlyOptimal), depth (R32F, General) and motion vectors
     // (R16G16F, ShaderReadOnlyOptimal), imported for this dispatch and released once the GPU is done.
     FfxVkFsr3_3_1_5Resource color_res{}, depth_res{}, mvec_res{};

@@ -193,7 +193,9 @@ the original repository.
 - [x] Phase 2: FSR 3.1 temporal upscaler, off by default (`SOTC_UPSCALER=fsr3`, with `SOTC_RENDER_RES` below 1080p and
       `SOTC_OUTPUT_RES`; 23/10: Shrine 720p to 4K, clean image, ~48 FPS like FSR 1; HUD still goes through it)
 - [x] Phase 3: launcher option (upscaler FSR 3.1 + quality preset) and the in-game F1 menu switch
-- [ ] Phase 4: DLSS Super Resolution through Streamline, NVIDIA only (blocked: needs sl.dlss.dll and nvngx_dlss.dll, not in the repository; untested code is not shipped)
+- [~] Phase 4: DLSS Super Resolution through Streamline, NVIDIA only (`SOTC_UPSCALER=dlss`): code in place and
+      falls back to FSR 3.1 without the DLLs (checked 23/10); NOT tested with the real `sl.dlss.dll` and
+      `nvngx_dlss.dll`, which are not in the repository and must be put next to bb-probe.exe
 - [x] Phase 5: documentation (CHANGELOG, this roadmap)
 
 **Part 2: up to 120 FPS in game, without frame generation**
@@ -230,7 +232,9 @@ Os números de issue se referem ao repositório original.
 - [x] Fase 2: upscaler temporal FSR 3.1, desligado por padrão (`SOTC_UPSCALER=fsr3`, com `SOTC_RENDER_RES` abaixo de 1080p e
       `SOTC_OUTPUT_RES`; 23/10: Santuário 720p para 4K, imagem limpa, ~48 FPS como o FSR 1; a interface também passa por ele)
 - [x] Fase 3: opção no launcher (upscaler FSR 3.1 + preset de qualidade) e a troca no menu F1 do jogo
-- [ ] Fase 4: DLSS Super Resolution via Streamline, só NVIDIA (bloqueada: faltam sl.dlss.dll e nvngx_dlss.dll, que não ficam no repositório; código sem teste não é publicado)
+- [~] Fase 4: DLSS Super Resolution via Streamline, só NVIDIA (`SOTC_UPSCALER=dlss`): código pronto, cai no FSR 3.1
+      sem as DLLs (verificado em 23/10); NÃO testado com as `sl.dlss.dll` e `nvngx_dlss.dll` de verdade, que não
+      ficam no repositório e precisam estar ao lado do bb-probe.exe
 - [x] Fase 5: documentação (CHANGELOG, este roteiro)
 
 **Parte 2: até 120 FPS no jogo, sem geração de quadros**

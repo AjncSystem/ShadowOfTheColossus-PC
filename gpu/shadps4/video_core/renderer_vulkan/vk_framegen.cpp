@@ -81,8 +81,11 @@ std::atomic<bool> have_dlss{false}, have_fsr{false};
 } // namespace
 
 bool WantStreamline() {
+    // sotc: DLSS Super Resolution (SOTC_UPSCALER=dlss) goes through Streamline too.
+    const char* upscaler = std::getenv("SOTC_UPSCALER");
+    const bool super_res = upscaler && _stricmp(upscaler, "dlss") == 0;
     // With fsr too, so that F8 can still switch to DLSS-G.
-    if (AskedMode() == Asked::Off) {
+    if (AskedMode() == Asked::Off && !super_res) {
         return false;
     }
     if (!HasNvidiaGpu()) {

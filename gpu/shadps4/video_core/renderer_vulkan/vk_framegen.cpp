@@ -83,7 +83,10 @@ std::atomic<bool> have_dlss{false}, have_fsr{false};
 bool WantStreamline() {
     // sotc: DLSS Super Resolution (SOTC_UPSCALER=dlss) goes through Streamline too.
     const char* upscaler = std::getenv("SOTC_UPSCALER");
-    const bool super_res = upscaler && _stricmp(upscaler, "dlss") == 0;
+    // SOTC_STREAMLINE_FORCE=1: load Streamline whatever the upscaler (diagnostic: what its Vulkan
+    // interposer costs by itself, against FSR 3.1 without it).
+    const bool super_res = (upscaler && _stricmp(upscaler, "dlss") == 0) ||
+                           std::getenv("SOTC_STREAMLINE_FORCE") != nullptr;
     // With fsr too, so that F8 can still switch to DLSS-G.
     if (AskedMode() == Asked::Off && !super_res) {
         return false;

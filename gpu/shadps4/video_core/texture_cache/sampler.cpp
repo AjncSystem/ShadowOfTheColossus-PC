@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_fsr3up.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/texture_cache/sampler.h"
 
@@ -51,7 +52,10 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
         .addressModeU = LiverpoolToVK::ClampMode(sampler.clamp_x),
         .addressModeV = LiverpoolToVK::ClampMode(sampler.clamp_y),
         .addressModeW = LiverpoolToVK::ClampMode(sampler.clamp_z),
-        .mipLodBias = std::min(sampler.LodBias(), instance.MaxSamplerLodBias()),
+        // sotc: with the FSR 3.1 / DLSS upscaler on, the textures are sampled finer to keep the
+        // detail of the output size (a compare sampler of a depth map is left alone).
+        .mipLodBias = std::clamp(sampler.LodBias() + (is_depth ? 0.0f : Vulkan::Fsr3Up::MipBias()),
+                                 -instance.MaxSamplerLodBias(), instance.MaxSamplerLodBias()),
         .anisotropyEnable = anisotropy_enable,
         .maxAnisotropy = max_anisotropy,
         // GCN compares per instruction; a plain read of a compare sampler is undefined in Vulkan.

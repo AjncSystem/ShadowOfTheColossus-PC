@@ -870,6 +870,18 @@ bool SuperResEvaluate(vk::CommandBuffer cmdbuf, u32 frame_id, vk::Image color, v
                                    : sl::DLSSMode::eUltraPerformance;
     options.outputWidth = out_width;
     options.outputHeight = out_height;
+    // DLSS 4.5 (second generation transformer model, nvngx_dlss.dll 310.5 and later): preset M in
+    // every mode but Ultra Performance, which has its own (L). SOTC_DLSS_PRESET=k is the DLSS 4
+    // model (K) for DLAA, Quality and Balanced, and what the SDK picks for the other two.
+    static const bool dlss4 = [] {
+        const char* v = std::getenv("SOTC_DLSS_PRESET");
+        return v && (v[0] == 'k' || v[0] == 'K');
+    }();
+    options.dlaaPreset = dlss4 ? sl::DLSSPreset::ePresetK : sl::DLSSPreset::ePresetM;
+    options.qualityPreset = dlss4 ? sl::DLSSPreset::ePresetK : sl::DLSSPreset::ePresetM;
+    options.balancedPreset = dlss4 ? sl::DLSSPreset::ePresetK : sl::DLSSPreset::ePresetM;
+    options.performancePreset = sl::DLSSPreset::ePresetM;
+    options.ultraPerformancePreset = sl::DLSSPreset::ePresetL;
     options.preExposure = 1.0f;
     options.colorBuffersHDR = sl::Boolean::eFalse; // the frame is display referred, not HDR
     options.useAutoExposure = sl::Boolean::eTrue;

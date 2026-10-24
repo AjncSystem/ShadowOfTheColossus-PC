@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
@@ -277,6 +278,35 @@ bool Wanted() {
 
 bool AskedAtStart() {
     return wanted;
+}
+
+float MipBias() {
+    static const float bias = [] {
+        if (const char* v = std::getenv("SOTC_MIP_BIAS")) {
+            return static_cast<float>(std::atof(v));
+        }
+        if (!supported) {
+            return 0.0f;
+        }
+        // The game's render size (1080p unless SOTC_RENDER_RES) against the output size.
+        unsigned render_w = 1920, render_h = 1080, out_w = 0, out_h = 0;
+        if (const char* v = std::getenv("SOTC_RENDER_RES")) {
+            std::sscanf(v, "%ux%u", &render_w, &render_h);
+        }
+        if (const char* v = std::getenv("SOTC_OUTPUT_RES")) {
+            std::sscanf(v, "%ux%u", &out_w, &out_h);
+        }
+        if (render_w == 0 || out_w == 0) {
+            return 0.0f;
+        }
+        const float value = std::log2(static_cast<float>(render_w) / static_cast<float>(out_w)) - 1.0f;
+        if (log_level > 0) {
+            std::fprintf(stderr, "SOTC FSR3 upscaler: texture LOD bias %.2f (render %ux%u, output %ux%u)\n",
+                         value, render_w, render_h, out_w, out_h);
+        }
+        return value;
+    }();
+    return bias;
 }
 
 void Prepare(vk::CommandBuffer cmdbuf, u32 frame_id, vk::Image game_image, u32 width, u32 height,

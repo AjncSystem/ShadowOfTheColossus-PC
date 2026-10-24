@@ -20,6 +20,12 @@ void runtime_content_configure(const uint32_t values[5]) {
     }
     memcpy(parameters,values,sizeof(parameters)); configured=1;
 }
+/* sotc: the running game's TITLE_ID (CUSA08809 EU, CUSA08034 US): only add-on content of that
+ * title (the same region) is listed. */
+static char title_id[16]="CUSA08809";
+void runtime_content_title(const char *id) {
+    if (id && *id) snprintf(title_id,sizeof title_id,"%s",id);
+}
 static void require_provider(void) {
     if (!configured) { fputs("STOP: AppContent needs --content-profile\n",stderr); exit(21); }
 }
@@ -77,8 +83,8 @@ static ABI int32_t param_int(uint32_t id,int32_t *out) {
 }
 /* sotc: installed add-on content (DLC) from SOTC_DLC_DIR, as shadPS4 does: the folder (or its
  * <TITLE_ID> subfolder) holds one folder per add-on with sce_sys/param.sfo, CATEGORY "ac..." and a
- * CONTENT_ID "UPXXXX-CUSAXXXXX_XX-<entitlement label>". The game only lists them (entitlements);
- * nothing is mounted. */
+ * CONTENT_ID "UPXXXX-CUSAXXXXX_XX-<entitlement label>" of the running title (title_id). The game
+ * only lists them (entitlements); nothing is mounted. */
 #define MAX_ADDONS 64
 typedef struct { char label[17]; char padding[3]; uint32_t status; } AddonInfo; /* 24 bytes */
 static AddonInfo addons[MAX_ADDONS];
@@ -114,7 +120,7 @@ static void scan_addons(void) {
     const char *root=getenv("SOTC_DLC_DIR");
     if (!root || !*root) return;
     static char base[1024], pattern[1100];
-    snprintf(base,sizeof base,"%s\\CUSA08809",root);
+    snprintf(base,sizeof base,"%s\\%s",root,title_id);
     if (GetFileAttributesA(base)==INVALID_FILE_ATTRIBUTES) snprintf(base,sizeof base,"%s",root);
     snprintf(pattern,sizeof pattern,"%s\\*",base);
     static WIN32_FIND_DATAA entry;
@@ -137,7 +143,7 @@ static void scan_addons(void) {
             memcpy(content,header+0x40,36); content[36]=0;
             const uint32_t type=(uint32_t)header[0x74]<<24|header[0x75]<<16|header[0x76]<<8|header[0x77];
             if (got<sizeof header || memcmp(header,"\x7f" "CNT",4) || type!=0x1b ||
-                !strstr(content,"CUSA08809") || strlen(content)<=20 || addon_count==MAX_ADDONS ||
+                !strstr(content,title_id) || strlen(content)<=20 || addon_count==MAX_ADDONS ||
                 addon_known(content)) continue;
             AddonInfo *info=&addons[addon_count++];
             memset(info,0,sizeof *info);
@@ -157,6 +163,10 @@ static void scan_addons(void) {
         const char *content=sfo_string(data,size,"CONTENT_ID");
         if (!category || strncmp(category,"ac",2) || !content || strlen(content)<=20) {
             printf("Runtime: DLC %s skipped (not add-on content)\n",entry.cFileName);
+            continue;
+        }
+        if (!strstr(content,title_id)) {
+            printf("Runtime: DLC %s skipped (%s is not of %s)\n",entry.cFileName,content,title_id);
             continue;
         }
         if (addon_count==MAX_ADDONS) break;

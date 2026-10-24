@@ -878,28 +878,18 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
             // sotc: hot data is applied only to pages the guest has not written since the
             // gather: a write fault during the GPU wait (the range was still GPU-modified, or
             // its page left writable by the fault grace) set the CPU bit, and the guest's bytes
-            // are the right ones. Checked again here, page by page, right before the copy.
+            // are the right ones. Checked again here, page by page, and written under the page's
+            // region lock, so a write fault in between waits instead of being overwritten (the
+            // game's resource loader crashed asking for 59 GiB once, 24 Oct: a size it had just
+            // read from a file, replaced by stale GPU bytes).
             const auto write_pages = [&](VAddr start, u64 size, auto&& write) {
                 if (!item.hot) {
                     write(start, size);
                     return;
                 }
-                VAddr run = start;
-                const VAddr end = start + size;
-                for (VAddr page = start; page < end;) {
-                    const VAddr next = std::min(Common::AlignDown(page, 4_KB) + 4_KB, end);
-                    if (memory_tracker->IsRegionCpuModified(page, next - page)) {
-                        if (page > run) {
-                            write(run, page - run);
-                        }
-                        run = next;
-                        SotcStats::rb_hot_late_skipped.fetch_add(next - page,
-                                                                 std::memory_order_relaxed);
-                    }
-                    page = next;
-                }
-                if (end > run) {
-                    write(run, end - run);
+                const u64 skipped = memory_tracker->WriteUnlessCpuModified(start, size, write);
+                if (skipped) {
+                    SotcStats::rb_hot_late_skipped.fetch_add(skipped, std::memory_order_relaxed);
                 }
             };
             write_pages(dst_addr, copy.size, [&](VAddr part_addr, u64 part_size) {

@@ -9,8 +9,10 @@
 
 #include <functional>
 #include <map>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace Storage {
@@ -51,6 +53,12 @@ public:
 private:
     void Prefetch();
     bool TakePrefetched(const std::filesystem::path& path, std::vector<u8>& data);
+    /// sotc: after FinishPreload, Load of a file this never saw at Prefetch or Save time returns
+    /// nothing without touching the disk: every new shader's collision check opened a missing
+    /// file on the command processor, ~28 ms each on Windows. Built from the same directory
+    /// listing Prefetch already does, kept current by Save/Clear.
+    bool MayExist(const std::filesystem::path& path);
+    void AddKnown(const std::filesystem::path& path);
 
     std::jthread io_worker{};
     std::filesystem::path cache_path{};
@@ -59,6 +67,9 @@ private:
     /// name; ordered like an NTFS directory listing. Emptied by FinishPreload.
     std::map<std::string, std::vector<u8>> prefetched{};
     bool prefetch_active{};
+    std::unordered_set<std::string> known_files{};
+    std::mutex known_mutex{};
+    bool known_valid{};
 };
 
 } // namespace Storage

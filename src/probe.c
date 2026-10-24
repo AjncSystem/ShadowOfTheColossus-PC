@@ -453,7 +453,9 @@ static DWORD WINAPI hang_watchdog(void *unused) {
 /* sotc: SOTC_PROFILE=<thread name part>: samples that thread every ~1 ms (SuspendThread +
  * GetThreadContext) from SOTC_PROFILE_DELAY (default 20) s for SOTC_PROFILE_SECONDS (default 15)
  * s, then prints the hottest instructions (leaf) and the hottest frames anywhere on the
- * frame-pointer chain (inclusive). exe offsets: llvm-symbolizer on out/gpu/bb-probe.exe. */
+ * frame-pointer chain (inclusive). exe offsets: llvm-symbolizer on out/gpu/bb-probe.exe.
+ * SOTC_PROFILE_SLOW_MS=<ms>: only the samples of frames (flip to flip) longer than that count;
+ * the samples of each frame wait until its flip decides (what a stutter frame spends time on). */
 #define PROFILE_SLOTS 65536
 typedef struct { uintptr_t address; unsigned leaf, inclusive; } ProfileSlot;
 static ProfileSlot *profile_slots;
@@ -475,6 +477,30 @@ static void profile_pair(uintptr_t exe, uintptr_t leaf, uintptr_t caller) {
         if (!p->count) { p->leaf=leaf; p->caller=caller; }
         if (p->leaf==leaf && p->caller==caller) { ++p->count; return; }
     }
+}
+/* SOTC_PROFILE_SLOW_MS: the current frame's samples, kept until its flip. */
+typedef struct { uintptr_t address, caller; int kind; } ProfilePending; /* 1 leaf, 0 caller, 2 pair */
+#define PROFILE_PENDING 262144
+static ProfilePending *profile_pending;
+static size_t profile_pending_count;
+static int profile_slow_ms;
+static void profile_note(uintptr_t address, int leaf) {
+    if (!profile_slow_ms) { profile_add(address,leaf); return; }
+    if (profile_pending_count<PROFILE_PENDING)
+        profile_pending[profile_pending_count++]=(ProfilePending){address,0,leaf};
+}
+static void profile_note_pair(uintptr_t exe, uintptr_t leaf, uintptr_t caller) {
+    if (!profile_slow_ms) { profile_pair(exe,leaf,caller); return; }
+    if (profile_pending_count<PROFILE_PENDING)
+        profile_pending[profile_pending_count++]=(ProfilePending){leaf,caller,2};
+}
+static void profile_settle(int keep) {
+    for (size_t i=0; keep && i<profile_pending_count; ++i) {
+        const ProfilePending *p=&profile_pending[i];
+        if (p->kind==2) profile_pair(0,p->address,p->caller);
+        else profile_add(p->address,p->kind);
+    }
+    profile_pending_count=0;
 }
 static int profile_by_pair(const void *a, const void *b) {
     return (int)((const ProfilePair *)b)->count-(int)((const ProfilePair *)a)->count;
@@ -509,16 +535,27 @@ static DWORD WINAPI profiler(void *name) {
     if (!target) { fprintf(stderr,"SOTC profile: no thread named like %s\n",(const char *)name); return 0; }
     HANDLE thread=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT|THREAD_QUERY_INFORMATION,FALSE,target);
     profile_slots=calloc(PROFILE_SLOTS,sizeof(*profile_slots));
-    if (!thread || !profile_slots) return 0;
+    if (getenv("SOTC_PROFILE_SLOW_MS")) profile_slow_ms=atoi(getenv("SOTC_PROFILE_SLOW_MS"));
+    if (profile_slow_ms) profile_pending=calloc(PROFILE_PENDING,sizeof(*profile_pending));
+    if (!thread || !profile_slots || (profile_slow_ms && !profile_pending)) return 0;
     const ULONGLONG end=GetTickCount64()+(ULONGLONG)(seconds ? atoi(seconds) : 15)*1000;
-    unsigned samples=0;
+    unsigned samples=0, frame_samples=0, slow_frames=0;
+    uint64_t frame_flips=bbgpu_flip_count();
+    ULONGLONG frame_start=GetTickCount64();
     timeBeginPeriod(1);
     while (GetTickCount64()<end) {
+        if (profile_slow_ms && bbgpu_flip_count()!=frame_flips) {
+            const ULONGLONG now=GetTickCount64();
+            const int slow=now-frame_start>=(ULONGLONG)profile_slow_ms;
+            profile_settle(slow);
+            if (slow) { samples+=frame_samples; ++slow_frames; }
+            frame_samples=0; frame_flips=bbgpu_flip_count(); frame_start=now;
+        }
         if (SuspendThread(thread)!=(DWORD)-1) {
             CONTEXT c={.ContextFlags=CONTEXT_CONTROL|CONTEXT_INTEGER};
             if (GetThreadContext(thread,&c)) {
-                ++samples;
-                profile_add((uintptr_t)c.Rip,1);
+                if (profile_slow_ms) ++frame_samples; else ++samples;
+                profile_note((uintptr_t)c.Rip,1);
                 const uintptr_t leaf=(uintptr_t)c.Rip;
                 int first_own=1;
                 /* sotc: RtlVirtualUnwind on a snapshot taken mid-prologue can read a garbage
@@ -542,13 +579,13 @@ static DWORD WINAPI profiler(void *name) {
                         c.Rip=ret; c.Rsp+=8;
                     }
                     if (!c.Rip) break;
-                    profile_add((uintptr_t)c.Rip,0);
+                    profile_note((uintptr_t)c.Rip,0);
                     /* The first frame in the loader/GPU library that leads to a system leaf:
                      * who waits, locks or calls the driver. */
                     if (first_own && (uintptr_t)c.Rip-(uintptr_t)GetModuleHandleA(NULL)<0x4000000 &&
                         leaf-(uintptr_t)GetModuleHandleA(NULL)>=0x4000000) {
                         first_own=0;
-                        profile_pair((uintptr_t)GetModuleHandleA(NULL),leaf,(uintptr_t)c.Rip);
+                        profile_note_pair((uintptr_t)GetModuleHandleA(NULL),leaf,(uintptr_t)c.Rip);
                     }
                 }
                 runtime_fault_recover=NULL;
@@ -560,6 +597,8 @@ static DWORD WINAPI profiler(void *name) {
     timeEndPeriod(1);
     char where[MAX_PATH+64];
     fprintf(stderr,"SOTC profile of %s: %u samples\n",(const char *)name,samples);
+    if (profile_slow_ms) fprintf(stderr,"SOTC profile: %u frames over %d ms\n",slow_frames,profile_slow_ms);
+    if (!samples) return 0;
     /* SOTC_PROFILE_OUT=<file>: every sampled address (module offset, leaf, inclusive), for
      * per-function totals offline (tools/profile_sym.py --functions). */
     if (getenv("SOTC_PROFILE_OUT")) {
@@ -722,12 +761,12 @@ static int helper_single_step(EXCEPTION_POINTERS *info) {
     info->ContextRecord->EFlags&=~(DWORD)0x100;
     return 1;
 }
-/* sotc: the BPE heap of Shadow of the Colossus (EU 1.01). GPU writes of dispatches on stale
- * descriptors land in freed heap blocks and readbacks then overwrite the allocator's metadata
- * (access violations in eboot+0x48xxx/0x49xxx). The GPU side keeps that metadata
- * (video_core/buffer_cache/bpe_heap_guard.cpp, from Pink-shadPS4) but needs the heap object: a
- * breakpoint on the heap's free function (eboot+0x495e0) records its first argument for the
- * first calls, then is removed. SOTC_HEAP_GUARD=0 leaves it off. */
+/* sotc: the BPE heap of Shadow of the Colossus (EU 1.01 / US 1.00, the same eboot). GPU writes
+ * of dispatches on stale descriptors land in freed heap blocks and readbacks then overwrite the
+ * allocator's metadata (access violations in eboot+0x48xxx/0x49xxx). The GPU side keeps that
+ * metadata (video_core/buffer_cache/bpe_heap_guard.cpp, from Pink-shadPS4) but needs the heap
+ * object: a breakpoint on the heap's free function (eboot+0x495e0) records its first argument for
+ * the first calls, then is removed. SOTC_HEAP_GUARD=0 leaves it off. */
 #define HEAP_FREE_OFFSET 0x495e0
 const unsigned char *runtime_memory_backing_pointer(uintptr_t address);
 #define HEAP_HOOK_CALLS 2000
@@ -772,7 +811,7 @@ static void choose_heap(void) {
     }
 }
 uintptr_t runtime_sotc_heap(void) { return heap_chosen; }
-/* sotc (#146): the engine's heap table (heap id -> heap object, eboot EU 1.01). The world's own
+/* sotc (#146): the engine's heap table (heap id -> heap object, eboot EU 1.01 / US 1.00). The world's own
  * heaps (created when a world loads, e.g. the last colossus' area) include more heaps of the
  * guarded heap's class; the GPU side guards those too. 0 until the guarded heap is chosen. */
 #define HEAP_TABLE_OFFSET 0x2dfaab0
@@ -1255,6 +1294,8 @@ int main(int argc, char **argv) {
         snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0);
         if (sfo_value(sfo,"INSTALL_DIR_SAVEDATA",id,sizeof(id),NULL) || sfo_value(sfo,"TITLE_ID",id,sizeof(id),NULL))
             runtime_savedata_configure(id);
+        char title_id[16]="";
+        if (sfo_value(sfo,"TITLE_ID",title_id,sizeof(title_id),NULL)) runtime_content_title(title_id);
     }
     bbgpu_register_kernel();
 #ifdef _WIN32
@@ -1463,7 +1504,7 @@ int main(int argc, char **argv) {
         _exit(0);
     }
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
-    {   /* sotc: fps60game applied (EU 1.01, scripts/sotc_modes.py): F7 sets the engine's own frame
+    {   /* sotc: fps60game applied (EU 1.01 / US 1.00, scripts/sotc_modes.py): F7 sets the engine's own frame
          * rate target, the TargetFramesPerSeconds cvar (object 0x2eed7a0, value pointer at +0x60). */
         static const unsigned char fps60game[]={0xc7,0x45,0x84,0x01,0x00,0x00,0x00};
         if (size>0x2eed800 && !memcmp(image+0x49a47f,fps60game,sizeof fps60game))

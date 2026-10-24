@@ -19,8 +19,10 @@
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 // Above both lines before the upstream merge: generation changed, so old caches are dropped.
-static constexpr u32 ShaderBinaryVersion = 33u;
+static constexpr u32 ShaderBinaryVersion = 34u;
 // sotc: 33 = the draw thread merge (SRT walker faults read zero instead of patching).
+// sotc: 34 = invariant position on barycentric-emulation pipelines (ground-level texture/depth
+// mismatch between the pipeline with the geometry shader and the one without).
 static constexpr u32 ShaderMetaVersion = 21u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization

@@ -58,28 +58,39 @@ def client_rect(pid):
             if rect.right > 320 and rect.bottom > 180:
                 origin = wintypes.POINT(0, 0)
                 user32.ClientToScreen(hwnd, ctypes.byref(origin))
-                found.append((origin.x, origin.y, rect.right & ~1, rect.bottom & ~1))
+                found.append((origin.x, origin.y, rect.right & ~1, rect.bottom & ~1, hwnd))
         return True
 
     user32.EnumWindows(proc(visit), 0)
     return found[0] if found else None
 
 
-def start_video(path, pid, ffmpeg):
-    """ffmpeg grabbing the game's client area at 60 FPS; None when the window or ffmpeg is missing."""
+def start_video(path, pid, ffmpeg, fps=30):
+    """ffmpeg grabbing the game's client area at fps; None when the window or ffmpeg is missing."""
     rect = client_rect(pid)
     exe = ffmpeg or shutil.which('ffmpeg')
     if not rect or not exe:
         print('video: no game window or no ffmpeg (use --ffmpeg)', flush=True)
         return None
-    x, y, w, h = rect
+    x, y, w, h, hwnd = rect
+    import ctypes
+    # Whatever is on top of the game would be recorded instead: bring it to the front.
+    ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0003)  # HWND_TOPMOST, no move, no size
+    ctypes.windll.user32.SetForegroundWindow(hwnd)
+    time.sleep(1.0)
     # NVIDIA hardware encoder when present (the game keeps the CPU busy), otherwise x264.
     nvenc = b'h264_nvenc' in subprocess.run([exe, '-hide_banner', '-encoders'], capture_output=True).stdout
     codec = ['-c:v', 'h264_nvenc', '-preset', 'p5', '-cq', '19'] if nvenc else \
             ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18']
-    command = [exe, '-hide_banner', '-loglevel', 'error', '-y', '-f', 'gdigrab', '-framerate', '60',
-               '-offset_x', str(x), '-offset_y', str(y), '-video_size', f'{w}x{h}', '-draw_mouse', '0',
-               '-i', 'desktop', *codec, '-pix_fmt', 'yuv420p', str(path)]
+    gpu = nvenc and b'ddagrab' in subprocess.run([exe, '-hide_banner', '-filters'], capture_output=True).stdout
+    if gpu:  # desktop duplication stays on the GPU: gdigrab cost ~6 FPS of the game
+        command = [exe, '-hide_banner', '-loglevel', 'error', '-y', '-filter_complex',
+                   f'ddagrab=0:framerate={fps}:draw_mouse=0:offset_x={x}:offset_y={y}:video_size={w}x{h},'
+                   'hwdownload,format=bgra,format=yuv420p', *codec, str(path)]
+    else:
+        command = [exe, '-hide_banner', '-loglevel', 'error', '-y', '-f', 'gdigrab', '-framerate', str(fps),
+                   '-offset_x', str(x), '-offset_y', str(y), '-video_size', f'{w}x{h}', '-draw_mouse', '0',
+                   '-i', 'desktop', *codec, '-pix_fmt', 'yuv420p', str(path)]
     print(f'video: recording {w}x{h} at {x},{y} to {path}', flush=True)
     return subprocess.Popen(command, stdin=subprocess.PIPE)
 
@@ -112,6 +123,7 @@ def main():
     parser.add_argument('--record', help='hand over to the player with BB_PAD_RECORD=<file> (F9 stops)')
     parser.add_argument('--replay', help='measure a replay of a BB_PAD_RECORD file')
     parser.add_argument('--video', help='record the window to this .mp4 from the idle scene on (see the docstring)')
+    parser.add_argument('--video-fps', type=int, default=30, help='recording frame rate (30 costs the game less)')
     parser.add_argument('--ffmpeg', help='path to ffmpeg.exe for --video')
     parser.add_argument('--turn', type=float, default=0,
                         help='at the idle scene, turn the camera (right stick) for this many seconds, then measure')
@@ -260,6 +272,9 @@ def main():
                       flush=True)
             time.sleep(0.5)
             continue
+        if idle_at is not None and args.video and not state.get('video_tried'):
+            state['video_tried'] = True
+            state['video'] = start_video(args.video, process.pid, args.ffmpeg, args.video_fps)
         if idle_at is not None and args.turn and not state.get('turned'):
             # Turn first; the measured window and the shots start once the stick is released.
             now = time.monotonic() - start
@@ -290,9 +305,6 @@ def main():
                 pad.write_text('replay')
                 state['assist_state'] = 'done'
 
-        if idle_at is not None and args.video and not state.get('video_tried'):
-            state['video_tried'] = True
-            state['video'] = start_video(args.video, process.pid, args.ffmpeg)
         if idle_at is not None:
             if not shot_times:
                 shot_times = [idle_at + (i + 1) * args.measure / (args.shots + 1) for i in range(args.shots)]

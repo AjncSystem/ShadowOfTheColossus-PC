@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 
+import sotc_report
 import sotc_update
 
 FROZEN = getattr(sys, 'frozen', False)
@@ -41,7 +42,7 @@ CONFIG_FILE = CONFIG_DIR / 'launcher_settings.json'
 from sotc_modes import GAMES  # noqa: E402
 GAME_ID = 'CUSA08809'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.60.6-plus4'
+VERSION = '0.60.6-plus5'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -1006,6 +1007,7 @@ class Launcher:
             self.nav[name] = item
         tk.Frame(side, bg=BG).pack(fill='both', expand=True)
         for text, command in ((_('Registro do jogo', 'Game log'), lambda: self.show('log')),
+                              (_('Reportar problema', 'Report a problem'), self.report_problem),
                               (_('Procurar atualização', 'Check for updates'), lambda: self.check_updates(True)),
                               (_('Configurar de novo', 'Set up again'), self.show_setup)):
             link = tk.Label(side, text=text, bg=BG, fg=MUTED, font=(ui_font(), 9, 'underline'), cursor='hand2')
@@ -1485,6 +1487,7 @@ class Launcher:
         top.pack(fill='x', pady=(0, 8))
         ttk.Label(top, text=_('Registro', 'Log'), font=(title_font(), 20)).pack(side='left')
         ttk.Button(top, text=_('Copiar', 'Copy'), command=self.copy_log).pack(side='right')
+        ttk.Button(top, text=_('Reportar problema', 'Report a problem'), command=self.report_problem).pack(side='right', padx=6)
         ttk.Button(top, text=_('Limpar', 'Clear'), command=lambda: self.set_log('')).pack(side='right', padx=6)
         self.log = tk.Text(page, wrap='none', bg='#090a0b', fg='#c9ccd0', insertbackground=TEXT, relief='flat',
                            font=('Consolas', 9), padx=8, pady=6, state='disabled', highlightthickness=0)
@@ -2107,6 +2110,41 @@ class Launcher:
         self.log.delete('1.0', 'end')
         self.log.insert('end', text)
         self.log.configure(state='disabled')
+
+    def report_problem(self):
+        # sotc: sotc_report.py. Nothing is sent: the player copies the text, saves a .zip or opens
+        # the GitHub issue page (and presses the button there).
+        report = sotc_report.build(VERSION, self.app, user_dir(self.app))
+        win = self.tk.Toplevel(self.root)
+        win.title(_('Reportar problema', 'Report a problem'))
+        win.geometry('760x520')
+        self.ttk.Label(win, wraplength=720, text=_(
+            'Este relatório não tem seu nome de usuário nem caminhos pessoais. Nada é enviado pelo lançador: '
+            'você copia, salva um .zip ou abre a página da issue no GitHub e cola o texto lá.',
+            'This report has no user name or personal paths. The launcher sends nothing: you copy it, save a '
+            '.zip or open the GitHub issue page and paste the text there.')).pack(padx=12, pady=8, anchor='w')
+        box = self.tk.Text(win, wrap='none', font=('Consolas', 9))
+        box.insert('1.0', report)
+        box.configure(state='disabled')
+        row = self.ttk.Frame(win)
+        row.pack(side='bottom', fill='x', padx=12, pady=8)
+        box.pack(fill='both', expand=True, padx=12)
+
+        def copy():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(report)
+
+        def save():
+            path = sotc_report.save_zip(VERSION, report, user_dir(self.app))
+            self.open_path(path.parent)
+
+        def issue():
+            copy()
+            sotc_report.open_issue(VERSION, report)
+
+        for text, command in ((_('Copiar', 'Copy'), copy), (_('Salvar .zip', 'Save .zip'), save),
+                              (_('Abrir issue no GitHub (copia o texto)', 'Open GitHub issue (copies the text)'), issue)):
+            self.ttk.Button(row, text=text, command=command).pack(side='left', padx=(0, 6))
 
     def copy_log(self):
         self.root.clipboard_clear()

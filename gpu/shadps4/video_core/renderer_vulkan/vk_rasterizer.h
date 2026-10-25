@@ -239,6 +239,11 @@ private:
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
     bool attachment_feedback_loop{};
     bool needs_barrier{};
+    /// sotc: SOTC_DEPTH_RO. The depth buffer of this draw is sampled (depth aspect) while its
+    /// stencil is written: one layout serves both.
+    bool DepthSampledAsAttachment(VideoCore::ImageId image_id, const VideoCore::Image& image,
+                                  const VideoCore::TextureCache::ImageDesc& desc,
+                                  bool compute) const;
 
     /// sotc: TakeHudless. BeginHudless starts the redraw of this draw (the final composite) into
     /// its HUD-less image; false when this draw is not the composite.

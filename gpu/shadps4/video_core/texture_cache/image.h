@@ -85,6 +85,8 @@ public:
     vk::DeviceSize size_bytes{};
 };
 
+extern u64 g_sotc_fence_epoch; // sotc: bumped at every fence the command processor retires
+
 struct Image {
     explicit Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime,
                    Common::SlotVector<ImageView>& slot_image_views, const ImageInfo& info);
@@ -184,6 +186,7 @@ public:
     u64 hash{};
     /// sotc: host bytes this full chain would save as a mip tail (census "projected" only).
     u64 sotc_shadow_saving{};
+    u64 general_epoch{~0ull}; // sotc: fence epoch of the last GENERAL->GENERAL barrier
 
     struct {
         u32 texture : 1;

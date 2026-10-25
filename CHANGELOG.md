@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.60.6-plus5 — 2026-10-25 (fork Lucas-blip-png)
+- **Santuário a 60 FPS (59 a 61 sem limite, antes 53 a 54):** cada uso de uma imagem de armazenamento 1920x1080 R32Uint
+  (em layout GENERAL) depois de uma escrita gerava uma barreira, e cada barreira dentro de um passe de renderização
+  obriga a fechá-lo e abri-lo de novo (cerca de 20 mil vezes por segundo). No GCN as escritas em UAV não são ordenadas
+  entre desenhos: o jogo coloca um rótulo de fim de pipe (EOP/ReleaseMem) onde precisa delas visíveis. Agora a barreira
+  GENERAL→GENERAL com o mesmo acesso sai uma vez por época de fence (no primeiro uso depois de um rótulo), não antes de
+  cada desenho. `SOTC_GENERAL_SYNC=0` volta à barreira em todo uso. Medido em execuções intercaladas: 59,2 / 60,9 FPS
+  contra 54,0 / 53,0. Roteiro de save de 400 s e de 600 s sem falhas e imagem sem defeitos visíveis.
+- **Profundidade amostrada como alvo:** a imagem de profundidade com escrita de stencil, amostrada ao mesmo tempo, usa
+  `DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL` também no descritor (validação do Vulkan; sozinha não muda o FPS).
+  `SOTC_DEPTH_RO=0` desliga.
+- **Leituras de volta parciais** (`SOTC_RB_PARTIAL`, ligada): uma leitura de volta assíncrona aplica só o trecho que ficou
+  sujo em vez de refazer a janela (cerca de +1,3 FPS).
+- **Lançador:** botão **Reportar problema** (menu lateral e página do registro): monta um relatório sem nome de usuário
+  nem caminhos pessoais (versão, Windows, CPU, RAM, GPU e driver, configurações, final dos logs e dos crashes), que se
+  copia, se salva em `user/reports/*.zip` ou abre uma issue no GitHub já iniciada. O lançador não envia nada sozinho.
+  Ideia vinda do lançador do iss_pc.
+- Medidas desta rodada que **não** viraram mudança: faixa assíncrona de compute em uma segunda fila (o compute é só 10 a 20%
+  do tempo da GPU), parâmetros do motor (compute assíncrono, sondas, sombras), afinidade de threads e espera ativa nos
+  mutexes (a contenção sumiu e o FPS não mudou).
+
 ## 0.60.6-plus4 — 2026-10-24 (fork Lucas-blip-png)
 - **Leituras de volta "quentes" ligadas por padrão (`SOTC_RB_HOT`, desligue com `SOTC_RB_HOT=0`):** o que a GPU escreve
   e o jogo logo lê volta pela CPU sem esperar o fim do quadro. Santuário: cerca de +14% (44,0 / 47,4 para 53,3 / 50,3 FPS).

@@ -11,11 +11,89 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_stats.h"
 #include <chrono>
+#include <cstdlib>
+#include <cstdio>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <deque>
 #include <span>
 #include <boost/container/small_vector.hpp>
 #include <immintrin.h>
 
 namespace Vulkan {
+
+// sotc: SOTC_GPU_TIME=1 (needs the GPU marker, SOTC_WAIT_MARKER=1 or 2): once a second, how long the
+// GPU worked on the submissions (busy: from the later of the queue submit and the previous
+// submission's end, to the end of this one) and how long it sat without submitted work (starved).
+// Busy + starved is the whole second: a large starved share means the GPU waits for the CPU.
+namespace {
+struct GpuTimeDiag {
+    std::mutex mutex;
+    std::vector<std::pair<u64, std::chrono::steady_clock::time_point>> pending;
+    std::jthread thread;
+    Semaphore* semaphore{};
+
+    void Note(Semaphore* sem, u64 tick) {
+        std::scoped_lock lock{mutex};
+        if (!thread.joinable()) {
+            semaphore = sem;
+            thread = std::jthread([this](std::stop_token stop) { Run(stop); });
+        }
+        pending.emplace_back(tick, std::chrono::steady_clock::now());
+    }
+
+    void Run(std::stop_token stop) {
+        using clock = std::chrono::steady_clock;
+        auto last_done = clock::now();
+        auto window = last_done;
+        double busy = 0, starved = 0;
+        u64 ticks = 0;
+        std::vector<std::pair<u64, clock::time_point>> work;
+        while (!stop.stop_requested()) {
+            {
+                std::scoped_lock lock{mutex};
+                work.swap(pending);
+            }
+            static std::deque<std::pair<u64, clock::time_point>> queue;
+            for (auto& item : work) {
+                queue.push_back(item);
+            }
+            work.clear();
+            const auto now = clock::now();
+            while (!queue.empty() && semaphore->MarkerReached(Semaphore::MarkerSlot::Timeline, queue.front().first)) {
+                const auto done = clock::now();
+                const auto submit = queue.front().second;
+                const auto start = std::max(submit, last_done);
+                busy += std::chrono::duration<double, std::milli>(done - start).count();
+                if (submit > last_done) {
+                    starved += std::chrono::duration<double, std::milli>(submit - last_done).count();
+                }
+                last_done = done;
+                ++ticks;
+                queue.pop_front();
+            }
+            if (now - window >= std::chrono::seconds(1)) {
+                std::fprintf(stderr, "SOTC GPU TIME: busy %.0f ms/s, no work queued %.0f ms/s, %llu submissions/s\n", busy,
+                             starved, static_cast<unsigned long long>(ticks));
+                busy = starved = 0;
+                ticks = 0;
+                window = now;
+            }
+            _mm_pause();
+            std::this_thread::yield();
+        }
+    }
+};
+
+GpuTimeDiag* GpuTime() {
+    static GpuTimeDiag* diag = [] {
+        const char* v = std::getenv("SOTC_GPU_TIME");
+        return v && v[0] == '1' ? new GpuTimeDiag : nullptr;
+    }();
+    return diag;
+}
+} // namespace
 
 std::mutex Scheduler::submit_mutex;
 
@@ -465,6 +543,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
                 real.push_back(recorder->Real(fake));
             }
             QueueSubmit(instance, info, real);
+            if (auto* diag = GpuTime(); diag && work_semaphore.HasMarker()) {
+                diag->Note(&work_semaphore, signal_value);
+            }
             recorded_submit_tick.store(signal_value, std::memory_order_release);
             recorded_submit_tick.notify_all();
             recorder->Retire(static_cast<u32>(fakes.size()));
@@ -472,6 +553,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         recorder->Kick();
     } else {
         QueueSubmit(instance, info, cmd_buffers);
+        if (auto* diag = GpuTime(); diag && work_semaphore.HasMarker()) {
+            diag->Note(&work_semaphore, signal_value);
+        }
     }
 
     work_semaphore.Refresh();

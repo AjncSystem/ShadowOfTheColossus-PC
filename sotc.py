@@ -23,8 +23,8 @@ Settings (environment variables, or sotc.ini beside this script as NAME=value li
                       with SOTC_FPS_CAP=off)
                       hdr (HDR10 output and the game's HDR rendering; Windows HDR must be on)
     SOTC_RENDER_RES   optional: the game renders at WxH instead of 1920x1080 (e.g. 2560x1080 for
-                      21:9, a wider view); the output follows its aspect; PS4 mode only; at most 1080
-                      lines tall and 4.2 million pixels, larger sizes are scaled down
+                      21:9, a wider view); the output follows its aspect; PS4 mode only; at most 1440
+                      lines tall (1440) and 4.2 million pixels, larger sizes are scaled down
     SOTC_CVARS        engine settings, NAME=VALUE separated by spaces (e.g. r_motionBlurEnable=0)
     BB_GAMEPAD        the gamepad to use (its name or part of it), when several are connected
     key.<input>=Keys, pad.<input>=buttons   remap the controls (README.md, Controles)
@@ -75,9 +75,10 @@ def find_probe():
 
 # Above about 4.2 million rendered pixels the fine detail textures (ground, cloth) shimmer, flicker
 # and then disappear (2736x1536 is fine, 3008x1696 shimmers, 3840x2160 has none); cause unknown.
-# The game itself never renders more than 1080 lines in PS4 mode, so the render height stays at
-# most 1080 (3840x1080 for 32:9 is tested fine) and the pixel limit covers wider aspects.
-MAX_RENDER_HEIGHT = 1080
+# The game itself never renders more than 1080 lines in PS4 mode; 1440 lines (2560x1440, 3.7 million
+# pixels) were tested fine on 25 Oct (Shrine 49.5 FPS with DLSS to 3840x2160, stone textures sharp)
+# and 3840x1080 for 32:9 too; the pixel limit covers wider aspects.
+MAX_RENDER_HEIGHT = 1440
 MAX_RENDER_PIXELS = 4_200_000
 
 

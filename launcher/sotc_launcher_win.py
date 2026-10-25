@@ -670,7 +670,12 @@ def game_environment(s):
     # own sizes.
     output = env['SOTC_OUTPUT_RES']
     if output not in ('1280x720', '1920x1080') and env['SOTC_NEO'] == '0':
-        env['SOTC_RENDER_RES'] = output
+        # sotc.py lets the render go to 1440 lines (FSR 3.1 and DLSS, below); FSR 1 and bilinear stay at 1080.
+        try:
+            lines = int(output.split('x')[1])
+        except (IndexError, ValueError):
+            lines = 1080
+        env['SOTC_RENDER_RES'] = render_size(output, max(1.0, lines / 1080)) or '1920x1080'
     env['BB_FSR1'] = '1' if s.get('upscaler', 'fsr1') == 'fsr1' else '0'
     if s.get('upscaler') in ('fsr3', 'dlss'):
         # FSR 3.1 and DLSS need the game's own render size, below the output: the PS4 Pro path keeps

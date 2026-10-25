@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstdlib>
+#include <system_error>
+#include <thread>
+#include <filesystem>
+#include <fstream>
 #include <cstring>
 #include <ranges>
 #include <xxhash.h>
@@ -98,6 +102,105 @@ static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsO
     }
 
     return num_outputs;
+}
+
+// sotc: the driver's own pipeline cache (VkPipelineCache) used to start empty at every launch, so
+// each pipeline the shader cache preloaded was compiled by the driver again behind the loading
+// screen and at every first visit. It now lives in <cache dir>/<serial>_driver.bin (cleared with
+// the shader cache), is checked against this GPU and driver before it is used, and is written
+// when it grew: after the preload, every few minutes and on exit. SOTC_DRIVER_CACHE=0 turns it
+// off; SOTC_DRIVER_CACHE_MAX_MB (default 512) is the size above which it is no longer written.
+namespace {
+std::atomic<PipelineCache*> g_driver_cache_owner{};
+
+bool DriverCacheEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_DRIVER_CACHE");
+        return !(v && v[0] == '0');
+    }();
+    return on;
+}
+
+std::filesystem::path DriverCachePath() {
+    return Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+           (std::string{Common::ElfInfo::Instance().GameSerial()} + "_driver.bin");
+}
+
+// VkPipelineCacheHeaderVersionOne: size, version, vendor, device, UUID.
+std::vector<u8> ReadDriverCache(const Instance& instance) {
+    std::vector<u8> data;
+    std::error_code ec;
+    const auto path = DriverCachePath();
+    const auto size = std::filesystem::file_size(path, ec);
+    if (ec || size < 32) {
+        return data;
+    }
+    std::ifstream in(path, std::ios::binary);
+    data.resize(static_cast<size_t>(size));
+    if (!in.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(size))) {
+        data.clear();
+        return data;
+    }
+    u32 head[4];
+    std::memcpy(head, data.data(), sizeof head);
+    const auto uuid = instance.GetPipelineCacheUUID();
+    if (head[0] < 32 || head[1] != 1 || head[2] != instance.GetVendorID() ||
+        head[3] != instance.GetDeviceID() ||
+        std::memcmp(data.data() + 16, uuid.data(), VK_UUID_SIZE) != 0) {
+        LOG_INFO(Render, "Driver pipeline cache is for another GPU or driver, starting empty");
+        data.clear();
+    }
+    return data;
+}
+} // namespace
+
+void PipelineCache::SaveDriverCache(bool wait) {
+    if (!DriverCacheEnabled() || !pipeline_cache || driver_cache_saving.exchange(true)) {
+        return;
+    }
+    const auto work = [this] {
+        auto [result, data] = instance.GetDevice().getPipelineCacheData(*pipeline_cache);
+        static const size_t max_bytes = [] {
+            const char* v = std::getenv("SOTC_DRIVER_CACHE_MAX_MB");
+            return static_cast<size_t>(v ? std::max(16, std::atoi(v)) : 512) << 20;
+        }();
+        if (result == vk::Result::eSuccess && data.size() != driver_cache_saved_size &&
+            data.size() <= max_bytes) {
+            const auto path = DriverCachePath();
+            auto temp = path;
+            temp += ".tmp";
+            std::error_code ec;
+            std::filesystem::create_directories(path.parent_path(), ec);
+            {
+                std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+                out.write(reinterpret_cast<const char*>(data.data()),
+                          static_cast<std::streamsize>(data.size()));
+                if (!out) {
+                    std::filesystem::remove(temp, ec);
+                    driver_cache_saving = false;
+                    return;
+                }
+            }
+            std::filesystem::rename(temp, path, ec);
+            if (!ec) {
+                driver_cache_saved_size = data.size();
+                LOG_INFO(Render, "Driver pipeline cache saved: {} KiB", data.size() >> 10);
+            }
+        }
+        driver_cache_last_save = std::chrono::steady_clock::now();
+        driver_cache_saving = false;
+    };
+    if (wait) {
+        work();
+    } else {
+        std::thread{work}.detach();
+    }
+}
+
+void SaveDriverPipelineCache() {
+    if (PipelineCache* owner = g_driver_cache_owner.load()) {
+        owner->SaveDriverCache(true);
+    }
 }
 
 const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStage l_stage) {
@@ -435,10 +538,17 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // sotc: the cache is read by the Presenter once it can draw (Presenter::Presenter), with
     // the loading screen on meanwhile.
 
-    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
+    std::vector<u8> driver_cache;
+    if (DriverCacheEnabled()) {
+        driver_cache = ReadDriverCache(instance);
+        driver_cache_saved_size = driver_cache.size();
+    }
+    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique(
+        {.initialDataSize = driver_cache.size(), .pInitialData = driver_cache.data()});
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
+    g_driver_cache_owner = this;
 
     // sotc: pipeline workers for SOTC_ASYNC_SHADERS (see AsyncPipelineJob).
     if (AsyncShadersEnabled()) {
@@ -456,7 +566,9 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     }
 }
 
-PipelineCache::~PipelineCache() = default;
+PipelineCache::~PipelineCache() {
+    g_driver_cache_owner = nullptr;
+}
 
 // sotc: a pipeline built on the command processor that took longer than 30 ms is logged with
 // the reason it was not built on a pipeline worker (SOTC_SYNC_PIPELINE_MS changes the limit).
@@ -764,6 +876,11 @@ void PipelineCache::InstallTranslation(AsyncPipelineJob::Translate& t) {
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     draw_indirect_params = params;
+    // sotc: every few minutes, write the driver cache if it grew (checked every 4096 draws).
+    if ((++driver_cache_tick & 4095u) == 0 &&
+        std::chrono::steady_clock::now() - driver_cache_last_save > std::chrono::minutes(3)) {
+        SaveDriverCache(false);
+    }
     // sotc: finished translations must be installed before the stages are looked up.
     if (async_done_count.load(std::memory_order_acquire) != 0) {
         CollectAsyncPipelines();

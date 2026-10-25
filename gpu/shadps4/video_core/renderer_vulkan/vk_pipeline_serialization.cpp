@@ -560,9 +560,11 @@ void PipelineCache::WarmUp() {
     }
 
     Storage::DataBase::Instance().FinishPreload();
+    SaveDriverCache(false);
 }
 
 void PipelineCache::Sync() {
+    SaveDriverCache(true);
     Storage::DataBase::Instance().Close();
 }
 

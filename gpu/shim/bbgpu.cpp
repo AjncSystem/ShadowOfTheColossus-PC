@@ -339,7 +339,8 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
                 SDL_Delay(50);
             }
         }
-        // sotc: write the pipelines still queued for the cache before leaving.
+        // sotc: write the pipelines still queued for the cache before leaving, and the driver's.
+        Vulkan::SaveDriverPipelineCache();
         Storage::DataBase::Instance().Close();
         std::fflush(stdout);
         std::_Exit(0);

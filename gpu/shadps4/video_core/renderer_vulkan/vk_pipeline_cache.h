@@ -4,6 +4,9 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
+
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -86,6 +89,10 @@ public:
     explicit PipelineCache(const Instance& instance, Scheduler& scheduler,
                            AmdGpu::Liverpool* liverpool, u32 sparse_page_shift);
     ~PipelineCache();
+
+    /// sotc: writes the driver's pipeline cache to disk when it grew (force: also when it did not
+    /// grow in a while; wait: do it on this thread). See DriverCache in vk_pipeline_cache.cpp.
+    void SaveDriverCache(bool wait);
 
     void WarmUp();
     void Sync();
@@ -207,6 +214,10 @@ private:
     AmdGpu::Liverpool* liverpool;
     DescriptorHeap desc_heap;
     vk::UniquePipelineCache pipeline_cache;
+    size_t driver_cache_saved_size{};
+    std::chrono::steady_clock::time_point driver_cache_last_save{std::chrono::steady_clock::now()};
+    std::atomic<bool> driver_cache_saving{};
+    u32 driver_cache_tick{};
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};
     Shader::Pools pools;
@@ -252,5 +263,8 @@ private:
     std::atomic<u32> async_done_count{0};
     std::vector<std::jthread> async_workers;
 };
+
+/// sotc: SaveDriverCache(true) of the live pipeline cache (the exit path calls it).
+void SaveDriverPipelineCache();
 
 } // namespace Vulkan

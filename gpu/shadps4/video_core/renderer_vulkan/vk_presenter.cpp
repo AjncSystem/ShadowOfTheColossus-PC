@@ -1528,7 +1528,10 @@ Frame* Presenter::GetRenderFrame() {
     Frame* frame;
     {
         std::unique_lock lock{free_mutex};
+        const auto t0 = std::chrono::steady_clock::now();
         free_cv.wait(lock, [this] { return !free_queue.empty(); });
+        SotcGpuWait("FrameQ", __builtin_return_address(0), nullptr,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
         LOG_DEBUG(Render_Vulkan, "Got render frame, remaining {}", free_queue.size() - 1);
 
         // Take the frame from the queue
@@ -1545,6 +1548,14 @@ Frame* Presenter::GetRenderFrame() {
     };
 
     // Wait for the presentation to be finished so all frame resources are free
+    const auto fence_t0 = std::chrono::steady_clock::now();
+    struct FenceReport {
+        std::chrono::steady_clock::time_point t0;
+        ~FenceReport() {
+            SotcGpuWait("FrameF", nullptr, nullptr,
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        }
+    } fence_report{fence_t0};
     while (wait() != vk::Result::eSuccess) {
         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
                    "Device lost during waiting for a frame");

@@ -11,6 +11,11 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_stats.h"
 #include <chrono>
+#include <cstdint>
+#include <algorithm>
+#include <string>
+#include <tuple>
+#include <map>
 #include <cstdlib>
 #include <cstdio>
 #include <vector>
@@ -20,6 +25,8 @@
 #include <span>
 #include <boost/container/small_vector.hpp>
 #include <immintrin.h>
+
+extern "C" const char __ImageBase;
 
 namespace Vulkan {
 
@@ -53,6 +60,42 @@ struct GpuTimeDiag {
     double period_ms{};
     std::atomic<u32> next_slot{0};
     std::atomic<u64> recorded{0};
+    // SOTC_GPU_TIME=2: how long the CPU waited for the GPU, by the two frames above the wait.
+    struct WaitAcc {
+        u64 count{};
+        double ms{};
+    };
+    std::map<std::tuple<const char*, void*, void*>, WaitAcc> waits;
+    std::mutex waits_mutex;
+
+    void AddWait(const char* kind, void* a, void* b, double ms) {
+        std::scoped_lock lock{waits_mutex};
+        auto& acc = waits[{kind, a, b}];
+        ++acc.count;
+        acc.ms += ms;
+    }
+
+    void PrintWaits() {
+        std::map<std::tuple<const char*, void*, void*>, WaitAcc> taken;
+        {
+            std::scoped_lock lock{waits_mutex};
+            taken.swap(waits);
+        }
+        std::vector<std::pair<double, std::string>> rows;
+        for (const auto& [key, acc] : taken) {
+            char line[200];
+            std::snprintf(line, sizeof(line), "SOTC GPU WAIT %-6s %7.1f ms/s in %5llu calls  at +%llx <- +%llx",
+                          std::get<0>(key), acc.ms, static_cast<unsigned long long>(acc.count),
+                          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(std::get<1>(key)) - base),
+                          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(std::get<2>(key)) - base));
+            rows.emplace_back(acc.ms, line);
+        }
+        std::sort(rows.begin(), rows.end(), [](const auto& l, const auto& r) { return l.first > r.first; });
+        for (size_t i = 0; i < rows.size() && i < 8; ++i) {
+            std::fprintf(stderr, "%s\n", rows[i].second.c_str());
+        }
+    }
+    uintptr_t base = reinterpret_cast<uintptr_t>(&__ImageBase);
     std::vector<Stamp> pending_stamps;
 
     /// Called from the recording thread right where a rendering interval starts (end false) or ends.
@@ -156,6 +199,7 @@ struct GpuTimeDiag {
                              static_cast<unsigned long long>(passes), pass_ms, gap_ms,
                              static_cast<unsigned long long>(big_gaps), big_gap_ms);
                 const u64 rec = recorded.load(std::memory_order_relaxed);
+                PrintWaits();
                 std::fprintf(stderr, "SOTC GPU PASSES stamps: queued %zu, recorded %llu/s, read %llu, not ready %llu, filtered %llu\n",
                              stamp_queue.size(), static_cast<unsigned long long>(rec - last_recorded), static_cast<unsigned long long>(read_ok),
                              static_cast<unsigned long long>(not_ready), static_cast<unsigned long long>(filtered));
@@ -206,6 +250,28 @@ GpuTimeDiag* GpuTime() {
     return diag;
 }
 } // namespace
+
+namespace {
+struct WaitTimer {
+    const char* kind;
+    void* a;
+    void* b;
+    std::chrono::steady_clock::time_point t0{std::chrono::steady_clock::now()};
+    WaitTimer(const char* kind_, void* a_, void* b_) : kind(kind_), a(a_), b(b_) {}
+    ~WaitTimer() {
+        if (auto* diag = GpuTime(); diag && diag->stamps_on) {
+            diag->AddWait(kind, a, b,
+                          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        }
+    }
+};
+} // namespace
+
+void SotcGpuWait(const char* kind, void* a, void* b, double ms) {
+    if (auto* diag = GpuTime(); diag && diag->stamps_on) {
+        diag->AddWait(kind, a, b, ms);
+    }
+}
 
 std::mutex Scheduler::submit_mutex;
 
@@ -383,7 +449,8 @@ void Scheduler::Finish() {
     Wait(presubmit_tick);
 }
 
-void Scheduler::FinishHostRead() {
+__attribute__((noinline)) void Scheduler::FinishHostRead() {
+    WaitTimer timer{"HostRd", __builtin_return_address(0), __builtin_return_address(1)};
     const u64 presubmit_tick = CurrentTick();
     SubmitInfo info{};
     SubmitExecution(info);
@@ -391,7 +458,9 @@ void Scheduler::FinishHostRead() {
     work_semaphore.WaitHostRead(presubmit_tick);
 }
 
-void Scheduler::Wait(u64 tick) {
+
+__attribute__((noinline)) void Scheduler::Wait(u64 tick) {
+    WaitTimer timer{"Wait", __builtin_return_address(0), __builtin_return_address(1)};
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};
@@ -478,6 +547,7 @@ void Scheduler::SubmitAheadAndWait() {
             _mm_pause();
         }
     }
+    WaitTimer ahead_timer{"Ahead", __builtin_return_address(0), nullptr};
     const auto wait_result =
         instance.GetDevice().waitForFences(*ahead_fence, true, std::numeric_limits<u64>::max());
     if (wait_result == vk::Result::eErrorDeviceLost) {

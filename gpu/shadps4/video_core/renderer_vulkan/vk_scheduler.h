@@ -352,6 +352,9 @@ struct DynamicState {
 using SessionFunc = Common::UniqueFunction<void>;
 using SubmitFunc = Common::UniqueFunction<void, SubmitInfo&>;
 
+/// sotc: SOTC_GPU_TIME=2, adds a wait of ms milliseconds to the per-second "SOTC GPU WAIT" report.
+void SotcGpuWait(const char* kind, void* a, void* b, double ms);
+
 class Scheduler {
 public:
     /// record_thread: Vulkan commands are recorded and submitted on a thread of their own

@@ -159,7 +159,7 @@ def windows_language():
 # Settings, passed to sotc.py as environment variables.
 
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
-                'user_dir': '', 'af16': True, 'textures': 'high', 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'hdr': False, 'fullscreen': False,
+                'user_dir': '', 'af16': True, 'textures': 'high', 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'hdr': False, 'fullscreen': False, 'fs_borderless': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
                 'readbacks': '', 'extra_env': '', 'close_on_play': False, 'skip_logos': False, 'gamepad': '',
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'render_preset': 'quality', 'sharpness': '250', 'mouse': True,
@@ -598,6 +598,8 @@ def game_environment(s):
     env['SOTC_FPS_LIMIT'] = '60' if fps_mode == '60' else '0'
     env['BB_VBLANK_HZ'] = '120'
     env['BB_FULLSCREEN'] = '1' if s['fullscreen'] else '0'
+    if s.get('fs_borderless'):
+        env['BB_FULLSCREEN_HZ'] = '0'  # sotc: keep the desktop mode, never the exclusive one
     env['BB_PRESENT_MODE'] = s['present_mode']
     if s['language']:
         env['BB_LANGUAGE'] = s['language']
@@ -1360,6 +1362,13 @@ class Launcher:
                        "Motion blur, brightness and filters are in the game's own menu (Options > Presentation)."), top=4)
         self.section(f, _('Tela', 'Display'))
         self.check(f, 'fullscreen', _('Tela cheia', 'Fullscreen'))
+        self.check(f, 'fs_borderless', _('Tela cheia sem borda (não trocar o modo do monitor)', 'Borderless fullscreen (never change the monitor mode)'),
+                   _('Em monitores cuja taxa não é múltipla de 60 Hz (144 Hz, por exemplo) a tela cheia troca para um modo exclusivo com um múltiplo de 60, '
+                     'para o movimento não tremer. Ligada, o jogo fica numa janela sem borda do tamanho do monitor, com a taxa do Windows: '
+                     'a troca de janela é instantânea, mas os quadros a 30 ou 60 FPS podem alternar entre 2 e 3 atualizações e tremer um pouco.',
+                     'On monitors whose rate is not a multiple of 60 Hz (144 Hz, for example) fullscreen switches to an exclusive mode with a multiple of 60, '
+                     'so motion does not judder. When on, the game stays in a borderless desktop-size window at the Windows rate: '
+                     'switching windows is instant, but 30 or 60 FPS frames may alternate between 2 and 3 refreshes and judder a little.'))
         self.row(f, _('Apresentação', 'Presentation'), self.choice(f, 'present_mode', PRESENT_MODES))
 
     def build_controls(self):

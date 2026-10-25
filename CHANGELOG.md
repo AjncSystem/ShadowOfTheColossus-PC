@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.60.6-plus6 — 2026-10-25 (fork Lucas-blip-png)
+- **Cache de pipelines do driver em disco** (`user/cache/CUSA08809_driver.bin`; `SOTC_DRIVER_CACHE=0` desliga,
+  `SOTC_DRIVER_CACHE_MAX_MB` limita o tamanho, 512 por padrão): o `VkPipelineCache` começava vazio a cada abertura, então
+  o driver recompilava todo pipeline que o cache de shaders já tinha carregado. Agora o arquivo é lido na abertura
+  (conferindo fabricante, dispositivo e UUID da GPU e do driver), gravado depois do pré-carregamento, a cada 3 minutos
+  quando cresceu e ao fechar. Pré-carga de 2.753 pipelines na RTX 5060 Ti: de 0,7–0,9 s para 0,2–0,3 s (a NVIDIA já guarda
+  um cache próprio, então o ganho é maior onde o driver não guarda). Não ajuda com shaders ainda nunca vistos. "Limpar cache
+  de shaders" apaga o arquivo junto. Savewalk de 300 s sem falhas.
+- **Lançador: tela cheia sem borda** ("Tela cheia sem borda (não trocar o modo do monitor)"): não muda o modo do monitor
+  (`BB_FULLSCREEN_HZ=0`). Em monitores de 144 Hz a tela cheia normal troca para um modo exclusivo com um múltiplo de 60 Hz
+  para o movimento não tremer; ligada, a troca de janela é instantânea, mas quadros a 30 ou 60 FPS podem alternar entre 2 e
+  3 atualizações.
+- **Diagnóstico:** `tools/sotc_bench_shrine.py --video arquivo.mp4` grava a janela do jogo durante a medição (ffmpeg, 60 FPS)
+  e `tools/sotc_video_to_gif.sh` converte o vídeo no GIF do README.
+
 ## 0.60.6-plus5 — 2026-10-25 (fork Lucas-blip-png)
 - **Santuário a 60 FPS (59 a 61 sem limite, antes 53 a 54):** cada uso de uma imagem de armazenamento 1920x1080 R32Uint
   (em layout GENERAL) depois de uma escrita gerava uma barreira, e cada barreira dentro de um passe de renderização

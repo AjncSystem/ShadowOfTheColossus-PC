@@ -100,12 +100,18 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     // 8 GB cards and new allocations failed).
     // sotc: SOTC_VRAM_GC_PERCENT (default 60, 30-95) moves that point: higher keeps more
     // textures resident on 8-16 GB cards (#143), lower helps 4-6 GB ones.
+    SotcStats::vram_budget = static_cast<u64>(device_local_memory); // VramTier needs it now
     static const u64 gc_percent = [] {
         const char* v = std::getenv("SOTC_VRAM_GC_PERCENT");
-        return std::clamp<u64>(v ? std::strtoull(v, nullptr, 10) : 60ull, 30ull, 95ull);
+        static constexpr u64 tier_percent[4] = {50, 60, 75, 85}; // sotc_stats.h VramTier
+        return std::clamp<u64>(v ? std::strtoull(v, nullptr, 10) : tier_percent[SotcStats::VramTier()],
+                               30ull, 95ull);
     }();
     critical_gc_memory = std::min<u64>(critical_gc_memory, device_local_memory * gc_percent / 100);
     pressure_gc_memory = std::min<u64>(pressure_gc_memory, critical_gc_memory);
+    std::fprintf(stderr, "SOTC VRAM: budget %llu MiB, tier %d, texture collection from %llu%%\n",
+                 static_cast<unsigned long long>(device_local_memory >> 20), SotcStats::VramTier(),
+                 static_cast<unsigned long long>(gc_percent));
     SotcStats::vram_budget = static_cast<u64>(device_local_memory);
     LOG_INFO(Render, "Video memory budget {} MB: collection from {} MB, pressure {} MB, critical {} MB",
              device_local_memory >> 20, trigger_gc_memory >> 20, pressure_gc_memory >> 20,

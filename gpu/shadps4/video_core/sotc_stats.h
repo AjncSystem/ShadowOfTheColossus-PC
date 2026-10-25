@@ -111,6 +111,16 @@ inline std::atomic<uint64_t> image_query_ns{0}, image_alloc_ns{0}, image_dedicat
 /// Video memory: usage the driver reports (texture cache GC), budget the GC works with, and the
 /// sparse buffer arena memory (never released) as allocations and bytes.
 inline std::atomic<uint64_t> vram_used{0}, vram_budget{0}, arena_allocs{0}, arena_bytes{0};
+
+/// sotc: video memory tier from the budget the OS gives the game (VK_EXT_memory_budget, set when
+/// the texture cache starts): 0 economy (4-6 GB cards, budget under 5.5 GiB), 2 high (8-12 GB
+/// cards), 3 maximum (16 GB and more, budget over 10.5 GiB). The launcher's "Automatic" setting
+/// leaves SOTC_VRAM_GC_PERCENT and SOTC_ARENA_EVICT_MB unset and the port picks from this.
+inline int VramTier() {
+    const uint64_t gib = 1ull << 30;
+    const uint64_t budget = vram_budget.load(std::memory_order_relaxed);
+    return budget == 0 ? 2 : budget < gib * 11 / 2 ? 0 : budget < gib * 21 / 2 ? 2 : 3;
+}
 /// Texture cache collector: ticks (one per submit with a frame's work), images freed and those
 /// written back to memory first, and the images in the cache with their (guest) size.
 inline std::atomic<uint64_t> gc_ticks{0}, gc_freed{0}, gc_downloads{0};

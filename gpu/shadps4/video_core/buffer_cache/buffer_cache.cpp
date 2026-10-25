@@ -1977,7 +1977,8 @@ bool BufferCache::MaybeEvictCold(std::chrono::steady_clock::time_point now) {
     // frame of zeros); blocks that came back that way stay resident from then on.
     static const u64 limit = [] {
         const char* v = std::getenv("SOTC_ARENA_EVICT_MB");
-        return (v ? std::strtoull(v, nullptr, 10) : 1536ull) << 20;
+        static constexpr u64 tier_mb[4] = {1024, 1536, 4096, 0}; // sotc_stats.h VramTier
+        return (v ? std::strtoull(v, nullptr, 10) : tier_mb[SotcStats::VramTier()]) << 20;
     }();
     static const u64 step = [] {
         const char* v = std::getenv("SOTC_ARENA_EVICT_STEP_MB");

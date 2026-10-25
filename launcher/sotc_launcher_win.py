@@ -165,7 +165,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'render_preset': 'quality', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
-                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'volume': '100', 'shadow_reuse': '0', 'grass_shadows': '3', 'grass_size': '1', 'grass_fade': '1', 'library_dirs': [], 'keys': {},
+                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'auto', 'volume': '100', 'shadow_reuse': '0', 'grass_shadows': '3', 'grass_size': '1', 'grass_fade': '1', 'library_dirs': [], 'keys': {},
                 'auto_setup': True, 'dlc_dir': '', 'framegen': 'off',
                 'check_updates': True, 'skip_version': ''}
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
@@ -197,7 +197,8 @@ GPU_SUBMIT = [('auto', ('Automático (ligado em NVIDIA)', 'Automatic (on with NV
               ('on', ('Ligado em qualquer placa (AMD/Intel: experimental)', 'On with any card (AMD/Intel: experimental)')),
               ('off', ('Desligado', 'Off'))]
 # Video memory use (#143): (texture collection from % of the card's budget, arena release from MB; 0 = never).
-VRAM_USE = [('low', ('Econômico (placas de 4–6 GB)', 'Economy (4–6 GB cards)')),
+VRAM_USE = [('auto', ('Automático (pelo orçamento da placa)', 'Automatic (from the card\'s budget)')),
+            ('low', ('Econômico (placas de 4–6 GB)', 'Economy (4–6 GB cards)')),
             ('normal', ('Padrão', 'Default')),
             ('high', ('Alto (placas de 8–12 GB)', 'High (8–12 GB cards)')),
             ('max', ('Máximo (placas de 16 GB ou mais)', 'Maximum (16 GB cards or more)'))]
@@ -460,7 +461,7 @@ def start_event_log(log_dir, settings, env):
             on_off(env.get('SOTC_NEO') == '1')),
         _('Geração de quadros: {} | Memória de vídeo: {} | Sombras distantes: {} | Volume: {}%',
           'Frame generation: {} | Video memory use: {} | Far shadows: {} | Volume: {}%').format(
-            words(FRAMEGEN, 'framegen', 'off'), words(VRAM_USE, 'vram_use', 'normal'),
+            words(FRAMEGEN, 'framegen', 'off'), words(VRAM_USE, 'vram_use', 'auto'),
             on_off(str(settings.get('shadow_reuse') or '0') != '0'), settings.get('volume') or '100'),
         _('Tela cheia: {} | Câmera pelo mouse: {} | Controle preferido: {} | Variáveis extras: {}',
           'Fullscreen: {} | Mouse camera: {} | Preferred controller: {} | Extra variables: {}').format(
@@ -636,7 +637,8 @@ def game_environment(s):
         env['SOTC_FLUSH_US'], env['SOTC_RB_AHEAD'] = '1000', '1'
     elif s.get('gpu_submit') == 'off':
         env['SOTC_FLUSH_EVERY'], env['SOTC_RB_AHEAD'] = '0', '0'
-    env['SOTC_VRAM_GC_PERCENT'], env['SOTC_ARENA_EVICT_MB'] = VRAM_LIMITS.get(s.get('vram_use'), VRAM_LIMITS['normal'])
+    if s.get('vram_use', 'auto') in VRAM_LIMITS:  # "auto": the port picks from the card's budget (sotc_stats.h)
+        env['SOTC_VRAM_GC_PERCENT'], env['SOTC_ARENA_EVICT_MB'] = VRAM_LIMITS[s['vram_use']]
     env['SOTC_VOLUME'] = str(s.get('volume') or '100')
     # The in-game menu's quick settings are written back here (bbport_overlay.cpp).
     env['SOTC_LAUNCHER_SETTINGS'] = str(CONFIG_FILE)

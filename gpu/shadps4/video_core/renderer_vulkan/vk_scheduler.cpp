@@ -30,17 +30,57 @@ namespace Vulkan {
 namespace {
 struct GpuTimeDiag {
     std::mutex mutex;
-    std::vector<std::pair<u64, std::chrono::steady_clock::time_point>> pending;
+    struct Submit {
+        u64 tick;
+        std::chrono::steady_clock::time_point at;
+        Semaphore* sem;
+    };
+    std::vector<Submit> pending;
     std::jthread thread;
-    Semaphore* semaphore{};
+    // SOTC_GPU_TIME=2: GPU timestamps at the start and end of every rendering interval (Begin/
+    // EndRendering). The gaps between an end and the next start are the GPU work outside render
+    // passes (compute, copies, barriers, waits).
+    struct Stamp {
+        u32 slot;
+        bool end;
+        u64 tick;
+        Semaphore* sem;
+    };
+    static constexpr u32 kSlots = 16384;
+    bool stamps_on{};
+    vk::Device device;
+    vk::QueryPool pool;
+    double period_ms{};
+    std::atomic<u32> next_slot{0};
+    std::atomic<u64> recorded{0};
+    std::vector<Stamp> pending_stamps;
+
+    /// Called from the recording thread right where a rendering interval starts (end false) or ends.
+    void Stamp_(const vk::Device& dev, double period, vk::CommandBuffer cmdbuf, Semaphore* sem, u64 tick, bool end) {
+        if (!pool) {
+            std::scoped_lock lock{mutex};
+            if (!pool) {
+                device = dev;
+                period_ms = period * 1e-6;
+                const vk::QueryPoolCreateInfo info{.queryType = vk::QueryType::eTimestamp, .queryCount = kSlots};
+                pool = device.createQueryPool(info).value;
+            }
+        }
+        const u32 slot = next_slot.fetch_add(1, std::memory_order_relaxed) % kSlots;
+        recorded.fetch_add(1, std::memory_order_relaxed);
+        cmdbuf.resetQueryPool(pool, slot, 1);
+        cmdbuf.writeTimestamp(end ? vk::PipelineStageFlagBits::eBottomOfPipe : vk::PipelineStageFlagBits::eTopOfPipe,
+                              pool, slot);
+        std::scoped_lock lock{mutex};
+        pending_stamps.push_back({slot, end, tick, sem});
+    }
 
     void Note(Semaphore* sem, u64 tick) {
         std::scoped_lock lock{mutex};
         if (!thread.joinable()) {
-            semaphore = sem;
             thread = std::jthread([this](std::stop_token stop) { Run(stop); });
         }
-        pending.emplace_back(tick, std::chrono::steady_clock::now());
+        pending.push_back({tick, std::chrono::steady_clock::now(), sem});
     }
 
     void Run(std::stop_token stop) {
@@ -49,21 +89,88 @@ struct GpuTimeDiag {
         auto window = last_done;
         double busy = 0, starved = 0;
         u64 ticks = 0;
-        std::vector<std::pair<u64, clock::time_point>> work;
+        std::vector<Submit> work;
         while (!stop.stop_requested()) {
             {
                 std::scoped_lock lock{mutex};
                 work.swap(pending);
             }
-            static std::deque<std::pair<u64, clock::time_point>> queue;
+            static std::deque<Submit> queue;
+            static std::deque<Stamp> stamp_queue;
+            static double last_end = -1, begin_at = 0, pass_ms = 0, gap_ms = 0, big_gap_ms = 0;
+            static u64 passes = 0, big_gaps = 0, not_ready = 0, filtered = 0, read_ok = 0, last_recorded = 0;
+            {
+                std::scoped_lock lock{mutex};
+                for (const auto& st : pending_stamps) {
+                    stamp_queue.push_back(st);
+                }
+                pending_stamps.clear();
+            }
+            while (!stamp_queue.empty() &&
+                   stamp_queue.front().sem->MarkerReached(Semaphore::MarkerSlot::Timeline, stamp_queue.front().tick)) {
+                // A run of stamps in consecutive slots (the recording order) whose submissions are done.
+                const u32 first = stamp_queue.front().slot;
+                u32 count = 0;
+                while (count < stamp_queue.size() && count < 2048 && first + count < kSlots &&
+                       stamp_queue[count].slot == first + count &&
+                       stamp_queue[count].sem->MarkerReached(Semaphore::MarkerSlot::Timeline, stamp_queue[count].tick)) {
+                    ++count;
+                }
+                static std::vector<u64> values;
+                values.assign(count, 0);
+                if (device.getQueryPoolResults(pool, first, count, count * sizeof(u64), values.data(), sizeof(u64),
+                                               vk::QueryResultFlagBits::e64) != vk::Result::eSuccess) {
+                    not_ready += count;
+                    stamp_queue.erase(stamp_queue.begin(), stamp_queue.begin() + count);
+                    continue;
+                }
+                for (u32 i = 0; i < count; ++i) {
+                    const Stamp st = stamp_queue[i];
+                    const double t = static_cast<double>(values[i]) * period_ms;
+                    ++read_ok;
+                    if (!st.end) {
+                        if (last_end >= 0 && t >= last_end && t - last_end < 50.0) {
+                            gap_ms += t - last_end;
+                            if (t - last_end > 0.25) {
+                                big_gap_ms += t - last_end;
+                                ++big_gaps;
+                            }
+                        }
+                        begin_at = t;
+                    } else {
+                        if (t >= begin_at && t - begin_at < 50.0) {
+                            pass_ms += t - begin_at;
+                            ++passes;
+                        } else {
+                            ++filtered;
+                        }
+                        last_end = t;
+                    }
+                }
+                stamp_queue.erase(stamp_queue.begin(), stamp_queue.begin() + count);
+            }
+            if (stamps_on && clock::now() - window >= std::chrono::seconds(1)) {
+                std::fprintf(stderr,
+                             "SOTC GPU PASSES: %llu rendering intervals/s, in them %.0f ms/s, between them %.0f ms/s "
+                             "(of which %llu gaps over 0.25 ms = %.0f ms/s)\n",
+                             static_cast<unsigned long long>(passes), pass_ms, gap_ms,
+                             static_cast<unsigned long long>(big_gaps), big_gap_ms);
+                const u64 rec = recorded.load(std::memory_order_relaxed);
+                std::fprintf(stderr, "SOTC GPU PASSES stamps: queued %zu, recorded %llu/s, read %llu, not ready %llu, filtered %llu\n",
+                             stamp_queue.size(), static_cast<unsigned long long>(rec - last_recorded), static_cast<unsigned long long>(read_ok),
+                             static_cast<unsigned long long>(not_ready), static_cast<unsigned long long>(filtered));
+                last_recorded = rec;
+                passes = big_gaps = not_ready = filtered = read_ok = 0;
+                pass_ms = gap_ms = big_gap_ms = 0;
+            }
             for (auto& item : work) {
                 queue.push_back(item);
             }
             work.clear();
             const auto now = clock::now();
-            while (!queue.empty() && semaphore->MarkerReached(Semaphore::MarkerSlot::Timeline, queue.front().first)) {
+            while (!queue.empty() && queue.front().sem->MarkerReached(Semaphore::MarkerSlot::Timeline, queue.front().tick)) {
                 const auto done = clock::now();
-                const auto submit = queue.front().second;
+                const auto submit = queue.front().at;
                 const auto start = std::max(submit, last_done);
                 busy += std::chrono::duration<double, std::milli>(done - start).count();
                 if (submit > last_done) {
@@ -89,7 +196,12 @@ struct GpuTimeDiag {
 GpuTimeDiag* GpuTime() {
     static GpuTimeDiag* diag = [] {
         const char* v = std::getenv("SOTC_GPU_TIME");
-        return v && v[0] == '1' ? new GpuTimeDiag : nullptr;
+        if (!v || (v[0] != '1' && v[0] != '2')) {
+            return static_cast<GpuTimeDiag*>(nullptr);
+        }
+        auto* d = new GpuTimeDiag;
+        d->stamps_on = v[0] == '2';
+        return d;
     }();
     return diag;
 }
@@ -213,6 +325,10 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
     };
 
+    if (auto* diag = GpuTime(); diag && diag->stamps_on && work_semaphore.HasMarker()) {
+        diag->Stamp_(instance.GetDevice(), instance.GetPhysicalDevice().getProperties().limits.timestampPeriod,
+                     CommandBuffer(), &work_semaphore, work_semaphore.CurrentTick(), false);
+    }
     CommandBuffer().beginRendering(rendering_info);
 }
 
@@ -225,6 +341,10 @@ void Scheduler::EndRendering() {
     }
     is_rendering = false;
     CommandBuffer().endRendering();
+    if (auto* diag = GpuTime(); diag && diag->stamps_on && work_semaphore.HasMarker()) {
+        diag->Stamp_(instance.GetDevice(), instance.GetPhysicalDevice().getProperties().limits.timestampPeriod,
+                     CommandBuffer(), &work_semaphore, work_semaphore.CurrentTick(), true);
+    }
 }
 
 vk::CommandBuffer Scheduler::UploadCommandBuffer() {

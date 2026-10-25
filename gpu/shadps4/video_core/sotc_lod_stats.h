@@ -156,7 +156,7 @@ inline void Collect(u64 (&entries)[256]) {
         std::fprintf(stderr, "SOTC LOD: page pool switch off, sampled textures ask for mip %u\n",
                      static_cast<unsigned>(level));
     }
-    if (linger_now && pool_low > 0 && reports++ % 30 == 0) {
+    if (linger_now && pool_low > 0 && reports++ % (coarser ? 6 : 30) == 0) {
         const int free = PoolFreePercent();
         // sotc: with hysteresis. The pool hovers at 0-14% free in large areas (9152 MiB), and
         // switching at one threshold changed the mip every second or two (4, 3, 2, 3, 2...): each
@@ -166,11 +166,15 @@ inline void Collect(u64 (&entries)[256]) {
         // pool_low * 3 / 4).
         u64 want = coarser;
         if (free >= 0) {
-            if (free < pool_low * 3 / 8) {
-                want = 2;
+            // sotc: below pool_low / 8 (1%) three levels: wide views (32:9) ran the pool dry
+            // between two checks and faulted at 0x1a371 (#293, #259); once coarser, check 5x faster.
+            if (free < pool_low / 8) {
+                want = 3;
+            } else if (free < pool_low * 3 / 8) {
+                want = std::max<u64>(coarser == 3 ? 3 : 0, 2);
             } else if (free < pool_low) {
                 want = std::max<u64>(coarser, 1);
-            } else if (coarser == 2) {
+            } else if (coarser >= 2) {
                 want = 1;
             }
             if (want == 1 && coarser == 1 && free > pool_low * 2) {

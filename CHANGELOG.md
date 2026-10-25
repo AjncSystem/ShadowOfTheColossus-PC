@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.60.6-plus7 — 2026-10-25 (fork Lucas-blip-png)
+- **Menu do jogo (F1): aviso sobre o upscaler.** O upscaler só muda na hora entre FSR 1 e bilinear (e a nitidez e a geração
+  de quadros também). FSR 3.1 e DLSS Super Resolution definem o tamanho de renderização ao abrir o jogo, então só se
+  escolhem no lançador; o menu agora diz isso, e que o "FSR 3" mais abaixo é a geração de quadros, não o upscaler (#246).
+- **README:** GIF novo do Santuário sem limite de FPS (Ryzen 7 5700X + RTX 5060 Ti); a legenda avisa que o painel de FPS
+  marca cerca de 3 FPS a menos durante a gravação de tela. O `--video` do benchmark passou a trazer a janela do jogo para
+  a frente e a gravar pela duplicação de desktop da GPU, a 30 FPS (menos custo para o jogo).
+
 ## 0.60.6-plus6 — 2026-10-25 (fork Lucas-blip-png)
 - **Cache de pipelines do driver em disco** (`user/cache/CUSA08809_driver.bin`; `SOTC_DRIVER_CACHE=0` desliga,
   `SOTC_DRIVER_CACHE_MAX_MB` limita o tamanho, 512 por padrão): o `VkPipelineCache` começava vazio a cada abertura, então

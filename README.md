@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC native port · v0.60.6-plus6
+# Shadow of the Colossus — PC native port · v0.60.6-plus7
 
 **The original 0.60.6, plus CPUs without BMI1 (pre-Haswell), CPUs with 4 threads, 120 Hz
 fullscreen, a 32-lane fix for AMD GCN cards (RX 470–590, to test), and the FSR 3.1 and DLSS 4.5 upscalers (NVIDIA RTX).** Everything in [AjncSystem's 0.60.6](https://github.com/AjncSystem/ShadowOfTheColossus-PC)
@@ -210,6 +210,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.60.6-plus7** | **Lucas-blip-png fork:** the F1 in-game menu now says that FSR 3.1 and DLSS are chosen in the launcher (the render size is set when the game starts) and that the "FSR 3" further down is frame generation; new README GIF; `--video` of the Shrine benchmark records lighter. |
 | **0.60.6-plus6** | **Lucas-blip-png fork:** the driver's pipeline cache is kept on disk (`SOTC_DRIVER_CACHE=0` turns it off; the 2,753-pipeline preload takes 0.2-0.3 s instead of 0.7-0.9 s on an RTX 5060 Ti); launcher option **Borderless fullscreen** (never changes the monitor mode); `--video` in the Shrine benchmark. |
 | **0.60.6-plus5** | **Lucas-blip-png fork:** **the Shrine runs at 59–61 FPS uncapped (was 53–54)**: a GENERAL→GENERAL storage-image barrier is now issued once per fence epoch instead of before every draw, so render passes are no longer cut ~20k times a second (`SOTC_GENERAL_SYNC=0` turns it off); partial async readbacks (`SOTC_RB_PARTIAL`); depth sampled as target keeps a consistent layout (`SOTC_DEPTH_RO=0` turns it off); launcher **Report a problem** button (sanitized report: copy, .zip, or a pre-filled GitHub issue; nothing is sent by itself). |
 | **0.60.6-plus4** | **Lucas-blip-png fork:** hot readbacks (`SOTC_RB_HOT`) are on by default again: about +14% in the Shrine (rainbow noise and the 0x49500 crash fixed by Oussama268's late checks; 26 min soak, 0 faults); GPU, launcher (HDR, skip logos, grass options, low-memory warning) and US-release (CUSA08034) work from Oussama268's fork. `SOTC_RB_HOT=0` turns it off. |

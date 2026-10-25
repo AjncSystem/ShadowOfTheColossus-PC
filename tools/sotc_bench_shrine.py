@@ -21,6 +21,10 @@ Open-world routes recorded by a player (src/runtime_pad.c BB_PAD_RECORD / BB_PAD
                              close.
     --replay out/route.txt   gets to the idle scene, plays the recording back and measures the
                              whole replay (frames dumped every 15 s).
+    --video FILE.mp4         records the game window (its FPS panel included) from the idle scene to the
+                             end of the measurement, for demo videos; needs ffmpeg (--ffmpeg, or on PATH),
+                             a visible, unobstructed window, no sound. Combine with --turn, --replay,
+                             --env BB_FULLSCREEN=1 and --env SOTC_FPS_CAP=off.
     --turn SECONDS           at the idle scene, holds --turn-pad (default rx=255, the right
                              stick) for SECONDS, then measures (e.g. Mono on the altar out of view).
 """
@@ -35,6 +39,59 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def client_rect(pid):
+    """Screen rectangle (x, y, w, h) of the client area of the first visible window of process pid."""
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    found = []
+    proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def visit(hwnd, _):
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        if owner.value == pid and user32.IsWindowVisible(hwnd):
+            rect = wintypes.RECT()
+            user32.GetClientRect(hwnd, ctypes.byref(rect))
+            if rect.right > 320 and rect.bottom > 180:
+                origin = wintypes.POINT(0, 0)
+                user32.ClientToScreen(hwnd, ctypes.byref(origin))
+                found.append((origin.x, origin.y, rect.right & ~1, rect.bottom & ~1))
+        return True
+
+    user32.EnumWindows(proc(visit), 0)
+    return found[0] if found else None
+
+
+def start_video(path, pid, ffmpeg):
+    """ffmpeg grabbing the game's client area at 60 FPS; None when the window or ffmpeg is missing."""
+    rect = client_rect(pid)
+    exe = ffmpeg or shutil.which('ffmpeg')
+    if not rect or not exe:
+        print('video: no game window or no ffmpeg (use --ffmpeg)', flush=True)
+        return None
+    x, y, w, h = rect
+    # NVIDIA hardware encoder when present (the game keeps the CPU busy), otherwise x264.
+    nvenc = b'h264_nvenc' in subprocess.run([exe, '-hide_banner', '-encoders'], capture_output=True).stdout
+    codec = ['-c:v', 'h264_nvenc', '-preset', 'p5', '-cq', '19'] if nvenc else \
+            ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18']
+    command = [exe, '-hide_banner', '-loglevel', 'error', '-y', '-f', 'gdigrab', '-framerate', '60',
+               '-offset_x', str(x), '-offset_y', str(y), '-video_size', f'{w}x{h}', '-draw_mouse', '0',
+               '-i', 'desktop', *codec, '-pix_fmt', 'yuv420p', str(path)]
+    print(f'video: recording {w}x{h} at {x},{y} to {path}', flush=True)
+    return subprocess.Popen(command, stdin=subprocess.PIPE)
+
+
+def stop_video(recorder):
+    if recorder and recorder.poll() is None:
+        try:
+            recorder.stdin.write(b'q')
+            recorder.stdin.flush()
+            recorder.wait(timeout=30)
+        except (OSError, subprocess.TimeoutExpired):
+            recorder.kill()
 sys.path.insert(0, str(ROOT / 'scripts'))
 from sotc_modes import game_serial, save_template  # noqa: E402
 GAME = os.environ.get('SOTC_GAME_DIR', str(Path(__file__).resolve().parents[2] / 'CUSA08809'))
@@ -54,6 +111,8 @@ def main():
     parser.add_argument('--template', default='out/save-template', help='save folder holding CUSA08809/ or CUSA08034/')
     parser.add_argument('--record', help='hand over to the player with BB_PAD_RECORD=<file> (F9 stops)')
     parser.add_argument('--replay', help='measure a replay of a BB_PAD_RECORD file')
+    parser.add_argument('--video', help='record the window to this .mp4 from the idle scene on (see the docstring)')
+    parser.add_argument('--ffmpeg', help='path to ffmpeg.exe for --video')
     parser.add_argument('--turn', type=float, default=0,
                         help='at the idle scene, turn the camera (right stick) for this many seconds, then measure')
     parser.add_argument('--turn-pad', default='rx=255',
@@ -231,6 +290,9 @@ def main():
                 pad.write_text('replay')
                 state['assist_state'] = 'done'
 
+        if idle_at is not None and args.video and not state.get('video_tried'):
+            state['video_tried'] = True
+            state['video'] = start_video(args.video, process.pid, args.ffmpeg)
         if idle_at is not None:
             if not shot_times:
                 shot_times = [idle_at + (i + 1) * args.measure / (args.shots + 1) for i in range(args.shots)]
@@ -244,6 +306,7 @@ def main():
                 break
         time.sleep(0.1)
     state['stop'] = True
+    stop_video(state.get('video'))
     if process.poll() is None:
         process.kill()
         process.wait()

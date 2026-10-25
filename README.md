@@ -11,6 +11,9 @@ fork's work on top.
 ![Shrine of Worship, 60 FPS mode, RTX 5060 Ti (FPS from RTSS)](docs/img/sotc-fork.gif)
 
 What it adds:
+- **The Shrine of Worship at 59-61 FPS uncapped** on a Ryzen 7 5700X with an RTX 5060 Ti (it was 53-54 on the same
+  PC): image barriers no longer cut the render passes ~20,000 times a second (0.60.6-plus5). The original 0.60.6 runs
+  the same scene at ~42 FPS with its safe defaults.
 - **CPUs without BMI1/LZCNT/MOVBE** (Intel before Haswell: 2nd/3rd generation Core, Xeon E3 v1/v2;
   AMD FX), which got "This CPU is not supported": the game's ~5,000 such instructions are replaced
   by equivalent routines at startup, only on those CPUs (Oussama268), also in code reached only

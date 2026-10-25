@@ -55,14 +55,21 @@ the original repository.
 - [x] Phase 5: documentation (CHANGELOG, this roadmap)
 
 **Part 2: up to 120 FPS in game, without frame generation**
-- Where we are: the Shrine of Worship runs at ~42 FPS on 0.60.6 with the safe defaults (~54 FPS with
-  the two readback options that caused rainbow noise, `0x49500` crashes and black sand dots turned
-  back on, so they stay off). The render thread needs ~20 ms per frame; 120 FPS means 8.3 ms.
+- Where we are (25/10, 0.60.6-plus5): the Shrine of Worship runs at 59-61 FPS uncapped (it was ~42 on 0.60.6 and
+  53-54 before the barrier change); descriptor reuse and hot readbacks are on by default again. 120 FPS means 8.3 ms.
 - [x] T0: ceiling measured 23/10 (0.60.6 + this fork, 1080p, safe defaults): attract demo 71.2 FPS average (min 48.4,
       draw thread busy 13-14 ms per frame); Shrine 41.6 FPS (draw thread ~20 ms). M1 needs 100, M3 needs 60
 - [x] T1: the game clock follows real time: in the attract demo the camera covers the same path in the same real
       seconds at 30 FPS (capped), 74.6 FPS (60 FPS mode) and 71.7 FPS with a 240 Hz vblank. Physics and animation
       above 60 FPS are not checked yet (needs a frame rate above what the PC reaches today)
+- [x] T2b (25/10, 0.60.6-plus5): the limit was not the CPU but render passes cut by barriers. Every use of a written
+      1920x1080 R32Uint storage image (GENERAL layout) after its previous use made a barrier, and a barrier inside a dynamic
+      render pass ends it (~22k `EndRendering` a second, 98% from `FlushBarriers`). The barrier is now issued once per
+      fence epoch (first use after an EOP/ReleaseMem label), as on GCN, where the game orders UAV writes itself.
+      Shrine 59.2 and 60.9 FPS against 54.0 and 53.0 (interleaved runs); save walks of 400 s and 600 s, 0 faults.
+      `SOTC_GENERAL_SYNC=0` turns it off. Also in plus5: partial async readbacks (+1.3 FPS), `SOTC_DEPTH_RO`.
+      Measured and dropped on the way: a second Vulkan queue for async compute (compute is 10-20% of GPU time), engine
+      cvars, thread affinity, spinning mutexes (contention gone, FPS unchanged), GPU clocks.
 - [ ] T2: reduce CPU work per draw: skip repeated register state, make the fast descriptor reuse safe,
       move pure precomputation off the render thread; splitting the render thread is the last resort
 - [~] T2 so far: `SOTC_FAST_BIND=1` (descriptor reuse, 59% hits) gives +7% in the Shrine (45.3 and 43.9 FPS against
@@ -89,9 +96,10 @@ the original repository.
       against 43.1 / 42.0. The Shrine does not move with any single piece of this traffic.
       A split of the draw thread was measured earlier at 6.7% of its time (no-go). The other T2 items are each
       expected to give a few percent, so the Shrine at 60 FPS (+44%) is not in reach by these alone.
+- [~] T3 (plus5): the barrier change passed two save walks and two screenshots; the open-world sand check and a long soak are still open
 - [ ] T3: every change must pass the rainbow-noise and sand-dot checks before it becomes default
 - [ ] T4: 120 Hz presentation options in the launcher and the in-game menu
-- Milestones: M1 attract demo ≥ 100 FPS · M2 open world ≥ 90 · M3 Shrine ≥ 60 stable with safe
+- Milestones (M3 reached 25/10 with 59.2-60.9 FPS in the Shrine, uncapped; the minimum over 15 s was 58.9-60.3, so "stable" is borderline): M1 attract demo ≥ 100 FPS · M2 open world ≥ 90 · M3 Shrine ≥ 60 stable with safe
   defaults · M4 Shrine 90 · M5 all scenes up to 120. Each one is marked only with a measured number.
 
 **Open items from the 0.60.6 release**
@@ -104,7 +112,7 @@ the original repository.
 
 ## Roteiro (português)
 
-Plano público deste fork, atualizado conforme o trabalho avança (última atualização: 24/10/2026).
+Plano público deste fork, atualizado conforme o trabalho avança (última atualização: 25/10/2026).
 Os números de issue se referem ao repositório original.
 
 **Parte 1: upscalers (mais FPS em GPUs mais fracas, saída 1440p/4K mais nítida)**
@@ -121,15 +129,23 @@ Os números de issue se referem ao repositório original.
 - [x] Fase 5: documentação (CHANGELOG, este roteiro)
 
 **Parte 2: até 120 FPS no jogo, sem geração de quadros**
-- Onde estamos: o Santuário de Culto roda a ~42 FPS na 0.60.6 com os padrões seguros (~54 FPS
-  com as duas opções de leitura que causavam ruído colorido, crashes `0x49500` e pontos pretos na
-  areia religadas, então elas continuam desligadas). A thread de desenho gasta ~20 ms por quadro;
+- Onde estamos (25/10, 0.60.6-plus5): o Santuário de Culto roda a 59-61 FPS sem limite (eram ~42 na 0.60.6 e 53-54
+  antes da mudança das barreiras); o reaproveitamento de descritores e as leituras quentes voltaram a ser padrão.
   120 FPS significam 8,3 ms.
 - [x] T0: teto medido em 23/10 (0.60.6 + este fork, 1080p, padrões seguros): demo de atração 71,2 FPS de média (mínima
       48,4, thread de desenho ocupada 13-14 ms por quadro); Santuário 41,6 FPS (thread de desenho ~20 ms). M1 pede 100, M3 pede 60
 - [x] T1: o relógio do jogo segue o tempo real: na demo de atração a câmera percorre o mesmo caminho nos mesmos segundos
       reais a 30 FPS (travado), 74,6 FPS (modo 60) e 71,7 FPS com vblank de 240 Hz. Física e animação acima de 60 FPS
       ainda não foram conferidas (precisa de uma taxa que este PC ainda não alcança)
+- [x] T2b (25/10, 0.60.6-plus5): o limite não era a CPU, e sim os passes de renderização cortados por barreiras. Cada
+      uso de uma imagem de armazenamento 1920x1080 R32Uint escrita (layout GENERAL) depois do uso anterior gerava uma
+      barreira, e uma barreira dentro de um passe dinâmico o encerra (~22 mil `EndRendering` por segundo, 98% vindos do
+      `FlushBarriers`). A barreira agora sai uma vez por época de fence (primeiro uso depois de um rótulo EOP/ReleaseMem),
+      como no GCN, onde o próprio jogo ordena as escritas em UAV. Santuário 59,2 e 60,9 FPS contra 54,0 e 53,0 (execuções
+      intercaladas); roteiros de save de 400 s e 600 s, 0 falhas. `SOTC_GENERAL_SYNC=0` desliga. Também na plus5: leituras
+      de volta assíncronas parciais (+1,3 FPS) e `SOTC_DEPTH_RO`. Medido e descartado no caminho: segunda fila Vulkan para
+      compute assíncrono (compute é 10 a 20% do tempo da GPU), cvars do motor, afinidade de threads, mutex com espera ativa
+      (a contenção sumiu e o FPS não mudou), clocks da GPU.
 - [ ] T2: reduzir o trabalho de CPU por desenho: pular estado de registradores repetido, tornar seguro o
       reaproveitamento de descritores, mover pré-cálculo puro para fora da thread de desenho; dividir a
       thread de desenho é o último recurso
@@ -157,9 +173,10 @@ Os números de issue se referem ao repositório original.
       recursos é 43% dela (texturas 19%, buffers 15%) e depende de estado dos caches que só ela possui; as proteções
       de página que ela pede custam 1,6 ms por quadro (14.800 chamadas/s, `SOTC_PROTECT_STATS=1`); o pré-cálculo puro
       (dados de usuário, sharps, hashes) é poucos por cento. Não compensa o risco de texturas velhas.
+- [~] T3 (plus5): a mudança das barreiras passou em dois roteiros de save e duas capturas de tela; a checagem da areia no mundo aberto e um soak longo continuam pendentes
 - [ ] T3: cada mudança precisa passar pelos testes de ruído colorido e de pontos pretos antes de virar padrão
 - [ ] T4: opções de apresentação a 120 Hz no launcher e no menu do jogo
-- Marcos: M1 demo de atração ≥ 100 FPS · M2 mundo aberto ≥ 90 · M3 Santuário ≥ 60 estável com os padrões
+- Marcos (M3 atingido em 25/10 com 59,2 a 60,9 FPS no Santuário sem limite; o mínimo em 15 s foi 58,9 a 60,3, então "estável" fica no limite): M1 demo de atração ≥ 100 FPS · M2 mundo aberto ≥ 90 · M3 Santuário ≥ 60 estável com os padrões
   seguros · M4 Santuário 90 · M5 todas as cenas até 120. Cada marco só é marcado com um número medido.
 
 **Pendências da versão 0.60.6**

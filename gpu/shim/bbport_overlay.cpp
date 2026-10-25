@@ -433,6 +433,13 @@ void QuickSettings() {
         }
         ImGui::EndCombo();
     }
+    if (!has_fsr3) {
+        // sotc: the temporal upscalers set the game's render size when it starts.
+        Hint(T("FSR 3.1 e DLSS só no lançador (o tamanho de renderização é definido ao abrir o jogo). "
+               "'FSR 3' mais abaixo é a geração de quadros.",
+               "FSR 3.1 and DLSS are chosen in the launcher (the render size is set when the game starts). "
+               "'FSR 3' below is frame generation."));
+    }
     static const int env_rcas = [] {
         const char* on = std::getenv("BB_RCAS");
         if (on && on[0] == '0') {

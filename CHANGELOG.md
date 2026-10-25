@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.60.6-plus8 — 2026-10-25 (fork Lucas-blip-png)
+- **VRAM automática** (nova opção padrão do lançador): o "limite de 6 GB" do overlay é o orçamento que o Windows e o driver
+  dão ao jogo (`VK_EXT_memory_budget`), não uma configuração. O port agora escolhe sozinho, por esse orçamento, quando
+  começar a liberar texturas e quanto manter de buffers: menos de 5,5 GB usa 50% e 1024 MB; até 10,5 GB usa 75% e 4096 MB;
+  acima disso 85% e sem limite de buffers. Quem já tinha salvo "normal" ou outra opção mantém a escolha.
+- **Resolução até 1440p** com FSR 3.1 e DLSS (antes 1080p): o 4K nativo continua bloqueado porque perde as texturas finas
+  (pedra e roupas ficam visivelmente borradas) e roda a cerca de 43 FPS na RTX 5060 Ti. 1440p nativo: 54 FPS; 1080p para
+  4K por FSR 1: 54 a 58 FPS; DLSS 1080p para 4K: 52 a 53 FPS. O caminho simples (FSR 1 e bilinear) continua em 1080p.
+- **Pool de texturas (falha em `0x1a371`, #259, #293, #283, #241):** a válvula de LOD confere o pool com mais frequência
+  quando já está engrossando mips, ganhou um nível extra (mip +3) abaixo de 1% livre e só solta acima de 2%. A falha de
+  origem está no jogo (lê o mapa de páginas com índice -1 quando não há página livre) e só reproduzi com
+  `SOTC_LOD_LEVEL=0`; com a válvula nova três corridas de 196 s não falharam. Se continuar acontecendo, mande o `last_run.log`.
+- **Diagnóstico:** `SOTC_GPU_TIME=1|2` (com `SOTC_WAIT_MARKER=1`) mede o tempo ocupado da GPU por segundo, carimbos de tempo
+  por passe e as esperas do CPU. Achado: a 1080p o jogo já está no teto de 60 FPS do próprio jogo; em 4K o limite é o
+  trabalho de GPU (14 a 16 ms por quadro em muitos passes pequenos e dependentes). `tools/sotc_route_test.sh` repete uma
+  rota gravada (`tools/routes/deserto_wide.txt`) para benchmark.
+
 ## 0.60.6-plus7 — 2026-10-25 (fork Lucas-blip-png)
 - **Menu do jogo (F1): aviso sobre o upscaler.** O upscaler só muda na hora entre FSR 1 e bilinear (e a nitidez e a geração
   de quadros também). FSR 3.1 e DLSS Super Resolution definem o tamanho de renderização ao abrir o jogo, então só se

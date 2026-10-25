@@ -232,6 +232,13 @@ private:
         bool is_write{};
         bool waiting{};
         bool dirty{};
+        /// sotc: a write that made it dirty touched the pages of the request itself (the rest of
+        /// the window can be left GPU-modified; the request cannot).
+        bool request_dirty{};
+        /// sotc: the page spans (sorted, merged) touched since the copies; past 32 only the request
+        /// pages are kept (spans_overflow).
+        boost::container::small_vector<std::pair<VAddr, VAddr>, 32> dirty_spans;
+        bool spans_overflow{};
         bool dependent{};
         bool finished{};
         u64 tick{};
@@ -250,7 +257,7 @@ private:
     void MarkWrittenByGuest(VAddr addr, u64 size);
     void FinishAsyncReadback(AsyncReadback& readback);
     AsyncReadback* FindInflightReadback(VAddr addr, u64 size);
-    void MarkInflightReadbacksDirty(VAddr addr, u64 size);
+    void MarkInflightReadbacksDirty(VAddr addr, u64 size, bool gpu_write = false);
     std::vector<AsyncReadback*> inflight_readbacks;
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,

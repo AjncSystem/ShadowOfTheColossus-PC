@@ -42,6 +42,7 @@ inline std::atomic<uint64_t> mem_epoch{0};
 inline std::atomic<bool> load_flush{false};
 /// sotc: bytes of hot readbacks not applied because the guest may have written them since.
 inline std::atomic<uint64_t> rb_hot_cpu_skipped{0};
+inline std::atomic<uint64_t> rb_partial{0}; ///< dirty readbacks finished on the request pages only (SOTC_RB_PARTIAL)
 /// sotc: bytes of hot readbacks not applied because the guest wrote them during the GPU wait.
 inline std::atomic<uint64_t> rb_hot_late_skipped{0};
 inline std::atomic<uint64_t> readbacks{0};    ///< BufferCache::DownloadMemory calls

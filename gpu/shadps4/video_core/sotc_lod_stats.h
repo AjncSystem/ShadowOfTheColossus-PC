@@ -171,9 +171,9 @@ inline void Collect(u64 (&entries)[256]) {
             if (free < pool_low / 8) {
                 want = 3;
             } else if (free < pool_low * 3 / 8) {
-                want = std::max<u64>(coarser == 3 ? 3 : 0, 2);
+                want = coarser == 3 && free < pool_low / 4 ? 3 : 2; // 3 holds until 2% free
             } else if (free < pool_low) {
-                want = std::max<u64>(coarser, 1);
+                want = std::max<u64>(std::min<u64>(coarser, 2), 1);
             } else if (coarser >= 2) {
                 want = 1;
             }

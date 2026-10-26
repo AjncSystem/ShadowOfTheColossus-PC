@@ -1,0 +1,60 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Post-dispatch UI stamp: copies static HUD pixels from color (real frame) onto
+// output (FSR 3 generated frame) wherever ui_mask indicates HUD elements with a 2px dilation.
+
+#version 450 core
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout (local_size_x = 8, local_size_y = 8) in;
+
+layout (binding = 0, set = 0) uniform texture2D ui_mask_in;
+layout (binding = 1, set = 0) uniform texture2D real_color_in;
+layout (binding = 2, set = 0, rgba8) uniform image2D fg_output_inout;
+layout (binding = 3, set = 0) buffer Stats {
+    uint stamped_pixels;
+    uint min_x;
+    uint max_x;
+    uint min_y;
+    uint max_y;
+} stats;
+
+layout (push_constant) uniform Params {
+    uvec2 size;
+} pc;
+
+void main() {
+    const ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (at.x >= int(pc.size.x) || at.y >= int(pc.size.y)) {
+        return;
+    }
+
+    const ivec2 mask_dim = textureSize(ui_mask_in, 0);
+    // Proportional mapping from output resolution (pc.size) to mask resolution (mask_dim)
+    const ivec2 mask_center = ivec2((vec2(at) + 0.5) * vec2(mask_dim) / vec2(pc.size));
+
+    // 4-pixel dilation check around 'mask_center' in ui_mask_in
+    bool is_ui = false;
+    for (int dy = -4; dy <= 4; ++dy) {
+        for (int dx = -4; dx <= 4; ++dx) {
+            const ivec2 sample_pos = clamp(mask_center + ivec2(dx, dy), ivec2(0), mask_dim - ivec2(1));
+            const vec4 ui = texelFetch(ui_mask_in, sample_pos, 0);
+            if (max(max(ui.r, ui.g), max(ui.b, ui.a)) > 0.002) {
+                is_ui = true;
+                break;
+            }
+        }
+        if (is_ui) {
+            break;
+        }
+    }
+
+    if (is_ui) {
+        const vec4 real_px = texelFetch(real_color_in, at, 0);
+        imageStore(fg_output_inout, at, real_px);
+        atomicAdd(stats.stamped_pixels, 1);
+        atomicMin(stats.min_x, uint(at.x));
+        atomicMax(stats.max_x, uint(at.x));
+        atomicMin(stats.min_y, uint(at.y));
+        atomicMax(stats.max_y, uint(at.y));
+    }
+}

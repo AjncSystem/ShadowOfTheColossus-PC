@@ -98,4 +98,18 @@ struct FrameInputs {
 /// Present thread: the inputs of presentation frame `frame_id`, false when it has none.
 bool GetFrameInputs(u32 frame_id, FrameInputs& out);
 
+/// Command processor thread: captures offscreen UI canvases during UI draw calls.
+void CheckCaptureHudless(const AmdGpu::Regs& regs, u32 mrt_mask, VideoCore::ImageId cb0_id,
+                         VideoCore::TextureCache& texture_cache, Scheduler& scheduler,
+                         Runtime& runtime);
+bool HasCapturedHudless(u32 frame_id);
+vk::Image GetStagingHudlessImage();
+vk::ImageView GetStagingHudlessView();
+u32 GetStagingHudlessWidth();
+u32 GetStagingHudlessHeight();
+
 } // namespace Vulkan::Dlssg
+
+namespace Vulkan::FgInputs {
+    using namespace Dlssg;
+}

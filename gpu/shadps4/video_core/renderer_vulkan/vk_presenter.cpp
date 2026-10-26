@@ -487,7 +487,9 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     // for half a frame: 4 frames in flight so that the command processor does not wait for the
     // presenter.
     const u32 num_frames =
-        Dlssg::Enabled() || FrameGen::AskedAtStart() ? std::max(num_images, 4u) : num_images;
+        FrameGen::Available(FrameGen::Mode::Fsr)
+            ? std::max(num_images + 3, 6u)
+            : (Dlssg::Enabled() || FrameGen::AskedAtStart() ? std::max(num_images, 4u) : num_images);
     present_frames.resize(num_frames);
     hudless_frames.resize(num_frames);
     for (u32 i = 0; i < num_frames; i++) {
@@ -812,10 +814,66 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
 
     // sotc: the game frame without the HUD, through the same pass (frame generation keeps the
-    // HUD of the real frame instead of interpolating it). Not with FSR 1 scaling, whose images
-    // are a ring meant for one frame each.
-    if (const vk::ImageView hudless_view = rasterizer->TakeHudless(cpu_address, view_info.format);
-        hudless_view && !DebugState.is_using_fsr) {
+    // HUD of the real frame instead of interpolating it).
+    frame->hudless = nullptr;
+    if (Dlssg::HasCapturedHudless(frame->id)) {
+        const vk::Image staging = Dlssg::GetStagingHudlessImage();
+        if (staging) {
+            Frame& hudless = hudless_frames[frame->id];
+            if (hudless.width != frame->width || hudless.height != frame->height ||
+                hudless.is_hdr != frame->is_hdr || !hudless.image) {
+                RecreateFrame(&hudless, frame->width, frame->height);
+            }
+            const auto hudless_pre_barrier = vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                .srcAccessMask = vk::AccessFlagBits2::eNone,
+                .dstStageMask = vk::PipelineStageFlagBits2::eBlit,
+                .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .oldLayout = vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                .image = hudless.image,
+                .subresourceRange = frame_subresources,
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .imageMemoryBarrierCount = 1,
+                .pImageMemoryBarriers = &hudless_pre_barrier,
+            });
+
+            const s32 src_w = static_cast<s32>(Dlssg::GetStagingHudlessWidth() ? Dlssg::GetStagingHudlessWidth() : image_size.width);
+            const s32 src_h = static_cast<s32>(Dlssg::GetStagingHudlessHeight() ? Dlssg::GetStagingHudlessHeight() : image_size.height);
+            const vk::ImageBlit blit{
+                .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
+                                         vk::Offset3D{src_w, src_h, 1}},
+                .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                .dstOffsets = std::array{vk::Offset3D{0, 0, 0},
+                                         vk::Offset3D{static_cast<s32>(frame->width),
+                                                      static_cast<s32>(frame->height), 1}},
+            };
+            cmdbuf.blitImage(staging, vk::ImageLayout::eTransferSrcOptimal, hudless.image,
+                             vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eNearest);
+
+            const auto hudless_post_barrier = vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eBlit,
+                .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader |
+                                vk::PipelineStageFlagBits2::eFragmentShader,
+                .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
+                .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+                .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+                .image = hudless.image,
+                .subresourceRange = frame_subresources,
+            };
+            cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .imageMemoryBarrierCount = 1,
+                .pImageMemoryBarriers = &hudless_post_barrier,
+            });
+            frame->hudless = &hudless;
+            Dlssg::NoteHudless(frame->id, hudless.image, hudless.image_view,
+                               swapchain.GetSurfaceFormat().format, hudless.width, hudless.height);
+        }
+    } else if (const vk::ImageView hudless_view = rasterizer->TakeHudless(cpu_address, view_info.format);
+               hudless_view && !DebugState.is_using_fsr) {
         Frame& hudless = hudless_frames[frame->id];
         if (hudless.width != frame->width || hudless.height != frame->height ||
             hudless.is_hdr != frame->is_hdr || !hudless.image) {
@@ -1317,8 +1375,11 @@ bool Presenter::PresentGenerated(Frame* frame) {
     auto& scheduler = present_scheduler;
     const auto cmdbuf = scheduler.CommandBuffer();
     const vk::Image generated =
-        FsrFg::Generate(cmdbuf, frame->id, frame->image, frame->width, frame->height,
-                        frame->hudless ? frame->hudless->image : vk::Image{});
+        FsrFg::Generate(cmdbuf, frame->id, frame->image,
+                        frame->hudless ? frame->hudless->image : vk::Image{},
+                        frame->hudless ? frame->hudless->image_view : vk::ImageView{},
+                        frame->hudless != nullptr,
+                        frame->width, frame->height);
 
     // FSR 3 reads the game frame and its inputs: after the frame's own commands.
     if (frame->ready_semaphore == draw_scheduler.GetWorkSemaphore()->Handle()) {

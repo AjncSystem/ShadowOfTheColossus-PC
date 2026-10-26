@@ -241,6 +241,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
         }
     }
     std::scoped_lock lock{mutex};
+    upload_generation.fetch_add(1, std::memory_order_release);
     ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
         const auto image_begin = image.info.guest_address;
         const auto image_end = image.info.guest_address + image.info.guest_size;
@@ -270,6 +271,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
 
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
     std::scoped_lock lock{mutex};
+    upload_generation.fetch_add(1, std::memory_order_release);
     // sotc: SOTC_IMG_GPU_OVERLAP=1 also reuploads images inside a range a shader wrote as a
     // buffer, not only an image at its exact base (test for the empty 960x540 A2B10G10R10
     // lighting input behind the black shadows; it did not change the image, 2026-10-12).

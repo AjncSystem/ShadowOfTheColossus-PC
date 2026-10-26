@@ -133,6 +133,8 @@ add_host_shader(fsr.comp fsr_rcas_comp SAMPLE_RCAS=1)
 add_host_shader(post_process.frag post_process_frag)
 add_host_shader(shadow_scroll.frag shadow_scroll_frag)
 add_host_shader(fg_depth.comp fg_depth_comp)
+add_host_shader(fg_ui_mask.comp fg_ui_mask_comp)
+add_host_shader(fg_ui_inpaint.comp fg_ui_inpaint_comp)
 foreach(BPP IN ITEMS 8 16 32 64 96 128)
     add_host_shader(tiling.comp tiling_micro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=0)
     add_host_shader(tiling.comp tiling_macro_${BPP}_comp BITS_PER_PIXEL=${BPP} IS_MACRO_TILED=1)
@@ -205,38 +207,9 @@ extern "C" void ffxVkFsr3_3_1_6FrameGenerationContextDestroy(]=] [=[
 
 extern "C" void ffxVkFsr3_3_1_6FrameGenerationContextDestroy(]=]
     fsr_fg_patched "${fsr_fg_patched}")
-# Frame generation without the HUD (vk_fsrfg.cpp sets sotc_fsrfg_hudless before RecordPrepare):
-# the HUD-less frame feeds the optical flow and is the interpolation source; FSR 3 then keeps the
-# real frame's pixels where the two differ (the HUD).
-string(REPLACE "#include <vector>\n"
-    "#include <vector>\n/* sotc */ extern \"C\" { FfxVkFsr3_3_1_6FrameGenerationImage sotc_fsrfg_hudless{}; }\nstatic FfxApiResource sotc_hudless_resource{};\n"
-    fsr_fg_patched "${fsr_fg_patched}")
-string(REPLACE [=[
-    flow.color = context->color;
-]=] [=[
-    flow.color = context->color;
-    sotc_hudless_resource = {}; /* sotc */
-    if (sotc_fsrfg_hudless.image != VK_NULL_HANDLE) {
-        const FfxVkFsr3_3_1_5Resource hudless =
-            import_frame_image(context->bridge, sotc_fsrfg_hudless, false);
-        sotc_hudless_resource = ffxVkFsr3_3_1_5BridgeResolveResource(context->bridge, hudless);
-        if (sotc_hudless_resource.resource) {
-            context->pendingImports.push_back(hudless);
-            flow.color = sotc_hudless_resource;
-        } else {
-            ffxVkFsr3_3_1_5BridgeReleaseImportedImage(context->bridge, hudless);
-        }
-    }
-]=] fsr_fg_patched "${fsr_fg_patched}")
-string(REPLACE [=[
-    dispatch.currentBackBuffer = context->color;
-]=] [=[
-    dispatch.currentBackBuffer = context->color;
-    dispatch.currentBackBuffer_HUDLess = sotc_hudless_resource; /* sotc */
-]=] fsr_fg_patched "${fsr_fg_patched}")
 string(REGEX MATCHALL "/\\* sotc \\*/" fsr_fg_marks "${fsr_fg_patched}")
 list(LENGTH fsr_fg_marks fsr_fg_mark_count)
-if (NOT fsr_fg_mark_count EQUAL 5)
+if (NOT fsr_fg_mark_count EQUAL 2)
     message(FATAL_ERROR "fsr-vulkan changed: update the frame generation fix in gpu/CMakeLists.txt")
 endif()
 set(FSR_FG_PATCHED ${CMAKE_CURRENT_BINARY_DIR}/sotc_fsr3_framegen.cpp)

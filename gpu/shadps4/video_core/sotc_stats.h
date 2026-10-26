@@ -25,8 +25,30 @@ inline const bool kCmdStats = std::getenv("SOTC_CMD_STATS") != nullptr;
 /// (mem_epoch below) waits for a check on that ground.
 inline const bool kFastBind = [] {
     const char* v = std::getenv("SOTC_FAST_BIND");
-    return v && v[0] == '1';
+    return !v || v[0] != '0';
 }();
+inline const bool kFastBindSlots = [] {
+    const char* v = std::getenv("SOTC_FAST_BIND_SLOTS");
+    return !v || v[0] != '0';
+}();
+inline const bool kPartialBind = [] {
+    const char* v = std::getenv("SOTC_PARTIAL_BIND");
+    return !v || v[0] != '0';
+}();
+inline std::atomic<uint64_t> full_hits{0};
+inline std::atomic<uint64_t> slot_fs_hits{0};
+inline std::atomic<uint64_t> slot_commits{0};
+inline std::atomic<uint64_t> slot_reject_size{0};
+inline std::atomic<uint64_t> slot_reject_write{0};
+inline std::atomic<uint64_t> slot_evicts{0};
+inline std::atomic<uint64_t> misses{0};
+inline std::atomic<uint64_t> fast_miss_invalid{0};
+inline std::atomic<uint64_t> fast_miss_pipeline{0};
+inline std::atomic<uint64_t> fast_miss_tick{0};
+inline std::atomic<uint64_t> fast_miss_buffer{0};
+inline std::atomic<uint64_t> fast_miss_texture{0};
+inline std::atomic<uint64_t> fast_miss_stream{0};
+inline std::atomic<uint64_t> fast_miss_hash{0};
 inline std::atomic<uint64_t> fast_bind_eligible{0};
 inline std::atomic<uint64_t> fast_bind_hits{0};
 /// sotc: bumped whenever guest memory changes outside the GPU's own draws: a write by the command
@@ -227,6 +249,8 @@ inline std::atomic<uint64_t> cp_frame{0};
 /// sotc: what the in-game performance overlay shows (bbport_overlay.cpp, show_fps / F10),
 /// published by the SOTC_FPS printer at the end of each five-second window (videoout/driver.cpp).
 inline std::atomic<float> ov_cmds_per_frame{0.0f};
+inline std::atomic<float> ov_draw_busy_ms{0.0f};
+inline std::atomic<float> ov_cp_parse_ms{0.0f};
 inline std::atomic<float> ov_readbacks_per_s{0.0f};
 inline std::atomic<float> ov_readback_ms_per_s{0.0f};
 inline std::atomic<uint32_t> ov_compiles_window{0};
@@ -240,6 +264,27 @@ inline std::atomic<uint32_t> ov_fg_frames{0};
 inline std::atomic<uint32_t> ov_fg_status{0};
 /// FSR 3 frame generation (vk_fsrfg.cpp): 0 waiting for a 3D scene, 1 generating, 2 error.
 inline std::atomic<int> ov_fsr_state{0};
+/// FSR 3 HUDless capture telemetry (vk_fsrfg.cpp):
+/// state: 0 = OFF, 1 = ON, 2 = REJECTED by dispatch.
+inline std::atomic<int> ov_hudless_state{0};
+inline std::atomic<uint32_t> ov_hudless_draw_idx{0};
+inline std::atomic<uint32_t> ov_hudless_total_draws{0};
+inline std::atomic<uint32_t> ov_hudless_is_vo{0};
+inline std::atomic<uint32_t> ov_hudless_canvases{0};
+inline std::atomic<uint32_t> ov_hudless_ui_px{0};
+inline std::atomic<uint32_t> ov_hudless_min_x{0};
+inline std::atomic<uint32_t> ov_hudless_max_x{0};
+inline std::atomic<uint32_t> ov_hudless_min_y{0};
+inline std::atomic<uint32_t> ov_hudless_max_y{0};
+enum class HudlessReason : uint32_t {
+    None = 0,
+    NoGbuffer = 1,
+    NoHudDraw = 2,
+    FormatMismatch = 3,
+    DispatchRejected = 4,
+    NoVoTarget = 5,
+};
+inline std::atomic<uint32_t> ov_hudless_reason{0};
 /// Phases of PipelineCache::CompileModule (SOTC_FPS, "SOTC COMPILE" line): translate, emit SPIR-V,
 /// shader patch lookup, vkCreateShaderModule, cache registration.
 inline std::atomic<uint64_t> compile_phase_ns[5]{};

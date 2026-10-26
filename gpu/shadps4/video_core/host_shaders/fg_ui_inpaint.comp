@@ -1,0 +1,83 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Pre-dispatch UI inpaint: removes HUD elements from the color image before FSR 3
+// frame generation, replacing HUD pixels with surrounding background scene colors.
+// This prevents FSR 3 from seeing the HUD and dragging ghost copies of it across the screen.
+
+#version 450 core
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout (local_size_x = 8, local_size_y = 8) in;
+
+layout (binding = 0, set = 0) uniform texture2D ui_mask_in;
+layout (binding = 1, set = 0) uniform texture2D real_color_in;
+layout (binding = 2, set = 0, rgba8) uniform image2D clean_color_out;
+
+layout (push_constant) uniform Params {
+    uvec2 size;
+} pc;
+
+void main() {
+    const ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (at.x >= int(pc.size.x) || at.y >= int(pc.size.y)) {
+        return;
+    }
+
+    const ivec2 mask_dim = textureSize(ui_mask_in, 0);
+    const ivec2 mask_center = ivec2((vec2(at) + 0.5) * vec2(mask_dim) / vec2(pc.size));
+
+    // Dilation check: 4-pixel radius around mask_center to cover UI elements and their edges
+    bool is_ui = false;
+    for (int dy = -4; dy <= 4; ++dy) {
+        for (int dx = -4; dx <= 4; ++dx) {
+            const ivec2 sp = clamp(mask_center + ivec2(dx, dy), ivec2(0), mask_dim - ivec2(1));
+            const vec4 m = texelFetch(ui_mask_in, sp, 0);
+            if (max(max(m.r, m.g), max(m.b, m.a)) > 0.002) {
+                is_ui = true;
+                break;
+            }
+        }
+        if (is_ui) {
+            break;
+        }
+    }
+
+    if (!is_ui) {
+        // Authentic scene pixel: pass through unchanged
+        const vec4 c = texelFetch(real_color_in, at, 0);
+        imageStore(clean_color_out, at, c);
+        return;
+    }
+
+    // UI pixel: inpaint by sampling non-UI background around the HUD
+    // Cast rays in 8 directions to find the nearest non-UI pixels outside the HUD
+    const ivec2 dirs[8] = ivec2[](
+        ivec2(-1, 0), ivec2(0, -1), ivec2(-1, -1), ivec2(-1, 1),
+        ivec2(1, -1), ivec2(0, 1), ivec2(1, 0), ivec2(1, 1)
+    );
+
+    vec4 accum = vec4(0.0);
+    float total_w = 0.0;
+
+    for (int d = 0; d < 8; ++d) {
+        for (int step = 6; step <= 84; step += 6) {
+            const ivec2 sp = mask_center + dirs[d] * step;
+            if (sp.x < 0 || sp.x >= mask_dim.x || sp.y < 0 || sp.y >= mask_dim.y) {
+                break;
+            }
+            const vec4 m = texelFetch(ui_mask_in, sp, 0);
+            if (max(max(m.r, m.g), max(m.b, m.a)) <= 0.002) {
+                // Non-UI background reached! Map to color coordinates and sample.
+                const ivec2 color_pos = clamp(ivec2((vec2(sp) + 0.5) * vec2(pc.size) / vec2(mask_dim)),
+                                              ivec2(0), ivec2(pc.size) - ivec2(1));
+                const vec4 c = texelFetch(real_color_in, color_pos, 0);
+                const float w = 1.0 / float(step);
+                accum += c * w;
+                total_w += w;
+                break;
+            }
+        }
+    }
+
+    const vec4 inpainted = (total_w > 0.0) ? (accum / total_w) : texelFetch(real_color_in, at, 0);
+    imageStore(clean_color_out, at, inpainted);
+}

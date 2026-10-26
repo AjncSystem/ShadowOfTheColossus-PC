@@ -156,6 +156,54 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     // Prefetch render targets to handle overlaps with bound textures (e.g. mipgen)
     const auto& key = pipeline->GetGraphicsKey();
     const auto& regs = liverpool->DrawRegs();
+
+    // sotc: consecutive draws usually keep the same attachments. Rebuilding the image descs and
+    // calling FindImage for every one of them was ~10% of the draw thread. Reuse cb_descs/db_desc
+    // while the attachment state and the texture cache generation are unchanged.
+    const auto hash_bytes = [](u64 hash, const void* data, size_t size) {
+        return XXH3_64bits_withSeed(data, size, hash);
+    };
+    u64 target_hash = 0x9E3779B97F4A7C15ULL;
+    const u32 color_mode = static_cast<u32>(regs.color_control.mode);
+    target_hash = hash_bytes(target_hash, &key.mrt_mask, sizeof(key.mrt_mask));
+    target_hash = hash_bytes(target_hash, &color_mode, sizeof(color_mode));
+    target_hash = hash_bytes(target_hash, regs.color_buffers, sizeof(regs.color_buffers));
+    target_hash = hash_bytes(target_hash, &regs.color_target_mask.raw,
+                             sizeof(regs.color_target_mask.raw));
+    target_hash = hash_bytes(target_hash, &regs.depth_control, sizeof(regs.depth_control));
+    target_hash = hash_bytes(target_hash, &regs.depth_render_control,
+                             sizeof(regs.depth_render_control));
+    target_hash = hash_bytes(target_hash, &regs.depth_clear, sizeof(regs.depth_clear));
+    target_hash = hash_bytes(target_hash, &regs.stencil_clear, sizeof(regs.stencil_clear));
+    target_hash = hash_bytes(target_hash, &regs.depth_buffer, sizeof(regs.depth_buffer));
+    target_hash = hash_bytes(target_hash, &regs.depth_view, sizeof(regs.depth_view));
+    target_hash = hash_bytes(target_hash, &regs.depth_htile_data_base,
+                             sizeof(regs.depth_htile_data_base));
+    target_hash = hash_bytes(target_hash, key.color_samples.data(), sizeof(key.color_samples));
+    target_hash = hash_bytes(target_hash, liverpool->DrawCbExtent().data(),
+                             sizeof(liverpool->DrawCbExtent()));
+    target_hash = hash_bytes(target_hash, &liverpool->DrawDbExtent(),
+                             sizeof(liverpool->DrawDbExtent()));
+    const u64 target_generation = texture_cache.BindGeneration();
+    target_hash = hash_bytes(target_hash, &target_generation, sizeof(target_generation));
+    if (target_cache_valid && target_hash == target_cache_hash &&
+        target_generation == target_cache_generation) {
+        for (s32 cb = 0; cb < std::bit_width(key.mrt_mask); ++cb) {
+            if (auto image_id = cb_descs[cb].first; image_id) {
+                bound_images.emplace_back(image_id);
+                texture_cache.GetImage(image_id).binding.is_target = 1u;
+            }
+        }
+        if (auto image_id = db_desc.first; image_id) {
+            bound_images.emplace_back(image_id);
+            texture_cache.GetImage(image_id).binding.is_target = 1u;
+        }
+        return;
+    }
+    target_cache_hash = target_hash;
+    target_cache_generation = target_generation;
+    target_cache_valid = true;
+
     if (regs.color_control.degamma_enable) {
         LOG_WARNING(Render_Vulkan, "Color buffers require gamma correction");
     }
@@ -925,6 +973,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
     if (Dlssg::CapturingInputs()) { // sotc: camera and inputs of frame generation
         Dlssg::NoteDraw(regs, pipeline->GetGraphicsKey().mrt_mask, db_desc.first,
                         cb_descs[4].first, texture_cache);
+        Dlssg::CheckCaptureHudless(regs, pipeline->GetGraphicsKey().mrt_mask, cb_descs[0].first,
+                                   texture_cache, scheduler, runtime);
     }
     if (!BindResources(pipeline)) {
         SotcStats::Drop(1, regs.color_buffers[0].Address(), 0);
@@ -1026,6 +1076,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (Dlssg::CapturingInputs()) { // sotc: camera and inputs of frame generation
         Dlssg::NoteDraw(liverpool->DrawRegs(), pipeline->GetGraphicsKey().mrt_mask, db_desc.first,
                         cb_descs[4].first, texture_cache);
+        Dlssg::CheckCaptureHudless(liverpool->DrawRegs(), pipeline->GetGraphicsKey().mrt_mask,
+                                   cb_descs[0].first, texture_cache, scheduler, runtime);
     }
     if (!BindResources(pipeline)) {
         SotcStats::Drop(1, liverpool->DrawRegs().color_buffers[0].Address(), 1);
@@ -1392,33 +1444,269 @@ bool Rasterizer::FastBindEligible(const Pipeline* pipeline) const {
     return true;
 }
 
-u64 Rasterizer::FastBindHash(const Pipeline* pipeline, const Shader::PushData& push_data) const {
+bool Rasterizer::FastBindCanReuseFragment(const Pipeline* pipeline) const {
+    const auto stages = pipeline->GetStages();
+    if (stages.empty() || !stages[0] ||
+        stages[0]->sw_stage != Shader::SwStage::Fragment) {
+        return false;
+    }
+    bool has_vertex = false;
+    for (size_t i = 1; i < stages.size(); ++i) {
+        const auto* stage = stages[i];
+        if (!stage) {
+            continue;
+        }
+        if (stage->sw_stage != Shader::SwStage::Vertex || has_vertex) {
+            return false;
+        }
+        has_vertex = true;
+    }
+    return has_vertex;
+}
+
+u64 Rasterizer::FastBindTargetsHash() const {
     const auto& regs = liverpool->DrawRegs();
-    u64 hash = XXH3_64bits(&pipeline, sizeof(pipeline));
-    hash = XXH3_64bits_withSeed(&push_data, sizeof(push_data), hash);
+    u64 hash = 0;
     for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
         const VAddr address = regs.color_buffers[cb].Address();
         hash = XXH3_64bits_withSeed(&address, sizeof(address), hash);
     }
     const VAddr depth_address = regs.depth_buffer.DepthAddress();
-    hash = XXH3_64bits_withSeed(&depth_address, sizeof(depth_address), hash);
-    for (const auto* stage : pipeline->GetStages()) {
-        if (!stage) {
-            continue;
-        }
-        const auto user_data = stage->UserData();
-        if (!user_data.empty()) {
-            hash = XXH3_64bits_withSeed(user_data.data(), user_data.size_bytes(), hash);
-        }
-        const auto& flat_buf = stage->FlatBuf();
-        if (!flat_buf.empty()) {
-            hash = XXH3_64bits_withSeed(flat_buf.data(), flat_buf.size() * sizeof(u32), hash);
-        }
+    return XXH3_64bits_withSeed(&depth_address, sizeof(depth_address), hash);
+}
+
+u64 Rasterizer::FastBindStageHash(const Shader::Info& stage) const {
+    u64 hash = stage.pgm_hash;
+    const auto user_data = stage.UserData();
+    if (!user_data.empty()) {
+        hash = XXH3_64bits_withSeed(user_data.data(), user_data.size_bytes(), hash);
+    }
+    const auto& flat_buf = stage.FlatBuf();
+    if (!flat_buf.empty()) {
+        hash = XXH3_64bits_withSeed(flat_buf.data(), flat_buf.size() * sizeof(u32), hash);
     }
     return hash;
 }
 
-void Rasterizer::CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dma) {
+u64 Rasterizer::FastBindResourceHash(const Pipeline* pipeline, u64 targets_hash,
+                                     u64& fs_hash) const {
+    u64 hash = XXH3_64bits(&pipeline, sizeof(pipeline));
+    hash = XXH3_64bits_withSeed(&targets_hash, sizeof(targets_hash), hash);
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        const u64 stage_hash = FastBindStageHash(*stage);
+        if (stage->sw_stage == Shader::SwStage::Fragment) {
+            fs_hash = stage_hash;
+        }
+        hash = XXH3_64bits_withSeed(&stage_hash, sizeof(stage_hash), hash);
+    }
+    return hash;
+}
+
+u32 Rasterizer::FastBindSlotSetIndex(const Pipeline* pipeline) noexcept {
+    const auto key = reinterpret_cast<uintptr_t>(pipeline) >> 4;
+    return static_cast<u32>((key * 0x9E3779B1u) & (FastBindSlotSet::SetCount - 1));
+}
+
+Rasterizer::FastBindSlotHit Rasterizer::RestoreFastBindSlot(
+    const Pipeline* pipeline, u64 fs_hash, const Shader::PushData& input_push) {
+    if (!SotcStats::kFastBindSlots || !SotcStats::kPartialBind ||
+        !FastBindCanReuseFragment(pipeline)) {
+        return {};
+    }
+    auto& set = fast_bind_sets[FastBindSlotSetIndex(pipeline)];
+    for (u32 way = 0; way < FastBindSlotSet::Ways; ++way) {
+        auto& slot = set.ways[way];
+        if (!slot.valid || slot.pipeline != pipeline || slot.fs_hash != fs_hash ||
+            slot.tick != scheduler.CurrentTick() ||
+            slot.buffer_generation != buffer_cache.BindGeneration() ||
+            slot.texture_generation != texture_cache.BindGeneration() ||
+            slot.stream_generation != buffer_cache.StreamGeneration() ||
+            slot.mem_epoch != SotcStats::mem_epoch.load(std::memory_order_relaxed)) {
+            continue;
+        }
+        set_writes.clear();
+        set_write_index = 0;
+        image_infos.clear();
+        buffer_infos.clear();
+        for (u32 i = 0; i < slot.fs_image_count; ++i) {
+            image_infos.push_back(slot.fs_image_infos[i]);
+        }
+        for (u32 i = 0; i < slot.fs_buffer_count; ++i) {
+            buffer_infos.push_back(slot.fs_buffer_infos[i]);
+        }
+        set_writes.reserve(slot.fs_write_count);
+        bool valid = true;
+        for (u32 i = 0; i < slot.fs_write_count; ++i) {
+            const auto& cached = slot.fs_set_writes[i];
+            const u32 info_count = cached.kind == FastBindState::CachedKind::Buffer
+                                       ? slot.fs_buffer_count
+                                       : slot.fs_image_count;
+            if (cached.info_index + cached.count > info_count) {
+                valid = false;
+                break;
+            }
+            vk::WriteDescriptorSet write{};
+            write.dstSet = VK_NULL_HANDLE;
+            write.dstBinding = cached.binding;
+            write.dstArrayElement = cached.array_element;
+            write.descriptorCount = cached.count;
+            switch (cached.kind) {
+            case FastBindState::CachedKind::Buffer:
+                write.descriptorType = vk::DescriptorType::eStorageBuffer;
+                write.pBufferInfo = &buffer_infos[cached.info_index];
+                break;
+            case FastBindState::CachedKind::Image:
+                write.descriptorType = vk::DescriptorType::eSampledImage;
+                write.pImageInfo = &image_infos[cached.info_index];
+                break;
+            case FastBindState::CachedKind::Sampler:
+                write.descriptorType = vk::DescriptorType::eSampler;
+                write.pImageInfo = &image_infos[cached.info_index];
+                break;
+            default:
+                valid = false;
+                break;
+            }
+            if (!valid) {
+                break;
+            }
+            set_writes.push_back(write);
+        }
+        if (!valid) {
+            set_writes.clear();
+            image_infos.clear();
+            buffer_infos.clear();
+            slot.valid = false;
+            continue;
+        }
+        set_write_index = slot.fs_write_count;
+        auto push_data = slot.fs_push_data;
+        push_data.xoffset = input_push.xoffset;
+        push_data.yoffset = input_push.yoffset;
+        push_data.xscale = input_push.xscale;
+        push_data.yscale = input_push.yscale;
+        set.mru_way = static_cast<u8>(way);
+        return FastBindSlotHit{true, slot.fs_uses_dma, slot.fs_buffer_end,
+                               slot.fs_unified_end, push_data};
+    }
+    return {};
+}
+
+void Rasterizer::CommitFastBindSlot(const Pipeline* pipeline, u64 fs_hash) {
+    if (!SotcStats::kFastBindSlots || !SotcStats::kPartialBind ||
+        !FastBindCanReuseFragment(pipeline)) {
+        return;
+    }
+    auto& set = fast_bind_sets[FastBindSlotSetIndex(pipeline)];
+    u32 way = FastBindSlotSet::Ways;
+    for (u32 i = 0; i < FastBindSlotSet::Ways; ++i) {
+        const auto& candidate = set.ways[i];
+        if (candidate.valid && candidate.pipeline == pipeline) {
+            way = i;
+            break;
+        }
+    }
+    if (way == FastBindSlotSet::Ways) {
+        if (!set.ways[0].valid) {
+            way = 0;
+        } else if (!set.ways[1].valid) {
+            way = 1;
+        } else {
+            way = static_cast<u32>(set.mru_way) ^ 1u;
+            SotcStats::slot_evicts.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    auto& slot = set.ways[way];
+    const auto stages = pipeline->GetStages();
+    const auto& fs = *stages[0];
+
+    u32 image_count = fs.samplers.size();
+    for (const auto& image : fs.images) {
+        image_count += image.NumBindings(fs);
+    }
+    const u32 buffer_count = fs.buffers.size();
+    const u32 write_count = buffer_count + fs.images.size() + fs.samplers.size();
+    if (image_count > slot.fs_image_infos.size() ||
+        buffer_count > slot.fs_buffer_infos.size() ||
+        write_count > slot.fs_set_writes.size() ||
+        image_infos.size() < image_count || buffer_infos.size() < buffer_count ||
+        set_writes.size() < write_count) {
+        slot.valid = false;
+        SotcStats::slot_reject_size.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    slot.pipeline = pipeline;
+    slot.fs_hash = fs_hash;
+    slot.buffer_generation = buffer_cache.BindGeneration();
+    slot.texture_generation = texture_cache.BindGeneration();
+    slot.stream_generation = buffer_cache.StreamGeneration();
+    slot.mem_epoch = SotcStats::mem_epoch.load(std::memory_order_relaxed);
+    slot.tick = scheduler.CurrentTick();
+    slot.fs_uses_dma = fs.uses_dma;
+    slot.fs_buffer_end = static_cast<u8>(buffer_count);
+    slot.fs_unified_end = static_cast<u8>(buffer_count + image_count);
+    slot.fs_write_count = static_cast<u8>(write_count);
+    slot.fs_image_count = static_cast<u8>(image_count);
+    slot.fs_buffer_count = static_cast<u8>(buffer_count);
+    slot.fs_push_data = push_data;
+    std::copy_n(image_infos.begin(), image_count, slot.fs_image_infos.begin());
+    std::copy_n(buffer_infos.begin(), buffer_count, slot.fs_buffer_infos.begin());
+
+    bool valid = true;
+    for (u32 i = 0; i < write_count; ++i) {
+        const auto& write = set_writes[i];
+        if (write.dstBinding > 0xFF || write.dstArrayElement > 0xFF ||
+            write.descriptorCount == 0 || write.descriptorCount > 0xFF) {
+            valid = false;
+            break;
+        }
+        FastBindState::CachedWrite cached{};
+        cached.binding = static_cast<u8>(write.dstBinding);
+        cached.array_element = static_cast<u8>(write.dstArrayElement);
+        cached.count = static_cast<u8>(write.descriptorCount);
+        if (write.pImageInfo != nullptr) {
+            const auto index = static_cast<size_t>(write.pImageInfo - image_infos.data());
+            if (index + write.descriptorCount > image_count ||
+                (write.descriptorType != vk::DescriptorType::eSampledImage &&
+                 write.descriptorType != vk::DescriptorType::eSampler)) {
+                valid = false;
+                break;
+            }
+            cached.info_index = static_cast<u8>(index);
+            cached.kind = write.descriptorType == vk::DescriptorType::eSampler
+                              ? FastBindState::CachedKind::Sampler
+                              : FastBindState::CachedKind::Image;
+        } else if (write.pBufferInfo != nullptr) {
+            const auto index = static_cast<size_t>(write.pBufferInfo - buffer_infos.data());
+            if (index + write.descriptorCount > buffer_count ||
+                write.descriptorType != vk::DescriptorType::eStorageBuffer) {
+                valid = false;
+                break;
+            }
+            cached.info_index = static_cast<u8>(index);
+            cached.kind = FastBindState::CachedKind::Buffer;
+        } else {
+            valid = false;
+            break;
+        }
+        slot.fs_set_writes[i] = cached;
+    }
+    if (!valid) {
+        slot.valid = false;
+        SotcStats::slot_reject_write.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    slot.valid = true;
+    set.mru_way = static_cast<u8>(way);
+    SotcStats::slot_commits.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Rasterizer::CommitFastBind(const Pipeline* pipeline, u64 hash, u64 fs_hash,
+                                bool uses_dma) {
     fast_bind.pipeline = pipeline;
     fast_bind.hash = hash;
     fast_bind.buffer_generation = buffer_cache.BindGeneration();
@@ -1427,6 +1715,21 @@ void Rasterizer::CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dm
     fast_bind.mem_epoch = SotcStats::mem_epoch.load(std::memory_order_relaxed);
     fast_bind.tick = scheduler.CurrentTick();
     fast_bind.uses_dma = uses_dma;
+    fast_bind.push_data = push_data;
+    fast_bind.valid = true;
+    CommitFastBindSlot(pipeline, fs_hash);
+}
+
+void Rasterizer::CommitFastBindPartial(const Pipeline* pipeline, u64 hash, bool uses_dma) {
+    fast_bind.pipeline = pipeline;
+    fast_bind.hash = hash;
+    fast_bind.buffer_generation = buffer_cache.BindGeneration();
+    fast_bind.texture_generation = texture_cache.BindGeneration();
+    fast_bind.stream_generation = buffer_cache.StreamGeneration();
+    fast_bind.mem_epoch = SotcStats::mem_epoch.load(std::memory_order_relaxed);
+    fast_bind.tick = scheduler.CurrentTick();
+    fast_bind.uses_dma = uses_dma;
+    fast_bind.push_data = push_data;
     fast_bind.valid = true;
 }
 
@@ -1486,10 +1789,15 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     // resource handles. The generation bumps catch reallocated buffers/images and dead samplers.
     const bool fast_eligible = FastBindEligible(pipeline);
     u64 fast_hash = 0;
+    u64 resource_hash = 0;
+    u64 fs_hash = 0;
+    u64 targets_hash = 0;
+    u32 full_miss_reason = 0;
     if (fast_eligible) {
-        SotcStats::fast_bind_eligible.fetch_add(1, std::memory_order_relaxed);
         const auto input_push = MakeUserData(liverpool->DrawRegs());
-        fast_hash = FastBindHash(pipeline, input_push);
+        targets_hash = FastBindTargetsHash();
+        resource_hash = FastBindResourceHash(pipeline, targets_hash, fs_hash);
+        fast_hash = XXH3_64bits_withSeed(&input_push, sizeof(input_push), resource_hash);
         if (fast_bind.valid && fast_bind.pipeline == pipeline &&
             fast_bind.tick == scheduler.CurrentTick() &&
             fast_bind.buffer_generation == buffer_cache.BindGeneration() &&
@@ -1498,17 +1806,81 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             fast_bind.mem_epoch == SotcStats::mem_epoch.load(std::memory_order_relaxed) &&
             fast_bind.hash == fast_hash) {
             fast_bind_hit = true;
+            SotcStats::full_hits.fetch_add(1, std::memory_order_relaxed);
             SotcStats::fast_bind_hits.fetch_add(1, std::memory_order_relaxed);
             if (fast_bind.uses_dma) {
                 buffer_cache.SynchronizeDmaBuffers();
             }
             return true;
         }
+
+        const auto slot_hit = RestoreFastBindSlot(pipeline, fs_hash, input_push);
+        if (slot_hit.hit) {
+            Shader::Backend::Bindings binding{};
+            binding.buffer = slot_hit.buffer_end;
+            binding.unified = slot_hit.unified_end;
+            const Shader::Info* vs = nullptr;
+            for (const auto* stage : pipeline->GetStages()) {
+                if (stage && stage->sw_stage == Shader::SwStage::Vertex) {
+                    vs = stage;
+                    break;
+                }
+            }
+            if (vs != nullptr) {
+                push_data = slot_hit.push_data;
+                set_writes.resize(set_writes.size() + vs->buffers.size() + vs->images.size() +
+                                  vs->samplers.size());
+                BindBuffers(*vs, binding, push_data);
+                BindTextures(*vs, binding);
+                const bool slot_uses_dma = slot_hit.uses_dma || vs->uses_dma;
+                CommitFastBindPartial(pipeline, fast_hash, slot_uses_dma);
+                CommitFastBindSlot(pipeline, fs_hash);
+                SotcStats::slot_fs_hits.fetch_add(1, std::memory_order_relaxed);
+                if (slot_uses_dma) {
+                    buffer_cache.SynchronizeDmaBuffers();
+                }
+                return true;
+            }
+            set_writes.clear();
+            image_infos.clear();
+            buffer_infos.clear();
+            fast_bind.valid = false;
+        }
+
+        if (!fast_bind.valid) {
+            full_miss_reason = 1;
+        } else if (fast_bind.pipeline != pipeline) {
+            full_miss_reason = 2;
+        } else if (fast_bind.tick != scheduler.CurrentTick()) {
+            full_miss_reason = 3;
+        } else if (fast_bind.buffer_generation != buffer_cache.BindGeneration()) {
+            full_miss_reason = 4;
+        } else if (fast_bind.texture_generation != texture_cache.BindGeneration()) {
+            full_miss_reason = 5;
+        } else if (fast_bind.stream_generation != buffer_cache.StreamGeneration()) {
+            full_miss_reason = 6;
+        } else if (fast_bind.hash != fast_hash) {
+            full_miss_reason = 7;
+        }
+
+        fast_bind.valid = false;
+        SotcStats::misses.fetch_add(1, std::memory_order_relaxed);
+        switch (full_miss_reason) {
+        case 1: SotcStats::fast_miss_invalid.fetch_add(1, std::memory_order_relaxed); break;
+        case 2: SotcStats::fast_miss_pipeline.fetch_add(1, std::memory_order_relaxed); break;
+        case 3: SotcStats::fast_miss_tick.fetch_add(1, std::memory_order_relaxed); break;
+        case 4: SotcStats::fast_miss_buffer.fetch_add(1, std::memory_order_relaxed); break;
+        case 5: SotcStats::fast_miss_texture.fetch_add(1, std::memory_order_relaxed); break;
+        case 6: SotcStats::fast_miss_stream.fetch_add(1, std::memory_order_relaxed); break;
+        case 7: SotcStats::fast_miss_hash.fetch_add(1, std::memory_order_relaxed); break;
+        default: break;
+        }
         push_data = input_push;
     } else {
         fast_bind.valid = false;
         push_data = MakeUserData(liverpool->DrawRegs());
     }
+
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
     for (const auto* stage : pipeline->GetStages()) {
@@ -1522,12 +1894,12 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         uses_dma |= stage->uses_dma;
     }
 
-    if (uses_dma) {
-        buffer_cache.SynchronizeDmaBuffers();
+    if (fast_eligible) {
+        CommitFastBind(pipeline, fast_hash, fs_hash, uses_dma);
     }
 
-    if (fast_eligible) {
-        CommitFastBind(pipeline, fast_hash, uses_dma);
+    if (uses_dma) {
+        buffer_cache.SynchronizeDmaBuffers();
     }
 
     return true;
@@ -1716,7 +2088,7 @@ void Rasterizer::FlushPeriodic() {
     // 1000 instead of 500 (2026-10-15, RTX 3060 laptop, idle shrine ~5800 draws/frame): about +8%
     // in a single unpaired run (250: no gain, 2000: same as 1000): fewer submits, each one
     // cheaper per draw.
-    static const u64 flush_us = [] {
+    static const u64 flush_us = []() -> u64 {
         if (const char* v = std::getenv("SOTC_FLUSH_US")) {
             return std::strtoull(v, nullptr, 10);
         }
@@ -2477,6 +2849,90 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     }();
     const auto& regs = liverpool->DrawRegs();
     const auto& key = pipeline->GetGraphicsKey();
+
+    // sotc: consecutive draws usually keep the same attachments and the pass stays open. Reuse
+    // the previous RenderState without rebuilding every view/layout. The cache entry is valid
+    // only while the target cache key is unchanged, the pass has no feedback loop, no target was
+    // rebound, and no target has a pending CMASK/HTILE clear (which must reopen the pass).
+    bool reuse_render_state =
+        render_state_cache_valid && render_state_cache_hash == target_cache_hash &&
+        render_state_cache_generation == target_cache_generation &&
+        !render_state_cache_feedback;
+    static const bool upload_cache = [] {
+        const char* v = std::getenv("SOTC_RT_UPLOAD_CACHE");
+        return !v || v[0] != '0';
+    }();
+    const bool intra_pass = scheduler.IsRendering();
+    const bool refresh_targets = !upload_cache || !intra_pass ||
+                                 render_state_cache_upload_generation !=
+                                     texture_cache.UploadGeneration();
+    if (reuse_render_state) {
+        for (u32 cb = 0; cb < std::bit_width(key.mrt_mask); ++cb) {
+            const auto image_id = cb_descs[cb].first;
+            if (!image_id) {
+                continue;
+            }
+            if (refresh_targets) {
+                texture_cache.UpdateImage(image_id);
+            } else {
+                texture_cache.TouchImageForReuse(image_id);
+            }
+            auto& image = texture_cache.GetImage(image_id);
+            if (image.binding.needs_rebind || image.binding.is_bound ||
+                image.binding.force_general ||
+                image.backing->state.layout !=
+                    render_state_cache.color_attachments[cb].image_layout ||
+                texture_cache.IsMetaCleared(regs.color_buffers[cb].CmaskAddress(),
+                                            render_state_cache_slices[cb])) {
+                reuse_render_state = false;
+                break;
+            }
+        }
+        if (reuse_render_state && db_desc.first) {
+            if (refresh_targets) {
+                texture_cache.UpdateImage(db_desc.first);
+            } else {
+                texture_cache.TouchImageForReuse(db_desc.first);
+            }
+            auto& image = texture_cache.GetImage(db_desc.first);
+            if (image.binding.needs_rebind || image.binding.is_bound ||
+                image.binding.force_general ||
+                image.backing->state.layout !=
+                    render_state_cache.depth_stencil_attachment.image_layout ||
+                texture_cache.IsMetaCleared(regs.depth_htile_data_base.GetAddress(),
+                                            render_state_cache_depth_slice)) {
+                reuse_render_state = false;
+            }
+        }
+        const bool depth_reg_clear = regs.depth_render_control.depth_clear_enable &&
+                                     regs.depth_control.depth_enable &&
+                                     regs.depth_control.depth_write_enable;
+        if (depth_reg_clear || regs.depth_render_control.stencil_clear_enable) {
+            reuse_render_state = false;
+        }
+    }
+    if (reuse_render_state) {
+        if (refresh_targets) {
+            render_state_cache_upload_generation = texture_cache.UploadGeneration();
+        }
+        auto cached = render_state_cache;
+        for (u32 cb = 0; cb < cached.num_color_attachments; ++cb) {
+            cached.color_attachments[cb].is_clear = 0;
+            cached.color_attachments[cb].clear_value = {};
+            if (const auto image_id = cb_descs[cb].first; image_id) {
+                texture_cache.GetImage(image_id).usage.render_target = 1u;
+            }
+        }
+        cached.depth_stencil_attachment.depth_clear = false;
+        cached.depth_stencil_attachment.stencil_clear = false;
+        cached.depth_stencil_attachment.clear_value = {};
+        if (db_desc.first) {
+            texture_cache.GetImage(db_desc.first).usage.depth_target = true;
+        }
+        return cached;
+    }
+
+    render_state_cache_valid = false;
     RenderState state;
     state.width = instance.GetMaxFramebufferWidth();
     state.height = instance.GetMaxFramebufferHeight();
@@ -2498,6 +2954,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         const auto& image_view = texture_cache.FindRenderTarget(image_id, desc, !rt_fast);
         const auto slice = image_view.info.range.base.layer;
         const auto mip = image_view.info.range.base.level;
+        render_state_cache_slices[cb] = slice;
 
         const auto& col_buf = regs.color_buffers[cb];
         // sotc: SOTC_RT_FAST: test-and-clear the CMASK bit with one lookup.
@@ -2561,6 +3018,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         auto& image = texture_cache.GetImage(image_id);
 
         const auto slice = image_view.info.range.base.layer;
+        render_state_cache_depth_slice = slice;
         const bool depth_reg_clear = regs.depth_render_control.depth_clear_enable &&
                                      regs.depth_control.depth_enable &&
                                      regs.depth_control.depth_write_enable;
@@ -2627,6 +3085,12 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         state.num_layers = 1;
     }
 
+    render_state_cache = state;
+    render_state_cache_hash = target_cache_hash;
+    render_state_cache_generation = target_cache_generation;
+    render_state_cache_upload_generation = texture_cache.UploadGeneration();
+    render_state_cache_feedback = attachment_feedback_loop;
+    render_state_cache_valid = !attachment_feedback_loop;
     return state;
 }
 

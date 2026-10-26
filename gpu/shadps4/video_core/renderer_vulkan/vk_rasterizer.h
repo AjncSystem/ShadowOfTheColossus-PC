@@ -175,8 +175,23 @@ private:
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline);
     bool FastBindEligible(const Pipeline* pipeline) const;
-    u64 FastBindHash(const Pipeline* pipeline, const Shader::PushData& push_data) const;
-    void CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dma);
+    bool FastBindCanReuseFragment(const Pipeline* pipeline) const;
+    u64 FastBindResourceHash(const Pipeline* pipeline, u64 targets_hash, u64& fs_hash) const;
+    u64 FastBindTargetsHash() const;
+    u64 FastBindStageHash(const Shader::Info& stage) const;
+    struct FastBindSlotHit {
+        bool hit{};
+        bool uses_dma{};
+        u8 buffer_end{};
+        u8 unified_end{};
+        Shader::PushData push_data{};
+    };
+    static u32 FastBindSlotSetIndex(const Pipeline* pipeline) noexcept;
+    FastBindSlotHit RestoreFastBindSlot(const Pipeline* pipeline, u64 fs_hash,
+                                        const Shader::PushData& input_push);
+    void CommitFastBindSlot(const Pipeline* pipeline, u64 fs_hash);
+    void CommitFastBind(const Pipeline* pipeline, u64 hash, u64 fs_hash, bool uses_dma);
+    void CommitFastBindPartial(const Pipeline* pipeline, u64 hash, bool uses_dma);
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
     void BindIndexBuffer(u32 index_offset = 0);
@@ -213,6 +228,19 @@ private:
     using RenderTargetInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     std::array<RenderTargetInfo, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc> db_desc;
+    u64 target_cache_hash{};
+    u64 target_cache_generation{};
+    bool target_cache_valid{};
+    /// sotc: the last RenderState for the current target cache entry. Reuse it while the pass is
+    /// open and no target needs a new clear, avoiding repeated image/view/layout preparation.
+    RenderState render_state_cache{};
+    std::array<u32, AmdGpu::NUM_COLOR_BUFFERS> render_state_cache_slices{};
+    u32 render_state_cache_depth_slice{};
+    u64 render_state_cache_hash{};
+    u64 render_state_cache_generation{};
+    u64 render_state_cache_upload_generation{};
+    bool render_state_cache_valid{};
+    bool render_state_cache_feedback{};
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
     /// sotc: the image of each image_infos entry (null for samplers and empty slots). Ids, not
     /// pointers: FindImage may grow the image slot vector and move every image.
@@ -261,6 +289,25 @@ private:
     /// sotc: descriptor state of the previous graphics draw (SOTC_FAST_BIND). Valid only while
     /// the same command buffer, pipeline, push data and resource generations are current.
     struct FastBindState {
+        static constexpr u32 MaxCachedWrites =
+            Shader::NUM_BUFFERS + Shader::NUM_IMAGES + Shader::NUM_SAMPLERS;
+
+        enum class CachedKind : u8 {
+            Buffer,
+            Image,
+            Sampler,
+        };
+
+        /// Compact metadata for one fragment descriptor write. The descriptor data itself lives
+        /// in fs_image_infos/fs_buffer_infos; no pointers to per-draw vectors are kept.
+        struct CachedWrite {
+            u8 binding{};
+            u8 array_element{};
+            u8 count{};
+            u8 info_index{};
+            CachedKind kind{};
+        };
+
         const Pipeline* pipeline{};
         u64 hash{};
         u64 buffer_generation{};
@@ -269,10 +316,41 @@ private:
         u64 mem_epoch{}; ///< SotcStats::mem_epoch: guest memory unchanged since
         u64 tick{};
         bool uses_dma{};
+        Shader::PushData push_data{};
         bool valid{};
     };
     FastBindState fast_bind{};
     bool fast_bind_hit{};
+
+    struct FastBindSlot {
+        const Pipeline* pipeline{};
+        u64 fs_hash{};
+        u64 buffer_generation{};
+        u64 texture_generation{};
+        u64 stream_generation{};
+        u64 mem_epoch{};
+        u64 tick{};
+        bool valid{};
+        bool fs_uses_dma{};
+        u8 fs_buffer_end{};
+        u8 fs_unified_end{};
+        u8 fs_write_count{};
+        u8 fs_image_count{};
+        u8 fs_buffer_count{};
+        Shader::PushData fs_push_data{};
+        std::array<vk::DescriptorImageInfo, Shader::NUM_IMAGES> fs_image_infos{};
+        std::array<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> fs_buffer_infos{};
+        std::array<FastBindState::CachedWrite, FastBindState::MaxCachedWrites> fs_set_writes{};
+    };
+    struct FastBindSlotSet {
+        static constexpr u32 SetCount = 64;
+        static constexpr u32 Ways = 2;
+        static constexpr u32 SlotCount = SetCount * Ways;
+
+        std::array<FastBindSlot, Ways> ways{};
+        u8 mru_way{};
+    };
+    std::array<FastBindSlotSet, FastBindSlotSet::SetCount> fast_bind_sets{};
 };
 
 } // namespace Vulkan

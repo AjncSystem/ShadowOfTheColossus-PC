@@ -616,8 +616,9 @@ def game_environment(s):
         cvars.append(f'r_virtualGeometryFadeMultiplier={fade}')
     if s.get('skip_logos'):
         # The engine cvar skipSplash=1 boots straight to the menu, without the opening logos and
-        # the autosave notice (tabnul, AjncSystem #185).
-        cvars.append('skipSplash=1')
+        # the autosave notice (tabnul, AjncSystem #185); +nointro (the engine's own switch, which it
+        # also sets when a button is held at start) skips the intro film too.
+        cvars += ['skipSplash=1', 'nointro']
     cvars += str(s.get('engine_cvars', '')).split()
     env['SOTC_CVARS'] = ' '.join(cvars)
     # Multipliers for the grass shaders' view distances and blade height (vk_rasterizer.cpp).

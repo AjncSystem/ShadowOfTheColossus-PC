@@ -185,7 +185,10 @@ def render_patches(elf, ph, size):
     # SOTC_RENDER_KEEP=<addr>,<addr>: sites left at the 1920x1080 value (finding the HUD's sites,
     # #301: health and stamina bars stretched in 21:9).
     keep = {int(a, 16) for a in os.environ.get('SOTC_RENDER_KEEP', '').replace(' ', ',').split(',') if a}
-    for address, kind, original in RENDER_SITES:
+    sites = list(RENDER_SITES)
+    if os.environ.get('SOTC_WIDE_ASPECT') == '1':  # the display object's aspect too (pre-#301)
+        sites.append((0x00495b3e, 'a', 'c74304398ee33f'))
+    for address, kind, original in sites:
         original = bytes.fromhex(original)
         if image_bytes(elf, ph, address - BASE, len(original)) != original:
             raise SystemExit(f'render size: unexpected bytes at {address:#x}')

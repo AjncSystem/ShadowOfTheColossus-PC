@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.60.6-plus11 — 2026-10-26 (fork Lucas-blip-png)
+- **CPUs de 4 threads: prioridades das threads** (#267, ideia primeiro feita no fork do MMadmer): com 4 processadores
+  lógicos ou menos, as threads de som sobem para a prioridade mais alta, as `BPE JobWorker` descem para abaixo do normal e
+  as de arquivo (`SceFios*`, `Resource Loading`) sobem para acima do normal. `SOTC_JOB_PRIORITY=0` desliga. Santuário com
+  o processo limitado a 4 CPUs (uma por núcleo): 34,0 / 33,8 FPS sem, 46,9 / 48,5 FPS com. CPUs maiores não mudam.
+- **Correção do alocador de páginas do jogo (queda `0x1a371`, tabnul, PR #288 do upstream, trazida da 0.60.6-C1):** o
+  contador de páginas livres do jogo se descolava do mapa real e o alocador lia antes do início do mapa. Agora, quando a
+  busca falha, o contador volta a 0, um pedaço novo é separado e a busca roda de novo. Só é aplicada se os bytes do
+  executável baterem. Testado até a tela de título e o jogo abrindo sem queda; a correção em si só aparece quando a queda
+  aconteceria.
+- **Leitura de memória que travava o jogo em CPUs de 4 threads** (fork do MMadmer): uma página marcada como escrita pela
+  GPU, sem nenhum dado da GPU por trás, ficava protegida para leitura e a leitura falhava para sempre. Agora a página é
+  liberada. `SOTC_READ_FAULT_DROP=0` desliga. Santuário em 4 CPUs: sem regressão e sem travamento. Também do MMadmer: ao
+  devolver memória fria de uma arena, o port agora sempre termina (e espera) as draws já gravadas antes do desmapeamento.
+- **Lançador: "Multiplicador do DLSS-G"** (2x, 3x, 4x, 6x, dinâmico): 3x a 6x geram 2 a 5 quadros por quadro do jogo na
+  NVIDIA RTX 50 (RTX 40 fica em 2x). O dinâmico só vale se o driver disser que suporta; senão vale 6x. Na RTX 5060 Ti: 6
+  quadros apresentados por quadro, estado 0. Experimental. Padrão continua 2x.
+- **Diagnóstico:** novo "Registro detalhado (diagnóstico)" no lançador (`user/texture_diag.log`, até 400 MB, ~7% de FPS)
+  com o motivo de cada textura descartada; aviso nas sombras distantes (podem piscar); o .zip de "Reportar problema" agora
+  leva também a sessão anterior e os últimos 8 MB do registro detalhado. A análise da água na captura do RenderDoc está em
+  `docs/sotc/AGUA.md` (a posterização aparece na passada de iluminação; causa ainda não provada).
+
 ## 0.60.6-plus10 — 2026-10-25 (fork Lucas-blip-png)
 - **Texturas menos borradas depois de carregar:** a válvula de LOD da 0.60.6-plus8 passava a mostrar as texturas no nível 5
   (o mais grosso) sempre que o pool de páginas do jogo marcava 0% livre, e depois de cada carregamento o jogo o mantém

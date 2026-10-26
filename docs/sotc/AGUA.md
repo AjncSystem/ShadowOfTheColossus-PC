@@ -63,6 +63,42 @@ ligado fica com os quatro) e define o SCC. O Pink tem o mesmo problema.
 - Só 9 pixel shaders do jogo usam essa forma (`s_wqm_b64 vcc, exec` ou `vcc, vcc`).
   `SOTC_WQM_COPY=0` volta ao comportamento antigo, para comparação.
 
+## Captura de 26 de outubro de 2026 (DMA ligado; causa das faixas ainda não provada)
+
+Capturas `agua_capture.rdc` e `agua_capture_2.rdc` (cena de "Carregando" com o Wander nadando).
+Os eventos `Present` da captura não delimitam quadros do jogo (são sub-submits); um quadro real
+dura cerca de 25 mil eventos e termina num draw B8G8R8A8. A passada de iluminação (`cs 3323`)
+aparece uma vez por quadro. Listar draws pelo replay é muito lento: use dispatches e histórico
+de pixel.
+
+- **Draw da superfície** (último quadro, ev 197236): 50496 índices, 7 alvos de G-buffer.
+  Normal em octaedro no `R32_UINT` (x 12 bits | y 12 bits | rugosidade no byte alto, ~22 na
+  água), stencil 96. Entradas: dois mapas de normal BC5 (256 e 512) e os mapas de simulação
+  RGBA8 256x256 e 512x512, escritos por `cs 1498` e `cs 1503` no fim do quadro.
+- **Onde NÃO nasce:** as normais do G-buffer sobre a água são suaves e contínuas; os mapas de
+  simulação não estão zerados nem com lixo (o de 512 mostra anéis de ondulação; o de 256 tem
+  hachura diagonal de ~2 px, que pode ser do jogo ou instabilidade da simulação, incerto); o
+  brilho médio da água é estável entre quadros (0,078 a 0,081).
+- **Onde aparece:** na saída da passada de iluminação (`cs 3323`: lê depth/stencil, três
+  `R32_UINT` do G-buffer, hi-Z, cor 960x540, LUT 256x256 e 8 cubemaps BC6 512x512 com 7 mips
+  usados como array 2D; escreve `R11G11B10` 1920x1080). Terraços planos com bordas nítidas e
+  linhas escuras sinuosas; as normais de entrada variam suavemente, mas o especular dá saltos
+  (em y=775, de x=66 a 72 a normal muda ~18 unidades e a luminância cai de 0,147 para 0,091).
+- **No shader do `cs 3323`:** o registro de probe de 224 bytes (`idx*224`) é lido por índice
+  dinâmico; a face do cubemap é emulada (`fma(sc/ma, 0.5, ...)`); o slot do cubemap
+  (`UMin(slot, 16)`) e o LOD (`exp2(f*k)*N`) vêm do registro.
+- **Hipóteses, em ordem (nenhuma provada):** (1) registro de probe lido por DMA desatualizado,
+  zerado ou com slot errado; (2) LOD alto demais ou cadeia de mips incompleta nos cubemaps
+  (terraços de reflexo); (3) erro na seleção ou borda da face do cubemap emulada (linhas
+  escuras finas).
+- **Testes que decidem:** trocar a saída do `cs 3323` por índice da probe, flags, slot, escala,
+  LOD e face (`spv_probe.py` + `rd_probe.py`, adaptados a compute); repetir com
+  `BB_DIRECT_MEMORY_ACCESS=0`; forçar `Lod = 0` ou um mip fixo e ver se os terraços somem;
+  conferir os mips dos cubemaps por upload; capturar quadros consecutivos (sem tela de
+  carregamento) para medir o flicker; comparar com quadros extraídos do clipe do PS4.
+- Arquivos da análise: `out/rd/` (fora do git), incluindo o shader desmontado
+  `cs/cs_197465_3323.txt` e as imagens `lit/ev197466_rw4_12969.png` e `crop_lit_bl.png`.
+
 ## Método (scripts em `tools/rdoc`; rodar com `qrenderdoc.exe --python <script>` e as variáveis `RD_*`)
 
 1. **Captura no RenderDoc:** `SOTC_WRAP` (JSON com `renderdoccmd capture`) +

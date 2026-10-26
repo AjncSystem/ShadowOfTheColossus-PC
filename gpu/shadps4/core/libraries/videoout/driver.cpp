@@ -1088,8 +1088,12 @@ void VideoOutDriver::Flip(const Request& req) {
             }
             if (const uint64_t hits = SotcStats::pipe_key_memo_hits.exchange(0)) {
                 const uint64_t misses = SotcStats::pipe_key_memo_misses.exchange(0);
-                ReportPrintf(report, "SOTC pipeline key memo: %.0f%% of %.0f draws\n",
-                             100.0 * double(hits) / double(hits + misses), double(hits + misses));
+                ReportPrintf(report,
+                             "SOTC pipeline key memo: %.0f%% of %.0f draws (%.0f%% of the draws "
+                             "only with the fine rule)\n",
+                             100.0 * double(hits) / double(hits + misses), double(hits + misses),
+                             100.0 * double(SotcStats::pipe_key_memo_fine_hits.exchange(0)) /
+                                 double(hits + misses));
             } else {
                 SotcStats::pipe_key_memo_misses.exchange(0);
             }
@@ -1168,6 +1172,34 @@ void VideoOutDriver::Flip(const Request& req) {
                              "recorder busy %.2f ms\n",
                              (seconds * 1000.0 - idle_ms) / flips, parse_ms / flips,
                              recorder_ms / flips);
+                // sotc: how much of the command parse time is the parser itself.
+                const double ring_ms = SotcStats::cp_ring_wait_ns.exchange(0) / 1e6;
+                const double drain_ms = SotcStats::cp_drain_wait_ns.exchange(0) / 1e6;
+                const double label_ms = SotcStats::cp_label_wait_ns.exchange(0) / 1e6;
+                std::fprintf(stderr,
+                             "SOTC CP own work %.2f ms per frame (parse minus waits: ring %.2f, "
+                             "drain %.2f, label %.2f)\n",
+                             (parse_ms - ring_ms - drain_ms - label_ms) / flips, ring_ms / flips,
+                             drain_ms / flips, label_ms / flips);
+                {
+                    // sotc: CPU time against wall time: a draw thread whose CPU time is well below
+                    // its busy time was preempted or stalled by the scheduler.
+                    static double prev_draw = 0, prev_cp = 0, prev_proc = 0;
+                    const double draw_cpu = SotcStats::ThreadCpuMs(0),
+                                 cp_cpu = SotcStats::ThreadCpuMs(1),
+                                 proc_cpu = SotcStats::ProcessCpuMs();
+                    std::fprintf(stderr,
+                                 "SOTC CPU time per frame: draw thread %.2f ms, command processor "
+                                 "%.2f ms, process %.1f ms (%.1f cores)\n",
+                                 (draw_cpu - prev_draw) / flips, (cp_cpu - prev_cp) / flips,
+                                 (proc_cpu - prev_proc) / flips,
+                                 (proc_cpu - prev_proc) / (seconds * 1000.0));
+                    prev_draw = draw_cpu;
+                    prev_cp = cp_cpu;
+                    prev_proc = proc_cpu;
+                }
+                std::fprintf(stderr, "SOTC draw thread guest commands %.2f ms per frame\n",
+                             SotcStats::draw_cmds_ns.exchange(0) / 1e6 / flips);
             }
             // sotc: SOTC_HASH_STATS=1, top shader hashes of the draw thread (liverpool.cpp).
             if (SotcStats::kHashStats && liverpool) {

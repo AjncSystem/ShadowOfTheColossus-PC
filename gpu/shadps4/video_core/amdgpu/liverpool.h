@@ -209,6 +209,15 @@ public:
     /// sotc: a register chunk was written since the last captured operation, so the GPU state is
     /// no longer the one the last graphics pipeline was built from (PipelineKeyMemo). Always
     /// false without the draw thread: MarkRegs does not track chunks then.
+    /// sotc: BbToggle::CpFastPaths. A register the pipeline key can read was written since the key
+    /// was last built (every MarkRegs except the draw-parameter ones, MarkParamRegs). Unlike the
+    /// dirty chunks it is not cleared by the next captured operation, only by a key build.
+    bool KeyDirty() const noexcept {
+        return key_dirty;
+    }
+    void ClearKeyDirty() noexcept {
+        key_dirty = false;
+    }
     bool HasDirtyRegChunks() const noexcept {
         for (const u64 word : dirty_chunks) {
             if (word != 0) {
@@ -380,6 +389,18 @@ private:
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
 
     void ProcessCommands();
+    /// sotc: BbToggle::CpFastPaths (1u << 20, static_assert in liverpool.cpp). ProcessCommands() for
+    /// the per-packet call sites of the command processor: with the draw thread, this thread only
+    /// ever takes the ordered commands (see ProcessCommands), so with none queued the call does
+    /// nothing and is not made. The draw thread and the old path always call it.
+    void PollCommands() {
+        if (back_threaded && num_ordered.load(std::memory_order_relaxed) == 0 &&
+            !(__atomic_load_n(&runtime_disabled_optimizations, __ATOMIC_RELAXED) & (1u << 20)) &&
+            !OnBackThread()) {
+            return;
+        }
+        ProcessCommands();
+    }
     /// Writes an EOP/EOS fence value, keeping GPU caches of that memory coherent.
     void WriteFenceValue(void* address, u64 data, u32 num_bytes);
     void Process(std::stop_token stoken);
@@ -533,6 +554,21 @@ private:
         if (!back_threaded || num_dwords == 0) {
             return;
         }
+        key_dirty = true;
+        MarkChunks(first_dword, num_dwords);
+    }
+    /// sotc: the draw parameters a draw packet writes (index type, counts, base, draw initiator,
+    /// instance count): the chunks travel to the draw thread as always, but the pipeline key does
+    /// not read them (RefreshGraphicsKey, BuildRuntimeInfo), so they do not make the key dirty.
+    void MarkParamRegs(const void* field, size_t bytes) {
+        if (!back_threaded) {
+            return;
+        }
+        const auto offset = static_cast<u32>(reinterpret_cast<const u32*>(field) -
+                                             regs.reg_array.data());
+        MarkChunks(offset, static_cast<u32>((bytes + 3) / 4));
+    }
+    void MarkChunks(u32 first_dword, u32 num_dwords) {
         const u32 last = std::min(first_dword + num_dwords - 1, Regs::NumRegs - 1);
         for (u32 chunk = first_dword / RegChunkDwords; chunk <= last / RegChunkDwords; ++chunk) {
             const u64 bit = u64{1} << (chunk % 64);
@@ -612,6 +648,7 @@ private:
     CbDbExtent back_db_extent{};
     std::array<u64, (NumRegChunks + 63) / 64> dirty_chunks{};
     std::vector<u16> dirty_list;
+    bool key_dirty{true}; ///< sotc: see KeyDirty (command processor thread only)
     std::jthread back_thread{};
 };
 

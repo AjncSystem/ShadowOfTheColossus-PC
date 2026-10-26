@@ -1418,7 +1418,11 @@ void *runtime_low_map(size_t size, int prot) {
  * render target and dynamic-state work whose inputs did not change (docs/sotc/DEPTH-FASTPATH.md). It also makes
  * the command processor send registers as changed dwords (the transport bit 60 would give), whichever the
  * state of bit 60. Honoured live, read per draw. */
-uint64_t runtime_disabled_optimizations=UINT64_C(1)<<39 | UINT64_C(1)<<59 | UINT64_C(1)<<60;
+/* sotc: bit 20 (CpFastPaths) is SET = off by default: the command processor's Nop skip, per-packet poll guard
+ * and fine pipeline key memo are exact (SOTC_CP_VERIFY=1: 0 bad in 13 M checks) and take 0.4 ms of the
+ * command processor's ~11 ms in the heavy temple, but the draw thread is the limiter there and the frame time
+ * did not move measurably (docs/sotc/SIGUIENTE-LIMITE.md). SOTC_CP_FAST=1 turns it on (see toggle_mask_env). */
+uint64_t runtime_disabled_optimizations=UINT64_C(1)<<20 | UINT64_C(1)<<39 | UINT64_C(1)<<59 | UINT64_C(1)<<60;
 /* Speculative readers of guest memory (GPU draw-preparation workers) register a recovery
  * point: a fault on that thread jumps back to it instead of terminating (probe.c). */
 __thread sigjmp_buf *runtime_fault_recover;
@@ -1440,6 +1444,11 @@ static int toggle_mask_read(const char *path, uint64_t *mask) {
     return ok;
 }
 static uint64_t toggle_mask_env(uint64_t mask) {
+    /* sotc: SOTC_CP_FAST=1/0 pins bit 20 (CpFastPaths) like SOTC_TIMER_RES pins bit 61: a bench that A/B toggles
+     * the bit in the file must leave the variable unset. */
+    const char *fast=getenv("SOTC_CP_FAST");
+    if (fast && fast[0]=='1') mask&=~(UINT64_C(1)<<20);
+    else if (fast && fast[0]=='0') mask|=(UINT64_C(1)<<20);
     const char *env=getenv("SOTC_TIMER_RES");
     if (!env) return mask;
     if (env[0]=='1') return mask&~(UINT64_C(1)<<61);

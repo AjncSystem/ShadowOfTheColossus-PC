@@ -38,6 +38,7 @@
 #include "video_core/sotc_lod_stats.h"
 #include "video_core/sotc_opstats.h"
 #include "video_core/sotc_stats.h"
+#include <optional>
 #include "bbport_toggles.h"
 
 // sotc: writes guest memory through the backing view (runtime_memory.c).
@@ -58,6 +59,7 @@ static const char* ccb_task_name{"CCB_TASK"};
 #define MAX_NAMES 56
 static_assert(Liverpool::NumComputeRings <= MAX_NAMES);
 static_assert(BbToggle::MicroCostSweep == (1u << 23), "Liverpool::OnBackThread hard-codes the bit");
+static_assert(BbToggle::CpFastPaths == (1u << 20), "Liverpool::PollCommands hard-codes the bit");
 
 #define NAME_NUM(z, n, name) BOOST_PP_STRINGIZE(name) BOOST_PP_STRINGIZE(n),
 #define NAME_ARRAY(name, num) {BOOST_PP_REPEAT(num, NAME_NUM, name)}
@@ -180,8 +182,23 @@ static inline void CpuRelax() {
 #endif
 }
 
+// sotc: SOTC_FPS=1, time a command processor wait takes (added to `counter` when it ends).
+namespace {
+struct CpWaitClock {
+    std::atomic<u64>& counter;
+    u64 start;
+    explicit CpWaitClock(std::atomic<u64>& c) : counter{c}, start{SotcStats::kFpsLog ? SotcStats::NowNs() : 0} {}
+    ~CpWaitClock() {
+        if (start) {
+            counter.fetch_add(SotcStats::NowNs() - start, std::memory_order_relaxed);
+        }
+    }
+};
+} // namespace
+
 void Liverpool::BackLoop(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuDraw");
+    SotcStats::RegisterThread(0);
     // sotc: MicroCostSweep, see Liverpool::OnBackThread.
     t_on_back_thread = true;
     runtime_memory_mark_draw_thread();
@@ -192,6 +209,9 @@ void Liverpool::BackLoop(std::stop_token stoken) {
     u64 tail = back_tail.load(std::memory_order_relaxed);
     while (!stoken.stop_requested()) {
         if (num_commands.load(std::memory_order_acquire)) {
+            // sotc: SOTC_FPS=1, time of the commands guest threads queued for this thread
+            // (readbacks, invalidations): part of "draw busy" but of no op in SOTC_HASH_STATS.
+            const CpWaitClock cmd_clock{SotcStats::draw_cmds_ns};
             ProcessCommands();
         }
         if (back_head.load(std::memory_order_acquire) == tail) {
@@ -263,6 +283,7 @@ void Liverpool::DrainBack() {
 
 void Liverpool::WaitBackTail(u64 head) {
     SotcStats::cp_waits.fetch_add(1, std::memory_order_relaxed);
+    const CpWaitClock wait_clock{SotcStats::cp_drain_wait_ns};
     for (u32 spin = 0; back_tail.load(std::memory_order_acquire) < head; ++spin) {
         if (spin < back_spin) {
             CpuRelax();
@@ -279,8 +300,13 @@ void Liverpool::WaitBackTail(u64 head) {
 
 Liverpool::BackOp& Liverpool::BackAlloc() {
     const u64 head = back_head.load(std::memory_order_relaxed);
+    // sotc: SOTC_FPS=1, only a wait that happens is timed (the clock starts at the first spin).
+    std::optional<CpWaitClock> ring_clock;
     for (u32 spin = 0; head - back_tail.load(std::memory_order_acquire) >= back_ring_capacity;
          ++spin) {
+        if (!spin) {
+            ring_clock.emplace(SotcStats::cp_ring_wait_ns);
+        }
         if (spin < back_spin) {
             CpuRelax();
             continue;
@@ -840,6 +866,7 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+    SotcStats::RegisterThread(1);
     gpu_id = std::this_thread::get_id();
 #ifdef __linux__
     gpu_tid = gettid();
@@ -1135,6 +1162,29 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
+// sotc: BbToggle::CpFastPaths. A type 3 Nop packet that the Nop case of ProcessGraphics passes
+// without doing anything: no payload, or a payload that is neither the patched flip nor (when
+// markers_matter) a debug marker. Keep in step with that case.
+static inline bool IsInertNop(const PM4Header* header, bool markers_matter) {
+    if (header->type != 3 || header->type3.opcode != PM4ItOpcode::Nop) {
+        return false;
+    }
+    const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
+    if (nop->header.count.Value() == 0) {
+        return true;
+    }
+    switch (nop->data_block[0]) {
+    case PM4CmdNop::PayloadType::PatchedFlip:
+        return false;
+    case PM4CmdNop::PayloadType::DebugMarkerPush:
+    case PM4CmdNop::PayloadType::DebugColorMarkerPush:
+    case PM4CmdNop::PayloadType::DebugMarkerPop:
+        return !markers_matter;
+    default:
+        return true;
+    }
+}
+
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
     FIBER_ENTER(dcb_task_name);
 
@@ -1151,8 +1201,23 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
 
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
+    // sotc: BbToggle::CpFastPaths, read once per command buffer. A Nop that does nothing here (see
+    // IsInertNop) goes past ProcessCommands and the opcode switch: the commands it would have let
+    // through are taken at the next packet that does something, with no operation in between.
+    const bool nop_fast = !BbToggle::Disabled(BbToggle::CpFastPaths) && !SotcOps::kOn;
+    // Markers only matter with the guest markers on and no draw thread (the Nop case below).
+    const bool markers_matter = guest_markers_enabled && !back_threaded;
     while (!dcb.empty()) {
-        ProcessCommands();
+        if (nop_fast) {
+            while (!dcb.empty() && IsInertNop(reinterpret_cast<const PM4Header*>(dcb.data()), markers_matter)) {
+                dcb = NextPacket(
+                    dcb, reinterpret_cast<const PM4Header*>(dcb.data())->type3.NumWords() + 1);
+            }
+            if (dcb.empty()) {
+                break;
+            }
+        }
+        PollCommands(); // sotc: BbToggle::CpFastPaths
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
@@ -1353,7 +1418,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::IndexType: {
                 const auto* index_type = reinterpret_cast<const PM4CmdDrawIndexType*>(header);
                 regs.index_buffer_type.raw = index_type->raw;
-                MarkRegs(&regs.index_buffer_type, sizeof(regs.index_buffer_type));
+                MarkParamRegs(&regs.index_buffer_type, sizeof(regs.index_buffer_type));
                 break;
             }
             case PM4ItOpcode::DrawIndex2: {
@@ -1363,10 +1428,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 regs.index_base_address.base_addr_hi = draw_index->index_base_hi;
                 regs.num_indices = draw_index->index_count;
                 regs.draw_initiator = draw_index->draw_initiator;
-                MarkRegs(&regs.max_index_size, sizeof(regs.max_index_size));
-                MarkRegs(&regs.index_base_address, sizeof(regs.index_base_address));
-                MarkRegs(&regs.num_indices, sizeof(regs.num_indices));
-                MarkRegs(&regs.draw_initiator, sizeof(regs.draw_initiator));
+                MarkParamRegs(&regs.max_index_size, sizeof(regs.max_index_size));
+                MarkParamRegs(&regs.index_base_address, sizeof(regs.index_base_address));
+                MarkParamRegs(&regs.num_indices, sizeof(regs.num_indices));
+                MarkParamRegs(&regs.draw_initiator, sizeof(regs.draw_initiator));
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
@@ -1386,9 +1451,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 regs.max_index_size = draw_index_off->max_size;
                 regs.num_indices = draw_index_off->index_count;
                 regs.draw_initiator = draw_index_off->draw_initiator;
-                MarkRegs(&regs.max_index_size, sizeof(regs.max_index_size));
-                MarkRegs(&regs.num_indices, sizeof(regs.num_indices));
-                MarkRegs(&regs.draw_initiator, sizeof(regs.draw_initiator));
+                MarkParamRegs(&regs.max_index_size, sizeof(regs.max_index_size));
+                MarkParamRegs(&regs.num_indices, sizeof(regs.num_indices));
+                MarkParamRegs(&regs.draw_initiator, sizeof(regs.draw_initiator));
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
@@ -1407,8 +1472,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* draw_index = reinterpret_cast<const PM4CmdDrawIndexAuto*>(header);
                 regs.num_indices = draw_index->index_count;
                 regs.draw_initiator = draw_index->draw_initiator;
-                MarkRegs(&regs.num_indices, sizeof(regs.num_indices));
-                MarkRegs(&regs.draw_initiator, sizeof(regs.draw_initiator));
+                MarkParamRegs(&regs.num_indices, sizeof(regs.num_indices));
+                MarkParamRegs(&regs.draw_initiator, sizeof(regs.draw_initiator));
                 if (DebugState.DumpingCurrentReg()) {
                     DebugState.PushRegsDump(base_addr, reinterpret_cast<uintptr_t>(header), regs);
                 }
@@ -1569,20 +1634,20 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::NumInstances: {
                 const auto* num_instances = reinterpret_cast<const PM4CmdDrawNumInstances*>(header);
                 regs.num_instances.num_instances = num_instances->num_instances;
-                MarkRegs(&regs.num_instances, sizeof(regs.num_instances));
+                MarkParamRegs(&regs.num_instances, sizeof(regs.num_instances));
                 break;
             }
             case PM4ItOpcode::IndexBase: {
                 const auto* index_base = reinterpret_cast<const PM4CmdDrawIndexBase*>(header);
                 regs.index_base_address.base_addr_lo = index_base->addr_lo;
                 regs.index_base_address.base_addr_hi = index_base->addr_hi;
-                MarkRegs(&regs.index_base_address, sizeof(regs.index_base_address));
+                MarkParamRegs(&regs.index_base_address, sizeof(regs.index_base_address));
                 break;
             }
             case PM4ItOpcode::IndexBufferSize: {
                 const auto* index_size = reinterpret_cast<const PM4CmdDrawIndexBufferSize*>(header);
                 regs.num_indices = index_size->num_indices;
-                MarkRegs(&regs.num_indices, sizeof(regs.num_indices));
+                MarkParamRegs(&regs.num_indices, sizeof(regs.num_indices));
                 break;
             }
             case PM4ItOpcode::SetBase: {
@@ -1804,6 +1869,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
                 if (vo_port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
+                    const CpWaitClock label_clock{SotcStats::cp_label_wait_ns};
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     break;
                 }

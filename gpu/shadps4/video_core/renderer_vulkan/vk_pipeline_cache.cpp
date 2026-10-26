@@ -902,14 +902,29 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         const char* v = std::getenv("SOTC_PIPE_KEY_MEMO");
         return !v || v[0] != '0';
     }();
+    // sotc: BbToggle::CpFastPaths. Clear: "no register the pipeline key reads was written since the
+    // key was last built" (Liverpool::KeyDirty: the draw parameters a draw packet writes do not
+    // count, and a dispatch between two draws does not hide a write). Set: no register chunk at all
+    // was written since the last captured operation (the old condition).
+    static const bool cp_verify = std::getenv("SOTC_CP_VERIFY") != nullptr;
     if (key_memo_env && !BbToggle::Disabled(BbToggle::PipelineKeyMemo) &&
-        last_graphics_pipeline && liverpool->IsBackThreaded() && !liverpool->HasDirtyRegChunks() &&
+        last_graphics_pipeline && liverpool->IsBackThreaded() &&
         params.vertex_sgpr_offset == last_graphics_params.vertex_sgpr_offset &&
         params.instance_sgpr_offset == last_graphics_params.instance_sgpr_offset) {
-        if (SotcStats::kFpsLog) {
-            SotcStats::pipe_key_memo_hits.fetch_add(1, std::memory_order_relaxed);
+        const bool fine = !BbToggle::Disabled(BbToggle::CpFastPaths);
+        const bool chunks_dirty = liverpool->HasDirtyRegChunks();
+        if (fine ? !liverpool->KeyDirty() : !chunks_dirty) {
+            if (SotcStats::kFpsLog) {
+                SotcStats::pipe_key_memo_hits.fetch_add(1, std::memory_order_relaxed);
+                if (chunks_dirty) {
+                    SotcStats::pipe_key_memo_fine_hits.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            if (cp_verify) [[unlikely]] {
+                VerifyKeyMemo(fine, chunks_dirty);
+            }
+            return last_graphics_pipeline;
         }
-        return last_graphics_pipeline;
     }
     if (SotcStats::kFpsLog) {
         SotcStats::pipe_key_memo_misses.fetch_add(1, std::memory_order_relaxed);
@@ -922,6 +937,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         last_graphics_pipeline = nullptr; // sotc: the key is not usable for the next draw
         return nullptr;
     }
+    liverpool->ClearKeyDirty(); // sotc: the key now reflects every register written so far
     if (key_start) {
         SotcStats::pipe_key_ns.fetch_add(SotcStats::NowNs() - key_start,
                                          std::memory_order_relaxed);
@@ -1002,6 +1018,58 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     last_graphics_pipeline = it->second.get();
     last_graphics_params = params;
     return it->second.get();
+}
+
+// sotc: SOTC_CP_VERIFY=1. A pipeline key memo hit is about to return last_graphics_pipeline: build the
+// key from the registers as they are now, compare it with the key of that pipeline, and put the
+// state the build touches back (the key, the stage tables and the command processor's per-draw
+// shader data), so a verified run behaves as an unverified one. fine: which rule hit.
+void PipelineCache::VerifyKeyMemo(bool fine, bool chunks_dirty) {
+    static std::atomic<u64> checked{0}, bad{0}, bad_fine_only{0};
+    const GraphicsPipelineKey saved_key = graphics_key;
+    const auto saved_infos = infos;
+    const auto saved_modules = modules;
+    const auto saved_runtime_infos = runtime_infos;
+    auto* const saved_fetch = fetch_shader;
+    const bool saved_pending = translation_pending;
+    std::array<Shader::InfoRuntime, MaxShaderStages> saved_runtime{};
+    for (u32 i = 0; i < MaxShaderStages; ++i) {
+        if (infos[i]) {
+            saved_runtime[i] = const_cast<Shader::Info*>(infos[i])->runtime[0];
+        }
+    }
+    const bool ok = RefreshGraphicsKey();
+    const bool same = ok && std::memcmp(&graphics_key, &last_graphics_key, sizeof(graphics_key)) == 0;
+    const u64 n = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (!same) {
+        const u64 b = bad.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (fine && chunks_dirty) {
+            bad_fine_only.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (b <= 20) {
+            std::fprintf(stderr,
+                         "SOTC CP VERIFY: pipeline key memo hit (%s rule, chunks dirty %d) but the "
+                         "key differs (build %s)\n",
+                         fine ? "fine" : "old", chunks_dirty ? 1 : 0, ok ? "ok" : "failed");
+        }
+    }
+    if ((n & 0xFFFFF) == 0) {
+        std::fprintf(stderr, "SOTC CP VERIFY: key memo hits checked %llu, bad %llu (fine rule only %llu)\n",
+                     static_cast<unsigned long long>(n),
+                     static_cast<unsigned long long>(bad.load()),
+                     static_cast<unsigned long long>(bad_fine_only.load()));
+    }
+    graphics_key = saved_key;
+    infos = saved_infos;
+    modules = saved_modules;
+    runtime_infos = saved_runtime_infos;
+    fetch_shader = saved_fetch;
+    translation_pending = saved_pending;
+    for (u32 i = 0; i < MaxShaderStages; ++i) {
+        if (saved_infos[i]) {
+            const_cast<Shader::Info*>(saved_infos[i])->runtime[0] = std::move(saved_runtime[i]);
+        }
+    }
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.60.6-plus10 — 2026-10-25 (fork Lucas-blip-png)
+- **Texturas menos borradas depois de carregar:** a válvula de LOD da 0.60.6-plus8 passava a mostrar as texturas no nível 5
+  (o mais grosso) sempre que o pool de páginas do jogo marcava 0% livre, e depois de cada carregamento o jogo o mantém
+  em 0% por um minuto ou mais sem falhar; as texturas ficavam no nível 5 até 40-70 s depois e nunca passavam do 4. Agora
+  o nível 5 só vale quando a memória livre está caindo abaixo de 1% e não houve carregamento nos últimos 60 s; fora
+  disso o limite é o nível 4, como na plus7. No Santuário: 0% livre ao carregar mostra o nível 4 e, com 10% livre, o 3.
+  Soak do deserto a 3840x1080 (3 corridas de 196 s): sem queda `0x1a371`.
+- **Diagnóstico:** `tools/sotc_bench_shrine.py --video` também grava durante uma sessão manual (`--record`).
+
 ## 0.60.6-plus9 — 2026-10-25 (fork Lucas-blip-png)
 - **Lançador: "Vibração do controle"** (Controle): desmarcada, o controle não vibra (`SOTC_RUMBLE=0`). Vale na próxima
   vez que o jogo abre (#292).

@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC native port · v0.60.6-plus9
+# Shadow of the Colossus — PC native port · v0.60.6-plus10
 
 **The original 0.60.6, plus CPUs without BMI1 (pre-Haswell), CPUs with 4 threads, 120 Hz
 fullscreen, a 32-lane fix for AMD GCN cards (RX 470–590, to test), and the FSR 3.1 and DLSS 4.5 upscalers (NVIDIA RTX).** Everything in [AjncSystem's 0.60.6](https://github.com/AjncSystem/ShadowOfTheColossus-PC)
@@ -210,6 +210,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.60.6-plus10** | **Lucas-blip-png fork:** textures are no longer stuck at the coarsest level after every load (the page-pool valve only goes to mip 5 while the pool is falling, not within 60 s of a load). |
 | **0.60.6-plus9** | **Lucas-blip-png fork:** launcher options to turn the controller vibration off and to generate frames without the interface (no shaking health/stamina bars); pad-recording fix. |
 | **0.60.6-plus8** | **Lucas-blip-png fork:** automatic VRAM tier from the card's budget (new launcher default); FSR 3.1/DLSS render size up to 1440p; stronger texture-pool LOD valve against the `0x1a371` crash; GPU time and wait diagnostics. |
 | **0.60.6-plus7** | **Lucas-blip-png fork:** the F1 in-game menu now says that FSR 3.1 and DLSS are chosen in the launcher (the render size is set when the game starts) and that the "FSR 3" further down is frame generation; new README GIF; `--video` of the Shrine benchmark records lighter. |

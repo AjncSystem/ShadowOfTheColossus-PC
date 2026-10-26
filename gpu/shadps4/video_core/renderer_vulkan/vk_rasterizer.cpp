@@ -14,6 +14,7 @@
 #include <vector>
 #include <vector>
 #include <algorithm>
+#include <unordered_set>
 #include <filesystem>
 #include <xxhash.h>
 #include "common/path_util.h"
@@ -2605,6 +2606,13 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     }
 }
 
+// sotc: the final composite samples the UI layer and the scene: UI first in the base game's
+// shader, scene first in the PS4 Pro one (0x9e6767fc). The UI layer is the output-size sRGB image.
+u32 Rasterizer::CompositeUiIndex() {
+    const auto& first = texture_cache.GetImage(image_bindings[0].first);
+    return first.info.pixel_format == vk::Format::eR16G16B16A16Sfloat ? 1 : 0;
+}
+
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the pass
     image_bindings.clear();
@@ -2834,11 +2842,39 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     if (hudless_on && stage.sw_stage == Shader::SwStage::Fragment && image_bindings.size() == 2 &&
         image_bindings[0].first && image_bindings[1].first &&
         FrameGen::Current() != FrameGen::Mode::Off) {
-        const auto& ui = texture_cache.GetImage(image_bindings[0].first);
-        const auto& scene = texture_cache.GetImage(image_bindings[1].first);
+        const u32 ui_i = CompositeUiIndex();
+        const auto& ui = texture_cache.GetImage(image_bindings[ui_i].first);
+        const auto& scene = texture_cache.GetImage(image_bindings[ui_i ^ 1].first);
         if (ui.usage.render_target && ui.info.pixel_format == vk::Format::eR8G8B8A8Srgb &&
             scene.info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
-            hudless_ui_info = static_cast<s32>(first_image_idx);
+            hudless_ui_info = static_cast<s32>(first_image_idx + ui_i);
+        }
+    }
+
+    // sotc: SOTC_DLSS_PROBE=1 logs each fragment shader that draws into a video out surface once:
+    // its images (format, size, render target or not), to find the final composite.
+    static const bool dlss_probe = std::getenv("SOTC_DLSS_PROBE") != nullptr;
+    if (dlss_probe && stage.sw_stage == Shader::SwStage::Fragment && cb_descs[0].first &&
+        texture_cache.GetImage(cb_descs[0].first).usage.vo_surface) {
+        static std::unordered_set<std::string> seen;
+        std::string line = fmt::format("{:#x}", stage.pgm_hash);
+        {
+            for (const auto& [id, desc] : image_bindings) {
+                if (!id) {
+                    line += " [none]";
+                    continue;
+                }
+                const auto& img = texture_cache.GetImage(id);
+                line += fmt::format(" [{} {}x{}{}]", vk::to_string(img.info.pixel_format),
+                                    img.info.size.width, img.info.size.height,
+                                    img.usage.render_target ? " rt" : "");
+            }
+            const auto& out = texture_cache.GetImage(cb_descs[0].first);
+            if (seen.size() < 60 && seen.insert(line).second)
+            std::fprintf(stderr, "SOTC DLSS PROBE: shader %#llx -> %s %ux%u, %zu images:%s\n",
+                         static_cast<unsigned long long>(stage.pgm_hash),
+                         vk::to_string(out.info.pixel_format).c_str(), out.info.size.width,
+                         out.info.size.height, image_bindings.size(), line.c_str());
         }
     }
 
@@ -2847,12 +2883,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     if (Dlssg::SuperResolution() && stage.sw_stage == Shader::SwStage::Fragment &&
         image_bindings.size() == 2 && image_bindings[0].first && image_bindings[1].first &&
         cb_descs[0].first) {
-        const auto& ui = texture_cache.GetImage(image_bindings[0].first);
-        const auto& scene = texture_cache.GetImage(image_bindings[1].first);
+        const u32 ui_i = CompositeUiIndex();
+        const auto& ui = texture_cache.GetImage(image_bindings[ui_i].first);
+        const auto& scene = texture_cache.GetImage(image_bindings[ui_i ^ 1].first);
         if (texture_cache.GetImage(cb_descs[0].first).usage.vo_surface &&
             ui.usage.render_target && ui.info.pixel_format == vk::Format::eR8G8B8A8Srgb &&
             scene.info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
-            Dlssg::NoteComposite(image_bindings[1].first, image_bindings[0].first, texture_cache);
+            Dlssg::NoteComposite(image_bindings[ui_i ^ 1].first, image_bindings[ui_i].first,
+                                 texture_cache);
             NoteUiShadow();
             static bool logged = false;
             if (!std::exchange(logged, true)) {

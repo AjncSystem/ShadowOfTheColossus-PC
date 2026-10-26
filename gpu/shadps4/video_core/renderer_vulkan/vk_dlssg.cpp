@@ -1202,14 +1202,17 @@ void CopyComposite(vk::CommandBuffer cmdbuf, VideoCore::TextureCache& texture_ca
     composite.copy_ok = false;
     VideoCore::Image* scene = texture_cache.TryGetImage(composite.scene_id, composite.scene_uid);
     VideoCore::Image* ui = texture_cache.TryGetImage(composite.ui_id, composite.ui_uid);
-    if (!scene || !ui || scene->info.size.width != ui->info.size.width ||
-        scene->info.size.height != ui->info.size.height) {
+    if (!scene || !ui) {
         return;
     }
+    // sotc: the UI layer is the scene's size in the base game, the output size in PS4 Pro mode
+    // (scene 1600x900, UI 1920x1080 at 1080p); the post-process pass samples it either way.
     const u32 w = scene->info.size.width;
     const u32 h = scene->info.size.height;
+    const u32 uw = ui->info.size.width;
+    const u32 uh = ui->info.size.height;
     if (!EnsureSrImage(sr_color, scene->info.pixel_format, w, h) ||
-        !EnsureSrImage(sr_ui, vk::Format::eR8G8B8A8Srgb, w, h)) {
+        !EnsureSrImage(sr_ui, vk::Format::eR8G8B8A8Srgb, uw, uh)) {
         return;
     }
     using Stage = vk::PipelineStageFlagBits2;
@@ -1255,8 +1258,10 @@ void CopyComposite(vk::CommandBuffer cmdbuf, VideoCore::TextureCache& texture_ca
     };
     cmdbuf.copyImage(scene->GetImage(), Layout::eTransferSrcOptimal, sr_color.image,
                      Layout::eTransferDstOptimal, region);
+    vk::ImageCopy ui_region = region;
+    ui_region.extent = vk::Extent3D{uw, uh, 1};
     cmdbuf.copyImage(ui->GetImage(), Layout::eTransferSrcOptimal, sr_ui.image,
-                     Layout::eTransferDstOptimal, region);
+                     Layout::eTransferDstOptimal, ui_region);
     const std::array to_read{
         barrier(sr_color.image, Layout::eTransferDstOptimal, Layout::eShaderReadOnlyOptimal,
                 Stage::eCopy, Access::eTransferWrite, Stage::eAllCommands, Access::eShaderRead),

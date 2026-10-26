@@ -20,6 +20,7 @@ Writes two files for the loader:
 The original bytes are checked first: another game version gets neither file's changes.
 """
 import argparse
+import os
 import re
 from pathlib import Path
 import struct
@@ -56,6 +57,18 @@ CVAR_MODES = {
 # 'W'/'H' an integer immediate (the last 4 bytes of the instruction at address), 'w'/'h' a float
 # (the PS4 entry of a [PS4, Pro] table), 'w2'/'h2' half of it, 'a' the aspect float W/H,
 # 'P' the render target pool (322.5 MiB at 1080p, scaled by the pixel count).
+# From tabnul's PR (Oussama268/ShadowOfTheColossus-PC#112). Page allocator (0x41a1e0): it
+# carves a new chunk only when the free-page tally at pool+0x74 is 0, and the tally drifts above
+# the bitmap's real free count. With the bitmap empty and the tally not 0, the scan found no bit
+# and read bitmap[-1] (crash at 0x41a371). On a failed scan: tally 0, then carve a chunk
+# (0x41a1f1, needs eax 0) and scan again. Applied whenever the bytes match.
+POOL_FIX = (0x41a321, bytes.fromhex('eb34666666662e0f1f840000000000'),
+            bytes.fromhex('41c7467400000000' '31c0' 'e9c1feffff'))
+# Above this many rendered pixels, and in PS4 Pro mode, the larger render target pool pushes the
+# game's free system memory figure under texturePoolReserveSystemMemMiBs (220): the texture
+# streamer then drops every texture to mip 3 every second or so (flicker, and in PS4 Pro mode
+# with Maximum textures the colour garbage after loads). Reserve 0 there; it needs POOL_FIX.
+LOW_MEM_PIXELS = 4_200_000
 RENDER_SITES = [
     # display init (0x495a90): the aspect of the display object, back buffer, display targets,
     # scene size
@@ -147,6 +160,22 @@ def main():
     elf, _, ph, _, _ = parse_self((args.game / 'eboot.bin').read_bytes())
     supported = is_supported(elf, ph)
     writes, cvars = [], []
+    pool_fix = supported and image_bytes(elf, ph, POOL_FIX[0] - BASE, len(POOL_FIX[1])) == POOL_FIX[1]
+    if pool_fix:
+        writes.append((POOL_FIX[0] - BASE, POOL_FIX[2]))
+    # SOTC_POOL_RESERVE=0/1 forces the reserve off/on; by default off above LOW_MEM_PIXELS and in
+    # PS4 Pro mode (SOTC_NEO=1).
+    reserve_env = os.environ.get('SOTC_POOL_RESERVE', '')
+    low_mem = os.environ.get('SOTC_NEO') == '1' or reserve_env == '0'
+    if args.render and args.render != '1920x1080':
+        try:
+            w, h = map(int, args.render.split('x'))
+            low_mem |= w * h > LOW_MEM_PIXELS
+        except ValueError:
+            pass
+    if pool_fix and low_mem and reserve_env != '1':
+        cvars.append('texturePoolReserveSystemMemMiBs=0')
+        print('Texture pool reserve: 0 (page allocator fix on)')
     for mode in filter(None, (m.strip().lower() for m in args.modes.split(','))):
         if mode not in MODES and mode not in CVAR_MODES:
             raise SystemExit(f'unknown mode {mode!r} (known: {", ".join([*MODES, *CVAR_MODES])})')

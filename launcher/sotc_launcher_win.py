@@ -309,8 +309,9 @@ FRAMEGEN = [('off', ('Desligada', 'Off')),
 # divided by the mode's factor and DLSS picks its mode from that ratio (vk_dlssg.cpp).
 DLSS_MODES = [('quality', ('Qualidade (1,5×)', 'Quality (1.5×)')),
               ('balanced', ('Equilibrado (1,72×)', 'Balanced (1.72×)')),
-              ('performance', ('Desempenho (2×)', 'Performance (2×)'))]
-DLSS_FACTORS = {'quality': 1.5, 'balanced': 1.724, 'performance': 2.0}
+              ('performance', ('Desempenho (2×)', 'Performance (2×)')),
+              ('ultra', ('Ultra Desempenho (3×)', 'Ultra Performance (3×)'))]
+DLSS_FACTORS = {'quality': 1.5, 'balanced': 1.724, 'performance': 2.0, 'ultra': 3.0}
 # RCAS after DLSS (SOTC_DLSS_SHARPEN, attenuation in stops: 0 = sharpest).
 DLSS_SHARPNESS = [('0', ('Alta (padrão)', 'High (default)')), ('0.5', ('Média', 'Medium')), ('1', ('Baixa', 'Low')),
                   ('off', ('Desligada', 'Off'))]

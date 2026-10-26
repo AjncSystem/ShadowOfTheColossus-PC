@@ -692,6 +692,32 @@ sl::Resource SlImage(vk::Image image, VkDeviceMemory memory, vk::ImageView view,
     return r;
 }
 
+/// sotc: whether a DLSS mode takes this input height for this output (DLAA at 1:1 or more).
+bool SrModeFits(u32 in_w, u32 in_h, u32 out_w, u32 out_h) {
+    static u32 last[4]{};
+    static bool last_fits = false;
+    if (last[0] == in_w && last[1] == in_h && last[2] == out_w && last[3] == out_h) {
+        return last_fits;
+    }
+    bool fits = in_w >= out_w && in_h >= out_h;
+    sl::DLSSOptions options{};
+    options.outputWidth = out_w;
+    options.outputHeight = out_h;
+    for (const sl::DLSSMode mode :
+         {sl::DLSSMode::eMaxQuality, sl::DLSSMode::eBalanced, sl::DLSSMode::eMaxPerformance,
+          sl::DLSSMode::eUltraPerformance}) {
+        options.mode = mode;
+        sl::DLSSOptimalSettings optimal{};
+        if (!fits && api.dlss_optimal(options, optimal) == sl::Result::eOk &&
+            in_h >= optimal.renderHeightMin && in_h <= optimal.renderHeightMax) {
+            fits = true;
+        }
+    }
+    last[0] = in_w, last[1] = in_h, last[2] = out_w, last[3] = out_h;
+    last_fits = fits;
+    return fits;
+}
+
 /// DLSS options for this input and output size: DLAA at 1:1, else the mode whose optimal render
 /// height is closest to the input's.
 bool SetSrOptions(u32 in_w, u32 in_h, u32 out_w, u32 out_h) {
@@ -1351,11 +1377,12 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
         sr_prev = false;
         return {};
     }
-    // sotc: DLSS upscales 2x at most; the post-process pass scales the rest. PS4 Pro mode at 4K
-    // hands it 1600x900: to 2160p no mode takes that height, NGX refused every evaluate
-    // (0xbad00005) and the screen stayed black (26 Oct). The launcher's render sizes are 2x or less.
+    // sotc: when no DLSS mode takes this input height for the output, DLSS upscales 2x and the
+    // post-process pass scales the rest. PS4 Pro mode at 4K hands it 1600x900: to 2160p no mode
+    // takes that height, NGX refused every evaluate (0xbad00005) and the screen stayed black.
     u32 out_w = width, out_h = height;
-    if (f.width * 2 < width || f.height * 2 < height) {
+    if (!SrModeFits(f.width, f.height, width, height) &&
+        (f.width * 2 < width || f.height * 2 < height)) {
         out_w = f.width * 2;
         out_h = f.height * 2;
     }

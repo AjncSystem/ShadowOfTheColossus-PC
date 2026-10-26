@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+import sys
 import unittest
 
 spec = importlib.util.spec_from_file_location("bbport_vulkan", ROOT / "launcher/bbport_vulkan.py")
@@ -54,6 +55,7 @@ class PackagedVulkanTests(unittest.TestCase):
                 self.assertEqual(self.env, before)
                 del self.env[key]
 
+    @unittest.skipIf(sys.platform == "win32", "Linux/Nix driver paths")
     def test_host_nvidia_and_compiler_are_exposed_without_host_libc(self):
         driver = self.library("libGLX_nvidia.so.580.1")
         (self.libs / "libGLX_nvidia.so.0").symlink_to(driver.name)
@@ -97,6 +99,7 @@ class PackagedVulkanTests(unittest.TestCase):
         self.assertEqual(self.env["VK_DRIVER_FILES"],
                          "/user/extra.json:/bundled/radeon.json:/bundled/intel.json")
 
+    @unittest.skipIf(sys.platform == "win32", "Linux/Nix driver paths")
     def test_host_driver_can_be_supplied_outside_hidden_nix_store(self):
         self.library("libGLX_nvidia.so.0")
         self.manifest("/nix/store/hidden/lib/libGLX_nvidia.so.0")

@@ -1233,7 +1233,14 @@ bool HandleEvent(const SDL_Event& event) {
         return true;
     }
     // sotc: F9 (diagnostic) uploads every cached texture again from guest memory (sotc_stats.h).
-    if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F9 && !event.key.repeat) {
+    // With the launcher's DLSS comparison on (SOTC_DLSS_COMPARE=1), F9 switches DLSS / FSR 1
+    // instead (window.cpp).
+    static const bool dlss_compare = [] {
+        const char* v = std::getenv("SOTC_DLSS_COMPARE");
+        return v && v[0] == '1';
+    }();
+    if (!dlss_compare && event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F9 &&
+        !event.key.repeat) {
         SotcStats::reload_all.store(true, std::memory_order_relaxed);
         SotcEvent::Log("KEY", "%s", SotcUi::T("F9: recarregar texturas", "F9: reload textures"));
         toast_text = SotcUi::T("F9: texturas recarregadas", "F9: textures reloaded");

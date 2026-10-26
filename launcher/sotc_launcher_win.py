@@ -1482,8 +1482,8 @@ class Launcher:
                                     'Saves the textures of the current frame to user/log/texcap_N')),
                           ('F6 / Start+Select', _('Abre o menu de debug (com a opção acima ligada)',
                                    'Opens the debug menu (with the option above on)')),
-                          ('F9', _('Recarrega todas as texturas da memória do jogo',
-                                   'Reloads every texture from game memory'))):
+                          ('F9', _('Recarrega todas as texturas da memória do jogo (com "Comparar DLSS" ligado: troca DLSS / FSR 1)',
+                                   'Reloads every texture from game memory (with "Compare DLSS" on: switches DLSS / FSR 1)'))):
             self.row(f, key, self.ttk.Label(f, text=text))
 
     def build_advanced(self):

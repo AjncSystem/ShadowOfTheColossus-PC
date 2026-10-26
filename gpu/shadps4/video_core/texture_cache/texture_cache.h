@@ -624,11 +624,7 @@ private:
     /// Touch the image in the LRU cache.
     void TouchImage(const Image& image);
 
-    void FreeImage(ImageId image_id) {
-        UntrackImage(image_id);
-        UnregisterImage(image_id);
-        DeleteImage(image_id);
-    }
+    void FreeImage(ImageId image_id, const char* why = "other");
 
     /// sotc: depth/colour twins (ResolveDepthOverlap). Park: what FreeImage does except the
     /// reclaim of the slot and its Vulkan objects. Unpark: registers it again as if new.

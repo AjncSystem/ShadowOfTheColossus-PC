@@ -338,7 +338,7 @@ void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
     ForEachImageInRegion(cpu_addr, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
     for (const ImageId id : deleted_images) {
         // TODO: Download image data back to host.
-        FreeImage(id);
+        FreeImage(id, "unmap memory");
     }
 }
 
@@ -452,7 +452,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
             ParkImage(cache_image_id);
             slot_images[new_image_id].parked_twin = cache_image_id;
         } else {
-            FreeImage(cache_image_id);
+            FreeImage(cache_image_id, "depth/colour overlap");
         }
         return new_image_id;
     }
@@ -476,7 +476,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             lhs_block_size != rhs_block_size) {
             // Very likely this kind of overlap is caused by allocation from a pool.
             if (safe_to_delete) {
-                FreeImage(cache_image_id);
+                FreeImage(cache_image_id, "equal address, block size differs");
             }
             return {merged_image_id, -1, -1};
         }
@@ -525,7 +525,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         if (image_info.tile_mode != cache_image.info.tile_mode ||
             image_info.alt_tile != cache_image.info.alt_tile) {
             if (safe_to_delete) {
-                FreeImage(cache_image_id);
+                FreeImage(cache_image_id, "equal address, tile mode differs");
             }
             return {merged_image_id, -1, -1};
         }
@@ -658,7 +658,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 
         // Image isn't a subresource but a chance overlap.
         if (safe_to_delete) {
-            FreeImage(cache_image_id);
+            FreeImage(cache_image_id, "right overlap, not a subresource");
         }
 
         return {{}, -1, -1};
@@ -674,7 +674,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                         GetImage(merged_image_id).binding.is_target = 1u;
                     }
 
-                    FreeImage(cache_image_id);
+                    FreeImage(cache_image_id, "left overlap, rebind target");
                     return {merged_image_id, -1, -1};
                 }
 
@@ -682,7 +682,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                 if (merged_image_id) {
                     auto& merged_image = slot_images[merged_image_id];
                     runtime.CopyMip(&cache_image, &merged_image, mip, slice);
-                    FreeImage(cache_image_id);
+                    FreeImage(cache_image_id, "left overlap, merged into larger");
                 }
             }
         }
@@ -705,7 +705,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
         src_image.binding.needs_rebind = 1u;
     }
 
-    FreeImage(image_id);
+    FreeImage(image_id, "expanded into a larger image");
     TrackImage(new_image_id);
     return new_image_id;
 }
@@ -849,7 +849,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             image_id = {};
         } else if (image_resolved.info.resources < info.resources) {
             // The image was clearly picked up wrong.
-            FreeImage(image_id);
+            FreeImage(image_id, "find image");
             image_id = {};
             LOG_WARNING(Render_Vulkan, "Image overlap resolve failed");
         }
@@ -1460,10 +1460,6 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
-    if (SotcTexDiag::Level() >= 1) {
-        SotcTexDiag::Get().freed.fetch_add(1, std::memory_order_relaxed);
-        SotcTexDiag::Log("DROP %s", DiagImage{image}.text);
-    }
     ++image_set_generation;
     ++addr_gens[AddrGenSlot(image.info.guest_address)]; // sotc: FindMemo per-address gen
     lru_cache.Free(image.lru_id);
@@ -1640,7 +1636,7 @@ void TextureCache::EmergencyCollect(u32 level) {
             }
             DownloadImageMemory(image_id);
         }
-        FreeImage(image_id);
+        FreeImage(image_id, "emergency collect");
         --num_deletions;
         ++freed;
         return false;
@@ -1725,7 +1721,7 @@ void TextureCache::GarbageCollectImages() {
             DownloadImageMemory(image_id);
             SotcStats::gc_downloads.fetch_add(1, std::memory_order_relaxed);
         }
-        FreeImage(image_id);
+        FreeImage(image_id, "garbage collect");
         SotcStats::gc_freed.fetch_add(1, std::memory_order_relaxed);
         if (total_used_memory < critical_gc_memory) {
             if (aggresive) {
@@ -2025,7 +2021,7 @@ void TextureCache::FreeRebased(ImageId image_id, std::atomic<std::uint64_t>& cou
     if (image.binding.is_bound || image.binding.is_target) {
         image.binding.needs_rebind = 1u;
     }
-    FreeImage(image_id);
+    FreeImage(image_id, "rebased mip tail");
     counter.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -2072,7 +2068,20 @@ void TextureCache::TouchImage(const Image& image) {
     }
 }
 
+void TextureCache::FreeImage(ImageId image_id, const char* why) {
+    if (SotcTexDiag::Level() >= 1) {
+        SotcTexDiag::Get().freed.fetch_add(1, std::memory_order_relaxed);
+        SotcTexDiag::Log("DROP (%s) %s", why, DiagImage{slot_images[image_id]}.text);
+    }
+    UntrackImage(image_id);
+    UnregisterImage(image_id);
+    DeleteImage(image_id);
+}
+
 void TextureCache::ParkImage(ImageId image_id) {
+    if (SotcTexDiag::Level() >= 1) {
+        SotcTexDiag::Log("PARK (depth/colour twin kept) %s", DiagImage{slot_images[image_id]}.text);
+    }
     UntrackImage(image_id);
     UnregisterImage(image_id);
     Image& image = slot_images[image_id];

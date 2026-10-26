@@ -165,7 +165,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
                 'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'volume': '100', 'shadow_reuse': '0', 'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1', 'weed_distance': '1', 'weed_height': '1', 'grass_fade': '1', 'grass_detail': '0.25', 'library_dirs': [], 'keys': {},
-                'auto_setup': True, 'dlc_dir': '', 'framegen': 'off',
+                'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'fg_hudless': False,
                 'dlss_mode': 'quality', 'dlss_sharpen': '0', 'dlss_ui_sharpen': '3', 'dlss_sky_sharpen': '2',
                 'dlss_compare': False,
                 'check_updates': True, 'skip_version': ''}
@@ -670,6 +670,8 @@ def game_environment(s):
     if s.get('neo') and env['SOTC_NEO'] == '0':
         env['SOTC_NOTE'] = f"{env['SOTC_OUTPUT_RES']} is wider than 16:9: PS4 Pro mode off (it renders 16:9 only)"
     env['SOTC_FRAMEGEN'] = s.get('framegen') or 'off'
+    if s.get('fg_hudless'):  # Lucas-blip-png's option (#206, #210)
+        env['SOTC_FG_HUDLESS'] = '1'
     # sotc: high quality textures: the texture banks sampled since the last report read as sampled
     # (sotc_lod_stats.h; before, none ever did and the game never streamed its fine mips: blurry
     # leaves and rocks). Off: the old behaviour, for cards short of video memory.
@@ -1286,6 +1288,14 @@ class Launcher:
                    'health and stamina bars may shake (the generated frame includes the interface). '
                    'In game, F8 switches the mode (off, DLSS-G, FSR 3). Best with the '
                    'screen at 60 or 120 Hz, or G-SYNC/FreeSync.'))
+        self.check(f, 'fg_hudless', _('Geração de quadros sem a interface (experimental)',
+                                      'Frame generation without the interface (experimental)'),
+                   _('Gera os quadros intermediários só com a cena e põe a interface por cima, sem interpolá-la: '
+                     'tira o tremor das barras de vida e stamina e das letras. Pode desbotar o logo na tela '
+                     'de título e mostrar a cena antiga atrás das telas de carregamento.',
+                     'Generates the in-between frames from the scene only and draws the interface on top, '
+                     'uninterpolated: removes the shaking health/stamina bars and text. It can fade the '
+                     'logo on the title screen and show the old scene behind loading screens.'))
         self.window_icon_row(f)
         self.section(f, _('Resolução', 'Resolution'))
         self.row(f, _('Saída', 'Output'), self.choice(f, 'output_res', OUTPUTS),

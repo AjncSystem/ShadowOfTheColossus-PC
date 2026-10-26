@@ -235,9 +235,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         fault_size = size;
         DownloadMemory(arena, window_start, window_end - window_start);
         fault_size = 0;
-        if (is_write) {
-            MarkWrittenByGuest(device_addr, size);
-        }
+        FinishGuestFault(device_addr, size, is_write);
     };
     if (assume_locks) {
         flush_request();
@@ -263,6 +261,47 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     scheduler.WaitSubmitted(readback.tick, false);
     scheduler.GetWorkSemaphore()->Wait(readback.tick);
     liverpool->SendCommand<true>([this, &readback] { FinishAsyncReadback(readback); });
+}
+
+void BufferCache::FinishGuestFault(VAddr addr, u64 size, bool is_write) {
+    if (is_write) {
+        MarkWrittenByGuest(addr, size);
+    } else {
+        DropUnbackedGpuPages(addr, size);
+    }
+}
+
+void BufferCache::DropUnbackedGpuPages(VAddr addr, u64 size) {
+    // sotc: a guest read fault's readback is done and its pages are still marked GPU-modified
+    // although no GPU-written byte backs them (the range left the set, the page bit stayed). Left
+    // set, the page stays read-protected and the load faults again forever: on a 4-thread run a
+    // job worker sat on its first load and no frame came (MMadmer fork, 23 Oct). The guest then
+    // reads its own memory. Pages that still hold GPU data (written since) stay protected, and a
+    // readback in flight over them unprotects them itself. MarkWrittenByGuest does the same for
+    // write faults.
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_READ_FAULT_DROP");
+        return !v || v[0] != '0';
+    }();
+    if (!enabled) {
+        return;
+    }
+    const VAddr lo = Common::AlignDown(addr, VAddr{4096});
+    const VAddr hi = Common::AlignUp(addr + size, VAddr{4096});
+    if (!memory_tracker->IsRegionGpuModified(lo, hi - lo) || FindInflightReadback(lo, hi - lo)) {
+        return;
+    }
+    {
+        std::shared_lock gpu_modified_lock{gpu_modified_mutex};
+        if (gpu_modified_ranges.Intersects(lo, hi - lo)) {
+            return;
+        }
+    }
+    memory_tracker->UnmarkRegionAsGpuModified(lo, hi - lo, false);
+    if (SotcStats::read_fault_stale_gpu.fetch_add(1, std::memory_order_relaxed) < 8) {
+        std::fprintf(stderr, "SOTC read fault over a stale GPU page at %#llx: unprotected\n",
+                     static_cast<unsigned long long>(addr));
+    }
 }
 
 void BufferCache::MarkWrittenByGuest(VAddr addr, u64 size) {
@@ -307,9 +346,7 @@ void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
             readback.dependent = true;
             return;
         }
-        if (readback.is_write) {
-            MarkWrittenByGuest(readback.device_addr, readback.size);
-        }
+        FinishGuestFault(readback.device_addr, readback.size, readback.is_write);
         return;
     }
     // Held until FinishAsyncReadback: the pool must not hand it out again before.
@@ -390,15 +427,11 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
         while (AsyncReadback* other = FindInflightReadback(readback.device_addr, readback.size)) {
             FinishAsyncReadback(*other);
         }
-        if (readback.is_write) {
-            MarkWrittenByGuest(readback.device_addr, readback.size);
-        }
+        FinishGuestFault(readback.device_addr, readback.size, readback.is_write);
         return;
     }
     if (readback.finished) {
-        if (readback.is_write) {
-            MarkWrittenByGuest(readback.device_addr, readback.size);
-        }
+        FinishGuestFault(readback.device_addr, readback.size, readback.is_write);
         return;
     }
     readback.finished = true;
@@ -500,9 +533,7 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
         SubtractDownloaded(readback.pending);
         staging_pool.FreeDeferred(download);
     }
-    if (readback.is_write) {
-        MarkWrittenByGuest(readback.device_addr, readback.size);
-    }
+    FinishGuestFault(readback.device_addr, readback.size, readback.is_write);
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
@@ -2089,14 +2120,15 @@ bool BufferCache::FinishEviction(std::chrono::steady_clock::time_point now, u16 
                                  bool wait) {
     // sotc: the unbind's sparse batch does not wait for earlier submits, so it goes only once
     // every command buffer submitted so far (the read-back's included) is done. The GPU catches
-    // up within a frame or two at the benchmark scenes; after 5 s, or with `wait`, Finish() it.
+    // up within a frame or two at the benchmark scenes; after 5 s, or with `wait`, it is waited for.
     PendingEviction& pending = *pending_eviction;
-    if (!scheduler.IsFree(pending.tick) || !scheduler.IsFree(scheduler.CurrentTick() - 1)) {
-        if (!wait && now < pending.deadline) {
-            return false;
-        }
-        scheduler.Finish();
+    if (!wait && now < pending.deadline &&
+        (!scheduler.IsFree(pending.tick) || !scheduler.IsFree(scheduler.CurrentTick() - 1))) {
+        return false;
     }
+    // Draws recorded since the last submit would run after the unbind and before the BDA page
+    // table fill below (reads of unbound memory, no fault): Finish() submits and waits for them.
+    scheduler.Finish();
     const SotcStats::ScopedTimer evict_timer{SotcStats::arena_evict_ns};
     const auto& download = pending.download;
     download.buffer->Invalidate(download.offset, download.size);

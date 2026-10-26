@@ -665,13 +665,15 @@ void VideoOutDriver::Flip(const Request& req) {
             }
             // sotc: write-fault readbacks whose pages were still GPU-modified (totals).
             if (const uint64_t pending = SotcStats::write_fault_gpu_pending.load(),
-                stale = SotcStats::write_fault_stale_gpu.load();
-                pending || stale) {
+                stale = SotcStats::write_fault_stale_gpu.load(),
+                stale_reads = SotcStats::read_fault_stale_gpu.load();
+                pending || stale || stale_reads) {
                 std::fprintf(stderr,
                              "SOTC write faults over GPU data: left protected %llu, stale page "
-                             "bits cleared %llu\n",
+                             "bits cleared %llu; read faults that cleared one %llu\n",
                              static_cast<unsigned long long>(pending),
-                             static_cast<unsigned long long>(stale));
+                             static_cast<unsigned long long>(stale),
+                             static_cast<unsigned long long>(stale_reads));
             }
             // sotc: cold buffer arena memory given back (BufferCache::MaybeEvictCold), totals.
             if (const uint64_t runs = SotcStats::arena_evict_runs.load(std::memory_order_relaxed)) {

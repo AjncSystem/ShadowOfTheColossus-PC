@@ -255,6 +255,10 @@ private:
     /// sotc: marks bytes a guest write fault asked for CPU-modified, unless pages of them
     /// still hold GPU data (see the definition).
     void MarkWrittenByGuest(VAddr addr, u64 size);
+    /// sotc: the end of a guest fault's readback: a write is marked, a read unprotects pages that
+    /// are GPU-modified with no GPU data behind them.
+    void FinishGuestFault(VAddr addr, u64 size, bool is_write);
+    void DropUnbackedGpuPages(VAddr addr, u64 size);
     void FinishAsyncReadback(AsyncReadback& readback);
     AsyncReadback* FindInflightReadback(VAddr addr, u64 size);
     void MarkInflightReadbacksDirty(VAddr addr, u64 size, bool gpu_write = false);

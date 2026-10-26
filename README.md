@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC native port · v0.60.6-C1
+# Shadow of the Colossus — PC native port · v0.60.6-C2
 
 [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
@@ -20,6 +20,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.60.6-C2** | **Widescreen health and stamina bars fixed** (21:9 / 32:9, #301), **controller vibration toggle** (launcher and in-game menu, #292), **more FPS at the Shrine** (Lucas-blip-png's barrier change), **frame generation without the interface** (no shaking text, experimental), **DLSS Ultra Performance**. |
 | **0.60.6-C1** | **Community release.** tabnul's **page allocator fix** (an hour in Maximum + PS4 Pro without a crash, far less colour garbage after loads), **Maximum textures in PS4 Pro mode** (experimental), **NVIDIA DLSS** for RTX 20 and newer (tabnul; here also in PS4 Pro mode and at 4K), **grass** distance/height/detail live in the in-game menu (tabnul), the **US release CUSA08034** (NathanMBR), fixes for weak CPUs and GTX 10xx (JihedMrouki), Oussama268's readback and bind work (new "More FPS" option), **F7: 30 → 60 → unlimited**, a launcher **Debug** page (debug menu on F6 / Start+Select, skip the logos). |
 | **0.60.6** | **No more rainbow garbage on textures and far fewer "closed out of nowhere" crashes** (the cause: speculative GPU readbacks written over memory the game had reused, after loading a save or a new area), **no more black dots on sandy ground**, **in-game menu cleaned up** (FPS, upscaler and sharpening now change at once; Bloodborne leftovers removed), **hard disk read-ahead** (fewer stalls in new areas on HDDs), textures refreshed on every load, a readable session event log (`user/events.log`). |
 | **0.60.5** | **Texture quality selector: Off / High / Maximum** (#235: sharp again), **memory leak fixed** (~60 MB/min, long-session stutter), **+3% average and +12% minimum FPS** (descriptor binds reused), **loading after a GPU driver update: 106 s → 7 s**, possible fix for **white characters on AMD GCN** (RX 470–590, Vega), **4-thread CPUs** no longer stuck loading, a hang watchdog, short hitches no longer flash a black loading screen, code review fixes. |

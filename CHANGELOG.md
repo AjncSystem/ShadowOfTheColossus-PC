@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.60.6-C2 — 2026-10-26
+- **Tela larga (21:9, 32:9): barras de vida e stamina certas (#301, #202).** A barra de vida
+  tinha um pedaço cinza a mais e a amarela da stamina parava longe do círculo e enchia ao
+  contrário. O aspecto do objeto de tela do jogo fica 16:9 (o jogo desenha a barra de vida com
+  ele) e dois retângulos de 1920 de largura da interface passam a usar a largura da tela.
+- **Vibração do controle pode ser desligada (#292, Lucas-blip-png):** no lançador (Controles) e
+  no menu F1 (seção Controle), na hora.
+- **Mais FPS no Santuário (Lucas-blip-png):** a barreira de imagens de armazenamento GENERAL é
+  feita uma vez por fence em vez de antes de cada desenho (cada uma encerrava o passe de
+  renderização, ~20 mil por segundo), e o buffer de profundidade lido enquanto o stencil é escrito
+  fica num layout só. `SOTC_GENERAL_SYNC=0` / `SOTC_DEPTH_RO=0` desligam.
+- **Geração de quadros sem a interface (opção do Lucas-blip-png, experimental):** Imagem e FPS →
+  "Geração de quadros sem a interface". As letras e as barras não tremem mais com o FSR 3
+  (funciona também no modo PS4 Pro). Pode desbotar o logo da tela de título.
+- **DLSS Ultra Desempenho (3×) (#306)**; o DLSS só amplia 2× + FSR 1 quando nenhum modo aceita a
+  escala (modo Pro em 4K).
+- Testes: `SOTC_RENDER_KEEP`, `SOTC_RENDER_EXTRA` e `SOTC_WIDE_ASPECT` (achar valores de tamanho
+  de tela do jogo).
+
 ## 0.60.6-C1 — 2026-10-26
 Versão da comunidade: correções e recursos do tabnul, do Oussama268, do NathanMBR e do
 JihedMrouki, testados com texturas **Máxima + modo PS4 Pro + 60 FPS** (RTX 2060 SUPER).

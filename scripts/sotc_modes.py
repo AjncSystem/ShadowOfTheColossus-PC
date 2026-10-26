@@ -117,6 +117,11 @@ RENDER_SITES = [
     (0x01667f94, 'w2', '00007044'), (0x01667f9c, 'h2', '00000744'),
     # the default camera's aspect (16/9)
     (0x0166633c, 'a', '398ee33f'),
+    # HUD gauges: {0, 0, 1920.0, h} rectangles the stamina bar's fill is laid out in; left at 1920
+    # the yellow bar stopped short of the grip circle in 21:9 and filled the wrong way (#301,
+    # found with SOTC_RENDER_EXTRA and the user's tests, 26 Oct)
+    (0x008e2cf1, 'w', 'c78550feffff0000f044'),
+    (0x00920309, 'w', 'c78560feffff0000f044'),
 ]
 RT_POOL = 0x14280000
 # EU 1.01 / US 1.00: the command line lea and the fps60 site.
@@ -189,6 +194,18 @@ def render_patches(elf, ph, size):
             continue
         data = values[kind]
         writes.append((address - BASE + len(original) - len(data), data))
+    # SOTC_RENDER_EXTRA=<addr>,<addr>: more 4-byte floats of 1920/960/1080/540 to scale (finding
+    # the stamina bar's site, #301).
+    extra = {1920.0: 'w', 960.0: 'w2', 1080.0: 'h', 540.0: 'h2'}
+    for a in os.environ.get('SOTC_RENDER_EXTRA', '').replace(' ', ',').split(','):
+        if not a:
+            continue
+        address = int(a, 16)
+        current = struct.unpack('<f', image_bytes(elf, ph, address - BASE, 4))[0]
+        if current not in extra:
+            raise SystemExit(f'render size: {address:#x} holds {current}, not 1920/960/1080/540')
+        writes.append((address - BASE, values[extra[current]]))
+        print(f'Render size: {address:#x} {current:g} scaled too')
     return writes
 
 

@@ -49,7 +49,22 @@ enum : std::uint64_t {
     PipelinedTasks = 1ull << 38,
     PendingFenceWaits = 1ull << 39,
     PipelinedDispatch = 1ull << 40,
-    RecorderFences = 1ull << 41,
+    // sotc (DRAW-REPLAY.md): bit 41 was RecorderFences (no reader left); reused.
+    DrawReplay = 1ull << 41,      ///< set: ExecuteBackOp copies every stage's flat buffer into the
+                                  ///< draw thread's InfoRuntime and a draw's reusable-bind key
+                                  ///< (Rasterizer::BindResources) is the XXH3 of its pipeline, push
+                                  ///< data, target addresses, user data and flat buffers; clear:
+                                  ///< an unchanged flat buffer is not copied (a changed one is
+                                  ///< swapped in), InfoRuntime::ud_gen counts the changes, and the
+                                  ///< key is compared field by field with the one the last bind
+                                  ///< stored (same equality, no hashing); the counters of the
+                                  ///< FASTBIND line are plain stores, and only with SOTC_FPS.
+                                  ///< CLEAR BY DEFAULT (accepted: -1.2 +- 0.33 ms of draw thread,
+                                  ///< +2.7 +- 0.8 FPS in the heavy temple, 0 differences against
+                                  ///< the hash: docs/sotc/DRAW-REPLAY.md); SOTC_DRAWREPLAY=0 pins
+                                  ///< the old path, SOTC_DRAWREPLAY_VERIFY=1 compares the key with
+                                  ///< the hash on every draw. Honoured live, read per op and per
+                                  ///< draw.
     PipelinedMemoryWrites = 1ull << 42,
     MultiCopyShader = 1ull << 43,
     RenderStateMemo = 1ull << 44,

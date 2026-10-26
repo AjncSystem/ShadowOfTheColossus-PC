@@ -1574,16 +1574,22 @@ void *runtime_low_map(size_t size, int prot) {
  * guard and fine pipeline key memo are exact (SOTC_CP_VERIFY=1: 0 bad in 13 M checks) and take 0.4 ms of the
  * command processor's ~11 ms in the heavy temple, but the draw thread is the limiter there and the frame time
  * did not move measurably (docs/sotc/SIGUIENTE-LIMITE.md). SOTC_CP_FAST=1 turns it on (toggle_env_pins). */
+/* sotc: bit 41 (DrawReplay, Lukto02) is clear = on by default (set = the old path): unchanged flat buffers are not copied
+ * per op and the reusable-bind key of a draw is compared field by field instead of hashed. Exact
+ * (SOTC_DRAWREPLAY_VERIFY=1: 0 differences against the hash in >30 M comparisons); -1.2 +- 0.33 ms of draw thread and
+ * +2.7 +- 0.8 FPS in the heavy temple (docs/sotc/DRAW-REPLAY.md). SOTC_DRAWREPLAY=0 pins the old path (toggle_env_pins). */
 uint64_t runtime_disabled_optimizations=UINT64_C(1)<<20 | UINT64_C(1)<<39 | UINT64_C(1)<<59 | UINT64_C(1)<<60; /* sotc: 59, 60 off as in Lukto02 #308 */
 /* Speculative readers of guest memory (GPU draw-preparation workers) register a recovery
  * point: a fault on that thread jumps back to it instead of terminating (probe.c). */
 __thread sigjmp_buf *runtime_fault_recover;
 /* sotc: environment pins for single toggle bits (Lukto02's fast paths), applied to the compiled mask at start
  * and to every BB_TOGGLE_FILE mask, so a bench that A/B toggles one of these bits in the file must leave its
- * variable unset. SOTC_CP_FAST=1/0: bit 20 (CpFastPaths) clear/set. */
+ * variable unset. SOTC_CP_FAST=1/0: bit 20 (CpFastPaths) clear/set;
+ * SOTC_DRAWREPLAY=1/0: bit 41 (DrawReplay) clear/set. */
 static uint64_t toggle_env_pins(uint64_t mask) {
     static const struct { const char *name; unsigned bit; } pins[]={
         {"SOTC_CP_FAST",20},
+        {"SOTC_DRAWREPLAY",41},
     };
     for (size_t i=0;i<sizeof pins/sizeof pins[0];++i) {
         const char *v=getenv(pins[i].name);

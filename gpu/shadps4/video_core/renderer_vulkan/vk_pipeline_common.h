@@ -57,6 +57,11 @@ public:
         return is_compute;
     }
 
+    /// sotc: BbToggle::DrawReplay. Rasterizer::FastBindEligible's part that only depends on the
+    /// stage infos (immutable once the pipeline exists): -1 not computed, 0 / 1 the answer. Draw
+    /// thread only.
+    mutable s8 fast_bind_static{-1};
+
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
     void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data) const;
 

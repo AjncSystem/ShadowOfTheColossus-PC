@@ -26,6 +26,7 @@
 #include "bbport_overlay.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/sotc_gpu_times.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/sotc_fps_cap.h"
 #include "video_core/sotc_event.h"
 #include "video_core/sotc_stats.h"
@@ -1130,6 +1131,7 @@ void VideoOutDriver::Flip(const Request& req) {
                 std::fprintf(stderr, "SOTC threads per frame: draw busy %.2f ms, command parse %.2f ms\n",
                              (seconds * 1000.0 - idle_ms) / flips, parse_ms / flips);
             }
+            Vulkan::DrawPhase::ReplayReport(); // sotc: SOTC_DRAW_REPLAY_PROBE (no-op otherwise)
             if (SotcStats::kDrawSplit && split_frames && split_tick0) {
                 const double ns = double(SotcStats::NowNs() - split_ns0);
                 const double ticks_per_ms =

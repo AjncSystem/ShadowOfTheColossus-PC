@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.60.6-plus13 — 2026-10-26 (fork Lucas-blip-png)
+- **Desempenho do PR #308 do upstream, de Lukto02 (Luca Zarecki):** caminhos rápidos na thread de desenho (`GpuDraw`),
+  DrawReplay, intervalos de leitura de volta, vigia de heap do BPE e ajustes de memória, tudo atrás de bits do `BbToggle`
+  (`bbport_toggles.h`) e com variáveis `*_VERIFY=1` do autor. Mesclado com os 5 commits originais, autoria dele mantida.
+  A/B intercalado (ABBA) contra o `main` anterior, mesmo perfil PGO antigo: Santuário 62,3 / 62,6 → 67,8 / 67,9 FPS (+8,6%);
+  rota do deserto largo (3840x1080) 48,6 / 45,6 → 61,2 / 55,5 FPS (cerca de +24%, a rota varia de uma rodada para outra).
+  Sem quedas nem "Jogo parado" nos logs. Não testado: AMD/Intel nem uma sessão longa de jogo.
+- **PGO retreinado** com o código novo (`tools/pgo_train.sh`, RTX 5060 Ti): mais 6% no Santuário (68,5 → 72,6 FPS) e 7% no deserto
+  (55,0 → 58,9 FPS) contra o perfil antigo de 17/10.
+- **Três pacotes por release:** `SotC-PC.zip` (Livre, sem configuração pronta, é o que o atualizador baixa),
+  `SotC-PC-Otimizada-NVIDIA.zip` (DLSS Qualidade, 60 FPS) e `SotC-PC-Otimizada-AMD-Intel.zip` (FSR 3.1 Qualidade). O perfil
+  PGO só foi treinado em NVIDIA; veja `docs/sotc/PGO.md` para enviar um de AMD ou Intel (quem enviar será creditado).
+- Também: tamanho de saída 1600x900 (pedido do usuário 2mg no #306).
+
 ## 0.60.6-plus12 — 2026-10-26 (fork Lucas-blip-png)
 - **Textura Máxima no modo PS4 Pro (experimental, da 0.60.6-C1):** o launcher e o menu do jogo não trocam mais a Máxima
   por Alta no modo Pro, agora que a correção do alocador de páginas está no fork. `SOTC_MAX_IN_PRO=0` volta ao

@@ -1,0 +1,9 @@
+{
+  "af16": true,
+  "textures": "high",
+  "fps_mode": "60",
+  "upscaler": "fsr3",
+  "render_preset": "quality",
+  "framegen": "off",
+  "present_mode": "Mailbox"
+}

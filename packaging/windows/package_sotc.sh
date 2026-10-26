@@ -71,6 +71,25 @@ fi
 mkdir -p dist
 rm -rf dist/SotC-PC.zip
 python -c 'import shutil, sys; shutil.make_archive("dist/SotC-PC", "zip", "out/stage", "SotC-PC")'
+# Editions: SotC-PC.zip is the "Livre" one (no ready-made settings; it is also what the launcher's
+# updater downloads). The "Otimizada" zips are the same files plus a user/launcher_settings.json
+# preset per GPU vendor (packaging/windows/presets/*.json): DLSS Quality for NVIDIA, FSR 3.1
+# Quality for AMD and Intel. A vendor-trained PGO build (pgo/bbgpu-<vendor>.profdata, see
+# docs/sotc/PGO.md) goes into the matching zip when that profile exists.
+for edition in nvidia amd_intel; do
+    name=$([[ $edition == nvidia ]] && echo NVIDIA || echo AMD-Intel)
+    rm -rf out/stage-$edition dist/SotC-PC-Otimizada-$name.zip
+    mkdir -p out/stage-$edition
+    cp -r "$dest" out/stage-$edition/SotC-PC
+    mkdir -p out/stage-$edition/SotC-PC/user
+    cp packaging/windows/presets/$edition.json out/stage-$edition/SotC-PC/user/launcher_settings.json
+    if [[ -f out/vendor-bin/$edition/bb-probe.exe ]]; then
+        llvm-strip --strip-debug -o out/stage-$edition/SotC-PC/bin/bb-probe.exe out/vendor-bin/$edition/bb-probe.exe
+        echo "Otimizada-$name: vendor-trained PGO bb-probe.exe"
+    fi
+    python -c "import shutil; shutil.make_archive('dist/SotC-PC-Otimizada-$name', 'zip', 'out/stage-$edition', 'SotC-PC')"
+    rm -rf out/stage-$edition
+done
 # The playable copy keeps its settings and saves.
 mkdir -p dist/SotC-PC
 cp -r "$dest/bin" "$dest/scripts" "$dest/launcher" "$dest/_internal" dist/SotC-PC/

@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC native port · v0.60.6-plus12
+# Shadow of the Colossus — PC native port · v0.60.6-plus13
 
 **The original 0.60.6, plus CPUs without BMI1 (pre-Haswell), CPUs with 4 threads, 120 Hz
 fullscreen, a 32-lane fix for AMD GCN cards (RX 470–590, to test), and the FSR 3.1 and DLSS 4.5 upscalers (NVIDIA RTX).** Everything in [AjncSystem's 0.60.6](https://github.com/AjncSystem/ShadowOfTheColossus-PC)
@@ -210,6 +210,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.60.6-plus13** | **Lucas-blip-png fork:** performance from Lukto02's PR #308 (draw-thread fast paths, DrawReplay, readback intervals; Shrine +8.6%, desert route about +24% in A/B) with a retrained PGO profile (another +6-7%); three downloads: Livre (no preset), Otimizada NVIDIA and Otimizada AMD/Intel (docs/sotc/PGO.md). |
 | **0.60.6-plus12** | **Lucas-blip-png fork:** Maximum texture quality allowed in PS4 Pro mode (experimental, from C1, now that the page allocator fix is in); F7 switches 30 -> 60 -> unlimited FPS. |
 | **0.60.6-plus11** | **Lucas-blip-png fork:** 4-thread CPUs get thread priorities (34 to 47 FPS in the Shrine limited to 4 CPUs) and a fix for a read-fault hang; the page allocator fix of the 0x1a371 crash (tabnul, from C1); DLSS-G multiplier 3x/4x/6x on RTX 50; a detailed texture log and a bigger problem report .zip. |
 | **0.60.6-plus10** | **Lucas-blip-png fork:** textures are no longer stuck at the coarsest level after every load (the page-pool valve only goes to mip 5 while the pool is falling, not within 60 s of a load). |

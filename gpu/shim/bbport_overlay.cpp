@@ -436,7 +436,9 @@ void GrassCombo(const char* label, const char* key, const GrassChoice (&choices)
     } else if (const auto it = saved.find(key); it != saved.end()) {
         now = it->second;
     } else {
-        now = saved[key] = std::strtof(LoadLauncherSetting(key).c_str(), nullptr);
+        // not saved yet (settings from before the grass options): the game's own value
+        const std::string v = LoadLauncherSetting(key);
+        now = saved[key] = v.empty() ? env_value : std::strtof(v.c_str(), nullptr);
     }
     char preview[16];
     std::snprintf(preview, sizeof(preview), "%g", now);
@@ -517,9 +519,9 @@ void GrassSettings() {
     GrassCombo(T("Altura do mato", "Weed height"), "weed_height", height, &SotcLive::grass[3],
                env[3]);
     GrassCombo(T("Sombras da grama (ao reiniciar)", "Grass shadows (on restart)"), "grass_shadows",
-               shadows, nullptr, 0.f);
+               shadows, nullptr, 2.f);
     GrassCombo(T("Esmaecimento da grama (ao reiniciar)", "Grass fade (on restart)"), "grass_fade",
-               fade, nullptr, 0.f);
+               fade, nullptr, 1.f);
     Hint(T("Abaixo de 100% a sombra da grama também some (50%: quase sem sombra). Menos grama "
            "alivia um pouco a GPU.",
            "Below 100% the grass shadow fades too (50%: almost no shadow). Less grass is a little "

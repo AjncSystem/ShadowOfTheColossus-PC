@@ -40,6 +40,10 @@ public:
         return *pipeline_layout;
     }
 
+    vk::DescriptorSetLayout GetDescriptorSetLayout() const noexcept {
+        return *desc_layout;
+    }
+
     auto GetStages() const {
         static_assert(static_cast<u32>(Shader::SwStage::Compute) == Shader::MaxStageTypes - 1);
         if (is_compute) {
@@ -55,6 +59,10 @@ public:
 
     bool IsCompute() const {
         return is_compute;
+    }
+
+    bool UsesPushDescriptors() const noexcept {
+        return uses_push_descriptors;
     }
 
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;

@@ -263,7 +263,16 @@ void Liverpool::CaptureBackOp(BackOp& op, const Vulkan::Pipeline* pipeline) {
                         stage.num_user_data * sizeof(u32));
         }
         stage.pgm_base = rt.pgm_base;
-        stage.flat.assign(rt.flattened_ud_buf.begin(), rt.flattened_ud_buf.end());
+        const u32 count = static_cast<u32>(rt.flattened_ud_buf.size());
+        stage.num_flat = count;
+        if (count <= stage.flat_inline.size()) {
+            if (count > 0) {
+                std::memcpy(stage.flat_inline.data(), rt.flattened_ud_buf.data(),
+                            count * sizeof(u32));
+            }
+        } else {
+            stage.flat_overflow.assign(rt.flattened_ud_buf.begin(), rt.flattened_ud_buf.end());
+        }
     }
 }
 
@@ -309,7 +318,15 @@ void Liverpool::ExecuteBackOp(BackOp& op) {
         rt.user_data = stage.num_user_data == ~0u
                            ? std::span<const u32>{}
                            : std::span<const u32>{stage.user_data.data(), stage.num_user_data};
-        rt.flattened_ud_buf.assign(stage.flat.begin(), stage.flat.end());
+        if (stage.num_flat <= stage.flat_inline.size()) {
+            rt.flattened_ud_buf.resize(stage.num_flat);
+            if (stage.num_flat > 0) {
+                std::memcpy(rt.flattened_ud_buf.data(), stage.flat_inline.data(),
+                            stage.num_flat * sizeof(u32));
+            }
+        } else {
+            rt.flattened_ud_buf.assign(stage.flat_overflow.begin(), stage.flat_overflow.end());
+        }
         rt.pgm_base = stage.pgm_base;
     }
     switch (op.kind) {

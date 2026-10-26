@@ -65,6 +65,19 @@ struct Pending {
     u64 depth_uid{}, mvec_uid{};
     Camera cam{};
     float yscale{-1.0f}, zscale{1.0f}, zoffset{0.0f};
+
+    struct UiCanvas {
+        VideoCore::ImageId id{};
+        u64 uid{};
+        u32 first_draw{}, last_draw{};
+        u32 width{}, height{};
+        vk::Format format{};
+    };
+    bool hudless_detected{};
+    u32 hudless_draw_idx{};
+    u32 hudless_last_draw_idx{};
+    u32 num_ui_canvases{};
+    std::array<UiCanvas, 8> ui_canvases{};
 };
 
 /// The inputs of one presentation frame (vk_presenter.h Frame, by id).
@@ -78,6 +91,7 @@ struct FrameSlot {
     u32 index{};     ///< Streamline frame index, 0: no game frame
     bool valid{};    ///< depth, motion vectors and constants are set for this frame
     bool sl_valid{}; ///< ... and given to Streamline
+    bool has_hudless{};
     sl::Constants constants{};
     /// The presenter's HUD-less copy of this frame (NoteHudless), null when it has none.
     struct Hudless {
@@ -102,6 +116,13 @@ const Instance* g_instance{};
 Pending pending;                     // command processor thread
 std::array<FrameSlot, kMaxFrames> frames;
 u32 next_index = 0;                  // command processor thread
+u32 frame_draw_count = 0;            // command processor thread
+VmaAllocation staging_hudless_alloc{};
+vk::Image staging_hudless;
+vk::ImageView staging_hudless_view;
+vk::Format staging_hudless_fmt{vk::Format::eUndefined};
+vk::Format staging_hudless_view_fmt{vk::Format::eUndefined};
+u32 staging_hudless_w = 0, staging_hudless_h = 0;
 bool have_prev = false;              // command processor thread
 double prev_pos[3]{}, prev_fwd[3]{}; // command processor thread
 u32 bad_cameras = 0;
@@ -857,6 +878,123 @@ void NoteDraw(const AmdGpu::Regs& regs, u32 mrt_mask, VideoCore::ImageId depth_i
     pending = p;
 }
 
+bool EnsureStagingHudless(u32 width, u32 height, vk::Format format) {
+    if (staging_hudless && staging_hudless_w == width && staging_hudless_h == height &&
+        staging_hudless_fmt == format) {
+        return true;
+    }
+    if (staging_hudless_view) {
+        g_instance->GetDevice().destroyImageView(staging_hudless_view);
+        staging_hudless_view = nullptr;
+        staging_hudless_view_fmt = vk::Format::eUndefined;
+    }
+    if (staging_hudless) {
+        vmaDestroyImage(g_instance->GetAllocator(), staging_hudless, staging_hudless_alloc);
+        staging_hudless = nullptr;
+        staging_hudless_alloc = nullptr;
+        staging_hudless_w = 0;
+        staging_hudless_h = 0;
+        staging_hudless_fmt = vk::Format::eUndefined;
+    }
+    const VkImageCreateInfo info = static_cast<VkImageCreateInfo>(vk::ImageCreateInfo{
+        .flags = vk::ImageCreateFlagBits::eMutableFormat | vk::ImageCreateFlagBits::eExtendedUsage,
+        .imageType = vk::ImageType::e2D,
+        .format = format,
+        .extent = {width, height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = vk::SampleCountFlagBits::e1,
+        .tiling = vk::ImageTiling::eOptimal,
+        .usage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc |
+                 vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage,
+        .initialLayout = vk::ImageLayout::eUndefined,
+    });
+    const VmaAllocationCreateInfo alloc_info = {
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+    };
+    VkImage raw{};
+    if (vmaCreateImage(g_instance->GetAllocator(), &info, &alloc_info, &raw,
+                       &staging_hudless_alloc, nullptr) != VK_SUCCESS) {
+        return false;
+    }
+    staging_hudless = vk::Image{raw};
+    staging_hudless_w = width;
+    staging_hudless_h = height;
+    staging_hudless_fmt = format;
+    return true;
+}
+
+void CheckCaptureHudless(const AmdGpu::Regs& regs, u32 mrt_mask, VideoCore::ImageId cb0_id,
+                         VideoCore::TextureCache& texture_cache, Scheduler& scheduler,
+                         Runtime& runtime) {
+    (void)scheduler;
+    (void)runtime;
+    ++frame_draw_count;
+    if (!CapturingInputs() || !pending.captured || !cb0_id) {
+        return;
+    }
+    // Only single color target draws (HUD never uses MRT 1..7).
+    if (mrt_mask != 1) {
+        return;
+    }
+    auto& cb0_img = texture_cache.GetImage(cb0_id);
+    const u32 w = cb0_img.info.size.width;
+    const u32 h = cb0_img.info.size.height;
+    if (w < 1280 || h < 720 || cb0_img.info.num_samples != 1) {
+        return;
+    }
+    const auto fmt = cb0_img.info.pixel_format;
+    // Condition 1: Require LDR 8-bit format compatible with kColorFormat (B8G8R8A8 / R8G8B8A8).
+    const bool is_ldr_8bit = (fmt == vk::Format::eR8G8B8A8Unorm ||
+                              fmt == vk::Format::eR8G8B8A8Srgb ||
+                              fmt == vk::Format::eB8G8R8A8Unorm ||
+                              fmt == vk::Format::eB8G8R8A8Srgb);
+    if (!is_ldr_8bit) {
+        return;
+    }
+
+    // Depth test/write check:
+    // 3D geometry writes to depth or uses depth testing with a real comparison (Less/Equal/etc).
+    // 2D HUD disables depth test, or has depth_write disabled with depth_func == Always.
+    const bool depth_active = regs.depth_control.depth_enable && regs.depth_buffer.DepthValid() &&
+                              (regs.depth_control.depth_write_enable ||
+                               regs.depth_control.depth_func != AmdGpu::CompareFunc::Always);
+    if (depth_active) {
+        return;
+    }
+
+    // Blend check: HUD elements always use blending over the post-processed scene.
+    const bool blend_enable = (regs.blend_control[0].enable != 0);
+    if (!blend_enable) {
+        return;
+    }
+
+    if (!pending.hudless_detected) {
+        pending.hudless_draw_idx = frame_draw_count;
+    }
+    pending.hudless_last_draw_idx = frame_draw_count;
+    pending.hudless_detected = true;
+
+    bool found = false;
+    for (u32 i = 0; i < pending.num_ui_canvases; ++i) {
+        if (pending.ui_canvases[i].id == cb0_id) {
+            pending.ui_canvases[i].last_draw = frame_draw_count;
+            found = true;
+            break;
+        }
+    }
+    if (!found && pending.num_ui_canvases < pending.ui_canvases.size()) {
+        auto& entry = pending.ui_canvases[pending.num_ui_canvases++];
+        entry.id = cb0_id;
+        entry.uid = cb0_img.image_uid;
+        entry.first_draw = frame_draw_count;
+        entry.last_draw = frame_draw_count;
+        entry.width = w;
+        entry.height = h;
+        entry.format = fmt;
+    }
+}
+
 void PrepareInputs(u32 frame_id, vk::CommandBuffer cmdbuf, VideoCore::TextureCache& texture_cache,
                    Runtime& runtime, u32 game_width, u32 game_height) {
     if (frame_id >= kMaxFrames) {
@@ -897,6 +1035,25 @@ void PrepareInputs(u32 frame_id, vk::CommandBuffer cmdbuf, VideoCore::TextureCac
     }
 
     const Pending p = std::exchange(pending, Pending{});
+    const u32 total_draws = std::exchange(frame_draw_count, 0);
+    if (p.hudless_detected) {
+        SotcStats::ov_hudless_draw_idx.store(p.hudless_draw_idx, std::memory_order_relaxed);
+        SotcStats::ov_hudless_total_draws.store(total_draws, std::memory_order_relaxed);
+        SotcStats::ov_hudless_canvases.store(p.num_ui_canvases, std::memory_order_relaxed);
+        SotcStats::ov_hudless_is_vo.store(0, std::memory_order_relaxed);
+    } else {
+        SotcStats::ov_hudless_canvases.store(0, std::memory_order_relaxed);
+        SotcStats::ov_hudless_is_vo.store(0, std::memory_order_relaxed);
+        if (!p.captured) {
+            SotcStats::ov_hudless_reason.store(
+                static_cast<uint32_t>(SotcStats::HudlessReason::NoGbuffer),
+                std::memory_order_relaxed);
+        } else {
+            SotcStats::ov_hudless_reason.store(
+                static_cast<uint32_t>(SotcStats::HudlessReason::NoHudDraw),
+                std::memory_order_relaxed);
+        }
+    }
     if (!p.captured) {
         return;
     }
@@ -1002,10 +1159,101 @@ void PrepareInputs(u32 frame_id, vk::CommandBuffer cmdbuf, VideoCore::TextureCac
 
     f.constants = constants;
     f.valid = true;
+    f.has_hudless = false;
     if (fsr) {
         // FSR 3 reads depth as R32F: from the copy, now ShaderReadOnlyOptimal.
         FsrFg::ConvertDepth(frame_id, cmdbuf, f.depth_view, width, height,
                             constants.depthInverted == sl::Boolean::eTrue);
+    }
+
+    if (p.hudless_detected && p.num_ui_canvases > 0 && p.ui_canvases[0].id) {
+        const auto& primary = p.ui_canvases[0];
+        VideoCore::Image* ui_img = texture_cache.TryGetImage(primary.id, primary.uid);
+        if (ui_img) {
+            texture_cache.UpdateImage(primary.id);
+            if (EnsureStagingHudless(primary.width, primary.height, primary.format)) {
+                runtime.Transit(ui_img, vk::ImageLayout::eTransferSrcOptimal,
+                                vk::PipelineStageFlagBits2::eAllCommands,
+                                vk::AccessFlagBits2::eTransferRead);
+                runtime.FlushBarriers();
+
+                const auto ui_range = vk::ImageSubresourceRange{
+                    .aspectMask = vk::ImageAspectFlagBits::eColor,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                };
+
+                const vk::ImageMemoryBarrier2 pre_ui_sync{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput |
+                                    vk::PipelineStageFlagBits2::eAllGraphics,
+                    .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+                    .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+                    .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
+                    .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+                    .image = ui_img->GetImage(),
+                    .subresourceRange = ui_range,
+                };
+
+                const vk::ImageMemoryBarrier2 to_dst_staging{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                    .srcAccessMask = vk::AccessFlagBits2::eNone,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+                    .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                    .oldLayout = vk::ImageLayout::eUndefined,
+                    .newLayout = vk::ImageLayout::eTransferDstOptimal,
+                    .image = staging_hudless,
+                    .subresourceRange = ui_range,
+                };
+                const std::array pre_barriers{pre_ui_sync, to_dst_staging};
+                cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                    .imageMemoryBarrierCount = static_cast<u32>(pre_barriers.size()),
+                    .pImageMemoryBarriers = pre_barriers.data(),
+                });
+
+                const vk::ImageCopy region{
+                    .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                    .srcOffset = {0, 0, 0},
+                    .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+                    .dstOffset = {0, 0, 0},
+                    .extent = {primary.width, primary.height, 1},
+                };
+                cmdbuf.copyImage(ui_img->GetImage(), vk::ImageLayout::eTransferSrcOptimal,
+                                 staging_hudless, vk::ImageLayout::eTransferDstOptimal, region);
+
+                const vk::ImageMemoryBarrier2 post_staging{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+                    .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eBlit | vk::PipelineStageFlagBits2::eFragmentShader,
+                    .dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eShaderRead,
+                    .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+                    .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+                    .image = staging_hudless,
+                    .subresourceRange = ui_range,
+                };
+
+                const vk::ImageMemoryBarrier2 restore_ui{
+                    .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+                    .srcAccessMask = vk::AccessFlagBits2::eTransferRead,
+                    .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                    .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentRead |
+                                     vk::AccessFlagBits2::eColorAttachmentWrite,
+                    .oldLayout = vk::ImageLayout::eTransferSrcOptimal,
+                    .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                    .image = ui_img->GetImage(),
+                    .subresourceRange = ui_range,
+                };
+                const std::array post_barriers{post_staging, restore_ui};
+                cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                    .imageMemoryBarrierCount = static_cast<u32>(post_barriers.size()),
+                    .pImageMemoryBarriers = post_barriers.data(),
+                });
+                ui_img->backing->state.layout = vk::ImageLayout::eColorAttachmentOptimal;
+                f.has_hudless = true;
+            }
+        }
     }
     if (!supported || FrameGen::Current() != FrameGen::Mode::Dlss) {
         return;
@@ -1215,6 +1463,32 @@ void Suspend() {
         SetOptions(false);
     }
     valid_streak = 0;
+    pending = Pending{};
+    frame_draw_count = 0;
+    for (auto& f : frames) {
+        f.valid = false;
+        f.has_hudless = false;
+    }
+}
+
+bool HasCapturedHudless(u32 frame_id) {
+    return frame_id < kMaxFrames && frames[frame_id].has_hudless;
+}
+
+vk::Image GetStagingHudlessImage() {
+    return staging_hudless;
+}
+
+vk::ImageView GetStagingHudlessView() {
+    return staging_hudless_view;
+}
+
+u32 GetStagingHudlessWidth() {
+    return staging_hudless_w;
+}
+
+u32 GetStagingHudlessHeight() {
+    return staging_hudless_h;
 }
 
 bool GetFrameInputs(u32 frame_id, FrameInputs& out) {

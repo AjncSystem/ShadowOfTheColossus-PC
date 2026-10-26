@@ -312,6 +312,12 @@ public:
                (sampler_epoch.load(std::memory_order_acquire) * 0x9E3779B97F4A7C15ULL);
     }
 
+    /// sotc: changes when guest/GPU writes may have made an image need an upload, i.e. when an
+    /// image opened in the current render pass cannot be reused without UpdateImage.
+    u64 UploadGeneration() const noexcept {
+        return upload_generation.load(std::memory_order_acquire);
+    }
+
     /// Frees cached images not used in the last few GC ticks (one per submit), regardless of
     /// memory thresholds. Called when a video memory allocation fails. Higher levels go deeper
     /// (sotc): level 0 frees up to 512 images last used 4 or more ticks ago, level 1 up to 4096
@@ -389,6 +395,14 @@ public:
         TrackImage(image_id);
         TouchImage(image);
         RefreshImage(image);
+    }
+
+    /// sotc: keeps an image used again by the open render pass in the LRU without repeating
+    /// TrackImage/RefreshImage; the caller checked that no upload generation advanced since.
+    void TouchImageForReuse(ImageId image_id) {
+        std::unique_lock lk{mutex, std::defer_lock};
+        LockCounted(lk);
+        TouchImage(slot_images[image_id]);
     }
 
     /// Resolves overlap between existing cache image and pending merged image
@@ -681,6 +695,8 @@ private:
     static constexpr u64 NumImagePages = u64{1} << (Traits::ADDRESS_SPACE_BITS - Traits::PAGE_BITS);
     std::unique_ptr<std::atomic<u32>[]> page_images{new std::atomic<u32>[NumImagePages]()};
     ReentrantMutex mutex;
+    /// sotc: bumped by InvalidateMemory/InvalidateMemoryFromGPU (see UploadGeneration).
+    std::atomic<u64> upload_generation{0};
     /// sotc: RefreshImage nesting on this thread (it runs under `mutex`).
     static inline thread_local u32 refresh_depth = 0;
     /// sotc: deferred EmergencyCollect level + 1 (0: none).

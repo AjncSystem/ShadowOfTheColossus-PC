@@ -25,6 +25,10 @@ public:
     void Render(vk::CommandBuffer cmdbuf, vk::ImageView input, vk::Extent2D input_size,
                 Frame& output, Settings settings);
 
+    void Render(vk::CommandBuffer cmdbuf, vk::ImageView input, vk::Extent2D input_size,
+                vk::ImageView output_view, vk::Image output_image, u32 output_width,
+                u32 output_height, Settings settings);
+
 private:
     vk::UniquePipeline pipeline{};
     vk::UniquePipelineLayout pipeline_layout{};

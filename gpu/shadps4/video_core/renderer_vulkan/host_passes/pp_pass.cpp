@@ -183,6 +183,14 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
 
 void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                                 vk::Extent2D input_size, Frame& frame, Settings settings) {
+    Render(cmdbuf, input, input_size, frame.image_view, frame.image, frame.width, frame.height,
+           settings);
+}
+
+void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
+                                vk::Extent2D input_size, vk::ImageView output_view,
+                                vk::Image output_image, u32 output_width, u32 output_height,
+                                Settings settings) {
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
             .pLabelName = "Host/Post processing",
@@ -196,7 +204,7 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
     };
     const std::array<vk::RenderingAttachmentInfo, 1> attachments{{
         {
-            .imageView = frame.image_view,
+            .imageView = output_view,
             .imageLayout = vk::ImageLayout::eColorAttachmentOptimal,
             .loadOp = vk::AttachmentLoadOp::eClear,
             .storeOp = vk::AttachmentStoreOp::eStore,
@@ -205,8 +213,8 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
     const vk::RenderingInfo rendering_info{
         .renderArea{
             .extent{
-                .width = frame.width,
-                .height = frame.height,
+                .width = output_width,
+                .height = output_height,
             },
         },
         .layerCount = 1,
@@ -235,8 +243,8 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
 
     const std::array viewports = {
         vk::Viewport{
-            .width = static_cast<float>(frame.width),
-            .height = static_cast<float>(frame.height),
+            .width = static_cast<float>(output_width),
+            .height = static_cast<float>(output_height),
             .minDepth = 0.0f,
             .maxDepth = 1.0f,
         },
@@ -245,8 +253,8 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
     cmdbuf.setViewport(0, viewports);
     cmdbuf.setScissor(0, vk::Rect2D{
                              .extent{
-                                 .width = frame.width,
-                                 .height = frame.height,
+                                 .width = output_width,
+                                 .height = output_height,
                              },
                          });
 
@@ -265,7 +273,7 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
         .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
         .newLayout = vk::ImageLayout::eGeneral,
-        .image = frame.image,
+        .image = output_image,
         .subresourceRange = simple_subresource,
     };
 

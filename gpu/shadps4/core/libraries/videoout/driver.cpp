@@ -689,6 +689,10 @@ void VideoOutDriver::Flip(const Request& req) {
             if (flips) {
                 const double idle_ms = SotcStats::draw_idle_ns.exchange(0) / 1e6;
                 const double parse_ms = SotcStats::cp_parse_ns.exchange(0) / 1e6;
+                const float draw_busy = float((seconds * 1000.0 - idle_ms) / flips);
+                const float parse_busy = float(parse_ms / flips);
+                SotcStats::ov_draw_busy_ms.store(draw_busy);
+                SotcStats::ov_cp_parse_ms.store(parse_busy);
                 std::fprintf(stderr, "SOTC threads per frame: draw busy %.2f ms, command parse %.2f ms\n",
                              (seconds * 1000.0 - idle_ms) / flips, parse_ms / flips);
             }

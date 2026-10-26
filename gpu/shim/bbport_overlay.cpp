@@ -902,15 +902,60 @@ void FpsCounter() {
             ImGui::TextColored(grey, SotcUi::T("DLSS-G: aguardando (sem cena 3D)", "DLSS-G: waiting (no 3D scene)"));
         }
         break;
-    case Vulkan::FrameGen::Mode::Fsr:
-        if (const int fg = SotcStats::ov_fsr_state.load(std::memory_order_relaxed); fg == 1) {
-            ImGui::TextColored(green, SotcUi::T("FSR 3 x2: ~%.0f FPS na tela", "FSR 3 x2: ~%.0f FPS shown"), avg_fps * 2);
+    case Vulkan::FrameGen::Mode::Fsr: {
+        const int fg = SotcStats::ov_fsr_state.load(std::memory_order_relaxed);
+        if (fg == 1) {
+            const int hl = SotcStats::ov_hudless_state.load(std::memory_order_relaxed);
+            const u32 hl_draw = SotcStats::ov_hudless_draw_idx.load(std::memory_order_relaxed);
+            const u32 hl_total = SotcStats::ov_hudless_total_draws.load(std::memory_order_relaxed);
+            const u32 hl_canvases = SotcStats::ov_hudless_canvases.load(std::memory_order_relaxed);
+            const u32 hl_ui_px = SotcStats::ov_hudless_ui_px.load(std::memory_order_relaxed);
+            const u32 min_x = SotcStats::ov_hudless_min_x.load(std::memory_order_relaxed);
+            const u32 max_x = SotcStats::ov_hudless_max_x.load(std::memory_order_relaxed);
+            const u32 min_y = SotcStats::ov_hudless_min_y.load(std::memory_order_relaxed);
+            const u32 max_y = SotcStats::ov_hudless_max_y.load(std::memory_order_relaxed);
+            if (hl == 1) {
+                if (hl_ui_px > 0 && min_x <= max_x) {
+                    ImGui::TextColored(green,
+                        SotcUi::T("FSR 3 FG: Ativo (~%.0f FPS) | HUDless: ON (draw %u/%u, cv: %u, UI px: %u [%u..%u, %u..%u])",
+                                  "FSR 3 FG: Active (~%.0f FPS) | HUDless: ON (draw %u/%u, cv: %u, UI px: %u [%u..%u, %u..%u])"),
+                        avg_fps * 2.0f, hl_draw, hl_total, hl_canvases, hl_ui_px, min_x, max_x, min_y, max_y);
+                } else {
+                    ImGui::TextColored(green,
+                        SotcUi::T("FSR 3 FG: Ativo (~%.0f FPS) | HUDless: ON (draw %u/%u, cv: %u, UI px: %u)",
+                                  "FSR 3 FG: Active (~%.0f FPS) | HUDless: ON (draw %u/%u, cv: %u, UI px: %u)"),
+                        avg_fps * 2.0f, hl_draw, hl_total, hl_canvases, hl_ui_px);
+                }
+            } else {
+                const auto reason_code = static_cast<SotcStats::HudlessReason>(
+                    SotcStats::ov_hudless_reason.load(std::memory_order_relaxed));
+                const char* r_pt = "desconhecido";
+                const char* r_en = "unknown";
+                switch (reason_code) {
+                case SotcStats::HudlessReason::NoGbuffer:
+                    r_pt = "aguardando G-buffer"; r_en = "waiting for G-buffer"; break;
+                case SotcStats::HudlessReason::NoHudDraw:
+                    r_pt = "HUD 2D nao detectado"; r_en = "no 2D HUD detected"; break;
+                case SotcStats::HudlessReason::FormatMismatch:
+                    r_pt = "formato incompativel"; r_en = "format mismatch"; break;
+                case SotcStats::HudlessReason::DispatchRejected:
+                    r_pt = "dispatch rejeitou imagem"; r_en = "dispatch rejected image"; break;
+                case SotcStats::HudlessReason::NoVoTarget:
+                    r_pt = "sem alvo VO"; r_en = "no VO target"; break;
+                default: break;
+                }
+                ImGui::TextColored(yellow,
+                    SotcUi::T("FSR 3 FG: Ativo (~%.0f FPS) | HUDless: OFF (%s)",
+                              "FSR 3 FG: Active (~%.0f FPS) | HUDless: OFF (%s)"),
+                    avg_fps * 2.0f, SotcUi::T(r_pt, r_en));
+            }
         } else if (fg == 2) {
-            ImGui::TextColored(red, "FSR 3 : erreur (voir le journal)");
+            ImGui::TextColored(red, "FSR 3 : erro (ver log)");
         } else {
             ImGui::TextColored(grey, SotcUi::T("FSR 3: aguardando (sem cena 3D)", "FSR 3: waiting (no 3D scene)"));
         }
         break;
+    }
     }
     if (const uint64_t vram = SotcStats::vram_used.load(std::memory_order_relaxed)) {
         ImGui::TextColored(grey, "VRAM %.1f / %.1f Go", vram / 1073741824.0,

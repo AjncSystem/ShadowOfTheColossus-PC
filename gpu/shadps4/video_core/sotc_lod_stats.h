@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -26,6 +27,7 @@
 #include <iterator>
 #include "common/types.h"
 #include "video_core/sotc_event.h"
+#include "video_core/sotc_stats.h"
 #include "video_core/sotc_live.h"
 #include "video_core/sotc_ui_lang.h"
 
@@ -165,11 +167,24 @@ inline void Collect(u64 (&entries)[256]) {
         // pool_low * 3 / 8), finer again only above twice pool_low (one level back above
         // pool_low * 3 / 4).
         u64 want = coarser;
+        // sotc: the deepest level (mip 5) is for a pool that is running dry, not one that is full: after a
+        // load the game keeps it at 0% free for a minute or more without a fault, and mip 5 all that
+        // time made the textures blurry (user logs, 25 Oct: level 5 from the load until 40-70 s later).
+        // So it needs the free share to have fallen since the last check, and no load in the last 60 s.
+        static const auto started = std::chrono::steady_clock::now();
+        static int last_free = -1;
+        const auto now = std::chrono::steady_clock::now();
+        const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+        const int64_t load_ms = SotcStats::last_load_ms.load(std::memory_order_relaxed);
+        const bool settling = now - started < std::chrono::seconds(60) ||
+                              (load_ms && now_ms - load_ms < 60'000);
+        const bool falling = last_free >= 0 && free < last_free;
+        last_free = free;
         if (free >= 0) {
             // sotc: below pool_low / 8 (1%) three levels: wide views (32:9) ran the pool dry
             // between two checks and faulted at 0x1a371 (#293, #259); once coarser, check 5x faster.
             if (free < pool_low / 8) {
-                want = 3;
+                want = coarser == 3 || (falling && !settling) ? 3 : 2;
             } else if (free < pool_low * 3 / 8) {
                 want = coarser == 3 && free < pool_low / 4 ? 3 : 2; // 3 holds until 2% free
             } else if (free < pool_low) {

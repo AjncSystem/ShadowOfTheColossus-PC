@@ -40,6 +40,9 @@ inline std::atomic<uint64_t> mem_epoch{0};
 /// RunGarbageCollector), so stale images over reused texture memory go away (green blocks after
 /// long sessions and many loads, user, 22 Oct). SOTC_LOAD_FLUSH=0 turns it off.
 inline std::atomic<bool> load_flush{false};
+/// sotc: steady_clock milliseconds of the last load_flush request (0: none yet); the texture
+/// valve (sotc_lod_stats.h) does not take its deepest level while a load settles.
+inline std::atomic<int64_t> last_load_ms{0};
 /// sotc: bytes of hot readbacks not applied because the guest may have written them since.
 inline std::atomic<uint64_t> rb_hot_cpu_skipped{0};
 inline std::atomic<uint64_t> rb_partial{0}; ///< dirty readbacks finished on the request pages only (SOTC_RB_PARTIAL)

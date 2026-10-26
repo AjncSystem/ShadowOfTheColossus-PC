@@ -241,6 +241,9 @@ extern "C" int bbgpu_warmup_finished(void) {
 
 extern "C" void bbgpu_request_texture_flush(void) {
     SotcStats::load_flush.store(true, std::memory_order_relaxed);
+    SotcStats::last_load_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::steady_clock::now().time_since_epoch()).count(),
+                                  std::memory_order_relaxed);
 }
 
 extern "C" uint64_t bbgpu_flip_count(void) {

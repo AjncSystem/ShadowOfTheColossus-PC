@@ -338,6 +338,26 @@ void SetTextureLevel(int level) {
     SotcEvent::Log("MENU", SotcUi::T("Qualidade das texturas: %s", "Texture quality: %s"), names[level]);
 }
 
+// sotc: the FPS mode now: 0 = 30 (the game's cap), 1 = 60, 2 = unlimited.
+int FpsMode() {
+    static const int env_limit = [] {
+        const char* v = std::getenv("SOTC_FPS_LIMIT");
+        return v ? std::atoi(v) : 0;
+    }();
+    if (!SotcFpsCap::uncapped.load(std::memory_order_relaxed)) {
+        return 0;
+    }
+    const int live_limit = SotcFpsCap::limit_fps.load(std::memory_order_relaxed);
+    return (live_limit >= 0 ? live_limit : env_limit) > 0 ? 1 : 2;
+}
+
+const char* FpsModeName(int mode) {
+    const char* names[] = {SotcUi::T("FPS travados em 30", "FPS capped at 30"),
+                           SotcUi::T("FPS travados em 60", "FPS capped at 60"),
+                           SotcUi::T("FPS ilimitados", "FPS unlimited")};
+    return names[mode];
+}
+
 // sotc: FPS mode 0 = 30 (the game's cap), 1 = 60, 2 = unlimited, as the launcher's.
 void SetFpsMode(int mode) {
     if (mode > 0) {
@@ -384,13 +404,8 @@ void QuickSettings() {
     ImGui::SeparatorText(T("Ajuste rápido (vale na hora)", "Quick settings (apply at once)"));
 
     // sotc: FPS as the launcher's: 30 (the game's cap), 60 or unlimited. F7 switches the cap.
-    static const int env_limit = [] {
-        const char* v = std::getenv("SOTC_FPS_LIMIT");
-        return v ? std::atoi(v) : 0;
-    }();
     const bool uncapped = SotcFpsCap::uncapped.load(std::memory_order_relaxed);
-    const int live_limit = SotcFpsCap::limit_fps.load(std::memory_order_relaxed);
-    const int fps_mode = !uncapped ? 0 : (live_limit >= 0 ? live_limit : env_limit) > 0 ? 1 : 2;
+    const int fps_mode = FpsMode();
     const char* fps_names[] = {T("30 FPS (como no PS4)", "30 FPS (as on PS4)"), "60 FPS",
                                T("Ilimitado", "Unlimited")};
     if (ImGui::BeginCombo("FPS  [F7]", fps_names[fps_mode])) {
@@ -943,7 +958,7 @@ void FpsCounter() {
         ImGui::SameLine();
     }
     ImGui::TextDisabled(SotcUi::T("F7: %s   F8: geração de quadros   F10: esconder", "F7: %s   F8: frame generation   F10: hide"),
-                        SotcFpsCap::uncapped ? SotcUi::T("FPS livres", "FPS uncapped") : SotcUi::T("travado em 30", "capped at 30"));
+                        FpsModeName(FpsMode()));
     ImGui::End();
 }
 
@@ -1047,12 +1062,10 @@ bool HandleEvent(const SDL_Event& event) {
         return false;
     }
     ImGuiIO& io = ImGui::GetIO();
-    // sotc: F7 caps the game at 30 FPS or uncaps it (sotc_fps_cap.h).
+    // sotc: F7 switches 30 -> 60 -> unlimited FPS, as the menu's FPS choice (kept for the launcher).
     // The new state is shown at the next frame (Render).
     if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F7 && !event.key.repeat) {
-        const bool uncapped = SotcFpsCap::Toggle();
-        SotcEvent::Log("KEY", "%s", uncapped ? SotcUi::T("F7: limite de 30 FPS desligado", "F7: 30 FPS cap off")
-                                             : SotcUi::T("F7: limite de 30 FPS ligado", "F7: 30 FPS cap on"));
+        SetFpsMode((FpsMode() + 1) % 3);
         return true;
     }
     // sotc: F8 switches the frame generation mode (off, DLSS-G, FSR 3; vk_framegen.h).
@@ -1391,12 +1404,12 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
         toast_text = std::string(SotcUi::T("Geração de quadros: ", "Frame generation: ")) + Vulkan::FrameGen::Name(mode);
         toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
     }
-    // The 30 FPS cap was switched (F7).
-    static bool shown_uncapped = SotcFpsCap::uncapped;
-    if (const bool uncapped = SotcFpsCap::uncapped; uncapped != shown_uncapped) {
-        shown_uncapped = uncapped;
+    // The FPS mode was switched (F7 or the menu).
+    static int shown_fps_mode = FpsMode();
+    if (const int fps_mode = FpsMode(); fps_mode != shown_fps_mode) {
+        shown_fps_mode = fps_mode;
         std::scoped_lock lock{imgui_mutex};
-        toast_text = uncapped ? SotcUi::T("FPS livres", "FPS uncapped") : SotcUi::T("FPS travados em 30", "FPS capped at 30");
+        toast_text = FpsModeName(fps_mode);
         toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
     }
     if (!Visible()) {

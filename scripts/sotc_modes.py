@@ -20,6 +20,7 @@ Writes two files for the loader:
 The original bytes are checked first: another game version gets neither file's changes.
 """
 import argparse
+import os
 import re
 from pathlib import Path
 import struct
@@ -177,6 +178,22 @@ def main():
                 cvars.append('texturePoolReserveSystemMemMiBs=0')
         else:
             print(f'Render size {args.render}: this eboot is not EU 1.01, not applied')
+    # sotc: PS4 Pro mode too (SOTC_NEO=1): its larger render targets push the game's free system
+    # memory figure under the reserve as well, and with Maximum textures the streamer's constant
+    # drops showed as colour garbage after loads (user, 26 Oct: 1 hour without a crash or
+    # garbage outside two areas with it). SOTC_POOL_RESERVE=0/1 forces the reserve off/on.
+    pool_fix = (POOL_FIX[0] - BASE, POOL_FIX[2]) in writes
+    reserve = os.environ.get('SOTC_POOL_RESERVE', '')
+    reserve_off = 'texturePoolReserveSystemMemMiBs=0' in cvars
+    if pool_fix and not reserve_off and reserve != '1' and (
+            reserve == '0' or os.environ.get('SOTC_NEO') == '1'):
+        cvars.append('texturePoolReserveSystemMemMiBs=0')
+        reserve_off = True
+    elif reserve_off and reserve == '1':
+        cvars.remove('texturePoolReserveSystemMemMiBs=0')
+        reserve_off = False
+    if reserve_off:
+        print('Texture pool reserve: 0 (page allocator fix on)')
     for item in args.cvars.split():
         item = item.lstrip('+')
         if not CVAR.match(item):

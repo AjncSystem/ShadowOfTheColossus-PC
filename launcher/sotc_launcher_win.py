@@ -593,9 +593,8 @@ def game_environment(s):
     if s.get('button_icons') == 'xbox' and (PORT_DIR / 'glyphs' / 'xbox').is_dir():
         env['SOTC_TEX_REPLACE'] = str(PORT_DIR / 'glyphs' / 'xbox')
     env['SOTC_UI_LANG'] = s.get('ui_language') or windows_language()  # overlay and F7/F8 texts
-    # The game renders at the output size (sotc.py scales it down above about 4.2 million pixels; the
-    # upscaler takes it to the output). 720p renders at 1080p, as on PS4; the PS4 Pro path keeps its
-    # own sizes.
+    # The game renders at the output size. 720p renders at 1080p, as on PS4; the PS4 Pro path keeps
+    # its own sizes.
     output = env['SOTC_OUTPUT_RES']
     if output not in ('1280x720', '1920x1080') and env['SOTC_NEO'] == '0':
         env['SOTC_RENDER_RES'] = output
@@ -1154,18 +1153,16 @@ class Launcher:
         self.window_icon_row(f)
         self.section(f, _('Resolução', 'Resolution'))
         self.row(f, _('Saída', 'Output'), self.choice(f, 'output_res', OUTPUTS),
-                 _('O jogo renderiza nesse tamanho; acima de cerca de 4,2 milhões de pixels (4K, 3440 × 1440) num '
-                   'tamanho menor, que o upscaler amplia: maior que isso, os detalhes finos das texturas somem. '
+                 _('O jogo renderiza nesse tamanho. '
                    'Mais largo que 16:9 (21:9, 32:9) mostra mais dos lados (Hor+), sem esticar; menus e vídeos '
                    'podem ficar esticados. 720p renderiza em 1080p; o modo PS4 Pro usa os tamanhos do Pro. '
                    'Num monitor menor que a saída, a janela cabe na tela e a tela cheia usa o monitor todo.',
-                   'The game renders at this size; above about 4.2 million pixels (4K, 3440 × 1440) at a smaller '
-                   'size that the upscaler enlarges: larger than that, the fine texture detail disappears. Wider '
+                   'The game renders at this size. Wider '
                    'than 16:9 (21:9, 32:9) shows more at the sides (Hor+), not stretched; menus and videos may '
                    'look stretched. 720p renders at 1080p; PS4 Pro mode uses the Pro sizes. On a monitor smaller '
                    'than the output the window fits the screen and fullscreen uses the whole monitor.'))
         self.row(f, _('Upscaler', 'Upscaler'), self.choice(f, 'upscaler', UPSCALERS),
-                 _('FSR 1 amplia com bordas nítidas (acima de 1080p).', 'FSR 1 upscales with sharp edges (above 1080p).'))
+                 _('FSR 1 amplia com bordas nítidas (quando o jogo renderiza menor que a saída).', 'FSR 1 upscales with sharp edges (when the game renders smaller than the output).'))
         self.row(f, _('Nitidez (RCAS)', 'Sharpening (RCAS)'), self.choice(f, 'sharpness', SHARPNESS))
         self.section(f, _('Modo PS4 Pro', 'PS4 Pro mode'))
         self.check(f, 'neo', _('Apresentar-se como PS4 Pro', 'Present as a PS4 Pro'),

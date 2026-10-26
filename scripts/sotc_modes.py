@@ -56,6 +56,16 @@ CVAR_MODES = {
 # 'W'/'H' an integer immediate (the last 4 bytes of the instruction at address), 'w'/'h' a float
 # (the PS4 entry of a [PS4, Pro] table), 'w2'/'h2' half of it, 'a' the aspect float W/H,
 # 'P' the render target pool (322.5 MiB at 1080p, scaled by the pixel count).
+# Page allocator (0x41a1e0): it carves a new chunk only when the free-page tally at pool+0x74 is
+# 0, and the tally drifts above the bitmap's real free count. With the bitmap empty and the tally
+# not 0, the scan found no bit and read bitmap[-1] (crash at 0x41a371). On a failed scan: tally 0,
+# then carve a chunk (0x41a1f1, needs eax 0) and scan again.
+POOL_FIX = (0x41a321, bytes.fromhex('eb34666666662e0f1f840000000000'),
+            bytes.fromhex('41c7467400000000' '31c0' 'e9c1feffff'))
+# Above this many rendered pixels the larger render target pool pushes the game's free system
+# memory figure under texturePoolReserveSystemMemMiBs (220), and the texture streamer drops every
+# texture to mip 3 every second or so (fine textures flicker). Reserve 0 there; it needs POOL_FIX.
+LOW_MEM_PIXELS = 4_200_000
 RENDER_SITES = [
     # display init (0x495a90): the aspect of the display object, back buffer, display targets,
     # scene size
@@ -147,6 +157,8 @@ def main():
     elf, _, ph, _, _ = parse_self((args.game / 'eboot.bin').read_bytes())
     supported = is_supported(elf, ph)
     writes, cvars = [], []
+    if supported and image_bytes(elf, ph, POOL_FIX[0] - BASE, len(POOL_FIX[1])) == POOL_FIX[1]:
+        writes.append((POOL_FIX[0] - BASE, POOL_FIX[2]))
     for mode in filter(None, (m.strip().lower() for m in args.modes.split(','))):
         if mode not in MODES and mode not in CVAR_MODES:
             raise SystemExit(f'unknown mode {mode!r} (known: {", ".join([*MODES, *CVAR_MODES])})')
@@ -160,6 +172,9 @@ def main():
         if supported:
             writes += render_patches(elf, ph, args.render)
             print(f'Render size {args.render}: on')
+            w, h = map(int, args.render.split('x'))
+            if w * h > LOW_MEM_PIXELS and (POOL_FIX[0] - BASE, POOL_FIX[2]) in writes:
+                cvars.append('texturePoolReserveSystemMemMiBs=0')
         else:
             print(f'Render size {args.render}: this eboot is not EU 1.01, not applied')
     for item in args.cvars.split():

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.60.6-plus12 — 2026-10-26 (fork Lucas-blip-png)
+- **Textura Máxima no modo PS4 Pro (experimental, da 0.60.6-C1):** o launcher e o menu do jogo não trocam mais a Máxima
+  por Alta no modo Pro, agora que a correção do alocador de páginas está no fork. `SOTC_MAX_IN_PRO=0` volta ao
+  comportamento antigo. Observação: com DLSS ou FSR 3 o modo Pro continua desligado (o upscaler usa o tamanho do jogo).
+- **F7 em 3 estágios (da 0.60.6-C1):** 30, 60 e FPS livres (antes só travava e destravava).
+- Testes Python: os dois de caminhos Linux/Nix passam a ser pulados no Windows.
+
 ## 0.60.6-plus11 — 2026-10-26 (fork Lucas-blip-png)
 - **CPUs de 4 threads: prioridades das threads** (#267, ideia primeiro feita no fork do MMadmer): com 4 processadores
   lógicos ou menos, as threads de som sobem para a prioridade mais alta, as `BPE JobWorker` descem para abaixo do normal e

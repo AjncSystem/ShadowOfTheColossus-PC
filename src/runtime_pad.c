@@ -425,16 +425,17 @@ static FILE *record_file;
 static uint64_t record_start;
 static PadSample record_last;
 static void record_sample(const PadData *d) {
-    static const char *path; static int checked, f9_was_down;
+    static const char *path; static int checked, f9_was_down, finished;
     if (!checked) { path=getenv("BB_PAD_RECORD"); checked=1; }
     if (!path || !*path || !sdl_ready) return;
     const bool *k=SDL_GetKeyboardState(NULL);
     const int f9=k && k[SDL_SCANCODE_F9];
     const int requested=record_requested==1 && !record_file;
     if (record_requested==1) record_requested=2;
-    if ((f9 && !f9_was_down) || requested) {
+    if (((f9 && !f9_was_down) || requested) && !finished) {
         if (record_file) {
             fclose(record_file); record_file=NULL;
+            finished=1;  /* sotc: one recording per run: a second F9 reopened the file with "w" and wiped it */
             printf("Runtime: pad recording stopped (%s)\n",path);
         } else if ((record_file=fopen(path,"w"))) {
             record_start=now_us();

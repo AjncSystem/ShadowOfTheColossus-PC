@@ -270,6 +270,10 @@ def main():
                 pad.write_text('record')
                 print('READY: recording has started. Play now; press F9 to stop, then close the window.',
                       flush=True)
+            if args.video and not state.get('video_tried'):
+                # Manual demo: the video runs from the hand-over until the window closes.
+                state['video_tried'] = True
+                state['video'] = start_video(args.video, process.pid, args.ffmpeg, args.video_fps)
             time.sleep(0.5)
             continue
         if idle_at is not None and args.video and not state.get('video_tried'):

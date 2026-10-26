@@ -157,7 +157,7 @@ def windows_language():
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
                 'user_dir': '', 'af16': True, 'textures': 'high', 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
-                'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'skip_logos': False, 'close_on_play': False, 'gamepad': '',
+                'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'skip_logos': False, 'skip_film': False, 'close_on_play': False, 'gamepad': '',
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
@@ -615,10 +615,12 @@ def game_environment(s):
     if fade in ('0.5', '0.75', '2', '3'):
         cvars.append(f'r_virtualGeometryFadeMultiplier={fade}')
     if s.get('skip_logos'):
-        # The engine cvar skipSplash=1 boots straight to the menu, without the opening logos and
-        # the autosave notice (tabnul, AjncSystem #185); +nointro (the engine's own switch, which it
-        # also sets when a button is held at start) skips the intro film too.
-        cvars += ['skipSplash=1', 'nointro']
+        # The engine cvar skipSplash=1: no opening logos and autosave notice (tabnul, AjncSystem #185).
+        cvars.append('skipSplash=1')
+    if s.get('skip_film'):
+        # +nointro: the engine's own switch (it also sets it when a button is held at start), no
+        # intro film before the menu.
+        cvars.append('nointro')
     cvars += str(s.get('engine_cvars', '')).split()
     env['SOTC_CVARS'] = ' '.join(cvars)
     # Multipliers for the grass shaders' view distances and blade height (vk_rasterizer.cpp).
@@ -1476,9 +1478,12 @@ class Launcher:
                      "Bluepoint's test menu: area loader, free camera, statistics and developer options. The "
                      'game files are not changed. The game can be less stable with it on: turn it off to play '
                      'normally.'))
-        self.check(f, 'skip_logos', _('Pular a abertura (direto para o menu)', 'Skip the intro (straight to the menu)'),
-                   _('O jogo abre direto no menu, sem os logotipos de abertura e o aviso de salvamento automático.',
-                     'The game opens straight to the menu, without the opening logos and the autosave notice.'))
+        self.check(f, 'skip_logos', _('Pular os logotipos de abertura', 'Skip the opening logos'),
+                   _('Sem os logotipos (Sony, Japan Studio, Bluepoint) e o aviso de salvamento automático.',
+                     'No logos (Sony, Japan Studio, Bluepoint) and no autosave notice.'))
+        self.check(f, 'skip_film', _('Pular o filme de abertura', 'Skip the intro film'),
+                   _('Sem o filme antes do menu principal. Com as duas opções o jogo abre direto no menu.',
+                     'No film before the main menu. With both options the game opens straight to the menu.'))
         self.section(f, _('Diagnóstico', 'Diagnostics'))
         self.check(f, 'debug_watch', _('Vigia da memória de texturas', 'Texture memory watch'),
                    _('Anota em user/events.log quando o jogo reaproveita memória de texturas ainda em uso. '

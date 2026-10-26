@@ -1348,6 +1348,24 @@ class Launcher:
                    'Draws the far sun shadows only every other frame and reuses them in between: a little more '
                    'FPS (~0.5%), but they blink in the distance (AMD and NVIDIA GTX 1080, RTX 40/50). Hence off '
                    'by default.'))
+        # A setting saved by 0.58/0.59 (on with NVIDIA) stays on, and its blinking looks like a bug (user, 25 Oct).
+        shadow_warn = self.ttk.Label(f, text=_('Atenção: com as sombras distantes ligadas, o cenário ao longe pode piscar '
+                                          '(a luz alterna entre claro e escuro). Se notar isso, volte para '
+                                          '"Desligado"; o ganho é de uns 0,5% de FPS.',
+                                          'Warning: with far shadows on, the distant scenery may blink (the light '
+                                          'alternates between bright and dark). If you see that, go back to "Off"; '
+                                          'the gain is about 0.5% FPS.'),
+                                style='Muted.TLabel', wraplength=self.px(680), justify='left')
+        shadow_warn.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w')
+        shadow_var = self.var('shadow_reuse')
+
+        def show_shadow_warn(*_args):
+            if str(shadow_var.get()) == '0':
+                shadow_warn.grid_remove()
+            else:
+                shadow_warn.grid()
+        show_shadow_warn()
+        shadow_var.trace_add('write', show_shadow_warn)
         self.row(f, _('Sombras da grama', 'Grass shadows'), self.choice(f, 'grass_shadows', GRASS_SHADOWS),
                  _('Até onde a grama projeta sombra. No PS4 só até ~8 m: ao cavalgar, uma faixa de grama '
                    'escurece logo à frente. "Longe" leva até ~24 m; "Muito longe" até ~100 m, com algum custo '

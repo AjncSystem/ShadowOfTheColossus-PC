@@ -663,8 +663,28 @@ void PatchForegroundWindow(const wchar_t* module_name) {
 
 void SetOptions(bool on) {
     sl::DLSSGOptions options{};
-    options.mode = on ? sl::DLSSGMode::eOn : sl::DLSSGMode::eOff;
-    options.numFramesToGenerate = 1;
+    // sotc: SOTC_DLSSG_FRAMES=1..5 generated frames per real one (2x..6x; the card's maximum is
+    // numFramesToGenerateMax: 5 on RTX 50, 1 on RTX 40), SOTC_DLSSG_MODE=dynamic for Dynamic MFG
+    // (RTX 50, not with a frame limiter or V-Sync). Default 2x, as before.
+    static const u32 requested_frames = [] {
+        const char* v = std::getenv("SOTC_DLSSG_FRAMES");
+        return v ? static_cast<u32>(std::clamp<long>(std::strtol(v, nullptr, 10), 1, 5)) : 1u;
+    }();
+    static const bool want_dynamic = [] {
+        const char* v = std::getenv("SOTC_DLSSG_MODE");
+        return v && std::strcmp(v, "dynamic") == 0;
+    }();
+    sl::DLSSGState caps{};
+    if (api.dlssg_get_state(sl::ViewportHandle{0}, caps, nullptr) != sl::Result::eOk) {
+        caps = {};
+    }
+    const u32 frames =
+        caps.numFramesToGenerateMax ? std::min(requested_frames, caps.numFramesToGenerateMax) : 1u;
+    // Dynamic only where the driver reports it (driver 621.1: no; Streamline then accepted
+    // eDynamic but generated nothing); otherwise the fixed multiplier.
+    bool dynamic = want_dynamic && caps.bIsDynamicMFGSupported == sl::Boolean::eTrue;
+    options.mode = !on ? sl::DLSSGMode::eOff : dynamic ? sl::DLSSGMode::eDynamic : sl::DLSSGMode::eOn;
+    options.numFramesToGenerate = frames;
     options.flags = sl::DLSSGFlags::eRetainResourcesWhenOff;
     // SOTC_DLSSG_ONLY_GENERATED=1: only the generated frames are shown (checking them).
     static const bool only_generated = [] {
@@ -680,12 +700,21 @@ void SetOptions(bool on) {
     if (Parallel()) {
         options.queueParallelismMode = sl::DLSSGQueueParallelismMode::eBlockNoClientQueues;
     }
-    const sl::Result r = api.dlssg_set_options(sl::ViewportHandle{0}, options);
+    sl::Result r = api.dlssg_set_options(sl::ViewportHandle{0}, options);
+    if (r != sl::Result::eOk && on && dynamic) {
+        std::fprintf(stderr, "SOTC DLSSG: Dynamic MFG refused (%d), fixed multiplier\n",
+                     static_cast<int>(r));
+        dynamic = false;
+        options.mode = sl::DLSSGMode::eOn;
+        r = api.dlssg_set_options(sl::ViewportHandle{0}, options);
+    }
     if (r != sl::Result::eOk) {
         std::fprintf(stderr, "SOTC DLSSG: slDLSSGSetOptions(%s) failed (%d)\n", on ? "on" : "off",
                      static_cast<int>(r));
     } else if (log_level >= 1 || !options_set) {
-        std::fprintf(stderr, "SOTC DLSSG: frame generation %s\n", on ? "on" : "off");
+        std::fprintf(stderr, "SOTC DLSSG: frame generation %s (%ux%s; dynamic supported: %s)\n",
+                     on ? "on" : "off", frames + 1, dynamic ? ", dynamic" : "",
+                     caps.bIsDynamicMFGSupported == sl::Boolean::eTrue ? "yes" : "no");
     }
     fg_on = on;
     options_set = true;

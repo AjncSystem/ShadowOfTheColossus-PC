@@ -166,7 +166,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
                 'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'auto', 'volume': '100', 'shadow_reuse': '0', 'grass_shadows': '3', 'grass_size': '1', 'grass_fade': '1', 'library_dirs': [], 'keys': {},
-                'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'fg_hudless': False, 'diag_log': False,
+                'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'fg_mult': '2', 'fg_hudless': False, 'diag_log': False,
                 'check_updates': True, 'skip_version': ''}
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
 KEY_INPUTS = [
@@ -300,6 +300,10 @@ FRAMEGEN = [('off', ('Desligada', 'Off')),
             ('auto', ('Automática (DLSS-G ou FSR 3, experimental)', 'Automatic (DLSS-G or FSR 3, experimental)')),
             ('dlss', ('NVIDIA DLSS-G (RTX 40/50)', 'NVIDIA DLSS-G (RTX 40/50)')),
             ('fsr', ('AMD FSR 3 (qualquer placa)', 'AMD FSR 3 (any GPU)'))]
+# DLSS-G multi frame generation (SOTC_DLSSG_FRAMES / SOTC_DLSSG_MODE): the card's limit applies (RTX 40: 2x).
+FG_MULT = [('2', ('2x (padrão)', '2x (default)')), ('3', ('3x (RTX 50)', '3x (RTX 50)')),
+           ('4', ('4x (RTX 50)', '4x (RTX 50)')), ('6', ('6x (RTX 50)', '6x (RTX 50)')),
+           ('dynamic', ('Dinâmico (se o driver suportar; senão 6x)', 'Dynamic (if the driver supports it; else 6x)'))]
 SHARPNESS = [('0', ('Alta', 'High')), ('250', ('Média (padrão)', 'Medium (default)')), ('600', ('Baixa', 'Low')),
              ('off', ('Desligada', 'Off'))]
 MOUSE_SENS = [('0.5', ('0,5 (lenta)', '0.5 (slow)')), ('0.75', ('0,75', '0.75')), ('1.0', ('1,0 (padrão)', '1.0 (default)')),
@@ -658,6 +662,12 @@ def game_environment(s):
     if s.get('neo') and env['SOTC_NEO'] == '0':
         env['SOTC_NOTE'] = f"{env['SOTC_OUTPUT_RES']} is wider than 16:9: PS4 Pro mode off (it renders 16:9 only)"
     env['SOTC_FRAMEGEN'] = s.get('framegen') or 'off'
+    fg_mult = str(s.get('fg_mult') or '2')
+    if fg_mult == 'dynamic':
+        env['SOTC_DLSSG_MODE'] = 'dynamic'
+        env['SOTC_DLSSG_FRAMES'] = '5'  # the most the card allows; Streamline picks the number
+    elif fg_mult in ('3', '4', '6'):
+        env['SOTC_DLSSG_FRAMES'] = str(int(fg_mult) - 1)
     if s.get('fg_hudless'):
         env['SOTC_FG_HUDLESS'] = '1'
     # sotc: high quality textures: the texture banks sampled since the last report read as sampled
@@ -1268,6 +1278,17 @@ class Launcher:
                    'health and stamina bars may shake (the generated frame includes the interface). '
                    'In game, F8 switches the mode (off, DLSS-G, FSR 3). Best with the '
                    'screen at 60 or 120 Hz, or G-SYNC/FreeSync.'))
+        self.row(f, _('Multiplicador do DLSS-G', 'DLSS-G multiplier'), self.choice(f, 'fg_mult', FG_MULT),
+                 _('Só vale com a geração de quadros em DLSS-G. 2x é uma imagem gerada por imagem do jogo; 3x, 4x e '
+                   '6x geram 2, 3 ou 5 (NVIDIA RTX 50; na RTX 40 vale 2x). Dinâmico escolhe sozinho para chegar à '
+                   'taxa da tela (só se o driver suportar; hoje o 621.1 não, e então vale 6x) e não funciona com '
+                   'limitador de FPS nem V-Sync. Experimental: mais quadros '
+                   'gerados aumentam o tremor das barras e a latência.',
+                   'Only with frame generation set to DLSS-G. 2x is one generated frame per game frame; 3x, 4x '
+                   'and 6x generate 2, 3 or 5 (NVIDIA RTX 50; RTX 40 stays at 2x). Dynamic picks the number to '
+                   'reach the screen\'s refresh rate (only if the driver supports it; driver 621.1 does not, '
+                   'then it is 6x) and does not work with a frame limiter or V-Sync. '
+                   'Experimental: more generated frames mean more shaking of the bars and more latency.'))
         self.check(f, 'fg_hudless', _('Geração de quadros sem a interface (experimental)',
                                       'Frame generation without the interface (experimental)'),
                    _('Gera os quadros intermediários só com a cena e põe a interface por cima, sem interpolá-la: '

@@ -75,9 +75,9 @@ POOL_FIX = (0x41a321, bytes.fromhex('eb34666666662e0f1f840000000000'),
 # texture to mip 3 every second or so (fine textures flicker). Reserve 0 there; it needs POOL_FIX.
 LOW_MEM_PIXELS = 4_200_000
 RENDER_SITES = [
-    # display init (0x495a90): the aspect of the display object, back buffer, display targets,
-    # scene size
-    (0x00495b3e, 'a', 'c74304398ee33f'),
+    # display init (0x495a90): back buffer, display targets, scene size. The display object's
+    # aspect (0x495b3e, 16/9) stays: the HUD lays out its health bar with it, and a wider value
+    # left a grey stub on the bar in 21:9 (#301, user test 26 Oct; the scene is unchanged).
     (0x00495bec, 'H', 'b938040000'), (0x00495bf7, 'W', 'b880070000'),
     (0x00495c91, 'W', 'ba80070000'), (0x00495c96, 'H', 'b938040000'),
     (0x00495d34, 'W', 'ba80070000'), (0x00495d39, 'H', 'b938040000'),

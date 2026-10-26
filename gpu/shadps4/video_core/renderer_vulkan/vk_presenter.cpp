@@ -874,8 +874,13 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // HUD of the real frame instead of interpolating it). Not with FSR 1 scaling, whose images
     // are a ring meant for one frame each. With DLSS super resolution the DLSS output is the
     // frame without its HUD (the UI layer is only put over it here), so it is used instead.
-    if (const vk::ImageView hudless_view = rasterizer->TakeHudless(cpu_address, view_info.format);
-        hudless_view && (upscaled_scene || !DebugState.is_using_fsr)) {
+    // sotc: with DLSS the upscaled scene is the HUD-less frame by itself (SOTC_FG_HUDLESS not
+    // needed): FSR 3 interpolated the text too and the letters shook (26 Oct).
+    const bool fg_on = FrameGen::Current() != FrameGen::Mode::Off;
+    const vk::ImageView hudless_view = upscaled_scene && fg_on
+                                           ? vk::ImageView{}
+                                           : rasterizer->TakeHudless(cpu_address, view_info.format);
+    if ((upscaled_scene && fg_on) || (hudless_view && !DebugState.is_using_fsr)) {
         Frame& hudless = hudless_frames[frame->id];
         if (hudless.width != frame->width || hudless.height != frame->height ||
             hudless.is_hdr != frame->is_hdr || !hudless.image) {

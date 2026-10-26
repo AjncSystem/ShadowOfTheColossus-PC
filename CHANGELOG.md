@@ -1,6 +1,44 @@
 # Changelog
 
-## Não lançado — versão americana (CUSA08034)
+## 0.60.6-C1 — 2026-10-26
+Versão da comunidade: correções e recursos do tabnul, do Oussama268, do NathanMBR e do
+JihedMrouki, testados com texturas **Máxima + modo PS4 Pro + 60 FPS** (RTX 2060 SUPER).
+
+- **Correção do alocador de páginas do jogo (tabnul, PR #288 / fork #112):** o contador de
+  páginas livres do jogo se descolava do mapa real e o jogo lia antes do início do mapa (queda
+  `0x1a371`). Com a correção e a reserva de memória de texturas em 0 (também no modo PS4 Pro), o
+  streamer não derruba mais todas as texturas para o nível 3 a cada segundo. Resultado: **uma
+  hora em Máxima + Pro sem queda** e quase todo o lixo colorido depois dos carregamentos sumiu.
+- **Textura Máxima no modo PS4 Pro (experimental):** voltou a valer (o lançador trocava por Alta).
+  `SOTC_MAX_IN_PRO=0` volta ao comportamento antigo.
+- **NVIDIA DLSS (RTX 20 ou mais nova), do tabnul (fork PR #81):** o jogo renderiza menor e o
+  DLSS amplia; a interface é desenhada na resolução de saída, TAA do jogo desligado, vinheta
+  depois da ampliação. Novo aqui: **funciona no modo PS4 Pro** (a composição final do Pro tem a
+  cena e a interface em outra ordem e tamanho) e **em 4K** (o DLSS amplia 2x e o FSR 1 completa;
+  antes a tela ficava preta). No menu F1 o upscaler aparece como "NVIDIA DLSS" e só troca no
+  lançador (antes gravava "fsr1" por cima). Arquivos `sl.dlss.dll` e `nvngx_dlss.dll` (NVIDIA
+  Streamline 2.14.16) incluídos.
+- **Grama (tabnul):** distância, altura e detalhe da grama e do mato mudam na hora no menu F1;
+  sombras e esmaecimento da grama no lançador; buffers de grama 4x maiores (a grama distante não
+  some em faixas).
+- **Mais FPS: leituras rápidas da GPU (experimental),** nova opção nos Ajustes rápidos, com a
+  checagem final e o travamento por página do Oussama268 (`SOTC_RB_HOT=1`). Desligada por padrão.
+- **Reutilização de binds** ligada de novo por padrão (Oussama268; a correção do chão de areia
+  foi conferida). Do Oussama268 também: o processador de comandos não espera filas vazias e a
+  memória fria das arenas volta sem esperar a GPU.
+- **Versão americana CUSA08034 (NathanMBR, PR #270)** — detalhes abaixo.
+- **CPUs fracas e GTX 10xx (JihedMrouki, PR #258):** posição invariante nos pipelines com
+  emulação de baricêntricas (diferença de textura/profundidade no chão) e o cache de shaders não lê
+  do disco arquivos que não existem. O cache de shaders é refeito na primeira abertura.
+- **F7** passa por **30 → 60 → ilimitado** (antes só ligava/desligava o limite de 30).
+- **Aba Debug do lançador:** menu de debug da Bluepoint (**F6 ou Start+Select** no controle; o
+  Select sozinho continua abrindo o mapa), **pular os logotipos de abertura**, **ir direto para o
+  jogo** (`+nointro`, pula também a tela Start), vigia da memória de texturas, F5 (captura das
+  texturas do quadro, limitada a 1 GB) e F9 (recarrega as texturas; com "Comparar DLSS" ligado,
+  troca DLSS / FSR 1).
+- Menu F1: sombras e esmaecimento da grama mostram o valor do jogo quando ainda não foram salvos.
+
+### Versão americana (CUSA08034), NathanMBR
 - **O dump americano CUSA08034 (1.00, a única versão americana) funciona.** O executável é o
   mesmo da versão europeia 1.01 (código e dados idênticos byte a byte; os arquivos `.psarc`
   também), então todas as correções, os modos de patch (60 FPS, filtro 16x, tamanho de

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.60.6-plus9 — 2026-10-25 (fork Lucas-blip-png)
+- **Lançador: "Vibração do controle"** (Controle): desmarcada, o controle não vibra (`SOTC_RUMBLE=0`). Vale na próxima
+  vez que o jogo abre (#292).
+- **Lançador: "Geração de quadros sem a interface (experimental)"** (`SOTC_FG_HUDLESS=1`): gera os quadros intermediários
+  só com a cena e põe a interface por cima, sem interpolá-la, o que tira o tremor das barras de vida e stamina e dos pelos
+  do Agro com a geração de quadros (#206, #210). Pode desbotar o logo na tela de título e mostrar a cena antiga atrás das
+  telas de carregamento; por isso vem desligada.
+- **Diagnóstico:** a gravação de comandos do controle (`BB_PAD_RECORD`) termina no primeiro F9; um segundo F9 reabria o
+  arquivo e apagava a gravação. Duas rotas de areia gravadas em `tools/routes/`. Soak do deserto: 3 corridas de 196 s e
+  uma sessão manual de 3 minutos na areia, sem queda `0x1a371`.
+
 ## 0.60.6-plus8 — 2026-10-25 (fork Lucas-blip-png)
 - **VRAM automática** (nova opção padrão do lançador): o "limite de 6 GB" do overlay é o orçamento que o Windows e o driver
   dão ao jogo (`VK_EXT_memory_budget`), não uma configuração. O port agora escolhe sozinho, por esse orçamento, quando

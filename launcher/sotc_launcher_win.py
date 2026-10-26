@@ -160,7 +160,7 @@ def windows_language():
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
                 'user_dir': '', 'af16': True, 'textures': 'high', 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
-                'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'rb_hot': False, 'skip_logos': False, 'skip_film': False, 'close_on_play': False, 'gamepad': '',
+                'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'rb_hot': False, 'skip_logos': False, 'skip_film': False, 'close_on_play': False, 'gamepad': '', 'rumble': True,
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
@@ -725,6 +725,8 @@ def game_environment(s):
         env['SOTC_POOL_WATCH'] = '1'
     if str(s.get('gamepad', '')).strip():
         env['BB_GAMEPAD'] = str(s['gamepad']).strip()
+    if not s.get('rumble', True):
+        env['SOTC_RUMBLE'] = '0'
     env['BB_CONFIG'] = str(PORT_DIR / 'sotc.ini')
     for item in str(s['extra_env']).split():
         if '=' in item:
@@ -1428,6 +1430,9 @@ class Launcher:
         self.row(f, _('Controle preferido', 'Preferred gamepad'), ttk.Entry(f, textvariable=self.var('gamepad'), width=30),
                  _('Nome (ou parte) do controle a usar quando houver vários; vazio = o primeiro.',
                    'Name (or part of it) of the gamepad to use when several are connected; empty = the first.'))
+        self.check(f, 'rumble', _('Vibração do controle', 'Controller vibration'),
+                   _('Desmarque para o controle não vibrar. Vale na próxima vez que o jogo abrir.',
+                     'Clear it to stop the gamepad from rumbling. Applies the next time the game starts.'))
         self.section(f, _('Mouse', 'Mouse'))
         self.check(f, 'mouse', _('Câmera no mouse', 'Mouse camera'),
                    _('Clique na janela do jogo para capturar o mouse; Esc solta. Botão esquerdo = R1 (agarrar), '

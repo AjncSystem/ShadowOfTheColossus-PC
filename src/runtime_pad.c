@@ -611,6 +611,9 @@ static ABI int32_t pad_info(int32_t handle, ControllerInfo *info) {
 static ABI int32_t pad_vibration(int32_t handle, const uint8_t *param) {
     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
     if (!param) return ERR_INVALID_ARG;
+    static int rumble=-1;  // SOTC_RUMBLE=0 turns the pad's vibration off (the launcher's option)
+    if (rumble<0) { const char *v=getenv("SOTC_RUMBLE"); rumble=!(v && v[0]=='0'); }
+    if (!rumble) return 0;
     pthread_mutex_lock(&lock);
     SDL_Gamepad *g=current_gamepad();
     if (g) SDL_RumbleGamepad(g,(uint16_t)(param[0]*257),(uint16_t)(param[1]*257),1000);

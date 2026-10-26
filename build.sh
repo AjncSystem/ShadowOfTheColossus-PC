@@ -31,9 +31,10 @@ MINGW*|MSYS*)
     fi
     mkdir -p pgo
     cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO="$pgo" \
-        -DBB_PGO_DIR="$PWD/pgo" -DBB_LTO="${BB_LTO:-ON}" -DCMAKE_C_COMPILER=clang \
+        -DBB_PGO_DIR="$PWD/pgo" -DBB_LTO="${BB_LTO:-ON}" -DBB_MARCH="${BB_MARCH:-}" \
+        -DCMAKE_C_COMPILER=clang \
         -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_RC_COMPILER=llvm-windres >/dev/null
-    echo "GPU library and loader: PGO $pgo, LTO ${BB_LTO:-ON}"
+    echo "GPU library and loader: PGO $pgo, LTO ${BB_LTO:-ON}, -march ${BB_MARCH:-none}"
     if ! ninja -C out/gpu bb-probe bb-gpu-capabilities > out/gpu-build.log 2>&1; then
         grep -v '^\[' out/gpu-build.log | tail -40 >&2
         echo 'Build failed (full log: out/gpu-build.log)' >&2; exit 1
@@ -81,8 +82,8 @@ for patch in gpu/patches/fsr-vulkan/*.patch; do
     fi
 done
 cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO="$pgo" \
-    -DBB_LTO="${BB_LTO:-ON}" -DBB_PGO_DIR="$PWD/pgo" >/dev/null
-echo "GPU library: PGO $pgo, LTO ${BB_LTO:-ON}"
+    -DBB_LTO="${BB_LTO:-ON}" -DBB_PGO_DIR="$PWD/pgo" -DBB_MARCH="${BB_MARCH:-}" >/dev/null
+echo "GPU library: PGO $pgo, LTO ${BB_LTO:-ON}, -march ${BB_MARCH:-none}"
 # A failed GPU build must stop here: an older libbbgpu.so would otherwise be used silently.
 if ! ninja -C out/gpu bbgpu > out/gpu-build.log 2>&1; then
     grep -v '^\[' out/gpu-build.log | tail -40 >&2

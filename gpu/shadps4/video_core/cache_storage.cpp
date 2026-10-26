@@ -210,6 +210,25 @@ bool DataBase::TakePrefetched(const std::filesystem::path& path, std::vector<u8>
     return true;
 }
 
+bool DataBase::TakePrefetched(const std::filesystem::path& path, std::vector<u32>& data) {
+    if (!prefetch_active) {
+        return false;
+    }
+    const auto it = prefetched.find(path.filename().string());
+    if (it == prefetched.end()) {
+        data.clear();
+        return true;
+    }
+    // sotc: copied once, straight into the u32 vector. It went through a temporary byte vector
+    // first (two copies of every SPIR-V blob, the second one freed right away but still a
+    // transient heap spike per shader while the preload ran).
+    data.resize(it->second.size() / sizeof(u32));
+    if (!data.empty()) {
+        std::memcpy(data.data(), it->second.data(), data.size() * sizeof(u32));
+    }
+    return true;
+}
+
 void DataBase::Close() {
     if (!IsOpened()) {
         return;
@@ -389,12 +408,7 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u32>& da
                                                            : cache_path / name;
     if (prefetch_active) {
         path.replace_extension(GetBlobFileExtension(type));
-        std::vector<u8> bytes;
-        TakePrefetched(path, bytes);
-        data.resize(bytes.size() / sizeof(u32));
-        if (!data.empty()) {
-            std::memcpy(data.data(), bytes.data(), data.size() * sizeof(u32));
-        }
+        TakePrefetched(path, data);
         return;
     }
     if (!EmulatorSettings.IsPipelineCacheArchived() &&
@@ -422,9 +436,18 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
             }
         }
     } else if (prefetch_active) {
-        for (const auto& [file_name, data] : prefetched) {
-            if (std::filesystem::path{file_name}.extension().string().ends_with(ext)) {
-                func(std::vector<u8>{data});
+        // sotc: each blob of this type is handed over once, so it is moved out (it was copied)
+        // and its map node is dropped before `func` runs: the ~tens of MB of pipeline keys do
+        // not stay in RAM, or exist twice, while the preload builds the pipelines. Only this
+        // thread touches `prefetched` during the preload, and `func` (the Load calls) never
+        // looks for a blob of this type, so erasing here is safe.
+        for (auto it = prefetched.begin(); it != prefetched.end();) {
+            if (std::filesystem::path{it->first}.extension().string().ends_with(ext)) {
+                std::vector<u8> data = std::move(it->second);
+                it = prefetched.erase(it);
+                func(std::move(data));
+            } else {
+                ++it;
             }
         }
     } else {
@@ -484,7 +507,10 @@ void DataBase::Reset() {
 
 void DataBase::FinishPreload() {
     prefetch_active = false;
-    prefetched = {};
+    // sotc: swap with an empty map, so the nodes and every blob buffer are freed right here
+    // (a plain `= {}` keeps nothing either, but this states the intent and cannot be turned
+    // into a clear() that keeps capacity).
+    std::map<std::string, std::vector<u8>>{}.swap(prefetched);
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         mz_zip_writer_init_from_reader(&zip_ar, cache_path.string().c_str());
         ar_is_read_only = false;

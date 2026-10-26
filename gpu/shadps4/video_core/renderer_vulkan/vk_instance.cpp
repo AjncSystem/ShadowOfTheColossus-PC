@@ -22,9 +22,19 @@
 
 #include <vk_mem_alloc.h>
 
+// sotc: src/runtime_memory.c, RAM census (SOTC_RAM_CENSUS=1).
+extern "C" void runtime_memory_census_vk(unsigned type, int host_visible, int64_t delta_bytes);
+
 namespace Vulkan {
 
 namespace {
+
+// sotc: VMA callback user data is the Instance (only set when the census is on).
+int CensusHostVisible(void* user, uint32_t type) {
+    const auto& props = static_cast<const Instance*>(user)->GetMemoryProperties();
+    return type < props.memoryTypeCount &&
+           (props.memoryTypes[type].propertyFlags & vk::MemoryPropertyFlagBits::eHostVisible);
+}
 
 std::vector<vk::PhysicalDevice> EnumeratePhysicalDevices(vk::UniqueInstance& instance) {
     auto [devices_result, devices] = instance->enumeratePhysicalDevices();
@@ -752,47 +762,69 @@ void Instance::CreateAllocator() {
         .vkGetDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr,
     };
 
-    // sotc: on cards with 8 GB or less, smaller blocks (default 256 MiB). VMA returns a block to
-    // the driver only once it is empty, and the free space inside its blocks is unusable for the
-    // buffer arenas (their own vkAllocateMemory calls): on a 6 GB card ~1 GB sat free in VMA
-    // blocks while arena allocations failed. The real budget (VK_EXT_memory_budget, which counts
-    // other processes) also replaces VMA's 80%-of-heap estimate for WITHIN_BUDGET allocations.
-    u64 device_local_heap = 0;
-    const auto memory_properties = physical_device.getMemoryProperties();
-    for (u32 i = 0; i < memory_properties.memoryHeapCount; ++i) {
-        if (memory_properties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
-            device_local_heap = std::max<u64>(device_local_heap, memory_properties.memoryHeaps[i].size);
-        }
-    }
+    // sotc: 64 MiB VMA blocks on every heap size (V7). Before, they were used only on heaps of
+    // 8 GB or less; larger cards got VMA's default 256 MiB and, as VMA returns a block to the
+    // driver only once it is empty, that much VRAM sat unused per block type (up to ~256 MiB in
+    // the host heap too). Expected win: 50-100 MiB of VRAM and less fragmentation, no FPS change;
+    // A/B with SOTC_VMA_BLOCK_MB=64 against 0. The small-block default is also what small cards
+    // need: the free space inside VMA blocks is unusable for the buffer arenas (their own
+    // vkAllocateMemory calls), and on a 6 GB card ~1 GB sat free in VMA blocks while arena
+    // allocations failed. The
+    // real budget (VK_EXT_memory_budget, which counts other processes) also replaces VMA's
+    // 80%-of-heap estimate for WITHIN_BUDGET allocations.
+    // sotc: this used to be gated by BbToggle::VmaBlock64, but the mask is read after the allocator
+    // is created, so the bit never changed anything at run time. It is gone: 64 MiB is the default
+    // on every heap size and SOTC_VMA_BLOCK_MB is the only override.
     // SOTC_VMA_BLOCK_MB=<n> overrides the block size (0: VMA's default), for A/B measurements.
-    u64 block_size = device_local_heap <= 8_GB ? 64_MB : 0;
+    u64 block_size = 64_MB;
     if (const char* env = std::getenv("SOTC_VMA_BLOCK_MB")) {
         block_size = static_cast<u64>(std::strtoull(env, nullptr, 10)) << 20;
     }
     // sotc: SOTC_CMD_STATS counts device memory allocations (SOTC sys line).
-    // SOTC_VK_ALLOC_TRACE=1 (with SOTC_CMD_STATS): the first allocations after the 3000th, with the
-    // size, memory type and the caller chain (image offsets), to find per-frame allocations.
-    static const VmaDeviceMemoryCallbacks memory_callbacks = {
-        .pfnAllocate = [](VmaAllocator, uint32_t type, VkDeviceMemory, VkDeviceSize size, void*) {
-            SotcStats::sys_vk_allocs.fetch_add(1, std::memory_order_relaxed);
-            static std::atomic<u64> seen{0};
-            const u64 n = seen.fetch_add(1, std::memory_order_relaxed);
-            static const bool trace = std::getenv("SOTC_VK_ALLOC_TRACE") != nullptr;
-            if (trace && n >= 3000 && n < 3040) {
-                void* frames[16]{};
-                const u32 count = CaptureStackBackTrace(1, 16, frames, nullptr);
-                std::string where;
-                for (u32 i = 0; i < count; ++i) {
-                    where += fmt::format(" {:#x}", reinterpret_cast<u64>(frames[i]) - reinterpret_cast<u64>(GetModuleHandleW(nullptr)));
+    // sotc: SOTC_RAM_CENSUS=1 also feeds the live bytes per memory type to the census
+    // (runtime_memory_census_vk); the callbacks are only registered when either is on, so
+    // they cost nothing otherwise. VMA copies the struct.
+    const char* census_env = std::getenv("SOTC_RAM_CENSUS");
+    const bool ram_census = census_env && census_env[0] == '1';
+    const VmaDeviceMemoryCallbacks memory_callbacks = {
+        .pfnAllocate = [](VmaAllocator, uint32_t type, VkDeviceMemory, VkDeviceSize size,
+                          void* user) {
+            if (SotcStats::kCmdStats) {
+                SotcStats::sys_vk_allocs.fetch_add(1, std::memory_order_relaxed);
+                // SOTC_VK_ALLOC_TRACE=1 (with SOTC_CMD_STATS): the first allocations after the
+                // 3000th, with the size, memory type and the caller chain (image offsets), to
+                // find per-frame allocations.
+                static std::atomic<u64> seen{0};
+                const u64 n = seen.fetch_add(1, std::memory_order_relaxed);
+                static const bool trace = std::getenv("SOTC_VK_ALLOC_TRACE") != nullptr;
+                if (trace && n >= 3000 && n < 3040) {
+                    void* frames[16]{};
+                    const u32 count = CaptureStackBackTrace(1, 16, frames, nullptr);
+                    std::string where;
+                    for (u32 i = 0; i < count; ++i) {
+                        where += fmt::format(" {:#x}", reinterpret_cast<u64>(frames[i]) -
+                                                           reinterpret_cast<u64>(GetModuleHandleW(nullptr)));
+                    }
+                    std::fprintf(stderr, "SOTC VKALLOC #%llu type %u size %llu KiB:%s\n",
+                                 static_cast<unsigned long long>(n), type,
+                                 static_cast<unsigned long long>(size >> 10), where.c_str());
                 }
-                std::fprintf(stderr, "SOTC VKALLOC #%llu type %u size %llu KiB:%s\n",
-                             static_cast<unsigned long long>(n), type,
-                             static_cast<unsigned long long>(size >> 10), where.c_str());
+            }
+            if (user) {
+                runtime_memory_census_vk(type, CensusHostVisible(user, type),
+                                         static_cast<int64_t>(size));
             }
         },
-        .pfnFree = [](VmaAllocator, uint32_t, VkDeviceMemory, VkDeviceSize, void*) {
-            SotcStats::sys_vk_frees.fetch_add(1, std::memory_order_relaxed);
+        .pfnFree = [](VmaAllocator, uint32_t type, VkDeviceMemory, VkDeviceSize size, void* user) {
+            if (SotcStats::kCmdStats) {
+                SotcStats::sys_vk_frees.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (user) {
+                runtime_memory_census_vk(type, CensusHostVisible(user, type),
+                                         -static_cast<int64_t>(size));
+            }
         },
+        .pUserData = ram_census ? this : nullptr,
     };
     const VmaAllocatorCreateInfo allocator_info = {
         .flags = static_cast<VmaAllocatorCreateFlags>(
@@ -801,7 +833,8 @@ void Instance::CreateAllocator() {
         .physicalDevice = physical_device,
         .device = *device,
         .preferredLargeHeapBlockSize = block_size,
-        .pDeviceMemoryCallbacks = SotcStats::kCmdStats ? &memory_callbacks : nullptr,
+        .pDeviceMemoryCallbacks =
+            (SotcStats::kCmdStats || ram_census) ? &memory_callbacks : nullptr,
         .pVulkanFunctions = &functions,
         .instance = *instance,
         .vulkanApiVersion = TargetVulkanApiVersion,
@@ -873,12 +906,26 @@ void Instance::CollectPhysicalMemoryInfo() {
         // We reserve some memory for the system.
         const u64 system_memory = std::min<u64>(total_memory_budget / 8, 1_GB);
         total_memory_budget -= system_memory;
-        return;
+    } else {
+        // Leave at least 8 GB for the system on integrated GPUs.
+        const s64 available_memory = static_cast<s64>(total_memory_budget - device_initial_usage);
+        total_memory_budget =
+            static_cast<u64>(std::max<s64>(available_memory - 8_GB, static_cast<s64>(2_GB)));
     }
-    // Leave at least 8 GB for the system on integrated GPUs.
-    const s64 available_memory = static_cast<s64>(total_memory_budget - device_initial_usage);
-    total_memory_budget =
-        static_cast<u64>(std::max<s64>(available_memory - 8_GB, static_cast<s64>(2_GB)));
+    // sotc: SOTC_VRAM_BUDGET_MB=<n> caps the effective budget (0 or absent: no cap), so a 12 GB
+    // card can simulate a 3-6 GB one for the GC A/B. Applied here, before the budget is published,
+    // so GetTotalMemoryBudget() (and with it SotcStats::vram_budget, the texture cache thresholds
+    // and the buffer arenas) all see the same simulated size.
+    if (const char* env = std::getenv("SOTC_VRAM_BUDGET_MB")) {
+        const u64 requested_mb = std::strtoull(env, nullptr, 10);
+        if (requested_mb != 0) {
+            const u64 capped_budget = std::min<u64>(total_memory_budget, requested_mb << 20);
+            LOG_INFO(Render_Vulkan,
+                     "Video memory budget capped by SOTC_VRAM_BUDGET_MB: {} -> {} MB",
+                     total_memory_budget >> 20, capped_budget >> 20);
+            total_memory_budget = capped_budget;
+        }
+    }
 }
 
 void Instance::CollectImageFormatInfo() {

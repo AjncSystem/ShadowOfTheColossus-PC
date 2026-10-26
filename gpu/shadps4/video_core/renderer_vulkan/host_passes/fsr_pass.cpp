@@ -121,6 +121,10 @@ void FsrPass::Create(vk::Device device, VmaAllocator allocator, u32 num_images) 
     device.destroyShaderModule(cs_rcas_module);
 
     available_imgs.resize(num_images);
+    // sotc: the presenter keeps at most max(swapchain images, 4) frames in flight
+    // (vk_presenter.cpp, num_frames), so an image may still be read that many Render calls after
+    // its last use.
+    release_delay = (num_images < 4u ? 4u : num_images) + 1;
     for (int i = 0; i < num_images; ++i) {
         auto& img = available_imgs[i];
         img.id = i;
@@ -134,14 +138,19 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                               bool hdr) {
     if (!settings.enable) {
         DebugState.is_using_fsr = false;
+        // sotc: FSR is off: its images (2 x RGBA16F per frame in the ring) are not needed, so
+        // release them instead of keeping them until the presenter is destroyed.
+        ReleaseImagesWhenIdle();
         return input;
     }
     if (input_size.width >= output_size.width && input_size.height >= output_size.height) {
         DebugState.is_using_fsr = false;
+        ReleaseImagesWhenIdle();
         return input;
     }
 
     DebugState.is_using_fsr = true;
+    release_pending = false; // sotc: still in use, cancel a release in progress
 
     if (output_size != cur_size) {
         ResizeAndInvalidate(output_size.width, output_size.height);
@@ -398,6 +407,47 @@ void FsrPass::ResizeAndInvalidate(u32 width, u32 height) {
     for (int i = 0; i < num_images; ++i) {
         available_imgs[i].dirty = true;
     }
+}
+
+void FsrPass::ReleaseImagesWhenIdle() {
+    if (!ImagesAlive()) {
+        release_pending = false;
+        return;
+    }
+    // sotc: the frames recorded with these images may still be on the GPU (see release_delay):
+    // wait before freeing them. Until then they idle, which they did before anyway.
+    if (!release_pending) {
+        release_pending = true;
+        release_wait = release_delay;
+        return;
+    }
+    if (release_wait > 1) {
+        --release_wait;
+        return;
+    }
+    ReleaseImages();
+    release_pending = false;
+}
+
+void FsrPass::ReleaseImages() {
+    for (auto& img : available_imgs) {
+        // Views first: a view references its image.
+        img.intermediary_image_view.reset();
+        img.output_image_view.reset();
+        img.intermediary_image.Destroy();
+        img.output_image.Destroy();
+        img.dirty = true; // sotc: CreateImages recreates them when FSR is enabled again
+    }
+    cur_image = 0;
+}
+
+bool FsrPass::ImagesAlive() const {
+    for (const auto& img : available_imgs) {
+        if (img.intermediary_image || img.output_image) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void FsrPass::CreateImages(Img& img) const {

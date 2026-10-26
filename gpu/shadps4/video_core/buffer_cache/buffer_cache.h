@@ -4,6 +4,8 @@
 #pragma once
 
 #include <array>
+#include <atomic>
+#include <mutex>
 
 #include <chrono>
 #include <shared_mutex>
@@ -21,6 +23,8 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
+#include "video_core/buffer_cache/rb_intervals.h"
+#include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 
@@ -37,6 +41,7 @@ class GraphicsPipeline;
 struct SubmitInfo;
 class Runtime;
 class StagingBufferPool;
+struct StagingBufferRef;
 } // namespace Vulkan
 
 namespace VideoCore {
@@ -107,13 +112,35 @@ public:
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false, bool assume_locks = false);
 
-    /// Finds a buffer for the specified region.
+    /// sotc: BbToggle::BufferBindMemo. What a read-only ObtainBuffer relies on, remembered by the
+    /// caller that wants to repeat a binding without calling again: the buffer registry (resident
+    /// set, which every arena creation also bumps; the arena table), the use epoch (EnsureResident
+    /// stamps the blocks once per epoch) and the CPU bits of the range's 256 KiB words (the page
+    /// look of SynchronizeMemory found none). While BindTokenValid holds, calling ObtainBuffer
+    /// again with the same arguments would return the same pair and do nothing else.
+    struct BindToken {
+        CpuGenKey gen{};
+        u64 resident_version{};
+        u16 epoch{};
+        bool valid{};
+    };
+
+    /// Finds a buffer for the specified region. `token` (optional): filled when the call was a
+    /// plain read-only binding, ranges of at most 16 words in one region, that uploaded nothing.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
                                                              bool is_written,
-                                                             bool is_texel_buffer = false);
+                                                             bool is_texel_buffer = false,
+                                                             BindToken* token = nullptr);
+
+    /// True while a token from ObtainBuffer still describes the registry and CPU bits.
+    [[nodiscard]] bool BindTokenValid(const BindToken& token) const noexcept;
 
     /// Attempts to obtain a buffer without modifying the cache contents.
-    [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
+    /// sotc: prefer_arena: a CPU-fed image that keeps being dirtied (RefreshImage counts its uploads)
+    /// goes through the synchronized arena like a buffer, so only the pages the game wrote are
+    /// copied again instead of the whole image (SOTC_IMG_ARENA_MB).
+    [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size,
+                                                                     bool prefer_arena = false);
 
     /// Return true when a region is modified from the CPU
     [[nodiscard]] bool IsRegionCpuModified(VAddr addr, size_t size);
@@ -155,6 +182,10 @@ public:
 
     /// Synchronizes all buffers needed for DMA.
     void SynchronizeDmaBuffers();
+    /// sotc: the DMA sweep restricted to [addr, addr + size): for shaders whose raw pointer reads
+    /// are known (vk_shader_hle.cpp KnownDmaRange). The range is made resident and uploaded as a
+    /// binding would be; the fault buffer is still processed after the submit.
+    bool SynchronizeDmaRange(VAddr addr, u64 size);
 
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
@@ -188,7 +219,7 @@ private:
 
     const Buffer* GetArena(u64 first_block, u64 last_block);
 
-    void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block);
+    void EnsureResident(const Buffer* arena, u64 first_block, u64 last_block, u8 bind_class = 2);
 
     void DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size);
 
@@ -196,6 +227,13 @@ private:
     /// downloads and unmarks as GPU-modified: 512 KiB around it, smaller with SOTC_RB_NARROW.
     std::pair<VAddr, VAddr> ReadbackWindow(const Buffer* arena, VAddr device_addr, u64 size);
 
+    /// sotc: what told MarkInflightReadbacksDirty that bytes changed (READBACK-PLAN.md).
+    enum DirtyCause : u8 { CauseGpuWrite, CauseApplied, CauseDrop, CauseCpuReplace, CauseCount };
+    struct StaleRange {
+        VAddr lo;
+        VAddr hi;
+        u8 cause;
+    };
     /// One range to read back: its GPU-modified parts, as copies from the arena.
     struct ReadbackItem {
         const Buffer* arena;
@@ -212,15 +250,26 @@ private:
     /// applied the data and called SubtractDownloaded (the command processor reads clean ranges
     /// from the backing meanwhile, with the draw thread); subtract: ranges with nothing bound
     /// to copy leave the set right away.
+    /// sotc: hot = false (the repeat rounds of ReadMemory) collects only [device_addr, +size) and
+    /// does not touch the hot readback list.
     u64 GatherDownloads(const Buffer* arena, VAddr device_addr, u64 size,
                         boost::container::small_vector<ReadbackItem, 16>& pending,
-                        bool subtract = true);
+                        bool subtract = true, bool hot = true);
     /// sotc: takes the downloaded ranges of items out of the GPU-modified set.
     void SubtractDownloaded(std::span<const ReadbackItem> items);
     /// Writes downloaded data (mapped, at the copies' destination offsets minus mapped_offset)
     /// into guest memory and unmarks the ranges as GPU-modified.
+    /// sotc: partial (BbToggle::ReadbackIntervals, FinishAsyncReadbackFine): the items hold only
+    /// the bytes to apply; their pages are not unmarked here but by UnmarkPagesWithoutGpuBytes
+    /// after SubtractDownloaded.
     void ApplyDownloads(std::span<const ReadbackItem> pending, const u8* mapped,
-                        u64 mapped_offset);
+                        u64 mapped_offset, bool partial = false);
+    /// sotc: tells the readbacks in flight that the bytes of `item` were applied (the guest may
+    /// write them now) and the pages it covers are no longer GPU-modified.
+    void NoteApplied(const ReadbackItem& item);
+    /// sotc: unmarks the pages of the items' gpu_ranges that hold no byte of gpu_modified_ranges
+    /// (the check MarkWrittenByGuest makes); a page with GPU bytes keeps its bit and protection.
+    void UnmarkPagesWithoutGpuBytes(std::span<const ReadbackItem> items);
 
     /// sotc (default, SOTC_RB_ASYNC=0 turns it off): a readback asked by a guest thread in two steps on the command
     /// processor: the copies are recorded and submitted without waiting (the command processor
@@ -230,15 +279,10 @@ private:
         VAddr device_addr{};
         u64 size{};
         bool is_write{};
+        bool narrow{}; ///< sotc: a repeat round of ReadMemory: only the asked pages, no hot readbacks
+        bool again{};  ///< sotc: set by Finish (fine path): asked pages still hold GPU bytes
         bool waiting{};
         bool dirty{};
-        /// sotc: a write that made it dirty touched the pages of the request itself (the rest of
-        /// the window can be left GPU-modified; the request cannot).
-        bool request_dirty{};
-        /// sotc: the page spans (sorted, merged) touched since the copies; past 32 only the request
-        /// pages are kept (spans_overflow).
-        boost::container::small_vector<std::pair<VAddr, VAddr>, 32> dirty_spans;
-        bool spans_overflow{};
         bool dependent{};
         bool finished{};
         u64 tick{};
@@ -250,7 +294,15 @@ private:
         Buffer* download_buffer{};
         u64 download_size{};
         boost::container::small_vector<ReadbackItem, 16> pending;
+        /// sotc: the byte intervals events changed while it was in flight (every one that touches
+        /// its regions or GPU page runs), with their cause (DirtyCause); `dirty` keeps the older
+        /// whole-region test of the old path. More than MaxStaleRanges after merging: stale_overflow
+        /// and the old path.
+        boost::container::small_vector<StaleRange, 16> stale;
+        bool stale_overflow{};
+        u8 first_cause{0xFF};
     };
+    static constexpr size_t MaxStaleRanges = 128;
     void BeginAsyncReadback(AsyncReadback& readback);
     /// sotc: marks bytes a guest write fault asked for CPU-modified, unless pages of them
     /// still hold GPU data (see the definition).
@@ -261,11 +313,61 @@ private:
     void DropUnbackedGpuPages(VAddr addr, u64 size);
     void FinishAsyncReadback(AsyncReadback& readback);
     AsyncReadback* FindInflightReadback(VAddr addr, u64 size);
-    void MarkInflightReadbacksDirty(VAddr addr, u64 size, bool gpu_write = false);
+    /// sotc: bytes [addr, addr + size) changed (cause: DirtyCause). Readbacks in flight whose region
+    /// overlaps get `dirty` (old path); every readback whose region or GPU page runs overlap
+    /// records the interval in `stale` (READBACK-PLAN.md).
+    void MarkInflightReadbacksDirty(VAddr addr, u64 size, u8 cause);
+    /// The old whole-region test only (sets `dirty`, no interval).
+    void MarkInflightRegionDirty(VAddr addr, u64 size);
+    void RecordStale(AsyncReadback& readback, VAddr lo, VAddr hi, u8 cause);
+    /// sotc: Finish of a readback whose copies were hit: applies what no interval touched.
+    void FinishAsyncReadbackFine(AsyncReadback& readback, const Vulkan::StagingBufferRef& download);
+    /// sotc: SOTC_RB_VERIFY=1 (diagnostic, blocks the draw thread), see the definition.
+    struct FineVerify;
+    void VerifyFineBefore(const AsyncReadback& readback, const Vulkan::StagingBufferRef& download,
+                          std::span<const RbIntervals::Interval> merged, FineVerify& state);
+    void VerifyFineAfter(const AsyncReadback& readback, std::span<const ReadbackItem> fine_items,
+                         FineVerify& state);
+    void NoteFinishedReadback(const AsyncReadback& readback); // sotc: SOTC_FPS telemetry
     std::vector<AsyncReadback*> inflight_readbacks;
 
+    /// sotc: `uploaded` (optional) is set to whether any CPU-modified page was collected.
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
-                           bool is_texel_buffer);
+                           bool is_texel_buffer, bool* uploaded = nullptr);
+
+    /// sotc: SynchronizeMemory split in two. Collect marks the CPU-modified pages of the range as
+    /// uploaded (and write-protects them, possibly batched, see ProtectBatchScope); Commit copies
+    /// their bytes to the GPU and MUST run after PageManager::FlushProtectBatch(): a guest write
+    /// landing after the protect faults and is captured, one before it is read by the copy.
+    struct UploadJob {
+        const Buffer* arena{};
+        boost::container::small_vector<vk::BufferCopy, 4> copies;
+        size_t total_size_bytes{};
+        VAddr req_addr{};  ///< sotc: SOTC_STALL_LOG, the bound range that produced the uploads
+        u32 req_size{};
+        bool written{};
+    };
+    void CollectUploads(UploadJob& job, VAddr device_addr, u32 size, bool is_written);
+    void CommitUploads(UploadJob& job);
+
+    /// sotc: SOTC_ASYNC_UPLOAD. Guest bytes copied to staging memory by the copy threads, the
+    /// submit (SubmitPendingArenaBinds) waits for them. See the definitions.
+    struct GuestCopyPiece {
+        VAddr source;
+        u8* dest;
+        u64 size;
+    };
+    struct GuestCopyFlush {
+        Buffer* buffer;
+        u64 offset, size;
+    };
+    bool AsyncUploadFor(u64 bytes) const;
+    void StartGuestCopy(std::vector<GuestCopyPiece>&& ranges, u64 total,
+                        const Vulkan::StagingBufferRef& staging);
+    void WaitGuestCopies();
+    std::atomic<u32> guest_copies_pending{0};
+    std::mutex guest_copy_mutex;
+    std::vector<GuestCopyFlush> guest_copy_flush; ///< staging ranges of non-coherent memory
 
     bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
 
@@ -314,8 +416,10 @@ private:
         u64 first{};
         u64 end{};
         u16 epoch{}; ///< sotc: use epoch its blocks were last stamped with
+        u8 cls{};    ///< sotc: bind class its blocks were marked with (ArenaBindClass)
     };
     std::array<ResidentCacheEntry, 64> resident_cache{};
+
     u64 dma_runs_version = ~0ULL;
     size_t dma_runs_arenas{};
     u64 dma_runs_ranges{};
@@ -324,6 +428,7 @@ private:
     std::vector<std::pair<VAddr, u64>> dma_runs;
     bool dma_full_pending{}; // sotc: the next DMA sweep visits every run (see SynchronizeDmaBuffers)
     std::vector<std::pair<VAddr, u64>> dma_spans;
+    std::vector<UploadJob> dma_jobs; ///< sotc: uploads collected by one DMA sweep (reused)
     /// Readback windows requested recently; downloaded together with the next readback.
     struct HotReadback {
         VAddr addr;
@@ -356,6 +461,27 @@ private:
     bool clean_pages_used = false;
     std::atomic<u64> clean_map_generation{};
     void AddGpuModified(VAddr addr, u64 size);
+
+    /// sotc: BbToggle::WriteMarkMemo. What a written binding does after its upload check:
+    /// AddGpuModified + RecordCurrentWrite, skipped when the same (address, size) found both
+    /// already in force. Part A (AddGpuModified) holds while the range is still in
+    /// gpu_modified_ranges (RangeSet::generation, or a look when something was removed) and no
+    /// readback entered the list in flight (inflight_gen: marks on the others are idempotent).
+    /// Part B (RecordCurrentWrite) holds within one command buffer while current_writes was not
+    /// cleared and no hot read was added (the
+    /// early-submit flag it may raise is raised again from `hot_overlap`).
+    struct WriteMarkMemo {
+        VAddr addr{};
+        u64 size{};
+        u64 gm_gen{}, inflight_gen{};
+        u64 tick{}, cw_gen{}, hot_gen{};
+        bool a_valid{}, b_valid{}, hot_overlap{};
+    };
+    static constexpr size_t NumWriteMarkMemos = 256;
+    std::array<WriteMarkMemo, NumWriteMarkMemos> write_mark_memos{};
+    u64 inflight_gen{};   ///< bumped when a readback enters inflight_readbacks
+    u64 hot_reads_gen{};  ///< bumped when a hot read is added
+    void MarkWrittenBinding(VAddr addr, u64 size);
 
     /// GPU writes recorded into the command buffer still being built (tick current_writes_tick).
     RangeSet current_writes;
@@ -392,6 +518,15 @@ private:
     void UnbindResident(std::span<const Backing> released);
     /// sotc: per arena block, the use epoch (seconds, wrapping, 0 = never) of its last bind.
     u16* block_last_use{};
+    /// sotc (BbToggle::ArenaImageRelease): per arena block, the classes of binds that have made or
+    /// kept it resident since it became resident: 1 = image source (ObtainBufferForImage),
+    /// 2 = any other bind. 0 = unclassified (made resident another way). Cleared when the block
+    /// is unbound. Only a block of class exactly 1 may be given back before the arena threshold.
+    u8* block_class{};
+    /// sotc: class the EnsureResident calls of this thread mark (2 unless ObtainBufferForImage).
+    static inline thread_local u8 arena_bind_class = 2;
+    /// sotc: arena memory by class of its blocks, for the SOTC MEM line (every 5 s).
+    void ArenaClassCensus(u16 idle_epochs);
     /// sotc: blocks MaybeEvictCold gave back and nothing bound again yet.
     IntervalList<> evicted_ranges;
     /// sotc: evicted blocks a shader faulted back in; never evicted again.
@@ -421,15 +556,18 @@ private:
         u64 bytes;
         std::vector<EvictPiece> pieces;
         boost::container::small_vector<Backing, 4> ranges;
+        bool img_only{}; ///< sotc: every block bound only as an image source (ArenaImageRelease)
+        u16 need_idle{}; ///< idle epochs this choice needed
     };
     struct PendingEviction {
         std::vector<EvictChoice> chosen;
         Vulkan::StagingBufferRef download;
         u64 tick{};
         std::chrono::steady_clock::time_point deadline{};
+        bool over{}; ///< sotc: chosen because resident arena memory passed the threshold
     };
     std::optional<PendingEviction> pending_eviction;
-    bool FinishEviction(std::chrono::steady_clock::time_point now, u16 idle_epochs, bool wait);
+    bool FinishEviction(std::chrono::steady_clock::time_point now, bool wait);
 
     u32 arena_memory_type_index{};
     std::optional<u32> arena_fallback_memory_type_index;

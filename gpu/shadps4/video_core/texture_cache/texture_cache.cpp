@@ -13,6 +13,7 @@
 #endif
 #include <xxhash.h>
 
+#include "bbport_toggles.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
@@ -131,6 +132,12 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     }();
     critical_gc_memory = std::min<u64>(critical_gc_memory, device_local_memory * gc_percent / 100);
     pressure_gc_memory = std::min<u64>(pressure_gc_memory, critical_gc_memory);
+    // sotc: V14 (docs/sotc/PORT-PLUS10.md): the soft-cleanup trigger is a fraction of the effective
+    // budget (50%, >= 256 MB, never above pressure) instead of (budget - 8 GB) / 2, which sat at
+    // ~1-2 GB on 8-12 GB cards, below what is really resident, so every pass was a strong one.
+    // Pressure and critical stay upstream's (tiered, SOTC_VRAM_GC_PERCENT).
+    trigger_gc_memory = std::min<u64>(
+        std::max<u64>(static_cast<u64>(device_local_memory) * 50 / 100, 256_MB), pressure_gc_memory);
     std::fprintf(stderr, "SOTC VRAM: budget %llu MiB, tier %d, texture collection from %llu%%\n",
                  static_cast<unsigned long long>(device_local_memory >> 20), SotcStats::VramTier(),
                  static_cast<unsigned long long>(gc_percent));
@@ -913,9 +920,19 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
     return {};
 }
 
+void TextureCache::NoteFound(Image& image) {
+    image.tick_accessed_last = scheduler.CurrentTick();
+    TouchImage(image);
+}
+
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
+    return FindTexture(image_id, desc.type, desc.view_info);
+}
+
+ImageView& TextureCache::FindTexture(ImageId image_id, BindingType type,
+                                     const ImageViewInfo& view_info) {
     Image& image = slot_images[image_id];
-    if (desc.type == BindingType::Storage) {
+    if (type == BindingType::Storage) {
         MarkWritten(image);
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
             image.info.guest_address != 0) {
@@ -924,7 +941,7 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
         }
     }
     UpdateImage(image_id);
-    return image.FindView(desc.view_info);
+    return image.FindView(view_info);
 }
 
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc,
@@ -953,14 +970,20 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
 
     // Register meta data for this color buffer
     if (desc.info.meta_info.cmask_addr) {
-        surface_metas.emplace(desc.info.meta_info.cmask_addr,
-                              MetaDataInfo{.type = MetaType::CMask});
+        if (surface_metas
+                .emplace(desc.info.meta_info.cmask_addr, MetaDataInfo{.type = MetaType::CMask})
+                .second) {
+            meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: DepthFastPath
+        }
         image.info.meta_info.cmask_addr = desc.info.meta_info.cmask_addr;
     }
 
     if (desc.info.meta_info.fmask_addr) {
-        surface_metas.emplace(desc.info.meta_info.fmask_addr,
-                              MetaDataInfo{.type = MetaType::FMask});
+        if (surface_metas
+                .emplace(desc.info.meta_info.fmask_addr, MetaDataInfo{.type = MetaType::FMask})
+                .second) {
+            meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: DepthFastPath
+        }
         image.info.meta_info.fmask_addr = desc.info.meta_info.fmask_addr;
     }
 
@@ -975,13 +998,18 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 
     // Register meta data for this depth buffer
     if (desc.info.meta_info.htile_addr) {
-        surface_metas.emplace(desc.info.meta_info.htile_addr,
-                              MetaDataInfo{.type = MetaType::HTile,
-                                           .clear_mask = image.info.meta_info.htile_clear_mask});
+        if (surface_metas
+                .emplace(desc.info.meta_info.htile_addr,
+                         MetaDataInfo{.type = MetaType::HTile,
+                                      .clear_mask = image.info.meta_info.htile_clear_mask})
+                .second) {
+            meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: DepthFastPath
+        }
         image.info.meta_info.htile_addr = desc.info.meta_info.htile_addr;
     }
 
     // If there is a stencil attachment, link depth and stencil.
+    last_depth_stencil_id = {}; // sotc: DepthFastPath replays the touch below
     if (desc.info.stencil_addr != 0) {
         // sotc: the lookup and RegisterImage need `mutex` like FindImage (only depth when the
         // caller's batch hold already has it; SOTC_TC_BATCH=0 has none).
@@ -1006,6 +1034,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
         Image& stencil_image = slot_images[stencil_id];
         TouchImage(stencil_image);
         stencil_image.AssociateDepth(image_id, image.image_uid);
+        last_depth_stencil_id = stencil_id;
     }
 
     return image.FindView(desc.view_info, false);
@@ -1121,6 +1150,9 @@ void TextureCache::RefreshImage(Image& image) {
         return;
     }
 
+    // sotc: SOTC_STALL_LOG: phase times of this texture upload.
+    const auto stall_t0 = SotcStats::kStallLog ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
     if (SotcTexDiag::Level() >= 1) {
         SotcTexDiag::Get().uploads.fetch_add(1, std::memory_order_relaxed);
         SotcTexDiag::Log("UPLOAD %zu of %u mips (%s%s%s): %s", image_copies.size(), num_mips,
@@ -1132,14 +1164,38 @@ void TextureCache::RefreshImage(Image& image) {
     scheduler.EndRendering();
 
     const auto [in_buffer, in_offset] =
-        buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
+        buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size,
+                                          image.sotc_uploads++ >= 1);
+    const auto stall_t1 = SotcStats::kStallLog ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
     const auto [buffer, offset] = tile_manager.DetileImage(in_buffer, in_offset, image.info);
+    const auto stall_t2 = SotcStats::kStallLog ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
     for (auto& copy : image_copies) {
         copy.bufferOffset += offset;
     }
 
     runtime.UploadImage(&image, buffer, image_copies);
     SotcGlyphHook(image);
+    if (SotcStats::kStallLog) {
+        const double total_ms = SotcStats::StallMsSince(stall_t0);
+        SotcStats::StallAgg(SotcStats::StallTextureUpload, image.info.guest_address, total_ms,
+                            image.info.guest_size / 1048576.0,
+                            std::chrono::duration<double, std::milli>(stall_t1 - stall_t0).count());
+        SotcStats::StallNote(
+            total_ms,
+            "texture-upload %.1f ms (source %.1f, detile %.1f, vk upload %.1f): %.2f MB guest at "
+            "%#llx, %ux%ux%u mips %u layers %u fmt %d tiled %d gpu-modified %d",
+            total_ms, std::chrono::duration<double, std::milli>(stall_t1 - stall_t0).count(),
+            std::chrono::duration<double, std::milli>(stall_t2 - stall_t1).count(),
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stall_t2)
+                .count(),
+            image.info.guest_size / 1048576.0,
+            static_cast<unsigned long long>(image.info.guest_address), image.info.size.width,
+            image.info.size.height, image.info.size.depth, num_mips, num_layers,
+            static_cast<int>(image.info.pixel_format), image.info.props.is_tiled ? 1 : 0,
+            is_gpu_modified ? 1 : 0);
+    }
 }
 
 namespace {
@@ -1447,6 +1503,19 @@ void TextureCache::RegisterImage(ImageId image_id) {
     SotcStats::cached_images.fetch_add(1, std::memory_order_relaxed);
     SotcStats::cached_image_bytes.fetch_add(Common::AlignUp(image.info.guest_size, 1024), std::memory_order_relaxed);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
+    if (!swept_images.empty()) {
+        // sotc: an image the cold sweep freed is needed again (a new one at its address).
+        if (const auto swept = swept_images.find(image.info.guest_address);
+            swept != swept_images.end()) {
+            SotcStats::sweep_recreated.fetch_add(1, std::memory_order_relaxed);
+            SotcStats::sweep_recreated_bytes.fetch_add(swept->second.bytes,
+                                                       std::memory_order_relaxed);
+            if (std::chrono::steady_clock::now() - swept->second.time < std::chrono::seconds{10}) {
+                SotcStats::sweep_recreated_fast.fetch_add(1, std::memory_order_relaxed);
+            }
+            swept_images.erase(swept);
+        }
+    }
     ForEachPage(image.info.guest_address, image.info.guest_size,
                 [this, image_id](u64 page) {
                     // Counted before TrackImage protects the pages (a system call: a barrier).
@@ -1709,12 +1778,28 @@ void TextureCache::GarbageCollectImages() {
         auto& image = slot_images[image_id];
         const bool download = image.SafeToDownload();
         const bool tiled = image.info.IsTiled();
+        // sotc: a kept image goes to the back of the LRU (BbToggle::GcLruAdvance, bit set: old
+        // behaviour, it stays in place). Only the order changes, not the budget: num_deletions is
+        // still charged above, so the pass frees as much as before, but it goes on with the
+        // next-oldest image instead of spending the whole budget on the same head every tick.
+        // Touch stamps the item with gc_tick (always >= its tick, so it never moves backwards) and
+        // does nothing when the item is already at the tail. ForEachItemBelow saves `next` before
+        // calling back, so moving the current item to the tail is safe (common/lru_cache.h); only
+        // registered images have a node.
+        const auto advance = [&] {
+            if (True(image.flags & ImageFlagBits::Registered) &&
+                !BbToggle::Disabled(BbToggle::GcLruAdvance)) {
+                lru_cache.Touch(image.lru_id, gc_tick);
+            }
+        };
         if (tiled && download) {
             // This is a workaround for now. We can't handle non-linear image downloads.
             SotcStats::gc_kept_tiled.fetch_add(1, std::memory_order_relaxed);
+            advance();
             return false;
         }
         if (download && !pressured) {
+            advance();
             return false;
         }
         if (download) {
@@ -1746,6 +1831,170 @@ void TextureCache::GarbageCollectImages() {
         configure(true);
         lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
     }
+}
+
+// sotc: ColdImageSweep (MEMORIA-PLAN.md candidate 1). The budget GC only starts at half of the VRAM
+// budget, so on a card with room the images of areas the player left stay for the whole session.
+// An image the game uploaded from memory (never written by the GPU) is exactly what FindImage
+// would rebuild from guest memory when it is needed again: the sweep frees those after
+// SOTC_COLD_IMAGE_S idle seconds (default 60), SOTC_COLD_IMAGE_MAX (default 4) per pass, a pass
+// every 250 ms. Idle is wall time: the LRU counts submits, so tick_marks translate.
+// Never swept: anything the GPU may have written (GpuModified, render/depth/storage/scan-out
+// targets, GPU copies, resolved or multisampled backings, depth/stencil pairs and parked twins,
+// images with cmask/fmask/htile metadata) or that is bound right now.
+bool TextureCache::IsColdSweepable(const Image& image) const {
+    if (False(image.flags & ImageFlagBits::Registered) || !image.backing) {
+        return false;
+    }
+    if (True(image.flags & ImageFlagBits::GpuModified) || image.sotc_gpu_copied ||
+        image.parked_twin || image.depth_id) {
+        return false;
+    }
+    if (image.usage.render_target || image.usage.depth_target || image.usage.storage ||
+        image.usage.vo_surface || image.binding.is_bound || image.binding.is_target ||
+        image.binding.needs_rebind) {
+        return false;
+    }
+    if (image.backing_images.size() != 1 || image.info.num_samples > 1 ||
+        image.info.props.is_depth) {
+        return false;
+    }
+    const auto& meta = image.info.meta_info;
+    return !meta.cmask_addr && !meta.fmask_addr && !meta.htile_addr;
+}
+
+void TextureCache::NoteTickClock(std::chrono::steady_clock::time_point now) {
+    if (tick_marks.empty() || now - tick_marks.back().time >= std::chrono::seconds{1}) {
+        tick_marks.push_back({gc_tick, now});
+        if (tick_marks.size() > 4000) {
+            tick_marks.pop_front();
+        }
+    }
+}
+
+bool TextureCache::TickAtAge(std::chrono::steady_clock::time_point now, double seconds,
+                             u64& tick) const {
+    const auto limit =
+        now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                  std::chrono::duration<double>(seconds));
+    for (auto it = tick_marks.rbegin(); it != tick_marks.rend(); ++it) {
+        if (it->time <= limit) {
+            tick = it->tick;
+            return true;
+        }
+    }
+    return false;
+}
+
+void TextureCache::SweepColdImages() {
+    if (BbToggle::Disabled(BbToggle::ColdImageSweep)) {
+        return;
+    }
+    static const double cold_seconds = [] {
+        const char* v = std::getenv("SOTC_COLD_IMAGE_S");
+        return std::clamp(v ? std::strtod(v, nullptr) : 60.0, 5.0, 3600.0);
+    }();
+    static const u32 per_pass = [] {
+        const char* v = std::getenv("SOTC_COLD_IMAGE_MAX");
+        return static_cast<u32>(std::clamp<unsigned long>(v ? std::strtoul(v, nullptr, 10) : 4ul,
+                                                          1ul, 64ul));
+    }();
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next_sweep) {
+        return;
+    }
+    next_sweep = now + std::chrono::milliseconds{250};
+    // A caller further up this thread's stack may hold ids of images it has not touched yet
+    // (overlap resolution): sweep only from a quiescent point.
+    if (mutex.HeldByThisThread() || refresh_depth > 0) {
+        return;
+    }
+    u64 threshold = 0;
+    if (!TickAtAge(now, cold_seconds, threshold)) {
+        return;
+    }
+    const SotcStats::ScopedTimer timer{SotcStats::sweep_ns};
+    SotcStats::sweep_passes.fetch_add(1, std::memory_order_relaxed);
+    std::scoped_lock lock{mutex};
+    if (swept_images.size() > 8192) {
+        swept_images.clear();
+    }
+    u32 freed = 0;
+    // Big images (texture arrays: 6-43 ms to upload again) wait four times as long.
+    u64 big_threshold = 0;
+    const bool have_big = TickAtAge(now, cold_seconds * 4, big_threshold);
+    lru_cache.ForEachItemBelow(threshold, [&](ImageId image_id) {
+        const Image& image = slot_images[image_id];
+        if (!IsColdSweepable(image)) {
+            return false;
+        }
+        const u64 bytes = image.GetHostImageSize();
+        if (bytes >= (u64{16} << 20) &&
+            !(have_big && lru_cache.TickOf(image.lru_id) <= big_threshold)) {
+            return false;
+        }
+        swept_images[image.info.guest_address] = {now, bytes};
+        FreeImage(image_id);
+        SotcStats::sweep_freed.fetch_add(1, std::memory_order_relaxed);
+        SotcStats::sweep_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        return ++freed >= per_pass;
+    });
+}
+
+// sotc: telemetry for the memory plan, every 5 s with SOTC_FPS (the "SOTC MEM" line): cached images
+// by idle time (CPU-origin ones the sweep may free, and the rest), images with more than one
+// backing VkImage and what the non-current ones hold.
+void TextureCache::MemoryCensus() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next_mem_census) {
+        return;
+    }
+    next_mem_census = now + std::chrono::seconds{5};
+    constexpr double ages[SotcStats::kIdleBuckets - 1] = {10.0, 30.0, 60.0, 120.0, 300.0};
+    u64 ticks[SotcStats::kIdleBuckets - 1];
+    bool have[SotcStats::kIdleBuckets - 1];
+    for (int i = 0; i < SotcStats::kIdleBuckets - 1; ++i) {
+        have[i] = TickAtAge(now, ages[i], ticks[i]);
+    }
+    u64 cpu_n[SotcStats::kIdleBuckets]{}, cpu_b[SotcStats::kIdleBuckets]{};
+    u64 gpu_n[SotcStats::kIdleBuckets]{}, gpu_b[SotcStats::kIdleBuckets]{};
+    u64 multi_n = 0, multi_b = 0;
+    std::scoped_lock lock{mutex};
+    lru_cache.ForEachItemBelow(gc_tick, [&](ImageId image_id) {
+        const Image& image = slot_images[image_id];
+        if (!image.backing) {
+            return;
+        }
+        const u64 tick = lru_cache.TickOf(image.lru_id);
+        int bucket = 0;
+        while (bucket < SotcStats::kIdleBuckets - 1 && have[bucket] && tick <= ticks[bucket]) {
+            ++bucket;
+        }
+        const u64 host = image.GetHostImageSize();
+        if (IsColdSweepable(image)) {
+            ++cpu_n[bucket];
+            cpu_b[bucket] += host;
+        } else {
+            ++gpu_n[bucket];
+            gpu_b[bucket] += host;
+        }
+        if (image.backing_images.size() > 1) {
+            ++multi_n;
+            for (const auto& backing : image.backing_images) {
+                if (&backing != image.backing) {
+                    multi_b += backing.image.size_bytes;
+                }
+            }
+        }
+    });
+    for (int i = 0; i < SotcStats::kIdleBuckets; ++i) {
+        SotcStats::img_idle_cpu_n[i].store(cpu_n[i], std::memory_order_relaxed);
+        SotcStats::img_idle_cpu_b[i].store(cpu_b[i], std::memory_order_relaxed);
+        SotcStats::img_idle_gpu_n[i].store(gpu_n[i], std::memory_order_relaxed);
+        SotcStats::img_idle_gpu_b[i].store(gpu_b[i], std::memory_order_relaxed);
+    }
+    SotcStats::img_multi_count.store(multi_n, std::memory_order_relaxed);
+    SotcStats::img_multi_bytes.store(multi_b, std::memory_order_relaxed);
 }
 
 void TextureCache::GarbageCollectSamplers() {
@@ -2057,7 +2306,12 @@ void TextureCache::RunGarbageCollector() {
         EmergencyCollect(2); // sotc: a load began (sotc_stats.h)
     }
     Census();
+    NoteTickClock(std::chrono::steady_clock::now());
     GarbageCollectImages();
+    SweepColdImages();
+    if (SotcStats::kFpsLog) {
+        MemoryCensus();
+    }
     GarbageCollectSamplers();
 }
 
@@ -2089,12 +2343,15 @@ void TextureCache::ParkImage(ImageId image_id) {
     const auto& meta_info = image.info.meta_info;
     if (meta_info.cmask_addr) {
         surface_metas.erase(meta_info.cmask_addr);
+        meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: DepthFastPath
     }
     if (meta_info.fmask_addr) {
         surface_metas.erase(meta_info.fmask_addr);
+        meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: DepthFastPath
     }
     if (meta_info.htile_addr) {
         surface_metas.erase(meta_info.htile_addr);
+        meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: DepthFastPath
     }
     std::unique_lock lk{download_images_mutex};
     download_images.erase(image_id);
@@ -2152,12 +2409,15 @@ void TextureCache::DeleteImage(ImageId image_id) {
     const auto& meta_info = image.info.meta_info;
     if (meta_info.cmask_addr) {
         surface_metas.erase(meta_info.cmask_addr);
+        meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: DepthFastPath
     }
     if (meta_info.fmask_addr) {
         surface_metas.erase(meta_info.fmask_addr);
+        meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: DepthFastPath
     }
     if (meta_info.htile_addr) {
         surface_metas.erase(meta_info.htile_addr);
+        meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: DepthFastPath
     }
 
     {

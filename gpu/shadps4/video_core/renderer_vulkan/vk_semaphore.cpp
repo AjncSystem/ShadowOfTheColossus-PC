@@ -11,6 +11,8 @@
 #include <immintrin.h>
 
 #include "common/assert.h"
+#include "common/thread.h"
+#include "video_core/sotc_stats.h"
 
 #include <vk_mem_alloc.h>
 
@@ -177,6 +179,29 @@ void Semaphore::Wait(u64 tick) {
     if (IsFree(tick)) {
         return;
     }
+
+    // sotc: SOTC_STALL_LOG: a wait that got this far blocks the thread (spin or sleep).
+    struct StallWait {
+        std::chrono::steady_clock::time_point start{};
+        u64 tick;
+        const Semaphore& self;
+        StallWait(u64 t, const Semaphore& s) : tick{t}, self{s} {
+            if (SotcStats::kStallLog) {
+                start = std::chrono::steady_clock::now();
+            }
+        }
+        ~StallWait() {
+            if (SotcStats::kStallLog) {
+                const double ms = SotcStats::StallMsSince(start);
+                SotcStats::StallAgg(SotcStats::StallGpuWait, 0, ms, 0.0);
+                SotcStats::StallNote(ms, "gpu-wait %.1f ms on %s: tick %llu, current %llu, gpu %llu",
+                                     ms, Common::GetCurrentThreadName().c_str(),
+                                     static_cast<unsigned long long>(tick),
+                                     static_cast<unsigned long long>(self.CurrentTick()),
+                                     static_cast<unsigned long long>(self.KnownGpuTick()));
+            }
+        }
+    } stall_wait{tick, *this};
 
     // sotc: the marker comes first; the driver reports the semaphore right after it.
     if (marker_buffer && tick < CurrentTick() && SpinMarker(MarkerSlot::Timeline, tick)) {

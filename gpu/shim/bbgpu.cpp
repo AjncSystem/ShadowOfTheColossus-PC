@@ -209,6 +209,7 @@ void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms)
     // only for the SOTC sys line (SOTC_CMD_STATS).
     if (SotcStats::kCmdStats) {
         SotcStats::sys_protects.fetch_add(1, std::memory_order_relaxed);
+        if (SotcStats::kHashStats) SotcStats::hash_tl.protects++;
         SotcStats::sys_protect_bytes.fetch_add(size, std::memory_order_relaxed);
         if (True(perms & MemoryPermission::Write)) {
             SotcStats::sys_unprotects.fetch_add(1, std::memory_order_relaxed);

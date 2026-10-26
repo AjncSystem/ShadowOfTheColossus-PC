@@ -133,6 +133,12 @@ struct Image {
 
     ImageView& FindView(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
 
+    /// sotc: BbToggle::DepthFastPath. True when GetBarriers with these arguments would add no
+    /// barrier and change no state (full or partial transition alike), so its caller can skip it.
+    [[nodiscard]] bool TransitIsNoop(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                                     vk::PipelineStageFlags2 dst_stage,
+                                     const std::optional<SubresourceRange>& subres_range) const;
+
     using Barriers = boost::container::small_vector<vk::ImageMemoryBarrier2, 32>;
     void GetBarriers(Barriers& out_barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                      vk::PipelineStageFlags2 dst_stage,
@@ -184,6 +190,11 @@ public:
     u64 lru_id{};
     u64 tick_accessed_last{};
     u64 hash{};
+    u32 sotc_uploads{}; ///< sotc: RefreshImage uploads of this image (SOTC_IMG_ARENA)
+    /// sotc: a GPU copy wrote this image (Runtime::CopyImage and friends) without marking it
+    /// GpuModified (the source was not): its bytes are not just guest memory, so the cold sweep
+    /// (BbToggle::ColdImageSweep) leaves it alone.
+    bool sotc_gpu_copied{};
     /// sotc: host bytes this full chain would save as a mip tail (census "projected" only).
     u64 sotc_shadow_saving{};
     u64 general_epoch{~0ull}; // sotc: fence epoch of the last GENERAL->GENERAL barrier

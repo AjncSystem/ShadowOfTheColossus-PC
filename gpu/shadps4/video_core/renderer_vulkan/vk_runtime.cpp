@@ -4,6 +4,7 @@
 #include "video_core/sotc_stats.h"
 #include <algorithm>
 #include "common/alignment.h"
+#include "bbport_toggles.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -330,6 +331,7 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
         VideoCore::MarkGpuModified(*dst, false); // sotc: see the copy fast path in the rasterizer
     }
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+    dst->sotc_gpu_copied = true; // sotc: ColdImageSweep must not free it (content is not a plain upload)
 }
 
 void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
@@ -392,6 +394,7 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
         VideoCore::MarkGpuModified(*dst, false); // sotc: see the copy fast path in the rasterizer
     }
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+    dst->sotc_gpu_copied = true; // sotc: ColdImageSweep must not free it (content is not a plain upload)
 }
 
 void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32 slice) {
@@ -446,6 +449,7 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
         VideoCore::MarkGpuModified(*dst, false); // sotc: see the copy fast path in the rasterizer
     }
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+    dst->sotc_gpu_copied = true; // sotc: ColdImageSweep must not free it (content is not a plain upload)
 }
 
 void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
@@ -728,6 +732,25 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 
 
 void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
                            vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access) {
+    // sotc: BbToggle::DrawBindMemo (SOTC_ACCESS_MEMO=0 off): the same access again within one
+    // barrier epoch is a no-op (see access_memos).
+    static const bool memo_enabled = [] {
+        const char* v = std::getenv("SOTC_ACCESS_MEMO");
+        return !v || v[0] != '0';
+    }();
+    AccessMemo* memo = nullptr;
+    if (memo_enabled && !BbToggle::Disabled(BbToggle::DrawBindMemo)) {
+        const u64 hash = (reinterpret_cast<uintptr_t>(handle) * 0x9E3779B97F4A7C15ULL) ^
+                         (offset * 0xC2B2AE3D27D4EB4FULL) ^ (size * 0x165667B19E3779F9ULL);
+        memo = &access_memos[(hash ^ (hash >> 32)) % NumAccessMemos];
+        if (memo->epoch == access_epoch && memo->handle == handle && memo->offset == offset &&
+            memo->size == size && memo->stage == u64{static_cast<VkFlags64>(src_stage)} &&
+            memo->access == u64{static_cast<VkFlags64>(src_access)}) {
+            return;
+        }
+        *memo = {handle, offset, size, static_cast<VkFlags64>(src_stage),
+                 static_cast<VkFlags64>(src_access), access_epoch};
+    }
     MakeCurrent(handle);
 
     const Interval range = {
@@ -800,6 +823,7 @@ void Runtime::FlushBarriers() {
     }
     active_resources = 0;
     resource = nullptr;
+    ++access_epoch; // sotc: the range lists are empty again (access_memos)
 }
 
 void Runtime::MakeCurrent(const VideoCore::Buffer* handle) {

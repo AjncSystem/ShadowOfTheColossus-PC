@@ -532,6 +532,12 @@ Presenter::~Presenter() {
     draw_scheduler.Finish();
     present_scheduler.Finish();
     flip_scheduler.Finish();
+
+    // sotc: the FSR 3 context, its colour images, the 16 depth images (up to ~130 MB at 1080p) and
+    // the depth pipeline. The schedulers are finished above, so no frame in flight uses them, and
+    // the device is destroyed after this presenter.
+    FsrFg::Shutdown();
+
     Check(draw_scheduler.CommandBuffer().reset());
     Check(present_scheduler.CommandBuffer().reset());
     Check(flip_scheduler.CommandBuffer().reset());
@@ -957,6 +963,11 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+    // sotc: FSR 3 resources after leaving its mode (F8, vk_framegen.cpp): freed here, on the
+    // present thread, once the frames in flight that may still use them are presented; and the
+    // depth pipeline back when FSR 3 is enabled again (vk_fsrfg.h).
+    FsrFg::Update(FrameGen::Current() == FrameGen::Mode::Fsr);
+
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {

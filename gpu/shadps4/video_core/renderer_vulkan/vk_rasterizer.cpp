@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
+#include <atomic>
+#include <span>
 #include <chrono>
 #include <cstdio>
 #include <map>
+#include <string>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -36,10 +39,13 @@
 #include "video_core/buffer_cache/region_manager.h"
 #include "video_core/sotc_live.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "bbport_toggles.h"
 #include "video_core/sotc_stats.h"
+#include "video_core/sotc_opstats.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
+#include "video_core/renderer_vulkan/sotc_dispphase.h" // sotc: SOTC_DISP_PHASES
 #include "video_core/renderer_vulkan/vk_framegen.h"
 // After vk_common.h (via the headers above), which sets the Vulkan header defines first.
 #include <vk_mem_alloc.h>
@@ -57,6 +63,825 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     push_data.yoffset = regs.viewport_control.yoffset_enable ? regs.viewports[0].yoffset : 0.f;
     push_data.yscale = regs.viewport_control.yscale_enable ? regs.viewports[0].yscale : 1.f;
     return push_data;
+}
+
+// sotc: SOTC_DRAW_PHASES (see vk_rasterizer.h).
+namespace DrawPhase {
+enum Phase : u32 {
+    Pre,      // pop pending ops, filters, pipeline resolve, stats
+    Prep,     // PrepareRenderState
+    BindBuf,  // BindBuffers (all stages)
+    BindTex,  // BindTextures (all stages)
+    BindRest, // rest of BindResources (set_writes resize, DMA, checks)
+    Begin,    // BeginRendering
+    Refresh,  // RefreshImageLayouts
+    VtxIdx,   // vertex and index buffers
+    Args,     // indirect args read, barriers
+    PipeBind, // pipeline->BindResources (push constants + descriptor push)
+    Dyn,      // UpdateDynamicState
+    Sched,    // scheduler.BeginRendering, bindPipeline, draw
+    Post,     // ResetBindings + FlushPeriodic
+    NumPhases,
+};
+static constexpr const char* kNames[NumPhases] = {"pre",  "prep", "bbuf", "btex", "brest", "begin", "refresh",
+                                                  "vtx",  "args", "pipe", "dyn",  "sched", "post"};
+// sotc: finer laps inside the phases above (SOTC_DRAW_PHASES only, docs/sotc/DEPTH-FASTPATH.md): each
+// Sub(k) takes the time since the previous Mark or Sub, so the subs of a phase partition it up to
+// the stretch after its last sub (left in the phase total).
+enum SubPhase : u32 {
+    SPop,       // pre: scheduler.PopPendingOperations
+    SFilter,    // pre: TracePass, FilterDraw, SkipStaggeredShadow, ReuseShadowCascade
+    SPrepLock,  // prep: BatchLock
+    SPrepCmp,   // prep: render target memo comparison
+    SBrCheck,   // brest: compute-copy checks, user data check, set_writes clears
+    SBrUser,    // brest: MakeUserData
+    SBbFlat,    // bbuf: special buffers (flat buffer copy into the stream buffer)
+    SBbClamp,   // bbuf: ClampRangeSize
+    SBbObt,     // bbuf: ObtainBuffer
+    SBbDesc,    // bbuf: descriptor, push offset, bound_buffers, IsBufferAccessed
+    SBtPre,     // btex: lock and memo prelude
+    SBtMemo,    // btex: T# hash, memo lookup and replay (ReplayTexBindMemo: BindResolvedImage per image)
+    SBtImages,  // btex: first/second pass of a stage the memo did not replay, memo store, set_writes
+    SBegLock,   // begin: BatchLock
+    SBegFind,   // begin: FindDepthTarget
+    SBegMeta,   // begin: htile TestAndTouchMeta
+    SBegTrans,  // begin: Transit and the rest of the depth attachment
+    SViInput,   // vtx: GetVertexInputs, input memo, setVertexInput
+    SViObt,     // vtx: vertex buffer ranges (ObtainBuffer, IsBufferAccessed)
+    SViBind,    // vtx: host arrays and bindVertexBuffers
+    SIbuf,      // idx: BindIndexBuffer
+    SPipePush,  // pipe: pushConstants thunk
+    SPipeDesc,  // pipe: descriptor push thunk
+    SDynCheck,  // dyn: memo test
+    SDynCommit, // dyn: dynamic_state.Commit (thunks of changed state)
+    SSchBegin,  // sched: scheduler.BeginRendering
+    SSchBind,   // sched: bindPipeline
+    SSchDraw,   // sched: drawIndexed, DebugState
+    SPostReset, // post: ResetBindings
+    SPostFlush, // post: FlushPeriodic
+    NumSubs,
+};
+static constexpr const char* kSubNames[NumSubs] = {
+    "pop",     "filter",  "prepLock", "prepCmp", "brCheck", "brUser",  "bbFlat",  "bbClamp",
+    "bbObt",   "bbDesc",  "btPre",    "btMemo", "btImages", "begLock", "begFind", "begMeta", "begTrans", "viInput",
+    "viObt",   "viBind",  "ibuf",     "pipePush", "pipeDesc", "dynCheck", "dynCommit", "schBegin",
+    "schBind", "schDraw", "postReset", "postFlush"};
+struct Totals {
+    u64 draws{};
+    std::array<u64, NumPhases> ticks{};
+    std::array<u64, NumSubs> sub{};
+    u64 same_push{}, same_writes{}, same_state{}, same_pipeline{}, writes_n{};
+};
+static std::array<Totals, 3> totals;
+static u64 op_ticks, op_ops, op_chunks, op_dwords;
+static std::array<u64, 8> lap_ticks;
+static u64 lap_draws;
+thread_local u64 lap_last = 0;
+std::atomic<u64> dyn_hits, dyn_misses;
+static std::atomic<u64> cp_ticks[3], cp_n;
+static u64 last_tsc, last_ns;
+thread_local struct Scope* cur = nullptr;
+
+struct Scope {
+    u64 last{};
+    u64 sub_last{};
+    std::array<u64, NumPhases> t{};
+    std::array<u64, NumSubs> s{};
+    bool active{};
+    Scope() {
+        if (kOn) {
+            active = true;
+            cur = this;
+            last = Now();
+            sub_last = last;
+        }
+    }
+    ~Scope() {
+        if (active) {
+            cur = nullptr;
+        }
+    }
+    void Mark(Phase p) {
+        if (active) {
+            const u64 now = Now();
+            t[p] += now - last;
+            last = now;
+            sub_last = now;
+        }
+    }
+    void Sub(SubPhase k) {
+        if (active) {
+            const u64 now = Now();
+            s[k] += now - sub_last;
+            sub_last = now;
+        }
+    }
+    void Skip() { // time that belongs to nobody (the statistics themselves)
+        if (active) {
+            last = Now();
+        }
+    }
+    void Finish(u32 cls, bool same_push, bool same_writes, bool same_state, bool same_pipeline,
+                u32 writes) {
+        if (!active) {
+            return;
+        }
+        Totals& tot = totals[cls];
+        ++tot.draws;
+        for (u32 i = 0; i < NumPhases; ++i) {
+            tot.ticks[i] += t[i];
+        }
+        for (u32 i = 0; i < NumSubs; ++i) {
+            tot.sub[i] += s[i];
+        }
+        tot.same_push += same_push;
+        tot.same_writes += same_writes;
+        tot.same_state += same_state;
+        tot.same_pipeline += same_pipeline;
+        tot.writes_n += writes;
+        const u64 all = totals[0].draws + totals[1].draws + totals[2].draws;
+        if (all >= 32768) {
+            const u64 tsc = Now();
+            const u64 ns = SotcStats::NowNs();
+            const double per_us = last_ns ? double(tsc - last_tsc) / (double(ns - last_ns) / 1000.0)
+                                          : 3000.0; // ticks per microsecond
+            last_tsc = tsc;
+            last_ns = ns;
+            static const char* const cls_names[3] = {"depth-only", "gbuffer", "other"};
+            for (u32 c = 0; c < 3; ++c) {
+                const Totals& x = totals[c];
+                if (x.draws == 0) {
+                    continue;
+                }
+                const double n = double(x.draws);
+                char line[512];
+                int at = std::snprintf(line, sizeof(line), "SOTC DRAWPHASE %s n=%llu us/draw:",
+                                       cls_names[c], static_cast<unsigned long long>(x.draws));
+                u64 sum = 0;
+                for (u32 i = 0; i < NumPhases; ++i) {
+                    sum += x.ticks[i];
+                    at += std::snprintf(line + at, sizeof(line) - at, " %s=%.2f", kNames[i],
+                                        double(x.ticks[i]) / n / per_us);
+                }
+                std::snprintf(line + at, sizeof(line) - at,
+                              " total=%.2f | same%%: push=%.0f writes=%.0f rstate=%.0f pipe=%.0f "
+                              "(writes/draw %.1f)",
+                              double(sum) / n / per_us, 100.0 * x.same_push / n,
+                              100.0 * x.same_writes / n, 100.0 * x.same_state / n,
+                              100.0 * x.same_pipeline / n, double(x.writes_n) / n);
+                std::fprintf(stderr, "%s\n", line);
+                char subline[768];
+                int at3 = std::snprintf(subline, sizeof(subline), "SOTC DRAWPHASE %s sub us/draw:",
+                                        cls_names[c]);
+                for (u32 i = 0; i < NumSubs; ++i) {
+                    at3 += std::snprintf(subline + at3, sizeof(subline) - at3, " %s=%.3f",
+                                         kSubNames[i], double(x.sub[i]) / n / per_us);
+                }
+                std::fprintf(stderr, "%s\n", subline);
+            }
+            {
+                char split[256];
+                int at2 = std::snprintf(split, sizeof(split), "SOTC DRAWPHASE begin split us/draw:");
+                static const char* const lap_names[7] = {"find+update", "samples", "findrt", "meta",
+                                                         "transit",     "colorrest", "depth"};
+                for (u32 k = 0; k < 7; ++k) {
+                    at2 += std::snprintf(split + at2, sizeof(split) - at2, " %s=%.2f", lap_names[k],
+                                         lap_draws ? double(lap_ticks[k]) / double(lap_draws) / per_us
+                                                   : 0.0);
+                }
+                std::fprintf(stderr, "%s (%llu draws)\n", split,
+                             static_cast<unsigned long long>(lap_draws));
+                lap_ticks.fill(0);
+                lap_draws = 0;
+            }
+            const u64 cpn = cp_n.load(std::memory_order_relaxed);
+            std::fprintf(stderr,
+                         "SOTC DRAWPHASE dyn memo %llu hits, %llu misses\n"
+                         "SOTC DRAWPHASE op prefix %.2f us/op (%.2f chunks, %.1f dwords per op, %llu ops); CP per "
+                         "draw: lookup %.2f alloc %.2f capture %.2f us (%llu draws); %.0f MHz\n",
+                         static_cast<unsigned long long>(dyn_hits.exchange(0)),
+                         static_cast<unsigned long long>(dyn_misses.exchange(0)),
+                         op_ops ? double(op_ticks) / double(op_ops) / per_us : 0.0,
+                         op_ops ? double(op_chunks) / double(op_ops) : 0.0,
+                         op_ops ? double(op_dwords) / double(op_ops) : 0.0,
+                         static_cast<unsigned long long>(op_ops),
+                         cpn ? double(cp_ticks[0].load()) / double(cpn) / per_us : 0.0,
+                         cpn ? double(cp_ticks[1].load()) / double(cpn) / per_us : 0.0,
+                         cpn ? double(cp_ticks[2].load()) / double(cpn) / per_us : 0.0,
+                         static_cast<unsigned long long>(cpn), per_us);
+            for (auto& x : totals) {
+                x = {};
+            }
+            op_ticks = op_ops = op_chunks = op_dwords = 0;
+            cp_ticks[0] = cp_ticks[1] = cp_ticks[2] = 0;
+            cp_n = 0;
+        }
+    }
+};
+void AddOpPrefix(u64 ticks, u32 chunks, u32 dwords) {
+    op_ticks += ticks;
+    op_chunks += chunks;
+    op_dwords += dwords;
+    ++op_ops;
+}
+void AddCp(u32 what, u64 ticks) {
+    cp_ticks[what].fetch_add(ticks, std::memory_order_relaxed);
+    if (what == 2) {
+        cp_n.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+static u32 ClassOf(u32 mrt_mask) {
+    return mrt_mask == 0 ? 0 : (mrt_mask & 0x10) ? 1 : 2;
+}
+inline void Mark(Phase p) {
+    if (kOn && cur) {
+        cur->Mark(p);
+    }
+}
+inline void Sub(SubPhase k) {
+    if (kOn && cur) {
+        cur->Sub(k);
+    }
+}
+void SubPipe(unsigned which) { // called from Pipeline::BindResources (vk_pipeline_common.cpp)
+    Sub(which == 0 ? SPipePush : SPipeDesc);
+}
+/// BeginRendering split (per draw, summed over its attachments): SOTC_DRAW_PHASES only.
+/// sotc: SOTC_DRAW_LAPS=0 takes the laps (and the begin subs) out: they are ~40 rdtsc reads per
+/// G-buffer draw, a large part of what the `begin` phase measures (docs/sotc/GBUFFER-FASTPATH.md).
+inline const bool kLaps = kOn && [] {
+    const char* v = std::getenv("SOTC_DRAW_LAPS");
+    return !v || v[0] != '0';
+}();
+inline void SubBeg(SubPhase k) {
+    if (kLaps) {
+        Sub(k);
+    }
+}
+inline void LapStart() {
+    if (kLaps) {
+        lap_last = Now();
+        ++lap_draws;
+    }
+}
+inline void Lap(u32 k) {
+    if (kLaps) {
+        const u64 now = Now();
+        lap_ticks[k] += now - lap_last;
+        lap_last = now;
+    }
+}
+
+/// sotc: BbToggle::DepthFastPath counters (draw thread only) and the SOTC_DEPTHFAST_VERIFY=1 switch
+/// (every replay is also computed in full and compared; a mismatch is counted and the full result
+/// is used). One "SOTC DEPTHFAST" line per ~1M draws.
+namespace DepthFastStats {
+inline const bool kVerify = [] {
+    const char* v = std::getenv("SOTC_DEPTHFAST_VERIFY");
+    return v && v[0] == '1';
+}();
+struct Counters {
+    u64 draws{};
+    u64 prep_hit{}, prep_miss{}, prep_old_only{}, prep_verify{}, prep_bad{};
+    u64 begin_cand{}, begin_hit{}, begin_record{}, begin_norecord{}, begin_verify{}, begin_bad{};
+    std::array<u64, 12> cause{};
+    std::array<u64, 9> why{}; ///< SOTC_DEPTHFAST_WHY: which depth side register differs
+    u64 dyn_hit{}, dyn_miss{}, dyn_verify{}, dyn_bad{};
+    // sotc: BbToggle::GBufferFastPath (GBufferFast): candidates (draws with colour targets), hits
+    // (check passed), recorded / not recorded (and why), per cause, verify totals.
+    u64 gb_cand{}, gb_hit{}, gb_record{}, gb_norecord{}, gb_verify{}, gb_bad{}, gb_count_bad{};
+    std::array<u64, 16> gb_cause{};
+    std::array<u64, 8> gb_norec{};
+    // sotc: BbToggle::TexBindFastPath: memoized texture bindings checked / replayed / why not.
+    u64 bt_cand{}, bt_hit{}, bt_verify{}, bt_bad{}, bt_count_bad{};
+    std::array<u64, 8> bt_cause{};
+};
+inline Counters c;
+inline const bool kGbCount = [] { // SOTC_GBFAST_MODE=count: check and record, never replay
+    const char* v = std::getenv("SOTC_GBFAST_MODE");
+    return v && std::strcmp(v, "count") == 0;
+}();
+inline const char* const kGbCause[16] = {"hit",   "nomemo", "mask",   "regs",  "ids",  "gen",
+                                         "gpuepoch", "meta", "flags", "bound", "backing", "transit",
+                                         "vo",    "dflags", "dbacking", "dtransit"};
+inline const bool kBtCount = [] { // SOTC_BTFAST_MODE=count: check, never replay
+    const char* v = std::getenv("SOTC_BTFAST_MODE");
+    return v && std::strcmp(v, "count") == 0;
+}();
+inline const char* const kBtCause[8] = {"hit", "nofast", "id", "special", "backing", "update", "transit", "-"};
+inline const char* const kGbNoRec[8] = {"clear", "feedback", "image", "vo", "depth", "transit", "samples", "-"};
+inline const bool kWhy = [] {
+    const char* v = std::getenv("SOTC_DEPTHFAST_WHY");
+    return v && v[0] == '1';
+}();
+inline const char* const kWhyNames[9] = {"depth_control", "depth_buffer", "depth_render_control",
+                                         "color_control", "depth_view",   "htile",
+                                         "depth_clear",   "stencil_clear", "db_extent"};
+inline const char* const kCause[12] = {"hit",  "nomemo", "regs",  "image", "gen",  "gpuepoch",
+                                       "meta", "flags",  "backing", "transit", "-", "-"};
+inline void Report() {
+    char line[768];
+    int at = std::snprintf(
+        line, sizeof(line),
+        "SOTC DEPTHFAST draws %llu | prep hit %llu miss %llu (old-only %llu) | begin cand %llu hit "
+        "%llu (%.1f%%) recorded %llu not-recorded %llu | dyn hit %llu miss %llu |",
+        static_cast<unsigned long long>(c.draws), static_cast<unsigned long long>(c.prep_hit),
+        static_cast<unsigned long long>(c.prep_miss),
+        static_cast<unsigned long long>(c.prep_old_only),
+        static_cast<unsigned long long>(c.begin_cand),
+        static_cast<unsigned long long>(c.begin_hit),
+        c.begin_cand ? 100.0 * double(c.begin_hit) / double(c.begin_cand) : 0.0,
+        static_cast<unsigned long long>(c.begin_record),
+        static_cast<unsigned long long>(c.begin_norecord),
+        static_cast<unsigned long long>(c.dyn_hit), static_cast<unsigned long long>(c.dyn_miss));
+    for (u32 i = 1; i < 10; ++i) {
+        at += std::snprintf(line + at, sizeof(line) - at, " %s %llu", kCause[i],
+                            static_cast<unsigned long long>(c.cause[i]));
+    }
+    if (kWhy) {
+        at += std::snprintf(line + at, sizeof(line) - at, " | why-regs");
+        for (u32 i = 0; i < 9; ++i) {
+            at += std::snprintf(line + at, sizeof(line) - at, " %s %llu", kWhyNames[i],
+                                static_cast<unsigned long long>(c.why[i]));
+        }
+    }
+    if (kVerify) {
+        at += std::snprintf(line + at, sizeof(line) - at,
+                            " | VERIFY prep %llu bad %llu, begin %llu bad %llu, dyn %llu bad %llu",
+                            static_cast<unsigned long long>(c.prep_verify),
+                            static_cast<unsigned long long>(c.prep_bad),
+                            static_cast<unsigned long long>(c.begin_verify),
+                            static_cast<unsigned long long>(c.begin_bad),
+                            static_cast<unsigned long long>(c.dyn_verify),
+                            static_cast<unsigned long long>(c.dyn_bad));
+    }
+    std::fprintf(stderr, "%s\n", line);
+    {
+        char gb[768];
+        int g = std::snprintf(gb, sizeof(gb),
+                              "SOTC GBFAST cand %llu hit %llu (%.1f%%) recorded %llu not-recorded %llu |",
+                              static_cast<unsigned long long>(c.gb_cand),
+                              static_cast<unsigned long long>(c.gb_hit),
+                              c.gb_cand ? 100.0 * double(c.gb_hit) / double(c.gb_cand) : 0.0,
+                              static_cast<unsigned long long>(c.gb_record),
+                              static_cast<unsigned long long>(c.gb_norecord));
+        for (u32 i = 1; i < 16; ++i) {
+            g += std::snprintf(gb + g, sizeof(gb) - g, " %s %llu", kGbCause[i],
+                               static_cast<unsigned long long>(c.gb_cause[i]));
+        }
+        g += std::snprintf(gb + g, sizeof(gb) - g, " | norec");
+        for (u32 i = 0; i < 7; ++i) {
+            g += std::snprintf(gb + g, sizeof(gb) - g, " %s %llu", kGbNoRec[i],
+                               static_cast<unsigned long long>(c.gb_norec[i]));
+        }
+        if (kGbCount) {
+            g += std::snprintf(gb + g, sizeof(gb) - g, " | COUNT state-differs %llu",
+                               static_cast<unsigned long long>(c.gb_count_bad));
+        }
+        if (kVerify) {
+            g += std::snprintf(gb + g, sizeof(gb) - g, " | VERIFY %llu bad %llu",
+                               static_cast<unsigned long long>(c.gb_verify),
+                               static_cast<unsigned long long>(c.gb_bad));
+        }
+        std::fprintf(stderr, "%s\n", gb);
+    }
+    {
+        char bt[512];
+        int b = std::snprintf(bt, sizeof(bt), "SOTC BTFAST cand %llu hit %llu (%.1f%%) |",
+                              static_cast<unsigned long long>(c.bt_cand),
+                              static_cast<unsigned long long>(c.bt_hit),
+                              c.bt_cand ? 100.0 * double(c.bt_hit) / double(c.bt_cand) : 0.0);
+        for (u32 i = 1; i < 7; ++i) {
+            b += std::snprintf(bt + b, sizeof(bt) - b, " %s %llu", kBtCause[i],
+                               static_cast<unsigned long long>(c.bt_cause[i]));
+        }
+        if (kBtCount) {
+            b += std::snprintf(bt + b, sizeof(bt) - b, " | COUNT infos-differ %llu",
+                               static_cast<unsigned long long>(c.bt_count_bad));
+        }
+        if (kVerify) {
+            b += std::snprintf(bt + b, sizeof(bt) - b, " | VERIFY %llu bad %llu",
+                               static_cast<unsigned long long>(c.bt_verify),
+                               static_cast<unsigned long long>(c.bt_bad));
+        }
+        std::fprintf(stderr, "%s\n", bt);
+    }
+    // The verify totals are cumulative, the rest are per interval.
+    const auto keep = c;
+    c = {};
+    c.gb_verify = keep.gb_verify;
+    c.gb_bad = keep.gb_bad;
+    c.bt_verify = keep.bt_verify;
+    c.bt_bad = keep.bt_bad;
+    if (kVerify) {
+        c.prep_verify = keep.prep_verify;
+        c.prep_bad = keep.prep_bad;
+        c.begin_verify = keep.begin_verify;
+        c.begin_bad = keep.begin_bad;
+        c.dyn_verify = keep.dyn_verify;
+        c.dyn_bad = keep.dyn_bad;
+    }
+}
+inline void NoteDraw() {
+    if ((++c.draws & 0xFFFFF) == 0) {
+        Report();
+    }
+}
+} // namespace DepthFastStats
+
+/// SOTC_SHADOW_PROBE=1 (diagnostic, no behaviour change): is a sun shadow cascade slice's draw
+/// stream, as the draw thread sees it (pipeline, push constants, descriptor writes and infos,
+/// render state, indirect arguments), the same as in an earlier frame? A necessary condition for
+/// skipping the slice; the contents of the bound buffers are not part of it. Printed every 300
+/// frames: per slice, draws per frame and frames equal to the previous one / to one of the 4
+/// frames before.
+struct ShadowProbe {
+    static constexpr u32 kSlices = 8, kHist = 5;
+    u64 frame_seen = ~0ull;
+    std::array<u64, kSlices> cur_hash{}, cur_n{};
+    std::array<std::array<u64, kHist>, kSlices> hist{};
+    std::array<std::array<u64, kHist>, kSlices> hist_n{};
+    std::array<u64, kSlices> frames{}, eq_prev{}, eq_any{}, draws{}, eq_prev_draws{};
+    u64 prev_frame_total = 0;
+};
+inline void Fnv(u64& h, const void* data, size_t bytes) {
+    const auto* p = static_cast<const u8*>(data);
+    for (size_t i = 0; i + 8 <= bytes; i += 8) {
+        u64 w;
+        std::memcpy(&w, p + i, 8);
+        h = (h ^ w) * 0x100000001b3ull;
+        h ^= h >> 29;
+    }
+    for (size_t i = bytes & ~size_t{7}; i < bytes; ++i) {
+        h = (h ^ p[i]) * 0x100000001b3ull;
+    }
+}
+}
+template <typename Regs, typename Writes, typename BufInfos, typename ImgInfos>
+static void ShadowProbeNote(const Regs& regs, const void* pipeline, const Writes& writes,
+                            const BufInfos& buf_infos, const ImgInfos& img_infos,
+                            const Shader::PushData& push, const RenderState& state,
+                            const void* args, size_t args_bytes) {
+    static const bool on = std::getenv("SOTC_SHADOW_PROBE") != nullptr;
+    if (!on || !regs.depth_buffer.DepthValid() ||
+        regs.depth_buffer.Pitch() != regs.depth_buffer.Height() || regs.depth_buffer.Pitch() < 512) {
+        return;
+    }
+    static DrawPhase::ShadowProbe s;
+    const u64 frame = SotcStats::flip_count.load(std::memory_order_relaxed);
+    if (frame != s.frame_seen) {
+        if (s.frame_seen != ~0ull) {
+            for (u32 sl = 0; sl < DrawPhase::ShadowProbe::kSlices; ++sl) {
+                if (s.cur_n[sl] == 0) {
+                    continue;
+                }
+                auto& h = s.hist[sl];
+                auto& hn = s.hist_n[sl];
+                ++s.frames[sl];
+                s.draws[sl] += s.cur_n[sl];
+                bool any = false;
+                for (u32 k = 0; k < DrawPhase::ShadowProbe::kHist; ++k) {
+                    any |= h[k] == s.cur_hash[sl] && hn[k] == s.cur_n[sl];
+                }
+                if (h[0] == s.cur_hash[sl] && hn[0] == s.cur_n[sl]) {
+                    ++s.eq_prev[sl];
+                    s.eq_prev_draws[sl] += s.cur_n[sl];
+                }
+                s.eq_any[sl] += any;
+                for (u32 k = DrawPhase::ShadowProbe::kHist - 1; k > 0; --k) {
+                    h[k] = h[k - 1];
+                    hn[k] = hn[k - 1];
+                }
+                h[0] = s.cur_hash[sl];
+                hn[0] = s.cur_n[sl];
+            }
+            if (s.frame_seen % 300 == 0) {
+                for (u32 sl = 0; sl < DrawPhase::ShadowProbe::kSlices; ++sl) {
+                    if (s.frames[sl]) {
+                        std::fprintf(stderr,
+                                     "SOTC SHADOW PROBE slice %u: %.0f draws/frame, stream equal "
+                                     "to previous frame %llu/%llu, to one of 5 before %llu/%llu\n",
+                                     sl, double(s.draws[sl]) / double(s.frames[sl]),
+                                     static_cast<unsigned long long>(s.eq_prev[sl]),
+                                     static_cast<unsigned long long>(s.frames[sl]),
+                                     static_cast<unsigned long long>(s.eq_any[sl]),
+                                     static_cast<unsigned long long>(s.frames[sl]));
+                    }
+                }
+                s.frames.fill(0);
+                s.eq_prev.fill(0);
+                s.eq_any.fill(0);
+                s.draws.fill(0);
+                s.eq_prev_draws.fill(0);
+            }
+        }
+        s.cur_hash.fill(0xcbf29ce484222325ull);
+        s.cur_n.fill(0);
+        s.frame_seen = frame;
+    }
+    const u32 sl = regs.depth_view.slice_start & 7;
+    u64& h = s.cur_hash[sl];
+    DrawPhase::Fnv(h, &pipeline, sizeof(pipeline));
+    DrawPhase::Fnv(h, &push, sizeof(push));
+    DrawPhase::Fnv(h, writes.data(), writes.size() * sizeof(*writes.data()));
+    DrawPhase::Fnv(h, buf_infos.data(), buf_infos.size() * sizeof(*buf_infos.data()));
+    DrawPhase::Fnv(h, img_infos.data(), img_infos.size() * sizeof(*img_infos.data()));
+    DrawPhase::Fnv(h, &state, sizeof(state));
+    DrawPhase::Fnv(h, args, args_bytes);
+    ++s.cur_n[sl];
+}
+namespace DrawPhase {
+/// Diagnostics: is this draw's push data / descriptor writes / render state / pipeline the same
+/// as the previous graphics draw's?
+template <typename Writes, typename BufInfos, typename ImgInfos>
+static void Finish(Scope& ph, const GraphicsPipeline* pipeline, const Writes& writes,
+                   const BufInfos& buf_infos, const ImgInfos& img_infos,
+                   const Shader::PushData& push, const RenderState& state) {
+    if (!kOn) {
+        return;
+    }
+    static Shader::PushData prev_push{};
+    static std::vector<u8> prev_writes, prev_bufs, prev_imgs;
+    static RenderState prev_state{};
+    static const GraphicsPipeline* prev_pipeline = nullptr;
+    const auto bytes = [](const auto& c) {
+        return std::span<const u8>{reinterpret_cast<const u8*>(c.data()),
+                                   c.size() * sizeof(*c.data())};
+    };
+    const auto w = bytes(writes), b = bytes(buf_infos), i = bytes(img_infos);
+    const bool same_push = std::memcmp(&prev_push, &push, sizeof(push)) == 0;
+    const bool same_writes =
+        prev_writes.size() == w.size() && prev_bufs.size() == b.size() &&
+        prev_imgs.size() == i.size() && std::memcmp(prev_writes.data(), w.data(), w.size()) == 0 &&
+        std::memcmp(prev_bufs.data(), b.data(), b.size()) == 0 &&
+        std::memcmp(prev_imgs.data(), i.data(), i.size()) == 0;
+    const bool same_state = prev_state == state;
+    const bool same_pipeline = prev_pipeline == pipeline;
+    prev_push = push;
+    prev_writes.assign(w.begin(), w.end());
+    prev_bufs.assign(b.begin(), b.end());
+    prev_imgs.assign(i.begin(), i.end());
+    prev_state = state;
+    prev_pipeline = pipeline;
+    ph.Finish(ClassOf(pipeline->GetGraphicsKey().mrt_mask), same_push, same_writes, same_state,
+              same_pipeline, static_cast<u32>(writes.size()));
+}
+} // namespace DrawPhase
+
+// sotc: SOTC_OP_STATS=1 (sotc_opstats.h): what one recorded draw looks like to the op composition
+// counters. Called once per issued draw after its descriptors are built (before they are reset).
+template <typename Regs, typename BufInfos, typename ImgInfos>
+static void OpStatsNoteDraw(const Regs& regs, const GraphicsPipeline* pipeline,
+                            const RenderState& state, const BufInfos& buf_infos,
+                            const ImgInfos& img_infos, const Shader::PushData& push, bool indexed,
+                            bool gpu_args, u32 count, u32 instances, u32 first_index,
+                            u32 vertex_offset, u32 first_instance) {
+    using SotcOps::Mix;
+    using SotcOps::MixBytes;
+    SotcOps::DrawNote n{};
+    n.indexed = indexed;
+    n.gpu_args = gpu_args;
+    u32 num_color = 0;
+    u64 pass = 0x70617373;
+    for (u32 i = 0; i < state.num_color_attachments; ++i) {
+        const u64 view = std::bit_cast<u64>(state.color_attachments[i].image_view);
+        num_color += view != 0;
+        pass = Mix(pass, view);
+    }
+    const u64 depth_view = std::bit_cast<u64>(state.depth_stencil_attachment.image_view);
+    pass = Mix(pass, depth_view);
+    n.kind = (num_color && depth_view) ? SotcOps::KindColorDepth
+             : depth_view              ? SotcOps::KindDepthOnly
+             : num_color               ? SotcOps::KindColor
+                                       : SotcOps::KindNone;
+    n.num_color = num_color;
+    n.pass_key = pass;
+    n.depth_addr = regs.depth_buffer.DepthValid() ? regs.depth_buffer.DepthWriteAddress() : 0;
+    n.slice = regs.depth_view.slice_start;
+    n.width = state.width;
+    n.height = state.height;
+    n.shadow = n.kind == SotcOps::KindDepthOnly && regs.depth_buffer.DepthValid() &&
+               regs.depth_buffer.Pitch() == regs.depth_buffer.Height() &&
+               regs.depth_buffer.Pitch() >= 512;
+    n.count = count;
+    n.instances = instances;
+    n.first_index = first_index;
+    n.vertex_offset = vertex_offset;
+    n.first_instance = first_instance;
+    n.n_buf = static_cast<u32>(buf_infos.size());
+    n.n_img = static_cast<u32>(img_infos.size());
+    u64 h = Mix(reinterpret_cast<uintptr_t>(pipeline), 1);
+    h = MixBytes(h, &state, sizeof(state));
+    n.h_pipe = h;
+    u64 d = Mix(h, 2);
+    d = MixBytes(d, img_infos.data(), img_infos.size() * sizeof(*img_infos.data()));
+    for (const auto& b : buf_infos) {
+        d = Mix(d, std::bit_cast<u64>(b.buffer));
+    }
+    d = MixBytes(d, &push, 4 * sizeof(float)); // viewport transform, no buffer offsets
+    d = Mix(d, SotcOps::vb_desc);
+    d = Mix(d, SotcOps::ib_desc);
+    n.h_desc = d;
+    u64 e = Mix(d, 3);
+    e = MixBytes(e, buf_infos.data(), buf_infos.size() * sizeof(*buf_infos.data()));
+    e = MixBytes(e, push.buf_offsets.data(), push.buf_offsets.size());
+    e = Mix(e, SotcOps::vb_exact);
+    e = Mix(e, SotcOps::ib_exact);
+    n.h_exact = e;
+    u64 a = Mix(count, instances);
+    a = Mix(a, (u64{first_index} << 32) | vertex_offset);
+    a = Mix(a, first_instance);
+    n.h_args = a;
+    u64 t = Mix(h, 4);
+    t = MixBytes(t, img_infos.data(), img_infos.size() * sizeof(*img_infos.data()));
+    t = Mix(t, SotcOps::vb_exact);
+    t = Mix(t, SotcOps::ib_exact);
+    t = Mix(t, a);
+    n.h_stat = t;
+    // sotc: depth pre-pass analysis (docs/sotc/ESCENA-TEMPLO.md): the raw state of the draw.
+    const auto raw32 = [](const auto& reg) {
+        u32 v = 0;
+        std::memcpy(&v, &reg, std::min<size_t>(sizeof(reg), sizeof(v)));
+        return v;
+    };
+    n.dctl = raw32(regs.depth_control);
+    n.sctl = raw32(regs.stencil_control);
+    n.dsc = raw32(regs.depth_shader_control);
+    n.pctl = raw32(regs.polygon_control);
+    n.rctl = raw32(regs.depth_render_control);
+    n.rovr = raw32(regs.depth_render_override);
+    n.cctl = raw32(regs.color_control);
+    n.sref_f = raw32(regs.stencil_ref_front);
+    n.sref_b = raw32(regs.stencil_ref_back);
+    n.bias = regs.polygon_control.NeedsBias();
+    n.depth_read_addr = regs.depth_buffer.DepthAddress();
+    n.depth_write_addr = regs.depth_buffer.DepthWriteAddress();
+    n.depth_pitch = regs.depth_buffer.Pitch();
+    n.depth_height = regs.depth_buffer.Height();
+    {
+        const auto& key = pipeline->GetGraphicsKey();
+        n.mrt_mask = key.mrt_mask;
+        n.num_samples = key.num_samples;
+        n.depth_samples = key.depth_samples;
+        for (u32 i = 0; i < AmdGpu::NUM_COLOR_BUFFERS; ++i) {
+            n.wmask |= (static_cast<u32>(key.write_masks[i]) & 0xF) << (4 * i);
+            n.blend_en |= u32{key.blend_controls[i].enable != 0} << i;
+        }
+    }
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        if (stage->sw_stage == Shader::SwStage::Vertex) {
+            n.vs_hash = stage->pgm_hash;
+            for (const auto& bd : stage->buffers) {
+                if (bd.IsSpecial() || n.n_vsbuf >= 12) {
+                    continue;
+                }
+                const auto sh = bd.GetSharp(*stage);
+                n.vsbuf[n.n_vsbuf++] =
+                    Mix(Mix(sh.base_address, sh.GetSize()), sh.GetStride()) | 1;
+            }
+        } else if (stage->sw_stage == Shader::SwStage::Fragment) {
+            n.has_ps = true;
+            n.ps_hash = stage->pgm_hash;
+            n.ps_discard = stage->has_discard;
+            n.ps_zexport = stage->stores.GetAny(Shader::IR::Attribute::Depth);
+            for (const auto& d : stage->images) {
+                n.ps_uav |= d.is_written;
+            }
+            for (const auto& d : stage->buffers) {
+                n.ps_uav |= d.is_written;
+            }
+            n.ps_other_export = stage->stores.GetAny(Shader::IR::Attribute::StencilRef) ||
+                                stage->stores.GetAny(Shader::IR::Attribute::SampleMask);
+        }
+    }
+    {
+        u64 vp = 0x7670;
+        vp = MixBytes(vp, &regs.viewports[0], sizeof(regs.viewports[0]));
+        vp = MixBytes(vp, &regs.viewport_depths[0], sizeof(regs.viewport_depths[0]));
+        vp = MixBytes(vp, &regs.viewport_scissors[0], sizeof(regs.viewport_scissors[0]));
+        vp = MixBytes(vp, &regs.screen_scissor, sizeof(regs.screen_scissor));
+        vp = MixBytes(vp, &regs.generic_scissor, sizeof(regs.generic_scissor));
+        vp = MixBytes(vp, &regs.window_scissor, sizeof(regs.window_scissor));
+        vp = MixBytes(vp, &regs.window_offset, sizeof(regs.window_offset));
+        vp = MixBytes(vp, &regs.viewport_control, sizeof(regs.viewport_control));
+        vp = MixBytes(vp, &regs.clipper_control, sizeof(regs.clipper_control));
+        n.vp_hash = vp;
+        n.bias_hash = MixBytes(0x6269, &regs.poly_offset, sizeof(regs.poly_offset));
+    }
+    {
+        // The view constants' matrix at +0x80 (the light matrix of a shadow cascade, see
+        // ReuseShadowCascade) and the whole flattened user data of the vertex stage.
+        constexpr u64 kMask48 = 0xFFFFFFFFFFFFull;
+        const u64 ud = (u64(regs.vs_program.user_data[0]) | (u64(regs.vs_program.user_data[1]) << 32)) &
+                       kMask48;
+        u64 cb = 0;
+        float lvp[16];
+        auto* mem = Core::Memory::Instance();
+        if (ud && mem->TryReadBacking(ud + 8, &cb, sizeof(cb)) && (cb &= kMask48) &&
+            mem->TryReadBacking(cb + 0x80, lvp, sizeof(lvp))) {
+            n.in_lvp = MixBytes(0x6c7670, lvp, sizeof(lvp)) | 1;
+        }
+        for (const auto* stage : pipeline->GetStages()) {
+            if (stage && stage->sw_stage == Shader::SwStage::Vertex) {
+                const auto& flat = stage->FlatBuf();
+                n.in_flat = MixBytes(0x666c6174, flat.data(),
+                                     std::min<size_t>(flat.size(), 512) * sizeof(u32)) | 1;
+            }
+        }
+    }
+    n.g1 = Mix(Mix(Mix(SotcOps::ib_exact, count), first_index), 0x6731);
+    n.g2 = Mix(Mix(Mix(n.g1, SotcOps::vb_exact), first_instance & 0xFFFF),
+               (u64{static_cast<u32>(vertex_offset)} << 32) | instances);
+    // Position inputs of the main twin pair (read from their SPIR-V in the shader cache): the
+    // position-only pre-pass VS f5366412 (position stream = guest buffer 0, per-instance matrix
+    // table = guest buffer 1, view-proj constants = flat dwords 26..43) and its G-buffer twin
+    // a2a164eb (position = guest buffer 2, table = guest buffer 1, view-proj = flat dwords
+    // 44..61). Both compute gl_Position with the same `precise` expression tree
+    // (out/prepass/postree.py).
+    {
+        int pos_idx = -1, inst_idx = -1;
+        u32 flat_base = 0;
+        const u64 vh = n.vs_hash & 0xFFFFFFFFull;
+        // stage->buffers order is not the ssbo numbering of the SPIR-V: the debug dump of the
+        // first draws showed position = buffers[0] / matrix table = buffers[1] for f5366412 and
+        // position = buffers[2] / matrix table = buffers[1] for a2a164eb.
+        if (vh == 0xf5366412) {
+            pos_idx = 0, inst_idx = 1, flat_base = 26;
+        } else if (vh == 0xa2a164eb) {
+            pos_idx = 2, inst_idx = 1, flat_base = 44;
+        }
+        if (pos_idx >= 0) {
+            for (const auto* stage : pipeline->GetStages()) {
+                if (!stage || stage->sw_stage != Shader::SwStage::Vertex) {
+                    continue;
+                }
+                if (static_cast<size_t>(std::max(pos_idx, inst_idx)) < stage->buffers.size()) {
+                    const auto& pb = stage->buffers[pos_idx];
+                    const auto& ib = stage->buffers[inst_idx];
+                    if (!pb.IsSpecial() && !ib.IsSpecial()) {
+                        const auto psharp = pb.GetSharp(*stage);
+                        const auto isharp = ib.GetSharp(*stage);
+                        n.in_pos = Mix(psharp.base_address, 0x706f73);
+                        {
+                            std::array<u8, 16384> pbytes;
+                            const u64 plen = std::min<u64>(psharp.GetSize(), pbytes.size());
+                            if (plen != 0 && Core::Memory::Instance()->TryReadBacking(
+                                                 psharp.base_address, pbytes.data(), plen)) {
+                                n.in_posc = MixBytes(0x706f7363, pbytes.data(), plen) | 1;
+                            }
+                        }
+                        u32 mat[12]{};
+                        const u64 addr = isharp.base_address + u64{first_instance & 0xFFFF} * 128;
+                        if (Core::Memory::Instance()->TryReadBacking(addr, mat, sizeof(mat))) {
+                            n.in_mat = MixBytes(0x6d6174, mat, sizeof(mat)) | 1;
+                        }
+                    }
+                }
+                const auto& flat = stage->FlatBuf();
+                if (flat.size() >= flat_base + 18) {
+                    n.in_vp = MixBytes(0x7670, flat.data() + flat_base, 18 * sizeof(u32)) | 1;
+                }
+            }
+        }
+    }
+    SotcOps::NoteDraw(n);
+}
+
+// sotc: SOTC_OP_STATS=1, depth pre-pass analysis: every image and buffer a stage binds, for the
+// "what touches a depth target" counters (sotc_opstats.cpp NoteTouch), plus shaders with raw
+// pointer access (uses_dma), which cannot be attributed.
+static void OpStatsScanBindings(const Pipeline* pipeline) {
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage || (stage->UserData().data() == nullptr &&
+                       stage->srt_info.flattened_bufsize_dw != 0)) {
+            continue;
+        }
+        for (const auto& d : stage->images) {
+            const auto t = d.GetSharp(*stage);
+            if (t.Valid()) {
+                SotcOps::NoteTouch(SotcOps::TouchImage, stage->pgm_hash,
+                                   static_cast<u32>(stage->sw_stage), d.is_written, t.Address(), 1);
+            }
+        }
+        for (const auto& d : stage->buffers) {
+            if (d.IsSpecial()) {
+                continue;
+            }
+            const auto b = d.GetSharp(*stage);
+            if (b.base_address != 0) {
+                SotcOps::NoteTouch(SotcOps::TouchBuffer, stage->pgm_hash,
+                                   static_cast<u32>(stage->sw_stage), d.is_written, b.base_address,
+                                   b.GetSize());
+            }
+        }
+        if (stage->uses_dma) {
+            SotcOps::NoteTouch(SotcOps::TouchDma, stage->pgm_hash,
+                               static_cast<u32>(stage->sw_stage), true, 0, 0);
+        }
+    }
 }
 
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime& runtime_,
@@ -151,13 +976,122 @@ bool Rasterizer::FilterDraw() {
     return true;
 }
 
+namespace DepthFastStats = DrawPhase::DepthFastStats; // sotc: DepthFastPath counters
+
 void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the targets
+    DrawPhase::Sub(DrawPhase::SPrepLock);
     // Prefetch render targets to handle overlaps with bound textures (e.g. mipgen)
     const auto& key = pipeline->GetGraphicsKey();
     const auto& regs = liverpool->DrawRegs();
+
+    // sotc: BbToggle::DrawBindMemo (RtMemo): the same targets as the last draw, in the same
+    // registry state: cb_descs and db_desc still hold their images.
+    const u32 num_cb = std::bit_width(key.mrt_mask);
+    const bool cb_disabled =
+        regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable;
+    const bool memo_on = DrawBindMemoOn();
+    u32 active_mask = 0;
+    for (u32 cb = 0; cb < num_cb; ++cb) {
+        active_mask |= u32{regs.color_target_mask.GetMask(cb) != 0} << cb;
+    }
+    // sotc: BbToggle::DepthFastPath: no register the render target block reads, and no extent,
+    // changed in value since the memo was stored (Liverpool::DrawRelSerial), so every register
+    // comparison below is known to come out equal and is not made (SOTC_DEPTHFAST_VERIFY=1 makes
+    // it as well and checks).
+    const bool depth_fast = memo_on && DepthFastActive();
+    bool rel_hit = false;
+    if (depth_fast && rt_memo.valid &&
+        rt_memo.rel_depth == liverpool->DrawRelSerial(AmdGpu::Liverpool::RelRender) &&
+        (num_cb == 0 ||
+         rt_memo.rel_color == liverpool->DrawRelSerial(AmdGpu::Liverpool::RelColor))) {
+        rel_hit = rt_memo.mrt_mask == key.mrt_mask &&
+                  rt_memo.image_generation == texture_cache.ImageSetGeneration() &&
+                  rt_memo.gpu_epoch == VideoCore::gpu_modified_epoch.load(std::memory_order_relaxed);
+    }
+    bool depth_enable = false, stencil_enable = false, depth_write = false;
+    u32 htile = 0;
+    bool memo_hit = rel_hit;
+    if (!rel_hit || DepthFastStats::kVerify) {
+        depth_enable = regs.depth_control.depth_enable;
+        stencil_enable = regs.depth_control.stencil_enable;
+        depth_write = regs.depth_control.depth_write_enable;
+        htile = regs.depth_htile_data_base.address;
+        bool old_hit = memo_on && rt_memo.valid && rt_memo.mrt_mask == key.mrt_mask &&
+            rt_memo.active_mask == active_mask && rt_memo.cb_disabled == cb_disabled &&
+            rt_memo.depth_enable == depth_enable && rt_memo.stencil_enable == stencil_enable &&
+            rt_memo.htile == htile &&
+            rt_memo.image_generation == texture_cache.ImageSetGeneration() &&
+            rt_memo.gpu_epoch == VideoCore::gpu_modified_epoch.load(std::memory_order_relaxed) &&
+            std::memcmp(&rt_memo.depth_buffer, &regs.depth_buffer, sizeof(regs.depth_buffer)) == 0 &&
+            std::memcmp(&rt_memo.depth_view, &regs.depth_view, sizeof(regs.depth_view)) == 0 &&
+            rt_memo.db_extent.raw == liverpool->DrawDbExtent().raw &&
+            std::memcmp(rt_memo.cb_extent.data(), liverpool->DrawCbExtent().data(),
+                        num_cb * sizeof(AmdGpu::CbDbExtent)) == 0 &&
+            std::memcmp(rt_memo.color_buffers.data(), regs.color_buffers,
+                        num_cb * sizeof(AmdGpu::ColorBuffer)) == 0;
+        // sotc: db_desc.view_info.is_storage is depth_write_enable (ImageViewInfo for a depth buffer)
+        // and BeginRendering picks the depth layout and the view usage from it, so a memo that
+        // differs only in the write enable must not replay the old db_desc (stale layout:
+        // attachment-optimal for a read-only pass, or, in the other direction, a read-only layout
+        // with writes enabled).
+        if (old_hit && rt_memo.depth_write != depth_write) {
+            old_hit = false;
+        }
+        if (rel_hit) { // verify only: the register-free test said hit, the comparison must agree
+            ++DepthFastStats::c.prep_verify;
+            if (!old_hit) {
+                if (++DepthFastStats::c.prep_bad <= 20) {
+                    std::fprintf(stderr,
+                                 "SOTC DEPTHFAST VERIFY: render target memo replayed by the "
+                                 "register serial but the registers differ (mismatch %llu)%c",
+                                 static_cast<unsigned long long>(DepthFastStats::c.prep_bad), 10);
+                }
+                memo_hit = false;
+            }
+        } else {
+            memo_hit = old_hit;
+            if (depth_fast) {
+                ++DepthFastStats::c.prep_miss;
+                DepthFastStats::c.prep_old_only += old_hit;
+            }
+        }
+    } else {
+        ++DepthFastStats::c.prep_hit;
+    }
+    DrawPhase::Sub(DrawPhase::SPrepCmp);
+    if (memo_hit) {
+        for (u32 cb = 0; cb < num_cb; ++cb) {
+            if (const auto image_id = cb_descs[cb].first) {
+                auto& image = texture_cache.GetImage(image_id);
+                texture_cache.NoteFound(image);
+                bound_images.emplace_back(image_id);
+                image.binding.is_target = 1u;
+            }
+        }
+        if (const auto image_id = db_desc.first) {
+            auto& image = texture_cache.GetImage(image_id);
+            texture_cache.NoteFound(image);
+            bound_images.emplace_back(image_id);
+            image.binding.is_target = 1u;
+        }
+        if (SotcStats::kFpsLog) {
+            SotcStats::rt_memo_hits.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    if (SotcStats::kFpsLog) {
+        SotcStats::rt_memo_misses.fetch_add(1, std::memory_order_relaxed);
+    }
+    rt_memo.valid = false;
     if (regs.color_control.degamma_enable) {
-        LOG_WARNING(Render_Vulkan, "Color buffers require gamma correction");
+        // sotc: once per process, not once per draw (the LOG macro looks the logger up in a map
+        // before checking the level, and this flag can stay set for a whole scene).
+        static const bool shown = [] {
+            LOG_WARNING(Render_Vulkan, "Color buffers require gamma correction");
+            return true;
+        }();
+        (void)shown;
     }
 
     const bool skip_cb_binding =
@@ -189,6 +1123,28 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         image.binding.is_target = 1u;
     } else {
         db_desc.first = {};
+    }
+
+    if (memo_on) {
+        rt_memo.valid = true;
+        rt_memo.mrt_mask = key.mrt_mask;
+        rt_memo.active_mask = active_mask;
+        rt_memo.cb_disabled = cb_disabled;
+        rt_memo.depth_enable = depth_enable;
+        rt_memo.stencil_enable = stencil_enable;
+        rt_memo.depth_write = depth_write;
+        rt_memo.htile = htile;
+        rt_memo.rel_depth = liverpool->DrawRelSerial(AmdGpu::Liverpool::RelRender); // sotc: DepthFastPath
+        rt_memo.rel_color = liverpool->DrawRelSerial(AmdGpu::Liverpool::RelColor);
+        rt_memo.image_generation = texture_cache.ImageSetGeneration();
+        rt_memo.gpu_epoch = VideoCore::gpu_modified_epoch.load(std::memory_order_relaxed);
+        std::memcpy(&rt_memo.depth_buffer, &regs.depth_buffer, sizeof(regs.depth_buffer));
+        std::memcpy(&rt_memo.depth_view, &regs.depth_view, sizeof(regs.depth_view));
+        rt_memo.db_extent = liverpool->DrawDbExtent();
+        std::memcpy(rt_memo.cb_extent.data(), liverpool->DrawCbExtent().data(),
+                    num_cb * sizeof(AmdGpu::CbDbExtent));
+        std::memcpy(rt_memo.color_buffers.data(), regs.color_buffers,
+                    num_cb * sizeof(AmdGpu::ColorBuffer));
     }
 }
 
@@ -835,6 +1791,7 @@ bool Rasterizer::BeginHudless(const GraphicsPipeline* pipeline, const RenderStat
     ui.imageView = hudless_clear.rt_view;
     ui.imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
     pipeline->BindResources(set_writes, push_data);
+    SotcStats::push_clobbers.fetch_add(1, std::memory_order_relaxed); // sotc: reused binds repush
     RenderState hudless_state = state;
     auto& attachment = hudless_state.color_attachments[0];
     attachment.image_view = target.rt_view;
@@ -893,8 +1850,13 @@ vk::ImageView Rasterizer::TakeHudless(VAddr address, vk::Format format) {
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolved,
                       bool use_resolved) {
     RENDERER_TRACE;
+    DrawPhase::Scope ph;
 
     scheduler.PopPendingOperations();
+    DrawPhase::Sub(DrawPhase::SPop);
+    if (!df_rel_built) {
+        DepthFastEnsureRelevance(); // sotc: DepthFastPath, once
+    }
     TracePass(liverpool->DrawRegs());
 
     if (!FilterDraw()) {
@@ -903,6 +1865,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
     if (SkipStaggeredShadow(liverpool->DrawRegs()) || ReuseShadowCascade()) {
         return;
     }
+    DrawPhase::Sub(DrawPhase::SFilter);
 
     const auto& regs = liverpool->DrawRegs();
     const GraphicsPipeline* pipeline =
@@ -914,12 +1877,15 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
     }
     if (!pipeline) {
         SotcStats::Drop(0, regs.color_buffers[0].Address(), regs.stage_enable.raw);
+        if (SotcOps::kOn) SotcOps::NoteDrawDropped(); // sotc: SOTC_OP_STATS=1
         return;
     }
     TraceGbufferShaders(regs, pipeline);
     TraceShadowShaders(regs, pipeline);
+    DrawPhase::Mark(DrawPhase::Pre);
 
     PrepareRenderState(pipeline);
+    DrawPhase::Mark(DrawPhase::Prep);
     hudless_ui_info = -1; // sotc: TakeHudless, set by BindTextures and BeginRendering
     hudless_vo = 0;
     if (Dlssg::CapturingInputs()) { // sotc: camera and inputs of frame generation
@@ -928,31 +1894,39 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
     }
     if (!BindResources(pipeline)) {
         SotcStats::Drop(1, regs.color_buffers[0].Address(), 0);
+        if (SotcOps::kOn) SotcOps::NoteDrawDropped(); // sotc: SOTC_OP_STATS=1
         return;
     }
-    const auto state = BeginRendering(pipeline);
+    DrawPhase::Mark(DrawPhase::BindRest);
+    RenderState state_storage;
+    u64 state_token = 0;
+    const RenderState& state = BeginRenderingFast(pipeline, state_storage, state_token);
+    DrawPhase::Mark(DrawPhase::Begin);
     RefreshImageLayouts();
+    DrawPhase::Mark(DrawPhase::Refresh);
 
     BindVertexBuffers(pipeline);
     if (is_indexed) {
         BindIndexBuffer(index_offset);
     }
+    DrawPhase::Mark(DrawPhase::VtxIdx);
 
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
+    DrawPhase::Mark(DrawPhase::Args);
 
     if (fast_bind_hit && fast_bind.clobbers != SotcStats::push_clobbers.load(std::memory_order_relaxed)) {
-
         fast_bind_hit = false; // sotc: a helper pass overwrote the pushed descriptors
-
     }
-
     if (!fast_bind_hit) {
         pipeline->BindResources(set_writes, push_data);
     }
-    UpdateDynamicState(pipeline, is_indexed);
-    scheduler.BeginRendering(state);
+    DrawPhase::Mark(DrawPhase::PipeBind);
+    CommitDynamicState(pipeline, is_indexed);
+    DrawPhase::Mark(DrawPhase::Dyn);
+    scheduler.BeginRendering(state, state_token);
+    DrawPhase::Sub(DrawPhase::SSchBegin);
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
@@ -960,6 +1934,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    DrawPhase::Sub(DrawPhase::SSchBind);
 
     if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
@@ -980,9 +1955,20 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
         }
     }
     DebugState.IncDrawCall();
+    DrawPhase::Sub(DrawPhase::SSchDraw);
+    DrawPhase::Mark(DrawPhase::Sched);
 
     ResetBindings(false);
+    DrawPhase::Sub(DrawPhase::SPostReset);
     FlushPeriodic();
+    DrawPhase::Sub(DrawPhase::SPostFlush);
+    DrawPhase::Mark(DrawPhase::Post);
+    if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1
+        OpStatsNoteDraw(regs, pipeline, state, buffer_infos, image_infos, push_data, is_indexed,
+                        false, regs.num_indices, regs.num_instances.NumInstances(), 0,
+                        vertex_offset, instance_offset);
+    }
+    DrawPhase::Finish(ph, pipeline, set_writes, buffer_infos, image_infos, push_data, state);
 }
 
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
@@ -990,8 +1976,13 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u16 instance_sgpr_offset, const Pipeline* resolved,
                               bool use_resolved) {
     RENDERER_TRACE;
+    DrawPhase::Scope ph;
 
     scheduler.PopPendingOperations();
+    DrawPhase::Sub(DrawPhase::SPop);
+    if (!df_rel_built) {
+        DepthFastEnsureRelevance(); // sotc: DepthFastPath, once
+    }
     TracePass(liverpool->DrawRegs());
 
     if (!FilterDraw()) {
@@ -1000,6 +1991,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (SkipStaggeredShadow(liverpool->DrawRegs()) || ReuseShadowCascade()) {
         return;
     }
+    DrawPhase::Sub(DrawPhase::SFilter);
 
     if (SotcStats::kCmdStats) { // sotc: the shared SOTC_CMD_STATS switch (sotc_stats.h)
         const u64 args_size = u64{stride} * max_count;
@@ -1024,26 +2016,36 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                      : pipeline_cache.GetGraphicsPipeline(params);
     if (!pipeline) {
         SotcStats::Drop(0, liverpool->DrawRegs().color_buffers[0].Address(), 1);
+        if (SotcOps::kOn) SotcOps::NoteDrawDropped(); // sotc: SOTC_OP_STATS=1
         return;
     }
     TraceShadowShaders(liverpool->DrawRegs(), pipeline);
+    DrawPhase::Mark(DrawPhase::Pre);
 
     PrepareRenderState(pipeline);
+    DrawPhase::Mark(DrawPhase::Prep);
     if (Dlssg::CapturingInputs()) { // sotc: camera and inputs of frame generation
         Dlssg::NoteDraw(liverpool->DrawRegs(), pipeline->GetGraphicsKey().mrt_mask, db_desc.first,
                         cb_descs[4].first, texture_cache);
     }
     if (!BindResources(pipeline)) {
         SotcStats::Drop(1, liverpool->DrawRegs().color_buffers[0].Address(), 1);
+        if (SotcOps::kOn) SotcOps::NoteDrawDropped(); // sotc: SOTC_OP_STATS=1
         return;
     }
-    const auto state = BeginRendering(pipeline);
+    DrawPhase::Mark(DrawPhase::BindRest);
+    RenderState state_storage;
+    u64 state_token = 0;
+    const RenderState& state = BeginRenderingFast(pipeline, state_storage, state_token);
+    DrawPhase::Mark(DrawPhase::Begin);
     RefreshImageLayouts();
+    DrawPhase::Mark(DrawPhase::Refresh);
 
     BindVertexBuffers(pipeline);
     if (is_indexed) {
         BindIndexBuffer();
     }
+    DrawPhase::Mark(DrawPhase::VtxIdx);
 
     // sotc: SotC writes the arguments of most indirect draws with WRITE_DATA right before them
     // (thousands per frame). With the arguments CPU-side, read them here and draw directly: no
@@ -1067,16 +2069,21 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         if (needs_barrier) {
             runtime.FlushBarriers();
         }
+        DrawPhase::Mark(DrawPhase::Args);
         if (fast_bind_hit && fast_bind.clobbers != SotcStats::push_clobbers.load(std::memory_order_relaxed)) {
             fast_bind_hit = false; // sotc: a helper pass overwrote the pushed descriptors
         }
         if (!fast_bind_hit) {
             pipeline->BindResources(set_writes, push_data);
         }
-        UpdateDynamicState(pipeline, is_indexed);
-        scheduler.BeginRendering(state);
+        DrawPhase::Mark(DrawPhase::PipeBind);
+        CommitDynamicState(pipeline, is_indexed);
+        DrawPhase::Mark(DrawPhase::Dyn);
+        scheduler.BeginRendering(state, state_token);
+        DrawPhase::Sub(DrawPhase::SSchBegin);
         const auto cmdbuf = scheduler.CommandBuffer();
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+        DrawPhase::Sub(DrawPhase::SSchBind);
         if (is_indexed) {
             const auto& a = args.indexed;
             cmdbuf.drawIndexed(a.indexCount, a.instanceCount, a.firstIndex, a.vertexOffset,
@@ -1086,8 +2093,29 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             cmdbuf.draw(a.vertexCount, a.instanceCount, a.firstVertex, a.firstInstance);
         }
         DebugState.IncDrawCall();
+        DrawPhase::Sub(DrawPhase::SSchDraw);
+        DrawPhase::Mark(DrawPhase::Sched);
         ResetBindings(false);
+        DrawPhase::Sub(DrawPhase::SPostReset);
         FlushPeriodic();
+        DrawPhase::Sub(DrawPhase::SPostFlush);
+        DrawPhase::Mark(DrawPhase::Post);
+        ShadowProbeNote(liverpool->DrawRegs(), pipeline, set_writes, buffer_infos, image_infos,
+                        push_data, state, &args, stride);
+        if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1
+            if (is_indexed) {
+                const auto& a = args.indexed;
+                OpStatsNoteDraw(liverpool->DrawRegs(), pipeline, state, buffer_infos, image_infos,
+                                push_data, true, false, a.indexCount, a.instanceCount,
+                                a.firstIndex, static_cast<u32>(a.vertexOffset), a.firstInstance);
+            } else {
+                const auto& a = args.plain;
+                OpStatsNoteDraw(liverpool->DrawRegs(), pipeline, state, buffer_infos, image_infos,
+                                push_data, false, false, a.vertexCount, a.instanceCount,
+                                a.firstVertex, 0, a.firstInstance);
+            }
+        }
+        DrawPhase::Finish(ph, pipeline, set_writes, buffer_infos, image_infos, push_data, state);
         return;
     }
 
@@ -1126,16 +2154,13 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
 
     if (fast_bind_hit && fast_bind.clobbers != SotcStats::push_clobbers.load(std::memory_order_relaxed)) {
-
         fast_bind_hit = false; // sotc: a helper pass overwrote the pushed descriptors
-
     }
-
     if (!fast_bind_hit) {
         pipeline->BindResources(set_writes, push_data);
     }
-    UpdateDynamicState(pipeline, is_indexed);
-    scheduler.BeginRendering(state);
+    CommitDynamicState(pipeline, is_indexed);
+    scheduler.BeginRendering(state, state_token);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
@@ -1175,10 +2200,26 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     ResetBindings(false);
     FlushPeriodic();
+    if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1, arguments written by the GPU
+        OpStatsNoteDraw(liverpool->DrawRegs(), pipeline, state, buffer_infos, image_infos,
+                        push_data, is_indexed, true, 0, 0, 0, 0, 0);
+    }
+}
+
+// sotc: SOTC_DISP_PHASES: buffers (all, written) of a compute stage, for the dispatch counters.
+static void DispShape(const Shader::Info& cs, u32& bufs, u32& wbufs) {
+    bufs = wbufs = 0;
+    for (const auto& desc : cs.buffers) {
+        if (!desc.IsSpecial()) {
+            ++bufs;
+            wbufs += desc.is_written ? 1 : 0;
+        }
+    }
 }
 
 void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
     RENDERER_TRACE;
+    DispPhase::Begin(); // sotc: SOTC_DISP_PHASES
 
     scheduler.PopPendingOperations();
 
@@ -1187,11 +2228,15 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
                                                    : pipeline_cache.GetComputePipeline();
     if (!pipeline) {
         SotcStats::Drop(2, cs_program.Address<uintptr_t>(), 0);
+        DispPhase::Abort();
         return;
     }
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     SotcStats::current_program.store(cs.pgm_hash, std::memory_order_relaxed);
+    if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1
+        SotcOps::NoteDispatch(cs.pgm_hash, u64{cs_program.dim_x} * cs_program.dim_y * cs_program.dim_z);
+    }
     if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer (sotc_stats.h)
         SotcStats::cmd_kinds[4].fetch_add(1, std::memory_order_relaxed);
     }
@@ -1267,32 +2312,54 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
             counts.clear();
         }
     }
+    DispPhase::Mark(DispPhase::Pre);
     if (ExecuteShaderHLE(cs, liverpool->DrawRegs(), cs_program, *this)) {
         fast_bind.valid = false; // sotc: wrote guest memory through the buffer cache
         SotcStats::Drop(5, cs_program.Address<uintptr_t>(), 0);
+        DispPhase::Mark(DispPhase::Hle);
+        DispPhase::Finish(0, cs.pgm_hash,
+                          u64{cs_program.dim_x} * cs_program.dim_y * cs_program.dim_z, 0, 0, 0,
+                          false, false, false);
         return;
     }
+    DispPhase::Mark(DispPhase::Hle);
 
     if (!BindResources(pipeline)) {
         SotcStats::Drop(3, cs_program.Address<uintptr_t>(), 0);
+        DispPhase::Abort();
         return;
     }
 
+    const bool disp_barrier = needs_barrier;
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
+    DispPhase::Mark(DispPhase::Barrier);
 
+    const bool disp_rendering = scheduler.IsRendering();
     scheduler.EndRendering();
+    DispPhase::Mark(DispPhase::EndRend);
     pipeline->BindResources(set_writes, push_data);
+    DispPhase::Mark(DispPhase::PipeBind);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     DebugState.IncDispatch();
     MaybeDumpImages(cs.pgm_hash);
+    DispPhase::Mark(DispPhase::Issue);
 
     ResetBindings(true);
     FlushPeriodic();
+    DispPhase::Mark(DispPhase::Post);
+    if (DispPhase::kOn) { // sotc: SOTC_DISP_PHASES
+        u32 bufs, wbufs;
+        DispShape(cs, bufs, wbufs);
+        DispPhase::Finish(1, cs.pgm_hash,
+                          u64{cs_program.dim_x} * cs_program.dim_y * cs_program.dim_z, bufs, wbufs,
+                          static_cast<u32>(cs.images.size()), disp_barrier, disp_rendering,
+                          cs.uses_dma);
+    }
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pipeline* resolved,
@@ -1302,6 +2369,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
         SotcStats::cmd_kinds[5].fetch_add(1, std::memory_order_relaxed);
     }
 
+    DispPhase::Begin(); // sotc: SOTC_DISP_PHASES
     scheduler.PopPendingOperations();
 
     const auto& cs_program = liverpool->DrawCsRegs();
@@ -1309,23 +2377,35 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
                                                    : pipeline_cache.GetComputePipeline();
     if (!pipeline) {
         SotcStats::Drop(2, cs_program.Address<uintptr_t>(), 0);
+        DispPhase::Abort();
         return;
     }
 
+    if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1
+        SotcOps::NoteDispatch(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash, 0);
+    }
+    DispPhase::Mark(DispPhase::Pre);
     if (!BindResources(pipeline)) {
         SotcStats::Drop(3, cs_program.Address<uintptr_t>(), 1);
+        DispPhase::Abort();
         return;
     }
 
     const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
+    DispPhase::Mark(DispPhase::BbRest);
 
+    const bool disp_barrier = needs_barrier;
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
+    DispPhase::Mark(DispPhase::Barrier);
 
+    const bool disp_rendering = scheduler.IsRendering();
     scheduler.EndRendering();
+    DispPhase::Mark(DispPhase::EndRend);
     pipeline->BindResources(set_writes, push_data);
+    DispPhase::Mark(DispPhase::PipeBind);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
@@ -1334,9 +2414,18 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
     runtime.AccessBuffer(buffer, base, size, vk::PipelineStageFlagBits2::eDrawIndirect,
                          vk::AccessFlagBits2::eIndirectCommandRead);
     MaybeDumpImages(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash);
+    DispPhase::Mark(DispPhase::Issue);
 
     ResetBindings(true);
     FlushPeriodic();
+    DispPhase::Mark(DispPhase::Post);
+    if (DispPhase::kOn) { // sotc: SOTC_DISP_PHASES
+        const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
+        u32 bufs, wbufs;
+        DispShape(cs, bufs, wbufs);
+        DispPhase::Finish(2, cs.pgm_hash, 0, bufs, wbufs, static_cast<u32>(cs.images.size()),
+                          disp_barrier, disp_rendering, cs.uses_dma);
+    }
 }
 
 u64 Rasterizer::Flush() {
@@ -1368,9 +2457,14 @@ void Rasterizer::OnFence() {
 // DEPTH_STENCIL_READ_ONLY_OPTIMAL (Vulkan validation; harmless on NVIDIA, wrong on GPUs that
 // compress depth by layout). The descriptors are written after this, with the layouts in force.
 void Rasterizer::RefreshImageLayouts() {
+    // sotc: BbToggle::DrawFixedCostOpt: PeekImage, not GetImage: every image listed was touched
+    // (LRU) by its own bind in this draw, and the same tick makes the second touch a no-op.
+    const bool peek = !BbToggle::Disabled(BbToggle::DrawFixedCostOpt);
     for (size_t i = 0; i < image_infos.size(); ++i) {
         if (const VideoCore::ImageId id = image_info_images[i]) {
-            image_infos[i].imageLayout = texture_cache.GetImage(id).backing->state.layout;
+            image_infos[i].imageLayout = (peek ? texture_cache.PeekImage(id)
+                                               : texture_cache.GetImage(id))
+                                             .backing->state.layout;
         }
     }
 }
@@ -1448,6 +2542,7 @@ void Rasterizer::CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dm
     fast_bind.clobbers = pre_clobbers;
     fast_bind.tick = scheduler.CurrentTick();
     fast_bind.uses_dma = uses_dma;
+    fast_bind.lod_marks.assign(lod_marks.begin(), lod_marks.end());
     fast_bind.valid = true;
     static const bool verify_env = std::getenv("SOTC_FAST_BIND_VERIFY") != nullptr;
     if (verify_env) {
@@ -1456,8 +2551,16 @@ void Rasterizer::CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dm
     }
 }
 
+// sotc: SOTC_CS_BIND_TRACE state (BindBuffers): the current dispatch prints its bindings.
+static bool cs_bind_trace_on = false;
+
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
+    cs_bind_trace_on = false;
+    if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1, touches of depth targets
+        OpStatsScanBindings(pipeline);
+    }
     fast_bind_hit = false;
+    lod_marks.clear();
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
         static const bool drop_trace = std::getenv("SOTC_DROP_TRACE") != nullptr;
@@ -1486,6 +2589,11 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         return false;
     }
 
+    // sotc: the buffer tracker's write/read protects of all bindings (and of the DMA sweep) are
+    // issued merged when the scope ends, and before any upload copy (see ProtectBatchScope).
+    // Off by default (SOTC_PROTECT_BATCH=1): the ranges were almost never adjacent.
+    const VideoCore::ProtectBatchScope protect_batch;
+
     set_write_index = 0;
     set_writes.clear();
     buffer_infos.clear();
@@ -1500,11 +2608,14 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     for (const auto* stage : pipeline->GetStages()) {
         if (stage && stage->UserData().data() == nullptr &&
             stage->srt_info.flattened_bufsize_dw != 0) {
-            LOG_ERROR(Render_Vulkan,
-                      "Skipping draw: shader {:#x} (sw stage {}, hw stage {}, info {}) has no "
-                      "user data bound",
-                      stage->pgm_hash, u32(stage->sw_stage), u32(stage->hw_stage),
-                      fmt::ptr(stage));
+            // sotc: per draw; throttled (P5), the dropped lines count in the SOTC log line.
+            if (SotcStats::LogThrottled("draw-no-userdata")) {
+                LOG_ERROR(Render_Vulkan,
+                          "Skipping draw: shader {:#x} (sw stage {}, hw stage {}, info {}) has no "
+                          "user data bound",
+                          stage->pgm_hash, u32(stage->sw_stage), u32(stage->hw_stage),
+                          fmt::ptr(stage));
+            }
             fast_bind.valid = false;
             return false;
         }
@@ -1531,6 +2642,11 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             if (!verify) {
                 fast_bind_hit = true;
                 SotcStats::fast_bind_hits.fetch_add(1, std::memory_order_relaxed);
+                // sotc: the slow path marks every sampled texture bank (SotcLod::Mark counts the
+                // uses the game's streaming priority reads); a reused bind marks the same banks.
+                for (const u32 bank : fast_bind.lod_marks) {
+                    SotcLod::Mark(bank);
+                }
                 if (fast_bind.uses_dma) {
                     buffer_cache.SynchronizeDmaBuffers();
                 }
@@ -1547,21 +2663,46 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         push_data = MakeUserData(liverpool->DrawRegs());
     }
     // Bind resource buffers and textures.
+    DrawPhase::Sub(DrawPhase::SBrCheck);
     Shader::Backend::Bindings binding{};
+    DrawPhase::Sub(DrawPhase::SBrUser);
     for (const auto* stage : pipeline->GetStages()) {
         if (!stage) {
             continue;
         }
         set_writes.resize(set_writes.size() + stage->buffers.size() + stage->images.size() +
                           stage->samplers.size());
+        DrawPhase::Mark(DrawPhase::BindRest);
+        DispPhase::Mark(DispPhase::BrPre);
         BindBuffers(*stage, binding, push_data);
+        DrawPhase::Mark(DrawPhase::BindBuf);
+        DispPhase::Mark(DispPhase::BbRest);
         BindTextures(*stage, binding);
-        uses_dma |= stage->uses_dma;
+        DrawPhase::Mark(DrawPhase::BindTex);
+        DispPhase::Mark(DispPhase::BtTex);
+        // sotc: a known shader's raw pointer range is synchronised alone (KnownDmaRange).
+        if (stage->uses_dma) {
+            VAddr dma_addr = 0;
+            u64 dma_size = 0;
+            if (!KnownDmaRange(*stage, dma_addr, dma_size) ||
+                !buffer_cache.SynchronizeDmaRange(dma_addr, dma_size)) {
+                uses_dma = true;
+            }
+        }
     }
 
+    DispPhase::Mark(DispPhase::BrDma);
     if (uses_dma) {
+        const u64 trace_up0 = cs_bind_trace_on ? SotcStats::upload_bytes.load() : 0;
+        const u64 trace_pr0 = cs_bind_trace_on ? SotcStats::sys_protects.load() : 0;
         buffer_cache.SynchronizeDmaBuffers();
+        if (cs_bind_trace_on) {
+            std::fprintf(stderr, "SOTC csbind dma sweep uploaded %llu protects %llu\n",
+                         static_cast<unsigned long long>(SotcStats::upload_bytes.load() - trace_up0),
+                         static_cast<unsigned long long>(SotcStats::sys_protects.load() - trace_pr0));
+        }
     }
+    DispPhase::Mark(DispPhase::BrDma);
 
     if (verify_pending) {
         verify_pending = false;
@@ -1637,12 +2778,40 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     pipeline->GetVertexInputs(attributes, bindings, divisors, guest_buffers,
                               regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
 
+    DrawPhase::Sub(DrawPhase::SViInput); // GetVertexInputs
     if (instance.IsVertexInputDynamicState()) {
-        // Update current vertex inputs.
-        const auto cmdbuf = scheduler.CommandBuffer();
-        cmdbuf.setVertexInputEXT(bindings, attributes);
+        // sotc: BbToggle::DrawFixedCostOpt: the same vertex input as the last one set in this
+        // command buffer (and no pass bound its own pipeline since: DynamicState::Invalidate)
+        // is not recorded again.
+        auto& dyn = scheduler.GetDynamicState();
+        bool same = !BbToggle::Disabled(BbToggle::DrawFixedCostOpt) && vi_memo.valid &&
+                    vi_memo.invalidations == dyn.invalidations &&
+                    vi_memo.bindings.size() == bindings.size() &&
+                    vi_memo.attributes.size() == attributes.size();
+        for (size_t i = 0; same && i < bindings.size(); ++i) {
+            const auto& a = vi_memo.bindings[i];
+            const auto& b = bindings[i];
+            same = a.binding == b.binding && a.stride == b.stride && a.inputRate == b.inputRate &&
+                   a.divisor == b.divisor;
+        }
+        for (size_t i = 0; same && i < attributes.size(); ++i) {
+            const auto& a = vi_memo.attributes[i];
+            const auto& b = attributes[i];
+            same = a.location == b.location && a.binding == b.binding && a.format == b.format &&
+                   a.offset == b.offset;
+        }
+        if (!same) {
+            // Update current vertex inputs.
+            const auto cmdbuf = scheduler.CommandBuffer();
+            cmdbuf.setVertexInputEXT(bindings, attributes);
+            vi_memo.valid = true;
+            vi_memo.invalidations = dyn.invalidations;
+            vi_memo.bindings = bindings;
+            vi_memo.attributes = attributes;
+        }
     }
 
+    DrawPhase::Sub(DrawPhase::SViInput);
     if (bindings.empty()) {
         // If there are no bindings, there is nothing further to do.
         return;
@@ -1697,6 +2866,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         fixed_function_reads.push_back({range.buffer, range.offset, static_cast<u32>(size), false});
     }
 
+    DrawPhase::Sub(DrawPhase::SViObt);
     // Bind vertex buffers
     VertexInputs<vk::Buffer> host_buffers;
     VertexInputs<vk::DeviceSize> host_offsets;
@@ -1721,6 +2891,17 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         host_strides.push_back(buffer.GetStride());
     }
 
+    if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1
+        u64 vd = 0x7662, ve = 0x7662;
+        for (size_t i = 0; i < guest_buffers.size(); ++i) {
+            vd = SotcOps::Mix(vd, std::bit_cast<u64>(host_buffers[i]));
+            vd = SotcOps::Mix(vd, host_strides[i]);
+            ve = SotcOps::Mix(ve, guest_buffers[i].base_address);
+            ve = SotcOps::Mix(ve, (host_sizes[i] << 16) ^ host_strides[i]);
+        }
+        SotcOps::vb_desc = vd;
+        SotcOps::vb_exact = ve;
+    }
     const auto cmdbuf = scheduler.CommandBuffer();
     const auto num_buffers = guest_buffers.size();
     if (instance.IsVertexInputDynamicState()) {
@@ -1729,6 +2910,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         cmdbuf.bindVertexBuffers2(0, num_buffers, host_buffers.data(), host_offsets.data(),
                                   host_sizes.data(), host_strides.data());
     }
+    DrawPhase::Sub(DrawPhase::SViBind);
 }
 
 void Rasterizer::BindIndexBuffer(u32 index_offset) {
@@ -1747,8 +2929,13 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
         buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
     fixed_function_reads.push_back({buffer, offset, index_buffer_size, false});
+    if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1
+        SotcOps::ib_desc = SotcOps::Mix(std::bit_cast<u64>(buffer->Handle()), u64{index_size});
+        SotcOps::ib_exact = SotcOps::Mix(index_address, u64{index_size});
+    }
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindIndexBuffer(buffer->Handle(), offset, index_type);
+    DrawPhase::Sub(DrawPhase::SIbuf);
 }
 
 void Rasterizer::FlushPeriodic() {
@@ -1941,8 +3128,15 @@ void Rasterizer::MaybeDumpImages(u64 pgm_hash) {
 }
 
 void Rasterizer::ResetBindings(bool is_compute) {
-    for (auto& image_id : bound_images) {
-        texture_cache.GetImage(image_id).binding = {};
+    if (!BbToggle::Disabled(BbToggle::DrawFixedCostOpt)) {
+        // sotc: PeekImage as in RefreshImageLayouts: bound_images were all touched by this draw.
+        for (auto& image_id : bound_images) {
+            texture_cache.PeekImage(image_id).binding = {};
+        }
+    } else {
+        for (auto& image_id : bound_images) {
+            texture_cache.GetImage(image_id).binding = {};
+        }
     }
     for (const auto [buffer, offset, size, is_written] : bound_buffers) {
         const auto dst_stage = is_compute ? vk::PipelineStageFlagBits2::eComputeShader
@@ -2124,9 +3318,47 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
     return true;
 }
 
+// sotc: SOTC_CS_BIND_TRACE (see BindBuffers): whether the current dispatch of the traced shader
+// prints its bindings (decided at the start of its BindBuffers).
+static bool CsBindTraceMatch(u64 pgm_hash) {
+    // SOTC_CS_BIND_TRACE=<hash>[,<hash>...]
+    static const std::vector<u64> hashes = [] {
+        std::vector<u64> list;
+        for (const char* p = std::getenv("SOTC_CS_BIND_TRACE"); p && *p;) {
+            char* end = nullptr;
+            const u64 v = std::strtoull(p, &end, 0);
+            if (end == p) {
+                break;
+            }
+            list.push_back(v);
+            p = *end == ',' ? end + 1 : end;
+        }
+        return list;
+    }();
+    return !hashes.empty() && std::find(hashes.begin(), hashes.end(), pgm_hash) != hashes.end();
+}
+static bool CsBindTraceActive(u64 pgm_hash) {
+    return cs_bind_trace_on && CsBindTraceMatch(pgm_hash);
+}
+
+// sotc: the guest VMA table generation (src/runtime_memory.c), part of the BufferBindMemo key.
+extern "C" uint64_t runtime_memory_generation(void);
+
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
     const u64 alignment = instance.StorageMinAlignment();
+    if (CsBindTraceMatch(stage.pgm_hash)) {
+        // New dispatch of the traced shader: pick whether this one prints.
+        static u64 dispatches = 0, shown = 0;
+        const u64 n = dispatches++;
+        cs_bind_trace_on = (n < 6 || (n % 13) == 0) && shown++ < 60;
+        if (cs_bind_trace_on) {
+            const auto& flat = stage.FlatBuf();
+            std::fprintf(stderr, "SOTC csbind dispatch %llu uses_dma %d flat[18..19] %#x %#x\n",
+                         static_cast<unsigned long long>(n), int(stage.uses_dma),
+                         flat.size() > 18 ? flat[18] : 0, flat.size() > 19 ? flat[19] : 0);
+        }
+    }
     for (const auto& desc : stage.buffers) {
         if (desc.IsSpecial()) {
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
@@ -2177,6 +3409,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             } else {
                 UNREACHABLE_MSG("Unexpected buffer type {}", u32(desc.buffer_type));
             }
+            DispPhase::Mark(DispPhase::BbFlat);
+            DrawPhase::Sub(DrawPhase::SBbFlat);
         } else {
             const auto vsharp = desc.GetSharp(stage);
             // Unmapped addresses show up in descriptors of bindings the shader does not use
@@ -2190,8 +3424,46 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const char* v = std::getenv("SOTC_BIND_CLAMP1");
                 return !v || v[0] != '0';
             }();
+            // sotc: BbToggle::BufferBindMemo, opt-in with SOTC_BUFFER_MEMO=1 (then bit 56 of the
+            // toggle mask switches it off live). Measured 2026-10-22: hit rate 92-97% (attract) and
+            // 80% (open field) but no gain (ns per binding and FPS equal within noise), so it is
+            // off by default; see docs/sotc/LOTE-2-RESULTADOS.md. A plain
+            // read-only binding (no hint, no 4 GB-style unbounded size) is a function of its V#
+            // (bytes), the guest VMA table (the clamp) and what ObtainBuffer relies on (the token
+            // of BufferCache::BindToken), so a binding of an equal V# under the same VMA table
+            // generation and a valid token repeats the remembered result: no clamp, no window
+            // logic, no ObtainBuffer. Everything per draw (descriptor, offsets, barrier check)
+            // below still runs.
+            static const bool buffer_memo_env = [] {
+                const char* v = std::getenv("SOTC_BUFFER_MEMO");
+                return v && v[0] == '1';
+            }();
+            BufferBindMemo* bmemo = nullptr;
+            u64 bmemo_words[2]{};
+            u64 bmemo_generation = 0;
+            bool memo_hit = false;
+            if (buffer_memo_env && clamp1 && !desc.is_written && !desc.is_formatted &&
+                !cs_bind_trace_on && vsharp.base_address != 0 && vsharp.GetSize() != 0 &&
+                vsharp.GetSize() < 0xFFFF0000ULL && !BbToggle::Disabled(BbToggle::BufferBindMemo)) {
+                std::memcpy(bmemo_words, &vsharp, sizeof(bmemo_words));
+                bmemo_generation = runtime_memory_generation();
+                const u64 hash = (bmemo_words[0] * 0x9E3779B97F4A7C15ULL) ^
+                                 (bmemo_words[1] * 0xC2B2AE3D27D4EB4FULL);
+                bmemo = &buffer_bind_memo[(hash ^ (hash >> 29)) % NumBufferBindMemos];
+                memo_hit = bmemo->words[0] == bmemo_words[0] && bmemo->words[1] == bmemo_words[1] &&
+                           bmemo->generation == bmemo_generation && !(bmemo_generation & 1) &&
+                           buffer_cache.BindTokenValid(bmemo->token);
+                if (SotcStats::kCmdStats) {
+                    auto& counter = memo_hit ? SotcStats::buffer_memo_hits
+                                             : SotcStats::buffer_memo_misses;
+                    counter.store(counter.load(std::memory_order_relaxed) + 1,
+                                  std::memory_order_relaxed); // draw thread only: no lock xadd
+                }
+            }
             u64 size = 0;
-            if (clamp1) {
+            if (memo_hit) {
+                size = bmemo->size;
+            } else if (clamp1) {
                 if (vsharp.base_address != 0 && vsharp.GetSize() != 0) {
                     size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
                 }
@@ -2200,9 +3472,29 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                        (!desc.is_written || memory->IsMappedAddress(vsharp.base_address))) {
                 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
             }
-            if (size == 0) {
+            DispPhase::Mark(DispPhase::BbClamp);
+            DrawPhase::Sub(DrawPhase::SBbClamp);
+            if (memo_hit) {
+                const VideoCore::Buffer* const buffer = bmemo->buffer;
+                const u64 offset = bmemo->offset;
+                const u64 offset_aligned = Common::AlignDown(offset, alignment);
+                const u64 adjust = offset - offset_aligned;
+                push_data.AddOffset(binding.buffer, adjust);
+                buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
+                bound_buffers.emplace_back(buffer, offset, size, false);
+                needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, false);
+            } else if (size == 0) {
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
+                // sotc: known shaders that read a few KiB of an unbounded descriptor (see
+                // BufferExtentHint) bind just that, not the 64 MiB window below.
+                if (!desc.is_written && vsharp.GetSize() >= 0xFFFF0000ULL) {
+                    const u64 hint = BufferExtentHint(
+                        stage, static_cast<u32>(&desc - stage.buffers.data()), vsharp.GetStride());
+                    if (hint != 0 && hint < size) {
+                        size = hint;
+                    }
+                }
                 // Guest code commonly marks a buffer as unbounded with num_records near 4GB and
                 // only touches a small part of it, and descriptors of unused bindings can hold
                 // garbage sizes of several GB. Backing such ranges makes the buffer cache keep
@@ -2228,16 +3520,63 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     size = unbounded_window;
                 }
                 if (size != vsharp.GetSize()) {
-                    LOG_DEBUG(Render, "Clamped size from {} to {} for stage {:#x}",
-                              vsharp.GetSize(), size, stage.pgm_hash);
+                    // sotc: the clamp is common (unbounded and leftover descriptors), so the logger
+                    // map lookup behind LOG_DEBUG was paid per binding. Report the first few.
+                    static std::atomic<u32> clamped_shown{0};
+                    const u32 shown = clamped_shown.load(std::memory_order_relaxed);
+                    if (shown < 8) {
+                        clamped_shown.store(shown + 1, std::memory_order_relaxed);
+                        LOG_DEBUG(Render, "Clamped size from {} to {} for stage {:#x}",
+                                  vsharp.GetSize(), size, stage.pgm_hash);
+                    }
                 }
+                // sotc: SOTC_CS_BIND_TRACE=<hash>: per binding of that compute shader (first 3
+                // dispatches, then 1 in 16, 60 shown), the descriptor and what its ObtainBuffer
+                // uploaded (needs SOTC_CMD_STATS=1 for the counters).
+                const bool bind_trace = CsBindTraceActive(stage.pgm_hash);
+                const u64 trace_up0 = bind_trace ? SotcStats::upload_bytes.load() : 0;
+                const u64 trace_pr0 = bind_trace ? SotcStats::sys_protects.load() : 0;
+                VideoCore::BufferCache::BindToken token;
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
-                    vsharp.base_address, size, desc.is_written, desc.is_formatted);
+                    vsharp.base_address, size, desc.is_written, desc.is_formatted,
+                    bmemo ? &token : nullptr);
+                DispPhase::Mark(desc.is_written ? DispPhase::BbObtW : DispPhase::BbObtR);
+                DrawPhase::Sub(DrawPhase::SBbObt);
+                if (bmemo && token.valid) {
+                    // The V# is the key: size was derived from it (and the VMA generation read
+                    // before the clamp, so a table change meanwhile makes the entry miss).
+                    *bmemo = {{bmemo_words[0], bmemo_words[1]}, bmemo_generation, buffer, offset,
+                              size, token};
+                }
+                if (bind_trace) {
+                    u32 first[4]{};
+                    memory->TryReadBacking(vsharp.base_address, first, sizeof(first));
+                    std::fprintf(stderr,
+                                 "SOTC csbind %#llx buf%u base %#llx num %#llx stride %u bound "
+                                 "%#llx written %d gpu %d uploaded %llu protects %llu mem %u %u "
+                                 "%u %u\n",
+                                 static_cast<unsigned long long>(stage.pgm_hash),
+                                 static_cast<u32>(&desc - stage.buffers.data()),
+                                 static_cast<unsigned long long>(vsharp.base_address),
+                                 static_cast<unsigned long long>(vsharp.GetSize()),
+                                 vsharp.GetStride(), static_cast<unsigned long long>(size),
+                                 int(desc.is_written),
+                                 int(buffer_cache.IsRegionGpuModified(vsharp.base_address, 32)),
+                                 static_cast<unsigned long long>(SotcStats::upload_bytes.load() -
+                                                                 trace_up0),
+                                 static_cast<unsigned long long>(SotcStats::sys_protects.load() -
+                                                                 trace_pr0),
+                                 first[0], first[1], first[2], first[3]);
+                }
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
                 const u64 adjust = offset - offset_aligned;
                 if (adjust % 4 != 0) {
-                    LOG_WARNING(Render_Vulkan, "Buffer binding in shader {:#x} isn't dword aligned",
-                                stage.pgm_hash);
+                    // sotc: per binding; throttled (P5).
+                    if (SotcStats::LogThrottled("buffer-unaligned")) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "Buffer binding in shader {:#x} isn't dword aligned",
+                                    stage.pgm_hash);
+                    }
                 }
                 push_data.AddOffset(binding.buffer, adjust);
                 buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
@@ -2247,6 +3586,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
                     Core::MemoryManager::NoteHostWrite(vsharp.base_address, size, 7,
                                                        stage.pgm_hash);
+                    DispPhase::Mark(DispPhase::BbWrite);
                 }
                 needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
             }
@@ -2260,9 +3600,18 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         set_write.descriptorType = vk::DescriptorType::eStorageBuffer;
         set_write.pBufferInfo = &buffer_infos.back();
         ++binding.buffer;
+        DrawPhase::Sub(DrawPhase::SBbDesc);
     }
 }
 
+// sotc: BbToggle::DrawBindMemo, SOTC_DRAW_MEMO=0 switches it off for the process.
+bool Rasterizer::DrawBindMemoOn() {
+    static const bool env_on = [] {
+        const char* v = std::getenv("SOTC_DRAW_MEMO");
+        return (!v || v[0] != '0') && std::getenv("SOTC_TSHARP_TRACE") == nullptr;
+    }();
+    return env_on && !BbToggle::Disabled(BbToggle::DrawBindMemo);
+}
 
 // sotc: DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL serves the depth target (stencil writes) and the
 // sampling of its depth aspect, so both uses ask for the same stages and accesses: the image state
@@ -2273,32 +3622,381 @@ static constexpr vk::AccessFlags2 kDepthReadOnlyStencilAccess =
     vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
     vk::AccessFlagBits2::eShaderRead;
 
+// The second pass of BindTextures for one image: its view, the layout transition its use needs,
+// the usage flags and the descriptor.
+void Rasterizer::BindResolvedImage(VideoCore::ImageId image_id,
+                                   VideoCore::TextureCache::BindingType type,
+                                   const VideoCore::ImageViewInfo& view_info) {
+    const bool is_storage = type == VideoCore::TextureCache::BindingType::Storage;
+    bound_images.emplace_back(image_id);
+
+    // FindTexture's UpdateImage touches the image (the LRU), so no GetImage touch first.
+    auto& image_view = texture_cache.FindTexture(image_id, type, view_info);
+    auto& image = texture_cache.PeekImage(image_id);
+    const auto binding = image.binding;
+
+    // The image is either bound as storage in a separate descriptor or bound as render
+    // target in feedback loop. Depth images are excluded because they can't be bound as
+    // storage and feedback loop doesn't make sense for them
+    if ((binding.force_general || binding.is_target) && !image.info.props.is_depth) {
+        if (instance.IsAttachmentFeedbackLoopLayoutSupported() && image.binding.is_target) {
+            needs_barrier |= runtime.Transit(
+                &image, vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT,
+                vk::PipelineStageFlagBits2::eAllGraphics, vk::AccessFlagBits2::eShaderRead);
+        } else {
+            needs_barrier |= runtime.Transit(
+                &image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
+                vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+                view_info.range);
+        }
+    } else {
+        if (is_storage) {
+            needs_barrier |= runtime.Transit(
+                &image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
+                vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+                view_info.range);
+        } else if (DepthSampledAsAttachment(image_id, image, view_info)) {
+            // sotc: the depth buffer the draw writes stencil to is also sampled (depth aspect
+            // only): DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL allows both, so the image stays in
+            // the layout the render target needs. Moving it to DEPTH_STENCIL_READ_ONLY here and
+            // back in BeginRendering ended the render pass at every such draw (~350 per frame in
+            // the Shrine). SOTC_DEPTH_RO=0 off.
+            needs_barrier |= runtime.Transit(
+                &image, vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal,
+                kDepthReadOnlyStencilStages, kDepthReadOnlyStencilAccess, view_info.range);
+        } else {
+            const auto new_layout = image.info.props.is_depth
+                                        ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+                                        : vk::ImageLayout::eShaderReadOnlyOptimal;
+            needs_barrier |= runtime.Transit(&image, new_layout,
+                                             vk::PipelineStageFlagBits2::eAllCommands,
+                                             vk::AccessFlagBits2::eShaderRead, view_info.range);
+        }
+    }
+    image.usage.storage |= is_storage;
+    image.usage.texture |= !is_storage;
+
+    image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view, image.backing->state.layout);
+    image_info_images[image_infos.size() - 1] = image_id;
+}
+
+// sotc: BbToggle::TexBindFastPath (docs/sotc/GBUFFER-FASTPATH.md). BindResolvedImage of a texture
+// binding (not storage) does: bound_images, FindTexture (UpdateImage: lock, TrackImage, TouchImage,
+// RefreshImage; FindView), Transit to the shader-read layout, usage.texture and the descriptor
+// (view, layout in force). When the image is not Dirty and tracked whole (UpdateIsNoop), has the
+// backing the view was found in (views only grow, and keep their entries), needs no barrier
+// (TransitIsNoop: same layout, access and stage, no pending write) and is not a render target or
+// forced to General (the other branch of BindResolvedImage), all that is: the LRU touch, the usage
+// flag, the bound list entry and the remembered view with the layout of the backing.
+u32 Rasterizer::TexBindFastCheck(const TexBindMemoBinding& b, VideoCore::ImageId image_id) {
+    if (!b.fast) {
+        return 1;
+    }
+    if (image_id != b.bound_id) {
+        return 2;
+    }
+    const auto& image = texture_cache.PeekImage(image_id);
+    const bool is_depth = image.info.props.is_depth;
+    if ((image.binding.force_general || image.binding.is_target) && !is_depth) {
+        return 3;
+    }
+    if (is_depth && DepthSampledAsAttachment(image_id, image, b.view_info)) {
+        return 7; // sotc: the slow path asks for the depth-read/stencil-attachment layout
+    }
+    if (image.backing != b.backing) {
+        return 4;
+    }
+    if (!VideoCore::TextureCache::UpdateIsNoop(image)) {
+        return 5;
+    }
+    const auto layout = is_depth ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+                                 : vk::ImageLayout::eShaderReadOnlyOptimal;
+    if (!image.TransitIsNoop(layout, vk::AccessFlagBits2::eShaderRead,
+                             vk::PipelineStageFlagBits2::eAllCommands, b.view_info.range)) {
+        return 6;
+    }
+    return 0;
+}
+
+void Rasterizer::TexBindFastApply(const TexBindMemoBinding& b, VideoCore::ImageId image_id) {
+    bound_images.emplace_back(image_id);
+    texture_cache.TouchLinked(image_id); // UpdateImage's touch
+    auto& image = texture_cache.PeekImage(image_id);
+    image.usage.texture = 1u;
+    image_infos.emplace_back(VK_NULL_HANDLE, b.view, image.backing->state.layout);
+    image_info_images[image_infos.size() - 1] = image_id;
+}
+
+// sotc: a TexBindMemo whose images are still the ones their lookups find (see TexBindMemoBinding).
+bool Rasterizer::TexBindMemoFresh(const TexBindMemo& memo) const {
+    if (memo.gpu_epoch != VideoCore::gpu_modified_epoch.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    for (u32 i = 0; i < memo.count; ++i) {
+        const auto& b = memo.bindings[i];
+        if (b.image_id &&
+            (texture_cache.FindGeneration(b.addr) != b.addr_gen ||
+             (b.other_addr && texture_cache.FindGeneration(b.other_addr) != b.other_gen))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// sotc: replays a TexBindMemo hit: the first and second pass of BindTextures for a stage whose
+// T#s equal the remembered ones, minus the image lookups. Returns false, having changed nothing
+// that matters, when an image wants a re-bind (the caller then resolves the stage as usual).
+bool Rasterizer::ReplayTexBindMemo(const Shader::Info& stage, TexBindMemo& memo,
+                                   const AmdGpu::Image* sharps,
+                                   boost::container::small_vector<u32, 8>& array_sizes,
+                                   std::array<VideoCore::ImageId, Shader::NUM_IMAGES>& bind_ids,
+                                   std::array<bool, Shader::NUM_IMAGES>& bind_storage,
+                                   u32& num_binds) {
+    const u32 n = memo.count;
+    std::array<VideoCore::ImageId, MemoMaxImages> ids;
+    // What FindImage did for the image: found now. Then the stencil to depth redirect.
+    for (u32 i = 0; i < n; ++i) {
+        VideoCore::ImageId image_id = memo.bindings[i].image_id;
+        if (image_id) {
+            auto* image = &texture_cache.PeekImage(image_id);
+            texture_cache.NoteFound(*image);
+            if (const auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
+                image_id = depth_image_id;
+                image = &texture_cache.GetImage(image_id);
+            }
+            if (image->binding.needs_rebind) {
+                return false;
+            }
+        }
+        ids[i] = image_id;
+    }
+    for (u32 i = 0; i < n; ++i) {
+        if (sharps[i].lod_hw_cnt_en) {
+            SotcLod::Mark(sharps[i].counter_bank_id); // GET_LOD_STATS (sotc_lod_stats.h)
+        }
+        if (ids[i]) {
+            auto& image = texture_cache.PeekImage(ids[i]);
+            if (image.binding.is_bound) {
+                image.binding.force_general |= stage.images[i].is_written;
+            }
+            image.binding.is_bound = 1u;
+        }
+        array_sizes.push_back(1);
+    }
+    for (u32 i = 0; i < n; ++i) {
+        const auto& b = memo.bindings[i];
+        VideoCore::ImageId image_id = ids[i];
+        VideoCore::TextureCache::BindingType type = b.type;
+        VideoCore::ImageViewInfo view_info = b.view_info;
+        if (!image_id) {
+            image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
+            image_info_images[image_infos.size() - 1] = {};
+        } else {
+            if (auto& old_image = texture_cache.PeekImage(image_id);
+                old_image.binding.needs_rebind) {
+                // Set meanwhile (an image update freed it): as the second pass does, from a
+                // descriptor made again from the T#, and forget this set.
+                VideoCore::TextureCache::ImageDesc desc{sharps[i], stage.images[i]};
+                old_image.binding = {};
+                image_id = texture_cache.FindImage(desc);
+                type = desc.type;
+                view_info = desc.view_info;
+                memo.stage = nullptr;
+            }
+            // sotc: BbToggle::TexBindFastPath (only when the image is the one the memo stored: a
+            // re-bind above looked up another one and goes the long way).
+            const bool same = image_id == ids[i];
+            if (same && !BbToggle::Disabled(BbToggle::TexBindFastPath)) {
+                using DepthFastStats::c;
+                ++c.bt_cand;
+                const u32 cause = TexBindFastCheck(b, image_id);
+                ++c.bt_cause[cause];
+                c.bt_hit += cause == 0;
+                if (cause == 0 && !DepthFastStats::kBtCount) {
+                    if (!DepthFastStats::kVerify) {
+                        TexBindFastApply(b, image_id);
+                    } else {
+                        // Verify: replay, snapshot, take the replay back and bind in full on top:
+                        // the descriptor and every effect on the image must be the same.
+                        struct Snap { // no padding: compared with memcmp
+                            u32 flags, usage, binding, subs;
+                            const void* backing;
+                            u64 layout, access, stage, track_a, track_b, lru, tick_found, needs,
+                                pending, bound_n, infos_n;
+                        };
+                        const auto snap = [&] {
+                            const auto& image = texture_cache.PeekImage(image_id);
+                            Snap s;
+                            std::memset(&s, 0, sizeof(s));
+                            s.flags = static_cast<u32>(image.flags);
+                            std::memcpy(&s.usage, &image.usage, sizeof(u32));
+                            std::memcpy(&s.binding, &image.binding, sizeof(u32));
+                            s.subs = static_cast<u32>(image.backing->subresource_states.size());
+                            s.backing = image.backing;
+                            s.layout = static_cast<u64>(image.backing->state.layout);
+                            s.access = static_cast<u64>(image.backing->state.access_mask);
+                            s.stage = static_cast<u64>(image.backing->state.pl_stage);
+                            s.track_a = image.track_addr;
+                            s.track_b = image.track_addr_end;
+                            s.lru = texture_cache.LruTickOf(image_id);
+                            s.tick_found = image.tick_accessed_last;
+                            s.needs = needs_barrier ? 1 : 0;
+                            s.pending = runtime.PendingImageBarriers();
+                            s.bound_n = bound_images.size();
+                            s.infos_n = image_infos.size();
+                            return s;
+                        };
+                        TexBindFastApply(b, image_id);
+                        const vk::ImageView pred_view = image_infos.back().imageView;
+                        const vk::ImageLayout pred_layout = image_infos.back().imageLayout;
+                        const Snap before = snap();
+                        bound_images.pop_back();
+                        image_infos.pop_back();
+                        BindResolvedImage(image_id, type, view_info);
+                        const Snap after = snap();
+                        ++c.bt_verify;
+                        const bool same_info = image_infos.back().imageView == pred_view &&
+                                               image_infos.back().imageLayout == pred_layout &&
+                                               bound_images.back() == image_id;
+                        if (!same_info || std::memcmp(&before, &after, sizeof(Snap)) != 0) {
+                            if (++c.bt_bad <= 20) {
+                                std::fprintf(stderr,
+                                             "SOTC BTFAST VERIFY: texture binding replay differs "
+                                             "(mismatch %llu): info %d flags %u/%u usage %u/%u "
+                                             "binding %u/%u layout %llu/%llu access %llx/%llx "
+                                             "stage %llx/%llx needs %llu/%llu pending %llu/%llu "
+                                             "lru %llu/%llu%c",
+                                             static_cast<unsigned long long>(c.bt_bad),
+                                             int(same_info), before.flags, after.flags,
+                                             before.usage, after.usage, before.binding,
+                                             after.binding,
+                                             static_cast<unsigned long long>(before.layout),
+                                             static_cast<unsigned long long>(after.layout),
+                                             static_cast<unsigned long long>(before.access),
+                                             static_cast<unsigned long long>(after.access),
+                                             static_cast<unsigned long long>(before.stage),
+                                             static_cast<unsigned long long>(after.stage),
+                                             static_cast<unsigned long long>(before.needs),
+                                             static_cast<unsigned long long>(after.needs),
+                                             static_cast<unsigned long long>(before.pending),
+                                             static_cast<unsigned long long>(after.pending),
+                                             static_cast<unsigned long long>(before.lru),
+                                             static_cast<unsigned long long>(after.lru), 10);
+                            }
+                        }
+                    }
+                    bind_ids[num_binds] = image_id;
+                    bind_storage[num_binds] = false;
+                    ++num_binds;
+                    continue;
+                }
+            }
+            BindResolvedImage(image_id, type, view_info);
+        }
+        bind_ids[num_binds] = image_id;
+        bind_storage[num_binds] =
+            image_id && type == VideoCore::TextureCache::BindingType::Storage;
+        ++num_binds;
+    }
+    return true;
+}
+
 bool Rasterizer::DepthSampledAsAttachment(VideoCore::ImageId image_id, const VideoCore::Image& image,
-                                          const VideoCore::TextureCache::ImageDesc& desc,
-                                          bool compute) const {
+                                          const VideoCore::ImageViewInfo& view_info) const {
     static const bool on = [] {
         const char* v = std::getenv("SOTC_DEPTH_RO");
         return !v || v[0] != '0';
     }();
-    if (!on || compute || !image.info.props.has_stencil || image_id != db_desc.first) {
+    if (!on || bind_stage_compute || !image.info.props.has_stencil || image_id != db_desc.first) {
         return false;
     }
     if (!liverpool->DrawRegs().depth_control.stencil_enable || db_desc.second.view_info.is_storage) {
         return false;
     }
-    const vk::Format fmt = desc.view_info.format;
+    const vk::Format fmt = view_info.format;
     return Vulkan::LiverpoolToVK::IsFormatDepthCompatible(fmt) &&
            !Vulkan::LiverpoolToVK::IsFormatStencilCompatible(fmt);
 }
 
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
+    bind_stage_compute = stage.sw_stage == Shader::SwStage::Compute; // sotc: DepthSampledAsAttachment
     const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the pass
+    DrawPhase::Sub(DrawPhase::SBtPre);
     image_bindings.clear();
     const u32 first_image_idx = image_infos.size();
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
-    for (const auto& image_desc : stage.images) {
+    // sotc: BbToggle::DrawBindMemo (TexBindMemo). A stage of plain images (no descriptor array, no
+    // mip fallback) looks its resolved bindings up by its exact T# set; a hit replays them in
+    // place of the first pass below, which then has no images to resolve.
+    std::array<VideoCore::ImageId, Shader::NUM_IMAGES> bind_ids; // each binding after the 2nd pass
+    std::array<bool, Shader::NUM_IMAGES> bind_storage;
+    u32 num_binds = 0;
+    std::array<AmdGpu::Image, MemoMaxImages> memo_sharps;
+    std::array<VideoCore::ImageId, MemoMaxImages> memo_pre_ids{};
+    TexBindMemo* memo = nullptr;
+    bool replayed = false;
+    bool memo_impure = false; // a binding depended on more than the T# bytes: do not remember
+    if (DrawBindMemoOn() && stage.images.size() <= MemoMaxImages && !stage.images.empty()) {
+        u64 hash = reinterpret_cast<uintptr_t>(&stage) * 0x9E3779B97F4A7C15ULL;
+        u32 n = 0;
+        bool plain = true;
+        for (const auto& image_desc : stage.images) {
+            if (image_desc.array_size != 0 ||
+                image_desc.mip_fallback_mode != Shader::MipStorageFallbackMode::None) {
+                plain = false;
+                break;
+            }
+            memo_sharps[n] = image_desc.GetSharp(stage);
+            std::array<u64, 4> words;
+            std::memcpy(words.data(), &memo_sharps[n], sizeof(words));
+            hash = (hash ^ words[0]) * 0xC2B2AE3D27D4EB4FULL;
+            hash = (hash ^ words[1]) * 0x165667B19E3779F9ULL;
+            hash = (hash ^ words[2]) * 0x27D4EB2F165667C5ULL;
+            hash = (hash ^ words[3]) * 0x9E3779B97F4A7C15ULL;
+            hash ^= hash >> 29;
+            ++n;
+        }
+        if (plain) {
+            if (!tex_bind_memos) {
+                tex_bind_memos.reset(static_cast<TexBindMemo*>(
+                    std::calloc(NumTexBindMemos, sizeof(TexBindMemo))));
+            }
+            memo = &tex_bind_memos[hash % NumTexBindMemos];
+            const bool key_hit = memo->stage == &stage && memo->count == n &&
+                                 std::memcmp(memo->sharps.data(), memo_sharps.data(),
+                                             n * sizeof(AmdGpu::Image)) == 0;
+            if (key_hit && TexBindMemoFresh(*memo)) {
+                replayed = ReplayTexBindMemo(stage, *memo, memo_sharps.data(),
+                                             image_descriptor_array_sizes, bind_ids, bind_storage,
+                                             num_binds);
+            }
+            if (SotcStats::kFpsLog) { // sotc: read only by the SOTC_FPS printer (sotc_stats.h)
+                (replayed ? SotcStats::bind_memo_hits : SotcStats::bind_memo_misses)
+                    .fetch_add(1, std::memory_order_relaxed);
+                if (!replayed) {
+                    // Why: another stage / T# set in the slot, the GPU-modified epoch moved, an
+                    // image's address generation moved, or the replay itself asked for a re-bind.
+                    auto& cause = !key_hit ? SotcStats::tbm_miss_key
+                                  : memo->gpu_epoch != VideoCore::gpu_modified_epoch.load(
+                                                           std::memory_order_relaxed)
+                                      ? SotcStats::tbm_miss_epoch
+                                  : !TexBindMemoFresh(*memo) ? SotcStats::tbm_miss_gen
+                                                             : SotcStats::tbm_miss_replay;
+                    cause.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        } else if (SotcStats::kFpsLog) {
+            SotcStats::tbm_not_plain.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    DispPhase::Mark(DispPhase::BtPre);
+    DrawPhase::Sub(DrawPhase::SBtMemo);
+    static const Shader::ImageResourceList no_images;
+    const Shader::ImageResourceList& first_pass_images = replayed ? no_images : stage.images;
+
+    for (const auto& image_desc : first_pass_images) {
         const auto tsharp = image_desc.GetSharp(stage);
         if (image_desc.array_size != 0) {
             // dynamic_tsharp_array_size (from Pink-shadPS4): one binding per table element, then a
@@ -2328,6 +4026,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 }
                 if (element.lod_hw_cnt_en) {
                     SotcLod::Mark(element.counter_bank_id);
+                    lod_marks.push_back(element.counter_bank_id); // sotc: replayed by a reused bind
                 }
                 auto& [image_id, desc] = image_bindings.emplace_back(
                     std::piecewise_construct, std::tuple{}, std::tuple{element, image_desc});
@@ -2382,11 +4081,15 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
         if (!memory->IsValidGpuMapping(tsharp.Address(), 0) ||
             !magic_enum::enum_contains(data_fmt) || !magic_enum::enum_contains(num_fmt)) {
-            LOG_WARNING(Render_Vulkan,
-                        "Rejecting invalid T# address={:#x}, pitch={}, width={}, "
-                        "data_format={}, num_format={}",
-                        tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
-                        static_cast<u32>(num_fmt));
+            // sotc: per binding; throttled (P5).
+            if (SotcStats::LogThrottled("image-invalid-taddr")) {
+                LOG_WARNING(Render_Vulkan,
+                            "Rejecting invalid T# address={:#x}, pitch={}, width={}, "
+                            "data_format={}, num_format={}",
+                            tsharp.Address(), tsharp.pitch, tsharp.width,
+                            static_cast<u32>(data_fmt), static_cast<u32>(num_fmt));
+            }
+            memo_impure = true; // the mapping can change without the T# changing
             image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
             image_descriptor_array_sizes.push_back(1);
             continue;
@@ -2409,6 +4112,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
 
             image_id = texture_cache.FindImage(desc);
+            if (memo && image_bindings.size() <= MemoMaxImages) {
+                memo_pre_ids[image_bindings.size() - 1] = image_id;
+            }
             auto* image = &texture_cache.GetImage(image_id);
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.
@@ -2427,9 +4133,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         image_descriptor_array_sizes.push_back(num_bindings);
     }
 
+    DispPhase::Mark(DispPhase::BtFind);
     // Second pass to re-bind images that were updated after binding
+    bool rebind_seen = false;
     for (auto& [image_id, desc] : image_bindings) {
-        bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
+        const bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
         if (!image_id) {
             image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
             image_info_images[image_infos.size() - 1] = {};
@@ -2438,62 +4146,66 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 old_image.binding.needs_rebind) {
                 old_image.binding = {};
                 image_id = texture_cache.FindImage(desc);
+                rebind_seen = true;
             }
-
-            bound_images.emplace_back(image_id);
-
-            auto& image = texture_cache.GetImage(image_id);
-            auto& image_view = texture_cache.FindTexture(image_id, desc);
-            const auto binding = image.binding;
-
-            // The image is either bound as storage in a separate descriptor or bound as render
-            // target in feedback loop. Depth images are excluded because they can't be bound as
-            // storage and feedback loop doesn't make sense for them
-            if ((binding.force_general || binding.is_target) && !image.info.props.is_depth) {
-                if (instance.IsAttachmentFeedbackLoopLayoutSupported() && image.binding.is_target) {
-                    needs_barrier |= runtime.Transit(
-                        &image, vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT,
-                        vk::PipelineStageFlagBits2::eAllGraphics, vk::AccessFlagBits2::eShaderRead);
-                } else {
-                    needs_barrier |= runtime.Transit(
-                        &image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
-                        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
-                        desc.view_info.range);
+            BindResolvedImage(image_id, desc.type, desc.view_info);
+        }
+        bind_ids[num_binds] = image_id;
+        bind_storage[num_binds] = is_storage;
+        ++num_binds;
+    }
+    DispPhase::Mark(DispPhase::BtBind);
+    // sotc: remember what this stage's set resolved to (plain stages only, see above).
+    if (memo && !replayed && !memo_impure && !rebind_seen &&
+        image_bindings.size() == stage.images.size()) {
+        // Only images FindImage matched as a whole: an overlap resolution depends on more than
+        // the registry (idle ticks, what is bound) and is made again each time.
+        // Storage bindings are made again as well: a writer's lookup frees the mip tails over it.
+        for (u32 k = 0; k < image_bindings.size() && memo; ++k) {
+            if (image_bindings[k].second.type != VideoCore::TextureCache::BindingType::Texture) {
+                memo_impure = true;
+                break;
+            }
+            if (memo_pre_ids[k] &&
+                !texture_cache.FoundExactly(memo_pre_ids[k], image_bindings[k].second)) {
+                memo_impure = true;
+                break;
+            }
+        }
+    }
+    if (memo && !replayed && !memo_impure && !rebind_seen &&
+        image_bindings.size() == stage.images.size()) {
+        memo->stage = &stage;
+        memo->gpu_epoch = VideoCore::gpu_modified_epoch.load(std::memory_order_relaxed);
+        memo->count = static_cast<u32>(stage.images.size());
+        std::memcpy(memo->sharps.data(), memo_sharps.data(),
+                    memo->count * sizeof(AmdGpu::Image));
+        for (u32 k = 0; k < memo->count; ++k) {
+            const auto& found = image_bindings[k].second;
+            auto& b = memo->bindings[k];
+            b = {.image_id = memo_pre_ids[k], .view_info = found.view_info, .type = found.type};
+            if (b.image_id) {
+                b.addr = found.info.guest_address;
+                b.addr_gen = texture_cache.FindGeneration(b.addr);
+                if (found.rebase_mip != 0 && VideoCore::MipTailMode() != 0) {
+                    b.other_addr = found.other_info ? found.other_info->guest_address : 0;
+                    b.other_gen = b.other_addr ? texture_cache.FindGeneration(b.other_addr) : 0;
                 }
-            } else {
-                if (is_storage) {
-                    needs_barrier |= runtime.Transit(
-                        &image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
-                        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
-                        desc.view_info.range);
-                } else {
-                    // sotc: the depth buffer the draw writes stencil to is also sampled (depth
-                    // aspect only): DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL allows both, so the
-                    // image stays in the layout the render target needs. Moving it to
-                    // DEPTH_STENCIL_READ_ONLY here and back in BeginRendering ended the render
-                    // pass at every such draw (~350 per frame in the Shrine). SOTC_DEPTH_RO=0 off.
-                    if (DepthSampledAsAttachment(image_id, image, desc,
-                                                 stage.sw_stage == Shader::SwStage::Compute)) {
-                        needs_barrier |= runtime.Transit(
-                            &image, vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal,
-                            kDepthReadOnlyStencilStages, kDepthReadOnlyStencilAccess,
-                            desc.view_info.range);
-                    } else {
-                        const auto new_layout = image.info.props.is_depth
-                                                    ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-                                                    : vk::ImageLayout::eShaderReadOnlyOptimal;
-                        needs_barrier |= runtime.Transit(
-                            &image, new_layout, vk::PipelineStageFlagBits2::eAllCommands,
-                            vk::AccessFlagBits2::eShaderRead, desc.view_info.range);
-                    }
+                // sotc: BbToggle::TexBindFastPath: what BindResolvedImage just gave this binding
+                // (image_infos holds one entry per image binding of a plain stage, in order).
+                const auto final_id = image_bindings[k].first;
+                const u32 info_idx = first_image_idx + k;
+                if (final_id && info_idx < image_infos.size() &&
+                    found.type == VideoCore::TextureCache::BindingType::Texture) {
+                    const auto& image = texture_cache.PeekImage(final_id);
+                    const bool special = (image.binding.force_general || image.binding.is_target) &&
+                                         !image.info.props.is_depth;
+                    b.bound_id = final_id;
+                    b.backing = image.backing;
+                    b.view = image_infos[info_idx].imageView;
+                    b.fast = !special && b.view;
                 }
             }
-            image.usage.storage |= is_storage;
-            image.usage.texture |= !is_storage;
-
-            image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view,
-                                     image.backing->state.layout);
-            image_info_images[image_infos.size() - 1] = image_id;
         }
     }
 
@@ -2505,22 +4217,21 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const char* v = std::getenv("SOTC_FG_HUDLESS");
         return v && v[0] == '1';
     }();
-    if (hudless_on && stage.sw_stage == Shader::SwStage::Fragment && image_bindings.size() == 2 &&
-        image_bindings[0].first && image_bindings[1].first &&
-        FrameGen::Current() != FrameGen::Mode::Off) {
-        const auto& ui = texture_cache.GetImage(image_bindings[0].first);
-        const auto& scene = texture_cache.GetImage(image_bindings[1].first);
+    if (hudless_on && stage.sw_stage == Shader::SwStage::Fragment && num_binds == 2 &&
+        bind_ids[0] && bind_ids[1] && FrameGen::Current() != FrameGen::Mode::Off) {
+        const auto& ui = texture_cache.GetImage(bind_ids[0]);
+        const auto& scene = texture_cache.GetImage(bind_ids[1]);
         if (ui.usage.render_target && ui.info.pixel_format == vk::Format::eR8G8B8A8Srgb &&
             scene.info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
             hudless_ui_info = static_cast<s32>(first_image_idx);
         }
     }
 
+    DrawPhase::Sub(DrawPhase::SBtImages);
     u32 image_info_idx = first_image_idx;
     u32 image_binding_idx = 0;
     for (u32 array_size : image_descriptor_array_sizes) {
-        const auto& [_, desc] = image_bindings[image_binding_idx];
-        const bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
+        const bool is_storage = bind_storage[image_binding_idx];
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = binding.unified;
@@ -2547,9 +4258,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         return r && *r && std::strcmp(r, "1920x1080") != 0;
     }();
     const VideoCore::Image* ui_asset = nullptr;
-    if (ui_linear && image_bindings.size() == 1 && image_bindings[0].first &&
-        stage.images.size() == 1 && stage.images[0].array_size == 0) {
-        const auto& image = texture_cache.GetImage(image_bindings[0].first);
+    if (ui_linear && num_binds == 1 && bind_ids[0] && stage.images.size() == 1 &&
+        stage.images[0].array_size == 0) {
+        const auto& image = texture_cache.GetImage(bind_ids[0]);
         const auto& u = image.usage;
         if (!u.render_target && !u.depth_target && !u.storage && !u.vo_surface &&
             !image.binding.is_target && !image.info.props.is_depth &&
@@ -2577,14 +4288,17 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
         if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
                                 liverpool->DrawRegs().ta_bc_base.Address() == 0)) {
-            LOG_WARNING(Render_Vulkan,
-                        "Rejecting invalid S# max_aniso={}, filter_mode={}, mip_filter={}, "
-                        "border_color_type={}, border_color_base={:#x}",
-                        static_cast<u32>(ssharp.max_aniso.Value()),
-                        static_cast<u32>(ssharp.filter_mode.Value()),
-                        static_cast<u32>(ssharp.mip_filter.Value()),
-                        static_cast<u32>(ssharp.border_color_type.Value()),
-                        liverpool->DrawRegs().ta_bc_base.Address());
+            // sotc: per binding; throttled (P5).
+            if (SotcStats::LogThrottled("sampler-invalid")) {
+                LOG_WARNING(Render_Vulkan,
+                            "Rejecting invalid S# max_aniso={}, filter_mode={}, mip_filter={}, "
+                            "border_color_type={}, border_color_base={:#x}",
+                            static_cast<u32>(ssharp.max_aniso.Value()),
+                            static_cast<u32>(ssharp.filter_mode.Value()),
+                            static_cast<u32>(ssharp.mip_filter.Value()),
+                            static_cast<u32>(ssharp.border_color_type.Value()),
+                            liverpool->DrawRegs().ta_bc_base.Address());
+            }
             ssharp = AmdGpu::Sampler{};
         }
         const auto vk_sampler =
@@ -2601,8 +4315,587 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     }
 }
 
+// sotc: BbToggle::DepthFastPath (docs/sotc/DEPTH-FASTPATH.md).
+bool Rasterizer::DepthFastActive() const {
+    return df_rel_built && !BbToggle::Disabled(BbToggle::DepthFastPath) &&
+           liverpool->IsBackThreaded() && liverpool->OnBackThread();
+}
+
+/// The register dwords the render target block reads: PrepareRenderState, BeginRendering and the
+/// dynamic state derivation (the list of CommitDynamicStateOld, a superset of what
+/// Update{ViewportScissor,DepthStencil,Primitive,Rasterization,ColorBlending}State read). The
+/// command processor sends changed dwords, so the draw thread knows per op whether one of these
+/// changed in value (Liverpool::DrawRelSerial).
+void Rasterizer::DepthFastEnsureRelevance() {
+    if (df_rel_built || !liverpool->IsBackThreaded() || !liverpool->OnBackThread()) {
+        return;
+    }
+    const auto& regs = liverpool->DrawRegs();
+    const u32* base = regs.reg_array.data();
+    std::vector<u64> depth(regs.reg_array.size() / 64 + 1, 0);
+    std::vector<u64> dynamic(regs.reg_array.size() / 64 + 1, 0);
+    std::vector<u64> color(regs.reg_array.size() / 64 + 1, 0);
+    const auto add = [&](std::vector<u64>& mask, const void* field, size_t bytes) {
+        const u32 first = static_cast<u32>(reinterpret_cast<const u32*>(field) - base);
+        const u32 last = first + static_cast<u32>((bytes + 3) / 4) - 1;
+        for (u32 d = first; d <= last; ++d) {
+            mask[d / 64] |= u64{1} << (d % 64);
+        }
+    };
+    const auto both = [&](const void* field, size_t bytes) {
+        add(depth, field, bytes);
+        add(dynamic, field, bytes);
+    };
+    // Dynamic state inputs only (the list CommitDynamicStateOld tracks).
+    add(dynamic, &regs.screen_scissor, sizeof(regs.screen_scissor));
+    add(dynamic, &regs.window_scissor, sizeof(regs.window_scissor));
+    add(dynamic, &regs.generic_scissor, sizeof(regs.generic_scissor));
+    add(dynamic, &regs.window_offset, sizeof(regs.window_offset));
+    add(dynamic, &regs.polygon_control, sizeof(regs.polygon_control));
+    add(dynamic, &regs.viewport_control, sizeof(regs.viewport_control));
+    add(dynamic, &regs.viewports, sizeof(regs.viewports));
+    add(dynamic, &regs.viewport_depths, sizeof(regs.viewport_depths));
+    add(dynamic, &regs.clipper_control, sizeof(regs.clipper_control));
+    add(dynamic, &regs.mode_control, sizeof(regs.mode_control));
+    add(dynamic, &regs.viewport_scissors, sizeof(regs.viewport_scissors));
+    add(dynamic, &regs.depth_bounds_min, sizeof(regs.depth_bounds_min));
+    add(dynamic, &regs.depth_bounds_max, sizeof(regs.depth_bounds_max));
+    add(dynamic, &regs.poly_offset, sizeof(regs.poly_offset));
+    add(dynamic, &regs.stencil_control, sizeof(regs.stencil_control));
+    add(dynamic, &regs.stencil_ref_front, sizeof(regs.stencil_ref_front));
+    add(dynamic, &regs.stencil_ref_back, sizeof(regs.stencil_ref_back));
+    add(dynamic, &regs.enable_primitive_restart, sizeof(regs.enable_primitive_restart));
+    add(dynamic, &regs.primitive_type, sizeof(regs.primitive_type));
+    add(dynamic, &regs.primitive_restart_index, sizeof(regs.primitive_restart_index));
+    add(dynamic, &regs.line_control, sizeof(regs.line_control));
+    add(dynamic, &regs.blend_constants, sizeof(regs.blend_constants));
+    // Read by both the dynamic state derivation and the depth side of the render target block.
+    // DB_DEPTH_CONTROL: the whole dword for the dynamic state (depth and stencil functions...), only
+    // stencil_enable, depth_enable and depth_write_enable (bits 0-2) for the render targets.
+    static_assert(sizeof(regs.depth_control) == sizeof(u32));
+    add(dynamic, &regs.depth_control, sizeof(regs.depth_control));
+    liverpool->SetRelevancePartial(
+        AmdGpu::Liverpool::RelRender,
+        static_cast<u32>(reinterpret_cast<const u32*>(&regs.depth_control) - base), 0x7);
+    both(&regs.depth_buffer, sizeof(regs.depth_buffer));
+    both(&regs.depth_render_control, sizeof(regs.depth_render_control));
+    // Depth side only (PrepareRenderState, BeginRendering). color_control is here because the
+    // render target memo compares cb_disabled whatever the number of colour targets.
+    add(depth, &regs.color_control, sizeof(regs.color_control));
+    add(depth, &regs.depth_view, sizeof(regs.depth_view));
+    add(depth, &regs.depth_htile_data_base, sizeof(regs.depth_htile_data_base));
+    add(depth, &regs.depth_clear, sizeof(regs.depth_clear));
+    add(depth, &regs.stencil_clear, sizeof(regs.stencil_clear));
+    // Colour side (a draw with colour targets needs this serial as well).
+    add(color, &regs.color_buffers, sizeof(regs.color_buffers));
+    add(color, &regs.color_target_mask, sizeof(regs.color_target_mask));
+    liverpool->SetRenderRelevance(AmdGpu::Liverpool::RelRender, depth.data(), depth.size());
+    liverpool->SetRenderRelevance(AmdGpu::Liverpool::RelDynamic, dynamic.data(), dynamic.size());
+    liverpool->SetRenderRelevance(AmdGpu::Liverpool::RelColor, color.data(), color.size());
+    df_rel_built = true;
+}
+
+/// 0 when the RenderState BeginRendering would derive for this depth-only draw is df_memo.state and
+/// replaying its effects is all it would do; else why not. No effects.
+u32 Rasterizer::DepthFastBeginCheck(const GraphicsPipeline*) {
+    const auto& m = df_memo;
+    if (!m.valid) {
+        return 1;
+    }
+    if (m.rel_serial != liverpool->DrawRelSerial(AmdGpu::Liverpool::RelRender)) {
+        return 2;
+    }
+    if (!db_desc.first || db_desc.first != m.db_id) {
+        return 3;
+    }
+    if (m.image_generation != texture_cache.ImageSetGeneration()) {
+        return 4;
+    }
+    if (m.gpu_epoch != VideoCore::gpu_modified_epoch.load(std::memory_order_relaxed)) {
+        return 5;
+    }
+    if (m.meta_epoch != texture_cache.MetaEpoch()) {
+        return 6;
+    }
+    const auto& image = texture_cache.PeekImage(m.db_id);
+    using Flags = VideoCore::ImageFlagBits;
+    // FindDepthTarget: MarkWritten (flag already set), UpdateImage (not Dirty, tracked whole),
+    // the ASSERT on needs_rebind; the backing is the one the views and layout were read from.
+    if (False(image.flags & Flags::Registered) || False(image.flags & Flags::GpuModified) ||
+        image.binding.needs_rebind || !VideoCore::TextureCache::UpdateIsNoop(image)) {
+        return 7;
+    }
+    if (image.backing != m.backing) {
+        return 8;
+    }
+    if (!image.TransitIsNoop(m.layout, m.access, m.stage, m.range)) {
+        return 9;
+    }
+    return 0;
+}
+
+/// The effects of BeginRendering for a depth-only draw that DepthFastBeginCheck passed: the LRU
+/// touches (depth image, linked stencil image) and the usage flag; everything else it does is a
+/// no-op then.
+void Rasterizer::DepthFastBeginApply() {
+    attachment_feedback_loop = false;
+    texture_cache.GetImage(df_memo.db_id);
+    texture_cache.TouchLinked(df_memo.stencil_id);
+    texture_cache.PeekImage(df_memo.db_id).usage.depth_target = true;
+}
+
+void Rasterizer::DepthFastRecord(const RenderState& state) {
+    using DepthFastStats::c;
+    auto& m = df_memo;
+    const auto& att = state.depth_stencil_attachment;
+    // A state that clears is not the state the next draw derives (the clear bit is consumed).
+    if (!db_desc.first || att.depth_clear || att.stencil_clear || state.num_color_attachments != 0) {
+        m.valid = false;
+        ++c.begin_norecord;
+        return;
+    }
+    const auto& image = texture_cache.PeekImage(db_desc.first);
+    m.valid = true;
+    m.rel_serial = liverpool->DrawRelSerial(AmdGpu::Liverpool::RelRender);
+    m.image_generation = texture_cache.ImageSetGeneration();
+    m.gpu_epoch = VideoCore::gpu_modified_epoch.load(std::memory_order_relaxed);
+    m.meta_epoch = texture_cache.MetaEpoch();
+    m.db_id = db_desc.first;
+    m.stencil_id = texture_cache.LastDepthStencil();
+    m.backing = image.backing;
+    m.layout = df_transit_layout;
+    m.access = df_transit_access;
+    m.stage = df_transit_stage;
+    m.range = df_transit_range;
+    m.state = state;
+    m.token = df_next_token++;
+    ++c.begin_record;
+    if (DepthFastStats::kWhy) {
+        const auto& regs = liverpool->DrawRegs();
+        df_snap.depth_control = regs.depth_control;
+        df_snap.depth_buffer = regs.depth_buffer;
+        df_snap.depth_render_control = regs.depth_render_control;
+        df_snap.color_control = regs.color_control;
+        df_snap.depth_view = regs.depth_view;
+        df_snap.htile = regs.depth_htile_data_base.address;
+        df_snap.depth_clear = std::bit_cast<u32>(regs.depth_clear);
+        df_snap.stencil_clear = regs.stencil_clear;
+        df_snap.db_extent = liverpool->DrawDbExtent().raw;
+    }
+}
+
+// sotc: BbToggle::GBufferFastPath (docs/sotc/GBUFFER-FASTPATH.md). The transition BeginRendering
+// makes on every colour attachment, a constant of the code.
+static constexpr vk::ImageLayout kGbColorLayout = vk::ImageLayout::eColorAttachmentOptimal;
+static constexpr vk::PipelineStageFlags2 kGbColorStage =
+    vk::PipelineStageFlagBits2::eColorAttachmentOutput;
+static constexpr vk::AccessFlags2 kGbColorAccess =
+    vk::AccessFlagBits2::eColorAttachmentWrite | vk::AccessFlagBits2::eColorAttachmentRead;
+
+/// 0 when the RenderState BeginRendering would derive for this draw (colour targets) is
+/// gb_memo.state and replaying its effects is all it would do; else why not (kGbCause). No effects.
+u32 Rasterizer::GBufferFastCheck(const GraphicsPipeline* pipeline) {
+    using Flags = VideoCore::ImageFlagBits;
+    const auto& m = gb_memo;
+    if (!m.valid) {
+        return 1;
+    }
+    const auto& key = pipeline->GetGraphicsKey();
+    if (m.mrt_mask != key.mrt_mask || m.samples != key.color_samples) {
+        return 2;
+    }
+    if (m.rel_render != liverpool->DrawRelSerial(AmdGpu::Liverpool::RelRender) ||
+        m.rel_color != liverpool->DrawRelSerial(AmdGpu::Liverpool::RelColor)) {
+        return 3;
+    }
+    for (u32 cb = 0; cb < m.num_cb; ++cb) {
+        if (cb_descs[cb].first != m.color_id[cb]) {
+            return 4;
+        }
+    }
+    if (db_desc.first != m.db_id) {
+        return 4;
+    }
+    if (m.image_generation != texture_cache.ImageSetGeneration()) {
+        return 5;
+    }
+    if (m.gpu_epoch != VideoCore::gpu_modified_epoch.load(std::memory_order_relaxed)) {
+        return 6;
+    }
+    if (m.meta_epoch != texture_cache.MetaEpoch()) {
+        return 7;
+    }
+    for (u32 cb = 0; cb < m.num_cb; ++cb) {
+        const auto id = m.color_id[cb];
+        if (!id) {
+            continue;
+        }
+        const auto& image = texture_cache.PeekImage(id);
+        // FindRenderTarget: MarkWritten (flag already set), UpdateImage (not Dirty, tracked whole),
+        // the needs_rebind re-lookup; the backing is the one the view and layout were read from.
+        if (False(image.flags & Flags::Registered) || False(image.flags & Flags::GpuModified) ||
+            image.binding.needs_rebind || !VideoCore::TextureCache::UpdateIsNoop(image)) {
+            return 8;
+        }
+        if (image.binding.is_bound) { // sampled by this draw: feedback loop, full path
+            return 9;
+        }
+        if (image.backing != m.color_backing[cb]) {
+            return 10;
+        }
+        if (!image.TransitIsNoop(kGbColorLayout, kGbColorAccess, kGbColorStage,
+                                 cb_descs[cb].second.view_info.range)) {
+            return 11;
+        }
+    }
+    if (m.num_cb != 0 && m.color_id[0] && texture_cache.PeekImage(m.color_id[0]).usage.vo_surface) {
+        return 12;
+    }
+    if (m.db_id) {
+        const auto& image = texture_cache.PeekImage(m.db_id);
+        if (False(image.flags & Flags::Registered) || False(image.flags & Flags::GpuModified) ||
+            image.binding.needs_rebind || !VideoCore::TextureCache::UpdateIsNoop(image)) {
+            return 13;
+        }
+        if (image.backing != m.db_backing) {
+            return 14;
+        }
+        if (!image.TransitIsNoop(m.db_layout, m.db_access, m.db_stage, m.db_range)) {
+            return 15;
+        }
+    }
+    return 0;
+}
+
+/// The effects of BeginRendering for a draw GBufferFastCheck passed: the LRU touches (attachment
+/// images, linked stencil image) and the usage flags; everything else it does is a no-op then.
+void Rasterizer::GBufferFastApply() {
+    const auto& m = gb_memo;
+    attachment_feedback_loop = false;
+    for (u32 cb = 0; cb < m.num_cb; ++cb) {
+        if (m.color_id[cb]) {
+            texture_cache.GetImage(m.color_id[cb]).usage.render_target = 1u;
+        }
+    }
+    if (m.db_id) {
+        texture_cache.GetImage(m.db_id);
+        texture_cache.TouchLinked(m.stencil_id);
+        texture_cache.PeekImage(m.db_id).usage.depth_target = true;
+    }
+}
+
+/// Remembers what the full BeginRendering that just ran derived, unless the next draw could not
+/// reuse it (it cleared, sampled one of its targets, ...).
+void Rasterizer::GBufferFastRecord(const RenderState& state, const GraphicsPipeline* pipeline) {
+    using Flags = VideoCore::ImageFlagBits;
+    using DepthFastStats::c;
+    auto& m = gb_memo;
+    const auto reject = [&](u32 why) {
+        m.valid = false;
+        ++c.gb_norecord;
+        ++c.gb_norec[why];
+    };
+    const auto& key = pipeline->GetGraphicsKey();
+    const u32 num_cb = state.num_color_attachments;
+    if (num_cb > AmdGpu::NUM_COLOR_BUFFERS) {
+        return reject(2);
+    }
+    if (attachment_feedback_loop) {
+        return reject(1);
+    }
+    const auto& att = state.depth_stencil_attachment;
+    if (att.depth_clear || att.stencil_clear) {
+        return reject(0);
+    }
+    for (u32 cb = 0; cb < num_cb; ++cb) {
+        if (state.color_attachments[cb].is_clear) { // the clear bit was consumed by this draw
+            return reject(0);
+        }
+        const auto id = cb_descs[cb].first;
+        if (!id) {
+            continue;
+        }
+        const auto& image = texture_cache.PeekImage(id);
+        if (False(image.flags & Flags::Registered) || False(image.flags & Flags::GpuModified) ||
+            image.binding.needs_rebind || image.binding.is_bound ||
+            !VideoCore::TextureCache::UpdateIsNoop(image) ||
+            !texture_cache.RenderTargetReplayable(image)) {
+            return reject(2);
+        }
+        if (!image.backing || image.backing->num_samples != key.color_samples[cb]) {
+            return reject(6);
+        }
+        if (!image.TransitIsNoop(kGbColorLayout, kGbColorAccess, kGbColorStage,
+                                 cb_descs[cb].second.view_info.range)) {
+            return reject(5);
+        }
+    }
+    if (num_cb != 0 && cb_descs[0].first &&
+        texture_cache.PeekImage(cb_descs[0].first).usage.vo_surface) {
+        return reject(3);
+    }
+    if (db_desc.first) {
+        const auto& image = texture_cache.PeekImage(db_desc.first);
+        if (False(image.flags & Flags::Registered) || False(image.flags & Flags::GpuModified) ||
+            image.binding.needs_rebind || !VideoCore::TextureCache::UpdateIsNoop(image)) {
+            return reject(4);
+        }
+        if (!image.TransitIsNoop(df_transit_layout, df_transit_access, df_transit_stage,
+                                 df_transit_range)) {
+            return reject(5);
+        }
+    }
+    m.valid = true;
+    m.rel_render = liverpool->DrawRelSerial(AmdGpu::Liverpool::RelRender);
+    m.rel_color = liverpool->DrawRelSerial(AmdGpu::Liverpool::RelColor);
+    m.mrt_mask = key.mrt_mask;
+    m.num_cb = num_cb;
+    m.samples = key.color_samples;
+    m.image_generation = texture_cache.ImageSetGeneration();
+    m.gpu_epoch = VideoCore::gpu_modified_epoch.load(std::memory_order_relaxed);
+    m.meta_epoch = texture_cache.MetaEpoch();
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        const auto id = cb < num_cb ? cb_descs[cb].first : VideoCore::ImageId{};
+        m.color_id[cb] = id;
+        m.color_backing[cb] = id ? texture_cache.PeekImage(id).backing : nullptr;
+    }
+    m.db_id = db_desc.first;
+    m.stencil_id = db_desc.first ? texture_cache.LastDepthStencil() : VideoCore::ImageId{};
+    m.db_backing = db_desc.first ? texture_cache.PeekImage(db_desc.first).backing : nullptr;
+    m.db_layout = df_transit_layout;
+    m.db_access = df_transit_access;
+    m.db_stage = df_transit_stage;
+    m.db_range = df_transit_range;
+    m.state = state;
+    m.token = df_next_token++;
+    ++c.gb_record;
+}
+
+const RenderState& Rasterizer::GBufferFast(const GraphicsPipeline* pipeline, RenderState& storage,
+                                           u64& token) {
+    using DepthFastStats::c;
+    ++c.gb_cand;
+    const auto texture_lock = texture_cache.BatchLock(); // the flags are read under the cache lock
+    const u32 cause = GBufferFastCheck(pipeline);
+    ++c.gb_cause[cause];
+    if (cause != 0) {
+        storage = BeginRendering(pipeline);
+        GBufferFastRecord(storage, pipeline);
+        return storage;
+    }
+    ++c.gb_hit;
+    if (DepthFastStats::kGbCount) {
+        // Count only: the full path runs; the replay it would have made must have given its state.
+        storage = BeginRendering(pipeline);
+        c.gb_count_bad += !(storage == gb_memo.state);
+        return storage;
+    }
+    if (!DepthFastStats::kVerify) {
+        GBufferFastApply();
+        token = gb_memo.token;
+        return gb_memo.state;
+    }
+    // Verify: replay, then derive in full on top. The full call must change nothing more (the
+    // snapshot is the same), add no barrier and return the replayed state.
+    struct Snap { // no padding: compared with memcmp
+        struct Img {
+            u32 flags, usage, binding, meta_mask;
+            const void* backing;
+            u64 layout, access, stage, subs, track_a, track_b, lru, tick_found;
+        };
+        Img img[9];
+        u64 feedback, barrier, bound_n, hudless, pending, ids, lru_stencil;
+    };
+    const auto snap = [&] {
+        Snap s;
+        std::memset(&s, 0, sizeof(s));
+        const auto& regs = liverpool->DrawRegs();
+        const auto fill = [&](Snap::Img& o, VideoCore::ImageId id, VAddr meta) {
+            const auto& image = texture_cache.PeekImage(id);
+            o.flags = static_cast<u32>(image.flags);
+            std::memcpy(&o.usage, &image.usage, sizeof(u32));
+            std::memcpy(&o.binding, &image.binding, sizeof(u32));
+            o.meta_mask = texture_cache.MetaClearMask(meta);
+            o.backing = image.backing;
+            o.layout = static_cast<u64>(image.backing->state.layout);
+            o.access = static_cast<u64>(image.backing->state.access_mask);
+            o.stage = static_cast<u64>(image.backing->state.pl_stage);
+            o.subs = image.backing->subresource_states.size();
+            o.track_a = image.track_addr;
+            o.track_b = image.track_addr_end;
+            o.lru = texture_cache.LruTickOf(id);
+            o.tick_found = image.tick_accessed_last;
+        };
+        for (u32 cb = 0; cb < gb_memo.num_cb; ++cb) {
+            const auto id = cb_descs[cb].first;
+            s.ids = s.ids * 1099511628211ull + (id ? id.index : 0xFFFFu) + 1;
+            if (id) {
+                fill(s.img[cb], id, regs.color_buffers[cb].CmaskAddress());
+            }
+        }
+        s.ids = s.ids * 1099511628211ull + (db_desc.first ? db_desc.first.index : 0xFFFFu) + 1;
+        if (db_desc.first) {
+            fill(s.img[8], db_desc.first, regs.depth_htile_data_base.GetAddress());
+        }
+        if (gb_memo.stencil_id) {
+            s.lru_stencil = texture_cache.LruTickOf(gb_memo.stencil_id);
+        }
+        s.feedback = attachment_feedback_loop ? 1 : 0;
+        s.barrier = needs_barrier ? 1 : 0;
+        s.bound_n = bound_images.size();
+        s.hudless = hudless_vo;
+        s.pending = runtime.PendingImageBarriers();
+        return s;
+    };
+    GBufferFastApply();
+    const Snap before = snap();
+    storage = BeginRendering(pipeline);
+    const Snap after = snap();
+    ++c.gb_verify;
+    const bool same_state = storage == gb_memo.state;
+    const bool same_snap = std::memcmp(&before, &after, sizeof(Snap)) == 0;
+    if (!same_state || !same_snap) {
+        if (++c.gb_bad <= 20) {
+            int first_diff = -1;
+            for (int i = 0; i < 9 && first_diff < 0; ++i) {
+                if (std::memcmp(&before.img[i], &after.img[i], sizeof(Snap::Img)) != 0) {
+                    first_diff = i;
+                }
+            }
+            std::fprintf(stderr,
+                         "SOTC GBFAST VERIFY: BeginRendering replay differs (mismatch %llu): state "
+                         "%d snapshot %d first differing attachment %d (feedback %d/%d barrier "
+                         "%d/%d bound %llu/%llu hudless %llx/%llx pending %llu/%llu ids %d)%c",
+                         static_cast<unsigned long long>(c.gb_bad), int(same_state), int(same_snap),
+                         first_diff, int(before.feedback), int(after.feedback), int(before.barrier),
+                         int(after.barrier), static_cast<unsigned long long>(before.bound_n),
+                         static_cast<unsigned long long>(after.bound_n),
+                         static_cast<unsigned long long>(before.hudless),
+                         static_cast<unsigned long long>(after.hudless),
+                         static_cast<unsigned long long>(before.pending),
+                         static_cast<unsigned long long>(after.pending), int(before.ids == after.ids),
+                         10);
+        }
+    }
+    return storage;
+}
+
+const RenderState& Rasterizer::BeginRenderingFast(const GraphicsPipeline* pipeline,
+                                                  RenderState& storage, u64& token) {
+    token = 0;
+    using DepthFastStats::c;
+    if (!DepthFastActive()) {
+        storage = BeginRendering(pipeline);
+        return storage;
+    }
+    DepthFastStats::NoteDraw();
+    if (pipeline->GetGraphicsKey().mrt_mask != 0) {
+        if (BbToggle::Disabled(BbToggle::GBufferFastPath)) {
+            storage = BeginRendering(pipeline);
+            return storage;
+        }
+        return GBufferFast(pipeline, storage, token);
+    }
+    ++c.begin_cand;
+    const auto texture_lock = texture_cache.BatchLock(); // the flags are read under the cache lock
+    const u32 cause = DepthFastBeginCheck(pipeline);
+    ++c.cause[cause];
+    if (cause == 2 && DepthFastStats::kWhy) {
+        const auto& regs = liverpool->DrawRegs();
+        const auto differs = [](const auto& a, const auto& b) {
+            return std::memcmp(&a, &b, sizeof(a)) != 0;
+        };
+        c.why[0] += differs(df_snap.depth_control, regs.depth_control);
+        c.why[1] += differs(df_snap.depth_buffer, regs.depth_buffer);
+        c.why[2] += differs(df_snap.depth_render_control, regs.depth_render_control);
+        c.why[3] += differs(df_snap.color_control, regs.color_control);
+        c.why[4] += differs(df_snap.depth_view, regs.depth_view);
+        c.why[5] += df_snap.htile != regs.depth_htile_data_base.address;
+        c.why[6] += df_snap.depth_clear != std::bit_cast<u32>(regs.depth_clear);
+        c.why[7] += df_snap.stencil_clear != regs.stencil_clear;
+        c.why[8] += df_snap.db_extent != liverpool->DrawDbExtent().raw;
+    }
+    if (cause == 0) {
+        ++c.begin_hit;
+        if (!DepthFastStats::kVerify) {
+            DepthFastBeginApply();
+            token = df_memo.token;
+            return df_memo.state;
+        }
+        // Verify: replay, then derive in full on top. The full call must change nothing more (the
+        // snapshot is the same), add no barrier and return the replayed state.
+        struct Snap { // no padding: compared with memcmp
+            u32 flags, usage, binding, meta_mask, feedback, barrier;
+            const void* backing;
+            u64 layout, access, stage;
+            u64 subs;
+            u64 track_a, track_b, lru_image, lru_stencil, tick_found;
+            u64 pending;
+        };
+        const auto snap = [&] {
+            const auto& image = texture_cache.PeekImage(df_memo.db_id);
+            Snap s{};
+            s.flags = static_cast<u32>(image.flags);
+            std::memcpy(&s.usage, &image.usage, sizeof(u32));
+            std::memcpy(&s.binding, &image.binding, sizeof(u32));
+            s.backing = image.backing;
+            s.layout = static_cast<u64>(image.backing->state.layout);
+            s.access = static_cast<u64>(image.backing->state.access_mask);
+            s.stage = static_cast<u64>(image.backing->state.pl_stage);
+            s.subs = image.backing->subresource_states.size();
+            s.track_a = image.track_addr;
+            s.track_b = image.track_addr_end;
+            s.lru_image = texture_cache.LruTickOf(df_memo.db_id);
+            s.lru_stencil = df_memo.stencil_id ? texture_cache.LruTickOf(df_memo.stencil_id) : 0;
+            s.tick_found = image.tick_accessed_last;
+            s.meta_mask =
+                texture_cache.MetaClearMask(liverpool->DrawRegs().depth_htile_data_base.GetAddress());
+            s.feedback = attachment_feedback_loop ? 1 : 0;
+            s.barrier = needs_barrier ? 1 : 0;
+            s.pending = runtime.PendingImageBarriers();
+            return s;
+        };
+        DepthFastBeginApply();
+        const Snap before = snap();
+        storage = BeginRendering(pipeline);
+        const Snap after = snap();
+        ++c.begin_verify;
+        const bool same_state = storage == df_memo.state;
+        const bool same_snap = std::memcmp(&before, &after, sizeof(Snap)) == 0;
+        if (!same_state || !same_snap) {
+            if (++c.begin_bad <= 20) {
+                std::fprintf(stderr,
+                             "SOTC DEPTHFAST VERIFY: BeginRendering replay differs (mismatch %llu): "
+                             "state %d snapshot %d (flags %u/%u binding %u/%u layout %llu/%llu "
+                             "access %llx/%llx subs %llu/%llu lru %llu/%llu stencil %llu/%llu meta "
+                             "%u/%u feedback %d/%d barrier %d/%d pending %llu/%llu)%c",
+                             static_cast<unsigned long long>(c.begin_bad), int(same_state),
+                             int(same_snap), before.flags, after.flags, before.binding,
+                             after.binding, static_cast<unsigned long long>(before.layout),
+                             static_cast<unsigned long long>(after.layout),
+                             static_cast<unsigned long long>(before.access),
+                             static_cast<unsigned long long>(after.access),
+                             static_cast<unsigned long long>(before.subs),
+                             static_cast<unsigned long long>(after.subs), static_cast<unsigned long long>(before.lru_image),
+                             static_cast<unsigned long long>(after.lru_image),
+                             static_cast<unsigned long long>(before.lru_stencil),
+                             static_cast<unsigned long long>(after.lru_stencil), before.meta_mask,
+                             after.meta_mask, int(before.feedback), int(after.feedback),
+                             int(before.barrier), int(after.barrier),
+                             static_cast<unsigned long long>(before.pending),
+                             static_cast<unsigned long long>(after.pending), 10);
+            }
+        }
+        return storage;
+    }
+    storage = BeginRendering(pipeline);
+    DepthFastRecord(storage);
+    return storage;
+}
+
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the attachments
+    DrawPhase::SubBeg(DrawPhase::SBegLock);
     attachment_feedback_loop = false;
     // sotc: SOTC_RT_FAST (default on) drops redundant attachment work: FindRenderTarget repeats
     // UpdateImage only when the image still needs it, and the CMASK/HTILE clear bit is read and
@@ -2618,6 +4911,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     state.height = instance.GetMaxFramebufferHeight();
     state.num_layers = std::numeric_limits<u16>::max();
     state.num_color_attachments = std::bit_width(key.mrt_mask);
+    DrawPhase::LapStart();
     for (auto cb = 0u; cb < state.num_color_attachments; ++cb) {
         auto& [image_id, desc] = cb_descs[cb];
         if (!image_id) {
@@ -2630,8 +4924,11 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             image = &texture_cache.GetImage(image_id);
         }
         texture_cache.UpdateImage(image_id);
+        DrawPhase::Lap(0);
         runtime.SetBackingSamples(image, key.color_samples[cb]);
+        DrawPhase::Lap(1);
         const auto& image_view = texture_cache.FindRenderTarget(image_id, desc, !rt_fast);
+        DrawPhase::Lap(2);
         const auto slice = image_view.info.range.base.layer;
         const auto mip = image_view.info.range.base.level;
 
@@ -2644,6 +4941,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             is_clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
             texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
         }
+        DrawPhase::Lap(3);
 
         if (image->binding.is_bound) {
             ASSERT_MSG(!image->binding.force_general,
@@ -2666,6 +4964,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                                              desc.view_info.range);
         }
 
+        DrawPhase::Lap(4);
         state.width = std::min<u32>(state.width, std::max(image->info.size.width >> mip, 1u));
         state.height = std::min<u32>(state.height, std::max(image->info.size.height >> mip, 1u));
         state.num_layers = std::min<u32>(state.num_layers, image_view.info.range.extent.layers);
@@ -2686,6 +4985,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             hudless_vo_height = image->info.size.height;
         }
     }
+    DrawPhase::Lap(5);
     for (u32 cb = state.num_color_attachments; cb < state.color_attachments.size(); ++cb) {
         state.color_attachments[cb] = {};
     }
@@ -2695,6 +4995,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         const auto& image_view = texture_cache.FindDepthTarget(image_id, desc);
         auto& image = texture_cache.GetImage(image_id);
+        DrawPhase::SubBeg(DrawPhase::SBegFind);
 
         const auto slice = image_view.info.range.base.layer;
         const bool depth_reg_clear = regs.depth_render_control.depth_clear_enable &&
@@ -2713,6 +5014,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         if (!rt_fast) {
             texture_cache.TouchMeta(htile_address, slice, false);
         }
+        DrawPhase::SubBeg(DrawPhase::SBegMeta);
         ASSERT(desc.view_info.range.extent.levels == 1 && !image.binding.needs_rebind);
 
         const bool has_stencil = image.info.props.has_stencil;
@@ -2726,21 +5028,26 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                                     ? vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal
                                 : has_stencil ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
                                               : vk::ImageLayout::eDepthReadOnlyOptimal;
+        // sotc: DepthFastPath replays this transition's arguments (BeginRenderingFast).
+        // sotc: SOTC_DEPTH_RO (upstream): the stencil-write layout asks for the stages and accesses
+        // the sampling of its depth aspect asks for (BindResolvedImage), so the state stays put.
         static const bool depth_ro = [] {
             const char* v = std::getenv("SOTC_DEPTH_RO");
             return !v || v[0] != '0';
         }();
+        df_transit_layout = new_layout;
         if (depth_ro && new_layout == vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal) {
-            needs_barrier |= runtime.Transit(&image, new_layout, kDepthReadOnlyStencilStages,
-                                             kDepthReadOnlyStencilAccess, desc.view_info.range);
+            df_transit_stage = kDepthReadOnlyStencilStages;
+            df_transit_access = kDepthReadOnlyStencilAccess;
         } else {
-            needs_barrier |= runtime.Transit(&image, new_layout,
-                                             vk::PipelineStageFlagBits2::eEarlyFragmentTests |
-                                                 vk::PipelineStageFlagBits2::eLateFragmentTests,
-                                             vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
-                                                 vk::AccessFlagBits2::eDepthStencilAttachmentRead,
-                                             desc.view_info.range);
+            df_transit_stage = vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                               vk::PipelineStageFlagBits2::eLateFragmentTests;
+            df_transit_access = vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+                                vk::AccessFlagBits2::eDepthStencilAttachmentRead;
         }
+        df_transit_range = desc.view_info.range;
+        needs_barrier |= runtime.Transit(&image, new_layout, df_transit_stage, df_transit_access,
+                                         desc.view_info.range);
 
         state.width = std::min<u32>(state.width, image.info.size.width);
         state.height = std::min<u32>(state.height, image.info.size.height);
@@ -2772,6 +5079,8 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         state.num_layers = 1;
     }
 
+    DrawPhase::Lap(6);
+    DrawPhase::SubBeg(DrawPhase::SBegTrans);
     return state;
 }
 
@@ -2793,6 +5102,11 @@ void Rasterizer::Resolve() {
 
 void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
     auto& regs = liverpool->DrawRegs();
+    if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1
+        SotcOps::NoteTouch(SotcOps::TouchCopySrc, 0, 0, false, regs.depth_buffer.DepthAddress(), 1);
+        SotcOps::NoteTouch(SotcOps::TouchCopyDst, 0, 0, true, regs.depth_buffer.DepthWriteAddress(),
+                           1);
+    }
 
     auto read_desc = VideoCore::TextureCache::ImageDesc(
         regs.depth_buffer, regs.depth_view, regs.depth_control,
@@ -2821,6 +5135,9 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
 void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
     ASSERT_MSG(address % 4 == 0 && num_bytes % 4 == 0,
                "FillBuffer address and size must be a multiple of 4 bytes");
+    if (SotcOps::kOn && !is_gds) [[unlikely]] { // sotc: SOTC_OP_STATS=1
+        SotcOps::NoteTouch(SotcOps::TouchFill, 0, 0, true, address, num_bytes);
+    }
     if (!is_gds) {
         texture_cache.ClearMeta(address);
         if (!buffer_cache.IsRegionGpuModified(address, num_bytes)) {
@@ -2839,6 +5156,14 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
+    if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1
+        if (!src_gds) {
+            SotcOps::NoteTouch(SotcOps::TouchCopySrc, 0, 0, false, src, num_bytes);
+        }
+        if (!dst_gds) {
+            SotcOps::NoteTouch(SotcOps::TouchCopyDst, 0, 0, true, dst, num_bytes);
+        }
+    }
     if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
         if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
             !texture_cache.FindImageFromRange(src, num_bytes)) {
@@ -2890,6 +5215,9 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
 // cache goes first so the page becomes writable last, after any wait on the texture mutex (the GPU
 // thread then has less time to protect it again before the guest retries its write).
 bool Rasterizer::InvalidateMemoryOnGuestFault(VAddr addr, u64 size) {
+    if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1
+        SotcOps::NoteCpuAccess(true, addr, size);
+    }
     if (!IsMapped(addr, size)) {
         return false;
     }
@@ -2904,6 +5232,9 @@ bool Rasterizer::InvalidateMemoryOnGuestFault(VAddr addr, u64 size) {
 }
 
 bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
+    if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1
+        SotcOps::NoteCpuAccess(false, addr, size);
+    }
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
@@ -2979,15 +5310,209 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     }
 }
 
-void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
+void Rasterizer::UpdateDynamicStateValues(const GraphicsPipeline* pipeline,
+                                          const bool is_indexed) const {
     UpdateViewportScissorState();
     UpdateDepthStencilState();
     UpdatePrimitiveState(is_indexed);
     UpdateRasterizationState();
     UpdateColorBlendingState(pipeline);
+}
 
+void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
+    UpdateDynamicStateValues(pipeline, is_indexed);
     auto& dynamic_state = scheduler.GetDynamicState();
     dynamic_state.Commit(instance, scheduler.CommandBuffer());
+}
+
+// sotc: BbToggle::DrawFixedCostOpt. The dynamic state object keeps the values derived for the
+// last draw (the setters compare against them and Invalidate only marks them dirty again), so a
+// draw whose inputs are those of the last derivation can go straight to Commit. The inputs are
+// the registers Update*State read (their chunks, tracked by value on the draw thread:
+// Liverpool::DrawChunksChangedSince), the pipeline's colour write masks and the feedback loop
+// flag of this draw. SOTC_DRAW_OPT_VERIFY=1 derives anyway on every hit and reports a value that
+// the memo would have kept stale.
+// sotc: BbToggle::DepthFastPath. A draw whose dynamic state inputs are those of the last derivation
+// (nothing the Update*State functions read changed in value: Liverpool::DrawRelSerial; the
+// pipeline's write masks, the feedback loop flag and indexed-ness are the same) commits what the
+// dynamic state object already holds; any other goes the old way and remembers its inputs.
+void Rasterizer::CommitDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) {
+    if (!DepthFastActive()) {
+        df_dyn.valid = false; // a derivation that does not go through the memo changes the values
+        CommitDynamicStateOld(pipeline, is_indexed);
+        return;
+    }
+    using DepthFastStats::c;
+    const auto& key = pipeline->GetGraphicsKey();
+    const u32 serial = liverpool->DrawRelSerial(AmdGpu::Liverpool::RelDynamic);
+    if (df_dyn.valid && df_dyn.rel_serial == serial &&
+        df_dyn.feedback_loop == attachment_feedback_loop && df_dyn.is_indexed == is_indexed &&
+        df_dyn.write_masks == key.write_masks) {
+        ++c.dyn_hit;
+        auto& dynamic_state = scheduler.GetDynamicState();
+        if (DepthFastStats::kVerify) {
+            // Derive again with every dirty bit clear: a bit that comes up is a value the replay
+            // would have left behind. The bits are merged back so the state stays right.
+            const auto saved = dynamic_state.dirty_state;
+            std::memset(&dynamic_state.dirty_state, 0, sizeof(dynamic_state.dirty_state));
+            UpdateDynamicStateValues(pipeline, is_indexed);
+            u8 now[sizeof(saved)], old[sizeof(saved)];
+            std::memcpy(now, &dynamic_state.dirty_state, sizeof(now));
+            std::memcpy(old, &saved, sizeof(old));
+            bool stale = false;
+            for (size_t i = 0; i < sizeof(now); ++i) {
+                stale |= now[i] != 0;
+                now[i] |= old[i];
+            }
+            std::memcpy(&dynamic_state.dirty_state, now, sizeof(now));
+            ++c.dyn_verify;
+            if (stale && ++c.dyn_bad <= 20) {
+                std::fprintf(stderr,
+                             "SOTC DEPTHFAST VERIFY: dynamic state replay kept a stale value "
+                             "(mismatch %llu)%c",
+                             static_cast<unsigned long long>(c.dyn_bad), 10);
+            }
+        }
+        dynamic_state.Commit(instance, scheduler.CommandBuffer());
+        return;
+    }
+    ++c.dyn_miss;
+    CommitDynamicStateOld(pipeline, is_indexed);
+    df_dyn.valid = true;
+    df_dyn.rel_serial = serial;
+    df_dyn.feedback_loop = attachment_feedback_loop;
+    df_dyn.is_indexed = is_indexed;
+    df_dyn.write_masks = key.write_masks;
+}
+
+void Rasterizer::CommitDynamicStateOld(const GraphicsPipeline* pipeline, const bool is_indexed) {
+    static const bool verify = std::getenv("SOTC_DRAW_OPT_VERIFY") != nullptr;
+    if (BbToggle::Disabled(BbToggle::DrawFixedCostOpt) || !liverpool->IsBackThreaded() ||
+        !liverpool->OnBackThread()) {
+        dyn_memo.valid = false;
+        UpdateDynamicState(pipeline, is_indexed);
+        return;
+    }
+    if (dyn_chunks.empty()) {
+        const auto& regs = liverpool->DrawRegs();
+        const u32* base = regs.reg_array.data();
+        const auto add = [&](const void* field, size_t bytes) {
+            const u32 first = static_cast<u32>(reinterpret_cast<const u32*>(field) - base);
+            const u32 last = first + static_cast<u32>((bytes + 3) / 4) - 1;
+            dyn_fields.push_back({first * 4, static_cast<u32>(bytes)});
+            dyn_snap.resize(dyn_snap.size() + bytes);
+            for (u32 chunk = first / 64; chunk <= last / 64; ++chunk) {
+                if (std::find(dyn_chunks.begin(), dyn_chunks.end(), chunk) == dyn_chunks.end()) {
+                    dyn_chunks.push_back(static_cast<u16>(chunk));
+                }
+            }
+        };
+        // Everything Update{ViewportScissor,DepthStencil,Primitive,Rasterization,ColorBlending}State
+        // and the helpers they call (IsClipDisabled, NeedsBias, DepthValid, ...) read.
+        add(&regs.screen_scissor, sizeof(regs.screen_scissor));
+        add(&regs.window_scissor, sizeof(regs.window_scissor));
+        add(&regs.generic_scissor, sizeof(regs.generic_scissor));
+        add(&regs.window_offset, sizeof(regs.window_offset));
+        add(&regs.polygon_control, sizeof(regs.polygon_control));
+        add(&regs.viewport_control, sizeof(regs.viewport_control));
+        add(&regs.viewports, sizeof(regs.viewports));
+        add(&regs.viewport_depths, sizeof(regs.viewport_depths));
+        add(&regs.clipper_control, sizeof(regs.clipper_control));
+        add(&regs.mode_control, sizeof(regs.mode_control));
+        add(&regs.viewport_scissors, sizeof(regs.viewport_scissors));
+        add(&regs.depth_control, sizeof(regs.depth_control));
+        add(&regs.depth_buffer, sizeof(regs.depth_buffer));
+        add(&regs.depth_render_control, sizeof(regs.depth_render_control));
+        add(&regs.depth_bounds_min, sizeof(regs.depth_bounds_min));
+        add(&regs.depth_bounds_max, sizeof(regs.depth_bounds_max));
+        add(&regs.poly_offset, sizeof(regs.poly_offset));
+        add(&regs.stencil_control, sizeof(regs.stencil_control));
+        add(&regs.stencil_ref_front, sizeof(regs.stencil_ref_front));
+        add(&regs.stencil_ref_back, sizeof(regs.stencil_ref_back));
+        add(&regs.enable_primitive_restart, sizeof(regs.enable_primitive_restart));
+        add(&regs.primitive_type, sizeof(regs.primitive_type));
+        add(&regs.primitive_restart_index, sizeof(regs.primitive_restart_index));
+        add(&regs.line_control, sizeof(regs.line_control));
+        add(&regs.blend_constants, sizeof(regs.blend_constants));
+    }
+    const auto& key = pipeline->GetGraphicsKey();
+    const auto& live = liverpool->DrawRegs();
+    const u8* live_bytes = reinterpret_cast<const u8*>(live.reg_array.data());
+    bool hit = dyn_memo.valid && dyn_memo.feedback_loop == attachment_feedback_loop &&
+               dyn_memo.write_masks == key.write_masks;
+    if (hit && liverpool->DrawChunksChangedSince(dyn_chunks.data(), dyn_chunks.size(),
+                                                 dyn_memo.serial)) {
+        // A chunk the inputs live in carried changes (a chunk holds up to 64 registers): the
+        // inputs themselves decide.
+        size_t at = 0;
+        for (const auto& [offset, bytes] : dyn_fields) {
+            if (std::memcmp(live_bytes + offset, dyn_snap.data() + at, bytes) != 0) {
+                hit = false;
+                break;
+            }
+            at += bytes;
+        }
+        if (hit) {
+            dyn_memo.serial = liverpool->DrawRegSerial();
+        }
+    }
+    if (hit) {
+        auto& dynamic_state = scheduler.GetDynamicState();
+        if (verify) {
+            // Derive again with every dirty bit clear: a bit that comes up is a value the memo
+            // would have left behind. The bits are merged back so the state stays right.
+            const auto saved = dynamic_state.dirty_state;
+            std::memset(&dynamic_state.dirty_state, 0, sizeof(dynamic_state.dirty_state));
+            UpdateDynamicStateValues(pipeline, is_indexed);
+            u8 now[sizeof(saved)], old[sizeof(saved)];
+            std::memcpy(now, &dynamic_state.dirty_state, sizeof(now));
+            std::memcpy(old, &saved, sizeof(old));
+            bool stale = false;
+            for (size_t i = 0; i < sizeof(now); ++i) {
+                stale |= now[i] != 0;
+                now[i] |= old[i];
+            }
+            std::memcpy(&dynamic_state.dirty_state, now, sizeof(now));
+            static std::atomic<u64> mismatches{0}, hits{0};
+            hits.fetch_add(1, std::memory_order_relaxed);
+            if (stale) {
+                const u64 n = mismatches.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (n <= 20) {
+                    std::fprintf(stderr, "SOTC DRAW OPT VERIFY: dynamic state memo kept a stale "
+                                         "value (mismatch %llu of %llu hits)\n",
+                                 static_cast<unsigned long long>(n),
+                                 static_cast<unsigned long long>(hits.load()));
+                }
+            } else if ((hits.load() & 0xFFFFF) == 0) {
+                std::fprintf(stderr, "SOTC DRAW OPT VERIFY: dynamic state memo ok, %llu hits, %llu "
+                                     "mismatches\n",
+                             static_cast<unsigned long long>(hits.load()),
+                             static_cast<unsigned long long>(mismatches.load()));
+            }
+        }
+        DrawPhase::Sub(DrawPhase::SDynCheck);
+        dynamic_state.Commit(instance, scheduler.CommandBuffer());
+        DrawPhase::Sub(DrawPhase::SDynCommit);
+        if (DrawPhase::kOn) {
+            DrawPhase::dyn_hits.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    if (DrawPhase::kOn) {
+        DrawPhase::dyn_misses.fetch_add(1, std::memory_order_relaxed);
+    }
+    {
+        size_t at = 0;
+        for (const auto& [offset, bytes] : dyn_fields) {
+            std::memcpy(dyn_snap.data() + at, live_bytes + offset, bytes);
+            at += bytes;
+        }
+    }
+    dyn_memo.valid = true;
+    dyn_memo.feedback_loop = attachment_feedback_loop;
+    dyn_memo.write_masks = key.write_masks;
+    dyn_memo.serial = liverpool->DrawRegSerial();
+    UpdateDynamicState(pipeline, is_indexed);
 }
 
 void Rasterizer::UpdateViewportScissorState() const {
@@ -3194,8 +5719,12 @@ void Rasterizer::UpdateDepthStencilState() const {
         if ((front_op && ref_conflict(regs.depth_control.stencil_ref_func, front)) ||
             (back_op && regs.depth_control.backface_enable &&
              ref_conflict(regs.depth_control.stencil_bf_func, back))) {
-            LOG_WARNING(Render_Vulkan, "Stencil test requires test_val while ReplaceOp requires "
-                                       "op_val; the stencil test will use op_val");
+            // sotc: per draw with this state; throttled (P5).
+            if (SotcStats::LogThrottled("stencil-ref-conflict")) {
+                LOG_WARNING(Render_Vulkan,
+                            "Stencil test requires test_val while ReplaceOp requires op_val; "
+                            "the stencil test will use op_val");
+            }
         }
         dynamic_state.SetStencilReferences(front_op ? front.stencil_op_val : front.stencil_test_val,
                                            back_op ? back.stencil_op_val : back.stencil_test_val);

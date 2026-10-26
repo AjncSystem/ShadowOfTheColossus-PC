@@ -76,6 +76,11 @@ public:
 
     void FlushBarriers();
 
+    /// sotc: image barriers waiting for FlushBarriers (SOTC_DEPTHFAST_VERIFY compares it).
+    [[nodiscard]] size_t PendingImageBarriers() const {
+        return static_cast<size_t>(image_barriers.size());
+    }
+
 private:
     void MakeCurrent(const VideoCore::Buffer* handle);
 
@@ -99,6 +104,20 @@ private:
     std::size_t active_resources{};
     bool access_reuse{true};
     bool access_union{true};
+    // sotc: BbToggle::DrawBindMemo. The accesses applied since the last FlushBarriers (the epoch),
+    // direct mapped: applying the same one again changes neither range list nor barrier masks, so
+    // a draw that binds what the previous one bound skips them (AccessBuffer).
+    struct AccessMemo {
+        const VideoCore::Buffer* handle{};
+        u64 offset{};
+        u64 size{};
+        u64 stage{};
+        u64 access{};
+        u64 epoch{};
+    };
+    static constexpr std::size_t NumAccessMemos = 64;
+    std::array<AccessMemo, NumAccessMemos> access_memos{};
+    u64 access_epoch{1};
     VideoCore::Image::Barriers image_barriers;
     vk::MemoryBarrier2 memory_barrier{};
 };

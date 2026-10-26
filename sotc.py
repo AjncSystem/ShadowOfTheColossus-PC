@@ -241,8 +241,9 @@ def main():
     env.setdefault('BB_DMEM_MB', '9152')
     # The game waits for vblanks: at 60 Hz an uncapped frame (fps60, or F7 in game) still rounds
     # up to 30 FPS. With the cap, 120 Hz only shows a late frame sooner (and SOTC_FPS_LIMIT counts
-    # in 120 Hz vblanks).
-    env.setdefault('BB_VBLANK_HZ', '120')
+    # in 120 Hz vblanks). sotc: with the 60 FPS limit, 480 Hz shows a frame that missed 16.7 ms
+    # ~2 ms later instead of at 25 ms (Shrine +2.9%, p99 25.8 -> 23.4 ms; docs/sotc/PERFIL-2.md).
+    env.setdefault('BB_VBLANK_HZ', '480' if env.get('SOTC_FPS_LIMIT') == '60' else '120')
     if 'hdr' in modes.lower():
         # HDR10 swapchain (Rec.2020 PQ, when Windows HDR is on); the game then offers HDR too.
         env.setdefault('BB_HDR', '1')

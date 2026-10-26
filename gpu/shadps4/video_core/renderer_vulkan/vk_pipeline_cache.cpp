@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstdio>
 #include <unordered_set>
+#include "bbport_toggles.h"
 #include "common/elf_info.h"
 #include "common/assert_scope.h"
 #include "common/hash.h"
@@ -891,11 +892,40 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                          liverpool->regs.num_indices > 6 && instance.IsVertexInputDynamicState() &&
                          !EmulatorSettings.IsShaderCollect();
     translation_pending = false;
+    // sotc: PipelineKeyMemo (BbToggle::PipelineKeyMemo disables it, SOTC_PIPE_KEY_MEMO=0 too):
+    // RefreshGraphicsKey only reads the registers and the draw's indirect parameters, so a draw
+    // that wrote no register chunk and passes the same parameters would rebuild exactly the key
+    // of the previous draw and then hit the pipe memo below anyway. Return its pipeline without
+    // walking the shader stages (GetProgram, specializations, flat buffers: ~15% of the command
+    // processor at the Shrine). Without the draw thread MarkRegs does not track chunks.
+    static const bool key_memo_env = [] {
+        const char* v = std::getenv("SOTC_PIPE_KEY_MEMO");
+        return !v || v[0] != '0';
+    }();
+    if (key_memo_env && !BbToggle::Disabled(BbToggle::PipelineKeyMemo) &&
+        last_graphics_pipeline && liverpool->IsBackThreaded() && !liverpool->HasDirtyRegChunks() &&
+        params.vertex_sgpr_offset == last_graphics_params.vertex_sgpr_offset &&
+        params.instance_sgpr_offset == last_graphics_params.instance_sgpr_offset) {
+        if (SotcStats::kFpsLog) {
+            SotcStats::pipe_key_memo_hits.fetch_add(1, std::memory_order_relaxed);
+        }
+        return last_graphics_pipeline;
+    }
+    if (SotcStats::kFpsLog) {
+        SotcStats::pipe_key_memo_misses.fetch_add(1, std::memory_order_relaxed);
+    }
+    const u64 key_start = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
     if (!RefreshGraphicsKey()) {
         if (translation_pending) {
             SotcStats::async_translate_skips.fetch_add(1, std::memory_order_relaxed);
         }
+        last_graphics_pipeline = nullptr; // sotc: the key is not usable for the next draw
         return nullptr;
+    }
+    if (key_start) {
+        SotcStats::pipe_key_ns.fetch_add(SotcStats::NowNs() - key_start,
+                                         std::memory_order_relaxed);
+        SotcStats::pipe_key_draws.fetch_add(1, std::memory_order_relaxed);
     }
     // sotc: consecutive draws mostly use the same pipeline: when the freshly built key equals the
     // previous draw's byte for byte, skip the map's hash and probe. The stage state (infos,
@@ -906,7 +936,14 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     }();
     if (pipe_memo && last_graphics_pipeline &&
         std::memcmp(&graphics_key, &last_graphics_key, sizeof(graphics_key)) == 0) {
+        if (SotcStats::kFpsLog) {
+            SotcStats::pipe_same_key_hits.fetch_add(1, std::memory_order_relaxed);
+        }
+        last_graphics_params = params;
         return last_graphics_pipeline;
+    }
+    if (SotcStats::kFpsLog) {
+        SotcStats::pipe_same_key_misses.fetch_add(1, std::memory_order_relaxed);
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     // sotc: still being built by a pipeline worker (SOTC_ASYNC_SHADERS, SOTC_ASYNC_PRELOAD). A
@@ -914,6 +951,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     // dropped when collected.
     const bool queued = !is_new && !it->second;
     if (queued && liverpool->regs.num_indices > 6) {
+        last_graphics_pipeline = nullptr; // sotc: key memo off until one is installed
         return nullptr;
     }
     if (is_new || queued) {
@@ -926,6 +964,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         const bool eligible = AsyncPipelineEligible();
         if (!async_workers.empty() && !tiny_draw && eligible && !queued) {
             QueueAsyncPipeline(pipeline_hash);
+            last_graphics_pipeline = nullptr; // sotc: key memo off until it is installed
             return nullptr; // the draws that need it are skipped until it is ready
         }
         const SotcStats::ScopedTimer stall_timer{SotcStats::pipeline_ns};
@@ -961,6 +1000,7 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     }
     std::memcpy(&last_graphics_key, &graphics_key, sizeof(graphics_key));
     last_graphics_pipeline = it->second.get();
+    last_graphics_params = params;
     return it->second.get();
 }
 

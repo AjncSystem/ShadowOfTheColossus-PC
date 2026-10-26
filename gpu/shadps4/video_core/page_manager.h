@@ -53,6 +53,26 @@ void ForEachNonStackRange(VAddr address, u64 size, NonStackRangeFn func);
 struct UffdImpl;
 struct SignalImpl;
 
+/// sotc: protect batch (off by default, SOTC_PROTECT_BATCH=1 turns it on). While a scope is open on this thread,
+/// the buffer tracker's restrictive protections (PageManager::UpdatePageWatchersForRegion: pages
+/// that lose access) update the page state at once but only record the page range; the scope end,
+/// PageManager::FlushProtectBatch() and the fault handlers issue them sorted and merged, one host
+/// protect per merged range. Anything that reads guest memory expecting those pages protected
+/// (the upload copies) must call FlushProtectBatch() first. Grants of access, the texture
+/// tracker and every other thread never wait for the batch. Scopes nest (the outermost flushes).
+bool ProtectBatchEnabled();
+
+class ProtectBatchScope {
+public:
+    ProtectBatchScope() noexcept;
+    ~ProtectBatchScope();
+    ProtectBatchScope(const ProtectBatchScope&) = delete;
+    ProtectBatchScope& operator=(const ProtectBatchScope&) = delete;
+
+private:
+    bool active;
+};
+
 enum class PageOp : s8 {
     None = 0,
     Track = 1,
@@ -80,6 +100,9 @@ public:
     void UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,
                                      const RegionBits& write_mask, const RegionBits& read_mask,
                                      PageOp write_op, PageOp read_op) const;
+
+    /// sotc: issues this thread's batched protections now (no-op outside a scope or when empty).
+    static void FlushProtectBatch();
 
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {

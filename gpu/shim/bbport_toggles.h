@@ -48,7 +48,21 @@ enum : std::uint64_t {
     DrawPipeline = 1ull << 37,
     PipelinedTasks = 1ull << 38,
     PendingFenceWaits = 1ull << 39,
-    PipelinedDispatch = 1ull << 40,
+    // sotc (DISPATCH-FASTPATH.md): bit 40 was PipelinedDispatch (no reader left); reused.
+    DispatchFastPath = 1ull << 40, ///< set: every written binding inserts its range into
+                                   ///< current_writes (a tree search and merges) and the write-mark
+                                   ///< memo is dropped by any readback that enters the list in
+                                   ///< flight; clear: the ranges go to a vector that the two
+                                   ///< Intersects queries scan too, and a readback that entered
+                                   ///< after the memo was made drops it only when the binding
+                                   ///< touches its region or GPU page runs; in-flight readbacks
+                                   ///< keep a hull that skips them; ClampRangeSize is remembered per
+                                   ///< VMA table generation; the resident-range, write-mark and
+                                   ///< barrier-access memos use 1024/2048/256 slots instead of
+                                   ///< 64/256/64. Same answers; honoured live, read per call. SET BY
+                                   ///< DEFAULT: measured -0.3 +- 0.17 ms of draw thread, below the
+                                   ///< 0.5 ms bar (SOTC_DISPFAST=1/0 pins it, SOTC_DISPFAST_VERIFY=1
+                                   ///< checks; docs/sotc/DISPATCH-FASTPATH.md).
     RecorderFences = 1ull << 41,
     PipelinedMemoryWrites = 1ull << 42,
     MultiCopyShader = 1ull << 43,

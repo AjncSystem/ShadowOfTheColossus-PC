@@ -331,6 +331,18 @@ private:
     };
     static constexpr size_t NumBufferBindMemos = 1024;
     std::array<BufferBindMemo, NumBufferBindMemos> buffer_bind_memo{};
+    /// sotc: BbToggle::DispatchFastPath. ClampRangeSize of a binding's (address, size), which only
+    /// depends on the guest VMA table: remembered per table generation (runtime_memory_generation,
+    /// even and unchanged = the same table).
+    struct ClampMemo {
+        VAddr base{};
+        u64 size{};
+        u64 generation{}; ///< 0: empty (a valid generation is even and never 0 once the table has changed)
+        u64 result{};
+    };
+    static constexpr size_t NumClampMemos = 512;
+    std::array<ClampMemo, NumClampMemos> clamp_memos{};
+    u64 ClampBindingSize(VAddr base, u64 size);
 
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;

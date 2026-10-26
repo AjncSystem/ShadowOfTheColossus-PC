@@ -742,7 +742,9 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
     if (memo_enabled && !BbToggle::Disabled(BbToggle::DrawBindMemo)) {
         const u64 hash = (reinterpret_cast<uintptr_t>(handle) * 0x9E3779B97F4A7C15ULL) ^
                          (offset * 0xC2B2AE3D27D4EB4FULL) ^ (size * 0x165667B19E3779F9ULL);
-        memo = &access_memos[(hash ^ (hash >> 32)) % NumAccessMemos];
+        // sotc: BbToggle::DispatchFastPath: 256 slots instead of 64.
+        memo = &access_memos[(hash ^ (hash >> 32)) %
+                             (BbToggle::Disabled(BbToggle::DispatchFastPath) ? 64 : NumAccessMemos)];
         if (memo->epoch == access_epoch && memo->handle == handle && memo->offset == offset &&
             memo->size == size && memo->stage == u64{static_cast<VkFlags64>(src_stage)} &&
             memo->access == u64{static_cast<VkFlags64>(src_access)}) {

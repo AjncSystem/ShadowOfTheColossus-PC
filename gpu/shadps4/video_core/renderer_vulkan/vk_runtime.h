@@ -115,7 +115,7 @@ private:
         u64 access{};
         u64 epoch{};
     };
-    static constexpr std::size_t NumAccessMemos = 64;
+    static constexpr std::size_t NumAccessMemos = 256; // sotc: 64 before DispatchFastPath (hash % 64)
     std::array<AccessMemo, NumAccessMemos> access_memos{};
     u64 access_epoch{1};
     VideoCore::Image::Barriers image_barriers;

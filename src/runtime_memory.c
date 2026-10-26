@@ -159,7 +159,12 @@ static void rw_wrunlock(void) { pthread_rwlock_unlock(&lock); }
 #endif
 static __thread unsigned exclusive_depth;
 /* Odd while a writer holds the lock; readers' region caches are valid for one even value. */
-static uint64_t table_generation;
+/* sotc: DISPATCH-FASTPATH.md: the draw thread reads this word for every region/backing/clamp lookup
+ * (8,000 bindings a frame), and the lock word next to it is written by every guest thread that takes
+ * the lock for reading: the load missed the cache each time another core had just written the line.
+ * Alone on a 64-byte line it stays shared. Layout only, same values. */
+static uint64_t table_generation_line[8] __attribute__((aligned(64)));
+#define table_generation (table_generation_line[0])
 #ifdef _WIN32
 /* sotc: SOTC_STALL_LOG: how long a thread holds the lock exclusively (a map, unmap or protect of
  * the game) and who took it; a guest thread holding it stalls the draw thread's per-draw lookups
@@ -1422,7 +1427,10 @@ void *runtime_low_map(size_t size, int prot) {
  * and fine pipeline key memo are exact (SOTC_CP_VERIFY=1: 0 bad in 13 M checks) and take 0.4 ms of the
  * command processor's ~11 ms in the heavy temple, but the draw thread is the limiter there and the frame time
  * did not move measurably (docs/sotc/SIGUIENTE-LIMITE.md). SOTC_CP_FAST=1 turns it on (see toggle_mask_env). */
-uint64_t runtime_disabled_optimizations=UINT64_C(1)<<20 | UINT64_C(1)<<39 | UINT64_C(1)<<59 | UINT64_C(1)<<60;
+/* sotc: bit 40 (DispatchFastPath) is SET = off by default: exact (SOTC_DISPFAST_VERIFY=1: 0 bad in >100 M checks) but it
+ * saved ~0.3 +- 0.17 ms of the draw thread in the heavy temple, under the 0.5 ms bar and with no visible FPS gain
+ * (docs/sotc/DISPATCH-FASTPATH.md). SOTC_DISPFAST=1 turns it on (see toggle_mask_env). */
+uint64_t runtime_disabled_optimizations=UINT64_C(1)<<20 | UINT64_C(1)<<39 | UINT64_C(1)<<40 | UINT64_C(1)<<59 | UINT64_C(1)<<60;
 /* Speculative readers of guest memory (GPU draw-preparation workers) register a recovery
  * point: a fault on that thread jumps back to it instead of terminating (probe.c). */
 __thread sigjmp_buf *runtime_fault_recover;
@@ -1449,6 +1457,10 @@ static uint64_t toggle_mask_env(uint64_t mask) {
     const char *fast=getenv("SOTC_CP_FAST");
     if (fast && fast[0]=='1') mask&=~(UINT64_C(1)<<20);
     else if (fast && fast[0]=='0') mask|=(UINT64_C(1)<<20);
+    /* sotc: SOTC_DISPFAST=1/0 pins bit 40 (DispatchFastPath, set = off by default until accepted), see SOTC_CP_FAST. */
+    const char *dfast=getenv("SOTC_DISPFAST");
+    if (dfast && dfast[0]=='1') mask&=~(UINT64_C(1)<<40);
+    else if (dfast && dfast[0]=='0') mask|=(UINT64_C(1)<<40);
     const char *env=getenv("SOTC_TIMER_RES");
     if (!env) return mask;
     if (env[0]=='1') return mask&~(UINT64_C(1)<<61);

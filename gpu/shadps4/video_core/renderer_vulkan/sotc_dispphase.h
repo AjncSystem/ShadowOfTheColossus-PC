@@ -38,12 +38,13 @@ enum Phase : uint32_t {
     EndRend,  // EndRendering
     PipeBind, // Pipeline::BindResources (push constants + descriptor push)
     Issue,    // bindPipeline + dispatch + stats
-    Post,     // ResetBindings + FlushPeriodic
+    PostReset, // ResetBindings
+    Post,     // FlushPeriodic
     NumPhases,
 };
 inline constexpr const char* kNames[NumPhases] = {"pre",   "hle",    "brpre",  "clamp", "obtR",  "obtW",
                                                   "wrnote", "flat",  "bbrest", "btex", "btpre", "btfind", "btbind", "dma",   "barrier",
-                                                  "endrend", "pipe", "issue",  "post"};
+                                                  "endrend", "pipe", "issue",  "reset", "post"};
 inline constexpr uint32_t NumClasses = 3; // 0 replicator HLE, 1 direct, 2 indirect
 
 struct ShaderRow {
@@ -59,6 +60,11 @@ struct Sub {
     uint64_t hle_cmp_bytes{}, hle_repl_bytes{}, hle_big_n{}, hle_big_ticks{}, hle_table_bytes{};
     // ObtainBuffer by [written]: calls, calls that uploaded, ticks of each stage.
     uint64_t ob_n[2]{}, ob_up[2]{}, ob_arena[2]{}, ob_sync[2]{}, ob_sync_up[2]{}, ob_mark[2]{};
+    // sotc (DISPATCH-FASTPATH.md): inside the uploading calls of SynchronizeMemory, by [written].
+    uint64_t up_collect[2]{}, up_flush[2]{}, up_commit[2]{}, up_ranges[2]{}, up_bytes[2]{};
+    // TextureCache::FindImage inside a dispatch, by outcome: 0 memo hit, 1 perfect match without a
+    // memo, 2 overlap resolved to an image, 3 resolution failed / new image; plus Expand/Free calls.
+    uint64_t fi_n[4]{}, fi_ticks[4]{}, fi_expand{}, fi_free{};
 };
 inline Sub& Subs() {
     static Sub s;
@@ -189,6 +195,31 @@ inline void Print(State& s) {
                          u.ob_up[w] ? double(u.ob_sync_up[w]) * tk / u.ob_up[w] : 0.0,
                          double(u.ob_mark[w]) * tk / u.ob_n[w]);
         }
+        for (int w = 0; w < 2; ++w) {
+            if (u.up_ranges[w] == 0) {
+                continue;
+            }
+            const uint64_t n = std::max<uint64_t>(1, u.ob_up[w]);
+            std::fprintf(stderr,
+                         "SOTC DISPPHASE upload %s n=%llu: collect %.3f flush %.3f commit %.3f us each, "
+                         "%.2f ranges, %.1f KB\n",
+                         w ? "written" : "read", static_cast<unsigned long long>(u.ob_up[w]),
+                         double(u.up_collect[w]) * tk / n, double(u.up_flush[w]) * tk / n,
+                         double(u.up_commit[w]) * tk / n, double(u.up_ranges[w]) / n,
+                         double(u.up_bytes[w]) / 1024.0 / n);
+        }
+        if (u.fi_n[0] + u.fi_n[1] + u.fi_n[2] + u.fi_n[3] != 0) {
+            static const char* names[4] = {"memo", "perfect", "overlap", "new"};
+            std::fprintf(stderr, "SOTC DISPPHASE findimage:");
+            for (int k = 0; k < 4; ++k) {
+                std::fprintf(stderr, " %s n=%llu %.2f us", names[k],
+                             static_cast<unsigned long long>(u.fi_n[k]),
+                             u.fi_n[k] ? double(u.fi_ticks[k]) * tk / u.fi_n[k] : 0.0);
+            }
+            std::fprintf(stderr, "; expand %llu free %llu\n",
+                         static_cast<unsigned long long>(u.fi_expand),
+                         static_cast<unsigned long long>(u.fi_free));
+        }
         u = {};
     }
     std::vector<ShaderRow> sorted;
@@ -264,7 +295,7 @@ inline void Finish(uint32_t cls, uint64_t hash, uint64_t groups, uint32_t bufs, 
             r.rendering += rendering;
             r.obt_ticks += s.t[BbObtR] + s.t[BbObtW];
             r.btex_ticks += s.t[BtTex] + s.t[BtPre] + s.t[BtFind] + s.t[BtBind];
-            r.post_ticks += s.t[Post];
+            r.post_ticks += s.t[Post] + s.t[PostReset];
             break;
         }
     }

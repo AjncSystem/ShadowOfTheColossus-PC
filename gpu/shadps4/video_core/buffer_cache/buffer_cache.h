@@ -301,6 +301,10 @@ private:
         boost::container::small_vector<StaleRange, 16> stale;
         bool stale_overflow{};
         u8 first_cause{0xFF};
+        u64 seq{}; ///< sotc: DispatchFastPath, inflight_gen value when it entered inflight_readbacks
+        /// sotc: DispatchFastPath, [hull_lo, hull_hi) holds every item region and GPU page run of
+        /// `pending` (fixed once the readback is in flight): a range outside it touches none.
+        VAddr hull_lo{~VAddr{0}}, hull_hi{0};
     };
     static constexpr size_t MaxStaleRanges = 128;
     void BeginAsyncReadback(AsyncReadback& readback);
@@ -418,7 +422,9 @@ private:
         u16 epoch{}; ///< sotc: use epoch its blocks were last stamped with
         u8 cls{};    ///< sotc: bind class its blocks were marked with (ArenaBindClass)
     };
-    std::array<ResidentCacheEntry, 64> resident_cache{};
+    // sotc: 64 slots before BbToggle::DispatchFastPath; the bit clear spreads over 1024 (an entry
+    // is valid by its own contents, wherever it sits).
+    std::array<ResidentCacheEntry, 1024> resident_cache{};
 
     u64 dma_runs_version = ~0ULL;
     size_t dma_runs_arenas{};
@@ -477,7 +483,7 @@ private:
         u64 tick{}, cw_gen{}, hot_gen{};
         bool a_valid{}, b_valid{}, hot_overlap{};
     };
-    static constexpr size_t NumWriteMarkMemos = 256;
+    static constexpr size_t NumWriteMarkMemos = 2048; // sotc: 256 before DispatchFastPath (low 256 slots)
     std::array<WriteMarkMemo, NumWriteMarkMemos> write_mark_memos{};
     u64 inflight_gen{};   ///< bumped when a readback enters inflight_readbacks
     u64 hot_reads_gen{};  ///< bumped when a hot read is added
@@ -487,6 +493,17 @@ private:
     RangeSet current_writes;
     u64 current_writes_tick{};
     void RecordCurrentWrite(VAddr addr, u64 size);
+    /// sotc: BbToggle::DispatchFastPath. The ranges RecordCurrentWrite appended since the last
+    /// Clear and did not insert into current_writes yet (its only queries are Intersects, answered
+    /// from both). Draw thread only, like current_writes.
+    std::vector<std::pair<VAddr, VAddr>> pending_writes;
+    static constexpr size_t MaxPendingWrites = 1024;
+    void ClearCurrentWrites();
+    void FlushPendingWrites();
+    [[nodiscard]] bool CurrentWritesIntersects(VAddr addr, u64 size);
+    /// sotc: whether marking [addr, addr + size) written would change a readback that entered
+    /// inflight_readbacks after `seq` (its region or one of its GPU page runs overlaps).
+    [[nodiscard]] bool InflightHitSince(u64 seq, VAddr addr, u64 size) const;
     /// sotc: the range the guest touched, during the DownloadMemory of its window (size 0 else).
     VAddr fault_addr{};
     u64 fault_size{};

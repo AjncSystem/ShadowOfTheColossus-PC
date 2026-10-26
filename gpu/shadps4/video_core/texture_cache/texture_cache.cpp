@@ -35,6 +35,7 @@
 #include "video_core/sotc_texdiag.h"
 #include "video_core/sotc_ui_lang.h"
 #include "video_core/sotc_stats.h"
+#include "video_core/renderer_vulkan/sotc_dispphase.h" // sotc: SOTC_DISP_PHASES
 #include "video_core/texture_cache/tile_manager.h"
 
 namespace VideoCore {
@@ -699,6 +700,9 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
+    if (DispPhase::kOn && DispPhase::Active()) {
+        ++DispPhase::Subs().fi_expand;
+    }
     const auto new_image_id = slot_images.insert(instance, runtime, slot_image_views, info);
     RegisterImage(new_image_id);
 
@@ -762,6 +766,19 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     const auto& info = desc.info;
     ASSERT(info.guest_address != 0);
 
+    // sotc: SOTC_DISP_PHASES: time by outcome of the lookups a dispatch makes.
+    struct FindScope {
+        u64 t0 = DispPhase::kOn && DispPhase::Active() ? DispPhase::Now() : 0;
+        int outcome = -1;
+        ~FindScope() {
+            if (t0 == 0 || outcome < 0) {
+                return;
+            }
+            auto& u = DispPhase::Subs();
+            ++u.fi_n[outcome];
+            u.fi_ticks[outcome] += DispPhase::Now() - t0;
+        }
+    } find_scope;
     std::unique_lock lock{mutex, std::defer_lock};
     LockCounted(lock);
     // sotc: SOTC_MIP_TAIL: `info` may become the T#'s mip tail.
@@ -782,6 +799,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         if (tail_candidate) {
             SetMipTailView(desc, -1);
         }
+        find_scope.outcome = 0;
         return memo_id;
     }
     // sotc: SOTC_IMG_WATCH=<address>: every lookup (texture, storage, render target) that
@@ -833,6 +851,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     // Try to resolve overlaps (if any)
     int view_mip{-1};
     int view_slice{-1};
+    const bool overlap_resolved = !image_id && !image_ids.empty();
     if (!image_id) {
         for (const auto& cache_id : image_ids) {
             view_mip = -1;
@@ -861,8 +880,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             LOG_WARNING(Render_Vulkan, "Image overlap resolve failed");
         }
     }
+    find_scope.outcome = overlap_resolved ? 2 : 1;
     // Create and register a new image
     if (!image_id) {
+        find_scope.outcome = 3;
         const SotcStats::ScopedTimer stall_timer{SotcStats::image_ns};
         SotcStats::images_new.fetch_add(1, std::memory_order_relaxed);
         image_id = slot_images.insert(instance, runtime, slot_image_views, info);
@@ -2323,6 +2344,9 @@ void TextureCache::TouchImage(const Image& image) {
 }
 
 void TextureCache::FreeImage(ImageId image_id, const char* why) {
+    if (DispPhase::kOn && DispPhase::Active()) {
+        ++DispPhase::Subs().fi_free;
+    }
     if (SotcTexDiag::Level() >= 1) {
         SotcTexDiag::Get().freed.fetch_add(1, std::memory_order_relaxed);
         SotcTexDiag::Log("DROP (%s) %s", why, DiagImage{slot_images[image_id]}.text);

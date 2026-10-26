@@ -435,20 +435,44 @@ void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
         while (seen < count && !SotcStats::rbs_inflight_max.compare_exchange_weak(
                                    seen, count, std::memory_order_relaxed)) {
         }
+        // sotc: the bytes of each copy that the copies of the readbacks in flight cover (their
+        // union: the old nested loops summed every pair, O(copies x in-flight copies) per begin,
+        // ~0.4 ms per frame of the draw thread in the heavy temple with SOTC_FPS=1, and counted a
+        // byte twice when two others held it). Sorted and merged once, then a binary search per copy.
         u64 held = 0, total_copy = 0;
+        static thread_local std::vector<std::pair<VAddr, VAddr>> others;
+        others.clear();
+        for (const AsyncReadback* other : inflight_readbacks) {
+            for (const auto& o_item : other->pending) {
+                for (const auto& o_copy : o_item.copies) {
+                    const VAddr o_lo = o_item.arena->cpu_addr + o_copy.srcOffset;
+                    others.emplace_back(o_lo, o_lo + o_copy.size);
+                }
+            }
+        }
+        std::sort(others.begin(), others.end());
+        size_t merged_count = 0;
+        for (size_t i = 0; i < others.size(); ++i) {
+            if (merged_count != 0 && others[i].first <= others[merged_count - 1].second) {
+                others[merged_count - 1].second =
+                    std::max(others[merged_count - 1].second, others[i].second);
+            } else {
+                others[merged_count++] = others[i];
+            }
+        }
+        others.resize(merged_count);
         for (const auto& item : readback.pending) {
             for (const auto& copy : item.copies) {
                 const VAddr lo = item.arena->cpu_addr + copy.srcOffset;
+                const VAddr hi = lo + copy.size;
                 u64 other_bytes = 0;
-                for (const AsyncReadback* other : inflight_readbacks) {
-                    for (const auto& o_item : other->pending) {
-                        for (const auto& o_copy : o_item.copies) {
-                            const VAddr o_lo = o_item.arena->cpu_addr + o_copy.srcOffset;
-                            const VAddr a = std::max(lo, o_lo);
-                            const VAddr b = std::min<VAddr>(lo + copy.size, o_lo + o_copy.size);
-                            other_bytes += b > a ? b - a : 0;
-                        }
-                    }
+                // The first merged interval ending after lo; the merged ones are disjoint.
+                auto it = std::upper_bound(others.begin(), others.end(), lo,
+                                           [](VAddr value, const std::pair<VAddr, VAddr>& r) {
+                                               return value < r.second;
+                                           });
+                for (; it != others.end() && it->first < hi; ++it) {
+                    other_bytes += std::min(hi, it->second) - std::max(lo, it->first);
                 }
                 held += std::min<u64>(other_bytes, copy.size);
                 total_copy += copy.size;
@@ -457,8 +481,16 @@ void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
         SotcStats::rbs_overlap_bytes.fetch_add(held, std::memory_order_relaxed);
         SotcStats::rbs_begin_bytes.fetch_add(total_copy, std::memory_order_relaxed);
     }
+    for (const auto& item : readback.pending) {
+        readback.hull_lo = std::min<VAddr>(readback.hull_lo, item.addr);
+        readback.hull_hi = std::max<VAddr>(readback.hull_hi, item.addr + item.size);
+        for (const auto& [run_addr, run_size] : item.gpu_ranges) {
+            readback.hull_lo = std::min<VAddr>(readback.hull_lo, run_addr);
+            readback.hull_hi = std::max<VAddr>(readback.hull_hi, run_addr + run_size);
+        }
+    }
     inflight_readbacks.push_back(&readback);
-    ++inflight_gen; // sotc: WriteMarkMemo
+    readback.seq = ++inflight_gen; // sotc: WriteMarkMemo (seq: DispatchFastPath)
     SotcStats::readback_finish.fetch_add(1, std::memory_order_relaxed);
     if (SotcStats::kHashStats) SotcStats::hash_tl.finishes++;
 }
@@ -636,7 +668,36 @@ void BufferCache::MarkInflightReadbacksDirty(VAddr addr, u64 size, u8 cause) {
     if (size == 0) {
         return;
     }
+    // sotc: BbToggle::DispatchFastPath: a readback whose hull the range misses has no region or GPU
+    // page run it touches: nothing below would change on it.
+    const bool use_hull = !BbToggle::Disabled(BbToggle::DispatchFastPath);
     for (AsyncReadback* readback : inflight_readbacks) {
+        if (use_hull && (addr >= readback->hull_hi || readback->hull_lo >= addr + size)) {
+            static const bool hull_verify = [] {
+                const char* v = std::getenv("SOTC_DISPFAST_VERIFY");
+                return v && v[0] == '1';
+            }();
+            if (hull_verify) {
+                static std::atomic<u64> checked{0}, bad{0};
+                bool touched = false;
+                for (const auto& item : readback->pending) {
+                    touched |= addr < item.addr + item.size && item.addr < addr + size;
+                    for (const auto& [run_addr, run_size] : item.gpu_ranges) {
+                        touched |= addr < run_addr + run_size && run_addr < addr + size;
+                    }
+                }
+                const u64 n = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (touched && bad.fetch_add(1, std::memory_order_relaxed) < 10) {
+                    std::fprintf(stderr, "SOTC DISPFAST VERIFY: hull skipped a touched readback at %#llx+%#llx\n",
+                                 static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size));
+                }
+                if ((n & 0xFFFFF) == 0) {
+                    std::fprintf(stderr, "SOTC DISPFAST VERIFY: %llu hull skips checked, %llu bad\n",
+                                 static_cast<unsigned long long>(n), static_cast<unsigned long long>(bad.load()));
+                }
+            }
+            continue;
+        }
         bool region_hit = false, hit = false;
         for (const auto& item : readback->pending) {
             const bool in_region = addr < item.addr + item.size && item.addr < addr + size;
@@ -1136,14 +1197,14 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     const auto download = staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached);
     // Was the data written by work already submitted, or by the command buffer being built?
     if (current_writes_tick != scheduler.CurrentTick()) {
-        current_writes.Clear();
+        ClearCurrentWrites();
         current_writes_tick = scheduler.CurrentTick();
     }
     bool written_by_current = false;
     for (const auto& item : pending) {
         for (const auto& copy : item.copies) {
             written_by_current |=
-                current_writes.Intersects(item.arena->cpu_addr + copy.srcOffset, copy.size);
+                CurrentWritesIntersects(item.arena->cpu_addr + copy.srcOffset, copy.size);
         }
     }
     for (auto& item : pending) {
@@ -1195,7 +1256,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         // Did the guest ask for bytes the command buffer being built writes, or only a neighbour
         // in the window (or a hot region) did?
         if (fault_size != 0 && written_by_current &&
-            current_writes.Intersects(fault_addr, fault_size)) {
+            CurrentWritesIntersects(fault_addr, fault_size)) {
             SotcStats::readback_finish_asked.fetch_add(1, std::memory_order_relaxed);
         }
         for (const auto& item : pending) {
@@ -1972,8 +2033,11 @@ void BufferCache::MarkWrittenBinding(VAddr addr, u64 size) {
         }
         return h;
     };
-    auto& m = write_mark_memos[((addr * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full)) >>
-                               56];
+    // sotc: BbToggle::DispatchFastPath: 2048 slots instead of 256 (3,400 written bindings a frame,
+    // ~1,500 distinct ranges: the small table kept losing them to collisions between two sightings).
+    const u64 mark_hash = (addr * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full);
+    auto& m = write_mark_memos[BbToggle::Disabled(BbToggle::DispatchFastPath) ? mark_hash >> 56
+                                                                              : mark_hash >> 53];
     if (m.addr != addr || m.size != size) {
         m = {};
         m.addr = addr;
@@ -1982,6 +2046,14 @@ void BufferCache::MarkWrittenBinding(VAddr addr, u64 size) {
     static std::atomic<u64> n_total{0}, n_a{0}, n_b{0}, n_bad{0};
     const u64 gm = __atomic_load_n(&gpu_modified_ranges.generation, __ATOMIC_ACQUIRE);
     bool a_hit = m.a_valid && m.inflight_gen == inflight_gen;
+    // sotc: BbToggle::DispatchFastPath: a readback that entered the list since the memo was made
+    // matters only if the range touches its region or GPU page runs (MarkInflightReadbacksDirty
+    // changes nothing on one it does not touch); the memo then stands for it too.
+    if (!a_hit && m.a_valid && !BbToggle::Disabled(BbToggle::DispatchFastPath) &&
+        !InflightHitSince(m.inflight_gen, addr, size)) {
+        a_hit = true;
+        m.inflight_gen = inflight_gen;
+    }
     if (a_hit && m.gm_gen != gm) {
         // Ranges left gpu_modified_ranges since (readbacks applied): the binding's own range may
         // not be among them. Contained now (generation read before the look) = Add changes nothing.
@@ -2210,10 +2282,108 @@ void BufferCache::RecordCurrentWrite(VAddr addr, u64 size) {
         }
     }
     if (current_writes_tick != scheduler.CurrentTick()) {
-        current_writes.Clear();
+        ClearCurrentWrites();
         current_writes_tick = scheduler.CurrentTick();
     }
+    // sotc: BbToggle::DispatchFastPath: current_writes is only ever asked Intersects (the two
+    // readback gathers), a few times per frame, while every written binding of a dispatch adds to
+    // it (3,400 a frame, each a tree search and, for a new range, an insertion with merges). The
+    // range is appended to a vector instead and Intersects looks through it too. Intersection with
+    // a union is intersection with one of its members, so the answers are the same.
+    // SOTC_DISPFAST_VERIFY=1 also inserts every range into the set and compares both answers.
+    static const bool verify = [] {
+        const char* v = std::getenv("SOTC_DISPFAST_VERIFY");
+        return v && v[0] == '1';
+    }();
+    if (size != 0 && (verify || !BbToggle::Disabled(BbToggle::DispatchFastPath))) {
+        const std::pair<VAddr, VAddr> range{addr, addr + size};
+        if (pending_writes.empty() || pending_writes.back() != range) {
+            pending_writes.push_back(range);
+        }
+        if (verify) {
+            current_writes.Add(addr, size);
+        } else if (pending_writes.size() >= MaxPendingWrites) {
+            FlushPendingWrites();
+        }
+        return;
+    }
     current_writes.Add(addr, size);
+}
+
+void BufferCache::ClearCurrentWrites() {
+    current_writes.Clear();
+    pending_writes.clear();
+}
+
+void BufferCache::FlushPendingWrites() {
+    for (const auto& [lo, hi] : pending_writes) {
+        current_writes.Add(lo, hi - lo);
+    }
+    pending_writes.clear();
+}
+
+bool BufferCache::CurrentWritesIntersects(VAddr addr, u64 size) {
+    static const bool verify = [] {
+        const char* v = std::getenv("SOTC_DISPFAST_VERIFY");
+        return v && v[0] == '1';
+    }();
+    const bool in_set = current_writes.Intersects(addr, size);
+    if (!verify && in_set) {
+        return true;
+    }
+    bool in_pending = false;
+    if (size != 0) {
+        const VAddr end = addr + size;
+        for (const auto& [lo, hi] : pending_writes) {
+            if (addr < hi && lo < end) {
+                in_pending = true;
+                break;
+            }
+        }
+    }
+    if (verify) {
+        // Every range went into both (RecordCurrentWrite): the pending vector alone must agree
+        // with the set alone (the vector is only cleared with the set; verify never flushes it).
+        static std::atomic<u64> n{0}, bad{0};
+        const u64 total = n.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (in_set != in_pending && bad.fetch_add(1, std::memory_order_relaxed) < 10) {
+            std::fprintf(stderr,
+                         "SOTC DISPFAST VERIFY: current_writes mismatch at %#llx+%#llx set %d pending %d\n",
+                         static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size),
+                         int(in_set), int(in_pending));
+        }
+        if ((total & 0x3FFF) == 0) {
+            std::fprintf(stderr, "SOTC DISPFAST VERIFY: %llu current_writes queries, %llu mismatches\n",
+                         static_cast<unsigned long long>(total),
+                         static_cast<unsigned long long>(bad.load()));
+        }
+        return BbToggle::Disabled(BbToggle::DispatchFastPath) ? in_set : in_pending;
+    }
+    return in_pending;
+}
+
+bool BufferCache::InflightHitSince(u64 seq, VAddr addr, u64 size) const {
+    // inflight_readbacks is in entry order (push_back, std::erase): the newer ones are at the end.
+    for (auto it = inflight_readbacks.rbegin(); it != inflight_readbacks.rend(); ++it) {
+        const AsyncReadback* readback = *it;
+        if (readback->seq <= seq) {
+            break;
+        }
+        if (addr >= readback->hull_hi || readback->hull_lo >= addr + size) {
+            continue;
+        }
+        for (const auto& item : readback->pending) {
+            if (addr < item.addr + item.size && item.addr < addr + size) {
+                return true;
+            }
+            for (const auto& [run_addr, run_size] : item.gpu_ranges) {
+                if (addr < run_addr + run_size && run_addr < addr + size) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size,
@@ -2605,7 +2775,12 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
     // sotc: a block records the classes of the binds that touched it (block_class). A cached
     // range stands for the binds of its own class only: another class takes the slow path below
     // once, which marks it.
-    auto& cached = resident_cache[(first_block * 0x9E3779B97F4A7C15ull) >> 58];
+    // sotc: BbToggle::DispatchFastPath: 1024 slots instead of 64 (the 64-slot cache lost entries to
+    // collisions: ~2,600 resident ranges, thousands of binds a frame).
+    const u64 resident_hash = first_block * 0x9E3779B97F4A7C15ull;
+    auto& cached = resident_cache[BbToggle::Disabled(BbToggle::DispatchFastPath)
+                                      ? resident_hash >> 58
+                                      : resident_hash >> 54];
     if (cached.version == resident_version && first_block >= cached.first &&
         last_block < cached.end && cached.cls == bind_class) {
         if (cached.epoch != use_epoch) {
@@ -2717,16 +2892,29 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                                     bool is_written, bool is_texel_buffer, bool* uploaded) {
     UploadJob job;
     job.arena = arena;
+    const bool disp_up = DispPhase::kOn && DispPhase::Active(); // sotc: SOTC_DISP_PHASES
+    const u64 up_t0 = disp_up ? DispPhase::Now() : 0;
     CollectUploads(job, device_addr, size, is_written);
     if (uploaded) {
         *uploaded = !job.copies.empty();
     }
     if (!job.copies.empty()) {
+        const u64 up_t1 = disp_up ? DispPhase::Now() : 0;
         // sotc: the write protection of the collected pages may still be batched (draw thread,
         // ProtectBatchScope): it must be in force before the first byte is copied, or a guest
         // write between the copy and the protect would be lost.
         PageManager::FlushProtectBatch();
+        const u64 up_t2 = disp_up ? DispPhase::Now() : 0;
         CommitUploads(job);
+        if (disp_up) {
+            auto& u = DispPhase::Subs();
+            const int w = is_written ? 1 : 0;
+            u.up_collect[w] += up_t1 - up_t0;
+            u.up_flush[w] += up_t2 - up_t1;
+            u.up_commit[w] += DispPhase::Now() - up_t2;
+            u.up_ranges[w] += job.copies.size();
+            u.up_bytes[w] += job.total_size_bytes;
+        }
     }
     if (is_texel_buffer && !is_written) {
         return SynchronizeMemoryFromImage(arena, device_addr, size);

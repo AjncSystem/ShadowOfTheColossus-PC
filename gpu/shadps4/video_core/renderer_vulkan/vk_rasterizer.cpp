@@ -2350,6 +2350,7 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
     DispPhase::Mark(DispPhase::Issue);
 
     ResetBindings(true);
+    DispPhase::Mark(DispPhase::PostReset); // sotc: SOTC_DISP_PHASES
     FlushPeriodic();
     DispPhase::Mark(DispPhase::Post);
     if (DispPhase::kOn) { // sotc: SOTC_DISP_PHASES
@@ -2417,6 +2418,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
     DispPhase::Mark(DispPhase::Issue);
 
     ResetBindings(true);
+    DispPhase::Mark(DispPhase::PostReset); // sotc: SOTC_DISP_PHASES
     FlushPeriodic();
     DispPhase::Mark(DispPhase::Post);
     if (DispPhase::kOn) { // sotc: SOTC_DISP_PHASES
@@ -3344,6 +3346,51 @@ static bool CsBindTraceActive(u64 pgm_hash) {
 // sotc: the guest VMA table generation (src/runtime_memory.c), part of the BufferBindMemo key.
 extern "C" uint64_t runtime_memory_generation(void);
 
+// sotc: BbToggle::DispatchFastPath. memory->ClampRangeSize reads the guest VMA table through a
+// per-thread region cache (a 2048-slot table and a binary search on a miss, ~35 ns, 8,000 bindings a
+// frame in the heavy temple). Its answer is a function of the table alone, and
+// runtime_memory_generation() is even and unchanged exactly while the table is: the answer is
+// remembered per (address, size) and generation. SOTC_DISPFAST_VERIFY=1 recomputes every hit.
+u64 Rasterizer::ClampBindingSize(VAddr base, u64 size) {
+    if (BbToggle::Disabled(BbToggle::DispatchFastPath)) {
+        return memory->ClampRangeSize(base, size);
+    }
+    static const bool verify = [] {
+        const char* v = std::getenv("SOTC_DISPFAST_VERIFY");
+        return v && v[0] == '1';
+    }();
+    const u64 generation = runtime_memory_generation();
+    if (generation & 1) {
+        return memory->ClampRangeSize(base, size);
+    }
+    const u64 hash = (base * 0x9E3779B97F4A7C15ULL) ^ (size * 0xC2B2AE3D27D4EB4FULL);
+    ClampMemo& m = clamp_memos[(hash ^ (hash >> 32)) % NumClampMemos];
+    if (m.generation == generation && m.base == base && m.size == size) {
+        if (verify) {
+            static u64 checked = 0, bad = 0;
+            const u64 fresh = memory->ClampRangeSize(base, size);
+            if (runtime_memory_generation() == generation) {
+                ++checked;
+                if (fresh != m.result && ++bad <= 10) {
+                    std::fprintf(stderr, "SOTC DISPFAST VERIFY: clamp mismatch at %#llx+%#llx memo %#llx now %#llx\n",
+                                 static_cast<unsigned long long>(base), static_cast<unsigned long long>(size),
+                                 static_cast<unsigned long long>(m.result), static_cast<unsigned long long>(fresh));
+                }
+                if ((checked & 0xFFFFF) == 0) {
+                    std::fprintf(stderr, "SOTC DISPFAST VERIFY: %llu clamp hits checked, %llu mismatches\n",
+                                 static_cast<unsigned long long>(checked), static_cast<unsigned long long>(bad));
+                }
+            }
+        }
+        return m.result;
+    }
+    const u64 result = memory->ClampRangeSize(base, size);
+    if (runtime_memory_generation() == generation) {
+        m = {base, size, generation, result};
+    }
+    return result;
+}
+
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
     const u64 alignment = instance.StorageMinAlignment();
@@ -3465,7 +3512,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 size = bmemo->size;
             } else if (clamp1) {
                 if (vsharp.base_address != 0 && vsharp.GetSize() != 0) {
-                    size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                    size = ClampBindingSize(vsharp.base_address, vsharp.GetSize());
                 }
             } else if (vsharp.base_address != 0 && vsharp.GetSize() != 0 &&
                        memory->IsValidMapping(vsharp.base_address) &&

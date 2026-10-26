@@ -1329,9 +1329,12 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
         c = std::exchange(composite, Composite{});
     }
     const bool copied = c.copy_ok && sr_color.width == f.width && sr_color.height == f.height;
-    const bool ui_full = c.copy_ok && c.ui_full_ok && sr_ui_full.width == width &&
-                         sr_ui_full.height == height;
-    const vk::ImageView ui_view = ui_full ? sr_ui_full.view : sr_ui.view;
+    const bool ui_shadow = c.copy_ok && c.ui_full_ok && sr_ui_full.width == width &&
+                           sr_ui_full.height == height;
+    // sotc: PS4 Pro mode draws its UI layer at the output size already: no unsharp on it (it put
+    // dark fringes around the letters, 26 Oct)
+    const bool ui_full = ui_shadow || (c.copy_ok && sr_ui.width == width && sr_ui.height == height);
+    const vk::ImageView ui_view = ui_shadow ? sr_ui_full.view : sr_ui.view;
     if (ui_full && (!f.sl_valid || !copied)) {
         // No DLSS inputs (splash, menus): the scene at the render size, the UI at the output size.
         sr_prev = false;

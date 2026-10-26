@@ -520,7 +520,13 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
             std::this_thread::sleep_for(std::chrono::milliseconds(33));
         }
     });
+    // sotc: from 0.60.6-C1: how long the loading screen waited for the cache (cold vs warm start).
+    const auto warm_start = std::chrono::steady_clock::now();
     rasterizer->GetPipelineCache().WarmUp();
+    std::fprintf(stderr, "SOTC warm-up: %lld ms\n",
+                 static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::steady_clock::now() - warm_start)
+                                            .count()));
     SotcStats::warmup_finished.store(true, std::memory_order_relaxed);
     warming.store(false, std::memory_order_relaxed);
     painter.join();

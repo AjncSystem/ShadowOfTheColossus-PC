@@ -283,6 +283,8 @@ inline int VramTier() {
 /// written back to memory first, and the images in the cache with their (guest) size.
 inline std::atomic<uint64_t> gc_ticks{0}, gc_freed{0}, gc_downloads{0};
 inline std::atomic<uint64_t> cached_images{0}, cached_image_bytes{0};
+inline std::atomic<uint64_t> reuse_size_frees{0};     ///< ResolveOverlap: slot reused by another size
+inline std::atomic<uint64_t> gc_downloads_skipped{0}; ///< SOTC_GC_DOWNLOAD=0
 inline std::atomic<uint64_t> vram_emergency{0}; ///< emergency texture collections (allocation failed)
 inline std::atomic<uint64_t> write_fault_gpu_pending{0}; ///< write-fault readbacks left protected
 inline std::atomic<uint64_t> write_fault_stale_gpu{0};   ///< ... that cleared a stale GPU page bit

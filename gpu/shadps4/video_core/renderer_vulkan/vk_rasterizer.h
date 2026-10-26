@@ -37,7 +37,12 @@ inline u64 Now() {
     return __builtin_ia32_rdtsc();
 }
 /// Draw thread: ExecuteBackOp's register chunk copy and per-stage user data copy, per op.
-void AddOpPrefix(u64 ticks, u32 chunks, u32 dwords);
+void AddOpPrefix(u64 ticks, u32 chunks, u32 dwords, u32 kind = 0);
+/// sotc: SOTC_DRAW_REPLAY_PROBE=1 (docs/sotc/DRAW-REPLAY.md): per draw, is its whole bound state
+/// the previous draw's? Needs SOTC_DRAW_PHASES=1 for the per-class phase timers. Printed by the
+/// FPS report (ReplayReport), once per window.
+inline const bool kReplay = std::getenv("SOTC_DRAW_REPLAY_PROBE") != nullptr;
+void ReplayReport();
 /// Command processor: 0 = pipeline lookup, 1 = BackAlloc (dirty chunk copy), 2 = CaptureBackOp.
 void AddCp(u32 what, u64 ticks);
 } // namespace DrawPhase
@@ -262,9 +267,24 @@ private:
                            std::array<bool, Shader::NUM_IMAGES>& bind_storage, u32& num_binds);
     bool BindResources(const Pipeline* pipeline);
     bool FastBindEligible(const Pipeline* pipeline) const;
+    bool FastBindStaticEligible(const Pipeline* pipeline) const; ///< sotc: DrawReplay, see .cpp
     u64 FastBindHash(const Pipeline* pipeline, const Shader::PushData& push_data) const;
+    /// sotc: BbToggle::DrawReplay. The fields FastBindHash hashes, kept as they are: the push data,
+    /// the colour and depth target addresses and, per stage, InfoRuntime::ud_gen.
+    struct FastBindKey {
+        Shader::PushData push{};
+        std::array<VAddr, AmdGpu::NUM_COLOR_BUFFERS + 1> addrs{};
+        std::array<u64, 8> gen{};
+        u32 stages{};
+        bool Equal(const FastBindKey& o) const {
+            return stages == o.stages && gen == o.gen && addrs == o.addrs &&
+                   std::memcmp(&push, &o.push, sizeof(push)) == 0;
+        }
+    };
+    void FastBindKeyBuild(const Pipeline* pipeline, const Shader::PushData& push,
+                          FastBindKey& key) const;
     void CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dma, u64 pre_epoch,
-                        u64 pre_clobbers);
+                        u64 pre_clobbers, const FastBindKey* key = nullptr);
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
     void BindIndexBuffer(u32 index_offset = 0);
@@ -511,6 +531,9 @@ private:
         u64 tick{};
         bool uses_dma{};
         bool valid{};
+        bool key_valid{};  ///< sotc: DrawReplay: `key` was stored by this bind
+        bool hash_valid{}; ///< sotc: DrawReplay: `hash` was computed by this bind
+        FastBindKey key{};
         boost::container::small_vector<u32, 8> lod_marks{}; ///< SotcLod banks the bind marked
     };
     boost::container::small_vector<u32, 8> lod_marks; ///< banks marked by the bind in progress
@@ -520,6 +543,10 @@ private:
     std::vector<vk::DescriptorBufferInfo> verify_buffers;
     std::vector<vk::DescriptorImageInfo> verify_images;
     bool fast_bind_hit{};
+    /// sotc: SOTC_DRAW_REPLAY_PROBE (DrawPhase::kReplay): compares this draw's complete bound state
+    /// with the previous draw's (docs/sotc/DRAW-REPLAY.md); returns the phase class of the draw.
+    u32 ReplayProbeNote(u32 kind, const GraphicsPipeline* pipeline, const RenderState& state,
+                        VAddr args_addr, u32 stride, u32 count, u32 first);
 };
 
 } // namespace Vulkan

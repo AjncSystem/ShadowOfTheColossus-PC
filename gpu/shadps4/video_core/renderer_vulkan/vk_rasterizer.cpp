@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
+#include <bit>
 #include <atomic>
 #include <span>
 #include <chrono>
@@ -119,13 +120,15 @@ enum SubPhase : u32 {
     SSchDraw,   // sched: drawIndexed, DebugState
     SPostReset, // post: ResetBindings
     SPostFlush, // post: FlushPeriodic
+    SBrHash,    // brest: MakeUserData + FastBindHash of an eligible draw (sotc: DRAW-REPLAY.md)
+    SArgRead,   // args: IsRegionGpuModified + TryReadBacking of the indirect arguments
     NumSubs,
 };
 static constexpr const char* kSubNames[NumSubs] = {
     "pop",     "filter",  "prepLock", "prepCmp", "brCheck", "brUser",  "bbFlat",  "bbClamp",
     "bbObt",   "bbDesc",  "btPre",    "btMemo", "btImages", "begLock", "begFind", "begMeta", "begTrans", "viInput",
     "viObt",   "viBind",  "ibuf",     "pipePush", "pipeDesc", "dynCheck", "dynCommit", "schBegin",
-    "schBind", "schDraw", "postReset", "postFlush"};
+    "schBind", "schDraw", "postReset", "postFlush", "brHash", "argRead"};
 struct Totals {
     u64 draws{};
     std::array<u64, NumPhases> ticks{};
@@ -133,6 +136,16 @@ struct Totals {
     u64 same_push{}, same_writes{}, same_state{}, same_pipeline{}, writes_n{};
 };
 static std::array<Totals, 3> totals;
+// sotc: SOTC_DRAW_REPLAY_PROBE: phase totals by class (kind x fast-bind hit x replayability), see
+// ReplayProbeNote. Windows are cut by ReplayReport (diff of two snapshots).
+static constexpr u32 kRpClasses = 12;
+struct RpTot {
+    u64 draws{};
+    std::array<u64, NumPhases> ticks{};
+    std::array<u64, NumSubs> sub{};
+};
+static std::array<RpTot, kRpClasses> rp_tot;
+static u64 op_ticks_k[2], op_ops_k[2], op_chunks_k[2], op_dwords_k[2];
 static u64 op_ticks, op_ops, op_chunks, op_dwords;
 static std::array<u64, 8> lap_ticks;
 static u64 lap_draws;
@@ -182,9 +195,19 @@ struct Scope {
         }
     }
     void Finish(u32 cls, bool same_push, bool same_writes, bool same_state, bool same_pipeline,
-                u32 writes) {
+                u32 writes, u32 rcls = ~0u) {
         if (!active) {
             return;
+        }
+        if (rcls < kRpClasses) {
+            RpTot& r = rp_tot[rcls];
+            ++r.draws;
+            for (u32 i = 0; i < NumPhases; ++i) {
+                r.ticks[i] += t[i];
+            }
+            for (u32 i = 0; i < NumSubs; ++i) {
+                r.sub[i] += s[i];
+            }
         }
         Totals& tot = totals[cls];
         ++tot.draws;
@@ -230,7 +253,7 @@ struct Scope {
                               100.0 * x.same_writes / n, 100.0 * x.same_state / n,
                               100.0 * x.same_pipeline / n, double(x.writes_n) / n);
                 std::fprintf(stderr, "%s\n", line);
-                char subline[768];
+                char subline[1024];
                 int at3 = std::snprintf(subline, sizeof(subline), "SOTC DRAWPHASE %s sub us/draw:",
                                         cls_names[c]);
                 for (u32 i = 0; i < NumSubs; ++i) {
@@ -278,7 +301,11 @@ struct Scope {
         }
     }
 };
-void AddOpPrefix(u64 ticks, u32 chunks, u32 dwords) {
+void AddOpPrefix(u64 ticks, u32 chunks, u32 dwords, u32 kind) {
+    op_ticks_k[kind] += ticks; // sotc: SOTC_DRAW_REPLAY_PROBE, per op kind
+    op_chunks_k[kind] += chunks;
+    op_dwords_k[kind] += dwords;
+    ++op_ops_k[kind];
     op_ticks += ticks;
     op_chunks += chunks;
     op_dwords += dwords;
@@ -596,7 +623,7 @@ namespace DrawPhase {
 template <typename Writes, typename BufInfos, typename ImgInfos>
 static void Finish(Scope& ph, const GraphicsPipeline* pipeline, const Writes& writes,
                    const BufInfos& buf_infos, const ImgInfos& img_infos,
-                   const Shader::PushData& push, const RenderState& state) {
+                   const Shader::PushData& push, const RenderState& state, u32 rcls = ~0u) {
     if (!kOn) {
         return;
     }
@@ -624,7 +651,399 @@ static void Finish(Scope& ph, const GraphicsPipeline* pipeline, const Writes& wr
     prev_state = state;
     prev_pipeline = pipeline;
     ph.Finish(ClassOf(pipeline->GetGraphicsKey().mrt_mask), same_push, same_writes, same_state,
-              same_pipeline, static_cast<u32>(writes.size()));
+              same_pipeline, static_cast<u32>(writes.size()), rcls);
+}
+} // namespace DrawPhase
+
+// sotc: SOTC_DRAW_REPLAY_PROBE=1 (docs/sotc/DRAW-REPLAY.md, diagnostic, no behaviour change): is the
+// complete bound state of a draw the previous draw's? Compared per draw on the draw thread, after
+// the draw was recorded: pipeline, push data, user data + flat buffer, descriptors (with and
+// without the stream ring offsets), render state, vertex and index bindings, dynamic state serials,
+// pending barrier; then the memory side (epoch, uploads, bind generations). Only the arguments
+// (and the index offset) may differ. Windows are printed by ReplayReport (FPS report).
+namespace DrawPhase {
+enum ReplayFail : u32 {
+    FAdj, FPipe, FPush, FUd, FDesc, FRs, FVb, FIb, FDyn, FBar, FEpoch, FUpload, FGen, NumFail
+};
+static constexpr const char* kFailNames[NumFail] = {"notadj", "pipe",  "push",  "userdata", "desc",
+                                                    "rstate", "vbuf",  "ibuf",  "dyn",      "barrier",
+                                                    "epoch",  "upload", "gen"};
+static constexpr u32 kStateBits = (1u << (FBar + 1)) - 1; // the bits of state proper (FAdj..FBar)
+static constexpr u32 kBuckets = 9;
+struct ReplayCtx {
+    u64 vb_hash{1};
+    u64 ib_handle{}, ib_off{};
+    u32 ib_type{};
+    bool has_ib{};
+    bool barrier{};
+    u64 events0{}, epoch0{}, bgen0{}, tgen0{}, sgen0{}, tick0{};
+};
+inline ReplayCtx rc;
+struct ReplayStats {
+    u64 draws[3]{}, fb_hit[3]{};
+    u64 cls_draws[3]{}, cls_s[3]{}, cls_r[3]{};
+    u64 kind_s[3]{}, kind_r[3]{}, kind_snoadj[3]{};
+    u64 fail_any[NumFail]{}, fail_only[NumFail]{};
+    u64 desc_stream_only{}, ib_off_diff_s{}, ib_off_diff_r{};
+    u64 contig_s{}, contig_r{}, same_addr_s{}, same_addr_r{};
+    u64 gap[5]{};
+    u64 runs_s[kBuckets]{}, run_draws_s[kBuckets]{};
+    u64 runs_r[kBuckets]{}, run_draws_r[kBuckets]{};
+    u64 runs_cs[kBuckets]{}, run_draws_cs[kBuckets]{};
+    u64 runs_cr[kBuckets]{}, run_draws_cr[kBuckets]{};
+};
+inline ReplayStats replay_stats;
+static u32 Bucket(u32 len) {
+    if (len <= 4) {
+        return len - 1;
+    }
+    u32 b = 4;
+    for (u32 hi = 8; len > hi && b < kBuckets - 1; hi *= 2) {
+        ++b;
+    }
+    return b;
+}
+static void CloseRun(u64* runs, u64* draws, u32& len) {
+    if (len) {
+        const u32 b = Bucket(len);
+        ++runs[b];
+        draws[b] += len;
+        len = 0;
+    }
+}
+/// Start of a draw: the memory-side counters the previous draw is compared with.
+inline void ReplayBegin(u64 epoch, u64 bgen, u64 tgen, u64 sgen, u64 tick) {
+    if (kReplay) {
+        rc = {};
+        rc.events0 = SotcStats::thread_data_events;
+        rc.epoch0 = epoch;
+        rc.bgen0 = bgen;
+        rc.tgen0 = tgen;
+        rc.sgen0 = sgen;
+        rc.tick0 = tick;
+    }
+}
+} // namespace DrawPhase
+
+u32 Rasterizer::ReplayProbeNote(u32 kind, const GraphicsPipeline* pipeline, const RenderState& state,
+                                VAddr args_addr, u32 stride, u32 count, u32 first) {
+    using namespace DrawPhase;
+    ReplayStats& st = replay_stats;
+    struct Snap {
+        const void* pipeline{};
+        Shader::PushData push{};
+        std::vector<std::array<u32, 4>> writes;
+        std::vector<vk::DescriptorBufferInfo> bufs;
+        std::vector<vk::DescriptorImageInfo> imgs;
+        RenderState state{};
+        u64 ud{}, vb{}, ib_handle{}, ib_off{};
+        u32 ib_type{};
+        u32 rel[3]{};
+        bool feedback{};
+        u64 epoch{}, bgen{}, tgen{}, sgen{}, tick{};
+        u32 serial{};
+        u32 kind{};
+        VAddr args{};
+        u32 stride{};
+        bool valid{};
+    };
+    static Snap prev;
+    static u32 run_s, run_r, run_cs, run_cr;
+    Snap cur;
+    cur.pipeline = pipeline;
+    cur.push = push_data;
+    cur.writes.reserve(set_writes.size());
+    for (const auto& w : set_writes) {
+        cur.writes.push_back({w.dstBinding, w.dstArrayElement, static_cast<u32>(w.descriptorType),
+                              w.descriptorCount});
+    }
+    cur.bufs.assign(buffer_infos.begin(), buffer_infos.end());
+    cur.imgs.assign(image_infos.begin(), image_infos.end());
+    cur.state = state;
+    u64 ud = 0xcbf29ce484222325ull;
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        const auto user_data = stage->UserData();
+        Fnv(ud, user_data.data(), user_data.size_bytes());
+        const auto& flat = stage->FlatBuf();
+        Fnv(ud, flat.data(), flat.size() * sizeof(u32));
+    }
+    cur.ud = ud;
+    cur.vb = rc.vb_hash;
+    cur.ib_handle = rc.has_ib ? rc.ib_handle : 0;
+    cur.ib_off = rc.ib_off;
+    cur.ib_type = rc.ib_type;
+    cur.rel[0] = liverpool->DrawRelSerial(AmdGpu::Liverpool::RelRender);
+    cur.rel[1] = liverpool->DrawRelSerial(AmdGpu::Liverpool::RelDynamic);
+    cur.rel[2] = liverpool->DrawRelSerial(AmdGpu::Liverpool::RelColor);
+    cur.feedback = attachment_feedback_loop;
+    cur.epoch = rc.epoch0;
+    cur.bgen = rc.bgen0;
+    cur.tgen = rc.tgen0;
+    cur.sgen = rc.sgen0;
+    cur.tick = rc.tick0;
+    cur.serial = liverpool->DrawRegSerial();
+    cur.kind = kind;
+    cur.args = args_addr;
+    cur.stride = stride;
+    cur.valid = true;
+
+    u32 m = 0;
+    bool desc_exact = false;
+    if (!prev.valid) {
+        m = ~0u;
+    } else {
+        const u32 gap = cur.serial - prev.serial;
+        ++st.gap[gap <= 1 ? 0 : gap == 2 ? 1 : gap <= 4 ? 2 : gap <= 8 ? 3 : 4];
+        m |= u32(gap != 1) << FAdj;
+        m |= u32(cur.pipeline != prev.pipeline) << FPipe;
+        m |= u32(std::memcmp(&cur.push, &prev.push, sizeof(cur.push)) != 0) << FPush;
+        m |= u32(cur.ud != prev.ud) << FUd;
+        const vk::Buffer stream = buffer_cache.GetStreamBuffer().Handle();
+        const auto descs_eq = [&](bool ignore_stream_offset) {
+            if (cur.writes != prev.writes || cur.bufs.size() != prev.bufs.size() ||
+                cur.imgs.size() != prev.imgs.size()) {
+                return false;
+            }
+            for (size_t i = 0; i < cur.bufs.size(); ++i) {
+                const auto& a = cur.bufs[i];
+                const auto& b = prev.bufs[i];
+                if (a.buffer != b.buffer || a.range != b.range ||
+                    (a.offset != b.offset && !(ignore_stream_offset && a.buffer == stream))) {
+                    return false;
+                }
+            }
+            for (size_t i = 0; i < cur.imgs.size(); ++i) {
+                const auto& a = cur.imgs[i];
+                const auto& b = prev.imgs[i];
+                if (a.imageView != b.imageView || a.sampler != b.sampler ||
+                    a.imageLayout != b.imageLayout) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        desc_exact = descs_eq(false);
+        const bool desc_ns = desc_exact || descs_eq(true);
+        m |= u32(!desc_ns) << FDesc;
+        m |= u32(!(cur.state == prev.state)) << FRs;
+        m |= u32(cur.vb != prev.vb) << FVb;
+        m |= u32(cur.ib_handle != prev.ib_handle || cur.ib_type != prev.ib_type) << FIb;
+        m |= u32((cur.rel[0] != prev.rel[0]) | (cur.rel[1] != prev.rel[1]) |
+                 (cur.rel[2] != prev.rel[2]) | (cur.feedback != prev.feedback))
+             << FDyn;
+        m |= u32(rc.barrier) << FBar;
+        m |= u32(cur.epoch != prev.epoch) << FEpoch;
+        m |= u32(SotcStats::thread_data_events != rc.events0) << FUpload;
+        m |= u32((cur.bgen != prev.bgen) | (cur.tgen != prev.tgen) | (cur.sgen != prev.sgen) |
+                 (cur.tick != prev.tick))
+             << FGen;
+        if (desc_ns && !desc_exact && !(m & (1u << FUd))) {
+            ++st.desc_stream_only;
+        }
+    }
+    const u32 k = kind > 1 ? 1 : kind;
+    const u32 mrt = pipeline->GetGraphicsKey().mrt_mask;
+    const u32 mcls = mrt == 0 ? 0 : (mrt & 0x10) ? 1 : 2;
+    const bool s = (m & kStateBits) == 0;
+    const bool r = m == 0;
+    const bool snoadj = (m & kStateBits & ~(1u << FAdj)) == 0;
+    ++st.draws[kind];
+    st.fb_hit[kind] += fast_bind_hit;
+    ++st.cls_draws[mcls];
+    st.cls_s[mcls] += s;
+    st.cls_r[mcls] += r;
+    st.kind_s[kind] += s;
+    st.kind_r[kind] += r;
+    st.kind_snoadj[kind] += snoadj;
+    for (u32 i = 0; i < NumFail; ++i) {
+        if (m & (1u << i)) {
+            ++st.fail_any[i];
+        }
+    }
+    if (prev.valid && m != 0 && (m & (m - 1)) == 0) {
+        ++st.fail_only[std::countr_zero(m)];
+    }
+    const bool same_ib_off = cur.ib_off == prev.ib_off;
+    if (prev.valid && s && !same_ib_off) {
+        ++st.ib_off_diff_s;
+        st.ib_off_diff_r += r;
+    }
+    const bool contig = prev.valid && kind == 1 && prev.kind == 1 && stride != 0 &&
+                        stride == prev.stride && args_addr == prev.args + stride;
+    if (prev.valid && kind == 1 && prev.kind == 1) {
+        st.same_addr_s += s && args_addr == prev.args;
+        st.same_addr_r += r && args_addr == prev.args;
+    }
+    st.contig_s += s && contig;
+    st.contig_r += r && contig;
+    if (s) {
+        ++run_s;
+    } else {
+        CloseRun(st.runs_s, st.run_draws_s, run_s);
+    }
+    if (r) {
+        ++run_r;
+    } else {
+        CloseRun(st.runs_r, st.run_draws_r, run_r);
+    }
+    if (s && contig) {
+        ++run_cs;
+    } else {
+        CloseRun(st.runs_cs, st.run_draws_cs, run_cs);
+    }
+    if (r && contig) {
+        ++run_cr;
+    } else {
+        CloseRun(st.runs_cr, st.run_draws_cr, run_cr);
+    }
+    (void)count;
+    (void)first;
+    prev = std::move(cur);
+    return k * 6 + (fast_bind_hit ? 3 : 0) + (r ? 2 : s ? 1 : 0);
+}
+
+namespace DrawPhase {
+void ReplayReport() {
+    if (!kReplay) {
+        return;
+    }
+    static ReplayStats p;
+    static std::array<RpTot, kRpClasses> pt;
+    static u64 p_ops[2], p_ticks[2], p_chunks[2], p_dwords[2];
+    static u64 last_tsc, last_ns;
+    const ReplayStats c = replay_stats; // racy copy of draw-thread counters: diagnostics only
+    const std::array<RpTot, kRpClasses> tot = rp_tot;
+    const u64 tsc = Now(), ns = SotcStats::NowNs();
+    const double per_us = last_ns && ns > last_ns
+                              ? double(tsc - last_tsc) / (double(ns - last_ns) / 1000.0)
+                              : 3000.0;
+    last_tsc = tsc;
+    last_ns = ns;
+    const auto d = [](u64 a, u64 b) { return a - b; };
+    const auto pct = [](u64 a, u64 n) { return n ? 100.0 * double(a) / double(n) : 0.0; };
+    const u64 nd = d(c.draws[0], p.draws[0]), ni = d(c.draws[1], p.draws[1]),
+              ng = d(c.draws[2], p.draws[2]);
+    std::fprintf(stderr,
+                 "SOTC DRAWREPLAY draws %llu (Draw %llu, DrawIndirect-direct %llu, gpu-args %llu); "
+                 "fastbind hit: Draw %.1f%% Ind %.1f%%; same state (all but memory): Draw %.1f%% Ind "
+                 "%.1f%%; strict (+epoch,uploads,gens): Draw %.1f%% Ind %.1f%%; same state ignoring "
+                 "adjacency: Draw %.1f%% Ind %.1f%%\n",
+                 (unsigned long long)(nd + ni + ng), (unsigned long long)nd, (unsigned long long)ni,
+                 (unsigned long long)ng, pct(d(c.fb_hit[0], p.fb_hit[0]), nd),
+                 pct(d(c.fb_hit[1], p.fb_hit[1]), ni), pct(d(c.kind_s[0], p.kind_s[0]), nd),
+                 pct(d(c.kind_s[1], p.kind_s[1]), ni), pct(d(c.kind_r[0], p.kind_r[0]), nd),
+                 pct(d(c.kind_r[1], p.kind_r[1]), ni),
+                 pct(d(c.kind_snoadj[0], p.kind_snoadj[0]), nd),
+                 pct(d(c.kind_snoadj[1], p.kind_snoadj[1]), ni));
+    {
+        char line[768];
+        int at = std::snprintf(line, sizeof(line), "SOTC DRAWREPLAY fail%% (any/only):");
+        const u64 n = nd + ni;
+        for (u32 i = 0; i < NumFail; ++i) {
+            at += std::snprintf(line + at, sizeof(line) - at, " %s %.1f/%.1f", kFailNames[i],
+                                pct(d(c.fail_any[i], p.fail_any[i]), n),
+                                pct(d(c.fail_only[i], p.fail_only[i]), n));
+        }
+        const u64 ks = d(c.kind_s[0] + c.kind_s[1], p.kind_s[0] + p.kind_s[1]);
+        std::fprintf(
+            stderr,
+            "%s | desc differs only by stream offsets %.1f%%; ibuf offset differs among same-state "
+            "%.1f%%; args contiguous among same-state indirect %.1f%% (strict %.1f%%), same address "
+            "%.1f%% (strict %.1f%%); gap (ops between draws) 1:%.0f%% 2:%.0f%% 3-4:%.0f%% 5-8:%.0f%% "
+            "9+:%.0f%%\n",
+            line, pct(d(c.desc_stream_only, p.desc_stream_only), n),
+            pct(d(c.ib_off_diff_s, p.ib_off_diff_s), ks),
+            pct(d(c.contig_s, p.contig_s), d(c.kind_s[1], p.kind_s[1])),
+            pct(d(c.contig_r, p.contig_r), d(c.kind_r[1], p.kind_r[1])),
+            pct(d(c.same_addr_s, p.same_addr_s), d(c.kind_s[1], p.kind_s[1])),
+            pct(d(c.same_addr_r, p.same_addr_r), d(c.kind_r[1], p.kind_r[1])),
+            pct(d(c.gap[0], p.gap[0]), n), pct(d(c.gap[1], p.gap[1]), n),
+            pct(d(c.gap[2], p.gap[2]), n), pct(d(c.gap[3], p.gap[3]), n),
+            pct(d(c.gap[4], p.gap[4]), n));
+    }
+    {
+        static const char* const names[3] = {"depth-only", "gbuffer", "other"};
+        char line[512];
+        int at = std::snprintf(line, sizeof(line),
+                               "SOTC DRAWREPLAY by target class (n, same-state%%, strict%%):");
+        for (u32 i = 0; i < 3; ++i) {
+            const u64 n = d(c.cls_draws[i], p.cls_draws[i]);
+            at += std::snprintf(line + at, sizeof(line) - at, " %s %llu %.1f %.1f;", names[i],
+                                (unsigned long long)n, pct(d(c.cls_s[i], p.cls_s[i]), n),
+                                pct(d(c.cls_r[i], p.cls_r[i]), n));
+        }
+        std::fprintf(stderr, "%s\n", line);
+    }
+    {
+        static const char* const lens[kBuckets] = {"1",    "2",    "3",     "4",    "5-8",
+                                                   "9-16", "17-32", "33-64", "65+"};
+        const auto hist = [&](const char* name, const u64* runs, const u64* pruns, const u64* rd,
+                              const u64* prd) {
+            char line[768];
+            int at = std::snprintf(line, sizeof(line),
+                                   "SOTC DRAWREPLAY runs %s (length: runs/draws):", name);
+            u64 total_draws = 0;
+            for (u32 b = 0; b < kBuckets; ++b) {
+                const u64 dr = d(rd[b], prd[b]);
+                total_draws += dr;
+                at += std::snprintf(line + at, sizeof(line) - at, " %s:%llu/%llu", lens[b],
+                                    (unsigned long long)d(runs[b], pruns[b]),
+                                    (unsigned long long)dr);
+            }
+            std::fprintf(stderr, "%s (draws in runs %llu)\n", line, (unsigned long long)total_draws);
+        };
+        hist("same-state", c.runs_s, p.runs_s, c.run_draws_s, p.run_draws_s);
+        hist("strict", c.runs_r, p.runs_r, c.run_draws_r, p.run_draws_r);
+        hist("same-state+contiguous-args", c.runs_cs, p.runs_cs, c.run_draws_cs, p.run_draws_cs);
+        hist("strict+contiguous-args", c.runs_cr, p.runs_cr, c.run_draws_cr, p.run_draws_cr);
+    }
+    static const char* const kind_names[2] = {"Draw", "Ind"};
+    static const char* const fb_names[2] = {"fbmiss", "fbhit"};
+    static const char* const rep_names[3] = {"diff", "same", "strict"};
+    for (u32 i = 0; i < kRpClasses; ++i) {
+        const u64 n = d(tot[i].draws, pt[i].draws);
+        if (n == 0) {
+            continue;
+        }
+        char line[1536];
+        int at = std::snprintf(line, sizeof(line), "SOTC DRAWREPLAY phase %s/%s/%s n=%llu us/draw:",
+                               kind_names[i / 6], fb_names[(i / 3) & 1], rep_names[i % 3],
+                               (unsigned long long)n);
+        u64 sum = 0;
+        for (u32 ph = 0; ph < NumPhases; ++ph) {
+            const u64 t = d(tot[i].ticks[ph], pt[i].ticks[ph]);
+            sum += t;
+            at += std::snprintf(line + at, sizeof(line) - at, " %s=%.3f", kNames[ph],
+                                double(t) / double(n) / per_us);
+        }
+        at += std::snprintf(line + at, sizeof(line) - at, " total=%.3f | sub:",
+                            double(sum) / double(n) / per_us);
+        for (u32 sb = 0; sb < NumSubs; ++sb) {
+            at += std::snprintf(line + at, sizeof(line) - at, " %s=%.3f", kSubNames[sb],
+                                double(d(tot[i].sub[sb], pt[i].sub[sb])) / double(n) / per_us);
+        }
+        std::fprintf(stderr, "%s\n", line);
+    }
+    for (u32 kd = 0; kd < 2; ++kd) {
+        const u64 ops = d(op_ops_k[kd], p_ops[kd]);
+        std::fprintf(stderr,
+                     "SOTC DRAWREPLAY op prefix %s %.3f us/op (%.2f chunks, %.1f dwords per op, %llu "
+                     "ops)\n",
+                     kind_names[kd],
+                     ops ? double(d(op_ticks_k[kd], p_ticks[kd])) / double(ops) / per_us : 0.0,
+                     ops ? double(d(op_chunks_k[kd], p_chunks[kd])) / double(ops) : 0.0,
+                     ops ? double(d(op_dwords_k[kd], p_dwords[kd])) / double(ops) : 0.0,
+                     (unsigned long long)ops);
+        p_ops[kd] = op_ops_k[kd];
+        p_ticks[kd] = op_ticks_k[kd];
+        p_chunks[kd] = op_chunks_k[kd];
+        p_dwords[kd] = op_dwords_k[kd];
+    }
+    p = c;
+    pt = tot;
 }
 } // namespace DrawPhase
 
@@ -1851,6 +2270,11 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
                       bool use_resolved) {
     RENDERER_TRACE;
     DrawPhase::Scope ph;
+    if (DrawPhase::kReplay) [[unlikely]] { // sotc: SOTC_DRAW_REPLAY_PROBE
+        DrawPhase::ReplayBegin(SotcStats::mem_epoch.load(std::memory_order_acquire),
+                               buffer_cache.BindGeneration(), texture_cache.BindGeneration(),
+                               buffer_cache.StreamGeneration(), scheduler.CurrentTick());
+    }
 
     scheduler.PopPendingOperations();
     DrawPhase::Sub(DrawPhase::SPop);
@@ -1911,6 +2335,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
     }
     DrawPhase::Mark(DrawPhase::VtxIdx);
 
+    DrawPhase::rc.barrier |= needs_barrier; // sotc: SOTC_DRAW_REPLAY_PROBE
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
@@ -1968,7 +2393,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
                         false, regs.num_indices, regs.num_instances.NumInstances(), 0,
                         vertex_offset, instance_offset);
     }
-    DrawPhase::Finish(ph, pipeline, set_writes, buffer_infos, image_infos, push_data, state);
+    DrawPhase::Finish(ph, pipeline, set_writes, buffer_infos, image_infos, push_data, state,
+                      DrawPhase::kReplay ? ReplayProbeNote(0, pipeline, state, 0, 0,
+                                                           regs.num_indices, index_offset)
+                                         : ~0u);
 }
 
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
@@ -1977,6 +2405,11 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               bool use_resolved) {
     RENDERER_TRACE;
     DrawPhase::Scope ph;
+    if (DrawPhase::kReplay) [[unlikely]] { // sotc: SOTC_DRAW_REPLAY_PROBE
+        DrawPhase::ReplayBegin(SotcStats::mem_epoch.load(std::memory_order_acquire),
+                               buffer_cache.BindGeneration(), texture_cache.BindGeneration(),
+                               buffer_cache.StreamGeneration(), scheduler.CurrentTick());
+    }
 
     scheduler.PopPendingOperations();
     DrawPhase::Sub(DrawPhase::SPop);
@@ -2066,6 +2499,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               : sizeof(VkDrawIndirectCommand)) &&
         !buffer_cache.IsRegionGpuModified(arg_address + offset, stride) &&
         memory->TryReadBacking(arg_address + offset, &args, stride)) {
+        DrawPhase::Sub(DrawPhase::SArgRead);
+        DrawPhase::rc.barrier |= needs_barrier; // sotc: SOTC_DRAW_REPLAY_PROBE
         if (needs_barrier) {
             runtime.FlushBarriers();
         }
@@ -2115,8 +2550,17 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                                 a.firstVertex, 0, a.firstInstance);
             }
         }
-        DrawPhase::Finish(ph, pipeline, set_writes, buffer_infos, image_infos, push_data, state);
+        DrawPhase::Finish(ph, pipeline, set_writes, buffer_infos, image_infos, push_data, state,
+                          DrawPhase::kReplay
+                              ? ReplayProbeNote(1, pipeline, state, arg_address + offset, stride,
+                                                is_indexed ? args.indexed.indexCount
+                                                           : args.plain.vertexCount,
+                                                0)
+                              : ~0u);
         return;
+    }
+    if (DrawPhase::kReplay) [[unlikely]] { // sotc: indirect draw with GPU-side arguments
+        ++DrawPhase::replay_stats.draws[2];
     }
 
     // sotc: SOTC_INDIRECT_TRACE=1: the indirect draws that keep their GPU arguments (first 80):
@@ -2479,6 +2923,39 @@ bool Rasterizer::FastBindEligible(const Pipeline* pipeline) const {
     if (regs.clipper_control.user_clip_plane_enable != 0) {
         return false;
     }
+    // sotc: BbToggle::DrawReplay: the stage loop below reads only the stage infos of the pipeline,
+    // so its answer is remembered in the pipeline (SOTC_DRAWREPLAY_VERIFY=1 recomputes it on every
+    // draw and counts a different answer).
+    if (!BbToggle::Disabled(BbToggle::DrawReplay) && liverpool->OnBackThread()) {
+        static const bool verify = [] {
+            const char* v = std::getenv("SOTC_DRAWREPLAY_VERIFY");
+            return v && v[0] == '1';
+        }();
+        if (pipeline->fast_bind_static < 0 || verify) {
+            const s8 fresh = FastBindStaticEligible(pipeline) ? 1 : 0;
+            static u64 checked = 0, bad = 0;
+            if (pipeline->fast_bind_static >= 0) {
+                ++checked;
+                if (pipeline->fast_bind_static != fresh && ++bad <= 20) {
+                    std::fprintf(stderr,
+                                 "SOTC DRAWREPLAY VERIFY: eligibility memo differs (mismatch %llu)\n",
+                                 static_cast<unsigned long long>(bad));
+                }
+                if ((checked & 0xFFFFF) == 0) {
+                    std::fprintf(stderr,
+                                 "SOTC DRAWREPLAY VERIFY: %llu eligibility checks, %llu differ\n",
+                                 static_cast<unsigned long long>(checked),
+                                 static_cast<unsigned long long>(bad));
+                }
+            }
+            pipeline->fast_bind_static = fresh;
+        }
+        return pipeline->fast_bind_static != 0;
+    }
+    return FastBindStaticEligible(pipeline);
+}
+
+bool Rasterizer::FastBindStaticEligible(const Pipeline* pipeline) const {
     for (const auto* stage : pipeline->GetStages()) {
         if (!stage) {
             continue;
@@ -2531,10 +3008,29 @@ u64 Rasterizer::FastBindHash(const Pipeline* pipeline, const Shader::PushData& p
     return hash;
 }
 
+void Rasterizer::FastBindKeyBuild(const Pipeline* pipeline, const Shader::PushData& push,
+                                  FastBindKey& key) const {
+    const auto& regs = liverpool->DrawRegs();
+    key.push = push;
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        key.addrs[cb] = regs.color_buffers[cb].Address();
+    }
+    key.addrs[AmdGpu::NUM_COLOR_BUFFERS] = regs.depth_buffer.DepthAddress();
+    u32 n = 0;
+    for (const auto* stage : pipeline->GetStages()) {
+        key.gen[n++] = stage ? stage->runtime[Shader::g_info_slot].ud_gen : ~u64{0};
+    }
+    key.stages = n;
+}
+
 void Rasterizer::CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dma, u64 pre_epoch,
-                                u64 pre_clobbers) {
+                                u64 pre_clobbers, const FastBindKey* key) {
     fast_bind.pipeline = pipeline;
     fast_bind.hash = hash;
+    fast_bind.key_valid = key != nullptr;
+    if (key) {
+        fast_bind.key = *key;
+    }
     fast_bind.buffer_generation = buffer_cache.BindGeneration();
     fast_bind.texture_generation = texture_cache.BindGeneration();
     fast_bind.stream_generation = buffer_cache.StreamGeneration();
@@ -2563,8 +3059,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     }
     fast_bind_hit = false;
     lod_marks.clear();
-    if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
-        IsComputeImageClear(pipeline)) {
+    if (pipeline->IsCompute() && // sotc: the three tests return false at once for a graphics pipeline
+        (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
+         IsComputeImageClear(pipeline))) {
         static const bool drop_trace = std::getenv("SOTC_DROP_TRACE") != nullptr;
         if (drop_trace) {
             static int shown = 0;
@@ -2628,10 +3125,68 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     // resource handles. The generation bumps catch reallocated buffers/images and dead samplers.
     const bool fast_eligible = FastBindEligible(pipeline);
     u64 fast_hash = 0;
+    // sotc: BbToggle::DrawReplay: the key is compared field by field instead of hashed (draw
+    // thread with the op prefix of ExecuteBackOp only: that is what keeps ud_gen).
+    static const bool replay_verify = [] {
+        const char* v = std::getenv("SOTC_DRAWREPLAY_VERIFY");
+        return v && v[0] == '1';
+    }();
+    const bool replay_key = !BbToggle::Disabled(BbToggle::DrawReplay) &&
+                            liverpool->IsBackThreaded() && liverpool->OnBackThread();
+    FastBindKey fast_key;
     if (fast_eligible) {
-        SotcStats::fast_bind_eligible.fetch_add(1, std::memory_order_relaxed);
+        if (replay_key) {
+            // sotc: BbToggle::DrawReplay: the counters of the FASTBIND line (SOTC_FPS only) are
+            // written by this thread alone: a relaxed load and store counts like fetch_add
+            // without its lock prefix (which waits for the stores the recorder thunks just
+            // made), and nothing at all when the line is not printed.
+            if (SotcStats::kFpsLog) {
+                auto& c = SotcStats::fast_bind_eligible;
+                c.store(c.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+            }
+        } else {
+            SotcStats::fast_bind_eligible.fetch_add(1, std::memory_order_relaxed);
+        }
         const auto input_push = MakeUserData(liverpool->DrawRegs());
-        fast_hash = FastBindHash(pipeline, input_push);
+        bool key_equal = false;
+        if (replay_key) {
+            FastBindKeyBuild(pipeline, input_push, fast_key);
+            key_equal = fast_bind.key_valid && fast_bind.key.Equal(fast_key);
+        }
+        if (!replay_key || replay_verify) {
+            fast_hash = FastBindHash(pipeline, input_push);
+        }
+        DrawPhase::Sub(DrawPhase::SBrHash);
+        const bool same_key = replay_key ? key_equal : fast_bind.hash == fast_hash;
+        if (replay_key && replay_verify) {
+            // The hash of the previous bind exists only when it was made in verify mode too (or
+            // with the bit set): a bind stored without one is skipped, not counted.
+            static u64 checked = 0, key_only = 0, hash_only = 0;
+            if (fast_bind.valid && fast_bind.hash_valid && fast_bind.key_valid &&
+                fast_bind.pipeline == pipeline) {
+                const bool hash_equal = fast_bind.hash == fast_hash;
+                ++checked;
+                if (key_equal && !hash_equal && ++key_only <= 20) {
+                    std::fprintf(stderr,
+                                 "SOTC DRAWREPLAY VERIFY: key equal but the hash differs (mismatch "
+                                 "%llu)\n",
+                                 static_cast<unsigned long long>(key_only));
+                } else if (!key_equal && hash_equal && ++hash_only <= 20) {
+                    std::fprintf(stderr,
+                                 "SOTC DRAWREPLAY VERIFY: hash equal but the key differs (mismatch "
+                                 "%llu)\n",
+                                 static_cast<unsigned long long>(hash_only));
+                }
+                if ((checked & 0xFFFFF) == 0) {
+                    std::fprintf(stderr,
+                                 "SOTC DRAWREPLAY VERIFY: %llu key/hash comparisons, key-only %llu, "
+                                 "hash-only %llu\n",
+                                 static_cast<unsigned long long>(checked),
+                                 static_cast<unsigned long long>(key_only),
+                                 static_cast<unsigned long long>(hash_only));
+                }
+            }
+        }
         if (fast_bind.valid && fast_bind.pipeline == pipeline &&
             fast_bind.tick == scheduler.CurrentTick() &&
             fast_bind.buffer_generation == buffer_cache.BindGeneration() &&
@@ -2639,11 +3194,18 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             fast_bind.stream_generation == buffer_cache.StreamGeneration() &&
             fast_bind.mem_epoch == SotcStats::mem_epoch.load(std::memory_order_acquire) &&
             fast_bind.clobbers == SotcStats::push_clobbers.load(std::memory_order_relaxed) &&
-            fast_bind.hash == fast_hash) {
+            same_key) {
             static const bool verify = std::getenv("SOTC_FAST_BIND_VERIFY") != nullptr;
             if (!verify) {
                 fast_bind_hit = true;
-                SotcStats::fast_bind_hits.fetch_add(1, std::memory_order_relaxed);
+                if (replay_key) {
+                    if (SotcStats::kFpsLog) { // see fast_bind_eligible above
+                        auto& c = SotcStats::fast_bind_hits;
+                        c.store(c.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+                    }
+                } else {
+                    SotcStats::fast_bind_hits.fetch_add(1, std::memory_order_relaxed);
+                }
                 // sotc: the slow path marks every sampled texture bank (SotcLod::Mark counts the
                 // uses the game's streaming priority reads); a reused bind marks the same banks.
                 for (const u32 bank : fast_bind.lod_marks) {
@@ -2765,7 +3327,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     }
 
     if (fast_eligible) {
-        CommitFastBind(pipeline, fast_hash, uses_dma, pre_epoch, pre_clobbers);
+        CommitFastBind(pipeline, fast_hash, uses_dma, pre_epoch, pre_clobbers,
+                       replay_key ? &fast_key : nullptr);
+        fast_bind.hash_valid = !replay_key || replay_verify;
     }
 
     return true;
@@ -2904,6 +3468,23 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         SotcOps::vb_desc = vd;
         SotcOps::vb_exact = ve;
     }
+    if (DrawPhase::kReplay) [[unlikely]] { // sotc: SOTC_DRAW_REPLAY_PROBE
+        u64 h = 0x7662;
+        for (size_t i = 0; i < guest_buffers.size(); ++i) {
+            const u64 w[4] = {std::bit_cast<u64>(host_buffers[i]), host_offsets[i], host_sizes[i],
+                              host_strides[i]};
+            DrawPhase::Fnv(h, w, sizeof(w));
+        }
+        for (const auto& b : bindings) {
+            const u32 w[4] = {b.binding, b.stride, static_cast<u32>(b.inputRate), b.divisor};
+            DrawPhase::Fnv(h, w, sizeof(w));
+        }
+        for (const auto& a : attributes) {
+            const u32 w[4] = {a.location, a.binding, static_cast<u32>(a.format), a.offset};
+            DrawPhase::Fnv(h, w, sizeof(w));
+        }
+        DrawPhase::rc.vb_hash = h;
+    }
     const auto cmdbuf = scheduler.CommandBuffer();
     const auto num_buffers = guest_buffers.size();
     if (instance.IsVertexInputDynamicState()) {
@@ -2934,6 +3515,12 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
     if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1
         SotcOps::ib_desc = SotcOps::Mix(std::bit_cast<u64>(buffer->Handle()), u64{index_size});
         SotcOps::ib_exact = SotcOps::Mix(index_address, u64{index_size});
+    }
+    if (DrawPhase::kReplay) [[unlikely]] { // sotc: SOTC_DRAW_REPLAY_PROBE
+        DrawPhase::rc.has_ib = true;
+        DrawPhase::rc.ib_handle = std::bit_cast<u64>(buffer->Handle());
+        DrawPhase::rc.ib_off = offset;
+        DrawPhase::rc.ib_type = static_cast<u32>(index_type);
     }
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindIndexBuffer(buffer->Handle(), offset, index_type);

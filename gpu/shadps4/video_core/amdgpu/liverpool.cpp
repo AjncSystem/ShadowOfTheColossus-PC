@@ -415,6 +415,25 @@ void Liverpool::CaptureBackOp(BackOp& op, const Vulkan::Pipeline* pipeline) {
         }
         stage.pgm_base = rt.pgm_base;
         stage.flat.assign(rt.flattened_ud_buf.begin(), rt.flattened_ud_buf.end());
+        // sotc: BbToggle::DrawReplay: did this op's user data or flat buffer change since the last
+        // op captured with this shader? The draw thread keeps a generation by it (ExecuteBackOp).
+        // Computed whatever the bit says, so the answer is relative to the previous capture
+        // when the bit is flipped in a run.
+        Shader::InfoRuntime& wrt = stage.info->runtime[0];
+        bool changed = stage.num_user_data != wrt.cap_ud_n;
+        if (stage.num_user_data != ~0u) {
+            const size_t bytes = stage.num_user_data * sizeof(u32);
+            changed |= std::memcmp(wrt.cap_ud.data(), stage.user_data.data(), bytes) != 0;
+            std::memcpy(wrt.cap_ud.data(), stage.user_data.data(), bytes);
+        }
+        wrt.cap_ud_n = stage.num_user_data;
+        if (wrt.cap_flat.size() != rt.flattened_ud_buf.size() ||
+            std::memcmp(wrt.cap_flat.data(), rt.flattened_ud_buf.data(),
+                        rt.flattened_ud_buf.size() * sizeof(u32)) != 0) {
+            wrt.cap_flat.assign(rt.flattened_ud_buf.begin(), rt.flattened_ud_buf.end());
+            changed = true;
+        }
+        stage.changed = changed;
     }
 }
 
@@ -529,18 +548,39 @@ void Liverpool::ExecuteBackOp(BackOp& op) {
     back_rel_serial[RelColor] += rel_color;
     back_cb_extent = op.cb_extent;
     back_db_extent = op.db_extent;
+    const bool replay_prefix = !BbToggle::Disabled(BbToggle::DrawReplay);
     for (u32 i = 0; i < op.num_stages; ++i) {
         BackStage& stage = op.stages[i];
         Shader::InfoRuntime& rt = stage.info->runtime[1];
         rt.user_data = stage.num_user_data == ~0u
                            ? std::span<const u32>{}
                            : std::span<const u32>{stage.user_data.data(), stage.num_user_data};
-        rt.flattened_ud_buf.assign(stage.flat.begin(), stage.flat.end());
+        if (replay_prefix) {
+            // sotc: BbToggle::DrawReplay: the op's flat buffer becomes this copy's (a swap: no
+            // bytes are read or written here; the op's vector takes the old ones and the command
+            // processor assigns it again before reusing the op). The command processor compared
+            // the op's user data and flat buffer with those of the previous op of this shader
+            // (CaptureBackOp): ud_gen moves exactly when they differ (see InfoRuntime).
+            rt.flattened_ud_buf.swap(stage.flat);
+            rt.ud_gen += stage.changed;
+            if (stage.changed) {
+                // The bytes were written by the command processor's core: ask for the first KiB
+                // now, the binds read them a few hundred ns later (a hit never reads them).
+                const char* p = reinterpret_cast<const char*>(rt.flattened_ud_buf.data());
+                const size_t n = std::min<size_t>(rt.flattened_ud_buf.size() * sizeof(u32), 1024);
+                for (size_t off = 0; off < n; off += 64) {
+                    __builtin_prefetch(p + off);
+                }
+            }
+        } else {
+            rt.flattened_ud_buf.assign(stage.flat.begin(), stage.flat.end());
+            ++rt.ud_gen; // the generation is only meaningful with the bit clear: always "changed"
+        }
         rt.pgm_base = stage.pgm_base;
     }
     if (Vulkan::DrawPhase::kOn && (op.kind == BackOp::Kind::Draw || op.kind == BackOp::Kind::DrawIndirect)) {
         Vulkan::DrawPhase::AddOpPrefix(Vulkan::DrawPhase::Now() - phase_t0, changed_chunks,
-                                       changed_dwords);
+                                       changed_dwords, op.kind == BackOp::Kind::Draw ? 0 : 1);
     }
     switch (op.kind) {
     case BackOp::Kind::Func:

@@ -23,6 +23,7 @@
 #include "video_core/renderer_vulkan/vk_framegen.h"
 #include "bbport_overlay.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/sotc_fps_cap.h"
 #include "video_core/sotc_event.h"
 #include "video_core/sotc_stats.h"
@@ -1201,6 +1202,7 @@ void VideoOutDriver::Flip(const Request& req) {
                 std::fprintf(stderr, "SOTC draw thread guest commands %.2f ms per frame\n",
                              SotcStats::draw_cmds_ns.exchange(0) / 1e6 / flips);
             }
+            Vulkan::DrawPhase::ReplayReport(); // sotc: SOTC_DRAW_REPLAY_PROBE (no-op otherwise)
             // sotc: SOTC_HASH_STATS=1, top shader hashes of the draw thread (liverpool.cpp).
             if (SotcStats::kHashStats && liverpool) {
                 liverpool->HashStatsReport(report, seconds);

@@ -483,6 +483,7 @@ private:
         u32 num_user_data; // ~0u: no user data bound
         VAddr pgm_base;
         std::vector<u32> flat;
+        bool changed; ///< sotc: DrawReplay, see CaptureBackOp
     };
     struct BackOp {
         enum class Kind : u8 { Func, Draw, DrawIndirect, Dispatch, DispatchIndirect };

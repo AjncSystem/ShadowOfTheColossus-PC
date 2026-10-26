@@ -1430,6 +1430,10 @@ void *runtime_low_map(size_t size, int prot) {
 /* sotc: bit 40 (DispatchFastPath) is SET = off by default: exact (SOTC_DISPFAST_VERIFY=1: 0 bad in >100 M checks) but it
  * saved ~0.3 +- 0.17 ms of the draw thread in the heavy temple, under the 0.5 ms bar and with no visible FPS gain
  * (docs/sotc/DISPATCH-FASTPATH.md). SOTC_DISPFAST=1 turns it on (see toggle_mask_env). */
+/* sotc: bit 41 (DrawReplay) is clear = on by default (set = the old path): unchanged flat buffers are not copied per op and the
+ * reusable-bind key of a draw is compared field by field instead of hashed. Exact (SOTC_DRAWREPLAY_VERIFY=1: 0 differences against the
+ * hash in >30 M comparisons); -1.2 +- 0.33 ms of draw thread and +2.7 +- 0.8 FPS in the heavy temple (docs/sotc/DRAW-REPLAY.md).
+ * SOTC_DRAWREPLAY=0 pins the old path (see toggle_mask_env). */
 uint64_t runtime_disabled_optimizations=UINT64_C(1)<<20 | UINT64_C(1)<<39 | UINT64_C(1)<<40 | UINT64_C(1)<<59 | UINT64_C(1)<<60;
 /* Speculative readers of guest memory (GPU draw-preparation workers) register a recovery
  * point: a fault on that thread jumps back to it instead of terminating (probe.c). */
@@ -1461,6 +1465,10 @@ static uint64_t toggle_mask_env(uint64_t mask) {
     const char *dfast=getenv("SOTC_DISPFAST");
     if (dfast && dfast[0]=='1') mask&=~(UINT64_C(1)<<40);
     else if (dfast && dfast[0]=='0') mask|=(UINT64_C(1)<<40);
+    /* sotc: SOTC_DRAWREPLAY=1/0 pins bit 41 (DrawReplay, set = the old path, clear by default), see SOTC_CP_FAST. */
+    const char *dreplay=getenv("SOTC_DRAWREPLAY");
+    if (dreplay && dreplay[0]=='1') mask&=~(UINT64_C(1)<<41);
+    else if (dreplay && dreplay[0]=='0') mask|=(UINT64_C(1)<<41);
     const char *env=getenv("SOTC_TIMER_RES");
     if (!env) return mask;
     if (env[0]=='1') return mask&~(UINT64_C(1)<<61);

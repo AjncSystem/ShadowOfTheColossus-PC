@@ -136,3 +136,5 @@ de `out/snapshots/port-2026-10-26` hasta reentrenar con `tools/pgo_train.sh`.
 2. Mover trabajo del hilo de dibujo (2.6-3.2 ms de comandos de hilos del juego: terminar lecturas de vuelta y guarda BPE)
    a otro hilo exige demostrar el orden con los draws: sin diseño aún.
 3. Reentrenar PGO después de cualquier cambio de `liverpool.cpp`.
+4. (2026-10-26, [DRAW-REPLAY.md](DRAW-REPLAY.md)) El hash de la clave del bind reutilizable y la copia por operación del buffer plano eran trabajo fijo
+   repetido: quitados con `BbToggle::DrawReplay` (bit 41, activado): `GpuDraw` ocupado -1.2 +- 0.33 ms en el tramo pesado.

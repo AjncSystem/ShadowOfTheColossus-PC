@@ -160,7 +160,7 @@ def windows_language():
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
                 'user_dir': '', 'af16': True, 'textures': 'high', 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
-                'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'skip_logos': False, 'skip_film': False, 'close_on_play': False, 'gamepad': '',
+                'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'rb_hot': False, 'skip_logos': False, 'skip_film': False, 'close_on_play': False, 'gamepad': '',
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
@@ -299,7 +299,7 @@ FPS_MODES = [('30', ('30 FPS (como no PS4)', '30 FPS (as on PS4)')),
 # game's page pool is low) or maximum (always fine; may close in very wide views in PS4 Pro mode).
 TEXTURES = [('off', ('Desligada', 'Off')),
             ('high', ('Alta (estável)', 'High (stable)')),
-            ('max', ('Máxima (nítida, pode fechar no modo Pro)', 'Maximum (sharp, may close in Pro mode)'))]
+            ('max', ('Máxima (nítida, experimental no modo Pro)', 'Maximum (sharp, experimental in Pro mode)'))]
 # Frame generation (bb-probe: SOTC_FRAMEGEN; F8 in game switches off / DLSS-G / FSR 3).
 FRAMEGEN = [('off', ('Desligada', 'Off')),
             ('auto', ('Automática (DLSS-G ou FSR 3, experimental)', 'Automatic (DLSS-G or FSR 3, experimental)')),
@@ -676,9 +676,10 @@ def game_environment(s):
     textures = s.get('textures') or 'high'
     if textures != 'off':
         env.setdefault('SOTC_LOD_LINGER', '1')
-    if textures == 'max' and env['SOTC_NEO'] == '1' and 'SOTC_MAX_IN_PRO=1' not in str(s.get('extra_env', '')):
-        # sotc: in PS4 Pro mode "Maximum" exhausted the game's page pool within minutes at the
-        # Shrine (0x1a371, user, 22 Oct): High there.
+    # sotc: "Maximum" in PS4 Pro mode exhausted the game's page pool within minutes at the Shrine
+    # (0x1a371, 22 Oct) until tabnul's page allocator fix (PR #288, sotc_modes.py POOL_FIX): an
+    # hour without a crash with it (26 Oct). Experimental there; SOTC_MAX_IN_PRO=0 brings back High.
+    if 'SOTC_MAX_IN_PRO=0' in str(s.get('extra_env', '')) and textures == 'max' and env['SOTC_NEO'] == '1':
         textures = 'high'
         env['SOTC_NOTE'] = 'Texture quality Maximum is not used in PS4 Pro mode: High'
     if textures == 'max':  # sotc: without the page pool switch (sotc_lod_stats.h)
@@ -712,6 +713,10 @@ def game_environment(s):
     env['SOTC_MOUSE'] = '1' if s.get('mouse', True) else '0'
     env['SOTC_MOUSE_SENS'] = str(s.get('mouse_sens') or '1.0')
     env['SOTC_MOUSE_INVERT'] = '1' if s.get('mouse_invert') else '0'
+    # Hot readbacks (buffer_cache.cpp GatherDownloads): ~25% more FPS at the Shrine; off by
+    # default since they put rainbow garbage and crashes on reused memory before the late check.
+    if s.get('rb_hot'):
+        env['SOTC_RB_HOT'] = '1'
     # Bluepoint's debug menu (+RetailBuild=0 served by the port; the game files are not touched).
     if s.get('debug_menu'):
         env['SOTC_DEBUG_MENU'] = '1'
@@ -1121,6 +1126,8 @@ class Launcher:
         self.check(quick, 'af16', _('Texturas nítidas (filtro 16x)', 'Sharp textures (16x filtering)'))
         self.check(quick, 'fullscreen', _('Tela cheia', 'Fullscreen'))
         self.check(quick, 'neo', _('Modo PS4 Pro', 'PS4 Pro mode'))
+        self.check(quick, 'rb_hot', _('Mais FPS: leituras rápidas da GPU (experimental)',
+                                      'More FPS: fast GPU readbacks (experimental)'))
         for key in ('af16', 'textures', 'fps_mode', 'fullscreen', 'neo', 'output_res', 'upscaler', 'sharpness', 'framegen'):
             self.vars[key].trace_add('write', lambda *_a: self.refresh_status())
 

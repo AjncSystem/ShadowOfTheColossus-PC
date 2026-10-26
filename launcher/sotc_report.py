@@ -14,7 +14,8 @@ from pathlib import Path
 ISSUES_URL = 'https://github.com/Lucas-blip-png/ShadowOfTheColossus-PC/issues/new'
 TAIL_LINES = 150
 URL_BODY_MAX = 1500    # a browser URL longer than ~8000 characters is refused; the report goes by clipboard
-LOGS = ('last_run.log', 'events.log')
+LOGS = ('last_run.log', 'events.log', 'last_run.1.log', 'events.1.log')
+DIAG_TAIL = 8 * 1024 * 1024  # the detailed texture log (up to 400 MB): only its last part goes in
 
 
 def _powershell(command):
@@ -85,6 +86,12 @@ def save_zip(version, report, user_dir):
             f = Path(user_dir) / name
             if f.is_file():
                 z.writestr(name, scrub(f.read_text(encoding='utf-8', errors='replace')))
+        diag = Path(user_dir) / 'texture_diag.log'
+        if diag.is_file():
+            with open(diag, 'rb') as fh:
+                fh.seek(0, os.SEEK_END)
+                fh.seek(max(0, fh.tell() - DIAG_TAIL))
+                z.writestr('texture_diag_tail.log', scrub(fh.read().decode('utf-8', errors='replace')))
         crashes = Path(user_dir) / 'crashes'
         for f in (sorted(crashes.glob('*.log'))[-3:] if crashes.is_dir() else []):
             z.writestr('crashes/' + f.name, scrub(f.read_text(encoding='utf-8', errors='replace')))

@@ -76,6 +76,34 @@ static void touch_click(PadData *d, int side) {
                             : (PadTouch){.x=side ? 1440 : 480,.y=471,.id=0};
 }
 
+/* sotc: with SOTC_DEBUG_MENU=1, Start+Select (Options+touchpad) together touch the debug menu
+ * corner instead (pads have no F6). Either button alone waits up to 150 ms for the other, so the
+ * pause menu or the map does not open first; a tap shorter than that is passed on after release. */
+static void debug_menu_combo(PadData *d) {
+    static int on=-1, combo;
+    static uint32_t held, tap; static uint64_t since, tap_until;
+    if (on<0) { const char *v=getenv("SOTC_DEBUG_MENU"); on=v && *v && strcmp(v,"0"); }
+    if (!on) return;
+    const uint32_t both=BTN_OPTIONS|BTN_TOUCHPAD, now=d->buttons & both;
+    if (combo || now==both) {
+        combo=now!=0; held=0; tap=0;
+        d->buttons&=~both; d->touch_count=0;
+        if (now) touch_click(d,2);
+        return;
+    }
+    if (tap) {
+        if (d->timestamp<tap_until) { d->buttons|=tap; return; }
+        tap=0;
+    }
+    if (!now) {
+        if (held && d->timestamp-since<150000) { tap=held; tap_until=d->timestamp+60000; d->buttons|=tap; }
+        held=0;
+        return;
+    }
+    if (!held) { held=now; since=d->timestamp; }
+    if (d->timestamp-since<150000) { d->buttons&=~both; d->touch_count=0; }
+}
+
 /* BB_GAMEPAD (the launcher's controller choice): its SDL GUID, or part of its name. Issue #15:
  * wheels and other controllers connected for good came first. */
 static const char *preferred_gamepad(void) {
@@ -358,6 +386,7 @@ static void sample_host(PadData *d) {
                 }
             }
         }
+        debug_menu_combo(d);
         // Back/Select on pads without a touch surface is a left-side click.
         if ((d->buttons & BTN_TOUCHPAD) && !d->touch_count) touch_click(d,0);
         if (touch_right) touch_click(d,1);

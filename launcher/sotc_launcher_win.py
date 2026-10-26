@@ -1319,7 +1319,7 @@ class Launcher:
                                _('Ferramentas de teste. Valem a partir da próxima abertura do jogo.',
                                  'Test tools. They apply the next time the game starts.'))
         self.section(f, _('Menu de debug do jogo', "The game's debug menu"), top=4)
-        self.check(f, 'debug_menu', _('Ligar o menu de debug (F6 no jogo)', 'Enable the debug menu (F6 in game)'),
+        self.check(f, 'debug_menu', _('Ligar o menu de debug (F6 ou Start+Select no jogo)', 'Enable the debug menu (F6 or Start+Select in game)'),
                    _('O menu de testes da Bluepoint: carregador de áreas, câmera livre, estatísticas e opções de '
                      'desenvolvedor. Os arquivos do jogo não são alterados. O jogo pode ficar menos estável com '
                      'ele ligado: desligue para jogar normalmente.',
@@ -1335,7 +1335,7 @@ class Launcher:
         self.section(f, _('Teclas no jogo', 'In-game keys'))
         for key, text in (('F5', _('Salva as texturas do quadro atual em user/log/texcap_N',
                                     'Saves the textures of the current frame to user/log/texcap_N')),
-                          ('F6', _('Abre o menu de debug (com a opção acima ligada)',
+                          ('F6 / Start+Select', _('Abre o menu de debug (com a opção acima ligada)',
                                    'Opens the debug menu (with the option above on)')),
                           ('F9', _('Recarrega todas as texturas da memória do jogo',
                                    'Reloads every texture from game memory'))):

@@ -40,6 +40,8 @@ static const Vulkan::Instance* s_instance = nullptr;
 // runtime (tests) still link.
 extern "C" __attribute__((weak)) void runtime_audio_set_volume_percent(int pct);
 extern "C" __attribute__((weak)) int runtime_audio_volume_percent(void);
+extern "C" __attribute__((weak)) int runtime_rumble_enabled(void);
+extern "C" __attribute__((weak)) void runtime_rumble_set(int on);
 
 // DejaVu Sans (Cyrillic), embedded (third_party/fonts, Bitstream Vera license).
 #ifdef _WIN32
@@ -663,6 +665,18 @@ void Menu() {
                        s.mouse_invert.load() ? SotcUi::T("ligado", "on") : SotcUi::T("desligado", "off"));
     }
     ImGui::EndDisabled();
+
+    // sotc: the pad's vibration, at once and kept as the launcher's option (#292)
+    if (runtime_rumble_enabled && runtime_rumble_set) {
+        ImGui::SeparatorText(SotcUi::T("Controle", "Controller"));
+        bool rumble = runtime_rumble_enabled() != 0;
+        if (ImGui::Checkbox(SotcUi::T("Vibração do controle", "Controller vibration"), &rumble)) {
+            runtime_rumble_set(rumble ? 1 : 0);
+            SaveLauncherSetting("rumble", rumble ? "true" : "false");
+            SotcEvent::Log("MENU", SotcUi::T("Vibração do controle: %s", "Controller vibration: %s"),
+                           rumble ? SotcUi::T("ligada", "on") : SotcUi::T("desligada", "off"));
+        }
+    }
 
     ImGui::Spacing();
     ImGui::Separator();

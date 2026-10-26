@@ -157,7 +157,7 @@ def windows_language():
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
                 'user_dir': '', 'af16': True, 'textures': 'high', 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
-                'readbacks': '', 'extra_env': '', 'close_on_play': False, 'gamepad': '',
+                'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'close_on_play': False, 'gamepad': '',
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
@@ -608,6 +608,12 @@ def game_environment(s):
     env['SOTC_MOUSE'] = '1' if s.get('mouse', True) else '0'
     env['SOTC_MOUSE_SENS'] = str(s.get('mouse_sens') or '1.0')
     env['SOTC_MOUSE_INVERT'] = '1' if s.get('mouse_invert') else '0'
+    # Bluepoint's debug menu (+RetailBuild=0 served by the port; the game files are not touched).
+    if s.get('debug_menu'):
+        env['SOTC_DEBUG_MENU'] = '1'
+    # The texture memory watch (events.log lines "Vigia: ..."), for bug reports.
+    if s.get('debug_watch'):
+        env['SOTC_POOL_WATCH'] = '1'
     if str(s.get('gamepad', '')).strip():
         env['BB_GAMEPAD'] = str(s['gamepad']).strip()
     env['BB_CONFIG'] = str(PORT_DIR / 'sotc.ini')
@@ -906,7 +912,7 @@ class Launcher:
         self.nav, self.current_page = {}, None
         for name, title in (('play', _('Jogar', 'Play')), ('game', _('Jogo e saves', 'Game & saves')),
                             ('graphics', _('Imagem e FPS', 'Display & FPS')), ('controls', _('Controles', 'Controls')),
-                            ('advanced', _('Avançado', 'Advanced'))):
+                            ('advanced', _('Avançado', 'Advanced')), ('debug', _('Debug', 'Debug'))):
             item = tk.Label(side, text='    ' + title, bg=BG, fg=TEXT, anchor='w', font=(ui_font(), 11),
                             pady=10, cursor='hand2')
             item.pack(fill='x')
@@ -943,6 +949,7 @@ class Launcher:
         self.build_graphics()
         self.build_controls()
         self.build_advanced()
+        self.build_debug()
         self.build_log()
         self.root.bind_all('<MouseWheel>', self.wheel)
         self.refresh_status()
@@ -1309,6 +1316,33 @@ class Launcher:
         window.bind('<KeyPress>', pressed)
         window.grab_set()
         window.focus_force()
+
+    def build_debug(self):
+        f = self.scrolled_page('debug', _('Debug', 'Debug'),
+                               _('Ferramentas de teste. Valem a partir da próxima abertura do jogo.',
+                                 'Test tools. They apply the next time the game starts.'))
+        self.section(f, _('Menu de debug do jogo', "The game's debug menu"), top=4)
+        self.check(f, 'debug_menu', _('Ligar o menu de debug (F6 no jogo)', 'Enable the debug menu (F6 in game)'),
+                   _('O menu de testes da Bluepoint: carregador de áreas, câmera livre, estatísticas e opções de '
+                     'desenvolvedor. Os arquivos do jogo não são alterados. O jogo pode ficar menos estável com '
+                     'ele ligado: desligue para jogar normalmente.',
+                     "Bluepoint's test menu: area loader, free camera, statistics and developer options. The "
+                     'game files are not changed. The game can be less stable with it on: turn it off to play '
+                     'normally.'))
+        self.section(f, _('Diagnóstico', 'Diagnostics'))
+        self.check(f, 'debug_watch', _('Vigia da memória de texturas', 'Texture memory watch'),
+                   _('Anota em user/events.log quando o jogo reaproveita memória de texturas ainda em uso. '
+                     'Útil para relatar texturas com lixo colorido.',
+                     'Writes to user/events.log when the game reuses memory of textures still in use. Useful '
+                     'when reporting colour garbage on textures.'))
+        self.section(f, _('Teclas no jogo', 'In-game keys'))
+        for key, text in (('F5', _('Salva as texturas do quadro atual em user/log/texcap_N',
+                                    'Saves the textures of the current frame to user/log/texcap_N')),
+                          ('F6', _('Abre o menu de debug (com a opção acima ligada)',
+                                   'Opens the debug menu (with the option above on)')),
+                          ('F9', _('Recarrega todas as texturas da memória do jogo',
+                                   'Reloads every texture from game memory'))):
+            self.row(f, key, self.ttk.Label(f, text=text))
 
     def build_advanced(self):
         ttk = self.ttk

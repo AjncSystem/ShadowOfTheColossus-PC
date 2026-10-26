@@ -1047,6 +1047,14 @@ bool HandleEvent(const SDL_Event& event) {
         }
         return true;
     }
+    // sotc: F5 (diagnostic) saves the textures of the next frame (sotc_stats.h).
+    if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F5 && !event.key.repeat) {
+        SotcStats::tex_capture.store(true, std::memory_order_relaxed);
+        SotcEvent::Log("KEY", "%s", SotcUi::T("F5: captura de texturas", "F5: texture capture"));
+        toast_text = SotcUi::T("F5: texturas capturadas", "F5: textures captured");
+        toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
+        return true;
+    }
     // sotc: F9 (diagnostic) uploads every cached texture again from guest memory (sotc_stats.h).
     if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F9 && !event.key.repeat) {
         SotcStats::reload_all.store(true, std::memory_order_relaxed);

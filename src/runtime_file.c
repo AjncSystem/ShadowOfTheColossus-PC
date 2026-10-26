@@ -233,11 +233,37 @@ static int game_path(const char *p) {
            (!strncmp(p,"/hostapp",8) && (!p[8] || p[8]=='/'));
 }
 /* All operations return >=0 or -(host errno); wrappers adapt the convention. */
+/* sotc: SOTC_DEBUG_MENU=1 (launcher option): the game reads gameversion.txt with +RetailBuild=0,
+ * which turns on Bluepoint's debug menu (upper left of the touchpad, F6 in the port). The copy is
+ * written to the user folder; the game's own file is left as it is. */
+static void debug_gameversion(const char *guest, char *path, size_t size) {
+    const char *on=getenv("SOTC_DEBUG_MENU");
+    const size_t n=strlen(guest);
+    if (!on || on[0]!='1' || n<15 || strcmp(guest+n-15,"gameversion.txt")) return;
+    FILE *in=fopen(path,"rb");
+    if (!in) return;
+    char text[4096];
+    const size_t len=fread(text,1,sizeof(text)-1,in);
+    fclose(in);
+    text[len]=0;
+    char *flag=strstr(text,"+RetailBuild=1");
+    if (flag) flag[13]='0';
+    const char *dir=getenv("BB_GPU_USER_DIR");
+    char copy[1024];
+    snprintf(copy,sizeof(copy),"%s/debug_gameversion.txt",dir && dir[0] ? dir : ".");
+    FILE *out=fopen(copy,"wb");
+    if (!out) return;
+    fwrite(text,1,len,out);
+    fclose(out);
+    snprintf(path,size,"%s",copy);
+    fprintf(stderr,"Runtime: debug menu on (+RetailBuild=0 from %s)\n",copy);
+}
 static int64_t do_open(const char *guest,int flags,int mode) {
     if (game_path(guest) && (flags & (3|0x8|0x200|0x400|0x800))) return -EROFS;
     char path[1024];
     int e=translate(guest,path,sizeof(path));
     if (e) return -e;
+    debug_gameversion(guest,path,sizeof(path));
 #ifdef _WIN32
     /* Windows cannot open a directory as a CRT descriptor: directories are listings only. */
     (void)mode;

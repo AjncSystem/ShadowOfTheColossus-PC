@@ -19,11 +19,13 @@
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
+#include <vector>
 #include "common/types.h"
 #include "video_core/sotc_event.h"
 #include "video_core/sotc_live.h"
@@ -92,6 +94,29 @@ inline PoolPages PoolFree() {
         free += std::popcount(word);
     }
     return {static_cast<s64>(std::min<u64>(free, pages)), pages};
+}
+
+/// sotc: a copy of the page pool's free bitmap (set bit: free 64 KiB page; page i is guest
+/// 0x1000000000 + i * 64 KiB, the whole direct memory). Empty when the pool is not there.
+inline std::vector<u64> PoolBitmap() {
+    constexpr uintptr_t Pool = 0x1000000140;
+    const u8* pool = runtime_memory_backing_pointer(Pool);
+    if (!pool || runtime_memory_backing_pointer(Pool + 0x67) != pool + 0x67) {
+        return {};
+    }
+    u64 bitmap, words;
+    std::memcpy(&bitmap, pool + 0x50, 8);
+    std::memcpy(&words, pool + 0x58, 8);
+    if (!words || words > 0x10000) {
+        return {};
+    }
+    const u8* bits = runtime_memory_backing_pointer(bitmap);
+    if (!bits || runtime_memory_backing_pointer(bitmap + words * 8 - 1) != bits + words * 8 - 1) {
+        return {};
+    }
+    std::vector<u64> out(words);
+    std::memcpy(out.data(), bits, words * 8);
+    return out;
 }
 
 /// Free share (percent) of the page pool, or -1 when it is not there
@@ -234,14 +259,17 @@ inline void Collect(u64 (&entries)[256]) {
         const char* v = std::getenv("SOTC_LOD_FB_KEEP");
         return v ? static_cast<u32>(std::strtoul(v, nullptr, 0)) : 60u;
     }();
-    // SOTC_LOD_FB_HOLD=<reports> (default 120, about 2 s): a bank asks for a finer mip at once
-    // but for a coarser one only after measuring it that long. Measured mips move between
-    // neighbours from one report to the next (a texture at the edge of a mip boundary), and every
-    // switch makes the game drop or stream mips: stalls down to 0.1 FPS without this (22 Oct).
-    static const u32 fb_hold = [] {
-        const char* v = std::getenv("SOTC_LOD_FB_HOLD");
-        return v ? static_cast<u32>(std::strtoul(v, nullptr, 0)) : 120u;
+    // SOTC_LOD_FB_HOLD_MS=<ms> (default 8000): a bank asks for a finer mip at once, and for one
+    // mip coarser only after no sample needed its current mip for that long (one step per
+    // period). Measured mips move between neighbours from frame to frame, and every switch makes
+    // the game drop or stream mips: stalls down to 0.1 FPS when it followed them (22 Oct).
+    static const u64 fb_hold_ms = [] {
+        const char* v = std::getenv("SOTC_LOD_FB_HOLD_MS");
+        return v ? std::strtoull(v, nullptr, 0) : 8000ull;
     }();
+    const u64 now_ms = static_cast<u64>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::steady_clock::now().time_since_epoch())
+                                            .count());
     // SOTC_LOD_FB_USE=0: measure (and log) without changing what the game reads (shader cost).
     static const bool fb_use = [] {
         const char* v = std::getenv("SOTC_LOD_FB_USE");
@@ -249,7 +277,7 @@ inline void Collect(u64 (&entries)[256]) {
     }();
     static u8 gpu_last[256];
     static u32 gpu_age[256];
-    static u32 gpu_coarse_for[256];
+    static u64 gpu_fine_ms[256]; // last time a sample needed the bank's current mip or finer
     static const bool gpu_ready = [] {
         std::fill(std::begin(gpu_last), std::end(gpu_last), u8{0xff});
         std::fill(std::begin(gpu_age), std::end(gpu_age), 0xffffffffu);
@@ -284,10 +312,10 @@ inline void Collect(u64 (&entries)[256]) {
                 const u8 now = static_cast<u8>(g - 1);
                 if (gpu_last[i] == 0xff || now <= gpu_last[i]) {
                     gpu_last[i] = now;
-                    gpu_coarse_for[i] = 0;
-                } else if (++gpu_coarse_for[i] >= fb_hold) {
-                    gpu_last[i] = now;
-                    gpu_coarse_for[i] = 0;
+                    gpu_fine_ms[i] = now_ms;
+                } else if (now_ms - gpu_fine_ms[i] >= fb_hold_ms) {
+                    gpu_last[i] = static_cast<u8>(gpu_last[i] + 1);
+                    gpu_fine_ms[i] = now_ms;
                 }
                 gpu_age[i] = 0;
                 gpu_fresh = true;

@@ -1934,7 +1934,73 @@ void Rasterizer::MaybeDumpImages(u64 pgm_hash) {
     ++seq;
 }
 
+// sotc: F5 (SotcStats::tex_capture): every sampled image of the next 30000 draws and dispatches
+// is saved once to user/log/texcap_N, named by guest address, size, format, mips and flags, to
+// find which texture shows garbage and where it lives.
+void Rasterizer::CaptureTextures() {
+    static u32 budget = 0, session = 0, count = 0;
+    static std::filesystem::path dir;
+    static std::set<u64> seen;
+    // SOTC_TEXCAP_AFTER=<seconds>: one capture that long after the first draw (tests).
+    static const auto first_draw = std::chrono::steady_clock::now();
+    static long after = [] {
+        const char* v = std::getenv("SOTC_TEXCAP_AFTER");
+        return v ? std::atol(v) : 0L;
+    }();
+    if (after > 0 && std::chrono::steady_clock::now() - first_draw > std::chrono::seconds{after}) {
+        after = 0;
+        SotcStats::tex_capture.store(true, std::memory_order_relaxed);
+    }
+    if (SotcStats::tex_capture.exchange(false, std::memory_order_relaxed)) {
+        budget = 30000;
+        count = 0;
+        seen.clear();
+        dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir) /
+              fmt::format("texcap_{}", ++session);
+        std::filesystem::create_directories(dir);
+        std::fprintf(stderr, "SOTC TEXCAP %u started\n", session);
+    }
+    if (!budget) {
+        return;
+    }
+    if (--budget == 0) {
+        std::fprintf(stderr, "SOTC TEXCAP %u done: %u textures\n", session, count);
+    }
+    for (const auto image_id : bound_images) {
+        if (!image_id || count >= 600) {
+            continue;
+        }
+        auto& image = texture_cache.GetImage(image_id);
+        // At most 64 MiB per image and 1 GiB per capture: each one is downloaded through a
+        // host staging buffer, and 600 full chains filled the system heap (out of memory, 26 Oct).
+        static u64 captured_bytes = 0;
+        if (count == 0) {
+            captured_bytes = 0;
+        }
+        const u64 bytes = image.info.guest_size;
+        if (image.info.size.width < 64 || image.info.size.height < 64 || bytes > 64_MB ||
+            captured_bytes + bytes > 1_GB) {
+            continue;
+        }
+        captured_bytes += bytes;
+        const u64 key = (u64{image.info.guest_address} << 8) ^ u64(image.info.pixel_format);
+        if (!seen.insert(key).second) {
+            continue;
+        }
+        ++count;
+        texture_cache.DumpImage(image_id,
+                                dir / fmt::format("{:03}_{}_m{}f{}_fl{:x}_u{}{}{}", count,
+                                                  vk::to_string(image.info.pixel_format),
+                                                  image.info.resources.levels,
+                                                  image.info.sotc_first_mip, u32(image.flags),
+                                                  image.usage.render_target ? "R" : "",
+                                                  image.usage.storage ? "S" : "",
+                                                  image.usage.depth_target ? "D" : ""));
+    }
+}
+
 void Rasterizer::ResetBindings(bool is_compute) {
+    CaptureTextures();
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
     }
@@ -2333,6 +2399,31 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                              u32(tsharp.last_level), u32(tsharp.min_lod), tsharp.min_lod / 256.f,
                              u32(tsharp.min_lod_warn), u32(tsharp.lod_hw_cnt_en),
                              u32(tsharp.counter_bank_id));
+            }
+        }
+        // sotc: SOTC_POOL_WATCH: the T#s bound at an address whose pages the game freed while the
+        // texture was in use (TextureCache::PoolWatch), each distinct mip field set once.
+        if (const u32 watched = SotcStats::pool_watch_count.load(std::memory_order_relaxed)) {
+            const u64 addr = tsharp.Address();
+            for (u32 k = 0; k < std::min<u32>(watched, 64); ++k) {
+                if (SotcStats::pool_watch_addr[k].load(std::memory_order_relaxed) != addr) {
+                    continue;
+                }
+                static std::mutex m;
+                static std::set<std::tuple<u64, u32, u32, u32>> seen;
+                std::scoped_lock lk{m};
+                if (seen.size() < 400 &&
+                    seen.insert({addr, u32(tsharp.base_level), u32(tsharp.last_level),
+                                 u32(tsharp.min_lod)}).second) {
+                    std::fprintf(stderr,
+                                 "SOTC POOLWATCH tsharp %#llx %ux%u base %u last %u min_lod %.2f "
+                                 "bank %u hwcnt %u\n",
+                                 static_cast<unsigned long long>(addr), tsharp.width + 1,
+                                 tsharp.height + 1, u32(tsharp.base_level), u32(tsharp.last_level),
+                                 tsharp.min_lod / 256.f, u32(tsharp.counter_bank_id),
+                                 u32(tsharp.lod_hw_cnt_en));
+                }
+                break;
             }
         }
         // sotc: first few only (per-draw warning; see BufferCache::SynchronizeMemoryFromImage).
@@ -2794,12 +2885,16 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
             !texture_cache.FindImageFromRange(src, num_bytes)) {
             // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
             std::memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
+            SotcStats::dma_cpu_copies.fetch_add(1, std::memory_order_relaxed);
+            SotcStats::dma_cpu_bytes.fetch_add(num_bytes, std::memory_order_relaxed);
             return;
         }
     }
     if (!dst_gds) {
         texture_cache.InvalidateMemoryFromGPU(dst, num_bytes, true);
     }
+    SotcStats::dma_gpu_copies.fetch_add(1, std::memory_order_relaxed);
+    SotcStats::dma_gpu_bytes.fetch_add(num_bytes, std::memory_order_relaxed);
     const auto* gds_buffer = buffer_cache.GetGdsBuffer();
     const auto [src_buffer, src_offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {
         if (src_gds) {

@@ -43,7 +43,20 @@ inline std::atomic<bool> load_flush{false};
 /// sotc: F9 (diagnostic): every cached texture not drawn by the GPU is uploaded again from guest
 /// memory. Garbage that stays was written there by the game; garbage that goes was a stale copy.
 inline std::atomic<bool> reload_all{false};
-inline std::atomic<uint64_t> reuse_size_frees{0}; ///< ResolveOverlap: slot reused by another size
+/// sotc: F5 (diagnostic): the textures the next draws sample are saved to user/log/texcap_N
+/// (raw mip 0 as the GPU holds it; Rasterizer::CaptureTextures).
+inline std::atomic<bool> tex_capture{false};
+/// sotc: FindMemo hits whose slot no longer held the memoized image (TextureCache::MemoLookup).
+inline std::atomic<uint64_t> memo_stale{0};
+/// sotc: readback bytes landing on pages the CPU wrote after the GPU (BufferCache, SOTC_RB_CPU_GUARD).
+inline std::atomic<uint64_t> rb_over_cpu{0};
+/// sotc: DMA copies (Rasterizer::CopyBuffer) done in host memory / on the GPU (SOTC_POOL_WATCH).
+inline std::atomic<uint64_t> dma_cpu_copies{0}, dma_cpu_bytes{0}, dma_gpu_copies{0}, dma_gpu_bytes{0};
+inline std::atomic<uint64_t> reuse_size_frees{0};
+/// sotc: SOTC_POOL_WATCH: guest addresses of images whose pages the game freed while in use; the
+/// rasterizer logs the T#s bound at these addresses afterwards.
+inline std::atomic<uint64_t> pool_watch_addr[64]{};
+inline std::atomic<uint32_t> pool_watch_count{0}; ///< ResolveOverlap: slot reused by another size
 inline std::atomic<uint64_t> gc_downloads_skipped{0}; ///< SOTC_GC_DOWNLOAD=0
 inline std::atomic<uint64_t> f9_gpu_copies{0}; ///< F9 uploads whose memory the GPU had written
 /// sotc: bytes of hot readbacks not applied because the guest may have written them since.

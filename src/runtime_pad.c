@@ -68,10 +68,12 @@ static uint8_t trigger(int16_t v) { int x=v>>7; return (uint8_t)(x<0 ? 0 : x>255
 static uint16_t touch_axis(float v, int max) {
     return (uint16_t)(v<=0.0f ? 0 : v>=1.0f ? max : (int)(v*max+0.5f));
 }
-static void touch_click(PadData *d, int right) {
+/* side: 0 left, 1 right, 2 upper left corner (the debug menu with +RetailBuild=0). */
+static void touch_click(PadData *d, int side) {
     d->buttons|=BTN_TOUCHPAD;
     d->touch_count=1;
-    d->touches[0]=(PadTouch){.x=right ? 1440 : 480,.y=471,.id=0};
+    d->touches[0] = side==2 ? (PadTouch){.x=160,.y=80,.id=0}
+                            : (PadTouch){.x=side ? 1440 : 480,.y=471,.id=0};
 }
 
 /* BB_GAMEPAD (the launcher's controller choice): its SDL GUID, or part of its name. Issue #15:
@@ -268,6 +270,9 @@ static void apply_keyboard(PadData *d, const bool *k) {
         if (i!=IN_TOUCHPAD && i!=IN_TOUCHPAD_RIGHT && key_down(k,i)) d->buttons|=input_buttons[i];
     if (key_down(k,IN_TOUCHPAD)) touch_click(d,0);
     if (key_down(k,IN_TOUCHPAD_RIGHT)) touch_click(d,1);
+    /* sotc: F6 touches the upper left of the touchpad: the game's debug menu when gameversion.txt
+     * says +RetailBuild=0. */
+    if (k[SDL_SCANCODE_F6]) touch_click(d,2);
     if (key_down(k,IN_L2)) d->l2=255;
     if (key_down(k,IN_R2)) d->r2=255;
     d->left_x=key_axis(d->left_x,key_down(k,IN_MOVE_LEFT),key_down(k,IN_MOVE_RIGHT));
@@ -408,6 +413,10 @@ static void read_inject(void) {
         if (!strcmp(token,"touchpad_left") || !strcmp(token,"touchpad_right")) {
             injected.buttons|=BTN_TOUCHPAD;
             injected.touch_side=!strcmp(token,"touchpad_right");
+        }
+        if (!strcmp(token,"touchpad_menu")) { /* the debug menu corner (F6) */
+            injected.buttons|=BTN_TOUCHPAD;
+            injected.touch_side=2;
         }
         for (size_t i=0;i<sizeof(names)/sizeof(*names);++i) if (!strcmp(token,names[i].name)) injected.buttons|=names[i].ps;
         for (int i=0;i<4;++i) if (!strncmp(token,sticks[i],3)) { int v=atoi(token+3); injected.stick[i]=v<0 ? 0 : v>255 ? 255 : v; }

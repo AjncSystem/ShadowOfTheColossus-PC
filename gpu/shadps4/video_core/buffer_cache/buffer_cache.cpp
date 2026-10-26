@@ -871,7 +871,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                     SotcStats::readback_bytes_changed.fetch_add(changed, std::memory_order_relaxed);
                 }
             }
-            ForEachNonStackRange(dst_addr, copy.size, [&](VAddr addr, u64 size) {
+            const auto write_range = [&](VAddr addr, u64 size) {
                 BpeHeapGuard* heap_guard = nullptr;
                 if (Active* a = active_for(addr, size)) {
                     BpeUsedBlocks& used = *a->slot->used;
@@ -905,6 +905,34 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                 }
                 memory->TryWriteBacking(std::bit_cast<u8*>(addr), src + (addr - dst_addr), size,
                                         1);
+            };
+            // sotc: pages the CPU wrote after the GPU are newer in guest memory than this copy:
+            // writing the copy over them put stale GPU data where the game had just written (the
+            // colour garbage after loads and the heap faults at 0x494xx-0x495xx are suspected to
+            // come from this). Counted always; SOTC_RB_CPU_GUARD=1 leaves those pages alone.
+            static const bool cpu_guard = [] {
+                const char* v = std::getenv("SOTC_RB_CPU_GUARD");
+                return v && v[0] == '1';
+            }();
+            ForEachNonStackRange(dst_addr, copy.size, [&](VAddr addr, u64 size) {
+                const VAddr end = addr + size;
+                VAddr run = addr;
+                for (VAddr page = addr; page < end;) {
+                    const VAddr next = std::min(Common::AlignDown(page, 4_KB) + 4_KB, end);
+                    if (memory_tracker->IsRegionCpuModified(page, next - page)) {
+                        SotcStats::rb_over_cpu.fetch_add(next - page, std::memory_order_relaxed);
+                        if (cpu_guard) {
+                            if (page > run) {
+                                write_range(run, page - run);
+                            }
+                            run = next;
+                        }
+                    }
+                    page = next;
+                }
+                if (end > run) {
+                    write_range(run, end - run);
+                }
             });
         }
         memory_tracker->UnmarkRegionAsGpuModified(item.addr, item.size, false);

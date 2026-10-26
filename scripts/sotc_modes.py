@@ -177,10 +177,16 @@ def render_patches(elf, ph, size):
               'h': struct.pack('<f', h), 'w2': struct.pack('<f', w / 2), 'h2': struct.pack('<f', h / 2),
               'a': struct.pack('<f', w / h), 'P': struct.pack('<I', render_pool(w, h))}
     writes = []
+    # SOTC_RENDER_KEEP=<addr>,<addr>: sites left at the 1920x1080 value (finding the HUD's sites,
+    # #301: health and stamina bars stretched in 21:9).
+    keep = {int(a, 16) for a in os.environ.get('SOTC_RENDER_KEEP', '').replace(' ', ',').split(',') if a}
     for address, kind, original in RENDER_SITES:
         original = bytes.fromhex(original)
         if image_bytes(elf, ph, address - BASE, len(original)) != original:
             raise SystemExit(f'render size: unexpected bytes at {address:#x}')
+        if address in keep:
+            print(f'Render size: {address:#x} kept at 1920x1080')
+            continue
         data = values[kind]
         writes.append((address - BASE + len(original) - len(data), data))
     return writes

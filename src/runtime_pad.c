@@ -12,6 +12,7 @@
 #include "gpu/bbgpu.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
@@ -608,12 +609,29 @@ static ABI int32_t pad_info(int32_t handle, ControllerInfo *info) {
     pthread_mutex_unlock(&lock);
     return 0;
 }
+/* sotc: the pad's vibration: SOTC_RUMBLE=0 (the launcher's option) starts with it off; the in-game
+ * menu switches it while playing (bbport_overlay.cpp). */
+static atomic_int rumble_on=-1;
+int runtime_rumble_enabled(void) {
+    int v=atomic_load(&rumble_on);
+    if (v<0) {
+        const char *e=getenv("SOTC_RUMBLE");
+        v=!(e && e[0]=='0');
+        atomic_store(&rumble_on,v);
+    }
+    return v;
+}
+void runtime_rumble_set(int on) {
+    atomic_store(&rumble_on,on ? 1 : 0);
+    pthread_mutex_lock(&lock);
+    if (!on && gamepad) SDL_RumbleGamepad(gamepad,0,0,0); /* stop a rumble in progress */
+    pthread_mutex_unlock(&lock);
+}
+
 static ABI int32_t pad_vibration(int32_t handle, const uint8_t *param) {
     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
     if (!param) return ERR_INVALID_ARG;
-    static int rumble=-1;  // SOTC_RUMBLE=0 turns the pad's vibration off (the launcher's option)
-    if (rumble<0) { const char *v=getenv("SOTC_RUMBLE"); rumble=!(v && v[0]=='0'); }
-    if (!rumble) return 0;
+    if (!runtime_rumble_enabled()) return 0;
     pthread_mutex_lock(&lock);
     SDL_Gamepad *g=current_gamepad();
     if (g) SDL_RumbleGamepad(g,(uint16_t)(param[0]*257),(uint16_t)(param[1]*257),1000);

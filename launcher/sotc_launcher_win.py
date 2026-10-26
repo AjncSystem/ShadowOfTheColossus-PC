@@ -166,7 +166,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
                 'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'auto', 'volume': '100', 'shadow_reuse': '0', 'grass_shadows': '3', 'grass_size': '1', 'grass_fade': '1', 'library_dirs': [], 'keys': {},
-                'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'fg_hudless': False,
+                'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'fg_hudless': False, 'diag_log': False,
                 'check_updates': True, 'skip_version': ''}
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
 KEY_INPUTS = [
@@ -433,6 +433,15 @@ def keep_crash_log(log_dir, code):
             old.unlink()
     except OSError:
         pass
+
+
+def apply_diag_log(env, settings, log_dir):
+    """Detailed log (user/texture_diag.log): every texture the GPU creates, drops, uploads or skips,
+    and every CPU write over a texture, with the clock time. Large (up to 400 MB); off by default."""
+    if settings.get('diag_log'):
+        env['SOTC_TEX_DIAG'] = str(log_dir / 'texture_diag.log')
+        env['SOTC_TEX_DIAG_LEVEL'] = '2'
+        env['SOTC_LOD_POOL_LOG'] = '1'
 
 
 def start_event_log(log_dir, settings, env):
@@ -1425,6 +1434,13 @@ class Launcher:
         self.check(f, 'rumble', _('Vibração do controle', 'Controller vibration'),
                    _('Desmarque para o controle não vibrar. Vale na próxima vez que o jogo abrir.',
                      'Clear it to stop the gamepad from rumbling. Applies the next time the game starts.'))
+        self.check(f, 'diag_log', _('Registro detalhado (diagnóstico)', 'Detailed log (diagnostics)'),
+                   _('Grava user/texture_diag.log com cada textura criada, descartada, enviada à placa ou pulada, e cada '
+                     'escrita do jogo sobre texturas, com a hora. Só para investigar defeitos de imagem: o arquivo fica '
+                     'grande (até 400 MB) e o jogo perde um pouco de desempenho. Vale na próxima vez que o jogo abrir.',
+                     'Writes user/texture_diag.log with every texture created, dropped, uploaded or skipped, and every '
+                     'game write over textures, with the time. Only for investigating image bugs: the file gets large '
+                     '(up to 400 MB) and the game runs a bit slower. Applies the next time the game starts.'))
         self.section(f, _('Mouse', 'Mouse'))
         self.check(f, 'mouse', _('Câmera no mouse', 'Mouse camera'),
                    _('Clique na janela do jogo para capturar o mouse; Esc solta. Botão esquerdo = R1 (agarrar), '
@@ -2061,6 +2077,7 @@ class Launcher:
         try:
             env = game_environment(self.app)
             env['SOTC_EVENT_LOG'] = start_event_log(user_dir(self.app), self.app, env)
+            apply_diag_log(env, self.app, user_dir(self.app))
             self.process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=env,
                                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                             stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
@@ -2382,6 +2399,7 @@ def play_without_window(settings):
         pass
     env = game_environment(settings)
     env['SOTC_EVENT_LOG'] = start_event_log(log_dir, settings, env)
+    apply_diag_log(env, settings, log_dir)
     with open_session_log(log_dir) as log:
         process = subprocess.Popen(run_command(), cwd=PORT_DIR, env=env,
                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,

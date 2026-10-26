@@ -31,11 +31,33 @@
 #include <vk_mem_alloc.h>
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/sotc_event.h"
+#include "video_core/sotc_texdiag.h"
 #include "video_core/sotc_ui_lang.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/texture_cache/tile_manager.h"
 
 namespace VideoCore {
+
+namespace {
+/// sotc: one-line image description for SOTC_TEX_DIAG.
+struct DiagImage {
+    char text[160];
+    explicit DiagImage(const Image& image) {
+        std::snprintf(text, sizeof(text),
+                      "0x%llx+0x%x %ux%u fmt %d tile %d mips %u layers %u flags %c%c%c%c%s",
+                      static_cast<unsigned long long>(image.info.guest_address),
+                      image.info.guest_size, image.info.size.width, image.info.size.height,
+                      static_cast<int>(image.info.pixel_format),
+                      static_cast<int>(image.info.tile_mode), image.info.resources.levels,
+                      image.info.resources.layers,
+                      True(image.flags & ImageFlagBits::CpuDirty) ? 'C' : '-',
+                      True(image.flags & ImageFlagBits::MaybeCpuDirty) ? 'M' : '-',
+                      True(image.flags & ImageFlagBits::GpuDirty) ? 'G' : '-',
+                      True(image.flags & ImageFlagBits::GpuModified) ? 'm' : '-',
+                      image.info.sotc_first_mip ? " tail" : "");
+    }
+};
+} // namespace
 
 void ReentrantMutex::AsymmetricBarrier() {
 #ifdef _WIN32
@@ -250,6 +272,18 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     ForEachImageInRegion(pages_start, pages_end - pages_start, [&](ImageId image_id, Image& image) {
         const auto image_begin = image.info.guest_address;
         const auto image_end = image.info.guest_address + image.info.guest_size;
+        if (SotcTexDiag::Level() >= 1) {
+            SotcTexDiag::Get().faults.fetch_add(1, std::memory_order_relaxed);
+            if (SotcTexDiag::Level() >= 2) {
+                const char* kind = image.Overlaps(addr, size)  ? "overlap -> cpu dirty"
+                                   : pages_end < image_end     ? "shares first page, untracked head"
+                                   : image_begin < pages_start ? "shares last page, untracked tail"
+                                                               : "same page only -> maybe dirty";
+                SotcTexDiag::Log("WRITE 0x%llx+0x%zx hits %s: %s",
+                                 static_cast<unsigned long long>(addr), size,
+                                 DiagImage{image}.text, kind);
+            }
+        }
         if (image.Overlaps(addr, size)) {
             // Modified region overlaps image, so the image was definitely accessed by this fault.
             // Untrack the image, so that the range is unprotected and the guest can write freely.
@@ -1025,6 +1059,11 @@ void TextureCache::RefreshImage(Image& image) {
             return XXH3_64bits(addr, size);
         }();
         if (image.hash == hash) {
+            if (SotcTexDiag::Level() >= 1) {
+                SotcTexDiag::Get().hash_skips.fetch_add(1, std::memory_order_relaxed);
+                SotcTexDiag::Log("SKIP maybe-dirty hash equal (8x8 texels only): %s",
+                                 DiagImage{image}.text);
+            }
             image.flags &= ~ImageFlagBits::MaybeCpuDirty;
             return;
         }
@@ -1052,6 +1091,9 @@ void TextureCache::RefreshImage(Image& image) {
                 return XXH3_64bits(addr + mip_offset, mip_size);
             }();
             if (image.mip_hashes[m] == hash) {
+                if (SotcTexDiag::Level() >= 1) {
+                    SotcTexDiag::Get().gpu_skips.fetch_add(1, std::memory_order_relaxed);
+                }
                 continue;
             }
             image.mip_hashes[m] = hash;
@@ -1079,6 +1121,14 @@ void TextureCache::RefreshImage(Image& image) {
         return;
     }
 
+    if (SotcTexDiag::Level() >= 1) {
+        SotcTexDiag::Get().uploads.fetch_add(1, std::memory_order_relaxed);
+        SotcTexDiag::Log("UPLOAD %zu of %u mips (%s%s%s): %s", image_copies.size(), num_mips,
+                         maybe_cpu_dirty ? "maybe-dirty hash changed " : "",
+                         is_gpu_modified ? "gpu-modified " : "",
+                         True(image.flags & ImageFlagBits::CpuDirty) ? "cpu-dirty" : "",
+                         DiagImage{image}.text);
+    }
     scheduler.EndRendering();
 
     const auto [in_buffer, in_offset] =
@@ -1387,6 +1437,10 @@ void TextureCache::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    if (SotcTexDiag::Level() >= 1) {
+        SotcTexDiag::Get().created.fetch_add(1, std::memory_order_relaxed);
+        SotcTexDiag::Log("NEW %s", DiagImage{image}.text);
+    }
     ++image_set_generation;
     ++addr_gens[AddrGenSlot(image.info.guest_address)]; // sotc: FindMemo per-address gen
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
@@ -1406,6 +1460,10 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     ASSERT_MSG(True(image.flags & ImageFlagBits::Registered),
                "Trying to unregister an already unregistered image");
     image.flags &= ~ImageFlagBits::Registered;
+    if (SotcTexDiag::Level() >= 1) {
+        SotcTexDiag::Get().freed.fetch_add(1, std::memory_order_relaxed);
+        SotcTexDiag::Log("DROP %s", DiagImage{image}.text);
+    }
     ++image_set_generation;
     ++addr_gens[AddrGenSlot(image.info.guest_address)]; // sotc: FindMemo per-address gen
     lru_cache.Free(image.lru_id);
@@ -1588,6 +1646,9 @@ void TextureCache::EmergencyCollect(u32 level) {
         return false;
     });
     LOG_WARNING(Render, "Emergency texture collection (level {}) freed {} images", level, freed);
+    if (SotcTexDiag::Level() >= 1) {
+        SotcTexDiag::Log("== EMERGENCY COLLECT level %u freed %zu images ==", level, freed);
+    }
     SotcEvent::Log("TEXTURE",
                    SotcUi::T("Limpeza de texturas (nível %u de 2): %zu descartadas, memória de vídeo em uso %llu MB",
                              "Texture cleanup (level %u of 2): %zu dropped, video memory in use %llu MB"),

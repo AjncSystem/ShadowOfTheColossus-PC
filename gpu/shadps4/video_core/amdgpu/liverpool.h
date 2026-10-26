@@ -8,9 +8,12 @@
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
+#include <memory>
+#include <deque>
 #include <mutex>
 #include <semaphore>
 #include <span>
+#include <string>
 #include <thread>
 #include <vector>
 #include <queue>
@@ -35,7 +38,15 @@ namespace Libraries::VideoOut {
 struct VideoOutPort;
 }
 
+// sotc: BbToggle::MicroCostSweep (gpu/shim/bbport_toggles.h) is read by OnBackThread below; the
+// header is not included here because the shader tests include this one without the runtime.
+extern "C" std::uint64_t runtime_disabled_optimizations;
+
 namespace AmdGpu {
+
+/// sotc: true on the draw thread only (Liverpool::BackLoop sets it when the thread starts, the
+/// thread never changes). Replaces the std::this_thread::get_id() comparison of OnBackThread.
+inline thread_local bool t_on_back_thread = false;
 
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
@@ -195,7 +206,37 @@ public:
     bool IsBackThreaded() const noexcept {
         return back_threaded;
     }
+    /// sotc: a register chunk was written since the last captured operation, so the GPU state is
+    /// no longer the one the last graphics pipeline was built from (PipelineKeyMemo). Always
+    /// false without the draw thread: MarkRegs does not track chunks then.
+    /// sotc: BbToggle::CpFastPaths. A register the pipeline key can read was written since the key
+    /// was last built (every MarkRegs except the draw-parameter ones, MarkParamRegs). Unlike the
+    /// dirty chunks it is not cleared by the next captured operation, only by a key build.
+    bool KeyDirty() const noexcept {
+        return key_dirty;
+    }
+    void ClearKeyDirty() noexcept {
+        key_dirty = false;
+    }
+    bool HasDirtyRegChunks() const noexcept {
+        for (const u64 word : dirty_chunks) {
+            if (word != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
     bool OnBackThread() const noexcept {
+        // sotc: 1u << 23 is BbToggle::MicroCostSweep (static_assert in liverpool.cpp). Clear: one
+        // thread_local read, the same value as the thread id comparison (set: the old path).
+        if (!(__atomic_load_n(&runtime_disabled_optimizations, __ATOMIC_RELAXED) & (1u << 23)))
+            [[likely]] {
+#ifdef SOTC_VERIFY_ON_BACK_THREAD
+            ASSERT_MSG(t_on_back_thread == (back_threaded && std::this_thread::get_id() == back_id),
+                       "OnBackThread flag differs from the thread id");
+#endif
+            return back_threaded && t_on_back_thread;
+        }
         return back_threaded && std::this_thread::get_id() == back_id;
     }
     /// The command processor or the draw thread: both work on the GPU state.
@@ -223,6 +264,53 @@ public:
     const CbDbExtent& DrawDbExtent() const noexcept {
         return OnBackThread() ? back_db_extent : last_db_extent;
     }
+    /// sotc: draw thread. The number of ops it has executed, and whether any of the register chunks
+    /// listed changed in value after the op with serial `since` (a chunk the command stream wrote
+    /// with the same value does not count). Always true off the draw thread, so a memo built on it
+    /// then recomputes every time.
+    [[nodiscard]] u32 DrawRegSerial() const noexcept {
+        return back_serial;
+    }
+    /// sotc: BbToggle::DepthFastPath. Draw thread. Three serials, each moving (by one per op) whenever
+    /// an op changed in value a register dword the rasterizer marked relevant to it
+    /// (SetRenderRelevance): RelRender for the depth side of the render target block (depth
+    /// registers, depth extent), RelColor for its colour side (colour target registers and
+    /// extents), RelDynamic for the dynamic state derivation. Ops that changed only other dwords
+    /// (index base, counts, user data...) leave them. Until the masks are set every op moves all.
+    enum RelKind : u32 { RelRender = 0, RelDynamic = 1, RelColor = 2, NumRelKinds };
+    [[nodiscard]] u32 DrawRelSerial(RelKind kind) const noexcept {
+        return back_rel_serial[kind];
+    }
+    /// sotc: the dwords of Regs (bit per dword, RegChunkDwords per entry) one block reads
+    /// (Rasterizer::DepthFastEnsureRelevance). Called on the draw thread, before the first draw
+    /// that uses DrawRelSerial; the masks count as set after the last kind.
+    /// sotc: a dword of which only the bits in `bits` matter to `kind` (leave it out of the mask
+    /// given to SetRenderRelevance for that kind): the serial then moves only when one of those
+    /// bits changed. DB_DEPTH_CONTROL is one for the render target block: of its depth function,
+    /// stencil functions... only the enable bits reach the targets.
+    void SetRelevancePartial(RelKind kind, u32 dword, u32 bits) {
+        if (rel_partial_n[kind] < rel_partial[kind].size()) {
+            rel_partial[kind][rel_partial_n[kind]++] = {dword, bits};
+        }
+    }
+    void SetRenderRelevance(RelKind kind, const u64* mask, size_t chunks) {
+        for (size_t i = 0; i < chunks && i < rel_mask[kind].size(); ++i) {
+            rel_mask[kind][i] = mask[i];
+        }
+        back_rel_ready = kind == RelColor;
+    }
+    [[nodiscard]] bool DrawChunksChangedSince(const u16* chunks, size_t count,
+                                              u32 since) const noexcept {
+        if (!OnBackThread()) {
+            return true;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            if (back_chunk_serial[chunks[i]] > since) {
+                return true;
+            }
+        }
+        return false;
+    }
     /// Command processor: waits until the draw thread ran everything queued.
     void DrainBack();
     /// sotc: frees a finished nested command buffer task's frame once the draw thread has run
@@ -237,6 +325,11 @@ public:
         QueueBackFunc(std::move(func), true);
         DrainBack();
     }
+
+    /// sotc: SOTC_HASH_STATS=1. Appends to `out` the top 15 (op kind, shader hash) keys of the draw
+    /// thread's time since the last call and a coverage line, then clears the table counters.
+    /// Called by the report thread (videoout/driver.cpp); `seconds` is the window length.
+    void HashStatsReport(std::string& out, double seconds);
 
 #ifdef __linux__
     u32 GetGpuCommandProcessorThreadId() {
@@ -296,6 +389,18 @@ private:
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
 
     void ProcessCommands();
+    /// sotc: BbToggle::CpFastPaths (1u << 20, static_assert in liverpool.cpp). ProcessCommands() for
+    /// the per-packet call sites of the command processor: with the draw thread, this thread only
+    /// ever takes the ordered commands (see ProcessCommands), so with none queued the call does
+    /// nothing and is not made. The draw thread and the old path always call it.
+    void PollCommands() {
+        if (back_threaded && num_ordered.load(std::memory_order_relaxed) == 0 &&
+            !(__atomic_load_n(&runtime_disabled_optimizations, __ATOMIC_RELAXED) & (1u << 20)) &&
+            !OnBackThread()) {
+            return;
+        }
+        ProcessCommands();
+    }
     /// Writes an EOP/EOS fence value, keeping GPU caches of that memory coherent.
     void WriteFenceValue(void* address, u64 data, u32 num_bytes);
     void Process(std::stop_token stoken);
@@ -365,6 +470,11 @@ private:
     u32 back_tid{}; // sotc: the draw thread's (IsGpuSideThreadId)
 #endif
     s32 curr_qid{-1};
+    /// sotc: BbToggle::CpPollBackoff. Command processor thread only. Set by a packet wait loop
+    /// the first time a resume reaches it (the resume got that far, so it made progress); a resume
+    /// that only re-checks a wait that is still false leaves it clear, and Process then counts the
+    /// pass over the queues as stalled.
+    bool cp_progress{};
 
     // sotc: the draw thread (see IsBackThreaded).
     struct BackStage {
@@ -373,6 +483,7 @@ private:
         u32 num_user_data; // ~0u: no user data bound
         VAddr pgm_base;
         std::vector<u32> flat;
+        bool changed; ///< sotc: DrawReplay, see CaptureBackOp
     };
     struct BackOp {
         enum class Kind : u8 { Func, Draw, DrawIndirect, Dispatch, DispatchIndirect };
@@ -388,7 +499,12 @@ private:
         VAddr address{};
         VAddr count_address{};
         const Vulkan::Pipeline* pipeline{};
-        std::vector<u32> reg_chunks; // chunk index followed by its RegChunkDwords dwords
+        /// per changed chunk: its index, a 64-bit mask of the dwords that differ (two u32), then
+        /// those dwords (BackAlloc / ExecuteBackOp)
+        std::vector<u32> reg_chunks;
+        /// SOTC_DRAW_OPT_VERIFY: the whole content of every dirty chunk, as the command processor
+        /// had it (chunk index, RegChunkDwords dwords), to compare with the draw thread's copy.
+        std::vector<u32> verify_chunks;
         std::array<CbDbExtent, NUM_COLOR_BUFFERS> cb_extent{};
         CbDbExtent db_extent{};
         ComputeProgram cs{};
@@ -398,7 +514,14 @@ private:
     };
     static constexpr u32 RegChunkDwords = 64;
     static constexpr u32 NumRegChunks = Regs::NumRegs / RegChunkDwords;
-    static constexpr u64 BackRingSize = 512;
+    // sotc: A/B knobs of the draw thread ring, read once in the constructor. SOTC_BACK_RING is
+    // the ring capacity (power of two, clamped to [512, 8192]), SOTC_BACK_SPIN the CpuRelax
+    // iterations before blocking (clamped to [0, 65536]). The defaults (512, 4096) are the
+    // behaviour from before the knobs; the backing array is sized for the maximum capacity.
+    static constexpr u64 BackRingMin = 512;
+    static constexpr u64 BackRingMax = 8192;
+    static constexpr u32 BackSpinDefault = 4096;
+    static constexpr u32 BackSpinMax = 65536;
 
     template <typename F>
     void BackOrRun(F&& func, bool writes_memory = true) {
@@ -432,6 +555,21 @@ private:
         if (!back_threaded || num_dwords == 0) {
             return;
         }
+        key_dirty = true;
+        MarkChunks(first_dword, num_dwords);
+    }
+    /// sotc: the draw parameters a draw packet writes (index type, counts, base, draw initiator,
+    /// instance count): the chunks travel to the draw thread as always, but the pipeline key does
+    /// not read them (RefreshGraphicsKey, BuildRuntimeInfo), so they do not make the key dirty.
+    void MarkParamRegs(const void* field, size_t bytes) {
+        if (!back_threaded) {
+            return;
+        }
+        const auto offset = static_cast<u32>(reinterpret_cast<const u32*>(field) -
+                                             regs.reg_array.data());
+        MarkChunks(offset, static_cast<u32>((bytes + 3) / 4));
+    }
+    void MarkChunks(u32 first_dword, u32 num_dwords) {
         const u32 last = std::min(first_dword + num_dwords - 1, Regs::NumRegs - 1);
         for (u32 chunk = first_dword / RegChunkDwords; chunk <= last / RegChunkDwords; ++chunk) {
             const u64 bit = u64{1} << (chunk % 64);
@@ -447,6 +585,27 @@ private:
         MarkRegs(offset, static_cast<u32>((bytes + 3) / 4));
     }
     void ExecuteBackOp(BackOp& op);
+    /// sotc: ExecuteBackOp with the SOTC_HASH_STATS accounting around it.
+    void ExecuteBackOpTimed(BackOp& op);
+    /// sotc: SOTC_HASH_STATS table, one slot per (op kind, VS/CS hash, PS hash). Written only by
+    /// the draw thread: the key fields before `used` is published (release) and never changed
+    /// afterwards, the counters with relaxed fetch_add. The report thread reads a slot only after
+    /// an acquire load of `used` and takes the counters with exchange(0), so there is no lock and
+    /// no data race (a slot's counters may be read between two of its updates: harmless).
+    struct HashSlot {
+        std::atomic<u32> used{0};
+        u32 kind{};
+        u64 h1{}; ///< VS (draw) or CS (dispatch) pgm_hash
+        u64 h2{}; ///< PS pgm_hash
+        std::atomic<u64> ticks{0}, ops{0}, protects{0}, readbacks{0}, finishes{0}, upload{0};
+    };
+    static constexpr u32 HashSlotBits = 13;
+    static constexpr u32 HashSlots = 1u << HashSlotBits; ///< the extra slot at [HashSlots] is the overflow bucket
+    HashSlot& HashFind(u32 kind, u64 h1, u64 h2);
+    std::unique_ptr<HashSlot[]> hash_slots; ///< HashSlots + 1 entries, allocated only with SOTC_HASH_STATS
+    u32 hash_used{};                        ///< draw thread only: slots in use
+    u64 hash_tsc0{};                        ///< TSC and steady clock (ns) when the table was created,
+    u64 hash_ns0{};                         ///< to calibrate ticks to ns at report time
     void BackLoop(std::stop_token stoken);
     void WakeBack() {
         if (back_threaded) {
@@ -458,7 +617,10 @@ private:
     bool back_threaded{};
     bool back_strict{};
     std::thread::id back_id{};
-    std::vector<BackOp> back_ring;
+    u64 back_ring_capacity{BackRingMin}; ///< sotc: SOTC_BACK_RING (power of two)
+    u64 back_ring_mask{BackRingMin - 1}; ///< sotc: back_ring_capacity - 1, the wrap-around mask
+    u32 back_spin{BackSpinDefault};      ///< sotc: SOTC_BACK_SPIN, iterations before blocking
+    std::vector<BackOp> back_ring;       ///< sotc: sized to the capacity read at startup
     std::atomic<u64> back_head{0};
     std::atomic<u64> back_tail{0};
     /// sotc: finished task frames and the back_head they wait for (FreeTaskFrame)
@@ -470,11 +632,24 @@ private:
     std::condition_variable drain_cv;
     u64 back_write_seq{0};
     Regs back_regs{};
+    std::array<u32, NumRegChunks> back_chunk_serial{}; ///< per chunk: serial of its last change
+    u32 back_serial{};                                  ///< ops executed (draw thread only)
+    std::array<std::array<u64, NumRegChunks>, 3> rel_mask{}; ///< sotc: see SetRenderRelevance
+    std::array<u32, 3> back_rel_serial{};                    ///< sotc: see DrawRelSerial
+    struct RelPartial {
+        u32 dword;
+        u32 bits;
+    };
+    std::array<std::array<RelPartial, 2>, 3> rel_partial{};
+    std::array<u32, 3> rel_partial_n{};
+    bool back_rel_ready{};
+    std::vector<u32> back_shadow; ///< CP side: the registers as the draw thread will hold them (BackAlloc)
     ComputeProgram back_cs{};
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> back_cb_extent{};
     CbDbExtent back_db_extent{};
     std::array<u64, (NumRegChunks + 63) / 64> dirty_chunks{};
     std::vector<u16> dirty_list;
+    bool key_dirty{true}; ///< sotc: see KeyDirty (command processor thread only)
     std::jthread back_thread{};
 };
 

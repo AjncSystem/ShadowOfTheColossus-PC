@@ -227,7 +227,11 @@ private:
     // sotc: any erase or clear must also null last_graphics_pipeline (see GetGraphicsPipeline).
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
     GraphicsPipelineKey last_graphics_key{};
+    /// sotc: SOTC_CP_VERIFY=1, see GetGraphicsPipeline.
+    void VerifyKeyMemo(bool fine, bool chunks_dirty);
     const GraphicsPipeline* last_graphics_pipeline{};
+    /// sotc: the indirect parameters last_graphics_pipeline was built for (PipelineKeyMemo).
+    DrawIndirectParams last_graphics_params{};
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
     std::array<const Shader::Info*, MaxShaderStages> infos{};
     std::array<vk::ShaderModule, MaxShaderStages> modules{};

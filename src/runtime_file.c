@@ -337,10 +337,16 @@ static void touch_for_write(void *buffer,uint64_t size) {
  * noticing, and the GPU keeps a stale copy (Shadow of the Colossus streams shaders, textures
  * and descriptors straight from the pak files into GPU-read memory while loading). */
 #define BOUNCE_LIMIT (UINT64_C(64) << 20)
+/* sotc: R6: the per-thread buffer used to grow to 64 MiB and was never freed (one per reading thread).
+ * It is capped at BOUNCE_CHUNK now and a read of up to BOUNCE_LIMIT is done in chunks of that size. */
+#define BOUNCE_CHUNK (UINT64_C(8) << 20)
 static _Thread_local unsigned char *bounce;
 static _Thread_local uint64_t bounce_size;
+/* Returns a buffer of at least min(size,BOUNCE_CHUNK) bytes (callers read in chunks), NULL if the
+ * request is too large to stage or memory is short. */
 static unsigned char *bounce_buffer(uint64_t size) {
     if (size>BOUNCE_LIMIT) return NULL;
+    if (size>BOUNCE_CHUNK) size=BOUNCE_CHUNK;
     if (bounce_size<size) {
         uint64_t want=size<UINT64_C(1)<<20 ? UINT64_C(1)<<20 : size;
         unsigned char *next=realloc(bounce,want);
@@ -349,17 +355,27 @@ static unsigned char *bounce_buffer(uint64_t size) {
     }
     return bounce;
 }
+/* sotc: R6: stages a read of size bytes (<= BOUNCE_LIMIT) through the bounce buffer, one chunk at a
+ * time. Same result as one read: the byte count, a short count at end of file or when a chunk comes
+ * back short, -errno when nothing was read yet (a later chunk's error returns what was read). */
+static int64_t staged_read(int h,unsigned char *staging,void *buffer,uint64_t size,int positional,int64_t offset) {
+    uint64_t done=0;
+    while (done<size) {
+        uint64_t chunk=size-done<BOUNCE_CHUNK ? size-done : BOUNCE_CHUNK;
+        ssize_t n=positional ? TIMED_READ(pread(h,staging,chunk,offset+(int64_t)done)) : TIMED_READ(host_read(h,staging,chunk));
+        if (n<0) { if (done) break; return -errno; }
+        memcpy((unsigned char *)buffer+done,staging,(size_t)n);
+        done+=(uint64_t)n;
+        if ((uint64_t)n<chunk) break;
+    }
+    __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,done,__ATOMIC_RELAXED);
+    return (int64_t)done;
+}
 static int64_t do_read(int fd,void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
     unsigned char *staging=bounce_buffer(size);
-    if (staging) {
-        ssize_t n=TIMED_READ(host_read(h,staging,size));
-        if (n<0) return -errno;
-        memcpy(buffer,staging,(size_t)n);
-        __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
-        return n;
-    }
+    if (staging) return staged_read(h,staging,buffer,size,0,0);
     touch_for_write(buffer,size);
     ssize_t n=TIMED_READ(host_read(h,buffer,size));
     if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
@@ -370,13 +386,7 @@ static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
     unsigned char *staging=bounce_buffer(size);
-    if (staging) {
-        ssize_t n=TIMED_READ(pread(h,staging,size,offset));
-        if (n<0) return -errno;
-        memcpy(buffer,staging,(size_t)n);
-        __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
-        return n;
-    }
+    if (staging) return staged_read(h,staging,buffer,size,1,offset);
     touch_for_write(buffer,size);
     ssize_t n=TIMED_READ(pread(h,buffer,size,offset));
     if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }

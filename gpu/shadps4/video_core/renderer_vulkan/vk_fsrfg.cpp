@@ -7,10 +7,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <mutex>
 #include <utility>
 #include <vk_mem_alloc.h>
 
@@ -62,6 +64,10 @@ vk::UniqueDescriptorSetLayout depth_set_layout;
 vk::UniquePipelineLayout depth_layout;
 vk::UniquePipeline depth_pipeline;
 std::array<DepthSlot, kMaxFrames> depth_slots;
+// sotc: EnsureDepthResources and Shutdown run on the present thread (Update), ConvertDepth on the
+// command processor. Uncontended except when FSR 3 is enabled again or shut down while the
+// command processor is a few frames ahead: it must never see a half-created pipeline.
+std::mutex depth_mutex;
 
 // Present thread.
 FfxVkFsr3_3_1_6FrameGenerationContext* context{};
@@ -81,6 +87,15 @@ double interval_ms = 33.3;
 double delay_sum_ms = 0.0; // generated frame presented after the game frame arrived
 u32 delay_count = 0;
 u64 generated = 0, generated_logged = 0;
+
+// sotc: freeing the context, the depth images and the depth pipeline (see RequestShutdown). The
+// present thread waits kShutdownDelay frames without FSR 3: the command processor records up to
+// max(swapchain images, 4) frames ahead (vk_presenter.cpp, num_frames), so its last depth
+// conversion and the present that waits for it may still be in flight.
+constexpr u32 kShutdownDelay = 6;
+std::atomic<u64> shutdown_requests{0}; // any thread: ++ per RequestShutdown
+u64 seen_shutdown_requests = 0;        // present thread (Update)
+u32 idle_frames = 0;                   // present thread (Update)
 
 bool CreateImage(OwnedImage& img, vk::Format format, u32 width, u32 height) {
     const VkImageCreateInfo info = static_cast<VkImageCreateInfo>(vk::ImageCreateInfo{
@@ -178,12 +193,13 @@ void RetireCompleted(bool wait_all) {
 }
 
 void DestroyContext() {
-    if (!context) {
-        return;
+    if (context) {
+        RetireCompleted(true);
+        ffxVkFsr3_3_1_6FrameGenerationContextDestroy(context);
+        context = nullptr;
     }
-    RetireCompleted(true);
-    ffxVkFsr3_3_1_6FrameGenerationContextDestroy(context);
-    context = nullptr;
+    // sotc: also without a context, so that Shutdown leaves nothing behind (the images are only
+    // ever created with a context).
     DestroyImage(color);
     DestroyImage(output);
     DestroyImage(hudless_color);
@@ -249,6 +265,79 @@ FfxVkFsr3_3_1_6FrameGenerationImage FgImage(vk::Image image, vk::Format format, 
     };
 }
 
+/// Creates the depth conversion shader, descriptor set layout, pipeline layout and pipeline, or
+/// only the missing ones: Shutdown destroys them and enabling FSR 3 again recreates them. Caller
+/// holds depth_mutex (ConvertDepth, Update).
+bool EnsureDepthResources() {
+    if (depth_pipeline) {
+        return true;
+    }
+    const vk::Device device = g_instance->GetDevice();
+    if (!depth_shader) {
+        depth_shader = CompileSPV(FG_DEPTH_COMP, device);
+    }
+    if (!depth_set_layout) {
+        const std::array bindings{
+            vk::DescriptorSetLayoutBinding{
+                .binding = 0,
+                .descriptorType = vk::DescriptorType::eSampledImage,
+                .descriptorCount = 1,
+                .stageFlags = vk::ShaderStageFlagBits::eCompute,
+            },
+            vk::DescriptorSetLayoutBinding{
+                .binding = 1,
+                .descriptorType = vk::DescriptorType::eStorageImage,
+                .descriptorCount = 1,
+                .stageFlags = vk::ShaderStageFlagBits::eCompute,
+            },
+        };
+        auto [set_result, set_layout] = device.createDescriptorSetLayoutUnique({
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+            .bindingCount = static_cast<u32>(bindings.size()),
+            .pBindings = bindings.data(),
+        });
+        if (set_result != vk::Result::eSuccess) {
+            std::fprintf(stderr, "SOTC FSR3 FG: descriptor set layout failed\n");
+            return false;
+        }
+        depth_set_layout = std::move(set_layout);
+    }
+    if (!depth_layout) {
+        const vk::PushConstantRange push_range = {
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+            .offset = 0,
+            .size = 3 * sizeof(u32),
+        };
+        const vk::DescriptorSetLayout layouts[] = {*depth_set_layout};
+        auto [layout_result, layout] = device.createPipelineLayoutUnique({
+            .setLayoutCount = 1,
+            .pSetLayouts = layouts,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &push_range,
+        });
+        if (layout_result != vk::Result::eSuccess) {
+            std::fprintf(stderr, "SOTC FSR3 FG: pipeline layout failed\n");
+            return false;
+        }
+        depth_layout = std::move(layout);
+    }
+    auto [pipeline_result, pipeline] = device.createComputePipelineUnique(
+        {}, vk::ComputePipelineCreateInfo{
+                .stage{
+                    .stage = vk::ShaderStageFlagBits::eCompute,
+                    .module = depth_shader,
+                    .pName = "main",
+                },
+                .layout = *depth_layout,
+            });
+    if (pipeline_result != vk::Result::eSuccess) {
+        std::fprintf(stderr, "SOTC FSR3 FG: depth pipeline failed\n");
+        return false;
+    }
+    depth_pipeline = std::move(pipeline);
+    return true;
+}
+
 /// Sleeps until `due`: a high resolution waitable timer, then a short spin.
 void SleepUntil(Clock::time_point due) {
     static HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr,
@@ -295,63 +384,12 @@ void Init(const Instance& instance) {
                              "image formats needed)\n");
         return;
     }
-    const vk::Device device = instance.GetDevice();
-    depth_shader = CompileSPV(FG_DEPTH_COMP, device);
-    const std::array bindings{
-        vk::DescriptorSetLayoutBinding{
-            .binding = 0,
-            .descriptorType = vk::DescriptorType::eSampledImage,
-            .descriptorCount = 1,
-            .stageFlags = vk::ShaderStageFlagBits::eCompute,
-        },
-        vk::DescriptorSetLayoutBinding{
-            .binding = 1,
-            .descriptorType = vk::DescriptorType::eStorageImage,
-            .descriptorCount = 1,
-            .stageFlags = vk::ShaderStageFlagBits::eCompute,
-        },
-    };
-    auto [set_result, set_layout] = device.createDescriptorSetLayoutUnique({
-        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
-        .bindingCount = static_cast<u32>(bindings.size()),
-        .pBindings = bindings.data(),
-    });
-    const vk::PushConstantRange push_range = {
-        .stageFlags = vk::ShaderStageFlagBits::eCompute,
-        .offset = 0,
-        .size = 3 * sizeof(u32),
-    };
-    if (set_result != vk::Result::eSuccess) {
-        std::fprintf(stderr, "SOTC FSR3 FG: descriptor set layout failed\n");
-        return;
+    {
+        std::scoped_lock lock{depth_mutex};
+        if (!EnsureDepthResources()) {
+            return;
+        }
     }
-    depth_set_layout = std::move(set_layout);
-    const vk::DescriptorSetLayout layouts[] = {*depth_set_layout};
-    auto [layout_result, layout] = device.createPipelineLayoutUnique({
-        .setLayoutCount = 1,
-        .pSetLayouts = layouts,
-        .pushConstantRangeCount = 1,
-        .pPushConstantRanges = &push_range,
-    });
-    if (layout_result != vk::Result::eSuccess) {
-        std::fprintf(stderr, "SOTC FSR3 FG: pipeline layout failed\n");
-        return;
-    }
-    depth_layout = std::move(layout);
-    auto [pipeline_result, pipeline] = device.createComputePipelineUnique(
-        {}, vk::ComputePipelineCreateInfo{
-                .stage{
-                    .stage = vk::ShaderStageFlagBits::eCompute,
-                    .module = depth_shader,
-                    .pName = "main",
-                },
-                .layout = *depth_layout,
-            });
-    if (pipeline_result != vk::Result::eSuccess) {
-        std::fprintf(stderr, "SOTC FSR3 FG: depth pipeline failed\n");
-        return;
-    }
-    depth_pipeline = std::move(pipeline);
     supported = true;
 }
 
@@ -362,6 +400,12 @@ bool Supported() {
 void ConvertDepth(u32 frame_id, vk::CommandBuffer cmdbuf, vk::ImageView depth_view, u32 width,
                   u32 height, bool inverted) {
     if (!supported || frame_id >= kMaxFrames) {
+        return;
+    }
+    std::scoped_lock lock{depth_mutex};
+    if (!depth_pipeline) {
+        // sotc: Shutdown freed it and Update (present thread) has not recreated it yet: this
+        // frame has no FSR 3 depth, which only loses interpolation until it does.
         return;
     }
     DepthSlot& slot = depth_slots[frame_id];
@@ -713,6 +757,84 @@ void WaitForGameFrame() {
     const auto due =
         last_present + std::chrono::microseconds(static_cast<s64>(interval_ms * 500.0));
     SleepUntil(due);
+}
+
+void RequestShutdown() {
+    // sotc: only a counter. Shutdown runs on the present thread (Update): it waits for the frames
+    // in flight on the scheduler (DestroyContext, RetireCompleted) and owns the depth pipeline.
+    // The counter, not a flag, so that a request arriving while the present thread reads it is
+    // never lost (a repeated Shutdown is harmless).
+    shutdown_requests.fetch_add(1, std::memory_order_release);
+}
+
+void Update(bool fsr_enabled) {
+    const u64 requests = shutdown_requests.load(std::memory_order_acquire);
+    if (fsr_enabled) {
+        // Enabled again, perhaps before the requested shutdown ran: nothing is freed and the
+        // request is dropped. After a Shutdown, the depth pipeline is created here, on the
+        // present thread, before the command processor gets a frame with depth again.
+        seen_shutdown_requests = requests;
+        idle_frames = 0;
+        if (supported && !depth_pipeline) {
+            std::scoped_lock lock{depth_mutex};
+            EnsureDepthResources();
+        }
+        return;
+    }
+    if (requests == seen_shutdown_requests) {
+        idle_frames = 0;
+        return;
+    }
+    if (++idle_frames < kShutdownDelay) {
+        return;
+    }
+    // A request stored after the load above is a new one: it gets its own kShutdownDelay frames,
+    // and Shutdown is idempotent anyway.
+    seen_shutdown_requests = requests;
+    idle_frames = 0;
+    Shutdown();
+}
+
+void Shutdown() {
+    const bool had_context = context != nullptr;
+    u64 depth_bytes = 0;
+    for (const auto& slot : depth_slots) {
+        depth_bytes += static_cast<u64>(slot.r32.width) * slot.r32.height * 4;
+    }
+    // The FSR 3 work recorded with the context, its colour images and the depth images: done when
+    // DestroyContext returns (RetireCompleted waits for their scheduler ticks).
+    DestroyContext();
+    {
+        std::scoped_lock lock{depth_mutex};
+        // The command processor no longer converts depth (the mode left FSR 3), and its last
+        // conversions were presented (Update waited kShutdownDelay frames): nothing records with
+        // these images or the pipeline any more.
+        for (auto& slot : depth_slots) {
+            DestroyImage(slot.r32);
+            slot.valid = false;
+        }
+        depth_pipeline.reset();
+        depth_layout.reset();
+        depth_set_layout.reset();
+        if (depth_shader && g_instance) {
+            g_instance->GetDevice().destroyShaderModule(depth_shader);
+            depth_shader = vk::ShaderModule{};
+        }
+    }
+    // Everything back to the state before the first Generate, so that enabling FSR 3 again
+    // recreates it (EnsureContext, Update, ConvertDepth).
+    recorded = false;
+    in_flight.clear();
+    submit_scheduler = nullptr;
+    sotc_fsrfg_hudless = {};
+    output_initialised = false;
+    ctx_display_w = ctx_display_h = ctx_render_w = ctx_render_h = 0;
+    history_game_frame = ~0ULL;
+    failed = false; // sotc: a later enable tries again instead of staying off for the session
+    if (had_context || depth_bytes != 0) {
+        std::fprintf(stderr, "SOTC FSR3 FG: released, %.0f MB of depth images freed\n",
+                     static_cast<double>(depth_bytes) / 1048576.0);
+    }
 }
 
 } // namespace Vulkan::FsrFg

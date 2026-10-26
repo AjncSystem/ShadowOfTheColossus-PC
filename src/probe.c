@@ -874,6 +874,38 @@ static int heap_hook_trap(EXCEPTION_POINTERS *info) {
     }
     return 1;
 }
+/* sotc: the PE stack is 16 MiB reserved but only 64 KiB committed (link line in gpu/CMakeLists.txt), so
+ * the dozens of host threads Windows creates with the default size (std::thread, SDL, Vulkan driver)
+ * do not each commit 16 MiB. Guest code has no stack probes and can step over the guard page, so
+ * every stack that runs guest code must be committed up front: guest threads do it through the
+ * explicit size of runtime_thread.c, the main thread through stack_commit_to() before the entry.
+ * Layout, low to high: reserved | guard page | committed [StackLimit, StackBase). TEB x64:
+ * StackBase 0x08, StackLimit 0x10 (NT_TIB), DeallocationStack 0x1478. */
+#define STACK_FLOOR (64u*1024u) /* the lowest pages stay reserved: a real overflow still faults */
+static uintptr_t stack_dealloc(void) { return *(uintptr_t *)((char *)NtCurrentTeb()+0x1478); }
+/* Commits [target, StackLimit) of the calling thread's stack, moves the guard page below the new
+ * limit and updates the TEB limit. Only VirtualAlloc/VirtualProtect: no heap, no locks. */
+static int stack_commit_to(uintptr_t target) {
+    NT_TIB *tib=(NT_TIB *)NtCurrentTeb();
+    const uintptr_t old_limit=(uintptr_t)tib->StackLimit, low=stack_dealloc()+STACK_FLOOR+page_size;
+    if (target<low) target=low;
+    target&=~(uintptr_t)(page_size-1);
+    if (target>=old_limit) return 1;
+    if (!VirtualAlloc((void *)target,old_limit-target,MEM_COMMIT,PAGE_READWRITE)) return 0;
+    VirtualAlloc((void *)(target-page_size),page_size,MEM_COMMIT,PAGE_READWRITE|PAGE_GUARD);
+    tib->StackLimit=(void *)target;
+    return 1;
+}
+/* Safety net: a stack access below the committed part (not the guard page) of a thread whose
+ * frame is still on its own stack, e.g. an AV from guest code on a callback thread. A thread whose
+ * rsp is itself below the limit never reaches the handler (the kernel cannot dispatch). */
+static int stack_fault_grow(const EXCEPTION_POINTERS *info) {
+    const EXCEPTION_RECORD *record=info->ExceptionRecord;
+    const NT_TIB *tib=(const NT_TIB *)NtCurrentTeb();
+    const uintptr_t addr=(uintptr_t)record->ExceptionInformation[1], dealloc=stack_dealloc(), rsp=(uintptr_t)info->ContextRecord->Rsp;
+    if (addr<dealloc+STACK_FLOOR+page_size || addr>=(uintptr_t)tib->StackLimit || rsp<dealloc || rsp>=(uintptr_t)tib->StackBase) return 0;
+    return stack_commit_to(addr);
+}
 static LONG vectored_fault_impl(EXCEPTION_POINTERS *info);
 /* sotc (from the shadPS4 SotC fork, signals.cpp): Shadow of the Colossus runs its jobs on fibers
  * with 16-64 KiB stacks packed back to back without guard pages. The exception handler runs on
@@ -916,6 +948,8 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     const uintptr_t sp=(uintptr_t)__builtin_frame_address(0);
     struct fault_entry *entry=fault_ring ? fault_ring_add(info) : NULL;
     fault_path=0;
+    if (info->ExceptionRecord->ExceptionCode==EXCEPTION_ACCESS_VIOLATION && info->ExceptionRecord->NumberParameters>=2 &&
+        stack_fault_grow(info)) { fault_path=11; if (entry) entry->outcome=((uint64_t)fault_path<<8)|1; return EXCEPTION_CONTINUE_EXECUTION; }
     if (sp>=(uintptr_t)tib->StackLimit && sp<(uintptr_t)tib->StackBase) {
         const LONG own=vectored_fault_impl(info);
         if (entry) entry->outcome=((uint64_t)fault_path<<8)|(own==EXCEPTION_CONTINUE_EXECUTION);
@@ -1345,6 +1379,11 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
     SYSTEM_INFO system_info; GetSystemInfo(&system_info); page_size = system_info.dwPageSize;
     AddVectoredExceptionHandler(1, vectored_fault);
+    {   /* sotc: the guest main thread runs on the process stack, which the PE header commits only 64 KiB. */
+        const NT_TIB *tib=(const NT_TIB *)NtCurrentTeb();
+        if (stack_commit_to(0)) printf("Runtime: main thread stack committed (%llu KiB)\n",(unsigned long long)(((uintptr_t)tib->StackBase-(uintptr_t)tib->StackLimit)>>10));
+        else printf("Runtime: WARNING: main thread stack commit failed (limit %p)\n",tib->StackLimit);
+    }
     if (getenv("BB_FAULT_RING")) fault_ring_open(getenv("BB_FAULT_RING"));
     if (getenv("BB_STACKS_TRIGGER")) CreateThread(NULL,0,stacks_watcher,(void *)getenv("BB_STACKS_TRIGGER"),0,NULL);
     if (getenv("SOTC_PROFILE")) CreateThread(NULL,0,profiler,(void *)getenv("SOTC_PROFILE"),0,NULL);

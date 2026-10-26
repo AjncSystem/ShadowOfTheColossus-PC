@@ -120,6 +120,9 @@ def main():
     parser.add_argument('--cmdline', default='out/bench.cmdline')
     parser.add_argument('--shots', type=int, default=3, help='frames dumped during the measurement')
     parser.add_argument('--template', default='out/save-template', help='save folder holding CUSA08809/ or CUSA08034/')
+    # sotc: templates whose shrine cinematic was already seen emit only one game-start message.
+    parser.add_argument('--direct-idle', action='store_true',
+                        help='stop skipping after one game start and three stable shrine samples')
     parser.add_argument('--record', help='hand over to the player with BB_PAD_RECORD=<file> (F9 stops)')
     parser.add_argument('--replay', help='measure a replay of a BB_PAD_RECORD file')
     parser.add_argument('--video', help='record the window to this .mp4 from the idle scene on (see the docstring)')
@@ -219,12 +222,13 @@ def main():
         # ...and once more when the shrine cutscene is skipped and gameplay begins. Hold X until
         # then; no input afterwards (X would make Wander act).
         at = time.monotonic() - start + 4
-        while state['game_starts'] < 2:
+        while state['game_starts'] < 2 and state['gameplay_at'] is None:
             if not wait_until(at):
                 return
             if state['game_starts'] >= 2:
                 break
-            press('cross', 5, until=lambda: state['game_starts'] >= 2)
+            press('cross', 5, until=lambda: state['game_starts'] >= 2 or
+                  state['gameplay_at'] is not None)
             at += 7
         state['gameplay_at'] = time.monotonic() - start
 
@@ -240,6 +244,14 @@ def main():
             for match in FPS_LINE.finditer(text, seen):
                 seen = match.end()
                 samples.append((float(match.group(1)), int(match.group(3)), time.monotonic() - start))
+                # sotc: opt-in only; require the actual shrine command range, then release input
+                # and let the usual detector settle again before beginning the measured window.
+                direct = samples[-IDLE_SAMPLES:]
+                if (args.direct_idle and state['game_starts'] >= 1 and
+                        state['gameplay_at'] is None and len(direct) == IDLE_SAMPLES and
+                        all(IDLE_LOW <= s[1] <= IDLE_HIGH for s in direct) and
+                        max(s[1] for s in direct) - min(s[1] for s in direct) <= IDLE_SPREAD):
+                    state['gameplay_at'] = time.monotonic() - start
                 # Idle: gameplay has begun and the draw count has settled (steady camera).
                 recent = [s for s in samples[-IDLE_SAMPLES:] if state['gameplay_at'] is not None and
                           s[2] > state['gameplay_at'] + 2]

@@ -369,6 +369,47 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
     return (*slot_image_views)[view_id];
 }
 
+bool Image::TransitIsNoop(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
+                          vk::PipelineStageFlags2 dst_stage,
+                          const std::optional<SubresourceRange>& subres_range) const {
+    // sotc: mirrors GetBarriers below without writing. Both of its branches end by storing
+    // (layout, access, stage) into the whole-image state, so that state must already be it; the
+    // partial branch also must not find a subresource in another state or a pending write.
+    const auto& last_state = backing->state;
+    constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
+                                 vk::AccessFlagBits2::eShaderWrite |
+                                 vk::AccessFlagBits2::eMemoryWrite;
+    if (last_state.layout != dst_layout || last_state.access_mask != dst_mask ||
+        last_state.pl_stage != dst_stage || (last_state.access_mask & write_flags)) {
+        return false;
+    }
+    const auto& subresource_states = backing->subresource_states;
+    const bool needs_partial_transition =
+        subres_range &&
+        (subres_range->base != SubresourceBase{} || subres_range->extent != info.resources);
+    if (subresource_states.empty()) {
+        return !needs_partial_transition; // a partial one would split the state first
+    }
+    if (!needs_partial_transition) {
+        return false; // the full transition would merge the subresource states
+    }
+    for (u32 mip = subres_range->base.level;
+         mip < subres_range->base.level + subres_range->extent.levels; ++mip) {
+        for (u32 layer = subres_range->base.layer;
+             layer < subres_range->base.layer + subres_range->extent.layers; ++layer) {
+            const auto subres_idx = mip * info.resources.layers + layer;
+            if (subres_idx >= subresource_states.size()) {
+                return false;
+            }
+            const auto& state = subresource_states[subres_idx];
+            if (state.layout != dst_layout || state.access_mask != dst_mask ||
+                (state.access_mask & write_flags)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
 
 // sotc: GCN does not order UAV writes between draws by itself; the game inserts an end-of-pipe label
 // where it needs the writes visible. A GENERAL image that was written and is used again with the

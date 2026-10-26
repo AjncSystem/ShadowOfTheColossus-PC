@@ -36,9 +36,17 @@ private:
 
     void ResizeAndInvalidate(u32 width, u32 height);
     void CreateImages(Img& img) const;
+    /// sotc: frees the FSR 1 images once the frames recorded with them are done, when the pass
+    /// is switched off at run time; CreateImages recreates them if it is switched on again.
+    void ReleaseImagesWhenIdle();
+    void ReleaseImages();
+    bool ImagesAlive() const;
 
     vk::Device device{};
     u32 num_images{};
+    u32 release_delay{5}; ///< sotc: Render calls waited before ReleaseImages (frames in flight)
+    u32 release_wait{};
+    bool release_pending{};
 
     vk::UniqueDescriptorSetLayout descriptor_set_layout{};
     vk::UniqueDescriptorSet easu_descriptor_set{};

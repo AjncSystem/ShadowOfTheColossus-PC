@@ -2,6 +2,7 @@
 // sotc: the frame generation mode, see vk_framegen.h.
 
 #include "video_core/renderer_vulkan/vk_framegen.h"
+#include "video_core/renderer_vulkan/vk_fsrfg.h"
 #include "video_core/sotc_ui_lang.h"
 
 #include <windows.h>
@@ -78,6 +79,15 @@ bool HasNvidiaGpu() {
 std::atomic<int> current{static_cast<int>(Mode::Off)};
 std::atomic<bool> have_dlss{false}, have_fsr{false};
 
+/// sotc: leaving FSR 3 frees its context, depth images and pipeline (vk_fsrfg.h: up to ~130 MB at
+/// 1080p). Only a request here (F8 runs on the window thread); the present thread runs the
+/// shutdown once the frames still using them are presented.
+void LeftFsr(Mode before, Mode after) {
+    if (before == Mode::Fsr && after != Mode::Fsr) {
+        FsrFg::RequestShutdown();
+    }
+}
+
 } // namespace
 
 bool WantStreamline() {
@@ -144,13 +154,16 @@ bool Set(Mode mode) {
     if (!Available(mode)) {
         return false;
     }
+    const Mode before = Current();
     current = static_cast<int>(mode);
+    LeftFsr(before, mode);
     std::fprintf(stderr, "SOTC FRAMEGEN: switched to %s\n", Name(mode));
     return true;
 }
 
 Mode Cycle() {
     Mode mode = Current();
+    const Mode before = mode;
     for (int i = 0; i < 3; ++i) {
         mode = static_cast<Mode>((static_cast<int>(mode) + 1) % 3);
         if (Available(mode)) {
@@ -158,6 +171,7 @@ Mode Cycle() {
         }
     }
     current = static_cast<int>(mode);
+    LeftFsr(before, mode);
     std::fprintf(stderr, "SOTC FRAMEGEN: switched to %s\n", Name(mode));
     return mode;
 }

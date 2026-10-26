@@ -30,12 +30,15 @@
 #include "common/decoder.h"
 #include "core/signals.h"
 #include "shader_recompiler/ir/passes/srt.h"
+#include "bbport_toggles.h"
 #include "video_core/page_manager.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 // src/runtime_memory.c: the runtime's view of a page next to the host protection (diagnostics).
 extern "C" void runtime_memory_describe(uintptr_t address, char* out, size_t capacity);
+// src/runtime_memory.c: names a big host allocation for the RAM census (SOTC_RAM_CENSUS=1).
+extern "C" void runtime_memory_tag(const void* p, size_t size, const char* name);
 
 #ifndef _WIN64
 #include <sys/mman.h>
@@ -202,6 +205,49 @@ void ForEachNonStackRange(VAddr address, u64 size, NonStackRangeFn func) {
     }
 }
 
+namespace {
+// sotc: protect batch state of one thread (see ProtectBatchScope). Only the draw thread opens
+// scopes; every other thread always sees depth == 0 and protects at once.
+// Constant-initialized and trivially destructible (no TLS guard or atexit hook): fault handlers on
+// guest threads read it, and must not allocate or take a lock to do so. The range array is only
+// allocated by the thread that defers.
+struct ProtectBatchState {
+    u32 depth{};     // open ProtectBatchScope objects on this thread
+    u32 suspended{}; // > 0 inside a fault handler or a flush: protects go straight to the OS
+    std::pair<u64, u64>* ranges{}; // [first page, end page) awaiting their host protect
+    size_t count{};
+    size_t capacity{};
+};
+ProtectBatchState& TlProtectBatch() {
+    static thread_local ProtectBatchState state;
+    return state;
+}
+bool ProtectBatchEnvEnabled() {
+    // sotc: off by default (SOTC_PROTECT_BATCH=1 turns it on). Measured on the attract demo
+    // (2026-10-21): 85376 requests merged into 84054 ranges, -1.5%. The protected ranges of a
+    // draw or a DMA sweep are almost never adjacent, so batching saved no syscalls and cost an
+    // extra page-lock pass.
+    static const bool v = [] {
+        const char* e = std::getenv("SOTC_PROTECT_BATCH");
+        return e && e[0] == '1';
+    }();
+    return v;
+}
+/// SOTC_CMD_STATS only: requests recorded, merged ranges issued, flushes (printed every 10 s).
+struct ProtectBatchStats {
+    u64 deferred{};
+    u64 merged{};
+    u64 flushes{};
+    u64 immediate{};
+    std::chrono::steady_clock::time_point last{std::chrono::steady_clock::now()};
+};
+ProtectBatchStats g_batch_stats; // draw thread only (the thread that owns scopes)
+} // namespace
+
+bool ProtectBatchEnabled() {
+    return ProtectBatchEnvEnabled();
+}
+
 struct PageManager::Impl {
     struct PageState {
         u8 num_write_watchers;
@@ -257,6 +303,7 @@ struct PageManager::Impl {
     static constexpr size_t NUM_ADDRESS_PAGES = 1ULL << (40 - PM_PAGE_BITS);
     static constexpr size_t NUM_ADDRESS_LOCKS = NUM_ADDRESS_PAGES / NUM_REGION_PAGES;
     inline static Vulkan::Rasterizer* rasterizer;
+    inline static Impl* instance; // sotc: for PageManager::FlushProtectBatch
 
     Impl() = default;
     virtual ~Impl() = default;
@@ -316,12 +363,88 @@ struct PageManager::Impl {
         }
     }
 
+    /// sotc: records a restrictive protection for the end of the batch scope of this thread.
+    /// False (caller protects now) outside a scope, inside a fault handler or when disabled.
+    static bool TryDefer(u64 first_page, u64 pages) {
+        auto& batch = TlProtectBatch();
+        if (batch.depth == 0 || batch.suspended != 0) {
+            return false;
+        }
+        if (batch.count == batch.capacity) {
+            const size_t capacity = batch.capacity ? batch.capacity * 2 : 256;
+            void* grown = std::realloc(batch.ranges, capacity * sizeof(batch.ranges[0]));
+            if (!grown) {
+                return false;
+            }
+            batch.ranges = static_cast<std::pair<u64, u64>*>(grown);
+            batch.capacity = capacity;
+        }
+        batch.ranges[batch.count++] = {first_page, first_page + pages};
+        return true;
+    }
+
+    /// sotc: issues the batched protections of this thread: sorted, overlapping and adjacent
+    /// ranges merged, then each merged range gets the protection its pages' CURRENT watcher state
+    /// implies (ReapplyProtection, under the page locks, skipping pages that are fully accessible).
+    /// The state was already updated when the request was recorded, so applying the state at flush
+    /// time is exactly "the latest request for the page wins", and a page another thread changed
+    /// in the meantime (its state update and host protect are atomic under the page lock) is
+    /// neither protected over its unprotect nor left behind it: no desync, whatever the order.
+    void FlushBatch() {
+        auto& batch = TlProtectBatch();
+        auto* const ranges = batch.ranges;
+        if (batch.count == 0 || batch.suspended != 0) {
+            return; // empty, or already flushing (a re-entrant flush would deadlock on the page locks)
+        }
+        ++batch.suspended; // nothing below may defer again
+        const u64 requests = batch.count;
+        std::sort(ranges, ranges + batch.count);
+        size_t merged = 0;
+        for (size_t i = 0; i < batch.count; ++i) {
+            if (merged != 0 && ranges[i].first <= ranges[merged - 1].second) {
+                ranges[merged - 1].second = std::max(ranges[merged - 1].second, ranges[i].second);
+            } else {
+                ranges[merged++] = ranges[i];
+            }
+        }
+        for (size_t i = 0; i < merged; ++i) {
+            ReapplyProtection(ranges[i].first << PM_PAGE_BITS,
+                              (ranges[i].second - ranges[i].first) << PM_PAGE_BITS);
+        }
+        batch.count = 0;
+        --batch.suspended;
+        if (SotcStats::kCmdStats) {
+            auto& st = g_batch_stats;
+            st.deferred += requests;
+            st.merged += merged;
+            ++st.flushes;
+            const auto now = std::chrono::steady_clock::now();
+            if (now - st.last >= std::chrono::seconds(10)) {
+                std::fprintf(stderr,
+                             "SOTC protect batch (10 s): %llu requests -> %llu merged ranges in "
+                             "%llu flushes, %llu protects at once\n",
+                             static_cast<unsigned long long>(st.deferred),
+                             static_cast<unsigned long long>(st.merged),
+                             static_cast<unsigned long long>(st.flushes),
+                             static_cast<unsigned long long>(st.immediate));
+                st.deferred = st.merged = st.flushes = st.immediate = 0;
+                st.last = now;
+            }
+        }
+    }
+
     void EnsurePages(VAddr begin, VAddr end) {
         end = std::min(end, VAddr{1} << ADDRESS_BITS) - 1;
         const size_t start_page = begin >> PM_PAGE_BITS;
         const size_t end_page = end >> PM_PAGE_BITS;
         cached_pages.reserve(start_page, end_page);
         locks.reserve(start_page, end_page);
+        // sotc: RAM census labels (the table pages come from ObjectPool chunks; the registry
+        // dedupes per 64 KiB, so only the chunks of a range's first and last page are named).
+        for (const size_t page : {start_page, end_page}) {
+            runtime_memory_tag(cached_pages.find(page), sizeof(PageState), "PageManager cached_pages");
+            runtime_memory_tag(locks.find(page), sizeof(MutexTraits::Entry), "PageManager locks");
+        }
     }
 
     void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) {
@@ -412,15 +535,35 @@ struct PageManager::Impl {
         u64 range_begin = base_page + page_start;
         u64 range_pages = 0;
         u64 potential_pages = 0;
+        // sotc: a page of the pending range gains an access right (never batched: whoever waits
+        // for the access, a faulting thread, must not wait for the end of the scope).
+        bool range_grants = false;
 
         const auto release_pending = [&] {
             if (range_pages > 0) {
                 if (SotcStats::kCmdStats) SotcStats::sys_protect_src[1].fetch_add(1, std::memory_order_relaxed);
-                Protect(range_begin << PM_PAGE_BITS, range_pages << PM_PAGE_BITS, perms);
+                // sotc: the state is updated; the host protect may wait for the batch flush
+                // (before any copy of the scope, see BufferCache::SynchronizeMemory).
+                if (range_grants || !TryDefer(range_begin, range_pages)) {
+                    if (SotcStats::kCmdStats && TlProtectBatch().depth != 0) {
+                        ++g_batch_stats.immediate; // draw thread in a scope only
+                    }
+                    Protect(range_begin << PM_PAGE_BITS, range_pages << PM_PAGE_BITS, perms);
+                }
                 range_pages = 0;
                 potential_pages = 0;
+                range_grants = false;
             }
         };
+
+        // sotc: MicroCostSweep (PERFIL-2.md C2). The pages visited and locked in this pass are
+        // unlocked from a local list instead of a second cached_pages/locks lookup per page
+        // (about 17 pages per protect, ~370 protects per frame). The first 256 locks are kept;
+        // a longer range falls back to the lookup pass.
+        const bool sweep = !BbToggle::Disabled(BbToggle::MicroCostSweep);
+        MutexTraits::Entry* held[256];
+        size_t held_count = 0;
+        bool held_overflow = false;
 
         for (u64 page = page_start; page != page_end; ++page) {
             PageState* state = cached_pages.find(base_page + page);
@@ -428,7 +571,15 @@ struct PageManager::Impl {
                 continue;
             }
 
-            locks[base_page + page].lock();
+            MutexTraits::Entry& page_lock = locks[base_page + page];
+            page_lock.lock();
+            if (sweep) {
+                if (held_count < std::size(held)) {
+                    held[held_count++] = &page_lock;
+                } else {
+                    held_overflow = true;
+                }
+            }
 
             const auto old_perms = state->Perms();
             if (page == page_start) {
@@ -458,12 +609,23 @@ struct PageManager::Impl {
                 }
                 // Extend current rango up to potential range
                 range_pages = potential_pages;
+                if ((std::to_underlying(new_perms) & ~std::to_underlying(old_perms)) != 0) {
+                    range_grants = true;
+                }
             }
         }
 
         // Add pending (un)protect action
         release_pending();
 
+        if (sweep && !held_overflow) {
+            // Same pages, same order: only the ones this pass locked (the old pass also tried
+            // the pages without a state, whose lock it never took).
+            for (size_t i = 0; i < held_count; ++i) {
+                held[i]->unlock();
+            }
+            return;
+        }
         for (u64 page = page_start; page != page_end; ++page) {
             if (auto* lock = locks.find(base_page + page)) {
                 lock->unlock();
@@ -953,6 +1115,13 @@ struct SignalImpl : public PageManager::Impl {
     }
 
     static bool HandleGuestFault(void* context, void* fault_address, bool is_gpu_thread) {
+        // sotc: handling a fault reads and changes protections: this thread's batched protects go
+        // out first and nothing is batched until the handler returns.
+        PageManager::FlushProtectBatch();
+        struct Suspend {
+            Suspend() { ++TlProtectBatch().suspended; }
+            ~Suspend() { --TlProtectBatch().suspended; }
+        } suspend;
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
         if (!Common::IsWriteError(context) && is_gpu_thread && TryCleanWalkerLoad(context)) {
@@ -1092,6 +1261,7 @@ PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
     if (EmulatorSettings.IsUserfaultfdTracking()) {
         try {
             impl = std::make_unique<UffdImpl>(rasterizer_);
+            Impl::instance = impl.get();
             LOG_INFO(Config, "Memory tracking method: userfaultfd");
             return;
         } catch (const std::runtime_error& e) {
@@ -1101,9 +1271,28 @@ PageManager::PageManager(Vulkan::Rasterizer* rasterizer_) {
     LOG_INFO(Config, "Memory tracking method: signals");
 #endif
     impl = std::make_unique<SignalImpl>(rasterizer_);
+    Impl::instance = impl.get();
 }
 
 PageManager::~PageManager() = default;
+
+void PageManager::FlushProtectBatch() {
+    if (Impl::instance) {
+        Impl::instance->FlushBatch();
+    }
+}
+
+ProtectBatchScope::ProtectBatchScope() noexcept : active{ProtectBatchEnabled()} {
+    if (active) {
+        ++TlProtectBatch().depth;
+    }
+}
+
+ProtectBatchScope::~ProtectBatchScope() {
+    if (active && --TlProtectBatch().depth == 0) {
+        PageManager::FlushProtectBatch(); // the outermost scope flushes
+    }
+}
 
 void PageManager::OnGpuMap(VAddr address, size_t size) {
     impl->OnMap(address, size);

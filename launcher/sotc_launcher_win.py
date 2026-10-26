@@ -610,7 +610,9 @@ def game_environment(s):
     env['SOTC_MODES'] = ','.join(modes)
     env['SOTC_FPS_CAP'] = '30' if fps_mode == '30' else 'off'
     env['SOTC_FPS_LIMIT'] = '60' if fps_mode == '60' else '0'
-    env['BB_VBLANK_HZ'] = '120'
+    # 60 FPS: 480 Hz vblanks show a late frame ~2 ms after it is ready instead of at the next 120 Hz
+    # vblank (25 ms); SOTC_FPS_LIMIT still keeps 16.7 ms between flips (docs/sotc/PERFIL-2.md).
+    env['BB_VBLANK_HZ'] = '480' if fps_mode == '60' else '120'
     env['BB_FULLSCREEN'] = '1' if s['fullscreen'] else '0'
     if s.get('fs_borderless'):
         env['BB_FULLSCREEN_HZ'] = '0'  # sotc: keep the desktop mode, never the exclusive one

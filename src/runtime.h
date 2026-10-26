@@ -75,6 +75,28 @@ int32_t runtime_guest_errno(int host_errno);
 void *runtime_low_map(size_t size, int prot);
 /* Windows: reserves the PS4 user address range as a placeholder (no-op elsewhere). */
 void runtime_memory_reserve(void);
+#ifdef __cplusplus
+extern "C" {
+#endif
+/* sotc: marks the calling thread as the GPU draw thread (liverpool.cpp BackLoop) for the split
+ * of the slow lock waits (sotc_stats.h). */
+void runtime_memory_mark_draw_thread(void);
+/* sotc: bytes of the pagefile-backed guest section (POOL_SIZE after any BB_DMEM_MB fallback);
+ * 0 where the pool is a memfd. */
+uint64_t runtime_memory_guest_section_bytes(void);
+/* sotc: SOTC_RAM_CENSUS=1: copies the last finished RAM census ("SOTC RAM census:" lines, each ending
+ * in a newline) into out and starts the next one on a background thread; returns the length (0:
+ * disabled, none finished yet, or not Windows). */
+size_t runtime_memory_ram_census(char *out, size_t cap);
+/* sotc: names a big host allocation for the census (it labels each top private region that contains
+ * a tagged pointer). name must be a static string; up to 64 tags, lock-free, rare calls only. */
+void runtime_memory_tag(const void *p, size_t size, const char *name);
+/* sotc: VMA allocate (delta_bytes > 0) / free (< 0) of one Vulkan device memory block of memory
+ * type `type`, for the census totals (registered only when SOTC_RAM_CENSUS=1). */
+void runtime_memory_census_vk(unsigned type, int host_visible, int64_t delta_bytes);
+#ifdef __cplusplus
+}
+#endif
 uintptr_t runtime_ajm_resolve(const char *name);
 void runtime_ajm_report(void);
 uintptr_t runtime_audio_resolve(const char *name);

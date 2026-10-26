@@ -51,9 +51,34 @@ Dev/bench helpers in `tools/` (bash, CLANG64): `sotc_run.sh [seconds] [log]` (re
 needs `out/save-template/CUSA08809` (or `CUSA08034`), a save after colossus 1 whose profile has the language set; the attract
 benchmark restores the same template and sits on the language menu without it). Profiling: `SOTC_PROFILE=<thread
 name part>` (e.g. `GpuCommandProcessor`, sampler in `src/probe.c`) with `SOTC_PROFILE_OUT=<file>`, then
-`tools/profile_functions.py <file> out/gpu/bb-probe.exe 60 --inlines --qualified`. At the benchmark scenes the
-port is CPU-bound on the `shadPS4:GpuCommandProcessor` thread (GPU ~25% busy), so judge changes by that thread. `tools/rdoc/` are RenderDoc Python scripts; RenderDoc capture
-via `SOTC_WRAP` (JSON command prefix, see `sotc.py`) + F12.
+`tools/profile_functions.py <file> out/gpu/bb-probe.exe 60 --inlines --qualified`. `tools/rdoc/` are RenderDoc
+Python scripts; RenderDoc capture via `SOTC_WRAP` (JSON command prefix, see `sotc.py`) + F12.
+
+## Performance work
+
+- **Which thread limits.** The GPU side runs as a pipeline: CP (`shadPS4:GpuCommandProcessor`, parses PM4 and
+  captures back ops) → back-op ring → `shadPS4:GpuDraw` (executes ops: binds, uploads, readbacks) → recorder
+  thread (Vulkan calls). With the draw-thread fast paths in place, the heavy scenes (temple surroundings,
+  >= 7000 cmds/frame) are limited by `GpuDraw` (~93% busy), not by the CP (~55% own work) or the GPU (~50%).
+  Only work removed from the limiting thread moves FPS; `SOTC_FPS=1` logs per-thread busy time and CP own work.
+- **BbToggle bits** (`gpu/shim/bbport_toggles.h`; default mask in `src/runtime_memory.c`): every optimization
+  sits behind a bit, and a set bit means the old path. `BB_TOGGLE_FILE=<file>` holding a mask is re-read live,
+  which allows in-run A/B (flip the mask in ABBA/BAAB order and compare windows by cmds/frame). New fast paths
+  come with a `SOTC_<NAME>_VERIFY=1` env that also runs the slow path and counts mismatches; it must report 0.
+  Bits added by the performance work: 20 `CpFastPaths` (off by default, `SOTC_CP_FAST=1`), 21 `BpeGuardDiff`,
+  22 `ReadbackIntervals`, 23 `MicroCostSweep`, 24 `WriteMarkMemo`, 25 `ColdImageSweep`, 26 `ArenaImageRelease`,
+  27 `StagingScale`, 28 `DepthFastPath`, 29 `GBufferFastPath`, 31 `TexBindFastPath`, 40 `DispatchFastPath` (off
+  by default, `SOTC_DISPFAST=1`), 41 `DrawReplay` (`SOTC_DRAWREPLAY=0` disables), 56 `BufferBindMemo`, 58
+  `PipelineKeyMemo`, 59 `GcLruAdvance`, 60 `DrawFixedCostOpt`, 61 `LowLatencyWait`, 62 `CpPollBackoff`, 63
+  `DrawBindMemo`.
+- **Measuring.** Compare PGO builds only (PGO is worth +15–20%); retrain after GPU-side changes. Run
+  `tools/pgo_train.sh` from the MSYS2 bash (`C:/msys64/usr/bin/bash.exe`): started from Git Bash, the `bash` it
+  calls can drop `SOTC_GAME_DIR`/`PY`, and llvm-windres needs a Windows `TMP`. Stop OneDrive (both
+  `OneDrive.exe` and `OneDrive.Sync.Service.exe`) and other heavy processes during benchmarks. End-to-end runs
+  are interleaved (new/old/old/new); a replayed route (`sotc_bench_shrine.py --replay <route>`) diverges between
+  runs, so bin its windows by cmds/frame instead of comparing averages.
+- Technical notes per change, in Spanish: `docs/sotc/DEPTH-FASTPATH.md`, `GBUFFER-FASTPATH.md`,
+  `SIGUIENTE-LIMITE.md` (frame-time breakdown), `DISPATCH-FASTPATH.md`, `DRAW-REPLAY.md`.
 
 ## Architecture
 

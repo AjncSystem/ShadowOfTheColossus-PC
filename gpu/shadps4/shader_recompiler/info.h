@@ -37,6 +37,15 @@ struct InfoRuntime {
     std::span<const u32> user_data;
     std::vector<u32> flattened_ud_buf;
     VAddr pgm_base{};
+    /// sotc: BbToggle::DrawReplay. Copy 1 (draw thread, Liverpool::ExecuteBackOp): moves whenever
+    /// the user data or the flattened buffer this copy holds changed in value, so "same user data
+    /// and flat buffer as the last bind" is one integer compare.
+    u64 ud_gen{};
+    /// Copy 0 (command processor, Liverpool::CaptureBackOp): the user data and flat buffer the last
+    /// captured op of this shader carried, to tell the draw thread whether the next one differs.
+    std::array<u32, 16> cap_ud{};
+    u32 cap_ud_n{~0u};
+    std::vector<u32> cap_flat;
 };
 
 enum class Qualifier : u8 {

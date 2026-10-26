@@ -18,6 +18,13 @@ add_compile_options(-fno-omit-frame-pointer)
 option(BB_LTO "Link-time optimization of bbgpu" ON)
 set(BB_PGO "off" CACHE STRING "Profile-guided optimization: off, generate, use")
 set(BB_PGO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../pgo" CACHE PATH "Profile directory")
+# sotc: optional -march for local benchmark builds (BB_MARCH=x86-64-v3, native, znver3...). Empty
+# keeps the portable build that runs on the Steam Deck; the default is unchanged.
+set(BB_MARCH "" CACHE STRING "Extra -march for bbgpu (empty keeps the portable build)")
+if (BB_MARCH)
+    add_compile_options(-march=${BB_MARCH})
+    message(STATUS "bbgpu: -march=${BB_MARCH}")
+endif()
 if (BB_LTO)
     include(CheckIPOSupported)
     check_ipo_supported(RESULT bb_ipo_ok OUTPUT bb_ipo_error)
@@ -297,8 +304,10 @@ if (WIN32)
     target_include_directories(bb-probe PRIVATE .. ../src)
     target_link_libraries(bb-probe PRIVATE bbgpu atrac9 onecore bcrypt ws2_32 winmm -pthread)
     # The PS4 range (64 GiB - 1 TiB) must stay free: no high-entropy ASLR for heaps and stacks.
-    # The guest main thread runs on the process stack: 16 MiB, committed (no stack probes).
-    target_link_options(bb-probe PRIVATE -Wl,--disable-high-entropy-va "SHELL:-Xlinker --stack -Xlinker 16777216,16777216")
+    # sotc: 16 MiB stack reserved, 64 KiB committed: every host thread created with the default size
+    # uses these values. The guest main thread commits its stack in probe.c (stack_commit_to), guest threads
+    # commit theirs through the explicit size in runtime_thread.c.
+    target_link_options(bb-probe PRIVATE -Wl,--disable-high-entropy-va "SHELL:-Xlinker --stack -Xlinker 16777216,65536")
     add_executable(bb-gpu-capabilities ../tools/gpu_capabilities.c ../packaging/windows/bb-gpu-capabilities.rc)
     target_link_libraries(bb-gpu-capabilities PRIVATE Vulkan::Vulkan)
 endif()

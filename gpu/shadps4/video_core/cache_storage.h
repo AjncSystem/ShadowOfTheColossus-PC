@@ -53,6 +53,8 @@ public:
 private:
     void Prefetch();
     bool TakePrefetched(const std::filesystem::path& path, std::vector<u8>& data);
+    /// sotc: same, straight into a u32 vector (no intermediate byte copy).
+    bool TakePrefetched(const std::filesystem::path& path, std::vector<u32>& data);
     /// sotc: after FinishPreload, Load of a file this never saw at Prefetch or Save time returns
     /// nothing without touching the disk: every new shader's collision check opened a missing
     /// file on the command processor, ~28 ms each on Windows. Built from the same directory

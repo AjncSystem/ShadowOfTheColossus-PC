@@ -2,15 +2,19 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include "bbport_copy.h"
 #include "core/memory.h"
 #include "shader_recompiler/info.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
+#include "video_core/renderer_vulkan/sotc_dispphase.h" // sotc: SOTC_DISP_PHASES
 
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 
@@ -160,6 +164,19 @@ struct TableData {
     }
 };
 
+// sotc: off by default (SOTC_FILL_HLE_PARALLEL=1 turns it on): the tables are compared on the
+// draw thread. The parallel compare saved ~2 us per op (~0.1 ms/frame) but its copy threads
+// read guest pages the GPU tracker may protect; a fault there waits for the draw thread, which
+// waits for the copy threads: boot deadlock in 5 of 32 launches. The pre-touch below closes it
+// as far as known, so the gain does not justify the remaining race.
+static bool ParallelCompareEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_FILL_HLE_PARALLEL");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+
 static bool ReplaceChangedPages(Rasterizer& rasterizer, VAddr address, const u8* current,
                                 const TableData& data, u64 size) {
     auto& buffer_cache = rasterizer.GetBufferCache();
@@ -169,6 +186,7 @@ static bool ReplaceChangedPages(Rasterizer& rasterizer, VAddr address, const u8*
         if (run_end == run_start) {
             return true;
         }
+        const u64 flush_t0 = DispPhase::kOn ? DispPhase::Now() : 0;
         const u64 offset = run_start - address;
         const u64 run_size = run_end - run_start;
         run_start = run_end;
@@ -180,12 +198,48 @@ static bool ReplaceChangedPages(Rasterizer& rasterizer, VAddr address, const u8*
             SotcStats::inv_hle.fetch_add(run_size, std::memory_order_relaxed);
         }
         rasterizer.GetTextureCache().InvalidateMemory(address + offset, run_size);
+        if (DispPhase::kOn) {
+            auto& u = DispPhase::Subs();
+            u.hle_flush += DispPhase::Now() - flush_t0;
+            u.hle_repl_bytes += run_size;
+        }
         return true;
     };
     const VAddr end = address + size;
+    // sotc: a table of 1 MiB and more (the game copies a 4 MiB and an 8 MiB one every frame,
+    // ~0.4 ms of memcmp of the draw thread, memory bound) is compared on the copy threads, one
+    // flag per page; the scan below then reads the flags instead of comparing. Same result.
+    // SOTC_FILL_HLE_PARALLEL=0 compares on this thread.
+    const bool parallel = ParallelCompareEnabled();
+    static std::vector<u8> differs;
+    const VAddr first_page = address & ~VAddr{4095};
+    const bool flagged = parallel && size >= 1_MB && BbCopy::Enabled();
+    if (flagged) {
+        constexpr u64 PagesPerTask = 64; // 256 KiB
+        const u64 pages = (end - first_page + 4095) / 4096;
+        differs.resize(pages);
+        BbCopy::ParallelFor((pages + PagesPerTask - 1) / PagesPerTask, [&](std::size_t task) {
+            const u64 last = std::min(pages, (task + 1) * PagesPerTask);
+            for (u64 page = task * PagesPerTask; page < last; ++page) {
+                const VAddr lo = std::max<VAddr>(first_page + page * 4096, address);
+                const VAddr hi = std::min<VAddr>(first_page + page * 4096 + 4096, end);
+                differs[page] =
+                    std::memcmp(current + (lo - address), data.At(lo - address), hi - lo) != 0;
+            }
+        });
+    }
     for (VAddr lo = address; lo < end;) {
         const VAddr hi = std::min<VAddr>((lo & ~VAddr{4095}) + 4096, end);
-        if (std::memcmp(current + (lo - address), data.At(lo - address), hi - lo) != 0) {
+        const u64 cmp_t0 = DispPhase::kOn ? DispPhase::Now() : 0;
+        const bool page_differs =
+            flagged ? differs[(lo - first_page) / 4096] != 0
+                    : std::memcmp(current + (lo - address), data.At(lo - address), hi - lo) != 0;
+        if (DispPhase::kOn) {
+            auto& u = DispPhase::Subs();
+            u.hle_cmp += DispPhase::Now() - cmp_t0;
+            u.hle_cmp_bytes += hi - lo;
+        }
+        if (page_differs) {
             if (run_end != lo && !flush()) {
                 return false;
             }
@@ -213,9 +267,32 @@ static void BuildTable(const u32* source, u64 src_count, u64 count) {
     }
 }
 
+namespace {
+// sotc: SOTC_DISP_PHASES: total time and table size of one replicator HLE call.
+struct HleScope {
+    u64 t0 = DispPhase::kOn ? DispPhase::Now() : 0;
+    u64 table_bytes = 0;
+    ~HleScope() {
+        if (!DispPhase::kOn) {
+            return;
+        }
+        auto& u = DispPhase::Subs();
+        const u64 dt = DispPhase::Now() - t0;
+        ++u.hle_n;
+        u.hle_total += dt;
+        u.hle_table_bytes += table_bytes;
+        if (table_bytes >= 1_MB) {
+            ++u.hle_big_n;
+            u.hle_big_ticks += dt;
+        }
+    }
+};
+} // namespace
+
 static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
                                       const AmdGpu::ComputeProgram& cs_program,
                                       Rasterizer& rasterizer) {
+    HleScope hle_scope;
     static const bool enabled = [] {
         const char* v = std::getenv("SOTC_FILL_HLE");
         return !v || v[0] != '0';
@@ -250,6 +327,7 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
     }
     const u32* source = std::bit_cast<const u32*>(src.base_address);
     const VAddr address = dst.base_address;
+    hle_scope.table_bytes = count * 4;
     // sotc: the tables are mostly the same every frame. When no byte of the destination is GPU
     // written (so its pages are not read-protected and the backing is authoritative) and it
     // already holds this data, the result of the replace below is already in place: skip its
@@ -280,10 +358,33 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
         const bool overlap = src.base_address < address + count * 4 &&
                              address < src.base_address + period;
         if (in_run && page_replace && !overlap && (src_count == count || period <= 64_KB)) {
+            if (DispPhase::kOn) {
+                auto& u = DispPhase::Subs();
+                ++(src_count == count ? u.hle_direct : u.hle_pattern);
+                u.hle_pre += DispPhase::Now() - hle_scope.t0;
+            }
             TableData table{};
             if (src_count == count) {
                 table.direct = reinterpret_cast<const u8*>(source);
+                // sotc: the parallel compare reads the source (guest memory) on the copy threads.
+                // A page of it that is GPU-tracked (the exact-range check above does not cover a
+                // page shared with GPU-written bytes) faults there, and a copy thread's fault
+                // waits for this thread (SendCommand<true> in BufferCache::ReadMemory) while this
+                // thread waits for the copy threads in BbCopy::ParallelFor: a deadlock that hung
+                // ~25% of boots at the loading screen. Touch one byte per page here first: the
+                // fault, if any, is handled inline by this (draw) thread and the page is
+                // accessible when the workers read it.
+                if (count * 4 >= 1_MB && ParallelCompareEnabled() && BbCopy::Enabled()) {
+                    const volatile u8* bytes = table.direct;
+                    u8 sink = 0;
+                    for (u64 offset = 0; offset < count * 4; offset += 4096) {
+                        sink ^= bytes[offset];
+                    }
+                    sink ^= bytes[count * 4 - 1];
+                    asm volatile("" : : "r"(sink));
+                }
             } else {
+                const u64 pb_t0 = DispPhase::kOn ? DispPhase::Now() : 0;
                 static std::vector<u8> pattern;
                 pattern.resize(period + 4096);
                 std::memcpy(pattern.data(), source, period);
@@ -294,9 +395,15 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
                 }
                 table.pattern = pattern.data();
                 table.period = period;
+                if (DispPhase::kOn) {
+                    DispPhase::Subs().hle_pattern_build += DispPhase::Now() - pb_t0;
+                }
             }
             return ReplaceChangedPages(rasterizer, address, run + (address - run_start), table,
                                        count * 4);
+        }
+        if (DispPhase::kOn) {
+            ++DispPhase::Subs().hle_other;
         }
         BuildTable(source, src_count, count);
         if (in_run) {
@@ -327,6 +434,155 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
     if (SotcStats::kCmdStats) SotcStats::inv_hle.fetch_add(count * 4, std::memory_order_relaxed);
     rasterizer.InvalidateMemory(address, count * 4);
     return true;
+}
+
+// sotc: the lighting compute shaders of the open world read a light array through a descriptor
+// with num_records near 4 GiB ("unbounded", which BindBuffers limits to a 64 MiB window) and
+// through raw 64-bit pointers (uses_dma: the whole DMA sweep runs before them). Both only touch
+// a few KiB, but the window and the sweep collected, re-protected and copied to the GPU every
+// page the game had written in all resident memory since the last frame: 2-9 MB and ~25 page
+// protects per frame, 0.5-0.9 ms of the draw thread (0x57bd9f27 paid it, as the first user;
+// 0xa0adab44 paid its own window; the other 8 MB per frame were read by nobody: with the sweep
+// off the frame uploads dropped from 11 MB to 2-4 MB). The extents come from the shader code:
+//  - 0x57bd9f27 (tiled light culling, 120x68 groups): the light array at the pointer in user
+//    data dwords 2-3 (the V# of buffer 0 points to the same place), its first dword n (the
+//    shader reads it as flattened slot 0x34), then lights of 28 dwords read at dwords
+//    28 * i + {32, 36, 40} (buffer 0) and at bytes 112 * i + {80 .. 180} (DMA) for i < n.
+//  - 0xfb974c0e (clustered lights): same pointer, n at flattened slot 0x9d, lights of 56 dwords
+//    (224 bytes), buffer 0 at dwords 56 * i + {7 .. 39} and DMA at bytes 224 * i + {32 .. 252}
+//    for i <= n.
+//  - 0xa0adab44 (deferred lighting, 240x135 groups): the index i of every load is < 4 (guard
+//    4 > i); buffer 0 (stride 64) is read at dwords 16 * i + {428 .. 459}, buffer 1 (stride 16)
+//    at dwords 4 * i + {510, 511}. 0x91c6c95e (20x12x64 groups) reads buffer 1 (stride 64, the
+//    same table) at dwords 16 * i + {428 .. 439}, i < 4; 0x79704cba (volumetric lighting) reads
+//    buffer 3 (stride 64) at dwords 16 * i + {348, 352, 356} (u32x4), i < 4.
+//  - 0xa8403cb5 (GPU particle spawner, dispatch-indirect, 27-40 per second in the open world):
+//    its bound descriptors are all small or already resident (the unbounded one, buffer 3, is
+//    clamped to the ~5 MB the game mapped there and uploads nothing after the first dispatch).
+//    The cost was the DMA sweep it triggered: 8-9 MB and ~65 page protects per dispatch,
+//    since the shader reads through a raw pointer. Every DMA load of the shader is a scalar load
+//    through the 64-bit pointer in user data dwords 16-17 at byte 288 + 16 * k + {0, 4}, k in
+//    {-1, 0, 1, 2} (k is a curve segment index chosen by float compares: the values are 0 or 1,
+//    minus 1, or the bit pattern 2, never anything else; the second load is 16 bytes further),
+//    that is bytes 272 .. 344 of the pointer (user data 16-17 = the base of its buffer 3, a table of
+//    16-byte curve keys). Its sibling 0x755ad38f (the next uses_dma dispatch-indirect of the
+//    frame, which paid the same sweep once the first one stopped: 74 ms/s, 577 MB/s) has the same
+//    curve code, DMA loads and user data slots. So does 0xcc4d91f3 (third variant, 29 ops/s, found
+//    paying the sweep next, 355 MB/s) with the table at byte 128 + 16 * k + {0, 4, 16, 20}: bytes
+//    112 .. 184 (not measured after the change). The first 512 bytes are synchronised.
+// A hint is only given when the descriptor has the stride the shader was analysed with and the
+// count is plausible. SOTC_HLE_<HASH>=0 disables a shader's hints (57BD9F27, FB974C0E,
+// A0ADAB44, the last one for 0xa0adab44, 0x91c6c95e and 0x79704cba; A8403CB5, for 0xa8403cb5,
+// 0x755ad38f and 0xcc4d91f3).
+static bool HintEnabled(u64 hash) {
+    const auto read = [](const char* name) {
+        const char* v = std::getenv(name);
+        return !v || v[0] != '0';
+    };
+    static const bool lights_cull = read("SOTC_HLE_57BD9F27");
+    static const bool lights_cluster = read("SOTC_HLE_FB974C0E");
+    static const bool lighting = read("SOTC_HLE_A0ADAB44");
+    static const bool particles = read("SOTC_HLE_A8403CB5");
+    switch (hash) {
+    case 0x57bd9f27:
+        return lights_cull;
+    case 0xfb974c0e:
+        return lights_cluster;
+    case 0xa0adab44:
+    case 0x91c6c95e:
+    case 0x79704cba:
+        return lighting;
+    case 0xa8403cb5:
+    case 0x755ad38f:
+    case 0xcc4d91f3:
+        return particles;
+    default:
+        return false;
+    }
+}
+
+static constexpr u32 MaxLights = 8192;
+
+u64 BufferExtentHint(const Shader::Info& info, u32 index, u32 stride) {
+    if (!HintEnabled(info.pgm_hash)) {
+        return 0;
+    }
+    const auto& flat = info.FlatBuf();
+    switch (info.pgm_hash) {
+    case 0x57bd9f27: {
+        static constexpr u32 CountSlot = 0x34;
+        if (index != 0 || stride != 112 || flat.size() <= CountSlot || flat[CountSlot] > MaxLights) {
+            return 0;
+        }
+        return u64{flat[CountSlot]} * 112 + 64 + 256; // 256 bytes of slack
+    }
+    case 0xfb974c0e: {
+        static constexpr u32 CountSlot = 0x9d;
+        if (index != 0 || stride != 224 || flat.size() <= CountSlot || flat[CountSlot] > MaxLights) {
+            return 0;
+        }
+        return u64{flat[CountSlot]} * 224 + 256;
+    }
+    case 0xa0adab44:
+        if (index == 0 && stride == 64) {
+            return 2032 + 256;
+        }
+        if (index == 1 && stride == 16) {
+            return 2096 + 256;
+        }
+        return 0;
+    case 0x91c6c95e:
+        // Same four-entry table: buffer 1 (stride 64) at dwords 16 * i + {428 .. 439}, i < 4.
+        return index == 1 && stride == 64 ? 1952 + 256 : 0;
+    case 0x79704cba:
+        // The same table, buffer 3 (stride 64) at dwords 16 * i + {348, 352, 356} (u32x4), i < 4.
+        return index == 3 && stride == 64 ? 1632 + 256 : 0;
+    default:
+        return 0;
+    }
+}
+
+bool KnownDmaRange(const Shader::Info& info, VAddr& address, u64& size) {
+    if (!HintEnabled(info.pgm_hash)) {
+        return false;
+    }
+    const auto& flat = info.FlatBuf();
+    if (info.pgm_hash == 0xa8403cb5 || info.pgm_hash == 0x755ad38f ||
+        info.pgm_hash == 0xcc4d91f3) {
+        // The curve table pointer of the particle spawner (see above): bytes 272 .. 344.
+        if (flat.size() <= 17) {
+            return false;
+        }
+        address = (u64{flat[17]} << 32 | flat[16]) & 0xFFFFFFFFFFFFULL;
+        size = 512;
+        static std::atomic<u32> shown{0};
+        if (address != 0 && shown.load(std::memory_order_relaxed) < 2 &&
+            shown.fetch_add(1, std::memory_order_relaxed) < 2) {
+            std::fprintf(stderr, "SOTC hle a8403cb5/755ad38f dma range %#llx + %llu\n",
+                         static_cast<unsigned long long>(address),
+                         static_cast<unsigned long long>(size));
+        }
+        return address != 0;
+    }
+    u32 count_slot;
+    u64 element;
+    u64 tail; // bytes read past the last element's start
+    switch (info.pgm_hash) {
+    case 0x57bd9f27:
+        count_slot = 0x34, element = 112, tail = 184;
+        break;
+    case 0xfb974c0e:
+        count_slot = 0x9d, element = 224, tail = 256 + 224; // i <= n
+        break;
+    default:
+        return false;
+    }
+    if (flat.size() <= std::max<u32>(count_slot, 0x13) || flat[count_slot] > MaxLights) {
+        return false;
+    }
+    address = (u64{flat[0x13]} << 32 | flat[0x12]) & 0xFFFFFFFFFFFFULL;
+    size = u64{flat[count_slot]} * element + tail + 256; // 256 bytes of slack
+    return address != 0;
 }
 
 bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,

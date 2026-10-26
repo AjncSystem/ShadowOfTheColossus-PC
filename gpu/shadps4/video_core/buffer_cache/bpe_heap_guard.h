@@ -4,6 +4,8 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -27,45 +29,71 @@ namespace VideoCore {
  */
 class BpeHeapGuard {
 public:
-    BpeHeapGuard(Core::MemoryManager* memory, VAddr heap);
+    /// sotc: reuse_scratch (BbToggle::BpeGuardDiff): the walk's scratch vectors (tree stack, header
+    /// starts) are thread_local instead of allocated per call. Rebuild() re-targets a pooled guard.
+    BpeHeapGuard(Core::MemoryManager* memory, VAddr heap, bool reuse_scratch = false);
+    /// sotc: as a new guard for heap, keeping the capacity of this object's vectors. Nothing from
+    /// the previous build survives (the free lists and the cached backing runs are cleared).
+    void Rebuild(VAddr new_heap);
 
     bool IsValid() const {
         return valid;
     }
-
-    /// Writes `size` bytes of `data` to guest `addr`, skipping allocator metadata. Returns the number of
-    /// skipped bytes whose GPU value differed from the CPU value (0 when harmless)
-    u64 Write(VAddr addr, const u8* data, u64 size);
-
-    /// sotc: from the lowest to the highest free block's metadata found by the walk ({0, 0}: none).
-    /// The heaps a world creates grow in 1 MiB pieces spread over direct memory, so this, not
-    /// [heap+0x28] (a pointer all heaps share), tells where their metadata is.
-    std::pair<VAddr, VAddr> FreeExtent() const {
-        if (free_spans.empty()) {
-            return {0, 0};
-        }
-        VAddr hi = 0;
-        for (const auto& span : free_spans) {
-            hi = std::max(hi, span.second);
-        }
-        return {free_spans.front().first, hi};
+    /// Free-tree nodes visited by the walk of this guard (stats only)
+    size_t TreeNodes() const {
+        return tree_nodes;
     }
 
-    /// True when [addr, end) overlaps allocator metadata
-    bool HasMetadata(VAddr addr, VAddr end) {
-        return !CollectSpans(addr, end).empty();
-    }
+    // sotc: the heap's real extent list. A heap is a doubly linked list of memory extents (sentinel
+    // at heap+0x38: prev heap+0x40, next heap+0x48, count u32 at heap+0x58, sum of sizes at
+    // heap+0x30). Each node is a system descriptor: [0] self, [8] prev, [0x10] next, [0x18] owner
+    // (the sentinel), [0x58] size, [0x60] base address; eboot FindExtent at +0x47ab0 walks it.
+    struct Extent {
+        VAddr lo;
+        VAddr hi;
+    };
+    /// Reads the extent list of the heap into out. False when it cannot be proven well formed
+    /// (broken links, a node that is not self owned, count or size sum that disagree with the
+    /// heap's own fields, torn by a concurrent growth): the caller must then assume the heap
+    /// can be anywhere. why (optional): 1 unreadable, 2 bad node, 3 broken ring, 4 count, 5 sum
+    /// heap_in_place: the heap object is a global of the eboot (no backing view): its fields are read
+    /// directly instead of asking the memory manager first.
+    static bool ReadExtents(Core::MemoryManager* memory, VAddr heap, std::vector<Extent>& out,
+                            int* why = nullptr, bool heap_in_place = false);
+    /// One line (stderr) describing the heap's bookkeeping: fields, extents and the chunk chain
+    /// ([heap+0xb8] -> [chunk+0] -> ...). Diagnostic only.
+    static void Describe(Core::MemoryManager* memory, VAddr heap);
+    /// Whether the heap needs a guard for these copies (all read fresh, nothing remembered): the
+    /// extents cannot be proven (see ReadExtents), or some copy overlaps an extent of the heap
+    /// without being proven to lie wholly in the payload of one live block (header right before the
+    /// copy: in use, room for the copy, successor pointing back, not the block being freed at
+    /// [heap+0xc0]). scratch is reused between calls.
+    static bool HeapTouched(Core::MemoryManager* memory, VAddr heap, std::span<const Extent> copies,
+                            std::vector<Extent>& scratch, int* why = nullptr,
+                            bool heap_in_place = false);
 
-    /// The in-use block whose user area holds `addr` (its header address and the next block's), found by
-    /// following the physical chain from the closest free block below it
-    bool FindUsedBlock(VAddr addr, VAddr& block, VAddr& next, int* why = nullptr) const;
+    // sotc: one write filtered against all heaps at once. Sequential per-heap writes would
+    // restore GPU bytes over metadata that an earlier heap's guard had preserved.
+    struct WriteResult {
+        u64 clipped = 0;
+        u64 differing = 0;
+    };
+    /// sotc: sink (VERIFY only): when set, the bytes that would be written to guest memory go to
+    /// sink[0, size) instead (a copy of the range's current bytes); guest memory is not touched.
+    /// reuse_scratch: the span list is thread_local instead of allocated per call.
+    static WriteResult Write(Core::MemoryManager* memory, std::span<BpeHeapGuard> guards,
+                             VAddr addr, const u8* data, u64 size, u8* sink = nullptr,
+                             bool reuse_scratch = false);
 
 private:
     using Span = std::pair<VAddr, VAddr>;
 
     /// The spans of allocator metadata overlapping [addr, end), sorted
     std::vector<Span> CollectSpans(VAddr addr, VAddr end);
+    /// sotc: appends the same spans, unsorted (Write sorts the union)
+    void AppendSpans(VAddr addr, VAddr end, std::vector<Span>& spans);
 
+    void Build(); // sotc: the constructor's walk, shared with Rebuild
     bool Read(VAddr addr, void* out, u64 size) const;
     bool IsHeapPointer(VAddr addr) const;
     void AddFreeBlock(VAddr block);
@@ -76,6 +104,8 @@ private:
     Core::MemoryManager* memory;
     VAddr heap;
     bool valid = false;
+    bool reuse = false; // sotc: thread_local scratch vectors in the walks
+    size_t tree_nodes = 0;
     std::vector<VAddr> free_blocks; // sorted block starts
     std::vector<Span> free_spans;   // sorted, header + tree links of every free block
     // Every backing run resolved during this guard's walk, sorted by start. The free-tree walk reads
@@ -87,39 +117,6 @@ private:
         const u8* ptr;
     };
     mutable std::vector<Run> runs;
-};
-
-/**
- * sotc: in-use heap blocks that readbacks write into. A write inside the user area of a block that is
- * still in use holds no allocator metadata (headers sit between blocks, tree links only in free
- * ones), so it needs no guard, whose build walks the whole free tree. The heap changes every frame,
- * which rebuilt the guard about once per frame (~6% of the draw thread in the Shrine). Each hit
- * re-reads the block's header and the next block's back link, so a block freed since is not trusted.
- */
-class BpeUsedBlocks {
-public:
-    explicit BpeUsedBlocks(Core::MemoryManager* memory_) : memory{memory_} {}
-
-    /// True when [addr, end) lies in the user area of a remembered block that is still in use
-    bool Covers(VAddr heap, VAddr addr, VAddr end, int* why = nullptr);
-
-    void Add(VAddr block, VAddr next);
-
-    /// The in-use, size-0 block that ends the chain: the heap's tail after it holds no metadata
-    void SetFence(VAddr block) {
-        fence = block;
-    }
-
-    size_t Size() const {
-        return blocks.size();
-    }
-
-private:
-    bool StillUsed(VAddr heap, VAddr block, VAddr next) const;
-
-    Core::MemoryManager* memory;
-    std::vector<std::pair<VAddr, VAddr>> blocks; // sorted [header, next header)
-    VAddr fence = 0;
 };
 
 } // namespace VideoCore

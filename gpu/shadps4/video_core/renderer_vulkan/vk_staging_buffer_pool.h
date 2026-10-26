@@ -4,7 +4,9 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include "common/types.h"
@@ -65,6 +67,7 @@ private:
         u64 tick;
         u64 last_used_frame;
         bool held;
+        bool pinned = false; ///< sotc: warm reserve (SOTC_STAGING_RESERVE_MB), never trimmed
     };
 
     static constexpr size_t NUM_TYPES = 3;
@@ -74,10 +77,22 @@ private:
     StagingBufferRef RequestLarge(u64 size, VideoCore::MemoryType type, bool deferred,
                                   bool unsynchronized);
 
-    void TrimRing(Ring& ring, size_t keep_blocks);
-    void TrimLarge(std::vector<LargeBuffer>& cache);
+    void TrimRing(Ring& ring, size_t keep_blocks, u64 idle_frames);
+    void TrimLarge(std::vector<LargeBuffer>& cache, u64 idle_frames);
 
     void PublishStats() const;
+
+    /// sotc: keeps SOTC_STAGING_RESERVE_MB of host staging allocated and touched in advance, off
+    /// the frame (a burst of uploads found no free buffer and paid the allocation plus the page
+    /// faults of the first touch, 2-7x the copy time, inside the frame).
+    void MaintainReserve();
+
+    std::mutex reserve_mutex;
+    std::vector<std::unique_ptr<VideoCore::Buffer>> reserve_ready; ///< made by a copy thread
+    std::vector<std::unique_ptr<VideoCore::StreamBuffer>> ring_ready; ///< ring blocks, likewise
+    u32 ring_reserve_made = 0;
+    std::atomic<u32> reserve_pending{0};
+    u32 reserve_made = 0;
 
     const Instance& instance;
     Scheduler& scheduler;

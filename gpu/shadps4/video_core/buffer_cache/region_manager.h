@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
@@ -193,6 +194,7 @@ public:
         if constexpr (cpu_op == StateOp::Set) {
             if (raised) {
                 sweep_words.fetch_or(raised, std::memory_order_release);
+                BumpCpuGen(raised); // sotc: after the bits are set (see CpuGenSum)
             }
         }
         const auto write_op = GetPageOp<Type::CPU>(cpu_op);
@@ -206,6 +208,20 @@ public:
         if constexpr (locked) {
             mutex.unlock();
         }
+    }
+
+    /// sotc: BbToggle::BufferBindMemo. Generation of the CPU bits of the 256 KiB words
+    /// [first_word, first_word + count): the sum of per-word counters, each bumped (release) by
+    /// ChangeRegionState right after bits of that word went 0 -> 1. CPU bits rise nowhere else
+    /// (region creation sets them all, but a region cannot be remembered before it exists), so a
+    /// sum equal to one read before an unlocked "no CPU-modified page" look proves the look still
+    /// holds. The counters only grow, so equal sums mean equal counters.
+    u64 CpuGenSum(u64 first_word, u64 count) const noexcept {
+        u64 sum = 0;
+        for (u64 i = first_word; i < first_word + count; ++i) {
+            sum += cpu_word_gen[i].load(std::memory_order_acquire);
+        }
+        return sum;
     }
 
     template <Type type, StateOp cpu_op, StateOp gpu_op, bool locked = true>
@@ -348,6 +364,12 @@ public:
 private:
     static_assert(NUM_REGION_WORDS == 64);
     std::atomic<u64> sweep_words{~0ULL}; // sotc: see TakeSweepWords
+    std::array<std::atomic<u32>, NUM_REGION_WORDS> cpu_word_gen{}; // sotc: see CpuGenSum
+    void BumpCpuGen(u64 raised_words) noexcept {
+        for (; raised_words; raised_words &= raised_words - 1) {
+            cpu_word_gen[std::countr_zero(raised_words)].fetch_add(1, std::memory_order_release);
+        }
+    }
     void ResetGrace() {
         fault_cur.Fill(0);
         fault_prev.Fill(0);

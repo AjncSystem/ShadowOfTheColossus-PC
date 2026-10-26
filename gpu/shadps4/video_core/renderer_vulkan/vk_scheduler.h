@@ -172,7 +172,12 @@ struct DynamicState {
     /// Invalidates all dynamic state to be flushed into the next command buffer.
     void Invalidate() {
         std::memset(&dirty_state, 0xFF, sizeof(dirty_state));
+        ++invalidations;
     }
+
+    /// sotc: how many times the state was invalidated (a new command buffer, or a pass that bound
+    /// its own pipeline): memos of per-command-buffer state (vertex input) drop with it.
+    u32 invalidations{};
 
     void SetViewports(const Viewports& viewports_) {
         if (!std::ranges::equal(viewports, viewports_)) {
@@ -399,7 +404,10 @@ public:
     void PopPendingOperations();
 
     /// Starts a new rendering scope with provided state.
-    void BeginRendering(const RenderState& new_state);
+    /// sotc: a non-zero token names a state a caller replays unchanged (BbToggle::DepthFastPath):
+    /// when the scope in progress was begun with that token the state is the same one, no
+    /// comparison needed.
+    void BeginRendering(const RenderState& new_state, u64 token = 0);
 
     /// Ends current rendering scope.
     void EndRendering();
@@ -530,6 +538,7 @@ private:
     std::condition_variable_any priority_pending_ops_cv;
     std::jthread priority_pending_ops_thread;
     RenderState render_state;
+    u64 render_state_token{}; ///< sotc: see BeginRendering
     bool is_rendering = false;
     vk::UniqueCommandPool ahead_pool;
     vk::CommandBuffer ahead_cmdbuf;

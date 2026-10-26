@@ -508,11 +508,8 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
     // frame, one after another, so while the GPU is idle anyway also bring along the other
     // regions read back recently ("hot" readbacks) that the GPU has modified since. The reads
     // that follow then find their data already on the CPU instead of each needing a sync.
-    // SOTC_RB_HOT=0: off, 1 (default): same arena and small regions only, 2: any existing arena,
-    // any size. sotc: off from 22 Oct, on again (mode 1) on 23 Oct with the late check in
-    // ApplyDownloads (pages the CPU wrote since the gather are skipped); the user's recipe (new
-    // area, reload the save, 3 times) stayed clean with it. Shrine idle 34.6 -> 43.3 FPS.
-    // Before that, without the check, those speculative copies landed on memory the game may have
+    // SOTC_RB_HOT=0 (default): off, 1: same arena and small regions only, 2: any existing arena,
+    // any size. sotc: off since 22 Oct. Those speculative copies land on memory the game may have
     // reused since: rainbow, striped garbage on the Shrine's stones after loading a save again, and
     // heap free lists corrupted (0x49500, the game closing "out of nowhere", once after 23 min idle
     // in the title demo); with them off the user's recipe (a new area, then reload the save, 3
@@ -521,7 +518,7 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
     // than it saved (42.7 / 23.5): copying it on the command processor thread.
     static const int hot_mode = [] {
         const char* v = std::getenv("SOTC_RB_HOT");
-        return v ? std::atoi(v) : 1;
+        return v ? std::atoi(v) : 0;
     }();
     const bool hot_enabled = hot_mode != 0;
     const auto now = std::chrono::steady_clock::now();

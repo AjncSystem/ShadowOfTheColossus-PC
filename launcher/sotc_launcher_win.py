@@ -618,8 +618,8 @@ def game_environment(s):
         # The engine cvar skipSplash=1: no opening logos and autosave notice (tabnul, AjncSystem #185).
         cvars.append('skipSplash=1')
     if s.get('skip_film'):
-        # +nointro: the engine's own switch (it also sets it when a button is held at start), no
-        # intro film before the menu.
+        # +nointro: the engine's developer switch (it also sets it when a button is held at start):
+        # no intro film and no title screen, the game goes straight in (user, 26 Oct).
         cvars.append('nointro')
     cvars += str(s.get('engine_cvars', '')).split()
     env['SOTC_CVARS'] = ' '.join(cvars)
@@ -1481,9 +1481,12 @@ class Launcher:
         self.check(f, 'skip_logos', _('Pular os logotipos de abertura', 'Skip the opening logos'),
                    _('Sem os logotipos (Sony, Japan Studio, Bluepoint) e o aviso de salvamento automático.',
                      'No logos (Sony, Japan Studio, Bluepoint) and no autosave notice.'))
-        self.check(f, 'skip_film', _('Pular o filme de abertura', 'Skip the intro film'),
-                   _('Sem o filme antes do menu principal. Com as duas opções o jogo abre direto no menu.',
-                     'No film before the main menu. With both options the game opens straight to the menu.'))
+        self.check(f, 'skip_film', _('Ir direto para o jogo (pula o filme e a tela Start)',
+                                     'Straight into the game (skips the film and the Start screen)'),
+                   _('A chave de desenvolvedor do jogo (+nointro): sem o filme e sem a tela de título. Para só '
+                     'pular o filme e parar na tela Start, deixe desligada e aperte um botão durante o filme.',
+                     "The game's developer switch (+nointro): no film and no title screen. To skip only the film "
+                     'and stop at the Start screen, leave it off and press a button during the film.'))
         self.section(f, _('Diagnóstico', 'Diagnostics'))
         self.check(f, 'debug_watch', _('Vigia da memória de texturas', 'Texture memory watch'),
                    _('Anota em user/events.log quando o jogo reaproveita memória de texturas ainda em uso. '

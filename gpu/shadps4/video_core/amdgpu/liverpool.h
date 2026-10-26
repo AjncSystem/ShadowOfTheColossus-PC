@@ -359,7 +359,9 @@ private:
         std::array<u32, 16> user_data; // ShaderParams::NumShaderUserData
         u32 num_user_data; // ~0u: no user data bound
         VAddr pgm_base;
-        std::vector<u32> flat;
+        u32 num_flat{0};
+        std::array<u32, 128> flat_inline{};
+        std::vector<u32> flat_overflow;
     };
     struct BackOp {
         enum class Kind : u8 { Func, Draw, DrawIndirect, Dispatch, DispatchIndirect };

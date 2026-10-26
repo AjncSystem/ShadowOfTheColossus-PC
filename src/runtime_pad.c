@@ -68,11 +68,12 @@ static uint8_t trigger(int16_t v) { int x=v>>7; return (uint8_t)(x<0 ? 0 : x>255
 static uint16_t touch_axis(float v, int max) {
     return (uint16_t)(v<=0.0f ? 0 : v>=1.0f ? max : (int)(v*max+0.5f));
 }
-/* side: 0 left, 1 right, 2 upper left corner (the debug menu with +RetailBuild=0). */
+/* side: 0 left, 1 right, 2 upper left corner (the debug menu with +RetailBuild=0), 3 lower right. */
 static void touch_click(PadData *d, int side) {
     d->buttons|=BTN_TOUCHPAD;
     d->touch_count=1;
     d->touches[0] = side==2 ? (PadTouch){.x=160,.y=80,.id=0}
+                  : side==3 ? (PadTouch){.x=1440,.y=800,.id=0}
                             : (PadTouch){.x=side ? 1440 : 480,.y=471,.id=0};
 }
 
@@ -92,16 +93,22 @@ static void debug_menu_combo(PadData *d) {
         return;
     }
     if (tap) {
-        if (d->timestamp<tap_until) { d->buttons|=tap; return; }
+        if (d->timestamp<tap_until) { d->buttons|=tap; if (tap & BTN_TOUCHPAD) touch_click(d,3); return; }
         tap=0;
     }
     if (!now) {
-        if (held && d->timestamp-since<150000) { tap=held; tap_until=d->timestamp+60000; d->buttons|=tap; }
+        if (held && d->timestamp-since<150000) {
+            tap=held; tap_until=d->timestamp+60000; d->buttons|=tap;
+            if (tap & BTN_TOUCHPAD) touch_click(d,3);
+        }
         held=0;
         return;
     }
     if (!held) { held=now; since=d->timestamp; }
     if (d->timestamp-since<150000) { d->buttons&=~both; d->touch_count=0; }
+    /* The debug build opens its menu on a touch at the middle left too (user, 26 Oct): Select
+     * alone touches the lower right, away from it. */
+    else if ((d->buttons & BTN_TOUCHPAD) && !d->touch_count) touch_click(d,3);
 }
 
 /* BB_GAMEPAD (the launcher's controller choice): its SDL GUID, or part of its name. Issue #15:

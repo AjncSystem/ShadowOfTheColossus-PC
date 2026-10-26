@@ -61,6 +61,20 @@ enum : std::uint64_t {
     SceneHalfRes = 1ull << 50, ///< live scaling also reduces the 960x540 post targets
     // sotc (Lote 3, 2026-10-25): set = the old path, clear (default) = the optimization. Bits 20
     // (flat copy swap) and 22 (image destroy worker) were measured without gain and removed.
+    // sotc (SIGUIENTE-LIMITE.md): bit 20 is reused for the command processor fast paths.
+    CpFastPaths = 1u << 20,        ///< set: the command processor walks every PM4 Nop packet through
+                                   ///< ProcessCommands and the opcode switch, and a draw reuses the
+                                   ///< previous pipeline only when no register chunk at all was
+                                   ///< written since (PipelineKeyMemo); clear: a run of Nop packets
+                                   ///< that does nothing (empty or unknown payload) is skipped
+                                   ///< without them, and the pipeline memo ignores the registers a
+                                   ///< draw packet itself writes (index type, counts, base, draw
+                                   ///< initiator, instance count), which no pipeline key reads; the
+                                   ///< per-packet ProcessCommands call is skipped when no ordered
+                                   ///< command is queued. SET BY DEFAULT (off: it did not move the
+                                   ///< frame time, see SIGUIENTE-LIMITE.md); SOTC_CP_FAST=1 or a
+                                   ///< BB_TOGGLE_FILE mask without the bit turns it on. Honoured
+                                   ///< live (Nops per command buffer, memo per draw).
     BpeGuardDiff = 1u << 21,       ///< set: ApplyDownloads builds BPE heap guards for every copy of
                                    ///< the batch and writes them all; clear: copies whose bytes
                                    ///< already equal guest memory are dropped first (nothing to

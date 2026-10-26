@@ -294,7 +294,7 @@ FPS_MODES = [('30', ('30 FPS (como no PS4)', '30 FPS (as on PS4)')),
 # game's page pool is low) or maximum (always fine; may close in very wide views in PS4 Pro mode).
 TEXTURES = [('off', ('Desligada', 'Off')),
             ('high', ('Alta (estável)', 'High (stable)')),
-            ('max', ('Máxima (nítida, pode fechar no modo Pro)', 'Maximum (sharp, may close in Pro mode)'))]
+            ('max', ('Máxima (nítida, experimental no modo Pro)', 'Maximum (sharp, experimental in Pro mode)'))]
 # Frame generation (bb-probe: SOTC_FRAMEGEN; F8 in game switches off / DLSS-G / FSR 3).
 FRAMEGEN = [('off', ('Desligada', 'Off')),
             ('auto', ('Automática (DLSS-G ou FSR 3, experimental)', 'Automatic (DLSS-G or FSR 3, experimental)')),
@@ -676,9 +676,10 @@ def game_environment(s):
     textures = s.get('textures') or 'high'
     if textures != 'off':
         env.setdefault('SOTC_LOD_LINGER', '1')
-    if textures == 'max' and env['SOTC_NEO'] == '1':
-        # sotc: in PS4 Pro mode "Maximum" exhausted the game's page pool within minutes at the
-        # Shrine (0x1a371, user, 22 Oct): High there.
+    # sotc: "Maximum" in PS4 Pro mode exhausted the game's page pool within minutes at the Shrine
+    # (0x1a371, 22 Oct) until tabnul's page allocator fix (sotc_modes.py POOL_FIX). Experimental
+    # there; SOTC_MAX_IN_PRO=0 brings back High.
+    if 'SOTC_MAX_IN_PRO=0' in str(s.get('extra_env', '')) and textures == 'max' and env['SOTC_NEO'] == '1':
         textures = 'high'
         env['SOTC_NOTE'] = 'Texture quality Maximum is not used in PS4 Pro mode: High'
     if textures == 'max':  # sotc: without the page pool switch (sotc_lod_stats.h)

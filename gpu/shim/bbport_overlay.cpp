@@ -505,11 +505,13 @@ void QuickSettings() {
     const int tex_level = !hq ? 0 : (live_low >= 0 ? live_low : EnvPoolLow()) > 0 ? 1 : 2;
     const char* tex_names[] = {T("Desligada", "Off"), T("Alta (estável)", "High (stable)"),
                                T("Máxima (nítida)", "Maximum (sharp)")};
-    // sotc: no "Maximum" in PS4 Pro mode: there it exhausted the game's page pool within minutes
-    // at the Shrine (0x1a371, user, 22 Oct).
+    // sotc: "Maximum" in PS4 Pro mode exhausted the game's page pool within minutes at the Shrine
+    // (0x1a371, 22 Oct) until tabnul's page allocator fix; experimental there. SOTC_MAX_IN_PRO=0
+    // blocks it again.
     static const bool neo = [] {
         const char* v = std::getenv("SOTC_NEO");
-        return v && v[0] == '1';
+        const char* allow = std::getenv("SOTC_MAX_IN_PRO");
+        return v && v[0] == '1' && allow && allow[0] == '0';
     }();
     if (ImGui::BeginCombo(T("Qualidade das texturas", "Texture quality"), tex_names[tex_level])) {
         for (int i = 0; i < 3; ++i) {

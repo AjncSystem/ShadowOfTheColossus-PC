@@ -1652,6 +1652,7 @@ void Rasterizer::OnSubmit() {
 }
 
 void Rasterizer::OnFence() {
+    ++VideoCore::g_sotc_fence_epoch;
     texture_cache.ProcessDownloadImages();
 }
 
@@ -2613,6 +2614,34 @@ u32 Rasterizer::CompositeUiIndex() {
     return first.info.pixel_format == vk::Format::eR16G16B16A16Sfloat ? 1 : 0;
 }
 
+
+// sotc: DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL serves the depth target (stencil writes) and the
+// sampling of its depth aspect, so both uses ask for the same stages and accesses: the image state
+// does not change from one draw to the next and the render pass is not ended for it.
+static constexpr vk::PipelineStageFlags2 kDepthReadOnlyStencilStages =
+    vk::PipelineStageFlagBits2::eAllCommands;
+static constexpr vk::AccessFlags2 kDepthReadOnlyStencilAccess =
+    vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+    vk::AccessFlagBits2::eShaderRead;
+
+bool Rasterizer::DepthSampledAsAttachment(VideoCore::ImageId image_id, const VideoCore::Image& image,
+                                          const VideoCore::TextureCache::ImageDesc& desc,
+                                          bool compute) const {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_DEPTH_RO");
+        return !v || v[0] != '0';
+    }();
+    if (!on || compute || !image.info.props.has_stencil || image_id != db_desc.first) {
+        return false;
+    }
+    if (!liverpool->DrawRegs().depth_control.stencil_enable || db_desc.second.view_info.is_storage) {
+        return false;
+    }
+    const vk::Format fmt = desc.view_info.format;
+    return Vulkan::LiverpoolToVK::IsFormatDepthCompatible(fmt) &&
+           !Vulkan::LiverpoolToVK::IsFormatStencilCompatible(fmt);
+}
+
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the pass
     image_bindings.clear();
@@ -2814,12 +2843,25 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
                         desc.view_info.range);
                 } else {
-                    const auto new_layout = image.info.props.is_depth
-                                                ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-                                                : vk::ImageLayout::eShaderReadOnlyOptimal;
-                    needs_barrier |= runtime.Transit(
-                        &image, new_layout, vk::PipelineStageFlagBits2::eAllCommands,
-                        vk::AccessFlagBits2::eShaderRead, desc.view_info.range);
+                    // sotc: the depth buffer the draw writes stencil to is also sampled (depth
+                    // aspect only): DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL allows both, so the
+                    // image stays in the layout the render target needs. Moving it to
+                    // DEPTH_STENCIL_READ_ONLY here and back in BeginRendering ended the render
+                    // pass at every such draw (~350 per frame in the Shrine). SOTC_DEPTH_RO=0 off.
+                    if (DepthSampledAsAttachment(image_id, image, desc,
+                                                 stage.sw_stage == Shader::SwStage::Compute)) {
+                        needs_barrier |= runtime.Transit(
+                            &image, vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal,
+                            kDepthReadOnlyStencilStages, kDepthReadOnlyStencilAccess,
+                            desc.view_info.range);
+                    } else {
+                        const auto new_layout = image.info.props.is_depth
+                                                    ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+                                                    : vk::ImageLayout::eShaderReadOnlyOptimal;
+                        needs_barrier |= runtime.Transit(
+                            &image, new_layout, vk::PipelineStageFlagBits2::eAllCommands,
+                            vk::AccessFlagBits2::eShaderRead, desc.view_info.range);
+                    }
                 }
             }
             image.usage.storage |= is_storage;
@@ -3119,12 +3161,21 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                                     ? vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal
                                 : has_stencil ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
                                               : vk::ImageLayout::eDepthReadOnlyOptimal;
-        needs_barrier |= runtime.Transit(&image, new_layout,
-                                         vk::PipelineStageFlagBits2::eEarlyFragmentTests |
-                                             vk::PipelineStageFlagBits2::eLateFragmentTests,
-                                         vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
-                                             vk::AccessFlagBits2::eDepthStencilAttachmentRead,
-                                         desc.view_info.range);
+        static const bool depth_ro = [] {
+            const char* v = std::getenv("SOTC_DEPTH_RO");
+            return !v || v[0] != '0';
+        }();
+        if (depth_ro && new_layout == vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal) {
+            needs_barrier |= runtime.Transit(&image, new_layout, kDepthReadOnlyStencilStages,
+                                             kDepthReadOnlyStencilAccess, desc.view_info.range);
+        } else {
+            needs_barrier |= runtime.Transit(&image, new_layout,
+                                             vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                                                 vk::PipelineStageFlagBits2::eLateFragmentTests,
+                                             vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+                                                 vk::AccessFlagBits2::eDepthStencilAttachmentRead,
+                                             desc.view_info.range);
+        }
 
         state.width = std::min<u32>(state.width, image.info.size.width);
         state.height = std::min<u32>(state.height, image.info.size.height);

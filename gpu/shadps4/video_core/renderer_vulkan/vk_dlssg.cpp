@@ -1351,9 +1351,17 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
         sr_prev = false;
         return {};
     }
+    // sotc: DLSS upscales 2x at most; the post-process pass scales the rest. PS4 Pro mode at 4K
+    // hands it 1600x900: to 2160p no mode takes that height, NGX refused every evaluate
+    // (0xbad00005) and the screen stayed black (26 Oct). The launcher's render sizes are 2x or less.
+    u32 out_w = width, out_h = height;
+    if (f.width * 2 < width || f.height * 2 < height) {
+        out_w = f.width * 2;
+        out_h = f.height * 2;
+    }
     sl::FrameToken* token = Token(f.index);
-    if (!token || !SetSrOptions(f.width, f.height, width, height) ||
-        !EnsureSrImage(sr_out, vk::Format::eR16G16B16A16Sfloat, width, height)) {
+    if (!token || !SetSrOptions(f.width, f.height, out_w, out_h) ||
+        !EnsureSrImage(sr_out, vk::Format::eR16G16B16A16Sfloat, out_w, out_h)) {
         sr_prev = false;
         return {};
     }
@@ -1392,7 +1400,7 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
                               Layout::eShaderReadOnlyOptimal, sr_color.format, f.width, f.height,
                               true);
     sl::Resource out = SlImage(sr_out.image, sr_out.memory, sr_out.view, Layout::eGeneral,
-                               sr_out.format, width, height, true);
+                               sr_out.format, out_w, out_h, true);
     sl::Resource depth = SlImage(f.depth, f.depth_memory, f.depth_view,
                                  Layout::eShaderReadOnlyOptimal, f.depth_format, f.width, f.height,
                                  false);
@@ -1401,7 +1409,7 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
     sl::Resource bias = SlImage(f.bias, f.bias_memory, f.bias_view, Layout::eShaderReadOnlyOptimal,
                                 vk::Format::eR8G8B8A8Unorm, f.width, f.height, true);
     const sl::Extent in_extent{0, 0, f.width, f.height};
-    const sl::Extent out_extent{0, 0, width, height};
+    const sl::Extent out_extent{0, 0, out_w, out_h};
     constexpr auto life = sl::ResourceLifecycle::eValidUntilPresent;
     std::array tags{
         sl::ResourceTag{&in, sl::kBufferTypeScalingInputColor, life, &in_extent},
@@ -1445,8 +1453,8 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
     });
     static bool reported = false;
     if (!std::exchange(reported, true)) {
-        std::fprintf(stderr, "SOTC DLSS: upscaling %ux%u -> %ux%u\n", f.width, f.height, width,
-                     height);
+        std::fprintf(stderr, "SOTC DLSS: upscaling %ux%u -> %ux%u\n", f.width, f.height, out_w,
+                     out_h);
     }
     sr_prev = true;
     // Debug: SOTC_DLSS_VIEW=input shows DLSS's colour input (render size, stretched).
@@ -1457,7 +1465,8 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
     if (view_input) {
         return {sr_color.view, ui_view, {}, ui_full};
     }
-    return {sr_out.view, ui_view, sky_bias_written ? f.bias_view : vk::ImageView{}, ui_full};
+    return {sr_out.view, ui_view, sky_bias_written ? f.bias_view : vk::ImageView{}, ui_full, false,
+            out_w, out_h};
 }
 
 // Streamline asks for vsync off with Vulkan, but DLSS-G generates and paces its frames in

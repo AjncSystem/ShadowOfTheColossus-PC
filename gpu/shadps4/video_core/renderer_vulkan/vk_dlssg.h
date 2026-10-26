@@ -108,7 +108,7 @@ struct Upscaled {
     vk::ImageView sky;   ///< render size, g = 1 in the sky; empty without camera motion fill
     bool ui_full{};      ///< ui is at the output size (UiTarget)
     bool scene_low{};    ///< scene is the render size scene (no DLSS inputs): scale it
-    u32 scene_width{}, scene_height{};
+    u32 scene_width{}, scene_height{}; ///< scene size (DLSS: below the output when it went 2x)
 };
 
 /// Command processor thread, in PrepareFrame after PrepareInputs: DLSS upscales this frame's

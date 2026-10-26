@@ -830,6 +830,15 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             if (DebugState.is_using_fsr) {
                 scene_size = {frame->width, frame->height};
             }
+        } else if (upscaled.scene_width &&
+                   (upscaled.scene_width != frame->width || upscaled.scene_height != frame->height)) {
+            // sotc: DLSS went 2x (PS4 Pro mode at 4K: 1600x900 -> 3200x1800): FSR 1 the rest
+            scene_size = {upscaled.scene_width, upscaled.scene_height};
+            scene = fsr_pass.Render(cmdbuf, scene, scene_size, {frame->width, frame->height},
+                                    fsr_settings, false);
+            if (DebugState.is_using_fsr) {
+                scene_size = {frame->width, frame->height};
+            }
         } else if (sharpness >= 0.0f) {
             scene = fsr_pass.Sharpen(cmdbuf, scene, {frame->width, frame->height}, sharpness);
         }

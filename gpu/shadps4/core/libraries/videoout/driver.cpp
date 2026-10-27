@@ -56,6 +56,8 @@ extern "C" void runtime_memory_region_stats(uint64_t* slow, uint64_t* slow_draw,
                                                   uint64_t* verified, uint64_t* mismatch,
                                                   uint64_t* threads, uint64_t* bytes);
 
+extern "C" void runtime_memory_protect_stats(uint64_t out[4]);
+
 namespace Libraries::VideoOut {
 
 // sotc: printf into the SOTC_FPS report, which is written to stderr in one go.
@@ -954,6 +956,18 @@ void VideoOutDriver::Flip(const Request& req) {
                                  "%.1f ms/s)\n",
                                  lock_waits / seconds, lock_ns / 1e6 / seconds,
                                  lock_waits_draw / seconds, lock_ns_draw / 1e6 / seconds);
+                }
+            }
+            // sotc: host protect calls of the GPU side (src/runtime_memory.c), QPC ticks of 100 ns.
+            {
+                uint64_t ps[4];
+                runtime_memory_protect_stats(ps);
+                if (ps[0]) {
+                    ReportPrintf(report,
+                                 "SOTC host protect: %.0f calls/s, %.1f ms/s (draw thread: %.0f/s, "
+                                 "%.1f ms/s)\n",
+                                 ps[0] / seconds, ps[1] / 1e4 / seconds, ps[2] / seconds,
+                                 ps[3] / 1e4 / seconds);
                 }
             }
             // sotc: guest region lookups that took the table lock (src/runtime_memory.c, C2 in

@@ -1897,7 +1897,17 @@ void runtime_memory_describe(uintptr_t address, char *out, size_t capacity) {
     snprintf(out,capacity,"vma kind %d prot %#x [%#llx,%#llx), host protect %#lx",kind,prot,
              (unsigned long long)start,(unsigned long long)end,host);
 }
+/* sotc: SOTC_FPS=1: time of the host protect calls of the GPU side (QPC ticks), all threads and the
+ * draw thread alone; read and cleared by runtime_memory_protect_stats (the FPS report). */
+static uint64_t protect_stat[4]; /* calls, ticks, draw calls, draw ticks */
+static int protect_stat_on = -1;
+void runtime_memory_protect_stats(uint64_t out[4]) {
+    for (int i=0;i<4;++i) out[i]=__atomic_exchange_n(&protect_stat[i],0,__ATOMIC_RELAXED);
+}
 void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int write) {
+    if (protect_stat_on<0) { const char *v=getenv("SOTC_FPS"); protect_stat_on=v && v[0]=='1'; }
+    LARGE_INTEGER t0,t1;
+    if (protect_stat_on) QueryPerformanceCounter(&t0);
     read_lock();
     for (size_t i=vma_index(address); i<vma_count && vmas[i].start<address+size; ++i) {
         if (vmas[i].kind==KIND_RESERVED) continue;
@@ -1908,6 +1918,16 @@ void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int 
         host_protect(a,b-a,guest & want);
     }
     read_unlock();
+    if (protect_stat_on) {
+        QueryPerformanceCounter(&t1);
+        uint64_t d=(uint64_t)(t1.QuadPart-t0.QuadPart);
+        __atomic_add_fetch(&protect_stat[0],1,__ATOMIC_RELAXED);
+        __atomic_add_fetch(&protect_stat[1],d,__ATOMIC_RELAXED);
+        if (lock_draw_thread==GetCurrentThreadId()) {
+            __atomic_add_fetch(&protect_stat[2],1,__ATOMIC_RELAXED);
+            __atomic_add_fetch(&protect_stat[3],d,__ATOMIC_RELAXED);
+        }
+    }
 }
 /* Host view of a guest range, for the GPU backend: the range must be mapped. */
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size) {

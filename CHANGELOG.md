@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.60.6-plus16 — 2026-10-27 (fork Lucas-blip-png)
+- **Barras de vida e stamina em telas 21:9 e mais largas (#301, #202, #145, #315):** o objeto de tela do HUD mantém o aspecto 16:9
+  (pedaço cinza na barra de vida) e os dois retângulos de 1920 de largura da barra de stamina são escalados (a barra amarela parava
+  antes do círculo e enchia ao contrário). Trabalho de AjncSystem (0.60.6-C2), confirmado por testes dele e do usuário em 2560x1080;
+  os commits entraram com a autoria original. `SOTC_WIDE_ASPECT=1` (teste) e `SOTC_RENDER_KEEP` ajudam a achar outros pontos do HUD.
+  Não testado aqui em tela larga de verdade (só a geração dos patches e a rota de 3840x1080 sem queda).
+- **Cache de shaders em um arquivo só** (`cache.sotcpack`, `SOTC_CACHE_PACK=0` desliga), também de AjncSystem (82229db): em HD, os
+  ~12 mil arquivos pequenos levavam de 30 a 100 s para ler quando o Windows os tirava do cache de arquivos. O arquivo (~200 MB) é
+  criado em segundo plano na primeira abertura.
+- Correção: `sotc_modes.py` faltava `import os` depois de trazer o commit da C2 (quebraria toda abertura).
+
 ## 0.60.6-plus15 — 2026-10-27 (fork Lucas-blip-png)
 - **Sombras do sol desligáveis no lançador** (efeitos visuais → "Sombras do sol", `r_enableCascadeShadows=0`): ideia e medição de
   4isaque4 (#294), com repetição intercalada: +34% de FPS a 720p numa Ryzen 7 5700X + RX 6700 XT, sem sombras do sol. Vem ligado.

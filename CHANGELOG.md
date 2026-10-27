@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.60.6-plus17 — 2026-10-27 (fork Lucas-blip-png)
+- **Correção urgente: o lançador fechava ao abrir nas versões plus15 e plus16** (`KeyError: 'fx_sunshadows'`, relato de geosaw616 no #316).
+  A opção "Sombras do sol" tinha entrado sem valor padrão. Agora tem, e um teste confere que todo efeito do lançador tem padrão.
+  Quem está no plus15 ou no plus16 deve baixar esta versão (o atualizador do lançador não abre nelas).
+
 ## 0.60.6-plus16 — 2026-10-27 (fork Lucas-blip-png)
 - **Barras de vida e stamina em telas 21:9 e mais largas (#301, #202, #145, #315):** o objeto de tela do HUD mantém o aspecto 16:9
   (pedaço cinza na barra de vida) e os dois retângulos de 1920 de largura da barra de stamina são escalados (a barra amarela parava

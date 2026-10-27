@@ -1345,6 +1345,22 @@ bool PipelineCache::RefreshGraphicsStages() {
     return true;
 }
 
+void PipelineCache::PrefetchComputeProgram() {
+    if (async_workers.empty() || EmulatorSettings.IsShaderCollect() ||
+        pending_programs.size() >= 512) {
+        return;
+    }
+    const auto params = AmdGpu::GetParams(liverpool->GetCsRegs());
+    if (program_cache.contains(params.hash) || in_place_programs.contains(params.hash) ||
+        !pending_programs.insert(params.hash).second) {
+        return;
+    }
+    Shader::Backend::Bindings binding{};
+    const auto& rt = BuildRuntimeInfo(HwStage::Compute, SwStage::Compute);
+    QueueAsyncTranslate(HwStage::Compute, SwStage::Compute, params, rt, binding, nullptr, nullptr,
+                        0);
+}
+
 bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
@@ -1361,6 +1377,25 @@ bool PipelineCache::RefreshComputeKey() {
             CollectAsyncPipelines();
         }
         translation_pending = false;
+    }
+    if (!async_ok && pending_programs.contains(cs_params.hash)) {
+        // sotc: queued by PrefetchComputeProgram: wait for the worker instead of translating again.
+        const auto wait_start = std::chrono::steady_clock::now();
+        const auto give_up = wait_start + std::chrono::seconds(2);
+        while (pending_programs.contains(cs_params.hash) &&
+               std::chrono::steady_clock::now() < give_up) {
+            if (async_done_count.load(std::memory_order_acquire) != 0) {
+                CollectAsyncPipelines();
+            } else {
+                std::this_thread::yield();
+            }
+        }
+        const auto waited = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - wait_start).count();
+        if (waited > 3.0) {
+            LOG_INFO(Render_Vulkan, "SOTC PREFETCH waited {:.1f} ms for compute {:#x}", waited,
+                     cs_params.hash);
+        }
     }
     std::tie(infos[0], modules[0], compute_key.value) =
         GetProgram(HwStage::Compute, SwStage::Compute, cs_params, binding, async_ok);

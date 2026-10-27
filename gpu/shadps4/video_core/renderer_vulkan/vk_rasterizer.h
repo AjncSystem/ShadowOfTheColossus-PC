@@ -88,6 +88,10 @@ public:
     /// PrimitiveType::None would not even build).
     bool IsDrawFilteredOut() const;
     const Pipeline* LookupComputePipeline();
+    /// sotc: queues the translation of the compute program in the current compute registers.
+    void PrefetchComputeProgram() {
+        pipeline_cache.PrefetchComputeProgram();
+    }
     bool IsGpuSideThread() const;
     void PrepareGpuSideFault();
     bool RunsGpuWorkElsewhere() const;

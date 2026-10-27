@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC native port · v0.60.6-plus19
+# Shadow of the Colossus — PC native port · v0.60.6-plus20
 
 **The original 0.60.6, plus CPUs without BMI1 (pre-Haswell), CPUs with 4 threads, 120 Hz
 fullscreen, a 32-lane fix for AMD GCN cards (RX 470–590, to test), and the FSR 3.1 and DLSS 4.5 upscalers (NVIDIA RTX).** Everything in [AjncSystem's 0.60.6](https://github.com/AjncSystem/ShadowOfTheColossus-PC)
@@ -210,7 +210,8 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
-| **0.60.6-plus19** | **Lucas-blip-png fork:** adjustable grass (tabnul, AjncSystem, Oussama Afassi), launcher presets, long-path warning, exit diagnostics, flexible-memory split fix. |
+| **0.60.6-plus20** | **Lucas-blip-png fork:** shorter cold shader cache: new compute shaders are translated ahead, in parallel, on the pipeline workers (worst frame of the desert route with an empty cache 493-618 ms to 174 ms). |
+| 0.60.6-plus19 | **Lucas-blip-png fork:** adjustable grass (tabnul, AjncSystem, Oussama Afassi), launcher presets, long-path warning, exit diagnostics, flexible-memory split fix. |
 | 0.60.6-plus18 | **Lucas-blip-png fork:** adjustable field of view in the launcher (100-140%, `SOTC_FOV_SCALE`, #179); in-game vibration toggle (AjncSystem). |
 | 0.60.6-plus17 | **Lucas-blip-png fork:** hotfix: the launcher closed on start in plus15 and plus16 (`KeyError: 'fx_sunshadows'`, #316, reported by geosaw616). |
 | **0.60.6-plus16** | **Lucas-blip-png fork:** health and stamina bars in 21:9 and wider (#301, #202, #145; AjncSystem's 0.60.6-C2 work, original authorship kept); shader cache read from one pack file (`cache.sotcpack`, AjncSystem), faster boots on hard disks. |

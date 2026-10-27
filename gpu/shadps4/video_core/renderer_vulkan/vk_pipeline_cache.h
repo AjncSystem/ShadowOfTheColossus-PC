@@ -105,6 +105,9 @@ public:
 
     const ComputePipeline* GetComputePipeline();
 
+    /// sotc: command processor only; translates the current compute program on a worker.
+    void PrefetchComputeProgram();
+
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule, u64>;
     /// sotc: async_ok: a stage that needs translating is queued for a pipeline worker instead
     /// (SOTC_ASYNC_TRANSLATE); it returns a null Info and sets translation_pending meanwhile.

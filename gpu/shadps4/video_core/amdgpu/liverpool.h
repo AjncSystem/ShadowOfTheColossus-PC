@@ -385,6 +385,9 @@ private:
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
     Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb);
     Task ProcessCeUpdate(std::span<const u32> ccb);
+    void PrefetchComputePrograms(std::span<const u32> cmds, s32 qid,
+                                 ComputeProgram* shadow_in = nullptr, int depth = 0);
+    std::vector<std::pair<uintptr_t, uintptr_t>> prefetch_ranges; ///< CP only
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
 

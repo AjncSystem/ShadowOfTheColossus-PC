@@ -42,3 +42,14 @@ esperar o worker só nos computes de execução única.
 - O único caminho sem risco que sobra é traduzir à frente: varrer o buffer de comandos antes de executá-lo, achar os pares `COMPUTE_PGM` + `DISPATCH` e traduzir todos em paralelo nos workers, esperando o resultado no dispatch. Exige reproduzir o estado dos registradores e dos dados de usuário que a tradução lê; fica como trabalho futuro.
 - O cache só é frio na primeira abertura, depois de uma mudança do recompilador (a versão do cache subiu duas vezes em 10 dias) ou da placa/driver.
 
+## Traduzir à frente (28/10, plus20)
+`Liverpool::PrefetchComputePrograms` varre cada buffer de comandos (graphics e ASC) ao começar a executá-lo, segue os `IndirectBuffer`
+(até 2 níveis, só endereços mapeados, no máximo 65536 dwords) e mantém uma cópia dos registradores de compute a partir dos `SetShReg`.
+Em cada `Dispatch*` chama `PipelineCache::PrefetchComputeProgram`, que enfileira a tradução nos workers (até 512 pendentes). Em
+`RefreshComputeKey`, se o programa está pendente, o dispatch espera o worker (no máximo 2 s) em vez de traduzir.
+- Rota do deserto largo, cache apagado: pior quadro 493-618 ms (shader 360-470) para 174 ms (shader 6); computes compilados na thread de
+  comandos 178 para 24; 5 quadros acima de 50 ms (antes 4-9, os restantes são cópia de ~250 MB e outros custos, não shader).
+- Com o limite de 64 pendentes a rajada estourava (150 computes ficavam de fora); 512 cobre a rajada medida (586 programas).
+- Santuário com cache frio e quente: mesmo céu e mesma névoa (luminância média 86,4 e 85,2).
+- Um quadro de 346 ms de `readback` no run quente (rota do deserto, `RepairStuckWriteFault` no log) não tem relação: o cache quente
+  não enfileira nada.

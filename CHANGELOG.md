@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.60.6-plus20 — 2026-10-27 (fork Lucas-blip-png)
+- **Cache de shaders frio mais curto (tradução à frente de compute):** antes de executar um buffer de comandos, o processador de comandos
+  varre os pacotes (seguindo os buffers indiretos), acha os `COMPUTE_PGM` + `DISPATCH` e manda traduzir os shaders de compute novos nos
+  workers, em paralelo; o dispatch espera o resultado em vez de traduzir de novo. Nada é descartado nem refeito (a versão assíncrona
+  antiga perdia dispatches de execução única, como a névoa do Santuário). Se a previsão errar, só nasce uma permutação a mais. Rota do
+  deserto largo com o cache apagado (3840x1080, 5700X): pior quadro de 493-618 ms para 174 ms, tempo de shader no pior quadro de 360-470 ms
+  para 6 ms; 150 computes que antes compilavam na thread de comandos passaram para 24. Com o cache quente não muda nada. `SOTC_PREFETCH_COMPUTE=0`
+  desliga. O cache de shaders não é invalidado.
+
 ## 0.60.6-plus19 — 2026-10-27 (fork Lucas-blip-png)
 - **Grama ajustável** (distância, altura, mato, detalhe e fade; menu da grama dentro do jogo; buffers de grama 4x maiores): trabalho de
   tabnul (197754f), AjncSystem (30002ea: o menu mostra o valor do jogo em vez de 0) e Oussama Afassi (teste do lançador, #94), trazidos do

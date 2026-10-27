@@ -1225,8 +1225,105 @@ static inline bool IsInertNop(const PM4Header* header, bool markers_matter) {
     }
 }
 
+// sotc: SOTC_PREFETCH_COMPUTE=0 disables. Scans a command buffer before it runs and queues the translation of
+// the compute programs it dispatches on the pipeline workers, so the burst of new shaders that
+// follows entering an area translates in parallel instead of one after another on the command
+// processor. The dispatch itself still looks its program up as before (and waits for the queued
+// job). A program the scan got wrong only adds a permutation; nothing here changes guest state.
+void Liverpool::PrefetchComputePrograms(std::span<const u32> cmds, s32 qid,
+                                        ComputeProgram* shadow_in, int depth) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_PREFETCH_COMPUTE");
+        return !v || v[0] != '0';
+    }();
+    if (!enabled || !rasterizer) {
+        return;
+    }
+    // Nested buffers run as their own tasks and enter here again: a range the scan of the
+    // submission already walked is skipped. Indirect buffers are followed (SotC dispatches
+    // from one per batch), so the whole submission is seen from its first command.
+    const auto lo = reinterpret_cast<uintptr_t>(cmds.data());
+    const auto hi = lo + cmds.size_bytes();
+    if (!shadow_in) {
+        for (const auto& [a, b] : prefetch_ranges) {
+            if (lo >= a && lo < b) {
+                return;
+            }
+        }
+        prefetch_ranges.clear();
+    }
+    prefetch_ranges.emplace_back(lo, hi);
+    ComputeProgram local_shadow;
+    if (!shadow_in) {
+        local_shadow = mapped_queues[qid].cs_state;
+    }
+    auto& shadow = shadow_in ? *shadow_in : local_shadow;
+    u64 last_addr = ~0ull;
+    size_t scanned = 0;
+    while (!cmds.empty() && scanned < (1u << 16)) {
+        const auto* header = reinterpret_cast<const PM4Header*>(cmds.data());
+        if (header->type == 2) {
+            cmds = cmds.subspan(1);
+            ++scanned;
+            continue;
+        }
+        if (header->type != 3) {
+            return;
+        }
+        const size_t size = header->type3.NumWords() + 1;
+        if (size > cmds.size()) {
+            return;
+        }
+        switch (header->type3.opcode) {
+        case PM4ItOpcode::SetShReg: {
+            const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+            const auto set_size = (header->type3.NumWords() - 1) * sizeof(u32);
+            if (set_data->reg_offset >= 0x200 &&
+                set_data->reg_offset <= (0x200 + sizeof(ComputeProgram) / 4) &&
+                set_size <= sizeof(ComputeProgram) -
+                                (set_data->reg_offset - 0x200) * sizeof(u32)) {
+                std::memcpy(reinterpret_cast<u32*>(&shadow) + (set_data->reg_offset - 0x200),
+                            header + 2, set_size);
+            }
+            break;
+        }
+        case PM4ItOpcode::IndirectBuffer: {
+            const auto* ib = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+            const auto* addr = ib->Address<const u32>();
+            if (depth < 2 && ib->ib_size != 0 &&
+                rasterizer->IsMapped(reinterpret_cast<VAddr>(addr), ib->ib_size * sizeof(u32))) {
+                PrefetchComputePrograms({addr, ib->ib_size}, qid, &shadow, depth + 1);
+            }
+            break;
+        }
+        case PM4ItOpcode::DispatchDirect:
+        case PM4ItOpcode::DispatchIndirect: {
+            const u64 code = shadow.address;
+            if (code == 0 || code == last_addr || !rasterizer->IsMapped(code << 8, 256)) {
+                break;
+            }
+            last_addr = code;
+            auto& live = mapped_queues[qid].cs_state;
+            const auto saved = live;
+            const auto saved_qid = curr_qid;
+            live = shadow;
+            curr_qid = qid;
+            rasterizer->PrefetchComputeProgram();
+            live = saved;
+            curr_qid = saved_qid;
+            break;
+        }
+        default:
+            break;
+        }
+        cmds = cmds.subspan(size);
+        scanned += size;
+    }
+}
+
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
     FIBER_ENTER(dcb_task_name);
+    PrefetchComputePrograms(dcb, GfxQueueId);
 
     cblock.Reset();
 
@@ -2041,6 +2138,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
+    PrefetchComputePrograms(acb, vqid + 1);
     auto& queue = asc_queues[{vqid}];
 
     struct IndirectPatch {

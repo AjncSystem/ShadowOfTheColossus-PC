@@ -1,6 +1,7 @@
 # Changelog
 
-## Não lançado
+## 0.60.6-plus21 — 2026-10-28 (fork Lucas-blip-png)
+- **Diagnóstico:** com `SOTC_FPS=1` o relatório de FPS mostra quantas chamadas de proteção de página o lado da GPU faz por segundo e quanto tempo gastam (total e na thread de desenho). Sem efeito fora do diagnóstico.
 - **Último recurso de buffer em RAM:** o fallback dos buffers (`buffer.cpp`) pedia dois flags de acesso do host ao mesmo tempo num buffer HostCached (RANDOM mais SEQUENTIAL), o que a VMA recusa; a última tentativa nunca podia dar certo. Agora troca um pelo outro. Visto no #319 (RX 7600, aborto de 0x17 com 6 GB de RAM livres: "Failed allocating HostCached buffer of 64 KB"). Não reproduzi; é uma correção de código sem prova de que era a causa única.
 - **Mapeamento fixo sobre memória viva avisa a GPU:** `place()` com `MAP_FIXED` apagava as áreas antigas sem mandar o `HOOK_UNMAP`, então o lado da GPU podia manter buffers e imagens do conteúdo antigo. Agora o aviso sai antes, como no `unmap`. Não consegui provar que isso causava as quedas de #283/#289/#255 (sem reprodução); a rota do deserto (2 passadas, 78 e 86 FPS) e as quedas não mudaram.
 

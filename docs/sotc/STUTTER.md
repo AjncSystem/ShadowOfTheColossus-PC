@@ -25,3 +25,13 @@ esperar o worker só nos computes de execução única.
 - Pipelines gráficos síncronos: só "tiny draw" (passes de tela cheia), 1–7 ms cada, um de 76 ms na primeira vez.
 - Evicção de arenas e GC: 0 ms nas rotas medidas (8 GB de VRAM não chegam ao limite).
 - Os 1% lows de ~39 FPS do deserto são cenas pesadas (> 5000 comandos por quadro), não engasgos.
+
+## Medições de 27/10 (0.60.6-plus18/19, Santuário parado, Ryzen 7 5700X, RTX 5060 Ti)
+
+- **Frame pacing:** Mailbox 70,5 e 71,7 FPS contra FIFO 69,4 e 71,7 (ordem M F F M); p50 16,2 ms e p99 19 a 26 ms nos dois. Sem diferença: Mailbox continua o padrão.
+- **Escala por CPUs** (afinidade 0x55, 0x555, 0x5555, 0xffff, um núcleo por CPU): 4 CPUs 56 FPS, 6 CPUs 65, 8 CPUs 70, 16 CPUs 73. Com 4 CPUs eram 34 FPS antes da prioridade de threads.
+- **`SOTC_RB_HOT`:** 0 = 53 FPS, 1 = 74 a 75,5, 2 = 72,5 a 74,1. O padrão 1 fica.
+- **Perfil da `GpuDraw`:** plano. `BindResources` 17,5% (soma de vários trechos inlined), `BackLoop` 11,8% (espera), `ObtainBuffer` 7%, nenhum trecho único acima de 3%. Draw ocupada 11,5 ms de 13,5 ms por quadro (85%), comando 8,2 ms, gravação 5,8 ms.
+- **Rota do deserto a 3840x1080 (196 s, cache quente):** 0 quadros acima de 50 ms, VRAM 3,4 de 6,2 GB com texturas Alta. Textura Máxima não foi medida.
+- Cache frio e compilação assíncrona de compute: continua como na seção anterior (a versão assíncrona perdia despachos de uma vez só e fica desligada).
+

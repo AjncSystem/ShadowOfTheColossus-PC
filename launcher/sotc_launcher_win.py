@@ -316,6 +316,15 @@ TEXTURES = [('off', ('Desligada', 'Off')),
             ('high', ('Alta (estável)', 'High (stable)')),
             ('max', ('Máxima (nítida, experimental no modo Pro)', 'Maximum (sharp, experimental in Pro mode)'))]
 # Frame generation (bb-probe: SOTC_FRAMEGEN; F8 in game switches off / DLSS-G / FSR 3).
+# One-click settings for the Display & FPS page (the player can still change each one after).
+QUALITY_PRESETS = {
+    'compat': {'af16': False, 'textures': 'off', 'fps_mode': '30', 'upscaler': 'fsr1', 'render_preset': 'native',
+               'framegen': 'off', 'fov': '100'},
+    'balanced': {'af16': True, 'textures': 'high', 'fps_mode': '60', 'upscaler': 'fsr3', 'render_preset': 'quality',
+                 'framegen': 'off'},
+    'performance': {'af16': True, 'textures': 'high', 'fps_mode': '60', 'upscaler': 'fsr3',
+                    'render_preset': 'performance', 'framegen': 'off'},
+}
 FRAMEGEN = [('off', ('Desligada', 'Off')),
             ('auto', ('Automática (DLSS-G ou FSR 3, experimental)', 'Automatic (DLSS-G or FSR 3, experimental)')),
             ('dlss', ('NVIDIA DLSS-G (RTX 40/50)', 'NVIDIA DLSS-G (RTX 40/50)')),
@@ -1281,11 +1290,28 @@ class Launcher:
                    _('O jogo abre direto no menu, sem os logotipos de abertura e o aviso de salvamento automático.',
                      'The game opens straight to the menu, without the opening logos and the autosave notice.'))
 
+    def apply_quality_preset(self, name):
+        for key, value in QUALITY_PRESETS[name].items():
+            if key in APP_DEFAULTS:
+                self.var(key).set(value)
+
     def build_graphics(self):
         f = self.scrolled_page('graphics', _('Imagem e FPS', 'Display & FPS'),
                                _('Os modos vêm do fork shadPS4 SotC e valem para as versões EU 1.01 e US 1.00.',
                                  'The modes come from the shadPS4 SotC fork and apply to EU version 1.01 and US '
                                  'version 1.00.'))
+        self.section(f, _('Predefinições', 'Presets'), top=4)
+        bar = self.ttk.Frame(f)
+        for key, label in (('compat', _('Compatibilidade', 'Compatibility')), ('balanced', _('Equilibrado', 'Balanced')),
+                           ('performance', _('Desempenho', 'Performance'))):
+            self.ttk.Button(bar, text=label, command=lambda k=key: self.apply_quality_preset(k)).pack(side='left', padx=(0, 8))
+        self.row(f, _('Aplicar', 'Apply'), bar,
+                 _('Compatibilidade: 30 FPS, sem upscaler, texturas desligadas (o mais leve e seguro). Equilibrado: 60 FPS, '
+                   'FSR 3.1 Qualidade, texturas altas. Desempenho: 60 FPS, FSR 3.1 Desempenho (2x). Mexem só nesta página; '
+                   'você pode ajustar cada opção depois.',
+                   'Compatibility: 30 FPS, no upscaler, textures off (lightest and safest). Balanced: 60 FPS, FSR 3.1 '
+                   'Quality, high textures. Performance: 60 FPS, FSR 3.1 Performance (2x). They only change this page; '
+                   'you can adjust each option afterwards.'))
         self.section(f, _('Modos', 'Modes'), top=4)
         self.check(f, 'af16', _('Texturas nítidas (filtro anisotrópico 16x)', 'Sharp textures (16x anisotropic filtering)'),
                    _('Chão, grama e rochas ficam nítidos à distância, quase sem custo.',

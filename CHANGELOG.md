@@ -1,6 +1,7 @@
 # Changelog
 
-## Não lançado
+## 0.60.6-plus22 — 2026-10-28 (fork Lucas-blip-png)
+- **Notas da atualização em inglês no lançador (#321, pedido de Khimari):** a janela "Procurar atualização" mostra o texto do release no idioma do lançador (seção `## English` do release).
 - **Vazamento de memória do processador de comandos corrigido (PR #2, Lukto02 / Luca Zarecki):** os quadros dos buffers indiretos aninhados (~700 por segundo) nunca eram liberados, cerca de 44 MB por minuto (2,6 GB por hora). Agora são liberados, depois que a thread de desenho termina o trabalho enfileirado deles; `SOTC_CP_FREE_TASKS=0` volta ao antigo. Medido aqui no Santuário parado, 5 min: `main` +31 MB/min, com o PR estável; armadilha de falha do autor (`SOTC_TASK_GUARD=1 SOTC_CP_FREE_NOW=1`) sem falta. Deserto A B B A sem regressão.
 - **Correções do cache de texturas da 0.60.6-C1 (82229db, AjncSystem), trazidas pelo mesmo PR:** `ExpandImage` só copia a imagem velha se ela tem dados da GPU (upstream shadPS4 #5444), cópias e preenchimentos DMA marcam todas as imagens sobrepostas, e um slot reaproveitado com outro tamanho troca a textura em vez de ver pela velha. `SOTC_EXPAND_COPY_STALE=1`, `SOTC_DMA_OVERLAP=0` e `SOTC_REUSE_SIZE_CHECK=0` voltam ao antigo. Também `SOTC_FRAMETIME_OUT` (tempo de cada quadro em arquivo) e `tools/sotc_frametimes.py`.
 - O conserto do alocador de páginas (`0x1a371`) continua ligado por padrão; `SOTC_POOL_FIX=0` o desliga (o PR o desligava, e foi corrigido na revisão).

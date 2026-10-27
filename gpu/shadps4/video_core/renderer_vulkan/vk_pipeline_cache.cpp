@@ -1349,9 +1349,22 @@ bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
     const auto cs_params = AmdGpu::GetParams(cs_pgm);
+    // sotc: SOTC_ASYNC_COMPUTE_TRANSLATE=1 translates a new compute shader on a worker; the
+    // dispatch is dropped until it is ready (a cold shader cache made ~900 ms of stalls per route).
+    static const bool async_cs = [] {
+        const char* v = std::getenv("SOTC_ASYNC_COMPUTE_TRANSLATE");
+        return v && v[0] == '1';
+    }();
+    const bool async_ok = async_cs && !async_workers.empty() && !EmulatorSettings.IsShaderCollect();
+    if (async_ok) {
+        if (async_done_count.load(std::memory_order_acquire) != 0) {
+            CollectAsyncPipelines();
+        }
+        translation_pending = false;
+    }
     std::tie(infos[0], modules[0], compute_key.value) =
-        GetProgram(HwStage::Compute, SwStage::Compute, cs_params, binding);
-    return true;
+        GetProgram(HwStage::Compute, SwStage::Compute, cs_params, binding, async_ok);
+    return !translation_pending || !async_ok;
 }
 
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
@@ -1372,6 +1385,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     SotcStats::shaders_compiled.fetch_add(1, std::memory_order_relaxed);
 
     auto phase_start = std::chrono::steady_clock::now();
+    const auto sync_shader_start = phase_start;
     const auto phase = [&](int i) {
         if (SotcStats::kFpsLog) {
             const auto now = std::chrono::steady_clock::now();
@@ -1384,6 +1398,11 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     const auto ir_program = Shader::TranslateProgram(code, worker_pools ? *worker_pools : pools,
                                                      info, runtime_info, profile);
     phase(0);
+    // sotc: a shader translated on the command processor (not on a worker) is a stall; log slow ones.
+    if (!worker_pools) {
+        LogSyncPipeline("shader", info.hw_stage == HwStage::Compute ? "compute" : "graphics stage",
+                        sync_shader_start, info.pgm_hash, perm_idx);
+    }
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
     phase(1);

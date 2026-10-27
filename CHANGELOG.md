@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.60.6-plus18 — 2026-10-27 (fork Lucas-blip-png)
+- **Campo de visão ajustável (#179):** o lançador ganhou "Campo de visão" (100% original a 140%). A câmera do jogo converte os graus
+  em radianos num único ponto (uma constante de 4 bytes, sem outro uso), então o patch multiplica essa constante e vale para todas as
+  câmeras; LOD e cascatas de sombra seguem a matriz. `SOTC_FOV_SCALE=<0,5 a 1,6>` faz o mesmo sem o lançador. Achado por engenharia
+  reversa do eboot EU 1.01 (nota em `out/fov_re_notes.md`, não vai no repositório). Medido no Santuário a 1080p: 140% mostra bem mais
+  cenário, sem artefatos; os comandos por quadro sobem de 5744 para 7302 (mais objetos na tela) e o FPS cai de 74,5 para 69,3. Só
+  testei o Santuário parado; câmeras de colossos e cutscenes não foram vistas. O aumento é só vertical, o horizontal acompanha o aspecto.
+- **Vibração liga/desliga dentro do jogo** (menu F1), mantida como opção do lançador: trabalho de AjncSystem (0.60.6-C1/C2, 307e024),
+  entrou com a autoria dele.
+- Desempenho: `SOTC_RB_HOT` conferido de novo no Santuário (0 = 53 FPS, 1 = 74-75, 2 = 72-74): o padrão 1 fica.
+
 ## 0.60.6-plus17 — 2026-10-27 (fork Lucas-blip-png)
 - **Correção urgente: o lançador fechava ao abrir nas versões plus15 e plus16** (`KeyError: 'fx_sunshadows'`, relato de geosaw616 no #316).
   A opção "Sombras do sol" tinha entrado sem valor padrão. Agora tem, e um teste confere que todo efeito do lançador tem padrão.

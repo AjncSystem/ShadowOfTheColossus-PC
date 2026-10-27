@@ -42,7 +42,7 @@ CONFIG_FILE = CONFIG_DIR / 'launcher_settings.json'
 from sotc_modes import GAMES  # noqa: E402
 GAME_ID = 'CUSA08809'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.60.6-plus17'
+VERSION = '0.60.6-plus18'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -165,7 +165,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'render_preset': 'quality', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'fx_sunshadows': True, 'engine_cvars': '', 'perf_culling': True,
-                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'auto', 'volume': '100', 'shadow_reuse': '0', 'grass_shadows': '3', 'grass_size': '1', 'grass_fade': '1', 'library_dirs': [], 'keys': {},
+                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'auto', 'volume': '100', 'fov': '100', 'shadow_reuse': '0', 'grass_shadows': '3', 'grass_size': '1', 'grass_fade': '1', 'library_dirs': [], 'keys': {},
                 'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'fg_mult': '2', 'fg_hudless': False, 'diag_log': False,
                 'check_updates': True, 'skip_version': ''}
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
@@ -223,6 +223,8 @@ GRASS_FADE = [('0.3', ('0.3 (grama rala, sem sombra)', '0.3 (sparse grass, no sh
               ('0.6', ('0.6 (grama mais rala)', '0.6 (sparser grass)')),
               ('1', ('Como no PS4', 'As on PS4')),
               ('2', ('2 (pouca grama)', '2 (little grass)'))]
+FOV = [('100', ('100% (original)', '100% (original)')), ('110', ('110%', '110%')), ('120', ('120%', '120%')),
+       ('130', ('130%', '130%')), ('140', ('140%', '140%'))]
 VOLUME = [('100', ('100% (original)', '100% (original)')), ('150', ('150%', '150%')),
           ('200', ('200%', '200%')), ('300', ('300% (máximo)', '300% (maximum)'))]
 VRAM_LIMITS = {'low': ('50', '1024'), 'normal': ('60', '1536'), 'high': ('75', '4096'), 'max': ('85', '0')}
@@ -658,6 +660,8 @@ def game_environment(s):
     if s.get('vram_use', 'auto') in VRAM_LIMITS:  # "auto": the port picks from the card's budget (sotc_stats.h)
         env['SOTC_VRAM_GC_PERCENT'], env['SOTC_ARENA_EVICT_MB'] = VRAM_LIMITS[s['vram_use']]
     env['SOTC_VOLUME'] = str(s.get('volume') or '100')
+    if str(s.get('fov') or '100') != '100':  # camera field of view, scales every camera (scripts/sotc_modes.py)
+        env['SOTC_FOV_SCALE'] = str(int(s['fov']) / 100)
     # The in-game menu's quick settings are written back here (bbport_overlay.cpp).
     env['SOTC_LAUNCHER_SETTINGS'] = str(CONFIG_FILE)
     env['SOTC_SHADOW_REUSE'] = str(s.get('shadow_reuse') or '0')
@@ -1220,6 +1224,11 @@ class Launcher:
                       'a shadPS4 installed on this PC (user/sys_modules) and copies them to the port\'s data folder. '
                       'They are Sony firmware and never come with the port. Without them the game is silent.'),
                     on_change=self.refresh_status)
+        self.row(f, _('Campo de visão', 'Field of view'), self.choice(f, 'fov', FOV),
+                 _('Amplia o campo de visão da câmera (100% é o original). Mostra mais cenário, mas desenha mais '
+                   'objetos e custa FPS; os tiros das cutscenes mudam de enquadramento. Vale na próxima abertura do jogo.',
+                   'Widens the camera field of view (100% is the original). Shows more of the scene but draws more '
+                   'objects and costs FPS; cutscene framing changes too. Applies the next time the game starts.'))
         self.row(f, _('Volume', 'Volume'), self.choice(f, 'volume', VOLUME),
                  _('Aumenta o som do jogo, que sai baixo. Acima de 100% os picos são suavizados em vez de '
                    'estourar. No jogo, o modo de alto-falante "TV" também deixa o som mais alto.',

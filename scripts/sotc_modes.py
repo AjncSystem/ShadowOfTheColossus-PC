@@ -204,6 +204,29 @@ def render_patches(elf, ph, size):
     return writes
 
 
+FOV_DEG2RAD = (0x013bed40, bytes.fromhex('35fa8e3c'))  # the view builder's degrees-to-radians factor (one xref)
+
+
+def fov_patch(elf, ph):
+    """SOTC_FOV_SCALE=<k> (0.5 to 1.6) scales the vertical field of view of every camera by k.
+
+    The only place where the camera's FOV in degrees becomes radians for the projection matrix is
+    a 4-byte constant (0.0174533), so scaling it is downstream of all the camera modifiers. LOD and
+    shadow cascades derive from the matrix and follow."""
+    try:
+        k = float(os.environ.get('SOTC_FOV_SCALE', '1'))
+    except ValueError:
+        return []
+    k = min(max(k, 0.5), 1.6)
+    if abs(k - 1) < 0.005:
+        return []
+    address, original = FOV_DEG2RAD
+    if image_bytes(elf, ph, address - BASE, 4) != original:
+        raise SystemExit(f'FOV: unexpected bytes at {address:#x}')
+    print(f'FOV scale {k:g}: on')
+    return [(address - BASE, struct.pack('<f', struct.unpack('<f', original)[0] * k))]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('game', type=Path)
@@ -235,6 +258,8 @@ def main():
                 cvars.append('texturePoolReserveSystemMemMiBs=0')
         else:
             print(f'Render size {args.render}: this eboot is not {SUPPORTED}, not applied')
+    if supported:
+        writes += fov_patch(elf, ph)
     for item in args.cvars.split():
         item = item.lstrip('+')
         if not CVAR.match(item):

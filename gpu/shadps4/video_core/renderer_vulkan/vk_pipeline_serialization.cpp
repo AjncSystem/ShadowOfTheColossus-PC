@@ -244,13 +244,7 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
                                                        *pipeline_cache, compute_key, *infos[0],
                                                        modules[0], sdata, true, deferred);
         if (deferred) {
-            auto job = std::make_unique<AsyncPipelineJob>();
-            job->compute = it.value().get();
-            {
-                std::scoped_lock lock{async_mutex};
-                async_queue.insert(async_queue.begin() + async_compute_queued++, std::move(job));
-            }
-            async_cv.notify_one();
+            QueueComputeBuild(it.value().get());
             preload_computes.push_back(compute_key);
         }
     }

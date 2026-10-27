@@ -192,6 +192,9 @@ private:
             std::vector<u32> spv;
             bool stale{}; ///< the worker's specialization differs from spec (permutation)
             bool failed{}; ///< translation asserted (tables reused by the game meanwhile)
+            /// sotc: a compute prefetch (PrefetchComputeProgram): the command processor waits
+            /// for it, so it is queued ahead of every other job (SOTC_PREFETCH_PRIORITY).
+            bool blocking{};
         };
         std::unique_ptr<Translate> translate; ///< a translation job
     };
@@ -202,7 +205,14 @@ private:
     void QueueAsyncTranslate(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
                              const Shader::ShaderParams& params, const Shader::RuntimeInfo& rt,
                              const Shader::Backend::Bindings& start, Program* program,
-                             const Shader::StageSpecialization* spec, size_t perm_idx);
+                             const Shader::StageSpecialization* spec, size_t perm_idx,
+                             bool blocking = false);
+    /// sotc: queues the deferred build of a compute pipeline (after the blocking translations
+    /// and the older compute builds, ahead of the other translations and graphics jobs).
+    void QueueComputeBuild(ComputePipeline* pipeline);
+    /// sotc: SOTC_COMPUTE_SPECULATE: makes and queues the compute pipeline of a program a
+    /// prefetch has just installed, before the dispatch that needs it is looked up.
+    void SpeculateComputePipeline(Program& program, u64 perm_hash);
     void RunAsyncTranslate(AsyncPipelineJob::Translate& job);
     void TranslateOnWorker(AsyncPipelineJob::Translate& job, const Shader::ShaderParams& params,
                            Shader::Backend::Bindings& binding, Shader::RuntimeInfo& runtime_info,
@@ -253,7 +263,8 @@ private:
     std::mutex async_mutex;
     std::condition_variable_any async_cv;
     std::deque<std::unique_ptr<AsyncPipelineJob>> async_queue;
-    size_t async_compute_queued{}; ///< compute jobs at the head of async_queue, oldest first
+    size_t async_prefetch_queued{}; ///< blocking (prefetch) translations at the very head
+    size_t async_compute_queued{}; ///< compute jobs after them, oldest first
     /// sotc: compute pipelines of the boot preload built by the workers (SOTC_ASYNC_PRELOAD);
     /// WarmUp waits for them and drops the ones the driver refused, as it does when it builds
     /// them itself.

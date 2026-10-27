@@ -35,3 +35,10 @@ esperar o worker só nos computes de execução única.
 - **Rota do deserto a 3840x1080 (196 s, cache quente):** 0 quadros acima de 50 ms, VRAM 3,4 de 6,2 GB com texturas Alta. Textura Máxima não foi medida.
 - Cache frio e compilação assíncrona de compute: continua como na seção anterior (a versão assíncrona perdia despachos de uma vez só e fica desligada).
 
+## Cache frio, segunda análise (27/10)
+- Rota do deserto largo com o cache de `CUSA08809` apagado: 4 quadros acima de 50 ms; o pior, 493 ms aos 60 s, tem 368 ms de shader. Só uma tradução passou de 30 ms (a de `b48a3d66`, 30 ms); o resto da rajada é uma centena de computes de 2 a 5 ms, ao entrar numa área nova.
+- A thread de comandos passa quase todo o tempo esperando: o perfil dela mostra `GetProgram` com 0,7%. O custo é concentrado em rajadas, não espalhado.
+- Por que não mexi no código: a tradução assíncrona de compute descarta o dispatch até o shader ficar pronto, e uma rajada de entrada de área é feita justamente de computes de execução única (inicializações), que não voltam. Esperar o worker no lugar de descartar é o mesmo que traduzir na thread de comandos. Reexecutar o dispatch depois não é seguro: ele lê memória do jogo (constantes, SRT) que muda até lá.
+- O único caminho sem risco que sobra é traduzir à frente: varrer o buffer de comandos antes de executá-lo, achar os pares `COMPUTE_PGM` + `DISPATCH` e traduzir todos em paralelo nos workers, esperando o resultado no dispatch. Exige reproduzir o estado dos registradores e dos dados de usuário que a tradução lê; fica como trabalho futuro.
+- O cache só é frio na primeira abertura, depois de uma mudança do recompilador (a versão do cache subiu duas vezes em 10 dias) ou da placa/driver.
+

@@ -1,5 +1,8 @@
 # Changelog
 
+## Não lançado
+- **Notas da atualização em inglês (#321, pedido de Khimari):** o texto de um release pode ter uma seção `## English`; a janela de "Procurar atualização" mostra a parte do idioma do lançador. Vale a partir do release seguinte ao que instalar este lançador; releases antigos continuam mostrando o texto inteiro.
+
 ## 0.60.6-plus21 — 2026-10-28 (fork Lucas-blip-png)
 - **Diagnóstico:** com `SOTC_FPS=1` o relatório de FPS mostra quantas chamadas de proteção de página o lado da GPU faz por segundo e quanto tempo gastam (total e na thread de desenho). Sem efeito fora do diagnóstico.
 - **Último recurso de buffer em RAM:** o fallback dos buffers (`buffer.cpp`) pedia dois flags de acesso do host ao mesmo tempo num buffer HostCached (RANDOM mais SEQUENTIAL), o que a VMA recusa; a última tentativa nunca podia dar certo. Agora troca um pelo outro. Visto no #319 (RX 7600, aborto de 0x17 com 6 GB de RAM livres: "Failed allocating HostCached buffer of 64 KB"). Não reproduzi; é uma correção de código sem prova de que era a causa única.

@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// sotc: FSR 3 frame generation (vk_fsrfg.cpp), after its dispatch: the HUD of the generated frame
+// from the game frame. FSR 3 keeps the game frame's pixels where it differs from the HUD-less one
+// only in part when the two are close (1 - min/max over 0.1): a translucent bar over grass came
+// out patched with the scene, and the bars and letters shook between the game and generated
+// frames. The HUD-less frame goes through the same passes as the game frame, so any difference
+// is the HUD: those pixels are the game frame's, whole.
+
+#version 450 core
+
+layout (local_size_x = 8, local_size_y = 8) in;
+
+layout (binding = 0, set = 0, rgba8) uniform readonly image2D game_frame;
+layout (binding = 1, set = 0, rgba8) uniform readonly image2D hudless_frame;
+layout (binding = 2, set = 0, rgba8) uniform image2D generated;
+
+layout (push_constant) uniform Params {
+    uvec2 size;
+} pc;
+
+void main() {
+    const ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (at.x >= int(pc.size.x) || at.y >= int(pc.size.y)) {
+        return;
+    }
+    const vec3 game = imageLoad(game_frame, at).rgb;
+    if (any(notEqual(game, imageLoad(hudless_frame, at).rgb))) {
+        imageStore(generated, at, vec4(game, 1.0));
+    }
+}

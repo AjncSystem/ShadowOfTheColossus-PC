@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.60.6-C3 — 2026-10-27
+- **Barra de stamina com DLSS (correção da C2):** a área da barra passou a usar a largura de uma
+  tela de 1080 linhas na proporção da saída (1080 × L/A) em vez da largura de renderização. Com
+  DLSS a renderização é menor (1704x720 em 2560x1080) e a barra amarela voltava a parar longe do
+  círculo; em 16:9 com DLSS sem o modo PS4 Pro a C2 também a quebrava.
+
 ## 0.60.6-C2 — 2026-10-26
 - **Tela larga (21:9, 32:9): barras de vida e stamina certas (#301, #202).** A barra de vida
   tinha um pedaço cinza a mais e a amarela da stamina parava longe do círculo e enchia ao

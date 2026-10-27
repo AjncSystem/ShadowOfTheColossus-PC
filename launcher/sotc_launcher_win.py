@@ -1654,10 +1654,15 @@ class Launcher:
 
     def refresh_status(self):
         info = game_info(self.var('game_dir').get())
+        # Long or non-ASCII paths (repack folders) were behind games that closed with no error (#299, #282).
+        odd_path = any(len(s) > 150 or not s.isascii() for s in (str(PORT_DIR), self.var('game_dir').get()))
         if not info:
             game = _('✗ Não há eboot.bin na pasta do jogo (Jogo e saves)', '✗ No eboot.bin in the game folder (Game & saves)')
         elif game_supported(self.var('game_dir').get()):
             game = _('✓ {} versão {}: todos os modos disponíveis', '✓ {} version {}: every mode available').format(*info)
+            if odd_path:
+                game = _('⚠ {} versão {}: o caminho tem acentos ou é longo; se o jogo fechar sem erro, mova a pasta para algo curto como C:\\SotC',
+                         '⚠ {} version {}: the path has accents or is long; if the game closes with no error, move the folder to a short one such as C:\\SotC').format(*info)
         else:
             game = _('⚠ {} versão {}: o port foi feito para {}; os modos não se aplicam',
                      '⚠ {} version {}: the port targets {}; the modes do not apply').format(*info, supported_games())

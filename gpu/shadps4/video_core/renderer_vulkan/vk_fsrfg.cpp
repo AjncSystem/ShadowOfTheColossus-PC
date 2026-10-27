@@ -505,9 +505,23 @@ vk::Image Generate(vk::CommandBuffer cmdbuf, u32 frame_id, vk::Image frame_image
         return {};
     }
     Dlssg::FrameInputs in{};
-    if (frame_id >= kMaxFrames || !depth_slots[frame_id].valid ||
-        !Dlssg::GetFrameInputs(frame_id, in) || depth_slots[frame_id].r32.width != in.width ||
+    // SOTC_FSRFG_LOG=1: why game frames were not interpolated, every 300 frames.
+    static u32 why[6]{}; // done, no depth, no inputs, size, reset by the game, gap
+    const auto count = [](u32 reason) {
+        ++why[reason];
+        if (log_level >= 1 && why[0] + why[1] + why[2] + why[3] + why[4] + why[5] >= 300) {
+            std::fprintf(stderr,
+                         "SOTC FSR3 FG frames: %u generated, %u without depth, %u without inputs, "
+                         "%u size, %u reset by the game, %u after a skipped frame\n",
+                         why[0], why[1], why[2], why[3], why[4], why[5]);
+            std::fill(std::begin(why), std::end(why), 0u);
+        }
+    };
+    const bool depth_ok = frame_id < kMaxFrames && depth_slots[frame_id].valid;
+    const bool inputs_ok = depth_ok && Dlssg::GetFrameInputs(frame_id, in);
+    if (!inputs_ok || depth_slots[frame_id].r32.width != in.width ||
         depth_slots[frame_id].r32.height != in.height) {
+        count(!depth_ok ? 1 : !inputs_ok ? 2 : 3);
         history_game_frame = ~0ULL;
         SetState(0);
         return {};
@@ -520,6 +534,7 @@ vk::Image Generate(vk::CommandBuffer cmdbuf, u32 frame_id, vk::Image frame_image
     RetireCompleted(false);
     // Interpolation needs the previous game frame to have gone through FSR 3.
     const bool reset = in.reset || history_game_frame + 1 != game_frames;
+    count(in.reset ? 4 : reset ? 5 : 0);
     history_game_frame = game_frames;
     ++fsr_frame;
 
@@ -625,6 +640,20 @@ vk::Image Generate(vk::CommandBuffer cmdbuf, u32 frame_id, vk::Image frame_image
     prepare.renderHeight = in.height;
     prepare.jitterOffsetX = in.jitter[0];
     prepare.jitterOffsetY = in.jitter[1];
+    // SOTC_FG_JITTER (tests): 0 none, 2 x negated, 3 y negated, 4 both negated; else as DLSS has it.
+    static const int jitter_mode = [] {
+        const char* v = std::getenv("SOTC_FG_JITTER");
+        return v ? std::atoi(v) : 1;
+    }();
+    if (jitter_mode == 0) {
+        prepare.jitterOffsetX = prepare.jitterOffsetY = 0.0f;
+    }
+    if (jitter_mode == 2 || jitter_mode == 4) {
+        prepare.jitterOffsetX = -prepare.jitterOffsetX;
+    }
+    if (jitter_mode == 3 || jitter_mode == 4) {
+        prepare.jitterOffsetY = -prepare.jitterOffsetY;
+    }
     // The game's motion vectors are curUV - prevUV; FSR 3 wants prev - cur, in render pixels
     // before its 1 / render size.
     prepare.motionVectorScaleX = -static_cast<float>(in.width);

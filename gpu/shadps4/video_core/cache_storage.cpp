@@ -13,6 +13,9 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 
 #include <miniz.h>
+#ifdef _WIN32
+#include <windows.h> // sotc: SetThreadPriority (background mode of the cache writer)
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -45,6 +48,18 @@ namespace Storage {
 
 void ProcessIO(const std::stop_token& stoken) {
     Common::SetCurrentThreadName("shadPS4:PipelineCacheIO");
+#ifdef _WIN32
+    // sotc: SOTC_CACHE_IO_BACKGROUND=0 leaves the writer at normal priority. By default it runs in
+    // background mode (low CPU, I/O and memory priority): on a cold shader cache it writes ~12k small
+    // files in the first minutes, which must not compete with the game's own file reads.
+    static const bool background = [] {
+        const char* v = std::getenv("SOTC_CACHE_IO_BACKGROUND");
+        return !v || v[0] != '0';
+    }();
+    if (background) {
+        SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+    }
+#endif
 
     while (!stoken.stop_requested()) {
         {

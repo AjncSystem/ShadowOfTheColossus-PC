@@ -1434,7 +1434,10 @@ void *runtime_low_map(size_t size, int prot) {
  * reusable-bind key of a draw is compared field by field instead of hashed. Exact (SOTC_DRAWREPLAY_VERIFY=1: 0 differences against the
  * hash in >30 M comparisons); -1.2 +- 0.33 ms of draw thread and +2.7 +- 0.8 FPS in the heavy temple (docs/sotc/DRAW-REPLAY.md).
  * SOTC_DRAWREPLAY=0 pins the old path (see toggle_mask_env). */
-uint64_t runtime_disabled_optimizations=UINT64_C(1)<<20 | UINT64_C(1)<<39 | UINT64_C(1)<<40 | UINT64_C(1)<<59 | UINT64_C(1)<<60;
+/* sotc: bits 20 (CpFastPaths) and 40 (DispatchFastPath) are on by default since 0.60.6-plus14: ABBA on the RTX 5060 Ti
+ * gave +4% in the Shrine (73.4 -> 76.4 FPS, same cmds/frame) and about +6% on the wide desert route; SOTC_CP_VERIFY=1 and
+ * SOTC_DISPFAST_VERIFY=1 reported 0 mismatches in >50 M checks. SOTC_CP_FAST=0 / SOTC_DISPFAST=0 turn them off. */
+uint64_t runtime_disabled_optimizations=UINT64_C(1)<<39 | UINT64_C(1)<<59 | UINT64_C(1)<<60;
 /* Speculative readers of guest memory (GPU draw-preparation workers) register a recovery
  * point: a fault on that thread jumps back to it instead of terminating (probe.c). */
 __thread sigjmp_buf *runtime_fault_recover;

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.60.6-plus14 — 2026-10-26 (fork Lucas-blip-png)
+- **Caminhos rápidos do processador de comandos e do despacho ligados por padrão** (`CpFastPaths`, bit 20, e `DispatchFastPath`,
+  bit 40, do PR #308 de Lukto02 / Luca Zarecki; ele os deixou desligados porque no teste dele o quadro não mexia). Medimos em
+  ABBA na RTX 5060 Ti: Santuário 73,4 → 76,4 FPS (+4%) com a mesma carga e, com o PGO retreinado, 71,7 → 75,5 FPS (+5%) contra o
+  plus13. `SOTC_CP_VERIFY=1` e `SOTC_DISPFAST_VERIFY=1` (do autor) deram 0 divergências em mais de 50 milhões de checagens.
+  A rota do deserto largo divergiu entre rodadas (de 4250 a 7500 comandos por quadro) e não serve para concluir; nela o lado novo
+  ficou igual ou melhor. `SOTC_CP_FAST=0` e `SOTC_DISPFAST=0` desligam. Não testado: AMD/Intel.
+- PGO retreinado com os caminhos novos (NVIDIA; veja `docs/sotc/PGO.md` para contribuir com AMD/Intel).
+
 ## 0.60.6-plus13 — 2026-10-26 (fork Lucas-blip-png)
 - **Desempenho do PR #308 do upstream, de Lukto02 (Luca Zarecki):** caminhos rápidos na thread de desenho (`GpuDraw`),
   DrawReplay, intervalos de leitura de volta, vigia de heap do BPE e ajustes de memória, tudo atrás de bits do `BbToggle`

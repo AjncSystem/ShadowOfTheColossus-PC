@@ -121,7 +121,14 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
                                      &allocation, out_alloc_info);
             if (result != VK_SUCCESS) {
                 retry_ci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
-                retry_ci.flags |= VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+                // sotc: VMA takes one host access flag; a HostCached buffer already had RANDOM,
+                // and both together made this last try fail (RX 7600, 256 MiB host-visible video
+                // heap full, 7 GB of system memory free: 64 KB HostCached buffer aborted, #319).
+                retry_ci.flags &= ~(VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                                    VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
+                retry_ci.flags |= mem_type == MemoryType::HostCached
+                                      ? VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
+                                      : VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
                 result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &retry_ci, &unsafe_buffer,
                                          &allocation, out_alloc_info);
             }

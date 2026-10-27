@@ -721,6 +721,10 @@ def game_environment(s):
         env['SOTC_NOTE'] = 'Texture quality Maximum is not used in PS4 Pro mode: High'
     if textures == 'max':  # sotc: without the page pool switch (sotc_lod_stats.h)
         env.setdefault('SOTC_LOD_POOL_LOW', '0')
+        if env['SOTC_NEO'] == '1':
+            # sotc: the page allocator fix can be turned off (SOTC_POOL_FIX=0, sotc_modes.py); Maximum
+            # in PS4 Pro mode crashed at 0x1a371 without it.
+            env.setdefault('SOTC_POOL_FIX', '1')
     if s.get('button_icons') == 'xbox' and (PORT_DIR / 'glyphs' / 'xbox').is_dir():
         env['SOTC_TEX_REPLACE'] = str(PORT_DIR / 'glyphs' / 'xbox')
     env['SOTC_UI_LANG'] = s.get('ui_language') or windows_language()  # overlay and F7/F8 texts

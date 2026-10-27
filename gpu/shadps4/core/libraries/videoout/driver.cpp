@@ -548,6 +548,22 @@ void VideoOutDriver::Flip(const Request& req) {
         cause_ns[SotcStats::FrameCauses] = runtime_file_read_ns_take();
         cause_ns[SotcStats::FrameCauses + 1] = SotcStats::frame_copy_bytes.exchange(0);
         frame_ms.push_back(static_cast<float>(interval_ms));
+        // sotc: SOTC_FRAMETIME_OUT=<file> also writes every flip ("seconds interval_ms cmds"),
+        // for whole-run frame-time percentiles (tools/sotc_frametimes.py). Flushed with each window.
+        static FILE* frametime_out = [] {
+            const char* path = std::getenv("SOTC_FRAMETIME_OUT");
+            return path && *path ? std::fopen(path, "w") : nullptr;
+        }();
+        static std::string frametime_lines;
+        if (frametime_out) {
+            static uint64_t frametime_cmds_seen = 0;
+            char line[64];
+            std::snprintf(line, sizeof(line), "%.3f %.3f %llu\n",
+                          std::chrono::duration<double>(now - run_start).count(), interval_ms,
+                          static_cast<unsigned long long>(
+                              SotcStats::TakeDelta(SotcStats::commands, frametime_cmds_seen)));
+            frametime_lines += line;
+        }
         if (interval_ms > worst_ms) {
             worst_ms = interval_ms;
             std::copy(std::begin(cause_ns), std::end(cause_ns), std::begin(worst_ns));
@@ -560,6 +576,11 @@ void VideoOutDriver::Flip(const Request& req) {
         }
         if (now - window_start >= std::chrono::seconds(5)) {
             const double seconds = std::chrono::duration<double>(now - window_start).count();
+            if (frametime_out) {
+                std::fwrite(frametime_lines.data(), 1, frametime_lines.size(), frametime_out);
+                std::fflush(frametime_out);
+                frametime_lines.clear();
+            }
             std::string report; // sotc: written at once off this thread (see ReportPrintf)
             {
                 std::sort(frame_ms.begin(), frame_ms.end());
@@ -796,13 +817,14 @@ void VideoOutDriver::Flip(const Request& req) {
             const uint64_t gc_freed = SotcStats::gc_freed.exchange(0);
             ReportPrintf(report,
                          "SOTC GC: %.1f ticks/frame, freed %.0f/s (%llu written back), images new "
-                         "%.0f/s, cached %llu (%llu MB)\n",
+                         "%.0f/s, cached %llu (%llu MB), reused slots %llu\n",
                          flips ? double(SotcStats::gc_ticks.exchange(0)) / flips : 0.0,
                          gc_freed / seconds,
                          static_cast<unsigned long long>(SotcStats::gc_downloads.exchange(0)),
                          (images_new - last_images_new) / seconds,
                          static_cast<unsigned long long>(SotcStats::cached_images.load()),
-                         static_cast<unsigned long long>(SotcStats::cached_image_bytes.load() >> 20));
+                         static_cast<unsigned long long>(SotcStats::cached_image_bytes.load() >> 20),
+                         static_cast<unsigned long long>(SotcStats::reuse_size_frees.exchange(0)));
             last_images_new = images_new;
             // sotc: warnings dropped by SotcStats::LogThrottled in the last window (M5/P5), so the
             // line rate that reaches the launcher pipe is visible.

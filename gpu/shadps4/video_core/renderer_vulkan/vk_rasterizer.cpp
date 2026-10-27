@@ -5847,6 +5847,9 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
         }
         return buffer_cache.ObtainBuffer(address, num_bytes, true);
     }();
+    if (!is_gds) { // sotc: from 0.60.6-C1: every image the fill overlaps (SOTC_DMA_OVERLAP)
+        texture_cache.InvalidateMemoryFromGPU(address, num_bytes, true);
+    }
     runtime.FillBuffer(buffer, offset, num_bytes, value);
 }
 
@@ -5867,7 +5870,9 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
             return;
         }
     }
-    texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);
+    if (!dst_gds) { // sotc: from 0.60.6-C1: every image the copy overlaps (SOTC_DMA_OVERLAP)
+        texture_cache.InvalidateMemoryFromGPU(dst, num_bytes, true);
+    }
     const auto* gds_buffer = buffer_cache.GetGdsBuffer();
     const auto [src_buffer, src_offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {
         if (src_gds) {

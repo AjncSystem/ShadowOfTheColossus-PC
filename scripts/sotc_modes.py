@@ -79,7 +79,7 @@ CVAR_MODES = {
 # Page allocator (0x41a1e0): it carves a new chunk only when the free-page tally at pool+0x74 is
 # 0, and the tally drifts above the bitmap's real free count. With the bitmap empty and the tally
 # not 0, the scan found no bit and read bitmap[-1] (crash at 0x41a371). On a failed scan: tally 0,
-# then carve a chunk (0x41a1f1, needs eax 0) and scan again.
+# then carve a chunk (0x41a1f1, needs eax 0) and scan again. On by default (see main).
 POOL_FIX = (0x41a321, bytes.fromhex('eb34666666662e0f1f840000000000'),
             bytes.fromhex('41c7467400000000' '31c0' 'e9c1feffff'))
 # Above this many rendered pixels the larger render target pool pushes the game's free system
@@ -249,7 +249,14 @@ def main():
     elf, _, ph, _, _ = parse_self((args.game / 'eboot.bin').read_bytes())
     supported = is_supported(elf, ph)
     writes, cvars = [], []
-    if supported and image_bytes(elf, ph, POOL_FIX[0] - BASE, len(POOL_FIX[1])) == POOL_FIX[1]:
+    # sotc: on by default, SOTC_POOL_FIX=0 turns it off. Rainbow-speckled and black-blocked textures
+    # and grass cards drawn as squares showed past the bridge to the second colossus (1440p, High
+    # textures, 0.60.8 local; one player, 26 Oct): 3 sessions of 3 with the patch, 0 of 2 without it,
+    # whatever the task-frame freeing and the 0.60.6-C1 texture cache changes. Not enough to turn it
+    # off: the patch only acts where the game would otherwise read bitmap[-1] (the 0x1a371 crash), so
+    # the sessions with garbage may just be the ones that reached that branch.
+    pool_fix = os.environ.get('SOTC_POOL_FIX', '1') != '0'
+    if supported and pool_fix and image_bytes(elf, ph, POOL_FIX[0] - BASE, len(POOL_FIX[1])) == POOL_FIX[1]:
         writes.append((POOL_FIX[0] - BASE, POOL_FIX[2]))
     for mode in filter(None, (m.strip().lower() for m in args.modes.split(','))):
         if mode not in MODES and mode not in CVAR_MODES:

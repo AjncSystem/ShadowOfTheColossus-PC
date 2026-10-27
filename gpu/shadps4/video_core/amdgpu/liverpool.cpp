@@ -1059,18 +1059,22 @@ void Liverpool::Process(std::stop_token stoken) {
 }
 
 // sotc: the frames of finished nested command buffer tasks (an indirect buffer each: ~700 a
-// second in the compute queues) were never freed, ~60 MB a minute (PR #219). Freed at once, as
-// that PR did, the game showed speckled, rainbow-coloured textures on the Shrine's floor and
-// walls and then crashed in its heap (0x49500), with that change alone on (user, 22 Oct): the
-// draw thread still ran work queued from them. A frame is freed once the draw thread has run
-// everything queued until it finished (back_tail >= the back_head then); the user still saw a
-// huge black polygon over the Shrine with that (vertex garbage, the GTX 1080 streamer's "vertex
-// explosion"): something else keeps using freed memory, and the leak hid it (frames were never
-// reused). Off until that is found, as before #219: SOTC_CP_FREE_TASKS=1 frees them.
+// second in the compute queues) were never freed: ~45 MB a minute, 2.6 GB an hour at the Shrine
+// (PR #219). Freed at once, as that PR did, the game showed speckled, rainbow-coloured textures
+// on the Shrine's floor and walls, a huge black polygon and a crash in its heap (0x49500) in the
+// 0.60.5 builds. That was blamed on the frames (nothing was reused while they leaked), but the
+// causes found since were the speculative hot readbacks (SOTC_RB_HOT, T31: late GPU copies landing
+// on guest memory the game had reused) and the bind memo of #232; no code keeps a pointer into a
+// frame (they hold spans of guest memory, values and by-value lambda captures; the draw thread
+// never sees them). With SOTC_TASK_GUARD=1 SOTC_CP_FREE_NOW=1 (frames on pages of their own that
+// are decommitted at once, so any later access faults) the Shrine idle (240 s), the temple route
+// and the title demo (10 min) ran with no fault and clean frames. A frame is still freed only
+// once the draw thread has run everything queued until it finished (back_tail >= the back_head
+// then), which costs nothing. On by default; SOTC_CP_FREE_TASKS=0 keeps the frames (the leak).
 static bool FreeNestedTasks() {
     static const bool free_tasks = [] {
         const char* v = std::getenv("SOTC_CP_FREE_TASKS");
-        return v && v[0] == '1';
+        return !v || v[0] != '0';
     }();
     return free_tasks;
 }

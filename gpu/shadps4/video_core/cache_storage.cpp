@@ -26,8 +26,12 @@
 #include <cstring>
 #include <functional>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <queue>
+#include <string_view>
+#include <type_traits>
+#include <unordered_map>
 
 namespace {
 
@@ -41,6 +45,277 @@ std::mutex m_request{};
 
 mz_zip_archive zip_ar{};
 bool ar_is_read_only{true};
+
+// sotc: the session's new cache blobs go into ONE append-only journal file instead of ~12k small
+// files (each a create + write + rename, which Windows/Defender make slow enough to show as
+// stutter on a cold cache). Format: "SOTCJN1" + NUL, then records of a 16-byte header (u32 magic,
+// u16 name length, u16 blob type, u32 data length, u32 CRC-32 of the first 12 header bytes + name
+// + data), the file name (with extension, as the loose file would be called) and the data. A
+// record that is cut short or fails its checksum ends the file for the reader (a killed session).
+constexpr char JournalMagic[8] = {'S', 'O', 'T', 'C', 'J', 'N', '1', '\0'};
+constexpr u32 JournalRecMagic = 0x43524A53;
+constexpr size_t JournalFlushBytes = 1u << 20;
+constexpr long long JournalFlushMs = 2000;
+constexpr std::string_view JournalPrefix = "cache.sotcjournal.";
+
+struct JournalRecHeader {
+    u32 magic;
+    u16 name_len;
+    u16 type;
+    u32 data_len;
+    u32 crc;
+};
+static_assert(sizeof(JournalRecHeader) == 16);
+
+using BlobPtr = std::shared_ptr<const std::vector<u8>>;
+
+u32 JournalCrc(const JournalRecHeader& h, const char* name, const u8* data) {
+    u32 crc = static_cast<u32>(mz_crc32(MZ_CRC32_INIT, reinterpret_cast<const mz_uint8*>(&h), 12));
+    crc = static_cast<u32>(mz_crc32(crc, reinterpret_cast<const mz_uint8*>(name), h.name_len));
+    if (h.data_len) {
+        crc = static_cast<u32>(mz_crc32(crc, data, h.data_len));
+    }
+    return crc;
+}
+
+class Journal {
+public:
+    void Begin(std::filesystem::path p) {
+        std::scoped_lock io{io_mtx};
+        std::scoped_lock lk{mtx};
+        ResetLocked();
+        path = std::move(p);
+        active = true;
+        last_flush = std::chrono::steady_clock::now();
+    }
+    bool Active() {
+        std::scoped_lock lk{mtx};
+        return active;
+    }
+    /// Caller thread: the blob is readable from now on, before the writer got to it.
+    void Submit(const std::string& name, const BlobPtr& data) {
+        std::scoped_lock lk{mtx};
+        pending[name] = data;
+    }
+    /// Writer thread. False: not written (journal unusable), the caller writes a loose file.
+    /// The caller threads only ever wait for `mtx`, which is never held across the CRC, a memory
+    /// copy of a whole blob or a disk write (`io_mtx` serializes those among writer-side calls).
+    bool Append(const std::string& name, Storage::BlobType type, const BlobPtr& data) {
+        std::scoped_lock io{io_mtx};
+        {
+            std::scoped_lock lk{mtx};
+            const auto it = pending.find(name);
+            if (it == pending.end() || it->second != data) {
+                return true; // dropped by Discard, or a newer blob of this name is queued behind
+            }
+            if (!active || failed) {
+                pending.erase(it);
+                return false;
+            }
+        }
+        if (!wfile && !OpenIo()) {
+            std::scoped_lock lk{mtx};
+            if (const auto it = pending.find(name); it != pending.end() && it->second == data) {
+                pending.erase(it);
+            }
+            return false;
+        }
+        JournalRecHeader h{JournalRecMagic, static_cast<u16>(name.size()), static_cast<u16>(type),
+                           static_cast<u32>(data->size()), 0};
+        h.crc = JournalCrc(h, name.data(), data->data());
+        std::vector<u8> rec(sizeof(h) + name.size() + data->size());
+        std::memcpy(rec.data(), &h, sizeof(h));
+        std::memcpy(rec.data() + sizeof(h), name.data(), name.size());
+        if (!data->empty()) {
+            std::memcpy(rec.data() + sizeof(h) + name.size(), data->data(), data->size());
+        }
+        bool flush_now = false;
+        {
+            std::scoped_lock lk{mtx};
+            const u64 base = logical_end;
+            buf.insert(buf.end(), rec.begin(), rec.end());
+            logical_end += rec.size();
+            index[name] = {base + sizeof(h) + name.size(), h.data_len};
+            if (const auto it = pending.find(name); it != pending.end() && it->second == data) {
+                pending.erase(it);
+            }
+            const auto now = std::chrono::steady_clock::now();
+            flush_now = buf.size() >= JournalFlushBytes ||
+                        std::chrono::duration_cast<std::chrono::milliseconds>(now - last_flush)
+                                .count() >= JournalFlushMs;
+        }
+        if (flush_now) {
+            FlushIo();
+        }
+        return true;
+    }
+    bool Dirty() {
+        std::scoped_lock lk{mtx};
+        return !buf.empty();
+    }
+    void Flush() {
+        std::scoped_lock io{io_mtx};
+        FlushIo();
+    }
+    /// Flushes and closes the files; the journal stays on disk for the next start to merge.
+    void End() {
+        std::scoped_lock io{io_mtx};
+        FlushIo();
+        std::scoped_lock lk{mtx};
+        ResetLocked();
+        active = false;
+    }
+    /// Clear(): forget everything. A new file is started by the next Append.
+    void Discard() {
+        std::scoped_lock io{io_mtx};
+        std::scoped_lock lk{mtx};
+        const bool was_active = active;
+        ResetLocked();
+        active = was_active;
+    }
+    bool Lookup(const std::string& name, std::vector<u8>& out) {
+        std::scoped_lock lk{mtx};
+        if (const auto p = pending.find(name); p != pending.end()) {
+            out = *p->second;
+            return true;
+        }
+        const auto it = index.find(name);
+        if (it == index.end()) {
+            return false;
+        }
+        const auto [off, len] = it->second;
+        out.resize(len);
+        const u64 inflight_size = inflight ? inflight->size() : 0;
+        if (off >= flushed + inflight_size) {
+            std::memcpy(out.data(), buf.data() + (off - flushed - inflight_size), len);
+            return true;
+        }
+        if (off >= flushed) {
+            std::memcpy(out.data(), inflight->data() + (off - flushed), len);
+            return true;
+        }
+        if (!rfile) {
+            rfile = _wfopen(path.c_str(), L"rb");
+            if (rfile) {
+                std::setvbuf(rfile, nullptr, _IONBF, 0);
+            }
+        }
+        if (!rfile || _fseeki64(rfile, static_cast<long long>(off), SEEK_SET) != 0 ||
+            std::fread(out.data(), 1, len, rfile) != len) {
+            out.clear();
+            return false;
+        }
+        return true;
+    }
+    /// Names (with extension) of the blobs written this session whose name ends in `ext`.
+    std::vector<std::string> Names(const std::string& ext) {
+        std::scoped_lock lk{mtx};
+        std::vector<std::string> names;
+        const auto match = [&](const std::string& n) {
+            return n.size() >= ext.size() && n.compare(n.size() - ext.size(), ext.size(), ext) == 0;
+        };
+        for (const auto& [n, loc] : index) {
+            if (match(n)) {
+                names.push_back(n);
+            }
+        }
+        for (const auto& [n, data] : pending) {
+            if (!index.contains(n) && match(n)) {
+                names.push_back(n);
+            }
+        }
+        return names;
+    }
+
+private:
+    // io_mtx held.
+    bool OpenIo() {
+        std::filesystem::path p;
+        {
+            std::scoped_lock lk{mtx};
+            p = path;
+        }
+        wfile = _wfopen(p.c_str(), L"wb");
+        std::scoped_lock lk{mtx};
+        if (!wfile) {
+            failed = true;
+            return false;
+        }
+        std::setvbuf(wfile, nullptr, _IONBF, 0);
+        buf.assign(JournalMagic, JournalMagic + sizeof(JournalMagic));
+        logical_end = sizeof(JournalMagic);
+        flushed = 0;
+        return true;
+    }
+    // io_mtx held. The disk write happens outside `mtx`: the bytes stay readable through
+    // `inflight` meanwhile.
+    void FlushIo() {
+        std::shared_ptr<std::vector<u8>> out;
+        {
+            std::scoped_lock lk{mtx};
+            last_flush = std::chrono::steady_clock::now();
+            if (buf.empty() || !wfile) {
+                return;
+            }
+            out = std::make_shared<std::vector<u8>>(std::move(buf));
+            buf.clear();
+            inflight = out;
+        }
+        const size_t n = std::fwrite(out->data(), 1, out->size(), wfile);
+        std::fflush(wfile);
+        std::scoped_lock lk{mtx};
+        if (n != out->size()) {
+            // Disk full or similar: what is not on disk is forgotten, later blobs go loose.
+            failed = true;
+            for (auto it = index.begin(); it != index.end();) {
+                it = (it->second.first + it->second.second > flushed + n) ? index.erase(it)
+                                                                           : std::next(it);
+            }
+            buf.clear();
+            logical_end = flushed + n;
+            std::fclose(wfile);
+            wfile = nullptr;
+        }
+        flushed += n;
+        inflight.reset();
+    }
+    // Both mutexes held.
+    void ResetLocked() {
+        if (wfile) {
+            std::fclose(wfile);
+            wfile = nullptr;
+        }
+        if (rfile) {
+            std::fclose(rfile);
+            rfile = nullptr;
+        }
+        active = false;
+        failed = false;
+        buf.clear();
+        inflight.reset();
+        index.clear();
+        pending.clear();
+        flushed = 0;
+        logical_end = 0;
+    }
+
+    std::mutex io_mtx{}; // writer-side calls; taken before `mtx`
+    std::mutex mtx{};    // everything below except `wfile`
+    std::filesystem::path path{};
+    std::FILE* wfile{};  // io_mtx
+    std::FILE* rfile{};
+    bool active{};
+    bool failed{};
+    std::vector<u8> buf{};                       // appended, not handed to the disk yet
+    std::shared_ptr<std::vector<u8>> inflight{}; // being written right now, at `flushed`
+    u64 flushed{};                               // bytes on disk
+    u64 logical_end{};                           // flushed + inflight + buf
+    std::chrono::steady_clock::time_point last_flush{};
+    std::unordered_map<std::string, std::pair<u64, u32>> index{}; // name -> data offset, size
+    std::unordered_map<std::string, BlobPtr> pending{};            // queued, not appended yet
+};
+
+Journal journal{};
 
 } // namespace
 
@@ -89,6 +364,19 @@ void ProcessIO(const std::stop_token& stoken) {
 
             --num_requests;
         }
+
+        // sotc: the journal's buffered tail goes to disk once the writer has been quiet for a
+        // moment (more blobs usually follow within milliseconds; they join the same write).
+        while (!stoken.stop_requested() && journal.Dirty()) {
+            std::unique_lock lk{submit_mutex};
+            const bool more = request_cv.wait_for(lk, std::chrono::milliseconds(250),
+                                                  [&] { return num_requests.load() != 0; });
+            lk.unlock();
+            if (more) {
+                break;
+            }
+            journal.Flush();
+        }
     }
 }
 
@@ -109,6 +397,18 @@ constexpr std::string GetBlobFileExtension(BlobType type) {
     default:
         UNREACHABLE();
     }
+}
+
+static bool CachePackEnabled();
+
+// sotc: SOTC_CACHE_JOURNAL=0 writes every blob as its own file again. The journal needs the pack
+// (the next start merges it there), so it is off when SOTC_CACHE_PACK=0.
+static bool CacheJournalEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_CACHE_JOURNAL");
+        return (!v || v[0] != '0') && CachePackEnabled();
+    }();
+    return enabled;
 }
 
 void DataBase::Open() {
@@ -146,6 +446,15 @@ void DataBase::Open() {
             std::filesystem::create_directories(cache_path);
         }
         Prefetch();
+        if (CacheJournalEnabled()) {
+            const auto stamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::system_clock::now().time_since_epoch())
+                                   .count();
+            char name[64];
+            std::snprintf(name, sizeof(name), "%.*s%016llu", static_cast<int>(JournalPrefix.size()),
+                          JournalPrefix.data(), static_cast<unsigned long long>(stamp));
+            journal.Begin(cache_path / name);
+        }
     }
 
     io_worker = std::jthread{ProcessIO};
@@ -218,8 +527,59 @@ static void ReadCachePack(const std::filesystem::path& path,
     }
 }
 
+// sotc: reads a session journal (format above `Journal`) into `out`, later records replacing
+// earlier ones of the same name. A bad or cut-short record ends the file: it can only be the tail
+// of a session that was killed, as a journal is never appended to by a later session.
+static size_t ReadJournal(const std::filesystem::path& path,
+                          std::map<std::string, std::vector<u8>>& out) {
+    std::FILE* f = _wfopen(path.c_str(), L"rb");
+    if (!f) {
+        return 0;
+    }
+    std::vector<u8> all;
+    _fseeki64(f, 0, SEEK_END);
+    const long long size = _ftelli64(f);
+    _fseeki64(f, 0, SEEK_SET);
+    if (size > static_cast<long long>(sizeof(JournalMagic))) {
+        all.resize(static_cast<size_t>(size));
+        if (std::fread(all.data(), 1, all.size(), f) != all.size()) {
+            all.clear();
+        }
+    }
+    std::fclose(f);
+    if (all.size() < sizeof(JournalMagic) ||
+        std::memcmp(all.data(), JournalMagic, sizeof(JournalMagic)) != 0) {
+        return 0;
+    }
+    size_t pos = sizeof(JournalMagic);
+    size_t records = 0;
+    while (pos + sizeof(JournalRecHeader) <= all.size()) {
+        JournalRecHeader h;
+        std::memcpy(&h, all.data() + pos, sizeof(h));
+        const size_t body = pos + sizeof(h);
+        if (h.magic != JournalRecMagic || h.name_len == 0 || h.name_len > 512 ||
+            body + h.name_len > all.size() || body + h.name_len + h.data_len > all.size()) {
+            break;
+        }
+        const char* name = reinterpret_cast<const char*>(all.data() + body);
+        const u8* data = all.data() + body + h.name_len;
+        if (JournalCrc(h, name, data) != h.crc) {
+            break;
+        }
+        out.insert_or_assign(std::string{name, h.name_len}, std::vector<u8>(data, data + h.data_len));
+        pos = body + h.name_len + h.data_len;
+        ++records;
+    }
+    if (pos != all.size()) {
+        std::fprintf(stderr, "SOTC shader cache: journal %s ends with a broken record, %zu bytes ignored\n",
+                     path.filename().string().c_str(), all.size() - pos);
+    }
+    return records;
+}
+
 static void WriteCachePack(std::filesystem::path path,
-                           std::vector<std::pair<std::string, std::vector<u8>>> files) {
+                           std::vector<std::pair<std::string, std::vector<u8>>> files,
+                           std::vector<std::filesystem::path> merged_journals) {
     auto tmp = path;
     tmp += L".tmp";
     std::FILE* f = _wfopen(tmp.c_str(), L"wb");
@@ -244,6 +604,11 @@ static void WriteCachePack(std::filesystem::path path,
     }
     if (!ok || ec) {
         std::filesystem::remove(tmp, ec);
+        return;
+    }
+    // sotc: the journals are in the pack now (and only now): they can go.
+    for (const auto& j : merged_journals) {
+        std::filesystem::remove(j, ec);
     }
 }
 
@@ -258,11 +623,16 @@ void DataBase::Prefetch() {
         ReadCachePack(pack_path, packed);
     }
     std::vector<std::filesystem::path> files;
+    std::vector<std::filesystem::path> journals;
     std::error_code ec;
     size_t in_pack = 0, on_disk = 0;
     for (const auto& entry : std::filesystem::directory_iterator{cache_path, ec}) {
         const auto ext = entry.path().extension();
         if (!entry.is_regular_file(ec) || ext == ".tmp" || ext == ".sotcpack") {
+            continue;
+        }
+        if (entry.path().filename().string().starts_with(JournalPrefix)) {
+            journals.push_back(entry.path());
             continue;
         }
         ++on_disk;
@@ -314,17 +684,36 @@ void DataBase::Prefetch() {
             prefetched.emplace(std::move(name), std::move(data));
         }
     }
+    // sotc: blobs only the pack has (no loose file: they came from a journal that was merged)
+    // are part of the cache too.
+    const size_t pack_only = packed.size();
+    for (auto& [name, data] : packed) {
+        prefetched.emplace(name, std::move(data));
+    }
+    // sotc: the journals of earlier sessions, oldest first (their names carry a timestamp); they
+    // win over a loose file or pack entry of the same name.
+    std::sort(journals.begin(), journals.end());
+    size_t journal_records = 0;
+    for (const auto& j : journals) {
+        std::map<std::string, std::vector<u8>> blobs;
+        journal_records += ReadJournal(j, blobs);
+        for (auto& [name, data] : blobs) {
+            prefetched.insert_or_assign(name, std::move(data));
+        }
+    }
     prefetch_active = true;
-    if (CachePackEnabled() && (!files.empty() || !packed.empty())) {
+    if (CachePackEnabled() && (!files.empty() || !journals.empty())) {
         std::vector<std::pair<std::string, std::vector<u8>>> copy;
         copy.reserve(prefetched.size());
         for (const auto& [name, data] : prefetched) {
             copy.emplace_back(name, data);
         }
-        std::thread{WriteCachePack, pack_path, std::move(copy)}.detach();
+        std::thread{WriteCachePack, pack_path, std::move(copy), journals}.detach();
     }
-    std::fprintf(stderr, "SOTC shader cache: %zu files, %zu from the pack, %zu read one by one\n",
-                 on_disk, in_pack, files.size());
+    std::fprintf(stderr,
+                 "SOTC shader cache: %zu files, %zu from the pack, %zu read one by one, %zu only "
+                 "in the pack, %zu records from %zu journals\n",
+                 on_disk, in_pack, files.size(), pack_only, journal_records, journals.size());
     LOG_INFO(Render, "Prefetched {} cache files ({} MiB) in {} ms with {} threads",
              prefetched.size(), bytes >> 20,
              std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -387,6 +776,8 @@ void DataBase::Close() {
         }
         num_requests = 0;
     }
+    // sotc: the journal's tail to disk; the file stays for the next start to merge into the pack.
+    journal.End();
 
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         mz_zip_writer_finalize_archive(&zip_ar);
@@ -408,6 +799,7 @@ void DataBase::Clear() {
         std::scoped_lock lock{known_mutex};
         known_files.clear();
     }
+    journal.Discard(); // sotc: closes this session's journal so it is removed below too
     std::error_code ec;
     u64 removed = 0;
     for (const auto& entry : std::filesystem::directory_iterator(cache_path, ec)) {
@@ -418,8 +810,65 @@ void DataBase::Clear() {
     LOG_WARNING(Render, "Pipeline cache cleared ({} files): it is rebuilt for this build", removed);
 }
 
+static void Enqueue(std::packaged_task<void()>&& request) {
+    {
+        std::scoped_lock lock{m_request};
+        req_queue.emplace(std::move(request));
+    }
+    std::scoped_lock lk{submit_mutex};
+    ++num_requests;
+    request_cv.notify_one();
+}
+
+// sotc: one loose file per blob, written whole or not at all (the legacy path, and the fallback
+// when the journal cannot be written).
+static void WriteLooseFile(std::filesystem::path path, const u8* data, size_t size) {
+    using namespace Common::FS;
+    auto temporary = path;
+    temporary += ".tmp";
+    {
+        const auto file = IOFile{temporary, FileAccessMode::Create};
+        file.WriteRaw<u8>(data, size);
+    }
+    std::error_code error;
+    std::filesystem::rename(temporary, path, error);
+    if (error) {
+        std::filesystem::remove(temporary, error);
+    }
+}
+
+// sotc: the blob goes to the journal (readable at once through `pending`); the writer thread
+// appends it.
+template <typename T>
+static bool WriteJournaled(const BlobType type, const std::filesystem::path& path_,
+                           std::vector<T>&& v) {
+    std::shared_ptr<std::vector<u8>> bytes;
+    if constexpr (std::is_same_v<T, u8>) {
+        bytes = std::make_shared<std::vector<u8>>(std::move(v));
+    } else {
+        bytes = std::make_shared<std::vector<u8>>(v.size() * sizeof(T));
+        if (!bytes->empty()) {
+            std::memcpy(bytes->data(), v.data(), bytes->size());
+        }
+    }
+    std::filesystem::path path{path_};
+    path.replace_extension(GetBlobFileExtension(type));
+    const std::string name = path.filename().string();
+    const BlobPtr blob = std::move(bytes);
+    journal.Submit(name, blob);
+    Enqueue(std::packaged_task<void()>{[type, path, name, blob] {
+        if (!journal.Append(name, type, blob)) {
+            WriteLooseFile(path, blob->data(), blob->size());
+        }
+    }});
+    return true;
+}
+
 template <typename T>
 bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector<T>&& v) {
+    if (!EmulatorSettings.IsPipelineCacheArchived() && journal.Active()) {
+        return WriteJournaled(type, path_, std::move(v));
+    }
     {
         auto request = std::packaged_task<void()>{[=]() {
             auto path{path_};
@@ -432,21 +881,10 @@ bool WriteVector(const BlobType type, std::filesystem::path&& path_, std::vector
                     LOG_ERROR(Render, "Failed to add {} to the archive", path.string().c_str());
                 }
             } else {
-                using namespace Common::FS;
                 // sotc: written whole or not at all. The game process is often ended (launcher
                 // Stop, a crash) while blobs are being written, and a truncated blob from the
                 // last session is read back at the next start.
-                auto temporary = path;
-                temporary += ".tmp";
-                {
-                    const auto file = IOFile{temporary, FileAccessMode::Create};
-                    file.Write(v);
-                }
-                std::error_code error;
-                std::filesystem::rename(temporary, path, error);
-                if (error) {
-                    std::filesystem::remove(temporary, error);
-                }
+                WriteLooseFile(path, reinterpret_cast<const u8*>(v.data()), v.size() * sizeof(T));
             }
         }};
         std::scoped_lock lock{m_request};
@@ -479,6 +917,15 @@ void LoadVector(BlobType type, std::filesystem::path& path, std::vector<T>& v) {
         v.resize(file.GetSize() / sizeof(T));
         file.Read(v);
     }
+}
+
+// sotc: a blob this session wrote to the journal (queued, buffered or on disk).
+static bool JournalLookup(BlobType type, std::filesystem::path path, std::vector<u8>& data) {
+    if (!journal.Active()) {
+        return false;
+    }
+    path.replace_extension(GetBlobFileExtension(type));
+    return journal.Lookup(path.filename().string(), data);
 }
 
 bool DataBase::MayExist(const std::filesystem::path& path) {
@@ -524,6 +971,9 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u8>& dat
 
     auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
                                                            : cache_path / name;
+    if (JournalLookup(type, path, data)) {
+        return;
+    }
     if (prefetch_active) {
         path.replace_extension(GetBlobFileExtension(type));
         TakePrefetched(path, data);
@@ -544,6 +994,16 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u32>& da
 
     auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
                                                            : cache_path / name;
+    {
+        std::vector<u8> bytes;
+        if (JournalLookup(type, path, bytes)) {
+            data.resize(bytes.size() / sizeof(u32));
+            if (!data.empty()) {
+                std::memcpy(data.data(), bytes.data(), data.size() * sizeof(u32));
+            }
+            return;
+        }
+    }
     if (prefetch_active) {
         path.replace_extension(GetBlobFileExtension(type));
         TakePrefetched(path, data);
@@ -611,6 +1071,13 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
                 }
             }
         }
+        // sotc: and the blobs this session put in the journal.
+        for (const auto& journal_name : journal.Names(ext)) {
+            std::vector<u8> data;
+            if (journal.Lookup(journal_name, data)) {
+                func(std::move(data));
+            }
+        }
     }
 }
 
@@ -633,6 +1100,7 @@ size_t DataBase::CountBlobs(BlobType type) {
         for (const auto& file_name : std::filesystem::directory_iterator{cache_path, ec}) {
             count += file_name.path().extension().string().ends_with(ext);
         }
+        count += journal.Names(ext).size(); // sotc: this session's journal blobs
     }
     return count;
 }

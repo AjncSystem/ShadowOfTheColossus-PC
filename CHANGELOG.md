@@ -5,6 +5,8 @@
   tela de 1080 linhas na proporção da saída (1080 × L/A) em vez da largura de renderização. Com
   DLSS a renderização é menor (1704x720 em 2560x1080) e a barra amarela voltava a parar longe do
   círculo; em 16:9 com DLSS sem o modo PS4 Pro a C2 também a quebrava.
+- **Limite de 30 FPS:** "30" (menu F1 ou F7) segura 30 FPS mesmo quando o jogo pede para não
+  limitar (modo PS4 Pro); antes ficava em ~42.
 
 ## 0.60.6-C2 — 2026-10-26
 - **Tela larga (21:9, 32:9): barras de vida e stamina certas (#301, #202).** A barra de vida

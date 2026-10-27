@@ -259,7 +259,10 @@ def write_key_bindings(keys):
 EFFECTS = [('fx_vignette', ('Vinheta (cantos escurecidos)', 'Vignette (darkened corners)'),
             'r_vignetteOverrideEnable=1 r_vignetteEnable=0'),
            ('fx_fog', ('Névoa atmosférica', 'Atmospheric fog'), 'fog_enable=0'),
-           ('fx_ssao', ('Oclusão ambiente (SSAO)', 'Ambient occlusion (SSAO)'), 'AO_Mode=0')]
+           ('fx_ssao', ('Oclusão ambiente (SSAO)', 'Ambient occlusion (SSAO)'), 'AO_Mode=0'),
+           # 4isaque4 (#294): +34% FPS on a Ryzen 7 5700X + RX 6700 XT at 720p, with no sun shadows.
+           ('fx_sunshadows', ('Sombras do sol (desligar: mais FPS, sem sombras do sol)',
+                              'Sun shadows (off: more FPS, no sun shadows)'), 'r_enableCascadeShadows=0')]
 # Common screen sizes: 16:9, 16:10, 21:9 (ultrawide) and 32:9 (super ultrawide).
 # 5120x2160 is left out: the game faults at start (memory), 3840x2160 runs.
 SCREENS = [('1600x900', '16:9, 900p'), ('1920x1080', '16:9, 1080p'), ('2560x1440', '16:9, 1440p'), ('3840x2160', '16:9, 4K'),

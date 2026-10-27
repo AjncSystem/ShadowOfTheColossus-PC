@@ -28,3 +28,11 @@ class FpsModeTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+@unittest.skipIf(launcher is None, 'launcher not importable')
+class EffectDefaultsTests(unittest.TestCase):
+    def test_every_effect_has_a_default(self):
+        # The settings window reads each effect key at build time: a missing default closed the launcher (#316).
+        for key, _title, _cvar in launcher.EFFECTS:
+            self.assertIn(key, launcher.APP_DEFAULTS, key)

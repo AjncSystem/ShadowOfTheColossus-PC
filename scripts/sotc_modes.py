@@ -72,7 +72,8 @@ CVAR_MODES = {
 # Render size (PS4 mode; the PS4 Pro values next to them stay): (address, kind, original).
 # 'W'/'H' an integer immediate (the last 4 bytes of the instruction at address), 'w'/'h' a float
 # (the PS4 entry of a [PS4, Pro] table), 'w2'/'h2' half of it, 'a' the aspect float W/H,
-# 'P' the render target pool (322.5 MiB at 1080p, scaled by the pixel count).
+# 'P' the render target pool (322.5 MiB at 1080p, scaled by the pixel count), 'v' the width of a
+# 1080 line canvas of the render's aspect (1080 * W/H).
 # Page allocator (0x41a1e0): it carves a new chunk only when the free-page tally at pool+0x74 is
 # 0, and the tally drifts above the bitmap's real free count. With the bitmap empty and the tally
 # not 0, the scan found no bit and read bitmap[-1] (crash at 0x41a371). On a failed scan: tally 0,
@@ -117,11 +118,12 @@ RENDER_SITES = [
     (0x01667f94, 'w2', '00007044'), (0x01667f9c, 'h2', '00000744'),
     # the default camera's aspect (16/9)
     (0x0166633c, 'a', '398ee33f'),
-    # HUD gauges: {0, 0, 1920.0, h} rectangles the stamina bar's fill is laid out in; left at 1920
-    # the yellow bar stopped short of the grip circle in 21:9 and filled the wrong way (#301,
-    # found with SOTC_RENDER_EXTRA and the user's tests, 26 Oct)
-    (0x008e2cf1, 'w', 'c78550feffff0000f044'),
-    (0x00920309, 'w', 'c78560feffff0000f044'),
+    # HUD gauges: {0, 0, 1920.0, h} rectangles the stamina bar's fill is laid out in, in units of a
+    # 1080 line canvas ('v': 1080 * W/H, not the render width: with DLSS the render is smaller and
+    # the bar broke again). Left at 1920 the yellow bar stopped short of the grip circle in 21:9
+    # and filled the wrong way (#301, found with SOTC_RENDER_EXTRA and the user's tests, 26 Oct).
+    (0x008e2cf1, 'v', 'c78550feffff0000f044'),
+    (0x00920309, 'v', 'c78560feffff0000f044'),
 ]
 RT_POOL = 0x14280000
 # EU 1.01 / US 1.00: the command line lea and the fps60 site.
@@ -180,7 +182,8 @@ def render_patches(elf, ph, size):
         raise SystemExit(f'render size {size}: 640x360 to 7680x4320, multiples of 8')
     values = {'W': struct.pack('<I', w), 'H': struct.pack('<I', h), 'w': struct.pack('<f', w),
               'h': struct.pack('<f', h), 'w2': struct.pack('<f', w / 2), 'h2': struct.pack('<f', h / 2),
-              'a': struct.pack('<f', w / h), 'P': struct.pack('<I', render_pool(w, h))}
+              'a': struct.pack('<f', w / h), 'P': struct.pack('<I', render_pool(w, h)),
+              'v': struct.pack('<f', 1080 * w / h)}
     writes = []
     # SOTC_RENDER_KEEP=<addr>,<addr>: sites left at the 1920x1080 value (finding the HUD's sites,
     # #301: health and stamina bars stretched in 21:9).

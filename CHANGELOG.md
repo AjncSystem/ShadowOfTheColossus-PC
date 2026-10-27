@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.60.6-plus15 — 2026-10-27 (fork Lucas-blip-png)
+- **Sombras do sol desligáveis no lançador** (efeitos visuais → "Sombras do sol", `r_enableCascadeShadows=0`): ideia e medição de
+  4isaque4 (#294), com repetição intercalada: +34% de FPS a 720p numa Ryzen 7 5700X + RX 6700 XT, sem sombras do sol. Vem ligado.
+- **RX 9070 XT, `ErrorOutOfDeviceMemory` em buffers de 24 a 96 MiB (#293, relato e logs de Coriolys):** com 13 GiB de orçamento livre,
+  o driver recusava o buffer (memória dedicada com endereço de dispositivo) e o jogo fechava com o código 0x17. Agora, antes de
+  abortar, o buffer é tentado sem memória dedicada e depois em memória do sistema (o log mostra `SOTC buffer fallback`).
+  Não testado numa placa AMD: depende de quem reportou confirmar.
+- **Diagnóstico de stutter:** tradução de shader na thread de comandos aparece no log como `SOTC SYNC PIPELINE shader (compute)`
+  (limite em `SOTC_SYNC_PIPELINE_MS`). Com o cache de shaders frio, 386 shaders de compute (cerca de 913 ms) são traduzidos ali, em
+  rajadas ao entrar numa área; `SOTC_ASYNC_COMPUTE_TRANSLATE=1` (experimental, desligado) leva o pior quadro de 571 para 188 ms,
+  mas descarta um compute de execução única e a névoa do Santuário some. Números e o que não deu certo: `docs/sotc/STUTTER.md`.
+- Medido: no deserto com cache aquecido o plus14 teve 3 a 5 quadros acima de 50 ms em 196 s, contra 78 do plus12 (a rota varia).
+
 ## 0.60.6-plus14 — 2026-10-26 (fork Lucas-blip-png)
 - **Caminhos rápidos do processador de comandos e do despacho ligados por padrão** (`CpFastPaths`, bit 20, e `DispatchFastPath`,
   bit 40, do PR #308 de Lukto02 / Luca Zarecki; ele os deixou desligados porque no teste dele o quadro não mexia). Medimos em

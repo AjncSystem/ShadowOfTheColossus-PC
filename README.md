@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC native port · v0.60.6-plus14
+# Shadow of the Colossus — PC native port · v0.60.6-plus15
 
 **The original 0.60.6, plus CPUs without BMI1 (pre-Haswell), CPUs with 4 threads, 120 Hz
 fullscreen, a 32-lane fix for AMD GCN cards (RX 470–590, to test), and the FSR 3.1 and DLSS 4.5 upscalers (NVIDIA RTX).** Everything in [AjncSystem's 0.60.6](https://github.com/AjncSystem/ShadowOfTheColossus-PC)
@@ -210,6 +210,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.60.6-plus15** | **Lucas-blip-png fork:** launcher option to turn the sun shadows off (+34% FPS in 4isaque4's measurement, #294); RX 9070 XT out-of-device-memory buffers are retried without dedicated memory and then in system memory (#293, reported by Coriolys); stutter diagnostics and notes (`docs/sotc/STUTTER.md`). |
 | **0.60.6-plus14** | **Lucas-blip-png fork:** the command-processor and dispatch fast paths of Lukto02's PR #308, off by default there, are on (Shrine 71.7 -> 75.5 FPS in A/B, 0 mismatches in >50 M verify checks) with a retrained PGO profile. `SOTC_CP_FAST=0` / `SOTC_DISPFAST=0` turn them off. |
 | **0.60.6-plus13** | **Lucas-blip-png fork:** performance from Lukto02's PR #308 (draw-thread fast paths, DrawReplay, readback intervals; Shrine +8.6%, desert route about +24% in A/B) with a retrained PGO profile (another +6-7%); three downloads: Livre (no preset), Otimizada NVIDIA and Otimizada AMD/Intel (docs/sotc/PGO.md). |
 | **0.60.6-plus12** | **Lucas-blip-png fork:** Maximum texture quality allowed in PS4 Pro mode (experimental, from C1, now that the page allocator fix is in); F7 switches 30 -> 60 -> unlimited FPS. |

@@ -23,7 +23,8 @@ namespace Serialization {
 // LOD feedback (sotc_lod_stats.h); binaries built with SOTC_LOD_FEEDBACK=0 are another version.
 // 37/135 = invariant position on barycentric-emulation pipelines (ground-level texture/depth
 // mismatch between the pipeline with the geometry shader and the one without; PR #258).
-static const u32 ShaderBinaryVersion = Shader::LodFeedbackEnabled() ? 37u : 135u;
+// 38 = early fragment tests on the LOD feedback shaders (emit_spirv.cpp).
+static const u32 ShaderBinaryVersion = Shader::LodFeedbackEnabled() ? 38u : 135u;
 static constexpr u32 ShaderMetaVersion = 21u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization

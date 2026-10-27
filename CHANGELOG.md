@@ -1,5 +1,8 @@
 # Changelog
 
+## Não lançado
+- **Mapeamento fixo sobre memória viva avisa a GPU:** `place()` com `MAP_FIXED` apagava as áreas antigas sem mandar o `HOOK_UNMAP`, então o lado da GPU podia manter buffers e imagens do conteúdo antigo. Agora o aviso sai antes, como no `unmap`. Não consegui provar que isso causava as quedas de #283/#289/#255 (sem reprodução); a rota do deserto (2 passadas, 78 e 86 FPS) e as quedas não mudaram.
+
 ## 0.60.6-plus20 — 2026-10-27 (fork Lucas-blip-png)
 - **Cache de shaders frio mais curto (tradução à frente de compute):** antes de executar um buffer de comandos, o processador de comandos
   varre os pacotes (seguindo os buffers indiretos), acha os `COMPUTE_PGM` + `DISPATCH` e manda traduzir os shaders de compute novos nos

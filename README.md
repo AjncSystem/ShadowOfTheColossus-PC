@@ -8,7 +8,7 @@ generation as an option, no crash with high quality textures and the smaller rea
 from this fork; the title-screen hang fix, low-memory PCs, a `user` folder per copy), with this
 fork's work on top.
 
-![Shrine of Worship, uncapped, Ryzen 7 5700X + RTX 5060 Ti, 0.60.6-plus6 (the port's FPS panel; it reads about 3 FPS lower while the screen is being recorded)](docs/img/sotc-fork.gif)
+![Shrine of Worship, uncapped, Ryzen 7 5700X + RTX 5060 Ti, 0.60.6-plus14 (the port's FPS panel; it reads about 3 FPS lower while the screen is being recorded)](docs/img/sotc-fork.gif)
 
 What it adds:
 - **The Shrine of Worship at 59-61 FPS uncapped** on a Ryzen 7 5700X with an RTX 5060 Ti (it was 53-54 on the same

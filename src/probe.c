@@ -20,6 +20,7 @@
 #include <tlhelp32.h>
 #include <wchar.h>
 #include <mmsystem.h>
+#include <signal.h>
 #else
 #include <sys/mman.h>
 #include <malloc.h>
@@ -1012,6 +1013,12 @@ static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 static LONG WINAPI unhandled_fault(EXCEPTION_POINTERS *info) { return fatal_exception(info); }
+static void sotc_exit_note(void) { fputs("SOTC: the process ended through exit()\n",stderr); fflush(NULL); }
+static void sotc_abort_note(int sig) {
+    (void)sig;
+    fputs("SOTC: abort() was called by the process (SIGABRT)\n",stderr); fflush(NULL);
+    TerminateProcess(GetCurrentProcess(),134);
+}
 /* Guest code reads its TCB with `mov rax, gs:[0]` (link_*.py rewrote fs:[0]); on Windows
  * the displacement becomes the TEB TLS slot that holds the guest TCB (runtime_thread.c). */
 uint32_t runtime_thread_tcb_offset(void);
@@ -1388,6 +1395,11 @@ int main(int argc, char **argv) {
     if (getenv("BB_STACKS_TRIGGER")) CreateThread(NULL,0,stacks_watcher,(void *)getenv("BB_STACKS_TRIGGER"),0,NULL);
     if (getenv("SOTC_PROFILE")) CreateThread(NULL,0,profiler,(void *)getenv("SOTC_PROFILE"),0,NULL);
     SetUnhandledExceptionFilter(unhandled_fault);
+    /* sotc: the silent exits (code 0xffffffff after "Resource Loading", #244 #291 #299 #61) leave no trace.
+     * Say which way the process ended: through exit() (this line is printed), through abort(), or not at all
+     * (killed from outside, e.g. by security software). */
+    atexit(sotc_exit_note);
+    signal(SIGABRT,sotc_abort_note);
     if (getenv("BB_STRICT_HANDLES")) {
         PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY strict={0};
         strict.RaiseExceptionOnInvalidHandleReference=1;

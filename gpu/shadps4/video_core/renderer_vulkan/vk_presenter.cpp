@@ -816,8 +816,24 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // sotc: DLSS super resolution (SOTC_UPSCALER=dlss): the game's scene before its UI, upscaled
     // to the frame's size; the post process pass puts the UI layer back over it. Frames without
     // that scene (menus, loading screens) are presented as before.
-    const auto upscaled = Dlssg::Upscale(frame->id, draw_scheduler, texture_cache, runtime,
-                                         frame->width, frame->height);
+    auto upscaled = Dlssg::Upscale(frame->id, draw_scheduler, texture_cache, runtime,
+                                   frame->width, frame->height);
+    // sotc: a buffer flipped again right after itself (PS4 Pro mode at the 30 FPS cap flips each
+    // rendered frame twice) has nothing new drawn: no composite, no DLSS inputs. That repeat went
+    // out without DLSS and without the vignette (taken out of the game's tonemap to be applied
+    // after upscaling): every other present lost both and the picture shook, the edges most
+    // (27 Oct). It shows the last DLSS output again. SOTC_DLSS_REPEAT=0: as before.
+    static const bool dlss_repeat = [] {
+        const char* v = std::getenv("SOTC_DLSS_REPEAT");
+        return !v || v[0] != '0';
+    }();
+    static Dlssg::Upscaled dlss_last{};
+    static VAddr dlss_last_address = 0;
+    if (!upscaled.scene && dlss_repeat && dlss_last.scene && cpu_address == dlss_last_address) {
+        upscaled = dlss_last;
+    }
+    dlss_last = upscaled.scene && !upscaled.scene_low ? upscaled : Dlssg::Upscaled{};
+    dlss_last_address = cpu_address;
     if (Dlssg::SuperResolutionAvailable() && Dlssg::CompareMode()) {
         BbOverlay::SetUpscalerLabel(upscaled.scene && !upscaled.scene_low ? Dlssg::ModeName()
                                     : fsr_settings.enable                 ? "FSR1"

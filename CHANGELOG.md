@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.60.6-plus19 — 2026-10-27 (fork Lucas-blip-png)
+- **Grama ajustável** (distância, altura, mato, detalhe e fade; menu da grama dentro do jogo; buffers de grama 4x maiores): trabalho de
+  tabnul (197754f), AjncSystem (30002ea: o menu mostra o valor do jogo em vez de 0) e Oussama Afassi (teste do lançador, #94), trazidos do
+  0.60.6-C1 com a autoria original. Mudança de padrão: sombras da grama em 2 (como no PS4; antes 3) e detalhe do patch 0,25. Testei só que
+  o jogo abre e que a rota do deserto (196 s, 3840x1080) roda sem queda; falta olhar a grama de longe e o custo de VRAM em jogo.
+- **Predefinições no lançador** (página de imagem): Compatibilidade, Equilibrado e Desempenho ajustam FPS, upscaler, textura, filtro e
+  geração de quadros de uma vez; cada opção continua editável depois.
+- **Aviso de caminho:** o lançador avisa quando a pasta do port ou do jogo tem acento ou é longa (mais de 150 letras), pois repacks em
+  caminhos assim estavam por trás de jogos que fechavam sem erro (#299, #282).
+- **Diagnóstico da saída silenciosa (código 0xffffffff depois de "Resource Loading", #244, #291, #299, #61):** o log passa a dizer se o
+  processo terminou por `exit()` ou por `abort()`. Sem nenhuma das duas linhas, o processo foi encerrado de fora (antivírus, por exemplo).
+- **Memória flexível dividida (`split_at`):** ao dividir um mapeamento flexível (mprotect ou munmap no meio), a metade direita mantinha o
+  endereço de backing da esquerda, e leituras, escritas e a liberação seguinte usavam as páginas erradas. Achado ao analisar as quedas por
+  leitura de endereço não canônico (#283, #289, #255); não provei que esse caminho seja o que as causa, nenhuma queda foi reproduzida aqui.
+- Medições (Santuário, Ryzen 7 5700X, RTX 5060 Ti): Mailbox e FIFO empatam (~70 FPS, mesmo p99); por número de CPUs 4/6/8/16 dão
+  56/65/70/73 FPS (4 CPUs eram 34 antes da prioridade de threads); a `GpuDraw` está plana, nenhuma função passa de 3%.
+
 ## 0.60.6-plus18 — 2026-10-27 (fork Lucas-blip-png)
 - **Campo de visão ajustável (#179):** o lançador ganhou "Campo de visão" (100% original a 140%). A câmera do jogo converte os graus
   em radianos num único ponto (uma constante de 4 bytes, sem outro uso), então o patch multiplica essa constante e vale para todas as

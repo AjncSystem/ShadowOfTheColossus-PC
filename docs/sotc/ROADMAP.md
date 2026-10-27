@@ -177,6 +177,27 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 | 23 | Ícone próprio da janela do jogo (menino com a espada; ou o do jogo, ou imagem do jogador) | ✅ | `83ecb1c`. |
 | 24 | Release v0.58.1 | ✅ | Publicada em 19/10 (texturas em alta qualidade + ícone da janela). Releases públicas: 0.58.1, 0.58, 0.57 (0.56 removida; tag mantida). |
 
+## Fase 7 — Fork Lucas-blip-png, 0.60.6-plus5 a plus21 (25/10 a 28/10)
+
+Detalhes e números de cada versão no [CHANGELOG](../../CHANGELOG.md).
+
+| # | Item | Estado | Notas |
+|---|---|---|---|
+| 25 | Desempenho do Santuário: barreira GENERAL→GENERAL uma vez por época, leitura parcial (plus5), cache de pipelines do driver (plus6) | ✅ | Santuário 54 → 59-61 FPS. |
+| 26 | VRAM automática, 1440p com FSR 3/DLSS, válvula de LOD (plus8, plus10), vibração e geração de quadros sem interface (plus9) | ✅ | |
+| 27 | CPUs de 4 threads: prioridades das threads (plus11) | ✅ | Santuário em 4 CPUs 34 → 47-48 FPS. 4/6/8/16 CPUs: 56/65/70/73 FPS. |
+| 28 | PR #308 (Lukto02): caminhos rápidos da `GpuDraw`, mais `CpFastPaths` e `DispatchFastPath` ligados (plus13, plus14) | ✅ | Santuário +8,6% e depois +4-5%; deserto ~+24%; PGO retreinado (+6-7%). |
+| 29 | Textura Máxima no modo Pro, F7 em 3 estágios (plus12), alocador de páginas (plus11) | ✅ | Da 0.60.6-C1 (tabnul, AjncSystem). |
+| 30 | Sombras do sol desligáveis (plus15), fallback de buffer na RX 9070 XT (#293, plus15), HostCached em RAM (#319, plus21) | 🔧 | Sem placa AMD aqui; ninguém confirmou a correção. |
+| 31 | HUD em 21:9 (plus16), pack único do cache de shaders (plus16), hotfix do lançador (plus17) | ✅ | |
+| 32 | Campo de visão (#179, plus18), grama ajustável, presets, aviso de caminho, diagnóstico da saída silenciosa (plus19) | ✅ | Saída 0xffffffff (#244, #291, #299, #61): só diagnóstico, causa desconhecida. |
+| 33 | Cache de shaders frio: tradução de compute à frente (plus20) | ✅ | Pior quadro 493-618 → 174 ms. |
+| 34 | `MAP_FIXED` avisa a GPU, contadores de proteção de página (plus21) | ✅ | Sem prova de que corrige as quedas de #283/#289/#255. |
+| 35 | Notas da atualização em inglês no lançador (#321) | ✅ | No `main`; vale a partir do plus22. |
+| 36 | Divisão da `GpuDraw`, fila de readback, ASC em fila própria, `FaultGrace` maior | ❌ | Medidos e descartados (ganho abaixo do ruído); ver `STUTTER.md` e `DRAW-REPLAY.md`. |
+| 37 | Geração de quadros 2x no deserto (1% low apresentado) | ⏳ | Depende de medição no lançador real (F10). |
+| 38 | Água, barra de stamina tremendo, AMD GCN, Intel Arc, FSR 4.1 | ⏳ | Faltam RenderDoc, hardware ou SDK. |
+
 ## Fora do roteiro
 
 - Issue #138 é golpe (malware: `iex(irm gitrm.sbs)` como admin) — apagar e denunciar a conta.

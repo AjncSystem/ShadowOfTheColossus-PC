@@ -59,6 +59,15 @@ def latest_release(timeout=10):
             'sha256': digest[7:].lower() if digest.startswith('sha256:') else ''}
 
 
+def release_notes(body, english):
+    """The release body in one language. A line "## English" starts the English part; a body
+    without one is shown whole."""
+    parts = re.split(r'^#+[ \t]*English[ \t]*$', body or '', maxsplit=1, flags=re.M | re.I)
+    if len(parts) == 2 and english and parts[1].strip():
+        return parts[1].strip()
+    return parts[0].strip()
+
+
 def is_newer(release, current):
     return bool(release) and version_key(release['version']) > version_key(current)
 

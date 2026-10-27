@@ -19,6 +19,15 @@ def release_zip(path, files):
             archive.writestr(name, data)
 
 
+class NotesTests(unittest.TestCase):
+    def test_languages(self):
+        body = 'Texto\n\n## English\nText\n'
+        self.assertEqual(sotc_update.release_notes(body, False), 'Texto')
+        self.assertEqual(sotc_update.release_notes(body, True), 'Text')
+        self.assertEqual(sotc_update.release_notes('So texto', True), 'So texto')
+        self.assertEqual(sotc_update.release_notes(None, True), '')
+
+
 class VersionTests(unittest.TestCase):
     def test_order(self):
         key = sotc_update.version_key

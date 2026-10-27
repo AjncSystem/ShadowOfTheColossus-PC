@@ -22,6 +22,7 @@ Writes two files for the loader:
 The original bytes are checked first: another game version gets neither file's changes.
 """
 import argparse
+import os
 import re
 from pathlib import Path
 import struct

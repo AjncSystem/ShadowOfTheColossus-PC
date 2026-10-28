@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC native port · v0.60.6-plus23
+# Shadow of the Colossus — PC native port · v0.60.6-plus24
 
 **The original 0.60.6, plus CPUs without BMI1 (pre-Haswell), CPUs with 4 threads, 120 Hz
 fullscreen, a 32-lane fix for AMD GCN cards (RX 470–590, to test), and the FSR 3.1 and DLSS 4.5 upscalers (NVIDIA RTX).** Everything in [AjncSystem's 0.60.6](https://github.com/AjncSystem/ShadowOfTheColossus-PC)
@@ -210,7 +210,8 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
-| **0.60.6-plus23** | **Lucas-blip-png fork:** F8 pressed in a burst no longer crashes the NVIDIA driver (one switch per 1.5 s); `BB_WRITE_LOG=3` crash diagnostic (last GPU writes per memory page). |
+| **0.60.6-plus24** | **Lucas-blip-png fork:** shader cache journal (one file per session instead of ~8,300), background cache writer and speculative compute pipelines (Lukto02, PR #3). |
+| 0.60.6-plus23 | **Lucas-blip-png fork:** F8 pressed in a burst no longer crashes the NVIDIA driver (one switch per 1.5 s); `BB_WRITE_LOG=3` crash diagnostic (last GPU writes per memory page). |
 | 0.60.6-plus22 | **Lucas-blip-png fork:** host memory leak of the command processor fixed (~44 MB/min, PR by Lukto02), texture cache fixes from 0.60.6-C1, per-frame time log, English update notes in the launcher. |
 | 0.60.6-plus21 | **Lucas-blip-png fork:** fixed mappings over live memory now tell the GPU side; HostCached buffer last-resort fix; host page-protect counters in the FPS report. |
 | 0.60.6-plus20 | **Lucas-blip-png fork:** shorter cold shader cache: new compute shaders are translated ahead, in parallel, on the pipeline workers (worst frame of the desert route with an empty cache 493-618 ms to 174 ms). |

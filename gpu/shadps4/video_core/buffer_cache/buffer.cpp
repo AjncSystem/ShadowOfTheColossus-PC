@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
+#include <atomic>
+#include <cstdlib>
 #include <numeric>
 
 #include "common/alignment.h"
@@ -27,6 +29,8 @@ std::string_view BufferTypeName(MemoryType type) {
         return "DeviceLocal";
     case MemoryType::Sparse:
         return "Sparse";
+    case MemoryType::DeviceHostVisible:
+        return "DeviceHostVisible";
     default:
         return "Invalid";
     }
@@ -37,10 +41,19 @@ std::string_view BufferTypeName(MemoryType type) {
                                            : VkMemoryPropertyFlagBits{};
 }
 
+[[nodiscard]] VkMemoryPropertyFlags MemoryUsageRequiredVmaFlags(MemoryType type) {
+    // sotc: DeviceHostVisible must come from the large BAR heap, not from a host-only type.
+    return type == MemoryType::DeviceHostVisible
+               ? VkMemoryPropertyFlags{VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT}
+               : VkMemoryPropertyFlags{};
+}
+
 [[nodiscard]] VmaAllocationCreateFlags MemoryUsageVmaFlags(MemoryType type) {
     switch (type) {
     case MemoryType::HostUncached:
     case MemoryType::Stream:
+    case MemoryType::DeviceHostVisible:
         return VMA_ALLOCATION_CREATE_MAPPED_BIT |
                VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
     case MemoryType::HostCached:
@@ -55,6 +68,7 @@ std::string_view BufferTypeName(MemoryType type) {
     switch (type) {
     case MemoryType::DeviceLocal:
     case MemoryType::Stream:
+    case MemoryType::DeviceHostVisible:
         return VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     case MemoryType::HostUncached:
     case MemoryType::HostCached:
@@ -62,6 +76,50 @@ std::string_view BufferTypeName(MemoryType type) {
     default:
         return VMA_MEMORY_USAGE_UNKNOWN;
     }
+}
+
+namespace {
+
+// sotc: total bytes of DeviceHostVisible memory reserved or allocated, checked against the cap.
+std::atomic<u64> rebar_reserved{0};
+
+// sotc: SOTC_REBAR_MB caps the ReBAR bytes (default 512 MiB), leaving the rest of the large heap
+// to images and to the other buffers.
+u64 RebarCapBytes() {
+    static const u64 cap = [] {
+        const char* v = std::getenv("SOTC_REBAR_MB");
+        return (v ? std::strtoull(v, nullptr, 10) : 512ull) << 20;
+    }();
+    return cap;
+}
+
+void ReleaseRebarBytes(u64 bytes) {
+    rebar_reserved.fetch_sub(bytes, std::memory_order_relaxed);
+}
+
+} // Anonymous namespace
+
+MemoryType ResolveRebarType(const Vulkan::Instance& instance, u64 size, MemoryType fallback) {
+    if (!instance.RebarUploadEnabled()) {
+        return fallback;
+    }
+    const u64 cap = RebarCapBytes();
+    u64 used = rebar_reserved.load(std::memory_order_relaxed);
+    do {
+        if (used + size > cap) {
+            return fallback;
+        }
+    } while (!rebar_reserved.compare_exchange_weak(used, used + size, std::memory_order_relaxed));
+
+    // Do not starve other allocations of the heap: stay within the driver's budget.
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+    vmaGetHeapBudgets(instance.GetAllocator(), budgets.data());
+    const VmaBudget& heap = budgets[instance.LargeBarHeapIndex()];
+    if (heap.usage + size > heap.budget) {
+        ReleaseRebarBytes(size);
+        return fallback;
+    }
+    return MemoryType::DeviceHostVisible;
 }
 
 UniqueBuffer::UniqueBuffer(vk::Device device_, VmaAllocator allocator_)
@@ -77,6 +135,10 @@ void UniqueBuffer::Destroy() {
     } else if (buffer) {
         device.destroyBuffer(buffer);
     }
+    if (rebar_bytes) {
+        ReleaseRebarBytes(rebar_bytes);
+        rebar_bytes = 0;
+    }
     buffer = VK_NULL_HANDLE;
     allocation = VK_NULL_HANDLE;
     bda_addr = 0;
@@ -88,11 +150,11 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
     if (mem_type != MemoryType::Sparse) {
         const VmaAllocationCreateFlags bda_flag =
             with_bda ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0;
-        const VmaAllocationCreateInfo alloc_ci = {
+        VmaAllocationCreateInfo alloc_ci = {
             .flags =
                 VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | bda_flag | MemoryUsageVmaFlags(mem_type),
             .usage = MemoryUsageVma(mem_type),
-            .requiredFlags = 0,
+            .requiredFlags = MemoryUsageRequiredVmaFlags(mem_type),
             .preferredFlags = MemoryUsagePreferredVmaFlags(mem_type),
             .pool = VK_NULL_HANDLE,
             .pUserData = nullptr,
@@ -102,6 +164,19 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
         VkBuffer unsafe_buffer{};
         VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
                                           &allocation, out_alloc_info);
+        if (mem_type == MemoryType::DeviceHostVisible) {
+            if (result == VK_SUCCESS) {
+                rebar_bytes = buffer_ci.size;
+            } else {
+                // sotc: refused (fragmentation, driver): release the reservation and allocate
+                // the way MemoryType::Stream does. Silent, no assert.
+                ReleaseRebarBytes(buffer_ci.size);
+                alloc_ci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+                alloc_ci.requiredFlags = 0;
+                result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
+                                         &allocation, out_alloc_info);
+            }
+        }
         if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
             // Same as images: going over the video memory budget beats aborting.
             VmaAllocationCreateInfo over_budget_ci = alloc_ci;
@@ -153,6 +228,17 @@ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes
         .usage = AllFlags,
         .sharingMode = vk::SharingMode::eExclusive,
     };
+    // sotc: SOTC_XFER_QUEUE: uploads copy into and out of these buffers on the transfer queue.
+    const std::array<u32, 2> families = {instance.GetGraphicsQueueFamilyIndex(),
+                                         instance.GetXferQueueFamilyIndex()};
+    // sotc: SOTC_HOST_IMPORT alone writes only device-local staging on the transfer queue: the
+    // other buffers stay exclusive, as without the transfer queue.
+    if (instance.IsXferRoutingEnabled() ||
+        (instance.IsHostImportEnabled() && mem_type_ == MemoryType::DeviceLocal)) {
+        buffer_ci.sharingMode = vk::SharingMode::eConcurrent;
+        buffer_ci.queueFamilyIndexCount = static_cast<u32>(families.size());
+        buffer_ci.pQueueFamilyIndices = families.data();
+    }
     VmaAllocationInfo alloc_info{};
     buffer.Create(buffer_ci, mem_type, &alloc_info);
 

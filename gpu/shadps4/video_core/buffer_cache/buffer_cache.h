@@ -10,6 +10,7 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <vector>
@@ -20,6 +21,15 @@
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
+#include "video_core/buffer_cache/host_import.h"
+#include "video_core/buffer_cache/async_upload.h"
+
+extern "C" {
+// runtime_memory.c (sotc: SOTC_ASYNC_UPLOAD resolves guest ranges to the backing view)
+int runtime_memory_region(uintptr_t address, uintptr_t* start, uintptr_t* end, int* mapped);
+const unsigned char* runtime_memory_backing_pointer(uintptr_t address);
+const unsigned char* runtime_memory_backing_view(uint64_t* size);
+}
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -261,6 +271,35 @@ private:
 
     bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
 
+    /// sotc: drops the hashed uploads overlapping [addr, addr + size). Any write into the arena
+    /// (RecordCurrentWrite) and any unbind (UnbindResident) make the stored hash stale.
+    void EraseHashedUploads(VAddr addr, u64 size);
+    struct HashedUpload {
+        u64 size;
+        u64 hash;
+    };
+    std::mutex hashed_uploads_mutex; // unbinds run on guest threads (ReleaseMemory)
+    std::multimap<VAddr, HashedUpload> hashed_uploads;
+    std::atomic<size_t> hashed_upload_count{0};
+
+public:
+    /// sotc: SOTC_FAULT_GRANULE. Called from the guest write fault handler for each page of the
+    /// faulting granule it marks CPU-modified: remembers a hash of the page's current bytes.
+    void NoteGranulePage(VAddr page);
+    /// sotc: forgets the granule snapshots in [addr, addr + size) (unbind, unmap): the arena no
+    /// longer holds what the guest held then.
+    void EraseGranuleSnapshots(VAddr addr, u64 size);
+
+private:
+    /// sotc: drops from `copies` (address-based, before staging offsets) the 4 KiB pages that a
+    /// granule marked dirty but whose bytes still equal the hash taken then: the guest did not
+    /// write them, so the arena keeps what it holds (it can differ from guest memory on pages the
+    /// tracker calls clean, and uploading guest bytes over it broke scenes).
+    void DropUnchangedGranulePages(boost::container::small_vector<vk::BufferCopy, 4>& copies);
+    std::mutex granule_mutex;
+    std::unordered_map<VAddr, u64> granule_snapshots;
+    std::atomic<size_t> granule_snapshot_count{0};
+
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
     Vulkan::Runtime& runtime;
@@ -278,6 +317,12 @@ private:
     std::shared_mutex gpu_modified_mutex;
 
     std::unique_ptr<FaultManager> fault_manager;
+    std::unique_ptr<HostImport> host_import; ///< sotc: SOTC_HOST_IMPORT, null when off
+    /// sotc: SOTC_ASYNC_UPLOAD: queues the CPU copy of an upload for the copy threads and
+    /// records its staging-to-arena copy. False (nothing done) when it must stay here.
+    bool TryUploadAsync(AsyncUpload& async_upload, const Buffer* arena,
+                        boost::container::small_vector<vk::BufferCopy, 4>& copies,
+                        u64 total_size_bytes);
     std::unique_ptr<Buffer> bda_pagetable_buffer;
     bool fault_process_pending{};
 
@@ -285,6 +330,14 @@ private:
     std::deque<Buffer> arenas;
     std::vector<ArenaBinds> pending_binds;
     Vulkan::Semaphore memory_semaphore;
+    /// sotc: SOTC_UNBIND_GPU_WAIT: work timeline tick the next sparse bind waits for (0 = none).
+    u64 pending_bind_wait_tick{};
+    /// sotc: SOTC_UNBIND_GPU_WAIT: the next bind carries an unbind (set by ReleaseMemory).
+    bool unbind_bind_next{};
+    /// sotc: SOTC_UNBIND_GPU_WAIT: memory_semaphore tick of the last bind that carried an unbind.
+    /// Every later bind waits for it, so blocks an unbind freed are not bound again before the
+    /// unbind has run on the GPU (the CPU side of an unbind frees them at once).
+    u64 unbind_bind_tick{};
 
     struct Backing : public Interval {
         vk::DeviceMemory memory;
@@ -379,6 +432,19 @@ private:
     /// Memory and first block for blocks of arena backing (video memory, else system memory).
     std::pair<vk::DeviceMemory, u64> AllocateArenaBlocks(u64 blocks);
     void FreeArenaBlocks(vk::DeviceMemory memory, u64 start, u64 blocks);
+    void ReturnArenaRun(vk::DeviceMemory memory, u64 start, u64 blocks);
+    /// sotc: SOTC_ARENA_TICK_FREE=1: runs freed by FreeArenaBlocks wait here, stamped with the
+    /// scheduler tick, until ReclaimArenaRuns sees the GPU past it. Ticks only grow, so the
+    /// front is the oldest.
+    struct PendingArenaRun {
+        vk::DeviceMemory memory;
+        u32 memory_type;
+        u64 start;
+        u64 blocks;
+        u64 tick;
+    };
+    std::deque<PendingArenaRun> pending_arena_runs;
+    void ReclaimArenaRuns();
     /// sotc: unbinds resident block ranges (zeroing their page table entries) and frees the
     /// allocations left without blocks. The GPU must no longer use them.
     void UnbindResident(std::span<const Backing> released);

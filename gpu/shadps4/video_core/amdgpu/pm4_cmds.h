@@ -417,6 +417,36 @@ enum class EventIndex : u32 {
     CacheFlush = 7,
 };
 
+/// Predication ops of IT_SET_PREDICATION (PRED_OP field). Values from Mesa radeonsi (sid.h); not
+/// checked against the AMD spec in this repo, so the diagnostic also logs the raw dwords.
+enum class PredicationOp : u32 {
+    Clear = 0,
+    ZPass = 1,
+    PrimCount = 2,
+    Bool64 = 3,
+};
+
+/// IT_SET_PREDICATION (type 3, 2 body dwords). Dword 1: address bits [31:0]. Dword 2: address bits
+/// [39:32] in [7:0], bit 8 draw visible (1) / not visible (0), bit 12 hint (1 = no-wait draw),
+/// bits [19:16] predication op, bit 31 continue. The bit positions are from Mesa, not verified
+/// against hardware docs; SOTC_CMD_STATS logs the raw dwords next to the decoded fields.
+struct PM4CmdSetPredication {
+    PM4Type3Header header;
+    u32 start_address_lo;
+    union {
+        u32 raw;
+        BitField<0, 8, u32> start_address_hi;
+        BitField<8, 1, u32> draw_visible;
+        BitField<12, 1, u32> hint;
+        BitField<16, 4, PredicationOp> op;
+        BitField<31, 1, u32> continue_bit;
+    } control;
+
+    u64 Address() const {
+        return u64(start_address_lo) | (u64(control.start_address_hi.Value()) << 32);
+    }
+};
+
 struct PM4CmdEventWrite {
     PM4Type3Header header;
     union {
@@ -698,6 +728,11 @@ struct PM4CmdWaitRegMem {
 
     bool Test(std::span<const u32> regs) const {
         u32 value = mem_space.Value() == MemSpace::Memory ? *Address() : regs[Reg()];
+        return TestValue(value);
+    }
+
+    /// sotc: the compare of Test on a given value (SOTC_EOP_TICK tests a label's pending value).
+    bool TestValue(u32 value) const {
         switch (function.Value()) {
         case Function::Always: {
             return true;

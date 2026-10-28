@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
@@ -20,6 +21,29 @@ namespace BbCopy {
 namespace {
 
 thread_local bool in_copy_thread = false;
+
+// sotc: SOTC_WAIT_NOSPIN=1 makes the waits below spin ~20 us and then block on an atomic instead of
+// yield-spinning, which takes a whole logical CPU away from its SMT sibling. Off by default.
+bool NoSpin() {
+    static const bool value = [] {
+        const char* v = std::getenv("SOTC_WAIT_NOSPIN");
+        return v && v[0] == '1';
+    }();
+    return value;
+}
+
+/// Spins ~20 us (deadline checked every 64 iterations), then blocks until value != seen.
+template <typename T>
+void SpinThenWait(const std::atomic<T>& value, T seen) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds{20};
+    for (unsigned spin = 1; value.load(std::memory_order_acquire) == seen; ++spin) {
+        if ((spin & 63) == 0 && std::chrono::steady_clock::now() >= deadline) {
+            value.wait(seen, std::memory_order_acquire);
+            return;
+        }
+        std::this_thread::yield();
+    }
+}
 
 class Pool {
 public:
@@ -59,6 +83,7 @@ public:
             async_tasks.push_back({std::move(task), epoch});
         }
         cv.notify_one();
+        Changed();
     }
 
     void AfterCopies(std::function<void()> callback) {
@@ -78,6 +103,7 @@ public:
         // The waiting thread helps instead of only spinning.
         while (true) {
             Task task;
+            unsigned long long seen = 0;
             {
                 std::scoped_lock lk{mutex};
                 if (pending == 0 && epochs.size() == 1 && !draining) {
@@ -87,9 +113,14 @@ public:
                     task = std::move(async_tasks.front());
                     async_tasks.pop_front();
                 }
+                seen = activity.load(std::memory_order_acquire);
             }
             if (task.run) {
                 RunAsync(task);
+            } else if (NoSpin()) {
+                // Every change of the state checked above is followed by Changed(), so a wait on
+                // the count it read under the lock cannot miss one.
+                SpinThenWait(activity, seen);
             } else {
                 std::this_thread::yield();
             }
@@ -108,6 +139,13 @@ public:
         cv.notify_all();
         Work(*job);
         // Workers only call the task for indices below count, all done before this returns.
+        if (NoSpin()) {
+            std::size_t done = job->done.load(std::memory_order_acquire);
+            while (done < count) {
+                SpinThenWait(job->done, done);
+                done = job->done.load(std::memory_order_acquire);
+            }
+        }
         while (job->done.load(std::memory_order_acquire) < count) {
             std::this_thread::yield();
         }
@@ -149,6 +187,7 @@ private:
         std::unique_lock lk{mutex};
         --epochs[epoch - epoch_base].pending;
         --pending;
+        Changed();
         if (draining) {
             return;
         }
@@ -162,6 +201,7 @@ private:
                 epochs.pop_front();
                 ++epoch_base;
             }
+            Changed();
             if (ready.empty()) {
                 break;
             }
@@ -172,20 +212,35 @@ private:
             lk.lock();
         }
         draining = false;
+        Changed();
+    }
+
+    /// sotc: wakes a WaitAll that blocked on activity (SOTC_WAIT_NOSPIN). Called after each change
+    /// of the state WaitAll checks.
+    void Changed() {
+        if (NoSpin()) {
+            activity.fetch_add(1, std::memory_order_seq_cst);
+            activity.notify_all();
+        }
     }
 
     static void Work(Job& job) {
         const bool was = in_copy_thread;
         in_copy_thread = true;
+        const bool nospin = NoSpin();
         for (std::size_t i; (i = job.next.fetch_add(1, std::memory_order_relaxed)) < job.count;) {
             (*job.task)(i);
             job.done.fetch_add(1, std::memory_order_release);
+            if (nospin) {
+                job.done.notify_all();
+            }
         }
         in_copy_thread = was;
     }
 
     void Loop(unsigned index) {
         Common::SetCurrentThreadName(("bb:Copy" + std::to_string(index)).c_str());
+        BbThreads::PlaceThread(BbThreads::Role::Copy);
         u64 seen = 0;
         std::unique_lock lk{mutex};
         while (true) {
@@ -222,6 +277,8 @@ private:
     u64 epoch_base = 0;       ///< epoch number of epochs.front()
     std::size_t pending = 0;
     bool draining = false;
+    /// sotc: bumped by Changed() (SOTC_WAIT_NOSPIN only); WaitAll blocks on it.
+    std::atomic<unsigned long long> activity{0};
 };
 
 Pool& GetPool() {

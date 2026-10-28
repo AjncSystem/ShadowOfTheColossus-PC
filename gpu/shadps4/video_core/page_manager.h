@@ -49,6 +49,8 @@ private:
     void (*call)(void*, VAddr, u64);
 };
 void ForEachNonStackRange(VAddr address, u64 size, NonStackRangeFn func);
+/// sotc: any byte of the range is in a registered guest stack (never write-protected).
+bool IntersectsGuestStack(VAddr address, u64 size);
 
 struct UffdImpl;
 struct SignalImpl;

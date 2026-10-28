@@ -27,9 +27,11 @@
 #include "video_core/renderdoc.h"
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
+#include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/sotc_lod_stats.h"
 #include "video_core/sotc_stats.h"
+#include "bbport_threads.h"
 
 // sotc: writes guest memory through the backing view (runtime_memory.c).
 extern "C" int runtime_memory_write_backing(unsigned long long address, const void* data,
@@ -39,6 +41,19 @@ extern "C" int runtime_memory_write_backing(unsigned long long address, const vo
 std::atomic<u64> g_sotc_zpass_dumps{0};
 
 namespace AmdGpu {
+
+// sotc: SOTC_GPU_THREAD_HIGH=1 runs the command processor and draw threads above normal priority,
+// so the pipeline workers and game job threads cannot delay them during streaming. Off by
+// default: both threads poll, and above normal they could starve normal-priority game threads.
+static void SotcRaiseGpuThread() {
+    static const bool high = [] {
+        const char* v = std::getenv("SOTC_GPU_THREAD_HIGH");
+        return v && v[0] == '1';
+    }();
+    if (high) {
+        Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
+    }
+}
 
 static const char* dcb_task_name{"DCB_TASK"};
 static const char* ccb_task_name{"CCB_TASK"};
@@ -92,20 +107,46 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
     back_threaded = !threads || threads[0] != '0';
     const char* strict = std::getenv("SOTC_CP_STRICT");
     back_strict = strict && strict[0] == '1';
+    // sotc: SOTC_WAIT_NOSPIN=1: BackLoop spins ~20 us, then blocks on back_wake (off by default).
+    const char* nospin = std::getenv("SOTC_WAIT_NOSPIN");
+    back_nospin = nospin && nospin[0] == '1';
+    // sotc: SOTC_EOP_TICK=1 (default off). The labels are polled by BackLoop, so it needs the
+    // draw thread; without it the command processor would have to poll while idle.
+    const char* eop_tick_env = std::getenv("SOTC_EOP_TICK");
+    eop_tick = back_threaded && eop_tick_env && eop_tick_env[0] == '1';
+    // sotc: measured 2026-10-27: the game writes ~130 EOP labels per frame and waits for each, so
+    // honest completion costs one GPU round trip per label (~300 ms frames at the default 2 ms
+    // limit, ~133 ms at SOTC_EOP_TICK_US=0). Diagnostic only; kept off by default.
+    if (eop_tick) {
+        LOG_WARNING(Render, "SOTC_EOP_TICK=1 is diagnostic only: ~130 GPU round trips per frame "
+                            "(3-7 FPS). Use it only to test streaming corruption.");
+    }
     if (back_threaded) {
         back_ring.resize(BackRingSize);
         dirty_list.reserve(NumRegChunks);
         back_thread = std::jthread{std::bind_front(&Liverpool::BackLoop, this)};
         back_id = back_thread.get_id();
+        // sotc: SOTC_FLIP_SERVICE=1 (off by default), see Vulkan::Presenter::wait_service.
+        static Liverpool* service_liverpool = nullptr;
+        const char* flip_service = std::getenv("SOTC_FLIP_SERVICE");
+        if (flip_service && flip_service[0] == '1') {
+            service_liverpool = this;
+            Vulkan::Presenter::wait_service = [] { service_liverpool->ServiceCommandsOnBackThread(); };
+        }
     }
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
 }
 
 Liverpool::~Liverpool() {
+    Vulkan::Presenter::wait_service = nullptr; // sotc: SOTC_FLIP_SERVICE
     process_thread.request_stop();
     process_thread.join();
     if (back_thread.joinable()) {
         back_thread.request_stop();
+        if (back_nospin) {
+            // sotc: BackLoop blocks on back_wake, which only changes when something bumps it
+            WakeBackAtomic();
+        }
         back_thread.join();
     }
 }
@@ -118,6 +159,8 @@ static inline void CpuRelax() {
 
 void Liverpool::BackLoop(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuDraw");
+    SotcRaiseGpuThread();
+    BbThreads::PlaceThread(BbThreads::Role::Draw);
     Shader::g_info_slot = 1;
 #ifdef __linux__
     back_tid = gettid();
@@ -127,7 +170,18 @@ void Liverpool::BackLoop(std::stop_token stoken) {
         if (num_commands.load(std::memory_order_acquire)) {
             ProcessCommands();
         }
+        // sotc: SOTC_EOP_TICK: labels the GPU has finished are written here, also while no new
+        // work arrives (EopService returns at once when none is outstanding).
+        if (eop_tick && eop_outstanding.load(std::memory_order_acquire) != 0) {
+            EopService();
+        }
         if (back_head.load(std::memory_order_acquire) == tail) {
+            if (eop_tick && eop_outstanding.load(std::memory_order_acquire) != 0) {
+                // sotc: SOTC_EOP_TICK: a label is waiting for the GPU, so poll instead of
+                // blocking on back_cv or back_wake, which nothing signals when the GPU finishes.
+                std::this_thread::sleep_for(std::chrono::microseconds{200});
+                continue;
+            }
             const u64 idle_start = SotcStats::NowNs();
             struct IdleTime {
                 u64 start;
@@ -136,6 +190,34 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                                                       std::memory_order_relaxed);
                 }
             } idle_time{idle_start};
+            if (back_nospin) {
+                // sotc: spin ~20 us, then block until back_wake changes. The snapshot is taken
+                // before the checks, and every producer changes the checked state before bumping.
+                const auto spin_end = std::chrono::steady_clock::now() + std::chrono::microseconds{20};
+                bool found = false;
+                for (u32 spin = 1;; ++spin) {
+                    if (back_head.load(std::memory_order_acquire) != tail ||
+                        num_commands.load(std::memory_order_acquire)) {
+                        found = true;
+                        break;
+                    }
+                    if ((spin & 63) == 0 && std::chrono::steady_clock::now() >= spin_end) {
+                        break;
+                    }
+                    CpuRelax();
+                }
+                if (!found) {
+                    back_sleeping.store(true, std::memory_order_seq_cst);
+                    const u32 seen = back_wake.load(std::memory_order_seq_cst);
+                    if (back_head.load(std::memory_order_seq_cst) == tail &&
+                        !num_commands.load(std::memory_order_seq_cst) &&
+                        !stoken.stop_requested()) {
+                        back_wake.wait(seen, std::memory_order_seq_cst);
+                    }
+                    back_sleeping.store(false, std::memory_order_relaxed);
+                }
+                continue;
+            }
             bool ready = false;
             for (u32 spin = 0; spin < 4096; ++spin) {
                 if (back_head.load(std::memory_order_acquire) != tail ||
@@ -230,8 +312,12 @@ void Liverpool::BackPublish(bool writes_memory) {
         back_write_seq = head;
     }
     if (back_sleeping.load(std::memory_order_seq_cst)) {
-        std::scoped_lock lk{back_mutex};
-        back_cv.notify_one();
+        if (back_nospin) {
+            WakeBackAtomic();
+        } else {
+            std::scoped_lock lk{back_mutex};
+            back_cv.notify_one();
+        }
     }
 }
 
@@ -379,6 +465,74 @@ void Liverpool::SubmitDrawIndirect(bool is_indexed, VAddr address, u32 offset, u
     BackPublish(back_strict && PipelineWrites(pipeline));
 }
 
+void Liverpool::PrefetchComputeAhead(std::span<const u32> rest) {
+    auto& cache = rasterizer->GetPipelineCache();
+    if (!cache.ComputePrefetchEnabled()) {
+        return;
+    }
+    const auto& cs = GetCsRegs();
+    // Usual case: the shader is known (one cached binary info lookup, as the dispatch does).
+    if (cache.IsProgramKnown(GetParams(cs).hash)) {
+        return;
+    }
+    SotcStats::compute_prefetch_scans.fetch_add(1, std::memory_order_relaxed);
+    // The scan replays on a copy the only packets that change the compute registers (the
+    // SET_SH_REG writes of ProcessGraphics/ProcessCompute and the dispatch fields), so each
+    // dispatch it meets sees the registers it will run with. Indirect buffers are not followed.
+    // The current shader is translated by the dispatch itself, meanwhile.
+    ComputeProgram copy = cs;
+    constexpr size_t MaxDwords = 64_KB;
+    constexpr u32 MaxDispatches = 256;
+    u32 dispatches = 0;
+    size_t pos = 0;
+    const size_t end = std::min(rest.size(), MaxDwords);
+    while (pos < end && dispatches < MaxDispatches) {
+        const auto* header = reinterpret_cast<const PM4Header*>(&rest[pos]);
+        if (header->type == 2) {
+            ++pos;
+            continue;
+        }
+        if (header->type != 3) {
+            break;
+        }
+        const u32 count = header->type3.NumWords();
+        if (pos + count + 1 > end) {
+            break;
+        }
+        switch (header->type3.opcode) {
+        case PM4ItOpcode::SetShReg: {
+            const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+            const u32 reg = set_data->reg_offset;
+            const size_t offset = (reg - 0x200) * sizeof(u32);
+            const size_t set_size = (count - 1) * sizeof(u32);
+            if (count >= 1 && reg >= 0x200 && reg <= 0x200 + sizeof(ComputeProgram) / 4 &&
+                offset + set_size <= sizeof(ComputeProgram)) {
+                std::memcpy(reinterpret_cast<u8*>(&copy) + offset,
+                            reinterpret_cast<const u32*>(header) + 2, set_size);
+            }
+            break;
+        }
+        case PM4ItOpcode::DispatchDirect: {
+            const auto* dispatch = reinterpret_cast<const PM4CmdDispatchDirect*>(header);
+            copy.dim_x = dispatch->dim_x;
+            copy.dim_y = dispatch->dim_y;
+            copy.dim_z = dispatch->dim_z;
+            copy.dispatch_initiator = dispatch->dispatch_initiator;
+            [[fallthrough]];
+        }
+        case PM4ItOpcode::DispatchIndirect:
+            if (copy.dispatch_initiator & 1) {
+                ++dispatches;
+                cache.PrefetchComputeProgram(copy);
+            }
+            break;
+        default:
+            break;
+        }
+        pos += count + 1;
+    }
+}
+
 void Liverpool::SubmitDispatch(bool indirect, VAddr address, u32 offset, u32 size) {
     if (!back_threaded) {
         if (indirect) {
@@ -398,6 +552,60 @@ void Liverpool::SubmitDispatch(bool indirect, VAddr address, u32 offset, u32 siz
     op.cs = GetCsRegs();
     CaptureBackOp(op, pipeline);
     BackPublish(back_strict);
+}
+
+// sotc: SOTC_EOP_TICK=1. A label whose work is still unsubmitted waits for the flush of the next
+// submission, so the guest's wait on it would stall until then. After this long the open command
+// buffer is submitted (EopService), the same as the previous code did at every label.
+static const u64 EopMaxWaitNs = [] {
+    // sotc: SOTC_EOP_TICK_US overrides the 2 ms (diagnostics).
+    const char* v = std::getenv("SOTC_EOP_TICK_US");
+    return v ? std::strtoull(v, nullptr, 10) * 1000ULL : 2'000'000ULL;
+}();
+// sotc: SOTC_EOP_TICK statistics, printed under SOTC_FPS (driver.cpp).
+std::atomic<u64> g_eop_written{0}, g_eop_latency_ns{0}, g_eop_max_latency_ns{0}, g_eop_flushes{0};
+
+void Liverpool::EopService() {
+    eop_service_requested.store(false, std::memory_order_relaxed);
+    if (!rasterizer || eop_outstanding.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    auto& scheduler = rasterizer->GetScheduler();
+    // Runs the queued labels whose tick the GPU has reached. The queue is FIFO, so labels to the
+    // same address are written in submission order.
+    scheduler.PopPendingOperations();
+    if (eop_outstanding.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    const u64 waited = SotcStats::NowNs() - eop_oldest_ns.load(std::memory_order_relaxed);
+    if (waited > EopMaxWaitNs &&
+        eop_last_tick.load(std::memory_order_relaxed) >= scheduler.CurrentTick()) {
+        g_eop_flushes.fetch_add(1, std::memory_order_relaxed);
+        rasterizer->Flush();
+    }
+}
+
+bool Liverpool::EopShadowSatisfies(const PM4CmdWaitRegMem& wait) {
+    if (wait.mem_space.Value() != PM4CmdWaitRegMem::MemSpace::Memory ||
+        eop_shadow_count.load(std::memory_order_acquire) == 0) {
+        return false;
+    }
+    std::scoped_lock lk{eop_shadow_mutex};
+    const auto it = eop_shadow.find(wait.Address<VAddr>());
+    return it != eop_shadow.end() && wait.TestValue(it->second);
+}
+
+void Liverpool::EopWaitGuard() {
+    if (eop_service_requested.load(std::memory_order_relaxed) ||
+        eop_outstanding.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    const u64 waited = SotcStats::NowNs() - eop_oldest_ns.load(std::memory_order_relaxed);
+    if (waited <= EopMaxWaitNs) {
+        return;
+    }
+    eop_service_requested.store(true, std::memory_order_relaxed);
+    QueueBackFunc(Common::UniqueFunction<void>{[this] { EopService(); }}, false);
 }
 
 void Liverpool::WriteFenceValue(void* address, u64 data, u32 num_bytes) {
@@ -457,6 +665,8 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+    SotcRaiseGpuThread();
+    BbThreads::PlaceThread(BbThreads::Role::CommandProcessor);
     gpu_id = std::this_thread::get_id();
 #ifdef __linux__
     gpu_tid = gettid();
@@ -753,6 +963,19 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 case PM4CmdNop::PayloadType::PatchedFlip: {
                     // There is no evidence that GPU CP drives flip events by parsing
                     // special NOP packets. For convenience lets assume that it does.
+                    // sotc: SOTC_CP_FLIP_PACE: the wait for a free presentation frame happens
+                    // here, before the flip is queued, instead of on the draw thread.
+                    if (auto* pacer = Vulkan::Presenter::cp_pacer; pacer && back_threaded) {
+                        pacer->PaceFlip();
+                        BackOrRun(
+                            [pacer] {
+                                pacer->FlipReached();
+                                Platform::IrqC::Instance()->Signal(
+                                    Platform::InterruptId::GfxFlip);
+                            },
+                            false);
+                        break;
+                    }
                     BackOrRun(
                         [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip); },
                         false);
@@ -905,6 +1128,23 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::SetPredication: {
+                // sotc: decoded for diagnostics only (SOTC_CMD_STATS); the predicate is not applied.
+                const auto* pred = reinterpret_cast<const PM4CmdSetPredication*>(header);
+                if (SotcStats::kCmdStats) {
+                    static std::atomic<u32> pred_logged{0};
+                    const auto op = static_cast<u32>(pred->control.op.Value());
+                    SotcStats::pred_ops[op < 4 ? op : 4].fetch_add(1, std::memory_order_relaxed);
+                    const u32 index = pred_logged.fetch_add(1, std::memory_order_relaxed);
+                    if (index < 4) {
+                        LOG_INFO(Render,
+                                 "SET_PREDICATION #{}: op {}, address {:#x}, hint {}, visible {}, "
+                                 "continue {}, raw dwords {:#010x} {:#010x}",
+                                 index + 1, op, pred->Address(), pred->control.hint.Value(),
+                                 pred->control.draw_visible.Value(),
+                                 pred->control.continue_bit.Value(), pred->start_address_lo,
+                                 pred->control.raw);
+                    }
+                }
                 // sotc: once; the game sends it every frame.
                 static bool reported = false;
                 if (!std::exchange(reported, true)) {
@@ -1094,6 +1334,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (!rasterizer || (cs_program.dispatch_initiator & 1) == 0) {
                     break;
                 }
+                PrefetchComputeAhead(count + 1 <= dcb.size() ? dcb.subspan(count + 1)
+                                                             : std::span<const u32>{});
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 rasterizer->ScopeMarker("gfx:{}:DispatchDirect", fmt::make_format_args(cmd_address),
                                         [&] { SubmitDispatch(false, 0, 0, 0); });
@@ -1112,6 +1354,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (!rasterizer || (cs_program.dispatch_initiator & 1) == 0) {
                     break;
                 }
+                PrefetchComputeAhead(count + 1 <= dcb.size() ? dcb.subspan(count + 1)
+                                                             : std::span<const u32>{});
                 const auto cmd_address = reinterpret_cast<const void*>(header);
                 rasterizer->ScopeMarker(
                     "gfx:{}:DispatchIndirect", fmt::make_format_args(cmd_address),
@@ -1199,6 +1443,77 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* event_eop = &eop_packet;
                 if (rasterizer) {
                     rasterizer->OnFence();
+                }
+                // sotc: SOTC_EOP_TICK=1. The label is a scheduler deferred operation keyed on the
+                // tick open now: it runs once the GPU has finished the work recorded up to here.
+                // Nothing is flushed per label, so the command buffer keeps its batching. The
+                // queue is FIFO, so labels to one address are written in submission order. The
+                // draw thread polls the queue (BackLoop, EopService), and EopWaitGuard submits the
+                // open buffer when a wait has been blocked on a label for too long.
+                if (eop_tick && rasterizer) {
+                    const PM4CmdEventWriteEop eop = *event_eop;
+                    const VAddr label = reinterpret_cast<VAddr>(eop.Address<void>());
+                    // As in the SOTC_EOP_DEFER path: the GPU copy of the label's page must not
+                    // be reused with the old value. Done now, while the page is still the same.
+                    if (eop.data_sel.Value() != DataSelect::None) {
+                        rasterizer->InvalidateMemory(label, 8, true);
+                    }
+                    auto& scheduler = rasterizer->GetScheduler();
+                    eop_last_tick.store(scheduler.CurrentTick(), std::memory_order_relaxed);
+                    if (eop_outstanding.fetch_add(1, std::memory_order_acq_rel) == 0) {
+                        eop_oldest_ns.store(SotcStats::NowNs(), std::memory_order_relaxed);
+                    }
+                    // The CP's waits on this label are satisfied by its pending value (see
+                    // eop_shadow); only the guest sees the real write, after the GPU.
+                    const bool shadow32 = eop.data_sel.Value() == DataSelect::Data32Low;
+                    const bool shadow64 = eop.data_sel.Value() == DataSelect::Data64;
+                    if (shadow32 || shadow64) {
+                        std::scoped_lock lk{eop_shadow_mutex};
+                        eop_shadow[label] = eop.data_lo;
+                        if (shadow64) {
+                            eop_shadow[label + 4] = eop.data_hi;
+                        }
+                        eop_shadow_count.store(u32(eop_shadow.size()), std::memory_order_release);
+                    }
+                    const u64 queued_ns = SotcStats::NowNs();
+                    scheduler.DeferOperation([this, eop, queued_ns, label, shadow32, shadow64] {
+                        const u64 latency = SotcStats::NowNs() - queued_ns;
+                        g_eop_written.fetch_add(1, std::memory_order_relaxed);
+                        g_eop_latency_ns.fetch_add(latency, std::memory_order_relaxed);
+                        u64 prev = g_eop_max_latency_ns.load(std::memory_order_relaxed);
+                        while (latency > prev && !g_eop_max_latency_ns.compare_exchange_weak(
+                                                     prev, latency, std::memory_order_relaxed)) {
+                        }
+                        eop.SignalFence(
+                            [](void* address, u64 data, u32 num_bytes) {
+                                ASSERT(Core::Memory::Instance()->TryWriteBacking(address, &data,
+                                                                                 num_bytes, 2));
+                            },
+                            [] {
+                                Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
+                            });
+                        if (shadow32 || shadow64) {
+                            // Written for real now: drop the shadow unless a later label of the
+                            // same address already replaced it.
+                            std::scoped_lock lk{eop_shadow_mutex};
+                            const auto drop = [&](VAddr a, u32 v) {
+                                if (const auto it = eop_shadow.find(a);
+                                    it != eop_shadow.end() && it->second == v) {
+                                    eop_shadow.erase(it);
+                                }
+                            };
+                            drop(label, eop.data_lo);
+                            if (shadow64) {
+                                drop(label + 4, eop.data_hi);
+                            }
+                            eop_shadow_count.store(u32(eop_shadow.size()),
+                                                   std::memory_order_release);
+                        }
+                        if (eop_outstanding.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                            eop_oldest_ns.store(0, std::memory_order_relaxed);
+                        }
+                    });
+                    return;
                 }
                 // sotc: an end-of-pipe label means "the GPU finished everything before it". It
                 // was written as soon as the command processor read it, while the work was still
@@ -1358,6 +1673,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 while (!wait_reg_mem->Test(regs.reg_array)) {
+                    // sotc: SOTC_EOP_TICK: a label queued for the GPU satisfies the stream's own
+                    // wait at once (the host queue keeps the order).
+                    if (eop_tick && EopShadowSatisfies(*wait_reg_mem)) {
+                        break;
+                    }
+                    // sotc: SOTC_EOP_TICK: the waited-for label may be queued behind work that
+                    // is not submitted yet; EopWaitGuard submits it after 2 ms.
+                    if (eop_tick) {
+                        EopWaitGuard();
+                    }
                     YIELD_GFX();
                 }
                 break;
@@ -1674,6 +1999,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (!rasterizer || (cs_program.dispatch_initiator & 1) == 0) {
                 break;
             }
+            PrefetchComputeAhead(next_dw_off <= acb.size() ? acb.subspan(next_dw_off)
+                                                           : std::span<const u32>{});
             const auto cmd_address = reinterpret_cast<const void*>(header);
             rasterizer->ScopeMarker("asc[{}]:{}:DispatchDirect",
                                     fmt::make_format_args(vqid, cmd_address),
@@ -1693,6 +2020,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (!rasterizer || (cs_program.dispatch_initiator & 1) == 0) {
                 break;
             }
+            PrefetchComputeAhead(next_dw_off <= acb.size() ? acb.subspan(next_dw_off)
+                                                           : std::span<const u32>{});
             const auto cmd_address = reinterpret_cast<const void*>(header);
             rasterizer->ScopeMarker("asc[{}]:{}:DispatchIndirect",
                                     fmt::make_format_args(vqid, cmd_address),

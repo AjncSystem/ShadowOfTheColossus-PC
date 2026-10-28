@@ -129,6 +129,25 @@ public:
         return skipped;
     }
 
+    /// sotc: SOTC_DROP_FAST. Marks the region CPU-modified when none of its pages is
+    /// GPU-modified, checking and marking each tracking region under its lock (as a guest write
+    /// fault does, InvalidateRegion). Returns false at the first GPU-modified page: the regions
+    /// before it are already marked, which only costs an upload.
+    bool MarkCpuModifiedUnlessGpu(VAddr cpu_addr, u64 size) noexcept {
+        SotcStats::mem_epoch.fetch_add(1, std::memory_order_relaxed); // reused binds
+        return !IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            const auto bounds = manager->GetBounds(offset, size);
+            manager->Lock(bounds);
+            const bool gpu = manager->template IsRegionModified<Type::GPU>(offset, size);
+            if (!gpu) {
+                manager->template ChangeRegionState<StateOp::Set, StateOp::None, false>(offset,
+                                                                                        size);
+            }
+            manager->Unlock(bounds);
+            return gpu;
+        });
+    }
+
     /// Mark region as modified from the CPU
     void MarkRegionAsCpuModified(VAddr cpu_addr, u64 size) noexcept {
         SotcStats::mem_epoch.fetch_add(1, std::memory_order_relaxed); // reused binds

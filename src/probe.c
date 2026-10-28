@@ -1189,7 +1189,20 @@ void runtime_restart(void) {
 #endif
 }
 
+#ifdef _WIN32
+/* sotc: winmm's default tick is 15.6 ms. The region-lock backoff (runtime_memory.c lock_backoff)
+ * and page_manager's Sleep(1) round to that tick unless the resolution is raised, so it is raised
+ * for the whole run. SOTC_TIMER_RES=0 keeps the default. */
+static void end_timer_resolution(void) { timeEndPeriod(1); }
+#endif
+
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    {
+        const char *timer_res = getenv("SOTC_TIMER_RES");
+        if (!(timer_res && timer_res[0] == '0') && timeBeginPeriod(1) == TIMERR_NOERROR) atexit(end_timer_resolution);
+    }
+#endif
     setvbuf(stdout, NULL, _IONBF, 0);
 #ifdef _WIN32
     reserve_eboot_range();

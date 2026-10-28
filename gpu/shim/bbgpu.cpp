@@ -32,6 +32,7 @@
 #include "common/rdtsc.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/libs.h"
+#include "video_core/buffer_cache/async_upload.h"
 #include "core/memory.h"
 #include "core/emulator_settings.h"
 #include "core/signals.h"
@@ -391,7 +392,30 @@ extern "C" int bbgpu_readbacks_mode(void) {
 }
 
 extern "C" int bbgpu_handle_fault(void* ucontext, void* address) {
+    // sotc: SOTC_ASYNC_UPLOAD write fence. A write fault unprotects the page and, with the
+    // write-ahead and the fault granule, pages up to 64 KiB around it: their pending copies
+    // finish first (the copy threads take no lock, so waiting here cannot deadlock).
+    if (auto* async_upload = VideoCore::AsyncUpload::Get(); async_upload &&
+                                                           async_upload->AnyPending()) {
+        // The fault granule is at most 64 KiB (kFaultGranule); the write-ahead covers
+        // SOTC_WRITE_AHEAD_PAGES pages (15 by default) after the faulting one.
+        static const u64 span = [] {
+            const char* v = std::getenv("SOTC_WRITE_AHEAD_PAGES");
+            const u64 ahead = (v ? std::strtoull(v, nullptr, 10) : 15ULL) * 4096 + 4096;
+            return std::max<u64>(ahead, 64 * 1024);
+        }();
+        const u64 window = reinterpret_cast<u64>(address) & ~u64{0xFFFF};
+        async_upload->WaitVa(window, span + 64 * 1024);
+    }
     return Core::Signals::Instance()->DispatchAccessViolation(ucontext, address) ? 1 : 0;
+}
+
+// sotc: SOTC_ASYNC_UPLOAD write fence for the runtime's own writes to guest memory (zeroing
+// freed memory, backing writes): offsets in the backing view (runtime_memory.c).
+extern "C" void bbgpu_upload_wait_phys(uint64_t phys, uint64_t size) {
+    if (auto* async_upload = VideoCore::AsyncUpload::Get()) {
+        async_upload->WaitPhys(phys, size);
+    }
 }
 
 extern "C" void bbgpu_set_fps_target_slot(void* slot) {

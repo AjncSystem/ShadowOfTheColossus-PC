@@ -66,6 +66,10 @@ typedef struct { void *start; uint64_t offset, length; int8_t prot, type; int16_
 _Static_assert(sizeof(VirtualQueryInfo)==72,"PS4 virtual query info layout");
 _Static_assert(sizeof(BatchEntry)==32,"PS4 batch map entry layout");
 
+/* sotc: counts the lock_backoff iterations that reached Sleep(1); read and reset by
+ * runtime_memory_lock_sleeps. Stays 0 on the Linux path, which never sleeps here. */
+static uint64_t lock_sleeps;
+uint64_t runtime_memory_lock_sleeps(void) { return __atomic_exchange_n(&lock_sleeps,0,__ATOMIC_RELAXED); }
 /* Region table lock. Lookups (GPU per-draw queries, VirtualQuery, GPU page
  * protection) share it; map/unmap/protect take it exclusively. Both nest: code
  * under the lock may write guest memory, and a GPU-tracked page then faults into
@@ -82,7 +86,7 @@ static volatile int64_t lock_state; /* readers, or -1 while a writer holds it */
 static void lock_backoff(unsigned *spins) {
     if (++*spins < 64) YieldProcessor();
     else if (*spins < 256) SwitchToThread();
-    else Sleep(1); /* Sleep(0) only yields to equal or higher priority: a preempted lower-priority holder could wait seconds */
+    else { __atomic_add_fetch(&lock_sleeps,1,__ATOMIC_RELAXED); Sleep(1); } /* Sleep(0) only yields to equal or higher priority: a preempted lower-priority holder could wait seconds */
 }
 static void rw_rdlock(void) {
     for (unsigned spins=0;;lock_backoff(&spins)) {
@@ -226,8 +230,27 @@ static int carve_suspend_enabled(void) {
     if (v<0) { const char *e=getenv("SOTC_CARVE_SUSPEND"); v=!(e && e[0]=='0'); }
     return v;
 }
-static uint64_t carve_splits;
+static uint64_t carve_splits, carve_freeze_ns;
 uint64_t runtime_memory_carve_splits(void) { return __atomic_exchange_n(&carve_splits,0,__ATOMIC_RELAXED); }
+/* sotc: time spent splitting live views (other guest threads stopped meanwhile), read and reset. */
+uint64_t runtime_memory_carve_freeze_ns(void) { return __atomic_exchange_n(&carve_freeze_ns,0,__ATOMIC_RELAXED); }
+static uint64_t qpc_ns(void) {
+    static LARGE_INTEGER freq; LARGE_INTEGER now;
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    return (uint64_t)((double)now.QuadPart*1e9/(double)freq.QuadPart);
+}
+/* sotc: SOTC_VIEW_CHUNK_MB=N maps new ranges as views of at most N MiB aligned to N MiB (0, the
+ * default: one view per mapping). Unmapping part of a range then splits only the chunk(s) at its
+ * edges, so the freeze of carve_host covers at most two chunks instead of the whole mapping. */
+static uint64_t view_chunk(void) {
+    static uint64_t v=UINT64_MAX;
+    if (v==UINT64_MAX) {
+        const char *e=getenv("SOTC_VIEW_CHUNK_MB");
+        v=e ? (uint64_t)strtoull(e,NULL,10)<<20 : 0;
+    }
+    return v;
+}
 /* The threads carve_host stopped, so win_fail can resume them before reporting. */
 static void *carve_stopped[256];
 static size_t carve_nstopped;
@@ -254,11 +277,13 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
     /* sotc: a live view is split: everything in it (fiber stacks included) disappears until it is
      * mapped again below. Other guest threads stop meanwhile (see runtime_thread_suspend_others).
      * The region table is grown first: no heap call while they are stopped (one may hold the heap). */
+    /* sotc: counted with or without the suspend (SOTC_CARVE_SUSPEND=0 used to read 0 splits). */
+    const uint64_t split_start=(keep_left || keep_right) ? qpc_ns() : 0;
+    if (keep_left || keep_right) __atomic_add_fetch(&carve_splits,1,__ATOMIC_RELAXED);
     if ((keep_left || keep_right) && carve_suspend_enabled()) {
         region_reserve(3);
         carve_nstopped=runtime_thread_suspend_others(carve_stopped,256);
         carve_stopping=1;
-        __atomic_add_fetch(&carve_splits,1,__ATOMIC_RELAXED);
     }
     for (size_t i=first;i<last;++i) if (regions[i].mapped) {
         if (!UnmapViewOfFile2(GetCurrentProcess(),(void *)regions[i].start,MEM_PRESERVE_PLACEHOLDER))
@@ -294,6 +319,7 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
             win_fail("restoring page protection",runs[i].start,runs[i].end-runs[i].start);
     }
     if (carve_stopping) { carve_stopping=0; runtime_thread_resume(carve_stopped,carve_nstopped); }
+    if (split_start) __atomic_add_fetch(&carve_freeze_ns,qpc_ns()-split_start,__ATOMIC_RELAXED);
     (void)left_runs;
     free(runs);
     return at;
@@ -301,8 +327,23 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
 static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, uint64_t phys) {
     size_t i=carve_host(address,address+size);
     if (reserved) return 0;
-    regions[i].phys=phys; regions[i].mapped=1;
-    view_map(&regions[i],win_prot(prot));
+    const uint64_t chunk=view_chunk();
+    if (!chunk || size<=chunk) {
+        regions[i].phys=phys; regions[i].mapped=1;
+        view_map(&regions[i],win_prot(prot));
+        return 0;
+    }
+    /* sotc: SOTC_VIEW_CHUNK_MB. The carved range is one unmapped placeholder: cutting it at chunk
+     * boundaries splits only placeholders, so no live view is touched and nothing is stopped. */
+    const uintptr_t end=address+size;
+    for (uintptr_t a=address; a<end;) {
+        uintptr_t b=(a/chunk+1)*chunk;
+        if (b>end) b=end;
+        size_t j=carve_host(a,b);
+        regions[j].phys=phys+(a-address); regions[j].mapped=1;
+        view_map(&regions[j],win_prot(prot));
+        a=b;
+    }
     return 0;
 }
 static int host_unmap(uintptr_t address, uint64_t size) { carve_host(address,address+size); return 0; }
@@ -317,7 +358,13 @@ static int host_protect(uintptr_t address, uint64_t size, int prot) {
     return 0;
 }
 /* Released pages read as zero when reused, like the memfd's punched holes. */
-static void host_discard(uint64_t phys, uint64_t size) { memset(backing_base+phys,0,size); }
+/* sotc: SOTC_ASYNC_UPLOAD (GPU async_upload.h): waits for the copies still reading these
+ * backing bytes. They take no runtime lock, so it is safe with the table locks held. */
+void bbgpu_upload_wait_phys(uint64_t phys, uint64_t size) __attribute__((weak));
+static void host_discard(uint64_t phys, uint64_t size) {
+    if (bbgpu_upload_wait_phys) bbgpu_upload_wait_phys(phys,size);
+    memset(backing_base+phys,0,size);
+}
 /* Direct memory occupies [0,POOL_SIZE) of the section, flexible memory [POOL_SIZE,+FLEX_SPAN). */
 static int pool(void) {
     if (backing_base) return 0;
@@ -360,7 +407,9 @@ static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, ui
 }
 static int host_unmap(uintptr_t address, uint64_t size) { return munmap((void *)address,size); }
 static int host_protect(uintptr_t address, uint64_t size, int prot) { return mprotect((void *)address,size,prot); }
+void bbgpu_upload_wait_phys(uint64_t phys, uint64_t size) __attribute__((weak));
 static void host_discard(uint64_t phys, uint64_t size) {
+    if (bbgpu_upload_wait_phys) bbgpu_upload_wait_phys(phys,size); /* sotc: SOTC_ASYNC_UPLOAD */
     fallocate(pool_fd,FALLOC_FL_PUNCH_HOLE|FALLOC_FL_KEEP_SIZE,(off_t)phys,(off_t)size);
 }
 #endif
@@ -486,6 +535,9 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
         address=find_free(address,size,alignment);
         if (!address) return NO_MEMORY;
     }
+    /* sotc: SOTC_ASYNC_UPLOAD: memory mapped again elsewhere is not write-protected there, so the
+     * copies still reading it finish first. */
+    if (bbgpu_upload_wait_phys && kind!=KIND_RESERVED) bbgpu_upload_wait_phys(phys,size);
     if (host_map(address,size,host_prot(prot),kind==KIND_RESERVED,phys)) return NO_MEMORY;
     void *mapped=(void *)address;
     drop_range(address,address+size);
@@ -894,6 +946,7 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
         size_t i=vma_index(at);
         if (i==vma_count || vmas[i].start>at || vmas[i].kind==KIND_RESERVED) { ok=0; break; }
         uint64_t n=(vmas[i].end<end ? vmas[i].end : end)-at;
+        if (bbgpu_upload_wait_phys) bbgpu_upload_wait_phys(vmas[i].phys+(at-vmas[i].start),n); /* sotc */
         memcpy(backing_base+vmas[i].phys+(at-vmas[i].start),(const unsigned char *)data+(at-address),n);
         at+=n;
     }
@@ -951,6 +1004,12 @@ uint64_t runtime_memory_generation(void) {
 }
 /* sotc: the GPU reads guest memory through the backing view on every upload; the per-thread
  * region cache spares it the table lock (a winpthread rwlock, slow) and the binary search. */
+/* sotc: SOTC_HOST_IMPORT (GPU host_import.cpp): the second view of the whole pool (direct and
+ * flexible memory) and its size; NULL before the pool exists. */
+const unsigned char *runtime_memory_backing_view(uint64_t *size) {
+    if (size) *size = backing_base ? (uint64_t)(POOL_SIZE+FLEX_SPAN) : 0;
+    return backing_base;
+}
 const unsigned char *runtime_memory_backing_pointer(uintptr_t address) {
     const CachedRegion *c=(runtime_disabled_optimizations & 1) ? NULL : cached_region(address);
     if (c && c->backing) return c->backing+(address-c->start);
@@ -1026,14 +1085,21 @@ void runtime_memory_describe(uintptr_t address, char *out, size_t capacity) {
 }
 void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int write) {
     read_lock();
+    /* sotc: adjacent VMAs that end up with the same protection share one host_protect call
+     * (VirtualProtect is a system call; the draw thread re-protects ranges per binding). */
+    uintptr_t run_a=0, run_b=0; int run_prot=-1;
     for (size_t i=vma_index(address); i<vma_count && vmas[i].start<address+size; ++i) {
         if (vmas[i].kind==KIND_RESERVED) continue;
         uintptr_t a=vmas[i].start>address ? vmas[i].start : address;
         uintptr_t b=vmas[i].end<address+size ? vmas[i].end : address+size;
         int guest=host_prot(vmas[i].prot);
         int want=(read ? PROT_READ : 0)|(write ? PROT_WRITE|PROT_READ : 0)|(guest & PROT_EXEC);
-        host_protect(a,b-a,guest & want);
+        int prot=guest & want;
+        if (run_prot==prot && run_b==a) { run_b=b; continue; }
+        if (run_prot>=0) host_protect(run_a,run_b-run_a,run_prot);
+        run_a=a; run_b=b; run_prot=prot;
     }
+    if (run_prot>=0) host_protect(run_a,run_b-run_a,run_prot);
     read_unlock();
 }
 /* Host view of a guest range, for the GPU backend: the range must be mapped. */

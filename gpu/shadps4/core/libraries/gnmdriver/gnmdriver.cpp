@@ -4,6 +4,8 @@
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
+#include <cstdlib>
+
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
@@ -88,6 +90,36 @@ static void WaitGpuIdle() {
     HLE_TRACE;
     std::unique_lock lock{m_wait_idle};
     cv_lock.wait(lock, [] { return submission_lock == 0; });
+}
+
+// sotc: SOTC_CP_AHEAD=1 (default off). WaitGpuIdle() above returns at once unless
+// submission_lock is set, which sceGnmSubmitDone does when the GPU is not idle; it is cleared by
+// the GpuIdle IRQ, which the command processor raises after the draw thread ran everything queued.
+// With the switch on, a submit waiting on that flag only waits until the command processor has
+// parsed every submitted command buffer (num_submits == 0), and the draw thread may still run
+// the previous frame. Why that stays safe for the command buffers: the command processor reads
+// guest DCB memory lazily (SubmitGfx keeps a span; the copy only runs with BB_COPY_GPU_BUFFERS),
+// and the decrement of num_submits is what marks a buffer parsed, so the wait keeps the guest from
+// reusing a DCB before its parse. Risk, not checked: the draw thread still reads guest memory
+// (vertex, constant, texture data) after the wait, so a guest that rewrites that memory without
+// its own GPU fence can make the previous frame draw with the next frame's data. Submit-time
+// gating does not guard that; only the game's own fences do. Off by default for that reason.
+static void WaitSubmitGate() {
+    static const bool cp_ahead = [] {
+        const char* v = std::getenv("SOTC_CP_AHEAD");
+        return v && std::atoi(v) != 0;
+    }();
+    if (!cp_ahead) {
+        WaitGpuIdle();
+        return;
+    }
+    {
+        std::unique_lock lock{m_wait_idle};
+        if (submission_lock == 0) {
+            return;
+        }
+    }
+    liverpool->WaitCommandsConsumed();
 }
 
 // Write a special ending NOP packet with N DWs data block
@@ -2296,7 +2328,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     const auto size_dw = dcb_sizes_in_bytes[count - 1] / 4;
 
     std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
+    WaitSubmitGate();
 
     const s32 patch_result =
         PatchFlipRequest(cmdbuf, size_dw, vo_handle, buf_idx, flip_mode, flip_arg, nullptr /*unk*/);
@@ -2339,7 +2371,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
     }
 
     std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
+    WaitSubmitGate();
 
     return PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
                          const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);

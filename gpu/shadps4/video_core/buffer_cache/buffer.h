@@ -33,7 +33,16 @@ enum class MemoryType : u8 {
     HostCached,   ///< Requires a host visible memory type optimized for GPU to CPU readbacks
     Stream,       ///< Requests device local host visible buffer, falling back host memory.
     Sparse,       ///< Requires an unbacked sparse resident buffer.
+    /// sotc: device local and host visible (Resizable BAR). Only obtained through
+    /// ResolveRebarType(); a refused allocation falls back to Stream-style memory silently.
+    DeviceHostVisible,
 };
+
+/// sotc: returns MemoryType::DeviceHostVisible when SOTC_REBAR_UPLOAD is on, the large BAR heap
+/// has budget left and the SOTC_REBAR_MB cap has room for `size` bytes. The bytes are reserved
+/// and released when the buffer is destroyed. Otherwise returns `fallback` and changes nothing.
+[[nodiscard]] MemoryType ResolveRebarType(const Vulkan::Instance& instance, u64 size,
+                                          MemoryType fallback);
 
 constexpr vk::BufferUsageFlags ReadFlags =
     vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eUniformBuffer |
@@ -54,7 +63,8 @@ struct UniqueBuffer {
         : device{other.device}, buffer{std::exchange(other.buffer, VK_NULL_HANDLE)},
           bda_addr{std::exchange(other.bda_addr, 0)},
           allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
-          allocation{std::exchange(other.allocation, VK_NULL_HANDLE)} {}
+          allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
+          rebar_bytes{std::exchange(other.rebar_bytes, 0)} {}
 
     UniqueBuffer& operator=(UniqueBuffer&& other) noexcept {
         if (this != &other) {
@@ -64,6 +74,7 @@ struct UniqueBuffer {
             bda_addr = std::exchange(other.bda_addr, 0);
             allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
             allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
+            rebar_bytes = std::exchange(other.rebar_bytes, 0);
         }
         return *this;
     }
@@ -78,6 +89,7 @@ struct UniqueBuffer {
     vk::DeviceAddress bda_addr{};
     VmaAllocator allocator;
     VmaAllocation allocation{};
+    u64 rebar_bytes{}; // sotc: ReBAR bytes reserved by this allocation, released in Destroy()
 };
 
 struct Buffer {

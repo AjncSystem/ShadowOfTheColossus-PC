@@ -13,7 +13,7 @@ namespace SotcStats {
 /// function-local static guard and no getenv inside the vectored fault handler; same pattern as
 /// BbStats::enabled). Counters that only one printer reads are bumped only when that printer is
 /// on: commands (SOTC_FPS) and cmd_kinds, render_breaks, upload_bytes, fault_writes,
-/// fault_walker, fault_gpu_reads (SOTC_CMD_STATS). By default the per-draw lock xadds and the
+/// fault_walker, fault_gpu_reads, fault_granule_pages (SOTC_CMD_STATS). By default the per-draw lock xadds and the
 /// guest-thread fault counter (which shared cache lines with CP counters) are gone; with the
 /// switches on, the printed numbers are unchanged (the printer reads and resets each counter with
 /// exchange(0) only under the same switch). The variables are never set at run time.
@@ -28,8 +28,33 @@ inline const bool kFastBind = [] {
     const char* v = std::getenv("SOTC_FAST_BIND");
     return !v || v[0] != '0';
 }();
+/// sotc: SOTC_FASTBIND_WIDE=1 (default off): a reused bind is also taken in a later GPU submit
+/// (the tick must differ). The lookups are skipped; push constants and descriptors are issued
+/// again into the current command buffer (Rasterizer::BindResources, vk_rasterizer.cpp).
+inline const bool kFastBindWide = [] {
+    const char* v = std::getenv("SOTC_FASTBIND_WIDE");
+    return v && v[0] == '1';
+}();
+/// sotc: SOTC_HOST_IMAGE_COPY=1 (default off): linear textures the GPU did not write are re-uploaded
+/// by the host (vkCopyMemoryToImageEXT, VK_EXT_host_image_copy) instead of a staging copy in a
+/// command buffer (TextureCache::RefreshImage, Runtime::TryHostImageCopy). Off as well when the
+/// texture dump or replacement hook is set (they change the bytes after the upload) and with
+/// SOTC_FASTBIND_WIDE=1 (a bind reused in a later submit is not seen by the image's tick).
+inline const bool kHostImageCopy = [] {
+    const char* v = std::getenv("SOTC_HOST_IMAGE_COPY");
+    return v && v[0] == '1' && !std::getenv("SOTC_TEX_DUMP") && !std::getenv("SOTC_TEX_REPLACE") &&
+           !kFastBindWide;
+}();
+/// sotc: host uploads done, and candidates refused because the image was not idle on the GPU.
+inline std::atomic<uint64_t> host_image_copies{0};
+inline std::atomic<uint64_t> host_image_copy_busy{0};
 inline std::atomic<uint64_t> fast_bind_eligible{0};
 inline std::atomic<uint64_t> fast_bind_hits{0};
+inline std::atomic<uint64_t> fast_bind_wide_hits{0}; ///< SOTC_FASTBIND_WIDE: reused in a later submit
+/// sotc: eligible draws that rebuilt their bindings (SOTC_FPS only, BindResources): all misses,
+/// and the misses where only the submit tick differed (the state was otherwise reusable).
+inline std::atomic<uint64_t> fast_bind_misses{0};
+inline std::atomic<uint64_t> fast_bind_tick_misses{0};
 /// sotc: bumped whenever guest memory changes outside the GPU's own draws: a write by the command
 /// processor (constant RAM dumps, WRITE_DATA, DMA: MemoryManager::NoteHostWrite) or a CPU write
 /// the page tracking sees (MemoryTracker). A reused bind (SOTC_FAST_BIND) needs it unchanged: the
@@ -76,19 +101,81 @@ inline std::atomic<uint64_t> readback_copies{0};          ///< ranges downloaded
 inline std::atomic<uint64_t> readback_copies_changed{0};  ///< ... whose bytes differed from memory
 inline std::atomic<uint64_t> readback_bytes{0};
 inline std::atomic<uint64_t> readback_bytes_changed{0};
+/// sotc: BufferCache::ReleaseMemory's GPU sync (Finish, or Flush with SOTC_UNBIND_GPU_WAIT=1):
+/// calls and time (SOTC_FPS only).
+inline std::atomic<uint64_t> release_finish_count{0}, release_finish_ns{0};
+/// sotc: time the guest thread waits in BufferCache::DropGpuModified (SOTC_DROP_ASYNC=0; 0 in
+/// the default async mode). SOTC_FPS only.
+inline std::atomic<uint64_t> drop_gpu_wait_ns{0};
+/// sotc: SOTC_DROP_FAST: unmaps dropped on the guest thread, and those that still waited
+/// (GPU-written pages in the range). Totals.
+inline std::atomic<uint64_t> drop_fast{0};
+/// sotc: SOTC_ASYNC_UPLOAD, totals: uploads copied by the copy threads and their bytes, the time
+/// submits waited for them, the guest writes / unmaps / frees that waited for a job (the write
+/// fence) and that time, and the large uploads kept on the draw thread (hot pages, no backing).
+inline std::atomic<uint64_t> async_upload_jobs{0};
+inline std::atomic<uint64_t> async_upload_bytes{0};
+inline std::atomic<uint64_t> async_upload_submit_ns{0};
+inline std::atomic<uint64_t> async_upload_fence_waits{0};
+inline std::atomic<uint64_t> async_upload_fence_ns{0};
+inline std::atomic<uint64_t> async_upload_kept{0};
+/// sotc: SOTC_CP_FLIP_PACE: command processor time spent waiting for a free presentation frame
+/// before queueing a flip (since the last SOTC_FPS report).
+inline std::atomic<uint64_t> cp_flip_pace_ns{0};
+/// sotc: SOTC_HOST_IMPORT, totals: uploads copied by the GPU from imported guest memory, their
+/// bytes and wait time, uploads that went back to the CPU path, chunks the driver refused, and
+/// the chunks imported now (64 MiB each).
+inline std::atomic<uint64_t> host_import_uploads{0};
+inline std::atomic<uint64_t> host_import_bytes{0};
+inline std::atomic<uint64_t> host_import_ns{0};
+inline std::atomic<uint64_t> host_import_fallbacks{0};
+inline std::atomic<uint64_t> host_import_refused{0};
+inline std::atomic<uint64_t> host_import_live_chunks{0};
+inline std::atomic<uint64_t> drop_slow{0};
 /// SOTC_RB_NARROW: readback window (KiB, 0 = off), GPU-modified bytes of the 512 KiB window left
 /// outside the narrow one (not downloaded nor unprotected), live hot readbacks (gauge).
 inline std::atomic<uint64_t> rb_narrow_kib{0}, rb_narrow_kept_bytes{0}, rb_hot_entries{0};
 inline std::atomic<uint64_t> uploads{0};        ///< SynchronizeMemory copies (CPU data to GPU)
+/// SOTC_XFER_QUEUE: uploads copied on the transfer queue instead of the graphics queue.
+inline std::atomic<uint64_t> xfer_copies{0};
 /// DMA sweeps (SynchronizeDmaBuffers): count, resident ranges visited, sweeps that uploaded.
 inline std::atomic<uint64_t> dma_sweeps{0}, dma_sweep_ranges{0}, dma_sweep_uploading{0};
 /// ... merged runs visited, and time (ns) in all sweeps and in the ones that uploaded nothing.
 inline std::atomic<uint64_t> dma_sweep_runs{0}, dma_sweep_ns{0}, dma_sweep_idle_ns{0};
 inline std::atomic<uint64_t> upload_bytes{0};
+/// sotc: SOTC_HASH_SMALL=<bytes> (default 0 = off, read once at static initialisation). A read-only
+/// bind of at most that many bytes whose pages the tracker reports CPU-dirty is hashed (XXH3 of
+/// the guest bytes) against the bytes last uploaded for the same bind range: equal bytes skip the
+/// upload (BufferCache::SyncSmallByHash). Pages stay write-protected: a guest write still faults.
+inline const uint64_t kHashSmall = [] {
+    const char* v = std::getenv("SOTC_HASH_SMALL");
+    return v ? std::strtoull(v, nullptr, 0) : uint64_t{0};
+}();
+/// sotc: hashed binds whose bytes were unchanged (upload skipped), hashed binds uploaded, and the
+/// bytes of the skipped uploads. Printed with the SOTC_FPS stats (videoout/driver.cpp).
+inline std::atomic<uint64_t> hash_small_hits{0};
+inline std::atomic<uint64_t> hash_small_uploads{0};
+inline std::atomic<uint64_t> hash_small_bytes{0};
 inline std::atomic<uint64_t> render_breaks{0};  ///< EndRendering that closed a render pass
+/// sotc: SOTC_PASS_SEC passes recorded on a secondary command buffer, and passes over the draw
+/// threshold that stayed on the primary (a block the secondary cannot hold, or no pass format)
+inline std::atomic<uint64_t> passes_secondary{0};
+inline std::atomic<uint64_t> passes_fallback{0};
 inline std::atomic<uint64_t> fault_writes{0};       ///< guest write faults on tracked pages
 inline std::atomic<uint64_t> fault_walker{0};       ///< SRT walker loads emulated after a fault
 inline std::atomic<uint64_t> fault_gpu_reads{0};    ///< other read faults on the command processor
+/// sotc: SOTC_FAULT_GRANULE=<bytes> (16384 or 65536; unset or anything else = 4096, the page). A
+/// guest write fault also invalidates the other pages of its aligned granule, so writes that
+/// follow in the same granule do not fault again. Read once at static initialisation.
+inline const uint64_t kFaultGranule = [] {
+    const char* v = std::getenv("SOTC_FAULT_GRANULE");
+    const uint64_t g = v ? std::strtoull(v, nullptr, 10) : 4096;
+    return (g == 16384 || g == 65536) ? g : uint64_t{4096};
+}();
+/// sotc: pages invalidated beyond the faulting one by kFaultGranule (SOTC_CMD_STATS).
+inline std::atomic<uint64_t> fault_granule_pages{0};
+/// sotc: SOTC_FAULT_GRANULE pages not uploaded because the guest left them unchanged.
+inline std::atomic<uint64_t> fault_granule_skipped{0};
 inline std::atomic<uint64_t> commands{0}; ///< draws and dispatches recorded (monotonic, CP only)
 /// Change of a monotonic single-writer counter since the last call (`seen` keeps the last value).
 inline uint64_t TakeDelta(const std::atomic<uint64_t>& counter, uint64_t& seen) {
@@ -112,6 +199,12 @@ inline uint64_t NowNs() {
 /// SOTC_CMD_STATS=1: draws, indirect draws (arguments GPU-written / CPU-side / CPU-side and
 /// empty), dispatches, indirect dispatches.
 inline std::atomic<uint64_t> cmd_kinds[6]{};
+/// sotc: IT_SET_PREDICATION packets by predication op (0 clear, 1 zpass, 2 primcount, 3 bool64,
+/// other), SOTC_CMD_STATS only; printed as the "SOTC predication" line (videoout/driver.cpp).
+inline std::atomic<uint64_t> pred_ops[5]{};
+/// SOTC_CMD_STATS: command blocks the recording thread ran, per CommandRecorder::BlockCategory
+/// (vk_recorder.cpp counts them, the SOTC_FPS printer takes them per window).
+inline std::atomic<uint64_t> recorder_blocks[16]{};
 inline std::atomic<uint64_t> early_flushes{0}; ///< submits right after a write to a read-back page
 /// Suspects of long frames, printed for each frame over SOTC_STALL_MS (SOTC_FRAME_LOG runs):
 /// pipelines created, shaders recompiled and images created during the frame, and their time.
@@ -137,6 +230,7 @@ inline std::atomic<uint64_t> arena_pinned{0};   ///< ... faulted back in by shad
 inline std::atomic<uint64_t> arena_evict_mismatch{0}; ///< read back unequal to guest memory: kept
 inline std::atomic<uint64_t> arena_evict_runs{0};
 inline std::atomic<uint64_t> arena_evict_ns{0}; ///< time in MaybeEvictCold (scan, GPU wait, unbind)
+inline std::atomic<uint64_t> arena_tick_waits{0}; ///< SOTC_ARENA_TICK_FREE: waits for freed arena runs
 // sotc: compute pipelines built by pipeline workers (SOTC_ASYNC_COMPUTE), totals.
 inline std::atomic<uint64_t> async_compute_built{0};
 inline std::atomic<uint64_t> async_compute_build_ns{0}; ///< worker time building them
@@ -148,8 +242,19 @@ inline std::atomic<uint64_t> async_translate_stale{0}; ///< permutations whose t
 inline std::atomic<uint64_t> async_translate_built{0};
 inline std::atomic<uint64_t> async_translate_ns{0};    ///< worker time translating them
 inline std::atomic<uint64_t> async_translate_skips{0}; ///< draws skipped while waiting for one
+// sotc: SOTC_ASYNC_COMPUTE_XLATE, totals: compute shaders queued ahead of their dispatch, the
+// dispatches that waited for one (and the wait), and those taken back before a worker started.
+inline std::atomic<uint64_t> compute_prefetch_queued{0};
+inline std::atomic<uint64_t> compute_prefetch_scans{0};
+inline std::atomic<uint64_t> compute_prefetch_waits{0};
+inline std::atomic<uint64_t> compute_prefetch_wait_ns{0};
+inline std::atomic<uint64_t> compute_prefetch_taken_back{0};
+inline std::atomic<uint64_t> compute_prefetch_timeouts{0};
 /// sotc: SRT walker loads that faulted (null or unmapped table pointer) and read zero, total.
 inline std::atomic<uint64_t> srt_walker_faults{0};
+/// sotc: Phi operands of SRT walker offsets: resolved to their one common value, and fallbacks
+/// (operands differ, or a cycle through Phis). Counted when the shader is translated.
+inline std::atomic<uint64_t> phi_resolved{0}, phi_fallback{0};
 inline std::atomic<uint64_t> image_bytes{0};    ///< live texture cache and host pass images
 inline std::atomic<uint64_t> image_count{0};
 inline std::atomic<uint64_t> gc_kept_tiled{0};  ///< GC candidates kept: GPU-written tiled images

@@ -124,6 +124,9 @@ std::unique_lock<StackLock> LockStacksExclusive() {
 // Reference counted: the margin below one stack often covers a neighbouring stack (games pack
 // fiber stacks back to back), so finalizing one must not drop the other's protection.
 boost::icl::interval_map<VAddr, u32> g_guest_stacks;
+// sotc: bumped (under the exclusive lock) whenever g_guest_stacks changes; readers keep a sorted
+// per-thread copy of its segments and refresh it only when this moves (StackSegments).
+std::atomic<u64> g_guest_stacks_generation{1};
 // Re-applies the tracker's protection to pages that stop being stack pages.
 std::function<void(VAddr, u64)> g_reapply_protection;
 } // namespace
@@ -143,6 +146,7 @@ void RegisterGuestStack(VAddr address, u64 size) {
     {
         auto lk = LockStacksExclusive(); // in-flight SignalImpl::Protect calls hold it shared
         g_guest_stacks += std::make_pair(boost::icl::interval<VAddr>::right_open(begin, end), 1u);
+        g_guest_stacks_generation.fetch_add(1, std::memory_order_release);
     }
     // Protects that computed their ranges before the insert have finished their host protect
     // (they held the lock shared); later ones see the range. Make it accessible now.
@@ -159,6 +163,7 @@ void UnregisterGuestStack(VAddr address, u64 size) {
     {
         auto lk = LockStacksExclusive();
         g_guest_stacks -= std::make_pair(boost::icl::interval<VAddr>::right_open(begin, end), 1u);
+        g_guest_stacks_generation.fetch_add(1, std::memory_order_release);
     }
     // The pages were left accessible while they were a stack: give the tracker its protection
     // back, or CPU writes there would go unnoticed (pages still used by another stack stay).
@@ -167,26 +172,50 @@ void UnregisterGuestStack(VAddr address, u64 size) {
     }
 }
 
+namespace {
+// sotc: the stack segments as a sorted flat array, one copy per thread. Guest stacks change only
+// when a guest thread or fiber is created or destroyed, while the readback and fault paths ask
+// for every range they write: a shared lock plus an interval-tree lookup (and an interval_set
+// built and destroyed) per call showed up as ~8% of the draw thread while streaming. The copy is
+// refreshed only when g_guest_stacks_generation moved.
+const std::vector<std::pair<VAddr, VAddr>>& StackSegments() {
+    struct Cache {
+        u64 generation = 0;
+        std::vector<std::pair<VAddr, VAddr>> segments;
+    };
+    thread_local Cache cache;
+    if (cache.generation != g_guest_stacks_generation.load(std::memory_order_acquire)) {
+        std::shared_lock lk{g_guest_stacks_mutex};
+        cache.segments.clear();
+        for (const auto& [interval, count] : g_guest_stacks) {
+            cache.segments.emplace_back(interval.lower(), interval.upper());
+        }
+        // Read under the lock: a change after it bumps the generation again.
+        cache.generation = g_guest_stacks_generation.load(std::memory_order_acquire);
+    }
+    return cache.segments;
+}
+} // namespace
+
+bool IntersectsGuestStack(VAddr address, u64 size) {
+    const VAddr end = address + size;
+    const auto& segments = StackSegments();
+    const auto it = std::ranges::partition_point(
+        segments, [address](const std::pair<VAddr, VAddr>& seg) { return seg.second <= address; });
+    return it != segments.end() && it->first < end;
+}
+
 // sotc: func is a NonStackRangeFn (non-owning) instead of const std::function&; see page_manager.h.
 void ForEachNonStackRange(VAddr address, u64 size, NonStackRangeFn func) {
     if (size == 0) {
         return;
     }
-    boost::icl::interval_set<VAddr> ranges;
-    const auto window = boost::icl::interval<VAddr>::right_open(address, address + size);
-    bool overlaps = false;
-    {
-        std::shared_lock lk{g_guest_stacks_mutex};
-        const auto [first, last] = g_guest_stacks.equal_range(window);
-        if (first != last) {
-            overlaps = true;
-            ranges += window;
-            for (auto it = first; it != last; ++it) {
-                ranges -= it->first;
-            }
-        }
-    }
-    if (!overlaps) {
+    const VAddr end = address + size;
+    const auto& segments = StackSegments();
+    // First segment ending after address (segments are sorted and disjoint).
+    auto it = std::ranges::partition_point(
+        segments, [address](const std::pair<VAddr, VAddr>& seg) { return seg.second <= address; });
+    if (it == segments.end() || it->first >= end) {
         // Common case: nothing of the range is a stack.
         func(address, size);
         return;
@@ -196,8 +225,15 @@ void ForEachNonStackRange(VAddr address, u64 size, NonStackRangeFn func) {
         LOG_WARNING(Render, "Not writing GPU data back over guest stack pages in {:#x}+{:#x}",
                     address, size);
     }
-    for (const auto& range : ranges) {
-        func(range.lower(), range.upper() - range.lower());
+    VAddr cursor = address;
+    for (; it != segments.end() && it->first < end; ++it) {
+        if (it->first > cursor) {
+            func(cursor, it->first - cursor);
+        }
+        cursor = std::max(cursor, it->second);
+    }
+    if (cursor < end) {
+        func(cursor, end - cursor);
     }
 }
 
@@ -873,6 +909,68 @@ struct SignalImpl : public PageManager::Impl {
         return HandleGuestFault(context, fault_address, rasterizer->IsGpuSideThread());
     }
 
+    // sotc: may a page other than the faulting one be invalidated by SOTC_FAULT_GRANULE? Not when
+    // it is part of a guest stack, and not when the GPU wrote it (its read protection stands for a
+    // readback; the GPU bit is checked here, and InvalidateRegion would read it back anyway).
+    static bool GranulePageMayInvalidate(VAddr page) {
+        u64 open = 0;
+        ForEachNonStackRange(page, PageManager::PM_PAGE_SIZE,
+                             [&open](VAddr, u64 size) { open += size; });
+        // sotc: nor when an image lives in the page's 1 MiB block: invalidating it marks the image
+        // CPU-dirty, and an image the GPU drew was then uploaded again from stale guest memory
+        // (colored blocks on the title screen, 2026-10-27). Texture pages keep one fault per page.
+        return open == PageManager::PM_PAGE_SIZE &&
+               !rasterizer->GetBufferCache().IsRegionGpuModified(page, PageManager::PM_PAGE_SIZE) &&
+               // sotc: nor when it is already CPU-dirty: it uploads anyway, and a snapshot taken
+               // now would equal its bytes and drop an upload the arena still needs.
+               !rasterizer->GetBufferCache().IsRegionCpuModified(page, PageManager::PM_PAGE_SIZE) &&
+               !rasterizer->GetTextureCache().HasImagesNear(page);
+    }
+
+    // sotc: SOTC_FAULT_GRANULE. After a guest write fault, the other pages of the faulting page's
+    // aligned granule are invalidated as well (CPU-modified and unprotected, through the same
+    // InvalidateMemoryOnGuestFault path), so writes that follow in that granule do not fault again.
+    // Trade-off: an invalidated texture or buffer is uploaded again from guest memory, and most of
+    // these pages are never written, so the uploads are wasted work; the gain is one exception per
+    // granule instead of one per 4 KiB page (16k per 64 MiB streamed). Pages the GPU wrote and
+    // guest stacks are skipped (they stay as they were); the faulting page is the caller's.
+    static void InvalidateGranule(VAddr addr) {
+        const VAddr begin = Common::AlignDown(addr, SotcStats::kFaultGranule);
+        const VAddr end = begin + SotcStats::kFaultGranule;
+        const VAddr fault_page = PageManager::GetPageAddr(addr);
+        VAddr run_start = 0;
+        u64 run_size = 0;
+        // Invalidates the pages collected so far as one range (one call per run of pages).
+        const auto flush = [&] {
+            if (run_size == 0) {
+                return;
+            }
+            if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer
+                SotcStats::fault_granule_pages.fetch_add(run_size / PageManager::PM_PAGE_SIZE,
+                                                         std::memory_order_relaxed);
+            }
+            // sotc: remember each page's bytes first: the buffer cache then uploads only the pages
+            // the guest really writes (BufferCache::DropUnchangedGranulePages).
+            for (VAddr page = run_start; page < run_start + run_size;
+                 page += PageManager::PM_PAGE_SIZE) {
+                rasterizer->GetBufferCache().NoteGranulePage(page);
+            }
+            rasterizer->InvalidateMemoryOnGuestFault(run_start, run_size);
+            run_size = 0;
+        };
+        for (VAddr page = begin; page < end; page += PageManager::PM_PAGE_SIZE) {
+            if (page == fault_page || !GranulePageMayInvalidate(page)) {
+                flush();
+                continue;
+            }
+            if (run_size == 0) {
+                run_start = page;
+            }
+            run_size += PageManager::PM_PAGE_SIZE;
+        }
+        flush();
+    }
+
     static bool HandleGuestFault(void* context, void* fault_address, bool is_gpu_thread) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
@@ -894,6 +992,11 @@ struct SignalImpl : public PageManager::Impl {
                                      : rasterizer->InvalidateMemoryOnGuestFault(addr, size);
             if (!handled) {
                 return false;
+            }
+            // sotc: SOTC_FAULT_GRANULE, guest threads only (the command processor's writes keep
+            // the single page).
+            if (!is_gpu_thread && SotcStats::kFaultGranule > PageManager::PM_PAGE_SIZE) {
+                InvalidateGranule(addr);
             }
             rasterizer->MarkWriteAhead(addr);
             RepairStuckWriteFault(context, addr);

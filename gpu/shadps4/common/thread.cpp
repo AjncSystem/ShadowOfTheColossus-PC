@@ -114,10 +114,30 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
     LARGE_INTEGER interval{
         .QuadPart = -1 * (duration.count() / 100u),
     };
-    HANDLE timer = ::CreateWaitableTimer(NULL, TRUE, NULL);
-    SetWaitableTimer(timer, &interval, 0, NULL, NULL, 0);
-    const auto ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);
-    ::CloseHandle(timer);
+    // sotc: one high-resolution timer per thread (the vblank and FPS-cap sleeps run here about 120
+    // times a second); a plain waitable timer fires on the scheduler tick. Falls back to a plain
+    // one on Windows before 10 1803, which lacks CREATE_WAITABLE_TIMER_HIGH_RESOLUTION.
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+    struct TimerHandle {
+        HANDLE handle = nullptr;
+        ~TimerHandle() {
+            if (handle) {
+                ::CloseHandle(handle);
+            }
+        }
+    };
+    thread_local TimerHandle timer;
+    if (!timer.handle) {
+        timer.handle = ::CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                                TIMER_ALL_ACCESS);
+        if (!timer.handle) {
+            timer.handle = ::CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
+        }
+    }
+    SetWaitableTimer(timer.handle, &interval, 0, NULL, NULL, 0);
+    const auto ret = WaitForSingleObjectEx(timer.handle, INFINITE, interruptible);
 
     if (remaining) {
         const auto end_sleep = std::chrono::high_resolution_clock::now();

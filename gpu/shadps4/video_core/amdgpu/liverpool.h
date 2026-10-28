@@ -9,6 +9,7 @@
 #include <coroutine>
 #include <exception>
 #include <mutex>
+#include <unordered_map>
 #include <semaphore>
 #include <span>
 #include <thread>
@@ -36,6 +37,11 @@ struct VideoOutPort;
 }
 
 namespace AmdGpu {
+
+struct PM4CmdWaitRegMem; // sotc: pm4_cmds.h (EopShadowSatisfies)
+
+// sotc: SOTC_EOP_TICK statistics (liverpool.cpp), printed under SOTC_FPS.
+extern std::atomic<u64> g_eop_written, g_eop_latency_ns, g_eop_max_latency_ns, g_eop_flushes;
 
 struct Liverpool {
     static constexpr u32 GfxQueueId = 0u;
@@ -94,6 +100,13 @@ public:
         while (back_tail.load(std::memory_order_acquire) != back_head.load(std::memory_order_acquire)) {
             std::this_thread::yield();
         }
+    }
+
+    /// sotc: waits only until the command processor parsed every submitted command buffer; the
+    /// draw thread may still run what it queued (SOTC_CP_AHEAD, see gnmdriver.cpp WaitSubmitGate).
+    void WaitCommandsConsumed() noexcept {
+        std::unique_lock lk{submit_mutex};
+        submit_cv.wait(lk, [this] { return num_submits == 0; });
     }
 
     bool IsGpuIdle() const {
@@ -197,6 +210,13 @@ public:
     }
     bool OnBackThread() const noexcept {
         return back_threaded && std::this_thread::get_id() == back_id;
+    }
+    /// sotc: SOTC_FLIP_SERVICE: runs the queued commands of the game's threads, when called on
+    /// the draw thread between two operations' worth of state (Vulkan::Presenter::wait_service).
+    void ServiceCommandsOnBackThread() {
+        if (OnBackThread() && num_commands.load(std::memory_order_acquire)) {
+            ProcessCommands();
+        }
     }
     /// The command processor or the draw thread: both work on the GPU state.
     bool IsGpuSideThread() const noexcept {
@@ -413,6 +433,10 @@ private:
     void SubmitDrawIndirect(bool is_indexed, VAddr address, u32 offset, u32 stride, u32 max_count,
                             VAddr count_address, u16 vertex_sgpr_offset, u16 instance_sgpr_offset);
     void SubmitDispatch(bool indirect, VAddr address, u32 offset, u32 size);
+    /// sotc: SOTC_ASYNC_COMPUTE_XLATE: when the current dispatch's compute shader is new,
+    /// queues the new compute shaders of the next dispatches in rest (the packets after it)
+    /// for the pipeline workers (see Vulkan::PipelineCache::ComputePrefetchEnabled).
+    void PrefetchComputeAhead(std::span<const u32> rest);
     BackOp& BackAlloc();
     void BackPublish(bool writes_memory);
     void CaptureBackOp(BackOp& op, const Vulkan::Pipeline* pipeline);
@@ -448,15 +472,37 @@ private:
     }
     void ExecuteBackOp(BackOp& op);
     void BackLoop(std::stop_token stoken);
+    /// sotc: SOTC_EOP_TICK=1. Runs the end-of-pipe labels the GPU has finished, and flushes the
+    /// open command buffer when a label has waited too long for it. Draw thread only.
+    void EopService();
+    /// sotc: SOTC_EOP_TICK=1. Called by the command processor while it waits on memory: queues
+    /// EopService on the draw thread once the oldest label has waited too long.
+    void EopWaitGuard();
     void WakeBack() {
+        if (back_threaded && back_nospin) {
+            // sotc: SOTC_WAIT_NOSPIN: BackLoop blocks on back_wake; bump it only when it sleeps.
+            if (back_sleeping.load(std::memory_order_seq_cst)) {
+                WakeBackAtomic();
+            }
+            return;
+        }
         if (back_threaded) {
             std::scoped_lock lk{back_mutex};
             back_cv.notify_one();
         }
     }
+    /// sotc: changes back_wake and wakes BackLoop. Called after the state BackLoop waits on changed.
+    void WakeBackAtomic() {
+        back_wake.fetch_add(1, std::memory_order_seq_cst);
+        back_wake.notify_one();
+    }
 
     bool back_threaded{};
     bool back_strict{};
+    /// sotc: SOTC_WAIT_NOSPIN=1: BackLoop spins ~20 us, then blocks on back_wake (not back_cv).
+    bool back_nospin{};
+    /// sotc: doorbell BackLoop blocks on under back_nospin; see WakeBackAtomic.
+    std::atomic<u32> back_wake{0};
     std::thread::id back_id{};
     std::vector<BackOp> back_ring;
     std::atomic<u64> back_head{0};
@@ -476,6 +522,29 @@ private:
     std::array<u64, (NumRegChunks + 63) / 64> dirty_chunks{};
     std::vector<u16> dirty_list;
     std::jthread back_thread{};
+
+    /// sotc: SOTC_EOP_TICK=1 (needs back_threaded). End-of-pipe labels wait for the GPU through
+    /// the scheduler's deferred operations instead of being written when the command processor
+    /// reads them. Off by default.
+    bool eop_tick{};
+    /// Labels queued and not yet written. Written on the draw thread, read by the CP guard.
+    std::atomic<u32> eop_outstanding{0};
+    /// Steady clock (ns) at which eop_outstanding went from 0 to 1; 0 when none is outstanding.
+    std::atomic<u64> eop_oldest_ns{0};
+    /// Scheduler tick of the newest queued label. Equal to CurrentTick() while that label's work
+    /// is still in the command buffer being recorded, that is not yet submitted.
+    std::atomic<u64> eop_last_tick{0};
+    /// sotc: SOTC_EOP_TICK: values queued labels will receive (u32 address -> value), so a
+    /// WaitRegMem of the command stream on such a label does not wait for the host GPU: the host
+    /// queue runs the stream in order anyway. Guest CPU threads still see the label only once
+    /// the GPU has finished (the protection the switch is for).
+    std::mutex eop_shadow_mutex;
+    std::unordered_map<VAddr, u32> eop_shadow;
+    std::atomic<u32> eop_shadow_count{0};
+    /// sotc: true when the pending value of a queued label satisfies this wait.
+    bool EopShadowSatisfies(const PM4CmdWaitRegMem& wait);
+    /// A EopService call is queued on the draw thread and has not run yet.
+    std::atomic<bool> eop_service_requested{false};
 };
 
 } // namespace AmdGpu

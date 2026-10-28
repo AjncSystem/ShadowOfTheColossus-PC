@@ -1254,12 +1254,14 @@ void VideoOutDriver::Flip(const Request& req) {
                 std::fprintf(
                     stderr,
                     "SOTC ASYNC COMPUTE built %llu (%.0f ms on workers), recorder waited %llu "
-                    "times (%.0f ms)\n",
+                    "times (%.0f ms), %llu made at prefetch install\n",
                     static_cast<unsigned long long>(built),
                     SotcStats::async_compute_build_ns.load(std::memory_order_relaxed) / 1e6,
                     static_cast<unsigned long long>(
                         SotcStats::async_compute_waits.load(std::memory_order_relaxed)),
-                    SotcStats::async_compute_wait_ns.load(std::memory_order_relaxed) / 1e6);
+                    SotcStats::async_compute_wait_ns.load(std::memory_order_relaxed) / 1e6,
+                    static_cast<unsigned long long>(
+                        SotcStats::compute_speculated.load(std::memory_order_relaxed)));
             }
             // sotc: graphics shaders translated by workers (SOTC_ASYNC_TRANSLATE), totals.
             if (const uint64_t built =

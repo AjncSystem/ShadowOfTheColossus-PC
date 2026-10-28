@@ -672,7 +672,11 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
             if (job->compute) {
                 --async_compute_queued;
             } else if (job->translate) {
-                --async_translate_queued;
+                if (job->translate->blocking) {
+                    --async_prefetch_queued;
+                } else {
+                    --async_translate_queued;
+                }
             }
         }
         if (job->translate) {
@@ -749,7 +753,8 @@ void PipelineCache::QueueAsyncTranslate(HwStage hw_stage, SwStage sw_stage,
                                         const Shader::ShaderParams& params,
                                         const Shader::RuntimeInfo& rt,
                                         const Shader::Backend::Bindings& start, Program* program,
-                                        const Shader::StageSpecialization* spec, size_t perm_idx) {
+                                        const Shader::StageSpecialization* spec, size_t perm_idx,
+                                        bool blocking) {
     auto job = std::make_unique<AsyncPipelineJob>();
     auto& t = *(job->translate = std::make_unique<AsyncPipelineJob::Translate>());
     t.hw_stage = hw_stage;
@@ -763,15 +768,77 @@ void PipelineCache::QueueAsyncTranslate(HwStage hw_stage, SwStage sw_stage,
     t.start = start;
     t.program = program;
     t.perm_idx = perm_idx;
+    t.blocking = blocking;
     if (spec) {
         t.spec = *spec;
     }
     {
         std::scoped_lock lock{async_mutex};
-        async_queue.insert(async_queue.begin() + async_compute_queued + async_translate_queued++,
+        if (blocking) {
+            async_queue.insert(async_queue.begin() + async_prefetch_queued++, std::move(job));
+        } else {
+            async_queue.insert(async_queue.begin() + async_prefetch_queued + async_compute_queued +
+                                   async_translate_queued++,
+                               std::move(job));
+        }
+    }
+    async_cv.notify_one();
+}
+
+void PipelineCache::QueueComputeBuild(ComputePipeline* pipeline) {
+    auto job = std::make_unique<AsyncPipelineJob>();
+    job->compute = pipeline;
+    {
+        std::scoped_lock lock{async_mutex};
+        // After the prefetch translations the command processor waits for, after the older
+        // compute ones (the recording thread binds them in this order), ahead of the rest.
+        async_queue.insert(async_queue.begin() + async_prefetch_queued + async_compute_queued++,
                            std::move(job));
     }
     async_cv.notify_one();
+}
+
+// sotc: SOTC_COMPUTE_SPECULATE=0 leaves the compute pipeline of a prefetched program to the first
+// dispatch that uses it. Default on: the pipeline (layouts here, the driver compile on a worker)
+// is made when the prefetch is installed, so a burst of new computes builds its pipelines in
+// parallel while the command processor goes on, and the recording thread rarely waits for one.
+// A dispatch whose tables give a different specialization looks up another key (a permutation),
+// as before; the speculative pipeline is then simply never bound.
+static bool ComputeSpeculateEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_COMPUTE_SPECULATE");
+        return !v || v[0] != '0';
+    }();
+    return enabled;
+}
+
+void PipelineCache::SpeculateComputePipeline(Program& program, u64 perm_hash) {
+    if (!ComputeSpeculateEnabled() || async_workers.empty() || !AsyncComputeEnabled() ||
+        !scheduler.HasRecordThread() || EmulatorSettings.IsShaderCollect()) {
+        return;
+    }
+    // The layout of an image array indexed by its own mip range depends on the sharp the
+    // dispatch passes (ImageResource::NumBindings): only the dispatch knows it.
+    for (const auto& image : program.info.images) {
+        if (image.array_size == 0 &&
+            image.mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
+            return;
+        }
+    }
+    const ComputePipelineKey key{perm_hash};
+    const auto [it, is_new] = compute_pipelines.try_emplace(key);
+    if (!is_new) {
+        return;
+    }
+    SotcStats::pipelines_new.fetch_add(1, std::memory_order_relaxed);
+    SotcStats::compute_speculated.fetch_add(1, std::memory_order_relaxed);
+    ComputePipeline::SerializationSupport sdata{};
+    it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
+                                                   *pipeline_cache, key, program.info,
+                                                   program.modules[0].module, sdata, false, true);
+    QueueComputeBuild(it.value().get());
+    RegisterPipelineData(key, sdata);
+    ++num_new_pipelines;
 }
 
 void PipelineCache::RunAsyncTranslate(AsyncPipelineJob::Translate& t) {
@@ -850,6 +917,9 @@ void PipelineCache::InstallTranslation(AsyncPipelineJob::Translate& t) {
         program->AddPermut(t.module, std::move(*t.spec));
         // The user data seen by the worker goes away with the job; every lookup sets its own.
         program->info.UserData() = {};
+        if (t.blocking) {
+            SpeculateComputePipeline(*program, HashCombine(t.hash, 0));
+        }
         return;
     }
     auto& program = *t.program;
@@ -1096,15 +1166,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
                                                        *pipeline_cache, compute_key, *infos[0],
                                                        modules[0], sdata, false, deferred);
         if (deferred) {
-            auto job = std::make_unique<AsyncPipelineJob>();
-            job->compute = it.value().get();
-            {
-                std::scoped_lock lock{async_mutex};
-                // Ahead of the graphics jobs, after the older compute ones: the recording
-                // thread binds them in this order.
-                async_queue.insert(async_queue.begin() + async_compute_queued++, std::move(job));
-            }
-            async_cv.notify_one();
+            QueueComputeBuild(it.value().get());
         } else {
             LogSyncPipeline("compute", async_workers.empty() ? "async off" : "not deferred",
                             sync_start, infos[0]->pgm_hash, 0);
@@ -1357,8 +1419,14 @@ void PipelineCache::PrefetchComputeProgram() {
     }
     Shader::Backend::Bindings binding{};
     const auto& rt = BuildRuntimeInfo(HwStage::Compute, SwStage::Compute);
+    // sotc: ahead of every other job (SOTC_PREFETCH_PRIORITY=0 queues it like the others): the
+    // command processor waits for it in RefreshComputeKey.
+    static const bool priority = [] {
+        const char* v = std::getenv("SOTC_PREFETCH_PRIORITY");
+        return !v || v[0] != '0';
+    }();
     QueueAsyncTranslate(HwStage::Compute, SwStage::Compute, params, rt, binding, nullptr, nullptr,
-                        0);
+                        0, priority);
 }
 
 bool PipelineCache::RefreshComputeKey() {

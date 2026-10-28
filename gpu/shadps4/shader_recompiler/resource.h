@@ -15,6 +15,11 @@ static constexpr u32 NUM_USER_DATA_REGS = 16;
 static constexpr u32 NUM_IMAGES = 64;
 static constexpr u32 NUM_BUFFERS = 40;
 static constexpr u32 NUM_SAMPLERS = 16;
+
+/// sotc: SOTC_BINDLESS_SAMP: the sampler slots in PushData. Each slot holds the index of a sampler
+/// in the global sampler heap (set 1); two 16-bit slots share one 32-bit push constant word.
+static constexpr u32 NUM_BINDLESS_SAMPLER_SLOTS = 36;
+static constexpr u32 NUM_BINDLESS_SAMPLER_WORDS = NUM_BINDLESS_SAMPLER_SLOTS / 2;
 static constexpr u32 NUM_FMASKS = 8;
 /// Per-game dynamic_tsharp_array_size: largest array, and the descriptors all the arrays of a shader may take
 /// on top of NUM_IMAGES (room for two arrays of the largest size)
@@ -269,6 +274,9 @@ struct PushData {
     static constexpr u32 XScaleIndex = 2;
     static constexpr u32 YScaleIndex = 3;
     static constexpr u32 BufOffsetIndex = 4;
+    // sotc: SOTC_BINDLESS_SAMP: the first member of BindlessSamplerSlots::words in the SPIR-V push
+    // block of a bindless stage, after buf_offsets.
+    static constexpr u32 SamplerSlotIndex = 7;
 
     float xoffset;
     float yoffset;
@@ -281,7 +289,16 @@ struct PushData {
         buf_offsets[binding] = offset;
     }
 };
+static_assert(sizeof(PushData) == 56, "PushData layout is assumed by the SPIR-V push block");
 static_assert(sizeof(PushData) <= 128,
               "PushData size is greater than minimum size guaranteed by Vulkan spec");
+
+/// sotc: SOTC_BINDLESS_SAMP: the heap index of each sampler slot, two u16 per word, low half
+/// first (see GetBindlessSamplerRange in runtime_info.h). Pushed right after PushData, at offset
+/// sizeof(PushData), and only by pipelines with a bindless stage (their layout has that range).
+struct BindlessSamplerSlots {
+    std::array<u32, NUM_BINDLESS_SAMPLER_WORDS> words{};
+};
+static_assert(sizeof(BindlessSamplerSlots) == NUM_BINDLESS_SAMPLER_WORDS * sizeof(u32));
 
 } // namespace Shader

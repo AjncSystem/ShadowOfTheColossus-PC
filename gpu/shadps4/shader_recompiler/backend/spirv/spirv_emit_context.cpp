@@ -805,8 +805,16 @@ void EmitContext::DefineOutputs() {
 
 void EmitContext::DefinePushDataBlock() {
     // Create push constants block for instance steps rates
-    const Id struct_type{
-        Name(TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2]), "AuxData")};
+    // sotc: a bindless stage also reads the sampler slots, pushed right after PushData
+    // (BindlessSamplerSlots). Other stages keep the block as it was.
+    const bool bindless = UsesBindlessSamplers(info);
+    std::vector<Id> members{F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2]};
+    if (bindless) {
+        for (u32 word = 0; word < NUM_BINDLESS_SAMPLER_WORDS; ++word) {
+            members.push_back(U32[1]);
+        }
+    }
+    const Id struct_type{Name(TypeStruct(std::span<const Id>(members)), "AuxData")};
     Decorate(struct_type, spv::Decoration::Block);
     MemberName(struct_type, PushData::XOffsetIndex, "xoffset");
     MemberName(struct_type, PushData::YOffsetIndex, "yoffset");
@@ -822,6 +830,13 @@ void EmitContext::DefinePushDataBlock() {
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 0, spv::Decoration::Offset, 16U);
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 1, spv::Decoration::Offset, 32U);
     MemberDecorate(struct_type, PushData::BufOffsetIndex + 2, spv::Decoration::Offset, 48U);
+    if (bindless) {
+        for (u32 word = 0; word < NUM_BINDLESS_SAMPLER_WORDS; ++word) {
+            MemberDecorate(struct_type, PushData::SamplerSlotIndex + word,
+                           spv::Decoration::Offset,
+                           static_cast<u32>(sizeof(PushData) + word * sizeof(u32)));
+        }
+    }
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
     Name(push_data_block, "push_data");
     interfaces.push_back(push_data_block);
@@ -847,7 +862,7 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_cohere
     const Id pointer_type = TypePointer(storage_class, data_type);
     const Id id{AddGlobalVariable(struct_pointer_type, storage_class)};
     Decorate(id, spv::Decoration::Binding, binding.unified);
-    Decorate(id, spv::Decoration::DescriptorSet, 0U);
+    Decorate(id, spv::Decoration::DescriptorSet, DescriptorSetIndex());
     if (!is_written) {
         Decorate(id, spv::Decoration::NonWritable);
     } else if (is_coherent) {
@@ -1052,7 +1067,7 @@ void EmitContext::DefineImagesAndSamplers() {
         const Id id{AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding.unified);
         binding.unified += num_bindings;
-        Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        Decorate(id, spv::Decoration::DescriptorSet, DescriptorSetIndex());
         Name(id, fmt::format("{}_{}{}", hw_stage, "img", images.size()));
         images.push_back({
             .data_types = &data_types,
@@ -1077,14 +1092,44 @@ void EmitContext::DefineImagesAndSamplers() {
     }
     sampler_type = TypeSampler();
     sampler_pointer_type = TypePointer(spv::StorageClass::UniformConstant, sampler_type);
+    if (UsesBindlessSamplers(info)) {
+        // sotc: SOTC_BINDLESS_SAMP: one runtime array of the global sampler heap (set 1). The
+        // samplers of this stage are indexed through the push constants, see LoadSampler.
+        uses_bindless_samplers = true;
+        bindless_sampler_base = GetBindlessSamplerRange(info.sw_stage).base;
+        const Id array_type{TypeRuntimeArray(sampler_type)};
+        const Id pointer_type{TypePointer(spv::StorageClass::UniformConstant, array_type)};
+        bindless_sampler_array = AddGlobalVariable(pointer_type, spv::StorageClass::UniformConstant);
+        Decorate(bindless_sampler_array, spv::Decoration::Binding, 0U);
+        Decorate(bindless_sampler_array, spv::Decoration::DescriptorSet, 1U);
+        Name(bindless_sampler_array, fmt::format("{}_bindless_samp", hw_stage));
+        interfaces.push_back(bindless_sampler_array);
+        return;
+    }
     for (const auto& samp_desc : info.samplers) {
         const Id id{AddGlobalVariable(sampler_pointer_type, spv::StorageClass::UniformConstant)};
         Decorate(id, spv::Decoration::Binding, binding.unified++);
-        Decorate(id, spv::Decoration::DescriptorSet, 0U);
+        Decorate(id, spv::Decoration::DescriptorSet, DescriptorSetIndex());
         Name(id, fmt::format("{}_{}{}", hw_stage, "samp", samplers.size()));
         samplers.push_back(id);
         interfaces.push_back(id);
     }
+}
+
+Id EmitContext::LoadSampler(u32 index) {
+    if (!uses_bindless_samplers) {
+        return OpLoad(sampler_type, samplers[index]);
+    }
+    // sotc: the heap index of this sampler is in its slot of the push constants (two per word).
+    const u32 slot = bindless_sampler_base + index;
+    const u32 word = PushData::SamplerSlotIndex + slot / 2;
+    const u32 shift = (slot & 1) * 16;
+    const Id ptr{OpAccessChain(TypePointer(spv::StorageClass::PushConstant, U32[1]),
+                               push_data_block, ConstU32(word))};
+    const Id value{OpLoad(U32[1], ptr)};
+    const Id heap_index{OpBitFieldUExtract(U32[1], value, ConstU32(shift), ConstU32(16U))};
+    const Id sampler_ptr{OpAccessChain(sampler_pointer_type, bindless_sampler_array, heap_index)};
+    return OpLoad(sampler_type, sampler_ptr);
 }
 
 void EmitContext::DefineSharedMemory() {

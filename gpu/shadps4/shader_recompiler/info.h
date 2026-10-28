@@ -17,6 +17,7 @@
 #include "shader_recompiler/ir/reg.h"
 #include "shader_recompiler/ir/type.h"
 #include "shader_recompiler/params.h"
+#include "shader_recompiler/profile.h"
 #include "shader_recompiler/resource.h"
 #include "shader_recompiler/runtime_info.h"
 
@@ -115,7 +116,10 @@ struct Info : InfoPersistent {
         Qualifier auxiliary;
     };
 
-    std::array<InfoRuntime, 2> runtime{}; // sotc: see g_info_slot
+    // sotc: runtime[slot] per thread, see g_info_slot. 0 = command processor, 1 = draw thread,
+    // 2..5 reserved for draw workers.
+    static constexpr u32 kInfoSlots = 6;
+    std::array<InfoRuntime, kInfoSlots> runtime{};
     PersistentSrtInfo srt_info;
 
     AttributeFlags loads{};
@@ -198,9 +202,11 @@ struct Info : InfoPersistent {
         return data;
     }
 
-    void AddBindings(Backend::Bindings& bnd) const {
+    /// `bindless_samplers`: the samplers come from the heap (UsesBindlessSamplers), so they take no
+    /// binding numbers. Must match what the SPIR-V emitter advances the counter by.
+    void AddBindings(Backend::Bindings& bnd, bool bindless_samplers = false) const {
         bnd.buffer += buffers.size();
-        bnd.unified += buffers.size() + images.size() + samplers.size();
+        bnd.unified += buffers.size() + images.size() + (bindless_samplers ? 0 : samplers.size());
         for (const auto& image : images) {
             // Descriptor arrays take array_size + 1 bindings
             bnd.unified += image.array_size;
@@ -255,5 +261,14 @@ u32 DynamicTsharpArraySize();
 /// sotc: fragment shaders measure the mip their streamed textures are sampled at, as the
 /// hardware's LOD counters do (sotc_lod_stats.h). SOTC_LOD_FEEDBACK=1 turns it on.
 bool LodFeedbackEnabled();
+
+/// sotc: SOTC_STAGE_BINDINGS=1 gives each graphics stage its own descriptor set
+/// (Profile::stage_bindings).
+bool StageBindingsEnabled();
+
+/// sotc: true when the samplers of this stage come from the bindless heap: SOTC_BINDLESS_SAMP is
+/// on (BindlessSamplersEnabled) and the stage's samplers fit its slots (GetBindlessSamplerRange).
+/// Shared by the pipeline layout and the SPIR-V emitter, so both agree on the descriptors.
+bool UsesBindlessSamplers(const Info& info);
 
 } // namespace Shader

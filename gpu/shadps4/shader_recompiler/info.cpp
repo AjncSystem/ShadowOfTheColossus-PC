@@ -5,6 +5,7 @@
 // run time (SotC's local IBL reads each reflection probe's cubemap from such a table).
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include "common/elf_info.h"
@@ -32,6 +33,31 @@ void Info::RefreshSharpTables() {
             std::memset(dst, 0, size);
         }
     }
+}
+
+bool StageBindingsEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_STAGE_BINDINGS");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+
+static std::atomic<bool> g_bindless_samplers{false};
+
+void SetBindlessSamplersEnabled(bool enabled) {
+    g_bindless_samplers.store(enabled, std::memory_order_relaxed);
+}
+
+bool BindlessSamplersEnabled() {
+    return g_bindless_samplers.load(std::memory_order_relaxed);
+}
+
+bool UsesBindlessSamplers(const Info& info) {
+    if (!BindlessSamplersEnabled() || info.samplers.empty()) {
+        return false;
+    }
+    return info.samplers.size() <= GetBindlessSamplerRange(info.sw_stage).count;
 }
 
 bool LodFeedbackEnabled() {

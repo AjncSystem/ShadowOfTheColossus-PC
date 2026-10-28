@@ -1502,9 +1502,7 @@ class Launcher:
                 window.destroy()
                 return
             key = sdl_key_name(event.keysym)
-            # Windows Tk can report numpad digits (NumLock on) as plain digit keysyms ('2'),
-            # so the top-row 2 and the numpad 2 look the same. The virtual-key code tells them
-            # apart: VK_NUMPAD0..VK_NUMPAD9 = 96..105, the top row is 48..57.
+
             if 96 <= event.keycode <= 105:
                 key = 'Keypad ' + str(event.keycode - 96)
             if not key:

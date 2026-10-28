@@ -6,6 +6,7 @@
 #include "common/debug.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
+#include "video_core/buffer_cache/async_upload.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_recorder.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -22,12 +23,15 @@ std::mutex Scheduler::submit_mutex;
 Scheduler::Scheduler(const Instance& instance, bool record_thread)
     : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
     if (record_thread) {
-        recorder = std::make_unique<CommandRecorder>();
+        recorder = std::make_unique<CommandRecorder>(instance, &work_semaphore);
         LOG_INFO(Render_Vulkan, "Vulkan commands are recorded on their own thread");
     }
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
+    if (instance.HasXferQueue()) {
+        xfer = std::make_unique<XferQueue>(instance, work_semaphore, this);
+    }
     BeginSession();
     priority_pending_ops_thread =
         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
@@ -52,7 +56,7 @@ void Scheduler::RecordDeferred(Common::UniqueFunction<void, vk::CommandBuffer>&&
         return;
     }
     recorder->CountCommand();
-    recorder->Run([this, cmdbuf, func = std::move(func)] {
+    recorder->Run(CommandRecorder::BlockCategory::Other, [this, cmdbuf, func = std::move(func)] {
         func(vk::CommandBuffer{recorder->Real(cmdbuf)});
     });
 }
@@ -135,6 +139,19 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
     };
 
+    if (recorder) {
+        // sotc: the secondary command buffer of this pass (SOTC_PASS_SEC) inherits these formats
+        PassFormats formats{};
+        formats.valid = true;
+        formats.num_colors = render_state.num_color_attachments;
+        for (u32 i = 0; i < formats.num_colors; ++i) {
+            formats.colors[i] = static_cast<VkFormat>(render_state.color_formats[i]);
+        }
+        formats.depth = static_cast<VkFormat>(render_state.depth_format);
+        formats.stencil = static_cast<VkFormat>(render_state.stencil_format);
+        formats.samples = static_cast<VkSampleCountFlagBits>(render_state.samples);
+        recorder->SetPassFormats(formats);
+    }
     CommandBuffer().beginRendering(rendering_info);
 }
 
@@ -156,7 +173,8 @@ vk::CommandBuffer Scheduler::UploadCommandBuffer() {
     }
     if (recorder) {
         upload_cmdbuf = recorder->NewFakeHandle();
-        recorder->Run([this, fake = upload_cmdbuf] { BeginRecorded(fake); });
+        recorder->Run(CommandRecorder::BlockCategory::Other,
+                      [this, fake = upload_cmdbuf] { BeginRecorded(fake); });
         return upload_cmdbuf;
     }
     const vk::CommandBufferBeginInfo begin_info = {
@@ -251,6 +269,10 @@ void Scheduler::SubmitAheadAndWait() {
     Check(ahead_cmdbuf.end());
     // With the recorder, the earlier submits must have reached the queue first.
     WaitSubmitted(CurrentTick() - 1);
+    // sotc: the readback may read what the transfer queue wrote; the queue does not order them.
+    if (xfer) {
+        xfer->WaitLastCopy();
+    }
     // Queue submission order and the barriers recorded in the command buffer order it after
     // all work submitted before; the command buffer being recorded is not involved.
     const vk::SubmitInfo submit_info = {
@@ -333,12 +355,14 @@ void Scheduler::PopPendingOperations() {
 
 void Scheduler::BeginSession() {
     EndSession();
+    ++session_serial;
 
     auto& session = sessions.emplace_back();
 
     if (recorder) {
         session.primary = recorder->NewFakeHandle();
-        recorder->Run([this, fake = session.primary] { BeginRecorded(fake); });
+        recorder->Run(CommandRecorder::BlockCategory::Other,
+                      [this, fake = session.primary] { BeginRecorded(fake); });
     } else {
         const vk::CommandBufferBeginInfo begin_info = {
             .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
@@ -378,6 +402,214 @@ void Scheduler::EndSession() {
     Check(session.primary.end());
 }
 
+XferQueue::XferQueue(const Instance& instance_, Semaphore& graphics_, Scheduler* scheduler_)
+    : instance{instance_}, graphics{&graphics_}, scheduler{scheduler_} {
+    const vk::Device device = instance.GetDevice();
+    queue = instance.GetXferQueue();
+
+    const vk::StructureChain semaphore_chain = {
+        vk::SemaphoreCreateInfo{},
+        vk::SemaphoreTypeCreateInfo{
+            .semaphoreType = vk::SemaphoreType::eTimeline,
+            .initialValue = 0,
+        },
+    };
+    auto [sem_result, sem] = device.createSemaphoreUnique(semaphore_chain.get());
+    ASSERT_MSG(sem_result == vk::Result::eSuccess, "Failed to create the transfer semaphore: {}",
+               vk::to_string(sem_result));
+    timeline = std::move(sem);
+
+    const vk::CommandPoolCreateInfo pool_info = {
+        .flags = vk::CommandPoolCreateFlagBits::eTransient |
+                 vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+        .queueFamilyIndex = instance.GetXferQueueFamilyIndex(),
+    };
+    auto [pool_result, pool_handle] = device.createCommandPoolUnique(pool_info);
+    ASSERT_MSG(pool_result == vk::Result::eSuccess, "Failed to create the transfer pool: {}",
+               vk::to_string(pool_result));
+    pool = std::move(pool_handle);
+
+    const vk::CommandBufferAllocateInfo alloc_info = {
+        .commandPool = *pool,
+        .level = vk::CommandBufferLevel::ePrimary,
+        .commandBufferCount = NumSlots,
+    };
+    auto [alloc_result, cmdbufs] = device.allocateCommandBuffers(alloc_info);
+    ASSERT_MSG(alloc_result == vk::Result::eSuccess,
+               "Failed to allocate the transfer command buffers: {}",
+               vk::to_string(alloc_result));
+    for (u32 i = 0; i < NumSlots; ++i) {
+        slots[i].cmd = cmdbufs[i];
+    }
+}
+
+XferQueue::~XferQueue() {
+    // Nothing of the copies may still run when the pool and the semaphore are destroyed.
+    (void)queue.waitIdle();
+}
+
+bool XferQueue::Copy(vk::Buffer src, vk::Buffer dst, std::span<const vk::BufferCopy> copies) {
+    // Newest graphics submit (the tick being recorded is CurrentTick(); ticks start at 1).
+    const u64 graphics_tick = graphics->CurrentTick() - 1;
+    // sotc: with the recording thread, the submit of graphics_tick may still be queued there; it
+    // collects the pending copy (TakePendingTick) when it is built, so it would wait for this copy
+    // while this copy waits for it: a GPU deadlock (the game froze at the logos with
+    // SOTC_BINDLESS_SAMP=1, 2026-10-27). Wait until that submit is on the queue first, outside the
+    // mutex the recording thread takes to collect the pending tick.
+    if (graphics_tick != 0 && scheduler) {
+        scheduler->WaitSubmitted(graphics_tick);
+    }
+    const std::scoped_lock lk{mutex};
+    const vk::Device device = instance.GetDevice();
+
+    Slot& slot = slots[next_slot];
+    next_slot = (next_slot + 1) % NumSlots;
+    if (slot.tick != 0) {
+        // A command buffer is reused only after the copy recorded in it has finished.
+        const vk::Semaphore wait_sem = *timeline;
+        const vk::SemaphoreWaitInfo wait_info = {
+            .semaphoreCount = 1,
+            .pSemaphores = &wait_sem,
+            .pValues = &slot.tick,
+        };
+        const vk::Result wait_result =
+            device.waitSemaphores(wait_info, std::numeric_limits<u64>::max());
+        ASSERT_MSG(wait_result == vk::Result::eSuccess, "Transfer slot wait failed: {}",
+                   vk::to_string(wait_result));
+    }
+
+    const u64 tick = next_tick++;
+    Check(slot.cmd.begin(vk::CommandBufferBeginInfo{
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    }));
+    slot.cmd.copyBuffer(src, dst, copies);
+    Check(slot.cmd.end());
+
+    const vk::Semaphore xfer_sem = *timeline;
+    const vk::Semaphore graphics_sem = graphics->Handle();
+    const bool wait_graphics = graphics_tick != 0;
+    const vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eAllCommands;
+    const vk::TimelineSemaphoreSubmitInfo timeline_info = {
+        .waitSemaphoreValueCount = wait_graphics ? 1u : 0u,
+        .pWaitSemaphoreValues = &graphics_tick,
+        .signalSemaphoreValueCount = 1u,
+        .pSignalSemaphoreValues = &tick,
+    };
+    const vk::SubmitInfo submit_info = {
+        .pNext = &timeline_info,
+        .waitSemaphoreCount = wait_graphics ? 1u : 0u,
+        .pWaitSemaphores = &graphics_sem,
+        .pWaitDstStageMask = &wait_stage,
+        .commandBufferCount = 1u,
+        .pCommandBuffers = &slot.cmd,
+        .signalSemaphoreCount = 1u,
+        .pSignalSemaphores = &xfer_sem,
+    };
+    const vk::Result submit_result = queue.submit(submit_info, vk::Fence{});
+    if (submit_result == vk::Result::eErrorDeviceLost) {
+        instance.ReportDeviceFault();
+        UNREACHABLE_MSG("Device lost during transfer submit");
+    }
+    ASSERT_MSG(submit_result == vk::Result::eSuccess, "Transfer submit failed: {}",
+               vk::to_string(submit_result));
+
+    slot.tick = tick;
+    last_tick = tick;
+    pending_tick = tick;
+    return true;
+}
+
+void XferQueue::CopyAndWait(std::span<const Region> regions) {
+    const vk::Device device = instance.GetDevice();
+    const vk::Semaphore xfer_sem = *timeline;
+    u64 tick;
+    {
+        const std::scoped_lock lk{mutex};
+        Slot& slot = slots[next_slot];
+        next_slot = (next_slot + 1) % NumSlots;
+        if (slot.tick != 0) {
+            // A command buffer is reused only after the copy recorded in it has finished.
+            const vk::SemaphoreWaitInfo wait_info = {
+                .semaphoreCount = 1,
+                .pSemaphores = &xfer_sem,
+                .pValues = &slot.tick,
+            };
+            const vk::Result wait_result =
+                device.waitSemaphores(wait_info, std::numeric_limits<u64>::max());
+            ASSERT_MSG(wait_result == vk::Result::eSuccess, "Transfer slot wait failed: {}",
+                       vk::to_string(wait_result));
+        }
+        tick = next_tick++;
+        Check(slot.cmd.begin(vk::CommandBufferBeginInfo{
+            .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+        }));
+        for (const auto& region : regions) {
+            slot.cmd.copyBuffer(region.src, region.dst, region.copy);
+        }
+        Check(slot.cmd.end());
+        const vk::TimelineSemaphoreSubmitInfo timeline_info = {
+            .signalSemaphoreValueCount = 1u,
+            .pSignalSemaphoreValues = &tick,
+        };
+        const vk::SubmitInfo submit_info = {
+            .pNext = &timeline_info,
+            .commandBufferCount = 1u,
+            .pCommandBuffers = &slot.cmd,
+            .signalSemaphoreCount = 1u,
+            .pSignalSemaphores = &xfer_sem,
+        };
+        const vk::Result submit_result = queue.submit(submit_info, vk::Fence{});
+        if (submit_result == vk::Result::eErrorDeviceLost) {
+            instance.ReportDeviceFault();
+            UNREACHABLE_MSG("Device lost during transfer submit");
+        }
+        ASSERT_MSG(submit_result == vk::Result::eSuccess, "Transfer submit failed: {}",
+                   vk::to_string(submit_result));
+        slot.tick = tick;
+        last_tick = tick;
+        pending_tick = tick;
+    }
+    // Outside the mutex: the recording thread takes it to collect the pending tick.
+    const vk::SemaphoreWaitInfo wait_info = {
+        .semaphoreCount = 1,
+        .pSemaphores = &xfer_sem,
+        .pValues = &tick,
+    };
+    const vk::Result wait_result = device.waitSemaphores(wait_info, std::numeric_limits<u64>::max());
+    if (wait_result == vk::Result::eErrorDeviceLost) {
+        instance.ReportDeviceFault();
+        UNREACHABLE_MSG("Device lost during a transfer wait");
+    }
+    ASSERT_MSG(wait_result == vk::Result::eSuccess, "Transfer wait failed: {}",
+               vk::to_string(wait_result));
+}
+
+u64 XferQueue::TakePendingTick() {
+    const std::scoped_lock lk{mutex};
+    return std::exchange(pending_tick, u64{0});
+}
+
+void XferQueue::WaitLastCopy() {
+    const std::scoped_lock lk{mutex};
+    if (last_tick == 0) {
+        return;
+    }
+    const vk::Semaphore wait_sem = *timeline;
+    const vk::SemaphoreWaitInfo wait_info = {
+        .semaphoreCount = 1,
+        .pSemaphores = &wait_sem,
+        .pValues = &last_tick,
+    };
+    const vk::Result wait_result =
+        instance.GetDevice().waitSemaphores(wait_info, std::numeric_limits<u64>::max());
+    ASSERT_MSG(wait_result == vk::Result::eSuccess, "Transfer wait failed: {}",
+               vk::to_string(wait_result));
+}
+
+bool Scheduler::XferCopy(vk::Buffer src, vk::Buffer dst, std::span<const vk::BufferCopy> copies) {
+    return xfer && xfer->Copy(src, dst, copies);
+}
+
 // The queue submit of SubmitExecution, from the command processor or the recording thread.
 static void QueueSubmit(const Instance& instance, const SubmitInfo& info,
                         std::span<const vk::CommandBuffer> cmd_buffers) {
@@ -391,6 +623,14 @@ static void QueueSubmit(const Instance& instance, const SubmitInfo& info,
     };
     static_assert(wait_stage_masks.size() >= std::tuple_size_v<decltype(info.wait_semas)>);
 
+    // Wait stages: the default per wait index, unless the wait names its own (transfer waits).
+    std::array<vk::PipelineStageFlags, 4> wait_stages = wait_stage_masks;
+    for (u32 i = 0; i < info.num_wait_semas; ++i) {
+        if (info.wait_stages[i] != vk::PipelineStageFlags{}) {
+            wait_stages[i] = info.wait_stages[i];
+        }
+    }
+
     const vk::TimelineSemaphoreSubmitInfo timeline_si = {
         .waitSemaphoreValueCount = info.num_wait_semas,
         .pWaitSemaphoreValues = info.wait_ticks.data(),
@@ -402,7 +642,7 @@ static void QueueSubmit(const Instance& instance, const SubmitInfo& info,
         .pNext = &timeline_si,
         .waitSemaphoreCount = info.num_wait_semas,
         .pWaitSemaphores = info.wait_semas.data(),
-        .pWaitDstStageMask = wait_stage_masks.data(),
+        .pWaitDstStageMask = wait_stages.data(),
         .commandBufferCount = static_cast<u32>(cmd_buffers.size()),
         .pCommandBuffers = cmd_buffers.data(),
         .signalSemaphoreCount = info.num_signal_semas,
@@ -454,15 +694,34 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     }
     sessions.clear();
 
+    // sotc: SOTC_XFER_QUEUE: this submit waits for the uploads copied since the previous one.
+    if (xfer) {
+        if (const u64 xfer_tick = xfer->TakePendingTick(); xfer_tick != 0) {
+            if (info.num_wait_semas < info.wait_semas.size()) {
+                info.AddWait(xfer->Handle(), xfer_tick, vk::PipelineStageFlagBits::eAllCommands);
+            } else {
+                xfer->WaitLastCopy(); // no wait slot left: wait on the CPU instead
+            }
+        }
+    }
+
     const vk::Semaphore timeline = work_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
 
     if (recorder) {
         // The submit runs on the recording thread after the commands of these command buffers.
-        recorder->Run([this, info, fakes = std::move(cmd_buffers), signal_value] {
+        recorder->Run(CommandRecorder::BlockCategory::Other,
+                      [this, info, fakes = std::move(cmd_buffers), signal_value] {
             boost::container::small_vector<vk::CommandBuffer, 8> real;
             for (const vk::CommandBuffer fake : fakes) {
                 real.push_back(recorder->Real(fake));
+            }
+            // sotc: the pass secondaries of these command buffers are released at signal_value
+            recorder->PassSubmitted(std::span<const vk::CommandBuffer>{fakes.data(), fakes.size()},
+                                    signal_value);
+            // sotc: SOTC_ASYNC_UPLOAD: the staging these copies read is filled first.
+            if (auto* async_upload = VideoCore::AsyncUpload::Get()) {
+                async_upload->WaitUpTo(this, signal_value);
             }
             QueueSubmit(instance, info, real);
             recorded_submit_tick.store(signal_value, std::memory_order_release);
@@ -471,6 +730,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         });
         recorder->Kick();
     } else {
+        if (auto* async_upload = VideoCore::AsyncUpload::Get()) { // sotc: SOTC_ASYNC_UPLOAD
+            async_upload->WaitUpTo(this, signal_value);
+        }
         QueueSubmit(instance, info, cmd_buffers);
     }
 

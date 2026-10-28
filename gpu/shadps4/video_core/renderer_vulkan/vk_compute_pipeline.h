@@ -49,7 +49,8 @@ public:
     /// sotc: deferred: only the layouts are made here; Build makes the pipeline on a pipeline
     /// worker (SOTC_ASYNC_COMPUTE) and command buffers bind it with BindWhenReady.
     ComputePipeline(const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
-                    const Shader::Profile& profile, vk::PipelineCache pipeline_cache,
+                    LayoutCache& layout_cache, const Shader::Profile& profile,
+                    vk::PipelineCache pipeline_cache,
                     ComputePipelineKey compute_key, const Shader::Info& info,
                     vk::ShaderModule module, SerializationSupport& sdata, bool preloading,
                     bool deferred = false);

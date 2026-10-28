@@ -810,6 +810,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     // until an image is registered or unregistered (SOTC_FIND_MEMO=0: always search).
     if (const ImageId memo_id = MemoLookup(info, exact_fmt, memo_writer)) {
         Image& image = slot_images[memo_id];
+        image.tick_prev_accessed = image.tick_accessed_last;
         image.tick_accessed_last = scheduler.CurrentTick();
         TouchImage(image);
         if (tail_candidate) {
@@ -907,6 +908,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
 
     Image& image = slot_images[image_id];
+    image.tick_prev_accessed = image.tick_accessed_last;
     image.tick_accessed_last = scheduler.CurrentTick();
     TouchImage(image);
 
@@ -935,16 +937,28 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
         }
         image_ids.push_back(image_id);
     });
+    // sotc: the caller (buffer to image copy, clear, readback) uses the image on the GPU, and
+    // nothing else records that use: with SOTC_HOST_IMAGE_COPY, record it as a touch, so the host
+    // image copy does not write an image that a copy still in flight reads. Off by default: the
+    // tick also decides how long the collector keeps an image, so it must not change then.
+    const auto touch = [&](ImageId id) {
+        if (SotcStats::kHostImageCopy) {
+            Image& image = slot_images[id];
+            image.tick_prev_accessed = image.tick_accessed_last;
+            image.tick_accessed_last = scheduler.CurrentTick();
+        }
+        return id;
+    };
     if (image_ids.size() == 1) {
         // Sometimes image size might not exactly match with requested buffer size
         // If we only found 1 candidate image use it without too many questions.
-        return image_ids.back();
+        return touch(image_ids.back());
     }
     if (!image_ids.empty()) {
         for (s32 i = 0; i < image_ids.size(); ++i) {
             Image& image = slot_images[image_ids[i]];
             if (image.info.guest_size == size) {
-                return image_ids[i];
+                return touch(image_ids[i]);
             }
         }
         LOG_WARNING(Render_Vulkan,
@@ -1082,17 +1096,16 @@ void TextureCache::RefreshImage(Image& image) {
         // sotc: mip tails are small enough to land here often, and the hash below only sees the
         // first texels of the first mip: a CPU write to another mip would be missed. Re-upload.
         SotcStats::rebase_maybe_dirty.fetch_add(1, std::memory_order_relaxed);
+    } else if (maybe_cpu_dirty && image.info.guest_size > 64_KB) {
+        // sotc: defensive. A MaybeCpuDirty image begins and ends inside one page, so this should
+        // not happen; if it does, re-upload instead of hashing an unexpectedly large range.
+        SotcStats::rebase_maybe_dirty.fetch_add(1, std::memory_order_relaxed);
     } else if (maybe_cpu_dirty) {
-        // The image size should be less than page size to be considered MaybeCpuDirty
-        // So this calculation should be very uncommon and reasonably fast
-        // For now we'll just check up to 64 first pixels
+        // sotc: hash the whole image, not just its first 8x8 texels. An image inside one page is
+        // untracked after the first fault, so a CPU write past the first texels would otherwise
+        // never be seen (colored patches on meshes). The size is bounded by the 64 KiB check above.
         const auto addr = std::bit_cast<u8*>(image.info.guest_address);
-        const u32 w = std::min(image.info.size.width, u32(8));
-        const u32 h = std::min(image.info.size.height, u32(8));
-
-        const u32 s_w = image.info.props.is_block ? Common::DivCeil(w, 4u) : w;
-        const u32 s_h = image.info.props.is_block ? Common::DivCeil(h, 4u) : h;
-        const u32 size = s_w * s_h * (image.info.num_bits / 8);
+        const size_t size = image.info.guest_size;
         const u64 hash = [&] {
             const SotcStats::FrameTimer hash_timer{SotcStats::FrameHash};
             return XXH3_64bits(addr, size);
@@ -1152,6 +1165,25 @@ void TextureCache::RefreshImage(Image& image) {
         return;
     }
 
+    // sotc: SOTC_HOST_IMAGE_COPY=1: a linear image the GPU did not write, re-uploaded whole from guest
+    // memory, is written by the host: no staging copy and no command buffer. The image must be
+    // idle on the GPU. Its last use before this submit is complete, and it was not used in this
+    // submit (the touch that set tick_accessed_last came from this FindImage, so the earlier use
+    // is tick_prev_accessed).
+    if (SotcStats::kHostImageCopy && !image.info.props.is_tiled && !is_gpu_modified &&
+        image_copies.size() == num_mips &&
+        !buffer_cache.IsRegionGpuModified(image.info.guest_address, image.info.guest_size)) {
+        const u64 current = scheduler.CurrentTick();
+        const u64 last_use = image.tick_accessed_last == current ? image.tick_prev_accessed
+                                                                 : image.tick_accessed_last;
+        const bool gpu_idle = last_use < current && scheduler.IsFree(last_use);
+        const auto guest_base = std::bit_cast<const u8*>(image.info.guest_address);
+        if (runtime.TryHostImageCopy(&image, guest_base, image_copies, gpu_idle)) {
+            image.sotc_upload_from_guest = false;
+            return;
+        }
+    }
+
     scheduler.EndRendering();
 
     // sotc: SOTC_POOL_WATCH: a material texture's content never changes once streamed in. An
@@ -1197,6 +1229,17 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     runtime.UploadImage(&image, buffer, image_copies);
+    // sotc: the MaybeCpuDirty check compares against image.hash, which only that branch used to
+    // set: after any other upload (CpuDirty, first upload) it described older contents, and a
+    // later rewrite of those older bytes was taken for "unchanged" (stale small textures). Keep
+    // it equal to what was just uploaded; 0 (never equal) for images the GPU writes or that do
+    // not fit in a page, which the MaybeCpuDirty path does not use.
+    if (image.info.guest_size <= 4_KB && False(image.flags & ImageFlagBits::GpuModified)) {
+        image.hash = XXH3_64bits(std::bit_cast<const u8*>(image.info.guest_address),
+                                 image.info.guest_size);
+    } else {
+        image.hash = 0;
+    }
     SotcGlyphHook(image);
 }
 
@@ -1444,7 +1487,7 @@ void TextureCache::SotcGlyphHook(Image& image) {
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
                                      AmdGpu::BorderColorBuffer border_color_base,
-                                     const bool is_depth) {
+                                     const bool is_depth, u32* bindless_slot) {
     // sotc: per-thread memo of S# -> sampler for the current GC tick: a repeated S# skips the
     // hash, the lock, the map and the LRU touch (already touched at this tick). Samplers are only
     // erased by the garbage collector, which bumps sampler_epoch. SOTC_SAMPLER_MEMO=0 disables.
@@ -1459,6 +1502,7 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
         u64 epoch;
         bool is_depth;
         vk::Sampler handle;
+        u32 bindless; // sotc: heap slot, BindlessSamplers::NoSlot when none taken yet
     };
     thread_local std::array<SamplerMemo, 64> memo{};
     u64 raw[2];
@@ -1469,7 +1513,11 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     if (sampler_memo) {
         slot = &memo[((raw[0] * 0x9E3779B97F4A7C15ULL) ^ raw[1] ^ (is_depth ? 1 : 0)) >> 58];
         if (slot->tick == tick && slot->epoch == epoch && slot->is_depth == is_depth &&
-            slot->raw[0] == raw[0] && slot->raw[1] == raw[1]) {
+            slot->raw[0] == raw[0] && slot->raw[1] == raw[1] &&
+            (!bindless_slot || slot->bindless != BindlessSamplers::NoSlot)) {
+            if (bindless_slot) {
+                *bindless_slot = slot->bindless;
+            }
             return slot->handle;
         }
     }
@@ -1484,10 +1532,25 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     } else {
         sampler_lru_cache.Touch(it->second.lru_id, tick);
     }
-    if (slot) {
-        *slot = SamplerMemo{{raw[0], raw[1]}, tick, epoch, is_depth, it->second.Handle()};
+    // sotc: a sampler takes a heap slot the first time a bindless stage asks for one (only those
+    // pass bindless_slot): samplers of classic stages and host passes stay out of the heap, which
+    // never shrinks. A full heap hands out the default sampler of the right kind (compare for
+    // depth samplers: a non-compare sampler on a Dref lookup is undefined, blinking shadows).
+    VideoCore::Sampler& entry = samplers.at(hash);
+    if (bindless_slot && bindless_samplers.Enabled() &&
+        entry.bindless_slot == BindlessSamplers::NoSlot) {
+        entry.bindless_slot = bindless_samplers.Allocate(entry.Handle());
     }
-    return it->second.Handle();
+    if (bindless_slot) {
+        *bindless_slot = entry.bindless_slot != BindlessSamplers::NoSlot
+                             ? entry.bindless_slot
+                             : BindlessSamplers::DefaultSlot(is_depth);
+    }
+    if (slot) {
+        *slot = SamplerMemo{{raw[0], raw[1]}, tick,   epoch, is_depth, entry.Handle(),
+                            bindless_slot ? *bindless_slot : entry.bindless_slot};
+    }
+    return entry.Handle();
 }
 
 void TextureCache::RegisterImage(ImageId image_id) {
@@ -1820,6 +1883,10 @@ void TextureCache::GarbageCollectSamplers() {
     const auto clean_up = [&](u64 hash) {
         if (num_deletions == 0) {
             return true;
+        }
+        // sotc: a sampler in the bindless heap stays: its descriptor names the handle.
+        if (samplers.at(hash).bindless_slot != BindlessSamplers::NoSlot) {
+            return false;
         }
         --num_deletions;
         const size_t lru_id = samplers.at(hash).lru_id;
@@ -2351,6 +2418,7 @@ void TextureCache::UnparkImage(ImageId image_id) {
     std::fill(image.mip_hashes.begin(), image.mip_hashes.end(), u64{0});
     image.hash = 0;
     image.tick_accessed_last = 0;
+    image.tick_prev_accessed = 0;
     image.binding = {};
     image.usage = {};
     image.RenewIdentity();

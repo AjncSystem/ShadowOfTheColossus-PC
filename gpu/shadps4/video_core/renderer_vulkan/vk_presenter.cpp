@@ -499,6 +499,10 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
         frame.present_done = fence;
         free_queue.push(&frame);
     }
+    // sotc: SOTC_CP_FLIP_PACE=1 (off by default), see cp_pacer.
+    if (const char* v = std::getenv("SOTC_CP_FLIP_PACE"); v && v[0] == '1') {
+        cp_pacer = this;
+    }
 
     fsr_settings.enable = EmulatorSettings.IsFsrEnabled();
     fsr_settings.use_rcas = EmulatorSettings.IsRcasEnabled();
@@ -531,6 +535,9 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
 }
 
 Presenter::~Presenter() {
+    if (cp_pacer == this) {
+        cp_pacer = nullptr;
+    }
     // This thread records the last commands of the rasterizer scheduler.
     draw_scheduler.ClaimRecorder();
     draw_scheduler.Finish();
@@ -699,6 +706,9 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
 
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
+    if (wait_service) {
+        WaitFreeFrame(); // sotc: SOTC_FLIP_SERVICE, before anything of this flip is done
+    }
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);
@@ -1000,6 +1010,73 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     return frame;
 }
 
+// sotc: SOTC_PRESENT_WAIT. Each present on the main path is tagged with the next id
+// (VK_KHR_present_id), so the vblank thread can wait until it is on screen (driver.cpp). Ids
+// are taken under Scheduler::submit_mutex together with swapchain.Present, so they follow the
+// queue order.
+u64 Presenter::TagPresent() {
+    std::scoped_lock lock{present_records_mutex};
+    const u64 id = last_present_id.load(std::memory_order_relaxed) + 1;
+    present_records[id % present_records.size()] = {
+        .id = id,
+        .swapchain = static_cast<VkSwapchainKHR>(swapchain.GetHandle()),
+    };
+    last_present_id.store(id, std::memory_order_release);
+    return id;
+}
+
+bool Presenter::WaitPresented(u64 id, u64 timeout_ns) {
+    if (id == 0) {
+        return true;
+    }
+    const VkSwapchainKHR current = static_cast<VkSwapchainKHR>(swapchain.GetHandle());
+    {
+        std::scoped_lock lock{present_records_mutex};
+        if (id > last_present_id.load(std::memory_order_acquire)) {
+            return false; // not presented yet
+        }
+        const PresentRecord& record = present_records[id % present_records.size()];
+        // Already waited for, or too old to be kept, or from a swapchain that was replaced (its
+        // presents were all finished by the device idle in Swapchain::Destroy): nothing to wait.
+        if (record.id != id || record.swapchain != current || record.done_ns != 0) {
+            return true;
+        }
+    }
+
+    // The raw dispatcher call: vk::Device::waitForPresentKHR asserts on results other than
+    // success and timeout, and a swapchain error here is handled by the next present.
+    const VkResult result = VULKAN_HPP_DEFAULT_DISPATCHER.vkWaitForPresentKHR(
+        static_cast<VkDevice>(instance.GetDevice()), current, id, timeout_ns);
+    if (result == VK_TIMEOUT) {
+        return false;
+    }
+    if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            std::fprintf(stderr, "SOTC PRESENT_WAIT: vkWaitForPresentKHR returned %d, not waiting\n",
+                         int(result));
+        }
+        return true;
+    }
+
+    const u64 done_ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+    std::scoped_lock lock{present_records_mutex};
+    PresentRecord& record = present_records[id % present_records.size()];
+    if (record.id == id) {
+        record.done_ns = done_ns;
+    }
+    return true;
+}
+
+u64 Presenter::PresentDoneNs(u64 id) const {
+    std::scoped_lock lock{present_records_mutex};
+    const PresentRecord& record = present_records[id % present_records.size()];
+    return record.id == id ? record.done_ns : 0;
+}
+
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
     // Free the frame for reuse
     const auto free_frame = [&] {
@@ -1007,7 +1084,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             last_submit_frame = frame;
             std::scoped_lock fl{free_mutex};
             free_queue.push(frame);
-            free_cv.notify_one();
+            // sotc: notify_all: the command processor may wait too (SOTC_CP_FLIP_PACE), and
+            // waking it instead of the draw thread left the draw thread blocked.
+            free_cv.notify_all();
         }
     };
 
@@ -1309,7 +1388,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
+    low_latency.SubmitStart(); // sotc: SOTC_LOW_LATENCY render submit markers (NVIDIA)
     scheduler.Flush(info);
+    low_latency.SubmitEnd();
 
     // Present to swapchain.
     {
@@ -1319,7 +1400,10 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                              FitImage(frame->width, frame->height, extent.width, extent.height),
                              extent);
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        const bool presented = swapchain.Present();
+        const u64 present_id = instance.IsPresentIdEnabled() ? TagPresent() : 0;
+        low_latency.BeforePresent(present_id);
+        const bool presented = swapchain.Present(present_id);
+        low_latency.AfterPresent(frame->present_done);
         Dlssg::AfterPresent(frame->id);
         if (FrameGen::Current() == FrameGen::Mode::Fsr) {
             FsrFg::NotePresent();
@@ -1529,6 +1613,42 @@ bool Presenter::PresentGenerated(Frame* frame) {
     }
     FsrFg::NotePresent();
     return true;
+}
+
+void Presenter::PaceFlip() {
+    const auto start = std::chrono::steady_clock::now();
+    {
+        std::unique_lock lock{free_mutex};
+        // Frames are free for the queued flips and this one. A flip the game never takes (no
+        // flip handler registered) still counts down when the draw thread reaches it; the
+        // deadline only guards against waiting for good.
+        const auto deadline = start + std::chrono::seconds{1};
+        while (static_cast<s32>(free_queue.size()) <=
+               pending_flips.load(std::memory_order_acquire)) {
+            if (free_cv.wait_until(lock, std::min(deadline, std::chrono::steady_clock::now() +
+                                                                std::chrono::milliseconds{1})) ==
+                    std::cv_status::timeout &&
+                std::chrono::steady_clock::now() >= deadline) {
+                break;
+            }
+        }
+    }
+    pending_flips.fetch_add(1, std::memory_order_acq_rel);
+    SotcStats::cp_flip_pace_ns.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                             start)
+            .count(),
+        std::memory_order_relaxed);
+}
+
+void Presenter::WaitFreeFrame() {
+    std::unique_lock lock{free_mutex};
+    while (!free_cv.wait_for(lock, std::chrono::microseconds{200},
+                             [this] { return !free_queue.empty(); })) {
+        lock.unlock();
+        wait_service();
+        lock.lock();
+    }
 }
 
 Frame* Presenter::GetRenderFrame() {

@@ -3,13 +3,17 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <condition_variable>
+#include <mutex>
 
 #include "core/libraries/videoout/buffer.h"
 #include <imgui.h> // sotc port: ImTextureID only
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
 #include "video_core/renderer_vulkan/host_passes/pp_pass.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_low_latency.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
@@ -98,13 +102,68 @@ public:
     Frame* PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                         VAddr cpu_address);
 
+    /// sotc: SOTC_FLIP_SERVICE=1 (off by default). Set by the command processor when the draw
+    /// thread prepares the frames: PrepareFrame first waits for a free presentation frame,
+    /// calling this every 200 us of waiting, so the commands of the game's threads (unmaps,
+    /// readbacks) run during that wait instead of after it. The wait comes before anything of
+    /// the flip is done, so they run as they would between two operations.
+    inline static void (*wait_service)() = nullptr;
+
+    /// sotc: SOTC_CP_FLIP_PACE=1 (off by default). The presenter the command processor paces its
+    /// flips with, null when off. Before it queues a flip for the draw thread, the command
+    /// processor waits (PaceFlip) until more presentation frames are free than flips it queued
+    /// that the draw thread has not reached yet (FlipReached), so the draw thread finds a free
+    /// frame instead of blocking in GetRenderFrame while the game's threads wait for it. The
+    /// frame rate is unchanged: the same wait moves to the command processor.
+    inline static Presenter* cp_pacer = nullptr;
+    void PaceFlip();
+    void FlipReached() {
+        pending_flips.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
     Frame* PrepareBlankFrame(bool present_thread);
 
     void Present(Frame* frame, bool is_reusing_frame = false, bool is_game_frame = true);
     Frame* PrepareLastFrame();
 
+    /// sotc: SOTC_LOW_LATENCY. Start of a game frame, called by the presenting thread before the
+    /// flip is released (driver.cpp). Does nothing when the switch is off.
+    void LowLatencyFrameStart() {
+        low_latency.FrameStart(swapchain.GetHandle());
+    }
+
+    /// sotc: SOTC_PRESENT_WAIT. Id of the last present tagged for VK_KHR_present_id, 0 while none
+    /// (the switch is off, or nothing presented yet). Written by the presenting thread.
+    u64 LastPresentId() const {
+        return last_present_id.load(std::memory_order_acquire);
+    }
+
+    /// sotc: SOTC_PRESENT_WAIT. Waits up to timeout_ns (vkWaitForPresentKHR) until present `id` is
+    /// on screen. True when it is, or when there is nothing to wait for (id 0, a present from a
+    /// replaced swapchain, or an error, which must not stall the caller); false on timeout, or
+    /// when `id` is not presented yet. The host time the wait saw it done is kept, see
+    /// PresentDoneNs.
+    bool WaitPresented(u64 id, u64 timeout_ns);
+
+    /// sotc: SOTC_PRESENT_WAIT. Host steady-clock time (ns) WaitPresented saw present `id` done,
+    /// 0 when it has not (or is too old to be kept: the last 64 presents are).
+    u64 PresentDoneNs(u64 id) const;
+
 private:
     Frame* GetRenderFrame();
+    /// sotc: SOTC_FLIP_SERVICE: waits until a presentation frame is free, calling wait_service.
+    void WaitFreeFrame();
+
+    /// sotc: SOTC_PRESENT_WAIT. A tagged present: its id, the swapchain it went to, and when
+    /// WaitPresented saw it done (0 until then).
+    struct PresentRecord {
+        u64 id{};
+        VkSwapchainKHR swapchain{};
+        u64 done_ns{};
+    };
+
+    /// sotc: takes the id of the present about to be queued (call under Scheduler::submit_mutex).
+    u64 TagPresent();
 
     void RecreateFrame(Frame* frame, u32 width, u32 height);
 
@@ -130,6 +189,7 @@ private:
     Scheduler present_scheduler;
     Scheduler flip_scheduler;
     Swapchain swapchain;
+    LowLatency low_latency{instance}; ///< sotc: SOTC_LOW_LATENCY backend, see vk_low_latency.h
     Runtime runtime;
     std::unique_ptr<Rasterizer> rasterizer;
     VideoCore::TextureCache& texture_cache;
@@ -140,8 +200,12 @@ private:
     Frame* last_submit_frame;
     std::mutex free_mutex;
     std::condition_variable free_cv;
+    std::atomic<s32> pending_flips{0}; ///< sotc: SOTC_CP_FLIP_PACE, see cp_pacer
     std::condition_variable_any frame_cv;
     std::vector<VAddr> vo_buffers_addr;
+    std::atomic<u64> last_present_id{0};         ///< sotc: SOTC_PRESENT_WAIT, see LastPresentId
+    mutable std::mutex present_records_mutex;    ///< sotc: guards present_records
+    std::array<PresentRecord, 64> present_records{}; ///< sotc: indexed by id % 64
 };
 
 } // namespace Vulkan

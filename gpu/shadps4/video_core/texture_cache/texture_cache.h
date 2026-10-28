@@ -301,6 +301,13 @@ public:
                  PageManager& tracker);
     ~TextureCache();
 
+    /// sotc: true when an image is registered in the 1 MiB block holding addr (lock free; used by
+    /// SOTC_FAULT_GRANULE to leave texture memory to the per-page fault path).
+    [[nodiscard]] bool HasImagesNear(VAddr addr) const {
+        const u64 page = addr >> Traits::PAGE_BITS;
+        return page >= NumImagePages || page_images[page].load(std::memory_order_acquire) != 0;
+    }
+
     TileManager& GetTileManager() noexcept {
         return tile_manager;
     }
@@ -408,10 +415,16 @@ public:
     /// Reuploads image contents.
     void RefreshImage(Image& image);
 
-    /// Retrieves the sampler that matches the provided S# descriptor.
+    /// Retrieves the sampler that matches the provided S# descriptor. With bindless samplers,
+    /// `bindless_slot` (when given) receives its heap slot, or 0 (the default sampler) if none.
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
                                          AmdGpu::BorderColorBuffer border_color_base,
-                                         bool is_depth);
+                                         bool is_depth, u32* bindless_slot = nullptr);
+
+    /// sotc: the global sampler heap of SOTC_BINDLESS_SAMP (disabled unless the instance has it).
+    [[nodiscard]] const VideoCore::BindlessSamplers& GetBindlessSamplers() const noexcept {
+        return bindless_samplers;
+    }
 
     /// Retrieves the image with the specified id.
     [[nodiscard]] Image& GetImage(ImageId id) {
@@ -666,6 +679,7 @@ private:
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;
     tsl::robin_map<u64, Sampler> samplers;
+    BindlessSamplers bindless_samplers{instance}; // sotc: SOTC_BINDLESS_SAMP heap (samplers_mutex)
     std::unordered_set<ImageId> download_images;
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;

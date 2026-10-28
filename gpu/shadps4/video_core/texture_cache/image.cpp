@@ -156,6 +156,36 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     }
 }
 
+// sotc: SOTC_HOST_IMAGE_COPY=1: VK_IMAGE_USAGE_HOST_TRANSFER_BIT is worth adding when the host can
+// write the format (format feature HOST_IMAGE_TRANSFER on optimal tiling) and the driver reports
+// optimal device access for this usage (VkHostImageCopyDevicePerformanceQueryEXT). Cached per
+// combination, as QueryImageFormat.
+static bool HostTransferUsable(const Vulkan::Instance& instance,
+                               const vk::PhysicalDeviceImageFormatInfo2& format_info) {
+    static std::mutex mutex;
+    static std::unordered_map<u64, bool> answers;
+    const u64 key = (u64(format_info.format) << 40) ^ (u64(format_info.type) << 36) ^
+                    (u64(u32(format_info.flags)) << 20) ^ u64(u32(format_info.usage));
+    std::scoped_lock lock{mutex};
+    if (const auto it = answers.find(key); it != answers.end()) {
+        return it->second;
+    }
+    const auto physical_device = instance.GetPhysicalDevice();
+    const auto format_chain =
+        physical_device.getFormatProperties2<vk::FormatProperties2, vk::FormatProperties3>(
+            format_info.format);
+    bool usable = bool(format_chain.get<vk::FormatProperties3>().optimalTilingFeatures &
+                       vk::FormatFeatureFlagBits2::eHostImageTransfer);
+    if (usable) {
+        const auto query = physical_device.getImageFormatProperties2<
+            vk::ImageFormatProperties2, vk::HostImageCopyDevicePerformanceQueryEXT>(format_info);
+        usable = query.result == vk::Result::eSuccess &&
+                 query.value.get<vk::HostImageCopyDevicePerformanceQueryEXT>().optimalDeviceAccess;
+    }
+    answers.emplace(key, usable);
+    return usable;
+}
+
 // sotc: vkGetPhysicalDeviceImageFormatProperties2 takes about 5 ms per call on a Radeon (driver
 // 32.0.21045), and the game creates dozens of images in a frame when the camera turns: frames of
 // 200-500 ms. The answer only depends on these parameters, so it is asked once per combination
@@ -222,13 +252,26 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
 
     constexpr auto tiling = vk::ImageTiling::eOptimal;
     const auto supported_format = instance.GetSupportedFormat(info.pixel_format, format_features);
-    const vk::PhysicalDeviceImageFormatInfo2 format_info{
+    vk::PhysicalDeviceImageFormatInfo2 format_info{
         .format = supported_format,
         .type = ConvertImageType(info.type),
         .tiling = tiling,
         .usage = usage_flags,
         .flags = flags,
     };
+    // sotc: SOTC_HOST_IMAGE_COPY=1: non-depth images that are not tiled in guest memory may be
+    // written by the host (TextureCache::RefreshImage). The usage is fixed at creation, so it is
+    // decided here. Colour images always get the attachment usage (ImageUsageFlags), so a render
+    // target can carry the flag too; the host upload itself is still gated per upload by
+    // Runtime::TryHostImageCopy (GPU idle, not GPU written).
+    if (instance.IsHostImageCopyEnabled() && !info.props.is_tiled && !info.props.is_depth) {
+        auto with_host = format_info;
+        with_host.usage = usage_flags | vk::ImageUsageFlagBits::eHostTransferEXT;
+        if (HostTransferUsable(instance, with_host)) {
+            usage_flags = with_host.usage;
+            format_info.usage = with_host.usage;
+        }
+    }
     FormatQuery format_query = QueryImageFormat(instance, format_info);
     // sotc: storage usage is speculative (see ImageUsageFlags). AMD's Windows driver refuses it for
     // BC5/BC6H; creating that combination anyway corrupts the texture or loses the device later,

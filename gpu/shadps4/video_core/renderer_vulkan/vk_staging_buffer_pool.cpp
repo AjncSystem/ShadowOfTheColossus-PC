@@ -77,8 +77,13 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
         } else {
             const SotcStats::FrameTimer frame_timer{SotcStats::FrameAlloc};
             const SotcStats::AllocTrace alloc_trace{SotcStats::AllocStagingBlock, BlockSize()};
+            // sotc: upload blocks move to the large BAR heap under SOTC_REBAR_UPLOAD, per block.
+            const MemoryType block_type =
+                type == MemoryType::HostUncached
+                    ? VideoCore::ResolveRebarType(instance, BlockSize(), type)
+                    : type;
             best = &ring.blocks.emplace_back(Block{
-                .buffer = std::make_unique<VideoCore::StreamBuffer>(instance, scheduler, type,
+                .buffer = std::make_unique<VideoCore::StreamBuffer>(instance, scheduler, block_type,
                                                                     BlockSize()),
                 .last_used_frame = frame,
             });
@@ -128,8 +133,12 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
     if (!best) {
         const SotcStats::FrameTimer frame_timer{SotcStats::FrameAlloc};
         const SotcStats::AllocTrace alloc_trace{SotcStats::AllocStagingLarge, alloc_size};
+        // sotc: see RequestFromRing; the ReBAR choice is per allocation.
+        const MemoryType alloc_type = type == MemoryType::HostUncached
+                                          ? VideoCore::ResolveRebarType(instance, alloc_size, type)
+                                          : type;
         best = &cache.emplace_back(LargeBuffer{
-            .buffer = std::make_unique<VideoCore::Buffer>(instance, 0, alloc_size, type,
+            .buffer = std::make_unique<VideoCore::Buffer>(instance, 0, alloc_size, alloc_type,
                                                           "StagingBufferPool:Dedicated"),
             .tick = 0,
             .last_used_frame = frame,

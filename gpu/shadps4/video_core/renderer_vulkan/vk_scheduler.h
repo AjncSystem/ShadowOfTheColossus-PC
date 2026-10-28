@@ -5,9 +5,11 @@
 
 
 #include <condition_variable>
+#include <cstddef>
 #include <mutex>
 #include <thread>
 #include <queue>
+#include <span>
 
 #include "common/interval_set.h"
 #include "common/unique_function.h"
@@ -49,9 +51,18 @@ struct RenderState {
     u16 height;
     u16 num_layers;
     u16 num_color_attachments;
+    // Formats and sample count of the attachments, for VkCommandBufferInheritanceRenderingInfo.
+    // An undefined format means no attachment of that kind. Filled wherever attachments are set.
+    std::array<vk::Format, 8> color_formats{};
+    vk::Format depth_format{};
+    vk::Format stencil_format{};
+    vk::SampleCountFlagBits samples{vk::SampleCountFlagBits::e1};
+    u32 tail_pad{}; // sotc: explicit padding, the struct must have no implicit padding (see below)
 
+    /// sotc: the attachments decide the state. The formats and samples are informational (the
+    /// inheritance of the pass secondaries, vk_recorder.cpp), so they do not restart a render pass.
     bool operator==(const RenderState& other) const noexcept {
-        return std::memcmp(this, &other, sizeof(RenderState)) == 0;
+        return std::memcmp(this, &other, offsetof(RenderState, color_formats)) == 0;
     }
 };
 static_assert(std::has_unique_object_representations_v<RenderState>);
@@ -59,14 +70,17 @@ static_assert(std::has_unique_object_representations_v<RenderState>);
 struct SubmitInfo {
     std::array<vk::Semaphore, 4> wait_semas;
     std::array<u64, 4> wait_ticks;
+    /// sotc: stage of each wait; 0 keeps the default of QueueSubmit for that index.
+    std::array<vk::PipelineStageFlags, 4> wait_stages{};
     std::array<vk::Semaphore, 4> signal_semas;
     std::array<u64, 4> signal_ticks;
     vk::Fence fence;
     u32 num_wait_semas;
     u32 num_signal_semas;
 
-    void AddWait(vk::Semaphore semaphore, u64 tick = 1) {
+    void AddWait(vk::Semaphore semaphore, u64 tick = 1, vk::PipelineStageFlags stage = {}) {
         wait_semas[num_wait_semas] = semaphore;
+        wait_stages[num_wait_semas] = stage;
         wait_ticks[num_wait_semas++] = tick;
     }
 
@@ -166,12 +180,45 @@ struct DynamicState {
     float line_width{};
     bool feedback_loop_enabled{};
 
+    /// sotc: advanced by Invalidate(), which BeginSession calls for every new primary command
+    /// buffer, and which the blit and shadow paths call after binding their own pipelines. The
+    /// caches below are trusted only while their generation equals this one (SOTC_DEDUP_STATE).
+    u64 generation{};
+
+    /// sotc: the vertex input last sent with setVertexInputEXT (Rasterizer::BindVertexBuffers).
+    struct VertexInputCache {
+        static constexpr u32 MaxEntries = 32; ///< MaxVertexBufferCount (vk_graphics_pipeline.h)
+        u64 generation{};                     ///< 0: nothing recorded
+        boost::container::static_vector<vk::VertexInputAttributeDescription2EXT, MaxEntries>
+            attributes;
+        boost::container::static_vector<vk::VertexInputBindingDescription2EXT, MaxEntries> bindings;
+    } vertex_input_cache{};
+
+    /// sotc: the push constants last written by Pipeline::BindResources. Shared by all pipelines,
+    /// so it lives here rather than in a pipeline.
+    struct PushConstantCache {
+        static constexpr u32 MaxBytes = 128; ///< Vulkan's guaranteed maxPushConstantsSize
+        u64 generation{};                    ///< 0: nothing recorded
+        vk::PipelineLayout layout{};
+        vk::ShaderStageFlags stages{};
+        u32 size{};
+        std::array<u8, MaxBytes> bytes{};
+    } push_constant_cache{};
+
     /// Commits the dynamic state to the provided command buffer.
     void Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf);
 
-    /// Invalidates all dynamic state to be flushed into the next command buffer.
+    /// Invalidates all dynamic state to be flushed into the next command buffer. Also voids the
+    /// cached vertex inputs and push constants, which the new command buffer does not hold.
     void Invalidate() {
         std::memset(&dirty_state, 0xFF, sizeof(dirty_state));
+        ++generation;
+    }
+
+    /// sotc: voids only the push constant cache. Called after any pass that binds its own
+    /// pipeline or pushes its own constants on the scheduler's command buffer.
+    void InvalidatePushConstants() {
+        push_constant_cache.generation = 0;
     }
 
     void SetViewports(const Viewports& viewports_) {
@@ -349,6 +396,66 @@ struct DynamicState {
     }
 };
 
+/// sotc: SOTC_XFER_QUEUE=1. Buffer uploads (BufferCache::SynchronizeMemory) are recorded on the
+/// transfer-only queue family of Instance, one command buffer per copy, and submitted at once.
+/// Each copy waits on the graphics timeline for the newest graphics submit, so it runs after
+/// all graphics work already submitted. The next graphics submit waits on the copy's timeline
+/// value (Scheduler::SubmitExecution), so everything recorded after the copy sees its data.
+/// Staging memory is safe to reuse: its tick is the next graphics submit, which waits for the copy.
+class Scheduler;
+
+class XferQueue {
+public:
+    XferQueue(const Instance& instance_, Semaphore& graphics_, Scheduler* scheduler_ = nullptr);
+    ~XferQueue();
+
+    /// Records and submits a buffer copy. Returns false when nothing was submitted.
+    bool Copy(vk::Buffer src, vk::Buffer dst, std::span<const vk::BufferCopy> copies);
+
+    /// sotc: SOTC_HOST_IMPORT. One copy between two buffers.
+    struct Region {
+        vk::Buffer src;
+        vk::Buffer dst;
+        vk::BufferCopy copy;
+    };
+    /// sotc: SOTC_HOST_IMPORT. Submits the copies and waits on the CPU until they are done. Unlike
+    /// Copy, it does not wait for the graphics work: the destinations must be memory no graphics
+    /// work uses (fresh staging). The next graphics submit still waits for it (TakePendingTick),
+    /// which makes the copied bytes visible to it.
+    void CopyAndWait(std::span<const Region> regions);
+
+    /// Returns and clears the timeline value the next graphics submit must wait for (0: none).
+    [[nodiscard]] u64 TakePendingTick();
+
+    /// Timeline semaphore of the copies (waited on by the graphics submits).
+    [[nodiscard]] vk::Semaphore Handle() const noexcept {
+        return *timeline;
+    }
+
+    /// Waits on the CPU until the newest copy has finished (readbacks ahead of the queue).
+    void WaitLastCopy();
+
+private:
+    static constexpr u32 NumSlots = 8;
+    struct Slot {
+        vk::CommandBuffer cmd{};
+        u64 tick{}; ///< timeline value of the copy last recorded here; 0: never used
+    };
+
+    const Instance& instance;
+    Semaphore* graphics;
+    Scheduler* scheduler{}; ///< sotc: to wait until a graphics tick is on the queue
+    vk::Queue queue;
+    vk::UniqueSemaphore timeline;
+    vk::UniqueCommandPool pool;
+    std::array<Slot, NumSlots> slots{};
+    u32 next_slot{};
+    u64 next_tick{1};
+    u64 last_tick{};
+    u64 pending_tick{};
+    std::mutex mutex;
+};
+
 using SessionFunc = Common::UniqueFunction<void>;
 using SubmitFunc = Common::UniqueFunction<void, SubmitInfo&>;
 
@@ -384,6 +491,24 @@ public:
 
     /// Waits for the given tick to trigger on the GPU.
     void Wait(u64 tick);
+
+    /// sotc: true when SOTC_XFER_QUEUE created the transfer queue (see XferQueue).
+    [[nodiscard]] bool HasXferQueue() const noexcept {
+        return xfer != nullptr;
+    }
+
+    /// sotc: copies buffer data on the transfer queue (XferQueue::Copy). False: not routed, the
+    /// caller records the copy on the graphics queue as before.
+    bool XferCopy(vk::Buffer src, vk::Buffer dst, std::span<const vk::BufferCopy> copies);
+
+    /// sotc: SOTC_HOST_IMPORT, see XferQueue::CopyAndWait. False without the transfer queue.
+    bool XferCopyAndWait(std::span<const XferQueue::Region> regions) {
+        if (!xfer) {
+            return false;
+        }
+        xfer->CopyAndWait(regions);
+        return true;
+    }
 
     /// Begins a one-off command buffer that is submitted ahead of the one being recorded, for
     /// work that only depends on already submitted commands (readbacks of their results).
@@ -435,6 +560,12 @@ public:
     /// Returns the current command buffer.
     vk::CommandBuffer CommandBuffer() const {
         return sessions.back().primary;
+    }
+
+    /// sotc: number of the current session, which is the command buffer being recorded. It changes
+    /// on every BeginSession, so per-command-buffer state (descriptor buffer bindings) can key on it.
+    [[nodiscard]] u64 SessionSerial() const noexcept {
+        return session_serial;
     }
 
     /// sotc: calls func with the real current command buffer at this point of the command
@@ -512,6 +643,7 @@ private:
         vk::CommandBuffer primary{};
     };
     std::vector<Session> sessions;
+    u64 session_serial{}; // sotc: see SessionSerial()
     std::condition_variable_any event_cv;
     struct PendingOp {
         Common::UniqueFunction<void> callback;
@@ -536,6 +668,8 @@ private:
     tracy::VkCtxScope* profiler_scope{};
     /// Newest tick the recording thread has put on the queue.
     std::atomic<u64> recorded_submit_tick{0};
+    /// sotc: SOTC_XFER_QUEUE only; null otherwise.
+    std::unique_ptr<XferQueue> xfer;
     /// Last member: stops (after running everything queued) before the rest is destroyed.
     std::unique_ptr<CommandRecorder> recorder;
 };

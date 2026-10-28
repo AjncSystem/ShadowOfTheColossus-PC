@@ -225,6 +225,8 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     runtime.FlushBarriers();
 
     const auto cmdbuf = scheduler.CommandBuffer();
+    // sotc: this pass pushes its own constants (SOTC_DEDUP_PUSH cache).
+    scheduler.GetDynamicState().InvalidatePushConstants();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, false));
 
     const vk::DescriptorBufferInfo tiled_buffer_info{
@@ -317,6 +319,8 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     runtime.FlushBarriers();
 
     const auto cmdbuf = scheduler.CommandBuffer();
+    // sotc: this pass pushes its own constants (SOTC_DEDUP_PUSH cache).
+    scheduler.GetDynamicState().InvalidatePushConstants();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, true));
 
     const vk::DescriptorBufferInfo tiled_buffer_info{

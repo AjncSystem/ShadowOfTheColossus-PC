@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <functional>
 #include <chrono>
 #include <unordered_map>
 
@@ -173,13 +174,17 @@ private:
     std::unique_ptr<class ShadowScroll> shadow_scroll;
 
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
-                     Shader::PushData& push_data);
-    void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
+                     Shader::PushData& push_data, u32 set);
+    void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding, u32 set);
     bool BindResources(const Pipeline* pipeline);
     bool FastBindEligible(const Pipeline* pipeline) const;
     u64 FastBindHash(const Pipeline* pipeline, const Shader::PushData& push_data) const;
     void CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dma);
 
+    /// sotc: records vertex input, vertex and index buffers again when a submit happened since
+    /// vertex_tick (the draw moved to a new command buffer).
+    void RebindVertexIfSubmitted(const GraphicsPipeline* pipeline, u64& vertex_tick,
+                                 bool is_indexed, const std::function<void()>& bind_index);
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
     void BindIndexBuffer(u32 index_offset = 0);
 
@@ -247,7 +252,9 @@ private:
 
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;
+    std::vector<u32> set_write_sets; ///< sotc: descriptor set of each set_writes entry
     Shader::PushData push_data;
+    Shader::BindlessSamplerSlots bindless_slots{}; // sotc: SOTC_BINDLESS_SAMP, pushed after push_data
 
     using ImageBindingInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;

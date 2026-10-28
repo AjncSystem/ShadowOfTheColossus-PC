@@ -52,7 +52,12 @@ void Swapchain::Create(u32 width_, u32 height_) {
     const vk::SharingMode sharing_mode =
         exclusive ? vk::SharingMode::eExclusive : vk::SharingMode::eConcurrent;
     const auto format = needs_hdr ? SURFACE_FORMAT_HDR : surface_format;
+    // sotc: VK_NV_low_latency2 (SOTC_LOW_LATENCY on NVIDIA) asks for latency mode on the swapchain.
+    const vk::SwapchainLatencyCreateInfoNV latency_info = {
+        .latencyModeEnable = vk::True,
+    };
     const vk::SwapchainCreateInfoKHR swapchain_info = {
+        .pNext = instance.IsNvLowLatencyEnabled() ? &latency_info : nullptr,
         .surface = surface,
         .minImageCount = image_count,
         .imageFormat = format.format,
@@ -128,8 +133,16 @@ bool Swapchain::AcquireNextImage() {
     return !needs_recreation;
 }
 
-bool Swapchain::Present() {
+bool Swapchain::Present(u64 present_id) {
+    // sotc: with SOTC_PRESENT_WAIT the present carries its id (VK_KHR_present_id), so the
+    // presenter can wait until it is on screen (vkWaitForPresentKHR).
+    const vk::PresentIdKHR present_id_info = {
+        .swapchainCount = 1,
+        .pPresentIds = &present_id,
+    };
+    const bool tag_present = present_id != 0 && instance.IsPresentIdEnabled();
     const vk::PresentInfoKHR present_info = {
+        .pNext = tag_present ? &present_id_info : nullptr,
         .waitSemaphoreCount = 1,
         .pWaitSemaphores = &present_ready[image_index],
         .swapchainCount = 1,
@@ -223,6 +236,12 @@ void Swapchain::FindPresentMode() {
     if (Dlssg::WantsImmediatePresent() &&
         std::ranges::find(modes, vk::PresentModeKHR::eImmediate) != modes.cend()) {
         present_mode = vk::PresentModeKHR::eImmediate;
+    }
+    // sotc: SOTC_PRESENT_WAIT paces the flips on the display: FIFO queues each present for the
+    // next vblank, in order, which is what vkWaitForPresentKHR reports on. The requested mode
+    // is ignored then, Immediate (DLSS Frame Generation above) included.
+    if (instance.IsPresentWaitEnabled()) {
+        present_mode = vk::PresentModeKHR::eFifo;
     }
 }
 

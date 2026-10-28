@@ -183,6 +183,9 @@ public:
     }
     u64 lru_id{};
     u64 tick_accessed_last{};
+    /// sotc: tick_accessed_last before its latest update (the use before the current one). The
+    /// host image copy (SOTC_HOST_IMAGE_COPY) needs the last use before the current submit.
+    u64 tick_prev_accessed{};
     u64 hash{};
     u64 general_epoch{~0ull}; // sotc: fence epoch of the last GENERAL->GENERAL barrier
     /// sotc: host bytes this full chain would save as a mip tail (census "projected" only).

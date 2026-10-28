@@ -356,6 +356,7 @@ bool ShadowScroll::Scroll(VideoCore::Image& image, u32 layer, s32 sx, s32 sy, fl
     state.depth_stencil_attachment.image_view = target_view;
     state.depth_stencil_attachment.image_layout = target_layout;
     state.depth_stencil_attachment.has_depth = true;
+    state.depth_format = format;
     scheduler.BeginRendering(state);
 
     const auto cmdbuf = scheduler.CommandBuffer();

@@ -34,6 +34,11 @@ public:
 
     void TickFrame();
 
+    /// sotc: SOTC_XFER_QUEUE. Copies a buffer range on the transfer queue when the current
+    /// graphics work does not touch it (see XferQueue). False: the caller uses CopyBuffer.
+    bool TryCopyBufferXfer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
+                           std::span<const vk::BufferCopy> copies);
+
     void CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
                     std::span<const vk::BufferCopy> copies);
 
@@ -47,6 +52,13 @@ public:
 
     void UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                      std::span<const vk::BufferImageCopy> upload_copies);
+
+    /// sotc: SOTC_HOST_IMAGE_COPY: writes a whole linear image from guest memory with the host
+    /// (vkCopyMemoryToImageEXT). guest_base is the image's guest address; the copies' bufferOffset
+    /// are relative to it. Returns false, with the image left as it was, when the path does not
+    /// apply; gpu_idle says whether the image has no GPU work in flight and none recorded.
+    bool TryHostImageCopy(VideoCore::Image* dst, const u8* guest_base,
+                          std::span<const vk::BufferImageCopy> copies, bool gpu_idle);
     void DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
                        std::span<const vk::BufferImageCopy> download_copies);
 

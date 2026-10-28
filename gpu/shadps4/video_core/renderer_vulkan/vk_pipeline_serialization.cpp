@@ -23,9 +23,29 @@ namespace Serialization {
 // LOD feedback (sotc_lod_stats.h); binaries built with SOTC_LOD_FEEDBACK=0 are another version.
 // 37/135 = invariant position on barycentric-emulation pipelines (ground-level texture/depth
 // mismatch between the pipeline with the geometry shader and the one without; PR #258).
-static const u32 ShaderBinaryVersion = Shader::LodFeedbackEnabled() ? 37u : 135u;
+// 38/136 = SRT walker resolves Phis whose operands compute the same offset (flattened layout
+// changes for those shaders).
+// sotc: SOTC_STAGE_BINDINGS=1 binaries number their descriptors per stage: +1000 keeps them apart
+// from the others (the layouts and the shader bindings differ).
+// sotc: SOTC_BINDLESS_SAMP=1 binaries read their samplers from the heap: +2000 keeps them apart.
+static bool BindlessSamplersRequested() {
+    const char* v = std::getenv("SOTC_BINDLESS_SAMP");
+    return v && v[0] == '1';
+}
+// sotc: SOTC_SRT_PHI=0 flattens Phi shaders the old way: +4000 so cached walkers of the other
+// setting are not reused (the A/B would be void otherwise).
+static bool SrtPhiDisabled() {
+    const char* v = std::getenv("SOTC_SRT_PHI");
+    return v && v[0] == '0';
+}
+// sotc: 39/137 (from 38/136): the SRT walker no longer uses dynamic-window ReadConsts as offsets.
+static const u32 ShaderBinaryVersion = (Shader::LodFeedbackEnabled() ? 39u : 137u) +
+                                       (Shader::StageBindingsEnabled() ? 1000u : 0u) +
+                                       (BindlessSamplersRequested() ? 2000u : 0u) +
+                                       (SrtPhiDisabled() ? 4000u : 0u);
 static constexpr u32 ShaderMetaVersion = 21u;
-static constexpr u32 PipelineKeyVersion = 3u;
+static const u32 PipelineKeyVersion =
+    3u + (Shader::StageBindingsEnabled() ? 1000u : 0u) + (BindlessSamplersRequested() ? 2000u : 0u);
 } // namespace Serialization
 
 namespace Vulkan {
@@ -241,7 +261,7 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
         WarmUpTimer timer{warmup_times.pipelines};
         // sotc: built by the pipeline workers (SOTC_ASYNC_PRELOAD); WarmUp waits for them.
         const bool deferred = AsyncPreloadEnabled();
-        it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
+        it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, layout_cache, profile,
                                                        *pipeline_cache, compute_key, *infos[0],
                                                        modules[0], sdata, true, deferred);
         if (deferred) {
@@ -354,7 +374,7 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     } else {
         WarmUpTimer timer{warmup_times.pipelines};
         it.value() = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
+            instance, scheduler, desc_heap, layout_cache, profile, graphics_key, *pipeline_cache, infos,
             runtime_infos, fetch_shader, modules, sdata, true);
     }
 
@@ -468,6 +488,9 @@ void PipelineCache::WarmUp() {
             // byte (seen 0xe3, 0x36): anything but 1 there is off, so those caches still match.
             auto& via_gs = profile_data[offsetof(Shader::Profile, barycentric_via_gs)];
             via_gs = via_gs == 1 ? 1 : 0;
+            // sotc: stage_bindings sits in the padding byte after it (see Profile).
+            auto& stage_bindings = profile_data[offsetof(Shader::Profile, stage_bindings)];
+            stage_bindings = stage_bindings == 1 ? 1 : 0;
             std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
         }
         compatible = profile_data.size() == sizeof(Shader::Profile) && cached_profile == profile;

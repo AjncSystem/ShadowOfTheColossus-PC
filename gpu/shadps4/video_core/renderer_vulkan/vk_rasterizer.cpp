@@ -49,6 +49,20 @@
 
 namespace Vulkan {
 
+// sotc: SOTC_DEDUP_STATE=0 sends the vertex inputs on every draw again (vertex_input_cache in
+// DynamicState, vk_scheduler.h, is then never read or written).
+static const bool kDedupState = [] {
+    const char* v = std::getenv("SOTC_DEDUP_STATE");
+    return !v || v[0] != '0';
+}();
+
+// sotc: SOTC_BINDLESS_SAMP: the samplers of this stage come from the global heap, not from set 0.
+// The same rule as Shader::UsesBindlessSamplers, whose profile flag is the instance flag.
+static bool IsBindlessStage(const Instance& instance, const Shader::Info& stage) {
+    return instance.IsBindlessSamplersEnabled() && !stage.samplers.empty() &&
+           stage.samplers.size() <= Shader::GetBindlessSamplerRange(stage.sw_stage).count;
+}
+
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
     // is encountered and implemented in the recompiler.
@@ -73,6 +87,12 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
+
+    // sotc: SOTC_BINDLESS_SAMP: the pipelines bind the global sampler set of the texture cache.
+    const auto& bindless = texture_cache.GetBindlessSamplers();
+    if (bindless.Enabled()) {
+        pipeline_cache.GetDescriptorHeap().SetBindlessSamplers(bindless.Layout(), bindless.Set());
+    }
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();
@@ -921,15 +941,19 @@ bool Rasterizer::BeginHudless(const GraphicsPipeline* pipeline, const RenderStat
     };
     cmdbuf.pipelineBarrier2(
         vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_target});
+    // sotc: the descriptor arrays of the last bind change here (the UI image becomes the clear
+    // image): no later fast-bind reuse of them, wide or not.
+    fast_bind.valid = false;
     auto& ui = image_infos[hudless_ui_info];
     ui.imageView = hudless_clear.rt_view;
     ui.imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
-    pipeline->BindResources(set_writes, push_data);
+    pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots);
     RenderState hudless_state = state;
     auto& attachment = hudless_state.color_attachments[0];
     attachment.image_view = target.rt_view;
     attachment.image_layout = vk::ImageLayout::eColorAttachmentOptimal;
     attachment.is_clear = 0;
+    hudless_state.color_formats[0] = target.rt_format;
     scheduler.BeginRendering(hudless_state);
     target.fresh = true;
     static bool reported = false;
@@ -1087,13 +1111,18 @@ bool Rasterizer::BeginUiShadow(const GraphicsPipeline* pipeline, const RenderSta
     }
     color.image_view = view;
     color.image_layout = vk::ImageLayout::eColorAttachmentOptimal;
+    shadow.color_formats[0] = ui_shadow_format;
     for (u32 cb = 1; cb < shadow.num_color_attachments; ++cb) {
         shadow.color_attachments[cb].image_view = vk::ImageView{}; // of the render size
+        shadow.color_formats[cb] = vk::Format{};
     }
     auto& depth = shadow.depth_stencil_attachment;
     depth.image_view = vk::ImageView{};
     depth.depth_clear = false;
     depth.stencil_clear = false;
+    shadow.depth_format = vk::Format{};
+    shadow.stencil_format = vk::Format{};
+    shadow.samples = vk::SampleCountFlagBits::e1; // the UI target is a single sample image
     shadow.width = static_cast<u16>(width);
     shadow.height = static_cast<u16>(height);
     scheduler.BeginRendering(shadow);
@@ -1176,17 +1205,21 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
     const auto state = BeginRendering(pipeline);
     RefreshImageLayouts();
 
+    // sotc: the binds below can submit the command buffer (arena allocation, readbacks,
+    // releases); what was recorded before lands in the old one. Re-record vertex state then.
+    u64 vertex_tick = scheduler.CurrentTick();
     BindVertexBuffers(pipeline);
     if (is_indexed) {
         BindIndexBuffer(index_offset);
     }
+    RebindVertexIfSubmitted(pipeline, vertex_tick, is_indexed, [&] { BindIndexBuffer(index_offset); });
 
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
 
-    if (!fast_bind_hit) {
-        pipeline->BindResources(set_writes, push_data);
+    if (!fast_bind_hit || fast_bind.tick != scheduler.CurrentTick()) {
+        pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots);
     }
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
@@ -1290,10 +1323,12 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     ui_shadow_broken |= ui_shadow_hit; // sotc: indirect draws are not redrawn (BeginUiShadow)
     RefreshImageLayouts();
 
+    u64 vertex_tick = scheduler.CurrentTick(); // sotc: see the direct draw
     BindVertexBuffers(pipeline);
     if (is_indexed) {
         BindIndexBuffer();
     }
+    RebindVertexIfSubmitted(pipeline, vertex_tick, is_indexed, [&] { BindIndexBuffer(); });
 
     // sotc: SotC writes the arguments of most indirect draws with WRITE_DATA right before them
     // (thousands per frame). With the arguments CPU-side, read them here and draw directly: no
@@ -1317,8 +1352,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         if (needs_barrier) {
             runtime.FlushBarriers();
         }
-        if (!fast_bind_hit) {
-            pipeline->BindResources(set_writes, push_data);
+        if (!fast_bind_hit || fast_bind.tick != scheduler.CurrentTick()) {
+            pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots);
         }
         UpdateDynamicState(pipeline, is_indexed);
         scheduler.BeginRendering(state);
@@ -1367,13 +1402,15 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         std::tie(count_buffer, count_offset) = buffer_cache.ObtainBuffer(count_address, 4, false);
         needs_barrier |= runtime.IsBufferAccessed(count_buffer, count_offset, 4);
     }
+    // sotc: the argument buffers can submit too.
+    RebindVertexIfSubmitted(pipeline, vertex_tick, is_indexed, [&] { BindIndexBuffer(); });
 
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
 
-    if (!fast_bind_hit) {
-        pipeline->BindResources(set_writes, push_data);
+    if (!fast_bind_hit || fast_bind.tick != scheduler.CurrentTick()) {
+        pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots);
     }
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
@@ -1576,7 +1613,7 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
     }
 
     scheduler.EndRendering();
-    pipeline->BindResources(set_writes, push_data);
+    pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
@@ -1618,7 +1655,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
     }
 
     scheduler.EndRendering();
-    pipeline->BindResources(set_writes, push_data);
+    pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
@@ -1680,6 +1717,10 @@ bool Rasterizer::FastBindEligible(const Pipeline* pipeline) const {
     for (const auto* stage : pipeline->GetStages()) {
         if (!stage) {
             continue;
+        }
+        // sotc: the bindless slots are set in the push data of the slow path only.
+        if (IsBindlessStage(instance, *stage)) {
+            return false;
         }
         if (stage->has_storage_images || !stage->fmasks.empty()) {
             return false;
@@ -1770,11 +1811,6 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         return false;
     }
 
-    set_write_index = 0;
-    set_writes.clear();
-    buffer_infos.clear();
-    image_infos.clear();
-
     bool uses_dma = false;
 
     // A stage whose user data was never attached (e.g. a program restored from the pipeline
@@ -1801,13 +1837,15 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         SotcStats::fast_bind_eligible.fetch_add(1, std::memory_order_relaxed);
         const auto input_push = MakeUserData(liverpool->DrawRegs());
         fast_hash = FastBindHash(pipeline, input_push);
-        if (fast_bind.valid && fast_bind.pipeline == pipeline &&
-            fast_bind.tick == scheduler.CurrentTick() &&
+        // Same state as the last full bind, ignoring the submit tick (SOTC_FASTBIND_WIDE needs it).
+        const bool fast_state_same =
+            fast_bind.valid && fast_bind.pipeline == pipeline &&
             fast_bind.buffer_generation == buffer_cache.BindGeneration() &&
             fast_bind.texture_generation == texture_cache.BindGeneration() &&
             fast_bind.stream_generation == buffer_cache.StreamGeneration() &&
             fast_bind.mem_epoch == SotcStats::mem_epoch.load(std::memory_order_relaxed) &&
-            fast_bind.hash == fast_hash) {
+            fast_bind.hash == fast_hash;
+        if (fast_state_same && fast_bind.tick == scheduler.CurrentTick()) {
             fast_bind_hit = true;
             SotcStats::fast_bind_hits.fetch_add(1, std::memory_order_relaxed);
             if (fast_bind.uses_dma) {
@@ -1815,21 +1853,65 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             }
             return true;
         }
+        if (fast_state_same && SotcStats::kFastBindWide) {
+            // sotc: SOTC_FASTBIND_WIDE: the same state in a later submit. The new command buffer
+            // holds none of the push constants or descriptors, so the caller still runs
+            // Pipeline::BindResources (fast_bind_hit stays false) with the descriptor arrays kept
+            // from the last full bind. fast_bind.valid guarantees no other BindResources call
+            // replaced them since (the others clear it), and the generations above guarantee the
+            // handles and residency they name are still current.
+            push_data = input_push;
+            fast_bind.tick = scheduler.CurrentTick();
+            if (SotcStats::kFpsLog) {
+                SotcStats::fast_bind_wide_hits.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (fast_bind.uses_dma) {
+                buffer_cache.SynchronizeDmaBuffers();
+            }
+            return true;
+        }
+        if (SotcStats::kFpsLog) {
+            SotcStats::fast_bind_misses.fetch_add(1, std::memory_order_relaxed);
+            if (fast_state_same) {
+                SotcStats::fast_bind_tick_misses.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         push_data = input_push;
     } else {
         fast_bind.valid = false;
         push_data = MakeUserData(liverpool->DrawRegs());
     }
+
+    set_write_index = 0;
+    // sotc: the heap indices of this draw; each bindless stage fills its own words in BindTextures.
+    if (instance.IsBindlessSamplersEnabled()) {
+        bindless_slots = {};
+    }
+    set_writes.clear();
+    buffer_infos.clear();
+    image_infos.clear();
+
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
+    const bool staged = pipeline->UsesStageSets();
     for (const auto* stage : pipeline->GetStages()) {
         if (!stage) {
             continue;
         }
+        // sotc: SOTC_STAGE_BINDINGS: each stage numbers its descriptors from 0 in its own set. The
+        // buffer count runs on across the stages: it indexes the push constant offsets they share.
+        const u32 set = staged ? Shader::StageDescriptorSet(stage->sw_stage) : 0u;
+        if (staged) {
+            binding.unified = 0;
+        }
+        // sotc: bindless samplers have no descriptor write (BindTextures sets their push slots).
+        const size_t num_sampler_writes =
+            IsBindlessStage(instance, *stage) ? 0 : stage->samplers.size();
         set_writes.resize(set_writes.size() + stage->buffers.size() + stage->images.size() +
-                          stage->samplers.size());
-        BindBuffers(*stage, binding, push_data);
-        BindTextures(*stage, binding);
+                          num_sampler_writes);
+        set_write_sets.resize(set_writes.size(), 0u);
+        BindBuffers(*stage, binding, push_data, set);
+        BindTextures(*stage, binding, set);
         uses_dma |= stage->uses_dma;
     }
 
@@ -1844,6 +1926,22 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     return true;
 }
 
+void Rasterizer::RebindVertexIfSubmitted(const GraphicsPipeline* pipeline, u64& vertex_tick,
+                                         bool is_indexed,
+                                         const std::function<void()>& bind_index) {
+    // sotc: a submit while binding (arena allocation, readback, release) moved recording to a new
+    // command buffer, and the vertex input, vertex and index buffers recorded before it stayed in
+    // the old one: the draw would run without them (broken vertices; review of 2026-10-27).
+    // Record them again; a second submit while doing so is rare, so retry a few times.
+    for (int tries = 0; tries < 4 && vertex_tick != scheduler.CurrentTick(); ++tries) {
+        vertex_tick = scheduler.CurrentTick();
+        BindVertexBuffers(pipeline);
+        if (is_indexed) {
+            bind_index();
+        }
+    }
+}
+
 void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     const auto& regs = liverpool->DrawRegs();
     VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
@@ -1854,9 +1952,23 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
                               regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
 
     if (instance.IsVertexInputDynamicState()) {
-        // Update current vertex inputs.
-        const auto cmdbuf = scheduler.CommandBuffer();
-        cmdbuf.setVertexInputEXT(bindings, attributes);
+        // Update current vertex inputs, unless this command buffer already holds them.
+        // sotc: the cache is voided with the generation of DynamicState (SOTC_DEDUP_STATE).
+        auto& dynamic = scheduler.GetDynamicState();
+        auto& cache = dynamic.vertex_input_cache;
+        static_assert(MaxVertexBufferCount <= DynamicState::VertexInputCache::MaxEntries);
+        const bool same = kDedupState && cache.generation == dynamic.generation &&
+                          std::ranges::equal(cache.attributes, attributes) &&
+                          std::ranges::equal(cache.bindings, bindings);
+        if (!same) {
+            const auto cmdbuf = scheduler.CommandBuffer();
+            cmdbuf.setVertexInputEXT(bindings, attributes);
+            if (kDedupState) {
+                cache.generation = dynamic.generation;
+                cache.attributes.assign(attributes.begin(), attributes.end());
+                cache.bindings.assign(bindings.begin(), bindings.end());
+            }
+        }
     }
 
     if (bindings.empty()) {
@@ -2407,7 +2519,7 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 }
 
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
-                             Shader::PushData& push_data) {
+                             Shader::PushData& push_data, u32 set) {
     const u64 alignment = instance.StorageMinAlignment();
     for (const auto& desc : stage.buffers) {
         if (desc.IsSpecial()) {
@@ -2596,6 +2708,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
         }
 
+        set_write_sets[set_write_index] = set;
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = binding.unified++;
@@ -2642,7 +2755,8 @@ bool Rasterizer::DepthSampledAsAttachment(VideoCore::ImageId image_id, const Vid
            !Vulkan::LiverpoolToVK::IsFormatStencilCompatible(fmt);
 }
 
-void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
+void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding,
+                              u32 set) {
     const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the pass
     image_bindings.clear();
     const u32 first_image_idx = image_infos.size();
@@ -2947,6 +3061,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     for (u32 array_size : image_descriptor_array_sizes) {
         const auto& [_, desc] = image_bindings[image_binding_idx];
         const bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
+        set_write_sets[set_write_index] = set;
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = binding.unified;
@@ -2983,7 +3098,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             ui_asset = &image;
         }
     }
-    for (const auto& sampler : stage.samplers) {
+    const bool bindless = IsBindlessStage(instance, stage);
+    const auto bindless_range = Shader::GetBindlessSamplerRange(stage.sw_stage);
+    for (u32 sampler_index = 0; sampler_index < stage.samplers.size(); ++sampler_index) {
+        const auto& sampler = stage.samplers[sampler_index];
         auto ssharp = sampler.GetSharp(stage);
         if (ui_asset && ssharp.xy_mag_filter.Value() == AmdGpu::Filter::Point &&
             !sampler.is_depth) {
@@ -3013,10 +3131,20 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         liverpool->DrawRegs().ta_bc_base.Address());
             ssharp = AmdGpu::Sampler{};
         }
-        const auto vk_sampler =
-            texture_cache.GetSampler(ssharp, liverpool->DrawRegs().ta_bc_base, sampler.is_depth);
+        u32 heap_slot = 0;
+        const auto vk_sampler = texture_cache.GetSampler(
+            ssharp, liverpool->DrawRegs().ta_bc_base, sampler.is_depth, &heap_slot);
+        if (bindless) {
+            // sotc: the shader reads the heap index from this slot of the push constants.
+            const u32 slot = bindless_range.base + sampler_index;
+            const u32 shift = (slot & 1) * 16;
+            auto& word = bindless_slots.words[slot / 2];
+            word = (word & ~(0xFFFFu << shift)) | (heap_slot << shift);
+            continue;
+        }
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         image_info_images[image_infos.size() - 1] = {};
+        set_write_sets[set_write_index] = set;
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = binding.unified++;
@@ -3045,6 +3173,9 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     state.height = instance.GetMaxFramebufferHeight();
     state.num_layers = std::numeric_limits<u16>::max();
     state.num_color_attachments = std::bit_width(key.mrt_mask);
+    // Same count as the pipeline's rasterizationSamples (vk_graphics_pipeline.cpp).
+    state.samples = LiverpoolToVK::NumSamples(
+        key.num_samples, instance.GetColorSampleCounts() & instance.GetDepthSampleCounts());
     for (auto cb = 0u; cb < state.num_color_attachments; ++cb) {
         auto& [image_id, desc] = cb_descs[cb];
         if (!image_id) {
@@ -3104,6 +3235,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         attachment.image_layout = image->backing->state.layout;
         attachment.clear_value = clear_value.color.uint32;
         attachment.is_clear = is_clear;
+        state.color_formats[cb] = image_view.info.format;
 
         image->usage.render_target = 1u;
         if (cb == 0 && image->usage.vo_surface) { // sotc: TakeHudless
@@ -3197,6 +3329,9 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             attachment.has_stencil = true;
             attachment.stencil_clear = is_stencil_clear;
         }
+        // Same aspects as the Scheduler's pDepthAttachment / pStencilAttachment.
+        state.depth_format = attachment.has_depth ? image_view.info.format : vk::Format{};
+        state.stencil_format = attachment.has_stencil ? image_view.info.format : vk::Format{};
 
         image.usage.depth_target = true;
     } else {

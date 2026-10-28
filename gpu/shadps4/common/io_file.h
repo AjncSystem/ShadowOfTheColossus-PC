@@ -249,4 +249,7 @@ private:
 
 u64 GetDirectorySize(const std::filesystem::path& path);
 
+// sotc: a binary C stream on a path, wide on Windows (non-ASCII folders); null when it fails.
+[[nodiscard]] std::FILE* OpenCFile(const std::filesystem::path& path, FileAccessMode mode);
+
 } // namespace Common::FS

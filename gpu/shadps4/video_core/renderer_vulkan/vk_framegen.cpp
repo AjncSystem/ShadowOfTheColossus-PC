@@ -103,7 +103,12 @@ bool WantStreamline() {
 }
 
 bool HasNvidia() {
+#ifdef _WIN32
     return HasNvidiaGpu();
+#else
+    // sotc: the check goes through DXGI, and Streamline (DLSS) is Windows only.
+    return false;
+#endif
 }
 
 void SetAvailable(bool dlss, bool fsr) {

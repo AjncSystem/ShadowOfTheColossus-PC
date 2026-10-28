@@ -1281,6 +1281,7 @@ static void apply_sotc_cmdline(const char *path, uint64_t size) {
     printf("Engine command line: %s\n",text);
 }
 #ifndef _WIN32
+static void dump_frames(ucontext_t *uc);
 static void fault(int sig, siginfo_t *info, void *context) {
     /* GPU page tracking (write-protected guest pages) is resolved first. */
     if (sig == SIGSEGV && gpu_enabled && helper_read_fault(info, context)) return;
@@ -1311,7 +1312,20 @@ static void fault(int sig, siginfo_t *info, void *context) {
     else
         snprintf(line, sizeof(line), "Fault (signal %d) at RIP %p, address %p\n", sig, (void *)rip, info->si_addr);
     { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
+    const greg_t *r = uc->uc_mcontext.gregs;
+    snprintf(line, sizeof(line),
+             "  rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n  rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n"
+             "  r8=%016llx r9=%016llx r10=%016llx r11=%016llx\n  r12=%016llx r13=%016llx r14=%016llx r15=%016llx\n",
+             (unsigned long long)r[REG_RAX], (unsigned long long)r[REG_RBX], (unsigned long long)r[REG_RCX],
+             (unsigned long long)r[REG_RDX], (unsigned long long)r[REG_RSI], (unsigned long long)r[REG_RDI],
+             (unsigned long long)r[REG_RBP], (unsigned long long)r[REG_RSP], (unsigned long long)r[REG_R8],
+             (unsigned long long)r[REG_R9], (unsigned long long)r[REG_R10], (unsigned long long)r[REG_R11],
+             (unsigned long long)r[REG_R12], (unsigned long long)r[REG_R13], (unsigned long long)r[REG_R14],
+             (unsigned long long)r[REG_R15]);
+    { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
     if (gpu_enabled) bbgpu_dump_guest_writes(context);
+    /* Guest rbp chain (the game keeps frame pointers); the host backtrace below stops at guest frames. */
+    dump_frames(uc);
     /* Host call chain (frames with unwind info; guest frames end it). */
     void *frames[32];
     int depth = backtrace(frames, 32);

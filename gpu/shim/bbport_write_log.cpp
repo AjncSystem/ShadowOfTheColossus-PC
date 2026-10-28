@@ -3,10 +3,12 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <utility>
 #ifdef _WIN32
 #include <windows.h>
 #undef near
@@ -33,6 +35,128 @@ constexpr std::uint64_t Pattern = 0x0000005300000000ull;
 void Push(std::array<Entry, Size>& r, std::atomic<std::uint64_t>& h, const Entry& e) {
     r[h.fetch_add(1, std::memory_order_relaxed) % r.size()] = e;
 }
+
+// BB_WRITE_LOG=3: the last writes per 4 KiB page of the guest arena. The ring above covers about
+// a minute of writes; this answers "what last wrote near this heap chunk" whatever its age.
+constexpr std::uint64_t PageBase = 0x1000000000ull; // SOTC arena, 16 GB
+constexpr std::uint64_t PageCount = 1ull << 22;
+constexpr std::uint64_t PageSlots = 4;
+constexpr std::uint64_t PageSpanCap = 2048; // pages of one write that are recorded (8 MiB)
+struct PageSlot {
+    std::uint64_t address, tsc;
+    std::uint32_t size;
+    std::uint16_t source, tid;
+};
+PageSlot* page_slots; // calloc: pages the game never writes through the GPU stay uncommitted
+std::uint8_t* page_next;
+std::atomic<std::uint64_t> page_outside{0};
+std::uint64_t page_tsc0;
+std::chrono::steady_clock::time_point page_time0;
+
+void PageInit() {
+    static const bool once = [] {
+        page_slots = static_cast<PageSlot*>(std::calloc(PageCount * PageSlots, sizeof(PageSlot)));
+        page_next = static_cast<std::uint8_t*>(std::calloc(PageCount, 1));
+        page_tsc0 = __rdtsc();
+        page_time0 = std::chrono::steady_clock::now();
+        return true;
+    }();
+    (void)once;
+}
+
+void PageNote(std::uint64_t address, std::uint64_t size, std::uint32_t source) {
+    PageInit();
+    if (!page_slots || !page_next || size == 0 || address < PageBase ||
+        address + size > PageBase + (PageCount << 12)) {
+        page_outside.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    static thread_local const std::uint16_t tid = static_cast<std::uint16_t>(gettid());
+    const std::uint64_t tsc = __rdtsc();
+    const std::uint64_t first = (address - PageBase) >> 12;
+    const std::uint64_t last = (address + size - 1 - PageBase) >> 12;
+    for (std::uint64_t p = first; p <= last && p < first + PageSpanCap; ++p) {
+        PageSlot& s = page_slots[p * PageSlots + (page_next[p]++ & (PageSlots - 1))];
+        s = {address, tsc, static_cast<std::uint32_t>(size > 0xffffffffull ? 0xffffffffull : size),
+             static_cast<std::uint16_t>(source), tid};
+    }
+}
+
+// The 4 KiB pages around each pointer register, newest write first: the ones that overlap the
+// 0x40 bytes before and 0x60 after the pointer (a heap chunk's header and footer) are marked.
+void PageDump(const std::uint64_t* regs, const char* const* names, int count) {
+    std::fprintf(stderr, "Write trace: %llu writes outside the arena\n",
+                 static_cast<unsigned long long>(page_outside.load()));
+    if (!page_slots || !page_next) {
+        return;
+    }
+    const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - page_time0).count();
+    const double hz = dt > 0 ? double(__rdtsc() - page_tsc0) / dt : 3.0e9;
+    const std::uint64_t now = __rdtsc();
+    const char* sources[] = {"backing", "WriteData", "fence", "EOP", "WriteData", "EOS"};
+    for (int i = 0; i < count; ++i) {
+        const std::uint64_t r = regs[i];
+        if (r < PageBase + 0x1000 || r + 0x1000 >= PageBase + (PageCount << 12)) {
+            continue;
+        }
+        std::fprintf(stderr, "Write trace: %s=%#llx\n", names[i], (unsigned long long)r);
+#ifdef _WIN32
+        MEMORY_BASIC_INFORMATION m;
+        if (VirtualQuery(reinterpret_cast<const void*>(r - 8), &m, sizeof(m)) &&
+            m.State == MEM_COMMIT && (m.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0 &&
+            m.Protect != 0) {
+            std::uint64_t header = 0;
+            std::memcpy(&header, reinterpret_cast<const void*>(r - 8), 8);
+            std::fprintf(stderr, "Write trace:   [%s-8] = %#llx\n", names[i],
+                         (unsigned long long)header);
+        }
+#endif
+        const std::uint64_t lo = r - 0x40, hi = r + 0x60;
+        std::array<const PageSlot*, 16> found{};
+        std::array<bool, 16> overlap{};
+        int n = 0;
+        for (std::uint64_t p = (lo - PageBase) >> 12; p <= (hi - PageBase) >> 12; ++p) {
+            for (std::uint64_t k = 0; k < PageSlots; ++k) {
+                const PageSlot& s = page_slots[p * PageSlots + k];
+                if (!s.address || n == 16) {
+                    continue;
+                }
+                bool dup = false;
+                for (int j = 0; j < n; ++j) {
+                    dup |= found[j]->address == s.address && found[j]->tsc == s.tsc;
+                }
+                if (!dup) {
+                    overlap[n] = s.address < hi && s.address + s.size > lo;
+                    found[n++] = &s;
+                }
+            }
+        }
+        for (int a = 0; a < n; ++a) { // newest first
+            for (int b = a + 1; b < n; ++b) {
+                if (found[b]->tsc > found[a]->tsc) {
+                    std::swap(found[a], found[b]);
+                    std::swap(overlap[a], overlap[b]);
+                }
+            }
+        }
+        for (int a = 0; a < n; ++a) {
+            const PageSlot& s = *found[a];
+            std::fprintf(stderr,
+                         "Write trace:   %s %s %#llx +%u tid %u, %.3f s before the fault\n",
+                         overlap[a] ? "OVERLAP" : "page   ",
+                         s.source < 6 ? sources[s.source]
+                         : s.source == 11 ? "buffer readback"
+                         : s.source == 12 ? "fence/label"
+                         : s.source == 13 ? "image download"
+                         : s.source == 20 ? "replace from CPU"
+                                          : "backing (other)",
+                         (unsigned long long)s.address, s.size, s.tid, double(now - s.tsc) / hz);
+        }
+        if (n == 0) {
+            std::fprintf(stderr, "Write trace:   no logged GPU write in the pages around it\n");
+        }
+    }
+}
 } // namespace
 
 void Record(std::uint64_t address, const void* data, std::uint64_t size, Source source);
@@ -58,6 +182,8 @@ void NoteIntent(std::uint64_t address, const void* data, std::uint64_t size, Sou
 void Note(std::uint64_t address, const void* data, std::uint64_t size, Source source) {
     if (Enabled()) {
         Record(address, data, size, source);
+    } else if (Mode() == 3) {
+        PageNote(address, size, source);
     }
 }
 
@@ -120,6 +246,28 @@ extern "C" void bbgpu_dump_guest_writes(void* ucontext) {
                                   std::uint64_t(g[REG_R14]), std::uint64_t(g[REG_R15])};
 #endif
     const char* names[] = {"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "r14", "r15"};
+    if (Mode() == 3) {
+        // BB_WRITE_LOG=3: no dereference of a register here (the fault may be a garbage pointer).
+#ifdef _WIN32
+        const std::uint64_t more[] = {c->R12, c->R13, c->Rbp};
+#else
+        const std::uint64_t more[] = {std::uint64_t(g[REG_R12]), std::uint64_t(g[REG_R13]),
+                                      std::uint64_t(g[REG_RBP])};
+#endif
+        const char* more_names[] = {"r12", "r13", "rbp"};
+        std::uint64_t all[11];
+        const char* all_names[11];
+        for (int i = 0; i < 8; ++i) {
+            all[i] = regs[i];
+            all_names[i] = names[i];
+        }
+        for (int i = 0; i < 3; ++i) {
+            all[8 + i] = more[i];
+            all_names[8 + i] = more_names[i];
+        }
+        PageDump(all, all_names, 11);
+        return;
+    }
     for (int i = 0; i < 8; ++i) {
         std::fprintf(stderr, "Write log: %s=%#llx\n", names[i], (unsigned long long)regs[i]);
     }

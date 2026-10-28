@@ -1,5 +1,64 @@
 # Changelog
 
+## Não lançado — desempenho no streaming e correções visuais
+- **Menos travadas ao andar pelo mapa:** o timer do Windows passa a 1 ms (`SOTC_TIMER_RES=0`
+  desliga), liberar memória não espera mais a thread da GPU (`SOTC_DROP_ASYNC=0`), os workers de
+  compilação rodam abaixo do normal (`SOTC_WORKER_LOW_PRIO=0`) e o sleep do ritmo de quadros usa um
+  timer de alta resolução.
+- **Sombras piscando logo após carregar:** os passes de sombra (só profundidade) compilam na hora
+  em vez de serem pulados (`SOTC_DEPTH_SYNC_PIPE=0` desliga).
+- **Manchas coloridas nas malhas:** texturas pequenas são comparadas inteiras, não só os primeiros
+  8×8 texels (`SOTC_MAYBE_DIRTY_HASH=0` re-envia sempre).
+- Menos chamadas por desenho: o formato dos vértices não é reenviado quando não mudou
+  (`SOTC_DEDUP_STATE=0`); chamadas de `VirtualProtect` vizinhas são juntadas.
+- O SRT walker resolve instruções `Phi` simples (`SOTC_SRT_PHI=0` desliga). O cache de shaders é
+  refeito na primeira abertura.
+- **Experimentais, desligados por padrão** (`=1` liga): `SOTC_UNBIND_GPU_WAIT`,
+  `SOTC_VIEW_CHUNK_MB=2`, `SOTC_GPU_THREAD_HIGH`, `SOTC_DEDUP_PUSH`, `SOTC_FASTBIND_WIDE`,
+  `SOTC_DESC_BUFFER`, `SOTC_ARENA_TICK_FREE`, `SOTC_CPUSETS`, `SOTC_WAIT_NOSPIN`,
+  `SOTC_PRESENT_WAIT`, `SOTC_CP_AHEAD`, `SOTC_FAULT_GRANULE=65536`, `SOTC_EOP_TICK`,
+  `SOTC_HASH_SMALL=16384`, `SOTC_REBAR_UPLOAD` (placas com Resizable BAR; `SOTC_REBAR_MB` limita),
+  `SOTC_XFER_QUEUE` (fila de transferência, se a placa tiver), `SOTC_HOST_IMAGE_COPY`,
+  `SOTC_LOW_LATENCY` (Reflex na NVIDIA, Anti-Lag na AMD, limitador genérico nas outras),
+  `SOTC_STAGE_BINDINGS` (refaz o cache de shaders), `SOTC_LAYOUT_CACHE`, `SOTC_PASS_SEC`
+  (passes grandes gravados numa thread à parte; `SOTC_PASS_SEC_MIN` = desenhos mínimos, 64),
+  `SOTC_BINDLESS_SAMP` (samplers num heap global; refaz o cache de shaders; não combina com
+  `SOTC_STAGE_BINDINGS` nem `SOTC_DESC_BUFFER`). Todos caem para o
+  caminho atual quando a placa ou o driver não têm o recurso.
+- `SOTC_ASYNC_COMPUTE_XLATE=1` (experimental, desligado): quando um dispatch precisa de um shader
+  de compute novo, o resto do command buffer é varrido e os outros shaders de compute novos vão
+  para os workers, traduzidos em paralelo; os dispatches continuam publicados em ordem. Linha
+  `SOTC COMPUTE PREFETCH` com `SOTC_FPS=1`.
+- `SOTC_DROP_FAST=1` (experimental, desligado): liberar memória sem dados escritos pela GPU (o
+  caso comum ao trocar de área) não espera mais a thread de draws; no boot e no carregamento do
+  save essa espera somava 2,5-3 s a cada 5 s, com as outras threads do jogo paradas no lock da
+  memória. Linha `SOTC drop fast` com `SOTC_FPS=1`.
+- `SOTC_FLIP_SERVICE=1` (experimental, desligado): enquanto a thread de draws espera um quadro
+  livre para apresentar (~20% do tempo dela), ela atende os pedidos das threads do jogo
+  (readbacks, liberar memória) em vez de deixá-los para depois.
+- `SOTC_CP_FLIP_PACE=1` (experimental, desligado): a espera por um quadro livre para apresentar
+  passa da thread de draws para o command processor, antes de enfileirar o flip. A thread de
+  draws não bloqueia mais ali e atende na hora os pedidos das threads do jogo; o FPS é o mesmo.
+  Linha `SOTC CP flip pacing` com `SOTC_FPS=1`.
+- `SOTC_ASYNC_UPLOAD=1` (experimental, desligado): a cópia da CPU de uploads grandes de buffer
+  (a partir de `SOTC_ASYNC_UPLOAD_MIN_KB`, 256) sai da thread de draws e vai para um pool de
+  threads de cópia (`SOTC_ASYNC_UPLOAD_THREADS`, 3); a submissão para a GPU espera as cópias do
+  seu tick. Uma cerca de escrita faz escritas do jogo, unmaps, remapeamentos e a memória liberada
+  esperarem a cópia pendente daqueles bytes, então os dados são os mesmos de antes. Páginas
+  quentes (que ficam sem proteção) e pilhas das threads ficam na thread de draws. Linha
+  `SOTC async upload` com `SOTC_FPS=1`.
+- `SOTC_HOST_IMPORT=1` (experimental, desligado): uploads grandes de buffer (a partir de
+  `SOTC_HOST_IMPORT_MIN_KB`, 256) são copiados pelo motor de cópia da GPU direto da memória do
+  jogo, importada com `VK_EXT_external_memory_host` em pedaços de 64 MiB sob demanda (no máximo
+  `SOTC_HOST_IMPORT_MB`, 512, travados na RAM), em vez de copiados pela CPU. Precisa de uma fila
+  só de transferência; sem ela, sem a extensão ou se o driver recusar a memória, o upload segue
+  pela CPU. Linha `SOTC host import` com `SOTC_FPS=1`.
+- `SOTC_CPUSETS` põe as threads da GPU nos núcleos mais rápidos e, em processadores híbridos
+  (núcleos P/E), os workers de compilação nos núcleos E.
+- Diagnóstico (`SOTC_FPS=1`): linhas `SOTC unmap`, `SOTC FASTBIND`, `SOTC arena tick waits` e o
+  motivo de cada `SOTC SYNC PIPELINE`; `SOTC_CMD_STATS=1` conta os pacotes `SET_PREDICATION`.
+- Arquitetura-alvo e plano de migração: `docs/ARCHITECTURE-TARGET.md`.
+
 ## 0.60.6-C3 — 2026-10-27
 - **Barra de stamina com DLSS (correção da C2):** a área da barra passou a usar a largura de uma
   tela de 1080 linhas na proporção da saída (1080 × L/A) em vez da largura de renderização. Com

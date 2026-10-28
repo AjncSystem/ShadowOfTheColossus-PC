@@ -949,6 +949,12 @@ uint64_t runtime_memory_generation(void) {
     if (runtime_disabled_optimizations & 1) return 1;
     return __atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
 }
+/* sotc: the whole backing view (direct then flexible memory) and its size, for the GPU to import
+ * it in place (SOTC_PC_MEMORY, docs/sotc/MODELO-MEMORIA-PC.md); NULL before the pool exists. */
+const unsigned char *runtime_memory_backing_view(uint64_t *size) {
+    if (size) *size=backing_base ? POOL_SIZE+FLEX_SPAN : 0;
+    return backing_base;
+}
 /* sotc: the GPU reads guest memory through the backing view on every upload; the per-thread
  * region cache spares it the table lock (a winpthread rwlock, slow) and the binary search. */
 const unsigned char *runtime_memory_backing_pointer(uintptr_t address) {

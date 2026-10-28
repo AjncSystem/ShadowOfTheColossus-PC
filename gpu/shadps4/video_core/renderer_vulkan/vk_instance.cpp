@@ -323,7 +323,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 32> enabled_extensions;
+    boost::container::static_vector<const char*, 48> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -361,6 +361,11 @@ bool Instance::CreateDevice() {
     // Optional
     maintenance_5 = add_extension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
     maintenance_8 = add_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+    // sotc: the game's memory imported for the GPU in place (SOTC_PC_MEMORY=1,
+    // docs/sotc/MODELO-MEMORIA-PC.md); asked for only then.
+    if (const char* v = std::getenv("SOTC_PC_MEMORY"); v && v[0] == '1') {
+        external_memory_host = add_extension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    }
     attachment_feedback_loop = add_extension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
     if (attachment_feedback_loop) {
         attachment_feedback_loop =

@@ -30,6 +30,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/sotc_guest_memory.h"
 #include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_shadow_scroll.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -73,6 +74,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
+    SotcGuestMemory::Init(instance); // sotc: SOTC_PC_MEMORY=1 (docs/sotc/MODELO-MEMORIA-PC.md)
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();
@@ -1644,6 +1646,7 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
+    SotcGuestMemory::Ready();
     SotcLodFeedbackCycle();
     buffer_cache.TickFrame();
     texture_cache.ProcessDownloadImages();

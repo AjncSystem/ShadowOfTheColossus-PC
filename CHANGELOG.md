@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.60.6-plus23 — 2026-10-28 (fork Lucas-blip-png)
+- **F8 em rajada não derruba mais o driver da NVIDIA:** alternar a geração de quadros várias vezes seguidas (DLSS-G, FSR 3, desligada, duas vezes em 2 s) fechou o jogo dentro de `nvoglv64.dll` 67 ms depois de o FSR 3 liberar suas imagens. A troca acontece no máximo a cada 1,5 s e os toques extras são ignorados. Visto uma vez; depois da correção, cerca de 40 toques seguidos não derrubaram o jogo.
+- **Diagnóstico `BB_WRITE_LOG=3` (quedas com leitura de `0xffffffffffffffff`, #88 e #325):** guarda, por página de 4 KiB da memória do jogo, as 4 últimas escritas que a GPU fez (readback de buffer, download de imagem, fence). Numa queda, as linhas `Write trace` do relatório listam as que cobrem o cabeçalho do bloco que o jogo leu, marcadas `OVERLAP`. Para ligar, coloque `BB_WRITE_LOG=3` em "Variáveis extras" do lançador; custa uns 7 a 9% de FPS e reserva cerca de 400 MB de memória virtual. Desligado por padrão. Quem enviar o zip de "Relatar problema" depois de uma queda com isso ligado ajuda a achar a causa (relatos de ta955995-cmd e brxzzi).
+- **Conhecido, sem causa ainda:** chão do deserto com ruído colorido e faixas ciano depois de carregar uma área (visto em vídeo no plus22; a demonstração da tela inicial não reproduz). Se acontecer, `SOTC_EXPAND_COPY_STALE=1 SOTC_DMA_OVERLAP=0 SOTC_REUSE_SIZE_CHECK=0` em "Variáveis extras" restauram o cache de texturas anterior ao plus22; diga se o chão volta ao normal.
+- O perfil de PGO não foi retreinado para esta versão.
+
 ## 0.60.6-plus22 — 2026-10-28 (fork Lucas-blip-png)
 - **Notas da atualização em inglês no lançador (#321, pedido de Khimari):** a janela "Procurar atualização" mostra o texto do release no idioma do lançador (seção `## English` do release).
 - **Vazamento de memória do processador de comandos corrigido (PR #2, Lukto02 / Luca Zarecki):** os quadros dos buffers indiretos aninhados (~700 por segundo) nunca eram liberados, cerca de 44 MB por minuto (2,6 GB por hora). Agora são liberados, depois que a thread de desenho termina o trabalho enfileirado deles; `SOTC_CP_FREE_TASKS=0` volta ao antigo. Medido aqui no Santuário parado, 5 min: `main` +31 MB/min, com o PR estável; armadilha de falha do autor (`SOTC_TASK_GUARD=1 SOTC_CP_FREE_NOW=1`) sem falta. Deserto A B B A sem regressão.

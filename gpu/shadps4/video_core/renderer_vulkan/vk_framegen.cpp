@@ -162,6 +162,14 @@ bool Set(Mode mode) {
 }
 
 Mode Cycle() {
+    // sotc: F8 pressed in a burst (DLSS-G -> FSR 3 -> off twice in 2 s) crashed inside the NVIDIA
+    // driver right after FSR 3 FG released its images; one switch per 1.5 s.
+    static auto last_switch = std::chrono::steady_clock::time_point{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_switch < std::chrono::milliseconds(1500)) {
+        return Current();
+    }
+    last_switch = now;
     Mode mode = Current();
     const Mode before = mode;
     for (int i = 0; i < 3; ++i) {

@@ -15,6 +15,10 @@
 - `sotc.py` multiplataforma e com `SOTC_DATA_DIR`; `sotc.sh`; AppImage
   (`packaging/linux/build_appimage.sh`) que pede a pasta do jogo na primeira abertura e acha os
   módulos de som do shadPS4. Opções: `docs/sotc/LINUX.md`.
+- **Lançador na AppImage:** a AppImage abre o mesmo lançador do Windows (FPS, modo PS4 Pro,
+  upscaler, texturas, controles, saves...), com Python e Tk próprios dentro dela, sem instalar
+  nada. Na primeira abertura ele lê o `sotc.ini` que já existir. `--play` joga com os ajustes
+  salvos sem abrir a janela (opções de inicialização da Steam).
 
 ## 0.76.1 — 2026-11-17
 - 🌌 **Linhas tracejadas no céu em placas AMD Radeon corrigidas** (#432, #433): um shader do céu trocava valores entre pixels vizinhos de um jeito que o driver da AMD não garante nas arestas dos triângulos, e desenhava uma grade de linhas sobre o céu (tela de título e jogo). Agora usa operações de quad, que todo driver garante. NVIDIA sem mudança. O cache de shaders é refeito na primeira abertura. `SOTC_QUAD_SWIZZLE=0` volta ao antigo.

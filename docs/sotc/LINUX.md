@@ -3,8 +3,17 @@
 `~/.local/share/sotc-pc/sotc.ini` (AppImage) ou / or `sotc.ini` ao lado do / next to `sotc.py`.
 Uma opção por linha / one option per line, `NOME=valor`; `#` comenta / comments. Variáveis de
 ambiente têm prioridade sobre o arquivo / environment variables take precedence over the file
-(`BB_FULLSCREEN=0 ./SotC-PC-...AppImage`). São as mesmas que o lançador do Windows ajusta / the
-same ones the Windows launcher sets (`launcher/sotc_launcher_win.py`, `game_environment`).
+(`BB_FULLSCREEN=0 ./SotC-PC-...AppImage`). São as mesmas que o lançador ajusta / the same ones the
+launcher sets (`launcher/sotc_launcher_win.py`, `game_environment`).
+
+A AppImage abre o lançador, que guarda os ajustes dele em / The AppImage opens the launcher, which
+keeps its settings in `~/.local/share/sotc-pc/user/launcher_settings.json` e os passa ao jogo por
+cima deste arquivo / and passes them to the game over this file; `--play` joga com eles sem a
+janela / plays with them without the window. Na primeira abertura, o lançador lê o que já estiver
+aqui / On its first start the launcher reads what is already here (`SOTC_GAME_DIR`,
+`SOTC_SYS_MODULES`, `SOTC_DLC_DIR`, `SOTC_USER_DIR`, `BB_FULLSCREEN`, `SOTC_NEO`, `SOTC_MODES`,
+`SOTC_FPS_CAP`/`SOTC_FPS_LIMIT`). Sem tela (terminal, SSH) ou com `--setup`, vale só este arquivo /
+Without a display (terminal, SSH) or with `--setup`, only this file applies.
 
 ## Jogo e arquivos / Game and files
 

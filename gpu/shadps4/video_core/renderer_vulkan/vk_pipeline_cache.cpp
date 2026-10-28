@@ -456,7 +456,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     std::vector<u8> driver_cache_data;
     if (DriverCacheEnabled()) {
         const auto path = DriverCachePath();
-        if (std::FILE* f = _wfopen(path.c_str(), L"rb")) {
+        if (std::FILE* f = Common::FS::OpenCFile(path, Common::FS::FileAccessMode::Read)) {
             std::fseek(f, 0, SEEK_END);
             const long size = std::ftell(f);
             std::fseek(f, 0, SEEK_SET);
@@ -551,7 +551,7 @@ void PipelineCache::SaveDriverCache() {
     const auto path = DriverCachePath();
     auto tmp = path;
     tmp += L".tmp";
-    std::FILE* f = _wfopen(tmp.c_str(), L"wb");
+    std::FILE* f = Common::FS::OpenCFile(tmp, Common::FS::FileAccessMode::Create);
     if (!f) {
         return;
     }

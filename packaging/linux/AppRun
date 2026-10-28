@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Shadow of the Colossus PC (Linux AppImage).
-#   ./SotC-PC-x86_64.AppImage            starts the game (asks for the game folder the first time)
-#   ./SotC-PC-x86_64.AppImage --setup    chooses the game folder and the sound modules again
-# Settings, prepared image, saves and the log of the last run: ~/.local/share/sotc-pc
+#   ./SotC-PC-x86_64.AppImage            the launcher (settings, then Play)
+#   ./SotC-PC-x86_64.AppImage --play     the game with the launcher's settings, no window (Steam)
+#   ./SotC-PC-x86_64.AppImage --setup    without the launcher: chooses the game folder and the sound
+#                                        modules again, kept in sotc.ini (also the start without a display)
+# Settings, prepared image, saves and the logs: ~/.local/share/sotc-pc
 set -uo pipefail
 HERE="$(dirname -- "$(readlink -f -- "$0")")"
 APP="$HERE/usr/share/sotc-pc"
@@ -11,8 +13,21 @@ mkdir -p "$SOTC_DATA_DIR"
 INI="$SOTC_DATA_DIR/sotc.ini"
 LOG="$SOTC_DATA_DIR/last_run.log"
 
-# Host libraries injected into every program (Steam overlay, ...) do not belong in the game.
-unset LD_PRELOAD
+# Host libraries injected into every program (Steam overlay, ...) do not belong in the game, and
+# the host's Python settings not in the bundled Python (build_appimage.sh).
+unset LD_PRELOAD PYTHONHOME PYTHONPATH
+PYTHON="$APP/python/bin/python3"
+# Tcl/Tk's scripts of the bundled Tk, not those of a host Tcl of another version.
+export TCL_LIBRARY="$APP/python/tcl" TK_LIBRARY="$APP/python/tk"
+
+case ${1:-} in
+--setup) ;;
+--play) exec "$PYTHON" "$APP/launcher/sotc_launcher_win.py" "$@" ;;
+*) # Tk draws through X11 (XWayland on a Wayland desktop): without it, the start below.
+   if [[ -n ${DISPLAY:-} ]]; then
+       exec "$PYTHON" "$APP/launcher/sotc_launcher_win.py" "$@"
+   fi ;;
+esac
 
 has() { command -v "$1" >/dev/null 2>&1; }
 say() {   # message to the user: a window when started from the desktop, else the terminal
@@ -34,11 +49,6 @@ ini_set() {  # $1 = name, $2 = value: replaces or appends the line
     printf '%s=%s\n' "$1" "$2" >> "$INI.tmp"
     mv "$INI.tmp" "$INI"
 }
-
-if ! has python3; then
-    say 'Python 3 não encontrado. No Fedora: sudo dnf install python3'
-    exit 1
-fi
 
 setup=0
 if [[ ${1:-} == --setup ]]; then setup=1; shift; fi
@@ -77,7 +87,7 @@ fi
 # Same defaults as the Windows launcher: 16x anisotropic filtering.
 [[ -n "$(ini_get SOTC_MODES)" || -n ${SOTC_MODES:-} ]] || ini_set SOTC_MODES af16
 
-python3 "$APP/sotc.py" "$@" 2>&1 | tee "$LOG"
+"$PYTHON" "$APP/sotc.py" "$@" 2>&1 | tee "$LOG"
 status=${PIPESTATUS[0]}
 if (( status != 0 && status != 130 )) && [[ ! -t 1 ]]; then
     say "O jogo fechou com erro ($status). O registro está em: $LOG"

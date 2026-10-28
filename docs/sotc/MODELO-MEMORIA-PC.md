@@ -54,4 +54,18 @@ final do jogo sem queda (POOL_FIX, guardas de heap e regra do pool intocados).
   RTX 2060 SUPER: `10176 MiB of game memory, 159 chunks ... chunk 0 in 24.2 ms` (tipo de memória
   3), demo a 60 FPS, sem erros. A lista de extensões do dispositivo passou de 32 para 48 lugares
   (33 pedidas).
-- Próximo: etapa 2 (leituras da GPU direto na memória do jogo, fora dos heaps guardados).
+- 27/10: **etapa 2 descartada** (pedido do usuário: o mais seguro, protegendo o final). A guarda
+  dos heaps decide na hora de aplicar quais blocos o jogo acabou de liberar (heaps do mundo crescem
+  em pedaços de 1 MiB, área refeita a cada 250 ms–2 s); uma cópia da GPU direto na memória cai fora
+  desse controle. Ganho também pequeno (~3–5% da thread de desenho; a espera continua).
+- 27/10, medição (`SOTC_RB_STATS=1`, save do usuário, gameplay parado, 60 FPS, Pro + DLSS):
+  leituras de volta por instrução do jogo em ~3 min: `eboot+0x1a6d60` (culling por visibilidade)
+  ~50 mil em `0x109f83…–0x109f8a…`; `eboot+0x101a98` ~22 mil espalhadas em `0x13…`;
+  `eboot+0x937fd` ~2,6 mil em `0x1245620000`. O buffer do culling **não é fixo** (14/10 estava em
+  `0x1078c1…`): é alocado no **pool de páginas de 64 KiB** (`0x10…`–`0x123C…`, o do `POOL_FIX`),
+  não num heap (o heap guardado começa em `0x123c000020`, 150 MB). O pool libera e reaproveita
+  páginas: escrita direta só é segura com o aviso de fim de trabalho honesto.
+- **Nova ordem:** (a) EOP honesto só para o trabalho do culling (risco: lentidão, nenhum dado muda
+  de lugar); (b) depois, escrita direta só nas páginas que o culling usa, conferindo a cada quadro
+  que continuam dele. Tudo desligado por padrão; final do jogo testado pelo usuário antes de virar
+  padrão.

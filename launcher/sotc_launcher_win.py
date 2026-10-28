@@ -2047,7 +2047,7 @@ class Launcher:
         for game in library_games(folders + extra):
             tree.insert('', 'end', iid=game['path'], text='  ' + game['title'],
                         image=self.library_icon(game['icon']) or '',
-                        values=(game['id'], game['version'], game['path']))
+                        values=(game['id'], (game_info(game['path']) or (0, game['version']))[1], game['path']))
             if current and os.path.normcase(game['path']) == os.path.normcase(current):
                 tree.selection_set(game['path'])
         self.library_label.configure(text=_('Pastas da biblioteca: {}', 'Library folders: {}').format(

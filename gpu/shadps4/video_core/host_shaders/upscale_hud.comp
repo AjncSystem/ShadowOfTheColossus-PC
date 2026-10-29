@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// sotc: the FSR 3.1 / DLSS upscaler (vk_fsr3up.cpp) upscales the game frame without its UI layer;
+// this puts the UI back. Where the frame with the UI differs from the frame without it, the
+// upscaled result is replaced by the frame with the UI, bilinear: text and bars come from the
+// current frame only and do not trail behind when the camera turns (the upscaler's history moved
+// them with the scene). Fades and opaque screens (title, loading) differ everywhere and show as
+// the game drew them.
+
+#version 450 core
+
+layout (local_size_x = 8, local_size_y = 8) in;
+
+layout (binding = 0, set = 0) uniform sampler2D with_ui;    // render size
+layout (binding = 1, set = 0) uniform sampler2D without_ui; // render size
+layout (binding = 2, set = 0, rgba16f) uniform image2D upscaled; // output size, in place
+
+layout (push_constant) uniform Params {
+    uvec2 size; // output size
+} pc;
+
+void main() {
+    const uvec2 at = gl_GlobalInvocationID.xy;
+    if (at.x >= pc.size.x || at.y >= pc.size.y) {
+        return;
+    }
+    const vec2 uv = (vec2(at) + 0.5) / vec2(pc.size);
+    const vec3 ui = texture(with_ui, uv).rgb;
+    const vec3 d = abs(ui - texture(without_ui, uv).rgb);
+    const float ui_amount = smoothstep(1.0 / 255.0, 6.0 / 255.0, max(d.r, max(d.g, d.b)));
+    if (ui_amount > 0.0) {
+        const vec4 scene = imageLoad(upscaled, ivec2(at));
+        imageStore(upscaled, ivec2(at), vec4(mix(scene.rgb, ui, ui_amount), scene.a));
+    }
+}

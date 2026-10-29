@@ -34,6 +34,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_dlssg.h"
+#include "video_core/renderer_vulkan/vk_fsr3up.h"
 #include "video_core/renderer_vulkan/vk_shadow_scroll.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -2145,7 +2146,8 @@ bool Rasterizer::BeginHudless(const GraphicsPipeline* pipeline, const RenderStat
     if (!target.image) {
         if (!CreateHudlessImage(instance, hudless_vo_format, hudless_vo_width, hudless_vo_height,
                                 vk::ImageUsageFlagBits::eColorAttachment |
-                                    vk::ImageUsageFlagBits::eSampled,
+                                    vk::ImageUsageFlagBits::eSampled |
+                                    vk::ImageUsageFlagBits::eTransferSrc, // Fsr3Up::Prepare
                                 target.image, target.rt_view, target.allocation)) {
             return false;
         }
@@ -2226,12 +2228,15 @@ bool Rasterizer::BeginHudless(const GraphicsPipeline* pipeline, const RenderStat
     return true;
 }
 
-vk::ImageView Rasterizer::TakeHudless(VAddr address, vk::Format format) {
+vk::ImageView Rasterizer::TakeHudless(VAddr address, vk::Format format, vk::Image* image) {
     const auto it = hudless_images.find(address);
     if (it == hudless_images.end() || !std::exchange(it->second.fresh, false)) {
         return {};
     }
     auto& target = it->second;
+    if (image) {
+        *image = target.image;
+    }
     if (!target.read_view) {
         // As the presenter's view of the video out image: alpha excluded.
         auto [result, view] = instance.GetDevice().createImageView(vk::ImageViewCreateInfo{
@@ -4908,12 +4913,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     // fp16 scene, nothing else. Off unless SOTC_FG_HUDLESS=1: with FSR 3 the generated frames of
     // the title screen (faded logo) and of loading screens (the scene left behind the opaque UI
     // layer shows through) came out wrong, the real frame's UI not put back over them.
+    // The FSR 3.1 / DLSS upscaler takes it as well (Fsr3Up::SplitsUi, SOTC_UPSCALER_HUD=0 off).
     static const bool hudless_on = [] {
         const char* v = std::getenv("SOTC_FG_HUDLESS");
         return v && v[0] == '1';
     }();
-    if (hudless_on && stage.sw_stage == Shader::SwStage::Fragment && num_binds == 2 &&
-        bind_ids[0] && bind_ids[1] && FrameGen::Current() != FrameGen::Mode::Off) {
+    if (stage.sw_stage == Shader::SwStage::Fragment && num_binds == 2 && bind_ids[0] &&
+        bind_ids[1] &&
+        ((hudless_on && FrameGen::Current() != FrameGen::Mode::Off) || Fsr3Up::SplitsUi())) {
         const auto& ui = texture_cache.GetImage(bind_ids[0]);
         const auto& scene = texture_cache.GetImage(bind_ids[1]);
         if (ui.usage.render_target && ui.info.pixel_format == vk::Format::eR8G8B8A8Srgb &&

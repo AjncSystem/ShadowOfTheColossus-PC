@@ -38,8 +38,14 @@ float MipBias();
 /// cannot go through the draw thread's recorded command buffer: the dispatch is on the present
 /// thread.
 /// `swap_red_blue`: the image's red and blue are the other way round for the display.
+/// `hudless_image`: the same frame without its UI (Rasterizer::TakeHudless, same size and layout
+/// ShaderReadOnlyOptimal) or null: the upscaler then gets that one and Dispatch puts the UI back.
 void Prepare(vk::CommandBuffer cmdbuf, u32 frame_id, vk::Image game_image, u32 width, u32 height,
-             bool swap_red_blue);
+             bool swap_red_blue, vk::Image hudless_image);
+
+/// The upscaler is on and takes the frame without its UI when there is one (SOTC_UPSCALER_HUD=0
+/// turns that off: the UI is upscaled with the scene and trails behind it in motion).
+bool SplitsUi();
 
 /// Present thread, `cmdbuf` a real command buffer of `scheduler`: upscales the colour of Prepare
 /// to `out_width` x `out_height`. Returns a view (layout ShaderReadOnlyOptimal) of the result, or

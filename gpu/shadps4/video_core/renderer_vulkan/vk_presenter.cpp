@@ -801,6 +801,12 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     // Continue with host-side passes that draw the displayed (scaled) frame.
 
+    // sotc: the game frame without the HUD (Rasterizer::TakeHudless), for the upscaler and for
+    // frame generation below.
+    vk::Image hudless_image{};
+    const vk::ImageView hudless_view =
+        rasterizer->TakeHudless(cpu_address, view_info.format, &hudless_image);
+
     // sotc: FSR 3.1 temporal upscaler (SOTC_UPSCALER=fsr3): the game image goes to its colour input
     // here; the present thread upscales it (Presenter::Present) over the bilinear frame made below.
     if (Fsr3Up::Wanted()) {
@@ -823,7 +829,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                          vk::to_string(native).c_str(), vk::to_string(view_info.format).c_str());
         }
         Fsr3Up::Prepare(cmdbuf, frame->id, image.GetImage(), image_size.width, image_size.height,
-                        swap);
+                        swap, hudless_image);
     }
 
     // sotc: FSR 1 reads the frame in compute shaders (EASU), not in the fragment shader of the
@@ -857,9 +863,14 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     // sotc: the game frame without the HUD, through the same pass (frame generation keeps the
     // HUD of the real frame instead of interpolating it). Not with FSR 1 scaling, whose images
-    // are a ring meant for one frame each.
-    if (const vk::ImageView hudless_view = rasterizer->TakeHudless(cpu_address, view_info.format);
-        hudless_view && !DebugState.is_using_fsr) {
+    // are a ring meant for one frame each. Only with SOTC_FG_HUDLESS=1 (vk_rasterizer.cpp): the
+    // upscaler alone also has the frame taken.
+    static const bool fg_hudless = [] {
+        const char* v = std::getenv("SOTC_FG_HUDLESS");
+        return v && v[0] == '1';
+    }();
+    if (hudless_view && fg_hudless && FrameGen::Current() != FrameGen::Mode::Off &&
+        !DebugState.is_using_fsr) {
         Frame& hudless = hudless_frames[frame->id];
         if (hudless.width != frame->width || hudless.height != frame->height ||
             hudless.is_hdr != frame->is_hdr || !hudless.image) {

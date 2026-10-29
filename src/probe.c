@@ -594,6 +594,154 @@ static DWORD WINAPI profiler(void *name) {
     fflush(stderr);
     return 0;
 }
+/* sotc: SOTC_PROFILE=*: every thread of the process, from SOTC_PROFILE_DELAY for
+ * SOTC_PROFILE_SECONDS: loading stalls (a new area) had no single thread to blame. Every ~2 ms
+ * each thread that ran since the last look (its cycle count moved) is sampled like the one-thread
+ * profiler (leaf, then callers through the unwind tables); idle threads cost nothing. The report
+ * lists the threads by busy samples with their kernel and user time, then the hottest frames of
+ * the busiest; SOTC_PROFILE_OUT gets every (thread, address, leaf, inclusive) line for offline
+ * symbolization. Guest threads have no description: SOTC_THREAD_IDS=1 logs their host ids. */
+#define ALL_MAX_THREADS 192
+#define ALL_SLOTS (1u<<18)
+typedef struct { uint32_t thread; uintptr_t address; unsigned leaf, inclusive; } AllSlot;
+typedef struct {
+    DWORD tid; HANDLE handle; char name[64]; ULONG64 cycles; unsigned busy;
+    FILETIME kernel0, user0, kernel1, user1;
+} AllThread;
+static AllSlot *all_slots;
+static AllThread all_threads[ALL_MAX_THREADS];
+static void all_add(uint32_t thread, uintptr_t address, int leaf) {
+    size_t i=((address*0x9E3779B97F4A7C15ull)^((uint64_t)(thread+1)*0xC2B2AE3D27D4EB4Full))>>46;
+    for (size_t n=0;n<ALL_SLOTS;++n,i=(i+1)&(ALL_SLOTS-1)) {
+        AllSlot *s=&all_slots[i];
+        if (!s->address) { s->address=address; s->thread=thread; }
+        if (s->address==address && s->thread==thread) { if (leaf) ++s->leaf; ++s->inclusive; return; }
+    }
+}
+static int all_by_busy(const void *a, const void *b) {
+    return (int)all_threads[*(const uint32_t *)b].busy-(int)all_threads[*(const uint32_t *)a].busy;
+}
+static int all_by_inclusive(const void *a, const void *b) {
+    return (int)((const AllSlot *)b)->inclusive-(int)((const AllSlot *)a)->inclusive;
+}
+static double filetime_ms(FILETIME a, FILETIME b) {
+    const ULONGLONG x=((ULONGLONG)a.dwHighDateTime<<32)|a.dwLowDateTime;
+    const ULONGLONG y=((ULONGLONG)b.dwHighDateTime<<32)|b.dwLowDateTime;
+    return (double)(y-x)/10000.0;
+}
+static DWORD WINAPI profiler_all(void *unused) {
+    (void)unused;
+    typedef HRESULT (WINAPI *Describe)(HANDLE, PWSTR *);
+    Describe describe=(Describe)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"),"GetThreadDescription");
+    const char *delay=getenv("SOTC_PROFILE_DELAY"), *seconds=getenv("SOTC_PROFILE_SECONDS");
+    Sleep((delay ? atoi(delay) : 20)*1000);
+    all_slots=calloc(ALL_SLOTS,sizeof(*all_slots));
+    if (!all_slots) return 0;
+    uint32_t count=0;
+    HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
+    THREADENTRY32 te={.dwSize=sizeof(te)};
+    for (BOOL ok=Thread32First(snapshot,&te); ok && count<ALL_MAX_THREADS; ok=Thread32Next(snapshot,&te)) {
+        if (te.th32OwnerProcessID!=GetCurrentProcessId() || te.th32ThreadID==GetCurrentThreadId()) continue;
+        HANDLE h=OpenThread(THREAD_SUSPEND_RESUME|THREAD_GET_CONTEXT|THREAD_QUERY_INFORMATION,FALSE,te.th32ThreadID);
+        if (!h) continue;
+        AllThread *t=&all_threads[count++];
+        t->tid=te.th32ThreadID;
+        t->handle=h;
+        PWSTR text=NULL;
+        if (describe && SUCCEEDED(describe(h,&text)) && text) {
+            WideCharToMultiByte(CP_UTF8,0,text,-1,t->name,sizeof(t->name),NULL,NULL);
+            LocalFree(text);
+        }
+        QueryThreadCycleTime(h,&t->cycles);
+        FILETIME created,exited;
+        GetThreadTimes(h,&created,&exited,&t->kernel0,&t->user0);
+    }
+    CloseHandle(snapshot);
+    const ULONGLONG end=GetTickCount64()+(ULONGLONG)(seconds ? atoi(seconds) : 10)*1000;
+    unsigned rounds=0;
+    timeBeginPeriod(1);
+    while (GetTickCount64()<end) {
+        ++rounds;
+        for (uint32_t i=0;i<count;++i) {
+            AllThread *t=&all_threads[i];
+            ULONG64 cycles;
+            if (!QueryThreadCycleTime(t->handle,&cycles) || cycles==t->cycles) continue;
+            t->cycles=cycles;
+            if (SuspendThread(t->handle)==(DWORD)-1) continue;
+            CONTEXT c={.ContextFlags=CONTEXT_CONTROL|CONTEXT_INTEGER};
+            if (GetThreadContext(t->handle,&c)) {
+                ++t->busy;
+                all_add(i,(uintptr_t)c.Rip,1);
+                /* As the one-thread profiler: a bad unwind resumes here instead of ending the game. */
+                sigjmp_buf unwind_recover;
+                volatile int depth=0;
+                if (sigsetjmp(unwind_recover,0)) depth=24;
+                else runtime_fault_recover=&unwind_recover;
+                for (; depth<24; ++depth) {
+                    DWORD64 base=0;
+                    PRUNTIME_FUNCTION fn=RtlLookupFunctionEntry(c.Rip,&base,NULL);
+                    if (fn) {
+                        PVOID handler_data=NULL; DWORD64 establisher=0;
+                        RtlVirtualUnwind(UNW_FLAG_NHANDLER,base,c.Rip,fn,&c,&handler_data,&establisher,NULL);
+                    } else {
+                        uintptr_t ret;
+                        if (!read_word((uintptr_t)c.Rsp,&ret)) break;
+                        c.Rip=ret; c.Rsp+=8;
+                    }
+                    if (!c.Rip) break;
+                    all_add(i,(uintptr_t)c.Rip,0);
+                }
+                runtime_fault_recover=NULL;
+            }
+            ResumeThread(t->handle);
+        }
+        Sleep(2);
+    }
+    timeEndPeriod(1);
+    uint32_t order[ALL_MAX_THREADS];
+    for (uint32_t i=0;i<count;++i) {
+        FILETIME created,exited;
+        GetThreadTimes(all_threads[i].handle,&created,&exited,&all_threads[i].kernel1,&all_threads[i].user1);
+        order[i]=i;
+    }
+    qsort(order,count,sizeof(*order),all_by_busy);
+    char where[MAX_PATH+64];
+    fprintf(stderr,"SOTC profile of all %u threads: %u rounds\n",count,rounds);
+    for (uint32_t r=0;r<count && r<30 && all_threads[order[r]].busy;++r) {
+        const AllThread *t=&all_threads[order[r]];
+        fprintf(stderr,"  %6u busy  kernel %7.0f ms  user %7.0f ms  tid %5lu  '%s'\n",t->busy,
+                filetime_ms(t->kernel0,t->kernel1),filetime_ms(t->user0,t->user1),t->tid,t->name);
+    }
+    /* The hottest frames (leaf and callers) of the busiest threads. */
+    AllSlot *mine=calloc(4096,sizeof(*mine));
+    for (uint32_t r=0;mine && r<count && r<8 && all_threads[order[r]].busy;++r) {
+        size_t n=0;
+        for (size_t s=0;s<ALL_SLOTS && n<4096;++s)
+            if (all_slots[s].address && all_slots[s].thread==order[r]) mine[n++]=all_slots[s];
+        qsort(mine,n,sizeof(*mine),all_by_inclusive);
+        const AllThread *t=&all_threads[order[r]];
+        fprintf(stderr,"  thread %lu '%s' (%u busy):\n",t->tid,t->name,t->busy);
+        for (size_t s=0;s<n && s<14;++s) {
+            describe_address(where,sizeof(where),mine[s].address);
+            fprintf(stderr,"    %5.1f%% incl %5.1f%% leaf %s\n",100.0*mine[s].inclusive/t->busy,
+                    100.0*mine[s].leaf/t->busy,where);
+        }
+    }
+    free(mine);
+    if (getenv("SOTC_PROFILE_OUT")) {
+        FILE *out=fopen(getenv("SOTC_PROFILE_OUT"),"w");
+        for (uint32_t i=0;out && i<count;++i)
+            fprintf(out,"thread %lu %u %s\n",all_threads[i].tid,all_threads[i].busy,all_threads[i].name);
+        for (size_t s=0;out && s<ALL_SLOTS;++s) {
+            if (!all_slots[s].address) continue;
+            describe_address(where,sizeof(where),all_slots[s].address);
+            fprintf(out,"%lu %s %u %u\n",all_threads[all_slots[s].thread].tid,where,all_slots[s].leaf,all_slots[s].inclusive);
+        }
+        if (out) fclose(out);
+    }
+    fflush(stderr);
+    return 0;
+}
 static DWORD WINAPI stacks_watcher(void *path) {
     for (;;) {
         Sleep(500);
@@ -1264,7 +1412,9 @@ int main(int argc, char **argv) {
     AddVectoredExceptionHandler(1, vectored_fault);
     if (getenv("BB_FAULT_RING")) fault_ring_open(getenv("BB_FAULT_RING"));
     if (getenv("BB_STACKS_TRIGGER")) CreateThread(NULL,0,stacks_watcher,(void *)getenv("BB_STACKS_TRIGGER"),0,NULL);
-    if (getenv("SOTC_PROFILE")) CreateThread(NULL,0,profiler,(void *)getenv("SOTC_PROFILE"),0,NULL);
+    if (getenv("SOTC_PROFILE"))
+        CreateThread(NULL,0,strcmp(getenv("SOTC_PROFILE"),"*") ? profiler : profiler_all,
+                     (void *)getenv("SOTC_PROFILE"),0,NULL);
     SetUnhandledExceptionFilter(unhandled_fault);
     if (getenv("BB_STRICT_HANDLES")) {
         PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY strict={0};

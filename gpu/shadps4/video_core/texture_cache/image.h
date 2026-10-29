@@ -189,6 +189,9 @@ public:
     u64 sotc_shadow_saving{};
     /// sotc: F9: the next upload reads guest memory itself, not the buffer cache's GPU copy.
     bool sotc_upload_from_guest{};
+    /// sotc: the upload budget (RefreshImage): guest data uploaded once / zeros put in meanwhile.
+    bool sotc_has_data{};
+    bool sotc_zero_filled{};
     /// sotc: SOTC_POOL_WATCH: hash of the first 64 KiB of guest memory at the first upload.
     u64 sotc_first_hash{};
     u32 sotc_uploads{};

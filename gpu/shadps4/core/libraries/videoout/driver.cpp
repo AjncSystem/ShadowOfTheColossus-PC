@@ -281,6 +281,14 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
 
 // sotc: src/runtime_memory.c, live view splits since the last call.
 extern "C" uint64_t runtime_memory_carve_splits(void);
+extern "C" void runtime_memory_lock_stats(uint64_t* writes, double* wait_ms, double* hold_ms,
+                                          double* worst_ms);
+extern "C" void runtime_memory_lock_stats2(double* worst_hold_ms, uint64_t* read_waits,
+                                           double* read_wait_ms);
+extern "C" void runtime_memory_carve_stats(uint64_t* mib, uint64_t* runs, double* split_ms,
+                                           double* worst_ms, double* other_ms);
+extern "C" void runtime_memory_lock_sites(char* readers, char* writers, size_t capacity);
+extern "C" void runtime_memory_cache_stats(uint64_t* misses, uint64_t* stale, uint64_t* fast);
 // sotc: src/runtime_file.c, guest file read time since the last call.
 extern "C" uint64_t runtime_file_read_ns_take(void);
 
@@ -534,6 +542,10 @@ void VideoOutDriver::Flip(const Request& req) {
             ReportPrintf(report, "SOTC readback finish: %llu for bytes the guest asked\n",
                          static_cast<unsigned long long>(
                              SotcStats::readback_finish_asked.exchange(0)));
+            if (const u64 streamed = SotcStats::rb_stream_windows.exchange(0)) {
+                ReportPrintf(report, "SOTC readback stream windows: %llu\n",
+                             static_cast<unsigned long long>(streamed));
+            }
             static uint64_t last_images_new = 0;
             const uint64_t images_new = SotcStats::images_new.load();
             ReportPrintf(report,
@@ -619,6 +631,71 @@ void VideoOutDriver::Flip(const Request& req) {
             const uint64_t grace_bytes = SotcStats::fault_grace_hot_upload_bytes.exchange(0);
             const uint64_t reg_spins = SotcStats::stack_reg_spins.exchange(0);
             const uint64_t carves = runtime_memory_carve_splits();
+            {
+                // sotc: the guest memory table's writers (maps, unmaps, protection changes)
+                uint64_t writes = 0;
+                double wait_ms = 0, hold_ms = 0, worst_ms = 0;
+                runtime_memory_lock_stats(&writes, &wait_ms, &hold_ms, &worst_ms);
+                double worst_hold_ms = 0, read_wait_ms = 0, split_ms = 0, split_worst_ms = 0,
+                       other_ms = 0;
+                uint64_t read_waits = 0, split_mib = 0, split_runs = 0;
+                runtime_memory_lock_stats2(&worst_hold_ms, &read_waits, &read_wait_ms);
+                runtime_memory_carve_stats(&split_mib, &split_runs, &split_ms, &split_worst_ms,
+                                           &other_ms);
+                if (writes) {
+                    ReportPrintf(report,
+                                 "SOTC memory lock: %llu writes, writers waited %.1f ms (worst "
+                                 "%.1f), held %.1f ms (worst %.1f); readers waited %llu times, "
+                                 "%.1f ms; view splits remapped %llu MiB, %llu protection runs, "
+                                 "%.1f ms (worst %.1f), other carves %.1f ms\n",
+                                 static_cast<unsigned long long>(writes), wait_ms, worst_ms,
+                                 hold_ms, worst_hold_ms,
+                                 static_cast<unsigned long long>(read_waits), read_wait_ms,
+                                 static_cast<unsigned long long>(split_mib),
+                                 static_cast<unsigned long long>(split_runs), split_ms,
+                                 split_worst_ms, other_ms);
+                    char readers[512], writers[512];
+                    runtime_memory_lock_sites(readers, writers, sizeof(readers));
+                    uint64_t misses = 0, stale = 0;
+                    uint64_t fast = 0;
+                    runtime_memory_cache_stats(&misses, &stale, &fast);
+                    ReportPrintf(report,
+                                 "SOTC memory lock sites: readers waited in %s; held in %s; "
+                                 "region cache misses %llu, stale %llu, read without the lock "
+                                 "%llu\n",
+                                 readers[0] ? readers : "-", writers[0] ? writers : "-",
+                                 static_cast<unsigned long long>(misses),
+                                 static_cast<unsigned long long>(stale),
+                                 static_cast<unsigned long long>(fast));
+                }
+            }
+            if (const uint64_t deferred = SotcStats::upload_deferred.exchange(0)) {
+                // sotc: first texture uploads put off by the per-frame budget (texture_cache.cpp)
+                ReportPrintf(report,
+                             "SOTC upload budget: %llu first uploads put off (%llu MiB), %llu "
+                             "images filled with zeros meanwhile\n",
+                             static_cast<unsigned long long>(deferred),
+                             static_cast<unsigned long long>(
+                                 SotcStats::upload_deferred_bytes.exchange(0) >> 20),
+                             static_cast<unsigned long long>(
+                                 SotcStats::upload_zero_filled.exchange(0)));
+            }
+            if (const uint64_t guard_ns = SotcStats::heap_guard_ns.exchange(0)) {
+                // sotc: the BPE heap guard's free-tree walks (bpe_heap_guard.cpp), this window
+                ReportPrintf(report,
+                             "SOTC heap guard walks: %.1f ms (slowest %.1f ms: %llu free blocks "
+                             "from %llu visits); repeats skipped %llu; writes vouched by the "
+                             "previous guard %llu\n",
+                             guard_ns / 1e6, SotcStats::heap_guard_worst_ns.exchange(0) / 1e6,
+                             static_cast<unsigned long long>(
+                                 SotcStats::heap_guard_worst_blocks.exchange(0)),
+                             static_cast<unsigned long long>(
+                                 SotcStats::heap_guard_worst_adds.exchange(0)),
+                             static_cast<unsigned long long>(
+                                 SotcStats::heap_guard_repeats.exchange(0)),
+                             static_cast<unsigned long long>(
+                                 SotcStats::heap_guard_stale_hits.exchange(0)));
+            }
             if (grace_marks || grace_caps || grace_bytes || reg_spins || carves) {
                 ReportPrintf(report,
                              "SOTC fault grace: marks %llu, cap hits %llu, hot uploads %llu KiB; "

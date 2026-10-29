@@ -72,6 +72,15 @@ inline std::atomic<uint64_t> readback_ahead{0};   ///< downloads of already subm
 inline std::atomic<uint64_t> readback_finish{0};  ///< downloads that flushed the current work
 inline std::atomic<uint64_t> readback_finish_asked{0}; ///< ... for bytes the guest itself asked
 inline std::atomic<uint64_t> heap_guard_builds{0}; ///< readbacks into the BPE heap
+inline std::atomic<uint64_t> heap_guard_stale_hits{0}; ///< writes the previous guard vouched for
+inline std::atomic<uint64_t> upload_deferred{0};        ///< first uploads put off to a later frame
+inline std::atomic<uint64_t> upload_deferred_bytes{0};
+inline std::atomic<uint64_t> upload_zero_filled{0};     ///< ... images filled with zeros meanwhile
+inline std::atomic<uint64_t> heap_guard_ns{0};        ///< time of the guard builds (free-tree walks)
+inline std::atomic<uint64_t> heap_guard_worst_ns{0};
+inline std::atomic<uint64_t> heap_guard_worst_blocks{0}; ///< free blocks of the slowest build
+inline std::atomic<uint64_t> heap_guard_worst_adds{0};   ///< ... and the visits it made
+inline std::atomic<uint64_t> heap_guard_repeats{0};      ///< nodes and ring members seen again, skipped
 inline std::atomic<uint64_t> readback_copies{0};          ///< ranges downloaded
 inline std::atomic<uint64_t> readback_copies_changed{0};  ///< ... whose bytes differed from memory
 inline std::atomic<uint64_t> readback_bytes{0};
@@ -79,6 +88,8 @@ inline std::atomic<uint64_t> readback_bytes_changed{0};
 /// SOTC_RB_NARROW: readback window (KiB, 0 = off), GPU-modified bytes of the 512 KiB window left
 /// outside the narrow one (not downloaded nor unprotected), live hot readbacks (gauge).
 inline std::atomic<uint64_t> rb_narrow_kib{0}, rb_narrow_kept_bytes{0}, rb_hot_entries{0};
+/// sotc: readbacks with a streaming window (SOTC_RB_STREAM, BufferCache::ReadMemory)
+inline std::atomic<uint64_t> rb_stream_windows{0};
 inline std::atomic<uint64_t> uploads{0};        ///< SynchronizeMemory copies (CPU data to GPU)
 /// DMA sweeps (SynchronizeDmaBuffers): count, resident ranges visited, sweeps that uploaded.
 inline std::atomic<uint64_t> dma_sweeps{0}, dma_sweep_ranges{0}, dma_sweep_uploading{0};

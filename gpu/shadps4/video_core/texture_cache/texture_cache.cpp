@@ -29,6 +29,7 @@
 #include "video_core/texture_cache/host_compatibility.h"
 
 #include <vk_mem_alloc.h>
+#include <vulkan/vulkan_format_traits.hpp>
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/sotc_event.h"
 #include "video_core/sotc_lod_stats.h"
@@ -1151,6 +1152,62 @@ void TextureCache::RefreshImage(Image& image) {
         image.flags &= ~ImageFlagBits::Dirty;
         return;
     }
+
+    // sotc: SOTC_UPLOAD_BUDGET_MB (default 32, 0 = off). Entering a new area, the game binds about
+    // 100 MB of new textures in one frame and that frame took 80-130 ms to upload them. Past the
+    // budget, the first upload of a big colour texture waits for a later frame (the first upload
+    // of each frame always goes through); meanwhile the image holds zeros, put in on the GPU once,
+    // so it shows black, never stale memory, and it stays Dirty for the next use.
+    static const u64 upload_budget = [] {
+        const char* v = std::getenv("SOTC_UPLOAD_BUDGET_MB");
+        return (v ? std::strtoull(v, nullptr, 10) : 32ull) << 20;
+    }();
+    static u64 budget_flip = ~0ull, budget_used = 0;
+    if (upload_budget) {
+        const u64 flip = SotcStats::flip_count.load(std::memory_order_relaxed);
+        if (flip != budget_flip) {
+            budget_flip = flip;
+            budget_used = 0;
+        }
+    }
+    if (upload_budget && !image.sotc_has_data && !is_gpu_modified && budget_used &&
+        image.info.guest_size >= 256_KB && budget_used + image.info.guest_size > upload_budget &&
+        image.aspect_mask == vk::ImageAspectFlagBits::eColor) {
+        constexpr u64 ZeroBytes = 64_MB;
+        bool fits = true;
+        auto zero_copies = image_copies;
+        for (auto& copy : zero_copies) {
+            copy.bufferOffset = 0;
+            copy.bufferRowLength = 0;
+            copy.bufferImageHeight = 0;
+            const auto block = vk::blockExtent(image.info.pixel_format);
+            const u64 rows = Common::DivCeil(copy.imageExtent.height, block[1]);
+            const u64 row_bytes =
+                Common::DivCeil(copy.imageExtent.width, block[0]) * vk::blockSize(image.info.pixel_format);
+            fits &= rows * row_bytes * copy.imageExtent.depth * copy.imageSubresource.layerCount <=
+                    ZeroBytes;
+        }
+        if (fits) {
+            if (!image.sotc_zero_filled) {
+                static std::unique_ptr<Buffer> zeros;
+                if (!zeros) {
+                    zeros = std::make_unique<Buffer>(instance, 0, ZeroBytes, MemoryType::DeviceLocal,
+                                                     "SOTC zero texels");
+                    runtime.FillBuffer(zeros.get(), 0, ZeroBytes, 0);
+                }
+                runtime.UploadImage(&image, zeros.get(), zero_copies);
+                image.flags |= ImageFlagBits::Dirty;
+                image.sotc_zero_filled = true;
+                SotcStats::upload_zero_filled.fetch_add(1, std::memory_order_relaxed);
+            }
+            SotcStats::upload_deferred.fetch_add(1, std::memory_order_relaxed);
+            SotcStats::upload_deferred_bytes.fetch_add(image.info.guest_size,
+                                                       std::memory_order_relaxed);
+            return;
+        }
+    }
+    image.sotc_has_data = true;
+    budget_used += image.info.guest_size;
 
     scheduler.EndRendering();
 

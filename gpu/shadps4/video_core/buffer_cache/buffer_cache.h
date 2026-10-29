@@ -295,7 +295,10 @@ private:
 
     /// sotc: the range [first, second) of the arena that a readback of [device_addr, +size)
     /// downloads and unmarks as GPU-modified: 512 KiB around it, smaller with SOTC_RB_NARROW.
-    std::pair<VAddr, VAddr> ReadbackWindow(const Buffer* arena, VAddr device_addr, u64 size);
+    /// sotc: stream: a larger window for a guest thread reading GPU-written memory in sequence
+    /// (SOTC_RB_STREAM, ReadMemory), 0 for the usual one.
+    std::pair<VAddr, VAddr> ReadbackWindow(const Buffer* arena, VAddr device_addr, u64 size,
+                                           u64 stream = 0);
 
     /// One range to read back: its GPU-modified parts, as copies from the arena.
     struct ReadbackItem {
@@ -339,6 +342,7 @@ private:
     struct AsyncReadback {
         VAddr device_addr{};
         u64 size{};
+        u64 stream{}; ///< sotc: ReadbackWindow's stream size (SOTC_RB_STREAM), 0 none
         bool is_write{};
         bool waiting{};
         bool dirty{};

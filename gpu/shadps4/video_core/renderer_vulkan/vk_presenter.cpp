@@ -414,6 +414,25 @@ static bool WritePng(const std::filesystem::path& path, const std::span<const u8
     return stbi_write_png_to_func(callback, &file, width, height, 4, rgba.data(), 0);
 }
 
+// sotc: SOTC_SHOT_SEQ=<file>: when the file appears it is removed and the next 12 presents, game
+// and generated frames alike, are saved as "hud" screenshots in the order they reach the screen
+// (checking frame generation's motion and pacing). Presenter thread only.
+static bool TakeSequenceShot() {
+    static const char* trigger = std::getenv("SOTC_SHOT_SEQ");
+    static int left = 0;
+    if (!trigger) {
+        return false;
+    }
+    if (left == 0 && std::remove(trigger) == 0) {
+        left = 12;
+    }
+    if (left == 0) {
+        return false;
+    }
+    --left;
+    return true;
+}
+
 static void SavePendingScreenshot(const ScreenshotReadback& readback) {
     if (readback.paths.empty()) {
         return;
@@ -510,6 +529,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
         static_cast<float>(EmulatorSettings.GetRcasAttenuation() / 1000.f);
 
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
+    fsr_pass_hudless.Create(device, instance.GetAllocator(), num_images);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
 
     // sotc: the pipeline cache is read here, once frames can be presented, and blank frames with
@@ -806,8 +826,24 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // sotc: DLSS super resolution (SOTC_UPSCALER=dlss): the game's scene before its UI, upscaled
     // to the frame's size; the post process pass puts the UI layer back over it. Frames without
     // that scene (menus, loading screens) are presented as before.
-    const auto upscaled = Dlssg::Upscale(frame->id, draw_scheduler, texture_cache, runtime,
-                                         frame->width, frame->height);
+    auto upscaled = Dlssg::Upscale(frame->id, draw_scheduler, texture_cache, runtime,
+                                   frame->width, frame->height);
+    // sotc: a buffer flipped again right after itself (PS4 Pro mode at the 30 FPS cap flips each
+    // rendered frame twice) has nothing new drawn: no composite, no DLSS inputs. That repeat went
+    // out without DLSS and without the vignette (taken out of the game's tonemap to be applied
+    // after upscaling): every other present lost both and the picture shook, the edges most
+    // (27 Oct). It shows the last DLSS output again. SOTC_DLSS_REPEAT=0: as before.
+    static const bool dlss_repeat = [] {
+        const char* v = std::getenv("SOTC_DLSS_REPEAT");
+        return !v || v[0] != '0';
+    }();
+    static Dlssg::Upscaled dlss_last{};
+    static VAddr dlss_last_address = 0;
+    if (!upscaled.scene && dlss_repeat && dlss_last.scene && cpu_address == dlss_last_address) {
+        upscaled = dlss_last;
+    }
+    dlss_last = upscaled.scene && !upscaled.scene_low ? upscaled : Dlssg::Upscaled{};
+    dlss_last_address = cpu_address;
     if (Dlssg::SuperResolutionAvailable() && Dlssg::CompareMode()) {
         BbOverlay::SetUpscalerLabel(upscaled.scene && !upscaled.scene_low ? Dlssg::ModeName()
                                     : fsr_settings.enable                 ? "FSR1"
@@ -890,11 +926,12 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     }
 
     // sotc: the game frame without the HUD, through the same pass (frame generation keeps the
-    // HUD of the real frame instead of interpolating it). Not with FSR 1 scaling, whose images
-    // are a ring meant for one frame each. With DLSS super resolution the DLSS output is the
-    // frame without its HUD (the UI layer is only put over it here), so it is used instead.
-    if (const vk::ImageView hudless_view = rasterizer->TakeHudless(cpu_address, view_info.format);
-        hudless_view && (upscaled_scene || !DebugState.is_using_fsr)) {
+    // HUD of the real frame instead of interpolating it). With FSR 1 it goes through its own FSR
+    // pass, the game frame's images being a ring meant for one frame each: skipping it left the
+    // HUD interpolated with FSR 1 on (letters shook, 27 Oct). With DLSS super resolution the DLSS
+    // output is the frame without its HUD (the UI layer is only put over it here), so it is used
+    // instead.
+    if (const vk::ImageView hudless_view = rasterizer->TakeHudless(cpu_address, view_info.format)) {
         Frame& hudless = hudless_frames[frame->id];
         if (hudless.width != frame->width || hudless.height != frame->height ||
             hudless.is_hdr != frame->is_hdr || !hudless.image) {
@@ -912,11 +949,48 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             pp_pass.Render(cmdbuf, upscaled_scene, {frame->width, frame->height}, hudless,
                            scene_only, upscaled.ui, upscaled.sky);
         } else {
-            pp_pass.Render(cmdbuf, hudless_view, image_size, hudless, pp_settings);
+            const vk::ImageView scaled =
+                fsr_pass_hudless.Render(cmdbuf, hudless_view, image_size,
+                                        {frame->width, frame->height}, fsr_settings, frame->is_hdr);
+            pp_pass.Render(cmdbuf, scaled, image_size, hudless, pp_settings);
         }
         frame->hudless = &hudless;
         Dlssg::NoteHudless(frame->id, hudless.image, hudless.image_view,
                            swapchain.GetSurfaceFormat().format, hudless.width, hudless.height);
+        // sotc: SOTC_SHOT_HUDLESS=<file>: when the file appears it is removed and this game frame
+        // is saved twice, as shown and without the HUD (two "hud" screenshots, in that order):
+        // checking what frame generation reads as the HUD.
+        static const char* shot_hudless = std::getenv("SOTC_SHOT_HUDLESS");
+        if (shot_hudless && std::remove(shot_hudless) == 0) {
+            for (const vk::Image source : {frame->image, hudless.image}) {
+                auto readback = std::make_shared<ScreenshotReadback>(
+                    instance, ScreenshotKind::WithOverlays,
+                    BuildScreenshotPaths(ScreenshotKind::WithOverlays, 1), frame->width,
+                    frame->height, swapchain.GetSurfaceFormat().format, false);
+                const auto to = [&](vk::ImageLayout from, vk::ImageLayout layout) {
+                    const vk::ImageMemoryBarrier2 barrier{
+                        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+                        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+                        .dstAccessMask =
+                            vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+                        .oldLayout = from,
+                        .newLayout = layout,
+                        .image = source,
+                        .subresourceRange{frame_subresources}};
+                    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                        .imageMemoryBarrierCount = 1,
+                        .pImageMemoryBarriers = &barrier,
+                    });
+                };
+                to(vk::ImageLayout::eGeneral, vk::ImageLayout::eTransferSrcOptimal);
+                CopyImageToReadback(cmdbuf, source, vk::ImageLayout::eTransferSrcOptimal,
+                                    *readback);
+                to(vk::ImageLayout::eTransferSrcOptimal, vk::ImageLayout::eGeneral);
+                draw_scheduler.DeferPriorityOperation(
+                    [readback] { SavePendingScreenshot(*readback); });
+            }
+        }
     }
 
 
@@ -1145,7 +1219,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
     auto& scheduler = present_scheduler;
     const auto cmdbuf = scheduler.CommandBuffer();
-    const u32 capture_with_overlays_count = VideoCore::ConsumeWithOverlaysScreenshotRequests();
+    const u32 capture_with_overlays_count =
+        VideoCore::ConsumeWithOverlaysScreenshotRequests() + (TakeSequenceShot() ? 1 : 0);
     std::optional<ScreenshotReadback> pending_screenshot;
 
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
@@ -1646,7 +1721,7 @@ bool Presenter::PresentGenerated(Frame* frame) {
     // generation (BB_FRAME_DUMP_TRIGGER saves the game frames).
     static const char* shot_generated = std::getenv("SOTC_SHOT_GENERATED");
     std::optional<ScreenshotReadback> pending_screenshot;
-    if (shot_generated && std::remove(shot_generated) == 0) {
+    if ((shot_generated && std::remove(shot_generated) == 0) || TakeSequenceShot()) {
         auto& readback = pending_screenshot.emplace(
             instance, ScreenshotKind::WithOverlays,
             BuildScreenshotPaths(ScreenshotKind::WithOverlays, 1), extent.width, extent.height,
@@ -1740,6 +1815,7 @@ void Presenter::WaitFreeFrame() {
 }
 
 Frame* Presenter::GetRenderFrame() {
+    const SotcStats::SplitTimer frame_split{SotcStats::SplitWaitFrame};
     // Wait for free presentation frames
     Frame* frame;
     {

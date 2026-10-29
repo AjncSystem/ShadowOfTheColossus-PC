@@ -43,7 +43,9 @@ static bool SrtPhiDisabled() {
 // 40/138: the cache now takes loose files newer than the pack (cache_storage.cpp), which brought
 // back binaries written by older recompiler builds under the same number (wrong vertices, dark
 // trees): everything is translated again once.
-static const u32 ShaderBinaryVersion = (Shader::LodFeedbackEnabled() ? 40u : 138u) +
+// 41 (from 40): early fragment tests on the LOD feedback shaders (emit_spirv.cpp, upstream
+// 0.70's 38); the non-feedback binaries are unchanged.
+static const u32 ShaderBinaryVersion = (Shader::LodFeedbackEnabled() ? 41u : 138u) +
                                        (Shader::StageBindingsEnabled() ? 1000u : 0u) +
                                        (BindlessSamplersRequested() ? 2000u : 0u) +
                                        (SrtPhiDisabled() ? 4000u : 0u);

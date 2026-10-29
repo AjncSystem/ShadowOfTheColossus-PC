@@ -30,6 +30,7 @@
 #include "video_core/texture_cache/host_compatibility.h"
 
 #include <vk_mem_alloc.h>
+#include <vulkan/vulkan_format_traits.hpp>
 #include "video_core/texture_cache/texture_cache.h"
 #include "video_core/sotc_event.h"
 #include "video_core/sotc_lod_stats.h"
@@ -763,6 +764,11 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     // SOTC_EXPAND_COPY_STALE=1: always copy, as before (A/B tests).
     static const bool copy_stale = std::getenv("SOTC_EXPAND_COPY_STALE") != nullptr;
     const bool src_has_gpu_data = copy_stale || src_image.SafeToDownload();
+    // sotc: SOTC_UPLOAD_BUDGET_MB must not defer this upload: CopyImage below clears Dirty, so a
+    // deferred (zero-filled) image would keep zeros outside the copied part for good.
+    if (src_has_gpu_data) {
+        new_image.sotc_has_data = true;
+    }
     RefreshImage(new_image);
     if (src_has_gpu_data) {
         runtime.CopyImage(&src_image, &new_image);
@@ -1224,6 +1230,7 @@ void TextureCache::RefreshImage(Image& image) {
     // sotc: SOTC_TRACE: a = guest address, kept when over 20 us
     const SotcTrace::ScopeMin trace_refresh{"image upload", image.info.guest_address};
     const SotcStats::FrameTimer frame_timer{SotcStats::FrameUpload};
+    const SotcStats::SplitTimer refresh_split{SotcStats::SplitTexRefresh};
     // sotc: RefreshImage always runs under `mutex` (UpdateImage, FindImage -> ExpandImage) and can
     // reach EnsureResident through ObtainBufferForImage; see TryEmergencyCollect.
     ++refresh_depth;
@@ -1261,6 +1268,7 @@ void TextureCache::RefreshImage(Image& image) {
         const size_t size = image.info.guest_size;
         const u64 hash = [&] {
             const SotcStats::FrameTimer hash_timer{SotcStats::FrameHash};
+            const SotcStats::SplitTimer hash_split{SotcStats::SplitTexHash};
             return XXH3_64bits(addr, size);
         }();
         if (image.hash == hash) {
@@ -1288,6 +1296,7 @@ void TextureCache::RefreshImage(Image& image) {
             const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
             const u64 hash = [&] {
                 const SotcStats::FrameTimer hash_timer{SotcStats::FrameHash};
+                const SotcStats::SplitTimer hash_split{SotcStats::SplitTexHash};
                 return XXH3_64bits(addr + mip_offset, mip_size);
             }();
             if (image.mip_hashes[m] == hash) {
@@ -1317,6 +1326,66 @@ void TextureCache::RefreshImage(Image& image) {
         image.flags &= ~ImageFlagBits::Dirty;
         return;
     }
+
+    // sotc: SOTC_UPLOAD_BUDGET_MB (default 32, 0 = off). Entering a new area, the game binds about
+    // 100 MB of new textures in one frame and that frame took 80-130 ms to upload them. Past the
+    // budget, the first upload of a big colour texture waits for a later frame (the first upload
+    // of each frame always goes through); meanwhile the image holds zeros, put in on the GPU once,
+    // so it shows black, never stale memory, and it stays Dirty for the next use.
+    // Placed before the host image copy below: that path also has to count as the image's data.
+    static const u64 upload_budget = [] {
+        const char* v = std::getenv("SOTC_UPLOAD_BUDGET_MB");
+        return (v ? std::strtoull(v, nullptr, 10) : 32ull) << 20;
+    }();
+    static u64 budget_flip = ~0ull, budget_used = 0;
+    if (upload_budget) {
+        const u64 flip = SotcStats::flip_count.load(std::memory_order_relaxed);
+        if (flip != budget_flip) {
+            budget_flip = flip;
+            budget_used = 0;
+        }
+    }
+    if (upload_budget && !image.sotc_has_data && !is_gpu_modified && budget_used &&
+        image.info.guest_size >= 256_KB && budget_used + image.info.guest_size > upload_budget &&
+        image.aspect_mask == vk::ImageAspectFlagBits::eColor) {
+        constexpr u64 ZeroBytes = 64_MB;
+        bool fits = true;
+        auto zero_copies = image_copies;
+        for (auto& copy : zero_copies) {
+            copy.bufferOffset = 0;
+            copy.bufferRowLength = 0;
+            copy.bufferImageHeight = 0;
+            const auto block = vk::blockExtent(image.info.pixel_format);
+            const u64 rows = Common::DivCeil(copy.imageExtent.height, block[1]);
+            const u64 row_bytes =
+                Common::DivCeil(copy.imageExtent.width, block[0]) * vk::blockSize(image.info.pixel_format);
+            fits &= rows * row_bytes * copy.imageExtent.depth * copy.imageSubresource.layerCount <=
+                    ZeroBytes;
+        }
+        if (fits) {
+            if (!image.sotc_zero_filled) {
+                static std::unique_ptr<Buffer> zeros;
+                if (!zeros) {
+                    zeros = std::make_unique<Buffer>(instance, 0, ZeroBytes, MemoryType::DeviceLocal,
+                                                     "SOTC zero texels");
+                    runtime.FillBuffer(zeros.get(), 0, ZeroBytes, 0);
+                }
+                {
+                    const SotcStats::SplitTimer record_split{SotcStats::SplitTexRecord};
+                    runtime.UploadImage(&image, zeros.get(), zero_copies);
+                }
+                image.flags |= ImageFlagBits::Dirty;
+                image.sotc_zero_filled = true;
+                SotcStats::upload_zero_filled.fetch_add(1, std::memory_order_relaxed);
+            }
+            SotcStats::upload_deferred.fetch_add(1, std::memory_order_relaxed);
+            SotcStats::upload_deferred_bytes.fetch_add(image.info.guest_size,
+                                                       std::memory_order_relaxed);
+            return;
+        }
+    }
+    image.sotc_has_data = true;
+    budget_used += image.info.guest_size;
 
     // sotc: SOTC_HOST_IMAGE_COPY=1: a linear image the GPU did not write, re-uploaded whole from guest
     // memory, is written by the host: no staging copy and no command buffer. The image must be
@@ -1382,12 +1451,18 @@ void TextureCache::RefreshImage(Image& image) {
                   True(image.flags & ImageFlagBits::Registered) &&
                       image.track_addr == image.info.guest_address &&
                       image.track_addr_end == image.info.guest_address + image.info.guest_size);
-    const auto [buffer, offset] = tile_manager.DetileImage(in_buffer, in_offset, image.info);
+    const auto [buffer, offset] = [&] {
+        const SotcStats::SplitTimer detile_split{SotcStats::SplitTexDetile};
+        return tile_manager.DetileImage(in_buffer, in_offset, image.info);
+    }();
     for (auto& copy : image_copies) {
         copy.bufferOffset += offset;
     }
 
-    runtime.UploadImage(&image, buffer, image_copies);
+    {
+        const SotcStats::SplitTimer record_split{SotcStats::SplitTexRecord};
+        runtime.UploadImage(&image, buffer, image_copies);
+    }
     // sotc: the MaybeCpuDirty check compares against image.hash, which only that branch used to
     // set: after any other upload (CpuDirty, first upload) it described older contents, and a
     // later rewrite of those older bytes was taken for "unchanged" (stale small textures). Keep
@@ -2612,6 +2687,10 @@ void TextureCache::UnparkImage(ImageId image_id) {
     image.tick_prev_accessed = 0;
     image.binding = {};
     image.usage = {};
+    // sotc: SOTC_UPLOAD_BUDGET_MB: a new image for the budget, and its texels are the old twin's,
+    // not zeros, so a deferral zero-fills it again.
+    image.sotc_has_data = false;
+    image.sotc_zero_filled = false;
     image.RenewIdentity();
     {
         std::unique_lock lk{download_images_mutex};

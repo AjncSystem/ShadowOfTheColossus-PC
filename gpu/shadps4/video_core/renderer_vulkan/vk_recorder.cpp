@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <optional>
 #include <string_view>
 #include <tuple>
 #include <unordered_map>
@@ -1470,6 +1471,7 @@ CommandRecorder::~CommandRecorder() {
 vk::CommandBuffer CommandRecorder::NewFakeHandle() {
     // Fake handles wrap around after NumFakeHandles sessions, so confirm the old session was
     // submitted before using that handle again
+    const SotcStats::SplitTimer recorder_split{SotcStats::SplitWaitRecorder};
     if (handles_issued - handles_retired.load(std::memory_order_acquire) >= NumFakeHandles / 2) {
         const SotcStats::DrawWait wait{SotcStats::WaitRecorder}; // sotc: SOTC_FPS accounting
         while (handles_issued - handles_retired.load(std::memory_order_acquire) >=
@@ -1642,7 +1644,9 @@ void CommandRecorder::NextChunk() {
 }
 
 CommandRecorder::Chunk* CommandRecorder::AcquireChunk() {
+    std::optional<SotcStats::SplitTimer> recorder_split;
     if (chunks_in_flight.load(std::memory_order_acquire) >= MaxChunksInFlight) {
+        recorder_split.emplace(SotcStats::SplitWaitRecorder);
         const SotcStats::DrawWait wait{SotcStats::WaitRecorder}; // sotc: SOTC_FPS accounting
         while (chunks_in_flight.load(std::memory_order_acquire) >= MaxChunksInFlight) {
             // The recording thread is far enough behind to fill the queue, so let it catch up
@@ -1738,6 +1742,7 @@ void CommandRecorder::Sync() {
     });
     Kick();
     const SotcStats::DrawWait wait{SotcStats::WaitRecorder}; // sotc: SOTC_FPS accounting
+    const SotcStats::SplitTimer recorder_split{SotcStats::SplitWaitRecorder};
     u64 done = sync_done.load(std::memory_order_acquire);
     while (done < target) {
         sync_done.wait(done, std::memory_order_acquire);
@@ -1755,6 +1760,7 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuRecorder");
     SotcStats::RegisterThreadRole(SotcStats::RoleRecorder); // sotc: SOTC_FPS accounting
     BbThreads::PlaceThread(BbThreads::Role::Recorder);
+    SotcStats::RegisterSplitThread(SotcStats::SplitThreadRecorder);
     Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
     using Clock = std::chrono::steady_clock;
     // The command processor publishes another batch every few microseconds while working

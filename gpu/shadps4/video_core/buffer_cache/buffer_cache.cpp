@@ -716,11 +716,21 @@ u64 BufferCache::MarkWriteAheadRange(VAddr begin, VAddr end, bool (*allow)(VAddr
 }
 
 std::pair<VAddr, VAddr> BufferCache::ReadbackWindow(const Buffer* arena, VAddr device_addr,
-                                                    u64 size) {
+                                                    u64 size, u64 stream) {
     // GPU-modified ranges come as many small scattered islands,
     // so the download is widened to a window around the request
     constexpr u64 WindowSize = 512_KB;
     const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
+    if (stream != 0) {
+        // sotc: a guest thread reading GPU-written memory in sequence (SOTC_RB_STREAM): from the
+        // request's 64 KiB granule on, `stream` bytes at once. What it brings is the GPU's data of
+        // now, applied as any readback (ApplyDownloads, with the heap guards); only GPU-modified
+        // pages are downloaded.
+        const VAddr start = std::max<VAddr>(Common::AlignDown(device_addr, 64_KB), arena->cpu_addr);
+        const VAddr end =
+            std::min<VAddr>(std::max<VAddr>(start + stream, device_addr + size), arena_end);
+        return {start, end};
+    }
     const auto window = [&](u64 window_size) {
         const VAddr start =
             std::max<VAddr>(Common::AlignDown(device_addr, window_size), arena->cpu_addr);
@@ -861,18 +871,46 @@ void BufferCache::NoteGuestReadbackDone(const AsyncReadback& readback) {
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
+    // sotc: SOTC_RB_STREAM=1: a guest thread whose faults walk GPU-written memory in sequence
+    // (loading a new area, the game copies hundreds of MB the GPU wrote, while it holds a lock the
+    // other job workers wait for) got one readback, and one wait for the GPU, per 64 KiB. Each
+    // fault just past the last window doubles this thread's window, up to SOTC_RB_STREAM_MAX_KB
+    // (4096); a fault elsewhere starts over. Same data, same path, fewer waits.
+    static const u64 stream_max = [] {
+        const char* on = std::getenv("SOTC_RB_STREAM");
+        if (!on || on[0] != '1') {
+            return u64{0};
+        }
+        const char* v = std::getenv("SOTC_RB_STREAM_MAX_KB");
+        return (v ? std::strtoull(v, nullptr, 10) : 4096ULL) * 1_KB;
+    }();
+    u64 stream = 0;
+    if (stream_max != 0) {
+        thread_local VAddr stream_end = 0;
+        thread_local u64 stream_size = 0;
+        if (device_addr >= stream_end && device_addr < stream_end + 64_KB && stream_size != 0) {
+            stream_size = std::min(stream_size * 2, stream_max);
+        } else {
+            stream_size = 64_KB;
+        }
+        stream_end = Common::AlignDown(device_addr, 64_KB) + stream_size;
+        stream = stream_size > 64_KB ? stream_size : 0;
+        if (stream != 0) {
+            SotcStats::rb_stream_windows.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     if (hrr) {
         hrr->NoteReadback(device_addr, size); // sotc: SOTC_HRR dry run
     }
     if (SotcStats::kWriteMarks) { // sotc: report only ("SOTC GPU writes by shader"), see sotc_stats.h
         SotcWriteExtent::NoteReadback(device_addr);
     }
-    const auto flush_request = [this, device_addr, size, is_write] {
+    const auto flush_request = [this, device_addr, size, is_write, stream] {
         NoteHotRead(device_addr, size);
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
         const auto* arena = GetArena(first_block, last_block);
-        const auto [window_start, window_end] = ReadbackWindow(arena, device_addr, size);
+        const auto [window_start, window_end] = ReadbackWindow(arena, device_addr, size, stream);
         Core::MemoryManager::NoteHostWrite(device_addr, size, 6, window_start);
         fault_addr = device_addr;
         fault_size = size;
@@ -898,7 +936,8 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         return;
     }
     // The guest thread waits for the GPU, not the command processor.
-    AsyncReadback readback{.device_addr = device_addr, .size = size, .is_write = is_write};
+    AsyncReadback readback{
+        .device_addr = device_addr, .size = size, .stream = stream, .is_write = is_write};
     // sotc: SOTC_TRACE: the guest thread's whole readback (request, GPU wait, apply)
     const SotcTrace::ScopeNoAlloc trace_readback{"readback", device_addr, size};
     // sotc: SOTC_FPS: the guest's wall-clock time from the Begin request to the Finish return.
@@ -911,12 +950,27 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     if (track) {
         PrepareGuestReadback(readback, t_begin);
     }
+    // sotc: SOTC_DRAW_SPLIT: the four parts of the guest's wait (draw thread queue and the copy
+    // recorded there, the recorder submitting it, the GPU, the apply on the draw thread).
+    const bool split = SotcStats::kDrawSplit;
+    u64 split_mark = split ? SotcStats::Ticks() : 0;
+    const auto split_part = [&](SotcStats::SplitPart part) {
+        if (split) {
+            const u64 now = SotcStats::Ticks();
+            SotcStats::split_ticks[part].fetch_add(now - split_mark, std::memory_order_relaxed);
+            split_mark = now;
+        }
+    };
     liverpool->SendCommand<true>([this, &readback] { BeginAsyncReadback(readback); });
+    split_part(SotcStats::SplitRbQueue);
     if (!readback.waiting) {
         if (track) {
             NoteGuestReadbackDone(readback);
         }
         return;
+    }
+    if (split) {
+        SotcStats::split_ticks[SotcStats::SplitRbCount].fetch_add(1, std::memory_order_relaxed);
     }
     const WaitObserver wait_observer = rbx_wait_observer.load(std::memory_order_acquire);
     const u64 t_wait0 = wait_observer ? SotcStats::NowNs() : 0;
@@ -929,6 +983,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     if (readback.wait_ahead != 0) {
         scheduler.WaitAheadSubmitted(readback.wait_ahead);
     }
+    split_part(SotcStats::SplitRbSubmit);
     const u64 t_gpu = SotcStats::kFpsTimers ? SotcStats::NowNs() : 0; // sotc: report only
     if (readback.tick != 0) {
         scheduler.GetWorkSemaphore()->Wait(readback.tick);
@@ -946,6 +1001,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         }();
         scheduler.XferWaitValue(readback.wait_xfer, rb_spin_us);
     }
+    split_part(SotcStats::SplitRbGpu);
     if (wait_observer && readback.wait_seq != 0) {
         wait_observer(readback.wait_seq, SotcStats::NowNs() - t_wait0);
     }
@@ -958,6 +1014,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             RbgApplyReady(false);
         }
     });
+    split_part(SotcStats::SplitRbFinish);
     if (track) {
         NoteGuestReadbackDone(readback);
     }
@@ -1110,9 +1167,11 @@ void BufferCache::BeginAsyncReadbackImpl(AsyncReadback& readback) {
     const u32 last_block = (readback.device_addr + readback.size - 1) >> block_shift;
     const auto* arena = GetArena(first_block, last_block);
     // sotc: SOTC_RB_GROW: the window the guest thread chose (PrepareGuestReadback), if grown.
+    // SOTC_RB_STREAM (readback.stream) applies only when it is not grown: grow wins if both are on.
     auto [window_start, window_end] =
-        readback.grow_window != 0 ? GrowReadbackWindow(arena, readback)
-                                  : ReadbackWindow(arena, readback.device_addr, readback.size);
+        readback.grow_window != 0
+            ? GrowReadbackWindow(arena, readback)
+            : ReadbackWindow(arena, readback.device_addr, readback.size, readback.stream);
     // sotc: SOTC_WRITE_FAULT_NARROW: a write fault needs the bytes of the pages the guest is about
     // to write and nothing else: the window shrinks to them (every GPU-modified byte of those
     // pages is still copied, so the page holds the GPU's final bytes before the write lands; the
@@ -4850,10 +4909,39 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                 BpeHeapGuard* heap_guard = nullptr;
                 if (Active* a = active_for(addr, size)) {
                     BpeUsedBlocks& used = *a->slot->used;
-                    if (heap_fast && used.Covers(a->slot->heap, addr, addr + size)) {
+                    if (heap_fast && (used.Covers(a->slot->heap, addr, addr + size) ||
+                                      used.TryUserPointer(a->slot->heap, addr, addr + size))) {
                         memory->TryWriteBacking(std::bit_cast<u8*>(addr), src + (addr - dst_addr),
                                                 size, 1);
                         return;
+                    }
+                    // sotc: SOTC_GUARD_STALE=1 asks the guard built before first. At an area change
+                    // the free tree changes all the time and each new block rebuilt the guard
+                    // (~300 walks per 5 s on the draw thread). The guard built before still finds
+                    // the block around addr (it follows the physical chain from a free block it
+                    // knew), and the block is then checked in memory as now, as Covers checks a
+                    // remembered one: in use, its next block pointing back, not the one being
+                    // freed. Only the writes it does not vouch for rebuild it. Off by default
+                    // since 29 Oct: like Covers, the check and the full-range write are not one
+                    // step, and a block freed in between loses its free tree links; it sent more
+                    // writes down that path while loads free blocks. The 0x49800 crash came 6 s
+                    // after the one window where it vouched for writes (30); it saved little.
+                    static const bool use_stale = [] {
+                        const char* v = std::getenv("SOTC_GUARD_STALE");
+                        return v && v[0] == '1';
+                    }();
+                    if (heap_fast && use_stale && !a->checked && a->slot->guard &&
+                        a->slot->guard->IsValid()) {
+                        if (VAddr block = 0, next = 0;
+                            a->slot->guard->FindUsedBlock(addr, block, next)) {
+                            used.Add(block, next);
+                            if (used.Covers(a->slot->heap, addr, addr + size)) {
+                                SotcStats::heap_guard_stale_hits.fetch_add(1, std::memory_order_relaxed);
+                                memory->TryWriteBacking(std::bit_cast<u8*>(addr),
+                                                        src + (addr - dst_addr), size, 1);
+                                return;
+                            }
+                        }
                     }
                     heap_guard = guard_of(*a);
                     int find = 0;
@@ -5532,8 +5620,12 @@ void BufferCache::NoteWriteAgainstXferReads(VAddr addr, u64 size) {
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainGuestCopyForImage(VAddr device_addr, u32 size) {
-    const auto staging = staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
-                                              instance.StorageMinAlignment());
+    const auto staging = [&] {
+        const SotcStats::SplitTimer staging_split{SotcStats::SplitTexStaging};
+        return staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
+                                    instance.StorageMinAlignment());
+    }();
+    const SotcStats::SplitTexCopyScope copy_split{staging.size};
     memory->CopySparseMemory(device_addr, staging.mapped, staging.size);
     staging.Flush();
     return {staging.buffer, staging.offset};
@@ -5542,10 +5634,16 @@ std::pair<const Buffer*, u64> BufferCache::ObtainGuestCopyForImage(VAddr device_
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size,
                                                                 bool pages_protected) {
     if (IsRegionGpuModified(device_addr, size)) {
+        const SotcStats::SplitTimer copy_split{SotcStats::SplitTexCopy};
         return ObtainBuffer(device_addr, size, false);
     }
-    const auto staging = staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
-                                              instance.StorageMinAlignment());
+    const auto staging = [&] {
+        const SotcStats::SplitTimer staging_split{SotcStats::SplitTexStaging};
+        return staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
+                                    instance.StorageMinAlignment());
+    }();
+    // sotc: SOTC_DRAW_SPLIT: the copy's bytes and time (the async queueing below included).
+    const SotcStats::SplitTexCopyScope copy_split{staging.size};
     // sotc: SOTC_ASYNC_TEXTURE_UPLOAD. The image's pages are write-protected by its tracking
     // (pages_protected): its guest copy goes to the copy threads like a buffer upload (the write
     // fence and the submit wait of async_upload.h apply; the detiling reads the staging on the
@@ -5653,6 +5751,15 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
 }
 
 void BufferCache::SynchronizeDmaBuffers() {
+    // sotc: SOTC_DMA_SYNC_SKIP=1, diagnostic only: no sweep, to weigh its share of the stalls when
+    // a new area loads (shaders unchanged, unlike turning the DMA off; reflections may lag).
+    static const bool skip = [] {
+        const char* v = std::getenv("SOTC_DMA_SYNC_SKIP");
+        return v && v[0] == '1';
+    }();
+    if (skip) {
+        return;
+    }
     const SotcStats::FrameTimer frame_timer{SotcStats::FrameDma};
     fault_process_pending = true;
     // sotc: SOTC_UNTRACK_AUTO. A chunk list the flip thread published (SotcUntrack::Publish) is

@@ -414,6 +414,8 @@ void Liverpool::BackLoop(std::stop_token stoken) {
     SotcRaiseGpuThread();
     BbThreads::PlaceThread(BbThreads::Role::Draw);
     Shader::g_info_slot = 1;
+    SotcStats::t_draw_thread = true;
+    SotcStats::RegisterSplitThread(SotcStats::SplitThreadDraw);
 #ifdef __linux__
     back_tid = gettid();
 #endif
@@ -448,6 +450,7 @@ void Liverpool::BackLoop(std::stop_token stoken) {
             // sotc: SOTC_FPS_LEAN: the idle time is read only for the reports and the trace.
             const bool idle_timed = SotcStats::kFpsTimers || SotcTrace::kOn;
             const u64 idle_start = idle_timed ? SotcStats::NowNs() : 0;
+            const SotcStats::SplitTimer idle_split{SotcStats::SplitIdle}; // sotc: SOTC_DRAW_SPLIT
             if (SotcTrace::kOn) {
                 tl_op_batch.Flush(); // sotc: SOTC_TRACE: the ops before the idle time
             }
@@ -492,13 +495,16 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                 continue;
             }
             bool ready = false;
-            for (u32 spin = 0; spin < 4096; ++spin) {
-                if (back_head.load(std::memory_order_acquire) != tail ||
-                    num_commands.load(std::memory_order_acquire)) {
-                    ready = true;
-                    break;
+            {
+                const SotcStats::SplitTimer spin_split{SotcStats::SplitIdleSpin};
+                for (u32 spin = 0; spin < 4096; ++spin) {
+                    if (back_head.load(std::memory_order_acquire) != tail ||
+                        num_commands.load(std::memory_order_acquire)) {
+                        ready = true;
+                        break;
+                    }
+                    CpuRelax();
                 }
-                CpuRelax();
             }
             if (!ready) {
                 std::unique_lock lk{back_mutex};
@@ -542,15 +548,24 @@ void Liverpool::BackLoop(std::stop_token stoken) {
         const bool func_op = op.kind == BackOp::Kind::Func || op.wd.num_segs != 0;
         if (op.xp_done) {
             XpReplayState(op); // sotc: SOTC_CULL_EXPRESS: ran ahead, only its state is replayed
-        } else if (SotcStats::kFpsTimers && op.kind == BackOp::Kind::Func && op.func) { // sotc: SOTC_FPS_LEAN
-            const u64 func_start = SotcStats::NowNs();
-            ExecuteBackOp(op);
-            SotcStats::draw_func_ns[op.func_kind & 3].fetch_add(SotcStats::NowNs() - func_start,
-                                                                std::memory_order_relaxed);
         } else {
-            ExecuteBackOp(op);
+            using enum BackOp::Kind;
+            // sotc: SOTC_DRAW_SPLIT: the time of the operation itself, by kind (not the replay above).
+            const SotcStats::SplitTimer op_split{
+                op.kind == Draw           ? SotcStats::SplitDraw
+                : op.kind == DrawIndirect ? SotcStats::SplitIndirect
+                : op.kind == Func         ? SotcStats::SplitFunc
+                                          : SotcStats::SplitDispatch};
+            if (SotcStats::kFpsTimers && op.kind == BackOp::Kind::Func && op.func) { // sotc: SOTC_FPS_LEAN
+                const u64 func_start = SotcStats::NowNs();
+                ExecuteBackOp(op);
+                SotcStats::draw_func_ns[op.func_kind & 3].fetch_add(SotcStats::NowNs() - func_start,
+                                                                    std::memory_order_relaxed);
+            } else {
+                ExecuteBackOp(op);
+            }
         }
-        op.func.Reset();
+        op.func.Reset(); // sotc: InlineFunction (SOTC_INLINE_FUNC), not UniqueFunction
         ++tail;
         back_tail.store(tail, std::memory_order_seq_cst);
         if (opstat) { // sotc: SOTC_OPSTAT
@@ -679,6 +694,12 @@ Liverpool::BackOp& Liverpool::BackAlloc() {
 void Liverpool::BackPublish(bool writes_memory) {
     const u64 head = back_head.load(std::memory_order_relaxed) + 1;
     back_head.store(head, std::memory_order_seq_cst);
+    if (SotcStats::kDrawSplit) { // only the command processor publishes
+        const u64 depth = head - back_tail.load(std::memory_order_relaxed);
+        if (depth > SotcStats::split_queue_max.load(std::memory_order_relaxed)) {
+            SotcStats::split_queue_max.store(depth, std::memory_order_relaxed);
+        }
+    }
     if (writes_memory) {
         back_write_seq = head;
     }
@@ -2384,6 +2405,7 @@ void Liverpool::ProcessCommands() {
                     --num_commands;
                 }
                 const SotcTrace::Scope trace_command{"command"}; // sotc: SOTC_TRACE
+                const SotcStats::SplitTimer command_split{SotcStats::SplitCommands};
                 callback();
             }
             NotifyCpWait(); // sotc: SOTC_CP_IDLE_US: a game thread's command may write memory
@@ -2426,6 +2448,7 @@ void Liverpool::Process(std::stop_token stoken) {
     SotcRaiseGpuThread();
     BbThreads::PlaceThread(BbThreads::Role::CommandProcessor);
     gpu_id = std::this_thread::get_id();
+    SotcStats::RegisterSplitThread(SotcStats::SplitThreadCp);
 #ifdef __linux__
     gpu_tid = gettid();
 #endif

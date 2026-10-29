@@ -160,6 +160,11 @@ public:
         return maintenance_8;
     }
 
+    /// sotc: VK_EXT_external_memory_host, enabled with SOTC_PC_MEMORY=1 only
+    bool IsExternalMemoryHostEnabled() const {
+        return external_memory_host;
+    }
+
     /// Returns true if VK_EXT_attachment_feedback_loop_layout is supported
     bool IsAttachmentFeedbackLoopLayoutSupported() const {
         return attachment_feedback_loop;
@@ -745,6 +750,7 @@ private:
     bool workgroup_memory_explicit_layout{};
     bool maintenance_5{};
     bool maintenance_8{};
+    bool external_memory_host{}; // sotc
     bool attachment_feedback_loop{};
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};

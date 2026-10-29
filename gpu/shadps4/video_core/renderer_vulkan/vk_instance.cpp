@@ -325,8 +325,9 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    // sotc: 33 optional extensions below, of which up to 2 more with SOTC_PRESENT_WAIT.
-    boost::container::static_vector<const char*, 40> enabled_extensions;
+    // sotc: 34 optional extensions below (SOTC_PC_MEMORY's external memory host among them), of
+    // which up to 2 more with SOTC_PRESENT_WAIT.
+    boost::container::static_vector<const char*, 48> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -364,6 +365,11 @@ bool Instance::CreateDevice() {
     // Optional
     maintenance_5 = add_extension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
     maintenance_8 = add_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+    // sotc: the game's memory imported for the GPU in place (SOTC_PC_MEMORY=1,
+    // docs/sotc/MODELO-MEMORIA-PC.md); asked for only then.
+    if (const char* v = std::getenv("SOTC_PC_MEMORY"); v && v[0] == '1') {
+        external_memory_host = add_extension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    }
     attachment_feedback_loop = add_extension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
     if (attachment_feedback_loop) {
         attachment_feedback_loop =
@@ -648,7 +654,11 @@ bool Instance::CreateDevice() {
             host_import_alignment =
                 props_chain.get<vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>()
                     .minImportedHostPointerAlignment;
-            add_extension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+            // sotc: SOTC_PC_MEMORY=1 already asked for it (external_memory_host stays that
+            // switch's own flag: SotcGuestMemory reads it).
+            if (!external_memory_host) {
+                add_extension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+            }
             host_import_enabled = true;
         } else {
             LOG_WARNING(Render_Vulkan, "SOTC_HOST_IMPORT=1 but VK_EXT_external_memory_host is not "

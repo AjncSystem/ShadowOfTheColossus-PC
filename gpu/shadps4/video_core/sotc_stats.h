@@ -450,6 +450,15 @@ inline std::atomic<uint64_t> rb_batch_saved{0};
 inline std::atomic<uint64_t> readback_finish{0};  ///< downloads that flushed the current work
 inline std::atomic<uint64_t> readback_finish_asked{0}; ///< ... for bytes the guest itself asked
 inline std::atomic<uint64_t> heap_guard_builds{0}; ///< readbacks into the BPE heap
+inline std::atomic<uint64_t> heap_guard_stale_hits{0}; ///< writes the previous guard vouched for
+inline std::atomic<uint64_t> upload_deferred{0};        ///< first uploads put off to a later frame
+inline std::atomic<uint64_t> upload_deferred_bytes{0};
+inline std::atomic<uint64_t> upload_zero_filled{0};     ///< ... images filled with zeros meanwhile
+inline std::atomic<uint64_t> heap_guard_ns{0};        ///< time of the guard builds (free-tree walks)
+inline std::atomic<uint64_t> heap_guard_worst_ns{0};
+inline std::atomic<uint64_t> heap_guard_worst_blocks{0}; ///< free blocks of the slowest build
+inline std::atomic<uint64_t> heap_guard_worst_adds{0};   ///< ... and the visits it made
+inline std::atomic<uint64_t> heap_guard_repeats{0};      ///< nodes and ring members seen again, skipped
 inline std::atomic<uint64_t> readback_copies{0};          ///< ranges downloaded
 inline std::atomic<uint64_t> readback_copies_changed{0};  ///< ... whose bytes differed from memory
 inline std::atomic<uint64_t> readback_bytes{0};
@@ -503,6 +512,8 @@ inline std::atomic<uint64_t> drop_slow{0};
 /// SOTC_RB_NARROW: readback window (KiB, 0 = off), GPU-modified bytes of the 512 KiB window left
 /// outside the narrow one (not downloaded nor unprotected), live hot readbacks (gauge).
 inline std::atomic<uint64_t> rb_narrow_kib{0}, rb_narrow_kept_bytes{0}, rb_hot_entries{0};
+/// sotc: readbacks with a streaming window (SOTC_RB_STREAM, BufferCache::ReadMemory)
+inline std::atomic<uint64_t> rb_stream_windows{0};
 inline std::atomic<uint64_t> uploads{0};        ///< SynchronizeMemory copies (CPU data to GPU)
 /// SOTC_XFER_QUEUE: uploads copied on the transfer queue instead of the graphics queue.
 inline std::atomic<uint64_t> xfer_copies{0};
@@ -793,6 +804,79 @@ inline void Done(uint64_t lo, uint64_t hi) {
     t.counted = true;
 }
 } // namespace FaultStat
+
+/// sotc: SOTC_DRAW_SPLIT=1 (with SOTC_FPS): where the draw thread's time goes, the "SOTC DRAW
+/// SPLIT" lines (videoout/driver.cpp; step 0 of docs/sotc/PLANO-THREAD-DESENHO.md). "draw busy"
+/// counts every wait inside an operation (flips, GPU waits, readbacks) as busy; these counters
+/// separate the operations, the binds and the waits, in TSC ticks (one rdtsc per edge), and the
+/// printer reads the CPU time of the draw, command processor and recorder threads. Counting only:
+/// nothing else changes.
+inline const bool kDrawSplit = std::getenv("SOTC_DRAW_SPLIT") != nullptr;
+enum SplitPart {
+    SplitDraw, SplitIndirect, SplitDispatch, SplitFunc, SplitCommands, // draw thread operations
+    SplitBind, SplitBindBuffers, SplitBindTextures, SplitBindDma,      // inside BindResources
+    SplitTexRefresh, SplitTexHash, SplitTexStaging, SplitTexCopy,      // TextureCache::RefreshImage
+    SplitTexDetile, SplitTexRecord,
+    SplitWaitGpu, SplitWaitSubmit, SplitWaitRecorder, SplitWaitFrame,  // draw thread blocked
+    SplitIdle, SplitIdleSpin,                                          // draw thread out of work
+    SplitRbQueue, SplitRbSubmit, SplitRbGpu, SplitRbFinish,            // guest readback waits
+    SplitRbCount, ///< guest readback waits (a count, not ticks)
+    /// Texture copies from guest memory on the draw thread (counts, not ticks): bytes, copies,
+    /// copies of 2 MiB and more (split across the copy threads), process page faults meanwhile.
+    SplitTexBytes, SplitTexCopies, SplitTexBig, SplitTexFaults,
+    SplitParts
+};
+inline std::atomic<uint64_t> split_ticks[SplitParts]{};
+/// Deepest draw thread queue (back_head - back_tail at a publish) since the last flip.
+inline std::atomic<uint64_t> split_queue_max{0};
+/// Set by Liverpool::BackLoop: the waits count only on the draw thread.
+inline thread_local bool t_draw_thread = false;
+inline uint64_t Ticks() {
+    return __builtin_ia32_rdtsc();
+}
+struct SplitTimer {
+    SplitPart part;
+    bool on;
+    uint64_t start;
+    explicit SplitTimer(SplitPart p, bool draw_thread_only = true)
+        : part{p}, on{kDrawSplit && (!draw_thread_only || t_draw_thread)}, start{on ? Ticks() : 0} {}
+    ~SplitTimer() {
+        if (on) {
+            split_ticks[part].fetch_add(Ticks() - start, std::memory_order_relaxed);
+        }
+    }
+};
+enum SplitThread { SplitThreadDraw, SplitThreadCp, SplitThreadRecorder, SplitThreads };
+/// The calling thread is that one (its CPU time is read by SplitThreadCycles); sotc_stats.cpp.
+void RegisterSplitThread(SplitThread which);
+/// CPU time of a registered thread in TSC ticks (QueryThreadCycleTime), 0 if not registered.
+uint64_t SplitThreadCycles(SplitThread which);
+/// Page faults of the whole process so far (GetProcessMemoryInfo), 0 where unknown.
+uint64_t SplitProcessFaults();
+/// A texture copy of `bytes` from guest memory: its wall time goes to SplitTexCopy and the counts
+/// to SplitTexBytes..SplitTexFaults (draw thread only, SOTC_DRAW_SPLIT).
+struct SplitTexCopyScope {
+    bool on;
+    uint64_t start, faults;
+    explicit SplitTexCopyScope(uint64_t bytes) : on{kDrawSplit && t_draw_thread} {
+        start = on ? Ticks() : 0;
+        faults = on ? SplitProcessFaults() : 0;
+        if (on) {
+            split_ticks[SplitTexBytes].fetch_add(bytes, std::memory_order_relaxed);
+            split_ticks[SplitTexCopies].fetch_add(1, std::memory_order_relaxed);
+            if (bytes >= (2u << 20)) {
+                split_ticks[SplitTexBig].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    ~SplitTexCopyScope() {
+        if (on) {
+            split_ticks[SplitTexCopy].fetch_add(Ticks() - start, std::memory_order_relaxed);
+            split_ticks[SplitTexFaults].fetch_add(SplitProcessFaults() - faults,
+                                                  std::memory_order_relaxed);
+        }
+    }
+};
 /// SOTC_CMD_STATS=1: draws, indirect draws (arguments GPU-written / CPU-side / CPU-side and
 /// empty), dispatches, indirect dispatches.
 inline std::atomic<uint64_t> cmd_kinds[7]{}; // [6]: direct draws with 0 indices or 0 instances

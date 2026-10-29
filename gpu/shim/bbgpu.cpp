@@ -52,6 +52,7 @@ uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size);
 int runtime_memory_region(uintptr_t address, uintptr_t* start, uintptr_t* end, int* mapped);
 void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int write);
 const unsigned char* runtime_memory_backing_pointer(uintptr_t address);
+int runtime_memory_copy_out(uintptr_t source, unsigned char* dest, uint64_t size);
 typedef void (*RuntimeGpuRange)(uintptr_t address, uint64_t size);
 // runtime_kernel.c: one clock for guest and GPU timestamps
 uint64_t runtime_process_time_us(void);
@@ -129,7 +130,17 @@ void MemoryManager::InvalidateMemory(VAddr address, u64 size) {
 u64 MemoryManager::ClampRangeSize(VAddr virtual_addr, u64 size) {
     return runtime_memory_clamp(virtual_addr, size);
 }
+// sotc: SOTC_COPY_LOCK_ONCE=1: one lookup pass per copy (runtime_memory_copy_out) instead of two
+// table lookups per mapping run, each of which could wait for a map batch at an area change.
+// Read at static initialisation: copies also run inside the fault handler.
+static const bool kCopyLockOnce = [] {
+    const char* v = std::getenv("SOTC_COPY_LOCK_ONCE");
+    return v && v[0] == '1';
+}();
 static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
+    if (kCopyLockOnce && size && runtime_memory_copy_out(source, dest, size)) {
+        return;
+    }
     while (size) {
         uintptr_t start = 0, end = 0;
         int mapped = 0;

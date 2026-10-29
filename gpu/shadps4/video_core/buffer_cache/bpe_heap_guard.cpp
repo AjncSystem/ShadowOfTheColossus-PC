@@ -4,12 +4,14 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
 #include "core/memory.h"
 #include "video_core/buffer_cache/bpe_heap_guard.h"
+#include "video_core/sotc_stats.h"
 
 extern "C" uint64_t runtime_memory_generation(void);
 
@@ -31,6 +33,58 @@ constexpr size_t MaxListNodes = 1 << 10;
 constexpr size_t MaxChainSteps = 1 << 12;
 constexpr u64 InUse = 1; // size | flags bit 0: set on allocated blocks, clear on free ones
 constexpr size_t MaxUsedBlocks = 1 << 12;
+
+// sotc: the walk's set of nodes and ring members seen (open addressing on the draw thread, kept
+// between builds: about 500 builds per 5 s at an area change, ~7000 nodes each)
+class SeenSet {
+public:
+    void Reset(size_t expected) {
+        size_t capacity = 1024;
+        while (capacity < expected * 2) {
+            capacity <<= 1;
+        }
+        if (table.size() != capacity) {
+            table.assign(capacity, 0);
+        } else {
+            std::fill(table.begin(), table.end(), 0);
+        }
+        count = 0;
+    }
+    /// false when key (never 0) was already in
+    bool Insert(u64 key) {
+        if ((count + 1) * 2 > table.size()) {
+            Grow();
+        }
+        const size_t mask = table.size() - 1;
+        for (size_t i = (key * 0x9E3779B97F4A7C15ULL) >> 32 & mask;; i = (i + 1) & mask) {
+            if (table[i] == key) {
+                return false;
+            }
+            if (!table[i]) {
+                table[i] = key;
+                ++count;
+                return true;
+            }
+        }
+    }
+
+private:
+    void Grow() {
+        std::vector<u64> old;
+        old.swap(table);
+        table.assign(old.size() * 2, 0);
+        count = 0;
+        for (const u64 key : old) {
+            if (key) {
+                Insert(key);
+            }
+        }
+    }
+    std::vector<u64> table;
+    size_t count = 0;
+};
+thread_local SeenSet seen;
+thread_local size_t last_seen = 0;
 } // namespace
 
 // sotc: SOTC_HEAP_GUARD_RUNS=1 (off by default). A guard is built again whenever its heap's free
@@ -64,7 +118,17 @@ BpeHeapGuard::BpeHeapGuard(Core::MemoryManager* memory_, VAddr heap_)
         return;
     }
     valid = true;
-    CollectFreeTree();
+    const auto start = std::chrono::steady_clock::now();
+    const size_t adds = CollectFreeTree();
+    const u64 ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now() - start)
+                       .count();
+    SotcStats::heap_guard_ns.fetch_add(ns, std::memory_order_relaxed);
+    if (ns > SotcStats::heap_guard_worst_ns.load(std::memory_order_relaxed)) {
+        SotcStats::heap_guard_worst_ns.store(ns, std::memory_order_relaxed);
+        SotcStats::heap_guard_worst_blocks.store(free_blocks.size(), std::memory_order_relaxed);
+        SotcStats::heap_guard_worst_adds.store(adds, std::memory_order_relaxed);
+    }
     if (reuse && !(generation & 1) && runtime_memory_generation() == generation) {
         cache.generation = generation;
         cache.runs = runs;
@@ -105,7 +169,22 @@ void BpeHeapGuard::AddFreeBlock(VAddr block) {
     free_blocks.push_back(block);
 }
 
-void BpeHeapGuard::CollectFreeTree() {
+size_t BpeHeapGuard::CollectFreeTree() {
+    // sotc: SOTC_GUARD_DEDUP=0 walks as before. The game changes the tree while this walk reads
+    // it: at an area change a node reached twice (a link read mid-change) was walked again and
+    // again up to MaxTreeNodes, each time with its ring of up to MaxListNodes members, and the
+    // sort of those millions of repeats held the draw thread 1-3 s (the game showed its loading
+    // screen). Nodes and ring members already seen are skipped: they only added repeats, which
+    // the sort/unique below removed anyway.
+    static const bool dedup = [] {
+        const char* v = std::getenv("SOTC_GUARD_DEDUP");
+        return !(v && v[0] == '0');
+    }();
+    if (dedup) {
+        seen.Reset(last_seen);
+    }
+    size_t seen_keys = 0;
+    u64 repeats = 0;
     const VAddr sentinel = heap + 0x80;
     VAddr root = 0;
     Read(sentinel, &root, sizeof(root));
@@ -119,6 +198,10 @@ void BpeHeapGuard::CollectFreeTree() {
         const VAddr node = stack.back();
         stack.pop_back();
         if (node == sentinel || !IsHeapPointer(node)) {
+            continue;
+        }
+        if (dedup && (++seen_keys, !seen.Insert(node))) {
+            ++repeats;
             continue;
         }
         std::array<u64, 7> words{};
@@ -136,6 +219,11 @@ void BpeHeapGuard::CollectFreeTree() {
         // Blocks of equal size hang off the tree node in a ring through the list links
         VAddr member = words[4];
         for (size_t i = 0; i < MaxListNodes && IsHeapPointer(member) && member != node; ++i) {
+            // members tagged in bit 0 (pointers are 8-aligned), apart from tree nodes
+            if (dedup && (++seen_keys, !seen.Insert(member | 1))) {
+                ++repeats;
+                break;
+            }
             AddFreeBlock(member - HeaderSize);
             VAddr next = 0;
             if (!Read(member + 0x10, &next, sizeof(next))) {
@@ -146,12 +234,18 @@ void BpeHeapGuard::CollectFreeTree() {
         stack.push_back(words[2]);
         stack.push_back(words[3]);
     }
+    const size_t adds = free_blocks.size();
+    last_seen = seen_keys;
+    if (repeats) {
+        SotcStats::heap_guard_repeats.fetch_add(repeats, std::memory_order_relaxed);
+    }
     std::sort(free_blocks.begin(), free_blocks.end());
     free_blocks.erase(std::unique(free_blocks.begin(), free_blocks.end()), free_blocks.end());
     free_spans.reserve(free_blocks.size());
     for (const VAddr block : free_blocks) {
         free_spans.emplace_back(block, block + FreeNodeSize);
     }
+    return adds;
 }
 
 bool BpeHeapGuard::NextBlock(VAddr block, VAddr& next) const {
@@ -345,9 +439,49 @@ bool BpeUsedBlocks::Covers(VAddr heap, VAddr addr, VAddr end, int* why) {
     return true;
 }
 
+bool BpeUsedBlocks::TryUserPointer(VAddr heap, VAddr addr, VAddr end) {
+    // sotc: SOTC_GUARD_USER_POINTER=1 trusts these without building the guard. Readbacks mostly
+    // start at a binding base, the user pointer of an allocation; at an area change new blocks
+    // came every frame and each one rebuilt the guard (a walk of the whole free tree, up to 670
+    // per 5 s). The header before addr is trusted as CollectHeaders and StillUsed trust one: in
+    // use, a sane size, and the next block points back to it. Off by default since 29 Oct: the
+    // check and the full-range write are not one step, and a block the game frees in between gets
+    // its free tree links (kept inside free blocks) overwritten. This sent more writes down that
+    // path exactly while loads free blocks; suspected in the 0x49800 crash 6 s after a load, 24 min
+    // into the user's session. It saved almost nothing.
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_GUARD_USER_POINTER");
+        return v && v[0] == '1';
+    }();
+    if (!on || addr < HeapPointerLo + HeaderSize || (addr & 7)) {
+        return false;
+    }
+    const VAddr block = addr - HeaderSize;
+    u64 size_flags = 0;
+    if (!memory->TryReadBacking(block + 8, &size_flags, sizeof(size_flags)) || !(size_flags & InUse)) {
+        return false;
+    }
+    const u64 size = size_flags & SizeMask;
+    if (size == 0 || size >= MaxBlockSize) {
+        return false;
+    }
+    const VAddr next = block + size + HeaderSize;
+    if (end > next || !StillUsed(heap, block, next)) {
+        return false;
+    }
+    Add(block, next);
+    return true;
+}
+
 void BpeUsedBlocks::Add(VAddr block, VAddr next) {
     if (blocks.size() >= MaxUsedBlocks) {
-        blocks.clear();
+        // sotc: keep every other one (was: forget all): at an area change the list filled up
+        // within seconds, and each forgotten block cost a guard rebuild on its next readback
+        size_t kept = 0;
+        for (size_t i = 0; i < blocks.size(); i += 2) {
+            blocks[kept++] = blocks[i];
+        }
+        blocks.resize(kept);
     }
     const auto it = std::lower_bound(blocks.begin(), blocks.end(), std::pair{block, VAddr{0}});
     if (it != blocks.end() && it->first == block) {

@@ -30,6 +30,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/sotc_guest_memory.h"
 #include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_shadow_scroll.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -93,6 +94,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
+    SotcGuestMemory::Init(instance); // sotc: SOTC_PC_MEMORY=1 (docs/sotc/MODELO-MEMORIA-PC.md)
 
     // sotc: SOTC_BINDLESS_SAMP: the pipelines bind the global sampler set of the texture cache.
     const auto& bindless = texture_cache.GetBindlessSamplers();
@@ -2343,6 +2345,7 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
+    SotcGuestMemory::Ready();
     SotcLodFeedbackCycle();
     buffer_cache.TickFrame();
     texture_cache.ProcessDownloadImages();
@@ -2729,6 +2732,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             cache.EndWriteScope();
         }
     } write_scope_guard{buffer_cache};
+    const SotcStats::SplitTimer bind_split{SotcStats::SplitBind}; // sotc: SOTC_DRAW_SPLIT
     fast_bind_hit = false;
     // sotc: SOTC_BIND_CACHE: flush the cached binds when the state they were made in moved, or
     // when this bind is not a read-only graphics bind (its writes and copies run before them).
@@ -2845,6 +2849,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             fast_bind_hit = true;
             SotcStats::fast_bind_hits.fetch_add(1, std::memory_order_relaxed);
             if (fast_bind.uses_dma) {
+                const SotcStats::SplitTimer dma_split{SotcStats::SplitBindDma};
                 buffer_cache.SynchronizeDmaBuffers();
             }
             return true;
@@ -2997,16 +3002,19 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
                                       : nullptr;
         {
             const SotcTrace::BindScope trace_step{"bind buffers"}; // sotc: a = bytes, b = protects
+            const SotcStats::SplitTimer buffers_split{SotcStats::SplitBindBuffers};
             BindBuffers(*stage, binding, push_data, set, pr_stage ? resolved : nullptr, pr_stage);
         }
         {
             const SotcTrace::ScopeMin trace_step{"bind textures", stage->images.size()}; // sotc
+            const SotcStats::SplitTimer textures_split{SotcStats::SplitBindTextures};
             BindTextures(*stage, binding, set, pr_stage ? resolved : nullptr, pr_stage);
         }
         uses_dma |= stage->uses_dma;
     }
 
     if (uses_dma) {
+        const SotcStats::SplitTimer dma_split{SotcStats::SplitBindDma};
         buffer_cache.SynchronizeDmaBuffers();
     }
 

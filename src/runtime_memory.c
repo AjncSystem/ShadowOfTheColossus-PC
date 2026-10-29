@@ -75,6 +75,27 @@ uint64_t runtime_memory_lock_sleeps(void) { return __atomic_exchange_n(&lock_sle
  * under the lock may write guest memory, and a GPU-tracked page then faults into
  * runtime_memory_gpu_protect on the same thread. Readers nest because glibc's
  * default rwlock prefers readers; a thread holding it exclusively skips relocking. */
+/* sotc: which functions readers waited in and writers held the lock in (lock sites report). */
+typedef struct { const char *name; uint64_t count, ticks; } LockSite;
+#define LOCK_SITES 32
+static LockSite read_sites[LOCK_SITES] __attribute__((unused)), write_sites[LOCK_SITES] __attribute__((unused));
+static __thread const char *lock_site_name, *lock_write_site;
+__attribute__((unused)) static void lock_site_add(LockSite *sites, const char *name, uint64_t ticks) {
+    if (!name) return;
+    for (int i=0;i<LOCK_SITES;++i) {
+        const char *n=__atomic_load_n(&sites[i].name,__ATOMIC_ACQUIRE);
+        if (!n) {
+            const char *expected=NULL;
+            if (!__atomic_compare_exchange_n(&sites[i].name,&expected,name,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE) && expected!=name) continue;
+            n=name;
+        }
+        if (n==name) {
+            __atomic_add_fetch(&sites[i].count,1,__ATOMIC_RELAXED);
+            __atomic_add_fetch(&sites[i].ticks,ticks,__ATOMIC_RELAXED);
+            return;
+        }
+    }
+}
 #ifdef _WIN32
 /* sotc: winpthreads' rwlock queues new readers behind a waiting writer, so a nested read (a
  * reader faulting into runtime_memory_gpu_protect) deadlocked against a mapping thread
@@ -88,32 +109,161 @@ static void lock_backoff(unsigned *spins) {
     else if (*spins < 256) SwitchToThread();
     else { __atomic_add_fetch(&lock_sleeps,1,__ATOMIC_RELAXED); Sleep(1); } /* Sleep(0) only yields to equal or higher priority: a preempted lower-priority holder could wait seconds */
 }
+/* sotc: what the writers wait for and hold (maps, unmaps, protection changes): loading a new
+ * area stalled with every thread around this table; runtime_memory_lock_stats reports it. */
+static uint64_t lock_writes, lock_wait_ticks, lock_hold_ticks, lock_worst_wait_ticks, lock_worst_hold_ticks;
+static uint64_t lock_read_wait_ticks, lock_read_waits;
+static __thread uint64_t lock_held_since;
+static uint64_t lock_ticks(void) { LARGE_INTEGER t; QueryPerformanceCounter(&t); return (uint64_t)t.QuadPart; }
+/* sotc: SOTC_LOCK_WAKE=0 goes back to Sleep(1) for readers that find a writer. A WPR trace of an
+ * area change: the draw thread waited 0.9 s of 1.9 s here, about 1.2 ms per wait for writes that
+ * held the lock 0.1 ms on average (Sleep(1) sleeps a whole timer tick). Readers now block on the
+ * lock word and the writer wakes them as it lets go; the 2 ms timeout only bounds a missed wake. */
+static int lock_wake(void) {
+    static int v=-1;
+    if (v<0) { const char *e=getenv("SOTC_LOCK_WAKE"); v=!(e && e[0]=='0'); }
+    return v;
+}
+static volatile LONG lock_sleepers;
 static void rw_rdlock(void) {
-    for (unsigned spins=0;;lock_backoff(&spins)) {
-        int64_t s=__atomic_load_n(&lock_state,__ATOMIC_RELAXED);
-        if (s>=0 && __atomic_compare_exchange_n(&lock_state,&s,s+1,0,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)) return;
+    int64_t s=__atomic_load_n(&lock_state,__ATOMIC_RELAXED);
+    if (s>=0 && __atomic_compare_exchange_n(&lock_state,&s,s+1,0,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)) return;
+    const uint64_t start=lock_ticks();
+    for (unsigned spins=0;;) {
+        s=__atomic_load_n(&lock_state,__ATOMIC_RELAXED);
+        if (s>=0 && __atomic_compare_exchange_n(&lock_state,&s,s+1,0,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)) break;
+        if (s<0 && spins>=64 && lock_wake()) {
+            __atomic_add_fetch(&lock_sleepers,1,__ATOMIC_SEQ_CST);
+            int64_t held=-1;
+            WaitOnAddress((volatile void *)&lock_state,&held,sizeof(held),2);
+            __atomic_sub_fetch(&lock_sleepers,1,__ATOMIC_SEQ_CST);
+        } else {
+            lock_backoff(&spins);
+        }
     }
+    const uint64_t waited=lock_ticks()-start;
+    __atomic_add_fetch(&lock_read_wait_ticks,waited,__ATOMIC_RELAXED);
+    __atomic_add_fetch(&lock_read_waits,1,__ATOMIC_RELAXED);
+    lock_site_add(read_sites,lock_site_name,waited);
 }
 static void rw_rdunlock(void) { __atomic_sub_fetch(&lock_state,1,__ATOMIC_RELEASE); }
 static void rw_wrlock(void) {
+    const uint64_t start=lock_ticks();
     for (unsigned spins=0;;lock_backoff(&spins)) {
         int64_t s=0;
-        if (__atomic_compare_exchange_n(&lock_state,&s,-1,0,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)) return;
+        if (__atomic_compare_exchange_n(&lock_state,&s,-1,0,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)) break;
+    }
+    const uint64_t now=lock_ticks(), waited=now-start;
+    lock_held_since=now;
+    ++lock_writes; /* under the lock */
+    lock_wait_ticks+=waited;
+    if (waited>lock_worst_wait_ticks) lock_worst_wait_ticks=waited;
+}
+static void rw_wrunlock(void) {
+    const uint64_t held=lock_ticks()-lock_held_since;
+    lock_hold_ticks+=held;
+    if (held>lock_worst_hold_ticks) lock_worst_hold_ticks=held;
+    lock_site_add(write_sites,lock_write_site,held);
+    /* seq_cst: the store must not pass the load of lock_sleepers (see rw_rdlock) */
+    __atomic_store_n(&lock_state,0,__ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&lock_sleepers,__ATOMIC_SEQ_CST)) WakeByAddressAll((void *)&lock_state);
+}
+/* Since the last call: writes, ms writers waited, ms they held it, the longest wait in ms. */
+void runtime_memory_lock_stats(uint64_t *writes, double *wait_ms, double *hold_ms, double *worst_ms) {
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    const double ms=1000.0/(double)f.QuadPart;
+    *writes=__atomic_exchange_n(&lock_writes,0,__ATOMIC_RELAXED);
+    *wait_ms=(double)__atomic_exchange_n(&lock_wait_ticks,0,__ATOMIC_RELAXED)*ms;
+    *hold_ms=(double)__atomic_exchange_n(&lock_hold_ticks,0,__ATOMIC_RELAXED)*ms;
+    *worst_ms=(double)__atomic_exchange_n(&lock_worst_wait_ticks,0,__ATOMIC_RELAXED)*ms;
+}
+/* Since the last call, the sites readers waited longest in and writers held the lock longest in:
+ * "name count/ms" by descending ms. */
+static void lock_sites_format(LockSite *sites, char *out, size_t capacity, double ms) {
+    LockSite copy[LOCK_SITES];
+    int n=0;
+    for (int i=0;i<LOCK_SITES;++i) {
+        const char *name=__atomic_load_n(&sites[i].name,__ATOMIC_ACQUIRE);
+        if (!name) break;
+        copy[n]=(LockSite){name,__atomic_exchange_n(&sites[i].count,0,__ATOMIC_RELAXED),__atomic_exchange_n(&sites[i].ticks,0,__ATOMIC_RELAXED)};
+        if (copy[n].count) ++n;
+    }
+    size_t used=0; out[0]=0;
+    for (int k=0;k<6 && n;++k) {
+        int best=0;
+        for (int i=1;i<n;++i) if (copy[i].ticks>copy[best].ticks) best=i;
+        int w=snprintf(out+used,capacity-used,"%s%s %llu/%.1f",k ? ", " : "",copy[best].name,(unsigned long long)copy[best].count,(double)copy[best].ticks*ms);
+        if (w<0 || (size_t)w>=capacity-used) break;
+        used+=(size_t)w; copy[best]=copy[--n];
     }
 }
-static void rw_wrunlock(void) { __atomic_store_n(&lock_state,0,__ATOMIC_RELEASE); }
+void runtime_memory_lock_sites(char *readers, char *writers, size_t capacity) {
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    const double ms=1000.0/(double)f.QuadPart;
+    lock_sites_format(read_sites,readers,capacity,ms);
+    lock_sites_format(write_sites,writers,capacity,ms);
+}
+/* Since the last call: the longest hold in ms, and how often and how long readers waited. */
+void runtime_memory_lock_stats2(double *worst_hold_ms, uint64_t *read_waits, double *read_wait_ms) {
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    const double ms=1000.0/(double)f.QuadPart;
+    *worst_hold_ms=(double)__atomic_exchange_n(&lock_worst_hold_ticks,0,__ATOMIC_RELAXED)*ms;
+    *read_waits=__atomic_exchange_n(&lock_read_waits,0,__ATOMIC_RELAXED);
+    *read_wait_ms=(double)__atomic_exchange_n(&lock_read_wait_ticks,0,__ATOMIC_RELAXED)*ms;
+}
 #else
 static pthread_rwlock_t lock=PTHREAD_RWLOCK_INITIALIZER;
 static void rw_rdlock(void) { pthread_rwlock_rdlock(&lock); }
 static void rw_rdunlock(void) { pthread_rwlock_unlock(&lock); }
 static void rw_wrlock(void) { pthread_rwlock_wrlock(&lock); }
 static void rw_wrunlock(void) { pthread_rwlock_unlock(&lock); }
+void runtime_memory_lock_stats(uint64_t *writes, double *wait_ms, double *hold_ms, double *worst_ms) {
+    *writes=0; *wait_ms=*hold_ms=*worst_ms=0;
+}
+void runtime_memory_lock_stats2(double *worst_hold_ms, uint64_t *read_waits, double *read_wait_ms) {
+    *worst_hold_ms=*read_wait_ms=0; *read_waits=0;
+}
+void runtime_memory_carve_stats(uint64_t *mib, uint64_t *runs, double *split_ms, double *worst_ms, double *other_ms) {
+    *mib=*runs=0; *split_ms=*worst_ms=*other_ms=0;
+}
+/* sotc: no live view splits on this path (driver.cpp reads these counters unconditionally). */
+uint64_t runtime_memory_carve_freeze_ns(void) { return 0; }
+uint64_t runtime_memory_carve_nostop(void) { return 0; }
+void runtime_memory_lock_sites(char *readers, char *writers, size_t capacity) {
+    if (capacity) readers[0]=writers[0]=0;
+}
 #endif
 static __thread unsigned exclusive_depth;
 /* Odd while a writer holds the lock; readers' region caches are valid for one even value. */
 static uint64_t table_generation;
-static void write_lock(void) {
-    if (!exclusive_depth++) { rw_wrlock(); __atomic_add_fetch(&table_generation,1,__ATOMIC_ACQ_REL); }
+/* sotc: the VMA range each write changed (SOTC_REGION_LOG=0: none kept). An area change makes
+ * ~2000 writes per second (maps, unmaps, the GPU hook queue), so caches valid for one generation
+ * were always stale and every GPU lookup took the read lock, then waited for the writer. A
+ * cached region stays valid while no write since it was read touched its range, even while a
+ * write elsewhere is under way (dirty_lo/hi is published before each change). Slot of the
+ * write that ended at even generation g: (g/2) % DIRTY_LOG; generation 0 while it is rewritten. */
+#define DIRTY_LOG 64
+typedef struct { uint64_t generation; uintptr_t start, end; } DirtyLogEntry; /* renamed: carve_dirty below has its own DirtyRange */
+static DirtyLogEntry dirty_log[DIRTY_LOG];
+static uintptr_t dirty_lo, dirty_hi; /* of the write under way */
+static int region_log_on(void) {
+    static int v=-1;
+    if (v<0) { const char *e=getenv("SOTC_REGION_LOG"); v=!(e && e[0]=='0'); }
+    return v;
+}
+/* Before a change of the VMAs in [a,b) (under the write lock). */
+static void dirty(uintptr_t a, uintptr_t b) {
+    if (a<dirty_lo) __atomic_store_n(&dirty_lo,a,__ATOMIC_SEQ_CST);
+    if (b>dirty_hi) __atomic_store_n(&dirty_hi,b,__ATOMIC_SEQ_CST);
+}
+static void write_lock_at(const char *site) {
+    if (!exclusive_depth++) {
+        rw_wrlock();
+        lock_write_site=site;
+        __atomic_store_n(&dirty_lo,UINTPTR_MAX,__ATOMIC_SEQ_CST);
+        __atomic_store_n(&dirty_hi,0,__ATOMIC_SEQ_CST);
+        __atomic_add_fetch(&table_generation,1,__ATOMIC_SEQ_CST);
+    }
 }
 /* sotc: SOTC_CARVE_NOSTOP. Ranges a split left writable that the GPU tracker had write-protected:
  * they are reported to the GPU as written by the CPU (hook_invalidate) once the table lock is free
@@ -123,6 +273,19 @@ typedef struct { uintptr_t start, end; } DirtyRange;
 static DirtyRange carve_dirty[CARVE_DIRTY_MAX];
 static size_t carve_dirty_count;
 static void (*carve_dirty_hook)(uintptr_t, uint64_t);
+/* Ends a write under the lock: logs the VMA range it changed (dirty_lo/hi) at the next even
+ * generation, then bumps the generation. Both unlock paths below call it before the lock is let go. */
+static void write_publish(void) {
+    const uint64_t ended=table_generation+1;
+    DirtyLogEntry *d=&dirty_log[(ended/2)%DIRTY_LOG];
+    const int any=dirty_lo<dirty_hi;
+    __atomic_store_n(&d->generation,0,__ATOMIC_RELAXED);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    __atomic_store_n(&d->start,any ? dirty_lo : 0,__ATOMIC_RELAXED);
+    __atomic_store_n(&d->end,any ? dirty_hi : 0,__ATOMIC_RELAXED);
+    __atomic_store_n(&d->generation,ended,__ATOMIC_RELEASE);
+    __atomic_add_fetch(&table_generation,1,__ATOMIC_RELEASE);
+}
 static void write_unlock(void) {
     if (exclusive_depth==1 && carve_dirty_count) {
         DirtyRange local[CARVE_DIRTY_MAX];
@@ -131,14 +294,35 @@ static void write_unlock(void) {
         memcpy(local,carve_dirty,n*sizeof(*local));
         carve_dirty_count=0;
         --exclusive_depth;
-        __atomic_add_fetch(&table_generation,1,__ATOMIC_RELEASE);
+        write_publish();
         rw_wrunlock();
         if (hook) for (size_t i=0;i<n;++i) hook(local[i].start,local[i].end-local[i].start);
         return;
     }
-    if (!--exclusive_depth) { __atomic_add_fetch(&table_generation,1,__ATOMIC_RELEASE); rw_wrunlock(); }
+    if (!--exclusive_depth) { write_publish(); rw_wrunlock(); }
 }
-static void read_lock(void) { if (!exclusive_depth) rw_rdlock(); }
+/* Whether a region read at even generation `since` is unchanged at generation now. */
+static int region_unchanged(uintptr_t start, uintptr_t end, uint64_t since, uint64_t now) {
+    const uint64_t done=now & ~(uint64_t)1;
+    if (done-since>2*(DIRTY_LOG-1)) return 0;
+    for (uint64_t g=since+2; g<=done; g+=2) {
+        DirtyLogEntry *d=&dirty_log[(g/2)%DIRTY_LOG];
+        if (__atomic_load_n(&d->generation,__ATOMIC_ACQUIRE)!=g) return 0;
+        uintptr_t a=__atomic_load_n(&d->start,__ATOMIC_RELAXED), b=__atomic_load_n(&d->end,__ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&d->generation,__ATOMIC_RELAXED)!=g) return 0;
+        if (a<end && start<b) return 0;
+    }
+    if (now & 1) {
+        uintptr_t lo=__atomic_load_n(&dirty_lo,__ATOMIC_SEQ_CST), hi=__atomic_load_n(&dirty_hi,__ATOMIC_SEQ_CST);
+        if (__atomic_load_n(&table_generation,__ATOMIC_SEQ_CST)!=now) return 0;
+        if (lo<end && start<hi) return 0;
+    }
+    return 1;
+}
+static void read_lock_at(const char *site) { if (!exclusive_depth) { lock_site_name=site; rw_rdlock(); } }
+#define write_lock() write_lock_at(__func__)
+#define read_lock() read_lock_at(__func__)
 static void read_unlock(void) { if (!exclusive_depth) rw_rdunlock(); }
 static Block blocks[LIMIT];
 static Vma *vmas; static size_t vma_count, vma_capacity;
@@ -260,14 +444,16 @@ static uint64_t qpc_ns(void) {
     QueryPerformanceCounter(&now);
     return (uint64_t)((double)now.QuadPart*1e9/(double)freq.QuadPart);
 }
-/* sotc: SOTC_VIEW_CHUNK_MB=N maps new ranges as views of at most N MiB aligned to N MiB (0, the
- * default: one view per mapping). Unmapping part of a range then splits only the chunk(s) at its
- * edges, so the freeze of carve_host covers at most two chunks instead of the whole mapping. */
-/* sotc: SOTC_VIEW_CHUNK_KB=N (multiple of 64, takes precedence over the MiB setting): views of N
- * KiB. With 64, a remap of the game's 64 KiB pages inside a large mapping (sceKernelBatchMap while
- * an area streams) replaces whole views and never splits a live one, so the other guest threads
- * are never stopped for it. Costs one view per 64 KiB (more host protection calls on wide ranges,
- * and the boot maps ~150k views). */
+/* sotc: the view chunk, one definition for both sides' switches (upstream 0.70 and ours).
+ * SOTC_VIEW_CHUNK_KB=N (multiple of 64, takes precedence when set): views of N KiB. With 64, a
+ * remap of the game's 64 KiB pages inside a large mapping (sceKernelBatchMap while an area streams)
+ * replaces whole views and never splits a live one, so the other guest threads are never stopped
+ * for it. Costs one view per 64 KiB (more host protection calls on wide ranges, and the boot maps
+ * ~150k views).
+ * SOTC_VIEW_CHUNK_MB=N (used when KB is not set): views of at most N MiB aligned to N MiB. Unset
+ * means 2 MiB, the upstream 0.70 default; 0 means one view per mapping. Unmapping part of a range
+ * then splits only the chunk(s) at its edges, so the freeze of carve_host covers at most two
+ * chunks instead of the whole mapping (a split only remaps the chunks at its two ends). */
 static uint64_t view_chunk(void) {
     static uint64_t v=UINT64_MAX;
     if (v==UINT64_MAX) {
@@ -277,10 +463,22 @@ static uint64_t view_chunk(void) {
             v=strtoull(kb,NULL,10)<<10;
             v=v<(UINT64_C(64)<<10) ? (UINT64_C(64)<<10) : v-v%(UINT64_C(64)<<10); /* granularity */
         } else {
-            v=e ? (uint64_t)strtoull(e,NULL,10)<<20 : 0;
+            v=e ? (uint64_t)strtoull(e,NULL,10)<<20 : UINT64_C(2)<<20;
         }
     }
     return v;
+}
+/* sotc: the cost of carving live views (under the write lock): splits, MiB of views mapped
+ * again, protection runs restored, ms they took and the longest one; ms of all other carves. */
+static uint64_t carve_split_bytes, carve_split_runs, carve_split_ticks, carve_split_worst, carve_other_ticks;
+void runtime_memory_carve_stats(uint64_t *mib, uint64_t *runs, double *split_ms, double *worst_ms, double *other_ms) {
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    const double ms=1000.0/(double)f.QuadPart;
+    *mib=__atomic_exchange_n(&carve_split_bytes,0,__ATOMIC_RELAXED)>>20;
+    *runs=__atomic_exchange_n(&carve_split_runs,0,__ATOMIC_RELAXED);
+    *split_ms=(double)__atomic_exchange_n(&carve_split_ticks,0,__ATOMIC_RELAXED)*ms;
+    *worst_ms=(double)__atomic_exchange_n(&carve_split_worst,0,__ATOMIC_RELAXED)*ms;
+    *other_ms=(double)__atomic_exchange_n(&carve_other_ticks,0,__ATOMIC_RELAXED)*ms;
 }
 /* The threads carve_host stopped, so win_fail can resume them before reporting. */
 static void *carve_stopped[256];
@@ -410,6 +608,10 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
     HostRegion left=regions[first], right=regions[last-1];
     int keep_left=left.mapped && lo<a, keep_right=right.mapped && b<hi;
     if (first==last-1 && !left.mapped && lo==a && hi==b) return first;
+    const uint64_t carve_start=lock_ticks();
+    /* before the views change (see runtime_memory_gpu_protect): [a,b) and the views around it
+     * that are mapped again; placeholders around it hold no view to protect */
+    dirty(keep_left ? lo : a,keep_right ? hi : b);
     ProtRun *runs=NULL; size_t nruns=0, capacity=0, left_runs=0;
     if (keep_left) left_runs=nruns=save_protections(lo,a,&runs,nruns,&capacity);
     if (keep_right) nruns=save_protections(b,hi,&runs,nruns,&capacity);
@@ -536,8 +738,22 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
     }
     (void)left_runs;
     free(runs);
+    const uint64_t carve_took=lock_ticks()-carve_start;
+    if (keep_left || keep_right) {
+        carve_split_bytes+=(keep_left ? a-lo : 0)+(keep_right ? hi-b : 0); /* under the write lock */
+        carve_split_runs+=nruns;
+        carve_split_ticks+=carve_took;
+        if (carve_took>carve_split_worst) carve_split_worst=carve_took;
+    } else {
+        carve_other_ticks+=carve_took;
+    }
     return at;
 }
+/* Why views are chunked (upstream 0.70, SOTC_VIEW_CHUNK_MB): a view cannot be unmapped in part, so
+ * unmapping a piece of a big mapping unmapped and mapped again everything around it (live view
+ * splits): at an area change the game's munmaps remapped 60-346 GB of views per 5 s under the
+ * write lock and the frame stopped. Mappings made of views that end at chunk boundaries let a
+ * split remap only the chunks at its two ends. */
 static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, uint64_t phys) {
     carve_reason="map";
     size_t i=carve_host(address,address+size);
@@ -689,18 +905,35 @@ static size_t vma_index(uintptr_t a) { /* first VMA with end > a */
     while (lo<hi) { size_t mid=(lo+hi)/2; if (vmas[mid].end<=a) lo=mid+1; else hi=mid; }
     return lo;
 }
+/* sotc: odd while the VMA array is being changed in place (insert, erase, field writes). The
+ * GPU's lookups read the array without the lock and retry when it changed meanwhile
+ * (vma_lookup_fast); a grown array is never freed, so such a read never touches freed memory. */
+static uint64_t vma_seq;
+static void vma_seq_begin(void) { __atomic_add_fetch(&vma_seq,1,__ATOMIC_SEQ_CST); }
+static void vma_seq_end(void) { __atomic_add_fetch(&vma_seq,1,__ATOMIC_RELEASE); }
 static int vma_insert(size_t at, Vma v) {
     if (vma_count==vma_capacity) {
         size_t capacity=vma_capacity ? vma_capacity*2 : 256;
-        Vma *next=realloc(vmas,capacity*sizeof(*vmas));
+        Vma *next=malloc(capacity*sizeof(*vmas));
         if (!next) return -1;
-        vmas=next; vma_capacity=capacity;
+        if (vma_count) memcpy(next,vmas,vma_count*sizeof(*vmas));
+        vma_seq_begin();
+        __atomic_store_n(&vmas,next,__ATOMIC_RELEASE); /* the old array stays: see vma_seq */
+        vma_capacity=capacity;
+        vma_seq_end();
     }
+    dirty(v.start,v.end);
+    vma_seq_begin();
     memmove(vmas+at+1,vmas+at,(vma_count-at)*sizeof(*vmas));
-    vmas[at]=v; ++vma_count; return 0;
+    vmas[at]=v; ++vma_count;
+    vma_seq_end();
+    return 0;
 }
 static void vma_erase(size_t at, size_t n) {
+    if (n) dirty(vmas[at].start,vmas[at+n-1].end);
+    vma_seq_begin();
     memmove(vmas+at,vmas+at+n,(vma_count-at-n)*sizeof(*vmas)); vma_count-=n;
+    vma_seq_end();
 }
 static int split_at(uintptr_t a) {
     size_t i=vma_index(a);
@@ -708,7 +941,10 @@ static int split_at(uintptr_t a) {
     Vma right=vmas[i];
     right.start=a;
     if (right.kind==KIND_DIRECT) right.phys+=a-vmas[i].start;
+    dirty(vmas[i].start,vmas[i].end);
+    vma_seq_begin();
     vmas[i].end=a;
+    vma_seq_end();
     return vma_insert(i+1,right);
 }
 /* Range [start,end) split on its edges; returns the first index inside it. */
@@ -954,10 +1190,13 @@ static int32_t protect_locked(uintptr_t start, uint64_t size, int prot, int type
     uintptr_t end=start+align_up(size,PAGE);
     start&=~(uintptr_t)(PAGE-1);
     if ((prot & ~0x37) || !covered(start,end,0)) return INVALID;
+    dirty(start,end); /* before the host protection changes: see runtime_memory_gpu_protect */
     if (host_protect(start,end-start,host_prot(prot))) return INVALID;
     int error; size_t i=carve(start,end,&error);
     if (error) return NO_MEMORY;
+    vma_seq_begin();
     for (; i<vma_count && vmas[i].start<end; ++i) { vmas[i].prot=prot; if (type>=0) vmas[i].type=type; }
+    vma_seq_end();
     queue_hook(HOOK_INVALIDATE,start,end-start);
     ++protects;
     return 0;
@@ -1016,8 +1255,14 @@ static ABI int32_t direct_memory_type(uint64_t phys, int *type, void **start, vo
 static ABI int32_t batch_map2(BatchEntry *entries, int count, int *processed, int flags) {
     if (!entries || count<0) return INVALID;
     int32_t result=0; int done=0;
+    /* sotc: SOTC_BATCH_SPLIT=0 holds the lock for the whole batch. At an area change the game's
+     * batches held it ~0.5 s per 5 s and every GPU lookup in that time waited for the batch to
+     * end; one entry at a time lets them in between (each entry is whole for them). */
+    static int split=-1;
+    if (split<0) { const char *v=getenv("SOTC_BATCH_SPLIT"); split=!(v && v[0]=='0'); }
     write_lock();
     for (; done<count; ++done) {
+        if (split && done) { write_unlock(); write_lock(); }
         BatchEntry *e=&entries[done];
         switch (e->operation) {
         case 0: result=map_direct_locked(&e->start,e->length,(uint8_t)e->prot,flags,(int64_t)e->offset,0); break;
@@ -1168,26 +1413,12 @@ void runtime_memory_set_gpu_hooks(GpuRange map, GpuRange unmap, GpuRange invalid
     flush_hooks();
 }
 /* Writes through the backing view; 0 when part of the range has no backing. */
-int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t size) {
-    read_lock();
-    int ok=1;
-    for (uintptr_t at=address, end=address+size; at<end && ok;) {
-        size_t i=vma_index(at);
-        if (i==vma_count || vmas[i].start>at || vmas[i].kind==KIND_RESERVED) { ok=0; break; }
-        uint64_t n=(vmas[i].end<end ? vmas[i].end : end)-at;
-        if (bbgpu_upload_wait_phys) bbgpu_upload_wait_phys(vmas[i].phys+(at-vmas[i].start),n); /* sotc */
-        memcpy(backing_base+vmas[i].phys+(at-vmas[i].start),(const unsigned char *)data+(at-address),n);
-        at+=n;
-    }
-    read_unlock();
-    return ok;
-}
 /* sotc: host pointer to the backing of a mapped guest address (bypasses GPU page protection),
  * valid to the end of its VMA; NULL for reserved or unmapped addresses. */
 
 /* Per-thread cache of recently found regions for the GPU's per-draw queries:
  * entries hold for as long as the table generation they were read at. */
-typedef struct { uint64_t generation; uintptr_t start, end; int kind; const unsigned char *backing; } CachedRegion; /* backing: view of start */
+typedef struct { uint64_t generation; uintptr_t start, end; int kind, prot; const unsigned char *backing; } CachedRegion; /* backing: view of start */
 static __thread CachedRegion region_cache[8];
 static __thread unsigned region_cache_next;
 /* sotc: plus 512 direct-mapped entries by 16 KiB of address. The command processor's buffer binds
@@ -1201,25 +1432,148 @@ static void region_direct_init(void) {
     region_direct_on=!(v && v[0]=='0');
 }
 static size_t region_direct_slot(uintptr_t address) { return (address>>14)&(REGION_DIRECT_SLOTS-1); }
-static const CachedRegion *cached_region(uintptr_t address) {
+/* An entry read at an older generation is checked against the writes since (region_unchanged)
+ * and, while no write is under way, stamped with the current one. */
+/* sotc: [qa,qb) is the part of the region the caller uses (qb 0: the whole region). A write that
+ * changed another part of a direct region (the game maps 64 KiB pages inside big mappings) leaves
+ * the used part as it was: direct memory stays contiguous across splits (split_at). */
+static int region_current(CachedRegion *c, uint64_t generation, uintptr_t qa, uintptr_t qb) {
+    if (c->generation==generation) return 1;
+    if (!region_log_on()) return 0;
+    if (region_unchanged(c->start,c->end,c->generation,generation)) {
+        if (!(generation & 1)) c->generation=generation;
+        return 1;
+    }
+    if (!qb || c->kind!=KIND_DIRECT) return 0;
+    return region_unchanged(qa,qb<c->end ? qb : c->end,c->generation,generation);
+}
+/* sotc: lookups that found no entry, and that found one a write had made stale (lock report) */
+static uint64_t region_misses, region_stale;
+static uint64_t region_fast_hits;
+void runtime_memory_cache_stats(uint64_t *misses, uint64_t *stale, uint64_t *fast) {
+    *misses=__atomic_exchange_n(&region_misses,0,__ATOMIC_RELAXED);
+    *stale=__atomic_exchange_n(&region_stale,0,__ATOMIC_RELAXED);
+    *fast=__atomic_exchange_n(&region_fast_hits,0,__ATOMIC_RELAXED);
+}
+/* sotc: the VMA holding address, read without the lock (0: none there, or the array kept changing:
+ * take the lock). A torn read is caught by vma_seq. */
+static int vma_lookup_fast(uintptr_t address, Vma *out) {
+    for (int tries=0; tries<4; ++tries) {
+        const uint64_t s=__atomic_load_n(&vma_seq,__ATOMIC_ACQUIRE);
+        if (s & 1) continue;
+        const Vma *v=__atomic_load_n(&vmas,__ATOMIC_ACQUIRE);
+        const size_t n=__atomic_load_n(&vma_count,__ATOMIC_RELAXED);
+        size_t lo=0, hi=n;
+        while (lo<hi) {
+            size_t mid=(lo+hi)/2;
+            if (__atomic_load_n(&v[mid].end,__ATOMIC_RELAXED)<=address) lo=mid+1; else hi=mid;
+        }
+        Vma e={0};
+        if (lo<n) {
+            e.start=__atomic_load_n(&v[lo].start,__ATOMIC_RELAXED);
+            e.end=__atomic_load_n(&v[lo].end,__ATOMIC_RELAXED);
+            e.kind=__atomic_load_n(&v[lo].kind,__ATOMIC_RELAXED);
+            e.prot=__atomic_load_n(&v[lo].prot,__ATOMIC_RELAXED);
+            e.phys=__atomic_load_n(&v[lo].phys,__ATOMIC_RELAXED);
+        }
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&vma_seq,__ATOMIC_RELAXED)!=s) continue;
+        if (lo==n || e.start>address) return 0;
+        *out=e;
+        return 1;
+    }
+    return 0;
+}
+static __thread CachedRegion region_scratch;
+static const CachedRegion *cached_region_q(uintptr_t address, uintptr_t qend) {
     uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
-    if (generation & 1) return NULL;
+    if ((generation & 1) && !region_log_on()) return NULL;
+    int found=0;
     if (region_direct_on) {
-        const CachedRegion *d=&region_direct[region_direct_slot(address)];
-        if (d->generation==generation && d->end && d->start<=address && address<d->end) return d;
+        CachedRegion *d=&region_direct[region_direct_slot(address)];
+        if (d->end && d->start<=address && address<d->end) {
+            if (region_current(d,generation,address,qend)) return d;
+            found=1;
+        }
     }
     for (unsigned i=0;i<8;++i) {
-        const CachedRegion *c=&region_cache[i];
-        if (c->generation==generation && c->end && c->start<=address && address<c->end) return c;
+        CachedRegion *c=&region_cache[i];
+        if (c->end && c->start<=address && address<c->end) {
+            if (region_current(c,generation,address,qend)) return c;
+            found=1;
+        }
     }
-    return NULL;
+    __atomic_add_fetch(found ? &region_stale : &region_misses,1,__ATOMIC_RELAXED);
+    /* sotc: SOTC_REGION_FAST=0: misses take the lock. The cache missed ~100k lookups per second at
+     * an area change (the GPU touches more regions than it holds), and each miss waited for the
+     * writer of the moment: the VMA is read without the lock instead, and used when no write
+     * since the generation read first changed its range (region_unchanged, the write under way
+     * included). */
+    static int fast=-1;
+    if (fast<0) { const char *v=getenv("SOTC_REGION_FAST"); fast=!(v && v[0]=='0'); }
+    if (!fast || !region_log_on() || !backing_base) return NULL;
+    Vma e;
+    if (!vma_lookup_fast(address,&e)) return NULL;
+    const uint64_t now=__atomic_load_n(&table_generation,__ATOMIC_SEQ_CST);
+    const uint64_t since=generation & ~(uint64_t)1;
+    if (!((now==generation && !(now & 1)) || region_unchanged(e.start,e.end,since,now) ||
+          (qend && e.kind==KIND_DIRECT && region_unchanged(address,qend<e.end ? qend : e.end,since,now)))) return NULL;
+    const CachedRegion entry={since,e.start,e.end,e.kind,e.prot,e.kind!=KIND_RESERVED ? backing_base+e.phys : NULL};
+    region_scratch=entry;
+    region_cache[region_cache_next++ % 8]=entry;
+    if (region_direct_on>0) region_direct[region_direct_slot(address)]=entry;
+    __atomic_add_fetch(&region_fast_hits,1,__ATOMIC_RELAXED);
+    return &region_scratch;
+}
+/* A lookup of address alone. */
+static const CachedRegion *cached_region(uintptr_t address) { return cached_region_q(address,address+1); }
+/* sotc: SOTC_WRITE_FAST=0 always takes the read lock. Readbacks write here thousands of times per
+ * frame and at an area change waited for map batches of other ranges (~0.4 s per 5 s). Copies up
+ * to 256 KiB whose regions the cache holds as unchanged (no write under way on them) are made
+ * without the lock: every region is resolved before the first byte is written, else all of it
+ * takes the lock. */
+static int write_backing_fast(uintptr_t address, const void *data, uint64_t size) {
+    static int on=-1;
+    if (on<0) { const char *v=getenv("SOTC_WRITE_FAST"); on=!(v && v[0]=='0') && region_log_on(); }
+    if (!on || exclusive_depth || (runtime_disabled_optimizations & 1) || !size || size>(256u<<10)) return 0;
+    unsigned char *dst[4]; uint64_t len[4]; int parts=0;
+    for (uintptr_t at=address, end=address+size; at<end; ++parts) {
+        if (parts==4) return 0;
+        const CachedRegion *c=cached_region_q(at,end);
+        if (!c || c->kind==KIND_RESERVED || !c->backing) return 0;
+        dst[parts]=(unsigned char *)c->backing+(at-c->start);
+        len[parts]=(c->end<end ? c->end : end)-at;
+        at+=len[parts];
+    }
+    /* sotc: SOTC_ASYNC_UPLOAD: the copies still reading these bytes finish first (they take no lock,
+     * so waiting here is safe). The backing offset of each part is its pointer minus backing_base. */
+    if (bbgpu_upload_wait_phys) for (int i=0;i<parts;++i)
+        bbgpu_upload_wait_phys((uint64_t)((uintptr_t)dst[i]-(uintptr_t)backing_base),len[i]);
+    const unsigned char *src=data;
+    for (int i=0;i<parts;++i) { memcpy(dst[i],src,len[i]); src+=len[i]; }
+    return 1;
+}
+int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t size) {
+    if (write_backing_fast(address,data,size)) return 1;
+    read_lock();
+    int ok=1;
+    for (uintptr_t at=address, end=address+size; at<end && ok;) {
+        size_t i=vma_index(at);
+        if (i==vma_count || vmas[i].start>at || vmas[i].kind==KIND_RESERVED) { ok=0; break; }
+        uint64_t n=(vmas[i].end<end ? vmas[i].end : end)-at;
+        if (bbgpu_upload_wait_phys) bbgpu_upload_wait_phys(vmas[i].phys+(at-vmas[i].start),n); /* sotc */
+        memcpy(backing_base+vmas[i].phys+(at-vmas[i].start),(const unsigned char *)data+(at-address),n);
+        at+=n;
+    }
+    read_unlock();
+    return ok;
 }
 /* Called under the read lock after a lookup of address. */
 static void cache_region(size_t i, uintptr_t address) {
     uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
     if (i==vma_count || (generation & 1)) return;
     const unsigned char *backing=vmas[i].kind!=KIND_RESERVED && backing_base ? backing_base+vmas[i].phys : NULL;
-    const CachedRegion entry={generation,vmas[i].start,vmas[i].end,vmas[i].kind,backing};
+    const CachedRegion entry={generation,vmas[i].start,vmas[i].end,vmas[i].kind,vmas[i].prot,backing};
     region_cache[region_cache_next++ % 8]=entry;
     if (region_direct_on>0) region_direct[region_direct_slot(address)]=entry;
 }
@@ -1233,8 +1587,9 @@ uint64_t runtime_memory_generation(void) {
 }
 /* sotc: the GPU reads guest memory through the backing view on every upload; the per-thread
  * region cache spares it the table lock (a winpthread rwlock, slow) and the binary search. */
-/* sotc: SOTC_HOST_IMPORT (GPU host_import.cpp): the second view of the whole pool (direct and
- * flexible memory) and its size; NULL before the pool exists. */
+/* sotc: the whole backing view (direct then flexible memory) and its size, for the GPU to import
+ * it in place: SOTC_HOST_IMPORT (GPU host_import.cpp) and SOTC_PC_MEMORY
+ * (docs/sotc/MODELO-MEMORIA-PC.md). NULL before the pool exists. One definition for both. */
 const unsigned char *runtime_memory_backing_view(uint64_t *size) {
     if (size) *size = backing_base ? (uint64_t)(POOL_SIZE+FLEX_SPAN) : 0;
     return backing_base;
@@ -1260,7 +1615,7 @@ static uint64_t cached_mapped_length(uintptr_t address, uint64_t size) {
     if (runtime_disabled_optimizations & 1) return 0;
     uint64_t length=0;
     for (unsigned hops=0; length<size && hops<4; ++hops) {
-        const CachedRegion *c=cached_region(address+length);
+        const CachedRegion *c=cached_region_q(address+length,address+size);
         if (!c || c->kind==KIND_RESERVED) return 0;
         length=c->end-address;
     }
@@ -1280,7 +1635,7 @@ uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size) {
 }
 /* Region around address: [start,end) mapped or a gap; 0 past the last mapping. */
 int runtime_memory_region(uintptr_t address, uintptr_t *start, uintptr_t *end, int *mapped) {
-    const CachedRegion *c=(runtime_disabled_optimizations & 1) ? NULL : cached_region(address);
+    const CachedRegion *c=(runtime_disabled_optimizations & 1) ? NULL : cached_region_q(address,0);
     if (c) { *start=c->start; *end=c->end; *mapped=c->kind!=KIND_RESERVED; return 1; }
     read_lock();
     size_t i=vma_index(address);
@@ -1293,6 +1648,46 @@ int runtime_memory_region(uintptr_t address, uintptr_t *start, uintptr_t *end, i
     }
     read_unlock();
     return found;
+}
+/* sotc: SOTC_COPY_LOCK_ONCE=1 (bbgpu CopySparseMemory): guest memory copied out through the
+ * backing view in one call, for the GPU's texture and buffer uploads. They looked up the region
+ * and then the backing pointer of every mapping run, and at an area change each lookup the region
+ * cache could not answer waited for a map batch: 41-58 ms for 12-20 MB of textures in one frame
+ * (user's route, 29 Oct). The cached regions are copied first; the rest under one read lock.
+ * Reserved and unmapped bytes read as zero, as before. 0 (caller copies run by run) before the
+ * backing view exists: a copy from guest addresses can fault, and the fault must not find the
+ * read lock held. */
+int runtime_memory_copy_out(uintptr_t source, unsigned char *dest, uint64_t size) {
+    if (!backing_base) return 0;
+    uintptr_t at=source;
+    const uintptr_t end=source+size;
+    if (!(runtime_disabled_optimizations & 1)) {
+        while (at<end) {
+            const CachedRegion *c=cached_region_q(at,end);
+            if (!c || c->kind==KIND_RESERVED || !c->backing) break;
+            const uintptr_t stop=c->end<end ? c->end : end;
+            memcpy(dest+(at-source),c->backing+(at-c->start),stop-at);
+            at=stop;
+        }
+    }
+    if (at==end) return 1;
+    read_lock();
+    while (at<end) {
+        const size_t i=vma_index(at);
+        uintptr_t stop;
+        if (i<vma_count && vmas[i].start<=at) {
+            stop=vmas[i].end<end ? vmas[i].end : end;
+            cache_region(i,at);
+            if (vmas[i].kind==KIND_RESERVED) memset(dest+(at-source),0,stop-at);
+            else memcpy(dest+(at-source),backing_base+vmas[i].phys+(at-vmas[i].start),stop-at);
+        } else {
+            stop=i<vma_count && vmas[i].start<end ? vmas[i].start : end;
+            memset(dest+(at-source),0,stop-at);
+        }
+        at=stop;
+    }
+    read_unlock();
+    return 1;
 }
 /* GPU page tracking: restrict host access, never beyond the guest's own protection. */
 /* sotc: diagnostics for page tracking problems: the runtime's view of a page (VMA kind and guest
@@ -1312,7 +1707,44 @@ void runtime_memory_describe(uintptr_t address, char *out, size_t capacity) {
     snprintf(out,capacity,"vma kind %d prot %#x [%#llx,%#llx), host protect %#lx",kind,prot,
              (unsigned long long)start,(unsigned long long)end,host);
 }
+/* sotc: SOTC_PROTECT_FAST=0 always takes the read lock. GPU page protection was the lock's
+ * busiest reader at area changes (~0.3 s of waits per 5 s): it waited for map and unmap batches
+ * of other ranges. When the range lies in one cached region that no write is changing, the host
+ * protection is set without the lock, split where views can end (chunk boundaries, within one
+ * VMA). A write that started meanwhile on the range (its carve or protect publishes the range
+ * first, dirty()) may have saved and restored the old protection: it is then set again under the
+ * lock, after that write. */
+#ifdef _WIN32
+static int protect_fast(uintptr_t address, uint64_t size, int read, int write) {
+    static int on=-1;
+    if (on<0) { const char *v=getenv("SOTC_PROTECT_FAST"); on=!(v && v[0]=='0') && region_log_on(); }
+    if (!on || exclusive_depth || (runtime_disabled_optimizations & 1) || !size) return 0;
+    const uint64_t before=__atomic_load_n(&table_generation,__ATOMIC_SEQ_CST);
+    const CachedRegion *c=cached_region_q(address,address+size);
+    if (!c || c->kind==KIND_RESERVED || address+size>c->end) return 0;
+    const int guest=host_prot(c->prot);
+    const int want=(read ? PROT_READ : 0)|(write ? PROT_WRITE|PROT_READ : 0)|(guest & PROT_EXEC);
+    const DWORD protect=win_prot(guest & want);
+    const uint64_t chunk=view_chunk();
+    for (uintptr_t at=address, end=address+size; at<end;) {
+        uintptr_t next=chunk ? (at/chunk+1)*chunk : end;
+        if (next>end) next=end;
+        DWORD old;
+        if (!VirtualProtect((void *)at,next-at,protect,&old)) return 0;
+        at=next;
+    }
+    /* an odd generation is a write under way, which may have reached this range since */
+    const uint64_t now=__atomic_load_n(&table_generation,__ATOMIC_SEQ_CST);
+    return (now==before && !(now & 1)) || region_unchanged(address,address+size,before & ~(uint64_t)1,now);
+}
+#else
+static int protect_fast(uintptr_t address, uint64_t size, int read, int write) {
+    (void)address; (void)size; (void)read; (void)write;
+    return 0;
+}
+#endif
 void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int write) {
+    if (protect_fast(address,size,read,write)) return;
     read_lock();
     /* sotc: adjacent VMAs that end up with the same protection share one host_protect call
      * (VirtualProtect is a system call; the draw thread re-protects ranges per binding). */

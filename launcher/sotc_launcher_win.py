@@ -1132,7 +1132,16 @@ class Launcher:
         self.build_advanced()
         self.build_log()
         self.root.bind_all('<MouseWheel>', self.wheel)
+        # The wheel over a closed box scrolls the page instead of changing the option (Tk's
+        # default on Windows changes it, easy to do by accident while scrolling).
+        self.root.bind_class('TCombobox', '<MouseWheel>', self.wheel_over_box)
         self.refresh_status()
+
+    def wheel_over_box(self, event):
+        page = self.pages.get(self.current_page)
+        if hasattr(page, 'scroll'):
+            page.scroll(int(-event.delta / 120))
+        return 'break'
 
     def wheel(self, event):
         page = self.pages.get(self.current_page)

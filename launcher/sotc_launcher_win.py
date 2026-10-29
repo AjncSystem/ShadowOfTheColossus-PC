@@ -193,8 +193,8 @@ TK_TO_SDL = {
     'KP_Add': 'Keypad +', 'KP_Subtract': 'Keypad -', 'KP_Multiply': 'Keypad *', 'KP_Divide': 'Keypad /',
     'KP_Decimal': 'Keypad .',
 }
-GPU_SUBMIT = [('auto', ('Automático (ligado em NVIDIA)', 'Automatic (on with NVIDIA)')),
-              ('on', ('Ligado em qualquer placa (AMD/Intel: experimental)', 'On with any card (AMD/Intel: experimental)')),
+GPU_SUBMIT = [('auto', ('Automático (ligado em NVIDIA e AMD)', 'Automatic (on with NVIDIA and AMD)')),
+              ('on', ('Ligado em qualquer placa (Intel: experimental)', 'On with any card (Intel: experimental)')),
               ('off', ('Desligado', 'Off'))]
 # Video memory use (#143): (texture collection from % of the card's budget, arena release from MB; 0 = never).
 VRAM_USE = [('auto', ('Automático (pelo orçamento da placa)', 'Automatic (from the card\'s budget)')),
@@ -680,7 +680,7 @@ def game_environment(s):
     env['SOTC_RECORD_THREAD'] = '1' if s.get('perf_record_thread', True) else '0'
     if not s.get('perf_dma', True):
         env['BB_DIRECT_MEMORY_ACCESS'] = '0'
-    # Periodic submits and readbacks ahead: by default only with NVIDIA (vk_rasterizer.cpp).
+    # Periodic submits and readbacks ahead: by default with NVIDIA and AMD (vk_rasterizer.cpp).
     if s.get('gpu_submit') == 'on':
         env['SOTC_FLUSH_US'], env['SOTC_RB_AHEAD'] = '1000', '1'
     elif s.get('gpu_submit') == 'off':

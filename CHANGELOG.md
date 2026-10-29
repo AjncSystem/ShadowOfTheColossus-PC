@@ -1,6 +1,16 @@
 # Changelog
 
 ## Não lançado — desempenho no streaming e correções visuais
+- **`SOTC_RB_EXACT=publish` (experimental, desligado; resultado medido: pior):** versão enxuta do
+  `SOTC_RB_EXACT`, sem o mapa de quem escreveu cada byte. Adia só o label do XPR (EOP, evento
+  `0x28` BOTTOM_OF_PIPE_TS, 32 bits, valor 1) que vem depois de escritas da GPU, copia em bloco o que
+  a GPU escreveu desde o label anterior e só escreve o label depois de entregar esses bytes na
+  memória do jogo; os outros labels saem cedo. Páginas que o jogo também escreveu ficam protegidas
+  com os bytes da GPU pendentes (a cópia informa exatamente quais pulou). Linha `SOTC RB publish`
+  com a latência em quatro etapas. Medido (~70 s): só com janelas aprendidas, ~3 labels/quadro a
+  ~2,4 ms cada e 34 quadros lentos (base 12–16), a cópia não pegava os bitsets; contando toda
+  escrita pequena, ~20 labels/quadro, ~100 MB copiados a cada 5 s e 19–24 FPS. Neste jogo esperar a
+  GPU em cada label custa mais do que deixar as faltas acontecerem.
 - **Resultado medido dos switches novos (sessões de ~70 s nas mesmas áreas, 29–30 out):** a
   configuração estável (`SOTC_RB_TICK`, `SOTC_RB_GROW`, `SOTC_RB_MATERIALIZE` sobre a base) teve 12
   quadros acima de 60 ms. Cada switch novo, ligado sozinho por cima dela, piorou ou não agiu:

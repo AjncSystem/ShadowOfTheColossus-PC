@@ -1226,3 +1226,20 @@ inline std::atomic<uint64_t> xp_decide_ns{0}, xp_decide_max_ns{0}, xp_run_ns{0};
 inline std::atomic<uint64_t> xp_conf_war{0}, xp_conf_raw{0}, xp_conf_waw{0};
 inline std::atomic<uint64_t> xp_conf_draw{0}, xp_conf_dispatch{0}, xp_conf_func{0};
 } // namespace SotcStats
+
+// sotc: SOTC_RB_EXACT=publish counters (lean XPR publish mode). Written by BufferCache (label
+// downloads, readbacks) and Liverpool (deferred CS_DONE labels, latency), printed with SOTC_FPS
+// by the "SOTC RB publish" line of videoout/driver.cpp.
+namespace SotcStats {
+inline std::atomic<uint64_t> rbp_labels_deferred{0};   ///< deferred CS_DONE labels that landed
+inline std::atomic<uint64_t> rbp_bytes_published{0};   ///< bytes applied by label downloads
+inline std::atomic<uint64_t> rbp_dropped_dirty{0};     ///< label downloads dropped: a later write made them dirty
+inline std::atomic<uint64_t> rbp_cpu_pages_skipped{0}; ///< pages skipped at apply because the CPU bit was set
+inline std::atomic<uint64_t> rbp_lat_cp_ns{0};         ///< sum: CP parsed the EOP -> draw thread processed it
+inline std::atomic<uint64_t> rbp_lat_submit_ns{0};     ///< sum: draw thread processed -> Flush() returned
+inline std::atomic<uint64_t> rbp_lat_gpu_ns{0};        ///< sum: Flush() returned -> RbxDrain saw the tick done
+inline std::atomic<uint64_t> rbp_lat_land_ns{0};       ///< sum: tick done -> label written
+inline std::atomic<uint64_t> rbp_lat_samples{0};       ///< number of labels in the sums above
+inline std::atomic<uint64_t> rbp_reads_before{0};      ///< guest readbacks on bytes of a label download not yet applied
+inline std::atomic<uint64_t> rbp_reads_after{0};       ///< guest readbacks that still faulted on a page a label download applied earlier
+} // namespace SotcStats

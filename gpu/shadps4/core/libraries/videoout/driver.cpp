@@ -840,6 +840,37 @@ void VideoOutDriver::Flip(const Request& req) {
                                          (unsafe | wrong) ? " !! UNSAFE ANNOUNCE / WRONG THREAD" : "");
                         }
                     }
+                    // sotc: SOTC_RB_EXACT=publish (lean XPR publish mode, sotc_stats.h counters).
+                    if (const char* rbp_env = std::getenv("SOTC_RB_EXACT"); rbp_env && rbp_env[0] == 'p') {
+                        const uint64_t lab = SotcStats::rbp_labels_deferred.exchange(0);
+                        const uint64_t pub_bytes = SotcStats::rbp_bytes_published.exchange(0);
+                        const uint64_t dropped = SotcStats::rbp_dropped_dirty.exchange(0);
+                        const uint64_t cpu_skip = SotcStats::rbp_cpu_pages_skipped.exchange(0);
+                        const uint64_t lat_cp = SotcStats::rbp_lat_cp_ns.exchange(0);
+                        const uint64_t lat_sub = SotcStats::rbp_lat_submit_ns.exchange(0);
+                        const uint64_t lat_gpu = SotcStats::rbp_lat_gpu_ns.exchange(0);
+                        const uint64_t lat_land = SotcStats::rbp_lat_land_ns.exchange(0);
+                        const uint64_t lat_n = SotcStats::rbp_lat_samples.exchange(0);
+                        const uint64_t rd_before = SotcStats::rbp_reads_before.exchange(0);
+                        const uint64_t rd_after = SotcStats::rbp_reads_after.exchange(0);
+                        const double rbp_frames = static_cast<double>(std::max<size_t>(frame_ms.size(), 1));
+                        const double n = static_cast<double>(lat_n);
+                        const auto avg_ms = [n](uint64_t ns) { return n > 0 ? ns / 1e6 / n : 0.0; };
+                        ReportPrintf(report,
+                                     "SOTC RB publish: labels deferred %llu (%.1f/frame), published %llu KiB, "
+                                     "dropped dirty %llu, CPU pages skipped %llu; latency avg ms: "
+                                     "cp->draw %.2f, draw->submit %.2f, submit->gpu %.2f, gpu->label %.2f "
+                                     "(%llu samples); guest readbacks on unapplied label data %llu, after "
+                                     "apply %llu\n",
+                                     static_cast<unsigned long long>(lab), lab / rbp_frames,
+                                     static_cast<unsigned long long>(pub_bytes / 1024),
+                                     static_cast<unsigned long long>(dropped),
+                                     static_cast<unsigned long long>(cpu_skip),
+                                     avg_ms(lat_cp), avg_ms(lat_sub), avg_ms(lat_gpu), avg_ms(lat_land),
+                                     static_cast<unsigned long long>(lat_n),
+                                     static_cast<unsigned long long>(rd_before),
+                                     static_cast<unsigned long long>(rd_after));
+                    }
                 }
                 if (char rbg[640]; SotcStats::RbGroupTake(rbg, sizeof(rbg))) ReportPrintf(report, "%s\n", rbg); // sotc: SOTC_RB_GROUP
                 const uint64_t grown = SotcStats::rb_grow_grown.exchange(0);

@@ -162,6 +162,12 @@ public:
     /// pages are written. Returns the bytes skipped.
     template <typename Func>
     u64 WriteUnlessCpuModified(VAddr cpu_addr, u64 size, Func&& write) {
+        return WriteUnlessCpuModified(cpu_addr, size, write, [](VAddr, u64) {});
+    }
+    /// sotc: same, and on_skip(addr, size) for every part skipped because of the CPU bit (decided
+    /// under the region lock, so the caller knows exactly which bytes were not written).
+    template <typename Func, typename Skip>
+    u64 WriteUnlessCpuModified(VAddr cpu_addr, u64 size, Func&& write, Skip&& on_skip) {
         u64 skipped = 0;
         u64 page_index = cpu_addr >> HIGHER_PAGE_BITS;
         u64 offset = cpu_addr & HIGHER_PAGE_MASK;
@@ -186,6 +192,7 @@ public:
                     }
                     run = next;
                     skipped += next - page;
+                    on_skip(base + page, next - page);
                 }
                 page = next;
             }

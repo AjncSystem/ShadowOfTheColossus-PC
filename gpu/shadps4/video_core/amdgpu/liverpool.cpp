@@ -1587,6 +1587,12 @@ std::atomic<u64> g_rbx_addr_deferred{0}, g_rbx_mode_switches{0}, g_rbx_probes{0}
 // owed bytes before they are applied, and SettleOwedUpTo (called before every early write) closes
 // it; bytes still GPU-modified stay protected, so a guest read of them takes the exact wait.
 // The order of labels to different addresses can therefore differ from the PS4's.
+// sotc: SOTC_RB_EXACT=publish: a deferred label to this address (8-byte key) is still outstanding.
+bool Liverpool::RbxAddrOutstanding(VAddr label) {
+    std::scoped_lock lk{rbx_mutex};
+    return rbx_out.contains(label & ~VAddr{7});
+}
+
 bool Liverpool::RbxDecide(u32 queue, VAddr label, u64& snap, bool* hot) {
     snap = rasterizer->GetBufferCache().HotWriteSeq();
     const bool changed = snap != rbx_last_seq[queue];
@@ -1744,9 +1750,9 @@ void Liverpool::RbxNoteWritten(u64 snap) {
     rasterizer->GetBufferCache().NoteLabelWritten(snap);
 }
 
-void Liverpool::QueueDeferredLabel(u32 queue, VAddr label, bool shadow32, bool shadow64,
-                                   u32 data_lo, u32 data_hi, u64 snap,
-                                   Common::UniqueFunction<void>&& write) {
+std::shared_ptr<Liverpool::RbxJob> Liverpool::QueueDeferredLabel(
+    u32 queue, VAddr label, bool shadow32, bool shadow64, u32 data_lo, u32 data_hi, u64 snap,
+    Common::UniqueFunction<void>&& write, u64 t_cp, u64 t_draw) {
     auto& scheduler = rasterizer->GetScheduler();
     eop_last_tick.store(scheduler.CurrentTick(), std::memory_order_relaxed);
     if (eop_outstanding.fetch_add(1, std::memory_order_acq_rel) == 0) {
@@ -1774,6 +1780,10 @@ void Liverpool::QueueDeferredLabel(u32 queue, VAddr label, bool shadow32, bool s
     job->queued_ns = SotcStats::NowNs();
     job->tick = scheduler.CurrentTick();
     job->write = std::move(write);
+    // sotc: SOTC_RB_EXACT=publish: latency stamps of a CS_DONE label (t_cp != 0).
+    job->stat = t_cp != 0;
+    job->t_cp = t_cp;
+    job->t_draw = t_draw;
     if (rbx) {
         std::scoped_lock lk{rbx_mutex};
         ++rbx_out[job->key];
@@ -1790,6 +1800,7 @@ void Liverpool::QueueDeferredLabel(u32 queue, VAddr label, bool shadow32, bool s
             LandLabel(*job);
         }
     });
+    return job;
 }
 
 // Queue time (ns) of the oldest deferred label whose tick is still the open one or later, that
@@ -1844,6 +1855,21 @@ void Liverpool::LandLabel(RbxJob& job) {
         }
     }
     job.write();
+    if (job.stat) {
+        // sotc: SOTC_RB_EXACT=publish latency sums. Differences clamp at 0: a stamp can be taken
+        // out of order when the draw thread lands a label during Flush.
+        const auto diff = [](u64 a, u64 b) { return a > b ? a - b : u64{0}; };
+        const u64 t_land = SotcStats::NowNs();
+        const u64 t_sub = job.t_sub ? job.t_sub : job.t_draw;
+        const u64 t_gpu = job.t_gpu ? job.t_gpu : t_sub;
+        SotcStats::rbp_labels_deferred.fetch_add(1, std::memory_order_relaxed);
+        SotcStats::rbp_lat_cp_ns.fetch_add(diff(job.t_draw, job.t_cp), std::memory_order_relaxed);
+        SotcStats::rbp_lat_submit_ns.fetch_add(diff(t_sub, job.t_draw),
+                                               std::memory_order_relaxed);
+        SotcStats::rbp_lat_gpu_ns.fetch_add(diff(t_gpu, t_sub), std::memory_order_relaxed);
+        SotcStats::rbp_lat_land_ns.fetch_add(diff(t_land, t_gpu), std::memory_order_relaxed);
+        SotcStats::rbp_lat_samples.fetch_add(1, std::memory_order_relaxed);
+    }
     if (job.shadow32 || job.shadow64) {
         // Written for real now: drop the shadow unless a later label of the same address
         // already replaced it.
@@ -1904,7 +1930,8 @@ void Liverpool::RbxDrain() {
             }
             job->ready.store(true, std::memory_order_release);
         }
-        {
+        if (job->stat && job->t_gpu == 0) {
+            job->t_gpu = SotcStats::NowNs(); // sotc: publish: the tick is seen done (first look)
         }
         // Rule 6: the data the label announces must be in guest memory first.
         if (!rasterizer->GetBufferCache().ApplyOwedBeforeLabel()) {
@@ -3096,8 +3123,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     }
                     // sotc: SOTC_RB_EXACT rules 5-7 for EOS (RbxTryDefer).
                     u64 rbx_snap = 0;
-                    const bool rbx_ok = rbx && rasterizer &&
-                                        eos.command == PM4CmdEventWriteEos::Command::SignalFence;
+                    // sotc: publish mode defers an EOS only to keep the per-address FIFO (a
+                    // deferred label to the same address is outstanding: writing this one now
+                    // would be overwritten by the older value when that one lands); otherwise
+                    // rbx_ok false takes the snapshot below.
+                    const bool rbx_ok =
+                        rbx && rasterizer &&
+                        eos.command == PM4CmdEventWriteEos::Command::SignalFence &&
+                        (!VideoCore::BufferCache::RbExactPublish() ||
+                         RbxAddrOutstanding(reinterpret_cast<VAddr>(eos.Address())));
                     if (rbx_ok &&
                         RbxTryDefer(0, reinterpret_cast<VAddr>(eos.Address()), true,
                                     eos.DataDWord(), rbx_snap, [this, eos] {
@@ -3140,11 +3174,20 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     *reinterpret_cast<const PM4CmdEventWriteEop*>(header);
                 XpSetHint(XpLabel, reinterpret_cast<VAddr>(eop_packet.Address<void>()),
                           eop_packet.data_sel.Value() == DataSelect::None ? 0 : 8);
-                BackOrRun([this, eop_packet] {
+                // sotc: SOTC_RB_EXACT=publish: the CP's stamp of this label (latency sums).
+                const u64 t_cp = (rbx && VideoCore::BufferCache::RbExactPublish())
+                                     ? SotcStats::NowNs()
+                                     : 0;
+                BackOrRun([this, eop_packet, t_cp] {
                 const auto* event_eop = &eop_packet;
                 if (rasterizer) {
                     rasterizer->OnFence();
                 }
+                // sotc: SOTC_RB_EXACT=publish: only a CS_DONE label with 32-bit data after a hot
+                // GPU write is deferred; no adaptive policy, the per-address FIFO still applies.
+                const bool rbp = rbx && rasterizer && VideoCore::BufferCache::RbExactPublish();
+                const u64 t_draw = rbp ? SotcStats::NowNs() : 0;
+                bool rbp_cand = false;
                 // sotc: SOTC_EOP_TICK=1. The label is a scheduler deferred operation keyed on the
                 // tick open now: it runs once the GPU has finished the work recorded up to here.
                 // Nothing is flushed per label, so the command buffer keeps its batching. The
@@ -3156,7 +3199,28 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 u64 rbx_snap = 0;
                 bool rbx_defer = false;
                 bool rbx_hot = false;
-                if (rbx && rasterizer) {
+                if (rbp && rasterizer) {
+                    // sotc: publish: the decision of RbxDecide without the adaptive policy and
+                    // the early-cost ring. rbx_last_seq is updated for every EOP label.
+                    rbx_snap = rasterizer->GetBufferCache().HotWriteSeq();
+                    rbx_hot = rbx_snap != rbx_last_seq[0];
+                    rbx_last_seq[0] = rbx_snap;
+                    // sotc: the game's XPR completion label (eboot 0x925c0 -> 0x86eb60): event
+                    // 0x28 = BOTTOM_OF_PIPE_TS (not CS_DONE, 0x2f: the first run filtered on that
+                    // and deferred nothing), 32-bit data, value 1.
+                    rbp_cand = rbx_hot &&
+                               event_eop->event_type.Value() ==
+                                   static_cast<u32>(EventType::BottomOfPipeTs) &&
+                               event_eop->data_sel.Value() == DataSelect::Data32Low &&
+                               event_eop->data_lo == 1;
+                    const VAddr key = reinterpret_cast<VAddr>(event_eop->Address<void>()) & ~VAddr{7};
+                    bool fifo = false;
+                    {
+                        std::scoped_lock lk{rbx_mutex};
+                        fifo = rbx_out.contains(key);
+                    }
+                    rbx_defer = rbp_cand || fifo;
+                } else if (rbx && rasterizer) {
                     rbx_defer = RbxDecide(0, reinterpret_cast<VAddr>(event_eop->Address<void>()),
                                           rbx_snap, &rbx_hot);
                 }
@@ -3171,7 +3235,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (rbx_defer && rbx_hot) {
                         rasterizer->GetBufferCache().RecordLabelDownloads();
                     }
-                    QueueDeferredLabel(
+                    const auto job = QueueDeferredLabel(
                         0, label, eop.data_sel.Value() == DataSelect::Data32Low,
                         eop.data_sel.Value() == DataSelect::Data64, eop.data_lo, eop.data_hi,
                         rbx_snap, Common::UniqueFunction<void>{[eop] {
@@ -3184,12 +3248,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                     Platform::IrqC::Instance()->Signal(
                                         Platform::InterruptId::GfxEop);
                                 });
-                        }});
+                        }},
+                        rbp_cand ? t_cp : 0, t_draw);
                     if (rbx_defer && rbx_hot) {
                         // The game spins on this label: submit now, so its latency is the GPU
                         // execution only (not the next periodic flush). A label deferred only by
                         // queue order is submitted by EopService after RbxMaxWaitNs.
                         rasterizer->Flush();
+                        if (rbp_cand) {
+                            job->t_sub = SotcStats::NowNs(); // sotc: publish: after Flush()
+                        }
                     }
                     return;
                 }
@@ -3878,7 +3946,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 bool rbx_hot = false;
                 const bool rbx_label = rbx && rasterizer &&
                                        release.data_sel.Value() != DataSelect::GdsMemStore;
-                if (rbx_label) {
+                if (rbx_label && VideoCore::BufferCache::RbExactPublish() &&
+                    !RbxAddrOutstanding(release.Address<VAddr>())) {
+                    // sotc: publish mode: a compute fence is not deferred (snapshot only), unless
+                    // a deferred label to the same address is outstanding (per-address FIFO, via
+                    // RbxDecide below).
+                    rbx_snap = rasterizer->GetBufferCache().HotWriteSeq();
+                } else if (rbx_label) {
                     rbx_defer = RbxDecide(1, release.Address<VAddr>(), rbx_snap, &rbx_hot);
                 }
                 if (rbx_defer) {

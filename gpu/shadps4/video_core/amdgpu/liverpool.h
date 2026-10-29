@@ -740,6 +740,7 @@ private:
     /// Deferred labels outstanding per 8-byte aligned address (per-address FIFO).
     std::mutex rbx_mutex;
     std::unordered_map<VAddr, u32> rbx_out;
+    bool RbxAddrOutstanding(VAddr label); ///< sotc: SOTC_RB_EXACT=publish per-address FIFO
     /// Draw thread, at the label's position in the stream: snapshots HotWriteSeq into snap and
     /// returns true when the label must wait for the GPU.
     bool RbxDecide(u32 queue, VAddr label, u64& snap, bool* hot = nullptr);
@@ -747,10 +748,6 @@ private:
     void RbxNoteWritten(u64 snap);
     template <typename F>
     bool RbxTryDefer(u32 queue, VAddr addr, bool shadow32, u32 value, u64& snap, F&& make);
-    /// Queues a label write (write is the whole SignalFence: value and interrupt) as a scheduler
-    /// deferred operation. shadow32/shadow64 publish its value for the CP's own waits.
-    void QueueDeferredLabel(u32 queue, VAddr label, bool shadow32, bool shadow64, u32 data_lo,
-                            u32 data_hi, u64 snap, Common::UniqueFunction<void>&& write);
     /// A deferred label: lands (RbxDrain / LandLabel) in queue order once its tick is done.
     struct RbxJob {
         VAddr label{}, key{};
@@ -759,7 +756,17 @@ private:
         u64 snap{}, queued_ns{}, tick{};
         std::atomic<bool> ready{false};
         Common::UniqueFunction<void> write;
+        // sotc: SOTC_RB_EXACT=publish latency stamps (stat: a CS_DONE label, see EventWriteEop).
+        bool stat{};
+        u64 t_cp{}, t_draw{}, t_sub{}, t_gpu{};
     };
+    /// Queues a label write (write is the whole SignalFence: value and interrupt) as a scheduler
+    /// deferred operation. shadow32/shadow64 publish its value for the CP's own waits. t_cp /
+    /// t_draw (nonzero t_cp = stat job) are the publish-mode latency stamps.
+    std::shared_ptr<RbxJob> QueueDeferredLabel(u32 queue, VAddr label, bool shadow32,
+                                               bool shadow64, u32 data_lo, u32 data_hi, u64 snap,
+                                               Common::UniqueFunction<void>&& write,
+                                               u64 t_cp = 0, u64 t_draw = 0);
     std::deque<std::shared_ptr<RbxJob>> rbx_jobs; ///< FIFO, under rbx_mutex
     std::array<u32, 2> rbx_q_out{};               ///< deferred labels outstanding per queue
     void LandLabel(RbxJob& job);

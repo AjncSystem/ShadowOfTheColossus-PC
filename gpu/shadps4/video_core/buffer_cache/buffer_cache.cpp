@@ -96,8 +96,9 @@ const bool rb_prefetch_env = [] {
     const char* prev = std::getenv("SOTC_RB_PREV");       // sotc: needs the recurring windows
     const char* exact = std::getenv("SOTC_RB_EXACT");     // sotc: needs the recurring windows
     const char* group = std::getenv("SOTC_RB_GROUP");     // sotc: group downloads are prefetches
+    // sotc: SOTC_RB_EXACT=publish also starts with '1'-or-'p' (see rb_publish_env)
     if ((!v || v[0] != '1') && (!mat || mat[0] != '1') && (!prev || prev[0] != '1') &&
-        (!exact || exact[0] != '1') && (!group || group[0] != '1')) {
+        (!exact || (exact[0] != '1' && exact[0] != 'p')) && (!group || group[0] != '1')) {
         return false;
     }
     const char* owner = std::getenv("SOTC_RB_OWNER");
@@ -146,14 +147,20 @@ const u64 rb_mat_ns = [] {
 /// Replaces SOTC_RB_PREV (which is then off): the owed downloads of the two would dirty each other.
 const bool rb_exact_env = [] {
     const char* v = std::getenv("SOTC_RB_EXACT");
-    if (!v || v[0] != '1') {
+    // sotc: SOTC_RB_EXACT=publish (first character 'p'): the lean mode, see BufferCache::RbExactPublish.
+    if (!v || (v[0] != '1' && v[0] != 'p')) {
         return false;
     }
-    std::fprintf(stderr, rb_prefetch_env ? "SOTC RB exact: on\n"
+    std::fprintf(stderr, rb_prefetch_env ? "SOTC RB exact: on%s\n"
                                          : "SOTC RB exact: inactive (needs SOTC_RB_OWNER=1 and "
-                                           "asynchronous readbacks)\n");
+                                           "asynchronous readbacks)\n",
+                 v[0] == 'p' ? " (publish)" : "");
     return rb_prefetch_env;
 }();
+/// sotc: SOTC_RB_EXACT=publish: lean XPR publish mode. Only the deferred completion labels and the
+/// batch download of the writes since the previous label stay; the per-byte writer map, the owed
+/// releases and the owed bookkeeping are off (see BufferCache::RbExactPublish).
+const bool rb_publish_env = rb_exact_env && std::getenv("SOTC_RB_EXACT")[0] == 'p';
 /// SOTC_RB_GROUP=1 (off by default): see BufferCache::RbgAtFault. Turns the prefetch bookkeeping
 /// on (rb_prefetch_env, same requirements: SOTC_RB_OWNER=1, asynchronous readbacks): a group
 /// download is an in-flight readback owning its pages.
@@ -1017,6 +1024,16 @@ void BufferCache::BeginAsyncReadbackImpl(AsyncReadback& readback) {
     RbxDepth rbx_depth_guard{rbx_depth}; // sotc: SOTC_RB_EXACT: no label op applies in here
     SotcStats::readbacks.fetch_add(1, std::memory_order_relaxed);
     NoteHotRead(readback.device_addr, readback.size);
+    // sotc: SOTC_RB_EXACT=publish report: a guest readback on bytes of a label download not applied yet.
+    if (RbExactPublish()) {
+        const VAddr ask_end = readback.device_addr + readback.size;
+        for (const auto& p : pf_live) {
+            if (p->pf_label && !p->finished && readback.device_addr < p->pf_hi && p->pf_lo < ask_end) {
+                SotcStats::rbp_reads_before.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+        }
+    }
     // sotc: SOTC_RB_PREFETCH: learn the recurring windows, and let the prefetches of the asked
     // granules land first (the gather below then finds their pages no longer GPU-modified).
     if (RbxOn()) {
@@ -1810,6 +1827,9 @@ void BufferCache::PrefetchDrop(size_t index) {
         p.finished = true;
         if (p.pf_label) { // sotc: SOTC_RB_EXACT: dropped dirty, expired or unused
             SotcStats::rb_ex_ld_dropped.fetch_add(1, std::memory_order_relaxed);
+            if (p.dirty && RbExactPublish()) { // sotc: SOTC_RB_EXACT=publish report
+                SotcStats::rbp_dropped_dirty.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         if (p.pf_group) { // sotc: SOTC_RB_GROUP: every page trimmed away, or expired
             (p.dirty ? SotcStats::rbg_fb_dirty : SotcStats::rbg_expired)
@@ -1881,6 +1901,10 @@ void BufferCache::PrefetchAtFault(VAddr addr, u64 size) {
             if (p.pf_label) {
                 SotcStats::rb_ex_ld_applied.fetch_add(1, std::memory_order_relaxed);
                 SotcStats::rb_ex_ld_bytes.fetch_add(p.gathered_bytes, std::memory_order_relaxed);
+                if (RbExactPublish()) { // sotc: SOTC_RB_EXACT=publish report
+                    SotcStats::rbp_bytes_published.fetch_add(p.gathered_bytes,
+                                                             std::memory_order_relaxed);
+                }
             }
             SotcStats::rb_pf_consumed.fetch_add(1, std::memory_order_relaxed);
             SotcStats::rb_pf_consumed_all.fetch_add(1, std::memory_order_relaxed);
@@ -2508,6 +2532,13 @@ void BufferCache::PrefetchMaterialize() {
 // released page are old there until applied.
 
 u64 BufferCache::RbxHotSeq(VAddr addr, u64 size) {
+    // sotc: SOTC_RB_EXACT=publish: every small GPU write counts (the XPR cull bitsets are a few
+    // hundred bytes, freshly allocated each frame, so they are not in the learned recurring
+    // windows and the first publish run copied everything but them). Bigger writes (render data,
+    // copies) are left to the usual readback path.
+    if (rb_publish_env && size <= 64_KB) {
+        return rbx_hot_seq.fetch_add(1, std::memory_order_acq_rel) + 1;
+    }
     const VAddr end = addr + size;
     if (pf_recurring.empty() || end <= pf_rec_lo || addr >= pf_rec_hi) {
         return 0;
@@ -2523,6 +2554,10 @@ u64 BufferCache::RbxHotSeq(VAddr addr, u64 size) {
 
 bool BufferCache::RbExactEnabled() noexcept {
     return rb_exact_env;
+}
+
+bool BufferCache::RbExactPublish() noexcept {
+    return rb_publish_env;
 }
 
 void BufferCache::SetLabelSideActive(bool on) noexcept {
@@ -2594,12 +2629,15 @@ bool BufferCache::ApplyOwedBeforeLabel() {
         FinishAsyncReadback(p);
         SotcStats::rb_ex_ld_applied.fetch_add(1, std::memory_order_relaxed);
         SotcStats::rb_ex_ld_bytes.fetch_add(p.gathered_bytes, std::memory_order_relaxed);
+        if (RbExactPublish()) { // sotc: SOTC_RB_EXACT=publish report
+            SotcStats::rbp_bytes_published.fetch_add(p.gathered_bytes, std::memory_order_relaxed);
+        }
     }
     return true;
 }
 
 void BufferCache::SettleOwedUpTo(u64 seq) {
-    if (!RbxOn() || !RbxOnDrawThread()) {
+    if (!RbxOn() || !RbxOnDrawThread() || RbExactPublish()) { // publish: no owed ranges exist
         return;
     }
     RbxDepth depth{rbx_depth};
@@ -2775,6 +2813,9 @@ bool BufferCache::RecordLabelDownloads() {
 }
 
 void BufferCache::RbxNoteWrite(VAddr addr, u64 size, u64 tick, u64 seq, bool gpu_write) {
+    if (RbExactPublish()) { // sotc: SOTC_RB_EXACT=publish: no writer map
+        return;
+    }
     if (size == 0) {
         return;
     }
@@ -2834,6 +2875,9 @@ void BufferCache::RbxNoteWrite(VAddr addr, u64 size, u64 tick, u64 seq, bool gpu
 }
 
 void BufferCache::RbxPrune() {
+    if (RbExactPublish()) { // sotc: SOTC_RB_EXACT=publish: the writer map is never filled
+        return;
+    }
     u64 free_max = 0;
     u64 pend_min = ~u64{0};
     const auto done = [&](u64 t) {
@@ -3124,6 +3168,9 @@ BufferCache::ExactResult BufferCache::TryServeExact(AsyncReadback& readback, con
         }
         return ExactResult::Fallback;
     };
+    if (RbExactPublish()) { // sotc: SOTC_RB_EXACT=publish: no owed releases, the usual path
+        return ExactResult::Fallback;
+    }
     if (readback.is_write || !arena) {
         return fallback(Why::Ok); // a write fault needs the exact bytes
     }
@@ -4158,6 +4205,12 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     SubtractDownloaded(pending); // sotc: after the backing holds the data (see FinishAsyncReadback)
 }
 
+// sotc: SOTC_RB_EXACT=publish: the pages ApplyDownloads skipped for the CPU bit in the batch it just
+// applied (4 KiB aligned runs). Their GPU-modified bytes were not written: they stay in the set and
+// their pages stay protected. Filled and consumed on the same thread (ApplyDownloads, then
+// SubtractDownloaded, called back to back by every caller).
+thread_local std::vector<std::pair<VAddr, VAddr>> tl_rbp_skipped;
+
 void BufferCache::SubtractDownloaded(std::span<const ReadbackItem> items) {
     std::unique_lock gpu_modified_lock{gpu_modified_mutex};
     for (const auto& item : items) {
@@ -4165,9 +4218,28 @@ void BufferCache::SubtractDownloaded(std::span<const ReadbackItem> items) {
             continue; // sotc: SOTC_RB_EXACT: already out of the set
         }
         for (const auto& [address, range_size] : item.gpu_ranges) {
+            if (item.hot && !tl_rbp_skipped.empty()) {
+                // sotc: publish: everything but the skipped pages leaves the set.
+                VAddr cursor = address;
+                const VAddr end = address + range_size;
+                for (const auto& [lo, hi] : tl_rbp_skipped) {
+                    if (hi <= cursor || lo >= end) {
+                        continue;
+                    }
+                    if (lo > cursor) {
+                        gpu_modified_ranges.Subtract(cursor, lo - cursor);
+                    }
+                    cursor = std::max(cursor, hi);
+                }
+                if (cursor < end) {
+                    gpu_modified_ranges.Subtract(cursor, end - cursor);
+                }
+                continue;
+            }
             gpu_modified_ranges.Subtract(address, range_size);
         }
     }
+    tl_rbp_skipped.clear();
 }
 
 u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 size,
@@ -4350,6 +4422,7 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
 void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8* mapped,
                                  u64 mapped_offset,
                                  std::span<const std::pair<VAddr, VAddr>> keep_gpu) {
+    tl_rbp_skipped.clear(); // sotc: SOTC_RB_EXACT=publish: this batch's skipped pages only
     // sotc (#146): every heap of the guarded heap's class, not only the one picked at boot: the
     // heaps a world creates when it loads (the last colossus' area) crashed the same way
     // (eboot+0x49500, freed blocks overwritten). They come from the engine's heap table.
@@ -4582,7 +4655,16 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                     write(start, size);
                     return;
                 }
-                const u64 skipped = memory_tracker->WriteUnlessCpuModified(start, size, write);
+                const u64 skipped =
+                    RbExactPublish()
+                        ? memory_tracker->WriteUnlessCpuModified(
+                              start, size, write,
+                              [](VAddr a, u64 len) { // sotc: publish: remember the skipped pages
+                                  const VAddr lo = Common::AlignDown(a, VAddr{4096});
+                                  const VAddr hi = Common::AlignUp(a + len, VAddr{4096});
+                                  tl_rbp_skipped.emplace_back(lo, hi);
+                              })
+                        : memory_tracker->WriteUnlessCpuModified(start, size, write);
                 if (skipped) {
                     SotcStats::rb_hot_late_skipped.fetch_add(skipped, std::memory_order_relaxed);
                 }
@@ -4662,6 +4744,36 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
             runs[merged++] = runs[i];
         }
     }
+    // sotc: SOTC_RB_EXACT=publish: a hot item (label download) skipped the pages with the CPU bit
+    // above (WriteUnlessCpuModified), so their GPU-modified bytes were not applied: those pages
+    // stay GPU-modified (kept, not unmarked) and stay protected. Publish implies SOTC_RB_OWNER
+    // (rb_prefetch_env), so the runs above are the items' gpu_ranges, which is what is scanned here.
+    thread_local std::vector<std::pair<VAddr, VAddr>> keep_all;
+    std::span<const std::pair<VAddr, VAddr>> keep = keep_gpu;
+    if (RbExactPublish() && !tl_rbp_skipped.empty()) {
+        // sotc: exactly the pages WriteUnlessCpuModified skipped (decided under the region lock),
+        // not a later re-check of the CPU bit, which an upload could have changed in between.
+        std::ranges::sort(tl_rbp_skipped);
+        size_t m = 0;
+        for (size_t i = 0; i < tl_rbp_skipped.size(); ++i) {
+            if (m && tl_rbp_skipped[i].first <= tl_rbp_skipped[m - 1].second) {
+                tl_rbp_skipped[m - 1].second =
+                    std::max(tl_rbp_skipped[m - 1].second, tl_rbp_skipped[i].second);
+            } else {
+                tl_rbp_skipped[m++] = tl_rbp_skipped[i];
+            }
+        }
+        tl_rbp_skipped.resize(m);
+        u64 pages = 0;
+        for (const auto& [lo, hi] : tl_rbp_skipped) {
+            pages += (hi - lo) / 4096;
+        }
+        SotcStats::rbp_cpu_pages_skipped.fetch_add(pages, std::memory_order_relaxed);
+        keep_all.assign(keep_gpu.begin(), keep_gpu.end());
+        keep_all.insert(keep_all.end(), tl_rbp_skipped.begin(), tl_rbp_skipped.end());
+        std::ranges::sort(keep_all); // the loop below needs the keep ranges in ascending order
+        keep = keep_all;
+    }
     for (std::size_t i = 0; i < merged; ++i) {
         const auto [start, stop] = runs[i];
         // sotc: SOTC_RB_KEEP_LATER: pages a later GPU write covers keep their GPU state.
@@ -4672,7 +4784,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                 MarkInflightReadbacksDirty(lo, hi - lo, StaleReason::Applied);
             }
         };
-        for (const auto& [keep_start, keep_end] : keep_gpu) {
+        for (const auto& [keep_start, keep_end] : keep) {
             const VAddr lo = std::max(Common::AlignDown(keep_start, VAddr{4096}), cursor);
             const VAddr hi = std::min(Common::AlignUp(keep_end, VAddr{4096}), stop);
             if (lo >= hi) {
@@ -5035,7 +5147,8 @@ void BufferCache::RecordCurrentWrite(VAddr addr, u64 size, u64 seq, bool gpu_wri
     // sotc: SOTC_RB_EXACT: who wrote these bytes and when. GPU writes always; other arena writes
     // (uploads, image syncs) only over bytes that are GPU-modified (the only bytes a readback
     // decides about).
-    if (RbxOn() && !gpu_write && gpu_modified_ranges.Intersects(addr, size)) {
+    if (RbxOn() && !gpu_write && !RbExactPublish() && // sotc: publish keeps no writer map
+        gpu_modified_ranges.Intersects(addr, size)) {
         RbxNoteWrite(addr, size, scheduler.CurrentTick(), 0, false);
     }
     // sotc: SOTC_RB_TICK: a write over bytes a transfer-queue readback copy still reads.

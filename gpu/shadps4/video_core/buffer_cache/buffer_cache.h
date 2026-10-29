@@ -207,8 +207,11 @@ public:
 
     // sotc: SOTC_RB_EXACT=1 API (see the big comment above BufferCache::TryServeExact). All are
     // no-ops returning neutral values when the switch is off. Draw thread unless noted.
-    /// SOTC_RB_EXACT=1 (and SOTC_RB_OWNER=1 and asynchronous readbacks).
+    /// SOTC_RB_EXACT=1 or =publish (and SOTC_RB_OWNER=1 and asynchronous readbacks).
     static bool RbExactEnabled() noexcept;
+    /// sotc: SOTC_RB_EXACT=publish only: the lean mode. No writer map, no owed releases (TryServeExact,
+    /// RbxNoteWrite, RbxPrune and SettleOwedUpTo do nothing); the label downloads stay.
+    static bool RbExactPublish() noexcept;
     /// Liverpool constructor: true iff its label side is active. Every SOTC_RB_EXACT behaviour
     /// requires the switch and this.
     static void SetLabelSideActive(bool on) noexcept;

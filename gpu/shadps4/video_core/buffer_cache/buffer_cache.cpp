@@ -939,16 +939,20 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                                                 size, 1);
                         return;
                     }
-                    // sotc: SOTC_GUARD_STALE=0 rebuilds the guard first. At an area change the free
-                    // tree changes all the time and each new block rebuilt the guard (~300 walks
-                    // per 5 s on the draw thread). The guard built before still finds the block
-                    // around addr (it follows the physical chain from a free block it knew), and
-                    // the block is then checked in memory as now, as Covers checks a remembered
-                    // one: in use, its next block pointing back, not the one being freed. Only
-                    // the writes it does not vouch for rebuild it.
+                    // sotc: SOTC_GUARD_STALE=1 asks the guard built before first. At an area change
+                    // the free tree changes all the time and each new block rebuilt the guard
+                    // (~300 walks per 5 s on the draw thread). The guard built before still finds
+                    // the block around addr (it follows the physical chain from a free block it
+                    // knew), and the block is then checked in memory as now, as Covers checks a
+                    // remembered one: in use, its next block pointing back, not the one being
+                    // freed. Only the writes it does not vouch for rebuild it. Off by default
+                    // since 29 Oct: like Covers, the check and the full-range write are not one
+                    // step, and a block freed in between loses its free tree links; it sent more
+                    // writes down that path while loads free blocks. The 0x49800 crash came 6 s
+                    // after the one window where it vouched for writes (30); it saved little.
                     static const bool use_stale = [] {
                         const char* v = std::getenv("SOTC_GUARD_STALE");
-                        return !(v && v[0] == '0');
+                        return v && v[0] == '1';
                     }();
                     if (heap_fast && use_stale && !a->checked && a->slot->guard &&
                         a->slot->guard->IsValid()) {

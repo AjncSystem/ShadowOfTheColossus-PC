@@ -411,14 +411,18 @@ bool BpeUsedBlocks::Covers(VAddr heap, VAddr addr, VAddr end, int* why) {
 }
 
 bool BpeUsedBlocks::TryUserPointer(VAddr heap, VAddr addr, VAddr end) {
-    // sotc: SOTC_GUARD_USER_POINTER=0 builds the guard for these too. Readbacks mostly start at
-    // a binding base, the user pointer of an allocation; at an area change new blocks came every
-    // frame and each one rebuilt the guard (a walk of the whole free tree, up to 670 per 5 s).
-    // The header before addr is trusted as CollectHeaders and StillUsed trust one: in use, a
-    // sane size, and the next block points back to it.
+    // sotc: SOTC_GUARD_USER_POINTER=1 trusts these without building the guard. Readbacks mostly
+    // start at a binding base, the user pointer of an allocation; at an area change new blocks
+    // came every frame and each one rebuilt the guard (a walk of the whole free tree, up to 670
+    // per 5 s). The header before addr is trusted as CollectHeaders and StillUsed trust one: in
+    // use, a sane size, and the next block points back to it. Off by default since 29 Oct: the
+    // check and the full-range write are not one step, and a block the game frees in between gets
+    // its free tree links (kept inside free blocks) overwritten. This sent more writes down that
+    // path exactly while loads free blocks; suspected in the 0x49800 crash 6 s after a load, 24 min
+    // into the user's session. It saved almost nothing.
     static const bool on = [] {
         const char* v = std::getenv("SOTC_GUARD_USER_POINTER");
-        return !(v && v[0] == '0');
+        return v && v[0] == '1';
     }();
     if (!on || addr < HeapPointerLo + HeaderSize || (addr & 7)) {
         return false;

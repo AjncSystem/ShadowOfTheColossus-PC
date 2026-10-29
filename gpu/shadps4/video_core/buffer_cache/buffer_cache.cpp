@@ -3775,6 +3775,16 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
     const auto bind_start = std::chrono::steady_clock::now();
     auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    // sotc: any other failure (out of device memory on a 4 GB card) left no trace: the GPU then
+    // waits for a tick the bind never signals (AMD GCN 4 GB reports #7, #8).
+    if (submit_result != vk::Result::eSuccess) {
+        static u32 failures = 0;
+        if (++failures <= 16) {
+            std::fprintf(stderr, "SOTC sparse bind failed: %s (%zu buffers, tick %llu)\n",
+                         vk::to_string(submit_result).c_str(), buffer_binds.size(),
+                         static_cast<unsigned long long>(signal_tick));
+        }
+    }
     // sotc: a bind of many ranges (an arena migration rebinds all of them) can take long.
     if (const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - bind_start)

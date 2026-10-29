@@ -293,6 +293,11 @@ public:
         return bool(vk13_props.requiredSubgroupSizeStages & stage);
     }
 
+    /// sotc: the smallest subgroup size the device runs (VkPhysicalDeviceSubgroupSizeControl).
+    u32 MinSubgroupSize() const {
+        return vk13_props.minSubgroupSize;
+    }
+
     /// sotc: the subgroup size a pipeline stage is created with, or 0 to leave it to the driver.
     /// Intel runs 8, 16 or 32 lanes: left free, its compiler builds each shader for several SIMD
     /// widths, and first-time compiles took from seconds to minutes (the screen froze meanwhile),

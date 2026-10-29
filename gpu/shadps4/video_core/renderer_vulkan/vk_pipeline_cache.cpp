@@ -455,6 +455,15 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     if (instance.IsAmdWave32Forced()) {
         std::fprintf(stderr, "GPU: AMD wave32 on: shaders lowered for 32 lanes, LDS barriers on "
                              "(SOTC_AMD_WAVE32)\n");
+        // GCN: compute pipelines then require 32, below the card's minimum: outside the Vulkan
+        // spec (VUID-VkPipelineShaderStageRequiredSubgroupSizeCreateInfo-requiredSubgroupSize-02761).
+        if (const u32 req = instance.RequiredSubgroupSize(vk::ShaderStageFlagBits::eCompute);
+            req != 0 && req < instance.MinSubgroupSize()) {
+            std::fprintf(stderr, "GPU: AMD wave32 requires subgroups of %u, below the card's "
+                                 "minimum %u (outside the Vulkan spec; SOTC_AMD_WAVE32=0 runs 64 "
+                                 "wide)\n",
+                         req, instance.MinSubgroupSize());
+        }
     }
     // Wave64 uniform branches on every driver. Tested on a Radeon RX 6650 XT (32-wide path):
     // off, the shadows next to the Wander and Agro on grass get horizontal stripes; on, the

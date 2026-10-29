@@ -20,8 +20,8 @@ modo Pro, HUD com geração de quadros).
 - Menos trabalho por desenho: o formato dos vértices só é reenviado quando muda, e chamadas
   vizinhas de proteção de memória são juntadas.
 - Build sem `libc++.dll` e com o caminho quente da thread de desenho mais leve.
-- Lançador: a aba **Imagem e FPS** ganhou a seção **Ajustes experimentais**. Ela traz as chaves
-  criadas contra as travadas, cada uma com uma descrição curta, todas no valor padrão.
+- Lançador: nova aba **Ajustes experimentais**, abaixo de Avançado. Ela traz as opções criadas
+  contra as travadas, cada uma com uma descrição curta e já no valor padrão.
 
 **Experimental (desligado por padrão)**
 - Dezenas de chaves para a thread de desenho (novo caminho de bind, cache de binds, memória dos

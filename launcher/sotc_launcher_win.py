@@ -558,6 +558,7 @@ def load_settings():
         if 'SOTC_DLSSG=1' in extra:
             settings['framegen'] = 'auto'
             settings['extra_env'] = ' '.join(item for item in extra if item != 'SOTC_DLSSG=1')
+    sotc_tuning.fill_defaults(settings)  # value fields saved empty by 0.70.1 show their default
     return settings
 
 
@@ -1047,7 +1048,9 @@ class Launcher:
         self.nav, self.current_page = {}, None
         for name, title in (('play', _('Jogar', 'Play')), ('game', _('Jogo e saves', 'Game & saves')),
                             ('graphics', _('Imagem e FPS', 'Display & FPS')), ('controls', _('Controles', 'Controls')),
-                            ('advanced', _('Avançado', 'Advanced')), ('debug', _('Debug', 'Debug'))):
+                            ('advanced', _('Avançado', 'Advanced')),
+                            ('tuning', _('Ajustes experimentais', 'Experimental tuning')),
+                            ('debug', _('Debug', 'Debug'))):
             item = tk.Label(side, text='    ' + title, bg=BG, fg=TEXT, anchor='w', font=(ui_font(), 11),
                             pady=10, cursor='hand2')
             item.pack(fill='x')
@@ -1084,6 +1087,7 @@ class Launcher:
         self.build_graphics()
         self.build_controls()
         self.build_advanced()
+        self.build_tuning()
         self.build_debug()
         self.build_log()
         self.root.bind_all('<MouseWheel>', self.wheel)
@@ -1431,20 +1435,19 @@ class Launcher:
         self.section(f, _('Tela', 'Display'))
         self.check(f, 'fullscreen', _('Tela cheia', 'Fullscreen'))
         self.row(f, _('Apresentação', 'Presentation'), self.choice(f, 'present_mode', PRESENT_MODES))
-        self.build_tuning(f)
 
-    def build_tuning(self, f):
-        """The tuning switches of the streaming-stutter work (sotc_tuning.py), grouped, each with
-        its variable name in the hint."""
+    def build_tuning(self):
+        """The tuning switches of the streaming-stutter work (sotc_tuning.py), on their own page,
+        grouped, each with its variable name in the hint."""
         ttk = self.ttk
-        self.section(f, _('Ajustes experimentais (travadas no streaming)',
-                          'Experimental tuning (streaming stutters)'), top=24)
-        self.note(f, _('As chaves criadas no trabalho contra as travadas, todas no valor padrão. Quase todas '
-                       'são experimentais ou só medem; mude uma por vez e compare. O campo "Variáveis extras" '
-                       '(aba Avançado) vale por cima destas.',
-                       'The switches made in the work against the stutters, all at their default. Almost all '
-                       'are experimental or only measure; change one at a time and compare. The "Extra '
-                       'variables" field (Advanced page) applies on top of these.'), top=2)
+        f = self.scrolled_page('tuning', _('Ajustes experimentais', 'Experimental tuning'),
+                               _('As opções criadas no trabalho contra as travadas no streaming.',
+                                 'The options made in the work against the streaming stutters.'))
+        self.note(f, _('Todas começam no valor padrão. Quase todas são experimentais ou só medem; mude uma '
+                       'por vez e compare. O campo "Variáveis extras" (aba Avançado) vale por cima destas.',
+                       'All start at their default. Almost all are experimental or only measure; change one '
+                       'at a time and compare. The "Extra variables" field (Advanced page) applies on top of '
+                       'these.'), top=4)
 
         def reset():
             for name, kind, *_rest in sotc_tuning.TUNING:

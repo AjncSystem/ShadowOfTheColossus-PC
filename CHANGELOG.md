@@ -22,7 +22,9 @@ modo Pro, HUD com geração de quadros).
   timer de alta resolução.
 - Menos trabalho por desenho: o formato dos vértices só é reenviado quando muda, e chamadas
   vizinhas de proteção de memória são juntadas.
-- Build sem `libc++.dll` e com o caminho quente da thread de desenho mais leve.
+- O `bb-probe.exe` passa a levar a libc++ embutida (a thread de desenho não chama mais o
+  `libc++.dll`), e o caminho quente da thread de desenho ficou mais leve. O `libc++.dll`
+  continua no pacote, porque os codecs do FFmpeg precisam dele.
 - Lançador: nova aba **Ajustes experimentais**, abaixo de Avançado. Ela traz as opções criadas
   contra as travadas, cada uma com uma descrição curta e já no valor padrão.
 
@@ -562,7 +564,7 @@ modo Pro, HUD com geração de quadros).
   (`SOTC_HOT_PAGES_MAX`). Linha `SOTC hot pages` com `SOTC_FPS=1`. **Não recomendado:** no teste
   reenviou 0,6-1,7 GB a cada 5 s e copiou buffers de vértices no meio da escrita do jogo
   (vértices piscando, mais travadas).
-- Build: libc++ ligada estaticamente (sem `libc++.dll`), xxhash compilado inline, e três custos
+- Build: libc++ ligada estaticamente no `bb-probe.exe` (o `libc++.dll` fica só para os codecs do FFmpeg), xxhash compilado inline, e três custos
   tirados do caminho quente da thread de draws (nomes de depuração de imagens montados com os
   nomes desligados, a checagem do nível de log e a do `SOTC_OPT_OFF`).
 - `SOTC_STAGING_LARGE_POW2=1` (experimental, desligado): buffers de staging grandes em classes de

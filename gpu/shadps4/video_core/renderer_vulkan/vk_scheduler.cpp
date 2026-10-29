@@ -72,6 +72,7 @@ void Scheduler::WaitSubmitted(u64 tick, bool kick) {
     if (kick) {
         recorder->Kick();
     }
+    const SotcStats::SplitTimer submit_split{SotcStats::SplitWaitSubmit};
     u64 submitted = recorded_submit_tick.load(std::memory_order_acquire);
     for (u32 spins = 0; spins < 4096 && submitted < tick; ++spins) {
         _mm_pause();

@@ -429,6 +429,55 @@ void VideoOutDriver::Flip(const Request& req) {
                 slow_ns[c] += cause_ns[c];
             }
         }
+        // sotc: SOTC_DRAW_SPLIT: this frame's share of the split counters (sotc_stats.h) and of the
+        // CPU time of the draw, command processor and recorder threads, summed for the window, kept
+        // for its worst frame and summed over its frames above 40 ms. The last column is the
+        // deepest draw thread queue (a maximum, not a sum). All in TSC ticks until printed.
+        constexpr int kSplitColumns = int{SotcStats::SplitParts} + int{SotcStats::SplitThreads} + 1;
+        constexpr int kSplitQueue = kSplitColumns - 1;
+        static uint64_t split_seen[kSplitColumns]{}, split_sum[kSplitColumns]{},
+            split_worst[kSplitColumns]{}, split_slow[kSplitColumns]{};
+        static double split_worst_ms = 0.0;
+        static u32 split_frames = 0, split_slow_frames = 0;
+        static uint64_t split_tick0 = 0, split_ns0 = 0;
+        if (SotcStats::kDrawSplit) {
+            uint64_t current[kSplitColumns]{};
+            for (int c = 0; c < SotcStats::SplitParts; ++c) {
+                current[c] = SotcStats::split_ticks[c].load(std::memory_order_relaxed);
+            }
+            for (int t = 0; t < SotcStats::SplitThreads; ++t) {
+                current[SotcStats::SplitParts + t] =
+                    SotcStats::SplitThreadCycles(static_cast<SotcStats::SplitThread>(t));
+            }
+            uint64_t frame[kSplitColumns]{};
+            for (int c = 0; c < kSplitQueue; ++c) {
+                // A thread registered since the last flip starts from its first reading.
+                frame[c] = split_seen[c] || c < SotcStats::SplitParts ? current[c] - split_seen[c] : 0;
+                split_seen[c] = current[c];
+            }
+            frame[kSplitQueue] = SotcStats::split_queue_max.exchange(0, std::memory_order_relaxed);
+            if (split_tick0 == 0) { // first flip: only the starting point
+                split_tick0 = SotcStats::Ticks();
+                split_ns0 = SotcStats::NowNs();
+            } else {
+                const auto add = [&](uint64_t* to) {
+                    for (int c = 0; c < kSplitQueue; ++c) {
+                        to[c] += frame[c];
+                    }
+                    to[kSplitQueue] = std::max(to[kSplitQueue], frame[kSplitQueue]);
+                };
+                ++split_frames;
+                add(split_sum);
+                if (interval_ms > split_worst_ms) {
+                    split_worst_ms = interval_ms;
+                    std::copy(std::begin(frame), std::end(frame), std::begin(split_worst));
+                }
+                if (interval_ms > 40.0) {
+                    ++split_slow_frames;
+                    add(split_slow);
+                }
+            }
+        }
         if (now - window_start >= std::chrono::seconds(5)) {
             const double seconds = std::chrono::duration<double>(now - window_start).count();
             std::string report; // sotc: written at once off this thread (see ReportPrintf)
@@ -777,6 +826,54 @@ void VideoOutDriver::Flip(const Request& req) {
                 std::fprintf(stderr, "SOTC threads per frame: draw busy %.2f ms, command parse %.2f ms\n",
                              (seconds * 1000.0 - idle_ms) / flips, parse_ms / flips);
             }
+            if (SotcStats::kDrawSplit && split_frames && split_tick0) {
+                const double ns = double(SotcStats::NowNs() - split_ns0);
+                const double ticks_per_ms =
+                    ns > 0 ? (SotcStats::Ticks() - split_tick0) / (ns / 1e6) : 1.0;
+                const auto line = [&](const uint64_t* v, double frames) {
+                    using namespace SotcStats;
+                    const auto ms = [&](int c) { return v[c] / ticks_per_ms / frames; };
+                    constexpr int threads = SplitParts; // the thread columns follow the parts
+                    char text[1536];
+                    std::snprintf(
+                        text, sizeof(text),
+                        "draw cpu %.1f ms (idle spin %.1f; idle %.1f), cp cpu %.1f, recorder cpu "
+                        "%.1f; ops draw %.1f, indirect %.1f, dispatch %.1f, func %.1f, commands "
+                        "%.1f; bind %.1f [buffers %.1f, textures %.1f, dma %.1f]; texture uploads "
+                        "%.1f [hash %.1f, staging %.1f, copy %.1f (%.1f MB in %.0f copies, %.0f of "
+                        "2 MB+, %.0f page faults), detile %.1f, record %.1f]; "
+                        "draw waits gpu "
+                        "%.1f, submit %.1f, recorder %.1f, frame %.1f; queue max %llu; guest "
+                        "readback waits %.1f [queue %.1f, submit %.1f, gpu %.1f, finish %.1f]",
+                        ms(threads + SplitThreadDraw), ms(SplitIdleSpin), ms(SplitIdle),
+                        ms(threads + SplitThreadCp), ms(threads + SplitThreadRecorder),
+                        ms(SplitDraw), ms(SplitIndirect), ms(SplitDispatch), ms(SplitFunc),
+                        ms(SplitCommands), ms(SplitBind), ms(SplitBindBuffers),
+                        ms(SplitBindTextures), ms(SplitBindDma), ms(SplitTexRefresh),
+                        ms(SplitTexHash), ms(SplitTexStaging), ms(SplitTexCopy),
+                        v[SplitTexBytes] / 1048576.0 / frames, v[SplitTexCopies] / frames,
+                        v[SplitTexBig] / frames, v[SplitTexFaults] / frames,
+                        ms(SplitTexDetile), ms(SplitTexRecord), ms(SplitWaitGpu),
+                        ms(SplitWaitSubmit), ms(SplitWaitRecorder), ms(SplitWaitFrame),
+                        static_cast<unsigned long long>(v[kSplitQueue]), v[SplitRbCount] / frames,
+                        ms(SplitRbQueue), ms(SplitRbSubmit), ms(SplitRbGpu), ms(SplitRbFinish));
+                    return std::string{text};
+                };
+                std::fprintf(stderr, "SOTC DRAW SPLIT per frame (%u frames): %s\n", split_frames,
+                             line(split_sum, split_frames).c_str());
+                std::fprintf(stderr, "SOTC DRAW SPLIT worst frame %.1f ms: %s\n", split_worst_ms,
+                             line(split_worst, 1.0).c_str());
+                if (split_slow_frames) {
+                    std::fprintf(stderr, "SOTC DRAW SPLIT frames > 40 ms: %u, per frame: %s\n",
+                                 split_slow_frames, line(split_slow, split_slow_frames).c_str());
+                }
+            }
+            split_frames = 0;
+            split_slow_frames = 0;
+            split_worst_ms = 0.0;
+            std::fill(std::begin(split_sum), std::end(split_sum), 0);
+            std::fill(std::begin(split_worst), std::end(split_worst), 0);
+            std::fill(std::begin(split_slow), std::end(split_slow), 0);
             if (const uint64_t faults =
                     SotcStats::srt_walker_faults.load(std::memory_order_relaxed)) {
                 std::fprintf(stderr, "SOTC SRT walker loads that read zero: %llu\n",

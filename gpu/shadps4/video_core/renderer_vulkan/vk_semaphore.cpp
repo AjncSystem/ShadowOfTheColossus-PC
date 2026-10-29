@@ -4,6 +4,7 @@
 #include <limits>
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
+#include "video_core/sotc_stats.h"
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -177,6 +178,7 @@ void Semaphore::Wait(u64 tick) {
     if (IsFree(tick)) {
         return;
     }
+    const SotcStats::SplitTimer gpu_split{SotcStats::SplitWaitGpu};
 
     // sotc: the marker comes first; the driver reports the semaphore right after it.
     if (marker_buffer && tick < CurrentTick() && SpinMarker(MarkerSlot::Timeline, tick)) {

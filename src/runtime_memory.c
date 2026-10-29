@@ -1374,6 +1374,46 @@ int runtime_memory_region(uintptr_t address, uintptr_t *start, uintptr_t *end, i
     read_unlock();
     return found;
 }
+/* sotc: SOTC_COPY_LOCK_ONCE=1 (bbgpu CopySparseMemory): guest memory copied out through the
+ * backing view in one call, for the GPU's texture and buffer uploads. They looked up the region
+ * and then the backing pointer of every mapping run, and at an area change each lookup the region
+ * cache could not answer waited for a map batch: 41-58 ms for 12-20 MB of textures in one frame
+ * (user's route, 29 Oct). The cached regions are copied first; the rest under one read lock.
+ * Reserved and unmapped bytes read as zero, as before. 0 (caller copies run by run) before the
+ * backing view exists: a copy from guest addresses can fault, and the fault must not find the
+ * read lock held. */
+int runtime_memory_copy_out(uintptr_t source, unsigned char *dest, uint64_t size) {
+    if (!backing_base) return 0;
+    uintptr_t at=source;
+    const uintptr_t end=source+size;
+    if (!(runtime_disabled_optimizations & 1)) {
+        while (at<end) {
+            const CachedRegion *c=cached_region_q(at,end);
+            if (!c || c->kind==KIND_RESERVED || !c->backing) break;
+            const uintptr_t stop=c->end<end ? c->end : end;
+            memcpy(dest+(at-source),c->backing+(at-c->start),stop-at);
+            at=stop;
+        }
+    }
+    if (at==end) return 1;
+    read_lock();
+    while (at<end) {
+        const size_t i=vma_index(at);
+        uintptr_t stop;
+        if (i<vma_count && vmas[i].start<=at) {
+            stop=vmas[i].end<end ? vmas[i].end : end;
+            cache_region(i,at);
+            if (vmas[i].kind==KIND_RESERVED) memset(dest+(at-source),0,stop-at);
+            else memcpy(dest+(at-source),backing_base+vmas[i].phys+(at-vmas[i].start),stop-at);
+        } else {
+            stop=i<vma_count && vmas[i].start<end ? vmas[i].start : end;
+            memset(dest+(at-source),0,stop-at);
+        }
+        at=stop;
+    }
+    read_unlock();
+    return 1;
+}
 /* GPU page tracking: restrict host access, never beyond the guest's own protection. */
 /* sotc: diagnostics for page tracking problems: the runtime's view of a page (VMA kind and guest
  * protection) next to the protection the host really has. */

@@ -1745,6 +1745,7 @@ void Rasterizer::CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dm
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
+    const SotcStats::SplitTimer bind_split{SotcStats::SplitBind};
     fast_bind_hit = false;
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
@@ -1814,6 +1815,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             fast_bind_hit = true;
             SotcStats::fast_bind_hits.fetch_add(1, std::memory_order_relaxed);
             if (fast_bind.uses_dma) {
+                const SotcStats::SplitTimer dma_split{SotcStats::SplitBindDma};
                 buffer_cache.SynchronizeDmaBuffers();
             }
             return true;
@@ -1831,12 +1833,19 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         }
         set_writes.resize(set_writes.size() + stage->buffers.size() + stage->images.size() +
                           stage->samplers.size());
-        BindBuffers(*stage, binding, push_data);
-        BindTextures(*stage, binding);
+        {
+            const SotcStats::SplitTimer buffers_split{SotcStats::SplitBindBuffers};
+            BindBuffers(*stage, binding, push_data);
+        }
+        {
+            const SotcStats::SplitTimer textures_split{SotcStats::SplitBindTextures};
+            BindTextures(*stage, binding);
+        }
         uses_dma |= stage->uses_dma;
     }
 
     if (uses_dma) {
+        const SotcStats::SplitTimer dma_split{SotcStats::SplitBindDma};
         buffer_cache.SynchronizeDmaBuffers();
     }
 

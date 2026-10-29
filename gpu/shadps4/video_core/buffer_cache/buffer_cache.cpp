@@ -294,13 +294,31 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     // The guest thread waits for the GPU, not the command processor.
     AsyncReadback readback{
         .device_addr = device_addr, .size = size, .stream = stream, .is_write = is_write};
+    // sotc: SOTC_DRAW_SPLIT: the four parts of the guest's wait (draw thread queue and the copy
+    // recorded there, the recorder submitting it, the GPU, the apply on the draw thread).
+    const bool split = SotcStats::kDrawSplit;
+    u64 split_mark = split ? SotcStats::Ticks() : 0;
+    const auto split_part = [&](SotcStats::SplitPart part) {
+        if (split) {
+            const u64 now = SotcStats::Ticks();
+            SotcStats::split_ticks[part].fetch_add(now - split_mark, std::memory_order_relaxed);
+            split_mark = now;
+        }
+    };
     liverpool->SendCommand<true>([this, &readback] { BeginAsyncReadback(readback); });
+    split_part(SotcStats::SplitRbQueue);
     if (!readback.waiting) {
         return;
     }
+    if (split) {
+        SotcStats::split_ticks[SotcStats::SplitRbCount].fetch_add(1, std::memory_order_relaxed);
+    }
     scheduler.WaitSubmitted(readback.tick, false);
+    split_part(SotcStats::SplitRbSubmit);
     scheduler.GetWorkSemaphore()->Wait(readback.tick);
+    split_part(SotcStats::SplitRbGpu);
     liverpool->SendCommand<true>([this, &readback] { FinishAsyncReadback(readback); });
+    split_part(SotcStats::SplitRbFinish);
 }
 
 void BufferCache::MarkWrittenByGuest(VAddr addr, u64 size) {
@@ -1184,8 +1202,12 @@ void BufferCache::RecordCurrentWrite(VAddr addr, u64 size) {
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainGuestCopyForImage(VAddr device_addr, u32 size) {
-    const auto staging = staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
-                                              instance.StorageMinAlignment());
+    const auto staging = [&] {
+        const SotcStats::SplitTimer staging_split{SotcStats::SplitTexStaging};
+        return staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
+                                    instance.StorageMinAlignment());
+    }();
+    const SotcStats::SplitTexCopyScope copy_split{staging.size};
     memory->CopySparseMemory(device_addr, staging.mapped, staging.size);
     staging.Flush();
     return {staging.buffer, staging.offset};
@@ -1193,10 +1215,15 @@ std::pair<const Buffer*, u64> BufferCache::ObtainGuestCopyForImage(VAddr device_
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
     if (IsRegionGpuModified(device_addr, size)) {
+        const SotcStats::SplitTimer copy_split{SotcStats::SplitTexCopy};
         return ObtainBuffer(device_addr, size, false);
     }
-    const auto staging = staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
-                                              instance.StorageMinAlignment());
+    const auto staging = [&] {
+        const SotcStats::SplitTimer staging_split{SotcStats::SplitTexStaging};
+        return staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
+                                    instance.StorageMinAlignment());
+    }();
+    const SotcStats::SplitTexCopyScope copy_split{staging.size};
     memory->CopySparseMemory(device_addr, staging.mapped, staging.size);
     staging.Flush();
     return {staging.buffer, staging.offset};

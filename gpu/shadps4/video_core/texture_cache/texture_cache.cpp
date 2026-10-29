@@ -1058,6 +1058,7 @@ void TextureCache::RefreshImage(Image& image) {
         return;
     }
     const SotcStats::FrameTimer frame_timer{SotcStats::FrameUpload};
+    const SotcStats::SplitTimer refresh_split{SotcStats::SplitTexRefresh};
     // sotc: RefreshImage always runs under `mutex` (UpdateImage, FindImage -> ExpandImage) and can
     // reach EnsureResident through ObtainBufferForImage; see TryEmergencyCollect.
     ++refresh_depth;
@@ -1096,6 +1097,7 @@ void TextureCache::RefreshImage(Image& image) {
         const u32 size = s_w * s_h * (image.info.num_bits / 8);
         const u64 hash = [&] {
             const SotcStats::FrameTimer hash_timer{SotcStats::FrameHash};
+            const SotcStats::SplitTimer hash_split{SotcStats::SplitTexHash};
             return XXH3_64bits(addr, size);
         }();
         if (image.hash == hash) {
@@ -1123,6 +1125,7 @@ void TextureCache::RefreshImage(Image& image) {
             const u8* addr = std::bit_cast<u8*>(image.info.guest_address);
             const u64 hash = [&] {
                 const SotcStats::FrameTimer hash_timer{SotcStats::FrameHash};
+                const SotcStats::SplitTimer hash_split{SotcStats::SplitTexHash};
                 return XXH3_64bits(addr + mip_offset, mip_size);
             }();
             if (image.mip_hashes[m] == hash) {
@@ -1195,7 +1198,10 @@ void TextureCache::RefreshImage(Image& image) {
                                                      "SOTC zero texels");
                     runtime.FillBuffer(zeros.get(), 0, ZeroBytes, 0);
                 }
-                runtime.UploadImage(&image, zeros.get(), zero_copies);
+                {
+                    const SotcStats::SplitTimer record_split{SotcStats::SplitTexRecord};
+                    runtime.UploadImage(&image, zeros.get(), zero_copies);
+                }
                 image.flags |= ImageFlagBits::Dirty;
                 image.sotc_zero_filled = true;
                 SotcStats::upload_zero_filled.fetch_add(1, std::memory_order_relaxed);
@@ -1248,12 +1254,18 @@ void TextureCache::RefreshImage(Image& image) {
         from_guest
             ? buffer_cache.ObtainGuestCopyForImage(image.info.guest_address, image.info.guest_size)
             : buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
-    const auto [buffer, offset] = tile_manager.DetileImage(in_buffer, in_offset, image.info);
+    const auto [buffer, offset] = [&] {
+        const SotcStats::SplitTimer detile_split{SotcStats::SplitTexDetile};
+        return tile_manager.DetileImage(in_buffer, in_offset, image.info);
+    }();
     for (auto& copy : image_copies) {
         copy.bufferOffset += offset;
     }
 
-    runtime.UploadImage(&image, buffer, image_copies);
+    {
+        const SotcStats::SplitTimer record_split{SotcStats::SplitTexRecord};
+        runtime.UploadImage(&image, buffer, image_copies);
+    }
     SotcGlyphHook(image);
 }
 

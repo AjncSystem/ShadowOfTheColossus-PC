@@ -1607,6 +1607,7 @@ bool Presenter::PresentGenerated(Frame* frame) {
 }
 
 Frame* Presenter::GetRenderFrame() {
+    const SotcStats::SplitTimer frame_split{SotcStats::SplitWaitFrame};
     // Wait for free presentation frames
     Frame* frame;
     {

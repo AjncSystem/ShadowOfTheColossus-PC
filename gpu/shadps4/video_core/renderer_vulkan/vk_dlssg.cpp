@@ -825,6 +825,18 @@ void OnDeviceCreated(const Instance& instance) {
                        ResolveFeature(api.dlss_set_options, sl::kFeatureDLSS, "slDLSSSetOptions");
         std::fprintf(stderr, "SOTC DLSS Super Resolution: %s (%d)\n",
                      sr_supported ? "available" : "not available, FSR 3.1 instead", static_cast<int>(sr));
+        // sotc: which DLSS this is (the NGX runtime decides the model), so a report says it.
+        if (sr_supported) {
+            if (auto* get_version = reinterpret_cast<PFun_slGetFeatureVersion*>(
+                    GetProcAddress(api.dll, "slGetFeatureVersion"))) {
+                sl::FeatureVersion v{};
+                if (get_version(sl::kFeatureDLSS, v) == sl::Result::eOk) {
+                    std::fprintf(stderr, "SOTC DLSS Super Resolution: Streamline %u.%u.%u, NGX %u.%u.%u\n",
+                                 v.versionSL.major, v.versionSL.minor, v.versionSL.build,
+                                 v.versionNGX.major, v.versionNGX.minor, v.versionNGX.build);
+                }
+            }
+        }
     }
     const sl::Result dlssg = api.is_supported(sl::kFeatureDLSS_G, adapter);
     const sl::Result reflex = api.is_supported(sl::kFeatureReflex, adapter);
@@ -911,6 +923,15 @@ bool SuperResEvaluate(vk::CommandBuffer cmdbuf, u32 frame_id, vk::Image color, v
     options.balancedPreset = dlss4 ? sl::DLSSPreset::ePresetK : sl::DLSSPreset::ePresetM;
     options.performancePreset = sl::DLSSPreset::ePresetM;
     options.ultraPerformancePreset = sl::DLSSPreset::ePresetL;
+    static bool logged_options = false;
+    if (!logged_options) {
+        logged_options = true;
+        std::fprintf(stderr,
+                     "SOTC DLSS Super Resolution: mode %d (1 performance, 2 balanced, 3 quality, 4 ultra "
+                     "performance, 6 DLAA), render %ux%u -> %ux%u, preset %s\n",
+                     static_cast<int>(options.mode), width, height, out_width, out_height,
+                     dlss4 ? "K" : "M (L in ultra performance)");
+    }
     options.preExposure = 1.0f;
     options.colorBuffersHDR = sl::Boolean::eFalse; // the frame is display referred, not HDR
     options.useAutoExposure = sl::Boolean::eTrue;

@@ -584,13 +584,26 @@ void runtime_rumble_set(int on) {
     pthread_mutex_unlock(&lock);
 }
 
+/* sotc: SOTC_VIBRATION=0..100 (the launcher's Vibration slider): the rumble strength of both
+ * motors in percent; 100 (default) is the game's own strength, 0 is off (#210). */
+static unsigned vibration_percent(void) {
+    static int percent=-1;
+    if (percent<0) {
+        const char *v=getenv("SOTC_VIBRATION");
+        const long p=v && *v ? strtol(v,NULL,10) : 100;
+        percent=p<0 ? 0 : p>100 ? 100 : (int)p;
+    }
+    return (unsigned)percent;
+}
+
 static ABI int32_t pad_vibration(int32_t handle, const uint8_t *param) {
     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
     if (!param) return ERR_INVALID_ARG;
-    if (!runtime_rumble_enabled()) return 0;
+    const unsigned scale=vibration_percent();
+    if (!runtime_rumble_enabled() || !scale) return 0;
     pthread_mutex_lock(&lock);
     SDL_Gamepad *g=current_gamepad();
-    if (g) SDL_RumbleGamepad(g,(uint16_t)(param[0]*257),(uint16_t)(param[1]*257),1000);
+    if (g) SDL_RumbleGamepad(g,(uint16_t)(param[0]*257u*scale/100u),(uint16_t)(param[1]*257u*scale/100u),1000);
     pthread_mutex_unlock(&lock);
     return 0;
 }

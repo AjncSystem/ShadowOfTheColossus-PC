@@ -161,7 +161,7 @@ def windows_language():
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
                 'user_dir': '', 'af16': True, 'textures': 'high', 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'hdr': False, 'fullscreen': False, 'fs_borderless': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
-                'readbacks': '', 'extra_env': '', 'close_on_play': False, 'skip_logos': False, 'gamepad': '', 'rumble': True,
+                'readbacks': '', 'extra_env': '', 'close_on_play': False, 'skip_logos': False, 'gamepad': '', 'rumble': True, 'vibration': '100',
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'render_preset': 'quality', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'fx_sunshadows': True, 'engine_cvars': '', 'perf_culling': True,
@@ -762,6 +762,7 @@ def game_environment(s):
         env['BB_GAMEPAD'] = str(s['gamepad']).strip()
     if not s.get('rumble', True):
         env['SOTC_RUMBLE'] = '0'
+    env['SOTC_VIBRATION'] = str(s.get('vibration', '100'))  # rumble strength 0..100 (src/runtime_pad.c)
     env['BB_CONFIG'] = str(PORT_DIR / 'sotc.ini')
     for item in str(s['extra_env']).split():
         if '=' in item:
@@ -995,6 +996,26 @@ class Launcher:
     def section(self, parent, title, top=18):
         self.ttk.Label(parent, text=title, style='Section.TLabel').grid(
             row=self.next_row(parent), column=0, columnspan=2, sticky='w', pady=(top, 2))
+
+    def vibration_row(self, parent):
+        """The rumble strength slider, 0..100 % (SOTC_VIBRATION)."""
+        tk, ttk = self.tk, self.ttk
+        var = self.var('vibration')
+        if not str(var.get()).strip().isdigit():  # a Scale turns a non-number into 0 (off)
+            var.set('100')
+        holder = ttk.Frame(parent)
+        tk.Scale(holder, from_=0, to=100, orient='horizontal', variable=var, showvalue=False,
+                 length=self.px(260), width=self.px(12), sliderlength=self.px(18), bg=ACCENT, troughcolor=CARD,
+                 activebackground=ACCENT_HI, highlightthickness=0, bd=0, sliderrelief='flat').pack(side='left')
+        value = ttk.Label(holder, width=5)
+        value.pack(side='left', padx=10)
+        show = lambda *_a: value.configure(text=f'{var.get()}%')
+        var.trace_add('write', show)
+        show()
+        return self.row(parent, _('Vibração', 'Vibration'), holder,
+                        _('Força da vibração do controle; 0% desliga. Vale na próxima vez que o jogo abrir.',
+                          "Strength of the gamepad's vibration; 0% turns it off. Applies the next time the game "
+                          'starts.'))
 
     def window_icon_row(self, parent):
         """The game window's icon: the game's (empty) or a picture of the player's choice."""
@@ -1542,6 +1563,7 @@ class Launcher:
         self.check(f, 'rumble', _('Vibração do controle', 'Controller vibration'),
                    _('Desmarque para o controle não vibrar. Vale na próxima vez que o jogo abrir.',
                      'Clear it to stop the gamepad from rumbling. Applies the next time the game starts.'))
+        self.vibration_row(f)
         self.check(f, 'diag_log', _('Registro detalhado (diagnóstico)', 'Detailed log (diagnostics)'),
                    _('Grava user/texture_diag.log com cada textura criada, descartada, enviada à placa ou pulada, e cada '
                      'escrita do jogo sobre texturas, com a hora. Só para investigar defeitos de imagem: o arquivo fica '

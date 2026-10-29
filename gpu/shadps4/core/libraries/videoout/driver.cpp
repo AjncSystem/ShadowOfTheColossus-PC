@@ -93,9 +93,14 @@ static u64 UntrackImageBase() {
 // game stores 31-bit pointers), and the whole read must be committed, readable and inside one
 // VirtualQuery region. A concurrent unmap could still race the copy; the engine does not unmap
 // these heaps, and the log is a diagnostic only (SOTC_UNTRACK_LOG). Not Windows: always false.
+// sotc: end of the user address space (x64 Windows). The engine's objects and heaps are not all
+// below 2 GiB: the game keeps 31-bit pointers for some data, but its allocators' chunks and their
+// list nodes live in the direct/flexible memory far above it.
+constexpr u64 kUntrackUserEnd = 0x0000800000000000ULL;
+
 static bool UntrackRead(u64 addr, void* out, size_t size) {
 #ifdef _WIN32
-    if (addr < 0x10000ULL || addr + size > 0x80000000ULL) {
+    if (addr < 0x10000ULL || addr + size > kUntrackUserEnd || addr + size < addr) {
         return false;
     }
     const auto* ptr = reinterpret_cast<const void*>(static_cast<uintptr_t>(addr));
@@ -121,9 +126,9 @@ static bool UntrackRead(u64 addr, void* out, size_t size) {
 // sotc: SOTC_UNTRACK_LOG. The chunk list of the RenderSingleFrameGPU parent allocator, as an eboot
 // offset walk: id (u32) at 0x2ed1f54 picks a heap object from the table at 0x2dfaab0; its parent
 // (+0x80) must equal the pointer at 0x2dfb2b8. The chunk list head is parent+0x48, with the
-// sentinel at parent+0x38. Each node: base at +0x60, size at +0x58, next at +0 (not verified: the
-// first nodes also print +8, so the right link can be told apart). One line is written only when
-// the list changes, so the report stays short.
+// sentinel at parent+0x38. Each node: base at +0x60, size at +0x58, next at +8 (measured on the
+// game: +8 of the last node is the sentinel, +0 holds the node itself; the first nodes print both).
+// One line is written only when the list changes, so the report stays short.
 static void UntrackLogChunks(u64 image, std::string& report) {
     static std::string last;
     static bool printed_links = false;
@@ -174,7 +179,7 @@ static void UntrackLogChunks(u64 image, std::string& report) {
         std::snprintf(item, sizeof(item), " %llx:%llx", static_cast<unsigned long long>(base),
                       static_cast<unsigned long long>(size));
         chunks += item;
-        node = next0;
+        node = next8; // sotc: the link is at +8 (measured: +8 of the last node is the sentinel)
         ++count;
     }
     if (count > 0) {
@@ -192,8 +197,8 @@ static void UntrackLogChunks(u64 image, std::string& report) {
 
 // sotc: SOTC_UNTRACK_AUTO. The chunk list of UntrackLogChunks as ranges. False when a read fails,
 // the list does not end at the sentinel within 64 nodes, or a node is not a sane chunk (64 KiB
-// aligned, below 2 GiB, at most one 32 MiB chunk). The next pointer at +0 is not verified on the
-// game: a wrong link makes the walk fail, which publishes nothing.
+// aligned, in user space, at most one 32 MiB chunk). The link is at +8 (see UntrackLogChunks); a
+// wrong link makes the walk fail, which publishes nothing.
 static bool UntrackAutoOneWalk(u64 parent, std::vector<VideoCore::SotcUntrack::Range>& out) {
     const u64 head = parent + 0x38;
     out.clear();
@@ -207,11 +212,13 @@ static bool UntrackAutoOneWalk(u64 parent, std::vector<VideoCore::SotcUntrack::R
         u64 next = 0;
         if (!UntrackRead(node + 0x60, &base, sizeof(base)) ||
             !UntrackRead(node + 0x58, &size, sizeof(size)) ||
-            !UntrackRead(node, &next, sizeof(next))) {
-            return false;
+            !UntrackRead(node + 8, &next, sizeof(next))) {
+            return false; // sotc: the link is at +8 (measured; +0 holds the node itself)
         }
-        if (base >= 0x80000000ULL || (base & 0xFFFFULL) != 0 || size == 0 ||
-            size > (32ULL << 20) || base + size > 0x80000000ULL) {
+        // sotc: chunk bases are guest addresses (the game's direct memory lives far above 2 GiB,
+        // e.g. 0x10xxxxxxxx): any user-space address, 64 KiB aligned, up to 32 MiB.
+        if (base < 0x10000ULL || base >= kUntrackUserEnd || (base & 0xFFFFULL) != 0 || size == 0 ||
+            size > (32ULL << 20) || base + size > kUntrackUserEnd) {
             return false;
         }
         out.push_back(VideoCore::SotcUntrack::Range{base, size});

@@ -1,6 +1,18 @@
 # Changelog
 
 ## Não lançado — desempenho no streaming e correções visuais
+- **Medido (29 out): `SOTC_UNTRACK_AUTO` não reduz as faltas.** Depois de duas correções (a leitura
+  da lista de blocos aceitava só endereços abaixo de 2 GiB, e o ponteiro para o próximo nó fica em
+  +8, não em +0), o port achou o heap por quadro RenderSingleFrameGPU: um bloco de 32 MiB, liberado
+  até o teto de 16 MiB, sem nenhuma falta nas faixas liberadas. Mas as faltas de escrita ficaram
+  iguais (~13.500 a cada 5 s, contra ~13.200 na base), as páginas liberadas passaram a ser reenviadas
+  200–450 mil vezes por segundo e a thread de desenho subiu de 19,2 para 22,1 ms por quadro. As
+  faltas de escrita não vêm desse heap. Fica desligado.
+- **ETW (29 out, WPR + `tools/etw_offcpu.py`):** a thread de desenho fica na CPU ~60% do tempo; ~8%
+  dele ela espera dentro do kernel sem syscall (provável disputa do lock de memória do processo) e o
+  resto é preempção ou espera por trabalho; a CPU tem pouca folga (o port ocupa ~7 threads pesadas, e
+  havia programas em segundo plano). `SOTC_THREAD_IDS=1` agora também lista as threads do port, para
+  cruzar com o ETW.
 - **Medido (29 out): a segunda rodada não melhorou.** Os cortes do anel de operações
   (`SOTC_BACK_HEAD_CACHE`, `SOTC_BACK_PF`, `SOTC_REG_SAME`) sozinhos: thread de desenho 21,5 ms
   por quadro contra 19,2 ms da base enxuta (sessão mais pesada; nenhum sinal de ganho). O

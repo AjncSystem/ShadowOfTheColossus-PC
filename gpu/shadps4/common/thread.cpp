@@ -3,6 +3,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <string>
 #include <thread>
@@ -195,6 +197,13 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
 void SetCurrentThreadName(const char* name) {
     // bbport: guest thread names are kept by the C runtime.
     SetThreadDescription(GetCurrentThread(), UTF8ToUTF16W(name).data());
+    // sotc: SOTC_THREAD_IDS=1 also prints the port's own threads (the runtime prints the guest
+    // ones): host thread ids to match against ETW traces.
+    static const bool print_ids = std::getenv("SOTC_THREAD_IDS") != nullptr;
+    if (print_ids) {
+        std::fprintf(stderr, "Runtime: host thread '%s' is host thread %lu%c", name,
+                     static_cast<unsigned long>(GetCurrentThreadId()), '\n');
+    }
 }
 
 void SetThreadName(void* thread, const char* name) {

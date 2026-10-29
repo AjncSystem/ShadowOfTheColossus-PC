@@ -175,6 +175,10 @@ public:
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
+    /// sotc: SOTC_HLE_SKIP=2: every page of the range is GPU-written and none CPU-dirty, i.e. a
+    /// written binding of it has nothing left to do (MemoryTracker::IsSyncClean, is_written).
+    [[nodiscard]] bool IsWrittenRangeSynced(VAddr addr, u64 size) const noexcept;
+
     /// sotc: a guest write fault at addr: unprotect the following pages too (MemoryTracker::
     /// MarkAheadAsCpuModified). SOTC_WRITE_AHEAD_PAGES (default 15, 0 = off).
     void MarkWriteAhead(VAddr addr);
@@ -421,6 +425,12 @@ private:
         u64 group_bytes{};
         u64 group_tick{};
         boost::container::small_vector<ReadbackItem, 16> pending;
+        /// sotc: SOTC_WRITE_DIET (C1): hull [hull_lo, hull_hi) over every pending item's
+        /// [addr, addr + size) and every gpu_ranges entry (RbHullCover). Widened wherever pending
+        /// grows, never shrunk (the trims only remove parts). A non-prefetch readback marks nothing
+        /// for a range outside it (MarkInflightReadbacksDirty). Empty: lo ~0, hi 0.
+        VAddr hull_lo{~VAddr{0}};
+        VAddr hull_hi{};
     };
     /// sotc: SOTC_RB_GROW: the window [first, second) of readback.grow_window bytes, aligned to
     /// the base (SOTC_RB_NARROW) window, from the request's granule forward (or backward, ending
@@ -433,6 +443,10 @@ private:
     void NoteGuestReadbackDone(const AsyncReadback& readback);
     void BeginAsyncReadback(AsyncReadback& readback);
     void BeginAsyncReadbackImpl(AsyncReadback& readback);
+    /// sotc: SOTC_WRITE_DIET (C1): widens readback's hull over its pending items from index `from`
+    /// on. Called before each readback enters inflight_readbacks (from 0), and after each push onto
+    /// the pending of a readback that may be in flight (from the new item's index).
+    void RbHullCover(AsyncReadback& readback, size_t from);
     /// sotc: newest hot seq among the pending writers a readback waits for (0: none).
     u64 RbxWaitSeq(const AsyncReadback& readback);
     /// sotc: marks bytes a guest write fault asked for CPU-modified, unless pages of them
@@ -647,8 +661,10 @@ private:
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
                            bool is_texel_buffer);
     /// sotc: the full synchronization; SynchronizeMemory adds the SOTC_SYNC_FAST skip around it.
+    /// sotc: SOTC_SYNC_PIPE: scan_clean (optional) receives the verdict of the scan
+    /// (MemoryTracker::ForEachUploadRange).
     bool SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
-                               bool is_texel_buffer);
+                               bool is_texel_buffer, bool* scan_clean = nullptr);
 
     bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
 
@@ -803,7 +819,10 @@ private:
     /// GPU writes recorded into the command buffer still being built (tick current_writes_tick).
     RangeSet current_writes;
     u64 current_writes_tick{};
-    void RecordCurrentWrite(VAddr addr, u64 size, u64 seq = 0, bool gpu_write = false);
+    /// sotc: SOTC_WRITE_DIET: pf_marked, set by ObtainBuffer when AddGpuModified already ran
+    /// MarkInflightReadbacksDirty over this same range (its prefetch walk is then not repeated).
+    void RecordCurrentWrite(VAddr addr, u64 size, u64 seq = 0, bool gpu_write = false,
+                            bool pf_marked = false);
     bool write_scope_on{};       ///< sotc: see BeginWriteScope
     u64 write_scope_tick{};
     std::vector<std::pair<VAddr, u64>> write_scope;

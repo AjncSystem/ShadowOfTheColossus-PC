@@ -39,6 +39,7 @@
 #include "video_core/sotc_live.h"
 #include "video_core/sotc_adaptive.h"
 #include "video_core/sotc_write_extent.h"
+#include "video_core/sotc_op_phases.h" // sotc: SOTC_OP_PHASES
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -270,6 +271,7 @@ bool Rasterizer::FilterDraw() {
 }
 
 void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
+    const SotcOpPhases::Scope ph{SotcOpPhases::PhRenderState}; // sotc: SOTC_OP_PHASES
     const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the targets
     // Prefetch render targets to handle overlaps with bound textures (e.g. mipgen)
     const auto& key = pipeline->GetGraphicsKey();
@@ -278,6 +280,7 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         LOG_WARNING(Render_Vulkan, "Color buffers require gamma correction");
     }
     rs_memo_prepared = false;
+    rs_memo_verify = false;
     if (SotcStats::kRsMemo && RsMemoPrepare(pipeline)) { // sotc: SOTC_RS_MEMO
         rs_memo_prepared = true;
         return;
@@ -390,7 +393,7 @@ bool Rasterizer::RsMemoPrepare(const GraphicsPipeline* pipeline) {
     }
     const auto miss = [&](u32 reason) {
         rs_memo.valid = false;
-        if (SotcStats::kFpsLog) {
+        if (SotcStats::kFpsLog || SotcOpPhases::kOn) { // sotc: SOTC_OP_PHASES reads the misses too
             SotcStats::rs_memo_misses[reason].fetch_add(1, std::memory_order_relaxed);
         }
         return false;
@@ -398,7 +401,8 @@ bool Rasterizer::RsMemoPrepare(const GraphicsPipeline* pipeline) {
     if (!rs_memo.valid) {
         return miss(SotcStats::RsMissNone);
     }
-    if (rs_memo.tick != scheduler.CurrentTick()) {
+    const bool same_tick = rs_memo.tick == scheduler.CurrentTick();
+    if (!same_tick && !SotcStats::kRsMemoCross) {
         return miss(SotcStats::RsMissTick);
     }
     if (rs_memo.texture_generation != texture_cache.BindGeneration()) {
@@ -408,17 +412,47 @@ bool Rasterizer::RsMemoPrepare(const GraphicsPipeline* pipeline) {
         std::memcmp(rs_memo.key.data(), rs_key.data(), rs_key_len * sizeof(u32)) != 0) {
         return miss(SotcStats::RsMissRegs);
     }
-    if (!scheduler.IsRendering() || !(scheduler.GetRenderState() == rs_memo.state)) {
-        return miss(SotcStats::RsMissPass);
-    }
     const u32 num_cb = rs_memo.state.num_color_attachments;
-    for (u32 cb = 0; cb < num_cb; ++cb) {
-        if (const auto id = cb_descs[cb].first; id && !RsMemoTargetClean(id)) {
+    if (same_tick) {
+        if (!scheduler.IsRendering() || !(scheduler.GetRenderState() == rs_memo.state)) {
+            return miss(SotcStats::RsMissPass);
+        }
+        for (u32 cb = 0; cb < num_cb; ++cb) {
+            if (const auto id = cb_descs[cb].first; id && !RsMemoTargetClean(id)) {
+                return miss(SotcStats::RsMissImage);
+            }
+        }
+        if (const auto id = db_desc.first; id && !RsMemoTargetClean(id)) {
             return miss(SotcStats::RsMissImage);
         }
+    } else {
+        // sotc: SOTC_RS_MEMO=2, an earlier submit. The memo's own targets are checked (cb_descs may
+        // hold another draw's), and the pass need not be open: BeginRendering checks the bindings
+        // and opens it.
+        if (rs_memo.meta_epoch != texture_cache.MetaEpoch()) {
+            return miss(SotcStats::RsMissMeta);
+        }
+        for (u32 slot = 0; slot < rs_memo.target_id.size(); ++slot) {
+            const auto id = rs_memo.target_id[slot];
+            if (!RsMemoSameImage(slot, id)) {
+                return miss(SotcStats::RsMissIdentity);
+            }
+            if (id && !RsMemoTargetClean(id)) {
+                return miss(SotcStats::RsMissImage);
+            }
+        }
     }
-    if (const auto id = db_desc.first; id && !RsMemoTargetClean(id)) {
-        return miss(SotcStats::RsMissImage);
+    if (SotcStats::kRsMemoVerify) { // sotc: SOTC_RS_MEMO=3, the full path runs and is compared
+        rs_memo_verify = true;
+        return false;
+    }
+    if (!same_tick) {
+        // sotc: the draw's targets are the memo's (checked above). The marks below and the
+        // BeginRendering hit read cb_descs / db_desc.
+        for (u32 cb = 0; cb < num_cb; ++cb) {
+            cb_descs[cb].first = rs_memo.target_id[cb];
+        }
+        db_desc.first = rs_memo.target_id[AmdGpu::NUM_COLOR_BUFFERS];
     }
     // The targets of this draw, as the full path marks them (ResetBindings cleared them).
     for (u32 cb = 0; cb < num_cb; ++cb) {
@@ -434,16 +468,48 @@ bool Rasterizer::RsMemoPrepare(const GraphicsPipeline* pipeline) {
     return true;
 }
 
-bool Rasterizer::RsMemoBegin(RenderState& state) {
+// sotc: SOTC_RS_MEMO=2. True when Image::GetBarriers would emit no barrier and change no state for
+// this transition, so a replay of an earlier submit may skip Runtime::Transit. Mirrors its
+// full-resource branch (image.cpp): a partial range or per-subresource states take the other
+// branch, and a write access is left to the full path (SkipSameGeneral).
+static bool RsMemoTransitIsNoop(const VideoCore::Image& image, vk::ImageLayout layout,
+                                vk::AccessFlags2 access, const VideoCore::SubresourceRange& range) {
+    const auto& backing = *image.backing;
+    if (range.base != VideoCore::SubresourceBase{} || range.extent != image.info.resources ||
+        !backing.subresource_states.empty()) {
+        return false;
+    }
+    constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
+                                 vk::AccessFlagBits2::eShaderWrite |
+                                 vk::AccessFlagBits2::eMemoryWrite;
+    return backing.state.layout == layout && backing.state.access_mask == access &&
+           !static_cast<bool>(backing.state.access_mask & write_flags);
+}
+
+bool Rasterizer::RsMemoSameImage(u32 slot, VideoCore::ImageId image_id) {
+    // sotc: SOTC_RS_MEMO=2. The image in a memo slot is still the one the memo drew: same uid
+    // (slots are reused) and same backing (its state views and sample count are the memo's).
+    if (!image_id) {
+        return true;
+    }
+    const auto& image = texture_cache.GetImage(image_id);
+    return image.image_uid == rs_memo.target_uid[slot] &&
+           image.backing == rs_memo.target_backing[slot];
+}
+
+Rasterizer::RsMemoHit Rasterizer::RsMemoBeginCheck() {
     // sotc: SOTC_RS_MEMO, under BeginRendering's batch lock, after the binds of this draw (they
     // may have submitted, uploaded, ended the pass, registered images or sampled a target).
+    // Read-only apart from the miss counters. Same tick: the checks of mode 1, unchanged. Another
+    // tick (SOTC_RS_MEMO=2): the pass need not be open, and the targets must be the memo's own.
     const auto miss = [&](u32 reason) {
-        if (SotcStats::kFpsLog) {
+        if (SotcStats::kFpsLog || SotcOpPhases::kOn) { // sotc: SOTC_OP_PHASES reads the misses too
             SotcStats::rs_memo_misses[reason].fetch_add(1, std::memory_order_relaxed);
         }
-        return false;
+        return RsMemoHit::Miss;
     };
-    if (rs_memo.tick != scheduler.CurrentTick()) {
+    const bool same_tick = rs_memo.tick == scheduler.CurrentTick();
+    if (!same_tick && !SotcStats::kRsMemoCross) {
         return miss(SotcStats::RsMissTick);
     }
     if (rs_memo.texture_generation != texture_cache.BindGeneration()) {
@@ -452,12 +518,16 @@ bool Rasterizer::RsMemoBegin(RenderState& state) {
     if (rs_memo.meta_epoch != texture_cache.MetaEpoch()) {
         return miss(SotcStats::RsMissMeta);
     }
-    if (!scheduler.IsRendering() || !(scheduler.GetRenderState() == rs_memo.state)) {
+    if (same_tick &&
+        (!scheduler.IsRendering() || !(scheduler.GetRenderState() == rs_memo.state))) {
         return miss(SotcStats::RsMissPass);
     }
     const u32 num_cb = rs_memo.state.num_color_attachments;
     for (u32 cb = 0; cb < num_cb; ++cb) {
         const auto id = cb_descs[cb].first;
+        if (!same_tick && (id != rs_memo.target_id[cb] || !RsMemoSameImage(cb, id))) {
+            return miss(SotcStats::RsMissIdentity);
+        }
         if (!id) {
             continue;
         }
@@ -469,9 +539,72 @@ bool Rasterizer::RsMemoBegin(RenderState& state) {
             return miss(SotcStats::RsMissImage);
         }
     }
-    if (const auto id = db_desc.first; id && !RsMemoTargetClean(id)) {
+    constexpr u32 depth_slot = AmdGpu::NUM_COLOR_BUFFERS;
+    const auto db_id = db_desc.first;
+    if (!same_tick &&
+        (db_id != rs_memo.target_id[depth_slot] || !RsMemoSameImage(depth_slot, db_id))) {
+        return miss(SotcStats::RsMissIdentity);
+    }
+    if (db_id && !RsMemoTargetClean(db_id)) {
         return miss(SotcStats::RsMissImage);
     }
+    return same_tick ? RsMemoHit::Same : RsMemoHit::Cross;
+}
+
+void Rasterizer::RsMemoVerify(const RenderState& full, RsMemoHit hit) {
+    // sotc: SOTC_RS_MEMO=3. The full path's result against what a hit would have replayed: the
+    // stored state with the layouts the replay sets (the backings after the full path's
+    // transitions), and the memo's image ids. The result of the full path is what is used.
+    if (SotcStats::kFpsLog) { // sotc: candidates are counted as checks, not as hits
+        SotcStats::rs_memo_verify_checks.fetch_add(1, std::memory_order_relaxed);
+    }
+    RenderState expect = rs_memo.state;
+    bool same = true;
+    const u32 num_cb = rs_memo.state.num_color_attachments;
+    for (u32 cb = 0; cb < num_cb; ++cb) {
+        const auto id = cb_descs[cb].first;
+        same &= id == rs_memo.target_id[cb];
+        if (id) {
+            expect.color_attachments[cb].image_layout =
+                texture_cache.GetImage(id).backing->state.layout;
+        }
+    }
+    constexpr u32 depth_slot = AmdGpu::NUM_COLOR_BUFFERS;
+    const auto db_id = db_desc.first;
+    same &= db_id == rs_memo.target_id[depth_slot];
+    if (db_id) {
+        expect.depth_stencil_attachment.image_layout =
+            texture_cache.GetImage(db_id).backing->state.layout;
+    }
+    // RenderState has no padding (static_assert in vk_scheduler.h), so memcmp compares values.
+    same &= std::memcmp(&expect, &full, sizeof(RenderState)) == 0;
+    // A transition a cross replay would skip must be one the full path did not change.
+    if (hit == RsMemoHit::Cross) {
+        const auto unchanged = [&](u32 slot, VideoCore::ImageId id) {
+            const auto& pred = rs_verify_pred[slot];
+            if (!id || !pred.noop) {
+                return true;
+            }
+            const auto& state = texture_cache.GetImage(id).backing->state;
+            return state.layout == pred.layout && state.access_mask == pred.access;
+        };
+        for (u32 cb = 0; cb < num_cb; ++cb) {
+            same &= unchanged(cb, cb_descs[cb].first);
+        }
+        same &= unchanged(depth_slot, db_desc.first);
+    }
+    if (!same) {
+        SotcStats::rs_memo_verify_mismatches.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+bool Rasterizer::RsMemoBegin(RenderState& state) {
+    const RsMemoHit hit = RsMemoBeginCheck();
+    if (hit == RsMemoHit::Miss) {
+        return false;
+    }
+    const bool cross = hit == RsMemoHit::Cross;
+    const u32 num_cb = rs_memo.state.num_color_attachments;
 
     state = rs_memo.state;
     for (u32 cb = 0; cb < num_cb; ++cb) {
@@ -481,11 +614,15 @@ bool Rasterizer::RsMemoBegin(RenderState& state) {
         }
         auto* image = &texture_cache.GetImage(image_id);
         texture_cache.ReuseTarget(image_id, false);
-        needs_barrier |= runtime.Transit(image, vk::ImageLayout::eColorAttachmentOptimal,
-                                         vk::PipelineStageFlagBits2::eColorAttachmentOutput,
-                                         vk::AccessFlagBits2::eColorAttachmentWrite |
-                                             vk::AccessFlagBits2::eColorAttachmentRead,
-                                         desc.view_info.range);
+        // sotc: a replay of an earlier submit runs the transition unless it is a provable no-op.
+        const auto access = vk::AccessFlagBits2::eColorAttachmentWrite |
+                            vk::AccessFlagBits2::eColorAttachmentRead;
+        if (!cross || !RsMemoTransitIsNoop(*image, vk::ImageLayout::eColorAttachmentOptimal, access,
+                                           desc.view_info.range)) {
+            needs_barrier |= runtime.Transit(image, vk::ImageLayout::eColorAttachmentOptimal,
+                                             vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                                             access, desc.view_info.range);
+        }
         state.color_attachments[cb].image_layout = image->backing->state.layout;
         if (cb == 0 && image->usage.vo_surface) { // sotc: TakeHudless
             hudless_vo = image->info.guest_address;
@@ -505,12 +642,24 @@ bool Rasterizer::RsMemoBegin(RenderState& state) {
     if (const auto image_id = db_desc.first) {
         auto& image = texture_cache.GetImage(image_id);
         texture_cache.ReuseTarget(image_id, true);
-        needs_barrier |= runtime.Transit(&image, rs_memo.depth_layout, rs_memo.depth_stages,
-                                         rs_memo.depth_access, db_desc.second.view_info.range);
+        if (!cross || !RsMemoTransitIsNoop(image, rs_memo.depth_layout, rs_memo.depth_access,
+                                           db_desc.second.view_info.range)) {
+            needs_barrier |= runtime.Transit(&image, rs_memo.depth_layout, rs_memo.depth_stages,
+                                             rs_memo.depth_access, db_desc.second.view_info.range);
+        }
         state.depth_stencil_attachment.image_layout = image.backing->state.layout;
     }
     if (SotcStats::kFpsLog) {
         SotcStats::rs_memo_hits.fetch_add(1, std::memory_order_relaxed);
+        if (cross) {
+            SotcStats::rs_memo_cross_hits.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (cross) {
+        // sotc: the memo belongs to this submit now: its tick, and its state with the layouts the
+        // replay set, so the pass the caller opens compares equal to it (same-tick checks).
+        rs_memo.tick = scheduler.CurrentTick();
+        rs_memo.state = state;
     }
     return true;
 }
@@ -1690,6 +1839,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
                       bool use_resolved, const PreparedDraw* prepared) {
     RENDERER_TRACE;
     MdiBreak(); // sotc: SOTC_MDI_STATS
+    const SotcOpPhases::OpScope op_scope{SotcOpPhases::OpDraw}; // sotc: SOTC_OP_PHASES
 
     scheduler.PopPendingOperations();
     TracePass(liverpool->DrawRegs());
@@ -1706,6 +1856,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
         use_resolved ? static_cast<const GraphicsPipeline*>(resolved)
                      : [&] { // sotc: SOTC_TRACE
                            const SotcTrace::ScopeMin trace_step{"get pipeline"};
+                           const SotcOpPhases::Scope ph{SotcOpPhases::PhPipeline}; // sotc: SOTC_OP_PHASES
                            return pipeline_cache.GetGraphicsPipeline();
                        }();
     SotcStats::current_program.store(1, std::memory_order_relaxed);
@@ -1754,22 +1905,31 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
     // releases); what was recorded before lands in the old one. Re-record vertex state then.
     u64 vertex_tick = scheduler.CurrentTick();
     {
-        const SotcTrace::BindScope trace_step{"vertex buffers"}; // sotc: SOTC_TRACE
-        BindVertexBuffers(pipeline);
+        const SotcOpPhases::Scope ph{SotcOpPhases::PhVertexIndex}; // sotc: SOTC_OP_PHASES
+        {
+            const SotcTrace::BindScope trace_step{"vertex buffers"}; // sotc: SOTC_TRACE
+            BindVertexBuffers(pipeline);
+        }
+        if (is_indexed) {
+            BindIndexBuffer(index_offset);
+        }
+        RebindVertexIfSubmitted(pipeline, vertex_tick, is_indexed, [&] { BindIndexBuffer(index_offset); });
     }
-    if (is_indexed) {
-        BindIndexBuffer(index_offset);
-    }
-    RebindVertexIfSubmitted(pipeline, vertex_tick, is_indexed, [&] { BindIndexBuffer(index_offset); });
 
     if (needs_barrier) {
         runtime.FlushBarriers();
     }
 
-    if (!fast_bind_hit || fast_bind.tick != scheduler.CurrentTick()) {
-        pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots);
+    {
+        const SotcOpPhases::Scope ph{SotcOpPhases::PhDescriptorPush}; // sotc: SOTC_OP_PHASES
+        if (!fast_bind_hit || fast_bind.tick != scheduler.CurrentTick()) {
+            pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots);
+        }
     }
-    UpdateDynamicState(pipeline, is_indexed, prepared);
+    {
+        const SotcOpPhases::Scope ph{SotcOpPhases::PhDynamicState}; // sotc: SOTC_OP_PHASES
+        UpdateDynamicState(pipeline, is_indexed, prepared);
+    }
     scheduler.BeginRendering(state);
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
@@ -1814,8 +1974,11 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
     }
     DebugState.IncDrawCall();
 
-    ResetBindings(false);
-    FlushPeriodic();
+    {
+        const SotcOpPhases::Scope ph{SotcOpPhases::PhReset}; // sotc: SOTC_OP_PHASES
+        ResetBindings(false);
+        FlushPeriodic();
+    }
 }
 
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
@@ -1823,6 +1986,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u16 instance_sgpr_offset, const Pipeline* resolved,
                               bool use_resolved, const PreparedDraw* prepared) {
     RENDERER_TRACE;
+    const SotcOpPhases::OpScope op_scope{SotcOpPhases::OpDrawIndirect}; // sotc: SOTC_OP_PHASES
 
     scheduler.PopPendingOperations();
     TracePass(liverpool->DrawRegs());
@@ -1856,6 +2020,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         use_resolved ? static_cast<const GraphicsPipeline*>(resolved)
                      : [&] { // sotc: SOTC_TRACE
                            const SotcTrace::ScopeMin trace_step{"get pipeline"};
+                           const SotcOpPhases::Scope ph{SotcOpPhases::PhPipeline}; // sotc: SOTC_OP_PHASES
                            return pipeline_cache.GetGraphicsPipeline(params);
                        }();
     if (!pipeline) {
@@ -1898,13 +2063,16 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     u64 vertex_tick = scheduler.CurrentTick(); // sotc: see the direct draw
     {
-        const SotcTrace::BindScope trace_step{"vertex buffers"}; // sotc: SOTC_TRACE
-        BindVertexBuffers(pipeline);
+        const SotcOpPhases::Scope ph{SotcOpPhases::PhVertexIndex}; // sotc: SOTC_OP_PHASES
+        {
+            const SotcTrace::BindScope trace_step{"vertex buffers"}; // sotc: SOTC_TRACE
+            BindVertexBuffers(pipeline);
+        }
+        if (is_indexed) {
+            BindIndexBuffer();
+        }
+        RebindVertexIfSubmitted(pipeline, vertex_tick, is_indexed, [&] { BindIndexBuffer(); });
     }
-    if (is_indexed) {
-        BindIndexBuffer();
-    }
-    RebindVertexIfSubmitted(pipeline, vertex_tick, is_indexed, [&] { BindIndexBuffer(); });
 
     // sotc: SotC writes the arguments of most indirect draws with WRITE_DATA right before them
     // (thousands per frame). With the arguments CPU-side, read them here and draw directly: no
@@ -1928,10 +2096,16 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         if (needs_barrier) {
             runtime.FlushBarriers();
         }
-        if (!fast_bind_hit || fast_bind.tick != scheduler.CurrentTick()) {
-            pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots);
+        {
+            const SotcOpPhases::Scope ph{SotcOpPhases::PhDescriptorPush}; // sotc: SOTC_OP_PHASES
+            if (!fast_bind_hit || fast_bind.tick != scheduler.CurrentTick()) {
+                pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots);
+            }
         }
-        UpdateDynamicState(pipeline, is_indexed, prepared);
+        {
+            const SotcOpPhases::Scope ph{SotcOpPhases::PhDynamicState}; // sotc: SOTC_OP_PHASES
+            UpdateDynamicState(pipeline, is_indexed, prepared);
+        }
         scheduler.BeginRendering(state);
         const auto cmdbuf = scheduler.CommandBuffer();
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
@@ -1944,8 +2118,11 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             cmdbuf.draw(a.vertexCount, a.instanceCount, a.firstVertex, a.firstInstance);
         }
         DebugState.IncDrawCall();
-        ResetBindings(false);
-        FlushPeriodic();
+        {
+            const SotcOpPhases::Scope ph{SotcOpPhases::PhReset}; // sotc: SOTC_OP_PHASES
+            ResetBindings(false);
+            FlushPeriodic();
+        }
         return;
     }
 
@@ -1987,10 +2164,16 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         runtime.FlushBarriers();
     }
 
-    if (!fast_bind_hit || fast_bind.tick != scheduler.CurrentTick()) {
-        pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots);
+    {
+        const SotcOpPhases::Scope ph{SotcOpPhases::PhDescriptorPush}; // sotc: SOTC_OP_PHASES
+        if (!fast_bind_hit || fast_bind.tick != scheduler.CurrentTick()) {
+            pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots);
+        }
     }
-    UpdateDynamicState(pipeline, is_indexed, prepared);
+    {
+        const SotcOpPhases::Scope ph{SotcOpPhases::PhDynamicState}; // sotc: SOTC_OP_PHASES
+        UpdateDynamicState(pipeline, is_indexed, prepared);
+    }
     scheduler.BeginRendering(state);
 
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -2029,8 +2212,11 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                              vk::AccessFlagBits2::eIndirectCommandRead);
     }
 
-    ResetBindings(false);
-    FlushPeriodic();
+    {
+        const SotcOpPhases::Scope ph{SotcOpPhases::PhReset}; // sotc: SOTC_OP_PHASES
+        ResetBindings(false);
+        FlushPeriodic();
+    }
 }
 
 // sotc: the two grass compute shaders (grass blades; taller weeds). Their flatbufs hold the blade
@@ -2104,12 +2290,16 @@ struct DirectDispatchGuard {
 void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
     RENDERER_TRACE;
     MdiBreak(); // sotc: SOTC_MDI_STATS
+    const SotcOpPhases::OpScope op_scope{SotcOpPhases::OpDispatch}; // sotc: SOTC_OP_PHASES
 
     scheduler.PopPendingOperations();
 
     const auto& cs_program = liverpool->DrawCsRegs();
     const ComputePipeline* pipeline = use_resolved ? static_cast<const ComputePipeline*>(resolved)
-                                                   : pipeline_cache.GetComputePipeline();
+                                                   : [&] { // sotc: SOTC_OP_PHASES
+                                                         const SotcOpPhases::Scope ph{SotcOpPhases::PhPipeline};
+                                                         return pipeline_cache.GetComputePipeline();
+                                                     }();
     if (!pipeline) {
         SotcStats::Drop(2, cs_program.Address<uintptr_t>(), 0);
         return;
@@ -2192,7 +2382,12 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
             counts.clear();
         }
     }
-    if (ExecuteShaderHLE(cs, liverpool->DrawRegs(), cs_program, *this)) {
+    bool hle_done;
+    {
+        const SotcOpPhases::Scope ph{SotcOpPhases::PhHle}; // sotc: SOTC_OP_PHASES
+        hle_done = ExecuteShaderHLE(cs, liverpool->DrawRegs(), cs_program, *this);
+    }
+    if (hle_done) {
         SotcStats::Drop(5, cs_program.Address<uintptr_t>(), 0);
         return;
     }
@@ -2248,7 +2443,10 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
     }
 
     scheduler.EndRendering();
-    pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots);
+    {
+        const SotcOpPhases::Scope ph{SotcOpPhases::PhDescriptorPush}; // sotc: SOTC_OP_PHASES
+        pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots);
+    }
 
     const auto cmdbuf = scheduler.CommandBuffer();
     pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
@@ -2256,13 +2454,17 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
     DebugState.IncDispatch();
     MaybeDumpImages(cs.pgm_hash);
 
-    ResetBindings(true);
-    FlushPeriodic();
+    {
+        const SotcOpPhases::Scope ph{SotcOpPhases::PhReset}; // sotc: SOTC_OP_PHASES
+        ResetBindings(true);
+        FlushPeriodic();
+    }
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pipeline* resolved,
                                   bool use_resolved) {
     RENDERER_TRACE;
+    const SotcOpPhases::OpScope op_scope{SotcOpPhases::OpDispatchIndirect}; // sotc: SOTC_OP_PHASES
     MdiBreak(); // sotc: SOTC_MDI_STATS
     if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer (sotc_stats.h)
         SotcStats::cmd_kinds[5].fetch_add(1, std::memory_order_relaxed);
@@ -2272,7 +2474,10 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
 
     const auto& cs_program = liverpool->DrawCsRegs();
     const ComputePipeline* pipeline = use_resolved ? static_cast<const ComputePipeline*>(resolved)
-                                                   : pipeline_cache.GetComputePipeline();
+                                                   : [&] { // sotc: SOTC_OP_PHASES
+                                                         const SotcOpPhases::Scope ph{SotcOpPhases::PhPipeline};
+                                                         return pipeline_cache.GetComputePipeline();
+                                                     }();
     if (!pipeline) {
         SotcStats::Drop(2, cs_program.Address<uintptr_t>(), 0);
         return;
@@ -2319,7 +2524,10 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
     }
 
     scheduler.EndRendering();
-    pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots);
+    {
+        const SotcOpPhases::Scope ph{SotcOpPhases::PhDescriptorPush}; // sotc: SOTC_OP_PHASES
+        pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots);
+    }
 
     const auto cmdbuf = scheduler.CommandBuffer();
     pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
@@ -2329,8 +2537,11 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
                          vk::AccessFlagBits2::eIndirectCommandRead);
     MaybeDumpImages(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash);
 
-    ResetBindings(true);
-    FlushPeriodic();
+    {
+        const SotcOpPhases::Scope ph{SotcOpPhases::PhReset}; // sotc: SOTC_OP_PHASES
+        ResetBindings(true);
+        FlushPeriodic();
+    }
 }
 
 u64 Rasterizer::Flush() {
@@ -2724,6 +2935,9 @@ void BindDiffNote(u32 mask, bool hit) {
 } // namespace
 
 bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* prepared) {
+    // sotc: SOTC_SYNC_PIPE counters: this call is one op (its Protect calls are counted).
+    const SotcStats::SyncPipe::OpScope sync_pipe_op;
+    const SotcOpPhases::Scope ph{SotcOpPhases::PhBindResources}; // sotc: SOTC_OP_PHASES
     // sotc: writes recorded during this bind follow its command into the tick it lands in.
     buffer_cache.BeginWriteScope();
     struct WriteScopeGuard {
@@ -3007,6 +3221,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
         }
         {
             const SotcTrace::ScopeMin trace_step{"bind textures", stage->images.size()}; // sotc
+            const SotcOpPhases::Scope ph{SotcOpPhases::PhBindTextures}; // sotc: SOTC_OP_PHASES
             const SotcStats::SplitTimer textures_split{SotcStats::SplitBindTextures};
             BindTextures(*stage, binding, set, pr_stage ? resolved : nullptr, pr_stage);
         }
@@ -5037,6 +5252,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 UNREACHABLE_MSG("Unexpected buffer type {}", u32(desc.buffer_type));
             }
         } else {
+            // sotc: SOTC_OP_PHASES: a binding is clean, dirty (its upload bytes moved) or written.
+            const u64 ph_t0 = SotcOpPhases::NowBinding(), ph_upload0 = SotcOpPhases::UploadBytes();
             // sotc: SOTC_PR_RESOLVE: the values the prep thread computed for this descriptor;
             // otherwise the V# is read here.
             const u32 buf_index = static_cast<u32>(&desc - stage.buffers.data());
@@ -5271,6 +5488,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     }
                 }
                 needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
+                SotcOpPhases::ChargeBinding(desc.is_written, ph_upload0, ph_t0); // sotc: SOTC_OP_PHASES
             }
         }
 
@@ -5347,10 +5565,460 @@ void Rasterizer::PrefetchImagesImpl(const Pipeline* pipeline) {
     }
 }
 
+namespace {
+// sotc: SOTC_TEX_BLOCK counters, one line on stderr per 5 s (TexBlockReport).
+std::atomic<u64> tex_block_lookups{}, tex_block_hits{}, tex_block_stores{};
+std::atomic<u64> tex_block_mismatches{};
+std::atomic<s64> tex_block_report_due{};
+
+void TexBlockReport() {
+    const s64 now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    s64 due = tex_block_report_due.load(std::memory_order_relaxed);
+    if (now < due || !tex_block_report_due.compare_exchange_strong(due, now + 5'000'000'000LL)) {
+        return;
+    }
+    std::fprintf(stderr,
+                 "SOTC TEX BLOCK: lookups %llu, hits %llu, stores %llu, verify mismatches %llu\n",
+                 static_cast<unsigned long long>(tex_block_lookups.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(tex_block_hits.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(tex_block_stores.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(
+                     tex_block_mismatches.load(std::memory_order_relaxed)));
+}
+} // namespace
+
+int Rasterizer::TexBlockMode() {
+    // sotc: SOTC_TEX_BLOCK, read once. 1: a stage's texture block is replayed from the memo when
+    // it can be; 2: also runs the full bind on a would-be hit and compares the two (verify).
+    static const int mode = [] {
+        const char* v = std::getenv("SOTC_TEX_BLOCK");
+        return v && v[0] == '1' ? 1 : v && v[0] == '2' ? 2 : 0;
+    }();
+    return mode;
+}
+
+bool Rasterizer::MakeTextureBlockKey(const Shader::Info& stage, u32 set,
+                                     const PreparedResources* pr, const PrStage* pr_stage,
+                                     TexBlockKey& key) {
+    // Not keyed: the binds the memo does not answer (storage and fmask stages, descriptor arrays,
+    // samplers the full bind rewrites), the composite paths that act on a fragment stage's two
+    // images (TakeHudless, DLSS, SOTC_DLSS_PROBE: their side effects are not replayed), and stages
+    // without images or samplers. sotc: while the bind cache records, the memo still answers and
+    // replays the cache records (see TryTextureBlock), except with SOTC_BIND_CACHE_FRAME (its
+    // lookups are not replayed) or a composite probe (its log is not).
+    static const bool composite_probe = [] {
+        const char* h = std::getenv("SOTC_FG_HUDLESS");
+        return (h && h[0] == '1') || std::getenv("SOTC_DLSS_PROBE") != nullptr;
+    }();
+    if ((bind_cache_recording && (SotcStats::kBindCacheFrame || composite_probe)) ||
+        stage.images.size() > MaxBlockImages || stage.samplers.size() > MaxBlockSamplers ||
+        (stage.images.empty() && stage.samplers.empty()) || !stage.fmasks.empty()) {
+        return false;
+    }
+    if (stage.sw_stage == Shader::SwStage::Fragment && stage.images.size() <= 2 &&
+        (composite_probe || Dlssg::SuperResolution())) {
+        return false;
+    }
+    auto& k = key.key;
+    u32 n = 0;
+    k[n++] = u64{stage.images.size()} | u64{stage.samplers.size()} << 8 | u64{set} << 16 |
+             u64(static_cast<u32>(stage.sw_stage)) << 24;
+    k[n++] = stage.pgm_hash;
+    const VAddr bc_base = liverpool->DrawRegs().ta_bc_base.Address();
+    k[n++] = bc_base;
+    for (u32 index = 0; index < stage.images.size(); ++index) {
+        const auto& image_desc = stage.images[index];
+        if (image_desc.is_written || image_desc.array_size != 0) {
+            return false;
+        }
+        // The T# the full bind reads: the prepared one when its entry is resolved.
+        const PrImage* pi = pr && pr_stage ? &pr->images[pr_stage->img_first + index] : nullptr;
+        if (pi && pi->verdict == 0) {
+            pi = nullptr;
+        }
+        const AmdGpu::Image tsharp = pi ? pi->tsharp : image_desc.GetSharp(stage);
+        k[n++] = u64{image_desc.is_depth} | u64{image_desc.is_atomic} << 1 |
+                 u64{image_desc.is_array} << 2 | u64{image_desc.is_r128} << 3 |
+                 u64{image_desc.constant_mip_index} << 8 |
+                 u64(image_desc.mip_fallback_mode) << 16 | u64(image_desc.post_op) << 24;
+        static_assert(sizeof(tsharp) == 4 * sizeof(u64));
+        std::memcpy(&k[n], &tsharp, sizeof(tsharp));
+        n += 4;
+    }
+    for (const auto& sampler : stage.samplers) {
+        const AmdGpu::Sampler ssharp = sampler.GetSharp(stage);
+        if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
+                                bc_base == 0)) {
+            return false; // the full bind logs and rewrites these
+        }
+        k[n++] = u64{sampler.is_depth};
+        static_assert(sizeof(ssharp) == 2 * sizeof(u64));
+        std::memcpy(&k[n], &ssharp, sizeof(ssharp));
+        n += 2;
+    }
+    u64 hash = 0x9E3779B97F4A7C15ULL;
+    for (u32 i = 0; i < n; ++i) {
+        hash = (hash ^ k[i]) * 0xC2B2AE3D27D4EB4FULL;
+        hash ^= hash >> 29;
+    }
+    key.words = n;
+    key.hash = hash;
+    key.slot = static_cast<u32>((hash ^ (hash >> 32)) % NumTexBlockMemos);
+    return true;
+}
+
+bool Rasterizer::TexBlockMatches(const TexBlockMemo& memo, const TexBlockKey& key) {
+    return memo.valid && memo.key_words == key.words &&
+           std::memcmp(memo.key.data(), key.key.data(), key.words * sizeof(u64)) == 0;
+}
+
+bool Rasterizer::TryTextureBlock(const Shader::Info& stage, const TexBlockKey& key, u32 set,
+                                 Shader::Backend::Bindings& binding, bool mark_lods) {
+    const TexBlockMemo& memo = (*tex_block_memos)[key.slot];
+    if (!TexBlockMatches(memo, key)) {
+        return false;
+    }
+    // A block that may hold a mip tail depends on the whole image set (DecideRebase looks at the
+    // images overlapping the tail) and on the GPU-written tails: those two must not have moved.
+    if (memo.candidate &&
+        (texture_cache.BindGeneration() != memo.bind_generation ||
+         VideoCore::gpu_modified_epoch.load(std::memory_order_relaxed) != memo.gpu_epoch)) {
+        return false;
+    }
+    // The bound image is the one stored, and its backing is in the state the bind left it in
+    // (state_version), with nothing that makes the bind go another way (needs_rebind, a render
+    // target or a feedback loop).
+    const auto bound_current = [&](const TexBlockEntry& e) {
+        const VideoCore::Image* image = texture_cache.TryGetImage(e.bound, e.bound_uid);
+        return image && image->backing == e.backing &&
+               image->backing->state_version == e.version && !image->binding.needs_rebind &&
+               (image->info.props.is_depth ||
+                (!image->binding.force_general && !image->binding.is_target));
+    };
+    // Checks only, nothing changed yet: the lookup's generation and image, the bound image.
+    for (u32 i = 0; i < memo.num_entries; ++i) {
+        const TexBlockEntry& e = memo.entries[i];
+        if (!e.null && (texture_cache.ImageAddrGeneration(e.addr) != e.addr_gen ||
+                        !texture_cache.TryGetImage(e.found, e.found_uid) || !bound_current(e))) {
+            return false;
+        }
+    }
+
+    // From here the bind's side effects are made in the order of the full bind: the lookups'
+    // stamps, the depth links and bound flags, then per image UpdateImage (FindTexture) and the
+    // transition. A miss after any of them gives the stamps back: the full bind makes them again.
+    const u64 tick = scheduler.CurrentTick();
+    std::array<std::pair<u64, u64>, MaxBlockEntries> stamps{}; // (tick_prev, tick_accessed) before
+    const auto restore_stamps = [&] {
+        for (u32 i = memo.num_entries; i-- > 0;) {
+            const TexBlockEntry& e = memo.entries[i];
+            if (!e.null) {
+                VideoCore::Image& found = texture_cache.GetImage(e.found);
+                found.tick_prev_accessed = stamps[i].first;
+                found.tick_accessed_last = stamps[i].second;
+            }
+        }
+    };
+    for (u32 i = 0; i < memo.num_entries; ++i) {
+        const TexBlockEntry& e = memo.entries[i];
+        if (e.null) {
+            continue;
+        }
+        VideoCore::Image& found = texture_cache.GetImage(e.found);
+        stamps[i] = {found.tick_prev_accessed, found.tick_accessed_last};
+        found.tick_prev_accessed = found.tick_accessed_last;
+        found.tick_accessed_last = tick;
+    }
+    for (u32 i = 0; i < memo.num_entries; ++i) {
+        const TexBlockEntry& e = memo.entries[i];
+        if (e.null) {
+            continue;
+        }
+        const VideoCore::ImageId depth =
+            texture_cache.GetAssociatedDepth(texture_cache.GetImage(e.found));
+        if (depth != (e.redirect ? e.bound : VideoCore::ImageId{})) {
+            restore_stamps();
+            return false;
+        }
+        texture_cache.GetImage(e.bound).binding.is_bound = 1u;
+    }
+
+    std::array<vk::DescriptorImageInfo, MaxBlockEntries> infos{};
+    std::array<VideoCore::ImageId, MaxBlockEntries> ids{};
+    for (u32 i = 0; i < memo.num_entries; ++i) {
+        const TexBlockEntry& e = memo.entries[i];
+        if (e.null) {
+            infos[i] = vk::DescriptorImageInfo(VK_NULL_HANDLE, VK_NULL_HANDLE,
+                                               vk::ImageLayout::eGeneral);
+            continue;
+        }
+        // FindTexture's UpdateImage (uploads what the guest wrote), then the second pass's checks
+        // on what that changed.
+        if (!bound_current(e)) {
+            restore_stamps();
+            return false;
+        }
+        texture_cache.UpdateImage(e.bound);
+        if (!bound_current(e)) {
+            restore_stamps();
+            return false;
+        }
+        VideoCore::Image& image = texture_cache.GetImage(e.bound);
+        // As the second pass: no depth-stencil image (TryTextureBlock stores none), so the layout
+        // is the sampled one of its kind.
+        const auto new_layout = image.info.props.is_depth
+                                    ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+                                    : vk::ImageLayout::eShaderReadOnlyOptimal;
+        needs_barrier |= runtime.Transit(&image, new_layout,
+                                         vk::PipelineStageFlagBits2::eAllCommands,
+                                         vk::AccessFlagBits2::eShaderRead, e.range);
+        image.usage.texture = 1u;
+        infos[i] = vk::DescriptorImageInfo(VK_NULL_HANDLE, e.view, image.backing->state.layout);
+        ids[i] = e.bound;
+    }
+
+    // sotc: SOTC_BIND_CACHE: the records the full bind makes, in its order (LOD banks in its first
+    // pass, sampled images in its second). Nothing below can return false.
+    if (bind_cache_recording) {
+        for (u32 i = 0; i < memo.num_lods; ++i) {
+            bind_cache_lod_rec.push_back(memo.lod_banks[i]);
+        }
+        for (u32 i = 0; i < memo.num_entries; ++i) {
+            const TexBlockEntry& e = memo.entries[i];
+            if (e.null) {
+                continue;
+            }
+            // The sampled layout, as the infos loop above.
+            const auto new_layout = texture_cache.GetImage(e.bound).info.props.is_depth
+                                        ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+                                        : vk::ImageLayout::eShaderReadOnlyOptimal;
+            BindCacheNoteImage(e.bound, new_layout, vk::PipelineStageFlagBits2::eAllCommands,
+                               vk::AccessFlagBits2::eShaderRead, e.range);
+        }
+    }
+    // The bindings, as BindTexturesFull makes them: the bound images (each descriptor's infos
+    // and one write), then the LOD marks and the samplers.
+    for (u32 i = 0; mark_lods && i < memo.num_lods; ++i) {
+        SotcLod::Mark(memo.lod_banks[i]);
+    }
+    u32 entry = 0;
+    for (u32 d = 0; d < memo.num_descs; ++d) {
+        const u32 count = memo.desc_counts[d];
+        const u32 info_index = image_infos.size();
+        for (u32 j = 0; j < count; ++j, ++entry) {
+            image_infos.push_back(infos[entry]);
+            image_info_images[image_infos.size() - 1] = ids[entry];
+            if (ids[entry]) {
+                bound_images.emplace_back(ids[entry]);
+            }
+        }
+        set_write_sets[set_write_index] = set;
+        auto& set_write = set_writes[set_write_index++];
+        set_write.dstSet = VK_NULL_HANDLE;
+        set_write.dstBinding = binding.unified;
+        set_write.dstArrayElement = 0;
+        set_write.descriptorCount = count;
+        set_write.descriptorType = vk::DescriptorType::eSampledImage;
+        set_write.pImageInfo = &image_infos[info_index];
+        binding.unified += count;
+    }
+    const VideoCore::ImageId first = memo.num_entries == 1 ? ids[0] : VideoCore::ImageId{};
+    const VideoCore::Image* ui_asset = UiLinearAsset(stage, memo.num_entries, first);
+    // sotc: SOTC_BIND_CACHE: as BindTexturesFull. The composite probes are refused while recording
+    // (MakeTextureBlockKey), so only the UI filter and hudless_ui_info can set it here.
+    if (bind_cache_recording && (ui_asset || hudless_ui_info >= 0)) {
+        bind_cache_uncacheable = true;
+    }
+    BindSamplers(stage, binding, set, ui_asset);
+    return true;
+}
+
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                               u32 set, const PreparedResources* pr, const PrStage* pr_stage) {
     const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the pass
+    const int mode = TexBlockMode();
+    TexBlockKey key;
+    if (mode == 0 || !MakeTextureBlockKey(stage, set, pr, pr_stage, key)) {
+        BindTexturesFull(stage, binding, set, pr, pr_stage, nullptr, nullptr);
+        return;
+    }
+    TexBlockMemo& slot = (*tex_block_memos)[key.slot];
+    tex_block_lookups.fetch_add(1, std::memory_order_relaxed);
+    TexBlockReport();
+    if (mode == 1) {
+        if (TryTextureBlock(stage, key, set, binding)) {
+            tex_block_hits.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        BindTexturesFull(stage, binding, set, pr, pr_stage, &key, &slot);
+        return;
+    }
+
+    // SOTC_TEX_BLOCK=2 (verify): a would-be hit is replayed, its outputs and the lookups' stamps
+    // are taken back, the full bind is made and the two are compared. The full bind's result is
+    // the one kept. The replay's UpdateImage and transitions run twice: both are idempotent here.
+    // sotc: while SOTC_BIND_CACHE records, the replay's cache records and uncacheable flag are
+    // compared with the full bind's the same way.
+    const u32 info_base = image_infos.size();
+    const u32 write_base = set_write_index;
+    const u32 bound_base = bound_images.size();
+    const Shader::Backend::Bindings binding_base = binding;
+    struct Stamp {
+        VideoCore::ImageId id;
+        u64 prev;
+        u64 accessed;
+    };
+    std::array<Stamp, MaxBlockEntries> stamps{};
+    u32 num_stamps = 0;
+    if (TexBlockMatches(slot, key)) {
+        for (u32 i = 0; i < slot.num_entries; ++i) {
+            const TexBlockEntry& e = slot.entries[i];
+            const VideoCore::Image* found =
+                e.null ? nullptr : texture_cache.TryGetImage(e.found, e.found_uid);
+            if (found) {
+                stamps[num_stamps++] = {e.found, found->tick_prev_accessed,
+                                        found->tick_accessed_last};
+            }
+        }
+    }
+    // sotc: SOTC_BIND_CACHE records of the replay: copied for the comparison below, then taken
+    // back with its outputs. The full bind makes its own.
+    const size_t lod0 = bind_cache_lod_rec.size();
+    const size_t img0 = bind_cache_images_rec.size();
+    const size_t smp0 = bind_cache_samplers_rec.size();
+    const bool unc0 = bind_cache_uncacheable;
+    // sotc: each side starts from a clear flag, so what this stage's replay and full bind set is
+    // compared even when an earlier stage already set it (unc0 is put back after both).
+    bind_cache_uncacheable = false;
+    // sotc: no LOD marks from the replay: the full bind below makes them once, as in mode 0.
+    const bool replayed = TryTextureBlock(stage, key, set, binding, false);
+    const std::vector<u32> r_lods(bind_cache_lod_rec.begin() + lod0, bind_cache_lod_rec.end());
+    const std::vector<BindCacheImage> r_recs(bind_cache_images_rec.begin() + img0,
+                                             bind_cache_images_rec.end());
+    const std::vector<BindCacheSampler> r_samplers(bind_cache_samplers_rec.begin() + smp0,
+                                                   bind_cache_samplers_rec.end());
+    const bool r_uncacheable = bind_cache_uncacheable;
+    bind_cache_lod_rec.erase(bind_cache_lod_rec.begin() + lod0, bind_cache_lod_rec.end());
+    bind_cache_images_rec.erase(bind_cache_images_rec.begin() + img0, bind_cache_images_rec.end());
+    bind_cache_samplers_rec.erase(bind_cache_samplers_rec.begin() + smp0,
+                                  bind_cache_samplers_rec.end());
+    bind_cache_uncacheable = unc0;
+    if (!replayed) {
+        BindTexturesFull(stage, binding, set, pr, pr_stage, &key, &slot);
+        return;
+    }
+    tex_block_hits.fetch_add(1, std::memory_order_relaxed);
+    const std::vector<vk::DescriptorImageInfo> r_infos(image_infos.begin() + info_base,
+                                                       image_infos.end());
+    const std::vector<VideoCore::ImageId> r_ids(image_info_images.begin() + info_base,
+                                                image_info_images.begin() + image_infos.size());
+    const std::vector<VideoCore::ImageId> r_bound(bound_images.begin() + bound_base,
+                                                  bound_images.end());
+    using WriteKey = std::array<s64, 4>; // dstBinding, count, type, index into image_infos
+    const auto write_key = [&](const vk::WriteDescriptorSet& w) {
+        return WriteKey{s64(w.dstBinding), s64(w.descriptorCount),
+                        s64(static_cast<u32>(w.descriptorType)),
+                        static_cast<s64>(static_cast<const vk::DescriptorImageInfo*>(w.pImageInfo) -
+                                         image_infos.data())};
+    };
+    std::vector<WriteKey> r_writes;
+    for (u32 i = write_base; i < set_write_index; ++i) {
+        r_writes.push_back(write_key(set_writes[i]));
+    }
+    const u32 r_unified = binding.unified;
+    // Take the replay's outputs back, and the stamps it made.
+    image_infos.resize(info_base);
+    set_write_index = write_base;
+    bound_images.resize(bound_base);
+    binding = binding_base;
+    for (u32 i = num_stamps; i-- > 0;) {
+        VideoCore::Image& found = texture_cache.GetImage(stamps[i].id);
+        found.tick_prev_accessed = stamps[i].prev;
+        found.tick_accessed_last = stamps[i].accessed;
+    }
+
+    bind_cache_uncacheable = false; // sotc: this stage's own flag (see unc0 above)
+    BindTexturesFull(stage, binding, set, pr, pr_stage, &key, &slot);
+    const bool f_uncacheable = bind_cache_uncacheable;
+    bind_cache_uncacheable = unc0 || f_uncacheable; // the full bind only ever sets it
+
+    bool same = binding.unified == r_unified && image_infos.size() - info_base == r_infos.size() &&
+                set_write_index - write_base == r_writes.size() &&
+                bound_images.size() - bound_base == r_bound.size();
+    for (u32 i = 0; same && i < r_infos.size(); ++i) {
+        const auto& a = r_infos[i];
+        const auto& b = image_infos[info_base + i];
+        same = a.sampler == b.sampler && a.imageView == b.imageView &&
+               a.imageLayout == b.imageLayout && r_ids[i] == image_info_images[info_base + i];
+    }
+    for (u32 i = 0; same && i < r_writes.size(); ++i) {
+        same = r_writes[i] == write_key(set_writes[write_base + i]);
+    }
+    for (u32 i = 0; same && i < r_bound.size(); ++i) {
+        same = r_bound[i] == bound_images[bound_base + i];
+    }
+    // sotc: SOTC_BIND_CACHE records of the full bind against the replay's. Neither adds any
+    // while not recording, so the counts match then.
+    bool rec_same = bind_cache_lod_rec.size() - lod0 == r_lods.size() &&
+                    bind_cache_images_rec.size() - img0 == r_recs.size() &&
+                    bind_cache_samplers_rec.size() - smp0 == r_samplers.size();
+    for (size_t i = 0; rec_same && i < r_samplers.size(); ++i) {
+        const BindCacheSampler& a = r_samplers[i];
+        const BindCacheSampler& b = bind_cache_samplers_rec[smp0 + i];
+        rec_same = std::memcmp(&a.sharp, &b.sharp, sizeof(a.sharp)) == 0 &&
+                   a.handle == b.handle && a.slot == b.slot && a.is_depth == b.is_depth &&
+                   a.bindless == b.bindless;
+    }
+    for (size_t i = 0; rec_same && i < r_lods.size(); ++i) {
+        rec_same = r_lods[i] == bind_cache_lod_rec[lod0 + i];
+    }
+    for (size_t i = 0; rec_same && i < r_recs.size(); ++i) {
+        const BindCacheImage& a = r_recs[i];
+        const BindCacheImage& b = bind_cache_images_rec[img0 + i];
+        rec_same = a.id == b.id && a.layout == b.layout && a.stages == b.stages &&
+                   a.access == b.access && a.range.base.level == b.range.base.level &&
+                   a.range.base.layer == b.range.base.layer &&
+                   a.range.extent.levels == b.range.extent.levels &&
+                   a.range.extent.layers == b.range.extent.layers && a.guest_lo == b.guest_lo &&
+                   a.guest_hi == b.guest_hi && a.uid == b.uid;
+    }
+    // Both start from a clear flag. The replay only sets it while recording, so compare then only.
+    if (bind_cache_recording) {
+        rec_same = rec_same && f_uncacheable == r_uncacheable;
+    }
+    same = same && rec_same;
+    if (!same) {
+        tex_block_mismatches.fetch_add(1, std::memory_order_relaxed);
+        std::fprintf(stderr,
+                     "SOTC TEX BLOCK mismatch: shader %#llx, infos %zu/%zu, writes %zu/%zu, "
+                     "images %zu/%zu, lods %zu/%zu, recs %zu/%zu\n",
+                     static_cast<unsigned long long>(stage.pgm_hash), r_infos.size(),
+                     static_cast<size_t>(image_infos.size() - info_base), r_writes.size(),
+                     static_cast<size_t>(set_write_index - write_base), r_bound.size(),
+                     static_cast<size_t>(bound_images.size() - bound_base), r_lods.size(),
+                     static_cast<size_t>(bind_cache_lod_rec.size() - lod0), r_recs.size(),
+                     static_cast<size_t>(bind_cache_images_rec.size() - img0));
+    }
+}
+
+void Rasterizer::BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bindings& binding,
+                                  u32 set, const PreparedResources* pr, const PrStage* pr_stage,
+                                  const TexBlockKey* tex_key, TexBlockMemo* rec) {
     image_bindings.clear();
+    // sotc: SOTC_TEX_BLOCK: what the memo records of this bind (rec, see TryTextureBlock).
+    // store_ok goes false on anything the replay does not repeat.
+    bool store_ok = true;
+    if (rec) {
+        rec->valid = false;
+        rec->key_words = tex_key->words;
+        std::copy_n(tex_key->key.begin(), tex_key->words, rec->key.begin());
+        rec->candidate = false;
+        rec->num_lods = 0;
+        rec->bind_generation = texture_cache.BindGeneration();
+        rec->gpu_epoch = VideoCore::gpu_modified_epoch.load(std::memory_order_relaxed);
+    }
     const u32 first_image_idx = image_infos.size();
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
@@ -5366,6 +6034,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         ++image_index;
         const auto tsharp = pi ? pi->tsharp : image_desc.GetSharp(stage);
         if (image_desc.array_size != 0) {
+            store_ok = false; // sotc: SOTC_TEX_BLOCK: descriptor arrays are not stored
             // dynamic_tsharp_array_size (from Pink-shadPS4): one binding per table element, then a
             // null one for out-of-range indices. The shader was typed after `tsharp`, the first
             // valid element, so elements of another view type or number class stay null.
@@ -5419,6 +6088,13 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             SotcLod::Mark(tsharp.counter_bank_id); // GET_LOD_STATS (sotc_lod_stats.h)
             if (bind_cache_recording) { // sotc: SOTC_BIND_CACHE repeats it on a hit
                 bind_cache_lod_rec.push_back(tsharp.counter_bank_id);
+            }
+            if (rec) { // sotc: SOTC_TEX_BLOCK repeats the mark on a hit
+                if (rec->num_lods < MaxBlockImages) {
+                    rec->lod_banks[rec->num_lods++] = tsharp.counter_bank_id;
+                } else {
+                    store_ok = false;
+                }
             }
         }
         // sotc: SOTC_TSHARP_TRACE=1: mip fields of the large streamed textures (first 120
@@ -5479,6 +6155,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                : (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid)) {
             image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
             image_descriptor_array_sizes.push_back(1);
+            if (rec && image_bindings.size() <= MaxBlockEntries) { // sotc: a null binding
+                rec->entries[image_bindings.size() - 1] = TexBlockEntry{.null = true};
+            }
             continue;
         }
 
@@ -5492,6 +6171,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         static_cast<u32>(num_fmt));
             // sotc: SOTC_BIND_CACHE_FRAME: a guest map can make the T# valid
             bind_cache_map_dep_rec |= bind_cache_recording;
+            store_ok = false; // sotc: SOTC_TEX_BLOCK: the memory map decided this one
             image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
             image_descriptor_array_sizes.push_back(1);
             continue;
@@ -5514,6 +6194,27 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
 
             image_id = texture_cache.FindImage(desc);
+            if (rec) { // sotc: SOTC_TEX_BLOCK: the lookup as TryTextureBlock replays it
+                const size_t index = image_bindings.size() - 1;
+                if (!texture_cache.IsPerfectFind(image_id, desc.info)) {
+                    store_ok = false; // an overlap resolution, not a perfect match
+                }
+                const VideoCore::Image& found = texture_cache.GetImage(image_id);
+                // A mip-tail decision (DecideRebase, MemoLookup) depends on the whole image set and
+                // on the GPU-written tails: such a block is checked against both (TryTextureBlock).
+                rec->candidate = rec->candidate || found.info.sotc_first_mip != 0 ||
+                                 (desc.rebase_mip != 0 && VideoCore::MipTailMode() != 0);
+                if (index < MaxBlockEntries) {
+                    rec->entries[index] = TexBlockEntry{};
+                    rec->entries[index].found = image_id;
+                    rec->entries[index].found_uid = found.image_uid;
+                    rec->entries[index].addr = found.info.guest_address;
+                    rec->entries[index].addr_gen =
+                        texture_cache.ImageAddrGeneration(found.info.guest_address);
+                } else {
+                    store_ok = false;
+                }
+            }
             if (bind_cache_recording && SotcStats::kBindCacheFrame) {
                 BindCacheNoteLookup(desc, image_id); // sotc: SOTC_BIND_CACHE_FRAME
             }
@@ -5536,7 +6237,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     }
 
     // Second pass to re-bind images that were updated after binding
-    for (auto& [image_id, desc] : image_bindings) {
+    for (size_t entry = 0; entry < image_bindings.size(); ++entry) {
+        auto& [image_id, desc] = image_bindings[entry];
         bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
         if (!image_id) {
             image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
@@ -5545,6 +6247,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             if (auto& old_image = texture_cache.GetImage(image_id);
                 old_image.binding.needs_rebind) {
                 old_image.binding = {};
+                store_ok = false; // sotc: SOTC_TEX_BLOCK: found again, not stored
                 image_id = texture_cache.FindImage(desc);
                 if (bind_cache_recording && SotcStats::kBindCacheFrame) {
                     BindCacheNoteLookup(desc, image_id); // sotc: SOTC_BIND_CACHE_FRAME
@@ -5565,6 +6268,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             // storage and feedback loop doesn't make sense for them
             if ((binding.force_general || binding.is_target) && !image.info.props.is_depth) {
                 bind_cache_uncacheable = true; // sotc: SOTC_BIND_CACHE: feedback loop / storage
+                store_ok = false;              // sotc: SOTC_TEX_BLOCK: a target binding
                 if (instance.IsAttachmentFeedbackLoopLayoutSupported() && image.binding.is_target) {
                     needs_barrier |= runtime.Transit(
                         &image, vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT,
@@ -5610,6 +6314,20 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         }
                     }
                 }
+            }
+            // sotc: SOTC_TEX_BLOCK: the bound image, its view and the backing state the bind left.
+            if (image.info.props.has_stencil) {
+                store_ok = false; // its transition depends on the draw's depth registers
+            }
+            if (rec && entry < MaxBlockEntries) {
+                TexBlockEntry& e = rec->entries[entry];
+                e.bound = image_id;
+                e.bound_uid = image.image_uid;
+                e.redirect = image_id != e.found;
+                e.range = desc.view_info.range;
+                e.view = *image_view.image_view;
+                e.backing = image.backing;
+                e.version = image.backing->state_version;
             }
             image.usage.storage |= is_storage;
             image.usage.texture |= !is_storage;
@@ -5710,6 +6428,51 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         binding.unified += array_size;
     }
 
+    const VideoCore::Image* ui_asset = UiLinearAsset(
+        stage, image_bindings.size(),
+        image_bindings.size() == 1 ? image_bindings[0].first : VideoCore::ImageId{});
+    // sotc: SOTC_BIND_CACHE: the composite (TakeHudless, DLSS), the probe and the bilinear UI
+    // filter depend on more than the cache key; those binds are not stored.
+    if (ui_asset || hudless_ui_info >= 0 || dlss_probe) {
+        bind_cache_uncacheable = true;
+    }
+    BindSamplers(stage, binding, set, ui_asset);
+
+    // sotc: SOTC_TEX_BLOCK: store the block when TryTextureBlock can answer it (TexBlockMemo).
+    if (rec) {
+        const size_t num_entries = image_bindings.size();
+        bool ok = store_ok && num_entries <= MaxBlockEntries &&
+                  stage.images.size() <= MaxBlockImages &&
+                  image_descriptor_array_sizes.size() == stage.images.size();
+        if (ok && rec->candidate) {
+            ok = texture_cache.BindGeneration() == rec->bind_generation &&
+                 VideoCore::gpu_modified_epoch.load(std::memory_order_relaxed) == rec->gpu_epoch;
+        }
+        for (size_t i = 0; ok && i < num_entries; ++i) {
+            const TexBlockEntry& e = rec->entries[i];
+            if (e.null) {
+                continue;
+            }
+            VideoCore::Image* found = texture_cache.TryGetImage(e.found, e.found_uid);
+            ok = found && texture_cache.TryGetImage(e.bound, e.bound_uid) &&
+                 texture_cache.ImageAddrGeneration(e.addr) == e.addr_gen &&
+                 texture_cache.GetAssociatedDepth(*found) ==
+                     (e.redirect ? e.bound : VideoCore::ImageId{});
+        }
+        rec->valid = ok;
+        if (ok) {
+            rec->num_entries = static_cast<u32>(num_entries);
+            rec->num_descs = static_cast<u32>(stage.images.size());
+            for (size_t d = 0; d < stage.images.size(); ++d) {
+                rec->desc_counts[d] = static_cast<u8>(image_descriptor_array_sizes[d]);
+            }
+            tex_block_stores.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+const VideoCore::Image* Rasterizer::UiLinearAsset(const Shader::Info& stage, size_t num_bindings,
+                                                  VideoCore::ImageId first) {
     // sotc: at a render size above 1080 lines the game stretches its 1080p 2D art (splash logos,
     // UI) itself, with the point sampler meant for 1:1 drawing: hard steps. A draw that samples
     // one asset texture (never a render target, storage or depth image) magnifies bilinearly
@@ -5721,22 +6484,22 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const char* r = std::getenv("SOTC_RENDER_RES");
         return r && *r && std::strcmp(r, "1920x1080") != 0;
     }();
-    const VideoCore::Image* ui_asset = nullptr;
-    if (ui_linear && image_bindings.size() == 1 && image_bindings[0].first &&
-        stage.images.size() == 1 && stage.images[0].array_size == 0) {
-        const auto& image = texture_cache.GetImage(image_bindings[0].first);
-        const auto& u = image.usage;
-        if (!u.render_target && !u.depth_target && !u.storage && !u.vo_surface &&
-            !image.binding.is_target && !image.info.props.is_depth &&
-            !AmdGpu::IsInteger(stage.images[0].GetSharp(stage).GetNumberFmt())) {
-            ui_asset = &image;
-        }
+    if (!ui_linear || num_bindings != 1 || !first || stage.images.size() != 1 ||
+        stage.images[0].array_size != 0) {
+        return nullptr;
     }
-    // sotc: SOTC_BIND_CACHE: the composite (TakeHudless, DLSS), the probe and the bilinear UI
-    // filter depend on more than the cache key; those binds are not stored.
-    if (ui_asset || hudless_ui_info >= 0 || dlss_probe) {
-        bind_cache_uncacheable = true;
+    const auto& image = texture_cache.GetImage(first);
+    const auto& u = image.usage;
+    if (u.render_target || u.depth_target || u.storage || u.vo_surface || image.binding.is_target ||
+        image.info.props.is_depth ||
+        AmdGpu::IsInteger(stage.images[0].GetSharp(stage).GetNumberFmt())) {
+        return nullptr;
     }
+    return &image;
+}
+
+void Rasterizer::BindSamplers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
+                              u32 set, const VideoCore::Image* ui_asset) {
     const bool bindless = IsBindlessStage(instance, stage);
     const auto bindless_range = Shader::GetBindlessSamplerRange(stage.sw_stage);
     for (u32 sampler_index = 0; sampler_index < stage.samplers.size(); ++sampler_index) {
@@ -5800,6 +6563,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 }
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
+    const SotcOpPhases::Scope ph{SotcOpPhases::PhBeginRendering}; // sotc: SOTC_OP_PHASES
     const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the attachments
     attachment_feedback_loop = false;
     // sotc: SOTC_RT_FAST (default on) drops redundant attachment work: FindRenderTarget repeats
@@ -5813,10 +6577,37 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     const auto& key = pipeline->GetGraphicsKey();
     RenderState state;
     ui_shadow_hit = false; // sotc: BeginUiShadow
+    rs_verify_hit = RsMemoHit::Miss; // sotc: SOTC_RS_MEMO=3
     if (rs_memo_prepared) { // sotc: SOTC_RS_MEMO
         rs_memo_prepared = false;
         if (RsMemoBegin(state)) {
             return state;
+        }
+    } else if (rs_memo_verify) { // sotc: SOTC_RS_MEMO=3, the full path runs below
+        rs_memo_verify = false;
+        rs_verify_hit = RsMemoBeginCheck();
+        rs_verify_pred = {};
+        if (rs_verify_hit == RsMemoHit::Cross) {
+            // sotc: the transitions a cross replay would skip, before the full path runs them.
+            const auto note = [&](u32 slot, VideoCore::ImageId id, vk::ImageLayout layout,
+                                  vk::AccessFlags2 access, const VideoCore::SubresourceRange& range) {
+                if (!id) {
+                    return;
+                }
+                const auto& image = texture_cache.GetImage(id);
+                auto& pred = rs_verify_pred[slot];
+                pred.noop = RsMemoTransitIsNoop(image, layout, access, range);
+                pred.layout = image.backing->state.layout;
+                pred.access = image.backing->state.access_mask;
+            };
+            for (u32 cb = 0; cb < rs_memo.state.num_color_attachments; ++cb) {
+                note(cb, cb_descs[cb].first, vk::ImageLayout::eColorAttachmentOptimal,
+                     vk::AccessFlagBits2::eColorAttachmentWrite |
+                         vk::AccessFlagBits2::eColorAttachmentRead,
+                     cb_descs[cb].second.view_info.range);
+            }
+            note(AmdGpu::NUM_COLOR_BUFFERS, db_desc.first, rs_memo.depth_layout,
+                 rs_memo.depth_access, db_desc.second.view_info.range);
         }
     }
     bool rs_cb0_base = false;
@@ -5998,6 +6789,10 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         state.num_layers = 1;
     }
 
+    if (rs_verify_hit != RsMemoHit::Miss) { // sotc: SOTC_RS_MEMO=3, before the memo is replaced
+        RsMemoVerify(state, rs_verify_hit);
+        rs_verify_hit = RsMemoHit::Miss;
+    }
     if (RsMemoEnabled()) { // sotc: SOTC_RS_MEMO: kept unless the pass clears or loops back
         bool storable = !attachment_feedback_loop;
         for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
@@ -6018,6 +6813,21 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             rs_memo.depth_layout = rs_depth_layout;
             rs_memo.depth_stages = rs_depth_stages;
             rs_memo.depth_access = rs_depth_access;
+            // sotc: SOTC_RS_MEMO=2, the images of this draw's targets (id, uid, backing).
+            for (u32 slot = 0; slot < rs_memo.target_id.size(); ++slot) {
+                const bool is_depth = slot == AmdGpu::NUM_COLOR_BUFFERS;
+                const auto id = is_depth ? db_desc.first
+                                : slot < state.num_color_attachments ? cb_descs[slot].first
+                                                                     : VideoCore::ImageId{};
+                rs_memo.target_id[slot] = id;
+                rs_memo.target_uid[slot] = 0;
+                rs_memo.target_backing[slot] = nullptr;
+                if (id) {
+                    const auto& image = texture_cache.GetImage(id);
+                    rs_memo.target_uid[slot] = image.image_uid;
+                    rs_memo.target_backing[slot] = image.backing;
+                }
+            }
         } else if (SotcStats::kFpsLog) {
             SotcStats::rs_memo_unstored.fetch_add(1, std::memory_order_relaxed);
         }

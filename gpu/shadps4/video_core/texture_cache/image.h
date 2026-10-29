@@ -104,6 +104,13 @@ struct ImagePlan {
 };
 ImagePlan PlanImage(const Vulkan::Instance& instance, const ImageInfo& info);
 
+/// sotc: SOTC_TEX_BLOCK: a state version for a backing (BackingImage::state_version), from one
+/// sequence shared by all backings and never repeated.
+inline u32 NextBackingVersion() {
+    static std::atomic<u32> sequence{0};
+    return sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
 struct Image {
     explicit Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime,
                    Common::SlotVector<ImageView>& slot_image_views, const ImageInfo& info);
@@ -188,6 +195,10 @@ public:
         // only grow and their entries never change, so an index stays valid for the backing's
         // lifetime; ~0u = none yet.
         u32 last_view = ~0u;
+        // sotc: SOTC_TEX_BLOCK: moves whenever the state above changes (layout, access, stage,
+        // the per-subresource split) and when the backing is first made. Every value comes from
+        // NextBackingVersion, so no two states of any backing share one.
+        u32 state_version = NextBackingVersion();
     };
     std::deque<BackingImage> backing_images;
     BackingImage* backing{};

@@ -270,6 +270,7 @@ bool Runtime::TryHostImageCopy(VideoCore::Image* dst, const u8* guest_base,
         // The state is updated even when the copy below fails: the barrier path that follows
         // then starts from the layout the image is really in.
         backing.state.layout = vk::ImageLayout::eGeneral;
+        backing.state_version = VideoCore::NextBackingVersion(); // sotc: SOTC_TEX_BLOCK
     }
 
     std::vector<VkMemoryToImageCopy> regions;
@@ -817,6 +818,7 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
         new_backing->state.layout = dst_layout;
         new_backing->state.access_mask = dst_access;
         new_backing->state.pl_stage = dst_stage;
+        new_backing->state_version = VideoCore::NextBackingVersion(); // sotc: SOTC_TEX_BLOCK
     }
 
     backing = new_backing;

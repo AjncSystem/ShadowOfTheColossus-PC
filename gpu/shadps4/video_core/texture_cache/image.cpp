@@ -512,6 +512,10 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                         std::optional<SubresourceRange> subres_range) {
     auto& last_state = backing->state;
     auto& subresource_states = backing->subresource_states;
+    // sotc: SOTC_TEX_BLOCK: the backing's state version moves when the state changes (at the end).
+    const State before = last_state;
+    const bool had_subresources = !subresource_states.empty();
+    bool subresources_changed = false;
 
     const bool needs_partial_transition =
         subres_range &&
@@ -522,6 +526,7 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
         if (!partially_transited) {
             subresource_states.resize(info.resources.levels * info.resources.layers);
             std::fill(subresource_states.begin(), subresource_states.end(), last_state);
+            subresources_changed = true;
         }
 
         // In case of partial transition, we need to change the specified subresources only.
@@ -570,6 +575,9 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                             .layerCount = 1,
                         },
                     });
+                    subresources_changed |= state.layout != dst_layout ||
+                                            state.access_mask != dst_mask ||
+                                            state.pl_stage != dst_stage;
                     state.layout = dst_layout;
                     state.access_mask = dst_mask;
                     state.pl_stage = dst_stage;
@@ -612,6 +620,10 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
     last_state.layout = dst_layout;
     last_state.access_mask = dst_mask;
     last_state.pl_stage = dst_stage;
+    if (subresources_changed || before.layout != dst_layout || before.access_mask != dst_mask ||
+        before.pl_stage != dst_stage || had_subresources != !subresource_states.empty()) {
+        backing->state_version = NextBackingVersion(); // sotc: SOTC_TEX_BLOCK
+    }
 }
 
 void NoteMipTailWrite(const Image& image) {

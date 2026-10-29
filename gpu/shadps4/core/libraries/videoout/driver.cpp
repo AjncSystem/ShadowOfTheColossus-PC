@@ -1397,6 +1397,9 @@ void VideoOutDriver::Flip(const Request& req) {
             if (SotcStats::kRsMemo) { // sotc: SOTC_RS_MEMO (sotc_stats.h)
                 const uint64_t lookups = SotcStats::rs_memo_lookups.exchange(0);
                 const uint64_t hits = SotcStats::rs_memo_hits.exchange(0);
+                const uint64_t cross = SotcStats::rs_memo_cross_hits.exchange(0);
+                const uint64_t checks = SotcStats::rs_memo_verify_checks.exchange(0);
+                const uint64_t mismatches = SotcStats::rs_memo_verify_mismatches.exchange(0);
                 std::string reasons;
                 for (uint32_t r = 0; r < SotcStats::RsMissReasons; ++r) {
                     char item[48];
@@ -1406,15 +1409,32 @@ void VideoOutDriver::Flip(const Request& req) {
                                       SotcStats::rs_memo_misses[r].exchange(0)));
                     reasons += item;
                 }
+                // sotc: the mode 2 and mode 3 fields follow, only when that mode is on (mode 1's
+                // line is unchanged).
+                std::string extra;
+                if (SotcStats::kRsMemoCross) {
+                    char item[48];
+                    std::snprintf(item, sizeof(item), ", cross-submit %llu",
+                                  static_cast<unsigned long long>(cross));
+                    extra += item;
+                }
+                if (SotcStats::kRsMemoVerify) {
+                    char item[80];
+                    std::snprintf(item, sizeof(item), ", verify %llu checked, %llu mismatches",
+                                  static_cast<unsigned long long>(checks),
+                                  static_cast<unsigned long long>(mismatches));
+                    extra += item;
+                }
                 ReportPrintf(report,
                              "SOTC RS MEMO hits %llu/%llu (%.1f%%), misses by reason %s; not "
-                             "stored %llu\n",
+                             "stored %llu%s\n",
                              static_cast<unsigned long long>(hits),
                              static_cast<unsigned long long>(lookups),
                              100.0 * double(hits) / double(std::max<u64>(lookups, 1)),
                              reasons.c_str(),
                              static_cast<unsigned long long>(
-                                 SotcStats::rs_memo_unstored.exchange(0)));
+                                 SotcStats::rs_memo_unstored.exchange(0)),
+                             extra.c_str());
             }
             // sotc: SOTC_PARALLEL_RECORD (sotc_stats.h); silent while no prep thread runs.
             if (const uint64_t prepared = SotcStats::pr_prepared.exchange(0),

@@ -190,6 +190,13 @@ private:
     bool RsMemoPrepare(const GraphicsPipeline* pipeline);
     bool RsMemoBegin(RenderState& state);
     bool RsMemoTargetClean(VideoCore::ImageId image_id);
+    /// sotc: SOTC_RS_MEMO=2/3 helpers. The read-only checks of a memo hit at BeginRendering
+    /// (counts the miss reason), whether cb_descs holds the memo's image in slot and it is still
+    /// the same image (uid and backing), and the result check of SOTC_RS_MEMO=3.
+    enum class RsMemoHit : u8 { Miss, Same, Cross };
+    RsMemoHit RsMemoBeginCheck();
+    bool RsMemoSameImage(u32 slot, VideoCore::ImageId image_id);
+    void RsMemoVerify(const RenderState& full, RsMemoHit hit);
     void RefreshImageLayouts();
     void Resolve();
     void DepthStencilCopy(bool is_depth, bool is_stencil);
@@ -226,6 +233,75 @@ private:
                      const PreparedResources* pr = nullptr, const PrStage* pr_stage = nullptr);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding, u32 set,
                       const PreparedResources* pr = nullptr, const PrStage* pr_stage = nullptr);
+
+    /// sotc: SOTC_TEX_BLOCK=1 (default off; 2 also runs the full bind and compares). A stage's
+    /// texture block (its image descriptors and samplers) is memoized by the raw T#/S# words it
+    /// fetches, its flags and the state of the images it bound. A hit replays the image infos,
+    /// descriptor writes, bindings and LOD marks; it still runs UpdateImage and Transit per image.
+    /// sotc: while SOTC_BIND_CACHE records, a hit also makes the cache records the full bind would.
+    static constexpr u32 MaxBlockImages = 16;
+    static constexpr u32 MaxBlockSamplers = Shader::NUM_SAMPLERS;
+    static constexpr u32 MaxBlockEntries = 32;
+    static constexpr u32 MaxBlockKeyWords = 3 + 5 * MaxBlockImages + 3 * MaxBlockSamplers;
+    static constexpr size_t NumTexBlockMemos = 512;
+    struct TexBlockKey {
+        u32 words{};
+        u32 slot{};
+        u64 hash{};
+        // sotc: not zeroed: MakeTextureBlockKey fills the first `words` entries, the only ones read
+        // (a value-initialised array cleared 1 KB per stage on every draw).
+        std::array<u64, MaxBlockKeyWords> key;
+    };
+    /// One image binding of a stored block (or a null one: a T# with address 0 or invalid format).
+    struct TexBlockEntry {
+        bool null{};
+        bool redirect{};                         ///< bound is the depth image of found
+        VideoCore::ImageId found{};              ///< FindImage's perfect match
+        VideoCore::ImageId bound{};              ///< the image bound (found, or its depth image)
+        u64 found_uid{};
+        u64 bound_uid{};
+        VAddr addr{};                            ///< found's guest address
+        u64 addr_gen{};                          ///< ImageAddrGeneration(addr) after FindImage
+        VideoCore::SubresourceRange range{};     ///< the view range the transition used
+        vk::ImageView view{};                    ///< the view of bound (stable for its backing)
+        const VideoCore::Image::BackingImage* backing{};
+        u32 version{};                           ///< bound's backing state_version after the bind
+    };
+    struct TexBlockMemo {
+        bool valid{};
+        u32 key_words{};
+        std::array<u64, MaxBlockKeyWords> key{};
+        bool candidate{};                        ///< a T# that may become a mip tail (DecideRebase)
+        u64 bind_generation{};                   ///< BindGeneration when stored
+        u64 gpu_epoch{};                         ///< gpu_modified_epoch when stored
+        u32 num_descs{};
+        std::array<u8, MaxBlockImages> desc_counts{}; ///< bindings of each image descriptor
+        u32 num_entries{};
+        std::array<TexBlockEntry, MaxBlockEntries> entries{};
+        u32 num_lods{};
+        std::array<u32, MaxBlockImages> lod_banks{};
+    };
+    std::unique_ptr<std::array<TexBlockMemo, NumTexBlockMemos>> tex_block_memos =
+        std::make_unique<std::array<TexBlockMemo, NumTexBlockMemos>>();
+    static int TexBlockMode();
+    bool MakeTextureBlockKey(const Shader::Info& stage, u32 set, const PreparedResources* pr,
+                             const PrStage* pr_stage, TexBlockKey& key);
+    static bool TexBlockMatches(const TexBlockMemo& memo, const TexBlockKey& key);
+    /// mark_lods: replay the LOD marks (false in verify mode, where the full bind marks them).
+    /// sotc: its bind cache records are pushed only after the last check that can return false.
+    bool TryTextureBlock(const Shader::Info& stage, const TexBlockKey& key, u32 set,
+                         Shader::Backend::Bindings& binding, bool mark_lods = true);
+    /// The full bind (the former BindTextures body). rec: the memo slot to store the block in
+    /// (null: not storable), filled as the bindings are made.
+    void BindTexturesFull(const Shader::Info& stage, Shader::Backend::Bindings& binding, u32 set,
+                          const PreparedResources* pr, const PrStage* pr_stage,
+                          const TexBlockKey* tex_key, TexBlockMemo* rec);
+    void BindSamplers(const Shader::Info& stage, Shader::Backend::Bindings& binding, u32 set,
+                      const VideoCore::Image* ui_asset);
+    /// sotc: SOTC_UI_LINEAR's image: the single image of a single-image stage that is drawn 1:1
+    /// asset, or null (the point sampler is made bilinear for it).
+    const VideoCore::Image* UiLinearAsset(const Shader::Info& stage, size_t num_bindings,
+                                          VideoCore::ImageId first);
     bool BindResources(const Pipeline* pipeline, const PreparedDraw* prepared = nullptr);
     bool FastBindEligible(const Pipeline* pipeline) const;
     bool FastBindStatic(const Pipeline* pipeline, const AmdGpu::Regs& regs) const;
@@ -611,7 +687,14 @@ private:
     /// sampled, skips the lookups: PrepareRenderState only marks the targets, BeginRendering
     /// repeats the per-draw side effects (TextureCache::ReuseTarget, the transitions, the hudless
     /// / UI shadow tests) on the stored state. Not stored for a pass with a clear or a feedback loop.
+    /// sotc: SOTC_RS_MEMO=2 also takes the state in a later submit (RsMemoBeginCheck): then the pass
+    /// need not be open, every target must still be the memo's image (uid and backing), and a
+    /// transition runs unless it is provably a no-op on the image's current state. =3 runs the full
+    /// path on each candidate and compares (RsMemoVerify).
     static constexpr size_t RsMemoKeyWords = 384;
+    /// sotc: SOTC_RS_MEMO=2: the memo's targets are slots 0..AmdGpu::NUM_COLOR_BUFFERS-1 (color) and
+    /// AmdGpu::NUM_COLOR_BUFFERS (depth). A slot holds the image id the draw used, the image's uid
+    /// and its backing (BackingImage lists only grow, so a backing lives as long as its image).
     struct RsMemo {
         std::array<u32, RsMemoKeyWords> key{};
         u32 key_len{};
@@ -625,11 +708,27 @@ private:
         vk::ImageLayout depth_layout{};
         vk::PipelineStageFlags2 depth_stages{};
         vk::AccessFlags2 depth_access{};
+        std::array<VideoCore::ImageId, AmdGpu::NUM_COLOR_BUFFERS + 1> target_id{};
+        std::array<u64, AmdGpu::NUM_COLOR_BUFFERS + 1> target_uid{};
+        std::array<VideoCore::Image::BackingImage*, AmdGpu::NUM_COLOR_BUFFERS + 1> target_backing{};
     };
     RsMemo rs_memo{};
     std::array<u32, RsMemoKeyWords> rs_key{}; ///< this draw's (RsMemoBuildKey)
     u32 rs_key_len{};
     bool rs_memo_prepared{}; ///< PrepareRenderState took the memo; BeginRendering checks it again
+    /// sotc: SOTC_RS_MEMO=3: PrepareRenderState found a memo candidate and ran the full path; the
+    /// next BeginRendering checks it (rs_verify_hit) and compares its result (RsMemoVerify).
+    bool rs_memo_verify{};
+    RsMemoHit rs_verify_hit{RsMemoHit::Miss};
+    /// sotc: SOTC_RS_MEMO=3, cross-submit candidates: per target (8 colour, then depth), whether a
+    /// replay would have skipped its transition (RsMemoTransitIsNoop) and the backing state before
+    /// the full path. A skipped transition is right only if the full path leaves that state as is.
+    struct RsVerifyPred {
+        bool noop{};
+        vk::ImageLayout layout{};
+        vk::AccessFlags2 access{};
+    };
+    std::array<RsVerifyPred, AmdGpu::NUM_COLOR_BUFFERS + 1> rs_verify_pred{};
 
     /// sotc: SOTC_PARALLEL_RECORD (MapEpoch, PrefetchImagesShared, CheckPrepared).
     std::atomic<u64> map_epoch{0};

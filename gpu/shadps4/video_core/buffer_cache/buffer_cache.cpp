@@ -23,6 +23,7 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/sotc_stats.h"
+#include "video_core/sotc_op_phases.h" // sotc: SOTC_OP_PHASES
 #include "video_core/sotc_adaptive.h"
 #include "video_core/sotc_write_extent.h"
 #include "video_core/buffer_cache/bpe_heap_guard.h"
@@ -1614,6 +1615,7 @@ void BufferCache::BeginAsyncReadbackImpl(AsyncReadback& readback) {
         SotcStats::readback_finish.fetch_add(1, std::memory_order_relaxed);
     }
     readback.waiting = true;
+    RbHullCover(readback, 0); // sotc: SOTC_WRITE_DIET: the hull of everything gathered above
     inflight_readbacks.push_back(&readback);
     if (readback.direct) {
         direct_inflight.fetch_add(1, std::memory_order_relaxed); // sotc: released in FinishAsyncReadback
@@ -1636,13 +1638,79 @@ static bool RbKeepLater() {
     return enabled;
 }
 
+// sotc: SOTC_WRITE_DIET (off by default). 1: the written-binding diet (per-readback hull test in
+// MarkInflightReadbacksDirty, one prefetch dirtying per write in RecordCurrentWrite). 2: verify,
+// the old logic always runs and its result is used, and every check that the new logic would
+// have changed is counted (see WriteDietCount).
+static u32 WriteDietMode() {
+    static const u32 mode = [] {
+        const char* v = std::getenv("SOTC_WRITE_DIET");
+        if (v && v[0] == '1') {
+            return u32{1};
+        }
+        if (v && v[0] == '2') {
+            return u32{2};
+        }
+        return u32{0};
+    }();
+    return mode;
+}
+
+// sotc: SOTC_WRITE_DIET=2 counters: checks made and mismatches found. The line goes to stderr at
+// most every 5 s, from whichever thread makes a check.
+static void WriteDietCount(bool mismatch) {
+    static std::atomic<u64> checks{};
+    static std::atomic<u64> mismatches{};
+    static std::atomic<u64> next_print_ns{};
+    checks.fetch_add(1, std::memory_order_relaxed);
+    if (mismatch) {
+        mismatches.fetch_add(1, std::memory_order_relaxed);
+    }
+    const u64 now = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now().time_since_epoch())
+                                         .count());
+    u64 due = next_print_ns.load(std::memory_order_relaxed);
+    if (now >= due &&
+        next_print_ns.compare_exchange_strong(due, now + 5'000'000'000ULL,
+                                              std::memory_order_relaxed)) {
+        std::fprintf(stderr, "SOTC WRITE DIET verify: checks %llu, mismatches %llu\n",
+                     static_cast<unsigned long long>(checks.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(mismatches.load(std::memory_order_relaxed)));
+    }
+}
+
+void BufferCache::RbHullCover(AsyncReadback& readback, size_t from) {
+    if (WriteDietMode() == 0) {
+        return;
+    }
+    // Both kinds of mark are covered: the item's own range (SOTC_RB_OWNER off) and its gpu_ranges
+    // (on). Only ever widens: the trims shrink pending, the hull stays a superset.
+    for (size_t i = from; i < readback.pending.size(); ++i) {
+        const ReadbackItem& item = readback.pending[i];
+        readback.hull_lo = std::min(readback.hull_lo, item.addr);
+        readback.hull_hi = std::max(readback.hull_hi, item.addr + item.size);
+        for (const auto& [range_addr, range_size] : item.gpu_ranges) {
+            readback.hull_lo = std::min(readback.hull_lo, range_addr);
+            readback.hull_hi = std::max(readback.hull_hi, range_addr + range_size);
+        }
+    }
+}
+
 void BufferCache::MarkInflightReadbacksDirty(VAddr addr, u64 size, StaleReason reason,
                                              bool keep_owed) {
+    const u32 wd_mode = WriteDietMode();
+    if (SotcOpPhases::kOn) {
+        SotcOpPhases::NoteWalk(inflight_readbacks.size()); // sotc: SOTC_OP_PHASES
+    }
     // sotc: SOTC_RB_EXACT: a write, unmap or guest write takes its bytes out of the owed
     // downloads (an applied readback or a page release does not touch owed bytes).
     if (!keep_owed && reason != StaleReason::Applied &&
         rbx_owed_count.load(std::memory_order_relaxed) != 0) {
         RbxTrim(addr, addr + size);
+    }
+    // sotc: SOTC_WRITE_DIET: nothing in flight, nothing to mark (the trim above still ran).
+    if (wd_mode != 0 && inflight_readbacks.empty()) {
+        return;
     }
     // sotc: the command processor (a GPU write, its own write or an applied readback after
     // which the guest may write) changed these bytes: asynchronous readbacks of them in flight
@@ -1672,6 +1740,16 @@ void BufferCache::MarkInflightReadbacksDirty(VAddr addr, u64 size, StaleReason r
             }
             continue;
         }
+        // sotc: SOTC_WRITE_DIET (C1): every range a non-prefetch readback marks lies in its hull
+        // (RbHullCover). mark() fires for a range [lo, hi) only when addr < hi && lo < end; with
+        // lo >= hull_lo and hi <= hull_hi that needs addr < hull_hi && hull_lo < end. So a miss marks
+        // nothing, its dirty flag and later_gpu stay as they are, and the walk is skipped.
+        const bool hull_miss = !(addr < readback->hull_hi && readback->hull_lo < end);
+        if (wd_mode == 1 && hull_miss) {
+            continue;
+        }
+        const bool dirty_before = readback->dirty;
+        const size_t later_before = readback->later_gpu.size();
         bool hit = false;
         const auto mark = [&](VAddr lo, VAddr hi) {
             if (!(addr < hi && lo < end)) {
@@ -1693,6 +1771,22 @@ void BufferCache::MarkInflightReadbacksDirty(VAddr addr, u64 size, StaleReason r
             } else {
                 mark(item.addr, item.addr + item.size);
             }
+        }
+        if (wd_mode == 2) {
+            // sotc: SOTC_WRITE_DIET=2: the old marking above ran and its result stands. Mismatch:
+            // a hull miss that changed the readback, or a range outside the hull (a pending
+            // change that did not widen it).
+            bool broken = hull_miss && (readback->dirty != dirty_before ||
+                                        readback->later_gpu.size() != later_before);
+            for (const auto& item : readback->pending) {
+                broken |= item.addr < readback->hull_lo ||
+                          item.addr + item.size > readback->hull_hi;
+                for (const auto& [range_addr, range_size] : item.gpu_ranges) {
+                    broken |= range_addr < readback->hull_lo ||
+                              range_addr + range_size > readback->hull_hi;
+                }
+            }
+            WriteDietCount(broken);
         }
         if (hit) {
             SotcStats::readback_stale[static_cast<u32>(reason)].fetch_add(
@@ -2264,6 +2358,7 @@ bool BufferCache::PrefetchIssue() {
         pf_lo = pf_live.empty() ? lo : std::min(pf_lo, lo);
         pf_hi = pf_live.empty() ? hi : std::max(pf_hi, hi);
         pf_bytes_held += bytes;
+        RbHullCover(p, 0); // sotc: SOTC_WRITE_DIET
         inflight_readbacks.push_back(&p);
         ++inflight_version;
         pf_live.push_back(std::move(prefetch));
@@ -2564,6 +2659,7 @@ bool BufferCache::TryServePrevious(AsyncReadback& readback) {
         pf_lo = pf_live.empty() ? o.pf_lo : std::min(pf_lo, o.pf_lo);
         pf_hi = pf_live.empty() ? o.pf_hi : std::max(pf_hi, o.pf_hi);
         pf_bytes_held += o.pf_bytes;
+        RbHullCover(o, 0); // sotc: SOTC_WRITE_DIET
         inflight_readbacks.push_back(&o);
         ++inflight_version;
         pf_live.push_back(std::move(owed));
@@ -2982,6 +3078,7 @@ bool BufferCache::RecordLabelDownloads() {
     pf_lo = pf_live.empty() ? lo_hull : std::min(pf_lo, lo_hull);
     pf_hi = pf_live.empty() ? hi_hull : std::max(pf_hi, hi_hull);
     rbx_label_bytes += bytes;
+    RbHullCover(p, 0); // sotc: SOTC_WRITE_DIET
     inflight_readbacks.push_back(&p);
     ++inflight_version;
     pf_live.push_back(std::move(label));
@@ -3568,6 +3665,7 @@ BufferCache::ExactResult BufferCache::TryServeExact(AsyncReadback& readback, con
         owed_item.size = hi_hull - lo_hull;
         runtime.CopyBuffer(arena, staging.buffer, owed_item.copies);
         o.pending.push_back(std::move(owed_item));
+        RbHullCover(o, 0); // sotc: SOTC_WRITE_DIET
         o.device_addr = lo_hull;
         o.size = hi_hull - lo_hull;
         o.arena = arena;
@@ -3630,6 +3728,7 @@ BufferCache::ExactResult BufferCache::TryServeExact(AsyncReadback& readback, con
         done_item.gpu_ranges.emplace_back(lo, hi - lo);
     }
     readback.pending.push_back(std::move(done_item));
+    RbHullCover(readback, readback.pending.size() - 1); // sotc: SOTC_WRITE_DIET
     total_out = done_total;
     writer_out = done_writer;
     SotcStats::rb_ex_served_dl.fetch_add(1, std::memory_order_relaxed);
@@ -4046,6 +4145,7 @@ u64 BufferCache::RbgAtFault(AsyncReadback& readback, VAddr ws, VAddr we) {
     pf_hi = pf_live.empty() ? hi_hull : std::max(pf_hi, hi_hull);
     rbg_bytes_held += bytes;
     ++rbg_live;
+    RbHullCover(p, 0); // sotc: SOTC_WRITE_DIET
     inflight_readbacks.push_back(&p);
     ++inflight_version;
     pf_live.push_back(std::move(group_download));
@@ -5114,7 +5214,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         const VAddr mark_addr = narrowed ? device_addr + mark_offset : device_addr;
         const u64 mark_len = narrowed ? mark_size : size;
         const u64 hot_seq = AddGpuModified(mark_addr, mark_len);
-        RecordCurrentWrite(mark_addr, mark_len, hot_seq, true);
+        // sotc: SOTC_WRITE_DIET: pf_marked, AddGpuModified just ran over the same range.
+        RecordCurrentWrite(mark_addr, mark_len, hot_seq, true, true);
     }
     return {arena, arena->Offset(device_addr)};
 }
@@ -5423,7 +5524,9 @@ void BufferCache::EraseHashedUploads(VAddr addr, u64 size) {
     hashed_upload_count.store(hashed_uploads.size(), std::memory_order_relaxed);
 }
 
-void BufferCache::RecordCurrentWrite(VAddr addr, u64 size, u64 seq, bool gpu_write) {
+void BufferCache::RecordCurrentWrite(VAddr addr, u64 size, u64 seq, bool gpu_write,
+                                     bool pf_marked) {
+    const u32 wd_mode = WriteDietMode();
     EraseHashedUploads(addr, size);
     // sotc: SOTC_RB_EXACT: any arena write over owed bytes takes them out of the owed downloads.
     if (RbxOn() && rbx_owed_count.load(std::memory_order_relaxed) != 0) {
@@ -5432,7 +5535,50 @@ void BufferCache::RecordCurrentWrite(VAddr addr, u64 size, u64 seq, bool gpu_wri
     // sotc: SOTC_RB_PREFETCH: every arena write recorded after a prefetch's copies (GPU-written
     // bindings, uploads, image syncs, write-throughs, transfer-queue copies) makes it stale.
     if (rb_prefetch_env && !pf_live.empty() && addr < pf_hi && pf_lo < addr + size) {
-        PrefetchMarkDirty(addr, size);
+        // sotc: SOTC_WRITE_DIET (C1): with pf_marked, AddGpuModified has just run
+        // MarkInflightReadbacksDirty over this same range, and that walk already did what this
+        // one does: it applies the same hull test and the same gpu_ranges test to every prefetch,
+        // and a group prefetch's RbgTrim is idempotent for the same range. Every pf_live entry is in
+        // inflight_readbacks until it finishes (PrefetchDrop, FinishAsyncReadback), and nothing runs
+        // in between that changes them (RbxTrim touches rbx_live only). So the walk is a no-op and
+        // is skipped. Mode 2 runs it and counts whether anything changed.
+        if (!pf_marked || wd_mode == 0) {
+            PrefetchMarkDirty(addr, size);
+        } else if (wd_mode == 2) {
+            struct PfSnap {
+                bool dirty;
+                u64 gpu_bytes;
+                size_t copies;
+            };
+            std::vector<PfSnap> before;
+            before.reserve(pf_live.size());
+            for (const auto& p : pf_live) {
+                PfSnap s{p->dirty, 0, 0};
+                for (const auto& item : p->pending) {
+                    s.copies += item.copies.size();
+                    for (const auto& [range_addr, range_size] : item.gpu_ranges) {
+                        s.gpu_bytes += range_size;
+                    }
+                }
+                before.push_back(s);
+            }
+            PrefetchMarkDirty(addr, size);
+            bool changed = false;
+            for (size_t i = 0; i < pf_live.size() && i < before.size(); ++i) {
+                const AsyncReadback& p = *pf_live[i];
+                u64 gpu_bytes = 0;
+                size_t copies = 0;
+                for (const auto& item : p.pending) {
+                    copies += item.copies.size();
+                    for (const auto& [range_addr, range_size] : item.gpu_ranges) {
+                        gpu_bytes += range_size;
+                    }
+                }
+                changed |= p.dirty != before[i].dirty || gpu_bytes != before[i].gpu_bytes ||
+                           copies != before[i].copies;
+            }
+            WriteDietCount(changed || before.size() != pf_live.size());
+        }
     }
     if (!hot_write_pending) {
         const VAddr end = addr + size;
@@ -5741,6 +5887,10 @@ bool BufferCache::TryWriteThroughFromCpu(VAddr addr, const void* data, u64 size)
     runtime.CopyBuffer(staging.buffer, arena, std::span{&copy, 1});
     RecordCurrentWrite(addr, size);
     return true;
+}
+
+bool BufferCache::IsWrittenRangeSynced(VAddr addr, u64 size) const noexcept {
+    return memory_tracker->IsSyncClean(addr, size, true); // sotc: SOTC_HLE_SKIP=2
 }
 
 bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
@@ -6217,30 +6367,49 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                    ? SynchronizeMemoryFromImage(arena, device_addr, size)
                    : false;
     }
-    const bool result =
-        SynchronizeMemoryFull(arena, device_addr, size, is_written, is_texel_buffer);
+    bool scan_clean = false;
+    const bool result = SynchronizeMemoryFull(arena, device_addr, size, is_written,
+                                              is_texel_buffer, &scan_clean);
+    // sotc: SOTC_SYNC_PIPE=1 takes the scan's own verdict instead of the second look below. The
+    // scan reports clean only when it changed no bit (MemoryTracker::ForEachUploadRange), so the
+    // look would find the same bits: the slot is stored exactly as below. A dirty verdict takes
+    // the look as before. =2 always takes the look and counts the disagreements.
+    if (SotcStats::kSyncPipe && scan_clean && !SotcStats::kSyncPipeVerify) {
+        slot = {device_addr, gen0, size, is_written};
+        return result;
+    }
+    const bool clean_after = memory_tracker->IsSyncClean(device_addr, size, is_written);
+    if (SotcStats::kSyncPipeVerify && scan_clean && !clean_after) {
+        SotcStats::SyncPipe::verify_mismatches.fetch_add(1, std::memory_order_relaxed);
+    }
     // A slot left stale (range not clean now) cannot match again: its sum only grows.
-    if (memory_tracker->IsSyncClean(device_addr, size, is_written)) {
+    if (clean_after) {
         slot = {device_addr, gen0, size, is_written};
     }
     return result;
 }
 
 bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, u32 size,
-                                        bool is_written, bool is_texel_buffer) {
+                                        bool is_written, bool is_texel_buffer,
+                                        bool* scan_clean) {
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes{};
+    bool clean = false;
     {
         // sotc: SOTC_PROTECT_BATCH (sotc_stats.h). The re-protects of the ranges collected here
         // are applied together when this scope closes, so before anything below reads guest
         // memory for them (the order of today's path: protect, then copy). A guest write landing
         // before the flush is in the bytes copied below; one after it faults.
         const PageManager::ProtectBatch protect_batch{SotcStats::kProtectBatch};
-        memory_tracker->ForEachUploadRange(device_addr, size, is_written,
-                                           [&](u64 addr, u64 size) {
-                                               copies.emplace_back(total_size_bytes, addr, size);
-                                               total_size_bytes += size;
-                                           });
+        clean = memory_tracker->ForEachUploadRange(device_addr, size, is_written,
+                                                   [&](u64 addr, u64 size) {
+                                                       copies.emplace_back(total_size_bytes, addr,
+                                                                           size);
+                                                       total_size_bytes += size;
+                                                   });
+    }
+    if (scan_clean) { // sotc: SOTC_SYNC_PIPE, see SynchronizeMemory
+        *scan_clean = clean;
     }
     // sotc: SOTC_FAULT_GRANULE: pages a granule marked dirty that the guest never wrote stay as
     // the arena holds them. Only runs when such pages are pending (otherwise one atomic load).
@@ -6262,6 +6431,7 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
             SotcStats::upload_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
         }
         SotcTrace::NoteUpload(total_size_bytes); // sotc: SOTC_TRACE (BindScope)
+        SotcOpPhases::NoteUpload(total_size_bytes); // sotc: SOTC_OP_PHASES
         // sotc: SOTC_HOST_IMPORT. A large upload is copied by the GPU from imported guest memory
         // into device-local staging (the CPU waits for that copy, so the bytes are taken now, as
         // below), then from there into the arena on the graphics queue, as below. SOTC_HASH_SMALL

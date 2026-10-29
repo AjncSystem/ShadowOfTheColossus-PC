@@ -191,19 +191,31 @@ inline std::atomic<uint64_t> bf_flat_copied{0}, bf_flat_reused{0}, bf_distinct_k
 /// in the render pass that draw began, takes that draw's render state instead of looking its
 /// targets up again (Rasterizer::RsMemoPrepare / RsMemoBegin, vk_rasterizer.cpp). Unset or 0:
 /// PrepareRenderState and BeginRendering are unchanged.
-inline const bool kRsMemo = [] {
+/// sotc: SOTC_RS_MEMO=2 also takes the memo of an earlier submit (the tick differs): the targets
+/// must still be the same registered images (uid and backing), the metadata epoch must not have
+/// moved and the transitions that are not provably no-ops are run. =3 runs the full path on every
+/// candidate and compares the result with the memo (mismatches are counted; the full path's result
+/// is used). Each inline variable below reads the environment once at static initialization (no
+/// inline variable depends on another one).
+inline unsigned RsMemoLevel() {
     const char* v = std::getenv("SOTC_RS_MEMO");
-    return v && v[0] == '1';
-}();
+    return (v && v[0] >= '1' && v[0] <= '3') ? static_cast<unsigned>(v[0] - '0') : 0u;
+}
+inline const bool kRsMemo = RsMemoLevel() >= 1;
+inline const bool kRsMemoCross = RsMemoLevel() >= 2;
+inline const bool kRsMemoVerify = RsMemoLevel() == 3;
 /// sotc: SOTC_RS_MEMO counters (SOTC_FPS only): draws looked up, hits, misses by reason, and full
-/// passes not stored (a clear, a feedback loop).
+/// passes not stored (a clear, a feedback loop). Mode 2: hits that took the memo of an earlier
+/// submit. Mode 3: candidates verified against the full path, and the ones that differed.
 enum RsMemoMissReason : uint32_t {
     RsMissNone, RsMissTick, RsMissResources, RsMissRegs, RsMissPass, RsMissImage, RsMissMeta,
-    RsMissReasons
+    RsMissIdentity, RsMissReasons
 };
 inline constexpr const char* kRsMemoMissNames[RsMissReasons] = {
-    "empty", "tick", "resources", "regs", "pass", "image", "meta"};
+    "empty", "tick", "resources", "regs", "pass", "image", "meta", "identity"};
 inline std::atomic<uint64_t> rs_memo_lookups{0}, rs_memo_hits{0}, rs_memo_unstored{0};
+inline std::atomic<uint64_t> rs_memo_cross_hits{0}, rs_memo_verify_checks{0},
+    rs_memo_verify_mismatches{0};
 inline std::atomic<uint64_t> rs_memo_misses[RsMissReasons]{};
 /// sotc: SOTC_PARALLEL_RECORD=1 (default off): GpuPrep threads compute the register-only inputs
 /// of the draws ahead of the draw thread (Liverpool::PrepLoop, amdgpu/draw_prep.h). Counters
@@ -269,6 +281,89 @@ inline const bool kProtectBatch = [] {
 /// skipped because their state had moved on.
 inline std::atomic<uint64_t> protect_batch_calls{0}, protect_batch_pages{0},
     protect_batch_requests{0}, protect_batch_redundant{0};
+/// sotc: SOTC_SYNC_PIPE=1 (default off; =2 also verifies). Read at static initialisation.
+///  1. BufferCache::SynchronizeMemory (needs SOTC_SYNC_FAST=1) takes the clean verdict of its own
+///     scan (MemoryTracker::ForEachUploadRange) instead of a second look at the bits.
+///  2. The SRT clean-page bitmap (SetSrtReadProtectedPages) is updated one 64-bit word at a time.
+///  3. Counters of the Protect calls made inside Rasterizer::BindResources (SyncPipe::OpScope),
+///     printed to stderr every 5 s.
+/// =2 computes both verdicts of (1) and (2), counts the disagreements in verify_mismatches, and
+/// uses the old result.
+inline const bool kSyncPipe = [] {
+    const char* v = std::getenv("SOTC_SYNC_PIPE");
+    return v && (v[0] == '1' || v[0] == '2');
+}();
+inline const bool kSyncPipeVerify = [] {
+    const char* v = std::getenv("SOTC_SYNC_PIPE");
+    return v && v[0] == '2';
+}();
+namespace SyncPipe {
+/// sotc: SOTC_SYNC_PIPE counters, cumulative: ops (BindResources calls) with at least one Protect
+/// call, Protect calls made inside BindResources, ops with two or more of them, and verify
+/// mismatches (=2).
+inline std::atomic<uint64_t> ops_with_protects{0}, protects{0}, ops_two_plus{0},
+    verify_mismatches{0};
+/// Per thread: the BindResources nesting depth and the Protect calls of the op in progress.
+inline thread_local uint32_t bind_depth = 0;
+inline thread_local uint32_t op_protects = 0;
+/// Steady-clock time (ns) of the next report; 0 until the first op ends (that call only arms it).
+inline std::atomic<int64_t> next_report_ns{0};
+
+/// Counts one Protect call, when the calling thread is inside BindResources.
+inline void NoteProtect() noexcept {
+    if (kSyncPipe && bind_depth != 0) {
+        ++op_protects;
+        protects.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+/// Prints the counters to stderr, at most once per 5 s.
+inline void PrintReport() {
+    constexpr int64_t period_ns = 5'000'000'000;
+    const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count();
+    int64_t next = next_report_ns.load(std::memory_order_relaxed);
+    if (next == 0) {
+        next_report_ns.compare_exchange_strong(next, now + period_ns, std::memory_order_relaxed);
+        return;
+    }
+    if (now < next ||
+        !next_report_ns.compare_exchange_strong(next, now + period_ns, std::memory_order_relaxed)) {
+        return;
+    }
+    std::fprintf(stderr,
+                 "SOTC SYNC PIPE: ops with protects %llu, protects %llu, ops with 2+ %llu, "
+                 "verify mismatches %llu\n",
+                 static_cast<unsigned long long>(ops_with_protects.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(protects.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(ops_two_plus.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(
+                     verify_mismatches.load(std::memory_order_relaxed)));
+}
+
+/// One BindResources call: counts its Protect calls and reports when the outermost one ends.
+struct OpScope {
+    OpScope() noexcept {
+        if (kSyncPipe && bind_depth++ == 0) {
+            op_protects = 0;
+        }
+    }
+    ~OpScope() {
+        if (kSyncPipe && --bind_depth == 0) {
+            if (op_protects != 0) {
+                ops_with_protects.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (op_protects >= 2) {
+                ops_two_plus.fetch_add(1, std::memory_order_relaxed);
+            }
+            PrintReport();
+        }
+    }
+    OpScope(const OpScope&) = delete;
+    OpScope& operator=(const OpScope&) = delete;
+};
+} // namespace SyncPipe
 /// sotc: SOTC_PROTECT_COALESCE=1 (default off). Two exact reductions of host protect calls (page_manager.cpp):
 ///  1. A guest write fault collects the unprotects its tracker updates make (the faulting page, the
 ///     fault granule, the write-ahead, an image's pages) and applies them as one call per run when

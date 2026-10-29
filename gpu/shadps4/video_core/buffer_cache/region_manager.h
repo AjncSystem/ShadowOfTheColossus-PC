@@ -565,8 +565,12 @@ public:
         }
     }
 
+    /// sotc: SOTC_SYNC_PIPE. Returns true only when the unlocked look below found nothing to do: no
+    /// CPU bit in the range and, for gpu_op Set, every GPU bit set. Then func was not called and no
+    /// bit changed, so the range was clean before this call (the verdict of IsSyncClean). Every
+    /// other path returns false.
     template <Type type, StateOp cpu_op, StateOp gpu_op, bool locked = true>
-    void ForEachModifiedRange(u64 offset, s64 size, auto&& func) {
+    bool ForEachModifiedRange(u64 offset, s64 size, auto&& func) {
         // sotc: CPU bits rise only in ChangeRegionState (it marks sweep_words).
         static_assert(!(type == Type::CPU && cpu_op == StateOp::Set));
         auto& state = GetRegionBits<type>();
@@ -586,7 +590,7 @@ public:
                 }
             });
             if (!any_cpu && (gpu_op == StateOp::None || all_gpu)) {
-                return;
+                return true;
             }
         }
         RegionBits write_prot;
@@ -696,6 +700,7 @@ public:
         if constexpr (locked) {
             mutex.unlock();
         }
+        return false;
     }
 
     template <Type type>

@@ -14,6 +14,36 @@
   - o envio de bytes do readback pelo caminho rápido da 0.70 (`SOTC_WRITE_FAST`) agora espera os
     uploads assíncronos que ainda leem esses bytes (`SOTC_ASYNC_UPLOAD`), como o caminho normal.
   O cache de shaders do LOD feedback é refeito na primeira abertura.
+- **Novo caminho de bind da thread de desenho (experimentais, todos desligados; ainda não
+  medidos no jogo).** Projeto em `docs/BIND-PATH-DESIGN.md`. Cada opção tem um modo de
+  verificação que refaz o caminho antigo, compara e usa o resultado antigo:
+  - `SOTC_OP_PHASES=1` (diagnóstico): a cada 5 s, o tempo de cada operação da thread de desenho
+    por fase (pipeline, render state, bind, texturas, vértices, descritores, estado dinâmico,
+    HLE, reset), os buffers limpos/sujos/escritos, uploads, chamadas de proteção de página e
+    readbacks percorridos. `=2` deixa de fora a medição por buffer (pesa menos: com `=1` o
+    próprio contador custa ~2 ms por quadro).
+  - `SOTC_WRITE_DIET=1` (`=2` verifica): cada readback em andamento guarda a faixa que cobre, e
+    um buffer escrito pula os readbacks fora dela; sem readbacks em andamento o percurso não roda;
+    a pré-busca deixa de ser marcada duas vezes pela mesma escrita.
+  - `SOTC_SYNC_PIPE=1` (`=2` verifica; precisa de `SOTC_SYNC_FAST`): uma faixa já limpa é
+    varrida uma vez só na sincronização (antes eram duas); os bits de página do SRT mudam uma
+    palavra de 64 bits por vez. Conta as chamadas de proteção por operação ("SOTC SYNC PIPE"),
+    para decidir se vale juntar as proteções de uma operação inteira.
+  - `SOTC_TEX_BLOCK=1` (`=2` verifica): o bloco de texturas de um estágio (T#, S# e as imagens
+    achadas) é reaproveitado enquanto as imagens, as visões e o estado delas não mudaram; a
+    checagem de sujeira e as transições continuam rodando em cada draw. Baseado no PR #69.
+    Também vale quando o `SOTC_BIND_CACHE` está gravando uma entrada nova: o acerto deixa na
+    entrada as mesmas marcas de LOD, imagens e transições que o bind completo deixaria (antes ele
+    recusava esses binds, ~50% do total, e só ~90 por quadro chegavam a ele). O `=2` também
+    compara essas marcas.
+  - `SOTC_RS_MEMO=2` (`=3` verifica): a memória dos alvos de render (`SOTC_RS_MEMO=1`, que não
+    muda) também vale entre um envio à GPU e o seguinte, com as transições rodando quando não for
+    provado que não fazem nada. Baseado no G-buffer do PR #308, sem os seriais de registrador.
+  - `SOTC_HLE_SKIP=1` (`=2` verifica): as cópias do shader de cópia emulado marcam o destino uma
+    vez por faixa juntada, em vez de uma vez por cópia. Pular cópias inteiras não foi feito: falta
+    um sinal exato de "não mudou" para as escritas da GPU.
+  - Correção pequena: `MarkSrtCleanPages` agora liga os bits de página com uma operação atômica
+    (uma proteção em outra thread podia perder o bit desligado).
 - **Medido (29 out): os dispatches não têm bind para reaproveitar.** `SOTC_CS_STATS=1`
   (diagnóstico, desligado) imprime a cada 5 s quantos dispatches repetem o anterior e quanto o bind
   deles custa. São ~1.100–1.200 dispatches por quadro, todos escrevendo em memória, com bind de

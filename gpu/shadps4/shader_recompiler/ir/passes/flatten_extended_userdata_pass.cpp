@@ -119,12 +119,36 @@ void SetSrtCleanLoad(bool (*clean_load)(u64, u32, u64*)) {
     WalkerContext().clean_load = clean_load;
 }
 
+// sotc: SOTC_SYNC_PIPE. Calls fn(word_index, mask) once per bitmap word that holds a page of
+// [first, last] (page numbers, inclusive), mask holding exactly those pages of that word.
+template <typename Fn>
+void ForEachPageWordMask(u64 first, u64 last, Fn&& fn) {
+    for (u64 w = first >> 6; w <= (last >> 6); ++w) {
+        const u64 lo = (w == (first >> 6)) ? (first & 63) : 0;
+        const u64 hi = (w == (last >> 6)) ? (last & 63) : 63;
+        const u64 span = hi - lo + 1;
+        const u64 mask = (span == 64 ? ~0ULL : ((1ULL << span) - 1)) << lo;
+        fn(w, mask);
+    }
+}
+
 void SetSrtReadProtectedPages(u64 address, u64 size, bool read_protected) {
     auto& context = WalkerContext();
     if (!context.clean_pages || size == 0 || address >= SrtCleanPageLimit) {
         return;
     }
     const u64 last = std::min<u64>((address + size - 1) >> 12, (SrtCleanPageLimit >> 12) - 1);
+    if (SotcStats::kSyncPipe && !SotcStats::kSyncPipeVerify) { // sotc: SOTC_SYNC_PIPE
+        ForEachPageWordMask(address >> 12, last, [&](u64 w, u64 mask) {
+            if (read_protected) {
+                __atomic_fetch_or(&context.clean_pages[w], mask, __ATOMIC_RELAXED);
+            } else {
+                __atomic_fetch_and(&context.clean_pages[w], ~mask, __ATOMIC_RELAXED);
+            }
+        });
+        return;
+    }
+    // The per-page update: the result, unless SOTC_SYNC_PIPE=2 (verify) is set.
     for (u64 page = address >> 12; page <= last; ++page) {
         u64* word = &context.clean_pages[page >> 6];
         const u64 bit = 1ULL << (page & 63);
@@ -133,6 +157,20 @@ void SetSrtReadProtectedPages(u64 address, u64 size, bool read_protected) {
         } else {
             __atomic_fetch_and(word, ~bit, __ATOMIC_RELAXED);
         }
+    }
+    if (SotcStats::kSyncPipeVerify) { // sotc: SOTC_SYNC_PIPE=2. The per-word masks must name
+        // exactly the pages the per-page loop touched: rebuild each word's mask bit by bit from
+        // the page range and compare (no shared memory read, so no race with other writers).
+        ForEachPageWordMask(address >> 12, last, [&](u64 w, u64 mask) {
+            u64 expected = 0;
+            for (u64 page = std::max(address >> 12, w << 6); page <= std::min(last, (w << 6) + 63);
+                 ++page) {
+                expected |= 1ULL << (page & 63);
+            }
+            if (expected != mask) {
+                SotcStats::SyncPipe::verify_mismatches.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
     }
 }
 
@@ -143,7 +181,10 @@ void MarkSrtCleanPages(u64 address, u32 size) {
     }
     for (u64 page = address >> 12; page <= (address + size - 1) >> 12; ++page) {
         if ((page << 12) < SrtCleanPageLimit) {
-            context.clean_pages[page >> 6] |= 1ULL << (page & 63);
+            // sotc: atomic, as in SetSrtReadProtectedPages: Protect clears bits of the same
+            // words from other threads, and a plain |= could write a cleared bit back.
+            __atomic_fetch_or(&context.clean_pages[page >> 6], 1ULL << (page & 63),
+                              __ATOMIC_RELAXED);
         }
     }
 }

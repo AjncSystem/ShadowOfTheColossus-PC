@@ -792,6 +792,16 @@ static bool IsPerfectMatch(const ImageInfo& cached, const ImageInfo& info, bool 
            (!exact_fmt || info.pixel_format == cached.pixel_format);
 }
 
+// sotc: SOTC_TEX_BLOCK. What FindImage (non-exact) returns through its perfect-match branch, and
+// whether that branch is the one that answers (the smaller-chain check of FindImage).
+bool TextureCache::IsPerfectFind(ImageId id, const ImageInfo& info) const {
+    if (!slot_images.is_allocated(id)) {
+        return false;
+    }
+    const ImageInfo& cached = slot_images[id].info;
+    return IsPerfectMatch(cached, info, false) && !(cached.resources < info.resources);
+}
+
 // sotc: the view of a mip-tail candidate, derived from its T# on every lookup (the second-pass
 // re-find must not shift it twice). In a tail the T#'s base mip is level 0 and min_lod moves
 // down with it; found as mip `view_mip` of a larger image, levels shift by what is left.

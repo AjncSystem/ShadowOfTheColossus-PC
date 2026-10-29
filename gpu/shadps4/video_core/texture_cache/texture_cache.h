@@ -367,6 +367,16 @@ public:
                (sampler_epoch.load(std::memory_order_acquire) * 0x9E3779B97F4A7C15ULL);
     }
 
+    /// sotc: SOTC_TEX_BLOCK. The generation of the guest address for FindImage's perfect-match memo
+    /// (MemoGeneration): it moves when an image is (un)registered at that address.
+    [[nodiscard]] u64 ImageAddrGeneration(VAddr address) const {
+        return MemoGeneration(address);
+    }
+    /// sotc: SOTC_TEX_BLOCK. True when `id` is what FindImage returns for `info` through a perfect
+    /// match (same address, size and format, not a smaller chain): the result then depends only on
+    /// the images registered at info.guest_address.
+    [[nodiscard]] bool IsPerfectFind(ImageId id, const ImageInfo& info) const;
+
     /// Frees cached images not used in the last few GC ticks (one per submit), regardless of
     /// memory thresholds. Called when a video memory allocation fails. Higher levels go deeper
     /// (sotc): level 0 frees up to 512 images last used 4 or more ticks ago, level 1 up to 4096

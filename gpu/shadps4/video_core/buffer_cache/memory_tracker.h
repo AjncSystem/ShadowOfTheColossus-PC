@@ -278,19 +278,31 @@ public:
         }
     }
 
-    /// Call 'func' for each CPU modified range and unmark those pages as CPU modified
-    void ForEachUploadRange(VAddr cpu_addr, u64 size, bool is_written, auto&& func) {
-        IteratePages<true>(
-            cpu_addr, size, [&func, is_written](RegionManager* manager, u64 offset, u64 size) {
-                if (is_written) {
-                    manager->template ForEachModifiedRange<Type::CPU, StateOp::Clear, StateOp::Set>(
-                        offset, size, func);
-                } else {
-                    manager
-                        ->template ForEachModifiedRange<Type::CPU, StateOp::Clear, StateOp::None>(
-                            offset, size, func);
-                }
-            });
+    /// Call 'func' for each CPU modified range and unmark those pages as CPU modified.
+    /// sotc: SOTC_SYNC_PIPE. Returns true when every tracking region of the range was clean at its
+    /// unlocked look (RegionManager::ForEachModifiedRange returned true for it). Then func was not
+    /// called and no bit changed, so the range was clean before this call: its verdict equals
+    /// IsSyncClean(cpu_addr, size, is_written) taken right after. False otherwise.
+    bool ForEachUploadRange(VAddr cpu_addr, u64 size, bool is_written, auto&& func) {
+        bool clean = size != 0; // sotc: IsSyncClean is false for an empty range, so is this
+        if (size == 0) {
+            return clean;
+        }
+        IteratePages<true>(cpu_addr, size,
+                           [&func, &clean, is_written](RegionManager* manager, u64 offset,
+                                                       u64 size) {
+                               bool region_clean;
+                               if (is_written) {
+                                   region_clean = manager->template ForEachModifiedRange<
+                                       Type::CPU, StateOp::Clear, StateOp::Set>(offset, size, func);
+                               } else {
+                                   region_clean = manager->template ForEachModifiedRange<
+                                       Type::CPU, StateOp::Clear, StateOp::None>(offset, size,
+                                                                                 func);
+                               }
+                               clean = clean && region_clean;
+                           });
+        return clean;
     }
 
     /// sotc: SOTC_SYNC_FAST. Sets gen to the sum of the write generations over [cpu_addr,

@@ -30,6 +30,7 @@
 #include "core/signals.h"
 #include "shader_recompiler/ir/passes/srt.h"
 #include "video_core/page_manager.h"
+#include "video_core/sotc_op_phases.h" // sotc: SOTC_OP_PHASES
 #include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -1002,6 +1003,8 @@ struct SignalImpl : public PageManager::Impl {
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
         RENDERER_TRACE;
         SotcTrace::NoteProtect(); // sotc: SOTC_TRACE (BindScope)
+        SotcStats::SyncPipe::NoteProtect(); // sotc: SOTC_SYNC_PIPE counters (inside BindResources)
+        SotcOpPhases::NoteProtect(size); // sotc: SOTC_OP_PHASES
         // sotc: SOTC_FPS: time spent in protect calls made while a guest fault is handled
         const SotcStats::FaultStat::Scope protect_timed{&SotcStats::FaultStat::Tl::protect_ns};
         auto* memory = Core::Memory::Instance();

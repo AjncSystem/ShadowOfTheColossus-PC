@@ -30,6 +30,22 @@ constexpr u64 ExpireNs = 2'000'000'000ULL;
 /// No prefetch while the reported video memory use is above this share of the budget (permille):
 /// the collector and the over-budget path of UniqueImage::Create keep that case.
 constexpr u64 BudgetPermille = 900;
+
+/// sotc: SOTC_IMAGE_PREFETCH_MAX=<n> (read once): outstanding prefetches allowed, instead of
+/// MaxEntries (1-4096). The byte cap grows in the same proportion as MaxBytes.
+size_t MaxEntriesLimit() {
+    static const size_t limit = [] {
+        const char* v = std::getenv("SOTC_IMAGE_PREFETCH_MAX");
+        const u64 n = v ? std::strtoull(v, nullptr, 10) : 0;
+        return n == 0 ? MaxEntries : size_t(std::clamp<u64>(n, 1, 4096));
+    }();
+    return limit;
+}
+u64 MaxBytesLimit() {
+    // sotc: at most 4x the default byte cap, also when the VRAM budget is unknown (budget 0, where
+    // Request applies no budget/16 cap)
+    return std::min<u64>(MaxBytes * MaxEntriesLimit() / MaxEntries, MaxBytes * 4);
+}
 } // namespace
 
 bool AsyncImageCreateEnabled() {
@@ -125,10 +141,11 @@ bool ImagePrefetcher::Request(const vk::ImageCreateInfo& image_ci, u64 size_hint
         return false;
     }
     // sotc: at most 1/16 of the budget ahead (256 MiB on a 4 GB card), and never over MaxBytes.
-    const u64 max_bytes = budget != 0 ? std::min(MaxBytes, budget / 16) : MaxBytes;
+    const u64 max_bytes = budget != 0 ? std::min(MaxBytesLimit(), budget / 16) : MaxBytesLimit();
     {
         std::scoped_lock lk{mutex};
-        if (stopping || entries.size() >= MaxEntries || outstanding_bytes + size_hint > max_bytes) {
+        if (stopping || entries.size() >= MaxEntriesLimit() ||
+            outstanding_bytes + size_hint > max_bytes) {
             SotcStats::async_image_skipped.fetch_add(1, std::memory_order_relaxed);
             return false;
         }

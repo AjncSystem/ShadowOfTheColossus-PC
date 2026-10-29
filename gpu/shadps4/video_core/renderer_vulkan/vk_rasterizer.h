@@ -88,6 +88,9 @@ public:
     /// for several callers.
     void PrepareDraw(const AmdGpu::Regs& regs, const Pipeline* pipeline, bool is_indexed,
                      bool direct, PreparedDraw& out) const;
+    /// sotc: SOTC_PR_RESOLVE. Called at the end of PrepareDraw on a GpuPrep thread: the
+    /// PreparedResources of a graphics draw (draw_prep.h). Resets everything it writes.
+    void PrepareResources(const GraphicsPipeline* pipeline, PreparedResources& out) const;
     void PrefetchImagesShared(const Pipeline* pipeline);
     /// sotc: SOTC_PARALLEL_RECORD: moves on every MapMemory / UnmapMemory (a prepared draw is
     /// used only while it stands still).
@@ -216,9 +219,13 @@ private:
     bool ReuseShadowCascade();
     std::unique_ptr<class ShadowScroll> shadow_scroll;
 
+    /// sotc: SOTC_PR_RESOLVE: pr / pr_stage (both or neither) are the prepared entries of this
+    /// stage; a descriptor they do not cover is resolved inline.
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
-                     Shader::PushData& push_data, u32 set);
-    void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding, u32 set);
+                     Shader::PushData& push_data, u32 set,
+                     const PreparedResources* pr = nullptr, const PrStage* pr_stage = nullptr);
+    void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding, u32 set,
+                      const PreparedResources* pr = nullptr, const PrStage* pr_stage = nullptr);
     bool BindResources(const Pipeline* pipeline, const PreparedDraw* prepared = nullptr);
     bool FastBindEligible(const Pipeline* pipeline) const;
     bool FastBindStatic(const Pipeline* pipeline, const AmdGpu::Regs& regs) const;
@@ -628,6 +635,9 @@ private:
     std::atomic<u64> map_epoch{0};
     std::mutex prep_prefetch_mutex;
     u64 pr_verify_count{};
+    /// sotc: SOTC_PR_RESOLVE + SOTC_PR_VERIFY: the current draw's prepared resources differ from
+    /// the inline ones (set by CheckPrepared); BindResources then resolves inline.
+    bool pr_verify_off{};
 
     /// sotc: DLSS super resolution draws the game's UI layer at the output size: each draw into
     /// it (Dlssg::UiTarget) is drawn again into ui_shadow with its viewport and scissor scaled,

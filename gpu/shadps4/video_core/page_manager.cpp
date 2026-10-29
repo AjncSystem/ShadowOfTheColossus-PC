@@ -294,7 +294,9 @@ bool OsCostFaultHandler(void*, void* address) {
     // Entry of bbgpu_handle_fault when SOTC_FPS timed it (the dispatch that got here is part of
     // what the operating system and the loader add to a fault).
     const auto& tl = SotcStats::FaultStat::tl;
-    g_oscost_enter_ns.store(tl.active ? tl.t0 : SotcStats::NowNs(), std::memory_order_relaxed);
+    // sotc: SOTC_FPS_LEAN leaves t0 at 0 (the fault is not timed): take the clock here instead.
+    g_oscost_enter_ns.store(tl.active && tl.t0 ? tl.t0 : SotcStats::NowNs(),
+                            std::memory_order_relaxed);
 #ifdef _WIN64
     DWORD old{};
     VirtualProtect(reinterpret_cast<void*>(page), 4096, PAGE_READWRITE, &old);
@@ -999,6 +1001,7 @@ struct SignalImpl : public PageManager::Impl {
 
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
         RENDERER_TRACE;
+        SotcTrace::NoteProtect(); // sotc: SOTC_TRACE (BindScope)
         // sotc: SOTC_FPS: time spent in protect calls made while a guest fault is handled
         const SotcStats::FaultStat::Scope protect_timed{&SotcStats::FaultStat::Tl::protect_ns};
         auto* memory = Core::Memory::Instance();

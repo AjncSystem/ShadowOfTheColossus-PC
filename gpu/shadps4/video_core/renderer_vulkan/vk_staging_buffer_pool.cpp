@@ -9,6 +9,7 @@
 #include "common/assert.h"
 #include "common/types.h"
 #include "core/devtools/widget/gpu_memory.h"
+#include "video_core/buffer_cache/async_upload.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -74,6 +75,34 @@ StagingBufferRef StagingBufferPool::Request(u64 size, MemoryType type, u64 align
         return RequestLarge(size, type, deferred, unsynchronized);
     }
     return RequestFromRing(ring, size, alignment, type, unsynchronized);
+}
+
+MemoryType StagingBufferPool::AsyncCopyType() const {
+    // sotc: SOTC_ASYNC_STAGE_CACHED=1 (AsyncUpload::StageCached). Without a host cached memory
+    // type the copies keep the write-combined HostUncached.
+    if (!VideoCore::AsyncUpload::StageCached()) {
+        return MemoryType::HostUncached;
+    }
+    // sotc: with SOTC_REBAR_UPLOAD the HostUncached staging moves to the BAR heap (written by the
+    // CPU, read by the GPU from its own memory); a cached type would silently leave it in system
+    // RAM. The BAR placement wins: the switch is ignored then (one log line).
+    if (instance.RebarUploadEnabled()) {
+        static bool reported = false;
+        if (!std::exchange(reported, true)) {
+            std::fputs("SOTC_ASYNC_STAGE_CACHED ignored: SOTC_REBAR_UPLOAD is on", stderr);
+            std::fputc('\n', stderr);
+        }
+        return MemoryType::HostUncached;
+    }
+    const vk::MemoryPropertyFlags wanted =
+        vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCached;
+    const auto& props = instance.GetMemoryProperties();
+    for (u32 i = 0; i < props.memoryTypeCount; ++i) {
+        if ((props.memoryTypes[i].propertyFlags & wanted) == wanted) {
+            return MemoryType::HostCached;
+        }
+    }
+    return MemoryType::HostUncached;
 }
 
 StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 alignment,

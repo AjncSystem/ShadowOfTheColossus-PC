@@ -27,6 +27,7 @@
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/sotc_stats.h" // sotc: SOTC_FPS submit gate accounting
+#include "video_core/sotc_trace.h"  // sotc: SOTC_TRACE
 
 extern Frontend::WindowSDL* g_window;
 std::unique_ptr<Vulkan::Presenter> presenter;
@@ -2373,6 +2374,8 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffers(u32 count, u32* dcb_gpu_addrs
 s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     u32 workload, u32 count, u32* dcb_gpu_addrs[], u32* dcb_sizes_in_bytes, u32* ccb_gpu_addrs[],
     u32* ccb_sizes_in_bytes, u32 vo_handle, u32 buf_idx, u32 flip_mode, s64 flip_arg) {
+    const SotcTrace::Scope sotc_trace{"gnm submit+flip", count,
+                                      reinterpret_cast<u64>(__builtin_return_address(0))};
     LOG_DEBUG(Lib_GnmDriver, "called [buf = {}]", buf_idx);
 
     if (count != 0) {
@@ -2429,6 +2432,8 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
                                                        const u32* ccb_gpu_addrs[],
                                                        u32* ccb_sizes_in_bytes) {
     HLE_TRACE;
+    const SotcTrace::Scope sotc_trace{"gnm submit", count,
+                                      reinterpret_cast<u64>(__builtin_return_address(0))};
     LOG_DEBUG(Lib_GnmDriver, "called");
 
     if (!dcb_gpu_addrs || !dcb_sizes_in_bytes) {
@@ -2469,6 +2474,8 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_gpu_addrs[
 
 s32 PS4_SYSV_ABI sceGnmSubmitDone() {
     HLE_TRACE;
+    const SotcTrace::Scope sotc_trace{"gnm submit done", 0,
+                                      reinterpret_cast<u64>(__builtin_return_address(0))};
     LOG_DEBUG(Lib_GnmDriver, "called");
     std::scoped_lock lk{m_submit_lock};
     GateWait(2); // sotc: SOTC_CP_AHEAD (WaitGpuIdle unless =2), SOTC_FPS accounting

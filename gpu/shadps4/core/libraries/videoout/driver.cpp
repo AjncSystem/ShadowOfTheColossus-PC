@@ -12,6 +12,16 @@
 #include <thread>
 #include <vector>
 #include <cstring>
+// sotc: SOTC_UNTRACK_LOG reads guest memory after a VirtualQuery check (UntrackRead).
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -29,6 +39,7 @@
 #include "video_core/sotc_fps_cap.h"
 #include "video_core/sotc_adaptive.h"
 #include "video_core/sotc_event.h"
+#include "video_core/buffer_cache/hrr.h"
 #include "video_core/buffer_cache/region_manager.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/sotc_write_extent.h"
@@ -63,6 +74,181 @@ static bool EarlyVoLabel() {
         return !v || std::strcmp(v, "0") != 0;
     }();
     return on;
+}
+
+// sotc: SOTC_IMAGE_BASE=<hex host address of the eboot image> (the port does not pass it to the
+// GPU library, so it is set by hand; the log prints it back). Read at the SOTC FPS report only.
+static u64 UntrackImageBase() {
+    // sotc: the loader reports the image to the GPU library (bbgpu_trace_image, kept by
+    // SotcTrace for every session); SOTC_IMAGE_BASE=<hex> overrides it.
+    static const u64 env_base = [] {
+        const char* v = std::getenv("SOTC_IMAGE_BASE");
+        return v ? static_cast<u64>(std::strtoull(v, nullptr, 16)) : 0ULL;
+    }();
+    return env_base ? env_base : SotcTrace::ImageBase();
+}
+
+// sotc: reads size bytes of guest memory at addr, or returns false without touching it. The
+// address must be a 31-bit host address (the image and the game's heaps are below 2 GiB, the
+// game stores 31-bit pointers), and the whole read must be committed, readable and inside one
+// VirtualQuery region. A concurrent unmap could still race the copy; the engine does not unmap
+// these heaps, and the log is a diagnostic only (SOTC_UNTRACK_LOG). Not Windows: always false.
+static bool UntrackRead(u64 addr, void* out, size_t size) {
+#ifdef _WIN32
+    if (addr < 0x10000ULL || addr + size > 0x80000000ULL) {
+        return false;
+    }
+    const auto* ptr = reinterpret_cast<const void*>(static_cast<uintptr_t>(addr));
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(ptr, &info, sizeof(info)) == 0 || info.State != MEM_COMMIT ||
+        (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+        return false;
+    }
+    const uintptr_t region_end = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+    if (addr + size > region_end) {
+        return false;
+    }
+    std::memcpy(out, ptr, size);
+    return true;
+#else
+    (void)addr;
+    (void)out;
+    (void)size;
+    return false;
+#endif
+}
+
+// sotc: SOTC_UNTRACK_LOG. The chunk list of the RenderSingleFrameGPU parent allocator, as an eboot
+// offset walk: id (u32) at 0x2ed1f54 picks a heap object from the table at 0x2dfaab0; its parent
+// (+0x80) must equal the pointer at 0x2dfb2b8. The chunk list head is parent+0x48, with the
+// sentinel at parent+0x38. Each node: base at +0x60, size at +0x58, next at +0 (not verified: the
+// first nodes also print +8, so the right link can be told apart). One line is written only when
+// the list changes, so the report stays short.
+static void UntrackLogChunks(u64 image, std::string& report) {
+    static std::string last;
+    static bool printed_links = false;
+    u32 id = 0;
+    u64 heap = 0;
+    u64 parent = 0;
+    u64 expected = 0;
+    if (!UntrackRead(image + 0x2ed1f54, &id, sizeof(id)) || id >= 4096 ||
+        !UntrackRead(image + 0x2dfaab0 + 8ULL * id, &heap, sizeof(heap)) ||
+        !UntrackRead(heap + 0x80, &parent, sizeof(parent)) ||
+        !UntrackRead(image + 0x2dfb2b8, &expected, sizeof(expected))) {
+        ReportPrintf(report, "SOTC untrack: heap table not readable (id %u, base %llx)\n", id,
+                     static_cast<unsigned long long>(image));
+        return;
+    }
+    if (parent != expected) {
+        ReportPrintf(report, "SOTC untrack: parent %llx is not the expected %llx (id %u)\n",
+                     static_cast<unsigned long long>(parent),
+                     static_cast<unsigned long long>(expected), id);
+        return;
+    }
+    const u64 head = parent + 0x38;
+    u64 node = 0;
+    if (!UntrackRead(parent + 0x48, &node, sizeof(node))) {
+        ReportPrintf(report, "SOTC untrack: chunk list head not readable\n");
+        return;
+    }
+    std::string chunks;
+    int count = 0;
+    while (node != head && count < 64) {
+        u64 base = 0;
+        u64 size = 0;
+        if (!UntrackRead(node + 0x60, &base, sizeof(base)) ||
+            !UntrackRead(node + 0x58, &size, sizeof(size))) {
+            break;
+        }
+        u64 next0 = 0;
+        u64 next8 = 0;
+        UntrackRead(node, &next0, sizeof(next0));
+        UntrackRead(node + 8, &next8, sizeof(next8));
+        if (!printed_links && count < 4) {
+            ReportPrintf(report, "SOTC untrack link probe: node %llx next+0 %llx next+8 %llx\n",
+                         static_cast<unsigned long long>(node),
+                         static_cast<unsigned long long>(next0),
+                         static_cast<unsigned long long>(next8));
+        }
+        char item[48];
+        std::snprintf(item, sizeof(item), " %llx:%llx", static_cast<unsigned long long>(base),
+                      static_cast<unsigned long long>(size));
+        chunks += item;
+        node = next0;
+        ++count;
+    }
+    if (count > 0) {
+        printed_links = true;
+    }
+    char summary[96];
+    std::snprintf(summary, sizeof(summary), "SOTC untrack chunks: %d nodes%s:", count,
+                  node == head ? "" : " (walk cut)");
+    const std::string line = std::string(summary) + chunks + "\n";
+    if (line != last) {
+        last = line;
+        ReportPrintf(report, "%s", line.c_str());
+    }
+}
+
+// sotc: SOTC_UNTRACK_AUTO. The chunk list of UntrackLogChunks as ranges. False when a read fails,
+// the list does not end at the sentinel within 64 nodes, or a node is not a sane chunk (64 KiB
+// aligned, below 2 GiB, at most one 32 MiB chunk). The next pointer at +0 is not verified on the
+// game: a wrong link makes the walk fail, which publishes nothing.
+static bool UntrackAutoOneWalk(u64 parent, std::vector<VideoCore::SotcUntrack::Range>& out) {
+    const u64 head = parent + 0x38;
+    out.clear();
+    u64 node = 0;
+    if (!UntrackRead(parent + 0x48, &node, sizeof(node))) {
+        return false;
+    }
+    for (int n = 0; node != head && n < 64; ++n) {
+        u64 base = 0;
+        u64 size = 0;
+        u64 next = 0;
+        if (!UntrackRead(node + 0x60, &base, sizeof(base)) ||
+            !UntrackRead(node + 0x58, &size, sizeof(size)) ||
+            !UntrackRead(node, &next, sizeof(next))) {
+            return false;
+        }
+        if (base >= 0x80000000ULL || (base & 0xFFFFULL) != 0 || size == 0 ||
+            size > (32ULL << 20) || base + size > 0x80000000ULL) {
+            return false;
+        }
+        out.push_back(VideoCore::SotcUntrack::Range{base, size});
+        node = next;
+    }
+    return node == head;
+}
+
+// sotc: SOTC_UNTRACK_AUTO. The live chunks of the RenderSingleFrameGPU heap, read twice; false
+// unless both walks succeed and agree (a list changing during the walk is dropped).
+static bool UntrackAutoWalk(u64 image, std::vector<VideoCore::SotcUntrack::Range>& out) {
+    u32 id = 0;
+    u64 heap = 0;
+    u64 parent = 0;
+    u64 expected = 0;
+    if (!UntrackRead(image + 0x2ed1f54, &id, sizeof(id)) || id >= 4096 ||
+        !UntrackRead(image + 0x2dfaab0 + 8ULL * id, &heap, sizeof(heap)) ||
+        !UntrackRead(heap + 0x80, &parent, sizeof(parent)) ||
+        !UntrackRead(image + 0x2dfb2b8, &expected, sizeof(expected)) || parent != expected) {
+        return false;
+    }
+    std::vector<VideoCore::SotcUntrack::Range> second;
+    return UntrackAutoOneWalk(parent, out) && UntrackAutoOneWalk(parent, second) && out == second;
+}
+
+// sotc: SOTC_UNTRACK_AUTO. Every 30 flips the flip thread publishes the chunk list (only when
+// SOTC_CP_AHEAD is unset, see SotcUntrack::AutoOn). It touches no region: the draw thread applies it.
+static void UntrackAutoTick() {
+    static u32 flips = 0;
+    if (!VideoCore::SotcUntrack::AutoOn() || ++flips % 30 != 0) {
+        return;
+    }
+    const u64 image = UntrackImageBase();
+    std::vector<VideoCore::SotcUntrack::Range> live;
+    if (image != 0 && UntrackAutoWalk(image, live)) {
+        VideoCore::SotcUntrack::Publish(std::move(live));
+    }
 }
 
 constexpr static bool Is32BppPixelFormat(PixelFormat format) {
@@ -356,6 +542,7 @@ void VideoOutDriver::Flip(const Request& req) {
         presenter->Present(frame);
     });
     SotcStats::flip_count.fetch_add(1, std::memory_order_relaxed);
+    UntrackAutoTick(); // sotc: SOTC_UNTRACK_AUTO (every 30 flips)
     {
         // sotc: a performance line in the event log every minute (average FPS, frames slower
         // than 50 ms, the slowest, video memory in use).
@@ -681,7 +868,7 @@ void VideoOutDriver::Flip(const Request& req) {
                     ReportPrintf(report,
                                  "SOTC HRR: ranges %llu (KiB %llu), faults %llu (no wait %llu, "
                                  "waited %llu, avg rb now %.0f us), demotions %llu, import "
-                                 "failures %llu (dry run: nothing is promoted)\n",
+                                 "failures %llu (%s)\n",
                                  static_cast<unsigned long long>(
                                      SotcStats::hrr_ranges.load(std::memory_order_relaxed)),
                                  static_cast<unsigned long long>(
@@ -695,7 +882,76 @@ void VideoOutDriver::Flip(const Request& req) {
                                  static_cast<unsigned long long>(
                                      SotcStats::hrr_demotions.exchange(0)),
                                  static_cast<unsigned long long>(
-                                     SotcStats::hrr_import_fail.exchange(0)));
+                                     SotcStats::hrr_import_fail.exchange(0)),
+                                 VideoCore::HostResidentRanges::Real()
+                                     ? "promotion on"
+                                     : "dry run: nothing is promoted");
+                    // sotc: SOTC_HRR=1 (buffer_cache/hrr.h): host-visible arena memory now, granules
+                    // migrated to it, and readbacks served from it without a copy. Only with the
+                    // real promotion (Real()), not for the dry run or a device without the memory.
+                    if (VideoCore::HostResidentRanges::Real()) {
+                        ReportPrintf(
+                            report,
+                            "SOTC HRR host: host MiB %.1f, migrated %llu (MiB %.1f, failed %llu), "
+                            "direct readbacks %llu (KiB %llu)\n",
+                            SotcStats::hrr_host_bytes.load(std::memory_order_relaxed) / 1048576.0,
+                            static_cast<unsigned long long>(
+                                SotcStats::hrr_migrated.load(std::memory_order_relaxed)),
+                            SotcStats::hrr_migrated_bytes.load(std::memory_order_relaxed) /
+                                1048576.0,
+                            static_cast<unsigned long long>(
+                                SotcStats::hrr_migrate_failed.load(std::memory_order_relaxed)),
+                            static_cast<unsigned long long>(
+                                SotcStats::hrr_direct_readbacks.load(std::memory_order_relaxed)),
+                            static_cast<unsigned long long>(
+                                SotcStats::hrr_direct_bytes.load(std::memory_order_relaxed) / 1024));
+                    }
+                }
+                // sotc: SOTC_UNTRACK_LOG=1 (off by default): the RenderSingleFrameGPU chunk list
+                // (UntrackLogChunks) and the pages SOTC_UNTRACK_RANGES kept. Only with SOTC_FPS.
+                {
+                    static const bool untrack_log = [] {
+                        const char* v = std::getenv("SOTC_UNTRACK_LOG");
+                        return v && v[0] == '1';
+                    }();
+                    if (untrack_log) {
+                        static bool base_shown = false;
+                        const u64 image = UntrackImageBase();
+                        if (!image) {
+                            if (!base_shown) {
+                                ReportPrintf(report, "SOTC untrack: image base unknown (SOTC_IMAGE_BASE=<hex> sets it) for the chunk log\n");
+                            }
+                        } else {
+                            if (!base_shown) {
+                                ReportPrintf(report, "SOTC untrack: image base %llx\n",
+                                             static_cast<unsigned long long>(image));
+                            }
+                            UntrackLogChunks(image, report);
+                        }
+                        base_shown = true;
+                        if (!VideoCore::SotcUntrack::Ranges().empty()) {
+                            ReportPrintf(report, "SOTC untrack: %llu pages kept (uploads that kept the CPU bit)\n",
+                                         static_cast<unsigned long long>(VideoCore::SotcUntrack::PagesKept()));
+                        }
+                    }
+                }
+                // sotc: SOTC_UNTRACK_AUTO (off by default): the published chunk list, the pages it
+                // kept per second (the SOTC_UNTRACK_LOG counter) and the self-check faults.
+                if (VideoCore::SotcUntrack::AutoOn()) {
+                    static u64 kept_seen = 0;
+                    const u64 kept = VideoCore::SotcUntrack::PagesKept();
+                    ReportPrintf(report,
+                                 "SOTC untrack auto: %zu ranges, %.1f MiB untracked, %.0f pages "
+                                 "kept/s, self-check faults %llu%s\n",
+                                 VideoCore::SotcUntrack::AutoRanges(),
+                                 VideoCore::SotcUntrack::AutoBytes() / 1048576.0,
+                                 (kept - kept_seen) / seconds,
+                                 static_cast<unsigned long long>(
+                                     VideoCore::SotcUntrack::FaultsUntracked()),
+                                 VideoCore::SotcUntrack::Tripped()
+                                     ? " (tripped: untracked pages released)"
+                                     : "");
+                    kept_seen = kept;
                 }
                 // sotc: SOTC_RB_PREFETCH (BufferCache::PrefetchIssue). The wait saved is an
                 // estimate: consumed prefetches times this period's average guest readback wait.

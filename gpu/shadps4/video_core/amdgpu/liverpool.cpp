@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <utility>
+#include <cstdio>  // sotc: SOTC_OPSTAT
 #include <cstdlib>
 #include <deque>
 #include <mutex>
@@ -117,6 +118,16 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
     // sotc: SOTC_WAIT_NOSPIN=1: BackLoop spins ~20 us, then blocks on back_wake (off by default).
     const char* nospin = std::getenv("SOTC_WAIT_NOSPIN");
     back_nospin = nospin && nospin[0] == '1';
+    // sotc: SOTC_BACK_HEAD_CACHE, SOTC_BACK_PF, SOTC_REG_SAME and SOTC_OPSTAT, all off by default
+    // (see the switches in liverpool.h). Read here, before any thread starts.
+    const auto sotc_switch = [](const char* name) {
+        const char* v = std::getenv(name);
+        return v && v[0] == '1';
+    };
+    back_head_cache = back_threaded && sotc_switch("SOTC_BACK_HEAD_CACHE");
+    back_pf = back_threaded && sotc_switch("SOTC_BACK_PF");
+    reg_same = back_threaded && sotc_switch("SOTC_REG_SAME");
+    opstat = back_threaded && sotc_switch("SOTC_OPSTAT");
     // sotc: SOTC_WD_FUSE=1 (off by default; needs the draw thread): small WRITE_DATA packets ride
     // along with the next indirect draw instead of being queued as functions. SOTC_INLINE_FUNC=1
     // (also set by SOTC_WD_FUSE) keeps small closures of the op ring out of the heap.
@@ -271,6 +282,131 @@ static inline void CpuRelax() {
 #endif
 }
 
+// sotc: SOTC_OPSTAT=1 (off by default): counters of the back ring, printed every 5 s by the draw
+// thread (OpStatTick) as one "SOTC OPSTAT" line on stderr. Each counter has one writer thread, so
+// an update is a relaxed load and store (no read-modify-write). The draw thread keeps the snapshot
+// it prints the change against.
+namespace {
+enum OpStatIdx : u32 {
+    OsKind = 0,  // 5 slots: BackOp::Kind (draw thread)
+    OsFunc = 5,  // 4 slots: func_kind, 0 write data, 1 EOP/EOS/release, 2 DMA, 3 other
+    OsOps = 9,   // ops ExecuteBackOp ran (draw thread)
+    OsRegChunks, // register chunks copied into the ops (command processor, summed per op)
+    OsCpDirty,   // dirty chunks BackAlloc copied (command processor)
+    OsRegWrites, // writes at the WriteRegsMarked sites (command processor)
+    OsRegSame,   // of which the words were unchanged
+    OsStages,    // shader stages per op
+    OsFlat,      // flattened user-data dwords per op
+    OsPreNs,     // draw thread: ExecuteBackOp before its switch, ns
+    OsBodyNs,    // draw thread: the switch (the op's own work), ns
+    OsCount,
+};
+std::atomic<u64> g_opstat[OsCount]{};
+u64 g_opstat_last[OsCount]{}; // draw thread only: values at the start of the window
+u64 g_opstat_last_ns{};       // draw thread only
+u64 g_opstat_last_frame{};    // draw thread only
+u32 g_opstat_tick{};          // draw thread only
+
+inline void OpStatAdd(u32 idx, u64 n) {
+    std::atomic<u64>& counter = g_opstat[idx];
+    counter.store(counter.load(std::memory_order_relaxed) + n, std::memory_order_relaxed);
+}
+
+/// Draw thread, after each op while SOTC_OPSTAT is on. Reads the clock once per 256 ops.
+void OpStatTick() {
+    if ((++g_opstat_tick & 255) != 0) {
+        return;
+    }
+    const u64 now = SotcStats::NowNs();
+    const u64 frames = SotcStats::cp_frame.load(std::memory_order_relaxed);
+    u64 cur[OsCount];
+    for (u32 i = 0; i < OsCount; ++i) {
+        cur[i] = g_opstat[i].load(std::memory_order_relaxed);
+    }
+    if (g_opstat_last_ns == 0) { // the first window starts now
+        g_opstat_last_ns = now;
+        g_opstat_last_frame = frames;
+        std::copy(cur, cur + OsCount, g_opstat_last);
+        return;
+    }
+    if (now - g_opstat_last_ns < 5'000'000'000ULL) {
+        return;
+    }
+    u64 d[OsCount];
+    for (u32 i = 0; i < OsCount; ++i) {
+        d[i] = cur[i] - g_opstat_last[i];
+    }
+    const u64 df = frames - g_opstat_last_frame;
+    const u64 ops = d[OsOps];
+    const auto per_op = [ops](u64 v) {
+        return ops ? static_cast<double>(v) / static_cast<double>(ops) : 0.0;
+    };
+    const u64 func = d[OsFunc] + d[OsFunc + 1] + d[OsFunc + 2] + d[OsFunc + 3];
+    const double window_s = static_cast<double>(now - g_opstat_last_ns) / 1e9;
+    std::fprintf(
+        stderr,
+        "SOTC OPSTAT window=%.1fs frames=%llu ops=%llu ops/frame=%.1f kind[draw=%llu indirect=%llu "
+        "dispatch=%llu dispatch_indirect=%llu] func=%llu [wd=%llu eop=%llu dma=%llu other=%llu] "
+        "reg_chunks/op=%.2f cp_dirty/op=%.2f reg_writes=%llu reg_same=%llu (%.1f%%) "
+        "stages/op=%.2f flat_dwords/op=%.1f exec_pre_ns/op=%.0f body_ns/op=%.0f "
+        "sizeof(BackOp)=%llu sizeof(PreparedDraw)=%llu\n",
+        window_s, static_cast<unsigned long long>(df), static_cast<unsigned long long>(ops),
+        df ? static_cast<double>(ops) / static_cast<double>(df) : 0.0,
+        static_cast<unsigned long long>(d[OsKind + 1]),
+        static_cast<unsigned long long>(d[OsKind + 2]),
+        static_cast<unsigned long long>(d[OsKind + 3]),
+        static_cast<unsigned long long>(d[OsKind + 4]), static_cast<unsigned long long>(func),
+        static_cast<unsigned long long>(d[OsFunc]), static_cast<unsigned long long>(d[OsFunc + 1]),
+        static_cast<unsigned long long>(d[OsFunc + 2]),
+        static_cast<unsigned long long>(d[OsFunc + 3]), per_op(d[OsRegChunks]),
+        per_op(d[OsCpDirty]), static_cast<unsigned long long>(d[OsRegWrites]),
+        static_cast<unsigned long long>(d[OsRegSame]),
+        d[OsRegWrites] ? 100.0 * static_cast<double>(d[OsRegSame]) / static_cast<double>(d[OsRegWrites])
+                       : 0.0,
+        per_op(d[OsStages]), per_op(d[OsFlat]), per_op(d[OsPreNs]), per_op(d[OsBodyNs]),
+        static_cast<unsigned long long>(Liverpool::BackOpSize()),
+        static_cast<unsigned long long>(sizeof(Vulkan::PreparedDraw)));
+    g_opstat_last_ns = now;
+    g_opstat_last_frame = frames;
+    std::copy(cur, cur + OsCount, g_opstat_last);
+}
+} // namespace
+
+// sotc: SOTC_REG_SAME=1 (off by default). Why skipping an unchanged write is safe. Invariant I: a
+// chunk that is not in dirty_list has regs == the value the last op carrying it copied into
+// back_regs (and into prep_regs). It holds at the start, where all three are zero. It is kept because BackAlloc copies every dirty chunk into the op and
+// clears its bit, the draw thread (and PrepLoop) copy every chunk of an op into back_regs (and
+// prep_regs), and every change of regs marks the chunks it touches (MarkRegs), so a changed chunk
+// stays dirty until the next BackAlloc. A write that leaves all its words unchanged changes no
+// chunk, so skipping its mark keeps I. A write that changes a word still marks, as before. No
+// consumer needs a mark for an unchanged value: dirty_list is read only by BackAlloc, and the
+// XP lane reads only the chunks of the ops (reg_chunks), which come from dirty_list.
+void Liverpool::WriteRegsMarked(u32 dst, const void* src, u32 dwords) {
+    const size_t bytes = dwords * sizeof(u32);
+    if (!reg_same && !opstat) {
+        std::memcpy(&regs.reg_array[dst], src, bytes);
+        MarkRegs(dst, dwords);
+        return;
+    }
+    const bool same = std::memcmp(&regs.reg_array[dst], src, bytes) == 0;
+    if (opstat) {
+        OpStatAdd(OsRegWrites, 1);
+        OpStatAdd(OsRegSame, same ? 1 : 0);
+    }
+    if (reg_same && same) {
+        return;
+    }
+    std::memcpy(&regs.reg_array[dst], src, bytes);
+    MarkRegs(dst, dwords);
+}
+
+// sotc: SOTC_TRACE: the draw thread's back ops (short ones merged, see SotcTrace::OpBatch).
+static thread_local SotcTrace::OpBatch tl_op_batch;
+
+std::size_t Liverpool::BackOpSize() noexcept {
+    return sizeof(BackOp);
+}
+
 void Liverpool::BackLoop(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuDraw");
     VideoCore::BufferCache::SetDrawThread(std::this_thread::get_id()); // sotc: SOTC_RB_EXACT
@@ -291,7 +427,17 @@ void Liverpool::BackLoop(std::stop_token stoken) {
         if (eop_poll && eop_outstanding.load(std::memory_order_acquire) != 0) {
             EopService();
         }
-        if (back_head.load(std::memory_order_acquire) == tail) {
+        // sotc: SOTC_BACK_HEAD_CACHE=1 (off by default). Proof: back_head only grows, and every op
+        // below it is published (BackPublish stores the head after the op's writes, seq_cst). An
+        // older head therefore only delays the draw thread's view of new ops, and the acquire load
+        // that produced it already gives the happens-before the op's writes need. Only an empty
+        // view reloads, so the idle path below always decides on the real head.
+        u64 head_seen = back_head_cache ? draw_known_head : back_head.load(std::memory_order_acquire);
+        if (back_head_cache && head_seen == tail) {
+            head_seen = back_head.load(std::memory_order_acquire);
+            draw_known_head = head_seen;
+        }
+        if (head_seen == tail) {
             if (eop_poll && eop_outstanding.load(std::memory_order_acquire) != 0) {
                 // sotc: SOTC_EOP_TICK: a label is waiting for the GPU, so poll instead of
                 // blocking on back_cv or back_wake, which nothing signals when the GPU finishes.
@@ -299,14 +445,24 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                 std::this_thread::sleep_for(std::chrono::microseconds{rbx ? 30 : 200});
                 continue;
             }
-            const u64 idle_start = SotcStats::NowNs();
+            // sotc: SOTC_FPS_LEAN: the idle time is read only for the reports and the trace.
+            const bool idle_timed = SotcStats::kFpsTimers || SotcTrace::kOn;
+            const u64 idle_start = idle_timed ? SotcStats::NowNs() : 0;
+            if (SotcTrace::kOn) {
+                tl_op_batch.Flush(); // sotc: SOTC_TRACE: the ops before the idle time
+            }
             struct IdleTime {
                 u64 start;
+                bool timed;
                 ~IdleTime() {
-                    SotcStats::draw_idle_ns.fetch_add(SotcStats::NowNs() - start,
-                                                      std::memory_order_relaxed);
+                    if (!timed) {
+                        return;
+                    }
+                    const u64 now = SotcStats::NowNs();
+                    SotcStats::draw_idle_ns.fetch_add(now - start, std::memory_order_relaxed);
+                    SotcTrace::Span("draw idle", start, now); // sotc: SOTC_TRACE
                 }
-            } idle_time{idle_start};
+            } idle_time{idle_start, idle_timed};
             if (back_nospin) {
                 // sotc: spin ~20 us, then block until back_wake changes. The snapshot is taken
                 // before the checks, and every producer changes the checked state before bumping.
@@ -370,10 +526,23 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                 _mm_prefetch(next + line * 64, _MM_HINT_T0);
             }
         }
+        // sotc: SOTC_BACK_PF=1 (off by default). A hint only. The read of the slot is race-free:
+        // tail + 1 < draw_known_head (SOTC_BACK_HEAD_CACHE) means the command processor published
+        // that op and does not reuse its slot before the draw thread passes it. Without
+        // SOTC_BACK_HEAD_CACHE draw_known_head stays 0 and this never runs.
+        if (back_pf && tail + 1 < draw_known_head) {
+            const BackOp& next = back_ring[(tail + 1) % BackRingSize];
+            const char* rc = reinterpret_cast<const char*>(next.reg_chunks.data());
+            const size_t bytes = std::min<size_t>(next.reg_chunks.size() * sizeof(u32), 2048);
+            for (size_t off = 0; off < bytes; off += 64) {
+                _mm_prefetch(rc + off, _MM_HINT_T0);
+            }
+            _mm_prefetch(reinterpret_cast<const char*>(&next), _MM_HINT_T0);
+        }
         const bool func_op = op.kind == BackOp::Kind::Func || op.wd.num_segs != 0;
         if (op.xp_done) {
             XpReplayState(op); // sotc: SOTC_CULL_EXPRESS: ran ahead, only its state is replayed
-        } else if (SotcStats::kFpsLog && op.kind == BackOp::Kind::Func && op.func) {
+        } else if (SotcStats::kFpsTimers && op.kind == BackOp::Kind::Func && op.func) { // sotc: SOTC_FPS_LEAN
             const u64 func_start = SotcStats::NowNs();
             ExecuteBackOp(op);
             SotcStats::draw_func_ns[op.func_kind & 3].fetch_add(SotcStats::NowNs() - func_start,
@@ -384,6 +553,9 @@ void Liverpool::BackLoop(std::stop_token stoken) {
         op.func.Reset();
         ++tail;
         back_tail.store(tail, std::memory_order_seq_cst);
+        if (opstat) { // sotc: SOTC_OPSTAT
+            OpStatTick();
+        }
         if (xp_on) {
             if (!op.xp_done) { // time per FIFO op (outliers clipped), for the saved-time estimate
                 const double dt =
@@ -424,7 +596,8 @@ void Liverpool::DrainBack() {
 void Liverpool::WaitBackTail(u64 head) {
     SotcStats::cp_waits.fetch_add(1, std::memory_order_relaxed);
     // sotc: SOTC_FPS: command processor time blocked on the draw thread.
-    const SotcStats::RoleTimer blocked{SotcStats::RoleCp, SotcStats::cp_blocked_ns};
+    const SotcStats::RoleTimer blocked{SotcStats::RoleCp, SotcStats::cp_blocked_ns,
+                                         "cp blocked on draw"};
     for (u32 spin = 0; back_tail.load(std::memory_order_acquire) < head; ++spin) {
         if (spin < 4096) {
             CpuRelax();
@@ -452,10 +625,11 @@ Liverpool::BackOp& Liverpool::BackAlloc() {
     }
     if (head - MinRingTail(std::memory_order_acquire) >= BackRingSize) {
         // sotc: SOTC_FPS: the ring is full, the command processor is blocked on the draw thread.
-        const SotcStats::RoleTimer blocked{SotcStats::RoleCp, SotcStats::cp_blocked_ns};
+        const SotcStats::RoleTimer blocked{SotcStats::RoleCp, SotcStats::cp_blocked_ns,
+                                         "cp blocked on draw"};
         // sotc: SOTC_PARALLEL_RECORD: the wait counts as the prep threads' when the draw thread
         // alone would have left room.
-        const bool prep_throttle = prep_workers && SotcStats::kFpsLog &&
+        const bool prep_throttle = prep_workers && SotcStats::kFpsTimers && // sotc: SOTC_FPS_LEAN
                                    head - back_tail.load(std::memory_order_acquire) < BackRingSize;
         const u64 throttle_start = prep_throttle ? SotcStats::NowNs() : 0;
         for (u32 spin = 0; head - MinRingTail(std::memory_order_acquire) >= BackRingSize;
@@ -486,6 +660,9 @@ Liverpool::BackOp& Liverpool::BackAlloc() {
     op.xp_rsize = op.xp_wsize = 0;
     op.qid = curr_qid < 0 ? u8{255} : static_cast<u8>(curr_qid);
     // The registers as of this point of the command stream: the chunks changed since the last op.
+    if (opstat) { // sotc: SOTC_OPSTAT
+        OpStatAdd(OsCpDirty, dirty_list.size());
+    }
     op.reg_chunks.clear();
     for (const u16 chunk : dirty_list) {
         const u32* src = &regs.reg_array[u32{chunk} * RegChunkDwords];
@@ -552,6 +729,11 @@ void Liverpool::WaitBackWritesSlow() {
     // sotc: SOTC_FPS: WaitBackWrites calls that had to wait for the draw thread, and for how long.
     if (!SotcStats::kFpsLog) {
         WaitBackTail(back_write_seq);
+        return;
+    }
+    if (!SotcStats::kFpsTimers) { // sotc: SOTC_FPS_LEAN: the count only, no clock reads
+        WaitBackTail(back_write_seq);
+        SotcStats::cp_bw_waits.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     const u64 start = SotcStats::NowNs();
@@ -643,7 +825,7 @@ void Liverpool::AttachWd(BackOp& op) {
 
 void Liverpool::ApplyBackWd(const BackWd& wd) {
     // Draw thread. Exactly what the WRITE_DATA Func did, once per packet.
-    const u64 start = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
+    const u64 start = SotcStats::kFpsTimers ? SotcStats::NowNs() : 0; // sotc: SOTC_FPS_LEAN
     // sotc: SOTC_RB_EXACT rule 7: a CPU-visible write, written now. Owed data announced by it is
     // settled first.
     u64 rbx_snap = 0;
@@ -662,7 +844,7 @@ void Liverpool::ApplyBackWd(const BackWd& wd) {
     if (rbx && rasterizer && wd.num_segs) {
         RbxNoteWritten(rbx_snap);
     }
-    if (SotcStats::kFpsLog) {
+    if (SotcStats::kFpsTimers) { // sotc: SOTC_FPS_LEAN
         SotcStats::draw_func_ns[0].fetch_add(SotcStats::NowNs() - start,
                                              std::memory_order_relaxed);
     }
@@ -761,6 +943,46 @@ static bool FuseTransparent(const PM4Header* header, PM4ItOpcode opcode) {
 }
 
 void Liverpool::ExecuteBackOp(BackOp& op) {
+    struct TraceOp {
+        const BackOp& op;
+        u64 t0;
+        ~TraceOp() {
+            if (t0) {
+                static constexpr const char* kNames[] = {"func", "draw", "draw indirect",
+                                                         "dispatch", "dispatch indirect"};
+                static constexpr const char* kFuncNames[] = {"write data", "eop/release", "dma",
+                                                             "func"};
+                const auto kind = static_cast<u32>(op.kind);
+                const char* name = op.kind == BackOp::Kind::Func ? kFuncNames[op.func_kind & 3]
+                                                                 : kNames[kind < 5 ? kind : 0];
+                const u64 t1 = SotcStats::NowNs();
+                if (op.kind == BackOp::Kind::Func && op.func_kind == 1) {
+                    // Label writes (EOP/EOS/release) release guest waits: never merged.
+                    tl_op_batch.Flush();
+                    SotcTrace::Span(name, t0, t1, kind);
+                } else {
+                    tl_op_batch.Note(name, t0, t1, kind);
+                }
+            }
+        }
+    } trace_op{op, SotcTrace::kOn ? SotcStats::NowNs() : 0};
+    // sotc: SOTC_OPSTAT=1: what this op is made of, and the start of the timing (ob_t0).
+    u64 ob_t0 = 0;
+    if (opstat) {
+        OpStatAdd(OsOps, 1);
+        OpStatAdd(OsKind + static_cast<u32>(op.kind), 1);
+        if (op.kind == BackOp::Kind::Func) {
+            OpStatAdd(OsFunc + (op.func_kind & 3), 1);
+        }
+        OpStatAdd(OsRegChunks, op.reg_chunks.size() / (RegChunkDwords + 1));
+        OpStatAdd(OsStages, op.num_stages);
+        u64 flat = 0;
+        for (u32 i = 0; i < op.num_stages; ++i) {
+            flat += op.stages[i].flat.size();
+        }
+        OpStatAdd(OsFlat, flat);
+        ob_t0 = SotcStats::NowNs();
+    }
     // sotc: SOTC_WD_FUSE: the WRITE_DATA packets that preceded this op in the command stream.
     if (op.wd.num_segs) {
         ApplyBackWd(op.wd);
@@ -780,6 +1002,7 @@ void Liverpool::ExecuteBackOp(BackOp& op) {
         rt.flattened_ud_buf.assign(stage.flat.begin(), stage.flat.end());
         rt.pgm_base = stage.pgm_base;
     }
+    const u64 ob_t1 = opstat ? SotcStats::NowNs() : 0; // sotc: SOTC_OPSTAT
     switch (op.kind) {
     case BackOp::Kind::Func:
         if (op.func) { // sotc: empty for a flushed batch of WRITE_DATA (FlushWd)
@@ -804,6 +1027,11 @@ void Liverpool::ExecuteBackOp(BackOp& op) {
         back_cs = op.cs;
         rasterizer->DispatchIndirect(op.address, op.offset, op.size, op.pipeline, true);
         break;
+    }
+    if (opstat) { // sotc: SOTC_OPSTAT
+        const u64 ob_t2 = SotcStats::NowNs();
+        OpStatAdd(OsPreNs, ob_t1 - ob_t0);
+        OpStatAdd(OsBodyNs, ob_t2 - ob_t1);
     }
 }
 
@@ -2038,7 +2266,7 @@ u8 Liverpool::MemWaitKind(const PM4CmdWaitRegMem& wait, bool vo_label) const {
 // how late those are seen. On Windows the condition variable and WaitOnAddress timeouts are whole
 // milliseconds, so the block is an auto-reset event plus a high-resolution waitable timer.
 bool Liverpool::CpIdleSleep(u64 seen_epoch) {
-    const u64 start = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
+    const u64 start = SotcStats::kFpsTimers ? SotcStats::NowNs() : 0; // sotc: SOTC_FPS_LEAN
     cp_sleeping.store(true, std::memory_order_seq_cst);
     bool notified = cp_wake_epoch.load(std::memory_order_seq_cst) != seen_epoch;
     if (notified) {
@@ -2095,14 +2323,19 @@ bool Liverpool::CpIdleSleep(u64 seen_epoch) {
 #endif
     cp_sleeping.store(false, std::memory_order_relaxed);
     if (SotcStats::kFpsLog) {
-        const u64 now = SotcStats::NowNs();
+        // sotc: SOTC_FPS_LEAN: the sleep time and the wake latency need the clock (kFpsTimers).
+        const u64 now = SotcStats::kFpsTimers ? SotcStats::NowNs() : 0;
         SotcStats::CpAdd(SotcStats::cp_sleeps, 1);
-        SotcStats::CpAdd(SotcStats::cp_sleep_ns, now - start);
+        if (SotcStats::kFpsTimers) {
+            SotcStats::CpAdd(SotcStats::cp_sleep_ns, now - start);
+        }
         if (notified) {
-            const u64 notify = cp_notify_ns.load(std::memory_order_relaxed);
             SotcStats::CpAdd(SotcStats::cp_wakes, 1);
-            SotcStats::CpAdd(SotcStats::cp_wake_latency_ns,
-                             notify >= start && now > notify ? now - notify : 0);
+            if (SotcStats::kFpsTimers) {
+                const u64 notify = cp_notify_ns.load(std::memory_order_relaxed);
+                SotcStats::CpAdd(SotcStats::cp_wake_latency_ns,
+                                 notify >= start && now > notify ? now - notify : 0);
+            }
         } else {
             SotcStats::CpAdd(SotcStats::cp_sleep_timeouts, 1);
         }
@@ -2111,7 +2344,7 @@ bool Liverpool::CpIdleSleep(u64 seen_epoch) {
 }
 
 void Liverpool::WakeCp() noexcept {
-    if (SotcStats::kFpsLog) {
+    if (SotcStats::kFpsTimers) { // sotc: SOTC_FPS_LEAN: only the wake latency reads it
         cp_notify_ns.store(SotcStats::NowNs(), std::memory_order_relaxed);
     }
 #ifdef _WIN32
@@ -2150,6 +2383,7 @@ void Liverpool::ProcessCommands() {
                     command_queue.pop();
                     --num_commands;
                 }
+                const SotcTrace::Scope trace_command{"command"}; // sotc: SOTC_TRACE
                 callback();
             }
             NotifyCpWait(); // sotc: SOTC_CP_IDLE_US: a game thread's command may write memory
@@ -2232,6 +2466,9 @@ void Liverpool::Process(std::stop_token stoken) {
         // clock is read once per progress resume (parse time) and every 32 resumes of a streak
         // (spin time, idle deadline); the resumes of a streak are not timed one by one.
         const bool track = SotcStats::kFpsLog || cp_idle_ns != 0;
+        // sotc: SOTC_FPS_LEAN: the parse and spin clock reads (kFpsTimers, or SOTC_TRACE's spans).
+        // The streak times that SOTC_CP_IDLE_US decides on are read whatever this is.
+        const bool cp_timed = SotcStats::kFpsTimers || SotcTrace::kOn;
         std::array<void*, NumTotalQueues> last_resumed{}; // the task each queue resumed last
         u32 idle_iters = 0;      // iterations of the round in progress, 0: a new round starts
         u32 round_kinds = 0;     // CpWaitKind bits seen in the round in progress
@@ -2292,12 +2529,21 @@ void Liverpool::Process(std::stop_token stoken) {
                         // sotc: SOTC_CP_IDLE_US. Every queue was resumed after round_epoch was
                         // read, so a notification since then makes CpIdleSleep return at once.
                         if (SotcStats::kFpsLog) {
-                            const u64 now = SotcStats::NowNs();
-                            SotcStats::CpAdd(SotcStats::cp_spin_ns, now - mark_ns);
+                            if (SotcStats::kFpsTimers) { // sotc: SOTC_FPS_LEAN
+                                SotcStats::CpAdd(SotcStats::cp_spin_ns,
+                                                 SotcStats::NowNs() - mark_ns);
+                            }
                             publish_rounds();
+                        }
+                        const u64 sleep_start = SotcTrace::kOn ? SotcStats::NowNs() : 0;
+                        if (sleep_start) {
+                            tl_op_batch.Flush();
                         }
                         const bool notified = CpIdleSleep(round_epoch);
                         mark_ns = SotcStats::NowNs();
+                        if (sleep_start) { // sotc: SOTC_TRACE
+                            SotcTrace::Span("cp idle", sleep_start, mark_ns, notified);
+                        }
                         streak_resumes = 0;
                         since_progress = 0;
                         // After a notification the full spin window runs again (the condition
@@ -2341,7 +2587,7 @@ void Liverpool::Process(std::stop_token stoken) {
             // sotc: SOTC_FPS parse time: outside a streak the resume is timed from its start;
             // the first progress after a streak is timed from the streak's last sample (at most
             // 31 re-tests earlier), so cp_parse_ns no longer contains the spin.
-            if (SotcStats::kFpsLog && !spinning) {
+            if (cp_timed && !spinning) {
                 mark_ns = SotcStats::NowNs();
             }
             const u64 exits_before = cp_wait_exits;
@@ -2352,10 +2598,16 @@ void Liverpool::Process(std::stop_token stoken) {
                                       resumed != last_resumed[curr_qid];
                 last_resumed[curr_qid] = resumed;
                 if (progress) {
-                    if (SotcStats::kFpsLog) {
+                    if (SotcStats::kFpsLog && cp_timed) {
                         const u64 parse_ns = SotcStats::NowNs() - mark_ns;
                         SotcStats::cp_parse_ns.fetch_add(parse_ns, std::memory_order_relaxed);
                         SotcStats::cp_parse_all_ns.fetch_add(parse_ns, std::memory_order_relaxed);
+                        // sotc: SOTC_TRACE: a = queue (0 graphics, others compute); the ops
+                        // this thread ran itself (no draw thread, express path) go out first
+                        if (SotcTrace::kOn) {
+                            tl_op_batch.Flush();
+                            SotcTrace::Span("cp parse", mark_ns, mark_ns + parse_ns, curr_qid);
+                        }
                     }
                     end_streak();
                 } else {
@@ -2365,19 +2617,26 @@ void Liverpool::Process(std::stop_token stoken) {
                     if (!spinning) {
                         spinning = true;
                         streak_resumes = 0;
-                        if (!SotcStats::kFpsLog) {
+                        if (!cp_timed) { // sotc: SOTC_FPS_LEAN: the idle deadline still needs it
                             mark_ns = SotcStats::NowNs();
                         }
                         streak_start_ns = mark_ns; // this resume's start (or now)
                     } else if ((++streak_resumes & 31) == 0) {
-                        const u64 now = SotcStats::NowNs();
+                        // sotc: SOTC_FPS_LEAN: sampled for the parse time, the spin sum and the
+                        // idle deadline only.
+                        const bool sample = cp_timed || cp_idle_ns != 0;
+                        const u64 now = sample ? SotcStats::NowNs() : 0;
                         if (SotcStats::kFpsLog) {
-                            SotcStats::CpAdd(SotcStats::cp_spin_ns, now - mark_ns);
+                            if (SotcStats::kFpsTimers) {
+                                SotcStats::CpAdd(SotcStats::cp_spin_ns, now - mark_ns);
+                            }
                             publish_rounds();
                         }
-                        mark_ns = now;
-                        if (cp_idle_ns && now - streak_start_ns >= cp_idle_ns) {
-                            idle_due = true;
+                        if (sample) {
+                            mark_ns = now;
+                            if (cp_idle_ns && now - streak_start_ns >= cp_idle_ns) {
+                                idle_due = true;
+                            }
                         }
                     }
                 }
@@ -2720,8 +2979,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
                 const auto reg_addr = Regs::ConfigRegWordOffset + set_data->reg_offset;
                 const auto* payload = reinterpret_cast<const u32*>(header + 2);
-                std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
-                MarkRegs(reg_addr, count - 1);
+                WriteRegsMarked(reg_addr, payload, count - 1);
                 break;
             }
             case PM4ItOpcode::SetContextReg: {
@@ -2729,8 +2987,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto reg_addr = Regs::ContextRegWordOffset + set_data->reg_offset;
                 const auto* payload = reinterpret_cast<const u32*>(header + 2);
 
-                std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
-                MarkRegs(reg_addr, count - 1);
+                WriteRegsMarked(reg_addr, payload, count - 1);
 
                 // In the case of HW, render target memory has alignment as color block operates on
                 // tiles. There is no information of actual resource extents stored in CB context
@@ -2809,18 +3066,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                                  (set_data->reg_offset - 0x200);
                     std::memcpy(addr, header + 2, set_size);
                 } else {
-                    std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
-                                header + 2, set_size);
-                    MarkRegs(Regs::ShRegWordOffset + set_data->reg_offset,
-                             static_cast<u32>(set_size / 4));
+                    WriteRegsMarked(Regs::ShRegWordOffset + set_data->reg_offset, header + 2, static_cast<u32>(set_size / 4));
                 }
                 break;
             }
             case PM4ItOpcode::SetUconfigReg: {
                 const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-                std::memcpy(&regs.reg_array[Regs::UconfigRegWordOffset + set_data->reg_offset],
-                            header + 2, (count - 1) * sizeof(u32));
-                MarkRegs(Regs::UconfigRegWordOffset + set_data->reg_offset, count - 1);
+                WriteRegsMarked(Regs::UconfigRegWordOffset + set_data->reg_offset, header + 2, count - 1);
                 break;
             }
             case PM4ItOpcode::SetPredication: {
@@ -3803,10 +4055,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                              (set_data->reg_offset - 0x200);
                 std::memcpy(addr, header + 2, set_size);
             } else {
-                std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
-                            header + 2, set_size);
-                MarkRegs(Regs::ShRegWordOffset + set_data->reg_offset,
-                         static_cast<u32>(set_size / 4));
+                WriteRegsMarked(Regs::ShRegWordOffset + set_data->reg_offset, header + 2, static_cast<u32>(set_size / 4));
             }
             break;
         }

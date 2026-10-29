@@ -40,6 +40,13 @@ FrameAccount TakeAccount() {
     a.rb_pf = rb_pf_consumed_all.load(std::memory_order_relaxed);
     a.fault_count = FaultStat::all_count.load(std::memory_order_relaxed);
     a.fault_ns = FaultStat::all_ns.load(std::memory_order_relaxed);
+    if (kStallDetail) { // sotc: SOTC_STALL_DETAIL, only read when the detail is printed
+        uint64_t user[BbThreadCpu::MaxRoles], kernel[BbThreadCpu::MaxRoles];
+        BbThreadCpu::SampleSplit(user, kernel);
+        a.upload_user_ns = user[RoleUpload];
+        a.upload_kernel_ns = kernel[RoleUpload];
+        a.flip_pace_ns = cp_flip_pace_all_ns.load(std::memory_order_relaxed);
+    }
     return a;
 }
 
@@ -66,6 +73,9 @@ FrameAccount DiffAccount(const FrameAccount& now, const FrameAccount& before) {
     d.rb_pf = sub(now.rb_pf, before.rb_pf);
     d.fault_count = sub(now.fault_count, before.fault_count);
     d.fault_ns = sub(now.fault_ns, before.fault_ns);
+    d.flip_pace_ns = sub(now.flip_pace_ns, before.flip_pace_ns);
+    d.upload_user_ns = sub(now.upload_user_ns, before.upload_user_ns);
+    d.upload_kernel_ns = sub(now.upload_kernel_ns, before.upload_kernel_ns);
     return d;
 }
 

@@ -15,6 +15,7 @@
 #include "video_core/sotc_fps_cap.h"
 #include "core/platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/sotc_trace.h" // sotc: SOTC_TRACE
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
 
@@ -161,6 +162,8 @@ s32 PS4_SYSV_ABI sceVideoOutIsFlipPending(s32 handle) {
 }
 
 s32 PS4_SYSV_ABI sceVideoOutSubmitFlip(s32 handle, s32 bufferIndex, s32 flipMode, s64 flipArg) {
+    const SotcTrace::Scope sotc_trace{"videoout flip", static_cast<u64>(bufferIndex),
+                                      reinterpret_cast<u64>(__builtin_return_address(0))};
     auto* port = driver->GetPort(handle);
     if (!port) {
         LOG_ERROR(Lib_VideoOut, "Invalid handle = {}", handle);

@@ -9,6 +9,7 @@
 #include "runtime.h"
 #include "runtime_event.h"
 #include "gpu/bbgpu.h"
+#include "trace.h"
 #include "gpu/sotc/sotc_patches.h"
 #if !defined(__x86_64__) || !defined(__GNUC__)
 #error This prototype requires x86-64 GCC or Clang (including MinGW).
@@ -1412,6 +1413,9 @@ int main(int argc, char **argv) {
 #endif
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
+    /* sotc: SOTC_TRACE shows guest return addresses as eboot offsets (the eboot is linked first). */
+    if (bbgpu_trace_image) bbgpu_trace_image((uint64_t)(uintptr_t)image, size);
+    trace_thread_init(); /* the main guest thread */
     if (!cpu_only) {
         char title[128]="Bloodborne", serial[16]="UNKNOWN", sfo[4096];
         uint32_t attributes=0;

@@ -49,6 +49,12 @@ void AsyncUpload::Init() {
     textures_enabled = texture_env && texture_env[0] == '1';
     const char* pieces_env = std::getenv("SOTC_FENCE_PIECES");
     fence_pieces = pieces_env && pieces_env[0] == '1';
+    // sotc: SOTC_ASYNC_STAGE_CACHED=1: buffer uploads copy into HOST_CACHED staging.
+    // sotc: SOTC_ASYNC_JOB_MB=<n>: jobs above n MiB are split into jobs of n MiB (Queue).
+    const char* stage_env = std::getenv("SOTC_ASYNC_STAGE_CACHED");
+    stage_cached = stage_env && stage_env[0] == '1';
+    const char* job_env = std::getenv("SOTC_ASYNC_JOB_MB");
+    job_bytes = job_env ? std::strtoull(job_env, nullptr, 10) << 20 : 0;
     if ((!buffers_enabled && !textures_enabled) || Get()) {
         return;
     }
@@ -80,15 +86,19 @@ AsyncUpload::~AsyncUpload() {
     threads.clear(); // joins; queued tasks are still copied (see Worker)
 }
 
+// sotc: SOTC_ASYNC_JOB_MB: appends [start, end) to ranges, extending the last range when it
+// ends where this one starts.
+static void AppendRange(std::vector<AsyncUpload::Range>& ranges, u64 start, u64 end) {
+    if (!ranges.empty() && ranges.back().end == start) {
+        ranges.back().end = end;
+    } else {
+        ranges.push_back({start, end});
+    }
+}
+
 void AsyncUpload::Queue(const void* owner, u64 tick, std::vector<Piece>&& pieces,
                         std::vector<Range>&& va, std::vector<Range>&& phys, Buffer* staging,
                         u64 flush_offset, u64 flush_size) {
-    auto job = std::make_shared<Job>();
-    job->owner = owner;
-    job->tick = tick;
-    job->staging = staging;
-    job->flush_offset = flush_offset;
-    job->flush_size = flush_size;
     // sotc: SOTC_FENCE_PIECES: the guest address and backing offset of each piece. The pieces
     // follow the va ranges in order (BufferCache::QueueAsyncGuestCopy splits each range at its
     // mappings) and each piece with a backing has the next phys range; when they do not line
@@ -120,8 +130,6 @@ void AsyncUpload::Queue(const void* owner, u64 tick, std::vector<Piece>&& pieces
         }
         has_ranges = has_ranges && pi == phys.size();
     }
-    job->va = std::move(va);
-    job->phys = std::move(phys);
     // Split into pieces of up to 512 KiB, spread over the threads.
     constexpr u64 Split = 512_KB;
     u64 count = 0;
@@ -131,33 +139,110 @@ void AsyncUpload::Queue(const void* owner, u64 tick, std::vector<Piece>&& pieces
     if (count == 0) {
         return;
     }
-    job->slots = std::make_unique<Job::Slot[]>(count);
-    job->count = static_cast<u32>(count);
-    job->has_ranges = has_ranges;
-    u32 index = 0;
+    struct Flat {
+        Piece piece;
+        u64 va;
+        u64 phys;
+    };
+    std::vector<Flat> flat;
+    flat.reserve(count);
     for (size_t i = 0; i < pieces.size(); ++i) {
         const auto& piece = pieces[i];
         for (u64 done = 0; done < piece.size; done += Split) {
-            auto& slot = job->slots[index++];
-            slot.piece = {piece.src ? piece.src + done : nullptr, piece.dst + done,
-                          std::min(Split, piece.size - done)};
+            Flat f{{piece.src ? piece.src + done : nullptr, piece.dst + done,
+                    std::min(Split, piece.size - done)},
+                   0, 0};
             if (has_ranges) {
-                slot.va = starts[i].first + done;
-                slot.phys = starts[i].second + done;
+                f.va = starts[i].first + done;
+                f.phys = starts[i].second + done;
+            }
+            flat.push_back(f);
+        }
+    }
+    // sotc: SOTC_ASYNC_JOB_MB=<n> (job_bytes): a job of more than n MiB is queued as several jobs
+    // of at most n MiB. Each keeps its own pieces, fence ranges and staging flush, so the write
+    // fence and the submit wait cover the same pieces as before (ranges exact to the job's pieces
+    // when the pieces' ranges are known, else the whole ranges), and the staging is flushed once
+    // in total. Refused unless the pieces are one contiguous run of staging that adds up to
+    // flush_size: the jobs' flush offsets are running sums of their pieces.
+    bool split = job_bytes != 0 && flush_size > job_bytes;
+    if (split) {
+        u64 sum = 0;
+        for (size_t i = 0; split && i < flat.size(); ++i) {
+            split = i == 0 || flat[i].piece.dst == flat[i - 1].piece.dst + flat[i - 1].piece.size;
+            sum += flat[i].piece.size;
+        }
+        split = split && sum == flush_size;
+    }
+    std::vector<std::shared_ptr<Job>> made;
+    const auto make_job = [&](size_t first, size_t last, u64 offset, u64 size,
+                              std::vector<Range>&& job_va, std::vector<Range>&& job_phys) {
+        auto job = std::make_shared<Job>();
+        job->owner = owner;
+        job->tick = tick;
+        job->staging = staging;
+        job->flush_offset = offset;
+        job->flush_size = size;
+        job->va = std::move(job_va);
+        job->phys = std::move(job_phys);
+        job->slots = std::make_unique<Job::Slot[]>(last - first);
+        job->count = static_cast<u32>(last - first);
+        job->has_ranges = has_ranges;
+        for (size_t i = first; i < last; ++i) {
+            auto& slot = job->slots[i - first];
+            slot.piece = flat[i].piece;
+            if (has_ranges) {
+                slot.va = flat[i].va;
+                slot.phys = flat[i].phys;
+            }
+        }
+        job->left.store(job->count, std::memory_order_relaxed);
+        made.push_back(std::move(job));
+    };
+    if (!split) {
+        make_job(0, flat.size(), flush_offset, flush_size, std::move(va), std::move(phys));
+    } else {
+        size_t first = 0;
+        u64 offset = 0; // staging bytes of the jobs before this one
+        while (first < flat.size()) {
+            size_t last = first;
+            u64 bytes = 0;
+            while (last < flat.size() &&
+                   (last == first || bytes + flat[last].piece.size <= job_bytes)) {
+                bytes += flat[last].piece.size;
+                ++last;
+            }
+            std::vector<Range> job_va;
+            std::vector<Range> job_phys;
+            if (has_ranges) {
+                for (size_t i = first; i < last; ++i) {
+                    AppendRange(job_va, flat[i].va, flat[i].va + flat[i].piece.size);
+                    if (flat[i].piece.src) {
+                        AppendRange(job_phys, flat[i].phys, flat[i].phys + flat[i].piece.size);
+                    }
+                }
+            } else {
+                job_va = va;
+                job_phys = phys;
+            }
+            make_job(first, last, flush_offset + offset, bytes, std::move(job_va),
+                     std::move(job_phys));
+            offset += bytes;
+            first = last;
+        }
+    }
+    {
+        std::scoped_lock lock{mutex};
+        for (const auto& job : made) {
+            jobs.push_back(job);
+            active.fetch_add(1, std::memory_order_acq_rel);
+            for (u32 i = 0; i < job->count; ++i) {
+                tasks.push_back({job, i});
             }
         }
     }
-    job->left.store(count, std::memory_order_relaxed);
-    {
-        std::scoped_lock lock{mutex};
-        jobs.push_back(job);
-        active.fetch_add(1, std::memory_order_acq_rel);
-        for (u32 i = 0; i < job->count; ++i) {
-            tasks.push_back({job, i});
-        }
-    }
     cv.notify_all();
-    SotcStats::async_upload_jobs.fetch_add(1, std::memory_order_relaxed);
+    SotcStats::async_upload_jobs.fetch_add(made.size(), std::memory_order_relaxed);
     SotcStats::async_upload_bytes.fetch_add(flush_size, std::memory_order_relaxed);
 }
 
@@ -267,7 +352,8 @@ void AsyncUpload::WaitUpTo(const void* owner, u64 tick) {
         return;
     }
     // sotc: SOTC_FPS accounting: the recording thread's wait before its queue submit.
-    const SotcStats::RoleTimer rec_wait{SotcStats::RoleRecorder, SotcStats::rec_upload_wait_ns};
+    const SotcStats::RoleTimer rec_wait{SotcStats::RoleRecorder, SotcStats::rec_upload_wait_ns,
+                                       "rec wait upload"};
     WaitFor([owner, tick](const Job& job) { return job.owner == owner && job.tick <= tick; },
             false);
 }

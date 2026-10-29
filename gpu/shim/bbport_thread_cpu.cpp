@@ -27,9 +27,10 @@ struct Slot {
     clockid_t clock{};
 #endif
     std::atomic<uint64_t> last{0}; ///< last good reading (an exited thread keeps it)
+    std::atomic<uint64_t> last_user{0}, last_kernel{0}; ///< sotc: SampleSplit readings, same rule
 };
 
-constexpr uint32_t MaxSlots = 64;
+constexpr uint32_t MaxSlots = 256; // sotc: 64 could fill up with guest threads (SOTC_STALL_DETAIL)
 Slot g_slots[MaxSlots];
 std::atomic<uint32_t> g_count{0};
 
@@ -82,6 +83,36 @@ uint64_t ReadNs(const Slot& slot, double) {
 }
 #endif
 
+// sotc: user and kernel time of a thread in nanoseconds (SampleSplit). Windows: GetThreadTimes
+// (100 ns units, scheduler-tick resolution). Other platforms: not sampled, reported as zero.
+bool ReadUserKernel(const Slot& slot, uint64_t& user_ns, uint64_t& kernel_ns) {
+#ifdef _WIN32
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (!GetThreadTimes(slot.handle, &created, &exited, &kernel, &user)) {
+        return false;
+    }
+    const auto ticks = [](const FILETIME& f) {
+        return ((static_cast<uint64_t>(f.dwHighDateTime) << 32) | f.dwLowDateTime) * 100u;
+    };
+    user_ns = ticks(user);
+    kernel_ns = ticks(kernel);
+    return true;
+#else
+    (void)slot;
+    user_ns = 0;
+    kernel_ns = 0;
+    return false;
+#endif
+}
+
+// sotc: CAS max, as in Sample: keeps the largest reading and returns it (monotonic per thread).
+uint64_t Advance(std::atomic<uint64_t>& last, uint64_t value) {
+    uint64_t cur = last.load(std::memory_order_relaxed);
+    while (value > cur && !last.compare_exchange_weak(cur, value, std::memory_order_relaxed)) {
+    }
+    return std::max(cur, value);
+}
+
 } // namespace
 
 void Register(int role) {
@@ -109,6 +140,13 @@ void Register(int role) {
     slot.used.store(true, std::memory_order_release);
 }
 
+void RegisterLowPriority(int role) {
+    if (g_count.load(std::memory_order_relaxed) + 64 >= MaxSlots) {
+        return; // the last 64 slots stay for the GPU threads
+    }
+    Register(role);
+}
+
 void Sample(uint64_t out[MaxRoles]) {
     for (int i = 0; i < MaxRoles; ++i) {
         out[i] = 0;
@@ -134,6 +172,24 @@ void Sample(uint64_t out[MaxRoles]) {
             ns = last; // exited thread, or the calibration moved a little: stay monotonic
         }
         out[slot.role] += ns;
+    }
+}
+
+void SampleSplit(uint64_t user[MaxRoles], uint64_t kernel[MaxRoles]) {
+    for (int i = 0; i < MaxRoles; ++i) {
+        user[i] = 0;
+        kernel[i] = 0;
+    }
+    const uint32_t count = std::min(g_count.load(std::memory_order_relaxed), MaxSlots);
+    for (uint32_t i = 0; i < count; ++i) {
+        Slot& slot = g_slots[i];
+        if (!slot.used.load(std::memory_order_acquire)) {
+            continue;
+        }
+        uint64_t u = 0, k = 0;
+        ReadUserKernel(slot, u, k); // on failure both stay 0 and the stored values are kept
+        user[slot.role] += Advance(slot.last_user, u);
+        kernel[slot.role] += Advance(slot.last_kernel, k);
     }
 }
 

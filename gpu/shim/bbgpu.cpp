@@ -3,6 +3,7 @@
 #include "bbport_overlay.h"
 #include "bbport_settings.h"
 #include "bbport_copy.h"
+#include "bbport_thread_cpu.h" // sotc: SOTC_STALL_DETAIL guest CPU
 #ifndef _WIN32
 #include <sys/resource.h>
 #endif
@@ -41,6 +42,7 @@
 #include "video_core/cache_storage.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/sotc_trace.h" // sotc: SOTC_TRACE
 
 extern "C" {
 // runtime_memory.c
@@ -312,6 +314,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
     StartProfileWriter();
 #endif
     g_sdk_version = config->sdk_version;
+    SotcTrace::SetUserDir(config->user_dir); // sotc: SOTC_TRACE files go to <user dir>/trace
 #ifdef _WIN32
     if (config->user_dir && !std::getenv("BB_GPU_USER_DIR")) _putenv_s("BB_GPU_USER_DIR", config->user_dir);
 #else
@@ -418,6 +421,7 @@ extern "C" int bbgpu_handle_fault(void* ucontext, void* address) {
     if (SotcStats::kFpsLog) {
         SotcStats::FaultStat::Begin();
     }
+    const u64 trace_t0 = SotcTrace::kOn ? SotcStats::NowNs() : 0; // sotc: SOTC_TRACE
     if (auto* async_upload = VideoCore::AsyncUpload::Get();
         async_upload && async_upload->AnyPending() && VideoCore::AsyncUpload::FencePieces() &&
         !Common::IsWriteError(ucontext)) {
@@ -446,12 +450,23 @@ extern "C" int bbgpu_handle_fault(void* ucontext, void* address) {
     if (SotcStats::kFpsLog) {
         SotcStats::FaultStat::End();
     }
+    if (trace_t0 && handled) {
+        // a = the faulting address, b = the faulting instruction
+        u64 rip = 0;
+#ifdef _WIN32
+        rip = static_cast<EXCEPTION_POINTERS*>(ucontext)->ContextRecord->Rip;
+#endif
+        // Never allocates here (the exception handler): threads get their ring beforehand.
+        SotcTrace::SpanIfReady(Common::IsWriteError(ucontext) ? "write fault" : "read fault",
+                               trace_t0, SotcStats::NowNs(), reinterpret_cast<u64>(address), rip);
+    }
     return handled;
 }
 
 // sotc: SOTC_ASYNC_UPLOAD write fence for the runtime's own writes to guest memory (zeroing
 // freed memory, backing writes): offsets in the backing view (runtime_memory.c).
 extern "C" void bbgpu_upload_wait_phys(uint64_t phys, uint64_t size) {
+    const SotcTrace::Scope trace_wait{"upload fence (runtime write)", phys, size}; // sotc
     if (auto* async_upload = VideoCore::AsyncUpload::Get()) {
         async_upload->WaitPhys(phys, size);
     }
@@ -459,6 +474,16 @@ extern "C" void bbgpu_upload_wait_phys(uint64_t phys, uint64_t size) {
 
 extern "C" void bbgpu_set_fps_target_slot(void* slot) {
     SotcFpsCap::target_slot.store(slot, std::memory_order_relaxed);
+}
+
+// sotc: SOTC_STALL_DETAIL: a game guest thread records its CPU time under SotcStats::RoleGuest (the
+// SOTCSTALL "guest cpu" figure). Called by host_start (src/runtime_thread.c). tl_role is left as it
+// is: the trace recorder reads RoleOther as "guest". Only with SOTC_STALL_DETAIL: SOTC_FPS alone
+// keeps sampling the GPU threads only, as before.
+void bbgpu_register_guest_thread(void) {
+    if (SotcStats::kStallDetail) {
+        BbThreadCpu::RegisterLowPriority(SotcStats::RoleGuest);
+    }
 }
 
 extern "C" unsigned bbgpu_symbol_count(void) {

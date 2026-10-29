@@ -8,11 +8,11 @@
 // bitmasks of the engine's XPR renderer) would live in the guest's own memory, imported as a
 // VkBuffer with VK_EXT_external_memory_host, so the GPU writes them in place and a guest read
 // fault only has to wait for the writer tick instead of copying arena -> staging -> backing.
-// Promotion needs every path that touches the arena bytes of the range to be redirected or to
-// force a demotion (see the report in CHANGELOG.md / docs). That is NOT done in this build:
-// SOTC_HRR=1 therefore behaves exactly like SOTC_HRR=dry. The dry run learns which ranges would
-// be promoted, which conditions block them, and what the promotion would have saved, so the
-// selection can be validated on real scenes before any behaviour changes.
+// SOTC_HRR=1 (Real()): the promoted granules (the "WOULD PROMOTE" runs below) are placed in
+// host-visible arena memory and, when they are already resident in device memory, migrated there
+// (BufferCache::MigrateHostResident, with the exactness argument). Any other value runs the dry
+// run only: it learns which ranges would be promoted, which conditions block them, and what the
+// promotion would have saved, so the selection can be checked on real scenes.
 //
 // Selection: the readback path (BufferCache::ReadMemory) counts, per 64 KiB granule, the guest
 // readbacks that touch it. Once a second, granules with at least SOTC_HRR_MIN_RB (default 30)
@@ -40,6 +40,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <utility>
 #include <vector>
 #include "common/types.h"
 #include "core/memory.h"
@@ -59,14 +60,29 @@ public:
             if (!v || v[0] == '\0' || v[0] == '0') {
                 return false;
             }
-            if (v[0] != 'd') {
-                std::fprintf(stderr, "SOTC HRR: promotion is not implemented in this build; "
-                                     "running as SOTC_HRR=dry (no change of behaviour)\n");
+            if (v[0] != 'd' && v[0] != '1') {
+                std::fprintf(stderr, "SOTC HRR: unknown value, running as SOTC_HRR=dry "
+                                     "(SOTC_HRR=1 enables promotion)\n");
             }
             return true;
         }();
         return on;
     }
+
+    /// sotc: SOTC_HRR=1 exactly: promoted ranges are placed in host-visible arena memory.
+    /// False when the device has no suitable host-visible memory type (the BufferCache
+    /// constructor sets no_host_memory and logs once): then everything behaves as the dry run.
+    static bool Real() {
+        static const bool env_real = [] {
+            const char* v = std::getenv("SOTC_HRR");
+            return v && v[0] == '1';
+        }();
+        return env_real && !no_host_memory.load(std::memory_order_relaxed);
+    }
+
+    /// sotc: set by the BufferCache constructor when Real() was asked for but no host-visible
+    /// arena memory type exists.
+    static inline std::atomic<bool> no_host_memory{false};
 
     /// Guest thread: a readback of [addr, addr + size) was requested. Runs the once-a-second
     /// selection when its time has come.
@@ -85,6 +101,7 @@ public:
                     continue;
                 }
                 it = granules.emplace(g, Granule_{}).first;
+                any_granules.store(true, std::memory_order_relaxed); // sotc: see NoteBinding
             }
             ++it->second.reads;
         }
@@ -101,6 +118,13 @@ public:
     /// reports it with NoteImageOverlap.
     bool NoteBinding(VAddr addr, u64 size, bool written) {
         if (size == 0) {
+            return false;
+        }
+        // sotc: no granule tracked: the locked path below returns false without any side effect,
+        // so the lock is skipped. Relaxed is enough: any_granules is stored under the mutex when a
+        // granule is added (NoteReadback) and when Evaluate leaves none. A bind ordered after an
+        // add sees it (coherence); a concurrent one linearizes before the add.
+        if (!any_granules.load(std::memory_order_relaxed)) {
             return false;
         }
         std::scoped_lock lock{mutex};
@@ -155,6 +179,39 @@ public:
             SotcStats::hrr_rb_ns.fetch_add(ns, std::memory_order_relaxed);
             SotcStats::hrr_rb_count.fetch_add(1, std::memory_order_relaxed);
         }
+    }
+
+    /// sotc: SOTC_HRR=1: true when a promoted granule overlaps [addr, addr + size).
+    bool IsPromoted(VAddr addr, u64 size) const {
+        std::scoped_lock lock{mutex};
+        return InPromoted(addr, size);
+    }
+
+    /// sotc: SOTC_HRR=1: the parts of [addr, addr + size) that lie in promoted granules, sorted.
+    std::vector<std::pair<VAddr, VAddr>> PromotedIn(VAddr addr, u64 size) const {
+        std::vector<std::pair<VAddr, VAddr>> out;
+        const VAddr end = addr + size;
+        std::scoped_lock lock{mutex};
+        for (const auto& [lo, hi] : promoted) {
+            if (addr < hi && lo < end) {
+                out.emplace_back(std::max(lo, addr), std::min(hi, end));
+            }
+        }
+        return out;
+    }
+
+    /// sotc: SOTC_HRR=1: granules (Granule-aligned) promoted since the last call, and not promoted
+    /// before. BufferCache::MigrateHostResident takes them.
+    std::vector<std::pair<VAddr, VAddr>> TakeNewPromotions() {
+        std::scoped_lock lock{mutex};
+        has_new.store(false, std::memory_order_relaxed);
+        return std::exchange(new_promotions, {});
+    }
+
+    /// sotc: SOTC_HRR=1: lock-free test: TakeNewPromotions would return something. Stale false
+    /// only delays the granules by one command.
+    bool HasNew() const {
+        return has_new.load(std::memory_order_relaxed);
     }
 
 private:
@@ -223,6 +280,8 @@ private:
             }
             ++it;
         }
+        // sotc: the erasures above may have emptied granules (see NoteBinding's early check).
+        any_granules.store(!granules.empty(), std::memory_order_relaxed);
         auto& mem = *Core::Memory::Instance();
         for (auto& run : runs) {
             const VAddr lo = run.first << GranuleBits;
@@ -271,6 +330,21 @@ private:
                 return lo < n.second && n.first < hi;
             });
             demoted += kept ? 0 : 1;
+        }
+        // sotc: SOTC_HRR=1: granules promoted now and not before, for the migration (dry run: none).
+        if (Real()) {
+            for (const auto& [lo, hi] : next) {
+                for (VAddr g = lo; g < hi; g += Granule) {
+                    const bool was_promoted =
+                        std::any_of(promoted.begin(), promoted.end(), [&](const auto& p) {
+                            return g < p.second && p.first < g + Granule;
+                        });
+                    if (!was_promoted && new_promotions.size() < MaxGranules) {
+                        new_promotions.emplace_back(g, g + Granule);
+                        has_new.store(true, std::memory_order_relaxed);
+                    }
+                }
+            }
         }
         const bool changed = next != promoted;
         promoted = std::move(next);
@@ -330,9 +404,16 @@ private:
         return h;
     }
 
-    std::mutex mutex;
+    mutable std::mutex mutex;
     std::map<u64, Granule_> granules; ///< by granule index
+    /// sotc: SOTC_HRR: granules is not empty (stored under mutex; read relaxed by NoteBinding).
+    std::atomic<bool> any_granules{false};
     std::vector<std::pair<VAddr, VAddr>> promoted; ///< would-be promoted ranges, sorted
+    /// sotc: SOTC_HRR=1: granules promoted since TakeNewPromotions (empty in the dry run).
+    std::vector<std::pair<VAddr, VAddr>> new_promotions;
+    /// sotc: SOTC_HRR=1: new_promotions is not empty. Set under the mutex (Evaluate), cleared by
+    /// TakeNewPromotions; read without the mutex by HasNew (the draw thread's per-command test).
+    std::atomic<bool> has_new{false};
     u64 next_eval_ns = 0;
     u64 blocked_logged = 0;
 };

@@ -310,6 +310,9 @@ private:
         /// sotc: SOTC_RB_EXACT: an owed download item: byte-precise ranges that already left the
         /// GPU-modified set; applying it writes guest bytes only (no tracker or set changes).
         bool owed = false;
+        /// sotc: SOTC_HRR=1: every copy's bytes are read from the host-visible arena chunk they sit
+        /// in, not from a staging copy (no vkCmdCopyBuffer; see BeginAsyncReadbackImpl).
+        bool direct = false;
     };
     /// Collects what a readback of [device_addr, +size) and the hot readbacks must copy. Returns
     /// the bytes to download. sotc: the ranges stay in the GPU-modified set until the caller
@@ -348,6 +351,9 @@ private:
         /// sotc: SOTC_RB_OWNER: part of the asked range belongs to readbacks in flight when it
         /// started (it did not copy those pages): they are finished with it.
         bool has_owners{};
+        /// sotc: SOTC_HRR=1: no copy was recorded for it; the bytes are read from the host-visible
+        /// arena chunks at FinishAsyncReadback (every item is direct, see BeginAsyncReadbackImpl).
+        bool direct{};
         /// sotc: SOTC_RB_ASYNC_AHEAD: the ahead timeline value of its own copies when they went
         /// in an ahead command buffer (Scheduler::SubmitAheadAsync; tick is then 0 or the newest
         /// owner tick), 0 otherwise. wait_ahead: the ahead value the guest waits for (its own or
@@ -443,6 +449,9 @@ private:
     /// work is done (the asking guest thread waited for their ticks).
     void FinishReadyOwners(VAddr addr, u64 size);
     std::vector<AsyncReadback*> inflight_readbacks;
+    /// sotc: SOTC_HRR=1: direct readbacks in inflight_readbacks (counted when they start, released
+    /// in FinishAsyncReadback). RecordCurrentWrite tests it before marking them stale.
+    std::atomic<u32> direct_inflight{};
 
     /// sotc: SOTC_RB_PREFETCH=1 (off by default; needs SOTC_RB_OWNER=1). Draw thread only.
     /// Base granules (the SOTC_RB_NARROW window, 512 KiB without it) the guest read back, with a
@@ -649,6 +658,11 @@ private:
     std::mutex hashed_uploads_mutex; // unbinds run on guest threads (ReleaseMemory)
     std::multimap<VAddr, HashedUpload> hashed_uploads;
     std::atomic<size_t> hashed_upload_count{0};
+    /// sotc: SOTC_HASH_EPOCH=1 (off by default): hull [lo, hi) of the ranges in hashed_uploads.
+    /// Written only under hashed_uploads_mutex (insert, clear, reset when the map empties); read
+    /// relaxed without it by EraseHashedUploads, which skips the lock for a range outside it.
+    std::atomic<VAddr> hashed_lo{~VAddr{0}};
+    std::atomic<VAddr> hashed_hi{0};
 
 public:
     /// sotc: SOTC_FAULT_GRANULE. Called from the guest write fault handler for each page of the
@@ -747,6 +761,7 @@ private:
     /// merged into runs of (device address, bytes). Only rebuilt at the top of a sweep.
     std::vector<std::pair<VAddr, u64>> dma_runs;
     bool dma_full_pending{}; // sotc: the next DMA sweep visits every run (see SynchronizeDmaBuffers)
+    u64 untrack_applied{0};  // sotc: SOTC_UNTRACK_AUTO, the published list version applied last
     std::vector<std::pair<VAddr, u64>> dma_spans;
     /// Readback windows requested recently; downloaded together with the next readback.
     struct HotReadback {
@@ -838,16 +853,34 @@ private:
     /// resident range reached thousands within minutes, each one a kernel call mid-frame (the
     /// open world then ran out of video memory).
     static constexpr u64 ARENA_CHUNK_SIZE = 64_MB;
+    /// sotc: SOTC_HRR=1: host-visible chunks (AllocateArenaBlocksHost), mapped whole.
+    static constexpr u64 ARENA_HOST_CHUNK_SIZE = 16_MB;
     struct ArenaChunk {
         vk::DeviceMemory memory;
         u32 memory_type{};
         u64 used_blocks{};
         std::map<u64, u64> free_runs; ///< first block -> number of free blocks
+        /// sotc: SOTC_HRR=1: whole-chunk mapping of a host-visible chunk, nullptr for the others.
+        u8* mapped{};
     };
     std::vector<std::unique_ptr<ArenaChunk>> arena_chunks;
     std::unordered_map<VkDeviceMemory, ArenaChunk*> chunk_by_memory;
     /// Memory and first block for blocks of arena backing (video memory, else system memory).
     std::pair<vk::DeviceMemory, u64> AllocateArenaBlocks(u64 blocks);
+    /// sotc: SOTC_HRR=1 (hrr.h): like AllocateArenaBlocks, but only in host-visible memory
+    /// (arena_host_memory_type_index), in chunks that are mapped when created. {nullptr, 0} when
+    /// there is no such memory or no room: the caller then uses AllocateArenaBlocks.
+    std::pair<vk::DeviceMemory, u64> AllocateArenaBlocksHost(u64 blocks);
+    /// sotc: mapped pointer of [addr, addr + size) when every block of it is resident in one host
+    /// chunk, contiguously; nullptr otherwise.
+    u8* ArenaHostPointer(VAddr addr, u64 size) const;
+    /// sotc: ArenaHostPointer, also giving the memory object and the byte offset in it.
+    u8* ArenaHostLocate(VAddr addr, u64 size, vk::DeviceMemory& memory, u64& offset) const;
+    /// sotc: SOTC_HRR=1: true when every copy of a direct readback still lies in a mapped host
+    /// chunk (ArenaHostPointer): the bytes FinishAsyncReadback reads are there.
+    bool DirectReadable(const AsyncReadback& readback) const;
+    /// sotc: SOTC_HRR=1: number of host-visible arena chunks (AllocateArenaBlocksHost, ReturnArenaRun).
+    u32 arena_host_chunks{};
     void FreeArenaBlocks(vk::DeviceMemory memory, u64 start, u64 blocks);
     void ReturnArenaRun(vk::DeviceMemory memory, u64 start, u64 blocks);
     /// sotc: SOTC_ARENA_TICK_FREE=1: runs freed by FreeArenaBlocks wait here, stamped with the
@@ -874,7 +907,8 @@ private:
     /// sotc: resident ranges (by first block) whose read-back did not match guest memory,
     /// tried again after this.
     std::unordered_map<u64, std::chrono::steady_clock::time_point> evict_retry;
-    /// sotc: arena memory in use (blocks handed out of the chunks), in bytes.
+    /// sotc: device arena memory in use (blocks handed out of the device chunks), in bytes. Host
+    /// chunks (SOTC_HRR) are not counted: the eviction limit is about video memory.
     u64 ArenaUsedBytes() const noexcept;
     u16 use_epoch{1};
     /// sotc: sets use_epoch from the clock (once per submit and per eviction check).
@@ -904,9 +938,34 @@ private:
         std::chrono::steady_clock::time_point deadline{};
     };
     std::optional<PendingEviction> pending_eviction;
-    bool FinishEviction(std::chrono::steady_clock::time_point now, u16 idle_epochs, bool wait);
+    /// migration: true when called by MigrateHostResident (keeps hot_readbacks: the granule stays
+    /// hot, it only moves to host memory).
+    bool FinishEviction(std::chrono::steady_clock::time_point now, u16 idle_epochs, bool wait,
+                        bool migration = false);
+    /// sotc: SOTC_HRR=1 (hrr.h): moves a few newly promoted granules from device memory to host
+    /// memory, through FinishEviction's own checks and unbind. Called from PrefetchIssue (a
+    /// command boundary outside a render pass, draw thread). Granules that fail a check stay where
+    /// they are: they are tried again up to 3 times, at most once a second. Synchronous.
+    void MigrateHostResident();
+    /// sotc: SOTC_HRR=1: a promoted granule waiting for MigrateHostResident (draw thread only).
+    /// tries: failed attempts so far; next: the earliest time of the next attempt.
+    struct MigrateItem {
+        VAddr lo{};
+        u32 tries{};
+        std::chrono::steady_clock::time_point next{};
+    };
+    std::vector<MigrateItem> hrr_migrate_queue;
+    /// sotc: SOTC_HRR=1: migrated granules per game frame (SotcStats::flip_count) and the frame
+    /// they were counted in.
+    u64 hrr_frame{};
+    u32 hrr_frame_granules{};
 
     u32 arena_memory_type_index{};
+    /// sotc: SOTC_HRR=1: host-visible memory type for promoted arena ranges (AllocateArenaBlocksHost):
+    /// HOST_VISIBLE|HOST_CACHED outside device-local heaps if any, else inside them. Without a
+    /// HOST_CACHED type there is none (Real() then runs as the dry run).
+    std::optional<u32> arena_host_memory_type_index;
+    bool arena_host_coherent{};
     std::optional<u32> arena_fallback_memory_type_index;
     u32 block_size{};
     u32 block_shift{};

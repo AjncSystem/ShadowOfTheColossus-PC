@@ -2,6 +2,7 @@
  * Each function follows the PS4 contract as implemented by shadPS4 (GPL-2.0-or-later). */
 #define _CRT_RAND_S
 #include "runtime.h"
+#include "trace.h"
 #include <errno.h>
 #include <math.h>
 #include <pthread.h>
@@ -53,11 +54,13 @@ static ABI int32_t is_neo_mode(void) {
     return runtime_sotc_neo();
 }
 static ABI int32_t kernel_sleep(uint32_t seconds) {
+    const uint64_t t0=trace_now(); /* sotc: SOTC_TRACE */
 #ifdef _WIN32
     Sleep(seconds*1000u);
 #else
     sleep(seconds);
 #endif
+    trace_span("sleep",t0,(uint64_t)seconds*1000000000u,(uint64_t)__builtin_return_address(0));
     return 0;
 }
 static ABI int32_t get_thread_id(void) {
@@ -426,7 +429,9 @@ static ABI int32_t evf_wait(EventFlag *f, uint64_t bits, uint32_t mode, uint64_t
     if (f && f->traced) fprintf(stderr,"EVF wait %p 0x%llx mode 0x%x (bits 0x%llx) from %p thread %lu\n",(void *)f,
                                 (unsigned long long)bits,mode,(unsigned long long)f->bits,__builtin_return_address(0),
                                 (unsigned long)get_thread_id());
+    const uint64_t t0=trace_now(); /* sotc: SOTC_TRACE */
     int32_t r=evf_wait_common(f,bits,(int)mode,result,timeout,0);
+    trace_span("evf wait",t0,bits,(uint64_t)__builtin_return_address(0));
     if (f && f->traced) fprintf(stderr,"EVF woke %p -> 0x%x thread %lu\n",(void *)f,(unsigned)r,(unsigned long)get_thread_id());
     return r;
 }

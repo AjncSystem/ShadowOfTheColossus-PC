@@ -52,6 +52,15 @@ public:
         return pages;
     }
 
+    /// sotc: SOTC_UNTRACK_AUTO: like UnmarkRegionAsGpuModified(.., false), after a download wrote
+    /// the GPU's bytes into guest memory: untracked pages get their CPU bit back (see retrack in
+    /// RegionManager::ChangeRegionState).
+    void UnmarkDownloadedAsGpuModified(VAddr cpu_addr, u64 size) noexcept {
+        IteratePages(cpu_addr, size, [](RegionManager* manager, u64 offset, u64 size) {
+            manager->template ChangeRegionState<StateOp::None, StateOp::Clear>(offset, size, true);
+        });
+    }
+
     /// Unmark region as modified from the host GPU
     void UnmarkRegionAsGpuModified(VAddr cpu_addr, u64 size, bool is_write) noexcept {
         IteratePages(cpu_addr, size, [is_write](RegionManager* manager, u64 offset, u64 size) {
@@ -247,6 +256,13 @@ public:
             if (guest_fault) {
                 manager->NoteGuestWriteFaultLocked(offset);
             }
+            // sotc: SOTC_UNTRACK_AUTO self-check. A protected, untracked page without a GPU bit
+            // faulted: the untracking did not hold, so the list is dropped (SotcUntrack::Trip).
+            if (guest_fault && SotcUntrack::AutoOn()) {
+                if (const u64 bad = manager->CountUntrackedFaultsLocked(offset, size)) {
+                    SotcUntrack::NoteUntrackedFaults(bad);
+                }
+            }
             const bool modified = manager->template IsRegionModified<Type::GPU>(offset, size);
             if (!modified) {
                 manager->template ChangeRegionState<StateOp::Set, StateOp::None, false>(offset,
@@ -398,6 +414,19 @@ public:
                 f(manager->CpuAddress() + u64(first) * BYTES_PER_WORD, u64(count) * BYTES_PER_WORD);
                 words = first + count >= 64 ? 0 : words & (~0ULL << (first + count));
             }
+        }
+    }
+
+    /// sotc: SOTC_UNTRACK_AUTO. Gives every live region its untracked mask for `ranges` (the list
+    /// the flip thread published, SotcUntrack::AutoSnapshot). GPU command (draw) thread only, as
+    /// ForEachSweepSpan. With readbacks disabled nothing is untracked (the self-check is blind there).
+    void ApplyUntracked(const std::vector<SotcUntrack::Range>& ranges) {
+        const bool enabled = readbacks_mode != GpuReadbacksMode::Disabled;
+        for (size_t i = 0; i < live_managers.size(); ++i) {
+            RegionManager* manager = live_managers[i];
+            manager->SetUntrackedMask(
+                enabled ? RegionManager::BuildUntrackedMask(manager->CpuAddress(), ranges)
+                        : RegionBits{});
         }
     }
 

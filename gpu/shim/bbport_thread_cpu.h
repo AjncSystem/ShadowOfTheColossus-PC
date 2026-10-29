@@ -13,6 +13,9 @@ namespace BbThreadCpu {
 /// Its CPU time is then summed into Sample(out[role]). Call once, from the thread itself, at its
 /// start; registrations past the fixed table size are ignored.
 void Register(int role);
+/// sotc: SOTC_STALL_DETAIL: like Register, but only while fewer than (table size - 64) threads are
+/// registered, so game threads can never take the slots of GPU threads that start later.
+void RegisterLowPriority(int role);
 
 constexpr int MaxRoles = 8;
 
@@ -20,5 +23,9 @@ constexpr int MaxRoles = 8;
 /// Monotonic per thread (an exited thread keeps its last value), so differences of two samples
 /// are the CPU time used between them. Callable from any thread.
 void Sample(uint64_t out[MaxRoles]);
+
+/// sotc: SOTC_STALL_DETAIL: the same per-role sums, split into user and kernel time (Windows:
+/// GetThreadTimes, whose resolution is the scheduler tick; other platforms report zeros). Monotonic.
+void SampleSplit(uint64_t user[MaxRoles], uint64_t kernel[MaxRoles]);
 
 } // namespace BbThreadCpu

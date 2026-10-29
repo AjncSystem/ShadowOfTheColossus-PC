@@ -303,6 +303,26 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool 
         const char* v = std::getenv("SOTC_DMA_OVERLAP");
         return !v || v[0] != '0';
     }();
+    // sotc: SOTC_INVAL_INDEX=1 (off by default). ForEachImageInRegion below visits only the images
+    // in page_table for the pages of the range. page_images counts, per 1 MiB page, the entries of
+    // page_table[page]: RegisterImage/UnregisterImage change both together under `mutex` (held
+    // here), so a zero count on every page proves the walk visits nothing. Pages past
+    // NumImagePages count as occupied, and an empty range is never skipped.
+    static const bool inval_index = [] {
+        const char* v = std::getenv("SOTC_INVAL_INDEX");
+        return v && v[0] == '1';
+    }();
+    if (inval_index && max_size != 0) {
+        const u64 first = address >> Traits::PAGE_BITS;
+        const u64 last = (address + max_size - 1) >> Traits::PAGE_BITS;
+        bool occupied = last >= NumImagePages;
+        for (u64 page = first; !occupied && page <= last; ++page) {
+            occupied = page_images[page].load(std::memory_order_relaxed) != 0;
+        }
+        if (!occupied) {
+            return;
+        }
+    }
     if (any_overlap && dma_overlap) {
         ForEachImageInRegion(address, max_size, [&](ImageId, Image& image) {
             if (image.Overlaps(address, max_size)) {
@@ -800,6 +820,8 @@ void TextureCache::ImageDesc::InitMipTail(const AmdGpu::Image& image,
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     const auto& info = desc.info;
+    // sotc: SOTC_TRACE (kept when over 20 us: a new image, a resolve, an overlap)
+    const SotcTrace::ScopeMin trace_find{"find image", info.guest_address};
     ASSERT(info.guest_address != 0);
 
     std::unique_lock lock{mutex, std::defer_lock};
@@ -1196,6 +1218,8 @@ void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }
+    // sotc: SOTC_TRACE: a = guest address, kept when over 20 us
+    const SotcTrace::ScopeMin trace_refresh{"image upload", image.info.guest_address};
     const SotcStats::FrameTimer frame_timer{SotcStats::FrameUpload};
     // sotc: RefreshImage always runs under `mutex` (UpdateImage, FindImage -> ExpandImage) and can
     // reach EnsureResident through ObtainBufferForImage; see TryEmergencyCollect.

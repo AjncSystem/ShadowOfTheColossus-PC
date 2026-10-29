@@ -1891,6 +1891,9 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
         if (SotcStats::kFpsLog) {
             SotcStats::rec_busy_ns.fetch_add(SotcStats::NowNs() - sotc_busy_start,
                                              std::memory_order_relaxed);
+            if (SotcTrace::kOn) { // sotc: SOTC_TRACE
+                SotcTrace::Span("rec busy", sotc_busy_start, SotcStats::NowNs());
+            }
         }
         if (perf) {
             Common::PerfStats::Add(

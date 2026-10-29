@@ -20,6 +20,29 @@ namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
 
+void Scheduler::SetHostVisibility(bool on) {
+    host_visibility.store(on, std::memory_order_release);
+}
+
+// sotc: SOTC_HRR=1 (see Scheduler::SetHostVisibility). Called right before each command buffer
+// ends, outside any render pass. A global memory barrier: every write of the command buffer, and
+// of the ones before it on the queue, is made available to host reads.
+static void RecordHostVisibility(vk::CommandBuffer cmdbuf) {
+    if (!Scheduler::host_visibility.load(std::memory_order_acquire)) {
+        return;
+    }
+    const vk::MemoryBarrier2 host_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &host_barrier,
+    });
+}
+
 Scheduler::Scheduler(const Instance& instance, bool record_thread)
     : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
     if (record_thread) {
@@ -35,6 +58,40 @@ Scheduler::Scheduler(const Instance& instance, bool record_thread)
     BeginSession();
     priority_pending_ops_thread =
         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
+    // sotc: SOTC_TRACE: only the draw scheduler (the one with its own recording thread) is
+    // watched; the present and flip schedulers do little GPU work.
+    if (SotcTrace::kOn && record_thread) {
+        trace_queue = SotcTrace::RegisterQueue("GPU: draw scheduler queue");
+        trace_watch_thread = std::jthread(std::bind_front(&Scheduler::TraceWatchThread, this));
+    }
+}
+
+void Scheduler::TraceWatchThread(std::stop_token stoken) {
+    Common::SetCurrentThreadName("shadPS4:SotcTraceGpuWatch");
+    const auto device = instance.GetDevice();
+    const vk::Semaphore semaphore = work_semaphore.Handle();
+    u64 done = 0;
+    if (const auto [result, value] = device.getSemaphoreCounterValue(semaphore);
+        result == vk::Result::eSuccess) {
+        done = value;
+    }
+    // Polls the counter instead of vkWaitSemaphores: on NVIDIA, ~500 timed-out waits per second
+    // made every vkQueueSubmit slower and slower (1 -> 74 ms per frame over a minute). The
+    // completion time is therefore known to the sleep granularity (about 0.5-1 ms).
+    while (!stoken.stop_requested()) {
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+        const auto [result, value] = device.getSemaphoreCounterValue(semaphore);
+        if (result != vk::Result::eSuccess) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2)); // device lost etc.
+            continue;
+        }
+        if (value <= done) {
+            continue;
+        }
+        const u64 first = value - done > 4096 ? value - 4095 : done + 1;
+        SotcTrace::Completed(trace_queue, first, value, SotcStats::NowNs());
+        done = value;
+    }
 }
 
 Scheduler::~Scheduler() {
@@ -268,6 +325,7 @@ void Scheduler::SubmitAheadAndWait() {
         work_semaphore.RecordMarker(ahead_cmdbuf, Semaphore::MarkerSlot::Ahead,
                                     static_cast<u32>(++ahead_sequence));
     }
+    RecordHostVisibility(ahead_cmdbuf);
     Check(ahead_cmdbuf.end());
     // With the recorder, the earlier submits must have reached the queue first.
     WaitSubmitted(CurrentTick() - 1);
@@ -372,6 +430,7 @@ vk::CommandBuffer Scheduler::BeginAheadAsync() {
 u64 Scheduler::SubmitAheadAsync() {
     AheadSlot& slot = *std::exchange(ahead_slot_open, nullptr);
     const vk::CommandBuffer cmdbuf = slot.cmdbuf;
+    RecordHostVisibility(cmdbuf);
     Check(cmdbuf.end());
     // Values are handed out in the order of the submits: both happen in producer order (the
     // recording thread runs its stream in order).
@@ -558,10 +617,12 @@ void Scheduler::EndSession() {
 
     const auto& session = sessions.back();
     if (session.upload) {
+        RecordHostVisibility(session.upload);
         Check(session.upload.end());
     }
 
     EndRendering();
+    RecordHostVisibility(session.primary);
     Check(session.primary.end());
 }
 
@@ -669,6 +730,7 @@ bool XferQueue::Copy(vk::Buffer src, vk::Buffer dst, std::span<const vk::BufferC
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
     }));
     slot.cmd.copyBuffer(src, dst, copies);
+    RecordHostVisibility(slot.cmd);
     Check(slot.cmd.end());
 
     const vk::Semaphore xfer_sem = *timeline;
@@ -749,6 +811,7 @@ void XferQueue::CopyAndWait(std::span<const Region> regions) {
         for (const auto& region : regions) {
             slot.cmd.copyBuffer(region.src, region.dst, region.copy);
         }
+        RecordHostVisibility(slot.cmd);
         Check(slot.cmd.end());
         const vk::TimelineSemaphoreSubmitInfo timeline_info = {
             .signalSemaphoreValueCount = 1u,
@@ -846,6 +909,7 @@ u64 XferQueue::ReadbackCopy(u64 graphics_tick, std::span<const ReadbackRegion> r
         .memoryBarrierCount = 1,
         .pMemoryBarriers = &host_barrier,
     });
+    RecordHostVisibility(slot.cmd);
     Check(slot.cmd.end());
 
     // RAW: the wait on the graphics timeline value of the writer tick makes the writes of that
@@ -1047,7 +1111,12 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
             {
                 // sotc: SOTC_FPS accounting: vkQueueSubmit time of the recording thread
                 const SotcStats::RoleTimer submit_time{SotcStats::RoleRecorder,
-                                                       SotcStats::rec_submit_ns};
+                                                       SotcStats::rec_submit_ns, "queue submit"};
+                // sotc: SOTC_TRACE: stored before the submit, so the watcher never sees the
+                // tick complete without it
+                if (SotcTrace::kOn) {
+                    SotcTrace::Submitted(trace_queue, signal_value, SotcStats::NowNs());
+                }
                 QueueSubmit(instance, info, real);
             }
             recorded_submit_tick.store(signal_value, std::memory_order_release);
@@ -1058,6 +1127,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     } else {
         if (auto* async_upload = VideoCore::AsyncUpload::Get()) { // sotc: SOTC_ASYNC_UPLOAD
             async_upload->WaitUpTo(this, signal_value);
+        }
+        if (SotcTrace::kOn) { // sotc: SOTC_TRACE (before the submit, see above)
+            SotcTrace::Submitted(trace_queue, signal_value, SotcStats::NowNs());
         }
         QueueSubmit(instance, info, cmd_buffers);
     }

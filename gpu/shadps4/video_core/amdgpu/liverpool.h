@@ -148,6 +148,8 @@ public:
     /// sotc: the SOTC_CP_AHEAD value (0 off, the default; 1 parse gate; 2 frame tickets; other
     /// non-zero values mean 1, as before mode 2 existed). See gnmdriver.cpp WaitSubmitGate.
     static int CpAheadMode() noexcept;
+    /// sotc: SOTC_OPSTAT: sizeof(BackOp) (the type is private).
+    static std::size_t BackOpSize() noexcept;
     /// sotc: SOTC_CP_AHEAD=2: frames closed by SubmitDone so far (any thread).
     u64 FramesMarked() const noexcept {
         return frames_marked.load(std::memory_order_acquire);
@@ -625,6 +627,9 @@ private:
                                              regs.reg_array.data());
         MarkRegs(offset, static_cast<u32>((bytes + 3) / 4));
     }
+    /// sotc: SOTC_REG_SAME (liverpool.cpp). Copies dwords from src to regs at dst and marks the
+    /// chunks dirty; with SOTC_REG_SAME=1 nothing is copied or marked when the words are unchanged.
+    void WriteRegsMarked(u32 dst, const void* src, u32 dwords);
     void ExecuteBackOp(BackOp& op);
     void BackLoop(std::stop_token stoken);
     /// sotc: SOTC_EOP_TICK=1. Runs the end-of-pipe labels the GPU has finished, and flushes the
@@ -656,16 +661,31 @@ private:
     bool back_strict{};
     /// sotc: SOTC_WAIT_NOSPIN=1: BackLoop spins ~20 us, then blocks on back_wake (not back_cv).
     bool back_nospin{};
+    // sotc: switches read in the constructor (liverpool.cpp), all OFF by default:
+    // SOTC_BACK_HEAD_CACHE (draw thread caches back_head), SOTC_BACK_PF (prefetch of the next
+    // op's register chunks), SOTC_REG_SAME (register writes that change nothing are not marked,
+    // WriteRegsMarked), SOTC_OPSTAT (counters printed every 5 s).
+    bool back_head_cache{};
+    bool back_pf{};
+    bool reg_same{};
+    bool opstat{};
     /// sotc: doorbell BackLoop blocks on under back_nospin; see WakeBackAtomic.
     std::atomic<u32> back_wake{0};
     std::thread::id back_id{};
     std::vector<BackOp> back_ring;
-    std::atomic<u64> back_head{0};
-    std::atomic<u64> back_tail{0};
+    // sotc: the command processor writes back_head and the draw thread writes back_tail on every
+    // op. Each gets its own cache line (layout only, no behaviour change), so the two per-op stores
+    // do not bounce one line between the cores. back_sleeping is read per op by the command
+    // processor (BackPublish) and stays with back_head; drain_waiting is read per op by the draw
+    // thread and stays with back_tail.
+    alignas(64) std::atomic<u64> back_head{0};
+    std::atomic<bool> back_sleeping{false};
     /// sotc: finished task frames and the back_head they wait for (FreeTaskFrame)
     std::vector<std::pair<std::coroutine_handle<>, u64>> finished_frames;
-    std::atomic<bool> back_sleeping{false};
+    alignas(64) std::atomic<u64> back_tail{0};
     std::atomic<bool> drain_waiting{false};
+    /// sotc: SOTC_BACK_HEAD_CACHE: the last back_head the draw thread loaded (draw thread only).
+    u64 draw_known_head{};
     std::mutex back_mutex;
     std::condition_variable back_cv;
     std::condition_variable drain_cv;

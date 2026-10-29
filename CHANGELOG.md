@@ -1,6 +1,98 @@
 # Changelog
 
 ## Não lançado — desempenho no streaming e correções visuais
+- **Medido (29 out): a segunda rodada não melhorou.** Os cortes do anel de operações
+  (`SOTC_BACK_HEAD_CACHE`, `SOTC_BACK_PF`, `SOTC_REG_SAME`) sozinhos: thread de desenho 21,5 ms
+  por quadro contra 19,2 ms da base enxuta (sessão mais pesada; nenhum sinal de ganho). O
+  `SOTC_OPSTAT` mostrou o porquê: o custo fixo de cada operação no anel é ~0,12–0,2 µs de ~5 µs; o
+  resto é o próprio draw. `SOTC_PR_RESOLVE` divergiu do cálculo normal 12 vezes numa sessão
+  (`SOTC_PR_VERIFY` desligou o atalho nesses draws): não usar até ser investigado.
+- **`SOTC_MDI_STATS=1` (diagnóstico, desligado):** conta quantos draws indiretos seguidos poderiam
+  virar um multi-draw (mesmo estado, argumentos contíguos, nada entre eles). Medido: ~3.000 draws
+  indiretos por quadro, só ~5% com argumentos escritos pela GPU; ~85–90% formam sequências de 1;
+  só 3–12% dariam para juntar. Juntar draws não compensa neste jogo.
+- **Medido (29 out): a configuração enxuta é o que melhorou.** Sem `SOTC_PROFILE`, `SOTC_TRACE` e
+  `SOTC_HRR=dry`, e com `SOTC_FPS_LEAN=1`, a thread de desenho caiu de 21–24 para ~19 ms de CPU por
+  quadro e os quadros acima de 60 ms de 12–17 para 6–8 numa sessão de ~70 s. Os cinco switches da
+  rodada anterior (`SOTC_SYNC_PRECHECK`, `SOTC_GPUMOD_CONTAINS`, `SOTC_HASH_EPOCH`,
+  `SOTC_BIND_MARK_ONCE`, `SOTC_INVAL_INDEX`) não mudaram nada mensurável (19,0 contra 19,2 ms).
+- **Segunda rodada para a thread de desenho (experimentais, todos desligados; ainda não medidos):**
+  - `SOTC_BACK_HEAD_CACHE=1`: a thread de desenho só relê o início do anel de operações quando
+    alcança o valor que já tinha; `SOTC_BACK_PF=1` (com o anterior) pré-carrega os registradores da
+    próxima operação. O início e o fim do anel agora ficam em linhas de cache separadas (só layout).
+  - `SOTC_REG_SAME=1`: uma escrita de registrador que não muda o valor não marca o bloco como
+    alterado (o bloco não é copiado de novo para a operação seguinte).
+  - `SOTC_PR_RESOLVE=1` (com `SOTC_PARALLEL_RECORD`): as threads de preparação já calculam os
+    descritores de buffer e textura de cada draw (leitura dos V#/T#, limites de faixa); a thread
+    de desenho só confere e usa. `SOTC_PR_VERIFY=1` refaz a conta e desliga o atalho se divergir.
+  - `SOTC_UNTRACK_AUTO=1`: as faixas do heap por quadro RenderSingleFrameGPU do jogo deixam de ser
+    protegidas e passam a ser enviadas a cada bind de leitura, achadas sozinhas a cada 30 quadros
+    (até `SOTC_UNTRACK_MAX_MB`, padrão 16); desliga sozinho se aparecer uma falta numa delas.
+  - `SOTC_ASYNC_JOB_MB=<n>`: uploads assíncronos maiores que n MiB viram vários jobs menores.
+    `SOTC_ASYNC_STAGE_CACHED=1`: staging dos uploads em memória cacheada (ignorado com
+    `SOTC_REBAR_UPLOAD`). `SOTC_IMAGE_PREFETCH_MAX=<n>`: mais imagens criadas antecipadamente.
+  - Diagnóstico: `SOTC_STALL_DETAIL=1` (com `SOTC_FPS`) acrescenta às linhas `SOTCSTALL` o tempo de
+    ritmo de flip, a CPU somada das threads do jogo e a divisão usuário/kernel das threads de
+    upload; `SOTC_OPSTAT=1` imprime a cada 5 s as operações da thread de desenho por tipo.
+  - Analisados e não implementados: aplicar os readbacks na própria thread do jogo (ganho estimado
+    de 1,5–3%, exige mais uma ida e volta à thread de desenho) e dividir a thread de desenho em
+    várias (~1,1–1,3x com 8 núcleos: a maior parte do trabalho mexe nos caches e precisa ser em
+    série).
+- **O que o gravador de linha do tempo mostrou sobre as travadas (29 out):** a thread de desenho do
+  port não tem folga. Nos quadros normais perto de uma travada ela já fica ocupada o quadro inteiro
+  (~5.700 operações, 6–10 µs cada) com a GPU ~50% ocupada; nos lentos o jogo pede ~14% mais
+  operações e cada uma custa ~21% mais, e o quadro dobra. Os readbacks do jogo (culling XPR,
+  partículas) só esperam por ela. Não há um culpado único: binds de buffer, operações curtas,
+  aplicação de readbacks, uploads e binds de texturas dividem o tempo. Atenção para medições
+  antigas: o `SOTC_PROFILE` suspende a thread de desenho ~1 vez por ms, e os timers do `SOTC_FPS` e
+  do `SOTC_TRACE` somam ~10% dela.
+- **Switches novos para dar folga à thread de desenho (experimentais, todos desligados; ainda não
+  medidos):**
+  - `SOTC_FPS_LEAN=1`: o `SOTC_FPS` mantém o resumo e as contagens, sem as leituras de relógio por
+    operação nem as marcas de escrita por shader (as colunas de tempo detalhado saem zeradas).
+  - `SOTC_SYNC_PRECHECK=1`: a sincronização de um buffer confere antes, sem locks, se ele está
+    limpo, e só então faz a varredura completa.
+  - `SOTC_GPUMOD_CONTAINS=1`: um bind escrito numa faixa já marcada como escrita pela GPU sai com
+    um lock compartilhado, sem o exclusivo.
+  - `SOTC_HASH_EPOCH=1`: com `SOTC_HASH_SMALL`, pula o mutex dos hashes quando a faixa está fora
+    de todos os uploads com hash.
+  - `SOTC_BIND_MARK_ONCE=1`: tira uma marcação de escrita repetida por bind escrito.
+  - `SOTC_INVAL_INDEX=1`: um bind escrito só procura imagens a invalidar quando há alguma imagem
+    nas páginas dele (contagem por página que o cache de texturas já mantém).
+  - `SOTC_UNTRACK_RANGES=<endereço:tamanho,...>`: faixas que nunca são protegidas e são enviadas
+    de novo a cada bind de leitura (desligado com `SOTC_CP_AHEAD`); `SOTC_UNTRACK_LOG=1` imprime
+    os blocos do heap por quadro RenderSingleFrameGPU do jogo, para escolher as faixas.
+  - Sem switch, sem mudança de resultado: o HRR em modo dry sai sem lock quando não há nada
+    rastreado, e leituras de relógio que só alimentavam relatórios deixaram de rodar com o
+    `SOTC_FPS` desligado.
+- **`SOTC_TRACE=1`: gravador de linha do tempo para os quadros lentos (diagnóstico, desligado).**
+  Cada thread que participa de um quadro grava o que fez num buffer circular próprio, sem lock: as
+  threads do jogo (esperas em event flag, semáforo, cond, mutex disputado, equeue, sleep; leitura de
+  arquivo; espera de upload antes de o runtime escrever na memória do jogo; faltas de leitura e
+  escrita, com o endereço e a instrução do jogo; readbacks; submits e flips), o processador
+  de comandos (parse por fila, bloqueio na thread de desenho, sono), a thread de desenho (cada
+  operação acima de 50 µs e toda escrita de label, as outras curtas agrupadas; esperas por GPU,
+  recorder, upload e lock de
+  texturas; ociosidade), a thread de gravação (blocos, espera de upload, vkQueueSubmit), a GPU (quando
+  cada submit terminou de fato, por fila) e o presenter. Quando um quadro passa de `SOTC_TRACE_MS`
+  (padrão 60), salva a janela em volta dele (`SOTC_TRACE_PRE_MS` antes, padrão 150; `SOTC_TRACE_POST_MS`
+  depois, padrão 40) em `user/trace/<sessão>/`, no formato do Chrome, que o ui.perfetto.dev abre no
+  navegador; no máximo `SOTC_TRACE_MAX` arquivos por sessão (padrão 40). Cada thread é uma faixa, e o
+  endereço de retorno do jogo aparece como offset do eboot. Serve para ver qual cadeia de esperas
+  segurou o flip em cada travada, em vez das somas do `SOTCSTALL`. Sem a variável, nada muda.
+- **`SOTC_HOOK_PSTATS=1` (experimental, desligado; resultado medido: não reduz as faltas):** tira uma escrita do jogo em
+  `ParticleSystemPool::ProcessStats` (eboot `0x101ae4`, troca 3 bytes por um `nop`). A cada quadro,
+  ela gravava a hora atual num array de "último quadro vivo" de cada sistema de partículas (heap
+  padrão, `pool+0x188`), que o jogo não lê em lugar nenhum encontrado. As páginas desse array caem
+  nos mesmos blocos de 64 KiB que dados da GPU, então essa escrita sozinha era 53% de todas as
+  faltas de escrita do jogo (~1.400/s numa sessão de 5.000 quadros). A gravação na criação do sistema
+  e o tempo de vida das partículas (contado a partir da criação) não mudam. Os bytes originais são
+  conferidos antes; em outra versão do jogo nada é alterado. Medido (~70 s, 29 out): a instrução
+  some das faltas, mas o total fica igual (~2.870 faltas de escrita/s antes e depois) e os quadros
+  lentos também (13; base 12–16). Cada bloco de 64 KiB é protegido de novo a cada quadro e a
+  primeira escrita da CPU nele, de qualquer instrução, é que paga a falta: tirada essa, a próxima
+  escrita do jogo no mesmo bloco faz o mesmo papel. Os "53%" vinham da lista das 12 maiores por
+  região, que pesava demais essa instrução.
 - **`SOTC_RB_EXACT=publish` (experimental, desligado; resultado medido: pior):** versão enxuta do
   `SOTC_RB_EXACT`, sem o mapa de quem escreveu cada byte. Adia só o label do XPR (EOP, evento
   `0x28` BOTTOM_OF_PIPE_TS, 32 bits, valor 1) que vem depois de escritas da GPU, copia em bloco o que

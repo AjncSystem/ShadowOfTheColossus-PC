@@ -7,8 +7,12 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <utility>
+#include <mutex>
+#include <vector>
 
 #include "common/adaptive_mutex.h"
 #include "common/types.h"
@@ -185,6 +189,176 @@ struct HotPages {
     }
 };
 
+/// sotc: SOTC_UNTRACK_RANGES=<hexaddr:hexsize,...> (off when unset). Guest ranges the port never
+/// write-protects. A page of such a range keeps its CPU bit after every upload that collects it
+/// (RegionManager::ForEachModifiedRange, grace_op), so it is never Track()ed again and every bind
+/// that covers it uploads it again: a guest write is seen by the next bind without a write fault.
+/// The price is one upload per bind for every untracked page, so only a range the game rewrites
+/// every frame is worth listing. Read bindings only: a page the GPU wrote is never kept (a CPU
+/// upload over it would undo the GPU result), it takes the normal path and is protected again.
+/// Disabled unless SOTC_CP_AHEAD is unset or 0.
+struct SotcUntrack {
+    struct Range {
+        u64 addr;
+        u64 size;
+        bool operator==(const Range&) const = default;
+    };
+    /// The parsed list, read once when the first region is created. Malformed entries are skipped.
+    static const std::vector<Range>& Ranges() {
+        static const std::vector<Range> ranges = Parse();
+        return ranges;
+    }
+    /// Untracked pages whose upload kept their CPU bit, summed over all uploads (SOTC_UNTRACK_LOG).
+    static u64 PagesKept() {
+        return pages_kept.load(std::memory_order_relaxed);
+    }
+    inline static std::atomic<u64> pages_kept{0};
+
+    /// sotc: SOTC_UNTRACK_AUTO=1 (off by default; off too when SOTC_CP_AHEAD is set, as Parse()).
+    /// The flip thread publishes the live chunk list of the game's heap (driver.cpp,
+    /// UntrackAutoTick); the draw thread applies it to the regions (BufferCache::SynchronizeDmaBuffers).
+    /// Only the list is shared between the two threads.
+    static bool AutoOn() {
+        static const bool on = [] {
+            const char* v = std::getenv("SOTC_UNTRACK_AUTO");
+            const char* ahead = std::getenv("SOTC_CP_AHEAD");
+            return v && v[0] == '1' && !(ahead && std::atoi(ahead) != 0);
+        }();
+        return on;
+    }
+    /// sotc: flip thread. Publishes a live list, clipped in list order to SOTC_UNTRACK_MAX_MB (16
+    /// when unset). An unchanged list publishes nothing; nothing is published after a trip.
+    static void Publish(std::vector<Range> live) {
+        static const u64 cap = [] {
+            const char* v = std::getenv("SOTC_UNTRACK_MAX_MB");
+            const u64 mib = v ? std::strtoull(v, nullptr, 10) : 16;
+            return std::min<u64>(mib, 1024) << 20;
+        }();
+        std::vector<Range> clipped;
+        u64 total = 0;
+        for (const Range& r : live) {
+            if (total >= cap) {
+                break;
+            }
+            const u64 size = std::min(r.size, cap - total);
+            clipped.push_back(Range{r.addr, size});
+            total += size;
+        }
+        std::scoped_lock lock{AutoMutex()};
+        if (tripped.load(std::memory_order_relaxed) || clipped == AutoActive()) {
+            return;
+        }
+        AutoActive() = std::move(clipped);
+        auto_bytes.store(total, std::memory_order_relaxed);
+        auto_version.fetch_add(1, std::memory_order_release);
+        std::fprintf(stderr, "SOTC untrack auto: %zu ranges, %.1f MiB untracked (cap %llu MiB)\n",
+                     AutoActive().size(), total / 1048576.0,
+                     static_cast<unsigned long long>(cap >> 20));
+    }
+    /// sotc: any thread. The published list (copied) and its version.
+    static std::vector<Range> AutoSnapshot(u64& version) {
+        std::scoped_lock lock{AutoMutex()};
+        version = auto_version.load(std::memory_order_relaxed);
+        return AutoActive();
+    }
+    /// sotc: the version the draw thread compares with the one it applied last.
+    static u64 AutoVersion() {
+        return auto_version.load(std::memory_order_acquire);
+    }
+    /// sotc: self-check. `bad` guest write faults hit pages that were untracked, had no GPU bit and
+    /// were protected (MemoryTracker::InvalidateRegion, region mutex held). Fails closed (Trip).
+    static void NoteUntrackedFaults(u64 bad) {
+        faults_untracked.fetch_add(bad, std::memory_order_relaxed);
+        Trip();
+    }
+    /// sotc: fail closed. Publishing stops and the empty list is applied, so the draw thread clears
+    /// every mask and the normal upload path re-protects those pages. Prints one line.
+    static void Trip() {
+        std::scoped_lock lock{AutoMutex()};
+        if (tripped.exchange(true, std::memory_order_relaxed)) {
+            return;
+        }
+        AutoActive().clear();
+        auto_bytes.store(0, std::memory_order_relaxed);
+        auto_version.fetch_add(1, std::memory_order_release);
+        std::fprintf(stderr,
+                     "SOTC untrack auto: disabled after a guest write fault inside an untracked page "
+                     "(%llu pages so far); untracked pages are released\n",
+                     static_cast<unsigned long long>(
+                         faults_untracked.load(std::memory_order_relaxed)));
+    }
+    /// sotc: SOTC_UNTRACK_AUTO report (SOTC FPS line).
+    static u64 AutoBytes() {
+        return auto_bytes.load(std::memory_order_relaxed);
+    }
+    static size_t AutoRanges() {
+        std::scoped_lock lock{AutoMutex()};
+        return AutoActive().size();
+    }
+    static u64 FaultsUntracked() {
+        return faults_untracked.load(std::memory_order_relaxed);
+    }
+    static bool Tripped() {
+        return tripped.load(std::memory_order_relaxed);
+    }
+    inline static std::atomic<u64> auto_version{0};
+    inline static std::atomic<u64> auto_bytes{0};
+    inline static std::atomic<u64> faults_untracked{0};
+    inline static std::atomic<bool> tripped{false};
+
+private:
+    static std::mutex& AutoMutex() {
+        static std::mutex m;
+        return m;
+    }
+    static std::vector<Range>& AutoActive() {
+        static std::vector<Range> v;
+        return v;
+    }
+    static std::vector<Range> Parse() {
+        std::vector<Range> out;
+        const char* env = std::getenv("SOTC_UNTRACK_RANGES");
+        if (!env || !env[0]) {
+            return out;
+        }
+        // Liverpool::CpAheadMode() read directly (liverpool.h is not included here). The other
+        // SOTC_CP_AHEAD modes move the uploads, which this has not been checked against.
+        const char* ahead = std::getenv("SOTC_CP_AHEAD");
+        if (ahead && std::atoi(ahead) != 0) {
+            std::fprintf(stderr, "SOTC untrack: off, SOTC_CP_AHEAD is set\n");
+            return out;
+        }
+        for (const char* p = env; *p;) {
+            char* after_addr = nullptr;
+            const u64 addr = std::strtoull(p, &after_addr, 16);
+            bool ok = after_addr != p && *after_addr == ':';
+            if (ok) {
+                const char* size_text = after_addr + 1;
+                char* after_size = nullptr;
+                const u64 size = std::strtoull(size_text, &after_size, 16);
+                // The size cap keeps addr + size from wrapping.
+                ok = after_size != size_text && size != 0 && size <= (1ULL << 32) &&
+                     addr < (1ULL << 48);
+                if (ok) {
+                    out.push_back(Range{addr, size});
+                }
+            }
+            const char* comma = std::strchr(p, ',');
+            if (!comma) {
+                break;
+            }
+            p = comma + 1;
+        }
+        std::fprintf(stderr, "SOTC untrack: %zu ranges\n", out.size());
+        for (const Range& r : out) {
+            std::fprintf(stderr, "SOTC untrack: range %llx +%llx\n",
+                         static_cast<unsigned long long>(r.addr),
+                         static_cast<unsigned long long>(r.size));
+        }
+        return out;
+    }
+};
+
 #ifdef PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP
 using LockType = Common::AdaptiveMutex;
 #else
@@ -203,13 +377,47 @@ public:
         cpu.Fill(~0ULL);
         gpu.Fill(0ULL);
         ResetGrace();
+        ComputeUntracked(); // sotc: SOTC_UNTRACK_RANGES
     }
     explicit RegionManager() = default;
 
     void SetCpuAddress(VAddr new_cpu_addr) {
         cpu_addr = new_cpu_addr;
+        ComputeUntracked(); // sotc: SOTC_UNTRACK_RANGES
         sweep_words.store(~0ULL, std::memory_order_relaxed);
         ResetGrace();
+    }
+
+    /// sotc: SOTC_UNTRACK_AUTO (draw thread, via MemoryTracker::ApplyUntracked). Replaces the
+    /// untracked mask of the whole region. A page that becomes untracked, has no GPU bit and is
+    /// protected (CPU bit 0) is unprotected and CPU-modified now, and its sweep word is raised, so
+    /// the next DMA sweep uploads it. A page that stops being untracked keeps its bits: the normal
+    /// upload re-protects it.
+    void SetUntrackedMask(RegionBits next) {
+        const Bounds full = GetBounds(0, HIGHER_PAGE_SIZE);
+        RegionBits write_prot{};
+        RegionBits read_prot{};
+        u64 raised = 0;
+        Lock(full);
+        for (u64 index = 0; index < NUM_REGION_WORDS; ++index) {
+            const u64 added = next[index] & ~untracked[index] & ~gpu[index] & ~cpu[index];
+            untracked[index] = next[index];
+            if (added) {
+                UpdateStateAndProtection<StateOp::Set, StateOp::None>(write_prot, read_prot, index,
+                                                                      added);
+                raised |= 1ULL << index;
+            }
+        }
+        if (raised) {
+            sweep_words.fetch_or(raised, std::memory_order_release);
+            Bounds watcher_bounds;
+            if (GetWatcherBounds<StateOp::Set, StateOp::None>(full, write_prot, read_prot,
+                                                              watcher_bounds)) {
+                tracker->UpdatePageWatchersForRegion(cpu_addr, watcher_bounds, write_prot, read_prot,
+                                                     PageOp::Untrack, PageOp::None);
+            }
+        }
+        Unlock(full);
     }
 
     /// sotc: the 256 KiB words where a CPU bit rose (or FaultGrace kept one) since the DMA sweep
@@ -222,6 +430,18 @@ public:
 
     VAddr CpuAddress() const noexcept {
         return cpu_addr;
+    }
+
+    /// sotc: SOTC_UNTRACK_AUTO self-check (region mutex held). Pages of [offset, offset + size)
+    /// that are untracked, have no GPU bit and are protected (CPU bit 0): a guest write fault on one
+    /// of them means the untracking did not hold.
+    u64 CountUntrackedFaultsLocked(u64 offset, u64 size) noexcept {
+        u64 bad = 0;
+        IterateWords(GetBounds(offset, size), [&](u64 index, u64 mask) {
+            bad += static_cast<u64>(
+                std::popcount(untracked[index] & ~gpu[index] & ~cpu[index] & mask));
+        });
+        return bad;
     }
 
     /// sotc: a guest write fault on the page at offset (region mutex held, from
@@ -300,8 +520,12 @@ public:
         }
     }
 
+    /// sotc: retrack (SOTC_UNTRACK_AUTO): the GPU bits are cleared because a download just wrote
+    /// the GPU's bytes into guest memory (ApplyDownloads). Only then may an untracked page get its
+    /// CPU bit back; a GPU bit dropped without a download must not, or the next bind would upload
+    /// stale guest bytes over the GPU's data.
     template <StateOp cpu_op, StateOp gpu_op, bool locked = true>
-    void ChangeRegionState(u64 offset, u64 size) {
+    void ChangeRegionState(u64 offset, u64 size, bool retrack = false) {
         RegionBits write_prot;
         RegionBits read_prot;
         auto bounds = GetBounds(offset, size);
@@ -330,6 +554,11 @@ public:
             GetWatcherBounds<cpu_op, gpu_op>(bounds, write_prot, read_prot, watcher_bounds)) {
             tracker->UpdatePageWatchersForRegion(cpu_addr, watcher_bounds, write_prot, read_prot,
                                                  write_op, read_op);
+        }
+        if constexpr (cpu_op == StateOp::None && gpu_op == StateOp::Clear) {
+            if (retrack) {
+                RetrackDownloadedLocked(bounds); // sotc: SOTC_UNTRACK_AUTO (after a download only)
+            }
         }
         if constexpr (locked) {
             mutex.unlock();
@@ -404,6 +633,17 @@ public:
                         SotcStats::fault_grace_hot_upload_bytes.fetch_add(
                             std::popcount(keep) * BYTES_PER_PAGE, std::memory_order_relaxed);
                     }
+                }
+                // sotc: SOTC_UNTRACK_RANGES. An untracked page keeps its CPU bit (see SotcUntrack),
+                // so it is not re-protected and every bind re-uploads it. A page the GPU wrote is
+                // excluded: keeping its CPU bit would upload CPU bytes over the GPU result on every
+                // read binding, so it takes the normal path and is protected again.
+                const u64 untrack = untracked[index] & word & ~gpu[index];
+                if (untrack) {
+                    keep |= untrack;
+                    kept_words |= 1ULL << index;
+                    SotcUntrack::pages_kept.fetch_add(static_cast<u64>(std::popcount(untrack)),
+                                                      std::memory_order_relaxed);
                 }
             }
             UpdateStateAndProtection<cpu_op, gpu_op>(write_prot, read_prot, index, mask, keep);
@@ -544,6 +784,73 @@ private:
     std::atomic<u64> sweep_words{~0ULL}; // sotc: see TakeSweepWords
     // sotc: SOTC_SYNC_FAST write generations, one per 2 MiB (see UpdateStateAndProtection).
     std::array<std::atomic<u64>, NUM_SYNC_GENS> sync_gen{};
+public:
+    /// sotc: SOTC_UNTRACK_RANGES / SOTC_UNTRACK_AUTO. Pure mask builder: the pages of the region
+    /// based at cpu_addr that lie in one of the ranges.
+    static RegionBits BuildUntrackedMask(VAddr cpu_addr,
+                                         const std::vector<SotcUntrack::Range>& ranges) {
+        RegionBits mask{};
+        mask.Fill(0);
+        const u64 region_end = cpu_addr + HIGHER_PAGE_SIZE;
+        for (const auto& range : ranges) {
+            const u64 lo = std::max<u64>(range.addr, cpu_addr);
+            const u64 hi = std::min<u64>(range.addr + range.size, region_end);
+            if (lo >= hi) {
+                continue;
+            }
+            const u64 first_page = (lo - cpu_addr) / BYTES_PER_PAGE;
+            const u64 last_page = (hi - 1 - cpu_addr) / BYTES_PER_PAGE;
+            for (u64 page = first_page; page <= last_page; ++page) {
+                mask[page / PAGES_PER_WORD] |= 1ULL << (page % PAGES_PER_WORD);
+            }
+        }
+        return mask;
+    }
+
+private:
+    /// sotc: SOTC_UNTRACK_RANGES / SOTC_UNTRACK_AUTO. Marks the pages of this region (based at
+    /// cpu_addr) that lie in an untracked range. Called when the region is created or moved, before
+    /// it is shared.
+    void ComputeUntracked() {
+        if (SotcUntrack::AutoOn()) {
+            u64 version = 0;
+            untracked = BuildUntrackedMask(cpu_addr, SotcUntrack::AutoSnapshot(version));
+            return;
+        }
+        untracked = BuildUntrackedMask(cpu_addr, SotcUntrack::Ranges());
+    }
+
+    /// sotc: SOTC_UNTRACK_AUTO (region mutex held, after GPU bits were cleared over bounds by a
+    /// download or ChangeRegionState<None, Clear>). An untracked page with no GPU bit that is still
+    /// protected (CPU bit 0) lost its GPU bit here: it is unprotected and CPU-modified again, as
+    /// SetUntrackedMask does. Without this the self-check would count the next guest write to it.
+    void RetrackDownloadedLocked(const Bounds& bounds) {
+        if (!SotcUntrack::AutoOn()) {
+            return;
+        }
+        RegionBits write_prot{};
+        RegionBits read_prot{};
+        u64 raised = 0;
+        IterateWords(bounds, [&](u64 index, u64 mask) {
+            const u64 back = untracked[index] & mask & ~gpu[index] & ~cpu[index];
+            if (back) {
+                UpdateStateAndProtection<StateOp::Set, StateOp::None>(write_prot, read_prot, index,
+                                                                      back);
+                raised |= 1ULL << index;
+            }
+        });
+        if (!raised) {
+            return;
+        }
+        sweep_words.fetch_or(raised, std::memory_order_release);
+        Bounds watcher_bounds;
+        if (GetWatcherBounds<StateOp::Set, StateOp::None>(bounds, write_prot, read_prot,
+                                                          watcher_bounds)) {
+            tracker->UpdatePageWatchersForRegion(cpu_addr, watcher_bounds, write_prot, read_prot,
+                                                 PageOp::Untrack, PageOp::None);
+        }
+    }
+
     void ResetGrace() {
         fault_cur.Fill(0);
         fault_prev.Fill(0);
@@ -796,6 +1103,7 @@ private:
     u32 long_epoch{};
     u32 sticky_epoch{};
     bool sticky_any{false};
+    RegionBits untracked{}; // sotc: SOTC_UNTRACK_RANGES (ComputeUntracked), zero when unset
     LockType mutex;
 };
 

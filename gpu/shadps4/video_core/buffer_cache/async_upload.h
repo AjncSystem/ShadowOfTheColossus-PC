@@ -24,6 +24,11 @@
 // (bbgpu_handle_fault): a read cannot change what a copy reads and leaves the page protected.
 // A job whose last piece a waiting thread copied is finished (staging flush, done) by a copy
 // thread, so the waiting thread calls no Vulkan function.
+//
+// sotc: SOTC_ASYNC_JOB_MB=<n> (off by default): a job of more than n MiB is queued as several jobs
+// of at most n MiB, each with its own pieces, fence ranges and staging flush (see Queue).
+// sotc: SOTC_ASYNC_STAGE_CACHED=1 (off by default): the staging of buffer uploads is HOST_CACHED
+// instead of HOST_UNCACHED (StagingBufferPool::AsyncCopyType).
 
 #pragma once
 
@@ -76,6 +81,11 @@ public:
         return fence_pieces;
     }
 
+    /// sotc: SOTC_ASYNC_STAGE_CACHED=1: buffer uploads ask for HOST_CACHED staging.
+    static bool StageCached() noexcept {
+        return stage_cached;
+    }
+
     [[nodiscard]] u64 MinBytes() const noexcept {
         return min_bytes;
     }
@@ -123,6 +133,8 @@ private:
     static inline bool buffers_enabled{};
     static inline bool textures_enabled{};
     static inline bool fence_pieces{};
+    static inline bool stage_cached{};
+    static inline u64 job_bytes{}; ///< sotc: SOTC_ASYNC_JOB_MB in bytes (0: no split)
 
     u64 min_bytes;
     std::mutex mutex;

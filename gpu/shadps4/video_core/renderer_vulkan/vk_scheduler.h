@@ -4,6 +4,7 @@
 #pragma once
 
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <mutex>
@@ -714,6 +715,14 @@ public:
 
     static std::mutex submit_mutex;
 
+    /// sotc: SOTC_HRR=1: while host-visible arena chunks exist (set by the buffer cache), every
+    /// command buffer this scheduler ends (sessions, ahead, transfer queue) finishes with a global
+    /// barrier, all writes -> host reads, so the CPU may read what the GPU wrote once the tick
+    /// that wrote it is waited for (BufferCache direct readbacks). Read when the command buffer
+    /// is ended, on the thread that records it.
+    static void SetHostVisibility(bool on);
+    static inline std::atomic<bool> host_visibility{false};
+
 private:
     void EndSession();
 
@@ -724,6 +733,8 @@ private:
 
 
     void PriorityPendingOpsThread(std::stop_token stoken);
+    /// sotc: SOTC_TRACE: records when the GPU reaches each tick of this scheduler's timeline.
+    void TraceWatchThread(std::stop_token stoken);
 
 private:
     const Instance& instance;
@@ -752,6 +763,8 @@ private:
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;
     std::jthread priority_pending_ops_thread;
+    u32 trace_queue{~0u};           // sotc: SOTC_TRACE queue track (SotcTrace::RegisterQueue)
+    std::jthread trace_watch_thread; // sotc: SOTC_TRACE (TraceWatchThread)
     RenderState render_state;
     bool is_rendering = false;
     vk::UniqueCommandPool ahead_pool;

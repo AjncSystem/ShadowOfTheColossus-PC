@@ -1402,6 +1402,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
         const u64 present_id = instance.IsPresentIdEnabled() ? TagPresent() : 0;
         low_latency.BeforePresent(present_id);
+        const SotcTrace::Scope trace_present{"present", present_id}; // sotc: SOTC_TRACE
         const bool presented = swapchain.Present(present_id);
         low_latency.AfterPresent(frame->present_done);
         Dlssg::AfterPresent(frame->id);
@@ -1417,6 +1418,16 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     free_frame();
     if (!is_reusing_frame && is_game_frame) {
         DebugState.IncFlipFrameNum();
+        // sotc: SOTC_TRACE: the game frame (flip to flip) and, when it was slow, its dump.
+        if (SotcTrace::kOn) {
+            static u64 trace_frames = 0, trace_prev_ns = 0;
+            const u64 now_ns = SotcStats::NowNs();
+            ++trace_frames;
+            if (trace_prev_ns) {
+                SotcTrace::FrameEnd(trace_frames, trace_prev_ns, now_ns);
+            }
+            trace_prev_ns = now_ns;
+        }
         // SOTC_FRAME_LOG=<n> prints the frame count and time to stderr every n frames, for
         // measuring the frame rate of scripted runs.
         static const u64 every = [] {
@@ -1512,6 +1523,17 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                                   ", hrr %llu", n(hrr_now - last_hrr));
                 }
                 last_hrr = hrr_now;
+                // sotc: SOTC_STALL_DETAIL: flip pacing of this frame, guest threads' CPU and the
+                // user/kernel CPU of the upload threads (RoleUpload only).
+                if (SotcStats::kStallDetail) {
+                    const size_t used_sd = std::strlen(account_text);
+                    if (used_sd + 1 < sizeof(account_text)) {
+                        std::snprintf(account_text + used_sd, sizeof(account_text) - used_sd,
+                                      ", flip pace %.1f ms, guest cpu %.1f ms, upload user %.1f kernel %.1f ms",
+                                      ms(d.flip_pace_ns), ms(d.cpu_ns[SotcStats::RoleGuest]),
+                                      ms(d.upload_user_ns), ms(d.upload_kernel_ns));
+                    }
+                }
             }
             if (last_us >= 0 && now_us - last_us > stall_us) {
                 std::fprintf(stderr,
@@ -1697,11 +1719,14 @@ void Presenter::PaceFlip() {
         }
     }
     pending_flips.fetch_add(1, std::memory_order_acq_rel);
-    SotcStats::cp_flip_pace_ns.fetch_add(
+    const uint64_t pace_ns = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
                                                              start)
-            .count(),
-        std::memory_order_relaxed);
+            .count());
+    SotcStats::cp_flip_pace_ns.fetch_add(pace_ns, std::memory_order_relaxed);
+    if (SotcStats::kStallDetail) { // sotc: SOTC_STALL_DETAIL, the report does not reset this copy
+        SotcStats::cp_flip_pace_all_ns.fetch_add(pace_ns, std::memory_order_relaxed);
+    }
 }
 
 void Presenter::WaitFreeFrame() {

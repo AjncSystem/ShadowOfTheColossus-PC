@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include "video_core/sotc_trace.h" // sotc: SOTC_TRACE
 
 namespace SotcStats {
 /// sotc: the switches of the stats printers in videoout/driver.cpp (SOTC_FPS line; SOTC_CMD_STATS
@@ -18,8 +19,30 @@ namespace SotcStats {
 /// guest-thread fault counter (which shared cache lines with CP counters) are gone; with the
 /// switches on, the printed numbers are unchanged (the printer reads and resets each counter with
 /// exchange(0) only under the same switch). The variables are never set at run time.
-inline const bool kFpsLog = std::getenv("SOTC_FPS") != nullptr;
+// sotc: SOTC_TRACE=1 (sotc_trace.h) needs the same timers.
+inline const bool kFpsLog = std::getenv("SOTC_FPS") != nullptr || [] {
+    const char* v = std::getenv("SOTC_TRACE");
+    return v && v[0] == '1';
+}();
 inline const bool kCmdStats = std::getenv("SOTC_CMD_STATS") != nullptr;
+/// sotc: SOTC_STALL_DETAIL=1 (off by default): the SOTCSTALL line also shows the flip pacing of the
+/// frame, the guest threads' CPU and the user/kernel CPU of the upload threads (vk_presenter.cpp).
+inline const bool kStallDetail = [] {
+    const char* v = std::getenv("SOTC_STALL_DETAIL");
+    return v && v[0] == '1';
+}();
+/// sotc: SOTC_FPS_LEAN=1 (off by default): SOTC_FPS keeps its per-frame summary and counters
+/// but drops the per-op work that only feeds detailed reports: the per-op/per-wait clock reads
+/// (kFpsTimers) and the per-binding write-extent marks (kWriteMarks, the "SOTC GPU writes by
+/// shader" lines). Unset: both follow kFpsLog exactly as before. kFpsTimers/kWriteMarks read
+/// kFpsLog and kFpsLean: inline variables defined earlier in this same header, which every
+/// translation unit sees in this order, so they are initialized first (partial ordering).
+inline const bool kFpsLean = [] {
+    const char* v = std::getenv("SOTC_FPS_LEAN");
+    return v && v[0] == '1';
+}();
+inline const bool kFpsTimers = kFpsLog && !kFpsLean;
+inline const bool kWriteMarks = kFpsLog && !kFpsLean;
 /// sotc: skip BindResources on consecutive draws whose pipeline, push data and resource
 /// handles did not change. On by default (SOTC_FAST_BIND=0 turns it off). In 0.60.5 it left black
 /// dots in a grid on sandy ground (new constants at the same address); with the fix (mem_epoch
@@ -432,6 +455,8 @@ inline std::atomic<uint64_t> image_pool_allocs{0}; ///< SOTC_IMAGE_POOL_MB: imag
 /// sotc: SOTC_CP_FLIP_PACE: command processor time spent waiting for a free presentation frame
 /// before queueing a flip (since the last SOTC_FPS report).
 inline std::atomic<uint64_t> cp_flip_pace_ns{0};
+/// sotc: SOTC_STALL_DETAIL: the same pacing time, never reset (the report exchanges cp_flip_pace_ns).
+inline std::atomic<uint64_t> cp_flip_pace_all_ns{0};
 /// sotc: SOTC_HOST_IMPORT, totals: uploads copied by the GPU from imported guest memory, their
 /// bytes and wait time, uploads that went back to the CPU path, chunks the driver refused, and
 /// the chunks imported now (64 MiB each).
@@ -596,7 +621,7 @@ struct StageScope {
     unsigned stage;
     uint64_t start = 0, mutex0 = 0, protect0 = 0, sum0 = 0;
     bool on;
-    explicit StageScope(unsigned s) : stage{s}, on{kFpsLog && tl.active} {
+    explicit StageScope(unsigned s) : stage{s}, on{kFpsTimers && tl.active} { // sotc: SOTC_FPS_LEAN
         if (on) {
             start = NowNs();
             mutex0 = tl.mutex_ns;
@@ -620,7 +645,7 @@ struct StageScope {
 /// The write-fault handler of the page manager is reached: everything since Begin that was not the
 /// fence wait was dispatch ("entry").
 inline void NoteHandlerEntry() {
-    if (kFpsLog && tl.active) {
+    if (kFpsTimers && tl.active) { // sotc: SOTC_FPS_LEAN: clock reads
         const uint64_t spent = NowNs() - tl.t0;
         const uint64_t own = spent > tl.fence_ns ? spent - tl.fence_ns : 0;
         stl.ns[kStEntry] = own;
@@ -637,7 +662,7 @@ struct Scope {
     uint64_t Tl::*field;
     uint64_t start = 0;
     bool on;
-    explicit Scope(uint64_t Tl::*f) : field{f}, on{kFpsLog && tl.active} {
+    explicit Scope(uint64_t Tl::*f) : field{f}, on{kFpsTimers && tl.active} { // sotc: SOTC_FPS_LEAN
         if (on) {
             start = NowNs();
         }
@@ -658,7 +683,8 @@ inline void Begin() {
         stl.ns[i] = 0;
     }
     stl.sum = 0;
-    tl.t0 = NowNs();
+    // sotc: SOTC_FPS_LEAN: the fault still counts without kFpsTimers, only the clock is skipped.
+    tl.t0 = kFpsTimers ? NowNs() : 0;
 }
 inline void End() {
     if (!tl.active) {
@@ -668,12 +694,15 @@ inline void End() {
     if (!tl.counted) {
         return;
     }
-    const uint64_t ns = NowNs() - tl.t0;
     count.fetch_add(1, std::memory_order_relaxed);
     all_count.fetch_add(1, std::memory_order_relaxed);
     if (tl.sequential) {
         seq.fetch_add(1, std::memory_order_relaxed);
     }
+    if (!kFpsTimers) { // sotc: SOTC_FPS_LEAN: the time sums and the histogram need the clock
+        return;
+    }
+    const uint64_t ns = NowNs() - tl.t0;
     total_ns.fetch_add(ns, std::memory_order_relaxed);
     all_ns.fetch_add(ns, std::memory_order_relaxed);
     mutex_ns.fetch_add(tl.mutex_ns, std::memory_order_relaxed);
@@ -766,6 +795,15 @@ inline std::atomic<uint64_t> arena_evict_mismatch{0}; ///< read back unequal to 
 inline std::atomic<uint64_t> arena_evict_runs{0};
 inline std::atomic<uint64_t> arena_evict_ns{0}; ///< time in MaybeEvictCold (scan, GPU wait, unbind)
 inline std::atomic<uint64_t> arena_tick_waits{0}; ///< SOTC_ARENA_TICK_FREE: waits for freed arena runs
+/// sotc: SOTC_HRR=1 (buffer_cache/hrr.h): arena bytes and chunks in host-visible memory, now.
+inline std::atomic<uint64_t> hrr_host_bytes{0}, hrr_host_allocs{0};
+/// sotc: SOTC_HRR=1 (BufferCache::MigrateHostResident): granules moved from device to host
+/// memory, and their bytes.
+/// hrr_migrate_failed: migrations a check kept in device memory (retried, see MigrateHostResident).
+inline std::atomic<uint64_t> hrr_migrated{0}, hrr_migrated_bytes{0}, hrr_migrate_failed{0};
+/// sotc: SOTC_HRR=1 direct readbacks (BufferCache::FinishAsyncReadback): readbacks that read their
+/// bytes from host-visible arena chunks instead of a staging copy, and those bytes.
+inline std::atomic<uint64_t> hrr_direct_readbacks{0}, hrr_direct_bytes{0};
 /// sotc: SOTC_ADAPTIVE_LOAD (sotc_adaptive.h), per report (SOTC_FPS only): flips seen and those
 /// while relieved, engagements, far cascades moved instead of drawn because of the governor,
 /// periodic submits left out (approximate: base-interval submits a longer window replaced),
@@ -933,16 +971,20 @@ inline std::atomic<uint64_t> alloc_count[AllocKinds]{}, alloc_bytes[AllocKinds]{
     alloc_ns[AllocKinds]{};
 struct AllocTrace {
     AllocKind kind;
+    bool timed = false; ///< sotc: the time is read only with kFpsTimers (SOTC_FPS_LEAN drops it)
     std::chrono::steady_clock::time_point start{};
     AllocTrace(AllocKind k, uint64_t bytes) : kind{k} {
         if (kFpsLog) {
             alloc_count[k].fetch_add(1, std::memory_order_relaxed);
             alloc_bytes[k].fetch_add(bytes, std::memory_order_relaxed);
-            start = std::chrono::steady_clock::now();
+            if (kFpsTimers) {
+                timed = true;
+                start = std::chrono::steady_clock::now();
+            }
         }
     }
     ~AllocTrace() {
-        if (kFpsLog) {
+        if (timed) {
             alloc_ns[kind].fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                          std::chrono::steady_clock::now() - start)
                                          .count(),
@@ -951,7 +993,8 @@ struct AllocTrace {
     }
 };
 
-/// Adds the scope's duration to frame_ns[cause]; reads no clock unless SOTC_FPS is set. A timer
+/// Adds the scope's duration to frame_ns[cause]; reads no clock unless kFpsTimers (SOTC_FPS, not
+/// SOTC_FPS_LEAN). A timer
 /// nested in one of the same cause on the same thread adds nothing (counted once).
 struct FrameTimer {
     FrameCause cause;
@@ -959,7 +1002,7 @@ struct FrameTimer {
     std::chrono::steady_clock::time_point start{};
     static inline thread_local bool active[FrameCauses]{};
     explicit FrameTimer(FrameCause c) : cause{c} {
-        if (kFpsLog && !active[c]) {
+        if (kFpsTimers && !active[c]) {
             outer = active[c] = true;
             start = std::chrono::steady_clock::now();
         }
@@ -983,7 +1026,10 @@ struct FrameTimer {
 /// Role of the calling thread, set at the start of each GPU thread (cheap thread_local; read
 /// only behind kFpsLog). The CPU-time roles are also the BbThreadCpu::Register roles.
 enum CpuRole : uint8_t {
-    RoleOther, RoleCp, RoleDraw, RoleRecorder, RolePassSecondary, RoleUpload, CpuRoles
+    RoleOther, RoleCp, RoleDraw, RoleRecorder, RolePassSecondary, RoleUpload,
+    RoleGuest, // sotc: SOTC_STALL_DETAIL, game guest threads (bbgpu_register_guest_thread);
+               // their tl_role stays RoleOther
+    CpuRoles
 };
 inline thread_local uint8_t tl_role = RoleOther;
 /// Records the calling thread under `role` for the CPU-time sums (bbport_thread_cpu.cpp, which
@@ -1027,29 +1073,41 @@ inline void CpAdd(std::atomic<uint64_t>& counter, uint64_t n) {
 inline std::atomic<uint64_t> rec_busy_ns{0}, rec_upload_wait_ns{0}, rec_submit_ns{0};
 
 /// Times a draw-thread wait into draw_wait_*[kind]. Exclusive: a wait nested in another (on the
-/// same thread) is taken out of the outer one, so each nanosecond lands in one bucket. Reads no
-/// clock unless SOTC_FPS is on and the caller is the draw thread.
+/// same thread) is taken out of the outer one, so each nanosecond lands in one bucket. The wait
+/// count needs only SOTC_FPS; the clock reads need kFpsTimers (or SOTC_TRACE) and the draw thread.
 struct DrawWait {
     static inline thread_local uint64_t nested_ns = 0;
     uint64_t start = 0;
     uint64_t outer_nested = 0;
     WaitKind kind;
-    bool on = false;
+    bool on = false;    ///< counted: SOTC_FPS, on the draw thread
+    bool timed = false; ///< clock read: kFpsTimers, or SOTC_TRACE (its span needs the times)
     explicit DrawWait(WaitKind k) : kind{k} {
         if (kFpsLog && tl_role == RoleDraw) {
             on = true;
-            outer_nested = nested_ns;
-            nested_ns = 0;
-            start = NowNs();
+            if (kFpsTimers || SotcTrace::kOn) { // sotc: SOTC_FPS_LEAN drops the clock reads
+                timed = true;
+                outer_nested = nested_ns;
+                nested_ns = 0;
+                start = NowNs();
+            }
         }
     }
     ~DrawWait() {
-        if (on) {
-            const uint64_t elapsed = NowNs() - start;
+        if (timed) {
+            const uint64_t now = NowNs();
+            const uint64_t elapsed = now - start;
+            if (SotcTrace::kOn) { // sotc: SOTC_TRACE
+                static constexpr const char* kNames[WaitKinds] = {"wait gpu", "wait recorder",
+                                                                  "wait upload", "wait tc lock"};
+                SotcTrace::Span(kNames[kind], start, now);
+            }
             const uint64_t inner = nested_ns < elapsed ? nested_ns : elapsed;
             draw_wait_ns[kind].fetch_add(elapsed - inner, std::memory_order_relaxed);
-            draw_wait_count[kind].fetch_add(1, std::memory_order_relaxed);
             nested_ns = outer_nested + elapsed;
+        }
+        if (on) {
+            draw_wait_count[kind].fetch_add(1, std::memory_order_relaxed);
         }
     }
     DrawWait(const DrawWait&) = delete;
@@ -1057,19 +1115,26 @@ struct DrawWait {
 };
 
 /// Adds the scope's duration to `total` when SOTC_FPS is on and the caller has `role`.
+/// sotc: trace_name (a string literal) also records the scope as a SOTC_TRACE span.
 struct RoleTimer {
     std::atomic<uint64_t>& total;
     uint64_t start = 0;
     bool on = false;
-    RoleTimer(CpuRole role, std::atomic<uint64_t>& t) : total{t} {
-        if (kFpsLog && tl_role == role) {
+    const char* trace_name = nullptr;
+    RoleTimer(CpuRole role, std::atomic<uint64_t>& t, const char* trace = nullptr)
+        : total{t}, trace_name{trace} {
+        if ((kFpsTimers || SotcTrace::kOn) && tl_role == role) { // sotc: SOTC_FPS_LEAN
             on = true;
             start = NowNs();
         }
     }
     ~RoleTimer() {
         if (on) {
-            total.fetch_add(NowNs() - start, std::memory_order_relaxed);
+            const uint64_t now = NowNs();
+            total.fetch_add(now - start, std::memory_order_relaxed);
+            if (trace_name && SotcTrace::kOn) {
+                SotcTrace::Span(trace_name, start, now);
+            }
         }
     }
     RoleTimer(const RoleTimer&) = delete;
@@ -1089,6 +1154,8 @@ struct FrameAccount {
     uint64_t rb_adj = 0; ///< sotc: adjacent guest readback requests (rb_pat_adjacent_all)
     uint64_t rb_pf = 0;  ///< sotc: SOTC_RB_PREFETCH prefetches consumed (rb_pf_consumed_all)
     uint64_t fault_count = 0, fault_ns = 0; ///< sotc: guest write faults (FaultStat::all_*)
+    uint64_t flip_pace_ns = 0; ///< sotc: SOTC_STALL_DETAIL, cp_flip_pace_all_ns
+    uint64_t upload_user_ns = 0, upload_kernel_ns = 0; ///< sotc: SOTC_STALL_DETAIL, RoleUpload threads
 };
 FrameAccount TakeAccount();
 /// `now - before`, per field (saturating at zero).

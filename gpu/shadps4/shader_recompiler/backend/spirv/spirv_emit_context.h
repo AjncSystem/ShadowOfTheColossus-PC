@@ -11,6 +11,7 @@
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/value.h"
 #include "shader_recompiler/profile.h"
+#include "shader_recompiler/runtime_info.h"
 
 namespace Shader::Backend::SPIRV {
 
@@ -64,6 +65,12 @@ public:
             Decorate(output_id, spv::Decoration::Location, *location);
         }
         return output_id;
+    }
+
+    /// sotc: the descriptor set of this shader's resources: its stage's set with
+    /// Profile::stage_bindings, set 0 otherwise.
+    [[nodiscard]] u32 DescriptorSetIndex() const {
+        return profile.stage_bindings ? StageDescriptorSet(info.sw_stage) : 0u;
     }
 
     [[nodiscard]] Id DefineUniformConst(Id type, u32 set, u32 binding, bool readonly = false) {
@@ -366,6 +373,13 @@ public:
 
     Id sampler_type{};
     Id sampler_pointer_type{};
+    /// sotc: SOTC_BINDLESS_SAMP: the samplers of this stage come from the global heap
+    /// (bindless_sampler_array, set 1) through the push constants; see LoadSampler.
+    bool uses_bindless_samplers{};
+    u32 bindless_sampler_base{};
+    Id bindless_sampler_array{};
+    /// Loads sampler `index` of info.samplers (the low 16 bits of a sampler handle).
+    Id LoadSampler(u32 index);
 
     struct SpirvAttribute {
         union {

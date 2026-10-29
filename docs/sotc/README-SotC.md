@@ -137,6 +137,11 @@ Estas variáveis de ambiente ajudam a investigar problemas:
 | Variável | Efeito |
 |---|---|
 | `SOTC_FPS=1` | taxa de quadros a cada 5 s |
+| `SOTC_FPS_LEAN=1` | com `SOTC_FPS`: mantém o resumo e as contagens, sem as leituras de relógio por operação (para jogar medindo) |
+| `SOTC_STALL_DETAIL=1` | com `SOTC_FPS`: linhas `SOTCSTALL` com ritmo de flip, CPU das threads do jogo e usuário/kernel do upload |
+| `SOTC_OPSTAT=1` | operações da thread de desenho por tipo, a cada 5 s |
+| `SOTC_UNTRACK_LOG=1` | com `SOTC_FPS`: blocos do heap por quadro RenderSingleFrameGPU do jogo |
+| `SOTC_TRACE=1` | gravador de linha do tempo: para cada quadro acima de `SOTC_TRACE_MS` (padrão 60), salva o que todas as threads fizeram ao redor dele em `user/trace/<sessão>/frameNNNNNN_XXms.json` (abrir em ui.perfetto.dev); também liga o `SOTC_FPS` |
 | `BB_FAULT_RING=arquivo` | grava as últimas exceções (sobrevive a quedas) |
 | `BB_STACKS_TRIGGER=arquivo` | criar o arquivo despeja as pilhas das threads |
 | `BB_READBACKS=0/1/2` | leituras da GPU; o padrão 2 é o exigido pelo jogo |

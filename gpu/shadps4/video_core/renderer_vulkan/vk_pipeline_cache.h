@@ -29,6 +29,7 @@ struct std::hash<vk::ShaderModule> {
 
 namespace AmdGpu {
 class Liverpool;
+struct ComputeProgram;
 }
 
 namespace Serialization {
@@ -87,6 +88,12 @@ public:
                            AmdGpu::Liverpool* liverpool, u32 sparse_page_shift);
     ~PipelineCache();
 
+    /// sotc: the descriptor heap the pipelines bind their sets from (the rasterizer sets the
+    /// bindless sampler set on it).
+    DescriptorHeap& GetDescriptorHeap() noexcept {
+        return desc_heap;
+    }
+
     void WarmUp();
 
     /// sotc: writes the driver's compiled pipelines to disk (sotc_vk_pipelines.bin), so the next
@@ -108,6 +115,25 @@ public:
     Result GetProgram(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
                       const Shader::ShaderParams& params, Shader::Backend::Bindings& binding,
                       bool async_ok = false);
+
+    /// sotc: SOTC_ASYNC_COMPUTE_XLATE=1 (off by default; needs the pipeline workers). When a
+    /// dispatch needs a compute shader not translated yet, the command processor scans the
+    /// rest of its command buffer and queues the new compute shaders it finds there for the
+    /// workers (PrefetchComputeProgram), while it translates the current one itself. Dispatches
+    /// are still published in order: a later dispatch whose shader is still on a worker waits
+    /// for it (or takes it back when no worker started it yet). Without the switch, nothing
+    /// changes.
+    bool ComputePrefetchEnabled() const {
+        return compute_prefetch;
+    }
+    /// sotc: the shader is translated, queued for a worker, or left to the command processor.
+    bool IsProgramKnown(u64 hash) const {
+        return program_cache.contains(hash) || pending_programs.contains(hash) ||
+               in_place_programs.contains(hash);
+    }
+    /// sotc: queues the translation of cs's shader for a worker when it is new. Returns true
+    /// when it queued one. Command processor thread only.
+    bool PrefetchComputeProgram(const AmdGpu::ComputeProgram& cs);
 
     std::optional<vk::ShaderModule> ReplaceShader(vk::ShaderModule module,
                                                   std::span<const u32> spv_code);
@@ -154,6 +180,7 @@ private:
     /// thread waits for it when it binds it (ComputePipeline::BindWhenReady).
     struct AsyncPipelineJob {
         ComputePipeline* compute{}; ///< a compute job: only Build() is run
+        bool priority{}; ///< sotc: a depth-only (shadow) graphics job queued ahead of the others
         GraphicsPipelineKey key;
         u64 hash{};
         std::array<const Shader::Info*, MaxShaderStages> infos{};
@@ -191,8 +218,11 @@ private:
     };
     bool AsyncPipelineEligible() const;
     void QueueAsyncPipeline(u64 hash,
-                            const GraphicsPipeline::SerializationSupport* preloaded = nullptr);
+                            const GraphicsPipeline::SerializationSupport* preloaded = nullptr,
+                            bool priority = false);
     bool AsyncPreloadEnabled() const;
+    bool IsDepthOnlyDraw() const;
+    const char* AsyncIneligibleReason() const;
     void QueueAsyncTranslate(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
                              const Shader::ShaderParams& params, const Shader::RuntimeInfo& rt,
                              const Shader::Backend::Bindings& start, Program* program,
@@ -203,6 +233,8 @@ private:
                            Shader::Pools& worker_pools);
     void InstallTranslation(AsyncPipelineJob::Translate& job);
     void CollectAsyncPipelines();
+    /// sotc: SOTC_ASYNC_COMPUTE_XLATE: waits for (or takes back) a prefetched translation.
+    void WaitPendingTranslation(u64 hash);
     void AsyncPipelineWorker(std::stop_token token);
 
 private:
@@ -210,6 +242,8 @@ private:
     Scheduler& scheduler;
     AmdGpu::Liverpool* liverpool;
     DescriptorHeap desc_heap;
+    // sotc: shared pipeline layouts. Declared before the pipelines, so they outlive them.
+    LayoutCache layout_cache;
     vk::UniquePipelineCache pipeline_cache;
     size_t saved_driver_cache_size{};
     std::mutex driver_cache_save_mutex;
@@ -251,12 +285,16 @@ private:
     /// worker job may still be queued (it returns at once, the pipeline being claimed).
     std::vector<std::unique_ptr<ComputePipeline>> preload_refused;
     size_t async_translate_queued{}; ///< translation jobs right after them, oldest first
+    size_t async_priority_queued{}; ///< sotc: shadow graphics jobs right after those, oldest first
     std::unordered_set<u64> pending_programs; ///< new programs being translated (CP only)
     std::unordered_set<u64> in_place_programs; ///< failed on a worker: translated here (CP only)
     bool async_translate_ok{};  ///< this draw may queue its translations (CP only)
     bool translation_pending{}; ///< a stage of this draw is being translated (CP only)
     std::vector<std::unique_ptr<AsyncPipelineJob>> async_done;
     std::atomic<u32> async_done_count{0};
+    /// sotc: notified (under async_mutex) when a translation job is done.
+    std::condition_variable_any translate_done_cv;
+    bool compute_prefetch{}; ///< SOTC_ASYNC_COMPUTE_XLATE=1 and workers exist
     std::vector<std::jthread> async_workers;
 };
 

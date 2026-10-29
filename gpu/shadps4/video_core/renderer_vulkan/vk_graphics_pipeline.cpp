@@ -29,7 +29,7 @@ static constexpr std::array LogicalStageToStageBit = {
 
 GraphicsPipeline::GraphicsPipeline(
     const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
-    const Shader::Profile& profile, const GraphicsPipelineKey& key_,
+    LayoutCache& layout_cache, const Shader::Profile& profile, const GraphicsPipelineKey& key_,
     vk::PipelineCache pipeline_cache, std::span<const Shader::Info*, MaxShaderStages> infos,
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
     const Shader::Gcn::FetchShaderData* fetch_shader_, std::span<const vk::ShaderModule> modules,
@@ -43,27 +43,11 @@ GraphicsPipeline::GraphicsPipeline(
     std::ranges::copy(infos, stages.begin());
     // sotc: built on a pipeline worker (SOTC_ASYNC_SHADERS), the guest registers already belong
     // to later draws: skip the buffer sharp reads, whose result is unused (as when preloading).
-    BuildDescSetLayout(preloading || async_build);
+    const bool layout_created = BuildDescSetLayout(layout_cache, preloading || async_build);
     const auto debug_str = GetDebugString();
-
-    const vk::PushConstantRange push_constants = {
-        .stageFlags = AllGraphicsStageBits,
-        .offset = 0,
-        .size = sizeof(Shader::PushData),
-    };
-
-    const vk::DescriptorSetLayout set_layout = *desc_layout;
-    const vk::PipelineLayoutCreateInfo layout_info = {
-        .setLayoutCount = 1U,
-        .pSetLayouts = &set_layout,
-        .pushConstantRangeCount = 1,
-        .pPushConstantRanges = &push_constants,
-    };
-    auto [layout_result, layout] = instance.GetDevice().createPipelineLayoutUnique(layout_info);
-    ASSERT_MSG(layout_result == vk::Result::eSuccess,
-               "Failed to create graphics pipeline layout: {}", vk::to_string(layout_result));
-    pipeline_layout = std::move(layout);
-    SetObjectName(device, *pipeline_layout, "Graphics PipelineLayout {}", debug_str);
+    if (layout_created) {
+        SetObjectName(device, pipeline_layout, "Graphics PipelineLayout {}", debug_str);
+    }
 
     if (!preloading) {
         VertexInputs<AmdGpu::Buffer> guest_buffers;
@@ -436,8 +420,14 @@ GraphicsPipeline::GraphicsPipeline(
     // In practice, we use dynamic state for all of it.
     constexpr vk::PipelineDepthStencilStateCreateInfo depth_stencil_info = {};
 
+    // sotc: pipelines whose layouts are descriptor buffer layouts carry this flag.
+    const vk::PipelineCreateFlags pipeline_flags =
+        instance.IsDescriptorBufferEnabled()
+            ? vk::PipelineCreateFlags(vk::PipelineCreateFlagBits::eDescriptorBufferEXT)
+            : vk::PipelineCreateFlags{};
     const vk::GraphicsPipelineCreateInfo pipeline_info = {
         .pNext = &pipeline_rendering_ci,
+        .flags = pipeline_flags,
         .stageCount = static_cast<u32>(shader_stages.size()),
         .pStages = shader_stages.data(),
         .pVertexInputState = !instance.IsVertexInputDynamicState() ? &vertex_input_info : nullptr,
@@ -450,7 +440,7 @@ GraphicsPipeline::GraphicsPipeline(
             !instance.IsExtendedDynamicState3Supported() ? &depth_stencil_info : nullptr,
         .pColorBlendState = &color_blending,
         .pDynamicState = &dynamic_info,
-        .layout = *pipeline_layout,
+        .layout = pipeline_layout,
     };
 
     auto [pipeline_result, pipe] =
@@ -523,13 +513,25 @@ template void GraphicsPipeline::GetVertexInputs(
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
     VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1) const;
 
-void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
-    boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32> bindings;
+bool GraphicsPipeline::BuildDescSetLayout(LayoutCache& layout_cache, bool preloading) {
+    // sotc: SOTC_STAGE_BINDINGS: each stage numbers its bindings from 0 in its own set. Otherwise
+    // every stage shares set 0 and the numbers run on across the stages.
+    std::array<boost::container::small_vector<vk::DescriptorSetLayoutBinding, 32>,
+               Shader::MaxStageDescriptorSets>
+        set_bindings;
+    u32 num_sets{1};
     u32 binding{};
+    uses_bindless_samplers = false;
 
     for (const auto* stage : stages) {
         if (!stage) {
             continue;
+        }
+        const u32 set = stage_sets ? Shader::StageDescriptorSet(stage->sw_stage) : 0u;
+        auto& bindings = set_bindings[set];
+        if (stage_sets) {
+            binding = 0;
+            num_sets = std::max(num_sets, set + 1);
         }
         const auto stage_bit = LogicalStageToStageBit[u32(stage->sw_stage)];
         for (const auto& buffer : stage->buffers) {
@@ -554,7 +556,13 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             });
             binding += num_bindings;
         }
+        // sotc: SOTC_BINDLESS_SAMP: the samplers of this stage come from the global heap instead.
+        const bool bindless = Shader::UsesBindlessSamplers(*stage);
+        uses_bindless_samplers |= bindless;
         for (const auto& sampler : stage->samplers) {
+            if (bindless) {
+                break;
+            }
             bindings.push_back({
                 .binding = binding++,
                 .descriptorType = vk::DescriptorType::eSampler,
@@ -563,20 +571,51 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             });
         }
     }
-    uses_push_descriptors = binding < instance.MaxPushDescriptors();
+    // sotc: descriptor buffers replace push descriptors (the two layout flags are exclusive).
+    // Neither is used with a set per stage: their sets are bound by BindStageSets.
+    const bool descriptor_buffer = !stage_sets && instance.IsDescriptorBufferEnabled();
+    uses_push_descriptors =
+        !stage_sets && !descriptor_buffer && binding < instance.MaxPushDescriptors();
     const auto flags = uses_push_descriptors
                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
+                       : descriptor_buffer
+                           ? vk::DescriptorSetLayoutCreateFlagBits::eDescriptorBufferEXT
                            : vk::DescriptorSetLayoutCreateFlagBits{};
-    const vk::DescriptorSetLayoutCreateInfo desc_layout_ci = {
-        .flags = flags,
-        .bindingCount = static_cast<u32>(bindings.size()),
-        .pBindings = bindings.data(),
+    const vk::PushConstantRange push_constants = {
+        .stageFlags = AllGraphicsStageBits,
+        .offset = 0,
+        .size = sizeof(Shader::PushData),
     };
-    auto [layout_result, layout] =
-        instance.GetDevice().createDescriptorSetLayoutUnique(desc_layout_ci);
-    ASSERT_MSG(layout_result == vk::Result::eSuccess,
-               "Failed to create graphics descriptor set layout: {}", vk::to_string(layout_result));
-    desc_layout = std::move(layout);
+    // sotc: SOTC_BINDLESS_SAMP: the sampler slots follow PushData, in a layout with a bindless stage.
+    const vk::PushConstantRange slot_push_constants = {
+        .stageFlags = AllGraphicsStageBits,
+        .offset = sizeof(Shader::PushData),
+        .size = sizeof(Shader::BindlessSamplerSlots),
+    };
+    boost::container::small_vector<LayoutCache::SetRequest, Shader::MaxStageDescriptorSets>
+        requests;
+    for (u32 set = 0; set < num_sets; ++set) {
+        requests.push_back({
+            .bindings = set_bindings[set],
+            .flags = flags,
+        });
+    }
+    const LayoutCache::Request request{
+        .sets = requests,
+        .push_constants = push_constants,
+        .trailing_set = uses_bindless_samplers ? desc_heap.BindlessSamplerLayout()
+                                               : vk::DescriptorSetLayout{},
+        .slot_constants = uses_bindless_samplers ? slot_push_constants : vk::PushConstantRange{},
+    };
+    const auto layouts = layout_cache.Get(request, owned_layouts);
+    set_layouts = layouts.sets;
+    desc_layout = set_layouts[0];
+    pipeline_layout = layouts.pipeline_layout;
+    // sotc: the offsets are per set layout, so every pipeline queries them from the shared handle.
+    if (!stage_sets) {
+        QueryDescriptorBufferLayout(set_bindings[0]);
+    }
+    return layouts.created;
 }
 
 } // namespace Vulkan

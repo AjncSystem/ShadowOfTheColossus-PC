@@ -58,6 +58,8 @@ unsigned bbgpu_symbol_count(void);
 /* sotc: where the engine keeps the pointer to its TargetFramesPerSeconds value (fps60game mode):
  * F7 then switches the game's own frame rate target instead of only its cap. */
 void bbgpu_set_fps_target_slot(void *slot);
+/* sotc: SOTC_STALL_DETAIL: the calling guest thread's CPU time is counted (src/runtime_thread.c host_start). */
+void bbgpu_register_guest_thread(void);
 #ifdef __cplusplus
 }
 #endif

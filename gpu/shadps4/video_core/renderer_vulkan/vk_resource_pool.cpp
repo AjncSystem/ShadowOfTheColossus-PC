@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstddef>
+#include <limits>
 #include <optional>
 
 #include "common/assert.h"
+#include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 
 namespace Vulkan {
@@ -61,8 +64,9 @@ std::size_t ResourcePool::ManageOverflow() {
 
 constexpr std::size_t COMMAND_BUFFER_POOL_SIZE = 4;
 
-CommandPool::CommandPool(const Instance& instance, Semaphore* work_semaphore)
-    : ResourcePool{work_semaphore, COMMAND_BUFFER_POOL_SIZE}, instance{instance} {
+CommandPool::CommandPool(const Instance& instance, Semaphore* work_semaphore,
+                         vk::CommandBufferLevel level_)
+    : ResourcePool{work_semaphore, COMMAND_BUFFER_POOL_SIZE}, instance{instance}, level{level_} {
     const vk::CommandPoolCreateInfo pool_create_info = {
         .flags = vk::CommandPoolCreateFlagBits::eTransient |
                  vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
@@ -83,7 +87,7 @@ void CommandPool::Allocate(std::size_t begin, std::size_t end) {
 
     const vk::CommandBufferAllocateInfo buffer_alloc_info = {
         .commandPool = *cmd_pool,
-        .level = vk::CommandBufferLevel::ePrimary,
+        .level = level,
         .commandBufferCount = COMMAND_BUFFER_POOL_SIZE,
     };
 
@@ -102,12 +106,34 @@ vk::CommandBuffer CommandPool::Commit() {
     return cmd_buffers[index];
 }
 
-DescriptorHeap::DescriptorHeap(const Instance& instance, Semaphore* work_semaphore_,
+std::size_t CommandPool::IndexOf(vk::CommandBuffer cmd) const {
+    for (std::size_t i = 0; i < cmd_buffers.size(); ++i) {
+        if (cmd_buffers[i] == cmd) {
+            return i;
+        }
+    }
+    ASSERT_MSG(false, "CommandPool: command buffer is not from this pool");
+    return 0;
+}
+
+void CommandPool::Hold(vk::CommandBuffer cmd) {
+    ticks[IndexOf(cmd)] = std::numeric_limits<u64>::max();
+}
+
+void CommandPool::Release(vk::CommandBuffer cmd, u64 tick) {
+    ticks[IndexOf(cmd)] = tick;
+}
+
+DescriptorHeap::DescriptorHeap(const Instance& instance, Scheduler& scheduler,
                                std::span<const vk::DescriptorPoolSize> pool_sizes_,
                                u32 descriptor_heap_count_)
-    : device{instance.GetDevice()}, work_semaphore{work_semaphore_},
+    : device{instance.GetDevice()}, work_semaphore{scheduler.GetWorkSemaphore()},
       descriptor_heap_count{descriptor_heap_count_}, pool_sizes{pool_sizes_} {
     CreateDescriptorPool();
+    // sotc: with descriptor buffers the sets are not pooled; the ring replaces Commit.
+    if (instance.IsDescriptorBufferEnabled()) {
+        descriptor_buffer = std::make_unique<DescriptorBufferRing>(instance, scheduler);
+    }
 }
 
 DescriptorHeap::~DescriptorHeap() {

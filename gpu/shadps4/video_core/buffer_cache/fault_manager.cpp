@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/div_ceil.h"
+#include "core/memory.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -142,6 +143,8 @@ void FaultManager::ProcessFaultBuffer() {
     }};
     scheduler.EndRendering();
     const auto cmdbuf = scheduler.CommandBuffer();
+    // sotc: this pass pushes its own constants (SOTC_DEDUP_PUSH cache).
+    scheduler.GetDynamicState().InvalidatePushConstants();
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
         .dependencyFlags = vk::DependencyFlagBits::eByRegion,
         .bufferMemoryBarrierCount = 1,
@@ -172,6 +175,13 @@ void FaultManager::ProcessFaultBuffer() {
         fault_ranges.ForEach([&](VAddr start, VAddr end) {
             ASSERT_MSG((end - start) <= std::numeric_limits<u32>::max(),
                        "Buffer size is too large");
+            // sotc: this runs once the GPU has finished the faulting work, which can be after the
+            // guest unmapped the range (ReleaseMemory with SOTC_UNBIND_GPU_WAIT=1 no longer waits
+            // for it): binding memory and copying guest bytes for an unmapped range would make it
+            // resident again behind the unmap. Only ranges still mapped are brought back.
+            if (!Core::Memory::Instance()->IsValidMapping(start, end - start)) {
+                return;
+            }
             buffer_cache.NoteFaultRebind(start, end - start); // sotc: before the rebind
             (void)buffer_cache.ObtainBuffer(start, end - start, false);
         });

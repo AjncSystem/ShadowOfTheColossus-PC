@@ -5,6 +5,7 @@
 #include <chrono>
 #include <mutex>
 #include <unordered_set>
+#include "common/hash.h"
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -23,10 +24,34 @@ namespace Serialization {
 // LOD feedback (sotc_lod_stats.h); binaries built with SOTC_LOD_FEEDBACK=0 are another version.
 // 37/135 = invariant position on barycentric-emulation pipelines (ground-level texture/depth
 // mismatch between the pipeline with the geometry shader and the one without; PR #258).
-// 38 = early fragment tests on the LOD feedback shaders (emit_spirv.cpp).
-static const u32 ShaderBinaryVersion = Shader::LodFeedbackEnabled() ? 38u : 135u;
+// 38/136 = SRT walker resolves Phis whose operands compute the same offset (flattened layout
+// changes for those shaders).
+// sotc: SOTC_STAGE_BINDINGS=1 binaries number their descriptors per stage: +1000 keeps them apart
+// from the others (the layouts and the shader bindings differ).
+// sotc: SOTC_BINDLESS_SAMP=1 binaries read their samplers from the heap: +2000 keeps them apart.
+static bool BindlessSamplersRequested() {
+    const char* v = std::getenv("SOTC_BINDLESS_SAMP");
+    return v && v[0] == '1';
+}
+// sotc: SOTC_SRT_PHI=0 flattens Phi shaders the old way: +4000 so cached walkers of the other
+// setting are not reused (the A/B would be void otherwise).
+static bool SrtPhiDisabled() {
+    const char* v = std::getenv("SOTC_SRT_PHI");
+    return v && v[0] == '0';
+}
+// sotc: 39/137 (from 38/136): the SRT walker no longer uses dynamic-window ReadConsts as offsets.
+// 40/138: the cache now takes loose files newer than the pack (cache_storage.cpp), which brought
+// back binaries written by older recompiler builds under the same number (wrong vertices, dark
+// trees): everything is translated again once.
+// 41 (from 40): early fragment tests on the LOD feedback shaders (emit_spirv.cpp, upstream
+// 0.70's 38); the non-feedback binaries are unchanged.
+static const u32 ShaderBinaryVersion = (Shader::LodFeedbackEnabled() ? 41u : 138u) +
+                                       (Shader::StageBindingsEnabled() ? 1000u : 0u) +
+                                       (BindlessSamplersRequested() ? 2000u : 0u) +
+                                       (SrtPhiDisabled() ? 4000u : 0u);
 static constexpr u32 ShaderMetaVersion = 21u;
-static constexpr u32 PipelineKeyVersion = 3u;
+static const u32 PipelineKeyVersion =
+    3u + (Shader::StageBindingsEnabled() ? 1000u : 0u) + (BindlessSamplersRequested() ? 2000u : 0u);
 } // namespace Serialization
 
 namespace Vulkan {
@@ -66,6 +91,33 @@ u64 BinaryId(u64 pgm_hash, size_t perm_idx) {
 bool IsCollidedPerm(size_t perm_hash) {
     std::scoped_lock lock{collided_mutex};
     return collided_perms.contains(perm_hash);
+}
+
+// sotc: whether the meta of this slot ({pgm}_{idx}) is one this build loads. A binary whose slot
+// has none (no meta, or one of an older version) belongs to no pipeline any more: an older build
+// left it. Before, it still counted as taken, so the permutation was left out of the cache and the
+// slot's meta was never rewritten: the shader was translated again every session, its pipelines
+// counted as stale at every start.
+bool SlotHasCurrentMeta(u64 pgm_hash, size_t perm_idx) {
+    std::vector<u8> blob;
+    Storage::DataBase::Instance().Load(Storage::BlobType::ShaderMeta,
+                                       fmt::format("{:#018x}", HashCombine(pgm_hash, u64(perm_idx))),
+                                       blob);
+    if (blob.empty()) {
+        return false;
+    }
+    try {
+        Serialization::Archive ar{std::move(blob)};
+        Serialization::Reader meta{ar};
+        u32 meta_version{};
+        u32 binary_version{};
+        meta.Read(meta_version);
+        meta.Read(binary_version);
+        return meta_version == Serialization::ShaderMetaVersion &&
+               binary_version == Serialization::ShaderBinaryVersion;
+    } catch (const Serialization::CorruptedData&) {
+        return false;
+    }
 }
 } // namespace
 
@@ -152,7 +204,11 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
     if (!EmulatorSettings.IsPipelineCacheArchived()) {
         std::vector<u32> stored;
         Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary, name, stored);
-        if (!stored.empty() && stored != spv) {
+        if (!stored.empty() && stored != spv && !SlotHasCurrentMeta(pgm_hash, perm_idx)) {
+            // An older build's binary: replaced (the meta is written right after).
+            SotcStats::shader_cache_replaced.fetch_add(1, std::memory_order_relaxed);
+        } else if (!stored.empty() && stored != spv) {
+            SotcStats::shader_cache_left_out.fetch_add(1, std::memory_order_relaxed);
             static std::atomic<u32> reported{0};
             if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
                 LOG_WARNING(Render_Vulkan,
@@ -242,7 +298,7 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
         WarmUpTimer timer{warmup_times.pipelines};
         // sotc: built by the pipeline workers (SOTC_ASYNC_PRELOAD); WarmUp waits for them.
         const bool deferred = AsyncPreloadEnabled();
-        it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
+        it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, layout_cache, profile,
                                                        *pipeline_cache, compute_key, *infos[0],
                                                        modules[0], sdata, true, deferred);
         if (deferred) {
@@ -355,7 +411,7 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     } else {
         WarmUpTimer timer{warmup_times.pipelines};
         it.value() = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
+            instance, scheduler, desc_heap, layout_cache, profile, graphics_key, *pipeline_cache, infos,
             runtime_infos, fetch_shader, modules, sdata, true);
     }
 
@@ -469,6 +525,9 @@ void PipelineCache::WarmUp() {
             // byte (seen 0xe3, 0x36): anything but 1 there is off, so those caches still match.
             auto& via_gs = profile_data[offsetof(Shader::Profile, barycentric_via_gs)];
             via_gs = via_gs == 1 ? 1 : 0;
+            // sotc: stage_bindings sits in the padding byte after it (see Profile).
+            auto& stage_bindings = profile_data[offsetof(Shader::Profile, stage_bindings)];
+            stage_bindings = stage_bindings == 1 ? 1 : 0;
             std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
         }
         compatible = profile_data.size() == sizeof(Shader::Profile) && cached_profile == profile;

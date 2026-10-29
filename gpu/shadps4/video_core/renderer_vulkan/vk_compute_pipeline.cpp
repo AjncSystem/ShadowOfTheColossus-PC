@@ -13,8 +13,9 @@
 namespace Vulkan {
 
 ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
-                                 DescriptorHeap& desc_heap, const Shader::Profile& profile,
-                                 vk::PipelineCache pipeline_cache, ComputePipelineKey compute_key_,
+                                 DescriptorHeap& desc_heap, LayoutCache& layout_cache,
+                                 const Shader::Profile& profile, vk::PipelineCache pipeline_cache,
+                                 ComputePipelineKey compute_key_,
                                  const Shader::Info& info_, vk::ShaderModule module_,
                                  SerializationSupport& sdata, bool preloading /*=false*/,
                                  bool deferred /*=false*/)
@@ -50,7 +51,12 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         });
         binding += num_bindings;
     }
+    // sotc: SOTC_BINDLESS_SAMP: the samplers come from the global heap (set 1) instead.
+    uses_bindless_samplers = Shader::UsesBindlessSamplers(*info);
     for (const auto& sampler : info->samplers) {
+        if (uses_bindless_samplers) {
+            break;
+        }
         bindings.push_back({
             .binding = binding++,
             .descriptorType = vk::DescriptorType::eSampler,
@@ -65,35 +71,42 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         .size = sizeof(Shader::PushData),
     };
 
-    uses_push_descriptors = binding < instance.MaxPushDescriptors();
+    // sotc: descriptor buffers replace push descriptors (the two layout flags are exclusive).
+    const bool descriptor_buffer = instance.IsDescriptorBufferEnabled();
+    uses_push_descriptors = !descriptor_buffer && binding < instance.MaxPushDescriptors();
     const auto flags = uses_push_descriptors
                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
+                       : descriptor_buffer
+                           ? vk::DescriptorSetLayoutCreateFlagBits::eDescriptorBufferEXT
                            : vk::DescriptorSetLayoutCreateFlagBits{};
-    const vk::DescriptorSetLayoutCreateInfo desc_layout_ci = {
+    // Compute has one set, set 0, whatever SOTC_STAGE_BINDINGS says.
+    const LayoutCache::SetRequest set_request{
+        .bindings = bindings,
         .flags = flags,
-        .bindingCount = static_cast<u32>(bindings.size()),
-        .pBindings = bindings.data(),
     };
-    const auto device = instance.GetDevice();
-    auto [descriptor_set_result, descriptor_set] =
-        device.createDescriptorSetLayoutUnique(desc_layout_ci);
-    ASSERT_MSG(descriptor_set_result == vk::Result::eSuccess,
-               "Failed to create compute descriptor set layout: {}",
-               vk::to_string(descriptor_set_result));
-    desc_layout = std::move(descriptor_set);
-
-    const vk::DescriptorSetLayout set_layout = *desc_layout;
-    const vk::PipelineLayoutCreateInfo layout_info = {
-        .setLayoutCount = 1U,
-        .pSetLayouts = &set_layout,
-        .pushConstantRangeCount = 1U,
-        .pPushConstantRanges = &push_constants,
+    const LayoutCache::Request request{
+        .sets = std::span{&set_request, 1},
+        .push_constants = push_constants,
+        .trailing_set = uses_bindless_samplers ? desc_heap.BindlessSamplerLayout()
+                                               : vk::DescriptorSetLayout{},
+        .slot_constants = uses_bindless_samplers
+                              ? vk::PushConstantRange{
+                                    .stageFlags = vk::ShaderStageFlagBits::eCompute,
+                                    .offset = sizeof(Shader::PushData),
+                                    .size = sizeof(Shader::BindlessSamplerSlots),
+                                }
+                              : vk::PushConstantRange{},
     };
-    auto [layout_result, layout] = instance.GetDevice().createPipelineLayoutUnique(layout_info);
-    ASSERT_MSG(layout_result == vk::Result::eSuccess,
-               "Failed to create compute pipeline layout: {}", vk::to_string(layout_result));
-    pipeline_layout = std::move(layout);
-    SetObjectName(device, *pipeline_layout, "Compute PipelineLayout {}", debug_str);
+    const auto layouts = layout_cache.Get(request, owned_layouts);
+    set_layouts = layouts.sets;
+    desc_layout = set_layouts[0];
+    pipeline_layout = layouts.pipeline_layout;
+    // sotc: the offsets are per set layout, so every pipeline queries them from the shared handle.
+    QueryDescriptorBufferLayout(bindings);
+    if (layouts.created) {
+        SetObjectName(instance.GetDevice(), pipeline_layout, "Compute PipelineLayout {}",
+                      debug_str);
+    }
 
     if (deferred) {
         ready.store(false, std::memory_order_relaxed);
@@ -119,9 +132,15 @@ void ComputePipeline::CreatePipeline() {
         .module = module,
         .pName = "main",
     };
+    // sotc: pipelines whose layouts are descriptor buffer layouts carry this flag.
+    const vk::PipelineCreateFlags pipeline_flags =
+        instance.IsDescriptorBufferEnabled()
+            ? vk::PipelineCreateFlags(vk::PipelineCreateFlagBits::eDescriptorBufferEXT)
+            : vk::PipelineCreateFlags{};
     const vk::ComputePipelineCreateInfo compute_pipeline_ci = {
+        .flags = pipeline_flags,
         .stage = shader_ci,
-        .layout = *pipeline_layout,
+        .layout = pipeline_layout,
     };
     auto [pipeline_result, pipe] =
         instance.GetDevice().createComputePipelineUnique(cache, compute_pipeline_ci);

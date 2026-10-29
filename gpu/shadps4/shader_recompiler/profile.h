@@ -56,6 +56,10 @@ struct Profile {
     /// (EmitBarycentricGeometryShader): per-vertex inputs and barycentrics become plain inputs.
     /// Last, so the profiles stored in older caches still compare equal.
     bool barycentric_via_gs{};
+    /// sotc: SOTC_STAGE_BINDINGS: each graphics stage in its own descriptor set (see
+    /// StageDescriptorSet), bindings numbered from 0 in every stage. Sits in the padding byte
+    /// after barycentric_via_gs, so the profile keeps its size; the cache check normalizes it.
+    bool stage_bindings{};
 
     bool operator==(const Profile&) const = default;
 };

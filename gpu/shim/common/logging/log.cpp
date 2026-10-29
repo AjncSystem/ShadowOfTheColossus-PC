@@ -17,7 +17,11 @@ static Level threshold() {
     }();
     return level;
 }
-bool ShouldLog(Level level) { return level >= threshold(); }
+int ReadLogThreshold() {
+    const int level = static_cast<int>(threshold());
+    g_log_threshold.store(level, std::memory_order_relaxed);
+    return level;
+}
 void Write(std::string_view log_class, Level level, const char* file, int line, const char* function,
            std::string&& message) {
     static std::mutex mutex;

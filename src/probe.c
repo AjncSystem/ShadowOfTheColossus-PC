@@ -9,6 +9,7 @@
 #include "runtime.h"
 #include "runtime_event.h"
 #include "gpu/bbgpu.h"
+#include "trace.h"
 #include "gpu/sotc/sotc_patches.h"
 #if !defined(__x86_64__) || !defined(__GNUC__)
 #error This prototype requires x86-64 GCC or Clang (including MinGW).
@@ -1010,6 +1011,7 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     if (entry) entry->outcome=((uint64_t)fault_path<<8)|(result==EXCEPTION_CONTINUE_EXECUTION)|0x10000;
     return result;
 }
+int runtime_memory_carve_retry(uintptr_t address, int write); /* sotc: runtime_memory.c */
 static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record=info->ExceptionRecord;
     DWORD code=record->ExceptionCode;
@@ -1017,6 +1019,11 @@ static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
     if (code==EXCEPTION_SINGLE_STEP && helper_single_step(info)) { fault_path=2; return EXCEPTION_CONTINUE_EXECUTION; }
     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2 && gpu_enabled && helper_read_fault(info)) {
         fault_path=3;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2 &&
+        runtime_memory_carve_retry((uintptr_t)record->ExceptionInformation[1],record->ExceptionInformation[0]==1)) {
+        fault_path=12; /* sotc: SOTC_CARVE_NOSTOP, a view split while the threads ran */
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2) {
@@ -1337,7 +1344,20 @@ void runtime_restart(void) {
 #endif
 }
 
+#ifdef _WIN32
+/* sotc: winmm's default tick is 15.6 ms. The region-lock backoff (runtime_memory.c lock_backoff)
+ * and page_manager's Sleep(1) round to that tick unless the resolution is raised, so it is raised
+ * for the whole run. SOTC_TIMER_RES=0 keeps the default. */
+static void end_timer_resolution(void) { timeEndPeriod(1); }
+#endif
+
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    {
+        const char *timer_res = getenv("SOTC_TIMER_RES");
+        if (!(timer_res && timer_res[0] == '0') && timeBeginPeriod(1) == TIMERR_NOERROR) atexit(end_timer_resolution);
+    }
+#endif
     setvbuf(stdout, NULL, _IONBF, 0);
 #ifdef _WIN32
     reserve_eboot_range();
@@ -1543,6 +1563,9 @@ int main(int argc, char **argv) {
 #endif
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
+    /* sotc: SOTC_TRACE shows guest return addresses as eboot offsets (the eboot is linked first). */
+    if (bbgpu_trace_image) bbgpu_trace_image((uint64_t)(uintptr_t)image, size);
+    trace_thread_init(); /* the main guest thread */
     if (!cpu_only) {
         char title[128]="Bloodborne", serial[16]="UNKNOWN", sfo[4096];
         uint32_t attributes=0;

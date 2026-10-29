@@ -26,6 +26,7 @@
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_stats.h"
+#include "video_core/sotc_adaptive.h"
 #include "video_core/texture_cache/host_compatibility.h"
 
 #include <vk_mem_alloc.h>
@@ -65,7 +66,13 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, liverpool{liverpool_},
       buffer_cache{buffer_cache_}, tracker{tracker_}, blit_helper{instance, scheduler},
       tile_manager{instance, scheduler, runtime, buffer_cache.GetStreamBuffer()},
-      readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()} {
+      readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()},
+      image_prefetcher{AsyncImageCreateEnabled() ? std::make_unique<ImagePrefetcher>(instance_)
+                                                 : nullptr} {
+    if (image_prefetcher) {
+        prefetch_seen = std::make_unique<std::array<PrefetchSeen, NumPrefetchSeen>>();
+        LOG_INFO(Render, "SOTC_ASYNC_IMAGE_CREATE: new images are created ahead of their draw");
+    }
 
     u32 max_samplers = instance.GetMaxSamplerAllocationCount();
     trigger_gc_samplers = max_samplers * 3 / 4;
@@ -297,6 +304,26 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool 
         const char* v = std::getenv("SOTC_DMA_OVERLAP");
         return !v || v[0] != '0';
     }();
+    // sotc: SOTC_INVAL_INDEX=1 (off by default). ForEachImageInRegion below visits only the images
+    // in page_table for the pages of the range. page_images counts, per 1 MiB page, the entries of
+    // page_table[page]: RegisterImage/UnregisterImage change both together under `mutex` (held
+    // here), so a zero count on every page proves the walk visits nothing. Pages past
+    // NumImagePages count as occupied, and an empty range is never skipped.
+    static const bool inval_index = [] {
+        const char* v = std::getenv("SOTC_INVAL_INDEX");
+        return v && v[0] == '1';
+    }();
+    if (inval_index && max_size != 0) {
+        const u64 first = address >> Traits::PAGE_BITS;
+        const u64 last = (address + max_size - 1) >> Traits::PAGE_BITS;
+        bool occupied = last >= NumImagePages;
+        for (u64 page = first; !occupied && page <= last; ++page) {
+            occupied = page_images[page].load(std::memory_order_relaxed) != 0;
+        }
+        if (!occupied) {
+            return;
+        }
+    }
     if (any_overlap && dma_overlap) {
         ForEachImageInRegion(address, max_size, [&](ImageId, Image& image) {
             if (image.Overlaps(address, max_size)) {
@@ -737,6 +764,11 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     // SOTC_EXPAND_COPY_STALE=1: always copy, as before (A/B tests).
     static const bool copy_stale = std::getenv("SOTC_EXPAND_COPY_STALE") != nullptr;
     const bool src_has_gpu_data = copy_stale || src_image.SafeToDownload();
+    // sotc: SOTC_UPLOAD_BUDGET_MB must not defer this upload: CopyImage below clears Dirty, so a
+    // deferred (zero-filled) image would keep zeros outside the copied part for good.
+    if (src_has_gpu_data) {
+        new_image.sotc_has_data = true;
+    }
     RefreshImage(new_image);
     if (src_has_gpu_data) {
         runtime.CopyImage(&src_image, &new_image);
@@ -758,6 +790,16 @@ static bool IsPerfectMatch(const ImageInfo& cached, const ImageInfo& info, bool 
            IsVulkanFormatCompatible(cached.pixel_format, info.pixel_format) &&
            (cached.type == info.type || info.size == Extent3D{1, 1, 1}) &&
            (!exact_fmt || info.pixel_format == cached.pixel_format);
+}
+
+// sotc: SOTC_TEX_BLOCK. What FindImage (non-exact) returns through its perfect-match branch, and
+// whether that branch is the one that answers (the smaller-chain check of FindImage).
+bool TextureCache::IsPerfectFind(ImageId id, const ImageInfo& info) const {
+    if (!slot_images.is_allocated(id)) {
+        return false;
+    }
+    const ImageInfo& cached = slot_images[id].info;
+    return IsPerfectMatch(cached, info, false) && !(cached.resources < info.resources);
 }
 
 // sotc: the view of a mip-tail candidate, derived from its T# on every lookup (the second-pass
@@ -794,6 +836,8 @@ void TextureCache::ImageDesc::InitMipTail(const AmdGpu::Image& image,
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     const auto& info = desc.info;
+    // sotc: SOTC_TRACE (kept when over 20 us: a new image, a resolve, an overlap)
+    const SotcTrace::ScopeMin trace_find{"find image", info.guest_address};
     ASSERT(info.guest_address != 0);
 
     std::unique_lock lock{mutex, std::defer_lock};
@@ -811,6 +855,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     // until an image is registered or unregistered (SOTC_FIND_MEMO=0: always search).
     if (const ImageId memo_id = MemoLookup(info, exact_fmt, memo_writer)) {
         Image& image = slot_images[memo_id];
+        image.tick_prev_accessed = image.tick_accessed_last;
         image.tick_accessed_last = scheduler.CurrentTick();
         TouchImage(image);
         if (tail_candidate) {
@@ -908,6 +953,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     }
 
     Image& image = slot_images[image_id];
+    image.tick_prev_accessed = image.tick_accessed_last;
     image.tick_accessed_last = scheduler.CurrentTick();
     TouchImage(image);
 
@@ -936,16 +982,28 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
         }
         image_ids.push_back(image_id);
     });
+    // sotc: the caller (buffer to image copy, clear, readback) uses the image on the GPU, and
+    // nothing else records that use: with SOTC_HOST_IMAGE_COPY, record it as a touch, so the host
+    // image copy does not write an image that a copy still in flight reads. Off by default: the
+    // tick also decides how long the collector keeps an image, so it must not change then.
+    const auto touch = [&](ImageId id) {
+        if (SotcStats::kHostImageCopy) {
+            Image& image = slot_images[id];
+            image.tick_prev_accessed = image.tick_accessed_last;
+            image.tick_accessed_last = scheduler.CurrentTick();
+        }
+        return id;
+    };
     if (image_ids.size() == 1) {
         // Sometimes image size might not exactly match with requested buffer size
         // If we only found 1 candidate image use it without too many questions.
-        return image_ids.back();
+        return touch(image_ids.back());
     }
     if (!image_ids.empty()) {
         for (s32 i = 0; i < image_ids.size(); ++i) {
             Image& image = slot_images[image_ids[i]];
             if (image.info.guest_size == size) {
-                return image_ids[i];
+                return touch(image_ids[i]);
             }
         }
         LOG_WARNING(Render_Vulkan,
@@ -953,6 +1011,69 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
                     size);
     }
     return {};
+}
+
+void TextureCache::PrefetchTexture(const AmdGpu::Image& tsharp,
+                                   const Shader::ImageResource& resource, u64 now) {
+    // sotc: SOTC_ASYNC_IMAGE_CREATE (image_prefetch.h). A T# is looked at again at most every
+    // RecheckNs, and an image is asked for it at most every RerequestNs (a guess that does not
+    // come true, e.g. a T# the draw thread resolves to part of a larger image, is not repeated
+    // every frame).
+    constexpr u64 RecheckNs = 100'000'000ULL;
+    constexpr u64 RerequestNs = 5'000'000'000ULL;
+    std::array<u64, 4> words;
+    static_assert(sizeof(words) == sizeof(AmdGpu::Image));
+    std::memcpy(words.data(), &tsharp, sizeof(words));
+    u64 tag = (words[0] * 0x9E3779B97F4A7C15ULL) ^ (words[1] * 0xC2B2AE3D27D4EB4FULL) ^
+              (words[2] * 0x165667B19E3779F9ULL) ^ (words[3] * 0x27D4EB2F165667C5ULL) ^
+              (u64{resource.is_depth} << 1) ^ (u64{resource.is_written} << 2);
+    tag |= 1; // never the empty slot's 0
+    PrefetchSeen& seen = (*prefetch_seen)[(tag ^ (tag >> 29)) % NumPrefetchSeen];
+    if (seen.tag == tag && now - seen.checked_ns < RecheckNs) {
+        return;
+    }
+    if (seen.tag != tag) {
+        seen = PrefetchSeen{.tag = tag, .checked_ns = now, .requested_ns = 0};
+    } else {
+        seen.checked_ns = now;
+    }
+    // sotc: a guess that did not come true (the T# still finds no image of its own after a
+    // request) waits twice as long each time, up to 64x RerequestNs.
+    if (seen.requested_ns != 0 &&
+        now - seen.requested_ns < (RerequestNs << std::min<u32>(seen.misses, 6))) {
+        return;
+    }
+    // Under the collector's pressure point the memory is better left to the images in use.
+    const u64 gate = pressure_gc_memory != 0 ? pressure_gc_memory : critical_gc_memory;
+    if (gate != 0 && SotcStats::vram_used.load(std::memory_order_relaxed) >= gate) {
+        return;
+    }
+    // The info FindImage will create for this T# when nothing overlaps it: a mip-tail candidate
+    // gets its tail then (DecideRebase), anything else the full chain. Built on this thread from
+    // the T# alone (ImageInfo and CachedRebase cache per thread).
+    const ImageDesc desc{tsharp, resource};
+    const ImageInfo& info = desc.other_info ? *desc.other_info : desc.info;
+    if (info.pixel_format == vk::Format::eUndefined || info.guest_address == 0 ||
+        desc.info.guest_address == 0) {
+        return;
+    }
+    // An image on the T#'s memory already exists: FindImage will most likely use it, or a view or
+    // slice of it (also when it starts at another address), so nothing is made ahead.
+    if (HasImagesInRange(desc.info.guest_address, desc.info.guest_size) ||
+        image_prefetcher->IsRegistered(info.guest_address)) {
+        return;
+    }
+    const ImagePlan plan = PlanImage(instance, info);
+    if (plan.format_result != vk::Result::eSuccess) {
+        return; // the draw thread decides what to do with a format the driver refuses
+    }
+    // Only a request the prefetcher took counts (a dropped one is asked again at the next check).
+    if (image_prefetcher->Request(plan.image_ci, info.guest_size)) {
+        if (seen.requested_ns != 0) {
+            ++seen.misses;
+        }
+        seen.requested_ns = now;
+    }
 }
 
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
@@ -995,18 +1116,61 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
 
     // Register meta data for this color buffer
     if (desc.info.meta_info.cmask_addr) {
-        surface_metas.emplace(desc.info.meta_info.cmask_addr,
-                              MetaDataInfo{.type = MetaType::CMask});
+        if (surface_metas.emplace(desc.info.meta_info.cmask_addr,
+                                  MetaDataInfo{.type = MetaType::CMask})
+                .second) {
+            meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: SOTC_RS_MEMO
+        }
         image.info.meta_info.cmask_addr = desc.info.meta_info.cmask_addr;
     }
 
     if (desc.info.meta_info.fmask_addr) {
-        surface_metas.emplace(desc.info.meta_info.fmask_addr,
-                              MetaDataInfo{.type = MetaType::FMask});
+        if (surface_metas.emplace(desc.info.meta_info.fmask_addr,
+                                  MetaDataInfo{.type = MetaType::FMask})
+                .second) {
+            meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: SOTC_RS_MEMO
+        }
         image.info.meta_info.fmask_addr = desc.info.meta_info.fmask_addr;
     }
 
     return image.FindView(desc.view_info, false);
+}
+
+void TextureCache::ReuseTarget(ImageId image_id, bool is_depth) {
+    // sotc: SOTC_RS_MEMO (Rasterizer::RsMemoBegin). FindImage's stamps and touch, then
+    // FindRenderTarget / FindDepthTarget; their UpdateImage would be a no-op on a clean, tracked
+    // image and the metadata surfaces and stencil link were registered by the earlier draw.
+    std::unique_lock lock{mutex, std::defer_lock};
+    LockCounted(lock);
+    Image& image = slot_images[image_id];
+    image.tick_prev_accessed = image.tick_accessed_last;
+    image.tick_accessed_last = scheduler.CurrentTick();
+    TouchImage(image);
+    MarkWritten(image);
+    if (is_depth) {
+        image.usage.depth_target = 1u;
+        return;
+    }
+    if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8)) {
+        std::unique_lock lk{download_images_mutex};
+        download_images.emplace(image_id);
+    }
+    image.usage.render_target = 1u;
+}
+
+void TextureCache::NoteBoundUse(ImageId image_id) {
+    // sotc: SOTC_BIND_CACHE_XTICK (Rasterizer::TryBindCache). FindImage's stamps and touch. A
+    // stamp already made in this tick is kept: tick_prev_accessed must stay the use before it
+    // (RefreshImage's host copy idle test reads it).
+    std::unique_lock lock{mutex, std::defer_lock};
+    LockCounted(lock);
+    Image& image = slot_images[image_id];
+    const u64 current = scheduler.CurrentTick();
+    if (image.tick_accessed_last != current) {
+        image.tick_prev_accessed = image.tick_accessed_last;
+        image.tick_accessed_last = current;
+    }
+    TouchImage(image);
 }
 
 ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc) {
@@ -1017,9 +1181,13 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 
     // Register meta data for this depth buffer
     if (desc.info.meta_info.htile_addr) {
-        surface_metas.emplace(desc.info.meta_info.htile_addr,
-                              MetaDataInfo{.type = MetaType::HTile,
-                                           .clear_mask = image.info.meta_info.htile_clear_mask});
+        if (surface_metas
+                .emplace(desc.info.meta_info.htile_addr,
+                         MetaDataInfo{.type = MetaType::HTile,
+                                      .clear_mask = image.info.meta_info.htile_clear_mask})
+                .second) {
+            meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: SOTC_RS_MEMO
+        }
         image.info.meta_info.htile_addr = desc.info.meta_info.htile_addr;
     }
 
@@ -1047,6 +1215,15 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
         }
         Image& stencil_image = slot_images[stencil_id];
         TouchImage(stencil_image);
+        // sotc: SOTC_BIND_CACHE_FRAME: BindTextures redirects a sampled stencil image to its depth
+        // image (GetAssociatedDepth); a cached bind of the stencil image must not outlive a change
+        // of that association (the depth image was evicted and made again).
+        if (SotcStats::kBindCacheFrame &&
+            (stencil_image.depth_id != image_id || stencil_image.depth_uid != image.image_uid)) {
+            image_stamps.Note(
+                stencil_image.info.guest_address - stencil_image.info.sotc_dropped_bytes,
+                stencil_image.info.guest_address + stencil_image.info.guest_size);
+        }
         stencil_image.AssociateDepth(image_id, image.image_uid);
     }
 
@@ -1057,6 +1234,11 @@ void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }
+    if (SotcStats::kCeiling & SotcStats::CeilingTex) {
+        return; // sotc: SOTC_CEILING=tex, measurement only (see sotc_stats.h)
+    }
+    // sotc: SOTC_TRACE: a = guest address, kept when over 20 us
+    const SotcTrace::ScopeMin trace_refresh{"image upload", image.info.guest_address};
     const SotcStats::FrameTimer frame_timer{SotcStats::FrameUpload};
     const SotcStats::SplitTimer refresh_split{SotcStats::SplitTexRefresh};
     // sotc: RefreshImage always runs under `mutex` (UpdateImage, FindImage -> ExpandImage) and can
@@ -1084,17 +1266,16 @@ void TextureCache::RefreshImage(Image& image) {
         // sotc: mip tails are small enough to land here often, and the hash below only sees the
         // first texels of the first mip: a CPU write to another mip would be missed. Re-upload.
         SotcStats::rebase_maybe_dirty.fetch_add(1, std::memory_order_relaxed);
+    } else if (maybe_cpu_dirty && image.info.guest_size > 64_KB) {
+        // sotc: defensive. A MaybeCpuDirty image begins and ends inside one page, so this should
+        // not happen; if it does, re-upload instead of hashing an unexpectedly large range.
+        SotcStats::rebase_maybe_dirty.fetch_add(1, std::memory_order_relaxed);
     } else if (maybe_cpu_dirty) {
-        // The image size should be less than page size to be considered MaybeCpuDirty
-        // So this calculation should be very uncommon and reasonably fast
-        // For now we'll just check up to 64 first pixels
+        // sotc: hash the whole image, not just its first 8x8 texels. An image inside one page is
+        // untracked after the first fault, so a CPU write past the first texels would otherwise
+        // never be seen (colored patches on meshes). The size is bounded by the 64 KiB check above.
         const auto addr = std::bit_cast<u8*>(image.info.guest_address);
-        const u32 w = std::min(image.info.size.width, u32(8));
-        const u32 h = std::min(image.info.size.height, u32(8));
-
-        const u32 s_w = image.info.props.is_block ? Common::DivCeil(w, 4u) : w;
-        const u32 s_h = image.info.props.is_block ? Common::DivCeil(h, 4u) : h;
-        const u32 size = s_w * s_h * (image.info.num_bits / 8);
+        const size_t size = image.info.guest_size;
         const u64 hash = [&] {
             const SotcStats::FrameTimer hash_timer{SotcStats::FrameHash};
             const SotcStats::SplitTimer hash_split{SotcStats::SplitTexHash};
@@ -1161,6 +1342,11 @@ void TextureCache::RefreshImage(Image& image) {
     // budget, the first upload of a big colour texture waits for a later frame (the first upload
     // of each frame always goes through); meanwhile the image holds zeros, put in on the GPU once,
     // so it shows black, never stale memory, and it stays Dirty for the next use.
+    // Placed before the host image copy below: that path also has to count as the image's data.
+    // sotc: an image is deferred for at most kMaxDeferFlips flips from its first deferral, then
+    // uploaded whatever the budget: when other uploads used the budget ahead of it in every frame,
+    // it stayed black for good (the Bluepoint logo and the autosave notice never showed, 29 Oct).
+    constexpr u64 kMaxDeferFlips = 2;
     static const u64 upload_budget = [] {
         const char* v = std::getenv("SOTC_UPLOAD_BUDGET_MB");
         return (v ? std::strtoull(v, nullptr, 10) : 32ull) << 20;
@@ -1175,7 +1361,9 @@ void TextureCache::RefreshImage(Image& image) {
     }
     if (upload_budget && !image.sotc_has_data && !is_gpu_modified && budget_used &&
         image.info.guest_size >= 256_KB && budget_used + image.info.guest_size > upload_budget &&
-        image.aspect_mask == vk::ImageAspectFlagBits::eColor) {
+        image.aspect_mask == vk::ImageAspectFlagBits::eColor &&
+        (image.sotc_deferred_flip == ~0ull ||
+         budget_flip - image.sotc_deferred_flip < kMaxDeferFlips)) {
         constexpr u64 ZeroBytes = 64_MB;
         bool fits = true;
         auto zero_copies = image_copies;
@@ -1206,6 +1394,9 @@ void TextureCache::RefreshImage(Image& image) {
                 image.sotc_zero_filled = true;
                 SotcStats::upload_zero_filled.fetch_add(1, std::memory_order_relaxed);
             }
+            if (image.sotc_deferred_flip == ~0ull) {
+                image.sotc_deferred_flip = budget_flip; // sotc: see kMaxDeferFlips
+            }
             SotcStats::upload_deferred.fetch_add(1, std::memory_order_relaxed);
             SotcStats::upload_deferred_bytes.fetch_add(image.info.guest_size,
                                                        std::memory_order_relaxed);
@@ -1214,6 +1405,25 @@ void TextureCache::RefreshImage(Image& image) {
     }
     image.sotc_has_data = true;
     budget_used += image.info.guest_size;
+
+    // sotc: SOTC_HOST_IMAGE_COPY=1: a linear image the GPU did not write, re-uploaded whole from guest
+    // memory, is written by the host: no staging copy and no command buffer. The image must be
+    // idle on the GPU. Its last use before this submit is complete, and it was not used in this
+    // submit (the touch that set tick_accessed_last came from this FindImage, so the earlier use
+    // is tick_prev_accessed).
+    if (SotcStats::kHostImageCopy && !image.info.props.is_tiled && !is_gpu_modified &&
+        image_copies.size() == num_mips &&
+        !buffer_cache.IsRegionGpuModified(image.info.guest_address, image.info.guest_size)) {
+        const u64 current = scheduler.CurrentTick();
+        const u64 last_use = image.tick_accessed_last == current ? image.tick_prev_accessed
+                                                                 : image.tick_accessed_last;
+        const bool gpu_idle = last_use < current && scheduler.IsFree(last_use);
+        const auto guest_base = std::bit_cast<const u8*>(image.info.guest_address);
+        if (runtime.TryHostImageCopy(&image, guest_base, image_copies, gpu_idle)) {
+            image.sotc_upload_from_guest = false;
+            return;
+        }
+    }
 
     scheduler.EndRendering();
 
@@ -1253,7 +1463,13 @@ void TextureCache::RefreshImage(Image& image) {
     const auto [in_buffer, in_offset] =
         from_guest
             ? buffer_cache.ObtainGuestCopyForImage(image.info.guest_address, image.info.guest_size)
-            : buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
+            : buffer_cache.ObtainBufferForImage(
+                  image.info.guest_address, image.info.guest_size,
+                  // sotc: tracked over its whole range: every page is write-protected
+                  // (SOTC_ASYNC_TEXTURE_UPLOAD; a new image is uploaded before TrackImage).
+                  True(image.flags & ImageFlagBits::Registered) &&
+                      image.track_addr == image.info.guest_address &&
+                      image.track_addr_end == image.info.guest_address + image.info.guest_size);
     const auto [buffer, offset] = [&] {
         const SotcStats::SplitTimer detile_split{SotcStats::SplitTexDetile};
         return tile_manager.DetileImage(in_buffer, in_offset, image.info);
@@ -1265,6 +1481,17 @@ void TextureCache::RefreshImage(Image& image) {
     {
         const SotcStats::SplitTimer record_split{SotcStats::SplitTexRecord};
         runtime.UploadImage(&image, buffer, image_copies);
+    }
+    // sotc: the MaybeCpuDirty check compares against image.hash, which only that branch used to
+    // set: after any other upload (CpuDirty, first upload) it described older contents, and a
+    // later rewrite of those older bytes was taken for "unchanged" (stale small textures). Keep
+    // it equal to what was just uploaded; 0 (never equal) for images the GPU writes or that do
+    // not fit in a page, which the MaybeCpuDirty path does not use.
+    if (image.info.guest_size <= 4_KB && False(image.flags & ImageFlagBits::GpuModified)) {
+        image.hash = XXH3_64bits(std::bit_cast<const u8*>(image.info.guest_address),
+                                 image.info.guest_size);
+    } else {
+        image.hash = 0;
     }
     SotcGlyphHook(image);
 }
@@ -1513,7 +1740,7 @@ void TextureCache::SotcGlyphHook(Image& image) {
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
                                      AmdGpu::BorderColorBuffer border_color_base,
-                                     const bool is_depth) {
+                                     const bool is_depth, u32* bindless_slot) {
     // sotc: per-thread memo of S# -> sampler for the current GC tick: a repeated S# skips the
     // hash, the lock, the map and the LRU touch (already touched at this tick). Samplers are only
     // erased by the garbage collector, which bumps sampler_epoch. SOTC_SAMPLER_MEMO=0 disables.
@@ -1528,6 +1755,7 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
         u64 epoch;
         bool is_depth;
         vk::Sampler handle;
+        u32 bindless; // sotc: heap slot, BindlessSamplers::NoSlot when none taken yet
     };
     thread_local std::array<SamplerMemo, 64> memo{};
     u64 raw[2];
@@ -1538,7 +1766,11 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     if (sampler_memo) {
         slot = &memo[((raw[0] * 0x9E3779B97F4A7C15ULL) ^ raw[1] ^ (is_depth ? 1 : 0)) >> 58];
         if (slot->tick == tick && slot->epoch == epoch && slot->is_depth == is_depth &&
-            slot->raw[0] == raw[0] && slot->raw[1] == raw[1]) {
+            slot->raw[0] == raw[0] && slot->raw[1] == raw[1] &&
+            (!bindless_slot || slot->bindless != BindlessSamplers::NoSlot)) {
+            if (bindless_slot) {
+                *bindless_slot = slot->bindless;
+            }
             return slot->handle;
         }
     }
@@ -1553,10 +1785,25 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     } else {
         sampler_lru_cache.Touch(it->second.lru_id, tick);
     }
-    if (slot) {
-        *slot = SamplerMemo{{raw[0], raw[1]}, tick, epoch, is_depth, it->second.Handle()};
+    // sotc: a sampler takes a heap slot the first time a bindless stage asks for one (only those
+    // pass bindless_slot): samplers of classic stages and host passes stay out of the heap, which
+    // never shrinks. A full heap hands out the default sampler of the right kind (compare for
+    // depth samplers: a non-compare sampler on a Dref lookup is undefined, blinking shadows).
+    VideoCore::Sampler& entry = samplers.at(hash);
+    if (bindless_slot && bindless_samplers.Enabled() &&
+        entry.bindless_slot == BindlessSamplers::NoSlot) {
+        entry.bindless_slot = bindless_samplers.Allocate(entry.Handle());
     }
-    return it->second.Handle();
+    if (bindless_slot) {
+        *bindless_slot = entry.bindless_slot != BindlessSamplers::NoSlot
+                             ? entry.bindless_slot
+                             : BindlessSamplers::DefaultSlot(is_depth);
+    }
+    if (slot) {
+        *slot = SamplerMemo{{raw[0], raw[1]}, tick,   epoch, is_depth, entry.Handle(),
+                            bindless_slot ? *bindless_slot : entry.bindless_slot};
+    }
+    return entry.Handle();
 }
 
 void TextureCache::RegisterImage(ImageId image_id) {
@@ -1566,10 +1813,17 @@ void TextureCache::RegisterImage(ImageId image_id) {
     image.flags |= ImageFlagBits::Registered;
     ++image_set_generation;
     ++addr_gens[AddrGenSlot(image.info.guest_address)]; // sotc: FindMemo per-address gen
+    if (SotcStats::kBindCacheFrame) { // sotc: the range form of the generation, see ImageChangedSince
+        image_stamps.Note(image.info.guest_address - image.info.sotc_dropped_bytes,
+                          image.info.guest_address + image.info.guest_size);
+    }
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
     SotcStats::cached_images.fetch_add(1, std::memory_order_relaxed);
     SotcStats::cached_image_bytes.fetch_add(Common::AlignUp(image.info.guest_size, 1024), std::memory_order_relaxed);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
+    if (image_prefetcher) { // sotc: SOTC_ASYNC_IMAGE_CREATE (PrefetchTexture skips it now)
+        image_prefetcher->NoteRegistered(image.info.guest_address);
+    }
     ForEachPage(image.info.guest_address, image.info.guest_size,
                 [this, image_id](u64 page) {
                     // Counted before TrackImage protects the pages (a system call: a barrier).
@@ -1585,7 +1839,14 @@ void TextureCache::UnregisterImage(ImageId image_id) {
     image.flags &= ~ImageFlagBits::Registered;
     ++image_set_generation;
     ++addr_gens[AddrGenSlot(image.info.guest_address)]; // sotc: FindMemo per-address gen
+    if (SotcStats::kBindCacheFrame) { // sotc: the range form of the generation, see ImageChangedSince
+        image_stamps.Note(image.info.guest_address - image.info.sotc_dropped_bytes,
+                          image.info.guest_address + image.info.guest_size);
+    }
     lru_cache.Free(image.lru_id);
+    if (image_prefetcher) { // sotc: SOTC_ASYNC_IMAGE_CREATE
+        image_prefetcher->NoteUnregistered(image.info.guest_address);
+    }
     total_used_memory -= Common::AlignUp(image.info.guest_size, 1024);
     SotcStats::cached_images.fetch_sub(1, std::memory_order_relaxed);
     SotcStats::cached_image_bytes.fetch_sub(Common::AlignUp(image.info.guest_size, 1024), std::memory_order_relaxed);
@@ -1733,9 +1994,14 @@ bool TextureCache::TryEmergencyCollect(u32 level) {
     return true;
 }
 
-void TextureCache::EmergencyCollect(u32 level) {
+void TextureCache::EmergencyCollect(u32 level, bool drop_prefetched) {
     const SotcStats::FrameTimer frame_timer{SotcStats::FrameGc};
     std::scoped_lock lock{mutex};
+    // sotc: SOTC_ASYNC_IMAGE_CREATE: images made ahead and not taken yet go first (they hold
+    // memory no cached image uses), except at the flush that starts a load.
+    if (image_prefetcher && drop_prefetched) {
+        image_prefetcher->DropUnclaimed();
+    }
     // sotc: parked depth/colour twins are not in the LRU; under pressure they go first.
     lru_cache.ForEachItemBelow(gc_tick + 1, [&](ImageId image_id) {
         auto& image = slot_images[image_id];
@@ -1803,6 +2069,15 @@ void TextureCache::GarbageCollectImages() {
     if (total_used_memory < trigger_gc_memory) {
         return;
     }
+    // sotc: SOTC_ADAPTIVE_LOAD (sotc_adaptive.h): while the governor is relieved, the routine pass
+    // (images unused for 16 submits, below the pressure point) waits for the normal state. At or
+    // over the pressure point it runs as always, as do EmergencyCollect and the load flush.
+    if (SotcAdaptive::DeferBackground() && total_used_memory < pressure_gc_memory) {
+        if (SotcStats::kFpsLog) {
+            SotcStats::adaptive_gc_deferred.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
     std::scoped_lock lock{mutex};
     bool pressured = false;
     bool aggresive = false;
@@ -1859,6 +2134,10 @@ void TextureCache::GarbageCollectImages() {
 
     // Try to remove anything old enough and not high priority.
     configure(false);
+    // sotc: SOTC_ASYNC_IMAGE_CREATE: under pressure the images made ahead go before cached ones.
+    if (pressured && image_prefetcher) {
+        image_prefetcher->DropUnclaimed();
+    }
     lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
 
     if (total_used_memory >= critical_gc_memory) {
@@ -1889,6 +2168,10 @@ void TextureCache::GarbageCollectSamplers() {
     const auto clean_up = [&](u64 hash) {
         if (num_deletions == 0) {
             return true;
+        }
+        // sotc: a sampler in the bindless heap stays: its descriptor names the handle.
+        if (samplers.at(hash).bindless_slot != BindlessSamplers::NoSlot) {
+            return false;
         }
         --num_deletions;
         const size_t lru_id = samplers.at(hash).lru_id;
@@ -2338,7 +2621,7 @@ void TextureCache::RunGarbageCollector() {
         EmergencyCollect(pending - 1);
     }
     if (SotcStats::load_flush.exchange(false, std::memory_order_relaxed)) {
-        EmergencyCollect(2); // sotc: a load began (sotc_stats.h)
+        EmergencyCollect(2, false); // sotc: a load began (sotc_stats.h)
     }
     if (SotcStats::reload_all.exchange(false, std::memory_order_relaxed)) {
         // Textures marked GPU-written although no draw targets them (copies, ExpandImage) are
@@ -2420,8 +2703,14 @@ void TextureCache::UnparkImage(ImageId image_id) {
     std::fill(image.mip_hashes.begin(), image.mip_hashes.end(), u64{0});
     image.hash = 0;
     image.tick_accessed_last = 0;
+    image.tick_prev_accessed = 0;
     image.binding = {};
     image.usage = {};
+    // sotc: SOTC_UPLOAD_BUDGET_MB: a new image for the budget, and its texels are the old twin's,
+    // not zeros, so a deferral zero-fills it again.
+    image.sotc_has_data = false;
+    image.sotc_zero_filled = false;
+    image.sotc_deferred_flip = ~0ull;
     image.RenewIdentity();
     {
         std::unique_lock lk{download_images_mutex};

@@ -3,6 +3,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <string>
 #include <thread>
@@ -114,10 +116,30 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
     LARGE_INTEGER interval{
         .QuadPart = -1 * (duration.count() / 100u),
     };
-    HANDLE timer = ::CreateWaitableTimer(NULL, TRUE, NULL);
-    SetWaitableTimer(timer, &interval, 0, NULL, NULL, 0);
-    const auto ret = WaitForSingleObjectEx(timer, INFINITE, interruptible);
-    ::CloseHandle(timer);
+    // sotc: one high-resolution timer per thread (the vblank and FPS-cap sleeps run here about 120
+    // times a second); a plain waitable timer fires on the scheduler tick. Falls back to a plain
+    // one on Windows before 10 1803, which lacks CREATE_WAITABLE_TIMER_HIGH_RESOLUTION.
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+    struct TimerHandle {
+        HANDLE handle = nullptr;
+        ~TimerHandle() {
+            if (handle) {
+                ::CloseHandle(handle);
+            }
+        }
+    };
+    thread_local TimerHandle timer;
+    if (!timer.handle) {
+        timer.handle = ::CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                                TIMER_ALL_ACCESS);
+        if (!timer.handle) {
+            timer.handle = ::CreateWaitableTimerExW(NULL, NULL, 0, TIMER_ALL_ACCESS);
+        }
+    }
+    SetWaitableTimer(timer.handle, &interval, 0, NULL, NULL, 0);
+    const auto ret = WaitForSingleObjectEx(timer.handle, INFINITE, interruptible);
 
     if (remaining) {
         const auto end_sleep = std::chrono::high_resolution_clock::now();
@@ -175,6 +197,13 @@ bool AccurateSleep(const std::chrono::nanoseconds duration, std::chrono::nanosec
 void SetCurrentThreadName(const char* name) {
     // bbport: guest thread names are kept by the C runtime.
     SetThreadDescription(GetCurrentThread(), UTF8ToUTF16W(name).data());
+    // sotc: SOTC_THREAD_IDS=1 also prints the port's own threads (the runtime prints the guest
+    // ones): host thread ids to match against ETW traces.
+    static const bool print_ids = std::getenv("SOTC_THREAD_IDS") != nullptr;
+    if (print_ids) {
+        std::fprintf(stderr, "Runtime: host thread '%s' is host thread %lu%c", name,
+                     static_cast<unsigned long>(GetCurrentThreadId()), '\n');
+    }
 }
 
 void SetThreadName(void* thread, const char* name) {

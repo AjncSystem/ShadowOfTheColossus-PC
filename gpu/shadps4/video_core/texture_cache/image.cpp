@@ -20,6 +20,7 @@
 #include "video_core/sotc_stats.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
+#include "video_core/texture_cache/image_prefetch.h"
 #include "video_core/sotc_stats.h"
 
 #include <vk_mem_alloc.h>
@@ -113,6 +114,44 @@ void UniqueImage::Destroy() {
     }
 }
 
+// sotc: SOTC_IMAGE_POOL_MB=<n> (off by default). A VMA pool of 64 MiB blocks for images, n MiB of
+// it allocated when the first image is created (the boot loading screen): images that fit are
+// suballocated from it, so a new texture no longer waits for vkAllocateMemory on the draw thread
+// while an area loads. The pool's memory type is the one VMA picks for the first image; an image
+// that cannot use it, or larger than a block, is allocated as before.
+static VmaPool ImagePool(VmaAllocator allocator, const VkImageCreateInfo& image_ci,
+                         const VmaAllocationCreateInfo& alloc_ci) {
+    static const u64 pool_mb = [] {
+        const char* v = std::getenv("SOTC_IMAGE_POOL_MB");
+        return v ? std::strtoull(v, nullptr, 10) : 0ULL;
+    }();
+    if (pool_mb == 0) {
+        return VK_NULL_HANDLE;
+    }
+    static std::once_flag once;
+    static VmaPool pool = VK_NULL_HANDLE;
+    std::call_once(once, [&] {
+        u32 type_index = 0;
+        if (vmaFindMemoryTypeIndexForImageInfo(allocator, &image_ci, &alloc_ci, &type_index) !=
+            VK_SUCCESS) {
+            return;
+        }
+        constexpr u64 BlockSize = 64_MB;
+        const VmaPoolCreateInfo pool_ci = {
+            .memoryTypeIndex = type_index,
+            .flags = 0,
+            .blockSize = BlockSize,
+            .minBlockCount = static_cast<size_t>(std::max<u64>(pool_mb * 1_MB / BlockSize, 1)),
+            .maxBlockCount = 0,
+        };
+        if (vmaCreatePool(allocator, &pool_ci, &pool) != VK_SUCCESS) {
+            pool = VK_NULL_HANDLE;
+            LOG_WARNING(Render_Vulkan, "SOTC_IMAGE_POOL_MB: the image pool could not be created");
+        }
+    });
+    return pool;
+}
+
 void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     this->image_ci = image_ci;
     ASSERT(!image);
@@ -129,8 +168,23 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     VkImage unsafe_image{};
     VmaAllocationInfo alloc_info{};
     const SotcStats::ScopedTimer alloc_timer{SotcStats::image_alloc_ns};
-    VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
-                                     &allocation, &alloc_info);
+    VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    bool from_pool = false;
+    if (const VmaPool pool = ImagePool(allocator, image_ci_unsafe, alloc_ci)) {
+        VmaAllocationCreateInfo pool_ci = alloc_ci;
+        pool_ci.pool = pool;
+        pool_ci.flags |= VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT; // only the blocks it has
+        result = vmaCreateImage(allocator, &image_ci_unsafe, &pool_ci, &unsafe_image, &allocation,
+                                &alloc_info);
+        from_pool = result == VK_SUCCESS;
+        if (from_pool) {
+            SotcStats::image_pool_allocs.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (!from_pool) {
+        result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image, &allocation,
+                                &alloc_info);
+    }
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
         // Over the video memory budget (loading screens peak before the cache collects old
         // images). Going over budget lets the driver page memory out instead of aborting.
@@ -154,6 +208,87 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     if (alloc_info2.dedicatedMemory) {
         SotcStats::image_dedicated.fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+// sotc: SOTC_ASYNC_IMAGE_CREATE. As Create, on an image worker: no allocation past the budget
+// (a speculative image must not push the cache over it; the image is then made by Create on
+// demand, which may go past it) and no assert. Not timed in image_alloc_ns, which is the time
+// the thread that needs the image spent.
+bool UniqueImage::TryCreateWithinBudget(const vk::ImageCreateInfo& image_ci) {
+    this->image_ci = image_ci;
+    ASSERT(!image);
+    const VmaAllocationCreateInfo alloc_ci = {
+        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
+        .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        .requiredFlags = 0,
+        .preferredFlags = 0,
+        .pool = VK_NULL_HANDLE,
+        .pUserData = nullptr,
+    };
+    const VkImageCreateInfo image_ci_unsafe = static_cast<VkImageCreateInfo>(image_ci);
+    VkImage unsafe_image{};
+    VmaAllocationInfo alloc_info{};
+    VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    bool from_pool = false;
+    if (const VmaPool pool = ImagePool(allocator, image_ci_unsafe, alloc_ci)) {
+        VmaAllocationCreateInfo pool_ci = alloc_ci;
+        pool_ci.pool = pool;
+        pool_ci.flags |= VMA_ALLOCATION_CREATE_NEVER_ALLOCATE_BIT;
+        result = vmaCreateImage(allocator, &image_ci_unsafe, &pool_ci, &unsafe_image, &allocation,
+                                &alloc_info);
+        from_pool = result == VK_SUCCESS;
+        if (from_pool) {
+            SotcStats::image_pool_allocs.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (!from_pool) {
+        result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image, &allocation,
+                                &alloc_info);
+    }
+    if (result != VK_SUCCESS) {
+        allocation = {};
+        return false;
+    }
+    image = vk::Image{unsafe_image};
+    size_bytes = alloc_info.size;
+    SotcStats::image_bytes.fetch_add(size_bytes, std::memory_order_relaxed);
+    SotcStats::image_count.fetch_add(1, std::memory_order_relaxed);
+    VmaAllocationInfo2 alloc_info2{};
+    vmaGetAllocationInfo2(allocator, allocation, &alloc_info2);
+    if (alloc_info2.dedicatedMemory) {
+        SotcStats::image_dedicated.fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+// sotc: SOTC_HOST_IMAGE_COPY=1: VK_IMAGE_USAGE_HOST_TRANSFER_BIT is worth adding when the host can
+// write the format (format feature HOST_IMAGE_TRANSFER on optimal tiling) and the driver reports
+// optimal device access for this usage (VkHostImageCopyDevicePerformanceQueryEXT). Cached per
+// combination, as QueryImageFormat.
+static bool HostTransferUsable(const Vulkan::Instance& instance,
+                               const vk::PhysicalDeviceImageFormatInfo2& format_info) {
+    static std::mutex mutex;
+    static std::unordered_map<u64, bool> answers;
+    const u64 key = (u64(format_info.format) << 40) ^ (u64(format_info.type) << 36) ^
+                    (u64(u32(format_info.flags)) << 20) ^ u64(u32(format_info.usage));
+    std::scoped_lock lock{mutex};
+    if (const auto it = answers.find(key); it != answers.end()) {
+        return it->second;
+    }
+    const auto physical_device = instance.GetPhysicalDevice();
+    const auto format_chain =
+        physical_device.getFormatProperties2<vk::FormatProperties2, vk::FormatProperties3>(
+            format_info.format);
+    bool usable = bool(format_chain.get<vk::FormatProperties3>().optimalTilingFeatures &
+                       vk::FormatFeatureFlagBits2::eHostImageTransfer);
+    if (usable) {
+        const auto query = physical_device.getImageFormatProperties2<
+            vk::ImageFormatProperties2, vk::HostImageCopyDevicePerformanceQueryEXT>(format_info);
+        usable = query.result == vk::Result::eSuccess &&
+                 query.value.get<vk::HostImageCopyDevicePerformanceQueryEXT>().optimalDeviceAccess;
+    }
+    answers.emplace(key, usable);
+    return usable;
 }
 
 // sotc: vkGetPhysicalDeviceImageFormatProperties2 takes about 5 ms per call on a Radeon (driver
@@ -189,16 +324,8 @@ static FormatQuery QueryImageFormat(const Vulkan::Instance& instance,
     return answer;
 }
 
-Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
-             Common::SlotVector<ImageView>& slot_image_views_, const ImageInfo& info_)
-    : runtime{&runtime_}, slot_image_views{&slot_image_views_}, info{info_} {
-    if (info.pixel_format == vk::Format::eUndefined) {
-        return;
-    }
-    const SotcStats::FrameTimer frame_timer{SotcStats::FrameImage};
-
-    image_uid = global_image_uid.Next();
-    mip_hashes.resize(info.resources.levels);
+ImagePlan PlanImage(const Vulkan::Instance& instance, const ImageInfo& info) {
+    ImagePlan plan{};
     vk::ImageCreateFlags flags{vk::ImageCreateFlagBits::eMutableFormat |
                                vk::ImageCreateFlagBits::eExtendedUsage};
     if (info.props.is_volume) {
@@ -211,24 +338,31 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
         flags |= vk::ImageCreateFlagBits::eBlockTexelViewCompatible;
     }
 
-    usage_flags = ImageUsageFlags(instance, info);
-    format_features = FormatFeatureFlags(usage_flags);
-    if (info.props.is_depth) {
-        aspect_mask = vk::ImageAspectFlagBits::eDepth;
-        if (info.props.has_stencil) {
-            aspect_mask |= vk::ImageAspectFlagBits::eStencil;
-        }
-    }
+    vk::ImageUsageFlags usage_flags = ImageUsageFlags(instance, info);
+    vk::FormatFeatureFlags2 format_features = FormatFeatureFlags(usage_flags);
 
     constexpr auto tiling = vk::ImageTiling::eOptimal;
     const auto supported_format = instance.GetSupportedFormat(info.pixel_format, format_features);
-    const vk::PhysicalDeviceImageFormatInfo2 format_info{
+    vk::PhysicalDeviceImageFormatInfo2 format_info{
         .format = supported_format,
         .type = ConvertImageType(info.type),
         .tiling = tiling,
         .usage = usage_flags,
         .flags = flags,
     };
+    // sotc: SOTC_HOST_IMAGE_COPY=1: non-depth images that are not tiled in guest memory may be
+    // written by the host (TextureCache::RefreshImage). The usage is fixed at creation, so it is
+    // decided here. Colour images always get the attachment usage (ImageUsageFlags), so a render
+    // target can carry the flag too; the host upload itself is still gated per upload by
+    // Runtime::TryHostImageCopy (GPU idle, not GPU written).
+    if (instance.IsHostImageCopyEnabled() && !info.props.is_tiled && !info.props.is_depth) {
+        auto with_host = format_info;
+        with_host.usage = usage_flags | vk::ImageUsageFlagBits::eHostTransferEXT;
+        if (HostTransferUsable(instance, with_host)) {
+            usage_flags = with_host.usage;
+            format_info.usage = with_host.usage;
+        }
+    }
     FormatQuery format_query = QueryImageFormat(instance, format_info);
     // sotc: storage usage is speculative (see ImageUsageFlags). AMD's Windows driver refuses it for
     // BC5/BC6H; creating that combination anyway corrupts the texture or loses the device later,
@@ -245,11 +379,14 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
             format_query = retry;
         }
     }
-    supported_samples = format_query.result == vk::Result::eSuccess
-                            ? format_query.sample_counts
-                            : vk::SampleCountFlagBits::e1;
+    plan.supported_samples = format_query.result == vk::Result::eSuccess
+                                 ? format_query.sample_counts
+                                 : vk::SampleCountFlagBits::e1;
+    plan.usage_flags = usage_flags;
+    plan.format_features = format_features;
+    plan.format_result = format_query.result;
 
-    const vk::ImageCreateInfo image_ci = {
+    plan.image_ci = vk::ImageCreateInfo{
         .flags = flags,
         .imageType = ConvertImageType(info.type),
         .format = supported_format,
@@ -260,22 +397,55 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
         },
         .mipLevels = static_cast<u32>(info.resources.levels),
         .arrayLayers = static_cast<u32>(info.resources.layers),
-        .samples = LiverpoolToVK::NumSamples(info.num_samples, supported_samples),
+        .samples = LiverpoolToVK::NumSamples(info.num_samples, plan.supported_samples),
         .tiling = tiling,
         .usage = usage_flags,
         .initialLayout = vk::ImageLayout::eUndefined,
     };
+    return plan;
+}
+
+Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
+             Common::SlotVector<ImageView>& slot_image_views_, const ImageInfo& info_)
+    : runtime{&runtime_}, slot_image_views{&slot_image_views_}, info{info_} {
+    if (info.pixel_format == vk::Format::eUndefined) {
+        return;
+    }
+    const SotcStats::FrameTimer frame_timer{SotcStats::FrameImage};
+
+    image_uid = global_image_uid.Next();
+    mip_hashes.resize(info.resources.levels);
+    // sotc: the parameters are worked out by PlanImage (shared with SOTC_ASYNC_IMAGE_CREATE).
+    const ImagePlan plan = PlanImage(instance, info);
+    usage_flags = plan.usage_flags;
+    format_features = plan.format_features;
+    supported_samples = plan.supported_samples;
+    if (info.props.is_depth) {
+        aspect_mask = vk::ImageAspectFlagBits::eDepth;
+        if (info.props.has_stencil) {
+            aspect_mask |= vk::ImageAspectFlagBits::eStencil;
+        }
+    }
 
     backing = &backing_images.emplace_back();
     backing->num_samples = info.num_samples;
     backing->image = UniqueImage{instance.GetDevice(), instance.GetAllocator()};
-    backing->image.Create(image_ci);
+    // sotc: SOTC_ASYNC_IMAGE_CREATE=1: an identical image an image worker already made (or is
+    // making: then this waits for it) is taken instead of creating one here.
+    if (!TakePrefetchedImage(plan.image_ci, backing->image)) {
+        backing->image.Create(plan.image_ci);
+    }
 
-    Vulkan::SetObjectName(instance.GetDevice(), GetImage(),
-                          "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{}", info.size.width,
-                          info.size.height, info.size.depth, AmdGpu::NameOf(info.tile_mode),
-                          vk::to_string(info.pixel_format), info.guest_address, info.guest_size,
-                          info.resources.layers, info.resources.levels, info.num_samples);
+    // sotc: the arguments (vk::to_string allocates) are built only when names are kept: with
+    // naming off they cost ~3% of the draw thread while textures stream.
+    if (Vulkan::object_names_enabled.load(std::memory_order_relaxed)) {
+        Vulkan::SetObjectName(instance.GetDevice(), GetImage(),
+                              "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{}", info.size.width,
+                              info.size.height, info.size.depth, AmdGpu::NameOf(info.tile_mode),
+                              vk::to_string(info.pixel_format), info.guest_address,
+                              info.guest_size, info.resources.layers, info.resources.levels,
+                              info.num_samples);
+    }
 }
 
 Image::~Image() = default;
@@ -342,6 +512,10 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                         std::optional<SubresourceRange> subres_range) {
     auto& last_state = backing->state;
     auto& subresource_states = backing->subresource_states;
+    // sotc: SOTC_TEX_BLOCK: the backing's state version moves when the state changes (at the end).
+    const State before = last_state;
+    const bool had_subresources = !subresource_states.empty();
+    bool subresources_changed = false;
 
     const bool needs_partial_transition =
         subres_range &&
@@ -352,6 +526,7 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
         if (!partially_transited) {
             subresource_states.resize(info.resources.levels * info.resources.layers);
             std::fill(subresource_states.begin(), subresource_states.end(), last_state);
+            subresources_changed = true;
         }
 
         // In case of partial transition, we need to change the specified subresources only.
@@ -400,6 +575,9 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                             .layerCount = 1,
                         },
                     });
+                    subresources_changed |= state.layout != dst_layout ||
+                                            state.access_mask != dst_mask ||
+                                            state.pl_stage != dst_stage;
                     state.layout = dst_layout;
                     state.access_mask = dst_mask;
                     state.pl_stage = dst_stage;
@@ -442,6 +620,10 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
     last_state.layout = dst_layout;
     last_state.access_mask = dst_mask;
     last_state.pl_stage = dst_stage;
+    if (subresources_changed || before.layout != dst_layout || before.access_mask != dst_mask ||
+        before.pl_stage != dst_stage || had_subresources != !subresource_states.empty()) {
+        backing->state_version = NextBackingVersion(); // sotc: SOTC_TEX_BLOCK
+    }
 }
 
 void NoteMipTailWrite(const Image& image) {

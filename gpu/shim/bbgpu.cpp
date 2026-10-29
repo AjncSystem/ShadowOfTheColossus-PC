@@ -3,6 +3,7 @@
 #include "bbport_overlay.h"
 #include "bbport_settings.h"
 #include "bbport_copy.h"
+#include "bbport_thread_cpu.h" // sotc: SOTC_STALL_DETAIL guest CPU
 #ifndef _WIN32
 #include <sys/resource.h>
 #endif
@@ -32,6 +33,8 @@
 #include "common/rdtsc.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/libs.h"
+#include "video_core/buffer_cache/async_upload.h"
+#include "common/signal_context.h" // sotc: SOTC_FENCE_PIECES (read faults)
 #include "core/memory.h"
 #include "core/emulator_settings.h"
 #include "core/signals.h"
@@ -39,6 +42,7 @@
 #include "video_core/cache_storage.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/sotc_trace.h" // sotc: SOTC_TRACE
 
 extern "C" {
 // runtime_memory.c
@@ -321,6 +325,7 @@ extern "C" int bbgpu_init(const BbGpuConfig* config) {
     StartProfileWriter();
 #endif
     g_sdk_version = config->sdk_version;
+    SotcTrace::SetUserDir(config->user_dir); // sotc: SOTC_TRACE files go to <user dir>/trace
 #ifdef _WIN32
     if (config->user_dir && !std::getenv("BB_GPU_USER_DIR")) _putenv_s("BB_GPU_USER_DIR", config->user_dir);
 #else
@@ -397,16 +402,99 @@ extern "C" void bbgpu_register_guest_stack(uintptr_t address, uint64_t size) {
 extern "C" void bbgpu_register_guest_stack_end(uintptr_t address, uint64_t size) {
     VideoCore::UnregisterGuestStack(address, size);
 }
+// sotc: SOTC_CARVE_NOSTOP (runtime_memory.c carve_host): is a registered guest (fiber) stack in
+// the range? The registry's writers never block on its lock, so this cannot deadlock.
+extern "C" int bbgpu_guest_stack_in_range(uintptr_t address, uint64_t size) {
+    return VideoCore::IntersectsGuestStack(address, size) ? 1 : 0;
+}
 extern "C" int bbgpu_readbacks_mode(void) {
     return static_cast<int>(EmulatorSettings.GetReadbacksMode());
 }
 
 extern "C" int bbgpu_handle_fault(void* ucontext, void* address) {
-    return Core::Signals::Instance()->DispatchAccessViolation(ucontext, address) ? 1 : 0;
+    // sotc: SOTC_ASYNC_UPLOAD write fence. A write fault unprotects the page and, with the
+    // write-ahead and the fault granule, pages up to 64 KiB around it: their pending copies
+    // finish first (the copy threads take no lock, so waiting here cannot deadlock).
+    // sotc: SOTC_FENCE_PIECES: read faults go on without waiting. A read fault only runs a
+    // readback (page_manager HandleGuestFault): the GPU bit is cleared and the page keeps its
+    // write protection (it only becomes writable when it is CPU-modified too, and a pending
+    // copy's pages are CPU-clean: TryUploadAsync; only a fenced write marks them). The readback
+    // writes the backing after its download's submit, which waits for every job queued before
+    // it (WaitUpTo), so it cannot overtake a copy that was already pending at the fault.
+    // sotc: the readbacks ahead of the queue (SOTC_RB_AHEAD's SubmitAheadAndWait,
+    // SOTC_RB_ASYNC_AHEAD's SubmitAheadAsync) skip WaitUpTo. They are taken only for bytes no
+    // command of the tick being recorded wrote (current_writes), while every pending job of an
+    // older tick finished before that tick's submit; a buffer job's arena copy is in
+    // current_writes (TryUploadAsync), and a texture job's pages were not GPU-modified when it
+    // was queued, so a GPU write that makes them so is in current_writes too.
+    // sotc: SOTC_FPS: times the fault (SotcStats::FaultStat; counted when it is a handled guest
+    // write fault).
+    if (SotcStats::kFpsLog) {
+        SotcStats::FaultStat::Begin();
+    }
+    const u64 trace_t0 = SotcTrace::kOn ? SotcStats::NowNs() : 0; // sotc: SOTC_TRACE
+    if (auto* async_upload = VideoCore::AsyncUpload::Get();
+        async_upload && async_upload->AnyPending() && VideoCore::AsyncUpload::FencePieces() &&
+        !Common::IsWriteError(ucontext)) {
+        SotcStats::fence_read_skips.fetch_add(1, std::memory_order_relaxed);
+    } else if (async_upload && async_upload->AnyPending()) {
+        const SotcStats::FaultStat::Scope fence_timed{&SotcStats::FaultStat::Tl::fence_ns};
+        // The fault granule is at most 64 KiB (kFaultGranule); the write-ahead covers
+        // SOTC_WRITE_AHEAD_PAGES pages (15 by default) after the faulting one.
+        static const u64 span = [] {
+            const char* v = std::getenv("SOTC_WRITE_AHEAD_PAGES");
+            const u64 ahead = (v ? std::strtoull(v, nullptr, 10) : 15ULL) * 4096 + 4096;
+            return std::max<u64>(ahead, 64 * 1024);
+        }();
+        const u64 window = reinterpret_cast<u64>(address) & ~u64{0xFFFF};
+        if (SotcStats::kWriteAheadAdapt) {
+            // sotc: SOTC_WRITE_AHEAD_ADAPT: the window can reach SOTC_WRITE_AHEAD_MAX_PAGES pages
+            // either side of the faulting page (rounded out to 64 KiB, as the fixed span is).
+            const u64 reach = (u64{SotcStats::kWriteAheadMaxPages} + 16) * 4096;
+            const u64 begin = (window > reach ? window - reach : 0) & ~u64{0xFFFF};
+            async_upload->WaitVa(begin, window - begin + std::max(span, reach) + 64 * 1024);
+        } else {
+            async_upload->WaitVa(window, span + 64 * 1024);
+        }
+    }
+    const int handled = Core::Signals::Instance()->DispatchAccessViolation(ucontext, address) ? 1 : 0;
+    if (SotcStats::kFpsLog) {
+        SotcStats::FaultStat::End();
+    }
+    if (trace_t0 && handled) {
+        // a = the faulting address, b = the faulting instruction
+        u64 rip = 0;
+#ifdef _WIN32
+        rip = static_cast<EXCEPTION_POINTERS*>(ucontext)->ContextRecord->Rip;
+#endif
+        // Never allocates here (the exception handler): threads get their ring beforehand.
+        SotcTrace::SpanIfReady(Common::IsWriteError(ucontext) ? "write fault" : "read fault",
+                               trace_t0, SotcStats::NowNs(), reinterpret_cast<u64>(address), rip);
+    }
+    return handled;
+}
+
+// sotc: SOTC_ASYNC_UPLOAD write fence for the runtime's own writes to guest memory (zeroing
+// freed memory, backing writes): offsets in the backing view (runtime_memory.c).
+extern "C" void bbgpu_upload_wait_phys(uint64_t phys, uint64_t size) {
+    const SotcTrace::Scope trace_wait{"upload fence (runtime write)", phys, size}; // sotc
+    if (auto* async_upload = VideoCore::AsyncUpload::Get()) {
+        async_upload->WaitPhys(phys, size);
+    }
 }
 
 extern "C" void bbgpu_set_fps_target_slot(void* slot) {
     SotcFpsCap::target_slot.store(slot, std::memory_order_relaxed);
+}
+
+// sotc: SOTC_STALL_DETAIL: a game guest thread records its CPU time under SotcStats::RoleGuest (the
+// SOTCSTALL "guest cpu" figure). Called by host_start (src/runtime_thread.c). tl_role is left as it
+// is: the trace recorder reads RoleOther as "guest". Only with SOTC_STALL_DETAIL: SOTC_FPS alone
+// keeps sampling the GPU threads only, as before.
+void bbgpu_register_guest_thread(void) {
+    if (SotcStats::kStallDetail) {
+        BbThreadCpu::RegisterLowPriority(SotcStats::RoleGuest);
+    }
 }
 
 extern "C" unsigned bbgpu_symbol_count(void) {

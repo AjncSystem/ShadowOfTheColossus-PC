@@ -48,7 +48,7 @@ struct UniqueImage {
     UniqueImage& operator=(const UniqueImage&) = delete;
 
     UniqueImage(UniqueImage&& other)
-        : allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
+        : device{other.device}, allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
           allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
           image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)},
           size_bytes{std::exchange(other.size_bytes, 0)} {}
@@ -65,6 +65,11 @@ struct UniqueImage {
     }
 
     void Create(const vk::ImageCreateInfo& image_ci);
+
+    /// sotc: SOTC_ASYNC_IMAGE_CREATE: Create for an image made ahead of use on an image worker
+    /// (ImagePrefetcher). Within the video memory budget only, and a failure is returned instead
+    /// of asserted: the image is then made by Create when it is needed, as without the switch.
+    bool TryCreateWithinBudget(const vk::ImageCreateInfo& image_ci);
 
     void Destroy();
 
@@ -86,6 +91,25 @@ public:
 };
 
 extern u64 g_sotc_fence_epoch; // sotc: bumped at every fence the command processor retires
+
+/// sotc: the Vulkan creation parameters Image::Image derives from an ImageInfo. Shared with the
+/// creation ahead of use (SOTC_ASYNC_IMAGE_CREATE, ImagePrefetcher), which must ask for exactly
+/// the image the constructor would. Thread safe (the format queries are cached under a mutex).
+struct ImagePlan {
+    vk::ImageCreateInfo image_ci{};
+    vk::ImageUsageFlags usage_flags{};
+    vk::FormatFeatureFlags2 format_features{};
+    vk::SampleCountFlags supported_samples{};
+    vk::Result format_result{}; ///< the driver's answer for the final format/usage combination
+};
+ImagePlan PlanImage(const Vulkan::Instance& instance, const ImageInfo& info);
+
+/// sotc: SOTC_TEX_BLOCK: a state version for a backing (BackingImage::state_version), from one
+/// sequence shared by all backings and never repeated.
+inline u32 NextBackingVersion() {
+    static std::atomic<u32> sequence{0};
+    return sequence.fetch_add(1, std::memory_order_relaxed) + 1;
+}
 
 struct Image {
     explicit Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime,
@@ -171,6 +195,10 @@ public:
         // only grow and their entries never change, so an index stays valid for the backing's
         // lifetime; ~0u = none yet.
         u32 last_view = ~0u;
+        // sotc: SOTC_TEX_BLOCK: moves whenever the state above changes (layout, access, stage,
+        // the per-subresource split) and when the backing is first made. Every value comes from
+        // NextBackingVersion, so no two states of any backing share one.
+        u32 state_version = NextBackingVersion();
     };
     std::deque<BackingImage> backing_images;
     BackingImage* backing{};
@@ -183,6 +211,9 @@ public:
     }
     u64 lru_id{};
     u64 tick_accessed_last{};
+    /// sotc: tick_accessed_last before its latest update (the use before the current one). The
+    /// host image copy (SOTC_HOST_IMAGE_COPY) needs the last use before the current submit.
+    u64 tick_prev_accessed{};
     u64 hash{};
     u64 general_epoch{~0ull}; // sotc: fence epoch of the last GENERAL->GENERAL barrier
     /// sotc: host bytes this full chain would save as a mip tail (census "projected" only).
@@ -192,6 +223,8 @@ public:
     /// sotc: the upload budget (RefreshImage): guest data uploaded once / zeros put in meanwhile.
     bool sotc_has_data{};
     bool sotc_zero_filled{};
+    /// sotc: the flip of the image's first deferral (~0: never deferred); deferrals stop 2 flips on.
+    u64 sotc_deferred_flip{~0ull};
     /// sotc: SOTC_POOL_WATCH: hash of the first 64 KiB of guest memory at the first upload.
     u64 sotc_first_hash{};
     u32 sotc_uploads{};

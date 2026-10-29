@@ -16,6 +16,7 @@
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
+#include "video_core/sotc_trace.h" // sotc: SOTC_TRACE
 
 namespace Libraries::Kernel {
 
@@ -490,7 +491,11 @@ int PS4_SYSV_ABI sceKernelWaitEqueue(OrbisKernelEqueue eq, OrbisKernelEvent* ev,
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
 
-    *out = equeue->WaitForEvents(ev, num, timo);
+    {
+        const SotcTrace::Scope sotc_trace{"equeue wait", static_cast<u64>(eq),
+                                          reinterpret_cast<u64>(__builtin_return_address(0))};
+        *out = equeue->WaitForEvents(ev, num, timo);
+    }
 
     if (*out == 0) {
         return ORBIS_KERNEL_ERROR_ETIMEDOUT;

@@ -69,6 +69,45 @@ public:
         return queue_family_index;
     }
 
+    /// sotc: SOTC_XFER_QUEUE=1: true when a transfer-only queue family was found and its queue
+    /// created (XferQueue in vk_scheduler.h). Without it, the device has the graphics queue only.
+    bool HasXferQueue() const {
+        return xfer_queue_family_index != NoXferQueueFamily;
+    }
+
+    u32 GetXferQueueFamilyIndex() const {
+        return xfer_queue_family_index;
+    }
+
+    /// sotc: SOTC_XFER_QUEUE=1: ordinary uploads may be routed to the transfer queue
+    /// (Runtime::TryCopyBufferXfer). The queue may also exist for SOTC_HOST_IMPORT alone.
+    bool IsXferRoutingEnabled() const {
+        return xfer_routing && HasXferQueue();
+    }
+
+    /// sotc: SOTC_RB_TICK=1 and the transfer queue exists: guest readbacks may be copied on it
+    /// (XferQueue::ReadbackCopy). It creates the queue WITHOUT routing uploads to it. Chosen over
+    /// queue family ownership transfers: every Buffer (arenas, staging) is then created
+    /// concurrent over {graphics, transfer} (buffer.cpp), so no release/acquire barriers pair up.
+    bool IsRbTickEnabled() const {
+        return rb_tick && HasXferQueue();
+    }
+
+    /// sotc: SOTC_HOST_IMPORT=1, VK_EXT_external_memory_host is enabled and the transfer queue
+    /// exists (BufferCache::HostImport).
+    bool IsHostImportEnabled() const {
+        return host_import_enabled;
+    }
+
+    /// sotc: minImportedHostPointerAlignment (SOTC_HOST_IMPORT).
+    u64 HostImportAlignment() const {
+        return host_import_alignment;
+    }
+
+    vk::Queue GetXferQueue() const {
+        return xfer_queue;
+    }
+
     vk::Queue GetGraphicsQueue() const {
         return graphics_queue;
     }
@@ -247,6 +286,18 @@ public:
         return vk12_features.shaderSharedInt64Atomics;
     }
 
+    /// sotc: true when SOTC_BINDLESS_SAMP=1 was set and the device has the descriptor indexing
+    /// features for a global sampler heap (runtime descriptor array of update-after-bind samplers).
+    /// Off by default; the shader cache version depends on it.
+    bool IsBindlessSamplersEnabled() const {
+        return bindless_samplers;
+    }
+
+    /// sotc: upper bound on update-after-bind sampler descriptors per set (device limit).
+    u32 GetMaxDescriptorSetUpdateAfterBindSamplers() const {
+        return vk12_props.maxDescriptorSetUpdateAfterBindSamplers;
+    }
+
     /// Returns true if the subgroup size can be set to match guest subgroup size in every stage.
     /// sotc: AMD reports 64-wide subgroups but can require a size only for compute
     /// (requiredSubgroupSizeStages = compute); requiring 64 in the graphics stages was invalid and
@@ -331,6 +382,33 @@ public:
         return shader_clock && shader_clock_features.shaderSubgroupClock;
     }
 
+    /// sotc: SOTC_PRESENT_WAIT=1 and VK_KHR_present_id / VK_KHR_present_wait are enabled. The
+    /// presenter then tags each present with an id and the vblank thread waits on them.
+    bool IsPresentWaitEnabled() const {
+        return present_wait_enabled;
+    }
+
+    /// sotc: VK_KHR_present_id is enabled (SOTC_PRESENT_WAIT or SOTC_REFLEX). Presents are then
+    /// tagged with an id.
+    bool IsPresentIdEnabled() const {
+        return present_id_enabled;
+    }
+
+    /// sotc: SOTC_LOW_LATENCY=1 (or SOTC_REFLEX=1) was set. The backend is picked by LowLatency.
+    bool IsLowLatencyRequested() const {
+        return low_latency_requested;
+    }
+
+    /// sotc: VK_NV_low_latency2 is enabled (SOTC_LOW_LATENCY, NVIDIA devices only).
+    bool IsNvLowLatencyEnabled() const {
+        return nv_low_latency_enabled;
+    }
+
+    /// sotc: VK_AMD_anti_lag is enabled with its feature (SOTC_LOW_LATENCY, AMD devices only).
+    bool IsAmdAntiLagEnabled() const {
+        return amd_anti_lag_enabled;
+    }
+
     /// Returns the vendor ID of the physical device
     u32 GetVendorID() const {
         return properties.vendorID;
@@ -395,6 +473,22 @@ public:
         return properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
     }
 
+    /// sotc: true when a discrete GPU exposes a DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT memory
+    /// type in a heap larger than 256 MiB (Resizable BAR). Always false on integrated GPUs.
+    bool HasLargeBar() const {
+        return has_large_bar;
+    }
+
+    /// sotc: index of the heap reported by HasLargeBar(). Only meaningful when it is true.
+    u32 LargeBarHeapIndex() const {
+        return large_bar_heap;
+    }
+
+    /// sotc: SOTC_REBAR_UPLOAD=1 (default off) and a large BAR is present.
+    bool RebarUploadEnabled() const {
+        return rebar_upload_enabled;
+    }
+
     /// Returns the pipeline cache unique identifier
     const auto GetPipelineCacheUUID() const {
         return properties.pipelineCacheUUID;
@@ -444,6 +538,29 @@ public:
     /// Returns the maximum number of push descriptors.
     u32 MaxPushDescriptors() const {
         return push_descriptor_props.maxPushDescriptors;
+    }
+
+    /// sotc: the most descriptor sets a pipeline layout can bind (SOTC_STAGE_BINDINGS needs 5).
+    u32 GetMaxBoundDescriptorSets() const {
+        return properties.limits.maxBoundDescriptorSets;
+    }
+
+    /// sotc: true when descriptors live in host-written descriptor buffers (VK_EXT_descriptor_buffer,
+    /// SOTC_DESC_BUFFER=1). Push descriptors are not used in that mode.
+    bool IsDescriptorBufferEnabled() const noexcept {
+        return descriptor_buffer;
+    }
+
+    /// sotc: true when VK_EXT_host_image_copy is enabled (SOTC_HOST_IMAGE_COPY=1). Images created
+    /// with VK_IMAGE_USAGE_HOST_TRANSFER_BIT may then be written by the host (Runtime::TryHostImageCopy).
+    bool IsHostImageCopyEnabled() const noexcept {
+        return host_image_copy;
+    }
+
+    /// sotc: descriptor sizes and offset alignment, valid when IsDescriptorBufferEnabled().
+    const vk::PhysicalDeviceDescriptorBufferPropertiesEXT& GetDescriptorBufferProperties()
+        const noexcept {
+        return descriptor_buffer_props;
     }
 
     /// Returns the maximum size of a single VkDeviceMemory
@@ -561,6 +678,9 @@ private:
     /// Creates the VMA allocator handle
     void CreateAllocator();
 
+    /// sotc: looks for a Resizable BAR heap and logs the SOTC_REBAR_UPLOAD decision once.
+    void DetectLargeBar();
+
     /// Collects various information from the device.
     void CollectDeviceParameters();
     void CollectPhysicalMemoryInfo();
@@ -590,6 +710,7 @@ private:
     vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT image_2d_view_of_3d_features;
     vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT list_restart_features;
     vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock_features;
+    vk::PhysicalDeviceDescriptorBufferPropertiesEXT descriptor_buffer_props;
     vk::DriverIdKHR driver_id;
     vk::UniqueDebugUtilsMessengerEXT debug_callback{};
     std::string vendor_name;
@@ -601,6 +722,13 @@ private:
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;
     TracyVkCtx profiler_context{};
     u32 queue_family_index{0};
+    static constexpr u32 NoXferQueueFamily = ~u32{0};
+    u32 xfer_queue_family_index{NoXferQueueFamily}; // sotc: see HasXferQueue()
+    vk::Queue xfer_queue;                           // sotc: see HasXferQueue()
+    bool xfer_routing{};          // sotc: see IsXferRoutingEnabled()
+    bool rb_tick{};               // sotc: see IsRbTickEnabled()
+    bool host_import_enabled{};   // sotc: see IsHostImportEnabled()
+    u64 host_import_alignment{};  // sotc: see HostImportAlignment()
     bool custom_border_color{};
     bool fragment_shader_barycentric{};
     bool amd_shader_explicit_vertex_parameter{};
@@ -628,9 +756,20 @@ private:
     bool image_view_min_lod{};
     bool shader_clock{};
     bool supports_memory_budget{};
+    bool has_large_bar{};         // sotc: see HasLargeBar()
+    bool rebar_upload_enabled{};  // sotc: see RebarUploadEnabled()
+    u32 large_bar_heap{};         // sotc: see LargeBarHeapIndex()
     bool device_fault{};
     bool device_fault_vendor_binary{};
+    bool descriptor_buffer{}; // sotc: VK_EXT_descriptor_buffer enabled (SOTC_DESC_BUFFER=1)
+    bool host_image_copy{};   // sotc: VK_EXT_host_image_copy enabled (SOTC_HOST_IMAGE_COPY=1)
+    bool present_wait_enabled{}; // sotc: SOTC_PRESENT_WAIT, see IsPresentWaitEnabled
+    bool present_id_enabled{};   // sotc: VK_KHR_present_id on, see IsPresentIdEnabled
+    bool low_latency_requested{};    // sotc: SOTC_LOW_LATENCY / SOTC_REFLEX, see IsLowLatencyRequested
+    bool nv_low_latency_enabled{};   // sotc: VK_NV_low_latency2 on, see IsNvLowLatencyEnabled
+    bool amd_anti_lag_enabled{};     // sotc: VK_AMD_anti_lag on, see IsAmdAntiLagEnabled
     bool supports_block_texel_view{};
+    bool bindless_samplers{};
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;
 };

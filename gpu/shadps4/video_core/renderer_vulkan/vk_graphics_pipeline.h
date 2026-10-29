@@ -88,7 +88,8 @@ public:
     };
 
     GraphicsPipeline(const Instance& instance, Scheduler& scheduler, DescriptorHeap& desc_heap,
-                     const Shader::Profile& profile, const GraphicsPipelineKey& key,
+                     LayoutCache& layout_cache, const Shader::Profile& profile,
+                     const GraphicsPipelineKey& key,
                      vk::PipelineCache pipeline_cache,
                      std::span<const Shader::Info*, MaxShaderStages> stages,
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
@@ -113,7 +114,8 @@ public:
                          u32 step_rate_1) const;
 
 private:
-    void BuildDescSetLayout(bool preloading);
+    /// sotc: sets desc_layout and pipeline_layout; true when this pipeline created them.
+    bool BuildDescSetLayout(LayoutCache& layout_cache, bool preloading);
 
 private:
     GraphicsPipelineKey key;

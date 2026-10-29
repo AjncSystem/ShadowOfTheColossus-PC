@@ -518,6 +518,10 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
         frame.present_done = fence;
         free_queue.push(&frame);
     }
+    // sotc: SOTC_CP_FLIP_PACE=1 (off by default), see cp_pacer.
+    if (const char* v = std::getenv("SOTC_CP_FLIP_PACE"); v && v[0] == '1') {
+        cp_pacer = this;
+    }
 
     fsr_settings.enable = EmulatorSettings.IsFsrEnabled();
     fsr_settings.use_rcas = EmulatorSettings.IsRcasEnabled();
@@ -551,6 +555,9 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
 }
 
 Presenter::~Presenter() {
+    if (cp_pacer == this) {
+        cp_pacer = nullptr;
+    }
     // This thread records the last commands of the rasterizer scheduler.
     draw_scheduler.ClaimRecorder();
     draw_scheduler.Finish();
@@ -719,6 +726,9 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
 
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
+    if (wait_service) {
+        WaitFreeFrame(); // sotc: SOTC_FLIP_SERVICE, before anything of this flip is done
+    }
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);
@@ -1074,6 +1084,73 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     return frame;
 }
 
+// sotc: SOTC_PRESENT_WAIT. Each present on the main path is tagged with the next id
+// (VK_KHR_present_id), so the vblank thread can wait until it is on screen (driver.cpp). Ids
+// are taken under Scheduler::submit_mutex together with swapchain.Present, so they follow the
+// queue order.
+u64 Presenter::TagPresent() {
+    std::scoped_lock lock{present_records_mutex};
+    const u64 id = last_present_id.load(std::memory_order_relaxed) + 1;
+    present_records[id % present_records.size()] = {
+        .id = id,
+        .swapchain = static_cast<VkSwapchainKHR>(swapchain.GetHandle()),
+    };
+    last_present_id.store(id, std::memory_order_release);
+    return id;
+}
+
+bool Presenter::WaitPresented(u64 id, u64 timeout_ns) {
+    if (id == 0) {
+        return true;
+    }
+    const VkSwapchainKHR current = static_cast<VkSwapchainKHR>(swapchain.GetHandle());
+    {
+        std::scoped_lock lock{present_records_mutex};
+        if (id > last_present_id.load(std::memory_order_acquire)) {
+            return false; // not presented yet
+        }
+        const PresentRecord& record = present_records[id % present_records.size()];
+        // Already waited for, or too old to be kept, or from a swapchain that was replaced (its
+        // presents were all finished by the device idle in Swapchain::Destroy): nothing to wait.
+        if (record.id != id || record.swapchain != current || record.done_ns != 0) {
+            return true;
+        }
+    }
+
+    // The raw dispatcher call: vk::Device::waitForPresentKHR asserts on results other than
+    // success and timeout, and a swapchain error here is handled by the next present.
+    const VkResult result = VULKAN_HPP_DEFAULT_DISPATCHER.vkWaitForPresentKHR(
+        static_cast<VkDevice>(instance.GetDevice()), current, id, timeout_ns);
+    if (result == VK_TIMEOUT) {
+        return false;
+    }
+    if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            std::fprintf(stderr, "SOTC PRESENT_WAIT: vkWaitForPresentKHR returned %d, not waiting\n",
+                         int(result));
+        }
+        return true;
+    }
+
+    const u64 done_ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+    std::scoped_lock lock{present_records_mutex};
+    PresentRecord& record = present_records[id % present_records.size()];
+    if (record.id == id) {
+        record.done_ns = done_ns;
+    }
+    return true;
+}
+
+u64 Presenter::PresentDoneNs(u64 id) const {
+    std::scoped_lock lock{present_records_mutex};
+    const PresentRecord& record = present_records[id % present_records.size()];
+    return record.id == id ? record.done_ns : 0;
+}
+
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
     // Free the frame for reuse
     const auto free_frame = [&] {
@@ -1081,7 +1158,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             last_submit_frame = frame;
             std::scoped_lock fl{free_mutex};
             free_queue.push(frame);
-            free_cv.notify_one();
+            // sotc: notify_all: the command processor may wait too (SOTC_CP_FLIP_PACE), and
+            // waking it instead of the draw thread left the draw thread blocked.
+            free_cv.notify_all();
         }
     };
 
@@ -1384,7 +1463,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
+    low_latency.SubmitStart(); // sotc: SOTC_LOW_LATENCY render submit markers (NVIDIA)
     scheduler.Flush(info);
+    low_latency.SubmitEnd();
 
     // Present to swapchain.
     {
@@ -1394,7 +1475,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                              FitImage(frame->width, frame->height, extent.width, extent.height),
                              extent);
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        const bool presented = swapchain.Present();
+        const u64 present_id = instance.IsPresentIdEnabled() ? TagPresent() : 0;
+        low_latency.BeforePresent(present_id);
+        const SotcTrace::Scope trace_present{"present", present_id}; // sotc: SOTC_TRACE
+        const bool presented = swapchain.Present(present_id);
+        low_latency.AfterPresent(frame->present_done);
         Dlssg::AfterPresent(frame->id);
         if (FrameGen::Current() == FrameGen::Mode::Fsr) {
             FsrFg::NotePresent();
@@ -1408,16 +1493,29 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     free_frame();
     if (!is_reusing_frame && is_game_frame) {
         DebugState.IncFlipFrameNum();
+        // sotc: SOTC_TRACE: the game frame (flip to flip) and, when it was slow, its dump.
+        if (SotcTrace::kOn) {
+            static u64 trace_frames = 0, trace_prev_ns = 0;
+            const u64 now_ns = SotcStats::NowNs();
+            ++trace_frames;
+            if (trace_prev_ns) {
+                SotcTrace::FrameEnd(trace_frames, trace_prev_ns, now_ns);
+            }
+            trace_prev_ns = now_ns;
+        }
         // SOTC_FRAME_LOG=<n> prints the frame count and time to stderr every n frames, for
         // measuring the frame rate of scripted runs.
         static const u64 every = [] {
             const char* v = std::getenv("SOTC_FRAME_LOG");
             return v ? std::strtoull(v, nullptr, 10) : 0ULL;
         }();
-        if (every != 0) {
+        // sotc: SOTC_FPS=1 also runs the SOTCSTALL check below (without the SOTCFRAME lines), so
+        // slow frames of normal play are attributed in the session log.
+        if (every != 0 || SotcStats::kFpsLog) {
             static u64 frames = 0;
             static const auto t0 = std::chrono::steady_clock::now();
-            if (++frames % every == 0) {
+            ++frames;
+            if (every != 0 && frames % every == 0) {
                 const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                                     std::chrono::steady_clock::now() - t0)
                                     .count();
@@ -1437,24 +1535,95 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             const long long now_us = std::chrono::duration_cast<std::chrono::microseconds>(
                                          std::chrono::steady_clock::now() - t0)
                                          .count();
+            // sotc: the SOTC_FPS report (driver.cpp) resets readbacks/readback_ns every 5 s, so
+            // their deltas fall back to the new value after a reset instead of wrapping.
             const u64 cur[11] = {SotcStats::pipelines_new.load(), SotcStats::pipeline_ns.load(),
                                 SotcStats::shaders_compiled.load(), SotcStats::shader_ns.load(),
                                 SotcStats::images_new.load(), SotcStats::image_ns.load(),
                                 SotcStats::readbacks.load(), SotcStats::readback_ns.load(),
                                 SotcStats::image_query_ns.load(), SotcStats::image_alloc_ns.load(),
                                 SotcStats::image_dedicated.load()};
+            // sotc: SOTC_FPS: the thread accounting of this frame (snapshot at every game flip,
+            // so the figures cover exactly the time since the previous one).
+            static SotcStats::FrameAccount last_account{};
+            char account_text[768] = ""; // sotc: 512 truncated the tail once many fields were appended
+            if (SotcStats::kFpsLog) {
+                const SotcStats::FrameAccount now_account = SotcStats::TakeAccount();
+                const SotcStats::FrameAccount d =
+                    SotcStats::DiffAccount(now_account, last_account);
+                last_account = now_account;
+                using SotcStats::WaitGpu, SotcStats::WaitRecorder, SotcStats::WaitUpload,
+                    SotcStats::WaitTcLock;
+                const auto ms = [](u64 ns) { return ns / 1e6; };
+                const auto n = [](u64 v) { return static_cast<unsigned long long>(v); };
+                std::snprintf(
+                    account_text, sizeof(account_text),
+                    "; cpu draw %.1f cp %.1f rec %.1f passsec %.1f upload %.1f ms; draw waits "
+                    "gpu %.1f (%llu) rec %.1f (%llu) upload %.1f (%llu) tc %.1f (%llu) ms; cp "
+                    "parse %.1f blocked %.1f spin %.1f ms; rec busy %.1f upload-wait %.1f submit %.1f ms; "
+                    "fence %.1f ms", // sotc: SOTC_ASYNC_UPLOAD write fence waits
+                    ms(d.cpu_ns[SotcStats::RoleDraw]), ms(d.cpu_ns[SotcStats::RoleCp]),
+                    ms(d.cpu_ns[SotcStats::RoleRecorder]),
+                    ms(d.cpu_ns[SotcStats::RolePassSecondary]),
+                    ms(d.cpu_ns[SotcStats::RoleUpload]), ms(d.wait_ns[WaitGpu]),
+                    n(d.wait_count[WaitGpu]), ms(d.wait_ns[WaitRecorder]),
+                    n(d.wait_count[WaitRecorder]), ms(d.wait_ns[WaitUpload]),
+                    n(d.wait_count[WaitUpload]), ms(d.wait_ns[WaitTcLock]),
+                    n(d.wait_count[WaitTcLock]), ms(d.parse_ns), ms(d.blocked_ns),
+                    ms(d.spin_ns), // sotc: CP no-progress spin (Liverpool::Process)
+                    ms(d.rec_busy), ms(d.rec_upload), ms(d.rec_submit), ms(d.fence));
+                // sotc: guest threads' wall-clock wait in asynchronous readbacks this frame
+                const size_t used = std::strlen(account_text);
+                std::snprintf(account_text + used, sizeof(account_text) - used,
+                              "; rb wait %.1f ms (%llu), rb adj %llu", ms(d.rb_wait_ns),
+                              n(d.rb_wait_count), n(d.rb_adj)); // sotc: adjacent requests
+                // sotc: SOTC_RB_PREFETCH: prefetches applied at a guest fault this frame
+                const size_t used_pf = std::strlen(account_text);
+                if (used_pf + 1 < sizeof(account_text)) {
+                    std::snprintf(account_text + used_pf, sizeof(account_text) - used_pf,
+                                  ", rb pf %llu", n(d.rb_pf));
+                }
+                // sotc: guest write faults this frame (FaultStat)
+                const size_t used_fl = std::strlen(account_text);
+                if (used_fl + 1 < sizeof(account_text)) {
+                    std::snprintf(account_text + used_fl, sizeof(account_text) - used_fl,
+                                  ", faults %llu (%.1f ms)", n(d.fault_count), ms(d.fault_ns));
+                }
+                // sotc: SOTC_HRR dry run: guest readbacks this frame that hit a would-be range
+                static u64 last_hrr = 0;
+                const u64 hrr_now = SotcStats::hrr_faults_all.load(std::memory_order_relaxed);
+                const size_t used_hrr = std::strlen(account_text);
+                if (hrr_now != 0 && used_hrr + 1 < sizeof(account_text)) {
+                    std::snprintf(account_text + used_hrr, sizeof(account_text) - used_hrr,
+                                  ", hrr %llu", n(hrr_now - last_hrr));
+                }
+                last_hrr = hrr_now;
+                // sotc: SOTC_STALL_DETAIL: flip pacing of this frame, guest threads' CPU and the
+                // user/kernel CPU of the upload threads (RoleUpload only).
+                if (SotcStats::kStallDetail) {
+                    const size_t used_sd = std::strlen(account_text);
+                    if (used_sd + 1 < sizeof(account_text)) {
+                        std::snprintf(account_text + used_sd, sizeof(account_text) - used_sd,
+                                      ", flip pace %.1f ms, guest cpu %.1f ms, upload user %.1f kernel %.1f ms",
+                                      ms(d.flip_pace_ns), ms(d.cpu_ns[SotcStats::RoleGuest]),
+                                      ms(d.upload_user_ns), ms(d.upload_kernel_ns));
+                    }
+                }
+            }
             if (last_us >= 0 && now_us - last_us > stall_us) {
                 std::fprintf(stderr,
                              "SOTCSTALL frame %llu %.0f ms: pipelines %llu (%.0f ms), shaders %llu "
                              "(%.0f ms), images %llu (%.0f ms: query %.0f, alloc %.0f, %llu dedicated), "
-                             "readbacks %llu (%.0f ms)\n",
+                             "readbacks %llu (%.0f ms)%s\n",
                              static_cast<unsigned long long>(frames), (now_us - last_us) / 1e3,
                              static_cast<unsigned long long>(cur[0] - last[0]), (cur[1] - last[1]) / 1e6,
                              static_cast<unsigned long long>(cur[2] - last[2]), (cur[3] - last[3]) / 1e6,
                              static_cast<unsigned long long>(cur[4] - last[4]), (cur[5] - last[5]) / 1e6,
                              (cur[8] - last[8]) / 1e6, (cur[9] - last[9]) / 1e6,
                              static_cast<unsigned long long>(cur[10] - last[10]),
-                             static_cast<unsigned long long>(cur[6] - last[6]), (cur[7] - last[7]) / 1e6);
+                             static_cast<unsigned long long>(cur[6] >= last[6] ? cur[6] - last[6] : cur[6]),
+                             (cur[7] >= last[7] ? cur[7] - last[7] : cur[7]) / 1e6,
+                             account_text);
             }
             last_us = now_us;
             std::copy(std::begin(cur), std::end(cur), std::begin(last));
@@ -1604,6 +1773,45 @@ bool Presenter::PresentGenerated(Frame* frame) {
     }
     FsrFg::NotePresent();
     return true;
+}
+
+void Presenter::PaceFlip() {
+    const auto start = std::chrono::steady_clock::now();
+    {
+        std::unique_lock lock{free_mutex};
+        // Frames are free for the queued flips and this one. A flip the game never takes (no
+        // flip handler registered) still counts down when the draw thread reaches it; the
+        // deadline only guards against waiting for good.
+        const auto deadline = start + std::chrono::seconds{1};
+        while (static_cast<s32>(free_queue.size()) <=
+               pending_flips.load(std::memory_order_acquire)) {
+            if (free_cv.wait_until(lock, std::min(deadline, std::chrono::steady_clock::now() +
+                                                                std::chrono::milliseconds{1})) ==
+                    std::cv_status::timeout &&
+                std::chrono::steady_clock::now() >= deadline) {
+                break;
+            }
+        }
+    }
+    pending_flips.fetch_add(1, std::memory_order_acq_rel);
+    const uint64_t pace_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                             start)
+            .count());
+    SotcStats::cp_flip_pace_ns.fetch_add(pace_ns, std::memory_order_relaxed);
+    if (SotcStats::kStallDetail) { // sotc: SOTC_STALL_DETAIL, the report does not reset this copy
+        SotcStats::cp_flip_pace_all_ns.fetch_add(pace_ns, std::memory_order_relaxed);
+    }
+}
+
+void Presenter::WaitFreeFrame() {
+    std::unique_lock lock{free_mutex};
+    while (!free_cv.wait_for(lock, std::chrono::microseconds{200},
+                             [this] { return !free_queue.empty(); })) {
+        lock.unlock();
+        wait_service();
+        lock.lock();
+    }
 }
 
 Frame* Presenter::GetRenderFrame() {

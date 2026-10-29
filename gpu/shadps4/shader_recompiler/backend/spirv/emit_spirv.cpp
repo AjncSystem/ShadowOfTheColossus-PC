@@ -364,6 +364,11 @@ spv::ExecutionMode ExecutionMode(AmdGpu::TessellationPartitioning spacing) {
 
 void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeInfo& runtime_info,
                        EmitContext& ctx) {
+    // sotc: SOTC_BINDLESS_SAMP: samplers are indexed in the runtime array of the heap
+    if (ctx.uses_bindless_samplers) {
+        ctx.AddCapability(spv::Capability::RuntimeDescriptorArray);
+        ctx.AddCapability(spv::Capability::SampledImageArrayDynamicIndexing);
+    }
     ctx.AddCapability(spv::Capability::Image1D);
     ctx.AddCapability(spv::Capability::Sampled1D);
     ctx.AddCapability(spv::Capability::ImageQuery);

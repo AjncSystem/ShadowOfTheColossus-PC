@@ -2,11 +2,17 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // sotc: taken from Pink-shadPS4 0.4.0 (luizgustavs), cp_record_thread; scheduler hooks in vk_scheduler.cpp.
 
+#include <algorithm>
 #include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <optional>
+#include <string_view>
+#include <tuple>
+#include <unordered_map>
+#include <unordered_set>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -18,7 +24,10 @@
 #include "common/logging/log.h"
 #include "common/perf_stats.h"
 #include "common/thread.h"
+#include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_recorder.h"
+#include "video_core/renderer_vulkan/vk_resource_pool.h"
+#include "bbport_threads.h"
 #include "video_core/sotc_stats.h"
 
 #if defined(_M_X64) || defined(__x86_64__)
@@ -30,13 +39,93 @@
 
 namespace Vulkan {
 
+/// sotc: payload of a BeginRendering block. The copied VkRenderingInfo points at the attachments
+/// stored right after this struct (the colors, then depth and stencil when present), so the block is
+/// self-contained and stays valid while its chunk is pinned.
+struct BeginPayload {
+    VkCommandBuffer cmdbuf;
+    VkRenderingInfo info;
+    PassFormats formats;
+};
+
 namespace {
 
 using Dispatch = std::remove_cvref_t<decltype(VULKAN_HPP_DEFAULT_DISPATCHER)>;
+using BlockCategory = CommandRecorder::BlockCategory;
+// sotc: the SOTC_CMD_STATS counters in sotc_stats.h hold one slot per category
+static_assert(static_cast<size_t>(BlockCategory::Count) <= 16);
 
 constexpr u32 NumFakeHandles = CommandRecorder::NumFakeHandles;
 alignas(64) u8 g_fake_handles[NumFakeHandles];
 CommandRecorder* g_recorder{};
+
+// sotc: on the pass worker thread, the secondary command buffer it is recording stands for the
+// fake handle of the pass (CommandRecorder::Real); both are null on every other thread
+thread_local VkCommandBuffer tls_pass_fake{};
+thread_local VkCommandBuffer tls_pass_real{};
+
+// sotc: SOTC_PASS_SEC=1 turns on the secondary command buffers of the dynamic rendering passes
+bool PassSecEnabled() {
+    static const bool value = [] {
+        const char* v = std::getenv("SOTC_PASS_SEC");
+        return v && v[0] == '1';
+    }();
+    return value;
+}
+
+// sotc: SOTC_PASS_SEC_MIN: passes with more draws than this go to a secondary command buffer
+u32 PassSecMin() {
+    static const u32 value = [] {
+        const char* v = std::getenv("SOTC_PASS_SEC_MIN");
+        const long n = v ? std::strtol(v, nullptr, 10) : 64;
+        return n > 0 ? static_cast<u32>(n) : 64U;
+    }();
+    return value;
+}
+
+// sotc: a distinct tag per template instance, for the StateKey of the state blocks it records. The
+// anchor is writable so the linker cannot merge two of them.
+template <auto Member>
+u32 TagOf() {
+    static u8 anchor;
+    return static_cast<u32>(reinterpret_cast<uintptr_t>(&anchor));
+}
+
+// sotc: the state key of a generic command: its tag, and the first argument when that selects
+// the state (vkCmdBindPipeline's bind point, the stencil face mask)
+template <typename... A>
+StateKey GenericKey(u32 tag, bool keyed, const A&... args) {
+    StateKey key{tag, 0, 0, 0};
+    if constexpr (sizeof...(A) > 0) {
+        using First = std::tuple_element_t<0, std::tuple<A...>>;
+        if constexpr (std::is_integral_v<First> || std::is_enum_v<First>) {
+            if (keyed) {
+                key.a = static_cast<u32>(std::get<0>(std::forward_as_tuple(args...)));
+            }
+        }
+    }
+    return key;
+}
+
+StateKey KeyOf(u32 tag, u32 a = 0, u32 b = 0, u32 c = 0) {
+    return StateKey{tag, a, b, c};
+}
+
+bool KeyedFirst(std::string_view name) {
+    return name == "vkCmdBindPipeline" || name == "vkCmdSetStencilOp" ||
+           name == "vkCmdSetStencilOpEXT" || name == "vkCmdSetStencilReference" ||
+           name == "vkCmdSetStencilWriteMask" || name == "vkCmdSetStencilCompareMask";
+}
+
+// sotc: SOTC_WAIT_NOSPIN=1: the consumer spins at most ~20 us, then blocks on the wake_seq doorbell
+// instead of the timed wait. Off by default.
+bool WaitNoSpin() {
+    static const bool value = [] {
+        const char* v = std::getenv("SOTC_WAIT_NOSPIN");
+        return v && v[0] == '1';
+    }();
+    return value;
+}
 
 u32 CurrentThreadId() {
 #ifdef _WIN32
@@ -61,6 +150,57 @@ struct IsInputPointer<const T*> : std::true_type {};
 template <auto Member>
 using MemberPfn = std::remove_cvref_t<decltype(std::declval<Dispatch&>().*Member)>;
 
+/// Category of a generic command, from the prefix of its Vulkan name; other commands are Other
+constexpr BlockCategory CategoryOfName(std::string_view name) {
+    const auto starts_with = [name](std::string_view prefix) {
+        return name.substr(0, prefix.size()) == prefix;
+    };
+    if (starts_with("vkCmdDispatch")) {
+        return BlockCategory::Dispatch;
+    }
+    if (starts_with("vkCmdDraw")) {
+        return BlockCategory::Draw;
+    }
+    if (starts_with("vkCmdBeginRendering") || starts_with("vkCmdBeginRenderPass")) {
+        return BlockCategory::BeginRendering;
+    }
+    if (starts_with("vkCmdEndRendering") || starts_with("vkCmdEndRenderPass")) {
+        return BlockCategory::EndRendering;
+    }
+    if (starts_with("vkCmdPipelineBarrier")) {
+        return BlockCategory::Barrier;
+    }
+    if (starts_with("vkCmdCopy") || starts_with("vkCmdBlit") || starts_with("vkCmdClear") ||
+        starts_with("vkCmdFill") || starts_with("vkCmdUpdate") || starts_with("vkCmdResolve")) {
+        return BlockCategory::Copy;
+    }
+    if (starts_with("vkCmdBindPipeline")) {
+        return BlockCategory::BindPipeline;
+    }
+    // Descriptor buffer offsets use a vkCmdSet name but bind descriptors, so this check comes
+    // before the vkCmdSet one
+    if (starts_with("vkCmdPushDescriptorSet") || starts_with("vkCmdBindDescriptorSets") ||
+        starts_with("vkCmdBindDescriptorBuffer") || starts_with("vkCmdSetDescriptorBufferOffsets") ||
+        starts_with("vkCmdBindSamplerHeap") || starts_with("vkCmdBindResourceHeap")) {
+        return BlockCategory::BindDescriptors;
+    }
+    if (starts_with("vkCmdPushConstants")) {
+        return BlockCategory::PushConstants;
+    }
+    if (starts_with("vkCmdSet")) {
+        return BlockCategory::DynamicState;
+    }
+    if (starts_with("vkCmdBindVertexBuffers") || starts_with("vkCmdBindIndexBuffer")) {
+        return BlockCategory::VertexIndex;
+    }
+    // sotc: labels are valid inside a secondary command buffer, so they do not end a pass
+    if (starts_with("vkCmdBeginDebugUtilsLabel") || starts_with("vkCmdEndDebugUtilsLabel") ||
+        starts_with("vkCmdInsertDebugUtilsLabel")) {
+        return BlockCategory::Label;
+    }
+    return BlockCategory::Other;
+}
+
 /// Handle one vkCmd entry by passing real command buffers straight to the driver and queuing calls
 /// made with fake handles
 /// Copy ordinary arguments by value, but use a dedicated deep-copy handler when pointers refer to
@@ -74,6 +214,8 @@ struct GenericThunk<Member, R(VKAPI_PTR*)(VkCommandBuffer, Args...)> {
     using Pfn = R(VKAPI_PTR*)(VkCommandBuffer, Args...);
     static inline Pfn real{};
     static inline const char* name{};
+    static inline BlockCategory category{};
+    static inline bool keyed{}; ///< sotc: the first argument selects part of the state (GenericKey)
 
     static R VKAPI_CALL Call(VkCommandBuffer cmdbuf, Args... args) {
         if (!CommandRecorder::IsFake(cmdbuf)) {
@@ -85,7 +227,15 @@ struct GenericThunk<Member, R(VKAPI_PTR*)(VkCommandBuffer, Args...)> {
             FailUncovered(name);
         } else {
             g_recorder->CountCommand();
-            g_recorder->Run([cmdbuf, args...] { real(g_recorder->Real(cmdbuf), args...); });
+            auto closure = [cmdbuf, args...] { real(g_recorder->Real(cmdbuf), args...); };
+            if (CommandRecorder::IsStateCategory(category)) {
+                // sotc: state blocks carry their key so a secondary command buffer can replay the
+                // latest of each
+                g_recorder->RunState(category, cmdbuf,
+                                     GenericKey(TagOf<Member>(), keyed, args...), closure);
+            } else {
+                g_recorder->Run(category, closure);
+            }
         }
     }
 };
@@ -98,6 +248,8 @@ void InstallGeneric(MemberPfn<Member>& slot, const char* name) {
     using Thunk = GenericThunk<Member>;
     Thunk::real = slot;
     Thunk::name = name;
+    Thunk::category = CategoryOfName(name);
+    Thunk::keyed = KeyedFirst(name);
     slot = &Thunk::Call;
 }
 
@@ -141,7 +293,8 @@ void VKAPI_CALL CmdPipelineBarrier2(VkCommandBuffer cmdbuf, const VkDependencyIn
         CheckNoChain(info->pImageMemoryBarriers[i].pNext, "VkImageMemoryBarrier2");
     }
     g_recorder->CountCommand();
-    rec.Run([cmdbuf, copy] { RealOf<Member>()(g_recorder->Real(cmdbuf), copy); });
+    rec.Run(BlockCategory::Barrier,
+            [cmdbuf, copy] { RealOf<Member>()(g_recorder->Real(cmdbuf), copy); });
 }
 
 template <auto Member>
@@ -161,7 +314,7 @@ void VKAPI_CALL CmdPipelineBarrier(VkCommandBuffer cmdbuf, VkPipelineStageFlags 
     const auto* buffer_copy = rec.Copy(buffer, num_buffer);
     const auto* image_copy = rec.Copy(image, num_image);
     g_recorder->CountCommand();
-    rec.Run([=] {
+    rec.Run(BlockCategory::Barrier, [=] {
         RealOf<Member>()(g_recorder->Real(cmdbuf), src_stage, dst_stage, flags, num_memory,
                          memory_copy, num_buffer, buffer_copy, num_image, image_copy);
     });
@@ -242,7 +395,9 @@ void VKAPI_CALL CmdPushDescriptorSet(VkCommandBuffer cmdbuf, VkPipelineBindPoint
     }
     auto& rec = *g_recorder;
     auto* push = static_cast<PushDescriptorPayload*>(
-        rec.AllocateCommand(bytes, &InvokePushDescriptorSet<Member>));
+        rec.AllocateCommand(bytes, BlockCategory::BindDescriptors,
+                            &InvokePushDescriptorSet<Member>, cmdbuf,
+                            KeyOf(TagOf<Member>(), static_cast<u32>(bind_point), set)));
     *push = {cmdbuf, layout, bind_point, set, num_writes};
     auto* copy = reinterpret_cast<VkWriteDescriptorSet*>(push + 1);
     std::memcpy(copy, writes, num_writes * sizeof(VkWriteDescriptorSet));
@@ -280,8 +435,11 @@ void VKAPI_CALL CmdPushConstants(VkCommandBuffer cmdbuf, VkPipelineLayout layout
     rec.Reserve(size + 256);
     const auto* copy = rec.Copy(static_cast<const u8*>(values), size);
     g_recorder->CountCommand();
-    rec.Run(
-        [=] { RealOf<Member>()(g_recorder->Real(cmdbuf), layout, stages, offset, size, copy); });
+    rec.RunState(BlockCategory::PushConstants, cmdbuf,
+                 KeyOf(TagOf<Member>(), offset, size, static_cast<u32>(stages)), [=] {
+                     RealOf<Member>()(g_recorder->Real(cmdbuf), layout, stages, offset, size,
+                                      copy);
+                 });
 }
 
 const VkDebugUtilsLabelEXT* CopyLabel(CommandRecorder& rec, const VkDebugUtilsLabelEXT* label) {
@@ -300,7 +458,14 @@ void VKAPI_CALL CmdDebugLabel(VkCommandBuffer cmdbuf, const VkDebugUtilsLabelEXT
     }
     const auto* copy = CopyLabel(*g_recorder, label);
     g_recorder->CountCommand();
-    g_recorder->Run([=] { RealOf<Member>()(g_recorder->Real(cmdbuf), copy); });
+    g_recorder->Run(BlockCategory::Label,
+                    [=] { RealOf<Member>()(g_recorder->Real(cmdbuf), copy); });
+}
+
+template <auto Member>
+void InvokeBeginRendering(void* payload) {
+    auto* begin = static_cast<BeginPayload*>(payload);
+    RealOf<Member>()(g_recorder->Real(begin->cmdbuf), &begin->info);
 }
 
 template <auto Member>
@@ -308,19 +473,43 @@ void VKAPI_CALL CmdBeginRendering(VkCommandBuffer cmdbuf, const VkRenderingInfo*
     if (!CommandRecorder::IsFake(cmdbuf)) {
         return RealOf<Member>()(cmdbuf, info);
     }
-    auto& rec = *g_recorder;
-    rec.Reserve(sizeof(VkRenderingInfo) +
-                (info->colorAttachmentCount + 2) * sizeof(VkRenderingAttachmentInfo) + 256);
     CheckNoChain(info->pNext, "VkRenderingInfo");
-    auto* copy = rec.Copy(info);
-    copy->pColorAttachments = rec.Copy(info->pColorAttachments, info->colorAttachmentCount);
-    copy->pDepthAttachment = rec.Copy(info->pDepthAttachment);
-    copy->pStencilAttachment = rec.Copy(info->pStencilAttachment);
-    for (u32 i = 0; i < info->colorAttachmentCount; ++i) {
+    const u32 num_colors = info->colorAttachmentCount;
+    for (u32 i = 0; i < num_colors; ++i) {
         CheckNoChain(info->pColorAttachments[i].pNext, "VkRenderingAttachmentInfo");
     }
+    size_t bytes = sizeof(BeginPayload) + num_colors * sizeof(VkRenderingAttachmentInfo);
+    if (info->pDepthAttachment) {
+        bytes += sizeof(VkRenderingAttachmentInfo);
+    }
+    if (info->pStencilAttachment) {
+        bytes += sizeof(VkRenderingAttachmentInfo);
+    }
+    auto& rec = *g_recorder;
+    auto* begin = static_cast<BeginPayload*>(rec.AllocateCommand(
+        bytes, BlockCategory::BeginRendering, &InvokeBeginRendering<Member>, nullptr, {},
+        CommandRecorder::kBeginPassAux));
+    begin->cmdbuf = cmdbuf;
+    begin->info = *info;
+    begin->formats = rec.TakePassFormats();
+    auto* tail = reinterpret_cast<VkRenderingAttachmentInfo*>(begin + 1);
+    begin->info.pColorAttachments = num_colors ? tail : nullptr;
+    if (num_colors) {
+        std::memcpy(tail, info->pColorAttachments, num_colors * sizeof(*tail));
+    }
+    tail += num_colors;
+    begin->info.pDepthAttachment = nullptr;
+    if (info->pDepthAttachment) {
+        *tail = *info->pDepthAttachment;
+        begin->info.pDepthAttachment = tail++;
+    }
+    begin->info.pStencilAttachment = nullptr;
+    if (info->pStencilAttachment) {
+        *tail = *info->pStencilAttachment;
+        begin->info.pStencilAttachment = tail;
+    }
     g_recorder->CountCommand();
-    rec.Run([=] { RealOf<Member>()(g_recorder->Real(cmdbuf), copy); });
+    rec.Commit();
 }
 
 /// Queue buffer and image copy, resolve or blit commands together with the region arrays they need
@@ -339,7 +528,8 @@ struct RegionsThunk<Member, Region, void(Pre...)> {
         rec.Reserve(count * sizeof(Region) + 256);
         const auto* copy = rec.Copy(regions, count);
         g_recorder->CountCommand();
-        rec.Run([=] { RealOf<Member>()(g_recorder->Real(cmdbuf), pre..., count, copy); });
+        rec.Run(BlockCategory::Copy,
+                [=] { RealOf<Member>()(g_recorder->Real(cmdbuf), pre..., count, copy); });
     }
 };
 
@@ -354,7 +544,7 @@ void VKAPI_CALL CmdBlitImage(VkCommandBuffer cmdbuf, VkImage src, VkImageLayout 
     rec.Reserve(count * sizeof(VkImageBlit) + 256);
     const auto* copy = rec.Copy(regions, count);
     g_recorder->CountCommand();
-    rec.Run([=] {
+    rec.Run(BlockCategory::Copy, [=] {
         RealOf<Member>()(g_recorder->Real(cmdbuf), src, src_layout, dst, dst_layout, count, copy,
                          filter);
     });
@@ -372,7 +562,7 @@ void VKAPI_CALL CmdClearImage(VkCommandBuffer cmdbuf, VkImage image, VkImageLayo
     const auto* value_copy = rec.Copy(value);
     const auto* ranges_copy = rec.Copy(ranges, count);
     g_recorder->CountCommand();
-    rec.Run([=] {
+    rec.Run(BlockCategory::Copy, [=] {
         RealOf<Member>()(g_recorder->Real(cmdbuf), image, layout, value_copy, count, ranges_copy);
     });
 }
@@ -387,7 +577,8 @@ void VKAPI_CALL CmdUpdateBuffer(VkCommandBuffer cmdbuf, VkBuffer buffer, VkDevic
     rec.Reserve(size + 256);
     const auto* copy = rec.Copy(static_cast<const u8*>(data), size);
     g_recorder->CountCommand();
-    rec.Run([=] { RealOf<Member>()(g_recorder->Real(cmdbuf), buffer, offset, size, copy); });
+    rec.Run(BlockCategory::Copy,
+            [=] { RealOf<Member>()(g_recorder->Real(cmdbuf), buffer, offset, size, copy); });
 }
 
 /// Copy viewport and scissor arrays for both the first-and-count commands and the WithCount
@@ -402,7 +593,8 @@ void VKAPI_CALL CmdSetFirstArray(VkCommandBuffer cmdbuf, u32 first, u32 count,
     rec.Reserve(count * sizeof(Element) + 256);
     const auto* copy = rec.Copy(elements, count);
     g_recorder->CountCommand();
-    rec.Run([=] { RealOf<Member>()(g_recorder->Real(cmdbuf), first, count, copy); });
+    rec.RunState(BlockCategory::DynamicState, cmdbuf, KeyOf(TagOf<Member>(), first, count),
+                 [=] { RealOf<Member>()(g_recorder->Real(cmdbuf), first, count, copy); });
 }
 
 template <auto Member, typename Element>
@@ -414,7 +606,8 @@ void VKAPI_CALL CmdSetArray(VkCommandBuffer cmdbuf, u32 count, const Element* el
     rec.Reserve(count * sizeof(Element) + 256);
     const auto* copy = rec.Copy(elements, count);
     g_recorder->CountCommand();
-    rec.Run([=] { RealOf<Member>()(g_recorder->Real(cmdbuf), count, copy); });
+    rec.RunState(BlockCategory::DynamicState, cmdbuf, KeyOf(TagOf<Member>(), count),
+                 [=] { RealOf<Member>()(g_recorder->Real(cmdbuf), count, copy); });
 }
 
 template <auto Member>
@@ -425,7 +618,8 @@ void VKAPI_CALL CmdSetBlendConstants(VkCommandBuffer cmdbuf, const float constan
     std::array<float, 4> copy;
     std::memcpy(copy.data(), constants, sizeof(copy));
     g_recorder->CountCommand();
-    g_recorder->Run([=] { RealOf<Member>()(g_recorder->Real(cmdbuf), copy.data()); });
+    g_recorder->RunState(BlockCategory::DynamicState, cmdbuf, KeyOf(TagOf<Member>()),
+                         [=] { RealOf<Member>()(g_recorder->Real(cmdbuf), copy.data()); });
 }
 
 template <auto Member>
@@ -441,7 +635,7 @@ void VKAPI_CALL CmdSetVertexInput(VkCommandBuffer cmdbuf, u32 num_bindings,
     const auto* bindings_copy = rec.Copy(bindings, num_bindings);
     const auto* attributes_copy = rec.Copy(attributes, num_attributes);
     g_recorder->CountCommand();
-    rec.Run([=] {
+    rec.RunState(BlockCategory::DynamicState, cmdbuf, KeyOf(TagOf<Member>()), [=] {
         RealOf<Member>()(g_recorder->Real(cmdbuf), num_bindings, bindings_copy, num_attributes,
                          attributes_copy);
     });
@@ -458,7 +652,7 @@ void VKAPI_CALL CmdBindVertexBuffers(VkCommandBuffer cmdbuf, u32 first, u32 coun
     const auto* buffers_copy = rec.Copy(buffers, count);
     const auto* offsets_copy = rec.Copy(offsets, count);
     g_recorder->CountCommand();
-    rec.Run([=] {
+    rec.RunState(BlockCategory::VertexIndex, cmdbuf, KeyOf(TagOf<Member>(), first, count), [=] {
         RealOf<Member>()(g_recorder->Real(cmdbuf), first, count, buffers_copy, offsets_copy);
     });
 }
@@ -477,7 +671,7 @@ void VKAPI_CALL CmdBindVertexBuffers2(VkCommandBuffer cmdbuf, u32 first, u32 cou
     const auto* sizes_copy = rec.Copy(sizes, count);
     const auto* strides_copy = rec.Copy(strides, count);
     g_recorder->CountCommand();
-    rec.Run([=] {
+    rec.RunState(BlockCategory::VertexIndex, cmdbuf, KeyOf(TagOf<Member>(), first, count), [=] {
         RealOf<Member>()(g_recorder->Real(cmdbuf), first, count, buffers_copy, offsets_copy,
                          sizes_copy, strides_copy);
     });
@@ -497,10 +691,52 @@ void VKAPI_CALL CmdBindDescriptorSets(VkCommandBuffer cmdbuf, VkPipelineBindPoin
     const auto* sets_copy = rec.Copy(sets, count);
     const auto* offsets_copy = rec.Copy(dynamic_offsets, num_dynamic);
     g_recorder->CountCommand();
-    rec.Run([=] {
-        RealOf<Member>()(g_recorder->Real(cmdbuf), bind_point, layout, first, count, sets_copy,
-                         num_dynamic, offsets_copy);
-    });
+    rec.RunState(BlockCategory::BindDescriptors, cmdbuf,
+                 KeyOf(TagOf<Member>(), static_cast<u32>(bind_point), first, count), [=] {
+                     RealOf<Member>()(g_recorder->Real(cmdbuf), bind_point, layout, first, count,
+                                      sets_copy, num_dynamic, offsets_copy);
+                 });
+}
+
+// sotc: descriptor buffer bindings and offsets (SOTC_DESC_BUFFER=1) have pointer arguments, so
+// their arrays are copied into the stream like vkCmdBindDescriptorSets does.
+template <auto Member>
+void VKAPI_CALL CmdBindDescriptorBuffers(VkCommandBuffer cmdbuf, u32 count,
+                                         const VkDescriptorBufferBindingInfoEXT* infos) {
+    if (!CommandRecorder::IsFake(cmdbuf)) {
+        return RealOf<Member>()(cmdbuf, count, infos);
+    }
+    auto& rec = *g_recorder;
+    rec.Reserve(count * sizeof(VkDescriptorBufferBindingInfoEXT) + 256);
+    for (u32 i = 0; i < count; ++i) {
+        CheckNoChain(infos[i].pNext, "VkDescriptorBufferBindingInfoEXT");
+    }
+    const auto* infos_copy = rec.Copy(infos, count);
+    g_recorder->CountCommand();
+    rec.RunState(BlockCategory::BindDescriptors, cmdbuf, KeyOf(TagOf<Member>(), count),
+                 [=] { RealOf<Member>()(g_recorder->Real(cmdbuf), count, infos_copy); });
+}
+
+template <auto Member>
+void VKAPI_CALL CmdSetDescriptorBufferOffsets(VkCommandBuffer cmdbuf,
+                                              VkPipelineBindPoint bind_point,
+                                              VkPipelineLayout layout, u32 first_set,
+                                              u32 set_count, const u32* buffer_indices,
+                                              const VkDeviceSize* offsets) {
+    if (!CommandRecorder::IsFake(cmdbuf)) {
+        return RealOf<Member>()(cmdbuf, bind_point, layout, first_set, set_count, buffer_indices,
+                                offsets);
+    }
+    auto& rec = *g_recorder;
+    rec.Reserve(set_count * (sizeof(u32) + sizeof(VkDeviceSize)) + 256);
+    const auto* indices_copy = rec.Copy(buffer_indices, set_count);
+    const auto* offsets_copy = rec.Copy(offsets, set_count);
+    g_recorder->CountCommand();
+    rec.RunState(BlockCategory::BindDescriptors, cmdbuf,
+                 KeyOf(TagOf<Member>(), static_cast<u32>(bind_point), first_set, set_count), [=] {
+                     RealOf<Member>()(g_recorder->Real(cmdbuf), bind_point, layout, first_set,
+                                      set_count, indices_copy, offsets_copy);
+                 });
 }
 
 /// Keep the opaque marker value unchanged so the driver can return it after device loss, without
@@ -511,7 +747,8 @@ void VKAPI_CALL CmdSetCheckpoint(VkCommandBuffer cmdbuf, const void* marker) {
         return RealOf<Member>()(cmdbuf, marker);
     }
     g_recorder->CountCommand();
-    g_recorder->Run([=] { RealOf<Member>()(g_recorder->Real(cmdbuf), marker); });
+    g_recorder->Run(BlockCategory::DynamicState,
+                    [=] { RealOf<Member>()(g_recorder->Real(cmdbuf), marker); });
 }
 
 // The scheduler begins recorded command buffers after the recording thread allocates them
@@ -534,7 +771,7 @@ VkResult VKAPI_CALL EndCommandBuffer(VkCommandBuffer cmdbuf) {
     if (!CommandRecorder::IsFake(cmdbuf)) {
         return real_end(cmdbuf);
     }
-    g_recorder->Run([cmdbuf] {
+    g_recorder->Run(BlockCategory::Other, [cmdbuf] {
         const VkResult result = real_end(g_recorder->Real(cmdbuf));
         ASSERT_MSG(result == VK_SUCCESS, "cp_record_thread: vkEndCommandBuffer failed: {}",
                    vk::to_string(vk::Result{result}));
@@ -546,7 +783,8 @@ VkResult VKAPI_CALL ResetCommandBuffer(VkCommandBuffer cmdbuf, VkCommandBufferRe
     if (!CommandRecorder::IsFake(cmdbuf)) {
         return real_reset(cmdbuf, flags);
     }
-    g_recorder->Run([cmdbuf, flags] { real_reset(g_recorder->Real(cmdbuf), flags); });
+    g_recorder->Run(BlockCategory::Other,
+                    [cmdbuf, flags] { real_reset(g_recorder->Real(cmdbuf), flags); });
     return VK_SUCCESS;
 }
 
@@ -622,6 +860,10 @@ void CommandRecorder::InstallThunks() {
                  CmdBindVertexBuffers2<&Dispatch::vkCmdBindVertexBuffers2EXT>);
         OVERRIDE(vkCmdBindDescriptorSets,
                  CmdBindDescriptorSets<&Dispatch::vkCmdBindDescriptorSets>);
+        OVERRIDE(vkCmdBindDescriptorBuffersEXT,
+                 CmdBindDescriptorBuffers<&Dispatch::vkCmdBindDescriptorBuffersEXT>);
+        OVERRIDE(vkCmdSetDescriptorBufferOffsetsEXT,
+                 CmdSetDescriptorBufferOffsets<&Dispatch::vkCmdSetDescriptorBufferOffsetsEXT>);
         OVERRIDE(vkCmdSetCheckpointNV, CmdSetCheckpoint<&Dispatch::vkCmdSetCheckpointNV>);
 #undef OVERRIDE
 
@@ -640,13 +882,569 @@ bool CommandRecorder::IsFake(VkCommandBuffer cmdbuf) noexcept {
     return offset < NumFakeHandles;
 }
 
-CommandRecorder::CommandRecorder() {
+// sotc: SOTC_PASS_SEC. The consumer finds a dynamic rendering pass (BeginRendering .. EndRendering)
+// with more than SOTC_PASS_SEC_MIN draws and no block a secondary cannot hold. It starts the pass on
+// the primary with secondary contents and hands the pass blocks to the worker thread, which records
+// them into one secondary command buffer while the consumer goes on with the next blocks. At the
+// EndRendering the consumer waits for that secondary, executes it, ends the pass and replays the
+// state.
+//
+// A secondary inherits no state, so the worker first replays the latest block of each state key
+// (the replay table, one entry per command buffer and key). Those blocks are not copied: a table
+// entry pins the chunk of its block and the chunk before it (its data comes before the command), so
+// the block stays valid in place until the entry is replaced or dropped. Each chunk has two pin
+// counts: table_pins, touched by the consumer only, and job_pins, atomic, released by the worker when
+// a job is recorded. A chunk with a pin left is deferred (CommandRecorder::ReleaseChunk) instead of
+// recycled.
+//
+// The table only holds command buffers that are still open: an entry goes when its command buffer is
+// submitted (Submitted) or begins again (Forget). If the table fills up, Prune drops the entries of
+// the other command buffers and marks them dropped; a pass on a dropped command buffer stays on the
+// primary, so a partial replay never reaches the GPU.
+//
+// Executing a secondary leaves the primary's bound state undefined, so the table is replayed on the
+// primary after each secondary pass too.
+//
+// Secondary command buffers come from a pool shared by the worker (commit) and the consumer
+// (release). A secondary is held while its job is recorded and until the submit that executes it
+// completes (its tick), so the pool never hands out a buffer the GPU still reads.
+class PassSecondary {
+public:
+    PassSecondary(CommandRecorder& rec, const Instance& instance, Semaphore* work_semaphore,
+                  u32 min_draws);
+    ~PassSecondary();
+
+    PassSecondary(const PassSecondary&) = delete;
+    PassSecondary& operator=(const PassSecondary&) = delete;
+
+    /// Consumer thread. True when the block must not run on the primary: the block that starts a
+    /// secondary pass (already run with secondary contents), the blocks the pass records, and the
+    /// EndRendering that closes it (run here, after the secondary). False for every other block; a
+    /// state block among those (meta != nullptr) is kept in the replay table.
+    bool Handle(CommandRecorder::Chunk* chunk, u32 pos, CommandRecorder::Chunk* previous,
+                CommandRecorder::BlockHeader* header, const CommandRecorder::StateMeta* meta,
+                std::stop_token stop);
+
+    /// Consumer thread: the replay state of fake is no longer needed (its session was submitted, or
+    /// it begins again)
+    void Forget(VkCommandBuffer fake);
+
+    /// Consumer thread: the submit of fakes completes at signal_tick. Their state goes, and the
+    /// secondaries executed in them are released for reuse once that tick is reached.
+    void Submitted(std::span<const vk::CommandBuffer> fakes, u64 signal_tick);
+
+private:
+    using Chunk = CommandRecorder::Chunk;
+    using BlockHeader = CommandRecorder::BlockHeader;
+    using BlockKind = CommandRecorder::BlockKind;
+    using BlockCategory = CommandRecorder::BlockCategory;
+    using StateMeta = CommandRecorder::StateMeta;
+
+    static constexpr size_t kMaxEntries = 1024; ///< table size at which Prune drops entries
+    static constexpr size_t kMaxScanChunks = 8; ///< a pass spanning more chunks stays on the primary
+    static constexpr auto kMaxScanWait = std::chrono::milliseconds{5};
+
+    struct TableKey {
+        VkCommandBuffer cmd{};
+        StateKey key{};
+
+        bool operator==(const TableKey& other) const noexcept = default;
+    };
+
+    struct TableKeyHash {
+        size_t operator()(const TableKey& k) const noexcept {
+            u64 h = reinterpret_cast<uintptr_t>(k.cmd);
+            h = (h * 0x9E3779B97F4A7C15ull) ^ ((u64{k.key.tag} << 32) | k.key.a);
+            h = (h * 0x9E3779B97F4A7C15ull) ^ ((u64{k.key.b} << 32) | k.key.c);
+            return static_cast<size_t>(h ^ (h >> 29));
+        }
+    };
+
+    struct StateEntry {
+        BlockHeader* header;
+        const StateMeta* meta;
+        Chunk* chunk;
+        Chunk* prev;
+        u64 seq;
+    };
+
+    struct Scan {
+        bool found{};
+        bool bad{}; ///< a block the secondary cannot hold, or the scan gave up
+        u32 draws{};
+        Chunk* end_chunk{};
+        u32 end_pos{};
+        std::vector<Chunk*> chunks; ///< the chunks the pass spans, the first one holding BeginRendering
+    };
+
+    struct Job {
+        VkCommandBuffer fake{};
+        PassFormats formats{};
+        Chunk* begin_chunk{}; ///< first block after the BeginRendering
+        u32 begin_pos{};
+        Chunk* end_chunk{}; ///< the EndRendering
+        u32 end_pos{};
+        std::vector<StateEntry> state; ///< replayed before the pass blocks, in sequence order
+        std::vector<Chunk*> pinned;    ///< job_pins held, released by the worker
+        u64 seq{};
+        VkCommandBuffer secondary{};
+    };
+
+    /// A secondary executed on the primary of fake, held until that primary is submitted
+    struct Awaiting {
+        VkCommandBuffer fake;
+        VkCommandBuffer secondary;
+    };
+
+    bool TryStart(Chunk* chunk, u32 pos, BlockHeader* header, std::stop_token stop);
+    bool ScanPass(Chunk* chunk, u32 pos, std::stop_token stop, Scan& scan);
+    void Insert(Chunk* chunk, Chunk* previous, BlockHeader* header, const StateMeta* meta);
+    void Prune(VkCommandBuffer keep);
+    void ClearTable();
+    void Finish(BlockHeader* end);
+    void Replay(VkCommandBuffer fake);
+    void WaitJob(u64 seq);
+    void WorkerLoop();
+    void Record(Job* job);
+    static void Pin(Chunk* chunk, Chunk* prev);
+    static void Unpin(Chunk* chunk, Chunk* prev);
+    static void PinJob(Job* job, Chunk* chunk);
+
+    CommandRecorder& rec;
+    u32 min_draws;
+    std::unique_ptr<CommandPool> pool; ///< secondary command buffers, pool_mutex guards them
+    std::mutex pool_mutex;
+    std::thread worker;
+    /// consumer: the latest state block of each command buffer and key
+    std::unordered_map<TableKey, StateEntry, TableKeyHash> table;
+    /// consumer: command buffers Prune took entries from; their passes stay on the primary
+    std::unordered_set<VkCommandBuffer> dropped;
+    std::vector<Awaiting> awaiting; ///< consumer: secondaries waiting for their submit
+    u64 seq{};
+    Job* active{}; ///< consumer thread: the pass being consumed
+    u64 job_seq{};
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<Job*> queue;
+    bool stopping{};
+    std::atomic<u64> done_seq{0};
+};
+
+PassSecondary::PassSecondary(CommandRecorder& rec_, const Instance& instance,
+                             Semaphore* work_semaphore, u32 min_draws_)
+    : rec{rec_}, min_draws{min_draws_},
+      pool{std::make_unique<CommandPool>(instance, work_semaphore,
+                                         vk::CommandBufferLevel::eSecondary)} {
+    // Started last: the worker reads the members above
+    worker = std::thread{[this] { WorkerLoop(); }};
+}
+
+PassSecondary::~PassSecondary() {
+    {
+        std::scoped_lock lk{mutex};
+        stopping = true;
+    }
+    cv.notify_all();
+    if (worker.joinable()) {
+        worker.join();
+    }
+    delete active;
+    active = nullptr;
+    ClearTable();
+}
+
+void PassSecondary::Pin(Chunk* chunk, Chunk* prev) {
+    if (chunk != nullptr) {
+        chunk->table_pins++;
+    }
+    if (prev != nullptr) {
+        prev->table_pins++;
+    }
+}
+
+void PassSecondary::Unpin(Chunk* chunk, Chunk* prev) {
+    if (chunk != nullptr) {
+        chunk->table_pins--;
+    }
+    if (prev != nullptr) {
+        prev->table_pins--;
+    }
+}
+
+void PassSecondary::PinJob(Job* job, Chunk* chunk) {
+    if (chunk != nullptr) {
+        chunk->job_pins.fetch_add(1, std::memory_order_acq_rel);
+        job->pinned.push_back(chunk);
+    }
+}
+
+void PassSecondary::Insert(Chunk* chunk, Chunk* previous, BlockHeader* header,
+                           const StateMeta* meta) {
+    const TableKey table_key{meta->cmd, meta->key};
+    if (const auto it = table.find(table_key); it != table.end()) {
+        // The latest block of this key replaces the older one
+        Unpin(it->second.chunk, it->second.prev);
+        it->second = StateEntry{header, meta, chunk, previous, ++seq};
+        Pin(chunk, previous);
+        return;
+    }
+    if (table.size() >= kMaxEntries) {
+        Prune(meta->cmd);
+    }
+    table.emplace(table_key, StateEntry{header, meta, chunk, previous, ++seq});
+    Pin(chunk, previous);
+}
+
+void PassSecondary::Prune(VkCommandBuffer keep) {
+    // Entries of the command buffer being inserted into stay. The others go, and their passes fall
+    // back to the primary (TryStart), because a partial replay would be wrong.
+    for (auto it = table.begin(); it != table.end();) {
+        if (it->first.cmd != keep) {
+            Unpin(it->second.chunk, it->second.prev);
+            dropped.insert(it->first.cmd);
+            it = table.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void PassSecondary::Forget(VkCommandBuffer fake) {
+    dropped.erase(fake);
+    for (auto it = table.begin(); it != table.end();) {
+        if (it->first.cmd == fake) {
+            Unpin(it->second.chunk, it->second.prev);
+            it = table.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void PassSecondary::Submitted(std::span<const vk::CommandBuffer> fakes, u64 signal_tick) {
+    for (const vk::CommandBuffer fake : fakes) {
+        Forget(static_cast<VkCommandBuffer>(fake));
+    }
+    for (size_t i = 0; i < awaiting.size();) {
+        const Awaiting entry = awaiting[i];
+        bool submitted = false;
+        for (const vk::CommandBuffer fake : fakes) {
+            if (static_cast<VkCommandBuffer>(fake) == entry.fake) {
+                submitted = true;
+                break;
+            }
+        }
+        if (!submitted) {
+            ++i;
+            continue;
+        }
+        {
+            std::scoped_lock lk{pool_mutex};
+            pool->Release(vk::CommandBuffer{entry.secondary}, signal_tick);
+        }
+        awaiting[i] = awaiting.back();
+        awaiting.pop_back();
+    }
+}
+
+void PassSecondary::ClearTable() {
+    for (const auto& [key, entry] : table) {
+        Unpin(entry.chunk, entry.prev);
+    }
+    table.clear();
+}
+
+bool PassSecondary::Handle(Chunk* chunk, u32 pos, Chunk* previous, BlockHeader* header,
+                           const StateMeta* meta, std::stop_token stop) {
+    if (active != nullptr) {
+        if (chunk == active->end_chunk && pos == active->end_pos) {
+            Finish(header);
+            return true;
+        }
+        // A block of the pass: the worker runs it, but a state block stays in the table
+        if (meta != nullptr) {
+            Insert(chunk, previous, header, meta);
+        }
+        return true;
+    }
+    if (header->category == BlockCategory::BeginRendering &&
+        header->aux == CommandRecorder::kBeginPassAux) {
+        return TryStart(chunk, pos, header, stop);
+    }
+    if (meta != nullptr) {
+        Insert(chunk, previous, header, meta);
+    }
+    return false;
+}
+
+bool PassSecondary::ScanPass(Chunk* chunk, u32 pos, std::stop_token stop, Scan& scan) {
+    // Reads the pass blocks as the producer publishes them, so the pass is complete before it is
+    // handed over. The scan gives up (scan.bad, the pass stays on the primary) at a block the
+    // secondary cannot hold, after kMaxScanChunks chunks, and after kMaxScanWait without a new block:
+    // the producer may wait for the consumer (chunk recycling, a submit) before it ends the pass.
+    // Returns false when shutdown interrupts the wait.
+    Chunk* c = chunk;
+    u32 p = pos;
+    scan.chunks.push_back(c);
+    u32 spins = 0;
+    bool waiting = false;
+    std::chrono::steady_clock::time_point wait_start{};
+    while (true) {
+        const u32 committed = c->committed.load(std::memory_order_acquire);
+        if (p >= committed) {
+            if (stop.stop_requested()) {
+                return false;
+            }
+            if (++spins < 64) {
+                RECORDER_PAUSE();
+                continue;
+            }
+            spins = 0;
+            const auto now = std::chrono::steady_clock::now();
+            if (!waiting) {
+                waiting = true;
+                wait_start = now;
+            } else if (now - wait_start > kMaxScanWait) {
+                scan.bad = true;
+                return true;
+            }
+            std::this_thread::yield();
+            continue;
+        }
+        waiting = false;
+        auto* h = reinterpret_cast<BlockHeader*>(c->data + p);
+        if (h->kind == BlockKind::End) {
+            if (scan.chunks.size() >= kMaxScanChunks) {
+                scan.bad = true;
+                return true;
+            }
+            // NextChunk links the next chunk before it publishes the End block
+            c = c->next.load(std::memory_order_acquire);
+            scan.chunks.push_back(c);
+            p = 0;
+            continue;
+        }
+        if (h->kind == BlockKind::Data || h->kind == BlockKind::Meta) {
+            p += h->size;
+            continue;
+        }
+        if (h->category == BlockCategory::EndRendering) {
+            scan.found = true;
+            scan.end_chunk = c;
+            scan.end_pos = p;
+            return true;
+        }
+        switch (h->category) {
+        case BlockCategory::Draw:
+            ++scan.draws;
+            break;
+        case BlockCategory::BindPipeline:
+        case BlockCategory::BindDescriptors:
+        case BlockCategory::PushConstants:
+        case BlockCategory::DynamicState:
+        case BlockCategory::VertexIndex:
+        case BlockCategory::Label:
+            break;
+        default:
+            // Dispatch, barriers, copies, nested passes and submits stay on the primary
+            scan.bad = true;
+            return true;
+        }
+        p += h->size;
+    }
+}
+
+bool PassSecondary::TryStart(Chunk* chunk, u32 pos, BlockHeader* header, std::stop_token stop) {
+    auto* begin = reinterpret_cast<BeginPayload*>(header + 1);
+    if (!begin->formats.valid || dropped.contains(begin->cmdbuf)) {
+        if (SotcStats::kCmdStats) {
+            SotcStats::passes_fallback.fetch_add(1, std::memory_order_relaxed);
+        }
+        return false;
+    }
+    Scan scan;
+    if (!ScanPass(chunk, pos + header->size, stop, scan)) {
+        return false;
+    }
+    if (scan.bad) {
+        if (SotcStats::kCmdStats) {
+            SotcStats::passes_fallback.fetch_add(1, std::memory_order_relaxed);
+        }
+        return false;
+    }
+    if (scan.draws <= min_draws) {
+        return false;
+    }
+
+    // The primary begins the pass with secondary contents and executes the secondary at its end
+    begin->info.flags |= VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT;
+    header->invoke(header + 1);
+
+    auto* job = new Job;
+    job->fake = begin->cmdbuf;
+    job->formats = begin->formats;
+    job->begin_chunk = chunk;
+    job->begin_pos = pos + header->size;
+    job->end_chunk = scan.end_chunk;
+    job->end_pos = scan.end_pos;
+    job->seq = ++job_seq;
+    for (Chunk* c : scan.chunks) {
+        PinJob(job, c);
+    }
+    for (const auto& [key, entry] : table) {
+        if (key.cmd != job->fake) {
+            continue;
+        }
+        job->state.push_back(entry);
+        PinJob(job, entry.chunk);
+        PinJob(job, entry.prev);
+    }
+    std::sort(job->state.begin(), job->state.end(),
+              [](const StateEntry& a, const StateEntry& b) { return a.seq < b.seq; });
+
+    active = job;
+    {
+        std::scoped_lock lk{mutex};
+        queue.push_back(job);
+    }
+    cv.notify_one();
+    if (SotcStats::kCmdStats) {
+        SotcStats::passes_secondary.fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+void PassSecondary::WaitJob(u64 job_seq_) {
+    u64 done = done_seq.load(std::memory_order_acquire);
+    while (done < job_seq_) {
+        done_seq.wait(done, std::memory_order_acquire);
+        done = done_seq.load(std::memory_order_acquire);
+    }
+}
+
+void PassSecondary::Replay(VkCommandBuffer fake) {
+    // Consumer thread: the table entries of this command buffer, latest last, run on the primary
+    std::vector<StateEntry> latest;
+    for (const auto& [key, entry] : table) {
+        if (key.cmd == fake) {
+            latest.push_back(entry);
+        }
+    }
+    std::sort(latest.begin(), latest.end(),
+              [](const StateEntry& a, const StateEntry& b) { return a.seq < b.seq; });
+    for (const StateEntry& entry : latest) {
+        entry.header->invoke(entry.header + 1);
+    }
+}
+
+void PassSecondary::Finish(BlockHeader* end) {
+    Job* job = active;
+    WaitJob(job->seq);
+    const VkCommandBuffer primary = rec.Real(job->fake);
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdExecuteCommands(primary, 1, &job->secondary);
+    awaiting.push_back(Awaiting{job->fake, job->secondary});
+    end->invoke(end + 1); // EndRendering on the primary
+    Replay(job->fake);
+    delete job;
+    active = nullptr;
+    rec.SweepDeferred();
+}
+
+void PassSecondary::WorkerLoop() {
+    Common::SetCurrentThreadName("shadPS4:PassSecondary");
+    SotcStats::RegisterThreadRole(SotcStats::RolePassSecondary); // sotc: SOTC_FPS accounting
+    while (true) {
+        Job* job = nullptr;
+        {
+            std::unique_lock lk{mutex};
+            cv.wait(lk, [this] { return stopping || !queue.empty(); });
+            if (queue.empty()) {
+                return;
+            }
+            job = queue.front();
+            queue.pop_front();
+        }
+        Record(job);
+    }
+}
+
+void PassSecondary::Record(Job* job) {
+    VkCommandBuffer secondary{};
+    {
+        std::scoped_lock lk{pool_mutex};
+        secondary = static_cast<VkCommandBuffer>(pool->Commit());
+        pool->Hold(vk::CommandBuffer{secondary});
+    }
+
+    VkCommandBufferInheritanceRenderingInfo rendering{};
+    rendering.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO;
+    rendering.colorAttachmentCount = job->formats.num_colors;
+    rendering.pColorAttachmentFormats = job->formats.colors.data();
+    rendering.depthAttachmentFormat = job->formats.depth;
+    rendering.stencilAttachmentFormat = job->formats.stencil;
+    rendering.rasterizationSamples = job->formats.samples;
+    VkCommandBufferInheritanceInfo inheritance{};
+    inheritance.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO;
+    inheritance.pNext = &rendering;
+    VkCommandBufferBeginInfo begin_info{};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
+    begin_info.pInheritanceInfo = &inheritance;
+    const VkResult begun = real_begin(secondary, &begin_info);
+    ASSERT_MSG(begun == VK_SUCCESS, "SOTC_PASS_SEC: vkBeginCommandBuffer failed: {}",
+               static_cast<u32>(begun));
+
+    // Commands of the fake handle now go to this secondary (CommandRecorder::Real)
+    tls_pass_fake = job->fake;
+    tls_pass_real = secondary;
+    for (const StateEntry& entry : job->state) {
+        entry.header->invoke(entry.header + 1);
+    }
+    Chunk* c = job->begin_chunk;
+    u32 p = job->begin_pos;
+    while (c != job->end_chunk || p != job->end_pos) {
+        auto* h = reinterpret_cast<BlockHeader*>(c->data + p);
+        if (h->kind == BlockKind::End) {
+            c = c->next.load(std::memory_order_acquire);
+            p = 0;
+            continue;
+        }
+        if (h->kind == BlockKind::Command) {
+            h->invoke(h + 1);
+        }
+        p += h->size;
+    }
+    tls_pass_fake = nullptr;
+    tls_pass_real = nullptr;
+
+    const VkResult ended = real_end(secondary);
+    ASSERT_MSG(ended == VK_SUCCESS, "SOTC_PASS_SEC: vkEndCommandBuffer failed: {}",
+               static_cast<u32>(ended));
+    job->secondary = secondary;
+
+    // The consumer may recycle the chunks from here on
+    for (Chunk* pinned : job->pinned) {
+        pinned->job_pins.fetch_sub(1, std::memory_order_release);
+    }
+    job->pinned.clear();
+    done_seq.store(job->seq, std::memory_order_release);
+    done_seq.notify_all();
+}
+
+CommandRecorder::CommandRecorder(const Instance& instance, Semaphore* work_semaphore) {
     ASSERT_MSG(g_recorder == nullptr, "cp_record_thread: only one recorded scheduler is supported");
     InstallThunks();
     g_recorder = this;
     write_chunk = AcquireChunk();
     first_chunk = write_chunk;
     producer_tid = CurrentThreadId();
+    if (PassSecEnabled()) {
+        // sotc: created before the consumer starts, which reads pass
+        pass = std::make_unique<PassSecondary>(*this, instance, work_semaphore, PassSecMin());
+        state_meta = true;
+        LOG_INFO(Render_Vulkan, "SOTC_PASS_SEC: passes over {} draws run on a secondary command buffer",
+                 PassSecMin());
+    }
     thread = std::jthread([this](std::stop_token stoken) { ConsumerLoop(stoken); });
 }
 
@@ -655,11 +1453,17 @@ CommandRecorder::~CommandRecorder() {
     thread.request_stop();
     WakeConsumer();
     thread.join();
+    // sotc: stops the pass worker (it reads the chunks and calls the driver through g_recorder)
+    pass.reset();
     g_recorder = nullptr;
     std::scoped_lock lk{free_mutex};
     for (Chunk* chunk : free_chunks) {
         delete chunk;
     }
+    for (Chunk* chunk : deferred_chunks) {
+        delete chunk;
+    }
+    deferred_chunks.clear();
     // The chunks still linked after the consumer position contain no remaining commands to run and
     // can be released during cleanup
 }
@@ -668,9 +1472,13 @@ vk::CommandBuffer CommandRecorder::NewFakeHandle() {
     // Fake handles wrap around after NumFakeHandles sessions, so confirm the old session was
     // submitted before using that handle again
     const SotcStats::SplitTimer recorder_split{SotcStats::SplitWaitRecorder};
-    while (handles_issued - handles_retired.load(std::memory_order_acquire) >= NumFakeHandles / 2) {
-        Kick();
-        std::this_thread::yield();
+    if (handles_issued - handles_retired.load(std::memory_order_acquire) >= NumFakeHandles / 2) {
+        const SotcStats::DrawWait wait{SotcStats::WaitRecorder}; // sotc: SOTC_FPS accounting
+        while (handles_issued - handles_retired.load(std::memory_order_acquire) >=
+               NumFakeHandles / 2) {
+            Kick();
+            std::this_thread::yield();
+        }
     }
     const u32 index = static_cast<u32>(handles_issued++ % NumFakeHandles);
     return vk::CommandBuffer{reinterpret_cast<VkCommandBuffer>(&g_fake_handles[index])};
@@ -678,9 +1486,23 @@ vk::CommandBuffer CommandRecorder::NewFakeHandle() {
 
 void CommandRecorder::Bind(VkCommandBuffer fake, VkCommandBuffer real) noexcept {
     real_handles[reinterpret_cast<u8*>(fake) - g_fake_handles] = real;
+    if (pass) {
+        // sotc: a new session starts with no replay state (consumer thread)
+        pass->Forget(fake);
+    }
+}
+
+void CommandRecorder::PassSubmitted(std::span<const vk::CommandBuffer> fakes, u64 signal_tick) {
+    if (pass) {
+        pass->Submitted(fakes, signal_tick);
+    }
 }
 
 VkCommandBuffer CommandRecorder::Real(VkCommandBuffer fake) const noexcept {
+    // sotc: on the pass worker, its secondary command buffer records the commands of the pass
+    if (fake != nullptr && fake == tls_pass_fake) {
+        return tls_pass_real;
+    }
     return real_handles[reinterpret_cast<u8*>(fake) - g_fake_handles];
 }
 
@@ -713,7 +1535,8 @@ void CommandRecorder::ClaimProducer() {
     }
 }
 
-void* CommandRecorder::Allocate(size_t size, BlockKind kind, void (*invoke)(void*)) {
+void* CommandRecorder::Allocate(size_t size, BlockKind kind, BlockCategory category,
+                                void (*invoke)(void*), u16 aux) {
     const size_t total = (sizeof(BlockHeader) + size + BlockAlign - 1) & ~(BlockAlign - 1);
     ASSERT_MSG(total + sizeof(BlockHeader) <= Chunk::Size, "cp_record_thread: block of {} bytes",
                total);
@@ -723,6 +1546,41 @@ void* CommandRecorder::Allocate(size_t size, BlockKind kind, void (*invoke)(void
     auto* header = reinterpret_cast<BlockHeader*>(write_chunk->data + write_pos);
     header->size = static_cast<u32>(total);
     header->kind = kind;
+    header->category = category;
+    header->aux = aux;
+    header->invoke = invoke;
+    write_pos += static_cast<u32>(total);
+    return header + 1;
+}
+
+void* CommandRecorder::AllocateState(size_t size, BlockCategory category, void (*invoke)(void*),
+                                     VkCommandBuffer cmd, StateKey key, u16 aux) {
+    // The Meta block and the command block are reserved together so that they share a chunk and
+    // the consumer finds the meta right before the command it describes
+    constexpr size_t meta_total =
+        (sizeof(BlockHeader) + sizeof(StateMeta) + BlockAlign - 1) & ~(BlockAlign - 1);
+    const size_t total = (sizeof(BlockHeader) + size + BlockAlign - 1) & ~(BlockAlign - 1);
+    ASSERT_MSG(meta_total + total + sizeof(BlockHeader) <= Chunk::Size,
+               "cp_record_thread: block of {} bytes", total);
+    if (write_pos + meta_total + total + sizeof(BlockHeader) > Chunk::Size) {
+        NextChunk();
+    }
+    auto* meta_header = reinterpret_cast<BlockHeader*>(write_chunk->data + write_pos);
+    meta_header->size = static_cast<u32>(meta_total);
+    meta_header->kind = BlockKind::Meta;
+    meta_header->category = BlockCategory::Other;
+    meta_header->aux = 0;
+    meta_header->invoke = nullptr;
+    auto* meta = reinterpret_cast<StateMeta*>(meta_header + 1);
+    meta->cmd = cmd;
+    meta->key = key;
+    write_pos += static_cast<u32>(meta_total);
+
+    auto* header = reinterpret_cast<BlockHeader*>(write_chunk->data + write_pos);
+    header->size = static_cast<u32>(total);
+    header->kind = BlockKind::Command;
+    header->category = category;
+    header->aux = aux;
     header->invoke = invoke;
     write_pos += static_cast<u32>(total);
     return header + 1;
@@ -769,9 +1627,18 @@ void CommandRecorder::NextChunk() {
     auto* end = reinterpret_cast<BlockHeader*>(write_chunk->data + write_pos);
     end->size = sizeof(BlockHeader);
     end->kind = BlockKind::End;
+    end->category = BlockCategory::Other;
+    end->aux = 0;
     end->invoke = nullptr;
     write_pos += sizeof(BlockHeader);
     write_chunk->committed.store(write_pos, std::memory_order_release);
+    if (WaitNoSpin()) {
+        // sotc: the consumer may be blocked on the end of the old chunk. The fence orders the
+        // committed store before the sleeping flag load, as in PublishAll and Kick (otherwise the
+        // consumer can sleep on the old value until the next publish: a hitch).
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        WakeIfSleeping();
+    }
     write_chunk = next;
     write_pos = 0;
 }
@@ -780,12 +1647,13 @@ CommandRecorder::Chunk* CommandRecorder::AcquireChunk() {
     std::optional<SotcStats::SplitTimer> recorder_split;
     if (chunks_in_flight.load(std::memory_order_acquire) >= MaxChunksInFlight) {
         recorder_split.emplace(SotcStats::SplitWaitRecorder);
-    }
-    while (chunks_in_flight.load(std::memory_order_acquire) >= MaxChunksInFlight) {
-        // The recording thread is far enough behind to fill the queue, so let it catch up before
-        // the producer adds more commands
-        Kick();
-        std::this_thread::yield();
+        const SotcStats::DrawWait wait{SotcStats::WaitRecorder}; // sotc: SOTC_FPS accounting
+        while (chunks_in_flight.load(std::memory_order_acquire) >= MaxChunksInFlight) {
+            // The recording thread is far enough behind to fill the queue, so let it catch up
+            // before the producer adds more commands
+            Kick();
+            std::this_thread::yield();
+        }
     }
     chunks_in_flight.fetch_add(1, std::memory_order_relaxed);
     Chunk* chunk = nullptr;
@@ -801,6 +1669,8 @@ CommandRecorder::Chunk* CommandRecorder::AcquireChunk() {
     }
     chunk->committed.store(0, std::memory_order_relaxed);
     chunk->next.store(nullptr, std::memory_order_relaxed);
+    chunk->job_pins.store(0, std::memory_order_relaxed);
+    chunk->table_pins = 0;
     return chunk;
 }
 
@@ -812,12 +1682,39 @@ void CommandRecorder::RecycleChunk(Chunk* chunk) {
     chunks_in_flight.fetch_sub(1, std::memory_order_release);
 }
 
+void CommandRecorder::ReleaseChunk(Chunk* chunk) {
+    // sotc: a chunk the replay table or a pass job still reads waits in deferred_chunks
+    if (chunk->table_pins == 0 && chunk->job_pins.load(std::memory_order_acquire) == 0) {
+        RecycleChunk(chunk);
+    } else {
+        deferred_chunks.push_back(chunk);
+    }
+}
+
+void CommandRecorder::SweepDeferred() {
+    for (size_t i = 0; i < deferred_chunks.size();) {
+        Chunk* chunk = deferred_chunks[i];
+        if (chunk->table_pins == 0 && chunk->job_pins.load(std::memory_order_acquire) == 0) {
+            RecycleChunk(chunk);
+            deferred_chunks[i] = deferred_chunks.back();
+            deferred_chunks.pop_back();
+        } else {
+            ++i;
+        }
+    }
+}
+
 void CommandRecorder::WakeConsumer() {
     {
         std::scoped_lock lk{wake_mutex};
         wake_flag = true;
     }
     wake_cv.notify_one();
+    if (WaitNoSpin()) {
+        // sotc: the doorbell the consumer blocks on; also what the destructor rings to stop it
+        wake_seq.fetch_add(1, std::memory_order_seq_cst);
+        wake_seq.notify_one();
+    }
 }
 
 void CommandRecorder::Kick() {
@@ -839,11 +1736,12 @@ void CommandRecorder::Sync() {
     const auto start =
         perf ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const u64 target = ++sync_requested;
-    Run([this, target] {
+    Run(BlockCategory::Other, [this, target] {
         sync_done.store(target, std::memory_order_release);
         sync_done.notify_all();
     });
     Kick();
+    const SotcStats::DrawWait wait{SotcStats::WaitRecorder}; // sotc: SOTC_FPS accounting
     const SotcStats::SplitTimer recorder_split{SotcStats::SplitWaitRecorder};
     u64 done = sync_done.load(std::memory_order_acquire);
     while (done < target) {
@@ -860,6 +1758,8 @@ void CommandRecorder::Sync() {
 
 void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuRecorder");
+    SotcStats::RegisterThreadRole(SotcStats::RoleRecorder); // sotc: SOTC_FPS accounting
+    BbThreads::PlaceThread(BbThreads::Role::Recorder);
     SotcStats::RegisterSplitThread(SotcStats::SplitThreadRecorder);
     Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
     using Clock = std::chrono::steady_clock;
@@ -902,18 +1802,36 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
         return sleep;
     }();
 
+    const bool nospin = WaitNoSpin();
     Chunk* chunk = first_chunk;
     Chunk* previous = nullptr;
     u32 pos = 0;
+    // sotc: the StateMeta of the Meta block just read, used by the command block right after it
+    const StateMeta* pending_meta = nullptr;
     while (true) {
         u32 committed = chunk->committed.load(std::memory_order_acquire);
         if (pos == committed) {
             // When there is no work, spin briefly before sleeping until the producer kicks the
             // queue or the short timeout expires
-            const auto spin_end = Clock::now() + SpinTime;
-            while ((committed = chunk->committed.load(std::memory_order_acquire)) == pos &&
-                   Clock::now() < spin_end && !stoken.stop_requested()) {
-                RECORDER_PAUSE();
+            if (nospin) {
+                // sotc: at most ~20 us of spinning (deadline checked every 64 iterations)
+                const auto spin_end =
+                    Clock::now() + std::min(SpinTime, std::chrono::microseconds{20});
+                for (u32 n = 1;
+                     (committed = chunk->committed.load(std::memory_order_acquire)) == pos &&
+                     !stoken.stop_requested();
+                     ++n) {
+                    if ((n & 63) == 0 && Clock::now() >= spin_end) {
+                        break;
+                    }
+                    RECORDER_PAUSE();
+                }
+            } else {
+                const auto spin_end = Clock::now() + SpinTime;
+                while ((committed = chunk->committed.load(std::memory_order_acquire)) == pos &&
+                       Clock::now() < spin_end && !stoken.stop_requested()) {
+                    RECORDER_PAUSE();
+                }
             }
             if (committed == pos) {
                 if (stoken.stop_requested()) {
@@ -921,7 +1839,16 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
                 }
                 consumer_sleeping.store(true, std::memory_order_relaxed);
                 std::atomic_thread_fence(std::memory_order_seq_cst);
-                if (chunk->committed.load(std::memory_order_acquire) == pos) {
+                if (nospin) {
+                    // sotc: the snapshot is taken before the re-check; a producer that publishes
+                    // after the re-check sees consumer_sleeping and rings the doorbell (or
+                    // WakeConsumer on destruction), so the wait returns at once
+                    const u32 seen = wake_seq.load(std::memory_order_acquire);
+                    if (chunk->committed.load(std::memory_order_acquire) == pos &&
+                        !stoken.stop_requested()) {
+                        wake_seq.wait(seen, std::memory_order_acquire);
+                    }
+                } else if (chunk->committed.load(std::memory_order_acquire) == pos) {
                     std::unique_lock lk{wake_mutex};
                     wake_cv.wait_for(lk, SleepTime,
                                      [&] { return wake_flag || stoken.stop_requested(); });
@@ -933,6 +1860,8 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
         }
         const bool perf = Common::PerfStats::Enabled();
         const auto busy_start = perf ? Clock::now() : Clock::time_point{};
+        // sotc: SOTC_FPS: recording thread busy time (blocks run, not the wait for work)
+        const u64 sotc_busy_start = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
         while (pos < committed) {
             auto* header = reinterpret_cast<BlockHeader*>(chunk->data + pos);
             if (header->kind == BlockKind::End) {
@@ -940,18 +1869,37 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
                 // Commands in next may still refer to data in chunk, so keep that chunk until the
                 // consumer has moved beyond those commands
                 if (previous != nullptr) {
-                    RecycleChunk(previous);
+                    ReleaseChunk(previous);
                 }
+                SweepDeferred();
                 previous = chunk;
                 chunk = next;
                 pos = 0;
                 committed = chunk->committed.load(std::memory_order_acquire);
                 continue;
             }
-            if (header->kind == BlockKind::Command) {
-                header->invoke(header + 1);
+            if (header->kind == BlockKind::Meta) {
+                pending_meta = reinterpret_cast<const StateMeta*>(header + 1);
+            } else if (header->kind == BlockKind::Command) {
+                if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer
+                    SotcStats::recorder_blocks[static_cast<size_t>(header->category)].fetch_add(
+                        1, std::memory_order_relaxed);
+                }
+                // sotc: with SOTC_PASS_SEC the pass hook may run this block itself or take it
+                // over for a secondary command buffer
+                const StateMeta* meta = std::exchange(pending_meta, nullptr);
+                if (pass == nullptr || !pass->Handle(chunk, pos, previous, header, meta, stoken)) {
+                    header->invoke(header + 1);
+                }
             }
             pos += header->size;
+        }
+        if (SotcStats::kFpsLog) {
+            SotcStats::rec_busy_ns.fetch_add(SotcStats::NowNs() - sotc_busy_start,
+                                             std::memory_order_relaxed);
+            if (SotcTrace::kOn) { // sotc: SOTC_TRACE
+                SotcTrace::Span("rec busy", sotc_busy_start, SotcStats::NowNs());
+            }
         }
         if (perf) {
             Common::PerfStats::Add(

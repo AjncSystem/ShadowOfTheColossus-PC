@@ -1,6 +1,7 @@
 /* Linux pthread-backed opaque PS4 mutex handles. No guest threads yet. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "trace.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -90,6 +91,8 @@ static ABI int32_t mutex_lock(GuestMutex **mutex) {
     if (e) return e;
     GuestMutex *m = *mutex;
     int native = pthread_mutex_trylock(&m->native);
+    /* sotc: SOTC_TRACE: contended locks only */
+    const uint64_t t0 = native == EBUSY ? trace_now() : 0;
     for (int waited = 0; native == EBUSY;) {
         struct timespec slice;
         clock_gettime(CLOCK_REALTIME, &slice);
@@ -104,6 +107,7 @@ static ABI int32_t mutex_lock(GuestMutex **mutex) {
     }
     e = orbis_error(native);
     if (!e) { ++locks; m->owner = current_tid(); m->site = __builtin_return_address(0); ++m->depth; }
+    trace_span("mutex wait", t0, (uint64_t)(uintptr_t)m, (uint64_t)__builtin_return_address(0));
     return e;
 }
 static ABI int32_t mutex_trylock(GuestMutex **mutex) {
@@ -193,19 +197,26 @@ static ABI int32_t cond_wait(GuestCond **cond, GuestMutex **mutex) {
     if (e) return e;
     if (!mutex || (uintptr_t)*mutex < 3) return orbis_error(EINVAL);
     ++waits;
-    return orbis_error(pthread_cond_wait(&(*cond)->native, &(*mutex)->native));
+    const uint64_t t0 = trace_now(); /* sotc: SOTC_TRACE */
+    const int r = pthread_cond_wait(&(*cond)->native, &(*mutex)->native);
+    trace_span("cond wait", t0, (uint64_t)(uintptr_t)*cond, (uint64_t)__builtin_return_address(0));
+    return orbis_error(r);
 }
-static int32_t cond_wait_until(GuestCond **cond, GuestMutex **mutex, const struct timespec *end) {
+/* sotc: ra, the guest return address of the import (SOTC_TRACE) */
+static int32_t cond_wait_until(GuestCond **cond, GuestMutex **mutex, const struct timespec *end, void *ra) {
     int32_t e = ensure_cond(cond);
     if (e) return e;
     if (!mutex || (uintptr_t)*mutex < 3 || !end) return orbis_error(EINVAL);
     ++waits;
-    return timed_error(pthread_cond_timedwait(&(*cond)->native, &(*mutex)->native, end));
+    const uint64_t t0 = trace_now(); /* sotc: SOTC_TRACE (the caller is a timed-wait import) */
+    const int r = pthread_cond_timedwait(&(*cond)->native, &(*mutex)->native, end);
+    trace_span("cond timedwait", t0, (uint64_t)(uintptr_t)*cond, (uint64_t)(uintptr_t)ra);
+    return timed_error(r);
 }
 static ABI int32_t cond_timedwait(GuestCond **cond, GuestMutex **mutex, uint32_t usec) {
     struct timespec end;
     if (deadline_after(&end, usec)) return orbis_error(EINVAL);
-    return cond_wait_until(cond, mutex, &end);
+    return cond_wait_until(cond, mutex, &end, __builtin_return_address(0));
 }
 static ABI int32_t cond_signal(GuestCond **cond) {
     int32_t e = ensure_cond(cond);
@@ -222,7 +233,7 @@ typedef struct { int64_t sec, nsec; } GuestTimespec;
 static ABI int32_t cond_abs_timedwait(GuestCond **cond, GuestMutex **mutex, const GuestTimespec *abs) {
     if (!abs || abs->nsec < 0 || abs->nsec >= 1000000000) return orbis_error(EINVAL);
     struct timespec end = {.tv_sec = (time_t)abs->sec, .tv_nsec = (long)abs->nsec};
-    return cond_wait_until(cond, mutex, &end);
+    return cond_wait_until(cond, mutex, &end, __builtin_return_address(0));
 }
 /* POSIX pthread APIs return positive guest errno values, unlike scePthread. */
 static int32_t posix_result(int32_t result) { return result ? (int32_t)((uint32_t)result & 0xffff) : 0; }

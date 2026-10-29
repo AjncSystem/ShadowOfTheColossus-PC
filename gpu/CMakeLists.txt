@@ -167,6 +167,9 @@ add_library(bbgpu ${BBGPU_KIND} ${VIDEO_CORE} ${RECOMPILER} ${COMMON} ${SHIM_SOU
     shadps4/core/libraries/kernel/equeue.cpp ${AVPLAYER}
     shadps4/core/libraries/videodec/video_utils.cpp)
 add_dependencies(bbgpu host_shaders)
+# sotc: SOTC_HLE_SHADOW_CULL replays a shader's single-precision arithmetic in its exact operation
+# order (picked up by the video_core glob above): no fused multiply-add contraction there.
+set_source_files_properties(shadps4/video_core/sotc_shadow_cull.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
 # In-game settings menu: Dear ImGui (third_party/imgui, MIT) with its Vulkan backend, and an
 # embedded Cyrillic font (third_party/fonts).
 target_sources(bbgpu PRIVATE third_party/imgui/imgui.cpp third_party/imgui/imgui_draw.cpp
@@ -260,6 +263,10 @@ list(APPEND fsr_fg_sources ${FSR_FG_PATCHED})
 set_property(TARGET ffx_vulkan_fsr3_vk_framegeneration_3_1_6 PROPERTY SOURCES ${fsr_fg_sources})
 target_include_directories(bbgpu PRIVATE shim shadps4 ${SHADER_INCLUDE} third_party/gcn/include third_party/half/include)
 target_compile_definitions(bbgpu PRIVATE BOOST_ASIO_STANDALONE NDEBUG)
+# sotc: xxhash inlined into the GPU library (XXH_INLINE_ALL): per-draw hashes of small keys were
+# calls into libxxhash.dll. Same algorithm and version as the DLL, which stays linked for the
+# other users, so cache keys do not change.
+target_compile_definitions(bbgpu PRIVATE XXH_INLINE_ALL)
 target_compile_options(bbgpu PRIVATE -Wno-deprecated-declarations -Wno-missing-field-initializers)
 # Runtime symbols (runtime_memory_*, runtime_process_*) resolve against bb-probe.
 if (NOT WIN32)
@@ -296,6 +303,26 @@ if (WIN32)
     # The PS4 range (64 GiB - 1 TiB) must stay free: no high-entropy ASLR for heaps and stacks.
     # The guest main thread runs on the process stack: 16 MiB, committed (no stack probes).
     target_link_options(bb-probe PRIVATE -Wl,--disable-high-entropy-va "SHELL:-Xlinker --stack -Xlinker 16777216,16777216")
+    # sotc: libc++ linked statically (BB_STATIC_LIBCXX=OFF links libc++.dll as before): the draw
+    # thread called into libc++.dll through the import table (mutexes, shared_ptr, strings),
+    # and a replacement allocator (BB_MIMALLOC) needs libc++ in the same image. The other DLLs
+    # (SDL3, FFmpeg, Zydis, Vulkan) have C interfaces: no C++ object crosses them.
+    option(BB_STATIC_LIBCXX "Link libc++ statically into bb-probe" ON)
+    if (BB_STATIC_LIBCXX)
+        target_link_options(bb-probe PRIVATE -static-libstdc++)
+    endif()
+    # sotc: BB_MIMALLOC=ON replaces operator new/delete with mimalloc (shim/bbport_mimalloc.cpp);
+    # needs the static libc++ above and MSYS2 mingw-w64-clang-x86_64-mimalloc (static library).
+    option(BB_MIMALLOC "Use mimalloc for operator new/delete in bb-probe" OFF)
+    if (BB_MIMALLOC)
+        if (NOT BB_STATIC_LIBCXX)
+            message(FATAL_ERROR "BB_MIMALLOC needs BB_STATIC_LIBCXX=ON")
+        endif()
+        find_library(MIMALLOC_STATIC NAMES libmimalloc.a REQUIRED)
+        target_sources(bb-probe PRIVATE shim/bbport_mimalloc.cpp)
+        target_compile_definitions(bb-probe PRIVATE BB_MIMALLOC)
+        target_link_libraries(bb-probe PRIVATE ${MIMALLOC_STATIC} advapi32 psapi)
+    endif()
     add_executable(bb-gpu-capabilities ../tools/gpu_capabilities.c ../packaging/windows/bb-gpu-capabilities.rc)
     target_link_libraries(bb-gpu-capabilities PRIVATE Vulkan::Vulkan)
 endif()

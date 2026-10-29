@@ -7,6 +7,7 @@
  * the same 9-byte instruction with another displacement. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "trace.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,14 +71,18 @@ static _Thread_local GuestThread *current;
 size_t runtime_thread_suspend_others(void **out, size_t capacity) {
     size_t n=0;
     pthread_mutex_lock(&lock);
+    /* sotc: every thread is asked to stop first, then each is waited for: the stops proceed in
+     * parallel instead of one kernel round trip after the other (17+ guest threads). */
     for (GuestThread *t=threads; t && n<capacity; t=t->next) {
         if (t==current || t->finished || !t->os_handle) continue;
         HANDLE h=t->os_handle;
         if (SuspendThread(h)==(DWORD)-1) continue;
+        out[n++]=h;
+    }
+    for (size_t i=0;i<n;++i) {
         CONTEXT c;
         c.ContextFlags=CONTEXT_CONTROL;
-        GetThreadContext(h,&c); /* returns once the thread is really stopped */
-        out[n++]=h;
+        GetThreadContext(out[i],&c); /* returns once the thread is really stopped */
     }
     return n;
 }
@@ -288,6 +293,8 @@ static void set_host_name(const char *name) {
 #define exit_setjmp(t) setjmp((t)->exit_jump)
 #define exit_longjmp(t) longjmp((t)->exit_jump,1)
 #endif
+/* sotc: SOTC_STALL_DETAIL: the GPU library counts this thread's CPU time (weak: absent builds skip it). */
+void bbgpu_register_guest_thread(void) __attribute__((weak));
 static void *host_start(void *p) {
     GuestThread *t=p;
 #ifdef _WIN32
@@ -300,6 +307,8 @@ static void *host_start(void *p) {
 #endif
     attach(t);
     set_host_name(t->name);
+    trace_thread_init(); /* sotc: SOTC_TRACE ring before any guest code (faults never allocate one) */
+    if (bbgpu_register_guest_thread) bbgpu_register_guest_thread(); /* sotc: SOTC_STALL_DETAIL guest CPU */
 #ifdef _WIN32
     /* sotc: host thread ids of guest threads, for traces that print GetCurrentThreadId. */
     if (getenv("SOTC_THREAD_IDS")) fprintf(stderr,"Runtime: guest thread '%s' is host thread %lu\n",t->name,GetCurrentThreadId());

@@ -43,6 +43,10 @@ public:
     [[nodiscard]] StagingBufferRef Request(u64 size, VideoCore::MemoryType type, u64 alignment = 0,
                                            bool deferred = false, bool unsynchronized = false);
 
+    /// sotc: SOTC_ASYNC_STAGE_CACHED=1: the memory type of the staging the async upload copies
+    /// write into: HostCached when the device has a HOST_VISIBLE|HOST_CACHED type, else HostUncached.
+    [[nodiscard]] VideoCore::MemoryType AsyncCopyType() const;
+
     /// Releases a deferred allocation. It becomes reusable once the current tick completes.
     void FreeDeferred(const StagingBufferRef& ref);
 

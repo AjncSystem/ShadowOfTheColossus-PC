@@ -3,6 +3,7 @@
  * use FreeBSD numbering; host errno values never reach the guest directly. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "trace.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -120,15 +121,19 @@ uint64_t runtime_process_time_us(void) { return process_time(); }
 uint64_t runtime_process_time_counter(void) { return process_time_counter(); }
 uint64_t runtime_tsc_frequency(void) { return tsc_frequency(); }
 uint64_t runtime_read_tsc(void) { return host_tsc(); }
-static int sleep_ns(uint64_t ns) {
+/* sotc: SOTC_TRACE: ra is the guest return address (the caller of the import). */
+static int sleep_ns_from(uint64_t ns, void *ra) {
+    const uint64_t t0=trace_now();
 #ifdef _WIN32
     compat_sleep_ns(ns);
 #else
     struct timespec t={.tv_sec=(time_t)(ns/1000000000),.tv_nsec=(long)(ns%1000000000)};
-    while (nanosleep(&t,&t)) if (errno!=EINTR) return errno;
+    while (nanosleep(&t,&t)) if (errno!=EINTR) { trace_span("sleep",t0,ns,(uint64_t)ra); return errno; }
 #endif
+    trace_span("sleep",t0,ns,(uint64_t)ra);
     return 0;
 }
+#define sleep_ns(ns) sleep_ns_from((ns),__builtin_return_address(0))
 static ABI int32_t kernel_usleep(uint32_t usec) { sleep_ns((uint64_t)usec*1000); return 0; }
 static ABI int32_t posix_usleep(uint32_t usec) { sleep_ns((uint64_t)usec*1000); return 0; }
 static ABI uint32_t posix_sleep(uint32_t seconds) { sleep_ns((uint64_t)seconds*1000000000); return 0; }
@@ -139,7 +144,10 @@ static ABI int32_t posix_nanosleep(const GuestTimespec *rq,GuestTimespec *rem) {
     return 0;
 }
 static ABI int32_t kernel_nanosleep(const GuestTimespec *rq,GuestTimespec *rem) {
-    return posix_nanosleep(rq,rem) ? ERR(*runtime_errno()) : 0;
+    if (!rq || rq->nsec<0 || rq->nsec>=1000000000 || rq->sec<0) { fail_posix(EINVAL); return ERR(*runtime_errno()); }
+    sleep_ns((uint64_t)rq->sec*1000000000+(uint64_t)rq->nsec);
+    if (rem) { rem->sec=0; rem->nsec=0; }
+    return 0;
 }
 typedef struct { int32_t minuteswest, dsttime; } GuestTimezone;
 static ABI int32_t kernel_gettimezone(GuestTimezone *tz) {

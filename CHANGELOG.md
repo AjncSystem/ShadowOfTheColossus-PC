@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.60.6-plus25 — 2026-10-28 (fork Lucas-blip-png)
+- **21:9 e 32:9 sem a cena esticada (#4, amarshall9062; o mesmo sintoma em #327 e #331 do upstream):** desde o plus16 (correção do HUD do C2, #301) o aspecto do objeto de tela ficava em 16:9, e é ele que também define o da cena 3D, então em tela larga o jogo era a imagem 16:9 esticada para os lados. Medido no Santuário e na demonstração em 3176x1320: o Wander ficava mais largo e sem mais cenário nas laterais; agora tem as proporções de 16:9 e mostra mais cenário dos lados. Vale só para saídas mais largas que 16:9; 16:9 não muda.
+- **Conhecido, volta com isso:** o pedaço cinza na barra de vida em 21:9 (#301). A barra de resistência continua certa. Para escolher o outro lado (cena esticada, sem o pedaço cinza), coloque `SOTC_WIDE_ASPECT=0` em "Variáveis extras". Procurando a causa do pedaço cinza sem estragar a cena.
+- **Biblioteca do lançador** mostra a versão 01.01, a mesma da aba Play (#5).
+
 ## 0.60.6-plus24 — 2026-10-28 (fork Lucas-blip-png)
 - **Cache de shaders em um arquivo por sessão (journal), escritor em segundo plano e pipelines de compute especulativos (Lukto02, PR #3):** com cache frio, a sessão grava 1 arquivo em vez de ~8,3 mil arquivos pequenos; na próxima abertura as entradas vão para o pack e o journal é apagado. O escritor do cache roda em modo de segundo plano no Windows. Os pipelines de compute das traduções antecipadas são montados já na instalação. Teste aqui (demonstração da tela inicial, cache frio, 4 rodadas com o código ligado e desligado): sem diferença de FPS nem de 1% low (63,0 e 63,4 contra 63,8 e 63,5), sem erros novos; partida seguinte leu 8779 registros do journal e gravou o pack. O ganho que o autor mediu na abertura (cinemática, cache frio) não apareceu na demonstração. Desligar: `SOTC_CACHE_JOURNAL=0`, `SOTC_CACHE_IO_BACKGROUND=0`, `SOTC_COMPUTE_SPECULATE=0`, `SOTC_PREFETCH_PRIORITY=0`. O cache de shaders não é refeito.
 

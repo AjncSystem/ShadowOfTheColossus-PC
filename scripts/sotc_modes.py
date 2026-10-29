@@ -189,7 +189,10 @@ def render_patches(elf, ph, size):
     # #301: health and stamina bars stretched in 21:9).
     keep = {int(a, 16) for a in os.environ.get('SOTC_RENDER_KEEP', '').replace(' ', ',').split(',') if a}
     sites = list(RENDER_SITES)
-    if os.environ.get('SOTC_WIDE_ASPECT') == '1':  # the display object's aspect too (pre-#301)
+    # sotc: the display object's aspect also sets the 3D scene's: left at 16:9 the scene is the 16:9 image
+    # stretched sideways (#4, 21:9 and 32:9). On by default above 16:9; the health bar's grey stub in 21:9
+    # (#301) comes back with it. SOTC_WIDE_ASPECT=0 keeps 16:9 (stretched scene, no stub).
+    if os.environ.get('SOTC_WIDE_ASPECT', '1' if w * 9 > h * 16 * 1.02 else '0') == '1':
         sites.append((0x00495b3e, 'a', 'c74304398ee33f'))
     for address, kind, original in sites:
         original = bytes.fromhex(original)

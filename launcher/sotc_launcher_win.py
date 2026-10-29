@@ -277,7 +277,7 @@ EFFECTS = [('fx_vignette', ('Vinheta (cantos escurecidos)', 'Vignette (darkened 
            ('fx_ssao', ('Oclusão ambiente (SSAO)', 'Ambient occlusion (SSAO)'), 'AO_Mode=0')]
 # Common screen sizes: 16:9, 16:10, 21:9 (ultrawide) and 32:9 (super ultrawide).
 # 5120x2160 is left out: the game faults at start (memory), 3840x2160 runs.
-SCREENS = [('1920x1080', '16:9, 1080p'), ('2560x1440', '16:9, 1440p'), ('3840x2160', '16:9, 4K'),
+SCREENS = [('1366x768', '16:9, 768p'), ('1920x1080', '16:9, 1080p'), ('2560x1440', '16:9, 1440p'), ('3840x2160', '16:9, 4K'),
            ('1920x1200', '16:10'), ('2560x1600', '16:10'),
            ('2560x1080', '21:9'), ('3440x1440', '21:9'), ('3840x1600', '21:9'),
            ('3840x1080', '32:9'), ('5120x1440', '32:9')]
@@ -1502,6 +1502,9 @@ class Launcher:
                 window.destroy()
                 return
             key = sdl_key_name(event.keysym)
+
+            if 96 <= event.keycode <= 105:
+                key = 'Keypad ' + str(event.keycode - 96)
             if not key:
                 hint.configure(text=_('Tecla não suportada: {}', 'Unsupported key: {}').format(event.keysym))
                 return

@@ -233,7 +233,8 @@ Buffer::Buffer(const Vulkan::Instance& instance, VAddr cpu_addr_, u64 size_bytes
                                          instance.GetXferQueueFamilyIndex()};
     // sotc: SOTC_HOST_IMPORT alone writes only device-local staging on the transfer queue: the
     // other buffers stay exclusive, as without the transfer queue.
-    if (instance.IsXferRoutingEnabled() ||
+    // sotc: SOTC_RB_TICK: the arena and the download staging of a readback copy on that queue.
+    if (instance.IsXferRoutingEnabled() || instance.IsRbTickEnabled() ||
         (instance.IsHostImportEnabled() && mem_type_ == MemoryType::DeviceLocal)) {
         buffer_ci.sharingMode = vk::SharingMode::eConcurrent;
         buffer_ci.queueFamilyIndexCount = static_cast<u32>(families.size());

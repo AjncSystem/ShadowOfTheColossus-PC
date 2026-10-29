@@ -33,6 +33,7 @@
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/libs.h"
 #include "video_core/buffer_cache/async_upload.h"
+#include "common/signal_context.h" // sotc: SOTC_FENCE_PIECES (read faults)
 #include "core/memory.h"
 #include "core/emulator_settings.h"
 #include "core/signals.h"
@@ -387,6 +388,11 @@ extern "C" void bbgpu_register_guest_stack(uintptr_t address, uint64_t size) {
 extern "C" void bbgpu_register_guest_stack_end(uintptr_t address, uint64_t size) {
     VideoCore::UnregisterGuestStack(address, size);
 }
+// sotc: SOTC_CARVE_NOSTOP (runtime_memory.c carve_host): is a registered guest (fiber) stack in
+// the range? The registry's writers never block on its lock, so this cannot deadlock.
+extern "C" int bbgpu_guest_stack_in_range(uintptr_t address, uint64_t size) {
+    return VideoCore::IntersectsGuestStack(address, size) ? 1 : 0;
+}
 extern "C" int bbgpu_readbacks_mode(void) {
     return static_cast<int>(EmulatorSettings.GetReadbacksMode());
 }
@@ -395,8 +401,29 @@ extern "C" int bbgpu_handle_fault(void* ucontext, void* address) {
     // sotc: SOTC_ASYNC_UPLOAD write fence. A write fault unprotects the page and, with the
     // write-ahead and the fault granule, pages up to 64 KiB around it: their pending copies
     // finish first (the copy threads take no lock, so waiting here cannot deadlock).
-    if (auto* async_upload = VideoCore::AsyncUpload::Get(); async_upload &&
-                                                           async_upload->AnyPending()) {
+    // sotc: SOTC_FENCE_PIECES: read faults go on without waiting. A read fault only runs a
+    // readback (page_manager HandleGuestFault): the GPU bit is cleared and the page keeps its
+    // write protection (it only becomes writable when it is CPU-modified too, and a pending
+    // copy's pages are CPU-clean: TryUploadAsync; only a fenced write marks them). The readback
+    // writes the backing after its download's submit, which waits for every job queued before
+    // it (WaitUpTo), so it cannot overtake a copy that was already pending at the fault.
+    // sotc: the readbacks ahead of the queue (SOTC_RB_AHEAD's SubmitAheadAndWait,
+    // SOTC_RB_ASYNC_AHEAD's SubmitAheadAsync) skip WaitUpTo. They are taken only for bytes no
+    // command of the tick being recorded wrote (current_writes), while every pending job of an
+    // older tick finished before that tick's submit; a buffer job's arena copy is in
+    // current_writes (TryUploadAsync), and a texture job's pages were not GPU-modified when it
+    // was queued, so a GPU write that makes them so is in current_writes too.
+    // sotc: SOTC_FPS: times the fault (SotcStats::FaultStat; counted when it is a handled guest
+    // write fault).
+    if (SotcStats::kFpsLog) {
+        SotcStats::FaultStat::Begin();
+    }
+    if (auto* async_upload = VideoCore::AsyncUpload::Get();
+        async_upload && async_upload->AnyPending() && VideoCore::AsyncUpload::FencePieces() &&
+        !Common::IsWriteError(ucontext)) {
+        SotcStats::fence_read_skips.fetch_add(1, std::memory_order_relaxed);
+    } else if (async_upload && async_upload->AnyPending()) {
+        const SotcStats::FaultStat::Scope fence_timed{&SotcStats::FaultStat::Tl::fence_ns};
         // The fault granule is at most 64 KiB (kFaultGranule); the write-ahead covers
         // SOTC_WRITE_AHEAD_PAGES pages (15 by default) after the faulting one.
         static const u64 span = [] {
@@ -405,9 +432,21 @@ extern "C" int bbgpu_handle_fault(void* ucontext, void* address) {
             return std::max<u64>(ahead, 64 * 1024);
         }();
         const u64 window = reinterpret_cast<u64>(address) & ~u64{0xFFFF};
-        async_upload->WaitVa(window, span + 64 * 1024);
+        if (SotcStats::kWriteAheadAdapt) {
+            // sotc: SOTC_WRITE_AHEAD_ADAPT: the window can reach SOTC_WRITE_AHEAD_MAX_PAGES pages
+            // either side of the faulting page (rounded out to 64 KiB, as the fixed span is).
+            const u64 reach = (u64{SotcStats::kWriteAheadMaxPages} + 16) * 4096;
+            const u64 begin = (window > reach ? window - reach : 0) & ~u64{0xFFFF};
+            async_upload->WaitVa(begin, window - begin + std::max(span, reach) + 64 * 1024);
+        } else {
+            async_upload->WaitVa(window, span + 64 * 1024);
+        }
     }
-    return Core::Signals::Instance()->DispatchAccessViolation(ucontext, address) ? 1 : 0;
+    const int handled = Core::Signals::Instance()->DispatchAccessViolation(ucontext, address) ? 1 : 0;
+    if (SotcStats::kFpsLog) {
+        SotcStats::FaultStat::End();
+    }
+    return handled;
 }
 
 // sotc: SOTC_ASYNC_UPLOAD write fence for the runtime's own writes to guest memory (zeroing

@@ -48,7 +48,7 @@ struct UniqueImage {
     UniqueImage& operator=(const UniqueImage&) = delete;
 
     UniqueImage(UniqueImage&& other)
-        : allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
+        : device{other.device}, allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
           allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
           image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)},
           size_bytes{std::exchange(other.size_bytes, 0)} {}
@@ -65,6 +65,11 @@ struct UniqueImage {
     }
 
     void Create(const vk::ImageCreateInfo& image_ci);
+
+    /// sotc: SOTC_ASYNC_IMAGE_CREATE: Create for an image made ahead of use on an image worker
+    /// (ImagePrefetcher). Within the video memory budget only, and a failure is returned instead
+    /// of asserted: the image is then made by Create when it is needed, as without the switch.
+    bool TryCreateWithinBudget(const vk::ImageCreateInfo& image_ci);
 
     void Destroy();
 
@@ -86,6 +91,18 @@ public:
 };
 
 extern u64 g_sotc_fence_epoch; // sotc: bumped at every fence the command processor retires
+
+/// sotc: the Vulkan creation parameters Image::Image derives from an ImageInfo. Shared with the
+/// creation ahead of use (SOTC_ASYNC_IMAGE_CREATE, ImagePrefetcher), which must ask for exactly
+/// the image the constructor would. Thread safe (the format queries are cached under a mutex).
+struct ImagePlan {
+    vk::ImageCreateInfo image_ci{};
+    vk::ImageUsageFlags usage_flags{};
+    vk::FormatFeatureFlags2 format_features{};
+    vk::SampleCountFlags supported_samples{};
+    vk::Result format_result{}; ///< the driver's answer for the final format/usage combination
+};
+ImagePlan PlanImage(const Vulkan::Instance& instance, const ImageInfo& info);
 
 struct Image {
     explicit Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime,

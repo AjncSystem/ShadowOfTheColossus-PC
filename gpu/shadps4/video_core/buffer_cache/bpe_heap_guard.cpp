@@ -11,6 +11,8 @@
 #include "core/memory.h"
 #include "video_core/buffer_cache/bpe_heap_guard.h"
 
+extern "C" uint64_t runtime_memory_generation(void);
+
 namespace VideoCore {
 
 namespace {
@@ -31,8 +33,31 @@ constexpr u64 InUse = 1; // size | flags bit 0: set on allocated blocks, clear o
 constexpr size_t MaxUsedBlocks = 1 << 12;
 } // namespace
 
+// sotc: SOTC_HEAP_GUARD_RUNS=1 (off by default). A guard is built again whenever its heap's free
+// tree changed (~100 times a second while an area streams), and each build resolved the backing run
+// of every node it read again (Read). The runs only change with the guest memory map: the last
+// build's runs are handed to the next one while the runtime's table generation is the same (even:
+// no writer), on the thread that builds the guards (the draw thread).
+static bool GuardRunsCacheEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_HEAP_GUARD_RUNS");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+
 BpeHeapGuard::BpeHeapGuard(Core::MemoryManager* memory_, VAddr heap_)
     : memory{memory_}, heap{heap_} {
+    struct RunsCache {
+        u64 generation = 1; // odd: empty
+        std::vector<Run> runs;
+    };
+    thread_local RunsCache cache;
+    const bool reuse = GuardRunsCacheEnabled();
+    const u64 generation = reuse ? runtime_memory_generation() : 1;
+    if (reuse && !(generation & 1) && cache.generation == generation) {
+        runs = cache.runs;
+    }
     u64 heap_size = 0;
     if (!Read(heap + 0x30, &heap_size, sizeof(heap_size)) || heap_size < 0x1000000 ||
         heap_size > MaxBlockSize) {
@@ -40,6 +65,10 @@ BpeHeapGuard::BpeHeapGuard(Core::MemoryManager* memory_, VAddr heap_)
     }
     valid = true;
     CollectFreeTree();
+    if (reuse && !(generation & 1) && runtime_memory_generation() == generation) {
+        cache.generation = generation;
+        cache.runs = runs;
+    }
 }
 
 bool BpeHeapGuard::Read(VAddr addr, void* out, u64 size) const {

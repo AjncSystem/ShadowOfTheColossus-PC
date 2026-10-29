@@ -5,6 +5,7 @@
 #include <chrono>
 #include <mutex>
 #include <unordered_set>
+#include "common/hash.h"
 #include "common/serdes.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
@@ -39,7 +40,10 @@ static bool SrtPhiDisabled() {
     return v && v[0] == '0';
 }
 // sotc: 39/137 (from 38/136): the SRT walker no longer uses dynamic-window ReadConsts as offsets.
-static const u32 ShaderBinaryVersion = (Shader::LodFeedbackEnabled() ? 39u : 137u) +
+// 40/138: the cache now takes loose files newer than the pack (cache_storage.cpp), which brought
+// back binaries written by older recompiler builds under the same number (wrong vertices, dark
+// trees): everything is translated again once.
+static const u32 ShaderBinaryVersion = (Shader::LodFeedbackEnabled() ? 40u : 138u) +
                                        (Shader::StageBindingsEnabled() ? 1000u : 0u) +
                                        (BindlessSamplersRequested() ? 2000u : 0u) +
                                        (SrtPhiDisabled() ? 4000u : 0u);
@@ -85,6 +89,33 @@ u64 BinaryId(u64 pgm_hash, size_t perm_idx) {
 bool IsCollidedPerm(size_t perm_hash) {
     std::scoped_lock lock{collided_mutex};
     return collided_perms.contains(perm_hash);
+}
+
+// sotc: whether the meta of this slot ({pgm}_{idx}) is one this build loads. A binary whose slot
+// has none (no meta, or one of an older version) belongs to no pipeline any more: an older build
+// left it. Before, it still counted as taken, so the permutation was left out of the cache and the
+// slot's meta was never rewritten: the shader was translated again every session, its pipelines
+// counted as stale at every start.
+bool SlotHasCurrentMeta(u64 pgm_hash, size_t perm_idx) {
+    std::vector<u8> blob;
+    Storage::DataBase::Instance().Load(Storage::BlobType::ShaderMeta,
+                                       fmt::format("{:#018x}", HashCombine(pgm_hash, u64(perm_idx))),
+                                       blob);
+    if (blob.empty()) {
+        return false;
+    }
+    try {
+        Serialization::Archive ar{std::move(blob)};
+        Serialization::Reader meta{ar};
+        u32 meta_version{};
+        u32 binary_version{};
+        meta.Read(meta_version);
+        meta.Read(binary_version);
+        return meta_version == Serialization::ShaderMetaVersion &&
+               binary_version == Serialization::ShaderBinaryVersion;
+    } catch (const Serialization::CorruptedData&) {
+        return false;
+    }
 }
 } // namespace
 
@@ -171,7 +202,11 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
     if (!EmulatorSettings.IsPipelineCacheArchived()) {
         std::vector<u32> stored;
         Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary, name, stored);
-        if (!stored.empty() && stored != spv) {
+        if (!stored.empty() && stored != spv && !SlotHasCurrentMeta(pgm_hash, perm_idx)) {
+            // An older build's binary: replaced (the meta is written right after).
+            SotcStats::shader_cache_replaced.fetch_add(1, std::memory_order_relaxed);
+        } else if (!stored.empty() && stored != spv) {
+            SotcStats::shader_cache_left_out.fetch_add(1, std::memory_order_relaxed);
             static std::atomic<u32> reported{0};
             if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
                 LOG_WARNING(Render_Vulkan,

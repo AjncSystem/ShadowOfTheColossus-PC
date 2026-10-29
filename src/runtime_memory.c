@@ -115,7 +115,27 @@ static uint64_t table_generation;
 static void write_lock(void) {
     if (!exclusive_depth++) { rw_wrlock(); __atomic_add_fetch(&table_generation,1,__ATOMIC_ACQ_REL); }
 }
+/* sotc: SOTC_CARVE_NOSTOP. Ranges a split left writable that the GPU tracker had write-protected:
+ * they are reported to the GPU as written by the CPU (hook_invalidate) once the table lock is free
+ * (the invalidation takes it for reading). Filled and emptied under the lock. */
+#define CARVE_DIRTY_MAX 256
+typedef struct { uintptr_t start, end; } DirtyRange;
+static DirtyRange carve_dirty[CARVE_DIRTY_MAX];
+static size_t carve_dirty_count;
+static void (*carve_dirty_hook)(uintptr_t, uint64_t);
 static void write_unlock(void) {
+    if (exclusive_depth==1 && carve_dirty_count) {
+        DirtyRange local[CARVE_DIRTY_MAX];
+        const size_t n=carve_dirty_count;
+        void (*hook)(uintptr_t, uint64_t)=carve_dirty_hook;
+        memcpy(local,carve_dirty,n*sizeof(*local));
+        carve_dirty_count=0;
+        --exclusive_depth;
+        __atomic_add_fetch(&table_generation,1,__ATOMIC_RELEASE);
+        rw_wrunlock();
+        if (hook) for (size_t i=0;i<n;++i) hook(local[i].start,local[i].end-local[i].start);
+        return;
+    }
     if (!--exclusive_depth) { __atomic_add_fetch(&table_generation,1,__ATOMIC_RELEASE); rw_wrunlock(); }
 }
 static void read_lock(void) { if (!exclusive_depth) rw_rdlock(); }
@@ -243,11 +263,22 @@ static uint64_t qpc_ns(void) {
 /* sotc: SOTC_VIEW_CHUNK_MB=N maps new ranges as views of at most N MiB aligned to N MiB (0, the
  * default: one view per mapping). Unmapping part of a range then splits only the chunk(s) at its
  * edges, so the freeze of carve_host covers at most two chunks instead of the whole mapping. */
+/* sotc: SOTC_VIEW_CHUNK_KB=N (multiple of 64, takes precedence over the MiB setting): views of N
+ * KiB. With 64, a remap of the game's 64 KiB pages inside a large mapping (sceKernelBatchMap while
+ * an area streams) replaces whole views and never splits a live one, so the other guest threads
+ * are never stopped for it. Costs one view per 64 KiB (more host protection calls on wide ranges,
+ * and the boot maps ~150k views). */
 static uint64_t view_chunk(void) {
     static uint64_t v=UINT64_MAX;
     if (v==UINT64_MAX) {
+        const char *kb=getenv("SOTC_VIEW_CHUNK_KB");
         const char *e=getenv("SOTC_VIEW_CHUNK_MB");
-        v=e ? (uint64_t)strtoull(e,NULL,10)<<20 : 0;
+        if (kb && strtoull(kb,NULL,10)) {
+            v=strtoull(kb,NULL,10)<<10;
+            v=v<(UINT64_C(64)<<10) ? (UINT64_C(64)<<10) : v-v%(UINT64_C(64)<<10); /* granularity */
+        } else {
+            v=e ? (uint64_t)strtoull(e,NULL,10)<<20 : 0;
+        }
     }
     return v;
 }
@@ -260,6 +291,114 @@ static void carve_resume_on_fail(void) {
 #ifdef _WIN32
     if (carve_stopping) { carve_stopping=0; runtime_thread_resume(carve_stopped,carve_nstopped); }
 #endif
+}
+/* sotc: SOTC_VIEW_SPLIT_FINE=1 (off by default). When a live view has to be split (the guest
+ * unmapped part of it), the parts that stay mapped are mapped again as views of 64 KiB, aligned:
+ * later unmaps of 64 KiB pages there (the game's allocator page) remove whole views and split
+ * nothing, so the other guest threads are stopped at most once per area instead of at every
+ * unmap. Only split areas get small views, so protection changes elsewhere stay one call. */
+#define FINE_VIEW (UINT64_C(64) << 10)
+static int view_split_fine(void) {
+    static int v=-1;
+    if (v<0) { const char *e=getenv("SOTC_VIEW_SPLIT_FINE"); v=e && e[0]=='1'; }
+    return v;
+}
+/* Maps the unmapped placeholder regions[at] from phys as FINE_VIEW views (its first piece ends at
+ * the next 64 KiB boundary). Returns the index of its last piece. The table must have room for
+ * them (region_reserve before stopping the other threads: no heap call meanwhile). */
+static size_t map_fine(size_t at, uint64_t phys) {
+    const uintptr_t start=regions[at].start, end=regions[at].end;
+    for (uintptr_t x=start; x<end;) {
+        uintptr_t y=(x/FINE_VIEW+1)*FINE_VIEW;
+        if (y>end) y=end;
+        if (y<end) {
+            if (!VirtualFree((void *)x,y-x,MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER)) win_fail("splitting a placeholder",x,y-x);
+            regions[at].end=y;
+            region_insert(at+1,(HostRegion){y,end,0,0});
+        }
+        regions[at].phys=phys+(x-start); regions[at].mapped=1;
+        view_map(&regions[at],PAGE_READWRITE);
+        if (y<end) ++at;
+        x=y;
+    }
+    return at;
+}
+/* Sets the protection of [start,end) view by view (VirtualProtect does not cross views). */
+static void protect_views(uintptr_t start, uintptr_t end, DWORD protect) {
+    DWORD old;
+    for (size_t i=region_index(start); i<region_count && regions[i].start<end; ++i) {
+        if (!regions[i].mapped) continue;
+        uintptr_t a=regions[i].start>start ? regions[i].start : start, b=regions[i].end<end ? regions[i].end : end;
+        if (!VirtualProtect((void *)a,b-a,protect,&old)) win_fail("restoring page protection",a,b-a);
+    }
+}
+/* sotc: SOTC_CARVE_NOSTOP=1 (off by default). A live view whose kept parts are all plain
+ * read-write (no page the GPU tracker protects) and hold no guest stack is split without stopping
+ * the other guest threads: one touching those parts while they are briefly unmapped faults, the
+ * exception handler waits for the split to end (runtime_memory_carve_retry) and the instruction
+ * runs again. Kept parts with protected pages still stop everything: they come back read-write
+ * before their protection is restored, and a write in between would escape the tracker. The
+ * windows of the last carves are kept for the handler (a fault raised during one may be handled
+ * after it ended). */
+int bbgpu_guest_stack_in_range(uintptr_t address, uint64_t size) __attribute__((weak));
+int bbgpu_readbacks_mode(void) __attribute__((weak));
+void bbgpu_upload_wait_phys(uint64_t phys, uint64_t size) __attribute__((weak));
+static size_t vma_index(uintptr_t a); /* below: first VMA with end > a */
+/* Why the last split stopped the threads, "" when it did not (SOTC_CARVE_LOG). */
+static const char *carve_stop_reason="";
+static int carve_nostop_enabled(void) {
+    static int v=-1;
+    if (v<0) { const char *e=getenv("SOTC_CARVE_NOSTOP"); v=e && e[0]=='1'; }
+    return v;
+}
+#define CARVE_WINDOWS 8
+static uintptr_t carve_win_lo[CARVE_WINDOWS], carve_win_hi[CARVE_WINDOWS];
+static unsigned carve_win_next;
+static uint64_t carve_gen; /* odd while a no-stop split runs */
+static uint64_t carve_nostop_count;
+uint64_t runtime_memory_carve_nostop(void) { return __atomic_exchange_n(&carve_nostop_count,0,__ATOMIC_RELAXED); }
+/* From the exception handler: 1 when the access at address hit a view being (or just) split
+ * without stopping the threads and can run again now. */
+int runtime_memory_carve_retry(uintptr_t address, int write) {
+    if (!carve_nostop_enabled()) return 0;
+    int hit=0;
+    for (unsigned i=0;i<CARVE_WINDOWS && !hit;++i)
+        hit=address>=__atomic_load_n(&carve_win_lo[i],__ATOMIC_ACQUIRE) &&
+            address<__atomic_load_n(&carve_win_hi[i],__ATOMIC_ACQUIRE);
+    if (!hit) return 0;
+    const uint64_t gen=__atomic_load_n(&carve_gen,__ATOMIC_ACQUIRE);
+    if (gen&1) while (__atomic_load_n(&carve_gen,__ATOMIC_ACQUIRE)==gen) YieldProcessor();
+    /* Run it again only if the page now allows the access: a real fault (the range the guest
+     * unmapped, a page the tracker protects) goes on to the other handlers. */
+    MEMORY_BASIC_INFORMATION m;
+    if (!VirtualQuery((void *)address,&m,sizeof(m)) || m.State!=MEM_COMMIT || (m.Protect&PAGE_GUARD)) return 0;
+    const DWORD p=m.Protect&0xff;
+    if (write) return p==PAGE_READWRITE || p==PAGE_EXECUTE_READWRITE || p==PAGE_WRITECOPY || p==PAGE_EXECUTE_WRITECOPY;
+    return p!=PAGE_NOACCESS;
+}
+/* sotc: SOTC_CARVE_LOG=1: each split of a live view is reported (what asked for it, the range,
+ * the view it split, its alignment and the time the other guest threads stayed stopped), the
+ * first 200 and then every 100th, with running totals. carve_reason: set by the caller (the
+ * table lock is held, so one carve at a time). */
+static const char *carve_reason="?";
+static int carve_log_enabled(void) {
+    static int v=-1;
+    if (v<0) { const char *e=getenv("SOTC_CARVE_LOG"); v=e && e[0]=='1'; }
+    return v;
+}
+static void carve_log(uintptr_t a, uintptr_t b, uintptr_t lo, uintptr_t hi, uint64_t freeze_ns) {
+    static uint64_t total, by_map, by_unmap, unaligned;
+    ++total;
+    if (carve_reason[0]=='m') ++by_map; else ++by_unmap;
+    const int aligned=!(a%(UINT64_C(64)<<10)) && !(b%(UINT64_C(64)<<10));
+    if (!aligned) ++unaligned;
+    if (total<=200 || total%100==0)
+        fprintf(stderr,"SOTC carve %" PRIu64 ": %s [%p,+%#" PRIx64 ") split view [%p,+%#" PRIx64 ")%s, %.2f ms, %s%s%s"
+                " (totals: map %" PRIu64 ", unmap %" PRIu64 ", not 64 KiB aligned %" PRIu64 ")\n",
+                total,carve_reason,(void *)a,(uint64_t)(b-a),(void *)lo,(uint64_t)(hi-lo),
+                aligned ? "" : " (not 64 KiB aligned)",freeze_ns/1e6,
+                carve_stop_reason[0] ? "threads stopped (" : "threads not stopped",carve_stop_reason,
+                carve_stop_reason[0] ? ")" : "",by_map,by_unmap,unaligned);
 }
 /* Leaves [a,b) as exactly one unmapped placeholder; returns its region index. */
 static size_t carve_host(uintptr_t a, uintptr_t b) {
@@ -280,7 +419,57 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
     /* sotc: counted with or without the suspend (SOTC_CARVE_SUSPEND=0 used to read 0 splits). */
     const uint64_t split_start=(keep_left || keep_right) ? qpc_ns() : 0;
     if (keep_left || keep_right) __atomic_add_fetch(&carve_splits,1,__ATOMIC_RELAXED);
-    if ((keep_left || keep_right) && carve_suspend_enabled()) {
+    /* sotc: SOTC_VIEW_SPLIT_FINE: kept parts become 64 KiB views (map_fine). */
+    const int fine=(keep_left || keep_right) && view_split_fine();
+    if (fine) region_reserve(3+(keep_left ? (a-lo)/FINE_VIEW+2 : 0)+(keep_right ? (hi-b)/FINE_VIEW+2 : 0));
+    /* sotc: SOTC_CARVE_NOSTOP (see runtime_memory_carve_retry). Kept pages that are read-write
+     * are fine. Write-protected ones (the GPU tracker's clean pages) come back read-write and are
+     * reported as CPU-written after the lock (carve_dirty), so a write while they are writable is
+     * never lost: allowed only with precise readbacks (where GPU-written pages are inaccessible,
+     * never merely write-protected) and where the guest mapping itself is writable. Inaccessible
+     * pages (GPU data not read back) and guest stacks still stop the threads. */
+    int nostop=(keep_left || keep_right) && carve_nostop_enabled();
+    size_t dirty_runs=0;
+    carve_stop_reason=nostop ? "" : "switch off";
+    for (size_t r=0; nostop && r<nruns; ++r) {
+        const DWORD pr=runs[r].protect&0xff;
+        if (pr==PAGE_READWRITE || pr==PAGE_EXECUTE_READWRITE) continue;
+        if (pr==PAGE_READONLY || pr==PAGE_EXECUTE_READ) { ++dirty_runs; continue; }
+        nostop=0; carve_stop_reason="inaccessible pages (GPU data)";
+    }
+    if (nostop && dirty_runs) {
+        if (!bbgpu_readbacks_mode || bbgpu_readbacks_mode()!=2) { nostop=0; carve_stop_reason="readbacks not precise"; }
+        else if (!hook_invalidate) { nostop=0; carve_stop_reason="no GPU hook"; }
+        else if (carve_dirty_count+dirty_runs>CARVE_DIRTY_MAX) { nostop=0; carve_stop_reason="dirty list full"; }
+        for (size_t r=0; nostop && r<nruns; ++r) {
+            const DWORD pr=runs[r].protect&0xff;
+            if (pr!=PAGE_READONLY && pr!=PAGE_EXECUTE_READ) continue;
+            /* The guest's own protection must allow writes (not a page the game made read-only). */
+            for (size_t v=vma_index(runs[r].start); nostop && v<vma_count && vmas[v].start<runs[r].end; ++v)
+                if (!(host_prot(vmas[v].prot)&PROT_WRITE)) { nostop=0; carve_stop_reason="guest read-only pages"; }
+        }
+    }
+    if (nostop && (!bbgpu_guest_stack_in_range || bbgpu_guest_stack_in_range(lo,hi-lo))) {
+        nostop=0; carve_stop_reason="guest stack";
+    }
+    if (nostop) carve_dirty_hook=hook_invalidate;
+    /* The copies of SOTC_ASYNC_UPLOAD rely on write faults to know when the guest writes what they
+     * still read: the kept pages become writable without faulting, so their pending copies finish
+     * first (the copy threads take no lock: safe with the table lock held). */
+    if (nostop && dirty_runs && bbgpu_upload_wait_phys) {
+        if (keep_left) bbgpu_upload_wait_phys(left.phys,a-lo);
+        if (keep_right) bbgpu_upload_wait_phys(right.phys+(b-right.start),hi-b);
+    }
+    if (nostop) {
+        region_reserve(3);
+        const unsigned w=carve_win_next++%CARVE_WINDOWS;
+        __atomic_store_n(&carve_win_lo[w],0,__ATOMIC_RELEASE); /* empty while it changes */
+        __atomic_store_n(&carve_win_hi[w],hi,__ATOMIC_RELEASE);
+        __atomic_store_n(&carve_win_lo[w],lo,__ATOMIC_RELEASE);
+        __atomic_add_fetch(&carve_gen,1,__ATOMIC_ACQ_REL); /* odd: splitting */
+        __atomic_add_fetch(&carve_nostop_count,1,__ATOMIC_RELAXED);
+    }
+    if ((keep_left || keep_right) && !nostop && carve_suspend_enabled()) {
         region_reserve(3);
         carve_nstopped=runtime_thread_suspend_others(carve_stopped,256);
         carve_stopping=1;
@@ -298,7 +487,9 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
         if (!VirtualFree((void *)lo,a-lo,MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER)) win_fail("splitting a placeholder",lo,a-lo);
         regions[at].end=a;
         region_insert(at+1,(HostRegion){a,hi,0,0});
-        if (keep_left) {
+        if (keep_left && fine) {
+            at=map_fine(at,left.phys);
+        } else if (keep_left) {
             regions[at].phys=left.phys; regions[at].mapped=1;
             view_map(&regions[at],PAGE_READWRITE);
         }
@@ -308,23 +499,47 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
         if (!VirtualFree((void *)a,b-a,MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER)) win_fail("splitting a placeholder",a,b-a);
         regions[at].end=b;
         region_insert(at+1,(HostRegion){b,hi,0,0});
-        if (keep_right) {
+        if (keep_right && fine) {
+            map_fine(at+1,right.phys+(b-right.start));
+        } else if (keep_right) {
             regions[at+1].phys=right.phys+(b-right.start); regions[at+1].mapped=1;
             view_map(&regions[at+1],PAGE_READWRITE);
         }
     }
     for (size_t i=0;i<nruns;++i) {
         DWORD old;
-        if (runs[i].protect!=PAGE_READWRITE && !VirtualProtect((void *)runs[i].start,runs[i].end-runs[i].start,runs[i].protect,&old))
+        if (runs[i].protect==PAGE_READWRITE) continue;
+        const DWORD pr=runs[i].protect&0xff;
+        if (nostop && (pr==PAGE_READONLY || pr==PAGE_EXECUTE_READ)) {
+            /* sotc: SOTC_CARVE_NOSTOP: left writable, reported as CPU-written after the lock. */
+            if (pr==PAGE_EXECUTE_READ) {
+                if (fine) protect_views(runs[i].start,runs[i].end,PAGE_EXECUTE_READWRITE);
+                else if (!VirtualProtect((void *)runs[i].start,runs[i].end-runs[i].start,PAGE_EXECUTE_READWRITE,&old))
+                    win_fail("restoring page protection",runs[i].start,runs[i].end-runs[i].start);
+            }
+            if (carve_dirty_count && carve_dirty[carve_dirty_count-1].end==runs[i].start)
+                carve_dirty[carve_dirty_count-1].end=runs[i].end;
+            else
+                carve_dirty[carve_dirty_count++]=(DirtyRange){runs[i].start,runs[i].end};
+            continue;
+        }
+        if (fine) protect_views(runs[i].start,runs[i].end,runs[i].protect); /* may span views now */
+        else if (!VirtualProtect((void *)runs[i].start,runs[i].end-runs[i].start,runs[i].protect,&old))
             win_fail("restoring page protection",runs[i].start,runs[i].end-runs[i].start);
     }
     if (carve_stopping) { carve_stopping=0; runtime_thread_resume(carve_stopped,carve_nstopped); }
-    if (split_start) __atomic_add_fetch(&carve_freeze_ns,qpc_ns()-split_start,__ATOMIC_RELAXED);
+    if (nostop) __atomic_add_fetch(&carve_gen,1,__ATOMIC_ACQ_REL); /* even: done, retries go on */
+    if (split_start) {
+        const uint64_t freeze=qpc_ns()-split_start;
+        __atomic_add_fetch(&carve_freeze_ns,freeze,__ATOMIC_RELAXED);
+        if (carve_log_enabled()) carve_log(a,b,lo,hi,freeze); /* threads resumed: stdio is safe */
+    }
     (void)left_runs;
     free(runs);
     return at;
 }
 static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, uint64_t phys) {
+    carve_reason="map";
     size_t i=carve_host(address,address+size);
     if (reserved) return 0;
     const uint64_t chunk=view_chunk();
@@ -333,20 +548,34 @@ static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, ui
         view_map(&regions[i],win_prot(prot));
         return 0;
     }
-    /* sotc: SOTC_VIEW_CHUNK_MB. The carved range is one unmapped placeholder: cutting it at chunk
-     * boundaries splits only placeholders, so no live view is touched and nothing is stopped. */
+    /* sotc: SOTC_VIEW_CHUNK_MB/KB. The carved range is one unmapped placeholder: cutting it at chunk
+     * boundaries splits only placeholders, so no live view is touched and nothing is stopped.
+     * The table gets all the pieces at once (one move of its tail): inserting them one by one moved
+     * the whole tail per piece, quadratic with 64 KiB pieces of a multi-GiB mapping. */
     const uintptr_t end=address+size;
-    for (uintptr_t a=address; a<end;) {
+    size_t pieces=0;
+    for (uintptr_t a=address; a<end; ++pieces) {
+        uintptr_t b=(a/chunk+1)*chunk;
+        a=b>end ? end : b;
+    }
+    region_reserve(pieces-1);
+    memmove(regions+i+pieces,regions+i+1,(region_count-i-1)*sizeof(*regions));
+    region_count+=pieces-1;
+    size_t k=i;
+    const DWORD protect=win_prot(prot);
+    for (uintptr_t a=address; a<end; ++k) {
         uintptr_t b=(a/chunk+1)*chunk;
         if (b>end) b=end;
-        size_t j=carve_host(a,b);
-        regions[j].phys=phys+(a-address); regions[j].mapped=1;
-        view_map(&regions[j],win_prot(prot));
+        /* [a,end) is one placeholder here: cut [a,b) off its start. */
+        if (b<end && !VirtualFree((void *)a,b-a,MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER))
+            win_fail("splitting a placeholder",a,b-a);
+        regions[k]=(HostRegion){a,b,phys+(a-address),1};
+        view_map(&regions[k],protect);
         a=b;
     }
     return 0;
 }
-static int host_unmap(uintptr_t address, uint64_t size) { carve_host(address,address+size); return 0; }
+static int host_unmap(uintptr_t address, uint64_t size) { carve_reason="unmap"; carve_host(address,address+size); return 0; }
 static int host_protect(uintptr_t address, uint64_t size, int prot) {
     DWORD protect=win_prot(prot), old;
     uintptr_t end=address+size;

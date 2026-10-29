@@ -2,6 +2,7 @@
 // Level from BB_GPU_LOG (trace|debug|info|warning|error; default warning).
 #pragma once
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstring>
 #include <iostream>
@@ -24,7 +25,19 @@ enum class level : int { trace, debug, info, warn, err, critical, off };
 }
 namespace Common::Log {
 using Level = spdlog::level;
-bool ShouldLog(Level level);
+/// sotc: the BB_GPU_LOG threshold, -1 until first read. ShouldLog runs for every LOG_* that is
+/// evaluated (per draw, per Gnm call): inline, one relaxed load instead of an out-of-line call
+/// behind a function-local static guard (~1.5% of the draw thread). Constant-initialised, so a
+/// log from another static initialiser still reads it correctly.
+inline std::atomic<int> g_log_threshold{-1};
+int ReadLogThreshold();
+inline bool ShouldLog(Level level) {
+    int threshold = g_log_threshold.load(std::memory_order_relaxed);
+    if (threshold < 0) [[unlikely]] {
+        threshold = ReadLogThreshold();
+    }
+    return static_cast<int>(level) >= threshold;
+}
 void Write(std::string_view log_class, Level level, const char* file, int line, const char* function,
            std::string&& message);
 inline void Flush() {}

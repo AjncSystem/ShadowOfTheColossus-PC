@@ -85,6 +85,14 @@ public:
         return xfer_routing && HasXferQueue();
     }
 
+    /// sotc: SOTC_RB_TICK=1 and the transfer queue exists: guest readbacks may be copied on it
+    /// (XferQueue::ReadbackCopy). It creates the queue WITHOUT routing uploads to it. Chosen over
+    /// queue family ownership transfers: every Buffer (arenas, staging) is then created
+    /// concurrent over {graphics, transfer} (buffer.cpp), so no release/acquire barriers pair up.
+    bool IsRbTickEnabled() const {
+        return rb_tick && HasXferQueue();
+    }
+
     /// sotc: SOTC_HOST_IMPORT=1, VK_EXT_external_memory_host is enabled and the transfer queue
     /// exists (BufferCache::HostImport).
     bool IsHostImportEnabled() const {
@@ -713,6 +721,7 @@ private:
     u32 xfer_queue_family_index{NoXferQueueFamily}; // sotc: see HasXferQueue()
     vk::Queue xfer_queue;                           // sotc: see HasXferQueue()
     bool xfer_routing{};          // sotc: see IsXferRoutingEnabled()
+    bool rb_tick{};               // sotc: see IsRbTickEnabled()
     bool host_import_enabled{};   // sotc: see IsHostImportEnabled()
     u64 host_import_alignment{};  // sotc: see HostImportAlignment()
     bool custom_border_color{};

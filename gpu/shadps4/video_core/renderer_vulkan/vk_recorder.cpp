@@ -1351,6 +1351,7 @@ void PassSecondary::Finish(BlockHeader* end) {
 
 void PassSecondary::WorkerLoop() {
     Common::SetCurrentThreadName("shadPS4:PassSecondary");
+    SotcStats::RegisterThreadRole(SotcStats::RolePassSecondary); // sotc: SOTC_FPS accounting
     while (true) {
         Job* job = nullptr;
         {
@@ -1469,9 +1470,13 @@ CommandRecorder::~CommandRecorder() {
 vk::CommandBuffer CommandRecorder::NewFakeHandle() {
     // Fake handles wrap around after NumFakeHandles sessions, so confirm the old session was
     // submitted before using that handle again
-    while (handles_issued - handles_retired.load(std::memory_order_acquire) >= NumFakeHandles / 2) {
-        Kick();
-        std::this_thread::yield();
+    if (handles_issued - handles_retired.load(std::memory_order_acquire) >= NumFakeHandles / 2) {
+        const SotcStats::DrawWait wait{SotcStats::WaitRecorder}; // sotc: SOTC_FPS accounting
+        while (handles_issued - handles_retired.load(std::memory_order_acquire) >=
+               NumFakeHandles / 2) {
+            Kick();
+            std::this_thread::yield();
+        }
     }
     const u32 index = static_cast<u32>(handles_issued++ % NumFakeHandles);
     return vk::CommandBuffer{reinterpret_cast<VkCommandBuffer>(&g_fake_handles[index])};
@@ -1637,11 +1642,14 @@ void CommandRecorder::NextChunk() {
 }
 
 CommandRecorder::Chunk* CommandRecorder::AcquireChunk() {
-    while (chunks_in_flight.load(std::memory_order_acquire) >= MaxChunksInFlight) {
-        // The recording thread is far enough behind to fill the queue, so let it catch up before
-        // the producer adds more commands
-        Kick();
-        std::this_thread::yield();
+    if (chunks_in_flight.load(std::memory_order_acquire) >= MaxChunksInFlight) {
+        const SotcStats::DrawWait wait{SotcStats::WaitRecorder}; // sotc: SOTC_FPS accounting
+        while (chunks_in_flight.load(std::memory_order_acquire) >= MaxChunksInFlight) {
+            // The recording thread is far enough behind to fill the queue, so let it catch up
+            // before the producer adds more commands
+            Kick();
+            std::this_thread::yield();
+        }
     }
     chunks_in_flight.fetch_add(1, std::memory_order_relaxed);
     Chunk* chunk = nullptr;
@@ -1729,6 +1737,7 @@ void CommandRecorder::Sync() {
         sync_done.notify_all();
     });
     Kick();
+    const SotcStats::DrawWait wait{SotcStats::WaitRecorder}; // sotc: SOTC_FPS accounting
     u64 done = sync_done.load(std::memory_order_acquire);
     while (done < target) {
         sync_done.wait(done, std::memory_order_acquire);
@@ -1744,6 +1753,7 @@ void CommandRecorder::Sync() {
 
 void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuRecorder");
+    SotcStats::RegisterThreadRole(SotcStats::RoleRecorder); // sotc: SOTC_FPS accounting
     BbThreads::PlaceThread(BbThreads::Role::Recorder);
     Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
     using Clock = std::chrono::steady_clock;
@@ -1844,6 +1854,8 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
         }
         const bool perf = Common::PerfStats::Enabled();
         const auto busy_start = perf ? Clock::now() : Clock::time_point{};
+        // sotc: SOTC_FPS: recording thread busy time (blocks run, not the wait for work)
+        const u64 sotc_busy_start = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
         while (pos < committed) {
             auto* header = reinterpret_cast<BlockHeader*>(chunk->data + pos);
             if (header->kind == BlockKind::End) {
@@ -1875,6 +1887,10 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
                 }
             }
             pos += header->size;
+        }
+        if (SotcStats::kFpsLog) {
+            SotcStats::rec_busy_ns.fetch_add(SotcStats::NowNs() - sotc_busy_start,
+                                             std::memory_order_relaxed);
         }
         if (perf) {
             Common::PerfStats::Add(

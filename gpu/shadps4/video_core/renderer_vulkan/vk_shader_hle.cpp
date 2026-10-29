@@ -8,6 +8,7 @@
 #include "core/memory.h"
 #include "shader_recompiler/info.h"
 #include "video_core/sotc_stats.h"
+#include "video_core/sotc_shadow_cull.h" // sotc: SOTC_HLE_SHADOW_CULL
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
@@ -49,6 +50,16 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         const u32 local_src_offset = src_idx * buf_stride;
         const u32 local_size = (end + 1) * buf_stride;
         copies.emplace_back(local_src_offset, local_dst_offset, local_size);
+    }
+    // sotc: SOTC_BIND_CACHE_RANGES: the copies write the arena (no BindResources for this
+    // dispatch): drop the cached binds reading their bounds.
+    if (SotcStats::kBindCacheRanges && !copies.empty()) {
+        vk::DeviceSize lo = ~vk::DeviceSize{0}, hi = 0;
+        for (const auto& copy : copies) {
+            lo = std::min(lo, copy.dstOffset);
+            hi = std::max(hi, copy.dstOffset + copy.size);
+        }
+        rasterizer.BindCacheNoteWrite(dst_buf_sharp.base_address + lo, hi - lo);
     }
 
     static constexpr vk::DeviceSize MaxDistanceForMerge = 64_MB;
@@ -334,8 +345,21 @@ bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
     switch (info.pgm_hash) {
     case COPY_SHADER_HASH:
         return ExecuteCopyShaderHLE(info, cs_program, rasterizer);
-    case REPLICATE_SHADER_HASH:
-        return ExecuteReplicateShaderHLE(info, cs_program, rasterizer);
+    case REPLICATE_SHADER_HASH: {
+        if (!ExecuteReplicateShaderHLE(info, cs_program, rasterizer)) {
+            return false;
+        }
+        // sotc: SOTC_BIND_CACHE_RANGES: the fill writes the destination from the CPU, and the
+        // write-through path into the arena as well, without marking it CPU-modified: drop the
+        // cached binds reading any of it (the destination buffer bounds every write).
+        if (SotcStats::kBindCacheRanges && info.buffers.size() >= 3) {
+            const auto dst = info.buffers[2].GetSharp(info);
+            rasterizer.BindCacheNoteWrite(dst.base_address, dst.GetSize());
+        }
+        return true;
+    }
+    case SotcShadowCull::kProgramHash: // sotc: SOTC_HLE_SHADOW_CULL=1 (sotc_shadow_cull.cpp)
+        return SotcStats::kShadowCullHle && SotcShadowCull::Execute(info, cs_program, rasterizer);
     default:
         return false;
     }

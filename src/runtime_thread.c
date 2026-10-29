@@ -70,14 +70,18 @@ static _Thread_local GuestThread *current;
 size_t runtime_thread_suspend_others(void **out, size_t capacity) {
     size_t n=0;
     pthread_mutex_lock(&lock);
+    /* sotc: every thread is asked to stop first, then each is waited for: the stops proceed in
+     * parallel instead of one kernel round trip after the other (17+ guest threads). */
     for (GuestThread *t=threads; t && n<capacity; t=t->next) {
         if (t==current || t->finished || !t->os_handle) continue;
         HANDLE h=t->os_handle;
         if (SuspendThread(h)==(DWORD)-1) continue;
+        out[n++]=h;
+    }
+    for (size_t i=0;i<n;++i) {
         CONTEXT c;
         c.ContextFlags=CONTEXT_CONTROL;
-        GetThreadContext(h,&c); /* returns once the thread is really stopped */
-        out[n++]=h;
+        GetThreadContext(out[i],&c); /* returns once the thread is really stopped */
     }
     return n;
 }

@@ -36,6 +36,8 @@
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/buffer_cache/region_manager.h"
 #include "video_core/sotc_live.h"
+#include "video_core/sotc_adaptive.h"
+#include "video_core/sotc_write_extent.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -269,6 +271,11 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     if (regs.color_control.degamma_enable) {
         LOG_WARNING(Render_Vulkan, "Color buffers require gamma correction");
     }
+    rs_memo_prepared = false;
+    if (SotcStats::kRsMemo && RsMemoPrepare(pipeline)) { // sotc: SOTC_RS_MEMO
+        rs_memo_prepared = true;
+        return;
+    }
 
     const bool skip_cb_binding =
         regs.color_control.mode == AmdGpu::ColorControl::OperationMode::Disable;
@@ -302,6 +309,206 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     }
 }
 
+// sotc: SOTC_RS_MEMO. The memo repeats SOTC_RT_FAST's evaluation (one TestAndTouchMeta per
+// target), so it is off with SOTC_RT_FAST=0.
+static bool RsMemoEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_RT_FAST");
+        return SotcStats::kRsMemo && (!v || v[0] != '0');
+    }();
+    return enabled;
+}
+
+static constexpr size_t RsMemoMaxWords =
+    (sizeof(u32) * 2 + 8 + sizeof(AmdGpu::ColorControl) + sizeof(AmdGpu::ColorBufferMask) +
+     AmdGpu::NUM_COLOR_BUFFERS * (sizeof(AmdGpu::ColorBuffer) + sizeof(AmdGpu::CbDbExtent)) +
+     sizeof(AmdGpu::DepthControl) + sizeof(AmdGpu::DepthBuffer) + sizeof(AmdGpu::DepthView) +
+     sizeof(AmdGpu::Address) + sizeof(AmdGpu::DepthRenderControl) + sizeof(u32) + sizeof(float) +
+     sizeof(AmdGpu::CbDbExtent) + 3) /
+    4;
+
+u32 Rasterizer::RsMemoBuildKey(const GraphicsPipeline* pipeline) {
+    // Every input of PrepareRenderState and BeginRendering besides the image state: the
+    // attachment part of the pipeline key, the target registers and the extent hints.
+    static_assert(Rasterizer::RsMemoKeyWords >= RsMemoMaxWords);
+    const auto& key = pipeline->GetGraphicsKey();
+    const auto& regs = liverpool->DrawRegs();
+    u32 n = 0;
+    const auto put = [&](const auto& v) {
+        static_assert(sizeof(v) % sizeof(u32) == 0);
+        std::memcpy(rs_key.data() + n, &v, sizeof(v));
+        n += static_cast<u32>(sizeof(v) / sizeof(u32));
+    };
+    put(key.mrt_mask);
+    put(u32{key.num_samples});
+    put(key.color_samples);
+    put(regs.color_control);
+    put(regs.color_target_mask);
+    const u32 num_cb =
+        std::min<u32>(std::bit_width(key.mrt_mask), AmdGpu::NUM_COLOR_BUFFERS);
+    for (u32 cb = 0; cb < num_cb; ++cb) {
+        put(regs.color_buffers[cb]);
+        put(liverpool->DrawCbExtent()[cb]);
+    }
+    put(regs.depth_control);
+    put(regs.depth_buffer);
+    put(regs.depth_view);
+    put(regs.depth_htile_data_base);
+    put(regs.depth_render_control);
+    put(regs.stencil_clear);
+    put(regs.depth_clear);
+    put(liverpool->DrawDbExtent());
+    return n;
+}
+
+bool Rasterizer::RsMemoTargetClean(VideoCore::ImageId image_id) {
+    // What lets the full path's UpdateImage / RefreshImage / TrackImage and the needs_rebind
+    // re-lookup be skipped (the same test as TryBindCache's).
+    const auto& image = texture_cache.GetImage(image_id);
+    return image.backing && True(image.flags & VideoCore::ImageFlagBits::Registered) &&
+           False(image.flags & VideoCore::ImageFlagBits::Dirty) &&
+           image.track_addr == image.info.guest_address &&
+           image.track_addr_end == image.info.guest_address + image.info.guest_size &&
+           !image.binding.needs_rebind;
+}
+
+bool Rasterizer::RsMemoPrepare(const GraphicsPipeline* pipeline) {
+    // sotc: SOTC_RS_MEMO, under PrepareRenderState's batch lock. A miss drops the memo: the full
+    // path rewrites cb_descs / db_desc, which a later hit would read.
+    if (!RsMemoEnabled()) {
+        return false;
+    }
+    rs_key_len = RsMemoBuildKey(pipeline);
+    if (SotcStats::kFpsLog) {
+        SotcStats::rs_memo_lookups.fetch_add(1, std::memory_order_relaxed);
+    }
+    const auto miss = [&](u32 reason) {
+        rs_memo.valid = false;
+        if (SotcStats::kFpsLog) {
+            SotcStats::rs_memo_misses[reason].fetch_add(1, std::memory_order_relaxed);
+        }
+        return false;
+    };
+    if (!rs_memo.valid) {
+        return miss(SotcStats::RsMissNone);
+    }
+    if (rs_memo.tick != scheduler.CurrentTick()) {
+        return miss(SotcStats::RsMissTick);
+    }
+    if (rs_memo.texture_generation != texture_cache.BindGeneration()) {
+        return miss(SotcStats::RsMissResources);
+    }
+    if (rs_memo.key_len != rs_key_len ||
+        std::memcmp(rs_memo.key.data(), rs_key.data(), rs_key_len * sizeof(u32)) != 0) {
+        return miss(SotcStats::RsMissRegs);
+    }
+    if (!scheduler.IsRendering() || !(scheduler.GetRenderState() == rs_memo.state)) {
+        return miss(SotcStats::RsMissPass);
+    }
+    const u32 num_cb = rs_memo.state.num_color_attachments;
+    for (u32 cb = 0; cb < num_cb; ++cb) {
+        if (const auto id = cb_descs[cb].first; id && !RsMemoTargetClean(id)) {
+            return miss(SotcStats::RsMissImage);
+        }
+    }
+    if (const auto id = db_desc.first; id && !RsMemoTargetClean(id)) {
+        return miss(SotcStats::RsMissImage);
+    }
+    // The targets of this draw, as the full path marks them (ResetBindings cleared them).
+    for (u32 cb = 0; cb < num_cb; ++cb) {
+        if (const auto id = cb_descs[cb].first) {
+            bound_images.emplace_back(id);
+            texture_cache.GetImage(id).binding.is_target = 1u;
+        }
+    }
+    if (const auto id = db_desc.first) {
+        bound_images.emplace_back(id);
+        texture_cache.GetImage(id).binding.is_target = 1u;
+    }
+    return true;
+}
+
+bool Rasterizer::RsMemoBegin(RenderState& state) {
+    // sotc: SOTC_RS_MEMO, under BeginRendering's batch lock, after the binds of this draw (they
+    // may have submitted, uploaded, ended the pass, registered images or sampled a target).
+    const auto miss = [&](u32 reason) {
+        if (SotcStats::kFpsLog) {
+            SotcStats::rs_memo_misses[reason].fetch_add(1, std::memory_order_relaxed);
+        }
+        return false;
+    };
+    if (rs_memo.tick != scheduler.CurrentTick()) {
+        return miss(SotcStats::RsMissTick);
+    }
+    if (rs_memo.texture_generation != texture_cache.BindGeneration()) {
+        return miss(SotcStats::RsMissResources);
+    }
+    if (rs_memo.meta_epoch != texture_cache.MetaEpoch()) {
+        return miss(SotcStats::RsMissMeta);
+    }
+    if (!scheduler.IsRendering() || !(scheduler.GetRenderState() == rs_memo.state)) {
+        return miss(SotcStats::RsMissPass);
+    }
+    const u32 num_cb = rs_memo.state.num_color_attachments;
+    for (u32 cb = 0; cb < num_cb; ++cb) {
+        const auto id = cb_descs[cb].first;
+        if (!id) {
+            continue;
+        }
+        const auto& image = texture_cache.GetImage(id);
+        // A sampled target (feedback loop) or a backing of another sample count
+        // (SetBackingSamples would swap it) takes the full path.
+        if (!RsMemoTargetClean(id) || image.binding.is_bound ||
+            image.backing->num_samples != rs_memo.color_samples[cb]) {
+            return miss(SotcStats::RsMissImage);
+        }
+    }
+    if (const auto id = db_desc.first; id && !RsMemoTargetClean(id)) {
+        return miss(SotcStats::RsMissImage);
+    }
+
+    state = rs_memo.state;
+    for (u32 cb = 0; cb < num_cb; ++cb) {
+        auto& [image_id, desc] = cb_descs[cb];
+        if (!image_id) {
+            continue;
+        }
+        auto* image = &texture_cache.GetImage(image_id);
+        texture_cache.ReuseTarget(image_id, false);
+        needs_barrier |= runtime.Transit(image, vk::ImageLayout::eColorAttachmentOptimal,
+                                         vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                                         vk::AccessFlagBits2::eColorAttachmentWrite |
+                                             vk::AccessFlagBits2::eColorAttachmentRead,
+                                         desc.view_info.range);
+        state.color_attachments[cb].image_layout = image->backing->state.layout;
+        if (cb == 0 && image->usage.vo_surface) { // sotc: TakeHudless
+            hudless_vo = image->info.guest_address;
+            hudless_vo_format = state.color_formats[0];
+            hudless_vo_width = image->info.size.width;
+            hudless_vo_height = image->info.size.height;
+        }
+        if (cb == 0 && rs_memo.cb0_base && // sotc: BeginUiShadow
+            Dlssg::UiTarget(image->info.guest_address, image->info.size.width,
+                            image->info.size.height, ui_shadow_width, ui_shadow_height)) {
+            ui_shadow_hit = true;
+            ui_shadow_format = state.color_formats[0];
+            ui_shadow_src_width = image->info.size.width;
+            ui_shadow_src_height = image->info.size.height;
+        }
+    }
+    if (const auto image_id = db_desc.first) {
+        auto& image = texture_cache.GetImage(image_id);
+        texture_cache.ReuseTarget(image_id, true);
+        needs_barrier |= runtime.Transit(&image, rs_memo.depth_layout, rs_memo.depth_stages,
+                                         rs_memo.depth_access, db_desc.second.view_info.range);
+        state.depth_stencil_attachment.image_layout = image.backing->state.layout;
+    }
+    if (SotcStats::kFpsLog) {
+        SotcStats::rs_memo_hits.fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
 static std::pair<u32, u32> GetDrawOffsets(const AmdGpu::Regs& regs, const Shader::Info& info,
                                           const Shader::Gcn::FetchShaderData& fetch_shader) {
     u32 vertex_offset = regs.index_offset;
@@ -332,6 +539,7 @@ void Rasterizer::EliminateFastClear() {
         texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
     }
     auto& image = texture_cache.GetImage(image_id);
+    BindCacheInvalidateImage(image_id); // sotc: SOTC_BIND_CACHE_RANGES (no-op otherwise)
     const auto clear_value = LiverpoolToVK::ColorBufferClearValue(col_buf);
 
     ScopeMarkerBegin(fmt::format("EliminateFastClear:MRT={:#x}:M={:#x}", col_buf.Address(),
@@ -517,6 +725,8 @@ static void TraceShadowShaders(const Regs& regs, const Pipe* pipeline) {
 // depth target that got the most draws in the previous frame (SotC: 1024x1024, 5 slices, ~6500
 // draws per frame, 3041 of them in slice 3 and 2049 in slice 2, SOTC_PASS_TRACE). Far shadows
 // then lag one frame behind the camera; the two slices cost half as much.
+// SOTC_ADAPTIVE_LOAD never uses this skip: a skipped slice holds texels of another light matrix
+// at best and, as measured (see SOTC_SHADOW_REUSE below), none at all: missing far shadows.
 template <typename Regs>
 static bool SkipStaggeredShadow(const Regs& regs) {
     static const bool on = [] {
@@ -611,13 +821,40 @@ bool Rasterizer::ReuseShadowCascade() {
     }();
     // The in-game menu can switch it while playing (sotc_live.h).
     const int live = SotcLive::shadow_reuse.load(std::memory_order_relaxed);
-    const int mode = live >= 0 ? live : env_mode;
+    int mode = live >= 0 ? live : env_mode;
+    // sotc: SOTC_ADAPTIVE_LOAD (sotc_adaptive.h): with the reuse off by the launcher/env (and no
+    // choice in the in-game menu, which keeps priority), it is on while the governor is relieved.
+    // The governor's state is latched at the first draw of a frame, so a frame never switches
+    // between moving and drawing a cascade halfway (a pass begun after a moved part could clear
+    // it). An explicit SOTC_SHADOW_REUSE=1/check is left as it is.
+    bool adaptive = false;
+    if (mode == 0 && live < 0 && SotcAdaptive::kShadows) {
+        static u64 latch_frame = ~u64{0};
+        static bool latch = false;
+        const u64 now_frame = SotcStats::cp_frame.load(std::memory_order_relaxed);
+        if (now_frame != latch_frame) {
+            latch_frame = now_frame;
+            latch = SotcAdaptive::AmortiseShadows();
+        }
+        adaptive = latch;
+        mode = latch ? 1 : 0;
+    }
     if (mode == 0) {
         return false;
     }
     static ShadowReuseState s;
     const auto& regs = liverpool->DrawRegs(); // sotc: the draw thread's copy there
     const u64 frame = SotcStats::cp_frame.load(std::memory_order_relaxed);
+    if (frame != s.frame_seen && SotcAdaptive::kEnabled && frame != s.frame_seen + 1) {
+        // sotc: SOTC_ADAPTIVE_LOAD: frames went by untracked (the reuse was off): the counts, the
+        // matrices and "drawn last frame" are from an older frame, whose texels are gone. Start
+        // over: this frame only finds the shadow map, the next draws and records each cascade,
+        // and only the one after can move last frame's texels.
+        s.counts.clear();
+        s.sun_map = 0;
+        s.have_vp.fill(false);
+        s.drawn_now.fill(false);
+    }
     if (frame != s.frame_seen) {
         u64 most_addr = 0;
         u32 most = 0;
@@ -816,6 +1053,9 @@ bool Rasterizer::ReuseShadowCascade() {
     s.skip[slice] = moved;
     s.drawn_now[slice] = !moved;
     ++(moved ? s.scrolled : s.drawn);
+    if (moved && adaptive && SotcStats::kFpsLog) {
+        SotcStats::adaptive_amortised.fetch_add(1, std::memory_order_relaxed);
+    }
     return moved;
 }
 
@@ -1163,7 +1403,7 @@ void Rasterizer::NoteUiShadow() {
 }
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolved,
-                      bool use_resolved) {
+                      bool use_resolved, const PreparedDraw* prepared) {
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
@@ -1190,6 +1430,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
     }
     TraceGbufferShaders(regs, pipeline);
     TraceShadowShaders(regs, pipeline);
+    if (prepared) { // sotc: SOTC_PARALLEL_RECORD (SOTC_PR_VERIFY compares it)
+        prepared = CheckPrepared(*prepared, pipeline, is_indexed, true);
+    }
 
     PrepareRenderState(pipeline);
     hudless_ui_info = -1; // sotc: TakeHudless, set by BindTextures and BeginRendering
@@ -1198,7 +1441,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
         Dlssg::NoteDraw(regs, pipeline->GetGraphicsKey().mrt_mask, db_desc.first,
                         cb_descs[4].first, texture_cache, runtime, scheduler);
     }
-    if (!BindResources(pipeline)) {
+    if (!BindResources(pipeline, prepared)) {
         SotcStats::Drop(1, regs.color_buffers[0].Address(), 0);
         return;
     }
@@ -1221,12 +1464,15 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
     if (!fast_bind_hit || fast_bind.tick != scheduler.CurrentTick()) {
         pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots);
     }
-    UpdateDynamicState(pipeline, is_indexed);
+    UpdateDynamicState(pipeline, is_indexed, prepared);
     scheduler.BeginRendering(state);
 
     const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
-    const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
+    const auto [vertex_offset, instance_offset] =
+        prepared && prepared->has_offsets
+            ? std::pair<u32, u32>{prepared->vertex_offset, prepared->instance_offset}
+            : GetDrawOffsets(regs, vs_info, fetch_shader);
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
@@ -1270,7 +1516,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
                               u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
                               u16 instance_sgpr_offset, const Pipeline* resolved,
-                              bool use_resolved) {
+                              bool use_resolved, const PreparedDraw* prepared) {
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
@@ -1309,13 +1555,16 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
     TraceShadowShaders(liverpool->DrawRegs(), pipeline);
+    if (prepared) { // sotc: SOTC_PARALLEL_RECORD (SOTC_PR_VERIFY compares it)
+        prepared = CheckPrepared(*prepared, pipeline, is_indexed, false);
+    }
 
     PrepareRenderState(pipeline);
     if (Dlssg::CapturingInputs()) { // sotc: camera and inputs of DLSS (frame generation, SR)
         Dlssg::NoteDraw(liverpool->DrawRegs(), pipeline->GetGraphicsKey().mrt_mask, db_desc.first,
                         cb_descs[4].first, texture_cache, runtime, scheduler);
     }
-    if (!BindResources(pipeline)) {
+    if (!BindResources(pipeline, prepared)) {
         SotcStats::Drop(1, liverpool->DrawRegs().color_buffers[0].Address(), 1);
         return;
     }
@@ -1355,7 +1604,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         if (!fast_bind_hit || fast_bind.tick != scheduler.CurrentTick()) {
             pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots);
         }
-        UpdateDynamicState(pipeline, is_indexed);
+        UpdateDynamicState(pipeline, is_indexed, prepared);
         scheduler.BeginRendering(state);
         const auto cmdbuf = scheduler.CommandBuffer();
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
@@ -1412,7 +1661,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (!fast_bind_hit || fast_bind.tick != scheduler.CurrentTick()) {
         pipeline->BindResources(set_writes, set_write_sets, push_data, bindless_slots);
     }
-    UpdateDynamicState(pipeline, is_indexed);
+    UpdateDynamicState(pipeline, is_indexed, prepared);
     scheduler.BeginRendering(state);
 
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -1507,6 +1756,21 @@ bool Rasterizer::TaaOff() {
     // TAA comes back if super resolution is switched or turns itself off
     return forced < 0 ? Dlssg::SuperResolution() : forced == 1;
 }
+
+namespace {
+// sotc: SOTC_WRITE_EXTENT / SOTC_FPS counter: the size of the direct dispatch whose resources are
+// being bound (BindBuffers reads it). groups == 0: not a direct dispatch (graphics, indirect),
+// nothing is narrowed there.
+struct DirectDispatchScope {
+    u64 hash{}, groups{}, threads{};
+};
+thread_local DirectDispatchScope t_direct_dispatch;
+struct DirectDispatchGuard {
+    ~DirectDispatchGuard() {
+        t_direct_dispatch = {};
+    }
+};
+} // namespace
 
 void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
     RENDERER_TRACE;
@@ -1603,6 +1867,18 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
         return;
     }
 
+    // sotc: dispatch size for BindBuffers (SOTC_WRITE_EXTENT, "SOTC GPU writes by shader"). A
+    // non-zero start offset shifts the thread ids: no extent then (groups stays 0), counter only.
+    const DirectDispatchGuard dispatch_guard;
+    if (SotcWriteExtent::kEnabled || SotcStats::kFpsLog) {
+        const u64 groups = u64{cs_program.dim_x} * cs_program.dim_y * cs_program.dim_z;
+        const u64 local = u64{std::max<u32>(cs_program.num_thread_x.full, 1)} *
+                          std::max<u32>(cs_program.num_thread_y.full, 1) *
+                          std::max<u32>(cs_program.num_thread_z.full, 1);
+        const bool plain = cs_program.start_x == 0 && cs_program.start_y == 0 &&
+                           cs_program.start_z == 0 && groups != 0;
+        t_direct_dispatch = {cs.pgm_hash, plain ? groups : 0, groups * local};
+    }
     if (!BindResources(pipeline)) {
         SotcStats::Drop(3, cs_program.Address<uintptr_t>(), 0);
         return;
@@ -1707,10 +1983,15 @@ void Rasterizer::RefreshImageLayouts() {
 }
 
 bool Rasterizer::FastBindEligible(const Pipeline* pipeline) const {
-    if (!SotcStats::kFastBind || pipeline->IsCompute() || attachment_feedback_loop) {
+    return !attachment_feedback_loop && FastBindStatic(pipeline, liverpool->DrawRegs());
+}
+
+bool Rasterizer::FastBindStatic(const Pipeline* pipeline, const AmdGpu::Regs& regs) const {
+    // sotc: FastBindEligible without its draw-thread input (attachment_feedback_loop): the
+    // registers and the pipeline only, so SOTC_PARALLEL_RECORD's prep threads can run it.
+    if (!SotcStats::kFastBind || pipeline->IsCompute()) {
         return false;
     }
-    const auto& regs = liverpool->DrawRegs();
     if (regs.clipper_control.user_clip_plane_enable != 0) {
         return false;
     }
@@ -1745,7 +2026,12 @@ bool Rasterizer::FastBindEligible(const Pipeline* pipeline) const {
 }
 
 u64 Rasterizer::FastBindHash(const Pipeline* pipeline, const Shader::PushData& push_data) const {
-    const auto& regs = liverpool->DrawRegs();
+    return FastBindHash(pipeline, push_data, liverpool->DrawRegs());
+}
+
+u64 Rasterizer::FastBindHash(const Pipeline* pipeline, const Shader::PushData& push_data,
+                             const AmdGpu::Regs& regs) const {
+    // sotc: the user data and flat buffers are this thread's (Shader::g_info_slot).
     u64 hash = XXH3_64bits(&pipeline, sizeof(pipeline));
     hash = XXH3_64bits_withSeed(&push_data, sizeof(push_data), hash);
     for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
@@ -1770,10 +2056,82 @@ u64 Rasterizer::FastBindHash(const Pipeline* pipeline, const Shader::PushData& p
     return hash;
 }
 
+namespace {
+/// sotc: SOTC_BIND_CACHE_FRAME. A stage's identity for the bind cache key: its shader and the
+/// descriptor layout (kinds and order) a cached entry's writes name.
+u64 BindCacheStageIdentity(const Shader::Info& stage) {
+    const u64 words[3] = {stage.pgm_hash,
+                          (u64{stage.buffers.size()} << 40) | (u64{stage.images.size()} << 20) |
+                              u64{stage.samplers.size()},
+                          static_cast<u64>(stage.sw_stage)};
+    u64 ident = XXH3_64bits(words, sizeof(words));
+    u64 layout = 0;
+    for (const auto& b : stage.buffers) {
+        layout = layout * 0x100000001B3ULL + ((u64{static_cast<u8>(b.buffer_type)} << 2) |
+                                              (u64{b.is_written} << 1) | u64{b.is_formatted});
+    }
+    for (const auto& i : stage.images) {
+        layout = layout * 0x100000001B3ULL +
+                 (u64{i.is_depth} | (u64{i.is_array} << 1) | (u64{i.is_written} << 2) |
+                  (u64{i.array_size} << 3) | (u64{i.is_r128} << 20) |
+                  (u64{static_cast<u16>(i.mip_fallback_mode)} << 24));
+    }
+    for (const auto& smp : stage.samplers) {
+        layout = layout * 0x100000001B3ULL + u64{smp.is_depth} + 7;
+    }
+    return XXH3_64bits_withSeed(&layout, sizeof(layout), ident);
+}
+} // namespace
+
+bool Rasterizer::BindResourceHash(const Pipeline* pipeline, u64& out) const {
+    // sotc: SOTC_BIND_CACHE_FRAME. What the descriptors of a bind are made of: the pipeline, the
+    // T#/V#/S# words each stage reads (GetSharp: the flat buffer words located by the stage's
+    // sharp fetches, with the post operations, exactly what BindBuffers / BindTextures use) and
+    // the stage identity. The rest of the flat buffer (user data registers, SRT pointers and
+    // values: constants the shader reads from its stream-ring copy, which a hit re-copies) and
+    // the viewport words of the push data are not in the key. A pointer the shader dereferences
+    // by itself (DMA), a table or an array it indexes at run time are resources chosen by
+    // constants: those pipelines return false and keep the full key.
+    u64 hash = 0x4C32525300000001ULL;
+    hash = XXH3_64bits_withSeed(&pipeline, sizeof(pipeline), hash);
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        if (stage->uses_dma || !stage->sharp_tables.empty() || !stage->fmasks.empty() ||
+            stage->has_storage_images || stage->UserData().data() == nullptr) {
+            return false;
+        }
+        for (const auto& image : stage->images) {
+            if (image.array_size != 0) {
+                return false;
+            }
+        }
+        const u64 ident = BindCacheStageIdentity(*stage);
+        hash = XXH3_64bits_withSeed(&ident, sizeof(ident), hash);
+        for (const auto& desc : stage->buffers) {
+            if (!desc.IsSpecial()) {
+                const auto sharp = desc.GetSharp(*stage);
+                hash = XXH3_64bits_withSeed(&sharp, sizeof(sharp), hash);
+            }
+        }
+        for (const auto& image : stage->images) {
+            const auto sharp = image.GetSharp(*stage);
+            hash = XXH3_64bits_withSeed(&sharp, sizeof(sharp), hash);
+        }
+        for (const auto& sampler : stage->samplers) {
+            const auto sharp = sampler.GetSharp(*stage);
+            hash = XXH3_64bits_withSeed(&sharp, sizeof(sharp), hash);
+        }
+    }
+    out = hash;
+    return true;
+}
+
 void Rasterizer::CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dma) {
     fast_bind.pipeline = pipeline;
     fast_bind.hash = hash;
-    fast_bind.buffer_generation = buffer_cache.BindGeneration();
+    fast_bind.buffer_generation = BufferBindGeneration(); // sotc: BindVersion with BIND_CACHE_XTICK
     fast_bind.texture_generation = texture_cache.BindGeneration();
     fast_bind.stream_generation = buffer_cache.StreamGeneration();
     fast_bind.mem_epoch = SotcStats::mem_epoch.load(std::memory_order_relaxed);
@@ -1782,10 +2140,47 @@ void Rasterizer::CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dm
     fast_bind.valid = true;
 }
 
-bool Rasterizer::BindResources(const Pipeline* pipeline) {
+bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* prepared) {
+    // sotc: writes recorded during this bind follow its command into the tick it lands in.
+    buffer_cache.BeginWriteScope();
+    struct WriteScopeGuard {
+        VideoCore::BufferCache& cache;
+        ~WriteScopeGuard() {
+            cache.EndWriteScope();
+        }
+    } write_scope_guard{buffer_cache};
     fast_bind_hit = false;
+    // sotc: SOTC_BIND_CACHE: flush the cached binds when the state they were made in moved, or
+    // when this bind is not a read-only graphics bind (its writes and copies run before them).
+    // sotc: SOTC_PARALLEL_RECORD: `prepared` holds the register-only inputs of this bind
+    // (eligibility, push data, FastBindHash), computed ahead by a prep thread.
+    const bool cache_eligible =
+        SotcStats::kBindCache &&
+        (prepared ? prepared->cache_eligible : BindCacheEligible(pipeline));
+    if (SotcStats::kBindCache) {
+        if (SotcStats::kBindCacheFrame) {
+            BindCacheSyncFrame(pipeline, cache_eligible);
+        } else {
+            BindCacheSync(pipeline, cache_eligible);
+        }
+    }
+    bind_memo_ok = SotcStats::kBindCacheFrame && cache_eligible; // sotc: SOTC_BIND_CACHE_FRAME
+    compute_written_image = {};
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
+        // sotc: SOTC_BIND_CACHE_RANGES: these replace the dispatch by an image copy / clear or a
+        // metadata state change, with no write recorded by range: every cached bind dies.
+        // sotc: SOTC_BIND_CACHE_FRAME: an image copy or clear is a GPU write to one image, which
+        // is what BindCacheInvalidateImage drops the readers of (as Resolve and DepthStencilCopy
+        // do); the metadata state change has no range and still flushes everything.
+        if (SotcStats::kBindCacheFrame && compute_written_image) {
+            BindCacheInvalidateImage(compute_written_image);
+            if (SotcStats::kFpsLog) {
+                SotcStats::bf_narrowed.fetch_add(1, std::memory_order_relaxed);
+            }
+        } else if (SotcStats::kBindCacheRanges) {
+            BindCacheFlush(SotcStats::BindCacheUnsafe);
+        }
         static const bool drop_trace = std::getenv("SOTC_DROP_TRACE") != nullptr;
         if (drop_trace) {
             static int shown = 0;
@@ -1831,16 +2226,17 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     // sotc: the previous draw left these descriptors and push constants bound. Skip rebuilding
     // them when this draw needs exactly the same pipeline, push data, render targets and
     // resource handles. The generation bumps catch reallocated buffers/images and dead samplers.
-    const bool fast_eligible = FastBindEligible(pipeline);
+    const bool fast_eligible = prepared ? prepared->fast_static && !attachment_feedback_loop
+                                        : FastBindEligible(pipeline);
     u64 fast_hash = 0;
     if (fast_eligible) {
         SotcStats::fast_bind_eligible.fetch_add(1, std::memory_order_relaxed);
-        const auto input_push = MakeUserData(liverpool->DrawRegs());
-        fast_hash = FastBindHash(pipeline, input_push);
+        const auto input_push = prepared ? prepared->push_data : MakeUserData(liverpool->DrawRegs());
+        fast_hash = prepared ? prepared->fast_hash : FastBindHash(pipeline, input_push);
         // Same state as the last full bind, ignoring the submit tick (SOTC_FASTBIND_WIDE needs it).
         const bool fast_state_same =
             fast_bind.valid && fast_bind.pipeline == pipeline &&
-            fast_bind.buffer_generation == buffer_cache.BindGeneration() &&
+            fast_bind.buffer_generation == BufferBindGeneration() &&
             fast_bind.texture_generation == texture_cache.BindGeneration() &&
             fast_bind.stream_generation == buffer_cache.StreamGeneration() &&
             fast_bind.mem_epoch == SotcStats::mem_epoch.load(std::memory_order_relaxed) &&
@@ -1879,7 +2275,78 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         push_data = input_push;
     } else {
         fast_bind.valid = false;
-        push_data = MakeUserData(liverpool->DrawRegs());
+        push_data = prepared ? prepared->push_data : MakeUserData(liverpool->DrawRegs());
+    }
+
+    // sotc: SOTC_BIND_CACHE: the same state as an earlier full bind of this submit.
+    size_t first_bound_buffer = 0;
+    u64 cache_hash = 0;
+    if (cache_eligible) {
+        // The border colour table of custom-border samplers (GetSampler) is a register too.
+        const u64 bc_base = liverpool->DrawRegs().ta_bc_base.Address();
+        bind_level2 = false;
+        if (SotcStats::kBindCacheFrame) {
+            // sotc: SOTC_BIND_CACHE_FRAME: the key is the pipeline and the resources it binds
+            // (BindResourceHash); the constants around them are refreshed by the hit. A pipeline
+            // that binds by constants keeps the full key below.
+            u64 res_hash = 0;
+            const bool res_ok = prepared ? prepared->res_ok : BindResourceHash(pipeline, res_hash);
+            if (prepared) {
+                res_hash = prepared->res_hash;
+            }
+            if (res_ok) {
+                cache_hash = XXH3_64bits_withSeed(&bc_base, sizeof(bc_base), res_hash);
+                bind_level2 = true;
+            }
+        }
+        if (!bind_level2) {
+            cache_hash = fast_eligible ? fast_hash
+                         : prepared    ? prepared->fast_hash
+                                       : FastBindHash(pipeline, push_data);
+            cache_hash = XXH3_64bits_withSeed(&bc_base, sizeof(bc_base), cache_hash);
+            if (SotcStats::kBindCacheFrame) {
+                // sotc: entries now outlive many frames: a pipeline erased and another made at the
+                // same address must not take its entries, so the stages' identity is in the key.
+                u64 ident = 0;
+                for (const auto* stage : pipeline->GetStages()) {
+                    if (stage) {
+                        const u64 id = BindCacheStageIdentity(*stage);
+                        ident = XXH3_64bits_withSeed(&id, sizeof(id), ident);
+                    }
+                }
+                cache_hash = XXH3_64bits_withSeed(&ident, sizeof(ident), cache_hash);
+            }
+        }
+        bind_input_push = push_data; // the draw's own viewport words (refreshed on a hit)
+        if (bool hit_dma = false; SotcStats::kBindCacheFrame
+                                      ? TryBindCacheFrame(pipeline, cache_hash, hit_dma)
+                                      : TryBindCache(pipeline, cache_hash, hit_dma)) {
+            // The arrays now hold this state: the next identical draw may take the fast bind.
+            if (fast_eligible) {
+                CommitFastBind(pipeline, fast_hash, hit_dma);
+            }
+            return true;
+        }
+        bind_cache_recording = true;
+        bind_cache_uncacheable = false;
+        bind_cache_images_rec.clear();
+        bind_cache_lod_rec.clear();
+        bind_cache_ranges_rec.clear();
+        bind_cache_repairs_rec.clear();  // sotc: SOTC_BIND_CACHE_XTICK
+        bind_cache_samplers_rec.clear(); // sotc: SOTC_BIND_CACHE_XTICK
+        if (SotcStats::kBindCacheFrame) { // sotc: what the entry depends on, from this point on
+            bind_cache_lookups_rec.clear();
+            bind_cache_texel_rec.clear();
+            bind_cache_stream_rec = false;
+            bind_cache_map_dep_rec = false;
+            bind_rec_tex_seq = texture_cache.ImageChangeSeq();
+            bind_rec_write_seq = write_stamps.Seq();
+            bind_rec_map_epoch = MapEpoch();
+            bind_rec_gpu_epoch = VideoCore::gpu_modified_epoch.load(std::memory_order_relaxed);
+            bind_cache_tail_rec = false;
+            bind_cache_flat_rec.clear();
+        }
+        first_bound_buffer = bound_buffers.size();
     }
 
     set_write_index = 0;
@@ -1894,10 +2361,13 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
     const bool staged = pipeline->UsesStageSets();
+    u32 stage_counter = ~0u;
     for (const auto* stage : pipeline->GetStages()) {
+        ++stage_counter;
         if (!stage) {
             continue;
         }
+        cur_bind_stage = stage_counter; // sotc: SOTC_BIND_CACHE_FRAME (flat buffer slots)
         // sotc: SOTC_STAGE_BINDINGS: each stage numbers its descriptors from 0 in its own set. The
         // buffer count runs on across the stages: it indexes the push constant offsets they share.
         const u32 set = staged ? Shader::StageDescriptorSet(stage->sw_stage) : 0u;
@@ -1922,8 +2392,1251 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     if (fast_eligible) {
         CommitFastBind(pipeline, fast_hash, uses_dma);
     }
+    if (bind_cache_recording) {
+        bind_cache_recording = false;
+        if (SotcStats::kBindCacheFrame) {
+            CommitBindCacheFrame(pipeline, cache_hash, uses_dma, first_bound_buffer);
+        } else {
+            CommitBindCache(pipeline, cache_hash, uses_dma, first_bound_buffer);
+        }
+    }
 
     return true;
+}
+
+bool Rasterizer::BindCacheEligible(const Pipeline* pipeline) const {
+    return BindCacheEligible(pipeline, liverpool->DrawRegs());
+}
+
+bool Rasterizer::BindCacheEligible(const Pipeline* pipeline, const AmdGpu::Regs& regs) const {
+    // sotc: SOTC_BIND_CACHE: graphics binds whose resources are all read-only (as FastBindEligible,
+    // bindless sampler stages included: their heap slots are kept in the entry). A bind that
+    // writes buffers or images, compute included, is not eligible and flushes the cache.
+    if (pipeline->IsCompute() || regs.clipper_control.user_clip_plane_enable != 0) {
+        return false;
+    }
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        if (stage->has_storage_images || !stage->fmasks.empty()) {
+            return false;
+        }
+        for (const auto& desc : stage->buffers) {
+            if (desc.buffer_type == Shader::BufferType::SharedMemory) {
+                return false;
+            }
+            if (desc.is_written && (!desc.IsSpecial() ||
+                                    desc.buffer_type == Shader::BufferType::GdsBuffer)) {
+                return false;
+            }
+        }
+        for (const auto& desc : stage->images) {
+            if (desc.is_written) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void Rasterizer::BindCacheFlush(u32 reason) {
+    if (bind_cache_live == 0) {
+        return;
+    }
+    if (SotcStats::kBindCacheFrame) {
+        // sotc: SOTC_BIND_CACHE_FRAME: older entries are dropped when a lookup finds them.
+        ++bind_cache_flush_gen;
+        if (SotcStats::kFpsLog) {
+            SotcStats::bind_cache_flushes[reason].fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    for (auto& entry : bind_cache) {
+        entry.valid = false;
+    }
+    bind_cache_live = 0;
+    if (SotcStats::kFpsLog) {
+        SotcStats::bind_cache_flushes[reason].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void Rasterizer::BindCacheSync(const Pipeline* pipeline, bool eligible) {
+    BindCacheState now{
+        .tick = scheduler.CurrentTick(),
+        .buffer_generation = BufferBindGeneration(),
+        .texture_generation = texture_cache.BindGeneration(),
+        .stream_generation = buffer_cache.StreamGeneration(),
+        .mem_epoch = SotcStats::mem_epoch.load(std::memory_order_relaxed),
+        .write_epoch = bind_cache_write_epoch.load(std::memory_order_relaxed),
+    };
+    if (!pipeline->IsCompute()) {
+        // The targets PrepareRenderState found for this draw (cb_descs past the MRT count are
+        // stale, so they are left out).
+        const auto& key = static_cast<const GraphicsPipeline*>(pipeline)->GetGraphicsKey();
+        const u32 num_cb = std::min<u32>(std::bit_width(key.mrt_mask), AmdGpu::NUM_COLOR_BUFFERS);
+        for (u32 cb = 0; cb < num_cb; ++cb) {
+            now.targets[cb] = cb_descs[cb].first;
+        }
+        now.targets[AmdGpu::NUM_COLOR_BUFFERS] = db_desc.first;
+    } else if (SotcStats::kBindCacheRanges) {
+        // A dispatch renders into no target: the draws after it still use the targets the
+        // entries were made with when the draws before it did.
+        now.targets = bind_cache_state.targets;
+    }
+    const auto& old = bind_cache_state;
+    if (SotcStats::kBindCacheRanges) {
+        // sotc: SOTC_BIND_CACHE_RANGES. The tick, resource generation and render target rules
+        // stay. Writes no longer flush everything: each one drops the entries reading what it
+        // writes (BindCacheInvalidate), and guest memory changes are left to the checks of each
+        // hit. Why that covers every writer (TryBindCache refuses a CPU-modified buffer range,
+        // and a Dirty, untracked, unregistered or re-bound image):
+        //  - guest CPU writes to tracked pages fault: Rasterizer::InvalidateMemory(OnGuestFault)
+        //    -> MemoryTracker::InvalidateRegion sets the CPU bit (directly, or after the readback
+        //    of a GPU-written page in MarkWrittenByGuest; a page still GPU-pending stays protected
+        //    and the write faults again), and TextureCache::InvalidateMemory marks the images
+        //    CpuDirty / MaybeCpuDirty or untracks them. Pages left writable (fault grace, hot
+        //    pages, write-ahead) keep their CPU bit, as the comment in TryBindCache says.
+        //  - command processor writes done on the host (WRITE_DATA, DUMP_CONST_RAM, the CPU paths
+        //    of FillBuffer / CopyBuffer, fence and label writes) are CPU writes: they fault the
+        //    same way on a protected page, or call InvalidateMemory (labels, video decode).
+        //  - unmaps (DropGpuModified, fast or not) mark the range CPU-modified; freed images
+        //    move the texture generation (resources flush).
+        //  - shader HLE: the replicate fill writes the backing (TryReplaceFromCpu marks it
+        //    CPU-modified; TryWriteThroughFromCpu also copies it into the arena) and the copy
+        //    shader writes the arena: both call BindCacheNoteWrite (vk_shader_hle.cpp).
+        //  - readbacks write guest memory with what the GPU already holds: nothing to drop.
+        //  - GPU writes: written buffers and storage images of non-eligible binds (BindBuffers,
+        //    BindTextures) and their render targets (below), GPU fills and copies (FillBuffer,
+        //    CopyBuffer; GDS is not guest memory and its barrier is replayed by a hit), Resolve,
+        //    DepthStencilCopy and EliminateFastClear call BindCacheInvalidate; the compute
+        //    image copy / clear / metadata clear paths flush (BindResources).
+        // Inputs a hit cannot revalidate are not stored at all (BindBuffers): texel buffers at an
+        // image's address (ObtainBuffer re-tiles a GPU-written image into them on every bind)
+        // and stream-buffer copies (a snapshot of guest memory, SOTC_STREAM_THRESHOLD).
+        // sotc: SOTC_BIND_CACHE_XTICK: the tick is not a flush reason. What it protected is
+        // replayed by the first hit of each entry in a new tick (TryBindCache): the image and
+        // sampler stamps and the block stamps; descriptors, push data, transitions and buffer
+        // access checks are re-issued by every hit anyway.
+        if (now.tick != old.tick && !SotcStats::kBindCacheXtick) {
+            BindCacheFlush(SotcStats::BindCacheTick);
+        } else if (now.buffer_generation != old.buffer_generation ||
+                   now.texture_generation != old.texture_generation ||
+                   now.stream_generation != old.stream_generation) {
+            BindCacheFlush(SotcStats::BindCacheResources);
+        } else if (now.targets != old.targets) {
+            BindCacheFlush(SotcStats::BindCacheTargets);
+        }
+        bind_cache_state = now;
+        // A draw that writes buffers or images is not eligible: its render targets are written
+        // along with the rest (BindBuffers / BindTextures drop the entries for those).
+        if (!eligible && !pipeline->IsCompute() && bind_cache_live != 0) {
+            const auto& key = static_cast<const GraphicsPipeline*>(pipeline)->GetGraphicsKey();
+            const u32 num_cb =
+                std::min<u32>(std::bit_width(key.mrt_mask), AmdGpu::NUM_COLOR_BUFFERS);
+            for (u32 cb = 0; cb < num_cb; ++cb) {
+                if (const auto id = cb_descs[cb].first) {
+                    BindCacheInvalidateImage(id);
+                }
+            }
+            if (const auto id = db_desc.first) {
+                BindCacheInvalidateImage(id);
+            }
+        }
+        return;
+    }
+    if (!eligible || now.write_epoch != old.write_epoch) {
+        BindCacheFlush(SotcStats::BindCacheUnsafe);
+    } else if (now.tick != old.tick) {
+        BindCacheFlush(SotcStats::BindCacheTick);
+    } else if (now.mem_epoch != old.mem_epoch) {
+        BindCacheFlush(SotcStats::BindCacheMemory);
+    } else if (now.buffer_generation != old.buffer_generation ||
+               now.texture_generation != old.texture_generation ||
+               now.stream_generation != old.stream_generation) {
+        BindCacheFlush(SotcStats::BindCacheResources);
+    } else if (now.targets != old.targets) {
+        BindCacheFlush(SotcStats::BindCacheTargets);
+    }
+    bind_cache_state = now;
+}
+
+void Rasterizer::BindCacheNoteImage(VideoCore::ImageId image_id, vk::ImageLayout layout,
+                                    vk::PipelineStageFlags2 stages, vk::AccessFlags2 access,
+                                    const VideoCore::SubresourceRange& range) {
+    // The depth target of this draw sampled: its layout depends on registers outside the key
+    // (stencil enable), so the bind is not stored.
+    if (image_id == db_desc.first) {
+        bind_cache_uncacheable = true;
+        return;
+    }
+    // Called under BindTextures' batch lock: the image info is stable here.
+    const auto& info = texture_cache.GetImage(image_id).info;
+    const VAddr guest_lo = info.guest_address - info.sotc_dropped_bytes; // a mip tail: its chain
+    const u64 uid = texture_cache.GetImage(image_id).image_uid;
+    bind_cache_images_rec.push_back({image_id, layout, stages, access, range, guest_lo,
+                                     info.guest_address + info.guest_size, uid});
+}
+
+void Rasterizer::BindCacheInvalidate(VAddr addr, u64 size, VideoCore::ImageId image) {
+    if (SotcStats::kBindCacheFrame) { // sotc: SOTC_BIND_CACHE_FRAME
+        BindCacheInvalidateFrame(addr, size, image);
+        return;
+    }
+    // sotc: SOTC_BIND_CACHE_RANGES. 32 entries: a linear scan, most rejected by the bounds.
+    if (bind_cache_live == 0) {
+        return;
+    }
+    const VAddr end = addr + size;
+    const auto overlaps = [&](VAddr lo, VAddr hi) { return size != 0 && lo < end && addr < hi; };
+    u32 dropped = 0;
+    for (auto& entry : bind_cache) {
+        if (!entry.valid) {
+            continue;
+        }
+        bool hit = false;
+        if (image) {
+            for (const auto& img : entry.images) {
+                if (img.id == image) {
+                    hit = true;
+                    break;
+                }
+            }
+        }
+        if (!hit && overlaps(entry.lo, entry.hi)) {
+            for (const auto& [lo, len] : entry.ranges) {
+                if (overlaps(lo, lo + len)) {
+                    hit = true;
+                    break;
+                }
+            }
+            for (size_t i = 0; !hit && i < entry.images.size(); ++i) {
+                hit = overlaps(entry.images[i].guest_lo, entry.images[i].guest_hi);
+            }
+        }
+        if (hit) {
+            entry.valid = false;
+            --bind_cache_live;
+            ++dropped;
+        }
+    }
+    if (SotcStats::kFpsLog) {
+        SotcStats::bind_cache_range_writes.fetch_add(1, std::memory_order_relaxed);
+        if (dropped) {
+            SotcStats::bind_cache_range_entries.fetch_add(dropped, std::memory_order_relaxed);
+        }
+    }
+}
+
+void Rasterizer::BindCacheInvalidateImage(VideoCore::ImageId image_id) {
+    // sotc: SOTC_BIND_CACHE_FRAME notes the write even with an empty cache: a bind in flight stores
+    // its entry afterwards and compares it with the writes noted since it began.
+    if (!SotcStats::kBindCacheRanges || (bind_cache_live == 0 && !SotcStats::kBindCacheFrame) ||
+        !image_id) {
+        return;
+    }
+    const auto& info = texture_cache.GetImage(image_id).info;
+    const VAddr lo = info.guest_address - info.sotc_dropped_bytes;
+    BindCacheInvalidate(lo, info.guest_address + info.guest_size - lo, image_id);
+}
+
+void Rasterizer::BindCacheNoteWrite(VAddr addr, u64 size) {
+    if (SotcStats::kBindCacheRanges) {
+        BindCacheInvalidate(addr, size);
+    }
+}
+
+bool Rasterizer::TryBindCache(const Pipeline* pipeline, u64 hash, bool& uses_dma) {
+    // sotc: SOTC_BIND_CACHE. BindCacheSync has just flushed every entry made in another tick,
+    // with other guest memory, other resident buffers / images / samplers / stream ring, other
+    // render targets, or before a GPU write; a live entry is the result of a full bind of this
+    // very state (same pipeline and FastBindHash inputs) in this command buffer, after which
+    // only read-only draws into these same targets ran. With SOTC_BIND_CACHE_RANGES, other
+    // binds and DMA may have run too, none of them writing what the entry reads
+    // (BindCacheInvalidate), and guest memory may have changed: the checks below catch that.
+    if (SotcStats::kFpsLog) {
+        SotcStats::bind_cache_lookups.fetch_add(1, std::memory_order_relaxed);
+        if (SotcStats::kBindCacheXtick) {
+            // sotc: SOTC_BIND_CACHE_XTICK: was this key looked up in the previous game frame too?
+            const u64 frame = SotcStats::cp_frame.load(std::memory_order_relaxed);
+            auto& seen = bind_seen[(hash ^ (hash >> 29)) % bind_seen.size()];
+            bool prev_frame = false;
+            if (seen.hash == hash) {
+                prev_frame = seen.frame_last == frame ? seen.frame_prev + 1 == frame
+                                                      : seen.frame_last + 1 == frame;
+                if (seen.frame_last != frame) {
+                    seen.frame_prev = seen.frame_last;
+                    seen.frame_last = frame;
+                }
+            } else {
+                seen = {hash, frame, 0};
+            }
+            if (prev_frame) {
+                SotcStats::bind_cache_seen_prev_frame.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    BindCacheEntry* entry = nullptr;
+    for (auto& e : bind_cache) {
+        if (e.valid && e.pipeline == pipeline && e.hash == hash) {
+            entry = &e;
+            break;
+        }
+    }
+    if (!entry) {
+        return false;
+    }
+    const auto refuse = [] {
+        if (SotcStats::kFpsLog) {
+            SotcStats::bind_cache_refused.fetch_add(1, std::memory_order_relaxed);
+        }
+        return false;
+    };
+    const bool xtick = SotcStats::kBindCacheXtick;
+    u64 current_tick = scheduler.CurrentTick();
+    // sotc: SOTC_BIND_CACHE_XTICK. What a full bind does once per submit tick (or per use epoch)
+    // that a hit would skip, and how it is replayed here, for an entry made in an earlier tick:
+    //  - TextureCache::FindImage: tick_prev_accessed / tick_accessed_last stamps and the LRU
+    //    touch of each sampled image (the image GC and the host image copy idle test read them):
+    //    TextureCache::NoteBoundUse below, once per entry and tick.
+    //  - TextureCache::GetSampler: the sampler LRU touch (an untouched sampler is collected,
+    //    which moves the texture generation and flushes the cache): GetSampler again, checked
+    //    to return the same handle and bindless slot.
+    //  - BufferCache::EnsureResident: block_last_use stamps (MaybeEvictCold's idle test): one
+    //    stamping per use epoch (seconds), BufferCache::NoteBindUse.
+    //  - memory->ClampRangeSize of each V#: the mapped extent the binding was made for (a guest
+    //    unmap or a map next to it); checked once per tick and before every repair.
+    // Not needed: descriptor and push data (re-issued by every hit), image layout transitions
+    // and buffer access barriers (replayed by every hit), SotcLod marks (every hit), the stream
+    // buffer (its wrap generation is a flush reason), the resident set (BindVersion is a flush
+    // reason: removals and arena replacement; additions move nothing a binding holds).
+    bool replay = xtick && entry->stamp_tick != current_tick;
+    bool mapping_checked = false;
+    const auto mapping_changed = [&] {
+        mapping_checked = true;
+        for (const auto& r : entry->repairs) {
+            if (memory->ClampRangeSize(r.addr, r.vsize) != r.mapped) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (replay && mapping_changed()) {
+        entry->valid = false;
+        --bind_cache_live;
+        return refuse();
+    }
+    if (xtick && buffer_cache.BindVersion() != bind_cache_state.buffer_generation) {
+        BindCacheFlush(SotcStats::BindCacheResources); // an unmap / eviction since BindCacheSync
+        return false;
+    }
+    // ObtainBuffer would upload CPU-modified pages. Pages kept writable after a fault (fault
+    // grace, SOTC_HOT_PAGES) take guest writes without moving mem_epoch: checked per range.
+    if (!xtick) {
+        for (const auto& [addr, size] : entry->ranges) {
+            if (buffer_cache.IsRegionCpuModified(addr, size)) {
+                return refuse();
+            }
+        }
+    } else {
+        // SOTC_BIND_CACHE_XTICK: repair instead of refusing. A CPU-modified range is
+        // synchronized as ObtainBuffer does (the same arena and arguments: the cached handle is
+        // still the binding, BindVersion), if the guest mapping under it is still the one the
+        // entry was made for; the descriptors stay valid. Images and the rest still refuse.
+        u32 repaired = 0;
+        for (const auto& r : entry->repairs) {
+            if (!r.arena || !buffer_cache.IsRegionCpuModified(r.addr, r.size)) {
+                continue;
+            }
+            if (memory->ClampRangeSize(r.addr, r.vsize) != r.mapped) {
+                return refuse();
+            }
+            buffer_cache.SynchronizeBinding(r.arena, r.addr, r.size, r.texel);
+            ++repaired;
+        }
+        if (repaired != 0) {
+            // The upload may have submitted, evicted or wrapped the stream ring: the entry would
+            // be stale. Nothing of this hit has been replayed yet, the full bind follows.
+            if (buffer_cache.BindVersion() != bind_cache_state.buffer_generation ||
+                buffer_cache.StreamGeneration() != bind_cache_state.stream_generation) {
+                BindCacheFlush(SotcStats::BindCacheResources);
+                return false;
+            }
+            // sotc: the synchronization may have dropped this very entry (a BindCacheInvalidate
+            // for a range it reads, reached through the upload); a dropped entry is not replayed.
+            if (!entry->valid) {
+                return false;
+            }
+            if (SotcStats::kFpsLog) {
+                SotcStats::bind_cache_xtick_repaired.fetch_add(1, std::memory_order_relaxed);
+            }
+            // The synchronization may have submitted: the stamps are for the tick being recorded.
+            current_tick = scheduler.CurrentTick();
+            replay = entry->stamp_tick != current_tick;
+            if (replay && !mapping_checked && mapping_changed()) {
+                entry->valid = false;
+                --bind_cache_live;
+                return refuse();
+            }
+        }
+    }
+    if (xtick && replay) {
+        for (const auto& s : entry->samplers) {
+            u32 slot = 0;
+            const vk::Sampler handle = texture_cache.GetSampler(
+                s.sharp, liverpool->DrawRegs().ta_bc_base, s.is_depth, &slot); // as BindTextures
+            if (handle != s.handle || slot != s.slot) {
+                entry->valid = false;
+                --bind_cache_live;
+                return refuse();
+            }
+        }
+    }
+    {
+        const auto texture_lock = texture_cache.BatchLock();
+        // The guest may unmap (unregister) images from its own threads: checked under the lock.
+        if (texture_cache.BindGeneration() != bind_cache_state.texture_generation) {
+            BindCacheFlush(SotcStats::BindCacheResources);
+            return false;
+        }
+        // What the full bind would do differently: an image to upload again or re-track
+        // (TextureCache::UpdateImage), one replaced since (needs_rebind), or one that became a
+        // target or storage image of this draw (general / feedback loop layouts).
+        for (const auto& img : entry->images) {
+            const auto& image = texture_cache.GetImage(img.id);
+            const bool ok =
+                True(image.flags & VideoCore::ImageFlagBits::Registered) &&
+                False(image.flags & VideoCore::ImageFlagBits::Dirty) &&
+                image.track_addr == image.info.guest_address &&
+                image.track_addr_end == image.info.guest_address + image.info.guest_size &&
+                !image.binding.needs_rebind && !image.binding.force_general &&
+                !image.binding.is_target && img.id != db_desc.first;
+            if (!ok) {
+                return refuse();
+            }
+        }
+        // The side effects of BindTextures' second pass: bound for this draw (BeginRendering's
+        // feedback test, ResetBindings), and in the layout the descriptors name, with a barrier
+        // when another command changed it since.
+        for (const auto& img : entry->images) {
+            auto& image = texture_cache.GetImage(img.id);
+            image.binding.is_bound = 1u;
+            bound_images.emplace_back(img.id);
+            needs_barrier |= runtime.Transit(&image, img.layout, img.stages, img.access, img.range);
+            image.usage.texture = 1u;
+            if (replay) {
+                texture_cache.NoteBoundUse(img.id); // sotc: SOTC_BIND_CACHE_XTICK, see above
+            }
+        }
+    }
+    if (xtick) {
+        entry->stamp_tick = current_tick;
+        if (const u16 epoch = buffer_cache.UseEpoch(); entry->stamp_epoch != epoch) {
+            for (const auto& r : entry->repairs) {
+                if (r.arena) {
+                    buffer_cache.NoteBindUse(r.addr, r.size);
+                }
+            }
+            entry->stamp_epoch = epoch;
+        }
+        if (SotcStats::kFpsLog) {
+            if (replay) {
+                SotcStats::bind_cache_xtick_replays.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (entry->made_tick != current_tick) {
+                SotcStats::bind_cache_xtick_hits.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    // The buffer side of BindBuffers: barrier against earlier writes, and the reads recorded
+    // after the draw (ResetBindings).
+    for (const auto& buf : entry->buffers) {
+        needs_barrier |= runtime.IsBufferAccessed(buf.buffer, buf.offset, buf.size, buf.is_written);
+        bound_buffers.emplace_back(buf);
+    }
+    for (const u32 bank : entry->lod_banks) {
+        SotcLod::Mark(bank);
+    }
+
+    buffer_infos.assign(entry->buffer_infos.begin(), entry->buffer_infos.end());
+    image_infos.assign(entry->image_infos.begin(), entry->image_infos.end());
+    std::copy(entry->image_info_images.begin(), entry->image_info_images.end(),
+              image_info_images.begin());
+    set_writes.assign(entry->writes.begin(), entry->writes.end());
+    set_write_sets.assign(entry->write_sets.begin(), entry->write_sets.end());
+    for (size_t i = 0; i < set_writes.size(); ++i) {
+        const u32 info = entry->write_info[i];
+        auto& write = set_writes[i];
+        write.dstSet = VK_NULL_HANDLE;
+        if (info & 0x80000000u) {
+            write.pBufferInfo = buffer_infos.data() + (info & 0x7FFFFFFFu);
+        } else {
+            write.pImageInfo = image_infos.data() + info;
+        }
+    }
+    set_write_index = static_cast<u32>(set_writes.size());
+    push_data = entry->push_data;
+    bindless_slots = entry->bindless_slots;
+    entry->last_use = ++bind_cache_clock;
+
+    uses_dma = entry->uses_dma;
+    if (uses_dma) {
+        buffer_cache.SynchronizeDmaBuffers();
+    }
+    if (SotcStats::kFpsLog) {
+        SotcStats::bind_cache_hits.fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+void Rasterizer::CommitBindCache(const Pipeline* pipeline, u64 hash, bool uses_dma,
+                                 size_t first_bound_buffer) {
+    // sotc: SOTC_BIND_CACHE. Not stored when the bind did something a hit would not repeat, or
+    // when the state moved while it ran (a submit, a guest write, a new image...): the next
+    // BindCacheSync flushes then.
+    const auto& state = bind_cache_state;
+    const auto vo_target = [&] {
+        const auto id = state.targets[0];
+        return id && texture_cache.GetImage(id).usage.vo_surface;
+    };
+    // SOTC_BIND_CACHE_RANGES: a guest write while this bind ran (another thread's fault) leaves
+    // its pages CPU-modified or its images dirty, which the next hit refuses: mem_epoch is not
+    // needed here either.
+    if (bind_cache_uncacheable || vo_target() || scheduler.CurrentTick() != state.tick ||
+        (!SotcStats::kBindCacheRanges &&
+         SotcStats::mem_epoch.load(std::memory_order_relaxed) != state.mem_epoch) ||
+        bind_cache_write_epoch.load(std::memory_order_relaxed) != state.write_epoch ||
+        BufferBindGeneration() != state.buffer_generation ||
+        texture_cache.BindGeneration() != state.texture_generation ||
+        buffer_cache.StreamGeneration() != state.stream_generation ||
+        set_writes.size() != set_write_index) {
+        if (SotcStats::kFpsLog) {
+            SotcStats::bind_cache_uncacheable.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    BindCacheEntry* entry = nullptr;
+    for (auto& e : bind_cache) {
+        if (e.valid && e.pipeline == pipeline && e.hash == hash) {
+            entry = &e; // a refused match: replaced
+            break;
+        }
+    }
+    if (!entry) {
+        entry = &bind_cache[0];
+        for (auto& e : bind_cache) {
+            if (!e.valid) {
+                entry = &e;
+                break;
+            }
+            if (e.last_use < entry->last_use) {
+                entry = &e;
+            }
+        }
+        if (!entry->valid) {
+            ++bind_cache_live;
+        }
+    }
+    entry->pipeline = pipeline;
+    entry->hash = hash;
+    entry->last_use = ++bind_cache_clock;
+    entry->uses_dma = uses_dma;
+    entry->push_data = push_data;
+    entry->bindless_slots = bindless_slots;
+    entry->writes.assign(set_writes.begin(), set_writes.end());
+    entry->write_sets.assign(set_write_sets.begin(), set_write_sets.end());
+    entry->write_info.resize(set_writes.size());
+    for (size_t i = 0; i < set_writes.size(); ++i) {
+        const auto& write = set_writes[i];
+        if (write.descriptorType == vk::DescriptorType::eStorageBuffer) {
+            entry->write_info[i] =
+                0x80000000u | static_cast<u32>(write.pBufferInfo - buffer_infos.data());
+        } else {
+            entry->write_info[i] = static_cast<u32>(write.pImageInfo - image_infos.data());
+        }
+    }
+    entry->buffer_infos.assign(buffer_infos.begin(), buffer_infos.end());
+    entry->image_infos.assign(image_infos.begin(), image_infos.end());
+    entry->image_info_images.assign(image_info_images.begin(),
+                                    image_info_images.begin() + image_infos.size());
+    entry->buffers.assign(bound_buffers.begin() + first_bound_buffer, bound_buffers.end());
+    entry->images.assign(bind_cache_images_rec.begin(), bind_cache_images_rec.end());
+    entry->lod_banks.assign(bind_cache_lod_rec.begin(), bind_cache_lod_rec.end());
+    entry->ranges.assign(bind_cache_ranges_rec.begin(), bind_cache_ranges_rec.end());
+    if (SotcStats::kBindCacheXtick) {
+        entry->repairs.assign(bind_cache_repairs_rec.begin(), bind_cache_repairs_rec.end());
+        entry->samplers.assign(bind_cache_samplers_rec.begin(), bind_cache_samplers_rec.end());
+        entry->made_tick = state.tick;
+        entry->stamp_tick = state.tick; // the full bind just made this tick's stamps
+        entry->stamp_epoch = 0;         // block stamps due at the first hit
+    }
+    // SOTC_BIND_CACHE_RANGES: the bounds of everything the entry reads (BindCacheInvalidate).
+    VAddr lo = ~VAddr{0}, hi = 0;
+    for (const auto& [addr, size] : entry->ranges) {
+        lo = std::min(lo, addr);
+        hi = std::max(hi, addr + size);
+    }
+    for (const auto& img : entry->images) {
+        lo = std::min(lo, img.guest_lo);
+        hi = std::max(hi, img.guest_hi);
+    }
+    entry->lo = lo;
+    entry->hi = hi;
+    entry->valid = true;
+}
+
+// ---------------------------------------------------------------------------------------------
+// sotc: SOTC_BIND_CACHE_FRAME. The bind cache that survives the frame.
+//
+// What changes against the SOTC_BIND_CACHE_XTICK cache above, and why each old flush reason is
+// still covered:
+//  - Table: 4096 entries, open addressing (FrameProbe slots), keyed by pipeline, FastBindHash
+//    (plus the pipeline's stage identity) and the render targets.
+//  - Render targets (and their image identities) are part of the key instead of a flush reason.
+//    What the targets guarded stays per hit: a sampled image that became a target of this draw
+//    (binding.is_target) or is its depth target refuses the hit.
+//  - The texture generation (every RegisterImage / UnregisterImage) no longer wipes the cache.
+//    FindImage's answer for a T# depends on the registered images overlapping the range it looked
+//    up, so the entry keeps those ranges (T# ranges, the found images', texel buffers') and asks
+//    TextureCache::ImageChangedSince whether an image was (un)registered over any of them since
+//    it last looked. An unrelated registration invalidates nothing. A freed image's slot can be
+//    reused: the unregistration is over the image's own range, which the entry watches, and the
+//    image uid is compared at the hit as well. The sampler half of the generation (a destroyed
+//    sampler leaves stale handles) stays a cache-wide flush.
+//  - The buffer generation (BindVersion: unbind, eviction, arena replacement) is compared per
+//    entry; an entry made before the change is dropped when found, one made after survives. (A
+//    per-range version would drop fewer: see the report.)
+//  - The stream ring wrap count is compared for entries that hold a flat buffer copy there.
+//  - GPU writes (BindCacheInvalidate) are range stamps checked by the entries that read the
+//    range or sample the image, as the scan of the old table did, at the next hit.
+//  - Not stored when any of it moved while the bind ran (the old code: texture generation).
+//  - A cache-wide flush (BindCacheFlush) is a generation counter.
+// Stamps are compared at the hit only when the global sequence number moved since the entry last
+// looked, so a hit between two events costs what it did.
+// ---------------------------------------------------------------------------------------------
+
+namespace {
+u64 BindCacheFrameKey(const Pipeline* pipeline, u64 hash, u64 targets_key) {
+    u64 key = hash ^ (reinterpret_cast<uintptr_t>(pipeline) * 0x9E3779B97F4A7C15ULL) ^
+              (targets_key * 0xC2B2AE3D27D4EB4FULL);
+    key ^= key >> 31;
+    return key | 1; // 0 marks an empty slot
+}
+} // namespace
+
+void Rasterizer::BindCacheSyncFrame(const Pipeline* pipeline, bool eligible) {
+    if (frame_cache.empty()) {
+        frame_cache.resize(BindCacheFrameEntries);
+        frame_keys.assign(BindCacheFrameEntries, 0);
+    }
+    BindCacheState now{
+        .tick = scheduler.CurrentTick(),
+        .buffer_generation = buffer_cache.BindVersion(),
+        .texture_generation = texture_cache.SamplerGeneration(),
+        .stream_generation = buffer_cache.StreamGeneration(),
+        .mem_epoch = SotcStats::mem_epoch.load(std::memory_order_relaxed),
+        .write_epoch = bind_cache_write_epoch.load(std::memory_order_relaxed),
+    };
+    if (!pipeline->IsCompute()) {
+        // The targets PrepareRenderState found for this draw (cb_descs past the MRT count are
+        // stale, so they are left out). Their identities (image uid) are in the key: a slot
+        // reused by another image is another target.
+        const auto& key = static_cast<const GraphicsPipeline*>(pipeline)->GetGraphicsKey();
+        const u32 num_cb = std::min<u32>(std::bit_width(key.mrt_mask), AmdGpu::NUM_COLOR_BUFFERS);
+        std::array<u64, AmdGpu::NUM_COLOR_BUFFERS + 1> identity{};
+        for (u32 cb = 0; cb < num_cb; ++cb) {
+            now.targets[cb] = cb_descs[cb].first;
+            if (now.targets[cb]) {
+                identity[cb] = texture_cache.GetImage(now.targets[cb]).image_uid;
+            }
+        }
+        now.targets[AmdGpu::NUM_COLOR_BUFFERS] = db_desc.first;
+        if (db_desc.first) {
+            identity[AmdGpu::NUM_COLOR_BUFFERS] = texture_cache.GetImage(db_desc.first).image_uid;
+        }
+        now.targets_key = XXH3_64bits(identity.data(), identity.size() * sizeof(u64));
+    } else {
+        // A dispatch renders into no target.
+        now.targets = bind_cache_state.targets;
+        now.targets_key = bind_cache_state.targets_key;
+    }
+    const bool samplers_moved = now.texture_generation != bind_cache_state.texture_generation;
+    bind_cache_state = now;
+    if (samplers_moved) {
+        BindCacheFlush(SotcStats::BindCacheResources);
+    }
+    // A draw that writes buffers or images is not eligible: its render targets are written along
+    // with the rest (BindBuffers / BindTextures note the writes of those).
+    if (!eligible && !pipeline->IsCompute()) {
+        const auto& key = static_cast<const GraphicsPipeline*>(pipeline)->GetGraphicsKey();
+        const u32 num_cb = std::min<u32>(std::bit_width(key.mrt_mask), AmdGpu::NUM_COLOR_BUFFERS);
+        for (u32 cb = 0; cb < num_cb; ++cb) {
+            if (const auto id = cb_descs[cb].first) {
+                BindCacheInvalidateImage(id);
+            }
+        }
+        if (const auto id = db_desc.first) {
+            BindCacheInvalidateImage(id);
+        }
+    }
+}
+
+void Rasterizer::BindCacheInvalidateFrame(VAddr addr, u64 size, VideoCore::ImageId image) {
+    // Only the draw thread notes writes (the scan this replaces was not thread safe either).
+    write_stamps.Note(addr, addr + std::max<u64>(size, 1),
+                      image ? &write_image_stamps[image.index % WriteImageStamps] : nullptr);
+    if (SotcStats::kFpsLog) {
+        SotcStats::bind_cache_range_writes.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+namespace {
+/// Whether the GPU writes and image set changes noted after the checkpoints leave a bind that
+/// reads `ranges`, samples `images` and looked up `tex_watch` alone. The checkpoints move up only
+/// when it does.
+template <typename Ranges, typename Images>
+bool BindCacheStampsOk(const VideoCore::RangeStamps& writes,
+                       const std::array<std::atomic<u64>, 4096>& image_stamps,
+                       const VideoCore::TextureCache& textures, const Ranges& ranges,
+                       const Images& images, const std::vector<std::pair<VAddr, VAddr>>& tex_watch,
+                       u64& checked_write, u64& checked_tex, u32& reason) {
+    // The checkpoint is the sequence number read before the stamps: an event published while
+    // looking is newer than it and is found by the next check.
+    const u64 write_seq = writes.Seq();
+    if (write_seq != checked_write) {
+        for (const auto& [addr, size] : ranges) {
+            if (writes.ChangedSince(addr, addr + size, checked_write)) {
+                reason = SotcStats::BfWrites;
+                return false;
+            }
+        }
+        for (const auto& img : images) {
+            if (image_stamps[img.id.index % 4096].load(std::memory_order_relaxed) >
+                    checked_write ||
+                writes.ChangedSince(img.guest_lo, img.guest_hi, checked_write)) {
+                reason = SotcStats::BfWrites;
+                return false;
+            }
+        }
+    }
+    const u64 tex_seq = textures.ImageChangeSeq();
+    if (tex_seq != checked_tex) {
+        for (const auto& [lo, hi] : tex_watch) {
+            if (textures.ImageChangedSince(lo, hi, checked_tex)) {
+                reason = SotcStats::BfImages;
+                return false;
+            }
+        }
+    }
+    checked_write = write_seq;
+    checked_tex = tex_seq;
+    return true;
+}
+} // namespace
+
+bool Rasterizer::BindCacheStampsFresh(BindCacheEntry& entry, u32& reason) {
+    if (entry.map_dependent && entry.map_epoch != MapEpoch()) {
+        reason = SotcStats::BfMapping;
+        return false;
+    }
+    if (entry.tail_dependent &&
+        entry.gpu_epoch != VideoCore::gpu_modified_epoch.load(std::memory_order_relaxed)) {
+        reason = SotcStats::BfImages;
+        return false;
+    }
+    return BindCacheStampsOk(write_stamps, write_image_stamps, texture_cache, entry.ranges,
+                             entry.images, entry.tex_watch, entry.checked_write_seq,
+                             entry.checked_tex_seq, reason);
+}
+
+bool Rasterizer::BindCacheEntryFresh(BindCacheEntry& entry, u32& reason) {
+    if (entry.flush_gen != bind_cache_flush_gen) {
+        reason = SotcStats::BfFlush;
+        return false;
+    }
+    if (entry.buffer_version != buffer_cache.BindVersion()) {
+        reason = SotcStats::BfBuffers;
+        return false;
+    }
+    if (entry.uses_stream && entry.stream_gen != buffer_cache.StreamGeneration()) {
+        reason = SotcStats::BfStream;
+        return false;
+    }
+    return BindCacheStampsFresh(entry, reason);
+}
+
+void Rasterizer::BindCacheDropFrame(BindCacheEntry& entry, u32 reason) {
+    const size_t index = static_cast<size_t>(&entry - frame_cache.data());
+    if (index < frame_keys.size() && frame_keys[index] != 0) {
+        frame_keys[index] = 0;
+        --bind_cache_live;
+        if (SotcStats::kFpsLog) {
+            SotcStats::bf_live.store(bind_cache_live, std::memory_order_relaxed);
+            SotcStats::bf_drop[reason].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+Rasterizer::BindCacheEntry* Rasterizer::BindCacheFindFrame(u64 key, const Pipeline* pipeline,
+                                                           u64 hash, u64 targets_key) {
+    const size_t base = static_cast<size_t>((key * 0x9E3779B97F4A7C15ULL) >> 52); // 12 bits
+    for (u32 probe = 0; probe < BindCacheFrameProbe; ++probe) {
+        const size_t index = (base + probe) & (BindCacheFrameEntries - 1);
+        if (frame_keys[index] != key) {
+            continue;
+        }
+        auto& entry = frame_cache[index];
+        if (entry.pipeline == pipeline && entry.hash == hash && entry.targets_key == targets_key) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
+void Rasterizer::BindCacheNoteLookup(const VideoCore::TextureCache::ImageDesc& desc,
+                                     VideoCore::ImageId image) {
+    // sotc: SOTC_BIND_CACHE_FRAME. What FindImage looked at: the T#'s range (with its mip tail
+    // alternative), and the image it settled on.
+    const auto add = [&](VAddr lo, VAddr hi) {
+        if (!bind_cache_lookups_rec.empty() && bind_cache_lookups_rec.back() == std::pair{lo, hi}) {
+            return;
+        }
+        bind_cache_lookups_rec.emplace_back(lo, hi);
+    };
+    add(desc.info.guest_address - desc.info.sotc_dropped_bytes,
+        desc.info.guest_address + desc.info.guest_size);
+    if (desc.other_info) {
+        add(desc.other_info->guest_address - desc.other_info->sotc_dropped_bytes,
+            desc.other_info->guest_address + desc.other_info->guest_size);
+    }
+    if (image) {
+        const auto& info = texture_cache.GetImage(image).info;
+        add(info.guest_address - info.sotc_dropped_bytes, info.guest_address + info.guest_size);
+        bind_cache_tail_rec |= info.sotc_first_mip != 0;
+    }
+}
+
+bool Rasterizer::TryBindCacheFrame(const Pipeline* pipeline, u64 hash, bool& uses_dma) {
+    // sotc: SOTC_BIND_CACHE_FRAME, see the comment above BindCacheSyncFrame. The rest follows
+    // TryBindCache (SOTC_BIND_CACHE_XTICK): what a full bind does that a hit would skip is
+    // replayed the same way.
+    const bool stats = SotcStats::kFpsLog;
+    if (stats) {
+        SotcStats::bind_cache_lookups.fetch_add(1, std::memory_order_relaxed);
+        const u64 frame = SotcStats::cp_frame.load(std::memory_order_relaxed);
+        auto& seen = bind_seen[(hash ^ (hash >> 29)) % bind_seen.size()];
+        bool prev_frame = false;
+        if (seen.hash == hash) {
+            prev_frame = seen.frame_last == frame ? seen.frame_prev + 1 == frame
+                                                  : seen.frame_last + 1 == frame;
+            if (seen.frame_last != frame) {
+                seen.frame_prev = seen.frame_last;
+                seen.frame_last = frame;
+            }
+        } else {
+            seen = {hash, frame, 0};
+        }
+        if (prev_frame) {
+            SotcStats::bind_cache_seen_prev_frame.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    const u64 targets_key = bind_cache_state.targets_key;
+    const u64 lookup_key = BindCacheFrameKey(pipeline, hash, targets_key);
+    if (stats) {
+        // distinct keys looked up per game frame (does the table hold a frame's worth?)
+        const u64 frame = SotcStats::cp_frame.load(std::memory_order_relaxed);
+        if (frame != bind_key_frame) {
+            bind_key_frame = frame;
+            SotcStats::bf_frames.fetch_add(1, std::memory_order_relaxed);
+        }
+        auto& seen_key = bind_key_seen[(lookup_key >> 20) % bind_key_seen.size()];
+        if (seen_key.key != lookup_key || seen_key.frame != frame) {
+            seen_key = {lookup_key, frame};
+            SotcStats::bf_distinct_keys.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    BindCacheEntry* entry = BindCacheFindFrame(lookup_key, pipeline, hash, targets_key);
+    const auto miss = [&](u32 reason) {
+        if (stats) {
+            SotcStats::bf_miss[reason].fetch_add(1, std::memory_order_relaxed);
+        }
+        return false;
+    };
+    // The entry is found and no longer valid: dropped, the full bind makes a new one.
+    const auto stale = [&](u32 reason) {
+        BindCacheDropFrame(*entry, reason);
+        return miss(reason);
+    };
+    const auto refuse = [&](bool drop) {
+        if (stats) {
+            SotcStats::bind_cache_refused.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (drop) {
+            BindCacheDropFrame(*entry, SotcStats::BfRefused);
+        }
+        return miss(SotcStats::BfRefused);
+    };
+    if (!entry) {
+        return miss(SotcStats::BfNoEntry);
+    }
+    if (u32 reason; !BindCacheEntryFresh(*entry, reason)) {
+        return stale(reason);
+    }
+    // sotc: an entry made under the resource identity key: this draw's constants. The flat
+    // buffer is copied into the stream ring again (patched as BindBuffers would), unless it is
+    // the very data the entry copied last and the ring has not wrapped since; the copy's offset
+    // goes into the descriptor below. The viewport words of the push data are set below too.
+    if (!entry->flat_slots.empty()) {
+        const auto stages = pipeline->GetStages();
+        const u64 alignment = instance.StorageMinAlignment();
+        auto& vk_buffer = buffer_cache.GetStreamBuffer();
+        for (auto& slot : entry->flat_slots) {
+            const Shader::Info* st = slot.stage < stages.size() ? stages[slot.stage] : nullptr;
+            if (!st || st->FlatBuf().size() * sizeof(u32) != slot.size) {
+                return refuse(true);
+            }
+            const u32* flat = FlatForBind(*st);
+            const u64 hash = XXH3_64bits(flat, slot.size);
+            // sotc: only a copy made in this tick may be reused: a later tick reusing it does not
+            // extend the ring's watch over it, and a wrap would overwrite it while that tick's
+            // draws still read it on the GPU (review of 2026-10-29).
+            if (hash == slot.hash && slot.gen == buffer_cache.StreamGeneration() &&
+                slot.tick == scheduler.CurrentTick()) {
+                if (stats) {
+                    SotcStats::bf_flat_reused.fetch_add(1, std::memory_order_relaxed);
+                }
+                continue;
+            }
+            slot.offset = vk_buffer.Copy(flat, slot.size, alignment);
+            slot.hash = hash;
+            slot.gen = buffer_cache.StreamGeneration();
+            slot.tick = scheduler.CurrentTick();
+            if (stats) {
+                SotcStats::bf_flat_copied.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+    u64 current_tick = scheduler.CurrentTick();
+    bool replay = entry->stamp_tick != current_tick;
+    bool mapping_checked = false;
+    const auto mapping_changed = [&] {
+        mapping_checked = true;
+        for (const auto& r : entry->repairs) {
+            if (memory->ClampRangeSize(r.addr, r.vsize) != r.mapped) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (replay && mapping_changed()) {
+        return refuse(true);
+    }
+    // A CPU-modified range is synchronized as ObtainBuffer does (the same arena and arguments:
+    // the cached handle is still the binding, BindVersion), if the guest mapping under it is
+    // still the one the entry was made for; the descriptors stay valid.
+    u32 repaired = 0;
+    for (const auto& r : entry->repairs) {
+        if (!r.arena || !buffer_cache.IsRegionCpuModified(r.addr, r.size)) {
+            continue;
+        }
+        if (memory->ClampRangeSize(r.addr, r.vsize) != r.mapped) {
+            return refuse(false);
+        }
+        buffer_cache.SynchronizeBinding(r.arena, r.addr, r.size, r.texel);
+        ++repaired;
+    }
+    if (repaired != 0) {
+        // The upload may have submitted, evicted or wrapped the stream ring, or reached a
+        // BindCacheInvalidate for a range this entry reads: it must be fresh again, or the full
+        // bind follows (nothing of this hit has been replayed yet).
+        if (u32 reason; !BindCacheEntryFresh(*entry, reason)) {
+            return stale(reason);
+        }
+        // sotc: the flat copies made or reused above must still be in this lap and tick of the
+        // stream ring (the synchronization may have wrapped it or submitted).
+        for (const auto& slot : entry->flat_slots) {
+            if (slot.gen != buffer_cache.StreamGeneration() ||
+                slot.tick != scheduler.CurrentTick()) {
+                return refuse(true);
+            }
+        }
+        if (stats) {
+            SotcStats::bind_cache_xtick_repaired.fetch_add(1, std::memory_order_relaxed);
+        }
+        // The synchronization may have submitted: the stamps are for the tick being recorded.
+        current_tick = scheduler.CurrentTick();
+        replay = entry->stamp_tick != current_tick;
+        if (replay && !mapping_checked && mapping_changed()) {
+            return refuse(true);
+        }
+    }
+    if (replay) {
+        for (const auto& s : entry->samplers) {
+            u32 slot = 0;
+            const vk::Sampler handle = texture_cache.GetSampler(
+                s.sharp, liverpool->DrawRegs().ta_bc_base, s.is_depth, &slot); // as BindTextures
+            if (handle != s.handle || slot != s.slot) {
+                return refuse(true);
+            }
+        }
+    }
+    {
+        const auto texture_lock = texture_cache.BatchLock();
+        // The guest may unmap (unregister) images from its own threads: checked under the lock,
+        // before the entry's images are touched (a freed image's slot may hold another image).
+        if (texture_cache.SamplerGeneration() != bind_cache_state.texture_generation) {
+            BindCacheFlush(SotcStats::BindCacheResources);
+            return miss(SotcStats::BfFlush);
+        }
+        if (u32 reason; !BindCacheStampsFresh(*entry, reason)) {
+            return stale(reason);
+        }
+        // What the full bind would do differently: an image to upload again or re-track
+        // (TextureCache::UpdateImage), one replaced since (needs_rebind), or one that became a
+        // target or storage image of this draw (general / feedback loop layouts).
+        for (const auto& img : entry->images) {
+            const auto& image = texture_cache.GetImage(img.id);
+            const bool ok =
+                True(image.flags & VideoCore::ImageFlagBits::Registered) &&
+                image.image_uid == img.uid &&
+                False(image.flags & VideoCore::ImageFlagBits::Dirty) &&
+                image.track_addr == image.info.guest_address &&
+                image.track_addr_end == image.info.guest_address + image.info.guest_size &&
+                !image.binding.needs_rebind && !image.binding.force_general &&
+                !image.binding.is_target && img.id != db_desc.first;
+            if (!ok) {
+                return refuse(false);
+            }
+        }
+        // The side effects of BindTextures' second pass: bound for this draw (BeginRendering's
+        // feedback test, ResetBindings), and in the layout the descriptors name, with a barrier
+        // when another command changed it since.
+        for (const auto& img : entry->images) {
+            auto& image = texture_cache.GetImage(img.id);
+            image.binding.is_bound = 1u;
+            bound_images.emplace_back(img.id);
+            needs_barrier |= runtime.Transit(&image, img.layout, img.stages, img.access, img.range);
+            image.usage.texture = 1u;
+            if (replay) {
+                texture_cache.NoteBoundUse(img.id);
+            }
+        }
+    }
+    entry->stamp_tick = current_tick;
+    if (const u16 epoch = buffer_cache.UseEpoch(); entry->stamp_epoch != epoch) {
+        for (const auto& r : entry->repairs) {
+            if (r.arena) {
+                buffer_cache.NoteBindUse(r.addr, r.size);
+            }
+        }
+        entry->stamp_epoch = epoch;
+    }
+    if (stats) {
+        if (replay) {
+            SotcStats::bind_cache_xtick_replays.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (entry->made_tick != current_tick) {
+            SotcStats::bind_cache_xtick_hits.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (entry->made_frame != SotcStats::cp_frame.load(std::memory_order_relaxed)) {
+            SotcStats::bf_cross_frame_hits.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    // The buffer side of BindBuffers: barrier against earlier writes, and the reads recorded
+    // after the draw (ResetBindings).
+    for (const auto& buf : entry->buffers) {
+        needs_barrier |= runtime.IsBufferAccessed(buf.buffer, buf.offset, buf.size, buf.is_written);
+        bound_buffers.emplace_back(buf);
+    }
+    for (const u32 bank : entry->lod_banks) {
+        SotcLod::Mark(bank);
+    }
+
+    buffer_infos.assign(entry->buffer_infos.begin(), entry->buffer_infos.end());
+    image_infos.assign(entry->image_infos.begin(), entry->image_infos.end());
+    std::copy(entry->image_info_images.begin(), entry->image_info_images.end(),
+              image_info_images.begin());
+    set_writes.assign(entry->writes.begin(), entry->writes.end());
+    set_write_sets.assign(entry->write_sets.begin(), entry->write_sets.end());
+    for (size_t i = 0; i < set_writes.size(); ++i) {
+        const u32 info = entry->write_info[i];
+        auto& write = set_writes[i];
+        write.dstSet = VK_NULL_HANDLE;
+        if (info & 0x80000000u) {
+            write.pBufferInfo = buffer_infos.data() + (info & 0x7FFFFFFFu);
+        } else {
+            write.pImageInfo = image_infos.data() + info;
+        }
+    }
+    set_write_index = static_cast<u32>(set_writes.size());
+    push_data = entry->push_data;
+    // The viewport words are registers of this draw (the buffer offsets stay the entry's).
+    push_data.xoffset = bind_input_push.xoffset;
+    push_data.yoffset = bind_input_push.yoffset;
+    push_data.xscale = bind_input_push.xscale;
+    push_data.yscale = bind_input_push.yscale;
+    for (const auto& slot : entry->flat_slots) {
+        buffer_infos[slot.info].offset = slot.offset;
+    }
+    bindless_slots = entry->bindless_slots;
+    entry->last_use = ++bind_cache_clock;
+
+    uses_dma = entry->uses_dma;
+    if (uses_dma) {
+        buffer_cache.SynchronizeDmaBuffers();
+    }
+    if (stats) {
+        SotcStats::bind_cache_hits.fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+void Rasterizer::CommitBindCacheFrame(const Pipeline* pipeline, u64 hash, bool uses_dma,
+                                      size_t first_bound_buffer) {
+    // sotc: SOTC_BIND_CACHE_FRAME. Not stored when the bind did something a hit would not repeat,
+    // or when what the entry depends on moved while the bind ran (a submit, a new image over a
+    // range it looked up, a GPU write to what it reads...).
+    const auto& state = bind_cache_state;
+    const auto vo_target = [&] {
+        const auto id = state.targets[0];
+        return id && texture_cache.GetImage(id).usage.vo_surface;
+    };
+    // Under the resource identity key the flat buffer copies are refreshed by every hit (their ring
+    // generation is per slot), so the entry itself does not depend on the ring.
+    const bool uses_stream = bind_cache_stream_rec && !bind_level2;
+    if (bind_cache_uncacheable || vo_target() || scheduler.CurrentTick() != state.tick ||
+        bind_cache_write_epoch.load(std::memory_order_relaxed) != state.write_epoch ||
+        buffer_cache.BindVersion() != state.buffer_generation ||
+        texture_cache.SamplerGeneration() != state.texture_generation ||
+        (uses_stream && buffer_cache.StreamGeneration() != state.stream_generation) ||
+        set_writes.size() != set_write_index) {
+        if (SotcStats::kFpsLog) {
+            SotcStats::bind_cache_uncacheable.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    // The ranges whose image set the entry depends on: the T# lookups, the sampled images and
+    // the texel buffers (an image registered over one makes ObtainBuffer re-tile it).
+    auto& tex_watch = bind_cache_tex_watch_rec;
+    tex_watch.assign(bind_cache_lookups_rec.begin(), bind_cache_lookups_rec.end());
+    tex_watch.insert(tex_watch.end(), bind_cache_texel_rec.begin(), bind_cache_texel_rec.end());
+    for (const auto& img : bind_cache_images_rec) {
+        tex_watch.emplace_back(img.guest_lo, img.guest_hi);
+    }
+    // Checked against the sequence numbers read when the bind began: what moved during it
+    // (including what this very bind did, e.g. creating an image) is not trusted.
+    u64 checked_write = bind_rec_write_seq;
+    u64 checked_tex = bind_rec_tex_seq;
+    if (u32 reason; (bind_cache_map_dep_rec && bind_rec_map_epoch != MapEpoch()) ||
+                    (bind_cache_tail_rec &&
+                     bind_rec_gpu_epoch !=
+                         VideoCore::gpu_modified_epoch.load(std::memory_order_relaxed)) ||
+                    !BindCacheStampsOk(write_stamps, write_image_stamps, texture_cache,
+                                       bind_cache_ranges_rec, bind_cache_images_rec, tex_watch,
+                                       checked_write, checked_tex, reason)) {
+        if (SotcStats::kFpsLog) {
+            SotcStats::bf_not_stored_moved.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    const u64 key = BindCacheFrameKey(pipeline, hash, state.targets_key);
+    const size_t base = static_cast<size_t>((key * 0x9E3779B97F4A7C15ULL) >> 52);
+    size_t chosen = ~size_t{0};
+    bool occupied = false;
+    // A match is replaced (a refused one); else an empty slot; else a stale one (made before a
+    // flush); else the least recently used of the probe window.
+    u64 best_score = ~0ULL;
+    for (u32 probe = 0; probe < BindCacheFrameProbe; ++probe) {
+        const size_t index = (base + probe) & (BindCacheFrameEntries - 1);
+        if (frame_keys[index] == 0) {
+            if (best_score != 0) {
+                chosen = index;
+                occupied = false;
+                best_score = 0;
+            }
+            continue;
+        }
+        const auto& e = frame_cache[index];
+        if (frame_keys[index] == key && e.pipeline == pipeline && e.hash == hash &&
+            e.targets_key == state.targets_key) {
+            chosen = index;
+            occupied = true;
+            best_score = 0;
+            break;
+        }
+        const u64 score = e.flush_gen != bind_cache_flush_gen ? 1 : 2 + e.last_use;
+        if (score < best_score) {
+            chosen = index;
+            occupied = true;
+            best_score = score;
+        }
+    }
+    auto* entry = &frame_cache[chosen];
+    if (occupied) {
+        if (SotcStats::kFpsLog && frame_keys[chosen] != key) {
+            SotcStats::bf_replaced.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else {
+        ++bind_cache_live;
+    }
+    frame_keys[chosen] = 0; // not findable while it is rewritten
+    entry->pipeline = pipeline;
+    entry->hash = hash;
+    entry->last_use = ++bind_cache_clock;
+    entry->uses_dma = uses_dma;
+    entry->push_data = push_data;
+    entry->bindless_slots = bindless_slots;
+    entry->writes.assign(set_writes.begin(), set_writes.end());
+    entry->write_sets.assign(set_write_sets.begin(), set_write_sets.end());
+    entry->write_info.resize(set_writes.size());
+    for (size_t i = 0; i < set_writes.size(); ++i) {
+        const auto& write = set_writes[i];
+        if (write.descriptorType == vk::DescriptorType::eStorageBuffer) {
+            entry->write_info[i] =
+                0x80000000u | static_cast<u32>(write.pBufferInfo - buffer_infos.data());
+        } else {
+            entry->write_info[i] = static_cast<u32>(write.pImageInfo - image_infos.data());
+        }
+    }
+    entry->buffer_infos.assign(buffer_infos.begin(), buffer_infos.end());
+    entry->image_infos.assign(image_infos.begin(), image_infos.end());
+    entry->image_info_images.assign(image_info_images.begin(),
+                                    image_info_images.begin() + image_infos.size());
+    entry->buffers.assign(bound_buffers.begin() + first_bound_buffer, bound_buffers.end());
+    entry->images.assign(bind_cache_images_rec.begin(), bind_cache_images_rec.end());
+    entry->lod_banks.assign(bind_cache_lod_rec.begin(), bind_cache_lod_rec.end());
+    entry->ranges.assign(bind_cache_ranges_rec.begin(), bind_cache_ranges_rec.end());
+    entry->repairs.assign(bind_cache_repairs_rec.begin(), bind_cache_repairs_rec.end());
+    entry->samplers.assign(bind_cache_samplers_rec.begin(), bind_cache_samplers_rec.end());
+    entry->tex_watch.assign(tex_watch.begin(), tex_watch.end());
+    entry->made_tick = state.tick;
+    entry->stamp_tick = state.tick; // the full bind just made this tick's stamps
+    entry->stamp_epoch = 0;         // block stamps due at the first hit
+    entry->key = key;
+    entry->targets_key = state.targets_key;
+    entry->flush_gen = bind_cache_flush_gen;
+    entry->buffer_version = state.buffer_generation;
+    entry->stream_gen = state.stream_generation;
+    entry->uses_stream = uses_stream;
+    entry->refresh = bind_level2;
+    if (bind_level2) {
+        entry->flat_slots.assign(bind_cache_flat_rec.begin(), bind_cache_flat_rec.end());
+    } else {
+        entry->flat_slots.clear();
+    }
+    entry->map_dependent = bind_cache_map_dep_rec;
+    entry->map_epoch = bind_rec_map_epoch;
+    entry->tail_dependent = bind_cache_tail_rec;
+    entry->gpu_epoch = bind_rec_gpu_epoch;
+    entry->checked_write_seq = checked_write;
+    entry->checked_tex_seq = checked_tex;
+    entry->made_frame = SotcStats::cp_frame.load(std::memory_order_relaxed);
+    entry->valid = true;
+    frame_keys[chosen] = key;
+    if (SotcStats::kFpsLog) {
+        SotcStats::bf_stored.fetch_add(1, std::memory_order_relaxed);
+        SotcStats::bf_live.store(bind_cache_live, std::memory_order_relaxed);
+    }
 }
 
 void Rasterizer::RebindVertexIfSubmitted(const GraphicsPipeline* pipeline, u64& vertex_tick,
@@ -2116,6 +3829,12 @@ void Rasterizer::FlushPeriodic() {
         SotcStats::commands.store(SotcStats::commands.load(std::memory_order_relaxed) + 1,
                                   std::memory_order_relaxed);
     }
+    // sotc: SOTC_RB_PREFETCH (off by default): a command boundary outside a render pass, where
+    // every write of the commands so far is recorded; the prefetch copies go here, in the tick
+    // being recorded, and ride on its submit (the early flush below, or the periodic one).
+    if (!scheduler.IsRendering()) {
+        buffer_cache.PrefetchIssue();
+    }
     static const bool early = [] {
         const char* v = std::getenv("SOTC_RB_EARLY");
         return !v || v[0] != '0';
@@ -2160,9 +3879,25 @@ void Rasterizer::FlushPeriodic() {
         }
         const auto now = std::chrono::steady_clock::now();
         const auto elapsed = now - commands_since;
-        const auto limit = std::chrono::microseconds(flush_us);
-        if (elapsed < limit || (scheduler.IsRendering() && elapsed < limit * 4)) {
+        // sotc: SOTC_ADAPTIVE_LOAD: while the governor is relieved, SOTC_ADAPTIVE_FLUSH_US
+        // (default 4000) between submits outside a render pass; inside one the longest window
+        // stays the larger of that and 4 * SOTC_FLUSH_US. Nothing needs the 1 ms cadence for
+        // correctness: readbacks and the hot-write submit above submit on their own, buffers that
+        // fill up within a tick wait (submit) as at any tick length, and the GPUs without the
+        // periodic submit run whole frames in one tick. Normal: limit and pass_limit as before.
+        const auto base = std::chrono::microseconds(flush_us);
+        const u64 relieved_us = SotcAdaptive::FlushUs();
+        const auto limit = relieved_us > flush_us ? std::chrono::microseconds(relieved_us) : base;
+        const auto pass_limit = std::max(limit, base * 4);
+        if (elapsed < limit || (scheduler.IsRendering() && elapsed < pass_limit)) {
             return;
+        }
+        if (SotcStats::kFpsLog && limit != base && !scheduler.IsRendering()) {
+            const auto windows = static_cast<u64>(elapsed / base);
+            if (windows > 1) {
+                SotcStats::adaptive_flushes_saved.fetch_add(windows - 1,
+                                                            std::memory_order_relaxed);
+            }
         }
         // sotc: cold arena memory goes back at a submit point outside a render pass.
         if (!scheduler.IsRendering() && buffer_cache.MaybeEvictCold(now)) {
@@ -2456,6 +4191,7 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     // sotc: the destination was found by address, not by a writer lookup: its first GPU write
     // moves the mip-tail epoch (CopyColorAndDepth only passes the flag on).
     VideoCore::MarkGpuModified(dst_image);
+    compute_written_image = desc0.is_written ? image0_id : image1_id; // sotc: BindResources
     runtime.CopyColorAndDepth(&src_image, &dst_image);
     return true;
 }
@@ -2514,8 +4250,78 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
             },
         .extent = image1.info.resources,
     };
+    compute_written_image = image1_id; // sotc: SOTC_BIND_CACHE_FRAME (BindResources)
     runtime.ClearImage(&image1, range, clear);
     return true;
+}
+
+const u32* Rasterizer::FlatForBind(const Shader::Info& stage) {
+    // sotc: the live-setting patches of the flat buffer (moved out of BindBuffers so that a hit of
+    // the resource identity bind cache, SOTC_BIND_CACHE_FRAME, applies them to the data it
+    // re-copies). Every bind-time rewrite of the flat buffer is here: TAA resolve off, the tonemap
+    // vignette moved after upscaling, the vegetation distance / height scales and the grass patch
+    // LOD scale.
+    const u32* flat = stage.FlatBuf().data();
+        static std::vector<u32> taa_flat;
+        if (stage.pgm_hash == kTaaResolveHash && stage.FlatBuf().size() > kTaaEnableDword &&
+            TaaOff()) {
+            taa_flat.assign(stage.FlatBuf().begin(), stage.FlatBuf().end());
+            taa_flat[kTaaEnableDword] &= ~1u;
+            flat = taa_flat.data();
+            static bool reported = false;
+            if (!std::exchange(reported, true)) {
+                std::fprintf(stderr, "SOTC TAA off: resolve without history blend\n");
+            }
+        }
+        static std::vector<u32> tonemap_flat;
+        static const bool vignette_after = [] {
+            const char* v = std::getenv("SOTC_DLSS_VIGNETTE");
+            return !v || v[0] != '0';
+        }();
+        if (stage.pgm_hash == kTonemapHash && stage.FlatBuf().size() > kVignetteDword + 3 &&
+            vignette_after && Dlssg::SuperResolution()) {
+            tonemap_flat.assign(stage.FlatBuf().begin(), stage.FlatBuf().end());
+            float params[4];
+            std::memcpy(params, &tonemap_flat[kVignetteDword], sizeof(params));
+            Dlssg::NoteVignette(params);
+            tonemap_flat[kVignetteDword + 3] = 0; // strength 0.0f
+            flat = tonemap_flat.data();
+            static bool reported = false;
+            if (!std::exchange(reported, true)) {
+                std::fprintf(stderr,
+                             "SOTC DLSS: vignette after upscaling (%g %g %g %g)\n",
+                             params[0], params[1], params[2], params[3]);
+            }
+        }
+        const auto veg_scales = VegetationScales();
+        for (size_t v = 0; v < kVegetation.size(); ++v) {
+            const auto& veg = kVegetation[v];
+            const float dist = veg_scales[v * 2], height = veg_scales[v * 2 + 1];
+            if (stage.pgm_hash != veg.hash || (dist == 1.f && height == 1.f) ||
+                stage.FlatBuf().size() < veg.bands_dword + kVegetationBands) {
+                continue;
+            }
+            static std::vector<u32> veg_flat;
+            veg_flat.assign(flat, flat + stage.FlatBuf().size());
+            const auto scale = [&](u32 dword, float m) {
+                veg_flat[dword] = std::bit_cast<u32>(std::bit_cast<float>(veg_flat[dword]) * m);
+            };
+            scale(veg.height_dword, height);
+            for (u32 i = 0; i < kVegetationBands; ++i) {
+                scale(veg.bands_dword + i, dist);
+            }
+            flat = veg_flat.data();
+        }
+        if (const float lod = veg_scales[4]; stage.pgm_hash == kGrassPatchHash &&
+                                                     lod != 1.f &&
+                                                     stage.FlatBuf().size() > kGrassPatchLodDword) {
+            static std::vector<u32> patch_flat;
+            patch_flat.assign(flat, flat + stage.FlatBuf().size());
+            patch_flat[kGrassPatchLodDword] =
+                std::bit_cast<u32>(std::bit_cast<float>(patch_flat[kGrassPatchLodDword]) * lod);
+            flat = patch_flat.data();
+        }
+    return flat;
 }
 
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
@@ -2532,68 +4338,23 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
                 auto& vk_buffer = buffer_cache.GetStreamBuffer();
                 const u32 ubo_size = stage.FlatBuf().size() * sizeof(u32);
-                const u32* flat = stage.FlatBuf().data();
-                static std::vector<u32> taa_flat;
-                if (stage.pgm_hash == kTaaResolveHash && stage.FlatBuf().size() > kTaaEnableDword &&
-                    TaaOff()) {
-                    taa_flat.assign(stage.FlatBuf().begin(), stage.FlatBuf().end());
-                    taa_flat[kTaaEnableDword] &= ~1u;
-                    flat = taa_flat.data();
-                    static bool reported = false;
-                    if (!std::exchange(reported, true)) {
-                        std::fprintf(stderr, "SOTC TAA off: resolve without history blend\n");
-                    }
-                }
-                static std::vector<u32> tonemap_flat;
-                static const bool vignette_after = [] {
-                    const char* v = std::getenv("SOTC_DLSS_VIGNETTE");
-                    return !v || v[0] != '0';
-                }();
-                if (stage.pgm_hash == kTonemapHash && stage.FlatBuf().size() > kVignetteDword + 3 &&
-                    vignette_after && Dlssg::SuperResolution()) {
-                    tonemap_flat.assign(stage.FlatBuf().begin(), stage.FlatBuf().end());
-                    float params[4];
-                    std::memcpy(params, &tonemap_flat[kVignetteDword], sizeof(params));
-                    Dlssg::NoteVignette(params);
-                    tonemap_flat[kVignetteDword + 3] = 0; // strength 0.0f
-                    flat = tonemap_flat.data();
-                    static bool reported = false;
-                    if (!std::exchange(reported, true)) {
-                        std::fprintf(stderr,
-                                     "SOTC DLSS: vignette after upscaling (%g %g %g %g)\n",
-                                     params[0], params[1], params[2], params[3]);
-                    }
-                }
-                const auto veg_scales = VegetationScales();
-                for (size_t v = 0; v < kVegetation.size(); ++v) {
-                    const auto& veg = kVegetation[v];
-                    const float dist = veg_scales[v * 2], height = veg_scales[v * 2 + 1];
-                    if (stage.pgm_hash != veg.hash || (dist == 1.f && height == 1.f) ||
-                        stage.FlatBuf().size() < veg.bands_dword + kVegetationBands) {
-                        continue;
-                    }
-                    static std::vector<u32> veg_flat;
-                    veg_flat.assign(flat, flat + stage.FlatBuf().size());
-                    const auto scale = [&](u32 dword, float m) {
-                        veg_flat[dword] = std::bit_cast<u32>(std::bit_cast<float>(veg_flat[dword]) * m);
-                    };
-                    scale(veg.height_dword, height);
-                    for (u32 i = 0; i < kVegetationBands; ++i) {
-                        scale(veg.bands_dword + i, dist);
-                    }
-                    flat = veg_flat.data();
-                }
-                if (const float lod = veg_scales[4]; stage.pgm_hash == kGrassPatchHash &&
-                                                             lod != 1.f &&
-                                                             stage.FlatBuf().size() > kGrassPatchLodDword) {
-                    static std::vector<u32> patch_flat;
-                    patch_flat.assign(flat, flat + stage.FlatBuf().size());
-                    patch_flat[kGrassPatchLodDword] =
-                        std::bit_cast<u32>(std::bit_cast<float>(patch_flat[kGrassPatchLodDword]) * lod);
-                    flat = patch_flat.data();
+                const u32* flat = FlatForBind(stage);
+                // sotc: SOTC_BIND_CACHE: flat buffers changed by live settings are not cached.
+                if (bind_cache_recording &&
+                    (flat != stage.FlatBuf().data() || stage.pgm_hash == kTaaResolveHash ||
+                     stage.pgm_hash == kTonemapHash)) {
+                    bind_cache_uncacheable = true;
                 }
                 const u64 offset = vk_buffer.Copy(flat, ubo_size, alignment);
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+                bind_cache_stream_rec = true; // sotc: SOTC_BIND_CACHE_FRAME: a copy in the ring
+                if (bind_cache_recording && SotcStats::kBindCacheFrame) {
+                    bind_cache_flat_rec.push_back({cur_bind_stage,
+                                                   static_cast<u32>(buffer_infos.size() - 1),
+                                                   ubo_size, XXH3_64bits(flat, ubo_size), offset,
+                                                   buffer_cache.StreamGeneration(),
+                                                   scheduler.CurrentTick()});
+                }
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 // Permutations compiled without enabled planes never read the buffer, so the
                 // declared binding is satisfied with a null descriptor instead of a copy.
@@ -2656,8 +4417,17 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                        (!desc.is_written || memory->IsMappedAddress(vsharp.base_address))) {
                 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
             }
+            const u64 mapped_size = size; // sotc: SOTC_BIND_CACHE_XTICK (BindCacheRepair)
             if (size == 0) {
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+                if (bind_cache_recording && SotcStats::kBindCacheXtick &&
+                    vsharp.base_address != 0 && vsharp.GetSize() != 0) {
+                    bind_cache_map_dep_rec = true; // sotc: SOTC_BIND_CACHE_FRAME: a map can fill it
+                    // sotc: SOTC_BIND_CACHE_XTICK: a null binding stays null only while the
+                    // guest memory under it stays unmapped (checked once per tick).
+                    bind_cache_repairs_rec.push_back({vsharp.base_address, vsharp.GetSize(), 0,
+                                                      nullptr, 0, false});
+                }
             } else {
                 // Guest code commonly marks a buffer as unbounded with num_records near 4GB and
                 // only touches a small part of it, and descriptors of unused bindings can hold
@@ -2687,8 +4457,97 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     LOG_DEBUG(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
                 }
-                const auto [buffer, offset] = buffer_cache.ObtainBuffer(
-                    vsharp.base_address, size, desc.is_written, desc.is_formatted);
+                // sotc: SOTC_WRITE_EXTENT. A written binding of a direct dispatch with a rule in
+                // user/write_extent.txt is marked only over the window the rule proves (the
+                // binding itself, its barriers and the aliased image / bind cache invalidations
+                // below keep the full range). Texel buffers and everything else: full range.
+                const u32 buf_index = static_cast<u32>(&desc - stage.buffers.data());
+                u32 mark_offset = 0;
+                u32 mark_size = ~0u;
+                if (SotcWriteExtent::kEnabled && desc.is_written && !desc.is_formatted &&
+                    size <= 0xFFFFFFF0ULL && t_direct_dispatch.groups != 0 &&
+                    t_direct_dispatch.hash == stage.pgm_hash) {
+                    u64 window_off = 0, window_len = 0;
+                    if (SotcWriteExtent::Narrow(stage.pgm_hash, buf_index, t_direct_dispatch.groups,
+                                                t_direct_dispatch.threads, size, window_off,
+                                                window_len)) {
+                        mark_offset = static_cast<u32>(window_off);
+                        mark_size = static_cast<u32>(window_len);
+                    }
+                }
+                // sotc: SOTC_BIND_CACHE_FRAME. A read-only V# of a read-only graphics bind: the
+                // arena and offset ObtainBuffer returned last time are still the answer while
+                // BufferCache::BindVersion and the mapping under it are as they were (the checks
+                // of a cached bind's hit, see TryBindCacheFrame); a CPU-modified range is
+                // synchronized as there, and the block stamps are made once per use epoch.
+                // Texel buffers (re-tiled from an aliasing image by every bind) and the stream
+                // ring (small buffers with SOTC_STREAM_THRESHOLD) are not memoized.
+                const bool memo_on = bind_memo_ok && !desc.is_written && !desc.is_formatted;
+                BufferMemo* memo = nullptr;
+                std::pair<const VideoCore::Buffer*, u64> obtained{};
+                if (memo_on) {
+                    if (buffer_memo.empty()) {
+                        buffer_memo.resize(BufferMemoEntries);
+                    }
+                    const u64 h = (vsharp.base_address * 0x9E3779B97F4A7C15ULL) ^
+                                  (u64{vsharp.GetSize()} * 0xC2B2AE3D27D4EB4FULL) ^ size;
+                    memo = &buffer_memo[(h ^ (h >> 29)) % BufferMemoEntries];
+                    if (memo->valid && memo->addr == vsharp.base_address &&
+                        memo->vsize == vsharp.GetSize() && memo->mapped == mapped_size &&
+                        memo->size == size && memo->version == buffer_cache.BindVersion()) {
+                        bool usable = true;
+                        if (buffer_cache.IsRegionCpuModified(memo->addr, memo->size)) {
+                            buffer_cache.SynchronizeBinding(memo->arena, memo->addr,
+                                                            static_cast<u32>(memo->size), false);
+                            // The upload may have unbound or replaced what the memo names.
+                            usable = memo->version == buffer_cache.BindVersion();
+                            if (SotcStats::kFpsLog) {
+                                SotcStats::bf_memo_repaired.fetch_add(1, std::memory_order_relaxed);
+                            }
+                        }
+                        if (usable) {
+                            if (const u16 epoch = buffer_cache.UseEpoch();
+                                memo->stamp_epoch != epoch) {
+                                buffer_cache.NoteBindUse(memo->addr, memo->size);
+                                memo->stamp_epoch = epoch;
+                            }
+                            obtained = {memo->arena, memo->offset};
+                            if (SotcStats::kFpsLog) {
+                                SotcStats::bf_memo_hits.fetch_add(1, std::memory_order_relaxed);
+                            }
+                        }
+                    }
+                }
+                if (!obtained.first) {
+                    obtained = buffer_cache.ObtainBuffer(vsharp.base_address, size, desc.is_written,
+                                                         desc.is_formatted, mark_offset, mark_size);
+                    if (memo) {
+                        // The version after the call: it may have unbound or evicted other ranges.
+                        const bool stream =
+                            static_cast<const void*>(obtained.first) ==
+                            static_cast<const void*>(&buffer_cache.GetStreamBuffer());
+                        *memo = BufferMemo{vsharp.base_address,
+                                           vsharp.GetSize(),
+                                           mapped_size,
+                                           size,
+                                           obtained.second,
+                                           buffer_cache.BindVersion(),
+                                           obtained.first,
+                                           buffer_cache.UseEpoch(),
+                                           !stream};
+                        if (SotcStats::kFpsLog) {
+                            SotcStats::bf_memo_misses.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                }
+                const auto [buffer, offset] = obtained;
+                if (SotcStats::kFpsLog && desc.is_written) {
+                    SotcWriteExtent::NoteMark(
+                        stage.pgm_hash, buf_index, vsharp.base_address, size,
+                        vsharp.base_address + (mark_size != ~0u ? mark_offset : 0),
+                        mark_size != ~0u ? mark_size : size,
+                        t_direct_dispatch.hash == stage.pgm_hash ? t_direct_dispatch.threads : 0);
+                }
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
                 const u64 adjust = offset - offset_aligned;
                 if (adjust % 4 != 0) {
@@ -2698,11 +4557,53 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 push_data.AddOffset(binding.buffer, adjust);
                 buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
                 bound_buffers.emplace_back(buffer, offset, size, desc.is_written);
+                if (bind_cache_recording) { // sotc: SOTC_BIND_CACHE checks it is still clean
+                    bind_cache_ranges_rec.emplace_back(vsharp.base_address, size);
+                    if (SotcStats::kBindCacheFrame && desc.is_formatted) {
+                        // sotc: an image registered over a texel buffer changes its binding
+                        bind_cache_texel_rec.emplace_back(vsharp.base_address,
+                                                          vsharp.base_address + size);
+                    }
+                    if (SotcStats::kBindCacheXtick) {
+                        bind_cache_repairs_rec.push_back({vsharp.base_address, vsharp.GetSize(),
+                                                          mapped_size, buffer,
+                                                          static_cast<u32>(size),
+                                                          desc.is_formatted});
+                    }
+                    // sotc: SOTC_BIND_CACHE_RANGES: what a hit cannot check. A stream-buffer copy
+                    // is a snapshot of guest memory; a texel buffer at an image's address is
+                    // re-tiled from that image by every full bind once the GPU wrote it
+                    // (SynchronizeMemoryFromImage), and HTile is refilled.
+                    if (SotcStats::kBindCacheRanges &&
+                        (static_cast<const void*>(buffer) ==
+                             static_cast<const void*>(&buffer_cache.GetStreamBuffer()) ||
+                         (desc.is_formatted && [&] {
+                             if (texture_cache.IsMeta(vsharp.base_address)) {
+                                 return true;
+                             }
+                             // Any image FindImageFromRange could return now or once the GPU
+                             // wrote it (it matches the base address only).
+                             const auto texture_lock = texture_cache.BatchLock();
+                             bool aliased = false;
+                             texture_cache.ForEachImageInRegion(
+                                 vsharp.base_address, size,
+                                 [&](VideoCore::ImageId, VideoCore::Image& image) {
+                                     aliased |= image.info.guest_address == vsharp.base_address;
+                                     return aliased;
+                                 });
+                             return aliased;
+                         }()))) {
+                        bind_cache_uncacheable = true;
+                    }
+                }
                 if (desc.is_written) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
                     Core::MemoryManager::NoteHostWrite(vsharp.base_address, size, 7,
                                                        stage.pgm_hash);
+                    if (SotcStats::kBindCacheRanges) { // sotc: drops the binds reading it
+                        BindCacheInvalidate(vsharp.base_address, size);
+                    }
                 }
                 needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
             }
@@ -2755,6 +4656,32 @@ bool Rasterizer::DepthSampledAsAttachment(VideoCore::ImageId image_id, const Vid
            !Vulkan::LiverpoolToVK::IsFormatStencilCompatible(fmt);
 }
 
+void Rasterizer::PrefetchImagesImpl(const Pipeline* pipeline) {
+    const u64 now = SotcStats::NowNs(); // sotc: one clock read per draw
+    // sotc: SOTC_ASYNC_IMAGE_CREATE. Reads the T#s as BindTextures will on the draw thread (from
+    // this thread's copy of the per-draw data, Shader::g_info_slot 0) with the same validity
+    // checks; descriptor arrays are left out.
+    for (const Shader::Info* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        for (const auto& image_desc : stage->images) {
+            if (image_desc.array_size != 0) {
+                continue;
+            }
+            const auto tsharp = image_desc.GetSharp(*stage);
+            const auto data_fmt = tsharp.GetDataFmt();
+            const auto num_fmt = tsharp.GetNumberFmt();
+            if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid ||
+                !memory->IsValidGpuMapping(tsharp.Address(), 0) ||
+                !magic_enum::enum_contains(data_fmt) || !magic_enum::enum_contains(num_fmt)) {
+                continue;
+            }
+            texture_cache.PrefetchTexture(tsharp, image_desc, now);
+        }
+    }
+}
+
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                               u32 set) {
     const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the pass
@@ -2787,16 +4714,24 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     AmdGpu::IsInteger(element_nfmt) == is_integer &&
                     element.GetNumberConversion() == tsharp.GetNumberConversion();
                 if (!bindable) {
+                    // sotc: SOTC_BIND_CACHE_FRAME: a guest map can make the element bindable
+                    bind_cache_map_dep_rec |= bind_cache_recording;
                     image_bindings.emplace_back(std::piecewise_construct, std::tuple{},
                                                 std::tuple{});
                     continue;
                 }
                 if (element.lod_hw_cnt_en) {
                     SotcLod::Mark(element.counter_bank_id);
+                    if (bind_cache_recording) { // sotc: SOTC_BIND_CACHE repeats it on a hit
+                        bind_cache_lod_rec.push_back(element.counter_bank_id);
+                    }
                 }
                 auto& [image_id, desc] = image_bindings.emplace_back(
                     std::piecewise_construct, std::tuple{}, std::tuple{element, image_desc});
                 image_id = texture_cache.FindImage(desc);
+                if (bind_cache_recording && SotcStats::kBindCacheFrame) {
+                    BindCacheNoteLookup(desc, image_id); // sotc: SOTC_BIND_CACHE_FRAME
+                }
                 auto* image = &texture_cache.GetImage(image_id);
                 if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                     image_id = depth_image_id;
@@ -2809,6 +4744,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         }
         if (tsharp.lod_hw_cnt_en) {
             SotcLod::Mark(tsharp.counter_bank_id); // GET_LOD_STATS (sotc_lod_stats.h)
+            if (bind_cache_recording) { // sotc: SOTC_BIND_CACHE repeats it on a hit
+                bind_cache_lod_rec.push_back(tsharp.counter_bank_id);
+            }
         }
         // sotc: SOTC_TSHARP_TRACE=1: mip fields of the large streamed textures (first 120
         // distinct address/field combinations): which mips the game says are resident.
@@ -2877,6 +4815,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         "data_format={}, num_format={}",
                         tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
                         static_cast<u32>(num_fmt));
+            // sotc: SOTC_BIND_CACHE_FRAME: a guest map can make the T# valid
+            bind_cache_map_dep_rec |= bind_cache_recording;
             image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
             image_descriptor_array_sizes.push_back(1);
             continue;
@@ -2899,6 +4839,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             }
 
             image_id = texture_cache.FindImage(desc);
+            if (bind_cache_recording && SotcStats::kBindCacheFrame) {
+                BindCacheNoteLookup(desc, image_id); // sotc: SOTC_BIND_CACHE_FRAME
+            }
             auto* image = &texture_cache.GetImage(image_id);
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.
@@ -2928,9 +4871,15 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 old_image.binding.needs_rebind) {
                 old_image.binding = {};
                 image_id = texture_cache.FindImage(desc);
+                if (bind_cache_recording && SotcStats::kBindCacheFrame) {
+                    BindCacheNoteLookup(desc, image_id); // sotc: SOTC_BIND_CACHE_FRAME
+                }
             }
 
             bound_images.emplace_back(image_id);
+            if (is_storage && SotcStats::kBindCacheRanges) {
+                BindCacheInvalidateImage(image_id); // sotc: drops the binds sampling it
+            }
 
             auto& image = texture_cache.GetImage(image_id);
             auto& image_view = texture_cache.FindTexture(image_id, desc);
@@ -2940,6 +4889,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             // target in feedback loop. Depth images are excluded because they can't be bound as
             // storage and feedback loop doesn't make sense for them
             if ((binding.force_general || binding.is_target) && !image.info.props.is_depth) {
+                bind_cache_uncacheable = true; // sotc: SOTC_BIND_CACHE: feedback loop / storage
                 if (instance.IsAttachmentFeedbackLoopLayoutSupported() && image.binding.is_target) {
                     needs_barrier |= runtime.Transit(
                         &image, vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT,
@@ -2952,6 +4902,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 }
             } else {
                 if (is_storage) {
+                    bind_cache_uncacheable = true; // sotc: SOTC_BIND_CACHE
                     needs_barrier |= runtime.Transit(
                         &image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
                         vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
@@ -2964,6 +4915,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     // pass at every such draw (~350 per frame in the Shrine). SOTC_DEPTH_RO=0 off.
                     if (DepthSampledAsAttachment(image_id, image, desc,
                                                  stage.sw_stage == Shader::SwStage::Compute)) {
+                        bind_cache_uncacheable = true; // sotc: SOTC_BIND_CACHE: register-dependent
                         needs_barrier |= runtime.Transit(
                             &image, vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal,
                             kDepthReadOnlyStencilStages, kDepthReadOnlyStencilAccess,
@@ -2975,6 +4927,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         needs_barrier |= runtime.Transit(
                             &image, new_layout, vk::PipelineStageFlagBits2::eAllCommands,
                             vk::AccessFlagBits2::eShaderRead, desc.view_info.range);
+                        if (bind_cache_recording) { // sotc: SOTC_BIND_CACHE replays it on a hit
+                            BindCacheNoteImage(image_id, new_layout,
+                                               vk::PipelineStageFlagBits2::eAllCommands,
+                                               vk::AccessFlagBits2::eShaderRead,
+                                               desc.view_info.range);
+                        }
                     }
                 }
             }
@@ -3045,6 +5003,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         if (texture_cache.GetImage(cb_descs[0].first).usage.vo_surface &&
             ui.usage.render_target && ui.info.pixel_format == vk::Format::eR8G8B8A8Srgb &&
             scene.info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
+            bind_cache_uncacheable = true; // sotc: SOTC_BIND_CACHE
             Dlssg::NoteComposite(image_bindings[ui_i ^ 1].first, image_bindings[ui_i].first,
                                  texture_cache);
             NoteUiShadow();
@@ -3098,6 +5057,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             ui_asset = &image;
         }
     }
+    // sotc: SOTC_BIND_CACHE: the composite (TakeHudless, DLSS), the probe and the bilinear UI
+    // filter depend on more than the cache key; those binds are not stored.
+    if (ui_asset || hudless_ui_info >= 0 || dlss_probe) {
+        bind_cache_uncacheable = true;
+    }
     const bool bindless = IsBindlessStage(instance, stage);
     const auto bindless_range = Shader::GetBindlessSamplerRange(stage.sw_stage);
     for (u32 sampler_index = 0; sampler_index < stage.samplers.size(); ++sampler_index) {
@@ -3134,6 +5098,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         u32 heap_slot = 0;
         const auto vk_sampler = texture_cache.GetSampler(
             ssharp, liverpool->DrawRegs().ta_bc_base, sampler.is_depth, &heap_slot);
+        if (bind_cache_recording && SotcStats::kBindCacheXtick) {
+            // sotc: SOTC_BIND_CACHE_XTICK: touched again by the first hit of each later tick
+            bind_cache_samplers_rec.push_back(
+                {ssharp, vk_sampler, heap_slot, sampler.is_depth, bindless});
+        }
         if (bindless) {
             // sotc: the shader reads the heap index from this slot of the push constants.
             const u32 slot = bindless_range.base + sampler_index;
@@ -3169,6 +5138,16 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
     const auto& key = pipeline->GetGraphicsKey();
     RenderState state;
     ui_shadow_hit = false; // sotc: BeginUiShadow
+    if (rs_memo_prepared) { // sotc: SOTC_RS_MEMO
+        rs_memo_prepared = false;
+        if (RsMemoBegin(state)) {
+            return state;
+        }
+    }
+    bool rs_cb0_base = false;
+    vk::ImageLayout rs_depth_layout{};
+    vk::PipelineStageFlags2 rs_depth_stages{};
+    vk::AccessFlags2 rs_depth_access{};
     state.width = instance.GetMaxFramebufferWidth();
     state.height = instance.GetMaxFramebufferHeight();
     state.num_layers = std::numeric_limits<u16>::max();
@@ -3244,6 +5223,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             hudless_vo_width = image->info.size.width;
             hudless_vo_height = image->info.size.height;
         }
+        rs_cb0_base |= cb == 0 && mip == 0 && slice == 0; // sotc: SOTC_RS_MEMO
         if (cb == 0 && mip == 0 && slice == 0 && // sotc: BeginUiShadow
             Dlssg::UiTarget(image->info.guest_address, image->info.size.width,
                             image->info.size.height, ui_shadow_width, ui_shadow_height)) {
@@ -3297,17 +5277,18 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             const char* v = std::getenv("SOTC_DEPTH_RO");
             return !v || v[0] != '0';
         }();
-        if (depth_ro && new_layout == vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal) {
-            needs_barrier |= runtime.Transit(&image, new_layout, kDepthReadOnlyStencilStages,
-                                             kDepthReadOnlyStencilAccess, desc.view_info.range);
-        } else {
-            needs_barrier |= runtime.Transit(&image, new_layout,
-                                             vk::PipelineStageFlagBits2::eEarlyFragmentTests |
-                                                 vk::PipelineStageFlagBits2::eLateFragmentTests,
-                                             vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
-                                                 vk::AccessFlagBits2::eDepthStencilAttachmentRead,
-                                             desc.view_info.range);
-        }
+        // sotc: the stages and access are kept for SOTC_RS_MEMO (same Transit as before).
+        const bool depth_ro_layout =
+            depth_ro && new_layout == vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal;
+        rs_depth_layout = new_layout;
+        rs_depth_stages = depth_ro_layout ? kDepthReadOnlyStencilStages
+                                          : vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                                                vk::PipelineStageFlagBits2::eLateFragmentTests;
+        rs_depth_access = depth_ro_layout ? kDepthReadOnlyStencilAccess
+                                          : vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+                                                vk::AccessFlagBits2::eDepthStencilAttachmentRead;
+        needs_barrier |= runtime.Transit(&image, new_layout, rs_depth_stages, rs_depth_access,
+                                         desc.view_info.range);
 
         state.width = std::min<u32>(state.width, image.info.size.width);
         state.height = std::min<u32>(state.height, image.info.size.height);
@@ -3342,6 +5323,31 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         state.num_layers = 1;
     }
 
+    if (RsMemoEnabled()) { // sotc: SOTC_RS_MEMO: kept unless the pass clears or loops back
+        bool storable = !attachment_feedback_loop;
+        for (u32 cb = 0; cb < state.num_color_attachments; ++cb) {
+            storable &= !state.color_attachments[cb].is_clear;
+        }
+        const auto& ds = state.depth_stencil_attachment;
+        storable &= !ds.depth_clear && !ds.stencil_clear;
+        rs_memo.valid = storable;
+        if (storable) {
+            rs_memo.key_len = rs_key_len;
+            std::memcpy(rs_memo.key.data(), rs_key.data(), rs_key_len * sizeof(u32));
+            rs_memo.cb0_base = rs_cb0_base;
+            rs_memo.color_samples = key.color_samples;
+            rs_memo.tick = scheduler.CurrentTick();
+            rs_memo.texture_generation = texture_cache.BindGeneration();
+            rs_memo.meta_epoch = texture_cache.MetaEpoch();
+            rs_memo.state = state;
+            rs_memo.depth_layout = rs_depth_layout;
+            rs_memo.depth_stages = rs_depth_stages;
+            rs_memo.depth_access = rs_depth_access;
+        } else if (SotcStats::kFpsLog) {
+            SotcStats::rs_memo_unstored.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
     return state;
 }
 
@@ -3351,7 +5357,8 @@ void Rasterizer::Resolve() {
     VideoCore::TextureCache::ImageDesc mrt0_desc{liverpool->DrawRegs().color_buffers[0], mrt0_hint};
     VideoCore::TextureCache::ImageDesc mrt1_desc{liverpool->DrawRegs().color_buffers[1], mrt1_hint};
     auto& mrt0_image = texture_cache.GetImage(texture_cache.FindImage(mrt0_desc, true));
-    auto& mrt1_image = texture_cache.GetImage(texture_cache.FindImage(mrt1_desc, true));
+    const auto mrt1_id = texture_cache.FindImage(mrt1_desc, true);
+    auto& mrt1_image = texture_cache.GetImage(mrt1_id);
 
     ScopeMarkerBegin(fmt::format("Resolve:MRT0={:#x}:MRT1={:#x}",
                                  liverpool->DrawRegs().color_buffers[0].Address(),
@@ -3359,10 +5366,20 @@ void Rasterizer::Resolve() {
     runtime.ResolveImage(&mrt0_image, &mrt1_image, mrt0_desc.view_info.range,
                          mrt1_desc.view_info.range);
     ScopeMarkerEnd();
+    if (SotcStats::kBindCacheRanges) { // sotc: drops the binds reading the written image
+        BindCacheInvalidateImage(mrt1_id);
+    } else if (SotcStats::kBindCache) { // sotc: a GPU image write a cached texel buffer may alias
+        bind_cache_write_epoch.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
     auto& regs = liverpool->DrawRegs();
+    // sotc: a GPU image write a cached texel buffer may alias (SOTC_BIND_CACHE_RANGES: the
+    // written image is dropped below instead).
+    if (SotcStats::kBindCache && !SotcStats::kBindCacheRanges) {
+        bind_cache_write_epoch.fetch_add(1, std::memory_order_relaxed);
+    }
 
     auto read_desc = VideoCore::TextureCache::ImageDesc(
         regs.depth_buffer, regs.depth_view, regs.depth_control,
@@ -3372,7 +5389,9 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
         regs.depth_htile_data_base.GetAddress(), liverpool->DrawDbExtent(), true);
 
     auto& read_image = texture_cache.GetImage(texture_cache.FindImage(read_desc));
-    auto& write_image = texture_cache.GetImage(texture_cache.FindImage(write_desc));
+    const auto write_id = texture_cache.FindImage(write_desc);
+    auto& write_image = texture_cache.GetImage(write_id);
+    BindCacheInvalidateImage(write_id); // sotc: SOTC_BIND_CACHE_RANGES (no-op otherwise)
 
     VideoCore::SubresourceRange sub_range;
     sub_range.base.layer = liverpool->DrawRegs().depth_view.slice_start;
@@ -3408,6 +5427,15 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
     if (!is_gds) {
         texture_cache.InvalidateMemoryFromGPU(address, num_bytes, true);
     }
+    if (SotcStats::kBindCacheRanges) {
+        // sotc: drops the binds reading the range. GDS is not guest memory, and a hit replays
+        // the GDS buffer's access check (barrier) as the full bind does.
+        if (!is_gds) {
+            BindCacheInvalidate(address, num_bytes);
+        }
+    } else if (SotcStats::kBindCache) { // sotc: a GPU write: no cached bind survives it
+        bind_cache_write_epoch.fetch_add(1, std::memory_order_relaxed);
+    }
     runtime.FillBuffer(buffer, offset, num_bytes, value);
 }
 
@@ -3424,6 +5452,13 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
     }
     if (!dst_gds) {
         texture_cache.InvalidateMemoryFromGPU(dst, num_bytes, true);
+    }
+    if (SotcStats::kBindCacheRanges) {
+        if (!dst_gds) { // sotc: drops the binds reading the destination (GDS: see FillBuffer)
+            BindCacheInvalidate(dst, num_bytes);
+        }
+    } else if (SotcStats::kBindCache) { // sotc: a GPU write: no cached bind survives it
+        bind_cache_write_epoch.fetch_add(1, std::memory_order_relaxed);
     }
     SotcStats::dma_gpu_copies.fetch_add(1, std::memory_order_relaxed);
     SotcStats::dma_gpu_bytes.fetch_add(num_bytes, std::memory_order_relaxed);
@@ -3472,12 +5507,19 @@ bool Rasterizer::InvalidateMemoryOnGuestFault(VAddr addr, u64 size) {
     if (!IsMapped(addr, size)) {
         return false;
     }
+    // sotc: the texture cache part is timed as the fault stage "tc" (SotcStats::FaultStat).
     if (VideoCore::FaultGrace::Pages() != 0) {
-        texture_cache.InvalidateMemory(addr, size);
+        {
+            const SotcStats::FaultStat::StageScope tc{SotcStats::FaultStat::kStTc};
+            texture_cache.InvalidateMemory(addr, size);
+        }
         buffer_cache.InvalidateMemory(addr, size, false, true);
     } else {
         buffer_cache.InvalidateMemory(addr, size, false);
-        texture_cache.InvalidateMemory(addr, size);
+        {
+            const SotcStats::FaultStat::StageScope tc{SotcStats::FaultStat::kStTc};
+            texture_cache.InvalidateMemory(addr, size);
+        }
     }
     return true;
 }
@@ -3507,6 +5549,7 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
 }
 
 void Rasterizer::MapMemory(VAddr addr, u64 size) {
+    map_epoch.fetch_add(1, std::memory_order_acq_rel); // sotc: SOTC_PARALLEL_RECORD
     buffer_cache.OnMappingChanged();
     {
         std::scoped_lock lock{mapped_ranges_mutex};
@@ -3519,6 +5562,7 @@ void Rasterizer::RegisterMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
+    map_epoch.fetch_add(1, std::memory_order_acq_rel); // sotc: SOTC_PARALLEL_RECORD
     buffer_cache.OnMappingChanged();
     // sotc: an unmapped range forgets its GPU-written state instead of downloading it (a 512 KB
     // window around it) into memory that is being given back: with texture streaming that
@@ -3558,19 +5602,182 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     }
 }
 
-void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
-    UpdateViewportScissorState();
-    UpdateDepthStencilState();
-    UpdatePrimitiveState(is_indexed);
-    UpdateRasterizationState();
-    UpdateColorBlendingState(pipeline);
+void Rasterizer::PrepareDraw(const AmdGpu::Regs& regs, const Pipeline* resolved, bool is_indexed,
+                             bool direct, PreparedDraw& out) const {
+    // sotc: SOTC_PARALLEL_RECORD, on a GpuPrep thread: its own registers (replayed up to this op)
+    // and its own Shader::g_info_slot, filled from the op like the draw thread's. Only the
+    // register-only inputs the draw thread would compute the same way; the decisions stay there.
+    out.valid = false;
+    out.has_offsets = false;
+    if (!resolved || resolved->IsCompute()) {
+        return;
+    }
+    const auto* pipeline = static_cast<const GraphicsPipeline*>(resolved);
+    // BindResources drops a draw with a stage without user data (GetDrawOffsets would read it).
+    for (const auto* stage : pipeline->GetStages()) {
+        if (stage && stage->UserData().data() == nullptr) {
+            return;
+        }
+    }
+    bool refuse = false;
+    out.dynamic = DynamicValues{}; // the fields a disabled test leaves alone stay zero (verify)
+    ComputeDynamic(regs, is_indexed, out.dynamic, &refuse);
+    if (refuse) {
+        return;
+    }
+    out.is_indexed = is_indexed;
+    out.push_data = MakeUserData(regs);
+    out.fast_static = FastBindStatic(pipeline, regs);
+    out.cache_eligible = BindCacheEligible(pipeline, regs);
+    out.fast_hash = FastBindHash(pipeline, out.push_data, regs);
+    out.res_ok = SotcStats::kBindCacheFrame && out.cache_eligible &&
+                 BindResourceHash(pipeline, out.res_hash);
+    if (direct) {
+        const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
+        const auto& fetch_shader = pipeline->GetFetchShader();
+        const auto user_data = vs_info.UserData();
+        const auto in_range = [&](s32 sgpr) {
+            return sgpr == -1 || static_cast<u32>(sgpr) < user_data.size();
+        };
+        if (fetch_shader.Empty() ||
+            (in_range(fetch_shader.vertex_offset_sgpr) &&
+             in_range(fetch_shader.instance_offset_sgpr))) {
+            std::tie(out.vertex_offset, out.instance_offset) =
+                GetDrawOffsets(regs, vs_info, fetch_shader);
+            out.has_offsets = true;
+        }
+    }
+    out.valid = true;
+}
+
+void Rasterizer::PrefetchImagesShared(const Pipeline* pipeline) {
+    // sotc: SOTC_PARALLEL_RECORD: the prep threads take PrefetchImages off the command processor.
+    // TextureCache::PrefetchTexture keeps per-T# state for a single caller, hence the lock.
+    if (pipeline && texture_cache.ImagePrefetchEnabled()) {
+        std::scoped_lock lock{prep_prefetch_mutex};
+        PrefetchImagesImpl(pipeline);
+    }
+}
+
+const PreparedDraw* Rasterizer::CheckPrepared(const PreparedDraw& prepared,
+                                              const GraphicsPipeline* pipeline, bool is_indexed,
+                                              bool direct) {
+    // sotc: SOTC_PR_VERIFY=N: every Nth prepared draw is computed inline as well; a difference is
+    // logged (first 16), counted, and the inline values are used.
+    static const u32 verify_every = [] {
+        const char* v = std::getenv("SOTC_PR_VERIFY");
+        return v ? static_cast<u32>(std::strtoul(v, nullptr, 0)) : 0u;
+    }();
+    if (prepared.is_indexed != is_indexed) {
+        return nullptr; // cannot happen (same op); refused rather than trusted
+    }
+    if (verify_every == 0 || ++pr_verify_count % verify_every != 0) {
+        return &prepared;
+    }
+    const auto& regs = liverpool->DrawRegs();
+    DynamicValues dynamic;
+    ComputeDynamic(regs, is_indexed, dynamic);
+    const auto push = MakeUserData(regs);
+    const bool fast_static = FastBindStatic(pipeline, regs);
+    const bool cache_eligible = BindCacheEligible(pipeline, regs);
+    const u64 fast_hash = FastBindHash(pipeline, push, regs);
+    u32 mismatch = 0;
+    mismatch |= SameDynamicValues(dynamic, prepared.dynamic) ? 0u : 1u;
+    mismatch |= std::memcmp(&push, &prepared.push_data, sizeof(push)) == 0 ? 0u : 2u;
+    mismatch |= fast_static == prepared.fast_static ? 0u : 4u;
+    mismatch |= cache_eligible == prepared.cache_eligible ? 0u : 8u;
+    mismatch |= fast_hash == prepared.fast_hash ? 0u : 16u;
+    if (direct && prepared.has_offsets) {
+        const auto offsets = GetDrawOffsets(regs, pipeline->GetStage(Shader::SwStage::Vertex),
+                                            pipeline->GetFetchShader());
+        mismatch |= offsets == std::pair<u32, u32>{prepared.vertex_offset,
+                                                   prepared.instance_offset}
+                        ? 0u
+                        : 32u;
+    }
+    if (mismatch == 0) {
+        return &prepared;
+    }
+    SotcStats::pr_verify_mismatches.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<u32> shown{0};
+    if (shown.fetch_add(1, std::memory_order_relaxed) < 16) {
+        std::fprintf(stderr,
+                     "SOTC PR verify mismatch (draw %llu): mask %#x (1 dynamic, 2 push data, 4 fast "
+                     "eligible, 8 cache eligible, 16 fast hash, 32 offsets), vs %#llx ps %#llx\n",
+                     static_cast<unsigned long long>(pr_verify_count), mismatch,
+                     static_cast<unsigned long long>(regs.vs_program.Address<uintptr_t>()),
+                     static_cast<unsigned long long>(regs.ps_program.Address<uintptr_t>()));
+    }
+    return nullptr;
+}
+
+void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed,
+                                    const PreparedDraw* prepared) const {
+    // sotc: the values are computed from the registers alone (ComputeDynamic, also run ahead by
+    // SOTC_PARALLEL_RECORD's prep threads) and handed to DynamicState in the order of the former
+    // Update*State calls (ApplyDynamic).
+    if (prepared) {
+        ApplyDynamic(prepared->dynamic, pipeline);
+    } else {
+        DynamicValues values;
+        ComputeDynamic(liverpool->DrawRegs(), is_indexed, values);
+        ApplyDynamic(values, pipeline);
+    }
 
     auto& dynamic_state = scheduler.GetDynamicState();
     dynamic_state.Commit(instance, scheduler.CommandBuffer());
 }
 
-void Rasterizer::UpdateViewportScissorState() const {
-    const auto& regs = liverpool->DrawRegs();
+void Rasterizer::ComputeDynamic(const AmdGpu::Regs& regs, const bool is_indexed,
+                                DynamicValues& out, bool* refuse) const {
+    ComputeViewportScissor(regs, out);
+    ComputeDepthStencil(regs, out);
+    ComputePrimitive(regs, is_indexed, out, refuse);
+    out.line_width = regs.line_control.Width();
+    out.blend_constants = regs.blend_constants;
+}
+
+void Rasterizer::ApplyDynamic(const DynamicValues& values, const GraphicsPipeline* pipeline) const {
+    auto& dynamic_state = scheduler.GetDynamicState();
+    // UpdateViewportScissorState
+    dynamic_state.SetViewports(values.viewports);
+    dynamic_state.SetScissors(values.scissors);
+    // UpdateDepthStencilState
+    dynamic_state.SetDepthTestEnabled(values.depth_test);
+    if (values.depth_test) {
+        dynamic_state.SetDepthWriteEnabled(values.depth_write);
+        dynamic_state.SetDepthCompareOp(values.depth_compare);
+    }
+    dynamic_state.SetDepthBoundsTestEnabled(values.depth_bounds_test);
+    if (values.depth_bounds_test) {
+        dynamic_state.SetDepthBounds(values.depth_bounds_min, values.depth_bounds_max);
+    }
+    dynamic_state.SetDepthBiasEnabled(values.depth_bias);
+    if (values.depth_bias) {
+        dynamic_state.SetDepthBias(values.bias_constant, values.bias_clamp, values.bias_slope);
+    }
+    dynamic_state.SetStencilTestEnabled(values.stencil_test);
+    if (values.stencil_test) {
+        dynamic_state.SetStencilOps(values.stencil_front, values.stencil_back);
+        dynamic_state.SetStencilReferences(values.stencil_ref_front, values.stencil_ref_back);
+        dynamic_state.SetStencilWriteMasks(values.stencil_write_front, values.stencil_write_back);
+        dynamic_state.SetStencilCompareMasks(values.stencil_compare_front,
+                                             values.stencil_compare_back);
+    }
+    // UpdatePrimitiveState
+    dynamic_state.SetPrimitiveRestartEnabled(values.prim_restart);
+    dynamic_state.SetRasterizerDiscardEnabled(values.rasterizer_discard);
+    dynamic_state.SetCullMode(values.cull_mode);
+    dynamic_state.SetFrontFace(values.front_face);
+    // UpdateRasterizationState
+    dynamic_state.SetLineWidth(values.line_width);
+    // UpdateColorBlendingState
+    dynamic_state.SetBlendConstants(values.blend_constants);
+    dynamic_state.SetColorWriteMasks(pipeline->GetGraphicsKey().write_masks);
+    dynamic_state.SetAttachmentFeedbackLoopEnabled(attachment_feedback_loop);
+}
+
+void Rasterizer::ComputeViewportScissor(const AmdGpu::Regs& regs, DynamicValues& out) const {
 
     const auto combined_scissor_value_tl = [](s16 scr, s16 win, s16 gen, s16 win_offset) {
         return std::max({scr, s16(win + win_offset), s16(gen + win_offset)});
@@ -3598,8 +5805,10 @@ void Rasterizer::UpdateViewportScissorState() const {
         regs.generic_scissor.bottom_right_y,
         enable_offset ? regs.window_offset.window_y_offset : 0);
 
-    boost::container::static_vector<vk::Viewport, AmdGpu::NUM_VIEWPORTS> viewports;
-    boost::container::static_vector<vk::Rect2D, AmdGpu::NUM_VIEWPORTS> scissors;
+    auto& viewports = out.viewports;
+    auto& scissors = out.scissors;
+    viewports.clear();
+    scissors.clear();
 
     if (regs.polygon_control.enable_window_offset &&
         (regs.window_offset.window_x_offset != 0 || regs.window_offset.window_y_offset != 0)) {
@@ -3694,44 +5903,38 @@ void Rasterizer::UpdateViewportScissorState() const {
         viewports.push_back(empty_viewport);
         scissors.push_back(empty_scissor);
     }
-
-    auto& dynamic_state = scheduler.GetDynamicState();
-    dynamic_state.SetViewports(viewports);
-    dynamic_state.SetScissors(scissors);
 }
 
-void Rasterizer::UpdateDepthStencilState() const {
-    const auto& regs = liverpool->DrawRegs();
-    auto& dynamic_state = scheduler.GetDynamicState();
-
+void Rasterizer::ComputeDepthStencil(const AmdGpu::Regs& regs, DynamicValues& out) const {
     const auto depth_test_enabled =
         regs.depth_control.depth_enable && regs.depth_buffer.DepthValid();
-    dynamic_state.SetDepthTestEnabled(depth_test_enabled);
+    out.depth_test = depth_test_enabled;
     if (depth_test_enabled) {
-        dynamic_state.SetDepthWriteEnabled(regs.depth_control.depth_write_enable &&
-                                           !regs.depth_render_control.depth_clear_enable);
-        dynamic_state.SetDepthCompareOp(LiverpoolToVK::CompareOp(regs.depth_control.depth_func));
+        out.depth_write = regs.depth_control.depth_write_enable &&
+                          !regs.depth_render_control.depth_clear_enable;
+        out.depth_compare = LiverpoolToVK::CompareOp(regs.depth_control.depth_func);
     }
 
     const auto depth_bounds_test_enabled = regs.depth_control.depth_bounds_enable;
-    dynamic_state.SetDepthBoundsTestEnabled(depth_bounds_test_enabled);
+    out.depth_bounds_test = depth_bounds_test_enabled;
     if (depth_bounds_test_enabled) {
-        dynamic_state.SetDepthBounds(regs.depth_bounds_min, regs.depth_bounds_max);
+        out.depth_bounds_min = regs.depth_bounds_min;
+        out.depth_bounds_max = regs.depth_bounds_max;
     }
 
     const auto depth_bias_enabled = regs.polygon_control.NeedsBias();
-    dynamic_state.SetDepthBiasEnabled(depth_bias_enabled);
+    out.depth_bias = depth_bias_enabled;
     if (depth_bias_enabled) {
         const bool front = regs.polygon_control.enable_polygon_offset_front;
-        dynamic_state.SetDepthBias(
-            front ? regs.poly_offset.front_offset : regs.poly_offset.back_offset,
-            regs.poly_offset.depth_bias,
-            (front ? regs.poly_offset.front_scale : regs.poly_offset.back_scale) / 16.f);
+        out.bias_constant = front ? regs.poly_offset.front_offset : regs.poly_offset.back_offset;
+        out.bias_clamp = regs.poly_offset.depth_bias;
+        out.bias_slope =
+            (front ? regs.poly_offset.front_scale : regs.poly_offset.back_scale) / 16.f;
     }
 
     const auto stencil_test_enabled =
         regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid();
-    dynamic_state.SetStencilTestEnabled(stencil_test_enabled);
+    out.stencil_test = stencil_test_enabled;
     if (stencil_test_enabled) {
         const StencilOps front_ops{
             .fail_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_fail_front),
@@ -3745,7 +5948,8 @@ void Rasterizer::UpdateDepthStencilState() const {
             .depth_fail_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_zfail_back),
             .compare_op = LiverpoolToVK::CompareOp(regs.depth_control.stencil_bf_func),
         } : front_ops;
-        dynamic_state.SetStencilOps(front_ops, back_ops);
+        out.stencil_front = front_ops;
+        out.stencil_back = back_ops;
 
         const bool stencil_clear = regs.depth_render_control.stencil_clear_enable;
         const auto front = regs.stencil_ref_front;
@@ -3776,17 +5980,17 @@ void Rasterizer::UpdateDepthStencilState() const {
             LOG_WARNING(Render_Vulkan, "Stencil test requires test_val while ReplaceOp requires "
                                        "op_val; the stencil test will use op_val");
         }
-        dynamic_state.SetStencilReferences(front_op ? front.stencil_op_val : front.stencil_test_val,
-                                           back_op ? back.stencil_op_val : back.stencil_test_val);
-        dynamic_state.SetStencilWriteMasks(!stencil_clear ? front.stencil_write_mask : 0U,
-                                           !stencil_clear ? back.stencil_write_mask : 0U);
-        dynamic_state.SetStencilCompareMasks(front.stencil_mask, back.stencil_mask);
+        out.stencil_ref_front = front_op ? front.stencil_op_val : front.stencil_test_val;
+        out.stencil_ref_back = back_op ? back.stencil_op_val : back.stencil_test_val;
+        out.stencil_write_front = !stencil_clear ? front.stencil_write_mask : 0U;
+        out.stencil_write_back = !stencil_clear ? back.stencil_write_mask : 0U;
+        out.stencil_compare_front = front.stencil_mask;
+        out.stencil_compare_back = back.stencil_mask;
     }
 }
 
-void Rasterizer::UpdatePrimitiveState(const bool is_indexed) const {
-    const auto& regs = liverpool->DrawRegs();
-    auto& dynamic_state = scheduler.GetDynamicState();
+void Rasterizer::ComputePrimitive(const AmdGpu::Regs& regs, const bool is_indexed,
+                                  DynamicValues& out, bool* refuse) const {
 
     const auto is_list_topology = [](const AmdGpu::PrimitiveType type) {
         const auto topology = LiverpoolToVK::PrimitiveType(type);
@@ -3806,8 +6010,15 @@ void Rasterizer::UpdatePrimitiveState(const bool is_indexed) const {
         (regs.enable_primitive_restart & 1) != 0 &&
         (instance.IsListRestartSupported() || !is_list_topology(regs.primitive_type)) &&
         (instance.IsPatchListRestartSupported() || !is_patch_list_topology(regs.primitive_type));
-    ASSERT_MSG(!is_indexed || !prim_restart || regs.primitive_restart_index == 0xFFFF ||
-                   regs.primitive_restart_index == 0xFFFFFFFF,
+    // sotc: a prep thread (SOTC_PARALLEL_RECORD) refuses the draw instead of asserting: the
+    // draw thread may still drop it, and asserts inline otherwise.
+    const bool restart_supported = !is_indexed || !prim_restart ||
+                                   regs.primitive_restart_index == 0xFFFF ||
+                                   regs.primitive_restart_index == 0xFFFFFFFF;
+    if (refuse && !restart_supported) {
+        *refuse = true;
+    }
+    ASSERT_MSG(refuse || restart_supported,
                "Primitive restart index other than -1 is not supported yet");
 
     const auto cull_mode = LiverpoolToVK::IsPrimitiveCulled(regs.primitive_type)
@@ -3815,25 +6026,43 @@ void Rasterizer::UpdatePrimitiveState(const bool is_indexed) const {
                                : vk::CullModeFlagBits::eNone;
     const auto front_face = LiverpoolToVK::FrontFace(regs.polygon_control.front_face);
 
-    dynamic_state.SetPrimitiveRestartEnabled(prim_restart);
-    dynamic_state.SetRasterizerDiscardEnabled(regs.clipper_control.dx_rasterization_kill);
-    dynamic_state.SetCullMode(cull_mode);
-    dynamic_state.SetFrontFace(front_face);
+    out.prim_restart = prim_restart;
+    out.rasterizer_discard = regs.clipper_control.dx_rasterization_kill;
+    out.cull_mode = cull_mode;
+    out.front_face = front_face;
 }
 
-void Rasterizer::UpdateRasterizationState() const {
-    const auto& regs = liverpool->DrawRegs();
-    auto& dynamic_state = scheduler.GetDynamicState();
-    dynamic_state.SetLineWidth(regs.line_control.Width());
+bool SameDynamicValues(const DynamicValues& a, const DynamicValues& b) {
+    // sotc: SOTC_PR_VERIFY: bit equality of every field (the vectors' live elements only).
+    const auto same = [](const auto& x, const auto& y) {
+        return std::memcmp(&x, &y, sizeof(x)) == 0;
+    };
+    if (a.viewports.size() != b.viewports.size() || a.scissors.size() != b.scissors.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.viewports.size(); ++i) {
+        if (!same(a.viewports[i], b.viewports[i]) || !same(a.scissors[i], b.scissors[i])) {
+            return false;
+        }
+    }
+    return a.depth_test == b.depth_test && a.depth_write == b.depth_write &&
+           a.depth_bounds_test == b.depth_bounds_test && a.depth_bias == b.depth_bias &&
+           a.stencil_test == b.stencil_test && a.prim_restart == b.prim_restart &&
+           a.rasterizer_discard == b.rasterizer_discard && a.depth_compare == b.depth_compare &&
+           same(a.depth_bounds_min, b.depth_bounds_min) &&
+           same(a.depth_bounds_max, b.depth_bounds_max) &&
+           same(a.bias_constant, b.bias_constant) && same(a.bias_clamp, b.bias_clamp) &&
+           same(a.bias_slope, b.bias_slope) && a.stencil_front == b.stencil_front &&
+           a.stencil_back == b.stencil_back && a.stencil_ref_front == b.stencil_ref_front &&
+           a.stencil_ref_back == b.stencil_ref_back &&
+           a.stencil_write_front == b.stencil_write_front &&
+           a.stencil_write_back == b.stencil_write_back &&
+           a.stencil_compare_front == b.stencil_compare_front &&
+           a.stencil_compare_back == b.stencil_compare_back && a.cull_mode == b.cull_mode &&
+           a.front_face == b.front_face && same(a.line_width, b.line_width) &&
+           same(a.blend_constants, b.blend_constants);
 }
 
-void Rasterizer::UpdateColorBlendingState(const GraphicsPipeline* pipeline) const {
-    const auto& regs = liverpool->DrawRegs();
-    auto& dynamic_state = scheduler.GetDynamicState();
-    dynamic_state.SetBlendConstants(regs.blend_constants);
-    dynamic_state.SetColorWriteMasks(pipeline->GetGraphicsKey().write_masks);
-    dynamic_state.SetAttachmentFeedbackLoopEnabled(attachment_feedback_loop);
-}
 
 void Rasterizer::ScopeMarkerBegin(const std::string_view& str, bool from_guest) {
     if ((from_guest && !EmulatorSettings.IsVkGuestMarkersEnabled()) ||

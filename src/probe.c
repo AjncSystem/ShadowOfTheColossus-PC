@@ -862,6 +862,7 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     if (entry) entry->outcome=((uint64_t)fault_path<<8)|(result==EXCEPTION_CONTINUE_EXECUTION)|0x10000;
     return result;
 }
+int runtime_memory_carve_retry(uintptr_t address, int write); /* sotc: runtime_memory.c */
 static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record=info->ExceptionRecord;
     DWORD code=record->ExceptionCode;
@@ -869,6 +870,11 @@ static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
     if (code==EXCEPTION_SINGLE_STEP && helper_single_step(info)) { fault_path=2; return EXCEPTION_CONTINUE_EXECUTION; }
     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2 && gpu_enabled && helper_read_fault(info)) {
         fault_path=3;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2 &&
+        runtime_memory_carve_retry((uintptr_t)record->ExceptionInformation[1],record->ExceptionInformation[0]==1)) {
+        fault_path=12; /* sotc: SOTC_CARVE_NOSTOP, a view split while the threads ran */
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2) {

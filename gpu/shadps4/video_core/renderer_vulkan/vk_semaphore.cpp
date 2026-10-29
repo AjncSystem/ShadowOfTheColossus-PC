@@ -11,6 +11,7 @@
 #include <immintrin.h>
 
 #include "common/assert.h"
+#include "video_core/sotc_stats.h"
 
 #include <vk_mem_alloc.h>
 
@@ -145,8 +146,11 @@ void Semaphore::WaitHostRead(u64 tick) {
         Wait(tick);
         return;
     }
-    if (SpinMarker(MarkerSlot::Timeline, tick)) {
-        return;
+    {
+        const SotcStats::DrawWait wait{SotcStats::WaitGpu}; // sotc: SOTC_FPS accounting
+        if (SpinMarker(MarkerSlot::Timeline, tick)) {
+            return;
+        }
     }
     Wait(tick);
 }
@@ -177,6 +181,7 @@ void Semaphore::Wait(u64 tick) {
     if (IsFree(tick)) {
         return;
     }
+    const SotcStats::DrawWait gpu_wait{SotcStats::WaitGpu}; // sotc: SOTC_FPS accounting
 
     // sotc: the marker comes first; the driver reports the semaphore right after it.
     if (marker_buffer && tick < CurrentTick() && SpinMarker(MarkerSlot::Timeline, tick)) {

@@ -53,6 +53,16 @@ struct RangeSet {
         m_ranges_set.clear();
     }
 
+    /// sotc: SOTC_RB_TICK write ring.
+    bool Empty() const {
+        return m_ranges_set.empty();
+    }
+
+    /// sotc: exchanges the contents without copying (the ring files a tick's writes).
+    void Swap(RangeSet& other) {
+        m_ranges_set.swap(other.m_ranges_set);
+    }
+
     bool Contains(VAddr base_address, size_t size) const {
         const VAddr end_address = base_address + size;
         IntervalType interval{base_address, end_address};

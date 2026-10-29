@@ -32,6 +32,10 @@
 #include "video_core/sotc_lod_stats.h"
 #include "video_core/sotc_stats.h"
 #include "bbport_threads.h"
+#include "video_core/amdgpu/draw_prep.h"
+#include "video_core/amdgpu/op_footprint.h" // sotc: SOTC_CULL_EXPRESS
+#include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include <xmmintrin.h>
 
 // sotc: writes guest memory through the backing view (runtime_memory.c).
 extern "C" int runtime_memory_write_backing(unsigned long long address, const void* data,
@@ -41,6 +45,9 @@ extern "C" int runtime_memory_write_backing(unsigned long long address, const vo
 std::atomic<u64> g_sotc_zpass_dumps{0};
 
 namespace AmdGpu {
+
+// sotc: SOTC_RB_EXACT: the Liverpool the wait observer charges (set in the constructor).
+static std::atomic<Liverpool*> g_rbx_self{nullptr};
 
 // sotc: SOTC_GPU_THREAD_HIGH=1 runs the command processor and draw threads above normal priority,
 // so the pipeline workers and game job threads cannot delay them during streaming. Off by
@@ -110,6 +117,37 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
     // sotc: SOTC_WAIT_NOSPIN=1: BackLoop spins ~20 us, then blocks on back_wake (off by default).
     const char* nospin = std::getenv("SOTC_WAIT_NOSPIN");
     back_nospin = nospin && nospin[0] == '1';
+    // sotc: SOTC_WD_FUSE=1 (off by default; needs the draw thread): small WRITE_DATA packets ride
+    // along with the next indirect draw instead of being queued as functions. SOTC_INLINE_FUNC=1
+    // (also set by SOTC_WD_FUSE) keeps small closures of the op ring out of the heap.
+    {
+        const char* fuse = std::getenv("SOTC_WD_FUSE");
+        const char* inline_func = std::getenv("SOTC_INLINE_FUNC");
+        wd_fuse = back_threaded && fuse && fuse[0] == '1';
+        Common::g_inline_function_enabled =
+            back_threaded && ((fuse && fuse[0] == '1') || (inline_func && inline_func[0] == '1'));
+    }
+    // sotc: SOTC_CP_IDLE_US / SOTC_CP_IDLE_TIMEOUT_US, see Process and CpIdleSleep. Read before
+    // any thread that calls NotifyCpWait starts.
+    if (const char* v = std::getenv("SOTC_CP_IDLE_US")) {
+        cp_idle_ns = std::strtoull(v, nullptr, 10) * 1000ULL;
+    }
+    if (const char* v = std::getenv("SOTC_CP_IDLE_TIMEOUT_US")) {
+        cp_idle_timeout_ns = std::max<u64>(std::strtoull(v, nullptr, 10), 10) * 1000ULL;
+    }
+#ifdef _WIN32
+    if (cp_idle_ns) {
+        cp_wake_event = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (!cp_wake_event) {
+            cp_idle_ns = 0;
+        }
+    }
+#endif
+    if (cp_idle_ns) {
+        LOG_INFO(Render, "SOTC_CP_IDLE_US: the command processor sleeps after {} us without "
+                         "progress, for at most {} us",
+                 cp_idle_ns / 1000, cp_idle_timeout_ns / 1000);
+    }
     // sotc: SOTC_EOP_TICK=1 (default off). The labels are polled by BackLoop, so it needs the
     // draw thread; without it the command processor would have to poll while idle.
     const char* eop_tick_env = std::getenv("SOTC_EOP_TICK");
@@ -117,9 +155,46 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
     // sotc: measured 2026-10-27: the game writes ~130 EOP labels per frame and waits for each, so
     // honest completion costs one GPU round trip per label (~300 ms frames at the default 2 ms
     // limit, ~133 ms at SOTC_EOP_TICK_US=0). Diagnostic only; kept off by default.
+    // sotc: SOTC_RB_EXACT=1: the label side (see QueueDeferredLabel). Needs the draw thread for
+    // the same reason as SOTC_EOP_TICK (BackLoop polls the deferred labels).
+    rbx = back_threaded && VideoCore::BufferCache::RbExactEnabled();
+    eop_poll = eop_tick || rbx;
+    VideoCore::BufferCache::SetLabelSideActive(rbx); // sotc: SOTC_RB_EXACT (cache side agrees)
+    if (rbx) {
+        g_rbx_self.store(this, std::memory_order_release);
+        VideoCore::BufferCache::SetWaitObserver(&Liverpool::RbxWaitObserver);
+    }
     if (eop_tick) {
         LOG_WARNING(Render, "SOTC_EOP_TICK=1 is diagnostic only: ~130 GPU round trips per frame "
                             "(3-7 FPS). Use it only to test streaming corruption.");
+    }
+    // sotc: SOTC_CP_AHEAD=2 (frame tickets) and SOTC_ASC_RPTR, both off by default.
+    frame_tickets = CpAheadMode() == 2;
+    asc_rptr_mode = AscRptrMode();
+    if (frame_tickets || asc_rptr_mode) {
+        LOG_INFO(Render, "SOTC_CP_AHEAD={} SOTC_ASC_RPTR={}", CpAheadMode(), asc_rptr_mode);
+    }
+    // sotc: SOTC_CULL_EXPRESS=1 (default off; needs the draw thread and SOTC_PARALLEL_RECORD=1 for
+    // the footprints). Read before the draw thread starts (XpPoll).
+    if (back_threaded && SotcStats::kCullExpress) {
+        xp_on = true;
+        const auto env_u64 = [](const char* name, u64 fallback) {
+            const char* v = std::getenv(name);
+            return v ? std::strtoull(v, nullptr, 0) : fallback;
+        };
+        xp_signals = env_u64("SOTC_CULL_EXPRESS_SIGNALS", 1) != 0;
+        xp_marks = env_u64("SOTC_CULL_EXPRESS_MARKS", 1) != 0;
+        xp_pattern = env_u64("SOTC_CULL_EXPRESS_PATTERN", 1) != 0;
+        xp_forced_addr = env_u64("SOTC_CULL_EXPRESS_ADDR", 0);
+        xp_max_seg = static_cast<u32>(std::clamp<u64>(env_u64("SOTC_CULL_EXPRESS_SEG", 256), 1, 480));
+        xp_max_skip = static_cast<u32>(
+            std::clamp<u64>(env_u64("SOTC_CULL_EXPRESS_SKIP", 480), 1, BackRingSize - 2));
+        xp_budget_ns = env_u64("SOTC_CULL_EXPRESS_US", 500) * 1000ULL;
+        xp_undo.reserve(64 * (RegChunkDwords + 1));
+        LOG_INFO(Render,
+                 "SOTC_CULL_EXPRESS=1: segment <= {} ops, skip <= {} ops, decision <= {} us, "
+                 "signals {}, marks {}",
+                 xp_max_seg, xp_max_skip, xp_budget_ns / 1000, xp_signals, xp_marks);
     }
     if (back_threaded) {
         back_ring.resize(BackRingSize);
@@ -134,10 +209,36 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
             Vulkan::Presenter::wait_service = [] { service_liverpool->ServiceCommandsOnBackThread(); };
         }
     }
+    // sotc: SOTC_PARALLEL_RECORD=1 (default off): GpuPrep threads (liverpool.h, draw_prep.h).
+    // Started before the command processor, which reads prep_workers in BackAlloc.
+    const char* parallel_record = std::getenv("SOTC_PARALLEL_RECORD");
+    if (back_threaded && parallel_record && parallel_record[0] == '1') {
+        const unsigned available = BbThreads::Available();
+        u32 workers = std::clamp<u32>(available / 4, 1, MaxPrepWorkers);
+        if (const char* w = std::getenv("SOTC_PARALLEL_RECORD_WORKERS")) {
+            workers = std::clamp<u32>(static_cast<u32>(std::strtoul(w, nullptr, 0)), 1,
+                                      MaxPrepWorkers);
+        }
+        if (available <= 6) {
+            LOG_WARNING(Render, "SOTC_PARALLEL_RECORD: off, {} hardware threads (needs 7 or more)",
+                        available);
+        } else {
+            prep_workers = workers;
+            prep_ring = std::make_unique<Vulkan::PreparedDraw[]>(BackRingSize);
+            for (u32 k = 0; k < prep_workers; ++k) {
+                prep_regs.push_back(std::make_unique<Regs>());
+            }
+            for (u32 k = 0; k < prep_workers; ++k) {
+                prep_threads.emplace_back(std::bind_front(&Liverpool::PrepLoop, this), k);
+            }
+            LOG_INFO(Render, "SOTC_PARALLEL_RECORD: {} prep thread(s)", prep_workers);
+        }
+    }
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
 }
 
 Liverpool::~Liverpool() {
+    g_rbx_self.store(nullptr, std::memory_order_release); // sotc: SOTC_RB_EXACT
     Vulkan::Presenter::wait_service = nullptr; // sotc: SOTC_FLIP_SERVICE
     process_thread.request_stop();
     process_thread.join();
@@ -149,6 +250,19 @@ Liverpool::~Liverpool() {
         }
         back_thread.join();
     }
+    for (auto& thread : prep_threads) { // sotc: SOTC_PARALLEL_RECORD
+        thread.request_stop();
+    }
+    if (!prep_threads.empty()) {
+        prep_wake.fetch_add(1, std::memory_order_seq_cst);
+        prep_wake.notify_all();
+    }
+    prep_threads.clear(); // joins
+#ifdef _WIN32
+    if (cp_wake_event) { // sotc: SOTC_CP_IDLE_US
+        ::CloseHandle(cp_wake_event);
+    }
+#endif
 }
 
 static inline void CpuRelax() {
@@ -159,6 +273,8 @@ static inline void CpuRelax() {
 
 void Liverpool::BackLoop(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuDraw");
+    VideoCore::BufferCache::SetDrawThread(std::this_thread::get_id()); // sotc: SOTC_RB_EXACT
+    SotcStats::RegisterThreadRole(SotcStats::RoleDraw); // sotc: SOTC_FPS thread accounting
     SotcRaiseGpuThread();
     BbThreads::PlaceThread(BbThreads::Role::Draw);
     Shader::g_info_slot = 1;
@@ -172,14 +288,15 @@ void Liverpool::BackLoop(std::stop_token stoken) {
         }
         // sotc: SOTC_EOP_TICK: labels the GPU has finished are written here, also while no new
         // work arrives (EopService returns at once when none is outstanding).
-        if (eop_tick && eop_outstanding.load(std::memory_order_acquire) != 0) {
+        if (eop_poll && eop_outstanding.load(std::memory_order_acquire) != 0) {
             EopService();
         }
         if (back_head.load(std::memory_order_acquire) == tail) {
-            if (eop_tick && eop_outstanding.load(std::memory_order_acquire) != 0) {
+            if (eop_poll && eop_outstanding.load(std::memory_order_acquire) != 0) {
                 // sotc: SOTC_EOP_TICK: a label is waiting for the GPU, so poll instead of
                 // blocking on back_cv or back_wake, which nothing signals when the GPU finishes.
-                std::this_thread::sleep_for(std::chrono::microseconds{200});
+                // sotc: SOTC_RB_EXACT: a spin-waited label should not wait 200 us for the poll.
+                std::this_thread::sleep_for(std::chrono::microseconds{rbx ? 30 : 200});
                 continue;
             }
             const u64 idle_start = SotcStats::NowNs();
@@ -239,11 +356,53 @@ void Liverpool::BackLoop(std::stop_token stoken) {
             }
             continue;
         }
+        // sotc: SOTC_CULL_EXPRESS: a published express segment may run before the older ops.
+        if (xp_on &&
+            xp_head.load(std::memory_order_acquire) != xp_tail.load(std::memory_order_relaxed)) {
+            XpPoll(tail);
+        }
         BackOp& op = back_ring[tail % BackRingSize];
-        ExecuteBackOp(op);
-        op.func = {};
+        back_exec_seq = tail;
+        const u64 xp_t0 = xp_on ? SotcStats::NowNs() : 0;
+        if (prep_workers) { // sotc: SOTC_PARALLEL_RECORD: the next prepared draw's first lines
+            const char* next = reinterpret_cast<const char*>(&prep_ring[(tail + 1) % BackRingSize]);
+            for (u32 line = 0; line < 4; ++line) {
+                _mm_prefetch(next + line * 64, _MM_HINT_T0);
+            }
+        }
+        const bool func_op = op.kind == BackOp::Kind::Func || op.wd.num_segs != 0;
+        if (op.xp_done) {
+            XpReplayState(op); // sotc: SOTC_CULL_EXPRESS: ran ahead, only its state is replayed
+        } else if (SotcStats::kFpsLog && op.kind == BackOp::Kind::Func && op.func) {
+            const u64 func_start = SotcStats::NowNs();
+            ExecuteBackOp(op);
+            SotcStats::draw_func_ns[op.func_kind & 3].fetch_add(SotcStats::NowNs() - func_start,
+                                                                std::memory_order_relaxed);
+        } else {
+            ExecuteBackOp(op);
+        }
+        op.func.Reset();
         ++tail;
         back_tail.store(tail, std::memory_order_seq_cst);
+        if (xp_on) {
+            if (!op.xp_done) { // time per FIFO op (outliers clipped), for the saved-time estimate
+                const double dt =
+                    static_cast<double>(std::min<u64>(SotcStats::NowNs() - xp_t0, 1'000'000));
+                xp_op_ns += (dt - xp_op_ns) / 64.0;
+            }
+            if (xp_watch_end && tail >= xp_watch_end) { // a FIFO segment's label has run
+                SotcStats::xp_lat_fifo_ns.fetch_add(SotcStats::NowNs() - xp_watch_ns,
+                                                    std::memory_order_relaxed);
+                SotcStats::xp_lat_fifo_n.fetch_add(1, std::memory_order_relaxed);
+                xp_watch_end = 0;
+            }
+        }
+        // sotc: SOTC_CP_IDLE_US: the queued functions write the labels, fences and data the
+        // command processor's WaitRegMem loops test (EOP/EOS, WRITE_DATA, RELEASE_MEM, DMA), and
+        // the label wait kind depends on back_tail; the ring running empty also wakes it.
+        if (func_op || back_head.load(std::memory_order_relaxed) == tail) {
+            NotifyCpWait();
+        }
         if (drain_waiting.load(std::memory_order_seq_cst)) {
             std::scoped_lock lk{back_mutex};
             drain_cv.notify_all();
@@ -255,11 +414,17 @@ void Liverpool::DrainBack() {
     if (!back_threaded || std::this_thread::get_id() == back_id) {
         return;
     }
+    // sotc: SOTC_WD_FUSE: what the draw thread must have run includes the held-back writes.
+    if (std::this_thread::get_id() == gpu_id && wd_pending.num_segs) {
+        FlushWd();
+    }
     WaitBackTail(back_head.load(std::memory_order_acquire));
 }
 
 void Liverpool::WaitBackTail(u64 head) {
     SotcStats::cp_waits.fetch_add(1, std::memory_order_relaxed);
+    // sotc: SOTC_FPS: command processor time blocked on the draw thread.
+    const SotcStats::RoleTimer blocked{SotcStats::RoleCp, SotcStats::cp_blocked_ns};
     for (u32 spin = 0; back_tail.load(std::memory_order_acquire) < head; ++spin) {
         if (spin < 4096) {
             CpuRelax();
@@ -276,21 +441,50 @@ void Liverpool::WaitBackTail(u64 head) {
 
 Liverpool::BackOp& Liverpool::BackAlloc() {
     const u64 head = back_head.load(std::memory_order_relaxed);
-    for (u32 spin = 0; head - back_tail.load(std::memory_order_acquire) >= BackRingSize; ++spin) {
-        if (spin < 4096) {
-            CpuRelax();
-            continue;
+    // sotc: SOTC_PARALLEL_RECORD: a slot is reused only once the prep threads replayed it too
+    // (MinRingTail is back_tail alone without them).
+    if (prep_workers && SotcStats::kFpsLog) {
+        const u32 lag = static_cast<u32>(head - MinRingTail(std::memory_order_acquire));
+        u32 seen = SotcStats::pr_lag_max.load(std::memory_order_relaxed);
+        while (lag > seen &&
+               !SotcStats::pr_lag_max.compare_exchange_weak(seen, lag, std::memory_order_relaxed)) {
         }
-        std::unique_lock lk{back_mutex};
-        drain_waiting.store(true, std::memory_order_seq_cst);
-        drain_cv.wait_for(lk, std::chrono::milliseconds(1), [&] {
-            return head - back_tail.load(std::memory_order_seq_cst) < BackRingSize;
-        });
-        drain_waiting.store(false, std::memory_order_relaxed);
+    }
+    if (head - MinRingTail(std::memory_order_acquire) >= BackRingSize) {
+        // sotc: SOTC_FPS: the ring is full, the command processor is blocked on the draw thread.
+        const SotcStats::RoleTimer blocked{SotcStats::RoleCp, SotcStats::cp_blocked_ns};
+        // sotc: SOTC_PARALLEL_RECORD: the wait counts as the prep threads' when the draw thread
+        // alone would have left room.
+        const bool prep_throttle = prep_workers && SotcStats::kFpsLog &&
+                                   head - back_tail.load(std::memory_order_acquire) < BackRingSize;
+        const u64 throttle_start = prep_throttle ? SotcStats::NowNs() : 0;
+        for (u32 spin = 0; head - MinRingTail(std::memory_order_acquire) >= BackRingSize;
+             ++spin) {
+            if (spin < 4096) {
+                CpuRelax();
+                continue;
+            }
+            std::unique_lock lk{back_mutex};
+            drain_waiting.store(true, std::memory_order_seq_cst);
+            drain_cv.wait_for(lk, std::chrono::milliseconds(1), [&] {
+                return head - MinRingTail(std::memory_order_seq_cst) < BackRingSize;
+            });
+            drain_waiting.store(false, std::memory_order_relaxed);
+        }
+        if (prep_throttle) {
+            SotcStats::pr_throttle_ns.fetch_add(SotcStats::NowNs() - throttle_start,
+                                                std::memory_order_relaxed);
+        }
     }
     BackOp& op = back_ring[head % BackRingSize];
     op.pipeline = nullptr;
     op.num_stages = 0;
+    op.wd.num_segs = 0;
+    op.func_kind = 3;
+    op.xp_cls = XpUnknown; // sotc: SOTC_CULL_EXPRESS
+    op.xp_done = false;
+    op.xp_rsize = op.xp_wsize = 0;
+    op.qid = curr_qid < 0 ? u8{255} : static_cast<u8>(curr_qid);
     // The registers as of this point of the command stream: the chunks changed since the last op.
     op.reg_chunks.clear();
     for (const u16 chunk : dirty_list) {
@@ -311,6 +505,12 @@ void Liverpool::BackPublish(bool writes_memory) {
     if (writes_memory) {
         back_write_seq = head;
     }
+    // sotc: SOTC_PARALLEL_RECORD: a prep thread blocks on prep_wake after it saw back_head
+    // unchanged (seq_cst on both sides: either it sees the new head or this sees it asleep).
+    if (prep_workers && prep_sleepers.load(std::memory_order_seq_cst) != 0) {
+        prep_wake.fetch_add(1, std::memory_order_seq_cst);
+        prep_wake.notify_all();
+    }
     if (back_sleeping.load(std::memory_order_seq_cst)) {
         if (back_nospin) {
             WakeBackAtomic();
@@ -321,11 +521,151 @@ void Liverpool::BackPublish(bool writes_memory) {
     }
 }
 
-void Liverpool::QueueBackFunc(Common::UniqueFunction<void>&& func, bool writes_memory) {
+void Liverpool::QueueBackFunc(Common::InlineFunction&& func, bool writes_memory) {
+    // sotc: SOTC_WD_FUSE: whatever the command processor queues goes after the writes held back
+    // before it (RunOnBackThread during a pipeline lookup, ordered commands, ...).
+    if (wd_pending.num_segs && std::this_thread::get_id() == gpu_id) {
+        FlushWd();
+    }
     BackOp& op = BackAlloc();
     op.kind = BackOp::Kind::Func;
     op.func = std::move(func);
+    op.func_kind = func_kind_hint;
+    if (xp_hint.cls != XpUnknown) { // sotc: SOTC_CULL_EXPRESS (the parser classified this op)
+        op.xp_cls = xp_hint.cls;
+        op.xp_raddr = xp_hint.raddr;
+        op.xp_rsize = xp_hint.rsize;
+        op.xp_waddr = xp_hint.waddr;
+        op.xp_wsize = xp_hint.wsize;
+    }
+    xp_hint = XpHint{};
+    if (SotcStats::kFpsLog) {
+        SotcStats::cp_func_ops[func_kind_hint & 3].fetch_add(1, std::memory_order_relaxed);
+    }
     BackPublish(writes_memory);
+    if (SotcStats::kFpsLog && func_kind_hint == 0) {
+        wd_last_seq = back_head.load(std::memory_order_relaxed);
+    }
+}
+
+void Liverpool::WaitBackWritesSlow() {
+    // sotc: SOTC_FPS: WaitBackWrites calls that had to wait for the draw thread, and for how long.
+    if (!SotcStats::kFpsLog) {
+        WaitBackTail(back_write_seq);
+        return;
+    }
+    const u64 start = SotcStats::NowNs();
+    WaitBackTail(back_write_seq);
+    SotcStats::cp_bw_waits.fetch_add(1, std::memory_order_relaxed);
+    SotcStats::cp_bw_wait_ns.fetch_add(SotcStats::NowNs() - start, std::memory_order_relaxed);
+}
+
+bool Liverpool::FuseWriteData(VAddr address, const u32* data, u32 data_size) {
+    if (!wd_fuse || data_size == 0 || data_size > WdMaxBytes || (data_size & 3)) {
+        return false;
+    }
+    BackWd& wd = wd_pending;
+    if (wd.num_segs >= WdMaxSegs || wd.used + data_size > WdMaxBytes) {
+        // Full: the held-back writes go first, in order, then this one starts a new batch.
+        FlushWd();
+    }
+    if (wd.num_segs == 0) {
+        wd.used = 0;
+    }
+    wd.segs[wd.num_segs++] = {address, wd.used, static_cast<u8>(data_size)};
+    std::memcpy(wd.data.data() + wd.used, data, data_size);
+    wd.used = static_cast<u8>(wd.used + data_size);
+    return true;
+}
+
+void Liverpool::FlushWd() {
+    // One op carrying the writes and no closure: the draw thread applies them in order, as the
+    // separate Func ops did (nothing was queued in between, see FuseTransparent).
+    if (wd_pending.num_segs == 0) {
+        return;
+    }
+    BackOp& op = BackAlloc();
+    op.kind = BackOp::Kind::Func;
+    op.func_kind = 0;
+    op.wd.num_segs = wd_pending.num_segs;
+    op.wd.used = wd_pending.used;
+    op.wd.segs = wd_pending.segs;
+    std::memcpy(op.wd.data.data(), wd_pending.data.data(), wd_pending.used);
+    if (SotcStats::kFpsLog) {
+        SotcStats::cp_func_ops[0].fetch_add(wd_pending.num_segs, std::memory_order_relaxed);
+    }
+    wd_pending.num_segs = 0;
+    wd_pending.used = 0;
+    BackPublish(true);
+    if (SotcStats::kFpsLog) {
+        wd_last_seq = back_head.load(std::memory_order_relaxed);
+    }
+}
+
+void Liverpool::NotePairs() {
+    if (SotcStats::kFpsLog &&
+        (wd_fuse ? wd_pending.num_segs != 0
+                 : wd_last_seq != 0 && wd_last_seq == back_head.load(std::memory_order_relaxed))) {
+        SotcStats::cp_wd_pairs.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void Liverpool::PrepareWdForIndirect(VAddr begin, u64 span, bool allowed) {
+    if (wd_pending.num_segs == 0) {
+        return;
+    }
+    // All or nothing: every held-back write must lie inside the arguments this packet reads
+    // (count buffers are read by the command processor's own paths: not allowed).
+    bool inside = allowed;
+    for (u32 i = 0; inside && i < wd_pending.num_segs; ++i) {
+        const BackWd::Seg& seg = wd_pending.segs[i];
+        inside = seg.address >= begin && seg.address + seg.length <= begin + span;
+    }
+    if (!inside) {
+        FlushWd();
+    }
+}
+
+void Liverpool::AttachWd(BackOp& op) {
+    if (wd_pending.num_segs == 0) {
+        return; // flushed meanwhile (QueueBackFunc), or none held
+    }
+    op.wd.num_segs = wd_pending.num_segs;
+    op.wd.used = wd_pending.used;
+    op.wd.segs = wd_pending.segs;
+    std::memcpy(op.wd.data.data(), wd_pending.data.data(), wd_pending.used);
+    if (SotcStats::kFpsLog) {
+        SotcStats::cp_wd_fused.fetch_add(wd_pending.num_segs, std::memory_order_relaxed);
+    }
+    wd_pending.num_segs = 0;
+    wd_pending.used = 0;
+}
+
+void Liverpool::ApplyBackWd(const BackWd& wd) {
+    // Draw thread. Exactly what the WRITE_DATA Func did, once per packet.
+    const u64 start = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
+    // sotc: SOTC_RB_EXACT rule 7: a CPU-visible write, written now. Owed data announced by it is
+    // settled first.
+    u64 rbx_snap = 0;
+    if (rbx && rasterizer && wd.num_segs) {
+        rbx_snap = rasterizer->GetBufferCache().HotWriteSeq();
+        rasterizer->GetBufferCache().SettleOwedUpTo(rbx_snap);
+    }
+    for (u32 i = 0; i < wd.num_segs; ++i) {
+        const BackWd::Seg& seg = wd.segs[i];
+        if (rasterizer) {
+            rasterizer->OnFence();
+        }
+        std::memcpy(reinterpret_cast<void*>(seg.address), wd.data.data() + seg.offset, seg.length);
+        Core::MemoryManager::NoteHostWrite(seg.address, seg.length, 4);
+    }
+    if (rbx && rasterizer && wd.num_segs) {
+        RbxNoteWritten(rbx_snap);
+    }
+    if (SotcStats::kFpsLog) {
+        SotcStats::draw_func_ns[0].fetch_add(SotcStats::NowNs() - start,
+                                             std::memory_order_relaxed);
+    }
 }
 
 void Liverpool::CaptureBackOp(BackOp& op, const Vulkan::Pipeline* pipeline) {
@@ -382,7 +722,49 @@ static bool PipelineWrites(const Vulkan::Pipeline* pipeline) {
     return false;
 }
 
+/// sotc: SOTC_WD_FUSE. True for the packets that may come between a held-back WRITE_DATA and the
+/// indirect draw taking it: they only update the command processor's register state (which is
+/// replayed on the draw thread with the next op), read no guest memory, and queue no op.
+/// Everything else (any draw, dispatch, fence, DMA, wait, indirect buffer, COND_EXEC, a flip NOP,
+/// ...) is not: the held-back writes are queued before it.
+static bool FuseTransparent(const PM4Header* header, PM4ItOpcode opcode) {
+    switch (opcode) {
+    case PM4ItOpcode::Nop: {
+        const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
+        return nop->header.count.Value() == 0 ||
+               nop->data_block[0] != PM4CmdNop::PayloadType::PatchedFlip;
+    }
+    case PM4ItOpcode::ContextControl:
+    case PM4ItOpcode::ClearState:
+    case PM4ItOpcode::SetConfigReg:
+    case PM4ItOpcode::SetContextReg:
+    case PM4ItOpcode::SetShReg:
+    case PM4ItOpcode::SetUconfigReg:
+    case PM4ItOpcode::SetPredication:
+    case PM4ItOpcode::IndexType:
+    case PM4ItOpcode::NumInstances:
+    case PM4ItOpcode::IndexBase:
+    case PM4ItOpcode::IndexBufferSize:
+    case PM4ItOpcode::SetBase:
+    case PM4ItOpcode::WriteData:
+    // The packets that take them (Liverpool::PrepareWdForIndirect decides).
+    case PM4ItOpcode::DrawIndirect:
+    case PM4ItOpcode::DrawIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirect:
+    case PM4ItOpcode::DrawIndexIndirectMulti:
+    case PM4ItOpcode::DrawIndexIndirectCountMulti:
+    case PM4ItOpcode::DispatchIndirect:
+        return true;
+    default:
+        return false;
+    }
+}
+
 void Liverpool::ExecuteBackOp(BackOp& op) {
+    // sotc: SOTC_WD_FUSE: the WRITE_DATA packets that preceded this op in the command stream.
+    if (op.wd.num_segs) {
+        ApplyBackWd(op.wd);
+    }
     for (size_t i = 0; i < op.reg_chunks.size(); i += RegChunkDwords + 1) {
         std::memcpy(&back_regs.reg_array[op.reg_chunks[i] * RegChunkDwords], &op.reg_chunks[i + 1],
                     RegChunkDwords * sizeof(u32));
@@ -400,15 +782,19 @@ void Liverpool::ExecuteBackOp(BackOp& op) {
     }
     switch (op.kind) {
     case BackOp::Kind::Func:
-        op.func();
+        if (op.func) { // sotc: empty for a flushed batch of WRITE_DATA (FlushWd)
+            op.func();
+        }
         break;
     case BackOp::Kind::Draw:
-        rasterizer->Draw(op.is_indexed, op.index_offset, op.pipeline, true);
+        rasterizer->Draw(op.is_indexed, op.index_offset, op.pipeline, true,
+                         prep_workers ? TakePrepared(back_exec_seq) : nullptr);
         break;
     case BackOp::Kind::DrawIndirect:
         rasterizer->DrawIndirect(op.is_indexed, op.address, op.offset, op.stride, op.max_count,
                                  op.count_address, op.vertex_sgpr_offset, op.instance_sgpr_offset,
-                                 op.pipeline, true);
+                                 op.pipeline, true,
+                                 prep_workers ? TakePrepared(back_exec_seq) : nullptr);
         break;
     case BackOp::Kind::Dispatch:
         back_cs = op.cs;
@@ -421,6 +807,117 @@ void Liverpool::ExecuteBackOp(BackOp& op) {
     }
 }
 
+void Liverpool::PrepLoop(std::stop_token stoken, u32 index) {
+    // sotc: SOTC_PARALLEL_RECORD (liverpool.h). Every op's registers are replayed, in order, so
+    // prep_regs matches back_regs at each op; only this thread's share of the draws is computed,
+    // and none the draw thread has already passed. The op stays valid until prep_tail moves past
+    // it (BackAlloc), the slot of prep_ring until the draw thread ran that op.
+    Common::SetCurrentThreadName(index == 0 ? "shadPS4:GpuPrep0" : "shadPS4:GpuPrep1");
+    BbThreads::PlaceThread(BbThreads::Role::Prep);
+    Shader::g_info_slot = 2 + index; // info.h: slots 2..5 are the draw workers'
+    Regs& prep = *prep_regs[index];
+    u64 seq = 0;
+    while (!stoken.stop_requested()) {
+        if (back_head.load(std::memory_order_acquire) == seq) {
+            bool found = false;
+            for (u32 spin = 0; spin < 2048; ++spin) {
+                if (back_head.load(std::memory_order_acquire) != seq) {
+                    found = true;
+                    break;
+                }
+                CpuRelax();
+            }
+            if (!found) {
+                prep_sleepers.fetch_add(1, std::memory_order_seq_cst);
+                const u32 seen = prep_wake.load(std::memory_order_seq_cst);
+                if (back_head.load(std::memory_order_seq_cst) == seq &&
+                    !stoken.stop_requested()) {
+                    prep_wake.wait(seen, std::memory_order_seq_cst);
+                }
+                prep_sleepers.fetch_sub(1, std::memory_order_seq_cst);
+            }
+            continue;
+        }
+        const BackOp& op = back_ring[seq % BackRingSize];
+        for (size_t i = 0; i < op.reg_chunks.size(); i += RegChunkDwords + 1) {
+            std::memcpy(&prep.reg_array[op.reg_chunks[i] * RegChunkDwords], &op.reg_chunks[i + 1],
+                        RegChunkDwords * sizeof(u32));
+        }
+        const bool is_draw = op.kind == BackOp::Kind::Draw || op.kind == BackOp::Kind::DrawIndirect;
+        const bool is_disp = op.kind == BackOp::Kind::Dispatch ||
+                             op.kind == BackOp::Kind::DispatchIndirect;
+        const auto setup_stages = [&] {
+            for (u32 i = 0; i < op.num_stages; ++i) {
+                const BackStage& stage = op.stages[i];
+                Shader::InfoRuntime& rt = stage.info->runtime[Shader::g_info_slot];
+                rt.user_data = stage.num_user_data == ~0u
+                                   ? std::span<const u32>{}
+                                   : std::span<const u32>{stage.user_data.data(),
+                                                          stage.num_user_data};
+                rt.flattened_ud_buf.assign(stage.flat.begin(), stage.flat.end());
+                rt.pgm_base = stage.pgm_base;
+            }
+        };
+        if (is_draw && seq % prep_workers == index &&
+            seq >= back_tail.load(std::memory_order_acquire)) {
+            Vulkan::PreparedDraw& slot = prep_ring[seq % BackRingSize];
+            slot.map_epoch = rasterizer->MapEpoch();
+            setup_stages();
+            if (xp_on) {
+                slot.resources_ready = false; // sotc: SOTC_CULL_EXPRESS
+                slot.mrt_mask = 0xFF;
+            }
+            rasterizer->PrefetchImagesShared(op.pipeline); // SOTC_ASYNC_IMAGE_CREATE
+            rasterizer->PrepareDraw(prep, op.pipeline, op.is_indexed,
+                                    op.kind == BackOp::Kind::Draw, slot);
+            if (xp_on && !slot.resources_ready) {
+                XpFillResources(slot, op.pipeline);
+            }
+            slot.ready_seq.store(seq, std::memory_order_release);
+        } else if (xp_on && is_disp && seq % prep_workers == index &&
+                   seq >= back_tail.load(std::memory_order_acquire)) {
+            // sotc: SOTC_CULL_EXPRESS: dispatches get a slot too, with the resource footprint only.
+            Vulkan::PreparedDraw& slot = prep_ring[seq % BackRingSize];
+            slot.resources_ready = false;
+            slot.mrt_mask = 0xFF;
+            setup_stages();
+            XpFillResources(slot, op.pipeline);
+            slot.ready_seq.store(seq, std::memory_order_release);
+        }
+        ++seq;
+        prep_tail[index].store(seq, std::memory_order_seq_cst);
+        if (drain_waiting.load(std::memory_order_seq_cst)) {
+            std::scoped_lock lk{back_mutex};
+            drain_cv.notify_all();
+        }
+    }
+}
+
+const Vulkan::PreparedDraw* Liverpool::TakePrepared(u64 seq) {
+    // sotc: SOTC_PARALLEL_RECORD: published for this very op (the slot is reused every
+    // BackRingSize ops) and no mapping changed since it was computed.
+    const Vulkan::PreparedDraw& slot = prep_ring[seq % BackRingSize];
+    const auto count = [](std::atomic<uint64_t>& counter) {
+        if (SotcStats::kFpsLog) {
+            counter.fetch_add(1, std::memory_order_relaxed);
+        }
+    };
+    if (slot.ready_seq.load(std::memory_order_acquire) != seq) {
+        count(SotcStats::pr_not_ready);
+        return nullptr;
+    }
+    if (!slot.valid) {
+        count(SotcStats::pr_ineligible);
+        return nullptr;
+    }
+    if (slot.map_epoch != rasterizer->MapEpoch()) {
+        count(SotcStats::pr_epoch);
+        return nullptr;
+    }
+    count(SotcStats::pr_prepared);
+    return &slot;
+}
+
 void Liverpool::SubmitDraw(bool is_indexed, u32 index_offset) {
     if (!back_threaded) {
         rasterizer->Draw(is_indexed, index_offset);
@@ -430,6 +927,9 @@ void Liverpool::SubmitDraw(bool is_indexed, u32 index_offset) {
     // sotc: no pipeline for a draw FilterDraw drops on the draw thread (review of #99).
     const auto* pipeline =
         rasterizer->IsDrawFilteredOut() ? nullptr : rasterizer->LookupGraphicsPipeline(0, 0);
+    if (!prep_workers) { // sotc: SOTC_PARALLEL_RECORD: the prep threads do it (PrepLoop)
+        rasterizer->PrefetchImages(pipeline); // sotc: SOTC_ASYNC_IMAGE_CREATE
+    }
     BackOp& op = BackAlloc();
     op.kind = BackOp::Kind::Draw;
     op.is_indexed = is_indexed;
@@ -446,12 +946,19 @@ void Liverpool::SubmitDrawIndirect(bool is_indexed, VAddr address, u32 offset, u
                                  vertex_sgpr_offset, instance_sgpr_offset);
         return;
     }
+    // sotc: SOTC_WD_FUSE: WRITE_DATA packets held back for this draw's arguments (or queued).
+    NotePairs();
+    PrepareWdForIndirect(address + offset, u64{stride} * max_count, count_address == 0);
     WaitBackWrites();
     const auto* pipeline = rasterizer->IsDrawFilteredOut()
                                ? nullptr
                                : rasterizer->LookupGraphicsPipeline(vertex_sgpr_offset,
                                                                     instance_sgpr_offset);
+    if (!prep_workers) { // sotc: SOTC_PARALLEL_RECORD: the prep threads do it (PrepLoop)
+        rasterizer->PrefetchImages(pipeline); // sotc: SOTC_ASYNC_IMAGE_CREATE
+    }
     BackOp& op = BackAlloc();
+    AttachWd(op);
     op.kind = BackOp::Kind::DrawIndirect;
     op.is_indexed = is_indexed;
     op.address = address;
@@ -542,9 +1049,25 @@ void Liverpool::SubmitDispatch(bool indirect, VAddr address, u32 offset, u32 siz
         }
         return;
     }
+    if (indirect) { // sotc: SOTC_WD_FUSE
+        NotePairs();
+        PrepareWdForIndirect(address + offset, size, true);
+    } else {
+        FlushWd();
+    }
     WaitBackWrites();
     const auto* pipeline = rasterizer->LookupComputePipeline();
+    // sotc: SOTC_ASYNC_IMAGE_CREATE; with SOTC_PARALLEL_RECORD the prep threads prefetch too, so
+    // the dispatches take their lock (PrefetchImagesShared).
+    if (prep_workers) {
+        rasterizer->PrefetchImagesShared(pipeline);
+    } else {
+        rasterizer->PrefetchImages(pipeline);
+    }
     BackOp& op = BackAlloc();
+    if (indirect) {
+        AttachWd(op);
+    }
     op.kind = indirect ? BackOp::Kind::DispatchIndirect : BackOp::Kind::Dispatch;
     op.address = address;
     op.offset = offset;
@@ -552,6 +1075,443 @@ void Liverpool::SubmitDispatch(bool indirect, VAddr address, u32 offset, u32 siz
     op.cs = GetCsRegs();
     CaptureBackOp(op, pipeline);
     BackPublish(back_strict);
+    if (xp_on && curr_qid == static_cast<s32>(GfxQueueId)) { // sotc: SOTC_CULL_EXPRESS
+        xp_last_dispatch = back_head.load(std::memory_order_relaxed);
+    }
+}
+
+// sotc: SOTC_CULL_EXPRESS=1 (default off): the express lane.
+//
+// Problem: with SOTC_CP_AHEAD=2 the XPR occlusion submit of frame N (occluder depth draws, HiZ
+// dispatches, the main cull dispatch, then an EOP label the game spins on) can sit in the back
+// ring behind hundreds of frame N-1 ops the draw thread has not recorded yet. The PS4 GPU front
+// end would have reached it long before.
+//
+// Mechanism. The command processor tags every op with the queue that parsed it and, for Func ops,
+// with what they do to guest memory (XpHint). It publishes a segment [start, end) when it parses
+// an EOP that matches the XPR pattern (CS_DONE/bottom-of-pipe, data 1, a dispatch since the
+// segment start); a segment starts at the beginning of the top-level gfx submit or after the
+// previous label. At an op boundary the draw thread (XpPoll) may execute the gfx ops of that
+// segment (the "express" ops) BEFORE the ops [back_tail, start) (plus any foreign-queue op parsed
+// inside the segment): both sets are the "skipped" ops. It first submits the open command buffer
+// (it holds only older, already recorded work), records the express ops, submits them at once,
+// and goes on in FIFO order; the lane-run ops are flagged xp_done and only replay their register
+// state when FIFO reaches them. GPU order is queue order, so on the host the express work now sits
+// between the recorded older work and the not yet recorded skipped work. Everything uncertain
+// keeps the FIFO order and is counted (SotcStats::XpReason).
+//
+// Why that is exact (each rule is tested before the segment runs ahead):
+//  1. Known footprints. Every skipped and every express draw/dispatch needs a footprint from
+//     op_footprint.h (page-rounded read/write ranges of buffers, images with all their mips,
+//     render targets, depth, vertex/index/indirect data), computed on the GpuPrep threads. Func
+//     ops are admitted only when the parser classified them: labels (a write of the label
+//     address), WRITE_DATA and mem-to-mem/fill DMA (their ranges), flips and frame marks (no
+//     memory), and WRITE_DATA fused into an op (its segments are writes). Anything else (DMA from or to GDS,
+//     lod stats, ordered commands, EopService, an op without footprint) blocks.
+//  2. No conflict. Conflicts() on the union of all express footprints against each skipped
+//     footprint: write/read, read/write and write/write overlaps all refuse the reorder, so for
+//     every pair of ops that could exchange data, the order is the stream's. Disjoint ops commute
+//     on the GPU too (the host orders by queue, barriers are per resource). The host-side
+//     caches (buffer, texture, image layouts) are touched only by the draw thread in record order,
+//     which is also the GPU submission order, so their state is consistent by construction.
+//  3. Progress signals. A skipped label/flip/frame mark may be seen by the game after the express
+//     label instead of before. Labels write different addresses (the same 8-byte key as an
+//     express label blocks: per-address FIFO), the express label announces only work recorded
+//     before it, and the game never infers "frame N-1 finished" from the XPR label of frame N
+//     (the RB_EXACT design already accepts cross-address label reordering). Each skipped label
+//     still lands after the work it guards, because it stays behind it. SOTC_CULL_EXPRESS_SIGNALS=0
+//     / _MARKS=0 make them block. A skipped frame mark (OnSubmit + Flush, the frames_recorded
+//     ticket) runs later than before relative to the express ops: its garbage collection ages
+//     by scheduler tick, and the ticket only gates guest submits that were not ahead of it.
+//  4. Record-time guest reads. A skipped op reads guest memory when it is recorded, which is
+//     now later by the express duration. That is legal: the PS4 GPU reads at execution time,
+//     later than parse time; the game keeps memory stable until the label that follows the op,
+//     and that label is itself skipped, so it is written after the op was recorded. The express
+//     ops read earlier than in FIFO but after the game submitted them, which already
+//     guarantees their inputs; inputs written by older recorded ops are earlier in GPU order, and
+//     inputs written by skipped ops are refused by rule 2.
+//  5. Bounds: at most SOTC_CULL_EXPRESS_SKIP skipped ops (default 480), SOTC_CULL_EXPRESS_SEG
+//     express ops (256) and SOTC_CULL_EXPRESS_US (500 us) for the whole decision.
+// Registers: every op carries the register chunks that changed since the previous op of the
+// stream, so the lane advances back_regs through [tail, end) in stream order (undo log), and
+// restores the state at tail afterwards; an op that already ran replays only its chunks.
+// Not done: renaming the HiZ image to avoid its write-after-read conflict (see the report).
+
+namespace {
+void XpAddRange(boost::container::small_vector<AmdGpu::OpRange, 16>& v, VAddr addr, u64 size) {
+    if (size == 0) {
+        return;
+    }
+    const VAddr lo = addr & ~VAddr{0xFFF};
+    const VAddr hi = (addr + size + 0xFFF) & ~VAddr{0xFFF};
+    v.push_back({lo, hi - lo});
+}
+void XpAddRange(boost::container::small_vector<AmdGpu::OpRange, 8>& v, VAddr addr, u64 size) {
+    if (size == 0) {
+        return;
+    }
+    const VAddr lo = addr & ~VAddr{0xFFF};
+    const VAddr hi = (addr + size + 0xFFF) & ~VAddr{0xFFF};
+    v.push_back({lo, hi - lo});
+}
+} // namespace
+
+void Liverpool::XpFillResources(Vulkan::PreparedDraw& slot, const Vulkan::Pipeline* pipeline) {
+    if (!pipeline) {
+        return; // a dropped draw: XpEvaluate treats a null pipeline as an empty footprint
+    }
+    const auto stages = pipeline->GetStages();
+    const Shader::Gcn::FetchShaderData* fetch = nullptr;
+    if (!pipeline->IsCompute()) {
+        const auto* graphics = static_cast<const Vulkan::GraphicsPipeline*>(pipeline);
+        fetch = &graphics->GetFetchShader();
+        slot.mrt_mask = static_cast<u8>(graphics->GetGraphicsKey().mrt_mask);
+    }
+    AmdGpu::CollectResourceFootprint(std::span<const Shader::Info* const>{stages}, fetch,
+                                     slot.resources);
+    slot.resources_ready = true;
+}
+
+void Liverpool::XpPublishSeg(const XpSeg& seg) {
+    SotcStats::xp_segments.fetch_add(1, std::memory_order_relaxed);
+    if (!prep_workers) {
+        SotcStats::xp_reasons[SotcStats::XpNoPrep].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const u64 head = xp_head.load(std::memory_order_relaxed);
+    if (head - xp_tail.load(std::memory_order_acquire) >= XpRing) {
+        return; // the draw thread is far behind on segments: FIFO
+    }
+    xp_ring[head % XpRing] = seg;
+    xp_head.store(head + 1, std::memory_order_release);
+    if (back_sleeping.load(std::memory_order_seq_cst)) {
+        WakeBack();
+    }
+}
+
+void Liverpool::XpApplyState(const BackOp& op) {
+    for (size_t i = 0; i < op.reg_chunks.size(); i += RegChunkDwords + 1) {
+        const u32 chunk = op.reg_chunks[i];
+        const u64 bit = u64{1} << (chunk % 64);
+        if (!(xp_undo_mask[chunk / 64] & bit)) {
+            xp_undo_mask[chunk / 64] |= bit;
+            xp_undo_list.push_back(static_cast<u16>(chunk));
+            xp_undo.push_back(chunk);
+            const u32* src = &back_regs.reg_array[chunk * RegChunkDwords];
+            xp_undo.insert(xp_undo.end(), src, src + RegChunkDwords);
+        }
+        std::memcpy(&back_regs.reg_array[chunk * RegChunkDwords], &op.reg_chunks[i + 1],
+                    RegChunkDwords * sizeof(u32));
+    }
+    back_cb_extent = op.cb_extent;
+    back_db_extent = op.db_extent;
+    if (op.kind == BackOp::Kind::Dispatch || op.kind == BackOp::Kind::DispatchIndirect) {
+        back_cs = op.cs;
+    }
+}
+
+void Liverpool::XpUndoState() {
+    for (size_t i = 0; i < xp_undo.size(); i += RegChunkDwords + 1) {
+        std::memcpy(&back_regs.reg_array[xp_undo[i] * RegChunkDwords], &xp_undo[i + 1],
+                    RegChunkDwords * sizeof(u32));
+    }
+    for (const u16 chunk : xp_undo_list) {
+        xp_undo_mask[chunk / 64] &= ~(u64{1} << (chunk % 64));
+    }
+    xp_undo.clear();
+    xp_undo_list.clear();
+    back_cb_extent = xp_saved_cb;
+    back_db_extent = xp_saved_db;
+    back_cs = xp_saved_cs;
+}
+
+void Liverpool::XpReplayState(const BackOp& op) {
+    for (size_t i = 0; i < op.reg_chunks.size(); i += RegChunkDwords + 1) {
+        std::memcpy(&back_regs.reg_array[op.reg_chunks[i] * RegChunkDwords], &op.reg_chunks[i + 1],
+                    RegChunkDwords * sizeof(u32));
+    }
+    back_cb_extent = op.cb_extent;
+    back_db_extent = op.db_extent;
+    if (op.kind == BackOp::Kind::Dispatch || op.kind == BackOp::Kind::DispatchIndirect) {
+        back_cs = op.cs;
+    }
+}
+
+void Liverpool::XpPoll(u64 tail) {
+    while (xp_head.load(std::memory_order_acquire) != xp_tail.load(std::memory_order_relaxed)) {
+        const XpSeg seg = xp_ring[xp_tail.load(std::memory_order_relaxed) % XpRing];
+        if (!XpEvaluate(seg, tail)) {
+            return; // retry at the next op boundary
+        }
+        xp_retries = 0;
+        xp_tail.store(xp_tail.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+    }
+}
+
+bool Liverpool::XpEvaluate(const XpSeg& seg, u64 tail) {
+    using namespace SotcStats;
+    const auto done = [&](XpReason r) {
+        xp_reasons[r].fetch_add(1, std::memory_order_relaxed);
+        return true;
+    };
+    const auto fifo = [&](XpReason r) {
+        if (!xp_watch_end) { // measure when its label really runs
+            xp_watch_end = seg.end;
+            xp_watch_ns = seg.queued_ns;
+        }
+        return done(r);
+    };
+    if (seg.start <= tail) {
+        return done(XpNoBacklog);
+    }
+    if (!rasterizer || !prep_workers) {
+        return fifo(XpNoPrep);
+    }
+    if (seg.end - seg.start > xp_max_seg) {
+        return fifo(XpSegTooLong);
+    }
+    if (seg.start - tail > xp_max_skip) {
+        return fifo(XpSkipTooMany);
+    }
+
+    struct Skipped {
+        OpFootprint fp;
+        u8 kind; // 0 draw, 1 dispatch, 2 func
+        bool has_ranges;
+    };
+    thread_local std::vector<Skipped> skipped;
+    thread_local std::vector<VAddr> skipped_labels;
+    skipped.clear();
+    skipped_labels.clear();
+    OpFootprint ex;
+    ex.known = true;
+    std::array<VAddr, 4> ex_labels{};
+    u32 num_ex_labels = 0;
+    u32 num_express = 0, num_skipped = 0;
+    u32 sk_labels = 0, sk_flips = 0, sk_marks = 0;
+
+    const u64 t0 = NowNs();
+    xp_saved_cb = back_cb_extent;
+    xp_saved_db = back_db_extent;
+    xp_saved_cs = back_cs;
+
+    XpReason fail = XpOk;
+    bool retry = false;
+    for (u64 seq = tail; seq < seg.end && fail == XpOk; ++seq) {
+        BackOp& op = back_ring[seq % BackRingSize];
+        XpApplyState(op); // back_regs now holds the registers this op runs with
+        const bool express = seq >= seg.start && op.qid == GfxQueueId;
+        if (op.xp_done && !express) {
+            continue; // ran ahead with an earlier segment: not part of this reorder
+        }
+        OpFootprint fp;
+        fp.known = true;
+        bool bad_func = false, not_ready = false, unknown_fp = false, signal_blocked = false;
+        bool is_label = false;
+        VAddr label_key = 0;
+        u8 kind = 2;
+        for (u32 i = 0; i < op.wd.num_segs; ++i) { // WRITE_DATA fused into the op: CPU-side writes
+            XpAddRange(fp.writes, op.wd.segs[i].address, op.wd.segs[i].length);
+        }
+        switch (op.kind) {
+        case BackOp::Kind::Func:
+            if (!op.func) {
+                break; // a flushed batch of WRITE_DATA: only the fused segments above
+            }
+            switch (op.xp_cls) {
+            case XpLabel:
+                XpAddRange(fp.writes, op.xp_waddr, op.xp_wsize);
+                is_label = true;
+                label_key = op.xp_waddr & ~VAddr{7};
+                signal_blocked = !express && !xp_signals;
+                break;
+            case XpWriteData:
+                XpAddRange(fp.writes, op.xp_waddr, op.xp_wsize);
+                break;
+            case XpDma:
+                XpAddRange(fp.reads, op.xp_raddr, op.xp_rsize);
+                XpAddRange(fp.writes, op.xp_waddr, op.xp_wsize);
+                break;
+            case XpMark:
+                bad_func = express;
+                signal_blocked = !express && !xp_marks;
+                break;
+            case XpFlip:
+                bad_func = express;
+                signal_blocked = !express && !xp_signals;
+                break;
+            default:
+                bad_func = true;
+                break;
+            }
+            break;
+        case BackOp::Kind::Draw:
+        case BackOp::Kind::DrawIndirect:
+        case BackOp::Kind::Dispatch:
+        case BackOp::Kind::DispatchIndirect: {
+            const bool dispatch = op.kind == BackOp::Kind::Dispatch ||
+                                  op.kind == BackOp::Kind::DispatchIndirect;
+            kind = dispatch ? 1 : 0;
+            if (!op.pipeline) {
+                break; // dropped by the draw filter: runs as nothing
+            }
+            const Vulkan::PreparedDraw& slot = prep_ring[seq % BackRingSize];
+            if (slot.ready_seq.load(std::memory_order_acquire) != seq || !slot.resources_ready) {
+                not_ready = true;
+                break;
+            }
+            OpArgs args;
+            args.indirect = op.kind == BackOp::Kind::DrawIndirect ||
+                            op.kind == BackOp::Kind::DispatchIndirect;
+            args.is_indexed = op.is_indexed;
+            args.index_offset = op.index_offset;
+            args.address = op.address;
+            args.offset = op.offset;
+            args.stride = op.stride;
+            args.max_count = op.max_count;
+            args.count_address = op.count_address;
+            args.size = op.size;
+            OpFootprint part;
+            const bool ok = dispatch ? ComputeDispatchFootprint(slot, op.cs, part, &args)
+                                     : ComputeDrawFootprint(slot, back_regs, part, &args);
+            if (!ok || !part.known) {
+                unknown_fp = true;
+                break;
+            }
+            fp.reads.insert(fp.reads.end(), part.reads.begin(), part.reads.end());
+            fp.writes.insert(fp.writes.end(), part.writes.begin(), part.writes.end());
+            break;
+        }
+        }
+        if (bad_func) {
+            fail = express ? XpExpressUnknown : XpSkipUnknownFunc;
+        } else if (signal_blocked) {
+            fail = XpSkipSignals;
+        } else if (not_ready) {
+            fail = express ? XpExpressNotReady : XpSkipNotReady;
+            retry = true;
+        } else if (unknown_fp) {
+            fail = express ? XpExpressUnknownFp : XpSkipUnknownFp;
+        }
+        if (fail != XpOk) {
+            break;
+        }
+        if (express) {
+            ++num_express;
+            ex.reads.insert(ex.reads.end(), fp.reads.begin(), fp.reads.end());
+            ex.writes.insert(ex.writes.end(), fp.writes.begin(), fp.writes.end());
+            if (is_label && num_ex_labels < ex_labels.size()) {
+                ex_labels[num_ex_labels++] = label_key;
+            }
+        } else {
+            ++num_skipped;
+            if (is_label) {
+                skipped_labels.push_back(label_key);
+                ++sk_labels;
+            } else if (op.kind == BackOp::Kind::Func && op.xp_cls == XpFlip && op.func) {
+                ++sk_flips;
+            } else if (op.kind == BackOp::Kind::Func && op.xp_cls == XpMark && op.func) {
+                ++sk_marks;
+            }
+            const bool has = !fp.reads.empty() || !fp.writes.empty();
+            if (has) {
+                skipped.push_back({std::move(fp), kind, true});
+            }
+        }
+        if (((seq - tail) & 31) == 31 && NowNs() - t0 > xp_budget_ns) {
+            fail = XpBudget;
+        }
+    }
+    XpUndoState();
+    const auto account = [&] {
+        const u64 ns = NowNs() - t0;
+        xp_decide_ns.fetch_add(ns, std::memory_order_relaxed);
+        GateStoreMax(xp_decide_max_ns, ns);
+    };
+    if (fail != XpOk) {
+        account();
+        if (retry && ++xp_retries < 8) {
+            return false; // a prep thread is behind: look again after the next op
+        }
+        return fifo(fail);
+    }
+    if (num_ex_labels == 0) {
+        account();
+        return fifo(XpExpressUnknown); // the segment must end in its label (parser invariant)
+    }
+    for (const VAddr key : skipped_labels) {
+        for (u32 i = 0; i < num_ex_labels; ++i) {
+            if (key == ex_labels[i]) {
+                account();
+                return fifo(XpLabelSame);
+            }
+        }
+    }
+    // Rule 2: the union of the express footprints against every skipped footprint.
+    OpFootprint ew, er;
+    ew.known = er.known = true;
+    ew.writes = ex.writes;
+    er.reads = ex.reads;
+    for (const Skipped& sk : skipped) {
+        if (!Conflicts(ex, sk.fp)) {
+            continue;
+        }
+        OpFootprint sr, sw;
+        sr.known = sw.known = true;
+        sr.reads = sk.fp.reads;
+        sw.writes = sk.fp.writes;
+        if (Conflicts(ew, sr)) {
+            xp_conf_war.fetch_add(1, std::memory_order_relaxed);
+        } else if (Conflicts(er, sw)) {
+            xp_conf_raw.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            xp_conf_waw.fetch_add(1, std::memory_order_relaxed);
+        }
+        (sk.kind == 0 ? xp_conf_draw : sk.kind == 1 ? xp_conf_dispatch : xp_conf_func)
+            .fetch_add(1, std::memory_order_relaxed);
+        account();
+        return fifo(XpConflict);
+    }
+    if (NowNs() - t0 > xp_budget_ns) {
+        account();
+        return fifo(XpBudget);
+    }
+    account();
+
+    // All rules hold: run the express ops ahead.
+    rasterizer->Flush(); // the open buffer holds only older recorded work
+    const u64 run_start = NowNs();
+    xp_saved_cb = back_cb_extent;
+    xp_saved_db = back_db_extent;
+    xp_saved_cs = back_cs;
+    u64 label_exec_ns = 0;
+    for (u64 seq = tail; seq < seg.end; ++seq) {
+        BackOp& op = back_ring[seq % BackRingSize];
+        XpApplyState(op);
+        if (seq >= seg.start && op.qid == GfxQueueId && !op.xp_done) {
+            back_exec_seq = seq;
+            ExecuteBackOp(op);
+            op.xp_done = true;
+            if (seq + 1 == seg.end) {
+                label_exec_ns = NowNs();
+            }
+        }
+    }
+    XpUndoState();
+    back_exec_seq = tail;
+    rasterizer->Flush(); // the express work goes to the GPU before anything older that is unrecorded
+    NotifyCpWait();
+    xp_ahead.fetch_add(1, std::memory_order_relaxed);
+    xp_skipped_ops.fetch_add(num_skipped, std::memory_order_relaxed);
+    xp_express_ops.fetch_add(num_express, std::memory_order_relaxed);
+    xp_sk_labels.fetch_add(sk_labels, std::memory_order_relaxed);
+    xp_sk_flips.fetch_add(sk_flips, std::memory_order_relaxed);
+    xp_sk_marks.fetch_add(sk_marks, std::memory_order_relaxed);
+    xp_lat_ahead_ns.fetch_add((label_exec_ns ? label_exec_ns : NowNs()) - seg.queued_ns,
+                              std::memory_order_relaxed);
+    xp_saved_est_ns.fetch_add(static_cast<u64>(num_skipped * xp_op_ns), std::memory_order_relaxed);
+    xp_run_ns.fetch_add(NowNs() - run_start, std::memory_order_relaxed);
+    return done(XpOk);
 }
 
 // sotc: SOTC_EOP_TICK=1. A label whose work is still unsubmitted waits for the flush of the next
@@ -562,8 +1522,401 @@ static const u64 EopMaxWaitNs = [] {
     const char* v = std::getenv("SOTC_EOP_TICK_US");
     return v ? std::strtoull(v, nullptr, 10) * 1000ULL : 2'000'000ULL;
 }();
+// sotc: SOTC_RB_EXACT: a deferred label deferred only by queue order is not flushed when queued
+// (its tick may be empty), so the open buffer is submitted after this wait (SOTC_RB_WAIT_US).
+static const u64 RbxMaxWaitNs = [] {
+    const char* v = std::getenv("SOTC_RB_WAIT_US");
+    return v ? std::strtoull(v, nullptr, 10) * 1000ULL : 300'000ULL;
+}();
 // sotc: SOTC_EOP_TICK statistics, printed under SOTC_FPS (driver.cpp).
 std::atomic<u64> g_eop_written{0}, g_eop_latency_ns{0}, g_eop_max_latency_ns{0}, g_eop_flushes{0};
+// sotc: SOTC_RB_EXACT label statistics (liverpool.h).
+std::atomic<u64> g_rbx_labels_deferred{0}, g_rbx_labels_total{0}, g_rbx_defer_latency_ns{0},
+    g_rbx_defer_max_latency_ns{0}, g_rbx_offthread{0};
+// Adaptive policy (layer 2). Addresses in deferred mode is a gauge; the EWMAs are global averages
+// over all addresses (ns), a = landing latency, b = readback wait charged to early labels.
+std::atomic<u64> g_rbx_addr_deferred{0}, g_rbx_mode_switches{0}, g_rbx_probes{0},
+    g_rbx_labels_early_hot{0}, g_rbx_waits_charged{0}, g_rbx_waits_unattributed{0},
+    g_rbx_ewma_a_ns{1'500'000}, g_rbx_ewma_b_ns{0};
+
+// sotc: SOTC_RB_EXACT=1, label side (rules 5-7 of the design).
+//
+// PS4 semantics: a GPU write becomes meaningful to the CPU when the GPU has finished it, and the
+// game learns that through labels (EOP / ReleaseMem fences) and other CPU-visible GPU writes. The
+// port used to write every label as soon as the command processor / draw thread executed the
+// packet, long before the host GPU ran the work, so every guest readback of a window the GPU is
+// still writing had to wait for that work. With the switch on, the buffer cache
+// (BufferCache::RbExactEnabled) can release pages whose GPU-written ranges are still pending and
+// not yet "announced"; what announces a range is a label written after it in the command stream.
+// This code is the label half of that contract:
+//  - Rule 5. At the label's position in the stream (draw thread, same order as the stream) the hot
+//    write sequence (BufferCache::HotWriteSeq: GPU writes into windows the guest reads back) is
+//    snapshotted. A label of a queue (gfx / compute) is deferred iff the sequence changed since
+//    the previous label of that queue, or a deferred label to the same 8-byte aligned address is
+//    still outstanding (per-address FIFO: the scheduler's queue is FIFO, and an undeferred label
+//    never overtakes a deferred one to its address). Deferred labels use the SOTC_EOP_TICK
+//    machinery: scheduler.DeferOperation keyed on the open tick, polled by BackLoop through
+//    EopService (so also while no new work arrives), the open command buffer submitted by
+//    EopService once a label has waited 2 ms (SOTC_EOP_TICK_US), the CP's own waits satisfied by
+//    eop_shadow, and EopWaitGuard making the draw thread submit when a CP wait is blocked on a
+//    label queued behind unsubmitted work. The interrupt follows its label (same callback).
+//    Labels with no hot write since the previous one keep the old early write, so only labels
+//    that guard hot data pay for the GPU round trip.
+//    The game's cull pass (eboot 0xc6f2f -> 0x925c0 -> 0x86eb60) emits an EVENT_WRITE_EOP
+//    (PM4 header 0xC0044700, opcode 0x47, event CS_DONE, data 1) on the gfx DCB after its
+//    dispatch and then spins on the word, so a deferred label first records the downloads of the
+//    hot data written before it (BufferCache::RecordLabelDownloads) and the open command buffer
+//    is submitted at once (rasterizer->Flush), so the latency is the GPU execution only.
+//  - Rule 6. Before a deferred label is written, BufferCache::ApplyOwedBeforeLabel applies the
+//    owed downloads that are complete, so the game never sees a label before the data it
+//    announces. The deferred operation runs inside Scheduler::PopPendingOperations, called by the
+//    draw thread (Draw, Dispatch, Flush, EopService, buffer cache waits); a call from another
+//    thread only sets the job ready and is counted in g_rbx_offthread (RbxDrain lands it later).
+//  - Rule 7. Every label written to guest memory, early or deferred, then reports the snapshot
+//    taken at its stream position (BufferCache::NoteLabelWritten): at landing for a deferred
+//    one, right after the write for the others; a plain WRITE_DATA to memory reports the same
+//    way. DMA_DATA and GDS copies are GPU writes, not CPU-visible announcements, and do not.
+// SOTC_EOP_DEFER (the diagnostic priority-thread label) is ignored while this is on: its
+// callback runs on a thread that must not call into the buffer cache.
+// With the switch off none of this runs (rbx false) and every path is as before.
+// A label is deferred when it follows a hot GPU write (the hot sequence changed since the previous
+// label of its queue) AND the adaptive policy of its address says deferral pays (RbxPolicyDefer),
+// or when a deferred label to the same address is still outstanding (per-address FIFO).
+// There is no cross-address cascade: a later label of the queue is written early even while an
+// earlier one is deferred. That is exact because the only hazard of an early label is announcing
+// owed bytes before they are applied, and SettleOwedUpTo (called before every early write) closes
+// it; bytes still GPU-modified stay protected, so a guest read of them takes the exact wait.
+// The order of labels to different addresses can therefore differ from the PS4's.
+bool Liverpool::RbxDecide(u32 queue, VAddr label, u64& snap, bool* hot) {
+    snap = rasterizer->GetBufferCache().HotWriteSeq();
+    const bool changed = snap != rbx_last_seq[queue];
+    rbx_last_seq[queue] = snap;
+    if (hot) {
+        *hot = changed;
+    }
+    g_rbx_labels_total.fetch_add(1, std::memory_order_relaxed);
+    const VAddr key = label & ~VAddr{7};
+    {
+        std::scoped_lock lk{rbx_mutex};
+        if (rbx_out.contains(key)) {
+            return true;
+        }
+    }
+    if (!changed) {
+        return false;
+    }
+    if (RbxPolicyDefer(key)) {
+        return true;
+    }
+    RbxRecordEarly(snap, key); // an early label that announces hot data: its waits are charged
+    return false;
+}
+
+// ---- SOTC_RB_EXACT adaptive policy (layer 2) ----
+// Per label address (8-byte aligned, at most RbxMaxStats, least recently used evicted) two EWMAs:
+// a = landing latency of the address's deferred labels (what deferring costs the game when it
+// waits on the label), b = guest readback wait time charged to its early labels (what writing
+// early costs). An address starts early; it is deferred once b > 1.25 a and goes back once
+// a > 1.25 b. In deferred mode one hot label in 32 is written early to keep b fresh.
+// Attribution: BufferCache calls RbxWaitObserver(writer_seq, wait_ns) for every guest readback
+// that waited for the GPU on hot data (any guest thread). The wait is charged to the first
+// recent early hot label whose snapshot >= writer_seq (the label that announced that write). A
+// ring entry's accumulated cost becomes one b sample when the entry leaves the ring.
+
+void Liverpool::RbxUpdateMode(RbxAddrStat& st) {
+    if (!st.deferred && st.b_samples != 0 && st.b > st.a * 1.25) {
+        st.deferred = true;
+        g_rbx_addr_deferred.fetch_add(1, std::memory_order_relaxed);
+        g_rbx_mode_switches.fetch_add(1, std::memory_order_relaxed);
+    } else if (st.deferred && st.b_samples != 0 && st.a > st.b * 1.25) {
+        st.deferred = false;
+        g_rbx_addr_deferred.fetch_sub(1, std::memory_order_relaxed);
+        g_rbx_mode_switches.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+Liverpool::RbxAddrStat& Liverpool::RbxStat(VAddr key) { // under rbx_stat_mutex
+    auto it = rbx_stats.find(key);
+    if (it == rbx_stats.end()) {
+        if (rbx_stats.size() >= RbxMaxStats) {
+            auto victim = rbx_stats.begin();
+            for (auto i = rbx_stats.begin(); i != rbx_stats.end(); ++i) {
+                if (i->second.last_use < victim->second.last_use) {
+                    victim = i;
+                }
+            }
+            if (victim->second.deferred) {
+                g_rbx_addr_deferred.fetch_sub(1, std::memory_order_relaxed);
+            }
+            rbx_stats.erase(victim);
+        }
+        RbxAddrStat st;
+        st.a = double(g_rbx_ewma_a_ns.load(std::memory_order_relaxed));
+        it = rbx_stats.emplace(key, st).first;
+    }
+    it->second.last_use = ++rbx_use_clock;
+    return it->second;
+}
+
+bool Liverpool::RbxPolicyDefer(VAddr key) {
+    std::scoped_lock lk{rbx_stat_mutex};
+    RbxAddrStat& st = RbxStat(key);
+    ++st.hot_count;
+    if (!st.deferred) {
+        return false;
+    }
+    if ((st.hot_count & 31) == 0) {
+        g_rbx_probes.fetch_add(1, std::memory_order_relaxed);
+        return false; // re-probe early mode to keep b fresh
+    }
+    return true;
+}
+
+void Liverpool::RbxRecordEarly(u64 snap, VAddr key) {
+    g_rbx_labels_early_hot.fetch_add(1, std::memory_order_relaxed);
+    std::scoped_lock lk{rbx_stat_mutex};
+    if (rbx_early_count == rbx_early_ring.size()) {
+        const RbxEarly& old = rbx_early_ring[rbx_early_head];
+        RbxAddrStat& st = RbxStat(old.key);
+        st.b = st.b_samples ? st.b + 0.125 * (old.cost - st.b) : old.cost;
+        ++st.b_samples;
+        const double g = double(g_rbx_ewma_b_ns.load(std::memory_order_relaxed));
+        g_rbx_ewma_b_ns.store(u64(g + 0.05 * (old.cost - g)), std::memory_order_relaxed);
+        RbxUpdateMode(st);
+    } else {
+        ++rbx_early_count;
+    }
+    rbx_early_ring[rbx_early_head] = RbxEarly{snap, key, 0.0};
+    rbx_early_head = (rbx_early_head + 1) % u32(rbx_early_ring.size());
+}
+
+void Liverpool::RbxFoldLanding(VAddr key, u64 latency_ns) {
+    std::scoped_lock lk{rbx_stat_mutex};
+    RbxAddrStat& st = RbxStat(key);
+    st.a = st.a_samples ? st.a + 0.125 * (double(latency_ns) - st.a) : double(latency_ns);
+    ++st.a_samples;
+    const double g = double(g_rbx_ewma_a_ns.load(std::memory_order_relaxed));
+    g_rbx_ewma_a_ns.store(u64(g + 0.05 * (double(latency_ns) - g)), std::memory_order_relaxed);
+    RbxUpdateMode(st);
+}
+
+// Any thread. Cheap: one short critical section over a ring of 128.
+void Liverpool::RbxWaitObserver(u64 writer_seq, u64 wait_ns) {
+    Liverpool* self = g_rbx_self.load(std::memory_order_acquire);
+    if (!self) {
+        return;
+    }
+    std::scoped_lock lk{self->rbx_stat_mutex};
+    const u32 n = self->rbx_early_count;
+    const u32 size = u32(self->rbx_early_ring.size());
+    // Oldest entry first: the ring is in snapshot order.
+    for (u32 i = 0; i < n; ++i) {
+        RbxEarly& e = self->rbx_early_ring[(self->rbx_early_head + size - n + i) % size];
+        if (e.snap >= writer_seq) {
+            e.cost += double(wait_ns);
+            g_rbx_waits_charged.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+    g_rbx_waits_unattributed.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Draw thread. EOS is a fence like a label: it is deferred under the same rules. Otherwise false
+// is returned with snap set, and the caller settles (SettleOwedUpTo), writes now and reports.
+template <typename F>
+bool Liverpool::RbxTryDefer(u32 queue, VAddr addr, bool shadow32, u32 value, u64& snap, F&& make) {
+    bool hot = false;
+    if (!RbxDecide(queue, addr, snap, &hot)) {
+        return false;
+    }
+    if (hot) {
+        rasterizer->GetBufferCache().RecordLabelDownloads();
+    }
+    QueueDeferredLabel(queue, addr, shadow32, false, value, 0, snap,
+                       Common::UniqueFunction<void>{make()});
+    if (hot) {
+        rasterizer->Flush();
+    }
+    return true;
+}
+
+void Liverpool::RbxNoteWritten(u64 snap) {
+    rasterizer->GetBufferCache().NoteLabelWritten(snap);
+}
+
+void Liverpool::QueueDeferredLabel(u32 queue, VAddr label, bool shadow32, bool shadow64,
+                                   u32 data_lo, u32 data_hi, u64 snap,
+                                   Common::UniqueFunction<void>&& write) {
+    auto& scheduler = rasterizer->GetScheduler();
+    eop_last_tick.store(scheduler.CurrentTick(), std::memory_order_relaxed);
+    if (eop_outstanding.fetch_add(1, std::memory_order_acq_rel) == 0) {
+        eop_oldest_ns.store(SotcStats::NowNs(), std::memory_order_relaxed);
+    }
+    // The CP's waits on this label are satisfied by its pending value (see eop_shadow); only the
+    // guest sees the real write, after the GPU.
+    if (shadow32 || shadow64) {
+        std::scoped_lock lk{eop_shadow_mutex};
+        eop_shadow[label] = data_lo;
+        if (shadow64) {
+            eop_shadow[label + 4] = data_hi;
+        }
+        eop_shadow_count.store(u32(eop_shadow.size()), std::memory_order_release);
+    }
+    auto job = std::make_shared<RbxJob>();
+    job->label = label;
+    job->key = label & ~VAddr{7};
+    job->shadow32 = shadow32;
+    job->shadow64 = shadow64;
+    job->lo = data_lo;
+    job->hi = data_hi;
+    job->snap = snap;
+    job->queue = queue;
+    job->queued_ns = SotcStats::NowNs();
+    job->tick = scheduler.CurrentTick();
+    job->write = std::move(write);
+    if (rbx) {
+        std::scoped_lock lk{rbx_mutex};
+        ++rbx_out[job->key];
+        ++rbx_q_out[queue];
+        rbx_jobs.push_back(job);
+    }
+    scheduler.DeferOperation([this, job] {
+        if (rbx) {
+            // The label's tick is done. Landing is in queue order and needs the draw thread and
+            // the owed downloads applied; RbxDrain retries from EopService until it can.
+            job->ready.store(true, std::memory_order_release);
+            RbxDrain();
+        } else {
+            LandLabel(*job);
+        }
+    });
+}
+
+// Queue time (ns) of the oldest deferred label whose tick is still the open one or later, that
+// is not submitted to the GPU yet; 0 when there is none. Jobs are queued in tick order.
+u64 Liverpool::RbxOldestUnsubmittedNs() {
+    const u64 cur = rasterizer->GetScheduler().CurrentTick();
+    std::scoped_lock lk{rbx_mutex};
+    for (const auto& job : rbx_jobs) {
+        if (job->tick >= cur) {
+            return job->queued_ns;
+        }
+    }
+    return 0;
+}
+
+// sotc: SOTC_RB_EXACT. Called only from top-level draw thread points that are not inside any
+// buffer or texture cache operation: BackLoop's EopService, and ServiceCommandsOnBackThread
+// (SOTC_FLIP_SERVICE's wait for a free frame, between two operations). It lands the labels whose
+// tick the GPU has finished and runs no other scheduler operation. It deliberately does not call
+// PopPendingOperations: that would run the fault manager and image reclaim operations in the
+// middle of a caller that holds references across the wait. Semaphore::Wait and the presenter's
+// frame waits are not hooked either, for the same reason (and the presenter callers could not be
+// shown to be outside cache calls). ApplyOwedBeforeLabel returns false when it is not safe, so
+// the job just stays queued.
+void Liverpool::RbxWaitService() {
+    if (!rbx || !rasterizer || std::this_thread::get_id() != back_id ||
+        eop_outstanding.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    RbxDrain();
+}
+
+// Writes the label, its interrupt and the bookkeeping (draw thread when rbx).
+void Liverpool::LandLabel(RbxJob& job) {
+    const u64 latency = SotcStats::NowNs() - job.queued_ns;
+    if (eop_tick) {
+        g_eop_written.fetch_add(1, std::memory_order_relaxed);
+        g_eop_latency_ns.fetch_add(latency, std::memory_order_relaxed);
+        u64 prev = g_eop_max_latency_ns.load(std::memory_order_relaxed);
+        while (latency > prev && !g_eop_max_latency_ns.compare_exchange_weak(
+                                     prev, latency, std::memory_order_relaxed)) {
+        }
+    }
+    if (rbx) {
+        SotcStats::RbExLabelDeferral(latency);
+        RbxFoldLanding(job.key, latency);
+        g_rbx_labels_deferred.fetch_add(1, std::memory_order_relaxed);
+        g_rbx_defer_latency_ns.fetch_add(latency, std::memory_order_relaxed);
+        u64 prev = g_rbx_defer_max_latency_ns.load(std::memory_order_relaxed);
+        while (latency > prev && !g_rbx_defer_max_latency_ns.compare_exchange_weak(
+                                     prev, latency, std::memory_order_relaxed)) {
+        }
+    }
+    job.write();
+    if (job.shadow32 || job.shadow64) {
+        // Written for real now: drop the shadow unless a later label of the same address
+        // already replaced it.
+        std::scoped_lock lk{eop_shadow_mutex};
+        const auto drop = [&](VAddr a, u32 v) {
+            if (const auto it = eop_shadow.find(a); it != eop_shadow.end() && it->second == v) {
+                eop_shadow.erase(it);
+            }
+        };
+        drop(job.label, job.lo);
+        if (job.shadow64) {
+            drop(job.label + 4, job.hi);
+        }
+        eop_shadow_count.store(u32(eop_shadow.size()), std::memory_order_release);
+    }
+    if (rbx) {
+        RbxNoteWritten(job.snap); // rule 7, at landing
+        std::scoped_lock lk{rbx_mutex};
+        if (const auto it = rbx_out.find(job.key); it != rbx_out.end() && --it->second == 0) {
+            rbx_out.erase(it);
+        }
+        --rbx_q_out[job.queue];
+    }
+    if (eop_outstanding.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        eop_oldest_ns.store(0, std::memory_order_relaxed);
+    }
+    NotifyCpWait(); // sotc: SOTC_CP_IDLE_US
+}
+
+// SOTC_RB_EXACT: lands the deferred labels in queue order. A label lands when its tick is done
+// (ready), on the draw thread only, and when ApplyOwedBeforeLabel says the data it announces is in
+// guest memory (false: stay queued, EopService retries). An op that ran on another thread only
+// sets ready; the next draw thread poll lands it. Order is kept by our own FIFO, not by the
+// scheduler's queue, so a retry never lets a later label overtake an earlier one.
+void Liverpool::RbxDrain() {
+    if (std::this_thread::get_id() != back_id) {
+        g_rbx_offthread.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    for (;;) {
+        std::shared_ptr<RbxJob> job;
+        {
+            std::scoped_lock lk{rbx_mutex};
+            if (rbx_jobs.empty()) {
+                return;
+            }
+            job = rbx_jobs.front();
+        }
+        // Ready when the scheduler op ran (an optimisation) or the GPU has finished the job's
+        // tick: the drain does not depend on any scheduler operation having run.
+        if (!job->ready.load(std::memory_order_acquire)) {
+            auto* work = rasterizer->GetScheduler().GetWorkSemaphore();
+            if (!work->IsFree(job->tick)) {
+                work->Refresh();
+            }
+            if (!work->IsFree(job->tick)) {
+                return;
+            }
+            job->ready.store(true, std::memory_order_release);
+        }
+        {
+        }
+        // Rule 6: the data the label announces must be in guest memory first.
+        if (!rasterizer->GetBufferCache().ApplyOwedBeforeLabel()) {
+            return;
+        }
+        {
+            std::scoped_lock lk{rbx_mutex};
+            rbx_jobs.pop_front();
+        }
+        LandLabel(*job);
+    }
+}
 
 void Liverpool::EopService() {
     eop_service_requested.store(false, std::memory_order_relaxed);
@@ -574,7 +1927,24 @@ void Liverpool::EopService() {
     // Runs the queued labels whose tick the GPU has reached. The queue is FIFO, so labels to the
     // same address are written in submission order.
     scheduler.PopPendingOperations();
+    if (rbx) {
+        RbxDrain(); // sotc: SOTC_RB_EXACT: retry labels held by ApplyOwedBeforeLabel
+    }
     if (eop_outstanding.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    if (rbx) {
+        // The guard runs on the oldest label that is not submitted yet, not on the 0 -> 1
+        // timestamp, which goes stale while labels keep streaming. A flush moves every queued
+        // label to a submitted tick, so it happens at most once per tick.
+        const u64 queued = RbxOldestUnsubmittedNs();
+        const u64 tick = scheduler.CurrentTick();
+        if (queued != 0 && SotcStats::NowNs() - queued > std::min(EopMaxWaitNs, RbxMaxWaitNs) &&
+            rbx_flush_tick != tick) {
+            rbx_flush_tick = tick;
+            g_eop_flushes.fetch_add(1, std::memory_order_relaxed);
+            rasterizer->Flush();
+        }
         return;
     }
     const u64 waited = SotcStats::NowNs() - eop_oldest_ns.load(std::memory_order_relaxed);
@@ -600,12 +1970,129 @@ void Liverpool::EopWaitGuard() {
         eop_outstanding.load(std::memory_order_acquire) == 0) {
         return;
     }
-    const u64 waited = SotcStats::NowNs() - eop_oldest_ns.load(std::memory_order_relaxed);
-    if (waited <= EopMaxWaitNs) {
-        return;
+    if (rbx) {
+        const u64 queued = RbxOldestUnsubmittedNs();
+        if (queued == 0 || SotcStats::NowNs() - queued <= std::min(EopMaxWaitNs, RbxMaxWaitNs)) {
+            return;
+        }
+    } else {
+        const u64 waited = SotcStats::NowNs() - eop_oldest_ns.load(std::memory_order_relaxed);
+        if (waited <= EopMaxWaitNs) {
+            return;
+        }
     }
     eop_service_requested.store(true, std::memory_order_relaxed);
     QueueBackFunc(Common::UniqueFunction<void>{[this] { EopService(); }}, false);
+}
+
+u8 Liverpool::MemWaitKind(const PM4CmdWaitRegMem& wait, bool vo_label) const {
+    if (wait.mem_space.Value() != PM4CmdWaitRegMem::MemSpace::Memory) {
+        return CpWaitOther;
+    }
+    if (vo_label) {
+        return CpWaitFlip;
+    }
+    // A label still to come from the draw thread (EOP/EOS, WRITE_DATA, RELEASE_MEM run there) or
+    // from the GPU (SOTC_EOP_TICK). Approximate: any queued op counts.
+    if ((back_threaded &&
+         back_tail.load(std::memory_order_relaxed) != back_head.load(std::memory_order_relaxed)) ||
+        eop_outstanding.load(std::memory_order_relaxed) != 0) {
+        return CpWaitLabel;
+    }
+    return CpWaitRegMem;
+}
+
+// sotc: SOTC_CP_IDLE_US. Lost wake-ups: NotifyCpWait bumps cp_wake_epoch and then reads
+// cp_sleeping; this sets cp_sleeping and then reads the epoch (all seq_cst), so either the
+// notifier sees the sleeper and wakes it, or the sleeper sees the new epoch and does not block.
+// The caller read seen_epoch before it last re-tested every waiting task, so a change made
+// before that re-test was seen by it, and one made after it moves the epoch. Conditions only the
+// guest CPU changes (game-written labels, Rewind, semaphores) cannot notify: the timeout bounds
+// how late those are seen. On Windows the condition variable and WaitOnAddress timeouts are whole
+// milliseconds, so the block is an auto-reset event plus a high-resolution waitable timer.
+bool Liverpool::CpIdleSleep(u64 seen_epoch) {
+    const u64 start = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
+    cp_sleeping.store(true, std::memory_order_seq_cst);
+    bool notified = cp_wake_epoch.load(std::memory_order_seq_cst) != seen_epoch;
+    if (notified) {
+        cp_sleeping.store(false, std::memory_order_relaxed);
+        return true; // changed during the round: not counted as a sleep
+    }
+#ifdef _WIN32
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+    struct Timer {
+        HANDLE handle = nullptr;
+        ~Timer() {
+            if (handle) {
+                ::CloseHandle(handle);
+            }
+        }
+    };
+    thread_local Timer timer;
+    if (!timer.handle) {
+        timer.handle = ::CreateWaitableTimerExW(nullptr, nullptr,
+                                                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                                TIMER_ALL_ACCESS);
+        if (!timer.handle) {
+            timer.handle = ::CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+        }
+    }
+    LARGE_INTEGER due{};
+    due.QuadPart = -static_cast<LONGLONG>(cp_idle_timeout_ns / 100); // relative, 100 ns units
+    const HANDLE handles[2] = {static_cast<HANDLE>(cp_wake_event), timer.handle};
+    DWORD result = WAIT_FAILED;
+    if (timer.handle && ::SetWaitableTimer(timer.handle, &due, 0, nullptr, nullptr, FALSE)) {
+        // A set event with the epoch unchanged is stale (a WakeCp that raced the end of the
+        // previous sleep): wait on, the timer keeps the deadline.
+        do {
+            result = ::WaitForMultipleObjects(2, handles, FALSE, INFINITE);
+        } while (result == WAIT_OBJECT_0 &&
+                 cp_wake_epoch.load(std::memory_order_seq_cst) == seen_epoch);
+    } else {
+        result = ::WaitForSingleObject(handles[0],
+                                       static_cast<DWORD>((cp_idle_timeout_ns + 999'999) / 1'000'000));
+    }
+    notified = result == WAIT_OBJECT_0;
+    if (notified && timer.handle) {
+        ::CancelWaitableTimer(timer.handle);
+    }
+#else
+    {
+        std::unique_lock lk{cp_idle_mutex};
+        notified = cp_idle_cv.wait_for(lk, std::chrono::nanoseconds{cp_idle_timeout_ns}, [&] {
+            return cp_wake_epoch.load(std::memory_order_seq_cst) != seen_epoch;
+        });
+    }
+#endif
+    cp_sleeping.store(false, std::memory_order_relaxed);
+    if (SotcStats::kFpsLog) {
+        const u64 now = SotcStats::NowNs();
+        SotcStats::CpAdd(SotcStats::cp_sleeps, 1);
+        SotcStats::CpAdd(SotcStats::cp_sleep_ns, now - start);
+        if (notified) {
+            const u64 notify = cp_notify_ns.load(std::memory_order_relaxed);
+            SotcStats::CpAdd(SotcStats::cp_wakes, 1);
+            SotcStats::CpAdd(SotcStats::cp_wake_latency_ns,
+                             notify >= start && now > notify ? now - notify : 0);
+        } else {
+            SotcStats::CpAdd(SotcStats::cp_sleep_timeouts, 1);
+        }
+    }
+    return notified;
+}
+
+void Liverpool::WakeCp() noexcept {
+    if (SotcStats::kFpsLog) {
+        cp_notify_ns.store(SotcStats::NowNs(), std::memory_order_relaxed);
+    }
+#ifdef _WIN32
+    ::SetEvent(static_cast<HANDLE>(cp_wake_event));
+#else
+    { std::scoped_lock lk{cp_idle_mutex}; }
+    cp_idle_cv.notify_one();
+#endif
 }
 
 void Liverpool::WriteFenceValue(void* address, u64 data, u32 num_bytes) {
@@ -626,6 +2113,8 @@ void Liverpool::ProcessCommands() {
     // here, at this point of the command stream.
     if (back_threaded) {
         if (std::this_thread::get_id() == back_id) {
+            // sotc: SOTC_RB_BATCH: the readbacks these commands start share one submit.
+            const VideoCore::ReadbackBatchScope readback_batch;
             while (num_commands) {
                 Common::UniqueFunction<void> callback{};
                 {
@@ -636,6 +2125,7 @@ void Liverpool::ProcessCommands() {
                 }
                 callback();
             }
+            NotifyCpWait(); // sotc: SOTC_CP_IDLE_US: a game thread's command may write memory
             return;
         }
         while (num_ordered) {
@@ -651,6 +2141,7 @@ void Liverpool::ProcessCommands() {
         return;
     }
     // Process incoming commands with high priority
+    const VideoCore::ReadbackBatchScope readback_batch; // sotc: SOTC_RB_BATCH
     while (num_commands) {
         Common::UniqueFunction<void> callback{};
         {
@@ -665,6 +2156,12 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+    // sotc: SOTC_FPS thread accounting. Without the draw thread the back ops run here, so its
+    // waits count as the draw thread's (DrawWait) while its CPU time stays the command processor's.
+    SotcStats::RegisterThreadRole(SotcStats::RoleCp);
+    if (!back_threaded) {
+        SotcStats::tl_role = SotcStats::RoleDraw;
+    }
     SotcRaiseGpuThread();
     BbThreads::PlaceThread(BbThreads::Role::CommandProcessor);
     gpu_id = std::this_thread::get_id();
@@ -701,11 +2198,99 @@ void Liverpool::Process(std::stop_token stoken) {
         }();
         u32 since_progress = 0;
 
+        // sotc: no-progress tracking, for the SOTC_FPS spin accounting and SOTC_CP_IDLE_US.
+        // A resume made progress when it finished its task, left a wait loop (cp_wait_exits) or
+        // was the first of its task; any other resume only re-tested the wait it yielded in. A
+        // streak is the time from the first resume without progress to the next progress. The
+        // clock is read once per progress resume (parse time) and every 32 resumes of a streak
+        // (spin time, idle deadline); the resumes of a streak are not timed one by one.
+        const bool track = SotcStats::kFpsLog || cp_idle_ns != 0;
+        std::array<void*, NumTotalQueues> last_resumed{}; // the task each queue resumed last
+        u32 idle_iters = 0;      // iterations of the round in progress, 0: a new round starts
+        u32 round_kinds = 0;     // CpWaitKind bits seen in the round in progress
+        u64 round_epoch = 0;     // cp_wake_epoch when the round in progress started
+        bool spinning = false;   // in a streak
+        bool idle_due = false;   // the streak passed SOTC_CP_IDLE_US: sleep at the round's end
+        u32 streak_resumes = 0;
+        u64 mark_ns = 0;         // last clock reading (resume start, or the streak's last sample)
+        u64 streak_start_ns = 0; // start of the streak, or of the spin window after a wake
+        u64 pending_rounds = 0;  // SOTC_FPS rounds not yet added to the counters
+        std::array<u64, SotcStats::CpSpinKinds> pending_kinds{};
+        const auto publish_rounds = [&] {
+            if (pending_rounds) {
+                SotcStats::CpAdd(SotcStats::cp_spin_rounds, pending_rounds);
+                for (int k = 0; k < SotcStats::CpSpinKinds; ++k) {
+                    if (pending_kinds[k]) {
+                        SotcStats::CpAdd(SotcStats::cp_spin_kind_rounds[k], pending_kinds[k]);
+                        pending_kinds[k] = 0;
+                    }
+                }
+                pending_rounds = 0;
+            }
+        };
+        const auto end_streak = [&] {
+            if (spinning && SotcStats::kFpsLog) {
+                publish_rounds();
+            }
+            spinning = false;
+            idle_due = false;
+            idle_iters = 0;
+        };
+
         while (num_submits || (num_commands && !back_threaded) || num_ordered) {
             if (num_commands && !back_threaded) {
                 since_progress = 0;
             }
+            if (track && ((num_commands && !back_threaded) || num_ordered)) {
+                end_streak(); // the commands are progress (and may be what a task waits for)
+            }
             ProcessCommands();
+            // sotc: SOTC_CP_AHEAD=2: a mark pushed while every task waits (one may wait on a
+            // guest write that comes after the guest's own frame-lag wait) is served here.
+            // Two compares unless a mark arrived or a task finished.
+            if (frame_tickets) {
+                ServiceFrameMarks();
+            }
+
+            if (track) {
+                if (idle_iters >= num_mapped_queues) {
+                    // A whole round over the mapped queues without progress.
+                    if (SotcStats::kFpsLog && round_kinds) {
+                        ++pending_rounds;
+                        for (int k = 0; k < SotcStats::CpSpinKinds; ++k) {
+                            pending_kinds[k] += (round_kinds >> k) & 1;
+                        }
+                    }
+                    if (idle_due) {
+                        // sotc: SOTC_CP_IDLE_US. Every queue was resumed after round_epoch was
+                        // read, so a notification since then makes CpIdleSleep return at once.
+                        if (SotcStats::kFpsLog) {
+                            const u64 now = SotcStats::NowNs();
+                            SotcStats::CpAdd(SotcStats::cp_spin_ns, now - mark_ns);
+                            publish_rounds();
+                        }
+                        const bool notified = CpIdleSleep(round_epoch);
+                        mark_ns = SotcStats::NowNs();
+                        streak_resumes = 0;
+                        since_progress = 0;
+                        // After a notification the full spin window runs again (the condition
+                        // probably just changed); after a timeout one round re-tests the waits
+                        // the guest CPU writes, then the thread sleeps again.
+                        idle_due = !notified;
+                        if (notified) {
+                            streak_start_ns = mark_ns;
+                        }
+                    }
+                    idle_iters = 0;
+                }
+                if (idle_iters == 0) {
+                    round_kinds = 0;
+                    if (cp_idle_ns) {
+                        round_epoch = cp_wake_epoch.load(std::memory_order_seq_cst);
+                    }
+                }
+                ++idle_iters;
+            }
 
             curr_qid = (curr_qid + 1) % num_mapped_queues;
             ++since_progress;
@@ -726,12 +2311,49 @@ void Liverpool::Process(std::stop_token stoken) {
                 }
                 task = queue.submits.front();
             }
-            // sotc: timed only for the SOTC_FPS line (two clock reads per resume of the spin).
-            const u64 parse_start = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
+            // sotc: SOTC_FPS parse time: outside a streak the resume is timed from its start;
+            // the first progress after a streak is timed from the streak's last sample (at most
+            // 31 re-tests earlier), so cp_parse_ns no longer contains the spin.
+            if (SotcStats::kFpsLog && !spinning) {
+                mark_ns = SotcStats::NowNs();
+            }
+            const u64 exits_before = cp_wait_exits;
             task.resume();
-            if (SotcStats::kFpsLog) {
-                SotcStats::cp_parse_ns.fetch_add(SotcStats::NowNs() - parse_start,
-                                                 std::memory_order_relaxed);
+            if (track) {
+                void* const resumed = task.done() ? nullptr : task.address();
+                const bool progress = !resumed || cp_wait_exits != exits_before ||
+                                      resumed != last_resumed[curr_qid];
+                last_resumed[curr_qid] = resumed;
+                if (progress) {
+                    if (SotcStats::kFpsLog) {
+                        const u64 parse_ns = SotcStats::NowNs() - mark_ns;
+                        SotcStats::cp_parse_ns.fetch_add(parse_ns, std::memory_order_relaxed);
+                        SotcStats::cp_parse_all_ns.fetch_add(parse_ns, std::memory_order_relaxed);
+                    }
+                    end_streak();
+                } else {
+                    round_kinds |= 1u << (cp_wait_kind < SotcStats::CpSpinKinds
+                                              ? cp_wait_kind
+                                              : SotcStats::CpSpinKinds - 1);
+                    if (!spinning) {
+                        spinning = true;
+                        streak_resumes = 0;
+                        if (!SotcStats::kFpsLog) {
+                            mark_ns = SotcStats::NowNs();
+                        }
+                        streak_start_ns = mark_ns; // this resume's start (or now)
+                    } else if ((++streak_resumes & 31) == 0) {
+                        const u64 now = SotcStats::NowNs();
+                        if (SotcStats::kFpsLog) {
+                            SotcStats::CpAdd(SotcStats::cp_spin_ns, now - mark_ns);
+                            publish_rounds();
+                        }
+                        mark_ns = now;
+                        if (cp_idle_ns && now - streak_start_ns >= cp_idle_ns) {
+                            idle_due = true;
+                        }
+                    }
+                }
             }
 
             if (!task.done()) {
@@ -743,17 +2365,42 @@ void Liverpool::Process(std::stop_token stoken) {
                 since_progress = 0;
                 task.destroy();
 
-                std::scoped_lock lock{queue.m_access};
-                queue.submits.pop();
-                queue.has_work.store(!queue.submits.empty(), std::memory_order_release);
+                {
+                    std::scoped_lock lock{queue.m_access};
+                    queue.submits.pop();
+                    // sotc: SOTC_ASC_RPTR=2: the ring copy the task ran from.
+                    if (!queue.owned.empty()) {
+                        queue.owned.pop();
+                    }
+                    queue.has_work.store(!queue.submits.empty(), std::memory_order_release);
 
-                --num_submits;
-                std::scoped_lock lock2{submit_mutex};
-                submit_cv.notify_all();
+                    --num_submits;
+                    std::scoped_lock lock2{submit_mutex};
+                    submit_cv.notify_all();
+                }
+                // sotc: SOTC_CP_AHEAD=2: a finished task may complete a frame's submits.
+                if (frame_tickets) {
+                    ++q_completed[curr_qid];
+                    ++q_done_epoch;
+                    ServiceFrameMarks();
+                }
             }
         }
+        if (track) {
+            end_streak();
+        }
 
-        if (submit_done) {
+        // sotc: SOTC_CP_AHEAD=2: the frame ends (OnSubmit, Flush, ticket) are queued by
+        // ServiceFrameMarks when their submits are parsed, not here once the CP is idle: the guest
+        // may already have submitted the next frame, and the CP may not become idle between two
+        // frames. submit_done is cleared before the marks are read, so a SubmitDone arriving
+        // after the read sets it again and the CP comes back here (no lost frame end).
+        if (frame_tickets) {
+            if (submit_done.exchange(false)) {
+                VideoCore::EndCapture();
+            }
+            ServiceFrameMarks();
+        } else if (submit_done) {
             VideoCore::EndCapture();
             if (rasterizer) {
                 BackOrRun(
@@ -886,8 +2533,10 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         case PM4ItOpcode::WaitOnDeCounterDiff: {
             const auto diff = it_body[0];
             while ((cblock.de_count - cblock.ce_count) >= diff) {
+                cp_wait_kind = CpWaitDeCounter; // sotc: SOTC_FPS CP spin accounting
                 YIELD_CE();
             }
+            ++cp_wait_exits; // sotc: progress marker (Process)
             break;
         }
         case PM4ItOpcode::IndirectBufferConst: {
@@ -920,6 +2569,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
     cblock.Reset();
 
+    // sotc: SOTC_CULL_EXPRESS: the first op of a top-level gfx submit starts an express segment
+    // (indirect buffers re-enter this function: only the outermost call counts).
+    if (xp_on && xp_gfx_depth++ == 0) {
+        xp_seg_start = back_head.load(std::memory_order_relaxed);
+    }
+
     // TODO: potentially, ASCs also can depend on CE and in this case the
     // CE task should be moved into more global scope
     Task ce_task{};
@@ -932,6 +2587,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     while (!dcb.empty()) {
+        func_kind_hint = 3; // sotc: SOTC_FPS accounting (ordered commands queued below)
         ProcessCommands();
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
@@ -952,6 +2608,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+            // sotc: SOTC_FPS accounting kind of the ops this packet queues, and SOTC_WD_FUSE:
+            // held-back WRITE_DATA packets go out before any packet that is not transparent.
+            func_kind_hint = opcode == PM4ItOpcode::DmaData        ? 2
+                             : opcode == PM4ItOpcode::WriteData    ? 0
+                             : (opcode == PM4ItOpcode::EventWriteEop ||
+                                opcode == PM4ItOpcode::EventWriteEos)
+                                 ? 1
+                                 : 3;
+            if (wd_pending.num_segs && !FuseTransparent(header, opcode)) {
+                FlushWd();
+            }
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -967,6 +2634,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     // here, before the flip is queued, instead of on the draw thread.
                     if (auto* pacer = Vulkan::Presenter::cp_pacer; pacer && back_threaded) {
                         pacer->PaceFlip();
+                        XpSetHint(XpFlip, 0, 0);
                         BackOrRun(
                             [pacer] {
                                 pacer->FlipReached();
@@ -976,6 +2644,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             false);
                         break;
                     }
+                    XpSetHint(XpFlip, 0, 0);
                     BackOrRun(
                         [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip); },
                         false);
@@ -1418,13 +3087,40 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWriteEos: {
                 const PM4CmdEventWriteEos eos = *reinterpret_cast<const PM4CmdEventWriteEos*>(header);
+                if (eos.command != PM4CmdEventWriteEos::Command::GdsStore) {
+                    XpSetHint(XpLabel, reinterpret_cast<VAddr>(eos.Address()), 8);
+                }
                 BackOrRun([this, eos] {
                     if (rasterizer) {
                         rasterizer->OnFence();
                     }
+                    // sotc: SOTC_RB_EXACT rules 5-7 for EOS (RbxTryDefer).
+                    u64 rbx_snap = 0;
+                    const bool rbx_ok = rbx && rasterizer &&
+                                        eos.command == PM4CmdEventWriteEos::Command::SignalFence;
+                    if (rbx_ok &&
+                        RbxTryDefer(0, reinterpret_cast<VAddr>(eos.Address()), true,
+                                    eos.DataDWord(), rbx_snap, [this, eos] {
+                                        return [this, eos] {
+                                            eos.SignalFence([this](void* a, u64 d, u32 n) {
+                                                WriteFenceValue(a, d, n);
+                                            });
+                                        };
+                                    })) {
+                        return;
+                    }
+                    if (rbx && rasterizer && !rbx_ok) {
+                        rbx_snap = rasterizer->GetBufferCache().HotWriteSeq();
+                    }
+                    if (rbx && rasterizer) {
+                        rasterizer->GetBufferCache().SettleOwedUpTo(rbx_snap);
+                    }
                     eos.SignalFence([this](void* address, u64 data, u32 num_bytes) {
                         WriteFenceValue(address, data, num_bytes);
                     });
+                    if (rbx && rasterizer) {
+                        RbxNoteWritten(rbx_snap); // rule 7: early write
+                    }
                     if (eos.command == PM4CmdEventWriteEos::Command::GdsStore) {
                         ASSERT(eos.size == 1);
                         if (rasterizer) {
@@ -1434,11 +3130,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         }
                     }
                 }, back_strict);
+                if (xp_on) {
+                    xp_seg_start = back_head.load(std::memory_order_relaxed); // a label ends a segment
+                }
                 break;
             }
             case PM4ItOpcode::EventWriteEop: {
                 const PM4CmdEventWriteEop eop_packet =
                     *reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+                XpSetHint(XpLabel, reinterpret_cast<VAddr>(eop_packet.Address<void>()),
+                          eop_packet.data_sel.Value() == DataSelect::None ? 0 : 8);
                 BackOrRun([this, eop_packet] {
                 const auto* event_eop = &eop_packet;
                 if (rasterizer) {
@@ -1450,7 +3151,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 // queue is FIFO, so labels to one address are written in submission order. The
                 // draw thread polls the queue (BackLoop, EopService), and EopWaitGuard submits the
                 // open buffer when a wait has been blocked on a label for too long.
-                if (eop_tick && rasterizer) {
+                // sotc: SOTC_RB_EXACT: only a label that follows a hot GPU write is deferred
+                // (QueueDeferredLabel has the details); the others are written below, early.
+                u64 rbx_snap = 0;
+                bool rbx_defer = false;
+                bool rbx_hot = false;
+                if (rbx && rasterizer) {
+                    rbx_defer = RbxDecide(0, reinterpret_cast<VAddr>(event_eop->Address<void>()),
+                                          rbx_snap, &rbx_hot);
+                }
+                if ((eop_tick || rbx_defer) && rasterizer) {
                     const PM4CmdEventWriteEop eop = *event_eop;
                     const VAddr label = reinterpret_cast<VAddr>(eop.Address<void>());
                     // As in the SOTC_EOP_DEFER path: the GPU copy of the label's page must not
@@ -1458,61 +3168,29 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     if (eop.data_sel.Value() != DataSelect::None) {
                         rasterizer->InvalidateMemory(label, 8, true);
                     }
-                    auto& scheduler = rasterizer->GetScheduler();
-                    eop_last_tick.store(scheduler.CurrentTick(), std::memory_order_relaxed);
-                    if (eop_outstanding.fetch_add(1, std::memory_order_acq_rel) == 0) {
-                        eop_oldest_ns.store(SotcStats::NowNs(), std::memory_order_relaxed);
+                    if (rbx_defer && rbx_hot) {
+                        rasterizer->GetBufferCache().RecordLabelDownloads();
                     }
-                    // The CP's waits on this label are satisfied by its pending value (see
-                    // eop_shadow); only the guest sees the real write, after the GPU.
-                    const bool shadow32 = eop.data_sel.Value() == DataSelect::Data32Low;
-                    const bool shadow64 = eop.data_sel.Value() == DataSelect::Data64;
-                    if (shadow32 || shadow64) {
-                        std::scoped_lock lk{eop_shadow_mutex};
-                        eop_shadow[label] = eop.data_lo;
-                        if (shadow64) {
-                            eop_shadow[label + 4] = eop.data_hi;
-                        }
-                        eop_shadow_count.store(u32(eop_shadow.size()), std::memory_order_release);
+                    QueueDeferredLabel(
+                        0, label, eop.data_sel.Value() == DataSelect::Data32Low,
+                        eop.data_sel.Value() == DataSelect::Data64, eop.data_lo, eop.data_hi,
+                        rbx_snap, Common::UniqueFunction<void>{[eop] {
+                            eop.SignalFence(
+                                [](void* address, u64 data, u32 num_bytes) {
+                                    ASSERT(Core::Memory::Instance()->TryWriteBacking(
+                                        address, &data, num_bytes, 2));
+                                },
+                                [] {
+                                    Platform::IrqC::Instance()->Signal(
+                                        Platform::InterruptId::GfxEop);
+                                });
+                        }});
+                    if (rbx_defer && rbx_hot) {
+                        // The game spins on this label: submit now, so its latency is the GPU
+                        // execution only (not the next periodic flush). A label deferred only by
+                        // queue order is submitted by EopService after RbxMaxWaitNs.
+                        rasterizer->Flush();
                     }
-                    const u64 queued_ns = SotcStats::NowNs();
-                    scheduler.DeferOperation([this, eop, queued_ns, label, shadow32, shadow64] {
-                        const u64 latency = SotcStats::NowNs() - queued_ns;
-                        g_eop_written.fetch_add(1, std::memory_order_relaxed);
-                        g_eop_latency_ns.fetch_add(latency, std::memory_order_relaxed);
-                        u64 prev = g_eop_max_latency_ns.load(std::memory_order_relaxed);
-                        while (latency > prev && !g_eop_max_latency_ns.compare_exchange_weak(
-                                                     prev, latency, std::memory_order_relaxed)) {
-                        }
-                        eop.SignalFence(
-                            [](void* address, u64 data, u32 num_bytes) {
-                                ASSERT(Core::Memory::Instance()->TryWriteBacking(address, &data,
-                                                                                 num_bytes, 2));
-                            },
-                            [] {
-                                Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
-                            });
-                        if (shadow32 || shadow64) {
-                            // Written for real now: drop the shadow unless a later label of the
-                            // same address already replaced it.
-                            std::scoped_lock lk{eop_shadow_mutex};
-                            const auto drop = [&](VAddr a, u32 v) {
-                                if (const auto it = eop_shadow.find(a);
-                                    it != eop_shadow.end() && it->second == v) {
-                                    eop_shadow.erase(it);
-                                }
-                            };
-                            drop(label, eop.data_lo);
-                            if (shadow64) {
-                                drop(label + 4, eop.data_hi);
-                            }
-                            eop_shadow_count.store(u32(eop_shadow.size()),
-                                                   std::memory_order_release);
-                        }
-                        if (eop_outstanding.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                            eop_oldest_ns.store(0, std::memory_order_relaxed);
-                        }
-                    });
                     return;
                 }
                 // sotc: an end-of-pipe label means "the GPU finished everything before it". It
@@ -1527,14 +3205,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     const char* v = std::getenv("SOTC_EOP_DEFER");
                     return v && v[0] == '1';
                 }();
-                if (defer_eop && rasterizer) {
+                if (defer_eop && !rbx && rasterizer) {
                     const PM4CmdEventWriteEop eop = *event_eop;
                     const VAddr label = reinterpret_cast<VAddr>(eop.Address<void>());
                     // A GPU copy of the label's page must not be reused with the old value.
                     if (eop.data_sel.Value() != DataSelect::None) {
                         rasterizer->InvalidateMemory(label, 8, true);
                     }
-                    rasterizer->GetScheduler().DeferPriorityOperation([eop] {
+                    rasterizer->GetScheduler().DeferPriorityOperation([this, eop] {
                         eop.SignalFence(
                             [](void* address, u64 data, u32 num_bytes) {
                                 ASSERT(Core::Memory::Instance()->TryWriteBacking(address, &data,
@@ -1543,18 +3221,48 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             [] {
                                 Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
                             });
+                        NotifyCpWait(); // sotc: SOTC_CP_IDLE_US
                     });
                     // Submit that work now: the game may wait for the label before it sends
                     // anything else, and nothing else would submit it.
                     rasterizer->Flush();
                     return;
                 }
+                if (rbx && rasterizer) {
+                    rasterizer->GetBufferCache().SettleOwedUpTo(rbx_snap);
+                }
                 event_eop->SignalFence(
                     [this](void* address, u64 data, u32 num_bytes) {
                         WriteFenceValue(address, data, num_bytes);
                     },
                     [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
+                if (rbx && rasterizer) {
+                    RbxNoteWritten(rbx_snap); // rule 7: early label
+                }
                 }, back_strict);
+                if (xp_on) {
+                    // sotc: SOTC_CULL_EXPRESS: a label closes the segment being parsed; the XPR
+                    // pattern (a CS_DONE-like EOP with data 1 after a dispatch of this segment)
+                    // publishes it.
+                    const u64 head = back_head.load(std::memory_order_relaxed);
+                    const VAddr label = reinterpret_cast<VAddr>(eop_packet.Address<void>());
+                    const auto ev = eop_packet.event_type.Value();
+                    const bool pattern =
+                        xp_pattern && (ev == static_cast<u32>(EventType::CsDone) ||
+                                       ev == static_cast<u32>(EventType::BottomOfPipeTs)) &&
+                        eop_packet.data_sel.Value() == DataSelect::Data32Low &&
+                        eop_packet.data_lo == 1 && xp_last_dispatch > xp_seg_start;
+                    const bool forced = xp_forced_addr != 0 && label == xp_forced_addr;
+                    if ((pattern || forced) && head > xp_seg_start) {
+                        XpSeg seg;
+                        seg.start = xp_seg_start;
+                        seg.end = head;
+                        seg.label_key = label & ~VAddr{7};
+                        seg.queued_ns = SotcStats::NowNs();
+                        XpPublishSeg(seg);
+                    }
+                    xp_seg_start = head;
+                }
                 break;
             }
             case PM4ItOpcode::DmaData: {
@@ -1578,6 +3286,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 } else if (dma.src_sel == DmaDataSrc::Data &&
                            (dma.dst_sel == DmaDataDst::Memory ||
                             dma.dst_sel == DmaDataDst::MemoryUsingL2)) {
+                    XpSetHint(XpDma, dma.DstAddress<VAddr>(), dma.NumBytes());
                     BackOrRun([this, dma] {
                         rasterizer->FillBuffer(dma.DstAddress<VAddr>(), dma.NumBytes(), dma.data,
                                                false);
@@ -1593,6 +3302,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             dma.src_sel == DmaDataSrc::MemoryUsingL2) &&
                            (dma.dst_sel == DmaDataDst::Memory ||
                             dma.dst_sel == DmaDataDst::MemoryUsingL2)) {
+                    XpSetHint(XpDma, dma.DstAddress<VAddr>(), dma.NumBytes(),
+                              dma.SrcAddress<VAddr>(), dma.NumBytes());
                     BackOrRun([this, dma] {
                         rasterizer->CopyBuffer(dma.DstAddress<VAddr>(), dma.SrcAddress<VAddr>(),
                                                dma.NumBytes(), false, false);
@@ -1609,14 +3320,30 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const u32 data_size = (header->type3.count.Value() - 2) * 4;
                 u64* address = write_data->Address<u64*>();
                 if (!write_data->wr_one_addr.Value()) {
+                    // sotc: SOTC_WD_FUSE: held back for the next indirect draw (false: queued).
+                    if (back_threaded && FuseWriteData(std::bit_cast<VAddr>(address),
+                                                       write_data->data, data_size)) {
+                        break;
+                    }
                     std::vector<u32> data(write_data->data, write_data->data + data_size / 4);
+                    XpSetHint(XpWriteData, std::bit_cast<VAddr>(address), data_size);
                     BackOrRun([this, address, data = std::move(data), data_size] {
                         if (rasterizer) {
                             rasterizer->OnFence();
                         }
+                        // sotc: SOTC_RB_EXACT: written now, never deferred (a later draw may read these
+                        // bytes through the buffer cache); owed data it announces is settled first.
+                        u64 rbx_snap = 0;
+                        if (rbx && rasterizer) {
+                            rbx_snap = rasterizer->GetBufferCache().HotWriteSeq();
+                            rasterizer->GetBufferCache().SettleOwedUpTo(rbx_snap);
+                        }
                         std::memcpy(address, data.data(), data_size);
                         Core::MemoryManager::NoteHostWrite(std::bit_cast<VAddr>(address),
                                                            data_size, 4);
+                        if (rbx && rasterizer) { // sotc: SOTC_RB_EXACT rule 7
+                            RbxNoteWritten(rbx_snap);
+                        }
                     });
                 } else {
                     UNREACHABLE();
@@ -1639,8 +3366,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     mem_semaphore->Signal();
                 } else {
                     while (!mem_semaphore->Signaled()) {
+                        cp_wait_kind = CpWaitOther; // sotc: SOTC_FPS CP spin accounting
                         YIELD_GFX();
                     }
+                    ++cp_wait_exits; // sotc: progress marker (Process)
                     mem_semaphore->Decrement();
                 }
                 break;
@@ -1655,8 +3384,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
                 while (!rewind->Valid()) {
+                    cp_wait_kind = CpWaitOther; // sotc: SOTC_FPS CP spin accounting
                     YIELD_GFX();
                 }
+                ++cp_wait_exits; // sotc: progress marker (Process)
                 break;
             }
             case PM4ItOpcode::WaitRegMem: {
@@ -1670,21 +3401,26 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (vo_port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                    ++cp_wait_exits; // sotc: progress marker (Process)
                     break;
                 }
                 while (!wait_reg_mem->Test(regs.reg_array)) {
                     // sotc: SOTC_EOP_TICK: a label queued for the GPU satisfies the stream's own
                     // wait at once (the host queue keeps the order).
-                    if (eop_tick && EopShadowSatisfies(*wait_reg_mem)) {
+                    if (eop_poll && EopShadowSatisfies(*wait_reg_mem)) {
                         break;
                     }
                     // sotc: SOTC_EOP_TICK: the waited-for label may be queued behind work that
                     // is not submitted yet; EopWaitGuard submits it after 2 ms.
-                    if (eop_tick) {
+                    if (eop_poll) {
                         EopWaitGuard();
+                    }
+                    if (SotcStats::kFpsLog) { // sotc: SOTC_FPS CP spin accounting
+                        cp_wait_kind = MemWaitKind(*wait_reg_mem, vo_port->IsVoLabel(wait_addr));
                     }
                     YIELD_GFX();
                 }
+                ++cp_wait_exits; // sotc: progress marker (Process)
                 break;
             }
             case PM4ItOpcode::IndirectBuffer: {
@@ -1796,11 +3532,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         }
     }
 
+    FlushWd(); // sotc: SOTC_WD_FUSE: nothing stays held back past the command buffer
+
     if (ce_task.handle) {
         while (!ce_task.handle.done()) {
             RESUME_GFX(ce_task);
         }
         ce_task.handle.destroy();
+    }
+
+    if (xp_on) {
+        --xp_gfx_depth; // sotc: SOTC_CULL_EXPRESS
     }
 
     FIBER_EXIT;
@@ -1820,6 +3562,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     auto base_addr = reinterpret_cast<VAddr>(acb.data());
     size_t acb_size = acb.size_bytes();
     while (!acb.empty()) {
+        func_kind_hint = 3; // sotc: SOTC_FPS accounting
         ProcessCommands();
 
         auto* header = reinterpret_cast<const PM4Header*>(acb.data());
@@ -1841,8 +3584,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             std::memcpy(queue.tmp_packet.data(), acb.data(), acb.size_bytes());
             queue.tmp_dwords = acb.size();
             if constexpr (!is_indirect) {
-                *queue.read_addr += acb.size();
-                *queue.read_addr %= queue.ring_size_dw;
+                if (asc_rptr_mode != 2) { // sotc: SOTC_ASC_RPTR=2 moved it at the doorbell
+                    *queue.read_addr += acb.size();
+                    *queue.read_addr %= queue.ring_size_dw;
+                    NoteAscRptr(vqid, queue);
+                }
             }
             break;
         }
@@ -1852,11 +3598,17 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             next_dw_off = 1;
             acb = NextPacket(acb, next_dw_off);
             if constexpr (!is_indirect) {
-                *queue.read_addr += next_dw_off;
-                *queue.read_addr %= queue.ring_size_dw;
+                if (asc_rptr_mode != 2) { // sotc: SOTC_ASC_RPTR=2 moved it at the doorbell
+                    *queue.read_addr += next_dw_off;
+                    *queue.read_addr %= queue.ring_size_dw;
+                    NoteAscRptr(vqid, queue);
+                }
             }
             continue;
         }
+        // sotc: SOTC_ASC_RPTR=1: the read pointer already moved past this packet (an indirect
+        // buffer, at its fetch).
+        [[maybe_unused]] bool rptr_moved = false;
 
         if (header->type != 3) {
             // No other types of packets were spotted so far
@@ -1875,6 +3627,21 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
             auto task = ProcessCompute<true>(
                 {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, vqid);
+            // sotc: SOTC_ASC_RPTR=1. The hardware read pointer counts fetched ring dwords: an
+            // indirect buffer packet is consumed when the CP jumps into the buffer, not when the
+            // buffer ends. The packet is fully decoded into the nested task above and its ring
+            // dwords are not read again (the packets after it lie between the read and the
+            // write pointer, which the guest does not overwrite), so the slot can be handed back
+            // now. Without it the slot stays taken until the whole buffer is parsed, including
+            // its waits.
+            if constexpr (!is_indirect) {
+                if (asc_rptr_mode == 1) {
+                    *queue.read_addr += next_dw_off;
+                    *queue.read_addr %= queue.ring_size_dw;
+                    rptr_moved = true;
+                    NoteAscRptr(vqid, queue);
+                }
+            }
             RESUME_ASC(task, vqid);
 
             while (!task.handle.done()) {
@@ -1951,8 +3718,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             }
             const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
             while (!rewind->Valid()) {
+                cp_wait_kind = CpWaitOther; // sotc: SOTC_FPS CP spin accounting
                 YIELD_ASC(vqid);
             }
+            ++cp_wait_exits; // sotc: progress marker (Process)
             break;
         }
         case PM4ItOpcode::SetShReg: {
@@ -2039,9 +3808,18 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                     if (rasterizer) {
                         rasterizer->OnFence();
                     }
+                    // sotc: SOTC_RB_EXACT: as the graphics WRITE_DATA, never deferred.
+                    u64 rbx_snap = 0;
+                    if (rbx && rasterizer) {
+                        rbx_snap = rasterizer->GetBufferCache().HotWriteSeq();
+                        rasterizer->GetBufferCache().SettleOwedUpTo(rbx_snap);
+                    }
                     std::memcpy(address, data.data(), data_size);
                     Core::MemoryManager::NoteHostWrite(reinterpret_cast<VAddr>(address), data_size,
                                                        4);
+                    if (rbx && rasterizer) { // sotc: SOTC_RB_EXACT rule 7
+                        RbxNoteWritten(rbx_snap);
+                    }
                 });
             } else {
                 UNREACHABLE();
@@ -2054,8 +3832,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 mem_semaphore->Signal();
             } else {
                 while (!mem_semaphore->Signaled()) {
+                    cp_wait_kind = CpWaitOther; // sotc: SOTC_FPS CP spin accounting
                     YIELD_ASC(vqid);
                 }
+                ++cp_wait_exits; // sotc: progress marker (Process)
                 mem_semaphore->Decrement();
             }
             break;
@@ -2064,15 +3844,68 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             while (!wait_reg_mem->Test(regs.reg_array)) {
+                // sotc: SOTC_RB_EXACT: as in the graphics wait, a deferred label's pending value
+                // satisfies the stream's own wait, and a wait blocked on a label queued behind
+                // unsubmitted work makes the draw thread submit it (EopWaitGuard).
+                if (eop_poll) {
+                    if (EopShadowSatisfies(*wait_reg_mem)) {
+                        break;
+                    }
+                    EopWaitGuard();
+                }
+                if (SotcStats::kFpsLog) { // sotc: SOTC_FPS CP spin accounting
+                    cp_wait_kind = MemWaitKind(
+                        *wait_reg_mem, vo_port && vo_port->IsVoLabel(wait_reg_mem->Address<u64*>()));
+                }
                 YIELD_ASC(vqid);
             }
+            ++cp_wait_exits; // sotc: progress marker (Process)
             break;
         }
         case PM4ItOpcode::ReleaseMem: {
             const PM4CmdReleaseMem release = *reinterpret_cast<const PM4CmdReleaseMem*>(header);
+            if (release.data_sel.Value() != DataSelect::GdsMemStore) {
+                XpSetHint(XpLabel, release.Address<VAddr>(), 8);
+            }
             BackOrRun([this, release, pipe_id = queue.pipe_id] {
                 if (rasterizer) {
                     rasterizer->OnFence();
+                }
+                // sotc: SOTC_RB_EXACT rules 5-7 for the compute fence (QueueDeferredLabel).
+                // A GDS store is a GPU copy, not a label.
+                u64 rbx_snap = 0;
+                bool rbx_defer = false;
+                bool rbx_hot = false;
+                const bool rbx_label = rbx && rasterizer &&
+                                       release.data_sel.Value() != DataSelect::GdsMemStore;
+                if (rbx_label) {
+                    rbx_defer = RbxDecide(1, release.Address<VAddr>(), rbx_snap, &rbx_hot);
+                }
+                if (rbx_defer) {
+                    const auto ds = release.data_sel.Value();
+                    if (rbx_hot) {
+                        rasterizer->GetBufferCache().RecordLabelDownloads();
+                    }
+                    // Same page invalidation the early write path never needed (the write goes
+                    // straight to the guest mapping), so none here either.
+                    QueueDeferredLabel(
+                        1, release.Address<VAddr>(), ds == DataSelect::Data32Low,
+                        ds == DataSelect::Data64, release.data_lo, release.data_hi, rbx_snap,
+                        Common::UniqueFunction<void>{[release, pipe_id] {
+                            release.SignalFence(
+                                [pipe_id] {
+                                    Platform::IrqC::Instance()->Signal(
+                                        static_cast<Platform::InterruptId>(pipe_id));
+                                },
+                                [](VAddr, u16, u16) {});
+                        }});
+                    if (rbx_hot) {
+                        rasterizer->Flush(); // the guest may spin on this label (see EOP)
+                    }
+                    return;
+                }
+                if (rbx_label) {
+                    rasterizer->GetBufferCache().SettleOwedUpTo(rbx_snap);
                 }
                 release.SignalFence(
                     [pipe_id] {
@@ -2083,6 +3916,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                         rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false,
                                                true);
                     });
+                if (rbx_label) {
+                    RbxNoteWritten(rbx_snap); // rule 7: early label
+                }
             }, back_strict);
             break;
         }
@@ -2098,8 +3934,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         acb = NextPacket(acb, next_dw_off);
 
         if constexpr (!is_indirect) {
-            *queue.read_addr += next_dw_off;
-            *queue.read_addr %= queue.ring_size_dw;
+            if (!rptr_moved && asc_rptr_mode != 2) { // sotc: SOTC_ASC_RPTR
+                *queue.read_addr += next_dw_off;
+                *queue.read_addr %= queue.ring_size_dw;
+                NoteAscRptr(vqid, queue);
+            }
         }
     }
 
@@ -2153,9 +3992,13 @@ void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
         queue.has_work.store(true, std::memory_order_release);
     }
 
-    std::scoped_lock lk{submit_mutex};
-    ++num_submits;
-    submit_cv.notify_one();
+    {
+        std::scoped_lock lk{submit_mutex};
+        ++num_submits;
+        ++q_enqueued[GfxQueueId]; // sotc: SOTC_CP_AHEAD=2 frame marks
+        submit_cv.notify_one();
+    }
+    NotifyCpWait(); // sotc: SOTC_CP_IDLE_US: a new task to run while the others wait
 }
 
 void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
@@ -2163,17 +4006,180 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     auto& queue = mapped_queues[gnm_vqid];
 
     const auto vqid = gnm_vqid - 1;
+    // sotc: SOTC_ASC_RPTR=2: the task runs from a copy of the ring dwords, so sceGnmDingDong can
+    // hand the ring space back to the guest at once (the copy lives until the task finishes).
+    std::vector<u32> ring_copy;
+    if (asc_rptr_mode == 2) {
+        ring_copy.assign(acb.begin(), acb.end());
+        acb = std::span<const u32>{ring_copy.data(), ring_copy.size()};
+    }
     const auto& task = ProcessCompute(acb, vqid);
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
+        if (asc_rptr_mode == 2) {
+            queue.owned.push(std::move(ring_copy)); // moving keeps the dwords where acb points
+        }
         queue.has_work.store(true, std::memory_order_release);
     }
 
-    std::scoped_lock lk{submit_mutex};
-    num_mapped_queues = std::max(num_mapped_queues, gnm_vqid + 1);
-    ++num_submits;
-    submit_cv.notify_one();
+    {
+        std::scoped_lock lk{submit_mutex};
+        num_mapped_queues = std::max(num_mapped_queues, gnm_vqid + 1);
+        ++num_submits;
+        ++q_enqueued[gnm_vqid]; // sotc: SOTC_CP_AHEAD=2 frame marks
+        submit_cv.notify_one();
+    }
+    NotifyCpWait(); // sotc: SOTC_CP_IDLE_US
+}
+
+// sotc: SOTC_CP_AHEAD. Read once; gnmdriver.cpp reads the same value through this.
+int Liverpool::CpAheadMode() noexcept {
+    static const int mode = [] {
+        const char* v = std::getenv("SOTC_CP_AHEAD");
+        const int n = v ? std::atoi(v) : 0;
+        return n == 0 ? 0 : (n == 2 ? 2 : 1);
+    }();
+    return mode;
+}
+
+// sotc: SOTC_ASC_RPTR (0, 1 or 2; anything else is 0).
+int Liverpool::AscRptrMode() noexcept {
+    static const int mode = [] {
+        const char* v = std::getenv("SOTC_ASC_RPTR");
+        const int n = v ? std::atoi(v) : 0;
+        return (n == 1 || n == 2) ? n : 0;
+    }();
+    return mode;
+}
+
+// sotc: SOTC_CP_AHEAD=2. Called by SubmitDone under submit_mutex: every submit of the frame
+// went through SubmitGfx / SubmitAsc before (gnmdriver serializes them with m_submit_lock).
+void Liverpool::PushFrameMark() {
+    CpFrameMark mark;
+    mark.frame = frames_marked.load(std::memory_order_relaxed) + 1;
+    mark.enqueued = q_enqueued;
+    frame_marks.push_back(mark);
+    frames_marked.store(mark.frame, std::memory_order_release);
+    frame_mark_epoch.fetch_add(1, std::memory_order_release);
+}
+
+// sotc: SOTC_CP_AHEAD=2, command processor thread. A frame is parsed once each queue finished as
+// many tasks as it had enqueued at the frame's SubmitDone: all of its draw-thread work is queued
+// then. Its end goes after that work, in the order the old idle path used: the per-frame
+// housekeeping and flush (OnSubmit, Flush), then the ticket, which the draw thread publishes when
+// it reaches it, that is after it ran (and read the guest memory of) every op of the frame.
+void Liverpool::ServiceFrameMarks() {
+    const u64 epoch = frame_mark_epoch.load(std::memory_order_acquire);
+    if (epoch == fm_seen_epoch && q_done_epoch == fm_seen_done) {
+        return;
+    }
+    fm_seen_epoch = epoch;
+    fm_seen_done = q_done_epoch;
+    for (;;) {
+        u64 frame = 0;
+        {
+            std::scoped_lock lk{submit_mutex};
+            if (frame_marks.empty()) {
+                return;
+            }
+            const CpFrameMark& mark = frame_marks.front();
+            for (u32 q = 0; q < NumTotalQueues; ++q) {
+                if (q_completed[q] < mark.enqueued[q]) {
+                    return;
+                }
+            }
+            frame = mark.frame;
+            frame_marks.pop_front();
+        }
+        if (rasterizer) {
+            XpSetHint(XpMark, 0, 0);
+            BackOrRun(
+                [this] {
+                    rasterizer->OnSubmit();
+                    rasterizer->Flush();
+                },
+                false);
+        }
+        XpSetHint(XpMark, 0, 0);
+        BackOrRun(
+            [this, frame] {
+                {
+                    std::scoped_lock lk{frames_mutex};
+                    frames_recorded.store(frame, std::memory_order_release);
+                }
+                frames_cv.notify_all();
+            },
+            false);
+    }
+}
+
+// sotc: SOTC_CP_AHEAD=2, guest threads (the submit gate).
+void Liverpool::WaitFramesRecorded(u64 target) noexcept {
+    if (frames_recorded.load(std::memory_order_acquire) >= target) {
+        return;
+    }
+    std::unique_lock lk{frames_mutex};
+    frames_cv.wait(lk, [&] { return frames_recorded.load(std::memory_order_acquire) >= target; });
+}
+
+// sotc: SOTC_FPS compute ring accounting. Doorbell side (guest thread, sceGnmDingDong).
+void Liverpool::NoteAscDoorbell(u32 vqid, u32 next_offs_dw, u32 submitted_dw) noexcept {
+    if (!SotcStats::kFpsLog || vqid >= NumComputeRings) {
+        return;
+    }
+    const auto& queue = asc_queues[{vqid}];
+    auto& st = asc_ring_stats[vqid];
+    const u64 now = SotcStats::NowNs();
+    SotcStats::asc_doorbells.fetch_add(1, std::memory_order_relaxed);
+    // A full window that the command processor ended just before this doorbell: the game was
+    // most likely spinning on the read pointer until then.
+    if (const u64 freed = st.freed_ns.exchange(0, std::memory_order_relaxed);
+        freed && now - freed < 1'000'000) {
+        SotcStats::asc_full_spun.fetch_add(1, std::memory_order_relaxed);
+        SotcStats::asc_full_spun_ns.fetch_add(now - st.window_ns.load(std::memory_order_relaxed),
+                                              std::memory_order_relaxed);
+    }
+    const u32 size = queue.ring_size_dw;
+    const u32 wptr = next_offs_dw % size;
+    st.wptr_dw.store(wptr, std::memory_order_relaxed);
+    st.need_dw.store(submitted_dw, std::memory_order_relaxed);
+    // The game's own test (eboot 0x85d3d0): free = (rptr - wptr - 1) mod size.
+    const u32 rptr = *queue.read_addr % size;
+    const u32 free_dw = (rptr + size - wptr - 1) % size;
+    if (free_dw < submitted_dw) {
+        u64 expected = 0;
+        st.full_ns.compare_exchange_strong(expected, now, std::memory_order_relaxed);
+    }
+}
+
+// sotc: SOTC_FPS compute ring accounting. Read pointer side (command processor, ProcessCompute).
+void Liverpool::NoteAscRptr(u32 vqid, const AscQueueInfo& queue) noexcept {
+    if (!SotcStats::kFpsLog || vqid >= NumComputeRings) {
+        return;
+    }
+    auto& st = asc_ring_stats[vqid];
+    const u64 full = st.full_ns.load(std::memory_order_relaxed);
+    if (!full) {
+        return;
+    }
+    const u32 size = queue.ring_size_dw;
+    const u32 rptr = *queue.read_addr % size;
+    const u32 wptr = st.wptr_dw.load(std::memory_order_relaxed);
+    const u32 free_dw = (rptr + size - wptr - 1) % size;
+    if (free_dw < st.need_dw.load(std::memory_order_relaxed)) {
+        return;
+    }
+    u64 expected = full;
+    if (!st.full_ns.compare_exchange_strong(expected, 0, std::memory_order_relaxed)) {
+        return;
+    }
+    const u64 now = SotcStats::NowNs();
+    SotcStats::asc_full_windows.fetch_add(1, std::memory_order_relaxed);
+    SotcStats::asc_full_ns.fetch_add(now - full, std::memory_order_relaxed);
+    SotcStats::GateStoreMax(SotcStats::asc_full_max_ns, now - full);
+    st.window_ns.store(full, std::memory_order_relaxed);
+    st.freed_ns.store(now, std::memory_order_relaxed);
 }
 
 } // namespace AmdGpu

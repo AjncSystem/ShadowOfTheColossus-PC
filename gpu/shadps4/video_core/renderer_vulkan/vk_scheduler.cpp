@@ -76,6 +76,7 @@ void Scheduler::WaitSubmitted(u64 tick, bool kick) {
     if (kick) {
         recorder->Kick();
     }
+    const SotcStats::DrawWait wait{SotcStats::WaitRecorder}; // sotc: SOTC_FPS accounting
     u64 submitted = recorded_submit_tick.load(std::memory_order_acquire);
     for (u32 spins = 0; spins < 4096 && submitted < tick; ++spins) {
         _mm_pause();
@@ -250,6 +251,7 @@ vk::CommandBuffer Scheduler::BeginAhead() {
     } else {
         // An ahead copy that returned on its marker may still be pending for the driver.
         if (std::exchange(ahead_unfinished, false)) {
+            const SotcStats::DrawWait wait{SotcStats::WaitGpu}; // sotc: SOTC_FPS accounting
             Check(device.waitForFences(*ahead_fence, true, std::numeric_limits<u64>::max()));
         }
         Check(device.resetFences(*ahead_fence));
@@ -269,6 +271,9 @@ void Scheduler::SubmitAheadAndWait() {
     Check(ahead_cmdbuf.end());
     // With the recorder, the earlier submits must have reached the queue first.
     WaitSubmitted(CurrentTick() - 1);
+    // sotc: SOTC_FPS accounting: from here on the draw thread waits for the GPU (the submit
+    // itself is short next to the wait for the work queued before the copy).
+    const SotcStats::DrawWait gpu_wait{SotcStats::WaitGpu};
     // sotc: the readback may read what the transfer queue wrote; the queue does not order them.
     if (xfer) {
         xfer->WaitLastCopy();
@@ -312,6 +317,164 @@ void Scheduler::SubmitAheadAndWait() {
                vk::to_string(wait_result));
     // The ahead copy waited for all submitted work.
     work_semaphore.Refresh();
+}
+
+vk::CommandBuffer Scheduler::BeginAheadAsync() {
+    const vk::Device device = instance.GetDevice();
+    if (!ahead_timeline) {
+        const vk::StructureChain semaphore_chain = {
+            vk::SemaphoreCreateInfo{},
+            vk::SemaphoreTypeCreateInfo{
+                .semaphoreType = vk::SemaphoreType::eTimeline,
+                .initialValue = 0,
+            },
+        };
+        auto [sem_result, sem] = device.createSemaphoreUnique(semaphore_chain.get());
+        ASSERT_MSG(sem_result == vk::Result::eSuccess, "Failed to create the ahead timeline: {}",
+                   vk::to_string(sem_result));
+        ahead_timeline = std::move(sem);
+        for (AheadSlot& slot : ahead_slots) {
+            const vk::CommandPoolCreateInfo pool_info = {
+                .flags = vk::CommandPoolCreateFlagBits::eTransient,
+                .queueFamilyIndex = instance.GetGraphicsQueueFamilyIndex(),
+            };
+            auto [pool_result, pool] = device.createCommandPoolUnique(pool_info);
+            ASSERT_MSG(pool_result == vk::Result::eSuccess,
+                       "Failed to create an ahead slot pool: {}", vk::to_string(pool_result));
+            slot.pool = std::move(pool);
+            const vk::CommandBufferAllocateInfo alloc_info = {
+                .commandPool = *slot.pool,
+                .level = vk::CommandBufferLevel::ePrimary,
+                .commandBufferCount = 1,
+            };
+            auto [alloc_result, cmdbufs] = device.allocateCommandBuffers(alloc_info);
+            ASSERT_MSG(alloc_result == vk::Result::eSuccess,
+                       "Failed to allocate an ahead slot command buffer: {}",
+                       vk::to_string(alloc_result));
+            slot.cmdbuf = cmdbufs[0];
+        }
+    }
+    AheadSlot& slot = ahead_slots[ahead_slot_next];
+    // Its previous copy completed means its submit ran too (the value is signalled by it), so the
+    // recording thread no longer touches the command buffer.
+    if (slot.value != 0 && !IsAheadDone(slot.value)) {
+        return {};
+    }
+    ahead_slot_next = (ahead_slot_next + 1) % NumAheadSlots;
+    Check(device.resetCommandPool(*slot.pool));
+    Check(slot.cmdbuf.begin(vk::CommandBufferBeginInfo{
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    }));
+    ahead_slot_open = &slot;
+    return slot.cmdbuf;
+}
+
+u64 Scheduler::SubmitAheadAsync() {
+    AheadSlot& slot = *std::exchange(ahead_slot_open, nullptr);
+    const vk::CommandBuffer cmdbuf = slot.cmdbuf;
+    Check(cmdbuf.end());
+    // Values are handed out in the order of the submits: both happen in producer order (the
+    // recording thread runs its stream in order).
+    const u64 value = ++ahead_value_last;
+    slot.value = value;
+    // Transfer-queue copies (uploads into arenas) are not ordered by the graphics queue: wait on
+    // the GPU for the newest one. Its submit is on the transfer queue already (XferQueue::Copy
+    // submits at once, and waits only for graphics ticks already queued), so this is no wait
+    // before signal.
+    const u64 xfer_wait = xfer ? xfer->LastTick() : 0;
+    const vk::Semaphore xfer_sem = xfer ? xfer->Handle() : vk::Semaphore{};
+    const vk::Semaphore signal_sem = *ahead_timeline;
+    auto submit = [this, cmdbuf, value, xfer_wait, xfer_sem, signal_sem] {
+        const vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eTransfer;
+        const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+            .waitSemaphoreValueCount = xfer_wait != 0 ? 1u : 0u,
+            .pWaitSemaphoreValues = &xfer_wait,
+            .signalSemaphoreValueCount = 1u,
+            .pSignalSemaphoreValues = &value,
+        };
+        const vk::SubmitInfo submit_info = {
+            .pNext = &timeline_si,
+            .waitSemaphoreCount = xfer_wait != 0 ? 1u : 0u,
+            .pWaitSemaphores = &xfer_sem,
+            .pWaitDstStageMask = &wait_stage,
+            .commandBufferCount = 1u,
+            .pCommandBuffers = &cmdbuf,
+            .signalSemaphoreCount = 1u,
+            .pSignalSemaphores = &signal_sem,
+        };
+        {
+            std::scoped_lock lk{submit_mutex};
+            const auto submit_result = instance.GetGraphicsQueue().submit(submit_info, vk::Fence{});
+            if (submit_result == vk::Result::eErrorDeviceLost) {
+                instance.ReportDeviceFault();
+                UNREACHABLE_MSG("Device lost during an async ahead submit");
+            }
+            ASSERT_MSG(submit_result == vk::Result::eSuccess, "Async ahead submit failed: {}",
+                       vk::to_string(submit_result));
+        }
+        ahead_value_submitted.store(value, std::memory_order_release);
+        ahead_value_submitted.notify_all();
+    };
+    if (recorder) {
+        recorder->Run(CommandRecorder::BlockCategory::Other, std::move(submit));
+        recorder->Kick();
+    } else {
+        submit();
+    }
+    return value;
+}
+
+bool Scheduler::IsAheadDone(u64 value) {
+    if (ahead_value_done.load(std::memory_order_acquire) >= value) {
+        return true;
+    }
+    const auto [result, counter] = instance.GetDevice().getSemaphoreCounterValue(*ahead_timeline);
+    if (result == vk::Result::eErrorDeviceLost) {
+        instance.ReportDeviceFault();
+        UNREACHABLE_MSG("Device lost while reading the ahead timeline");
+    }
+    u64 seen = ahead_value_done.load(std::memory_order_relaxed);
+    while (seen < counter &&
+           !ahead_value_done.compare_exchange_weak(seen, counter, std::memory_order_acq_rel)) {
+    }
+    return counter >= value;
+}
+
+void Scheduler::WaitAheadSubmitted(u64 value) {
+    u64 submitted = ahead_value_submitted.load(std::memory_order_acquire);
+    for (u32 spins = 0; spins < 4096 && submitted < value; ++spins) {
+        _mm_pause();
+        submitted = ahead_value_submitted.load(std::memory_order_acquire);
+    }
+    while (submitted < value) {
+        ahead_value_submitted.wait(submitted, std::memory_order_acquire);
+        submitted = ahead_value_submitted.load(std::memory_order_acquire);
+    }
+}
+
+void Scheduler::WaitAhead(u64 value) {
+    WaitAheadSubmitted(value);
+    if (IsAheadDone(value)) {
+        return;
+    }
+    const vk::Semaphore sem = *ahead_timeline;
+    const vk::SemaphoreWaitInfo wait_info = {
+        .semaphoreCount = 1,
+        .pSemaphores = &sem,
+        .pValues = &value,
+    };
+    const vk::Result wait_result =
+        instance.GetDevice().waitSemaphores(wait_info, std::numeric_limits<u64>::max());
+    if (wait_result == vk::Result::eErrorDeviceLost) {
+        instance.ReportDeviceFault();
+        UNREACHABLE_MSG("Device lost during an async ahead wait");
+    }
+    ASSERT_MSG(wait_result == vk::Result::eSuccess, "Async ahead wait failed: {}",
+               vk::to_string(wait_result));
+    u64 seen = ahead_value_done.load(std::memory_order_relaxed);
+    while (seen < value &&
+           !ahead_value_done.compare_exchange_weak(seen, value, std::memory_order_acq_rel)) {
+    }
 }
 
 void Scheduler::PopPendingOperations() {
@@ -441,6 +604,29 @@ XferQueue::XferQueue(const Instance& instance_, Semaphore& graphics_, Scheduler*
     for (u32 i = 0; i < NumSlots; ++i) {
         slots[i].cmd = cmdbufs[i];
     }
+
+    // sotc: SOTC_RB_TICK: readback copies get a pool and a slot ring of their own.
+    upload_routing = instance.IsXferRoutingEnabled();
+    rb_enabled = instance.IsRbTickEnabled();
+    if (rb_enabled) {
+        auto [rb_pool_result, rb_pool_handle] = device.createCommandPoolUnique(pool_info);
+        ASSERT_MSG(rb_pool_result == vk::Result::eSuccess,
+                   "Failed to create the transfer readback pool: {}",
+                   vk::to_string(rb_pool_result));
+        rb_pool = std::move(rb_pool_handle);
+        const vk::CommandBufferAllocateInfo rb_alloc_info = {
+            .commandPool = *rb_pool,
+            .level = vk::CommandBufferLevel::ePrimary,
+            .commandBufferCount = NumRbSlots,
+        };
+        auto [rb_alloc_result, rb_cmdbufs] = device.allocateCommandBuffers(rb_alloc_info);
+        ASSERT_MSG(rb_alloc_result == vk::Result::eSuccess,
+                   "Failed to allocate the transfer readback command buffers: {}",
+                   vk::to_string(rb_alloc_result));
+        for (u32 i = 0; i < NumRbSlots; ++i) {
+            rb_slots[i].cmd = rb_cmdbufs[i];
+        }
+    }
 }
 
 XferQueue::~XferQueue() {
@@ -487,19 +673,36 @@ bool XferQueue::Copy(vk::Buffer src, vk::Buffer dst, std::span<const vk::BufferC
 
     const vk::Semaphore xfer_sem = *timeline;
     const vk::Semaphore graphics_sem = graphics->Handle();
-    const bool wait_graphics = graphics_tick != 0;
     const vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eAllCommands;
+    // sotc: SOTC_RB_TICK with uploads routed too: this copy may write bytes an earlier readback
+    // copy (same queue) reads, and two submits of one queue are not ordered against each other's
+    // memory accesses; so it also waits for the newest readback copy (write after read). The
+    // value was signalled by an earlier submit of this queue, so the wait cannot dangle.
+    std::array<vk::Semaphore, 2> wait_sems{};
+    std::array<u64, 2> wait_values{};
+    std::array<vk::PipelineStageFlags, 2> wait_stages{wait_stage, wait_stage};
+    u32 num_waits = 0;
+    if (graphics_tick != 0) {
+        wait_sems[num_waits] = graphics_sem;
+        wait_values[num_waits++] = graphics_tick;
+    }
+    if (rb_enabled) {
+        if (const u64 rb_tick = rb_last_tick.load(std::memory_order_acquire); rb_tick != 0) {
+            wait_sems[num_waits] = xfer_sem;
+            wait_values[num_waits++] = rb_tick;
+        }
+    }
     const vk::TimelineSemaphoreSubmitInfo timeline_info = {
-        .waitSemaphoreValueCount = wait_graphics ? 1u : 0u,
-        .pWaitSemaphoreValues = &graphics_tick,
+        .waitSemaphoreValueCount = num_waits,
+        .pWaitSemaphoreValues = wait_values.data(),
         .signalSemaphoreValueCount = 1u,
         .pSignalSemaphoreValues = &tick,
     };
     const vk::SubmitInfo submit_info = {
         .pNext = &timeline_info,
-        .waitSemaphoreCount = wait_graphics ? 1u : 0u,
-        .pWaitSemaphores = &graphics_sem,
-        .pWaitDstStageMask = &wait_stage,
+        .waitSemaphoreCount = num_waits,
+        .pWaitSemaphores = wait_sems.data(),
+        .pWaitDstStageMask = wait_stages.data(),
         .commandBufferCount = 1u,
         .pCommandBuffers = &slot.cmd,
         .signalSemaphoreCount = 1u,
@@ -570,6 +773,7 @@ void XferQueue::CopyAndWait(std::span<const Region> regions) {
         pending_tick = tick;
     }
     // Outside the mutex: the recording thread takes it to collect the pending tick.
+    const SotcStats::DrawWait wait{SotcStats::WaitUpload}; // sotc: SOTC_FPS accounting
     const vk::SemaphoreWaitInfo wait_info = {
         .semaphoreCount = 1,
         .pSemaphores = &xfer_sem,
@@ -594,6 +798,7 @@ void XferQueue::WaitLastCopy() {
     if (last_tick == 0) {
         return;
     }
+    const SotcStats::DrawWait wait{SotcStats::WaitGpu}; // sotc: SOTC_FPS accounting
     const vk::Semaphore wait_sem = *timeline;
     const vk::SemaphoreWaitInfo wait_info = {
         .semaphoreCount = 1,
@@ -603,6 +808,122 @@ void XferQueue::WaitLastCopy() {
     const vk::Result wait_result =
         instance.GetDevice().waitSemaphores(wait_info, std::numeric_limits<u64>::max());
     ASSERT_MSG(wait_result == vk::Result::eSuccess, "Transfer wait failed: {}",
+               vk::to_string(wait_result));
+}
+
+u64 XferQueue::ReadbackCopy(u64 graphics_tick, std::span<const ReadbackRegion> regions) {
+    if (!rb_enabled) {
+        return 0;
+    }
+    // The submit of graphics_tick may still be queued on the recording thread; a wait queued
+    // before its signal would block this queue for good (see Copy). Outside the mutex, which the
+    // recording thread takes to collect the pending tick.
+    if (graphics_tick != 0 && scheduler) {
+        scheduler->WaitSubmitted(graphics_tick);
+    }
+    const std::scoped_lock lk{mutex};
+    Slot& slot = rb_slots[rb_next_slot];
+    if (slot.tick != 0 && Completed() < slot.tick) {
+        return 0; // the previous copy of this command buffer is still running: usual path
+    }
+    rb_next_slot = (rb_next_slot + 1) % NumRbSlots;
+
+    const u64 tick = next_tick++;
+    Check(slot.cmd.begin(vk::CommandBufferBeginInfo{
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    }));
+    for (const auto& region : regions) {
+        slot.cmd.copyBuffer(region.src, region.dst, region.copies);
+    }
+    // Transfer write -> host read; the guest reads the staging after waiting on the timeline.
+    const vk::MemoryBarrier2 host_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+    };
+    slot.cmd.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &host_barrier,
+    });
+    Check(slot.cmd.end());
+
+    // RAW: the wait on the graphics timeline value of the writer tick makes the writes of that
+    // tick and of every earlier submit available and visible to the copy (semaphore memory
+    // dependency); the caller guarantees no newer tick wrote these bytes.
+    const vk::Semaphore xfer_sem = *timeline;
+    const vk::Semaphore graphics_sem = graphics->Handle();
+    const vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eTransfer;
+    const vk::TimelineSemaphoreSubmitInfo timeline_info = {
+        .waitSemaphoreValueCount = graphics_tick != 0 ? 1u : 0u,
+        .pWaitSemaphoreValues = &graphics_tick,
+        .signalSemaphoreValueCount = 1u,
+        .pSignalSemaphoreValues = &tick,
+    };
+    const vk::SubmitInfo submit_info = {
+        .pNext = &timeline_info,
+        .waitSemaphoreCount = graphics_tick != 0 ? 1u : 0u,
+        .pWaitSemaphores = &graphics_sem,
+        .pWaitDstStageMask = &wait_stage,
+        .commandBufferCount = 1u,
+        .pCommandBuffers = &slot.cmd,
+        .signalSemaphoreCount = 1u,
+        .pSignalSemaphores = &xfer_sem,
+    };
+    const vk::Result submit_result = queue.submit(submit_info, vk::Fence{});
+    if (submit_result == vk::Result::eErrorDeviceLost) {
+        instance.ReportDeviceFault();
+        UNREACHABLE_MSG("Device lost during transfer readback submit");
+    }
+    ASSERT_MSG(submit_result == vk::Result::eSuccess, "Transfer readback submit failed: {}",
+               vk::to_string(submit_result));
+    slot.tick = tick;
+    // Finish, sparse unbinds and ahead copies wait for last_tick: they see this copy too.
+    last_tick = tick;
+    rb_last_tick.store(tick, std::memory_order_release);
+    return tick;
+}
+
+void XferQueue::RequireWait(u64 value) {
+    const std::scoped_lock lk{mutex};
+    pending_tick = std::max(pending_tick, value);
+    last_tick = std::max(last_tick, value);
+}
+
+u64 XferQueue::Completed() const {
+    const auto [result, counter] = instance.GetDevice().getSemaphoreCounterValue(*timeline);
+    if (result == vk::Result::eErrorDeviceLost) {
+        instance.ReportDeviceFault();
+        UNREACHABLE_MSG("Device lost while reading the transfer timeline");
+    }
+    return result == vk::Result::eSuccess ? counter : 0;
+}
+
+void XferQueue::WaitValue(u64 value, u32 spin_us) {
+    if (spin_us != 0) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(spin_us);
+        do {
+            for (int i = 0; i < 32; ++i) {
+                _mm_pause();
+            }
+            if (Completed() >= value) {
+                return;
+            }
+        } while (std::chrono::steady_clock::now() < deadline);
+    }
+    const vk::Semaphore wait_sem = *timeline;
+    const vk::SemaphoreWaitInfo wait_info = {
+        .semaphoreCount = 1,
+        .pSemaphores = &wait_sem,
+        .pValues = &value,
+    };
+    const vk::Result wait_result =
+        instance.GetDevice().waitSemaphores(wait_info, std::numeric_limits<u64>::max());
+    if (wait_result == vk::Result::eErrorDeviceLost) {
+        instance.ReportDeviceFault();
+        UNREACHABLE_MSG("Device lost during a transfer readback wait");
+    }
+    ASSERT_MSG(wait_result == vk::Result::eSuccess, "Transfer readback wait failed: {}",
                vk::to_string(wait_result));
 }
 
@@ -723,7 +1044,12 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
             if (auto* async_upload = VideoCore::AsyncUpload::Get()) {
                 async_upload->WaitUpTo(this, signal_value);
             }
-            QueueSubmit(instance, info, real);
+            {
+                // sotc: SOTC_FPS accounting: vkQueueSubmit time of the recording thread
+                const SotcStats::RoleTimer submit_time{SotcStats::RoleRecorder,
+                                                       SotcStats::rec_submit_ns};
+                QueueSubmit(instance, info, real);
+            }
             recorded_submit_tick.store(signal_value, std::memory_order_release);
             recorded_submit_tick.notify_all();
             recorder->Retire(static_cast<u32>(fakes.size()));

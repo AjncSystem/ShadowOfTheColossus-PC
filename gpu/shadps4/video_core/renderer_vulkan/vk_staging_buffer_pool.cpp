@@ -34,6 +34,27 @@ u64 BlockSize() {
     return size;
 }
 
+// sotc: SOTC_STAGING_LARGE_POW2=1 (off by default). Large uploads (streaming bursts) come in many
+// sizes: matched within 1.25x they seldom found a free buffer and allocated a new one inside the
+// frame that needed it (6 allocations, 240 MiB, 7-19 ms per 5 s while an area loads). With the
+// switch they get power-of-two size classes and reuse any free buffer up to twice the request,
+// and idle ones are kept up to SOTC_STAGING_LARGE_KEEP_MB (default 256) per memory type instead
+// of being freed after 120 idle frames.
+static bool StagingLargePow2() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_STAGING_LARGE_POW2");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+static u64 StagingLargeKeepBytes() {
+    static const u64 bytes = [] {
+        const char* v = std::getenv("SOTC_STAGING_LARGE_KEEP_MB");
+        return (v ? std::strtoull(v, nullptr, 10) : 256ULL) << 20;
+    }();
+    return bytes;
+}
+
 u64 RoundAllocationSize(u64 size) {
     const u64 step = std::max(std::bit_floor(size) / 4, LARGE_MIN_GRANULARITY);
     return Common::AlignUp(size, step);
@@ -114,9 +135,12 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
     // come in slightly different sizes; matched within 1.25x they rarely found a free buffer and
     // allocated a new one ~1,100 times in a 6-minute attract run. They get power-of-two sizes
     // instead, and reuse any free buffer of that size class.
+    const bool pow2 = deferred || StagingLargePow2();
     const u64 alloc_size =
-        deferred ? std::bit_ceil(std::max(size, LARGE_MIN_GRANULARITY)) : RoundAllocationSize(size);
-    const u64 max_size = deferred ? alloc_size : std::max(size + size / 4, RoundAllocationSize(size));
+        pow2 ? std::bit_ceil(std::max(size, LARGE_MIN_GRANULARITY)) : RoundAllocationSize(size);
+    const u64 max_size = deferred ? alloc_size
+                         : pow2   ? alloc_size * 2
+                                  : std::max(size + size / 4, RoundAllocationSize(size));
 
     LargeBuffer* best{};
     for (LargeBuffer& entry : cache) {
@@ -213,9 +237,25 @@ void StagingBufferPool::TrimRing(Ring& ring, size_t keep_blocks) {
 }
 
 void StagingBufferPool::TrimLarge(std::vector<LargeBuffer>& cache) {
-    std::erase_if(cache, [this](const LargeBuffer& entry) {
-        return !entry.held && frame - entry.last_used_frame >= LARGE_IDLE_FRAMES &&
-               scheduler.IsFree(entry.tick);
+    // sotc: SOTC_STAGING_LARGE_POW2: idle buffers are kept up to SOTC_STAGING_LARGE_KEEP_MB,
+    // the most recently used first.
+    u64 keep = StagingLargePow2() ? StagingLargeKeepBytes() : 0;
+    if (keep != 0) {
+        std::ranges::sort(cache, [](const LargeBuffer& a, const LargeBuffer& b) {
+            return a.last_used_frame > b.last_used_frame;
+        });
+    }
+    std::erase_if(cache, [this, &keep](const LargeBuffer& entry) {
+        if (entry.held || frame - entry.last_used_frame < LARGE_IDLE_FRAMES ||
+            !scheduler.IsFree(entry.tick)) {
+            return false;
+        }
+        const u64 bytes = entry.buffer->SizeBytes();
+        if (bytes <= keep) {
+            keep -= bytes;
+            return false;
+        }
+        return true;
     });
 }
 

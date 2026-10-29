@@ -655,7 +655,12 @@ bool Instance::CreateDevice() {
                                        "supported; uploads copy through the CPU");
         }
     }
-    if (xfer_routing || host_import_enabled) {
+    // sotc: SOTC_RB_TICK=1 needs the queue for guest readback copies (not for uploads).
+    rb_tick = [] {
+        const char* env = std::getenv("SOTC_RB_TICK");
+        return env && env[0] == '1';
+    }();
+    if (xfer_routing || host_import_enabled || rb_tick) {
         bool best_has_compute = false;
         for (std::size_t i = 0; i < family_properties.size(); i++) {
             const vk::QueueFlags flags = family_properties[i].queueFlags;

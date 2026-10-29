@@ -763,12 +763,14 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
         new_backing->image = VideoCore::UniqueImage{instance.GetDevice(), instance.GetAllocator()};
         new_backing->image.Create(new_image_ci);
 
-        Vulkan::SetObjectName(instance.GetDevice(), new_backing->image.image,
-                              "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{} (backing)",
-                              info.size.width, info.size.height, info.size.depth,
-                              AmdGpu::NameOf(info.tile_mode), vk::to_string(info.pixel_format),
-                              info.guest_address, info.guest_size, info.resources.layers,
-                              info.resources.levels, num_samples);
+        if (Vulkan::object_names_enabled.load(std::memory_order_relaxed)) { // sotc: see Image
+            Vulkan::SetObjectName(instance.GetDevice(), new_backing->image.image,
+                                  "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{} (backing)",
+                                  info.size.width, info.size.height, info.size.depth,
+                                  AmdGpu::NameOf(info.tile_mode), vk::to_string(info.pixel_format),
+                                  info.guest_address, info.guest_size, info.resources.layers,
+                                  info.resources.levels, num_samples);
+        }
     } else {
         new_backing = std::addressof(*it);
     }

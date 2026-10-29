@@ -21,7 +21,8 @@
 
 namespace BbThreads {
 /// GPU threads that PlaceThread can pin (SOTC_CPUSETS=1, Windows only).
-enum class Role { CommandProcessor, Draw, Recorder, Present, PipelineWorker, Copy };
+/// sotc: Prep: SOTC_PARALLEL_RECORD's GpuPrep threads (normal priority, on the sibling CPUs).
+enum class Role { CommandProcessor, Draw, Recorder, Present, PipelineWorker, Copy, Prep };
 
 #ifdef _WIN32
 /// Hardware threads available to the process (its affinity mask).
@@ -184,6 +185,7 @@ inline void PlaceThread(Role role) {
     case Role::Present: ids = &layout.exclusive[3]; count = 1; break;
     case Role::PipelineWorker:
     case Role::Copy:
+    case Role::Prep:
         ids = layout.siblings.data();
         count = static_cast<ULONG>(layout.siblings.size());
         break;

@@ -16,6 +16,14 @@
 // the runtime or of the GPU side: every wait depends on the copy threads alone, so none can
 // deadlock, whatever lock the waiting thread holds. Uploads with pages the tracker leaves
 // unprotected (hot pages of the fault grace) stay on the draw thread.
+//
+// SOTC_FENCE_PIECES=1 (off by default) narrows the write fence: it waits only for the pieces
+// (<= 512 KiB) that read the asked range, not for every piece of the jobs touching it, and the
+// waiting thread copies the pieces no copy thread has started yet itself (each piece goes
+// queued -> claimed -> done once, whoever claims it copies it). Guest read faults do not wait
+// (bbgpu_handle_fault): a read cannot change what a copy reads and leaves the page protected.
+// A job whose last piece a waiting thread copied is finished (staging flush, done) by a copy
+// thread, so the waiting thread calls no Vulkan function.
 
 #pragma once
 
@@ -50,9 +58,22 @@ public:
     static void Init();
     /// Stops the pool (the buffer cache's destructor).
     static void Shutdown();
-    /// The pool, or nullptr when the switch is off.
+    /// The pool, or nullptr when both switches are off.
     static AsyncUpload* Get() noexcept {
         return instance.load(std::memory_order_acquire);
+    }
+    /// SOTC_ASYNC_UPLOAD=1: buffer uploads use the pool.
+    static bool BuffersEnabled() noexcept {
+        return buffers_enabled;
+    }
+    /// SOTC_ASYNC_TEXTURE_UPLOAD=1: the guest copies of texture uploads use the pool.
+    static bool TexturesEnabled() noexcept {
+        return textures_enabled;
+    }
+
+    /// SOTC_FENCE_PIECES=1: the write fence waits for (and helps with) single pieces.
+    static bool FencePieces() noexcept {
+        return fence_pieces;
     }
 
     [[nodiscard]] u64 MinBytes() const noexcept {
@@ -82,13 +103,26 @@ private:
     void Worker(std::stop_token token);
     template <typename Pred>
     void WaitFor(Pred&& pred, bool fence);
+    /// SOTC_FENCE_PIECES: waits for the pieces of the jobs job_pred selects that slot_pred
+    /// selects (every piece of a job without per-piece ranges), copying the unclaimed ones.
+    template <typename JobPred, typename SlotPred>
+    void WaitPieces(JobPred&& job_pred, SlotPred&& slot_pred);
+    /// A piece is copied: marks it done and finishes its job after the last one (inline on a
+    /// copy thread, through a finish task otherwise).
+    void PieceDone(const std::shared_ptr<Job>& job, u32 index, bool on_worker);
+    void FinishJob(const std::shared_ptr<Job>& job);
 
+    /// index: the job's piece, or FinishTask (the job's pieces are copied: finish it).
+    static constexpr u32 FinishTask = ~u32{0};
     struct Task {
         std::shared_ptr<Job> job;
-        Piece piece;
+        u32 index;
     };
 
     static inline std::atomic<AsyncUpload*> instance{nullptr};
+    static inline bool buffers_enabled{};
+    static inline bool textures_enabled{};
+    static inline bool fence_pieces{};
 
     u64 min_bytes;
     std::mutex mutex;

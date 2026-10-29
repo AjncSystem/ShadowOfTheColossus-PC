@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "bbport_copy.h"
 #include "bbport_threads.h"
+#include "video_core/sotc_stats.h"
 
 #include <algorithm>
 #include <atomic>
@@ -100,6 +101,8 @@ public:
     }
 
     void WaitAll() {
+        // sotc: SOTC_FPS accounting (draw thread): host copies (the copies it helps with count).
+        const SotcStats::DrawWait wait{SotcStats::WaitUpload};
         // The waiting thread helps instead of only spinning.
         while (true) {
             Task task;
@@ -138,6 +141,8 @@ public:
         }
         cv.notify_all();
         Work(*job);
+        // sotc: SOTC_FPS accounting (draw thread): waiting for the workers' share of the copies.
+        const SotcStats::DrawWait wait{SotcStats::WaitUpload};
         // Workers only call the task for indices below count, all done before this returns.
         if (NoSpin()) {
             std::size_t done = job->done.load(std::memory_order_acquire);
@@ -240,6 +245,7 @@ private:
 
     void Loop(unsigned index) {
         Common::SetCurrentThreadName(("bb:Copy" + std::to_string(index)).c_str());
+        SotcStats::RegisterThreadRole(SotcStats::RoleUpload); // sotc: SOTC_FPS accounting
         BbThreads::PlaceThread(BbThreads::Role::Copy);
         u64 seen = 0;
         std::unique_lock lk{mutex};

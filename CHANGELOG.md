@@ -1,6 +1,153 @@
 # Changelog
 
 ## Não lançado — desempenho no streaming e correções visuais
+- **Resultado medido dos switches novos (sessões de ~70 s nas mesmas áreas, 29–30 out):** a
+  configuração estável (`SOTC_RB_TICK`, `SOTC_RB_GROW`, `SOTC_RB_MATERIALIZE` sobre a base) teve 12
+  quadros acima de 60 ms. Cada switch novo, ligado sozinho por cima dela, piorou ou não agiu:
+  `SOTC_RB_EXACT` 25 (a espera total de readback cai ~15%, mas a thread de desenho sobe de 22 para
+  35 ms/quadro); `SOTC_HOT_PAGES` + granule 4 KiB + write-ahead adaptativo 22 (faltas 30% menos, mas
+  o dobro do custo cada); `SOTC_BIND_CACHE_FRAME` dobrou a thread de desenho (o cache é esvaziado
+  ~15 mil vezes por segundo); `SOTC_RB_GROUP` não agiu (cada bind do jogo escreve um bitset só);
+  `SOTC_HLE_SHADOW_CULL` não agiu (as entradas do shader são escritas pela GPU);
+  `SOTC_WRITE_FAULT_NARROW` dobrou os readbacks. Todos ficam desligados por padrão; servem de base
+  para medições futuras. `SOTC_CULL_EXPRESS` (fila prioritária para o culling) está incompleto.
+- **Correção: `SOTC_BIND_CACHE_XTICK` e `SOTC_BIND_CACHE_FRAME` nunca ligavam:** liam outro switch
+  durante a inicialização, numa ordem não garantida; agora leem as variáveis diretamente. Quem tinha
+  `SOTC_BIND_CACHE_XTICK=1` no launcher passa a tê-lo ligado de verdade (nunca foi medido sozinho).
+- **Correção: uploads pequenos podiam ficar velhos na GPU (`SOTC_HASH_SMALL`).** O port copiava os
+  bytes para o upload e só depois calculava o hash relendo a memória do jogo; uma escrita do jogo no
+  meio guardava o hash dos bytes novos enquanto a GPU recebia os velhos, e o próximo upload era
+  pulado como "igual". Agora o hash e o upload usam a mesma cópia. Também: um upload com uma página
+  que o jogo está escrevendo não vai mais inteiro para a thread de desenho — só essa página.
+- **`SOTC_RB_EXACT`, segunda versão:** a queda para ~20 FPS vinha de avisos adiados em cascata
+  (6.170 a cada 5 s, quando só ~150 tinham dado quente). Agora só é adiado o aviso que vem depois de
+  escritas quentes, e só no endereço em que adiar custou menos que deixar o aviso sair cedo — o port
+  mede as duas coisas por endereço. Com `SOTC_FPS=1` a linha `SOTC RB exact` ganha a parte
+  `adaptive`.
+- **Faltas de escrita sem readback inteiro (`SOTC_WRITE_FAULT_NARROW=1`, desligado por padrão):**
+  uma escrita do jogo numa página escrita pela GPU lia de volta uma janela de 512 KiB; agora só as
+  páginas da falta, pela fila de transferência quando a GPU já terminou (com `SOTC_RB_TICK=1`).
+- **Bind cache que dura o quadro inteiro (`SOTC_BIND_CACHE_FRAME=1`, desligado por padrão; precisa
+  de `SOTC_BIND_CACHE_XTICK=1`):** o cache era zerado ~30 vezes por quadro (troca de render target,
+  envio, qualquer imagem nova). Agora os render targets fazem parte da chave, a tabela tem 4096
+  entradas, e cada entrada só cai quando algo nas faixas que ela usa mudou. Linha `SOTC BIND FRAME`.
+- **Menos chamadas de proteção de página (`SOTC_PROTECT_COALESCE=1`, desligado por padrão):** numa
+  falta de escrita, as liberações de páginas vizinhas viram uma chamada só; nova linha
+  `SOTC FAULT SPLIT` mostra onde vai o tempo de cada falta. `SOTC_HOT_PAGES`: tempo de vida sem
+  "precipício", contagem certa e limite que cresce sozinho (`SOTC_HOT_PAGES_MAX_CEIL`).
+- **Leituras da GPU exatas e sem espera desnecessária (`SOTC_RB_EXACT=1`, experimental, desligado
+  por padrão; precisa de `SOTC_RB_OWNER=1` e do processador de comandos em threads):** a análise do
+  código do jogo mostrou que 92% das leituras de volta vêm de duas funções. A de 63% (`eboot+0x1a6d60`)
+  lê o bitset de visibilidade do XPR deste quadro depois de esperar o label `CS_DONE`; o port
+  escrevia esse label assim que o lia, antes da GPU rodar o trabalho, e o jogo travava na leitura.
+  A de 29% (`eboot+0x101a98`) lê um anel de 3 buffers, o de 2 quadros atrás, já pronto; o port
+  esperava mesmo assim, porque a página é a mesma do buffer que a GPU escreve agora. Com o switch:
+  os labels que vêm depois de escritas nessas faixas são escritos quando a GPU termina de verdade,
+  em ordem, com o trabalho enviado na hora e os dados já na memória do jogo; e uma leitura espera só
+  por quem escreveu os bytes pedidos — vizinhos que a GPU ainda escreve, e que nenhum label anunciou,
+  são entregues quando ela termina. É o mesmo resultado do PS4, sem dado de quadro anterior. Desliga
+  `SOTC_RB_PREV`. Com `SOTC_FPS=1` a linha `SOTC RB exact` mostra leituras servidas sem espera, as
+  que caíram no caminho antigo e por quê, labels adiados e a latência deles.
+- **Máscaras do XPR com um quadro de atraso (`SOTC_RB_PREV=1`, experimental, desligado por
+  padrão; precisa de `SOTC_RB_OWNER=1`):** depois de `SOTC_RB_MATERIALIZE`, o que sobra das
+  travadas são leituras da máscara do quadro atual enquanto a GPU ainda a produz; nenhum truque de
+  memória tira essa espera, porque o dado ainda não existe. Com o switch, o jogo lê a versão que já
+  está na memória dele (a última entregue, de no máximo `SOTC_RB_PREV_FRAMES` quadros, padrão 2, e
+  150 ms atrás) em vez de esperar; a próxima escrita da GPU traz o quadro seguinte. Nada é gravado
+  na memória do jogo. Só vale para leituras (nunca escritas), de janelas lidas e reescritas pela
+  GPU em todos os últimos 3 quadros, e só para bytes entregues recentemente; memória desmapeada ou
+  liberada perde esse histórico. Risco aceito: um objeto que acabou de ficar visível pode sumir por
+  1-2 quadros ao girar a câmera. Com `SOTC_FPS=1` a linha `SOTC RB previous` mostra quantas leituras
+  foram servidas sem espera e por que as outras foram recusadas.
+- **Máscaras do XPR entregues antes da leitura (`SOTC_RB_MATERIALIZE=1`, desligado por padrão;
+  liga junto as cópias antecipadas de `SOTC_RB_PREFETCH` e precisa de `SOTC_RB_OWNER=1`):** as
+  máscaras de oclusão do XPR são ~80% das leituras de volta da GPU (com `r_EnableXPR=0` caem de
+  ~900 para ~200 por segundo, mas os draws dobram e o jogo vai a 8-17 FPS, então elas ficam), e em
+  78-89% dessas leituras a GPU já tinha terminado de escrever quando o jogo leu. Agora a cópia
+  antecipada de uma janela lida todo quadro é aplicada na memória do jogo assim que termina, sem
+  esperar a falta de página: o jogo lê sem falta, sem ida à thread de desenho e sem espera. O dado
+  é o mesmo que uma leitura naquele momento copiaria (mesmas regras de descarte das cópias
+  antecipadas). Duas proteções contra o problema do antigo `SOTC_RB_HOT` (ruído arco-íris,
+  `0x49500`): só entram bytes que a GPU escreveu neste quadro ou no anterior, e há no máximo 100 ms (memória esquecida
+  e reaproveitada pelo jogo fica para a falta normal), e páginas que o jogo escreveu nesse meio
+  tempo ficam com os bytes do jogo. `SOTC_RB_MATERIALIZE_US` (padrão 100) é o intervalo mínimo
+  entre verificações. Com `SOTC_FPS=1` a linha `SOTC RB materialize` mostra quantas foram
+  aplicadas sem falta (e MiB) e quantas cópias não se qualificaram (`not fresh`).
+- **Faixas residentes no host, passo 1: seleção e simulação (`SOTC_HRR=dry`, desligado por padrão):**
+  aprende, pelo caminho das leituras do jogo, quais faixas de 64 KiB são lidas de volta pelo menos
+  `SOTC_HRR_MIN_RB` (padrão 30) vezes por segundo e as junta em faixas contíguas, até
+  `SOTC_HRR_MB` (padrão 16) MiB. Anota o que impediria a promoção: imagem do cache de texturas
+  sobre a faixa, bind que ultrapassa a borda, nenhum bind visto, faixa sem visão de backing. Com
+  `SOTC_FPS=1` a linha `SOTC HRR` mostra faixas, KiB, faltas nelas (sem espera / com espera, pelo
+  tick do escritor) e quanto essas leituras custam hoje; as linhas `SOTCSTALL` ganham `hrr N`.
+  Nada é promovido: `SOTC_HRR=1` ainda se comporta como `dry` (a importação com
+  `VK_EXT_external_memory_host` e o redirecionamento da arena não estão feitos). Sem a variável
+  nada muda.
+- **Cache de binds que atravessa o tick de envio (`SOTC_BIND_CACHE_XTICK=1`, desligado por padrão;
+  exige `SOTC_BIND_CACHE=1` e `SOTC_BIND_CACHE_RANGES=1`):** o cache de binds era esvaziado a cada
+  envio (~20–30 por quadro) e a cada faixa nova tornada residente. Com a variável, (1) o tick deixa
+  de esvaziar o cache: o primeiro acerto de cada entrada num tick novo repete o que um bind
+  completo faz uma vez por tick e um acerto pulava (carimbos de acesso e LRU das imagens, toque no
+  LRU dos samplers, conferido por devolver o mesmo handle e slot, carimbos de uso dos blocos da
+  arena usados por `MaybeEvictCold`, uma vez por segundo, e a conferência de que o mapeamento do
+  guest sob cada V# continua o mesmo); descritores, dados de push, transições de imagem e
+  barreiras de buffer já eram refeitos a cada acerto; (2) o cache de buffers ganha `BindVersion`,
+  que só sobe quando uma faixa residente é desfeita (liberar memória, evicção, troca de arena) e
+  não quando mais memória vira residente; o bind rápido e o cache usam esse número, então os
+  quadros de streaming deixam de esvaziá-los; (3) faixa de buffer modificada pela CPU não recusa
+  mais o acerto: é sincronizada como o bind completo faz e os descritores guardados continuam
+  valendo (imagens sujas continuam recusando). Com `SOTC_FPS=1` a linha `SOTC BIND CACHE` ganha
+  `xtick hits` (acertos de entradas feitas em tick anterior), `repaired` (acertos que sincronizaram
+  uma faixa), `replays` (primeiros acertos num tick novo) e as chaves já vistas no quadro anterior.
+  Sem a variável nada muda.
+- **Leituras do jogo na fila de transferência, sem esperar o trabalho novo (`SOTC_RB_TICK=1`,
+  desligado por padrão):** o cache de buffers guarda os conjuntos de escrita dos últimos 8 ticks
+  (quem escreveu cada faixa e quando). Com `SOTC_FPS=1` a linha `SOTC RB writer` mostra, a cada 5 s,
+  quantas leituras do jogo tinham o escritor já terminado na GPU (`done`), enviado mas não terminado
+  (`submitted`) ou ainda em gravação (`unsubmitted`), e a idade média em ticks. Com
+  `SOTC_RB_TICK=1`, quando o escritor já foi enviado, a cópia vai para a fila só de transferência
+  (criada sem desviar uploads; os buffers ficam concorrentes entre as duas famílias de filas),
+  esperando apenas o tick do escritor; a thread do jogo espera o valor da fila de transferência,
+  consultando o contador por `SOTC_RB_SPIN_US` (padrão 150) antes de bloquear. O próximo envio
+  gráfico só espera essa cópia se uma escrita gravada depois cobrir os mesmos bytes (escrita depois
+  de leitura); desfazer mapeamentos e `Finish` também esperam por ela. Escritor desconhecido ou em
+  gravação, binds esparsos pendentes, sem fila de transferência ou sem slot livre seguem o caminho
+  de antes. A linha `SOTC RB tick` mostra cópias, espera média e recuos (sem fila, desconhecido,
+  binds). Sem a variável nada muda.
+- **Latência das faltas de escrita e janela de escrita adaptativa (`SOTC_WRITE_AHEAD_ADAPT=1`,
+  desligado por padrão):** com `SOTC_FPS=1` a linha `SOTC FAULTS` mostra as faltas de escrita das
+  threads do jogo por janela: quantas, quantas em rajada sequencial, latência média (do início ao
+  fim do tratador) separada em espera do mutex da região, espera da cerca do upload assíncrono e
+  tempo em `VirtualProtect`, p99, páginas marcadas à frente (e quantas voltaram idênticas no
+  upload) e as páginas do grânulo que não precisaram subir; as linhas `SOTCSTALL` ganham
+  `faults N (X ms)`. Com `SOTC_WRITE_AHEAD_ADAPT=1`, uma thread que escreve em sequência (falta
+  logo após a extensão liberada pela anterior, em até `SOTC_WRITE_AHEAD_ADAPT_US`, padrão 1000)
+  dobra a janela de escrita à frente (ou atrás, se escreve para baixo) a cada falta, de 16 páginas
+  até `SOTC_WRITE_AHEAD_MAX_PAGES` (padrão 512 = 2 MiB), e volta a 16 numa falta não sequencial. As
+  páginas marcadas ganham antes um instantâneo (hash) do conteúdo, e no upload as que o jogo não
+  escreveu são descartadas, como no grânulo; páginas da GPU, com imagens por perto, de pilha ou já
+  sujas não são marcadas. Sem a variável nada muda. Soltar o mutex da região durante o
+  `VirtualProtect` foi avaliado e não implementado: sem o mutex a ordem entre o rastreador de
+  páginas e os bits poderia estourar a contagem de observadores.
+- **Processador de comandos sem ping-pong com a thread de desenho (`SOTC_WD_FUSE=1`, desligado
+  por padrão):** os pacotes WRITE_DATA pequenos (até 64 bytes, 4 pacotes) que escrevem os
+  argumentos de um DRAW_INDIRECT/DISPATCH_INDIRECT seguinte viajam dentro do próprio draw em vez de
+  virar uma função na fila; assim o `WaitBackWrites` não espera mais por eles e o processador de
+  comandos pode correr à frente da thread de desenho. Os closures pequenos da fila também ficam
+  num buffer interno, sem alocação (`SOTC_INLINE_FUNC=1` liga só isso). Com `SOTC_FPS` as linhas
+  `SOTC CP ops` mostram funções por quadro, WRITE_DATA fundidos, pares WRITE_DATA→draw indireto e
+  as esperas do `WaitBackWrites`.
+- **Escritas da GPU por shader (diagnóstico) e extensão de escrita (`SOTC_WRITE_EXTENT=1`, desligado
+  por padrão):** com `SOTC_FPS=1` a linha `SOTC GPU writes by shader` lista, a cada 5 s, os 8
+  pares (hash do programa, índice do binding) com mais leituras da CPU que exigiram ida à GPU, com
+  os MB marcados como escritos, o tamanho do binding, as threads do dispatch e os offsets lidos.
+  Com `SOTC_WRITE_EXTENT=1`, bindings de armazenamento escritos por dispatches diretos listados em
+  `user/write_extent.txt` (`hash binding [offset [fixo [por_thread [por_grupo]]]]`, em bytes) são
+  marcados como modificados pela GPU só na janela `offset + fixo + por_thread*threads +
+  por_grupo*grupos`, em vez do range inteiro; o resto do binding é sincronizado como leitura. Quem
+  lista um shader garante que ele não escreve fora da janela (janela maior é sempre segura; menor
+  deixa a CPU ler dados velhos). Gráficos, dispatches indiretos e buffers com formato mantêm o range
+  inteiro. O cache de shaders não muda.
 - **Menos travadas ao andar pelo mapa:** o timer do Windows passa a 1 ms (`SOTC_TIMER_RES=0`
   desliga), liberar memória não espera mais a thread da GPU (`SOTC_DROP_ASYNC=0`), os workers de
   compilação rodam abaixo do normal (`SOTC_WORKER_LOW_PRIO=0`) e o sleep do ritmo de quadros usa um
@@ -25,6 +172,79 @@
   `SOTC_BINDLESS_SAMP` (samplers num heap global; refaz o cache de shaders; não combina com
   `SOTC_STAGE_BINDINGS` nem `SOTC_DESC_BUFFER`). Todos caem para o
   caminho atual quando a placa ou o driver não têm o recurso.
+- Diagnóstico das travadas: com `SOTC_FPS=1` o log mostra o tempo de CPU por quadro de cada
+  thread da GPU (`SOTC cpu/frame`: command processor, draws, gravação, `PassSecondary`, cópias),
+  o que a thread de draws esperou (`SOTC draw waits/frame`: GPU, gravação, uploads, lock do cache
+  de texturas), o tempo que o command processor ficou bloqueado na thread de draws
+  (`SOTC cp/frame`) e o da thread de gravação (`SOTC recorder/frame`). Cada quadro acima de
+  `SOTC_STALL_MS` (70 ms) ganha uma linha `SOTCSTALL` com esses números só daquele quadro, sem
+  precisar de `SOTC_FRAME_LOG`. Sem `SOTC_FPS` nada é medido.
+- Diagnóstico dos readbacks (`SOTC_FPS=1`): a linha `SOTC RB pattern` mostra, a cada 5 s, quantos
+  pedidos de readback das threads do jogo caem logo depois (ou antes, até 64 KiB) da janela
+  anterior da mesma thread (e quantos em até 1 ms), quantos caem dentro dela, quantos repetem uma
+  janela do quadro anterior, o tamanho médio pedido/janela/baixado e as 5 janelas mais pedidas. A
+  linha `SOTCSTALL` ganha `rb adj` (pedidos vizinhos naquele quadro).
+- `SOTC_RB_GROW=1` (experimental, desligado): quando uma thread do jogo lê a memória escrita pela
+  GPU em sequência (cada pedido vizinho à janela anterior em até `SOTC_RB_GROW_US`, 1000 µs), a
+  janela do readback dobra a cada pedido, na direção da leitura, até `SOTC_RB_GROW_MAX_KB`
+  (1024); qualquer outro pedido volta à janela normal (`SOTC_RB_NARROW`, 64 KiB). Só vale com a
+  janela estreita. Com `SOTC_FPS=1`, linha `SOTC RB grow` (janelas aumentadas, quantas batem em
+  escritas do envio atual, readbacks economizados no máximo).
+- `SOTC_BIND_CACHE=1` (experimental, desligado): os recursos dos últimos 32 desenhos que só leem
+  buffers e texturas ficam guardados; um desenho com o mesmo estado de um anterior no mesmo envio
+  à GPU (não só o imediatamente anterior, como no `SOTC_FAST_BIND`) não refaz as buscas no cache
+  de buffers e de texturas, só reenvia os descritores. Tudo é descartado quando muda o envio, a
+  memória do jogo, os buffers/texturas/samplers residentes ou os render targets, ou quando um
+  desenho, dispatch ou DMA escreve na memória da GPU. Linha `SOTC BIND CACHE` com `SOTC_FPS=1`.
+- `SOTC_ADAPTIVE_LOAD=1` (experimental, desligado): controle de carga dinâmico. Quando dois
+  quadros seguidos passam de `SOTC_ADAPTIVE_HIGH_MS` (36 ms, ~27,8 FPS no limite de 30), o port
+  alivia o próprio trabalho até os quadros voltarem ao ritmo (todos até `SOTC_ADAPTIVE_LOW_MS`,
+  34,5 ms) por `SOTC_ADAPTIVE_HOLD_MS` (1000 ms; dobra, até 8×, se voltar a pesar logo depois).
+  No modo 60 FPS os limites acompanham o alvo (18 / 17,25 ms); sem limite de FPS ele não age.
+  Enquanto alivia: as duas cascatas distantes da sombra do sol são desenhadas em quadros
+  alternados e deslocadas nos outros, como `SOTC_SHADOW_REUSE=1` (`SOTC_ADAPTIVE_SHADOW=0`
+  desliga; onde o deslocamento não serve, a cascata é desenhada, nunca pulada); os envios à GPU
+  ficam a cada `SOTC_ADAPTIVE_FLUSH_US` (4000 µs em vez de 1000); a limpeza rotineira de texturas
+  e a verificação de memória fria esperam (`SOTC_ADAPTIVE_DEFER=0` desliga; sob pressão de
+  memória tudo roda como antes). **Troca visual:** só enquanto o jogo está abaixo de ~27 FPS, as
+  sombras distantes podem atrasar um quadro ou piscar brevemente (o mesmo pisca-pisca da
+  reutilização de sombras). `SOTC_SHADOW_REUSE=1` e a opção do menu no jogo continuam valendo
+  como antes. Linha `SOTC ADAPTIVE` com `SOTC_FPS=1`.
+- `SOTC_BIND_CACHE_RANGES=1` (experimental, desligado; só vale junto com `SOTC_BIND_CACHE=1`):
+  um dispatch, desenho ou DMA que escreve na memória da GPU descarta só as entradas que leem o que
+  ele escreve (faixas de buffers e texturas que se sobrepõem, ou a mesma textura), em vez do cache
+  inteiro; dispatches que só leem não descartam nada. Mudanças na memória do jogo também deixam de
+  esvaziar o cache: cada acerto já recusa faixas modificadas pela CPU e texturas sujas. As regras
+  de envio, de recursos residentes e de render targets continuam. Desenhos que leem um texel
+  buffer no endereço de uma textura, ou uma cópia no stream buffer, não são guardados. A linha
+  `SOTC BIND CACHE` ganha `invalidated by ranges N entries (writes M)`.
+- `SOTC_RS_MEMO=1` (experimental, desligado): um desenho nos mesmos render targets do desenho
+  anterior, no mesmo envio à GPU e no render pass que ele deixou aberto, reaproveita o estado de
+  renderização dele em vez de procurar os alvos de novo no cache de texturas. Não vale quando
+  algum alvo foi recriado, sujo pela CPU ou também é lido como textura, nem em passes com clear
+  (CMASK/HTILE ou registrador) ou com feedback loop. Linha `SOTC RS MEMO` com `SOTC_FPS=1`
+  (acertos e motivos das falhas).
+- `SOTC_PARALLEL_RECORD=1` (experimental, desligado; precisa da thread de draws e de mais de 6
+  threads de CPU): 1 ou 2 threads `GpuPrep` (`SOTC_PARALLEL_RECORD_WORKERS`) seguem a fila de
+  desenhos e calculam antes da thread de draws o que só depende dos registradores (estado
+  dinâmico, push constants, a chave do fast bind/bind cache, os offsets de vértice) e fazem o
+  `SOTC_ASYNC_IMAGE_CREATE` no lugar do command processor. As decisões continuam na thread de
+  draws, na ordem; um desenho sem o cálculo pronto é feito como hoje. `SOTC_PR_VERIFY=N` confere
+  um a cada N desenhos com o cálculo normal e registra as diferenças. Linha `SOTC PR prep/frame`
+  com `SOTC_FPS=1`.
+- `SOTC_SYNC_FAST=1` (experimental, desligado): cada buffer de cada desenho ou dispatch não varre
+  mais as páginas rastreadas quando nada mudou desde a última sincronização daquele trecho. Um
+  contador por bloco de 2 MiB sobe sempre que a CPU suja uma página (ou um dado escrito pela GPU
+  deixa de valer); um trecho que ficou limpo e cujos blocos não mudaram é pulado. Páginas que
+  ficam liberadas para escrita (fault grace, `SOTC_HOT_PAGES`) seguem pelo caminho normal. Linha
+  `SOTC SYNC FAST` com `SOTC_FPS=1` (pulados/consultados).
+- `SOTC_PROTECT_BATCH=1` (experimental, desligado): as re-proteções de páginas de um upload de
+  buffer (páginas que a CPU sujou e que voltam a ser protegidas contra escrita) são juntadas e
+  aplicadas de uma vez antes de o upload ler a memória do jogo, em vez de uma chamada de
+  `VirtualProtect` por bloco rastreado de 16 MiB; páginas cujo estado mudou nesse meio-tempo são
+  puladas. Páginas com dados escritos pela GPU e as desproteções (readbacks, faults) continuam
+  imediatas. Linha `SOTC PROTECT BATCH` com `SOTC_FPS=1` (chamadas e páginas, pedidos juntados,
+  páginas puladas).
 - `SOTC_ASYNC_COMPUTE_XLATE=1` (experimental, desligado): quando um dispatch precisa de um shader
   de compute novo, o resto do command buffer é varrido e os outros shaders de compute novos vão
   para os workers, traduzidos em paralelo; os dispatches continuam publicados em ordem. Linha
@@ -40,6 +260,95 @@
   passa da thread de draws para o command processor, antes de enfileirar o flip. A thread de
   draws não bloqueia mais ali e atende na hora os pedidos das threads do jogo; o FPS é o mesmo.
   Linha `SOTC CP flip pacing` com `SOTC_FPS=1`.
+- **Cache de shaders que não se atualizava:** um arquivo do cache regravado depois do pacote
+  (`cache.sotcpack`) perdia para a cópia antiga do pacote, então ~1850 pipelines eram recusados
+  em todo boot e ~2100 estágios de shader eram traduzidos de novo em toda sessão (com ~6900
+  desenhos pulados). Agora o arquivo mais novo vence e o pacote é refeito com ele. A versão dos
+  shaders sobe junto (binários antigos com o mesmo número davam vértices errados e árvores
+  escuras): **o cache de shaders é refeito na primeira abertura.**
+- `SOTC_VIEW_SPLIT_FINE=1` (experimental, desligado): quando o jogo libera parte de uma visão de
+  memória, as partes que ficam viram visões de 64 KiB; as próximas liberações ali não param mais
+  todas as threads do jogo (49 ms parados numa janela de 5 s ao trocar de área).
+- `SOTC_RB_OWNER=1` (experimental, desligado): várias threads do jogo leem a mesma memória
+  escrita pela GPU ao mesmo tempo, e cada readback copiava tudo de novo; o primeiro a terminar
+  deixava os outros "velhos" e eles eram refeitos esperando a GPU. Agora as páginas que um
+  readback em andamento está baixando são dele: o seguinte não as copia e, para a parte que pediu,
+  espera e termina junto com o dono. `SOTC_RB_BATCH=1` (experimental, desligado): os readbacks
+  pedidos juntos vão para a GPU num só envio. Linha `SOTC readbacks sharing pages` com
+  `SOTC_FPS=1`.
+- `SOTC_RB_KEEP_LATER=1` (experimental, desligado): um readback em andamento cujos bytes a GPU
+  escreve de novo por um comando posterior era refeito na hora, com a thread de draws esperando a
+  GPU (~15 mil numa sessão, concentrados ao virar a câmera em áreas densas). Agora o dado lido é
+  aplicado (é o que a memória tinha quando o jogo pediu) e só os trechos da escrita posterior
+  continuam marcados como da GPU, para a próxima leitura buscar o dado novo. Linha
+  `SOTC readbacks made stale by` com o motivo de cada um, com `SOTC_FPS=1`.
+- `SOTC_RB_ASYNC_AHEAD=1` (experimental, desligado): quando uma thread do jogo lê memória escrita
+  pela GPU, a cópia ia no envio do trabalho que estava sendo gravado e a thread esperava tudo até
+  ali na GPU, inclusive as cópias de upload daquele envio (até ~190 ms de CPU nos quadros
+  pesados). Se os bytes pedidos só foram escritos por trabalho já enviado, a cópia agora vai num
+  envio pequeno à parte, logo atrás dele, sem fechar o envio atual nem esperar os uploads dele, e a
+  thread do jogo espera só essa cópia. Nos outros casos nada muda. Com `SOTC_FPS=1` o log ganha a
+  linha `SOTC RB guest wait` (quantos readbacks a thread do jogo esperou, o total, a média, o
+  maior, e quanto foi esperando o envio e a GPU), a linha `SOTC RB ahead-async` (quantos poderiam
+  ir na frente, quantos foram e a espera média de cada caminho) e o campo `rb wait` nas linhas
+  `SOTCSTALL`; essas medidas valem mesmo com o switch desligado.
+- `SOTC_RB_PREFETCH=1` (experimental, desligado; só age junto com `SOTC_RB_OWNER=1`): nos quadros
+  travados as threads do jogo passavam 60–90 ms esperando readbacks (até ~126 por quadro), quase
+  sempre das mesmas janelas a cada quadro. Uma janela lida em pelo menos 2 dos 3 quadros
+  anteriores passa a ser "recorrente"; quando a GPU escreve nela, a cópia dos trechos escritos
+  vai para a memória de staging logo depois do comando, no mesmo envio, e fica como dona dessas
+  páginas. Quando o jogo lê a janela e a cópia já terminou, ela é aplicada na hora, sem esperar a
+  GPU. Nada é escrito na memória do jogo antes dessa leitura e nenhuma proteção de página muda:
+  qualquer escrita posterior nesses bytes (GPU, upload, liberação de memória, outro readback)
+  descarta a cópia, e uma cópia não pedida em `SOTC_RB_PREFETCH_TICKS` envios (8) é descartada;
+  nos dois casos a leitura segue o caminho normal. Limites: `SOTC_RB_PREFETCH_MAX` cópias ao mesmo
+  tempo (32) e `SOTC_RB_PREFETCH_MB` de staging (4). Com `SOTC_FPS=1`, linha `SOTC RB prefetch`
+  (emitidas, usadas e a espera economizada estimada, expiradas, descartadas, puladas pelos
+  limites, ainda na GPU na hora da leitura) e o campo `rb pf` nas linhas `SOTCSTALL`.
+- `SOTC_HEAP_GUARD_RUNS=1` (experimental, desligado): a proteção do heap do jogo durante os
+  readbacks é refeita ~100 vezes por segundo ao carregar áreas; cada vez ela localizava de novo
+  onde fica cada pedaço da memória que lê. Agora reaproveita isso enquanto o mapa de memória não
+  muda. Diagnóstico: linha `SOTC readbacks redone synchronously` (readbacks que ficaram velhos e
+  foram refeitos esperando a GPU) com `SOTC_FPS=1`.
+- `SOTC_CARVE_NOSTOP=1` (experimental, desligado): ao entrar em área nova o jogo libera pedaços
+  de 64 KiB-1,4 MiB dentro dos heaps grandes, e cada liberação dividia uma visão de memória
+  parando todas as threads do jogo (738 vezes numa sessão, até 218 ms parados a cada 5 s). Quando
+  a parte da visão que fica não tem páginas bloqueadas para leitura (dado da GPU) nem pilha de
+  fibra, a
+  divisão acontece com o jogo rodando: uma thread que toque ali no meio espera e repete o acesso.
+  Páginas protegidas só contra escrita voltam graváveis e são marcadas como escritas pela CPU
+  (reenviadas no próximo uso). `SOTC_CARVE_LOG=1` mostra por que cada divisão ainda parou.
+  As outras ainda param, mas a suspensão das threads agora é feita em paralelo. Linha
+  `SOTC view splits without stopping the game` com `SOTC_FPS=1`.
+- `SOTC_VIEW_CHUNK_KB=64` (experimental, desligado): a memória do jogo é mapeada em visões de 64 KiB;
+  ao entrar em área nova o jogo remapeia páginas de 64 KiB dentro dos heaps grandes
+  (`sceKernelBatchMap`), e com visões de 2 MiB cada primeiro remapeamento dividia uma visão e
+  parava todas as threads do jogo (até 87 ms a cada 5 s). `SOTC_CARVE_LOG=1` registra cada divisão
+  que ainda acontecer (quem pediu, endereço, alinhamento e tempo parado).
+  **Não recomendado:** com ~150 mil visões cada mudança de proteção vira dezenas de chamadas,
+  e o jogo caiu para 2-4 FPS no teste.
+- `SOTC_ASYNC_TEXTURE_UPLOAD=1` (experimental, desligado): a cópia da memória do jogo para o
+  upload de texturas usa o mesmo pool de cópia e a mesma cerca de escrita do `SOTC_ASYNC_UPLOAD`.
+- `SOTC_IMAGE_POOL_MB=<n>` (desligado): reserva n MiB de memória de vídeo para texturas no boot,
+  e as texturas novas não esperam mais `vkAllocateMemory` ao carregar uma área.
+- `SOTC_ASYNC_IMAGE_CREATE=1` (experimental, desligado): o command processor lê as texturas de
+  cada desenho antes da thread de draws e, para as que ainda não existem, dois workers criam a
+  imagem Vulkan com a memória dela (~1 ms cada ao carregar uma área) enquanto isso; a thread de
+  draws pega a imagem pronta. Sem reservar memória de vídeo: só dentro do orçamento, no máximo
+  128 imagens/384 MiB adiantadas, e as que ninguém usa em 2 s são liberadas. Linha
+  `SOTC async image create` com `SOTC_FPS=1`.
+- `SOTC_HOT_PAGES=1` (experimental, desligado): páginas que o jogo reescreve a cada frame ficam
+  sem proteção por 2 s (`SOTC_HOT_PAGES_MS`) em vez de gerar uma falta de página por frame; são
+  reenviadas nos syncs (o `SOTC_HASH_SMALL` pula as que não mudaram). No máximo 1024 páginas
+  (`SOTC_HOT_PAGES_MAX`). Linha `SOTC hot pages` com `SOTC_FPS=1`. **Não recomendado:** no teste
+  reenviou 0,6-1,7 GB a cada 5 s e copiou buffers de vértices no meio da escrita do jogo
+  (vértices piscando, mais travadas).
+- Build: libc++ ligada estaticamente (sem `libc++.dll`), xxhash compilado inline, e três custos
+  tirados do caminho quente da thread de draws (nomes de depuração de imagens montados com os
+  nomes desligados, a checagem do nível de log e a do `SOTC_OPT_OFF`).
+- `SOTC_STAGING_LARGE_POW2=1` (experimental, desligado): buffers de staging grandes em classes de
+  potência de dois, reaproveitados até 2x o pedido, e até `SOTC_STAGING_LARGE_KEEP_MB` (256)
+  mantidos ociosos em vez de alocados de novo a cada rajada de streaming.
 - `SOTC_ASYNC_UPLOAD=1` (experimental, desligado): a cópia da CPU de uploads grandes de buffer
   (a partir de `SOTC_ASYNC_UPLOAD_MIN_KB`, 256) sai da thread de draws e vai para um pool de
   threads de cópia (`SOTC_ASYNC_UPLOAD_THREADS`, 3); a submissão para a GPU espera as cópias do
@@ -47,6 +356,13 @@
   esperarem a cópia pendente daqueles bytes, então os dados são os mesmos de antes. Páginas
   quentes (que ficam sem proteção) e pilhas das threads ficam na thread de draws. Linha
   `SOTC async upload` com `SOTC_FPS=1`.
+- `SOTC_FENCE_PIECES=1` (experimental, desligado; só vale junto com `SOTC_ASYNC_UPLOAD=1` ou
+  `SOTC_ASYNC_TEXTURE_UPLOAD=1`): a cerca de escrita espera só os pedaços da cópia (até 512 KiB)
+  que leem os bytes escritos, não o upload inteiro (até 16 MiB num sweep de DMA juntado), e a
+  thread do jogo copia ela mesma os pedaços que nenhuma thread de cópia começou. Leituras do jogo
+  não esperam mais a cerca (não mudam o que a cópia lê). Linha `SOTC FENCE` com `SOTC_FPS=1`
+  (esperas e tempo, pedaços copiados pela thread do jogo, leituras que passaram sem esperar); as
+  linhas `SOTCSTALL` ganham o tempo da cerca no quadro (`fence ... ms`).
 - `SOTC_HOST_IMPORT=1` (experimental, desligado): uploads grandes de buffer (a partir de
   `SOTC_HOST_IMPORT_MIN_KB`, 256) são copiados pelo motor de cópia da GPU direto da memória do
   jogo, importada com `VK_EXT_external_memory_host` em pedaços de 64 MiB sob demanda (no máximo
@@ -57,6 +373,18 @@
   (núcleos P/E), os workers de compilação nos núcleos E.
 - Diagnóstico (`SOTC_FPS=1`): linhas `SOTC unmap`, `SOTC FASTBIND`, `SOTC arena tick waits` e o
   motivo de cada `SOTC SYNC PIPELINE`; `SOTC_CMD_STATS=1` conta os pacotes `SET_PREDICATION`.
+- `SOTC_CP_IDLE_US=<µs>` (experimental, desligado; sugerido 50): quando nenhuma fila do command
+  processor avança por esse tempo (todas esperando um label, um semáforo ou a CPU do jogo), a
+  thread dorme até ser avisada ou por no máximo `SOTC_CP_IDLE_TIMEOUT_US` (200 µs), em vez de
+  girar a 100% de um núcleo com `yield` (nos quadros de travada eram ~140 ms de CPU em 150 ms).
+  Labels, cercas e dados escritos pela thread de draws, labels de flip, novos envios e comandos
+  acordam a thread na hora; o que só a CPU do jogo escreve é visto no fim do timeout. Antes de
+  dormir ela continua girando como hoje, então esperas curtas não mudam.
+- Diagnóstico (`SOTC_FPS=1`): linha `SOTC CP spin` (tempo por quadro em que o command processor
+  só re-testou esperas, rodadas sem progresso por tipo de espera, sonos, timeouts e a latência
+  média do aviso até acordar) e `spin ... ms` nas linhas `SOTCSTALL`. O tempo de `parse` passa a
+  contar só as retomadas que avançaram (antes incluía o giro) e o giro não lê mais o relógio a
+  cada retomada, o que custava ~5% da thread com `SOTC_FPS`.
 - Arquitetura-alvo e plano de migração: `docs/ARCHITECTURE-TARGET.md`.
 
 ## 0.60.6-C3 — 2026-10-27

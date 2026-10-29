@@ -435,6 +435,43 @@ public:
     /// Waits on the CPU until the newest copy has finished (readbacks ahead of the queue).
     void WaitLastCopy();
 
+    /// sotc: SOTC_RB_TICK=1. One buffer readback copy (arena -> download staging).
+    struct ReadbackRegion {
+        vk::Buffer src;
+        vk::Buffer dst;
+        std::span<const vk::BufferCopy> copies;
+    };
+    /// sotc: SOTC_RB_TICK=1. Copies the regions on the transfer queue, after graphics tick
+    /// graphics_tick (already flushed: the caller knows nothing newer wrote them) and nothing
+    /// newer, and returns the value of the transfer timeline that is signalled when they ran and
+    /// their data is visible to the host (0: no free slot, nothing submitted). The slots are a
+    /// ring of their own, apart from the upload ones. Does NOT make the next graphics submit
+    /// wait: RequireWait does, when a write to the bytes comes (write after read). It does bump
+    /// last_tick, so Scheduler::Finish and sparse binds (unbinds) see it.
+    u64 ReadbackCopy(u64 graphics_tick, std::span<const ReadbackRegion> regions);
+
+    /// sotc: SOTC_RB_TICK=1. The next graphics submit waits for this timeline value.
+    void RequireWait(u64 value);
+
+    /// sotc: SOTC_RB_TICK=1. Counter of the transfer timeline (any thread).
+    [[nodiscard]] u64 Completed() const;
+
+    /// sotc: SOTC_RB_TICK=1. Waits until the timeline reached value: polls up to spin_us
+    /// microseconds, then blocks.
+    void WaitValue(u64 value, u32 spin_us);
+
+    /// sotc: SOTC_RB_TICK=1. Value of the newest readback copy (0: none). Any thread.
+    [[nodiscard]] u64 LastReadbackTick() const noexcept {
+        return rb_last_tick.load(std::memory_order_acquire);
+    }
+
+    /// sotc: timeline value of the newest copy submitted (0: none yet). SOTC_RB_ASYNC_AHEAD
+    /// waits for it on the GPU instead of the CPU (WaitLastCopy).
+    [[nodiscard]] u64 LastTick() {
+        const std::scoped_lock lk{mutex};
+        return last_tick;
+    }
+
 private:
     static constexpr u32 NumSlots = 8;
     struct Slot {
@@ -453,6 +490,14 @@ private:
     u64 next_tick{1};
     u64 last_tick{};
     u64 pending_tick{};
+    // sotc: SOTC_RB_TICK: the readback command buffers (their own pool and ring).
+    static constexpr u32 NumRbSlots = 16;
+    vk::UniqueCommandPool rb_pool;
+    std::array<Slot, NumRbSlots> rb_slots{};
+    u32 rb_next_slot{};
+    std::atomic<u64> rb_last_tick{0};
+    bool rb_enabled{};
+    bool upload_routing{}; ///< SOTC_XFER_QUEUE: uploads on this queue order against readbacks
     std::mutex mutex;
 };
 
@@ -510,12 +555,61 @@ public:
         return true;
     }
 
+    /// sotc: SOTC_RB_TICK, see XferQueue::ReadbackCopy / RequireWait / Completed / WaitValue.
+    /// 0 / false without the transfer queue.
+    u64 XferReadbackCopy(u64 graphics_tick, std::span<const XferQueue::ReadbackRegion> regions) {
+        return xfer ? xfer->ReadbackCopy(graphics_tick, regions) : 0;
+    }
+    void XferRequireWait(u64 value) {
+        if (xfer) {
+            xfer->RequireWait(value);
+        }
+    }
+    [[nodiscard]] bool XferDone(u64 value) const {
+        return !xfer || xfer->Completed() >= value;
+    }
+    void XferWaitValue(u64 value, u32 spin_us) {
+        if (xfer) {
+            xfer->WaitValue(value, spin_us);
+        }
+    }
+    [[nodiscard]] u64 XferLastReadbackTick() const noexcept {
+        return xfer ? xfer->LastReadbackTick() : 0;
+    }
+    [[nodiscard]] vk::Semaphore XferSemaphore() const noexcept {
+        return xfer ? xfer->Handle() : vk::Semaphore{};
+    }
+
     /// Begins a one-off command buffer that is submitted ahead of the one being recorded, for
     /// work that only depends on already submitted commands (readbacks of their results).
     vk::CommandBuffer BeginAhead();
 
     /// Submits the command buffer from BeginAhead after all submitted work and waits for it.
     void SubmitAheadAndWait();
+
+    /// sotc: SOTC_RB_ASYNC_AHEAD=1 (BufferCache::BeginAsyncReadback). Producer thread only.
+    /// Begins a command buffer from a pool of NumAheadSlots, for copies that read only what
+    /// submitted ticks wrote. Null when the next slot's previous copy is still on the GPU (the
+    /// caller takes the usual path then). Unlike BeginAhead nothing is waited for here or at the
+    /// submit: the guest thread waits for the returned value (WaitAhead).
+    vk::CommandBuffer BeginAheadAsync();
+
+    /// sotc: submits the command buffer from BeginAheadAsync without waiting and returns the
+    /// value of the ahead timeline it signals. With the recording thread the submit is a block of
+    /// its stream, so it lands on the queue after the submits of every tick flushed before (they
+    /// are earlier in the stream) and before the submit of the tick being recorded; without it,
+    /// it is queued here, the flushed ticks being on the queue already. Either way it does not
+    /// flush the tick being recorded nor wait for its async uploads. It waits on the GPU for the
+    /// newest transfer-queue copy (the graphics queue does not order those).
+    u64 SubmitAheadAsync();
+
+    /// sotc: true once the ahead copy that signals value has completed. Any thread.
+    [[nodiscard]] bool IsAheadDone(u64 value);
+
+    /// sotc: waits until the ahead copy of value is on the queue (the recording thread may not
+    /// have reached it yet), then until it completed. Any thread; for the guest's split timing.
+    void WaitAheadSubmitted(u64 value);
+    void WaitAhead(u64 value);
 
     /// Attempts to execute operations whose tick the GPU has caught up with.
     void PopPendingOperations();
@@ -665,6 +759,22 @@ private:
     vk::UniqueFence ahead_fence;
     u64 ahead_sequence{};
     bool ahead_unfinished{};
+    // sotc: SOTC_RB_ASYNC_AHEAD (BeginAheadAsync). One pool per slot, so recording into a slot
+    // on the producer never shares a pool with a submit on the recording thread. A slot is reused
+    // only after the ahead timeline reached its value.
+    struct AheadSlot {
+        vk::UniqueCommandPool pool;
+        vk::CommandBuffer cmdbuf{};
+        u64 value{}; ///< ahead timeline value of its last submit; 0: never used
+    };
+    static constexpr u32 NumAheadSlots = 16;
+    std::array<AheadSlot, NumAheadSlots> ahead_slots{};
+    vk::UniqueSemaphore ahead_timeline;
+    AheadSlot* ahead_slot_open{};
+    u32 ahead_slot_next{};
+    u64 ahead_value_last{};                 ///< producer: newest value handed out
+    std::atomic<u64> ahead_value_submitted{0}; ///< newest value on the queue
+    std::atomic<u64> ahead_value_done{0};      ///< cache of the timeline's counter
     tracy::VkCtxScope* profiler_scope{};
     /// Newest tick the recording thread has put on the queue.
     std::atomic<u64> recorded_submit_tick{0};

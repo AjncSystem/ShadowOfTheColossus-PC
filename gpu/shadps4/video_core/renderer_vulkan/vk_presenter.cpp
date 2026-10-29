@@ -1423,10 +1423,13 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             const char* v = std::getenv("SOTC_FRAME_LOG");
             return v ? std::strtoull(v, nullptr, 10) : 0ULL;
         }();
-        if (every != 0) {
+        // sotc: SOTC_FPS=1 also runs the SOTCSTALL check below (without the SOTCFRAME lines), so
+        // slow frames of normal play are attributed in the session log.
+        if (every != 0 || SotcStats::kFpsLog) {
             static u64 frames = 0;
             static const auto t0 = std::chrono::steady_clock::now();
-            if (++frames % every == 0) {
+            ++frames;
+            if (every != 0 && frames % every == 0) {
                 const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                                     std::chrono::steady_clock::now() - t0)
                                     .count();
@@ -1446,24 +1449,84 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             const long long now_us = std::chrono::duration_cast<std::chrono::microseconds>(
                                          std::chrono::steady_clock::now() - t0)
                                          .count();
+            // sotc: the SOTC_FPS report (driver.cpp) resets readbacks/readback_ns every 5 s, so
+            // their deltas fall back to the new value after a reset instead of wrapping.
             const u64 cur[11] = {SotcStats::pipelines_new.load(), SotcStats::pipeline_ns.load(),
                                 SotcStats::shaders_compiled.load(), SotcStats::shader_ns.load(),
                                 SotcStats::images_new.load(), SotcStats::image_ns.load(),
                                 SotcStats::readbacks.load(), SotcStats::readback_ns.load(),
                                 SotcStats::image_query_ns.load(), SotcStats::image_alloc_ns.load(),
                                 SotcStats::image_dedicated.load()};
+            // sotc: SOTC_FPS: the thread accounting of this frame (snapshot at every game flip,
+            // so the figures cover exactly the time since the previous one).
+            static SotcStats::FrameAccount last_account{};
+            char account_text[768] = ""; // sotc: 512 truncated the tail once many fields were appended
+            if (SotcStats::kFpsLog) {
+                const SotcStats::FrameAccount now_account = SotcStats::TakeAccount();
+                const SotcStats::FrameAccount d =
+                    SotcStats::DiffAccount(now_account, last_account);
+                last_account = now_account;
+                using SotcStats::WaitGpu, SotcStats::WaitRecorder, SotcStats::WaitUpload,
+                    SotcStats::WaitTcLock;
+                const auto ms = [](u64 ns) { return ns / 1e6; };
+                const auto n = [](u64 v) { return static_cast<unsigned long long>(v); };
+                std::snprintf(
+                    account_text, sizeof(account_text),
+                    "; cpu draw %.1f cp %.1f rec %.1f passsec %.1f upload %.1f ms; draw waits "
+                    "gpu %.1f (%llu) rec %.1f (%llu) upload %.1f (%llu) tc %.1f (%llu) ms; cp "
+                    "parse %.1f blocked %.1f spin %.1f ms; rec busy %.1f upload-wait %.1f submit %.1f ms; "
+                    "fence %.1f ms", // sotc: SOTC_ASYNC_UPLOAD write fence waits
+                    ms(d.cpu_ns[SotcStats::RoleDraw]), ms(d.cpu_ns[SotcStats::RoleCp]),
+                    ms(d.cpu_ns[SotcStats::RoleRecorder]),
+                    ms(d.cpu_ns[SotcStats::RolePassSecondary]),
+                    ms(d.cpu_ns[SotcStats::RoleUpload]), ms(d.wait_ns[WaitGpu]),
+                    n(d.wait_count[WaitGpu]), ms(d.wait_ns[WaitRecorder]),
+                    n(d.wait_count[WaitRecorder]), ms(d.wait_ns[WaitUpload]),
+                    n(d.wait_count[WaitUpload]), ms(d.wait_ns[WaitTcLock]),
+                    n(d.wait_count[WaitTcLock]), ms(d.parse_ns), ms(d.blocked_ns),
+                    ms(d.spin_ns), // sotc: CP no-progress spin (Liverpool::Process)
+                    ms(d.rec_busy), ms(d.rec_upload), ms(d.rec_submit), ms(d.fence));
+                // sotc: guest threads' wall-clock wait in asynchronous readbacks this frame
+                const size_t used = std::strlen(account_text);
+                std::snprintf(account_text + used, sizeof(account_text) - used,
+                              "; rb wait %.1f ms (%llu), rb adj %llu", ms(d.rb_wait_ns),
+                              n(d.rb_wait_count), n(d.rb_adj)); // sotc: adjacent requests
+                // sotc: SOTC_RB_PREFETCH: prefetches applied at a guest fault this frame
+                const size_t used_pf = std::strlen(account_text);
+                if (used_pf + 1 < sizeof(account_text)) {
+                    std::snprintf(account_text + used_pf, sizeof(account_text) - used_pf,
+                                  ", rb pf %llu", n(d.rb_pf));
+                }
+                // sotc: guest write faults this frame (FaultStat)
+                const size_t used_fl = std::strlen(account_text);
+                if (used_fl + 1 < sizeof(account_text)) {
+                    std::snprintf(account_text + used_fl, sizeof(account_text) - used_fl,
+                                  ", faults %llu (%.1f ms)", n(d.fault_count), ms(d.fault_ns));
+                }
+                // sotc: SOTC_HRR dry run: guest readbacks this frame that hit a would-be range
+                static u64 last_hrr = 0;
+                const u64 hrr_now = SotcStats::hrr_faults_all.load(std::memory_order_relaxed);
+                const size_t used_hrr = std::strlen(account_text);
+                if (hrr_now != 0 && used_hrr + 1 < sizeof(account_text)) {
+                    std::snprintf(account_text + used_hrr, sizeof(account_text) - used_hrr,
+                                  ", hrr %llu", n(hrr_now - last_hrr));
+                }
+                last_hrr = hrr_now;
+            }
             if (last_us >= 0 && now_us - last_us > stall_us) {
                 std::fprintf(stderr,
                              "SOTCSTALL frame %llu %.0f ms: pipelines %llu (%.0f ms), shaders %llu "
                              "(%.0f ms), images %llu (%.0f ms: query %.0f, alloc %.0f, %llu dedicated), "
-                             "readbacks %llu (%.0f ms)\n",
+                             "readbacks %llu (%.0f ms)%s\n",
                              static_cast<unsigned long long>(frames), (now_us - last_us) / 1e3,
                              static_cast<unsigned long long>(cur[0] - last[0]), (cur[1] - last[1]) / 1e6,
                              static_cast<unsigned long long>(cur[2] - last[2]), (cur[3] - last[3]) / 1e6,
                              static_cast<unsigned long long>(cur[4] - last[4]), (cur[5] - last[5]) / 1e6,
                              (cur[8] - last[8]) / 1e6, (cur[9] - last[9]) / 1e6,
                              static_cast<unsigned long long>(cur[10] - last[10]),
-                             static_cast<unsigned long long>(cur[6] - last[6]), (cur[7] - last[7]) / 1e6);
+                             static_cast<unsigned long long>(cur[6] >= last[6] ? cur[6] - last[6] : cur[6]),
+                             (cur[7] >= last[7] ? cur[7] - last[7] : cur[7]) / 1e6,
+                             account_text);
             }
             last_us = now_us;
             std::copy(std::begin(cur), std::end(cur), std::begin(last));

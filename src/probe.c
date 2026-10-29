@@ -847,6 +847,7 @@ uintptr_t runtime_sotc_heap(void) { return heap_chosen; }
  * heaps (created when a world loads, e.g. the last colossus' area) include more heaps of the
  * guarded heap's class; the GPU side guards those too. 0 until the guarded heap is chosen. */
 #define HEAP_TABLE_OFFSET 0x2dfaab0
+uintptr_t runtime_guest_image(void) { return (uintptr_t)image; }
 uintptr_t runtime_sotc_heap_table(void) { return heap_chosen ? (uintptr_t)(image+HEAP_TABLE_OFFSET) : 0; }
 static int heap_hook_trap(EXCEPTION_POINTERS *info) {
     CONTEXT *c=info->ContextRecord;

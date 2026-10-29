@@ -113,6 +113,51 @@ static ABI int32_t mutex_trylock(GuestMutex **mutex) {
     if (!e) ++locks;
     return e;
 }
+/* sotc: SotC's job workers (bpe::threading::JobSystemScheduler::DoJobScheduling, EU 1.01) poll
+ * the scheduler lock without pause while a job waits on a counter: on PS4 each has a core of
+ * its own. A worker whose polls keep coming back empty (the unlock of the no-job path) naps
+ * between them; a job (the unlock of the job path) ends the streak. On a 4-core PC the polling
+ * took the cores of the renderer and the game thread. SOTC_POLL_NAP_US (default 100, 0: off),
+ * SOTC_POLL_STREAK (default 64 empty polls). Ported from MMadmer's fork (c301eef, Madmer). */
+#ifdef _WIN32
+static uintptr_t poll_empty_site, poll_job_site;
+static uint64_t poll_nap_ns;
+static unsigned poll_streak_limit;
+static int poll_ready;
+static __thread unsigned poll_streak;
+static uintptr_t call_target(uintptr_t call) {
+    int32_t rel;
+    memcpy(&rel, (const void *)(call + 1), sizeof(rel));
+    return call + 5 + (uintptr_t)(intptr_t)rel;
+}
+static void poll_setup(void) {
+    const char *v = getenv("SOTC_POLL_NAP_US");
+    poll_nap_ns = (v ? strtoull(v, NULL, 10) : 100) * 1000;
+    v = getenv("SOTC_POLL_STREAK");
+    poll_streak_limit = v ? (unsigned)strtoul(v, NULL, 10) : 64;
+    const uintptr_t base = runtime_guest_image();
+    /* Both sites must still be calls of the scheduler's unlock thunk. */
+    const uintptr_t empty_call = base + 0x38af3, job_call = base + 0x38a60, unlock = base + 0x3b3c0;
+    if (base && poll_nap_ns && *(const uint8_t *)empty_call == 0xe8 && *(const uint8_t *)job_call == 0xe8 &&
+        call_target(empty_call) == unlock && call_target(job_call) == unlock) {
+        poll_empty_site = empty_call + 5;
+        poll_job_site = job_call + 5;
+    }
+    fprintf(stderr, "Runtime: job worker poll nap %s (%llu us after %u empty polls)\n",
+            poll_empty_site ? "on" : "off", (unsigned long long)(poll_nap_ns / 1000), poll_streak_limit);
+    __atomic_store_n(&poll_ready, 1, __ATOMIC_RELEASE);
+}
+static void poll_nap(uintptr_t site) {
+    if (!__atomic_load_n(&poll_ready, __ATOMIC_ACQUIRE)) poll_setup();
+    if (site == poll_empty_site) {
+        if (++poll_streak >= poll_streak_limit) compat_sleep_ns(poll_nap_ns);
+    } else if (site == poll_job_site) {
+        poll_streak = 0;
+    }
+}
+#else
+static void poll_nap(uintptr_t site) { (void)site; }
+#endif
 static ABI int32_t mutex_unlock(GuestMutex **mutex) {
     if (!mutex || (uintptr_t)*mutex == 2) return orbis_error(EINVAL);
     if ((uintptr_t)*mutex < 2) return orbis_error(EPERM);
@@ -122,8 +167,10 @@ static ABI int32_t mutex_unlock(GuestMutex **mutex) {
     if (!m->depth) m->owner = 0;
     int32_t e = orbis_error(pthread_mutex_unlock(&m->native));
     if (e) m->depth = depth;
-    if (!e) ++unlocks;
-    else {
+    if (!e) {
+        ++unlocks;
+        poll_nap((uintptr_t)__builtin_return_address(0));
+    } else {
         static _Atomic unsigned failures;
         if (failures++ < 8)
             fprintf(stderr, "Runtime: mutex %p unlock failed 0x%x from %p\n", (void *)*mutex, (unsigned)e,

@@ -2,6 +2,7 @@
 
 [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
+> [!CAUTION]
 > **No game or Sony files are included.** You need your own game dump and, for sound, two
 > modules from your own console. This project is not affiliated with Sony Interactive
 > Entertainment or Bluepoint Games.

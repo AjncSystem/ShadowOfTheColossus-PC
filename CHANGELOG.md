@@ -1,6 +1,37 @@
 # Changelog
 
-## Não lançado — desempenho no streaming e correções visuais
+## 0.70.1 — 2026-10-29
+Correções e melhorias por cima da 0.70, que vem inteira (trocas de área, queda `0x49800`, DLSS no
+modo Pro, HUD com geração de quadros).
+
+**Correções**
+- Manchas coloridas nas malhas: as texturas pequenas agora são comparadas inteiras.
+- Cache de shaders que não se atualizava: ~1.850 pipelines eram recusados e ~2.100 shaders
+  traduzidos de novo a cada sessão. **O cache de shaders é refeito na primeira abertura.**
+- Uploads pequenos que podiam chegar velhos à GPU.
+- Uma textura ampliada podia ficar preta para sempre com o limite de 32 MB por quadro da 0.70.
+- Sombras que piscavam ao carregar uma área: os passes de sombra passam na frente na fila de
+  compilação, então a piscada é mais curta.
+- Uma condição de corrida na marcação das páginas lidas pelos shaders.
+
+**Melhorias**
+- Menos travadas ao andar pelo mapa: o timer do Windows passa a 1 ms, e o ritmo de quadros usa um
+  timer de alta resolução.
+- Menos trabalho por desenho: o formato dos vértices só é reenviado quando muda, e chamadas
+  vizinhas de proteção de memória são juntadas.
+- Build sem `libc++.dll` e com o caminho quente da thread de desenho mais leve.
+- Lançador: a aba **Imagem e FPS** ganhou a seção **Ajustes experimentais**. Ela traz as chaves
+  criadas contra as travadas, cada uma com uma descrição curta, todas no valor padrão.
+
+**Experimental (desligado por padrão)**
+- Dezenas de chaves para a thread de desenho (novo caminho de bind, cache de binds, memória dos
+  alvos de render), para os readbacks, para a proteção de memória e para os uploads, além de
+  diagnósticos (`SOTC_TRACE`, `SOTC_OP_PHASES`, `SOTC_FPS_LEAN`). Cada uma tem os seus resultados
+  medidos nos detalhes abaixo; a maioria não deu ganho sozinha.
+
+<details>
+<summary>Detalhes técnicos: medições e chaves experimentais</summary>
+
 - **Tudo da 0.70 incluído** (trocas de área, correção da queda `0x49800`, DLSS no modo Pro, HUD
   com geração de quadros, LOD feedback, `SOTC_DRAW_SPLIT`, `SOTC_PC_MEMORY`), junto com o
   trabalho desta versão. Os padrões da 0.70 valem: as correções de troca de área vêm ligadas
@@ -571,6 +602,8 @@
   contar só as retomadas que avançaram (antes incluía o giro) e o giro não lê mais o relógio a
   cada retomada, o que custava ~5% da thread com `SOTC_FPS`.
 - Arquitetura-alvo e plano de migração: `docs/ARCHITECTURE-TARGET.md`.
+
+</details>
 
 ## 0.70 — 2026-10-29
 > ⚠️ **Atenção: instale o jogo num SSD (de preferência NVMe).** Cada área nova lê centenas de MB

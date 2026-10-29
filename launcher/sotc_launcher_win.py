@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 
+import sotc_tuning
 import sotc_update
 
 FROZEN = getattr(sys, 'frozen', False)
@@ -41,7 +42,7 @@ CONFIG_FILE = CONFIG_DIR / 'launcher_settings.json'
 from sotc_modes import GAMES  # noqa: E402
 GAME_ID = 'CUSA08809'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.70'
+VERSION = '0.70.1'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -169,6 +170,8 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'dlss_mode': 'quality', 'dlss_sharpen': '0', 'dlss_ui_sharpen': '3', 'dlss_sky_sharpen': '2',
                 'dlss_compare': False,
                 'check_updates': True, 'skip_version': ''}
+# The tuning switches of the streaming-stutter work, each at the build's default (sotc_tuning.py).
+APP_DEFAULTS.update(sotc_tuning.defaults())
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
 KEY_INPUTS = [
     ('move_up', 'W', ('Andar para frente', 'Move forward')), ('move_down', 'S', ('Andar para trás', 'Move back')),
@@ -731,6 +734,8 @@ def game_environment(s):
     if not s.get('rumble', True):
         env['SOTC_RUMBLE'] = '0'
     env['BB_CONFIG'] = str(PORT_DIR / 'sotc.ini')
+    # The tuning switches not at their default; the extra variables below still win.
+    env.update(sotc_tuning.environment(s))
     for item in str(s['extra_env']).split():
         if '=' in item:
             key, value = item.split('=', 1)
@@ -1426,6 +1431,51 @@ class Launcher:
         self.section(f, _('Tela', 'Display'))
         self.check(f, 'fullscreen', _('Tela cheia', 'Fullscreen'))
         self.row(f, _('Apresentação', 'Presentation'), self.choice(f, 'present_mode', PRESENT_MODES))
+        self.build_tuning(f)
+
+    def build_tuning(self, f):
+        """The tuning switches of the streaming-stutter work (sotc_tuning.py), grouped, each with
+        its variable name in the hint."""
+        ttk = self.ttk
+        self.section(f, _('Ajustes experimentais (travadas no streaming)',
+                          'Experimental tuning (streaming stutters)'), top=24)
+        self.note(f, _('As chaves criadas no trabalho contra as travadas, todas no valor padrão. Quase todas '
+                       'são experimentais ou só medem; mude uma por vez e compare. O campo "Variáveis extras" '
+                       '(aba Avançado) vale por cima destas.',
+                       'The switches made in the work against the stutters, all at their default. Almost all '
+                       'are experimental or only measure; change one at a time and compare. The "Extra '
+                       'variables" field (Advanced page) applies on top of these.'), top=2)
+
+        def reset():
+            for name, kind, *_rest in sotc_tuning.TUNING:
+                self.var(sotc_tuning.setting_key(name)).set(APP_DEFAULTS[sotc_tuning.setting_key(name)])
+        ttk.Button(f, text=_('Voltar todos ao padrão', 'Reset all to default'), command=reset).grid(
+            row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(6, 0))
+        def wide_row(title, make_widget, hint):
+            # Title and field on one line, the hint below across the page (as self.check does):
+            # in the two-column self.row the long titles pushed the hints off the right edge.
+            r = self.next_row(f)
+            holder = ttk.Frame(f)
+            holder.grid(row=r, column=0, columnspan=2, sticky='w', pady=(6, 0))
+            ttk.Label(holder, text=title).pack(side='left', padx=(0, 12))
+            make_widget(holder).pack(side='left')
+            ttk.Label(f, text=hint, style='Muted.TLabel', wraplength=self.px(640), justify='left').grid(
+                row=r + 1, column=0, columnspan=2, sticky='w', padx=(26, 0))
+
+        titles = dict(sotc_tuning.GROUPS)
+        group = None
+        for name, kind, row_group, title, hint, _default, options in sotc_tuning.TUNING:
+            if row_group != group:
+                group = row_group
+                self.section(f, _(*titles[group]), top=14)
+            key = sotc_tuning.setting_key(name)
+            text = '{} ({})'.format(_(*hint), name)  # the hint already gives the default
+            if kind in ('flag', 'flag_on'):
+                self.check(f, key, _(*title), text)
+            elif kind == 'choice':
+                wide_row(_(*title), lambda p, k=key, o=list(options): self.choice(p, k, o, 34), text)
+            else:
+                wide_row(_(*title), lambda p, k=key: ttk.Entry(p, textvariable=self.var(k), width=14), text)
 
     def build_controls(self):
         ttk = self.ttk

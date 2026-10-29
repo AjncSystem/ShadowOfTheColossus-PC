@@ -5,6 +5,9 @@ Correções e melhorias por cima da 0.70, que vem inteira (trocas de área, qued
 modo Pro, HUD com geração de quadros).
 
 **Correções**
+- O logo da Bluepoint e o aviso de salvamento automático não apareciam: o limite de 32 MB de
+  texturas novas por quadro da 0.70 podia adiar a mesma textura para sempre. Agora uma textura
+  espera no máximo 2 quadros.
 - Manchas coloridas nas malhas: as texturas pequenas agora são comparadas inteiras.
 - Cache de shaders que não se atualizava: ~1.850 pipelines eram recusados e ~2.100 shaders
   traduzidos de novo a cada sessão. **O cache de shaders é refeito na primeira abertura.**

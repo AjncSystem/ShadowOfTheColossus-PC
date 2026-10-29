@@ -1343,6 +1343,10 @@ void TextureCache::RefreshImage(Image& image) {
     // of each frame always goes through); meanwhile the image holds zeros, put in on the GPU once,
     // so it shows black, never stale memory, and it stays Dirty for the next use.
     // Placed before the host image copy below: that path also has to count as the image's data.
+    // sotc: an image is deferred for at most kMaxDeferFlips flips from its first deferral, then
+    // uploaded whatever the budget: when other uploads used the budget ahead of it in every frame,
+    // it stayed black for good (the Bluepoint logo and the autosave notice never showed, 29 Oct).
+    constexpr u64 kMaxDeferFlips = 2;
     static const u64 upload_budget = [] {
         const char* v = std::getenv("SOTC_UPLOAD_BUDGET_MB");
         return (v ? std::strtoull(v, nullptr, 10) : 32ull) << 20;
@@ -1357,7 +1361,9 @@ void TextureCache::RefreshImage(Image& image) {
     }
     if (upload_budget && !image.sotc_has_data && !is_gpu_modified && budget_used &&
         image.info.guest_size >= 256_KB && budget_used + image.info.guest_size > upload_budget &&
-        image.aspect_mask == vk::ImageAspectFlagBits::eColor) {
+        image.aspect_mask == vk::ImageAspectFlagBits::eColor &&
+        (image.sotc_deferred_flip == ~0ull ||
+         budget_flip - image.sotc_deferred_flip < kMaxDeferFlips)) {
         constexpr u64 ZeroBytes = 64_MB;
         bool fits = true;
         auto zero_copies = image_copies;
@@ -1387,6 +1393,9 @@ void TextureCache::RefreshImage(Image& image) {
                 image.flags |= ImageFlagBits::Dirty;
                 image.sotc_zero_filled = true;
                 SotcStats::upload_zero_filled.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (image.sotc_deferred_flip == ~0ull) {
+                image.sotc_deferred_flip = budget_flip; // sotc: see kMaxDeferFlips
             }
             SotcStats::upload_deferred.fetch_add(1, std::memory_order_relaxed);
             SotcStats::upload_deferred_bytes.fetch_add(image.info.guest_size,
@@ -2701,6 +2710,7 @@ void TextureCache::UnparkImage(ImageId image_id) {
     // not zeros, so a deferral zero-fills it again.
     image.sotc_has_data = false;
     image.sotc_zero_filled = false;
+    image.sotc_deferred_flip = ~0ull;
     image.RenewIdentity();
     {
         std::unique_lock lk{download_images_mutex};

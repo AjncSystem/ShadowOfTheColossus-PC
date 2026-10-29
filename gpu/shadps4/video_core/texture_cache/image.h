@@ -223,6 +223,8 @@ public:
     /// sotc: the upload budget (RefreshImage): guest data uploaded once / zeros put in meanwhile.
     bool sotc_has_data{};
     bool sotc_zero_filled{};
+    /// sotc: the flip of the image's first deferral (~0: never deferred); deferrals stop 2 flips on.
+    u64 sotc_deferred_flip{~0ull};
     /// sotc: SOTC_POOL_WATCH: hash of the first 64 KiB of guest memory at the first upload.
     u64 sotc_first_hash{};
     u32 sotc_uploads{};

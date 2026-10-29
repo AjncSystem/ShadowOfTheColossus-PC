@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.70 — 2026-10-29
+> ⚠️ **Atenção: instale o jogo num SSD (de preferência NVMe).** Cada área nova lê centenas de MB
+> de texturas e modelos da pasta do jogo; num HD as trocas de área travam muito mais e podem
+> parar por segundos. Coloque a pasta do jogo (o dump) e, se puder, a pasta do port num SSD.
+
+- **Trocas de área sem o FPS cair perto de zero.** Antes, cada troca de área derrubava o FPS e às
+  vezes forçava telas de carregamento de 1–3 s; o pior quadro passava de meio segundo (534 ms).
+  Agora o pior fica em 58–75 ms, sem tela de carregamento forçada, e o final do jogo vai até os
+  créditos. Ainda se perdem 1–6 quadros em cada troca: é o próximo trabalho. As causas eram a
+  trava da tabela de memória do jogo, cópias de memória remapeando gigabytes, a busca de regiões
+  da GPU refeita a cada escrita, a proteção da memória do jogo percorrendo o mesmo trecho
+  milhares de vezes e muitas texturas novas num quadro só. Agora entram no máximo 32 MB de
+  texturas novas grandes por quadro, e as que ficam para o quadro seguinte aparecem pretas por
+  um instante. Cada correção tem uma chave para desligar (`SOTC_LOCK_WAKE=0`,
+  `SOTC_VIEW_CHUNK_MB=0`, `SOTC_REGION_LOG=0`, `SOTC_REGION_FAST=0`, `SOTC_PROTECT_FAST=0`,
+  `SOTC_WRITE_FAST=0`, `SOTC_BATCH_SPLIT=0`, `SOTC_GUARD_DEDUP=0`, `SOTC_UPLOAD_BUDGET_MB=0`).
+- **Queda rara no alocador do jogo depois de uma carga** (`0x49800`): dois atalhos da proteção da
+  memória do jogo podiam deixar a GPU escrever num bloco que o jogo acabava de liberar. Saem
+  desligados (`SOTC_GUARD_STALE=1` e `SOTC_GUARD_USER_POINTER=1` ligam). Uma sessão de 36 min com
+  6 carregamentos sem queda; se cair, mande o log.
+- **DLSS no modo PS4 Pro a 30 FPS sem a imagem tremer:** o quadro repetido mostrava a imagem sem
+  DLSS.
+- **Geração de quadros (F8) com FSR 1: o HUD fica parado.**
+- **LOD feedback** (`SOTC_LOD_FEEDBACK=1`, experimental) não custa mais ~7 FPS.
+- Diagnóstico: `SOTC_DRAW_SPLIT=1` (com o FPS na tela) mostra no log onde vai o tempo da thread
+  de desenho.
+
 ## 0.60.6-C3 — 2026-10-27
 - **Barra de stamina com DLSS (correção da C2):** a área da barra passou a usar a largura de uma
   tela de 1080 linhas na proporção da saída (1080 × L/A) em vez da largura de renderização. Com

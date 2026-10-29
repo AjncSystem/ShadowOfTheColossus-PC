@@ -215,6 +215,14 @@ def render_patches(elf, ph, size):
             raise SystemExit(f'render size: {address:#x} holds {current}, not 1920/960/1080/540')
         writes.append((address - BASE, values[extra[current]]))
         print(f'Render size: {address:#x} {current:g} scaled too')
+    # sotc: SOTC_SCENE_ASPECT=1 (test): the scene projection setup (0xb0bc6) reads the render aspect at
+    # 0x166633c instead of the display object's, so the object can stay 16:9 for the HUD (SOTC_WIDE_ASPECT=0).
+    if os.environ.get('SOTC_SCENE_ASPECT') == '1':
+        site = 0xb0bc6
+        if image_bytes(elf, ph, site, 8) != bytes.fromhex('498b06c5fa104004'):
+            raise SystemExit(f'scene aspect: unexpected bytes at {site + BASE:#x}')
+        writes.append((site, bytes.fromhex('c5fa1005') + struct.pack('<i', 0x166633c - (site + 8))))
+        print('Scene aspect: projection setup reads the render aspect')
     return writes
 
 

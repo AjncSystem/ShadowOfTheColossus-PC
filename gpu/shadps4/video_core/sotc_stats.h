@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include "video_core/sotc_trace.h" // sotc: SOTC_TRACE
 
 namespace SotcStats {
@@ -42,6 +43,29 @@ inline const bool kFpsLean = [] {
     return v && v[0] == '1';
 }();
 inline const bool kFpsTimers = kFpsLog && !kFpsLean;
+/// sotc: SOTC_CEILING=<sync,tex> (off by default): MEASUREMENT ONLY, the picture is wrong. Skips
+/// a whole part of the draw thread's work to show how much faster it would be if that part cost
+/// nothing: "sync" skips the buffer memory synchronization (uploads of CPU-written bytes and the
+/// re-protection of their pages; residency, labels and command order are kept), "tex" skips the
+/// texture uploads. Never play with it: the GPU reads stale data and readbacks return stale bytes.
+enum CeilingPart : unsigned { CeilingSync = 1, CeilingTex = 2 };
+inline const unsigned kCeiling = [] {
+    const char* v = std::getenv("SOTC_CEILING");
+    unsigned parts = 0;
+    if (v) {
+        const auto has = [v](const char* word) {
+            const char* p = std::strstr(v, word);
+            return p != nullptr;
+        };
+        parts |= has("sync") ? CeilingSync : 0u;
+        parts |= has("tex") ? CeilingTex : 0u;
+        if (parts) {
+            std::fprintf(stderr, "SOTC_CEILING=%s: measurement only, the picture is wrong%c", v,
+                         10);
+        }
+    }
+    return parts;
+}();
 inline const bool kWriteMarks = kFpsLog && !kFpsLean;
 /// sotc: skip BindResources on consecutive draws whose pipeline, push data and resource
 /// handles did not change. On by default (SOTC_FAST_BIND=0 turns it off). In 0.60.5 it left black
@@ -129,6 +153,15 @@ inline const bool kBindCacheFrame = [] {
     };
     return on("SOTC_BIND_CACHE") && on("SOTC_BIND_CACHE_RANGES") && on("SOTC_BIND_CACHE_XTICK") &&
            on("SOTC_BIND_CACHE_FRAME");
+}();
+/// sotc: SOTC_BUFFER_MEMO=1 (off by default): only the buffer binding memo of SOTC_BIND_CACHE_FRAME
+/// (vk_rasterizer.cpp BufferMemo: a read-only V# of a read-only graphics bind reuses the arena and
+/// offset ObtainBuffer gave for the same address, size and mapping while BindVersion is unchanged;
+/// CPU-written ranges are still synchronized and the use stamps made). The rest of the frame-wide
+/// bind cache (which measured worse) stays off. Needs SOTC_BIND_CACHE (the read-only eligibility).
+inline const bool kBufferMemo = [] {
+    const char* v = std::getenv("SOTC_BUFFER_MEMO");
+    return v && v[0] == '1';
 }();
 enum BindFrameReason : uint32_t {
     BfNoEntry,   ///< no entry under the key
@@ -762,7 +795,7 @@ inline void Done(uint64_t lo, uint64_t hi) {
 } // namespace FaultStat
 /// SOTC_CMD_STATS=1: draws, indirect draws (arguments GPU-written / CPU-side / CPU-side and
 /// empty), dispatches, indirect dispatches.
-inline std::atomic<uint64_t> cmd_kinds[6]{};
+inline std::atomic<uint64_t> cmd_kinds[7]{}; // [6]: direct draws with 0 indices or 0 instances
 /// sotc: IT_SET_PREDICATION packets by predication op (0 clear, 1 zpass, 2 primcount, 3 bool64,
 /// other), SOTC_CMD_STATS only; printed as the "SOTC predication" line (videoout/driver.cpp).
 inline std::atomic<uint64_t> pred_ops[5]{};

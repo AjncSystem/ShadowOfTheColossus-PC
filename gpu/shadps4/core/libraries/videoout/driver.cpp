@@ -1256,6 +1256,19 @@ void VideoOutDriver::Flip(const Request& req) {
                              SotcStats::kBindCacheFlushNames[4],
                              static_cast<unsigned long long>(flushes[4]), ranges);
             }
+            // sotc: SOTC_BUFFER_MEMO alone: only the memo's hit rate (the line below needs _FRAME)
+            if (SotcStats::kBufferMemo && !SotcStats::kBindCacheFrame) {
+                const uint64_t memo_hits = SotcStats::bf_memo_hits.exchange(0);
+                const uint64_t memo_misses = SotcStats::bf_memo_misses.exchange(0);
+                const uint64_t memo_repaired = SotcStats::bf_memo_repaired.exchange(0);
+                std::fprintf(stderr, "SOTC BUFFER MEMO hits %llu, misses %llu (%.1f%% hits), repaired %llu%c",
+                             static_cast<unsigned long long>(memo_hits),
+                             static_cast<unsigned long long>(memo_misses),
+                             memo_hits + memo_misses
+                                 ? 100.0 * double(memo_hits) / double(memo_hits + memo_misses)
+                                 : 0.0,
+                             static_cast<unsigned long long>(memo_repaired), 10);
+            }
             if (SotcStats::kBindCacheFrame) { // sotc: SOTC_BIND_CACHE_FRAME (sotc_stats.h)
                 char misses[160]{}, drops[160]{};
                 size_t mi = 0, di = 0;
@@ -1955,14 +1968,14 @@ void VideoOutDriver::Flip(const Request& req) {
             }
             const bool cmd_stats = SotcStats::kCmdStats; // sotc: as the counters (sotc_stats.h)
             if (cmd_stats && flips) {
-                double k[6];
-                for (int i = 0; i < 6; ++i) {
+                double k[7];
+                for (int i = 0; i < 7; ++i) {
                     k[i] = double(SotcStats::cmd_kinds[i].exchange(0)) / flips;
                 }
                 ReportPrintf(report,
-                             "SOTC cmds/frame: draw %.0f, indirect %.0f gpu-args + %.0f cpu-args "
-                             "(%.0f empty), dispatch %.0f, dispatch-indirect %.0f\n",
-                             k[0], k[1], k[2], k[3], k[4], k[5]);
+                             "SOTC cmds/frame: draw %.0f (%.0f empty), indirect %.0f gpu-args + "
+                             "%.0f cpu-args (%.0f empty), dispatch %.0f, dispatch-indirect %.0f\n",
+                             k[0], k[6], k[1], k[2], k[3], k[4], k[5]);
                 // sotc: IT_SET_PREDICATION packets per frame (decoded only, not applied).
                 double p[5];
                 for (int i = 0; i < 5; ++i) {

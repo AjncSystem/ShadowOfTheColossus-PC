@@ -1492,6 +1492,196 @@ void MdiNote(const void* pipeline, bool indexed, VAddr base, u64 offset, u32 str
         }
     }
 }
+
+// sotc: SOTC_CS_STATS=1 (off by default; a measurement for a possible compute fast bind). Each
+// dispatch's bind state is keyed by the pipeline, the resource sharps it binds and its user data
+// and flat buffer. Counts how many dispatches repeat the previous dispatch's key ("same"), and of
+// those how many also saw no buffer/texture/memory change in between in the same command buffer
+// ("clean": what a fast bind could skip), or repeat any key bound earlier in the same command
+// buffer ("seen"); and how much time BindResources takes for each group. One line every 5 s.
+const bool kCsStats = [] {
+    const char* v = std::getenv("SOTC_CS_STATS");
+    return v && v[0] == '1';
+}();
+struct CsStatsState {
+    u64 prev_key = 0, prev_gen = 0, tick = ~u64{0};
+    bool prev_ok = false;
+    std::unordered_set<u64> seen;
+    u64 dispatches = 0, keyed = 0, writing = 0, same = 0, clean = 0, seen_hits = 0;
+    u64 ns_all = 0, ns_same = 0, ns_clean = 0, ns_seen = 0;
+    // The same with the resources-only key (BindResourceHash: the sharps, no constants).
+    u64 res_prev = 0, res_prev_gen = 0;
+    bool res_prev_ok = false;
+    std::unordered_set<u64> res_seen;
+    u64 res_keyed = 0, res_same = 0, res_clean = 0, res_seen_hits = 0;
+    u64 ns_res_same = 0, ns_res_clean = 0, ns_res_seen = 0;
+    // The descriptors the bind produced (buffer_infos / image_infos): identical to the previous
+    // dispatch's, or the same buffers, ranges and images with only the buffer offsets moved.
+    u64 desc_prev = 0, handle_prev = 0;
+    bool desc_prev_ok = false;
+    u64 desc_keyed = 0, desc_same = 0, offsets_only = 0;
+    u64 ns_desc_same = 0, ns_offsets_only = 0;
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+CsStatsState g_cs; // the draw thread only
+
+/// The key of a compute bind; false when the pipeline binds by constants (BindResourceHash).
+bool CsStatsKey(const Vulkan::Pipeline* pipeline, u64& key, bool& writes) {
+    writes = false;
+    u64 hash = XXH3_64bits(&pipeline, sizeof(pipeline));
+    for (const auto* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        if (stage->uses_dma || !stage->sharp_tables.empty() || stage->UserData().data() == nullptr) {
+            return false;
+        }
+        writes |= stage->has_storage_images;
+        for (const auto& desc : stage->buffers) {
+            writes |= !desc.IsSpecial() && desc.is_written;
+        }
+        for (const auto& desc : stage->images) {
+            writes |= desc.is_written;
+        }
+        const auto user_data = stage->UserData();
+        hash = XXH3_64bits_withSeed(user_data.data(), user_data.size_bytes(), hash);
+        const auto& flat_buf = stage->FlatBuf();
+        if (!flat_buf.empty()) {
+            hash = XXH3_64bits_withSeed(flat_buf.data(), flat_buf.size() * sizeof(u32), hash);
+        }
+    }
+    key = hash;
+    return true;
+}
+
+/// The descriptors of a finished bind: with the buffer offsets (desc) and without them (handle).
+template <typename BufInfos, typename ImgInfos>
+void CsDescKeys(const Vulkan::Pipeline* pipeline, const BufInfos& bufs, const ImgInfos& imgs,
+                u64& desc, u64& handle) {
+    u64 d = XXH3_64bits(&pipeline, sizeof(pipeline));
+    u64 h = d;
+    for (const auto& b : bufs) {
+        const VkBuffer vb = b.buffer;
+        const u64 off = b.offset, range = b.range;
+        h = XXH3_64bits_withSeed(&vb, sizeof(vb), h);
+        h = XXH3_64bits_withSeed(&range, sizeof(range), h);
+        d = XXH3_64bits_withSeed(&vb, sizeof(vb), d);
+        d = XXH3_64bits_withSeed(&range, sizeof(range), d);
+        d = XXH3_64bits_withSeed(&off, sizeof(off), d);
+    }
+    for (const auto& i : imgs) {
+        const VkImageView v = i.imageView;
+        const VkSampler smp = i.sampler;
+        const u32 layout = static_cast<u32>(i.imageLayout);
+        for (u64* k : {&d, &h}) {
+            *k = XXH3_64bits_withSeed(&v, sizeof(v), *k);
+            *k = XXH3_64bits_withSeed(&smp, sizeof(smp), *k);
+            *k = XXH3_64bits_withSeed(&layout, sizeof(layout), *k);
+        }
+    }
+    desc = d;
+    handle = h;
+}
+
+void CsStatsNote(bool ok, u64 key, bool res_ok, u64 res_key, bool writes, u64 gen, u64 tick,
+                 u64 ns, bool desc_ok, u64 desc_key, u64 handle_key) {
+    auto& s = g_cs;
+    if (tick != s.tick) {
+        s.tick = tick;
+        s.seen.clear();
+        s.prev_ok = false;
+        s.res_seen.clear();
+        s.res_prev_ok = false;
+        s.desc_prev_ok = false;
+    }
+    if (desc_ok) {
+        ++s.desc_keyed;
+        if (s.desc_prev_ok && handle_key == s.handle_prev) {
+            if (desc_key == s.desc_prev) {
+                ++s.desc_same;
+                s.ns_desc_same += ns;
+            } else {
+                ++s.offsets_only;
+                s.ns_offsets_only += ns;
+            }
+        }
+        s.desc_prev = desc_key;
+        s.handle_prev = handle_key;
+    }
+    s.desc_prev_ok = desc_ok;
+    if (res_ok) {
+        ++s.res_keyed;
+        if (s.res_prev_ok && res_key == s.res_prev) {
+            ++s.res_same;
+            s.ns_res_same += ns;
+            if (gen == s.res_prev_gen) {
+                ++s.res_clean;
+                s.ns_res_clean += ns;
+            }
+        }
+        if (!s.res_seen.insert(res_key).second) {
+            ++s.res_seen_hits;
+            s.ns_res_seen += ns;
+        }
+        s.res_prev = res_key;
+        s.res_prev_gen = gen;
+    }
+    s.res_prev_ok = res_ok;
+    ++s.dispatches;
+    s.ns_all += ns;
+    s.writing += writes ? 1 : 0;
+    if (ok) {
+        ++s.keyed;
+        if (s.prev_ok && key == s.prev_key) {
+            ++s.same;
+            s.ns_same += ns;
+            if (gen == s.prev_gen) {
+                ++s.clean;
+                s.ns_clean += ns;
+            }
+        }
+        if (!s.seen.insert(key).second) {
+            ++s.seen_hits;
+            s.ns_seen += ns;
+        }
+        s.prev_key = key;
+        s.prev_gen = gen;
+    }
+    s.prev_ok = ok;
+    if ((s.dispatches & 255) == 0) {
+        const auto now = std::chrono::steady_clock::now();
+        const double secs = std::chrono::duration<double>(now - s.last).count();
+        if (secs >= 5.0) {
+            const auto ms = [&](u64 v) { return double(v) / 1e6 / secs; };
+            std::fprintf(stderr,
+                         "SOTC CS STATS: dispatches %llu (keyed %llu, writing %llu), same as "
+                         "previous %llu (clean %llu), seen in this submit %llu; bind ms/s: all "
+                         "%.1f, same %.1f, clean %.1f, seen %.1f\n",
+                         (unsigned long long)s.dispatches, (unsigned long long)s.keyed,
+                         (unsigned long long)s.writing, (unsigned long long)s.same,
+                         (unsigned long long)s.clean, (unsigned long long)s.seen_hits,
+                         ms(s.ns_all), ms(s.ns_same), ms(s.ns_clean), ms(s.ns_seen));
+            std::fprintf(stderr,
+                         "SOTC CS STATS resources only: keyed %llu, same as previous %llu "
+                         "(clean %llu), seen in this submit %llu; bind ms/s: same %.1f, clean "
+                         "%.1f, seen %.1f\n",
+                         (unsigned long long)s.res_keyed, (unsigned long long)s.res_same,
+                         (unsigned long long)s.res_clean, (unsigned long long)s.res_seen_hits,
+                         ms(s.ns_res_same), ms(s.ns_res_clean), ms(s.ns_res_seen));
+            std::fprintf(stderr,
+                         "SOTC CS STATS descriptors: bound %llu, identical to previous %llu, "
+                         "same buffers with other offsets %llu; bind ms/s: identical %.1f, "
+                         "offsets only %.1f\n",
+                         (unsigned long long)s.desc_keyed, (unsigned long long)s.desc_same,
+                         (unsigned long long)s.offsets_only, ms(s.ns_desc_same),
+                         ms(s.ns_offsets_only));
+            const auto tick_keep = s.tick;
+            s = CsStatsState{};
+            s.last = now;
+            s.tick = tick_keep;
+        }
+    }
+}
 } // namespace
 
 void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolved,
@@ -1519,6 +1709,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
     SotcStats::current_program.store(1, std::memory_order_relaxed);
     if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer (sotc_stats.h)
         SotcStats::cmd_kinds[0].fetch_add(1, std::memory_order_relaxed);
+        if (regs.num_indices == 0 || regs.num_instances.NumInstances() == 0) {
+            SotcStats::cmd_kinds[6].fetch_add(1, std::memory_order_relaxed);
+        }
     }
     if (!pipeline) {
         SotcStats::Drop(0, regs.color_buffers[0].Address(), regs.stage_enable.raw);
@@ -2015,7 +2208,35 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
                            cs_program.start_z == 0 && groups != 0;
         t_direct_dispatch = {cs.pgm_hash, plain ? groups : 0, groups * local};
     }
-    if (!BindResources(pipeline)) {
+    // sotc: SOTC_CS_STATS (measurement only)
+    u64 cs_key = 0;
+    bool cs_key_ok = false, cs_writes = false, cs_res_ok = false;
+    u64 cs_res_key = 0;
+    u64 cs_gen = 0, cs_tick = 0;
+    std::chrono::steady_clock::time_point cs_t0{};
+    if (kCsStats) {
+        cs_key_ok = CsStatsKey(pipeline, cs_key, cs_writes);
+        cs_res_ok = BindResourceHash(pipeline, cs_res_key);
+        cs_tick = scheduler.CurrentTick();
+        const u64 gens[4] = {BufferBindGeneration(), texture_cache.BindGeneration(),
+                             buffer_cache.StreamGeneration(),
+                             SotcStats::mem_epoch.load(std::memory_order_relaxed)};
+        cs_gen = XXH3_64bits(gens, sizeof(gens));
+        cs_t0 = std::chrono::steady_clock::now();
+    }
+    const bool cs_bound = BindResources(pipeline);
+    if (kCsStats) {
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - cs_t0)
+                            .count();
+        u64 cs_desc = 0, cs_handle = 0;
+        if (cs_bound) {
+            CsDescKeys(pipeline, buffer_infos, image_infos, cs_desc, cs_handle);
+        }
+        CsStatsNote(cs_key_ok, cs_key, cs_res_ok, cs_res_key, cs_writes, cs_gen, cs_tick,
+                    static_cast<u64>(ns), cs_bound, cs_desc, cs_handle);
+    }
+    if (!cs_bound) {
         SotcStats::Drop(3, cs_program.Address<uintptr_t>(), 0);
         return;
     }
@@ -2055,7 +2276,35 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
         return;
     }
 
-    if (!BindResources(pipeline)) {
+    // sotc: SOTC_CS_STATS (measurement only)
+    u64 cs_key = 0;
+    bool cs_key_ok = false, cs_writes = false, cs_res_ok = false;
+    u64 cs_res_key = 0;
+    u64 cs_gen = 0, cs_tick = 0;
+    std::chrono::steady_clock::time_point cs_t0{};
+    if (kCsStats) {
+        cs_key_ok = CsStatsKey(pipeline, cs_key, cs_writes);
+        cs_res_ok = BindResourceHash(pipeline, cs_res_key);
+        cs_tick = scheduler.CurrentTick();
+        const u64 gens[4] = {BufferBindGeneration(), texture_cache.BindGeneration(),
+                             buffer_cache.StreamGeneration(),
+                             SotcStats::mem_epoch.load(std::memory_order_relaxed)};
+        cs_gen = XXH3_64bits(gens, sizeof(gens));
+        cs_t0 = std::chrono::steady_clock::now();
+    }
+    const bool cs_bound = BindResources(pipeline);
+    if (kCsStats) {
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - cs_t0)
+                            .count();
+        u64 cs_desc = 0, cs_handle = 0;
+        if (cs_bound) {
+            CsDescKeys(pipeline, buffer_infos, image_infos, cs_desc, cs_handle);
+        }
+        CsStatsNote(cs_key_ok, cs_key, cs_res_ok, cs_res_key, cs_writes, cs_gen, cs_tick,
+                    static_cast<u64>(ns), cs_bound, cs_desc, cs_handle);
+    }
+    if (!cs_bound) {
         SotcStats::Drop(3, cs_program.Address<uintptr_t>(), 1);
         return;
     }
@@ -2398,6 +2647,79 @@ static bool SamePreparedResources(const PreparedResources& a, const PreparedReso
     return true;
 }
 
+// sotc: SOTC_BIND_DIFF=1 (off by default; a measurement). For every fast-bind-eligible draw that
+// misses the fast bind, which of its conditions failed, as a bit mask: the 6-8 most frequent masks
+// are printed every 5 s. "epoch" alone means nothing the draw binds changed, only the global
+// mem_epoch counter that any write anywhere bumps (memory_tracker.h, NoteHostWrite).
+namespace {
+const bool kBindDiff = [] {
+    const char* v = std::getenv("SOTC_BIND_DIFF");
+    return v && v[0] == '1';
+}();
+enum BindDiffBit : u32 {
+    BdInvalid = 1, BdPipeline = 2, BdBufGen = 4, BdTexGen = 8, BdStreamGen = 16, BdEpoch = 32,
+    BdHash = 64, BdTick = 128,
+};
+struct BindDiffState {
+    u64 counts[256]{};
+    u64 eligible = 0, hits = 0;
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+};
+BindDiffState g_bind_diff; // the draw thread only
+void BindDiffNote(u32 mask, bool hit) {
+    auto& d = g_bind_diff;
+    ++d.eligible;
+    if (hit) {
+        ++d.hits;
+    } else {
+        ++d.counts[mask & 255];
+    }
+    if ((d.eligible & 1023) != 0) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - d.last < std::chrono::seconds(5)) {
+        return;
+    }
+    d.last = now;
+    u64 misses = 0;
+    for (u64 c : d.counts) {
+        misses += c;
+    }
+    std::string line = "SOTC BIND DIFF: eligible " + std::to_string(d.eligible) + ", hits " +
+                       std::to_string(d.hits) + ", misses " + std::to_string(misses) + ":";
+    for (int k = 0; k < 8; ++k) {
+        u32 best = 0;
+        for (u32 m = 1; m < 256; ++m) {
+            if (d.counts[m] > d.counts[best]) {
+                best = m;
+            }
+        }
+        if (d.counts[best] == 0) {
+            break;
+        }
+        std::string name;
+        static constexpr const char* kNames[8] = {"invalid", "pipeline", "bufgen", "texgen",
+                                                  "streamgen", "epoch", "hash", "tick"};
+        for (int bit = 0; bit < 8; ++bit) {
+            if (best & (1u << bit)) {
+                name += (name.empty() ? "" : "+");
+                name += kNames[bit];
+            }
+        }
+        char item[96];
+        std::snprintf(item, sizeof(item), " %s %.1f%%", name.c_str(),
+                      misses ? 100.0 * double(d.counts[best]) / double(misses) : 0.0);
+        line += item;
+        d.counts[best] = 0;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+    const auto last = d.last;
+    d = BindDiffState{};
+    d.last = last;
+}
+} // namespace
+
 bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* prepared) {
     // sotc: writes recorded during this bind follow its command into the tick it lands in.
     buffer_cache.BeginWriteScope();
@@ -2422,7 +2744,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             BindCacheSync(pipeline, cache_eligible);
         }
     }
-    bind_memo_ok = SotcStats::kBindCacheFrame && cache_eligible; // sotc: SOTC_BIND_CACHE_FRAME
+    // sotc: SOTC_BIND_CACHE_FRAME, or SOTC_BUFFER_MEMO alone (the memo without the frame cache)
+    bind_memo_ok = (SotcStats::kBindCacheFrame || SotcStats::kBufferMemo) && cache_eligible;
     compute_written_image = {};
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
@@ -2499,6 +2822,25 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             fast_bind.stream_generation == buffer_cache.StreamGeneration() &&
             fast_bind.mem_epoch == SotcStats::mem_epoch.load(std::memory_order_relaxed) &&
             fast_bind.hash == fast_hash;
+        if (kBindDiff) { // sotc: SOTC_BIND_DIFF: which conditions failed
+            u32 mask = 0;
+            if (!fast_bind.valid) {
+                mask = BdInvalid;
+            } else {
+                mask |= fast_bind.pipeline != pipeline ? BdPipeline : 0u;
+                mask |= fast_bind.buffer_generation != BufferBindGeneration() ? BdBufGen : 0u;
+                mask |= fast_bind.texture_generation != texture_cache.BindGeneration() ? BdTexGen
+                                                                                        : 0u;
+                mask |= fast_bind.stream_generation != buffer_cache.StreamGeneration() ? BdStreamGen
+                                                                                       : 0u;
+                mask |= fast_bind.mem_epoch != SotcStats::mem_epoch.load(std::memory_order_relaxed)
+                            ? BdEpoch
+                            : 0u;
+                mask |= fast_bind.hash != fast_hash ? BdHash : 0u;
+                mask |= fast_bind.tick != scheduler.CurrentTick() ? BdTick : 0u;
+            }
+            BindDiffNote(mask, mask == 0);
+        }
         if (fast_state_same && fast_bind.tick == scheduler.CurrentTick()) {
             fast_bind_hit = true;
             SotcStats::fast_bind_hits.fetch_add(1, std::memory_order_relaxed);

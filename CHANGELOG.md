@@ -1,6 +1,34 @@
 # Changelog
 
 ## Não lançado — desempenho no streaming e correções visuais
+- **Medido (29 out): os dispatches não têm bind para reaproveitar.** `SOTC_CS_STATS=1`
+  (diagnóstico, desligado) imprime a cada 5 s quantos dispatches repetem o anterior e quanto o bind
+  deles custa. São ~1.100–1.200 dispatches por quadro, todos escrevendo em memória, com bind de
+  125–190 ms por segundo (~4,5 ms por quadro). Nenhum repete o estado completo do anterior; só
+  0,5–2% repetem os mesmos recursos, e nenhum deles sem mudança de memória no meio. ~28% usam os
+  mesmos buffers com outro deslocamento, mas esses já são baratos (~1,4 µs contra ~5,8 µs dos que
+  trocam de recurso; ~9% do tempo). Um atalho de bind para compute não compensa: o custo está em
+  achar e preparar cada recurso novo.
+- **Medido (29 out): o jogo não manda draws vazios.** `SOTC_CMD_STATS=1` agora também conta os
+  draws diretos com 0 índices ou 0 instâncias. Numa sessão, os ~320–1.080 draws diretos e os
+  ~2.100–4.600 indiretos com argumentos na CPU por quadro tiveram 0 vazios (um único indireto vazio
+  na sessão toda). O culling do jogo funciona; pular draws vazios não ganha nada.
+- **Medido (29 out): nova base enxuta e a variação entre sessões.** Sem nenhuma mudança, a thread
+  de desenho ficou em 18,1 ms por quadro (mediana), com 5 quadros acima de 60 ms, contra 21–22 ms
+  nas sessões de teste anteriores. Dentro de uma mesma sessão ela varia de 14 a 25 ms a cada 5 s.
+  Diferenças de 1–3 ms entre sessões em trajetos diferentes são ruído: os testes A/B precisam
+  repetir o mesmo save e o mesmo trajeto.
+- **Medidos (29 out), todos desligados:**
+  - `SOTC_BIND_DIFF=1` (diagnóstico): diz por que cada draw elegível perdeu o atalho do bind. Só
+    ~1–2% perdem apenas pela época de memória; a maioria muda o pipeline e o hash (30–50%), o
+    atalho já estava inválido (25–50%) ou só o hash muda (20–25%).
+  - `SOTC_BUFFER_MEMO=1`: a memória de V# do `SOTC_BIND_CACHE_FRAME` sozinha. Acerta 96–99% dos
+    buffers, mas a thread de desenho não melhorou: os binds que ela pula já eram baratos.
+  - `SOTC_CEILING=sync` / `=tex` (só medição, quebra o jogo): pulam a sincronização de memória
+    dos buffers ou a atualização das texturas, para medir o teto do ganho. `sync` derruba o jogo
+    (o alocador de command buffers do jogo devolve nulo); `tex` piorou (as imagens ficam sujas).
+  - `SOTC_FAULT_GRANULE` de 4 KB (sem granularidade): 22,2 ms por quadro e 12% mais faltas; sem
+    ganho.
 - **Medido (29 out): `SOTC_UNTRACK_AUTO` não reduz as faltas.** Depois de duas correções (a leitura
   da lista de blocos aceitava só endereços abaixo de 2 GiB, e o ponteiro para o próximo nó fica em
   +8, não em +0), o port achou o heap por quadro RenderSingleFrameGPU: um bloco de 32 MiB, liberado

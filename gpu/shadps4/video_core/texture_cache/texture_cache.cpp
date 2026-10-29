@@ -1218,6 +1218,9 @@ void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
     }
+    if (SotcStats::kCeiling & SotcStats::CeilingTex) {
+        return; // sotc: SOTC_CEILING=tex, measurement only (see sotc_stats.h)
+    }
     // sotc: SOTC_TRACE: a = guest address, kept when over 20 us
     const SotcTrace::ScopeMin trace_refresh{"image upload", image.info.guest_address};
     const SotcStats::FrameTimer frame_timer{SotcStats::FrameUpload};

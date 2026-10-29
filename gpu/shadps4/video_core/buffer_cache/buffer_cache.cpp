@@ -6053,6 +6053,9 @@ SyncFastSlot& SyncFastSlotFor(VAddr addr, u32 size, bool is_written) {
 
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
                                     bool is_written, bool is_texel_buffer) {
+    if (SotcStats::kCeiling & SotcStats::CeilingSync) {
+        return false; // sotc: SOTC_CEILING=sync, measurement only (see sotc_stats.h)
+    }
     if (!SotcStats::kSyncFast) {
         return SynchronizeMemoryFull(arena, device_addr, size, is_written, is_texel_buffer);
     }

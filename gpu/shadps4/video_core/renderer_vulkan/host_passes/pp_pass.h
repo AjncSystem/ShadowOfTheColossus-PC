@@ -18,6 +18,7 @@ public:
         float gamma = 1.0f;
         u32 hdr = 0;
         u32 srgb_input = 0;
+        float hdr_white = 200.0f; ///< sotc: HDR paper white in nits (SOTC_HDR_WHITE)
     };
 
     void Create(vk::Device device, vk::Format surface_format);

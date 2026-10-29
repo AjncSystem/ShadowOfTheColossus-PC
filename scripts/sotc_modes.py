@@ -222,7 +222,37 @@ def render_patches(elf, ph, size):
         if image_bytes(elf, ph, site, 8) != bytes.fromhex('498b06c5fa104004'):
             raise SystemExit(f'scene aspect: unexpected bytes at {site + BASE:#x}')
         writes.append((site, bytes.fromhex('c5fa1005') + struct.pack('<i', 0x166633c - (site + 8))))
-        print('Scene aspect: projection setup reads the render aspect')
+        # the other readers (vmovss 0x4(%rax),%xmm0 = c5fa104004, 5 bytes): a jmp to a cave in the padding
+        # between functions that loads the same constant and jumps back
+        for site, cave in ((0xb0cdd, 0xb1bf1), (0xb0d1d, 0x20d401), (0xb0d5d, 0x20dad1),
+                           (0xb0d9d, 0x20e191), (0x20e783, 0x20e1d1)):
+            if f'{site:x}' in os.environ.get('SOTC_SCENE_SKIP', '').split(','):
+                continue
+            if (image_bytes(elf, ph, site, 5) != bytes.fromhex('c5fa104004') or
+                    image_bytes(elf, ph, cave, 13) != b'\x90' * 13):
+                raise SystemExit(f'scene aspect: unexpected bytes at {site + BASE:#x} or {cave + BASE:#x}')
+            writes.append((site, b'\xe9' + struct.pack('<i', cave - (site + 5))))
+            writes.append((cave, bytes.fromhex('c5fa1005') + struct.pack('<i', 0x166633c - (cave + 8)) +
+                           b'\xe9' + struct.pack('<i', (site + 5) - (cave + 13))))
+        print('Scene aspect: the 6 projection setups read the render aspect')
+    # sotc: SOTC_HUD_ASPECT169=1 (test): the HUD scale getters (0x5c9310, 0x5c9350, 0x5c93f0) divide by the display
+    # object's aspect; with the wide aspect on (the scene needs it) they read a 16:9 constant instead, as the HUD
+    # laid out its bars before (#301, the health bar's grey stub). Each site is jumped to a cave in the padding.
+    if os.environ.get('SOTC_HUD_ASPECT169') == '1':
+        const = 0x20e8c1
+        if image_bytes(elf, ph, const, 4) != b'\x90' * 4:
+            raise SystemExit(f'HUD aspect: unexpected bytes at {const + BASE:#x}')
+        writes.append((const, struct.pack('<f', 16 / 9)))
+        for site, cave, old, new in ((0x5c933b, 0x20d6c2, 'c5fa5e4004', 'c5fa5e05'),
+                                     (0x5c939e, 0x20d782, 'c5f25e4904', 'c5f25e0d'),
+                                     (0x5c9442, 0x20e822, 'c5ea5e5004', 'c5ea5e15')):
+            if (image_bytes(elf, ph, site, 5) != bytes.fromhex(old) or
+                    image_bytes(elf, ph, cave, 13) != b'\x90' * 13):
+                raise SystemExit(f'HUD aspect: unexpected bytes at {site + BASE:#x} or {cave + BASE:#x}')
+            writes.append((site, b'\xe9' + struct.pack('<i', cave - (site + 5))))
+            writes.append((cave, bytes.fromhex(new) + struct.pack('<i', const - (cave + 8)) +
+                           b'\xe9' + struct.pack('<i', (site + 5) - (cave + 13))))
+        print('HUD aspect: the 3 HUD scale getters divide by 16:9')
     return writes
 
 

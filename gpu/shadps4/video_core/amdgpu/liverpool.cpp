@@ -40,6 +40,7 @@
 #include "video_core/sotc_stats.h"
 #include <optional>
 #include "bbport_toggles.h"
+#include "bbport_threads.h"
 
 // sotc: writes guest memory through the backing view (runtime_memory.c).
 extern "C" int runtime_memory_write_backing(unsigned long long address, const void* data,
@@ -935,7 +936,7 @@ void Liverpool::Process(std::stop_token stoken) {
         // spare yield returns at once anyway.
         static const bool cp_yield_few_cores = [] {
             const char* v = std::getenv("SOTC_CP_YIELD");
-            return (!v || std::atoi(v) != 0) && std::thread::hardware_concurrency() <= 6;
+            return (!v || std::atoi(v) != 0) && BbThreads::Available() <= 6;
         }();
 
         // sotc: BbToggle::CpPollBackoff. A packet that waits (WaitRegMem, MemSemaphore, Rewind)

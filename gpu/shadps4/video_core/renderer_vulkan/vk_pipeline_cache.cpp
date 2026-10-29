@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <unordered_set>
 #include "bbport_toggles.h"
+#include "bbport_threads.h"
 #include "common/elf_info.h"
 #include "common/assert_scope.h"
 #include "common/hash.h"
@@ -558,7 +559,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         // mostly wait for them (cold caches, attract demo, 16 threads: worst frame 4.8 s with 6
         // workers, 3.4 s with 12; one worker, the old default on 4 threads: 18 s).
         const char* workers = std::getenv("SOTC_PIPELINE_WORKERS");
-        const int threads = static_cast<int>(std::thread::hardware_concurrency());
+        const int threads = static_cast<int>(BbThreads::Available()); // sotc: affinity mask
         const unsigned count = static_cast<unsigned>(
             workers ? std::clamp(std::atoi(workers), 1, 16) : std::clamp(threads - 4, 2, 12));
         for (unsigned i = 0; i < count; ++i) {

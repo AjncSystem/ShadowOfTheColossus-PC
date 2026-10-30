@@ -71,6 +71,16 @@ inline std::atomic<uint64_t> current_program{0}; ///< hash of the dispatch being
 inline std::atomic<uint64_t> readback_ahead{0};   ///< downloads of already submitted work
 inline std::atomic<uint64_t> readback_finish{0};  ///< downloads that flushed the current work
 inline std::atomic<uint64_t> readback_finish_asked{0}; ///< ... for bytes the guest itself asked
+/// ... the ahead path was idle only because sparse binds were pending (data itself submitted)
+inline std::atomic<uint64_t> readback_finish_binds{0};
+/// ... only the widened window of the asked bytes was written by the command buffer being built
+inline std::atomic<uint64_t> readback_finish_window{0};
+/// ... only a hot region brought along was written by the command buffer being built
+inline std::atomic<uint64_t> readback_finish_hot{0};
+/// async readbacks whose window was re-written in flight and re-read synchronously
+inline std::atomic<uint64_t> readback_dirty_retries{0};
+/// stale hot bring-alongs dropped instead of forcing that synchronous re-read (SOTC_RB_PART)
+inline std::atomic<uint64_t> rb_dirty_hot_dropped{0};
 inline std::atomic<uint64_t> heap_guard_builds{0}; ///< readbacks into the BPE heap
 inline std::atomic<uint64_t> heap_guard_stale_hits{0}; ///< writes the previous guard vouched for
 inline std::atomic<uint64_t> upload_deferred{0};        ///< first uploads put off to a later frame

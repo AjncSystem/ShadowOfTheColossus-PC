@@ -212,6 +212,8 @@ private:
         boost::container::small_vector<std::pair<VAddr, u64>, 4> gpu_ranges;
         /// sotc: brought along by the hot readbacks (SOTC_RB_HOT), not asked for.
         bool hot = false;
+        /// sotc: a GPU write landed on this region while the readback was in flight.
+        bool dirty = false;
     };
     /// Collects what a readback of [device_addr, +size) and the hot readbacks must copy. Returns
     /// the bytes to download. sotc: the ranges stay in the GPU-modified set until the caller

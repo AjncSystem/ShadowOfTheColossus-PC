@@ -325,6 +325,11 @@ QUALITY_PRESETS = {
                  'framegen': 'off'},
     'performance': {'af16': True, 'textures': 'high', 'fps_mode': '60', 'upscaler': 'fsr3',
                     'render_preset': 'performance', 'framegen': 'off'},
+    # Everything up, for strong PCs: the output follows the screen and the render stays native up to
+    # 1440p (apply_quality_preset); a native 4K render lost fine textures and ran at 42-44 FPS.
+    'max': {'af16': True, 'textures': 'max', 'fps_mode': 'unlimited', 'upscaler': 'fsr3', 'framegen': 'off',
+            'shadow_reuse': '0', 'fx_sunshadows': True, 'fx_ssao': True, 'fx_fog': True, 'grass_shadows': '3',
+            'grass_distance': '2', 'weed_distance': '2', 'grass_detail': '0.15'},
 }
 
 
@@ -1436,6 +1441,11 @@ class Launcher:
             if key in APP_DEFAULTS:
                 # DLSS runs as fast as FSR 3.1 since the Reflex fix, with a better image.
                 self.var(key).set('dlss' if value == 'fsr3' and is_rtx(self.gpu_name) else value)
+        if name == 'max':
+            screen = screen_size()
+            output = screen if screen in dict(OUTPUTS) else self.var('output_res').get()
+            self.var('output_res').set(output)
+            self.var('render_preset').set('native' if int(output.split('x')[1]) <= 1600 else 'quality')
 
     def suggest_for_pc(self):
         settings, reasons = suggest_settings(self.gpu_name, self.gpu_vram, os.cpu_count() or 0, screen_size())
@@ -1454,18 +1464,20 @@ class Launcher:
         self.section(f, _('Predefinições', 'Presets'), top=4)
         bar = self.ttk.Frame(f)
         for key, label in (('compat', _('Compatibilidade', 'Compatibility')), ('balanced', _('Equilibrado', 'Balanced')),
-                           ('performance', _('Desempenho', 'Performance'))):
+                           ('performance', _('Desempenho', 'Performance')), ('max', _('Máximo', 'Maximum'))):
             self.ttk.Button(bar, text=label, command=lambda k=key: self.apply_quality_preset(k)).pack(side='left', padx=(0, 8))
         self.ttk.Button(bar, text=_('Sugerir para meu PC', 'Suggest for my PC'), command=self.suggest_for_pc).pack(side='left')
         self.row(f, _('Aplicar', 'Apply'), bar,
                  _('Compatibilidade: 30 FPS, sem upscaler, texturas desligadas (o mais leve e seguro). Equilibrado: 60 FPS, '
                    'FSR 3.1 Qualidade (DLSS numa RTX), texturas altas. Desempenho: 60 FPS, FSR 3.1 Desempenho (2x). '
-                   'Sugerir para meu PC: escolhe pela placa, VRAM, CPU e tela, e explica por quê. Mexem só nesta página; '
-                   'você pode ajustar cada opção depois.',
+                   'Máximo: tudo no alto (FPS ilimitado, texturas máximas, render nativo até 1440p, grama e sombras '
+                   'mais longe), para PCs fortes. Sugerir para meu PC: escolhe pela placa, VRAM, CPU e tela, e explica '
+                   'por quê. Mexem só nesta página; você pode ajustar cada opção depois.',
                    'Compatibility: 30 FPS, no upscaler, textures off (lightest and safest). Balanced: 60 FPS, FSR 3.1 '
-                   'Quality (DLSS on an RTX), high textures. Performance: 60 FPS, FSR 3.1 Performance (2x). Suggest for my '
-                   'PC: picks from the card, VRAM, CPU and screen, and says why. They only change this page; you can '
-                   'adjust each option afterwards.'))
+                   'Quality (DLSS on an RTX), high textures. Performance: 60 FPS, FSR 3.1 Performance (2x). Maximum: '
+                   'everything up (unlimited FPS, maximum textures, native render up to 1440p, grass and shadows '
+                   'farther), for strong PCs. Suggest for my PC: picks from the card, VRAM, CPU and screen, and says '
+                   'why. They only change this page; you can adjust each option afterwards.'))
         self.section(f, _('Modos', 'Modes'), top=4)
         self.check(f, 'af16', _('Texturas nítidas (filtro anisotrópico 16x)', 'Sharp textures (16x anisotropic filtering)'),
                    _('Chão, grama e rochas ficam nítidos à distância, quase sem custo.',

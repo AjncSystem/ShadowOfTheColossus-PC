@@ -337,6 +337,15 @@ def is_rtx(gpu):
     return 'NVIDIA' in gpu.upper() and 'RTX' in gpu.upper()
 
 
+def framegen_blocked(gpu):
+    """Frame generation choices this card cannot use, with the reason (unknown card: none). DLSS-G needs an
+    RTX 40 or newer; elsewhere "automatic" would still load NVIDIA Streamline for nothing (fork issue #5)."""
+    if not gpu or re.search(r'RTX\s*[4-9]0\d0', gpu, re.I):
+        return {}
+    return {'auto': _('nesta placa, use AMD FSR 3', 'on this card, use AMD FSR 3'),
+            'dlss': _('só RTX 40/50', 'RTX 40/50 only')}
+
+
 def suggest_settings(gpu, vram_mib, threads, screen):
     """Display settings for this PC ("Suggest for my PC") and the reasons, from what was measured on the
     port (Shrine, RTX 5060 Ti + Ryzen 7 5700X, 30 Oct 2026): the CPU limits it at ~72 FPS at any output;
@@ -1065,15 +1074,38 @@ class Launcher:
     def choice(self, parent, key, options, width=38):
         var = self.var(key)
         values = [v for v, _t in options]
-        box = self.ttk.Combobox(parent, values=[_(*text) for _v, text in options], state='readonly', width=width)
+        texts = [_(*text) for _v, text in options]
+        box = self.ttk.Combobox(parent, values=texts, state='readonly', width=width)
         if var.get() not in values:
             var.set(values[0])
 
         def show(*_args):
             current = var.get()
             box.current(values.index(current) if current in values else 0)
+
+        def blocked():
+            return framegen_blocked(self.gpu_name) if key == 'framegen' else {}
+
+        def post():
+            # Choices this PC cannot use stay in the list, greyed, with the reason.
+            off = blocked()
+            box['values'] = [f'{t} — {off[v]}' if v in off else t for v, t in zip(values, texts)]
+
+            def grey():
+                listbox = f"{box.tk.call('ttk::combobox::PopdownWindow', box)}.f.l"
+                for i, v in enumerate(values):
+                    box.tk.call(listbox, 'itemconfigure', i, '-foreground', 'gray' if v in off else '',
+                                '-selectforeground', 'gray' if v in off else '')
+            box.after_idle(grey)
+
+        def select(_e):
+            if values[box.current()] in blocked():
+                show()
+            else:
+                var.set(values[box.current()])
         show()
-        box.bind('<<ComboboxSelected>>', lambda _e: var.set(values[box.current()]))
+        box.configure(postcommand=post)
+        box.bind('<<ComboboxSelected>>', select)
         var.trace_add('write', show)
         return box
 
@@ -1846,6 +1878,9 @@ class Launcher:
         self.refresh_status()
 
     def refresh_status(self):
+        # A frame generation choice the detected card cannot use: the one it falls back to.
+        if self.var('framegen').get() in framegen_blocked(self.gpu_name):
+            self.var('framegen').set('fsr' if self.var('framegen').get() == 'auto' else 'off')
         info = game_info(self.var('game_dir').get())
         # Long or non-ASCII paths (repack folders) were behind games that closed with no error (#299, #282).
         odd_path = any(len(s) > 150 or not s.isascii() for s in (str(PORT_DIR), self.var('game_dir').get()))

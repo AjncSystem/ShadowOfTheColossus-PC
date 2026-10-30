@@ -40,3 +40,13 @@ class SuggestTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+@unittest.skipIf(launcher is None, 'launcher not importable')
+class FramegenBlockedTests(unittest.TestCase):
+    def test_dlss_g_only_on_rtx_40_and_newer(self):
+        self.assertEqual(launcher.framegen_blocked(''), {})
+        self.assertEqual(launcher.framegen_blocked('NVIDIA GeForce RTX 4060 Laptop GPU'), {})
+        self.assertEqual(launcher.framegen_blocked('NVIDIA GeForce RTX 5060 Ti'), {})
+        for gpu in ('NVIDIA GeForce RTX 2080 Ti', 'NVIDIA GeForce RTX 3060', 'AMD Radeon RX 570 Series'):
+            self.assertEqual(set(launcher.framegen_blocked(gpu)), {'auto', 'dlss'}, gpu)

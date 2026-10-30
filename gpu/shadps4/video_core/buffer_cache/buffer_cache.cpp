@@ -244,7 +244,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             return u64{0};
         }
         const char* v = std::getenv("SOTC_RB_STREAM_MAX_KB");
-        return (v ? std::strtoull(v, nullptr, 10) : 4096ULL) * 1_KB;
+        return static_cast<u64>((v ? std::strtoull(v, nullptr, 10) : 4096ULL) * 1_KB);
     }();
     u64 stream = 0;
     if (stream_max != 0) {

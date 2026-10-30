@@ -16,6 +16,7 @@ import os
 import platform
 from pathlib import Path
 import queue
+import re
 import runpy
 import shutil
 import subprocess
@@ -325,6 +326,67 @@ QUALITY_PRESETS = {
     'performance': {'af16': True, 'textures': 'high', 'fps_mode': '60', 'upscaler': 'fsr3',
                     'render_preset': 'performance', 'framegen': 'off'},
 }
+
+
+def is_rtx(gpu):
+    return 'NVIDIA' in gpu.upper() and 'RTX' in gpu.upper()
+
+
+def suggest_settings(gpu, vram_mib, threads, screen):
+    """Display settings for this PC ("Suggest for my PC") and the reasons, from what was measured on the
+    port (Shrine, RTX 5060 Ti + Ryzen 7 5700X, 30 Oct 2026): the CPU limits it at ~72 FPS at any output;
+    DLSS runs as fast as FSR 3.1 and DLAA at 1080p costs nothing; a 1080p render for a 1440p or 4K
+    output keeps 65-69 FPS; on 2 GB cards the fine textures broke (GTX 750 Ti, fork issue #5)."""
+    name = gpu.upper()
+    output = screen if screen in dict(OUTPUTS) else '1920x1080'
+    height = int(output.split('x')[1])
+    reasons = []
+    if vram_mib and vram_mib < 3000:
+        settings = dict(QUALITY_PRESETS['compat'], output_res=output)
+        reasons.append(_('{} MB de VRAM: Compatibilidade (texturas finas esgotam placas de 2 GB).',
+                         '{} MB of VRAM: Compatibility (fine textures run 2 GB cards out of memory).').format(vram_mib))
+        return settings, reasons
+    rtx = is_rtx(gpu)
+    settings = {'af16': True, 'textures': 'high', 'fps_mode': '60', 'framegen': 'off', 'output_res': output,
+                'upscaler': 'dlss' if rtx else 'fsr3'}
+    if height <= 1200:
+        settings['render_preset'] = 'native' if rtx else 'quality'
+    else:
+        settings['render_preset'] = 'quality' if height <= 1600 else 'performance'
+    reasons.append(_('Saída {}: a resolução da tela.', 'Output {}: the screen resolution.').format(output))
+    if rtx:
+        reasons.append(_('NVIDIA RTX: DLSS, tão rápido quanto o FSR 3.1 e com imagem melhor.',
+                         'NVIDIA RTX: DLSS, as fast as FSR 3.1 with a better image.'))
+        if settings['render_preset'] == 'native':
+            reasons.append(_('DLAA (render na resolução da tela): em 1080p não custa FPS.',
+                             'DLAA (render at the screen resolution): at 1080p it costs no FPS.'))
+        if re.search(r'RTX\s*[45]0\d0', name):
+            reasons.append(_('RTX 40/50: a geração de quadros DLSS-G fica disponível (F8 no jogo).',
+                             'RTX 40/50: DLSS-G frame generation is available (F8 in game).'))
+    if height > 1200:
+        reasons.append(_('Tela acima de 1080p: o jogo renderiza menor e o upscaler completa (65-69 FPS medidos em 1440p e 4K).',
+                         'Screen above 1080p: the game renders smaller and the upscaler fills in (65-69 FPS measured at 1440p and 4K).'))
+    if 'INTEL' in name:
+        reasons.append(_('Intel: suporte experimental; se as texturas quebrarem, use Compatibilidade.',
+                         'Intel: experimental support; if textures break, use Compatibility.'))
+    if re.search(r'RX\s*[45][0-9]0\b|VEGA|R9 |R7 ', name):
+        reasons.append(_('Radeon GCN (RX 400/500, Vega): o port já usa o caminho próprio para elas; se as cores piscarem, mande o zip de relatório.',
+                         'Radeon GCN (RX 400/500, Vega): the port already takes their own path; if colours flicker, send the report zip.'))
+    if threads and threads <= 4:
+        reasons.append(_('CPU com {} threads: em cenas pesadas, espere uns 45-50 FPS no modo 60.',
+                         'CPU with {} threads: expect about 45-50 FPS in heavy scenes in the 60 mode.').format(threads))
+    return settings, reasons
+
+
+def screen_size():
+    """The primary screen in pixels (the process is DPI aware)."""
+    try:
+        user32 = ctypes.windll.user32
+        return f'{user32.GetSystemMetrics(0)}x{user32.GetSystemMetrics(1)}'
+    except (AttributeError, OSError):
+        return ''
+
+
 FRAMEGEN = [('off', ('Desligada', 'Off')),
             ('auto', ('Automática (DLSS-G ou FSR 3, experimental)', 'Automatic (DLSS-G or FSR 3, experimental)')),
             ('dlss', ('NVIDIA DLSS-G (RTX 40/50)', 'NVIDIA DLSS-G (RTX 40/50)')),
@@ -868,6 +930,7 @@ class Launcher:
         self.output = queue.Queue()
         self.ui_calls = queue.Queue()
         self.gpu_text = _('• Verificando a placa de vídeo…', '• Checking the graphics card…')
+        self.gpu_name, self.gpu_vram = '', 0
         self.banner_source = self.banner_image = None
         root.title('Shadow of the Colossus — ' + _('port nativo', 'native port'))
         root.configure(bg=BG)
@@ -1371,7 +1434,17 @@ class Launcher:
     def apply_quality_preset(self, name):
         for key, value in QUALITY_PRESETS[name].items():
             if key in APP_DEFAULTS:
+                # DLSS runs as fast as FSR 3.1 since the Reflex fix, with a better image.
+                self.var(key).set('dlss' if value == 'fsr3' and is_rtx(self.gpu_name) else value)
+
+    def suggest_for_pc(self):
+        settings, reasons = suggest_settings(self.gpu_name, self.gpu_vram, os.cpu_count() or 0, screen_size())
+        for key, value in settings.items():
+            if key in APP_DEFAULTS:
                 self.var(key).set(value)
+        head = _('Placa: {}. Ajustes aplicados nesta página:', 'Card: {}. Settings applied on this page:').format(
+            self.gpu_name or _('não detectada', 'not detected'))
+        self.messagebox.showinfo('Shadow of the Colossus', '\n\n'.join([head] + ['• ' + r for r in reasons]))
 
     def build_graphics(self):
         f = self.scrolled_page('graphics', _('Imagem e FPS', 'Display & FPS'),
@@ -1383,13 +1456,16 @@ class Launcher:
         for key, label in (('compat', _('Compatibilidade', 'Compatibility')), ('balanced', _('Equilibrado', 'Balanced')),
                            ('performance', _('Desempenho', 'Performance'))):
             self.ttk.Button(bar, text=label, command=lambda k=key: self.apply_quality_preset(k)).pack(side='left', padx=(0, 8))
+        self.ttk.Button(bar, text=_('Sugerir para meu PC', 'Suggest for my PC'), command=self.suggest_for_pc).pack(side='left')
         self.row(f, _('Aplicar', 'Apply'), bar,
                  _('Compatibilidade: 30 FPS, sem upscaler, texturas desligadas (o mais leve e seguro). Equilibrado: 60 FPS, '
-                   'FSR 3.1 Qualidade, texturas altas. Desempenho: 60 FPS, FSR 3.1 Desempenho (2x). Mexem só nesta página; '
+                   'FSR 3.1 Qualidade (DLSS numa RTX), texturas altas. Desempenho: 60 FPS, FSR 3.1 Desempenho (2x). '
+                   'Sugerir para meu PC: escolhe pela placa, VRAM, CPU e tela, e explica por quê. Mexem só nesta página; '
                    'você pode ajustar cada opção depois.',
                    'Compatibility: 30 FPS, no upscaler, textures off (lightest and safest). Balanced: 60 FPS, FSR 3.1 '
-                   'Quality, high textures. Performance: 60 FPS, FSR 3.1 Performance (2x). They only change this page; '
-                   'you can adjust each option afterwards.'))
+                   'Quality (DLSS on an RTX), high textures. Performance: 60 FPS, FSR 3.1 Performance (2x). Suggest for my '
+                   'PC: picks from the card, VRAM, CPU and screen, and says why. They only change this page; you can '
+                   'adjust each option afterwards.'))
         self.section(f, _('Modos', 'Modes'), top=4)
         self.check(f, 'af16', _('Texturas nítidas (filtro anisotrópico 16x)', 'Sharp textures (16x anisotropic filtering)'),
                    _('Chão, grama e rochas ficam nítidos à distância, quase sem custo.',
@@ -1825,6 +1901,10 @@ class Launcher:
                                     env=env, creationflags=NO_WINDOW)
             names = [line[5:].split(':')[0] for line in result.stderr.splitlines() if line.startswith('GPU: ')]
             if names:
+                # "NVIDIA GeForce RTX 5060 Ti, discrete, 7891 MiB"
+                parts = names[0].split(', ')
+                vram = re.match(r'(\d+) MiB', parts[-1]) if len(parts) > 2 else None
+                self.gpu_name, self.gpu_vram = parts[0], int(vram.group(1)) if vram else 0
                 text = _('✓ Placa de vídeo: {}', '✓ Graphics card: {}').format(names[0])
             elif result.returncode:
                 text = _('✗ Nenhuma placa com Vulkan 1.3 (atualize o driver)',

@@ -113,6 +113,22 @@ the original repository.
 
 ---
 
+## Testado em (português)
+
+Santuário de Culto, a cena mais pesada (~5.600 desenhos por quadro), sem limite de FPS; medido por este fork em
+30/10/2026 com o build depois do 0.60.6-plus26. A CPU limita em uns 72 FPS em qualquer saída.
+
+| PC | Saída | Upscaler (render) | FPS (média / mínimo) |
+|---|---|---|---|
+| Ryzen 7 5700X + RTX 5060 Ti 8 GB | 1920×1080 | DLAA (1920×1080) | 72,6 / 70,2 |
+| Ryzen 7 5700X + RTX 5060 Ti 8 GB | 1920×1080 | DLSS ou FSR 3.1 (1280×720) | 72,4 / 70,9 |
+| Ryzen 7 5700X + RTX 5060 Ti 8 GB | 2560×1440 | DLSS Qualidade (1920×1080) | 65,0 / 63,9 |
+| Ryzen 7 5700X + RTX 5060 Ti 8 GB | 3840×2160 | FSR 3.1 (1920×1080) | 67–69 / 65–66 |
+
+No launcher, **Imagem e FPS → Sugerir para meu PC** escolhe saída, upscaler, render e texturas pela placa, VRAM, CPU
+e tela, e explica por quê. Outros PCs: abra uma issue com os seus números (painel F1) e o zip de relatório, e eles
+entram nesta tabela.
+
 ## Roteiro (português)
 
 Plano público deste fork, atualizado conforme o trabalho avança (última atualização: 25/10/2026).
@@ -334,6 +350,20 @@ In the launcher (**Quick settings → Textures**) and in the in-game menu (chang
 
 Requirements: Windows 10/11 64-bit and a **Vulkan 1.3** GPU (NVIDIA, AMD or Intel with a recent
 driver). No Python install needed.
+
+**Tested on** (Shrine of Worship, the heaviest scene, ~5,600 draws per frame, uncapped; measured by
+this fork on 30 Oct 2026 with the build after 0.60.6-plus26; the CPU limits it at about 72 FPS at any output):
+
+| PC | Output | Upscaler (render) | FPS (avg / min) |
+|---|---|---|---|
+| Ryzen 7 5700X + RTX 5060 Ti 8 GB | 1920×1080 | DLAA (1920×1080) | 72.6 / 70.2 |
+| Ryzen 7 5700X + RTX 5060 Ti 8 GB | 1920×1080 | DLSS or FSR 3.1 (1280×720) | 72.4 / 70.9 |
+| Ryzen 7 5700X + RTX 5060 Ti 8 GB | 2560×1440 | DLSS Quality (1920×1080) | 65.0 / 63.9 |
+| Ryzen 7 5700X + RTX 5060 Ti 8 GB | 3840×2160 | FSR 3.1 (1920×1080) | 67–69 / 65–66 |
+
+**Display & FPS → Suggest for my PC** in the launcher picks the output, upscaler, render size and
+textures from your card, video memory, CPU and screen, and says why. Other PCs: open an issue with
+your numbers (F1 panel) and the report zip, and they go in this table.
 
 | What | Where from | What for |
 |---|---|---|

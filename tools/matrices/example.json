@@ -1,0 +1,14 @@
+{
+  "scenarios": [
+    {"name": "route", "route": "tools/routes/example.json", "lap_s": 120},
+    {"name": "boss1", "boss": 1, "measure_s": 60}
+  ],
+  "laps": 3,
+  "settle_s": 10,
+  "base_env": {},
+  "configs": [
+    {"name": "baseline", "env": {}},
+    {"name": "live-switch", "env": {"SOTC_RB_WAIT_US": "0"}},
+    {"name": "restart-switch", "env": {"SOTC_SHADOW_REUSE": "1"}}
+  ]
+}

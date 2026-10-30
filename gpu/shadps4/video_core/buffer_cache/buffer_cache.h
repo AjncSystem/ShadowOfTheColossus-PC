@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <span>
 #include <vector>
 #include <unordered_map>
@@ -175,6 +176,16 @@ public:
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
+    /// sotc: SOTC_WRITE_DECL (page_manager.cpp DeclareCpuWrite): lock-free check whether any page
+    /// of the span may be write-protected, and how many are.
+    [[nodiscard]] bool MaybeWriteProtected(VAddr addr, size_t size) noexcept;
+    [[nodiscard]] u64 CountWriteProtectedPages(VAddr addr, size_t size) noexcept;
+    /// sotc: SOTC_WRITE_DECL: fn(ctx, addr, size) for each run of the span a declare settles
+    /// (MemoryTracker::ForEachDeclarableRun, unlocked look). Type-erased: MemoryTracker is not
+    /// complete in this header.
+    void ForEachDeclarableRun(VAddr addr, size_t size, void (*fn)(void*, VAddr, u64),
+                              void* ctx) noexcept;
+
     /// sotc: SOTC_HLE_SKIP=2: every page of the range is GPU-written and none CPU-dirty, i.e. a
     /// written binding of it has nothing left to do (MemoryTracker::IsSyncClean, is_written).
     [[nodiscard]] bool IsWrittenRangeSynced(VAddr addr, u64 size) const noexcept;
@@ -200,6 +211,29 @@ public:
     /// page protection system calls per replaced range). Data the guest never writes itself
     /// (fill-shader tables written by the command processor). Not resident: TryReplaceFromCpu.
     bool TryWriteThroughFromCpu(VAddr addr, const void* data, u64 size);
+
+    /// sotc: SOTC_FILL_HLE_GPU. TryWriteThroughFromCpu for a table that repeats a pattern of
+    /// `period` bytes (`period` == `size`: no repeat). The backing gets `data` from the CPU; the
+    /// arena is filled by the GPU (a fill when `period` is 4, else one uploaded seed of at most
+    /// ~1 MiB doubled by copies inside the arena), so the full table is never copied through a
+    /// staging buffer or marked CPU-written. `source` (may be 0): guest address of a copy's
+    /// source, used for a GPU-to-GPU copy when it is resident in the same arena and its pages are
+    /// in sync. `path` gets how it was done (FillGpuPath). Not resident: TryReplaceFromCpu.
+    bool TryFillThroughFromCpu(VAddr addr, const void* data, u64 size, u64 period, VAddr source,
+                               u32& path);
+
+    /// sotc: the arena holding [addr, addr + size) when the whole range is resident in one
+    /// arena, else nullptr.
+    const Buffer* ResidentArena(VAddr addr, u64 size) const;
+
+    /// sotc: values of TryFillThroughFromCpu's `path` (also the `aux` of the "hle fill" trace).
+    enum FillGpuPath : u32 {
+        FillPathReplace = 1, ///< not resident in one arena: TryReplaceFromCpu (marked CPU-written)
+        FillPathFill = 2,    ///< vkCmdFillBuffer (period 4)
+        FillPathDouble = 3,  ///< a seed upload, then doubling copies in the arena
+        FillPathUpload = 4,  ///< no repeat: the whole table through staging (write-through)
+        FillPathGpuCopy = 5, ///< no repeat: a copy from the source's arena range
+    };
 
     /// Byte-precise: true when a written binding covered any byte of the range since its last
     /// readback. Readbacks copy only these bytes, so the backing holds every other byte.
@@ -782,6 +816,10 @@ private:
     std::vector<std::pair<VAddr, u64>> dma_runs;
     bool dma_full_pending{}; // sotc: the next DMA sweep visits every run (see SynchronizeDmaBuffers)
     u64 untrack_applied{0};  // sotc: SOTC_UNTRACK_AUTO, the published list version applied last
+    u64 class_shadow_version{0}; // sotc: SOTC_CLASS_TRACK=2, the classified version counted last
+    u64 class_shadow_tick{0};    // sotc: SOTC_CLASS_TRACK=2, periodic recount counter
+    u64 class_pub_version{~0ULL}; // sotc: SOTC_CLASS_TRACK=1, the classification version published last
+    u32 class_pub_wait{30};       // sotc: SOTC_CLASS_TRACK=1, syncs since the last publish (at most 1 per 30)
     std::vector<std::pair<VAddr, u64>> dma_spans;
     /// Readback windows requested recently; downloaded together with the next readback.
     struct HotReadback {
@@ -1008,5 +1046,39 @@ public:
     /// From BeginAsyncReadback: true when the submit was left to the scope.
     static bool Defer(Vulkan::Scheduler& scheduler);
 };
+
+/// sotc: SOTC_FPS (B6). The guest instruction whose read fault is being served on this thread
+/// (PageManager::HandleGuestFault sets it around its ReadMemory call; 0 otherwise). ReadMemory
+/// counts the readbacks it waits for under it (NoteReadbackRip, buffer_cache.cpp).
+namespace SotcFaultRip {
+inline thread_local u64 current = 0;
+
+/// Sets current to rip for the scope when rip is not 0; restores the previous value on exit.
+class Scope {
+public:
+    explicit Scope(u64 rip) noexcept : set_{rip != 0}, prev_{set_ ? current : 0} {
+        if (set_) {
+            current = rip;
+        }
+    }
+    ~Scope() {
+        if (set_) {
+            current = prev_;
+        }
+    }
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+
+private:
+    bool set_;
+    u64 prev_;
+};
+} // namespace SotcFaultRip
+
+/// sotc: SOTC_FPS (B6). Appends the guest instructions (eboot offsets) with the most readbacks in
+/// the window to out, and resets the window. seconds = the window length. Counts the readbacks
+/// that wait for the GPU on the async path (SOTC_RB_ASYNC, the default); the sync path is not
+/// counted. Nothing is kept unless SOTC_FPS is set.
+void ReportReadbackRips(std::string& out, double seconds);
 
 } // namespace VideoCore

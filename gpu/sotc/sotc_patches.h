@@ -17,11 +17,16 @@ typedef struct {
     const uint64_t *red_zone_functions; /* function offsets to protect */
     uint32_t red_zone_count;
     void *tsc_clock;          /* non-null: rdtsc reads this host function (cores disagree on the TSC) */
+    /* sotc: out/hooks.bin (SOTCHOOK1, scripts/sotc_hooks.py) or NULL: engine hooks
+     * (docs/HOOK-DESIGN.md, gpu/sotc/hooks.h), installed after every other CPU patch. */
+    const char *hooks_path;
 } SotcPatchRequest;
 typedef struct {
     int needs_sse4a;
     uint64_t function_starts, short_sse4a, red_zone_functions, red_zone_instructions;
     uint64_t rdtsc, rdtsc_unpatched;
+    uint64_t hooks_installed, hooks_off; /* sotc: engine hooks (see the SOTC HOOK manifest) */
+    uint64_t trampoline_used;            /* sotc: trampoline bytes used by all CPU patches */
 } SotcPatchResult;
 int sotc_patch_eboot(const SotcPatchRequest *request, SotcPatchResult *result);
 int sotc_handle_illegal(void *exception_pointers);

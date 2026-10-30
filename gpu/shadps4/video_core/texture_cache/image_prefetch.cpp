@@ -13,6 +13,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/texture_cache/image_prefetch.h"
+#include "../../../sotc/area_prewarm.h" // sotc: SOTC_AREA_PREWARM replay hits
 
 namespace VideoCore {
 
@@ -30,6 +31,9 @@ constexpr u64 ExpireNs = 2'000'000'000ULL;
 /// No prefetch while the reported video memory use is above this share of the budget (permille):
 /// the collector and the over-budget path of UniqueImage::Create keep that case.
 constexpr u64 BudgetPermille = 900;
+/// sotc: replay entries outstanding (SOTC_AREA_PREWARM=3). Not in MaxEntries / MaxBytes: a replay
+/// has its own per-area budget (texture_cache.cpp), and it is dropped at each area change.
+constexpr size_t MaxReplayEntries = 4096;
 
 /// sotc: SOTC_IMAGE_PREFETCH_MAX=<n> (read once): outstanding prefetches allowed, instead of
 /// MaxEntries (1-4096). The byte cap grows in the same proportion as MaxBytes.
@@ -129,6 +133,41 @@ bool ImagePrefetcher::FitsLimits(const vk::ImageCreateInfo& ci) const {
     return ci.mipLevels <= u32(std::bit_width(largest));
 }
 
+void ImagePrefetcher::ReleaseLocked(const Entry& entry) {
+    if (entry.replay) {
+        --replay_outstanding;
+    } else {
+        outstanding_bytes -= entry.size_hint;
+    }
+}
+
+bool ImagePrefetcher::RequestReplay(const vk::ImageCreateInfo& image_ci, u64 size_hint) {
+    if (!FitsLimits(image_ci)) {
+        return false;
+    }
+    const u64 budget = SotcStats::vram_budget.load(std::memory_order_relaxed);
+    const u64 used = SotcStats::vram_used.load(std::memory_order_relaxed);
+    if (budget != 0 && used + size_hint > budget / 1000 * BudgetPermille) {
+        return false;
+    }
+    {
+        std::scoped_lock lk{mutex};
+        if (stopping || replay_outstanding >= MaxReplayEntries) {
+            return false;
+        }
+        auto entry = std::make_shared<Entry>();
+        entry->image_ci = image_ci;
+        entry->key = KeyOf(image_ci);
+        entry->size_hint = size_hint;
+        entry->replay = true;
+        entries.emplace(entry->key, entry);
+        queue.push_back(std::move(entry));
+        ++replay_outstanding;
+    }
+    work_cv.notify_one();
+    return true;
+}
+
 bool ImagePrefetcher::Request(const vk::ImageCreateInfo& image_ci, u64 size_hint) {
     if (!FitsLimits(image_ci)) {
         SotcStats::async_image_skipped.fetch_add(1, std::memory_order_relaxed);
@@ -144,7 +183,7 @@ bool ImagePrefetcher::Request(const vk::ImageCreateInfo& image_ci, u64 size_hint
     const u64 max_bytes = budget != 0 ? std::min(MaxBytesLimit(), budget / 16) : MaxBytesLimit();
     {
         std::scoped_lock lk{mutex};
-        if (stopping || entries.size() >= MaxEntriesLimit() ||
+        if (stopping || entries.size() - replay_outstanding >= MaxEntriesLimit() ||
             outstanding_bytes + size_hint > max_bytes) {
             SotcStats::async_image_skipped.fetch_add(1, std::memory_order_relaxed);
             return false;
@@ -166,7 +205,7 @@ void ImagePrefetcher::EraseLocked(const EntryPtr& entry) {
     auto [first, last] = entries.equal_range(entry->key);
     for (auto it = first; it != last; ++it) {
         if (it->second == entry) {
-            outstanding_bytes -= entry->size_hint;
+            ReleaseLocked(*entry);
             entries.erase(it);
             return;
         }
@@ -177,7 +216,9 @@ void ImagePrefetcher::ExpireLocked(u64 now, std::vector<UniqueImage>& out) {
     for (auto it = entries.begin(); it != entries.end();) {
         Entry& entry = *it->second;
         const bool failed = entry.state == State::Failed;
-        const bool stale = entry.state == State::Ready && now - entry.ready_ns > ExpireNs;
+        // sotc: a replay entry waits for its draw (no time expiry)
+        const bool stale =
+            entry.state == State::Ready && !entry.replay && now - entry.ready_ns > ExpireNs;
         if (entry.claimed || (!failed && !stale)) {
             ++it;
             continue;
@@ -186,7 +227,7 @@ void ImagePrefetcher::ExpireLocked(u64 now, std::vector<UniqueImage>& out) {
             out.push_back(std::move(entry.image));
             SotcStats::async_image_expired.fetch_add(1, std::memory_order_relaxed);
         }
-        outstanding_bytes -= entry.size_hint;
+        ReleaseLocked(entry);
         it = entries.erase(it);
     }
 }
@@ -249,6 +290,9 @@ bool ImagePrefetcher::Take(const vk::ImageCreateInfo& image_ci, UniqueImage& out
         return false; // the worker failed (budget): the caller creates it as before
     }
     out = std::move(best->image);
+    if (best->replay) {
+        SotcAreaPrewarm::NoteReplayHit(); // sotc: SOTC_AREA_PREWARM: a draw took a replayed image
+    }
     if (!waited) {
         SotcStats::async_image_taken.fetch_add(1, std::memory_order_relaxed);
     }
@@ -288,7 +332,29 @@ void ImagePrefetcher::DropUnclaimed() {
             } else if (entry.state == State::Queued) {
                 entry.state = State::Cancelled;
             }
-            outstanding_bytes -= entry.size_hint;
+            ReleaseLocked(entry);
+            it = entries.erase(it);
+        }
+    }
+    // `dropped` is destroyed here, outside the lock.
+}
+
+void ImagePrefetcher::DropReplay() {
+    std::vector<UniqueImage> dropped;
+    {
+        std::scoped_lock lk{mutex};
+        for (auto it = entries.begin(); it != entries.end();) {
+            Entry& entry = *it->second;
+            if (!entry.replay || entry.claimed || entry.state == State::Running) {
+                ++it;
+                continue;
+            }
+            if (entry.state == State::Ready) {
+                dropped.push_back(std::move(entry.image));
+            } else if (entry.state == State::Queued) {
+                entry.state = State::Cancelled;
+            }
+            ReleaseLocked(entry);
             it = entries.erase(it);
         }
     }

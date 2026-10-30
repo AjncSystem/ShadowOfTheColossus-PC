@@ -370,3 +370,28 @@ add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_sup
 target_include_directories(upscaler-support-test PRIVATE shim)
 target_compile_options(upscaler-support-test PRIVATE -UNDEBUG)
 
+# sotc: guest detour stubs (Core::InstallGuestDetour, docs/HOOK-DESIGN.md). Windows only.
+if (WIN32)
+    add_executable(hook-detour-test EXCLUDE_FROM_ALL sotc/tests/hook_detour_test.cpp)
+    target_include_directories(hook-detour-test PRIVATE shim shadps4 sotc)
+    target_compile_options(hook-detour-test PRIVATE -UNDEBUG)
+    target_link_libraries(hook-detour-test PRIVATE bbgpu)
+
+    # sotc: trace v2 unit tests (no game). The copy-based stack unwinder (gpu/sotc/unwind.cpp) and
+    # the import-timing thunk (src/runtime_trace_imports.c), each self-contained.
+    add_executable(unwind-test EXCLUDE_FROM_ALL ../tools/unwind_test.cpp sotc/unwind.cpp)
+    target_include_directories(unwind-test PRIVATE shim shadps4 sotc)
+    target_compile_options(unwind-test PRIVATE -UNDEBUG)
+
+    add_executable(trace-thunk-test EXCLUDE_FROM_ALL ../tools/trace_thunk_test.c
+                   ../src/runtime_trace_imports.c)
+    set_target_properties(trace-thunk-test PROPERTIES C_STANDARD 11 C_EXTENSIONS OFF)
+    target_compile_options(trace-thunk-test PRIVATE $<$<COMPILE_LANGUAGE:C>:-Wall -Wextra>)
+endif()
+
+
+# sotc: SotC Lab autopilot (route spline, JSON round trip). Links only the autopilot; the test
+# stubs SotcFreecam::MaxSpeed itself.
+add_executable(autopilot-test EXCLUDE_FROM_ALL sotc/tests/autopilot_test.cpp sotc/autopilot.cpp)
+target_include_directories(autopilot-test PRIVATE sotc)
+target_compile_options(autopilot-test PRIVATE -UNDEBUG)

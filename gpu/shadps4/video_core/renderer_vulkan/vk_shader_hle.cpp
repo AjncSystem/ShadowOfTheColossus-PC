@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -390,6 +391,16 @@ static bool ReplaceChangedPages(Rasterizer& rasterizer, VAddr address, const u8*
     return flush();
 }
 
+// sotc: SOTC_TRACE. One "hle fill" instant per whole-table replace: a = bytes, b = address,
+// aux = BufferCache::FillGpuPath, flags = log2 of the pattern period in bytes (capped at 0xffff).
+static void TraceHleFill(VAddr address, u64 size, u64 period, u32 path) {
+    if (SotcTrace::kOn) {
+        const uint64_t now = SotcTrace::Now();
+        const auto log2 = static_cast<u16>(period ? std::bit_width(period) - 1 : 0);
+        SotcTrace::PushEvent(SotcTrace::EvInstant, "hle fill", now, now, size, address, path, log2);
+    }
+}
+
 // The whole table: the pattern of src_count elements, repeated (no division per element).
 static std::vector<u32> data;
 static void BuildTable(const u32* source, u64 src_count, u64 count) {
@@ -512,9 +523,41 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
     } else {
         BuildTable(source, src_count, count);
     }
+    // sotc: SOTC_FILL_HLE_GPU (on by default since 30 Oct 2026; =0 turns it off). A destination resident in one arena gets the
+    // table from the GPU (fill, doubling copies or a copy from the source; FillGpuPath) instead of
+    // being marked CPU-written, which the next DMA sweep or bind copied through staging again
+    // (one 8 MiB table at 0x1068b00000, ~33 times per area load). The backing is still written.
+    static const bool fill_gpu = [] {
+        const char* v = std::getenv("SOTC_FILL_HLE_GPU");
+        return !v || v[0] != '0';
+    }();
+    const u64 table_bytes = count * 4;
+    const u64 period = src_count * 4;
+    if (fill_gpu) {
+        const bool overlap = src.base_address < address + table_bytes &&
+                             address < src.base_address + period;
+        u32 path = 0;
+        if (!buffer_cache.TryFillThroughFromCpu(address, data.data(), table_bytes, period,
+                                                overlap ? 0 : src.base_address, path)) {
+            return false;
+        }
+        TraceHleFill(address, table_bytes, period, path);
+        wrote = true;
+        if (SotcStats::kCmdStats) {
+            SotcStats::inv_hle.fetch_add(table_bytes, std::memory_order_relaxed);
+        }
+        if (path == VideoCore::BufferCache::FillPathReplace) {
+            rasterizer.InvalidateMemory(address, table_bytes);
+        } else {
+            // As ReplaceChangedPages: the arena already holds the table.
+            rasterizer.GetTextureCache().InvalidateMemory(address, table_bytes);
+        }
+        return true;
+    }
     if (!buffer_cache.TryReplaceFromCpu(address, data.data(), count * 4)) {
         return false;
     }
+    TraceHleFill(address, table_bytes, period, VideoCore::BufferCache::FillPathReplace);
     wrote = true;
     if (SotcStats::kCmdStats) SotcStats::inv_hle.fetch_add(count * 4, std::memory_order_relaxed);
     rasterizer.InvalidateMemory(address, count * 4);

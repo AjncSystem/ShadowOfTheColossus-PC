@@ -371,6 +371,26 @@ static void sample_host(PadData *d) {
     SDL_Gamepad *g=current_gamepad();
     if (!bindings_ready) { load_bindings(); bindings_ready=1; }
     if (bbgpu_overlay_captures_input()) return; /* settings menu open: neutral input */
+    if (bbgpu_freecam_captures_input()) {
+        /* sotc: SotC Lab free-cam flying: neutral input for the game; the gamepad drives the camera.
+         * Mouse motion is read by the free-cam from SDL events, so drain it here (no jump later). */
+        float mdx=0, mdy=0;
+        unsigned held=0;
+        (void)bbgpu_mouse_take(&mdx,&mdy,&held);
+        float lx=0, ly=0, rx=0, ry=0, l2=0, r2=0;
+        uint32_t buttons=0;
+        if (g) {
+            for (int i=IN_CROSS;i<=IN_RIGHT;++i) if (pad_value(g,i)>30) buttons|=input_buttons[i];
+            lx=SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_LEFTX)/32767.0f;
+            ly=SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_LEFTY)/32767.0f;
+            rx=SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_RIGHTX)/32767.0f;
+            ry=SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_RIGHTY)/32767.0f;
+            l2=SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_LEFT_TRIGGER)/32767.0f;
+            r2=SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_RIGHT_TRIGGER)/32767.0f;
+        }
+        bbgpu_freecam_feed_pad(lx,ly,rx,ry,l2,r2,buttons);
+        return;
+    }
     const bool *k=SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(NULL) : NULL;
     if (g) {
         int touch_right=0;
@@ -549,7 +569,7 @@ static void touch_ids(PadData *d) {
 }
 static void sample(PadData *d) {
     sample_host(d);
-    if (bbgpu_overlay_captures_input()) return;
+    if (bbgpu_overlay_captures_input() || bbgpu_freecam_captures_input()) return;
     record_sample(d);
     read_inject();
     replay_sample(d);

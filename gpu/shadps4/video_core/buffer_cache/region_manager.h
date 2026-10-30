@@ -20,6 +20,10 @@
 #include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/page_manager.h"
 #include "video_core/sotc_stats.h"
+#include "../../../sotc/mem_classes.h" // sotc: SOTC_CLASS_TRACK=1 owns the untrack list (plan step 6)
+#include "../../../sotc/sotc_live.h" // sotc: live switches (SotcLive)
+// sotc: SOTC_UNTRACK_MAX_MB (default 16 MiB), live (SotcLive): the cap of the untrack list.
+inline SotcLive::Int kUntrackMaxMb{"SOTC_UNTRACK_MAX_MB", 16};
 
 namespace VideoCore {
 
@@ -218,42 +222,38 @@ struct SotcUntrack {
     /// The flip thread publishes the live chunk list of the game's heap (driver.cpp,
     /// UntrackAutoTick); the draw thread applies it to the regions (BufferCache::SynchronizeDmaBuffers).
     /// Only the list is shared between the two threads.
+    /// sotc: SOTC_CLASS_TRACK=1 (plan step 6) also turns this on: the draw thread publishes the CPU-only
+    /// ranges of the chosen pools (PublishClass), so the same apply and self-check run for them.
+    /// Mode 1 is refused (Mode() == 0) with SOTC_UNTRACK_AUTO=1 or SOTC_CP_AHEAD.
     static bool AutoOn() {
         static const bool on = [] {
             const char* v = std::getenv("SOTC_UNTRACK_AUTO");
             const char* ahead = std::getenv("SOTC_CP_AHEAD");
-            return v && v[0] == '1' && !(ahead && std::atoi(ahead) != 0);
+            return (v && v[0] == '1' && !(ahead && std::atoi(ahead) != 0)) ||
+                   SotcMemClasses::Mode() == 1;
         }();
         return on;
     }
     /// sotc: flip thread. Publishes a live list, clipped in list order to SOTC_UNTRACK_MAX_MB (16
-    /// when unset). An unchanged list publishes nothing; nothing is published after a trip.
+    /// when unset). An unchanged list publishes nothing; nothing is published after a trip. With
+    /// SOTC_CLASS_TRACK=1 the class mode owns the list: the flip thread publishes nothing.
     static void Publish(std::vector<Range> live) {
-        static const u64 cap = [] {
-            const char* v = std::getenv("SOTC_UNTRACK_MAX_MB");
-            const u64 mib = v ? std::strtoull(v, nullptr, 10) : 16;
-            return std::min<u64>(mib, 1024) << 20;
-        }();
-        std::vector<Range> clipped;
-        u64 total = 0;
-        for (const Range& r : live) {
-            if (total >= cap) {
-                break;
-            }
-            const u64 size = std::min(r.size, cap - total);
-            clipped.push_back(Range{r.addr, size});
-            total += size;
-        }
-        std::scoped_lock lock{AutoMutex()};
-        if (tripped.load(std::memory_order_relaxed) || clipped == AutoActive()) {
+        if (SotcMemClasses::Mode() == 1) {
             return;
         }
-        AutoActive() = std::move(clipped);
-        auto_bytes.store(total, std::memory_order_relaxed);
-        auto_version.fetch_add(1, std::memory_order_release);
-        std::fprintf(stderr, "SOTC untrack auto: %zu ranges, %.1f MiB untracked (cap %llu MiB)\n",
-                     AutoActive().size(), total / 1048576.0,
-                     static_cast<unsigned long long>(cap >> 20));
+        // Live (SotcLive): the cap is read on each publish.
+        const u64 cap = std::min<u64>(static_cast<u64>(std::max(kUntrackMaxMb.get(), 0)), 1024) << 20;
+        PublishCapped(std::move(live), cap, "untrack auto");
+    }
+    /// sotc: SOTC_CLASS_TRACK=1 (draw thread). Publishes the CPU-only ranges of the apply pools,
+    /// clipped to SOTC_CLASS_MAX_MB (512 when unset). Same rules as Publish otherwise.
+    static void PublishClass(std::vector<Range> live) {
+        static const u64 cap = [] {
+            const char* v = std::getenv("SOTC_CLASS_MAX_MB");
+            const u64 mib = v ? std::strtoull(v, nullptr, 10) : 512;
+            return std::min<u64>(mib, 1024) << 20;
+        }();
+        PublishCapped(std::move(live), cap, "class apply");
     }
     /// sotc: any thread. The published list (copied) and its version.
     static std::vector<Range> AutoSnapshot(u64& version) {
@@ -307,6 +307,29 @@ struct SotcUntrack {
     inline static std::atomic<bool> tripped{false};
 
 private:
+    /// sotc: clips `live` in list order to `cap` bytes and makes it the active list when it changed.
+    static void PublishCapped(std::vector<Range> live, u64 cap, const char* label) {
+        std::vector<Range> clipped;
+        u64 total = 0;
+        for (const Range& r : live) {
+            if (total >= cap) {
+                break;
+            }
+            const u64 size = std::min(r.size, cap - total);
+            clipped.push_back(Range{r.addr, size});
+            total += size;
+        }
+        std::scoped_lock lock{AutoMutex()};
+        if (tripped.load(std::memory_order_relaxed) || clipped == AutoActive()) {
+            return;
+        }
+        AutoActive() = std::move(clipped);
+        auto_bytes.store(total, std::memory_order_relaxed);
+        auto_version.fetch_add(1, std::memory_order_release);
+        std::fprintf(stderr, "SOTC %s: %zu ranges, %.1f MiB untracked (cap %llu MiB)\n", label,
+                     AutoActive().size(), total / 1048576.0,
+                     static_cast<unsigned long long>(cap >> 20));
+    }
     static std::mutex& AutoMutex() {
         static std::mutex m;
         return m;
@@ -733,6 +756,69 @@ public:
         return pages;
     }
 
+    /// sotc: SOTC_WRITE_DECL pre-check (MemoryTracker::MaybeWriteProtected). Unlocked look at the
+    /// bits of [offset, offset + size): true when a page is CPU-clean (its write watcher protects
+    /// it) or, with GPU readbacks Precise (read watchers on GPU-modified pages), GPU-modified. The
+    /// look is racy by design: a page that changes meanwhile is missed (it faults later) or taken
+    /// for protected (an unneeded call).
+    bool MaybeWriteProtected(u64 offset, u64 size) noexcept {
+        const bool read_tracked = readbacks_mode == GpuReadbacksMode::Precise;
+        bool any = false;
+        IterateWords(GetBounds(offset, size), [&](u64 index, u64 mask) {
+            u64 prot = ~__atomic_load_n(&cpu[index], __ATOMIC_RELAXED);
+            if (read_tracked) {
+                prot |= __atomic_load_n(&gpu[index], __ATOMIC_RELAXED);
+            }
+            any |= (prot & mask) != 0;
+        });
+        return any;
+    }
+
+    /// sotc: SOTC_WRITE_DECL statistics: the pages MaybeWriteProtected counts in the range (same
+    /// unlocked bits, all of them).
+    u64 CountWriteProtectedPages(u64 offset, u64 size) noexcept {
+        const bool read_tracked = readbacks_mode == GpuReadbacksMode::Precise;
+        u64 pages = 0;
+        IterateWords(GetBounds(offset, size), [&](u64 index, u64 mask) {
+            u64 prot = ~__atomic_load_n(&cpu[index], __ATOMIC_RELAXED);
+            if (read_tracked) {
+                prot |= __atomic_load_n(&gpu[index], __ATOMIC_RELAXED);
+            }
+            pages += std::popcount(prot & mask);
+        });
+        return pages;
+    }
+
+    /// sotc: SOTC_WRITE_DECL. Unlocked look at the pages of [offset, offset + size): calls
+    /// func(offset, size) for each run of pages that are write-protected by CPU tracking (CPU bit
+    /// 0) and hold no GPU data (GPU bit 0). Only those are declared. CPU-modified pages are already
+    /// known to the caches, and GPU-modified pages keep their protection and go through the fault
+    /// path (a readback), so a declare never reads a GPU page back. Each run is clipped to the span.
+    template <typename Func>
+    void ForEachDeclarableRun(u64 offset, u64 size, Func&& func) noexcept {
+        const u64 end = offset + size;
+        bool open = false;
+        u64 run_begin = 0;
+        for (u64 page = offset / BYTES_PER_PAGE; page * BYTES_PER_PAGE < end; ++page) {
+            const u64 index = page / PAGES_PER_WORD;
+            const u64 bit = 1ULL << (page % PAGES_PER_WORD);
+            const u64 cpu_bits = __atomic_load_n(&cpu[index], __ATOMIC_RELAXED);
+            const u64 gpu_bits = __atomic_load_n(&gpu[index], __ATOMIC_RELAXED);
+            const bool declarable = ((~cpu_bits) & (~gpu_bits) & bit) != 0;
+            const u64 page_begin = page * BYTES_PER_PAGE;
+            if (declarable && !open) {
+                run_begin = std::max(page_begin, offset);
+                open = true;
+            } else if (!declarable && open) {
+                func(run_begin, std::min(page_begin, end) - run_begin);
+                open = false;
+            }
+        }
+        if (open) {
+            func(run_begin, end - run_begin);
+        }
+    }
+
     /// sotc: SOTC_SYNC_FAST. Words (256 KiB each) per write generation: 8 = 2 MiB granules.
     static constexpr u64 SYNC_GEN_WORDS = 8;
     static constexpr u64 NUM_SYNC_GENS = NUM_REGION_WORDS / SYNC_GEN_WORDS;
@@ -810,6 +896,18 @@ public:
             }
         }
         return mask;
+    }
+
+    /// sotc: SOTC_CLASS_TRACK=2 shadow. Counts pages of this region that lie in `mask` and carry a
+    /// GPU bit, without changing any state. A non-zero count over a CPU-only mask means the
+    /// classification is wrong (the GPU wrote a range the allocator called CPU-only). Read only,
+    /// relaxed loads: an approximate count is enough for the self-check.
+    u64 CountGpuInMask(const RegionBits& mask) const {
+        u64 pages = 0;
+        for (u64 index = 0; index < NUM_REGION_WORDS; ++index) {
+            pages += std::popcount(__atomic_load_n(&gpu[index], __ATOMIC_RELAXED) & mask[index]);
+        }
+        return pages;
     }
 
 private:

@@ -1,0 +1,12 @@
+{
+  "_comment": "Demo route with placeholder coordinates near the origin. Real routes are recorded in-game with F4 (SotC Lab), which writes user/routes/<name>.json.",
+  "name": "example",
+  "speed": 20.0,
+  "start": {},
+  "points": [
+    { "p": [0.0, 0.0, 0.0], "yaw": 0.0, "pitch": 0.0, "seg": "bridge", "dwell_ms": 0 },
+    { "p": [0.0, 0.0, 10.0], "yaw": 0.0, "pitch": -0.1, "dwell_ms": 0 },
+    { "p": [10.0, 0.0, 20.0], "yaw": 0.5, "pitch": -0.2, "seg": "courtyard", "dwell_ms": 1000 },
+    { "p": [20.0, 0.0, 20.0], "yaw": 1.0, "pitch": 0.0, "dwell_ms": 0 }
+  ]
+}

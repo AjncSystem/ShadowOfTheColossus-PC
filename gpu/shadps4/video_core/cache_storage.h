@@ -47,6 +47,15 @@ public:
     void Load(BlobType type, const std::string& name, std::vector<u32>& data);
 
     void ForEachBlob(BlobType type, const std::function<void(std::vector<u8>&& data)>& func);
+    /// sotc: ForEachBlob that also passes each blob name, without the extension (as Save).
+    void ForEachNamedBlob(
+        BlobType type,
+        const std::function<void(std::vector<u8>&& data, const std::string& name)>& func);
+    /// sotc: deletes the loose file of a blob (name without extension) and forgets the name in
+    /// known_files. During the preload the name also leaves the preload copy when the preload
+    /// ends (FinishPreload). True when a file was deleted. False when there is no loose file to
+    /// delete, or the cache is an archive (an archived cache cannot drop an entry).
+    bool Remove(BlobType type, const std::string& name);
     /// sotc: how many blobs of a type there are (the loading screen's progress).
     size_t CountBlobs(BlobType type);
 
@@ -67,6 +76,8 @@ private:
     /// name; ordered like an NTFS directory listing. Emptied by FinishPreload.
     std::map<std::string, std::vector<u8>> prefetched{};
     bool prefetch_active{};
+    /// sotc: files Remove deleted during the preload; FinishPreload drops them from prefetched.
+    std::vector<std::string> prefetch_removed{};
     std::unordered_set<std::string> known_files{};
     std::mutex known_mutex{};
     bool known_valid{};

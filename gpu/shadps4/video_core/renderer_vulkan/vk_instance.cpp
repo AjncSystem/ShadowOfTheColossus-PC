@@ -20,6 +20,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/sotc_stats.h"
+#include "sotc_gpu_trace.h"
 
 #include <vk_mem_alloc.h>
 
@@ -459,6 +460,23 @@ bool Instance::CreateDevice() {
     }
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
+    // sotc: SOTC_TRACE_GPU (sotc_gpu_trace.cpp) needs a calibrated time domain too: KHR when the
+    // device lists it, else EXT. The EXT one that Tracy enabled above is reused.
+    if (SotcGpuTrace::kOn) {
+        const auto available = [this](const char* name) {
+            return std::find_if(available_extensions.begin(), available_extensions.end(),
+                                [&](const std::string& e) { return e == name; }) !=
+                   available_extensions.end();
+        };
+        if (calibrated_timestamps) {
+            gpu_trace_calibrated = true;
+        } else if (available(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+            gpu_trace_calibrated_khr = add_extension(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+            gpu_trace_calibrated = gpu_trace_calibrated_khr;
+        } else if (available(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+            gpu_trace_calibrated = add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+        }
+    }
     // Device fault reporting: lets us print the faulting address/type after a device loss.
     device_fault = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
     if (device_fault) {
@@ -1068,6 +1086,25 @@ bool Instance::CreateDevice() {
         } else {
             LOG_WARNING(Render_Vulkan, "Could not query calibrated time domains for profiling: {}",
                         vk::to_string(time_domains_result));
+        }
+    }
+
+    // sotc: SOTC_TRACE_GPU: timestampValidBits of the graphics queue family, and whether the
+    // calibrated domains include QueryPerformanceCounter (Windows).
+    if (SotcGpuTrace::kOn) {
+        timestamp_valid_bits =
+            physical_device.getQueueFamilyProperties()[queue_family_index].timestampValidBits;
+        if (gpu_trace_calibrated) {
+#if defined(_WIN64)
+            const auto domains_info = gpu_trace_calibrated_khr
+                                          ? physical_device.getCalibrateableTimeDomainsKHR()
+                                          : physical_device.getCalibrateableTimeDomainsEXT();
+            gpu_trace_host_domain =
+                domains_info.result == vk::Result::eSuccess &&
+                std::find(domains_info.value.cbegin(), domains_info.value.cend(),
+                          vk::TimeDomainKHR::eQueryPerformanceCounter) !=
+                    domains_info.value.cend();
+#endif
         }
     }
 

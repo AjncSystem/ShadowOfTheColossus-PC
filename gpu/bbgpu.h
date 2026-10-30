@@ -53,6 +53,11 @@ int bbgpu_text_input_poll(char *out_utf8, uint64_t size);
 int bbgpu_mouse_take(float *dx, float *dy, unsigned *buttons);
 /* 1 while the in-game settings menu is open: the game's pad input is held neutral. */
 int bbgpu_overlay_captures_input(void);
+/* sotc: SotC Lab free-cam (gpu/sotc/freecam.h). Non-zero while it flies: the game gets a neutral pad
+ * and the host pad is handed to the free camera (sticks/triggers -1..1 / 0..1, PS4 button bits). */
+int bbgpu_freecam_captures_input(void);
+void bbgpu_freecam_feed_pad(float lx, float ly, float rx, float ry, float l2, float r2,
+                            uint32_t buttons);
 /* Number of symbols registered by the vendored libraries (diagnostics). */
 unsigned bbgpu_symbol_count(void);
 /* sotc: where the engine keeps the pointer to its TargetFramesPerSeconds value (fps60game mode):
@@ -60,6 +65,13 @@ unsigned bbgpu_symbol_count(void);
 void bbgpu_set_fps_target_slot(void *slot);
 /* sotc: SOTC_STALL_DETAIL: the calling guest thread's CPU time is counted (src/runtime_thread.c host_start). */
 void bbgpu_register_guest_thread(void);
+/* sotc: SOTC_WRITE_DECL. The CPU is about to write [address, address+size) of guest memory
+ * (a host memcpy/memset/memmove or file read on behalf of the guest; return_address is the
+ * guest caller, for attribution). =1: the GPU-tracked pages of the span are taken as written
+ * now, as one write fault per page would, but in one pass (page_manager.cpp DeclareCpuWrite).
+ * =2: only counted (the would-be declared pages per caller, SOTC WRITE DECL report line).
+ * Unset/0: returns at once. Returns the number of tracked pages found in the span. */
+uint64_t bbgpu_declare_cpu_write(void *address, uint64_t size, uint64_t return_address);
 #ifdef __cplusplus
 }
 #endif

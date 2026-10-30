@@ -1,0 +1,202 @@
+# SotC eboot function names (fingerprint 72c1d4a9...), one per function start.
+# Read only by tools/re/eboot_re.py (labels in func/dis/callers output). Hooks and the port
+# never read this file; a name here is a hint for the RE tools, not a symbol the game has.
+# Format: 0x<eboot offset> <name>  # <report> [; note] [; also <other name> (<report>), ...]
+# Names come from the "Proposed names" sections of docs/re-stutters/reports/01-08. When two
+# reports name the same address differently, the more specific name is kept and the others
+# follow "also". Notes say when a name is inferred or unverified. Every address was checked with
+# eboot_re.py func: it is the +0x0 start of its function range.
+# The text after the name (from "  #") is part of the line for the tool, so eboot_re.py shows it.
+
+0x110a0 memory_system_init  # 04; allocator sets, GameSingleFrame, GPUMemory | also Memory_InitAllocators (03)
+0x12040 mem_allocator_destroy  # 04
+0x13380 cpu_memory_family_init  # 04; kind 1
+0x18aa0 bpe_PlatformPageAllocator_Init  # 04; builds the four blocks
+0x19660 pool_node_alloc  # 04; free-run node from the node pool
+0x197d0 pool_init_flexible  # 04; 406 MiB flexible pool
+0x19ae0 pool_alloc_block_wrapper  # 04
+0x19c60 pool_alloc_region_simple  # 04
+0x19e00 pool_alloc_region  # 04; main block allocator
+0x1a660 pool_alloc_region_aligned  # 04
+0x1a800 pool_take_free_run  # 04
+0x1abf0 vmem_query_reserve_map  # 04
+0x1af80 vmem_batch_map  # 04
+0x1b0e0 pool_free_block  # 04
+0x312a0 FiosOp::WaitAndRelease  # 05
+0x31830 FiosFile::PreadAsync  # 05; sceFiosFHPread
+0x31900 FiosOp::IsDone  # 05
+0x323c0 Rdtsc_Read  # 08
+0x324e0 Time_SecondsSinceBase  # 08
+0x33400 JobSystem_NotifyCounterUpdate  # 08
+0x335d0 JobSystem_Initialize  # 08
+0x34230 EThreadAffinity_Name  # 08
+0x34b10 JobSystem_AllocateCounter  # 08 | also JobSystem::AllocateCounter (06)
+0x34bd0 JobSystem_FreeCounter  # 08 | also BpeJobSystem_FreeCounter (02)
+0x34d90 JobSystem_BeginJobArray  # 08
+0x35480 JobSystem_KickJobArray  # 08 | also JobSystem::BeginJobArray (06)
+0x35590 JobSystem_WaitForCounter  # 08 | also BpeJobSystem_WaitCounter (02)
+0x35730 JobSystem_WaitAndFreeCounter  # 08 | also BpeJobSystem_WaitCounterWrapper (02), JobSystem::KickArray (06)
+0x36140 WorkerThread_StartFunc  # 08
+0x37500 JobSystemScheduler_SuspendFiberSwitchFree  # 08
+0x38700 JobSystemScheduler_DoJobScheduling  # 08
+0x38b40 JobSystemScheduler_WorkerIdleWait  # 08
+0x39800 JobSystemScheduler_ExecuteJob  # 08
+0x39cc0 JobSystemScheduler_CanWorkerSleep  # 08
+0x39de0 JobSystemScheduler_CheckForDeadlock  # 08
+0x3b3d0 EventFlag_CreatePS4SyncEvent  # 08 | also EventFlag_Init (02), bpe::threading::Event::Create (05), SyncEvent::Create (06)
+0x3b450 EventFlag_Set  # 02; 08 | also bpe::threading::Event::Set (05), SyncEvent::Set (06)
+0x3b460 EventFlag_Clear  # 02; 08 | also SyncEvent::Clear (06)
+0x3b470 EventFlag_Poll  # 02; 08 | also SyncEvent::Poll (06)
+0x3b4a0 EventFlag_WaitInfinite  # 02; 08; no timeout | also bpe::threading::Event::Wait (05), SyncEvent::Wait (06)
+0x3b4e0 EventFlag_WaitMs  # 02; timed variant, no direct callers found | also EventFlag_WaitTimed (08)
+0x3b570 Sleep_Usec1  # 02; jmp sceKernelUsleep | also Thread_Usleep (08)
+0x3b5c0 Thread_Create  # 08 | also Thread::Create (06)
+0x3b6a0 Thread_PthreadCreateAffinity  # 08
+0x475c0 mem_allocator_ctor  # 04
+0x47620 mem_allocator_free_all  # 04
+0x479a0 mem_allocator_alloc  # 04
+0x47a10 mem_allocator_alloc_reuse  # 04
+0x47b20 mem_family_ctor  # 04; vtable 0x15959c0
+0x47b60 mem_family_set_root  # 04
+0x48a70 BpeHeap_Walk  # 03; inferred
+0x48c80 BpeHeap_Free  # 03; inferred
+0x49030 BpeHeap_Find  # 03; inferred
+0x493d0 BpeHeap_Link  # 03; inferred
+0x497f0 BpeHeap_Alloc  # 03; inferred
+0x5bd70 InitEXPROccluderDebugModeNames  # 01
+0x6efe0 RegisterXprCvars  # 01
+0x8b7f0 EndFrameView_WriteA  # 03; inferred
+0x8c880 render_context_register_heaps  # 04; static init of named heaps | also RenderSingleFrameGPU_Init (03)
+0x8ef20 RenderDeferredMemoryDeleter_FlushPendingFree  # 02
+0x90470 PerFrameRenderContexts::RequestNewRenderContext  # 03; string-confirmed
+0x90860 Flip::SetupFlipState  # 06
+0x90ea0 RenderBackend_Frame  # 02
+0x925c0 BPGnm_WriteCsDoneLabel  # 01; EOP 0x28, data 1
+0x92b50 BPGnm_DispatchWithLabelWait  # 01; inferred
+0x956e0 Flip::SubmitAndWaitVblank  # 06 | also Flip_SubmitAndWaitVblank (02), VideoOut_FlipShutdown (08)
+0x95760 RenderFlip_Setup  # 02 | also Flip::Setup (06), VideoOut_ReconfigureBuffers (08)
+0x95a90 VideoOut_OpenSetFlipRate  # 08
+0x960a0 FlipEvent_WaitEqueue  # 02 | also RenderFlip::ThreadFunction (06)
+0x96f50 Flip::GetBufferIndex  # 06; reads [obj+0x198]
+0x9aef0 render_targets_allocate  # 04; kRTT_* | also BPXPR_CreateOccluderTargets (01)
+0xbcde0 RenderThread_Kick  # 02 | also RenderSync_KickFrame (08)
+0xbcf60 RenderThread::ResetFrameEvents  # 06 | also RenderThread_SignalGate (02)
+0xbcf90 RenderThread_WaitGateTimed_A  # 02
+0xbd010 RenderThread_WaitGateTimed_B  # 02
+0xbd0a0 RenderThread_WaitGateTimed_C  # 02
+0xbd110 RenderThread_WaitGateTimed_D  # 02
+0xbd170 RenderThread_Ctor  # 02 | also RenderThread::Init (06), RenderThread_Init (08)
+0xbd6d0 RenderThread_ThreadFunction  # 02; 08 | also RenderThread::ThreadFunction (06)
+0xbda00 RenderThread_Dtor  # 02 | also RenderThread::KickFrame (06)
+0xbdf20 RenderThread_WaitGateTimed_E  # 02
+0xbe1f0 SetViewParams  # 03; string-confirmed
+0xc12a0 RenderThread::RunFunctionAsRenderJob  # 06 | also RenderThread_RunFunctionAsRenderJob (08)
+0xc5110 BPXPR_IndexCullJob  # 01
+0xc5130 BPXPR_QueueIndexCull  # 01
+0xc53d0 RenderCullXPR  # 06
+0xc5560 RenderThread::SubmitJob  # 06; allocates SubmitJobParams | also RenderThread_KickoffSubmitJob (08)
+0xc59d0 BPRender_DepthAndGBufferPasses  # 01; inferred | also RenderDepthAndGBuffer (06)
+0xc6670 BPXPR_RunCullPasses  # 01
+0xc6810 BPXPR_BuildPreShaderSlots  # 01; XPRRenderInstancePreShaders
+0xc6bd0 BPXPR_CullShadowScenes  # 01
+0xc6f70 BPXPR_CullMainScene  # 01
+0xca6d0 BPXPR_PreRender  # 01; XPRPreRender
+0xcaed0 RenderView::MainCamera  # 06
+0xcc9b0 RenderShadows  # 06
+0xcedf0 EndFrameView_WriteB  # 03; inferred | also RenderPhase (06)
+0xcef90 RenderThread::FrameJobEntry  # 06 | also RenderJob_Entry (08)
+0xcefa0 EndFrameViewParams  # 03; string-confirmed | also RenderThread::RenderFrame (06)
+0xcfdb0 UpdateSkinningRenderObjects  # 03; string-confirmed | also RenderSkinningAndStreaming (06)
+0xd07c0 RenderThread::KickoffSubmitJob  # 06
+0xe48b0 WaterRendering::ReadQueries  # 06
+0x101720 ParticleRenderer_ShiftRecords  # 03; inferred
+0x1018c0 ParticleSystemPool::ProcessStats  # 03; string-confirmed | also ParticleSystemPool_ProcessStats (02)
+0x103ad0 ParticleRenderer::UpdateSimulation  # 03; string-confirmed
+0x1051f0 ParticleRenderer::UpdateSimulation  # 03; string-confirmed, second entry
+0x107540 ParticleRenderer::BeginFrame  # 03; string-confirmed
+0x109ca0 ParticleRenderer_TranslucentHelper  # 03; inferred
+0x112b80 TextureStreamingChunk::ProcessTextureData  # 05
+0x117930 CRenderer::UpdateTextureStreamingGPUData  # 05; CRenderContext
+0x118100 UpdateGPUData_InstanceData  # 03; string-confirmed
+0x118440 Flip::FrameStart  # 06
+0x118470 Frame::InsertWaitFlipDone  # 06 | also Renderer_FrameTail (08)
+0x11c710 InstanceDynamicData_Update  # 03; string-confirmed
+0x11d7a0 BPXPR_RecordMaskedDraws  # 01
+0x11dbe0 BPXPR_IndexCullObjects  # 01; string IndexCullXPRObjects
+0x123330 InstanceData_WriteStream_b  # 03; inferred
+0x123410 InstanceData_WriteStream  # 03; inferred
+0x13a9a0 TextureManager::RegisterCvars  # 05; streaming pool
+0x144ca0 ResourceFactory::ResourceFactory  # 05; ctor
+0x1451a0 ResourceFactory::DebugDumpStats  # 05; gated by debug flags
+0x1464d0 ResourceFactory::ThreadFunc  # 05 | also ResourceFactory_ThreadFunc (08)
+0x146770 ResourceFactory::~ResourceFactory  # 05
+0x1469d0 ResourceFactory::WaitForAllCmdsToFinish  # 05; frame barrier | also ResourceFactory_WaitForAllCmdsToFinish (02)
+0x146b60 ResourceFactory::BuildSync  # 05
+0x146ea0 ResourceFactory::PrepareNextResourceToLoad  # 05
+0x147160 ResourceFactory::CreateResource  # 05
+0x147490 ResourceFactory::BuildAsync  # 05
+0x1478d0 ResourceFactory::DeleteResource  # 05
+0x147f00 ResourceFactory::GetPendingCount  # 05
+0x147f40 ResourceFactory::HasPendingWork  # 05
+0x1480f0 ResourceFactory::SyncPointProcessPendingResources  # 05
+0x148600 ResourceFactory::ProcessLoadingThreadLoop  # 05
+0x149670 ResourceFactoryResourceLoader::ctor  # 05
+0x149df0 ResourceFactoryResourceLoader::ReleaseJobSlot  # 05
+0x14ae70 ResourceFactoryResourceLoader::IsJobDone  # 05
+0x14aee0 ResourceFactoryResourceLoader::PrepareForLoad  # 05
+0x14b800 ResourceFactoryResourceLoader::StartLoadJob  # 05
+0x14b980 ResourceFactoryResourceLoader::LoadFileInternal  # 05
+0x14cf00 ResourceWrapper::IsReadyToCreate  # 05
+0x14d5d0 ResourceWrapper::GetState  # 05
+0x14e560 ResourcePool::GetResourceDependencies  # 07; string-confirmed
+0x14edc0 ResourcePool::RecordResourceDependencies  # 07; string-confirmed
+0x14efb0 ResourcePool::LoadResourceDependencies  # 07; string-confirmed, body inferred
+0x16b8c0 Profiler::PushScope  # 06
+0x16b900 Profiler::PopScope  # 06
+0x19af20 BPXPR_SelectMaskSource  # 01
+0x19b400 BPXPR_BuildSetEntry  # 01
+0x19b760 BPXPR_BuildSetDraws  # 01
+0x1a6d20 BPXPR_ConsumeVisibilityMask  # 01; CPU reader, one draw per visible object
+0x1a7290 BPXPR_ConsumeVisibilityMaskIndirect  # 01
+0x1aa2a0 bpe::Compression::Decompress  # 05
+0x2534c0 Cvars::RegisterResourceDependenciesFile  # 07; inferred | also Cvars_RegisterDebugCamera_FixedStep (08)
+0x2567f0 GameCoreLoop::LoadResourceDependencyFile  # 07; string-confirmed
+0x2569d0 AreaLoad_ShaderListAndAssets  # 07; inferred
+0x25ae80 GameFrame_Update  # 02
+0x25c080 GameCoreLoop::GameLoop  # 05
+0x3c5170 CGame::LoadInitialWorld  # 05
+0x533100 AreaLoad_PrecacheLists  # 07; inferred
+0x534690 ShadowGameUpdate_ThreadFunc  # 02 | also ShadowGameUpdate_Frame (08)
+0x536480 GameUpdate_FrameGate  # 02
+0x536730 BuildStartupCommandLine  # 07; strings
+0x56c620 PrecacheBuildPath_bp_precache  # 07; string bp_precache/
+0x6ac470 PrecacheSegmentData_Load  # 07; string BP_PrecacheSegmentData
+0x85d380 Gnmx_ComputeQueue_TrySubmit  # 02
+0x85d3d0 Gnmx_ComputeRing_ReserveSpace  # 02
+0x85f220 Material_BindComputeShader  # 07; inferred
+0x85f410 Material_BindGraphicsShaders_A  # 07; inferred, 2,042 bytes
+0x85fc10 Material_BindGraphicsShaders_B  # 07; inferred, 3,995 bytes
+0x8636e0 GfxCmdList::Submit  # 06; wrapper
+0x863af0 Gnmx_InternalSubmitAndFlip  # 02
+0x86a9d0 CmdBuf::DrawIndex  # 06
+0x86abb0 CmdBuf::DrawIndexAuto  # 06
+0x86b3d0 BPGnm_DrawIndexIndirect  # 01; wrapper
+0x86b970 CmdBuf::DispatchDirect  # 06
+0x86b9e0 BPGnm_DispatchDirect  # 01; wrapper
+0x86c050 GnmShader_SetPs350  # 07; import sceGnmSetPsShader350
+0x86c110 GnmShader_UpdatePs350  # 07; import sceGnmUpdatePsShader350
+0x86c170 GnmShader_SetVs  # 07; import sceGnmSetVsShader
+0x86c250 GnmShader_UpdateVs  # 07; import sceGnmUpdateVsShader
+0x86c7d0 GnmShader_SetCsWithModifier  # 07; import
+0x86c950 CmdBuf::SetVgtControl  # 06
+0x86eb60 BPGnm_EmitEventWriteEop  # 01
+0x86edc0 BPGnm_EmitWaitRegMem  # 01 | also CmdBuf::EmitPacket (06)
+0x86f700 Gnmx_InsertWaitFlipDone_Emit  # 02 | also CmdBuf::InsertWaitFlipDone (06), Gnm_InsertWaitFlipDone_Frame (08)
+0x882ac0 GfxCmdList::SubmitThunk  # 06
+0x882ce0 GfxCmdList::SubmitDoneThunk  # 06
+0x884d40 Gnmx_ComputeWaitOnAddress_Emit  # 02
+0x885320 Gnmx_ComputeWaitSemaphore_Emit  # 02
+0x89d3b0 bpe::Compression::OodleDecode  # 05; wrapper
+0xb0e250 Cvar_ShaderTypeToLoad  # 07; string-confirmed
+0xb0e3a0 ShaderList_Load  # 07; string ShaderList
+0xb10f60 GameFiles::MountPaks  # 05

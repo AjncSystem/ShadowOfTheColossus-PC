@@ -47,6 +47,11 @@ public:
     /// write into: HostCached when the device has a HOST_VISIBLE|HOST_CACHED type, else HostUncached.
     [[nodiscard]] VideoCore::MemoryType AsyncCopyType() const;
 
+    /// sotc: SOTC_STAGING_CACHED=1: the memory type of the staging that the draw thread's buffer
+    /// syncs, image guest copies and write-throughs write into: HostCached when the device has a
+    /// HOST_VISIBLE|HOST_CACHED type (and SOTC_REBAR_UPLOAD is off), else HostUncached.
+    [[nodiscard]] VideoCore::MemoryType UploadType() const;
+
     /// Releases a deferred allocation. It becomes reusable once the current tick completes.
     void FreeDeferred(const StagingBufferRef& ref);
 

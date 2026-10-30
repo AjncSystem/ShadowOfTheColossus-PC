@@ -104,6 +104,31 @@ public:
         return host_import_alignment;
     }
 
+    /// sotc: SOTC_TRACE_GPU (sotc_gpu_trace.h). A calibrated time domain extension is enabled.
+    bool IsGpuTraceCalibrated() const {
+        return gpu_trace_calibrated;
+    }
+
+    /// sotc: SOTC_TRACE_GPU. The enabled extension is VK_KHR_calibrated_timestamps (else EXT).
+    bool IsGpuTraceCalibratedKhr() const {
+        return gpu_trace_calibrated_khr;
+    }
+
+    /// sotc: SOTC_TRACE_GPU. The QueryPerformanceCounter time domain is listed (Windows).
+    bool IsGpuTraceHostDomain() const {
+        return gpu_trace_host_domain;
+    }
+
+    /// sotc: SOTC_TRACE_GPU. timestampValidBits of the graphics queue family (0: no timestamps).
+    u32 GetTimestampValidBits() const {
+        return timestamp_valid_bits;
+    }
+
+    /// sotc: SOTC_TRACE_GPU. limits.timestampPeriod, in ns per tick.
+    float GetTimestampPeriodNs() const {
+        return properties.limits.timestampPeriod;
+    }
+
     vk::Queue GetXferQueue() const {
         return xfer_queue;
     }
@@ -729,6 +754,10 @@ private:
     bool rb_tick{};               // sotc: see IsRbTickEnabled()
     bool host_import_enabled{};   // sotc: see IsHostImportEnabled()
     u64 host_import_alignment{};  // sotc: see HostImportAlignment()
+    bool gpu_trace_calibrated{};     // sotc: see IsGpuTraceCalibrated()
+    bool gpu_trace_calibrated_khr{}; // sotc: see IsGpuTraceCalibratedKhr()
+    bool gpu_trace_host_domain{};    // sotc: see IsGpuTraceHostDomain()
+    u32 timestamp_valid_bits{};      // sotc: see GetTimestampValidBits()
     bool custom_border_color{};
     bool fragment_shader_barycentric{};
     bool amd_shader_explicit_vertex_parameter{};

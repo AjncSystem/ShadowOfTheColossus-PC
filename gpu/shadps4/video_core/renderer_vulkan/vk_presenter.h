@@ -7,6 +7,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <string>
 
 #include "core/libraries/videoout/buffer.h"
 #include <imgui.h> // sotc port: ImTextureID only
@@ -165,7 +166,8 @@ private:
     /// sotc: takes the id of the present about to be queued (call under Scheduler::submit_mutex).
     u64 TagPresent();
 
-    void RecreateFrame(Frame* frame, u32 width, u32 height);
+    /// sotc: false when a frame past ring_default_frames cannot be allocated (the caller drops it).
+    bool RecreateFrame(Frame* frame, u32 width, u32 height);
 
     /// sotc: FSR 3 frame generation: presents the frame between the last game frame and
     /// `frame`. False when there is none.
@@ -199,6 +201,9 @@ private:
     vk::UniqueCommandPool command_pool;
     std::vector<Frame> present_frames;
     std::vector<Frame> hudless_frames; ///< sotc: Frame::hudless, one per present frame
+    /// sotc: SOTC_PRESENT_FRAMES: frames with an id below this are always allocated; the ones past
+    /// it may be dropped when VRAM is short.
+    u32 ring_default_frames{};
     std::queue<Frame*> free_queue;
     Frame* last_submit_frame;
     std::mutex free_mutex;
@@ -210,5 +215,16 @@ private:
     mutable std::mutex present_records_mutex;    ///< sotc: guards present_records
     std::array<PresentRecord, 64> present_records{}; ///< sotc: indexed by id % 64
 };
+
+/// sotc: SOTC_FPS (B5). Appends one line per window: the draw thread's flip wait split by cause
+/// (no free presentation frame, the present_done fence, submit_mutex on the draw thread), per
+/// frame. Resets its counters. Appends nothing while SOTC_FPS is off.
+void ReportFlipWait(std::string& out, double seconds);
+
+/// sotc: SOTC_PRESENT_FRAMES (C6) and the present thread's lock. Appends one line per window:
+/// the ring size, the GetRenderFrame calls that waited for a free frame, the time the present
+/// thread waited for submit_mutex and the time under it. Resets its counters. Appends nothing
+/// while SOTC_FPS is off.
+void ReportPresent(std::string& out, double seconds);
 
 } // namespace Vulkan

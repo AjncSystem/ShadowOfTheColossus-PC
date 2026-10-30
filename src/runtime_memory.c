@@ -1101,6 +1101,32 @@ static int32_t unmap_locked(uintptr_t start, uint64_t size) {
     drop_range(start,end);
     return 0;
 }
+/* Unmaps the direct-memory views of a released range (the lock is held). Returns how many. */
+static size_t unmap_released_vmas_locked(uint64_t start, uint64_t size) {
+    size_t count=0;
+    /* guard: a failed host_unmap leaves the VMA in place, so bound the scan and skip a VMA that
+     * did not shrink the table (no progress), or the loop spins forever holding the lock. */
+    for (size_t i=0, guard=0; i<vma_count && guard<vma_count*2+16; ++guard) {
+        Vma v=vmas[i];
+        uint64_t length=v.end-v.start;
+        if (v.kind==KIND_DIRECT && v.phys<start+size && start<v.phys+length) {
+            uint64_t a=v.phys>start ? v.phys : start, b=v.phys+length<start+size ? v.phys+length : start+size;
+            size_t before=vma_count;
+            unmap_locked(v.start+(a-v.phys),b-a);
+            if (vma_count<before) { i=vma_index(v.start); ++count; continue; }
+            ++i; /* unmap_locked made no progress: do not revisit this VMA */
+            continue;
+        }
+        ++i;
+    }
+    return count;
+}
+/* sotc: SOTC_RELEASE_ORDER=0 restores the old order (zeroing before the GPU unmap hook). Default on. */
+static int release_order(void) {
+    static int v=-1;
+    if (v<0) { const char *e=getenv("SOTC_RELEASE_ORDER"); v=!(e && e[0]=='0'); }
+    return v;
+}
 static ABI int32_t direct_unmap(void *address, uint64_t size) {
     /* The GPU forgets the range before it disappears (as shadPS4's early GPU unmap). */
     if (hook_unmap && !((uintptr_t)address%PAGE) && size) hook_unmap((uintptr_t)address,align_up(size,PAGE));
@@ -1115,18 +1141,18 @@ static ABI int32_t direct_release(uint64_t start, uint64_t size) {
     if (start % PAGE || size % PAGE) return INVALID;
     if (!size) return 0;
     write_lock();
-    if (!direct_range_allocated(start,size)) { write_unlock(); return INVALID; }
-    /* Mappings of released physical pages disappear with them. */
-    for (size_t i=0; i<vma_count;) {
-        Vma v=vmas[i];
-        uint64_t length=v.end-v.start;
-        if (v.kind==KIND_DIRECT && v.phys<start+size && start<v.phys+length) {
-            uint64_t a=v.phys>start ? v.phys : start, b=v.phys+length<start+size ? v.phys+length : start+size;
-            unmap_locked(v.start+(a-v.phys),b-a);
-            i=vma_index(v.start);
-            continue;
-        }
-        ++i;
+    for (int pass=0; ; ++pass) {
+        if (!direct_range_allocated(start,size)) { write_unlock(); return INVALID; }
+        /* Mappings of released physical pages disappear with them. */
+        size_t unmapped=unmap_released_vmas_locked(start,size);
+        /* Cap the passes: a thread that keeps mapping the range must not hold this loop open. */
+        if (!unmapped || !release_order() || pass>=16) break;
+        /* sotc: SOTC_RELEASE_ORDER: the GPU unmap hook (queued above) runs without the lock, before the
+         * zeroing below. The blocks stay allocated meanwhile, so nothing reuses the range; the check
+         * runs again and unmaps any view mapped during the window. */
+        write_unlock();
+        flush_hooks();
+        write_lock();
     }
     for (int i=0; i<LIMIT; ++i) {
         Block *b=&blocks[i];

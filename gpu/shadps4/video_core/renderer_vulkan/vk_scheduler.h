@@ -24,6 +24,10 @@ namespace tracy {
 class VkCtxScope;
 }
 
+namespace SotcGpuTrace {
+class Timeline;
+}
+
 namespace Vulkan {
 
 class Instance;
@@ -715,6 +719,12 @@ public:
 
     static std::mutex submit_mutex;
 
+    /// sotc: SOTC_FPS (B5). Time the submits waited for submit_mutex (LockSubmit in
+    /// vk_scheduler.cpp), split into the draw thread and the other threads. Read and reset by
+    /// ReportFlipWait (vk_presenter.cpp). Counted only while SOTC_FPS is on.
+    static inline std::atomic<uint64_t> submit_lock_draw_ns{0}, submit_lock_draw_count{0};
+    static inline std::atomic<uint64_t> submit_lock_other_ns{0}, submit_lock_other_count{0};
+
     /// sotc: SOTC_HRR=1: while host-visible arena chunks exist (set by the buffer cache), every
     /// command buffer this scheduler ends (sessions, ahead, transfer queue) finishes with a global
     /// barrier, all writes -> host reads, so the CPU may read what the GPU wrote once the tick
@@ -746,6 +756,7 @@ private:
     struct Session {
         vk::CommandBuffer upload{};
         vk::CommandBuffer primary{};
+        u32 gpu_pair{~u32{0}}; // sotc: SOTC_TRACE_GPU pair of primary (SotcGpuTrace::Timeline)
     };
     std::vector<Session> sessions;
     u64 session_serial{}; // sotc: see SessionSerial()
@@ -764,6 +775,9 @@ private:
     std::condition_variable_any priority_pending_ops_cv;
     std::jthread priority_pending_ops_thread;
     u32 trace_queue{~0u};           // sotc: SOTC_TRACE queue track (SotcTrace::RegisterQueue)
+    /// sotc: SOTC_TRACE_GPU, draw scheduler only. Declared before trace_watch_thread, so the
+    /// watch thread is joined before it is destroyed.
+    std::unique_ptr<SotcGpuTrace::Timeline> gpu_trace;
     std::jthread trace_watch_thread; // sotc: SOTC_TRACE (TraceWatchThread)
     RenderState render_state;
     bool is_rendering = false;

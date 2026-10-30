@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""sotc: classifies the slow frames of a SOTC_TRACE session (user/trace/<session>/*.json).
+"""sotc: classifies the slow frames of a SOTC_TRACE session (user/trace/<session>/*.json and
+*.sotctrace).
 
 For the slow frame of each file it measures, inside the frame:
   - how busy the port's threads were (draw thread, command processor, recorder) and the GPU;
@@ -15,12 +16,17 @@ Then it names the most likely cause:
   game-cpu the main game threads were mostly running, not waiting: the game's own work
   other    none of the above
 
+A .sotctrace stream file gives one row per slow frame; a dump gives the frame it is named after.
+
     python tools/sotc_trace_classify.py user/trace/<session>
 """
 import collections
 import json
 import pathlib
 import sys
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / 'trace'))
+import sotc_trace  # noqa: E402  (the .sotctrace reader, tools/trace/sotc_trace.py)
 
 GUEST_KEYS = {
     'readback': ('readback',),
@@ -36,9 +42,9 @@ MAIN_GAME = ('Shadow Game Upd', 'Game Render', 'RenderFlip', 'BPE JobWorker')
 
 
 def union(spans, f0, f1, skip=()):
-    """Time covered by the spans inside [f0, f1), overlaps counted once."""
-    cut = sorted((max(e['ts'], f0), min(e['ts'] + e['dur'], f1)) for e in spans
-                 if e['name'] not in skip and e['ts'] < f1 and e['ts'] + e['dur'] > f0)
+    """Time covered by the (start, end, name, ...) spans inside [f0, f1), overlaps counted once."""
+    cut = sorted((max(sp[0], f0), min(sp[1], f1)) for sp in spans
+                 if sp[2] not in skip and sp[0] < f1 and sp[1] > f0)
     total, end = 0.0, f0
     for a, b in cut:
         if b > end:
@@ -47,29 +53,15 @@ def union(spans, f0, f1, skip=()):
     return total
 
 
-def classify(path):
-    d = json.loads(path.read_text())
-    ev = d['traceEvents']
-    names = {e['tid']: e['args']['name'] for e in ev if e.get('name') == 'thread_name'}
-    slow = [e for e in ev if e.get('name') == 'SLOW FRAME']
-    if not slow:
-        return None
-    # The frame the file is named after (otherData.frame); a window may hold others too.
-    want = d.get('otherData', {}).get('frame')
-    named = [e for e in slow if e.get('args', {}).get('a') == want]
-    f = named[0] if named else max(slow, key=lambda e: e['dur'])
-    f0, f1 = f['ts'], f['ts'] + f['dur']
-    dur = f['dur']
-    by_tid = collections.defaultdict(list)
-    for e in ev:
-        if e.get('ph') == 'X':
-            by_tid[e['tid']].append(e)
-    row = {'file': path.name, 'ms': dur / 1000}
+def frame_stats(f0, f1, lanes):
+    """The cause of one frame. lanes: (thread name, spans) pairs; a span is a tuple whose first
+    three items are (start, end, name), in the unit of f0 and f1 (µs). The busy fractions are
+    of the frame; the waits are in that unit."""
+    dur = (f1 - f0) or 1.0
     draw = cp = rec = gpu = 0.0
     waits = collections.Counter()
     running = []
-    for tid, spans in by_tid.items():
-        n = names.get(tid, '')
+    for n, spans in lanes:
         if 'GpuDraw' in n:
             draw = max(draw, union(spans, f0, f1, skip=('draw idle',)))
         elif 'GpuCommandProcessor' in n:
@@ -82,21 +74,18 @@ def classify(path):
             short = n[6:]
             main = any(short.startswith(m) for m in MAIN_GAME)
             for key, kinds in GUEST_KEYS.items():
-                t = union([e for e in spans if e['name'] in kinds], f0, f1)
+                t = union([sp for sp in spans if sp[2] in kinds], f0, f1)
                 if main:
                     waits[key] += t
             if main and not short.startswith('RenderFlip'):
                 busy = union(spans, f0, f1)
                 running.append((short, (dur - busy) / dur))
-    row.update(draw=draw / dur, cp=cp / dur, rec=rec / dur, gpu=gpu / dur)
     main_run = max((r for _, r in running), default=0.0)
-    row['game_running'] = main_run
-    row['waits'] = {k: v / 1000 for k, v in waits.items() if v > 0}
     blocking = {k: v for k, v in waits.items() if k in ('readback', 'fault', 'io', 'upload fence')}
     top = max(blocking, key=blocking.get) if blocking else None
-    if row['draw'] >= 0.85:
+    if draw / dur >= 0.85:
         cause = 'draw'
-    elif row['gpu'] >= 0.85:
+    elif gpu / dur >= 0.85:
         cause = 'gpu'
     elif top and blocking[top] >= 0.3 * dur:
         cause = {'readback': 'readback', 'fault': 'fault', 'io': 'io',
@@ -105,14 +94,71 @@ def classify(path):
         cause = 'game-cpu'
     else:
         cause = 'other'
-    row['cause'] = cause
-    return row
+    return {'dur': dur, 'draw': draw / dur, 'cp': cp / dur, 'rec': rec / dur, 'gpu': gpu / dur,
+            'game_running': main_run, 'waits': dict(waits), 'cause': cause}
+
+
+def _row(name, st):
+    return {'file': name, 'ms': st['dur'] / 1000, 'draw': st['draw'], 'cp': st['cp'],
+            'rec': st['rec'], 'gpu': st['gpu'], 'game_running': st['game_running'],
+            'waits': {k: v / 1000 for k, v in st['waits'].items() if v > 0},
+            'cause': st['cause']}
+
+
+def classify(path):
+    """The row of a Chrome JSON dump (None when it has no slow frame)."""
+    d = json.loads(path.read_text())
+    ev = d['traceEvents']
+    names = {e['tid']: e['args']['name'] for e in ev if e.get('name') == 'thread_name'}
+    slow = [e for e in ev if e.get('name') == 'SLOW FRAME']
+    if not slow:
+        return None
+    # The frame the file is named after (otherData.frame); a window may hold others too.
+    want = d.get('otherData', {}).get('frame')
+    named = [e for e in slow if e.get('args', {}).get('a') == want]
+    f = named[0] if named else max(slow, key=lambda e: e['dur'])
+    by_tid = {}
+    for e in ev:
+        if e.get('ph') == 'X':
+            by_tid.setdefault(e['tid'], []).append((e['ts'], e['ts'] + e['dur'], e['name']))
+    lanes = [(names.get(tid, ''), spans) for tid, spans in by_tid.items()]
+    st = frame_stats(f['ts'], f['ts'] + f['dur'], lanes)
+    return _row(path.name, st)
+
+
+def classify_trace(path):
+    """The rows of a .sotctrace file: one for the dump's frame, one per slow frame of a stream."""
+    t = sotc_trace.load(path)
+    slow = [e for e in t.all_events() if e.kind == sotc_trace.K_FRAME
+            and e.flags & sotc_trace.FLAG_SLOW]
+    if not slow:
+        return []
+    if t.meta.get('kind') == 'stream':
+        chosen = sorted(slow, key=lambda e: e.t0)
+    else:
+        want = t.meta.get('frame')
+        named = [e for e in slow if e.a == want]
+        chosen = [named[0] if named else max(slow, key=lambda e: e.t1 - e.t0)]
+    lanes = sotc_trace.span_lanes(t)
+    rows = []
+    for f in chosen:
+        f0, f1 = f.t0 / 1000.0, f.t1 / 1000.0
+        st = frame_stats(f0, f1, [(lane.label, lane.window(f0, f1)) for lane in lanes])
+        name = path.name if len(chosen) == 1 else f'{path.name} #{f.a}'
+        rows.append(_row(name, st))
+    return rows
 
 
 def main():
     if len(sys.argv) < 2:
         raise SystemExit(__doc__)
-    rows = [r for p in sorted(pathlib.Path(sys.argv[1]).glob('*.json')) if (r := classify(p))]
+    folder = pathlib.Path(sys.argv[1])
+    rows = []
+    for p in sorted([*folder.glob('*.json'), *folder.glob('*.sotctrace')]):
+        if p.suffix == '.sotctrace':
+            rows.extend(classify_trace(p))
+        elif (r := classify(p)):
+            rows.append(r)
     print(f"{'file':26s} {'ms':>5s} {'draw':>5s} {'cp':>5s} {'rec':>5s} {'gpu':>5s} "
           f"{'run':>5s}  cause     main game threads' waits (ms, summed)")
     for r in rows:

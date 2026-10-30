@@ -51,6 +51,10 @@ private:
 void ForEachNonStackRange(VAddr address, u64 size, NonStackRangeFn func);
 /// sotc: any byte of the range is in a registered guest stack (never write-protected).
 bool IntersectsGuestStack(VAddr address, u64 size);
+/// sotc: the registered guest stack range holding addr (margin included; adjacent registrations
+/// may merge, every byte of [lo, hi) is accessible). For the trace sampler, outside suspended
+/// threads: takes the registry lock shared. False when addr is in no registered stack.
+bool GuestStackRange(VAddr addr, VAddr& lo, VAddr& hi);
 
 /// sotc: SOTC_FAULT_OSCOST=1 (needs SOTC_FPS): what the operating system adds to a write fault
 /// around the handler, in microseconds: from the faulting store to the entry of
@@ -122,6 +126,27 @@ public:
     /// sotc: SOTC_PROTECT_COALESCE. Makes the page at `page` writable on the host if the tracker's
     /// state for it is read-write and the host protection is not (see FaultProtectScope).
     static void EnsureFaultPageWritable(VAddr page);
+
+    /// sotc: SOTC_WRITE_DECL (bbgpu_declare_cpu_write, the runtime's memcpy/memset). The CPU is
+    /// about to write [addr, addr + size) of guest memory. The pages a write fault would invalidate
+    /// without a readback (write-protected, CPU-clean, no GPU data) are invalidated here, one call
+    /// per run, as a fault invalidates its page; the unprotects are batched and applied once. Pages
+    /// with GPU data are left to the fault path, guest stack pages are skipped, and the span is
+    /// clipped to the tracked address space. No fault granule and no write-ahead. Async uploads
+    /// still reading the span finish first, and a call from the command processor thread runs on
+    /// the draw thread. The caller checks MaybeWriteProtected first. on_run, if set, is called for
+    /// each run just before it is invalidated (SOTC_FPS verify stamps). Static: it uses the one
+    /// rasterizer, and does nothing before one exists.
+    using DeclareRunFn = void (*)(VAddr addr, u64 size);
+    static void DeclareCpuWrite(VAddr addr, u64 size, DeclareRunFn on_run = nullptr);
+    /// sotc: SOTC_WRITE_DECL=2 and the verify stamps: calls fn for each run DeclareCpuWrite would
+    /// invalidate, without invalidating anything (no thread switch, lock-free look).
+    static void VisitDeclarableRuns(VAddr addr, u64 size, DeclareRunFn fn);
+    /// sotc: SOTC_WRITE_DECL pre-check, lock-free: false only when no page of the span is
+    /// write-protected (MemoryTracker::MaybeWriteProtected).
+    static bool MaybeWriteProtected(VAddr addr, u64 size);
+    /// sotc: SOTC_WRITE_DECL=2 statistics: the write-protected pages of the span (lock-free).
+    static u64 CountWriteProtectedPages(VAddr addr, u64 size);
 
     /// sotc: SOTC_PROTECT_COALESCE=1 (off by default). Opened by the guest write fault handler:
     /// while it is open on a thread, the tracker updates that thread makes which only REMOVE

@@ -570,7 +570,19 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u32>& da
     return LoadVector(type, path, data);
 }
 
+// sotc: the blob name Save and Load take: the file name without its extension.
+static std::string BlobName(const std::filesystem::path& file) {
+    return file.stem().string();
+}
+
 void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u8>&& data)>& func) {
+    ForEachNamedBlob(type,
+                     [&](std::vector<u8>&& data, const std::string&) { func(std::move(data)); });
+}
+
+void DataBase::ForEachNamedBlob(
+    BlobType type,
+    const std::function<void(std::vector<u8>&& data, const std::string& name)>& func) {
     const auto& ext = GetBlobFileExtension(type);
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         const auto num_files = mz_zip_reader_get_num_files(&zip_ar);
@@ -583,13 +595,13 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
                 mz_zip_reader_file_stat(&zip_ar, index, &stat);
                 std::vector<u8> data(stat.m_uncomp_size);
                 mz_zip_reader_extract_to_mem(&zip_ar, index, data.data(), data.size(), 0);
-                func(std::move(data));
+                func(std::move(data), BlobName(file_name.data()));
             }
         }
     } else if (prefetch_active) {
         for (const auto& [file_name, data] : prefetched) {
             if (std::filesystem::path{file_name}.extension().string().ends_with(ext)) {
-                func(std::vector<u8>{data});
+                func(std::vector<u8>{data}, BlobName(file_name));
             }
         }
     } else {
@@ -600,11 +612,37 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
                 if (file.IsOpen()) {
                     std::vector<u8> data(file.GetSize());
                     file.Read(data);
-                    func(std::move(data));
+                    func(std::move(data), BlobName(file_name.path()));
                 }
             }
         }
     }
+}
+
+// sotc: SOTC_PIPE_REMAP drops the key of a pipeline that is rebuilt under another key. Loose files
+// only: the cache pack is a copy that is rewritten at the next start without the missing file.
+bool DataBase::Remove(BlobType type, const std::string& name) {
+    if (!opened || EmulatorSettings.IsPipelineCacheArchived()) {
+        return false;
+    }
+    auto path = cache_path / name;
+    path.replace_extension(GetBlobFileExtension(type));
+    std::error_code ec;
+    if (!std::filesystem::remove(path, ec)) {
+        return false;
+    }
+    const auto file_name = path.filename().string();
+    {
+        std::scoped_lock lock{known_mutex};
+        known_files.erase(file_name);
+    }
+    if (prefetch_active) {
+        // The preload is walking prefetched right now: the copy goes when it ends.
+        prefetch_removed.push_back(file_name);
+    }
+    // Once the preload is over, prefetched is left as it is: other threads read it, and no
+    // pipeline key is loaded by name from it after the warm-up.
+    return true;
 }
 
 size_t DataBase::CountBlobs(BlobType type) {
@@ -652,6 +690,11 @@ void DataBase::FinishPreload() {
     // there. Dropping them sent every later lookup to the disk, one small file at a time, while
     // the game loaded a save from the same hard disk: the game stood still for 27 s (22 Oct).
     prefetch_active = false;
+    // sotc: blobs Remove deleted during the preload leave their in-memory copies too.
+    for (const auto& file_name : prefetch_removed) {
+        prefetched.erase(file_name);
+    }
+    prefetch_removed.clear();
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         mz_zip_writer_init_from_reader(&zip_ar, cache_path.string().c_str());
         ar_is_read_only = false;

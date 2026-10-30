@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdio>
 #include <cstdlib>
 
 #include "common/alignment.h"
@@ -35,7 +36,7 @@ u64 BlockSize() {
     return size;
 }
 
-// sotc: SOTC_STAGING_LARGE_POW2=1 (off by default). Large uploads (streaming bursts) come in many
+// sotc: SOTC_STAGING_LARGE_POW2 (on by default since 30 Oct 2026; =0 turns it off). Large uploads (streaming bursts) come in many
 // sizes: matched within 1.25x they seldom found a free buffer and allocated a new one inside the
 // frame that needed it (6 allocations, 240 MiB, 7-19 ms per 5 s while an area loads). With the
 // switch they get power-of-two size classes and reuse any free buffer up to twice the request,
@@ -44,7 +45,7 @@ u64 BlockSize() {
 static bool StagingLargePow2() {
     static const bool enabled = [] {
         const char* v = std::getenv("SOTC_STAGING_LARGE_POW2");
-        return v && v[0] == '1';
+        return !v || v[0] != '0';
     }();
     return enabled;
 }
@@ -103,6 +104,43 @@ MemoryType StagingBufferPool::AsyncCopyType() const {
         }
     }
     return MemoryType::HostUncached;
+}
+
+MemoryType StagingBufferPool::UploadType() const {
+    // sotc: SOTC_STAGING_CACHED=1 (off by default). The staging of the draw thread's buffer syncs,
+    // image guest copies and write-throughs. Write-combined memory held one thread's memcpy to
+    // 2.6-6 GB/s in the area-load frames (92% of the draw thread's samples inside "sync copy" were
+    // the memcpy). Cached system memory takes a plain memcpy at full speed; the GPU reads it over
+    // PCIe. Same rules as AsyncCopyType: no cached type, or SOTC_REBAR_UPLOAD on, keeps
+    // HostUncached. Resolved once and logged once: the type cannot change while the device lives.
+    static const MemoryType type = [this] {
+        const char* v = std::getenv("SOTC_STAGING_CACHED");
+        if (!v || v[0] != '1') {
+            return MemoryType::HostUncached;
+        }
+        MemoryType t = MemoryType::HostUncached;
+        const char* why = "no host cached memory type";
+        if (instance.RebarUploadEnabled()) {
+            why = "SOTC_REBAR_UPLOAD is on";
+        } else {
+            const vk::MemoryPropertyFlags wanted =
+                vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCached;
+            const auto& props = instance.GetMemoryProperties();
+            for (u32 i = 0; i < props.memoryTypeCount; ++i) {
+                if ((props.memoryTypes[i].propertyFlags & wanted) == wanted) {
+                    t = MemoryType::HostCached;
+                    break;
+                }
+            }
+        }
+        if (t == MemoryType::HostCached) {
+            std::fputs("SOTC_STAGING_CACHED: upload staging is HostCached\n", stderr);
+        } else {
+            std::fprintf(stderr, "SOTC_STAGING_CACHED ignored: %s\n", why);
+        }
+        return t;
+    }();
+    return type;
 }
 
 StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 alignment,

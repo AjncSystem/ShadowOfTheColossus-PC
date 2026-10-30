@@ -130,6 +130,15 @@ normal o jogo roda travado em 30 FPS, como no PS4.
   do heap do jogo contra leituras da GPU (`bpe_heap_guard`), o flush periódico, as leituras antecipadas,
   o marcador de espera e o gravador de comandos Vulkan em thread própria (`cp_record_thread`).
 
+## SotC Lab
+
+Banco de testes de travadas dentro do jogo (experimental, desligado por padrão): câmera livre
+(F3) com o Wander junto, rotas gravadas (F4), pulo para qualquer um dos 16 colossos, `SOTC_*` ao
+vivo ou com reinício, e um orquestrador que roda matrizes de configurações e grava os resultados
+em CSV. Para ligar, use **Ajustes experimentais** no lançador (`SOTC_LAB=1`). Teclas: **F2** abre o
+menu, **F3** liga a câmera livre, **F4** grava um ponto de rota. O guia completo, com os controles,
+o formato das rotas, o canal de controle e as limitações, está em [LAB.md](LAB.md).
+
 ## Diagnóstico
 
 Estas variáveis de ambiente ajudam a investigar problemas:
@@ -141,14 +150,65 @@ Estas variáveis de ambiente ajudam a investigar problemas:
 | `SOTC_STALL_DETAIL=1` | com `SOTC_FPS`: linhas `SOTCSTALL` com ritmo de flip, CPU das threads do jogo e usuário/kernel do upload |
 | `SOTC_OPSTAT=1` | operações da thread de desenho por tipo, a cada 5 s |
 | `SOTC_UNTRACK_LOG=1` | com `SOTC_FPS`: blocos do heap por quadro RenderSingleFrameGPU do jogo |
-| `SOTC_TRACE=1` | gravador de linha do tempo: para cada quadro acima de `SOTC_TRACE_MS` (padrão 60), salva o que todas as threads fizeram ao redor dele em `user/trace/<sessão>/frameNNNNNN_XXms.json` (abrir em ui.perfetto.dev); também liga o `SOTC_FPS` |
+| `SOTC_TRACE=1/2` | gravador de linha do tempo (trace automático, versão 2): ver [Trace automático](#trace-automático-sotc_trace) |
 | `BB_FAULT_RING=arquivo` | grava as últimas exceções (sobrevive a quedas) |
 | `BB_STACKS_TRIGGER=arquivo` | criar o arquivo despeja as pilhas das threads |
 | `BB_READBACKS=0/1/2` | leituras da GPU; o padrão 2 é o exigido pelo jogo |
 | `SOTC_FAST_BIND=1` | reaproveita binds de descritores entre desenhos iguais (padrão: desligado desde a 0.60.6) |
 | `SOTC_RECORD_THREAD=0` | grava os comandos Vulkan na própria thread de comandos (padrão: thread própria) |
 | `SOTC_INDIRECT_DIRECT=0` | mantém indiretos os draws cujos argumentos estão na CPU |
+| `SOTC_STAGING_CACHED=1` | experimental: a área de cópia (staging) dos buffers e das texturas que a thread de desenho envia à GPU fica em memória com cache, em vez de write-combined, para a cópia da CPU andar mais rápido nas cargas de área (ignorado sem esse tipo de memória ou com `SOTC_REBAR_UPLOAD`) |
+| `SOTC_COPY_GUEST_VIEW=0` | desliga (ligado por padrão desde 30/10): os envios de memória do jogo para a GPU leem pelo endereço do próprio jogo, protegidos contra falha (se a página estiver bloqueada, a cópia volta para a segunda visão da memória); evita a falta de página da segunda visão, que segurava a cópia em ~3 GB/s |
+| `SOTC_BACKING_WARM=1` | experimental: uma thread de baixa prioridade toca, na segunda visão da memória, as páginas que o jogo começa a escrever, para os envios à GPU não pagarem a falta de página na thread de desenho (medido em 30/10: sem ganho; prefira `SOTC_COPY_GUEST_VIEW`) |
+| `SOTC_FILL_HLE_GPU=0` | desliga (ligado por padrão desde 30/10): as tabelas que o shader de preenchimento (HLE) escreve chegam à GPU por preenchimento ou cópia na própria GPU, em vez de serem copiadas de novo pela memória do jogo na varredura DMA (uma tabela de 8 MiB, ~33 vezes por carga de área) |
 | `SOTC_WAIT_MARKER=1/2` | esperas pela GPU consultam um marcador escrito por ela (experimental) |
 | `SOTC_CMD_STATS=1/2` | draws e dispatches por quadro (2: shaders de compute mais usados) |
 | `SOTC_TSC=qpc/native` | relógio do jogo: `qpc` sempre usa o QPC do Windows, `native` sempre o TSC do processador (padrão: QPC só quando os núcleos discordam no TSC) |
 | `SOTC_UI_HIRES=0` | com DLSS, a interface (textos, logos, HUD) volta a ser desenhada na resolução de renderização e ampliada, em vez de na resolução de saída |
+| `SOTC_LAB=1` | liga o SotC Lab (menu F2, câmera livre, pulo para colosso, canal de controle). Ver [LAB.md](LAB.md) |
+| `SOTC_FREECAM=1` | câmera livre (F3); ligada por `SOTC_LAB=1` |
+| `SOTC_FREECAM_MAXSPEED=<m/s>` | velocidade máxima da câmera livre, acima da qual o streaming não acompanha |
+| `SOTC_ENGINE_CMD=1` | executa comandos do console da engine (pulo para colosso); ligada por `SOTC_LAB=1` |
+| `SOTC_CTL=1` ou `SOTC_CTL=<nome>` | canal de controle em `\\.\pipe\sotc-ctl` (ou `\\.\pipe\<nome>`), para `tools/sotc_ctl.py` |
+| `SOTC_CAM_PROBE=1` | só medição: registra a câmera do jogo e a posição do jogador |
+| `SOTC_TUNING_JSON=<arquivo>` | `out/tuning.json` lido pelo menu do SotC Lab para montar a aba SOTC_* |
+| `SOTC_BOOT_BOSS=N` | abre o jogo direto no colosso N (1 a 16) |
+| `SOTC_LAB_ORCH_CMD=<comando>` | comando que o menu usa para iniciar o orquestrador (padrão `python tools/sotc_matrix.py`) |
+
+### Trace automático (SOTC_TRACE)
+
+Gravador de linha do tempo da versão 2, experimental e desligado por padrão. Registra, com um
+relógio só, o que as threads do jogo e do motor fizeram, e grava arquivos `.sotctrace` em
+`user/trace/<sessão>/`. Formato em [TRACE-FORMAT.md](TRACE-FORMAT.md).
+
+- `SOTC_TRACE=1`: grava a janela ao redor de cada quadro acima de `SOTC_TRACE_MS` (padrão 60), com
+  `SOTC_TRACE_PRE_MS` (150) antes e `SOTC_TRACE_POST_MS` (40) depois, até `SOTC_TRACE_MAX` arquivos
+  por sessão (padrão 40).
+- `SOTC_TRACE=2`: grava a sessão inteira, em pedaços comprimidos, enquanto o jogo roda.
+- Os dois custam CPU e ligam o `SOTC_FPS` (contadores no registro).
+
+Interruptores que acompanham o `SOTC_TRACE` (todos desligados por padrão):
+
+| Variável | Efeito |
+|---|---|
+| `SOTC_TRACE_DIR=<pasta>` | pasta dos arquivos (padrão `user/trace`) |
+| `SOTC_TRACE_RING=<n>` | multiplicador do tamanho dos anéis de eventos de cada thread |
+| `SOTC_TRACE_ZONES=1` | as zonas de medição do shadPS4 (Tracy) viram trechos; mínimo `SOTC_TRACE_ZONE_MIN_US` (padrão 20 µs) |
+| `SOTC_TRACE_GPU=1` | tempo real da GPU por envio, com marcas de tempo da Vulkan (usa a calibração do relógio da placa, quando ela tem a extensão) |
+| `SOTC_TRACE_IMPORTS=1/2` | chamadas ao sistema PS4: 1 conta chamadas e tempo; 2 também grava os trechos maiores que `SOTC_TRACE_IMPORT_MIN_US` (padrão 50 µs) |
+| `SOTC_TRACE_SCOPES=1` | os escopos de medição do próprio motor do jogo viram trechos com os seus nomes |
+| `SOTC_TRACE_SAMPLE=<Hz>` | amostragem contínua das pilhas de todas as threads; substitui o `SOTC_PROFILE` (o nome antigo ainda vale) |
+| `SOTC_TRACE_FUNCS=<arquivo>` | cronometragem exata das funções do eboot listadas no arquivo, gerado por `tools/trace/sotc_trace.py autofuncs` |
+
+Os arquivos são lidos com `tools/trace/sotc_trace.py` (biblioteca padrão do Python, sem instalação):
+
+- `hitch <arquivos> [--md relatório.md]`: por que cada quadro lento foi lento.
+- `top <arquivos>`: tempo total por nome e por thread.
+- `json <arquivo>`: JSON do Chrome, para abrir em ui.perfetto.dev.
+- `diff <pasta A> <pasta B> --md relatório.md`: diferença de tempo entre duas execuções.
+
+No `tools/sotc_matrix.py`, a chave de topo `"trace": 1` ou `2` (e `"trace_funcs"`, um arquivo para
+`SOTC_TRACE_FUNCS`) liga o rastreamento em cada execução. Cada volta do teste também envia
+`trace mark <configuração>-<cenário>-lapN`, e o `summary.md` ganha a seção "Onde o tempo foi": a
+diferença de cada configuração contra a primeira, com links para as pastas de rastreamento e os
+relatórios de travada.

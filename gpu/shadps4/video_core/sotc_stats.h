@@ -20,11 +20,11 @@ namespace SotcStats {
 /// guest-thread fault counter (which shared cache lines with CP counters) are gone; with the
 /// switches on, the printed numbers are unchanged (the printer reads and resets each counter with
 /// exchange(0) only under the same switch). The variables are never set at run time.
-// sotc: SOTC_TRACE=1 (sotc_trace.h) needs the same timers.
-inline const bool kFpsLog = std::getenv("SOTC_FPS") != nullptr || [] {
-    const char* v = std::getenv("SOTC_TRACE");
-    return v && v[0] == '1';
-}();
+// sotc: SOTC_TRACE (sotc_trace.h) does not turn this on. The trace spans read the clock on their
+// own (SotcTrace::kOn checks at the call sites: DrawWait, RoleTimer, liverpool.cpp, vk_recorder.cpp)
+// and the counters stay off unless SOTC_FPS is set. kFpsLog reads no trace state, so the order
+// of the initialisation of sotc_trace.h's kOn does not matter here.
+inline const bool kFpsLog = std::getenv("SOTC_FPS") != nullptr;
 inline const bool kCmdStats = std::getenv("SOTC_CMD_STATS") != nullptr;
 /// sotc: SOTC_STALL_DETAIL=1 (off by default): the SOTCSTALL line also shows the flip pacing of the
 /// frame, the guest threads' CPU and the user/kernel CPU of the upload threads (vk_presenter.cpp).
@@ -561,8 +561,9 @@ inline std::atomic<uint64_t> readback_bytes_changed{0};
 /// sotc: BufferCache::ReleaseMemory's GPU sync (Finish, or Flush with SOTC_UNBIND_GPU_WAIT=1):
 /// calls and time (SOTC_FPS only).
 inline std::atomic<uint64_t> release_finish_count{0}, release_finish_ns{0};
-/// sotc: time the guest thread waits in BufferCache::DropGpuModified (SOTC_DROP_ASYNC=0; 0 in
-/// the default async mode). SOTC_FPS only.
+/// sotc: time the guest thread waits in BufferCache::DropGpuModified. The default (SOTC_DROP_ASYNC
+/// unset) waits for the command processor; SOTC_DROP_ASYNC=1 (experimental, off) orders the drop
+/// with the stream instead, and this stays 0. SOTC_FPS only.
 inline std::atomic<uint64_t> drop_gpu_wait_ns{0};
 /// sotc: SOTC_DROP_FAST: unmaps dropped on the guest thread, and those that still waited
 /// (GPU-written pages in the range). Totals.
@@ -604,6 +605,62 @@ inline std::atomic<uint64_t> host_import_fallbacks{0};
 inline std::atomic<uint64_t> host_import_refused{0};
 inline std::atomic<uint64_t> host_import_live_chunks{0};
 inline std::atomic<uint64_t> drop_slow{0};
+/// sotc: SOTC_DROP_FAST guard: unmaps that took the waiting path because the range overlaps a
+/// command buffer the command processor has not finished reading (Liverpool::CmdRangeInUse).
+inline std::atomic<uint64_t> drop_fast_guarded{0};
+/// sotc: SOTC_DROP_FAST guard: submits whose nested indirect buffer walk hit a cap (ranges, packets
+/// or depth). Their ranges are incomplete, so unmaps wait while one of them is in flight.
+inline std::atomic<uint64_t> drop_fast_overflows{0};
+/// sotc: SOTC_DROP_FAST guard: nested indirect buffers the walk skipped because their memory is
+/// not mapped (Liverpool::CollectNestedIbs).
+inline std::atomic<uint64_t> drop_fast_unmapped_ibs{0};
+/// sotc: SOTC_DROP_FAST diagnostics: the last kDropRing fast-dropped ranges, so a bad PM4 packet
+/// can tell whether it was read from memory the guest had already unmapped (FastDropAge).
+/// Each slot is a seqlock, so a reader never mixes the bounds of two drops.
+inline constexpr uint32_t kDropRing = 256;
+struct DropSlot {
+    std::atomic<uint32_t> seq{0}; ///< odd while NoteFastDrop writes the slot
+    std::atomic<uint64_t> lo{0};
+    std::atomic<uint64_t> hi{0};
+};
+inline DropSlot drop_ring[kDropRing]{};
+inline std::atomic<uint32_t> drop_ring_head{0};
+inline void NoteFastDrop(uint64_t addr, uint64_t size) noexcept {
+    const uint64_t end = size > ~uint64_t{0} - addr ? ~uint64_t{0} : addr + size; // saturates
+    const uint32_t i = drop_ring_head.fetch_add(1, std::memory_order_relaxed) % kDropRing;
+    DropSlot& s = drop_ring[i];
+    const uint32_t q = s.seq.load(std::memory_order_relaxed);
+    s.seq.store(q + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    s.lo.store(addr, std::memory_order_relaxed);
+    s.hi.store(end, std::memory_order_relaxed);
+    s.seq.store(q + 2, std::memory_order_release);
+}
+/// How many fast drops ago `addr` was inside a dropped range (1 = the newest); 0 when it is not in
+/// any of the last kDropRing.
+inline uint32_t FastDropAge(uint64_t addr) noexcept {
+    const uint32_t head = drop_ring_head.load(std::memory_order_relaxed);
+    for (uint32_t k = 1; k <= kDropRing && k <= head; ++k) {
+        const DropSlot& s = drop_ring[(head - k) % kDropRing];
+        for (int retry = 0; retry < 8; ++retry) {
+            const uint32_t s1 = s.seq.load(std::memory_order_acquire);
+            if (s1 & 1) {
+                continue; // being written
+            }
+            const uint64_t lo = s.lo.load(std::memory_order_relaxed);
+            const uint64_t hi = s.hi.load(std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (s.seq.load(std::memory_order_relaxed) != s1) {
+                continue; // overwritten while read
+            }
+            if (addr >= lo && addr < hi) {
+                return k;
+            }
+            break;
+        }
+    }
+    return 0;
+}
 /// SOTC_RB_NARROW: readback window (KiB, 0 = off), GPU-modified bytes of the 512 KiB window left
 /// outside the narrow one (not downloaded nor unprotected), live hot readbacks (gauge).
 inline std::atomic<uint64_t> rb_narrow_kib{0}, rb_narrow_kept_bytes{0}, rb_hot_entries{0};
@@ -1266,6 +1323,11 @@ inline std::atomic<uint64_t> cp_blocked_ns{0}, cp_parse_all_ns{0};
 /// that waited and their time.
 inline std::atomic<uint64_t> cp_func_ops[4]{}, draw_func_ns[4]{};
 inline std::atomic<uint64_t> cp_wd_fused{0}, cp_wd_pairs{0}, cp_bw_waits{0}, cp_bw_wait_ns{0};
+/// sotc: "SOTC CP back-write waits" report line (driver.cpp), reset by each report: the
+/// WaitBackWrites calls that waited (Liverpool::WaitBackWritesSlow), their wall time and the
+/// longest one. Counted with SOTC_FPS; the time and the maximum need kFpsTimers (SOTC_FPS_LEAN
+/// leaves them 0).
+inline std::atomic<uint64_t> cp_bw_rep_waits{0}, cp_bw_rep_ns{0}, cp_bw_rep_max_ns{0};
 /// sotc: command processor no-progress spin (Liverpool::Process; "SOTC CP spin" line, SOTCSTALL
 /// "spin"). Written by the CP thread only (monotonic, store of load + n). spin: wall time of
 /// streaks in which every resumed task only re-tested its wait (outside cp_parse_ns; sampled
@@ -1295,8 +1357,9 @@ struct DrawWait {
     bool on = false;    ///< counted: SOTC_FPS, on the draw thread
     bool timed = false; ///< clock read: kFpsTimers, or SOTC_TRACE (its span needs the times)
     explicit DrawWait(WaitKind k) : kind{k} {
-        if (kFpsLog && tl_role == RoleDraw) {
-            on = true;
+        // sotc: SOTC_TRACE alone times the draw thread's waits for their spans (no counts).
+        if ((kFpsLog || SotcTrace::kOn) && tl_role == RoleDraw) {
+            on = kFpsLog;
             if (kFpsTimers || SotcTrace::kOn) { // sotc: SOTC_FPS_LEAN drops the clock reads
                 timed = true;
                 outer_nested = nested_ns;
@@ -1315,7 +1378,9 @@ struct DrawWait {
                 SotcTrace::Span(kNames[kind], start, now);
             }
             const uint64_t inner = nested_ns < elapsed ? nested_ns : elapsed;
-            draw_wait_ns[kind].fetch_add(elapsed - inner, std::memory_order_relaxed);
+            if (kFpsLog) { // sotc: the sums are read only by the SOTC_FPS printer
+                draw_wait_ns[kind].fetch_add(elapsed - inner, std::memory_order_relaxed);
+            }
             nested_ns = outer_nested + elapsed;
         }
         if (on) {
@@ -1326,7 +1391,8 @@ struct DrawWait {
     DrawWait& operator=(const DrawWait&) = delete;
 };
 
-/// Adds the scope's duration to `total` when SOTC_FPS is on and the caller has `role`.
+/// Adds the scope's duration to `total` when SOTC_FPS is on and the caller has `role`. With
+/// SOTC_TRACE only, the clock is read for the span (trace_name) and `total` is left alone.
 /// sotc: trace_name (a string literal) also records the scope as a SOTC_TRACE span.
 struct RoleTimer {
     std::atomic<uint64_t>& total;
@@ -1343,7 +1409,9 @@ struct RoleTimer {
     ~RoleTimer() {
         if (on) {
             const uint64_t now = NowNs();
-            total.fetch_add(now - start, std::memory_order_relaxed);
+            if (kFpsLog) { // sotc: the sums are read only by the SOTC_FPS printer
+                total.fetch_add(now - start, std::memory_order_relaxed);
+            }
             if (trace_name && SotcTrace::kOn) {
                 SotcTrace::Span(trace_name, start, now);
             }
@@ -1486,6 +1554,38 @@ enum XpReason : int {
     XpOk,             ///< ran ahead
     XpReasons
 };
+// sotc: SOTC_OP_OVERLAP=1 (plan step 7c.0, docs/DRAW-THREAD-7C-DESIGN.md, open question 5).
+// Measurement only, default off; needs SOTC_PARALLEL_RECORD=1 (the prep threads fill the
+// footprints) and SOTC_FPS=1 (the report). The draw thread compares each draw/dispatch's guest
+// footprint with the previous op's (AmdGpu::Conflicts): the share of conflicting pairs bounds what
+// a pipeline of draw stages could overlap. It adds work on the draw thread, so do not time
+// anything in the same session.
+inline const bool kOpOverlap = [] {
+    const char* v = std::getenv("SOTC_OP_OVERLAP");
+    return v && v[0] == '1';
+}();
+inline std::atomic<uint64_t> ovl_ops{0};       ///< draws/dispatches whose footprint was computed
+inline std::atomic<uint64_t> ovl_not_ready{0}; ///< the op's prep slot was not ready (no footprint)
+inline std::atomic<uint64_t> ovl_unknown{0};   ///< footprint unknown: would block any overlap
+inline std::atomic<uint64_t> ovl_pairs{0};     ///< consecutive pairs with both footprints known
+inline std::atomic<uint64_t> ovl_conflicts{0}; ///< ... where one op's writes overlap the other op
+inline std::atomic<uint64_t> ovl_breaks{0};    ///< pairs cut by a command-processor op between them
+
+// sotc: SOTC_AB_PR=1 (plan step 7c.0). In-session A/B of SOTC_PARALLEL_RECORD, default off; needs
+// SOTC_PARALLEL_RECORD=1 and SOTC_FPS=1. The 5 s report alternates the phase: in even windows the
+// draw thread uses the prepared draws, in odd windows it ignores them and computes inline (the
+// path it already takes when a prepared draw is not ready). Each report starts with a
+// "SOTC AB PR window N: on|off" line so the windows can be compared offline.
+inline const bool kAbPr = [] {
+    const char* v = std::getenv("SOTC_AB_PR");
+    return v && v[0] == '1';
+}();
+inline std::atomic<uint32_t> ab_window{0};      ///< report window index; odd = prepared draws ignored
+inline std::atomic<uint64_t> ab_ignored{0};     ///< prepared draws ignored in this window
+inline bool AbPrIgnoring() noexcept {
+    return kAbPr && (ab_window.load(std::memory_order_relaxed) & 1) != 0;
+}
+
 inline std::atomic<uint64_t> xp_segments{0};      ///< express segments published by the parser
 inline std::atomic<uint64_t> xp_ahead{0};         ///< ... that ran ahead of older ops
 inline std::atomic<uint64_t> xp_skipped_ops{0};   ///< older ops they jumped over

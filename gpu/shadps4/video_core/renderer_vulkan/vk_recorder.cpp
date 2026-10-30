@@ -1861,7 +1861,8 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
         const bool perf = Common::PerfStats::Enabled();
         const auto busy_start = perf ? Clock::now() : Clock::time_point{};
         // sotc: SOTC_FPS: recording thread busy time (blocks run, not the wait for work)
-        const u64 sotc_busy_start = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
+        // sotc: SOTC_TRACE reads it too (its "rec busy" span)
+        const u64 sotc_busy_start = (SotcStats::kFpsLog || SotcTrace::kOn) ? SotcStats::NowNs() : 0;
         while (pos < committed) {
             auto* header = reinterpret_cast<BlockHeader*>(chunk->data + pos);
             if (header->kind == BlockKind::End) {
@@ -1897,9 +1898,9 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
         if (SotcStats::kFpsLog) {
             SotcStats::rec_busy_ns.fetch_add(SotcStats::NowNs() - sotc_busy_start,
                                              std::memory_order_relaxed);
-            if (SotcTrace::kOn) { // sotc: SOTC_TRACE
-                SotcTrace::Span("rec busy", sotc_busy_start, SotcStats::NowNs());
-            }
+        }
+        if (SotcTrace::kOn) { // sotc: SOTC_TRACE
+            SotcTrace::Span("rec busy", sotc_busy_start, SotcStats::NowNs());
         }
         if (perf) {
             Common::PerfStats::Add(

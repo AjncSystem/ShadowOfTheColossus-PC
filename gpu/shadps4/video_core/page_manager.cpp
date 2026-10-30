@@ -24,6 +24,7 @@
 #include "common/multi_level_page_table.h"
 #include "common/signal_context.h"
 #include "common/thread.h"
+#include "sotc_backing_warm.h" // sotc: SOTC_BACKING_WARM (gpu/shim)
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "common/decoder.h"
@@ -32,7 +33,12 @@
 #include "video_core/page_manager.h"
 #include "video_core/sotc_op_phases.h" // sotc: SOTC_OP_PHASES
 #include "video_core/sotc_stats.h"
+#include "video_core/buffer_cache/async_upload.h" // sotc: SOTC_WRITE_DECL waits for the copies
+#include "video_core/buffer_cache/buffer_cache.h" // sotc: SOTC_FPS readbacks by guest RIP (B6)
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/buffer_cache/memory_tracker.h" // sotc: SOTC_WRITE_DECL (MAX_CPU_PAGE_BITS)
+#include "../../sotc/write_decl.h" // sotc: SOTC_WRITE_DECL statistics and write fault classes
+#include "../../sotc/mem_classes.h" // sotc: SOTC_CLASS_TRACK write faults per pool (plan step 6)
 
 // src/runtime_memory.c: the runtime's view of a page next to the host protection (diagnostics).
 extern "C" void runtime_memory_describe(uintptr_t address, char* out, size_t capacity);
@@ -210,6 +216,19 @@ void UnregisterGuestStack(VAddr address, u64 size) {
     if (g_reapply_protection) {
         g_reapply_protection(begin, end - begin);
     }
+}
+
+// sotc: see page_manager.h. Shared lock like the readers below: a writer only try-locks, so this
+// waits for at most one registry edit.
+bool GuestStackRange(VAddr addr, VAddr& lo, VAddr& hi) {
+    std::shared_lock lk{g_guest_stacks_mutex};
+    const auto it = g_guest_stacks.find(addr);
+    if (it == g_guest_stacks.end()) {
+        return false;
+    }
+    lo = it->first.lower();
+    hi = it->first.upper();
+    return true;
 }
 
 namespace {
@@ -1001,7 +1020,9 @@ struct SignalImpl : public PageManager::Impl {
     }
 
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
-        RENDERER_TRACE;
+        // sotc: no RENDERER_TRACE zone here: Protect is reached from the guest fault handler, where
+        // a zone's Span/RegisterZoneSite (allocation, a mutex) is unsafe. The fault span is
+        // recorded separately with the no-alloc path.
         SotcTrace::NoteProtect(); // sotc: SOTC_TRACE (BindScope)
         SotcStats::SyncPipe::NoteProtect(); // sotc: SOTC_SYNC_PIPE counters (inside BindResources)
         SotcOpPhases::NoteProtect(size); // sotc: SOTC_OP_PHASES
@@ -1339,6 +1360,15 @@ struct SignalImpl : public PageManager::Impl {
         if (Common::IsWriteError(context)) {
             // sotc: SOTC_FPS: the time from the entry of bbgpu_handle_fault to here is dispatch.
             SotcStats::FaultStat::NoteHandlerEntry();
+            // sotc: SOTC_FPS (0b): write faults by the class of the code that faulted.
+            if (SotcStats::kFpsLog) {
+                SotcWriteDecl::NoteWriteFault(reinterpret_cast<u64>(Common::GetRip(context)), addr);
+            }
+            // sotc: SOTC_CLASS_TRACK (modes 1 and 2): the write fault counted per allocator pool. Lock
+            // free; the lookup is the CPU-only table of mem_classes.cpp.
+            if (SotcMemClasses::On()) {
+                SotcMemClasses::NoteWriteFault(addr);
+            }
             // sotc: read only by the SOTC_CMD_STATS printer; every guest thread faults here, and
             // the counter shared a cache line with command-processor counters.
             if (SotcStats::kCmdStats) {
@@ -1411,6 +1441,11 @@ struct SignalImpl : public PageManager::Impl {
             if (track_fault) {
                 SotcStats::FaultStat::Done(extent_lo, extent_hi);
             }
+            // sotc: SOTC_BACKING_WARM: the backing view pages of what the guest writes next are
+            // touched by the warm thread, before an upload reads them (lock-free queue push).
+            if (!is_gpu_thread) {
+                SotcBackingWarm::Note(extent_lo, extent_hi - extent_lo);
+            }
             {
                 // sotc: SOTC_PROTECT_COALESCE: the page must be writable before the guest
                 // retries, and before RepairStuckWriteFault looks at it.
@@ -1433,9 +1468,77 @@ struct SignalImpl : public PageManager::Impl {
                 SotcStats::fault_gpu_reads.fetch_add(1, std::memory_order_relaxed);
             }
             NoteReadFault(context, addr, is_gpu_thread);
+            // sotc: SOTC_FPS (B6): the guest instruction of this read fault, for the readback
+            // counts per RIP (ReportReadbackRips). Nothing is set unless SOTC_FPS is on.
+            const SotcFaultRip::Scope fault_rip{
+                SotcStats::kFpsLog && !is_gpu_thread
+                    ? reinterpret_cast<u64>(Common::GetRip(context))
+                    : u64{0}};
             return rasterizer->ReadMemory(addr, size, is_gpu_thread);
         }
         return false;
+    }
+
+    // sotc: SOTC_WRITE_DECL. Clips [addr, addr + size) to the tracked address space (regions exist
+    // below 1 << MAX_CPU_PAGE_BITS only). False when nothing is left.
+    static bool ClipToTracked(VAddr& addr, u64& size) {
+        const u64 limit = u64{1} << VideoCore::MemoryTracker::MAX_CPU_PAGE_BITS;
+        if (addr >= limit) {
+            return false;
+        }
+        size = std::min(size, limit - addr);
+        return size != 0;
+    }
+
+    // sotc: SOTC_WRITE_DECL. func(addr, size) for each run of the span outside the guest stacks
+    // that a declare settles (BufferCache::ForEachDeclarableRun). The look is unlocked; func takes
+    // the locked path, which checks the bits again. Func is a lambda or a DeclareRunFn.
+    template <typename Func>
+    static void ForEachDeclarableRunHere(VAddr addr, u64 size, Func& func) {
+        ForEachNonStackRange(addr, size, [&func](VAddr begin, u64 length) {
+            rasterizer->GetBufferCache().ForEachDeclarableRun(
+                begin, length,
+                [](void* ctx, VAddr run, u64 run_size) {
+                    (*static_cast<Func*>(ctx))(run, run_size);
+                },
+                &func);
+        });
+    }
+
+    // sotc: SOTC_WRITE_DECL (PageManager::DeclareCpuWrite). The write branch of HandleGuestFault
+    // for the pages of a span the CPU is about to write: async uploads that still read the span
+    // finish first (as bbgpu_handle_fault waits for its page), then each run of protected, CPU-clean
+    // pages is invalidated as a fault invalidates its page, and the unprotects of the span are
+    // applied in one flush. Pages with GPU data are not declared (their fault path does the
+    // readback). No fault granule, no write-ahead, no repair.
+    static void DeclareCpuWriteHere(VAddr addr, u64 size, bool is_gpu_thread,
+                                    PageManager::DeclareRunFn on_run) {
+        if (auto* async_upload = VideoCore::AsyncUpload::Get();
+            async_upload && async_upload->AnyPending()) {
+            async_upload->WaitVa(addr, size);
+        }
+        // As in a fault: the updates protect at once, also on a thread with a batch open.
+        struct BatchSuspend {
+            BatchSuspend() { ++tl_protect_batch.suspended; }
+            ~BatchSuspend() { --tl_protect_batch.suspended; }
+        } const batch_suspend;
+        // The unprotects of the runs are collected and applied by the flush below, as a guest write
+        // fault collects them. A span holding GPU data is not collected (see FaultMayCoalesce).
+        PageManager::FaultProtectScope protect_scope{
+            SotcStats::kProtectCoalesce && !is_gpu_thread &&
+            !rasterizer->GetBufferCache().IsRegionGpuModified(addr, size)};
+        auto invalidate = [is_gpu_thread, on_run](VAddr begin, u64 length) {
+            if (on_run) { // sotc: SOTC_FPS verify stamps, before the run is settled
+                on_run(begin, length);
+            }
+            if (is_gpu_thread) {
+                rasterizer->InvalidateMemory(begin, length, true);
+            } else {
+                rasterizer->InvalidateMemoryOnGuestFault(begin, length);
+            }
+        };
+        ForEachDeclarableRunHere(addr, size, invalidate);
+        protect_scope.Flush(0);
     }
 
 #ifdef _WIN32
@@ -1629,6 +1732,43 @@ void PageManager::FaultProtectScope::Flush(VAddr fault_page) {
     if (active && (fault_page != 0 || !tl_protect_batch.fault_runs.empty())) {
         g_fault_protect_flush(fault_page);
     }
+}
+
+// sotc: SOTC_WRITE_DECL (page_manager.h). Like GuestFaultSignalHandler: the command processor's
+// span runs on the draw thread, after the work queued before it. The caller's pre-check comes
+// first, so a span with no write-protected page costs no thread switch.
+void PageManager::DeclareCpuWrite(VAddr addr, u64 size, DeclareRunFn on_run) {
+    auto* rasterizer = Impl::rasterizer;
+    if (!rasterizer || !SignalImpl::ClipToTracked(addr, size)) {
+        return;
+    }
+    if (rasterizer->RunsGpuWorkElsewhere()) {
+        rasterizer->RunOnDrawThread(
+            [addr, size, on_run] { SignalImpl::DeclareCpuWriteHere(addr, size, true, on_run); });
+        return;
+    }
+    SignalImpl::DeclareCpuWriteHere(addr, size, rasterizer->IsGpuSideThread(), on_run);
+}
+
+// sotc: SOTC_WRITE_DECL=2 (page_manager.h). The look only: no thread switch, nothing invalidated.
+void PageManager::VisitDeclarableRuns(VAddr addr, u64 size, DeclareRunFn fn) {
+    if (!Impl::rasterizer || !fn || !SignalImpl::ClipToTracked(addr, size)) {
+        return;
+    }
+    SignalImpl::ForEachDeclarableRunHere(addr, size, fn);
+}
+
+bool PageManager::MaybeWriteProtected(VAddr addr, u64 size) {
+    auto* rasterizer = Impl::rasterizer;
+    return rasterizer && size != 0 &&
+           rasterizer->GetBufferCache().MaybeWriteProtected(addr, size);
+}
+
+u64 PageManager::CountWriteProtectedPages(VAddr addr, u64 size) {
+    auto* rasterizer = Impl::rasterizer;
+    return rasterizer && size != 0
+               ? rasterizer->GetBufferCache().CountWriteProtectedPages(addr, size)
+               : 0;
 }
 
 bool MeasureFaultOsCost(double& in_us, double& out_us) {

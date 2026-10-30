@@ -12,7 +12,10 @@
 #include "core/signals.h"
 #include "cpu_patches.h"
 #include "dwarf.h"
+#include "hook_layout.h"
+#include "hooks.h"
 #include "sotc_patches.h"
+#include "../shim/sotc_sampler.h" // sotc: trace v2 continuous sampler (SOTC_TRACE_SAMPLE)
 
 extern "C" int sotc_patch_eboot(const SotcPatchRequest* request, SotcPatchResult* result) {
     *result = {};
@@ -57,6 +60,36 @@ extern "C" int sotc_patch_eboot(const SotcPatchRequest* request, SotcPatchResult
         // Long forms last: the linear sweep sees the jumps written above as plain instructions.
         Core::PrePatchInstructions(address, size);
     }
+
+    // sotc: engine hooks last, so their pattern checks see the final bytes (docs/HOOK-DESIGN.md).
+    // The code layout gives the hook scan its code segments and function starts.
+    if (request->hooks_path) {
+        Core::RegisterFunctionStarts(function_starts); // the detours need the function table
+        SotcHooks::RegisterAllHandlers();
+        std::vector<SotcHooks::CodeRange> code;
+        for (uint32_t i = 0; i < request->segment_count; ++i) {
+            const uint64_t begin = request->segments[i].offset;
+            code.push_back({begin, begin + request->segments[i].size});
+        }
+        std::vector<uint64_t> starts;
+        for (const uintptr_t start : function_starts) {
+            if (start >= base) {
+                starts.push_back(start - base);
+            }
+        }
+        SotcHooks::SetCodeLayout(code, starts);
+        SotcHooks::InstallStats hook_stats{};
+        SotcHooks::InstallHooks(request->hooks_path, request->image, request->module_size,
+                                &hook_stats);
+        result->hooks_installed = hook_stats.installed;
+        result->hooks_off = hook_stats.off;
+    }
+    result->trampoline_used = Core::TrampolineBytesUsed();
+    // sotc: trace v2 continuous sampler (SOTC_TRACE_SAMPLE). A no-op unless the recorder and the
+    // sampler switch are on. Runs before any guest thread starts.
+    SotcSampler::Info sampler{base, request->module_size, base + request->eh_frame_hdr,
+                              request->eh_frame_hdr_size};
+    SotcSampler::Start(sampler);
     return 0;
 }
 

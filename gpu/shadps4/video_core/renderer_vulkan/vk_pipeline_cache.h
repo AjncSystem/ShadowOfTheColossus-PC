@@ -4,13 +4,16 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <thread>
 #include <unordered_set>
 #include <variant>
+#include <vector>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
@@ -150,6 +153,64 @@ private:
     bool RefreshGraphicsStages();
     bool RefreshComputeKey();
 
+    /// sotc: SOTC_PIPE_MEMO=1/2 (see GetProgram). The permutation a stage last resolved to, with
+    /// every input its specialization reads: the program and stage pair, the shader hash, the user
+    /// data, the flattened buffer (refreshed on every call, compared after that), the runtime info,
+    /// the bindings the stage started from, for tessellation the constant buffer in guest memory,
+    /// and for a vertex fetch shader its code words. The runtime memory generation of the store
+    /// must still be the current one. Command processor thread only.
+    struct StageMemo {
+        bool valid{};
+        const Program* program{};
+        Shader::HwStage hw_stage{};
+        Shader::SwStage sw_stage{};
+        u64 hash{};
+        u32 perm{};
+        size_t modules_size{}; ///< program->modules.size() when stored (a new permutation moves it)
+        std::array<u32, Shader::ShaderParams::NumShaderUserData> user_data{};
+        std::vector<u32> flat_buf;
+        Shader::RuntimeInfo runtime_info{};
+        Shader::Backend::Bindings start{};
+        Shader::Backend::Bindings after{}; ///< the bindings the stage left with (slow path result)
+        bool has_tess{};
+        Shader::TessellationDataConstantBuffer tess{};
+        bool has_fetch{};            ///< a vertex fetch shader was parsed (fetch_code is used)
+        std::vector<u32> fetch_code; ///< its code words, read from the backing view at store time
+        u64 generation{};            ///< runtime_memory_generation() before the slow path ran
+        u64 stamp{};                 ///< last store or hit (LRU choice within a set)
+    };
+    // sotc: 2-way set-associative: kStageMemoSets sets of kStageMemoWays entries. Allocated on the
+    // first memo lookup, so the switch being unset costs nothing.
+    static constexpr size_t kStageMemoSets = 256;
+    static constexpr size_t kStageMemoWays = 2;
+    std::vector<StageMemo> stage_memo;
+    u64 stage_memo_tick{};
+    /// sotc: the first thread that called GetProgram in a memo mode. Other threads take the slow
+    /// path (counted as foreign).
+    std::atomic<std::thread::id> pipe_memo_owner{};
+    bool PipeMemoOwnerThread();
+    static size_t StageMemoSet(u64 hash, Shader::HwStage hw_stage, Shader::SwStage sw_stage);
+    bool StageMemoHit(const StageMemo& memo, const Program& program, Shader::HwStage hw_stage,
+                      Shader::SwStage sw_stage, const Shader::ShaderParams& params,
+                      const Shader::RuntimeInfo& rt, const Shader::Backend::Bindings& start,
+                      const Shader::TessellationDataConstantBuffer& tess, bool has_tess,
+                      u64 generation) const;
+    /// sotc: the way a store goes into when the lookup missed: an entry of the same key (its
+    /// inputs changed), else an empty way, else the least recently used one (an eviction).
+    StageMemo* StageMemoVictim(StageMemo* ways, const Program& program, Shader::HwStage hw_stage,
+                               Shader::SwStage sw_stage, u64 hash);
+    /// Returns false (nothing stored) when the fetch code cannot be read from the backing view.
+    bool StageMemoStore(StageMemo& memo, const Program& program, Shader::HwStage hw_stage,
+                        Shader::SwStage sw_stage, const Shader::ShaderParams& params,
+                        const Shader::RuntimeInfo& rt, const Shader::Backend::Bindings& start,
+                        const Shader::TessellationDataConstantBuffer& tess, bool has_tess,
+                        u64 generation, size_t perm, const Shader::Backend::Bindings& after);
+    /// sotc: SOTC_PIPE_MEMO=1/2: the last compute pipeline and the key it was looked up with.
+    const ComputePipeline* last_compute_pipeline{};
+    ComputePipelineKey last_compute_key{};
+    size_t last_compute_size{}; ///< compute_pipelines.size() when stored
+    size_t last_graphics_size{}; ///< graphics_pipelines.size() when last_graphics_pipeline was stored
+
     void DumpShader(std::span<const u32> code, u64 hash, Shader::HwStage stage, size_t perm_idx,
                     std::string_view ext);
     /// A patch is SPIR-V edited from the module the recompiler generated on one GPU. When a
@@ -192,6 +253,9 @@ private:
         /// sotc: a pipeline of the boot preload (SOTC_ASYNC_PRELOAD): built from the cached
         /// state, and already in the cache (not registered again).
         bool preloaded{};
+        /// sotc: SOTC_PIPE_REMAP: set for a preload whose key was remapped, to the name of the
+        /// old key's blob. The new key is saved and the old blob removed only once it built.
+        std::optional<std::string> remap_old_blob;
 
         /// sotc: SOTC_ASYNC_TRANSLATE (default on): a graphics shader stage seen for the first
         /// time (or a new permutation of one) is translated by a worker, queued after the compute
@@ -219,7 +283,8 @@ private:
     bool AsyncPipelineEligible() const;
     void QueueAsyncPipeline(u64 hash,
                             const GraphicsPipeline::SerializationSupport* preloaded = nullptr,
-                            bool priority = false);
+                            bool priority = false,
+                            std::optional<std::string> remap_old_blob = std::nullopt);
     bool AsyncPreloadEnabled() const;
     bool IsDepthOnlyDraw() const;
     const char* AsyncIneligibleReason() const;
@@ -297,5 +362,9 @@ private:
     bool compute_prefetch{}; ///< SOTC_ASYNC_COMPUTE_XLATE=1 and workers exist
     std::vector<std::jthread> async_workers;
 };
+
+/// sotc: SOTC_PIPE_MEMO=1/2 counters (vk_pipeline_cache.cpp): appends one line for the 5 s report
+/// when the switch is on and the window had lookups. Call from one thread only.
+void ReportPipeMemo(std::string& out, double seconds);
 
 } // namespace Vulkan

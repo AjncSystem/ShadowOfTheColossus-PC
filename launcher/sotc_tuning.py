@@ -301,13 +301,17 @@ TUNING = [('SOTC_ADAPTIVE_SHADOW',
   '',
   ()),
  ('SOTC_DROP_FAST',
-  'flag',
+  'flag_on',
   'memory',
   ('Liberar memória que a GPU só leu, sem espera', 'Fast release of memory the GPU only read'),
-  ('Experimental, desligado: liberar memória que a GPU só leu não espera a thread de desenho. '
-   'Medido: no boot e no carregamento do save, essa espera somava 2,5 a 3 s a cada 5 s.',
-   'Experimental, off: releasing memory the GPU only read does not wait for the draw thread. '
-   'Measured: at boot and save loading that wait added 2.5 to 3 s per 5 s.'),
+  ('Ligado por padrão: liberar memória que a GPU só leu não espera a thread de desenho. '
+   'Medido: menos travadas nas cargas (o pior quadro caiu de 417 ms para 125–185 ms, e as esperas '
+   'ao liberar memória de ~9 s para menos de 50 ms por sessão). ATENÇÃO: em 1 de 4 testes o jogo '
+   'fechou sozinho ao carregar o save; a causa ainda não foi encontrada.',
+   'On by default: releasing memory the GPU only read does not wait for the draw thread. '
+   'Measured: fewer hitches while loading (worst frame from 417 ms to 125-185 ms, memory-release '
+   'waits from ~9 s to under 50 ms per session). WARNING: in 1 of 4 tests the game closed on its '
+   'own while loading the save; the cause is not found yet.'),
   '',
   ()),
  ('SOTC_FAULT_GRANULE',
@@ -1077,13 +1081,36 @@ TUNING = [('SOTC_ADAPTIVE_SHADOW',
   '256',
   ()),
  ('SOTC_STAGING_LARGE_POW2',
-  'flag',
+  'flag_on',
   'upload',
   ('Reaproveitar buffers grandes de envio', 'Reuse large upload buffers'),
   ('Agrupa os buffers grandes de envio à GPU em tamanhos fixos, para reaproveitá-los e não alocar '
-   'de novo durante o carregamento de áreas. Desligado por padrão, experimental.',
+   'de novo durante o carregamento de áreas. Ligado por padrão.',
    'Groups large GPU upload buffers into fixed sizes so they can be reused instead of allocated '
-   'again while areas load. Off by default, experimental.'),
+   'again while areas load. On by default.'),
+  '',
+  ()),
+ ('SOTC_COPY_GUEST_VIEW',
+  'flag_on',
+  'upload',
+  ('Envios leem pelo endereço do jogo', 'Uploads read through the game address'),
+  ('Ligado por padrão. Os envios de memória do jogo à GPU leem pelo endereço do próprio jogo, '
+   'protegidos contra falha, em vez da segunda visão da memória, cuja primeira leitura de cada '
+   'página é lenta. Cópias de carregamento de área ~25% mais rápidas. Desligue para voltar à '
+   'segunda visão.',
+   'On by default. GPU uploads of game memory read through the game\'s own address, guarded '
+   'against faults, instead of the second view of memory, whose first read of each page is slow. '
+   'Area-load copies ~25% faster. Turn off to go back to the second view.'),
+  '',
+  ()),
+ ('SOTC_FILL_HLE_GPU',
+  'flag_on',
+  'upload',
+  ('Tabelas de preenchimento na GPU', 'Fill tables on the GPU'),
+  ('Ligado por padrão. As tabelas que o shader de preenchimento escreve chegam à GPU por '
+   'preenchimento ou cópia na própria GPU, em vez de serem copiadas de novo a cada carga de área.',
+   'On by default. The tables the fill shader writes reach the GPU through a fill or copy on the '
+   'GPU itself, instead of being copied again on every area load.'),
   '',
   ()),
  ('SOTC_XFER_QUEUE',
@@ -1116,6 +1143,18 @@ TUNING = [('SOTC_ADAPTIVE_SHADOW',
    'Default 4000 us (normal is 1000). Only with "Adaptive load control (experimental)": while '
    'relief is active, the periodic submits to the GPU are spaced further apart.'),
   '4000',
+  ()),
+ ('SOTC_MUTEX_SPIN_US',
+  'value',
+  'threads',
+  ('Espera curta nos mutexes do jogo (µs)', 'Short spin on game mutexes (us)'),
+  ('Padrão 20 µs (0 desliga, até 1000). Um mutex do jogo disputado tenta de novo por esse tempo '
+   'antes de esperar no sistema: o agendador de tarefas do jogo deixava de formar fila nas cargas '
+   'de área.',
+   'Default 20 us (0 turns it off, up to 1000). A contended game mutex retries for this long '
+   'before waiting in the system: the game\'s job scheduler stopped queueing up during area '
+   'loads.'),
+  '20',
   ()),
  ('SOTC_ASC_RPTR',
   'choice',
@@ -1657,22 +1696,26 @@ TUNING = [('SOTC_ADAPTIVE_SHADOW',
   '',
   ()),
  ('SOTC_TRACE',
-  'flag',
+  'choice',
   'diag',
-  ('Gravar linha do tempo dos quadros lentos', 'Record timeline of slow frames'),
-  ('Salva em user/trace a linha do tempo das threads ao redor de cada quadro lento. Custa CPU e '
-   'também liga “FPS no registro” (aba Avançado). Desligado por padrão; só para diagnóstico.',
-   'Saves to user/trace the thread timeline around each slow frame. Costs CPU and also turns on '
-   '"FPS in the log" (Advanced page). Off by default; diagnostics only.'),
+  ('Gravar linha do tempo (rastreamento)', 'Record timeline (tracing)'),
+  ('Desligado por padrão. 1: grava a janela ao redor de cada quadro lento (SOTC_TRACE_MS) em '
+   'user/trace. 2: grava a sessão inteira, em pedaços comprimidos. Custa CPU e liga “FPS no '
+   'registro” (aba Avançado). Os arquivos são lidos com tools/trace/sotc_trace.py. Só diagnóstico.',
+   'Off by default. 1: records the window around each slow frame (SOTC_TRACE_MS) in user/trace. '
+   '2: records the whole session in compressed chunks. Costs CPU and turns on "FPS in the log" '
+   '(Advanced page). Read the files with tools/trace/sotc_trace.py. Diagnostics only.'),
   '',
-  ()),
+  (('', ('Desligado', 'Off')),
+   ('1', ('Quadros lentos (janela ao redor)', 'Slow frames (window around)')),
+   ('2', ('Sessão inteira (fluxo contínuo)', 'Whole session (continuous stream)')))),
  ('SOTC_TRACE_DIR',
   'value',
   'diag',
   ('Pasta da linha do tempo', 'Timeline folder'),
-  ('Pasta onde a linha do tempo é gravada, com “Gravar linha do tempo dos quadros lentos”. Vazio '
-   'usa a pasta user/trace. Só para diagnóstico.',
-   'Folder where the timeline is written, with "Record timeline of slow frames". Empty uses the '
+  ('Pasta onde os arquivos de rastreamento são gravados, com “Gravar linha do tempo (rastreamento)”. '
+   'Vazio usa a pasta user/trace. Só para diagnóstico.',
+   'Folder where the trace files are written, with "Record timeline (tracing)". Empty uses the '
    'user/trace folder. Diagnostics only.'),
   '',
   ()),
@@ -1680,41 +1723,119 @@ TUNING = [('SOTC_ADAPTIVE_SHADOW',
   'value',
   'diag',
   ('Máximo de arquivos de linha do tempo', 'Maximum timeline files'),
-  ('Quantos arquivos de linha do tempo são gravados por sessão, com “Gravar linha do tempo dos '
-   'quadros lentos”. Padrão 40. Só para diagnóstico.',
-   'How many timeline files are written per session, with "Record timeline of slow frames". '
-   'Default 40. Diagnostics only.'),
+  ('Quantos arquivos de rastreamento são gravados por sessão, com “Gravar linha do tempo '
+   '(rastreamento)” em 1. Padrão 40. Só para diagnóstico.',
+   'How many trace files are written per session, with "Record timeline (tracing)" on 1. Default '
+   '40. Diagnostics only.'),
   '40',
   ()),
  ('SOTC_TRACE_MS',
   'value',
   'diag',
   ('Limite de quadro lento (ms)', 'Slow frame threshold (ms)'),
-  ('A partir de quantos milissegundos um quadro é considerado lento e gera uma linha do tempo, com '
-   '“Gravar linha do tempo dos quadros lentos”. Padrão 60. Só para diagnóstico.',
-   'Frame time in milliseconds above which a frame counts as slow and gets a timeline, with '
-   '"Record timeline of slow frames". Default 60. Diagnostics only.'),
+  ('A partir de quantos milissegundos um quadro é considerado lento e gera uma janela de '
+   'rastreamento, com “Gravar linha do tempo (rastreamento)” em 1 ou 2. Padrão 60. Só para diagnóstico.',
+   'Frame time in milliseconds above which a frame counts as slow and gets a trace window, with '
+   '"Record timeline (tracing)" on 1 or 2. Default 60. Diagnostics only.'),
   '60',
   ()),
  ('SOTC_TRACE_POST_MS',
   'value',
   'diag',
   ('Tempo gravado depois do quadro lento (ms)', 'Time recorded after a slow frame (ms)'),
-  ('Quanto tempo, em milissegundos, é gravado depois de um quadro lento na linha do tempo. Padrão '
-   '40. Só com “Gravar linha do tempo dos quadros lentos”; diagnóstico.',
-   'How long, in milliseconds, is recorded after a slow frame in the timeline. Default 40. Only '
-   'with "Record timeline of slow frames"; diagnostics.'),
+  ('Quanto tempo, em milissegundos, é gravado depois de um quadro lento. Padrão 40. Só com '
+   '“Gravar linha do tempo (rastreamento)” em 1; diagnóstico.',
+   'How long, in milliseconds, is recorded after a slow frame. Default 40. Only with "Record '
+   'timeline (tracing)" on 1; diagnostics.'),
   '40',
   ()),
  ('SOTC_TRACE_PRE_MS',
   'value',
   'diag',
   ('Tempo gravado antes do quadro lento (ms)', 'Time recorded before a slow frame (ms)'),
-  ('Quanto tempo, em milissegundos, é gravado antes de um quadro lento na linha do tempo. Padrão '
-   '150. Só com “Gravar linha do tempo dos quadros lentos”; diagnóstico.',
-   'How long, in milliseconds, is recorded before a slow frame in the timeline. Default 150. Only '
-   'with "Record timeline of slow frames"; diagnostics.'),
+  ('Quanto tempo, em milissegundos, é gravado antes de um quadro lento. Padrão 150. Só com '
+   '“Gravar linha do tempo (rastreamento)” em 1; diagnóstico.',
+   'How long, in milliseconds, is recorded before a slow frame. Default 150. Only with "Record '
+   'timeline (tracing)" on 1; diagnostics.'),
   '150',
+  ()),
+ ('SOTC_TRACE_RING',
+  'value',
+  'diag',
+  ('Tamanho dos anéis de eventos (multiplicador)', 'Event ring size (multiplier)'),
+  ('Multiplica o tamanho dos anéis de eventos de cada papel de thread. Vazio usa o padrão do build. '
+   'Aumente se o contador de descartes mostrar perda dentro da janela de um quadro lento. Só com '
+   '“Gravar linha do tempo (rastreamento)” ligado.',
+   'Multiplies the event ring size of each thread role. Empty uses the build default. Raise it if the '
+   'drop counter shows loss inside a slow-frame window. Only with "Record timeline (tracing)" on.'),
+  '',
+  ()),
+ ('SOTC_TRACE_ZONES',
+  'flag',
+  'diag',
+  ('Zonas do shadPS4 na linha do tempo', 'shadPS4 zones in the timeline'),
+  ('Desligado por padrão. As zonas de medição do shadPS4 (Tracy) entram na linha do tempo como '
+   'trechos. Só as de pelo menos SOTC_TRACE_ZONE_MIN_US (padrão 20 µs). Só diagnóstico.',
+   'Off by default. The shadPS4 measurement zones (Tracy) enter the timeline as spans. Only zones of '
+   'at least SOTC_TRACE_ZONE_MIN_US (default 20 µs). Diagnostics only.'),
+  '',
+  ()),
+ ('SOTC_TRACE_GPU',
+  'flag',
+  'diag',
+  ('Tempos reais da GPU na linha do tempo', 'Real GPU times in the timeline'),
+  ('Desligado por padrão. Grava o tempo que a GPU gastou em cada envio, com marcas de tempo da '
+   'Vulkan. Mostra se um quadro lento esperou a GPU ou a CPU. Usa a calibração de relógio da placa, '
+   'quando ela tem a extensão; sem ela, não há efeito. Só diagnóstico.',
+   'Off by default. Records the GPU time of each submit, with Vulkan timestamps. Shows whether a slow '
+   'frame waited for the GPU or the CPU. Uses the GPU clock calibration when the card has the '
+   'extension; without it, no effect. Diagnostics only.'),
+  '',
+  ()),
+ ('SOTC_TRACE_IMPORTS',
+  'choice',
+  'diag',
+  ('Chamadas ao sistema PS4 (importações)', 'PS4 system calls (imports)'),
+  ('Desligado por padrão. 1: conta as chamadas e o tempo de cada função do sistema PS4 que o jogo '
+   'importa. 2: também grava os trechos mais longos que SOTC_TRACE_IMPORT_MIN_US (padrão 50 µs). '
+   'Só diagnóstico.',
+   'Off by default. 1: counts the calls and the time of each PS4 system function the game imports. '
+   '2: also records the spans longer than SOTC_TRACE_IMPORT_MIN_US (default 50 µs). Diagnostics only.'),
+  '',
+  (('', ('Desligado (padrão)', 'Off (default)')),
+   ('1', ('Contadores por importação', 'Counters per import')),
+   ('2', ('Contadores e trechos longos', 'Counters and long spans')))),
+ ('SOTC_TRACE_SCOPES',
+  'flag',
+  'diag',
+  ('Escopos de medição do motor como trechos', 'Engine measurement scopes as spans'),
+  ('Desligado por padrão. Os escopos de medição do próprio motor do jogo entram na linha do tempo '
+   'com os seus nomes. Só diagnóstico.',
+   "Off by default. The game engine's own measurement scopes enter the timeline under their names. "
+   'Diagnostics only.'),
+  '',
+  ()),
+ ('SOTC_TRACE_SAMPLE',
+  'value',
+  'diag',
+  ('Amostragem de pilhas (Hz)', 'Stack sampling (Hz)'),
+  ('Vazio desliga. Amostra a pilha de todas as threads nesta frequência e põe as pilhas na linha do '
+   'tempo e em tools/trace top. Substitui SOTC_PROFILE (o nome antigo ainda vale). Custa CPU: cada '
+   'amostra suspende a thread medida por pouco tempo. Só diagnóstico.',
+   'Empty turns it off. Samples the stack of every thread at this rate and puts the stacks in the '
+   'timeline and in tools/trace top. Replaces SOTC_PROFILE (the old name still works). Costs CPU: each '
+   'sample suspends the measured thread briefly. Diagnostics only.'),
+  '',
+  ()),
+ ('SOTC_TRACE_FUNCS',
+  'value',
+  'diag',
+  ('Funções do eboot cronometradas (arquivo)', 'Timed eboot functions (file)'),
+  ('Arquivo com a lista de funções do eboot a cronometrar com exatidão, gerado por '
+   'tools/trace/sotc_trace.py autofuncs. Vazio não usa nenhum. Só diagnóstico.',
+   'File with the list of eboot functions to time exactly, generated by tools/trace/sotc_trace.py '
+   'autofuncs. Empty uses none. Diagnostics only.'),
+  '',
   ()),
  ('SOTC_UNTRACK_LOG',
   'flag',
@@ -1725,7 +1846,56 @@ TUNING = [('SOTC_ADAPTIVE_SHADOW',
    'Logs the game\'s per-frame temporary memory blocks, with "FPS in the log" (Advanced page), to '
    'help choose "Unprotected memory ranges". Diagnostics only.'),
   '',
+  ()),
+ ('SOTC_LAB',
+  'flag',
+  'diag',
+  ('SotC Lab: menu F2, câmera livre F3, colossos, testes automáticos',
+   'SotC Lab: menu F2, free-cam F3, colossi, automated tests'),
+  ('Desligado por padrão. Liga as ferramentas de medição: menu F2, câmera livre (F3), rotas, pulo '
+   'direto aos colossos e testes automáticos. Só para medição; não afeta o jogo quando desligado.',
+   'Off by default. Turns on the measurement tools: F2 menu, free-cam (F3), routes, direct jumps to '
+   'the colossi and automated tests. For measurement only; the game is unaffected when off.'),
+  '',
+  ()),
+ ('SOTC_FREECAM_MAXSPEED',
+  'value',
+  'diag',
+  ('Velocidade máxima da câmera livre (m/s)', 'Free-cam maximum speed (m/s)'),
+  ('Limite de velocidade da câmera livre do SotC Lab, em metros por segundo. Padrão 60. Só com '
+   '“SotC Lab” ligado.',
+   'Speed cap of the SotC Lab free-cam, in metres per second. Default 60. Only with "SotC Lab" on.'),
+  '60',
+  ()),
+ ('SOTC_CTL',
+  'value',
+  'diag',
+  ('Canal de controle do SotC Lab (nome do pipe)', 'SotC Lab control channel (pipe name)'),
+  ('Nome do canal de controle (named pipe) do SotC Lab, para scripts externos. Vazio deixa o canal '
+   'desligado; só tem efeito com “SotC Lab” ligado.',
+   'Name of the SotC Lab control channel (named pipe) for external scripts. Empty keeps it off; it '
+   'only has an effect with "SotC Lab" on.'),
+  '',
   ())]
+
+
+# Switches that can change while the game runs (SotC Lab, gpu/sotc/sotc_live.h). Every name is in
+# TUNING and is read on its use path through SotcLive::Int, so a change applies at once.
+# Migrating a switch means meeting the live-safe rules in sotc_live.h, not just listing it here.
+LIVE = {
+    'SOTC_MDI_STATS': True,
+    'SOTC_CS_STATS': True,
+    'SOTC_BIND_DIFF': True,
+    'SOTC_EOP_TICK_US': True,
+    'SOTC_RB_WAIT_US': True,
+    'SOTC_RB_SPIN_US': True,
+    'SOTC_UNTRACK_MAX_MB': True,
+}
+
+
+def is_live(name):
+    """True when the switch can change while the game runs (see LIVE)."""
+    return bool(LIVE.get(name))
 
 
 def setting_key(name):
@@ -1738,6 +1908,26 @@ def defaults():
     return {setting_key(name): kind == 'flag_on' if kind in ('flag', 'flag_on') else
             (default if kind == 'value' else '')
             for name, kind, _group, _title, _hint, default, _options in TUNING}
+
+
+# Switches whose launcher default changed from off to on: a launcher setting saved before the change
+# holds False ("off, the old default") although the player never chose it. migrate() drops such a
+# saved value once, so the box shows the new default. (marker key, names)
+DEFAULT_ON_MIGRATIONS = [
+    ('tune_migrated_20261030', ('SOTC_STAGING_LARGE_POW2',)),
+    ('tune_migrated_20261030b', ('SOTC_DROP_FAST',)),
+]
+
+
+def migrate(saved):
+    """Drops the saved values of switches that became on by default (DEFAULT_ON_MIGRATIONS), once."""
+    for marker, names in DEFAULT_ON_MIGRATIONS:
+        if saved.get(marker):
+            continue
+        for name in names:
+            saved.pop(setting_key(name), None)
+        saved[marker] = True
+    return saved
 
 
 def fill_defaults(settings):

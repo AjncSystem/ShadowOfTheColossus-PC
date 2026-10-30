@@ -57,6 +57,12 @@ public:
     /// Queues the creation of an image. False when it was not queued (limits, budget, stopping).
     bool Request(const vk::ImageCreateInfo& image_ci, u64 size_hint);
 
+    /// sotc: SOTC_AREA_PREWARM=3 (area_prewarm.h): as Request for a record of an area being
+    /// replayed. Such an entry does not expire by time (it waits for its draw until DropReplay or
+    /// DropUnclaimed), and it has its own count cap, not the prefetch caps. Same plausibility and
+    /// video memory checks as Request.
+    bool RequestReplay(const vk::ImageCreateInfo& image_ci, u64 size_hint);
+
     /// Any thread constructing an Image: moves a prefetched image with exactly these parameters
     /// into `out` and returns true. A matching image a worker is creating right now is waited
     /// for; one still queued is taken back (false: the caller creates it). False also when none
@@ -74,6 +80,10 @@ public:
     /// nobody claimed and cancels the queued ones.
     void DropUnclaimed();
 
+    /// sotc: destroys the unclaimed replay entries (the next area's replay replaces them). Ones a
+    /// worker is making now stay until the next call.
+    void DropReplay();
+
 private:
     enum class State : u8 { Queued, Running, Ready, Failed, Cancelled };
     struct Entry {
@@ -82,6 +92,7 @@ private:
         u64 size_hint{};
         State state{State::Queued};
         bool claimed{}; ///< a Take waits for it: expiry and other Takes leave it alone
+        bool replay{};  ///< sotc: SOTC_AREA_PREWARM replay (RequestReplay): no time expiry
         u64 ready_ns{};
         UniqueImage image;
     };
@@ -93,6 +104,8 @@ private:
     /// Unclaimed failed entries, and ready ones older than ExpireNs, leave; the images go to
     /// `out` so they are destroyed after `mutex` is released. Under `mutex`.
     void ExpireLocked(u64 now, std::vector<UniqueImage>& out);
+    /// sotc: the accounting of an entry that leaves `entries`: its bytes (or its replay count).
+    void ReleaseLocked(const Entry& entry);
     bool FitsLimits(const vk::ImageCreateInfo& image_ci) const;
     static u64 KeyOf(const vk::ImageCreateInfo& image_ci);
     static bool SameImage(const vk::ImageCreateInfo& a, const vk::ImageCreateInfo& b);
@@ -106,6 +119,7 @@ private:
     std::deque<EntryPtr> queue;
     std::unordered_multimap<u64, EntryPtr> entries; ///< not taken yet (any state but Cancelled)
     u64 outstanding_bytes{};
+    size_t replay_outstanding{}; ///< sotc: replay entries in `entries` (not in outstanding_bytes)
     std::mutex alive_mutex;
     std::unordered_map<VAddr, u32> alive;
     std::vector<std::thread> workers;

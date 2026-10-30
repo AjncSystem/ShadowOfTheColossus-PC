@@ -9,9 +9,10 @@
 
 namespace Vulkan {
 
-void RegisterPipelineData(const ComputePipelineKey& key,
+// sotc: false when nothing was queued for saving (a collided permutation, or the cache is closed).
+bool RegisterPipelineData(const ComputePipelineKey& key,
                           ComputePipeline::SerializationSupport& sdata);
-void RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,
+bool RegisterPipelineData(const GraphicsPipelineKey& key, u64 hash,
                           GraphicsPipeline::SerializationSupport& sdata);
 void RegisterShaderMeta(const Shader::Info& info,
                         const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,

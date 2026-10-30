@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <algorithm>
+#include <array>
 #include <unordered_set>
 #include <stb_image.h>
 #include "common/path_util.h"
@@ -22,11 +24,13 @@
 #include "core/memory.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/sotc_adaptive.h"
+#include "../../../sotc/area_prewarm.h" // sotc: SOTC_AREA_PREWARM (records and replay)
 #include "video_core/texture_cache/host_compatibility.h"
 
 #include <vk_mem_alloc.h>
@@ -60,6 +64,9 @@ static void WriteBackSkippingStacks(VAddr guest_address, const u8* data, u64 siz
     });
 }
 
+// sotc: SOTC_AREA_PREWARM record check, defined with the replay below.
+static bool ReplayRecordKnown(const SotcAreaPrewarm::ImageRecord& rec);
+
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            Vulkan::Runtime& runtime_, AmdGpu::Liverpool* liverpool_,
                            BufferCache& buffer_cache_, PageManager& tracker_)
@@ -69,9 +76,15 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
       readback_linear_images{EmulatorSettings.IsReadbackLinearImagesEnabled()},
       image_prefetcher{AsyncImageCreateEnabled() ? std::make_unique<ImagePrefetcher>(instance_)
                                                  : nullptr} {
+    if (SotcAreaPrewarm::Recording()) {
+        SotcAreaPrewarm::SetRecordCheck(&ReplayRecordKnown); // sotc: checked when loaded
+    }
     if (image_prefetcher) {
         prefetch_seen = std::make_unique<std::array<PrefetchSeen, NumPrefetchSeen>>();
         LOG_INFO(Render, "SOTC_ASYNC_IMAGE_CREATE: new images are created ahead of their draw");
+    } else if (SotcAreaPrewarm::Mode() >= 3) {
+        LOG_WARNING(Render_Vulkan, "SOTC_AREA_PREWARM=3 needs SOTC_ASYNC_IMAGE_CREATE=1: "
+                                   "areas are recorded but not replayed");
     }
 
     u32 max_samplers = instance.GetMaxSamplerAllocationCount();
@@ -346,14 +359,77 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool 
     });
 }
 
+// sotc: SOTC_UNMAP_PARK (C5): an image may be parked by UnmapMemory only when nothing binds it
+// (the depth twins' test), it has Vulkan objects, and no depth twin hangs off it (its reclaim
+// goes with the image otherwise).
+static bool UnmapParkCandidate(const Image& image) {
+    // sotc: MSAA is never parked: RefreshImage skips the upload of a multisampled image.
+    return !image.binding.is_bound && !image.binding.is_target && !image.parked_twin &&
+           image.backing != nullptr && image.info.num_samples == 1;
+}
+
+// sotc: SOTC_UNMAP_PARK: whether `have` (the info of a parked image) is what a new image for `want`
+// would be. The Vulkan objects depend on these fields; the depth twins check the same set, with
+// the mip-tail fields and the alt tile added.
+static bool SameParkedShape(const ImageInfo& have, const ImageInfo& want) {
+    return have.guest_address == want.guest_address && have.guest_size == want.guest_size &&
+           have.pixel_format == want.pixel_format && have.type == want.type &&
+           have.size == want.size && have.pitch == want.pitch &&
+           !(have.resources < want.resources) && !(want.resources < have.resources) &&
+           have.num_samples == want.num_samples && have.num_bits == want.num_bits &&
+           have.tile_mode == want.tile_mode && have.alt_tile == want.alt_tile &&
+           have.props.is_depth == want.props.is_depth &&
+           have.props.has_stencil == want.props.has_stencil &&
+           have.props.is_block == want.props.is_block &&
+           have.props.is_tiled == want.props.is_tiled &&
+           have.props.is_pow2 == want.props.is_pow2 &&
+           have.sotc_first_mip == want.sotc_first_mip &&
+           have.sotc_dropped_bytes == want.sotc_dropped_bytes;
+}
+
+bool TextureCache::ParkUnmapped(ImageId image_id, u32 park_mode) {
+    Image& image = slot_images[image_id];
+    if (!UnmapParkCandidate(image)) {
+        return false;
+    }
+    if (park_mode == 2) {
+        ShadowNoteUnmapped(image.info); // log only: the caller frees the image as before
+        return false;
+    }
+    // sotc: every backing is charged: a multi-backing image holds more than the current one.
+    u64 bytes = 0;
+    for (const auto& backing : image.backing_images) {
+        bytes += backing.image.size_bytes;
+    }
+    if (bytes > UnmapParkBudget()) {
+        return false;
+    }
+    // The oldest parked images go first, to make room under the count and the VRAM budget.
+    while (!unmap_parked.empty() && (unmap_parked.size() >= UnmapParkMaxImages ||
+                                     unmap_parked_bytes + bytes > UnmapParkBudget())) {
+        EvictOldestUnmapParked();
+    }
+    ParkImage(image_id, ImageLeave::UnmapPark);
+    unmap_parked.push_back({image_id, bytes, gc_tick});
+    unmap_parked_bytes += bytes;
+    unmap_parks.fetch_add(1, std::memory_order_relaxed);
+    SyncUnmapParkGauges();
+    return true;
+}
+
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
     std::scoped_lock lk{mutex};
 
     ImageIds deleted_images;
     ForEachImageInRegion(cpu_addr, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
+    // sotc: SOTC_UNMAP_PARK=0 (default): every image is freed, as before.
+    const u32 park_mode = UnmapParkMode();
     for (const ImageId id : deleted_images) {
+        if (park_mode != 0 && ParkUnmapped(id, park_mode)) {
+            continue;
+        }
         // TODO: Download image data back to host.
-        FreeImage(id);
+        FreeImage(id, ImageLeave::Unmap);
     }
 }
 
@@ -464,10 +540,10 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
         runtime.CopyColorAndDepth(&old_image, &new_image);
 
         if (twins) {
-            ParkImage(cache_image_id);
+            ParkImage(cache_image_id, ImageLeave::DepthTwin);
             slot_images[new_image_id].parked_twin = cache_image_id;
         } else {
-            FreeImage(cache_image_id);
+            FreeImage(cache_image_id, ImageLeave::DepthNoTwin);
         }
         return new_image_id;
     }
@@ -491,7 +567,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             lhs_block_size != rhs_block_size) {
             // Very likely this kind of overlap is caused by allocation from a pool.
             if (safe_to_delete) {
-                FreeImage(cache_image_id);
+                FreeImage(cache_image_id, ImageLeave::OverlapBlock);
             }
             return {merged_image_id, -1, -1};
         }
@@ -557,7 +633,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                              cpu_rewrote_gpu_image ? " (gpu image rewritten)" : "");
             }
             if (safe_to_delete && !cpu_rewrote_gpu_image) {
-                FreeImage(cache_image_id);
+                FreeImage(cache_image_id, ImageLeave::OverlapReuse);
             }
             return {merged_image_id, -1, -1};
         }
@@ -583,7 +659,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         if (image_info.tile_mode != cache_image.info.tile_mode ||
             image_info.alt_tile != cache_image.info.alt_tile) {
             if (safe_to_delete) {
-                FreeImage(cache_image_id);
+                FreeImage(cache_image_id, ImageLeave::OverlapTiling);
             }
             return {merged_image_id, -1, -1};
         }
@@ -716,7 +792,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 
         // Image isn't a subresource but a chance overlap.
         if (safe_to_delete) {
-            FreeImage(cache_image_id);
+            FreeImage(cache_image_id, ImageLeave::OverlapChance);
         }
 
         return {{}, -1, -1};
@@ -732,7 +808,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                         GetImage(merged_image_id).binding.is_target = 1u;
                     }
 
-                    FreeImage(cache_image_id);
+                    FreeImage(cache_image_id, ImageLeave::OverlapRtSub);
                     return {merged_image_id, -1, -1};
                 }
 
@@ -740,7 +816,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                 if (merged_image_id) {
                     auto& merged_image = slot_images[merged_image_id];
                     runtime.CopyMip(&cache_image, &merged_image, mip, slice);
-                    FreeImage(cache_image_id);
+                    FreeImage(cache_image_id, ImageLeave::OverlapCopyMip);
                 }
             }
         }
@@ -778,7 +854,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
         src_image.binding.needs_rebind = 1u;
     }
 
-    FreeImage(image_id);
+    FreeImage(image_id, ImageLeave::Expand);
     TrackImage(new_image_id);
     return new_image_id;
 }
@@ -832,6 +908,88 @@ void TextureCache::ImageDesc::InitMipTail(const AmdGpu::Image& image,
     if (mode != 0) {
         other_info = ImageInfo::CachedRebase(image, resource);
     }
+}
+
+// sotc: SOTC_AREA_PREWARM. The ImageInfo fields PlanImage reads, as a record and back. The
+// props are copied as their bits (ImageProperties is one 32-bit word).
+static SotcAreaPrewarm::ImageRecord RecordOf(const ImageInfo& info) {
+    static_assert(sizeof(ImageProperties) == sizeof(u32));
+    SotcAreaPrewarm::ImageRecord rec{};
+    rec.guest_address = info.guest_address;
+    rec.guest_size = info.guest_size;
+    rec.pixel_format = static_cast<u32>(info.pixel_format);
+    rec.width = info.size.width;
+    rec.height = info.size.height;
+    rec.depth = info.size.depth;
+    rec.levels = info.resources.levels;
+    rec.layers = info.resources.layers;
+    std::memcpy(&rec.props, &info.props, sizeof rec.props);
+    rec.type = static_cast<u32>(info.type);
+    rec.num_samples = info.num_samples;
+    return rec;
+}
+
+static ImageInfo InfoOf(const SotcAreaPrewarm::ImageRecord& rec) {
+    ImageInfo info{};
+    info.guest_address = rec.guest_address;
+    info.guest_size = rec.guest_size;
+    info.pixel_format = static_cast<vk::Format>(rec.pixel_format);
+    info.size = Extent3D{rec.width, rec.height, rec.depth};
+    info.resources = SubresourceExtent{rec.levels, rec.layers};
+    std::memcpy(&info.props, &rec.props, sizeof rec.props);
+    info.type = static_cast<AmdGpu::ImageType>(rec.type);
+    info.num_samples = rec.num_samples;
+    return info;
+}
+
+// sotc: SOTC_AREA_PREWARM. The exact checks of a record before PlanImage: ConvertImageType,
+// RawNumSamples and the format table (Instance::GetFormatFeatureFlags) reach UNREACHABLE or
+// UNIMPLEMENTED for a value they do not know. Mirrors those functions; pure, any thread.
+static bool ReplayRecordKnown(const SotcAreaPrewarm::ImageRecord& rec) {
+    switch (static_cast<AmdGpu::ImageType>(rec.type)) {
+    case AmdGpu::ImageType::Color1D:
+    case AmdGpu::ImageType::Color1DArray:
+    case AmdGpu::ImageType::Color2D:
+    case AmdGpu::ImageType::Color2DMsaa:
+    case AmdGpu::ImageType::Color2DArray:
+    case AmdGpu::ImageType::Cube:
+    case AmdGpu::ImageType::Color3D:
+        break;
+    default: // Color2DMsaaArray has no case in ConvertImageType
+        return false;
+    }
+    switch (rec.num_samples) {
+    case 1:
+    case 2:
+    case 4:
+    case 8:
+    case 16:
+        break;
+    default:
+        return false;
+    }
+    const auto format = static_cast<vk::Format>(rec.pixel_format);
+    if (format == vk::Format::eUndefined) {
+        return false;
+    }
+    for (const auto& info : Vulkan::LiverpoolToVK::SurfaceFormats()) {
+        if (info.vk_format == format) {
+            return true;
+        }
+    }
+    for (const auto& info : Vulkan::LiverpoolToVK::DepthFormats()) {
+        if (info.vk_format == format) {
+            return true;
+        }
+    }
+    // The same miscellaneous formats the instance queries (vk_instance.cpp).
+    static constexpr std::array misc_formats = {
+        vk::Format::eA2R10G10B10UnormPack32,
+        vk::Format::eB8G8R8A8Unorm,
+        vk::Format::eB8G8R8A8Srgb,
+        vk::Format::eD24UnormS8Uint,
+    };
+    return std::find(misc_formats.begin(), misc_formats.end(), format) != misc_formats.end();
 }
 
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
@@ -936,7 +1094,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             image_id = {};
         } else if (image_resolved.info.resources < info.resources) {
             // The image was clearly picked up wrong.
-            FreeImage(image_id);
+            FreeImage(image_id, ImageLeave::ResolveFail);
             image_id = {};
             LOG_WARNING(Render_Vulkan, "Image overlap resolve failed");
         }
@@ -944,9 +1102,22 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     // Create and register a new image
     if (!image_id) {
         const SotcStats::ScopedTimer stall_timer{SotcStats::image_ns};
-        SotcStats::images_new.fetch_add(1, std::memory_order_relaxed);
-        image_id = slot_images.insert(instance, runtime, slot_image_views, info);
-        RegisterImage(image_id);
+        // sotc: SOTC_UNMAP_PARK (C5): an image UnmapMemory parked at this address with the same
+        // shape is re-armed instead (UnparkImage registers it); mode 2 only counts the match.
+        const u32 park_mode = UnmapParkMode();
+        if (park_mode == 1) {
+            image_id = TakeUnmapParked(info);
+        } else if (park_mode == 2) {
+            ShadowTake(info);
+        }
+        if (!image_id) {
+            SotcStats::images_new.fetch_add(1, std::memory_order_relaxed);
+            image_id = slot_images.insert(instance, runtime, slot_image_views, info);
+            RegisterImage(image_id);
+            if (SotcAreaPrewarm::Recording()) { // sotc: SOTC_AREA_PREWARM=2/3: the area's manifest
+                SotcAreaPrewarm::NoteImageCreated(RecordOf(info));
+            }
+        }
         if (desc.rebase_mip) {
             MipTailCreated(image_id, desc);
         }
@@ -1013,8 +1184,84 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
     return {};
 }
 
+void TextureCache::ReplayAreaImages() {
+    if (!image_prefetcher) {
+        return;
+    }
+    if (SotcAreaPrewarm::TakeReplay(replay_records)) {
+        // An area changed: the previous area's replay images that no draw took go now, whether or
+        // not the new area has records. Its records replace any left over from the previous area.
+        image_prefetcher->DropReplay();
+        replay_next = 0;
+        replay_accepted = 0;
+    }
+    // Time box: a few records and about 1 ms per call. PlanImage costs ~5 ms the first time a
+    // format combination is queried, so this runs over several PrefetchTexture calls.
+    constexpr size_t RecordsPerCall = 4;
+    constexpr u64 NsPerCall = 1'000'000;
+    const u64 start = SotcStats::NowNs();
+    const u64 budget = SotcAreaPrewarm::ReplayBudgetBytes();
+    // Under the collector's pressure point the rest of the area is not made (as PrefetchTexture).
+    const u64 gate = pressure_gc_memory != 0 ? pressure_gc_memory : critical_gc_memory;
+    Core::MemoryManager* memory = Core::Memory::Instance();
+    size_t done = 0;
+    while (replay_next < replay_records.size()) {
+        if (done > 0 && (done == RecordsPerCall || SotcStats::NowNs() - start >= NsPerCall)) {
+            return; // the rest on the next call
+        }
+        if (gate != 0 && SotcStats::vram_used.load(std::memory_order_relaxed) >= gate) {
+            while (replay_next < replay_records.size()) {
+                SotcAreaPrewarm::NoteReplaySkipped();
+                ++replay_next;
+            }
+            break;
+        }
+        const SotcAreaPrewarm::ImageRecord rec = replay_records[replay_next++];
+        ++done;
+        // Checked again here (defense in depth): the records were checked when loaded.
+        if (!SotcAreaPrewarm::ValidRecord(rec) || !ReplayRecordKnown(rec)) {
+            SotcAreaPrewarm::NoteReplaySkipped();
+            continue;
+        }
+        const ImageInfo info = InfoOf(rec);
+        // Not replayed when the range is no longer mapped: the prefetch's own test (40-bit GPU
+        // address) and the real mapping of the guest range (IsValidMapping: the VMAs).
+        if (info.pixel_format == vk::Format::eUndefined || info.guest_address == 0 ||
+            !memory->IsValidGpuMapping(info.guest_address, 0) ||
+            !memory->IsValidMapping(info.guest_address, info.guest_size)) {
+            SotcAreaPrewarm::NoteReplaySkipped();
+            continue;
+        }
+        if (replay_accepted + info.guest_size > budget) {
+            SotcAreaPrewarm::NoteReplaySkipped();
+            continue;
+        }
+        // An image on the range exists already (as in PrefetchTexture): nothing to make ahead.
+        if (HasImagesInRange(info.guest_address, info.guest_size) ||
+            image_prefetcher->IsRegistered(info.guest_address)) {
+            SotcAreaPrewarm::NoteReplaySkipped();
+            continue;
+        }
+        const ImagePlan plan = PlanImage(instance, info);
+        if (plan.format_result != vk::Result::eSuccess ||
+            !image_prefetcher->RequestReplay(plan.image_ci, info.guest_size)) {
+            SotcAreaPrewarm::NoteReplaySkipped();
+            continue;
+        }
+        replay_accepted += info.guest_size;
+        SotcAreaPrewarm::NoteReplayed(info.guest_size);
+    }
+    replay_records.clear();
+    replay_next = 0;
+}
+
 void TextureCache::PrefetchTexture(const AmdGpu::Image& tsharp,
                                    const Shader::ImageResource& resource, u64 now) {
+    // sotc: SOTC_AREA_PREWARM=3: an area changed since the last draw, or a replay of it is under
+    // way (ReplayAreaImages works through it a few records per call); its images go first.
+    if (replay_next < replay_records.size() || SotcAreaPrewarm::ReplayPending()) {
+        ReplayAreaImages();
+    }
     // sotc: SOTC_ASYNC_IMAGE_CREATE (image_prefetch.h). A T# is looked at again at most every
     // RecheckNs, and an image is asked for it at most every RerequestNs (a guess that does not
     // come true, e.g. a T# the draw thread resolves to part of a larger image, is not repeated
@@ -1811,6 +2058,9 @@ void TextureCache::RegisterImage(ImageId image_id) {
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    if (SotcStats::kFpsLog) { // sotc: B4, the image enters the cache
+        image_registers.fetch_add(1, std::memory_order_relaxed);
+    }
     ++image_set_generation;
     ++addr_gens[AddrGenSlot(image.info.guest_address)]; // sotc: FindMemo per-address gen
     if (SotcStats::kBindCacheFrame) { // sotc: the range form of the generation, see ImageChangedSince
@@ -2011,6 +2261,10 @@ void TextureCache::EmergencyCollect(u32 level, bool drop_prefetched) {
         }
         return false;
     });
+    // sotc: SOTC_UNMAP_PARK: parked unmapped images are not in the LRU; under this collection they go.
+    if (!unmap_parked.empty()) {
+        DropUnmapParked();
+    }
     size_t num_deletions = level == 0 ? 512 : level == 1 ? 4096 : SIZE_MAX;
     size_t freed = 0;
     const u64 ticks = std::min<u64>(level == 0 ? 4 : level == 1 ? 2 : 1, gc_tick);
@@ -2025,7 +2279,7 @@ void TextureCache::EmergencyCollect(u32 level, bool drop_prefetched) {
             }
             DownloadImageMemory(image_id);
         }
-        FreeImage(image_id);
+        FreeImage(image_id, ImageLeave::Emergency);
         --num_deletions;
         ++freed;
         return false;
@@ -2066,6 +2320,14 @@ void TextureCache::GarbageCollectImages() {
         SotcStats::vma_allocation_bytes.store(vma_allocations, std::memory_order_relaxed);
     }
     SotcStats::vram_used.store(total_used_memory, std::memory_order_relaxed);
+    // sotc: SOTC_UNMAP_PARK: parked images older than UnmapParkMaxAgeTicks are reclaimed here, also
+    // when memory is low (an idle scene would keep them). The gauge is read without the lock.
+    if (UnmapParkMode() != 0 && unmap_parked_now.load(std::memory_order_relaxed) != 0) {
+        std::scoped_lock park_lock{mutex};
+        while (!unmap_parked.empty() && gc_tick - unmap_parked.front().tick > UnmapParkMaxAgeTicks) {
+            EvictOldestUnmapParked();
+        }
+    }
     if (total_used_memory < trigger_gc_memory) {
         return;
     }
@@ -2079,6 +2341,12 @@ void TextureCache::GarbageCollectImages() {
         return;
     }
     std::scoped_lock lock{mutex};
+    // sotc: SOTC_UNMAP_PARK: under pressure the parked images go first. Their VRAM is in
+    // total_used_memory but they are not in the LRU, so the thresholds below count live images.
+    if (!unmap_parked.empty()) {
+        total_used_memory -= std::min(unmap_parked_bytes, total_used_memory);
+        DropUnmapParked();
+    }
     bool pressured = false;
     bool aggresive = false;
     u64 ticks_to_destroy = 0;
@@ -2116,7 +2384,7 @@ void TextureCache::GarbageCollectImages() {
             DownloadImageMemory(image_id);
             SotcStats::gc_downloads.fetch_add(1, std::memory_order_relaxed);
         }
-        FreeImage(image_id);
+        FreeImage(image_id, ImageLeave::Routine);
         SotcStats::gc_freed.fetch_add(1, std::memory_order_relaxed);
         if (total_used_memory < critical_gc_memory) {
             if (aggresive) {
@@ -2588,7 +2856,7 @@ void TextureCache::FreeRebased(ImageId image_id, std::atomic<std::uint64_t>& cou
     if (image.binding.is_bound || image.binding.is_target) {
         image.binding.needs_rebind = 1u;
     }
-    FreeImage(image_id);
+    FreeImage(image_id, ImageLeave::MipTail);
     counter.fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -2672,7 +2940,10 @@ void TextureCache::TouchImage(const Image& image) {
     }
 }
 
-void TextureCache::ParkImage(ImageId image_id) {
+void TextureCache::ParkImage(ImageId image_id, ImageLeave why) {
+    if (SotcStats::kFpsLog) { // sotc: B4, the image leaves the cache without being freed
+        image_parks[static_cast<size_t>(why)].fetch_add(1, std::memory_order_relaxed);
+    }
     UntrackImage(image_id);
     UnregisterImage(image_id);
     Image& image = slot_images[image_id];
@@ -2702,8 +2973,7 @@ void TextureCache::UnparkImage(ImageId image_id) {
     image.parked_twin = {};
     std::fill(image.mip_hashes.begin(), image.mip_hashes.end(), u64{0});
     image.hash = 0;
-    image.tick_accessed_last = 0;
-    image.tick_prev_accessed = 0;
+    // sotc: the ticks are kept: they are the image's last real uses (RefreshImage's IsFree).
     image.binding = {};
     image.usage = {};
     // sotc: SOTC_UPLOAD_BUDGET_MB: a new image for the budget, and its texels are the old twin's,
@@ -2774,6 +3044,145 @@ void TextureCache::DeleteImage(ImageId image_id) {
         }
         slot_images.erase(image_id);
     });
+}
+
+// sotc: SOTC_UNMAP_PARK (C5). Every change of the parked set refreshes the gauges.
+void TextureCache::SyncUnmapParkGauges() {
+    unmap_parked_now.store(unmap_parked.size(), std::memory_order_relaxed);
+    unmap_parked_now_bytes.store(unmap_parked_bytes, std::memory_order_relaxed);
+}
+
+void TextureCache::EvictOldestUnmapParked() {
+    const UnmapParked oldest = unmap_parked.front();
+    unmap_parked.pop_front();
+    unmap_parked_bytes -= oldest.bytes;
+    // Unregistered and untracked since it was parked: its Vulkan objects go, as a twin's do.
+    ReclaimImage(oldest.id);
+    unmap_evicts.fetch_add(1, std::memory_order_relaxed);
+    SyncUnmapParkGauges();
+}
+
+void TextureCache::DropUnmapParked() {
+    while (!unmap_parked.empty()) {
+        EvictOldestUnmapParked();
+    }
+}
+
+ImageId TextureCache::TakeUnmapParked(const ImageInfo& info) {
+    for (auto it = unmap_parked.begin(); it != unmap_parked.end(); ++it) {
+        const ImageId id = it->id;
+        if (!SameParkedShape(slot_images[id].info, info)) {
+            continue;
+        }
+        unmap_parked_bytes -= it->bytes;
+        unmap_parked.erase(it);
+        Image& image = slot_images[id];
+        if (True(image.flags & ImageFlagBits::GpuModified)) {
+            // Its VRAM holds GPU-written texels that the guest memory does not: reusing them would
+            // show stale pixels. UnparkImage makes it a new image, uploaded from guest memory.
+            unmap_stale_avoided.fetch_add(1, std::memory_order_relaxed);
+        }
+        image.info = info;
+        UnparkImage(id); // registers it again: flags Dirty, as a new image has
+        unmap_rearms.fetch_add(1, std::memory_order_relaxed);
+        SyncUnmapParkGauges();
+        return id;
+    }
+    return {};
+}
+
+void TextureCache::ShadowNoteUnmapped(const ImageInfo& info) {
+    if (unmap_shadow.size() >= UnmapParkMaxImages) {
+        unmap_shadow.pop_front();
+    }
+    unmap_shadow.push_back(info);
+    unmap_would_park.fetch_add(1, std::memory_order_relaxed);
+}
+
+void TextureCache::ShadowTake(const ImageInfo& info) {
+    for (auto it = unmap_shadow.begin(); it != unmap_shadow.end(); ++it) {
+        if (SameParkedShape(*it, info)) {
+            unmap_shadow.erase(it);
+            unmap_would_rearm.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+}
+
+void TextureCache::ReportImageFrees(std::string& out, double seconds) {
+    if (!SotcStats::kFpsLog) {
+        return;
+    }
+    static constexpr const char* const names[] = {
+        "unmap",         "overlap-block", "overlap-reuse", "overlap-tiling", "overlap-chance",
+        "overlap-rt-sub", "overlap-copy-mip", "expand",    "resolve-fail",   "emergency",
+        "routine",       "mip-tail",      "depth-no-twin", "depth-twin",     "unmap-park"};
+    static_assert(sizeof(names) / sizeof(names[0]) == NumImageLeave);
+    u64 freed = 0, parked = 0;
+    std::string freed_by, parked_by;
+    char part[64];
+    for (size_t i = 0; i < NumImageLeave; ++i) {
+        const u64 f = image_frees[i].exchange(0, std::memory_order_relaxed);
+        const u64 p = image_parks[i].exchange(0, std::memory_order_relaxed);
+        freed += f;
+        parked += p;
+        if (f) {
+            std::snprintf(part, sizeof(part), " %s=%llu", names[i],
+                          static_cast<unsigned long long>(f));
+            freed_by += part;
+        }
+        if (p) {
+            std::snprintf(part, sizeof(part), " %s=%llu", names[i],
+                          static_cast<unsigned long long>(p));
+            parked_by += part;
+        }
+    }
+    const u64 registered = image_registers.exchange(0, std::memory_order_relaxed);
+    const long long change =
+        static_cast<long long>(registered) - static_cast<long long>(freed + parked);
+    const std::string freed_list = freed_by.empty() ? "none" : freed_by.substr(1);
+    const std::string parked_list = parked_by.empty() ? "none" : parked_by.substr(1);
+    char line[512];
+    std::snprintf(line, sizeof(line),
+                  "SOTC IMG FREE (%.1f s): freed %llu (%s), parked %llu (%s), registered %llu, "
+                  "cache change %lld, cached now %llu\n",
+                  seconds, static_cast<unsigned long long>(freed), freed_list.c_str(),
+                  static_cast<unsigned long long>(parked), parked_list.c_str(),
+                  static_cast<unsigned long long>(registered), change,
+                  static_cast<unsigned long long>(SotcStats::cached_images.load()));
+    out += line;
+}
+
+void TextureCache::ReportUnmapPark(std::string& out, double seconds) {
+    const u32 mode = UnmapParkMode();
+    if (mode == 0) {
+        return;
+    }
+    const u64 parks = unmap_parks.exchange(0, std::memory_order_relaxed);
+    const u64 rearms = unmap_rearms.exchange(0, std::memory_order_relaxed);
+    const u64 evicts = unmap_evicts.exchange(0, std::memory_order_relaxed);
+    const u64 stale = unmap_stale_avoided.exchange(0, std::memory_order_relaxed);
+    const u64 would_park = unmap_would_park.exchange(0, std::memory_order_relaxed);
+    const u64 would_rearm = unmap_would_rearm.exchange(0, std::memory_order_relaxed);
+    char line[384];
+    if (mode == 1) {
+        std::snprintf(line, sizeof(line),
+                      "SOTC UNMAP PARK (%.1f s): parked %llu, re-armed %llu, evicted %llu, "
+                      "stale avoided %llu, held %llu images %llu of %llu MB\n",
+                      seconds, static_cast<unsigned long long>(parks),
+                      static_cast<unsigned long long>(rearms),
+                      static_cast<unsigned long long>(evicts),
+                      static_cast<unsigned long long>(stale),
+                      static_cast<unsigned long long>(unmap_parked_now.load()),
+                      static_cast<unsigned long long>(unmap_parked_now_bytes.load() >> 20),
+                      static_cast<unsigned long long>(UnmapParkBudget() >> 20));
+    } else {
+        std::snprintf(line, sizeof(line),
+                      "SOTC UNMAP PARK=2 (%.1f s, log only): would park %llu, would re-arm %llu\n",
+                      seconds, static_cast<unsigned long long>(would_park),
+                      static_cast<unsigned long long>(would_rearm));
+    }
+    out += line;
 }
 
 } // namespace VideoCore

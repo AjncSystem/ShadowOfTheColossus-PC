@@ -4,6 +4,7 @@ import contextlib
 import gzip
 import io
 import json
+import os
 import re
 import struct
 import subprocess
@@ -658,6 +659,205 @@ class ModulesTest(unittest.TestCase):
         cmd = run.call_args[0][0]
         self.assertFalse(any(arg.startswith('--adjust-vma') for arg in cmd))
         self.assertEqual(cmd[-1], f'{EXE_BASE + 0x1000:#x}')
+
+
+def make_pe(path, image_base, size_of_image, magic=0x20B):
+    """A minimal PE file: DOS header, PE signature, COFF header and an optional header with the
+    given ImageBase (PE32+ when magic is 0x20B, PE32 when 0x10B) and SizeOfImage. No sections."""
+    dos = bytearray(0x80)
+    dos[0:2] = b'MZ'
+    struct.pack_into('<I', dos, 0x3C, 0x80)
+    coff = struct.pack('<HHIIIHH', 0x8664, 0, 0, 0, 0, 240, 0x22)
+    opt = bytearray(240)
+    struct.pack_into('<H', opt, 0, magic)
+    if magic == 0x20B:
+        struct.pack_into('<Q', opt, 24, image_base)
+    else:
+        struct.pack_into('<I', opt, 28, image_base)
+    struct.pack_into('<I', opt, 56, size_of_image)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_bytes(bytes(dos) + b'PE\x00\x00' + coff + bytes(opt))
+    return Path(path)
+
+
+class PeFileSlideTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_pe_headers_give_image_base_and_size(self):
+        exe = make_pe(self.dir / 'p.exe', 0x140000000, 0xBB9C000)
+        self.assertEqual(sotc_trace.pe_image_info(exe),
+                         {'image_base': 0x140000000, 'size_of_image': 0xBB9C000})
+        pe32 = make_pe(self.dir / 'p32.exe', 0x400000, 0x9000, magic=0x10B)
+        self.assertEqual(sotc_trace.pe_image_info(pe32),
+                         {'image_base': 0x400000, 'size_of_image': 0x9000})
+
+    def test_not_a_pe_file_gives_none(self):
+        (self.dir / 'text.exe').write_bytes(b'hello, not a PE file')
+        self.assertIsNone(sotc_trace.pe_image_info(self.dir / 'text.exe'))
+        self.assertIsNone(sotc_trace.pe_image_info(self.dir / 'missing.exe'))
+
+    def test_slide_uses_the_file_base_not_the_recorded_preferred_base(self):
+        # The recorded preferred_base is the runtime base (a relocated image): the file decides.
+        base = 0x7FF7EB7E0000
+        mods = [{'name': 'bb-probe.exe', 'base': base, 'size': 0x800000, 'preferred_base': base}]
+        exe = make_pe(self.dir / 'bb-probe.exe', 0x140000000, 0x800000)
+        proc = mock.Mock(stdout='Fn\nx.cpp:1:0\n\n')
+        with mock.patch.object(sotc_trace, 'find_llvm_symbolizer', return_value='llvm-symbolizer'), \
+                mock.patch.object(sotc_trace.subprocess, 'run', return_value=proc) as run:
+            sym = sotc_trace.Symbolizer(modules=mods, host_exe=str(exe),
+                                        exe_image_base=sotc_trace.pe_image_info(exe)['image_base'])
+            self.assertEqual(sym.label(base + 0x10FB), 'Fn')
+        cmd = run.call_args[0][0]
+        self.assertIn(f'--adjust-vma={base - 0x140000000:#x}', cmd)
+        self.assertEqual(cmd[-1], f'{base + 0x10FB:#x}')
+
+    def test_without_the_file_the_recorded_base_is_still_the_fallback(self):
+        base = 0x7FF7EB7E0000
+        mods = [{'name': 'bb-probe.exe', 'base': base, 'size': 0x800000, 'preferred_base': 0x140000000}]
+        proc = mock.Mock(stdout='Fn\nx.cpp:1:0\n\n')
+        with mock.patch.object(sotc_trace, 'find_llvm_symbolizer', return_value='llvm-symbolizer'), \
+                mock.patch.object(sotc_trace.subprocess, 'run', return_value=proc) as run:
+            sym = sotc_trace.Symbolizer(modules=mods, host_exe='C:/bb-probe.exe')
+            sym.label(base + 0x10)
+        self.assertIn(f'--adjust-vma={base - 0x140000000:#x}', run.call_args[0][0])
+
+    def test_make_symbolizer_takes_the_newer_copy_and_its_base(self):
+        base = 0x7FF7EB7E0000
+        old = make_pe(self.dir / 'old' / 'bb-probe.exe', 0x140000000, 0x800000)
+        new = make_pe(self.dir / 'new' / 'bb-probe.exe', 0x140000000, 0x800000)
+        os.utime(old, (1_000_000_000, 1_000_000_000))
+        mods = [{'name': 'bb-probe.exe', 'base': base, 'size': 0x800000, 'preferred_base': base}]
+        t = sotc_trace.load(module_trace(self.dir / 'mk.sotctrace', modules=mods))
+        proc = mock.Mock(stdout='Fn\nx.cpp:1:0\n\n')
+        with mock.patch.object(sotc_trace, 'EXE_CANDIDATES', (old, new)), \
+                mock.patch.object(sotc_trace, 'find_llvm_symbolizer', return_value='llvm-symbolizer'), \
+                mock.patch.object(sotc_trace.subprocess, 'run', return_value=proc) as run:
+            self.assertEqual(sotc_trace.host_exe_path(), new)   # the older copy has 2001 mtime
+            sym = sotc_trace.make_symbolizer(t, use_index=False)
+            self.assertEqual(sym.exe_image_base, 0x140000000)
+            self.assertEqual(sym.label(base + 0x1000), 'Fn')
+        self.assertIn(f'--adjust-vma={base - 0x140000000:#x}', run.call_args[0][0])
+
+    def test_newer_file_warns_once(self):
+        exe = make_pe(self.dir / 'late' / 'bb-probe.exe', 0x140000000, 0x800000)
+        os.utime(exe, (4_000_000_000, 4_000_000_000))
+        mods = [{'name': 'bb-probe.exe', 'base': 0x7FF7EB7E0000, 'size': 0x800000,
+                 'preferred_base': 0x7FF7EB7E0000}]
+        t = sotc_trace.load(module_trace(self.dir / 'warn.sotctrace', modules=mods))
+        t.meta['created_unix'] = 1_700_000_000
+        err = io.StringIO()
+        with mock.patch.object(sotc_trace, 'EXE_CANDIDATES', (exe,)), \
+                mock.patch.object(sotc_trace, 'find_llvm_symbolizer', return_value=None), \
+                contextlib.redirect_stderr(err):
+            sotc_trace.make_symbolizer(t, use_index=False)
+            sotc_trace.make_symbolizer(t, use_index=False)
+        self.assertEqual(err.getvalue().count('is newer than warn.sotctrace'), 1)
+
+    def test_size_mismatch_with_the_recorded_module_warns(self):
+        exe = make_pe(self.dir / 'size' / 'bb-probe.exe', 0x140000000, 0x900000)
+        mods = [{'name': 'bb-probe.exe', 'base': 0x7FF7EB7E0000, 'size': 0x800000,
+                 'preferred_base': 0x7FF7EB7E0000}]
+        t = sotc_trace.load(module_trace(self.dir / 'size.sotctrace', modules=mods))
+        err = io.StringIO()
+        with mock.patch.object(sotc_trace, 'EXE_CANDIDATES', (exe,)), \
+                mock.patch.object(sotc_trace, 'find_llvm_symbolizer', return_value=None), \
+                contextlib.redirect_stderr(err):
+            sotc_trace.make_symbolizer(t, use_index=False)
+        self.assertIn('SizeOfImage 0x900000 on disk, 0x800000', err.getvalue())
+
+
+MUTEX_NAMES = {1: 'mutex wait', 2: 'mutex holder', 3: 'frame'}
+
+
+def mutex_trace(path, holders=True):
+    """A slow frame (500-600 ms) with three contended waits on the draw thread: two with a holder
+    span (same t0 and t1; the holders are thread os_tid 101 and an unknown id 999) and one without.
+    A wait of 1 ms sits in a normal frame and must not count. holders=False drops the holder
+    spans (an old trace)."""
+    threads = [{'id': 1, 'os_tid': 100, 'name': 'GpuDraw', 'kind': 'draw', 'sort': 2000},
+               {'id': 2, 'os_tid': 101, 'name': 'Shadow Game Upd', 'kind': 'guest', 'sort': 1000},
+               {'id': 3, 'os_tid': 102, 'name': 'frames', 'kind': 'frames', 'sort': 0}]
+    frames = [record(i * 40 * MS, i * 40 * MS + 33 * MS, 3, kind=6, a=i) for i in range(3)]
+    frames.append(record(500 * MS, 600 * MS, 3, kind=6, flags=1, a=99))
+    draw = [record(1 * MS, 2 * MS, 1, b=IMAGE_BASE + 0x1010)]
+    waits = [(510 * MS, 550 * MS, IMAGE_BASE + 0x1010, 101, IMAGE_BASE + 0x1110),
+             (570 * MS, 590 * MS, IMAGE_BASE + 0x1020, 999, IMAGE_BASE + 0x1120),
+             (590 * MS, 595 * MS, IMAGE_BASE + 0x1010, None, None)]
+    for t0, t1, b, a, site in waits:
+        draw.append(record(t0, t1, 1, b=b))
+        if holders and a is not None:
+            draw.append(record(t0, t1, 2, a=a, b=site))
+    parts = [json_chunk(1, {'version': 1, 'mode': 2, 'kind': 'stream', 'created_unix': 1000,
+                            'image_base': IMAGE_BASE, 'image_size': IMAGE_SIZE}),
+             json_chunk(2, threads), json_chunk(3, {str(k): v for k, v in MUTEX_NAMES.items()}),
+             events_chunk(1, draw), events_chunk(3, frames)]
+    return write(path, parts)
+
+
+def mutex_sym():
+    return sotc_trace.Symbolizer(IMAGE_BASE, IMAGE_SIZE,
+                                 funcs=[(0x1000, 0x1100), (0x1100, 0x1200)],
+                                 names={0x1000: 'Game::Wait', 0x1100: 'Game::Lock'})
+
+
+class MutexHolderTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_holder_table_of_the_slow_frame(self):
+        t = sotc_trace.load(mutex_trace(self.dir / 'm.sotctrace'))
+        results = sotc_trace.hitch_file(t, mutex_sym())
+        self.assertEqual(len(results), 1)
+        m = results[0]['mutex']
+        self.assertAlmostEqual(m['total_ms'], 65.0)
+        self.assertEqual(m['sites'], [('Game::Lock+0x10', 'Game::Wait+0x10', 40.0),
+                                      ('Game::Lock+0x20', 'Game::Wait+0x20', 20.0),
+                                      ('-', 'Game::Wait+0x10', 5.0)])
+        self.assertEqual(m['holders'], [('game: Shadow Game Upd', 40.0),
+                                        ('thread id 999', 20.0), ('-', 5.0)])
+        self.assertFalse(any(row['name'] == 'mutex holder' for row in results[0]['top']))
+        md = '\n'.join(sotc_trace.hitch_markdown(t.path.name, results))
+        self.assertIn('| 40.0 | Game::Lock+0x10 | Game::Wait+0x10 |', md)
+        self.assertIn('Holder threads: game: Shadow Game Upd 40.0 ms; thread id 999 20.0 ms; - 5.0 ms.',
+                      md)
+
+    def test_old_trace_without_holders_prints_nothing_extra(self):
+        t = sotc_trace.load(mutex_trace(self.dir / 'old.sotctrace', holders=False))
+        results = sotc_trace.hitch_file(t, mutex_sym())
+        self.assertIsNone(results[0]['mutex'])
+        md = '\n'.join(sotc_trace.hitch_markdown(t.path.name, results))
+        self.assertNotIn('Mutex', md)
+        self.assertNotIn('Holder threads', md)
+
+    def test_top_lists_the_whole_trace_table(self):
+        t = sotc_trace.load(mutex_trace(self.dir / 'top.sotctrace'))
+        lines = sotc_trace.top_report(t, 8, None, mutex_sym())
+        self.assertIn('mutex waits, whole trace (66.00 ms): holder site <- waiter caller, '
+                      'then holder threads:', lines)
+        self.assertIn('  %10.2f ms  %s  <-  %s' % (40.0, 'Game::Lock+0x10', 'Game::Wait+0x10'),
+                      lines)
+        self.assertTrue(any(line.startswith('  holders: game: Shadow Game Upd 40.00 ms')
+                            for line in lines))
+
+    def test_top_without_holders_has_no_mutex_lines(self):
+        t = sotc_trace.load(mutex_trace(self.dir / 'top-old.sotctrace', holders=False))
+        lines = sotc_trace.top_report(t, 8, None, mutex_sym())
+        self.assertFalse(any('mutex waits' in line for line in lines))
+
+    def test_pairing_needs_the_same_times(self):
+        t = sotc_trace.load(mutex_trace(self.dir / 'pair.sotctrace'))
+        pairs = sotc_trace.mutex_pairs(t)
+        self.assertEqual(len(pairs), 4)
+        self.assertEqual(sum(1 for _, h in pairs if h is not None), 2)
 
 
 if __name__ == '__main__':

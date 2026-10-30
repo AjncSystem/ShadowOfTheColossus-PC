@@ -18,7 +18,10 @@ hitch: for each slow frame, the time each thread spent in each span name inside 
 median of the normal frames of the same segment; the biggest growth first, with the guest callers
 (the span's b field) and the cause of the frame (draw, gpu, readback, fault, io, game-cpu, other).
 When the trace has samples, imports or GPU spans: the sampled functions that grew, the import time
-that grew and the GPU verdict (GPU-bound or CPU-bound).
+that grew and the GPU verdict (GPU-bound or CPU-bound). When the trace has "mutex holder" spans:
+the "mutex wait" time of the frame by holder site and waiter caller, and the holder threads.
+top also prints the mutex table of the whole trace. "mutex holder" spans are not in the span
+tables (they mark the holder of a wait, they are not time spent).
 
 json: Chrome JSON that Perfetto opens (gzip when the name ends in .gz). Samples are instants with
 the symbolized stack in args; EvGpu spans are on one "GPU" track.
@@ -33,7 +36,10 @@ mode 'time' hooks (switch SOTC_TRACE_FUNCS, group trace_funcs).
 
 Guest addresses are symbolized from out/re/index.pkl.gz (build it once with tools/re/eboot_re.py
 build), names from tools/re/names.txt and out/re/ghidra/names2.txt. Host addresses use
-llvm-symbolizer on out/gpu/bb-probe.exe when llvm-symbolizer is on PATH. Pure standard library.
+llvm-symbolizer on bb-probe.exe (out/gpu/bb-probe.exe, or out/bb-probe.exe when that is newer).
+Its slide comes from the ImageBase of the file on disk, not from the MODULES preferred_base: the
+sampler reads the in-memory header, which the loader rewrites for a relocated image. Pure standard
+library.
 """
 import argparse
 import bisect
@@ -71,6 +77,8 @@ JSON_IMAGE_SIZE = 0x1000_0000
 PLAIN_LIMIT = 1_000_000   # smaller values are plain numbers, not addresses (recorder rule)
 HOST_MIN = 0x10000        # smaller values are not host addresses
 GPU_TID = 999_999         # the "GPU" track of the Chrome JSON
+MUTEX_WAIT = 'mutex wait'      # a contended guest mutex: b = the waiter's caller
+MUTEX_HOLDER = 'mutex holder'  # same t0/t1 as its wait: a = holder thread id, b = holder's lock site
 SAMPLE_CAP_NS = 100_000_000   # a sample weighs the time to the next one, at most this
 CATEGORIES = ('draw ms', 'gpu ms', 'imports ms', 'waits ms', 'samples', 'slow frames')
 Sample = collections.namedtuple('Sample', 'ns thread stack')   # stack: names, leaf first
@@ -361,6 +369,46 @@ def find_llvm_symbolizer():
 
 
 EXE_MODULE = 'bb-probe.exe'   # the host module with DWARF: llvm-symbolizer on host_exe, slide-adjusted
+EXE_CANDIDATES = (ROOT / 'out' / 'gpu' / 'bb-probe.exe', ROOT / 'out' / 'bb-probe.exe')
+PE_OPT_MIN = 60               # SizeOfImage ends at offset 60 of the optional header
+
+
+def pe_image_info(path):
+    """{'image_base', 'size_of_image'} of a PE file on disk (PE32 or PE32+ optional header, read
+    with struct), or None when the file is not a PE file. image_base is the preferred base the
+    file was linked for: the loader may map the image elsewhere, so this is not the runtime base."""
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(0x40)
+            if len(head) < 0x40 or head[:2] != b'MZ':
+                return None
+            (lfanew,) = struct.unpack_from('<I', head, 0x3C)
+            f.seek(lfanew)
+            if f.read(4) != b'PE\x00\x00':
+                return None
+            coff = f.read(20)
+            if len(coff) < 20:
+                return None
+            opt = f.read(max(struct.unpack_from('<H', coff, 16)[0], PE_OPT_MIN))
+    except (OSError, struct.error):
+        return None
+    if len(opt) < PE_OPT_MIN:
+        return None
+    magic = struct.unpack_from('<H', opt, 0)[0]
+    if magic == 0x20B:                      # PE32+: ImageBase is 8 bytes at offset 24
+        image_base = struct.unpack_from('<Q', opt, 24)[0]
+    elif magic == 0x10B:                    # PE32: ImageBase is 4 bytes at offset 28
+        image_base = struct.unpack_from('<I', opt, 28)[0]
+    else:
+        return None
+    return {'image_base': image_base, 'size_of_image': struct.unpack_from('<I', opt, 56)[0]}
+
+
+def host_exe_path():
+    """The bb-probe.exe on disk: out/gpu/bb-probe.exe, or out/bb-probe.exe when that is newer (the
+    build copies it there). None when neither exists."""
+    existing = [p for p in EXE_CANDIDATES if p.is_file()]
+    return max(existing, key=lambda p: p.stat().st_mtime) if existing else None
 
 
 class Symbolizer:
@@ -369,11 +417,14 @@ class Symbolizer:
 
     Host addresses. With modules (the MODULES chunk, TRACE-FORMAT.md type 9) the module that holds x
     names it: "name+0xrva". bb-probe.exe goes to llvm-symbolizer on host_exe with
-    --adjust-vma=slide, slide = base - preferred_base, which resolves the runtime address itself; a
-    host address in no module stays hex. Without modules (old files) every host address goes to
-    llvm-symbolizer on host_exe as it is, when given, else stays hex."""
+    --adjust-vma=slide, slide = base - exe_image_base, which resolves the runtime address itself;
+    exe_image_base is the ImageBase of the file on disk (pe_image_info). Without it (no file) the
+    slide uses the recorded preferred_base. A host address in no module stays hex. Without modules
+    (old files) every host address goes to llvm-symbolizer on host_exe as it is, when given, else
+    stays hex."""
 
-    def __init__(self, image_base=0, image_size=0, funcs=(), names=None, host_exe=None, modules=()):
+    def __init__(self, image_base=0, image_size=0, funcs=(), names=None, host_exe=None, modules=(),
+                 exe_image_base=None):
         self.image_base = int(image_base or 0)
         self.image_size = int(image_size or 0)
         self.funcs = sorted(funcs)
@@ -381,6 +432,7 @@ class Symbolizer:
         self.names = dict(names or {})
         self.modules = sorted((dict(m) for m in modules or ()), key=lambda m: m['base'])
         self._mod_bases = [m['base'] for m in self.modules]
+        self.exe_image_base = None if exe_image_base is None else int(exe_image_base)
         self._llvm = find_llvm_symbolizer() if host_exe else None
         self.host_exe = host_exe if self._llvm else None
         self._host = {}
@@ -414,6 +466,13 @@ class Symbolizer:
             self.resolve_host([x])
         return self._host.get(x, f'{x:#x}')
 
+    def _exe_slide(self, m):
+        """base - ImageBase of the file on disk; without the file, base - the recorded preferred_base
+        (which is the runtime base for a relocated image, so the slide is then 0: see the docs)."""
+        if self.exe_image_base is not None:
+            return m['base'] - self.exe_image_base
+        return m['base'] - m['preferred_base'] if m['preferred_base'] else 0
+
     def resolve_host(self, addrs):
         """Batch lookup of the host addresses not seen yet (see the class docstring)."""
         todo = sorted({x for x in addrs if x >= HOST_MIN and x not in self._host
@@ -428,8 +487,7 @@ class Symbolizer:
             if m is None:
                 self._host[x] = f'{x:#x}'
             elif self.host_exe and m['name'].lower() == EXE_MODULE:
-                slide = m['base'] - m['preferred_base'] if m['preferred_base'] else 0
-                by_slide[slide].append(x)
+                by_slide[self._exe_slide(m)].append(x)
             else:
                 self._host[x] = self._module_label(x)
         for slide, group in sorted(by_slide.items()):
@@ -464,12 +522,40 @@ class Symbolizer:
                 self._host.setdefault(x, self._module_label(x))
 
 
+_WARNED = set()
+
+
+def _warn_once(key, text):
+    if key not in _WARNED:
+        _WARNED.add(key)
+        print(f'sotc_trace: warning: {text}', file=sys.stderr)
+
+
+def _host_build_warnings(trace, host, info):
+    """One stderr line each when the bb-probe.exe on disk is probably not the build that recorded
+    the trace: it is newer than the trace (META created_unix), or its SizeOfImage is not the size
+    the MODULES chunk recorded. Its symbols then may not match the trace's addresses."""
+    created = trace.meta.get('created_unix')
+    if isinstance(created, (int, float)) and host.stat().st_mtime > created + 1:
+        _warn_once((str(host), trace.path.name, 'mtime'),
+                   f'{host} is newer than {trace.path.name} (recorded at created_unix {created}); '
+                   'host symbols may come from another build')
+    mod = next((m for m in trace.modules if m['name'].lower() == EXE_MODULE), None)
+    if info and mod and mod['size'] and mod['size'] != info['size_of_image']:
+        _warn_once((str(host), trace.path.name, 'size'),
+                   f"{host.name} SizeOfImage {info['size_of_image']:#x} on disk, "
+                   f"{mod['size']:#x} in {trace.path.name}: another build, host symbols may be off")
+
+
 def make_symbolizer(trace, use_index=True, use_host=True):
-    host = ROOT / 'out' / 'gpu' / 'bb-probe.exe'
+    host = host_exe_path() if use_host else None
+    info = pe_image_info(host) if host else None
+    if host is not None:
+        _host_build_warnings(trace, host, info)
     return Symbolizer(trace.meta.get('image_base'), trace.meta.get('image_size'),
                       eboot_funcs() if use_index else (), repo_names(),
-                      host if use_host and host.exists() else None,
-                      modules=getattr(trace, 'modules', ()))
+                      host, modules=getattr(trace, 'modules', ()),
+                      exe_image_base=info['image_base'] if info else None)
 
 
 _OFFSET_TAIL = re.compile(r'(.+?)\+0x[0-9a-f]+')
@@ -518,7 +604,7 @@ def span_lanes(trace):
     lanes = []
     for ring in sorted(trace.events):
         items = [(e.t0 / 1000.0, e.t1 / 1000.0, e.name, e.b, e.kind, e.flags)
-                 for e in trace.events[ring] if e.t1 != e.t0]
+                 for e in trace.events[ring] if e.t1 != e.t0 and e.name != MUTEX_HOLDER]
         lanes.append(Lane(ring, trace.thread_label(ring), items))
     return lanes
 
@@ -603,6 +689,73 @@ def _counts_in(samples, ns_list, t0, t1):
     return out
 
 
+# ---------------------------------------------------------------- mutex holders
+
+def has_mutex_holders(trace):
+    """True when the trace has "mutex holder" spans (newer recorders; old traces have none)."""
+    return any(e.name == MUTEX_HOLDER and e.t1 > e.t0 for e in trace.all_events())
+
+
+def mutex_pairs(trace):
+    """(wait, holder) for every "mutex wait" span: the holder is the "mutex holder" span with the
+    same t0 and t1 (on any ring), or None when there is none."""
+    holders = {}
+    for e in trace.all_events():
+        if e.name == MUTEX_HOLDER and e.t1 > e.t0:
+            holders.setdefault((e.t0, e.t1), e)
+    return [(e, holders.get((e.t0, e.t1))) for e in trace.all_events()
+            if e.name == MUTEX_WAIT and e.t1 > e.t0]
+
+
+def mutex_table(pairs, window=None):
+    """(sites, holders) for the waits inside window (ns, (t0, t1)), clipped to it. sites maps
+    (holder b, waiter b) to wait ms, holders maps holder a to wait ms; None stands for a wait
+    without a holder span."""
+    sites, holders = collections.Counter(), collections.Counter()
+    for wait, holder in pairs:
+        s, e = wait.t0, wait.t1
+        if window is not None:
+            s, e = max(s, window[0]), min(e, window[1])
+        if e <= s:
+            continue
+        ms = (e - s) / 1e6
+        sites[(holder.b if holder else None, wait.b)] += ms
+        holders[holder.a if holder else None] += ms
+    return sites, holders
+
+
+def _holder_name(trace, a):
+    """The thread whose os_tid is a (its game or shadPS4 track, not a samples track), else the id."""
+    if a is None:
+        return '-'
+    match = sorted((r for r, t in trace.threads.items() if t.get('os_tid') == a),
+                   key=lambda r: trace.threads[r].get('kind') in ('samples', 'gpu'))
+    return trace.thread_label(match[0]) if match else f'thread id {a}'
+
+
+def _site_label(x, sym):
+    return '-' if x is None else _caller_label(x, sym)
+
+
+def mutex_rows(trace, sym, pairs, window=None, limit=8):
+    """The holder table of the waits inside window: {'total_ms', 'sites': [(holder site, waiter
+    caller, ms)], 'holders': [(thread name or raw id, ms)]}, biggest first, at most limit of each.
+    Labels are symbolized. None when no wait falls in the window."""
+    sites, holders = mutex_table(pairs, window)
+    if not sites:
+        return None
+    sym.resolve_host({x for key in sites for x in key if x is not None})
+    by_site = collections.Counter()
+    for (hb, wb), ms in sites.items():
+        by_site[(_site_label(hb, sym), _site_label(wb, sym))] += ms
+    by_thread = collections.Counter()
+    for a, ms in holders.items():
+        by_thread[_holder_name(trace, a)] += ms
+    return {'total_ms': sum(sites.values()),
+            'sites': [(h, w, ms) for (h, w), ms in by_site.most_common(limit)],
+            'holders': by_thread.most_common(limit)}
+
+
 # ---------------------------------------------------------------- hitch
 
 def _classify_module():
@@ -657,6 +810,7 @@ def hitch_file(trace, sym, top=10, callers=3):
     samples = sample_rows(trace, sym)
     sample_ns = [s.ns for s in samples]
     has_gpu = any(e.kind == K_GPU for e in trace.all_events())
+    holder_pairs = mutex_pairs(trace) if has_mutex_holders(trace) else None
     results = []
     for f in slow:
         f0, f1 = f.t0 / 1000.0, f.t1 / 1000.0
@@ -708,13 +862,15 @@ def hitch_file(trace, sym, top=10, callers=3):
                        'bound': 'GPU-bound' if busy >= 0.85 else
                        ('CPU-bound' if busy < 0.5 else 'mixed')}
         stats = cls.frame_stats(f0, f1, [(lane.label, lane.window(f0, f1)) for lane in lanes])
+        mutex = mutex_rows(trace, sym, holder_pairs, (f.t0, f.t1), top) \
+            if holder_pairs else None
         results.append({
             'file': trace.path.name, 'frame': f.a, 'segment': f.name,
             'ms': (f1 - f0) / 1000.0, 'normal_frames': len(normal),
             'typical_ms': (statistics.median([(n.t1 - n.t0) / 1e6 for n in normal])
                            if normal else None),
             'verdict': stats['cause'], 'top': rows,
-            'funcs': func_rows, 'imports': imp_rows, 'gpu': gpu_row})
+            'funcs': func_rows, 'imports': imp_rows, 'gpu': gpu_row, 'mutex': mutex})
     return results
 
 
@@ -766,19 +922,28 @@ def hitch_markdown(name, results):
             out += [f"GPU (EvGpu): busy {g['busy']:.0%} of the frame, verdict {g['bound']}; "
                     f"{g['slow_ms']:.1f} ms against {g['typical_ms']:.1f} ms typical "
                     f"({g['delta_ms']:+.1f} ms).", '']
+        if r.get('mutex'):
+            m = r['mutex']
+            out += [f"Mutex waits in this frame: {m['total_ms']:.1f} ms. Wait time by holder site "
+                    "(the lock site of the holder) and waiter caller:", '',
+                    '| wait ms | holder site | waiter caller |', '|---|---|---|']
+            for holder, waiter, ms in m['sites']:
+                out.append(f'| {ms:.1f} | {_md(holder)} | {_md(waiter)} |')
+            out += ['', 'Holder threads: ' + '; '.join(f'{_md(name)} {ms:.1f} ms'
+                                                       for name, ms in m['holders']) + '.', '']
     return out
 
 
 # ---------------------------------------------------------------- top / info
 
-def top_report(trace, limit, samples=None):
+def top_report(trace, limit, samples=None, sym=None):
     lines = []
     per = collections.defaultdict(collections.Counter)
     calls = collections.Counter()
     for ring, evs in trace.events.items():
         label = trace.thread_label(ring)
         for e in evs:
-            if e.kind == K_FRAME or e.t1 == e.t0:
+            if e.kind == K_FRAME or e.t1 == e.t0 or e.name == MUTEX_HOLDER:
                 continue
             per[label][e.name] += e.t1 - e.t0
             calls[(label, e.name)] += 1
@@ -790,6 +955,15 @@ def top_report(trace, limit, samples=None):
     if gpu:
         lines.append(f'GPU (EvGpu): {sum(e.t1 - e.t0 for e in gpu) / 1e6:.2f} ms in '
                      f'{len(gpu)} spans')
+    if has_mutex_holders(trace):
+        rows = mutex_rows(trace, sym or Symbolizer(), mutex_pairs(trace), None, limit)
+        if rows:
+            lines.append(f"mutex waits, whole trace ({rows['total_ms']:.2f} ms): holder site <- "
+                         'waiter caller, then holder threads:')
+            for holder, waiter, ms in rows['sites']:
+                lines.append(f'  {ms:10.2f} ms  {holder}  <-  {waiter}')
+            lines.append('  holders: ' + '; '.join(f'{name} {ms:.2f} ms'
+                                                   for name, ms in rows['holders']))
     if samples:
         for thread, p in sorted(sample_profiles(samples).items(), key=lambda kv: -kv[1]['n']):
             lines.append(f"{thread} ({p['n']} samples), flat (leaf):")
@@ -1196,9 +1370,10 @@ def cmd_top(args):
         if trace is None:
             status = 1
             continue
-        samples = sample_rows(trace, _symbolizer_for(trace, args))
+        sym = _symbolizer_for(trace, args)
+        samples = sample_rows(trace, sym)
         print(f'== {trace.path.name}')
-        print('\n'.join(top_report(trace, args.top, samples)))
+        print('\n'.join(top_report(trace, args.top, samples, sym)))
         print()
         folded += folded_lines(samples)
     if args.folded:

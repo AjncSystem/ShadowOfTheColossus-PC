@@ -145,20 +145,48 @@ every DLL of the process, from the sampler's Toolhelp snapshot, refreshed once a
 
 All numbers are decimal integers (not hex text). `name` is the module base name in UTF-8
 (`"bb-probe.exe"`, `"ntdll.dll"`, the Vulkan driver DLL). `base` and `size` are the loaded image
-(the Toolhelp entry); `preferred_base` is the PE OptionalHeader.ImageBase, or 0 when the header
-did not parse (unknown).
+(the Toolhelp entry); `preferred_base` is the PE OptionalHeader.ImageBase as the sampler read it,
+or 0 when the header did not parse (unknown). **Caveat:** the sampler reads the header in
+memory, and the Windows loader rewrites ImageBase in a relocated image. So `preferred_base` can
+equal the runtime `base` (seen for `bb-probe.exe`: both 0x7ff7eb7e0000, the file says
+0x140000000). Readers must take the ImageBase from the file on disk (the PE OptionalHeader of
+the binary that was traced: PE32+ at offset 24 of the optional header, u64) and use the recorded
+`preferred_base` only when no file is available. The Python reader does this for `bb-probe.exe`
+(`out/gpu/bb-probe.exe`, or `out/bb-probe.exe` when newer) and warns when that file is newer than
+the trace or its SizeOfImage differs from the recorded `size`.
 
 A host sample address x (a STACKS address outside `image_base`/`image_size`, or the `a` of a
 `samples` event) belongs to the module with `base <= x < base + size`. Its RVA is `x - base`.
-Its slide is `base - preferred_base`: 0 for a module loaded at its preferred base, negative when
+Its slide is `base - ImageBase`: 0 for a module loaded at its preferred base, negative when
 it was loaded below it. `llvm-symbolizer --obj=<file> --adjust-vma=<slide>` resolves the runtime
-address x directly, because it shifts the file's addresses by the slide. The Python reader
+address x directly, because it adds the slide to the input address. The Python reader
 (`tools/trace/sotc_trace.py`) does exactly that for `bb-probe.exe`, and names every other module
-`name+0x<rva>` (DLLs have no DWARF here).
+`name+0x<rva>` (DLLs have no DWARF here). The binary used must be the one that was traced: symbols
+of a later build do not match the addresses.
 
 ### ZONE_STATS entries
 
 `{"name": str, "file": str, "line": u32, "calls": u64, "total_ns": u64, "max_ns": u64}`.
+
+## Named spans
+
+### mutex wait and mutex holder
+
+A contended guest mutex records a `mutex wait` span: `[t0, t1)` = the time the thread waited,
+`b` = the waiter's guest caller (return address).
+
+A `mutex holder` span is recorded next to each contended `mutex wait` and names the holder:
+
+| Field | Meaning |
+|---|---|
+| `t0`, `t1` | the same as the `mutex wait` span it belongs to (the reader pairs them by equal `t0` and `t1`) |
+| `a` | the holder thread id, as stored by the guest mutex; a reader matches it to a THREADS `os_tid` (no match: show the raw id) |
+| `b` | the holder's lock site: a guest return address (the call that took the lock) |
+
+Readers: the holder span is not time spent by its thread, so it is left out of the span totals.
+`hitch` lists, per slow frame, the wait time by (holder site, waiter caller) and the holder threads.
+A trace without `mutex holder` spans (older recorders) simply has no holder table. A wait without
+a holder span is counted with holder `-`.
 
 ## Self-stats object
 

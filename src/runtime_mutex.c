@@ -153,6 +153,9 @@ static ABI int32_t mutex_lock(GuestMutex **mutex) {
     int native = pthread_mutex_trylock(&m->native);
     /* sotc: SOTC_TRACE: contended locks only */
     const uint64_t t0 = native == EBUSY ? trace_now() : 0;
+    /* sotc: the holder at the start of the wait (read once, racy by design; SOTC_TRACE only) */
+    uint64_t holder_tid = 0, holder_site = 0;
+    if (t0) { holder_tid = m->owner; holder_site = (uint64_t)(uintptr_t)m->site; }
     /* sotc: SOTC_MUTEX_SPIN_US: spin before the kernel-timed wait (contended locks only). */
     const uint64_t spin_us = native == EBUSY ? mutex_spin_us_get() : 0;
     if (spin_us) native = mutex_spin(m, spin_us);
@@ -171,6 +174,8 @@ static ABI int32_t mutex_lock(GuestMutex **mutex) {
     e = orbis_error(native);
     if (!e) { ++locks; m->owner = current_tid(); m->site = (void *)(uintptr_t)GUEST_CALLER(); ++m->depth; }
     trace_span("mutex wait", t0, (uint64_t)(uintptr_t)m, (uint64_t)GUEST_CALLER());
+    /* sotc: "mutex holder" spans the same interval; a = holder guest tid (GuestMutex.owner), b = its lock site */
+    trace_span("mutex holder", t0, holder_tid, holder_site);
     return e;
 }
 static ABI int32_t mutex_trylock(GuestMutex **mutex) {

@@ -6609,6 +6609,9 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
         // are applied together when this scope closes, so before anything below reads guest
         // memory for them (the order of today's path: protect, then copy). A guest write landing
         // before the flush is in the bytes copied below; one after it faults.
+        // sotc: SOTC_TRACE "sync protect": declared before protect_batch, so it ends after the
+        // re-protects are flushed. a = ranges found.
+        SotcTrace::ScopeMin trace_protect{"sync protect"};
         const PageManager::ProtectBatch protect_batch{SotcStats::kProtectBatch};
         clean = memory_tracker->ForEachUploadRange(device_addr, size, is_written,
                                                    [&](u64 addr, u64 size) {
@@ -6616,6 +6619,7 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
                                                                            size);
                                                        total_size_bytes += size;
                                                    });
+        trace_protect.a = copies.size();
     }
     if (scan_clean) { // sotc: SOTC_SYNC_PIPE, see SynchronizeMemory
         *scan_clean = clean;
@@ -6647,6 +6651,7 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
         // only skips runs of up to 16 KiB, which the CPU path below keeps handling for small
         // uploads; RecordCurrentWrite drops the stored hashes of the runs written here.
         if (host_import && total_size_bytes >= host_import->MinBytes()) {
+            SotcTrace::Scope trace_import{"sync import", total_size_bytes}; // sotc: SOTC_TRACE
             const auto device_staging =
                 staging_pool.Request(total_size_bytes, MemoryType::DeviceLocal);
             if (host_import->Upload(copies, device_staging.buffer->Handle(),
@@ -6671,6 +6676,7 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
         if (auto* async_upload = AsyncUpload::Get(); async_upload &&
                                                      AsyncUpload::BuffersEnabled() &&
                                                      total_size_bytes >= async_upload->MinBytes()) {
+            SotcTrace::Scope trace_async{"sync async", total_size_bytes}; // sotc: SOTC_TRACE
             if (TryUploadAsync(*async_upload, arena, copies, total_size_bytes)) { // sotc: may keep a rest in copies
                 return is_texel_buffer && !is_written
                            ? SynchronizeMemoryFromImage(arena, device_addr, size)
@@ -6678,7 +6684,10 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
             }
             SotcStats::async_upload_kept.fetch_add(1, std::memory_order_relaxed);
         }
-        const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
+        const auto staging = [&] {
+            SotcTrace::Scope trace_staging{"sync staging", total_size_bytes}; // sotc: SOTC_TRACE
+            return staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
+        }();
         // sotc: SOTC_HASH_SMALL=<bytes> (off by default). A dirty run no larger than that whose bytes
         // equal the ones last uploaded for exactly that run is not copied again: the arena already
         // holds them (any other arena write drops the stored hash, RecordCurrentWrite and
@@ -6744,27 +6753,38 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
             const char* v = std::getenv("SOTC_COPY_BATCH");
             return !v || v[0] != '0';
         }();
-        if (copy_batch && bulk.size() > 1 && total_size_bytes >= 2_MB && BbCopy::Enabled()) {
-            struct Piece {
-                VAddr source;
-                u8* dest;
-                u64 size;
-            };
-            constexpr u64 PieceSize = 512_KB;
-            boost::container::small_vector<Piece, 64> pieces;
-            for (const auto& copy : bulk) {
-                for (u64 done = 0; done < copy.size; done += PieceSize) {
-                    pieces.push_back({copy.dstOffset + done, staging.mapped + copy.srcOffset + done,
-                                      std::min(PieceSize, copy.size - done)});
+        {
+            // sotc: SOTC_TRACE "sync copy": a = bytes copied, b = pieces (batch) or ranges.
+            SotcTrace::Scope trace_copy{"sync copy"};
+            if (SotcTrace::kOn) {
+                for (const auto& copy : bulk) {
+                    trace_copy.a += copy.size;
                 }
             }
-            BbCopy::ParallelFor(pieces.size(), [&](std::size_t i) {
-                memory->CopySparseMemory(pieces[i].source, pieces[i].dest, pieces[i].size);
-            });
-        } else {
-            for (const auto& copy : bulk) {
-                memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset,
-                                         copy.size);
+            trace_copy.b = bulk.size();
+            if (copy_batch && bulk.size() > 1 && total_size_bytes >= 2_MB && BbCopy::Enabled()) {
+                struct Piece {
+                    VAddr source;
+                    u8* dest;
+                    u64 size;
+                };
+                constexpr u64 PieceSize = 512_KB;
+                boost::container::small_vector<Piece, 64> pieces;
+                for (const auto& copy : bulk) {
+                    for (u64 done = 0; done < copy.size; done += PieceSize) {
+                        pieces.push_back({copy.dstOffset + done, staging.mapped + copy.srcOffset + done,
+                                          std::min(PieceSize, copy.size - done)});
+                    }
+                }
+                BbCopy::ParallelFor(pieces.size(), [&](std::size_t i) {
+                    memory->CopySparseMemory(pieces[i].source, pieces[i].dest, pieces[i].size);
+                });
+                trace_copy.b = pieces.size();
+            } else {
+                for (const auto& copy : bulk) {
+                    memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset,
+                                             copy.size);
+                }
             }
         }
         for (auto& copy : copies) {
@@ -6774,16 +6794,26 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
         staging.Flush();
         // sotc: SOTC_XFER_QUEUE. Sparse binds of this arena still pending are submitted with the
         // next graphics submit, after any transfer copy routed now: such copies stay put.
-        const bool binds_pending = std::ranges::any_of(pending_binds, [arena](const auto& b) {
-            return b.arena == arena && !b.binds.empty();
-        });
-        const bool routed =
-            !binds_pending && runtime.TryCopyBufferXfer(staging.buffer, arena, copies);
-        if (!routed) {
-            runtime.CopyBuffer(staging.buffer, arena, copies);
-        }
-        for (const auto& copy : copies) {
-            RecordCurrentWrite(arena->cpu_addr + copy.dstOffset, copy.size);
+        {
+            // sotc: SOTC_TRACE "sync record": a = bytes recorded, b = runs.
+            SotcTrace::Scope trace_record{"sync record"};
+            if (SotcTrace::kOn) {
+                for (const auto& copy : copies) {
+                    trace_record.a += copy.size;
+                }
+            }
+            trace_record.b = copies.size();
+            const bool binds_pending = std::ranges::any_of(pending_binds, [arena](const auto& b) {
+                return b.arena == arena && !b.binds.empty();
+            });
+            const bool routed =
+                !binds_pending && runtime.TryCopyBufferXfer(staging.buffer, arena, copies);
+            if (!routed) {
+                runtime.CopyBuffer(staging.buffer, arena, copies);
+            }
+            for (const auto& copy : copies) {
+                RecordCurrentWrite(arena->cpu_addr + copy.dstOffset, copy.size);
+            }
         }
         // The hashes go in after RecordCurrentWrite, which drops the older ones of these runs.
         if (!new_hashes.empty()) {

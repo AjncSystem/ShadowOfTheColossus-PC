@@ -52,6 +52,16 @@
 
 namespace Vulkan {
 
+namespace {
+// sotc: B5/C6 counters (SOTC_FPS only: every writer checks SotcStats::kFpsLog first). Times in ns.
+std::atomic<u64> flip_free_ns{0}, flip_free_waits{0}; ///< GetRenderFrame: no free frame
+std::atomic<u64> flip_fence_ns{0}, flip_frames{0};   ///< GetRenderFrame: present_done; calls
+std::atomic<u64> ring_waits{0};                      ///< the same free-frame waits, for ReportPresent
+std::atomic<u64> present_lock_ns{0}, present_lock_count{0}; ///< present thread: submit_mutex wait
+std::atomic<u64> present_under_lock_ns{0};           ///< present thread: time under submit_mutex
+std::atomic<u32> present_ring{0};                    ///< C6: presentation frames in the ring
+} // namespace
+
 bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format format) {
     const vk::FormatProperties props{physical_device.getFormatProperties(format)};
     return static_cast<bool>(props.optimalTilingFeatures & vk::FormatFeatureFlagBits::eBlitDst);
@@ -483,6 +493,41 @@ static void SavePendingScreenshot(const ScreenshotReadback& readback) {
     }
 }
 
+// sotc: SOTC_PRESENT_FRAMES. The VRAM the frames past the default count may take: a quarter of the
+// free budget of the largest device-local heap, which is where the presentation frames go.
+static u64 PresentRingBudget(const Instance& instance) {
+    const auto& props = instance.GetMemoryProperties();
+    u32 heap = VK_MAX_MEMORY_HEAPS;
+    for (u32 i = 0; i < props.memoryHeapCount; ++i) {
+        if ((props.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) &&
+            (heap == VK_MAX_MEMORY_HEAPS || props.memoryHeaps[i].size > props.memoryHeaps[heap].size)) {
+            heap = i;
+        }
+    }
+    if (heap == VK_MAX_MEMORY_HEAPS) {
+        return 0;
+    }
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+    vmaGetHeapBudgets(instance.GetAllocator(), budgets.data());
+    const u64 total = budgets[heap].budget;
+    const u64 used = budgets[heap].usage;
+    return total > used ? (total - used) / 4 : 0;
+}
+
+// sotc: SOTC_PRESENT_FRAMES. The largest ring of at most `want` frames whose frames past
+// `default_frames` fit in PresentRingBudget. A frame is width x height x 4 bytes, counted twice
+// since it may have a hudless image too.
+static u32 FitPresentRing(const Instance& instance, u32 default_frames, u32 want, u32 width,
+                          u32 height) {
+    const u64 budget = PresentRingBudget(instance);
+    const u64 frame_bytes = static_cast<u64>(width) * height * 4 * 2;
+    u32 frames = want;
+    while (frames > default_frames && (frames - default_frames) * frame_bytes > budget) {
+        --frames;
+    }
+    return frames;
+}
+
 Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_)
     : window{window_}, liverpool{liverpool_},
       instance{window, EmulatorSettings.GetGpuId(), EmulatorSettings.IsVkValidationEnabled(),
@@ -505,8 +550,33 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     // sotc: with DLSS Frame Generation Streamline keeps 2 swapchain images, FSR 3 holds a frame
     // for half a frame: 4 frames in flight so that the command processor does not wait for the
     // presenter.
-    const u32 num_frames =
+    u32 num_frames =
         Dlssg::Enabled() || FrameGen::AskedAtStart() ? std::max(num_images, 4u) : num_images;
+    // sotc: SOTC_PRESENT_FRAMES=N (C6; unset or 0 keeps the count above). The ring grows to N
+    // frames, at most 16, each one display-size (plus a hudless one where it is used). A larger
+    // ring lets GetRenderFrame find a free frame without waiting. ReportPresent prints it.
+    // The frames past the count above are kept only while they fit in VRAM (FitPresentRing).
+    ring_default_frames = num_frames;
+    if (const char* v = std::getenv("SOTC_PRESENT_FRAMES"); v && v[0] != '\0') {
+        const u32 want =
+            static_cast<u32>(std::min<unsigned long>(std::strtoul(v, nullptr, 10), 16ul));
+        // sotc: sized at SOTC_OUTPUT_RES when it is set (the presented size), else at the game size.
+        u32 ring_width = expected_frame_width;
+        u32 ring_height = expected_frame_height;
+        if (const char* o = std::getenv("SOTC_OUTPUT_RES"); o) {
+            s32 w = 0, h = 0;
+            if (std::sscanf(o, "%dx%d", &w, &h) == 2 && w >= 640 && h >= 360 && w <= 7680 &&
+                h <= 4320) {
+                ring_width = static_cast<u32>(w);
+                ring_height = static_cast<u32>(h);
+            }
+        }
+        num_frames = FitPresentRing(instance, ring_default_frames, std::max(num_frames, want),
+                                    ring_width, ring_height);
+        LOG_INFO(Render_Vulkan, "SOTC_PRESENT_FRAMES: presentation ring of {} frames ({} asked)",
+                 num_frames, want);
+    }
+    present_ring.store(num_frames, std::memory_order_relaxed);
     present_frames.resize(num_frames);
     hudless_frames.resize(num_frames);
     for (u32 i = 0; i < num_frames; i++) {
@@ -517,6 +587,10 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
             device.createFence({.flags = vk::FenceCreateFlagBits::eSignaled}));
         frame.present_done = fence;
         free_queue.push(&frame);
+    }
+    // sotc: SOTC_CP_FLIP_PACE=1 (off by default), see cp_pacer.
+    if (const char* v = std::getenv("SOTC_CP_FLIP_PACE"); v && v[0] == '1') {
+        cp_pacer = this;
     }
 
     fsr_settings.enable = EmulatorSettings.IsFsrEnabled();
@@ -551,6 +625,9 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
 }
 
 Presenter::~Presenter() {
+    if (cp_pacer == this) {
+        cp_pacer = nullptr;
+    }
     // This thread records the last commands of the rasterizer scheduler.
     draw_scheduler.ClaimRecorder();
     draw_scheduler.Finish();
@@ -578,7 +655,7 @@ bool Presenter::IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const
     return std::ranges::find(vo_buffers_addr, color_buffer.Address()) != vo_buffers_addr.cend();
 }
 
-void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
+bool Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     const vk::Device device = instance.GetDevice();
     if (false) { // sotc port: no ImGui layer
     }
@@ -588,6 +665,10 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     if (frame->image) {
         vmaDestroyImage(instance.GetAllocator(), frame->image, frame->allocation);
     }
+    // sotc: no image is held until the new one is allocated (see the failure path below).
+    frame->image = nullptr;
+    frame->image_view = nullptr;
+    frame->allocation = nullptr;
 
     const vk::Format format = swapchain.GetSurfaceFormat().format;
     const vk::ImageCreateInfo image_info = {
@@ -617,9 +698,16 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     VkResult result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &alloc_info,
                                      &unsafe_image, &frame->allocation, nullptr);
     if (result != VK_SUCCESS) [[unlikely]] {
-        LOG_CRITICAL(Render_Vulkan, "Failed allocating texture with error {}",
-                     vk::to_string(vk::Result{result}));
-        UNREACHABLE();
+        if (frame->id < ring_default_frames) {
+            LOG_CRITICAL(Render_Vulkan, "Failed allocating texture with error {}",
+                         vk::to_string(vk::Result{result}));
+            UNREACHABLE();
+        }
+        // sotc: a frame past the default count (SOTC_PRESENT_FRAMES) does not fit in VRAM: the
+        // caller takes it out of the ring.
+        LOG_ERROR(Render_Vulkan, "Failed allocating extra presentation frame {} with error {}",
+                  frame->id, vk::to_string(vk::Result{result}));
+        return false;
     }
     frame->image = vk::Image{unsafe_image};
     SetObjectName(device, frame->image, "Frame image #{}", frame->id);
@@ -642,6 +730,7 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     frame->height = height;
 
     frame->is_hdr = swapchain.GetHDR();
+    return true;
 }
 
 Frame* Presenter::PrepareLastFrame() {
@@ -719,6 +808,9 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
 
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
+    if (wait_service) {
+        WaitFreeFrame(); // sotc: SOTC_FLIP_SERVICE, before anything of this flip is done
+    }
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);
@@ -921,12 +1013,15 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // HUD interpolated with FSR 1 on (letters shook, 27 Oct). With DLSS super resolution the DLSS
     // output is the frame without its HUD (the UI layer is only put over it here), so it is used
     // instead.
-    if (const vk::ImageView hudless_view = rasterizer->TakeHudless(cpu_address, view_info.format)) {
-        Frame& hudless = hudless_frames[frame->id];
-        if (hudless.width != frame->width || hudless.height != frame->height ||
-            hudless.is_hdr != frame->is_hdr || !hudless.image) {
-            RecreateFrame(&hudless, frame->width, frame->height);
-        }
+    const vk::ImageView hudless_view = rasterizer->TakeHudless(cpu_address, view_info.format);
+    Frame& hudless = hudless_frames[frame->id];
+    // sotc: a hudless image of an extra frame that does not fit in VRAM is not made: then this frame
+    // goes out without frame->hudless, as when no hudless frame is taken (hudless.image is null).
+    if (hudless_view && (hudless.width != frame->width || hudless.height != frame->height ||
+                         hudless.is_hdr != frame->is_hdr || !hudless.image)) {
+        RecreateFrame(&hudless, frame->width, frame->height);
+    }
+    if (hudless_view && hudless.image) {
         auto hudless_barrier = pre_barrier;
         hudless_barrier.image = hudless.image;
         cmdbuf.pipelineBarrier2(vk::DependencyInfo{
@@ -1074,6 +1169,73 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
     return frame;
 }
 
+// sotc: SOTC_PRESENT_WAIT. Each present on the main path is tagged with the next id
+// (VK_KHR_present_id), so the vblank thread can wait until it is on screen (driver.cpp). Ids
+// are taken under Scheduler::submit_mutex together with swapchain.Present, so they follow the
+// queue order.
+u64 Presenter::TagPresent() {
+    std::scoped_lock lock{present_records_mutex};
+    const u64 id = last_present_id.load(std::memory_order_relaxed) + 1;
+    present_records[id % present_records.size()] = {
+        .id = id,
+        .swapchain = static_cast<VkSwapchainKHR>(swapchain.GetHandle()),
+    };
+    last_present_id.store(id, std::memory_order_release);
+    return id;
+}
+
+bool Presenter::WaitPresented(u64 id, u64 timeout_ns) {
+    if (id == 0) {
+        return true;
+    }
+    const VkSwapchainKHR current = static_cast<VkSwapchainKHR>(swapchain.GetHandle());
+    {
+        std::scoped_lock lock{present_records_mutex};
+        if (id > last_present_id.load(std::memory_order_acquire)) {
+            return false; // not presented yet
+        }
+        const PresentRecord& record = present_records[id % present_records.size()];
+        // Already waited for, or too old to be kept, or from a swapchain that was replaced (its
+        // presents were all finished by the device idle in Swapchain::Destroy): nothing to wait.
+        if (record.id != id || record.swapchain != current || record.done_ns != 0) {
+            return true;
+        }
+    }
+
+    // The raw dispatcher call: vk::Device::waitForPresentKHR asserts on results other than
+    // success and timeout, and a swapchain error here is handled by the next present.
+    const VkResult result = VULKAN_HPP_DEFAULT_DISPATCHER.vkWaitForPresentKHR(
+        static_cast<VkDevice>(instance.GetDevice()), current, id, timeout_ns);
+    if (result == VK_TIMEOUT) {
+        return false;
+    }
+    if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            std::fprintf(stderr, "SOTC PRESENT_WAIT: vkWaitForPresentKHR returned %d, not waiting\n",
+                         int(result));
+        }
+        return true;
+    }
+
+    const u64 done_ns = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+    std::scoped_lock lock{present_records_mutex};
+    PresentRecord& record = present_records[id % present_records.size()];
+    if (record.id == id) {
+        record.done_ns = done_ns;
+    }
+    return true;
+}
+
+u64 Presenter::PresentDoneNs(u64 id) const {
+    std::scoped_lock lock{present_records_mutex};
+    const PresentRecord& record = present_records[id % present_records.size()];
+    return record.id == id ? record.done_ns : 0;
+}
+
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
     // Free the frame for reuse
     const auto free_frame = [&] {
@@ -1081,7 +1243,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             last_submit_frame = frame;
             std::scoped_lock fl{free_mutex};
             free_queue.push(frame);
-            free_cv.notify_one();
+            // sotc: notify_all: the command processor may wait too (SOTC_CP_FLIP_PACE), and
+            // waking it instead of the draw thread left the draw thread blocked.
+            free_cv.notify_all();
         }
     };
 
@@ -1384,7 +1548,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
+    low_latency.SubmitStart(); // sotc: SOTC_LOW_LATENCY render submit markers (NVIDIA)
     scheduler.Flush(info);
+    low_latency.SubmitEnd();
 
     // Present to swapchain.
     {
@@ -1393,8 +1559,24 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         Dlssg::BeforePresent(frame->id,
                              FitImage(frame->width, frame->height, extent.width, extent.height),
                              extent);
+        // sotc: SOTC_FPS (B5, C6): how long this thread waited for submit_mutex, and the time under
+        // it until the present returns. Clock reads only; the lock is taken as before.
+        const u64 lock_start = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        const bool presented = swapchain.Present();
+        const u64 lock_taken = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
+        if (SotcStats::kFpsLog) {
+            present_lock_ns.fetch_add(lock_taken - lock_start, std::memory_order_relaxed);
+            present_lock_count.fetch_add(1, std::memory_order_relaxed);
+        }
+        const u64 present_id = instance.IsPresentIdEnabled() ? TagPresent() : 0;
+        low_latency.BeforePresent(present_id);
+        const SotcTrace::Scope trace_present{"present", present_id}; // sotc: SOTC_TRACE
+        const bool presented = swapchain.Present(present_id);
+        if (SotcStats::kFpsLog) {
+            present_under_lock_ns.fetch_add(SotcStats::NowNs() - lock_taken,
+                                            std::memory_order_relaxed);
+        }
+        low_latency.AfterPresent(frame->present_done);
         Dlssg::AfterPresent(frame->id);
         if (FrameGen::Current() == FrameGen::Mode::Fsr) {
             FsrFg::NotePresent();
@@ -1408,16 +1590,29 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     free_frame();
     if (!is_reusing_frame && is_game_frame) {
         DebugState.IncFlipFrameNum();
+        // sotc: SOTC_TRACE: the game frame (flip to flip) and, when it was slow, its dump.
+        if (SotcTrace::kOn) {
+            static u64 trace_frames = 0, trace_prev_ns = 0;
+            const u64 now_ns = SotcStats::NowNs();
+            ++trace_frames;
+            if (trace_prev_ns) {
+                SotcTrace::FrameEnd(trace_frames, trace_prev_ns, now_ns);
+            }
+            trace_prev_ns = now_ns;
+        }
         // SOTC_FRAME_LOG=<n> prints the frame count and time to stderr every n frames, for
         // measuring the frame rate of scripted runs.
         static const u64 every = [] {
             const char* v = std::getenv("SOTC_FRAME_LOG");
             return v ? std::strtoull(v, nullptr, 10) : 0ULL;
         }();
-        if (every != 0) {
+        // sotc: SOTC_FPS=1 also runs the SOTCSTALL check below (without the SOTCFRAME lines), so
+        // slow frames of normal play are attributed in the session log.
+        if (every != 0 || SotcStats::kFpsLog) {
             static u64 frames = 0;
             static const auto t0 = std::chrono::steady_clock::now();
-            if (++frames % every == 0) {
+            ++frames;
+            if (every != 0 && frames % every == 0) {
                 const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                                     std::chrono::steady_clock::now() - t0)
                                     .count();
@@ -1437,24 +1632,95 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             const long long now_us = std::chrono::duration_cast<std::chrono::microseconds>(
                                          std::chrono::steady_clock::now() - t0)
                                          .count();
+            // sotc: the SOTC_FPS report (driver.cpp) resets readbacks/readback_ns every 5 s, so
+            // their deltas fall back to the new value after a reset instead of wrapping.
             const u64 cur[11] = {SotcStats::pipelines_new.load(), SotcStats::pipeline_ns.load(),
                                 SotcStats::shaders_compiled.load(), SotcStats::shader_ns.load(),
                                 SotcStats::images_new.load(), SotcStats::image_ns.load(),
                                 SotcStats::readbacks.load(), SotcStats::readback_ns.load(),
                                 SotcStats::image_query_ns.load(), SotcStats::image_alloc_ns.load(),
                                 SotcStats::image_dedicated.load()};
+            // sotc: SOTC_FPS: the thread accounting of this frame (snapshot at every game flip,
+            // so the figures cover exactly the time since the previous one).
+            static SotcStats::FrameAccount last_account{};
+            char account_text[768] = ""; // sotc: 512 truncated the tail once many fields were appended
+            if (SotcStats::kFpsLog) {
+                const SotcStats::FrameAccount now_account = SotcStats::TakeAccount();
+                const SotcStats::FrameAccount d =
+                    SotcStats::DiffAccount(now_account, last_account);
+                last_account = now_account;
+                using SotcStats::WaitGpu, SotcStats::WaitRecorder, SotcStats::WaitUpload,
+                    SotcStats::WaitTcLock;
+                const auto ms = [](u64 ns) { return ns / 1e6; };
+                const auto n = [](u64 v) { return static_cast<unsigned long long>(v); };
+                std::snprintf(
+                    account_text, sizeof(account_text),
+                    "; cpu draw %.1f cp %.1f rec %.1f passsec %.1f upload %.1f ms; draw waits "
+                    "gpu %.1f (%llu) rec %.1f (%llu) upload %.1f (%llu) tc %.1f (%llu) ms; cp "
+                    "parse %.1f blocked %.1f spin %.1f ms; rec busy %.1f upload-wait %.1f submit %.1f ms; "
+                    "fence %.1f ms", // sotc: SOTC_ASYNC_UPLOAD write fence waits
+                    ms(d.cpu_ns[SotcStats::RoleDraw]), ms(d.cpu_ns[SotcStats::RoleCp]),
+                    ms(d.cpu_ns[SotcStats::RoleRecorder]),
+                    ms(d.cpu_ns[SotcStats::RolePassSecondary]),
+                    ms(d.cpu_ns[SotcStats::RoleUpload]), ms(d.wait_ns[WaitGpu]),
+                    n(d.wait_count[WaitGpu]), ms(d.wait_ns[WaitRecorder]),
+                    n(d.wait_count[WaitRecorder]), ms(d.wait_ns[WaitUpload]),
+                    n(d.wait_count[WaitUpload]), ms(d.wait_ns[WaitTcLock]),
+                    n(d.wait_count[WaitTcLock]), ms(d.parse_ns), ms(d.blocked_ns),
+                    ms(d.spin_ns), // sotc: CP no-progress spin (Liverpool::Process)
+                    ms(d.rec_busy), ms(d.rec_upload), ms(d.rec_submit), ms(d.fence));
+                // sotc: guest threads' wall-clock wait in asynchronous readbacks this frame
+                const size_t used = std::strlen(account_text);
+                std::snprintf(account_text + used, sizeof(account_text) - used,
+                              "; rb wait %.1f ms (%llu), rb adj %llu", ms(d.rb_wait_ns),
+                              n(d.rb_wait_count), n(d.rb_adj)); // sotc: adjacent requests
+                // sotc: SOTC_RB_PREFETCH: prefetches applied at a guest fault this frame
+                const size_t used_pf = std::strlen(account_text);
+                if (used_pf + 1 < sizeof(account_text)) {
+                    std::snprintf(account_text + used_pf, sizeof(account_text) - used_pf,
+                                  ", rb pf %llu", n(d.rb_pf));
+                }
+                // sotc: guest write faults this frame (FaultStat)
+                const size_t used_fl = std::strlen(account_text);
+                if (used_fl + 1 < sizeof(account_text)) {
+                    std::snprintf(account_text + used_fl, sizeof(account_text) - used_fl,
+                                  ", faults %llu (%.1f ms)", n(d.fault_count), ms(d.fault_ns));
+                }
+                // sotc: SOTC_HRR dry run: guest readbacks this frame that hit a would-be range
+                static u64 last_hrr = 0;
+                const u64 hrr_now = SotcStats::hrr_faults_all.load(std::memory_order_relaxed);
+                const size_t used_hrr = std::strlen(account_text);
+                if (hrr_now != 0 && used_hrr + 1 < sizeof(account_text)) {
+                    std::snprintf(account_text + used_hrr, sizeof(account_text) - used_hrr,
+                                  ", hrr %llu", n(hrr_now - last_hrr));
+                }
+                last_hrr = hrr_now;
+                // sotc: SOTC_STALL_DETAIL: flip pacing of this frame, guest threads' CPU and the
+                // user/kernel CPU of the upload threads (RoleUpload only).
+                if (SotcStats::kStallDetail) {
+                    const size_t used_sd = std::strlen(account_text);
+                    if (used_sd + 1 < sizeof(account_text)) {
+                        std::snprintf(account_text + used_sd, sizeof(account_text) - used_sd,
+                                      ", flip pace %.1f ms, guest cpu %.1f ms, upload user %.1f kernel %.1f ms",
+                                      ms(d.flip_pace_ns), ms(d.cpu_ns[SotcStats::RoleGuest]),
+                                      ms(d.upload_user_ns), ms(d.upload_kernel_ns));
+                    }
+                }
+            }
             if (last_us >= 0 && now_us - last_us > stall_us) {
                 std::fprintf(stderr,
                              "SOTCSTALL frame %llu %.0f ms: pipelines %llu (%.0f ms), shaders %llu "
                              "(%.0f ms), images %llu (%.0f ms: query %.0f, alloc %.0f, %llu dedicated), "
-                             "readbacks %llu (%.0f ms)\n",
+                             "readbacks %llu (%.0f ms)%s\n",
                              static_cast<unsigned long long>(frames), (now_us - last_us) / 1e3,
                              static_cast<unsigned long long>(cur[0] - last[0]), (cur[1] - last[1]) / 1e6,
                              static_cast<unsigned long long>(cur[2] - last[2]), (cur[3] - last[3]) / 1e6,
                              static_cast<unsigned long long>(cur[4] - last[4]), (cur[5] - last[5]) / 1e6,
                              (cur[8] - last[8]) / 1e6, (cur[9] - last[9]) / 1e6,
                              static_cast<unsigned long long>(cur[10] - last[10]),
-                             static_cast<unsigned long long>(cur[6] - last[6]), (cur[7] - last[7]) / 1e6);
+                             static_cast<unsigned long long>(cur[6] >= last[6] ? cur[6] - last[6] : cur[6]),
+                             (cur[7] >= last[7] ? cur[7] - last[7] : cur[7]) / 1e6,
+                             account_text);
             }
             last_us = now_us;
             std::copy(std::begin(cur), std::end(cur), std::begin(last));
@@ -1606,13 +1872,61 @@ bool Presenter::PresentGenerated(Frame* frame) {
     return true;
 }
 
+void Presenter::PaceFlip() {
+    const auto start = std::chrono::steady_clock::now();
+    {
+        std::unique_lock lock{free_mutex};
+        // Frames are free for the queued flips and this one. A flip the game never takes (no
+        // flip handler registered) still counts down when the draw thread reaches it; the
+        // deadline only guards against waiting for good.
+        const auto deadline = start + std::chrono::seconds{1};
+        while (static_cast<s32>(free_queue.size()) <=
+               pending_flips.load(std::memory_order_acquire)) {
+            if (free_cv.wait_until(lock, std::min(deadline, std::chrono::steady_clock::now() +
+                                                                std::chrono::milliseconds{1})) ==
+                    std::cv_status::timeout &&
+                std::chrono::steady_clock::now() >= deadline) {
+                break;
+            }
+        }
+    }
+    pending_flips.fetch_add(1, std::memory_order_acq_rel);
+    const uint64_t pace_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                             start)
+            .count());
+    SotcStats::cp_flip_pace_ns.fetch_add(pace_ns, std::memory_order_relaxed);
+    if (SotcStats::kStallDetail) { // sotc: SOTC_STALL_DETAIL, the report does not reset this copy
+        SotcStats::cp_flip_pace_all_ns.fetch_add(pace_ns, std::memory_order_relaxed);
+    }
+}
+
+void Presenter::WaitFreeFrame() {
+    std::unique_lock lock{free_mutex};
+    while (!free_cv.wait_for(lock, std::chrono::microseconds{200},
+                             [this] { return !free_queue.empty(); })) {
+        lock.unlock();
+        wait_service();
+        lock.lock();
+    }
+}
+
 Frame* Presenter::GetRenderFrame() {
     const SotcStats::SplitTimer frame_split{SotcStats::SplitWaitFrame};
     // Wait for free presentation frames
     Frame* frame;
     {
         std::unique_lock lock{free_mutex};
-        free_cv.wait(lock, [this] { return !free_queue.empty(); });
+        // sotc: SOTC_FPS (B5, C6): a wait for a free frame is timed on its own.
+        if (SotcStats::kFpsLog && free_queue.empty()) {
+            const u64 start = SotcStats::NowNs();
+            free_cv.wait(lock, [this] { return !free_queue.empty(); });
+            flip_free_ns.fetch_add(SotcStats::NowNs() - start, std::memory_order_relaxed);
+            flip_free_waits.fetch_add(1, std::memory_order_relaxed);
+            ring_waits.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            free_cv.wait(lock, [this] { return !free_queue.empty(); });
+        }
         LOG_DEBUG(Render_Vulkan, "Got render frame, remaining {}", free_queue.size() - 1);
 
         // Take the frame from the queue
@@ -1628,6 +1942,8 @@ Frame* Presenter::GetRenderFrame() {
         return result;
     };
 
+    // sotc: SOTC_FPS (B5): the present_done wait below is timed on its own.
+    const u64 fence_start = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
     // Wait for the presentation to be finished so all frame resources are free
     while (wait() != vk::Result::eSuccess) {
         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
@@ -1638,13 +1954,71 @@ Frame* Presenter::GetRenderFrame() {
         }
     }
 
+    if (SotcStats::kFpsLog) {
+        flip_fence_ns.fetch_add(SotcStats::NowNs() - fence_start, std::memory_order_relaxed);
+        flip_frames.fetch_add(1, std::memory_order_relaxed);
+    }
     if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
         frame->is_hdr != swapchain.GetHDR()) {
-        RecreateFrame(frame, expected_frame_width, expected_frame_height);
+        if (!RecreateFrame(frame, expected_frame_width, expected_frame_height)) {
+            // sotc: the ring is capped at the frames that exist: this one is not given back to the
+            // free queue, and another free frame is taken. Only frames past the default count can
+            // fail here (RecreateFrame aborts for the others).
+            const u32 left = present_ring.fetch_sub(1, std::memory_order_relaxed) - 1;
+            LOG_WARNING(Render_Vulkan, "Presentation ring capped at {} frames", left);
+            return GetRenderFrame();
+        }
     }
     frame->hudless = nullptr;
 
     return frame;
+}
+
+void ReportFlipWait(std::string& out, double seconds) {
+    if (!SotcStats::kFpsLog) {
+        return;
+    }
+    const u64 frames = flip_frames.exchange(0, std::memory_order_relaxed);
+    const u64 free_ns = flip_free_ns.exchange(0, std::memory_order_relaxed);
+    const u64 free_n = flip_free_waits.exchange(0, std::memory_order_relaxed);
+    const u64 fence_ns = flip_fence_ns.exchange(0, std::memory_order_relaxed);
+    const u64 draw_ns = Scheduler::submit_lock_draw_ns.exchange(0, std::memory_order_relaxed);
+    const u64 draw_n = Scheduler::submit_lock_draw_count.exchange(0, std::memory_order_relaxed);
+    const u64 other_ns = Scheduler::submit_lock_other_ns.exchange(0, std::memory_order_relaxed);
+    const u64 other_n = Scheduler::submit_lock_other_count.exchange(0, std::memory_order_relaxed);
+    // Per frame: the GetRenderFrame calls of the window (one per flip).
+    const auto per_frame = [frames](u64 ns) { return frames ? ns / 1e6 / frames : 0.0; };
+    char line[512];
+    std::snprintf(
+        line, sizeof(line),
+        "SOTC FLIP WAIT per frame (%llu frames in %.1f s): no free frame %.2f ms (%llu waits), "
+        "present_done fence %.2f ms, submit_mutex on the draw thread %.2f ms (%llu submits), "
+        "other threads %.2f ms (%llu)\n",
+        static_cast<unsigned long long>(frames), seconds, per_frame(free_ns),
+        static_cast<unsigned long long>(free_n), per_frame(fence_ns), per_frame(draw_ns),
+        static_cast<unsigned long long>(draw_n), per_frame(other_ns),
+        static_cast<unsigned long long>(other_n));
+    out += line;
+}
+
+void ReportPresent(std::string& out, double seconds) {
+    if (!SotcStats::kFpsLog) {
+        return;
+    }
+    const u64 waits = ring_waits.exchange(0, std::memory_order_relaxed);
+    const u64 lock_ns = present_lock_ns.exchange(0, std::memory_order_relaxed);
+    const u64 presents = present_lock_count.exchange(0, std::memory_order_relaxed);
+    const u64 under_ns = present_under_lock_ns.exchange(0, std::memory_order_relaxed);
+    const auto per_present = [presents](u64 ns) { return presents ? ns / 1e6 / presents : 0.0; };
+    char line[512];
+    std::snprintf(
+        line, sizeof(line),
+        "SOTC PRESENT (%.1f s): ring %u frames, %llu frame waits, %llu presents: present thread "
+        "blocked on submit_mutex %.2f ms per present, under it %.2f ms per present\n",
+        seconds, static_cast<unsigned>(present_ring.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(waits), static_cast<unsigned long long>(presents),
+        per_present(lock_ns), per_present(under_ns));
+    out += line;
 }
 
 void Presenter::SetExpectedGameSize(s32 width, s32 height) {

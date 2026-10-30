@@ -32,6 +32,12 @@
 #include "video_core/sotc_live.h"
 #include "video_core/sotc_ui_lang.h"
 #include "video_core/sotc_stats.h"
+#include "video_core/sotc_trace.h"  // sotc: SOTC_TRACE dump toast
+#include "sotc_lab_menu.h"          // sotc: SotC Lab (F2 menu)
+#include "../sotc/autopilot.h"     // sotc: SotC Lab (F4 waypoint)
+
+#include "../sotc/freecam.h"       // sotc: SotC Lab (F3 free-cam)
+#include "../sotc/lab_commands.h"  // sotc: SotC Lab (SOTC_SET_TRIGGER commands)
 
 extern Frontend::WindowSDL* g_window;
 static const Vulkan::Instance* s_instance = nullptr;
@@ -1200,7 +1206,7 @@ void UpdateTextInput(SDL_Window* window) {
     bool want = false;
     {
         std::scoped_lock lock{imgui_mutex};
-        want = initialized && menu_open && ImGui::GetIO().WantTextInput;
+        want = initialized && (menu_open || SotcLabMenu::Visible()) && ImGui::GetIO().WantTextInput;
     }
     if (want != SDL_TextInputActive(window)) {
         if (want) {
@@ -1260,6 +1266,49 @@ bool HandleEvent(const SDL_Event& event) {
         toast_text = SotcUi::T("F9: texturas recarregadas", "F9: textures reloaded");
         toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
         return true;
+    }
+    // sotc: SotC Lab (docs/sotc/LAB.md), only with SOTC_LAB=1: F2 menu, F3 free-cam, F4 route
+    // waypoint while flying; mouse motion and wheel steer the free camera while it flies.
+    if (SotcLabMenu::Available()) {
+        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F2) {
+            SotcLabMenu::Toggle();
+            return true;
+        }
+        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F3) {
+            // The free camera runs on the engine's debug camera and console commands (freecam.cpp).
+            const bool on = !SotcFreecam::Active();
+            if (!SotcFreecam::SetActive(on) && on) {
+                toast_text = SotcUi::T("Câmera livre indisponível (comandos do motor não encontrados)",
+                                       "Free camera unavailable (engine commands not found)");
+            } else {
+                toast_text = on ? SotcUi::T("F3: câmera livre ligada", "F3: free camera on")
+                                : SotcUi::T("F3: câmera livre desligada", "F3: free camera off");
+            }
+            toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
+            return true;
+        }
+        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_F4 &&
+            SotcFreecam::Active()) {
+            SotcAutopilot::AddWaypoint(SotcFreecam::Get().cam);
+            toast_text = SotcUi::T("F4: ponto de rota adicionado", "F4: route waypoint added");
+            toast_until_ms.store(NowMs() + 1500, std::memory_order_relaxed);
+            return true;
+        }
+        // G while flying: free-cam ends with Wander left where the camera is (teleport).
+        if (event.type == SDL_EVENT_KEY_DOWN && !event.key.repeat && event.key.key == SDLK_G &&
+            SotcFreecam::Active() && !SotcLabMenu::Visible() && !menu_open) {
+            SotcFreecam::LeaveHere();
+            toast_text = SotcUi::T("G: Wander deixado aqui", "G: Wander left here");
+            toast_until_ms.store(NowMs() + 1500, std::memory_order_relaxed);
+            return true;
+        }
+        if (SotcFreecam::Active() && !SotcLabMenu::Visible() && !menu_open) {
+            if (event.type == SDL_EVENT_MOUSE_MOTION) {
+                SotcFreecam::FeedMouse(event.motion.xrel, event.motion.yrel, 0.0f);
+            } else if (event.type == SDL_EVENT_MOUSE_WHEEL) {
+                SotcFreecam::FeedMouse(0.0f, 0.0f, event.wheel.y);
+            }
+        }
     }
     // sotc: F10 shows or hides the performance overlay.
     if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F10 && !event.key.repeat) {
@@ -1389,6 +1438,8 @@ bool HandleEvent(const SDL_Event& event) {
         }
     }
     const bool is_open = menu_open;
+    // sotc: the SotC Lab window (F2) also takes keyboard and mouse input while it is shown.
+    const bool feed = is_open || SotcLabMenu::Visible();
     switch (event.type) {
     case SDL_EVENT_KEY_DOWN:
     case SDL_EVENT_KEY_UP: {
@@ -1399,7 +1450,12 @@ bool HandleEvent(const SDL_Event& event) {
             SetOpen(toggle_key ? !is_open : false);
             return true;
         }
-        if (!is_open) {
+        if (down && !event.key.repeat && !is_open && event.key.key == SDLK_ESCAPE &&
+            SotcLabMenu::Visible()) {
+            SotcLabMenu::Toggle(); // sotc: Esc closes the SotC Lab window
+            return true;
+        }
+        if (!feed) {
             return false;
         }
         io.AddKeyEvent(ImGuiMod_Ctrl, (event.key.mod & SDL_KMOD_CTRL) != 0);
@@ -1423,7 +1479,7 @@ bool HandleEvent(const SDL_Event& event) {
             SetOpen(!is_open);
             return true;
         }
-        if (!is_open) {
+        if (!feed) {
             return false;
         }
         if (const ImGuiKey key = KeyFromGamepad(button); key != ImGuiKey_None) {
@@ -1434,14 +1490,14 @@ bool HandleEvent(const SDL_Event& event) {
     case SDL_EVENT_TEXT_INPUT: {
         // Typed characters (Ctrl+click on a slider, a text field): key events alone erase but
         // do not type. SDL sends them while text input is on (UpdateTextInput).
-        if (!is_open) {
+        if (!feed) {
             return false;
         }
         io.AddInputCharactersUTF8(event.text.text);
         return true;
     }
     case SDL_EVENT_MOUSE_MOTION: {
-        if (!is_open) {
+        if (!feed) {
             return false;
         }
         const float density = PixelDensity(event.motion.windowID);
@@ -1450,7 +1506,7 @@ bool HandleEvent(const SDL_Event& event) {
     }
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
     case SDL_EVENT_MOUSE_BUTTON_UP: {
-        if (!is_open) {
+        if (!feed) {
             return false;
         }
         const int button = event.button.button == SDL_BUTTON_LEFT    ? 0
@@ -1463,7 +1519,7 @@ bool HandleEvent(const SDL_Event& event) {
         return true;
     }
     case SDL_EVENT_MOUSE_WHEEL:
-        if (!is_open) {
+        if (!feed) {
             return false;
         }
         io.AddMouseWheelEvent(event.wheel.x, event.wheel.y);
@@ -1496,6 +1552,7 @@ bool TriggerPending() {
 
 bool Visible() {
     return initialized && (menu_open || text_entry_active || list_active || OverlayOn() ||
+                           SotcLabMenu::Visible() ||
                            ToastShown() || LoadingShown() || TriggerPending() ||
                            upscaler_label.load(std::memory_order_relaxed));
 }
@@ -1505,7 +1562,7 @@ void SetUpscalerLabel(const char* label) {
 }
 
 bool CapturesInput() {
-    return menu_open || text_entry_active || list_active;
+    return menu_open || text_entry_active || list_active || SotcLabMenu::Visible();
 }
 
 bool OpenSaveList(const std::string& title, const std::vector<std::string>& items, int focus,
@@ -1595,6 +1652,29 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
         toast_text = FpsModeName(fps_mode);
         toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
     }
+    // sotc: SOTC_TRACE: a finished dump shows a toast for 4 s. LastDump is polled at most every
+    // 250 ms; the toast shows when the dump serial changed (ToastShown keeps Visible() true).
+    if (SotcTrace::kOn) {
+        static long long next_poll_ms = 0;
+        static uint64_t shown_serial = 0;
+        if (const long long now_ms = NowMs(); now_ms >= next_poll_ms) {
+            next_poll_ms = now_ms + 250;
+            const SotcTrace::DumpInfo dump = SotcTrace::LastDump();
+            if (dump.serial != shown_serial) {
+                shown_serial = dump.serial;
+                if (dump.serial != 0) {
+                    char num[96];
+                    std::snprintf(num, sizeof num, "%llu, %.0f ms",
+                                  static_cast<unsigned long long>(dump.frame), dump.worst_ms);
+                    const std::string file = std::filesystem::path(dump.path).filename().string();
+                    std::scoped_lock lock{imgui_mutex};
+                    toast_text = std::string(SotcUi::T("Trace: quadro ", "Trace: frame ")) + num +
+                                 " \xE2\x86\x92 " + file;
+                    toast_until_ms.store(now_ms + 4000, std::memory_order_relaxed);
+                }
+            }
+        }
+    }
     if (!Visible()) {
         return;
     }
@@ -1645,7 +1725,7 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
     static const char* set_trigger = std::getenv("SOTC_SET_TRIGGER");
     if (set_trigger) {
         if (std::FILE* f = std::fopen(set_trigger, "rb")) {
-            char line[32] = {};
+            char line[256] = {}; // sotc: room for SotC Lab command lines
             std::fread(line, 1, sizeof(line) - 1, f);
             std::fclose(f);
             std::remove(set_trigger);
@@ -1660,6 +1740,11 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
                 SetUpscaler(v == 'f' ? 0 : 1);
             } else if (key == "rcas") {
                 SetRcas(v == 'h' ? 0 : v == 'm' ? 1 : v == 'l' ? 2 : 3);
+            } else if (SotcLab::Enabled()) {
+                // sotc: any other line is a SotC Lab command (lab_commands.h), e.g. "boss 3".
+                std::string cmd = text.substr(0, text.find_first_of("\r\n"));
+                std::fprintf(stderr, "SOTC SET: %s -> %s\n", cmd.c_str(),
+                             SotcLab::Execute(cmd).c_str());
             }
             std::fprintf(stderr, "SOTC SET: %s\n", line);
         }
@@ -1667,6 +1752,7 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
     if (menu_open) {
         Menu();
     }
+    SotcLabMenu::Draw(); // sotc: SotC Lab (F2); draws nothing when hidden
     float fps_bottom = 0.0f;
     if (OverlayOn() && !menu_open) {
         fps_bottom = FpsCounter();

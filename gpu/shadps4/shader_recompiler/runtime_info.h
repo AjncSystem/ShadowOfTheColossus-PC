@@ -35,6 +35,59 @@ enum class SwStage : u32 {
 };
 
 constexpr u32 MaxStageTypes = static_cast<u32>(SwStage::NumLogicalStages);
+
+/// sotc: SOTC_BINDLESS_SAMP as the instance settled it (env and device features), set once by
+/// Instance::CreateDevice before any shader is compiled. Kept out of Profile on purpose: the
+/// profile blob is compared by size with the saved cache, so a new field would discard every
+/// cache, switch-off ones included.
+void SetBindlessSamplersEnabled(bool enabled);
+bool BindlessSamplersEnabled();
+
+/// sotc: SOTC_BINDLESS_SAMP: the sampler slots of each stage, out of NUM_BINDLESS_SAMPLER_SLOTS
+/// (resource.h). The slots are fixed per stage, so a shader needs no base from its pipeline.
+/// A stage with more samplers than its count keeps classic descriptors in set 0.
+struct BindlessSamplerRange {
+    u32 base;
+    u32 count;
+};
+constexpr BindlessSamplerRange GetBindlessSamplerRange(SwStage stage) {
+    switch (stage) {
+    case SwStage::Fragment:
+        return {0, 12};
+    case SwStage::Vertex:
+        return {12, 8};
+    case SwStage::Geometry:
+        return {20, 4};
+    case SwStage::TessellationControl:
+        return {24, 6};
+    case SwStage::TessellationEval:
+        return {30, 6};
+    default: // Compute is alone in its pipeline
+        return {0, 12};
+    }
+}
+
+/// sotc: SOTC_STAGE_BINDINGS: the descriptor set of each graphics stage. The numbers are fixed per
+/// stage (not per pipeline), so a stage keeps its set whichever other stages the pipeline has.
+/// Compute keeps set 0.
+constexpr u32 MaxStageDescriptorSets = 5;
+constexpr u32 StageDescriptorSet(SwStage stage) {
+    switch (stage) {
+    case SwStage::Fragment:
+        return 0;
+    case SwStage::Vertex:
+        return 1;
+    case SwStage::Geometry:
+        return 2;
+    case SwStage::TessellationControl:
+        return 3;
+    case SwStage::TessellationEval:
+        return 4;
+    default:
+        return 0;
+    }
+}
+
 constexpr auto MaxEmulatedClipDistances = 4u;
 
 constexpr HwStage StageFromIndex(size_t index) noexcept {

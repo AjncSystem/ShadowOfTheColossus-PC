@@ -2,12 +2,19 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
+#include <bit>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <span>
 #include <vector>
 #include "core/memory.h"
 #include "shader_recompiler/info.h"
 #include "video_core/sotc_stats.h"
+#include "video_core/sotc_shadow_cull.h" // sotc: SOTC_HLE_SHADOW_CULL
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
@@ -17,6 +24,143 @@ extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
 namespace Vulkan {
 
 static constexpr u64 COPY_SHADER_HASH = 0xfefebf9f;
+
+// sotc: SOTC_HLE_SKIP (off by default). 1: the copy shader marks the GPU-written destination of
+// each batch once per merged run (MergeMarkRuns) instead of once per copy. 2: the original
+// per-copy marks are made (they are the result); the merged runs are checked against the copies
+// (MarkRunsMatch) and, after the marks, for being fully GPU-written (IsWrittenRangeSynced); a
+// difference counts as a verify mismatch. The replicate skip is not built:
+// skipping an unchanged replicate needs an exact "unchanged since" signal for guest CPU writes
+// and for GPU writes to its source, control words and destination. Guest CPU writes are seen
+// only through the global mem_epoch, which hot pages (fault grace) bypass, and the per-range GPU
+// write stamps (Rasterizer::write_stamps) are fed only with SOTC_BIND_CACHE_FRAME on, so neither
+// is exact by itself. ExecuteReplicateShaderHLE already compares the guest bytes, which is exact.
+// Counters print every 5 s to stderr (the window's values, then reset).
+namespace {
+
+const int kHleSkipMode = [] {
+    const char* v = std::getenv("SOTC_HLE_SKIP");
+    if (v && v[0] == '1') {
+        return 1;
+    }
+    if (v && v[0] == '2') {
+        return 2;
+    }
+    return 0;
+}();
+
+struct HleSkipStats {
+    std::atomic<u64> runs{0};           ///< replicate dispatches seen
+    std::atomic<u64> noop{0};           ///< replicates that wrote nothing (already in place)
+    std::atomic<u64> merged{0};         ///< per-copy marks saved by coalescing (mode 1)
+    std::atomic<u64> mismatches{0};     ///< mode 2: merged runs that differ from the marks made
+    std::atomic<std::int64_t> window_start_ns{0};
+};
+HleSkipStats hle_skip_stats;
+
+// Prints the counters of the last 5 s window and resets them. Called once per dispatch.
+void HleSkipTick() {
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+    auto start = hle_skip_stats.window_start_ns.load(std::memory_order_relaxed);
+    if (start == 0) {
+        hle_skip_stats.window_start_ns.store(now, std::memory_order_relaxed);
+        return;
+    }
+    constexpr std::int64_t Window = 5'000'000'000; // 5 s in ns
+    if (now - start < Window ||
+        !hle_skip_stats.window_start_ns.compare_exchange_strong(start, now,
+                                                                std::memory_order_relaxed)) {
+        return;
+    }
+    const u64 runs = hle_skip_stats.runs.exchange(0, std::memory_order_relaxed);
+    const u64 noop = hle_skip_stats.noop.exchange(0, std::memory_order_relaxed);
+    const u64 merged = hle_skip_stats.merged.exchange(0, std::memory_order_relaxed);
+    const u64 mismatches = hle_skip_stats.mismatches.exchange(0, std::memory_order_relaxed);
+    // No skip is built (see above): "skipped" is always 0.
+    std::fprintf(stderr,
+                 "SOTC HLE SKIP: runs %llu, skipped 0, already no-op %llu, marks merged %llu, "
+                 "verify mismatches %llu\n",
+                 static_cast<unsigned long long>(runs), static_cast<unsigned long long>(noop),
+                 static_cast<unsigned long long>(merged),
+                 static_cast<unsigned long long>(mismatches));
+}
+
+// One destination byte interval [lo, hi) of a copy batch, relative to the destination base.
+struct MarkRun {
+    vk::DeviceSize lo;
+    vk::DeviceSize hi;
+};
+
+// The pieces (dstOffset, size) sorted by start, with the ones that overlap or touch merged: the
+// result is sorted and disjoint, and its union is the union of the pieces.
+void MergeMarkRuns(std::span<const vk::BufferCopy> pieces, std::vector<MarkRun>& runs) {
+    runs.clear();
+    for (const auto& piece : pieces) {
+        runs.push_back({piece.dstOffset, piece.dstOffset + piece.size});
+    }
+    std::sort(runs.begin(), runs.end(),
+              [](const MarkRun& a, const MarkRun& b) { return a.lo < b.lo; });
+    std::size_t out = 0;
+    for (std::size_t i = 1; i < runs.size(); ++i) {
+        if (runs[i].lo <= runs[out].hi) {
+            runs[out].hi = std::max(runs[out].hi, runs[i].hi);
+        } else {
+            runs[++out] = runs[i];
+        }
+    }
+    if (!runs.empty()) {
+        runs.resize(out + 1);
+    }
+}
+
+// Verify (mode 2). True when `runs` is exactly the union of `pieces`: every piece lies inside one
+// run, the runs are sorted and disjoint, and their total length equals the length of the union
+// of the pieces, which a separate sweep computes. Pieces inside the runs make the runs a superset
+// of the union, and equal lengths then leave no extra byte.
+bool MarkRunsMatch(std::span<const vk::BufferCopy> pieces, const std::vector<MarkRun>& runs) {
+    for (const auto& piece : pieces) {
+        const vk::DeviceSize lo = piece.dstOffset;
+        const vk::DeviceSize hi = piece.dstOffset + piece.size;
+        auto it = std::upper_bound(runs.begin(), runs.end(), lo,
+                                   [](vk::DeviceSize v, const MarkRun& r) { return v < r.lo; });
+        if (it == runs.begin()) {
+            return false;
+        }
+        --it;
+        if (hi > it->hi) {
+            return false;
+        }
+    }
+    for (std::size_t i = 1; i < runs.size(); ++i) {
+        if (runs[i].lo <= runs[i - 1].hi) { // disjoint and not touching (MergeMarkRuns merges those)
+            return false;
+        }
+    }
+    static std::vector<MarkRun> sorted;
+    sorted.clear();
+    for (const auto& piece : pieces) {
+        sorted.push_back({piece.dstOffset, piece.dstOffset + piece.size});
+    }
+    std::sort(sorted.begin(), sorted.end(),
+              [](const MarkRun& a, const MarkRun& b) { return a.lo < b.lo; });
+    vk::DeviceSize union_len = 0;
+    vk::DeviceSize end = 0;
+    for (const auto& piece : sorted) {
+        if (piece.hi > end) {
+            union_len += piece.hi - std::max(piece.lo, end);
+            end = piece.hi;
+        }
+    }
+    vk::DeviceSize runs_len = 0;
+    for (const auto& run : runs) {
+        runs_len += run.hi - run.lo;
+    }
+    return runs_len == union_len;
+}
+
+} // namespace
 
 static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::ComputeProgram& cs_program,
                                  Rasterizer& rasterizer) {
@@ -49,6 +193,16 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
         const u32 local_src_offset = src_idx * buf_stride;
         const u32 local_size = (end + 1) * buf_stride;
         copies.emplace_back(local_src_offset, local_dst_offset, local_size);
+    }
+    // sotc: SOTC_BIND_CACHE_RANGES: the copies write the arena (no BindResources for this
+    // dispatch): drop the cached binds reading their bounds.
+    if (SotcStats::kBindCacheRanges && !copies.empty()) {
+        vk::DeviceSize lo = ~vk::DeviceSize{0}, hi = 0;
+        for (const auto& copy : copies) {
+            lo = std::min(lo, copy.dstOffset);
+            hi = std::max(hi, copy.dstOffset + copy.size);
+        }
+        rasterizer.BindCacheNoteWrite(dst_buf_sharp.base_address + lo, hi - lo);
     }
 
     static constexpr vk::DeviceSize MaxDistanceForMerge = 64_MB;
@@ -98,9 +252,45 @@ static bool ExecuteCopyShaderHLE(const Shader::Info& info, const AmdGpu::Compute
             dst_buf_sharp.base_address + dst_offset_min, dst_offset_max - dst_offset_min,
             mark_whole);
         if (!mark_whole) {
-            for (u32 i = batch_start; i < batch_end; ++i) {
-                buffer_cache.ObtainBuffer(dst_buf_sharp.base_address + copies[i].dstOffset,
-                                          static_cast<u32>(copies[i].size), true);
+            const auto pieces = std::span{copies}.subspan(batch_start, batch_end - batch_start);
+            // sotc: SOTC_HLE_SKIP. Mode 0: one mark per copy (unchanged). Mode 1: one mark per
+            // merged run (the union of the copies, so the same GPU-written bytes). Mode 2: the
+            // per-copy marks, as in mode 0, then the merged runs are checked (see the top).
+            if (kHleSkipMode == 0) {
+                for (u32 i = batch_start; i < batch_end; ++i) {
+                    (void)buffer_cache.ObtainBuffer(
+                        dst_buf_sharp.base_address + copies[i].dstOffset,
+                        static_cast<u32>(copies[i].size), true);
+                }
+            } else {
+                static std::vector<MarkRun> mark_runs;
+                MergeMarkRuns(pieces, mark_runs);
+                if (kHleSkipMode == 2) {
+                    if (!MarkRunsMatch(pieces, mark_runs)) {
+                        hle_skip_stats.mismatches.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    for (u32 i = batch_start; i < batch_end; ++i) {
+                        (void)buffer_cache.ObtainBuffer(
+                            dst_buf_sharp.base_address + copies[i].dstOffset,
+                            static_cast<u32>(copies[i].size), true);
+                    }
+                    // The per-copy marks must leave every merged run fully marked, which is what
+                    // mode 1's one mark per run produces. Hot pages (fault grace) keep their CPU
+                    // bit and can count here although nothing is wrong.
+                    for (const auto& run : mark_runs) {
+                        if (!buffer_cache.IsWrittenRangeSynced(dst_buf_sharp.base_address + run.lo,
+                                                               run.hi - run.lo)) {
+                            hle_skip_stats.mismatches.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                } else {
+                    hle_skip_stats.merged.fetch_add(pieces.size() - mark_runs.size(),
+                                                    std::memory_order_relaxed);
+                    for (const auto& run : mark_runs) {
+                        (void)buffer_cache.ObtainBuffer(dst_buf_sharp.base_address + run.lo,
+                                                        static_cast<u32>(run.hi - run.lo), true);
+                    }
+                }
             }
         }
 
@@ -160,8 +350,9 @@ struct TableData {
     }
 };
 
+// `wrote` is set when bytes were written (false: every page already held the table).
 static bool ReplaceChangedPages(Rasterizer& rasterizer, VAddr address, const u8* current,
-                                const TableData& data, u64 size) {
+                                const TableData& data, u64 size, bool& wrote) {
     auto& buffer_cache = rasterizer.GetBufferCache();
     VAddr run_start = 0;
     VAddr run_end = 0; // the pending run of changed pages, empty while run_end == run_start
@@ -176,6 +367,7 @@ static bool ReplaceChangedPages(Rasterizer& rasterizer, VAddr address, const u8*
                                                  run_size)) {
             return false;
         }
+        wrote = true;
         if (SotcStats::kCmdStats) {
             SotcStats::inv_hle.fetch_add(run_size, std::memory_order_relaxed);
         }
@@ -199,6 +391,16 @@ static bool ReplaceChangedPages(Rasterizer& rasterizer, VAddr address, const u8*
     return flush();
 }
 
+// sotc: SOTC_TRACE. One "hle fill" instant per whole-table replace: a = bytes, b = address,
+// aux = BufferCache::FillGpuPath, flags = log2 of the pattern period in bytes (capped at 0xffff).
+static void TraceHleFill(VAddr address, u64 size, u64 period, u32 path) {
+    if (SotcTrace::kOn) {
+        const uint64_t now = SotcTrace::Now();
+        const auto log2 = static_cast<u16>(period ? std::bit_width(period) - 1 : 0);
+        SotcTrace::PushEvent(SotcTrace::EvInstant, "hle fill", now, now, size, address, path, log2);
+    }
+}
+
 // The whole table: the pattern of src_count elements, repeated (no division per element).
 static std::vector<u32> data;
 static void BuildTable(const u32* source, u64 src_count, u64 count) {
@@ -215,7 +417,7 @@ static void BuildTable(const u32* source, u64 src_count, u64 count) {
 
 static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
                                       const AmdGpu::ComputeProgram& cs_program,
-                                      Rasterizer& rasterizer) {
+                                      Rasterizer& rasterizer, bool& wrote) {
     static const bool enabled = [] {
         const char* v = std::getenv("SOTC_FILL_HLE");
         return !v || v[0] != '0';
@@ -296,7 +498,7 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
                 table.period = period;
             }
             return ReplaceChangedPages(rasterizer, address, run + (address - run_start), table,
-                                       count * 4);
+                                       count * 4, wrote);
         }
         BuildTable(source, src_count, count);
         if (in_run) {
@@ -305,7 +507,7 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
             if (!same && page_replace) {
                 return ReplaceChangedPages(rasterizer, address, current,
                                            TableData{reinterpret_cast<const u8*>(data.data())},
-                                           count * 4);
+                                           count * 4, wrote);
             }
         } else {
             static std::vector<u32> current;
@@ -321,9 +523,42 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
     } else {
         BuildTable(source, src_count, count);
     }
+    // sotc: SOTC_FILL_HLE_GPU (on by default since 30 Oct 2026; =0 turns it off). A destination resident in one arena gets the
+    // table from the GPU (fill, doubling copies or a copy from the source; FillGpuPath) instead of
+    // being marked CPU-written, which the next DMA sweep or bind copied through staging again
+    // (one 8 MiB table at 0x1068b00000, ~33 times per area load). The backing is still written.
+    static const bool fill_gpu = [] {
+        const char* v = std::getenv("SOTC_FILL_HLE_GPU");
+        return !v || v[0] != '0';
+    }();
+    const u64 table_bytes = count * 4;
+    const u64 period = src_count * 4;
+    if (fill_gpu) {
+        const bool overlap = src.base_address < address + table_bytes &&
+                             address < src.base_address + period;
+        u32 path = 0;
+        if (!buffer_cache.TryFillThroughFromCpu(address, data.data(), table_bytes, period,
+                                                overlap ? 0 : src.base_address, path)) {
+            return false;
+        }
+        TraceHleFill(address, table_bytes, period, path);
+        wrote = true;
+        if (SotcStats::kCmdStats) {
+            SotcStats::inv_hle.fetch_add(table_bytes, std::memory_order_relaxed);
+        }
+        if (path == VideoCore::BufferCache::FillPathReplace) {
+            rasterizer.InvalidateMemory(address, table_bytes);
+        } else {
+            // As ReplaceChangedPages: the arena already holds the table.
+            rasterizer.GetTextureCache().InvalidateMemory(address, table_bytes);
+        }
+        return true;
+    }
     if (!buffer_cache.TryReplaceFromCpu(address, data.data(), count * 4)) {
         return false;
     }
+    TraceHleFill(address, table_bytes, period, VideoCore::BufferCache::FillPathReplace);
+    wrote = true;
     if (SotcStats::kCmdStats) SotcStats::inv_hle.fetch_add(count * 4, std::memory_order_relaxed);
     rasterizer.InvalidateMemory(address, count * 4);
     return true;
@@ -331,11 +566,34 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
 
 bool ExecuteShaderHLE(const Shader::Info& info, const AmdGpu::Regs& regs,
                       const AmdGpu::ComputeProgram& cs_program, Rasterizer& rasterizer) {
+    if (kHleSkipMode != 0) {
+        HleSkipTick(); // sotc: SOTC_HLE_SKIP counters; every compute dispatch comes here
+    }
     switch (info.pgm_hash) {
     case COPY_SHADER_HASH:
         return ExecuteCopyShaderHLE(info, cs_program, rasterizer);
-    case REPLICATE_SHADER_HASH:
-        return ExecuteReplicateShaderHLE(info, cs_program, rasterizer);
+    case REPLICATE_SHADER_HASH: {
+        bool wrote = false;
+        if (kHleSkipMode != 0) {
+            hle_skip_stats.runs.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (!ExecuteReplicateShaderHLE(info, cs_program, rasterizer, wrote)) {
+            return false;
+        }
+        if (kHleSkipMode != 0 && !wrote) {
+            hle_skip_stats.noop.fetch_add(1, std::memory_order_relaxed);
+        }
+        // sotc: SOTC_BIND_CACHE_RANGES: the fill writes the destination from the CPU, and the
+        // write-through path into the arena as well, without marking it CPU-modified: drop the
+        // cached binds reading any of it (the destination buffer bounds every write).
+        if (SotcStats::kBindCacheRanges && info.buffers.size() >= 3) {
+            const auto dst = info.buffers[2].GetSharp(info);
+            rasterizer.BindCacheNoteWrite(dst.base_address, dst.GetSize());
+        }
+        return true;
+    }
+    case SotcShadowCull::kProgramHash: // sotc: SOTC_HLE_SHADOW_CULL=1 (sotc_shadow_cull.cpp)
+        return SotcStats::kShadowCullHle && SotcShadowCull::Execute(info, cs_program, rasterizer);
     default:
         return false;
     }

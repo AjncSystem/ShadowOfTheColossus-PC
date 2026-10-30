@@ -6,6 +6,7 @@
 #define _GNU_SOURCE
 #include "runtime.h"
 #include "runtime_event.h"
+#include "trace.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,8 +63,10 @@ static uint64_t read_clock_ns(void) {
     clock_gettime(CLOCK_MONOTONIC,&ts);
     return (uint64_t)ts.tv_sec*1000000000u+(uint64_t)ts.tv_nsec;
 }
-#define TIMED_READ(expr) ({ uint64_t t0_=read_clock_ns(); ssize_t r_=(expr); \
-    __atomic_add_fetch(&read_ns,read_clock_ns()-t0_,__ATOMIC_RELAXED); r_; })
+/* sotc: also a SOTC_TRACE span (a = bytes read) */
+#define TIMED_READ(expr) ({ uint64_t t0_=read_clock_ns(); const uint64_t tr_=trace_now(); ssize_t r_=(expr); \
+    __atomic_add_fetch(&read_ns,read_clock_ns()-t0_,__ATOMIC_RELAXED); \
+    trace_span("file read",tr_,(uint64_t)(r_>0 ? r_ : 0),0); r_; })
 uint64_t runtime_file_read_ns_take(void) { return __atomic_exchange_n(&read_ns,0,__ATOMIC_RELAXED); }
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 
@@ -413,6 +416,9 @@ static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
  * the texture cache then drops its unused images (bbgpu_request_texture_flush, sotc_stats.h:
  * stale images over reused texture memory, green blocks). SOTC_LOAD_FLUSH=0 turns it off. */
 void bbgpu_request_texture_flush(void) __attribute__((weak));
+/* sotc: SotC Lab (gpu/sotc/engine_cmd.cpp) reads the game's console replies ("Camera Position: ...")
+ * from its stdout. Weak, so the C tests link without the GPU library. */
+void bbgpu_engine_output(const void *buffer,uint64_t size) __attribute__((weak));
 static void note_game_load(const void *buffer,uint64_t size) {
     static int on=-1;
     if (on<0) { const char *v=getenv("SOTC_LOAD_FLUSH"); on=!v || v[0]!='0'; }
@@ -432,7 +438,10 @@ static void note_game_load(const void *buffer,uint64_t size) {
 static int64_t do_write(int fd,const void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
-    if (fd==1 || fd==2) note_game_load(buffer,size);
+    if (fd==1 || fd==2) {
+        note_game_load(buffer,size);
+        if (bbgpu_engine_output) bbgpu_engine_output(buffer,size); /* sotc: SotC Lab engine replies */
+    }
     ssize_t n=host_write(h,buffer,size);
     if (n<0) return -errno;
     __atomic_add_fetch(&writes,1,__ATOMIC_RELAXED);

@@ -108,4 +108,116 @@ Sampler::Sampler(const Vulkan::Instance& instance, const AmdGpu::Sampler& sample
 
 Sampler::~Sampler() = default;
 
+// sotc: SOTC_BINDLESS_SAMP. Off unless the instance enabled the descriptor indexing features.
+BindlessSamplers::BindlessSamplers(const Vulkan::Instance& instance_) : instance{instance_} {
+    enabled = instance.IsBindlessSamplersEnabled();
+    if (!enabled) {
+        return;
+    }
+    const auto device = instance.GetDevice();
+
+    // Samplers of the heap are read by any stage, so the layout is visible to all of them.
+    const vk::DescriptorSetLayoutBinding binding{
+        .binding = 0,
+        .descriptorType = vk::DescriptorType::eSampler,
+        .descriptorCount = Capacity,
+        .stageFlags = vk::ShaderStageFlagBits::eAll,
+    };
+    const vk::DescriptorBindingFlags binding_flags =
+        vk::DescriptorBindingFlagBits::ePartiallyBound |
+        vk::DescriptorBindingFlagBits::eUpdateAfterBind |
+        // sotc: new samplers are written while earlier submits using the set are pending.
+        vk::DescriptorBindingFlagBits::eUpdateUnusedWhilePending;
+    const vk::DescriptorSetLayoutBindingFlagsCreateInfo flags_info{
+        .bindingCount = 1,
+        .pBindingFlags = &binding_flags,
+    };
+    const vk::DescriptorSetLayoutCreateInfo layout_info{
+        .pNext = &flags_info,
+        .flags = vk::DescriptorSetLayoutCreateFlagBits::eUpdateAfterBindPool,
+        .bindingCount = 1,
+        .pBindings = &binding,
+    };
+    auto [layout_result, new_layout] = device.createDescriptorSetLayoutUnique(layout_info);
+    ASSERT_MSG(layout_result == vk::Result::eSuccess, "Bindless sampler layout: {}",
+               vk::to_string(layout_result));
+    layout = std::move(new_layout);
+
+    const vk::DescriptorPoolSize pool_size{vk::DescriptorType::eSampler, Capacity};
+    const vk::DescriptorPoolCreateInfo pool_info{
+        .flags = vk::DescriptorPoolCreateFlagBits::eUpdateAfterBind,
+        .maxSets = 1,
+        .poolSizeCount = 1,
+        .pPoolSizes = &pool_size,
+    };
+    auto [pool_result, new_pool] = device.createDescriptorPoolUnique(pool_info);
+    ASSERT_MSG(pool_result == vk::Result::eSuccess, "Bindless sampler pool: {}",
+               vk::to_string(pool_result));
+    pool = std::move(new_pool);
+
+    const vk::DescriptorSetAllocateInfo alloc_info{
+        .descriptorPool = *pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &*layout,
+    };
+    auto [alloc_result, sets] = device.allocateDescriptorSets(alloc_info);
+    ASSERT_MSG(alloc_result == vk::Result::eSuccess, "Bindless sampler set: {}",
+               vk::to_string(alloc_result));
+    set = sets.front();
+
+    // Slot 0: linear, repeat. Pipelines index it when the heap is full.
+    const vk::SamplerCreateInfo default_info{
+        .magFilter = vk::Filter::eLinear,
+        .minFilter = vk::Filter::eLinear,
+        .mipmapMode = vk::SamplerMipmapMode::eLinear,
+        .addressModeU = vk::SamplerAddressMode::eRepeat,
+        .addressModeV = vk::SamplerAddressMode::eRepeat,
+        .addressModeW = vk::SamplerAddressMode::eRepeat,
+        .maxLod = VK_LOD_CLAMP_NONE,
+    };
+    auto [sampler_result, new_default] = device.createSamplerUnique(default_info);
+    ASSERT_MSG(sampler_result == vk::Result::eSuccess, "Default sampler: {}",
+               vk::to_string(sampler_result));
+    default_sampler = std::move(new_default);
+    Write(0, *default_sampler);
+    // Slot 1: the same with depth compare (LessOrEqual), for depth samplers when the heap is full.
+    vk::SamplerCreateInfo compare_info = default_info;
+    compare_info.compareEnable = vk::True;
+    compare_info.compareOp = vk::CompareOp::eLessOrEqual;
+    auto [compare_result, new_compare] = device.createSamplerUnique(compare_info);
+    ASSERT_MSG(compare_result == vk::Result::eSuccess, "Default compare sampler: {}",
+               vk::to_string(compare_result));
+    default_compare_sampler = std::move(new_compare);
+    Write(1, *default_compare_sampler);
+    LOG_INFO(Render_Vulkan, "Bindless sampler heap: {} slots", Capacity);
+}
+
+BindlessSamplers::~BindlessSamplers() = default;
+
+u32 BindlessSamplers::Allocate(vk::Sampler sampler) {
+    if (next_slot >= Capacity || next_slot >= MaxAllocated) {
+        if (!logged_full) {
+            logged_full = true;
+            LOG_WARNING(Render_Vulkan, "Bindless sampler heap full: new samplers use the defaults");
+        }
+        return NoSlot;
+    }
+    const u32 slot = next_slot++;
+    Write(slot, sampler);
+    return slot;
+}
+
+void BindlessSamplers::Write(u32 slot, vk::Sampler sampler) {
+    const vk::DescriptorImageInfo info{sampler, {}, vk::ImageLayout::eUndefined};
+    const vk::WriteDescriptorSet write{
+        .dstSet = set,
+        .dstBinding = 0,
+        .dstArrayElement = slot,
+        .descriptorCount = 1,
+        .descriptorType = vk::DescriptorType::eSampler,
+        .pImageInfo = &info,
+    };
+    instance.GetDevice().updateDescriptorSets(write, {});
+}
+
 } // namespace VideoCore

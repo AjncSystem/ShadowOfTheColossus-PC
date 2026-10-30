@@ -4,6 +4,9 @@
 #include "gnm_error.h"
 #include "gnmdriver.h"
 
+#include <algorithm>
+#include <cstdlib>
+
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
@@ -23,6 +26,9 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/sotc_stats.h" // sotc: SOTC_FPS submit gate accounting
+#include "video_core/sotc_trace.h"  // sotc: SOTC_TRACE
+#include "sotc_guest_caller.h"  // sotc: SOTC_GUEST_CALLER
 
 extern Frontend::WindowSDL* g_window;
 std::unique_ptr<Vulkan::Presenter> presenter;
@@ -88,6 +94,106 @@ static void WaitGpuIdle() {
     HLE_TRACE;
     std::unique_lock lock{m_wait_idle};
     cv_lock.wait(lock, [] { return submission_lock == 0; });
+}
+
+// sotc: SOTC_CP_AHEAD=1 (default off). WaitGpuIdle() above returns at once unless
+// submission_lock is set, which sceGnmSubmitDone does when the GPU is not idle; it is cleared by
+// the GpuIdle IRQ, which the command processor raises after the draw thread ran everything queued.
+// With the switch on, a submit waiting on that flag only waits until the command processor has
+// parsed every submitted command buffer (num_submits == 0), and the draw thread may still run
+// the previous frame. Why that stays safe for the command buffers: the command processor reads
+// guest DCB memory lazily (SubmitGfx keeps a span; the copy only runs with BB_COPY_GPU_BUFFERS),
+// and the decrement of num_submits is what marks a buffer parsed, so the wait keeps the guest from
+// reusing a DCB before its parse. Risk, not checked: the draw thread still reads guest memory
+// (vertex, constant, texture data) after the wait, so a guest that rewrites that memory without
+// its own GPU fence can make the previous frame draw with the next frame's data. Submit-time
+// gating does not guard that; only the game's own fences do. Off by default for that reason.
+// sotc: note on =1: only the command buffer submits use it; sceGnmDingDong and sceGnmSubmitDone
+// still call WaitGpuIdle, and submission_lock stays set until the GpuIdle IRQ, so a frame whose
+// submits ring a compute doorbell (eboot 0x863800 submits its compute queues right after the
+// command buffers) or reaches SubmitDone still waits for the draw thread to finish the previous
+// frame.
+//
+// sotc: SOTC_CP_AHEAD=2 (default off): frame tickets instead of the GpuIdle IRQ.
+// What the gate does and does not protect (2026-10-28 analysis):
+// - Every CPU-visible sign of GPU progress is produced by the draw thread, in stream order, after
+//   it ran every earlier op: EOP/EOS/RELEASE_MEM labels and their interrupts, WRITE_DATA and DMA
+//   to memory, flip interrupts (liverpool.cpp; the closures copy their packets). An op reads its
+//   guest memory (vertex, index, constant, texture data, sharps) when the draw thread records it;
+//   the bytes go to staging then (SOTC_ASYNC_UPLOAD and SOTC_HOST_IMPORT take them at record time
+//   too, or hold guest writes behind their write fence). CPU writes after that are seen by the
+//   page tracking and uploaded again for later ops, in stream order. So a guest that rewrites or
+//   frees memory only after a label (or flip) that follows the GPU work reading it, which the PS4
+//   needs anyway since its GPU runs behind the CPU, can never change bytes a queued op still has
+//   to read, whatever this gate does. Early labels do not open that race: early means before the
+//   host GPU runs the work, not before the draw thread recorded it, and the host GPU only reads
+//   the recorded copies. The exceptions are CP-thread writes (PixelPipeStatDump's fake occlusion
+//   counters, the CE RAM dump, which drains the draw thread first); neither is a fence.
+// - The gate never ordered the game's CPU writes anyway: the game builds a frame's command buffers
+//   and constants in jobs before its first submit, while the draw thread still runs the previous
+//   frame. Only the thread calling the submit (KickoffSubmitJob, eboot 0xd07c0) is held, and with
+//   it whatever the game makes wait for that job. The old IRQ clears submission_lock at the first
+//   GpuIdle op the draw thread runs after SubmitDone, which may be one queued before the frame's
+//   last submit, so even "previous frame recorded" was not exact.
+// - What it does bound is how far the guest runs ahead: an unfenced double-buffered allocator
+//   (command buffers included) written two frames later stays correct only while the draw thread
+//   is at most one frame behind at the next frame's first submit. Such a game would break on a
+//   GPU-bound PS4 as well, but that was not checked by reverse engineering here.
+// Mode 2 keeps that bound, made exact and configurable: SubmitDone records a mark per frame
+// (Liverpool::PushFrameMark); once the command processor parsed every submit made before it, it
+// queues the frame's OnSubmit/Flush and a ticket op, and the draw thread publishes the frame as
+// recorded when it runs that op. A command buffer submit, a compute doorbell and SubmitDone wait
+// until all frames but the last SOTC_CP_AHEAD_FRAMES (default 1, 0..3) closed ones are recorded;
+// 0 is the old gate made exact (it still serializes). With BB_COPY_GPU_BUFFERS SubmitDone also
+// waits for the parse of every submit, since Liverpool::SubmitDone reuses the copy buffers.
+static u64 CpAheadFrames() {
+    static const u64 frames = [] {
+        const char* v = std::getenv("SOTC_CP_AHEAD_FRAMES");
+        return v ? static_cast<u64>(std::clamp(std::atoi(v), 0, 3)) : u64{1};
+    }();
+    return frames;
+}
+
+static void WaitSubmitGate() {
+    static const bool cp_ahead = Liverpool::CpAheadMode() == 1;
+    if (!cp_ahead) {
+        WaitGpuIdle();
+        return;
+    }
+    {
+        std::unique_lock lock{m_wait_idle};
+        if (submission_lock == 0) {
+            return;
+        }
+    }
+    liverpool->WaitCommandsConsumed();
+}
+
+// sotc: the submit gate of every site (SotcStats::gate_*: 0 command buffer submit, 1 compute
+// doorbell, 2 SubmitDone). Modes 0 and 1 run exactly what each site ran before; mode 2 waits on
+// the frame tickets. Called under m_submit_lock.
+static void GateWait(int site) {
+    const u64 start = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
+    if (Liverpool::CpAheadMode() == 2) {
+        const u64 marked = liverpool->FramesMarked();
+        const u64 lag = CpAheadFrames();
+        if (marked > lag) {
+            liverpool->WaitFramesRecorded(marked - lag);
+        }
+    } else if (site == 0) {
+        WaitSubmitGate();
+    } else {
+        WaitGpuIdle();
+    }
+    if (SotcStats::kFpsLog) {
+        const u64 ns = SotcStats::NowNs() - start;
+        SotcStats::gate_calls[site].fetch_add(1, std::memory_order_relaxed);
+        if (ns >= 5000) {
+            SotcStats::gate_waits[site].fetch_add(1, std::memory_order_relaxed);
+            SotcStats::gate_ns[site].fetch_add(ns, std::memory_order_relaxed);
+            SotcStats::GateStoreMax(SotcStats::gate_max_ns[site], ns);
+        }
+    }
 }
 
 // Write a special ending NOP packet with N DWs data block
@@ -299,7 +405,7 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
     }
 
     std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
+    GateWait(1); // sotc: SOTC_CP_AHEAD (WaitGpuIdle unless =2), SOTC_FPS accounting
 
     if (DebugState.ShouldPauseInSubmit()) {
         DebugState.PauseGuestThreads();
@@ -313,6 +419,9 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
     if (next_offs_dw == offs_dw) {
         return;
     }
+    // sotc: SOTC_FPS ring accounting / SOTC_ASC_RPTR=2: the dwords this doorbell hands over.
+    const u32 submitted_dw = next_offs_dw > offs_dw ? next_offs_dw - offs_dw
+                                                    : asc_queue.ring_size_dw - offs_dw + next_offs_dw;
 
     if (next_offs_dw < offs_dw && next_offs_dw != 0) {
         // For cases if a submission is split at the end of the ring buffer, we need to submit it in
@@ -361,6 +470,14 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
         });
     }
     liverpool->SubmitAsc(gnm_vqid, acb_span);
+    // sotc: SOTC_ASC_RPTR=2: SubmitAsc copied the ring dwords, so the whole ring is free again,
+    // as if the CP had fetched them at once (its read pointer only tells the guest which ring
+    // dwords it may overwrite; the game uses it for nothing else, eboot 0x85d3d0). The game then
+    // never spins in its ring-full retry loop (eboot 0x863a50) while the CP is busy elsewhere.
+    if (Liverpool::AscRptrMode() == 2) {
+        *asc_queue.read_addr = next_offs_dw % asc_queue.ring_size_dw;
+    }
+    liverpool->NoteAscDoorbell(vqid, next_offs_dw, submitted_dw); // sotc: SOTC_FPS
 }
 
 void PS4_SYSV_ABI sceGnmDingDongForWorkload(u32 gnm_vqid, u32 next_offs_dw, u64 workload_id) {
@@ -2258,6 +2375,8 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffers(u32 count, u32* dcb_gpu_addrs
 s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     u32 workload, u32 count, u32* dcb_gpu_addrs[], u32* dcb_sizes_in_bytes, u32* ccb_gpu_addrs[],
     u32* ccb_sizes_in_bytes, u32 vo_handle, u32 buf_idx, u32 flip_mode, s64 flip_arg) {
+    const SotcTrace::Scope sotc_trace{"gnm submit+flip", count,
+                                      SOTC_GUEST_CALLER()}; // sotc: guest caller (SOTC_TRACE_IMPORTS)
     LOG_DEBUG(Lib_GnmDriver, "called [buf = {}]", buf_idx);
 
     if (count != 0) {
@@ -2296,7 +2415,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     const auto size_dw = dcb_sizes_in_bytes[count - 1] / 4;
 
     std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
+    GateWait(0); // sotc: SOTC_CP_AHEAD, SOTC_FPS accounting
 
     const s32 patch_result =
         PatchFlipRequest(cmdbuf, size_dw, vo_handle, buf_idx, flip_mode, flip_arg, nullptr /*unk*/);
@@ -2314,6 +2433,8 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
                                                        const u32* ccb_gpu_addrs[],
                                                        u32* ccb_sizes_in_bytes) {
     HLE_TRACE;
+    const SotcTrace::Scope sotc_trace{"gnm submit", count,
+                                      SOTC_GUEST_CALLER()}; // sotc: guest caller (SOTC_TRACE_IMPORTS)
     LOG_DEBUG(Lib_GnmDriver, "called");
 
     if (!dcb_gpu_addrs || !dcb_sizes_in_bytes) {
@@ -2339,7 +2460,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
     }
 
     std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
+    GateWait(0); // sotc: SOTC_CP_AHEAD, SOTC_FPS accounting
 
     return PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
                          const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);
@@ -2354,11 +2475,28 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_gpu_addrs[
 
 s32 PS4_SYSV_ABI sceGnmSubmitDone() {
     HLE_TRACE;
+    const SotcTrace::Scope sotc_trace{"gnm submit done", 0,
+                                      SOTC_GUEST_CALLER()}; // sotc: guest caller (SOTC_TRACE_IMPORTS)
     LOG_DEBUG(Lib_GnmDriver, "called");
     std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
-    if (!liverpool->IsGpuIdle()) {
-        submission_lock = true;
+    GateWait(2); // sotc: SOTC_CP_AHEAD (WaitGpuIdle unless =2), SOTC_FPS accounting
+    if (Liverpool::CpAheadMode() != 2) {
+        if (!liverpool->IsGpuIdle()) {
+            submission_lock = true;
+        }
+    } else {
+        // sotc: SOTC_CP_AHEAD=2: the frame tickets replace submission_lock. Liverpool::SubmitDone
+        // reuses the command buffer copies from their start, so with BB_COPY_GPU_BUFFERS every
+        // copy must be parsed first (the old lock made the next submit wait for that).
+        if (EmulatorSettings.IsCopyGpuBuffers()) {
+            liverpool->WaitCommandsConsumed();
+        }
+        if (SotcStats::kFpsLog) {
+            const u64 lag = liverpool->FramesMarked() - liverpool->FramesRecorded();
+            SotcStats::gate_lag_sum.fetch_add(lag, std::memory_order_relaxed);
+            SotcStats::gate_lag_samples.fetch_add(1, std::memory_order_relaxed);
+            SotcStats::GateStoreMax(SotcStats::gate_lag_max, lag);
+        }
     }
     liverpool->SubmitDone();
     send_init_packet = true;

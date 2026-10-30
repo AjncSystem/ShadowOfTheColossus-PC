@@ -6,7 +6,10 @@
     python scripts/sotc_modes.py GAME --out out --modes af16,fps60 --cvars "r_motionBlurEnable=0 ..."
 
 Writes two files for the loader:
-  out/patches.bin  code patches (BBPATCH2, bb-probe --patches):
+  out/patches.bin  code patches (BBPATCH3, bb-probe --patches). Each patch family is one group
+                   (a code mode, the render size, the page allocator fix, the ProcessStats store), and
+                   every entry carries the bytes it expects; the loader applies a group only when all
+                   its entries find those bytes.
                    fps60  removes the game's 30 FPS cap (illusion's GoldHEN patch, the shadPS4
                           SotC fork's "SotC-Modes")
                    fps60game  the game's own 60 FPS target (PS4 Pro Performance mode): it asks for
@@ -18,7 +21,8 @@ Writes two files for the loader:
                    bb-probe --sotc-cmdline): cvars of the Bluepoint engine, e.g.
                    +r_motionBlurEnable=0. Modes that are only cvars:
                    af16   16x anisotropic filtering on every texture
-The original bytes are checked first: another game version gets neither file's changes.
+The original bytes are checked first: another game version gets neither file's changes. A mode
+whose bytes differ from the eboot's is skipped as a whole (its cvars too) and logged.
 """
 import argparse
 import os
@@ -78,6 +82,9 @@ CVAR_MODES = {
 # 0, and the tally drifts above the bitmap's real free count. With the bitmap empty and the tally
 # not 0, the scan found no bit and read bitmap[-1] (crash at 0x41a371). On a failed scan: tally 0,
 # then carve a chunk (0x41a1f1, needs eax 0) and scan again.
+# ParticleSystemPool::ProcessStats: `movl %ecx,(%rax,%rbx,4)` (time stored to pool+0x188[slot])
+# -> 3-byte nop (SOTC_HOOK_PSTATS, see main).
+PSTATS_STORE = (0x501ae4, bytes.fromhex('890c98'), bytes.fromhex('0f1f00'))
 POOL_FIX = (0x41a321, bytes.fromhex('eb34666666662e0f1f840000000000'),
             bytes.fromhex('41c7467400000000' '31c0' 'e9c1feffff'))
 # Above this many rendered pixels the larger render target pool pushes the game's free system
@@ -128,7 +135,8 @@ RENDER_SITES = [
 RT_POOL = 0x14280000
 # EU 1.01 / US 1.00: the command line lea and the fps60 site.
 VERSION_CHECKS = [(CMDLINE_LEA, bytes.fromhex('488d352debad00')), (0x01390090, bytes.fromhex('ff25a20567'))]
-CVAR = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*(=[-+.0-9A-Za-z_%]+)?$')  # NAME=VALUE or a flag such as nointro
+# NAME=VALUE, a flag such as nointro, or a command with arguments such as automate_loadfile(route_bossjump.txt)
+CVAR = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*(\([^\s()]*\))?(=[-+.0-9A-Za-z_%]+)?$')
 
 
 def image_bytes(elf, ph, vaddr, length):
@@ -137,6 +145,17 @@ def image_bytes(elf, ph, vaddr, length):
             offset = p['offset'] + vaddr - p['vaddr']
             return bytes(elf[offset:offset + length])
     return None
+
+
+def holds(elf, ph, address, expected):
+    """True when the eboot holds the expected bytes at the PS4 address."""
+    return image_bytes(elf, ph, address - BASE, len(expected)) == expected
+
+
+def patch_entry(address, expected, data):
+    """A patches.bin entry (image offset, expected bytes, new bytes). A new value shorter than the
+    expected bytes (fps60) leaves the tail alone, so the entry expects only the bytes it overwrites."""
+    return (address - BASE, expected[:len(data)], data)
 
 
 def title_id(game):
@@ -172,8 +191,9 @@ def render_pool(w, h):
     return (pool + 0xffff) & ~0xffff
 
 
-def render_patches(elf, ph, size):
-    """The writes for render size WxH; SystemExit when a site does not hold the expected bytes."""
+def render_patches(elf, ph, size, log=print):
+    """The writes for render size WxH as (image offset, expected bytes, new bytes); SystemExit when a
+    site does not hold the expected bytes."""
     match = re.fullmatch(r'(\d+)x(\d+)', size)
     if not match:
         raise SystemExit(f'bad render size {size!r} (WxH, e.g. 3840x1600)')
@@ -196,10 +216,11 @@ def render_patches(elf, ph, size):
         if image_bytes(elf, ph, address - BASE, len(original)) != original:
             raise SystemExit(f'render size: unexpected bytes at {address:#x}')
         if address in keep:
-            print(f'Render size: {address:#x} kept at 1920x1080')
+            log(f'Render size: {address:#x} kept at 1920x1080')
             continue
         data = values[kind]
-        writes.append((address - BASE + len(original) - len(data), data))
+        tail = len(original) - len(data)  # the new value is the last bytes of the instruction
+        writes.append((address - BASE + tail, original[tail:], data))
     # SOTC_RENDER_EXTRA=<addr>,<addr>: more 4-byte floats of 1920/960/1080/540 to scale (finding
     # the stamina bar's site, #301).
     extra = {1920.0: 'w', 960.0: 'w2', 1080.0: 'h', 540.0: 'h2'}
@@ -207,12 +228,88 @@ def render_patches(elf, ph, size):
         if not a:
             continue
         address = int(a, 16)
-        current = struct.unpack('<f', image_bytes(elf, ph, address - BASE, 4))[0]
+        raw = image_bytes(elf, ph, address - BASE, 4)
+        current = struct.unpack('<f', raw)[0]
         if current not in extra:
             raise SystemExit(f'render size: {address:#x} holds {current}, not 1920/960/1080/540')
-        writes.append((address - BASE, values[extra[current]]))
-        print(f'Render size: {address:#x} {current:g} scaled too')
+        writes.append((address - BASE, raw, values[extra[current]]))
+        log(f'Render size: {address:#x} {current:g} scaled too')
     return writes
+
+
+def build_patches(elf, ph, modes, render='', pstats=False, log=print):
+    """The patch groups (one per family, see patches_blob) and the cvars of the modes and the render
+    size that apply to this eboot. A family whose expected bytes differ from the eboot's is left out
+    as a whole; a mode with a differing entry is logged and skipped, its cvars too."""
+    supported = is_supported(elf, ph)
+    groups, cvars = [], []
+    pool_fix = supported and holds(elf, ph, POOL_FIX[0], POOL_FIX[1])
+    if pool_fix:
+        groups.append([patch_entry(*POOL_FIX)])
+    # sotc: SOTC_HOOK_PSTATS=1 (off by default): skip the per-frame "last alive" store in
+    # ParticleSystemPool::ProcessStats (eboot 0x1018c0). That u32 array (pool+0x188, default heap)
+    # is written at spawn and here, and no reader was found; its pages share 64 KiB fault granules
+    # with GPU data, so this one store was 53% of all guest write faults.
+    if pstats:
+        if supported and holds(elf, ph, PSTATS_STORE[0], PSTATS_STORE[1]):
+            groups.append([patch_entry(*PSTATS_STORE)])
+            log('Hook ProcessStats: on')
+        else:
+            log('Hook ProcessStats: original bytes not found, not applied')
+    for mode in filter(None, (m.strip().lower() for m in modes.split(','))):
+        if mode not in MODES and mode not in CVAR_MODES:
+            raise SystemExit(f'unknown mode {mode!r} (known: {", ".join([*MODES, *CVAR_MODES])})')
+        if not supported:
+            log(f'Mode {mode}: this eboot is not {SUPPORTED}, not applied')
+            continue
+        differ = [address for address, expected, _ in MODES.get(mode, []) if not holds(elf, ph, address, expected)]
+        if differ:
+            log(f'modes: {mode} skipped: bytes at {differ[0]:#x} differ')
+            continue
+        if mode in MODES:
+            groups.append([patch_entry(*entry) for entry in MODES[mode]])
+        cvars += CVAR_MODES.get(mode, [])
+        log(f'Mode {mode}: on')
+    if render and render != '1920x1080':
+        if supported:
+            groups.append(render_patches(elf, ph, render, log))
+            log(f'Render size {render}: on')
+            w, h = map(int, render.split('x'))
+            if w * h > LOW_MEM_PIXELS and pool_fix:
+                cvars.append('texturePoolReserveSystemMemMiBs=0')
+        else:
+            log(f'Render size {render}: this eboot is not {SUPPORTED}, not applied')
+    # sotc: PS4 Pro mode too (SOTC_NEO=1): its larger render targets push the game's free system
+    # memory figure under the reserve as well, and with Maximum textures the streamer's constant
+    # drops showed as colour garbage after loads (user, 26 Oct: 1 hour without a crash or
+    # garbage outside two areas with it). SOTC_POOL_RESERVE=0/1 forces the reserve off/on.
+    reserve = os.environ.get('SOTC_POOL_RESERVE', '')
+    reserve_off = 'texturePoolReserveSystemMemMiBs=0' in cvars
+    if pool_fix and not reserve_off and reserve != '1' and (
+            reserve == '0' or os.environ.get('SOTC_NEO') == '1'):
+        cvars.append('texturePoolReserveSystemMemMiBs=0')
+        reserve_off = True
+    elif reserve_off and reserve == '1':
+        cvars.remove('texturePoolReserveSystemMemMiBs=0')
+        reserve_off = False
+    if reserve_off:
+        log('Texture pool reserve: 0 (page allocator fix on)')
+    return groups, cvars
+
+
+def patches_blob(groups):
+    """BBPATCH3 (patches.bin): the magic, the image base, the entry count; then per entry its image
+    offset, its length, its group number (1-based, the index of its group in groups), a reserved u32
+    (0), the expected bytes and the new bytes. The loader applies a group only when every entry of
+    it finds its expected bytes."""
+    entries = [(number, offset, expected, data) for number, group in enumerate(groups, 1)
+               for offset, expected, data in group]
+    blob = struct.pack('<8sQQ', b'BBPATCH3', BASE, len(entries))
+    for number, offset, expected, data in entries:
+        if len(expected) != len(data):
+            raise ValueError(f'patch at {offset:#x}: {len(expected)} expected bytes, {len(data)} new')
+        blob += struct.pack('<QQII', offset, len(data), number, 0) + expected + data
+    return blob
 
 
 def main():
@@ -224,55 +321,16 @@ def main():
     parser.add_argument('--render', default='', help='render size WxH instead of 1920x1080, e.g. 3840x1600')
     args = parser.parse_args()
     elf, _, ph, _, _ = parse_self((args.game / 'eboot.bin').read_bytes())
-    supported = is_supported(elf, ph)
-    writes, cvars = [], []
-    if supported and image_bytes(elf, ph, POOL_FIX[0] - BASE, len(POOL_FIX[1])) == POOL_FIX[1]:
-        writes.append((POOL_FIX[0] - BASE, POOL_FIX[2]))
-    for mode in filter(None, (m.strip().lower() for m in args.modes.split(','))):
-        if mode not in MODES and mode not in CVAR_MODES:
-            raise SystemExit(f'unknown mode {mode!r} (known: {", ".join([*MODES, *CVAR_MODES])})')
-        if not supported:
-            print(f'Mode {mode}: this eboot is not {SUPPORTED}, not applied')
-            continue
-        writes += [(address - BASE, data) for address, _, data in MODES.get(mode, [])]
-        cvars += CVAR_MODES.get(mode, [])
-        print(f'Mode {mode}: on')
-    if args.render and args.render != '1920x1080':
-        if supported:
-            writes += render_patches(elf, ph, args.render)
-            print(f'Render size {args.render}: on')
-            w, h = map(int, args.render.split('x'))
-            if w * h > LOW_MEM_PIXELS and (POOL_FIX[0] - BASE, POOL_FIX[2]) in writes:
-                cvars.append('texturePoolReserveSystemMemMiBs=0')
-        else:
-            print(f'Render size {args.render}: this eboot is not {SUPPORTED}, not applied')
-    # sotc: PS4 Pro mode too (SOTC_NEO=1): its larger render targets push the game's free system
-    # memory figure under the reserve as well, and with Maximum textures the streamer's constant
-    # drops showed as colour garbage after loads (user, 26 Oct: 1 hour without a crash or
-    # garbage outside two areas with it). SOTC_POOL_RESERVE=0/1 forces the reserve off/on.
-    pool_fix = (POOL_FIX[0] - BASE, POOL_FIX[2]) in writes
-    reserve = os.environ.get('SOTC_POOL_RESERVE', '')
-    reserve_off = 'texturePoolReserveSystemMemMiBs=0' in cvars
-    if pool_fix and not reserve_off and reserve != '1' and (
-            reserve == '0' or os.environ.get('SOTC_NEO') == '1'):
-        cvars.append('texturePoolReserveSystemMemMiBs=0')
-        reserve_off = True
-    elif reserve_off and reserve == '1':
-        cvars.remove('texturePoolReserveSystemMemMiBs=0')
-        reserve_off = False
-    if reserve_off:
-        print('Texture pool reserve: 0 (page allocator fix on)')
+    groups, cvars = build_patches(elf, ph, args.modes, args.render,
+                                  pstats=os.environ.get('SOTC_HOOK_PSTATS') == '1')
     for item in args.cvars.split():
         item = item.lstrip('+')
         if not CVAR.match(item):
             raise SystemExit(f'bad cvar {item!r} (NAME=VALUE or NAME)')
         cvars.append(item)
-    blob = struct.pack('<8sQQ', b'BBPATCH2', BASE, len(writes))
-    for offset, data in writes:
-        blob += struct.pack('<QQ', offset, len(data)) + data
-    (args.out / 'patches.bin').write_bytes(blob)
+    (args.out / 'patches.bin').write_bytes(patches_blob(groups))
     cmdline = args.out / 'cmdline.bin'
-    if supported and cvars:
+    if is_supported(elf, ph) and cvars:
         text = ' '.join([CMDLINE_ORIGINAL, *('+' + c for c in cvars)])
         cmdline.write_bytes(struct.pack('<8sQ', b'SOTCCMD1', CMDLINE_LEA - BASE) + text.encode('ascii'))
     elif cmdline.exists():

@@ -11,13 +11,16 @@
 #include "common/debug.h"
 #include "common/types.h"
 #include "core/emulator_settings.h"
+#include "shader_recompiler/runtime_info.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_descriptor_buffer.h"
 #include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/sotc_stats.h"
+#include "sotc_gpu_trace.h"
 
 #include <vk_mem_alloc.h>
 
@@ -323,6 +326,8 @@ bool Instance::CreateDevice() {
         return false;
     }
 
+    // sotc: 34 optional extensions below (SOTC_PC_MEMORY's external memory host among them), of
+    // which up to 2 more with SOTC_PRESENT_WAIT.
     boost::container::static_vector<const char*, 48> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
@@ -455,12 +460,177 @@ bool Instance::CreateDevice() {
     }
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
+    // sotc: SOTC_TRACE_GPU (sotc_gpu_trace.cpp) needs a calibrated time domain too: KHR when the
+    // device lists it, else EXT. The EXT one that Tracy enabled above is reused.
+    if (SotcGpuTrace::kOn) {
+        const auto available = [this](const char* name) {
+            return std::find_if(available_extensions.begin(), available_extensions.end(),
+                                [&](const std::string& e) { return e == name; }) !=
+                   available_extensions.end();
+        };
+        if (calibrated_timestamps) {
+            gpu_trace_calibrated = true;
+        } else if (available(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+            gpu_trace_calibrated_khr = add_extension(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+            gpu_trace_calibrated = gpu_trace_calibrated_khr;
+        } else if (available(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)) {
+            gpu_trace_calibrated = add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+        }
+    }
     // Device fault reporting: lets us print the faulting address/type after a device loss.
     device_fault = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
     if (device_fault) {
         const auto fault_features = feature_chain.get<vk::PhysicalDeviceFaultFeaturesEXT>();
         device_fault = fault_features.deviceFault;
         device_fault_vendor_binary = fault_features.deviceFaultVendorBinary;
+    }
+
+    // sotc: VK_EXT_descriptor_buffer behind SOTC_DESC_BUFFER=1 (vk_descriptor_buffer.h). Without
+    // it, or when a requirement is missing, the descriptor set path stays in use.
+    if (const char* env = std::getenv("SOTC_DESC_BUFFER"); env && env[0] == '1') {
+        const bool listed =
+            std::find(available_extensions.begin(), available_extensions.end(),
+                      std::string{VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME}) !=
+            available_extensions.end();
+        const auto db_chain =
+            physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
+                                         vk::PhysicalDeviceDescriptorBufferFeaturesEXT>();
+        const auto db_features = db_chain.get<vk::PhysicalDeviceDescriptorBufferFeaturesEXT>();
+        const bool buffer_device_address =
+            feature_chain.get<vk::PhysicalDeviceVulkan12Features>().bufferDeviceAddress;
+        if (listed && db_features.descriptorBuffer && buffer_device_address) {
+            const auto props_chain = physical_device.getProperties2<
+                vk::PhysicalDeviceProperties2, vk::PhysicalDeviceDescriptorBufferPropertiesEXT>();
+            descriptor_buffer_props =
+                props_chain.get<vk::PhysicalDeviceDescriptorBufferPropertiesEXT>();
+            // The ring is one buffer bound per command buffer: it must fit the descriptor limits.
+            // Samplers and image views are created while recording, after earlier submissions,
+            // so the driver has to accept that for descriptor buffers.
+            const bool fits =
+                descriptor_buffer_props.maxResourceDescriptorBufferRange >= DescriptorBufferBytes &&
+                descriptor_buffer_props.maxSamplerDescriptorBufferRange >= DescriptorBufferBytes &&
+                descriptor_buffer_props.allowSamplerImageViewPostSubmitCreation;
+            descriptor_buffer = fits && add_extension(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
+        }
+        if (descriptor_buffer) {
+            LOG_INFO(Render_Vulkan,
+                     "Descriptor buffers enabled (SOTC_DESC_BUFFER=1): offset alignment {}, "
+                     "storage buffer descriptor {} bytes",
+                     descriptor_buffer_props.descriptorBufferOffsetAlignment,
+                     descriptor_buffer_props.storageBufferDescriptorSize);
+        } else {
+            LOG_WARNING(Render_Vulkan, "SOTC_DESC_BUFFER=1 but VK_EXT_descriptor_buffer is not "
+                                       "usable here, keeping descriptor sets");
+        }
+    }
+
+    // sotc: VK_EXT_host_image_copy behind SOTC_HOST_IMAGE_COPY=1 (texture_cache.cpp RefreshImage,
+    // vk_runtime.cpp TryHostImageCopy). It needs the feature bit, and GENERAL must be a layout
+    // the host can transition to and copy into; otherwise the staging uploads stay in use.
+    if (const char* env = std::getenv("SOTC_HOST_IMAGE_COPY"); env && env[0] == '1') {
+        const bool listed =
+            std::find(available_extensions.begin(), available_extensions.end(),
+                      std::string{VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME}) !=
+            available_extensions.end();
+        if (listed) {
+            const auto hic_chain =
+                physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
+                                             vk::PhysicalDeviceHostImageCopyFeaturesEXT>();
+            const bool feature =
+                hic_chain.get<vk::PhysicalDeviceHostImageCopyFeaturesEXT>().hostImageCopy;
+            if (feature) {
+                // Two queries: the first returns the layout counts, the second fills the arrays.
+                vk::PhysicalDeviceHostImageCopyPropertiesEXT hic_props{};
+                vk::PhysicalDeviceProperties2 props2{.pNext = &hic_props};
+                physical_device.getProperties2(&props2);
+                std::vector<vk::ImageLayout> src_layouts(hic_props.copySrcLayoutCount);
+                std::vector<vk::ImageLayout> dst_layouts(hic_props.copyDstLayoutCount);
+                hic_props.pCopySrcLayouts = src_layouts.data();
+                hic_props.pCopyDstLayouts = dst_layouts.data();
+                physical_device.getProperties2(&props2);
+                const auto has_general = [](const std::vector<vk::ImageLayout>& layouts) {
+                    return std::find(layouts.begin(), layouts.end(), vk::ImageLayout::eGeneral) !=
+                           layouts.end();
+                };
+                if (has_general(src_layouts) && has_general(dst_layouts)) {
+                    host_image_copy = add_extension(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME);
+                }
+            }
+        }
+        if (host_image_copy) {
+            LOG_INFO(Render_Vulkan, "Host image copy enabled (SOTC_HOST_IMAGE_COPY=1)");
+        } else {
+            LOG_WARNING(Render_Vulkan, "SOTC_HOST_IMAGE_COPY=1 but VK_EXT_host_image_copy is not "
+                                       "usable here, keeping the staging uploads");
+        }
+    }
+
+    // sotc: SOTC_PRESENT_WAIT=1 paces the flips on the display (driver.cpp, vk_presenter.cpp).
+    // VK_KHR_present_wait needs VK_KHR_present_id. Both are enabled only when the switch is on
+    // and the device reports both features, so the default device is unchanged.
+    const auto has_extension = [this](const char* name) {
+        return std::find(available_extensions.begin(), available_extensions.end(), name) !=
+               available_extensions.end();
+    };
+    const char* present_wait_env = std::getenv("SOTC_PRESENT_WAIT");
+    if (present_wait_env && present_wait_env[0] == '1') {
+        if (has_extension(VK_KHR_PRESENT_ID_EXTENSION_NAME) &&
+            has_extension(VK_KHR_PRESENT_WAIT_EXTENSION_NAME)) {
+            const vk::StructureChain present_chain = physical_device.getFeatures2<
+                vk::PhysicalDeviceFeatures2, vk::PhysicalDevicePresentIdFeaturesKHR,
+                vk::PhysicalDevicePresentWaitFeaturesKHR>();
+            const bool present_id_ok =
+                present_chain.get<vk::PhysicalDevicePresentIdFeaturesKHR>().presentId;
+            const bool present_wait_ok =
+                present_chain.get<vk::PhysicalDevicePresentWaitFeaturesKHR>().presentWait;
+            if (present_id_ok && present_wait_ok) {
+                add_extension(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+                add_extension(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+                present_wait_enabled = true;
+                present_id_enabled = true;
+            }
+        }
+        if (!present_wait_enabled) {
+            LOG_WARNING(Render_Vulkan, "SOTC_PRESENT_WAIT=1 but VK_KHR_present_wait is not "
+                                       "supported; the software vblank timer paces the flips");
+        }
+    }
+
+    // sotc: SOTC_LOW_LATENCY=1 (alias SOTC_REFLEX=1) picks one low latency backend, the first
+    // the device reports: NVIDIA VK_NV_low_latency2 (needs VK_KHR_present_id for the present ids),
+    // then AMD VK_AMD_anti_lag. Any other device gets the generic CPU limiter in LowLatency, which
+    // needs no extension, so nothing is enabled here for it. The backend is chosen again in
+    // LowLatency only if its setup fails.
+    const char* low_latency_env = std::getenv("SOTC_LOW_LATENCY");
+    const char* reflex_env = std::getenv("SOTC_REFLEX");
+    low_latency_requested = (low_latency_env && low_latency_env[0] == '1') ||
+                            (reflex_env && reflex_env[0] == '1');
+    if (low_latency_requested) {
+        if (has_extension(VK_NV_LOW_LATENCY_2_EXTENSION_NAME) &&
+            has_extension(VK_KHR_PRESENT_ID_EXTENSION_NAME)) {
+            if (!present_id_enabled) {
+                const vk::StructureChain id_chain =
+                    physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
+                                                 vk::PhysicalDevicePresentIdFeaturesKHR>();
+                if (id_chain.get<vk::PhysicalDevicePresentIdFeaturesKHR>().presentId) {
+                    add_extension(VK_KHR_PRESENT_ID_EXTENSION_NAME);
+                    present_id_enabled = true;
+                }
+            }
+            if (present_id_enabled) {
+                add_extension(VK_NV_LOW_LATENCY_2_EXTENSION_NAME);
+                nv_low_latency_enabled = true;
+            }
+        }
+        if (!nv_low_latency_enabled && has_extension(VK_AMD_ANTI_LAG_EXTENSION_NAME)) {
+            const vk::StructureChain anti_lag_chain =
+                physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
+                                             vk::PhysicalDeviceAntiLagFeaturesAMD>();
+            if (anti_lag_chain.get<vk::PhysicalDeviceAntiLagFeaturesAMD>().antiLag) {
+                add_extension(VK_AMD_ANTI_LAG_EXTENSION_NAME);
+                amd_anti_lag_enabled = true;
+            }
+        }
     }
 
     const auto family_properties = physical_device.getQueueFamilyProperties();
@@ -483,20 +653,118 @@ bool Instance::CreateDevice() {
         return false;
     }
 
+    // sotc: SOTC_XFER_QUEUE=1 adds one queue of a transfer-only family for buffer uploads
+    // (XferQueue in vk_scheduler.h). The family needs TRANSFER and no GRAPHICS; one without
+    // COMPUTE is preferred. When none exists, or the device refuses the extra queue below, the
+    // device is the same as without the switch.
+    // sotc: SOTC_HOST_IMPORT=1 (off by default): large buffer uploads are copied by the GPU
+    // from guest memory imported with VK_EXT_external_memory_host (BufferCache::HostImport),
+    // on the transfer-only queue. Without the extension or such a queue, uploads are unchanged.
+    xfer_routing = [] {
+        const char* env = std::getenv("SOTC_XFER_QUEUE");
+        return env && env[0] == '1';
+    }();
+    if (const char* env = std::getenv("SOTC_HOST_IMPORT"); env && env[0] == '1') {
+        if (has_extension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME)) {
+            const auto props_chain =
+                physical_device.getProperties2<vk::PhysicalDeviceProperties2,
+                                               vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>();
+            host_import_alignment =
+                props_chain.get<vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>()
+                    .minImportedHostPointerAlignment;
+            // sotc: SOTC_PC_MEMORY=1 already asked for it (external_memory_host stays that
+            // switch's own flag: SotcGuestMemory reads it).
+            if (!external_memory_host) {
+                add_extension(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+            }
+            host_import_enabled = true;
+        } else {
+            LOG_WARNING(Render_Vulkan, "SOTC_HOST_IMPORT=1 but VK_EXT_external_memory_host is not "
+                                       "supported; uploads copy through the CPU");
+        }
+    }
+    // sotc: SOTC_RB_TICK=1 needs the queue for guest readback copies (not for uploads).
+    rb_tick = [] {
+        const char* env = std::getenv("SOTC_RB_TICK");
+        return env && env[0] == '1';
+    }();
+    if (xfer_routing || host_import_enabled || rb_tick) {
+        bool best_has_compute = false;
+        for (std::size_t i = 0; i < family_properties.size(); i++) {
+            const vk::QueueFlags flags = family_properties[i].queueFlags;
+            const bool transfer = bool(flags & vk::QueueFlagBits::eTransfer);
+            const bool graphics = bool(flags & vk::QueueFlagBits::eGraphics);
+            const bool has_compute = bool(flags & vk::QueueFlagBits::eCompute);
+            if (!transfer || graphics) {
+                continue;
+            }
+            if (xfer_queue_family_index == NoXferQueueFamily ||
+                (best_has_compute && !has_compute)) {
+                xfer_queue_family_index = static_cast<u32>(i);
+                best_has_compute = has_compute;
+            }
+        }
+        if (!HasXferQueue()) {
+            LOG_WARNING(Render_Vulkan, "SOTC_XFER_QUEUE=1 or SOTC_HOST_IMPORT=1 but the device "
+                                       "has no transfer-only queue family; uploads stay on the "
+                                       "graphics queue");
+        }
+    }
+
     static constexpr std::array queue_priorities = {1.0f};
     const vk::DeviceQueueCreateInfo queue_info = {
         .queueFamilyIndex = queue_family_index,
         .queueCount = static_cast<u32>(queue_priorities.size()),
         .pQueuePriorities = queue_priorities.data(),
     };
+    const vk::DeviceQueueCreateInfo xfer_queue_info = {
+        .queueFamilyIndex = xfer_queue_family_index,
+        .queueCount = 1u,
+        .pQueuePriorities = queue_priorities.data(),
+    };
+    const std::array queue_infos = {queue_info, xfer_queue_info};
+    const u32 queue_info_count = HasXferQueue() ? 2u : 1u;
 
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
+
+    // sotc: SOTC_BINDLESS_SAMP=1 (default off) enables the global sampler heap (Vulkan 1.2
+    // descriptor indexing). Only enabled when every feature it needs is present.
+    bindless_samplers = false;
+    if (const char* v = std::getenv("SOTC_BINDLESS_SAMP"); v && v[0] == '1') {
+        // Not combined with the other untested paths: they use the descriptors differently.
+        const char* stage = std::getenv("SOTC_STAGE_BINDINGS");
+        if (stage && stage[0] == '1') {
+            LOG_WARNING(Render_Vulkan, "SOTC_BINDLESS_SAMP=1 ignored: SOTC_STAGE_BINDINGS=1");
+        } else if (descriptor_buffer) {
+            LOG_WARNING(Render_Vulkan, "SOTC_BINDLESS_SAMP=1 ignored: SOTC_DESC_BUFFER=1");
+        } else {
+            constexpr u32 min_bindless_samplers = 4096;
+            bindless_samplers =
+                vk12_features.runtimeDescriptorArray &&
+                vk12_features.descriptorBindingPartiallyBound &&
+                vk12_features.descriptorBindingSampledImageUpdateAfterBind &&
+                vk12_features.descriptorBindingUpdateUnusedWhilePending &&
+                vk12_features.shaderSampledImageArrayNonUniformIndexing &&
+                features.shaderSampledImageArrayDynamicIndexing &&
+                vk12_props.maxDescriptorSetUpdateAfterBindSamplers >= min_bindless_samplers &&
+                vk12_props.maxPerStageDescriptorUpdateAfterBindSamplers >= min_bindless_samplers;
+            if (bindless_samplers) {
+                LOG_INFO(Render_Vulkan, "Bindless sampler heap enabled (SOTC_BINDLESS_SAMP=1)");
+            } else {
+                LOG_WARNING(Render_Vulkan,
+                            "SOTC_BINDLESS_SAMP=1 ignored: descriptor indexing features missing");
+            }
+        }
+    }
+    // sotc: the shader compiler reads the setting (Shader::UsesBindlessSamplers); set before any
+    // shader is compiled.
+    Shader::SetBindlessSamplersEnabled(bindless_samplers);
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
-            .queueCreateInfoCount = 1u,
-            .pQueueCreateInfos = &queue_info,
+            .queueCreateInfoCount = queue_info_count,
+            .pQueueCreateInfos = queue_infos.data(),
             .enabledExtensionCount = static_cast<u32>(enabled_extensions.size()),
             .ppEnabledExtensionNames = enabled_extensions.data(),
         },
@@ -549,6 +817,17 @@ bool Instance::CreateDevice() {
             .shaderSharedInt64Atomics = vk12_features.shaderSharedInt64Atomics,
             .shaderFloat16 = vk12_features.shaderFloat16,
             .shaderInt8 = vk12_features.shaderInt8,
+            // sotc: descriptor indexing for the bindless sampler heap (off unless
+            // SOTC_BINDLESS_SAMP=1); declaration order matters for the designated initializers.
+            .shaderSampledImageArrayNonUniformIndexing =
+                bindless_samplers && vk12_features.shaderSampledImageArrayNonUniformIndexing,
+            .descriptorBindingSampledImageUpdateAfterBind =
+                bindless_samplers && vk12_features.descriptorBindingSampledImageUpdateAfterBind,
+            .descriptorBindingUpdateUnusedWhilePending =
+                bindless_samplers && vk12_features.descriptorBindingUpdateUnusedWhilePending,
+            .descriptorBindingPartiallyBound =
+                bindless_samplers && vk12_features.descriptorBindingPartiallyBound,
+            .runtimeDescriptorArray = bindless_samplers && vk12_features.runtimeDescriptorArray,
             .scalarBlockLayout = vk12_features.scalarBlockLayout,
             .uniformBufferStandardLayout = vk12_features.uniformBufferStandardLayout,
             .separateDepthStencilLayouts = vk12_features.separateDepthStencilLayouts,
@@ -639,6 +918,12 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderClockFeaturesKHR{
             .shaderSubgroupClock = shader_clock_features.shaderSubgroupClock,
         },
+        vk::PhysicalDeviceDescriptorBufferFeaturesEXT{
+            .descriptorBuffer = true,
+        },
+        vk::PhysicalDeviceHostImageCopyFeaturesEXT{
+            .hostImageCopy = true,
+        },
     };
 
     if (!custom_border_color) {
@@ -690,6 +975,39 @@ bool Instance::CreateDevice() {
     if (!shader_clock) {
         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
     }
+    if (!descriptor_buffer) {
+        device_chain.unlink<vk::PhysicalDeviceDescriptorBufferFeaturesEXT>();
+    }
+    if (!host_image_copy) {
+        device_chain.unlink<vk::PhysicalDeviceHostImageCopyFeaturesEXT>();
+    }
+
+    // sotc: present id / present wait features, chained by hand like the fault features below.
+    vk::PhysicalDevicePresentWaitFeaturesKHR present_wait_features{
+        .presentWait = vk::True,
+    };
+    vk::PhysicalDevicePresentIdFeaturesKHR present_id_features{
+        .presentId = vk::True,
+    };
+    if (present_id_enabled) {
+        auto& features2 = device_chain.get<vk::PhysicalDeviceFeatures2>();
+        present_id_features.pNext = features2.pNext;
+        features2.pNext = &present_id_features;
+        if (present_wait_enabled) {
+            present_wait_features.pNext = features2.pNext;
+            features2.pNext = &present_wait_features;
+        }
+    }
+
+    // sotc: VK_AMD_anti_lag (SOTC_LOW_LATENCY on AMD) needs its feature turned on.
+    vk::PhysicalDeviceAntiLagFeaturesAMD anti_lag_features{
+        .antiLag = vk::True,
+    };
+    if (amd_anti_lag_enabled) {
+        auto& features2 = device_chain.get<vk::PhysicalDeviceFeatures2>();
+        anti_lag_features.pNext = features2.pNext;
+        features2.pNext = &anti_lag_features;
+    }
 
     // Chained by hand to keep the large StructureChain above untouched.
     vk::PhysicalDeviceFaultFeaturesEXT fault_features{
@@ -703,6 +1021,17 @@ bool Instance::CreateDevice() {
     }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
+    if (device_result != vk::Result::eSuccess && HasXferQueue()) {
+        // sotc: the extra queue was refused: retry with the graphics queue alone, as without it.
+        LOG_WARNING(Render_Vulkan, "Device creation with the transfer queue failed ({}), "
+                                   "retrying without it",
+                    vk::to_string(device_result));
+        xfer_queue_family_index = NoXferQueueFamily;
+        device_chain.get<vk::DeviceCreateInfo>().queueCreateInfoCount = 1u;
+        auto [retry_result, retry_dev] = physical_device.createDeviceUnique(device_chain.get());
+        device_result = retry_result;
+        dev = std::move(retry_dev);
+    }
     if (device_result != vk::Result::eSuccess) {
         LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}", vk::to_string(device_result));
         return false;
@@ -713,6 +1042,21 @@ bool Instance::CreateDevice() {
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
+    // sotc: SOTC_HOST_IMPORT copies on the transfer queue: without it, the CPU path stays.
+    if (host_import_enabled && !HasXferQueue()) {
+        host_import_enabled = false;
+    }
+    if (host_import_enabled) {
+        LOG_INFO(Render_Vulkan, "SOTC_HOST_IMPORT: large uploads are copied by the GPU from "
+                                "imported guest memory (alignment {} bytes)",
+                 host_import_alignment);
+    }
+    if (HasXferQueue()) {
+        xfer_queue = device->getQueue(xfer_queue_family_index, 0);
+        LOG_INFO(Render_Vulkan, "Buffer uploads use the transfer-only queue family {} "
+                                "(SOTC_XFER_QUEUE=1)",
+                 xfer_queue_family_index);
+    }
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =
@@ -745,12 +1089,75 @@ bool Instance::CreateDevice() {
         }
     }
 
+    // sotc: SOTC_TRACE_GPU: timestampValidBits of the graphics queue family, and whether the
+    // calibrated domains include QueryPerformanceCounter (Windows).
+    if (SotcGpuTrace::kOn) {
+        timestamp_valid_bits =
+            physical_device.getQueueFamilyProperties()[queue_family_index].timestampValidBits;
+        if (gpu_trace_calibrated) {
+#if defined(_WIN64)
+            const auto domains_info = gpu_trace_calibrated_khr
+                                          ? physical_device.getCalibrateableTimeDomainsKHR()
+                                          : physical_device.getCalibrateableTimeDomainsEXT();
+            gpu_trace_host_domain =
+                domains_info.result == vk::Result::eSuccess &&
+                std::find(domains_info.value.cbegin(), domains_info.value.cend(),
+                          vk::TimeDomainKHR::eQueryPerformanceCounter) !=
+                    domains_info.value.cend();
+#endif
+        }
+    }
+
     CreateAllocator();
     Dlssg::OnDeviceCreated(*this); // sotc: DLSS Frame Generation (SOTC_DLSSG=1)
     return true;
 }
 
+void Instance::DetectLargeBar() {
+    // sotc: SOTC_REBAR_UPLOAD=1 (default off) puts staging and stream uploads in a
+    // DEVICE_LOCAL|HOST_VISIBLE heap when the driver exposes one (Resizable BAR). Heaps of 256 MiB
+    // or less are the classic BAR window of a discrete GPU without ReBAR: not a large BAR.
+    static constexpr u64 LargeBarMinHeap = 256_MB;
+    const char* env = std::getenv("SOTC_REBAR_UPLOAD");
+    const bool wanted = env && std::strtoul(env, nullptr, 10) != 0;
+
+    has_large_bar = false;
+    rebar_upload_enabled = false;
+    if (IsIntegrated()) {
+        // Unified memory: every host-visible type is already device local, nothing to gain.
+        LOG_INFO(Render_Vulkan, "SOTC_REBAR_UPLOAD: integrated GPU, upload path unchanged");
+        return;
+    }
+
+    constexpr auto wanted_flags = vk::MemoryPropertyFlagBits::eDeviceLocal |
+                                  vk::MemoryPropertyFlagBits::eHostVisible |
+                                  vk::MemoryPropertyFlagBits::eHostCoherent;
+    const auto mem_props = physical_device.getMemoryProperties();
+    for (u32 i = 0; i < mem_props.memoryTypeCount && !has_large_bar; ++i) {
+        const auto& type = mem_props.memoryTypes[i];
+        const u32 heap = type.heapIndex;
+        if ((type.propertyFlags & wanted_flags) == wanted_flags &&
+            mem_props.memoryHeaps[heap].size > LargeBarMinHeap) {
+            has_large_bar = true;
+            large_bar_heap = heap;
+        }
+    }
+    rebar_upload_enabled = wanted && has_large_bar;
+
+    if (!has_large_bar) {
+        LOG_INFO(Render_Vulkan, "SOTC_REBAR_UPLOAD: no large BAR heap, upload path unchanged");
+    } else if (!wanted) {
+        LOG_INFO(Render_Vulkan, "SOTC_REBAR_UPLOAD: large BAR heap {} MB available, off (not set)",
+                 mem_props.memoryHeaps[large_bar_heap].size >> 20);
+    } else {
+        LOG_INFO(Render_Vulkan, "SOTC_REBAR_UPLOAD: on, large BAR heap {} MB",
+                 mem_props.memoryHeaps[large_bar_heap].size >> 20);
+    }
+}
+
 void Instance::CreateAllocator() {
+    DetectLargeBar(); // sotc: must run before any ReBAR allocation decision
+
     const VmaVulkanFunctions functions = {
         .vkGetInstanceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
         .vkGetDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr,

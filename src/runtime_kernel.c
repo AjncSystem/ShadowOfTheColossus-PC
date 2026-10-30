@@ -3,16 +3,22 @@
  * use FreeBSD numbering; host errno values never reach the guest directly. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "trace_imports.h"
+#include "trace.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <pthread.h>
 #include <sched.h>
+#include <stdatomic.h>
 #include <time.h>
 #include <unistd.h>
 #include <sys/time.h>
 #include <x86intrin.h>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #ifndef _WIN32
 #include <sys/random.h>
 #include <sys/resource.h>
@@ -120,17 +126,139 @@ uint64_t runtime_process_time_us(void) { return process_time(); }
 uint64_t runtime_process_time_counter(void) { return process_time_counter(); }
 uint64_t runtime_tsc_frequency(void) { return tsc_frequency(); }
 uint64_t runtime_read_tsc(void) { return host_tsc(); }
-static int sleep_ns(uint64_t ns) {
+/* sotc: SOTC_TRACE: ra is the guest return address (the caller of the import). */
+static int sleep_ns_from(uint64_t ns, void *ra) {
+    const uint64_t t0=trace_now();
 #ifdef _WIN32
     compat_sleep_ns(ns);
 #else
     struct timespec t={.tv_sec=(time_t)(ns/1000000000),.tv_nsec=(long)(ns%1000000000)};
-    while (nanosleep(&t,&t)) if (errno!=EINTR) return errno;
+    while (nanosleep(&t,&t)) if (errno!=EINTR) { trace_span("sleep",t0,ns,(uint64_t)ra); return errno; }
 #endif
+    trace_span("sleep",t0,ns,(uint64_t)ra);
     return 0;
 }
-static ABI int32_t kernel_usleep(uint32_t usec) { sleep_ns((uint64_t)usec*1000); return 0; }
-static ABI int32_t posix_usleep(uint32_t usec) { sleep_ns((uint64_t)usec*1000); return 0; }
+#define sleep_ns(ns) sleep_ns_from((ns),(void *)(uintptr_t)GUEST_CALLER())
+/* sotc: usleep statistics (on when SOTC_FPS or SOTC_USLEEP_YIELD is set) and SOTC_USLEEP_YIELD.
+ * Config is packed and read once: bits 0-1 the yield mode (SOTC_USLEEP_YIELD: 1 yields, 2 only
+ * counts), bit 2 counting on, bits 8+ the yield threshold in us (SOTC_USLEEP_YIELD_US, default
+ * 10). With everything off a usleep costs one relaxed load and the plain sleep. */
+#define USLEEP_UNREAD UINT64_MAX
+#define USLEEP_SLOTS 64
+#define USLEEP_TOP 8
+static _Atomic uint64_t usleep_config = USLEEP_UNREAD;
+static struct {
+    _Atomic uint64_t calls, requested_us, actual_ns, yielded, overflow;
+    _Atomic uint64_t buckets[4];                   /* <=10 us, <=100 us, <=1 ms, more */
+    _Atomic uintptr_t caller[USLEEP_SLOTS];        /* guest return addresses of requests <=100 us */
+    _Atomic uint64_t caller_hits[USLEEP_SLOTS];
+} usleep_stats;
+static uint64_t usleep_read_config(void) {
+    const char *yield = getenv("SOTC_USLEEP_YIELD");
+    const char *threshold = getenv("SOTC_USLEEP_YIELD_US");
+    unsigned long long us = 10;
+    char *end = NULL;
+    if (threshold) { unsigned long long v = strtoull(threshold, &end, 10); if (end != threshold) us = v; }
+    if (us > 1000000) us = 1000000;
+    int mode = yield ? atoi(yield) : 0;
+    if (mode != 1 && mode != 2) mode = 0;
+    int counting = mode != 0 || getenv("SOTC_FPS") != NULL;
+    return (uint64_t)mode | (counting ? 4 : 0) | ((uint64_t)us << 8);
+}
+static uint64_t usleep_config_get(void) {
+    uint64_t config = atomic_load_explicit(&usleep_config, memory_order_relaxed);
+    if (config == USLEEP_UNREAD) {
+        config = usleep_read_config();
+        atomic_store_explicit(&usleep_config, config, memory_order_relaxed);
+    }
+    return config;
+}
+static uint64_t usleep_now_ns(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
+    return (uint64_t)t.tv_sec*1000000000+(uint64_t)t.tv_nsec;
+}
+static void usleep_note_caller(uintptr_t caller) {
+    for (size_t i=0;i<USLEEP_SLOTS;++i) {
+        uintptr_t seen=atomic_load_explicit(&usleep_stats.caller[i],memory_order_relaxed);
+        if (!seen) {
+            uintptr_t empty=0;
+            if (!atomic_compare_exchange_strong(&usleep_stats.caller[i],&empty,caller) && empty!=caller) continue;
+            seen=caller;
+        }
+        if (seen==caller) { atomic_fetch_add(&usleep_stats.caller_hits[i],1); return; }
+    }
+    atomic_fetch_add(&usleep_stats.overflow,1);
+}
+static void usleep_yield_thread(void) {
+#ifdef _WIN32
+    SwitchToThread();
+#else
+    sched_yield();
+#endif
+}
+/* ra is the guest caller of the import. */
+static void usleep_guest(uint32_t usec, void *ra) {
+    const uint64_t config = usleep_config_get();
+    if (!(config & 4)) { sleep_ns_from((uint64_t)usec*1000,ra); return; }
+    const unsigned mode = (unsigned)(config & 3);
+    const uint64_t yield_us = config >> 8;
+    const int would_yield = mode && usec<=yield_us;
+    const int yields = mode==1 && would_yield;
+    const uint64_t t0 = usleep_now_ns();
+    if (would_yield) atomic_fetch_add_explicit(&usleep_stats.yielded,1,memory_order_relaxed);
+    if (yields) usleep_yield_thread(); else sleep_ns_from((uint64_t)usec*1000,ra);
+    const uint64_t actual = usleep_now_ns()-t0;
+    const size_t bucket = usec<=10 ? 0 : usec<=100 ? 1 : usec<=1000 ? 2 : 3;
+    atomic_fetch_add_explicit(&usleep_stats.calls,1,memory_order_relaxed);
+    atomic_fetch_add_explicit(&usleep_stats.buckets[bucket],1,memory_order_relaxed);
+    atomic_fetch_add_explicit(&usleep_stats.requested_us,usec,memory_order_relaxed);
+    atomic_fetch_add_explicit(&usleep_stats.actual_ns,actual,memory_order_relaxed);
+    if (usec<=100) usleep_note_caller((uintptr_t)ra);
+}
+static ABI int32_t kernel_usleep(uint32_t usec) { usleep_guest(usec,(void *)(uintptr_t)GUEST_CALLER()); return 0; }
+static ABI int32_t posix_usleep(uint32_t usec) { usleep_guest(usec,(void *)(uintptr_t)GUEST_CALLER()); return 0; }
+/* sotc: one "SOTC USLEEP:" line for the SOTC_FPS report, then the counters are reset. seconds is
+ * the window length (per-second rates). Callers are guest return addresses (host addresses of
+ * the mapped image; subtract the image base for an eboot offset). */
+void runtime_usleep_stats(char *out, size_t size, double seconds) {
+    if (!out || !size) return;
+    const uint64_t config = usleep_config_get();
+    const unsigned mode = (unsigned)(config & 3);
+    const uint64_t yield_us = config >> 8;
+    const uint64_t calls = atomic_exchange_explicit(&usleep_stats.calls,0,memory_order_relaxed);
+    uint64_t b[4];
+    for (int i=0;i<4;++i) b[i]=atomic_exchange_explicit(&usleep_stats.buckets[i],0,memory_order_relaxed);
+    const uint64_t requested=atomic_exchange_explicit(&usleep_stats.requested_us,0,memory_order_relaxed);
+    const uint64_t actual=atomic_exchange_explicit(&usleep_stats.actual_ns,0,memory_order_relaxed);
+    const uint64_t yielded=atomic_exchange_explicit(&usleep_stats.yielded,0,memory_order_relaxed);
+    const uint64_t overflow=atomic_exchange_explicit(&usleep_stats.overflow,0,memory_order_relaxed);
+    uintptr_t addr[USLEEP_SLOTS]; uint64_t hits[USLEEP_SLOTS]; size_t n=0;
+    for (size_t i=0;i<USLEEP_SLOTS;++i) {
+        uintptr_t a=atomic_load_explicit(&usleep_stats.caller[i],memory_order_relaxed);
+        uint64_t h=atomic_exchange_explicit(&usleep_stats.caller_hits[i],0,memory_order_relaxed);
+        if (a && h) { addr[n]=a; hits[n]=h; ++n; }
+    }
+    if (!calls) { out[0]='\0'; return; } /* sotc: no line in an idle window */
+    const double window = seconds>0 ? seconds : 1.0;
+    const char *yield_name = mode==1 ? "yield" : mode==2 ? "count" : "off";
+    int w=snprintf(out,size,
+        "SOTC USLEEP: calls=%llu (%.0f/s) short<=100us=%.0f/s <=10us=%llu <=100us=%llu <=1ms=%llu more=%llu "
+        "requested=%.1f ms actual=%.1f ms yield=%s<=%llu us yielded=%llu overflow=%llu top:",
+        (unsigned long long)calls, calls/window, (b[0]+b[1])/window,
+        (unsigned long long)b[0], (unsigned long long)b[1], (unsigned long long)b[2], (unsigned long long)b[3],
+        requested/1000.0, actual/1000000.0, yield_name, (unsigned long long)yield_us,
+        (unsigned long long)yielded, (unsigned long long)overflow);
+    size_t used = w<0 ? 0 : (size_t)w;
+    if (used>=size) used=size-1;
+    for (size_t k=0;k<n && k<USLEEP_TOP;++k) {
+        size_t best=k;
+        for (size_t j=k+1;j<n;++j) if (hits[j]>hits[best]) best=j;
+        uintptr_t ta=addr[k]; addr[k]=addr[best]; addr[best]=ta;
+        uint64_t th=hits[k]; hits[k]=hits[best]; hits[best]=th;
+        int t=snprintf(out+used,size-used," 0x%llx=%llu",(unsigned long long)addr[k],(unsigned long long)hits[k]);
+        if (t>0) { used+=(size_t)t; if (used>=size) used=size-1; }
+    }
+}
 static ABI uint32_t posix_sleep(uint32_t seconds) { sleep_ns((uint64_t)seconds*1000000000); return 0; }
 static ABI int32_t posix_nanosleep(const GuestTimespec *rq,GuestTimespec *rem) {
     if (!rq || rq->nsec<0 || rq->nsec>=1000000000 || rq->sec<0) return fail_posix(EINVAL);
@@ -139,7 +267,10 @@ static ABI int32_t posix_nanosleep(const GuestTimespec *rq,GuestTimespec *rem) {
     return 0;
 }
 static ABI int32_t kernel_nanosleep(const GuestTimespec *rq,GuestTimespec *rem) {
-    return posix_nanosleep(rq,rem) ? ERR(*runtime_errno()) : 0;
+    if (!rq || rq->nsec<0 || rq->nsec>=1000000000 || rq->sec<0) { fail_posix(EINVAL); return ERR(*runtime_errno()); }
+    sleep_ns((uint64_t)rq->sec*1000000000+(uint64_t)rq->nsec);
+    if (rem) { rem->sec=0; rem->nsec=0; }
+    return 0;
 }
 typedef struct { int32_t minuteswest, dsttime; } GuestTimezone;
 static ABI int32_t kernel_gettimezone(GuestTimezone *tz) {

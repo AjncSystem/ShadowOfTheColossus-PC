@@ -31,8 +31,9 @@ public:
     /// Acquires the next image in the swapchain.
     bool AcquireNextImage();
 
-    /// Presents the current image and move to the next one
-    bool Present();
+    /// Presents the current image and move to the next one. `present_id` (VK_KHR_present_id, used
+    /// with SOTC_PRESENT_WAIT only) tags the present; 0 leaves it untagged.
+    bool Present(u64 present_id = 0);
 
     vk::SurfaceKHR GetSurface() const {
         return surface;

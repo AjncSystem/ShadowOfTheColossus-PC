@@ -7,6 +7,7 @@
  * the same 9-byte instruction with another displacement. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "trace.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,14 +71,18 @@ static _Thread_local GuestThread *current;
 size_t runtime_thread_suspend_others(void **out, size_t capacity) {
     size_t n=0;
     pthread_mutex_lock(&lock);
+    /* sotc: every thread is asked to stop first, then each is waited for: the stops proceed in
+     * parallel instead of one kernel round trip after the other (17+ guest threads). */
     for (GuestThread *t=threads; t && n<capacity; t=t->next) {
         if (t==current || t->finished || !t->os_handle) continue;
         HANDLE h=t->os_handle;
         if (SuspendThread(h)==(DWORD)-1) continue;
+        out[n++]=h;
+    }
+    for (size_t i=0;i<n;++i) {
         CONTEXT c;
         c.ContextFlags=CONTEXT_CONTROL;
-        GetThreadContext(h,&c); /* returns once the thread is really stopped */
-        out[n++]=h;
+        GetThreadContext(out[i],&c); /* returns once the thread is really stopped */
     }
     return n;
 }
@@ -288,6 +293,151 @@ static void set_host_name(const char *name) {
 #define exit_setjmp(t) setjmp((t)->exit_jump)
 #define exit_longjmp(t) longjmp((t)->exit_jump,1)
 #endif
+/* sotc: SOTC_STALL_DETAIL: the GPU library counts this thread's CPU time (weak: absent builds skip it). */
+void bbgpu_register_guest_thread(void) __attribute__((weak));
+#ifdef _WIN32
+/* sotc: SOTC_GAME_AFFINITY=1 (off by default). The game's job workers ("BPE JobWorkerThread CPUn",
+ * report 16) get a Windows affinity that leaves out the logical CPUs the port pins its own GPU threads
+ * to with SOTC_CPUSETS=1 (gpu/shim/bbport_threads.h, not edited here): the first logical CPU of the
+ * first four physical cores, in the same order (fastest efficiency class first, then core index). The
+ * workers get every other logical CPU this process may run on. Placement needs SOTC_CPUSETS=1 as well,
+ * and the same layout gate as GetCpuLayout (at least 6 physical cores, at least 4 in the fastest
+ * efficiency class). Otherwise nothing is placed and one line says which condition failed. Guest
+ * priorities are not mapped. Each placed worker logs one line.
+ * The affinity is set by the worker itself, before any guest code runs on it. */
+#define GAME_JOB_WORKER_NAME "BPE JobWorkerThread"
+static int game_affinity_on(void) {
+    static int on=-1; /* read once; a benign race writes the same value */
+    if (on<0) { const char *v=getenv("SOTC_GAME_AFFINITY"); on=(v && v[0]=='1'); }
+    return on;
+}
+/* sotc: SOTC_CPUSETS=1 (same parsing as CpuSetsEnabled in gpu/shim/bbport_threads.h). */
+static int cpusets_on(void) {
+    static int on=-1; /* read once; a benign race writes the same value */
+    if (on<0) { const char *v=getenv("SOTC_CPUSETS"); on=(v && v[0]=='1'); }
+    return on;
+}
+static pthread_mutex_t game_affinity_lock=PTHREAD_MUTEX_INITIALIZER;
+static int game_affinity_ready;
+static DWORD_PTR game_affinity_mask_value;
+typedef struct { BYTE core, lp, eff; } GameCpu;
+
+/* Computes the worker mask (group 0 only), or 0 when placement does not apply. The gate is the one in
+ * GetCpuLayout (gpu/shim/bbport_threads.h): SOTC_CPUSETS=1, at least 6 physical cores among the CPUs this
+ * process may run on, and at least 4 of them in the fastest efficiency class. The port only reserves its
+ * four cores under that same gate, so the two sides agree. */
+static DWORD_PTR game_affinity_compute(void) {
+    if (!cpusets_on()) {
+        printf("Runtime: SOTC_GAME_AFFINITY: SOTC_CPUSETS is not 1, job workers not placed\n");
+        return 0;
+    }
+    DWORD_PTR process=0, system=0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(),&process,&system) || !process) process=~(DWORD_PTR)0;
+    ULONG length=0;
+    GetSystemCpuSetInformation(NULL,0,&length,NULL,0);
+    if (length==0) {
+        printf("Runtime: SOTC_GAME_AFFINITY: no CPU set information, job workers not placed\n");
+        return 0;
+    }
+    BYTE *buffer=malloc(length);
+    if (!buffer) return 0;
+    if (!GetSystemCpuSetInformation((SYSTEM_CPU_SET_INFORMATION*)buffer,length,&length,NULL,0)) {
+        printf("Runtime: SOTC_GAME_AFFINITY: GetSystemCpuSetInformation failed (%lu), job workers not placed\n",(unsigned long)GetLastError());
+        free(buffer);
+        return 0;
+    }
+    /* Logical CPUs of group 0 that this process may run on. */
+    GameCpu cpus[64];
+    size_t n=0;
+    for (BYTE *p=buffer; p<buffer+length;) {
+        SYSTEM_CPU_SET_INFORMATION *info=(SYSTEM_CPU_SET_INFORMATION*)p;
+        if (info->Size==0) break;
+        if (info->Type==CpuSetInformation) {
+            const BYTE lp=info->CpuSet.LogicalProcessorIndex;
+            if (info->CpuSet.Group==0 && lp<64 && ((process>>lp)&1) && n<64) {
+                cpus[n].core=info->CpuSet.CoreIndex;
+                cpus[n].lp=lp;
+                cpus[n].eff=info->CpuSet.EfficiencyClass;
+                ++n;
+            }
+        }
+        p+=info->Size;
+    }
+    free(buffer);
+    /* Sort by (core, lp), insertion sort (at most 64 entries). */
+    for (size_t i=1;i<n;++i) {
+        GameCpu v=cpus[i];
+        size_t j=i;
+        while (j>0 && (cpus[j-1].core>v.core || (cpus[j-1].core==v.core && cpus[j-1].lp>v.lp))) {
+            cpus[j]=cpus[j-1];
+            --j;
+        }
+        cpus[j]=v;
+    }
+    /* One entry per physical core: its first (lowest) logical CPU. */
+    GameCpu firsts[64];
+    size_t nc=0;
+    for (size_t i=0;i<n;++i) {
+        if (nc==0 || firsts[nc-1].core!=cpus[i].core) firsts[nc++]=cpus[i];
+    }
+    if (nc<6) {
+        printf("Runtime: SOTC_GAME_AFFINITY: %zu physical cores (need 6), job workers not placed\n",nc);
+        return 0;
+    }
+    /* Fastest efficiency class and how many physical cores it holds (need 4). */
+    BYTE fastest=0;
+    for (size_t i=0;i<nc;++i) if (firsts[i].eff>fastest) fastest=firsts[i].eff;
+    size_t fast=0;
+    for (size_t i=0;i<nc;++i) if (firsts[i].eff==fastest) ++fast;
+    if (fast<4) {
+        printf("Runtime: SOTC_GAME_AFFINITY: %zu physical cores in the fastest class (need 4), job workers not placed\n",fast);
+        return 0;
+    }
+    /* The port's four exclusive threads: fastest efficiency class first, then core index. */
+    DWORD_PTR allowed=0, reserved=0;
+    for (size_t i=0;i<n;++i) allowed|=(DWORD_PTR)1<<cpus[i].lp;
+    unsigned char used[64]={0};
+    for (int k=0;k<4;++k) {
+        size_t best=(size_t)-1;
+        for (size_t i=0;i<nc;++i) {
+            if (!used[i] && (best==(size_t)-1 || firsts[i].eff>firsts[best].eff)) best=i;
+        }
+        used[best]=1;
+        reserved|=(DWORD_PTR)1<<firsts[best].lp;
+    }
+    DWORD_PTR workers=allowed&~reserved;
+    if (!workers) {
+        printf("Runtime: SOTC_GAME_AFFINITY: no logical CPU left for job workers, not placed\n");
+        return 0;
+    }
+    printf("Runtime: SOTC_GAME_AFFINITY: port threads reserve CPU mask 0x%llx, job workers get 0x%llx\n",
+           (unsigned long long)reserved,(unsigned long long)workers);
+    return workers;
+}
+static DWORD_PTR game_affinity_worker_mask(void) {
+    pthread_mutex_lock(&game_affinity_lock);
+    if (!game_affinity_ready) {
+        game_affinity_mask_value=game_affinity_compute();
+        game_affinity_ready=1;
+    }
+    DWORD_PTR mask=game_affinity_mask_value;
+    pthread_mutex_unlock(&game_affinity_lock);
+    return mask;
+}
+/* Called by the new thread itself. Only game job workers are placed. */
+static void game_affinity_apply(const char *name) {
+    if (!game_affinity_on() || !strstr(name,GAME_JOB_WORKER_NAME)) return;
+    DWORD_PTR mask=game_affinity_worker_mask();
+    if (!mask) return;
+    DWORD_PTR previous=SetThreadAffinityMask(GetCurrentThread(),mask);
+    if (!previous) {
+        printf("Runtime: SOTC_GAME_AFFINITY: guest thread '%s' not placed (error %lu)\n",name,(unsigned long)GetLastError());
+    } else {
+        printf("Runtime: SOTC_GAME_AFFINITY: guest thread '%s' (host thread %lu) on CPU mask 0x%llx (was 0x%llx)\n",
+               name,(unsigned long)GetCurrentThreadId(),(unsigned long long)mask,(unsigned long long)previous);
+    }
+}
+#endif
 static void *host_start(void *p) {
     GuestThread *t=p;
 #ifdef _WIN32
@@ -300,6 +450,11 @@ static void *host_start(void *p) {
 #endif
     attach(t);
     set_host_name(t->name);
+#ifdef _WIN32
+    game_affinity_apply(t->name); /* sotc: SOTC_GAME_AFFINITY=1 only (game job workers) */
+#endif
+    trace_thread_init(); /* sotc: SOTC_TRACE ring before any guest code (faults never allocate one) */
+    if (bbgpu_register_guest_thread) bbgpu_register_guest_thread(); /* sotc: SOTC_STALL_DETAIL guest CPU */
 #ifdef _WIN32
     /* sotc: host thread ids of guest threads, for traces that print GetCurrentThreadId. */
     if (getenv("SOTC_THREAD_IDS")) fprintf(stderr,"Runtime: guest thread '%s' is host thread %lu\n",t->name,GetCurrentThreadId());

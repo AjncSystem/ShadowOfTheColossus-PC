@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <vector>
 #include "common/alignment.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/sotc_stats.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
 
@@ -139,6 +141,28 @@ void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* 
     }
 }
 
+bool Runtime::TryCopyBufferXfer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
+                                std::span<const vk::BufferCopy> copies) {
+    if (!scheduler.HasXferQueue() || !instance.IsXferRoutingEnabled()) {
+        return false;
+    }
+    // The copy runs ahead of the graphics work recorded since the last submit, which is not
+    // waited for. Ranges that this work reads or writes stay on the graphics queue.
+    for (const auto& copy : copies) {
+        if (IsBufferAccessed(src, copy.srcOffset, copy.size) ||
+            IsBufferAccessed(dst, copy.dstOffset, copy.size, true)) {
+            return false;
+        }
+    }
+    // No EndRendering and no barrier bookkeeping: the next graphics submit waits on the copy
+    // (Scheduler::SubmitExecution), so nothing recorded later can run before it.
+    if (!scheduler.XferCopy(src->Handle(), dst->Handle(), copies)) {
+        return false;
+    }
+    SotcStats::xfer_copies.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 void Runtime::FillBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, u32 value) {
     scheduler.EndRendering();
 
@@ -202,6 +226,89 @@ void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
     }
 
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+}
+
+bool Runtime::TryHostImageCopy(VideoCore::Image* dst, const u8* guest_base,
+                               std::span<const vk::BufferImageCopy> copies, bool gpu_idle) {
+    if (!instance.IsHostImageCopyEnabled() ||
+        !(dst->usage_flags & vk::ImageUsageFlagBits::eHostTransferEXT)) {
+        return false;
+    }
+    if (!gpu_idle) {
+        SotcStats::host_image_copy_busy.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    auto& backing = *dst->backing;
+    // A partially transitioned image keeps one state per subresource: left to the barrier path.
+    if (!backing.subresource_states.empty() || backing.num_samples != dst->info.num_samples) {
+        return false;
+    }
+
+    const VkDevice device = static_cast<VkDevice>(instance.GetDevice());
+    const VkImage image = static_cast<VkImage>(dst->GetImage());
+    const auto aspect = static_cast<VkImageAspectFlags>(dst->aspect_mask);
+
+    // The host transition discards the old contents, which the copy below replaces entirely.
+    if (backing.state.layout != vk::ImageLayout::eGeneral) {
+        VkHostImageLayoutTransitionInfo transition{};
+        transition.sType = VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO;
+        transition.image = image;
+        transition.oldLayout = static_cast<VkImageLayout>(backing.state.layout);
+        transition.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        transition.subresourceRange.aspectMask = aspect;
+        transition.subresourceRange.baseMipLevel = 0;
+        transition.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
+        transition.subresourceRange.baseArrayLayer = 0;
+        transition.subresourceRange.layerCount = VK_REMAINING_ARRAY_LAYERS;
+        const VkResult result =
+            VULKAN_HPP_DEFAULT_DISPATCHER.vkTransitionImageLayoutEXT(device, 1, &transition);
+        if (result != VK_SUCCESS) {
+            LOG_WARNING(Render_Vulkan, "Host image layout transition failed: {}",
+                        vk::to_string(static_cast<vk::Result>(result)));
+            return false;
+        }
+        // The state is updated even when the copy below fails: the barrier path that follows
+        // then starts from the layout the image is really in.
+        backing.state.layout = vk::ImageLayout::eGeneral;
+        backing.state_version = VideoCore::NextBackingVersion(); // sotc: SOTC_TEX_BLOCK
+    }
+
+    std::vector<VkMemoryToImageCopy> regions;
+    regions.reserve(copies.size());
+    for (const auto& copy : copies) {
+        VkMemoryToImageCopy region{};
+        region.sType = VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY;
+        region.pHostPointer = guest_base + copy.bufferOffset;
+        region.memoryRowLength = copy.bufferRowLength;
+        region.memoryImageHeight = copy.bufferImageHeight;
+        region.imageSubresource.aspectMask =
+            static_cast<VkImageAspectFlags>(copy.imageSubresource.aspectMask);
+        region.imageSubresource.mipLevel = copy.imageSubresource.mipLevel;
+        region.imageSubresource.baseArrayLayer = copy.imageSubresource.baseArrayLayer;
+        region.imageSubresource.layerCount = copy.imageSubresource.layerCount;
+        region.imageOffset = VkOffset3D{copy.imageOffset.x, copy.imageOffset.y, copy.imageOffset.z};
+        region.imageExtent =
+            VkExtent3D{copy.imageExtent.width, copy.imageExtent.height, copy.imageExtent.depth};
+        regions.push_back(region);
+    }
+
+    VkCopyMemoryToImageInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO;
+    info.dstImage = image;
+    info.dstImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    info.regionCount = static_cast<uint32_t>(regions.size());
+    info.pRegions = regions.data();
+    const VkResult result = VULKAN_HPP_DEFAULT_DISPATCHER.vkCopyMemoryToImageEXT(device, &info);
+    if (result != VK_SUCCESS) {
+        LOG_WARNING(Render_Vulkan, "Host image copy failed: {}",
+                    vk::to_string(static_cast<vk::Result>(result)));
+        return false;
+    }
+
+    // No barrier is recorded: the copy runs on the host and the GPU does not use the image now.
+    dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+    SotcStats::host_image_copies.fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
 void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
@@ -657,12 +764,14 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
         new_backing->image = VideoCore::UniqueImage{instance.GetDevice(), instance.GetAllocator()};
         new_backing->image.Create(new_image_ci);
 
-        Vulkan::SetObjectName(instance.GetDevice(), new_backing->image.image,
-                              "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{} (backing)",
-                              info.size.width, info.size.height, info.size.depth,
-                              AmdGpu::NameOf(info.tile_mode), vk::to_string(info.pixel_format),
-                              info.guest_address, info.guest_size, info.resources.layers,
-                              info.resources.levels, num_samples);
+        if (Vulkan::object_names_enabled.load(std::memory_order_relaxed)) { // sotc: see Image
+            Vulkan::SetObjectName(instance.GetDevice(), new_backing->image.image,
+                                  "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{} (backing)",
+                                  info.size.width, info.size.height, info.size.depth,
+                                  AmdGpu::NameOf(info.tile_mode), vk::to_string(info.pixel_format),
+                                  info.guest_address, info.guest_size, info.resources.layers,
+                                  info.resources.levels, num_samples);
+        }
     } else {
         new_backing = std::addressof(*it);
     }
@@ -709,6 +818,7 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
         new_backing->state.layout = dst_layout;
         new_backing->state.access_mask = dst_access;
         new_backing->state.pl_stage = dst_stage;
+        new_backing->state_version = VideoCore::NextBackingVersion(); // sotc: SOTC_TEX_BLOCK
     }
 
     backing = new_backing;

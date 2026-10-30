@@ -2,8 +2,10 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <bitset>
 #include <climits>
 #include <cstring>
@@ -27,6 +29,7 @@
 #include "core/signals.h"
 #include "sotc_tls.h" // sotc: the port rewrites guest TCB loads itself
 #include "cpu_patches.h"
+#include "hooks.h" // sotc: detour stubs call sotc_hook_dispatch (docs/HOOK-DESIGN.md)
 
 #ifdef _WIN32
 #include <windows.h>
@@ -576,6 +579,20 @@ struct PatchModule {
     /// Prevents repeated generation attempts after the fixed trampoline area is exhausted.
     bool trampoline_exhausted{};
 
+    /// sotc: sorted function starts of the segment, from the passes that receive the eh_frame
+    /// list. The guest detours need the function bounds (InstallGuestDetour).
+    std::vector<uintptr_t> function_starts;
+
+    /// sotc: [begin, end) image ranges written by any CPU patch, for the detour overlap check.
+    std::vector<std::pair<uintptr_t, uintptr_t>> patched_ranges;
+
+    /// sotc: [begin, end) of functions that PatchRedZoneMemoryInstructions protected.
+    std::vector<std::pair<uintptr_t, uintptr_t>> red_zone_ranges;
+
+    /// sotc: the shared time-mode thunks (DetourMode::Time), emitted by the first time detour.
+    u8* time_enter{};
+    u8* time_leave{};
+
     PatchModule(u8* module_ptr, const u64 module_size, u8* trampoline_ptr,
                 const u64 trampoline_size)
         : start(module_ptr), end(module_ptr + module_size), patch_gen(module_size, module_ptr),
@@ -677,6 +694,9 @@ static std::pair<bool, u64> TryPatch(u8* code, PatchModule* module) {
                     patch_gen.nop(instruction.length - patch_size);
 
                     module->patched.insert(code);
+                    module->patched_ranges.emplace_back(
+                        reinterpret_cast<uintptr_t>(code),
+                        reinterpret_cast<uintptr_t>(code) + instruction.length);
                     LOG_DEBUG(Core, "Patched instruction '{}' at: {}",
                               ZydisMnemonicGetString(instruction.mnemonic), fmt::ptr(code));
                     return std::make_pair(true, instruction.length);
@@ -1579,6 +1599,15 @@ bool GenerateProtectedIndirectCall(const DecodedCodeInstruction& decoded,
     return true;
 }
 
+// sotc: keeps the function starts of a pass for the guest detours. The caller holds the module
+// lock (or runs at load, before any thread starts).
+void MergeFunctionStarts(PatchModule* module, const std::vector<uintptr_t>& starts) {
+    module->function_starts.insert(module->function_starts.end(), starts.begin(), starts.end());
+    std::ranges::sort(module->function_starts);
+    module->function_starts.erase(std::ranges::unique(module->function_starts).begin(),
+                                  module->function_starts.end());
+}
+
 bool IsInPlaceMemoryPatch(ZydisMnemonic mnemonic) {
     return mnemonic == ZYDIS_MNEMONIC_MOVNTSS || mnemonic == ZYDIS_MNEMONIC_MOVNTSD;
 }
@@ -1619,6 +1648,7 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
     starts.erase(unique_end, starts.end());
 
     std::unique_lock lock{module->mutex};
+    MergeFunctionStarts(module, starts);
     for (size_t function_index = 0; function_index < starts.size(); ++function_index) {
         const uintptr_t function_start = starts[function_index];
         const uintptr_t function_end =
@@ -1697,6 +1727,13 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
         }
         if (rewrite_sites.empty()) {
             continue;
+        }
+
+        // sotc: a function with a red-zone rewrite is protected: detours refuse to enter it.
+        if (std::ranges::any_of(rewrite_sites, [](const auto& entry) {
+                return entry.second.protect_red_zone;
+            })) {
+            module->red_zone_ranges.emplace_back(function_start, function_end);
         }
 
         struct RelocationSpan {
@@ -2122,6 +2159,9 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
             record_rewrites(site_span);
             patched_spans.emplace_back(site_span.patch_start, site_span.continuation);
         }
+        for (const auto& [begin, end] : patched_spans) {
+            module->patched_ranges.emplace_back(begin, end);
+        }
     }
     return result;
 }
@@ -2167,6 +2207,7 @@ u64 PatchShortSse4aInstructions(u64 segment_addr, u64 segment_size,
 
     u64 patched_count = 0;
     std::unique_lock lock{module->mutex};
+    MergeFunctionStarts(module, starts);
     for (size_t index = 0; index < starts.size(); ++index) {
         const uintptr_t function_start = starts[index];
         const uintptr_t function_end = index + 1 < starts.size() ? starts[index + 1] : segment_end;
@@ -2258,6 +2299,7 @@ u64 PatchShortSse4aInstructions(u64 segment_addr, u64 segment_size,
             for (const auto* decoded : span) {
                 module->patched.insert(reinterpret_cast<u8*>(decoded->address));
             }
+            module->patched_ranges.emplace_back(site, continuation);
             covered_until = continuation;
             ++patched_count;
         }
@@ -2333,6 +2375,7 @@ u64 PatchRdtscInstructions(u64 segment_addr, u64 segment_size,
 
     u64 patched_count = 0;
     std::unique_lock lock{module->mutex};
+    MergeFunctionStarts(module, starts);
     for (size_t index = 0; index < starts.size(); ++index) {
         const uintptr_t function_start = starts[index];
         const uintptr_t function_end = index + 1 < starts.size() ? starts[index + 1] : segment_end;
@@ -2423,11 +2466,775 @@ u64 PatchRdtscInstructions(u64 segment_addr, u64 segment_size,
             for (const auto* decoded : span) {
                 module->patched.insert(reinterpret_cast<u8*>(decoded->address));
             }
+            module->patched_ranges.emplace_back(site, continuation);
             covered_until = continuation;
             ++patched_count;
         }
     }
     return patched_count;
+}
+
+// sotc: guest detours (gpu/sotc/hooks.h, docs/HOOK-DESIGN.md). A detour is a jmp rel32 over the
+// displaced instructions, which move into a stub in the trampoline area. The stub follows the
+// rdtsc template (GenerateClockCall), widened: it skips the red zone, saves the flags, every GPR
+// and xmm0-7 into a SotcHooks::GuestRegs, aligns the host call to 16 and calls sotc_hook_dispatch.
+namespace {
+
+// The frame holds the GuestRegs, then one slot with the host rsp before alignment, then the
+// CallGuest block (guest fn and six arguments) and the xmm8-15 save of a guest call.
+constexpr int DetourHostRspOffset = static_cast<int>(sizeof(SotcHooks::GuestRegs));
+constexpr int DetourCallBlockOffset = DetourHostRspOffset + 16;
+constexpr int DetourCallSaveOffset = DetourCallBlockOffset + 64;
+constexpr int DetourFrameSize = DetourCallSaveOffset + 8 * 16;
+static_assert(DetourFrameSize % 16 == 0 && DetourCallSaveOffset % 16 == 0);
+// The guest rsp is the host rsp before alignment + 144: the 128-byte red zone, the pushed guest
+// rbx and the pushed flags.
+constexpr int DetourGuestRspDelta = static_cast<int>(GuestRedZoneSize) + 16;
+
+#define SOTC_GR(field) static_cast<int>(offsetof(SotcHooks::GuestRegs, field))
+
+// Entered with rsp = the guest rsp at the hook (E). Leaves rsp at the frame base with every
+// register saved, rbx = E - 144 and the HookAction in eax.
+void EmitDetourSave(Xbyak::CodeGenerator& c, u32 hook_id, u32 phase) {
+    c.lea(rsp, ptr[rsp - GuestRedZoneSize]); // skip the red zone
+    c.pushfq();
+    c.push(rbx);
+    c.mov(rbx, rsp); // rbx = E - 144 until the frame is built
+    c.and_(rsp, -16); // flags are already saved above
+    c.sub(rsp, DetourFrameSize);
+
+    c.mov(ptr[rsp + SOTC_GR(rax)], rax);
+    c.mov(ptr[rsp + SOTC_GR(rcx)], rcx);
+    c.mov(ptr[rsp + SOTC_GR(rdx)], rdx);
+    c.mov(ptr[rsp + SOTC_GR(rsi)], rsi);
+    c.mov(ptr[rsp + SOTC_GR(rdi)], rdi);
+    c.mov(ptr[rsp + SOTC_GR(rbp)], rbp);
+    c.mov(ptr[rsp + SOTC_GR(r8)], r8);
+    c.mov(ptr[rsp + SOTC_GR(r9)], r9);
+    c.mov(ptr[rsp + SOTC_GR(r10)], r10);
+    c.mov(ptr[rsp + SOTC_GR(r11)], r11);
+    c.mov(ptr[rsp + SOTC_GR(r12)], r12);
+    c.mov(ptr[rsp + SOTC_GR(r13)], r13);
+    c.mov(ptr[rsp + SOTC_GR(r14)], r14);
+    c.mov(ptr[rsp + SOTC_GR(r15)], r15);
+    c.mov(ptr[rsp + DetourHostRspOffset], rbx);
+    c.mov(rax, ptr[rbx]); // guest rbx (rax is saved, so it is free now)
+    c.mov(ptr[rsp + SOTC_GR(rbx)], rax);
+    c.lea(rax, ptr[rbx + DetourGuestRspDelta]);
+    c.mov(ptr[rsp + SOTC_GR(rsp)], rax);
+    c.mov(rax, ptr[rbx + 8]); // guest flags, pushed at E - 136
+    c.mov(ptr[rsp + SOTC_GR(rflags)], rax);
+    for (int i = 0; i < 8; ++i) {
+        c.movdqu(ptr[rsp + SOTC_GR(xmm) + i * 16], Xbyak::Xmm(i));
+    }
+
+    c.mov(rcx, rsp);
+    c.mov(edx, hook_id);
+    c.mov(r8d, phase);
+    c.sub(rsp, 32); // Win64 shadow space; rsp stays 16-byte aligned at the call
+    c.cld();        // Win64 requires DF clear at a call; rflags are restored from the save
+    c.mov(rax, reinterpret_cast<uintptr_t>(&sotc_hook_dispatch));
+    c.call(rax);
+    c.add(rsp, 32);
+}
+
+// Entered with rsp = the frame base. Restores every register and the flags from the frame
+// (handlers may have changed them) and leaves rsp at the guest rsp E.
+void EmitDetourRestore(Xbyak::CodeGenerator& c) {
+    c.mov(rax, ptr[rsp + SOTC_GR(rax)]);
+    c.mov(rcx, ptr[rsp + SOTC_GR(rcx)]);
+    c.mov(rdx, ptr[rsp + SOTC_GR(rdx)]);
+    c.mov(rsi, ptr[rsp + SOTC_GR(rsi)]);
+    c.mov(rdi, ptr[rsp + SOTC_GR(rdi)]);
+    c.mov(rbp, ptr[rsp + SOTC_GR(rbp)]);
+    c.mov(r8, ptr[rsp + SOTC_GR(r8)]);
+    c.mov(r9, ptr[rsp + SOTC_GR(r9)]);
+    c.mov(r10, ptr[rsp + SOTC_GR(r10)]);
+    c.mov(r11, ptr[rsp + SOTC_GR(r11)]);
+    c.mov(r12, ptr[rsp + SOTC_GR(r12)]);
+    c.mov(r13, ptr[rsp + SOTC_GR(r13)]);
+    c.mov(r14, ptr[rsp + SOTC_GR(r14)]);
+    c.mov(r15, ptr[rsp + SOTC_GR(r15)]);
+    for (int i = 0; i < 8; ++i) {
+        c.movdqu(Xbyak::Xmm(i), ptr[rsp + SOTC_GR(xmm) + i * 16]);
+    }
+    c.push(qword[rsp + SOTC_GR(rflags)]); // pushed below the frame, popped as the flags
+    c.popfq();
+    c.mov(rbx, ptr[rsp + SOTC_GR(rbx)]);
+    c.mov(rsp, ptr[rsp + DetourHostRspOffset]); // host rsp before alignment (E - 144)
+    c.lea(rsp, ptr[rsp + DetourGuestRspDelta]); // guest rsp E
+}
+
+// CallGuest (hooks.h): entered with rsp = the frame base (16-byte aligned) after the handler
+// returned CallGuest, GuestRegs saved. The frame sits below the guest red zone, so the call runs
+// on the guest stack below it, with rsp 16-byte aligned at the call and no extra space needed.
+// Jumps to done without a call when no guest call was pending. Otherwise xmm8-15 are saved
+// around the call (the guest function may clobber them; xmm0-7 come back from GuestRegs in the
+// restore that follows). The return value is discarded and every register is restored by that
+// restore.
+void EmitDetourGuestCall(Xbyak::CodeGenerator& c, const Xbyak::Label& done) {
+    c.lea(rcx, ptr[rsp + DetourCallBlockOffset]);
+    c.sub(rsp, 32); // host shadow space; rsp stays 16-byte aligned at the call
+    c.mov(rax, reinterpret_cast<uintptr_t>(&sotc_hook_take_guest_call));
+    c.call(rax);
+    c.add(rsp, 32);
+    c.test(eax, eax);
+    c.jz(done, Xbyak::CodeGenerator::T_NEAR);
+
+    for (int i = 0; i < 8; ++i) {
+        c.movdqu(ptr[rsp + DetourCallSaveOffset + i * 16], Xbyak::Xmm(8 + i));
+    }
+    c.mov(r11, ptr[rsp + DetourCallBlockOffset]); // guest function
+    c.mov(rdi, ptr[rsp + DetourCallBlockOffset + 8]);
+    c.mov(rsi, ptr[rsp + DetourCallBlockOffset + 16]);
+    c.mov(rdx, ptr[rsp + DetourCallBlockOffset + 24]);
+    c.mov(rcx, ptr[rsp + DetourCallBlockOffset + 32]);
+    c.mov(r8, ptr[rsp + DetourCallBlockOffset + 40]);
+    c.mov(r9, ptr[rsp + DetourCallBlockOffset + 48]);
+    c.xor_(eax, eax); // SysV: al = number of vector arguments (none)
+    c.call(r11);
+    for (int i = 0; i < 8; ++i) {
+        c.movdqu(Xbyak::Xmm(8 + i), ptr[rsp + DetourCallSaveOffset + i * 16]);
+    }
+}
+
+#undef SOTC_GR
+
+bool IsDetourControlFlow(const ZydisDecodedInstruction& instruction) {
+    return instruction.meta.category == ZYDIS_CATEGORY_CALL ||
+           instruction.meta.category == ZYDIS_CATEGORY_COND_BR ||
+           IsControlFlowTerminator(instruction);
+}
+
+// Wrap runs the original one call deeper, so any read of the return address or of stack
+// arguments would see the wrong words. Walks every path from the entry with the rsp depth
+// (0 = the return address at [rsp]) and the depth rbp holds when it is a copy of rsp. Refuses a
+// visible stack or rbp operand at depth >= 0, a pop or rsp copy at depth >= 0, an unknown or
+// path-dependent depth, and indirect jumps. Returns nullptr when the function is safe to wrap.
+// sotc: time_mode (the return address is replaced, DetourMode::Time) also refuses a ret that is
+// not at depth 0, since the shared leave trampoline expects the return at the entry depth.
+// Time also refuses a register or memory value taken from rsp (or a copy of rsp in rbp) that
+// may point at the return slot, and arithmetic on rsp.
+const char* WrapStackRefusal(const DecodedFunction& function, uintptr_t start,
+                             bool time_mode = false) {
+    constexpr s64 kUnknown = INT64_MIN;
+    constexpr s64 kNotStack = INT64_MAX; // rbp holds no copy of rsp
+    constexpr s64 kTimeSlotMargin = 8;   // Time: values this close to E are refused
+    struct State {
+        s64 depth;
+        s64 rbp;
+        bool operator==(const State&) const = default;
+    };
+    const auto is_rbp = [](ZydisRegister reg) {
+        return reg != ZYDIS_REGISTER_NONE &&
+               ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, reg) ==
+                   ZYDIS_REGISTER_RBP;
+    };
+    std::map<uintptr_t, State> state_at;
+    std::vector<uintptr_t> work{start};
+    state_at[start] = State{0, kNotStack};
+    while (!work.empty()) {
+        uintptr_t address = work.back();
+        work.pop_back();
+        State state = state_at[address];
+        while (true) {
+            const auto it = function.instructions.find(address);
+            if (it == function.instructions.end()) {
+                break;
+            }
+            const auto& decoded = it->second;
+            const auto& instruction = decoded.instruction;
+            const auto* operands = decoded.operands.data();
+            for (u8 index = 0; index < instruction.operand_count_visible; ++index) {
+                const auto& operand = operands[index];
+                if (operand.type != ZYDIS_OPERAND_TYPE_MEMORY) {
+                    continue;
+                }
+                if (IsStackPointerRegister(operand.mem.index) ||
+                    (is_rbp(operand.mem.index) && state.rbp != kNotStack)) {
+                    return "Wrap: the function indexes the stack";
+                }
+                if (IsStackPointerRegister(operand.mem.base)) {
+                    if (state.depth == kUnknown) {
+                        return "Wrap: stack operand at an unknown stack depth";
+                    }
+                    if (state.depth + operand.mem.disp.value >= 0) {
+                        return "Wrap: the function reads its return address or stack arguments";
+                    }
+                }
+                if (is_rbp(operand.mem.base) && state.rbp != kNotStack) {
+                    if (state.rbp == kUnknown) {
+                        return "Wrap: frame-pointer operand at an unknown stack depth";
+                    }
+                    if (state.rbp + operand.mem.disp.value >= 0) {
+                        return "Wrap: the function reads its return address or stack arguments";
+                    }
+                }
+            }
+            const auto mnemonic = instruction.mnemonic;
+            // sotc: Time only. A register or memory value derived from rsp, or from a copy of rsp in
+            // rbp, can point at the return slot and be read later through another register. Its
+            // offset from E is the depth (plus the displacement for LEA); it is refused unless it is
+            // provably below the slot by more than kTimeSlotMargin. Arithmetic on rsp is refused.
+            // A value moved on through a third register is not followed (docs/HOOK-DESIGN.md).
+            if (time_mode) {
+                bool writes_other = mnemonic == ZYDIS_MNEMONIC_PUSH; // push stores its value
+                for (u8 index = 0; index < instruction.operand_count_visible; ++index) {
+                    const auto& operand = operands[index];
+                    if ((operand.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) == 0) {
+                        continue;
+                    }
+                    const bool stack_register =
+                        operand.type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                        (IsStackPointerRegister(operand.reg.value) || is_rbp(operand.reg.value));
+                    writes_other |= !stack_register;
+                }
+                for (u8 index = 0; index < instruction.operand_count_visible; ++index) {
+                    const auto& operand = operands[index];
+                    bool stack_value = false;
+                    s64 offset = kUnknown;
+                    if (operand.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                        if (IsStackPointerRegister(operand.reg.value)) {
+                            stack_value = true;
+                            offset = state.depth;
+                        } else if (is_rbp(operand.reg.value) && state.rbp != kNotStack) {
+                            stack_value = true;
+                            offset = state.rbp;
+                        }
+                    } else if (mnemonic == ZYDIS_MNEMONIC_LEA &&
+                               operand.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                        const bool rsp_base = IsStackPointerRegister(operand.mem.base);
+                        if (rsp_base || (is_rbp(operand.mem.base) && state.rbp != kNotStack)) {
+                            stack_value = true;
+                            const s64 base = rsp_base ? state.depth : state.rbp;
+                            if (base != kUnknown && operand.mem.index == ZYDIS_REGISTER_NONE) {
+                                offset = base + operand.mem.disp.value;
+                            }
+                        }
+                    }
+                    if (!stack_value || !writes_other) {
+                        continue;
+                    }
+                    if (mnemonic != ZYDIS_MNEMONIC_MOV && mnemonic != ZYDIS_MNEMONIC_LEA &&
+                        mnemonic != ZYDIS_MNEMONIC_PUSH) {
+                        return "Time: a stack pointer is used in arithmetic";
+                    }
+                    if (offset == kUnknown || offset >= -kTimeSlotMargin) {
+                        return "Time: a register or memory value points near the return slot";
+                    }
+                }
+            }
+            if (time_mode && mnemonic == ZYDIS_MNEMONIC_RET && state.depth != 0) {
+                return "Time: the return is not at the entry stack depth";
+            }
+            const bool pops = mnemonic == ZYDIS_MNEMONIC_POP || mnemonic == ZYDIS_MNEMONIC_POPF ||
+                              mnemonic == ZYDIS_MNEMONIC_POPFQ;
+            if (pops && (state.depth == kUnknown || state.depth >= 0)) {
+                return "Wrap: a pop reads the return address";
+            }
+
+            // A register taking a copy of rsp: rbp is tracked, any other one must not point at
+            // the return address or above.
+            const bool copies_rsp =
+                mnemonic == ZYDIS_MNEMONIC_MOV && operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                IsStackPointerRegister(operands[1].reg.value) &&
+                !IsStackPointerRegister(operands[0].reg.value);
+            if (copies_rsp && !is_rbp(operands[0].reg.value) &&
+                (state.depth == kUnknown || state.depth >= 0)) {
+                return "Wrap: rsp is copied while it points at the return address";
+            }
+            if (mnemonic == ZYDIS_MNEMONIC_LEAVE) {
+                // mov rsp,rbp; pop rbp
+                if (state.rbp == kNotStack || state.rbp == kUnknown || state.rbp >= 0) {
+                    return "Wrap: leave without a known frame";
+                }
+                state.depth = state.rbp + 8;
+                state.rbp = kNotStack;
+            } else {
+                const s64 depth_before = state.depth;
+                if (decoded.changes_stack_pointer) {
+                    state.depth = (state.depth != kUnknown && decoded.stack_pointer_delta)
+                                      ? state.depth + *decoded.stack_pointer_delta
+                                      : kUnknown;
+                }
+                bool writes_rbp = false;
+                for (u8 index = 0; index < instruction.operand_count; ++index) {
+                    const auto& operand = operands[index];
+                    if (operand.type == ZYDIS_OPERAND_TYPE_REGISTER && is_rbp(operand.reg.value) &&
+                        (operand.actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) != 0) {
+                        writes_rbp = true;
+                    }
+                }
+                if (writes_rbp) {
+                    if (copies_rsp) {
+                        state.rbp = depth_before;
+                    } else if (mnemonic == ZYDIS_MNEMONIC_LEA &&
+                               IsStackPointerRegister(operands[1].mem.base) &&
+                               operands[1].mem.index == ZYDIS_REGISTER_NONE) {
+                        state.rbp = depth_before == kUnknown
+                                        ? kUnknown
+                                        : depth_before + operands[1].mem.disp.value;
+                    } else {
+                        state.rbp = kNotStack;
+                    }
+                }
+            }
+
+            const uintptr_t next = address + instruction.length;
+            const auto follow = [&](uintptr_t target) {
+                const auto [seen, inserted] = state_at.emplace(target, state);
+                if (inserted) {
+                    work.push_back(target);
+                    return true;
+                }
+                return seen->second == state;
+            };
+            if (instruction.meta.category == ZYDIS_CATEGORY_COND_BR) {
+                const uintptr_t target = GetRelativeTarget(decoded);
+                if (function.instructions.contains(target) && !follow(target)) {
+                    return "Wrap: the stack depth differs between paths";
+                }
+            } else if (IsControlFlowTerminator(instruction)) {
+                if (instruction.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
+                    const uintptr_t target = GetRelativeTarget(decoded);
+                    if (target == 0) {
+                        return "Wrap: the function has an indirect jump";
+                    }
+                    if (function.instructions.contains(target) && !follow(target)) {
+                        return "Wrap: the stack depth differs between paths";
+                    }
+                }
+                break;
+            }
+            if (function.branch_targets.contains(next)) {
+                if (!follow(next)) {
+                    return "Wrap: the stack depth differs between paths";
+                }
+                break;
+            }
+            address = next;
+        }
+    }
+    return nullptr;
+}
+
+// sotc: time mode (DetourMode::Time, docs/HOOK-DESIGN.md). Two thunks are shared by every time
+// stub and emitted once per module (EnsureTimeThunks):
+//  - enter: called by a stub with rcx = entry rsp, rdx = return address, r8d = hook id. It calls
+//    sotc_trace_funcs_enter (Win64) on the guest stack at any alignment and returns its result in
+//    eax. The host ABI clobbers xmm0-5, so those are kept (the stub keeps the other registers).
+//  - leave: the address a timed frame returns to. It calls sotc_trace_funcs_leave with the guest
+//    rsp after the body's ret, keeps the return registers (rax, rdx, xmm0-1), and jumps to the
+//    real return address the call gave back.
+void EmitTimeEnterThunk(Xbyak::CodeGenerator& c) {
+    c.mov(rbx, rsp); // the stub saved the guest rbx; the thunk may use it as a frame base
+    c.and_(rsp, -16);
+    c.sub(rsp, 32 + 6 * 16);
+    for (int i = 0; i < 6; ++i) {
+        c.movdqu(ptr[rsp + 32 + i * 16], Xbyak::Xmm(i));
+    }
+    c.cld(); // Win64 requires DF clear at a call
+    c.mov(rax, reinterpret_cast<uintptr_t>(&sotc_trace_funcs_enter));
+    c.call(rax);
+    for (int i = 0; i < 6; ++i) {
+        c.movdqu(Xbyak::Xmm(i), ptr[rsp + 32 + i * 16]);
+    }
+    c.mov(rsp, rbx);
+    c.ret();
+}
+
+void EmitTimeLeaveTrampoline(Xbyak::CodeGenerator& c) {
+    c.mov(r11, rsp); // the guest rsp after the body's ret: the return slot + 8
+    c.push(rbx);
+    c.push(rax);
+    c.push(rdx);
+    c.mov(rbx, rsp);
+    c.and_(rsp, -16);
+    c.sub(rsp, 32 + 2 * 16);
+    c.movdqu(ptr[rsp + 32], Xbyak::Xmm(0));
+    c.movdqu(ptr[rsp + 48], Xbyak::Xmm(1));
+    c.mov(rcx, r11);
+    c.cld();
+    c.mov(rax, reinterpret_cast<uintptr_t>(&sotc_trace_funcs_leave));
+    c.call(rax);
+    c.movdqu(Xbyak::Xmm(0), ptr[rsp + 32]);
+    c.movdqu(Xbyak::Xmm(1), ptr[rsp + 48]);
+    c.mov(rsp, rbx);
+    c.mov(r11, rax); // the real return address
+    c.pop(rdx);
+    c.pop(rax);
+    c.pop(rbx);
+    c.jmp(r11);
+}
+
+// Bytes between the entry rsp E and the stub's rsp after its pushes: the red zone, the flags and
+// the eight GPR pushes of EmitTimeStub.
+constexpr int TimeStubFrame = 8 * 8 + 8 + static_cast<int>(GuestRedZoneSize);
+
+// The time stub, entered with rsp = E (the return address at [E]). Skips the red zone, saves the
+// flags and the registers the thunk call changes, calls the enter thunk and, when it pushed a
+// frame, replaces [E] with the shared leave trampoline. The displaced instructions run after the
+// restore, as for Entry.
+void EmitTimeStub(Xbyak::CodeGenerator& c, u32 hook_id, const u8* enter, const u8* leave) {
+    c.lea(rsp, ptr[rsp - GuestRedZoneSize]);
+    c.pushfq();
+    c.push(rbx);
+    c.push(rax);
+    c.push(rcx);
+    c.push(rdx);
+    c.push(r8);
+    c.push(r9);
+    c.push(r10);
+    c.push(r11);
+    c.lea(rcx, ptr[rsp + TimeStubFrame]); // entry rsp
+    c.mov(rdx, ptr[rsp + TimeStubFrame]); // return address
+    c.mov(r8d, hook_id);
+    c.mov(r9d, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(leave)));
+    c.call(enter);
+    Xbyak::Label passthrough;
+    c.test(eax, eax);
+    c.jz(passthrough, Xbyak::CodeGenerator::T_NEAR);
+    c.mov(r11d, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(leave)));
+    c.mov(ptr[rsp + TimeStubFrame], r11);
+    c.L(passthrough);
+    c.pop(r11);
+    c.pop(r10);
+    c.pop(r9);
+    c.pop(r8);
+    c.pop(rdx);
+    c.pop(rcx);
+    c.pop(rax);
+    c.pop(rbx);
+    c.popfq();
+    c.lea(rsp, ptr[rsp + GuestRedZoneSize]);
+}
+
+// Emits the shared time thunks once, when the module first gets a time detour.
+bool EnsureTimeThunks(PatchModule* module) {
+    if (module->time_enter != nullptr) {
+        return true;
+    }
+    auto& gen = module->trampoline_gen;
+    const size_t offset = gen.getSize();
+    u8* enter = nullptr;
+    u8* leave = nullptr;
+    try {
+        enter = const_cast<u8*>(gen.getCurr());
+        EmitTimeEnterThunk(gen);
+        leave = const_cast<u8*>(gen.getCurr());
+        EmitTimeLeaveTrampoline(gen);
+    } catch (const Xbyak::Error& error) {
+        gen.setSize(offset);
+        HandleTrampolineError(module, error);
+        return false;
+    }
+    // The stub stores the leave address as a 32-bit immediate (the trampolines sit below 2 GiB).
+    if (reinterpret_cast<uintptr_t>(leave) > UINT32_MAX) {
+        gen.setSize(offset);
+        return false;
+    }
+    module->time_enter = enter;
+    module->time_leave = leave;
+    return true;
+}
+
+// Emits one detour into c. For Wrap the original comes first: the relocated span and a jump
+// back into the body. *stub receives the address the image jumps to. Returns false when a
+// displaced instruction cannot be relocated. time_enter/time_leave are used by DetourMode::Time.
+bool EmitGuestDetour(Xbyak::CodeGenerator& c, const DetourRequest& request,
+                     const std::vector<const DecodedCodeInstruction*>& span,
+                     uintptr_t continuation, u8** stub, const u8* time_enter,
+                     const u8* time_leave) {
+    if (request.mode == DetourMode::Time) {
+        *stub = const_cast<u8*>(c.getCurr());
+        EmitTimeStub(c, request.hook_id, time_enter, time_leave);
+        for (const auto* decoded : span) {
+            if (!EncodeRelocatedInstruction(*decoded, c)) {
+                return false;
+            }
+        }
+        c.jmp(reinterpret_cast<void*>(continuation));
+        return true;
+    }
+
+    const bool wrap = request.mode == DetourMode::Wrap;
+
+    u8* original = nullptr;
+    if (wrap) {
+        original = const_cast<u8*>(c.getCurr());
+        for (const auto* decoded : span) {
+            if (!EncodeRelocatedInstruction(*decoded, c)) {
+                return false;
+            }
+        }
+        c.jmp(reinterpret_cast<void*>(continuation));
+    }
+
+    *stub = const_cast<u8*>(c.getCurr());
+    Xbyak::Label return_to_guest;
+    EmitDetourSave(c, request.hook_id, 0);
+    const bool entry = request.mode == DetourMode::Entry;
+    if (entry) {
+        // HookAction::Return (Entry only): the handler supplied the result in regs.rax/rdx/xmm0.
+        c.cmp(eax, static_cast<uint32_t>(SotcHooks::HookAction::Return));
+        c.je(return_to_guest, Xbyak::CodeGenerator::T_NEAR); // the restore + span exceed rel8
+    }
+    // HookAction::CallGuest: run the guest function the handler set, then restore as usual. Wrap
+    // runs its original after the restore, so its guest call comes first.
+    Xbyak::Label after_guest_call;
+    c.cmp(eax, static_cast<uint32_t>(SotcHooks::HookAction::CallGuest));
+    c.jne(after_guest_call, Xbyak::CodeGenerator::T_NEAR);
+    EmitDetourGuestCall(c, after_guest_call);
+    c.L(after_guest_call);
+    EmitDetourRestore(c);
+    if (wrap) {
+        // The original gets the guest's alignment: rsp = E - 8 before its call pushes the
+        // return address, so it enters with rsp = E - 16 = 8 mod 16, as E is.
+        c.lea(rsp, ptr[rsp - 8]);
+        c.call(original);
+        // The original returns to here with rsp = E - 8.
+        c.lea(rsp, ptr[rsp + 8]);
+        EmitDetourSave(c, request.hook_id, 1);
+        EmitDetourRestore(c);
+        c.ret();
+    } else {
+        for (const auto* decoded : span) {
+            if (!EncodeRelocatedInstruction(*decoded, c)) {
+                return false;
+            }
+        }
+        c.jmp(reinterpret_cast<void*>(continuation));
+    }
+    if (entry) {
+        c.L(return_to_guest);
+        EmitDetourRestore(c);
+        c.ret();
+    }
+    return true;
+}
+
+} // namespace
+
+bool InstallGuestDetour(const DetourRequest& request, DetourResult* result) {
+    DetourResult scratch{};
+    if (result == nullptr) {
+        result = &scratch;
+    }
+    *result = DetourResult{};
+    const auto refuse = [result](const char* reason) {
+        result->installed = false;
+        result->reason = reason;
+        return false;
+    };
+
+    const auto address = static_cast<uintptr_t>(request.address);
+    auto* module = GetContainingModule(reinterpret_cast<void*>(address));
+    if (module == nullptr) {
+        return refuse("address is outside the registered module");
+    }
+    std::unique_lock lock{module->mutex};
+    const auto module_start = reinterpret_cast<uintptr_t>(module->start);
+    const auto module_end = reinterpret_cast<uintptr_t>(module->end);
+
+    // The pattern is checked on the bytes as they are now, after every other CPU patch.
+    const size_t pattern_size = request.pattern.size();
+    if (pattern_size == 0) {
+        return refuse("empty pattern");
+    }
+    if (!request.mask.empty() && request.mask.size() != pattern_size) {
+        return refuse("mask size differs from the pattern");
+    }
+    if (pattern_size > module_end - address) {
+        return refuse("pattern runs past the module");
+    }
+    const auto* bytes = reinterpret_cast<const u8*>(address);
+    for (size_t i = 0; i < pattern_size; ++i) {
+        const u8 mask = request.mask.empty() ? u8{0xff} : request.mask[i];
+        if ((bytes[i] & mask) != (request.pattern[i] & mask)) {
+            return refuse("pattern does not match");
+        }
+    }
+
+    // Function bounds come from the function starts of the eh_frame passes.
+    const auto& starts = module->function_starts;
+    if (starts.empty()) {
+        return refuse("no function table (the eh_frame passes record it)");
+    }
+    const auto next_start = std::upper_bound(starts.begin(), starts.end(), address);
+    if (next_start == starts.begin()) {
+        return refuse("address is before the first function");
+    }
+    const uintptr_t function_start = *std::prev(next_start);
+    if (request.mode != DetourMode::Site && function_start != address) {
+        return refuse("not a function entry");
+    }
+    const uintptr_t function_end = next_start != starts.end() ? *next_start : module_end;
+
+    for (const auto& [begin, end] : module->red_zone_ranges) {
+        if (address >= begin && address < end) {
+            return refuse("inside a red-zone-protected function");
+        }
+    }
+
+    // Branch targets and control flow come from the same analysis as the other passes. Targets
+    // of branches from other functions are not seen (the same limit as the SSE4a and rdtsc
+    // passes).
+    const auto function = DecodeFunction(function_start, function_end, module_start, module_end);
+    if (function.has_indirect_branch) {
+        return refuse("function has an unresolved indirect branch");
+    }
+    if (request.mode == DetourMode::Wrap || request.mode == DetourMode::Time) {
+        for (const auto& [_, decoded] : function.instructions) {
+            // Visible operands only: a plain ret also has hidden rsp/rip operands.
+            if (decoded.instruction.mnemonic == ZYDIS_MNEMONIC_RET &&
+                decoded.instruction.operand_count_visible > 0) {
+                return refuse(request.mode == DetourMode::Wrap
+                                  ? "Wrap: the function pops stack arguments"
+                                  : "Time: the function pops stack arguments");
+            }
+        }
+    }
+
+    // Bytes rewritten by an earlier pass hide the branches they relocated, so branch targets and
+    // paths in this function are no longer complete.
+    for (const auto& [begin, end] : module->patched_ranges) {
+        if (begin < function_end && function_start < end) {
+            return refuse("the function has other CPU patches (its branch targets are unknown)");
+        }
+    }
+
+    // Entry and Wrap: a branch back to the entry would re-run the handler (Wrap: nest a call)
+    // on every iteration.
+    if (request.mode != DetourMode::Site && function.branch_targets.contains(address)) {
+        return refuse("a branch inside the function targets its entry");
+    }
+
+    // The displaced span: whole instructions, at least NearJumpSize bytes.
+    std::vector<const DecodedCodeInstruction*> span;
+    uintptr_t continuation = address;
+    while (continuation - address < NearJumpSize) {
+        const auto it = function.instructions.find(continuation);
+        if (it == function.instructions.end()) {
+            return refuse("displaced span is not decoded");
+        }
+        if (continuation != address && function.branch_targets.contains(continuation)) {
+            return refuse("branch target inside the displaced span");
+        }
+        if (module->patched.contains(reinterpret_cast<u8*>(continuation))) {
+            return refuse("displaced span overlaps another CPU patch");
+        }
+        span.push_back(&it->second);
+        continuation += it->second.instruction.length;
+    }
+    for (size_t i = 0; i + 1 < span.size(); ++i) {
+        if (!IsDetourControlFlow(span[i]->instruction)) {
+            continue;
+        }
+        // Entry and Wrap: the first instruction may branch, it is relocated as it is.
+        if (i == 0 && request.mode != DetourMode::Site) {
+            continue;
+        }
+        return refuse("control flow inside the displaced span");
+    }
+    if (continuation > function_end) {
+        return refuse("displaced span crosses the function end");
+    }
+    // sotc: Time only. A branch that leaves the function is a tail call: the callee returns
+    // through the leave trampoline's slot with no frame of its own, and a callee that pops
+    // arguments (ret imm) moves the return off the entry depth. Indirect branches were refused
+    // above (target 0 counts as one).
+    if (request.mode == DetourMode::Time) {
+        for (const auto& [_, decoded] : function.instructions) {
+            const auto category = decoded.instruction.meta.category;
+            if (category != ZYDIS_CATEGORY_UNCOND_BR && category != ZYDIS_CATEGORY_COND_BR) {
+                continue;
+            }
+            const uintptr_t target = GetRelativeTarget(decoded);
+            if (target < function_start || target >= function_end) {
+                return refuse("Time: a branch leaves the function (tail call)");
+            }
+        }
+    }
+    if (request.mode == DetourMode::Wrap || request.mode == DetourMode::Time) {
+        if (const char* reason =
+                WrapStackRefusal(function, address, request.mode == DetourMode::Time)) {
+            return refuse(reason);
+        }
+    }
+    for (const auto& [begin, end] : module->patched_ranges) {
+        if (address < end && begin < continuation) {
+            return refuse("displaced span overlaps another CPU patch");
+        }
+    }
+
+    // Emit the stub. A failure rolls the trampoline area back, so nothing is left behind.
+    if (module->trampoline_exhausted) {
+        return refuse("trampoline space exhausted");
+    }
+    if (request.mode == DetourMode::Time && !EnsureTimeThunks(module)) {
+        return refuse("time thunks did not fit the trampoline area");
+    }
+    auto& trampoline_gen = module->trampoline_gen;
+    const size_t trampoline_offset = trampoline_gen.getSize();
+    u8* stub = nullptr;
+    try {
+        if (!EmitGuestDetour(trampoline_gen, request, span, continuation, &stub,
+                             module->time_enter, module->time_leave)) {
+            trampoline_gen.setSize(trampoline_offset);
+            return refuse("displaced instruction cannot be relocated");
+        }
+    } catch (const Xbyak::Error& error) {
+        trampoline_gen.setSize(trampoline_offset);
+        const bool full = HandleTrampolineError(module, error);
+        return refuse(full ? "trampoline space exhausted" : "trampoline emit failed");
+    }
+
+    // Write the jump over the displaced span. The rel32 range is checked before writing, so an
+    // out-of-range jump never throws past the extern "C" caller.
+    const s64 jump_distance = static_cast<s64>(reinterpret_cast<uintptr_t>(stub)) -
+                              static_cast<s64>(address + NearJumpSize);
+    if (jump_distance < INT32_MIN || jump_distance > INT32_MAX) {
+        trampoline_gen.setSize(trampoline_offset);
+        return refuse("trampoline is out of rel32 range");
+    }
+    const size_t span_bytes = continuation - address;
+    auto& patch_gen = module->patch_gen;
+    patch_gen.reset();
+    patch_gen.setSize(address - reinterpret_cast<uintptr_t>(patch_gen.getCode()));
+    patch_gen.jmp(stub, Xbyak::CodeGenerator::LabelType::T_NEAR);
+    patch_gen.nop(span_bytes - NearJumpSize);
+    for (const auto* decoded : span) {
+        module->patched.insert(reinterpret_cast<u8*>(decoded->address));
+    }
+    module->patched_ranges.emplace_back(address, continuation);
+
+    result->installed = true;
+    result->displaced_bytes = span_bytes;
+    LOG_DEBUG(Core, "Guest detour at {:#x} (hook {}, mode {}, {} bytes)", address, request.hook_id,
+              static_cast<u32>(request.mode), span_bytes);
+    return true;
+}
+
+u64 TrampolineBytesUsed() {
+    u64 total = 0;
+    for (auto& [_, module] : modules) {
+        std::unique_lock lock{module.mutex};
+        total += module.trampoline_gen.getSize();
+    }
+    return total;
+}
+
+void RegisterFunctionStarts(std::span<const uintptr_t> function_starts) {
+    if (function_starts.empty()) {
+        return;
+    }
+    auto* module = GetContainingModule(reinterpret_cast<void*>(function_starts.front()));
+    if (module == nullptr) {
+        return;
+    }
+    std::unique_lock lock{module->mutex};
+    MergeFunctionStarts(module, {function_starts.begin(), function_starts.end()});
 }
 
 #else
@@ -2449,6 +3256,20 @@ bool NeedsSse4aEmulation() {
 u64 PatchShortSse4aInstructions(u64, u64, std::span<const uintptr_t>) {
     return 0;
 }
+
+bool InstallGuestDetour(const DetourRequest&, DetourResult* result) {
+    if (result != nullptr) {
+        *result = DetourResult{};
+        result->reason = "guest detours are Windows only";
+    }
+    return false;
+}
+
+u64 TrampolineBytesUsed() {
+    return 0;
+}
+
+void RegisterFunctionStarts(std::span<const uintptr_t>) {}
 
 #endif
 

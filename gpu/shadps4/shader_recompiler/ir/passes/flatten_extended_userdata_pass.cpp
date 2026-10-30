@@ -6,7 +6,9 @@
 #include <cstdlib>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 #include <boost/container/flat_map.hpp>
+#include <boost/container/small_vector.hpp>
 #include <queue>
 #include <xbyak/xbyak.h>
 #include <xbyak/xbyak_util.h>
@@ -117,12 +119,36 @@ void SetSrtCleanLoad(bool (*clean_load)(u64, u32, u64*)) {
     WalkerContext().clean_load = clean_load;
 }
 
+// sotc: SOTC_SYNC_PIPE. Calls fn(word_index, mask) once per bitmap word that holds a page of
+// [first, last] (page numbers, inclusive), mask holding exactly those pages of that word.
+template <typename Fn>
+void ForEachPageWordMask(u64 first, u64 last, Fn&& fn) {
+    for (u64 w = first >> 6; w <= (last >> 6); ++w) {
+        const u64 lo = (w == (first >> 6)) ? (first & 63) : 0;
+        const u64 hi = (w == (last >> 6)) ? (last & 63) : 63;
+        const u64 span = hi - lo + 1;
+        const u64 mask = (span == 64 ? ~0ULL : ((1ULL << span) - 1)) << lo;
+        fn(w, mask);
+    }
+}
+
 void SetSrtReadProtectedPages(u64 address, u64 size, bool read_protected) {
     auto& context = WalkerContext();
     if (!context.clean_pages || size == 0 || address >= SrtCleanPageLimit) {
         return;
     }
     const u64 last = std::min<u64>((address + size - 1) >> 12, (SrtCleanPageLimit >> 12) - 1);
+    if (SotcStats::kSyncPipe && !SotcStats::kSyncPipeVerify) { // sotc: SOTC_SYNC_PIPE
+        ForEachPageWordMask(address >> 12, last, [&](u64 w, u64 mask) {
+            if (read_protected) {
+                __atomic_fetch_or(&context.clean_pages[w], mask, __ATOMIC_RELAXED);
+            } else {
+                __atomic_fetch_and(&context.clean_pages[w], ~mask, __ATOMIC_RELAXED);
+            }
+        });
+        return;
+    }
+    // The per-page update: the result, unless SOTC_SYNC_PIPE=2 (verify) is set.
     for (u64 page = address >> 12; page <= last; ++page) {
         u64* word = &context.clean_pages[page >> 6];
         const u64 bit = 1ULL << (page & 63);
@@ -131,6 +157,20 @@ void SetSrtReadProtectedPages(u64 address, u64 size, bool read_protected) {
         } else {
             __atomic_fetch_and(word, ~bit, __ATOMIC_RELAXED);
         }
+    }
+    if (SotcStats::kSyncPipeVerify) { // sotc: SOTC_SYNC_PIPE=2. The per-word masks must name
+        // exactly the pages the per-page loop touched: rebuild each word's mask bit by bit from
+        // the page range and compare (no shared memory read, so no race with other writers).
+        ForEachPageWordMask(address >> 12, last, [&](u64 w, u64 mask) {
+            u64 expected = 0;
+            for (u64 page = std::max(address >> 12, w << 6); page <= std::min(last, (w << 6) + 63);
+                 ++page) {
+                expected |= 1ULL << (page & 63);
+            }
+            if (expected != mask) {
+                SotcStats::SyncPipe::verify_mismatches.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
     }
 }
 
@@ -141,7 +181,10 @@ void MarkSrtCleanPages(u64 address, u32 size) {
     }
     for (u64 page = address >> 12; page <= (address + size - 1) >> 12; ++page) {
         if ((page << 12) < SrtCleanPageLimit) {
-            context.clean_pages[page >> 6] |= 1ULL << (page & 63);
+            // sotc: atomic, as in SetSrtReadProtectedPages: Protect clears bits of the same
+            // words from other threads, and a plain |= could write a cleared bit back.
+            __atomic_fetch_or(&context.clean_pages[page >> 6], 1ULL << (page & 63),
+                              __ATOMIC_RELAXED);
         }
     }
 }
@@ -273,6 +316,8 @@ struct PassInfo {
         boost::container::flat_map<IR::Value, Shader::IR::Inst*, PointerListCompare>;
 
     Optimization::SrtGvnTable gvn_table;
+    // sotc: hash of the shader being flattened (for the once-per-shader log of unresolved Phis)
+    u64 pgm_hash{};
     // keys are GetUserData, ReadConst or ReadConstBuffer instructions that are used as pointers
     std::unordered_map<IR::Inst*, PtrUserList> pointer_uses;
     // GetUserData instructions corresponding to sgpr_base of SRT roots
@@ -617,6 +662,91 @@ static bool EmitComputeOffsetBitFieldUExtract(Xbyak::CodeGenerator& c, Xbyak::Re
     return true;
 }
 
+// sotc: two offset operands are the same value when they are the same immediate, the same
+// instruction, or instructions with the same value number (GVN: same opcode, flags and operand
+// value numbers; Phis never share one).
+static bool SameOffsetValue(PassInfo& pass_info, const IR::Value& a, const IR::Value& b) {
+    if (a.IsImmediate() || b.IsImmediate()) {
+        return a.IsImmediate() && b.IsImmediate() && a.U32() == b.U32();
+    }
+    if (a.Inst() == b.Inst()) {
+        return true;
+    }
+    return pass_info.gvn_table.GetValueNumber(a.Inst()) ==
+           pass_info.gvn_table.GetValueNumber(b.Inst());
+}
+
+// sotc: finds the single offset a Phi always holds: every operand is that offset, or the Phi
+// itself (a loop counter that keeps its value, phi(x, phi) = x). Operands that are Phis are
+// resolved recursively. `path` holds the Phis being resolved, so a cycle through other Phis
+// fails; `budget` bounds the work on Phi-heavy shaders. Pure: emits no code, so a failure
+// leaves the code buffer untouched. On success `out` is never a Phi.
+static bool ResolvePhi(PassInfo& pass_info, const IR::Inst* phi, IR::Value& out,
+                       boost::container::small_vector<const IR::Inst*, 8>& path, int& budget) {
+    if (path.size() >= 16 || --budget < 0) {
+        return false;
+    }
+    path.push_back(phi);
+    bool have_common = false;
+    IR::Value common;
+    for (size_t i = 0; i < phi->NumArgs(); i++) {
+        const IR::Value arg = phi->Arg(i);
+        IR::Value operand = arg;
+        if (!arg.IsImmediate()) {
+            const IR::Inst* arg_inst = arg.Inst();
+            if (arg_inst == phi) {
+                continue;
+            }
+            if (arg_inst->GetOpcode() == IR::Opcode::Phi) {
+                if (std::ranges::find(path, arg_inst) != path.end()) {
+                    return false;
+                }
+                if (!ResolvePhi(pass_info, arg_inst, operand, path, budget)) {
+                    return false;
+                }
+            }
+        }
+        if (!have_common) {
+            common = operand;
+            have_common = true;
+        } else if (!SameOffsetValue(pass_info, common, operand)) {
+            return false;
+        }
+    }
+    path.pop_back();
+    if (!have_common) {
+        return false;
+    }
+    out = common;
+    return true;
+}
+
+// sotc: logs the first Phi that does not resolve, once per shader (pgm hash); the walker falls
+// back for every such Phi.
+static void LogUnresolvedPhi(const PassInfo& pass_info, const IR::Inst* phi) {
+    static std::mutex log_mutex;
+    static std::unordered_set<u64> logged;
+    {
+        std::scoped_lock lock{log_mutex};
+        if (!logged.insert(pass_info.pgm_hash).second) {
+            return;
+        }
+    }
+    std::string operands;
+    for (size_t i = 0; i < phi->NumArgs(); i++) {
+        const IR::Value arg = phi->Arg(i);
+        if (arg.IsImmediate()) {
+            operands += fmt::format(" imm:{}", arg.U32());
+        } else {
+            operands += fmt::format(" {}", magic_enum::enum_name(arg.Inst()->GetOpcode()));
+        }
+    }
+    LOG_WARNING(Render_Recompiler,
+                "SRT walker: Phi did not resolve to one offset in shader {:#018x}, falling back;"
+                " operands:{}",
+                pass_info.pgm_hash, operands);
+}
+
 static bool IsAllowedOffsetInstruction(const IR::Inst* inst) {
     switch (inst->GetOpcode()) {
     case IR::Opcode::GetUserData:
@@ -649,7 +779,17 @@ static bool ComputeOffset(Xbyak::CodeGenerator& c, Xbyak::Reg32 reg, PassInfo& p
         c.mov(reg, ptr[rsi + (static_cast<u32>(inst->Arg(0).ScalarReg()) << 2)]);
         return true;
     case IR::Opcode::ReadConst:
-    case IR::Opcode::ReadConstBuffer:
+    case IR::Opcode::ReadConstBuffer: {
+        // sotc: a ReadConst given a dynamic copy window holds window | ReadConstDynamicWindowFlag in
+        // its flags; GetFlatbufOffset keeps the low 16 bits, so it would read the window's first
+        // dword instead of the value (wrong sharps: broken vertices). Such operands cannot be used
+        // as an offset here: fall back. Phi resolution made these trees reachable.
+        const IR::Inst* dedup = pass_info.DeduplicateInstruction(inst);
+        if ((inst->Flags<u32>() & ReadConstDynamicWindowFlag) != 0 ||
+            (dedup->Flags<u32>() & ReadConstDynamicWindowFlag) != 0) {
+            return false;
+        }
+    }
         if (u16 offset = GetFlatbufOffset(pass_info.DeduplicateInstruction(inst)); offset != 0) {
             c.mov(reg, ptr[rsi + (offset << 2)]);
             return true;
@@ -691,6 +831,32 @@ static bool ComputeOffset(Xbyak::CodeGenerator& c, Xbyak::Reg32 reg, PassInfo& p
     case IR::Opcode::BitFieldUExtract:
         ABORT_ON_FAILURE(EmitComputeOffsetBitFieldUExtract(c, reg, pass_info, inst));
         return true;
+    case IR::Opcode::Phi: {
+        // sotc: SOTC_SRT_PHI=0 restores the fallback for every Phi (shader cache rebuilt either way).
+        static const bool resolve_phis = [] {
+            const char* v = std::getenv("SOTC_SRT_PHI");
+            return !v || v[0] != '0';
+        }();
+        if (!resolve_phis) {
+            return false;
+        }
+        IR::Value resolved;
+        boost::container::small_vector<const IR::Inst*, 8> path;
+        int budget = 256;
+        if (ResolvePhi(pass_info, inst, resolved, path, budget)) {
+            // resolved is never a Phi, so this emits the operand's own computation
+            const bool emitted = resolved.IsImmediate()
+                                     ? (c.mov(reg, resolved.U32()), true)
+                                     : ComputeOffset(c, reg, pass_info, resolved);
+            if (emitted) {
+                SotcStats::phi_resolved.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+        }
+        SotcStats::phi_fallback.fetch_add(1, std::memory_order_relaxed);
+        LogUnresolvedPhi(pass_info, inst);
+        return false;
+    }
     default:
         // sotc: first few only: ~1000 per session while shaders translate on the draw path (the
         // walker falls back), each a stderr line costing milliseconds there.
@@ -1024,6 +1190,7 @@ void SimplifyReadConstAddressAdd(IR::Inst& inst) {
 void FlattenExtendedUserdataPass(IR::Program& program) {
     auto& post_order = program.post_order_blocks;
     PassInfo pass_info;
+    pass_info.pgm_hash = program.info.pgm_hash;
 
     // traverse at end and assign offsets to duplicate readconsts, using
     // vn_to_inst as the source

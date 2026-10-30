@@ -1,4 +1,5 @@
-// bbport: profiler disabled.
+// sotc: the Vulkan profiler macros stay no-ops (no GPU zones through Tracy; the GPU queue
+// spans come from the SOTC_TRACE queue watcher instead). The host zones of Tracy.hpp are unaffected.
 #pragma once
 #include "Tracy.hpp"
 #define TracyVkCtx void*

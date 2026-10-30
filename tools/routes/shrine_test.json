@@ -1,0 +1,12 @@
+{
+  "_comment": "Short test route: leaves the Shrine of Worship start point heading north, 15-30 m above the ground (about 8 s at 20 m/s). For SOTC_LAB_ROUTE tests.",
+  "name": "shrine_test",
+  "speed": 20.0,
+  "start": {},
+  "points": [
+    { "p": [298.0, 10.0, -190.0], "yaw": 3.1416, "pitch": -0.15, "seg": "shrine", "dwell_ms": 0 },
+    { "p": [300.0, 10.0, -150.0], "yaw": 3.1416, "pitch": -0.15, "dwell_ms": 0 },
+    { "p": [304.0, 15.0, -100.0], "yaw": 3.1416, "pitch": -0.1, "seg": "field", "dwell_ms": 0 },
+    { "p": [304.0, 30.0, -40.0], "yaw": 3.1416, "pitch": -0.1, "dwell_ms": 0 }
+  ]
+}

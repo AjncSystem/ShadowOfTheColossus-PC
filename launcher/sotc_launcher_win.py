@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 
+import sotc_tuning
 import sotc_update
 
 FROZEN = getattr(sys, 'frozen', False)
@@ -160,7 +161,7 @@ def windows_language():
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
                 'user_dir': '', 'af16': True, 'textures': 'high', 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
-                'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'rb_hot': False, 'skip_logos': False, 'skip_film': False, 'close_on_play': False, 'gamepad': '', 'rumble': True,
+                'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'rb_hot': True, 'skip_logos': False, 'skip_film': False, 'close_on_play': False, 'gamepad': '', 'rumble': True,
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
@@ -169,6 +170,8 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'dlss_mode': 'quality', 'dlss_sharpen': '0', 'dlss_ui_sharpen': '3', 'dlss_sky_sharpen': '2',
                 'dlss_compare': False,
                 'check_updates': True, 'skip_version': ''}
+# The tuning switches of the streaming-stutter work, each at the build's default (sotc_tuning.py).
+APP_DEFAULTS.update(sotc_tuning.defaults())
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
 KEY_INPUTS = [
     ('move_up', 'W', ('Andar para frente', 'Move forward')), ('move_down', 'S', ('Andar para trás', 'Move back')),
@@ -545,6 +548,10 @@ def load_settings():
                         shutil.copytree(source, target)
                     except OSError:
                         pass
+    sotc_tuning.migrate(saved)  # switches that became on by default drop their old saved "off"
+    if not saved.get('rb_hot_migrated_20261030'):  # hot readbacks: on by default since 30 Oct
+        saved.pop('rb_hot', None)
+        saved['rb_hot_migrated_20261030'] = True
     settings = {**APP_DEFAULTS, **saved}
     if 'fps_mode' not in saved:  # before the choice: the "uncapped FPS" box
         settings['fps_mode'] = '60' if saved.get('fps60') else '30'
@@ -555,6 +562,7 @@ def load_settings():
         if 'SOTC_DLSSG=1' in extra:
             settings['framegen'] = 'auto'
             settings['extra_env'] = ' '.join(item for item in extra if item != 'SOTC_DLSSG=1')
+    sotc_tuning.fill_defaults(settings)  # value fields saved empty by 0.70.1 show their default
     return settings
 
 
@@ -716,10 +724,11 @@ def game_environment(s):
     env['SOTC_MOUSE'] = '1' if s.get('mouse', True) else '0'
     env['SOTC_MOUSE_SENS'] = str(s.get('mouse_sens') or '1.0')
     env['SOTC_MOUSE_INVERT'] = '1' if s.get('mouse_invert') else '0'
-    # Hot readbacks (buffer_cache.cpp GatherDownloads): ~25% more FPS at the Shrine; off by
-    # default since they put rainbow garbage and crashes on reused memory before the late check.
-    if s.get('rb_hot'):
-        env['SOTC_RB_HOT'] = '1'
+    # Hot readbacks (buffer_cache.cpp GatherDownloads): on by default since 30 Oct 2026 (mode 2,
+    # the build's default; attract demo ~57 / 40 FPS against 54.8 / 36.4). Known risk: rainbow
+    # garbage and crashes on reused memory (the reason they were off from 22 Oct). Unchecked: 0.
+    if not s.get('rb_hot', True):
+        env['SOTC_RB_HOT'] = '0'
     # Bluepoint's debug menu (+RetailBuild=0 served by the port; the game files are not touched).
     if s.get('debug_menu'):
         env['SOTC_DEBUG_MENU'] = '1'
@@ -731,6 +740,8 @@ def game_environment(s):
     if not s.get('rumble', True):
         env['SOTC_RUMBLE'] = '0'
     env['BB_CONFIG'] = str(PORT_DIR / 'sotc.ini')
+    # The tuning switches not at their default; the extra variables below still win.
+    env.update(sotc_tuning.environment(s))
     for item in str(s['extra_env']).split():
         if '=' in item:
             key, value = item.split('=', 1)
@@ -1042,7 +1053,9 @@ class Launcher:
         self.nav, self.current_page = {}, None
         for name, title in (('play', _('Jogar', 'Play')), ('game', _('Jogo e saves', 'Game & saves')),
                             ('graphics', _('Imagem e FPS', 'Display & FPS')), ('controls', _('Controles', 'Controls')),
-                            ('advanced', _('Avançado', 'Advanced')), ('debug', _('Debug', 'Debug'))):
+                            ('advanced', _('Avançado', 'Advanced')),
+                            ('tuning', _('Ajustes experimentais', 'Experimental tuning')),
+                            ('debug', _('Debug', 'Debug'))):
             item = tk.Label(side, text='    ' + title, bg=BG, fg=TEXT, anchor='w', font=(ui_font(), 11),
                             pady=10, cursor='hand2')
             item.pack(fill='x')
@@ -1079,6 +1092,7 @@ class Launcher:
         self.build_graphics()
         self.build_controls()
         self.build_advanced()
+        self.build_tuning()
         self.build_debug()
         self.build_log()
         self.root.bind_all('<MouseWheel>', self.wheel)
@@ -1426,6 +1440,50 @@ class Launcher:
         self.section(f, _('Tela', 'Display'))
         self.check(f, 'fullscreen', _('Tela cheia', 'Fullscreen'))
         self.row(f, _('Apresentação', 'Presentation'), self.choice(f, 'present_mode', PRESENT_MODES))
+
+    def build_tuning(self):
+        """The tuning switches of the streaming-stutter work (sotc_tuning.py), on their own page,
+        grouped, each with its variable name in the hint."""
+        ttk = self.ttk
+        f = self.scrolled_page('tuning', _('Ajustes experimentais', 'Experimental tuning'),
+                               _('As opções criadas no trabalho contra as travadas no streaming.',
+                                 'The options made in the work against the streaming stutters.'))
+        self.note(f, _('Todas começam no valor padrão. Quase todas são experimentais ou só medem; mude uma '
+                       'por vez e compare. O campo "Variáveis extras" (aba Avançado) vale por cima destas.',
+                       'All start at their default. Almost all are experimental or only measure; change one '
+                       'at a time and compare. The "Extra variables" field (Advanced page) applies on top of '
+                       'these.'), top=4)
+
+        def reset():
+            for name, kind, *_rest in sotc_tuning.TUNING:
+                self.var(sotc_tuning.setting_key(name)).set(APP_DEFAULTS[sotc_tuning.setting_key(name)])
+        ttk.Button(f, text=_('Voltar todos ao padrão', 'Reset all to default'), command=reset).grid(
+            row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(6, 0))
+        def wide_row(title, make_widget, hint):
+            # Title and field on one line, the hint below across the page (as self.check does):
+            # in the two-column self.row the long titles pushed the hints off the right edge.
+            r = self.next_row(f)
+            holder = ttk.Frame(f)
+            holder.grid(row=r, column=0, columnspan=2, sticky='w', pady=(6, 0))
+            ttk.Label(holder, text=title).pack(side='left', padx=(0, 12))
+            make_widget(holder).pack(side='left')
+            ttk.Label(f, text=hint, style='Muted.TLabel', wraplength=self.px(640), justify='left').grid(
+                row=r + 1, column=0, columnspan=2, sticky='w', padx=(26, 0))
+
+        titles = dict(sotc_tuning.GROUPS)
+        group = None
+        for name, kind, row_group, title, hint, _default, options in sotc_tuning.TUNING:
+            if row_group != group:
+                group = row_group
+                self.section(f, _(*titles[group]), top=14)
+            key = sotc_tuning.setting_key(name)
+            text = '{} ({})'.format(_(*hint), name)  # the hint already gives the default
+            if kind in ('flag', 'flag_on'):
+                self.check(f, key, _(*title), text)
+            elif kind == 'choice':
+                wide_row(_(*title), lambda p, k=key, o=list(options): self.choice(p, k, o, 34), text)
+            else:
+                wide_row(_(*title), lambda p, k=key: ttk.Entry(p, textvariable=self.var(k), width=14), text)
 
     def build_controls(self):
         ttk = self.ttk

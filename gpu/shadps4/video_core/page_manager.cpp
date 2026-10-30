@@ -24,14 +24,21 @@
 #include "common/multi_level_page_table.h"
 #include "common/signal_context.h"
 #include "common/thread.h"
+#include "sotc_backing_warm.h" // sotc: SOTC_BACKING_WARM (gpu/shim)
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "common/decoder.h"
 #include "core/signals.h"
 #include "shader_recompiler/ir/passes/srt.h"
 #include "video_core/page_manager.h"
+#include "video_core/sotc_op_phases.h" // sotc: SOTC_OP_PHASES
 #include "video_core/sotc_stats.h"
+#include "video_core/buffer_cache/async_upload.h" // sotc: SOTC_WRITE_DECL waits for the copies
+#include "video_core/buffer_cache/buffer_cache.h" // sotc: SOTC_FPS readbacks by guest RIP (B6)
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/buffer_cache/memory_tracker.h" // sotc: SOTC_WRITE_DECL (MAX_CPU_PAGE_BITS)
+#include "../../sotc/write_decl.h" // sotc: SOTC_WRITE_DECL statistics and write fault classes
+#include "../../sotc/mem_classes.h" // sotc: SOTC_CLASS_TRACK write faults per pool (plan step 6)
 
 // src/runtime_memory.c: the runtime's view of a page next to the host protection (diagnostics).
 extern "C" void runtime_memory_describe(uintptr_t address, char* out, size_t capacity);
@@ -124,8 +131,50 @@ std::unique_lock<StackLock> LockStacksExclusive() {
 // Reference counted: the margin below one stack often covers a neighbouring stack (games pack
 // fiber stacks back to back), so finalizing one must not drop the other's protection.
 boost::icl::interval_map<VAddr, u32> g_guest_stacks;
+// sotc: bumped (under the exclusive lock) whenever g_guest_stacks changes; readers keep a sorted
+// per-thread copy of its segments and refresh it only when this moves (StackSegments).
+std::atomic<u64> g_guest_stacks_generation{1};
 // Re-applies the tracker's protection to pages that stop being stack pages.
 std::function<void(VAddr, u64)> g_reapply_protection;
+
+// sotc: SOTC_PROTECT_BATCH (page_manager.h, PageManager::ProtectBatch). A collected protection
+// change: pages [page, page + pages) were left by their tracker update in state perms.
+struct PendingProtect {
+    u64 page;
+    u64 pages;
+    Core::MemoryPermission perms;
+};
+struct ProtectBatchState {
+    u32 depth = 0;     ///< open ProtectBatch scopes on this thread
+    u32 suspended = 0; ///< faults being handled on this thread (their updates protect at once)
+    std::vector<PendingProtect> runs;
+    // sotc: SOTC_PROTECT_COALESCE (PageManager::FaultProtectScope): the unprotects a guest write
+    // fault collects. Always read-write runs (the perms field is kept for the shared flush).
+    u32 fault_depth = 0;
+    std::vector<PendingProtect> fault_runs;
+};
+thread_local ProtectBatchState tl_protect_batch;
+// Applies this thread's collected changes (the tracker instance's FlushProtectBatch).
+std::function<void()> g_protect_batch_flush;
+// Applies this thread's fault runs, then makes the page writable (FlushFaultProtects).
+std::function<void(VAddr)> g_fault_protect_flush;
+// Makes one page writable if the tracker says so and the host does not (EnsurePageWritable).
+std::function<void(VAddr)> g_fault_page_fix;
+
+/// sotc: SOTC_PROTECT_COALESCE: pages of a hole between two runs of one protection that a flush
+/// bridges with a single call (SOTC_PROTECT_GAP, default 8; 0 = no bridging, also when the switch
+/// is off). A bridged page is protected only if its own state is that protection, under its page
+/// lock, as every page of a run is, so bridging never changes what a page ends up with.
+u64 CoalesceGapPages() {
+    static const u64 v = [] {
+        if (!SotcStats::kProtectCoalesce) {
+            return u64{0};
+        }
+        const char* e = std::getenv("SOTC_PROTECT_GAP");
+        return e ? std::min<u64>(std::strtoull(e, nullptr, 10), 64) : u64{8};
+    }();
+    return v;
+}
 } // namespace
 
 // The exception frame is written below the faulting stack pointer, so a nearly full stack also
@@ -143,6 +192,7 @@ void RegisterGuestStack(VAddr address, u64 size) {
     {
         auto lk = LockStacksExclusive(); // in-flight SignalImpl::Protect calls hold it shared
         g_guest_stacks += std::make_pair(boost::icl::interval<VAddr>::right_open(begin, end), 1u);
+        g_guest_stacks_generation.fetch_add(1, std::memory_order_release);
     }
     // Protects that computed their ranges before the insert have finished their host protect
     // (they held the lock shared); later ones see the range. Make it accessible now.
@@ -159,6 +209,7 @@ void UnregisterGuestStack(VAddr address, u64 size) {
     {
         auto lk = LockStacksExclusive();
         g_guest_stacks -= std::make_pair(boost::icl::interval<VAddr>::right_open(begin, end), 1u);
+        g_guest_stacks_generation.fetch_add(1, std::memory_order_release);
     }
     // The pages were left accessible while they were a stack: give the tracker its protection
     // back, or CPU writes there would go unnoticed (pages still used by another stack stay).
@@ -167,26 +218,63 @@ void UnregisterGuestStack(VAddr address, u64 size) {
     }
 }
 
+// sotc: see page_manager.h. Shared lock like the readers below: a writer only try-locks, so this
+// waits for at most one registry edit.
+bool GuestStackRange(VAddr addr, VAddr& lo, VAddr& hi) {
+    std::shared_lock lk{g_guest_stacks_mutex};
+    const auto it = g_guest_stacks.find(addr);
+    if (it == g_guest_stacks.end()) {
+        return false;
+    }
+    lo = it->first.lower();
+    hi = it->first.upper();
+    return true;
+}
+
+namespace {
+// sotc: the stack segments as a sorted flat array, one copy per thread. Guest stacks change only
+// when a guest thread or fiber is created or destroyed, while the readback and fault paths ask
+// for every range they write: a shared lock plus an interval-tree lookup (and an interval_set
+// built and destroyed) per call showed up as ~8% of the draw thread while streaming. The copy is
+// refreshed only when g_guest_stacks_generation moved.
+const std::vector<std::pair<VAddr, VAddr>>& StackSegments() {
+    struct Cache {
+        u64 generation = 0;
+        std::vector<std::pair<VAddr, VAddr>> segments;
+    };
+    thread_local Cache cache;
+    if (cache.generation != g_guest_stacks_generation.load(std::memory_order_acquire)) {
+        std::shared_lock lk{g_guest_stacks_mutex};
+        cache.segments.clear();
+        for (const auto& [interval, count] : g_guest_stacks) {
+            cache.segments.emplace_back(interval.lower(), interval.upper());
+        }
+        // Read under the lock: a change after it bumps the generation again.
+        cache.generation = g_guest_stacks_generation.load(std::memory_order_acquire);
+    }
+    return cache.segments;
+}
+} // namespace
+
+bool IntersectsGuestStack(VAddr address, u64 size) {
+    const VAddr end = address + size;
+    const auto& segments = StackSegments();
+    const auto it = std::ranges::partition_point(
+        segments, [address](const std::pair<VAddr, VAddr>& seg) { return seg.second <= address; });
+    return it != segments.end() && it->first < end;
+}
+
 // sotc: func is a NonStackRangeFn (non-owning) instead of const std::function&; see page_manager.h.
 void ForEachNonStackRange(VAddr address, u64 size, NonStackRangeFn func) {
     if (size == 0) {
         return;
     }
-    boost::icl::interval_set<VAddr> ranges;
-    const auto window = boost::icl::interval<VAddr>::right_open(address, address + size);
-    bool overlaps = false;
-    {
-        std::shared_lock lk{g_guest_stacks_mutex};
-        const auto [first, last] = g_guest_stacks.equal_range(window);
-        if (first != last) {
-            overlaps = true;
-            ranges += window;
-            for (auto it = first; it != last; ++it) {
-                ranges -= it->first;
-            }
-        }
-    }
-    if (!overlaps) {
+    const VAddr end = address + size;
+    const auto& segments = StackSegments();
+    // First segment ending after address (segments are sorted and disjoint).
+    auto it = std::ranges::partition_point(
+        segments, [address](const std::pair<VAddr, VAddr>& seg) { return seg.second <= address; });
+    if (it == segments.end() || it->first >= end) {
         // Common case: nothing of the range is a stack.
         func(address, size);
         return;
@@ -196,10 +284,47 @@ void ForEachNonStackRange(VAddr address, u64 size, NonStackRangeFn func) {
         LOG_WARNING(Render, "Not writing GPU data back over guest stack pages in {:#x}+{:#x}",
                     address, size);
     }
-    for (const auto& range : ranges) {
-        func(range.lower(), range.upper() - range.lower());
+    VAddr cursor = address;
+    for (; it != segments.end() && it->first < end; ++it) {
+        if (it->first > cursor) {
+            func(cursor, it->first - cursor);
+        }
+        cursor = std::max(cursor, it->second);
+    }
+    if (cursor < end) {
+        func(cursor, end - cursor);
     }
 }
+
+namespace {
+// sotc: SOTC_FAULT_OSCOST (MeasureFaultOsCost): the private page the measurement faults on, and
+// the clock readings its handler leaves. The handler is registered at start-up when the switch is
+// on (the handler list must not change while threads dispatch faults).
+std::atomic<bool> g_oscost_registered{false};
+std::atomic<uintptr_t> g_oscost_page{0};
+std::atomic<u64> g_oscost_enter_ns{0};
+std::atomic<u64> g_oscost_exit_ns{0};
+
+bool OsCostFaultHandler(void*, void* address) {
+    const uintptr_t page = g_oscost_page.load(std::memory_order_acquire);
+    const auto fault = reinterpret_cast<uintptr_t>(address);
+    if (page == 0 || fault < page || fault >= page + 4096) {
+        return false;
+    }
+    // Entry of bbgpu_handle_fault when SOTC_FPS timed it (the dispatch that got here is part of
+    // what the operating system and the loader add to a fault).
+    const auto& tl = SotcStats::FaultStat::tl;
+    // sotc: SOTC_FPS_LEAN leaves t0 at 0 (the fault is not timed): take the clock here instead.
+    g_oscost_enter_ns.store(tl.active && tl.t0 ? tl.t0 : SotcStats::NowNs(),
+                            std::memory_order_relaxed);
+#ifdef _WIN64
+    DWORD old{};
+    VirtualProtect(reinterpret_cast<void*>(page), 4096, PAGE_READWRITE, &old);
+#endif
+    g_oscost_exit_ns.store(SotcStats::NowNs(), std::memory_order_relaxed);
+    return true;
+}
+} // namespace
 
 struct PageManager::Impl {
     struct PageState {
@@ -257,7 +382,12 @@ struct PageManager::Impl {
     static constexpr size_t NUM_ADDRESS_LOCKS = NUM_ADDRESS_PAGES / NUM_REGION_PAGES;
     inline static Vulkan::Rasterizer* rasterizer;
 
-    Impl() = default;
+    Impl() {
+        // sotc: SOTC_PROTECT_BATCH: the batches of every thread flush through this instance.
+        g_protect_batch_flush = [this] { FlushProtectBatch(); };
+        g_fault_protect_flush = [this](VAddr fault_page) { FlushFaultProtects(fault_page); };
+        g_fault_page_fix = [this](VAddr page) { EnsurePageWritable(page >> PM_PAGE_BITS); };
+    }
     virtual ~Impl() = default;
 
     virtual void OnMap(VAddr address, size_t size) {
@@ -331,9 +461,19 @@ struct PageManager::Impl {
         u64 range_begin = page_start;
         u64 range_pages = 0;
         u64 potential_pages = 0;
+        // sotc: SOTC_PROTECT_COALESCE. A pending run whose changed pages all went from read-only
+        // to read-write is collected by this thread's fault scope (PageManager::FaultProtectScope).
+        const bool fault_collect = tl_protect_batch.fault_depth != 0;
+        bool unprotect_only = true;
 
         const auto release_pending = [&] {
             if (range_pages > 0) {
+                if (fault_collect && unprotect_only) {
+                    CollectFaultProtect(range_begin, range_pages);
+                    range_pages = 0;
+                    potential_pages = 0;
+                    return;
+                }
                 if (SotcStats::kCmdStats) SotcStats::sys_protect_src[0].fetch_add(1, std::memory_order_relaxed);
                 Protect(range_begin << PM_PAGE_BITS, range_pages << PM_PAGE_BITS, perms);
                 range_pages = 0;
@@ -384,7 +524,10 @@ struct PageManager::Impl {
                     // Start a new potential range
                     range_begin = page;
                     potential_pages = 1;
+                    unprotect_only = true;
                 }
+                unprotect_only &= old_perms == Core::MemoryPermission::Read &&
+                                  new_perms == Core::MemoryPermission::ReadWrite;
                 // Extend current range up to potential range
                 range_pages = potential_pages;
             }
@@ -402,7 +545,7 @@ struct PageManager::Impl {
 
     void UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,
                                      const RegionBits& write_mask, const RegionBits& read_mask,
-                                     PageOp write_op, PageOp read_op) {
+                                     PageOp write_op, PageOp read_op, bool deferrable = false) {
         const u64 base_page = base_addr >> PM_PAGE_BITS;
         const u64 page_start = bounds.start_word * PAGES_PER_WORD + bounds.start_page;
         const u64 page_end = bounds.end_word * PAGES_PER_WORD + bounds.end_page + 1;
@@ -411,9 +554,27 @@ struct PageManager::Impl {
         u64 range_begin = base_page + page_start;
         u64 range_pages = 0;
         u64 potential_pages = 0;
+        // sotc: SOTC_PROTECT_BATCH. Collected by this thread's open batch instead (the caller
+        // only passes deferrable for re-protects, see PageManager::ProtectBatch).
+        const bool defer = deferrable && PageManager::ProtectBatchOpen();
+        // sotc: SOTC_PROTECT_COALESCE, see UpdatePageWatchers.
+        const bool fault_collect = tl_protect_batch.fault_depth != 0;
+        bool unprotect_only = true;
 
         const auto release_pending = [&] {
             if (range_pages > 0) {
+                if (defer) {
+                    CollectProtect(range_begin, range_pages, perms);
+                    range_pages = 0;
+                    potential_pages = 0;
+                    return;
+                }
+                if (fault_collect && unprotect_only) {
+                    CollectFaultProtect(range_begin, range_pages);
+                    range_pages = 0;
+                    potential_pages = 0;
+                    return;
+                }
                 if (SotcStats::kCmdStats) SotcStats::sys_protect_src[1].fetch_add(1, std::memory_order_relaxed);
                 Protect(range_begin << PM_PAGE_BITS, range_pages << PM_PAGE_BITS, perms);
                 range_pages = 0;
@@ -454,7 +615,10 @@ struct PageManager::Impl {
                     // Start a new potential range
                     range_begin = base_page + page;
                     potential_pages = 1;
+                    unprotect_only = true;
                 }
+                unprotect_only &= old_perms == Core::MemoryPermission::Read &&
+                                  new_perms == Core::MemoryPermission::ReadWrite;
                 // Extend current rango up to potential range
                 range_pages = potential_pages;
             }
@@ -468,6 +632,212 @@ struct PageManager::Impl {
                 lock->unlock();
             }
         }
+    }
+
+    /// sotc: SOTC_PROTECT_BATCH. Adds the run to this thread's batch (page locks of the run held
+    /// by the caller; the batch itself is thread-local). A run touching or overlapping the last
+    /// one with the same protection extends it.
+    static void CollectProtect(u64 page, u64 pages, Core::MemoryPermission perms) {
+        if (SotcStats::kFpsLog) {
+            SotcStats::protect_batch_requests.fetch_add(1, std::memory_order_relaxed);
+        }
+        auto& runs = tl_protect_batch.runs;
+        if (!runs.empty()) {
+            PendingProtect& last = runs.back();
+            if (last.perms == perms && page <= last.page + last.pages &&
+                last.page <= page + pages) {
+                const u64 begin = std::min(last.page, page);
+                const u64 end = std::max(last.page + last.pages, page + pages);
+                last.page = begin;
+                last.pages = end - begin;
+                return;
+            }
+        }
+        runs.push_back({page, pages, perms});
+    }
+
+    /// sotc: SOTC_PROTECT_COALESCE. Adds a read-write run to this thread's fault scope (page locks
+    /// of the run held by the caller; the list is thread-local).
+    static void CollectFaultProtect(u64 page, u64 pages) {
+        if (SotcStats::kFpsLog) {
+            SotcStats::coalesce_requests.fetch_add(1, std::memory_order_relaxed);
+        }
+        auto& runs = tl_protect_batch.fault_runs;
+        if (!runs.empty()) {
+            PendingProtect& last = runs.back();
+            if (page <= last.page + last.pages && last.page <= page + pages) {
+                const u64 begin = std::min(last.page, page);
+                const u64 end = std::max(last.page + last.pages, page + pages);
+                last.page = begin;
+                last.pages = end - begin;
+                return;
+            }
+        }
+        runs.push_back({page, pages, Core::MemoryPermission::ReadWrite});
+    }
+
+    struct FlushResult {
+        u64 calls = 0;
+        u64 pages = 0;
+        u64 redundant = 0;
+    };
+
+    /// sotc: applies collected runs (SOTC_PROTECT_BATCH's, or a fault scope's) and empties them.
+    /// Each run's pages are locked (ascending, as every tracker update locks them; no other lock
+    /// is held here) and a page is protected only while its watcher state still gives the
+    /// collected protection, under its page lock, as the update would have done. A page whose
+    /// state moved since is skipped: the update that moved it protected it from the state it left
+    /// (under the same page lock, after ours), or collected it in its own batch. So the host
+    /// protection of every page still ends as its last update's state, as without batching.
+    /// gap > 0 (SOTC_PROTECT_COALESCE): runs of one protection at most gap pages apart become one
+    /// run; the pages between them are checked like any other page of a run, so a page in the hole
+    /// that is not in that protection splits the run again and is left alone.
+    FlushResult FlushRuns(std::vector<PendingProtect>& runs, u64 gap) {
+        FlushResult result;
+        std::ranges::sort(runs, [](const PendingProtect& a, const PendingProtect& b) {
+            return a.page != b.page ? a.page < b.page
+                                    : std::to_underlying(a.perms) < std::to_underlying(b.perms);
+        });
+        std::size_t merged = 0;
+        for (std::size_t i = 0; i < runs.size(); ++i) {
+            // Joins an earlier run of the same protection that ends within gap pages (runs are
+            // sorted by start, so only the last few can be near enough). gap 0: only a run that
+            // touches or overlaps, and only the previous one.
+            bool joined = false;
+            const std::size_t span = gap == 0 ? 1 : 4;
+            const std::size_t lowest = merged > span ? merged - span : 0;
+            for (std::size_t j = merged; j-- > lowest && !joined;) {
+                PendingProtect& earlier = runs[j];
+                if (earlier.perms == runs[i].perms &&
+                    earlier.page + earlier.pages + gap >= runs[i].page) {
+                    earlier.pages = std::max(earlier.page + earlier.pages,
+                                             runs[i].page + runs[i].pages) -
+                                    earlier.page;
+                    joined = true;
+                }
+            }
+            if (!joined) {
+                runs[merged++] = runs[i];
+            }
+        }
+        thread_local std::vector<u64> locked_pages;
+        for (std::size_t i = 0; i < merged; ++i) {
+            const PendingProtect run = runs[i];
+            const u64 run_end = run.page + run.pages;
+            locked_pages.clear();
+            for (u64 page = run.page; page < run_end; ++page) {
+                if (cached_pages.find(page)) {
+                    locks[page].lock();
+                    locked_pages.push_back(page);
+                }
+            }
+            u64 begin = 0;
+            u64 count = 0;
+            const auto emit = [&] {
+                if (count != 0) {
+                    if (SotcStats::kCmdStats) {
+                        SotcStats::sys_protect_src[1].fetch_add(1, std::memory_order_relaxed);
+                    }
+                    Protect(begin << PM_PAGE_BITS, count << PM_PAGE_BITS, run.perms);
+                    ++result.calls;
+                    result.pages += count;
+                    count = 0;
+                }
+            };
+            for (const u64 page : locked_pages) {
+                const PageState* state = cached_pages.find(page);
+                if (state->Perms() != run.perms) {
+                    ++result.redundant;
+                    emit();
+                    continue;
+                }
+                if (count != 0 && begin + count != page) {
+                    emit();
+                }
+                if (count == 0) {
+                    begin = page;
+                }
+                ++count;
+            }
+            emit();
+            for (const u64 page : locked_pages) {
+                locks[page].unlock();
+            }
+        }
+        runs.clear();
+        return result;
+    }
+
+    /// sotc: SOTC_PROTECT_BATCH. Applies this thread's collected runs (FlushRuns).
+    void FlushProtectBatch() {
+        auto& runs = tl_protect_batch.runs;
+        if (runs.empty()) {
+            return;
+        }
+        const FlushResult result = FlushRuns(runs, CoalesceGapPages());
+        if (SotcStats::kFpsLog) {
+            SotcStats::protect_batch_calls.fetch_add(result.calls, std::memory_order_relaxed);
+            SotcStats::protect_batch_pages.fetch_add(result.pages, std::memory_order_relaxed);
+            SotcStats::protect_batch_redundant.fetch_add(result.redundant,
+                                                         std::memory_order_relaxed);
+        }
+    }
+
+    /// sotc: SOTC_PROTECT_COALESCE. Applies this thread's fault runs (FlushRuns), then, if
+    /// fault_page (0: none) was not part of them, makes it writable when its tracker state says
+    /// so. That page may have been covered by another thread's pending flush (its CPU bit was set
+    /// by that thread's update, so this fault's own update changed nothing): applying the state
+    /// here keeps every faulting thread independent of the others' flushes.
+    void FlushFaultProtects(VAddr fault_page) {
+        auto& runs = tl_protect_batch.fault_runs;
+        const u64 page = fault_page >> PM_PAGE_BITS;
+        bool covered = false;
+        for (const PendingProtect& run : runs) {
+            covered |= page >= run.page && page < run.page + run.pages;
+        }
+        if (!runs.empty()) {
+            const FlushResult result = FlushRuns(runs, CoalesceGapPages());
+            if (SotcStats::kFpsLog) {
+                SotcStats::coalesce_calls.fetch_add(result.calls, std::memory_order_relaxed);
+                SotcStats::coalesce_pages.fetch_add(result.pages, std::memory_order_relaxed);
+                SotcStats::coalesce_skipped.fetch_add(result.redundant, std::memory_order_relaxed);
+            }
+        }
+        if (fault_page != 0 && !covered) {
+            EnsurePageWritable(page);
+        }
+    }
+
+    /// sotc: SOTC_PROTECT_COALESCE. Applies the tracker's state to one page when it says
+    /// read-write and the host disagrees. Run for EVERY handled write fault (of a guest thread
+    /// whose runs did not cover the page, of the command processor, of a fault that did not
+    /// collect), so that no thread's progress depends on another thread's pending flush: the page
+    /// may have been covered by a flush another thread has not applied yet (its update set the CPU
+    /// bit, so this fault's own update changed nothing). Page lock held across the check and the
+    /// protect, as every update; a state that is not read-write is left to the update that set it.
+    void EnsurePageWritable(u64 page) {
+        if (!cached_pages.find(page)) {
+            return;
+        }
+        locks[page].lock();
+        if (cached_pages.find(page)->Perms() == Core::MemoryPermission::ReadWrite) {
+#ifdef _WIN32
+            // The query takes no exclusive lock on the address space, a protect does: ask first
+            // (an update that was applied at once, not collected, left the page writable).
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(reinterpret_cast<void*>(page << PM_PAGE_BITS), &info, sizeof(info)) &&
+                (info.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY |
+                                 PAGE_EXECUTE_WRITECOPY)) != 0) {
+                locks[page].unlock();
+                return;
+            }
+#endif
+            if (SotcStats::kFpsLog) {
+                SotcStats::coalesce_self_fixes.fetch_add(1, std::memory_order_relaxed);
+            }
+            Protect(page << PM_PAGE_BITS, PM_PAGE_SIZE, Core::MemoryPermission::ReadWrite);
+        }
+        locks[page].unlock();
     }
 
     struct PageTraits {
@@ -641,10 +1011,23 @@ struct SignalImpl : public PageManager::Impl {
         Core::Signals::Instance()->RegisterAccessViolationHandler(GuestFaultSignalHandler,
                                                                   priority);
         Shader::SetSrtCleanLoad(&SrtWalkerCleanLoad);
+        // sotc: SOTC_FAULT_OSCOST=1 with SOTC_FPS: see MeasureFaultOsCost.
+        if (const char* oscost = std::getenv("SOTC_FAULT_OSCOST");
+            SotcStats::kFpsLog && oscost && oscost[0] == '1') {
+            Core::Signals::Instance()->RegisterAccessViolationHandler(OsCostFaultHandler, 2);
+            g_oscost_registered.store(true, std::memory_order_release);
+        }
     }
 
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
-        RENDERER_TRACE;
+        // sotc: no RENDERER_TRACE zone here: Protect is reached from the guest fault handler, where
+        // a zone's Span/RegisterZoneSite (allocation, a mutex) is unsafe. The fault span is
+        // recorded separately with the no-alloc path.
+        SotcTrace::NoteProtect(); // sotc: SOTC_TRACE (BindScope)
+        SotcStats::SyncPipe::NoteProtect(); // sotc: SOTC_SYNC_PIPE counters (inside BindResources)
+        SotcOpPhases::NoteProtect(size); // sotc: SOTC_OP_PHASES
+        // sotc: SOTC_FPS: time spent in protect calls made while a guest fault is handled
+        const SotcStats::FaultStat::Scope protect_timed{&SotcStats::FaultStat::Tl::protect_ns};
         auto* memory = Core::Memory::Instance();
         auto& impl = memory->GetAddressSpace();
         // sotc: write-only means pages both CPU- and GPU-modified (the asserting opt4 crash, ~1 in
@@ -873,7 +1256,99 @@ struct SignalImpl : public PageManager::Impl {
         return HandleGuestFault(context, fault_address, rasterizer->IsGpuSideThread());
     }
 
+    // sotc: may a page other than the faulting one be invalidated by SOTC_FAULT_GRANULE? Not when
+    // it is part of a guest stack, and not when the GPU wrote it (its read protection stands for a
+    // readback; the GPU bit is checked here, and InvalidateRegion would read it back anyway).
+    static bool GranulePageMayInvalidate(VAddr page) {
+        u64 open = 0;
+        ForEachNonStackRange(page, PageManager::PM_PAGE_SIZE,
+                             [&open](VAddr, u64 size) { open += size; });
+        // sotc: nor when an image lives in the page's 1 MiB block: invalidating it marks the image
+        // CPU-dirty, and an image the GPU drew was then uploaded again from stale guest memory
+        // (colored blocks on the title screen, 2026-10-27). Texture pages keep one fault per page.
+        return open == PageManager::PM_PAGE_SIZE &&
+               !rasterizer->GetBufferCache().IsRegionGpuModified(page, PageManager::PM_PAGE_SIZE) &&
+               // sotc: nor when it is already CPU-dirty: it uploads anyway, and a snapshot taken
+               // now would equal its bytes and drop an upload the arena still needs.
+               !rasterizer->GetBufferCache().IsRegionCpuModified(page, PageManager::PM_PAGE_SIZE) &&
+               !rasterizer->GetTextureCache().HasImagesNear(page);
+    }
+
+    // sotc: SOTC_WRITE_AHEAD_ADAPT: may the write-ahead window mark this page? The stop rules of
+    // the granule: not a guest stack page, not in a 1 MiB block with an image (the GPU-modified
+    // and already CPU-dirty pages are skipped by BufferCache::MarkWriteAheadRange itself).
+    static bool AheadPageMayInvalidate(VAddr page) {
+        return !IntersectsGuestStack(page, PageManager::PM_PAGE_SIZE) &&
+               !rasterizer->GetTextureCache().HasImagesNear(page);
+    }
+
+    // sotc: SOTC_FAULT_GRANULE. After a guest write fault, the other pages of the faulting page's
+    // aligned granule are invalidated as well (CPU-modified and unprotected, through the same
+    // InvalidateMemoryOnGuestFault path), so writes that follow in that granule do not fault again.
+    // Trade-off: an invalidated texture or buffer is uploaded again from guest memory, and most of
+    // these pages are never written, so the uploads are wasted work; the gain is one exception per
+    // granule instead of one per 4 KiB page (16k per 64 MiB streamed). Pages the GPU wrote and
+    // guest stacks are skipped (they stay as they were); the faulting page is the caller's.
+    static void InvalidateGranule(VAddr addr) {
+        const VAddr begin = Common::AlignDown(addr, SotcStats::kFaultGranule);
+        const VAddr end = begin + SotcStats::kFaultGranule;
+        const VAddr fault_page = PageManager::GetPageAddr(addr);
+        VAddr run_start = 0;
+        u64 run_size = 0;
+        // Invalidates the pages collected so far as one range (one call per run of pages).
+        const auto flush = [&] {
+            if (run_size == 0) {
+                return;
+            }
+            if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer
+                SotcStats::fault_granule_pages.fetch_add(run_size / PageManager::PM_PAGE_SIZE,
+                                                         std::memory_order_relaxed);
+            }
+            // sotc: remember each page's bytes first: the buffer cache then uploads only the pages
+            // the guest really writes (BufferCache::DropUnchangedGranulePages).
+            {
+                const SotcStats::FaultStat::StageScope hash_stage{
+                    SotcStats::FaultStat::kStGranHash};
+                for (VAddr page = run_start; page < run_start + run_size;
+                     page += PageManager::PM_PAGE_SIZE) {
+                    rasterizer->GetBufferCache().NoteGranulePage(page);
+                }
+            }
+            rasterizer->InvalidateMemoryOnGuestFault(run_start, run_size);
+            run_size = 0;
+        };
+        for (VAddr page = begin; page < end; page += PageManager::PM_PAGE_SIZE) {
+            if (page == fault_page || !GranulePageMayInvalidate(page)) {
+                flush();
+                continue;
+            }
+            if (run_size == 0) {
+                run_start = page;
+            }
+            run_size += PageManager::PM_PAGE_SIZE;
+        }
+        flush();
+    }
+
+    // sotc: SOTC_PROTECT_COALESCE: may this fault collect its unprotects (FaultProtectScope)?
+    // Not when the page holds GPU data: the fault then waits for a readback (the GPU thread), and
+    // other threads writing a page that is collected but not yet applied would wait for this
+    // thread meanwhile. Checked from unlocked bits; a page that turns GPU-modified right after
+    // only makes such a wait possible, never wrong (every faulting thread applies its own page,
+    // see FlushFaultProtects).
+    static bool FaultMayCoalesce(VAddr page) {
+        return !rasterizer->GetBufferCache().IsRegionGpuModified(page, PageManager::PM_PAGE_SIZE);
+    }
+
     static bool HandleGuestFault(void* context, void* fault_address, bool is_gpu_thread) {
+        // sotc: SOTC_PROTECT_BATCH. The updates a fault makes protect at once, also on a thread
+        // with a batch open (the draw thread also handles other threads' faults,
+        // RunOnDrawThread). None of the collected re-protects can be what faulted: they only
+        // remove access the host still grants until the flush.
+        struct BatchSuspend {
+            BatchSuspend() { ++tl_protect_batch.suspended; }
+            ~BatchSuspend() { --tl_protect_batch.suspended; }
+        } const batch_suspend;
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
         if (!Common::IsWriteError(context) && is_gpu_thread && TryCleanWalkerLoad(context)) {
@@ -883,29 +1358,187 @@ struct SignalImpl : public PageManager::Impl {
             return true;
         }
         if (Common::IsWriteError(context)) {
+            // sotc: SOTC_FPS: the time from the entry of bbgpu_handle_fault to here is dispatch.
+            SotcStats::FaultStat::NoteHandlerEntry();
+            // sotc: SOTC_FPS (0b): write faults by the class of the code that faulted.
+            if (SotcStats::kFpsLog) {
+                SotcWriteDecl::NoteWriteFault(reinterpret_cast<u64>(Common::GetRip(context)), addr);
+            }
+            // sotc: SOTC_CLASS_TRACK (modes 1 and 2): the write fault counted per allocator pool. Lock
+            // free; the lookup is the CPU-only table of mem_classes.cpp.
+            if (SotcMemClasses::On()) {
+                SotcMemClasses::NoteWriteFault(addr);
+            }
             // sotc: read only by the SOTC_CMD_STATS printer; every guest thread faults here, and
             // the counter shared a cache line with command-processor counters.
             if (SotcStats::kCmdStats) {
                 SotcStats::fault_writes.fetch_add(1, std::memory_order_relaxed);
             }
             NoteReadFault(context, addr, is_gpu_thread, true);
-            const bool handled = is_gpu_thread
-                                     ? rasterizer->InvalidateMemory(addr, size, true)
-                                     : rasterizer->InvalidateMemoryOnGuestFault(addr, size);
+            const VAddr fault_page = PageManager::GetPageAddr(addr);
+            // sotc: SOTC_PROTECT_COALESCE, guest threads only: the unprotects of this fault's
+            // tracker updates (page, granule, write-ahead, images) are applied as one call per
+            // run by protect_scope.Flush below (page_manager.h, FaultProtectScope).
+            PageManager::FaultProtectScope protect_scope{SotcStats::kProtectCoalesce &&
+                                                         !is_gpu_thread &&
+                                                         FaultMayCoalesce(fault_page)};
+            bool handled;
+            {
+                const SotcStats::FaultStat::StageScope stage{SotcStats::FaultStat::kStInval};
+                handled = is_gpu_thread ? rasterizer->InvalidateMemory(addr, size, true)
+                                        : rasterizer->InvalidateMemoryOnGuestFault(addr, size);
+            }
             if (!handled) {
                 return false;
             }
-            rasterizer->MarkWriteAhead(addr);
-            RepairStuckWriteFault(context, addr);
+            // sotc: SOTC_FPS fault counters and SOTC_WRITE_AHEAD_ADAPT: classify this guest
+            // thread's fault against its previous one (SotcStats::FaultStat).
+            const bool track_fault =
+                !is_gpu_thread && (SotcStats::kFpsLog || SotcStats::kWriteAheadAdapt);
+            SotcStats::FaultStat::Plan plan;
+            if (track_fault) {
+                plan = SotcStats::FaultStat::Observe(fault_page);
+            }
+            // The extent this fault unprotects, for the next one's classification.
+            VAddr extent_lo = fault_page;
+            VAddr extent_hi = fault_page + PageManager::PM_PAGE_SIZE;
+            // sotc: SOTC_FAULT_GRANULE, guest threads only (the command processor's writes keep
+            // the single page).
+            if (!is_gpu_thread && SotcStats::kFaultGranule > PageManager::PM_PAGE_SIZE) {
+                {
+                    const SotcStats::FaultStat::StageScope stage{SotcStats::FaultStat::kStGranule};
+                    InvalidateGranule(addr);
+                }
+                extent_lo = Common::AlignDown(addr, SotcStats::kFaultGranule);
+                extent_hi = extent_lo + SotcStats::kFaultGranule;
+            }
+            {
+                const SotcStats::FaultStat::StageScope stage{SotcStats::FaultStat::kStAhead};
+                if (SotcStats::kWriteAheadAdapt && !is_gpu_thread && plan.sequential) {
+                    // sotc: SOTC_WRITE_AHEAD_ADAPT: the window of a sequential writer, in its
+                    // direction of travel, snapshot-hashed (BufferCache::MarkWriteAheadRange).
+                    const u64 window = u64{plan.window} * PageManager::PM_PAGE_SIZE;
+                    VAddr begin;
+                    VAddr end;
+                    if (plan.dir < 0) {
+                        begin = fault_page > window ? fault_page - window : 0;
+                        end = fault_page;
+                        extent_lo = std::min(extent_lo, begin);
+                    } else {
+                        begin = fault_page + PageManager::PM_PAGE_SIZE;
+                        end = begin + window;
+                        extent_hi = std::max(extent_hi, end);
+                    }
+                    rasterizer->GetBufferCache().MarkWriteAheadRange(begin, end,
+                                                                     &AheadPageMayInvalidate);
+                } else {
+                    rasterizer->MarkWriteAhead(addr);
+                    extent_hi = std::max(extent_hi,
+                                         fault_page + (1 + BufferCache::WriteAheadPages()) *
+                                                          PageManager::PM_PAGE_SIZE);
+                }
+            }
+            if (track_fault) {
+                SotcStats::FaultStat::Done(extent_lo, extent_hi);
+            }
+            // sotc: SOTC_BACKING_WARM: the backing view pages of what the guest writes next are
+            // touched by the warm thread, before an upload reads them (lock-free queue push).
+            if (!is_gpu_thread) {
+                SotcBackingWarm::Note(extent_lo, extent_hi - extent_lo);
+            }
+            {
+                // sotc: SOTC_PROTECT_COALESCE: the page must be writable before the guest
+                // retries, and before RepairStuckWriteFault looks at it.
+                const SotcStats::FaultStat::StageScope stage{SotcStats::FaultStat::kStFlush};
+                protect_scope.Flush(fault_page);
+                // A thread without an active scope (the command processor, a page the scope did
+                // not take) may have its page covered by another thread's pending flush: apply
+                // the tracker's state for it here, so it never re-faults until that flush runs.
+                if (SotcStats::kProtectCoalesce && !protect_scope.Active()) {
+                    PageManager::EnsureFaultPageWritable(fault_page);
+                }
+            }
+            {
+                const SotcStats::FaultStat::StageScope stage{SotcStats::FaultStat::kStRepair};
+                RepairStuckWriteFault(context, addr);
+            }
             return true;
         } else {
             if (is_gpu_thread && SotcStats::kCmdStats) { // sotc: SOTC_CMD_STATS printer only
                 SotcStats::fault_gpu_reads.fetch_add(1, std::memory_order_relaxed);
             }
             NoteReadFault(context, addr, is_gpu_thread);
+            // sotc: SOTC_FPS (B6): the guest instruction of this read fault, for the readback
+            // counts per RIP (ReportReadbackRips). Nothing is set unless SOTC_FPS is on.
+            const SotcFaultRip::Scope fault_rip{
+                SotcStats::kFpsLog && !is_gpu_thread
+                    ? reinterpret_cast<u64>(Common::GetRip(context))
+                    : u64{0}};
             return rasterizer->ReadMemory(addr, size, is_gpu_thread);
         }
         return false;
+    }
+
+    // sotc: SOTC_WRITE_DECL. Clips [addr, addr + size) to the tracked address space (regions exist
+    // below 1 << MAX_CPU_PAGE_BITS only). False when nothing is left.
+    static bool ClipToTracked(VAddr& addr, u64& size) {
+        const u64 limit = u64{1} << VideoCore::MemoryTracker::MAX_CPU_PAGE_BITS;
+        if (addr >= limit) {
+            return false;
+        }
+        size = std::min(size, limit - addr);
+        return size != 0;
+    }
+
+    // sotc: SOTC_WRITE_DECL. func(addr, size) for each run of the span outside the guest stacks
+    // that a declare settles (BufferCache::ForEachDeclarableRun). The look is unlocked; func takes
+    // the locked path, which checks the bits again. Func is a lambda or a DeclareRunFn.
+    template <typename Func>
+    static void ForEachDeclarableRunHere(VAddr addr, u64 size, Func& func) {
+        ForEachNonStackRange(addr, size, [&func](VAddr begin, u64 length) {
+            rasterizer->GetBufferCache().ForEachDeclarableRun(
+                begin, length,
+                [](void* ctx, VAddr run, u64 run_size) {
+                    (*static_cast<Func*>(ctx))(run, run_size);
+                },
+                &func);
+        });
+    }
+
+    // sotc: SOTC_WRITE_DECL (PageManager::DeclareCpuWrite). The write branch of HandleGuestFault
+    // for the pages of a span the CPU is about to write: async uploads that still read the span
+    // finish first (as bbgpu_handle_fault waits for its page), then each run of protected, CPU-clean
+    // pages is invalidated as a fault invalidates its page, and the unprotects of the span are
+    // applied in one flush. Pages with GPU data are not declared (their fault path does the
+    // readback). No fault granule, no write-ahead, no repair.
+    static void DeclareCpuWriteHere(VAddr addr, u64 size, bool is_gpu_thread,
+                                    PageManager::DeclareRunFn on_run) {
+        if (auto* async_upload = VideoCore::AsyncUpload::Get();
+            async_upload && async_upload->AnyPending()) {
+            async_upload->WaitVa(addr, size);
+        }
+        // As in a fault: the updates protect at once, also on a thread with a batch open.
+        struct BatchSuspend {
+            BatchSuspend() { ++tl_protect_batch.suspended; }
+            ~BatchSuspend() { --tl_protect_batch.suspended; }
+        } const batch_suspend;
+        // The unprotects of the runs are collected and applied by the flush below, as a guest write
+        // fault collects them. A span holding GPU data is not collected (see FaultMayCoalesce).
+        PageManager::FaultProtectScope protect_scope{
+            SotcStats::kProtectCoalesce && !is_gpu_thread &&
+            !rasterizer->GetBufferCache().IsRegionGpuModified(addr, size)};
+        auto invalidate = [is_gpu_thread, on_run](VAddr begin, u64 length) {
+            if (on_run) { // sotc: SOTC_FPS verify stamps, before the run is settled
+                on_run(begin, length);
+            }
+            if (is_gpu_thread) {
+                rasterizer->InvalidateMemory(begin, length, true);
+            } else {
+                rasterizer->InvalidateMemoryOnGuestFault(begin, length);
+            }
+        };
+        ForEachDeclarableRunHere(addr, size, invalidate);
+        protect_scope.Flush(0);
     }
 
 #ifdef _WIN32
@@ -1041,8 +1674,152 @@ void PageManager::UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) cons
 void PageManager::UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,
                                               const RegionBits& write_mask,
                                               const RegionBits& read_mask, PageOp write_op,
-                                              PageOp read_op) const {
-    impl->UpdatePageWatchersForRegion(base_addr, bounds, write_mask, read_mask, write_op, read_op);
+                                              PageOp read_op, bool deferrable) const {
+    impl->UpdatePageWatchersForRegion(base_addr, bounds, write_mask, read_mask, write_op, read_op,
+                                      deferrable);
+}
+
+// sotc: SOTC_PROTECT_BATCH (page_manager.h). The batch is per thread; the tracker has a single
+// instance, whose constructor sets g_protect_batch_flush.
+PageManager::ProtectBatch::ProtectBatch(bool enable) noexcept : active{enable} {
+    if (active) {
+        ++tl_protect_batch.depth;
+    }
+}
+
+// Every scope flushes when it closes, an inner one too: applying a change early is always safe,
+// late is not (the inner scope's caller reads guest memory next).
+PageManager::ProtectBatch::~ProtectBatch() {
+    if (active) {
+        Flush();
+        --tl_protect_batch.depth;
+    }
+}
+
+void PageManager::ProtectBatch::Flush() {
+    if (active && !tl_protect_batch.runs.empty() && g_protect_batch_flush) {
+        g_protect_batch_flush();
+    }
+}
+
+bool PageManager::ProtectBatchOpen() noexcept {
+    return tl_protect_batch.depth > 0 && tl_protect_batch.suspended == 0;
+}
+
+void PageManager::EnsureFaultPageWritable(VAddr page) {
+    if (g_fault_page_fix) {
+        g_fault_page_fix(page);
+    }
+}
+
+// sotc: SOTC_PROTECT_COALESCE (page_manager.h). Per thread; the tracker has a single instance,
+// whose constructor sets g_fault_protect_flush.
+PageManager::FaultProtectScope::FaultProtectScope(bool enable) noexcept
+    : active{enable && g_fault_protect_flush != nullptr} {
+    if (active) {
+        ++tl_protect_batch.fault_depth;
+    }
+}
+
+PageManager::FaultProtectScope::~FaultProtectScope() {
+    if (active) {
+        Flush(0);
+        --tl_protect_batch.fault_depth;
+    }
+}
+
+void PageManager::FaultProtectScope::Flush(VAddr fault_page) {
+    if (active && (fault_page != 0 || !tl_protect_batch.fault_runs.empty())) {
+        g_fault_protect_flush(fault_page);
+    }
+}
+
+// sotc: SOTC_WRITE_DECL (page_manager.h). Like GuestFaultSignalHandler: the command processor's
+// span runs on the draw thread, after the work queued before it. The caller's pre-check comes
+// first, so a span with no write-protected page costs no thread switch.
+void PageManager::DeclareCpuWrite(VAddr addr, u64 size, DeclareRunFn on_run) {
+    auto* rasterizer = Impl::rasterizer;
+    if (!rasterizer || !SignalImpl::ClipToTracked(addr, size)) {
+        return;
+    }
+    if (rasterizer->RunsGpuWorkElsewhere()) {
+        rasterizer->RunOnDrawThread(
+            [addr, size, on_run] { SignalImpl::DeclareCpuWriteHere(addr, size, true, on_run); });
+        return;
+    }
+    SignalImpl::DeclareCpuWriteHere(addr, size, rasterizer->IsGpuSideThread(), on_run);
+}
+
+// sotc: SOTC_WRITE_DECL=2 (page_manager.h). The look only: no thread switch, nothing invalidated.
+void PageManager::VisitDeclarableRuns(VAddr addr, u64 size, DeclareRunFn fn) {
+    if (!Impl::rasterizer || !fn || !SignalImpl::ClipToTracked(addr, size)) {
+        return;
+    }
+    SignalImpl::ForEachDeclarableRunHere(addr, size, fn);
+}
+
+bool PageManager::MaybeWriteProtected(VAddr addr, u64 size) {
+    auto* rasterizer = Impl::rasterizer;
+    return rasterizer && size != 0 &&
+           rasterizer->GetBufferCache().MaybeWriteProtected(addr, size);
+}
+
+u64 PageManager::CountWriteProtectedPages(VAddr addr, u64 size) {
+    auto* rasterizer = Impl::rasterizer;
+    return rasterizer && size != 0
+               ? rasterizer->GetBufferCache().CountWriteProtectedPages(addr, size)
+               : 0;
+}
+
+bool MeasureFaultOsCost(double& in_us, double& out_us) {
+    static std::once_flag once;
+    static double in = 0.0;
+    static double out = 0.0;
+    static bool ok = false;
+    std::call_once(once, [] {
+#ifdef _WIN64
+        if (!g_oscost_registered.load(std::memory_order_acquire)) {
+            return;
+        }
+        void* page = VirtualAlloc(nullptr, 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY);
+        if (!page) {
+            return;
+        }
+        g_oscost_page.store(reinterpret_cast<uintptr_t>(page), std::memory_order_release);
+        std::vector<u64> ins;
+        std::vector<u64> outs;
+        for (int i = 0; i < 41; ++i) {
+            DWORD old{};
+            VirtualProtect(page, 4096, PAGE_READONLY, &old);
+            g_oscost_enter_ns.store(0, std::memory_order_relaxed);
+            const u64 before = SotcStats::NowNs();
+            *static_cast<volatile char*>(page) = 1; // faults: the handler above makes it writable
+            const u64 after = SotcStats::NowNs();
+            const u64 enter = g_oscost_enter_ns.load(std::memory_order_relaxed);
+            const u64 exit = g_oscost_exit_ns.load(std::memory_order_relaxed);
+            if (i == 0 || enter < before || after < exit) {
+                continue; // the first fault pages in the exception path
+            }
+            ins.push_back(enter - before);
+            outs.push_back(after - exit);
+        }
+        g_oscost_page.store(0, std::memory_order_release);
+        VirtualFree(page, 0, MEM_RELEASE);
+        if (ins.size() < 8) {
+            return;
+        }
+        std::ranges::nth_element(ins, ins.begin() + ins.size() / 2);
+        std::ranges::nth_element(outs, outs.begin() + outs.size() / 2);
+        in = static_cast<double>(ins[ins.size() / 2]) / 1000.0;
+        out = static_cast<double>(outs[outs.size() / 2]) / 1000.0;
+        SotcStats::FaultStat::os_fault_in_ns.store(ins[ins.size() / 2], std::memory_order_relaxed);
+        SotcStats::FaultStat::os_fault_out_ns.store(outs[outs.size() / 2], std::memory_order_relaxed);
+        ok = true;
+#endif
+    });
+    in_us = in;
+    out_us = out;
+    return ok;
 }
 
 } // namespace VideoCore

@@ -767,7 +767,7 @@ void RequestShutdown() {
     shutdown_requests.fetch_add(1, std::memory_order_release);
 }
 
-void Update(bool fsr_enabled) {
+void Update(bool fsr_enabled, bool depth_wanted) {
     const u64 requests = shutdown_requests.load(std::memory_order_acquire);
     if (fsr_enabled) {
         // Enabled again, perhaps before the requested shutdown ran: nothing is freed and the
@@ -792,19 +792,22 @@ void Update(bool fsr_enabled) {
     // and Shutdown is idempotent anyway.
     seen_shutdown_requests = requests;
     idle_frames = 0;
-    Shutdown();
+    // sotc: the FSR 3 / DLSS upscaler reads this depth too (Fsr3Up::Dispatch): freeing it left
+    // every later frame a bilinear stretch (F8 DLSS-G -> FSR 3 -> off: 600 of 600 frames "no
+    // depth/motion"), and recreating it right away crashed in the NVIDIA driver. It stays.
+    Shutdown(depth_wanted);
 }
 
-void Shutdown() {
+void Shutdown(bool keep_depth) {
     const bool had_context = context != nullptr;
     u64 depth_bytes = 0;
     for (const auto& slot : depth_slots) {
-        depth_bytes += static_cast<u64>(slot.r32.width) * slot.r32.height * 4;
+        depth_bytes += keep_depth ? 0 : static_cast<u64>(slot.r32.width) * slot.r32.height * 4;
     }
     // The FSR 3 work recorded with the context, its colour images and the depth images: done when
     // DestroyContext returns (RetireCompleted waits for their scheduler ticks).
     DestroyContext();
-    {
+    if (!keep_depth) {
         std::scoped_lock lock{depth_mutex};
         // The command processor no longer converts depth (the mode left FSR 3), and its last
         // conversions were presented (Update waited kShutdownDelay frames): nothing records with

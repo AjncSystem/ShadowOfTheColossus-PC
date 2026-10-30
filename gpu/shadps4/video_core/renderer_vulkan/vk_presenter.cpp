@@ -983,7 +983,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // sotc: FSR 3 resources after leaving its mode (F8, vk_framegen.cpp): freed here, on the
     // present thread, once the frames in flight that may still use them are presented; and the
     // depth pipeline back when FSR 3 is enabled again (vk_fsrfg.h).
-    FsrFg::Update(FrameGen::Current() == FrameGen::Mode::Fsr);
+    FsrFg::Update(FrameGen::Current() == FrameGen::Mode::Fsr, Fsr3Up::Wanted());
 
     // Free the frame for reuse
     const auto free_frame = [&] {

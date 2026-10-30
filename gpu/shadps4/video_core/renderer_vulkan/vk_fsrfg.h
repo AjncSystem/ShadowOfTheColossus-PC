@@ -66,12 +66,13 @@ void RequestShutdown();
 /// Present thread, once per presented frame: with `fsr_enabled` it recreates the depth pipeline
 /// after a Shutdown (and drops a pending request); otherwise, a requested Shutdown runs after a
 /// few frames without FSR 3, so that the command processor's last depth conversion is presented.
-void Update(bool fsr_enabled);
+/// `depth_wanted` (the upscaler is on): that Shutdown keeps the depth images and pipeline.
+void Update(bool fsr_enabled, bool depth_wanted);
 
 /// Destroys the FSR 3 context and its images, the depth images of the 16 presentation frames and
 /// the depth pipeline: the VRAM they hold (up to ~130 MB of depth at 1080p) is free again, and
 /// enabling FSR 3 later recreates them. Idempotent; present thread (DestroyContext waits for the
 /// frames in flight on the scheduler).
-void Shutdown();
+void Shutdown(bool keep_depth = false);
 
 } // namespace Vulkan::FsrFg

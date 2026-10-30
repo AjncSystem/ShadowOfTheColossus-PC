@@ -1224,11 +1224,15 @@ void FrameSubmitted(u32 frame_id) {
     const u32 index = frames[frame_id].index;
     Marker(sl::PCLMarker::eRenderSubmitEnd, index);
     // The next frame starts here: Reflex may hold it back a little to keep the GPU queue short
-    // (SOTC_DLSSG_SLEEP=0: no sleep).
-    static const bool sleep = [] {
+    // (SOTC_DLSSG_SLEEP=0: no sleep). sotc: only while DLSS frame generation runs, which needs it;
+    // with DLSS only upscaling, the sleep cost ~6% (Shrine, 72.5 -> 68.3 FPS) and with the driver's
+    // Low Latency Mode: Ultra much more (issue #5 of the fork, 2mg). SOTC_DLSSG_SLEEP=2: always.
+    static const int sleep_mode = [] {
         const char* v = std::getenv("SOTC_DLSSG_SLEEP");
-        return !v || v[0] != '0';
+        return v ? std::atoi(v) : 1;
     }();
+    const bool sleep =
+        sleep_mode == 2 || (sleep_mode == 1 && FrameGen::Current() == FrameGen::Mode::Dlss);
     if (sleep && api.reflex_sleep) {
         if (sl::FrameToken* token = Token(index + 1)) {
             api.reflex_sleep(*token);

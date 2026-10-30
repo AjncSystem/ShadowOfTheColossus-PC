@@ -161,7 +161,7 @@ def windows_language():
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
                 'user_dir': '', 'af16': True, 'textures': 'high', 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'hdr': False, 'fullscreen': False, 'fs_borderless': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
-                'readbacks': '', 'extra_env': '', 'close_on_play': False, 'skip_logos': False, 'gamepad': '', 'rumble': True, 'vibration': '100',
+                'readbacks': '', 'extra_env': '', 'close_on_play': False, 'skip_logos': False, 'skip_intro': False, 'gamepad': '', 'rumble': True, 'vibration': '100',
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'render_preset': 'quality', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'fx_sunshadows': True, 'engine_cvars': '', 'perf_culling': True,
@@ -703,6 +703,8 @@ def game_environment(s):
         cvars += ['doIndexBufferCulling=0', 'doSunShadowIndexBufferCulling=0']
     if s.get('skip_logos'):
         cvars.append('skipSplash=1')
+    if s.get('skip_intro'):
+        env['SOTC_SKIP_INTRO'] = '1'  # src/runtime_pad.c: X held through the opening cutscene
     grass = str(s.get('grass_shadows') or '2')
     if grass in ('3', '4'):
         # Every mode's copy: the game takes the one of its graphics mode (PS4 Pro Cinematic has 3).
@@ -1362,6 +1364,9 @@ class Launcher:
         self.check(f, 'skip_logos', _('Pular os logotipos de abertura', 'Skip the opening logos'),
                    _('O jogo abre direto no menu, sem os logotipos de abertura e o aviso de salvamento automático.',
                      'The game opens straight to the menu, without the opening logos and the autosave notice.'))
+        self.check(f, 'skip_intro', _('Pular a cena de abertura', 'Skip the opening cutscene'),
+                   _('Segura o X sozinho na abertura, como você faria, e para na tela de título. Solta no primeiro botão que você apertar.',
+                     'Holds X by itself during the opening, as you would, and stops on the title screen. Lets go at the first button you press.'))
 
     def apply_quality_preset(self, name):
         for key, value in QUALITY_PRESETS[name].items():

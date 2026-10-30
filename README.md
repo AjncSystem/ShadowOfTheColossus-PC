@@ -1,232 +1,154 @@
-# Shadow of the Colossus — PC native port · v0.60.6-plus26
+# Shadow of the Colossus — PC native port · v0.60.6-plus27
 
-**The original 0.60.6, plus CPUs without BMI1 (pre-Haswell), CPUs with 4 threads, 120 Hz
-fullscreen, a 32-lane fix for AMD GCN cards (RX 470–590, to test), and the FSR 3.1 and DLSS 4.5 upscalers (NVIDIA RTX).** Everything in [AjncSystem's 0.60.6](https://github.com/AjncSystem/ShadowOfTheColossus-PC)
-(the game can be finished from start to end; the in-game menu with quick settings; textures on
-GTX 10xx cards, 60 FPS through the game's own 60 FPS mode, faster heap guards, HUD-less frame
-generation as an option, no crash with high quality textures and the smaller readback window, all
-from this fork; the title-screen hang fix, low-memory PCs, a `user` folder per copy), with this
-fork's work on top.
+Port nativo para Windows do **Shadow of the Colossus** de PS4 (Bluepoint, 2018; CUSA08809 EU 1.01 ou CUSA08034 US 1.00):
+o código x86-64 do próprio jogo roda direto na CPU do PC e a GPU do PS4 é traduzida para Vulkan. Este é o fork
+Lucas-blip-png do [port do AjncSystem](https://github.com/AjncSystem/ShadowOfTheColossus-PC), com tudo dele e o trabalho deste
+fork por cima. **O jogo pode ser terminado do começo ao fim.**
+
+A native Windows port of the PS4 **Shadow of the Colossus**: the game's own x86-64 code runs on the PC's CPU and the PS4 GPU is
+translated to Vulkan. This is Lucas-blip-png's fork of [AjncSystem's port](https://github.com/AjncSystem/ShadowOfTheColossus-PC).
+**The game can be finished from start to end.**
 
 ![Shrine of Worship, uncapped, Ryzen 7 5700X + RTX 5060 Ti, 0.60.6-plus14 (the port's FPS panel; it reads about 3 FPS lower while the screen is being recorded)](docs/img/sotc-fork.gif)
 
-What it adds:
-- **The Shrine of Worship at 59-61 FPS uncapped** on a Ryzen 7 5700X with an RTX 5060 Ti (it was 53-54 on the same
-  PC): image barriers no longer cut the render passes ~20,000 times a second (0.60.6-plus5). The original 0.60.6 runs
-  the same scene at ~42 FPS with its safe defaults.
-- **CPUs without BMI1/LZCNT/MOVBE** (Intel before Haswell: 2nd/3rd generation Core, Xeon E3 v1/v2;
-  AMD FX), which got "This CPU is not supported": the game's ~5,000 such instructions are replaced
-  by equivalent routines at startup, only on those CPUs (Oussama268), also in code reached only
-  through jump tables (a hang on the first loading screen on a real one). AVX is still required.
-  Confirmed on a real one (issue #88 of the original: played up to the first colossus).
-- **CPUs with 4 threads** (4 cores without SMT, 2 cores with SMT): two of the port's GPU threads no
-  longer spin on a core while they wait, so the game's threads get it. A Ryzen 7 held to 4 logical
-  processors stayed stuck loading the attract demo; now it runs at 76 FPS (60 FPS mode). With more
-  than 8 logical processors nothing changes (sent to the original as
-  [PR #198](https://github.com/AjncSystem/ShadowOfTheColossus-PC/pull/198)).
-- **AMD GCN cards (RX 470–590, Vega), to test:** white, flickering characters and smoke and fog
-  colours that change every run. These cards run the shaders 64 wide. The port now lowers them to 32
-  lanes where the driver requires a 32-lane compute subgroup (`GPU: AMD wave32 on` in the log;
-  `SOTC_AMD_WAVE32=0` turns it off, `=1` forces it), and the LDS barriers are on for 64-wide AMD
-  (`SOTC_AMD64_LDS=0` turns them off). On an RX 570 on Windows the flicker went away. **Open:** some
-  GCN runs stop with a lost GPU device right after the first colossus (issues #187, #123 and #41 of
-  the original). If that happens to you, try `SOTC_AMD_WAVE32=0` and send `last_run.log`.
-- **Fullscreen at 120 Hz** on 144/165 Hz monitors, so every frame stays on screen as long (Anthonypc23).
-- The launcher's self-update follows this fork's releases; the launcher no longer stops when its
-  console refuses writes (issue #104).
+**[⬇ Baixar a última versão / Download the latest release](../../releases/latest)** · traga o seu próprio dump do jogo / bring your own game dump
 
-**[⬇ Download the latest release](../../releases/latest)** · bring your own game dump · Windows 10/11, Vulkan 1.3
+> **Nenhum arquivo do jogo ou da Sony está incluído. / No game or Sony files are included.** É preciso o seu próprio dump e,
+> para o som, dois módulos do seu console. / You need your own game dump and, for sound, two modules from your own console.
+> Este projeto não tem ligação com a Sony Interactive Entertainment nem com a Bluepoint Games. / This project is not
+> affiliated with Sony Interactive Entertainment or Bluepoint Games.
+
+[Requisitos](#requisitos) · [Roteiro](#roteiro) · [Novidades](#novidades) · [Requirements](#requirements) · [Roadmap](#roadmap) · [What's new](#whats-new) · [Changelog](CHANGELOG.md)
 
 ---
+
+## Requisitos
+
+**Para rodar:** Windows 10/11 64 bits · placa de vídeo com **Vulkan 1.3** e driver recente (NVIDIA GTX 10xx ou mais nova;
+AMD RX 5000 ou mais nova; AMD RX 400/500/Vega e Intel Arc em teste) · CPU x86-64 com **AVX** (BMI1 não é exigido) e pelo
+menos **4 threads** (8 ou mais recomendado) · **16 GB de RAM** recomendados · jogo num **SSD** (cada área nova lê centenas
+de MB do disco; num HD as trocas de área travam mais).
+
+**Por preset e resolução.** Medido por este fork em 30/10/2026 no Santuário de Culto, a cena mais pesada (~5.600 desenhos
+por quadro), num **Ryzen 7 5700X + RTX 5060 Ti 8 GB**, sem limite de FPS (os presets limitam a 30 ou 60, o Máximo não),
+com DLSS (FSR 3.1 dá números parecidos). Nesse PC a CPU limita o FPS em uns 70-80.
+
+| Preset | Saída | Render | VRAM recomendada | FPS médio / mínimo | VRAM usada pelo jogo |
+|---|---|---|---|---|---|
+| Compatibilidade (FSR 1, texturas desligadas, 30 FPS) | 1920×1080 | 1920×1080 | 4 GB | 70,7 / 68,9 | 2,8 GB |
+| Equilibrado (DLSS/FSR 3.1 Qualidade, texturas Alta, 60 FPS) | 1920×1080 | 1280×720 | 6 GB | 81,2 / 78,9 | 3,0 GB |
+| Equilibrado | 2560×1440 | 1704×960 | 6 GB | 75,8 / 73,0 | 3,5 GB |
+| Equilibrado | 3840×2160 | 2560×1440 | 8 GB | 57,0 / 55,8 | 4,4 GB |
+| Máximo (texturas Máxima, grama longa, 3 cascatas, FPS livre) | 1920×1080 | 1920×1080 (DLAA) | 8 GB | 65,4 / 63,0 | 3,7 GB |
+| Máximo | 2560×1440 | 2560×1440 (DLAA) | 8 GB | 59,4 / 56,8 | 4,2 GB |
+| Máximo | 3840×2160 | 2560×1440 (Qualidade) | 12 GB | 53,6 / 52,1 | 4,5 GB |
+
+- "VRAM usada pelo jogo" é o contador do port (texturas, buffers, imagens) no Santuário. O driver, a tela e o upscaler
+  ocupam mais 1-2 GB, e as vistas amplas do mundo aberto usam mais que o Santuário: por isso a coluna "recomendada" tem folga.
+- A geração de quadros (F8) soma memória: com DLSS-G a 4K uma placa de 8 GB estourou numa sessão longa.
+- No lançador, **Imagem e FPS → Sugerir para meu PC** escolhe saída, upscaler, render e texturas pela placa, VRAM, CPU e
+  tela, e explica por quê. Outros PCs: abra uma issue com os seus números (painel F1) e o zip de relatório, e eles entram aqui.
+
+## Roteiro
+
+Plano público deste fork. Detalhe de cada item: [docs/sotc/ROADMAP.md](docs/sotc/ROADMAP.md) (atualizado em 30/10/2026).
+
+**Em andamento**
+- [ ] **0.70-plus1:** trazer a correção do 0.70 do upstream (AjncSystem) para as quedas de FPS perto de zero nas trocas de
+      área (pior quadro de 534 ms para 58-75 ms lá) e a da queda `0x49800`. Mexe no núcleo de memória, que aqui está diferente.
+- [ ] DLSS com o **Low Latency Mode: Ultra** do driver (RTX 2080 Ti, 2mg): o plus27 deixa de carregar Reflex e DLSS-G sem
+      geração de quadros, a causa provável; falta confirmar com o Ultra ligado.
+- [ ] **AMD GCN** (RX 470-590, Vega): o AMD-Fix (raulbezerro-dev) parou as quedas numa RX 570 (brxzzi, #9). Falta achar qual
+      dos ajustes dele resolve e ligar só esse nas GCN, sem a camada.
+
+**Próximos**
+- [ ] Água e barra de stamina tremendo (RenderDoc) · Intel Arc · FSR 4.1 (quando o SDK da AMD tiver Vulkan)
+- [ ] Ruído colorido no chão do deserto depois de uma carga (sem causa ainda)
+- [ ] Saídas silenciosas com código `0xffffffff` (#244, #291, #299, #61): só diagnóstico até agora
+
+**Medido e descartado**
+- [x] Limite de CPU do Santuário (70-80 FPS no 5700X): é uma cadeia de latência entre as threads, não uma thread só;
+      somar 2 ms na thread de desenho custa 0,5 ms no quadro. Agrupar `VirtualProtect` e otimizar só a `GpuDraw`: ganho ~0.
+- [x] 2ª fila Vulkan para readback, ASC em fila própria, divisão da `GpuDraw`, 4K nativo (texturas finas somem, 42-44 FPS).
+
+## Novidades
+
+**0.60.6-plus27** (30/10/2026, detalhes no [CHANGELOG](CHANGELOG.md)):
+- **DLSS:** a espera do Reflex só roda com a geração de quadros DLSS-G (+6% no Santuário com o DLSS só ampliando); sem
+  geração de quadros o jogo carrega só o plugin do DLSS (causa provável da queda com o Low Latency Mode: Ultra, #5 do fork, 2mg).
+- **A nitidez (RCAS) agora vale no FSR 3.1, no DLSS e no FSR 1 sem ampliação** (pedido do 2mg).
+- **O F8 não desliga mais o DLSS/FSR 3.1** depois de passar pelo FSR 3; 4K com DLSS Desempenho sem chão preto; menos VRAM
+  presa com a placa quase cheia; DLSS sem o contexto do FSR 3.1 junto (até ~200 MB a menos em 4K).
+- **Lançador:** "Sugerir para meu PC", preset **Máximo**, saves em Documentos\My Games, pular a abertura, opções de geração
+  de quadros que a placa não usa em cinza.
+- **Menu F1:** opções que só valem ao abrir o jogo aparecem em cinza com o motivo; a qualidade das texturas muda só no lançador.
+
+Versões anteriores: tabela em [What's new](#whats-new) e o [CHANGELOG](CHANGELOG.md) completo.
+
+---
+
+## Requirements
+
+**To run:** Windows 10/11 64-bit · a **Vulkan 1.3** graphics card with a recent driver (NVIDIA GTX 10xx or newer; AMD RX
+5000 or newer; AMD RX 400/500/Vega and Intel Arc being tested) · an x86-64 CPU with **AVX** (BMI1 not needed) and at least
+**4 threads** (8 or more recommended) · **16 GB of RAM** recommended · the game on an **SSD** (each new area reads hundreds
+of MB; on a hard disk area changes stall more).
+
+**By preset and resolution.** Measured by this fork on 30 Oct 2026 in the Shrine of Worship, the heaviest scene (~5,600
+draws per frame), on a **Ryzen 7 5700X + RTX 5060 Ti 8 GB**, uncapped (the presets cap at 30 or 60, Maximum does not),
+with DLSS (FSR 3.1 gives similar numbers). The CPU limits this PC at about 70-80 FPS.
+
+| Preset | Output | Render | Recommended VRAM | FPS avg / min | VRAM used by the game |
+|---|---|---|---|---|---|
+| Compatibility (FSR 1, textures off, 30 FPS) | 1920×1080 | 1920×1080 | 4 GB | 70.7 / 68.9 | 2.8 GB |
+| Balanced (DLSS/FSR 3.1 Quality, High textures, 60 FPS) | 1920×1080 | 1280×720 | 6 GB | 81.2 / 78.9 | 3.0 GB |
+| Balanced | 2560×1440 | 1704×960 | 6 GB | 75.8 / 73.0 | 3.5 GB |
+| Balanced | 3840×2160 | 2560×1440 | 8 GB | 57.0 / 55.8 | 4.4 GB |
+| Maximum (Maximum textures, long grass, 3 cascades, uncapped) | 1920×1080 | 1920×1080 (DLAA) | 8 GB | 65.4 / 63.0 | 3.7 GB |
+| Maximum | 2560×1440 | 2560×1440 (DLAA) | 8 GB | 59.4 / 56.8 | 4.2 GB |
+| Maximum | 3840×2160 | 2560×1440 (Quality) | 12 GB | 53.6 / 52.1 | 4.5 GB |
+
+- "VRAM used by the game" is the port's counter (textures, buffers, images) in the Shrine. The driver, the screen and the
+  upscaler take 1-2 GB more, and wide open-world views use more than the Shrine, hence the margin in "recommended".
+- Frame generation (F8) adds memory: with DLSS-G at 4K an 8 GB card ran out in a long session.
+- In the launcher, **Display & FPS → Suggest for my PC** picks the output, upscaler, render size and textures from your
+  card, video memory, CPU and screen, and says why. Other PCs: open an issue with your numbers (F1 panel) and the report zip.
 
 ## Roadmap
 
-Public plan for this fork, updated as work lands (last update: 24/10/2026). Issue numbers refer to
-the original repository.
+Detail of each item (Portuguese): [docs/sotc/ROADMAP.md](docs/sotc/ROADMAP.md) (updated 30 Oct 2026).
 
-**Part 1: upscalers (more FPS on weaker GPUs, sharper 1440p/4K output)**
-- [x] FSR 1 with RCAS (in place since 0.60.x)
-- [x] Phase 0: rendering below 1080p works with the game's own patches (23/10: Shrine, 3840x2160 output with FSR 1:
-      1080p 38.7 FPS, 720p 46.9, 576p 49.7; clean image, no device lost)
-- [x] Phase 1: the temporal inputs (depth, motion vectors, jitter, camera) are captured without frame generation
-- [x] Phase 2: FSR 3.1 temporal upscaler, off by default (`SOTC_UPSCALER=fsr3`, with `SOTC_RENDER_RES` below 1080p and
-      `SOTC_OUTPUT_RES`; 23/10: Shrine 720p to 4K, clean image, ~48 FPS like FSR 1; HUD still goes through it)
-- [x] Phase 3: launcher option (upscaler FSR 3.1 + quality preset) and the in-game F1 menu switch
-- [~] Phase 4: DLSS Super Resolution through Streamline, NVIDIA only (`SOTC_UPSCALER=dlss`): code in place and
-      falls back to FSR 3.1 without the DLLs (checked 23/10); NOT tested with the real `sl.dlss.dll` and
-      `nvngx_dlss.dll`, which are not in the repository and must be put next to bb-probe.exe
-- [x] Phase 5: documentation (CHANGELOG, this roadmap)
+**In progress**
+- [ ] **0.70-plus1:** bring upstream 0.70's fix (AjncSystem) for the near-zero FPS drops on area changes (worst frame 534 ms
+      to 58-75 ms there) and the `0x49800` crash. It touches the memory core, which differs here.
+- [ ] DLSS with the driver's **Low Latency Mode: Ultra** (RTX 2080 Ti, 2mg): plus27 no longer loads Reflex and DLSS-G
+      without frame generation, the likely cause; not confirmed with Ultra yet.
+- [ ] **AMD GCN** (RX 470-590, Vega): the AMD-Fix layer (raulbezerro-dev) stopped the crashes on an RX 570 (brxzzi, #9).
+      Next: find which of its changes does it and turn only that one on for GCN, without the layer.
 
-**Part 2: up to 120 FPS in game, without frame generation**
-- Where we are (25/10, 0.60.6-plus5): the Shrine of Worship runs at 59-61 FPS uncapped (it was ~42 on 0.60.6 and
-  53-54 before the barrier change); descriptor reuse and hot readbacks are on by default again. 120 FPS means 8.3 ms.
-- [x] T0: ceiling measured 23/10 (0.60.6 + this fork, 1080p, safe defaults): attract demo 71.2 FPS average (min 48.4,
-      draw thread busy 13-14 ms per frame); Shrine 41.6 FPS (draw thread ~20 ms). M1 needs 100, M3 needs 60
-- [x] T1: the game clock follows real time: in the attract demo the camera covers the same path in the same real
-      seconds at 30 FPS (capped), 74.6 FPS (60 FPS mode) and 71.7 FPS with a 240 Hz vblank. Physics and animation
-      above 60 FPS are not checked yet (needs a frame rate above what the PC reaches today)
-- [x] T2b (25/10, 0.60.6-plus5): the limit was not the CPU but render passes cut by barriers. Every use of a written
-      1920x1080 R32Uint storage image (GENERAL layout) after its previous use made a barrier, and a barrier inside a dynamic
-      render pass ends it (~22k `EndRendering` a second, 98% from `FlushBarriers`). The barrier is now issued once per
-      fence epoch (first use after an EOP/ReleaseMem label), as on GCN, where the game orders UAV writes itself.
-      Shrine 59.2 and 60.9 FPS against 54.0 and 53.0 (interleaved runs); save walks of 400 s and 600 s, 0 faults.
-      `SOTC_GENERAL_SYNC=0` turns it off. Also in plus5: partial async readbacks (+1.3 FPS), `SOTC_DEPTH_RO`.
-      Measured and dropped on the way: a second Vulkan queue for async compute (compute is 10-20% of GPU time), engine
-      cvars, thread affinity, spinning mutexes (contention gone, FPS unchanged), GPU clocks.
-- [ ] T2: reduce CPU work per draw: skip repeated register state, make the fast descriptor reuse safe,
-      move pure precomputation off the render thread; splitting the render thread is the last resort
-- [~] T2 so far: `SOTC_FAST_BIND=1` (descriptor reuse, 59% hits) gives +7% in the Shrine (45.3 and 43.9 FPS against
-      42.3 and 41.0, 24/10). It stays off: its fix (`mem_epoch`) still needs a check on sandy ground in the open
-      world, which the scripted save walk does not reach. Players can try it with `SOTC_FAST_BIND=1`.
-      Moving work to the command processor thread (24/10 profile of the draw thread, Shrine): binding resources is
-      43% of it (textures 19%, buffers 15%) and depends on cache state that only that thread owns; the host
-      page protects it issues cost 1.6 ms per frame (14,800 calls/s, `SOTC_PROTECT_STATS=1`); pure precomputation
-      (user data, sharps, hashes) is a few percent. Not worth the risk of stale textures.
-      Found instead: 4 video memory allocations and 4 frees per frame (the driver wants dedicated memory for
-      images), ~5% of the draw thread. An image pool removes them: Shrine 40.3 to 42.0 FPS (+4%), attract demo
-      71.2 to 75.5 (+6%), same video memory use, `SOTC_IMAGE_POOL=0` turns it off.
-      Tried and dropped (24/10, Shrine, two runs each): making the draw thread the biased owner of the texture
-      cache lock gave 40.8 / 40.9 FPS against 43.1 / 43.8 with the old owner (-5%); one atomic per 64-page word in
-      `SetSrtReadProtectedPages` is within noise (43.0 over four runs), kept because it is equivalent and cheaper.
-      What is left in the draw thread is the CPU-GPU traffic of the scene itself, per frame: 45 readbacks (~10% of
-      the time, 6% waiting on the GPU), 230 guest write faults, 108 uploads (11.7 MB, the `memmove`) and 737 page
-      protects (6%). Each is the tracking that keeps the game's memory and the GPU's in step, so cutting it means
-      changing what is tracked, not how fast it runs. Tried on that traffic (24/10): half of the guest read
-      faults (28,600 of 55,000 over a run) hit bytes the GPU never wrote, on pages that share them with game
-      objects (`SOTC_RB_STATS=1`, `SOTC_RB_STATS_CODE=1` dumps the code around each reader); finishing such a load
-      from the backing without a readback removed 60% of those faults and changed nothing (42.9 / 40.8 against
-      43.7 / 41.9), so it was dropped. `SOTC_RB_EARLY=0` (43 early submits a frame) is the same: 42.6 / 41.9
-      against 43.1 / 42.0. The Shrine does not move with any single piece of this traffic.
-      A split of the draw thread was measured earlier at 6.7% of its time (no-go). The other T2 items are each
-      expected to give a few percent, so the Shrine at 60 FPS (+44%) is not in reach by these alone.
-- [~] T3 (plus5): the barrier change passed two save walks and two screenshots; the open-world sand check and a long soak are still open
-- [ ] T3: every change must pass the rainbow-noise and sand-dot checks before it becomes default
-- [ ] T4: 120 Hz presentation options in the launcher and the in-game menu
-- Milestones (M3 reached 25/10 with 59.2-60.9 FPS in the Shrine, uncapped; the minimum over 15 s was 58.9-60.3, so "stable" is borderline): M1 attract demo ≥ 100 FPS · M2 open world ≥ 90 · M3 Shrine ≥ 60 stable with safe
-  defaults · M4 Shrine 90 · M5 all scenes up to 120. Each one is marked only with a measured number.
+**Next**
+- [ ] Water and shaking stamina bar (RenderDoc) · Intel Arc · FSR 4.1 (once AMD's SDK has Vulkan)
+- [ ] Coloured noise on the desert ground after a load (no cause yet)
+- [ ] Silent exits with code `0xffffffff` (#244, #291, #299, #61): diagnostics only so far
 
-**Open items from the 0.60.6 release**
-- [ ] GCN cards: some runs end with a lost GPU device after the first colossus (issues #187, #123, #41).
-      The 32-lane change is not the cause; the event log from 0.60.6 is needed to continue.
-- [ ] FSR 1 on RDNA4 (#208, #209): fix in 0.60.5-plus3 not yet confirmed on hardware.
-- [ ] Upstream pull requests #198, #205 and #207: content already in 0.60.6; open decision on closing them.
+**Measured and dropped**
+- [x] The Shrine's CPU limit (70-80 FPS on the 5700X) is a latency chain across threads, not one thread; adding 2 ms to
+      the draw thread costs 0.5 ms per frame. Batching `VirtualProtect` and tuning `GpuDraw` alone: ~0 gain.
+- [x] Second Vulkan queue for readbacks, ASC on its own queue, splitting `GpuDraw`, native 4K (fine textures vanish, 42-44 FPS).
 
----
+## What's new
 
-## Testado em (português)
-
-Santuário de Culto, a cena mais pesada (~5.600 desenhos por quadro), sem limite de FPS; medido por este fork em
-30/10/2026 com o build depois do 0.60.6-plus26. A CPU limita em uns 72 FPS em qualquer saída.
-
-| PC | Saída | Upscaler (render) | FPS (média / mínimo) |
-|---|---|---|---|
-| Ryzen 7 5700X + RTX 5060 Ti 8 GB | 1920×1080 | DLAA (1920×1080) | 72,6 / 70,2 |
-| Ryzen 7 5700X + RTX 5060 Ti 8 GB | 1920×1080 | DLSS ou FSR 3.1 (1280×720) | 72,4 / 70,9 |
-| Ryzen 7 5700X + RTX 5060 Ti 8 GB | 2560×1440 | DLSS Qualidade (1920×1080) | 65,0 / 63,9 |
-| Ryzen 7 5700X + RTX 5060 Ti 8 GB | 3840×2160 | FSR 3.1 (1920×1080) | 67–69 / 65–66 |
-
-No launcher, **Imagem e FPS → Sugerir para meu PC** escolhe saída, upscaler, render e texturas pela placa, VRAM, CPU
-e tela, e explica por quê. Outros PCs: abra uma issue com os seus números (painel F1) e o zip de relatório, e eles
-entram nesta tabela.
-
-## Roteiro (português)
-
-Plano público deste fork, atualizado conforme o trabalho avança (última atualização: 25/10/2026).
-Os números de issue se referem ao repositório original.
-
-**Parte 1: upscalers (mais FPS em GPUs mais fracas, saída 1440p/4K mais nítida)**
-- [x] FSR 1 com RCAS (já presente desde a 0.60.x)
-- [x] Fase 0: renderizar abaixo de 1080p funciona com os ajustes do próprio jogo (23/10: Santuário, saída 3840x2160 com FSR 1:
-      1080p 38,7 FPS, 720p 46,9, 576p 49,7; imagem limpa, sem perda de dispositivo)
-- [x] Fase 1: as entradas temporais (profundidade, vetores de movimento, jitter, câmera) são capturadas sem geração de quadros
-- [x] Fase 2: upscaler temporal FSR 3.1, desligado por padrão (`SOTC_UPSCALER=fsr3`, com `SOTC_RENDER_RES` abaixo de 1080p e
-      `SOTC_OUTPUT_RES`; 23/10: Santuário 720p para 4K, imagem limpa, ~48 FPS como o FSR 1; a interface também passa por ele)
-- [x] Fase 3: opção no launcher (upscaler FSR 3.1 + preset de qualidade) e a troca no menu F1 do jogo
-- [~] Fase 4: DLSS Super Resolution via Streamline, só NVIDIA (`SOTC_UPSCALER=dlss`): código pronto, cai no FSR 3.1
-      sem as DLLs (verificado em 23/10); NÃO testado com as `sl.dlss.dll` e `nvngx_dlss.dll` de verdade, que não
-      ficam no repositório e precisam estar ao lado do bb-probe.exe
-- [x] Fase 5: documentação (CHANGELOG, este roteiro)
-
-**Parte 2: até 120 FPS no jogo, sem geração de quadros**
-- Onde estamos (25/10, 0.60.6-plus5): o Santuário de Culto roda a 59-61 FPS sem limite (eram ~42 na 0.60.6 e 53-54
-  antes da mudança das barreiras); o reaproveitamento de descritores e as leituras quentes voltaram a ser padrão.
-  120 FPS significam 8,3 ms.
-- [x] T0: teto medido em 23/10 (0.60.6 + este fork, 1080p, padrões seguros): demo de atração 71,2 FPS de média (mínima
-      48,4, thread de desenho ocupada 13-14 ms por quadro); Santuário 41,6 FPS (thread de desenho ~20 ms). M1 pede 100, M3 pede 60
-- [x] T1: o relógio do jogo segue o tempo real: na demo de atração a câmera percorre o mesmo caminho nos mesmos segundos
-      reais a 30 FPS (travado), 74,6 FPS (modo 60) e 71,7 FPS com vblank de 240 Hz. Física e animação acima de 60 FPS
-      ainda não foram conferidas (precisa de uma taxa que este PC ainda não alcança)
-- [x] T2b (25/10, 0.60.6-plus5): o limite não era a CPU, e sim os passes de renderização cortados por barreiras. Cada
-      uso de uma imagem de armazenamento 1920x1080 R32Uint escrita (layout GENERAL) depois do uso anterior gerava uma
-      barreira, e uma barreira dentro de um passe dinâmico o encerra (~22 mil `EndRendering` por segundo, 98% vindos do
-      `FlushBarriers`). A barreira agora sai uma vez por época de fence (primeiro uso depois de um rótulo EOP/ReleaseMem),
-      como no GCN, onde o próprio jogo ordena as escritas em UAV. Santuário 59,2 e 60,9 FPS contra 54,0 e 53,0 (execuções
-      intercaladas); roteiros de save de 400 s e 600 s, 0 falhas. `SOTC_GENERAL_SYNC=0` desliga. Também na plus5: leituras
-      de volta assíncronas parciais (+1,3 FPS) e `SOTC_DEPTH_RO`. Medido e descartado no caminho: segunda fila Vulkan para
-      compute assíncrono (compute é 10 a 20% do tempo da GPU), cvars do motor, afinidade de threads, mutex com espera ativa
-      (a contenção sumiu e o FPS não mudou), clocks da GPU.
-- [ ] T2: reduzir o trabalho de CPU por desenho: pular estado de registradores repetido, tornar seguro o
-      reaproveitamento de descritores, mover pré-cálculo puro para fora da thread de desenho; dividir a
-      thread de desenho é o último recurso
-- [~] T2 até agora: `SOTC_FAST_BIND=1` (reaproveitar descritores, 59% de acertos) dá +7% no Santuário (45,3 e 43,9 FPS
-      contra 42,3 e 41,0, 24/10). Continua desligado: a correção dele (`mem_epoch`) ainda precisa de uma checagem
-      em chão de areia no mundo aberto, que a caminhada automática do save não alcança. Quem joga pode testar com
-      `SOTC_FAST_BIND=1`. Dividir a thread de desenho foi medido antes em 6,7% do tempo dela (inviável). Os outros
-      itens do T2 devem dar poucos por cento cada, então o Santuário a 60 FPS (+44%) não vem só deles.
-      Achado no lugar: 4 alocações e 4 liberações de memória de vídeo por quadro (o driver quer memória dedicada
-      para imagens), ~5% da thread de desenho. Um pool de imagens as elimina: Santuário 40,3 para 42,0 FPS (+4%),
-      demo de atração 71,2 para 75,5 (+6%), mesmo uso de memória de vídeo, `SOTC_IMAGE_POOL=0` desliga.
-      Testado e descartado (24/10, Santuário, duas rodadas cada): tornar a thread de desenho a dona privilegiada da
-      trava do cache de texturas deu 40,8 / 40,9 FPS contra 43,1 / 43,8 com a dona antiga (-5%); uma atômica por
-      palavra de 64 páginas em `SetSrtReadProtectedPages` fica dentro do ruído (43,0 em quatro rodadas), mantida por
-      ser equivalente e mais barata. O que sobra na thread de desenho é o tráfego CPU-GPU da própria cena, por
-      quadro: 45 readbacks (~10% do tempo, 6% esperando o GPU), 230 faltas de escrita do jogo, 108 uploads (11,7 MB,
-      o `memmove`) e 737 proteções de página (6%). Cada um é o rastreamento que mantém a memória do jogo e a do GPU
-      em dia, então reduzir é mudar o que se rastreia, não a velocidade com que roda. Testado nesse tráfego
-      (24/10): metade das faltas de leitura do jogo (28.600 de 55.000 numa rodada) cai em bytes que o GPU nunca
-      escreveu, em páginas que os dividem com objetos do jogo (`SOTC_RB_STATS=1`; `SOTC_RB_STATS_CODE=1` despeja o
-      código em volta de cada leitor); terminar essa leitura pelo backing, sem readback, tirou 60% dessas faltas e
-      não mudou nada (42,9 / 40,8 contra 43,7 / 41,9), então saiu. `SOTC_RB_EARLY=0` (43 envios antecipados por
-      quadro) é igual: 42,6 / 41,9 contra 43,1 / 42,0. O Santuário não se mexe com nenhuma peça isolada desse tráfego.
-      Mover trabalho para a thread do processador de comandos (perfil de 24/10 da thread de desenho, Santuário): ligar
-      recursos é 43% dela (texturas 19%, buffers 15%) e depende de estado dos caches que só ela possui; as proteções
-      de página que ela pede custam 1,6 ms por quadro (14.800 chamadas/s, `SOTC_PROTECT_STATS=1`); o pré-cálculo puro
-      (dados de usuário, sharps, hashes) é poucos por cento. Não compensa o risco de texturas velhas.
-- [~] T3 (plus5): a mudança das barreiras passou em dois roteiros de save e duas capturas de tela; a checagem da areia no mundo aberto e um soak longo continuam pendentes
-- [ ] T3: cada mudança precisa passar pelos testes de ruído colorido e de pontos pretos antes de virar padrão
-- [ ] T4: opções de apresentação a 120 Hz no launcher e no menu do jogo
-- Marcos (M3 atingido em 25/10 com 59,2 a 60,9 FPS no Santuário sem limite; o mínimo em 15 s foi 58,9 a 60,3, então "estável" fica no limite): M1 demo de atração ≥ 100 FPS · M2 mundo aberto ≥ 90 · M3 Santuário ≥ 60 estável com os padrões
-  seguros · M4 Santuário 90 · M5 todas as cenas até 120. Cada marco só é marcado com um número medido.
-
-**Pendências da versão 0.60.6**
-- [ ] Placas GCN: algumas sessões terminam com a perda do dispositivo gráfico após o primeiro colosso
-      (issues #187, #123, #41). A conversão para 32 lanes não é a causa; é preciso o log de eventos da 0.60.6.
-- [ ] FSR 1 em RDNA4 (#208, #209): correção da 0.60.5-plus3 ainda não confirmada em hardware.
-- [ ] Pull requests do original #198, #205 e #207: o conteúdo já está na 0.60.6; decisão pendente sobre fechá-los.
-
----
-
-[Releases](../../releases) · [Changelog](CHANGELOG.md) · [Roadmap](#roadmap) · [Roteiro](#roteiro-português)
-
-> **No game or Sony files are included.** You need your own game dump and, for sound, two
-> modules from your own console. This project is not affiliated with Sony Interactive
-> Entertainment or Bluepoint Games.
-
----
-
-**Status: the game can be finished from start to end** (v0.60.3: played through the last
-colossus, the ending and the credits, with high quality textures, PS4 Pro mode and 60 FPS on).
-
-A native Windows port of the PS4 **Shadow of the Colossus** (Bluepoint, 2018; CUSA08809 EU 1.01 or
-CUSA08034 US 1.00) for **Windows 10/11**. The game's own x86-64 code runs directly on the PC's CPU and the PS4 GPU
-is translated to Vulkan. It is not a full emulator: it is a loader with the system functions the
-game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodborne_pc).
-
-### What's new
+**0.60.6-plus27:** DLSS no longer slowed by Reflex when only upscaling, and loads the DLSS plugin alone without frame
+generation (likely cause of the drop with Low Latency Mode: Ultra, fork #5, 2mg); sharpening (RCAS) now works with FSR 3.1,
+DLSS and same-size FSR 1; F8 no longer turns DLSS/FSR 3.1 off after FSR 3; 4K DLSS Performance without black ground; less
+stuck VRAM near the limit; launcher "Suggest for my PC", Maximum preset, saves in Documents\My Games, skip the opening,
+greyed frame generation choices the card cannot use; F1 greys launcher-only choices and texture quality changes in the
+launcher only.
 
 | Version | Improvements and fixes |
 |---|---|
-| **0.60.6-plus26** | **Lucas-blip-png fork:** 4-thread CPUs +19% in the Shrine (job worker naps, from MMadmer); HUD text without trails with FSR 3.1/DLSS; HUD bars right with reduced render; 30 FPS cap in PS4 Pro mode (AjncSystem); DMA off on Intel (Oussama268); HDR fixes (tabnul); vibration strength (MMadmer, xeodeo). |
+| **0.60.6-plus27** | **Lucas-blip-png fork:** DLSS without the Reflex wait when only upscaling (+6% in the Shrine) and with the DLSS plugin alone without frame generation (2mg, fork #5); sharpening with FSR 3.1/DLSS; F8 keeps DLSS/FSR 3.1; Suggest for my PC and Maximum preset; saves in Documents; F1 greys launcher-only choices. |
+| 0.60.6-plus26 | **Lucas-blip-png fork:** 4-thread CPUs +19% in the Shrine (job worker naps, from MMadmer); HUD text without trails with FSR 3.1/DLSS; HUD bars right with reduced render; 30 FPS cap in PS4 Pro mode (AjncSystem); DMA off on Intel (Oussama268); HDR fixes (tabnul); vibration strength (MMadmer, xeodeo). |
 | 0.60.6-plus25 | **Lucas-blip-png fork:** 21:9 and 32:9: the 3D scene is no longer the 16:9 image stretched sideways (#4, with #327 and #331 upstream); game library shows version 01.01. |
 | 0.60.6-plus24 | **Lucas-blip-png fork:** shader cache journal (one file per session instead of ~8,300), background cache writer and speculative compute pipelines (Lukto02, PR #3). |
 | 0.60.6-plus23 | **Lucas-blip-png fork:** F8 pressed in a burst no longer crashes the NVIDIA driver (one switch per 1.5 s); `BB_WRITE_LOG=3` crash diagnostic (last GPU writes per memory page). |
@@ -284,6 +206,10 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 Full details in the [CHANGELOG](CHANGELOG.md) (in Portuguese).
 
+---
+
+## Using the port
+
 ### In-game menu and shortcuts
 
 Press **F1** (or **Insert**, or **L3+R3** on the controller) while playing. The mouse is free while
@@ -291,9 +217,10 @@ the menu is open; **Esc** or F1 closes it.
 
 ![In-game menu (F1)](docs/images/sotc-menu-f1-en.png)
 
-- **Quick settings (apply at once):** FPS (30 / 60 / unlimited), upscaler (FSR 1 / bilinear),
-  sharpening (RCAS), frame generation, **texture quality**, far shadow reuse, volume. They are
-  also saved as the launcher's choice for the next start.
+- **Quick settings (apply at once):** FPS (30 / 60 / unlimited), upscaler (FSR 1 / bilinear, or back to the FSR 3.1 /
+  DLSS the game started with), sharpening (RCAS), frame generation, far shadow reuse, volume. They are also saved as the
+  launcher's choice for the next start. Choices that only apply when the game starts (FSR 3.1 / DLSS, texture quality,
+  DLSS-G when the game started without frame generation) are listed greyed, with the reason.
 - **Display:** fullscreen, FPS counter.
 - **Camera & mouse:** mouse camera on/off, sensitivity, invert Y.
 - The header shows FPS, frame time, the GPU and its video memory in use. Output resolution,
@@ -303,14 +230,14 @@ the menu is open; **Esc** or F1 closes it.
 | Key | What it does |
 |---|---|
 | **F1** / Insert / L3+R3 | Opens or closes the in-game menu |
-| **F7** | 30 FPS cap on/off (60 FPS without the cap) |
+| **F7** | FPS: 30 → 60 → unlimited |
 | **F8** | Frame generation: off → DLSS-G → FSR 3 (when the GPU supports it) |
 | **F10** | Performance overlay (FPS and frame time) |
 | **F11** | Window / fullscreen |
 
 ### Texture quality
 
-In the launcher (**Quick settings → Textures**) and in the in-game menu (changes at once):
+In the launcher (**Quick settings → Textures**); it applies when the game starts (the in-game menu only shows it):
 
 | Level | What it does | Possible problems |
 |---|---|---|
@@ -351,19 +278,7 @@ In the launcher (**Quick settings → Textures**) and in the in-game menu (chang
 Requirements: Windows 10/11 64-bit and a **Vulkan 1.3** GPU (NVIDIA, AMD or Intel with a recent
 driver). No Python install needed.
 
-**Tested on** (Shrine of Worship, the heaviest scene, ~5,600 draws per frame, uncapped; measured by
-this fork on 30 Oct 2026 with the build after 0.60.6-plus26; the CPU limits it at about 72 FPS at any output):
-
-| PC | Output | Upscaler (render) | FPS (avg / min) |
-|---|---|---|---|
-| Ryzen 7 5700X + RTX 5060 Ti 8 GB | 1920×1080 | DLAA (1920×1080) | 72.6 / 70.2 |
-| Ryzen 7 5700X + RTX 5060 Ti 8 GB | 1920×1080 | DLSS or FSR 3.1 (1280×720) | 72.4 / 70.9 |
-| Ryzen 7 5700X + RTX 5060 Ti 8 GB | 2560×1440 | DLSS Quality (1920×1080) | 65.0 / 63.9 |
-| Ryzen 7 5700X + RTX 5060 Ti 8 GB | 3840×2160 | FSR 3.1 (1920×1080) | 67–69 / 65–66 |
-
-**Display & FPS → Suggest for my PC** in the launcher picks the output, upscaler, render size and
-textures from your card, video memory, CPU and screen, and says why. Other PCs: open an issue with
-your numbers (F1 panel) and the report zip, and they go in this table.
+Requirements and measured FPS / video memory per preset and resolution: see [Requirements](#requirements).
 
 | What | Where from | What for |
 |---|---|---|
@@ -416,7 +331,8 @@ Packaging refuses any `.sprx`/`.prx`: Sony firmware never goes into the package.
   the LOD statistics approach and direct memory access for SotC.
 - Community pull requests and forks: **Oussama268**, **Lucas-blip-png**, **Gabriell-os**,
   **jownatan**, **xeodeo**, **nakaionyt / y7ngboy**, **tabnul**, **EdouardSence**, **Einar**,
-  **KingJhoss**, **nosekefik**, **raulbezerro-dev** and everyone who reports issues with logs.
+  **KingJhoss**, **nosekefik**, **raulbezerro-dev**, **MMadmer**,
+  **Lukto02**, **2mg**, **brxzzi** and everyone who reports issues with logs.
 - 60 FPS patch: illusion (GoldHEN cheats).
 
 License: **GPL-2.0-or-later** ([LICENSE](LICENSE)).

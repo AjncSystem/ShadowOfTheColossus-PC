@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.60.6-plus27 — 2026-10-30 (fork Lucas-blip-png)
+- **DLSS sem perder FPS só por ter o Reflex (2mg, #5 do fork):** com o DLSS só ampliando a imagem, o Streamline segurava cada quadro com a espera do Reflex: Santuário (1080p de 720p, RTX 5060 Ti) 68,0 FPS com ela, 72,4 sem, igual ao FSR 3.1 (72,7). Agora a espera só roda com a geração de quadros DLSS-G ligada (`SOTC_DLSSG_SLEEP=0` desliga sempre, `=2` força). E com a geração de quadros desligada ao abrir o jogo o Streamline carrega só o plugin do DLSS, sem Reflex nem DLSS-G: é a causa provável da queda com o **Low Latency Mode: Ultra** do driver numa RTX 2080 Ti (48,5 FPS contra 59,1 com Off, teste do 2mg); ainda não confirmado com o Ultra. Com isso, numa RTX 40/50 o F8 só liga o DLSS-G se o jogo abriu com a geração de quadros ligada no lançador (o FSR 3 continua no F8). `SOTC_SL_ALL=1` carrega tudo como antes.
+- **Nitidez (RCAS) também no FSR 3.1, no DLSS e no FSR 1 sem ampliação (pedido do 2mg):** a nitidez do F1 e do lançador só agia dentro da ampliação do FSR 1 e não fazia nada com FSR 3.1, DLSS ou FSR 1 com a imagem já no tamanho da saída (1080p → 1080p). Agora vale em todos (não no bilinear). A nitidez padrão (Média) passa a agir no FSR 3.1 e no DLSS também: a imagem fica um pouco mais nítida que antes; "Desligada" volta ao visual anterior. Santuário 1080p com DLSS: 70-72 FPS com e sem ela (ruído).
+- **F8 não desliga mais o DLSS/FSR 3.1 depois de passar pelo FSR 3:** sair da geração de quadros FSR 3 liberava as imagens de profundidade que o upscaler também lê, e todo quadro depois disso era a ampliação bilinear (teste do usuário a 4K, 29/10). Teste com 4 ciclos DLSS-G → FSR 3 → desligada: nenhum quadro bilinear depois.
+- **4K com DLSS Desempenho sem chão preto e grama em cartões:** o ajuste de nível de textura do upscaler (`log2(render/saída) - 1`) chegava a -2 e esgotava o pool de páginas de textura do jogo. Agora para em -1 (`SOTC_MIP_BIAS` muda).
+- **VRAM perto do limite:** a memória fria das arenas de buffer também volta para a placa quando o uso total passa de 85% do orçamento (antes só com as arenas acima de 4 GB). Numa sessão de 53 min a 4K com DLSS-G (placa de 8 GB) o uso chegou a 6,9 de 6,2 GB, a limpeza de texturas rodava sem parar (74 → 35 FPS) e as texturas corromperam. `SOTC_ARENA_EVICT_VRAM_PERCENT=0` desliga.
+- **DLSS sem o contexto do FSR 3.1 junto:** com DLSS o jogo criava o contexto e as imagens do FSR 3.1 (64 MB em 1080p, ~200 MB em 4K) sem usar.
+- **Lançador:**
+  - **"Sugerir para meu PC"** (Imagem e FPS): escolhe saída, upscaler, render e texturas pela placa, VRAM, CPU e tela, e explica por quê.
+  - **Preset "Máximo"** (texturas Máxima, grama mais longe e mais densa, 3 cascatas de sombra da geometria virtual, FPS livre; DLSS nativo/DLAA até 1600 linhas de altura, Qualidade acima), para placas com 8 GB de VRAM ou mais (12 GB em 4K). No "Equilibrado" as placas RTX usam DLSS.
+  - **Saves em Documentos\My Games\Shadow of the Colossus PC** por padrão: ao trocar ou apagar a pasta do port, os saves ficam. Na primeira abertura os saves de `user\savedata` são copiados para lá (a cópia antiga fica).
+  - **Pular a cinemática de abertura** (`SOTC_SKIP_INTRO`): segura o X sozinho até a tela de título.
+  - **Geração de quadros:** em placas que não são RTX 40/50 (RTX 20/30, AMD, Intel), DLSS-G e "Automática" ficam na lista em cinza, com o motivo, e não podem ser escolhidas; quem tinha "Automática" passa para FSR 3. Ali o "Automática" carregava o Streamline da NVIDIA à toa.
+- **Menu F1:**
+  - O Upscaler lista FSR 1, Bilinear, FSR 3.1 e DLSS; o que não pode ser trocado em jogo fica em cinza com "só no lançador" ou "só NVIDIA RTX".
+  - A geração de quadros indisponível diz por quê ("ligue no lançador antes de abrir o jogo", "só NVIDIA RTX 40/50", "não suportada nesta placa").
+  - **Qualidade das texturas muda só no lançador:** trocar em jogo podia fechar o jogo (Máxima em vistas amplas) e "Desligada" não fazia nada até reiniciar. O F1 mostra o nível em uso.
+- **README:** requisitos primeiro, com FPS e VRAM medidos por preset e resolução (Santuário, Ryzen 7 5700X + RTX 5060 Ti 8 GB), depois o roteiro e as novidades.
+- Diagnóstico: quando a GPU para ou o dispositivo é perdido, o registro mostra as 32 últimas operações da fila.
+- O perfil de PGO foi retreinado em 4K (DLSS Desempenho); sem ganho medível contra o anterior.
+- **Não trazido do 0.70 do upstream (ainda):** a correção das quedas de FPS nas trocas de área (AjncSystem, 7fde988) mexe no núcleo de memória, que aqui está diferente (23 conflitos); fica para a próxima versão, com teste próprio.
+
 ## 0.60.6-plus26 — 2026-10-29 (fork Lucas-blip-png)
 - **CPUs de 4 threads mais rápidas (cochilo das threads de jobs, do fork do MMadmer, c301eef):** as threads de jobs do jogo ficavam testando a fila sem parar enquanto esperavam trabalho (no PS4 cada uma tem um núcleo só seu). Agora, depois de 64 tentativas vazias seguidas, cochilam 100 µs e devolvem o núcleo ao render. Santuário, A/B intercalado: **4 CPUs 61,8 e 60,0 FPS ligado contra 49,3 e 52,8 desligado (+19%)**; 16 CPUs sem diferença (69,5/75,8 contra 69,2/75,7). `SOTC_POLL_NAP_US=0` desliga. Crédito: Madmer (MMadmer), autor do commit.
 - **Contagem de CPUs pela máscara de afinidade:** o modo de CPU fraca do processador de comandos e o número de workers de pipeline usavam o total de threads do sistema, não as que o processo pode usar (ideia do `UsableCpuCount` do MMadmer). Em PCs de verdade nada muda; os testes com 4 CPUs agora representam um PC de 4 threads.

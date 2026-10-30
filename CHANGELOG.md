@@ -3,6 +3,17 @@
 ## Em desenvolvimento
 
 **Experimental (desligado por padrão)**
+- **Rastreamento automático (`SOTC_TRACE`, versão 2)**: gravador de linha do tempo que registra, com
+  um relógio só, as threads do jogo e do motor. `SOTC_TRACE=1` grava a janela ao redor de cada quadro
+  lento; `SOTC_TRACE=2` grava a sessão inteira em pedaços comprimidos (`.sotctrace`, em
+  `user/trace/<sessão>/`). Opcionais: zonas de medição do shadPS4 (`SOTC_TRACE_ZONES`), tempo real da
+  GPU por envio (`SOTC_TRACE_GPU`), chamadas ao sistema PS4 com contadores e trechos
+  (`SOTC_TRACE_IMPORTS`), escopos do motor (`SOTC_TRACE_SCOPES`), amostragem contínua das pilhas
+  (`SOTC_TRACE_SAMPLE`, que substitui o `SOTC_PROFILE`) e cronometragem exata de funções do eboot
+  (`SOTC_TRACE_FUNCS`). Ferramentas em `tools/trace/sotc_trace.py` (`hitch`, `top`, `json`, `diff`).
+  O `tools/sotc_matrix.py` aceita `"trace": 1|2` e envia marcas por volta; o `summary.md` ganha a
+  seção "Onde o tempo foi", com a diferença de cada configuração contra a primeira. Tudo desligado
+  por padrão e experimental; os ajustes estão na aba Ajustes experimentais do lançador.
 - Liberar memória sem espera (`SOTC_DROP_FAST=1`, aba de ajustes experimentais do lançador):
   medido em 29/10 numa rota de carga (carregar o save, cavalgar, entrar na arena de um colosso),
   contra a mesma rota sem a opção. As esperas ao liberar memória caíram de ~9,3 s para 25–44 ms por

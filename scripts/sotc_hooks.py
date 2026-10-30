@@ -15,7 +15,8 @@ tools/re/hooks_check.py). A file that does not parse turns every hook off, it ne
         switch='SOTC_HOOK_EXAMPLE_HOOK',  # default SOTC_HOOK_<NAME>; the hook runs when it is set non-zero
         group='example',                  # default: the name; a group is all or nothing at load time
         mode='entry',                     # 'entry' (detour, may return early), 'wrap' (before and after),
-                                          # 'site' (one instruction inside a function), 'range' (no code change)
+                                          # 'site' (one instruction inside a function), 'range' (no code change),
+                                          # 'time' (a trace span per call of the function; no handler, see below)
         pattern='55 48 89 e5 ?? ?? be 28 00 00 00',  # required: hex bytes, ?? matches any byte
         expected={'<eboot fingerprint, 64 hex>': 0x925c0},  # optional: image offset for that eboot
         range_len=0,                      # range mode only (required there): bytes the range covers
@@ -29,6 +30,14 @@ A derived field is decoded from the matched bytes (offset into the pattern, size
 kind 'imm' is an unsigned immediate; 'disp' is a signed displacement; 'rip_target' is the image
 offset of a RIP-relative operand: the instruction ends at insn_end (a pattern offset), and the
 target is match + insn_end + the signed displacement.
+
+A 'time' hook (SOTC_TRACE_FUNCS) is a slim timed entry at one function: the loader records a trace
+span named after the hook for each call, and the function's own return is kept. Its pattern must be
+the function's first bytes. Its switch is one group switch in practice: any non-empty value other
+than 0 turns the hook on (the value is not read), and it needs SOTC_TRACE on. Give each time hook
+its own group (the default), so a function that does not resolve or is refused does not turn the
+others off. Scanning costs one pass of the code per hook when the fingerprint is unknown, so declare
+the expected offset for the release in use.
 
 The eboot fingerprint is the SHA-256 of its PT_LOAD and PT_SCE_RELRO segments (see fingerprint()).
 expected offsets are used only for the fingerprint they name; with any other eboot the loader
@@ -49,7 +58,7 @@ HOOKS_DIR = Path(__file__).resolve().parent / 'hooks.d'
 MAGIC = b'SOTCHOOK'
 VERSION = 1
 PT_LOAD, PT_SCE_RELRO = 1, 0x61000010
-MODES = {'entry': 0, 'wrap': 1, 'site': 2, 'range': 3}
+MODES = {'entry': 0, 'wrap': 1, 'site': 2, 'range': 3, 'time': 4}
 MODE_NAMES = {number: name for name, number in MODES.items()}
 KINDS = {'imm': 0, 'disp': 1, 'rip_target': 2}
 KIND_NAMES = {number: name for name, number in KINDS.items()}

@@ -16,6 +16,7 @@
 #include "core/platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/sotc_trace.h" // sotc: SOTC_TRACE
+#include "sotc_guest_caller.h"  // sotc: SOTC_GUEST_CALLER
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
 
@@ -163,7 +164,7 @@ s32 PS4_SYSV_ABI sceVideoOutIsFlipPending(s32 handle) {
 
 s32 PS4_SYSV_ABI sceVideoOutSubmitFlip(s32 handle, s32 bufferIndex, s32 flipMode, s64 flipArg) {
     const SotcTrace::Scope sotc_trace{"videoout flip", static_cast<u64>(bufferIndex),
-                                      reinterpret_cast<u64>(__builtin_return_address(0))};
+                                      SOTC_GUEST_CALLER()}; // sotc: guest caller (SOTC_TRACE_IMPORTS)
     auto* port = driver->GetPort(handle);
     if (!port) {
         LOG_ERROR(Lib_VideoOut, "Invalid handle = {}", handle);

@@ -10,6 +10,7 @@
 #include "particle_prev.h"
 #include "decommit_budget.h"
 #include "mip_budget.h"
+#include "probe_scopes.h" // sotc: trace v2, engine profiler scopes (SOTC_TRACE_SCOPES)
 #include "ctl_server.h"   // sotc: SotC Lab
 #include "engine_cmd.h"
 #include "freecam.h"
@@ -31,6 +32,9 @@ void RegisterAllHandlers() {
     SotcProbes::RegisterParticlePrev();
     SotcDecommitBudget::RegisterDecommitBudget();
     SotcMipBudget::RegisterMipBudget();
+    // sotc: trace v2, engine profiler scopes (SOTC_TRACE_SCOPES; the hook installs only when
+    // SOTC_TRACE is also on, so the handler is harmless otherwise).
+    SotcProbes::RegisterScopes();
     // sotc: SotC Lab (docs/sotc/LAB.md): engine commands, free-cam (+ its camera probe) and the
     // control pipe. Off unless SOTC_LAB / their own switches are set.
     SotcEngineCmd::Register();

@@ -98,7 +98,8 @@ void SetGuestCall(uint64_t fn, const uint64_t args[6]);
 //           u32 reserved
 //   count records, each:
 //     char name[48]; char switch_name[64]; char group[32];   (NUL-padded ASCII)
-//     u32 mode;           0 Entry, 1 Wrap, 2 Site, 3 Range (no detour, resolve only)
+//     u32 mode;           0 Entry, 1 Wrap, 2 Site, 3 Range (no detour, resolve only),
+//                         4 Time (timed function entry, sotc_trace_funcs_* below; no handler)
 //     u32 pattern_len;    bytes of pattern and of mask that follow
 //     u64 expected;       image offset for this fingerprint, 0 = unknown (scan)
 //     u64 range_len;      Range: bytes from the match covered by the range, else 0
@@ -129,6 +130,19 @@ uint32_t sotc_hook_dispatch(SotcHooks::GuestRegs* regs, uint32_t hook_id, uint32
 /// (no host stack switch). Copies the pending guest call into out[0] = fn, out[1..6] = args and
 /// clears it. Returns 1 when a call was pending, 0 otherwise (the stub then continues).
 uint32_t sotc_hook_take_guest_call(uint64_t out[7]);
+/// Time mode (mode 4, DetourMode::Time): called by the time stub at a timed function's entry, on
+/// the guest stack (Win64 ABI). entry_rsp = the guest rsp at the entry (the return address's slot),
+/// real_ret = that return address, hook_id = the record index, leave = the shared leave trampoline.
+/// Returns 1 when the frame was pushed on this thread's shadow stack (the stub then returns through
+/// leave), 0 when not: hook off, shadow stack full, or real_ret == leave (a tail call from a timed
+/// body, whose frame is the one that must close). The body then runs untimed. Reads the clock (t0).
+uint32_t sotc_trace_funcs_enter(uint64_t entry_rsp, uint64_t real_ret, uint32_t hook_id,
+                                uint64_t leave);
+/// Time mode: called by the shared leave trampoline after the timed body's ret, with rsp_at_return
+/// = the guest rsp after that ret. Records the span [t0, now) when it lasts SOTC_TRACE_FUNC_MIN_US
+/// or more, pops the frame (and any frame a longjmp left behind) and returns the real return
+/// address. A return that matches no frame stops the process (the address cannot be known).
+uint64_t sotc_trace_funcs_leave(uint64_t rsp_at_return);
 /// src/probe.c: runs fn(arg) on the thread's host stack (the fault handler's alternate stack
 /// when the guest runs on a fiber stack); calls it directly when already on the host stack.
 void runtime_call_on_host_stack(void (*fn)(void*), void* arg);

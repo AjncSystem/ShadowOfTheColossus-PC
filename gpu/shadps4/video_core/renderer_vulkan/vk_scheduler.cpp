@@ -11,6 +11,7 @@
 #include "video_core/renderer_vulkan/vk_recorder.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_stats.h"
+#include "sotc_gpu_trace.h"
 #include <chrono>
 #include <span>
 #include <boost/container/small_vector.hpp>
@@ -74,6 +75,11 @@ Scheduler::Scheduler(const Instance& instance, bool record_thread)
     if (instance.HasXferQueue()) {
         xfer = std::make_unique<XferQueue>(instance, work_semaphore, this);
     }
+    // sotc: SOTC_TRACE_GPU: GPU timestamps of the draw scheduler's command buffers. Only with the
+    // record thread, as the watch thread that reads them is started only then.
+    if (SotcGpuTrace::kOn && record_thread) {
+        gpu_trace = SotcGpuTrace::Timeline::Create(instance);
+    }
     BeginSession();
     priority_pending_ops_thread =
         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
@@ -99,6 +105,9 @@ void Scheduler::TraceWatchThread(std::stop_token stoken) {
     // completion time is therefore known to the sleep granularity (about 0.5-1 ms).
     while (!stoken.stop_requested()) {
         std::this_thread::sleep_for(std::chrono::microseconds(500));
+        if (gpu_trace) { // sotc: SOTC_TRACE_GPU calibration, about once a second
+            gpu_trace->Poll(SotcTrace::Now());
+        }
         const auto [result, value] = device.getSemaphoreCounterValue(semaphore);
         if (result != vk::Result::eSuccess) {
             std::this_thread::sleep_for(std::chrono::milliseconds(2)); // device lost etc.
@@ -109,6 +118,9 @@ void Scheduler::TraceWatchThread(std::stop_token stoken) {
         }
         const u64 first = value - done > 4096 ? value - 4095 : done + 1;
         SotcTrace::Completed(trace_queue, first, value, SotcStats::NowNs());
+        if (gpu_trace) { // sotc: SOTC_TRACE_GPU, the timestamps of the ticks that completed
+            gpu_trace->Completed(first, value);
+        }
         done = value;
     }
 }
@@ -615,6 +627,11 @@ void Scheduler::BeginSession() {
         Check(session.primary.begin(begin_info));
     }
 
+    // sotc: SOTC_TRACE_GPU: reset and begin stamp of this command buffer (first in the session).
+    if (gpu_trace) {
+        session.gpu_pair = gpu_trace->Begin(session.primary);
+    }
+
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
 
@@ -644,6 +661,9 @@ void Scheduler::EndSession() {
     }
 
     EndRendering();
+    if (gpu_trace) { // sotc: SOTC_TRACE_GPU, end stamp (outside the render pass)
+        gpu_trace->End(session.primary, session.gpu_pair);
+    }
     RecordHostVisibility(session.primary);
     Check(session.primary.end());
 }
@@ -1093,6 +1113,10 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     EndSession();
 
+    // sotc: SOTC_TRACE_GPU: the timestamp pair of the primary command buffer submitted here.
+    const u32 gpu_pair = gpu_trace && !sessions.empty() ? sessions.back().gpu_pair
+                                                        : SotcGpuTrace::Timeline::kNoPair;
+
     boost::container::small_vector<vk::CommandBuffer, 8> cmd_buffers;
     for (const auto& session : sessions) {
         if (session.upload) {
@@ -1119,7 +1143,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     if (recorder) {
         // The submit runs on the recording thread after the commands of these command buffers.
         recorder->Run(CommandRecorder::BlockCategory::Other,
-                      [this, info, fakes = std::move(cmd_buffers), signal_value] {
+                      [this, info, fakes = std::move(cmd_buffers), signal_value, gpu_pair] {
             boost::container::small_vector<vk::CommandBuffer, 8> real;
             for (const vk::CommandBuffer fake : fakes) {
                 real.push_back(recorder->Real(fake));
@@ -1140,6 +1164,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
                 if (SotcTrace::kOn) {
                     SotcTrace::Submitted(trace_queue, signal_value, SotcStats::NowNs());
                 }
+                if (gpu_trace) { // sotc: SOTC_TRACE_GPU, before the submit as well
+                    gpu_trace->Submitted(gpu_pair, signal_value, SotcTrace::Now());
+                }
                 QueueSubmit(instance, info, real);
             }
             recorded_submit_tick.store(signal_value, std::memory_order_release);
@@ -1153,6 +1180,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         }
         if (SotcTrace::kOn) { // sotc: SOTC_TRACE (before the submit, see above)
             SotcTrace::Submitted(trace_queue, signal_value, SotcStats::NowNs());
+        }
+        if (gpu_trace) { // sotc: SOTC_TRACE_GPU, before the submit
+            gpu_trace->Submitted(gpu_pair, signal_value, SotcTrace::Now());
         }
         QueueSubmit(instance, info, cmd_buffers);
     }

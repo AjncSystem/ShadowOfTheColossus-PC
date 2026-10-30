@@ -150,7 +150,7 @@ Estas variáveis de ambiente ajudam a investigar problemas:
 | `SOTC_STALL_DETAIL=1` | com `SOTC_FPS`: linhas `SOTCSTALL` com ritmo de flip, CPU das threads do jogo e usuário/kernel do upload |
 | `SOTC_OPSTAT=1` | operações da thread de desenho por tipo, a cada 5 s |
 | `SOTC_UNTRACK_LOG=1` | com `SOTC_FPS`: blocos do heap por quadro RenderSingleFrameGPU do jogo |
-| `SOTC_TRACE=1` | gravador de linha do tempo: para cada quadro acima de `SOTC_TRACE_MS` (padrão 60), salva o que todas as threads fizeram ao redor dele em `user/trace/<sessão>/frameNNNNNN_XXms.json` (abrir em ui.perfetto.dev); também liga o `SOTC_FPS` |
+| `SOTC_TRACE=1/2` | gravador de linha do tempo (trace automático, versão 2): ver [Trace automático](#trace-automático-sotc_trace) |
 | `BB_FAULT_RING=arquivo` | grava as últimas exceções (sobrevive a quedas) |
 | `BB_STACKS_TRIGGER=arquivo` | criar o arquivo despeja as pilhas das threads |
 | `BB_READBACKS=0/1/2` | leituras da GPU; o padrão 2 é o exigido pelo jogo |
@@ -170,3 +170,41 @@ Estas variáveis de ambiente ajudam a investigar problemas:
 | `SOTC_TUNING_JSON=<arquivo>` | `out/tuning.json` lido pelo menu do SotC Lab para montar a aba SOTC_* |
 | `SOTC_BOOT_BOSS=N` | abre o jogo direto no colosso N (1 a 16) |
 | `SOTC_LAB_ORCH_CMD=<comando>` | comando que o menu usa para iniciar o orquestrador (padrão `python tools/sotc_matrix.py`) |
+
+### Trace automático (SOTC_TRACE)
+
+Gravador de linha do tempo da versão 2, experimental e desligado por padrão. Registra, com um
+relógio só, o que as threads do jogo e do motor fizeram, e grava arquivos `.sotctrace` em
+`user/trace/<sessão>/`. Formato em [TRACE-FORMAT.md](TRACE-FORMAT.md).
+
+- `SOTC_TRACE=1`: grava a janela ao redor de cada quadro acima de `SOTC_TRACE_MS` (padrão 60), com
+  `SOTC_TRACE_PRE_MS` (150) antes e `SOTC_TRACE_POST_MS` (40) depois, até `SOTC_TRACE_MAX` arquivos
+  por sessão (padrão 40).
+- `SOTC_TRACE=2`: grava a sessão inteira, em pedaços comprimidos, enquanto o jogo roda.
+- Os dois custam CPU e ligam o `SOTC_FPS` (contadores no registro).
+
+Interruptores que acompanham o `SOTC_TRACE` (todos desligados por padrão):
+
+| Variável | Efeito |
+|---|---|
+| `SOTC_TRACE_DIR=<pasta>` | pasta dos arquivos (padrão `user/trace`) |
+| `SOTC_TRACE_RING=<n>` | multiplicador do tamanho dos anéis de eventos de cada thread |
+| `SOTC_TRACE_ZONES=1` | as zonas de medição do shadPS4 (Tracy) viram trechos; mínimo `SOTC_TRACE_ZONE_MIN_US` (padrão 20 µs) |
+| `SOTC_TRACE_GPU=1` | tempo real da GPU por envio, com marcas de tempo da Vulkan (usa a calibração do relógio da placa, quando ela tem a extensão) |
+| `SOTC_TRACE_IMPORTS=1/2` | chamadas ao sistema PS4: 1 conta chamadas e tempo; 2 também grava os trechos maiores que `SOTC_TRACE_IMPORT_MIN_US` (padrão 50 µs) |
+| `SOTC_TRACE_SCOPES=1` | os escopos de medição do próprio motor do jogo viram trechos com os seus nomes |
+| `SOTC_TRACE_SAMPLE=<Hz>` | amostragem contínua das pilhas de todas as threads; substitui o `SOTC_PROFILE` (o nome antigo ainda vale) |
+| `SOTC_TRACE_FUNCS=<arquivo>` | cronometragem exata das funções do eboot listadas no arquivo, gerado por `tools/trace/sotc_trace.py autofuncs` |
+
+Os arquivos são lidos com `tools/trace/sotc_trace.py` (biblioteca padrão do Python, sem instalação):
+
+- `hitch <arquivos> [--md relatório.md]`: por que cada quadro lento foi lento.
+- `top <arquivos>`: tempo total por nome e por thread.
+- `json <arquivo>`: JSON do Chrome, para abrir em ui.perfetto.dev.
+- `diff <pasta A> <pasta B> --md relatório.md`: diferença de tempo entre duas execuções.
+
+No `tools/sotc_matrix.py`, a chave de topo `"trace": 1` ou `2` (e `"trace_funcs"`, um arquivo para
+`SOTC_TRACE_FUNCS`) liga o rastreamento em cada execução. Cada volta do teste também envia
+`trace mark <configuração>-<cenário>-lapN`, e o `summary.md` ganha a seção "Onde o tempo foi": a
+diferença de cada configuração contra a primeira, com links para as pastas de rastreamento e os
+relatórios de travada.

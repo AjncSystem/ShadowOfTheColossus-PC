@@ -22,6 +22,7 @@
 
 #include "imgui.h"
 #include "imgui_internal.h" // ImGui::GetActiveID (the overlay includes it too)
+#include "video_core/sotc_trace.h" // sotc: SOTC_TRACE dump button
 #include "video_core/sotc_ui_lang.h"
 #include "../sotc/autopilot.h"
 #include "../sotc/engine_cmd.h"
@@ -944,6 +945,19 @@ void DrawTests() {
     if (ImGui::Button(T("Marcar segmento", "Mark segment"))) {
         ui.msg = SotcLab::Execute(std::string("mark ") + ui.mark_name);
     }
+
+    // sotc: SOTC_TRACE dump on demand (docs/sotc/LAB.md, "Trace"); disabled when the recorder is off.
+    ImGui::Separator();
+    if (!SotcTrace::kOn) {
+        ImGui::TextDisabled("%s", T("SOTC_TRACE desligado", "SOTC_TRACE is off"));
+    }
+    ImGui::BeginDisabled(!SotcTrace::kOn);
+    if (ImGui::Button(T("Gravar trace agora", "Record trace now"))) {
+        ui.msg = SotcLab::Execute("trace dump menu");
+    }
+    ImGui::EndDisabled();
+    const SotcTrace::DumpInfo dump = SotcTrace::LastDump();
+    ImGui::Text("%s: %s", T("Último trace", "Last trace"), dump.path.empty() ? "-" : dump.path.c_str());
 }
 
 } // namespace

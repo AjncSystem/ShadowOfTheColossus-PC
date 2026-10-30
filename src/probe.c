@@ -10,6 +10,7 @@
 #include "runtime_event.h"
 #include "gpu/bbgpu.h"
 #include "trace.h"
+#include "trace_imports.h"
 #include "gpu/sotc/sotc_patches.h"
 #if !defined(__x86_64__) || !defined(__GNUC__)
 #error This prototype requires x86-64 GCC or Clang (including MinGW).
@@ -1777,6 +1778,8 @@ int main(int argc, char **argv) {
         if (bbgpu_init(&gpu)) fail("GPU initialization failed");
         printf("GPU: window and Vulkan presenter ready; SDK 0x%08x, %u HLE symbols\n",(unsigned)sdk,bbgpu_symbol_count());
     }
+    /* sotc: SOTC_TRACE_IMPORTS: thunk area for the function imports (off: mode 0, no code runs). */
+    trace_imports_init((uint32_t)import_count);
     unsigned char *traps = allocate(round_page((import_count + 1) * 32));
     unsigned char *data_traps = allocate((import_count + 1) * page_size);
     protect(data_traps, (import_count + 1) * page_size, 0);
@@ -1804,8 +1807,12 @@ int main(int argc, char **argv) {
                 value=(uintptr_t)image+address+relocs[i].addend;
             }
         }
+        /* sotc: function imports bound to host or native code get a timing thunk (never traps). */
+        if (trace_imports_mode && relocs[i].kind == 1 && value != (uintptr_t)(traps + 32 * relocs[i].value))
+            value = (uintptr_t)trace_imports_wrap((uint32_t)relocs[i].value, names[relocs[i].value], (uint64_t)value);
         memcpy(image + relocs[i].target, &value, 8);
     }
+    trace_imports_seal();
     /* sotc: BB_LIST_IMPORTS=1 prints how every import is served, then exits. */
     if (getenv("BB_LIST_IMPORTS")) {
         unsigned served[3]={0};

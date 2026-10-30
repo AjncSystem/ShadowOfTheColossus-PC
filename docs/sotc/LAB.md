@@ -177,8 +177,12 @@ Comandos (sensíveis a maiúsculas; campos separados por espaço):
 | `set NOME=valor` | `ok`, `err needs-restart` ou `err bad-value` |
 | `pending NOME=valor` | `ok` (entra na lista do próximo reinício) |
 | `relaunch [boss N]` | `ok` (pede ao orquestrador conectado que reinicie) |
-| `mark <segmento>` | `ok` (zera a janela de medição e dá nome a ela) |
-| `get state` | JSON com posição, câmera, câmera livre, piloto automático, área, pulo pendente, segmento, janela de medição (p50, p99, máximo, travadas), valores ao vivo, pendências e pedido de reinício |
+| `mark <segmento>` | `ok` (zera a janela de medição e dá nome a ela; com `SOTC_TRACE`, também marca o trace e define o segmento) |
+| `trace dump [motivo]` | `ok queued`, `err off` (com `SOTC_TRACE` desligado) ou `err limit` (chegou em `SOTC_TRACE_MAX`). Grava um trace agora |
+| `trace mark <texto>` | `ok`, ou `err off`. Escreve um texto na linha do tempo do trace |
+| `trace stats` | JSON com as estatísticas do gravador; `{"mode":0}` quando `SOTC_TRACE` está desligado |
+| `trace threshold <ms>` | `ok`, `err off` ou `err bad-argument`. Muda o limiar de quadro lento ao vivo |
+| `get state` | JSON com posição, câmera, câmera livre, piloto automático, área, pulo pendente, segmento, janela de medição (p50, p99, máximo, travadas), valores ao vivo, pendências, pedido de reinício e trace (modo, último arquivo, número de gravações) |
 | `get live` | JSON só com os valores ao vivo |
 | `quit` | `ok`; fecha só esta conexão |
 
@@ -189,6 +193,36 @@ python tools/sotc_ctl.py "get state"
 python tools/sotc_ctl.py "boss 3 play"
 python tools/sotc_ctl.py "set SOTC_EXEMPLO=1"
 ```
+
+## Trace (SOTC_TRACE)
+
+O `SOTC_TRACE` é o gravador de voo das travadas. Fica desligado por padrão e é independente do Lab
+(funciona com ou sem `SOTC_LAB`). Cada thread que participa de um quadro (threads do jogo,
+processador de comandos, desenho, apresentação) grava seus trechos cronometrados, então uma travada
+pode ser lida como a cadeia de esperas que a segurou.
+
+- `SOTC_TRACE=1`: quando um quadro passa de `SOTC_TRACE_MS` (padrão 60 ms), grava um arquivo
+  `.sotctrace` com a janela ao redor (`SOTC_TRACE_PRE_MS` antes, `SOTC_TRACE_POST_MS` depois).
+  Também dá para pedir um despejo na hora (`trace dump`, o botão da aba Testes).
+- `SOTC_TRACE=2`: contínuo. A sessão inteira é transmitida para `session.sotctrace`.
+- Outras chaves: `SOTC_TRACE_JSON=1` também grava o JSON do Chrome antigo junto de cada despejo
+  (modo 1); `SOTC_TRACE_RING=1|2|4|8` multiplica os buffers circulares; `SOTC_TRACE_ZONES=1` leva as
+  marcações de zona do shadPS4 para o trace (`SOTC_TRACE_ZONE_MIN_US`, padrão 20, guarda só as zonas
+  que durarem isso); `SOTC_TRACE_MAX` limita os arquivos por sessão (padrão 40); `SOTC_TRACE_DIR`
+  substitui `user/trace`. O gravador não liga o relatório do `SOTC_FPS`; ligue `SOTC_FPS=1` também
+  para o relatório de 5 s.
+
+Com o Lab ligado, os comandos de trace estão na tabela do pipe acima (`trace dump`, `trace mark`,
+`trace stats`, `trace threshold`). Os segmentos e as voltas da rota (`SOTC SEG` / `SOTC LAP`) também
+entram no trace, então cada quadro carrega o segmento e a volta em que rodou.
+
+- **Aviso (toast)**: quando um despejo termina, o topo da tela mostra `Trace: quadro N, X ms → arquivo`
+  por 4 s.
+- **Aba Testes**: o botão **Gravar trace agora** roda `trace dump menu`. Fica desabilitado quando o
+  `SOTC_TRACE` está desligado, e o caminho do último despejo aparece abaixo dele.
+
+Os arquivos vão para `user/trace/<sessão>/` (uma pasta por abertura do jogo). São lidos com
+`tools/trace/sotc_trace.py`. O formato está em `docs/sotc/TRACE-FORMAT.md`.
 
 ## Rotas
 
@@ -309,6 +343,7 @@ chaves ao vivo não reiniciam o jogo: o orquestrador envia as trocas pelo pipe e
 | `SOTC_LAB_ROUTE_EXIT=<s>` | espera depois do fim da rota antes de fechar o jogo (padrão 5; negativo não fecha) |
 | `SOTC_FREECAM_DROP=<m>` | quantos metros abaixo da câmera livre o Wander vai (padrão 8) |
 | `SOTC_LAB_ORCH_CMD=<comando>` | comando que o menu usa para iniciar o orquestrador (padrão `python tools/sotc_matrix.py`) |
+| `SOTC_TRACE=1` ou `2` | liga o gravador de quadros lentos (seção "Trace"). Desligado por padrão, independente do Lab |
 
 As chaves acima podem ir no `sotc.ini` ou no ambiente do sistema, como as demais.
 

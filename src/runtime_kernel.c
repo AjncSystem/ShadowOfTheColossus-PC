@@ -3,6 +3,7 @@
  * use FreeBSD numbering; host errno values never reach the guest directly. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "trace_imports.h"
 #include "trace.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -137,7 +138,7 @@ static int sleep_ns_from(uint64_t ns, void *ra) {
     trace_span("sleep",t0,ns,(uint64_t)ra);
     return 0;
 }
-#define sleep_ns(ns) sleep_ns_from((ns),__builtin_return_address(0))
+#define sleep_ns(ns) sleep_ns_from((ns),(void *)(uintptr_t)GUEST_CALLER())
 /* sotc: usleep statistics (on when SOTC_FPS or SOTC_USLEEP_YIELD is set) and SOTC_USLEEP_YIELD.
  * Config is packed and read once: bits 0-1 the yield mode (SOTC_USLEEP_YIELD: 1 yields, 2 only
  * counts), bit 2 counting on, bits 8+ the yield threshold in us (SOTC_USLEEP_YIELD_US, default
@@ -214,8 +215,8 @@ static void usleep_guest(uint32_t usec, void *ra) {
     atomic_fetch_add_explicit(&usleep_stats.actual_ns,actual,memory_order_relaxed);
     if (usec<=100) usleep_note_caller((uintptr_t)ra);
 }
-static ABI int32_t kernel_usleep(uint32_t usec) { usleep_guest(usec,__builtin_return_address(0)); return 0; }
-static ABI int32_t posix_usleep(uint32_t usec) { usleep_guest(usec,__builtin_return_address(0)); return 0; }
+static ABI int32_t kernel_usleep(uint32_t usec) { usleep_guest(usec,(void *)(uintptr_t)GUEST_CALLER()); return 0; }
+static ABI int32_t posix_usleep(uint32_t usec) { usleep_guest(usec,(void *)(uintptr_t)GUEST_CALLER()); return 0; }
 /* sotc: one "SOTC USLEEP:" line for the SOTC_FPS report, then the counters are reset. seconds is
  * the window length (per-second rates). Callers are guest return addresses (host addresses of
  * the mapped image; subtract the image base for an eboot offset). */

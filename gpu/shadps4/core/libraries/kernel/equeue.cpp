@@ -17,6 +17,7 @@
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
 #include "video_core/sotc_trace.h" // sotc: SOTC_TRACE
+#include "sotc_guest_caller.h"  // sotc: SOTC_GUEST_CALLER
 
 namespace Libraries::Kernel {
 
@@ -493,7 +494,7 @@ int PS4_SYSV_ABI sceKernelWaitEqueue(OrbisKernelEqueue eq, OrbisKernelEvent* ev,
 
     {
         const SotcTrace::Scope sotc_trace{"equeue wait", static_cast<u64>(eq),
-                                          reinterpret_cast<u64>(__builtin_return_address(0))};
+                                          SOTC_GUEST_CALLER()}; // sotc: guest caller (SOTC_TRACE_IMPORTS)
         *out = equeue->WaitForEvents(ev, num, timo);
     }
 

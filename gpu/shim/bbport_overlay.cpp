@@ -32,6 +32,7 @@
 #include "video_core/sotc_live.h"
 #include "video_core/sotc_ui_lang.h"
 #include "video_core/sotc_stats.h"
+#include "video_core/sotc_trace.h"  // sotc: SOTC_TRACE dump toast
 #include "sotc_lab_menu.h"          // sotc: SotC Lab (F2 menu)
 #include "../sotc/autopilot.h"     // sotc: SotC Lab (F4 waypoint)
 
@@ -1650,6 +1651,29 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
         std::scoped_lock lock{imgui_mutex};
         toast_text = FpsModeName(fps_mode);
         toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
+    }
+    // sotc: SOTC_TRACE: a finished dump shows a toast for 4 s. LastDump is polled at most every
+    // 250 ms; the toast shows when the dump serial changed (ToastShown keeps Visible() true).
+    if (SotcTrace::kOn) {
+        static long long next_poll_ms = 0;
+        static uint64_t shown_serial = 0;
+        if (const long long now_ms = NowMs(); now_ms >= next_poll_ms) {
+            next_poll_ms = now_ms + 250;
+            const SotcTrace::DumpInfo dump = SotcTrace::LastDump();
+            if (dump.serial != shown_serial) {
+                shown_serial = dump.serial;
+                if (dump.serial != 0) {
+                    char num[96];
+                    std::snprintf(num, sizeof num, "%llu, %.0f ms",
+                                  static_cast<unsigned long long>(dump.frame), dump.worst_ms);
+                    const std::string file = std::filesystem::path(dump.path).filename().string();
+                    std::scoped_lock lock{imgui_mutex};
+                    toast_text = std::string(SotcUi::T("Trace: quadro ", "Trace: frame ")) + num +
+                                 " \xE2\x86\x92 " + file;
+                    toast_until_ms.store(now_ms + 4000, std::memory_order_relaxed);
+                }
+            }
+        }
     }
     if (!Visible()) {
         return;

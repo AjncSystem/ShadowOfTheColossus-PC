@@ -1,6 +1,7 @@
 /* Narrow, explicit PS4 libc contracts. No automatic success stubs. */
 #define _CRT_RAND_S
 #include "runtime.h"
+#include "trace_imports.h"
 #include "gpu/bbgpu.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -204,17 +205,17 @@ static inline void declare_guest_write(void *dst, size_t size, void *caller) {
 }
 static ABI void *guest_memset(void *dst, int value, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
-    declare_guest_write(dst, size, __builtin_return_address(0));
+    declare_guest_write(dst, size, (void *)(uintptr_t)GUEST_CALLER());
     return memset(dst, value, size);
 }
 static ABI void *guest_memcpy(void *dst, const void *src, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
-    declare_guest_write(dst, size, __builtin_return_address(0));
+    declare_guest_write(dst, size, (void *)(uintptr_t)GUEST_CALLER());
     return memcpy(dst, src, size);
 }
 static ABI void *guest_memmove(void *dst, const void *src, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
-    declare_guest_write(dst, size, __builtin_return_address(0));
+    declare_guest_write(dst, size, (void *)(uintptr_t)GUEST_CALLER());
     return memmove(dst, src, size);
 }
 static ABI int guest_memcmp(const void *a, const void *b, size_t size) {

@@ -95,6 +95,11 @@ enum class DetourMode : u32 {
     /// At one instruction inside a function. The handler may edit the registers, which are
     /// written back before the displaced instructions run.
     Site,
+    /// sotc: At a function entry, timed (SOTC_TRACE_FUNCS, docs/HOOK-DESIGN.md). No GuestRegs and
+    /// no dispatch: the stub records the entry time and a shadow frame (sotc_trace_funcs_enter),
+    /// and the return goes through one shared trampoline that records the span
+    /// (sotc_trace_funcs_leave). Same refusals as Wrap, plus a return at a non-zero stack depth.
+    Time,
 };
 
 struct DetourRequest {

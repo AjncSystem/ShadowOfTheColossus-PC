@@ -11,6 +11,10 @@ Matrix file (JSON):
                    {"name": "boss1", "boss": 1, "measure_s": 60}],
      "laps": 3, "settle_s": 10, "base_env": {"SOTC_MODES": "af16"},
      "configs": [{"name": "baseline", "env": {}}, {"name": "x", "env": {"SOTC_FOO": "1"}}]}
+Optional top-level "trace": 1 or 2 turns SOTC_TRACE on for every launch (restart-only), with
+SOTC_TRACE_DIR=<out>/traces/launch-NNN; every lap also sends "trace mark <config>-<scenario>-lapN".
+"trace_funcs": a file for SOTC_TRACE_FUNCS. summary.md then compares each config's dumps with the
+first config's through tools/trace/sotc_trace.py diff.
 
 Switches are split with launcher/sotc_tuning.is_live: a live switch is sent to the running game
 with "set NAME=value" (a switch that is not set by a config is reset to empty first); a restart-only
@@ -129,9 +133,20 @@ def normalize_matrix(data):
     if laps < 1:
         raise ValueError('laps must be at least 1')
     base_env = {str(k): format_value(v) for k, v in (data.get('base_env') or {}).items()}
+    trace = data.get('trace', 0)
+    if isinstance(trace, bool) or trace not in (0, 1, 2):
+        raise ValueError('trace must be 0, 1 or 2')
+    trace_funcs = str(data.get('trace_funcs') or '')
+    if trace_funcs:
+        path = Path(trace_funcs)
+        trace_funcs = str(path if path.is_absolute() else (ROOT / path).resolve())
+        base_env['SOTC_TRACE_FUNCS'] = trace_funcs
+    if trace:
+        base_env['SOTC_TRACE'] = str(int(trace))  # restart-only: SOTC_TRACE is not in LIVE
     return {'scenarios': scenarios, 'configs': configs, 'laps': laps,
             'settle_s': float(data.get('settle_s', SETTLE_DEFAULT_S)), 'base_env': base_env,
-            'launch_limit_s': float(data.get('launch_limit_s', LAUNCH_LIMIT_S))}
+            'launch_limit_s': float(data.get('launch_limit_s', LAUNCH_LIMIT_S)),
+            'trace': int(trace), 'trace_funcs': trace_funcs}
 
 
 def load_matrix(path):
@@ -200,12 +215,15 @@ def set_commands(live, previous=()):
     return commands
 
 
-def launch_env(group, boss):
-    """The environment of a launch of sotc.py for a group (its restart-only part)."""
+def launch_env(group, boss, trace_dir=None):
+    """The environment of a launch of sotc.py for a group (its restart-only part). trace_dir is the
+    folder of this launch's trace dumps (SOTC_TRACE_DIR), when the matrix turns the trace on."""
     env = dict(group['restart'])
     env['SOTC_LAB'] = '1'
     if boss:
         env['SOTC_BOOT_BOSS'] = str(boss)
+    if trace_dir is not None:
+        env['SOTC_TRACE_DIR'] = str(trace_dir)
     return env
 
 
@@ -289,7 +307,7 @@ def summarize(rows, config_order=()):
     return result
 
 
-def summary_markdown(summary, rows, matrix_name=''):
+def summary_markdown(summary, rows, matrix_name='', trace_text=''):
     lines = [f'# SotC Lab matrix {matrix_name}'.rstrip(), '',
              'Medians over the laps. The deltas are against the first config of the scenario '
              '(percent; positive is more time, for the frame times and hitches).', '']
@@ -315,6 +333,8 @@ def summary_markdown(summary, rows, matrix_name=''):
                          f'{entry["hitch33"]:.1f} | {entry["hitch50"]:.1f} | {entry["hitch100"]:.1f} | '
                          f'{delta("p50")} | {delta("p99")} | {delta("max")} | {delta("hitch100")} |')
         lines.append('')
+    if trace_text:
+        lines += [trace_text, '']
     hangs = [r for r in rows if r['segment'] not in ('route', 'fight')]
     lines += ['## Hangs and aborts', '']
     lines += [f'- {r["config"]} / {r["scenario"]} lap {r["lap"]}: {r["segment"]}: {r.get("note", "")}'
@@ -324,6 +344,60 @@ def summary_markdown(summary, rows, matrix_name=''):
 
 
 # --- running -----------------------------------------------------------------------------------------
+
+TRACE_TOOL = ROOT / 'tools' / 'trace' / 'sotc_trace.py'
+
+
+def trace_section(out, order, folders):
+    """The "where the time went" part of summary.md: the trace folders of each config and, for each
+    config after the first, the diff against the first config's folder (tools/trace/sotc_trace.py diff).
+    '' when no config has a trace folder; the diff is left out quietly when the tool is missing."""
+    if not any(folders.get(name) for name in order):
+        return ''
+
+    def rel(path):
+        return Path(os.path.relpath(path, out)).as_posix()
+
+    base = order[0]
+    base_dir = (folders.get(base) or [None])[0]
+    lines = ['## Onde o tempo foi (where the time went)', '',
+             f'Trace folders per config; the first config ({base}) is the baseline.', '']
+    for name in order:
+        mine = folders.get(name) or []
+        if not mine:
+            lines.append(f'- {name}: no trace folder (the trace is off or the config did not run).')
+            continue
+        dumps = sum(len(list(folder.glob('*.sotctrace'))) for folder in mine)
+        links = ', '.join(f'[{rel(folder)}]({rel(folder)})' for folder in mine)
+        lines.append(f'- {name}: {dumps} dump(s) in {links}')
+        for folder in mine:
+            for report in sorted(folder.glob('*.md')):
+                lines.append(f'  - hitch report: [{rel(report)}]({rel(report)})')
+    lines += ['', '### Diff against the baseline', '']
+    for name in order[1:]:
+        mine = folders.get(name) or []
+        other = next((folder for folder in mine if folder != base_dir), None)
+        if base_dir is None or other is None:
+            lines.append(f'- {name}: not compared (its dumps share a launch with {base}, so they mix '
+                         'the configs).')
+            continue
+        if not TRACE_TOOL.is_file():
+            continue  # the tool is missing: quietly no diff
+        report = out / 'traces' / f'diff-{name}.md'
+        try:
+            done = subprocess.run([sys.executable, str(TRACE_TOOL), 'diff', str(base_dir), str(other),
+                                   '--md', str(report)],
+                                  capture_output=True, text=True, timeout=600)
+        except (OSError, subprocess.SubprocessError) as error:
+            lines.append(f'- {name}: not compared ({error}).')
+            continue
+        if done.returncode or not report.is_file():
+            detail = (done.stderr or '').strip().splitlines()[-1:] or ['no output']
+            lines.append(f'- {name}: not compared (sotc_trace.py diff exit {done.returncode}: {detail[0]}).')
+            continue
+        lines += [f'#### {name} against {base}', '', report.read_text(encoding='utf-8').strip(), '']
+    return '\n'.join(lines)
+
 
 def autopilot_playing(state):
     """True/False from the autopilot part of "get state"; None when the state does not tell."""
@@ -482,6 +556,8 @@ class Runner:
         self.launches = 0
         self.process = None      # the sotc.py this matrix started, while it runs
         self.process_log = None
+        self.trace_dirs = {}     # config -> the trace folders of the launches it ran in
+        self.trace_dir = None    # the trace folder of the launch that runs now, when the trace is on
         self.csv_file = open(out / 'results.csv', 'w', newline='', encoding='utf-8')
         self.writer = csv.DictWriter(self.csv_file, fieldnames=RESULT_FIELDS + ['note'], extrasaction='ignore')
         self.writer.writeheader()
@@ -508,8 +584,11 @@ class Runner:
             self.stop_game()
             self.csv_file.close()
             self.log_file.close()
-        summary = summarize(self.rows, [c['name'] for c in self.matrix['configs']])
-        (self.out / 'summary.md').write_text(summary_markdown(summary, self.rows), encoding='utf-8')
+        order = [c['name'] for c in self.matrix['configs']]
+        summary = summarize(self.rows, order)
+        trace_text = trace_section(self.out, order, self.trace_dirs)
+        (self.out / 'summary.md').write_text(summary_markdown(summary, self.rows, trace_text=trace_text),
+                                             encoding='utf-8')
         return 0
 
     def stop_game(self):
@@ -529,6 +608,7 @@ class Runner:
         items = list(launch['items'])
         boss, relaunches = launch['boss'], 0
         while items:
+            self.trace_dir = None
             if adopt:
                 ctl = self.connect(None)
                 adopted = True
@@ -580,13 +660,18 @@ class Runner:
         env = dict(os.environ)
         for name in ('SOTC_LAB', 'SOTC_BOOT_BOSS'):
             env.pop(name, None)
-        env.update(launch_env(group, boss))
+        self.trace_dir = None
+        if self.matrix['trace']:
+            self.trace_dir = self.out / 'traces' / f'launch-{self.launches:03d}'
+            self.trace_dir.mkdir(parents=True, exist_ok=True)
+        env.update(launch_env(group, boss, self.trace_dir))
         self.process_log = open(self.out / f'launch-{self.launches:03d}.txt', 'wb')
         self.process = subprocess.Popen([sys.executable, str(ROOT / 'sotc.py')], cwd=str(ROOT), env=env,
                                         stdin=subprocess.DEVNULL, stdout=self.process_log,
                                         stderr=subprocess.STDOUT)
+        where = f' trace={self.trace_dir}' if self.trace_dir is not None else ''
         self.log(f'launch {self.launches}: sotc.py boss={boss or "none"} '
-                 f'restart-only={json.dumps(group["restart"], sort_keys=True)}')
+                 f'restart-only={json.dumps(group["restart"], sort_keys=True)}{where}')
 
     def connect(self, process, timeout=CONNECT_S):
         deadline = time.monotonic() + timeout
@@ -614,13 +699,17 @@ class Runner:
     def run_item(self, session, config_name, scenario):
         session.where.update(scenario=scenario['name'], config=config_name)
         mark_prefix = f'{config_name}-{scenario["name"]}'
+        if self.trace_dir is not None:
+            folders = self.trace_dirs.setdefault(config_name, [])
+            if self.trace_dir not in folders:
+                folders.append(self.trace_dir)
         if scenario['boss']:
             session.wait_until(lambda state: bool(state.get('area')), BOSS_WAIT_S)
             for lap in range(1, self.matrix['laps'] + 1):
                 session.where['lap'] = lap
                 mark = f'{mark_prefix}-lap{lap}'
                 session.ask(f'boss {scenario["boss"]}')
-                session.ask(f'mark {mark}')
+                self.mark(session, mark)
                 session.wait(scenario['measure_s'])
                 self.record(session, scenario['name'], config_name, lap, 'fight', mark)
             return
@@ -632,9 +721,15 @@ class Runner:
             if lap > 1:
                 session.ask('path seek 0')
                 session.ask('path play')
-            session.ask(f'mark {mark}')
+            self.mark(session, mark)
             self.wait_lap(session, scenario)
             self.record(session, scenario['name'], config_name, lap, 'route', mark)
+
+    def mark(self, session, mark):
+        """A lap mark; with the trace on, a trace mark of the same name goes into the dumps too."""
+        session.ask(f'mark {mark}')
+        if self.matrix['trace']:
+            session.ask(f'trace mark {mark}')
 
     def wait_lap(self, session, scenario):
         """Waits for the end of a route lap: the autopilot stops (after it was seen playing). Without
@@ -671,6 +766,8 @@ def ensure_routes(matrix):
     missing = [s['route'] for s in matrix['scenarios'] if s['route'] and not Path(route_path(s)).is_file()]
     if missing:
         raise SystemExit('route file(s) not found: ' + ', '.join(missing))
+    if matrix['trace_funcs'] and not Path(matrix['trace_funcs']).is_file():
+        raise SystemExit('trace_funcs file not found: ' + matrix['trace_funcs'])
 
 
 def main(argv=None):

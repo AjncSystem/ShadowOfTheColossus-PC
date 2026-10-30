@@ -505,8 +505,9 @@ public:
     static void LockCounted(std::unique_lock<ReentrantMutex>& lk) {
         // sotc: SOTC_FPS alone only times the draw thread; other threads keep the plain lock()
         // (try_lock + lock costs a second asymmetric barrier on the biased mutex).
+        // sotc: SOTC_TRACE alone also times the draw thread's wait here (its span).
         if ((SotcStats::kCmdStats ||
-             (SotcStats::kFpsLog && SotcStats::tl_role == SotcStats::RoleDraw)) &&
+             ((SotcStats::kFpsLog || SotcTrace::kOn) && SotcStats::tl_role == SotcStats::RoleDraw)) &&
             !lk.mutex()->HeldByThisThread()) {
             if (SotcStats::kCmdStats) {
                 SotcStats::sys_tc_locks.fetch_add(1, std::memory_order_relaxed);

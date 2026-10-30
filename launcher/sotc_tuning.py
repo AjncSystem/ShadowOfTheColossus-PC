@@ -1661,22 +1661,26 @@ TUNING = [('SOTC_ADAPTIVE_SHADOW',
   '',
   ()),
  ('SOTC_TRACE',
-  'flag',
+  'choice',
   'diag',
-  ('Gravar linha do tempo dos quadros lentos', 'Record timeline of slow frames'),
-  ('Salva em user/trace a linha do tempo das threads ao redor de cada quadro lento. Custa CPU e '
-   'também liga “FPS no registro” (aba Avançado). Desligado por padrão; só para diagnóstico.',
-   'Saves to user/trace the thread timeline around each slow frame. Costs CPU and also turns on '
-   '"FPS in the log" (Advanced page). Off by default; diagnostics only.'),
+  ('Gravar linha do tempo (rastreamento)', 'Record timeline (tracing)'),
+  ('Desligado por padrão. 1: grava a janela ao redor de cada quadro lento (SOTC_TRACE_MS) em '
+   'user/trace. 2: grava a sessão inteira, em pedaços comprimidos. Custa CPU e liga “FPS no '
+   'registro” (aba Avançado). Os arquivos são lidos com tools/trace/sotc_trace.py. Só diagnóstico.',
+   'Off by default. 1: records the window around each slow frame (SOTC_TRACE_MS) in user/trace. '
+   '2: records the whole session in compressed chunks. Costs CPU and turns on "FPS in the log" '
+   '(Advanced page). Read the files with tools/trace/sotc_trace.py. Diagnostics only.'),
   '',
-  ()),
+  (('', ('Desligado', 'Off')),
+   ('1', ('Quadros lentos (janela ao redor)', 'Slow frames (window around)')),
+   ('2', ('Sessão inteira (fluxo contínuo)', 'Whole session (continuous stream)')))),
  ('SOTC_TRACE_DIR',
   'value',
   'diag',
   ('Pasta da linha do tempo', 'Timeline folder'),
-  ('Pasta onde a linha do tempo é gravada, com “Gravar linha do tempo dos quadros lentos”. Vazio '
-   'usa a pasta user/trace. Só para diagnóstico.',
-   'Folder where the timeline is written, with "Record timeline of slow frames". Empty uses the '
+  ('Pasta onde os arquivos de rastreamento são gravados, com “Gravar linha do tempo (rastreamento)”. '
+   'Vazio usa a pasta user/trace. Só para diagnóstico.',
+   'Folder where the trace files are written, with "Record timeline (tracing)". Empty uses the '
    'user/trace folder. Diagnostics only.'),
   '',
   ()),
@@ -1684,41 +1688,119 @@ TUNING = [('SOTC_ADAPTIVE_SHADOW',
   'value',
   'diag',
   ('Máximo de arquivos de linha do tempo', 'Maximum timeline files'),
-  ('Quantos arquivos de linha do tempo são gravados por sessão, com “Gravar linha do tempo dos '
-   'quadros lentos”. Padrão 40. Só para diagnóstico.',
-   'How many timeline files are written per session, with "Record timeline of slow frames". '
-   'Default 40. Diagnostics only.'),
+  ('Quantos arquivos de rastreamento são gravados por sessão, com “Gravar linha do tempo '
+   '(rastreamento)” em 1. Padrão 40. Só para diagnóstico.',
+   'How many trace files are written per session, with "Record timeline (tracing)" on 1. Default '
+   '40. Diagnostics only.'),
   '40',
   ()),
  ('SOTC_TRACE_MS',
   'value',
   'diag',
   ('Limite de quadro lento (ms)', 'Slow frame threshold (ms)'),
-  ('A partir de quantos milissegundos um quadro é considerado lento e gera uma linha do tempo, com '
-   '“Gravar linha do tempo dos quadros lentos”. Padrão 60. Só para diagnóstico.',
-   'Frame time in milliseconds above which a frame counts as slow and gets a timeline, with '
-   '"Record timeline of slow frames". Default 60. Diagnostics only.'),
+  ('A partir de quantos milissegundos um quadro é considerado lento e gera uma janela de '
+   'rastreamento, com “Gravar linha do tempo (rastreamento)” em 1 ou 2. Padrão 60. Só para diagnóstico.',
+   'Frame time in milliseconds above which a frame counts as slow and gets a trace window, with '
+   '"Record timeline (tracing)" on 1 or 2. Default 60. Diagnostics only.'),
   '60',
   ()),
  ('SOTC_TRACE_POST_MS',
   'value',
   'diag',
   ('Tempo gravado depois do quadro lento (ms)', 'Time recorded after a slow frame (ms)'),
-  ('Quanto tempo, em milissegundos, é gravado depois de um quadro lento na linha do tempo. Padrão '
-   '40. Só com “Gravar linha do tempo dos quadros lentos”; diagnóstico.',
-   'How long, in milliseconds, is recorded after a slow frame in the timeline. Default 40. Only '
-   'with "Record timeline of slow frames"; diagnostics.'),
+  ('Quanto tempo, em milissegundos, é gravado depois de um quadro lento. Padrão 40. Só com '
+   '“Gravar linha do tempo (rastreamento)” em 1; diagnóstico.',
+   'How long, in milliseconds, is recorded after a slow frame. Default 40. Only with "Record '
+   'timeline (tracing)" on 1; diagnostics.'),
   '40',
   ()),
  ('SOTC_TRACE_PRE_MS',
   'value',
   'diag',
   ('Tempo gravado antes do quadro lento (ms)', 'Time recorded before a slow frame (ms)'),
-  ('Quanto tempo, em milissegundos, é gravado antes de um quadro lento na linha do tempo. Padrão '
-   '150. Só com “Gravar linha do tempo dos quadros lentos”; diagnóstico.',
-   'How long, in milliseconds, is recorded before a slow frame in the timeline. Default 150. Only '
-   'with "Record timeline of slow frames"; diagnostics.'),
+  ('Quanto tempo, em milissegundos, é gravado antes de um quadro lento. Padrão 150. Só com '
+   '“Gravar linha do tempo (rastreamento)” em 1; diagnóstico.',
+   'How long, in milliseconds, is recorded before a slow frame. Default 150. Only with "Record '
+   'timeline (tracing)" on 1; diagnostics.'),
   '150',
+  ()),
+ ('SOTC_TRACE_RING',
+  'value',
+  'diag',
+  ('Tamanho dos anéis de eventos (multiplicador)', 'Event ring size (multiplier)'),
+  ('Multiplica o tamanho dos anéis de eventos de cada papel de thread. Vazio usa o padrão do build. '
+   'Aumente se o contador de descartes mostrar perda dentro da janela de um quadro lento. Só com '
+   '“Gravar linha do tempo (rastreamento)” ligado.',
+   'Multiplies the event ring size of each thread role. Empty uses the build default. Raise it if the '
+   'drop counter shows loss inside a slow-frame window. Only with "Record timeline (tracing)" on.'),
+  '',
+  ()),
+ ('SOTC_TRACE_ZONES',
+  'flag',
+  'diag',
+  ('Zonas do shadPS4 na linha do tempo', 'shadPS4 zones in the timeline'),
+  ('Desligado por padrão. As zonas de medição do shadPS4 (Tracy) entram na linha do tempo como '
+   'trechos. Só as de pelo menos SOTC_TRACE_ZONE_MIN_US (padrão 20 µs). Só diagnóstico.',
+   'Off by default. The shadPS4 measurement zones (Tracy) enter the timeline as spans. Only zones of '
+   'at least SOTC_TRACE_ZONE_MIN_US (default 20 µs). Diagnostics only.'),
+  '',
+  ()),
+ ('SOTC_TRACE_GPU',
+  'flag',
+  'diag',
+  ('Tempos reais da GPU na linha do tempo', 'Real GPU times in the timeline'),
+  ('Desligado por padrão. Grava o tempo que a GPU gastou em cada envio, com marcas de tempo da '
+   'Vulkan. Mostra se um quadro lento esperou a GPU ou a CPU. Usa a calibração de relógio da placa, '
+   'quando ela tem a extensão; sem ela, não há efeito. Só diagnóstico.',
+   'Off by default. Records the GPU time of each submit, with Vulkan timestamps. Shows whether a slow '
+   'frame waited for the GPU or the CPU. Uses the GPU clock calibration when the card has the '
+   'extension; without it, no effect. Diagnostics only.'),
+  '',
+  ()),
+ ('SOTC_TRACE_IMPORTS',
+  'choice',
+  'diag',
+  ('Chamadas ao sistema PS4 (importações)', 'PS4 system calls (imports)'),
+  ('Desligado por padrão. 1: conta as chamadas e o tempo de cada função do sistema PS4 que o jogo '
+   'importa. 2: também grava os trechos mais longos que SOTC_TRACE_IMPORT_MIN_US (padrão 50 µs). '
+   'Só diagnóstico.',
+   'Off by default. 1: counts the calls and the time of each PS4 system function the game imports. '
+   '2: also records the spans longer than SOTC_TRACE_IMPORT_MIN_US (default 50 µs). Diagnostics only.'),
+  '',
+  (('', ('Desligado (padrão)', 'Off (default)')),
+   ('1', ('Contadores por importação', 'Counters per import')),
+   ('2', ('Contadores e trechos longos', 'Counters and long spans')))),
+ ('SOTC_TRACE_SCOPES',
+  'flag',
+  'diag',
+  ('Escopos de medição do motor como trechos', 'Engine measurement scopes as spans'),
+  ('Desligado por padrão. Os escopos de medição do próprio motor do jogo entram na linha do tempo '
+   'com os seus nomes. Só diagnóstico.',
+   "Off by default. The game engine's own measurement scopes enter the timeline under their names. "
+   'Diagnostics only.'),
+  '',
+  ()),
+ ('SOTC_TRACE_SAMPLE',
+  'value',
+  'diag',
+  ('Amostragem de pilhas (Hz)', 'Stack sampling (Hz)'),
+  ('Vazio desliga. Amostra a pilha de todas as threads nesta frequência e põe as pilhas na linha do '
+   'tempo e em tools/trace top. Substitui SOTC_PROFILE (o nome antigo ainda vale). Custa CPU: cada '
+   'amostra suspende a thread medida por pouco tempo. Só diagnóstico.',
+   'Empty turns it off. Samples the stack of every thread at this rate and puts the stacks in the '
+   'timeline and in tools/trace top. Replaces SOTC_PROFILE (the old name still works). Costs CPU: each '
+   'sample suspends the measured thread briefly. Diagnostics only.'),
+  '',
+  ()),
+ ('SOTC_TRACE_FUNCS',
+  'value',
+  'diag',
+  ('Funções do eboot cronometradas (arquivo)', 'Timed eboot functions (file)'),
+  ('Arquivo com a lista de funções do eboot a cronometrar com exatidão, gerado por '
+   'tools/trace/sotc_trace.py autofuncs. Vazio não usa nenhum. Só diagnóstico.',
+   'File with the list of eboot functions to time exactly, generated by tools/trace/sotc_trace.py '
+   'autofuncs. Empty uses none. Diagnostics only.'),
+  '',
   ()),
  ('SOTC_UNTRACK_LOG',
   'flag',

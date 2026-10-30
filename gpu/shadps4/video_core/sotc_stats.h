@@ -20,11 +20,11 @@ namespace SotcStats {
 /// guest-thread fault counter (which shared cache lines with CP counters) are gone; with the
 /// switches on, the printed numbers are unchanged (the printer reads and resets each counter with
 /// exchange(0) only under the same switch). The variables are never set at run time.
-// sotc: SOTC_TRACE=1 (sotc_trace.h) needs the same timers.
-inline const bool kFpsLog = std::getenv("SOTC_FPS") != nullptr || [] {
-    const char* v = std::getenv("SOTC_TRACE");
-    return v && v[0] == '1';
-}();
+// sotc: SOTC_TRACE (sotc_trace.h) does not turn this on. The trace spans read the clock on their
+// own (SotcTrace::kOn checks at the call sites: DrawWait, RoleTimer, liverpool.cpp, vk_recorder.cpp)
+// and the counters stay off unless SOTC_FPS is set. kFpsLog reads no trace state, so the order
+// of the initialisation of sotc_trace.h's kOn does not matter here.
+inline const bool kFpsLog = std::getenv("SOTC_FPS") != nullptr;
 inline const bool kCmdStats = std::getenv("SOTC_CMD_STATS") != nullptr;
 /// sotc: SOTC_STALL_DETAIL=1 (off by default): the SOTCSTALL line also shows the flip pacing of the
 /// frame, the guest threads' CPU and the user/kernel CPU of the upload threads (vk_presenter.cpp).
@@ -1357,8 +1357,9 @@ struct DrawWait {
     bool on = false;    ///< counted: SOTC_FPS, on the draw thread
     bool timed = false; ///< clock read: kFpsTimers, or SOTC_TRACE (its span needs the times)
     explicit DrawWait(WaitKind k) : kind{k} {
-        if (kFpsLog && tl_role == RoleDraw) {
-            on = true;
+        // sotc: SOTC_TRACE alone times the draw thread's waits for their spans (no counts).
+        if ((kFpsLog || SotcTrace::kOn) && tl_role == RoleDraw) {
+            on = kFpsLog;
             if (kFpsTimers || SotcTrace::kOn) { // sotc: SOTC_FPS_LEAN drops the clock reads
                 timed = true;
                 outer_nested = nested_ns;
@@ -1377,7 +1378,9 @@ struct DrawWait {
                 SotcTrace::Span(kNames[kind], start, now);
             }
             const uint64_t inner = nested_ns < elapsed ? nested_ns : elapsed;
-            draw_wait_ns[kind].fetch_add(elapsed - inner, std::memory_order_relaxed);
+            if (kFpsLog) { // sotc: the sums are read only by the SOTC_FPS printer
+                draw_wait_ns[kind].fetch_add(elapsed - inner, std::memory_order_relaxed);
+            }
             nested_ns = outer_nested + elapsed;
         }
         if (on) {
@@ -1388,7 +1391,8 @@ struct DrawWait {
     DrawWait& operator=(const DrawWait&) = delete;
 };
 
-/// Adds the scope's duration to `total` when SOTC_FPS is on and the caller has `role`.
+/// Adds the scope's duration to `total` when SOTC_FPS is on and the caller has `role`. With
+/// SOTC_TRACE only, the clock is read for the span (trace_name) and `total` is left alone.
 /// sotc: trace_name (a string literal) also records the scope as a SOTC_TRACE span.
 struct RoleTimer {
     std::atomic<uint64_t>& total;
@@ -1405,7 +1409,9 @@ struct RoleTimer {
     ~RoleTimer() {
         if (on) {
             const uint64_t now = NowNs();
-            total.fetch_add(now - start, std::memory_order_relaxed);
+            if (kFpsLog) { // sotc: the sums are read only by the SOTC_FPS printer
+                total.fetch_add(now - start, std::memory_order_relaxed);
+            }
             if (trace_name && SotcTrace::kOn) {
                 SotcTrace::Span(trace_name, start, now);
             }

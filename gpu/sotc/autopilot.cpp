@@ -18,11 +18,13 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
 #include "freecam.h"
 #include "mini_json.h"
+#include "video_core/sotc_trace.h" // sotc: SOTC_TRACE segment and lap marks
 
 namespace SotcAutopilot {
 namespace {
@@ -183,6 +185,12 @@ Pose PoseLocked() {
 void AnnounceLocked(const char* what, const std::string& name) {
     std::fprintf(stderr, "SOTC SEG %s %s\n", name.c_str(), what);
     std::fflush(stderr);
+    if (SotcTrace::kOn) { // sotc: the segment is stored with every following frame
+        const bool begin = std::string_view(what) == "begin";
+        const std::string text = "SEG " + name + " " + what;
+        SotcTrace::Mark(text.c_str());
+        SotcTrace::SetSegment(begin ? name.c_str() : "", static_cast<uint32_t>(g_lap));
+    }
 }
 
 // Passing point p: a named point starts a new segment when its name differs from the current one.
@@ -226,6 +234,11 @@ void DepartLocked() {
         ++g_lap;
         std::fprintf(stderr, "SOTC LAP %d\n", g_lap);
         std::fflush(stderr);
+        if (SotcTrace::kOn) { // sotc: lap mark; EndSegmentLocked above already cleared the segment
+            const std::string text = "LAP " + std::to_string(g_lap);
+            SotcTrace::Mark(text.c_str());
+            SotcTrace::SetSegment("", static_cast<uint32_t>(g_lap));
+        }
         g_at = 0;
         g_seg = 0;
         g_dist = 0.0;

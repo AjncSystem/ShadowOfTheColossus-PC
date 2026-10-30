@@ -2731,7 +2731,9 @@ void Liverpool::Process(std::stop_token stoken) {
         // streak is the time from the first resume without progress to the next progress. The
         // clock is read once per progress resume (parse time) and every 32 resumes of a streak
         // (spin time, idle deadline); the resumes of a streak are not timed one by one.
-        const bool track = SotcStats::kFpsLog || cp_idle_ns != 0;
+        // sotc: SOTC_TRACE also tracks the streaks: the cp parse span needs the progress marks.
+        // Scheduling is unchanged: idle_due is set only with cp_idle_ns.
+        const bool track = SotcStats::kFpsLog || SotcTrace::kOn || cp_idle_ns != 0;
         // sotc: SOTC_FPS_LEAN: the parse and spin clock reads (kFpsTimers, or SOTC_TRACE's spans).
         // The streak times that SOTC_CP_IDLE_US decides on are read whatever this is.
         const bool cp_timed = SotcStats::kFpsTimers || SotcTrace::kOn;
@@ -2864,10 +2866,13 @@ void Liverpool::Process(std::stop_token stoken) {
                                       resumed != last_resumed[curr_qid];
                 last_resumed[curr_qid] = resumed;
                 if (progress) {
-                    if (SotcStats::kFpsLog && cp_timed) {
+                    if ((SotcStats::kFpsLog || SotcTrace::kOn) && cp_timed) {
                         const u64 parse_ns = SotcStats::NowNs() - mark_ns;
-                        SotcStats::cp_parse_ns.fetch_add(parse_ns, std::memory_order_relaxed);
-                        SotcStats::cp_parse_all_ns.fetch_add(parse_ns, std::memory_order_relaxed);
+                        if (SotcStats::kFpsLog) { // sotc: the sums are SOTC_FPS only
+                            SotcStats::cp_parse_ns.fetch_add(parse_ns, std::memory_order_relaxed);
+                            SotcStats::cp_parse_all_ns.fetch_add(parse_ns,
+                                                                 std::memory_order_relaxed);
+                        }
                         // sotc: SOTC_TRACE: a = queue (0 graphics, others compute); the ops
                         // this thread ran itself (no draw thread, express path) go out first
                         if (SotcTrace::kOn) {

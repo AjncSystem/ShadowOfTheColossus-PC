@@ -215,6 +215,16 @@ extern "C" uint32_t sotc_hook_take_guest_call(uint64_t out[7]) {
     return 1;
 }
 
+// sotc: time-mode shims the cpu_patches time stub references. This test does not exercise time
+// mode; the stubs are here so the linker does not pull in hooks.cpp (which also defines
+// sotc_hook_dispatch, a duplicate of this file's own stub above).
+extern "C" uint32_t sotc_trace_funcs_enter(uint64_t, uint64_t, uint32_t, uint64_t) {
+    return 0;
+}
+extern "C" uint64_t sotc_trace_funcs_leave(uint64_t rsp_at_return) {
+    return rsp_at_return;
+}
+
 int main() {
     void* memory = VirtualAlloc(nullptr, kCodeSize + kTrampolineSize, MEM_RESERVE | MEM_COMMIT,
                                 PAGE_EXECUTE_READWRITE);

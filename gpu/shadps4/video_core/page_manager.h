@@ -51,6 +51,10 @@ private:
 void ForEachNonStackRange(VAddr address, u64 size, NonStackRangeFn func);
 /// sotc: any byte of the range is in a registered guest stack (never write-protected).
 bool IntersectsGuestStack(VAddr address, u64 size);
+/// sotc: the registered guest stack range holding addr (margin included; adjacent registrations
+/// may merge, every byte of [lo, hi) is accessible). For the trace sampler, outside suspended
+/// threads: takes the registry lock shared. False when addr is in no registered stack.
+bool GuestStackRange(VAddr addr, VAddr& lo, VAddr& hi);
 
 /// sotc: SOTC_FAULT_OSCOST=1 (needs SOTC_FPS): what the operating system adds to a write fault
 /// around the handler, in microseconds: from the faulting store to the entry of

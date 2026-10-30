@@ -42,6 +42,7 @@
 #include "video_core/buffer_cache/hrr.h"
 #include "video_core/buffer_cache/region_manager.h"
 #include "video_core/sotc_stats.h"
+#include "video_core/sotc_trace.h" // sotc: SOTC_TRACE flip marks
 #include "video_core/sotc_write_extent.h"
 #include "video_core/sotc_ui_lang.h"
 #include "../../../../sotc/hooks.h"      // sotc: SotcHookStats::Report
@@ -53,6 +54,7 @@
 #include "../../../../sotc/probe_buildsync.h" // sotc: Wave D report lines
 #include "../../../../sotc/probe_dt.h"
 #include "../../../../sotc/probe_drawtag.h"
+#include "../../../../sotc/probe_scopes.h" // sotc: trace v2 engine scopes report
 #include "../../../../sotc/particle_prev.h"
 #include "../../../../sotc/decommit_budget.h"
 #include "../../../../sotc/mip_budget.h"
@@ -69,6 +71,8 @@ void ReportPipeMemo(std::string& out, double seconds); // sotc: SOTC_PIPE_MEMO
 extern "C" void runtime_usleep_stats(char* out, size_t size, double seconds);
 // sotc: src/runtime_mutex.c, SOTC_MUTEX_SPIN_US stats (Wave D C1).
 extern "C" void runtime_mutex_spin_stats(char* out, size_t size, double seconds);
+// sotc: trace v2 import timing (src/runtime_trace_imports.c, SOTC_TRACE_IMPORTS).
+extern "C" void trace_imports_report(char* out, unsigned long size, double seconds);
 // sotc: Wave D B5/C6, declared in vk_presenter.h; forward-declared here in case the header lacks it.
 namespace Vulkan {
 void ReportFlipWait(std::string& out, double seconds);
@@ -589,7 +593,10 @@ void VideoOutDriver::Flip(const Request& req) {
         presenter->SetHDR(hdr);
         presenter->Present(frame);
     });
-    SotcStats::flip_count.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t sotc_flip = SotcStats::flip_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (SotcTrace::kOn) { // sotc: SOTC_TRACE, the game's flip on the frames track
+        SotcTrace::FlipMark(sotc_flip);
+    }
     UntrackAutoTick(); // sotc: SOTC_UNTRACK_AUTO (every 30 flips)
     {
         // sotc: a performance line in the event log every minute (average FPS, frames slower
@@ -1970,6 +1977,16 @@ void VideoOutDriver::Flip(const Request& req) {
             Vulkan::ReportFlipWait(report, seconds);                  // B5 (SOTC_FPS)
             Vulkan::ReportPresent(report, seconds);                   // SOTC_PRESENT_FRAMES / SOTC_FPS
             VideoCore::ReportReadbackRips(report, seconds);           // B6 (SOTC_FPS)
+            SotcProbes::ReportScopes(report, seconds);                // SOTC_TRACE_SCOPES
+            { // sotc: SOTC_TRACE_IMPORTS, PS4 system-call timing (C side)
+                char imports_line[512];
+                imports_line[0] = '\0';
+                trace_imports_report(imports_line, sizeof(imports_line), seconds);
+                if (imports_line[0]) {
+                    report += imports_line;
+                    report += '\n';
+                }
+            }
             // sotc: SOTC_OP_OVERLAP (plan step 7c.0): footprint conflicts between consecutive ops.
             if (SotcStats::kOpOverlap) {
                 const uint64_t ovl_ops = SotcStats::ovl_ops.exchange(0);

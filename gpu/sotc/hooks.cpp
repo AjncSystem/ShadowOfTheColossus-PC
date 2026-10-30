@@ -20,6 +20,7 @@
 #include "hook_layout.h"
 #include "hook_stats.h"
 #include "hooks.h"
+#include "video_core/sotc_trace.h" // sotc: time mode spans (Now, PushEvent, InternString)
 
 namespace SotcHooks {
 namespace {
@@ -68,6 +69,7 @@ struct Record {
     bool active{};            // on, resolved and installed: the handler may run
     bool has_handler{};
     Handler handler{};
+    const char* trace_name{}; // sotc: time mode only: the interned span name, set at install
 };
 
 struct Layout {
@@ -82,6 +84,8 @@ uintptr_t g_image = 0;
 uint64_t g_module_size = 0;
 bool g_fingerprint_known = false;
 std::string g_fingerprint_hex;
+// sotc: time mode: spans shorter than this are not recorded (SOTC_TRACE_FUNC_MIN_US, ns).
+uint64_t g_time_min_ns = 10000;
 
 // ---------------------------------------------------------------------------
 // Reading out/hooks.bin
@@ -224,7 +228,7 @@ bool ParseFile(const std::vector<uint8_t>& data, std::string& error) {
             error = "truncated record";
             return false;
         }
-        if (rec.name.empty() || rec.mode > 3 || pattern_len == 0 || pattern_len > kMaxPattern ||
+        if (rec.name.empty() || rec.mode > 4 || pattern_len == 0 || pattern_len > kMaxPattern ||
             rec.anchor_kind > 1 || dep_count > kMaxDeps) {
             error = "bad record " + rec.name;
             return false;
@@ -296,6 +300,13 @@ int ReadSwitch(const char* name) {
     char* end = nullptr;
     const long parsed = std::strtol(value, &end, 10);
     return end == value ? 0 : static_cast<int>(parsed);
+}
+
+// sotc: the switch of a time hook (SOTC_TRACE_FUNCS, one switch for a whole group) is on for any
+// value but empty or 0, so it may name a file; the loader does not read the value.
+int ReadPresence(const char* name) {
+    const char* value = std::getenv(name);
+    return value && *value && std::strcmp(value, "0") != 0 ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -500,6 +511,7 @@ void InstallDetour(size_t index) {
     request.address = static_cast<uint64_t>(g_image) + rec.match;
     request.mode = rec.mode == 0   ? Core::DetourMode::Entry
                    : rec.mode == 1 ? Core::DetourMode::Wrap
+                   : rec.mode == 4 ? Core::DetourMode::Time
                                    : Core::DetourMode::Site;
     request.hook_id = static_cast<uint32_t>(index);
     request.pattern = rec.pattern;
@@ -656,16 +668,24 @@ bool InstallHooks(const char* hooks_path, void* image, uint64_t module_size, Ins
     const bool master_off = master && *master && ReadSwitch("SOTC_HOOKS") == 0;
     std::vector<std::string> names;
     for (Record& rec : g_records) {
-        rec.switch_value = ReadSwitch(rec.switch_name.c_str());
-        rec.enabled = !master_off && rec.switch_value != 0;
+        // sotc: time hooks need the recorder on (their spans go nowhere otherwise).
+        const bool timed = rec.mode == 4;
+        rec.switch_value = timed ? ReadPresence(rec.switch_name.c_str())
+                                 : ReadSwitch(rec.switch_name.c_str());
+        rec.enabled = !master_off && rec.switch_value != 0 && (!timed || SotcTrace::kOn);
         if (master_off) {
             rec.off_reason = "SOTC_HOOKS=0";
         } else if (!rec.enabled) {
-            rec.off_reason = "switch";
+            rec.off_reason = rec.switch_value != 0 ? "SOTC_TRACE off" : "switch";
         }
         names.push_back(rec.name);
     }
     SotcHookStats::Configure(names);
+    {
+        const char* us = std::getenv("SOTC_TRACE_FUNC_MIN_US");
+        const long value = us && *us ? std::strtol(us, nullptr, 10) : 10;
+        g_time_min_ns = value > 0 ? static_cast<uint64_t>(value) * 1000 : 0;
+    }
 
     // Resolution, then dependencies and groups, then the detours. A detour refused after an
     // earlier member of its group was written leaves that member inert: its dispatch sees
@@ -688,6 +708,10 @@ bool InstallHooks(const char* hooks_path, void* image, uint64_t module_size, Ins
         rec.active = rec.enabled && rec.off_reason.empty() && rec.resolved;
         if (rec.active) {
             ++installed;
+        }
+        // sotc: a time hook's span is named after the hook; interned once, the shims only read it.
+        if (rec.active && rec.mode == 4) {
+            rec.trace_name = SotcTrace::InternString(rec.name.c_str(), rec.name.size());
         }
     }
     // sotc: one manifest line per enabled hook; hooks whose switch is unset are listed only with
@@ -788,4 +812,101 @@ extern "C" uint32_t sotc_hook_take_guest_call(uint64_t out[7]) {
     std::memcpy(out, SotcHooks::t_guest_call.words, sizeof(SotcHooks::t_guest_call.words));
     SotcHooks::t_guest_call.set = false;
     return 1;
+}
+
+// ---------------------------------------------------------------------------
+// sotc: time mode (DetourMode::Time, cpu_patches.cpp EmitTimeStub; docs/HOOK-DESIGN.md). Every
+// timed entry records a frame keyed by its return slot: the address that held the caller's return
+// address E at entry (the guest rsp at the entry). The stub then replaces [slot] with the shared
+// leave trampoline, which runs with rsp = slot + 8 after the body's ret and looks the frame up by
+// exactly that address. The table is not a LIFO: fibers run on stacks at arbitrary addresses on
+// the same host thread, and a longjmp leaves frames behind. Each live call owns one return slot,
+// so an exact-address match finds its frame in any order. Two rules keep the table consistent:
+//  - enter: a live entry at the same slot is dead (a longjmp left it, and this call now writes
+//    the slot), so the new frame overwrites it. A full table (kTimeFrames) makes enter decline
+//    (return 0): the body runs untimed and its return slot is not swapped.
+//  - leave: an exact match is always present for a timed return, because the trampoline only
+//    runs through a slot that enter swapped and no later enter can reuse that slot while the
+//    frame is live. A miss means the guest rewrote its return slot, which WrapStackRefusal refuses
+//    for Time, so the real return address is unknown and the process stops.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct TimeFrame {
+    uint64_t slot;      // address of the return slot (the guest rsp at the entry)
+    uint64_t real_ret;  // E: the caller's return address, read at the entry
+    uint64_t t0;        // entry time, ns (SotcTrace::Now)
+    const char* name;   // interned hook name
+};
+
+// Deeper timed calls than this run untimed (the enter shim returns 0: no return swap).
+constexpr uint32_t kTimeFrames = 256;
+
+struct TimeShadow {
+    // Unordered: frames[0, depth) are the live entries. Removal moves the last entry down.
+    TimeFrame frames[kTimeFrames];
+    uint32_t depth;
+};
+
+thread_local TimeShadow t_time_shadow;
+
+} // namespace
+
+extern "C" uint32_t sotc_trace_funcs_enter(uint64_t entry_rsp, uint64_t real_ret, uint32_t hook_id,
+                                           uint64_t leave) {
+    if (hook_id >= SotcHooks::g_records.size()) {
+        return 0;
+    }
+    const SotcHooks::Record& rec = SotcHooks::g_records[hook_id];
+    if (!rec.active || rec.trace_name == nullptr) {
+        return 0;
+    }
+    // A tail call from a timed body: the body's frame (same return slot) closes on the return.
+    if (real_ret == leave) {
+        return 0;
+    }
+    TimeShadow& shadow = t_time_shadow;
+    TimeFrame* frame = nullptr;
+    // A live entry at this slot belongs to a frame a longjmp left behind: this call owns the slot.
+    for (uint32_t i = shadow.depth; i-- > 0;) {
+        if (shadow.frames[i].slot == entry_rsp) {
+            frame = &shadow.frames[i];
+            break;
+        }
+    }
+    if (frame == nullptr) {
+        if (shadow.depth >= kTimeFrames) {
+            return 0;
+        }
+        frame = &shadow.frames[shadow.depth++];
+    }
+    frame->slot = entry_rsp;
+    frame->real_ret = real_ret;
+    frame->name = rec.trace_name;
+    frame->t0 = SotcTrace::Now();
+    return 1;
+}
+
+extern "C" uint64_t sotc_trace_funcs_leave(uint64_t rsp_at_return) {
+    const uint64_t t1 = SotcTrace::Now();
+    TimeShadow& shadow = t_time_shadow;
+    // The body's ret popped the return slot, so the slot is one address below the rsp here.
+    const uint64_t slot = rsp_at_return - 8;
+    for (uint32_t i = shadow.depth; i-- > 0;) {
+        if (shadow.frames[i].slot != slot) {
+            continue;
+        }
+        const TimeFrame frame = shadow.frames[i];
+        shadow.frames[i] = shadow.frames[--shadow.depth];
+        if (t1 - frame.t0 >= SotcHooks::g_time_min_ns) {
+            SotcTrace::PushEvent(SotcTrace::EvSpan, frame.name, frame.t0, t1);
+        }
+        return frame.real_ret;
+    }
+    // Unreachable in normal control flow (see above). No correct return address is known, so
+    // the process stops here instead of returning to a wrong address.
+    std::fprintf(stderr, "SOTC TRACE FUNCS: return at rsp 0x%llx matches no timed frame\n",
+                 static_cast<unsigned long long>(rsp_at_return));
+    std::abort();
 }

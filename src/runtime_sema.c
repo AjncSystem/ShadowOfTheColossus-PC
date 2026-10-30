@@ -2,6 +2,7 @@
  * Priority-ordered semaphores are approximated by FIFO order. */
 #define _GNU_SOURCE
 #include "runtime.h"
+#include "trace_imports.h"
 #include "trace.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -108,7 +109,7 @@ static int32_t wait_count(uint32_t id,int32_t need,uint32_t *timeout,int block) 
 static ABI int32_t sem_wait(uint32_t id,int32_t need,uint32_t *timeout) {
     const uint64_t t0=trace_now(); /* sotc: SOTC_TRACE */
     const int32_t r=wait_count(id,need,timeout,1);
-    trace_span("sema wait",t0,id,(uint64_t)__builtin_return_address(0));
+    trace_span("sema wait",t0,id,(uint64_t)GUEST_CALLER());
     return r;
 }
 static ABI int32_t sem_poll(uint32_t id,int32_t need) { return wait_count(id,need,NULL,0); }

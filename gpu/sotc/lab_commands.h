@@ -14,13 +14,19 @@
 //   set NAME=value                        -> ok | err needs-restart | err bad-value
 //   pending NAME=value                    -> ok (queued for the next launch, see below)
 //   relaunch [boss N]                     -> ok (asks an attached orchestrator to relaunch)
-//   mark <segment>                        -> ok (resets the stats window, names it)
+//   mark <segment>                        -> ok (resets the stats window, names it; with SOTC_TRACE
+//                                             also a trace mark and segment)
+//   trace dump [reason]                   -> ok queued | err off | err limit (SOTC_TRACE dump now)
+//   trace mark <text>                     -> ok | err off (free-text mark in the trace)
+//   trace stats                           -> JSON self-stats | {"mode":0} when SOTC_TRACE is off
+//   trace threshold <ms>                  -> ok | err off | err bad-argument (live slow-frame ms)
 //   get state                             -> {"pos":[..],"cam":[..],"freecam":bool,"autopilot":{..},
 //                                             "area":"..","boss_pending":bool,"segment":"..",
 //                                             "window":{"frames":n,"p50":ms,"p99":ms,"max":ms,
 //                                             "hitch33":n,"hitch50":n,"hitch100":n},
 //                                             "live":{"SOTC_X":v,..},"pending":{..},
-//                                             "relaunch":{"requested":bool,"boss":n}}
+//                                             "relaunch":{"requested":bool,"boss":n},
+//                                             "trace":{"mode":n,"last_dump":"<path>","dumps":serial}}
 //   get live                              -> {"SOTC_X":v,..}
 //   quit                                  -> ok (closes the pipe connection only)
 //

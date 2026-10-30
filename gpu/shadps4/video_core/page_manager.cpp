@@ -217,6 +217,19 @@ void UnregisterGuestStack(VAddr address, u64 size) {
     }
 }
 
+// sotc: see page_manager.h. Shared lock like the readers below: a writer only try-locks, so this
+// waits for at most one registry edit.
+bool GuestStackRange(VAddr addr, VAddr& lo, VAddr& hi) {
+    std::shared_lock lk{g_guest_stacks_mutex};
+    const auto it = g_guest_stacks.find(addr);
+    if (it == g_guest_stacks.end()) {
+        return false;
+    }
+    lo = it->first.lower();
+    hi = it->first.upper();
+    return true;
+}
+
 namespace {
 // sotc: the stack segments as a sorted flat array, one copy per thread. Guest stacks change only
 // when a guest thread or fiber is created or destroyed, while the readback and fault paths ask
@@ -1006,7 +1019,9 @@ struct SignalImpl : public PageManager::Impl {
     }
 
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
-        RENDERER_TRACE;
+        // sotc: no RENDERER_TRACE zone here: Protect is reached from the guest fault handler, where
+        // a zone's Span/RegisterZoneSite (allocation, a mutex) is unsafe. The fault span is
+        // recorded separately with the no-alloc path.
         SotcTrace::NoteProtect(); // sotc: SOTC_TRACE (BindScope)
         SotcStats::SyncPipe::NoteProtect(); // sotc: SOTC_SYNC_PIPE counters (inside BindResources)
         SotcOpPhases::NoteProtect(size); // sotc: SOTC_OP_PHASES

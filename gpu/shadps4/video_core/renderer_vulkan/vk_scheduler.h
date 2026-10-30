@@ -24,6 +24,10 @@ namespace tracy {
 class VkCtxScope;
 }
 
+namespace SotcGpuTrace {
+class Timeline;
+}
+
 namespace Vulkan {
 
 class Instance;
@@ -752,6 +756,7 @@ private:
     struct Session {
         vk::CommandBuffer upload{};
         vk::CommandBuffer primary{};
+        u32 gpu_pair{~u32{0}}; // sotc: SOTC_TRACE_GPU pair of primary (SotcGpuTrace::Timeline)
     };
     std::vector<Session> sessions;
     u64 session_serial{}; // sotc: see SessionSerial()
@@ -770,6 +775,9 @@ private:
     std::condition_variable_any priority_pending_ops_cv;
     std::jthread priority_pending_ops_thread;
     u32 trace_queue{~0u};           // sotc: SOTC_TRACE queue track (SotcTrace::RegisterQueue)
+    /// sotc: SOTC_TRACE_GPU, draw scheduler only. Declared before trace_watch_thread, so the
+    /// watch thread is joined before it is destroyed.
+    std::unique_ptr<SotcGpuTrace::Timeline> gpu_trace;
     std::jthread trace_watch_thread; // sotc: SOTC_TRACE (TraceWatchThread)
     RenderState render_state;
     bool is_rendering = false;

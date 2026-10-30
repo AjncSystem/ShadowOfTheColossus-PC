@@ -27,6 +27,7 @@
 #include "engine_cmd.h"
 #include "freecam.h"
 #include "sotc_live.h"
+#include "video_core/sotc_trace.h" // sotc: SOTC_TRACE (trace commands, segment marks)
 
 #include <SDL3/SDL.h>
 
@@ -451,7 +452,61 @@ std::string CmdMark(const Args& a) {
         return "err usage: mark <segment>";
     }
     Mark(a.Rest(1));
+    if (SotcTrace::kOn) { // sotc: the segment names the trace frames that follow
+        const std::string seg(a.Rest(1));
+        SotcTrace::Mark(seg.c_str());
+        SotcTrace::SetSegment(seg.c_str(), 0);
+    }
     return "ok";
+}
+
+// trace dump [reason] | mark <text> | stats | threshold <ms> (SOTC_TRACE, see sotc_trace.h)
+std::string CmdTrace(const Args& a) {
+    if (a.size() < 2) {
+        return "err usage: trace dump|mark|stats|threshold";
+    }
+    const std::string_view sub = a[1];
+    if (sub == "stats") {
+        return SotcTrace::kOn ? SotcTrace::StatsJson() : std::string("{\"mode\":0}");
+    }
+    if (sub == "dump") {
+        if (!SotcTrace::kOn) {
+            return "err off";
+        }
+        const std::string reason = a.size() >= 3 ? std::string(a.Rest(2)) : std::string("lab");
+        return SotcTrace::RequestDump(reason.c_str()) ? "ok queued" : "err limit";
+    }
+    if (sub == "mark") {
+        if (a.size() < 3) {
+            return "err usage: trace mark <text>";
+        }
+        if (!SotcTrace::kOn) {
+            return "err off";
+        }
+        const std::string text(a.Rest(2));
+        SotcTrace::Mark(text.c_str());
+        return "ok";
+    }
+    if (sub == "threshold") {
+        if (a.size() != 3) {
+            return "err usage: trace threshold <ms>";
+        }
+        if (!SotcTrace::kOn) {
+            return "err off";
+        }
+        const std::string text(a[2]);
+        if (text.empty() || text[0] < '0' || text[0] > '9') {
+            return "err bad-argument";
+        }
+        char* end = nullptr;
+        const unsigned long long ms = std::strtoull(text.c_str(), &end, 10);
+        if (end != text.c_str() + text.size()) {
+            return "err bad-argument";
+        }
+        SotcTrace::SetThresholdMs(ms);
+        return "ok";
+    }
+    return "err usage: trace dump|mark|stats|threshold";
 }
 
 std::string JsonWindow(const Window& w) {
@@ -513,6 +568,10 @@ std::string JsonState() {
     out += ",\"pending\":" + JsonMapObject(pending);
     out += ",\"relaunch\":{\"requested\":" + JsonBool(relaunch_requested) +
            ",\"boss\":" + std::to_string(relaunch_boss) + "}";
+    const SotcTrace::DumpInfo dump = SotcTrace::LastDump();
+    out += ",\"trace\":{\"mode\":" + std::to_string(SotcTrace::kMode) +
+           ",\"last_dump\":" + JsonStr(dump.path) + ",\"dumps\":" + std::to_string(dump.serial) +
+           "}";
     return out + "}";
 }
 
@@ -577,6 +636,9 @@ std::string Execute(std::string_view line) {
         }
         if (cmd == "mark") {
             return CmdMark(a);
+        }
+        if (cmd == "trace") {
+            return CmdTrace(a);
         }
         if (cmd == "get") {
             return CmdGet(a);

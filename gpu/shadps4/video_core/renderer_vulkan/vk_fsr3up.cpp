@@ -622,19 +622,21 @@ vk::ImageView Dispatch(vk::CommandBuffer cmdbuf, Scheduler& scheduler, u32 frame
         return {};
     }
     retire_scheduler = &scheduler;
-    if (!EnsureContext(width, height, out_width, out_height)) {
+    // sotc: with DLSS Super Resolution the FSR 3.1 context (its shared images: 64 MB at 720p ->
+    // 1080p, 200-250 MB at 4K) was created and never used; DLSS stays on for the whole session.
+    const bool dlss = Dlssg::SuperResReady();
+    if (!dlss && !EnsureContext(width, height, out_width, out_height)) {
         failed = true;
         CountFrame(SkipError);
         return {};
     }
     Retire(false);
     OwnedImage& out = outputs[frame_id];
-    const bool dlss = Dlssg::SuperResReady();
     if (out.width != out_width || out.height != out_height) {
         DestroyImage(out);
         if (!CreateImage(out, kColorFormat, out_width, out_height) ||
-            !Import(out.resource, out.image, out_width, out_height, kColorFormat,
-                    vk::ImageLayout::eGeneral, FFX_VK_FSR3_3_1_5_RESOURCE_STATE_UNORDERED_ACCESS)) {
+            (!dlss && !Import(out.resource, out.image, out_width, out_height, kColorFormat,
+                    vk::ImageLayout::eGeneral, FFX_VK_FSR3_3_1_5_RESOURCE_STATE_UNORDERED_ACCESS))) {
             std::fprintf(stderr, "SOTC FSR3 upscaler: cannot create the %ux%u output\n", out_width,
                          out_height);
             DestroyImage(out);
@@ -666,7 +668,7 @@ vk::ImageView Dispatch(vk::CommandBuffer cmdbuf, Scheduler& scheduler, u32 frame
                           vk::AccessFlagBits2::eNone, vk::ImageLayout::eUndefined,
                           vk::PipelineStageFlagBits2::eComputeShader,
                           vk::AccessFlagBits2::eShaderWrite, vk::ImageLayout::eGeneral));
-    if (!shared_ready) {
+    if (!shared_ready && !dlss) {
         shared_ready = true;
         for (auto& sh : shared) {
             pre.push_back(Barrier(sh.image, vk::PipelineStageFlagBits2::eAllCommands,

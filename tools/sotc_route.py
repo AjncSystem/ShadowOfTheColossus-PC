@@ -23,6 +23,8 @@ measured). --outro skips the fight entirely: it marks the boss defeated and play
 encounter that long (the colossus comes to you) and leaves the frame log for spike_report.py /
 the bench skill - launch-into-boss performance analysis with no hands. --measure uses the
 install's current save as it is (the jump makes the spawn deterministic regardless of progress).
+--play hands the game over once the jump is done: nothing is killed or closed, so you can fight
+the boss yourself (killBoss only ever runs when --kill is given).
 """
 import argparse
 import json
@@ -70,12 +72,15 @@ def main():
     mode.add_argument('--record')
     mode.add_argument('--replay')
     mode.add_argument('--measure', type=float, help='just sit in the game that many seconds')
+    mode.add_argument('--play', action='store_true',
+                      help='leave the game running for you to play (the boss stays alive)')
     parser.add_argument('--boss', type=int, choices=range(1, 17), metavar='1-16',
                         help='jump into this boss encounter first')
     parser.add_argument('--outro', action='store_true',
                         help='with --boss: skip the fight, mark it defeated and play the aftermath')
-    parser.add_argument('--kill', action='store_true',
-                        help='with --boss: kill the boss after the jump (death cinematic plays)')
+    parser.add_argument('--kill', '--killboss', action='store_true',
+                        help='with --boss: kill the boss after the jump (death cinematic plays); '
+                             'without it the boss stays alive')
     parser.add_argument('--intro', action='store_true',
                         help="with --boss: let the encounter's intro cutscene play instead of skipping it")
     parser.add_argument('--env', action='append', default=[])
@@ -95,7 +100,7 @@ def main():
         return 1
     restore = None
     plan = None
-    if args.measure is None:
+    if args.record or args.replay:
         route = Path(args.record or args.replay).resolve()
         snapshot = route.with_suffix('.save')
         if args.record:
@@ -116,7 +121,7 @@ def main():
     pad.write_text('cross')
     env = dict(os.environ, BB_PAD_FILE=str(pad), SOTC_FPS='1', SOTC_FRAME_LOG='1', SOTC_STALL_MS='40',
                SOTC_SAVE_PROMPT='auto')
-    if args.measure is None:
+    if args.record or args.replay:
         env['BB_PAD_RECORD' if args.record else 'BB_PAD_REPLAY'] = str(route)
     if args.boss:
         # The plan file must sit in the game dump (the engine loads it from app0).
@@ -236,6 +241,10 @@ def drive(args, pad, log, launched, launcher):
             print('INVALID: the boss jump did not finish')
             return 1
         print(f'in boss {args.boss} encounter', flush=True)
+    if args.play:
+        # Hand the game over: no timer, no kill, the boss is yours until you close the window.
+        print('READY: the game is yours', flush=True)
+        return 0
     if args.measure is not None:
         print(f'measuring {args.measure:g}s', flush=True)
         wait(args.measure)

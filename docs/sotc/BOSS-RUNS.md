@@ -23,6 +23,9 @@ python tools/sotc_route.py --install DIR --measure SECONDS --boss N [--kill|--ou
   animations themselves. With `--intro` the kill fires 110 s after the arena loads; without, 40 s.
 - `--measure SECONDS` — sit in the encounter that long, then exit. The run's frame log is kept
   as `user/measure-<timestamp>.log` for `tools/spike_report.py`.
+- `--play` — instead of measuring, hand the game over once the jump is done: nothing is killed
+  or closed, the boss stays alive, and you fight it yourself. The quickest way to playtest one
+  encounter.
 - `--record FILE` / `--replay FILE` — instead of measuring, record or replay a pad route after
   the jump (see the tool's docstring; routes pair with a save snapshot).
 
@@ -30,6 +33,12 @@ Example — the Eel's death cinematic, measured for two minutes:
 
 ```
 python tools/sotc_route.py --install "D:\SotC-PC" --measure 120 --boss 7 --kill
+```
+
+Playtest Phalanx yourself, intro included:
+
+```
+python tools/sotc_route.py --install "D:\SotC-PC" --play --boss 13 --intro
 ```
 
 All twelve early bosses back to back, intros and death cinematics included (one game launch per

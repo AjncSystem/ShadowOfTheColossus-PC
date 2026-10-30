@@ -425,6 +425,7 @@ void VideoOutDriver::Flip(const Request& req) {
         if (now - window_start >= std::chrono::seconds(5)) {
             const double seconds = std::chrono::duration<double>(now - window_start).count();
             std::string report; // sotc: written at once off this thread (see ReportPrintf)
+            bool mem_line_due = false; // sotc: SOTC MEM walk, also off this thread
             {
                 std::sort(frame_ms.begin(), frame_ms.end());
                 const auto pct = [&](double p) {
@@ -491,13 +492,19 @@ void VideoOutDriver::Flip(const Request& req) {
                                  static_cast<unsigned long long>(SotcStats::host_heap_usage.load() >> 20),
                                  static_cast<unsigned long long>(SotcStats::host_vma_block_bytes.load() >> 20));
                 }
-                // sotc: heaps vs other private memory, every 12th report (a minute at 5 s).
+                // sotc: heaps vs other private memory, every 12th report (a minute at 5 s),
+                // only under SOTC_MEM=1. The walk grows with the address space's regions
+                // (180 ms fresh, 800+ ms after 20 min of play) and stalls the game once a
+                // minute even when run off the flip thread: HeapSummary locks the heaps and
+                // the VirtualQuery loop contends the VM lock the game's page protections
+                // need. Computed in the writer thread below so an enabled walk at least
+                // never blocks the flip.
+                static const bool mem_diag = [] {
+                    const char* v = std::getenv("SOTC_MEM");
+                    return v && v[0] == '1';
+                }();
                 static u32 mem_reports = 0;
-                if (mem_reports++ % 12 == 0) {
-                    if (const std::string mem = BbMemReport::Line(); !mem.empty()) {
-                        ReportPrintf(report, "SOTC MEM %s\n", mem.c_str());
-                    }
-                }
+                mem_line_due = mem_diag && mem_reports++ % 12 == 0;
                 if (const uint64_t translate = SotcStats::compile_phase_ns[0].exchange(0)) {
                     const auto take = [](int i) {
                         return SotcStats::compile_phase_ns[i].exchange(0) / 1e6;
@@ -789,8 +796,13 @@ void VideoOutDriver::Flip(const Request& req) {
             flips = 0;
             // The flip thread does not wait for the log: one stderr write took 7-10 ms (bench log
             // file, Radeon RX 6650 XT session), ~15 of them a frame of 80-100 ms every 5 s.
-            std::thread([text = std::move(report)] {
+            std::thread([text = std::move(report), mem_line_due] {
                 std::fwrite(text.data(), 1, text.size(), stderr);
+                if (mem_line_due) {
+                    if (const std::string mem = BbMemReport::Line(); !mem.empty()) {
+                        std::fprintf(stderr, "SOTC MEM %s\n", mem.c_str());
+                    }
+                }
             }).detach();
             window_start = now;
         }

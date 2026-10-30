@@ -972,11 +972,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     // frames (the judder of heavy scenes). Instead, pace flips at the game's own production
     // rate: release a flip at last flip + EMA of the submit intervals, so release stays smooth
     // when submits arrive in bursts, and never hold one past submit + a vblank period, which is
-    // the worst the grid did. SOTC_FLIP_PACER=0 restores the vblank grid.
-    static const bool flip_pacer = [] {
-        const char* v = std::getenv("SOTC_FLIP_PACER");
-        return !v || v[0] != '0';
-    }();
+    // the worst the grid did. SOTC_FLIP_PACER=0 starts on the vblank grid, and F6 switches
+    // while playing (SotcFpsCap::flip_pacer, bbport_overlay.cpp).
     auto last_flip_time = std::chrono::steady_clock::now();
     auto prev_arrival = last_flip_time;
     std::chrono::nanoseconds arrival_ema = vblank_period;
@@ -1035,7 +1032,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             const u64 limit_vblanks = live_limit >= 0 ? vblanks_for(live_limit) : start_limit_vblanks;
             if (limit_vblanks != 0) {
                 take_request = vblank_status.count - last_flip_vblank >= limit_vblanks;
-            } else if (!flip_pacer) {
+            } else if (!SotcFpsCap::flip_pacer.load(std::memory_order_relaxed)) {
                 take_request = subtick == 0;
             } else if (const auto arrival = peek_arrival()) {
                 const auto now = std::chrono::steady_clock::now();

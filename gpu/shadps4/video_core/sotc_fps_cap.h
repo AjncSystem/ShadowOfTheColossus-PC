@@ -28,6 +28,21 @@ inline std::atomic<int> limit_fps{-1};
 /// The flip rate the game asked, -1 while it asked none (with the fps60 code patch it never does).
 inline std::atomic<int> game_rate{-1};
 
+/// Uncapped flip pacing (videoout driver.cpp): flips released at the game's own rate (true) or on
+/// the vblank grid (false). F6 switches it while playing; SOTC_FLIP_PACER=0 starts on the grid.
+inline std::atomic<bool> flip_pacer{[] {
+    const char* v = std::getenv("SOTC_FLIP_PACER");
+    return !v || v[0] != '0';
+}()};
+
+/// F6: the game's own rate <-> the vblank grid. Returns true when now paced.
+inline bool TogglePacer() {
+    const bool now = !flip_pacer.load(std::memory_order_relaxed);
+    flip_pacer.store(now, std::memory_order_relaxed);
+    std::fprintf(stderr, "SOTC FLIP PACER: %s\n", now ? "game rate" : "vblank grid");
+    return now;
+}
+
 /// The flip rate the vblank thread applies.
 inline int EffectiveRate() {
     if (uncapped.load(std::memory_order_relaxed)) {

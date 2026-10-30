@@ -488,7 +488,11 @@ float MipBias() {
         if (render_w == 0 || out_w == 0) {
             return 0.0f;
         }
-        const float value = std::log2(static_cast<float>(render_w) / static_cast<float>(out_w)) - 1.0f;
+        // sotc: at most -1. Finer mips fill the game's texture page pool: DLSS Performance at 4K
+        // (-2) left it 0-1% free and the far ground black and the grass as pale cards; -1 kept the
+        // same scene normal (RTX 5060 Ti 8 GB, user test 29 Oct).
+        const float value = std::max(
+            std::log2(static_cast<float>(render_w) / static_cast<float>(out_w)) - 1.0f, -1.0f);
         if (log_level > 0) {
             std::fprintf(stderr, "SOTC FSR3 upscaler: texture LOD bias %.2f (render %ux%u, output %ux%u)\n",
                          value, render_w, render_h, out_w, out_h);

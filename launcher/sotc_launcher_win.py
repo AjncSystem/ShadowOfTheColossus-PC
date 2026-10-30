@@ -431,6 +431,44 @@ def user_dir(s):
     return folder
 
 
+def documents_dir():
+    """The user's Documents folder, also when Windows moved it (OneDrive, another drive)."""
+    try:
+        import ctypes
+        import uuid
+        guid = ctypes.create_string_buffer(uuid.UUID('FDD39AD0-238F-46AF-ADB4-6C85480369C7').bytes_le)
+        path = ctypes.c_wchar_p()
+        if ctypes.windll.shell32.SHGetKnownFolderPath(guid, 0, None, ctypes.byref(path)) == 0:
+            folder = Path(path.value)
+            ctypes.windll.ole32.CoTaskMemFree(path)
+            return folder
+    except (AttributeError, OSError, ValueError):
+        pass
+    return Path.home() / 'Documents'
+
+
+def save_dir(s):
+    """The savedata folder (1/<title id> below it). A data folder picked in the launcher keeps its
+    savedata; by default Documents/My Games/Shadow of the Colossus PC/savedata, so that deleting or
+    replacing the port's folder on an update keeps the saves."""
+    if s.get('user_dir'):
+        return user_dir(s) / 'savedata'
+    return documents_dir() / 'My Games' / 'Shadow of the Colossus PC' / 'savedata'
+
+
+def copy_old_saves(s):
+    """Saves of versions before the Documents folder (the port's user/savedata), copied there once
+    while it does not exist yet; the old copy stays. Returns the new folder when it copied."""
+    old, new = PORT_DIR / 'user' / 'savedata', save_dir(s)
+    if s.get('user_dir') or new.exists() or not old.is_dir() or not any(old.iterdir()):
+        return None
+    try:
+        shutil.copytree(old, new)
+    except OSError:
+        return None
+    return new
+
+
 LOGS_KEPT = 5      # last_run.log and last_run.1.log ... last_run.4.log
 CRASH_LOGS_KEPT = 20
 
@@ -622,6 +660,7 @@ def game_environment(s):
         env['SOTC_WINDOW_ICON'] = str(icon)
     env['SOTC_GAME_DIR'] = s['game_dir']
     env['SOTC_USER_DIR'] = str(user_dir(s))
+    env['SOTC_SAVE_DIR'] = str(save_dir(s))
     if s['sys_modules']:
         env['SOTC_SYS_MODULES'] = s['sys_modules']
     if s.get('dlc_dir'):
@@ -1733,9 +1772,8 @@ class Launcher:
         else:
             sound = _('⚠ Sem os módulos de som do seu console: o jogo fica mudo (Jogo e saves)',
                       '⚠ No sound modules from your console: the game is silent (Game & saves)')
-        user = user_dir({'user_dir': self.var('user_dir').get()})
         serial = game_serial(self.var('game_dir').get())
-        saves = user / 'savedata' / '1' / serial
+        saves = save_dir({'user_dir': self.var('user_dir').get()}) / '1' / serial
         save = (_('✓ Saves em {}', '✓ Saves in {}').format(saves) if saves.is_dir() and any(saves.iterdir())
                 else _('• Ainda sem saves: o jogo cria em {}', '• No saves yet: the game creates them in {}').format(saves))
         from sotc_discovery import dlc_count
@@ -1824,7 +1862,7 @@ class Launcher:
         # saves are of the same game build). The save goes to this game's folder.
         if source.name not in GAMES:
             source = next((source / s for s in (serial, *GAMES) if (source / s).is_dir()), source)
-        target = user_dir({'user_dir': self.var('user_dir').get()}) / 'savedata' / '1' / serial
+        target = save_dir({'user_dir': self.var('user_dir').get()}) / '1' / serial
         # sotc: one save folder picked (it holds sce_sys/param.sfo): import it as one save. The
         # runtime creates the port's metadata for saves that come without it.
         single = (source / 'sce_sys' / 'param.sfo').is_file()
@@ -1940,6 +1978,7 @@ class Launcher:
         self.setup_hint.unbind('<Button-1>')
         self.setup_hint.configure(text=_('Configurando…', 'Setting up…'), fg=MUTED)
         user = user_dir({'user_dir': self.var('user_dir').get()})
+        saves_root = save_dir({'user_dir': self.var('user_dir').get()})
 
         def work():
             from sotc_discovery import find_dlc_root, find_update, dlc_count, scan, SYS_MODULES as modules
@@ -1949,7 +1988,7 @@ class Launcher:
             result['dlc_count'] = dlc_count(result['dlc'], serial)
             sound_ready = self.app.get('sys_modules') and all(
                 (Path(self.app['sys_modules']) / m).is_file() for m in modules)
-            saves = user / 'savedata' / '1' / serial
+            saves = saves_root / '1' / serial
             has_saves = saves.is_dir() and any(saves.iterdir())
             found = {'sys_modules': [], 'saves': []}
             if not sound_ready or not has_saves:
@@ -2114,7 +2153,7 @@ class Launcher:
         return bool(folder) and all((Path(folder) / m).is_file() for m in SYS_MODULES)
 
     def saves_folder(self):
-        return user_dir({'user_dir': self.var('user_dir').get()}) / 'savedata' / '1' / game_serial(self.var('game_dir').get())
+        return save_dir({'user_dir': self.var('user_dir').get()}) / '1' / game_serial(self.var('game_dir').get())
 
     def has_saves(self):
         saves = self.saves_folder()
@@ -2218,6 +2257,10 @@ class Launcher:
         except OSError as error:
             self.append(_('Não foi possível gravar as teclas no sotc.ini: {}',
                           'Could not write the keys to sotc.ini: {}').format(error) + '\n')
+        copied = copy_old_saves(self.app)
+        if copied:
+            self.append(_('Saves copiados para {} (a cópia antiga fica em user/savedata).',
+                          'Saves copied to {} (the old copy stays in user/savedata).').format(copied) + '\n')
         try:
             env = game_environment(self.app)
             env['SOTC_EVENT_LOG'] = start_event_log(user_dir(self.app), self.app, env)
@@ -2541,6 +2584,7 @@ def play_without_window(settings):
         write_key_bindings(settings.get('keys'))
     except OSError:
         pass
+    copy_old_saves(settings)
     env = game_environment(settings)
     env['SOTC_EVENT_LOG'] = start_event_log(log_dir, settings, env)
     apply_diag_log(env, settings, log_dir)

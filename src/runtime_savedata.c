@@ -87,8 +87,17 @@ static int make_dirs(const char *path) {
     for (char *p=buffer+1;*p;++p) if (*p=='/') { *p=0; mkdir(buffer,0755); *p='/'; }
     return mkdir(buffer,0755) && errno!=EEXIST ? -1 : 0;
 }
+/* sotc: SOTC_SAVE_DIR (the launcher: Documents\My Games\...\savedata) holds <user id>/<title id>;
+ * unset, <user>/savedata as before. */
+static void saves_dir(char *out, size_t size) {
+    const char *dir=getenv("SOTC_SAVE_DIR");
+    if (dir && *dir) snprintf(out,size,"%s",dir);
+    else snprintf(out,size,"%s/savedata",runtime_file_user_dir());
+    for (char *p=out;*p;++p) if (*p=='\\') *p='/'; /* make_dirs creates the missing levels at '/' */
+}
 static void root(int32_t user, const char *title, char *out, size_t size) {
-    snprintf(out,size,"%s/savedata/%d/%s",runtime_file_user_dir(),user,title && *title ? title : title_id);
+    char dir[600]; saves_dir(dir,sizeof(dir));
+    snprintf(out,size,"%s/%d/%s",dir,user,title && *title ? title : title_id);
 }
 static int valid_name(const char *name, size_t max) {
     size_t n=strnlen(name,max);
@@ -237,7 +246,7 @@ static int ensure_meta(const char *host, const char *meta, const char *name) {
 /* At startup: every save of this title, of every user, gets its sidecar. */
 static void repair_all_meta(void) {
     char users[700];
-    snprintf(users,sizeof(users),"%s/savedata",runtime_file_user_dir());
+    saves_dir(users,sizeof(users));
     DIR *ud=opendir(users);
     for (struct dirent *u; ud && (u=readdir(ud));) {
         if (u->d_name[0]=='.') continue;

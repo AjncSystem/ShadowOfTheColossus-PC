@@ -197,6 +197,9 @@ public:
     bool sotc_gpu_copied{};
     /// sotc: host bytes this full chain would save as a mip tail (census "projected" only).
     u64 sotc_shadow_saving{};
+    /// sotc: the upload budget (RefreshImage): guest data uploaded once / zeros put in meanwhile.
+    bool sotc_has_data{};
+    bool sotc_zero_filled{};
     u64 general_epoch{~0ull}; // sotc: fence epoch of the last GENERAL->GENERAL barrier
 
     struct {

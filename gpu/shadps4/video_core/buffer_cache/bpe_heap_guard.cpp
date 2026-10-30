@@ -11,6 +11,7 @@
 
 #include "core/memory.h"
 #include "video_core/buffer_cache/bpe_heap_guard.h"
+#include "video_core/sotc_stats.h"
 
 namespace VideoCore {
 
@@ -27,6 +28,58 @@ constexpr VAddr HeapPointerHi = 0x10000000000ULL;
 constexpr u64 MaxBlockSize = 0x100000000ULL;
 constexpr size_t MaxTreeNodes = 1 << 16;
 constexpr size_t MaxListNodes = 1 << 10;
+
+// sotc: the free-tree walk's set of nodes and ring members seen (AjncSystem, upstream 0.70, 7fde988).
+// Open addressing, on the draw thread, kept between builds.
+class SeenSet {
+public:
+    void Reset(size_t expected) {
+        size_t capacity = 1024;
+        while (capacity < expected * 2) {
+            capacity <<= 1;
+        }
+        if (table.size() != capacity) {
+            table.assign(capacity, 0);
+        } else {
+            std::fill(table.begin(), table.end(), 0);
+        }
+        count = 0;
+    }
+    /// false when key (never 0) was already in
+    bool Insert(u64 key) {
+        if ((count + 1) * 2 > table.size()) {
+            Grow();
+        }
+        const size_t mask = table.size() - 1;
+        for (size_t i = (key * 0x9E3779B97F4A7C15ULL) >> 32 & mask;; i = (i + 1) & mask) {
+            if (table[i] == key) {
+                return false;
+            }
+            if (!table[i]) {
+                table[i] = key;
+                ++count;
+                return true;
+            }
+        }
+    }
+
+private:
+    void Grow() {
+        std::vector<u64> old;
+        old.swap(table);
+        table.assign(old.size() * 2, 0);
+        count = 0;
+        for (const u64 key : old) {
+            if (key) {
+                Insert(key);
+            }
+        }
+    }
+    std::vector<u64> table;
+    size_t count = 0;
+};
+thread_local SeenSet seen;
+thread_local size_t last_seen = 0;
 constexpr size_t MaxChainSteps = 1 << 12;
 constexpr u64 InUse = 1; // size | flags bit 0: set on allocated blocks, clear on free ones
 constexpr size_t MaxExtents = 1 << 12;
@@ -405,6 +458,20 @@ void BpeHeapGuard::AddFreeBlock(VAddr block) {
 }
 
 void BpeHeapGuard::CollectFreeTree() {
+    // sotc: SOTC_GUARD_DEDUP=0 walks as before (AjncSystem, upstream 0.70, 7fde988). The game changes
+    // the tree while this walk reads it: at an area change a node reached twice (a link read
+    // mid-change) was walked again and again up to MaxTreeNodes, each time with its ring of up to
+    // MaxListNodes members, and the sort of those repeats held the draw thread 1-3 s. Nodes and ring
+    // members already seen are skipped: they only added repeats, which sort/unique removed anyway.
+    static const bool dedup = [] {
+        const char* v = std::getenv("SOTC_GUARD_DEDUP");
+        return !(v && v[0] == '0');
+    }();
+    if (dedup) {
+        seen.Reset(last_seen);
+    }
+    size_t seen_keys = 0;
+    u64 repeats = 0;
     const VAddr sentinel = heap + 0x80;
     VAddr root = 0;
     Read(sentinel, &root, sizeof(root));
@@ -424,6 +491,10 @@ void BpeHeapGuard::CollectFreeTree() {
         if (node == sentinel || !IsHeapPointer(node)) {
             continue;
         }
+        if (dedup && (++seen_keys, !seen.Insert(node))) {
+            ++repeats;
+            continue;
+        }
         std::array<u64, 7> words{};
         if (!Read(node - HeaderSize, words.data(), sizeof(words))) {
             continue;
@@ -440,6 +511,11 @@ void BpeHeapGuard::CollectFreeTree() {
         // Blocks of equal size hang off the tree node in a ring through the list links
         VAddr member = words[4];
         for (size_t i = 0; i < MaxListNodes && IsHeapPointer(member) && member != node; ++i) {
+            // members tagged in bit 0 (pointers are 8-aligned), apart from tree nodes
+            if (dedup && (++seen_keys, !seen.Insert(member | 1))) {
+                ++repeats;
+                break;
+            }
             AddFreeBlock(member - HeaderSize);
             VAddr next = 0;
             if (!Read(member + 0x10, &next, sizeof(next))) {
@@ -449,6 +525,10 @@ void BpeHeapGuard::CollectFreeTree() {
         }
         stack.push_back(words[2]);
         stack.push_back(words[3]);
+    }
+    last_seen = seen_keys;
+    if (repeats) {
+        SotcStats::heap_guard_repeats.fetch_add(repeats, std::memory_order_relaxed);
     }
     std::sort(free_blocks.begin(), free_blocks.end());
     free_blocks.erase(std::unique(free_blocks.begin(), free_blocks.end()), free_blocks.end());

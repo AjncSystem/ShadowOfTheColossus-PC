@@ -79,6 +79,10 @@ inline std::atomic<uint64_t> readback_finish_asked{0}; ///< ... for bytes the gu
 // sotc: metadata-clipped non-stack readback ranges and bytes, per SOTC_FPS report.
 inline std::atomic<uint64_t> heap_guard_clipped_writes{0}, heap_guard_clipped_bytes{0};
 inline std::atomic<uint64_t> heap_guard_builds{0}; ///< readbacks into the BPE heap
+inline std::atomic<uint64_t> upload_deferred{0};        ///< first uploads put off to a later frame
+inline std::atomic<uint64_t> upload_deferred_bytes{0};
+inline std::atomic<uint64_t> upload_zero_filled{0};     ///< ... images filled with zeros meanwhile
+inline std::atomic<uint64_t> heap_guard_repeats{0};      ///< free-tree nodes seen again, skipped
 // sotc: BPE guard cost split per SOTC_FPS report (only counted with SOTC_FPS): batches, heaps whose
 // extents were checked, tree nodes walked by builds, heaps whose extent list could not be proven (always
 // built), and ns spent selecting heaps / building guards / filtering the writes.

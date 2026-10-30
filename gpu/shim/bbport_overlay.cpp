@@ -562,18 +562,30 @@ void QuickSettings() {
     }();
     const int live_fsr1 = SotcLive::fsr1.load(std::memory_order_relaxed);
     const bool has_fsr3 = Vulkan::Fsr3Up::AskedAtStart();
+    const bool dlss = Vulkan::Dlssg::SuperResReady();
+    const bool nvidia = s_instance && s_instance->GetVendorID() == 0x10DE;
     const int up_mode = has_fsr3 && Vulkan::Fsr3Up::Wanted()
-                            ? 2
+                            ? (dlss ? 3 : 2)
                             : (live_fsr1 >= 0 ? live_fsr1 : env_fsr1) ? 0 : 1;
     const char* up_names[] = {T("FSR 1 (AMD, qualquer placa)", "FSR 1 (AMD, any GPU)"),
                               T("Bilinear (simples)", "Bilinear (plain)"),
-                              Vulkan::Dlssg::SuperResReady()
-                                  ? T("DLSS Super Resolution (NVIDIA RTX)", "DLSS Super Resolution (NVIDIA RTX)")
-                                  : T("FSR 3.1 (temporal)", "FSR 3.1 (temporal)")};
+                              T("FSR 3.1 (temporal)", "FSR 3.1 (temporal)"),
+                              T("DLSS Super Resolution (NVIDIA RTX)", "DLSS Super Resolution (NVIDIA RTX)")};
     if (ImGui::BeginCombo("Upscaler", up_names[up_mode])) {
-        for (int i = 0; i < (has_fsr3 ? 3 : 2); ++i) {
-            if (ImGui::Selectable(up_names[i], i == up_mode) && i != up_mode) {
-                SetUpscaler(i);
+        // sotc: the temporal upscaler the game did not start with stays listed, greyed, with why.
+        for (int i = 0; i < 4; ++i) {
+            const bool usable = i < 2 || (has_fsr3 && (i == 3) == dlss);
+            if (!usable) {
+                ImGui::BeginDisabled();
+            }
+            if (ImGui::Selectable(up_names[i], i == up_mode) && usable && i != up_mode) {
+                SetUpscaler(i < 2 ? i : 2);
+            }
+            if (!usable) {
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                ImGui::TextDisabled("%s", i == 3 && !nvidia ? T("— só NVIDIA RTX", "— NVIDIA RTX only")
+                                                            : T("— só no lançador", "— launcher only"));
             }
         }
         ImGui::EndCombo();
@@ -636,6 +648,14 @@ void QuickSettings() {
             }
             if (!available) {
                 ImGui::EndDisabled();
+                ImGui::SameLine();
+                ImGui::TextDisabled(
+                    "%s", mode == Mode::Dlss && !nvidia
+                              ? T("— só NVIDIA RTX 40/50", "— NVIDIA RTX 40/50 only")
+                          : mode == Mode::Dlss && !Vulkan::FrameGen::AskedAtStart()
+                              ? T("— ligue no lançador antes de abrir o jogo",
+                                  "— turn it on in the launcher before starting the game")
+                              : T("— não suportada nesta placa", "— not supported on this card"));
             }
         }
         ImGui::EndCombo();
@@ -661,7 +681,9 @@ void QuickSettings() {
     }();
     if (ImGui::BeginCombo(T("Qualidade das texturas", "Texture quality"), tex_names[tex_level])) {
         for (int i = 0; i < 3; ++i) {
-            const bool blocked = neo && i == 2;
+            // sotc: "Off" only shows once the game starts again (it keeps what it loaded).
+            const bool off_later = i == 0 && tex_level != 0;
+            const bool blocked = (neo && i == 2) || off_later;
             if (blocked) {
                 ImGui::BeginDisabled();
             }
@@ -671,7 +693,8 @@ void QuickSettings() {
             if (blocked) {
                 ImGui::EndDisabled();
                 ImGui::SameLine();
-                ImGui::TextDisabled("%s", T("— não no modo PS4 Pro", "— not in PS4 Pro mode"));
+                ImGui::TextDisabled("%s", off_later ? T("— só no lançador", "— launcher only")
+                                                    : T("— não no modo PS4 Pro", "— not in PS4 Pro mode"));
             }
         }
         ImGui::EndCombo();

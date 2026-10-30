@@ -2,10 +2,12 @@
 
 [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
-> **No game or Sony files are included.** You need your own game dump and, for sound, two
+> [!CAUTION]
+> *⚠️*No game or Sony files are included.** You need your own game dump and, for sound, two
 > modules from your own console. This project is not affiliated with Sony Interactive
 > Entertainment or Bluepoint Games.
 
+> [!CAUTION]
 > ⚠️ **Install the game on an SSD, NVMe if you can.** Every new area streams hundreds of MB of
 > textures and models from the game folder; on a hard disk the area changes stutter far more and
 > can freeze for seconds. Put the game dump (and, ideally, the port's folder) on an SSD.

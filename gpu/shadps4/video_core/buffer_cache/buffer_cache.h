@@ -212,6 +212,8 @@ private:
         boost::container::small_vector<std::pair<VAddr, u64>, 4> gpu_ranges;
         /// sotc: brought along by the hot readbacks (SOTC_RB_HOT), not asked for.
         bool hot = false;
+        /// sotc: a GPU write landed on this region while the readback was in flight.
+        bool dirty = false;
     };
     /// Collects what a readback of [device_addr, +size) and the hot readbacks must copy. Returns
     /// the bytes to download. sotc: the ranges stay in the GPU-modified set until the caller
@@ -255,7 +257,7 @@ private:
     /// sotc: marks bytes a guest write fault asked for CPU-modified, unless pages of them
     /// still hold GPU data (see the definition).
     void MarkWrittenByGuest(VAddr addr, u64 size);
-    void FinishAsyncReadback(AsyncReadback& readback);
+    bool FinishAsyncReadback(AsyncReadback& readback, bool allow_requeue = false);
     AsyncReadback* FindInflightReadback(VAddr addr, u64 size);
     void MarkInflightReadbacksDirty(VAddr addr, u64 size);
     std::vector<AsyncReadback*> inflight_readbacks;

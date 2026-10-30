@@ -86,8 +86,8 @@ POOL_FIX = (0x41a321, bytes.fromhex('eb34666666662e0f1f840000000000'),
 LOW_MEM_PIXELS = 4_200_000
 RENDER_SITES = [
     # display init (0x495a90): back buffer, display targets, scene size. The display object's
-    # aspect (0x495b3e, 16/9) stays: the HUD lays out its health bar with it, and a wider value
-    # left a grey stub on the bar in 21:9 (#301, user test 26 Oct; the scene is unchanged).
+    # aspect (0x495b3e, WIDE_ASPECT) is added in render_patches: the 3D scene and the HUD's health
+    # bar both read it.
     (0x00495bec, 'H', 'b938040000'), (0x00495bf7, 'W', 'b880070000'),
     (0x00495c91, 'W', 'ba80070000'), (0x00495c96, 'H', 'b938040000'),
     (0x00495d34, 'W', 'ba80070000'), (0x00495d39, 'H', 'b938040000'),
@@ -125,6 +125,7 @@ RENDER_SITES = [
     (0x008e2cf1, 'v', 'c78550feffff0000f044'),
     (0x00920309, 'v', 'c78560feffff0000f044'),
 ]
+WIDE_ASPECT = (0x00495b3e, 'a', 'c74304398ee33f')  # the display object's aspect (16/9)
 RT_POOL = 0x14280000
 # EU 1.01 / US 1.00: the command line lea and the fps60 site.
 VERSION_CHECKS = [(CMDLINE_LEA, bytes.fromhex('488d352debad00')), (0x01390090, bytes.fromhex('ff25a20567'))]
@@ -172,6 +173,11 @@ def render_pool(w, h):
     return (pool + 0xffff) & ~0xffff
 
 
+def is_wide(w, h):
+    """True for a WxH wider than 16:9 by more than 2% (the launcher's is_wide)."""
+    return w * 9 > h * 16 * 1.02
+
+
 def render_patches(elf, ph, size):
     """The writes for render size WxH; SystemExit when a site does not hold the expected bytes."""
     match = re.fullmatch(r'(\d+)x(\d+)', size)
@@ -189,8 +195,12 @@ def render_patches(elf, ph, size):
     # #301: health and stamina bars stretched in 21:9).
     keep = {int(a, 16) for a in os.environ.get('SOTC_RENDER_KEEP', '').replace(' ', ',').split(',') if a}
     sites = list(RENDER_SITES)
-    if os.environ.get('SOTC_WIDE_ASPECT') == '1':  # the display object's aspect too (pre-#301)
-        sites.append((0x00495b3e, 'a', 'c74304398ee33f'))
+    # The display object's aspect also sets the 3D scene's: left at 16:9 (C2, for #301) the scene
+    # was the 16:9 image stretched sideways in 21:9 and 32:9 (#327, #331, #341; the moon of the
+    # opening is not round). On by default above 16:9; the health bar's grey stub in 21:9 (#301)
+    # comes back with it. SOTC_WIDE_ASPECT=0 keeps 16:9 (stretched scene, no stub).
+    if os.environ.get('SOTC_WIDE_ASPECT', '1' if is_wide(w, h) else '0') == '1':
+        sites.append(WIDE_ASPECT)
     for address, kind, original in sites:
         original = bytes.fromhex(original)
         if image_bytes(elf, ph, address - BASE, len(original)) != original:

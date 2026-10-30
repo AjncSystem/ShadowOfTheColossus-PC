@@ -480,18 +480,20 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    // sotc: a second queue for vkQueuePresentKHR when the family has one. Present can block for
-    // tens of ms in the driver; on the shared queue that hold starved every submit (the ~11 s
-    // cadence hitch), on its own queue it blocks nobody.
-    // SOTC_PRESENT_QUEUE: 0 = shared, default = same-family second queue, 2 = present from a
-    // non-graphics family (own HW engine) — NVIDIA advertises its compute family but loses the
-    // device within seconds under load (driver 617.42, RTX 5090), so never the default.
+    // sotc: present from the shared graphics queue, like nearly every game: RTSS and friends hook
+    // vkQueuePresentKHR and draw their overlay assuming exactly that (a second queue makes RTSS
+    // flicker). The ~11 s cadence hitch (NVIDIA blocking present up to ~140 ms) is bridged by the
+    // deeper swapchain alone (vk_swapchain.cpp), verified with RTSS on the shared queue.
+    // SOTC_PRESENT_QUEUE: default/0 = shared, 1 = same-family second queue (blocks nobody, but
+    // external overlays flicker), 2 = present from a non-graphics family (own HW engine) — NVIDIA
+    // advertises its compute family but loses the device within seconds under load (driver 617.42,
+    // RTX 5090), so never the default.
     const u32 family_queue_count = family_properties[queue_family_index].queueCount;
     const char* pq = std::getenv("SOTC_PRESENT_QUEUE");
     present_queue_family = queue_family_index;
     dedicated_present_queue = false;
-    if (!(pq && pq[0] == '0')) {
-        if (pq && pq[0] == '2') {
+    if (pq && (pq[0] == '1' || pq[0] == '2')) {
+        if (pq[0] == '2') {
             for (std::size_t i = 0; i < family_properties.size(); i++) {
                 const u32 index = static_cast<u32>(i);
                 if (index != queue_family_index &&

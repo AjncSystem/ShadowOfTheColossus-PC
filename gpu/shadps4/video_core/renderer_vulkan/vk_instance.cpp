@@ -483,14 +483,42 @@ bool Instance::CreateDevice() {
     // sotc: a second queue for vkQueuePresentKHR when the family has one. Present can block for
     // tens of ms in the driver; on the shared queue that hold starved every submit (the ~11 s
     // cadence hitch), on its own queue it blocks nobody.
+    // SOTC_PRESENT_QUEUE: 0 = shared, default = same-family second queue, 2 = present from a
+    // non-graphics family (own HW engine) — NVIDIA advertises its compute family but loses the
+    // device within seconds under load (driver 617.42, RTX 5090), so never the default.
     const u32 family_queue_count = family_properties[queue_family_index].queueCount;
-    const char* pq = std::getenv("SOTC_PRESENT_QUEUE"); // =0 forces the old shared queue
-    dedicated_present_queue = family_queue_count >= 2 && !(pq && pq[0] == '0');
+    const char* pq = std::getenv("SOTC_PRESENT_QUEUE");
+    present_queue_family = queue_family_index;
+    dedicated_present_queue = false;
+    if (!(pq && pq[0] == '0')) {
+        if (pq && pq[0] == '2') {
+            for (std::size_t i = 0; i < family_properties.size(); i++) {
+                const u32 index = static_cast<u32>(i);
+                if (index != queue_family_index &&
+                    QueueFamilyCanPresent(physical_device, index, queue_family_index)) {
+                    present_queue_family = index;
+                    dedicated_present_queue = true;
+                    break;
+                }
+            }
+        }
+        if (!dedicated_present_queue && family_queue_count >= 2) {
+            dedicated_present_queue = true; // second queue in the graphics family
+        }
+    }
     static constexpr std::array queue_priorities = {1.0f, 1.0f};
-    const vk::DeviceQueueCreateInfo queue_info = {
-        .queueFamilyIndex = queue_family_index,
-        .queueCount = dedicated_present_queue ? 2u : 1u,
-        .pQueuePriorities = queue_priorities.data(),
+    const bool cross_family = present_queue_family != queue_family_index;
+    const std::array queue_infos = {
+        vk::DeviceQueueCreateInfo{
+            .queueFamilyIndex = queue_family_index,
+            .queueCount = !cross_family && dedicated_present_queue ? 2u : 1u,
+            .pQueuePriorities = queue_priorities.data(),
+        },
+        vk::DeviceQueueCreateInfo{
+            .queueFamilyIndex = present_queue_family,
+            .queueCount = 1u,
+            .pQueuePriorities = queue_priorities.data(),
+        },
     };
 
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
@@ -498,8 +526,8 @@ bool Instance::CreateDevice() {
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
-            .queueCreateInfoCount = 1u,
-            .pQueueCreateInfos = &queue_info,
+            .queueCreateInfoCount = cross_family ? 2u : 1u,
+            .pQueueCreateInfos = queue_infos.data(),
             .enabledExtensionCount = static_cast<u32>(enabled_extensions.size()),
             .ppEnabledExtensionNames = enabled_extensions.data(),
         },
@@ -715,9 +743,14 @@ bool Instance::CreateDevice() {
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
 
     graphics_queue = device->getQueue(queue_family_index, 0);
-    present_queue = device->getQueue(queue_family_index, dedicated_present_queue ? 1 : 0);
-    LOG_INFO(Render_Vulkan, "Present queue: {}",
-             dedicated_present_queue ? "dedicated" : "shared with graphics");
+    present_queue = device->getQueue(
+        present_queue_family,
+        dedicated_present_queue && present_queue_family == queue_family_index ? 1 : 0);
+    std::fprintf(stderr, "GPU present queue: %s (family %u, graphics family %u)\n",
+                 present_queue_family != queue_family_index ? "own family"
+                 : dedicated_present_queue                  ? "second graphics-family queue"
+                                                            : "shared with graphics",
+                 present_queue_family, queue_family_index);
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =

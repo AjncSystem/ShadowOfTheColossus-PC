@@ -66,7 +66,7 @@ public:
     }
 
     u32 GetPresentQueueFamilyIndex() const {
-        return queue_family_index;
+        return present_queue_family;
     }
 
     vk::Queue GetGraphicsQueue() const {
@@ -617,6 +617,7 @@ private:
     VmaAllocator allocator{};
     vk::Queue present_queue;
     bool dedicated_present_queue{};
+    u32 present_queue_family{0};
     vk::Queue graphics_queue;
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;

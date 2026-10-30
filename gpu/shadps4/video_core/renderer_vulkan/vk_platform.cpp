@@ -125,6 +125,18 @@ vk::SurfaceKHR CreateSurface(vk::Instance instance, const Frontend::WindowSDL& e
     return surface;
 }
 
+// sotc: whether this queue family can present at all, without needing a surface (the present
+// queue is chosen at device creation, before the swapchain exists). Windows only; elsewhere the
+// graphics family is assumed, as before.
+bool QueueFamilyCanPresent(vk::PhysicalDevice physical_device, u32 family_index,
+                           u32 graphics_family_index) {
+#if defined(VK_USE_PLATFORM_WIN32_KHR)
+    return physical_device.getWin32PresentationSupportKHR(family_index);
+#else
+    return family_index == graphics_family_index;
+#endif
+}
+
 static auto GetLayerExtensions(std::vector<const char*>&& extensions,
                                const std::vector<const char*>& layers) {
     auto all_missing_vk_settings = true;

@@ -140,7 +140,7 @@ static const bool kCopyLockOnce = [] {
     const char* v = std::getenv("SOTC_COPY_LOCK_ONCE");
     return v && v[0] == '1';
 }();
-// sotc: SOTC_COPY_GUEST_VIEW=1 (off by default). Guest memory is one section mapped twice, and
+// sotc: SOTC_COPY_GUEST_VIEW (on by default since 30 Oct 2026; =0 turns it off). Guest memory is one section mapped twice, and
 // each view has its own page-table entries: the first read through the backing view of a page
 // the guest just wrote through its own view is a soft page fault (~0.8 us per 4 KiB, measured),
 // which held the upload memcpy at ~3 GB/s against ~10 through the guest view. With the switch a
@@ -160,7 +160,7 @@ void Report() {
 } // namespace SotcCopyGuest
 static const bool kCopyGuestView = [] {
     const char* v = std::getenv("SOTC_COPY_GUEST_VIEW");
-    return v && v[0] == '1';
+    return !v || v[0] != '0';
 }();
 // Every 5 s on a detached thread (bbgpu_init): the process may end without atexit handlers.
 static void StartCopyGuestReport() {

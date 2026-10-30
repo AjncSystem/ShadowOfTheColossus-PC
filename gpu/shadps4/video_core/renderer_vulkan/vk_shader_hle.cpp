@@ -523,13 +523,13 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
     } else {
         BuildTable(source, src_count, count);
     }
-    // sotc: SOTC_FILL_HLE_GPU=1 (off by default). A destination resident in one arena gets the
+    // sotc: SOTC_FILL_HLE_GPU (on by default since 30 Oct 2026; =0 turns it off). A destination resident in one arena gets the
     // table from the GPU (fill, doubling copies or a copy from the source; FillGpuPath) instead of
     // being marked CPU-written, which the next DMA sweep or bind copied through staging again
     // (one 8 MiB table at 0x1068b00000, ~33 times per area load). The backing is still written.
     static const bool fill_gpu = [] {
         const char* v = std::getenv("SOTC_FILL_HLE_GPU");
-        return v && v[0] == '1';
+        return !v || v[0] != '0';
     }();
     const u64 table_bytes = count * 4;
     const u64 period = src_count * 4;

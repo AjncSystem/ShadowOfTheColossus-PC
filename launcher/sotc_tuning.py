@@ -301,14 +301,14 @@ TUNING = [('SOTC_ADAPTIVE_SHADOW',
   '',
   ()),
  ('SOTC_DROP_FAST',
-  'flag',
+  'flag_on',
   'memory',
   ('Liberar memória que a GPU só leu, sem espera', 'Fast release of memory the GPU only read'),
-  ('Experimental, desligado: liberar memória que a GPU só leu não espera a thread de desenho. '
+  ('Ligado por padrão: liberar memória que a GPU só leu não espera a thread de desenho. '
    'Medido: menos travadas nas cargas (o pior quadro caiu de 417 ms para 125–185 ms, e as esperas '
    'ao liberar memória de ~9 s para menos de 50 ms por sessão). ATENÇÃO: em 1 de 4 testes o jogo '
    'fechou sozinho ao carregar o save; a causa ainda não foi encontrada.',
-   'Experimental, off: releasing memory the GPU only read does not wait for the draw thread. '
+   'On by default: releasing memory the GPU only read does not wait for the draw thread. '
    'Measured: fewer hitches while loading (worst frame from 417 ms to 125-185 ms, memory-release '
    'waits from ~9 s to under 50 ms per session). WARNING: in 1 of 4 tests the game closed on its '
    'own while loading the save; the cause is not found yet.'),
@@ -1081,13 +1081,36 @@ TUNING = [('SOTC_ADAPTIVE_SHADOW',
   '256',
   ()),
  ('SOTC_STAGING_LARGE_POW2',
-  'flag',
+  'flag_on',
   'upload',
   ('Reaproveitar buffers grandes de envio', 'Reuse large upload buffers'),
   ('Agrupa os buffers grandes de envio à GPU em tamanhos fixos, para reaproveitá-los e não alocar '
-   'de novo durante o carregamento de áreas. Desligado por padrão, experimental.',
+   'de novo durante o carregamento de áreas. Ligado por padrão.',
    'Groups large GPU upload buffers into fixed sizes so they can be reused instead of allocated '
-   'again while areas load. Off by default, experimental.'),
+   'again while areas load. On by default.'),
+  '',
+  ()),
+ ('SOTC_COPY_GUEST_VIEW',
+  'flag_on',
+  'upload',
+  ('Envios leem pelo endereço do jogo', 'Uploads read through the game address'),
+  ('Ligado por padrão. Os envios de memória do jogo à GPU leem pelo endereço do próprio jogo, '
+   'protegidos contra falha, em vez da segunda visão da memória, cuja primeira leitura de cada '
+   'página é lenta. Cópias de carregamento de área ~25% mais rápidas. Desligue para voltar à '
+   'segunda visão.',
+   'On by default. GPU uploads of game memory read through the game\'s own address, guarded '
+   'against faults, instead of the second view of memory, whose first read of each page is slow. '
+   'Area-load copies ~25% faster. Turn off to go back to the second view.'),
+  '',
+  ()),
+ ('SOTC_FILL_HLE_GPU',
+  'flag_on',
+  'upload',
+  ('Tabelas de preenchimento na GPU', 'Fill tables on the GPU'),
+  ('Ligado por padrão. As tabelas que o shader de preenchimento escreve chegam à GPU por '
+   'preenchimento ou cópia na própria GPU, em vez de serem copiadas de novo a cada carga de área.',
+   'On by default. The tables the fill shader writes reach the GPU through a fill or copy on the '
+   'GPU itself, instead of being copied again on every area load.'),
   '',
   ()),
  ('SOTC_XFER_QUEUE',
@@ -1120,6 +1143,18 @@ TUNING = [('SOTC_ADAPTIVE_SHADOW',
    'Default 4000 us (normal is 1000). Only with "Adaptive load control (experimental)": while '
    'relief is active, the periodic submits to the GPU are spaced further apart.'),
   '4000',
+  ()),
+ ('SOTC_MUTEX_SPIN_US',
+  'value',
+  'threads',
+  ('Espera curta nos mutexes do jogo (µs)', 'Short spin on game mutexes (us)'),
+  ('Padrão 20 µs (0 desliga, até 1000). Um mutex do jogo disputado tenta de novo por esse tempo '
+   'antes de esperar no sistema: o agendador de tarefas do jogo deixava de formar fila nas cargas '
+   'de área.',
+   'Default 20 us (0 turns it off, up to 1000). A contended game mutex retries for this long '
+   'before waiting in the system: the game\'s job scheduler stopped queueing up during area '
+   'loads.'),
+  '20',
   ()),
  ('SOTC_ASC_RPTR',
   'choice',
@@ -1873,6 +1908,26 @@ def defaults():
     return {setting_key(name): kind == 'flag_on' if kind in ('flag', 'flag_on') else
             (default if kind == 'value' else '')
             for name, kind, _group, _title, _hint, default, _options in TUNING}
+
+
+# Switches whose launcher default changed from off to on: a launcher setting saved before the change
+# holds False ("off, the old default") although the player never chose it. migrate() drops such a
+# saved value once, so the box shows the new default. (marker key, names)
+DEFAULT_ON_MIGRATIONS = [
+    ('tune_migrated_20261030', ('SOTC_STAGING_LARGE_POW2',)),
+    ('tune_migrated_20261030b', ('SOTC_DROP_FAST',)),
+]
+
+
+def migrate(saved):
+    """Drops the saved values of switches that became on by default (DEFAULT_ON_MIGRATIONS), once."""
+    for marker, names in DEFAULT_ON_MIGRATIONS:
+        if saved.get(marker):
+            continue
+        for name in names:
+            saved.pop(setting_key(name), None)
+        saved[marker] = True
+    return saved
 
 
 def fill_defaults(settings):

@@ -364,8 +364,8 @@ private:
         /// Only SOTC_DROP_FAST reads the ranges; with it unset nothing is recorded.
         static bool Enabled() {
             static const bool on = [] {
-                const char* v = std::getenv("SOTC_DROP_FAST");
-                return v && v[0] == '1';
+                const char* v = std::getenv("SOTC_DROP_FAST"); // sotc: on unless =0
+                return !v || v[0] != '0';
             }();
             return on;
         }

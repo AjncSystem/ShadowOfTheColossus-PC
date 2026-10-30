@@ -603,9 +603,12 @@ void BufferCache::DropGpuModified(VAddr device_addr, u64 size) {
     // then does not wait for the draw thread to finish its current operation (up to a frame
     // while it waits for a free presentation frame; seconds per minute while loading, with the
     // region lock of the unmap held and the game's other threads sleeping on it).
+    // sotc: on by default since 30 Oct 2026 (=0 turns it off): worst load frame 417 -> 125-185 ms.
+    // Caveat kept from the first tests: 1 of 4 sessions closed while loading the save ("bad PM4
+    // packet"); Liverpool::CmdRanges now waits for command buffers in the freed memory.
     static const bool fast = [] {
         const char* v = std::getenv("SOTC_DROP_FAST");
-        return v && v[0] == '1';
+        return !v || v[0] != '0';
     }();
     if (fast) {
         bool gpu_ranges;
@@ -4732,9 +4735,10 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
     // times) stayed clean. Attract demo, full settings: 54.8 / 36.4 FPS off against ~57 / 40 with
     // mode 2. Keeping the hot data aside until the guest reads it (no speculative writes) cost more
     // than it saved (42.7 / 23.5): copying it on the command processor thread.
+    // sotc: mode 2 by default since 30 Oct 2026 (=0 turns it off), with the risks above.
     static const int hot_mode = [] {
         const char* v = std::getenv("SOTC_RB_HOT");
-        return v ? std::atoi(v) : 0;
+        return v ? std::atoi(v) : 2;
     }();
     // sotc: SOTC_RB_PREFETCH: a prefetch copies its own window only (rb_gather_no_hot).
     const bool hot_enabled = hot_mode != 0 && !rb_gather_no_hot;

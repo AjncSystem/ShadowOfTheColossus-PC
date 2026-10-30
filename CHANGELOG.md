@@ -2,7 +2,38 @@
 
 ## Em desenvolvimento
 
+**Cargas de área mais leves (ligado por padrão)**
+Medido em 30/10 numa rota de carga (spawn → home_north → cathedral → cathedral_north →
+cathedral_pool), uma sessão por configuração, contra a mesma rota sem as opções. Cada uma desliga
+com `=0` (ou na aba Ajustes experimentais do lançador).
+- **Envios leem pelo endereço do jogo** (`SOTC_COPY_GUEST_VIEW`): a cópia da memória do jogo para a
+  GPU lia por uma segunda visão da memória, cuja primeira leitura de cada página recém-escrita paga
+  uma falta de página (~3 GB/s). Agora lê pelo endereço do próprio jogo, protegida contra falha (uma
+  página bloqueada volta à segunda visão). Cópias nos quadros lentos de 6,2 para 7,9 GB/s; quadros
+  acima de 60 ms de 11 para 5.
+- **Tabelas de preenchimento na GPU** (`SOTC_FILL_HLE_GPU`): uma tabela de 8 MiB que o shader de
+  preenchimento reescreve ~33 vezes por carga não é mais copiada de novo pela memória do jogo; a GPU
+  a preenche. Cópias da varredura DMA nos quadros lentos de 98 para 62 ms.
+- **Espera curta nos mutexes do jogo** (`SOTC_MUTEX_SPIN_US`, padrão 20 µs): o agendador de
+  tarefas do jogo formava fila na espera do sistema; as esperas por quadro lento caíram de 145 para
+  17 ms somadas entre as threads.
+- **Reaproveitar buffers grandes de envio** (`SOTC_STAGING_LARGE_POW2`): menos alocações durante a
+  carga. Junto com a espera curta: pior quadro de ~330 para ~200 ms.
+- O pior quadro da primeira carga (~170–200 ms) continua: é o bind de recursos na thread de desenho.
+- **Liberar memória sem espera** (`SOTC_DROP_FAST`, agora ligado): medido em 29/10, esperas ao
+  liberar memória de ~9,3 s para 25–44 ms por sessão e pior quadro de 417 para 125–185 ms.
+  **Risco conhecido:** em 1 de 4 sessões de teste o jogo fechou ao carregar o save (`sotc: bad PM4
+  packet …`); a proteção adicionada depois não disparou de novo, mas a causa não foi confirmada. Se
+  o jogo fechar ao carregar, desligue com `SOTC_DROP_FAST=0` (aba Ajustes experimentais).
+- **Leituras rápidas da GPU** (`SOTC_RB_HOT`, agora no modo 2 por padrão; caixa “Mais FPS” do
+  lançador marcada): demo da tela de título ~57 / 40 FPS contra 54,8 / 36,4. **Risco conhecido:**
+  foi desligada em 22/10 por lixo colorido nas pedras do Shrine depois de recarregar o save e por
+  uma queda após 23 min parado no demo. Se aparecer, desmarque a caixa (ou `SOTC_RB_HOT=0`).
+
 **Experimental (desligado por padrão)**
+- Rastreamento da origem das cópias de envio (`SOTC_TRACE`, comando `copysrc` do
+  `tools/trace/sotc_trace.py`), staging em memória com cache (`SOTC_STAGING_CACHED`) e aquecimento
+  da segunda visão da memória (`SOTC_BACKING_WARM`). Os dois últimos foram medidos sem ganho.
 - **Rastreamento automático (`SOTC_TRACE`, versão 2)**: gravador de linha do tempo que registra, com
   um relógio só, as threads do jogo e do motor. `SOTC_TRACE=1` grava a janela ao redor de cada quadro
   lento; `SOTC_TRACE=2` grava a sessão inteira em pedaços comprimidos (`.sotctrace`, em

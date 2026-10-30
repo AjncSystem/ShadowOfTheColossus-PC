@@ -88,7 +88,9 @@ static int32_t ensure_mutex(GuestMutex **mutex) {
     return e;
 }
 /* sotc: SOTC_MUTEX_SPIN_US=<us>: a contended guest mutex retries trylock with a pause between tries for
- * up to this many us before the kernel-timed wait (default 0 = off, the old path). Read once and clamped
+ * up to this many us before the kernel-timed wait (default 20 since 30 Oct 2026: the job scheduler's
+ * no-pause relock loop convoyed on the kernel wait, 145 -> 17 thread-ms of waits per slow frame; 0 = off,
+ * the old path). Read once and clamped
  * to MUTEX_SPIN_MAX_US. Ignored on machines with 2 or fewer logical CPUs, where a spinning waiter can only
  * delay the owner. Counters are kept only while the switch is on (runtime_mutex_spin_stats). */
 #define MUTEX_SPIN_MAX_US 1000
@@ -116,7 +118,7 @@ static uint64_t mutex_spin_us_get(void) {
     if (us != MUTEX_SPIN_UNREAD) return us;
     const char *env = getenv("SOTC_MUTEX_SPIN_US");
     /* A negative value (strtoll < 0) is off, not the clamped maximum. */
-    long long signed_v = env ? strtoll(env, NULL, 10) : 0;
+    long long signed_v = env ? strtoll(env, NULL, 10) : 20;
     unsigned long long v = signed_v > 0 ? (unsigned long long)signed_v : 0;
     if (v > MUTEX_SPIN_MAX_US) v = MUTEX_SPIN_MAX_US;
     if (v && spin_cpu_count() <= 2) {

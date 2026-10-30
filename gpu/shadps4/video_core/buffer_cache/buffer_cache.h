@@ -257,7 +257,7 @@ private:
     /// sotc: marks bytes a guest write fault asked for CPU-modified, unless pages of them
     /// still hold GPU data (see the definition).
     void MarkWrittenByGuest(VAddr addr, u64 size);
-    void FinishAsyncReadback(AsyncReadback& readback);
+    bool FinishAsyncReadback(AsyncReadback& readback, bool allow_requeue = false);
     AsyncReadback* FindInflightReadback(VAddr addr, u64 size);
     void MarkInflightReadbacksDirty(VAddr addr, u64 size);
     std::vector<AsyncReadback*> inflight_readbacks;

@@ -590,7 +590,8 @@ void VideoOutDriver::Flip(const Request& req) {
                          static_cast<unsigned long long>(SotcStats::arena_bytes.load() >> 20));
             ReportPrintf(report,
                          "SOTC readback finish: %llu for bytes the guest asked, %llu binds, "
-                         "%llu window, %llu hot; dirty retries %llu, hot dropped %llu\n",
+                         "%llu window, %llu hot; dirty retries %llu, hot dropped %llu, "
+                         "requeued %llu\n",
                          static_cast<unsigned long long>(
                              SotcStats::readback_finish_asked.exchange(0)),
                          static_cast<unsigned long long>(
@@ -602,7 +603,8 @@ void VideoOutDriver::Flip(const Request& req) {
                          static_cast<unsigned long long>(
                              SotcStats::readback_dirty_retries.exchange(0)),
                          static_cast<unsigned long long>(
-                             SotcStats::rb_dirty_hot_dropped.exchange(0)));
+                             SotcStats::rb_dirty_hot_dropped.exchange(0)),
+                         static_cast<unsigned long long>(SotcStats::rb_requeues.exchange(0)));
             if (const u64 streamed = SotcStats::rb_stream_windows.exchange(0)) {
                 ReportPrintf(report, "SOTC readback stream windows: %llu\n",
                              static_cast<unsigned long long>(streamed));

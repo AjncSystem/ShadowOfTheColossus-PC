@@ -81,6 +81,8 @@ inline std::atomic<uint64_t> readback_finish_hot{0};
 inline std::atomic<uint64_t> readback_dirty_retries{0};
 /// stale hot bring-alongs dropped instead of forcing that synchronous re-read (SOTC_RB_PART)
 inline std::atomic<uint64_t> rb_dirty_hot_dropped{0};
+/// Dirtied readback windows re-read asynchronously (another round trip) instead of synchronously.
+inline std::atomic<uint64_t> rb_requeues{0};
 inline std::atomic<uint64_t> heap_guard_builds{0}; ///< readbacks into the BPE heap
 inline std::atomic<uint64_t> heap_guard_stale_hits{0}; ///< writes the previous guard vouched for
 inline std::atomic<uint64_t> upload_deferred{0};        ///< first uploads put off to a later frame

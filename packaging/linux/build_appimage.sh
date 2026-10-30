@@ -6,8 +6,8 @@
 # The AppImage carries the loader, the GPU library, the preparation scripts, the launcher with
 # this machine's Python and Tcl/Tk (so the host needs neither) and every library they use except
 # the base system every desktop has (glibc, libstdc++, the Vulkan loader, fontconfig and
-# freetype, which read the host's own font setup, and the libraries of the host's graphics driver:
-# Wayland, X11/xcb, libdrm, gbm, expat, zlib, zstd). It never contains game or Sony files: the
+# freetype, which read the host's own font setup, and the libraries of the host's graphics driver
+# and sound server: Wayland, X11/xcb, libdrm, gbm, expat, zlib, zstd, PipeWire, ALSA). It never contains game or Sony files: the
 # user points it at their own dump and sound modules on first start (packaging/linux/AppRun).
 # Tools: patchelf, python3 with Tk (apt install python3-tk, dnf install python3-tkinter), and
 # appimagetool (APPIMAGETOOL=path, else downloaded into out/tools).
@@ -61,11 +61,13 @@ cp -a "$tcl_dir" "$python/tcl"
 cp -a "$tk_dir" "$python/tk"
 
 # Every library the given binaries load, except the base system, the port's own GPU library and
-# what the host's Vulkan driver loads into the same process: an older bundled copy shadows the
-# host's, and a driver built against a newer one fails to load (Arch's Mesa 26.2 RADV needs
-# wl_fixes_interface from libwayland 1.24; the window then reports no VK_KHR_surface).
+# what loads the host's own plugins or is loaded by them into the same process: the Vulkan
+# driver's libraries, PipeWire (its modules) and ALSA (its plugins). A bundled copy of another
+# version shadows the host's: Arch's Mesa 26.2 RADV needs wl_fixes_interface from libwayland 1.24
+# (the window then reports no VK_KHR_surface), and Debian's libpipewire 1.4 crashed in Ubuntu
+# 24.04's 1.0 client-node module when SDL opened the audio.
 host='^(linux-vdso|ld-linux-x86-64|libc|libm|libdl|librt|libpthread|libresolv|libstdc\+\+|libgcc_s|libvulkan|libfontconfig|libfreetype)\.so'
-driver='^(libdrm|libgbm|libwayland-[a-z]+|libxcb|libX11|libX11-xcb|libxshmfence|libexpat|libz|libzstd)\.so'
+driver='^(libdrm|libgbm|libwayland-[a-z]+|libxcb|libX11|libX11-xcb|libxshmfence|libexpat|libz|libzstd|libpipewire-[0-9.]+|libasound)\.so'
 bundle() {
     while read -r name path; do
         [[ $name =~ $host || $name =~ $driver || $path == */out/gpu/* ]] && continue

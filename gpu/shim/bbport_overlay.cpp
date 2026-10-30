@@ -611,8 +611,9 @@ void QuickSettings() {
         }
         ImGui::EndCombo();
     }
-    if (!(live_fsr1 >= 0 ? live_fsr1 : env_fsr1)) {
-        Hint(T("A nitidez vale com o FSR 1.", "Sharpening applies with FSR 1."));
+    if (up_mode == 1) {
+        Hint(T("A nitidez vale com FSR 1, FSR 3.1 e DLSS (não com bilinear).",
+               "Sharpening applies with FSR 1, FSR 3.1 and DLSS (not with bilinear)."));
     }
 
     using Vulkan::FrameGen::Mode;

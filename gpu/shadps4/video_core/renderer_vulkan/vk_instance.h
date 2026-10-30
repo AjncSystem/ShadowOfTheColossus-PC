@@ -77,6 +77,12 @@ public:
         return present_queue;
     }
 
+    /// sotc: true when present_queue is its own vk::Queue (second queue in the graphics family),
+    /// so vkQueuePresentKHR does not need Scheduler::submit_mutex.
+    bool HasDedicatedPresentQueue() const {
+        return dedicated_present_queue;
+    }
+
     TracyVkCtx GetProfilerContext() const {
         return profiler_context;
     }
@@ -610,6 +616,7 @@ private:
     std::string vendor_name;
     VmaAllocator allocator{};
     vk::Queue present_queue;
+    bool dedicated_present_queue{};
     vk::Queue graphics_queue;
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;

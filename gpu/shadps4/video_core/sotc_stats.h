@@ -299,6 +299,29 @@ struct FrameTimer {
     }
 };
 
+/// sotc: SOTC_TICKWATCH=1 -- a watcher thread on the draw scheduler samples its timeline
+/// semaphore (vk_scheduler.cpp StartTickWatch); submits and GPU progress land in this ring and
+/// the FLIPGAP detector (videoout/driver.cpp) prints what the timeline did during a gap.
+/// Diagnostic: off by default, never on in benchmarks.
+inline const bool kTickWatch = [] {
+    const char* v = std::getenv("SOTC_TICKWATCH");
+    return v && v[0] == '1';
+}();
+struct TickEvent {
+    int64_t t_ns;  ///< steady_clock time_since_epoch (NowNs)
+    uint64_t gpu;  ///< kind 0: known GPU tick; kind 1/2: the tick submitted
+    uint64_t sub;  ///< kind 0: newest submitted tick; kind 1: (wait semas << 8) | cmd buffers;
+                   ///< kind 2: (submit_mutex wait us << 32) | vkQueueSubmit us
+    uint32_t kind; ///< 0 progress sample, 1 SubmitExecution, 2 put on the Vulkan queue
+};
+inline constexpr size_t kTickRing = 8192;
+inline TickEvent tick_ring[kTickRing];
+inline std::atomic<uint64_t> tick_ring_head{0};
+inline void PushTick(uint32_t kind, uint64_t gpu, uint64_t sub) {
+    const uint64_t i = tick_ring_head.fetch_add(1, std::memory_order_relaxed);
+    tick_ring[i % kTickRing] = {static_cast<int64_t>(NowNs()), gpu, sub, kind};
+}
+
 /// SOTC_DROP_TRACE=1: logs the first 80 draws/dispatches of each kind that are dropped.
 inline void Drop(int kind, unsigned long long a, unsigned long long b) {
     static const bool enabled = [] {

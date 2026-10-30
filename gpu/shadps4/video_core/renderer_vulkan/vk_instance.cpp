@@ -480,10 +480,16 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    static constexpr std::array queue_priorities = {1.0f};
+    // sotc: a second queue for vkQueuePresentKHR when the family has one. Present can block for
+    // tens of ms in the driver; on the shared queue that hold starved every submit (the ~11 s
+    // cadence hitch), on its own queue it blocks nobody.
+    const u32 family_queue_count = family_properties[queue_family_index].queueCount;
+    const char* pq = std::getenv("SOTC_PRESENT_QUEUE"); // =0 forces the old shared queue
+    dedicated_present_queue = family_queue_count >= 2 && !(pq && pq[0] == '0');
+    static constexpr std::array queue_priorities = {1.0f, 1.0f};
     const vk::DeviceQueueCreateInfo queue_info = {
         .queueFamilyIndex = queue_family_index,
-        .queueCount = static_cast<u32>(queue_priorities.size()),
+        .queueCount = dedicated_present_queue ? 2u : 1u,
         .pQueuePriorities = queue_priorities.data(),
     };
 
@@ -709,7 +715,9 @@ bool Instance::CreateDevice() {
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
 
     graphics_queue = device->getQueue(queue_family_index, 0);
-    present_queue = device->getQueue(queue_family_index, 0);
+    present_queue = device->getQueue(queue_family_index, dedicated_present_queue ? 1 : 0);
+    LOG_INFO(Render_Vulkan, "Present queue: {}",
+             dedicated_present_queue ? "dedicated" : "shared with graphics");
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =

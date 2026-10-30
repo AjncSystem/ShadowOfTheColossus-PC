@@ -42,6 +42,7 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <sstream>
 #include <system_error>
@@ -51,6 +52,10 @@
 #include <vk_mem_alloc.h>
 
 namespace Vulkan {
+
+// sotc: serializes vkQueuePresentKHR (both present sites) on the dedicated present queue; with a
+// shared queue the sites take Scheduler::submit_mutex as well.
+static std::mutex present_queue_mutex;
 
 bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format format) {
     const vk::FormatProperties props{physical_device.getFormatProperties(format)};
@@ -479,6 +484,8 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
       swapchain{instance, window}, runtime{instance, draw_scheduler},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
+    // sotc: SOTC_TICKWATCH samples the draw scheduler's timeline (FLIPGAP diagnosis).
+    draw_scheduler.StartTickWatch();
     const u32 num_images = swapchain.GetImageCount();
     const vk::Device device = instance.GetDevice();
 
@@ -1306,13 +1313,32 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         Dlssg::BeforePresent(frame->id,
                              FitImage(frame->width, frame->height, extent.width, extent.height),
                              extent);
-        std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        // sotc: vkQueuePresentKHR can block for tens of ms in the driver; on a dedicated present
+        // queue it only needs the present queue's own lock, so those stalls no longer starve the
+        // schedulers' submits (the ~11 s cadence hitch). Shared queue: submit_mutex as before.
+        const s64 tw0 = SotcStats::kTickWatch ? static_cast<s64>(SotcStats::NowNs()) : 0;
+        std::unique_lock submit_lock{Scheduler::submit_mutex, std::defer_lock};
+        if (!instance.HasDedicatedPresentQueue()) {
+            submit_lock.lock();
+        }
+        std::scoped_lock present_lock{present_queue_mutex};
+        const s64 tw1 = SotcStats::kTickWatch ? static_cast<s64>(SotcStats::NowNs()) : 0;
         const bool presented = swapchain.Present();
+        if (SotcStats::kTickWatch) {
+            const s64 tw2 = static_cast<s64>(SotcStats::NowNs());
+            SotcStats::PushTick(4, 0,
+                                (static_cast<u64>((tw1 - tw0) / 1000) << 32) |
+                                    static_cast<u64>((tw2 - tw1) / 1000));
+        }
         Dlssg::AfterPresent(frame->id);
         if (FrameGen::Current() == FrameGen::Mode::Fsr) {
             FsrFg::NotePresent();
         }
         if (!presented) {
+            // Recreate() waits for the whole device to go idle: no submits may race it.
+            if (!submit_lock.owns_lock()) {
+                submit_lock.lock();
+            }
             Dlssg::Suspend();
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
@@ -1510,8 +1536,26 @@ bool Presenter::PresentGenerated(Frame* frame) {
     info.AddWait(swapchain.GetImageAcquiredSemaphore());
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     submit();
-    std::scoped_lock submit_lock{Scheduler::submit_mutex};
-    if (!swapchain.Present()) {
+    // sotc: same locking as the frame-path present above (dedicated present queue).
+    const s64 tw0 = SotcStats::kTickWatch ? static_cast<s64>(SotcStats::NowNs()) : 0;
+    std::unique_lock submit_lock{Scheduler::submit_mutex, std::defer_lock};
+    if (!instance.HasDedicatedPresentQueue()) {
+        submit_lock.lock();
+    }
+    std::scoped_lock present_lock{present_queue_mutex};
+    const s64 tw1 = SotcStats::kTickWatch ? static_cast<s64>(SotcStats::NowNs()) : 0;
+    const bool presented = swapchain.Present();
+    if (SotcStats::kTickWatch) {
+        const s64 tw2 = static_cast<s64>(SotcStats::NowNs());
+        SotcStats::PushTick(4, 1,
+                            (static_cast<u64>((tw1 - tw0) / 1000) << 32) |
+                                static_cast<u64>((tw2 - tw1) / 1000));
+    }
+    if (!presented) {
+        // Recreate() waits for the whole device to go idle: no submits may race it.
+        if (!submit_lock.owns_lock()) {
+            submit_lock.lock();
+        }
         Dlssg::Suspend();
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }

@@ -362,6 +362,10 @@ public:
     /// Makes the calling thread the one recording (shutdown from another thread).
     void ClaimRecorder();
 
+    /// sotc: SOTC_TICKWATCH -- samples this scheduler's timeline into SotcStats::tick_ring
+    /// (the presenter starts it on the draw scheduler; the FLIPGAP detector prints it).
+    void StartTickWatch();
+
     /// Waits until the recording thread has put the submit of tick on the queue. Another
     /// thread that queues work waiting for tick on the same queue must call this first: a wait
     /// queued before its signal blocks the queue for good. kick: the recording thread only.
@@ -536,6 +540,9 @@ private:
     tracy::VkCtxScope* profiler_scope{};
     /// Newest tick the recording thread has put on the queue.
     std::atomic<u64> recorded_submit_tick{0};
+    /// sotc: SOTC_TICKWATCH (StartTickWatch); the thread uses work_semaphore, declared above.
+    bool tickwatch{};
+    std::jthread tickwatch_thread;
     /// Last member: stops (after running everything queued) before the rest is destroyed.
     std::unique_ptr<CommandRecorder> recorder;
 };

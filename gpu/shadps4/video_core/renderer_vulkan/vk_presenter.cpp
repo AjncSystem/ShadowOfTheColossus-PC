@@ -106,6 +106,16 @@ bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format for
     return MakeImageBlit(frame_width, frame_height, swapchain_width, swapchain_height, 0, 0);
 }
 
+// sotc: sharpening as the in-game menu set it (sotc_live.h), else as it came in.
+static void ApplyLiveRcas(HostPasses::FsrPass::Settings& settings) {
+    if (const int live = SotcLive::rcas.load(std::memory_order_relaxed); live != -1) {
+        settings.use_rcas = live >= 0;
+        if (live >= 0) {
+            settings.rcas_attenuation = static_cast<float>(live) / 1000.f;
+        }
+    }
+}
+
 static vk::Rect2D FitImage(s32 frame_width, s32 frame_height, s32 swapchain_width,
                            s32 swapchain_height) {
     float frame_aspect = static_cast<float>(frame_width) / frame_height;
@@ -507,6 +517,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
         static_cast<float>(EmulatorSettings.GetRcasAttenuation() / 1000.f);
 
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
+    sharpen_pass.Create(device, instance.GetAllocator(), num_images);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
 
     // sotc: the pipeline cache is read here, once frames can be presented, and blank frames with
@@ -846,14 +857,11 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     if (const int live = SotcLive::fsr1.load(std::memory_order_relaxed); live >= 0) {
         fsr_settings.enable = live != 0;
     }
-    if (const int live = SotcLive::rcas.load(std::memory_order_relaxed); live != -1) {
-        fsr_settings.use_rcas = live >= 0;
-        if (live >= 0) {
-            fsr_settings.rcas_attenuation = static_cast<float>(live) / 1000.f;
-        }
-    }
+    ApplyLiveRcas(fsr_settings);
+    const vk::ImageView game_view = image_view;
     image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
                                  fsr_settings, frame->is_hdr);
+    DebugState.is_using_fsr = image_view != game_view;
 
     // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
     // the post process pass still sRGB encoded and has to be decoded there instead.
@@ -1071,7 +1079,17 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             };
             cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 1,
                                                        .pImageMemoryBarriers = &to_target});
-            pp_pass.Render(cmdbuf, up, {frame->width, frame->height}, *frame, pp_settings);
+            // sotc: the sharpening setting (F1 / launcher) over the upscaler's output too, as RCAS
+            // after FSR 1 (2mg, fork issue #5: it did nothing with FSR 3.1 and DLSS).
+            HostPasses::FsrPass::Settings sharpen{
+                .use_rcas = EmulatorSettings.IsRcasEnabled(),
+                .rcas_attenuation = static_cast<float>(EmulatorSettings.GetRcasAttenuation()) / 1000.f,
+            };
+            ApplyLiveRcas(sharpen);
+            const vk::ImageView shown = sharpen_pass.Render(cmdbuf, up, {frame->width, frame->height},
+                                                            {frame->width, frame->height}, sharpen,
+                                                            frame->is_hdr);
+            pp_pass.Render(cmdbuf, shown, {frame->width, frame->height}, *frame, pp_settings);
             const auto to_general = vk::ImageMemoryBarrier2{
                 .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
                 .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,

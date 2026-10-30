@@ -35,7 +35,7 @@ private:
     };
 
     void ResizeAndInvalidate(u32 width, u32 height);
-    void CreateImages(Img& img) const;
+    void CreateImages(Img& img, bool with_intermediary) const;
     /// sotc: frees the FSR 1 images once the frames recorded with them are done, when the pass
     /// is switched off at run time; CreateImages recreates them if it is switched on again.
     void ReleaseImagesWhenIdle();

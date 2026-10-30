@@ -378,3 +378,9 @@ if (WIN32)
     target_link_libraries(hook-detour-test PRIVATE bbgpu)
 endif()
 
+
+# sotc: SotC Lab autopilot (route spline, JSON round trip). Links only the autopilot; the test
+# stubs SotcFreecam::MaxSpeed itself.
+add_executable(autopilot-test EXCLUDE_FROM_ALL sotc/tests/autopilot_test.cpp sotc/autopilot.cpp)
+target_include_directories(autopilot-test PRIVATE sotc)
+target_compile_options(autopilot-test PRIVATE -UNDEBUG)

@@ -545,11 +545,20 @@ struct DispatchCall {
     uint32_t action{};
 };
 
+// sotc: the guest call a pre handler requested with SetGuestCall (hooks.h). Per thread: the
+// handler and the stub's sotc_hook_take_guest_call run on the same guest thread.
+struct PendingGuestCall {
+    bool set{};
+    uint64_t words[7]{}; // fn, then the six arguments
+};
+thread_local PendingGuestCall t_guest_call;
+
 // Runs on the host stack (runtime_call_on_host_stack). Nothing may escape: a throw would unwind
 // into the guest's frames.
 void RunDispatch(void* arg) {
     auto& call = *static_cast<DispatchCall*>(arg);
     call.action = static_cast<uint32_t>(HookAction::Continue);
+    t_guest_call.set = false;
     try {
         if (call.hook_id >= g_records.size()) {
             return;
@@ -568,6 +577,10 @@ void RunDispatch(void* arg) {
             if (action == HookAction::Return && rec.mode != 0) {
                 action = HookAction::Continue;
             }
+            // sotc: CallGuest needs the call the handler set (hooks.h); the stub runs it.
+            if (action == HookAction::CallGuest && !t_guest_call.set) {
+                action = HookAction::Continue;
+            }
             SotcHookStats::CountPre(call.hook_id, action == HookAction::Return);
             call.action = static_cast<uint32_t>(action);
         } else if (call.phase == static_cast<uint32_t>(Phase::Post)) {
@@ -578,6 +591,10 @@ void RunDispatch(void* arg) {
         }
     } catch (...) {
         call.action = static_cast<uint32_t>(HookAction::Continue);
+    }
+    // A pending call survives only into the CallGuest return it belongs to.
+    if (call.action != static_cast<uint32_t>(HookAction::CallGuest)) {
+        t_guest_call.set = false;
     }
 }
 
@@ -751,4 +768,24 @@ extern "C" uint32_t sotc_hook_dispatch(SotcHooks::GuestRegs* regs, uint32_t hook
     SotcHooks::DispatchCall call{regs, hook_id, phase, 0};
     runtime_call_on_host_stack(SotcHooks::RunDispatch, &call);
     return call.action;
+}
+
+namespace SotcHooks {
+
+void SetGuestCall(uint64_t fn, const uint64_t args[6]) {
+    t_guest_call.words[0] = fn;
+    std::memcpy(&t_guest_call.words[1], args, 6 * sizeof(uint64_t));
+    t_guest_call.set = true;
+}
+
+} // namespace SotcHooks
+
+// Runs on the guest stack from the detour stub (hooks.h). Must not throw: it only copies.
+extern "C" uint32_t sotc_hook_take_guest_call(uint64_t out[7]) {
+    if (!SotcHooks::t_guest_call.set) {
+        return 0;
+    }
+    std::memcpy(out, SotcHooks::t_guest_call.words, sizeof(SotcHooks::t_guest_call.words));
+    SotcHooks::t_guest_call.set = false;
+    return 1;
 }

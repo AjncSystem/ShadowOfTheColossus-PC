@@ -135,7 +135,8 @@ RENDER_SITES = [
 RT_POOL = 0x14280000
 # EU 1.01 / US 1.00: the command line lea and the fps60 site.
 VERSION_CHECKS = [(CMDLINE_LEA, bytes.fromhex('488d352debad00')), (0x01390090, bytes.fromhex('ff25a20567'))]
-CVAR = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*(=[-+.0-9A-Za-z_%]+)?$')  # NAME=VALUE or a flag such as nointro
+# NAME=VALUE, a flag such as nointro, or a command with arguments such as automate_loadfile(route_bossjump.txt)
+CVAR = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*(\([^\s()]*\))?(=[-+.0-9A-Za-z_%]+)?$')
 
 
 def image_bytes(elf, ph, vaddr, length):

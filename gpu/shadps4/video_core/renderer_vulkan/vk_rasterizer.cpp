@@ -42,6 +42,7 @@
 #include "video_core/sotc_op_phases.h" // sotc: SOTC_OP_PHASES
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/sotc_stats.h"
+#include "../../../sotc/sotc_live.h" // sotc: live switches (SotcLive)
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
@@ -1564,10 +1565,8 @@ void Rasterizer::NoteUiShadow() {
 // fast bind (same pipeline, push data, targets and resources), and its arguments directly follow
 // the first's in the same buffer, in the same submit. Counts the run lengths; every 5 s one line.
 namespace {
-const bool kMdiStats = [] {
-    const char* v = std::getenv("SOTC_MDI_STATS");
-    return v && v[0] == '1';
-}();
+// sotc: live (SotcLive): read on every draw.
+SotcLive::Int kMdiStats{"SOTC_MDI_STATS", 0};
 struct MdiState {
     const void* pipeline = nullptr;
     VAddr base = 0;
@@ -1593,7 +1592,7 @@ void MdiCloseRun() {
     g_mdi.run = 0;
 }
 void MdiBreak() { // a direct draw or a dispatch ends the run
-    if (kMdiStats) {
+    if (kMdiStats.get()) {
         MdiCloseRun();
     }
 }
@@ -1650,10 +1649,8 @@ void MdiNote(const void* pipeline, bool indexed, VAddr base, u64 offset, u32 str
 // those how many also saw no buffer/texture/memory change in between in the same command buffer
 // ("clean": what a fast bind could skip), or repeat any key bound earlier in the same command
 // buffer ("seen"); and how much time BindResources takes for each group. One line every 5 s.
-const bool kCsStats = [] {
-    const char* v = std::getenv("SOTC_CS_STATS");
-    return v && v[0] == '1';
-}();
+// sotc: live (SotcLive): read on every compute dispatch.
+SotcLive::Int kCsStats{"SOTC_CS_STATS", 0};
 struct CsStatsState {
     u64 prev_key = 0, prev_gen = 0, tick = ~u64{0};
     bool prev_ok = false;
@@ -2049,7 +2046,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         SotcStats::Drop(1, liverpool->DrawRegs().color_buffers[0].Address(), 1);
         return;
     }
-    if (kMdiStats) { // sotc: SOTC_MDI_STATS (fast_bind_hit is this draw's, set by BindResources)
+    if (kMdiStats.get()) { // sotc: SOTC_MDI_STATS (fast_bind_hit is this draw's, set by BindResources)
         MdiNote(pipeline, is_indexed, arg_address, offset, stride, max_count, count_address,
                 fast_bind_hit, buffer_cache.IsRegionGpuModified(arg_address + offset, stride),
                 scheduler.CurrentTick());
@@ -2411,7 +2408,7 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
     u64 cs_res_key = 0;
     u64 cs_gen = 0, cs_tick = 0;
     std::chrono::steady_clock::time_point cs_t0{};
-    if (kCsStats) {
+    if (kCsStats.get()) {
         cs_key_ok = CsStatsKey(pipeline, cs_key, cs_writes);
         cs_res_ok = BindResourceHash(pipeline, cs_res_key);
         cs_tick = scheduler.CurrentTick();
@@ -2422,7 +2419,7 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
         cs_t0 = std::chrono::steady_clock::now();
     }
     const bool cs_bound = BindResources(pipeline);
-    if (kCsStats) {
+    if (kCsStats.get()) {
         const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - cs_t0)
                             .count();
@@ -2489,7 +2486,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
     u64 cs_res_key = 0;
     u64 cs_gen = 0, cs_tick = 0;
     std::chrono::steady_clock::time_point cs_t0{};
-    if (kCsStats) {
+    if (kCsStats.get()) {
         cs_key_ok = CsStatsKey(pipeline, cs_key, cs_writes);
         cs_res_ok = BindResourceHash(pipeline, cs_res_key);
         cs_tick = scheduler.CurrentTick();
@@ -2500,7 +2497,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
         cs_t0 = std::chrono::steady_clock::now();
     }
     const bool cs_bound = BindResources(pipeline);
-    if (kCsStats) {
+    if (kCsStats.get()) {
         const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - cs_t0)
                             .count();
@@ -2866,10 +2863,8 @@ static bool SamePreparedResources(const PreparedResources& a, const PreparedReso
 // are printed every 5 s. "epoch" alone means nothing the draw binds changed, only the global
 // mem_epoch counter that any write anywhere bumps (memory_tracker.h, NoteHostWrite).
 namespace {
-const bool kBindDiff = [] {
-    const char* v = std::getenv("SOTC_BIND_DIFF");
-    return v && v[0] == '1';
-}();
+// sotc: live (SotcLive): read on every draw that misses the bind shortcut.
+SotcLive::Int kBindDiff{"SOTC_BIND_DIFF", 0};
 enum BindDiffBit : u32 {
     BdInvalid = 1, BdPipeline = 2, BdBufGen = 4, BdTexGen = 8, BdStreamGen = 16, BdEpoch = 32,
     BdHash = 64, BdTick = 128,
@@ -3040,7 +3035,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline, const PreparedDraw* pre
             fast_bind.stream_generation == buffer_cache.StreamGeneration() &&
             fast_bind.mem_epoch == SotcStats::mem_epoch.load(std::memory_order_relaxed) &&
             fast_bind.hash == fast_hash;
-        if (kBindDiff) { // sotc: SOTC_BIND_DIFF: which conditions failed
+        if (kBindDiff.get()) { // sotc: SOTC_BIND_DIFF: which conditions failed
             u32 mask = 0;
             if (!fast_bind.valid) {
                 mask = BdInvalid;

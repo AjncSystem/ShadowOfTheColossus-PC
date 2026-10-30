@@ -15,6 +15,7 @@
 #include <unordered_map>
 #include <semaphore>
 #include <span>
+#include <string>
 #include <thread>
 #include <vector>
 #include <queue>
@@ -45,6 +46,10 @@ struct VideoOutPort;
 namespace AmdGpu {
 
 struct PM4CmdWaitRegMem; // sotc: pm4_cmds.h (EopShadowSatisfies)
+
+// sotc: SOTC_CP_LABEL_SKIP report line (liverpool.cpp), appended every 5 s while the switch is on:
+// waits that did not pass at once, skippable ones, skipped ones (mode 2 counts only).
+void ReportCpLabelSkip(std::string& out, double seconds);
 
 // sotc: SOTC_EOP_TICK statistics (liverpool.cpp), printed under SOTC_FPS.
 extern std::atomic<u64> g_eop_written, g_eop_latency_ns, g_eop_max_latency_ns, g_eop_flushes;
@@ -339,7 +344,106 @@ public:
     }
 #endif
 
+    /// sotc: SOTC_DROP_FAST guard. True when [addr, addr + size) overlaps a command buffer the
+    /// command processor has not finished reading (CmdRanges below). Any thread.
+    bool CmdRangeInUse(VAddr addr, u64 size) const {
+        // A submit whose walk hit a cap has incomplete ranges: fail closed while one is in flight.
+        return cmd_overflow_live.load(std::memory_order_acquire) != 0 ||
+               cmd_ranges.Intersects(addr, size);
+    }
+
 private:
+    /// sotc: SOTC_DROP_FAST guard (CmdRangeInUse). The guest ranges the command processor still
+    /// reads: each submitted command buffer until its task finishes (SubmitGfx/SubmitAsc to the
+    /// pop in Process), and each nested indirect buffer while it is parsed (CmdRangeGuard). An
+    /// unmap that skips the wait for the command processor must not free one of them: the parser
+    /// would read unmapped (zero) memory and stop on "Unimplemented PM4 type 0". A handful of
+    /// entries at a time; one small mutex, taken after GpuQueue::m_access when both are held.
+    class CmdRanges {
+    public:
+        /// Only SOTC_DROP_FAST reads the ranges; with it unset nothing is recorded.
+        static bool Enabled() {
+            static const bool on = [] {
+                const char* v = std::getenv("SOTC_DROP_FAST");
+                return v && v[0] == '1';
+            }();
+            return on;
+        }
+        void Add(const void* data, u64 bytes) {
+            if (!Enabled() || data == nullptr || bytes == 0) {
+                return;
+            }
+            std::scoped_lock lock{mutex};
+            ranges.emplace_back(reinterpret_cast<VAddr>(data), bytes);
+        }
+        void Remove(const void* data, u64 bytes) {
+            if (!Enabled() || data == nullptr || bytes == 0) {
+                return;
+            }
+            const VAddr addr = reinterpret_cast<VAddr>(data);
+            std::scoped_lock lock{mutex};
+            for (auto it = ranges.begin(); it != ranges.end(); ++it) {
+                if (it->first == addr && it->second == bytes) {
+                    *it = ranges.back();
+                    ranges.pop_back();
+                    return;
+                }
+            }
+        }
+        bool Intersects(VAddr addr, u64 size) const {
+            // Ends saturate at the top of the address space, so a wrapping range overlaps
+            // everything above its start instead of nothing.
+            const auto end_of = [](VAddr at, u64 n) -> VAddr {
+                return n > ~VAddr{0} - at ? ~VAddr{0} : at + n;
+            };
+            const VAddr end = end_of(addr, size);
+            std::scoped_lock lock{mutex};
+            for (const auto& [lo, bytes] : ranges) {
+                if (addr < end_of(lo, bytes) && lo < end) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+    private:
+        mutable std::mutex mutex;
+        std::vector<std::pair<VAddr, u64>> ranges;
+    };
+    /// sotc: holds a nested indirect buffer in CmdRanges while its task is parsed (a local of the
+    /// parent coroutine, so it lives across the parent's yields).
+    struct CmdRangeGuard {
+        CmdRangeGuard(CmdRanges& ranges_, const void* data_, u64 bytes_)
+            : ranges{ranges_}, data{data_}, bytes{bytes_} {
+            ranges.Add(data, bytes);
+        }
+        ~CmdRangeGuard() {
+            ranges.Remove(data, bytes);
+        }
+        CmdRangeGuard(const CmdRangeGuard&) = delete;
+        CmdRangeGuard& operator=(const CmdRangeGuard&) = delete;
+        CmdRanges& ranges;
+        const void* data;
+        u64 bytes;
+    };
+    CmdRanges cmd_ranges;
+    /// sotc: submits in flight whose walk hit a cap (SubmitRanges::overflowed). CmdRangeInUse
+    /// answers true while this is not zero.
+    std::atomic<u32> cmd_overflow_live{0};
+    /// The CmdRanges entries of one submit: the DCB and CCB (or the ACB slice), plus every nested
+    /// indirect buffer they call, found at submit time (CollectNestedIbs). overflowed: a cap of
+    /// the walk was hit, so the list may miss ranges.
+    struct SubmitRanges {
+        std::vector<std::pair<const void*, u64>> list;
+        bool overflowed{};
+    };
+    /// sotc: SOTC_DROP_FAST guard. Walks a command buffer's packets at submit time and appends
+    /// the ranges of the indirect buffers it calls (recursively, capped), so they are guarded from
+    /// the submit on and not only once the parser reaches them (reports2/01-cmdbuf-lifetime.md).
+    /// Nested buffers whose memory is not mapped are skipped (counted); a repeated one is walked
+    /// once per submit.
+    static void CollectNestedIbs(std::span<const u32> cb, SubmitRanges& out, u32 depth);
+
     struct Task {
         struct promise_type {
             auto get_return_object() {
@@ -396,6 +500,7 @@ private:
         std::vector<u32> dcb_buffer;
         std::vector<u32> ccb_buffer;
         std::queue<Task::Handle> submits{};
+        std::queue<SubmitRanges> submit_ranges{}; ///< sotc: CmdRanges entries, in step with submits
         ComputeProgram cs_state{};
         // sotc: lock-free hint for Process()'s round-robin so it can skip m_access entirely for
         // queues with nothing queued, instead of locking every queue every pass just to find
@@ -596,7 +701,9 @@ private:
     /// for the pipeline workers (see Vulkan::PipelineCache::ComputePrefetchEnabled).
     void PrefetchComputeAhead(std::span<const u32> rest);
     BackOp& BackAlloc();
-    void BackPublish(bool writes_memory);
+    /// gpu_write: the op writes guest memory on the GPU even when writes_memory is false (a
+    /// pipeline that may write, with SOTC_CP_STRICT off). Feeds back_gpu_write_seq only.
+    void BackPublish(bool writes_memory, bool gpu_write = false);
     void CaptureBackOp(BackOp& op, const Vulkan::Pipeline* pipeline);
     /// Before reading guest memory the queued work may write (pipeline lookups read the SRTs):
     /// waits for the last queued op that writes guest memory from the CPU (WRITE_DATA, DMA), or
@@ -691,6 +798,11 @@ private:
     std::condition_variable back_cv;
     std::condition_variable drain_cv;
     u64 back_write_seq{0};
+    /// sotc: SOTC_CP_LABEL_SKIP. back_head of the newest publish that may write guest memory on
+    /// the GPU or the CPU (every writes_memory publish, every pipeline that may write, and every
+    /// non-recorded label). Recorded labels do not count: a skipped wait is for one of them.
+    /// Always >= back_write_seq.
+    u64 back_gpu_write_seq{0};
     Regs back_regs{};
     ComputeProgram back_cs{};
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> back_cb_extent{};
@@ -746,6 +858,38 @@ private:
     std::atomic<u32> eop_shadow_count{0};
     /// sotc: true when the pending value of a queued label satisfies this wait.
     bool EopShadowSatisfies(const PM4CmdWaitRegMem& wait);
+
+    // sotc: SOTC_CP_LABEL_SKIP=1 (skip) or 2 (count only), off by default. A WAIT_REG_MEM on a
+    // label this command processor queued earlier is treated as satisfied while the draw thread
+    // has not run that label yet, when the label's value satisfies the wait. Only labels of the
+    // same queue count, and only while no other queued op came after them (label_barrier). The
+    // CP-side records below are touched by the command processor thread only.
+    static constexpr u32 LabelQueues = 8;   ///< 0 graphics, 1 + vqid for compute (vqid < 7)
+    static constexpr u32 LabelRecs = 8;     ///< newest queued labels kept per queue
+    struct LabelRec {
+        VAddr addr{};
+        u32 value{};
+        u64 seq{}; ///< back_head after the label was published (0: empty slot)
+    };
+    u8 label_skip{};                                   ///< 0 off, 1 skip, 2 count only
+    /// back_head of the newest publish that is not a recorded label of queue q.
+    std::array<u64, LabelQueues> label_barrier{};
+    std::array<std::array<LabelRec, LabelRecs>, LabelQueues> label_recs{};
+    std::array<u32, LabelQueues> label_next{};
+    static u32 LabelQueueOf(u32 vqid) {
+        return vqid + 1 < LabelQueues ? vqid + 1 : LabelQueues;
+    }
+    /// Records a label the queue just published (prev_barrier: label_barrier[q] before it).
+    /// recordable false: the publish stays a barrier for every label of q.
+    void NoteQueuedLabel(u32 q, u64 prev_barrier, bool recordable, VAddr addr, bool dword64,
+                         u32 lo, u32 hi);
+    /// label_barrier[q] as it is after the FlushWd that QueueBackFunc may run before the label
+    /// op (that flush is a publish too). Command processor thread, before BackOrRun.
+    u64 LabelPrevBarrier(u32 q);
+    /// True when the wait on a not-yet-satisfied label may be treated as satisfied: the queued
+    /// ops that may write guest memory (back_gpu_write_seq) are waited for first. Mode 2: counts,
+    /// returns false.
+    bool LabelWaitSkip(u32 q, const PM4CmdWaitRegMem& wait, bool vo_label);
     /// A EopService call is queued on the draw thread and has not run yet.
     std::atomic<bool> eop_service_requested{false};
 

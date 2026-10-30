@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <span>
 #include <vector>
 #include <unordered_map>
@@ -794,6 +795,8 @@ private:
     u64 untrack_applied{0};  // sotc: SOTC_UNTRACK_AUTO, the published list version applied last
     u64 class_shadow_version{0}; // sotc: SOTC_CLASS_TRACK=2, the classified version counted last
     u64 class_shadow_tick{0};    // sotc: SOTC_CLASS_TRACK=2, periodic recount counter
+    u64 class_pub_version{~0ULL}; // sotc: SOTC_CLASS_TRACK=1, the classification version published last
+    u32 class_pub_wait{30};       // sotc: SOTC_CLASS_TRACK=1, syncs since the last publish (at most 1 per 30)
     std::vector<std::pair<VAddr, u64>> dma_spans;
     /// Readback windows requested recently; downloaded together with the next readback.
     struct HotReadback {
@@ -1020,5 +1023,39 @@ public:
     /// From BeginAsyncReadback: true when the submit was left to the scope.
     static bool Defer(Vulkan::Scheduler& scheduler);
 };
+
+/// sotc: SOTC_FPS (B6). The guest instruction whose read fault is being served on this thread
+/// (PageManager::HandleGuestFault sets it around its ReadMemory call; 0 otherwise). ReadMemory
+/// counts the readbacks it waits for under it (NoteReadbackRip, buffer_cache.cpp).
+namespace SotcFaultRip {
+inline thread_local u64 current = 0;
+
+/// Sets current to rip for the scope when rip is not 0; restores the previous value on exit.
+class Scope {
+public:
+    explicit Scope(u64 rip) noexcept : set_{rip != 0}, prev_{set_ ? current : 0} {
+        if (set_) {
+            current = rip;
+        }
+    }
+    ~Scope() {
+        if (set_) {
+            current = prev_;
+        }
+    }
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+
+private:
+    bool set_;
+    u64 prev_;
+};
+} // namespace SotcFaultRip
+
+/// sotc: SOTC_FPS (B6). Appends the guest instructions (eboot offsets) with the most readbacks in
+/// the window to out, and resets the window. seconds = the window length. Counts the readbacks
+/// that wait for the GPU on the async path (SOTC_RB_ASYNC, the default); the sync path is not
+/// counted. Nothing is kept unless SOTC_FPS is set.
+void ReportReadbackRips(std::string& out, double seconds);
 
 } // namespace VideoCore

@@ -10,7 +10,9 @@
 #include <thread>
 #include <unordered_set>
 #include <boost/container/small_vector.hpp>
+#include <deque>
 #include <queue>
+#include <string>
 #include <tsl/robin_map.h>
 
 #include "common/lru_cache.h"
@@ -23,6 +25,7 @@
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_prefetch.h"
 #include "video_core/texture_cache/image_view.h"
+#include "../../../sotc/area_prewarm.h" // sotc: SOTC_AREA_PREWARM replay records
 #include "video_core/texture_cache/sampler.h"
 #include "video_core/texture_cache/tile_manager.h"
 
@@ -51,6 +54,51 @@ inline u32 MipTailMode() {
     }();
     return mode;
 }
+
+/// sotc: B4 (SOTC_FPS): why an image leaves the cache (FreeImage) or is parked (ParkImage). Each
+/// reason has a counter, printed every 5 s by TextureCache::ReportImageFrees.
+enum class ImageLeave : u32 {
+    Unmap,          ///< UnmapMemory: the guest unmapped the range (report 13)
+    OverlapBlock,   ///< ResolveOverlap, equal address, other block size or dimensions (a pool)
+    OverlapReuse,   ///< ResolveOverlap, equal address, other texture size (SOTC_REUSE_SIZE_CHECK)
+    OverlapTiling,  ///< ResolveOverlap, equal address, other tile mode
+    OverlapChance,  ///< ResolveOverlap, the cached image lies on the right: a chance overlap
+    OverlapRtSub,   ///< ResolveOverlap, left side: a render target subresource
+    OverlapCopyMip, ///< ResolveOverlap, left side: a subresource copied into the merged image
+    Expand,         ///< ExpandImage: replaced by a larger image
+    ResolveFail,    ///< FindImage: the resolved image has too few resources
+    Emergency,      ///< EmergencyCollect
+    Routine,        ///< GarbageCollectImages (routine pass or pressure)
+    MipTail,        ///< FreeRebased: mip tails (SOTC_MIP_TAIL)
+    DepthNoTwin,    ///< ResolveDepthOverlap with SOTC_DEPTH_TWIN=0
+    DepthTwin,      ///< ParkImage: depth/colour twin (a park, not a free)
+    UnmapPark,      ///< ParkImage: parked by UnmapMemory (SOTC_UNMAP_PARK=1, a park, not a free)
+    Count,
+};
+inline constexpr size_t NumImageLeave = static_cast<size_t>(ImageLeave::Count);
+
+/// sotc: SOTC_UNMAP_PARK (C5): 0 off (default). 1: UnmapMemory parks the idle images of the range
+/// (ParkImage) and FindImage re-arms a parked image with the same address and shape instead of
+/// creating one. 2: log only, counts what 1 would park and re-arm; nothing else changes.
+inline u32 UnmapParkMode() {
+    static const u32 mode = [] {
+        const char* v = std::getenv("SOTC_UNMAP_PARK");
+        return v && (v[0] == '1' || v[0] == '2') ? static_cast<u32>(v[0] - '0') : 0u;
+    }();
+    return mode;
+}
+/// sotc: SOTC_UNMAP_PARK_MB (default 128): the video memory the parked images may hold.
+inline u64 UnmapParkBudget() {
+    static const u64 bytes = [] {
+        const char* v = std::getenv("SOTC_UNMAP_PARK_MB");
+        return (v ? std::strtoull(v, nullptr, 10) : 128ull) << 20;
+    }();
+    return bytes;
+}
+/// sotc: the most parked images (and the most shapes mode 2 remembers); the oldest go first.
+inline constexpr size_t UnmapParkMaxImages = 256;
+/// sotc: parked images older than this many GC ticks are reclaimed (GarbageCollectImages).
+inline constexpr u64 UnmapParkMaxAgeTicks = 300;
 
 /// sotc: the texture cache lock, re-entrant on its owner thread. The command processor holds it
 /// over a whole binding pass (Rasterizer::BindTextures, BeginRendering, PrepareRenderState), so the
@@ -413,6 +461,17 @@ public:
     /// now: SotcStats::NowNs() read once per draw by the caller.
     void PrefetchTexture(const AmdGpu::Image& tsharp, const Shader::ImageResource& resource,
                          u64 now);
+    /// sotc: SOTC_AREA_PREWARM=3 (area_prewarm.h): creates ahead the images of the area that just
+    /// became current. Called by PrefetchTexture while a replay is pending or under way; same thread,
+    /// no cache lock. Time-boxed: a few records (about 1 ms) per call, the rest on the next calls.
+    void ReplayAreaImages();
+
+    /// sotc: B4 (SOTC_FPS): appends one line per window: the images freed and parked by reason since
+    /// the last call, the registrations, and the change in the cache count they imply (nothing
+    /// is appended with SOTC_FPS unset).
+    static void ReportImageFrees(std::string& out, double seconds);
+    /// sotc: C5 (SOTC_UNMAP_PARK): appends one line per window since the last call (mode 1 or 2).
+    static void ReportUnmapPark(std::string& out, double seconds);
 
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
@@ -738,17 +797,42 @@ private:
     /// Touch the image in the LRU cache.
     void TouchImage(const Image& image);
 
-    void FreeImage(ImageId image_id) {
+    void FreeImage(ImageId image_id, ImageLeave why) {
+        if (SotcStats::kFpsLog) { // sotc: B4, the image leaves the cache
+            image_frees[static_cast<size_t>(why)].fetch_add(1, std::memory_order_relaxed);
+        }
         UntrackImage(image_id);
         UnregisterImage(image_id);
         DeleteImage(image_id);
     }
 
-    /// sotc: depth/colour twins (ResolveDepthOverlap). Park: what FreeImage does except the
-    /// reclaim of the slot and its Vulkan objects. Unpark: registers it again as if new.
-    void ParkImage(ImageId image_id);
+    /// sotc: depth/colour twins (ResolveDepthOverlap) and unmapped images parked by SOTC_UNMAP_PARK.
+    /// Park: what FreeImage does except the reclaim of the slot and its Vulkan objects. Unpark:
+    /// registers it again as if new.
+    void ParkImage(ImageId image_id, ImageLeave why);
     void UnparkImage(ImageId image_id);
     void ReclaimImage(ImageId image_id);
+
+    /// sotc: B4 counters (SOTC_FPS), read and reset by ReportImageFrees.
+    static inline std::array<std::atomic<u64>, NumImageLeave> image_frees{};
+    static inline std::array<std::atomic<u64>, NumImageLeave> image_parks{};
+    static inline std::atomic<u64> image_registers{};
+    /// sotc: C5 counters (SOTC_UNMAP_PARK), read and reset by ReportUnmapPark. The two gauges are
+    /// the parked set as of its last change.
+    static inline std::atomic<u64> unmap_parks{}, unmap_rearms{}, unmap_evicts{};
+    static inline std::atomic<u64> unmap_stale_avoided{}, unmap_would_park{}, unmap_would_rearm{};
+    static inline std::atomic<u64> unmap_parked_now{}, unmap_parked_now_bytes{};
+    /// sotc: C5 (SOTC_UNMAP_PARK, cache lock held). ParkUnmapped parks an image UnmapMemory is
+    /// about to free (mode 1; mode 2 only remembers its shape and returns false). TakeUnmapParked
+    /// re-arms the parked image of `info`'s address and shape, or returns an empty id.
+    /// EvictOldestUnmapParked reclaims the oldest; DropUnmapParked all (EmergencyCollect).
+    bool ParkUnmapped(ImageId image_id, u32 park_mode);
+    ImageId TakeUnmapParked(const ImageInfo& info);
+    void EvictOldestUnmapParked();
+    void DropUnmapParked();
+    void SyncUnmapParkGauges();
+    void ShadowNoteUnmapped(const ImageInfo& info);
+    void ShadowTake(const ImageInfo& info);
 
     void GarbageCollectImages();
 
@@ -860,6 +944,21 @@ private:
     /// sotc: SOTC_ASYNC_IMAGE_CREATE (null when off). Declared last: destroyed first, so its
     /// workers stop and the images nobody took are freed while everything else still exists.
     std::unique_ptr<ImagePrefetcher> image_prefetcher;
+    /// sotc: SOTC_AREA_PREWARM=3 replay of the current area (command processor thread only): its
+    /// records, the next one to process, and the guest bytes accepted so far (the area's budget).
+    std::vector<SotcAreaPrewarm::ImageRecord> replay_records;
+    size_t replay_next{};
+    u64 replay_accepted{};
+    /// sotc: SOTC_UNMAP_PARK (C5): the parked images, oldest first (unregistered, Vulkan objects
+    /// kept; `bytes` is their VRAM), and the shapes mode 2 would have parked.
+    struct UnmapParked {
+        ImageId id{};
+        u64 bytes{};
+        u64 tick{}; // gc_tick at the park
+    };
+    std::deque<UnmapParked> unmap_parked;
+    u64 unmap_parked_bytes{};
+    std::deque<ImageInfo> unmap_shadow;
 };
 
 } // namespace VideoCore

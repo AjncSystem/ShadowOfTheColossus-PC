@@ -23,8 +23,12 @@
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/sotc_stats.h"
+#include "video_core/sotc_trace.h" // sotc: SOTC_FPS readbacks by guest RIP (B6)
 #include "video_core/sotc_op_phases.h" // sotc: SOTC_OP_PHASES
 #include "../../../sotc/mem_classes.h"  // sotc: SOTC_CLASS_TRACK (plan step 6)
+#include "../../../sotc/sotc_live.h" // sotc: live switches (SotcLive)
+// sotc: SOTC_RB_SPIN_US (default 150 us), live (SotcLive): see the readback wait below.
+SotcLive::Int kRbSpinUs{"SOTC_RB_SPIN_US", 150};
 #include "video_core/sotc_adaptive.h"
 #include "video_core/sotc_write_extent.h"
 #include "video_core/buffer_cache/bpe_heap_guard.h"
@@ -581,10 +585,19 @@ void BufferCache::DropGpuModified(VAddr device_addr, u64 size) {
         // sotc: SOTC_RB_EXACT: owed bytes are trimmed by the drop on the draw thread.
         gpu_ranges = gpu_ranges || (rbx_owed_count.load(std::memory_order_relaxed) != 0 &&
                                     RbxOwedIntersects(device_addr, size));
-        if (!gpu_ranges) {
+        // sotc: the wait below also kept the range mapped until the command processor had read
+        // the command buffers queued before the unmap. Skipping it while one of them lies in the
+        // range let the parser read unmapped memory and stop on a zero packet (2 load sessions
+        // of 29 Oct, one of them crashed). Such a range takes the waiting path.
+        const bool cmd_in_use = !gpu_ranges && liverpool->CmdRangeInUse(device_addr, size);
+        if (cmd_in_use) {
+            SotcStats::drop_fast_guarded.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (!gpu_ranges && !cmd_in_use) {
             EraseGranuleSnapshots(device_addr, size);
             if (memory_tracker->MarkCpuModifiedUnlessGpu(device_addr, size)) {
                 SotcStats::drop_fast.fetch_add(1, std::memory_order_relaxed);
+                SotcStats::NoteFastDrop(device_addr, size); // diagnostics for a bad packet
                 return;
             }
         }
@@ -872,6 +885,106 @@ void BufferCache::NoteGuestReadbackDone(const AsyncReadback& readback) {
     }
 }
 
+namespace {
+
+// sotc: SOTC_FPS (B6). The readbacks that wait for the GPU, by the guest instruction whose read
+// fault caused them (SotcFaultRip::current), keyed by eboot offset. At most kRipRows distinct
+// offsets are kept; the rest count as overflow. A mutex: only under SOTC_FPS, and a readback is far
+// slower than the lock.
+constexpr size_t kRipRows = 512;
+struct RipRow {
+    u64 count{};
+    u64 bytes{};
+};
+struct RipTable {
+    std::mutex mutex;
+    std::unordered_map<u64, RipRow> rows;
+    u64 overflow{}; // readbacks at offsets past kRipRows
+    u64 outside{};  // readbacks whose RIP is not in the eboot image
+};
+
+RipTable& Table() {
+    static RipTable table;
+    return table;
+}
+
+// One readback made under the guest instruction rip. rip 0 is no guest read fault: not counted.
+void NoteReadbackRip(u64 rip, u64 size) {
+    if (rip == 0) {
+        return;
+    }
+    RipTable& t = Table();
+    const u64 base = SotcTrace::ImageBase();
+    const u64 image_size = SotcTrace::ImageSize();
+    std::scoped_lock lock{t.mutex};
+    if (!base || rip < base || rip - base >= image_size) {
+        ++t.outside;
+        return;
+    }
+    const u64 offset = rip - base;
+    auto it = t.rows.find(offset);
+    if (it == t.rows.end()) {
+        if (t.rows.size() >= kRipRows) {
+            ++t.overflow;
+            return;
+        }
+        it = t.rows.emplace(offset, RipRow{}).first;
+    }
+    ++it->second.count;
+    it->second.bytes += size;
+}
+
+} // namespace
+
+void ReportReadbackRips(std::string& out, double seconds) {
+    if (!SotcStats::kFpsLog) {
+        return;
+    }
+    const double per_second = seconds > 0 ? 1.0 / seconds : 1.0;
+    RipTable& t = Table();
+    std::vector<std::pair<u64, RipRow>> rows;
+    u64 overflow = 0;
+    u64 outside = 0;
+    {
+        std::scoped_lock lock{t.mutex};
+        rows.assign(t.rows.begin(), t.rows.end());
+        t.rows.clear();
+        overflow = t.overflow;
+        outside = t.outside;
+        t.overflow = 0;
+        t.outside = 0;
+    }
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+        return a.second.count != b.second.count ? a.second.count > b.second.count
+                                                : a.first < b.first;
+    });
+    u64 total = 0;
+    for (const auto& row : rows) {
+        total += row.second.count;
+    }
+    char line[256];
+    std::snprintf(line, sizeof(line),
+                  "SOTC READBACK RIPS: %.1f readbacks/s (waited for the GPU) at %zu guest "
+                  "instructions; top 12 by readbacks, eboot offsets\n",
+                  double(total) * per_second, rows.size());
+    out += line;
+    for (size_t i = 0; i < rows.size() && i < 12; ++i) {
+        std::snprintf(line, sizeof(line), "  eboot+0x%llx %.1f readbacks/s %.1f KB/s\n",
+                      static_cast<unsigned long long>(rows[i].first),
+                      double(rows[i].second.count) * per_second,
+                      double(rows[i].second.bytes) * per_second / 1024.0);
+        out += line;
+    }
+    if (overflow || outside) {
+        std::snprintf(line, sizeof(line),
+                      "  not listed: %llu at other offsets (table full), %llu outside the eboot "
+                      "image\n",
+                      static_cast<unsigned long long>(overflow),
+                      static_cast<unsigned long long>(outside));
+        out += line;
+    }
+}
+
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
     // sotc: SOTC_RB_STREAM=1: a guest thread whose faults walk GPU-written memory in sequence
     // (loading a new area, the game copies hundreds of MB the GPU wrote, while it holds a lock the
@@ -971,6 +1084,11 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         }
         return;
     }
+    // sotc: SOTC_FPS (B6): this readback waits for the GPU; counted under the guest instruction
+    // of the read fault that asked for it (SotcFaultRip, page_manager.cpp).
+    if (SotcStats::kFpsLog) {
+        NoteReadbackRip(SotcFaultRip::current, size);
+    }
     if (split) {
         SotcStats::split_ticks[SotcStats::SplitRbCount].fetch_add(1, std::memory_order_relaxed);
     }
@@ -997,11 +1115,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     // timeline counter for SOTC_RB_SPIN_US (default 150) before blocking: the copy is short once
     // the writer tick is done, and waking from a blocking wait costs about as much.
     if (readback.wait_xfer != 0) {
-        static const u32 rb_spin_us = [] {
-            const char* v = std::getenv("SOTC_RB_SPIN_US");
-            return v ? static_cast<u32>(std::strtoul(v, nullptr, 10)) : 150u;
-        }();
-        scheduler.XferWaitValue(readback.wait_xfer, rb_spin_us);
+        // Live (SotcLive): read on each wait.
+        scheduler.XferWaitValue(readback.wait_xfer,
+                                static_cast<u32>(std::max(kRbSpinUs.get(), 0)));
     }
     split_part(SotcStats::SplitRbGpu);
     if (wait_observer && readback.wait_seq != 0) {
@@ -5929,6 +6045,45 @@ void BufferCache::SynchronizeDmaBuffers() {
     }
     const SotcStats::FrameTimer frame_timer{SotcStats::FrameDma};
     fault_process_pending = true;
+    // sotc: SOTC_CLASS_TRACK=1 apply (plan step 6). The CPU-only ranges of the apply pools
+    // (SOTC_CLASS_POOLS) are published through SotcUntrack when the classification changed and at
+    // least 30 syncs passed since the last publish. The SOTC_UNTRACK_AUTO apply below takes the list
+    // (AutoOn() is true in this mode), so it runs in this same sync. GPU-written pages are never kept
+    // untracked (RegionManager), and the self-check trips and releases everything on a bad fault.
+    if (SotcMemClasses::On()) {
+        SotcMemClasses::RefreshLookup(); // the write-fault lookup (both modes), cheap when unchanged
+    }
+    if (SotcMemClasses::Mode() == 1) {
+        if (class_pub_wait < 30) {
+            ++class_pub_wait;
+        }
+        if (class_pub_wait >= 30 && SotcMemClasses::Version() != class_pub_version) {
+            u64 version = 0;
+            const auto cls = SotcMemClasses::ApplyRanges(version);
+            std::vector<VideoCore::SotcUntrack::Range> list;
+            list.reserve(cls.size());
+            std::array<u64, SotcMemClasses::kMaxPools> image_ranges{};
+            for (const auto& r : cls) {
+                // sotc: an image in the range is written by the GPU without region GPU bits
+                // (render targets, storage images): keep such a range tracked.
+                if (texture_cache.HasImageInRange(r.addr, r.size)) {
+                    ++image_ranges[std::min<u32>(r.pool, SotcMemClasses::kMaxPools - 1)];
+                    continue;
+                }
+                list.push_back(VideoCore::SotcUntrack::Range{r.addr, r.size});
+            }
+            for (u32 pool = 0; pool < SotcMemClasses::kMaxPools; ++pool) {
+                SotcMemClasses::NoteImageRanges(pool, image_ranges[pool]);
+            }
+            VideoCore::SotcUntrack::PublishClass(std::move(list));
+            SotcMemClasses::NotePublish(VideoCore::SotcUntrack::AutoRanges(),
+                                        VideoCore::SotcUntrack::AutoBytes());
+            class_pub_version = version;
+            class_pub_wait = 0;
+        }
+        SotcMemClasses::NoteApplyState(VideoCore::SotcUntrack::Tripped(),
+                                       VideoCore::SotcUntrack::FaultsUntracked());
+    }
     // sotc: SOTC_UNTRACK_AUTO. A chunk list the flip thread published (SotcUntrack::Publish) is
     // applied before the sweep, so the words it raises are swept by this call. Only a new version
     // is applied; a trip publishes an empty list, which clears every mask.
@@ -5965,6 +6120,13 @@ void BufferCache::SynchronizeDmaBuffers() {
                 const u64 pages = memory_tracker->CountClassGpuPages(by_pool[pool]);
                 SotcMemClasses::NoteShadowPool(pool, pages);
                 gpu_pages += pages;
+                // sotc: images do not set region GPU bits, so count the ranges they overlap apart
+                // (a non-zero count means the GPU-page gauge alone cannot clear that pool).
+                u64 images = 0;
+                for (const auto& r : by_pool[pool]) {
+                    images += texture_cache.HasImageInRange(r.addr, r.size) ? 1 : 0;
+                }
+                SotcMemClasses::NoteImageRanges(pool, images);
             }
             SotcMemClasses::NoteShadow(cls.size(), bytes, gpu_pages);
         }

@@ -605,6 +605,62 @@ inline std::atomic<uint64_t> host_import_fallbacks{0};
 inline std::atomic<uint64_t> host_import_refused{0};
 inline std::atomic<uint64_t> host_import_live_chunks{0};
 inline std::atomic<uint64_t> drop_slow{0};
+/// sotc: SOTC_DROP_FAST guard: unmaps that took the waiting path because the range overlaps a
+/// command buffer the command processor has not finished reading (Liverpool::CmdRangeInUse).
+inline std::atomic<uint64_t> drop_fast_guarded{0};
+/// sotc: SOTC_DROP_FAST guard: submits whose nested indirect buffer walk hit a cap (ranges, packets
+/// or depth). Their ranges are incomplete, so unmaps wait while one of them is in flight.
+inline std::atomic<uint64_t> drop_fast_overflows{0};
+/// sotc: SOTC_DROP_FAST guard: nested indirect buffers the walk skipped because their memory is
+/// not mapped (Liverpool::CollectNestedIbs).
+inline std::atomic<uint64_t> drop_fast_unmapped_ibs{0};
+/// sotc: SOTC_DROP_FAST diagnostics: the last kDropRing fast-dropped ranges, so a bad PM4 packet
+/// can tell whether it was read from memory the guest had already unmapped (FastDropAge).
+/// Each slot is a seqlock, so a reader never mixes the bounds of two drops.
+inline constexpr uint32_t kDropRing = 256;
+struct DropSlot {
+    std::atomic<uint32_t> seq{0}; ///< odd while NoteFastDrop writes the slot
+    std::atomic<uint64_t> lo{0};
+    std::atomic<uint64_t> hi{0};
+};
+inline DropSlot drop_ring[kDropRing]{};
+inline std::atomic<uint32_t> drop_ring_head{0};
+inline void NoteFastDrop(uint64_t addr, uint64_t size) noexcept {
+    const uint64_t end = size > ~uint64_t{0} - addr ? ~uint64_t{0} : addr + size; // saturates
+    const uint32_t i = drop_ring_head.fetch_add(1, std::memory_order_relaxed) % kDropRing;
+    DropSlot& s = drop_ring[i];
+    const uint32_t q = s.seq.load(std::memory_order_relaxed);
+    s.seq.store(q + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    s.lo.store(addr, std::memory_order_relaxed);
+    s.hi.store(end, std::memory_order_relaxed);
+    s.seq.store(q + 2, std::memory_order_release);
+}
+/// How many fast drops ago `addr` was inside a dropped range (1 = the newest); 0 when it is not in
+/// any of the last kDropRing.
+inline uint32_t FastDropAge(uint64_t addr) noexcept {
+    const uint32_t head = drop_ring_head.load(std::memory_order_relaxed);
+    for (uint32_t k = 1; k <= kDropRing && k <= head; ++k) {
+        const DropSlot& s = drop_ring[(head - k) % kDropRing];
+        for (int retry = 0; retry < 8; ++retry) {
+            const uint32_t s1 = s.seq.load(std::memory_order_acquire);
+            if (s1 & 1) {
+                continue; // being written
+            }
+            const uint64_t lo = s.lo.load(std::memory_order_relaxed);
+            const uint64_t hi = s.hi.load(std::memory_order_relaxed);
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (s.seq.load(std::memory_order_relaxed) != s1) {
+                continue; // overwritten while read
+            }
+            if (addr >= lo && addr < hi) {
+                return k;
+            }
+            break;
+        }
+    }
+    return 0;
+}
 /// SOTC_RB_NARROW: readback window (KiB, 0 = off), GPU-modified bytes of the 512 KiB window left
 /// outside the narrow one (not downloaded nor unprotected), live hot readbacks (gauge).
 inline std::atomic<uint64_t> rb_narrow_kib{0}, rb_narrow_kept_bytes{0}, rb_hot_entries{0};

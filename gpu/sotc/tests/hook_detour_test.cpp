@@ -2,8 +2,10 @@
 // Core::InstallGuestDetour (gpu/sotc/cpu_patches.cpp, docs/HOOK-DESIGN.md) on hand-assembled SysV
 // functions in a fake module: Entry with a RIP-relative prologue, Entry Return, Wrap (pre and
 // post, Return ignored), Site with register write-back, a red-zone sentinel and live registers and
-// flags, the host call alignment, and the refusals (Wrap stack reads, branch to the entry, the
-// trampoline rollback). Windows only. Prints PASS or FAIL; the exit code is 0 on PASS.
+// flags, the host call alignment, HookAction::CallGuest (Entry and Wrap: a guest callee with six
+// arguments that clobbers the GPRs, flags and xmm0/8/15, while the caller keeps xmm8 live), and the
+// refusals (Wrap stack reads, branch to the entry, the trampoline rollback). Windows only. Prints
+// PASS or FAIL; the exit code is 0 on PASS.
 
 #include <windows.h>
 #include <intrin.h>
@@ -35,6 +37,7 @@ constexpr uint32_t kHookEntryRip = 1;
 constexpr uint32_t kHookWrap = 2;
 constexpr uint32_t kHookSite = 3;
 constexpr uint32_t kHookSiteRegs = 6;
+constexpr uint32_t kHookCallEntry = 7;
 
 // State written by the test dispatcher and read by the checks.
 int g_entry_pre = 0;
@@ -51,6 +54,17 @@ bool g_wrap_post_adds = false; // Wrap post handler adds 1000 to rax
 bool g_site_edit = false;      // Site handler sets rsi = 100
 uint64_t g_wrap_entry_rsp = 0;
 uint64_t g_wrap_post_rax = 0;
+int g_call_entry_pre = 0;
+int g_call_entry_misaligned = 0;
+bool g_call_entry_enabled = false; // Entry handler answers HookAction::CallGuest
+bool g_wrap_call_enabled = false;  // Wrap pre handler answers HookAction::CallGuest
+
+// The guest call set by the test handlers (stands in for SotcHooks::SetGuestCall).
+struct TestGuestCall {
+    bool set = false;
+    uint64_t words[7] = {}; // fn, then six arguments
+};
+TestGuestCall g_test_call;
 
 // Offsets of the fake functions inside the module, and of the data word they load.
 constexpr uint64_t kCodeSize = 0x2000;
@@ -66,6 +80,10 @@ constexpr uint64_t kOffWrapArg = 0x200;   // mov rax,[rsp+8]; ret (Wrap refused)
 constexpr uint64_t kOffWrapFrame = 0x240; // push rbp; mov rbp,rsp; mov rax,[rbp+8]; pop rbp; ret
 constexpr uint64_t kOffLoopEntry = 0x280; // T: add eax,esi; add eax,-1; jne T; ret (Entry refused)
 constexpr uint64_t kOffWrapRet = 0x2C0;   // mov eax,edi; add eax,esi; add eax,1; ret (Wrap)
+constexpr uint64_t kOffCallee = 0x300;    // guest callee: stores its args, clobbers, returns 0x999
+constexpr uint64_t kOffDriver = 0x400;    // holds xmm8 live, calls kOffCallHook, stores xmm8
+constexpr uint64_t kOffCallHook = 0x440;  // mov eax,edi; add eax,esi; add eax,1; ret (Entry CallGuest)
+constexpr uint64_t kOffCallData = 0xA00;  // callee results: 6 args, rsp&15, then the xmm8 word
 constexpr uint64_t kOffData = 0x800;
 
 typedef int(__attribute__((sysv_abi)) * Fn1)(int);
@@ -76,6 +94,18 @@ void Put(uint8_t* base, uint64_t offset, std::initializer_list<uint8_t> bytes) {
     for (const uint8_t byte : bytes) {
         base[offset + i++] = byte;
     }
+}
+
+// Emits the opcode bytes in head, then a disp32 that addresses target (the disp32 ends the
+// instruction). at advances past it.
+void PutRipRelative(uint8_t* base, uint64_t& at, std::initializer_list<uint8_t> head,
+                    uint64_t target) {
+    for (const uint8_t byte : head) {
+        base[at++] = byte;
+    }
+    const auto disp = static_cast<int32_t>(static_cast<int64_t>(target) - static_cast<int64_t>(at + 4));
+    std::memcpy(base + at, &disp, sizeof(disp));
+    at += 4;
 }
 
 // Host work the Site handler runs: a big stack array, floating point, and integer flags left
@@ -94,6 +124,14 @@ __attribute__((noinline)) double ClobberHostState(uint32_t seed) {
 
 } // namespace
 
+// Test side of SotcHooks::SetGuestCall and of the stub's take helper (hooks.h).
+uintptr_t g_callee_addr = 0;
+void TestSetGuestCall(uint64_t fn, const uint64_t (&args)[6]) {
+    g_test_call.words[0] = fn;
+    std::memcpy(&g_test_call.words[1], args, sizeof(args));
+    g_test_call.set = true;
+}
+
 // The stub calls this with the Win64 ABI. The return address sits just above the saved frame
 // pointer (frame + 8), and the host call was 16-byte aligned when that slot is 8 mod 16.
 extern "C" uint32_t sotc_hook_dispatch(SotcHooks::GuestRegs* regs, uint32_t hook_id, uint32_t phase) {
@@ -102,6 +140,8 @@ extern "C" uint32_t sotc_hook_dispatch(SotcHooks::GuestRegs* regs, uint32_t hook
     }
     const auto action_continue = static_cast<uint32_t>(SotcHooks::HookAction::Continue);
     const auto action_return = static_cast<uint32_t>(SotcHooks::HookAction::Return);
+    const auto action_call = static_cast<uint32_t>(SotcHooks::HookAction::CallGuest);
+    g_test_call.set = false;
     switch (hook_id) {
     case kHookEntryRip:
         // The guest entered with rsp = 8 mod 16 (its return address is at rsp).
@@ -114,6 +154,17 @@ extern "C" uint32_t sotc_hook_dispatch(SotcHooks::GuestRegs* regs, uint32_t hook
             return action_return;
         }
         return action_continue;
+    case kHookCallEntry:
+        if ((regs->rsp & 15) != 8) {
+            ++g_call_entry_misaligned;
+        }
+        ++g_call_entry_pre;
+        if (g_call_entry_enabled) {
+            const uint64_t args[6] = {11, 22, 33, 44, 55, 66};
+            TestSetGuestCall(g_callee_addr, args);
+            return action_call;
+        }
+        return action_continue;
     case kHookWrap:
         if (phase == static_cast<uint32_t>(SotcHooks::Phase::Pre)) {
             ++g_wrap_pre;
@@ -121,6 +172,11 @@ extern "C" uint32_t sotc_hook_dispatch(SotcHooks::GuestRegs* regs, uint32_t hook
             if (g_wrap_pre_return) {
                 regs->rax = 777; // Wrap ignores Return: the original overwrites rax
                 return action_return;
+            }
+            if (g_wrap_call_enabled) {
+                const uint64_t args[6] = {1, 2, 3, 4, 5, 6};
+                TestSetGuestCall(g_callee_addr, args);
+                return action_call;
             }
             return action_continue;
         }
@@ -147,6 +203,16 @@ extern "C" uint32_t sotc_hook_dispatch(SotcHooks::GuestRegs* regs, uint32_t hook
     default:
         return action_continue;
     }
+}
+
+// The detour stub calls this on the guest stack after a CallGuest (hooks.h).
+extern "C" uint32_t sotc_hook_take_guest_call(uint64_t out[7]) {
+    if (!g_test_call.set) {
+        return 0;
+    }
+    std::memcpy(out, g_test_call.words, sizeof(g_test_call.words));
+    g_test_call.set = false;
+    return 1;
 }
 
 int main() {
@@ -240,13 +306,64 @@ int main() {
     Put(base, kOffLoopEntry, {0x01, 0xF0, 0x83, 0xC0, 0xFF, 0x75, 0xF9, 0xC3});
     Put(base, kOffWrapRet, {0x89, 0xF8, 0x01, 0xF0, 0x83, 0xC0, 0x01, 0xC3});
 
+    // Guest callee for CallGuest: stores rdi, rsi, rdx, rcx, r8, r9 and rsp & 15 into the data
+    // area, then clobbers every argument register, flags, and xmm0/8/15, and returns 0x999.
+    const auto emit = [base](uint64_t& at, std::initializer_list<uint8_t> bytes) {
+        Put(base, at, bytes);
+        at += bytes.size();
+    };
+    {
+        uint64_t at = kOffCallee;
+        PutRipRelative(base, at, {0x48, 0x89, 0x3D}, kOffCallData + 0);  // mov [rip],rdi
+        PutRipRelative(base, at, {0x48, 0x89, 0x35}, kOffCallData + 8);  // mov [rip],rsi
+        PutRipRelative(base, at, {0x48, 0x89, 0x15}, kOffCallData + 16); // mov [rip],rdx
+        PutRipRelative(base, at, {0x48, 0x89, 0x0D}, kOffCallData + 24); // mov [rip],rcx
+        PutRipRelative(base, at, {0x4C, 0x89, 0x05}, kOffCallData + 32); // mov [rip],r8
+        PutRipRelative(base, at, {0x4C, 0x89, 0x0D}, kOffCallData + 40); // mov [rip],r9
+        emit(at, {0x48, 0x89, 0xE0, 0x83, 0xE0, 0x0F});                 // mov rax,rsp; and eax,15
+        PutRipRelative(base, at, {0x48, 0x89, 0x05}, kOffCallData + 48); // mov [rip],rax
+        emit(at, {0xBF, 0xAD, 0x0B, 0x00, 0x00});                       // mov edi,0xBAD
+        emit(at, {0xBE, 0xAD, 0x0B, 0x00, 0x00});                       // mov esi,0xBAD
+        emit(at, {0xBA, 0xAD, 0x0B, 0x00, 0x00});                       // mov edx,0xBAD
+        emit(at, {0xB9, 0xAD, 0x0B, 0x00, 0x00});                       // mov ecx,0xBAD
+        emit(at, {0x41, 0xB8, 0xAD, 0x0B, 0x00, 0x00});                 // mov r8d,0xBAD
+        emit(at, {0x41, 0xB9, 0xAD, 0x0B, 0x00, 0x00});                 // mov r9d,0xBAD
+        emit(at, {0x41, 0xBA, 0xAD, 0x0B, 0x00, 0x00});                 // mov r10d,0xBAD
+        emit(at, {0x41, 0xBB, 0xAD, 0x0B, 0x00, 0x00});                 // mov r11d,0xBAD
+        emit(at, {0xB8, 0xAD, 0x0B, 0x00, 0x00});                       // mov eax,0xBAD
+        emit(at, {0x66, 0x0F, 0x6E, 0xC0});                             // movd xmm0,eax
+        emit(at, {0x66, 0x44, 0x0F, 0x6E, 0xC0});                       // movd xmm8,eax
+        emit(at, {0x66, 0x44, 0x0F, 0x6E, 0xF8});                       // movd xmm15,eax
+        emit(at, {0x83, 0xF8, 0x01});                                   // cmp eax,1 (flags)
+        emit(at, {0xB8, 0x99, 0x09, 0x00, 0x00, 0xC3});                 // mov eax,0x999; ret
+    }
+    // Driver: sub rsp,8; holds 0x5A5A in xmm8 across a call to kOffCallHook; stores xmm8; ret.
+    {
+        uint64_t at = kOffDriver;
+        emit(at, {0x48, 0x83, 0xEC, 0x08});       // sub rsp,8 (call sees rsp = 8 mod 16)
+        emit(at, {0xB8, 0x5A, 0x5A, 0x00, 0x00}); // mov eax,0x5A5A
+        emit(at, {0x66, 0x44, 0x0F, 0x6E, 0xC0}); // movd xmm8,eax
+        emit(at, {0xE8});                         // call kOffCallHook
+        const auto disp = static_cast<int32_t>(static_cast<int64_t>(kOffCallHook) -
+                                               static_cast<int64_t>(at + 4));
+        std::memcpy(base + at, &disp, sizeof(disp));
+        at += 4;
+        PutRipRelative(base, at, {0x66, 0x44, 0x0F, 0xD6, 0x05}, kOffCallData + 64); // movq [rip],xmm8
+        emit(at, {0x48, 0x83, 0xC4, 0x08});       // add rsp,8
+        emit(at, {0xC3});                         // ret
+    }
+    // The Entry hook's body: mov eax,edi; add eax,esi; add eax,1; ret.
+    Put(base, kOffCallHook, {0x89, 0xF8, 0x01, 0xF0, 0x83, 0xC0, 0x01, 0xC3});
+    g_callee_addr = addr(kOffCallee);
+
     Core::RegisterPatchModule(base, kCodeSize, base + kCodeSize, kTrampolineSize);
 
     // Function starts reach the detour code through the red-zone pass. The empty selection
     // (address 0 is in no function) only records the starts; it protects nothing.
-    const std::array<uintptr_t, 9> starts{addr(kOffRip),       addr(kOffWrap),      addr(kOffSite),
-                                          addr(kOffBranch),    addr(kOffRegs),      addr(kOffWrapArg),
-                                          addr(kOffWrapFrame), addr(kOffLoopEntry), addr(kOffWrapRet)};
+    const std::array<uintptr_t, 12> starts{addr(kOffRip),       addr(kOffWrap),      addr(kOffSite),
+                                           addr(kOffBranch),    addr(kOffRegs),      addr(kOffWrapArg),
+                                           addr(kOffWrapFrame), addr(kOffLoopEntry), addr(kOffWrapRet),
+                                           addr(kOffCallee),    addr(kOffDriver),    addr(kOffCallHook)};
     const std::array<uintptr_t, 1> no_selection{0};
     Core::PatchRedZoneMemoryInstructions(reinterpret_cast<uintptr_t>(base), kCodeSize, starts,
                                          no_selection);
@@ -381,6 +498,40 @@ int main() {
     g_wrap_pre_return = false;
     EXPECT(g_wrap_pre == wrap_ret_pre + 1 && g_wrap_post == wrap_ret_post + 1);
     EXPECT(g_wrap_post_rax == 8);
+
+    // CallGuest on Entry. The handler asks for a six-argument call; the callee clobbers every
+    // register and the flags, and the hooked function still returns 3 + 4 + 1 with the driver's
+    // xmm8 intact. Without the call (handler off) the detour behaves as before.
+    const std::vector<uint8_t> call_pattern{0x89, 0xF8, 0x01, 0xF0, 0x83, 0xC0, 0x01};
+    EXPECT(install(kOffCallHook, Core::DetourMode::Entry, kHookCallEntry, call_pattern, &result));
+    EXPECT(result.installed && result.displaced_bytes == 7);
+    const auto call_hook_fn = reinterpret_cast<Fn2>(addr(kOffCallHook));
+    const auto driver_fn = reinterpret_cast<Fn2>(addr(kOffDriver));
+    const auto* call_data = reinterpret_cast<const uint64_t*>(base + kOffCallData);
+    EXPECT(call_hook_fn(3, 4) == 8);
+    EXPECT(g_call_entry_pre == 1);
+    EXPECT(call_data[0] == 0); // the callee did not run
+    g_call_entry_enabled = true;
+    std::memset(base + kOffCallData, 0, 0x100);
+    EXPECT(driver_fn(3, 4) == 8);
+    EXPECT(call_data[0] == 11 && call_data[1] == 22 && call_data[2] == 33);
+    EXPECT(call_data[3] == 44 && call_data[4] == 55 && call_data[5] == 66);
+    EXPECT(call_data[6] == 8);       // rsp was 16-byte aligned at the guest call (8 after the push of the return address)
+    EXPECT(call_data[8] == 0x5A5A);  // xmm8 survived the callee (which wrote 0xBAD)
+    EXPECT(g_call_entry_pre == 2);   // the bare call above and the driver's call
+    EXPECT(g_call_entry_misaligned == 0);
+    g_call_entry_enabled = false;
+    EXPECT(call_hook_fn(5, 6) == 12);
+
+    // CallGuest on Wrap (pre phase): the callee runs before the original, the original and the
+    // post handler still see the registers as they were.
+    g_wrap_call_enabled = true;
+    std::memset(base + kOffCallData, 0, 0x100);
+    const int wrap_call_post = g_wrap_post;
+    EXPECT(wrap_fn(3, 4) == 8);
+    EXPECT(g_wrap_post == wrap_call_post + 1 && g_wrap_post_rax == 8);
+    EXPECT(call_data[0] == 1 && call_data[5] == 6 && call_data[6] == 8);
+    g_wrap_call_enabled = false;
 
     EXPECT(g_host_misaligned == 0);
     EXPECT(g_guest_misaligned == 0);

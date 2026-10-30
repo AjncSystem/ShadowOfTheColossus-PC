@@ -130,6 +130,15 @@ normal o jogo roda travado em 30 FPS, como no PS4.
   do heap do jogo contra leituras da GPU (`bpe_heap_guard`), o flush periódico, as leituras antecipadas,
   o marcador de espera e o gravador de comandos Vulkan em thread própria (`cp_record_thread`).
 
+## SotC Lab
+
+Banco de testes de travadas dentro do jogo (experimental, desligado por padrão): câmera livre
+(F3) com o Wander junto, rotas gravadas (F4), pulo para qualquer um dos 16 colossos, `SOTC_*` ao
+vivo ou com reinício, e um orquestrador que roda matrizes de configurações e grava os resultados
+em CSV. Para ligar, use **Ajustes experimentais** no lançador (`SOTC_LAB=1`). Teclas: **F2** abre o
+menu, **F3** liga a câmera livre, **F4** grava um ponto de rota. O guia completo, com os controles,
+o formato das rotas, o canal de controle e as limitações, está em [LAB.md](LAB.md).
+
 ## Diagnóstico
 
 Estas variáveis de ambiente ajudam a investigar problemas:
@@ -152,3 +161,12 @@ Estas variáveis de ambiente ajudam a investigar problemas:
 | `SOTC_CMD_STATS=1/2` | draws e dispatches por quadro (2: shaders de compute mais usados) |
 | `SOTC_TSC=qpc/native` | relógio do jogo: `qpc` sempre usa o QPC do Windows, `native` sempre o TSC do processador (padrão: QPC só quando os núcleos discordam no TSC) |
 | `SOTC_UI_HIRES=0` | com DLSS, a interface (textos, logos, HUD) volta a ser desenhada na resolução de renderização e ampliada, em vez de na resolução de saída |
+| `SOTC_LAB=1` | liga o SotC Lab (menu F2, câmera livre, pulo para colosso, canal de controle). Ver [LAB.md](LAB.md) |
+| `SOTC_FREECAM=1` | câmera livre (F3); ligada por `SOTC_LAB=1` |
+| `SOTC_FREECAM_MAXSPEED=<m/s>` | velocidade máxima da câmera livre, acima da qual o streaming não acompanha |
+| `SOTC_ENGINE_CMD=1` | executa comandos do console da engine (pulo para colosso); ligada por `SOTC_LAB=1` |
+| `SOTC_CTL=1` ou `SOTC_CTL=<nome>` | canal de controle em `\\.\pipe\sotc-ctl` (ou `\\.\pipe\<nome>`), para `tools/sotc_ctl.py` |
+| `SOTC_CAM_PROBE=1` | só medição: registra a câmera do jogo e a posição do jogador |
+| `SOTC_TUNING_JSON=<arquivo>` | `out/tuning.json` lido pelo menu do SotC Lab para montar a aba SOTC_* |
+| `SOTC_BOOT_BOSS=N` | abre o jogo direto no colosso N (1 a 16) |
+| `SOTC_LAB_ORCH_CMD=<comando>` | comando que o menu usa para iniciar o orquestrador (padrão `python tools/sotc_matrix.py`) |

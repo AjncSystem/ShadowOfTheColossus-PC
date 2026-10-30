@@ -52,6 +52,16 @@
 
 namespace Vulkan {
 
+namespace {
+// sotc: B5/C6 counters (SOTC_FPS only: every writer checks SotcStats::kFpsLog first). Times in ns.
+std::atomic<u64> flip_free_ns{0}, flip_free_waits{0}; ///< GetRenderFrame: no free frame
+std::atomic<u64> flip_fence_ns{0}, flip_frames{0};   ///< GetRenderFrame: present_done; calls
+std::atomic<u64> ring_waits{0};                      ///< the same free-frame waits, for ReportPresent
+std::atomic<u64> present_lock_ns{0}, present_lock_count{0}; ///< present thread: submit_mutex wait
+std::atomic<u64> present_under_lock_ns{0};           ///< present thread: time under submit_mutex
+std::atomic<u32> present_ring{0};                    ///< C6: presentation frames in the ring
+} // namespace
+
 bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format format) {
     const vk::FormatProperties props{physical_device.getFormatProperties(format)};
     return static_cast<bool>(props.optimalTilingFeatures & vk::FormatFeatureFlagBits::eBlitDst);
@@ -483,6 +493,41 @@ static void SavePendingScreenshot(const ScreenshotReadback& readback) {
     }
 }
 
+// sotc: SOTC_PRESENT_FRAMES. The VRAM the frames past the default count may take: a quarter of the
+// free budget of the largest device-local heap, which is where the presentation frames go.
+static u64 PresentRingBudget(const Instance& instance) {
+    const auto& props = instance.GetMemoryProperties();
+    u32 heap = VK_MAX_MEMORY_HEAPS;
+    for (u32 i = 0; i < props.memoryHeapCount; ++i) {
+        if ((props.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) &&
+            (heap == VK_MAX_MEMORY_HEAPS || props.memoryHeaps[i].size > props.memoryHeaps[heap].size)) {
+            heap = i;
+        }
+    }
+    if (heap == VK_MAX_MEMORY_HEAPS) {
+        return 0;
+    }
+    std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+    vmaGetHeapBudgets(instance.GetAllocator(), budgets.data());
+    const u64 total = budgets[heap].budget;
+    const u64 used = budgets[heap].usage;
+    return total > used ? (total - used) / 4 : 0;
+}
+
+// sotc: SOTC_PRESENT_FRAMES. The largest ring of at most `want` frames whose frames past
+// `default_frames` fit in PresentRingBudget. A frame is width x height x 4 bytes, counted twice
+// since it may have a hudless image too.
+static u32 FitPresentRing(const Instance& instance, u32 default_frames, u32 want, u32 width,
+                          u32 height) {
+    const u64 budget = PresentRingBudget(instance);
+    const u64 frame_bytes = static_cast<u64>(width) * height * 4 * 2;
+    u32 frames = want;
+    while (frames > default_frames && (frames - default_frames) * frame_bytes > budget) {
+        --frames;
+    }
+    return frames;
+}
+
 Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_)
     : window{window_}, liverpool{liverpool_},
       instance{window, EmulatorSettings.GetGpuId(), EmulatorSettings.IsVkValidationEnabled(),
@@ -505,8 +550,33 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     // sotc: with DLSS Frame Generation Streamline keeps 2 swapchain images, FSR 3 holds a frame
     // for half a frame: 4 frames in flight so that the command processor does not wait for the
     // presenter.
-    const u32 num_frames =
+    u32 num_frames =
         Dlssg::Enabled() || FrameGen::AskedAtStart() ? std::max(num_images, 4u) : num_images;
+    // sotc: SOTC_PRESENT_FRAMES=N (C6; unset or 0 keeps the count above). The ring grows to N
+    // frames, at most 16, each one display-size (plus a hudless one where it is used). A larger
+    // ring lets GetRenderFrame find a free frame without waiting. ReportPresent prints it.
+    // The frames past the count above are kept only while they fit in VRAM (FitPresentRing).
+    ring_default_frames = num_frames;
+    if (const char* v = std::getenv("SOTC_PRESENT_FRAMES"); v && v[0] != '\0') {
+        const u32 want =
+            static_cast<u32>(std::min<unsigned long>(std::strtoul(v, nullptr, 10), 16ul));
+        // sotc: sized at SOTC_OUTPUT_RES when it is set (the presented size), else at the game size.
+        u32 ring_width = expected_frame_width;
+        u32 ring_height = expected_frame_height;
+        if (const char* o = std::getenv("SOTC_OUTPUT_RES"); o) {
+            s32 w = 0, h = 0;
+            if (std::sscanf(o, "%dx%d", &w, &h) == 2 && w >= 640 && h >= 360 && w <= 7680 &&
+                h <= 4320) {
+                ring_width = static_cast<u32>(w);
+                ring_height = static_cast<u32>(h);
+            }
+        }
+        num_frames = FitPresentRing(instance, ring_default_frames, std::max(num_frames, want),
+                                    ring_width, ring_height);
+        LOG_INFO(Render_Vulkan, "SOTC_PRESENT_FRAMES: presentation ring of {} frames ({} asked)",
+                 num_frames, want);
+    }
+    present_ring.store(num_frames, std::memory_order_relaxed);
     present_frames.resize(num_frames);
     hudless_frames.resize(num_frames);
     for (u32 i = 0; i < num_frames; i++) {
@@ -585,7 +655,7 @@ bool Presenter::IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const
     return std::ranges::find(vo_buffers_addr, color_buffer.Address()) != vo_buffers_addr.cend();
 }
 
-void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
+bool Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     const vk::Device device = instance.GetDevice();
     if (false) { // sotc port: no ImGui layer
     }
@@ -595,6 +665,10 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     if (frame->image) {
         vmaDestroyImage(instance.GetAllocator(), frame->image, frame->allocation);
     }
+    // sotc: no image is held until the new one is allocated (see the failure path below).
+    frame->image = nullptr;
+    frame->image_view = nullptr;
+    frame->allocation = nullptr;
 
     const vk::Format format = swapchain.GetSurfaceFormat().format;
     const vk::ImageCreateInfo image_info = {
@@ -624,9 +698,16 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     VkResult result = vmaCreateImage(instance.GetAllocator(), &unsafe_image_info, &alloc_info,
                                      &unsafe_image, &frame->allocation, nullptr);
     if (result != VK_SUCCESS) [[unlikely]] {
-        LOG_CRITICAL(Render_Vulkan, "Failed allocating texture with error {}",
-                     vk::to_string(vk::Result{result}));
-        UNREACHABLE();
+        if (frame->id < ring_default_frames) {
+            LOG_CRITICAL(Render_Vulkan, "Failed allocating texture with error {}",
+                         vk::to_string(vk::Result{result}));
+            UNREACHABLE();
+        }
+        // sotc: a frame past the default count (SOTC_PRESENT_FRAMES) does not fit in VRAM: the
+        // caller takes it out of the ring.
+        LOG_ERROR(Render_Vulkan, "Failed allocating extra presentation frame {} with error {}",
+                  frame->id, vk::to_string(vk::Result{result}));
+        return false;
     }
     frame->image = vk::Image{unsafe_image};
     SetObjectName(device, frame->image, "Frame image #{}", frame->id);
@@ -649,6 +730,7 @@ void Presenter::RecreateFrame(Frame* frame, u32 width, u32 height) {
     frame->height = height;
 
     frame->is_hdr = swapchain.GetHDR();
+    return true;
 }
 
 Frame* Presenter::PrepareLastFrame() {
@@ -931,12 +1013,15 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // HUD interpolated with FSR 1 on (letters shook, 27 Oct). With DLSS super resolution the DLSS
     // output is the frame without its HUD (the UI layer is only put over it here), so it is used
     // instead.
-    if (const vk::ImageView hudless_view = rasterizer->TakeHudless(cpu_address, view_info.format)) {
-        Frame& hudless = hudless_frames[frame->id];
-        if (hudless.width != frame->width || hudless.height != frame->height ||
-            hudless.is_hdr != frame->is_hdr || !hudless.image) {
-            RecreateFrame(&hudless, frame->width, frame->height);
-        }
+    const vk::ImageView hudless_view = rasterizer->TakeHudless(cpu_address, view_info.format);
+    Frame& hudless = hudless_frames[frame->id];
+    // sotc: a hudless image of an extra frame that does not fit in VRAM is not made: then this frame
+    // goes out without frame->hudless, as when no hudless frame is taken (hudless.image is null).
+    if (hudless_view && (hudless.width != frame->width || hudless.height != frame->height ||
+                         hudless.is_hdr != frame->is_hdr || !hudless.image)) {
+        RecreateFrame(&hudless, frame->width, frame->height);
+    }
+    if (hudless_view && hudless.image) {
         auto hudless_barrier = pre_barrier;
         hudless_barrier.image = hudless.image;
         cmdbuf.pipelineBarrier2(vk::DependencyInfo{
@@ -1474,11 +1559,23 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         Dlssg::BeforePresent(frame->id,
                              FitImage(frame->width, frame->height, extent.width, extent.height),
                              extent);
+        // sotc: SOTC_FPS (B5, C6): how long this thread waited for submit_mutex, and the time under
+        // it until the present returns. Clock reads only; the lock is taken as before.
+        const u64 lock_start = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        const u64 lock_taken = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
+        if (SotcStats::kFpsLog) {
+            present_lock_ns.fetch_add(lock_taken - lock_start, std::memory_order_relaxed);
+            present_lock_count.fetch_add(1, std::memory_order_relaxed);
+        }
         const u64 present_id = instance.IsPresentIdEnabled() ? TagPresent() : 0;
         low_latency.BeforePresent(present_id);
         const SotcTrace::Scope trace_present{"present", present_id}; // sotc: SOTC_TRACE
         const bool presented = swapchain.Present(present_id);
+        if (SotcStats::kFpsLog) {
+            present_under_lock_ns.fetch_add(SotcStats::NowNs() - lock_taken,
+                                            std::memory_order_relaxed);
+        }
         low_latency.AfterPresent(frame->present_done);
         Dlssg::AfterPresent(frame->id);
         if (FrameGen::Current() == FrameGen::Mode::Fsr) {
@@ -1820,7 +1917,16 @@ Frame* Presenter::GetRenderFrame() {
     Frame* frame;
     {
         std::unique_lock lock{free_mutex};
-        free_cv.wait(lock, [this] { return !free_queue.empty(); });
+        // sotc: SOTC_FPS (B5, C6): a wait for a free frame is timed on its own.
+        if (SotcStats::kFpsLog && free_queue.empty()) {
+            const u64 start = SotcStats::NowNs();
+            free_cv.wait(lock, [this] { return !free_queue.empty(); });
+            flip_free_ns.fetch_add(SotcStats::NowNs() - start, std::memory_order_relaxed);
+            flip_free_waits.fetch_add(1, std::memory_order_relaxed);
+            ring_waits.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            free_cv.wait(lock, [this] { return !free_queue.empty(); });
+        }
         LOG_DEBUG(Render_Vulkan, "Got render frame, remaining {}", free_queue.size() - 1);
 
         // Take the frame from the queue
@@ -1836,6 +1942,8 @@ Frame* Presenter::GetRenderFrame() {
         return result;
     };
 
+    // sotc: SOTC_FPS (B5): the present_done wait below is timed on its own.
+    const u64 fence_start = SotcStats::kFpsLog ? SotcStats::NowNs() : 0;
     // Wait for the presentation to be finished so all frame resources are free
     while (wait() != vk::Result::eSuccess) {
         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
@@ -1846,13 +1954,71 @@ Frame* Presenter::GetRenderFrame() {
         }
     }
 
+    if (SotcStats::kFpsLog) {
+        flip_fence_ns.fetch_add(SotcStats::NowNs() - fence_start, std::memory_order_relaxed);
+        flip_frames.fetch_add(1, std::memory_order_relaxed);
+    }
     if (frame->width != expected_frame_width || frame->height != expected_frame_height ||
         frame->is_hdr != swapchain.GetHDR()) {
-        RecreateFrame(frame, expected_frame_width, expected_frame_height);
+        if (!RecreateFrame(frame, expected_frame_width, expected_frame_height)) {
+            // sotc: the ring is capped at the frames that exist: this one is not given back to the
+            // free queue, and another free frame is taken. Only frames past the default count can
+            // fail here (RecreateFrame aborts for the others).
+            const u32 left = present_ring.fetch_sub(1, std::memory_order_relaxed) - 1;
+            LOG_WARNING(Render_Vulkan, "Presentation ring capped at {} frames", left);
+            return GetRenderFrame();
+        }
     }
     frame->hudless = nullptr;
 
     return frame;
+}
+
+void ReportFlipWait(std::string& out, double seconds) {
+    if (!SotcStats::kFpsLog) {
+        return;
+    }
+    const u64 frames = flip_frames.exchange(0, std::memory_order_relaxed);
+    const u64 free_ns = flip_free_ns.exchange(0, std::memory_order_relaxed);
+    const u64 free_n = flip_free_waits.exchange(0, std::memory_order_relaxed);
+    const u64 fence_ns = flip_fence_ns.exchange(0, std::memory_order_relaxed);
+    const u64 draw_ns = Scheduler::submit_lock_draw_ns.exchange(0, std::memory_order_relaxed);
+    const u64 draw_n = Scheduler::submit_lock_draw_count.exchange(0, std::memory_order_relaxed);
+    const u64 other_ns = Scheduler::submit_lock_other_ns.exchange(0, std::memory_order_relaxed);
+    const u64 other_n = Scheduler::submit_lock_other_count.exchange(0, std::memory_order_relaxed);
+    // Per frame: the GetRenderFrame calls of the window (one per flip).
+    const auto per_frame = [frames](u64 ns) { return frames ? ns / 1e6 / frames : 0.0; };
+    char line[512];
+    std::snprintf(
+        line, sizeof(line),
+        "SOTC FLIP WAIT per frame (%llu frames in %.1f s): no free frame %.2f ms (%llu waits), "
+        "present_done fence %.2f ms, submit_mutex on the draw thread %.2f ms (%llu submits), "
+        "other threads %.2f ms (%llu)\n",
+        static_cast<unsigned long long>(frames), seconds, per_frame(free_ns),
+        static_cast<unsigned long long>(free_n), per_frame(fence_ns), per_frame(draw_ns),
+        static_cast<unsigned long long>(draw_n), per_frame(other_ns),
+        static_cast<unsigned long long>(other_n));
+    out += line;
+}
+
+void ReportPresent(std::string& out, double seconds) {
+    if (!SotcStats::kFpsLog) {
+        return;
+    }
+    const u64 waits = ring_waits.exchange(0, std::memory_order_relaxed);
+    const u64 lock_ns = present_lock_ns.exchange(0, std::memory_order_relaxed);
+    const u64 presents = present_lock_count.exchange(0, std::memory_order_relaxed);
+    const u64 under_ns = present_under_lock_ns.exchange(0, std::memory_order_relaxed);
+    const auto per_present = [presents](u64 ns) { return presents ? ns / 1e6 / presents : 0.0; };
+    char line[512];
+    std::snprintf(
+        line, sizeof(line),
+        "SOTC PRESENT (%.1f s): ring %u frames, %llu frame waits, %llu presents: present thread "
+        "blocked on submit_mutex %.2f ms per present, under it %.2f ms per present\n",
+        seconds, static_cast<unsigned>(present_ring.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(waits), static_cast<unsigned long long>(presents),
+        per_present(lock_ns), per_present(under_ns));
+    out += line;
 }
 
 void Presenter::SetExpectedGameSize(s32 width, s32 height) {

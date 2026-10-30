@@ -53,6 +53,11 @@ int bbgpu_text_input_poll(char *out_utf8, uint64_t size);
 int bbgpu_mouse_take(float *dx, float *dy, unsigned *buttons);
 /* 1 while the in-game settings menu is open: the game's pad input is held neutral. */
 int bbgpu_overlay_captures_input(void);
+/* sotc: SotC Lab free-cam (gpu/sotc/freecam.h). Non-zero while it flies: the game gets a neutral pad
+ * and the host pad is handed to the free camera (sticks/triggers -1..1 / 0..1, PS4 button bits). */
+int bbgpu_freecam_captures_input(void);
+void bbgpu_freecam_feed_pad(float lx, float ly, float rx, float ry, float l2, float r2,
+                            uint32_t buttons);
 /* Number of symbols registered by the vendored libraries (diagnostics). */
 unsigned bbgpu_symbol_count(void);
 /* sotc: where the engine keeps the pointer to its TargetFramesPerSeconds value (fps60game mode):

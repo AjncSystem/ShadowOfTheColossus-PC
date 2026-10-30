@@ -305,9 +305,13 @@ TUNING = [('SOTC_ADAPTIVE_SHADOW',
   'memory',
   ('Liberar memória que a GPU só leu, sem espera', 'Fast release of memory the GPU only read'),
   ('Experimental, desligado: liberar memória que a GPU só leu não espera a thread de desenho. '
-   'Medido: no boot e no carregamento do save, essa espera somava 2,5 a 3 s a cada 5 s.',
+   'Medido: menos travadas nas cargas (o pior quadro caiu de 417 ms para 125–185 ms, e as esperas '
+   'ao liberar memória de ~9 s para menos de 50 ms por sessão). ATENÇÃO: em 1 de 4 testes o jogo '
+   'fechou sozinho ao carregar o save; a causa ainda não foi encontrada.',
    'Experimental, off: releasing memory the GPU only read does not wait for the draw thread. '
-   'Measured: at boot and save loading that wait added 2.5 to 3 s per 5 s.'),
+   'Measured: fewer hitches while loading (worst frame from 417 ms to 125-185 ms, memory-release '
+   'waits from ~9 s to under 50 ms per session). WARNING: in 1 of 4 tests the game closed on its '
+   'own while loading the save; the cause is not found yet.'),
   '',
   ()),
  ('SOTC_FAULT_GRANULE',
@@ -1725,7 +1729,56 @@ TUNING = [('SOTC_ADAPTIVE_SHADOW',
    'Logs the game\'s per-frame temporary memory blocks, with "FPS in the log" (Advanced page), to '
    'help choose "Unprotected memory ranges". Diagnostics only.'),
   '',
+  ()),
+ ('SOTC_LAB',
+  'flag',
+  'diag',
+  ('SotC Lab: menu F2, câmera livre F3, colossos, testes automáticos',
+   'SotC Lab: menu F2, free-cam F3, colossi, automated tests'),
+  ('Desligado por padrão. Liga as ferramentas de medição: menu F2, câmera livre (F3), rotas, pulo '
+   'direto aos colossos e testes automáticos. Só para medição; não afeta o jogo quando desligado.',
+   'Off by default. Turns on the measurement tools: F2 menu, free-cam (F3), routes, direct jumps to '
+   'the colossi and automated tests. For measurement only; the game is unaffected when off.'),
+  '',
+  ()),
+ ('SOTC_FREECAM_MAXSPEED',
+  'value',
+  'diag',
+  ('Velocidade máxima da câmera livre (m/s)', 'Free-cam maximum speed (m/s)'),
+  ('Limite de velocidade da câmera livre do SotC Lab, em metros por segundo. Padrão 60. Só com '
+   '“SotC Lab” ligado.',
+   'Speed cap of the SotC Lab free-cam, in metres per second. Default 60. Only with "SotC Lab" on.'),
+  '60',
+  ()),
+ ('SOTC_CTL',
+  'value',
+  'diag',
+  ('Canal de controle do SotC Lab (nome do pipe)', 'SotC Lab control channel (pipe name)'),
+  ('Nome do canal de controle (named pipe) do SotC Lab, para scripts externos. Vazio deixa o canal '
+   'desligado; só tem efeito com “SotC Lab” ligado.',
+   'Name of the SotC Lab control channel (named pipe) for external scripts. Empty keeps it off; it '
+   'only has an effect with "SotC Lab" on.'),
+  '',
   ())]
+
+
+# Switches that can change while the game runs (SotC Lab, gpu/sotc/sotc_live.h). Every name is in
+# TUNING and is read on its use path through SotcLive::Int, so a change applies at once.
+# Migrating a switch means meeting the live-safe rules in sotc_live.h, not just listing it here.
+LIVE = {
+    'SOTC_MDI_STATS': True,
+    'SOTC_CS_STATS': True,
+    'SOTC_BIND_DIFF': True,
+    'SOTC_EOP_TICK_US': True,
+    'SOTC_RB_WAIT_US': True,
+    'SOTC_RB_SPIN_US': True,
+    'SOTC_UNTRACK_MAX_MB': True,
+}
+
+
+def is_live(name):
+    """True when the switch can change while the game runs (see LIVE)."""
+    return bool(LIVE.get(name))
 
 
 def setting_key(name):

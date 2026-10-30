@@ -81,7 +81,9 @@ u64 PatchRdtscInstructions(u64 segment_addr, u64 segment_size,
 /// sotc: a detour from guest code into the host hook dispatcher (gpu/sotc/hooks.h,
 /// docs/HOOK-DESIGN.md). The stub follows the rdtsc clock call (GenerateClockCall): it steps over
 /// the 128-byte red zone, saves flags, every GPR (as a GuestRegs) and xmm0-7, aligns the stack,
-/// reserves the Win64 shadow space and calls sotc_hook_dispatch(regs, hook_id, phase).
+/// reserves the Win64 shadow space and calls sotc_hook_dispatch(regs, hook_id, phase). A pre
+/// handler may return HookAction::CallGuest in any mode: the stub then calls the guest function
+/// set by SetGuestCall (hooks.h) on the guest stack, before the restore and the original.
 enum class DetourMode : u32 {
     /// At a function entry. The pre-handler may return HookAction::Return: the stub then returns
     /// to the guest caller with regs.rax/rdx/xmm0 as the result, skipping the original.

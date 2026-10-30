@@ -33,9 +33,11 @@
 #include "video_core/sotc_op_phases.h" // sotc: SOTC_OP_PHASES
 #include "video_core/sotc_stats.h"
 #include "video_core/buffer_cache/async_upload.h" // sotc: SOTC_WRITE_DECL waits for the copies
+#include "video_core/buffer_cache/buffer_cache.h" // sotc: SOTC_FPS readbacks by guest RIP (B6)
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/buffer_cache/memory_tracker.h" // sotc: SOTC_WRITE_DECL (MAX_CPU_PAGE_BITS)
 #include "../../sotc/write_decl.h" // sotc: SOTC_WRITE_DECL statistics and write fault classes
+#include "../../sotc/mem_classes.h" // sotc: SOTC_CLASS_TRACK write faults per pool (plan step 6)
 
 // src/runtime_memory.c: the runtime's view of a page next to the host protection (diagnostics).
 extern "C" void runtime_memory_describe(uintptr_t address, char* out, size_t capacity);
@@ -1346,6 +1348,11 @@ struct SignalImpl : public PageManager::Impl {
             if (SotcStats::kFpsLog) {
                 SotcWriteDecl::NoteWriteFault(reinterpret_cast<u64>(Common::GetRip(context)), addr);
             }
+            // sotc: SOTC_CLASS_TRACK (modes 1 and 2): the write fault counted per allocator pool. Lock
+            // free; the lookup is the CPU-only table of mem_classes.cpp.
+            if (SotcMemClasses::On()) {
+                SotcMemClasses::NoteWriteFault(addr);
+            }
             // sotc: read only by the SOTC_CMD_STATS printer; every guest thread faults here, and
             // the counter shared a cache line with command-processor counters.
             if (SotcStats::kCmdStats) {
@@ -1440,6 +1447,12 @@ struct SignalImpl : public PageManager::Impl {
                 SotcStats::fault_gpu_reads.fetch_add(1, std::memory_order_relaxed);
             }
             NoteReadFault(context, addr, is_gpu_thread);
+            // sotc: SOTC_FPS (B6): the guest instruction of this read fault, for the readback
+            // counts per RIP (ReportReadbackRips). Nothing is set unless SOTC_FPS is on.
+            const SotcFaultRip::Scope fault_rip{
+                SotcStats::kFpsLog && !is_gpu_thread
+                    ? reinterpret_cast<u64>(Common::GetRip(context))
+                    : u64{0}};
             return rasterizer->ReadMemory(addr, size, is_gpu_thread);
         }
         return false;

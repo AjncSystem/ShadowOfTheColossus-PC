@@ -5,6 +5,11 @@
 
 static int capture;
 int bbgpu_overlay_captures_input(void) { return capture; }
+int bbgpu_freecam_captures_input(void) { return 0; }
+void bbgpu_freecam_feed_pad(float lx, float ly, float rx, float ry, float l2, float r2,
+                            uint32_t buttons) {
+    (void)lx; (void)ly; (void)rx; (void)ry; (void)l2; (void)r2; (void)buttons;
+}
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *name) {
     (void)table; (void)count; (void)name;
     return 0;

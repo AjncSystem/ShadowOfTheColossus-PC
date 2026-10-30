@@ -29,6 +29,14 @@ enum class Phase : uint32_t { Pre = 0, Post = 1 };
 enum class HookAction : uint32_t {
     Continue = 0, ///< run the original (Entry/Wrap) or the displaced instructions (Site)
     Return = 1,   ///< Entry only: return to the guest caller with regs.rax/rdx/xmm0
+    /// Pre phase only (Entry, Wrap, Site): the handler must have called SetGuestCall. The stub
+    /// restores the registers (with the handler's changes), calls the guest function on the guest
+    /// stack with the SysV ABI (args[0..5] in rdi, rsi, rdx, rcx, r8, r9; rsp 16-byte aligned at the
+    /// call; the 128-byte red zone below the guest rsp is skipped), discards its return value,
+    /// restores every guest register (GPRs, rflags, xmm0-15) and continues as for Continue (Wrap:
+    /// the original runs next). Without a pending SetGuestCall, or outside the pre phase, the
+    /// dispatcher turns it into Continue. Not preserved: MXCSR and the x87 state.
+    CallGuest = 2,
 };
 
 /// A handler runs on the host stack (runtime_call_on_host_stack), on the guest thread.
@@ -77,6 +85,11 @@ bool Derived(std::string_view hook, std::string_view field, uint64_t* value);
 /// A resolved Range hook (mode 3): [begin, end) image offsets. False when not resolved.
 bool ResolvedRange(std::string_view hook, uint64_t* begin, uint64_t* end);
 
+/// For a pre-phase handler returning HookAction::CallGuest: the guest function fn and its six
+/// integer arguments, for the calling thread only. The call runs when the handler returns; the
+/// pending call is cleared by that dispatch (a call set but not returned is dropped).
+void SetGuestCall(uint64_t fn, const uint64_t args[6]);
+
 // out/hooks.bin, format SOTCHOOK1 (little endian), written by scripts/sotc_hooks.py:
 //   header: char magic[8] = "SOTCHOOK"; u32 version = 1; u32 count;
 //           u8 fingerprint[32]   (SHA-256 of the eboot's PT_LOAD + PT_SCE_RELRO segments, as
@@ -112,6 +125,10 @@ extern "C" {
 /// Entered from the detour stubs (Win64 ABI). Switches to the host stack, runs the handler of
 /// hook_id for the phase, returns the HookAction as uint32_t.
 uint32_t sotc_hook_dispatch(SotcHooks::GuestRegs* regs, uint32_t hook_id, uint32_t phase);
+/// Called by the detour stub after sotc_hook_dispatch returned CallGuest, on the guest stack
+/// (no host stack switch). Copies the pending guest call into out[0] = fn, out[1..6] = args and
+/// clears it. Returns 1 when a call was pending, 0 otherwise (the stub then continues).
+uint32_t sotc_hook_take_guest_call(uint64_t out[7]);
 /// src/probe.c: runs fn(arg) on the thread's host stack (the fault handler's alternate stack
 /// when the guest runs on a fiber stack); calls it directly when already on the host stack.
 void runtime_call_on_host_stack(void (*fn)(void*), void* arg);

@@ -715,6 +715,12 @@ public:
 
     static std::mutex submit_mutex;
 
+    /// sotc: SOTC_FPS (B5). Time the submits waited for submit_mutex (LockSubmit in
+    /// vk_scheduler.cpp), split into the draw thread and the other threads. Read and reset by
+    /// ReportFlipWait (vk_presenter.cpp). Counted only while SOTC_FPS is on.
+    static inline std::atomic<uint64_t> submit_lock_draw_ns{0}, submit_lock_draw_count{0};
+    static inline std::atomic<uint64_t> submit_lock_other_ns{0}, submit_lock_other_count{0};
+
     /// sotc: SOTC_HRR=1: while host-visible arena chunks exist (set by the buffer cache), every
     /// command buffer this scheduler ends (sessions, ahead, transfer queue) finishes with a global
     /// barrier, all writes -> host reads, so the CPU may read what the GPU wrote once the tick

@@ -40,6 +40,10 @@
 #include "video_core/sotc_stats.h"
 #include "bbport_threads.h"
 
+// sotc: generation of the runtime memory table (src/runtime_memory.c); odd while a change is in
+// progress. Same declaration as vk_rasterizer.cpp and sotc_bininfo.cpp.
+extern "C" uint64_t runtime_memory_generation(void);
+
 namespace Vulkan {
 
 // sotc: the saved driver pipeline cache (PipelineCache::SaveDriverCache).
@@ -1147,6 +1151,245 @@ void PipelineCache::InstallTranslation(AsyncPipelineJob::Translate& t) {
     program.AddPermut(t.module, std::move(*t.spec));
 }
 
+// sotc: SOTC_PIPE_MEMO. Unset: the graphics key memo of GetGraphicsPipeline is on, as before, and
+// the stage and compute memos are off. =0: the key memo is off too. =1: the stage memo (GetProgram)
+// and the compute memo (GetComputePipeline) are on. =2: the same, and every memo answer is also
+// computed by the slow path; a different answer is counted and the slow result is used.
+static bool PipeMemoKeyOn() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_PIPE_MEMO");
+        return !v || v[0] != '0';
+    }();
+    return on;
+}
+
+static int PipeMemoStageMode() {
+    static const int mode = [] {
+        const char* v = std::getenv("SOTC_PIPE_MEMO");
+        return v && v[0] == '1' ? 1 : v && v[0] == '2' ? 2 : 0;
+    }();
+    return mode;
+}
+
+namespace {
+// sotc: counters of SOTC_PIPE_MEMO, printed by ReportPipeMemo.
+// The fields are in the order of kPipeMemoCounters (ReportPipeMemo).
+struct PipeMemoStats {
+    std::atomic<u64> graphics_lookups{}; ///< graphics lookups (mode 1/2)
+    std::atomic<u64> graphics_hits{};    ///< of those, answered by the last-pipeline memo
+    std::atomic<u64> stage_lookups{};    ///< stage lookups of an existing program (mode 1/2)
+    std::atomic<u64> stage_hits{};       ///< of those, answered by the stage memo
+    std::atomic<u64> stage_evictions{};  ///< stage stores that replaced an entry of another key
+    std::atomic<u64> stage_foreign{};    ///< GetProgram calls from a thread other than the first
+    std::atomic<u64> compute_lookups{};  ///< compute lookups (mode 1/2)
+    std::atomic<u64> compute_hits{};     ///< of those, answered by the last-pipeline memo
+    std::atomic<u64> mismatch_graphics{}; ///< =2: graphics memo answer differed from the slow path
+    std::atomic<u64> mismatch_stage_perm{};     ///< =2: stage memo permutation index differed
+    std::atomic<u64> mismatch_stage_module{};   ///< =2: same permutation, other shader module
+    std::atomic<u64> mismatch_stage_fetch{};    ///< =2: vertex fetch shader data differed
+    std::atomic<u64> mismatch_stage_bindings{}; ///< =2: bindings after the stage differed
+    std::atomic<u64> mismatch_stage_pending{};  ///< =2: memo hit, the slow path queued a translation
+    std::atomic<u64> mismatch_compute{};  ///< =2: compute memo answer differed from the slow path
+};
+PipeMemoStats g_pipe_memo;
+} // namespace
+
+// sotc: a thread other than the first caller of GetProgram (in a memo mode) takes the slow path.
+// Command processor thread only in practice; the check is one atomic load on a hit of the first
+// caller and a compare-exchange on the very first call.
+bool PipelineCache::PipeMemoOwnerThread() {
+    const std::thread::id self = std::this_thread::get_id();
+    std::thread::id owner{};
+    if (pipe_memo_owner.compare_exchange_strong(owner, self, std::memory_order_acq_rel)) {
+        return true;
+    }
+    if (owner == self) {
+        return true;
+    }
+    g_pipe_memo.stage_foreign.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
+size_t PipelineCache::StageMemoSet(u64 hash, Shader::HwStage hw_stage, Shader::SwStage sw_stage) {
+    const u64 mix = hash ^ (u64(static_cast<u32>(hw_stage)) << 3) ^
+                    (u64(static_cast<u32>(sw_stage)) << 9);
+    return static_cast<size_t>((mix ^ (mix >> 29)) % kStageMemoSets);
+}
+
+// sotc: true when every input the specialization of this stage reads is the one stored in memo.
+// The flattened buffer and the user data are compared as they are now (RefreshFlatBuf already ran);
+// the tessellation constant buffer is read from guest memory again, as the specialization does.
+// A vertex fetch shader: its code words are compared with the copy stored (read through the
+// backing view, like the shader binary info, so a draw does not read-fault the guest page).
+bool PipelineCache::StageMemoHit(const StageMemo& memo, const Program& program,
+                                 Shader::HwStage hw_stage, Shader::SwStage sw_stage,
+                                 const Shader::ShaderParams& params,
+                                 const Shader::RuntimeInfo& rt,
+                                 const Shader::Backend::Bindings& start,
+                                 const Shader::TessellationDataConstantBuffer& tess,
+                                 bool has_tess, u64 generation) const {
+    if (!memo.valid || memo.program != &program || memo.hw_stage != hw_stage ||
+        memo.sw_stage != sw_stage || memo.hash != params.hash ||
+        memo.modules_size != program.modules.size() || memo.perm >= program.modules.size() ||
+        memo.generation != generation || memo.has_tess != has_tess || !(memo.start == start) ||
+        !(memo.runtime_info == rt) ||
+        std::memcmp(memo.user_data.data(), params.user_data.data(), sizeof(memo.user_data)) != 0) {
+        return false;
+    }
+    if (has_tess && std::memcmp(&memo.tess, &tess, sizeof(tess)) != 0) {
+        return false;
+    }
+    if (!std::ranges::equal(memo.flat_buf, program.info.FlatBuf())) {
+        return false;
+    }
+    // sotc: the same test as ParseFetchShader: a vertex stage with a fetch shader.
+    const bool fetch_now =
+        program.info.sw_stage == Shader::SwStage::Vertex && program.info.has_fetch_shader;
+    if (memo.has_fetch != fetch_now) {
+        return false;
+    }
+    if (!fetch_now) {
+        return true;
+    }
+    const u8* backing = Core::Memory::Instance()->GetBackingPointer(reinterpret_cast<VAddr>(
+        Shader::Gcn::GetFetchShaderCode(program.info, program.info.fetch_shader_sgpr_base)));
+    return backing != nullptr &&
+           (memo.fetch_code.empty() ||
+            std::memcmp(backing, memo.fetch_code.data(), memo.fetch_code.size() * sizeof(u32)) == 0);
+}
+
+PipelineCache::StageMemo* PipelineCache::StageMemoVictim(StageMemo* ways, const Program& program,
+                                                         Shader::HwStage hw_stage,
+                                                         Shader::SwStage sw_stage, u64 hash) {
+    StageMemo* pick = nullptr;
+    for (size_t w = 0; w < kStageMemoWays; ++w) {
+        StageMemo& m = ways[w];
+        if (m.valid && m.program == &program && m.hw_stage == hw_stage &&
+            m.sw_stage == sw_stage && m.hash == hash) {
+            return &m; // same key, other inputs: this entry is replaced, nothing is evicted
+        }
+        // An empty way first, else the least recently used one.
+        if (!pick || (!m.valid && pick->valid) || (m.valid && pick->valid && m.stamp < pick->stamp)) {
+            pick = &m;
+        }
+    }
+    if (pick->valid) {
+        g_pipe_memo.stage_evictions.fetch_add(1, std::memory_order_relaxed);
+    }
+    return pick;
+}
+
+bool PipelineCache::StageMemoStore(StageMemo& memo, const Program& program,
+                                   Shader::HwStage hw_stage, Shader::SwStage sw_stage,
+                                   const Shader::ShaderParams& params,
+                                   const Shader::RuntimeInfo& rt,
+                                   const Shader::Backend::Bindings& start,
+                                   const Shader::TessellationDataConstantBuffer& tess,
+                                   bool has_tess, u64 generation, size_t perm,
+                                   const Shader::Backend::Bindings& after) {
+    const bool fetch_now =
+        program.info.sw_stage == Shader::SwStage::Vertex && program.info.has_fetch_shader;
+    // Read before anything in the entry changes: a failed read leaves the old entry as it was.
+    const u8* fetch_backing = nullptr;
+    u32 fetch_words = 0;
+    if (fetch_now) {
+        fetch_backing = Core::Memory::Instance()->GetBackingPointer(reinterpret_cast<VAddr>(
+            Shader::Gcn::GetFetchShaderCode(program.info, program.info.fetch_shader_sgpr_base)));
+        if (!fetch_backing) {
+            return false;
+        }
+        fetch_words = program.modules[perm].spec.fetch_shader_data.size / sizeof(u32);
+        memo.fetch_code.resize(fetch_words); // keeps its capacity once warm
+        std::memcpy(memo.fetch_code.data(), fetch_backing, fetch_words * sizeof(u32));
+    } else {
+        memo.fetch_code.clear();
+    }
+    memo.valid = true;
+    memo.program = &program;
+    memo.hw_stage = hw_stage;
+    memo.sw_stage = sw_stage;
+    memo.hash = params.hash;
+    memo.perm = static_cast<u32>(perm);
+    memo.modules_size = program.modules.size();
+    std::memcpy(memo.user_data.data(), params.user_data.data(), sizeof(memo.user_data));
+    // assign() reuses the capacity kept from earlier stores: no allocation once warm.
+    const auto& flat = program.info.FlatBuf();
+    memo.flat_buf.assign(flat.begin(), flat.end());
+    memo.runtime_info = rt;
+    memo.start = start;
+    memo.after = after;
+    memo.has_tess = has_tess;
+    memo.tess = tess;
+    memo.has_fetch = fetch_now;
+    memo.generation = generation;
+    memo.stamp = ++stage_memo_tick;
+    return true;
+}
+
+// sotc: writes a report line for the 5 s report: counts since the previous call. Prints nothing
+// while SOTC_PIPE_MEMO is not 1 or 2, or when the window had no lookups. Call from one thread only.
+void ReportPipeMemo(std::string& out, double seconds) {
+    if (PipeMemoStageMode() == 0) {
+        return;
+    }
+    // Same order as the fields of PipeMemoStats.
+    const std::array<const std::atomic<u64>*, 15> counters{
+        &g_pipe_memo.graphics_lookups,      &g_pipe_memo.graphics_hits,
+        &g_pipe_memo.stage_lookups,         &g_pipe_memo.stage_hits,
+        &g_pipe_memo.stage_evictions,       &g_pipe_memo.stage_foreign,
+        &g_pipe_memo.compute_lookups,       &g_pipe_memo.compute_hits,
+        &g_pipe_memo.mismatch_graphics,     &g_pipe_memo.mismatch_stage_perm,
+        &g_pipe_memo.mismatch_stage_module, &g_pipe_memo.mismatch_stage_fetch,
+        &g_pipe_memo.mismatch_stage_bindings, &g_pipe_memo.mismatch_stage_pending,
+        &g_pipe_memo.mismatch_compute,
+    };
+    static std::array<u64, counters.size()> prev{};
+    std::array<u64, counters.size()> d{};
+    for (std::size_t i = 0; i < d.size(); ++i) {
+        const u64 now = counters[i]->load(std::memory_order_relaxed);
+        d[i] = now - prev[i];
+        prev[i] = now;
+    }
+    // Indices as in the array above.
+    constexpr std::size_t kGraphicsLookups = 0, kGraphicsHits = 1, kStageLookups = 2,
+                          kStageHits = 3, kStageEvictions = 4, kStageForeign = 5,
+                          kComputeLookups = 6, kComputeHits = 7, kMismatchGraphics = 8,
+                          kMismatchPerm = 9, kMismatchModule = 10, kMismatchFetch = 11,
+                          kMismatchBindings = 12, kMismatchPending = 13, kMismatchCompute = 14;
+    if (d[kGraphicsLookups] == 0 && d[kStageLookups] == 0 && d[kComputeLookups] == 0 &&
+        d[kStageForeign] == 0) {
+        return;
+    }
+    const auto pct = [](u64 hits, u64 lookups) {
+        return lookups ? 100.0 * static_cast<double>(hits) / static_cast<double>(lookups) : 0.0;
+    };
+    const u64 stage_mismatch = d[kMismatchPerm] + d[kMismatchModule] + d[kMismatchFetch] +
+                               d[kMismatchBindings] + d[kMismatchPending];
+    char line[640];
+    std::snprintf(
+        line, sizeof(line),
+        "SOTC pipe memo: mode %d, graphics %llu/%llu hits (%.0f%%), stage %llu/%llu hits "
+        "(%.0f%%), stage evictions %llu, stage foreign %llu, compute %llu/%llu hits (%.0f%%), "
+        "mismatches %llu (graphics %llu, stage %llu: perm %llu, module %llu, fetch %llu, "
+        "bindings %llu, pending %llu; compute %llu), %.1f lookups/s\n",
+        PipeMemoStageMode(), static_cast<unsigned long long>(d[kGraphicsHits]),
+        static_cast<unsigned long long>(d[kGraphicsLookups]), pct(d[kGraphicsHits], d[kGraphicsLookups]),
+        static_cast<unsigned long long>(d[kStageHits]), static_cast<unsigned long long>(d[kStageLookups]),
+        pct(d[kStageHits], d[kStageLookups]), static_cast<unsigned long long>(d[kStageEvictions]),
+        static_cast<unsigned long long>(d[kStageForeign]),
+        static_cast<unsigned long long>(d[kComputeHits]),
+        static_cast<unsigned long long>(d[kComputeLookups]), pct(d[kComputeHits], d[kComputeLookups]),
+        static_cast<unsigned long long>(d[kMismatchGraphics] + stage_mismatch + d[kMismatchCompute]),
+        static_cast<unsigned long long>(d[kMismatchGraphics]), static_cast<unsigned long long>(stage_mismatch),
+        static_cast<unsigned long long>(d[kMismatchPerm]), static_cast<unsigned long long>(d[kMismatchModule]),
+        static_cast<unsigned long long>(d[kMismatchFetch]), static_cast<unsigned long long>(d[kMismatchBindings]),
+        static_cast<unsigned long long>(d[kMismatchPending]), static_cast<unsigned long long>(d[kMismatchCompute]),
+        seconds > 0.0
+            ? static_cast<double>(d[kGraphicsLookups] + d[kStageLookups] + d[kComputeLookups]) / seconds
+            : 0.0);
+    out += line;
+}
+
 // sotc: a draw with a depth target, depth writes enabled and no color target bound (a shadow-map
 // pass). The color rules are the ones RefreshGraphicsKey applies.
 bool PipelineCache::IsDepthOnlyDraw() const {
@@ -1199,15 +1442,27 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     // sotc: consecutive draws mostly use the same pipeline: when the freshly built key equals the
     // previous draw's byte for byte, skip the map's hash and probe. The stage state (infos,
     // modules, fetch shader) was refreshed by RefreshGraphicsKey either way. SOTC_PIPE_MEMO=0.
-    static const bool pipe_memo = [] {
-        const char* v = std::getenv("SOTC_PIPE_MEMO");
-        return !v || v[0] != '0';
-    }();
-    if (pipe_memo && last_graphics_pipeline &&
-        std::memcmp(&graphics_key, &last_graphics_key, sizeof(graphics_key)) == 0) {
+    const int memo_mode = PipeMemoStageMode();
+    // The map size check (an erase since the last store) is only made in modes 1 and 2.
+    const bool key_hit = PipeMemoKeyOn() && last_graphics_pipeline &&
+                         (memo_mode == 0 || last_graphics_size == graphics_pipelines.size()) &&
+                         std::memcmp(&graphics_key, &last_graphics_key, sizeof(graphics_key)) == 0;
+    if (memo_mode != 0) {
+        g_pipe_memo.graphics_lookups.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (key_hit && memo_mode != 2) {
+        if (memo_mode != 0) {
+            g_pipe_memo.graphics_hits.fetch_add(1, std::memory_order_relaxed);
+        }
         return last_graphics_pipeline;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
+    if (key_hit) { // =2 only: the slow path runs too and must give the same pipeline
+        g_pipe_memo.graphics_hits.fetch_add(1, std::memory_order_relaxed);
+        if (is_new || it.value().get() != last_graphics_pipeline) {
+            g_pipe_memo.mismatch_graphics.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     // sotc: still being built by a pipeline worker (SOTC_ASYNC_SHADERS, SOTC_ASYNC_PRELOAD). A
     // full-screen pass is not skipped: it builds the pipeline here, and the worker's copy is
     // dropped when collected.
@@ -1358,12 +1613,28 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     }
     std::memcpy(&last_graphics_key, &graphics_key, sizeof(graphics_key));
     last_graphics_pipeline = it->second.get();
+    last_graphics_size = graphics_pipelines.size();
     return it->second.get();
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (!RefreshComputeKey()) {
         return nullptr;
+    }
+    // sotc: SOTC_PIPE_MEMO=1/2: the key of the last lookup and its pipeline. Same key, same map
+    // entry: the map is probed only when the key changes or the maps changed size (an erase).
+    const int memo_mode = PipeMemoStageMode();
+    const bool memo_hit = memo_mode != 0 && last_compute_pipeline &&
+                          compute_key == last_compute_key &&
+                          last_compute_size == compute_pipelines.size();
+    if (memo_mode != 0) {
+        g_pipe_memo.compute_lookups.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (memo_hit) {
+        g_pipe_memo.compute_hits.fetch_add(1, std::memory_order_relaxed);
+        if (memo_mode == 1) {
+            return last_compute_pipeline;
+        }
     }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     if (is_new) {
@@ -1407,7 +1678,16 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             module_related_pipelines[m].emplace_back(compute_key);
         }
     }
-    return it->second.get();
+    const ComputePipeline* result = it->second.get();
+    if (memo_mode != 0) {
+        if (memo_hit && result != last_compute_pipeline) { // =2 only
+            g_pipe_memo.mismatch_compute.fetch_add(1, std::memory_order_relaxed);
+        }
+        last_compute_pipeline = result;
+        last_compute_key = compute_key;
+        last_compute_size = compute_pipelines.size();
+    }
+    return result;
 }
 
 bool PipelineCache::RefreshGraphicsKey() {
@@ -1758,6 +2038,60 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     info.PgmBase() = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.UserData() = params.user_data;
     info.RefreshFlatBuf();
+
+    // sotc: SOTC_PIPE_MEMO=1/2. The flattened buffer, the user data and the fetch code are the
+    // memo's inputs. A hit skips the specialization and the search below; the bindings, the fetch
+    // shader and the returned values are set the same way. Entries are only stored from this path
+    // (an existing program), never for a translation still pending. Unset: none of the code below
+    // runs; the locals only start empty.
+    int memo_mode = PipeMemoStageMode();
+    if (memo_mode != 0 && !PipeMemoOwnerThread()) {
+        memo_mode = 0; // sotc: a call from another thread takes the slow path (counted)
+    }
+    Shader::Backend::Bindings memo_start{}; // the specialization starts from this
+    Shader::TessellationDataConstantBuffer memo_tess{};
+    StageMemo* memo_hit = nullptr;   // the way that answered the lookup
+    StageMemo* memo_ways = nullptr;  // the set the lookup used (store target is chosen at store)
+    u64 memo_gen = 0;
+    bool memo_usable = false;        // false while the runtime memory generation is odd
+    bool has_tess = false;
+    if (memo_mode != 0) {
+        has_tess = info.sw_stage == SwStage::TessellationControl ||
+                   info.sw_stage == SwStage::TessellationEval;
+        memo_start = binding;
+        // Read before the slow path, so a store is tagged with the generation it started from.
+        memo_gen = runtime_memory_generation();
+        memo_usable = (memo_gen & 1) == 0;
+        // Read as the specialization reads it (ForEachSharp / the tessellation runtime info).
+        if (has_tess) {
+            info.ReadTessConstantBuffer(memo_tess);
+        }
+        if (stage_memo.empty()) {
+            stage_memo.resize(kStageMemoSets * kStageMemoWays);
+        }
+        memo_ways = &stage_memo[StageMemoSet(params.hash, hw_stage, sw_stage) * kStageMemoWays];
+        g_pipe_memo.stage_lookups.fetch_add(1, std::memory_order_relaxed);
+        for (size_t w = 0; memo_usable && !memo_hit && w < kStageMemoWays; ++w) {
+            if (StageMemoHit(memo_ways[w], *program, hw_stage, sw_stage, params, rt, memo_start,
+                             memo_tess, has_tess, memo_gen)) {
+                memo_hit = &memo_ways[w];
+            }
+        }
+        if (memo_hit) {
+            g_pipe_memo.stage_hits.fetch_add(1, std::memory_order_relaxed);
+            memo_hit->stamp = ++stage_memo_tick;
+        }
+        if (memo_hit && memo_mode == 1) {
+            info.AddBindings(binding, Shader::UsesBindlessSamplers(info));
+            auto& found = program->modules[memo_hit->perm];
+            if (auto& fetch = found.spec.fetch_shader_data; !fetch.Empty()) {
+                fetch_shader = &fetch;
+            }
+            return std::make_tuple(&program->info, found.module,
+                                   HashCombine(params.hash, static_cast<size_t>(memo_hit->perm)));
+        }
+    }
+
     auto spec = Shader::StageSpecialization(info, rt, profile, binding);
 
     size_t perm_idx = program->modules.size();
@@ -1773,6 +2107,9 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             program->pending_specs.push_back(spec);
         }
         translation_pending = true;
+        if (memo_hit) { // =2 only: the memo found a permutation the slow path cannot give yet
+            g_pipe_memo.mismatch_stage_pending.fetch_add(1, std::memory_order_relaxed);
+        }
         return {nullptr, vk::ShaderModule{}, 0};
     }
     if (it == program->modules.end()) {
@@ -1783,10 +2120,38 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
         program->AddPermut(module, std::move(spec));
     } else {
+        perm_idx = std::distance(program->modules.begin(), it);
         info.AddBindings(binding, Shader::UsesBindlessSamplers(info));
         module = it->module;
-        perm_idx = std::distance(program->modules.begin(), it);
         perm_hash = HashCombine(params.hash, perm_idx);
+    }
+    if (memo_mode != 0) {
+        if (memo_hit && memo_mode == 2) {
+            // sotc: =2 only. The memo answer, as mode 1 would return it, against the slow result.
+            // Each kind is counted on its own; the slow result is the one returned.
+            const auto& memo_module = program->modules[memo_hit->perm];
+            if (memo_hit->perm != perm_idx) {
+                g_pipe_memo.mismatch_stage_perm.fetch_add(1, std::memory_order_relaxed);
+            } else if (memo_module.module != module) {
+                g_pipe_memo.mismatch_stage_module.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (!(memo_module.spec.fetch_shader_data ==
+                  program->modules[perm_idx].spec.fetch_shader_data)) {
+                g_pipe_memo.mismatch_stage_fetch.fetch_add(1, std::memory_order_relaxed);
+            }
+            Shader::Backend::Bindings memo_after = memo_start;
+            info.AddBindings(memo_after, Shader::UsesBindlessSamplers(info));
+            if (!(memo_after == binding)) {
+                g_pipe_memo.mismatch_stage_bindings.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (memo_usable) {
+            StageMemo& target =
+                memo_hit ? *memo_hit
+                         : *StageMemoVictim(memo_ways, *program, hw_stage, sw_stage, params.hash);
+            StageMemoStore(target, *program, hw_stage, sw_stage, params, rt, memo_start, memo_tess,
+                           has_tess, memo_gen, perm_idx, binding);
+        }
     }
     if (auto& fetch = program->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
         fetch_shader = &fetch;
@@ -1797,6 +2162,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,
                                                              std::span<const u32> spv_code) {
     last_graphics_pipeline = nullptr; // sotc: pipelines may be erased below
+    last_compute_pipeline = nullptr;  // sotc: SOTC_PIPE_MEMO, same reason
     std::optional<vk::ShaderModule> new_module{};
     for (const auto& [_, program] : program_cache) {
         for (auto& m : program->modules) {

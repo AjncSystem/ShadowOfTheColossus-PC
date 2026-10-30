@@ -20,6 +20,25 @@ namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
 
+// sotc: SOTC_FPS (B5). Takes submit_mutex; with SOTC_FPS on, the wait is timed and counted (see
+// Scheduler::submit_lock_draw_ns). With SOTC_FPS off it is the plain lock.
+static void LockSubmit(std::unique_lock<std::mutex>& lk) {
+    if (!SotcStats::kFpsLog) {
+        lk.lock();
+        return;
+    }
+    const uint64_t start = SotcStats::NowNs();
+    lk.lock();
+    const uint64_t waited = SotcStats::NowNs() - start;
+    if (SotcStats::t_draw_thread) {
+        Scheduler::submit_lock_draw_ns.fetch_add(waited, std::memory_order_relaxed);
+        Scheduler::submit_lock_draw_count.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        Scheduler::submit_lock_other_ns.fetch_add(waited, std::memory_order_relaxed);
+        Scheduler::submit_lock_other_count.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 void Scheduler::SetHostVisibility(bool on) {
     host_visibility.store(on, std::memory_order_release);
 }
@@ -344,7 +363,8 @@ void Scheduler::SubmitAheadAndWait() {
         .pCommandBuffers = &ahead_cmdbuf,
     };
     {
-        std::scoped_lock lk{submit_mutex};
+        std::unique_lock lk{submit_mutex, std::defer_lock};
+        LockSubmit(lk);
         const auto submit_result = instance.GetGraphicsQueue().submit(submit_info, *ahead_fence);
         if (submit_result == vk::Result::eErrorDeviceLost) {
             instance.ReportDeviceFault();
@@ -463,7 +483,8 @@ u64 Scheduler::SubmitAheadAsync() {
             .pSignalSemaphores = &signal_sem,
         };
         {
-            std::scoped_lock lk{submit_mutex};
+            std::unique_lock lk{submit_mutex, std::defer_lock};
+            LockSubmit(lk);
             const auto submit_result = instance.GetGraphicsQueue().submit(submit_info, vk::Fence{});
             if (submit_result == vk::Result::eErrorDeviceLost) {
                 instance.ReportDeviceFault();
@@ -1035,7 +1056,8 @@ static void QueueSubmit(const Instance& instance, const SubmitInfo& info,
         .pSignalSemaphores = info.signal_semas.data(),
     };
 
-    std::scoped_lock lk{Scheduler::submit_mutex};
+    std::unique_lock lk{Scheduler::submit_mutex, std::defer_lock};
+    LockSubmit(lk);
     ImGui::Core::TextureManager::Submit();
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
     if (submit_result == vk::Result::eErrorDeviceLost) {

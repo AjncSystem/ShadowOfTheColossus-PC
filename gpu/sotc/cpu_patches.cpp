@@ -2476,9 +2476,13 @@ u64 PatchRdtscInstructions(u64 segment_addr, u64 segment_size,
 // and xmm0-7 into a SotcHooks::GuestRegs, aligns the host call to 16 and calls sotc_hook_dispatch.
 namespace {
 
-// The frame holds the GuestRegs, then one slot with the host rsp before alignment.
-constexpr int DetourFrameSize = static_cast<int>(sizeof(SotcHooks::GuestRegs)) + 16;
+// The frame holds the GuestRegs, then one slot with the host rsp before alignment, then the
+// CallGuest block (guest fn and six arguments) and the xmm8-15 save of a guest call.
 constexpr int DetourHostRspOffset = static_cast<int>(sizeof(SotcHooks::GuestRegs));
+constexpr int DetourCallBlockOffset = DetourHostRspOffset + 16;
+constexpr int DetourCallSaveOffset = DetourCallBlockOffset + 64;
+constexpr int DetourFrameSize = DetourCallSaveOffset + 8 * 16;
+static_assert(DetourFrameSize % 16 == 0 && DetourCallSaveOffset % 16 == 0);
 // The guest rsp is the host rsp before alignment + 144: the 128-byte red zone, the pushed guest
 // rbx and the pushed flags.
 constexpr int DetourGuestRspDelta = static_cast<int>(GuestRedZoneSize) + 16;
@@ -2555,6 +2559,39 @@ void EmitDetourRestore(Xbyak::CodeGenerator& c) {
     c.mov(rbx, ptr[rsp + SOTC_GR(rbx)]);
     c.mov(rsp, ptr[rsp + DetourHostRspOffset]); // host rsp before alignment (E - 144)
     c.lea(rsp, ptr[rsp + DetourGuestRspDelta]); // guest rsp E
+}
+
+// CallGuest (hooks.h): entered with rsp = the frame base (16-byte aligned) after the handler
+// returned CallGuest, GuestRegs saved. The frame sits below the guest red zone, so the call runs
+// on the guest stack below it, with rsp 16-byte aligned at the call and no extra space needed.
+// Jumps to done without a call when no guest call was pending. Otherwise xmm8-15 are saved
+// around the call (the guest function may clobber them; xmm0-7 come back from GuestRegs in the
+// restore that follows). The return value is discarded and every register is restored by that
+// restore.
+void EmitDetourGuestCall(Xbyak::CodeGenerator& c, const Xbyak::Label& done) {
+    c.lea(rcx, ptr[rsp + DetourCallBlockOffset]);
+    c.sub(rsp, 32); // host shadow space; rsp stays 16-byte aligned at the call
+    c.mov(rax, reinterpret_cast<uintptr_t>(&sotc_hook_take_guest_call));
+    c.call(rax);
+    c.add(rsp, 32);
+    c.test(eax, eax);
+    c.jz(done, Xbyak::CodeGenerator::T_NEAR);
+
+    for (int i = 0; i < 8; ++i) {
+        c.movdqu(ptr[rsp + DetourCallSaveOffset + i * 16], Xbyak::Xmm(8 + i));
+    }
+    c.mov(r11, ptr[rsp + DetourCallBlockOffset]); // guest function
+    c.mov(rdi, ptr[rsp + DetourCallBlockOffset + 8]);
+    c.mov(rsi, ptr[rsp + DetourCallBlockOffset + 16]);
+    c.mov(rdx, ptr[rsp + DetourCallBlockOffset + 24]);
+    c.mov(rcx, ptr[rsp + DetourCallBlockOffset + 32]);
+    c.mov(r8, ptr[rsp + DetourCallBlockOffset + 40]);
+    c.mov(r9, ptr[rsp + DetourCallBlockOffset + 48]);
+    c.xor_(eax, eax); // SysV: al = number of vector arguments (none)
+    c.call(r11);
+    for (int i = 0; i < 8; ++i) {
+        c.movdqu(Xbyak::Xmm(8 + i), ptr[rsp + DetourCallSaveOffset + i * 16]);
+    }
 }
 
 #undef SOTC_GR
@@ -2745,6 +2782,13 @@ bool EmitGuestDetour(Xbyak::CodeGenerator& c, const DetourRequest& request,
         c.cmp(eax, static_cast<uint32_t>(SotcHooks::HookAction::Return));
         c.je(return_to_guest, Xbyak::CodeGenerator::T_NEAR); // the restore + span exceed rel8
     }
+    // HookAction::CallGuest: run the guest function the handler set, then restore as usual. Wrap
+    // runs its original after the restore, so its guest call comes first.
+    Xbyak::Label after_guest_call;
+    c.cmp(eax, static_cast<uint32_t>(SotcHooks::HookAction::CallGuest));
+    c.jne(after_guest_call, Xbyak::CodeGenerator::T_NEAR);
+    EmitDetourGuestCall(c, after_guest_call);
+    c.L(after_guest_call);
     EmitDetourRestore(c);
     if (wrap) {
         // The original gets the guest's alignment: rsp = E - 8 before its call pushes the

@@ -22,7 +22,9 @@
 #include <mutex>
 #include <string>
 
+#include "area_prewarm.h"
 #include "hooks.h"
+#include "lab_commands.h" // sotc: SotC Lab "get state" area
 #include "probes.h"
 
 extern "C" {
@@ -127,6 +129,10 @@ char g_area_name[kNameMax] = {0};
 uint8_t g_area_guid[kGuidLen] = {0};
 bool g_area_valid = false;
 int32_t g_last_state = -1;
+// sotc: SOTC_AREA_PREWARM: the area changes sent to SotcAreaPrewarm::OnAreaChange, in order (the
+// call is made after the lock is released, so the sequence number keeps them in order).
+uint64_t g_change_seq = 0;
+bool g_notified_unknown = false; // the last notice was "unknown area"
 
 // Window counters (reset by ReportArea).
 std::atomic<uint64_t> g_state_sets{0};   // AREA_LOADER_STATE calls
@@ -175,19 +181,46 @@ HookAction OnLoaderState(GuestRegs& regs, void*) {
         g_unknown.fetch_add(1, std::memory_order_relaxed);
     }
 
-    std::lock_guard<std::mutex> lock(g_mutex);
-    if (requested != g_last_state) {
-        g_transitions.fetch_add(1, std::memory_order_relaxed);
-        g_last_state = requested;
+    // sotc: SOTC_AREA_PREWARM: the notice to the prewarm module is decided here and sent after the
+    // lock is released. An unknown area is sent as "" (records then go nowhere), once per unknown run.
+    bool notify = false;
+    char notify_name[kNameMax] = {0};
+    uint64_t seq = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (requested != g_last_state) {
+            g_transitions.fetch_add(1, std::memory_order_relaxed);
+            g_last_state = requested;
+        }
+        if (ok) {
+            const bool area_changed =
+                name[0] && (!g_area_valid || std::strcmp(g_area_name, name) != 0);
+            if (area_changed) {
+                notify = true;
+                std::snprintf(notify_name, kNameMax, "%s", name);
+                g_notified_unknown = false;
+            }
+            std::snprintf(g_area_name, kNameMax, "%s", name[0] ? name : "?");
+            std::memcpy(g_area_guid, guid, kGuidLen);
+            g_area_valid = true;
+        } else {
+            if (!g_notified_unknown) {
+                notify = true;
+                notify_name[0] = '\0';
+                g_notified_unknown = true;
+            }
+            std::snprintf(g_area_name, kNameMax, "unknown");
+            std::memset(g_area_guid, 0, kGuidLen);
+            g_area_valid = false;
+        }
+        if (notify) {
+            seq = ++g_change_seq;
+        }
     }
-    if (ok) {
-        std::snprintf(g_area_name, kNameMax, "%s", name[0] ? name : "?");
-        std::memcpy(g_area_guid, guid, kGuidLen);
-        g_area_valid = true;
-    } else {
-        std::snprintf(g_area_name, kNameMax, "unknown");
-        std::memset(g_area_guid, 0, kGuidLen);
-        g_area_valid = false;
+    // sotc: SOTC_AREA_PREWARM: outside g_mutex (the prewarm module does its own file I/O).
+    if (notify) {
+        SotcAreaPrewarm::OnAreaChange(notify_name, seq);
+        SotcLab::SetArea(notify_name);
     }
     return HookAction::Continue;
 }
@@ -200,6 +233,8 @@ HookAction OnPrecache(GuestRegs&, void*) {
 } // namespace
 
 void RegisterArea() {
+    // sotc: SOTC_AREA_PREWARM: the records of the boot area start now (no-op when the switch is off).
+    SotcAreaPrewarm::OnAreaChange("boot", 0);
     SotcHooks::Handler state;
     state.pre = &OnLoaderState;
     SotcHooks::RegisterHandler("AREA_LOADER_STATE", state);

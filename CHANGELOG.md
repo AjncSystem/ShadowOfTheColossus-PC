@@ -1,5 +1,28 @@
 # Changelog
 
+## Em desenvolvimento
+
+**Experimental (desligado por padrão)**
+- Liberar memória sem espera (`SOTC_DROP_FAST=1`, aba de ajustes experimentais do lançador):
+  medido em 29/10 numa rota de carga (carregar o save, cavalgar, entrar na arena de um colosso),
+  contra a mesma rota sem a opção. As esperas ao liberar memória caíram de ~9,3 s para 25–44 ms por
+  sessão, o pior quadro de 417 ms para 125–185 ms e o p99 de 42 para ~34,5 ms. **Em 1 de 4 sessões
+  o jogo fechou durante o carregamento do save** (o processador de comandos leu um comando
+  zerado). A opção agora espera quando a memória liberada contém um command buffer que ainda está
+  sendo lido, mas essa proteção não disparou nas sessões seguintes, então a causa não está
+  confirmada. Por isso continua desligada por padrão. Se a queda voltar, o log diz se o comando
+  veio de memória liberada sem espera (`sotc: bad PM4 packet …`).
+- **SotC Lab** (`SOTC_LAB=1`, aba Ajustes experimentais do lançador): banco de testes de travadas
+  dentro do jogo. F3 liga uma câmera livre (noclip) que leva o Wander junto, para a carga de áreas
+  acompanhar a câmera como no jogo; F4 grava pontos de rota, que são reproduzidos em velocidade
+  constante; F2 abre o menu, com as abas Câmera, Rotas, Colossos, SOTC_* (trocas ao vivo quando a
+  chave permite, senão no reinício) e Testes. O pulo para os 16 colossos tem os modos Play, Kill e
+  Outro; Kill e Outro copiam o save para `user/save-backups/` antes de mexer nele. Canal de controle
+  em `\\.\pipe\sotc-ctl` (`SOTC_CTL=1`) e orquestrador `tools/sotc_matrix.py`, que roda matrizes de
+  configurações e grava CSV e resumo. Recursos cujos ganchos não são encontrados ficam desligados, e
+  o menu diz isso. O pulo para colosso usa a automação de comandos da engine descoberta por tabnul na
+  PR AjncSystem/ShadowOfTheColossus-PC#345 (ainda não mesclada). Guia: `docs/sotc/LAB.md`.
+
 ## 0.70.1 — 2026-10-29
 Correções e melhorias por cima da 0.70, que vem inteira (trocas de área, queda `0x49800`, DLSS no
 modo Pro, HUD com geração de quadros).

@@ -48,14 +48,32 @@
 #include "../../../../sotc/write_decl.h" // sotc: SotcWriteDecl::Report
 #include "../../../../sotc/probes.h"     // sotc: engine probe report lines
 #include "../../../../sotc/mem_classes.h" // sotc: SOTC_CLASS_TRACK report (plan step 6)
+#include "../../../../sotc/lab_commands.h" // sotc: SotC Lab frame-time window
+#include "../../../../sotc/area_prewarm.h" // sotc: SOTC_AREA_PREWARM report (plan step 5d)
+#include "../../../../sotc/probe_buildsync.h" // sotc: Wave D report lines
+#include "../../../../sotc/probe_dt.h"
+#include "../../../../sotc/probe_drawtag.h"
+#include "../../../../sotc/particle_prev.h"
+#include "../../../../sotc/decommit_budget.h"
+#include "../../../../sotc/mip_budget.h"
+#include "video_core/buffer_cache/buffer_cache.h"     // sotc: VideoCore::ReportReadbackRips (B6)
+#include "video_core/texture_cache/texture_cache.h"   // sotc: ReportImageFrees / ReportUnmapPark (B4/C5)
 
 // sotc: SOTC_TINY_ASYNC (vk_pipeline_cache.cpp).
 namespace Vulkan {
 void SotcTinyAsyncNoteDisplayBuffer(u64 address, u64 size);
 void SotcTinyAsyncReport(std::string& out, double seconds);
+void ReportPipeMemo(std::string& out, double seconds); // sotc: SOTC_PIPE_MEMO
 } // namespace Vulkan
 // sotc: src/runtime_kernel.c, SOTC USLEEP line (usleep histogram, SOTC_USLEEP_YIELD).
 extern "C" void runtime_usleep_stats(char* out, size_t size, double seconds);
+// sotc: src/runtime_mutex.c, SOTC_MUTEX_SPIN_US stats (Wave D C1).
+extern "C" void runtime_mutex_spin_stats(char* out, size_t size, double seconds);
+// sotc: Wave D B5/C6, declared in vk_presenter.h; forward-declared here in case the header lacks it.
+namespace Vulkan {
+void ReportFlipWait(std::string& out, double seconds);
+void ReportPresent(std::string& out, double seconds);
+} // namespace Vulkan
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
@@ -583,6 +601,7 @@ void VideoOutDriver::Flip(const Request& req) {
         const Clock::time_point now = Clock::now();
         const double gap_ms = std::chrono::duration<double, std::milli>(now - last_flip).count();
         last_flip = now;
+        SotcLab::OnFrame(gap_ms); // sotc: SotC Lab stats window (lab_commands.h)
         ++minute_flips;
         worst_ms = std::max(worst_ms, gap_ms);
         slow += gap_ms > 50.0;
@@ -1814,10 +1833,18 @@ void VideoOutDriver::Flip(const Request& req) {
             }
             // sotc: SOTC_DROP_FAST, totals: unmaps dropped on the guest thread, and waited.
             if (const uint64_t fast = SotcStats::drop_fast.load(std::memory_order_relaxed)) {
-                ReportPrintf(report, "SOTC drop fast %llu, waited %llu\n",
+                ReportPrintf(report,
+                             "SOTC drop fast %llu, waited %llu (%llu of them over a command "
+                             "buffer in use); IB walk overflows %llu, unmapped IBs skipped %llu\n",
                              static_cast<unsigned long long>(fast),
                              static_cast<unsigned long long>(
-                                 SotcStats::drop_slow.load(std::memory_order_relaxed)));
+                                 SotcStats::drop_slow.load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(
+                                 SotcStats::drop_fast_guarded.load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(
+                                 SotcStats::drop_fast_overflows.load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(
+                                 SotcStats::drop_fast_unmapped_ibs.load(std::memory_order_relaxed)));
             }
             {
                 // sotc: SOTC_EOP_TICK labels: written, mean/max time from queue to write, flushes.
@@ -1926,6 +1953,23 @@ void VideoOutDriver::Flip(const Request& req) {
             SotcProbes::ReportCvars(report, seconds);
             SotcProbes::ReportArea(report, seconds);
             SotcMemClasses::Report(report, seconds);
+            // sotc: Wave C optimizations, each prints only while its switch is on.
+            SotcAreaPrewarm::ReportAreaPrewarm(report, seconds); // SOTC_AREA_PREWARM >= 2
+            Vulkan::ReportPipeMemo(report, seconds);              // SOTC_PIPE_MEMO
+            AmdGpu::ReportCpLabelSkip(report, seconds);           // SOTC_CP_LABEL_SKIP
+            // sotc: Wave D probes and optimizations (docs/re-stutters/reports2/00-PLAN.md); each
+            // prints only while its switch is on.
+            SotcBuildSync::ReportBuildSyncProbe(report, seconds);      // SOTC_BUILDSYNC_PROBE
+            SotcProbes::ReportDtProbe(report, seconds);               // SOTC_DT_PROBE
+            SotcProbes::ReportDrawTag(report, seconds);               // SOTC_DRAW_TAG
+            SotcProbes::ReportParticlePrev(report, seconds);          // SOTC_PARTICLE_PREV
+            SotcDecommitBudget::ReportDecommitBudget(report, seconds); // SOTC_DECOMMIT_BUDGET
+            SotcMipBudget::ReportMipBudget(report, seconds);          // SOTC_MIP_BUDGET
+            VideoCore::TextureCache::ReportImageFrees(report, seconds); // B4 (SOTC_FPS)
+            VideoCore::TextureCache::ReportUnmapPark(report, seconds);  // SOTC_UNMAP_PARK
+            Vulkan::ReportFlipWait(report, seconds);                  // B5 (SOTC_FPS)
+            Vulkan::ReportPresent(report, seconds);                   // SOTC_PRESENT_FRAMES / SOTC_FPS
+            VideoCore::ReportReadbackRips(report, seconds);           // B6 (SOTC_FPS)
             // sotc: SOTC_OP_OVERLAP (plan step 7c.0): footprint conflicts between consecutive ops.
             if (SotcStats::kOpOverlap) {
                 const uint64_t ovl_ops = SotcStats::ovl_ops.exchange(0);
@@ -1954,6 +1998,15 @@ void VideoOutDriver::Flip(const Request& req) {
                 usleep_line[0] = '\0';
                 runtime_usleep_stats(usleep_line, sizeof(usleep_line), seconds);
                 report += usleep_line;
+            }
+            { // sotc: SOTC_MUTEX_SPIN_US stats (Wave D C1)
+                char spin_line[256];
+                spin_line[0] = '\0';
+                runtime_mutex_spin_stats(spin_line, sizeof(spin_line), seconds);
+                if (spin_line[0]) {
+                    report += spin_line;
+                    report += '\n';
+                }
             }
             // sotc: SOTC_WD_FUSE accounting (Liverpool).
             if (flips) {

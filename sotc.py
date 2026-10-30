@@ -31,6 +31,10 @@ Settings (environment variables, or sotc.ini beside this script as NAME=value li
                       tuning table to out/tuning.tsv (SOTC_TUNING_TSV)
     SOTC_BOOT_BOSS    N (1..16): boots straight into colossus N (a route_bossjump.txt plan is
                       written into the game folder for the launch and deleted afterwards)
+    SOTC_LAB_ROUTE    with SOTC_LAB: a route file (tools/routes/x.json, user/routes/x.json) played
+                      by itself once gameplay begins (SOTC_LAB_ROUTE_DELAY s after it, default 8);
+                      the game closes SOTC_LAB_ROUTE_EXIT s after the route ends (default 5,
+                      negative keeps it open). The log gets "SOTC LAB ROUTE done: ..." with the stats
     user/lab_pending_env.json  restart-only settings queued by the lab ({"env": {..}, "boss": n});
                       merged into this launch once, then deleted
 The image is prepared again only when the game, the modules or the scripts change.

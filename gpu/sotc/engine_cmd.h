@@ -26,6 +26,11 @@ bool Queue(std::string_view line, std::string* err = nullptr);
 /// Lines the engine printed for the last executed commands (newest last, bounded). Any thread.
 std::vector<std::string> RecentOutput();
 
+/// How many times the game printed "st_gameflow() starting game" (save loaded / gameplay begins),
+/// and the steady-clock time of the last one in ms (0 before the first). Any thread.
+uint64_t GameStarts();
+int64_t LastGameStartMs();
+
 // --- Colossi -----------------------------------------------------------------------------------
 struct Colossus {
     const char* name;  ///< English name (Valus, Quadratus, ...)

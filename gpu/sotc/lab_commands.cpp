@@ -28,6 +28,8 @@
 #include "freecam.h"
 #include "sotc_live.h"
 
+#include <SDL3/SDL.h>
+
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -592,7 +594,133 @@ std::string Execute(std::string_view line) {
     }
 }
 
+namespace {
+
+// SOTC_LAB_ROUTE=<route file>: plays that route by itself once gameplay begins, then (after
+// SOTC_LAB_ROUTE_EXIT seconds, default 5; negative keeps the game open) closes the game.
+// SOTC_LAB_ROUTE_DELAY (seconds, default 8) is the wait after the last "starting game" line, so the
+// area has loaded before the free camera takes over. Runs from OnFrame (the flip thread) and only
+// queues work for the update thread through the module APIs.
+enum class AutoPhase { Off, WaitGame, StartCam, WaitCam, Playing, Done, Closed };
+
+struct AutoRoute {
+    AutoPhase phase = AutoPhase::Off;
+    std::string path;
+    double delay_s = 8.0;
+    double exit_s = 5.0;
+    uint64_t starts_seen = 0;
+    int64_t phase_ms = 0;
+    bool was_playing = false;
+};
+
+int64_t NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+double EnvSeconds(const char* name, double def) {
+    const char* v = std::getenv(name);
+    if (!v || !*v) {
+        return def;
+    }
+    char* end = nullptr;
+    const double d = std::strtod(v, &end);
+    return end != v && std::isfinite(d) ? d : def;
+}
+
+void AutoRouteTick() {
+    static AutoRoute a = [] {
+        AutoRoute r;
+        const char* v = std::getenv("SOTC_LAB_ROUTE");
+        if (v && *v && Enabled()) {
+            r.path = v;
+            r.delay_s = EnvSeconds("SOTC_LAB_ROUTE_DELAY", 8.0);
+            r.exit_s = EnvSeconds("SOTC_LAB_ROUTE_EXIT", 5.0);
+            std::string err;
+            if (SotcAutopilot::Load(r.path, &err)) {
+                r.phase = AutoPhase::WaitGame;
+                std::fprintf(stderr, "SOTC LAB ROUTE %s: waiting for gameplay\n", r.path.c_str());
+            } else {
+                std::fprintf(stderr, "SOTC LAB ROUTE %s: %s\n", r.path.c_str(), err.c_str());
+            }
+        }
+        return r;
+    }();
+    if (a.phase == AutoPhase::Off || a.phase == AutoPhase::Closed) {
+        return;
+    }
+    const int64_t now = NowMs();
+    switch (a.phase) {
+    case AutoPhase::WaitGame: {
+        const uint64_t starts = SotcEngineCmd::GameStarts();
+        const int64_t last = SotcEngineCmd::LastGameStartMs();
+        if (starts > 0 && now - last >= static_cast<int64_t>(a.delay_s * 1000.0)) {
+            a.phase = AutoPhase::StartCam;
+        }
+        break;
+    }
+    case AutoPhase::StartCam:
+        if (SotcFreecam::SetActive(true)) {
+            a.phase = AutoPhase::WaitCam;
+            a.phase_ms = now;
+        }
+        break;
+    case AutoPhase::WaitCam: {
+        const SotcFreecam::State st = SotcFreecam::Get();
+        if (st.active && st.frames > 0) {
+            SotcAutopilot::Stop();
+            SotcAutopilot::Play();
+            Mark(SotcAutopilot::Current().name.empty() ? "route" : SotcAutopilot::Current().name);
+            a.phase = AutoPhase::Playing;
+            a.phase_ms = now;
+            a.was_playing = false;
+            std::fprintf(stderr, "SOTC LAB ROUTE start\n");
+        } else if (!st.active && now - a.phase_ms > 3000) {
+            a.phase = AutoPhase::StartCam; // the start pose was not ready yet: try again
+        }
+        break;
+    }
+    case AutoPhase::Playing: {
+        const bool playing = SotcAutopilot::GetProgress().playing;
+        if (playing) {
+            a.was_playing = true;
+        } else if (a.was_playing || now - a.phase_ms > 5000) {
+            const Window w = CurrentWindow();
+            std::fprintf(stderr,
+                         "SOTC LAB ROUTE done: %llu frames, p50 %.1f ms, p99 %.1f ms, max %.1f ms, "
+                         "hitches >33 ms %llu, >50 ms %llu, >100 ms %llu\n",
+                         static_cast<unsigned long long>(w.frames), w.p50, w.p99, w.max,
+                         static_cast<unsigned long long>(w.hitch33),
+                         static_cast<unsigned long long>(w.hitch50),
+                         static_cast<unsigned long long>(w.hitch100));
+            a.phase = AutoPhase::Done;
+            a.phase_ms = now;
+        }
+        break;
+    }
+    case AutoPhase::Done:
+        if (a.exit_s < 0.0) {
+            a.phase = AutoPhase::Closed;
+        } else if (now - a.phase_ms >= static_cast<int64_t>(a.exit_s * 1000.0)) {
+            std::fprintf(stderr, "SOTC LAB ROUTE exit\n");
+            std::fflush(stderr);
+            a.phase = AutoPhase::Closed;
+            // The same path as closing the window.
+            SDL_Event quit{};
+            quit.type = SDL_EVENT_QUIT;
+            SDL_PushEvent(&quit);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+} // namespace
+
 void OnFrame(double frame_ms) {
+    AutoRouteTick();
     if (!std::isfinite(frame_ms)) {
         return;
     }

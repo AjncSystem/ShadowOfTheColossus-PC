@@ -226,6 +226,20 @@ F4 ou pelo menu, a rota vai para `user/routes/`.
 Ao reproduzir, o Lab escreve no log `SOTC SEG <nome> begin` e `SOTC SEG <nome> end` nas fronteiras
 de segmento, e `SOTC LAP <n>` a cada volta. Esses marcadores são usados para separar as medições.
 
+### Rota automática
+
+Para gravar uma rota e medir sem tocar no jogo:
+
+```bash
+SOTC_LAB=1 SOTC_CVARS="skipSplash=1 nointro" SOTC_LAB_ROUTE=user/routes/minharota.json python sotc.py
+```
+
+O jogo abre sem logos e sem tela de título, espera 8 s depois que o jogo começa
+(`SOTC_LAB_ROUTE_DELAY`), liga a câmera livre, toca a rota inteira, escreve no log uma linha
+`SOTC LAB ROUTE done: ...` com quadros, p50, p99, pior quadro e travadas, espera 5 s
+(`SOTC_LAB_ROUTE_EXIT`) e fecha o jogo. Os segmentos da rota aparecem como `SOTC SEG <nome>
+begin/end`. A rota `tools/routes/shrine_test.json` (8 s, saindo do Santuário) serve de teste.
+
 ## Orquestrador de matrizes
 
 O `tools/sotc_matrix.py` roda uma matriz completa sem intervenção: para cada cenário, cada
@@ -288,8 +302,12 @@ chaves ao vivo não reiniciam o jogo: o orquestrador envia as trocas pelo pipe e
 | `SOTC_ENGINE_CMD=1` | liga a execução de comandos da engine (aba Colossos, `engine` no pipe). Ligada por `SOTC_LAB=1` |
 | `SOTC_CTL=1` ou `SOTC_CTL=<nome>` | liga o canal de controle no pipe `\\.\pipe\sotc-ctl` (ou `\\.\pipe\<nome>`) |
 | `SOTC_CAM_PROBE=1` | só medição: registra a câmera do jogo e a posição do jogador (para o desenvolvimento) |
-| `SOTC_TUNING_JSON=<arquivo>` | caminho do `out/tuning.json` que o menu lê para montar a aba SOTC_* |
+| `SOTC_TUNING_TSV=<arquivo>` | caminho do `out/tuning.tsv` que o menu lê para montar a aba SOTC_* (o `sotc.py` preenche) |
 | `SOTC_BOOT_BOSS=N` | abre o jogo direto no colosso N (1 a 16) |
+| `SOTC_LAB_ROUTE=<arquivo>` | toca essa rota sozinho quando o jogo começa e fecha o jogo depois (veja "Rota automática") |
+| `SOTC_LAB_ROUTE_DELAY=<s>` | espera depois do início do jogo antes da rota (padrão 8) |
+| `SOTC_LAB_ROUTE_EXIT=<s>` | espera depois do fim da rota antes de fechar o jogo (padrão 5; negativo não fecha) |
+| `SOTC_FREECAM_DROP=<m>` | quantos metros abaixo da câmera livre o Wander vai (padrão 8) |
 | `SOTC_LAB_ORCH_CMD=<comando>` | comando que o menu usa para iniciar o orquestrador (padrão `python tools/sotc_matrix.py`) |
 
 As chaves acima podem ir no `sotc.ini` ou no ambiente do sistema, como as demais.

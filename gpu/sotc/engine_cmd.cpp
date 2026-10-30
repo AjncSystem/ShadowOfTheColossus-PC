@@ -191,10 +191,34 @@ SotcHooks::HookAction OnPrint(SotcHooks::GuestRegs& regs, void*) {
 
 // The game's stdout (src/runtime_file.c): keeps only console replies the lab parses ("... Position:
 // Set..." from printPlayerPos / PrintCameraPos), so the rest of the log costs one short scan.
+std::atomic<uint64_t> g_game_starts{0};
+std::atomic<int64_t> g_game_start_ms{0};
+
+bool Contains(const char* text, size_t size, const char* key) {
+    const size_t n = std::strlen(key);
+    for (size_t i = 0; i + n <= size; ++i) {
+        if (text[i] == key[0] && std::memcmp(text + i, key, n) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void TakeStdout(const char* text, size_t size) {
     static constexpr char kKey[] = "Position: Set";
     constexpr size_t n = sizeof(kKey) - 1;
-    if (size < n || size > 4096) {
+    if (size > 4096) {
+        return;
+    }
+    if (Contains(text, size, "st_gameflow() starting game")) {
+        g_game_start_ms.store(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::steady_clock::now().time_since_epoch())
+                                  .count(),
+                              std::memory_order_relaxed);
+        g_game_starts.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (size < n) {
         return;
     }
     bool found = false;
@@ -269,6 +293,14 @@ bool Queue(std::string_view line, std::string* err) {
     }
     g_queue.push_back({g_frame.load(std::memory_order_relaxed) + 1, std::string(line), false});
     return true;
+}
+
+uint64_t GameStarts() {
+    return g_game_starts.load(std::memory_order_relaxed);
+}
+
+int64_t LastGameStartMs() {
+    return g_game_start_ms.load(std::memory_order_relaxed);
 }
 
 std::vector<std::string> RecentOutput() {

@@ -3472,7 +3472,21 @@ bool BufferCache::MaybeEvictCold(std::chrono::steady_clock::time_point now) {
     if (SotcStats::kFpsLog) {
         ArenaClassCensus(img_idle_epochs ? img_idle_epochs : 30);
     }
-    const bool over = limit != 0 && resident > limit;
+    // sotc: the arena limit above counts the arenas alone, 4 GiB on 8 GB cards; with 4K output and
+    // DLSS-G (~2.4 GB outside VMA) the card's budget ran out first: arenas 0.5 -> 1.4 GB in 4 min of
+    // the attract demo, nothing evicted, then constant texture collection (74 -> 35 FPS) and
+    // corrupt textures (user, 29 Oct, 53 min). So the arenas also give back cold memory once the
+    // whole device use passes SOTC_ARENA_EVICT_VRAM_PERCENT (default 85, 0 = off) of the budget.
+    static const u64 vram_percent = [] {
+        const char* v = std::getenv("SOTC_ARENA_EVICT_VRAM_PERCENT");
+        return std::min<u64>(v ? std::strtoull(v, nullptr, 10) : 85ull, 100ull);
+    }();
+    const u64 vram_budget = SotcStats::vram_budget.load(std::memory_order_relaxed);
+    const bool vram_over = vram_percent != 0 && vram_budget != 0 && resident > (256ull << 20) &&
+                           SotcStats::vram_used.load(std::memory_order_relaxed) >
+                               vram_budget * vram_percent / 100;
+    const bool arena_over = limit != 0 && resident > limit;
+    const bool over = arena_over || vram_over;
     const bool img_release = img_idle_epochs != 0 && !BbToggle::Disabled(BbToggle::ArenaImageRelease);
     if (!over && !img_release) {
         return false;
@@ -3533,7 +3547,8 @@ bool BufferCache::MaybeEvictCold(std::chrono::steady_clock::time_point now) {
     std::vector<EvictChoice> chosen;
     u64 total = 0;
     for (const auto& [age, key] : order) {
-        if (total >= step || (over && resident - total <= limit / 8 * 7)) {
+        // The 7/8 floor is the arena threshold's: under VRAM pressure alone `step` bounds a run.
+        if (total >= step || (arena_over && resident - total <= limit / 8 * 7)) {
             break;
         }
         const Candidate& candidate = candidates[key];

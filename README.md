@@ -236,10 +236,11 @@ bash packaging/linux/build_appimage.sh
 Testes / tests: `./build.sh --test`. A AppImage leva o loader, a biblioteca de GPU, os scripts, o
 lançador com o Python e o Tcl/Tk da máquina de build e as bibliotecas que eles usam, menos o
 sistema base (glibc, libstdc++, loader do Vulkan, fontconfig, freetype) e as que o driver de vídeo
-do sistema carrega (Wayland, X11/xcb, libdrm, gbm, expat, zlib, zstd) / The AppImage carries the
+e o servidor de som do sistema carregam (Wayland, X11/xcb, libdrm, gbm, expat, zlib, zstd, PipeWire, ALSA) / The AppImage carries the
 loader, GPU library, scripts, the launcher with the build machine's Python and Tcl/Tk, and their
 libraries except the base system (glibc, libstdc++, Vulkan loader, fontconfig, freetype) and those
-the host's graphics driver loads (Wayland, X11/xcb, libdrm, gbm, expat, zlib, zstd). Precisa de / needs `patchelf`; o `appimagetool` é baixado em /
+the host's graphics driver and sound server load (Wayland, X11/xcb, libdrm, gbm, expat, zlib, zstd,
+PipeWire, ALSA). Precisa de / needs `patchelf`; o `appimagetool` é baixado em /
 is downloaded into `out/tools` (ou / or `APPIMAGETOOL=<caminho / path>`).
 
 Packaging refuses any `.sprx`/`.prx`: Sony firmware never goes into the package. Test tools:

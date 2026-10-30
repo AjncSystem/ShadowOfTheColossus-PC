@@ -4,8 +4,8 @@
 // A manifest is the list of distinct images one area's first load created. It is kept in memory per
 // area (so an area that is left and entered again keeps its records) and written to
 // user/cache/area_manifest/<area>.bin by a save worker: an area change queues the previous area, and
-// each report tick queues the current area when it has new records. The worker copies the records
-// under g_mutex and writes the file without it. The file is a 20-byte header (magic "SOTCAREA",
+// a 10 s tick saves the current area when it is dirty, and an atexit handler saves it at exit. The
+// worker copies the records under g_mutex and writes the file without it. The file is a 20-byte header (magic "SOTCAREA",
 // version, record size, count) and the records as they are in memory. A file with another version,
 // size or a short body is ignored; records that fail ValidRecord or the texture cache's check are
 // dropped when the file is read. Area names are lower case (NTFS is case-insensitive).
@@ -20,7 +20,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -69,7 +71,9 @@ struct Manifest {
 };
 
 std::mutex g_mutex;
-std::string g_area;                                        // current area (lower case); empty: unknown
+// One manifest write at a time: the save worker, the exit save. Never taken with g_mutex held.
+std::timed_mutex g_write_mutex;
+std::string g_area;                                       // current area (lower case); empty: unknown
 std::unordered_map<std::string, Manifest> g_areas;         // by area name, kept for the session
 std::vector<ImageRecord> g_pending;                        // mode 3: records for the next replay
 std::atomic<bool (*)(const ImageRecord&)> g_check{nullptr}; // texture cache's exact record check
@@ -208,9 +212,17 @@ void AddLocked(Manifest& m, const std::vector<ImageRecord>& records) {
     }
 }
 
+// "<path>: <what failed> (errno N: text)" for the log.
+std::string Describe(const std::filesystem::path& path, const char* what, int code) {
+    return path.string() + ": " + what + " (errno " + std::to_string(code) + ": " +
+           std::strerror(code) + ")";
+}
+
 // Writes records to the area's file (a temporary file with a unique name, then rename). Only the
-// save worker calls it. False on any failure.
-bool WriteManifest(const std::string& area, const std::vector<ImageRecord>& records) {
+// save worker and the exit save call it, under g_write_mutex. False on any failure, with the reason in
+// error.
+bool WriteManifest(const std::string& area, const std::vector<ImageRecord>& records,
+                   std::string& error) {
     std::error_code ec;
     const auto path = ManifestPath(area);
     std::filesystem::create_directories(path.parent_path(), ec);
@@ -218,8 +230,10 @@ bool WriteManifest(const std::string& area, const std::vector<ImageRecord>& reco
     auto tmp = path;
     tmp += "." + std::to_string(counter.fetch_add(1, std::memory_order_relaxed)) + ".tmp";
     {
+        errno = 0;
         std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
         if (!out) {
+            error = Describe(tmp, "open failed", errno);
             return false;
         }
         char header[20];
@@ -234,12 +248,14 @@ bool WriteManifest(const std::string& area, const std::vector<ImageRecord>& reco
         }
         out.close();
         if (!out) {
+            error = Describe(tmp, "write failed", errno);
             std::filesystem::remove(tmp, ec);
             return false;
         }
     }
     std::filesystem::rename(tmp, path, ec);
     if (ec) {
+        error = Describe(path, "rename failed", ec.value());
         std::filesystem::remove(tmp, ec);
         return false;
     }
@@ -259,10 +275,9 @@ SaveQueue& Queue() {
     return *queue;
 }
 
-// Writes one area: the records are copied under g_mutex, then written without it. A failed write
-// leaves the area dirty, so the next request saves it again. Only the worker calls it, so the
-// writes happen one at a time, in the order of their copies.
-void SaveArea(const std::string& area) {
+// Writes one area (caller holds g_write_mutex): the records are copied under g_mutex, then written
+// without it. A failed write leaves the area dirty, so the next save retries it.
+void SaveAreaLocked(const std::string& area) {
     std::vector<ImageRecord> records;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -273,7 +288,12 @@ void SaveArea(const std::string& area) {
         it->second.dirty = false;
         records = it->second.records;
     }
-    if (!WriteManifest(area, records)) {
+    std::string error;
+    if (WriteManifest(area, records, error)) {
+        std::fprintf(stderr, "SOTC AREA PREWARM: saved %s (%zu images)\n",
+                     ManifestPath(area).string().c_str(), records.size());
+    } else {
+        std::fprintf(stderr, "SOTC AREA PREWARM: save failed: %s\n", error.c_str());
         std::lock_guard<std::mutex> lock(g_mutex);
         if (auto it = g_areas.find(area); it != g_areas.end()) {
             it->second.dirty = true;
@@ -281,19 +301,58 @@ void SaveArea(const std::string& area) {
     }
 }
 
+// Saves one area, serialized with the other writers.
+void SaveArea(const std::string& area) {
+    std::lock_guard<std::timed_mutex> write(g_write_mutex);
+    SaveAreaLocked(area);
+}
+
+// Current area, copied under g_mutex ("" when unknown).
+std::string CurrentArea() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_area;
+}
+
 void SaveLoop() {
     Common::SetCurrentThreadName("sotc:AreaSave");
     SaveQueue& q = Queue();
     for (;;) {
         std::string area;
+        bool queued = false;
         {
             std::unique_lock<std::mutex> lock(q.mutex);
-            q.cv.wait(lock, [&] { return !q.areas.empty(); });
-            area = std::move(q.areas.back());
-            q.areas.pop_back();
+            queued = q.cv.wait_for(lock, std::chrono::seconds(10), [&] { return !q.areas.empty(); });
+            if (queued) {
+                area = std::move(q.areas.back());
+                q.areas.pop_back();
+            }
         }
-        SaveArea(area);
+        if (queued) {
+            SaveArea(area);
+            continue;
+        }
+        // Tick without a queued save: the current area is saved if it is dirty, so a session that
+        // ends without an area change (or without a report) keeps its records.
+        const std::string current = CurrentArea();
+        if (!current.empty()) {
+            SaveArea(current);
+        }
     }
+}
+
+// Exit save of the current area. Waits at most 1 s for a write in progress; the 10 s tick covers
+// a process that ends without running atexit (TerminateProcess).
+void SaveAtExit() {
+    const std::string area = CurrentArea();
+    if (area.empty()) {
+        return;
+    }
+    std::unique_lock<std::timed_mutex> write(g_write_mutex, std::chrono::seconds(1));
+    if (!write.owns_lock()) {
+        std::fprintf(stderr, "SOTC AREA PREWARM: exit save skipped (writer busy)\n");
+        return;
+    }
+    SaveAreaLocked(area);
 }
 
 // Queues the save of an area. Called without g_mutex. Without a worker thread (creation failed) the
@@ -393,6 +452,8 @@ void OnAreaChange(const char* area_name, std::uint64_t seq) {
     if (Mode() < 2 || !area_name) {
         return;
     }
+    static std::once_flag exit_flag;
+    std::call_once(exit_flag, [] { std::atexit(SaveAtExit); });
     const std::string name = NormalizeArea(area_name); // empty: unknown
 
     // One change at a time. The probe numbers its changes; a change older than the last applied one

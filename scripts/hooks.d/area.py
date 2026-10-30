@@ -12,7 +12,8 @@ calls the setter) and the timed advance sub_343720. All state changes pass throu
 Entry registers: rdi = the AreaLoaderState object; rsi = int* of the current state (the value is
 *rsi); rdx = int* of the requested state (the value is *rdx, read before the clamp of the setter).
 
-Both hooks: switch SOTC_AREA_PREWARM, group area_prewarm.
+AREA_PRECACHE and AREA_LOADER_STATE: switch SOTC_AREA_PREWARM, group area_prewarm.
+AREA_ZONE_ACTIVATE: switch SOTC_AREA_PREWARM, group area_zone (see its entry below).
 
 Checks (EU 1.01 eboot, tools/re/eboot_re.py):
 - 0x533100: displaced bytes push rbp / mov rbp,rsp / push r15 (6 bytes). The 32-byte pattern is unique.
@@ -57,6 +58,17 @@ HOOKS = [
         # push rbp; mov rbp,rsp; push r15; push r14; push r13; push r12; push rbx; sub rsp,0x2d8; ...
         pattern='55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec d8 02 00 00 48 8b 05 ?? ?? ?? ?? 48 89 bd 00 fd',
         expected={EU_FINGERPRINT: 0x533100},
+    ),
+    # Zone change (free roam): entry of ZoneActivate (0x34fb30), void (mgr rdi, zoneId esi, param3 rdx).
+    # First statement: *(uint*)(mgr+0xf4) = zoneId. Zone table: begin/end at mgr+0xa0/+0xa8, records of
+    # 0x80 bytes sorted by the uint key at record+0. Own group: it does not depend on the hooks below.
+    dict(
+        name='AREA_ZONE_ACTIVATE',
+        switch='SOTC_AREA_PREWARM',
+        group='area_zone',
+        mode='entry',
+        pattern='55 48 89 e5 41 57 41 56 41 55 41 54 53 48 83 ec 68 48 8b 05 ?? ?? ?? ?? 49 89 d4 48 8b 00 48 89',
+        expected={EU_FINGERPRINT: 0x34fb30},
     ),
     dict(
         name='AREA_LOADER_STATE',

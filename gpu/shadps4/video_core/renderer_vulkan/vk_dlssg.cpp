@@ -770,8 +770,16 @@ PFN_vkGetInstanceProcAddr LoadInterposer() {
                                               sl::kFeatureDLSS};
     static const sl::Feature features_fg[] = {sl::kFeatureDLSS_G, sl::kFeatureReflex,
                                               sl::kFeaturePCL};
-    const sl::Feature* features = want_sr ? features_sr : features_fg;
-    const size_t feature_count = want_sr ? std::size(features_sr) : std::size(features_fg);
+    // sotc: DLSS with frame generation off at start: the DLSS plugin alone. Reflex and PCL loaded
+    // but unused are the likely cause of DLSS losing FPS with the driver's Low Latency Mode: Ultra
+    // (2mg, fork issue #5, RTX 2080 Ti: 48.5 against 59.1 FPS with Off). F8 then offers FSR 3 frame
+    // generation only. SOTC_SL_ALL=1: load them anyway.
+    static const sl::Feature features_dlss[] = {sl::kFeatureDLSS};
+    const bool dlss_only = want_sr && !FrameGen::AskedAtStart() && !std::getenv("SOTC_SL_ALL");
+    const sl::Feature* features = dlss_only ? features_dlss : want_sr ? features_sr : features_fg;
+    const size_t feature_count = dlss_only ? std::size(features_dlss)
+                                 : want_sr ? std::size(features_sr)
+                                           : std::size(features_fg);
     sl::Preferences pref{};
     pref.showConsole = false;
     pref.logLevel = log_level >= 2 ? sl::LogLevel::eVerbose : sl::LogLevel::eDefault;

@@ -10,6 +10,7 @@
 #include "common/types.h"
 #include "video_core/buffer_cache/region_manager.h"
 #include "video_core/sotc_stats.h"
+#include "video_core/sotc_trace.h" // sotc: SOTC_TRACE (redirty instants)
 
 namespace VideoCore {
 
@@ -481,6 +482,13 @@ private:
         free_managers.pop_back();
         // sotc: SOTC_WRITE_DECL: the lock-free readers (acquire loads) see the region built above.
         __atomic_store_n(&top_tier[page_index], new_manager, __ATOMIC_RELEASE);
+        // sotc: SOTC_TRACE "redirty first touch": the region's CPU bits were filled with ones in
+        // the RegionManager constructor (pool slots), so its whole 16 MiB counts as CPU-modified.
+        if (SotcTrace::kOn) {
+            const uint64_t now = SotcTrace::Now();
+            SotcTrace::PushEvent(SotcTrace::EvInstant, "redirty first touch", now, now,
+                                 HIGHER_PAGE_SIZE, base_cpu_addr);
+        }
         live_managers.push_back(new_manager);
         return new_manager;
     }

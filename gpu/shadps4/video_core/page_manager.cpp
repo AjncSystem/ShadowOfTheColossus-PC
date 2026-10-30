@@ -24,6 +24,7 @@
 #include "common/multi_level_page_table.h"
 #include "common/signal_context.h"
 #include "common/thread.h"
+#include "sotc_backing_warm.h" // sotc: SOTC_BACKING_WARM (gpu/shim)
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "common/decoder.h"
@@ -1439,6 +1440,11 @@ struct SignalImpl : public PageManager::Impl {
             }
             if (track_fault) {
                 SotcStats::FaultStat::Done(extent_lo, extent_hi);
+            }
+            // sotc: SOTC_BACKING_WARM: the backing view pages of what the guest writes next are
+            // touched by the warm thread, before an upload reads them (lock-free queue push).
+            if (!is_gpu_thread) {
+                SotcBackingWarm::Note(extent_lo, extent_hi - extent_lo);
             }
             {
                 // sotc: SOTC_PROTECT_COALESCE: the page must be writable before the guest

@@ -212,6 +212,29 @@ public:
     /// (fill-shader tables written by the command processor). Not resident: TryReplaceFromCpu.
     bool TryWriteThroughFromCpu(VAddr addr, const void* data, u64 size);
 
+    /// sotc: SOTC_FILL_HLE_GPU. TryWriteThroughFromCpu for a table that repeats a pattern of
+    /// `period` bytes (`period` == `size`: no repeat). The backing gets `data` from the CPU; the
+    /// arena is filled by the GPU (a fill when `period` is 4, else one uploaded seed of at most
+    /// ~1 MiB doubled by copies inside the arena), so the full table is never copied through a
+    /// staging buffer or marked CPU-written. `source` (may be 0): guest address of a copy's
+    /// source, used for a GPU-to-GPU copy when it is resident in the same arena and its pages are
+    /// in sync. `path` gets how it was done (FillGpuPath). Not resident: TryReplaceFromCpu.
+    bool TryFillThroughFromCpu(VAddr addr, const void* data, u64 size, u64 period, VAddr source,
+                               u32& path);
+
+    /// sotc: the arena holding [addr, addr + size) when the whole range is resident in one
+    /// arena, else nullptr.
+    const Buffer* ResidentArena(VAddr addr, u64 size) const;
+
+    /// sotc: values of TryFillThroughFromCpu's `path` (also the `aux` of the "hle fill" trace).
+    enum FillGpuPath : u32 {
+        FillPathReplace = 1, ///< not resident in one arena: TryReplaceFromCpu (marked CPU-written)
+        FillPathFill = 2,    ///< vkCmdFillBuffer (period 4)
+        FillPathDouble = 3,  ///< a seed upload, then doubling copies in the arena
+        FillPathUpload = 4,  ///< no repeat: the whole table through staging (write-through)
+        FillPathGpuCopy = 5, ///< no repeat: a copy from the source's arena range
+    };
+
     /// Byte-precise: true when a written binding covered any byte of the range since its last
     /// readback. Readbacks copy only these bytes, so the backing holds every other byte.
     /// Command processor thread only.

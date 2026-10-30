@@ -188,6 +188,63 @@ Readers: the holder span is not time spent by its thread, so it is left out of t
 A trace without `mutex holder` spans (older recorders) simply has no holder table. A wait without
 a holder span is counted with holder `-`.
 
+### sync copy
+
+A guest range copied into the GPU-side mirror (a span on the thread that copied it). `[t0, t1)` =
+the copy, `a` = bytes copied, `flags` = number of copy pieces, and:
+
+| Field | Meaning |
+|---|---|
+| `b` | start address of the synchronized guest range (guest address, as in `image_base`/`image_size`) |
+| `aux` | reason code of the caller (below) |
+
+Reason codes:
+
+| `aux` | Reason | Caller |
+|---|---|---|
+| 0 | untagged | no caller tag |
+| 1 | `bind` | ObtainBuffer normal bind |
+| 2 | `written` | ObtainBuffer written-extent sync |
+| 3 | `dma` | DMA sweep (SynchronizeDmaBuffers) |
+| 4 and up | `code N` | other callers (labels not yet assigned; readers show the raw code) |
+
+Old traces (before the reason and address fields) have `aux` 0 and `b` = the number of pieces, not
+an address. A reader takes a copy span as old when `aux` is 0 and `b` is below 1 << 20: it counts
+the span as reason 0 with no address, so it has no region.
+
+### write fault
+
+A guest write fault on a tracked page (a span). `a` = the guest address of the fault.
+
+### redirty instants
+
+Instants (`kind` 1) named `redirty first touch`, `redirty unmap`, `redirty evict` or
+`redirty other`. The suffix is the kind used by `copysrc`. Each marks bytes CPU-dirty without a
+guest fault: `a` = bytes marked, `b` = start address.
+
+### hle fill
+
+An instant (`kind` 1) per whole-table replace of the fill (replicate) shader HLE
+(`vk_shader_hle.cpp`): `a` = table bytes, `b` = destination address, `flags` = log2 of the pattern
+period in bytes (the period is the table size when it does not repeat), and `aux` = how the
+table reached the GPU (`BufferCache::FillGpuPath`):
+
+| `aux` | Path |
+|---|---|
+| 1 | replace: the range was marked CPU-written (the DMA sweep or a bind copies it later). Always this without `SOTC_FILL_HLE_GPU=1` |
+| 2 | GPU fill (`vkCmdFillBuffer`, period 4) |
+| 3 | one uploaded seed, doubled by copies inside the arena |
+| 4 | the whole table through a staging buffer (no repeat) |
+| 5 | a GPU copy from the source's arena range (no repeat) |
+
+Replaces of changed pages only (`ReplaceChangedPages`) are not recorded here.
+
+`copysrc` (`tools/trace/sotc_trace.py copysrc`) reads these: copy bytes and time per reason, the
+top 64 MiB regions, the size histogram, the re-dirty totals per kind, and for each reason the
+share of its copied bytes whose 64 MiB region got a re-dirty marker or a write fault, and the
+`hle fill` tables by path and period. `hitch` adds
+one line per slow frame with the copy bytes by reason when the trace has the address fields.
+
 ## Self-stats object
 
 `{"mode", "rings", "events", "events_per_s", "bytes_per_s", "dropped", "windows_overwritten",

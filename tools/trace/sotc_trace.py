@@ -9,6 +9,7 @@ docs/sotc/TRACE-FORMAT.md) and for the old Chrome JSON dumps (traceEvents, .json
     python tools/trace/sotc_trace.py diff  A B [--md out.md] [--top 15]
     python tools/trace/sotc_trace.py autofuncs <file|folder...> -o scripts/hooks.d/trace_funcs.py
                                               [--top 20] [--min-ms 1.0]
+    python tools/trace/sotc_trace.py copysrc <file|folder...> [--md out.md] [--frame-only]
 
 top: total time by span name per thread, the sample profiles (flat and inclusive, symbolized),
 the IMPORT_STATS totals and the GPU time (EvGpu). --folded writes Brendan Gregg folded stacks
@@ -33,6 +34,12 @@ function (means per trace).
 autofuncs: picks the guest functions with the most sampled time and hitch span time, reads a
 unique byte signature of each with tools/re/eboot_re.py sig, and writes a scripts/hooks.d file of
 mode 'time' hooks (switch SOTC_TRACE_FUNCS, group trace_funcs).
+
+copysrc: where the guest bytes that were synchronized to the GPU came from. The "sync copy" spans
+split by caller reason (aux) and by 64 MiB region of the copied range (b), the size histogram, the
+"redirty" instants (bytes marked CPU-dirty without a guest fault) and the "write fault" spans, and
+for each reason the share of its copied bytes whose region was re-dirtied or faulted. --frame-only
+counts only the slow frame. Old traces (no copy address) count as reason 0 with unknown regions.
 
 Guest addresses are symbolized from out/re/index.pkl.gz (build it once with tools/re/eboot_re.py
 build), names from tools/re/names.txt and out/re/ghidra/names2.txt. Host addresses use
@@ -81,6 +88,18 @@ MUTEX_WAIT = 'mutex wait'      # a contended guest mutex: b = the waiter's calle
 MUTEX_HOLDER = 'mutex holder'  # same t0/t1 as its wait: a = holder thread id, b = holder's lock site
 SAMPLE_CAP_NS = 100_000_000   # a sample weighs the time to the next one, at most this
 CATEGORIES = ('draw ms', 'gpu ms', 'imports ms', 'waits ms', 'samples', 'slow frames')
+COPY_NAME = 'sync copy'            # EvSpan: a = bytes copied, b = start address, aux = reason
+WRITE_FAULT_NAME = 'write fault'   # a = guest address of the fault
+REDIRTY_PREFIX = 'redirty '        # EvInstant: a = bytes marked CPU-dirty, b = start address
+HLE_FILL_NAME = 'hle fill'         # EvInstant: a = bytes, b = address, aux = path, flags = log2 period
+HLE_FILL_PATHS = {1: 'replace (CPU-written)', 2: 'GPU fill', 3: 'GPU doubling',
+                  4: 'staging upload', 5: 'GPU copy from source'}
+COPY_REASONS = {0: 'untagged', 1: 'bind', 2: 'written', 3: 'dma'}
+COPY_PIECES_LIMIT = 1 << 20        # old recorders: aux 0 and b below this is a piece count
+REGION_SHIFT = 26                  # 64 MiB regions
+MIB = 1 << 20
+SIZE_LIMITS = (64 << 10, 1 << 20, 8 << 20, 32 << 20)
+SIZE_LABELS = ('<64K', '64K-1M', '1-8M', '8-32M', '>=32M')
 Sample = collections.namedtuple('Sample', 'ns thread stack')   # stack: names, leaf first
 
 
@@ -799,18 +818,28 @@ def _grown(slow, normals, top):
             if slow.get(k, 0.0) - typical[k] > 0]
 
 
-def hitch_file(trace, sym, top=10, callers=3):
-    """One result per slow frame of a trace (see the module docstring)."""
+def slow_frames(trace):
+    """(every frame event sorted by t0, the slow ones): flag bit 0, else the frame number of
+    the META (a dump's frame)."""
     frames = sorted((e for e in trace.all_events() if e.kind == K_FRAME), key=lambda e: e.t0)
     slow = [f for f in frames if f.flags & FLAG_SLOW]
     if not slow and 'frame' in trace.meta:
         slow = [f for f in frames if f.a == trace.meta['frame']]
+    return frames, slow
+
+
+def hitch_file(trace, sym, top=10, callers=3):
+    """One result per slow frame of a trace (see the module docstring)."""
+    frames, slow = slow_frames(trace)
     lanes = span_lanes(trace)
     cls = _classify_module()
     samples = sample_rows(trace, sym)
     sample_ns = [s.ns for s in samples]
     has_gpu = any(e.kind == K_GPU for e in trace.all_events())
     holder_pairs = mutex_pairs(trace) if has_mutex_holders(trace) else None
+    copies = sorted((e for e in trace.all_events() if is_copy_span(e)), key=lambda e: e.t0)
+    copy_starts = [e.t0 for e in copies]
+    copy_fields = any(not copy_is_legacy(e) for e in copies)
     results = []
     for f in slow:
         f0, f1 = f.t0 / 1000.0, f.t1 / 1000.0
@@ -864,13 +893,19 @@ def hitch_file(trace, sym, top=10, callers=3):
         stats = cls.frame_stats(f0, f1, [(lane.label, lane.window(f0, f1)) for lane in lanes])
         mutex = mutex_rows(trace, sym, holder_pairs, (f.t0, f.t1), top) \
             if holder_pairs else None
+        copy = None
+        if copy_fields:
+            lo = bisect.bisect_left(copy_starts, f.t0)
+            hi = bisect.bisect_left(copy_starts, f.t1)
+            copy = _copy_by_reason(copies[lo:hi])
         results.append({
             'file': trace.path.name, 'frame': f.a, 'segment': f.name,
             'ms': (f1 - f0) / 1000.0, 'normal_frames': len(normal),
             'typical_ms': (statistics.median([(n.t1 - n.t0) / 1e6 for n in normal])
                            if normal else None),
             'verdict': stats['cause'], 'top': rows,
-            'funcs': func_rows, 'imports': imp_rows, 'gpu': gpu_row, 'mutex': mutex})
+            'funcs': func_rows, 'imports': imp_rows, 'gpu': gpu_row, 'mutex': mutex,
+            'copy': copy})
     return results
 
 
@@ -893,6 +928,10 @@ def hitch_markdown(name, results):
                    if r['typical_ms'] is not None else 'no normal frames to compare with')
         out += [f"### frame {r['frame']} ({_md(r['segment'])}): {r['ms']:.1f} ms, "
                 f"verdict: {r['verdict']}", '', f'Typical frame: {typical}.', '']
+        if r.get('copy') is not None:
+            split = ', '.join(f'{label} {_mib(b)} MiB' for label, b in r['copy'].items()) \
+                or 'none'
+            out += [f'Sync copy by caller: {split}.', '']
         if not r['top']:
             out += ['No span grew inside this frame.', '']
         else:
@@ -932,6 +971,284 @@ def hitch_markdown(name, results):
             out += ['', 'Holder threads: ' + '; '.join(f'{_md(name)} {ms:.1f} ms'
                                                        for name, ms in m['holders']) + '.', '']
     return out
+
+
+# ---------------------------------------------------------------- sync copies (copysrc)
+
+def is_copy_span(e):
+    return e.kind == K_SPAN and e.name == COPY_NAME
+
+
+def copy_is_legacy(e):
+    """An old recorder's copy span: aux 0 and b is the number of pieces, not an address."""
+    return e.aux == 0 and e.b < COPY_PIECES_LIMIT
+
+
+def reason_label(code):
+    return COPY_REASONS.get(code, f'code {code}')
+
+
+def size_label(n):
+    return SIZE_LABELS[bisect.bisect_right(SIZE_LIMITS, n)]
+
+
+def _mib(n):
+    return f'{n / MIB:.1f}'
+
+
+def _copy_by_reason(spans):
+    """{reason label: bytes} of the copy spans, biggest first, zero reasons left out."""
+    out = collections.Counter()
+    for e in spans:
+        out[reason_label(e.aux)] += e.a
+    return {label: b for label, b in out.most_common() if b > 0}
+
+
+def _new_reason():
+    return {'count': 0, 'bytes': 0, 'ms': 0.0, 'unknown': 0, 'buckets': collections.Counter(),
+            'sizes_n': collections.Counter(), 'sizes_b': collections.Counter()}
+
+
+def _new_mark():
+    return {'count': 0, 'bytes': 0, 'buckets': collections.Counter(),
+            'bytes_buckets': collections.Counter()}
+
+
+def new_copy_totals():
+    return {'files': 0, 'window': '', 'reasons': {}, 'redirty': {},
+            'faults': {'count': 0, 'buckets': collections.Counter()},
+            'hle': {}}   # (path, log2 period) -> {'count', 'bytes'}
+
+
+def copy_totals(trace, frame_only=False):
+    """The sync copy, re-dirty and write fault totals of one trace. An event counts when it
+    starts inside the dump window (META window_ns, when present) and, with frame_only, inside
+    a slow frame. Buckets are 64 MiB regions of the start address."""
+    win = trace.meta.get('window_ns')
+    dump = (int(win[0]), int(win[1])) if isinstance(win, (list, tuple)) and len(win) == 2 \
+        else None
+    parts, frames = [], None
+    if dump is not None:
+        parts.append(f'dump window {dump[0] / 1e6:.1f}-{dump[1] / 1e6:.1f} ms')
+    if frame_only:
+        _, slow = slow_frames(trace)
+        frames = [(f.t0, f.t1) for f in slow]
+        parts.append('slow frame ' + ', '.join(str(f.a) for f in slow) if slow
+                     else 'no slow frame, nothing counted')
+    tot = new_copy_totals()
+    tot['window'] = ' and '.join(parts) or 'whole file'
+    tot['files'] = 1
+    for e in trace.all_events():
+        t0 = e.t0
+        if dump is not None and not dump[0] <= t0 < dump[1]:
+            continue
+        if frames is not None and not any(a <= t0 < b for a, b in frames):
+            continue
+        if is_copy_span(e):
+            r = tot['reasons'].setdefault(e.aux, _new_reason())
+            r['count'] += 1
+            r['bytes'] += e.a
+            r['ms'] += (e.t1 - e.t0) / 1e6
+            r['sizes_n'][size_label(e.a)] += 1
+            r['sizes_b'][size_label(e.a)] += e.a
+            if copy_is_legacy(e):
+                r['unknown'] += e.a
+            else:
+                r['buckets'][e.b >> REGION_SHIFT] += e.a
+        elif e.kind == K_INSTANT and e.name.startswith(REDIRTY_PREFIX):
+            m = tot['redirty'].setdefault(e.name[len(REDIRTY_PREFIX):], _new_mark())
+            bucket = e.b >> REGION_SHIFT
+            m['count'] += 1
+            m['bytes'] += e.a
+            m['buckets'][bucket] += 1
+            m['bytes_buckets'][bucket] += e.a
+        elif e.name == WRITE_FAULT_NAME:
+            tot['faults']['count'] += 1
+            tot['faults']['buckets'][e.a >> REGION_SHIFT] += 1
+        elif e.kind == K_INSTANT and e.name == HLE_FILL_NAME:
+            h = tot['hle'].setdefault((e.aux, e.flags), {'count': 0, 'bytes': 0})
+            h['count'] += 1
+            h['bytes'] += e.a
+    return tot
+
+
+def merge_copy_totals(into, other):
+    into['files'] += other['files']
+    for code, r in other['reasons'].items():
+        t = into['reasons'].setdefault(code, _new_reason())
+        for key in ('count', 'bytes', 'unknown'):
+            t[key] += r[key]
+        t['ms'] += r['ms']
+        for key in ('buckets', 'sizes_n', 'sizes_b'):
+            t[key].update(r[key])
+    for kind, m in other['redirty'].items():
+        t = into['redirty'].setdefault(kind, _new_mark())
+        for key in ('count', 'bytes'):
+            t[key] += m[key]
+        for key in ('buckets', 'bytes_buckets'):
+            t[key].update(m[key])
+    into['faults']['count'] += other['faults']['count']
+    into['faults']['buckets'].update(other['faults']['buckets'])
+    for key, h in other.get('hle', {}).items():
+        t = into.setdefault('hle', {}).setdefault(key, {'count': 0, 'bytes': 0})
+        t['count'] += h['count']
+        t['bytes'] += h['bytes']
+    return into
+
+
+def _share(buckets, known, regions):
+    """The share of the bytes in buckets whose region is in regions (None without bytes)."""
+    if not known:
+        return None
+    return sum(v for b, v in buckets.items() if b in regions) / known
+
+
+def copy_overlap(tot):
+    """Per reason: the copied bytes with a known address and the share of them whose 64 MiB
+    region got a re-dirty marker of each kind, or a write fault."""
+    marked = {kind: set(m['buckets']) for kind, m in tot['redirty'].items()}
+    faulted = set(tot['faults']['buckets'])
+    rows = []
+    for code in sorted(tot['reasons']):
+        buckets = tot['reasons'][code]['buckets']
+        known = sum(buckets.values())
+        rows.append({'reason': code, 'known': known,
+                     'kinds': {k: _share(buckets, known, s) for k, s in sorted(marked.items())},
+                     'faults': _share(buckets, known, faulted)})
+    return rows
+
+
+def copy_conclusion(tot):
+    reasons = tot['reasons']
+    if not reasons:
+        return 'Conclusion: no sync copy span in the window.'
+    total = sum(r['bytes'] for r in reasons.values())
+    top = max(reasons, key=lambda c: (reasons[c]['bytes'], -c))
+    share = reasons[top]['bytes'] / total if total else 0.0
+    text = (f'Conclusion: the dominant copy reason is {reason_label(top)} '
+            f'({_mib(reasons[top]["bytes"])} of {_mib(total)} MiB, {share:.0%} of the bytes).')
+    if tot['redirty']:
+        kind = max(tot['redirty'], key=lambda k: (tot['redirty'][k]['bytes'], k))
+        m = tot['redirty'][kind]
+        text += (f' The dominant re-dirty kind is {_md(kind)} '
+                 f'({_mib(m["bytes"])} MiB in {m["count"]} markers).')
+    else:
+        text += ' No re-dirty marker in the window.'
+    return text
+
+
+def _reason_table(tot):
+    rows = ['| reason | spans | MiB | ms | MiB without address |', '|---|---|---|---|---|']
+    for code in sorted(tot['reasons']):
+        r = tot['reasons'][code]
+        rows.append(f"| {_md(reason_label(code))} | {r['count']} | {_mib(r['bytes'])} | "
+                    f"{r['ms']:.1f} | {_mib(r['unknown'])} |")
+    return rows
+
+
+def _mark_table(tot):
+    if not tot['redirty']:
+        return ['No re-dirty marker in the window.']
+    rows = ['| re-dirty kind | markers | MiB |', '|---|---|---|']
+    for kind in sorted(tot['redirty']):
+        m = tot['redirty'][kind]
+        rows.append(f"| {_md(kind)} | {m['count']} | {_mib(m['bytes'])} |")
+    return rows
+
+
+def _region_name(bucket):
+    start = bucket << REGION_SHIFT
+    return f'0x{start:08x}-0x{start + (1 << REGION_SHIFT) - 1:08x}'
+
+
+def copy_lines(files, pooled):
+    """The copysrc report (markdown; printed and written with --md): one section per trace
+    with the totals, then the pooled tables and the conclusion."""
+    out = []
+    for name, tot in files:
+        out += [f'## {_md(name)}', '', f'Window: {tot["window"]}.', '']
+        out += _reason_table(tot) if tot['reasons'] else ['No sync copy span in the window.']
+        out += ['']
+        out += _mark_table(tot)
+        out += [f"Write faults in the window: {tot['faults']['count']}.", '']
+    out += [f'## Pooled over {pooled["files"]} dump(s)', '']
+    out += _reason_table(pooled) if pooled['reasons'] else ['No sync copy span in the window.']
+    out += ['']
+    out += _mark_table(pooled)
+    out += [f"Write faults in the window: {pooled['faults']['count']}.", '']
+    for code in sorted(pooled['reasons']):
+        r = pooled['reasons'][code]
+        out += [f'### {_md(reason_label(code))}: top regions (64 MiB, copy start)', '']
+        if not r['buckets']:
+            out += ['No copy with a known address (old trace).', '']
+            continue
+        out += ['| region | MiB |', '|---|---|']
+        for bucket, b in r['buckets'].most_common(10):
+            out.append(f'| {_region_name(bucket)} | {_mib(b)} |')
+        out.append('')
+    if pooled['reasons']:
+        out += ['### Size histogram: copies per size class (count / MiB)', '',
+                '| reason | ' + ' | '.join(SIZE_LABELS) + ' |',
+                '|---|' + '---|' * len(SIZE_LABELS)]
+        for code in sorted(pooled['reasons']):
+            r = pooled['reasons'][code]
+            cells = [f"{r['sizes_n'][s]} / {_mib(r['sizes_b'][s])}" for s in SIZE_LABELS]
+            out.append(f'| {_md(reason_label(code))} | ' + ' | '.join(cells) + ' |')
+        out.append('')
+    if pooled['redirty']:
+        regions = collections.Counter()
+        for m in pooled['redirty'].values():
+            regions.update(m['bytes_buckets'])
+        out += ['### Re-dirty: top regions (64 MiB)', '', '| region | MiB | by kind (MiB) |',
+                '|---|---|---|']
+        for bucket, b in regions.most_common(10):
+            by_kind = ', '.join(f"{_md(k)} {_mib(m['bytes_buckets'][bucket])}"
+                                for k, m in sorted(pooled['redirty'].items())
+                                if m['bytes_buckets'][bucket])
+            out.append(f'| {_region_name(bucket)} | {_mib(b)} | {by_kind} |')
+        out.append('')
+    if pooled['reasons']:
+        kinds = sorted(pooled['redirty'])
+        out += ['### Overlap: share of each reason\'s copied bytes (with an address) whose region '
+                'got a re-dirty marker of the kind, or a write fault', '',
+                '| reason | copied MiB with address | ' + ' | '.join(_md(k) for k in kinds)
+                + ' | write fault |', '|---|---|' + '---|' * (len(kinds) + 1)]
+        for row in copy_overlap(pooled):
+            def pct(v):
+                return '-' if v is None else f'{v:.0%}'
+            cells = [pct(row['kinds'][k]) for k in kinds] + [pct(row['faults'])]
+            out.append(f"| {_md(reason_label(row['reason']))} | {_mib(row['known'])} | "
+                       + ' | '.join(cells) + ' |')
+        out.append('')
+    if pooled.get('hle'):
+        out += ['### hle fill: whole-table replaces of the fill shader HLE', '',
+                '| path | pattern period | tables | MiB |', '|---|---|---|---|']
+        for (path, log2), h in sorted(pooled['hle'].items(), key=lambda kv: -kv[1]['bytes']):
+            label = HLE_FILL_PATHS.get(path, f'path {path}')
+            out.append(f"| {_md(label)} | {1 << log2} B | {h['count']} | {_mib(h['bytes'])} |")
+        out.append('')
+    out += [copy_conclusion(pooled), '']
+    return out
+
+
+def cmd_copysrc(args):
+    files, pooled, status = [], new_copy_totals(), 0
+    for path in expand_inputs(args.files):
+        trace = _open_trace(path)
+        if trace is None:
+            status = 1
+            continue
+        tot = copy_totals(trace, args.frame_only)
+        files.append((trace.path.name, tot))
+        merge_copy_totals(pooled, tot)
+    if not files:
+        print('copysrc: no trace loaded', file=sys.stderr)
+        return 1
+    text = '\n'.join(copy_lines(files, pooled))
+    print(text)
+    if args.md:
+        Path(args.md).write_text(text + '\n', encoding='utf-8')
+    return status
 
 
 # ---------------------------------------------------------------- top / info
@@ -1515,6 +1832,11 @@ def main(argv=None):
     p.add_argument('--eboot', default=str(ROOT / 'out' / 'eboot.elf'),
                    help='the eboot whose fingerprint the hooks name (default out/eboot.elf)')
     p.set_defaults(func=cmd_autofuncs)
+    p = sub.add_parser('copysrc', help='sync copy by reason and region, re-dirty, write faults')
+    p.add_argument('files', nargs='+', help='trace files or folders')
+    p.add_argument('--md', help='also write the report here')
+    p.add_argument('--frame-only', action='store_true', help='count only the slow frame')
+    p.set_defaults(func=cmd_copysrc)
     args = ap.parse_args(argv)
     return args.func(args)
 

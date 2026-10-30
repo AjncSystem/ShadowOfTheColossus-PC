@@ -51,6 +51,37 @@ namespace VideoCore {
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
 static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
 
+// sotc: SOTC_TRACE reason of the SynchronizeMemory calls on this thread (the "sync copy" aux).
+// 0 untagged, 1 ObtainBuffer normal bind, 2 ObtainBuffer written-extent sync (SOTC_WRITE_EXTENT),
+// 3 SynchronizeDmaBuffers sweep, 4 SynchronizeBinding (no caller in the tree today).
+thread_local uint32_t tl_sync_reason = 0;
+struct SyncReason {
+    uint32_t prev = 0;
+    bool active = false;
+    explicit SyncReason(uint32_t reason) {
+        if (SotcTrace::kOn) {
+            active = true;
+            prev = tl_sync_reason;
+            tl_sync_reason = reason;
+        }
+    }
+    ~SyncReason() {
+        if (active) {
+            tl_sync_reason = prev;
+        }
+    }
+    SyncReason(const SyncReason&) = delete;
+    SyncReason& operator=(const SyncReason&) = delete;
+};
+
+// sotc: SOTC_TRACE instant for CPU-dirty marks that come without a guest write fault.
+static void TraceRedirty(const char* name, VAddr addr, u64 size) {
+    if (SotcTrace::kOn) {
+        const uint64_t now = SotcTrace::Now();
+        SotcTrace::PushEvent(SotcTrace::EvInstant, name, now, now, size, addr);
+    }
+}
+
 /// sotc: SOTC_RB_NARROW=<KiB> (power of two, 4-512; 1 or unset = 64 KiB): the readback window,
 /// in bytes; 0 keeps the 512 KiB one (Shrine: 46.0 FPS at 512 KiB, 47.9-48.8 at 64, 47.5 at 128,
 /// 42.9 at 32, where the readbacks double). A readback unprotects every GPU-written page of its
@@ -596,6 +627,7 @@ void BufferCache::DropGpuModified(VAddr device_addr, u64 size) {
         if (!gpu_ranges && !cmd_in_use) {
             EraseGranuleSnapshots(device_addr, size);
             if (memory_tracker->MarkCpuModifiedUnlessGpu(device_addr, size)) {
+                TraceRedirty("redirty unmap", device_addr, size);
                 SotcStats::drop_fast.fetch_add(1, std::memory_order_relaxed);
                 SotcStats::NoteFastDrop(device_addr, size); // diagnostics for a bad packet
                 return;
@@ -617,6 +649,7 @@ void BufferCache::DropGpuModified(VAddr device_addr, u64 size) {
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
         MarkInflightReadbacksDirty(device_addr, size, StaleReason::Unmap);
         memory_tracker->MarkRegionAsCpuModified(device_addr, size);
+        TraceRedirty("redirty unmap", device_addr, size);
     };
     if (async) {
         liverpool->SendOrderedCommand(std::move(drop));
@@ -5317,9 +5350,11 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
                           u64{mark_offset} + mark_size <= size &&
                           (mark_offset != 0 || mark_size < size);
     if (narrowed) {
+        const SyncReason sync_reason{2}; // sotc: SOTC_TRACE reason 2 (written-extent sync)
         SynchronizeMemory(arena, device_addr + mark_offset, mark_size, true, false);
         SynchronizeMemory(arena, device_addr, size, false, false);
     } else {
+        const SyncReason sync_reason{1}; // sotc: SOTC_TRACE reason 1 (normal bind)
         SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
     }
     if (is_texel_buffer && !is_written && SotcStats::kOptOff) {
@@ -5885,7 +5920,8 @@ void BufferCache::NoteWriteAgainstXferReads(VAddr addr, u64 size) {
 std::pair<const Buffer*, u64> BufferCache::ObtainGuestCopyForImage(VAddr device_addr, u32 size) {
     const auto staging = [&] {
         const SotcStats::SplitTimer staging_split{SotcStats::SplitTexStaging};
-        return staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
+        // sotc: SOTC_STAGING_CACHED picks the type (StagingBufferPool::UploadType)
+        return staging_pool.Request(size, staging_pool.UploadType(),
                                     instance.StorageMinAlignment());
     }();
     const SotcStats::SplitTexCopyScope copy_split{staging.size};
@@ -5902,7 +5938,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
     }
     const auto staging = [&] {
         const SotcStats::SplitTimer staging_split{SotcStats::SplitTexStaging};
-        return staging_pool.Request(size, VideoCore::MemoryType::HostUncached,
+        // sotc: SOTC_STAGING_CACHED picks the type (StagingBufferPool::UploadType)
+        return staging_pool.Request(size, staging_pool.UploadType(),
                                     instance.StorageMinAlignment());
     }();
     // sotc: SOTC_DRAW_SPLIT: the copy's bytes and time (the async queueing below included).
@@ -5956,6 +5993,7 @@ bool BufferCache::TryReplaceFromCpu(VAddr addr, const void* data, u64 size) {
         return false;
     }
     memory_tracker->MarkRegionAsCpuModified(addr, size);
+    TraceRedirty("redirty other", addr, size);
     return true;
 }
 
@@ -5997,11 +6035,114 @@ bool BufferCache::TryWriteThroughFromCpu(VAddr addr, const void* data, u64 size)
     }
     // The arena gets the same bytes now, in stream order, so the CPU bits stay as they are: a
     // clean page stays clean and write-protected, a dirty one uploads the same bytes later.
-    const auto staging = staging_pool.Request(size, MemoryType::HostUncached);
+    const auto staging = staging_pool.Request(size, staging_pool.UploadType());
     std::memcpy(staging.mapped, data, size);
     staging.Flush();
     const vk::BufferCopy copy{staging.offset, arena->Offset(addr), size};
     runtime.CopyBuffer(staging.buffer, arena, std::span{&copy, 1});
+    RecordCurrentWrite(addr, size);
+    return true;
+}
+
+// sotc: SOTC_FILL_HLE_GPU. The arena of [addr, addr + size) when it is resident in one arena, else
+// nullptr (the same test as TryWriteThroughFromCpu).
+const Buffer* BufferCache::ResidentArena(VAddr addr, u64 size) const {
+    const u64 first_block = addr >> block_shift;
+    const u64 last_block = (addr + size - 1) >> block_shift;
+    bool resident = true;
+    resident_ranges.ForEachGap(first_block, last_block + 1, [&](u64, u64) { resident = false; });
+    const Buffer* arena =
+        resident ? address_space[first_block >> blocks_per_arena_page_shift] : nullptr;
+    if (!arena || arena != address_space[last_block >> blocks_per_arena_page_shift]) {
+        return nullptr;
+    }
+    return arena;
+}
+
+bool BufferCache::TryFillThroughFromCpu(VAddr addr, const void* data, u64 size, u64 period,
+                                        VAddr source, u32& path) {
+    path = 0;
+    if (size == 0) {
+        return true;
+    }
+    const Buffer* arena = ResidentArena(addr, size);
+    if (!arena) {
+        path = FillPathReplace;
+        return TryReplaceFromCpu(addr, data, size);
+    }
+    if (!memory->GetBackingPointer(addr) || !memory->GetBackingPointer(addr + size - 1)) {
+        return false;
+    }
+    // Page tracking is page granular: other GPU-written bytes on these pages would be lost.
+    const VAddr lo = Common::AlignDown(addr, VAddr{4096});
+    const VAddr hi = Common::AlignUp(addr + size, VAddr{4096});
+    bool foreign = false;
+    gpu_modified_ranges.ForEachInRange(lo, hi - lo, [&](VAddr start, VAddr end) {
+        foreign |= start < addr || end > addr + size;
+    });
+    if (foreign) {
+        return false;
+    }
+    {
+        std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+        gpu_modified_ranges.Subtract(addr, size);
+    }
+    memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
+    MarkInflightReadbacksDirty(addr, size, StaleReason::CpuWrite);
+    if (!memory->TryWriteBacking(std::bit_cast<void*>(addr), data, size, 10)) {
+        return false;
+    }
+    // As in TryWriteThroughFromCpu, the CPU bits stay as they are: the arena gets the same bytes
+    // now, in stream order (Runtime::CopyBuffer / FillBuffer place the barriers between steps).
+    const u64 dst = arena->Offset(addr);
+    const auto upload = [&](u64 bytes) {
+        const auto staging = staging_pool.Request(bytes, staging_pool.UploadType());
+        std::memcpy(staging.mapped, data, bytes);
+        staging.Flush();
+        const vk::BufferCopy copy{staging.offset, dst, bytes};
+        runtime.CopyBuffer(staging.buffer, arena, std::span{&copy, 1});
+    };
+    if (period == 4 && (dst & 3) == 0 && (size & 3) == 0) {
+        u32 value;
+        std::memcpy(&value, data, sizeof(value));
+        runtime.FillBuffer(arena, dst, size, value);
+        path = FillPathFill;
+    } else if (period != 0 && period < size) {
+        // The seed is a whole number of periods, so each doubling copy repeats the pattern.
+        constexpr u64 SeedTarget = 1_MB;
+        const u64 seed = std::min(size, period * std::max<u64>(1, SeedTarget / period));
+        upload(seed);
+        for (u64 have = seed; have < size;) {
+            const u64 n = std::min(have, size - have);
+            const vk::BufferCopy copy{dst, dst + have, n};
+            runtime.CopyBuffer(arena, arena, std::span{&copy, 1});
+            have += n;
+        }
+        path = FillPathDouble;
+    } else {
+        // No repeat: a plain copy. The source's arena range holds the guest bytes when the source
+        // is resident and none of its pages is CPU-written (untracked pages keep their CPU bit)
+        // or GPU-written, and it does not overlap the destination.
+        const Buffer* src_arena = nullptr;
+        if (source != 0 && (source + size <= addr || addr + size <= source)) {
+            src_arena = ResidentArena(source, size);
+            if (src_arena && (!memory_tracker->IsSyncClean(source, size, false) ||
+                              IsRegionGpuModified(source, size))) {
+                src_arena = nullptr;
+            }
+        }
+        if (src_arena) {
+            const vk::BufferCopy copy{src_arena->Offset(source), dst, size};
+            runtime.CopyBuffer(src_arena, arena, std::span{&copy, 1});
+            path = FillPathGpuCopy;
+        } else {
+            upload(size);
+            path = FillPathUpload;
+        }
+    }
+    // The old path (TryReplaceFromCpu + Rasterizer::InvalidateMemory) moved the reused-bind epoch;
+    // keep doing so, the guest bytes changed.
+    SotcStats::mem_epoch.fetch_add(1, std::memory_order_relaxed);
     RecordCurrentWrite(addr, size);
     return true;
 }
@@ -6034,6 +6175,7 @@ bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
 }
 
 void BufferCache::SynchronizeDmaBuffers() {
+    const SyncReason sync_reason{3}; // sotc: SOTC_TRACE reason 3 (DMA sweep)
     // sotc: SOTC_DMA_SYNC_SKIP=1, diagnostic only: no sweep, to weigh its share of the stalls when
     // a new area loads (shaders unchanged, unlike turning the DMA off; reflections may lag).
     static const bool skip = [] {
@@ -6349,6 +6491,7 @@ void BufferCache::NoteBindUse(VAddr device_addr, u64 size) noexcept {
 void BufferCache::SynchronizeBinding(const Buffer* arena, VAddr device_addr, u32 size,
                                      bool is_texel_buffer) {
     // sotc: SOTC_BIND_CACHE_XTICK. ObtainBuffer's SynchronizeMemory for a read-only binding.
+    const SyncReason sync_reason{4}; // sotc: SOTC_TRACE reason 4 (SynchronizeBinding)
     SynchronizeMemory(arena, device_addr, size, false, is_texel_buffer);
     if (is_texel_buffer && SotcStats::kOptOff) {
         SynchronizeMemoryFromImage(arena, device_addr, size);
@@ -6686,7 +6829,8 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
         }
         const auto staging = [&] {
             SotcTrace::Scope trace_staging{"sync staging", total_size_bytes}; // sotc: SOTC_TRACE
-            return staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
+            // sotc: SOTC_STAGING_CACHED picks the type (StagingBufferPool::UploadType)
+            return staging_pool.Request(total_size_bytes, staging_pool.UploadType());
         }();
         // sotc: SOTC_HASH_SMALL=<bytes> (off by default). A dirty run no larger than that whose bytes
         // equal the ones last uploaded for exactly that run is not copied again: the arena already
@@ -6753,15 +6897,17 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
             const char* v = std::getenv("SOTC_COPY_BATCH");
             return !v || v[0] != '0';
         }();
+        // sotc: SOTC_TRACE "sync copy" (below): a = bytes copied, b = guest start, aux = reason,
+        // flags = pieces (batch) or ranges. Same timing as the scope it replaced.
+        const uint64_t copy_t0 = SotcTrace::kOn ? SotcTrace::Now() : 0;
+        uint64_t copy_bytes = 0;
+        uint64_t copy_pieces = bulk.size();
         {
-            // sotc: SOTC_TRACE "sync copy": a = bytes copied, b = pieces (batch) or ranges.
-            SotcTrace::Scope trace_copy{"sync copy"};
             if (SotcTrace::kOn) {
                 for (const auto& copy : bulk) {
-                    trace_copy.a += copy.size;
+                    copy_bytes += copy.size;
                 }
             }
-            trace_copy.b = bulk.size();
             if (copy_batch && bulk.size() > 1 && total_size_bytes >= 2_MB && BbCopy::Enabled()) {
                 struct Piece {
                     VAddr source;
@@ -6779,13 +6925,18 @@ bool BufferCache::SynchronizeMemoryFull(const Buffer* arena, VAddr device_addr, 
                 BbCopy::ParallelFor(pieces.size(), [&](std::size_t i) {
                     memory->CopySparseMemory(pieces[i].source, pieces[i].dest, pieces[i].size);
                 });
-                trace_copy.b = pieces.size();
+                copy_pieces = pieces.size();
             } else {
                 for (const auto& copy : bulk) {
                     memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset,
                                              copy.size);
                 }
             }
+        }
+        if (copy_t0) {
+            SotcTrace::PushEvent(SotcTrace::EvSpan, "sync copy", copy_t0, SotcTrace::Now(),
+                                 copy_bytes, device_addr, tl_sync_reason,
+                                 static_cast<uint16_t>(std::min<uint64_t>(copy_pieces, 65535)));
         }
         for (auto& copy : copies) {
             copy.srcOffset += staging.offset;
@@ -7733,6 +7884,7 @@ bool BufferCache::FinishEviction(std::chrono::steady_clock::time_point now, u16 
         const VAddr addr = range.start << block_shift;
         const u64 size = (range.end - range.start) << block_shift;
         memory_tracker->MarkRegionAsCpuModified(addr, size);
+        TraceRedirty("redirty evict", addr, size);
         evicted_ranges.Add({range.start, range.end});
         SotcStats::arena_evicted.fetch_add(size, std::memory_order_relaxed);
         // sotc: SOTC_HRR migration keeps the hot entries: the granule stays hot, only its memory

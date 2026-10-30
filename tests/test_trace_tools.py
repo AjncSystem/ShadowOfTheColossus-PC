@@ -860,5 +860,209 @@ class MutexHolderTest(unittest.TestCase):
         self.assertEqual(sum(1 for _, h in pairs if h is not None), 2)
 
 
+def copy_trace(path, copies=(), redirty=(), faults=(), frames=(), window=None, hle=()):
+    """A dump with sync copy spans (t0, t1, aux, bytes, b), re-dirty instants (t, kind, bytes,
+    addr), write faults (t, addr), frames (t0, t1, number, slow) and hle fill instants (t, path,
+    log2 period, bytes, addr). window: META window_ns."""
+    names = {}
+
+    def nid(name):
+        return names.setdefault(name, len(names) + 1)
+
+    recs = []
+    for t0, t1, aux, nbytes, addr in copies:
+        recs.append(record(t0, t1, nid('sync copy'), aux=aux, a=nbytes, b=addr))
+    for t, kind, nbytes, addr in redirty:
+        recs.append(record(t, t, nid('redirty ' + kind), kind=1, a=nbytes, b=addr))
+    for t, addr in faults:
+        recs.append(record(t, t + 1000, nid('write fault'), a=addr))
+    for t0, t1, num, slow in frames:
+        recs.append(record(t0, t1, nid('frame'), kind=6, flags=1 if slow else 0, a=num))
+    for t, path_code, log2, nbytes, addr in hle:
+        recs.append(record(t, t, nid('hle fill'), kind=1, aux=path_code, flags=log2, a=nbytes,
+                           b=addr))
+    meta = {'version': 1, 'mode': 2, 'kind': 'dump'}
+    if window is not None:
+        meta['window_ns'] = list(window)
+    threads = [{'id': 1, 'os_tid': 100, 'name': 'Shadow Game Upd', 'kind': 'guest', 'sort': 1}]
+    parts = [json_chunk(1, meta), json_chunk(2, threads),
+             json_chunk(3, {str(v): k for k, v in names.items()}), events_chunk(1, recs)]
+    return write(path, parts)
+
+
+# Overlap data: bind copies in regions 16 (3 MiB) and 17 (1 MiB); written copies in region 18.
+# First touch marks region 16, evict marks region 17; write faults hit regions 17 and 18.
+OVERLAP_COPIES = [(1 * MS, 2 * MS, 1, 3 << 20, 0x40000000),
+                  (3 * MS, 4 * MS, 1, 1 << 20, 0x44000000),
+                  (5 * MS, 6 * MS, 2, 2 << 20, 0x48000000)]
+OVERLAP_REDIRTY = [(1 * MS, 'first touch', 3 << 20, 0x40000010),
+                   (2 * MS, 'evict', 1 << 20, 0x44000010)]
+OVERLAP_FAULTS = [(1 * MS, 0x44000000), (2 * MS, 0x48000000)]
+
+
+class CopySrcTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def load(self, name, **kw):
+        return sotc_trace.load(copy_trace(self.dir / name, **kw))
+
+    def test_new_format_split_by_reason_and_window(self):
+        copies = [(1 * MS, 3 * MS, 1, 1 << 20, 0x40001000),
+                  (5 * MS, 8 * MS, 1, 100 << 10, 0x44000000),
+                  (10 * MS, 14 * MS, 2, 2 << 20, 0x40002000),
+                  (20 * MS, 28 * MS, 3, 40 << 20, 0x40000000),
+                  (30 * MS, 31 * MS, 7, 10, 0x40000000),
+                  (200 * MS, 201 * MS, 1, 1000, 0x40000000)]    # after the dump window
+        tot = sotc_trace.copy_totals(self.load('n.sotctrace', copies=copies,
+                                               window=(0, 100 * MS)))
+        self.assertEqual(tot['window'], 'dump window 0.0-100.0 ms')
+        bind = tot['reasons'][1]
+        self.assertEqual((bind['count'], bind['bytes'], bind['unknown']),
+                         (2, (1 << 20) + (100 << 10), 0))
+        self.assertAlmostEqual(bind['ms'], 5.0)
+        self.assertEqual(dict(bind['buckets']), {16: 1 << 20, 17: 100 << 10})
+        self.assertEqual(dict(bind['sizes_n']), {'1-8M': 1, '64K-1M': 1})
+        self.assertEqual(dict(tot['reasons'][2]['sizes_n']), {'1-8M': 1})
+        self.assertEqual(dict(tot['reasons'][3]['sizes_n']), {'>=32M': 1})
+        self.assertEqual(tot['reasons'][7]['bytes'], 10)
+        self.assertEqual(sotc_trace.reason_label(3), 'dma')
+        self.assertEqual(sotc_trace.reason_label(7), 'code 7')
+        self.assertEqual(sotc_trace.size_label(63 << 10), '<64K')
+        self.assertEqual(sotc_trace.size_label(64 << 10), '64K-1M')
+        self.assertEqual(sotc_trace.size_label(8 << 20), '8-32M')
+        self.assertEqual(sotc_trace.size_label(32 << 20), '>=32M')
+        text = '\n'.join(sotc_trace.copy_lines([('n', tot)], tot))
+        self.assertIn('| bind | 2 | 1.1 | 5.0 | 0.0 |', text)
+        self.assertIn('| 0x40000000-0x43ffffff | 1.0 |', text)
+        self.assertIn('Conclusion: the dominant copy reason is dma', text)
+
+    def test_old_format_copies_count_as_untagged_without_address(self):
+        copies = [(1 * MS, 2 * MS, 0, 1 << 20, 3), (5 * MS, 6 * MS, 0, 2 << 20, 2)]  # b = pieces
+        tot = sotc_trace.copy_totals(self.load('old.sotctrace', copies=copies))
+        r = tot['reasons'][0]
+        self.assertEqual((r['count'], r['bytes'], r['unknown']), (2, 3 << 20, 3 << 20))
+        self.assertEqual(dict(r['buckets']), {})
+        row = sotc_trace.copy_overlap(tot)[0]
+        self.assertEqual(row['known'], 0)
+        self.assertIsNone(row['faults'])
+        text = '\n'.join(sotc_trace.copy_lines([('old', tot)], tot))
+        self.assertIn('| untagged | 2 | 3.0 | 2.0 | 3.0 |', text)
+        self.assertIn('No copy with a known address', text)
+        self.assertIn('the dominant copy reason is untagged (3.0 of 3.0 MiB, 100% of the bytes)',
+                      text)
+
+    def test_redirty_totals_and_top_regions(self):
+        redirty = [(1 * MS, 'first touch', 1 << 20, 0x40000000),
+                   (2 * MS, 'first touch', 2 << 20, 0x44000000),
+                   (3 * MS, 'evict', 4096, 0x40001000)]
+        tot = sotc_trace.copy_totals(self.load('r.sotctrace', redirty=redirty,
+                                               window=(0, 100 * MS)))
+        ft, ev = tot['redirty']['first touch'], tot['redirty']['evict']
+        self.assertEqual((ft['count'], ft['bytes']), (2, 3 << 20))
+        self.assertEqual((ev['count'], ev['bytes']), (1, 4096))
+        text = '\n'.join(sotc_trace.copy_lines([('r', tot)], tot))
+        self.assertIn('| first touch | 2 | 3.0 |', text)
+        self.assertIn('| evict | 1 | 0.0 |', text)
+        # Region 17 holds 2 MiB and region 16 about 1 MiB: the bigger one comes first.
+        self.assertLess(text.index('| 0x44000000-0x47ffffff | 2.0 | first touch 2.0 |'),
+                        text.index('| 0x40000000-0x43ffffff | 1.0 | evict 0.0, first touch 1.0 |'))
+        self.assertIn('Conclusion: no sync copy span in the window.', text)
+
+    def test_overlap_fractions_by_reason(self):
+        t = self.load('o.sotctrace', copies=OVERLAP_COPIES, redirty=OVERLAP_REDIRTY,
+                      faults=OVERLAP_FAULTS, window=(0, 100 * MS))
+        by = {r['reason']: r for r in sotc_trace.copy_overlap(sotc_trace.copy_totals(t))}
+        self.assertEqual(by[1]['known'], 4 << 20)
+        self.assertAlmostEqual(by[1]['kinds']['first touch'], 0.75)   # 3 of 4 MiB in region 16
+        self.assertAlmostEqual(by[1]['kinds']['evict'], 0.25)         # 1 of 4 MiB in region 17
+        self.assertAlmostEqual(by[1]['faults'], 0.25)                 # region 17 faulted
+        self.assertEqual(by[2]['kinds'], {'evict': 0.0, 'first touch': 0.0})
+        self.assertAlmostEqual(by[2]['faults'], 1.0)                  # region 18 faulted
+
+    def test_pooling_adds_bytes_and_keeps_the_shares(self):
+        pooled = sotc_trace.new_copy_totals()
+        for name in ('p1.sotctrace', 'p2.sotctrace'):
+            t = self.load(name, copies=OVERLAP_COPIES, redirty=OVERLAP_REDIRTY,
+                          faults=OVERLAP_FAULTS)
+            sotc_trace.merge_copy_totals(pooled, sotc_trace.copy_totals(t))
+        self.assertEqual(pooled['files'], 2)
+        self.assertEqual(pooled['reasons'][1]['bytes'], 8 << 20)
+        self.assertEqual(pooled['redirty']['first touch']['count'], 2)
+        by = {r['reason']: r for r in sotc_trace.copy_overlap(pooled)}
+        self.assertAlmostEqual(by[1]['kinds']['first touch'], 0.75)
+        text = '\n'.join(sotc_trace.copy_lines([], pooled))
+        self.assertIn('## Pooled over 2 dump(s)', text)
+        self.assertIn('dominant re-dirty kind is first touch (6.0 MiB in 2 markers)', text)
+
+    def test_hle_fill_paths_are_pooled(self):
+        hle = [(1 * MS, 1, 16, 8 << 20, 0x1068b00000),
+               (2 * MS, 1, 16, 8 << 20, 0x1068b00000),
+               (3 * MS, 2, 2, 1 << 20, 0x40000000)]
+        pooled = sotc_trace.new_copy_totals()
+        for name in ('h1.sotctrace', 'h2.sotctrace'):
+            sotc_trace.merge_copy_totals(pooled, sotc_trace.copy_totals(self.load(name, hle=hle)))
+        self.assertEqual(pooled['hle'][(1, 16)], {'count': 4, 'bytes': 32 << 20})
+        self.assertEqual(pooled['hle'][(2, 2)], {'count': 2, 'bytes': 2 << 20})
+        text = '\n'.join(sotc_trace.copy_lines([], pooled))
+        self.assertIn('| replace (CPU-written) | 65536 B | 4 | 32.0 |', text)
+        self.assertLess(text.index('replace (CPU-written)'), text.index('| GPU fill | 4 B | 2 |'))
+
+    def test_frame_only_counts_the_slow_frame(self):
+        copies = [(10 * MS, 11 * MS, 1, 1 << 20, 0x40000000),     # normal frame
+                  (100 * MS, 101 * MS, 2, 2 << 20, 0x40000000),   # slow frame
+                  (300 * MS, 301 * MS, 3, 4 << 20, 0x40000000)]   # outside every frame
+        frames = [(0, 33 * MS, 1, False), (50 * MS, 250 * MS, 7, True)]
+        whole = sotc_trace.copy_totals(self.load('f.sotctrace', copies=copies, frames=frames))
+        self.assertEqual(sorted(whole['reasons']), [1, 2, 3])
+        slow = sotc_trace.copy_totals(self.load('fs.sotctrace', copies=copies, frames=frames),
+                                      frame_only=True)
+        self.assertEqual(sorted(slow['reasons']), [2])
+        self.assertEqual(slow['reasons'][2]['bytes'], 2 << 20)
+        self.assertEqual(slow['window'], 'slow frame 7')
+        calm = sotc_trace.copy_totals(self.load('calm.sotctrace', copies=copies,
+                                                frames=[(0, 33 * MS, 1, False)]),
+                                      frame_only=True)
+        self.assertEqual(calm['reasons'], {})
+        self.assertEqual(calm['window'], 'no slow frame, nothing counted')
+
+    def test_hitch_line_gives_the_copy_split_of_the_slow_frame(self):
+        frames = [(i * 40 * MS, i * 40 * MS + 33 * MS, i, False) for i in range(5)]
+        frames.append((500 * MS, 700 * MS, 99, True))
+        copies = [(510 * MS, 515 * MS, 1, 3 << 20, 0x40000000),
+                  (600 * MS, 601 * MS, 3, 1 << 20, 0x40000000),
+                  (800 * MS, 801 * MS, 2, 1 << 20, 0x40000000)]   # after the slow frame
+        t = self.load('h.sotctrace', copies=copies, frames=frames)
+        results = sotc_trace.hitch_file(t, sym())
+        self.assertEqual(results[0]['copy'], {'bind': 3 << 20, 'dma': 1 << 20})
+        md = '\n'.join(sotc_trace.hitch_markdown(t.path.name, results))
+        self.assertIn('Sync copy by caller: bind 3.0 MiB, dma 1.0 MiB.', md)
+
+    def test_old_format_hitch_has_no_copy_line(self):
+        frames = [(0, 33 * MS, 1, False), (500 * MS, 700 * MS, 99, True)]
+        copies = [(510 * MS, 515 * MS, 0, 3 << 20, 4)]
+        t = self.load('oh.sotctrace', copies=copies, frames=frames)
+        results = sotc_trace.hitch_file(t, sym())
+        self.assertIsNone(results[0]['copy'])
+        md = '\n'.join(sotc_trace.hitch_markdown(t.path.name, results))
+        self.assertNotIn('Sync copy by caller', md)
+
+    def test_cli_prints_and_writes_the_report(self):
+        frames = [(0, 33 * MS, 1, False), (50 * MS, 250 * MS, 7, True)]
+        path = copy_trace(self.dir / 'cli.sotctrace', copies=OVERLAP_COPIES,
+                          redirty=OVERLAP_REDIRTY, faults=OVERLAP_FAULTS, frames=frames)
+        md = self.dir / 'copy.md'
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = sotc_trace.main(['copysrc', str(path), '--md', str(md), '--frame-only'])
+        self.assertEqual(rc, 0)
+        self.assertIn('Window: slow frame 7.', out.getvalue())
+        self.assertEqual(md.read_text(encoding='utf-8'), out.getvalue())
+
+
 if __name__ == '__main__':
     unittest.main()

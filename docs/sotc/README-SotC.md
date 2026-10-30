@@ -157,6 +157,10 @@ Estas variáveis de ambiente ajudam a investigar problemas:
 | `SOTC_FAST_BIND=1` | reaproveita binds de descritores entre desenhos iguais (padrão: desligado desde a 0.60.6) |
 | `SOTC_RECORD_THREAD=0` | grava os comandos Vulkan na própria thread de comandos (padrão: thread própria) |
 | `SOTC_INDIRECT_DIRECT=0` | mantém indiretos os draws cujos argumentos estão na CPU |
+| `SOTC_STAGING_CACHED=1` | experimental: a área de cópia (staging) dos buffers e das texturas que a thread de desenho envia à GPU fica em memória com cache, em vez de write-combined, para a cópia da CPU andar mais rápido nas cargas de área (ignorado sem esse tipo de memória ou com `SOTC_REBAR_UPLOAD`) |
+| `SOTC_COPY_GUEST_VIEW=1` | experimental: os envios de memória do jogo para a GPU leem pelo endereço do próprio jogo, protegidos contra falha (se a página estiver bloqueada, a cópia volta para a segunda visão da memória); evita a falta de página da segunda visão, que segurava a cópia em ~3 GB/s |
+| `SOTC_BACKING_WARM=1` | experimental: uma thread de baixa prioridade toca, na segunda visão da memória, as páginas que o jogo começa a escrever, para os envios à GPU não pagarem a falta de página na thread de desenho (medido em 30/10: sem ganho; prefira `SOTC_COPY_GUEST_VIEW`) |
+| `SOTC_FILL_HLE_GPU=1` | experimental: as tabelas que o shader de preenchimento (HLE) escreve chegam à GPU por preenchimento ou cópia na própria GPU, em vez de serem copiadas de novo pela memória do jogo na varredura DMA (uma tabela de 8 MiB, ~33 vezes por carga de área) |
 | `SOTC_WAIT_MARKER=1/2` | esperas pela GPU consultam um marcador escrito por ela (experimental) |
 | `SOTC_CMD_STATS=1/2` | draws e dispatches por quadro (2: shaders de compute mais usados) |
 | `SOTC_TSC=qpc/native` | relógio do jogo: `qpc` sempre usa o QPC do Windows, `native` sempre o TSC do processador (padrão: QPC só quando os núcleos discordam no TSC) |

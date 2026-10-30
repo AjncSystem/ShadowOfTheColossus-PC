@@ -235,6 +235,8 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
                         available);
         } else {
             prep_workers = workers;
+            // sotc: SOTC_OP_OVERLAP needs the prep threads' footprints; set before they start.
+            ovl_on = SotcStats::kOpOverlap;
             prep_ring = std::make_unique<Vulkan::PreparedDraw[]>(BackRingSize);
             for (u32 k = 0; k < prep_workers; ++k) {
                 prep_regs.push_back(std::make_unique<Regs>());
@@ -243,6 +245,20 @@ Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkers
                 prep_threads.emplace_back(std::bind_front(&Liverpool::PrepLoop, this), k);
             }
             LOG_INFO(Render, "SOTC_PARALLEL_RECORD: {} prep thread(s)", prep_workers);
+        }
+    }
+    if (SotcStats::kAbPr) { // sotc: SOTC_AB_PR (7c.0)
+        if (prep_workers) {
+            LOG_INFO(Render, "SOTC_AB_PR: prepared draws used in even 5 s windows, ignored in odd");
+        } else {
+            LOG_WARNING(Render, "SOTC_AB_PR: no effect, it needs SOTC_PARALLEL_RECORD=1 running");
+        }
+    }
+    if (SotcStats::kOpOverlap) { // sotc: SOTC_OP_OVERLAP (7c.0)
+        if (ovl_on) {
+            LOG_INFO(Render, "SOTC_OP_OVERLAP: on (measurement only; do not time this session)");
+        } else {
+            LOG_WARNING(Render, "SOTC_OP_OVERLAP: off, it needs SOTC_PARALLEL_RECORD=1 running");
         }
     }
     process_thread = std::jthread{std::bind_front(&Liverpool::Process, this)};
@@ -755,12 +771,18 @@ void Liverpool::WaitBackWritesSlow() {
     if (!SotcStats::kFpsTimers) { // sotc: SOTC_FPS_LEAN: the count only, no clock reads
         WaitBackTail(back_write_seq);
         SotcStats::cp_bw_waits.fetch_add(1, std::memory_order_relaxed);
+        SotcStats::cp_bw_rep_waits.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     const u64 start = SotcStats::NowNs();
     WaitBackTail(back_write_seq);
+    const u64 waited = SotcStats::NowNs() - start;
     SotcStats::cp_bw_waits.fetch_add(1, std::memory_order_relaxed);
-    SotcStats::cp_bw_wait_ns.fetch_add(SotcStats::NowNs() - start, std::memory_order_relaxed);
+    SotcStats::cp_bw_wait_ns.fetch_add(waited, std::memory_order_relaxed);
+    // sotc: the per-report line (cp_bw_rep_*, read and reset by the SOTC_FPS printer)
+    SotcStats::cp_bw_rep_waits.fetch_add(1, std::memory_order_relaxed);
+    SotcStats::cp_bw_rep_ns.fetch_add(waited, std::memory_order_relaxed);
+    SotcStats::GateStoreMax(SotcStats::cp_bw_rep_max_ns, waited);
 }
 
 bool Liverpool::FuseWriteData(VAddr address, const u32* data, u32 data_size) {
@@ -1024,6 +1046,9 @@ void Liverpool::ExecuteBackOp(BackOp& op) {
         rt.pgm_base = stage.pgm_base;
     }
     const u64 ob_t1 = opstat ? SotcStats::NowNs() : 0; // sotc: SOTC_OPSTAT
+    if (ovl_on) { // sotc: SOTC_OP_OVERLAP (7c.0): back_regs now holds this op's registers
+        NoteOpOverlap(op);
+    }
     switch (op.kind) {
     case BackOp::Kind::Func:
         if (op.func) { // sotc: empty for a flushed batch of WRITE_DATA (FlushWd)
@@ -1065,6 +1090,8 @@ void Liverpool::PrepLoop(std::stop_token stoken, u32 index) {
     BbThreads::PlaceThread(BbThreads::Role::Prep);
     Shader::g_info_slot = 2 + index; // info.h: slots 2..5 are the draw workers'
     Regs& prep = *prep_regs[index];
+    // sotc: the op footprints are filled for SOTC_CULL_EXPRESS and for SOTC_OP_OVERLAP.
+    const bool fp_fill = xp_on || ovl_on;
     u64 seq = 0;
     while (!stoken.stop_requested()) {
         if (back_head.load(std::memory_order_acquire) == seq) {
@@ -1112,18 +1139,18 @@ void Liverpool::PrepLoop(std::stop_token stoken, u32 index) {
             Vulkan::PreparedDraw& slot = prep_ring[seq % BackRingSize];
             slot.map_epoch = rasterizer->MapEpoch();
             setup_stages();
-            if (xp_on) {
-                slot.resources_ready = false; // sotc: SOTC_CULL_EXPRESS
+            if (fp_fill) {
+                slot.resources_ready = false; // sotc: SOTC_CULL_EXPRESS / SOTC_OP_OVERLAP
                 slot.mrt_mask = 0xFF;
             }
             rasterizer->PrefetchImagesShared(op.pipeline); // SOTC_ASYNC_IMAGE_CREATE
             rasterizer->PrepareDraw(prep, op.pipeline, op.is_indexed,
                                     op.kind == BackOp::Kind::Draw, slot);
-            if (xp_on && !slot.resources_ready) {
+            if (fp_fill && !slot.resources_ready) {
                 XpFillResources(slot, op.pipeline);
             }
             slot.ready_seq.store(seq, std::memory_order_release);
-        } else if (xp_on && is_disp && seq % prep_workers == index &&
+        } else if (fp_fill && is_disp && seq % prep_workers == index &&
                    seq >= back_tail.load(std::memory_order_acquire)) {
             // sotc: SOTC_CULL_EXPRESS: dispatches get a slot too, with the resource footprint only.
             Vulkan::PreparedDraw& slot = prep_ring[seq % BackRingSize];
@@ -1143,6 +1170,12 @@ void Liverpool::PrepLoop(std::stop_token stoken, u32 index) {
 }
 
 const Vulkan::PreparedDraw* Liverpool::TakePrepared(u64 seq) {
+    // sotc: SOTC_AB_PR (7c.0): in the "off" windows the draw thread computes inline, as when a
+    // prepared draw is not ready.
+    if (SotcStats::AbPrIgnoring()) {
+        SotcStats::ab_ignored.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
     // sotc: SOTC_PARALLEL_RECORD: published for this very op (the slot is reused every
     // BackRingSize ops) and no mapping changed since it was computed.
     const Vulkan::PreparedDraw& slot = prep_ring[seq % BackRingSize];
@@ -1419,6 +1452,68 @@ void Liverpool::XpFillResources(Vulkan::PreparedDraw& slot, const Vulkan::Pipeli
     AmdGpu::CollectResourceFootprint(std::span<const Shader::Info* const>{stages}, fetch,
                                      slot.resources);
     slot.resources_ready = true;
+}
+
+// sotc: SOTC_OP_OVERLAP (plan step 7c.0, docs/DRAW-THREAD-7C-DESIGN.md). Draw thread, before the
+// op runs. Counts how often a draw/dispatch's footprint conflicts with the previous one's: a
+// pipeline of draw stages can only overlap two ops that do not conflict. Observe only.
+void Liverpool::NoteOpOverlap(const BackOp& op) {
+    using namespace AmdGpu;
+    const auto add = [](std::atomic<uint64_t>& counter) {
+        counter.fetch_add(1, std::memory_order_relaxed);
+    };
+    if (op.kind == BackOp::Kind::Func) {
+        if (!op.func) {
+            return; // a flushed WRITE_DATA batch with nothing left to run
+        }
+        // A command-processor op (write data, label, DMA, ...) between two draws: a stage
+        // pipeline would have to drain here.
+        if (ovl_prev_known) {
+            add(SotcStats::ovl_breaks);
+        }
+        ovl_prev_known = false;
+        return;
+    }
+    if (!op.pipeline) {
+        return; // dropped by the draw filter: runs as nothing
+    }
+    const Vulkan::PreparedDraw& slot = prep_ring[back_exec_seq % BackRingSize];
+    if (slot.ready_seq.load(std::memory_order_acquire) != back_exec_seq ||
+        !slot.resources_ready) {
+        add(SotcStats::ovl_not_ready);
+        ovl_prev_known = false;
+        return;
+    }
+    const bool dispatch =
+        op.kind == BackOp::Kind::Dispatch || op.kind == BackOp::Kind::DispatchIndirect;
+    OpArgs args;
+    args.indirect =
+        op.kind == BackOp::Kind::DrawIndirect || op.kind == BackOp::Kind::DispatchIndirect;
+    args.is_indexed = op.is_indexed;
+    args.index_offset = op.index_offset;
+    args.address = op.address;
+    args.offset = op.offset;
+    args.stride = op.stride;
+    args.max_count = op.max_count;
+    args.count_address = op.count_address;
+    args.size = op.size;
+    OpFootprint cur;
+    const bool ok = dispatch ? ComputeDispatchFootprint(slot, op.cs, cur, &args)
+                             : ComputeDrawFootprint(slot, back_regs, cur, &args);
+    add(SotcStats::ovl_ops);
+    if (!ok || !cur.known) {
+        add(SotcStats::ovl_unknown);
+        ovl_prev_known = false;
+        return;
+    }
+    if (ovl_prev_known) {
+        add(SotcStats::ovl_pairs);
+        if (Conflicts(ovl_prev, cur)) {
+            add(SotcStats::ovl_conflicts);
+        }
+    }
+    ovl_prev = std::move(cur);
+    ovl_prev_known = true;
 }
 
 void Liverpool::XpPublishSeg(const XpSeg& seg) {
@@ -1812,7 +1907,7 @@ std::atomic<u64> g_rbx_addr_deferred{0}, g_rbx_mode_switches{0}, g_rbx_probes{0}
 //    Labels with no hot write since the previous one keep the old early write, so only labels
 //    that guard hot data pay for the GPU round trip.
 //    The game's cull pass (eboot 0xc6f2f -> 0x925c0 -> 0x86eb60) emits an EVENT_WRITE_EOP
-//    (PM4 header 0xC0044700, opcode 0x47, event CS_DONE, data 1) on the gfx DCB after its
+//    (PM4 header 0xC0044700, opcode 0x47, event 0x28 BOTTOM_OF_PIPE_TS, data 1) on the gfx DCB after its
 //    dispatch and then spins on the word, so a deferred label first records the downloads of the
 //    hot data written before it (BufferCache::RecordLabelDownloads) and the open command buffer
 //    is submitted at once (rasterizer->Flush), so the latency is the GPU execution only.
@@ -3458,7 +3553,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (rasterizer) {
                     rasterizer->OnFence();
                 }
-                // sotc: SOTC_RB_EXACT=publish: only a CS_DONE label with 32-bit data after a hot
+                // sotc: SOTC_RB_EXACT=publish: only an event 0x28 label with 32-bit data after a hot
                 // GPU write is deferred; no adaptive policy, the per-address FIFO still applies.
                 const bool rbp = rbx && rasterizer && VideoCore::BufferCache::RbExactPublish();
                 const u64 t_draw = rbp ? SotcStats::NowNs() : 0;

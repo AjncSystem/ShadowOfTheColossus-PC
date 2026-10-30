@@ -44,6 +44,18 @@
 #include "video_core/sotc_stats.h"
 #include "video_core/sotc_write_extent.h"
 #include "video_core/sotc_ui_lang.h"
+#include "../../../../sotc/hooks.h"      // sotc: SotcHookStats::Report
+#include "../../../../sotc/write_decl.h" // sotc: SotcWriteDecl::Report
+#include "../../../../sotc/probes.h"     // sotc: engine probe report lines
+#include "../../../../sotc/mem_classes.h" // sotc: SOTC_CLASS_TRACK report (plan step 6)
+
+// sotc: SOTC_TINY_ASYNC (vk_pipeline_cache.cpp).
+namespace Vulkan {
+void SotcTinyAsyncNoteDisplayBuffer(u64 address, u64 size);
+void SotcTinyAsyncReport(std::string& out, double seconds);
+} // namespace Vulkan
+// sotc: src/runtime_kernel.c, SOTC USLEEP line (usleep histogram, SOTC_USLEEP_YIELD).
+extern "C" void runtime_usleep_stats(char* out, size_t size, double seconds);
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
@@ -416,6 +428,9 @@ int VideoOutDriver::RegisterBuffers(VideoOutPort* port, s32 startIndex, void* co
         liverpool->NotifyCpWait(); // sotc: SOTC_CP_IDLE_US (VO label waits)
 
         presenter->RegisterVideoOutSurface(group, address);
+        // sotc: SOTC_TINY_ASYNC keeps the pipelines of tiny draws into display buffers inline.
+        Vulkan::SotcTinyAsyncNoteDisplayBuffer(
+            address, static_cast<u64>(attribute->pitch_in_pixel) * attribute->height * 8);
         LOG_INFO(Lib_VideoOut, "buffers[{}] = {:#x}", i + startIndex, address);
     }
 
@@ -688,6 +703,15 @@ void VideoOutDriver::Flip(const Request& req) {
         if (now - window_start >= std::chrono::seconds(5)) {
             const double seconds = std::chrono::duration<double>(now - window_start).count();
             std::string report; // sotc: written at once off this thread (see ReportPrintf)
+            // sotc: SOTC_AB_PR (7c.0): label the window that just ended, then flip the phase for the
+            // next one. Printed first, so every line of this report belongs to that window.
+            if (SotcStats::kAbPr) {
+                const uint32_t w = SotcStats::ab_window.load(std::memory_order_relaxed);
+                ReportPrintf(report, "SOTC AB PR window %u: %s (%llu prepared draws ignored)\n", w,
+                             (w & 1) ? "off" : "on",
+                             static_cast<unsigned long long>(SotcStats::ab_ignored.exchange(0)));
+                SotcStats::ab_window.store(w + 1, std::memory_order_relaxed);
+            }
             {
                 std::sort(frame_ms.begin(), frame_ms.end());
                 const auto pct = [&](double p) {
@@ -1881,6 +1905,55 @@ void VideoOutDriver::Flip(const Request& req) {
             }
             if (const uint64_t waits = SotcStats::cp_waits.exchange(0)) {
                 ReportPrintf(report, "SOTC CP waits for the draw thread %.0f/s\n", waits / seconds);
+            }
+            // sotc: CP waits on back-op writes (WaitBackWritesSlow), per 5 s window.
+            if (const uint64_t bw_n = SotcStats::cp_bw_rep_waits.exchange(0)) {
+                const uint64_t bw_ns = SotcStats::cp_bw_rep_ns.exchange(0);
+                const uint64_t bw_max = SotcStats::cp_bw_rep_max_ns.exchange(0);
+                ReportPrintf(report, "SOTC CP back-write waits: %.0f/s, %.2f ms/s, max %.2f ms\n",
+                             bw_n / seconds, bw_ns / 1e6 / seconds, bw_max / 1e6);
+            }
+            // sotc: stutter-architecture counters (engine hooks, declared writes, tiny pipelines,
+            // short sleeps); each prints only when its switch or SOTC_FPS gave it activity.
+            SotcHookStats::Report(report, seconds);
+            SotcWriteDecl::Report(report, seconds);
+            Vulkan::SotcTinyAsyncReport(report, seconds);
+            // sotc: engine probes (plan step 0c); each prints only when its hook is on and saw
+            // activity in the window.
+            SotcProbes::ReportXpr(report, seconds);
+            SotcProbes::ReportLoader(report, seconds);
+            SotcProbes::ReportAlloc(report, seconds);
+            SotcProbes::ReportCvars(report, seconds);
+            SotcProbes::ReportArea(report, seconds);
+            SotcMemClasses::Report(report, seconds);
+            // sotc: SOTC_OP_OVERLAP (plan step 7c.0): footprint conflicts between consecutive ops.
+            if (SotcStats::kOpOverlap) {
+                const uint64_t ovl_ops = SotcStats::ovl_ops.exchange(0);
+                const uint64_t ovl_nr = SotcStats::ovl_not_ready.exchange(0);
+                const uint64_t ovl_unk = SotcStats::ovl_unknown.exchange(0);
+                const uint64_t ovl_pairs = SotcStats::ovl_pairs.exchange(0);
+                const uint64_t ovl_conf = SotcStats::ovl_conflicts.exchange(0);
+                const uint64_t ovl_brk = SotcStats::ovl_breaks.exchange(0);
+                if (ovl_ops || ovl_nr) {
+                    ReportPrintf(report,
+                                 "SOTC OP OVERLAP: %llu ops (%llu no footprint: %llu not ready, "
+                                 "%llu unknown), %llu consecutive pairs, %llu conflicting "
+                                 "(%.0f%%), %llu pairs cut by CP ops\n",
+                                 static_cast<unsigned long long>(ovl_ops),
+                                 static_cast<unsigned long long>(ovl_nr + ovl_unk),
+                                 static_cast<unsigned long long>(ovl_nr),
+                                 static_cast<unsigned long long>(ovl_unk),
+                                 static_cast<unsigned long long>(ovl_pairs),
+                                 static_cast<unsigned long long>(ovl_conf),
+                                 ovl_pairs ? 100.0 * ovl_conf / ovl_pairs : 0.0,
+                                 static_cast<unsigned long long>(ovl_brk));
+                }
+            }
+            {
+                char usleep_line[1024];
+                usleep_line[0] = '\0';
+                runtime_usleep_stats(usleep_line, sizeof(usleep_line), seconds);
+                report += usleep_line;
             }
             // sotc: SOTC_WD_FUSE accounting (Liverpool).
             if (flips) {

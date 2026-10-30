@@ -38,6 +38,77 @@ public:
         });
     }
 
+    /// sotc: SOTC_WRITE_DECL pre-check, lock-free (no region mutex). False only when no page of
+    /// [cpu_addr, cpu_addr + size) can be write-protected by the buffer tracking: a region that
+    /// does not exist protects nothing here. A page only the texture cache protects is not seen
+    /// (it faults as before). Cheap for small spans: one region and a few words.
+    bool MaybeWriteProtected(VAddr cpu_addr, u64 size) noexcept {
+        const u64 limit = u64{1} << MAX_CPU_PAGE_BITS;
+        if (cpu_addr >= limit) {
+            return false;
+        }
+        size = std::min(size, limit - cpu_addr);
+        u64 page_index = cpu_addr >> HIGHER_PAGE_BITS;
+        u64 offset = cpu_addr & HIGHER_PAGE_MASK;
+        for (u64 remaining = size; remaining > 0; ++page_index, offset = 0) {
+            const u64 len = std::min(HIGHER_PAGE_SIZE - offset, remaining);
+            remaining -= len;
+            RegionManager* region = __atomic_load_n(&top_tier[page_index], __ATOMIC_ACQUIRE);
+            if (region && region->MaybeWriteProtected(offset, len)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// sotc: SOTC_WRITE_DECL statistics (SOTC_WRITE_DECL=2): the pages MaybeWriteProtected finds
+    /// in the range, lock-free. Same bits, all pages counted.
+    u64 CountWriteProtectedPages(VAddr cpu_addr, u64 size) noexcept {
+        const u64 limit = u64{1} << MAX_CPU_PAGE_BITS;
+        if (cpu_addr >= limit) {
+            return 0;
+        }
+        size = std::min(size, limit - cpu_addr);
+        u64 pages = 0;
+        u64 page_index = cpu_addr >> HIGHER_PAGE_BITS;
+        u64 offset = cpu_addr & HIGHER_PAGE_MASK;
+        for (u64 remaining = size; remaining > 0; ++page_index, offset = 0) {
+            const u64 len = std::min(HIGHER_PAGE_SIZE - offset, remaining);
+            remaining -= len;
+            RegionManager* region = __atomic_load_n(&top_tier[page_index], __ATOMIC_ACQUIRE);
+            if (region) {
+                pages += region->CountWriteProtectedPages(offset, len);
+            }
+        }
+        return pages;
+    }
+
+    /// sotc: SOTC_WRITE_DECL. Calls func(cpu_addr, size) for each run of [cpu_addr, cpu_addr +
+    /// size) that a declare settles (RegionManager::ForEachDeclarableRun). Unlocked look: the
+    /// caller invalidates each run through the locked path, which checks the bits again.
+    template <typename Func>
+    void ForEachDeclarableRun(VAddr cpu_addr, u64 size, Func&& func) noexcept {
+        const u64 limit = u64{1} << MAX_CPU_PAGE_BITS;
+        if (cpu_addr >= limit) {
+            return;
+        }
+        size = std::min(size, limit - cpu_addr);
+        u64 page_index = cpu_addr >> HIGHER_PAGE_BITS;
+        u64 offset = cpu_addr & HIGHER_PAGE_MASK;
+        for (u64 remaining = size; remaining > 0; ++page_index, offset = 0) {
+            const u64 len = std::min(HIGHER_PAGE_SIZE - offset, remaining);
+            remaining -= len;
+            RegionManager* region = __atomic_load_n(&top_tier[page_index], __ATOMIC_ACQUIRE);
+            if (!region) {
+                continue;
+            }
+            const VAddr base = page_index << HIGHER_PAGE_BITS;
+            region->ForEachDeclarableRun(offset, len, [&](u64 run, u64 run_size) {
+                func(base + run, run_size);
+            });
+        }
+    }
+
     /// sotc: BB_READBACKS (GpuReadbacksMode)
     u32 ReadbacksMode() const noexcept {
         return readbacks_mode;
@@ -351,7 +422,8 @@ private:
         u64 page_offset = cpu_address & HIGHER_PAGE_MASK;
         for (u64 remaining = size; remaining > 0; ++page_index, page_offset = 0) {
             const u64 len = std::min(HIGHER_PAGE_SIZE - page_offset, remaining);
-            RegionManager* region = top_tier[page_index];
+            // sotc: SOTC_WRITE_DECL: lock-free reader, acquire (see CreateRegion).
+            RegionManager* region = __atomic_load_n(&top_tier[page_index], __ATOMIC_ACQUIRE);
             if (!region || !func(region, page_offset, len)) {
                 return false;
             }
@@ -407,7 +479,8 @@ private:
         auto* new_manager = free_managers.back();
         new_manager->SetCpuAddress(base_cpu_addr);
         free_managers.pop_back();
-        top_tier[page_index] = new_manager;
+        // sotc: SOTC_WRITE_DECL: the lock-free readers (acquire loads) see the region built above.
+        __atomic_store_n(&top_tier[page_index], new_manager, __ATOMIC_RELEASE);
         live_managers.push_back(new_manager);
         return new_manager;
     }
@@ -440,6 +513,17 @@ public:
                 enabled ? RegionManager::BuildUntrackedMask(manager->CpuAddress(), ranges)
                         : RegionBits{});
         }
+    }
+
+    /// sotc: SOTC_CLASS_TRACK=2 shadow. Total GPU-marked pages that fall in `ranges` across every
+    /// live region, without changing state. Used to validate the allocator classification.
+    u64 CountClassGpuPages(const std::vector<SotcUntrack::Range>& ranges) {
+        u64 pages = 0;
+        for (RegionManager* manager : live_managers) {
+            pages += manager->CountGpuInMask(
+                RegionManager::BuildUntrackedMask(manager->CpuAddress(), ranges));
+        }
+        return pages;
     }
 
 private:

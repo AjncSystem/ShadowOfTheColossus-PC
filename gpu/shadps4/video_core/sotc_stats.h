@@ -561,8 +561,9 @@ inline std::atomic<uint64_t> readback_bytes_changed{0};
 /// sotc: BufferCache::ReleaseMemory's GPU sync (Finish, or Flush with SOTC_UNBIND_GPU_WAIT=1):
 /// calls and time (SOTC_FPS only).
 inline std::atomic<uint64_t> release_finish_count{0}, release_finish_ns{0};
-/// sotc: time the guest thread waits in BufferCache::DropGpuModified (SOTC_DROP_ASYNC=0; 0 in
-/// the default async mode). SOTC_FPS only.
+/// sotc: time the guest thread waits in BufferCache::DropGpuModified. The default (SOTC_DROP_ASYNC
+/// unset) waits for the command processor; SOTC_DROP_ASYNC=1 (experimental, off) orders the drop
+/// with the stream instead, and this stays 0. SOTC_FPS only.
 inline std::atomic<uint64_t> drop_gpu_wait_ns{0};
 /// sotc: SOTC_DROP_FAST: unmaps dropped on the guest thread, and those that still waited
 /// (GPU-written pages in the range). Totals.
@@ -1266,6 +1267,11 @@ inline std::atomic<uint64_t> cp_blocked_ns{0}, cp_parse_all_ns{0};
 /// that waited and their time.
 inline std::atomic<uint64_t> cp_func_ops[4]{}, draw_func_ns[4]{};
 inline std::atomic<uint64_t> cp_wd_fused{0}, cp_wd_pairs{0}, cp_bw_waits{0}, cp_bw_wait_ns{0};
+/// sotc: "SOTC CP back-write waits" report line (driver.cpp), reset by each report: the
+/// WaitBackWrites calls that waited (Liverpool::WaitBackWritesSlow), their wall time and the
+/// longest one. Counted with SOTC_FPS; the time and the maximum need kFpsTimers (SOTC_FPS_LEAN
+/// leaves them 0).
+inline std::atomic<uint64_t> cp_bw_rep_waits{0}, cp_bw_rep_ns{0}, cp_bw_rep_max_ns{0};
 /// sotc: command processor no-progress spin (Liverpool::Process; "SOTC CP spin" line, SOTCSTALL
 /// "spin"). Written by the CP thread only (monotonic, store of load + n). spin: wall time of
 /// streaks in which every resumed task only re-tested its wait (outside cp_parse_ns; sampled
@@ -1486,6 +1492,38 @@ enum XpReason : int {
     XpOk,             ///< ran ahead
     XpReasons
 };
+// sotc: SOTC_OP_OVERLAP=1 (plan step 7c.0, docs/DRAW-THREAD-7C-DESIGN.md, open question 5).
+// Measurement only, default off; needs SOTC_PARALLEL_RECORD=1 (the prep threads fill the
+// footprints) and SOTC_FPS=1 (the report). The draw thread compares each draw/dispatch's guest
+// footprint with the previous op's (AmdGpu::Conflicts): the share of conflicting pairs bounds what
+// a pipeline of draw stages could overlap. It adds work on the draw thread, so do not time
+// anything in the same session.
+inline const bool kOpOverlap = [] {
+    const char* v = std::getenv("SOTC_OP_OVERLAP");
+    return v && v[0] == '1';
+}();
+inline std::atomic<uint64_t> ovl_ops{0};       ///< draws/dispatches whose footprint was computed
+inline std::atomic<uint64_t> ovl_not_ready{0}; ///< the op's prep slot was not ready (no footprint)
+inline std::atomic<uint64_t> ovl_unknown{0};   ///< footprint unknown: would block any overlap
+inline std::atomic<uint64_t> ovl_pairs{0};     ///< consecutive pairs with both footprints known
+inline std::atomic<uint64_t> ovl_conflicts{0}; ///< ... where one op's writes overlap the other op
+inline std::atomic<uint64_t> ovl_breaks{0};    ///< pairs cut by a command-processor op between them
+
+// sotc: SOTC_AB_PR=1 (plan step 7c.0). In-session A/B of SOTC_PARALLEL_RECORD, default off; needs
+// SOTC_PARALLEL_RECORD=1 and SOTC_FPS=1. The 5 s report alternates the phase: in even windows the
+// draw thread uses the prepared draws, in odd windows it ignores them and computes inline (the
+// path it already takes when a prepared draw is not ready). Each report starts with a
+// "SOTC AB PR window N: on|off" line so the windows can be compared offline.
+inline const bool kAbPr = [] {
+    const char* v = std::getenv("SOTC_AB_PR");
+    return v && v[0] == '1';
+}();
+inline std::atomic<uint32_t> ab_window{0};      ///< report window index; odd = prepared draws ignored
+inline std::atomic<uint64_t> ab_ignored{0};     ///< prepared draws ignored in this window
+inline bool AbPrIgnoring() noexcept {
+    return kAbPr && (ab_window.load(std::memory_order_relaxed) & 1) != 0;
+}
+
 inline std::atomic<uint64_t> xp_segments{0};      ///< express segments published by the parser
 inline std::atomic<uint64_t> xp_ahead{0};         ///< ... that ran ahead of older ops
 inline std::atomic<uint64_t> xp_skipped_ops{0};   ///< older ops they jumped over

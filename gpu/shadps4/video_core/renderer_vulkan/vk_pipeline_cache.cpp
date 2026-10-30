@@ -7,11 +7,15 @@
 #include <xxhash.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <mutex>
+#include <string>
 #include <unordered_set>
+#include <vector>
 #include "common/elf_info.h"
 #include "common/assert_scope.h"
 #include "common/hash.h"
@@ -586,6 +590,121 @@ void PipelineCache::SaveDriverCache() {
     }
 }
 
+// sotc: SOTC_TINY_ASYNC (see GetGraphicsPipeline). 0 (unset): a tiny draw (<= 6 indices) whose
+// pipeline is missing is built on the command processor, as before. 1: it is queued at the front
+// of the async queue and the draw is skipped until the pipeline is ready, as for geometry draws.
+// 2: nothing changes, the build stays inline, and the draws that =1 would defer are counted and
+// logged (first 20).
+//
+// Why tiny draws were built inline: a skipped full-screen pass leaves its target stale, or
+// undefined (black) the first time. Geometry draws accept that for the build time. Mode 1 keeps
+// the inline build for draws that write a display buffer: a stale or black presented frame is
+// seen directly. Other tiny draws (post-processing into intermediates, HUD quads, depth writes)
+// are deferred: their result is one or more frames old until the pipeline is ready. Their shaders
+// are still translated on the command processor (async_translate_ok excludes tiny draws).
+// Known risk of mode 1 (review, 29 Oct): a full-screen pass the game runs only once (a lookup
+// table or noise texture made at boot or area load) is skipped on its first and only run, so its
+// target stays wrong for good. Mode 1 stays experimental for that reason; the per-area prewarm
+// (SOTC_AREA_PREWARM) is the intended fix for first-use builds, since it compiles the pipeline
+// before the draw instead of skipping the draw.
+static int TinyAsyncMode() {
+    static const int mode = [] {
+        const char* v = std::getenv("SOTC_TINY_ASYNC");
+        if (!v) {
+            return 0;
+        }
+        return v[0] == '1' ? 1 : v[0] == '2' ? 2 : 0;
+    }();
+    return mode;
+}
+
+namespace {
+// sotc: tiny jobs queued (SOTC_TINY_ASYNC=1). They form a run right after the compute and
+// translation jobs, before the priority jobs. Guarded by PipelineCache::async_mutex. Only one
+// PipelineCache exists per process; the workers reset it when they drain the queue.
+std::size_t g_tiny_jobs_queued{};
+
+// sotc: display buffers as guest ranges [begin, end), from SotcTinyAsyncNoteDisplayBuffer.
+std::mutex g_display_mutex;
+std::vector<std::pair<u64, u64>> g_display_ranges;
+
+// sotc: counters of SOTC_TINY_ASYNC, printed by SotcTinyAsyncReport.
+struct TinyAsyncStats {
+    std::atomic<u64> queued{};             ///< =1: new tiny pipelines queued at the front
+    std::atomic<u64> moved{};              ///< =1: queued pipelines moved to the front
+    std::atomic<u64> skipped{};            ///< =1: tiny draws skipped while their pipeline builds
+    std::atomic<u64> display_inline{};     ///< =1: built inline, a color target is a display buffer
+    std::atomic<u64> would_defer{};        ///< =2: draws that =1 would defer
+    std::atomic<u64> would_defer_display{}; ///< =2: of those, the ones on a display buffer
+    std::atomic<u64> sync_builds{};        ///< tiny draws built on the command processor
+    std::atomic<u64> sync_ns{};            ///< time of those builds
+};
+TinyAsyncStats g_tiny_stats;
+std::atomic<u32> g_tiny_logged{};
+} // namespace
+
+// sotc: SOTC_TINY_ASYNC=1 treats a color target that lies in a display buffer as a presentation
+// pass. Called for each display buffer VideoOut registers (address, size in bytes). While no
+// display buffer is known, every draw counts as one (fail-safe: mode 1 then builds inline).
+void SotcTinyAsyncNoteDisplayBuffer(u64 address, u64 size) {
+    if (address == 0 || size == 0) {
+        return;
+    }
+    std::scoped_lock lock{g_display_mutex};
+    // sotc: the game registers the same buffers again (mode and area changes): keep each base once,
+    // so the cap counts distinct buffers.
+    for (auto& range : g_display_ranges) {
+        if (range.first == address) {
+            range.second = address + size;
+            return;
+        }
+    }
+    if (g_display_ranges.size() < 64) {
+        g_display_ranges.emplace_back(address, address + size);
+    }
+}
+
+// sotc: writes a report line for the 5 s report: counts since the previous call, and the rate of
+// skipped draws over `seconds`. Call from one thread only.
+void SotcTinyAsyncReport(std::string& out, double seconds) {
+    static std::array<u64, 8> prev{};
+    const std::array<u64, 8> now{
+        g_tiny_stats.queued.load(std::memory_order_relaxed),
+        g_tiny_stats.moved.load(std::memory_order_relaxed),
+        g_tiny_stats.skipped.load(std::memory_order_relaxed),
+        g_tiny_stats.display_inline.load(std::memory_order_relaxed),
+        g_tiny_stats.would_defer.load(std::memory_order_relaxed),
+        g_tiny_stats.would_defer_display.load(std::memory_order_relaxed),
+        g_tiny_stats.sync_builds.load(std::memory_order_relaxed),
+        g_tiny_stats.sync_ns.load(std::memory_order_relaxed),
+    };
+    std::array<u64, 8> d{};
+    for (std::size_t i = 0; i < d.size(); ++i) {
+        d[i] = now[i] - prev[i];
+    }
+    prev = now;
+    // sotc: no line when nothing happened in the window (mode 0 has only sync-build counts).
+    bool any = false;
+    for (const u64 v : d) {
+        any |= v != 0;
+    }
+    if (!any) {
+        return;
+    }
+    const double skip_rate = seconds > 0.0 ? static_cast<double>(d[2]) / seconds : 0.0;
+    char line[320];
+    std::snprintf(line, sizeof(line),
+                  "SOTC tiny async: mode %d, queued %llu, moved %llu, skipped %llu (%.1f/s), "
+                  "display inline %llu, would defer %llu (display kept inline %llu), sync tiny "
+                  "builds %llu (%.1f ms)\n",
+                  TinyAsyncMode(), static_cast<unsigned long long>(d[0]),
+                  static_cast<unsigned long long>(d[1]), static_cast<unsigned long long>(d[2]),
+                  skip_rate, static_cast<unsigned long long>(d[3]),
+                  static_cast<unsigned long long>(d[4]), static_cast<unsigned long long>(d[5]),
+                  static_cast<unsigned long long>(d[6]), static_cast<double>(d[7]) / 1e6);
+    out += line;
+}
+
 // sotc: a pipeline built on the command processor that took longer than 30 ms is logged with
 // the reason it was not built on a pipeline worker (SOTC_SYNC_PIPELINE_MS changes the limit).
 static void LogSyncPipeline(const char* kind, const char* reason,
@@ -652,7 +771,8 @@ bool PipelineCache::AsyncPreloadEnabled() const {
 
 void PipelineCache::QueueAsyncPipeline(u64 hash,
                                        const GraphicsPipeline::SerializationSupport* preloaded,
-                                       bool priority) {
+                                       bool priority,
+                                       std::optional<std::string> remap_old_blob) {
     auto job = std::make_unique<AsyncPipelineJob>();
     job->key = graphics_key;
     job->hash = hash;
@@ -660,6 +780,7 @@ void PipelineCache::QueueAsyncPipeline(u64 hash,
         job->preloaded = true;
         job->sdata = *preloaded; // the cached vertex layout the pipeline is built from
     }
+    job->remap_old_blob = std::move(remap_old_blob); // sotc: SOTC_PIPE_REMAP (nullopt otherwise)
     job->infos = infos;
     job->runtime_infos = runtime_infos;
     if (fetch_shader) {
@@ -673,9 +794,10 @@ void PipelineCache::QueueAsyncPipeline(u64 hash,
         if (priority) {
             // Oldest first among them (FIFO), so the first shadow pipeline is not starved.
             job->priority = true;
+            // sotc: behind the tiny run (SOTC_TINY_ASYNC), which is empty unless that is on.
             const std::size_t front = std::min<std::size_t>(
-                async_queue.size(),
-                async_compute_queued + async_translate_queued + async_priority_queued++);
+                async_queue.size(), async_compute_queued + async_translate_queued +
+                                        g_tiny_jobs_queued + async_priority_queued++);
             async_queue.insert(async_queue.begin() + front, std::move(job));
         } else {
             async_queue.push_back(std::move(job));
@@ -714,6 +836,7 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
                         job->compute->Build();
                     }
                 }
+                g_tiny_jobs_queued = 0; // sotc: SOTC_TINY_ASYNC, the queue is empty now
                 return;
             }
             job = std::move(async_queue.front());
@@ -722,6 +845,10 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
                 --async_compute_queued;
             } else if (job->translate) {
                 --async_translate_queued;
+            } else if (g_tiny_jobs_queued != 0) {
+                // sotc: SOTC_TINY_ASYNC. The tiny run follows the compute and translation jobs, so
+                // with it non-empty the head is one of its jobs.
+                --g_tiny_jobs_queued;
             } else if (job->priority) {
                 --async_priority_queued;
             }
@@ -776,7 +903,8 @@ void PipelineCache::CollectAsyncPipelines() {
         }
         if (it.value()) {
             // A full-screen pass built it on the command processor meanwhile (that one may be
-            // in use): the worker's copy is dropped.
+            // in use): the worker's copy is dropped. A remapped job leaves its old blob alone:
+            // nothing here checked the pipeline the entry holds.
             if (!job->preloaded) {
                 RegisterPipelineData(job->key, job->hash, job->sdata);
                 ++num_new_pipelines;
@@ -788,6 +916,18 @@ void PipelineCache::CollectAsyncPipelines() {
             // it compiles it, as when WarmUp builds it itself and it fails.
             if (job->pipeline->Handle()) {
                 it.value() = std::move(job->pipeline);
+                if (job->remap_old_blob) {
+                    // sotc: SOTC_PIPE_REMAP: the remapped key built. It is saved under its new
+                    // hash, then the old blob goes; a save that is not queued keeps the old one.
+                    if (RegisterPipelineData(job->key, job->hash, job->sdata) &&
+                        Storage::DataBase::Instance().Remove(Storage::BlobType::PipelineKey,
+                                                             *job->remap_old_blob)) {
+                        LOG_INFO(Render_Vulkan,
+                                 "SOTC_PIPE_REMAP: built under the remapped key, old key {} "
+                                 "removed",
+                                 *job->remap_old_blob);
+                    }
+                }
             } else {
                 graphics_pipelines.erase(it);
             }
@@ -1076,16 +1216,103 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         return nullptr;
     }
     if (is_new || queued) {
+        const bool eligible = AsyncPipelineEligible();
+        // sotc: SOTC_TINY_ASYNC. Full-screen passes (post-processing, composition) are tiny draws:
+        // skipping one leaves a black or stale frame, so by default they still build here (see
+        // TinyAsyncMode for when mode 1 defers them).
+        const bool tiny_draw = liverpool->regs.num_indices <= 6;
+        const int tiny_mode = tiny_draw && !depth_only ? TinyAsyncMode() : 0;
+        const bool tiny_can_defer = tiny_mode != 0 && !async_workers.empty() && eligible;
+        // sotc: a color target lies in a display buffer (a presentation pass): never deferred.
+        const auto tiny_writes_display = [this] {
+            const auto& regs = liverpool->regs;
+            std::scoped_lock lock{g_display_mutex};
+            if (g_display_ranges.empty()) {
+                return true; // no display buffer known: every draw counts as one
+            }
+            for (s32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+                if (!regs.color_buffers[cb] || !regs.color_target_mask.GetMask(cb)) {
+                    continue;
+                }
+                const u64 addr = regs.color_buffers[cb].Address();
+                for (const auto& [begin, end] : g_display_ranges) {
+                    if (addr >= begin && addr < end) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+        // sotc: moves this draw's queued pipeline to the tiny run: behind the compute and
+        // translation jobs, ahead of the priority jobs. Returns false if no worker has it queued
+        // (a worker may have taken it already) or it is in the run already.
+        const auto move_to_tiny_run = [this] {
+            std::scoped_lock lock{async_mutex};
+            const auto found =
+                std::find_if(async_queue.begin(), async_queue.end(), [this](const auto& job) {
+                    return !job->compute && !job->translate && job->key == graphics_key;
+                });
+            const std::size_t head = async_compute_queued + async_translate_queued;
+            if (found == async_queue.end() ||
+                static_cast<std::size_t>(std::distance(async_queue.begin(), found)) <
+                    head + g_tiny_jobs_queued) {
+                return false;
+            }
+            auto job = std::move(*found);
+            async_queue.erase(found);
+            if (job->priority) {
+                job->priority = false;
+                --async_priority_queued;
+            }
+            const std::size_t at = std::min(head + g_tiny_jobs_queued, async_queue.size());
+            async_queue.insert(async_queue.begin() + static_cast<std::ptrdiff_t>(at),
+                               std::move(job));
+            ++g_tiny_jobs_queued;
+            return true;
+        };
+        // sotc: SOTC_TINY_ASYNC=1: a tiny draw whose pipeline a worker is building is skipped, as
+        // a geometry draw is, and the pipeline moves to the front. A display draw builds here.
+        if (queued && tiny_mode == 1 && tiny_can_defer && !tiny_writes_display()) {
+            if (move_to_tiny_run()) {
+                g_tiny_stats.moved.fetch_add(1, std::memory_order_relaxed);
+            }
+            g_tiny_stats.skipped.fetch_add(1, std::memory_order_relaxed);
+            return nullptr;
+        }
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
-        // Full-screen passes (post-processing, composition) are tiny draws: skipping one leaves
-        // a black or stale frame, so they still build here. Geometry draws are skipped while
-        // their pipeline is built (a brief pop-in instead of a freeze on first sight).
-        const bool tiny_draw = liverpool->regs.num_indices <= 6;
-        const bool eligible = AsyncPipelineEligible();
+        // Geometry draws are skipped while their pipeline is built (a brief pop-in instead of a
+        // freeze on first sight).
         if (!async_workers.empty() && !tiny_draw && !depth_only && eligible && !queued) {
             QueueAsyncPipeline(pipeline_hash, nullptr, depth_draw);
             return nullptr; // the draws that need it are skipped until it is ready
+        }
+        // sotc: SOTC_TINY_ASYNC. Mode 2 only counts and logs what mode 1 would defer. Mode 1
+        // queues a new pipeline at the front of the tiny run (a queued one returned above).
+        if (tiny_can_defer) {
+            const bool tiny_display = tiny_writes_display();
+            if (tiny_mode == 2) {
+                if (tiny_display) {
+                    g_tiny_stats.would_defer_display.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    g_tiny_stats.would_defer.fetch_add(1, std::memory_order_relaxed);
+                    if (g_tiny_logged.fetch_add(1, std::memory_order_relaxed) < 20) {
+                        std::fprintf(stderr, "SOTC tiny draw would defer %016llx%s\n",
+                                     static_cast<unsigned long long>(pipeline_hash),
+                                     queued ? " (already queued)" : "");
+                    }
+                }
+            } else if (tiny_display) {
+                g_tiny_stats.display_inline.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                QueueAsyncPipeline(pipeline_hash, nullptr, false);
+                // Queued at the back by QueueAsyncPipeline, moved to the front right after. If a
+                // worker took it in between, the draw is skipped all the same.
+                move_to_tiny_run();
+                g_tiny_stats.queued.fetch_add(1, std::memory_order_relaxed);
+                g_tiny_stats.skipped.fetch_add(1, std::memory_order_relaxed);
+                return nullptr;
+            }
         }
         const SotcStats::ScopedTimer stall_timer{SotcStats::pipeline_ns};
         SotcStats::pipelines_new.fetch_add(1, std::memory_order_relaxed);
@@ -1107,6 +1334,14 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                         sync_start, infos[3] ? infos[3]->pgm_hash : 0, // vertex
                         infos[0] ? infos[0]->pgm_hash : 0);              // fragment
 
+        if (tiny_draw) { // sotc: SOTC_TINY_ASYNC counters (every mode), for the 5 s report
+            g_tiny_stats.sync_builds.fetch_add(1, std::memory_order_relaxed);
+            g_tiny_stats.sync_ns.fetch_add(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - sync_start)
+                    .count(),
+                std::memory_order_relaxed);
+        }
         if (!queued) { // a queued one registers when collected (or was preloaded)
             RegisterPipelineData(graphics_key, pipeline_hash, sdata);
             ++num_new_pipelines;

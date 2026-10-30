@@ -71,13 +71,19 @@ def find_probe():
     fail('bb-probe.exe not found: build it with build.sh (MSYS2 CLANG64) or use a packaged build.')
 
 
-def run_script(name, *args):
+def run_script(name, *args, required=True):
+    """Runs a preparation script; a failure stops the launch unless required is False (then it
+    returns False and the caller goes on without that script's output)."""
     # Inside the packaged SotC.exe (PyInstaller) the executable runs the scripts itself.
     script = ['--script'] if getattr(sys, 'frozen', False) else []
     result = subprocess.run([sys.executable, *script, str(SCRIPTS / name), *map(str, args)], stdin=subprocess.DEVNULL,
                             creationflags=no_console())
     if result.returncode:
-        sys.exit(result.returncode)
+        if required:
+            sys.exit(result.returncode)
+        print(f'sotc: {name} failed (see above): the engine hooks stay off', file=sys.stderr)
+        return False
+    return True
 
 
 def fingerprint(game, modules):
@@ -192,6 +198,12 @@ def main():
         env.pop('SOTC_RENDER_RES', None)
     run_script('sotc_modes.py', source, '--out', out, '--modes', modes, '--cvars', cvars,
                *(['--render', render] if render else []))
+    # Engine hooks (docs/HOOK-DESIGN.md): the declarations of scripts/hooks.d, on every launch. A broken
+    # declaration turns the hooks off (no hooks.bin); it does not stop the game.
+    # The previous launch's file never survives: a run that exits without writing leaves none.
+    (out / 'hooks.bin').unlink(missing_ok=True)
+    if not run_script('sotc_hooks.py', source, '--out', out, required=False):
+        (out / 'hooks.bin').unlink(missing_ok=True)
     if render:
         # The output keeps the render size's aspect (a 16:9 output would stretch a 21:9 image).
         try:
@@ -229,6 +241,7 @@ def main():
     command = [str(probe), str(out / 'boot-linked.bin'), '--content-profile', str(out / 'content.bin'),
                '--sotc-cpu', str(out / 'sotc-cpu.bin'), '--patches', str(out / 'patches.bin'),
                *(['--sotc-cmdline', str(out / 'cmdline.bin')] if (out / 'cmdline.bin').is_file() else []),
+               *(['--sotc-hooks', str(out / 'hooks.bin')] if (out / 'hooks.bin').is_file() else []),
                '--app0', str(game), '--user', str(user), *sys.argv[1:]]
     # SOTC_WRAP: a JSON list put in front of the game, e.g. RenderDoc
     # ["C:/Program Files/RenderDoc/renderdoccmd.exe", "capture", "-w", "-c", "<file>"]; F12 then

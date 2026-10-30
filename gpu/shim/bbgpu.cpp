@@ -10,6 +10,8 @@
 #include "bbport_toggles.h"
 #include "video_core/sotc_fps_cap.h"
 #include "video_core/sotc_stats.h"
+#include "video_core/page_manager.h" // sotc: bbgpu_declare_cpu_write (SOTC_WRITE_DECL)
+#include "../sotc/write_decl.h"      // sotc: SOTC_WRITE_DECL statistics
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -481,6 +483,45 @@ extern "C" void bbgpu_upload_wait_phys(uint64_t phys, uint64_t size) {
     if (auto* async_upload = VideoCore::AsyncUpload::Get()) {
         async_upload->WaitPhys(phys, size);
     }
+}
+
+// sotc: SOTC_WRITE_DECL verify stamp: a run the declare settles (SOTC_FPS only).
+static void NoteDeclaredRun(VAddr addr, uint64_t size) {
+    SotcWriteDecl::NoteDeclared(addr, size);
+}
+
+// sotc: SOTC_WRITE_DECL (bbgpu.h). The runtime calls this before its memcpy/memset/memmove write a
+// span of guest memory. Off unless SOTC_WRITE_DECL is 1 or 2; spans below SOTC_WRITE_DECL_MIN, or
+// above SOTC_WRITE_DECL_MAX, are not declared. The pre-check is lock-free and runs once: a span
+// with no write-protected page is only counted.
+extern "C" uint64_t bbgpu_declare_cpu_write(void* address, uint64_t size, uint64_t return_address) {
+    static const uint32_t mode = SotcWriteDecl::Mode();
+    static const uint64_t min_bytes = SotcWriteDecl::MinBytes();
+    static const uint64_t max_bytes = SotcWriteDecl::MaxBytes();
+    if (mode == 0 || size == 0 || size < min_bytes) {
+        return 0;
+    }
+    // The guest address of a host pointer is the pointer itself, as in the fault handler.
+    const VAddr addr = reinterpret_cast<VAddr>(address);
+    if (max_bytes && size > max_bytes) {
+        SotcWriteDecl::NoteCall(return_address, size, 0); // counted, not looked at
+        return 0;
+    }
+    const bool maybe = VideoCore::PageManager::MaybeWriteProtected(addr, size);
+    const uint64_t pages = maybe ? VideoCore::PageManager::CountWriteProtectedPages(addr, size) : 0;
+    SotcWriteDecl::NoteCall(return_address, size, pages);
+    if (!maybe) {
+        return pages;
+    }
+    if (mode == 1) {
+        VideoCore::PageManager::DeclareCpuWrite(addr, size,
+                                                SotcStats::kFpsLog ? NoteDeclaredRun : nullptr);
+    } else if (SotcStats::kFpsLog) {
+        // Count only: stamp the runs a declare would settle, so the verify line counts the
+        // write faults it would remove.
+        VideoCore::PageManager::VisitDeclarableRuns(addr, size, NoteDeclaredRun);
+    }
+    return pages;
 }
 
 extern "C" void bbgpu_set_fps_target_slot(void* slot) {

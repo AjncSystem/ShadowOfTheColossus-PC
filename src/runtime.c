@@ -167,14 +167,55 @@ static ABI __attribute__((noreturn)) void stack_fail(void) {
     fputs("STOP: guest stack protector detected corruption\n", stderr);
     exit(22);
 }
+/* sotc: SOTC_WRITE_DECL (gpu/bbgpu.h). Weak: the Linux C tests link without the GPU library.
+ * Config is packed and read once: bits 0-7 the mode (1 declare, 2 count only, 0 off), bits 8+
+ * the minimum span in bytes (SOTC_WRITE_DECL_MIN, default 256). Off costs one relaxed load. */
+uint64_t bbgpu_declare_cpu_write(void *address, uint64_t size, uint64_t return_address) __attribute__((weak));
+#define WRITE_DECL_UNREAD UINT64_MAX
+static _Atomic uint64_t write_decl_config = WRITE_DECL_UNREAD;
+static uint64_t write_decl_read(void) {
+    const char *mode = getenv("SOTC_WRITE_DECL");
+    const char *minimum = getenv("SOTC_WRITE_DECL_MIN");
+    char *end = NULL;
+    unsigned long long span = minimum ? strtoull(minimum, &end, 10) : 256;
+    if (!minimum || end == minimum) span = 256;
+    if (span > (UINT64_MAX >> 8)) span = UINT64_MAX >> 8;
+    int m = mode ? atoi(mode) : 0;
+    if (m != 1 && m != 2) m = 0;
+    return ((uint64_t)span << 8) | (uint64_t)m;
+}
+static void declare_on_host_stack(void *arg) {
+    const struct { void *dst; uint64_t size; uint64_t caller; } *call = arg;
+    bbgpu_declare_cpu_write(call->dst, call->size, call->caller);
+}
+static inline void declare_guest_write(void *dst, size_t size, void *caller) {
+    uint64_t config = atomic_load_explicit(&write_decl_config, memory_order_relaxed);
+    if (config == WRITE_DECL_UNREAD) {
+        config = write_decl_read();
+        atomic_store_explicit(&write_decl_config, config, memory_order_relaxed);
+    }
+    if (!(config & 0xff) || !size || size < (config >> 8) || !bbgpu_declare_cpu_write) return;
+    /* sotc: the declaration runs the page tracker's invalidation (deep stacks), and guest copies
+     * run on job fibers of 16-64 KiB without guard pages: switch to the host stack first, as the
+     * fault handler does (runtime_call_on_host_stack, src/probe.c). */
+    struct { void *dst; uint64_t size; uint64_t caller; } call = {
+        dst, (uint64_t)size, (uint64_t)(uintptr_t)caller };
+    runtime_call_on_host_stack(declare_on_host_stack, &call);
+}
 static ABI void *guest_memset(void *dst, int value, size_t size) {
-    atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memset(dst, value, size);
+    atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
+    declare_guest_write(dst, size, __builtin_return_address(0));
+    return memset(dst, value, size);
 }
 static ABI void *guest_memcpy(void *dst, const void *src, size_t size) {
-    atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memcpy(dst, src, size);
+    atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
+    declare_guest_write(dst, size, __builtin_return_address(0));
+    return memcpy(dst, src, size);
 }
 static ABI void *guest_memmove(void *dst, const void *src, size_t size) {
-    atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memmove(dst, src, size);
+    atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed);
+    declare_guest_write(dst, size, __builtin_return_address(0));
+    return memmove(dst, src, size);
 }
 static ABI int guest_memcmp(const void *a, const void *b, size_t size) {
     atomic_fetch_add_explicit(&memory_calls,1,memory_order_relaxed); return memcmp(a, b, size);

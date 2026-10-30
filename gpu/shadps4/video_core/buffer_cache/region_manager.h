@@ -733,6 +733,69 @@ public:
         return pages;
     }
 
+    /// sotc: SOTC_WRITE_DECL pre-check (MemoryTracker::MaybeWriteProtected). Unlocked look at the
+    /// bits of [offset, offset + size): true when a page is CPU-clean (its write watcher protects
+    /// it) or, with GPU readbacks Precise (read watchers on GPU-modified pages), GPU-modified. The
+    /// look is racy by design: a page that changes meanwhile is missed (it faults later) or taken
+    /// for protected (an unneeded call).
+    bool MaybeWriteProtected(u64 offset, u64 size) noexcept {
+        const bool read_tracked = readbacks_mode == GpuReadbacksMode::Precise;
+        bool any = false;
+        IterateWords(GetBounds(offset, size), [&](u64 index, u64 mask) {
+            u64 prot = ~__atomic_load_n(&cpu[index], __ATOMIC_RELAXED);
+            if (read_tracked) {
+                prot |= __atomic_load_n(&gpu[index], __ATOMIC_RELAXED);
+            }
+            any |= (prot & mask) != 0;
+        });
+        return any;
+    }
+
+    /// sotc: SOTC_WRITE_DECL statistics: the pages MaybeWriteProtected counts in the range (same
+    /// unlocked bits, all of them).
+    u64 CountWriteProtectedPages(u64 offset, u64 size) noexcept {
+        const bool read_tracked = readbacks_mode == GpuReadbacksMode::Precise;
+        u64 pages = 0;
+        IterateWords(GetBounds(offset, size), [&](u64 index, u64 mask) {
+            u64 prot = ~__atomic_load_n(&cpu[index], __ATOMIC_RELAXED);
+            if (read_tracked) {
+                prot |= __atomic_load_n(&gpu[index], __ATOMIC_RELAXED);
+            }
+            pages += std::popcount(prot & mask);
+        });
+        return pages;
+    }
+
+    /// sotc: SOTC_WRITE_DECL. Unlocked look at the pages of [offset, offset + size): calls
+    /// func(offset, size) for each run of pages that are write-protected by CPU tracking (CPU bit
+    /// 0) and hold no GPU data (GPU bit 0). Only those are declared. CPU-modified pages are already
+    /// known to the caches, and GPU-modified pages keep their protection and go through the fault
+    /// path (a readback), so a declare never reads a GPU page back. Each run is clipped to the span.
+    template <typename Func>
+    void ForEachDeclarableRun(u64 offset, u64 size, Func&& func) noexcept {
+        const u64 end = offset + size;
+        bool open = false;
+        u64 run_begin = 0;
+        for (u64 page = offset / BYTES_PER_PAGE; page * BYTES_PER_PAGE < end; ++page) {
+            const u64 index = page / PAGES_PER_WORD;
+            const u64 bit = 1ULL << (page % PAGES_PER_WORD);
+            const u64 cpu_bits = __atomic_load_n(&cpu[index], __ATOMIC_RELAXED);
+            const u64 gpu_bits = __atomic_load_n(&gpu[index], __ATOMIC_RELAXED);
+            const bool declarable = ((~cpu_bits) & (~gpu_bits) & bit) != 0;
+            const u64 page_begin = page * BYTES_PER_PAGE;
+            if (declarable && !open) {
+                run_begin = std::max(page_begin, offset);
+                open = true;
+            } else if (!declarable && open) {
+                func(run_begin, std::min(page_begin, end) - run_begin);
+                open = false;
+            }
+        }
+        if (open) {
+            func(run_begin, end - run_begin);
+        }
+    }
+
     /// sotc: SOTC_SYNC_FAST. Words (256 KiB each) per write generation: 8 = 2 MiB granules.
     static constexpr u64 SYNC_GEN_WORDS = 8;
     static constexpr u64 NUM_SYNC_GENS = NUM_REGION_WORDS / SYNC_GEN_WORDS;
@@ -810,6 +873,18 @@ public:
             }
         }
         return mask;
+    }
+
+    /// sotc: SOTC_CLASS_TRACK=2 shadow. Counts pages of this region that lie in `mask` and carry a
+    /// GPU bit, without changing any state. A non-zero count over a CPU-only mask means the
+    /// classification is wrong (the GPU wrote a range the allocator called CPU-only). Read only,
+    /// relaxed loads: an approximate count is enough for the self-check.
+    u64 CountGpuInMask(const RegionBits& mask) const {
+        u64 pages = 0;
+        for (u64 index = 0; index < NUM_REGION_WORDS; ++index) {
+            pages += std::popcount(__atomic_load_n(&gpu[index], __ATOMIC_RELAXED) & mask[index]);
+        }
+        return pages;
     }
 
 private:

@@ -24,6 +24,7 @@
 #include "video_core/buffer_cache/memory_tracker.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/sotc_op_phases.h" // sotc: SOTC_OP_PHASES
+#include "../../../sotc/mem_classes.h"  // sotc: SOTC_CLASS_TRACK (plan step 6)
 #include "video_core/sotc_adaptive.h"
 #include "video_core/sotc_write_extent.h"
 #include "video_core/buffer_cache/bpe_heap_guard.h"
@@ -5893,6 +5894,22 @@ bool BufferCache::IsWrittenRangeSynced(VAddr addr, u64 size) const noexcept {
     return memory_tracker->IsSyncClean(addr, size, true); // sotc: SOTC_HLE_SKIP=2
 }
 
+// sotc: SOTC_WRITE_DECL pre-checks (memory_tracker.h, relaxed reads without the region locks).
+bool BufferCache::MaybeWriteProtected(VAddr addr, size_t size) noexcept {
+    return memory_tracker->MaybeWriteProtected(addr, size);
+}
+
+u64 BufferCache::CountWriteProtectedPages(VAddr addr, size_t size) noexcept {
+    return memory_tracker->CountWriteProtectedPages(addr, size);
+}
+
+void BufferCache::ForEachDeclarableRun(VAddr addr, size_t size, void (*fn)(void*, VAddr, u64),
+                                       void* ctx) noexcept {
+    memory_tracker->ForEachDeclarableRun(addr, size, [fn, ctx](VAddr run, u64 run_size) {
+        fn(ctx, run, run_size);
+    });
+}
+
 bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
     // sotc: SOTC_RB_EXACT: bytes owed to guest memory still count as GPU-modified for the callers
     // outside the readback path (page manager granules, indirect arguments, textures).
@@ -5921,6 +5938,36 @@ void BufferCache::SynchronizeDmaBuffers() {
         const auto ranges = VideoCore::SotcUntrack::AutoSnapshot(version);
         memory_tracker->ApplyUntracked(ranges);
         untrack_applied = version;
+    }
+    // sotc: SOTC_CLASS_TRACK=2 shadow (plan step 6). Count GPU-marked pages inside the ranges the
+    // allocator classified CPU-only, without changing any state. Recount when the classification
+    // changed or every 64 syncs (GPU bits move every frame), so the "want 0" gauge stays current.
+    if (SotcMemClasses::Mode() == 2) {
+        u64 version = 0;
+        const auto cls = SotcMemClasses::Snapshot(version);
+        if (version != class_shadow_version || (++class_shadow_tick & 63) == 0) {
+            class_shadow_version = version;
+            // Counted per pool, so the report names the pool that breaks the rule. The total work
+            // is the same as one count over all ranges (each range is visited once).
+            std::vector<std::vector<VideoCore::SotcUntrack::Range>> by_pool(
+                SotcMemClasses::kMaxPools);
+            u64 bytes = 0;
+            for (const auto& r : cls) {
+                by_pool[std::min<u32>(r.pool, SotcMemClasses::kMaxPools - 1)].push_back(
+                    VideoCore::SotcUntrack::Range{r.addr, r.size});
+                bytes += r.size;
+            }
+            u64 gpu_pages = 0;
+            for (u32 pool = 0; pool < SotcMemClasses::kMaxPools; ++pool) {
+                if (by_pool[pool].empty()) {
+                    continue;
+                }
+                const u64 pages = memory_tracker->CountClassGpuPages(by_pool[pool]);
+                SotcMemClasses::NoteShadowPool(pool, pages);
+                gpu_pages += pages;
+            }
+            SotcMemClasses::NoteShadow(cls.size(), bytes, gpu_pages);
+        }
     }
     const u64 uploads_before = SotcStats::uploads.load(std::memory_order_relaxed);
     const auto sweep_start = std::chrono::steady_clock::now();

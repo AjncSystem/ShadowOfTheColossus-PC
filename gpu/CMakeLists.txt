@@ -370,3 +370,11 @@ add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_sup
 target_include_directories(upscaler-support-test PRIVATE shim)
 target_compile_options(upscaler-support-test PRIVATE -UNDEBUG)
 
+# sotc: guest detour stubs (Core::InstallGuestDetour, docs/HOOK-DESIGN.md). Windows only.
+if (WIN32)
+    add_executable(hook-detour-test EXCLUDE_FROM_ALL sotc/tests/hook_detour_test.cpp)
+    target_include_directories(hook-detour-test PRIVATE shim shadps4 sotc)
+    target_compile_options(hook-detour-test PRIVATE -UNDEBUG)
+    target_link_libraries(hook-detour-test PRIVATE bbgpu)
+endif()
+

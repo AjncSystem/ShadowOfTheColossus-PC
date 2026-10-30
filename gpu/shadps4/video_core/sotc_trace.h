@@ -45,6 +45,8 @@ void Instant(const char* name, uint64_t a = 0, uint64_t b = 0);
 void SetImage(uint64_t base, uint64_t size);
 /// The image base SetImage recorded (0 before the loader reported it); kept with the recorder off.
 uint64_t ImageBase();
+/// The image size SetImage recorded (0 before the loader reported it).
+uint64_t ImageSize();
 /// The directory the session folder is created in (BbGpuConfig::user_dir + "/trace").
 void SetUserDir(const char* user_dir);
 

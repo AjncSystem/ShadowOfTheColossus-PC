@@ -175,6 +175,16 @@ public:
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
 
+    /// sotc: SOTC_WRITE_DECL (page_manager.cpp DeclareCpuWrite): lock-free check whether any page
+    /// of the span may be write-protected, and how many are.
+    [[nodiscard]] bool MaybeWriteProtected(VAddr addr, size_t size) noexcept;
+    [[nodiscard]] u64 CountWriteProtectedPages(VAddr addr, size_t size) noexcept;
+    /// sotc: SOTC_WRITE_DECL: fn(ctx, addr, size) for each run of the span a declare settles
+    /// (MemoryTracker::ForEachDeclarableRun, unlocked look). Type-erased: MemoryTracker is not
+    /// complete in this header.
+    void ForEachDeclarableRun(VAddr addr, size_t size, void (*fn)(void*, VAddr, u64),
+                              void* ctx) noexcept;
+
     /// sotc: SOTC_HLE_SKIP=2: every page of the range is GPU-written and none CPU-dirty, i.e. a
     /// written binding of it has nothing left to do (MemoryTracker::IsSyncClean, is_written).
     [[nodiscard]] bool IsWrittenRangeSynced(VAddr addr, u64 size) const noexcept;
@@ -782,6 +792,8 @@ private:
     std::vector<std::pair<VAddr, u64>> dma_runs;
     bool dma_full_pending{}; // sotc: the next DMA sweep visits every run (see SynchronizeDmaBuffers)
     u64 untrack_applied{0};  // sotc: SOTC_UNTRACK_AUTO, the published list version applied last
+    u64 class_shadow_version{0}; // sotc: SOTC_CLASS_TRACK=2, the classified version counted last
+    u64 class_shadow_tick{0};    // sotc: SOTC_CLASS_TRACK=2, periodic recount counter
     std::vector<std::pair<VAddr, u64>> dma_spans;
     /// Readback windows requested recently; downloaded together with the next readback.
     struct HotReadback {

@@ -1079,6 +1079,60 @@ static uint64_t patch_tcb_loads(const Segment *segments, uint64_t count) {
     return patched;
 }
 #endif
+/* sotc: runs fn(arg) on the thread's host stack, for the engine hook handlers (gpu/sotc/hooks.h).
+ * A guest fiber stack holds 16-64 KiB, too little for a handler, so a call from a fiber stack
+ * switches to the fault handler's alternate stack (alt_stack, 512 KiB, one per thread, made on
+ * first use). The TEB stack bounds are swapped to it for the call, the same as the fault handler
+ * does, so a fault inside fn finds its stack inside the bounds and runs its handler on that stack
+ * without switching again. A call from the thread's own stack, or from the alternate stack, runs fn
+ * directly. Only one call chain uses the alternate stack at a time: whenever it is in use the
+ * bounds point at it, and every stack switch above checks the bounds first. runtime_fault_recover
+ * is parked during fn: a longjmp out of fn would skip the restore of the bounds. */
+#ifdef _WIN32
+__asm__(".text\n.p2align 4\n.globl host_stack_call\nhost_stack_call:\n"
+        " push %rbp\n mov %rsp,%rbp\n mov %r8,%rsp\n sub $32,%rsp\n call *%rdx\n"
+        " mov %rbp,%rsp\n pop %rbp\n ret\n");
+void host_stack_call(void *arg, void (*fn)(void *), void *top);
+void runtime_call_on_host_stack(void (*fn)(void *), void *arg) {
+    NT_TIB *tib=(NT_TIB *)NtCurrentTeb();
+    const uintptr_t sp=(uintptr_t)__builtin_frame_address(0);
+    sigjmp_buf *const recover=runtime_fault_recover;
+    runtime_fault_recover=NULL;
+    const int on_own_stack=sp>=(uintptr_t)tib->StackLimit && sp<(uintptr_t)tib->StackBase;
+    const int on_alt_stack=alt_stack && sp>=(uintptr_t)alt_stack && sp<(uintptr_t)alt_stack+ALT_STACK_SIZE;
+    /* sotc: set while a call runs on the alternate stack. If fn ever let another fiber run on this
+     * thread and that fiber came back here, switching again would overwrite the live frames at the
+     * top of the alternate stack: that case runs fn in place instead (and says so once). */
+    static _Thread_local int alt_in_use;
+    if (on_own_stack || on_alt_stack) {
+        fn(arg);
+    } else {
+        if (!alt_stack) alt_stack=VirtualAlloc(NULL,ALT_STACK_SIZE,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
+        if (!alt_stack || alt_in_use) {
+            static int warned;
+            if (!warned) {
+                warned=1;
+                fprintf(stderr,"runtime_call_on_host_stack: %s; running on the current stack\n",
+                        alt_stack ? "alternate stack already in use" : "no alternate stack");
+            }
+            fn(arg); /* as the fault handler: without the alternate stack, the current one */
+        } else {
+            void *const base=tib->StackBase, *const limit=tib->StackLimit;
+            tib->StackBase=alt_stack+ALT_STACK_SIZE;
+            tib->StackLimit=alt_stack;
+            alt_in_use=1;
+            /* host_stack_call has no unwind data: nothing may throw or SEH-unwind through fn. */
+            host_stack_call(arg,fn,alt_stack+ALT_STACK_SIZE);
+            alt_in_use=0;
+            tib->StackBase=base;
+            tib->StackLimit=limit;
+        }
+    }
+    runtime_fault_recover=recover;
+}
+#else
+void runtime_call_on_host_stack(void (*fn)(void *), void *arg) { fn(arg); }
+#endif
 #ifdef _WIN32
 /* The engine times itself with inline rdtsc ((now - start) / frequency, unsigned). Some
  * systems do not keep the cores' TSCs in step (a Ryzen 9 5900X under Hyper-V: each core about
@@ -1103,9 +1157,12 @@ static void choose_tsc(void) {
     runtime_tsc_use_qpc();
 }
 #endif
-/* sotc: SSE4a and red-zone patches of the eboot (gpu/sotc), described by scripts/sotc_cpu.py. */
+/* sotc: SSE4a and red-zone patches of the eboot (gpu/sotc), described by scripts/sotc_cpu.py.
+ * The trampoline area is shared: the generated code takes its first part, and the last
+ * SOTC_CMDLINE_RESERVE bytes hold the engine command line text (apply_sotc_cmdline). */
 #define SOTC_TRAMPOLINE_SIZE (UINT64_C(16) << 20)
-static void apply_sotc_cpu_patches(const char *path, const Segment *segments, uint64_t count, uint64_t size) {
+#define SOTC_CMDLINE_RESERVE (UINT64_C(16) << 10)
+static void apply_sotc_cpu_patches(const char *path, const char *hooks, const Segment *segments, uint64_t count, uint64_t size) {
     FILE *f=fopen(path,"rb");
     char magic[8];
     if (!f || fread(magic,1,8,f)!=8 || memcmp(magic,"SOTCCPU1",8)) fail("bad --sotc-cpu file (run scripts/sotc_cpu.py)");
@@ -1119,20 +1176,23 @@ static void apply_sotc_cpu_patches(const char *path, const Segment *segments, ui
     for (uint64_t s=0;s<count && n<16;++s)
         if ((segments[s].flags&1) && segments[s].address<eboot_end)
             code[n++]=(SotcCodeSegment){segments[s].address,segments[s].size};
-    SotcPatchRequest request={image,eboot_end,image+round_page(size),SOTC_TRAMPOLINE_SIZE,eh,eh_size,
-                              code,n,offsets,(uint32_t)functions,NULL};
+    SotcPatchRequest request={image,eboot_end,image+round_page(size),SOTC_TRAMPOLINE_SIZE-SOTC_CMDLINE_RESERVE,eh,eh_size,
+                              code,n,offsets,(uint32_t)functions,NULL,hooks};
 #ifdef _WIN32
     request.tsc_clock=tsc_clock;
 #endif
     SotcPatchResult result;
     if (sotc_patch_eboot(&request,&result)) fail("CPU patches: cannot decode the eboot function table");
     printf("CPU patches: SSE4a %s, %" PRIu64 " functions, %" PRIu64 " short SSE4a relocated, "
-           "red zone: %" PRIu64 " functions / %" PRIu64 " instructions\n",
+           "red zone: %" PRIu64 " functions / %" PRIu64 " instructions, trampoline %" PRIu64 " bytes\n",
            result.needs_sse4a ? "emulated" : "native", result.function_starts, result.short_sse4a,
-           result.red_zone_functions, result.red_zone_instructions);
+           result.red_zone_functions, result.red_zone_instructions, result.trampoline_used);
     if (request.tsc_clock)
         printf("CPU patches: %" PRIu64 " rdtsc read QPC, %" PRIu64 " left on the TSC\n",
                result.rdtsc, result.rdtsc_unpatched);
+    if (hooks)
+        printf("Engine hooks (%s): %" PRIu64 " installed, %" PRIu64 " off\n",
+               hooks, result.hooks_installed, result.hooks_off);
 }
 /* sotc: extra engine command line (cvars such as +r_motionBlurEnable=0), described by
  * scripts/sotc_modes.py: SOTCCMD1, the image offset of the `lea rsi,[rip+x]` that loads the
@@ -1144,13 +1204,13 @@ static void apply_sotc_cmdline(const char *path, uint64_t size) {
     char magic[8];
     if (!f || fread(magic,1,8,f)!=8 || memcmp(magic,"SOTCCMD1",8)) fail("bad --sotc-cmdline file (run scripts/sotc_modes.py)");
     uint64_t lea=read64(f);
-    char text[16384];
+    char text[SOTC_CMDLINE_RESERVE];
     size_t length=fread(text,1,sizeof(text)-1,f);
     fclose(f);
     text[length]=0;
     unsigned char *at=image+lea;
     if (lea+7>size || at[0]!=0x48 || at[1]!=0x8d || at[2]!=0x35) fail("--sotc-cmdline: no lea rsi at the given offset");
-    unsigned char *place=image+round_page(size)+SOTC_TRAMPOLINE_SIZE-sizeof(text);
+    unsigned char *place=image+round_page(size)+SOTC_TRAMPOLINE_SIZE-SOTC_CMDLINE_RESERVE;
     memcpy(place,text,length+1);
     const int64_t disp=(int64_t)(place-(at+7));
     if (disp<INT32_MIN || disp>INT32_MAX) fail("--sotc-cmdline: text out of reach");
@@ -1277,13 +1337,134 @@ static int mapped(Segment *segments, uint64_t count, uint64_t address, uint64_t 
             address - segments[i].address <= segments[i].size - bytes) return 1;
     return 0;
 }
+/* BBPATCH3 (scripts/sotc_modes.py): as BBPATCH2, but each entry names a group and carries the
+ * bytes it expects at its offset, and a group is applied only when every entry of it matches the
+ * image. A mismatched group is skipped and logged; the other groups still apply. The whole file is
+ * parsed and checked against its size before the first write. Layout: "BBPATCH3", u64 base,
+ * u64 count, then per entry u64 offset, u64 length, u32 group, u32 reserved, u8 expected[length],
+ * u8 data[length]. Expected bytes and data are in the patches' base form, like BBPATCH2 data. */
+#define BBPATCH3_MAX_LENGTH 4096
+typedef struct { uint64_t offset, length, expected_at; uint32_t group; } Patch3Entry;
+static uint32_t read32(FILE *f) {
+    unsigned char b[4];
+    if (fread(b, 1, 4, f) != 4) fail("truncated patch file");
+    return (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
+}
+/* Whether the image holds an entry's expected bytes. Pointer slots (8 bytes, relocation targets)
+ * are compared after rebasing the image value to the patches' base, and the data's pointer must
+ * point into the image. On failure *why names the cause for the log. */
+static int patch3_entry_ok(Segment *segments, uint64_t ns, const Reloc *relocs, uint64_t nr, uint64_t base,
+                           const Patch3Entry *e, const unsigned char *expected, const unsigned char *data,
+                           const char **why) {
+    unsigned char now[BBPATCH3_MAX_LENGTH];
+    if (!mapped(segments,ns,e->offset,e->length)) { *why="lie outside the image"; return 0; }
+    memcpy(now,image+e->offset,e->length);
+    for (uint64_t r=0;r<nr;++r) {
+        const uint64_t target=relocs[r].target;
+        if (!(target<e->offset+e->length && e->offset<target+8)) continue;
+        if (relocs[r].kind || target<e->offset || target+8>e->offset+e->length) { *why="differ"; return 0; }
+        uint64_t value;
+        memcpy(&value,now+(target-e->offset),8);
+        value=value-(uint64_t)(uintptr_t)image+base;
+        memcpy(now+(target-e->offset),&value,8);
+        memcpy(&value,data+(target-e->offset),8);
+        if (value<base || !mapped(segments,ns,value-base,1)) { *why="hold a pointer outside the image"; return 0; }
+    }
+    if (memcmp(now,expected,e->length)) { *why="differ"; return 0; }
+    return 1;
+}
+static void apply_patches3(FILE *f, Segment *segments, uint64_t ns, const Reloc *relocs, uint64_t nr) {
+    const uint64_t base=read64(f), count=read64(f);
+    const long start=ftell(f);
+    fseek(f,0,SEEK_END);
+    const long total=ftell(f);
+    fseek(f,start,SEEK_SET);
+    /* Pass 1: the entry headers and their file positions. Nothing is written yet. */
+    Patch3Entry *entries=calloc(count ? count : 1, sizeof *entries);
+    uint32_t *groups=calloc(count ? count : 1, sizeof *groups);
+    if (!entries || !groups) fail("patch file has too many entries");
+    for (uint64_t i=0;i<count;++i) {
+        Patch3Entry *e=&entries[i];
+        e->offset=read64(f);
+        e->length=read64(f);
+        e->group=read32(f);
+        read32(f); /* reserved */
+        if (!e->length || e->length>BBPATCH3_MAX_LENGTH) fail("bad patch entry");
+        const long at=ftell(f);
+        if (at<0 || (uint64_t)at+2*e->length>(uint64_t)total) fail("bad patch entry");
+        e->expected_at=(uint64_t)at;
+        fseek(f,(long)(2*e->length),SEEK_CUR);
+    }
+    if (ftell(f)!=total) fail("trailing data in patch file");
+    size_t ngroups=0;
+    for (uint64_t i=0;i<count;++i) {
+        size_t g=0;
+        while (g<ngroups && groups[g]!=entries[i].group) ++g;
+        if (g==ngroups) groups[ngroups++]=entries[i].group;
+    }
+    /* Pass 2: check every group against the unpatched image first (a group must never see bytes
+     * another group wrote), then pass 3 writes the accepted groups. */
+    unsigned char expected[BBPATCH3_MAX_LENGTH], data[BBPATCH3_MAX_LENGTH];
+    uint64_t writes=0, bytes=0, rebased=0;
+    size_t applied=0, skipped=0;
+    unsigned char *group_ok=calloc(ngroups ? ngroups : 1,1);
+    if (!group_ok) fail("out of memory");
+    for (size_t g=0;g<ngroups;++g) {
+        int ok=1;
+        uint64_t bad=0;
+        const char *why="differ";
+        for (uint64_t i=0;i<count && ok;++i) {
+            const Patch3Entry *e=&entries[i];
+            if (e->group!=groups[g]) continue;
+            fseek(f,(long)e->expected_at,SEEK_SET);
+            if (fread(expected,1,e->length,f)!=e->length || fread(data,1,e->length,f)!=e->length)
+                fail("bad patch entry");
+            if (!patch3_entry_ok(segments,ns,relocs,nr,base,e,expected,data,&why)) { ok=0; bad=e->offset; }
+        }
+        group_ok[g]=(unsigned char)ok;
+        if (!ok) {
+            printf("Patches: group %" PRIu32 " skipped: bytes at 0x%" PRIx64 " %s\n", groups[g], bad, why);
+            ++skipped;
+        }
+    }
+    for (size_t g=0;g<ngroups;++g) {
+        if (!group_ok[g]) continue;
+        for (uint64_t i=0;i<count;++i) {
+            const Patch3Entry *e=&entries[i];
+            if (e->group!=groups[g]) continue;
+            fseek(f,(long)(e->expected_at+e->length),SEEK_SET);
+            if (fread(data,1,e->length,f)!=e->length) fail("bad patch entry");
+            memcpy(image+e->offset,data,e->length);
+            for (uint64_t r=0;r<nr;++r) {
+                const uint64_t target=relocs[r].target;
+                if (!(target<e->offset+e->length && e->offset<target+8)) continue;
+                uint64_t value;
+                memcpy(&value,image+target,8);
+                value=(uint64_t)(uintptr_t)image+(value-base);
+                memcpy(image+target,&value,8);
+                ++rebased;
+            }
+            ++writes;
+            bytes+=e->length;
+        }
+        ++applied;
+    }
+    free(group_ok);
+    free(entries);
+    free(groups);
+    fclose(f);
+    printf("Patches: %" PRIu64 " writes, %" PRIu64 " bytes applied, %" PRIu64 " pointers rebased (BBPATCH3: %zu groups applied, %zu skipped)\n",
+           writes, bytes, rebased, applied, skipped);
+}
 /* BBPATCH2 (patches.py): the patches' image base, then byte writes at image offsets, applied
  * after relocation. A write may replace a whole base-relative pointer slot (60/90 FPS++ swap
  * function pointers): the patch holds the address at the patches' base, rebased here. */
 static void apply_patches(const char *path, Segment *segments, uint64_t ns, const Reloc *relocs, uint64_t nr) {
     FILE *f=fopen(path,"rb");
     char magic[8];
-    if (!f || fread(magic,1,8,f)!=8 || memcmp(magic,"BBPATCH2",8)) fail("invalid patch file");
+    if (!f || fread(magic,1,8,f)!=8) fail("invalid patch file");
+    if (!memcmp(magic,"BBPATCH3",8)) { apply_patches3(f,segments,ns,relocs,nr); return; }
+    if (memcmp(magic,"BBPATCH2",8)) fail("invalid patch file");
     uint64_t base=read64(f), count=read64(f), bytes=0, rebased=0;
     unsigned char data[4096];
     for (uint64_t i=0;i<count;++i) {
@@ -1377,11 +1558,12 @@ int main(int argc, char **argv) {
 #endif
     int cpu_only = 0, strict_imports = 0;
     unsigned timeout_seconds = 10;
-    const char *content_profile=NULL, *app0=NULL, *user_dir=NULL, *patch_file=NULL, *sotc_cpu=NULL, *sotc_cmdline=NULL;
+    const char *content_profile=NULL, *app0=NULL, *user_dir=NULL, *patch_file=NULL, *sotc_cpu=NULL, *sotc_cmdline=NULL, *sotc_hooks=NULL;
     for (int i = 2; i < argc; ++i) {
         if (!strcmp(argv[i], "--cpu-only")) cpu_only = 1;
         else if (!strcmp(argv[i], "--sotc-cpu") && i+1<argc) sotc_cpu=argv[++i];
         else if (!strcmp(argv[i], "--sotc-cmdline") && i+1<argc) sotc_cmdline=argv[++i];
+        else if (!strcmp(argv[i], "--sotc-hooks") && i+1<argc) sotc_hooks=argv[++i];
         else if (!strcmp(argv[i], "--strict-imports")) strict_imports = 1;
         else if (!strcmp(argv[i], "--content-profile") && i+1<argc) content_profile=argv[++i];
         else if (!strcmp(argv[i], "--app0") && i+1<argc) app0=argv[++i];
@@ -1390,6 +1572,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--timeout") && i+1<argc) timeout_seconds=(unsigned)strtoul(argv[++i],NULL,10);
         else { fprintf(stderr, "Unknown option: %s\n", argv[i]); return 1; }
     }
+    if (sotc_hooks && !sotc_cpu) { fputs("--sotc-hooks needs --sotc-cpu (hooks are installed with the CPU patches)\n", stderr); return 1; }
     if (argc < 2) {
         fprintf(stderr, "Usage: %s boot.bin [--cpu-only] [--strict-imports] [--content-profile file] [--app0 dir] [--user dir] [--patches file] [--timeout seconds] | --vulkan-only\n", argv[0]);
         return 1;
@@ -1647,7 +1830,7 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
 #endif
-    if (sotc_cpu) apply_sotc_cpu_patches(sotc_cpu, segments, ns, size);
+    if (sotc_cpu) apply_sotc_cpu_patches(sotc_cpu, sotc_hooks, segments, ns, size);
     if (sotc_cmdline) apply_sotc_cmdline(sotc_cmdline, size);
     if (sotc_cpu) install_heap_hook();
     protect(traps, round_page((import_count + 1) * 32), 5);

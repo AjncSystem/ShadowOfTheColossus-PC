@@ -437,6 +437,10 @@ uint64_t ImageBase() {
     return S().image_base;
 }
 
+uint64_t ImageSize() {
+    return S().image_size;
+}
+
 void SetUserDir(const char* user_dir) {
     if (user_dir && *user_dir) {
         S().user_dir = user_dir;

@@ -13,7 +13,7 @@ python=${WINPYTHON:-/c/PyBuild312/python.exe}
 "$python" -m PyInstaller --version >/dev/null || { echo "Need PyInstaller in $python (WINPYTHON)" >&2; exit 1; }
 # The scripts run inside SotC.exe (--script): the standard modules they import come along.
 hidden=()
-for module in argparse base64 collections hashlib json re shutil struct; do
+for module in argparse base64 collections hashlib importlib.util json re shutil struct; do
     hidden+=(--hidden-import "$module")
 done
 "$python" -m PyInstaller --noconfirm --clean --log-level WARN --windowed --name SotC \
@@ -51,7 +51,10 @@ else
     echo "DLSS-G: no Streamline runtime in $streamline (FSR 3 only)" >&2
 fi
 cp scripts/prepare.py scripts/link_libc.py scripts/link_modules.py scripts/content_profile.py \
-   scripts/sotc_cpu.py scripts/sotc_modes.py "$dest/scripts/"
+   scripts/sotc_cpu.py scripts/sotc_modes.py scripts/sotc_hooks.py "$dest/scripts/"
+# Engine hook declarations (sotc_hooks.py loads every hooks.d/*.py that does not start with "_").
+mkdir -p "$dest/scripts/hooks.d"
+cp scripts/hooks.d/*.py "$dest/scripts/hooks.d/"
 cp sotc.py SotC.bat LICENSE CHANGELOG.md "$dest/"
 cp docs/sotc/README-SotC.md "$dest/README.md"
 cat > "$dest/sotc.ini" <<'EOF'

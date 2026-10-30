@@ -31,6 +31,27 @@ What the counters say about the expected gain:
 | C5 | `marks merged 0`; ~20% of runs already no-op | Mark coalescing finds nothing to merge: no gain. |
 | C0 | bind_resources 230–440 ms/s, textures 64–138 ms/s of it; 1.25k–1.8k dirty syncs/s, 74–135 MB/s uploaded | Absolute times are inflated by the verify modes. |
 
+### Timed A/B, 1+1 (29 Oct 2026, ~80 s each, same save and route)
+
+Base `SOTC_FPS=1` vs `SOTC_FPS=1 SOTC_WRITE_DIET=1 SOTC_SYNC_PIPE=1 SOTC_TEX_BLOCK=1 SOTC_RS_MEMO=2`,
+both with `SOTC_CVARS="skipSplash=1 nointro"`. Default config (PS4 mode). 13 windows each after
+dropping 2. All four were active: RS MEMO hits 76-90%, TEX BLOCK 81% of 4.1 M lookups, SYNC PIPE
+and TEX BLOCK 0 verify mismatches.
+
+| | base | C1-C4 |
+|---|---|---|
+| draw thread, median | 27.32 ms | 28.80 ms |
+| draw thread per 1000 cmds | 4.92 ms | 4.78 ms (-2.9%) |
+| cmds/frame, median | 5,327 | 5,228 (heavier windows: 8,355 vs 7,219 peak) |
+| CP, median | 26.65 ms | 26.82 ms |
+| frame p50 / p99 | 33.4 / 42.0 ms | 33.4 / 42.0 ms |
+| frames > 50 ms / worst | 31 / 417 ms | 23 / 376 ms |
+
+**Not accepted.** No visual defect seen by the user in the C1-C4 session. The raw median is worse. Normalized per command it is ~3% (~0.8 ms) cheaper, which
+is inside the session-to-session noise and far below the 2.5-4.5 ms estimate of §6. Only 1+1
+sessions, so this is not a full §6 protocol result. A 3+3 would be needed to accept it, and these
+numbers do not justify running one. The draw thread and the CP are both at ~27 ms in these windows.
+
 ## 1. Goal
 
 The serial draw thread (`GpuDraw`: `Rasterizer::Draw`, `DrawIndirect`, `DispatchDirect`,

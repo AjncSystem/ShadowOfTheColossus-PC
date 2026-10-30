@@ -60,6 +60,10 @@ struct RegionBits {
         return data[index];
     }
 
+    constexpr const u64& operator[](u64 index) const {
+        return data[index];
+    }
+
 private:
     alignas(64) std::array<u64, NUM_REGION_WORDS> data;
 };

@@ -370,7 +370,8 @@ modo Pro, HUD com geração de quadros).
   deixa a CPU ler dados velhos). Gráficos, dispatches indiretos e buffers com formato mantêm o range
   inteiro. O cache de shaders não muda.
 - **Menos travadas ao andar pelo mapa:** o timer do Windows passa a 1 ms (`SOTC_TIMER_RES=0`
-  desliga), liberar memória não espera mais a thread da GPU (`SOTC_DROP_ASYNC=0`), os workers de
+  desliga), liberar memória ainda espera a thread da GPU por padrão (`SOTC_DROP_ASYNC=1`, experimental
+  e desligado, deixa de esperar), os workers de
   compilação rodam abaixo do normal (`SOTC_WORKER_LOW_PRIO=0`) e o sleep do ritmo de quadros usa um
   timer de alta resolução.
 - **Sombras piscando logo após carregar:** os passes de sombra (só profundidade) compilam na hora

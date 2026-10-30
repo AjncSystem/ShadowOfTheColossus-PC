@@ -25,6 +25,7 @@
 #include "common/unique_function.h"
 #include "common/inline_function.h" // sotc: SOTC_INLINE_FUNC
 #include "video_core/amdgpu/cb_db_extent.h"
+#include "video_core/amdgpu/op_footprint.h" // sotc: SOTC_OP_OVERLAP
 #include "video_core/amdgpu/regs.h"
 
 namespace Vulkan {
@@ -872,6 +873,13 @@ private:
     void XpPublishSeg(const XpSeg& seg);
     /// Prep thread: the shader-bound footprint of an op into its prepared slot.
     void XpFillResources(Vulkan::PreparedDraw& slot, const Vulkan::Pipeline* pipeline);
+    /// sotc: SOTC_OP_OVERLAP (7c.0, SotcStats::kOpOverlap). ovl_on is set before the prep threads
+    /// start; ovl_prev* are draw-thread only.
+    bool ovl_on{};
+    bool ovl_prev_known{};
+    AmdGpu::OpFootprint ovl_prev;
+    /// Draw thread, before the op runs: compare its footprint with the previous op's.
+    void NoteOpOverlap(const BackOp& op);
     void XpPoll(u64 tail);
     /// Draw thread: returns true when the segment was consumed (ran ahead or dropped).
     bool XpEvaluate(const XpSeg& seg, u64 tail);

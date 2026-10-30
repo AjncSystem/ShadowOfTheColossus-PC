@@ -78,4 +78,48 @@ u64 PatchRdtscInstructions(u64 segment_addr, u64 segment_size,
                            std::span<const uintptr_t> function_starts, void* clock,
                            u64* unpatched);
 
+/// sotc: a detour from guest code into the host hook dispatcher (gpu/sotc/hooks.h,
+/// docs/HOOK-DESIGN.md). The stub follows the rdtsc clock call (GenerateClockCall): it steps over
+/// the 128-byte red zone, saves flags, every GPR (as a GuestRegs) and xmm0-7, aligns the stack,
+/// reserves the Win64 shadow space and calls sotc_hook_dispatch(regs, hook_id, phase).
+enum class DetourMode : u32 {
+    /// At a function entry. The pre-handler may return HookAction::Return: the stub then returns
+    /// to the guest caller with regs.rax/rdx/xmm0 as the result, skipping the original.
+    Entry,
+    /// At a function entry, pre and post. The original runs as a call from the stub (one extra
+    /// frame on the guest stack); the post-handler sees and may change the return values. Only
+    /// for functions without stack arguments and without varargs.
+    Wrap,
+    /// At one instruction inside a function. The handler may edit the registers, which are
+    /// written back before the displaced instructions run.
+    Site,
+};
+
+struct DetourRequest {
+    u64 address{};                  ///< host address of the hooked instruction (image + offset)
+    DetourMode mode{DetourMode::Entry};
+    u32 hook_id{};                  ///< passed to sotc_hook_dispatch
+    std::span<const u8> pattern;    ///< bytes expected at address after all other patches
+    std::span<const u8> mask;       ///< same length: 0xff compare, 0x00 wildcard (empty: all 0xff)
+};
+
+struct DetourResult {
+    bool installed{};
+    const char* reason{""};         ///< why not installed (static string)
+    u64 displaced_bytes{};          ///< guest bytes moved into the trampoline
+};
+
+/// Installs one detour into the module registered with RegisterPatchModule. Refuses (installed =
+/// false) when the pattern does not match, the displaced span (>= 5 bytes) holds a branch target
+/// after its first instruction or control flow before its end, overlaps another CPU patch, lies in
+/// a red-zone protected function, or the trampoline area is full. Nothing is written on refusal.
+bool InstallGuestDetour(const DetourRequest& request, DetourResult* result);
+
+/// Trampoline bytes used so far by every CPU patch of the registered module.
+u64 TrampolineBytesUsed();
+
+/// sotc: gives the registered module its function starts (host addresses) for the guest detours,
+/// without patching anything. The other passes merge theirs too, but they may not run.
+void RegisterFunctionStarts(std::span<const uintptr_t> function_starts);
+
 } // namespace Core

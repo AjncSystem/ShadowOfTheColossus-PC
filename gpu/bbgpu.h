@@ -60,6 +60,13 @@ unsigned bbgpu_symbol_count(void);
 void bbgpu_set_fps_target_slot(void *slot);
 /* sotc: SOTC_STALL_DETAIL: the calling guest thread's CPU time is counted (src/runtime_thread.c host_start). */
 void bbgpu_register_guest_thread(void);
+/* sotc: SOTC_WRITE_DECL. The CPU is about to write [address, address+size) of guest memory
+ * (a host memcpy/memset/memmove or file read on behalf of the guest; return_address is the
+ * guest caller, for attribution). =1: the GPU-tracked pages of the span are taken as written
+ * now, as one write fault per page would, but in one pass (page_manager.cpp DeclareCpuWrite).
+ * =2: only counted (the would-be declared pages per caller, SOTC WRITE DECL report line).
+ * Unset/0: returns at once. Returns the number of tracked pages found in the span. */
+uint64_t bbgpu_declare_cpu_write(void *address, uint64_t size, uint64_t return_address);
 #ifdef __cplusplus
 }
 #endif

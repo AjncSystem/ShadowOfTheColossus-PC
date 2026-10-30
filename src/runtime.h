@@ -91,4 +91,12 @@ void runtime_savedata_configure(const char *title);
 uintptr_t runtime_savedata_resolve(const char *name);
 void runtime_savedata_report(void);
 void runtime_thread_attach_host(const char *name);
+/* sotc: one "SOTC USLEEP:" line for the SOTC_FPS report; resets the usleep counters (runtime_kernel.c). */
+void runtime_usleep_stats(char *out, size_t size, double seconds);
+/* sotc: runs fn(arg) on the thread's host stack (probe.c): the fault handler's alternate stack when
+ * the caller runs on a guest fiber stack, the current stack otherwise. Reentrant: see probe.c. */
+#ifdef __cplusplus
+extern "C"
+#endif
+void runtime_call_on_host_stack(void (*fn)(void *), void *arg);
 #endif

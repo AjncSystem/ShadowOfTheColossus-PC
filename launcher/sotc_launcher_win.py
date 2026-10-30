@@ -1471,12 +1471,12 @@ class Launcher:
                  _('Compatibilidade: 30 FPS, sem upscaler, texturas desligadas (o mais leve e seguro). Equilibrado: 60 FPS, '
                    'FSR 3.1 Qualidade (DLSS numa RTX), texturas altas. Desempenho: 60 FPS, FSR 3.1 Desempenho (2x). '
                    'Máximo: tudo no alto (FPS ilimitado, texturas máximas, render nativo até 1440p, grama e sombras '
-                   'mais longe), para PCs fortes. Sugerir para meu PC: escolhe pela placa, VRAM, CPU e tela, e explica '
+                   'mais longe), para placas com 8 GB de VRAM ou mais (12 GB em 4K). Sugerir para meu PC: escolhe pela placa, VRAM, CPU e tela, e explica '
                    'por quê. Mexem só nesta página; você pode ajustar cada opção depois.',
                    'Compatibility: 30 FPS, no upscaler, textures off (lightest and safest). Balanced: 60 FPS, FSR 3.1 '
                    'Quality (DLSS on an RTX), high textures. Performance: 60 FPS, FSR 3.1 Performance (2x). Maximum: '
                    'everything up (unlimited FPS, maximum textures, native render up to 1440p, grass and shadows '
-                   'farther), for strong PCs. Suggest for my PC: picks from the card, VRAM, CPU and screen, and says '
+                   'farther), for cards with 8 GB of VRAM or more (12 GB at 4K). Suggest for my PC: picks from the card, VRAM, CPU and screen, and says '
                    'why. They only change this page; you can adjust each option afterwards.'))
         self.section(f, _('Modos', 'Modes'), top=4)
         self.check(f, 'af16', _('Texturas nítidas (filtro anisotrópico 16x)', 'Sharp textures (16x anisotropic filtering)'),

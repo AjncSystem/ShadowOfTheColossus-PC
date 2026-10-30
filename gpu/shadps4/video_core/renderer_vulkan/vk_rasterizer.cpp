@@ -2039,7 +2039,7 @@ void Rasterizer::FlushPeriodic() {
     // 1000 instead of 500 (2026-10-15, RTX 3060 laptop, idle shrine ~5800 draws/frame): about +8%
     // in a single unpaired run (250: no gain, 2000: same as 1000): fewer submits, each one
     // cheaper per draw.
-    static const u64 flush_us = [] {
+    static const u64 flush_us = []() -> u64 {
         if (const char* v = std::getenv("SOTC_FLUSH_US")) {
             return std::strtoull(v, nullptr, 10);
         }

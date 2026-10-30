@@ -5,11 +5,16 @@
 #include "video_core/renderer_vulkan/vk_framegen.h"
 #include "video_core/renderer_vulkan/vk_fsrfg.h"
 
+// sotc: NVIDIA Streamline exists for Windows only. Elsewhere DLSS-G is unavailable and this file
+// only captures the frame inputs FSR 3 frame generation uses.
+#ifdef _WIN32
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -50,7 +55,9 @@ bool sky_bias_written = false;
 namespace {
 
 struct Api {
+#ifdef _WIN32
     HMODULE dll{};
+#endif
     PFun_slInit* init{};
     PFun_slIsFeatureSupported* is_supported{};
     PFun_slGetFeatureRequirements* requirements{};
@@ -138,10 +145,11 @@ bool fg_on = false;
 bool options_set = false;
 u32 valid_streak = 0;
 u64 presents = 0;
-LARGE_INTEGER present_start{};
+std::chrono::steady_clock::time_point present_start{}; // epoch: no present being timed
 double present_ms_sum = 0.0, present_ms_max = 0.0;
 u32 present_ms_count = 0;
 
+#ifdef _WIN32
 void LogCallback(sl::LogType type, const char* msg) {
     if (type == sl::LogType::eInfo && log_level < 2) {
         return;
@@ -153,6 +161,7 @@ void LogCallback(sl::LogType type, const char* msg) {
         std::fputc('\n', stderr);
     }
 }
+#endif
 
 void OnApiError(const sl::APIError& e) {
     static std::atomic<u32> count{0};
@@ -161,6 +170,7 @@ void OnApiError(const sl::APIError& e) {
     }
 }
 
+#ifdef _WIN32
 template <typename T>
 bool Resolve(T*& out, const char* name) {
     out = reinterpret_cast<T*>(GetProcAddress(api.dll, name));
@@ -169,6 +179,7 @@ bool Resolve(T*& out, const char* name) {
     }
     return out != nullptr;
 }
+#endif
 
 template <typename T>
 bool ResolveFeature(T*& out, sl::Feature feature, const char* name) {
@@ -483,12 +494,10 @@ bool MakeConstants(const Pending& p, u32 width, u32 height, sl::Constants& out) 
         return v && v[0] == '1';
     }();
     if (cam_log && next_index % 10 == 0) {
-        LARGE_INTEGER t, f;
-        QueryPerformanceCounter(&t);
-        QueryPerformanceFrequency(&f);
-        std::fprintf(stderr, "SOTC CAM %lld %.2f %.2f %.2f\n",
-                     static_cast<long long>(t.QuadPart * 1000 / f.QuadPart), p.cam.pos[0],
-                     p.cam.pos[1], p.cam.pos[2]);
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch());
+        std::fprintf(stderr, "SOTC CAM %lld %.2f %.2f %.2f\n", static_cast<long long>(ms.count()),
+                     p.cam.pos[0], p.cam.pos[1], p.cam.pos[2]);
     }
     have_prev = true;
     std::memcpy(prev_pos, p.cam.pos, sizeof(prev_pos));
@@ -792,6 +801,7 @@ bool Capturing() {
     }
 }
 
+#ifdef _WIN32
 // SOTC_DLSSG_ASSUME_FOCUS=1 (background test runs only): DLSS-G pauses while the game window
 // is not the foreground window. The scripted benchmarks keep their window behind the user's
 // (it must never take the focus), so Streamline's GetForegroundWindow import is pointed at a
@@ -854,6 +864,7 @@ void PatchForegroundWindow(const wchar_t* module_name) {
         }
     }
 }
+#endif
 
 void SetOptions(bool on) {
     sl::DLSSGOptions options{};
@@ -903,6 +914,10 @@ PFN_vkGetInstanceProcAddr LoadInterposer() {
     if (const char* l = std::getenv("SOTC_DLSSG_LOG")) {
         log_level = std::atoi(l);
     }
+#ifndef _WIN32
+    // FrameGen::WantStreamline() is false without Windows: Streamline is never loaded.
+    return nullptr;
+#else
     static std::wstring dir = [] {
         wchar_t path[MAX_PATH];
         const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
@@ -972,6 +987,7 @@ PFN_vkGetInstanceProcAddr LoadInterposer() {
     std::fprintf(stderr, "SOTC DLSSG: Streamline %d.%d.%d loaded\n", SL_VERSION_MAJOR,
                  SL_VERSION_MINOR, SL_VERSION_PATCH);
     return gipa;
+#endif
 }
 
 void OnDeviceCreated(const Instance& instance) {
@@ -2049,7 +2065,7 @@ void BeforePresent(u32 frame_id, vk::Rect2D rect, vk::Extent2D extent) {
         api.set_tag(*token, sl::ViewportHandle{0}, tags.data(), 3, nullptr);
     }
     api.pcl_marker(sl::PCLMarker::ePresentStart, *token);
-    QueryPerformanceCounter(&present_start);
+    present_start = std::chrono::steady_clock::now();
 }
 
 void AfterPresent(u32 frame_id) {
@@ -2057,15 +2073,14 @@ void AfterPresent(u32 frame_id) {
         return;
     }
     const u32 index = frames[frame_id].index;
-    if (index != 0 && present_start.QuadPart) {
-        LARGE_INTEGER now, freq;
-        QueryPerformanceCounter(&now);
-        QueryPerformanceFrequency(&freq);
-        const double ms = double(now.QuadPart - present_start.QuadPart) * 1000.0 / freq.QuadPart;
+    if (index != 0 && present_start != std::chrono::steady_clock::time_point{}) {
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - present_start)
+                              .count();
         present_ms_sum += ms;
         present_ms_max = std::max(present_ms_max, ms);
         ++present_ms_count;
-        present_start.QuadPart = 0;
+        present_start = {};
     }
     Marker(sl::PCLMarker::ePresentEnd, index);
     const bool stats = ++presents % 60 == 0;

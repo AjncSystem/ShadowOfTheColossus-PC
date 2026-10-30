@@ -420,4 +420,12 @@ u64 GetDirectorySize(const std::filesystem::path& path) {
     return total;
 }
 
+std::FILE* OpenCFile(const std::filesystem::path& path, FileAccessMode mode) {
+#ifdef _WIN32
+    return _wfopen(path.c_str(), AccessModeToWStr(mode, FileType::BinaryFile));
+#else
+    return std::fopen(path.c_str(), AccessModeToStr(mode, FileType::BinaryFile));
+#endif
+}
+
 } // namespace Common::FS

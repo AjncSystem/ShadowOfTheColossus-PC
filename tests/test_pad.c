@@ -5,6 +5,8 @@
 
 static int capture;
 int bbgpu_overlay_captures_input(void) { return capture; }
+/* No game window in the test: no mouse camera input. */
+int bbgpu_mouse_take(float *dx, float *dy, unsigned *buttons) { (void)dx; (void)dy; (void)buttons; return 0; }
 uintptr_t runtime_lookup(const RuntimeExport *table, size_t count, const char *name) {
     (void)table; (void)count; (void)name;
     return 0;
@@ -63,8 +65,10 @@ int main(void) {
     SDL_UpdateGamepads();
     assert(pad_read_state(1,&data)==0);
     assert(gamepad && data.touch_count==2 && (data.buttons & BTN_TOUCHPAD));
-    assert(data.touches[0].x==1439 && data.touches[0].y==471 && data.touches[0].id==0);
-    assert(data.touches[1].x==480 && data.touches[1].y==942 && data.touches[1].id==1);
+    assert(data.touches[0].x==1439 && data.touches[0].y==471);
+    assert(data.touches[1].x==480 && data.touches[1].y==942);
+    /* DualShock 4 ids: each finger going down gets a new nonzero one (touch_ids). */
+    assert(data.touches[0].id && data.touches[1].id && data.touches[0].id!=data.touches[1].id);
     capture=1;
     assert(pad_read_state(1,&data)==0 && data.touch_count==0 && data.buttons==0);
     capture=0;

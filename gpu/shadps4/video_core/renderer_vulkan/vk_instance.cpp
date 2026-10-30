@@ -17,6 +17,7 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/sotc_stats.h"
 
@@ -265,6 +266,7 @@ std::string Instance::GetDriverVersionName() {
 
 void Instance::ReportDeviceFault() const {
     LOG_CRITICAL(Render_Vulkan, "Vulkan device lost");
+    DumpQueueOps(*this, "device lost"); // sotc: the last submits and sparse binds (vk_scheduler.cpp)
     if (!device_fault) {
         LOG_CRITICAL(Render_Vulkan, "VK_EXT_device_fault unavailable, no fault details");
         return;

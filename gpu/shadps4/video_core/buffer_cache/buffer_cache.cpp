@@ -3788,6 +3788,11 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
     // Queue access is serialized by submit_mutex, which the scheduler no longer holds here.
     std::scoped_lock lk{Vulkan::Scheduler::submit_mutex};
     const auto bind_start = std::chrono::steady_clock::now();
+    {
+        Vulkan::SubmitInfo bind_info{};
+        bind_info.AddSignal(signal_sema, signal_tick);
+        Vulkan::NoteQueueOp('B', bind_info, static_cast<u32>(buffer_binds.size()));
+    }
     auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
     // sotc: any other failure (out of device memory on a 4 GB card) left no trace: the GPU then

@@ -4,6 +4,7 @@
 #include <limits>
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -250,6 +251,12 @@ void Semaphore::Wait(u64 tick) {
                          static_cast<unsigned long long>(tick), (waited + 1) * 5,
                          static_cast<unsigned long long>(counter),
                          static_cast<unsigned long long>(CurrentTick()));
+            if (waited == 1) { // sotc: 10 s: what the queue holds (vk_scheduler.cpp)
+                std::fprintf(stderr, "SOTC GPU wait: this semaphore is %llx\n",
+                             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(
+                                 static_cast<VkSemaphore>(*semaphore))));
+                DumpQueueOps(instance, "GPU wait over 10 s");
+            }
             continue;
         }
         if (result == vk::Result::eErrorDeviceLost) {

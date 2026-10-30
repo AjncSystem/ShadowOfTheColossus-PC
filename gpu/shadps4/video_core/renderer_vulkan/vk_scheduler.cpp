@@ -654,6 +654,59 @@ void Scheduler::EndSession() {
 }
 
 // The queue submit of SubmitExecution, from the command processor or the recording thread.
+namespace {
+struct QueueOp {
+    u64 seq;
+    char kind;
+    u32 command_buffers;
+    SubmitInfo info;
+};
+std::array<QueueOp, 32> queue_ops{};
+u64 queue_op_count = 0;
+std::mutex queue_ops_mutex;
+} // namespace
+
+void NoteQueueOp(char kind, const SubmitInfo& info, u32 command_buffers) {
+    std::scoped_lock lk{queue_ops_mutex};
+    queue_ops[queue_op_count % queue_ops.size()] = {queue_op_count, kind, command_buffers, info};
+    ++queue_op_count;
+}
+
+void DumpQueueOps(const Instance& instance, const char* why) {
+    std::scoped_lock lk{queue_ops_mutex};
+    const u64 first = queue_op_count > queue_ops.size() ? queue_op_count - queue_ops.size() : 0;
+    std::fprintf(stderr, "SOTC queue ops (%s), oldest first; S submit, B sparse bind; "
+                         "semaphore=value (at its current value when above 1):\n", why);
+    const auto add = [&](std::string& line, vk::Semaphore sem, u64 value) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), " %llx=%llu",
+                      static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(
+                          static_cast<VkSemaphore>(sem))),
+                      static_cast<unsigned long long>(value));
+        line += buf;
+        if (value > 1) { // a timeline value; binary semaphores are added with 1
+            const auto [result, now] = instance.GetDevice().getSemaphoreCounterValue(sem);
+            if (result == vk::Result::eSuccess) {
+                std::snprintf(buf, sizeof(buf), " (at %llu)", static_cast<unsigned long long>(now));
+                line += buf;
+            }
+        }
+    };
+    for (u64 i = first; i < queue_op_count; ++i) {
+        const QueueOp& op = queue_ops[i % queue_ops.size()];
+        std::string line = "  #" + std::to_string(op.seq) + ' ' + op.kind + " cmds " +
+                           std::to_string(op.command_buffers) + " waits";
+        for (u32 w = 0; w < op.info.num_wait_semas; ++w) {
+            add(line, op.info.wait_semas[w], op.info.wait_ticks[w]);
+        }
+        line += " | signals";
+        for (u32 s = 0; s < op.info.num_signal_semas; ++s) {
+            add(line, op.info.signal_semas[s], op.info.signal_ticks[s]);
+        }
+        std::fprintf(stderr, "%s\n", line.c_str());
+    }
+}
+
 static void QueueSubmit(const Instance& instance, const SubmitInfo& info,
                         std::span<const vk::CommandBuffer> cmd_buffers) {
     // One stage mask per wait semaphore; SubmitInfo can carry up to 4 waits (it used to provide
@@ -686,6 +739,7 @@ static void QueueSubmit(const Instance& instance, const SubmitInfo& info,
 
     std::scoped_lock lk{Scheduler::submit_mutex};
     ImGui::Core::TextureManager::Submit();
+    NoteQueueOp('S', info, static_cast<u32>(cmd_buffers.size()));
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
     if (submit_result == vk::Result::eErrorDeviceLost) {
         instance.ReportDeviceFault();

@@ -80,6 +80,12 @@ struct SubmitInfo {
     }
 };
 
+/// sotc: the last queue operations (submits and sparse binds), printed when the GPU stops
+/// answering (a wait over 10 s) or the device is lost: the semaphore values each one waited for
+/// and signalled show what holds the queue. Callers hold Scheduler::submit_mutex.
+void NoteQueueOp(char kind, const SubmitInfo& info, u32 command_buffers);
+void DumpQueueOps(const Instance& instance, const char* why);
+
 using Viewports = boost::container::static_vector<vk::Viewport, AmdGpu::NUM_VIEWPORTS>;
 using Scissors = boost::container::static_vector<vk::Rect2D, AmdGpu::NUM_VIEWPORTS>;
 using ColorWriteMasks = std::array<vk::ColorComponentFlags, AmdGpu::NUM_COLOR_BUFFERS>;

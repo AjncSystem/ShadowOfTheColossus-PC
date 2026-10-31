@@ -125,6 +125,10 @@ def main():
                         help='stop skipping after one game start and three stable shrine samples')
     parser.add_argument('--record', help='hand over to the player with BB_PAD_RECORD=<file> (F9 stops)')
     parser.add_argument('--replay', help='measure a replay of a BB_PAD_RECORD file')
+    parser.add_argument('--replay-after-load', type=float, metavar='SECONDS',
+                        help='for a save that does not start at the shrine (--template of a player): '
+                             'start the replay SECONDS after the save finished loading, as the player '
+                             'pressed F9 then, instead of after the shrine cutscene')
     parser.add_argument('--video', help='record the window to this .mp4 from the idle scene on (see the docstring)')
     parser.add_argument('--video-fps', type=int, default=30, help='recording frame rate (30 costs the game less)')
     parser.add_argument('--ffmpeg', help='path to ffmpeg.exe for --video')
@@ -219,6 +223,13 @@ def main():
                 break
             press('cross', 0.3)
             at += 3
+        if args.replay_after_load is not None:
+            # A player's save: no shrine cutscene to skip and no X afterwards (Wander would act).
+            while state.get('loaded_at') is None:
+                if not wait_until(time.monotonic() - start + 0.2):
+                    return
+            state['gameplay_at'] = state['loaded_at'] + args.replay_after_load - 1
+            return
         # ...and once more when the shrine cutscene is skipped and gameplay begins. Hold X until
         # then; no input afterwards (X would make Wander act).
         at = time.monotonic() - start + 4
@@ -241,6 +252,8 @@ def main():
             except OSError:
                 continue
             state['game_starts'] = text.count('st_gameflow() starting game')
+            if state['game_starts'] >= 1 and state.get('loaded_at') is None and                     'Loading a save or a new area' in text:
+                state['loaded_at'] = time.monotonic() - start
             for match in FPS_LINE.finditer(text, seen):
                 seen = match.end()
                 samples.append((float(match.group(1)), int(match.group(3)), time.monotonic() - start))

@@ -1022,11 +1022,32 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     if (entry) entry->outcome=((uint64_t)fault_path<<8)|(result==EXCEPTION_CONTINUE_EXECUTION)|0x10000;
     return result;
 }
+/* sotc: SOTC_COPY_GUEST_VIEW (gpu/shim/bbgpu.cpp GuardedGuestCopy; HiddenUserHere, upstream PR
+ * #339). A host thread copying guest memory through the guest's own addresses arms this guard; a
+ * fault inside [lo, hi) (a page the GPU tracking read-protected, or one the guest unmapped)
+ * resumes at the copy's recovery point before any other handler runs, and the copy falls back to
+ * the backing view. Page tracking must not see that fault: its readback could wait for the
+ * command processor, which may be waiting for this thread. Single shot: the handler clears buf. */
+__thread uintptr_t bb_copy_guard_lo, bb_copy_guard_hi;
+__thread unsigned long long *bb_copy_guard_buf;
 static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record=info->ExceptionRecord;
     DWORD code=record->ExceptionCode;
     if ((code==EXCEPTION_BREAKPOINT || code==EXCEPTION_SINGLE_STEP) && heap_hook_trap(info)) { fault_path=1; return EXCEPTION_CONTINUE_EXECUTION; }
     if (code==EXCEPTION_SINGLE_STEP && helper_single_step(info)) { fault_path=2; return EXCEPTION_CONTINUE_EXECUTION; }
+    if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2 && bb_copy_guard_buf &&
+        (uintptr_t)record->ExceptionInformation[1]>=bb_copy_guard_lo &&
+        (uintptr_t)record->ExceptionInformation[1]<bb_copy_guard_hi) {
+        unsigned long long *buffer=bb_copy_guard_buf;
+        bb_copy_guard_buf=NULL;
+        CONTEXT *c=info->ContextRecord;
+        c->Rsp=((c->Rsp-128)&~(DWORD64)15)-40;
+        c->Rcx=(DWORD64)(uintptr_t)buffer;
+        c->Rdx=1;
+        c->Rip=(DWORD64)(uintptr_t)bb_longjmp;
+        fault_path=13;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2 && gpu_enabled && helper_read_fault(info)) {
         fault_path=3;
         return EXCEPTION_CONTINUE_EXECUTION;

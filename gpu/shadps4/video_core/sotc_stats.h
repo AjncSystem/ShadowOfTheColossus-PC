@@ -83,6 +83,7 @@ inline std::atomic<uint64_t> upload_deferred{0};        ///< first uploads put o
 inline std::atomic<uint64_t> upload_deferred_bytes{0};
 inline std::atomic<uint64_t> upload_zero_filled{0};     ///< ... images filled with zeros meanwhile
 inline std::atomic<uint64_t> heap_guard_repeats{0};      ///< free-tree nodes seen again, skipped
+inline std::atomic<uint64_t> copy_guest_fallbacks{0}; ///< SOTC_COPY_GUEST_VIEW copies that faulted (backing view)
 // sotc: BPE guard cost split per SOTC_FPS report (only counted with SOTC_FPS): batches, heaps whose
 // extents were checked, tree nodes walked by builds, heaps whose extent list could not be proven (always
 // built), and ns spent selecting heaps / building guards / filtering the writes.

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.70-plus2 — 2026-10-31 (fork Lucas-blip-png)
+- **Formato de textura inválido não fecha mais o jogo (#10 do fork, pepinou123, RX 9070 XT):** depois de uma corrupção de memória, o tradutor de shaders lia um descritor com formato impossível e parava o jogo (código 0x17, "MapNumberConversion: Unreachable code"). Agora usa um valor neutro: no pior caso um texel errado em vez da queda. A corrupção de texturas "arco-íris" em si continua aberta.
+- **AMD GCN (RX 470-590, Vega), para teste: `SOTC_GCN_NV=1` (#8 e #9 do fork, brxzzi; #7, valterf391-ptbr):** o AMD-Fix (raulbezerro-dev) faz a placa se apresentar como driver NVIDIA, e com ele (mais `SOTC_AMD_WAVE32=0`) uma RX 570 parou de perder o dispositivo. Numa placa AMD, isso muda três opções de shader do port: sem arredondamento RTZ, emulação de clip distance e interpolação manual (as barreiras de LDS já estavam ligadas nas GCN). `SOTC_GCN_NV=1` liga as três sem a camada; `SOTC_RTZ=0`, `SOTC_CLIP_EMU=1` e `SOTC_MANUAL_INTERP=1` ligam uma de cada vez, para achar qual resolve. Padrão sem mudança. O cache de shaders é refeito na primeira abertura com uma delas ligada.
+- **Correção da nota do 0.70-plus1:** o heap guard sem repetir nós (`SOTC_GUARD_DEDUP`) continua desligado, mas o motivo dado estava errado. Os quadros de 200-575 ms sem causa no lado da GPU também apareceram com ele desligado (296 e 241 ms numa sessão de 20 min): são do próprio jogo, e o A/B de sessões curtas enganou.
+- O perfil de PGO não foi retreinado para esta versão.
+
 ## 0.70-plus1 — 2026-10-30 (fork Lucas-blip-png)
 - **Versão 0.70:** traz do 0.70 do upstream (AjncSystem) a parte que vale para este fork. O resto dele já existia aqui ou não ajudou nas medições.
 - **Trocas de área com menos trancos de textura (AjncSystem, 0.70, 7fde988):** ao entrar numa área, o jogo pede ~100 MB de texturas novas num quadro só, e esse quadro levava 80-130 ms para enviá-las. Agora entram no máximo 32 MB de texturas grandes novas por quadro; as que ficam para o quadro seguinte aparecem pretas por um instante. `SOTC_UPLOAD_BUDGET_MB=0` desliga, outro número muda o limite. Teste do usuário (mesmo caminho a pé, mesmo save, 1440p DLSS-G): pior quadro 133 ms com ele contra 174 ms no plus27, 1 quadro acima de 100 ms em cada.

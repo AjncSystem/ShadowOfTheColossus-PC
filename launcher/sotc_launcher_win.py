@@ -43,7 +43,7 @@ CONFIG_FILE = CONFIG_DIR / 'launcher_settings.json'
 from sotc_modes import GAMES  # noqa: E402
 GAME_ID = 'CUSA08809'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.70-plus1'
+VERSION = '0.70-plus2'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 

@@ -93,6 +93,7 @@ inline std::atomic<uint64_t> heap_guard_worst_ns{0};
 inline std::atomic<uint64_t> heap_guard_worst_blocks{0}; ///< free blocks of the slowest build
 inline std::atomic<uint64_t> heap_guard_worst_adds{0};   ///< ... and the visits it made
 inline std::atomic<uint64_t> heap_guard_repeats{0};      ///< nodes and ring members seen again, skipped
+inline std::atomic<uint64_t> copy_guest_fallbacks{0}; ///< SOTC_COPY_GUEST_VIEW copies that faulted (backing view)
 inline std::atomic<uint64_t> readback_copies{0};          ///< ranges downloaded
 inline std::atomic<uint64_t> readback_copies_changed{0};  ///< ... whose bytes differed from memory
 inline std::atomic<uint64_t> readback_bytes{0};

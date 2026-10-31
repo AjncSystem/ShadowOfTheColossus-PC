@@ -222,6 +222,12 @@ void DestroyContext() {
     shared_ready = false;
 }
 
+// sotc: an on/off environment switch (unset: `fallback`).
+bool Fsr3Flag(const char* name, bool fallback) {
+    const char* v = std::getenv(name);
+    return v && v[0] ? v[0] != '0' : fallback;
+}
+
 bool EnsureContext(u32 render_w, u32 render_h, u32 out_w, u32 out_h) {
     if (context && render_w <= ctx_render_w && render_h <= ctx_render_h && out_w == ctx_out_w &&
         out_h == ctx_out_h) {
@@ -235,8 +241,14 @@ bool EnsureContext(u32 render_w, u32 render_h, u32 out_w, u32 out_h) {
         .maxRenderHeight = render_h,
         .maxUpscaleWidth = out_w,
         .maxUpscaleHeight = out_h,
-        .hdrColorInput = VK_TRUE,
-        .autoExposure = VK_TRUE,
+        // sotc: the colour input is the game's final, tonemapped frame (8 bits per channel), not
+        // HDR. Flagged as HDR with auto exposure (as it was until 0.70-plus2), FSR 3.1 compared
+        // colours wrongly and dropped its history in motion: grass in blotches, the horse's mane in
+        // steps, while a still scene looked fine (2mg, fork issue #5: "pixelated"). Attract demo,
+        // 720p -> 1080p: finer grass and smooth edges in motion without the flags.
+        // SOTC_FSR3_HDR=1 / SOTC_FSR3_AUTOEXP=1 bring the old flags back.
+        .hdrColorInput = Fsr3Flag("SOTC_FSR3_HDR", false) ? VK_TRUE : VK_FALSE,
+        .autoExposure = Fsr3Flag("SOTC_FSR3_AUTOEXP", false) ? VK_TRUE : VK_FALSE,
     };
     const auto start = Clock::now();
     if (ffxVkFsr3_3_1_5UpscalerContextCreate(&info, &context) != FFX_VK_FSR3_3_1_5_OK) {

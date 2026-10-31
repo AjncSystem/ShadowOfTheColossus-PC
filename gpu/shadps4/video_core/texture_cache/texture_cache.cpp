@@ -1239,12 +1239,18 @@ void TextureCache::RefreshImage(Image& image) {
         const char* v = std::getenv("SOTC_UPLOAD_BUDGET_MB");
         return (v ? std::strtoull(v, nullptr, 10) : 32ull) << 20;
     }();
+    // sotc: the budget also starts over after 16 ms without a flip. Reset on flips only, the boot
+    // (much bound, few frames presented) kept deferring: the opening logos and the title menu text
+    // stayed black (upstream issue #341, found by Gabriel-TwoBits).
     static u64 budget_flip = ~0ull, budget_used = 0;
+    static std::chrono::steady_clock::time_point budget_start{};
     if (upload_budget) {
         const u64 flip = SotcStats::flip_count.load(std::memory_order_relaxed);
-        if (flip != budget_flip) {
+        const auto now = std::chrono::steady_clock::now();
+        if (flip != budget_flip || now - budget_start > std::chrono::milliseconds(16)) {
             budget_flip = flip;
             budget_used = 0;
+            budget_start = now;
         }
     }
     if (upload_budget && !image.sotc_has_data && !is_gpu_modified && budget_used &&

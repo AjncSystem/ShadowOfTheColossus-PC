@@ -212,7 +212,7 @@ Detalhes e números de cada versão no [CHANGELOG](../../CHANGELOG.md).
 | 46 | Lançador: "Sugerir para meu PC", preset Máximo, saves em Documentos, pular a abertura, opções em cinza (plus27) | ✅ | Requisitos por preset e resolução no topo do README. |
 | 47 | F1: opções só do lançador em cinza com o motivo; textura só no lançador (plus27) | ✅ | Pedido do usuário. |
 | 48 | Limite de CPU do Santuário (~72 FPS no 5700X) | ❌ | Cadeia de latência (jogo ↔ CP ↔ GpuDraw ↔ gravação ↔ GPU); +2 ms na thread de desenho = +0,5 ms no quadro. Agrupar `VirtualProtect` e otimizar só a `GpuDraw`: teto ~0. |
-| 49 | Trocas de área sem o FPS cair perto de zero, queda `0x49800` (upstream 0.70, AjncSystem) | ⏳ | 23 conflitos no núcleo de memória; próxima versão (0.70-plus1), com teste de troca de área. |
+| 49 | Trocas de área (upstream 0.70, AjncSystem) | 🔧 | 0.70-plus1: limite de 32 MB de textura por quadro (pior quadro 133 vs 174 ms no teste do usuário). Dedup do heap guard portado mas desligado (travadas de 200-575 ms sem causa na GPU com ele). Trava não portada (espera ≤2 ms aqui); `0x49800` não se aplica. Falta: envio de 200-250 MB de buffers num quadro (até 123 ms). |
 | 50 | AMD GCN: o AMD-Fix (raulbezerro-dev) com o nosso wave32 desligado parou as quedas numa RX 570 (brxzzi, #9) | ⏳ | Achar qual efeito do "driver NVIDIA" segura a queda (barreiras LDS, interpolação manual, clip distance, baricêntricas por GS, RTZ) e ligar só ele nas GCN. |
 
 ## Fora do roteiro

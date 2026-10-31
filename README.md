@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC native port · v0.60.6-plus27
+# Shadow of the Colossus — PC native port · v0.70-plus1
 
 Port nativo para Windows do **Shadow of the Colossus** de PS4 (Bluepoint, 2018; CUSA08809 EU 1.01 ou CUSA08034 US 1.00):
 o código x86-64 do próprio jogo roda direto na CPU do PC e a GPU do PS4 é traduzida para Vulkan. Este é o fork
@@ -54,8 +54,8 @@ com DLSS (FSR 3.1 dá números parecidos). Nesse PC a CPU limita o FPS em uns 70
 Plano público deste fork. Detalhe de cada item: [docs/sotc/ROADMAP.md](docs/sotc/ROADMAP.md) (atualizado em 30/10/2026).
 
 **Em andamento**
-- [ ] **0.70-plus1:** trazer a correção do 0.70 do upstream (AjncSystem) para as quedas de FPS perto de zero nas trocas de
-      área (pior quadro de 534 ms para 58-75 ms lá) e a da queda `0x49800`. Mexe no núcleo de memória, que aqui está diferente.
+- [ ] **Trocas de área:** o pico que sobra é o envio de 200-250 MB de buffers num quadro só (até 123 ms). O 0.70-plus1 trouxe
+      do upstream o limite de textura por quadro; a trava de memória não era o gargalo aqui (espera de até 2 ms).
 - [ ] DLSS com o **Low Latency Mode: Ultra** do driver (RTX 2080 Ti, 2mg): o plus27 deixa de carregar Reflex e DLSS-G sem
       geração de quadros, a causa provável; falta confirmar com o Ultra ligado.
 - [ ] **AMD GCN** (RX 470-590, Vega): o AMD-Fix (raulbezerro-dev) parou as quedas numa RX 570 (brxzzi, #9). Falta achar qual
@@ -72,6 +72,10 @@ Plano público deste fork. Detalhe de cada item: [docs/sotc/ROADMAP.md](docs/sot
 - [x] 2ª fila Vulkan para readback, ASC em fila própria, divisão da `GpuDraw`, 4K nativo (texturas finas somem, 42-44 FPS).
 
 ## Novidades
+
+**0.70-plus1** (30/10/2026): do 0.70 do upstream (AjncSystem), no máximo 32 MB de texturas novas por quadro nas trocas de área
+(pior quadro 133 ms contra 174 no plus27, no teste do usuário). O resto do 0.70 já existia aqui ou não ajudou; detalhes no
+[CHANGELOG](CHANGELOG.md).
 
 **0.60.6-plus27** (30/10/2026, detalhes no [CHANGELOG](CHANGELOG.md)):
 - **DLSS:** a espera do Reflex só roda com a geração de quadros DLSS-G (+6% no Santuário com o DLSS só ampliando); sem
@@ -119,8 +123,8 @@ with DLSS (FSR 3.1 gives similar numbers). The CPU limits this PC at about 70-80
 Detail of each item (Portuguese): [docs/sotc/ROADMAP.md](docs/sotc/ROADMAP.md) (updated 30 Oct 2026).
 
 **In progress**
-- [ ] **0.70-plus1:** bring upstream 0.70's fix (AjncSystem) for the near-zero FPS drops on area changes (worst frame 534 ms
-      to 58-75 ms there) and the `0x49800` crash. It touches the memory core, which differs here.
+- [ ] **Area changes:** the spike left is uploading 200-250 MB of buffers in one frame (up to 123 ms). 0.70-plus1 brought the
+      per-frame texture budget from upstream; the memory lock was not the bottleneck here (waits up to 2 ms).
 - [ ] DLSS with the driver's **Low Latency Mode: Ultra** (RTX 2080 Ti, 2mg): plus27 no longer loads Reflex and DLSS-G
       without frame generation, the likely cause; not confirmed with Ultra yet.
 - [ ] **AMD GCN** (RX 470-590, Vega): the AMD-Fix layer (raulbezerro-dev) stopped the crashes on an RX 570 (brxzzi, #9).
@@ -138,6 +142,9 @@ Detail of each item (Portuguese): [docs/sotc/ROADMAP.md](docs/sotc/ROADMAP.md) (
 
 ## What's new
 
+**0.70-plus1:** from upstream 0.70 (AjncSystem), at most 32 MB of new textures per frame on area changes (worst frame 133 ms
+against 174 ms on plus27 in the user's test). The rest of 0.70 was already here or did not help; details in the CHANGELOG.
+
 **0.60.6-plus27:** DLSS no longer slowed by Reflex when only upscaling, and loads the DLSS plugin alone without frame
 generation (likely cause of the drop with Low Latency Mode: Ultra, fork #5, 2mg); sharpening (RCAS) now works with FSR 3.1,
 DLSS and same-size FSR 1; F8 no longer turns DLSS/FSR 3.1 off after FSR 3; 4K DLSS Performance without black ground; less
@@ -147,7 +154,8 @@ launcher only.
 
 | Version | Improvements and fixes |
 |---|---|
-| **0.60.6-plus27** | **Lucas-blip-png fork:** DLSS without the Reflex wait when only upscaling (+6% in the Shrine) and with the DLSS plugin alone without frame generation (2mg, fork #5); sharpening with FSR 3.1/DLSS; F8 keeps DLSS/FSR 3.1; Suggest for my PC and Maximum preset; saves in Documents; F1 greys launcher-only choices. |
+| **0.70-plus1** | **Lucas-blip-png fork:** per-frame texture upload budget from upstream 0.70 (AjncSystem); free-tree dedup ported but off (long stalls in the user's A/B). |
+| 0.60.6-plus27 | **Lucas-blip-png fork:** DLSS without the Reflex wait when only upscaling (+6% in the Shrine) and with the DLSS plugin alone without frame generation (2mg, fork #5); sharpening with FSR 3.1/DLSS; F8 keeps DLSS/FSR 3.1; Suggest for my PC and Maximum preset; saves in Documents; F1 greys launcher-only choices. |
 | 0.60.6-plus26 | **Lucas-blip-png fork:** 4-thread CPUs +19% in the Shrine (job worker naps, from MMadmer); HUD text without trails with FSR 3.1/DLSS; HUD bars right with reduced render; 30 FPS cap in PS4 Pro mode (AjncSystem); DMA off on Intel (Oussama268); HDR fixes (tabnul); vibration strength (MMadmer, xeodeo). |
 | 0.60.6-plus25 | **Lucas-blip-png fork:** 21:9 and 32:9: the 3D scene is no longer the 16:9 image stretched sideways (#4, with #327 and #331 upstream); game library shows version 01.01. |
 | 0.60.6-plus24 | **Lucas-blip-png fork:** shader cache journal (one file per session instead of ~8,300), background cache writer and speculative compute pipelines (Lukto02, PR #3). |

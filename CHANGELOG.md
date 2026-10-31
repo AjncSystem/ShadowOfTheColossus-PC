@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.70-plus1 — 2026-10-30 (fork Lucas-blip-png)
+- **Versão 0.70:** traz do 0.70 do upstream (AjncSystem) a parte que vale para este fork. O resto dele já existia aqui ou não ajudou nas medições.
+- **Trocas de área com menos trancos de textura (AjncSystem, 0.70, 7fde988):** ao entrar numa área, o jogo pede ~100 MB de texturas novas num quadro só, e esse quadro levava 80-130 ms para enviá-las. Agora entram no máximo 32 MB de texturas grandes novas por quadro; as que ficam para o quadro seguinte aparecem pretas por um instante. `SOTC_UPLOAD_BUDGET_MB=0` desliga, outro número muda o limite. Teste do usuário (mesmo caminho a pé, mesmo save, 1440p DLSS-G): pior quadro 133 ms com ele contra 174 ms no plus27, 1 quadro acima de 100 ms em cada.
+- **Não trazido, com o motivo:**
+  - Percurso do heap guard sem repetir nós (`SOTC_GUARD_DEDUP`): veio portado, mas sai **desligado**. Em todas as sessões do usuário com ele ligado houve quadros de 200-575 ms sem causa no lado da GPU, e em nenhuma sem ele. `SOTC_GUARD_DEDUP=1` liga para teste.
+  - Mudanças na trava da memória do jogo: nos piores quadros daqui a espera pela trava foi de até 2 ms; o pico que sobra é o envio de 200-250 MB de buffers num quadro (até 123 ms), que é o próximo trabalho.
+  - Correção da queda `0x49800`: vinha de dois atalhos do heap guard que o upstream criou e desligou; este fork nunca os teve.
+  - Vistas de memória em pedaços: já existiam aqui (`SOTC_VIEW_GRANULE_MB`).
+- **Ferramenta de teste:** `tools/sotc_bench_shrine.py --replay-after-load` reproduz uma rota gravada com F9 a partir do save de um jogador (rotas a cavalo ainda desviam).
+- O perfil de PGO não foi retreinado para esta versão.
+
 ## 0.60.6-plus27 — 2026-10-30 (fork Lucas-blip-png)
 - **DLSS sem perder FPS só por ter o Reflex (2mg, #5 do fork):** com o DLSS só ampliando a imagem, o Streamline segurava cada quadro com a espera do Reflex: Santuário (1080p de 720p, RTX 5060 Ti) 68,0 FPS com ela, 72,4 sem, igual ao FSR 3.1 (72,7). Agora a espera só roda com a geração de quadros DLSS-G ligada (`SOTC_DLSSG_SLEEP=0` desliga sempre, `=2` força). E com a geração de quadros desligada ao abrir o jogo o Streamline carrega só o plugin do DLSS, sem Reflex nem DLSS-G: é a causa provável da queda com o **Low Latency Mode: Ultra** do driver numa RTX 2080 Ti (48,5 FPS contra 59,1 com Off, teste do 2mg); ainda não confirmado com o Ultra. Com isso, numa RTX 40/50 o F8 só liga o DLSS-G se o jogo abriu com a geração de quadros ligada no lançador (o FSR 3 continua no F8). `SOTC_SL_ALL=1` carrega tudo como antes.
 - **Nitidez (RCAS) também no FSR 3.1, no DLSS e no FSR 1 sem ampliação (pedido do 2mg):** a nitidez do F1 e do lançador só agia dentro da ampliação do FSR 1 e não fazia nada com FSR 3.1, DLSS ou FSR 1 com a imagem já no tamanho da saída (1080p → 1080p). Agora vale em todos (não no bilinear). A nitidez padrão (Média) passa a agir no FSR 3.1 e no DLSS também: a imagem fica um pouco mais nítida que antes; "Desligada" volta ao visual anterior. Santuário 1080p com DLSS: 70-72 FPS com e sem ela (ruído).

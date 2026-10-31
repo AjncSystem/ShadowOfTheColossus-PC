@@ -166,7 +166,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'render_preset': 'quality', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'fx_sunshadows': True, 'engine_cvars': '', 'perf_culling': True,
-                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'auto', 'volume': '100', 'fov': '100', 'shadow_reuse': '0', 'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1', 'weed_distance': '1', 'weed_height': '1', 'grass_fade': '1', 'grass_detail': '0.25', 'library_dirs': [], 'keys': {},
+                'perf_record_thread': True, 'perf_dma': True, 'amd_gcn_compat': False, 'gpu_submit': 'auto', 'vram_use': 'auto', 'volume': '100', 'fov': '100', 'shadow_reuse': '0', 'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1', 'weed_distance': '1', 'weed_height': '1', 'grass_fade': '1', 'grass_detail': '0.25', 'library_dirs': [], 'keys': {},
                 'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'fg_mult': '2', 'fg_hudless': False, 'diag_log': False,
                 'check_updates': True, 'skip_version': ''}
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
@@ -797,6 +797,10 @@ def game_environment(s):
     env['SOTC_RECORD_THREAD'] = '1' if s.get('perf_record_thread', True) else '0'
     if not s.get('perf_dma', True):
         env['BB_DIRECT_MEMORY_ACCESS'] = '0'
+    # AMD GCN (RX 470-590, Vega): the shader options the SotC-AMD-Fix layer turns on by reporting the
+    # NVIDIA driver, without the layer, and the port's 32-lane path off (fork issues #8/#9, brxzzi).
+    if s.get('amd_gcn_compat'):
+        env['SOTC_GCN_NV'], env['SOTC_AMD_WAVE32'] = '1', '0'
     # Periodic submits and readbacks ahead: by default with NVIDIA and AMD (vk_rasterizer.cpp).
     if s.get('gpu_submit') == 'on':
         env['SOTC_FLUSH_US'], env['SOTC_RB_AHEAD'] = '1000', '1'
@@ -1628,6 +1632,16 @@ class Launcher:
                      'and reflects far away. Off gains ~10% FPS, but distant water is flatter. After a change '
                      'the shaders are compiled again the first time. Off on AMD and Intel cards (it drew stripes over '
                      'shadows and water).'))
+        self.check(f, 'amd_gcn_compat', _('Compatibilidade AMD GCN (RX 470-590, Vega; em teste)',
+                                           'AMD GCN compatibility (RX 470-590, Vega; testing)'),
+                   _('Para placas AMD antigas que fecham com "perda do dispositivo" ou mostram linhas no céu: '
+                     'liga nos shaders as opções que o AMD-Fix (raulbezerro-dev) ativa, sem precisar da camada, e '
+                     'desliga o modo de 32 lanes do port. Em teste: se piorar, desligue e conte na issue #9 do '
+                     'fork. Os shaders são compilados de novo na primeira vez. Não use em outras placas.',
+                     'For older AMD cards that close with a "lost device" or show lines in the sky: turns on in '
+                     'the shaders the options the AMD-Fix layer (raulbezerro-dev) enables, without the layer, and '
+                     'turns the port\'s 32-lane mode off. Testing: if it gets worse, turn it off and say so in '
+                     'issue #9 of the fork. Shaders are compiled again the first time. Do not use on other cards.'))
         self.row(f, _('Envio de trabalho à GPU', 'GPU work submission'), self.choice(f, 'gpu_submit', GPU_SUBMIT),
                  _('Manda trabalho à GPU a cada 0,5 ms e lê resultados por um atalho (técnicas do Pink-shadPS4). '
                    'Medido em NVIDIA (+10–15%); em AMD/Intel use "Ligado" para testar e volte para "Automático" '

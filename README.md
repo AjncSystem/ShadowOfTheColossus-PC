@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC native port · v0.70-plus3
+# Shadow of the Colossus — PC native port · v0.70-plus4
 
 Port nativo para Windows do **Shadow of the Colossus** de PS4 (Bluepoint, 2018; CUSA08809 EU 1.01 ou CUSA08034 US 1.00):
 o código x86-64 do próprio jogo roda direto na CPU do PC e a GPU do PS4 é traduzida para Vulkan. Este é o fork
@@ -72,6 +72,10 @@ Plano público deste fork. Detalhe de cada item: [docs/sotc/ROADMAP.md](docs/sot
 - [x] 2ª fila Vulkan para readback, ASC em fila própria, divisão da `GpuDraw`, 4K nativo (texturas finas somem, 42-44 FPS).
 
 ## Novidades
+
+**0.70-plus4** (31/10/2026): DLSS direto pelo driver, sem o Streamline (o "Modo de baixa latência" Ultra não pesa mais);
+máscara reativa no FSR 3.1; quadros no ritmo do jogo (tabnul, F6 compara); o F10 mostra qual DLSS amplia; menus com FSR 1;
+opção "Compatibilidade AMD GCN" no lançador.
 
 **0.70-plus3** (31/10/2026): FSR 3.1 sem o visual pixelado em movimento (a cor ia marcada como HDR); envios de memória para a
 GPU mais rápidos (HiddenUserHere); aviso do Low Latency Mode Ultra com DLSS no lançador.
@@ -148,6 +152,10 @@ Detail of each item (Portuguese): [docs/sotc/ROADMAP.md](docs/sotc/ROADMAP.md) (
 
 ## What's new
 
+**0.70-plus4:** DLSS straight through the driver, without Streamline (NVIDIA Low Latency Mode Ultra no longer costs FPS);
+FSR 3.1 reactive mask; frames at the game's own pace (tabnul, F6 compares); F10 shows which DLSS upscales; menus with
+FSR 1; launcher "AMD GCN compatibility" option.
+
 **0.70-plus3:** FSR 3.1 no longer looks pixelated in motion (its colour input was flagged as HDR); faster uploads to the GPU
 (HiddenUserHere); launcher warning about Low Latency Mode Ultra with DLSS.
 
@@ -166,7 +174,8 @@ launcher only.
 
 | Version | Improvements and fixes |
 |---|---|
-| **0.70-plus3** | **Lucas-blip-png fork:** FSR 3.1 colour no longer flagged as HDR (pixelated in motion, 2mg #5); guest-view upload copies and GPU fill of HLE tables (HiddenUserHere, upstream PR #339); Low Latency Mode Ultra warning. |
+| **0.70-plus4** | **Lucas-blip-png fork:** DLSS through NGX directly, without Streamline (Low Latency Mode Ultra, 2mg #5); FSR 3.1 reactive mask; flip pacing at the game's rate (tabnul, upstream PR #351, F6); DLSS label on F10; FSR 1 for menus; launcher AMD GCN option (brxzzi, raulbezerro-dev). |
+| 0.70-plus3 | **Lucas-blip-png fork:** FSR 3.1 colour no longer flagged as HDR (pixelated in motion, 2mg #5); guest-view upload copies and GPU fill of HLE tables (HiddenUserHere, upstream PR #339); Low Latency Mode Ultra warning. |
 | 0.70-plus2 | **Lucas-blip-png fork:** invalid texture format no longer closes the game (pepinou123, #10); `SOTC_GCN_NV=1` for AMD GCN (brxzzi, raulbezerro-dev, #8/#9). |
 | 0.70-plus1 | **Lucas-blip-png fork:** per-frame texture upload budget from upstream 0.70 (AjncSystem); free-tree dedup ported but off (long stalls in the user's A/B). |
 | 0.60.6-plus27 | **Lucas-blip-png fork:** DLSS without the Reflex wait when only upscaling (+6% in the Shrine) and with the DLSS plugin alone without frame generation (2mg, fork #5); sharpening with FSR 3.1/DLSS; F8 keeps DLSS/FSR 3.1; Suggest for my PC and Maximum preset; saves in Documents; F1 greys launcher-only choices. |

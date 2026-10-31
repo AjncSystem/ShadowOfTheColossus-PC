@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.70-plus3 — 2026-10-31 (fork Lucas-blip-png)
+- **FSR 3.1 sem o visual pixelado em movimento (2mg, #5 do fork):** o FSR 3.1 recebe a imagem final do jogo, já com tonemap e em 8 bits, mas o contexto era criado dizendo que a cor era HDR e pedindo exposição automática. Com isso ele comparava as cores errado e jogava fora o histórico quando a câmera se mexia: grama em manchas, crina do cavalo em degraus, enquanto a cena parada ficava igual à do DLSS. Agora a cor vai como ela é. Demonstração, 720p → 1080p, mesmos momentos: grama com folhas finas e bordas lisas em movimento. Santuário: mesmo brilho, 70,4 FPS. `SOTC_FSR3_HDR=1` e `SOTC_FSR3_AUTOEXP=1` voltam ao antigo.
+- **Envios de memória para a GPU mais rápidos (HiddenUserHere, PR #339 do upstream):**
+  - `SOTC_COPY_GUEST_VIEW` (ligado): os envios leem a memória do jogo pelo endereço do próprio jogo, protegidos contra falha no tratador de exceções; antes liam por uma segunda visão da memória, que pagava uma falta de página por página recém-escrita. Demonstração: envios nos quadros lentos 2 a 3 vezes mais rápidos por MB, nenhum erro.
+  - `SOTC_FILL_HLE_GPU` (ligado): tabelas que o jogo preenche com um padrão repetido são preenchidas na GPU, em vez de copiadas de novo pela CPU a cada varredura (uma tabela de 8 MB, ~33 vezes por carga de área). Demonstração: sem erros, imagem normal.
+  - `=0` desliga cada uma.
+- **Limite de textura por quadro também zera a cada 16 ms sem quadro novo:** na abertura (muito carregamento, poucos quadros) o limite do 0.70 podia deixar logos e o texto do menu pretos (#341 do upstream, achado pelo Gabriel-TwoBits). Não reproduzido aqui; acima de 60 FPS nada muda no jogo.
+- **Lançador:** a dica do Upscaler avisa para deixar o "Modo de baixa latência" da NVIDIA em Desligado ou Ligado com DLSS: em Ultra, o DLSS perde FPS (o Streamline faz o driver aplicar esse modo). A causa em si continua (exigiria o DLSS sem o Streamline).
+- **Do tabnul (PRs #349/#351 do upstream):** a contagem do SOTCSTALL não estoura mais depois de zerar as estatísticas; diagnóstico de tempo de CPU por thread e nomes das threads do jogo no profiler.
+- O perfil de PGO não foi retreinado para esta versão.
+
 ## 0.70-plus2 — 2026-10-31 (fork Lucas-blip-png)
 - **Formato de textura inválido não fecha mais o jogo (#10 do fork, pepinou123, RX 9070 XT):** depois de uma corrupção de memória, o tradutor de shaders lia um descritor com formato impossível e parava o jogo (código 0x17, "MapNumberConversion: Unreachable code"). Agora usa um valor neutro: no pior caso um texel errado em vez da queda. A corrupção de texturas "arco-íris" em si continua aberta.
 - **AMD GCN (RX 470-590, Vega), para teste: `SOTC_GCN_NV=1` (#8 e #9 do fork, brxzzi; #7, valterf391-ptbr):** o AMD-Fix (raulbezerro-dev) faz a placa se apresentar como driver NVIDIA, e com ele (mais `SOTC_AMD_WAVE32=0`) uma RX 570 parou de perder o dispositivo. Numa placa AMD, isso muda três opções de shader do port: sem arredondamento RTZ, emulação de clip distance e interpolação manual (as barreiras de LDS já estavam ligadas nas GCN). `SOTC_GCN_NV=1` liga as três sem a camada; `SOTC_RTZ=0`, `SOTC_CLIP_EMU=1` e `SOTC_MANUAL_INTERP=1` ligam uma de cada vez, para achar qual resolve. Padrão sem mudança. O cache de shaders é refeito na primeira abertura com uma delas ligada.

@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC native port · v0.70-plus2
+# Shadow of the Colossus — PC native port · v0.70-plus3
 
 Port nativo para Windows do **Shadow of the Colossus** de PS4 (Bluepoint, 2018; CUSA08809 EU 1.01 ou CUSA08034 US 1.00):
 o código x86-64 do próprio jogo roda direto na CPU do PC e a GPU do PS4 é traduzida para Vulkan. Este é o fork
@@ -73,6 +73,9 @@ Plano público deste fork. Detalhe de cada item: [docs/sotc/ROADMAP.md](docs/sot
 
 ## Novidades
 
+**0.70-plus3** (31/10/2026): FSR 3.1 sem o visual pixelado em movimento (a cor ia marcada como HDR); envios de memória para a
+GPU mais rápidos (HiddenUserHere); aviso do Low Latency Mode Ultra com DLSS no lançador.
+
 **0.70-plus2** (31/10/2026): formato de textura inválido não fecha mais o jogo (#10 do fork); `SOTC_GCN_NV=1` para testar nas
 AMD GCN as opções de shader que o AMD-Fix liga (#8, #9).
 
@@ -145,6 +148,9 @@ Detail of each item (Portuguese): [docs/sotc/ROADMAP.md](docs/sotc/ROADMAP.md) (
 
 ## What's new
 
+**0.70-plus3:** FSR 3.1 no longer looks pixelated in motion (its colour input was flagged as HDR); faster uploads to the GPU
+(HiddenUserHere); launcher warning about Low Latency Mode Ultra with DLSS.
+
 **0.70-plus2:** an invalid texture format no longer closes the game (fork #10); `SOTC_GCN_NV=1` to test on AMD GCN the shader
 options the AMD-Fix layer turns on (#8, #9).
 
@@ -160,7 +166,8 @@ launcher only.
 
 | Version | Improvements and fixes |
 |---|---|
-| **0.70-plus2** | **Lucas-blip-png fork:** invalid texture format no longer closes the game (pepinou123, #10); `SOTC_GCN_NV=1` for AMD GCN (brxzzi, raulbezerro-dev, #8/#9). |
+| **0.70-plus3** | **Lucas-blip-png fork:** FSR 3.1 colour no longer flagged as HDR (pixelated in motion, 2mg #5); guest-view upload copies and GPU fill of HLE tables (HiddenUserHere, upstream PR #339); Low Latency Mode Ultra warning. |
+| 0.70-plus2 | **Lucas-blip-png fork:** invalid texture format no longer closes the game (pepinou123, #10); `SOTC_GCN_NV=1` for AMD GCN (brxzzi, raulbezerro-dev, #8/#9). |
 | 0.70-plus1 | **Lucas-blip-png fork:** per-frame texture upload budget from upstream 0.70 (AjncSystem); free-tree dedup ported but off (long stalls in the user's A/B). |
 | 0.60.6-plus27 | **Lucas-blip-png fork:** DLSS without the Reflex wait when only upscaling (+6% in the Shrine) and with the DLSS plugin alone without frame generation (2mg, fork #5); sharpening with FSR 3.1/DLSS; F8 keeps DLSS/FSR 3.1; Suggest for my PC and Maximum preset; saves in Documents; F1 greys launcher-only choices. |
 | 0.60.6-plus26 | **Lucas-blip-png fork:** 4-thread CPUs +19% in the Shrine (job worker naps, from MMadmer); HUD text without trails with FSR 3.1/DLSS; HUD bars right with reduced render; 30 FPS cap in PS4 Pro mode (AjncSystem); DMA off on Intel (Oussama268); HDR fixes (tabnul); vibration strength (MMadmer, xeodeo). |

@@ -2,6 +2,7 @@
 from paths import ROOT
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -11,6 +12,8 @@ vulkan = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(vulkan)
 
 
+@unittest.skipIf(os.name == "nt", "bbport_vulkan is the Linux AppImage entry point: POSIX paths, "
+                 "':'-separated VK_DRIVER_FILES and LD_LIBRARY_PATH")
 class PackagedVulkanTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

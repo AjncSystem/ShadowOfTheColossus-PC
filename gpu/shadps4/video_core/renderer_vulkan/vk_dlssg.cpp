@@ -1744,6 +1744,7 @@ bool GetFrameInputs(u32 frame_id, FrameInputs& out) {
     const FrameSlot& f = frames[frame_id];
     const sl::Constants& c = f.constants;
     out.mvec = f.mvec;
+    out.mvec_view = f.mvec_view;
     out.mvec_usage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc |
                      vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eStorage;
     out.width = f.width;

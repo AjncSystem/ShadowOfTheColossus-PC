@@ -1,0 +1,57 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// sotc: the FSR 3.1 reactive mask (vk_fsr3up.cpp). Where the previous frame, moved by the motion
+// vectors, falls outside the colour range of the pixel's 3x3 neighbourhood now, something changed
+// that the motion vectors do not carry (particles, smoke, blended effects: they write no motion
+// vectors): those pixels get a reactive value, so FSR 3.1 trusts the new frame there instead of
+// dragging a trail. The game frame is also copied to `history` for the next frame.
+
+#version 450 core
+
+layout (local_size_x = 8, local_size_y = 8) in;
+
+layout (binding = 0) uniform sampler2D cur_color;
+layout (binding = 1) uniform sampler2D prev_color;
+layout (binding = 2) uniform sampler2D motion; // curUV - prevUV
+layout (binding = 3, r8) uniform writeonly image2D reactive;
+layout (binding = 4, rgba16f) uniform writeonly image2D history;
+
+layout (push_constant) uniform Params {
+    uvec2 size;
+    uint valid;     // prev_color holds the previous frame
+    float strength; // the most reactive a pixel gets (0..1)
+} pc;
+
+float Luma(vec3 c) {
+    return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+void main() {
+    const ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(uvec2(at), pc.size))) {
+        return;
+    }
+    const vec4 color = texelFetch(cur_color, at, 0);
+    imageStore(history, at, color);
+    float value = 0.0;
+    if (pc.valid != 0u) {
+        const ivec2 last = ivec2(pc.size) - 1;
+        float lo = 1.0e9, hi = -1.0e9;
+        for (int y = -1; y <= 1; ++y) {
+            for (int x = -1; x <= 1; ++x) {
+                const ivec2 p = clamp(at + ivec2(x, y), ivec2(0), last);
+                const float l = Luma(texelFetch(cur_color, p, 0).rgb);
+                lo = min(lo, l);
+                hi = max(hi, l);
+            }
+        }
+        const vec2 uv = (vec2(at) + 0.5) / vec2(pc.size);
+        const vec2 prev_uv = uv - texelFetch(motion, at, 0).xy;
+        // Off screen last frame: a disocclusion, which FSR 3.1 handles from depth.
+        if (all(greaterThanEqual(prev_uv, vec2(0.0))) && all(lessThanEqual(prev_uv, vec2(1.0)))) {
+            const float prev = Luma(texture(prev_color, prev_uv).rgb);
+            const float outside = max(lo - prev, prev - hi);
+            value = smoothstep(0.04, 0.20, outside) * pc.strength;
+        }
+    }
+    imageStore(reactive, at, vec4(value));
+}

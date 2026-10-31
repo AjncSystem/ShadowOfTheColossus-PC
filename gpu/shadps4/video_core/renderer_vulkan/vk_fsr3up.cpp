@@ -18,6 +18,7 @@
 
 #include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_fsrfg.h"
+#include "video_core/host_shaders/fsr3_reactive_comp.h"
 #include "video_core/host_shaders/upscale_hud_comp.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -47,7 +48,7 @@ struct OwnedImage {
 struct InFlight {
     u64 frame_id;
     u64 tick;
-    FfxVkFsr3_3_1_5Resource color, depth, mvec;
+    FfxVkFsr3_3_1_5Resource color, depth, mvec, reactive;
 };
 
 const Instance* g_instance{};
@@ -200,6 +201,9 @@ void Retire(bool wait_all) {
         ffxVkFsr3_3_1_5BridgeReleaseImportedImage(bridge, f.color);
         ffxVkFsr3_3_1_5BridgeReleaseImportedImage(bridge, f.depth);
         ffxVkFsr3_3_1_5BridgeReleaseImportedImage(bridge, f.mvec);
+        if (f.reactive.resource) {
+            ffxVkFsr3_3_1_5BridgeReleaseImportedImage(bridge, f.reactive);
+        }
         in_flight.pop_front();
     }
 }
@@ -454,6 +458,182 @@ void PutUiBack(vk::CommandBuffer cmdbuf, u32 frame_id, const OwnedImage& out, u3
     const u32 params[2] = {out_width, out_height};
     cmdbuf.pushConstants(*hud_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params), params);
     cmdbuf.dispatch((out_width + 7) / 8, (out_height + 7) / 8, 1);
+}
+
+// sotc: the reactive mask (fsr3_reactive.comp): pixels the motion vectors do not explain, so FSR
+// 3.1 drops its history there (particles, smoke, blended effects left trails). SOTC_FSR3_REACTIVE=0
+// turns it off; a number 0..1 sets the strongest value (default 0.6).
+OwnedImage reactive_img;
+std::array<OwnedImage, 2> history; // the game frame of the previous dispatch, ping-pong
+u32 history_index = 0;
+bool history_valid = false;
+vk::ShaderModule reactive_shader;
+vk::UniqueDescriptorSetLayout reactive_set_layout;
+vk::UniquePipelineLayout reactive_layout;
+vk::UniquePipeline reactive_pipeline;
+vk::UniqueSampler reactive_sampler;
+bool reactive_failed = false;
+
+float ReactiveStrength() {
+    static const float strength = [] {
+        const char* v = std::getenv("SOTC_FSR3_REACTIVE");
+        return v ? std::clamp(static_cast<float>(std::atof(v)), 0.0f, 1.0f) : 0.6f;
+    }();
+    return strength;
+}
+
+bool EnsureReactive(u32 width, u32 height) {
+    if (reactive_failed || ReactiveStrength() <= 0.0f) {
+        return false;
+    }
+    if (!reactive_pipeline) {
+        reactive_failed = true; // until every part below exists
+        const vk::Device device = g_instance->GetDevice();
+        if (!(g_instance->GetPhysicalDevice().getFormatProperties(vk::Format::eR8Unorm)
+                  .optimalTilingFeatures & vk::FormatFeatureFlagBits::eStorageImage)) {
+            std::fprintf(stderr, "SOTC FSR3 upscaler: no R8 storage images, no reactive mask\n");
+            return false;
+        }
+        reactive_shader = CompileSPV(FSR3_REACTIVE_COMP, device);
+        std::array<vk::DescriptorSetLayoutBinding, 5> bindings{};
+        for (u32 i = 0; i < bindings.size(); ++i) {
+            bindings[i] = vk::DescriptorSetLayoutBinding{
+                .binding = i,
+                .descriptorType = i < 3 ? vk::DescriptorType::eCombinedImageSampler
+                                        : vk::DescriptorType::eStorageImage,
+                .descriptorCount = 1,
+                .stageFlags = vk::ShaderStageFlagBits::eCompute,
+            };
+        }
+        auto [set_result, set_layout] = device.createDescriptorSetLayoutUnique({
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+            .bindingCount = static_cast<u32>(bindings.size()),
+            .pBindings = bindings.data(),
+        });
+        if (!reactive_shader || set_result != vk::Result::eSuccess) {
+            std::fprintf(stderr, "SOTC FSR3 upscaler: reactive mask unavailable\n");
+            return false;
+        }
+        const vk::PushConstantRange push_range = {
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+            .offset = 0,
+            .size = 4 * sizeof(u32),
+        };
+        const vk::DescriptorSetLayout layouts[] = {*set_layout};
+        auto [layout_result, layout] = device.createPipelineLayoutUnique({
+            .setLayoutCount = 1,
+            .pSetLayouts = layouts,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &push_range,
+        });
+        auto [sampler_result, sampler] = device.createSamplerUnique({
+            .magFilter = vk::Filter::eLinear,
+            .minFilter = vk::Filter::eLinear,
+            .mipmapMode = vk::SamplerMipmapMode::eNearest,
+            .addressModeU = vk::SamplerAddressMode::eClampToEdge,
+            .addressModeV = vk::SamplerAddressMode::eClampToEdge,
+            .addressModeW = vk::SamplerAddressMode::eClampToEdge,
+        });
+        if (layout_result != vk::Result::eSuccess || sampler_result != vk::Result::eSuccess) {
+            std::fprintf(stderr, "SOTC FSR3 upscaler: reactive mask unavailable\n");
+            return false;
+        }
+        auto [pipeline_result, pipeline] = device.createComputePipelineUnique(
+            {}, vk::ComputePipelineCreateInfo{
+                    .stage{
+                        .stage = vk::ShaderStageFlagBits::eCompute,
+                        .module = reactive_shader,
+                        .pName = "main",
+                    },
+                    .layout = *layout,
+                });
+        if (pipeline_result != vk::Result::eSuccess) {
+            std::fprintf(stderr, "SOTC FSR3 upscaler: reactive mask unavailable\n");
+            return false;
+        }
+        reactive_set_layout = std::move(set_layout);
+        reactive_layout = std::move(layout);
+        reactive_sampler = std::move(sampler);
+        reactive_pipeline = std::move(pipeline);
+        reactive_failed = false;
+        std::fprintf(stderr, "SOTC FSR3 upscaler: reactive mask on (strength %.2f)\n",
+                     ReactiveStrength());
+    }
+    if (reactive_img.width != width || reactive_img.height != height) {
+        // A new size: wait for the old images' last readers.
+        (void)g_instance->GetDevice().waitIdle();
+        DestroyImage(reactive_img);
+        for (auto& h : history) {
+            DestroyImage(h);
+        }
+        if (!CreateImage(reactive_img, vk::Format::eR8Unorm, width, height) ||
+            !CreateImage(history[0], kColorFormat, width, height) ||
+            !CreateImage(history[1], kColorFormat, width, height)) {
+            std::fprintf(stderr, "SOTC FSR3 upscaler: cannot create the reactive mask images\n");
+            reactive_failed = true;
+            return false;
+        }
+        history_valid = false;
+    }
+    return true;
+}
+
+/// Writes reactive_img (General, for FSR 3.1 to read) from `color` (ShaderReadOnlyOptimal) and the
+/// motion vectors, and copies `color` to the history for the next frame.
+void RecordReactive(vk::CommandBuffer cmdbuf, const OwnedImage& color, vk::ImageView mvec_view,
+                    bool reset) {
+    OwnedImage& prev = history[history_index ^ 1];
+    OwnedImage& next = history[history_index];
+    const bool valid = history_valid && !reset;
+    const std::array pre{
+        Barrier(reactive_img.image, vk::PipelineStageFlagBits2::eAllCommands,
+                vk::AccessFlagBits2::eNone, vk::ImageLayout::eUndefined,
+                vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite,
+                vk::ImageLayout::eGeneral),
+        Barrier(next.image, vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eNone,
+                vk::ImageLayout::eUndefined, vk::PipelineStageFlagBits2::eComputeShader,
+                vk::AccessFlagBits2::eShaderWrite, vk::ImageLayout::eGeneral),
+        Barrier(prev.image, vk::PipelineStageFlagBits2::eComputeShader,
+                vk::AccessFlagBits2::eShaderWrite,
+                history_valid ? vk::ImageLayout::eGeneral : vk::ImageLayout::eUndefined,
+                vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderRead,
+                vk::ImageLayout::eGeneral),
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = static_cast<u32>(pre.size()),
+                                               .pImageMemoryBarriers = pre.data()});
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *reactive_pipeline);
+    const std::array infos{
+        vk::DescriptorImageInfo{*reactive_sampler, color.view, vk::ImageLayout::eShaderReadOnlyOptimal},
+        vk::DescriptorImageInfo{*reactive_sampler, prev.view, vk::ImageLayout::eGeneral},
+        vk::DescriptorImageInfo{*reactive_sampler, mvec_view, vk::ImageLayout::eShaderReadOnlyOptimal},
+        vk::DescriptorImageInfo{{}, reactive_img.view, vk::ImageLayout::eGeneral},
+        vk::DescriptorImageInfo{{}, next.view, vk::ImageLayout::eGeneral},
+    };
+    std::array<vk::WriteDescriptorSet, 5> writes{};
+    for (u32 i = 0; i < writes.size(); ++i) {
+        writes[i] = vk::WriteDescriptorSet{
+            .dstBinding = i,
+            .descriptorCount = 1,
+            .descriptorType = i < 3 ? vk::DescriptorType::eCombinedImageSampler
+                                    : vk::DescriptorType::eStorageImage,
+            .pImageInfo = &infos[i],
+        };
+    }
+    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *reactive_layout, 0, writes);
+    const float strength = ReactiveStrength();
+    u32 params[4] = {color.width, color.height, valid ? 1u : 0u, 0};
+    std::memcpy(&params[3], &strength, sizeof(strength));
+    cmdbuf.pushConstants(*reactive_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params),
+                         params);
+    cmdbuf.dispatch((color.width + 7) / 8, (color.height + 7) / 8, 1);
+    const auto post = Barrier(reactive_img.image, vk::PipelineStageFlagBits2::eComputeShader,
+                              vk::AccessFlagBits2::eShaderWrite, vk::ImageLayout::eGeneral,
+                              vk::PipelineStageFlagBits2::eComputeShader,
+                              vk::AccessFlagBits2::eShaderRead, vk::ImageLayout::eGeneral);
+    cmdbuf.pipelineBarrier2(
+        vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &post});
+    history_index ^= 1;
+    history_valid = true;
 }
 
 } // namespace
@@ -719,7 +899,14 @@ vk::ImageView Dispatch(vk::CommandBuffer cmdbuf, Scheduler& scheduler, u32 frame
     }
     // The frame's colour (fp16, ShaderReadOnlyOptimal), depth (R32F, General) and motion vectors
     // (R16G16F, ShaderReadOnlyOptimal), imported for this dispatch and released once the GPU is done.
-    FfxVkFsr3_3_1_5Resource color_res{}, depth_res{}, mvec_res{};
+    FfxVkFsr3_3_1_5Resource color_res{}, depth_res{}, mvec_res{}, reactive_res{};
+    if (in.mvec_view && EnsureReactive(width, height)) {
+        RecordReactive(cmdbuf, color, in.mvec_view, reset);
+        if (!Import(reactive_res, reactive_img.image, width, height, vk::Format::eR8Unorm,
+                    vk::ImageLayout::eGeneral, FFX_VK_FSR3_3_1_5_RESOURCE_STATE_COMPUTE_READ)) {
+            reactive_res = {};
+        }
+    }
     if (!Import(color_res, color.image, width, height, kColorFormat,
                 vk::ImageLayout::eShaderReadOnlyOptimal,
                 FFX_VK_FSR3_3_1_5_RESOURCE_STATE_COMPUTE_READ) ||
@@ -732,7 +919,7 @@ vk::ImageView Dispatch(vk::CommandBuffer cmdbuf, Scheduler& scheduler, u32 frame
         if (errors++ < 5) {
             std::fprintf(stderr, "SOTC FSR3 upscaler: cannot import the frame inputs\n");
         }
-        for (auto* r : {&color_res, &depth_res, &mvec_res}) {
+        for (auto* r : {&color_res, &depth_res, &mvec_res, &reactive_res}) {
             if (r->resource) {
                 ffxVkFsr3_3_1_5BridgeReleaseImportedImage(bridge, *r);
             }
@@ -745,6 +932,7 @@ vk::ImageView Dispatch(vk::CommandBuffer cmdbuf, Scheduler& scheduler, u32 frame
     d.color = color_res;
     d.depth = depth_res;
     d.motionVectors = mvec_res;
+    d.reactive = reactive_res;
     d.dilatedDepth = shared[0].resource;
     d.dilatedMotionVectors = shared[1].resource;
     d.reconstructedPrevNearestDepth = shared[2].resource;
@@ -775,7 +963,8 @@ vk::ImageView Dispatch(vk::CommandBuffer cmdbuf, Scheduler& scheduler, u32 frame
     d.viewSpaceToMeters = 1.0f;
     d.frameId = sdk_frame;
     const FfxVkFsr3_3_1_5Result r = ffxVkFsr3_3_1_5UpscalerContextRecordDispatch(context, &d);
-    in_flight.push_back({sdk_frame, scheduler.CurrentTick(), color_res, depth_res, mvec_res});
+    in_flight.push_back(
+        {sdk_frame, scheduler.CurrentTick(), color_res, depth_res, mvec_res, reactive_res});
     if (r != FFX_VK_FSR3_3_1_5_OK) {
         static u32 errors = 0;
         if (errors++ < 5) {
@@ -792,7 +981,41 @@ vk::ImageView Dispatch(vk::CommandBuffer cmdbuf, Scheduler& scheduler, u32 frame
                      out_height, in.jitter[0], in.jitter[1], in.z_near, in.z_far, in.fov_y,
                      reset ? 1 : 0, interval_ms);
     }
-    if (split_ui) {
+    // SOTC_FSR3_REACTIVE_VIEW=1 (diagnostic): the reactive mask is shown instead of the frame.
+    static const bool show_reactive = [] {
+        const char* v = std::getenv("SOTC_FSR3_REACTIVE_VIEW");
+        return v && v[0] == '1';
+    }();
+    if (show_reactive && reactive_res.resource) {
+        const std::array pre_view{
+            Barrier(reactive_img.image, vk::PipelineStageFlagBits2::eComputeShader,
+                    vk::AccessFlagBits2::eShaderRead, vk::ImageLayout::eGeneral,
+                    vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferRead,
+                    vk::ImageLayout::eGeneral),
+            Barrier(out.image, vk::PipelineStageFlagBits2::eComputeShader,
+                    vk::AccessFlagBits2::eShaderWrite, vk::ImageLayout::eGeneral,
+                    vk::PipelineStageFlagBits2::eBlit, vk::AccessFlagBits2::eTransferWrite,
+                    vk::ImageLayout::eGeneral),
+        };
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{.imageMemoryBarrierCount = 2,
+                                                   .pImageMemoryBarriers = pre_view.data()});
+        const vk::ImageBlit view_blit{
+            .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .srcOffsets = std::array{vk::Offset3D{0, 0, 0},
+                                     vk::Offset3D{static_cast<s32>(width), static_cast<s32>(height), 1}},
+            .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
+            .dstOffsets = std::array{vk::Offset3D{0, 0, 0}, vk::Offset3D{static_cast<s32>(out_width),
+                                                                         static_cast<s32>(out_height), 1}},
+        };
+        cmdbuf.blitImage(reactive_img.image, vk::ImageLayout::eGeneral, out.image,
+                         vk::ImageLayout::eGeneral, view_blit, vk::Filter::eNearest);
+        const auto post_view = Barrier(out.image, vk::PipelineStageFlagBits2::eBlit,
+                                       vk::AccessFlagBits2::eTransferWrite, vk::ImageLayout::eGeneral,
+                                       vk::PipelineStageFlagBits2::eComputeShader,
+                                       vk::AccessFlagBits2::eShaderWrite, vk::ImageLayout::eGeneral);
+        cmdbuf.pipelineBarrier2(
+            vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &post_view});
+    } else if (split_ui) {
         PutUiBack(cmdbuf, frame_id, out, out_width, out_height);
     }
     const auto to_sample = Barrier(out.image, vk::PipelineStageFlagBits2::eComputeShader,

@@ -428,6 +428,25 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
     } else {
         BuildTable(source, src_count, count);
     }
+    // sotc: SOTC_FILL_HLE_GPU (default on, =0 off; HiddenUserHere, upstream PR #339). A destination
+    // resident in one arena gets the table from the GPU (a fill, or a seed doubled by copies)
+    // instead of being marked CPU-written, which the next DMA sweep or bind copied through staging
+    // again (one 8 MiB table, ~33 times per area load). The backing is still written.
+    static const bool fill_gpu = [] {
+        const char* v = std::getenv("SOTC_FILL_HLE_GPU");
+        return !(v && v[0] == '0');
+    }();
+    if (fill_gpu) {
+        if (!buffer_cache.TryFillThroughFromCpu(address, data.data(), count * 4, src_count * 4)) {
+            return false;
+        }
+        if (SotcStats::kCmdStats) SotcStats::inv_hle.fetch_add(count * 4, std::memory_order_relaxed);
+        // The guest bytes changed: the reused-bind epoch moves as with InvalidateMemory, and
+        // textures over the range are invalidated; the arena already holds the table.
+        SotcStats::mem_epoch.fetch_add(1, std::memory_order_relaxed);
+        rasterizer.GetTextureCache().InvalidateMemory(address, count * 4);
+        return true;
+    }
     if (!buffer_cache.TryReplaceFromCpu(address, data.data(), count * 4)) {
         return false;
     }

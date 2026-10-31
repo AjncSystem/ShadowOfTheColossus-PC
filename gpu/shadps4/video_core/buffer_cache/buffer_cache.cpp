@@ -2465,6 +2465,10 @@ bool BufferCache::TryReplaceFromCpu(VAddr addr, const void* data, u64 size) {
 }
 
 bool BufferCache::TryWriteThroughFromCpu(VAddr addr, const void* data, u64 size) {
+    return TryFillThroughFromCpu(addr, data, size, size);
+}
+
+bool BufferCache::TryFillThroughFromCpu(VAddr addr, const void* data, u64 size, u64 period) {
     if (size == 0) {
         return true;
     }
@@ -2502,11 +2506,33 @@ bool BufferCache::TryWriteThroughFromCpu(VAddr addr, const void* data, u64 size)
     }
     // The arena gets the same bytes now, in stream order, so the CPU bits stay as they are: a
     // clean page stays clean and write-protected, a dirty one uploads the same bytes later.
-    const auto staging = staging_pool.Request(size, MemoryType::HostUncached);
-    std::memcpy(staging.mapped, data, size);
-    staging.Flush();
-    const vk::BufferCopy copy{staging.offset, arena->Offset(addr), size};
-    runtime.CopyBuffer(staging.buffer, arena, std::span{&copy, 1});
+    const u64 dst = arena->Offset(addr);
+    const auto upload = [&](u64 bytes) {
+        const auto staging = staging_pool.Request(bytes, MemoryType::HostUncached);
+        std::memcpy(staging.mapped, data, bytes);
+        staging.Flush();
+        const vk::BufferCopy copy{staging.offset, dst, bytes};
+        runtime.CopyBuffer(staging.buffer, arena, std::span{&copy, 1});
+    };
+    if (period == 4 && (dst & 3) == 0 && (size & 3) == 0) {
+        u32 value;
+        std::memcpy(&value, data, sizeof(value));
+        runtime.FillBuffer(arena, dst, size, value);
+    } else if (period != 0 && period < size) {
+        // The seed is a whole number of periods, so each doubling copy repeats the pattern
+        // (Runtime::CopyBuffer places the barriers between the steps).
+        constexpr u64 SeedTarget = 1_MB;
+        const u64 seed = std::min(size, period * std::max<u64>(1, SeedTarget / period));
+        upload(seed);
+        for (u64 have = seed; have < size;) {
+            const u64 n = std::min(have, size - have);
+            const vk::BufferCopy copy{dst, dst + have, n};
+            runtime.CopyBuffer(arena, arena, std::span{&copy, 1});
+            have += n;
+        }
+    } else {
+        upload(size);
+    }
     RecordCurrentWrite(addr, size);
     return true;
 }

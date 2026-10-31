@@ -163,6 +163,13 @@ public:
     /// (fill-shader tables written by the command processor). Not resident: TryReplaceFromCpu.
     bool TryWriteThroughFromCpu(VAddr addr, const void* data, u64 size);
 
+    /// sotc: SOTC_FILL_HLE_GPU (HiddenUserHere, upstream PR #339). TryWriteThroughFromCpu for a
+    /// table that repeats a pattern of `period` bytes (`period` == `size`: no repeat). The backing
+    /// gets `data` from the CPU; the arena is filled by the GPU (a fill when `period` is 4, else
+    /// one uploaded seed of at most ~1 MiB doubled by copies inside the arena), so the full table
+    /// is never copied through a staging buffer. Not resident: TryReplaceFromCpu.
+    bool TryFillThroughFromCpu(VAddr addr, const void* data, u64 size, u64 period);
+
     /// Byte-precise: true when a written binding covered any byte of the range since its last
     /// readback. Readbacks copy only these bytes, so the backing holds every other byte.
     /// Command processor thread only.

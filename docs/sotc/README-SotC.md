@@ -37,7 +37,9 @@ Na primeira vez a imagem do jogo é preparada, o que leva alguns segundos. Isso 
 quando o jogo ou os módulos mudam. Os saves e o cache de shaders ficam em `user/`.
 
 Sem o lançador, `SotC.bat` faz o mesmo lendo `sotc.ini`. `SotC.exe --play` abre o jogo direto
-com as últimas opções do lançador, o que serve para atalhos e para o Steam.
+com as últimas opções do lançador, o que serve para atalhos e para o Steam. O botão "Atalho para
+jogar direto" do lançador (Avançado) cria esse atalho na área de trabalho, que pode ser adicionado
+ao Steam como jogo não-Steam.
 
 ## Imagem e desempenho
 

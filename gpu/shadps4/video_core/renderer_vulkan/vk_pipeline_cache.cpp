@@ -437,7 +437,21 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     const auto& vk12_props = instance.GetVk12Properties();
     // NVIDIA's shader compiler (seen on 617.14) hits a breakpoint on any OpFDiv in a shader
     // with RoundingModeRTZ for that width, killing the process. Prefer default rounding there.
-    const bool rtz_usable = instance.GetDriverID() != vk::DriverId::eNvidiaProprietary;
+    // sotc: SOTC_GCN_NV=1 gives an AMD card the shader options the NVIDIA driver gets, which is what
+    // the SotC-AMD-Fix layer (raulbezerro-dev) does by reporting the NVIDIA driver ID: with it and our
+    // wave32 path off, an RX 570 stopped losing the device (brxzzi, fork issues #8/#9). Per option:
+    // SOTC_RTZ=0 (no round-to-zero), SOTC_CLIP_EMU=1, SOTC_MANUAL_INTERP=1, to find the one that matters.
+    const auto env_flag = [](const char* name) {
+        const char* v = std::getenv(name);
+        return v ? std::atoi(v) : -1;
+    };
+    const bool nv_driver = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary;
+    const bool nv_paths = nv_driver || (env_flag("SOTC_GCN_NV") == 1 && instance.GetVendorID() == 0x1002);
+    if (nv_paths && !nv_driver) {
+        std::fprintf(stderr, "GPU: SOTC_GCN_NV=1: NVIDIA shader options on this AMD card (no RTZ, "
+                             "clip distance emulation, manual interpolation)\n");
+    }
+    const bool rtz_usable = env_flag("SOTC_RTZ") != 0 && !nv_paths;
     // sotc: the LDS barriers are also needed on AMD running the shaders 64 wide. GCN (RX 470-590,
     // Vega) has no 32-wide waves, so the 32-wide path never engages there, and its compiler may
     // move LDS reads before other lanes' writes just the same: white, flickering characters and
@@ -483,8 +497,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         instance_.IsAmdShaderExplicitVertexParameterSupported() && !no_barycentric;
     const bool barycentric_via_gs = !khr_barycentric && !amd_explicit_vertex &&
                                     instance.IsGeometryStageSupported() &&
-                                    instance.GetDriverID() == vk::DriverId::eNvidiaProprietary &&
-                                    !env_is("SOTC_BARYCENTRIC_GS", "0");
+                                    nv_paths && !env_is("SOTC_BARYCENTRIC_GS", "0");
     if (barycentric_via_gs) {
         LOG_WARNING(Render_Vulkan, "No fragment shader barycentrics: emulated by a geometry shader");
     }
@@ -533,8 +546,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supports_amd_shader_explicit_vertex_parameter = amd_explicit_vertex,
         .supports_fragment_shader_barycentric = khr_barycentric || barycentric_via_gs,
         .supports_shader_subgroup_clock = instance_.IsShaderSubgroupClockSupported(),
-        .needs_manual_interpolation = khr_barycentric &&
-                                      instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
+        .needs_manual_interpolation =
+            khr_barycentric && (nv_paths || env_flag("SOTC_MANUAL_INTERP") == 1),
         // sotc: also whenever the shaders are lowered for fewer than 64 lanes (AMD on the 32-wide
         // path): without the barriers the GPU hung ~2 min into the intro (issue #7).
         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
@@ -542,7 +555,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                               instance.SubgroupSize() < 64 || amd64_lds,
         .needs_buffer_offsets = instance.StorageMinAlignment() > 4,
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
-        .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
+        .needs_clip_distance_emulation = nv_paths || env_flag("SOTC_CLIP_EMU") == 1,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
         .barycentric_via_gs = barycentric_via_gs,
     };

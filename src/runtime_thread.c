@@ -303,6 +303,25 @@ static void *host_start(void *p) {
 #ifdef _WIN32
     /* sotc: host thread ids of guest threads, for traces that print GetCurrentThreadId. */
     if (getenv("SOTC_THREAD_IDS")) fprintf(stderr,"Runtime: guest thread '%s' is host thread %lu\n",t->name,GetCurrentThreadId());
+    /* sotc: on 4 CPU threads or fewer the game's job workers (busy-wait style) starve the update,
+     * render and GPU threads, and the sound and file threads that mostly sleep wait behind them
+     * (AjncSystem #267; the same fix as the God of War 3 port's, first made in the MMadmer fork).
+     * Workers go below normal, sound threads highest, file and loading threads above normal.
+     * Bigger CPUs are left alone. SOTC_JOB_PRIORITY=0 turns it off. */
+    {
+        DWORD_PTR process_mask=0, system_mask=0;
+        const char *off=getenv("SOTC_JOB_PRIORITY");
+        if (!(off && off[0]=='0') &&
+            GetProcessAffinityMask(GetCurrentProcess(),&process_mask,&system_mask) &&
+            __builtin_popcountll((unsigned long long)process_mask)<=4) {
+            if (t->attr.prio<400 || strstr(t->name,"Sound") || strstr(t->name,"sndx"))
+                SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_HIGHEST);
+            else if (!strncmp(t->name,"BPE JobWorker",13))
+                SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);
+            else if (!strncmp(t->name,"SceFios",7) || !strcmp(t->name,"Resource Loading"))
+                SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_ABOVE_NORMAL);
+        }
+    }
 #endif
     if (!exit_setjmp(t)) t->result=t->entry(t->argument);
     runtime_thread_keys_cleanup();

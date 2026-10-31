@@ -1576,16 +1576,16 @@ class Launcher:
                    'look stretched. 720p renders at 1080p; PS4 Pro mode uses the Pro sizes. On a monitor smaller '
                    'than the output the window fits the screen and fullscreen uses the whole monitor.'))
         self.row(f, _('Upscaler', 'Upscaler'), self.choice(f, 'upscaler', UPSCALERS),
-                 _('FSR 1 amplia com bordas nítidas (acima de 1080p). DLSS exige uma placa NVIDIA RTX e as DLLs do '
-                   'DLSS e do Streamline na pasta bin do jogo; sem elas o jogo usa o FSR 3.1.\n'
-                   'Com DLSS, deixe o "Modo de baixa latência" do painel/NVIDIA App em Desligado ou Ligado, não em '
-                   'Ultra: com Ultra o DLSS perde FPS (o Streamline faz o driver aplicar esse modo, que não age no '
-                   'FSR). Dá para mudar só para este jogo no perfil do programa (bin\\bb-probe.exe).',
-                   'FSR 1 upscales with sharp edges (above 1080p). DLSS needs an NVIDIA RTX card and the DLSS and '
-                   'Streamline DLLs in the bin folder of the game; without them the game uses FSR 3.1.\n'
-                   'With DLSS, keep the NVIDIA control panel / app "Low Latency Mode" at Off or On, not Ultra: with '
-                   'Ultra DLSS loses FPS (Streamline makes the driver apply that mode, which does not act on FSR). '
-                   'It can be set for this game only in a program profile (bin\\bb-probe.exe).'))
+                 _('FSR 1 amplia com bordas nítidas (acima de 1080p). DLSS exige uma placa NVIDIA RTX e a DLL do '
+                   'DLSS (nvngx_dlss.dll) na pasta bin do jogo; sem ela o jogo usa o FSR 3.1.\n'
+                   'O DLSS é chamado direto pelo driver, sem o Streamline, e o "Modo de baixa latência" da NVIDIA '
+                   'não o afeta mais. Com a geração de quadros DLSS-G ligada ao abrir o jogo o Streamline volta: '
+                   'aí deixe esse modo em Desligado ou Ligado, não em Ultra (com Ultra o DLSS perde FPS).',
+                   'FSR 1 upscales with sharp edges (above 1080p). DLSS needs an NVIDIA RTX card and the DLSS DLL '
+                   '(nvngx_dlss.dll) in the bin folder of the game; without it the game uses FSR 3.1.\n'
+                   'DLSS is called straight through the driver, without Streamline, and the NVIDIA "Low Latency '
+                   'Mode" no longer affects it. With DLSS-G frame generation on when the game starts Streamline '
+                   'comes back: then keep that mode at Off or On, not Ultra (with Ultra DLSS loses FPS).'))
         self.row(f, _('Qualidade do upscaler (FSR 3.1 / DLSS)', 'Upscaler quality (FSR 3.1 / DLSS)'),
                  self.choice(f, 'render_preset', RENDER_PRESETS),
                  _('Só com os upscalers FSR 3.1 e DLSS: o jogo renderiza num tamanho menor que a saída e o upscaler o '

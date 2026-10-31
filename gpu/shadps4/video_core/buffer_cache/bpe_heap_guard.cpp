@@ -458,14 +458,17 @@ void BpeHeapGuard::AddFreeBlock(VAddr block) {
 }
 
 void BpeHeapGuard::CollectFreeTree() {
-    // sotc: SOTC_GUARD_DEDUP=0 walks as before (AjncSystem, upstream 0.70, 7fde988). The game changes
+    // sotc: SOTC_GUARD_DEDUP=1 skips repeats (AjncSystem, upstream 0.70, 7fde988); off by default:
+    // in the user's A/B (30 Oct, same walk, 1440p DLSS-G) every session with it on had 200-575 ms
+    // frames with nothing on the GPU side (391 and 200 ms; 575 and 467 ms earlier), none without it
+    // (plus27 174 ms worst, upload budget alone 133 ms). Cause not found. The game changes
     // the tree while this walk reads it: at an area change a node reached twice (a link read
     // mid-change) was walked again and again up to MaxTreeNodes, each time with its ring of up to
     // MaxListNodes members, and the sort of those repeats held the draw thread 1-3 s. Nodes and ring
     // members already seen are skipped: they only added repeats, which sort/unique removed anyway.
     static const bool dedup = [] {
         const char* v = std::getenv("SOTC_GUARD_DEDUP");
-        return !(v && v[0] == '0');
+        return v && v[0] == '1';
     }();
     if (dedup) {
         seen.Reset(last_seen);

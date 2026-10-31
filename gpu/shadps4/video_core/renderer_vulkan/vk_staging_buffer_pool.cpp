@@ -172,6 +172,17 @@ u32 RingReserveBlocks() {
     return blocks;
 }
 
+// sotc: SOTC_STAGING_LARGE_POW2=1 (off by default; HiddenUserHere, upstream PR #339). Large uploads
+// in power-of-two size classes reuse any free buffer up to twice the request instead of allocating
+// one inside the frame that needs it while an area loads.
+static bool StagingLargePow2() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_STAGING_LARGE_POW2");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+
 u64 RoundAllocationSize(u64 size) {
     const u64 step = std::max(std::bit_floor(size) / 4, LARGE_MIN_GRANULARITY);
     return Common::AlignUp(size, step);
@@ -273,9 +284,12 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
     // come in slightly different sizes; matched within 1.25x they rarely found a free buffer and
     // allocated a new one ~1,100 times in a 6-minute attract run. They get power-of-two sizes
     // instead, and reuse any free buffer of that size class.
+    const bool pow2 = deferred || StagingLargePow2();
     const u64 alloc_size =
-        deferred ? std::bit_ceil(std::max(size, LARGE_MIN_GRANULARITY)) : RoundAllocationSize(size);
-    const u64 max_size = deferred ? alloc_size : std::max(size + size / 4, RoundAllocationSize(size));
+        pow2 ? std::bit_ceil(std::max(size, LARGE_MIN_GRANULARITY)) : RoundAllocationSize(size);
+    const u64 max_size = deferred ? alloc_size
+                         : pow2   ? alloc_size * 2
+                                  : std::max(size + size / 4, RoundAllocationSize(size));
 
     LargeBuffer* best{};
     for (LargeBuffer& entry : cache) {

@@ -2273,7 +2273,13 @@ class Launcher:
         if manual:
             self.refresh_status()
         if error or not sotc_update.is_newer(release, VERSION):
-            if manual and error:
+            if manual and error and sotc_update.is_cert_error(error):
+                self.messagebox.showwarning('Shadow of the Colossus', _(
+                    'Não foi possível verificar a conexão com o GitHub (certificado não reconhecido).\n'
+                    'Baixe a versão nova manualmente em:\n{}',
+                    'The connection to GitHub could not be verified (certificate not trusted).\n'
+                    'You can download the new version manually from:\n{}').format(sotc_update.RELEASES_PAGE))
+            elif manual and error:
                 self.messagebox.showwarning('Shadow of the Colossus', _(
                     'Não foi possível procurar atualização:\n{}', 'Could not check for updates:\n{}').format(error))
             elif manual:
@@ -2328,6 +2334,10 @@ class Launcher:
                 sotc_update.start_applier(new_root, PORT_DIR)
             except Exception as problem:
                 error = problem
+        if error and sotc_update.is_cert_error(error):
+            error = _('não foi possível verificar a conexão com o GitHub. Baixe manualmente em:\n{}',
+                      'the connection to GitHub could not be verified. Download it manually from:\n{}').format(
+                sotc_update.RELEASES_PAGE)
         if error:
             self.updating = False
             self.refresh_status()
@@ -2406,12 +2416,19 @@ def main():
         sys.exit(0 if sotc_update.apply_update(args[1], args[2], int(args[3])) else 1)
     if args and args[0] == '--update-now':
         attach_stdio()
-        release = sotc_update.latest_release()
-        if not sotc_update.is_newer(release, VERSION):
-            print(f'up to date (v{VERSION}, latest {release and release["version"]})')
-            sys.exit(0)
-        print(f'updating v{VERSION} -> v{release["version"]}')
-        new_root = sotc_update.download(release, PORT_DIR / 'update')
+        try:
+            release = sotc_update.latest_release()
+            if not sotc_update.is_newer(release, VERSION):
+                print(f'up to date (v{VERSION}, latest {release and release["version"]})')
+                sys.exit(0)
+            print(f'updating v{VERSION} -> v{release["version"]}')
+            new_root = sotc_update.download(release, PORT_DIR / 'update')
+        except OSError as error:
+            if not sotc_update.is_cert_error(error):
+                raise
+            print(f'the connection to GitHub could not be verified ({error}); '
+                  f'download the release manually from {sotc_update.RELEASES_PAGE}')
+            sys.exit(1)
         if FROZEN:
             sotc_update.start_applier(new_root, PORT_DIR)
         sys.exit(0)

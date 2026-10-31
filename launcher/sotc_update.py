@@ -21,6 +21,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import time
@@ -28,6 +29,7 @@ import urllib.request
 import zipfile
 
 RELEASES_URL = 'https://api.github.com/repos/AjncSystem/ShadowOfTheColossus-PC/releases/latest'
+RELEASES_PAGE = 'https://github.com/AjncSystem/ShadowOfTheColossus-PC/releases'
 ASSET_NAME = 'SotC-PC.zip'
 TOP = 'SotC-PC'
 KEEP = ('user', 'update')  # top-level names an update never writes into
@@ -39,10 +41,36 @@ def version_key(text):
     return tuple(int(n) for n in re.findall(r'\d+', text or ''))
 
 
+_context = None
+
+
+def _ssl_context():
+    """Verifying context with every root available: the system's (on Windows the ROOT and CA
+    stores, loaded by create_default_context) plus certifi's bundle when it is installed, which
+    has the roots Windows has not downloaded yet (issue #359). Verification is never disabled."""
+    global _context
+    if _context is None:
+        context = ssl.create_default_context()
+        try:
+            import certifi
+            context.load_verify_locations(cafile=certifi.where())
+        except (ImportError, OSError, ssl.SSLError):
+            pass
+        _context = context
+    return _context
+
+
+def is_cert_error(error):
+    """True when the error (or the URLError wrapping it) is a failed certificate check."""
+    return isinstance(error, ssl.SSLCertVerificationError) or \
+        isinstance(getattr(error, 'reason', None), ssl.SSLCertVerificationError)
+
+
 def _open(url, timeout):
     request = urllib.request.Request(url, headers={'Accept': 'application/vnd.github+json',
                                                    'User-Agent': USER_AGENT})
-    return urllib.request.urlopen(request, timeout=timeout)
+    context = _ssl_context() if url.lower().startswith('https:') else None
+    return urllib.request.urlopen(request, timeout=timeout, context=context)
 
 
 def latest_release(timeout=10):

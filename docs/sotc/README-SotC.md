@@ -39,6 +39,11 @@ quando o jogo ou os módulos mudam. Os saves e o cache de shaders ficam em `user
 Sem o lançador, `SotC.bat` faz o mesmo lendo `sotc.ini`. `SotC.exe --play` abre o jogo direto
 com as últimas opções do lançador, o que serve para atalhos e para o Steam.
 
+O lançador procura versões novas no GitHub ao abrir. Se a conexão com o GitHub não puder ser
+verificada (erro de certificado, comum com antivírus ou proxy que inspecionam HTTPS, ou com o
+Windows sem os certificados raiz atualizados), ele avisa e mostra o endereço para baixar a versão
+nova manualmente: https://github.com/AjncSystem/ShadowOfTheColossus-PC/releases
+
 ## Imagem e desempenho
 
 Tudo isto está no lançador, na página **Imagem e FPS** (e os principais em **Jogar**):

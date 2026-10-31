@@ -4,9 +4,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import ssl
 import sys
 import tempfile
 import unittest
+import unittest.mock
+import urllib.error
 import zipfile
 
 sys.path.insert(0, str(ROOT / 'launcher'))
@@ -31,6 +34,44 @@ class VersionTests(unittest.TestCase):
         self.assertTrue(sotc_update.is_newer({'version': '0.57-opt6'}, '0.57-opt5'))
         self.assertFalse(sotc_update.is_newer({'version': '0.57-opt5'}, '0.57-opt5'))
         self.assertFalse(sotc_update.is_newer(None, '0.57-opt5'))
+
+
+class SslTests(unittest.TestCase):
+    def setUp(self):
+        sotc_update._context = None
+        self.addCleanup(setattr, sotc_update, '_context', None)
+
+    def test_context_verifies(self):
+        context = sotc_update._ssl_context()
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+        self.assertIs(sotc_update._ssl_context(), context)
+
+    def test_without_certifi(self):
+        with unittest.mock.patch.dict(sys.modules, {'certifi': None}):
+            context = sotc_update._ssl_context()
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+
+    def test_cert_error(self):
+        failure = ssl.SSLCertVerificationError(1, 'CERTIFICATE_VERIFY_FAILED')
+        self.assertTrue(sotc_update.is_cert_error(failure))
+        self.assertTrue(sotc_update.is_cert_error(urllib.error.URLError(failure)))
+        self.assertFalse(sotc_update.is_cert_error(urllib.error.URLError(OSError('offline'))))
+        self.assertFalse(sotc_update.is_cert_error(ValueError('x')))
+
+    def test_https_gets_context(self):
+        with unittest.mock.patch('urllib.request.urlopen') as urlopen:
+            sotc_update._open('https://example.invalid/x', 5)
+            self.assertIs(urlopen.call_args.kwargs['context'], sotc_update._ssl_context())
+            sotc_update._open('http://example.invalid/x', 5)
+            self.assertIsNone(urlopen.call_args.kwargs['context'])
+
+    def test_file_url(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'a.json'
+            path.write_text('{}')
+            with sotc_update._open(path.as_uri(), 5) as response:
+                self.assertEqual(response.read(), b'{}')
 
 
 class DownloadTests(unittest.TestCase):

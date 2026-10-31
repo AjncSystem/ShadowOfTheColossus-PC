@@ -1075,6 +1075,10 @@ void FpsCounter() {
                                SotcStats::ov_worst_cause_ms.load());
         }
     }
+    // sotc: which DLSS upscales (model, preset, mode, sizes, NGX version), when it is the upscaler.
+    if (const char* dlss = Vulkan::Dlssg::SuperResLabel()) {
+        ImGui::TextColored(grey, "%s", dlss);
+    }
     // Frame generation (vk_framegen.h): DLSS-G (vk_dlssg.cpp) or FSR 3 (vk_fsrfg.cpp).
     switch (Vulkan::FrameGen::Current()) {
     case Vulkan::FrameGen::Mode::Off:

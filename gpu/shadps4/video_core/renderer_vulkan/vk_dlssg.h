@@ -86,6 +86,11 @@ void Suspend();
 /// bb-probe.exe): Streamline loaded and the feature supported on this device.
 bool SuperResReady();
 
+/// sotc: which DLSS upscales, for the F10 panel and the event log: model, preset, mode, render and
+/// output sizes and the NGX version ("DLSS 4.5 | preset M | Quality | 1280x720 -> 1920x1080 | NGX
+/// 310.9.16"). nullptr until the first upscaled frame.
+const char* SuperResLabel();
+
 /// Present thread, `cmdbuf` a real command buffer: upscales `color` (`width` x `height`, layout
 /// ShaderReadOnlyOptimal) of presentation frame `frame_id` with its depth, motion vectors and camera
 /// into `out` (`out_width` x `out_height`, layout General). False when it cannot (no inputs, an error).

@@ -29,12 +29,19 @@
 #include "video_core/amdgpu/regs.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
+#include "video_core/sotc_event.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace Vulkan::Dlssg {
 
 namespace {
+
+// sotc: SuperResLabel. The NGX version is read when the device is created; the label is built once,
+// at the first upscaled frame (the present thread), and only read after `sr_label_ready`.
+char ngx_version[32];
+char sr_label[192];
+std::atomic<bool> sr_label_ready{false};
 
 struct Api {
     HMODULE dll{};
@@ -842,6 +849,8 @@ void OnDeviceCreated(const Instance& instance) {
                     std::fprintf(stderr, "SOTC DLSS Super Resolution: Streamline %u.%u.%u, NGX %u.%u.%u\n",
                                  v.versionSL.major, v.versionSL.minor, v.versionSL.build,
                                  v.versionNGX.major, v.versionNGX.minor, v.versionNGX.build);
+                    std::snprintf(ngx_version, sizeof(ngx_version), "%u.%u.%u", v.versionNGX.major,
+                                  v.versionNGX.minor, v.versionNGX.build);
                 }
             }
         }
@@ -888,6 +897,10 @@ void OnDeviceCreated(const Instance& instance) {
 
 bool Enabled() {
     return supported;
+}
+
+const char* SuperResLabel() {
+    return sr_label_ready.load(std::memory_order_acquire) ? sr_label : nullptr;
 }
 
 bool SuperResReady() {
@@ -939,6 +952,20 @@ bool SuperResEvaluate(vk::CommandBuffer cmdbuf, u32 frame_id, vk::Image color, v
                      "performance, 6 DLAA), render %ux%u -> %ux%u, preset %s\n",
                      static_cast<int>(options.mode), width, height, out_width, out_height,
                      dlss4 ? "K" : "M (L in ultra performance)");
+        const bool ultra = options.mode == sl::DLSSMode::eUltraPerformance;
+        const char* preset = ultra ? "L" : dlss4 ? "K" : "M";
+        const char* mode = options.mode == sl::DLSSMode::eDLAA          ? "DLAA"
+                           : options.mode == sl::DLSSMode::eMaxQuality  ? "Quality"
+                           : options.mode == sl::DLSSMode::eBalanced    ? "Balanced"
+                           : options.mode == sl::DLSSMode::eMaxPerformance ? "Performance"
+                                                                           : "Ultra Performance";
+        // Presets K and M are the DLSS 4 and DLSS 4.5 transformer models; L is DLSS 4.5's for
+        // Ultra Performance.
+        std::snprintf(sr_label, sizeof(sr_label), "%s | preset %s | %s | %ux%u -> %ux%u%s%s",
+                      preset[0] == 'K' ? "DLSS 4" : "DLSS 4.5", preset, mode, width, height, out_width,
+                      out_height, ngx_version[0] ? " | NGX " : "", ngx_version);
+        sr_label_ready.store(true, std::memory_order_release);
+        SotcEvent::Log("CONFIG", "DLSS: %s", sr_label);
     }
     options.preExposure = 1.0f;
     options.colorBuffersHDR = sl::Boolean::eFalse; // the frame is display referred, not HDR

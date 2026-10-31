@@ -13,6 +13,8 @@
 #define VK_USE_PLATFORM_XLIB_KHR
 #endif
 
+#include <algorithm>
+#include <cstring>
 #include <vector>
 #include <fmt/ranges.h>
 
@@ -293,6 +295,20 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
 
     const auto layers = GetInstanceLayers(enable_validation, enable_crash_diagnostic);
     auto extensions = GetLayerExtensions(GetInstanceExtensions(window_type, true), layers);
+    // sotc: the instance extensions NVIDIA NGX asks for (DLSS without Streamline), when available.
+    if (const auto& ngx = Dlssg::NgxExtensions(false); !ngx.empty()) {
+        const auto [props_result, props] = vk::enumerateInstanceExtensionProperties();
+        for (const char* e : ngx) {
+            const auto same = [e](const char* x) { return std::strcmp(x, e) == 0; };
+            const bool available =
+                std::any_of(props.begin(), props.end(), [e](const vk::ExtensionProperties& p) {
+                    return std::strcmp(p.extensionName, e) == 0;
+                });
+            if (available && std::none_of(extensions.begin(), extensions.end(), same)) {
+                extensions.push_back(e);
+            }
+        }
+    }
 
     const vk::ApplicationInfo application_info = {
         .pApplicationName = "shadPS4",

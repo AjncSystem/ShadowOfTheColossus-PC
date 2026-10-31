@@ -13,6 +13,8 @@
 
 #pragma once
 
+#include <vector>
+
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/texture_cache/types.h"
@@ -34,6 +36,10 @@ namespace Vulkan::Dlssg {
 /// Before any Vulkan call: when FrameGen::WantStreamline(), loads sl.interposer.dll and
 /// initialises Streamline. Its vkGetInstanceProcAddr, or nullptr to use the Vulkan loader.
 PFN_vkGetInstanceProcAddr LoadInterposer();
+
+/// The instance (false) or device (true) extensions NVIDIA NGX asks for, when LoadInterposer
+/// chose DLSS through NGX instead of Streamline; empty otherwise.
+const std::vector<const char*>& NgxExtensions(bool device);
 
 /// After vkCreateDevice: support checks, Reflex options, FSR 3, the frame generation mode.
 void OnDeviceCreated(const Instance& instance);

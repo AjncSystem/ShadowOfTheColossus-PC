@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -338,7 +339,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 32> enabled_extensions;
+    boost::container::static_vector<const char*, 48> enabled_extensions; // sotc: 32 + NGX's
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -465,6 +466,13 @@ bool Instance::CreateDevice() {
     }
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
+    // sotc: the device extensions NVIDIA NGX asks for (DLSS without Streamline).
+    for (const char* e : Dlssg::NgxExtensions(true)) {
+        if (std::none_of(enabled_extensions.begin(), enabled_extensions.end(),
+                         [e](const char* x) { return std::strcmp(x, e) == 0; })) {
+            add_extension(e);
+        }
+    }
     // Device fault reporting: lets us print the faulting address/type after a device loss.
     device_fault = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
     if (device_fault) {

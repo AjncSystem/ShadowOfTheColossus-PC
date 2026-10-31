@@ -728,6 +728,290 @@ void SetOptions(bool on) {
     SotcStats::ov_fg_state.store(on ? 1 : 0, std::memory_order_relaxed);
 }
 
+const std::wstring& ExeDir() {
+    static const std::wstring dir = [] {
+        wchar_t path[MAX_PATH];
+        const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+        std::wstring p(path, n);
+        const size_t slash = p.find_last_of(L"\\/");
+        return slash == std::wstring::npos ? std::wstring(L".") : p.substr(0, slash);
+    }();
+    return dir;
+}
+
+// sotc: DLSS Super Resolution straight through NVIDIA NGX, without Streamline, when frame
+// generation is off at start (SOTC_DLSS_NGX=0: Streamline as before). With Streamline's Vulkan
+// interposer loaded the driver's Low Latency Mode applies, and Ultra cost DLSS ~18% of its FPS on
+// an RTX 2080 Ti (2mg, fork issue #5); FSR, without Streamline, was unaffected. The NGX core
+// (_nvngx.dll) comes with the driver: it is found through the registry keys NVIDIA's header-only
+// loader reads (nvsdk_ngx_loader.h) and called through its C exports. Its parameter object is a
+// C++ class built by MSVC, so its virtual methods go through the MSVC vtable layout (overloads in
+// reverse declaration order: Set void* 0, int 3, unsigned 4, float 6; Get int* 11), checked
+// against clang's x86_64-pc-windows-msvc code for nvsdk_ngx_params.h.
+namespace Ngx {
+
+// The few NGX declarations used, with the values of NVIDIA's DLSS SDK 310.9 (nvsdk_ngx_defs.h,
+// nvsdk_ngx_defs_vk.h, nvsdk_ngx_params.h). The SDK's own headers may only be redistributed
+// built into a program, so they are not in this repository.
+using Result = u32;
+constexpr bool Failed(Result r) {
+    return (r & 0xFFF00000u) == 0xBAD00000u;
+}
+constexpr u32 kVersionApi = 0x15;
+constexpr u32 kFeatureSuperSampling = 1;
+enum : int { kMaxPerf, kBalanced, kMaxQuality, kUltraPerformance, kUltraQuality, kDlaa };
+enum : int { kMvLowRes = 1 << 1, kDepthInverted = 1 << 3, kAutoExposure = 1 << 6 };
+struct Param;
+struct Handle;
+/// ResourceVk holding an image view (its union's larger member).
+struct ResourceVk {
+    VkImageView view;
+    VkImage image;
+    VkImageSubresourceRange range;
+    VkFormat format;
+    u32 width, height;
+    u32 type; ///< 0: image view
+    bool read_write;
+};
+
+using PfnRequiredExtensions = Result (*)(unsigned int*, const char***, unsigned int*,
+                                                   const char***);
+// The core's exports have the NGX_SNIPPET_BUILD signatures of nvsdk_ngx_vk.h (NVIDIA's static
+// library turns the application API into them): Init_Ext2 takes the loader functions.
+using PfnInit = Result (*)(unsigned long long, const wchar_t*, VkInstance,
+                                     VkPhysicalDevice, VkDevice, PFN_vkGetInstanceProcAddr,
+                                     PFN_vkGetDeviceProcAddr, u32,
+                                     const Param*);
+using PfnParams = Result (*)(Param**);
+using PfnCreate = Result (*)(VkDevice, VkCommandBuffer, u32,
+                                       Param*, Handle**);
+using PfnEvaluate = Result (*)(VkCommandBuffer, const Handle*,
+                                         const Param*, void*);
+using PfnRelease = Result (*)(Handle*);
+
+HMODULE dll{};
+PfnInit init{};
+PfnParams get_caps{}, allocate{};
+PfnCreate create{};
+PfnEvaluate evaluate{};
+PfnRelease release{};
+std::vector<const char*> instance_exts, device_exts;
+bool ready = false; // DLSS available through NGX
+Param* params{};
+Handle* handle{};
+struct Key {
+    u32 w, h, ow, oh;
+    int quality;
+    bool inverted;
+    bool operator==(const Key&) const = default;
+} key{};
+
+template <typename F>
+F Slot(const Param* p, int slot) {
+    return reinterpret_cast<F>((*reinterpret_cast<void* const* const*>(p))[slot]);
+}
+void SetPtr(Param* p, const char* n, void* v) {
+    Slot<void (*)(Param*, const char*, void*)>(p, 0)(p, n, v);
+}
+void SetI(Param* p, const char* n, int v) {
+    Slot<void (*)(Param*, const char*, int)>(p, 3)(p, n, v);
+}
+void SetUI(Param* p, const char* n, unsigned v) {
+    Slot<void (*)(Param*, const char*, unsigned)>(p, 4)(p, n, v);
+}
+void SetF(Param* p, const char* n, float v) {
+    Slot<void (*)(Param*, const char*, float)>(p, 6)(p, n, v);
+}
+int GetI(Param* p, const char* n) {
+    int v = 0;
+    Slot<Result (*)(Param*, const char*, int*)>(p, 11)(p, n, &v);
+    return v;
+}
+
+/// Before the instance: finds _nvngx.dll and the extensions it needs.
+bool Load() {
+    wchar_t path[MAX_PATH];
+    const auto read = [&](const wchar_t* key, const wchar_t* value) {
+        DWORD size = sizeof(path);
+        return RegGetValueW(HKEY_LOCAL_MACHINE, key, value, RRF_RT_REG_SZ, nullptr, path, &size) ==
+               ERROR_SUCCESS;
+    };
+    if (!read(L"System\\CurrentControlSet\\Services\\nvlddmkm\\Parameters\\NGXCore", L"NGXPath") &&
+        !read(L"System\\CurrentControlSet\\Services\\nvlddmkm\\NGXCore", L"NGXPath") &&
+        !read(L"SOFTWARE\\NVIDIA Corporation\\Global\\NGXCore", L"FullPath")) {
+        std::fprintf(stderr, "SOTC DLSS NGX: no NGX core in the registry, Streamline instead\n");
+        return false;
+    }
+    const std::wstring file = std::wstring(path) + L"\\_nvngx.dll";
+    dll = LoadLibraryExW(file.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    const auto required = dll ? reinterpret_cast<PfnRequiredExtensions>(
+                                    GetProcAddress(dll, "NVSDK_NGX_VULKAN_RequiredExtensions"))
+                              : nullptr;
+    const auto get = [](auto& out, const char* name) {
+        out = reinterpret_cast<std::remove_reference_t<decltype(out)>>(GetProcAddress(dll, name));
+        return out != nullptr;
+    };
+    if (!required || !get(init, "NVSDK_NGX_VULKAN_Init_Ext2") ||
+        !get(get_caps, "NVSDK_NGX_VULKAN_GetCapabilityParameters") ||
+        !get(allocate, "NVSDK_NGX_VULKAN_AllocateParameters") ||
+        !get(create, "NVSDK_NGX_VULKAN_CreateFeature1") ||
+        !get(evaluate, "NVSDK_NGX_VULKAN_EvaluateFeature") ||
+        !get(release, "NVSDK_NGX_VULKAN_ReleaseFeature")) {
+        std::fprintf(stderr, "SOTC DLSS NGX: %ls not usable (error %lu), Streamline instead\n",
+                     file.c_str(), GetLastError());
+        if (dll) {
+            FreeLibrary(dll);
+            dll = nullptr;
+        }
+        return false;
+    }
+    unsigned int ni = 0, nd = 0;
+    const char** ie{};
+    const char** de{};
+    if (Failed(required(&ni, &ie, &nd, &de))) {
+        ni = nd = 0;
+    }
+    instance_exts.assign(ie, ie + ni);
+    device_exts.assign(de, de + nd);
+    std::fprintf(stderr, "SOTC DLSS NGX: %ls, %u instance and %u device extensions\n", file.c_str(),
+                 ni, nd);
+    return true;
+}
+
+/// After the device: NGX initialised and DLSS Super Resolution available.
+bool Init(const Instance& instance) {
+    // nvngx_dlss.dll is looked for next to the executable first. 231313132: the application id
+    // of NVIDIA's DLSS samples, for applications without their own.
+    Result r =
+        init(231313132ull, ExeDir().c_str(), static_cast<VkInstance>(instance.GetInstance()),
+             static_cast<VkPhysicalDevice>(instance.GetPhysicalDevice()),
+             static_cast<VkDevice>(instance.GetDevice()),
+             VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
+             VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr, kVersionApi, nullptr);
+    Param* caps{};
+    if (!Failed(r)) {
+        r = get_caps(&caps);
+    }
+    if (Failed(r) || !caps) {
+        std::fprintf(stderr, "SOTC DLSS NGX: init failed (%#x), FSR 3.1 instead\n",
+                     static_cast<u32>(r));
+        return false;
+    }
+    const int available = GetI(caps, "SuperSampling.Available");
+    const int old_driver = GetI(caps, "SuperSampling.NeedsUpdatedDriver");
+    if (!available || Failed(allocate(&params)) || !params) {
+        std::fprintf(stderr, "SOTC DLSS NGX: DLSS not available (needs a newer driver: %d), FSR "
+                             "3.1 instead\n",
+                     old_driver);
+        return false;
+    }
+    ready = true;
+    std::snprintf(ngx_version, sizeof(ngx_version), "direct");
+    std::fprintf(stderr, "SOTC DLSS Super Resolution: available through NGX, without Streamline\n");
+    return true;
+}
+
+ResourceVk Resource(vk::Image image, vk::ImageView view, vk::Format format, u32 w, u32 h,
+                               bool depth, bool write) {
+    return ResourceVk{
+        .view = static_cast<VkImageView>(view),
+        .image = static_cast<VkImage>(image),
+        .range = {depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+        .format = static_cast<VkFormat>(format),
+        .width = w,
+        .height = h,
+        .type = 0,
+        .read_write = write,
+    };
+}
+
+/// The Streamline path's inputs and options, given to NGX (what sl.dlss does with them).
+bool Evaluate(vk::CommandBuffer cmdbuf, const FrameSlot& f, const sl::DLSSOptions& o,
+              vk::Image color, vk::ImageView color_view, vk::Format color_format, u32 w, u32 h,
+              vk::Image out, vk::ImageView out_view, vk::Format out_format, u32 ow, u32 oh) {
+    const sl::Constants& c = f.constants;
+    const int quality = o.mode == sl::DLSSMode::eDLAA         ? kDlaa
+                        : o.mode == sl::DLSSMode::eMaxQuality ? kMaxQuality
+                        : o.mode == sl::DLSSMode::eBalanced   ? kBalanced
+                        : o.mode == sl::DLSSMode::eMaxPerformance
+                            ? kMaxPerf
+                            : kUltraPerformance;
+    const Key k{w, h, ow, oh, quality, c.depthInverted == sl::Boolean::eTrue};
+    if (!handle || !(k == key)) {
+        if (handle) {
+            (void)g_instance->GetDevice().waitIdle();
+            release(handle);
+            handle = nullptr;
+        }
+        SetUI(params, "CreationNodeMask", 1);
+        SetUI(params, "VisibilityNodeMask", 1);
+        SetUI(params, "Width", w);
+        SetUI(params, "Height", h);
+        SetUI(params, "OutWidth", ow);
+        SetUI(params, "OutHeight", oh);
+        SetI(params, "PerfQualityValue", quality);
+        SetI(params, "DLSS.Feature.Create.Flags",
+             kMvLowRes | kAutoExposure |
+                 (k.inverted ? kDepthInverted : 0));
+        SetI(params, "DLSS.Enable.Output.Subrects", 0);
+        // sl::DLSSPreset and the NGX render preset hint share their values (K 11, L 12, M 13).
+        SetUI(params, "DLSS.Hint.Render.Preset.DLAA", static_cast<u32>(o.dlaaPreset));
+        SetUI(params, "DLSS.Hint.Render.Preset.Quality",
+              static_cast<u32>(o.qualityPreset));
+        SetUI(params, "DLSS.Hint.Render.Preset.Balanced",
+              static_cast<u32>(o.balancedPreset));
+        SetUI(params, "DLSS.Hint.Render.Preset.Performance",
+              static_cast<u32>(o.performancePreset));
+        SetUI(params, "DLSS.Hint.Render.Preset.UltraPerformance",
+              static_cast<u32>(o.ultraPerformancePreset));
+        const Result r =
+            create(static_cast<VkDevice>(g_instance->GetDevice()), static_cast<VkCommandBuffer>(cmdbuf),
+                   kFeatureSuperSampling, params, &handle);
+        if (Failed(r) || !handle) {
+            std::fprintf(stderr, "SOTC DLSS NGX: creating DLSS %ux%u -> %ux%u failed (%#x), FSR 3.1 "
+                                 "instead\n",
+                         w, h, ow, oh, static_cast<u32>(r));
+            handle = nullptr;
+            ready = false;
+            sr_supported = false;
+            return false;
+        }
+        key = k;
+    }
+    ResourceVk color_r = Resource(color, color_view, color_format, w, h, false, false);
+    ResourceVk out_r = Resource(out, out_view, out_format, ow, oh, false, true);
+    ResourceVk depth_r =
+        Resource(f.depth, f.depth_view, f.depth_format, f.width, f.height, true, false);
+    ResourceVk mvec_r =
+        Resource(f.mvec, f.mvec_view, f.mvec_format, f.width, f.height, false, false);
+    SetPtr(params, "Color", &color_r);
+    SetPtr(params, "Output", &out_r);
+    SetPtr(params, "Depth", &depth_r);
+    SetPtr(params, "MotionVectors", &mvec_r);
+    SetF(params, "Jitter.Offset.X", c.jitterOffset.x);
+    SetF(params, "Jitter.Offset.Y", c.jitterOffset.y);
+    SetF(params, "Sharpness", 0.0f);
+    SetI(params, "Reset", c.reset == sl::Boolean::eTrue ? 1 : 0);
+    // Streamline's scale makes the vectors UV units (prev - cur); NGX's makes them pixels.
+    SetF(params, "MV.Scale.X", c.mvecScale.x * static_cast<float>(w));
+    SetF(params, "MV.Scale.Y", c.mvecScale.y * static_cast<float>(h));
+    SetUI(params, "DLSS.Render.Subrect.Dimensions.Width", w);
+    SetUI(params, "DLSS.Render.Subrect.Dimensions.Height", h);
+    SetF(params, "DLSS.Pre.Exposure", 1.0f);
+    SetF(params, "DLSS.Exposure.Scale", 1.0f);
+    const Result r = evaluate(static_cast<VkCommandBuffer>(cmdbuf), handle, params, nullptr);
+    if (Failed(r)) {
+        static u32 errors = 0;
+        if (errors++ < 5) {
+            std::fprintf(stderr, "SOTC DLSS NGX: evaluate failed (%#x)\n", static_cast<u32>(r));
+        }
+        return false;
+    }
+    return true;
+}
+
+} // namespace Ngx
+
 } // namespace
 
 PFN_vkGetInstanceProcAddr LoadInterposer() {
@@ -737,13 +1021,26 @@ PFN_vkGetInstanceProcAddr LoadInterposer() {
     if (const char* l = std::getenv("SOTC_DLSSG_LOG")) {
         log_level = std::atoi(l);
     }
-    static std::wstring dir = [] {
-        wchar_t path[MAX_PATH];
-        const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
-        std::wstring p(path, n);
-        const size_t slash = p.find_last_of(L"\\/");
-        return slash == std::wstring::npos ? std::wstring(L".") : p.substr(0, slash);
+    // sotc: DLSS Super Resolution (SOTC_UPSCALER=dlss) needs its plugin loaded too.
+    static const bool want_sr = [] {
+        const char* v = std::getenv("SOTC_UPSCALER");
+        return v && _stricmp(v, "dlss") == 0;
     }();
+    // sotc: DLSS with frame generation off at start: the DLSS plugin alone. Reflex and PCL loaded
+    // but unused were the first suspect of DLSS losing FPS with the driver's Low Latency Mode:
+    // Ultra (2mg, fork issue #5, RTX 2080 Ti: 48.5 against 59.1 FPS with Off). F8 then offers FSR 3
+    // frame generation only. SOTC_SL_ALL=1: load them anyway.
+    const bool dlss_only = want_sr && !FrameGen::AskedAtStart() && !std::getenv("SOTC_SL_ALL") &&
+                           !std::getenv("SOTC_STREAMLINE_FORCE");
+    // ... and then without Streamline at all, through NGX (Ngx above).
+    static const bool ngx_wanted = [] {
+        const char* v = std::getenv("SOTC_DLSS_NGX");
+        return !v || v[0] != '0';
+    }();
+    if (dlss_only && ngx_wanted && Ngx::Load()) {
+        return nullptr;
+    }
+    const std::wstring& dir = ExeDir();
     const std::wstring interposer = dir + L"\\sl.interposer.dll";
     api.dll = LoadLibraryExW(interposer.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!api.dll) {
@@ -768,21 +1065,11 @@ PFN_vkGetInstanceProcAddr LoadInterposer() {
     }
 
     static const wchar_t* plugin_paths[] = {dir.c_str()};
-    // sotc: DLSS Super Resolution (SOTC_UPSCALER=dlss) needs its plugin loaded too.
-    static const bool want_sr = [] {
-        const char* v = std::getenv("SOTC_UPSCALER");
-        return v && _stricmp(v, "dlss") == 0;
-    }();
     static const sl::Feature features_sr[] = {sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL,
                                               sl::kFeatureDLSS};
     static const sl::Feature features_fg[] = {sl::kFeatureDLSS_G, sl::kFeatureReflex,
                                               sl::kFeaturePCL};
-    // sotc: DLSS with frame generation off at start: the DLSS plugin alone. Reflex and PCL loaded
-    // but unused are the likely cause of DLSS losing FPS with the driver's Low Latency Mode: Ultra
-    // (2mg, fork issue #5, RTX 2080 Ti: 48.5 against 59.1 FPS with Off). F8 then offers FSR 3 frame
-    // generation only. SOTC_SL_ALL=1: load them anyway.
     static const sl::Feature features_dlss[] = {sl::kFeatureDLSS};
-    const bool dlss_only = want_sr && !FrameGen::AskedAtStart() && !std::getenv("SOTC_SL_ALL");
     const sl::Feature* features = dlss_only ? features_dlss : want_sr ? features_sr : features_fg;
     const size_t feature_count = dlss_only ? std::size(features_dlss)
                                  : want_sr ? std::size(features_sr)
@@ -829,6 +1116,10 @@ void OnDeviceCreated(const Instance& instance) {
             FrameGen::SetAvailable(supported, FsrFg::Supported());
         }
     } resolve_mode; // on every return
+    if (Ngx::dll) {
+        sr_supported = Ngx::Init(instance);
+        return;
+    }
     if (!loaded) {
         return;
     }
@@ -916,12 +1207,6 @@ bool SuperResEvaluate(vk::CommandBuffer cmdbuf, u32 frame_id, vk::Image color, v
         return false;
     }
     FrameSlot& f = frames[frame_id];
-    sl::FrameToken* token = Token(f.index);
-    if (!token) {
-        return false;
-    }
-    const sl::ViewportHandle viewport{0};
-    const sl::Result constants_result = api.set_constants(f.constants, *token, viewport);
     // The mode follows the scale: 1.5x quality, 1.7x balanced, 2x performance, 3x ultra performance.
     const float scale = static_cast<float>(out_width) / static_cast<float>(width);
     sl::DLSSOptions options{};
@@ -967,6 +1252,16 @@ bool SuperResEvaluate(vk::CommandBuffer cmdbuf, u32 frame_id, vk::Image color, v
         sr_label_ready.store(true, std::memory_order_release);
         SotcEvent::Log("CONFIG", "DLSS: %s", sr_label);
     }
+    if (Ngx::ready) {
+        return Ngx::Evaluate(cmdbuf, f, options, color, color_view, color_format, width, height, out,
+                             out_view, out_format, out_width, out_height);
+    }
+    sl::FrameToken* token = Token(f.index);
+    if (!token) {
+        return false;
+    }
+    const sl::ViewportHandle viewport{0};
+    const sl::Result constants_result = api.set_constants(f.constants, *token, viewport);
     options.preExposure = 1.0f;
     options.colorBuffersHDR = sl::Boolean::eFalse; // the frame is display referred, not HDR
     options.useAutoExposure = sl::Boolean::eTrue;
@@ -1468,6 +1763,10 @@ bool GetFrameInputs(u32 frame_id, FrameInputs& out) {
     out.depth_inverted = c.depthInverted == sl::Boolean::eTrue;
     out.reset = c.reset == sl::Boolean::eTrue;
     return true;
+}
+
+const std::vector<const char*>& NgxExtensions(bool device) {
+    return device ? Ngx::device_exts : Ngx::instance_exts;
 }
 
 } // namespace Vulkan::Dlssg

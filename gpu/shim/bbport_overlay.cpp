@@ -1111,7 +1111,7 @@ void FpsCounter() {
                            SotcStats::vram_budget.load(std::memory_order_relaxed) / 1073741824.0);
         ImGui::SameLine();
     }
-    ImGui::TextDisabled(SotcUi::T("F7: %s   F8: geração de quadros   F10: esconder", "F7: %s   F8: frame generation   F10: hide"),
+    ImGui::TextDisabled(SotcUi::T("F6: ritmo   F7: %s   F8: geração de quadros   F10: esconder", "F6: pacing   F7: %s   F8: frame generation   F10: hide"),
                         FpsModeName(FpsMode()));
     ImGui::End();
 }
@@ -1235,6 +1235,24 @@ bool HandleEvent(const SDL_Event& event) {
             toast_text = SotcUi::T("Geração de quadros: indisponível nesta placa", "Frame generation: not available on this GPU");
             toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
         }
+        return true;
+    }
+    // sotc: F6 switches the flip pacing (videoout/driver.cpp, tabnul's upstream PR #351): frames at
+    // the game's own rate, or snapped to the vblank grid, to compare the judder in place.
+    if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F6 && !event.key.repeat) {
+        static const bool env_on = [] {
+            const char* v = std::getenv("SOTC_FLIP_PACER");
+            return !v || v[0] != '0';
+        }();
+        const int live = SotcLive::flip_pacer.load(std::memory_order_relaxed);
+        const bool on = !(live >= 0 ? live != 0 : env_on);
+        SotcLive::flip_pacer.store(on ? 1 : 0, std::memory_order_relaxed);
+        toast_text = on ? SotcUi::T("Ritmo dos quadros: suave (no ritmo do jogo)",
+                                    "Frame pacing: smooth (at the game's rate)")
+                        : SotcUi::T("Ritmo dos quadros: grade do vblank (antigo)",
+                                    "Frame pacing: vblank grid (old)");
+        toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
+        SotcEvent::Log("KEY", "F6: %s", toast_text.c_str());
         return true;
     }
     // sotc: F10 shows or hides the performance overlay.

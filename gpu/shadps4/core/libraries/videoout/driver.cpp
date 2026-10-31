@@ -26,6 +26,7 @@
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/sotc_fps_cap.h"
+#include "video_core/sotc_live.h"
 #include "video_core/sotc_event.h"
 #include "video_core/sotc_stats.h"
 #ifdef _WIN32
@@ -1519,7 +1520,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     // (the game's own production rate, smooth when submits come in bursts), and never held past
     // submit + one vblank period, the worst the grid did (tabnul, upstream PR #351).
     // SOTC_FLIP_PACER=0 restores the vblank grid.
-    static const bool flip_pacer = [] {
+    static const bool env_flip_pacer = [] {
         const char* v = std::getenv("SOTC_FLIP_PACER");
         return !v || v[0] != '0';
     }();
@@ -1556,6 +1557,9 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             continue;
         }
 
+        // sotc: F6 switches the flip pacing while playing (sotc_live.h).
+        const int live_pacer = SotcLive::flip_pacer.load(std::memory_order_relaxed);
+        const bool flip_pacer = live_pacer >= 0 ? live_pacer != 0 : env_flip_pacer;
         // Check if it's time to take a request.
         // sotc: the flip rate counts from the last flip instead of fixed vblank phases: at 30 fps
         // (flip rate 1) a frame ready just after an even vblank went out two vblanks later

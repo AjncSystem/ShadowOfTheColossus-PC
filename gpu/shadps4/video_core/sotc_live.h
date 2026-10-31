@@ -22,6 +22,10 @@ inline std::atomic<int> fsr1{-1};
 inline std::atomic<int> fsr3{-1};
 inline std::atomic<int> rcas{-1};
 
+/// Flip pacing (SOTC_FLIP_PACER, videoout/driver.cpp): 1 at the game's own rate, 0 on the vblank
+/// grid. F6 switches it while playing. -1: the environment's.
+inline std::atomic<int> flip_pacer{-1};
+
 /// Far sun shadow cascades drawn on alternate frames (SOTC_SHADOW_REUSE): 0 off, 1 on.
 inline std::atomic<int> shadow_reuse{-1};
 

@@ -1573,9 +1573,15 @@ class Launcher:
                    'than the output the window fits the screen and fullscreen uses the whole monitor.'))
         self.row(f, _('Upscaler', 'Upscaler'), self.choice(f, 'upscaler', UPSCALERS),
                  _('FSR 1 amplia com bordas nítidas (acima de 1080p). DLSS exige uma placa NVIDIA RTX e as DLLs do '
-                   'DLSS e do Streamline na pasta bin do jogo; sem elas o jogo usa o FSR 3.1.',
+                   'DLSS e do Streamline na pasta bin do jogo; sem elas o jogo usa o FSR 3.1.\n'
+                   'Com DLSS, deixe o "Modo de baixa latência" do painel/NVIDIA App em Desligado ou Ligado, não em '
+                   'Ultra: com Ultra o DLSS perde FPS (o Streamline faz o driver aplicar esse modo, que não age no '
+                   'FSR). Dá para mudar só para este jogo no perfil do programa (bin\\bb-probe.exe).',
                    'FSR 1 upscales with sharp edges (above 1080p). DLSS needs an NVIDIA RTX card and the DLSS and '
-                   'Streamline DLLs in the bin folder of the game; without them the game uses FSR 3.1.'))
+                   'Streamline DLLs in the bin folder of the game; without them the game uses FSR 3.1.\n'
+                   'With DLSS, keep the NVIDIA control panel / app "Low Latency Mode" at Off or On, not Ultra: with '
+                   'Ultra DLSS loses FPS (Streamline makes the driver apply that mode, which does not act on FSR). '
+                   'It can be set for this game only in a program profile (bin\\bb-probe.exe).'))
         self.row(f, _('Qualidade do upscaler (FSR 3.1 / DLSS)', 'Upscaler quality (FSR 3.1 / DLSS)'),
                  self.choice(f, 'render_preset', RENDER_PRESETS),
                  _('Só com os upscalers FSR 3.1 e DLSS: o jogo renderiza num tamanho menor que a saída e o upscaler o '

@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <vector>
 #include <vk_mem_alloc.h>
@@ -736,8 +737,15 @@ vk::ImageView Dispatch(vk::CommandBuffer cmdbuf, Scheduler& scheduler, u32 frame
     d.dilatedMotionVectors = shared[1].resource;
     d.reconstructedPrevNearestDepth = shared[2].resource;
     d.output = out.resource;
-    d.jitterOffsetX = in.jitter[0];
-    d.jitterOffsetY = in.jitter[1];
+    // sotc: SOTC_FSR3_JITTER=x|y|xy negates the jitter given to FSR 3.1 (diagnostic: the DLSS
+    // convention is used as is; a wrong sign makes FSR 3.1 reject its history, edges stay stepped).
+    static const std::pair<float, float> jitter_sign = [] {
+        const char* v = std::getenv("SOTC_FSR3_JITTER");
+        const bool x = v && std::strchr(v, 'x'), y = v && std::strchr(v, 'y');
+        return std::pair{x ? -1.0f : 1.0f, y ? -1.0f : 1.0f};
+    }();
+    d.jitterOffsetX = in.jitter[0] * jitter_sign.first;
+    d.jitterOffsetY = in.jitter[1] * jitter_sign.second;
     // The game's motion vectors are curUV - prevUV; FSR 3 wants prev - cur, in render pixels.
     d.motionVectorScaleX = -static_cast<float>(width);
     d.motionVectorScaleY = -static_cast<float>(height);

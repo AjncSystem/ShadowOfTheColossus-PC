@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <optional>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -1459,6 +1460,7 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         .flip_arg = flip_arg,
         .index = index,
         .eop = is_eop,
+        .arrival = std::chrono::steady_clock::now(),
     });
 }
 
@@ -1466,10 +1468,25 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     const std::chrono::nanoseconds vblank_period(1000000000 /
                                                  EmulatorSettings.GetVblankFrequency());
 
-    Common::SetCurrentThreadName("shadPS4:PresentThread");
-    Common::SetCurrentThreadRealtime(vblank_period);
+    // sotc: flips on a finer grid than the vblank (tabnul, upstream PR #351). With flips only at
+    // vblank boundaries a frame that misses one waits for the next: at 120 Hz every frame time is
+    // a multiple of 8.33 ms, and a scene hovering around 10 ms shows as 8/17 ms judder. The thread
+    // ticks several times per vblank and may flip on any tick, while the guest still sees vblanks
+    // at BB_VBLANK_HZ. Ticks of about 1 ms: 8 per vblank at 120 Hz, 2 at the 60 FPS mode's 480 Hz
+    // (already a 2 ms grid there). SOTC_FLIP_SUBTICKS overrides (1 = the old one tick per vblank).
+    static const u32 flip_subticks = [&] {
+        const char* v = std::getenv("SOTC_FLIP_SUBTICKS");
+        const long fallback = std::max<long>(1, long(vblank_period.count() / 1000000));
+        const long n = v ? std::strtol(v, nullptr, 10) : fallback;
+        return u32(std::clamp(n, 1l, 16l));
+    }();
+    const std::chrono::nanoseconds tick_period = vblank_period / flip_subticks;
+    u32 subtick = 0;
 
-    Common::AccurateTimer timer{vblank_period};
+    Common::SetCurrentThreadName("shadPS4:PresentThread");
+    Common::SetCurrentThreadRealtime(tick_period);
+
+    Common::AccurateTimer timer{tick_period};
 
     // sotc: the flip rate is the minimum interval between two flips, counted from the last flip,
     // as on the console: a 30 FPS frame that misses its vblank is shown one vblank later (50 ms).
@@ -1497,6 +1514,26 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     u64 last_flip_vblank = 0;
     bool flipped = false;
 
+    // sotc: the uncapped game paces itself on flip completions; the vblank grid snapped every flip
+    // to its multiples. Uncapped, a flip is released at last flip + an EMA of the submit intervals
+    // (the game's own production rate, smooth when submits come in bursts), and never held past
+    // submit + one vblank period, the worst the grid did (tabnul, upstream PR #351).
+    // SOTC_FLIP_PACER=0 restores the vblank grid.
+    static const bool flip_pacer = [] {
+        const char* v = std::getenv("SOTC_FLIP_PACER");
+        return !v || v[0] != '0';
+    }();
+    auto last_flip_time = std::chrono::steady_clock::now();
+    auto prev_arrival = last_flip_time;
+    std::chrono::nanoseconds arrival_ema = vblank_period;
+    const auto peek_arrival = [this]() -> std::optional<std::chrono::steady_clock::time_point> {
+        std::scoped_lock lk{mutex};
+        if (requests.empty()) {
+            return std::nullopt;
+        }
+        return requests.front().arrival;
+    };
+
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
         if (!requests.empty()) {
@@ -1511,7 +1548,10 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         timer.Start();
 
         if (DebugState.IsGuestThreadsPaused()) {
-            DrawLastFrame();
+            if (subtick == 0) {
+                DrawLastFrame();
+            }
+            subtick = (subtick + 1) % flip_subticks;
             timer.End();
             continue;
         }
@@ -1547,34 +1587,60 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             }();
             const u64 floor_vblanks =
                 explicit_fast_vblank ? std::max<u64>(1, EmulatorSettings.GetVblankFrequency() / 120) : 1;
-            take_request = vblank_status.count - last_flip_vblank >= std::max(limit_vblanks, floor_vblanks);
+            const u64 need_vblanks = std::max(limit_vblanks, floor_vblanks);
+            if (need_vblanks > 1 || !flip_pacer) {
+                // A frame limit: whole vblanks since the last flip, released on any tick.
+                take_request = vblank_status.count - last_flip_vblank >= need_vblanks &&
+                               (flip_pacer || subtick == 0);
+            } else if (const auto arrival = peek_arrival()) {
+                // Never above 120 FPS (the game's movement timing breaks past it): the vblank grid
+                // at 120 Hz held that by itself, flips on any tick do not.
+                constexpr auto min_interval = std::chrono::nanoseconds(1000000000 / 120);
+                const auto now = std::chrono::steady_clock::now();
+                take_request =
+                    now >= last_flip_time + min_interval &&
+                    (now >= last_flip_time + arrival_ema || now >= *arrival + vblank_period);
+            } else {
+                take_request = false;
+            }
         } else {
             const u64 interval = u64(flip_rate + 1) * vblanks_per_60hz;
             take_request = vblank_status.count - last_flip_vblank >= interval;
         }
-        if (take_request) {
-            const auto request = receive_request();
-            if (request) {
-                last_flip_count = vblank_status.count;
-            }
-            if (!request) {
-                if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
-                    if (!main_port.is_open) {
-                        DrawBlankFrame();
-                    } else if (ImGui::Core::MustKeepDrawing() || BbOverlay::LoadingShown()) {
-                        // sotc: also the port's loading screen while the game shows nothing.
-                        DrawLastFrame();
-                    }
+        // sotc: capped rates (30 FPS, flip rate) keep taking flips on the vblank grid only.
+        if (flip_rate > 0 && subtick != 0) {
+            take_request = false;
+        }
+        const auto request = take_request ? receive_request() : Request{};
+        if (!request) {
+            // sotc: redraws without a flip stay on the vblank grid, not the tick grid.
+            if (subtick == 0 && timer.GetTotalWait().count() < 0) { // Dont draw too fast
+                if (!main_port.is_open) {
+                    DrawBlankFrame();
+                } else if (ImGui::Core::MustKeepDrawing() || BbOverlay::LoadingShown()) {
+                    // sotc: also the port's loading screen while the game shows nothing.
+                    DrawLastFrame();
                 }
-            } else {
-                Flip(request);
-                last_flip_vblank = vblank_status.count;
-                flipped = true;
-                FRAME_END;
             }
+        } else {
+            last_flip_count = vblank_status.count;
+            Flip(request);
+            last_flip_vblank = vblank_status.count;
+            last_flip_time = std::chrono::steady_clock::now();
+            // sotc: the game's production rate from the submit intervals (clamped so a load stall
+            // does not poison it).
+            const auto delta = std::clamp(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(request.arrival - prev_arrival),
+                std::chrono::nanoseconds{0}, std::chrono::nanoseconds{100000000});
+            prev_arrival = request.arrival;
+            arrival_ema += (delta - arrival_ema) / 8;
+            flipped = true;
+            FRAME_END;
         }
 
-        {
+        // sotc: the vblank fires on the first tick of each vblank period, keeping the
+        // flip-then-vblank order the thread had with one tick per vblank.
+        if (subtick == 0) {
             // Needs lock here as can be concurrently read by `sceVideoOutGetVblankStatus`
             std::scoped_lock lock{main_port.vo_mutex};
 
@@ -1597,6 +1663,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             vblank_status.tsc = Libraries::Kernel::sceKernelReadTsc();
             main_port.vblank_cv.notify_all();
         }
+        subtick = (subtick + 1) % flip_subticks;
 
         timer.End();
     }

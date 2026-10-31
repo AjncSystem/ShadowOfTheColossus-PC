@@ -858,9 +858,18 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         fsr_settings.enable = live != 0;
     }
     ApplyLiveRcas(fsr_settings);
+    // sotc: with FSR 3.1 or DLSS, a frame without depth and motion inputs (menus, loading screens)
+    // is not upscaled by them and went out as a bilinear stretch of the small render: blurry,
+    // blocky text and logos (2mg, fork issue #5). Such a frame gets FSR 1 and the sharpening
+    // setting instead; frames the temporal upscaler takes skip this pass as before.
+    HostPasses::FsrPass::Settings frame_fsr = fsr_settings;
+    if (Fsr3Up::Wanted() && !frame_fsr.enable) {
+        Dlssg::FrameInputs inputs{};
+        frame_fsr.enable = !Dlssg::GetFrameInputs(frame->id, inputs);
+    }
     const vk::ImageView game_view = image_view;
     image_view = fsr_pass.Render(cmdbuf, image_view, image_size, {frame->width, frame->height},
-                                 fsr_settings, frame->is_hdr);
+                                 frame_fsr, frame->is_hdr);
     DebugState.is_using_fsr = image_view != game_view;
 
     // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches

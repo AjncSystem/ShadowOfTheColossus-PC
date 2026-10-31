@@ -171,7 +171,8 @@ private:
         case CompSwizzle::Alpha:
             return data[3];
         default:
-            UNREACHABLE();
+            // sotc: a garbage descriptor (swizzle 2 or 3) reads zero instead of stopping the game
+            return T(0);
         }
     }
 
@@ -356,7 +357,10 @@ constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
         case DataFormat::Format16_16_16_16:
             return NumberConversion::Sint16ToSnormNz;
         default:
-            UNREACHABLE_MSG("data_fmt = {}", u32(data_fmt));
+            // sotc: no conversion instead of stopping the game. Seen with data_fmt 14 on an RX
+            // 9070 XT (fork issue #10, pepinou123): the descriptor came from memory the shader's
+            // SRT walk read as zeros right before, so it was garbage; a wrong texel beats a crash.
+            return NumberConversion::None;
         }
     }
     default:

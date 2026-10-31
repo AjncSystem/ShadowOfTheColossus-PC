@@ -39,6 +39,11 @@ quando o jogo ou os módulos mudam. Os saves e o cache de shaders ficam em `user
 Sem o lançador, `SotC.bat` faz o mesmo lendo `sotc.ini`. `SotC.exe --play` abre o jogo direto
 com as últimas opções do lançador, o que serve para atalhos e para o Steam.
 
+Ao procurar atualização, o lançador mostra as notas da versão do GitHub. Quem publica uma versão
+pode incluir uma seção `## English` no texto: o lançador em português mostra só o que vem antes dela,
+e em outros idiomas mostra só essa seção (até um `## Português`, se houver). Sem essa seção, o texto
+aparece inteiro.
+
 ## Imagem e desempenho
 
 Tudo isto está no lançador, na página **Imagem e FPS** (e os principais em **Jogar**):

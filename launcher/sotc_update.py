@@ -59,6 +59,25 @@ def latest_release(timeout=10):
             'sha256': digest[7:].lower() if digest.startswith('sha256:') else ''}
 
 
+_ENGLISH = re.compile(r'^##[ \t]+(?:in[ \t]+)?english(?:[ \t]+version)?[ \t:]*$', re.I | re.M)
+_OTHER_LANGUAGE = re.compile(r'^##[ \t]+(?:portugu[eê]s[a-z]*|em[ \t]+portugu[eê]s|vers[aã]o[ \t]+em[ \t]+portugu[eê]s)'
+                             r'[ \t:]*$', re.I | re.M)
+
+
+def notes_for(notes, english):
+    """The part of a release body in the launcher's language: a '## English' section holds the
+    English notes; the text before it is the Portuguese one. Without that section, the whole body."""
+    notes = notes or ''
+    heading = _ENGLISH.search(notes)
+    if not heading:
+        return notes.strip()
+    if not english:
+        return notes[:heading.start()].strip() or notes.strip()
+    rest = notes[heading.end():]
+    other = _OTHER_LANGUAGE.search(rest)
+    return (rest[:other.start()] if other else rest).strip() or notes.strip()
+
+
 def is_newer(release, current):
     return bool(release) and version_key(release['version']) > version_key(current)
 

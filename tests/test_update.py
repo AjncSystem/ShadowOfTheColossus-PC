@@ -127,5 +127,37 @@ class ApplyTests(unittest.TestCase):
         self.assertIsNone(sotc_update.cleanup(self.port))
 
 
+class NotesTests(unittest.TestCase):
+    def test_no_english_section(self):
+        body = '  Correções de áudio.\n\n## Detalhes\nMais texto.  '
+        self.assertEqual(sotc_update.notes_for(body, True), body.strip())
+        self.assertEqual(sotc_update.notes_for(body, False), body.strip())
+        self.assertEqual(sotc_update.notes_for('', True), '')
+
+    def test_english_at_end(self):
+        body = 'Correções.\n- item\n\n## English\nFixes.\n- item\n'
+        self.assertEqual(sotc_update.notes_for(body, False), 'Correções.\n- item')
+        self.assertEqual(sotc_update.notes_for(body, True), 'Fixes.\n- item')
+
+    def test_english_then_portuguese(self):
+        body = 'Intro\n## English\nFixes.\n### Details\nMore.\n## Português\nCorreções.'
+        self.assertEqual(sotc_update.notes_for(body, True), 'Fixes.\n### Details\nMore.')
+        self.assertEqual(sotc_update.notes_for(body, False), 'Intro')
+
+    def test_heading_variants(self):
+        for heading in ('## English', '## english:', '## In English  ', '## English version:', '##  ENGLISH'):
+            body = f'PT\n{heading}\nEN'
+            self.assertEqual(sotc_update.notes_for(body, True), 'EN', heading)
+            self.assertEqual(sotc_update.notes_for(body, False), 'PT', heading)
+        for heading in ('# English', '### English', '## English fixes', 'Text ## English'):
+            body = f'PT\n{heading}\nEN'
+            self.assertEqual(sotc_update.notes_for(body, True), body, heading)
+
+    def test_empty_portuguese_part(self):
+        body = '\n## English\nFixes.'
+        self.assertEqual(sotc_update.notes_for(body, False), body.strip())
+        self.assertEqual(sotc_update.notes_for(body, True), 'Fixes.')
+
+
 if __name__ == '__main__':
     unittest.main()

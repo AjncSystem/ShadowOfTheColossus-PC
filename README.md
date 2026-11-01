@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC native port · v0.70
+# Shadow of the Colossus — PC native port · v0.70-opt12
 
 [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
@@ -26,6 +26,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.70-opt12** | **Much less stutter:** frames are shown at an even rhythm (tabnul's flip pacer; frame-time jitter 5.2 → 1.2 ms), **in 60 FPS mode too** (no more 17/25 ms judder below 60), hitches over 100 ms down from 15 to 2 per 5-minute demo, worst frame 194 → 113 ms, **no more 900 ms freezes from the v0.70 shader cache** (it translated thousands of shaders again every session), stale or colored small textures fixed, Shrine 40 → 43.5 FPS. Everything from v0.70. The shader cache is rebuilt on first start. |
 | **0.70** | **Area changes no longer drop to near zero FPS** (worst frame 534 ms → 58–75 ms, no forced loading screens; 1–6 frames are still lost per change), **fix for a rare crash in the game's allocator after a load** (`0x49800`), **DLSS no longer shakes** in PS4 Pro mode at 30 FPS, **the HUD stays still with frame generation** on FSR 1, a cheaper LOD feedback, new draw thread diagnostics. **Install the game on an SSD.** |
 | **0.60.6-C3** | Fix for the C2 stamina bar with DLSS (wide screens, and 16:9 outside PS4 Pro mode); the 30 FPS cap holds in PS4 Pro mode too. |
 | **0.60.6-C2** | **Widescreen health and stamina bars fixed** (21:9 / 32:9, #301), **controller vibration toggle** (launcher and in-game menu, #292), **more FPS at the Shrine** (Lucas-blip-png's barrier change), **frame generation without the interface** (no shaking text, experimental), **DLSS Ultra Performance**. |

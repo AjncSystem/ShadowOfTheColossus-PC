@@ -1084,17 +1084,16 @@ void TextureCache::RefreshImage(Image& image) {
         // sotc: mip tails are small enough to land here often, and the hash below only sees the
         // first texels of the first mip: a CPU write to another mip would be missed. Re-upload.
         SotcStats::rebase_maybe_dirty.fetch_add(1, std::memory_order_relaxed);
+    } else if (maybe_cpu_dirty && image.info.guest_size > 64_KB) {
+        // sotc: defensive. A MaybeCpuDirty image begins and ends inside one page, so this should
+        // not happen; if it does, re-upload instead of hashing an unexpectedly large range.
+        SotcStats::rebase_maybe_dirty.fetch_add(1, std::memory_order_relaxed);
     } else if (maybe_cpu_dirty) {
-        // The image size should be less than page size to be considered MaybeCpuDirty
-        // So this calculation should be very uncommon and reasonably fast
-        // For now we'll just check up to 64 first pixels
+        // sotc: hash the whole image, not just its first 8x8 texels. An image inside one page is
+        // untracked after the first fault, so a CPU write past the first texels would otherwise
+        // never be seen (colored patches on meshes; HiddenUserHere, upstream PR #339).
         const auto addr = std::bit_cast<u8*>(image.info.guest_address);
-        const u32 w = std::min(image.info.size.width, u32(8));
-        const u32 h = std::min(image.info.size.height, u32(8));
-
-        const u32 s_w = image.info.props.is_block ? Common::DivCeil(w, 4u) : w;
-        const u32 s_h = image.info.props.is_block ? Common::DivCeil(h, 4u) : h;
-        const u32 size = s_w * s_h * (image.info.num_bits / 8);
+        const size_t size = image.info.guest_size;
         const u64 hash = [&] {
             const SotcStats::FrameTimer hash_timer{SotcStats::FrameHash};
             const SotcStats::SplitTimer hash_split{SotcStats::SplitTexHash};
@@ -1274,6 +1273,17 @@ void TextureCache::RefreshImage(Image& image) {
     {
         const SotcStats::SplitTimer record_split{SotcStats::SplitTexRecord};
         runtime.UploadImage(&image, buffer, image_copies);
+    }
+    // sotc: the MaybeCpuDirty check compares against image.hash, which only that branch used to
+    // set: after any other upload (CpuDirty, first upload) it described older contents, and a
+    // later rewrite of those older bytes was taken for "unchanged" (stale small textures). Keep
+    // it equal to what was just uploaded; 0 (never equal) for images the GPU writes or that do
+    // not fit in a page, which the MaybeCpuDirty path does not use.
+    if (image.info.guest_size <= 4_KB && False(image.flags & ImageFlagBits::GpuModified)) {
+        image.hash = XXH3_64bits(std::bit_cast<const u8*>(image.info.guest_address),
+                                 image.info.guest_size);
+    } else {
+        image.hash = 0;
     }
     SotcGlyphHook(image);
 }

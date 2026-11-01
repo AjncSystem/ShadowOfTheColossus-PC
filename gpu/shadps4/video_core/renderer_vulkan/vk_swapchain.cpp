@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -240,11 +241,19 @@ void Swapchain::SetSurfaceProperties() {
                                  std::min(capabilities.maxImageExtent.height, height));
     }
 
-    // Select number of images in swap chain, we prefer one buffer in the background to work on
-    image_count = capabilities.minImageCount + 1;
-    if (capabilities.maxImageCount > 0) {
-        image_count = std::min(image_count, capabilities.maxImageCount);
+    // sotc: 8 images instead of the usual minImageCount + 1. NVIDIA blocks vkQueuePresentKHR for
+    // up to ~140 ms every ~11 s; with 3 images acquire runs dry ~2 frames in and the GPU idles for
+    // the rest of the stall (a visible hitch at high fps). 8 bridge it (the frame pool sizes from
+    // this too), and under Mailbox/Immediate they add no steady-state latency: the queue only
+    // fills while a present is stuck. SOTC_SWAP_IMAGES overrides (=3 for the old behaviour).
+    u32 wanted_images = std::max(capabilities.minImageCount + 1, 8u);
+    if (const char* env = std::getenv("SOTC_SWAP_IMAGES"); env && env[0]) {
+        wanted_images = static_cast<u32>(std::strtoul(env, nullptr, 10));
     }
+    image_count = std::clamp(wanted_images, capabilities.minImageCount,
+                             capabilities.maxImageCount > 0 ? capabilities.maxImageCount : 16u);
+    std::fprintf(stderr, "GPU swapchain images: %u (driver min %u, max %u)\n", image_count,
+                 capabilities.minImageCount, capabilities.maxImageCount);
 
     // Prefer identity transform if possible
     transform = vk::SurfaceTransformFlagBitsKHR::eIdentity;

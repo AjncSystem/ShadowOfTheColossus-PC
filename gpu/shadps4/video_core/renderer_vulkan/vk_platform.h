@@ -23,6 +23,11 @@ constexpr u32 TargetVulkanApiVersion = VK_API_VERSION_1_3;
 
 vk::SurfaceKHR CreateSurface(vk::Instance instance, const Frontend::WindowSDL& emu_window);
 
+/// sotc: whether the family can present, usable before any surface exists (Win32 query; other
+/// platforms assume only the graphics family can).
+bool QueueFamilyCanPresent(vk::PhysicalDevice physical_device, u32 family_index,
+                           u32 graphics_family_index);
+
 vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool enable_validation,
                                   bool enable_crash_diagnostic);
 

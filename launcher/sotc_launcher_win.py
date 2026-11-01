@@ -526,6 +526,29 @@ def short_path(path):
         return str(path)
 
 
+def _ps_quote(value):
+    """A PowerShell single-quoted string literal (no $ expansion; every quote PowerShell accepts doubled)."""
+    return "'" + ''.join(c * 2 if c in "'\u2018\u2019\u201a\u201b" else c for c in str(value)) + "'"
+
+
+def _shortcut_script(play, frozen, executable, port_dir, game_icon):
+    """PowerShell that creates the desktop shortcut: the launcher window, or with play the game directly
+    (--play, also usable as a non-Steam game in Steam)."""
+    if frozen:
+        target, arguments, icon = executable, '--play' if play else '', game_icon or f'{executable},0'
+    else:
+        pythonw = Path(executable).with_name('pythonw.exe')
+        target = pythonw if pythonw.exists() else executable
+        arguments = f'"{Path(port_dir) / "launcher" / "sotc_launcher_win.py"}"' + (' --play' if play else '')
+        icon = Path(port_dir) / 'launcher' / 'sotc.ico'
+    name = '\\Shadow of the Colossus (play).lnk' if play else '\\Shadow of the Colossus.lnk'
+    return ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')"
+            f"+{_ps_quote(name)});"
+            f'$s.TargetPath={_ps_quote(target)};$s.WorkingDirectory={_ps_quote(port_dir)};'
+            f'$s.IconLocation={_ps_quote(icon)};'
+            + (f'$s.Arguments={_ps_quote(arguments)};' if arguments else '') + '$s.Save()')
+
+
 def load_settings():
     """Saved settings over the defaults. Older settings that turned DLSS-G on with SOTC_DLSSG=1 in
     the extra variables get the frame generation setting instead."""
@@ -1571,6 +1594,8 @@ class Launcher:
         holder = ttk.Frame(f)
         holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(10, 0))
         ttk.Button(holder, text=_('Atalho na área de trabalho', 'Desktop shortcut'), command=self.shortcut).pack(side='left')
+        ttk.Button(holder, text=_('Atalho para jogar direto', 'Shortcut that starts the game'),
+                   command=lambda: self.shortcut(play=True)).pack(side='left', padx=(6, 0))
         ttk.Button(holder, text=_('Pasta do port', 'Port folder'), command=lambda: self.open_path(PORT_DIR)).pack(side='left', padx=6)
         ttk.Button(holder, text=_('Limpar cache de shaders', 'Clear shader cache'), command=self.clear_cache).pack(side='left')
         self.section(f, _('Diagnóstico', 'Diagnostics'))
@@ -2231,24 +2256,18 @@ class Launcher:
             'Cache de shaders limpo. A próxima partida engasga alguns minutos enquanto ele é refeito.',
             'Shader cache cleared. The next start stutters for a few minutes while it is rebuilt.'))
 
-    def shortcut(self):
+    def shortcut(self, play=False):
         self.collect()
-        game_icon = self.game_icon_file()
-        if FROZEN:
-            target, arguments, icon = sys.executable, '', game_icon or f'{sys.executable},0'
-        else:
-            pythonw = Path(sys.executable).with_name('pythonw.exe')
-            target = str(pythonw if pythonw.exists() else sys.executable)
-            arguments, icon = Path(__file__).resolve(), PORT_DIR / 'launcher' / 'sotc.ico'
-        script = ('$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath("Desktop")'
-                  '+"\\Shadow of the Colossus.lnk");'
-                  f'$s.TargetPath="{target}";$s.WorkingDirectory="{PORT_DIR}";$s.IconLocation="{icon}";'
-                  + (f"$s.Arguments='\"{arguments}\"';" if arguments else '') + '$s.Save()')
+        script = _shortcut_script(play, FROZEN, sys.executable, PORT_DIR, self.game_icon_file())
         result = subprocess.run(['powershell', '-NoProfile', '-Command', script], capture_output=True,
                                 creationflags=NO_WINDOW)
         if result.returncode == 0:
-            self.messagebox.showinfo('Shadow of the Colossus', _('Atalho criado na área de trabalho.',
-                                                                 'Shortcut created on the desktop.'))
+            self.messagebox.showinfo('Shadow of the Colossus', _(
+                'Atalho criado na área de trabalho. Ele abre o jogo direto e pode ser adicionado ao Steam como '
+                'jogo não-Steam.',
+                'Shortcut created on the desktop. It starts the game directly and can be added to Steam as a '
+                'non-Steam game.') if play else _('Atalho criado na área de trabalho.',
+                                                  'Shortcut created on the desktop.'))
         else:
             self.messagebox.showerror('Shadow of the Colossus', result.stderr.decode(errors='replace')[:400])
 

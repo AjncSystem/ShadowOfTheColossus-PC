@@ -4,6 +4,8 @@
 # scripts, sotc.py and SotC.bat. Players need their own game dump; sound needs their own console's
 # libSceNgs2/libSceUlt (never packaged here). Run after `bash build.sh`.
 # Freezing uses a Windows Python with PyInstaller and Pillow (WINPYTHON, default C:\PyBuild312).
+# Install certifi there too: the updater adds its CA bundle to the Windows roots (issue #359);
+# PyInstaller bundles it (and its cacert.pem) by itself when it is installed.
 set -euo pipefail
 cd -- "$(dirname -- "$0")/../.."
 export MSYS2_ROOT=${MSYS2_ROOT:-/i/msys64}

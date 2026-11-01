@@ -536,7 +536,7 @@ void QuickSettings() {
         }
         ImGui::EndCombo();
     }
-    // sotc: uncapped flip pacing (videoout driver.cpp): the game's own rate or the vblank grid.
+    // sotc: flip pacing at 60 FPS and unlimited (videoout driver.cpp): the game's own rate or the vblank grid.
     const bool paced = SotcFpsCap::flip_pacer.load(std::memory_order_relaxed);
     const char* pace_names[] = {T("Grade do vblank (original)", "Vblank grid (original)"),
                                 T("Suave (ritmo do jogo)", "Smooth (game's rate)")};
@@ -548,10 +548,10 @@ void QuickSettings() {
         }
         ImGui::EndCombo();
     }
-    Hint(T("Com FPS ilimitado: solta cada quadro no ritmo do jogo em vez de na grade do vblank "
-           "(sem o tranco 8/17 ms).",
-           "With unlimited FPS: releases each frame at the game's rate instead of on the vblank "
-           "grid (no 8/17 ms double-beat)."));
+    Hint(T("Em 60 FPS e ilimitado: solta cada quadro no ritmo do jogo em vez de na grade do "
+           "vblank (sem o tranco 8/17 ms ou 17/25 ms).",
+           "At 60 FPS and unlimited: releases each frame at the game's rate instead of on the "
+           "vblank grid (no 8/17 ms or 17/25 ms double-beat)."));
 
     // Started at 30 FPS the game is not in its own 60 FPS mode (fps60game, chosen at start):
     // uncapped it runs faster, but some physics may be off (the 2nd colossus' wall).

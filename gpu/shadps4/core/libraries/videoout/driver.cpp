@@ -1178,6 +1178,13 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     auto last_flip_time = std::chrono::steady_clock::now();
     auto prev_arrival = last_flip_time;
     std::chrono::nanoseconds arrival_ema = vblank_period;
+    // sotc: the FPS limit (the launcher's 60 FPS mode) paced the same way. It took a flip only
+    // once limit_vblanks vblanks had passed, so a frame slower than the limit waited for the next
+    // 8.33 ms boundary: at 40-55 FPS the frames alternated 16.7 / 25 ms. With the pacer a flip
+    // goes out as soon as it is due on its own timeline (limit_next), at subtick resolution;
+    // limit_next advances by exactly one limit period while the game keeps up, so the cap stays
+    // at 60 and is not rounded up to the tick grid.
+    auto limit_next = last_flip_time;
 
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
@@ -1231,9 +1238,20 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         } else if (flip_rate <= 0) {
             const int live_limit = SotcFpsCap::limit_fps.load(std::memory_order_relaxed);
             const u64 limit_vblanks = live_limit >= 0 ? vblanks_for(live_limit) : start_limit_vblanks;
-            if (limit_vblanks != 0) {
+            const bool paced = SotcFpsCap::flip_pacer.load(std::memory_order_relaxed);
+            if (limit_vblanks != 0 && !paced) {
                 take_request = vblank_status.count - last_flip_vblank >= limit_vblanks;
-            } else if (!SotcFpsCap::flip_pacer.load(std::memory_order_relaxed)) {
+            } else if (limit_vblanks != 0) {
+                const auto now = std::chrono::steady_clock::now();
+                const auto arrival = peek_arrival();
+                take_request = arrival && now + tick_period / 2 >= limit_next &&
+                               (now + tick_period / 2 >= last_flip_time + arrival_ema ||
+                                now >= *arrival + vblank_period);
+                if (take_request) {
+                    const auto limit_period = vblank_period * limit_vblanks;
+                    limit_next = (now - limit_next < tick_period ? limit_next : now) + limit_period;
+                }
+            } else if (!paced) {
                 take_request = subtick == 0;
             } else if (const auto arrival = peek_arrival()) {
                 const auto now = std::chrono::steady_clock::now();

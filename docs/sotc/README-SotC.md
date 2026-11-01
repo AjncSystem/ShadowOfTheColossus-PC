@@ -46,6 +46,11 @@ verificada (erro de certificado, comum com antivírus ou proxy que inspecionam H
 Windows sem os certificados raiz atualizados), ele avisa e mostra o endereço para baixar a versão
 nova manualmente: https://github.com/AjncSystem/ShadowOfTheColossus-PC/releases
 
+Ao procurar atualização, o lançador mostra as notas da versão do GitHub. Quem publica uma versão
+pode incluir uma seção `## English` no texto: o lançador em português mostra só o que vem antes dela,
+e em outros idiomas mostra só essa seção (até um `## Português`, se houver). Sem essa seção, o texto
+aparece inteiro.
+
 ## Imagem e desempenho
 
 Tudo isto está no lançador, na página **Imagem e FPS** (e os principais em **Jogar**):

@@ -66,7 +66,7 @@ public:
     }
 
     u32 GetPresentQueueFamilyIndex() const {
-        return queue_family_index;
+        return present_queue_family;
     }
 
     vk::Queue GetGraphicsQueue() const {
@@ -75,6 +75,12 @@ public:
 
     vk::Queue GetPresentQueue() const {
         return present_queue;
+    }
+
+    /// sotc: true when present_queue is its own vk::Queue (second queue in the graphics family),
+    /// so vkQueuePresentKHR does not need Scheduler::submit_mutex.
+    bool HasDedicatedPresentQueue() const {
+        return dedicated_present_queue;
     }
 
     TracyVkCtx GetProfilerContext() const {
@@ -610,6 +616,8 @@ private:
     std::string vendor_name;
     VmaAllocator allocator{};
     vk::Queue present_queue;
+    bool dedicated_present_queue{};
+    u32 present_queue_family{0};
     vk::Queue graphics_queue;
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;

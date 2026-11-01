@@ -1357,17 +1357,20 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                                 SotcStats::image_query_ns.load(), SotcStats::image_alloc_ns.load(),
                                 SotcStats::image_dedicated.load()};
             if (last_us >= 0 && now_us - last_us > stall_us) {
+                // The 5 s stats printer resets these counters with exchange(0): a snapshot taken
+                // across a reset would underflow, so a shrunk counter reads as its new value.
+                const auto d = [&](int i) { return cur[i] >= last[i] ? cur[i] - last[i] : cur[i]; };
                 std::fprintf(stderr,
                              "SOTCSTALL frame %llu %.0f ms: pipelines %llu (%.0f ms), shaders %llu "
                              "(%.0f ms), images %llu (%.0f ms: query %.0f, alloc %.0f, %llu dedicated), "
                              "readbacks %llu (%.0f ms)\n",
                              static_cast<unsigned long long>(frames), (now_us - last_us) / 1e3,
-                             static_cast<unsigned long long>(cur[0] - last[0]), (cur[1] - last[1]) / 1e6,
-                             static_cast<unsigned long long>(cur[2] - last[2]), (cur[3] - last[3]) / 1e6,
-                             static_cast<unsigned long long>(cur[4] - last[4]), (cur[5] - last[5]) / 1e6,
-                             (cur[8] - last[8]) / 1e6, (cur[9] - last[9]) / 1e6,
-                             static_cast<unsigned long long>(cur[10] - last[10]),
-                             static_cast<unsigned long long>(cur[6] - last[6]), (cur[7] - last[7]) / 1e6);
+                             static_cast<unsigned long long>(d(0)), d(1) / 1e6,
+                             static_cast<unsigned long long>(d(2)), d(3) / 1e6,
+                             static_cast<unsigned long long>(d(4)), d(5) / 1e6,
+                             d(8) / 1e6, d(9) / 1e6,
+                             static_cast<unsigned long long>(d(10)),
+                             static_cast<unsigned long long>(d(6)), d(7) / 1e6);
             }
             last_us = now_us;
             std::copy(std::begin(cur), std::end(cur), std::begin(last));

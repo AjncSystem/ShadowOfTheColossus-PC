@@ -119,6 +119,8 @@ public:
     u64 Flush();
     void Finish();
     void OnSubmit();
+    /// sotc: copies the LOD feedback buffer to the host and clears it (sotc_lod_stats.h)
+    void SotcLodFeedbackCycle();
     void OnFence();
 
     PipelineCache& GetPipelineCache() {
@@ -182,7 +184,9 @@ private:
     void BindIndexBuffer(u32 index_offset = 0);
 
     void ResetBindings(bool is_compute);
+    void CaptureTextures();
     static bool TaaOff(); ///< sotc: DLSS on or SOTC_TAA_OFF=1, vk_rasterizer.cpp
+    u32 CompositeUiIndex(); ///< sotc: which of the composite's two images is the UI layer
     void MaybeDumpImages(u64 pgm_hash);
     void FlushPeriodic();
     u64 commands_tick{};
@@ -203,6 +207,16 @@ private:
     VideoCore::PageManager page_manager;
     VideoCore::BufferCache buffer_cache;
     VideoCore::TextureCache texture_cache;
+    // sotc: the finest mip per texture counter bank written by fragment shaders (device local),
+    // and the host copies read when the GPU reaches them (one per area in flight).
+    static constexpr u32 SotcLodFeedbackBytes = 256 * sizeof(u32); ///< + the gate word
+    static constexpr u32 SotcLodFeedbackAreas = 4;
+    u32 sotc_lod_cycles{};
+    std::unique_ptr<VideoCore::Buffer> sotc_lod_feedback;
+    std::unique_ptr<VideoCore::Buffer> sotc_lod_download;
+    std::array<std::atomic<bool>, SotcLodFeedbackAreas> sotc_lod_pending{};
+    u32 sotc_lod_area{};
+    std::chrono::steady_clock::time_point sotc_lod_last{};
     AmdGpu::Liverpool* liverpool;
     Core::MemoryManager* memory;
     boost::icl::interval_set<VAddr> mapped_ranges;
@@ -239,6 +253,11 @@ private:
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
     bool attachment_feedback_loop{};
     bool needs_barrier{};
+    /// sotc: SOTC_DEPTH_RO. The depth buffer of this draw is sampled (depth aspect) while its
+    /// stencil is written: one layout serves both.
+    bool DepthSampledAsAttachment(VideoCore::ImageId image_id, const VideoCore::Image& image,
+                                  const VideoCore::TextureCache::ImageDesc& desc,
+                                  bool compute) const;
 
     /// sotc: TakeHudless. BeginHudless starts the redraw of this draw (the final composite) into
     /// its HUD-less image; false when this draw is not the composite.

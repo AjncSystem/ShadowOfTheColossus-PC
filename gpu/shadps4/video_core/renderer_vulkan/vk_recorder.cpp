@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -18,6 +19,7 @@
 #include "common/perf_stats.h"
 #include "common/thread.h"
 #include "video_core/renderer_vulkan/vk_recorder.h"
+#include "video_core/sotc_stats.h"
 
 #if defined(_M_X64) || defined(__x86_64__)
 #include <immintrin.h>
@@ -665,6 +667,7 @@ CommandRecorder::~CommandRecorder() {
 vk::CommandBuffer CommandRecorder::NewFakeHandle() {
     // Fake handles wrap around after NumFakeHandles sessions, so confirm the old session was
     // submitted before using that handle again
+    const SotcStats::SplitTimer recorder_split{SotcStats::SplitWaitRecorder};
     while (handles_issued - handles_retired.load(std::memory_order_acquire) >= NumFakeHandles / 2) {
         Kick();
         std::this_thread::yield();
@@ -774,6 +777,10 @@ void CommandRecorder::NextChunk() {
 }
 
 CommandRecorder::Chunk* CommandRecorder::AcquireChunk() {
+    std::optional<SotcStats::SplitTimer> recorder_split;
+    if (chunks_in_flight.load(std::memory_order_acquire) >= MaxChunksInFlight) {
+        recorder_split.emplace(SotcStats::SplitWaitRecorder);
+    }
     while (chunks_in_flight.load(std::memory_order_acquire) >= MaxChunksInFlight) {
         // The recording thread is far enough behind to fill the queue, so let it catch up before
         // the producer adds more commands
@@ -837,6 +844,7 @@ void CommandRecorder::Sync() {
         sync_done.notify_all();
     });
     Kick();
+    const SotcStats::SplitTimer recorder_split{SotcStats::SplitWaitRecorder};
     u64 done = sync_done.load(std::memory_order_acquire);
     while (done < target) {
         sync_done.wait(done, std::memory_order_acquire);
@@ -852,6 +860,7 @@ void CommandRecorder::Sync() {
 
 void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuRecorder");
+    SotcStats::RegisterSplitThread(SotcStats::SplitThreadRecorder);
     Common::SetCurrentThreadPriority(Common::ThreadPriority::High);
     using Clock = std::chrono::steady_clock;
     // The command processor publishes another batch every few microseconds while working

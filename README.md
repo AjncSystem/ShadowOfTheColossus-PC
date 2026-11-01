@@ -1,10 +1,16 @@
-# Shadow of the Colossus — PC native port · v0.60.6-opt11
+# Shadow of the Colossus — PC native port · v0.70
 
 [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
-> **No game or Sony files are included.** You need your own game dump and, for sound, two
+> [!CAUTION]
+> *⚠️*No game or Sony files are included.** You need your own game dump and, for sound, two
 > modules from your own console. This project is not affiliated with Sony Interactive
 > Entertainment or Bluepoint Games.
+
+> [!CAUTION]
+> ⚠️ **Install the game on an SSD, NVMe if you can.** Every new area streams hundreds of MB of
+> textures and models from the game folder; on a hard disk the area changes stutter far more and
+> can freeze for seconds. Put the game dump (and, ideally, the port's folder) on an SSD.
 
 ---
 
@@ -20,6 +26,10 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.70** | **Area changes no longer drop to near zero FPS** (worst frame 534 ms → 58–75 ms, no forced loading screens; 1–6 frames are still lost per change), **fix for a rare crash in the game's allocator after a load** (`0x49800`), **DLSS no longer shakes** in PS4 Pro mode at 30 FPS, **the HUD stays still with frame generation** on FSR 1, a cheaper LOD feedback, new draw thread diagnostics. **Install the game on an SSD.** |
+| **0.60.6-C3** | Fix for the C2 stamina bar with DLSS (wide screens, and 16:9 outside PS4 Pro mode); the 30 FPS cap holds in PS4 Pro mode too. |
+| **0.60.6-C2** | **Widescreen health and stamina bars fixed** (21:9 / 32:9, #301), **controller vibration toggle** (launcher and in-game menu, #292), **more FPS at the Shrine** (Lucas-blip-png's barrier change), **frame generation without the interface** (no shaking text, experimental), **DLSS Ultra Performance**. |
+| **0.60.6-C1** | **Community release.** tabnul's **page allocator fix** (an hour in Maximum + PS4 Pro without a crash, far less colour garbage after loads), **Maximum textures in PS4 Pro mode** (experimental), **NVIDIA DLSS** for RTX 20 and newer (tabnul; here also in PS4 Pro mode and at 4K), **grass** distance/height/detail live in the in-game menu (tabnul), the **US release CUSA08034** (NathanMBR), fixes for weak CPUs and GTX 10xx (JihedMrouki), Oussama268's readback and bind work (new "More FPS" option), **F7: 30 → 60 → unlimited**, a launcher **Debug** page (debug menu on F6 / Start+Select, skip the logos). |
 | **0.60.6-opt11** | **US version (CUSA08034) supported** (same eboot as EU 1.01; own saves and shader cache), **+25% FPS at the Shrine and steadier frame times** (speculative GPU readbacks back on, now with a safety check and per-page locking, so no rainbow textures), descriptor binds reused by default, grass, HDR and DLSS menu fixes, logo skip, low-memory warning in the launcher, shader cache file check and invariant positions (GTX 10xx). The shader cache is rebuilt on first start. Riding stutter is still there. |
 | **0.60.6** | **No more rainbow garbage on textures and far fewer "closed out of nowhere" crashes** (the cause: speculative GPU readbacks written over memory the game had reused, after loading a save or a new area), **no more black dots on sandy ground**, **in-game menu cleaned up** (FPS, upscaler and sharpening now change at once; Bloodborne leftovers removed), **hard disk read-ahead** (fewer stalls in new areas on HDDs), textures refreshed on every load, a readable session event log (`user/events.log`). |
 | **0.60.5** | **Texture quality selector: Off / High / Maximum** (#235: sharp again), **memory leak fixed** (~60 MB/min, long-session stutter), **+3% average and +12% minimum FPS** (descriptor binds reused), **loading after a GPU driver update: 106 s → 7 s**, possible fix for **white characters on AMD GCN** (RX 470–590, Vega), **4-thread CPUs** no longer stuck loading, a hang watchdog, short hitches no longer flash a black loading screen, code review fixes. |
@@ -78,8 +88,10 @@ In the launcher (**Quick settings → Textures**) and in the in-game menu (chang
 
 - The first start after updating rebuilds the shaders: the first load is slow and stutters.
 - **Texture quality "Maximum"** can close the game in very wide views (sword raised against the
-  sun, the last colossus' area; #186). Since 0.60.6 it is not available in PS4 Pro mode, where it
-  closed within minutes.
+  sun, the last colossus' area; #186). In PS4 Pro mode it is experimental since 0.60.6-C1 (with
+  tabnul's page allocator fix): an hour without a crash in our test, but some colour garbage can
+  still show in the 7th and 8th colossus' areas after several visits.
+- **Frame generation (FSR 3) with DLSS:** text and HUD may shake; best left off.
 - The first start after an update rebuilds the GPU driver's shader cache: about 2 minutes of
   loading screen, and short stalls the first time each area is visited.
 - **AMD GCN** cards (RX 470–590, Vega, APUs on the legacy driver): characters and Agro may glow
@@ -105,7 +117,8 @@ In the launcher (**Quick settings → Textures**) and in the in-game menu (chang
 4. Click **PLAY**.
 
 Requirements: Windows 10/11 64-bit and a **Vulkan 1.3** GPU (NVIDIA, AMD or Intel with a recent
-driver). No Python install needed.
+driver). No Python install needed. **The game folder should be on an SSD** (NVMe best): on a hard
+disk new areas stutter much more.
 
 | What | Where from | What for |
 |---|---|---|

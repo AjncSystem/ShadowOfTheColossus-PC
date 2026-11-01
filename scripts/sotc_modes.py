@@ -22,6 +22,7 @@ Writes two files for the loader:
 The original bytes are checked first: another game version gets neither file's changes.
 """
 import argparse
+import os
 import re
 from pathlib import Path
 import struct
@@ -75,11 +76,22 @@ CVAR_MODES = {
 # Render size (PS4 mode; the PS4 Pro values next to them stay): (address, kind, original).
 # 'W'/'H' an integer immediate (the last 4 bytes of the instruction at address), 'w'/'h' a float
 # (the PS4 entry of a [PS4, Pro] table), 'w2'/'h2' half of it, 'a' the aspect float W/H,
-# 'P' the render target pool (322.5 MiB at 1080p, scaled by the pixel count).
+# 'P' the render target pool (322.5 MiB at 1080p, scaled by the pixel count), 'v' the width of a
+# 1080 line canvas of the render's aspect (1080 * W/H).
+# Page allocator (0x41a1e0): it carves a new chunk only when the free-page tally at pool+0x74 is
+# 0, and the tally drifts above the bitmap's real free count. With the bitmap empty and the tally
+# not 0, the scan found no bit and read bitmap[-1] (crash at 0x41a371). On a failed scan: tally 0,
+# then carve a chunk (0x41a1f1, needs eax 0) and scan again.
+POOL_FIX = (0x41a321, bytes.fromhex('eb34666666662e0f1f840000000000'),
+            bytes.fromhex('41c7467400000000' '31c0' 'e9c1feffff'))
+# Above this many rendered pixels the larger render target pool pushes the game's free system
+# memory figure under texturePoolReserveSystemMemMiBs (220), and the texture streamer drops every
+# texture to mip 3 every second or so (fine textures flicker). Reserve 0 there; it needs POOL_FIX.
+LOW_MEM_PIXELS = 4_200_000
 RENDER_SITES = [
-    # display init (0x495a90): the aspect of the display object, back buffer, display targets,
-    # scene size
-    (0x00495b3e, 'a', 'c74304398ee33f'),
+    # display init (0x495a90): back buffer, display targets, scene size. The display object's
+    # aspect (0x495b3e, 16/9) stays: the HUD lays out its health bar with it, and a wider value
+    # left a grey stub on the bar in 21:9 (#301, user test 26 Oct; the scene is unchanged).
     (0x00495bec, 'H', 'b938040000'), (0x00495bf7, 'W', 'b880070000'),
     (0x00495c91, 'W', 'ba80070000'), (0x00495c96, 'H', 'b938040000'),
     (0x00495d34, 'W', 'ba80070000'), (0x00495d39, 'H', 'b938040000'),
@@ -110,6 +122,12 @@ RENDER_SITES = [
     (0x01667f94, 'w2', '00007044'), (0x01667f9c, 'h2', '00000744'),
     # the default camera's aspect (16/9)
     (0x0166633c, 'a', '398ee33f'),
+    # HUD gauges: {0, 0, 1920.0, h} rectangles the stamina bar's fill is laid out in, in units of a
+    # 1080 line canvas ('v': 1080 * W/H, not the render width: with DLSS the render is smaller and
+    # the bar broke again). Left at 1920 the yellow bar stopped short of the grip circle in 21:9
+    # and filled the wrong way (#301, found with SOTC_RENDER_EXTRA and the user's tests, 26 Oct).
+    (0x008e2cf1, 'v', 'c78550feffff0000f044'),
+    (0x00920309, 'v', 'c78560feffff0000f044'),
 ]
 RT_POOL = 0x14280000
 # EU 1.01 / US 1.00: the command line lea and the fps60 site.
@@ -168,14 +186,36 @@ def render_patches(elf, ph, size):
         raise SystemExit(f'render size {size}: 640x360 to 7680x4320, multiples of 8')
     values = {'W': struct.pack('<I', w), 'H': struct.pack('<I', h), 'w': struct.pack('<f', w),
               'h': struct.pack('<f', h), 'w2': struct.pack('<f', w / 2), 'h2': struct.pack('<f', h / 2),
-              'a': struct.pack('<f', w / h), 'P': struct.pack('<I', render_pool(w, h))}
+              'a': struct.pack('<f', w / h), 'P': struct.pack('<I', render_pool(w, h)),
+              'v': struct.pack('<f', 1080 * w / h)}
     writes = []
-    for address, kind, original in RENDER_SITES:
+    # SOTC_RENDER_KEEP=<addr>,<addr>: sites left at the 1920x1080 value (finding the HUD's sites,
+    # #301: health and stamina bars stretched in 21:9).
+    keep = {int(a, 16) for a in os.environ.get('SOTC_RENDER_KEEP', '').replace(' ', ',').split(',') if a}
+    sites = list(RENDER_SITES)
+    if os.environ.get('SOTC_WIDE_ASPECT') == '1':  # the display object's aspect too (pre-#301)
+        sites.append((0x00495b3e, 'a', 'c74304398ee33f'))
+    for address, kind, original in sites:
         original = bytes.fromhex(original)
         if image_bytes(elf, ph, address - BASE, len(original)) != original:
             raise SystemExit(f'render size: unexpected bytes at {address:#x}')
+        if address in keep:
+            print(f'Render size: {address:#x} kept at 1920x1080')
+            continue
         data = values[kind]
         writes.append((address - BASE + len(original) - len(data), data))
+    # SOTC_RENDER_EXTRA=<addr>,<addr>: more 4-byte floats of 1920/960/1080/540 to scale (finding
+    # the stamina bar's site, #301).
+    extra = {1920.0: 'w', 960.0: 'w2', 1080.0: 'h', 540.0: 'h2'}
+    for a in os.environ.get('SOTC_RENDER_EXTRA', '').replace(' ', ',').split(','):
+        if not a:
+            continue
+        address = int(a, 16)
+        current = struct.unpack('<f', image_bytes(elf, ph, address - BASE, 4))[0]
+        if current not in extra:
+            raise SystemExit(f'render size: {address:#x} holds {current}, not 1920/960/1080/540')
+        writes.append((address - BASE, values[extra[current]]))
+        print(f'Render size: {address:#x} {current:g} scaled too')
     return writes
 
 
@@ -190,6 +230,8 @@ def main():
     elf, _, ph, _, _ = parse_self((args.game / 'eboot.bin').read_bytes())
     supported = is_supported(elf, ph)
     writes, cvars = [], []
+    if supported and image_bytes(elf, ph, POOL_FIX[0] - BASE, len(POOL_FIX[1])) == POOL_FIX[1]:
+        writes.append((POOL_FIX[0] - BASE, POOL_FIX[2]))
     for mode in filter(None, (m.strip().lower() for m in args.modes.split(','))):
         if mode not in MODES and mode not in CVAR_MODES:
             raise SystemExit(f'unknown mode {mode!r} (known: {", ".join([*MODES, *CVAR_MODES])})')
@@ -203,8 +245,27 @@ def main():
         if supported:
             writes += render_patches(elf, ph, args.render)
             print(f'Render size {args.render}: on')
+            w, h = map(int, args.render.split('x'))
+            if w * h > LOW_MEM_PIXELS and (POOL_FIX[0] - BASE, POOL_FIX[2]) in writes:
+                cvars.append('texturePoolReserveSystemMemMiBs=0')
         else:
             print(f'Render size {args.render}: this eboot is not {SUPPORTED}, not applied')
+    # sotc: PS4 Pro mode too (SOTC_NEO=1): its larger render targets push the game's free system
+    # memory figure under the reserve as well, and with Maximum textures the streamer's constant
+    # drops showed as colour garbage after loads (user, 26 Oct: 1 hour without a crash or
+    # garbage outside two areas with it). SOTC_POOL_RESERVE=0/1 forces the reserve off/on.
+    pool_fix = (POOL_FIX[0] - BASE, POOL_FIX[2]) in writes
+    reserve = os.environ.get('SOTC_POOL_RESERVE', '')
+    reserve_off = 'texturePoolReserveSystemMemMiBs=0' in cvars
+    if pool_fix and not reserve_off and reserve != '1' and (
+            reserve == '0' or os.environ.get('SOTC_NEO') == '1'):
+        cvars.append('texturePoolReserveSystemMemMiBs=0')
+        reserve_off = True
+    elif reserve_off and reserve == '1':
+        cvars.remove('texturePoolReserveSystemMemMiBs=0')
+        reserve_off = False
+    if reserve_off:
+        print('Texture pool reserve: 0 (page allocator fix on)')
     for item in args.cvars.split():
         item = item.lstrip('+')
         if not CVAR.match(item):

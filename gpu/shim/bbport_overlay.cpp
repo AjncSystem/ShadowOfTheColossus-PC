@@ -39,6 +39,8 @@ static const Vulkan::Instance* s_instance = nullptr;
 // runtime (tests) still link.
 extern "C" __attribute__((weak)) void runtime_audio_set_volume_percent(int pct);
 extern "C" __attribute__((weak)) int runtime_audio_volume_percent(void);
+extern "C" __attribute__((weak)) int runtime_rumble_enabled(void);
+extern "C" __attribute__((weak)) void runtime_rumble_set(int on);
 
 // DejaVu Sans (Cyrillic), embedded (third_party/fonts, Bitstream Vera license).
 #ifdef _WIN32
@@ -352,6 +354,26 @@ void SetTextureLevel(int level) {
     SotcEvent::Log("MENU", SotcUi::T("Qualidade das texturas: %s", "Texture quality: %s"), names[level]);
 }
 
+// sotc: the FPS mode now: 0 = 30 (the game's cap), 1 = 60, 2 = unlimited.
+int FpsMode() {
+    static const int env_limit = [] {
+        const char* v = std::getenv("SOTC_FPS_LIMIT");
+        return v ? std::atoi(v) : 0;
+    }();
+    if (!SotcFpsCap::uncapped.load(std::memory_order_relaxed)) {
+        return 0;
+    }
+    const int live_limit = SotcFpsCap::limit_fps.load(std::memory_order_relaxed);
+    return (live_limit >= 0 ? live_limit : env_limit) > 0 ? 1 : 2;
+}
+
+const char* FpsModeName(int mode) {
+    const char* names[] = {SotcUi::T("FPS travados em 30", "FPS capped at 30"),
+                           SotcUi::T("FPS travados em 60", "FPS capped at 60"),
+                           SotcUi::T("FPS ilimitados", "FPS unlimited")};
+    return names[mode];
+}
+
 // sotc: FPS mode 0 = 30 (the game's cap), 1 = 60, 2 = unlimited, as the launcher's.
 void SetFpsMode(int mode) {
     if (mode > 0) {
@@ -404,7 +426,9 @@ void GrassCombo(const char* label, const char* key, const GrassChoice (&choices)
     } else if (const auto it = saved.find(key); it != saved.end()) {
         now = it->second;
     } else {
-        now = saved[key] = std::strtof(LoadLauncherSetting(key).c_str(), nullptr);
+        // not saved yet (settings from before the grass options): the game's own value
+        const std::string v = LoadLauncherSetting(key);
+        now = saved[key] = v.empty() ? env_value : std::strtof(v.c_str(), nullptr);
     }
     char preview[16];
     std::snprintf(preview, sizeof(preview), "%g", now);
@@ -485,9 +509,9 @@ void GrassSettings() {
     GrassCombo(T("Altura do mato", "Weed height"), "weed_height", height, &SotcLive::grass[3],
                env[3]);
     GrassCombo(T("Sombras da grama (ao reiniciar)", "Grass shadows (on restart)"), "grass_shadows",
-               shadows, nullptr, 0.f);
+               shadows, nullptr, 2.f);
     GrassCombo(T("Esmaecimento da grama (ao reiniciar)", "Grass fade (on restart)"), "grass_fade",
-               fade, nullptr, 0.f);
+               fade, nullptr, 1.f);
     Hint(T("Abaixo de 100% a sombra da grama também some (50%: quase sem sombra). Menos grama "
            "alivia um pouco a GPU.",
            "Below 100% the grass shadow fades too (50%: almost no shadow). Less grass is a little "
@@ -500,13 +524,8 @@ void QuickSettings() {
     ImGui::SeparatorText(T("Ajuste rápido (vale na hora)", "Quick settings (apply at once)"));
 
     // sotc: FPS as the launcher's: 30 (the game's cap), 60 or unlimited. F7 switches the cap.
-    static const int env_limit = [] {
-        const char* v = std::getenv("SOTC_FPS_LIMIT");
-        return v ? std::atoi(v) : 0;
-    }();
     const bool uncapped = SotcFpsCap::uncapped.load(std::memory_order_relaxed);
-    const int live_limit = SotcFpsCap::limit_fps.load(std::memory_order_relaxed);
-    const int fps_mode = !uncapped ? 0 : (live_limit >= 0 ? live_limit : env_limit) > 0 ? 1 : 2;
+    const int fps_mode = FpsMode();
     const char* fps_names[] = {T("30 FPS (como no PS4)", "30 FPS (as on PS4)"), "60 FPS",
                                T("Ilimitado", "Unlimited")};
     if (ImGui::BeginCombo("FPS  [F7]", fps_names[fps_mode])) {
@@ -517,7 +536,7 @@ void QuickSettings() {
         }
         ImGui::EndCombo();
     }
-    // sotc: uncapped flip pacing (videoout driver.cpp): the game's own rate or the vblank grid.
+    // sotc: flip pacing at 60 FPS and unlimited (videoout driver.cpp): the game's own rate or the vblank grid.
     const bool paced = SotcFpsCap::flip_pacer.load(std::memory_order_relaxed);
     const char* pace_names[] = {T("Grade do vblank (original)", "Vblank grid (original)"),
                                 T("Suave (ritmo do jogo)", "Smooth (game's rate)")};
@@ -529,10 +548,10 @@ void QuickSettings() {
         }
         ImGui::EndCombo();
     }
-    Hint(T("Com FPS ilimitado: solta cada quadro no ritmo do jogo em vez de na grade do vblank "
-           "(sem o tranco 8/17 ms).",
-           "With unlimited FPS: releases each frame at the game's rate instead of on the vblank "
-           "grid (no 8/17 ms double-beat)."));
+    Hint(T("Em 60 FPS e ilimitado: solta cada quadro no ritmo do jogo em vez de na grade do "
+           "vblank (sem o tranco 8/17 ms ou 17/25 ms).",
+           "At 60 FPS and unlimited: releases each frame at the game's rate instead of on the "
+           "vblank grid (no 8/17 ms or 17/25 ms double-beat)."));
 
     // Started at 30 FPS the game is not in its own 60 FPS mode (fps60game, chosen at start):
     // uncapped it runs faster, but some physics may be off (the 2nd colossus' wall).
@@ -552,7 +571,21 @@ void QuickSettings() {
     const int up_mode = (live_fsr1 >= 0 ? live_fsr1 : env_fsr1) ? 0 : 1;
     const char* up_names[] = {T("FSR 1 (AMD, qualquer placa)", "FSR 1 (AMD, any GPU)"),
                               T("Bilinear (simples)", "Bilinear (plain)")};
-    if (ImGui::BeginCombo("Upscaler", up_names[up_mode])) {
+    // sotc: DLSS (SOTC_UPSCALER=dlss) is chosen at start, its render size with it: shown, not
+    // switchable here (picking FSR 1 here saved "fsr1" over the launcher's DLSS, 26 Oct).
+    static const bool dlss_start = [] {
+        const char* v = std::getenv("SOTC_UPSCALER");
+        return v && std::strcmp(v, "dlss") == 0;
+    }();
+    if (dlss_start) {
+        ImGui::BeginDisabled();
+        if (ImGui::BeginCombo("Upscaler", "NVIDIA DLSS")) {
+            ImGui::EndCombo();
+        }
+        ImGui::EndDisabled();
+        Hint(T("DLSS troca no lançador (vale ao abrir o jogo de novo).",
+               "DLSS is switched in the launcher (applies when the game starts again)."));
+    } else if (ImGui::BeginCombo("Upscaler", up_names[up_mode])) {
         for (int i = 0; i < 2; ++i) {
             if (ImGui::Selectable(up_names[i], i == up_mode) && i != up_mode) {
                 SetUpscaler(i);
@@ -625,11 +658,13 @@ void QuickSettings() {
     const int tex_level = !hq ? 0 : (live_low >= 0 ? live_low : EnvPoolLow()) > 0 ? 1 : 2;
     const char* tex_names[] = {T("Desligada", "Off"), T("Alta (estável)", "High (stable)"),
                                T("Máxima (nítida)", "Maximum (sharp)")};
-    // sotc: no "Maximum" in PS4 Pro mode: there it exhausted the game's page pool within minutes
-    // at the Shrine (0x1a371, user, 22 Oct).
+    // sotc: "Maximum" in PS4 Pro mode exhausted the game's page pool within minutes at the Shrine
+    // (0x1a371, 22 Oct) until tabnul's page allocator fix (PR #288); experimental there since.
+    // SOTC_MAX_IN_PRO=0 blocks it again.
     static const bool neo = [] {
         const char* v = std::getenv("SOTC_NEO");
-        return v && v[0] == '1';
+        const char* allow = std::getenv("SOTC_MAX_IN_PRO");
+        return v && v[0] == '1' && allow && allow[0] == '0';
     }();
     if (ImGui::BeginCombo(T("Qualidade das texturas", "Texture quality"), tex_names[tex_level])) {
         for (int i = 0; i < 3; ++i) {
@@ -767,6 +802,18 @@ void Menu() {
                        s.mouse_invert.load() ? SotcUi::T("ligado", "on") : SotcUi::T("desligado", "off"));
     }
     ImGui::EndDisabled();
+
+    // sotc: the pad's vibration, at once and kept as the launcher's option (#292)
+    if (runtime_rumble_enabled && runtime_rumble_set) {
+        ImGui::SeparatorText(SotcUi::T("Controle", "Controller"));
+        bool rumble = runtime_rumble_enabled() != 0;
+        if (ImGui::Checkbox(SotcUi::T("Vibração do controle", "Controller vibration"), &rumble)) {
+            runtime_rumble_set(rumble ? 1 : 0);
+            SaveLauncherSetting("rumble", rumble ? "true" : "false");
+            SotcEvent::Log("MENU", SotcUi::T("Vibração do controle: %s", "Controller vibration: %s"),
+                           rumble ? SotcUi::T("ligada", "on") : SotcUi::T("desligada", "off"));
+        }
+    }
 
     ImGui::Spacing();
     ImGui::Separator();
@@ -1081,7 +1128,7 @@ float FpsCounter() {
         ImGui::SameLine();
     }
     ImGui::TextDisabled(SotcUi::T("F7: %s   F8: geração de quadros   F10: esconder", "F7: %s   F8: frame generation   F10: hide"),
-                        SotcFpsCap::uncapped ? SotcUi::T("FPS livres", "FPS uncapped") : SotcUi::T("travado em 30", "capped at 30"));
+                        FpsModeName(FpsMode()));
     const float bottom = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y;
     ImGui::End();
     return bottom;
@@ -1187,12 +1234,10 @@ bool HandleEvent(const SDL_Event& event) {
         return false;
     }
     ImGuiIO& io = ImGui::GetIO();
-    // sotc: F7 caps the game at 30 FPS or uncaps it (sotc_fps_cap.h).
+    // sotc: F7 switches 30 -> 60 -> unlimited FPS, as the menu's FPS choice (kept for the launcher).
     // The new state is shown at the next frame (Render).
     if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F7 && !event.key.repeat) {
-        const bool uncapped = SotcFpsCap::Toggle();
-        SotcEvent::Log("KEY", "%s", uncapped ? SotcUi::T("F7: limite de 30 FPS desligado", "F7: 30 FPS cap off")
-                                             : SotcUi::T("F7: limite de 30 FPS ligado", "F7: 30 FPS cap on"));
+        SetFpsMode((FpsMode() + 1) % 3);
         return true;
     }
     // sotc: F6 switches uncapped flip pacing: the game's own rate or the vblank grid
@@ -1218,6 +1263,29 @@ bool HandleEvent(const SDL_Event& event) {
             toast_text = SotcUi::T("Geração de quadros: indisponível nesta placa", "Frame generation: not available on this GPU");
             toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
         }
+        return true;
+    }
+    // sotc: F5 (diagnostic) saves the textures of the next frame (sotc_stats.h).
+    if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F5 && !event.key.repeat) {
+        SotcStats::tex_capture.store(true, std::memory_order_relaxed);
+        SotcEvent::Log("KEY", "%s", SotcUi::T("F5: captura de texturas", "F5: texture capture"));
+        toast_text = SotcUi::T("F5: texturas capturadas", "F5: textures captured");
+        toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
+        return true;
+    }
+    // sotc: F9 (diagnostic) uploads every cached texture again from guest memory (sotc_stats.h).
+    // With the launcher's DLSS comparison on (SOTC_DLSS_COMPARE=1), F9 switches DLSS / FSR 1
+    // instead (window.cpp).
+    static const bool dlss_compare = [] {
+        const char* v = std::getenv("SOTC_DLSS_COMPARE");
+        return v && v[0] == '1';
+    }();
+    if (!dlss_compare && event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F9 &&
+        !event.key.repeat) {
+        SotcStats::reload_all.store(true, std::memory_order_relaxed);
+        SotcEvent::Log("KEY", "%s", SotcUi::T("F9: recarregar texturas", "F9: reload textures"));
+        toast_text = SotcUi::T("F9: texturas recarregadas", "F9: textures reloaded");
+        toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
         return true;
     }
     // sotc: F10 shows or hides the performance overlay.
@@ -1557,12 +1625,12 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
                                        "Frame pacing: vblank grid (original)");
         toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
     }
-    // The 30 FPS cap was switched (F7).
-    static bool shown_uncapped = SotcFpsCap::uncapped;
-    if (const bool uncapped = SotcFpsCap::uncapped; uncapped != shown_uncapped) {
-        shown_uncapped = uncapped;
+    // The FPS mode was switched (F7 or the menu).
+    static int shown_fps_mode = FpsMode();
+    if (const int fps_mode = FpsMode(); fps_mode != shown_fps_mode) {
+        shown_fps_mode = fps_mode;
         std::scoped_lock lock{imgui_mutex};
-        toast_text = uncapped ? SotcUi::T("FPS livres", "FPS uncapped") : SotcUi::T("FPS travados em 30", "FPS capped at 30");
+        toast_text = FpsModeName(fps_mode);
         toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
     }
     if (!Visible()) {

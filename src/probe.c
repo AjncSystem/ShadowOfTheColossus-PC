@@ -511,6 +511,60 @@ static int profile_by_leaf(const void *a, const void *b) {
 static int profile_by_inclusive(const void *a, const void *b) {
     return (int)((const ProfileSlot *)b)->inclusive-(int)((const ProfileSlot *)a)->inclusive;
 }
+/* sotc: SOTC_THREAD_TIMES=1: per-thread CPU time over the profile window (SOTC_PROFILE_DELAY to
+ * +SOTC_PROFILE_SECONDS), with the flip count, to see which thread gains or loses busy time
+ * between two flip modes without picking a thread up front. */
+typedef struct { DWORD id; ULONGLONG cycles; char name[32]; } ThreadTimeRow;
+static int thread_times_snapshot(ThreadTimeRow *rows, int max) {
+    typedef HRESULT (WINAPI *Describe)(HANDLE, PWSTR *);
+    static Describe describe;
+    if (!describe) describe=(Describe)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"),"GetThreadDescription");
+    int n=0;
+    HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
+    THREADENTRY32 te={.dwSize=sizeof(te)};
+    for (BOOL ok=Thread32First(snapshot,&te); ok && n<max; ok=Thread32Next(snapshot,&te)) {
+        if (te.th32OwnerProcessID!=GetCurrentProcessId()) continue;
+        HANDLE t=OpenThread(THREAD_QUERY_LIMITED_INFORMATION,FALSE,te.th32ThreadID);
+        if (!t) continue;
+        ThreadTimeRow *r=&rows[n];
+        r->id=te.th32ThreadID; r->name[0]=0;
+        if (!QueryThreadCycleTime(t,&r->cycles)) r->cycles=0;
+        PWSTR text=NULL;
+        if (describe && SUCCEEDED(describe(t,&text)) && text) {
+            WideCharToMultiByte(CP_UTF8,0,text,-1,r->name,sizeof(r->name),NULL,NULL);
+            LocalFree(text);
+        }
+        CloseHandle(t); ++n;
+    }
+    CloseHandle(snapshot);
+    return n;
+}
+static DWORD WINAPI thread_times(void *unused) {
+    (void)unused;
+    const char *delay=getenv("SOTC_PROFILE_DELAY"), *seconds=getenv("SOTC_PROFILE_SECONDS");
+    Sleep((delay ? atoi(delay) : 20)*1000);
+    static ThreadTimeRow before[256], after[256];
+    const uint64_t flips0=bbgpu_flip_count();
+    const int nb=thread_times_snapshot(before,256);
+    const ULONGLONG t0=GetTickCount64();
+    Sleep((seconds ? atoi(seconds) : 15)*1000);
+    const int na=thread_times_snapshot(after,256);
+    const double ms=(double)(GetTickCount64()-t0);
+    const uint64_t frames=bbgpu_flip_count()-flips0;
+    fprintf(stderr,"SOTC thread times: %.0f ms, %llu flips\n",ms,(unsigned long long)frames);
+    for (int i=0;i<na;++i) {
+        ULONGLONG start=0;
+        for (int j=0;j<nb;++j) if (before[j].id==after[i].id) { start=before[j].cycles; break; }
+        if (after[i].cycles<=start) continue;
+        /* Cycles, not time; report both raw and per-flip so two runs compare by share. */
+        const double mcycles=(double)(after[i].cycles-start)/1e6;
+        if (mcycles<1.0) continue;
+        fprintf(stderr,"  tid %6lu %-32s %10.1f Mcycles  %8.3f Mc/flip\n",
+                (unsigned long)after[i].id,after[i].name[0]?after[i].name:"?",
+                mcycles,frames?mcycles/(double)frames:0.0);
+    }
+    return 0;
+}
 static DWORD WINAPI profiler(void *name) {
     typedef HRESULT (WINAPI *Describe)(HANDLE, PWSTR *);
     Describe describe=(Describe)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"),"GetThreadDescription");
@@ -1304,6 +1358,7 @@ int main(int argc, char **argv) {
     if (getenv("BB_FAULT_RING")) fault_ring_open(getenv("BB_FAULT_RING"));
     if (getenv("BB_STACKS_TRIGGER")) CreateThread(NULL,0,stacks_watcher,(void *)getenv("BB_STACKS_TRIGGER"),0,NULL);
     if (getenv("SOTC_PROFILE")) CreateThread(NULL,0,profiler,(void *)getenv("SOTC_PROFILE"),0,NULL);
+    if (getenv("SOTC_THREAD_TIMES")) CreateThread(NULL,0,thread_times,NULL,0,NULL);
     SetUnhandledExceptionFilter(unhandled_fault);
     if (getenv("BB_STRICT_HANDLES")) {
         PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY strict={0};

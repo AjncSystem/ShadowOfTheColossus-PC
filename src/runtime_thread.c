@@ -158,13 +158,16 @@ GuestThread *runtime_thread_current(void) {
 }
 /* Host threads that call guest code (HLE decoders invoking guest callbacks) need
  * a TCB/TLS like guest threads; the record lives until process exit. */
+static void set_host_name(const char *name);
 void runtime_thread_attach_host(const char *name) {
     GuestThread *t=runtime_thread_current();
     snprintf(t->name,sizeof(t->name),"%s",name ? name : "host");
+    set_host_name(t->name);
 }
 void runtime_thread_attach_main(void) {
     GuestThread *t=runtime_thread_current();
     snprintf(t->name,sizeof(t->name),"main");
+    set_host_name(t->name);
 }
 static GuestThread *find_thread(void *handle) {
     GuestThread *found=NULL;
@@ -280,6 +283,23 @@ static void set_host_name(const char *name) {
     char host[16]={0};
     memcpy(host,name,strnlen(name,sizeof(host)-1));
     pthread_setname_np(pthread_self(),host);
+#ifdef _WIN32
+    /* sotc: also publish the name as the Win32 thread description, so the sampling profiler
+     * (SOTC_PROFILE matches GetThreadDescription) can pick guest threads by name. */
+    typedef HRESULT (WINAPI *SetDescription)(HANDLE,PCWSTR);
+    static SetDescription set_description;
+    static int looked;
+    if (!looked) {
+        set_description=(SetDescription)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                                                               "SetThreadDescription");
+        looked=1;
+    }
+    if (set_description) {
+        wchar_t wide[16];
+        for (int i=0;i<16;++i) wide[i]=(unsigned char)host[i];
+        set_description(GetCurrentThread(),wide);
+    }
+#endif
 }
 #ifdef _WIN32
 #define exit_setjmp(t) bb_setjmp((t)->exit_jump)
@@ -401,6 +421,9 @@ static ABI int32_t thread_rename(GuestThread *t,const char *name) {
     if (!name) return ERR(22);
     snprintf(t->name,sizeof(t->name),"%s",name);
     if (t==current) set_host_name(t->name);
+#ifdef _WIN32
+    if (getenv("SOTC_THREAD_IDS")) fprintf(stderr,"Runtime: guest thread renamed to '%s'\n",t->name);
+#endif
     return 0;
 }
 static ABI int32_t thread_equal(GuestThread *a,GuestThread *b) { return a==b; }

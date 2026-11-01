@@ -7,6 +7,7 @@
 #include "common/polyfill_thread.h"
 #include "core/libraries/videoout/video_out.h"
 
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -101,6 +102,8 @@ private:
         s64 flip_arg;
         s32 index;
         bool eop;
+        // sotc: when the flip was submitted; the present thread paces flips from it.
+        std::chrono::steady_clock::time_point arrival;
 
         operator bool() const noexcept {
             return frame != nullptr;

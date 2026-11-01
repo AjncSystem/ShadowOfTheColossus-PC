@@ -644,6 +644,8 @@ def game_environment(s):
     if fade in ('0.5', '0.75', '2', '3'):
         cvars.append(f'r_virtualGeometryFadeMultiplier={fade}')
     cvars += str(s.get('engine_cvars', '')).split()
+    # Tools (tools/sotc_route.py --boss) add cvars for one run without editing the settings.
+    cvars += os.environ.get('SOTC_EXTRA_CVARS', '').split()
     env['SOTC_CVARS'] = ' '.join(cvars)
     # Multipliers for the grass shaders' view distances and blade height (vk_rasterizer.cpp).
     env['SOTC_GRASS'] = ' '.join(str(s.get(k) or '1') for k in

@@ -23,6 +23,7 @@
 #include "video_core/sotc_stats.h"
 
 #include "video_core/host_shaders/fg_depth_comp.h"
+#include "video_core/host_shaders/fg_ui_comp.h"
 
 // sotc: the HUD-less input of the next RecordPrepare/RecordDispatch (gpu/CMakeLists.txt adds it to
 // the module's frame generation source; a null image: none).
@@ -62,6 +63,12 @@ vk::UniqueDescriptorSetLayout depth_set_layout;
 vk::UniquePipelineLayout depth_layout;
 vk::UniquePipeline depth_pipeline;
 std::array<DepthSlot, kMaxFrames> depth_slots;
+
+// The game frame's HUD put back over the generated frame (fg_ui.comp), present thread.
+vk::ShaderModule ui_shader;
+vk::UniqueDescriptorSetLayout ui_set_layout;
+vk::UniquePipelineLayout ui_layout;
+vk::UniquePipeline ui_pipeline;
 
 // Present thread.
 FfxVkFsr3_3_1_6FrameGenerationContext* context{};
@@ -353,6 +360,57 @@ void Init(const Instance& instance) {
     }
     depth_pipeline = std::move(pipeline);
     supported = true;
+
+    // The HUD pass is optional: without it FSR 3 composes the HUD by itself, as before.
+    ui_shader = CompileSPV(FG_UI_COMP, device);
+    std::array<vk::DescriptorSetLayoutBinding, 3> ui_bindings{};
+    for (u32 i = 0; i < ui_bindings.size(); ++i) {
+        ui_bindings[i] = {
+            .binding = i,
+            .descriptorType = vk::DescriptorType::eStorageImage,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        };
+    }
+    auto [ui_set_result, ui_set] = device.createDescriptorSetLayoutUnique({
+        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+        .bindingCount = static_cast<u32>(ui_bindings.size()),
+        .pBindings = ui_bindings.data(),
+    });
+    if (ui_set_result != vk::Result::eSuccess) {
+        return;
+    }
+    ui_set_layout = std::move(ui_set);
+    const vk::DescriptorSetLayout ui_layouts[] = {*ui_set_layout};
+    const vk::PushConstantRange ui_push = {
+        .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        .offset = 0,
+        .size = 2 * sizeof(u32),
+    };
+    auto [ui_layout_result, ui_pipe_layout] = device.createPipelineLayoutUnique({
+        .setLayoutCount = 1,
+        .pSetLayouts = ui_layouts,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &ui_push,
+    });
+    if (ui_layout_result != vk::Result::eSuccess) {
+        return;
+    }
+    ui_layout = std::move(ui_pipe_layout);
+    auto [ui_pipeline_result, ui_pipe] = device.createComputePipelineUnique(
+        {}, vk::ComputePipelineCreateInfo{
+                .stage{
+                    .stage = vk::ShaderStageFlagBits::eCompute,
+                    .module = ui_shader,
+                    .pName = "main",
+                },
+                .layout = *ui_layout,
+            });
+    if (ui_pipeline_result == vk::Result::eSuccess) {
+        ui_pipeline = std::move(ui_pipe);
+    } else {
+        std::fprintf(stderr, "SOTC FSR3 FG: HUD pipeline failed, FSR 3 composes the HUD\n");
+    }
 }
 
 bool Supported() {
@@ -447,9 +505,23 @@ vk::Image Generate(vk::CommandBuffer cmdbuf, u32 frame_id, vk::Image frame_image
         return {};
     }
     Dlssg::FrameInputs in{};
-    if (frame_id >= kMaxFrames || !depth_slots[frame_id].valid ||
-        !Dlssg::GetFrameInputs(frame_id, in) || depth_slots[frame_id].r32.width != in.width ||
+    // SOTC_FSRFG_LOG=1: why game frames were not interpolated, every 300 frames.
+    static u32 why[6]{}; // done, no depth, no inputs, size, reset by the game, gap
+    const auto count = [](u32 reason) {
+        ++why[reason];
+        if (log_level >= 1 && why[0] + why[1] + why[2] + why[3] + why[4] + why[5] >= 300) {
+            std::fprintf(stderr,
+                         "SOTC FSR3 FG frames: %u generated, %u without depth, %u without inputs, "
+                         "%u size, %u reset by the game, %u after a skipped frame\n",
+                         why[0], why[1], why[2], why[3], why[4], why[5]);
+            std::fill(std::begin(why), std::end(why), 0u);
+        }
+    };
+    const bool depth_ok = frame_id < kMaxFrames && depth_slots[frame_id].valid;
+    const bool inputs_ok = depth_ok && Dlssg::GetFrameInputs(frame_id, in);
+    if (!inputs_ok || depth_slots[frame_id].r32.width != in.width ||
         depth_slots[frame_id].r32.height != in.height) {
+        count(!depth_ok ? 1 : !inputs_ok ? 2 : 3);
         history_game_frame = ~0ULL;
         SetState(0);
         return {};
@@ -462,6 +534,7 @@ vk::Image Generate(vk::CommandBuffer cmdbuf, u32 frame_id, vk::Image frame_image
     RetireCompleted(false);
     // Interpolation needs the previous game frame to have gone through FSR 3.
     const bool reset = in.reset || history_game_frame + 1 != game_frames;
+    count(in.reset ? 4 : reset ? 5 : 0);
     history_game_frame = game_frames;
     ++fsr_frame;
 
@@ -567,6 +640,20 @@ vk::Image Generate(vk::CommandBuffer cmdbuf, u32 frame_id, vk::Image frame_image
     prepare.renderHeight = in.height;
     prepare.jitterOffsetX = in.jitter[0];
     prepare.jitterOffsetY = in.jitter[1];
+    // SOTC_FG_JITTER (tests): 0 none, 2 x negated, 3 y negated, 4 both negated; else as DLSS has it.
+    static const int jitter_mode = [] {
+        const char* v = std::getenv("SOTC_FG_JITTER");
+        return v ? std::atoi(v) : 1;
+    }();
+    if (jitter_mode == 0) {
+        prepare.jitterOffsetX = prepare.jitterOffsetY = 0.0f;
+    }
+    if (jitter_mode == 2 || jitter_mode == 4) {
+        prepare.jitterOffsetX = -prepare.jitterOffsetX;
+    }
+    if (jitter_mode == 3 || jitter_mode == 4) {
+        prepare.jitterOffsetY = -prepare.jitterOffsetY;
+    }
     // The game's motion vectors are curUV - prevUV; FSR 3 wants prev - cur, in render pixels
     // before its 1 / render size.
     prepare.motionVectorScaleX = -static_cast<float>(in.width);
@@ -609,6 +696,46 @@ vk::Image Generate(vk::CommandBuffer cmdbuf, u32 frame_id, vk::Image frame_image
         dispatch.frameId = fsr_frame;
         dispatch.reset = prepare.reset;
         r = ffxVkFsr3_3_1_6FrameGenerationContextRecordDispatch(context, &dispatch);
+    }
+    // sotc: the HUD from the game frame, whole (fg_ui.comp). SOTC_FG_UI_COPY=0: FSR 3's own
+    // HUD composition only.
+    static const bool ui_copy = [] {
+        const char* v = std::getenv("SOTC_FG_UI_COPY");
+        return !v || v[0] != '0';
+    }();
+    if (r == FFX_VK_FSR3_3_1_6_FRAMEGEN_OK && hudless_image && ui_copy && ui_pipeline) {
+        const auto fsr_written = Barrier(output.image, vk::PipelineStageFlagBits2::eAllCommands,
+                                         vk::AccessFlagBits2::eMemoryWrite,
+                                         vk::ImageLayout::eGeneral,
+                                         vk::PipelineStageFlagBits2::eComputeShader,
+                                         vk::AccessFlagBits2::eShaderStorageRead |
+                                             vk::AccessFlagBits2::eShaderStorageWrite,
+                                         vk::ImageLayout::eGeneral);
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .imageMemoryBarrierCount = 1,
+            .pImageMemoryBarriers = &fsr_written,
+        });
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *ui_pipeline);
+        const std::array infos{
+            vk::DescriptorImageInfo{.imageView = color.view, .imageLayout = vk::ImageLayout::eGeneral},
+            vk::DescriptorImageInfo{.imageView = hudless_color.view,
+                                    .imageLayout = vk::ImageLayout::eGeneral},
+            vk::DescriptorImageInfo{.imageView = output.view, .imageLayout = vk::ImageLayout::eGeneral},
+        };
+        std::array<vk::WriteDescriptorSet, 3> writes{};
+        for (u32 i = 0; i < writes.size(); ++i) {
+            writes[i] = {
+                .dstBinding = i,
+                .descriptorCount = 1,
+                .descriptorType = vk::DescriptorType::eStorageImage,
+                .pImageInfo = &infos[i],
+            };
+        }
+        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *ui_layout, 0, writes);
+        const u32 params[2] = {width, height};
+        cmdbuf.pushConstants(*ui_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params),
+                             params);
+        cmdbuf.dispatch((width + 7) / 8, (height + 7) / 8, 1);
     }
     if (r != FFX_VK_FSR3_3_1_6_FRAMEGEN_OK) {
         static u32 errors = 0;

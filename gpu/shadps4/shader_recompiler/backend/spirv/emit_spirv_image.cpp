@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
 #include <boost/container/static_vector.hpp>
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
@@ -163,8 +164,43 @@ Id EmitImageSampleRaw(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address1,
     UNREACHABLE_MSG("Unreachable instruction");
 }
 
+// sotc: one T# dword of the image, from the flat buffer (or the compiled-in immediate).
+static Id LoadTsharpDword(EmitContext& ctx, const ImageResource& desc, u32 dw) {
+    const auto& fetch = desc.sharp_fetch;
+    if (fetch.summary == SharpFetch<AmdGpu::Image>::Summary::SingleLoad) {
+        return ctx.EmitFlatbufferLoad(ctx.ConstU32(u32(fetch.offsets[0]) + dw));
+    }
+    if (fetch.load_mask & (1u << dw)) {
+        return ctx.EmitFlatbufferLoad(ctx.ConstU32(u32(fetch.offsets[dw])));
+    }
+    return ctx.ConstU32(fetch.immediates[dw]);
+}
+
+// sotc: reports the mip this sample reads to the LOD feedback buffer (sotc_lod_stats.h). 2D
+// textures with a full 8-dword T# only (the counter bank lives in dword 6).
+static void EmitLodFeedback(EmitContext& ctx, u32 handle, Id coords) {
+    if (!ctx.info.uses_lod_feedback) {
+        return;
+    }
+    const auto& desc = ctx.info.images[handle & 0xFFFF];
+    const auto& texture = ctx.images[handle & 0xFFFF];
+    if (desc.is_r128 || desc.array_size != 0 || desc.is_written ||
+        desc.sharp_fetch.summary == SharpFetch<AmdGpu::Image>::Summary::Invalid ||
+        (texture.view_type != AmdGpu::ImageType::Color2D &&
+         texture.view_type != AmdGpu::ImageType::Color2DArray)) {
+        return;
+    }
+    const Id uv = ctx.OpCompositeConstruct(ctx.F32[2],
+                                           ctx.OpCompositeExtract(ctx.F32[1], coords, 0U),
+                                           ctx.OpCompositeExtract(ctx.F32[1], coords, 1U));
+    const std::array<Id, 4> args{LoadTsharpDword(ctx, desc, 2), LoadTsharpDword(ctx, desc, 3),
+                                 LoadTsharpDword(ctx, desc, 6), uv};
+    ctx.OpFunctionCall(ctx.void_id, ctx.lod_feedback, args);
+}
+
 Id EmitImageSampleImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id bias,
                               const IR::Value& offset) {
+    EmitLodFeedback(ctx, handle, coords);
     const auto& texture = ctx.images[handle & 0xFFFF];
     const Id image = LoadImage(ctx, inst, texture);
     const Id result_type = texture.data_types->Get(4);
@@ -197,6 +233,7 @@ Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id c
 
 Id EmitImageSampleDrefImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id dref,
                                   Id bias, const IR::Value& offset) {
+    EmitLodFeedback(ctx, handle, coords);
     const auto& texture = ctx.images[handle & 0xFFFF];
     const Id image = LoadImage(ctx, inst, texture);
     const Id result_type = texture.data_types->Get(1);

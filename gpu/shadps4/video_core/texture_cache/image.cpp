@@ -4,6 +4,12 @@
 #include <mutex>
 #include <optional>
 #include <cstdlib>
+#include <vector>
+#include <string>
+#include <map>
+#include <cstdio>
+#include <chrono>
+#include <algorithm>
 #include <ranges>
 #include <unordered_map>
 #include "common/assert.h"
@@ -307,6 +313,30 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
     return (*slot_image_views)[view_id];
 }
 
+
+// sotc: GCN does not order UAV writes between draws by itself; the game inserts an end-of-pipe label
+// where it needs the writes visible. A GENERAL image that was written and is used again with the
+// same access therefore only needs the barrier once per fence epoch (the first use after a label),
+// not before every draw: each of those barriers ends the dynamic render pass (~20k/s in the Shrine).
+// SOTC_GENERAL_SYNC=0 restores a barrier at every use.
+u64 g_sotc_fence_epoch = 0;
+
+static bool SkipSameGeneral(Image& image, vk::ImageLayout a, vk::ImageLayout b, vk::AccessFlags2 ma,
+                            vk::AccessFlags2 mb) {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_GENERAL_SYNC");
+        return !(v && v[0] == '0');
+    }();
+    if (!on || a != vk::ImageLayout::eGeneral || b != a || ma != mb) {
+        return false;
+    }
+    if (image.general_epoch == g_sotc_fence_epoch) {
+        return true;
+    }
+    image.general_epoch = g_sotc_fence_epoch;
+    return false;
+}
+
 void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                         vk::PipelineStageFlags2 dst_stage,
                         std::optional<SubresourceRange> subres_range) {
@@ -350,7 +380,8 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                                              vk::AccessFlagBits2::eShaderWrite |
                                              vk::AccessFlagBits2::eMemoryWrite;
                 const bool is_write = static_cast<bool>(state.access_mask & write_flags);
-                if (state.layout != dst_layout || state.access_mask != dst_mask || is_write) {
+                if (state.layout != dst_layout || state.access_mask != dst_mask ||
+                    (is_write && !SkipSameGeneral(*this, state.layout, dst_layout, state.access_mask, dst_mask))) {
                     barriers.emplace_back(vk::ImageMemoryBarrier2{
                         .srcStageMask = state.pl_stage,
                         .srcAccessMask = state.access_mask,
@@ -384,7 +415,8 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                                      vk::AccessFlagBits2::eShaderWrite |
                                      vk::AccessFlagBits2::eMemoryWrite;
         const bool is_write = static_cast<bool>(last_state.access_mask & write_flags);
-        if (last_state.layout == dst_layout && last_state.access_mask == dst_mask && !is_write) {
+        if (last_state.layout == dst_layout && last_state.access_mask == dst_mask &&
+            (!is_write || SkipSameGeneral(*this, last_state.layout, dst_layout, last_state.access_mask, dst_mask))) {
             return;
         }
         barriers.emplace_back(vk::ImageMemoryBarrier2{

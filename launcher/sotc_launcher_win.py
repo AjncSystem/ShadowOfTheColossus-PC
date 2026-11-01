@@ -160,12 +160,12 @@ def windows_language():
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
                 'user_dir': '', 'af16': True, 'textures': 'high', 'hdr': False, 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
-                'readbacks': '', 'extra_env': '', 'close_on_play': False, 'skip_logos': False, 'gamepad': '',
+                'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'rb_hot': True, 'skip_logos': False, 'skip_film': False, 'close_on_play': False, 'gamepad': '', 'rumble': True,
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
                 'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'volume': '100', 'shadow_reuse': '0', 'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1', 'weed_distance': '1', 'weed_height': '1', 'grass_fade': '1', 'grass_detail': '0.25', 'library_dirs': [], 'keys': {},
-                'auto_setup': True, 'dlc_dir': '', 'framegen': 'off',
+                'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'fg_hudless': False,
                 'dlss_mode': 'quality', 'dlss_sharpen': '0', 'dlss_ui_sharpen': '3', 'dlss_sky_sharpen': '2',
                 'dlss_compare': False,
                 'check_updates': True, 'skip_version': ''}
@@ -299,18 +299,19 @@ FPS_MODES = [('30', ('30 FPS (como no PS4)', '30 FPS (as on PS4)')),
 # game's page pool is low) or maximum (always fine; may close in very wide views in PS4 Pro mode).
 TEXTURES = [('off', ('Desligada', 'Off')),
             ('high', ('Alta (estável)', 'High (stable)')),
-            ('max', ('Máxima (nítida, pode fechar no modo Pro)', 'Maximum (sharp, may close in Pro mode)'))]
+            ('max', ('Máxima (nítida, experimental no modo Pro)', 'Maximum (sharp, experimental in Pro mode)'))]
 # Frame generation (bb-probe: SOTC_FRAMEGEN; F8 in game switches off / DLSS-G / FSR 3).
 FRAMEGEN = [('off', ('Desligada', 'Off')),
             ('auto', ('Automática (DLSS-G ou FSR 3, experimental)', 'Automatic (DLSS-G or FSR 3, experimental)')),
             ('dlss', ('NVIDIA DLSS-G (RTX 40/50)', 'NVIDIA DLSS-G (RTX 40/50)')),
-            ('fsr', ('AMD FSR 3 (experimental)', 'AMD FSR 3 (experimental)'))]
+            ('fsr', ('AMD FSR 3 (qualquer placa)', 'AMD FSR 3 (any GPU)'))]
 # DLSS super resolution (bb-probe: SOTC_UPSCALER=dlss): the game renders at the output size
 # divided by the mode's factor and DLSS picks its mode from that ratio (vk_dlssg.cpp).
 DLSS_MODES = [('quality', ('Qualidade (1,5×)', 'Quality (1.5×)')),
               ('balanced', ('Equilibrado (1,72×)', 'Balanced (1.72×)')),
-              ('performance', ('Desempenho (2×)', 'Performance (2×)'))]
-DLSS_FACTORS = {'quality': 1.5, 'balanced': 1.724, 'performance': 2.0}
+              ('performance', ('Desempenho (2×)', 'Performance (2×)')),
+              ('ultra', ('Ultra Desempenho (3×)', 'Ultra Performance (3×)'))]
+DLSS_FACTORS = {'quality': 1.5, 'balanced': 1.724, 'performance': 2.0, 'ultra': 3.0}
 # RCAS after DLSS (SOTC_DLSS_SHARPEN, attenuation in stops: 0 = sharpest).
 DLSS_SHARPNESS = [('0', ('Alta (padrão)', 'High (default)')), ('0.5', ('Média', 'Medium')), ('1', ('Baixa', 'Low')),
                   ('off', ('Desligada', 'Off'))]
@@ -633,8 +634,6 @@ def game_environment(s):
         # From Pink-shadPS4: no GPU index-buffer culling (always both), same image, far fewer
         # GPU results the CPU has to wait for.
         cvars += ['doIndexBufferCulling=0', 'doSunShadowIndexBufferCulling=0']
-    if s.get('skip_logos'):
-        cvars.append('skipSplash=1')
     grass = str(s.get('grass_shadows') or '2')
     if grass in ('3', '4'):
         # Every mode's copy: the game takes the one of its graphics mode (PS4 Pro Cinematic has 3).
@@ -643,6 +642,13 @@ def game_environment(s):
     fade = str(s.get('grass_fade') or '1')
     if fade in ('0.5', '0.75', '2', '3'):
         cvars.append(f'r_virtualGeometryFadeMultiplier={fade}')
+    if s.get('skip_logos'):
+        # The engine cvar skipSplash=1: no opening logos and autosave notice (tabnul, AjncSystem #185).
+        cvars.append('skipSplash=1')
+    if s.get('skip_film'):
+        # +nointro: the engine's developer switch (it also sets it when a button is held at start):
+        # no intro film and no title screen, the game goes straight in (user, 26 Oct).
+        cvars.append('nointro')
     cvars += str(s.get('engine_cvars', '')).split()
     # Tools (tools/sotc_route.py --boss) add cvars for one run without editing the settings.
     cvars += os.environ.get('SOTC_EXTRA_CVARS', '').split()
@@ -669,15 +675,18 @@ def game_environment(s):
     if s.get('neo') and env['SOTC_NEO'] == '0':
         env['SOTC_NOTE'] = f"{env['SOTC_OUTPUT_RES']} is wider than 16:9: PS4 Pro mode off (it renders 16:9 only)"
     env['SOTC_FRAMEGEN'] = s.get('framegen') or 'off'
+    if s.get('fg_hudless'):  # Lucas-blip-png's option (#206, #210)
+        env['SOTC_FG_HUDLESS'] = '1'
     # sotc: high quality textures: the texture banks sampled since the last report read as sampled
     # (sotc_lod_stats.h; before, none ever did and the game never streamed its fine mips: blurry
     # leaves and rocks). Off: the old behaviour, for cards short of video memory.
     textures = s.get('textures') or 'high'
     if textures != 'off':
         env.setdefault('SOTC_LOD_LINGER', '1')
-    if textures == 'max' and env['SOTC_NEO'] == '1':
-        # sotc: in PS4 Pro mode "Maximum" exhausted the game's page pool within minutes at the
-        # Shrine (0x1a371, user, 22 Oct): High there.
+    # sotc: "Maximum" in PS4 Pro mode exhausted the game's page pool within minutes at the Shrine
+    # (0x1a371, 22 Oct) until tabnul's page allocator fix (PR #288, sotc_modes.py POOL_FIX): an
+    # hour without a crash with it (26 Oct). Experimental there; SOTC_MAX_IN_PRO=0 brings back High.
+    if 'SOTC_MAX_IN_PRO=0' in str(s.get('extra_env', '')) and textures == 'max' and env['SOTC_NEO'] == '1':
         textures = 'high'
         env['SOTC_NOTE'] = 'Texture quality Maximum is not used in PS4 Pro mode: High'
     if textures == 'max':  # sotc: without the page pool switch (sotc_lod_stats.h)
@@ -685,9 +694,8 @@ def game_environment(s):
     if s.get('button_icons') == 'xbox' and (PORT_DIR / 'glyphs' / 'xbox').is_dir():
         env['SOTC_TEX_REPLACE'] = str(PORT_DIR / 'glyphs' / 'xbox')
     env['SOTC_UI_LANG'] = s.get('ui_language') or windows_language()  # overlay and F7/F8 texts
-    # The game renders at the output size (sotc.py scales it down above about 4.2 million pixels; the
-    # upscaler takes it to the output). 720p renders at 1080p, as on PS4; the PS4 Pro path keeps its
-    # own sizes.
+    # The game renders at the output size. 720p renders at 1080p, as on PS4; the PS4 Pro path keeps
+    # its own sizes.
     output = env['SOTC_OUTPUT_RES']
     upscaler = s.get('upscaler', 'fsr1')
     if upscaler == 'dlss' and env['SOTC_NEO'] == '0':
@@ -712,8 +720,19 @@ def game_environment(s):
     env['SOTC_MOUSE'] = '1' if s.get('mouse', True) else '0'
     env['SOTC_MOUSE_SENS'] = str(s.get('mouse_sens') or '1.0')
     env['SOTC_MOUSE_INVERT'] = '1' if s.get('mouse_invert') else '0'
+    # Hot readbacks (buffer_cache.cpp GatherDownloads): ~25% more FPS at the Shrine. On by default
+    # in this fork: the late check and per-page region locks keep them off reused memory.
+    env['SOTC_RB_HOT'] = '1' if s.get('rb_hot', True) else '0'
+    # Bluepoint's debug menu (+RetailBuild=0 served by the port; the game files are not touched).
+    if s.get('debug_menu'):
+        env['SOTC_DEBUG_MENU'] = '1'
+    # The texture memory watch (events.log lines "Vigia: ..."), for bug reports.
+    if s.get('debug_watch'):
+        env['SOTC_POOL_WATCH'] = '1'
     if str(s.get('gamepad', '')).strip():
         env['BB_GAMEPAD'] = str(s['gamepad']).strip()
+    if not s.get('rumble', True):
+        env['SOTC_RUMBLE'] = '0'
     env['BB_CONFIG'] = str(PORT_DIR / 'sotc.ini')
     for item in str(s['extra_env']).split():
         if '=' in item:
@@ -1026,7 +1045,7 @@ class Launcher:
         self.nav, self.current_page = {}, None
         for name, title in (('play', _('Jogar', 'Play')), ('game', _('Jogo e saves', 'Game & saves')),
                             ('graphics', _('Imagem e FPS', 'Display & FPS')), ('controls', _('Controles', 'Controls')),
-                            ('advanced', _('Avançado', 'Advanced'))):
+                            ('advanced', _('Avançado', 'Advanced')), ('debug', _('Debug', 'Debug'))):
             item = tk.Label(side, text='    ' + title, bg=BG, fg=TEXT, anchor='w', font=(ui_font(), 11),
                             pady=10, cursor='hand2')
             item.pack(fill='x')
@@ -1063,6 +1082,7 @@ class Launcher:
         self.build_graphics()
         self.build_controls()
         self.build_advanced()
+        self.build_debug()
         self.build_log()
         self.root.bind_all('<MouseWheel>', self.wheel)
         self.refresh_status()
@@ -1115,6 +1135,8 @@ class Launcher:
         self.check(quick, 'hdr', _('HDR (HDR do Windows ligado)', 'HDR (Windows HDR on)'))
         self.check(quick, 'fullscreen', _('Tela cheia', 'Fullscreen'))
         self.check(quick, 'neo', _('Modo PS4 Pro', 'PS4 Pro mode'))
+        self.check(quick, 'rb_hot', _('Mais FPS: leituras rápidas da GPU (experimental)',
+                                      'More FPS: fast GPU readbacks (experimental)'))
         for key in ('af16', 'textures', 'fps_mode', 'hdr', 'fullscreen', 'neo', 'output_res', 'upscaler', 'sharpness', 'framegen'):
             self.vars[key].trace_add('write', lambda *_a: self.refresh_status())
 
@@ -1283,21 +1305,27 @@ class Launcher:
         self.check(f, 'hdr', _('HDR', 'HDR'),
                    _('Saída HDR10 e a renderização HDR do jogo. Ligue o HDR do Windows antes de jogar.',
                      'HDR10 output and the game\'s HDR rendering. Turn on Windows HDR before playing.'))
+        self.check(f, 'fg_hudless', _('Geração de quadros sem a interface (experimental)',
+                                      'Frame generation without the interface (experimental)'),
+                   _('Gera os quadros intermediários só com a cena e põe a interface por cima, sem interpolá-la: '
+                     'tira o tremor das barras de vida e stamina e das letras. Pode desbotar o logo na tela '
+                     'de título e mostrar a cena antiga atrás das telas de carregamento.',
+                     'Generates the in-between frames from the scene only and draws the interface on top, '
+                     'uninterpolated: removes the shaking health/stamina bars and text. It can fade the '
+                     'logo on the title screen and show the old scene behind loading screens.'))
         self.window_icon_row(f)
         self.section(f, _('Resolução', 'Resolution'))
         self.row(f, _('Saída', 'Output'), self.choice(f, 'output_res', OUTPUTS),
-                 _('O jogo renderiza nesse tamanho; acima de cerca de 4,2 milhões de pixels (4K, 3440 × 1440) num '
-                   'tamanho menor, que o upscaler amplia: maior que isso, os detalhes finos das texturas somem. '
+                 _('O jogo renderiza nesse tamanho. '
                    'Mais largo que 16:9 (21:9, 32:9) mostra mais dos lados (Hor+), sem esticar; menus e vídeos '
                    'podem ficar esticados. 720p renderiza em 1080p; o modo PS4 Pro usa os tamanhos do Pro. '
                    'Num monitor menor que a saída, a janela cabe na tela e a tela cheia usa o monitor todo.',
-                   'The game renders at this size; above about 4.2 million pixels (4K, 3440 × 1440) at a smaller '
-                   'size that the upscaler enlarges: larger than that, the fine texture detail disappears. Wider '
+                   'The game renders at this size. Wider '
                    'than 16:9 (21:9, 32:9) shows more at the sides (Hor+), not stretched; menus and videos may '
                    'look stretched. 720p renders at 1080p; PS4 Pro mode uses the Pro sizes. On a monitor smaller '
                    'than the output the window fits the screen and fullscreen uses the whole monitor.'))
         self.row(f, _('Upscaler', 'Upscaler'), self.choice(f, 'upscaler', UPSCALERS),
-                 _('FSR 1 amplia com bordas nítidas (acima de 1080p).', 'FSR 1 upscales with sharp edges (above 1080p).'))
+                 _('FSR 1 amplia com bordas nítidas (quando o jogo renderiza menor que a saída).', 'FSR 1 upscales with sharp edges (when the game renders smaller than the output).'))
         self.row(f, _('Nitidez (RCAS)', 'Sharpening (RCAS)'), self.choice(f, 'sharpness', SHARPNESS))
         self.section(f, _('NVIDIA DLSS', 'NVIDIA DLSS'))
         self.note(f, _('Com o upscaler DLSS (placas RTX): o jogo renderiza menor e o DLSS amplia com detalhe '
@@ -1429,6 +1457,9 @@ class Launcher:
         self.row(f, _('Controle preferido', 'Preferred gamepad'), ttk.Entry(f, textvariable=self.var('gamepad'), width=30),
                  _('Nome (ou parte) do controle a usar quando houver vários; vazio = o primeiro.',
                    'Name (or part of it) of the gamepad to use when several are connected; empty = the first.'))
+        self.check(f, 'rumble', _('Vibração do controle', 'Controller vibration'),
+                   _('Desmarque para o controle não vibrar. Vale na próxima vez que o jogo abrir.',
+                     'Clear it to stop the gamepad from rumbling. Applies the next time the game starts.'))
         self.section(f, _('Mouse', 'Mouse'))
         self.check(f, 'mouse', _('Câmera no mouse', 'Mouse camera'),
                    _('Clique na janela do jogo para capturar o mouse; Esc solta. Botão esquerdo = R1 (agarrar), '
@@ -1505,6 +1536,42 @@ class Launcher:
         window.bind('<KeyPress>', pressed)
         window.grab_set()
         window.focus_force()
+
+    def build_debug(self):
+        f = self.scrolled_page('debug', _('Debug', 'Debug'),
+                               _('Ferramentas de teste. Valem a partir da próxima abertura do jogo.',
+                                 'Test tools. They apply the next time the game starts.'))
+        self.section(f, _('Menu de debug do jogo', "The game's debug menu"), top=4)
+        self.check(f, 'debug_menu', _('Ligar o menu de debug (F6 ou Start+Select no jogo)', 'Enable the debug menu (F6 or Start+Select in game)'),
+                   _('O menu de testes da Bluepoint: carregador de áreas, câmera livre, estatísticas e opções de '
+                     'desenvolvedor. Os arquivos do jogo não são alterados. O jogo pode ficar menos estável com '
+                     'ele ligado: desligue para jogar normalmente.',
+                     "Bluepoint's test menu: area loader, free camera, statistics and developer options. The "
+                     'game files are not changed. The game can be less stable with it on: turn it off to play '
+                     'normally.'))
+        self.check(f, 'skip_logos', _('Pular os logotipos de abertura', 'Skip the opening logos'),
+                   _('Sem os logotipos (Sony, Japan Studio, Bluepoint) e o aviso de salvamento automático.',
+                     'No logos (Sony, Japan Studio, Bluepoint) and no autosave notice.'))
+        self.check(f, 'skip_film', _('Ir direto para o jogo (pula o filme e a tela Start)',
+                                     'Straight into the game (skips the film and the Start screen)'),
+                   _('A chave de desenvolvedor do jogo (+nointro): sem o filme e sem a tela de título. Para só '
+                     'pular o filme e parar na tela Start, deixe desligada e aperte um botão durante o filme.',
+                     "The game's developer switch (+nointro): no film and no title screen. To skip only the film "
+                     'and stop at the Start screen, leave it off and press a button during the film.'))
+        self.section(f, _('Diagnóstico', 'Diagnostics'))
+        self.check(f, 'debug_watch', _('Vigia da memória de texturas', 'Texture memory watch'),
+                   _('Anota em user/events.log quando o jogo reaproveita memória de texturas ainda em uso. '
+                     'Útil para relatar texturas com lixo colorido.',
+                     'Writes to user/events.log when the game reuses memory of textures still in use. Useful '
+                     'when reporting colour garbage on textures.'))
+        self.section(f, _('Teclas no jogo', 'In-game keys'))
+        for key, text in (('F5', _('Salva as texturas do quadro atual em user/log/texcap_N',
+                                    'Saves the textures of the current frame to user/log/texcap_N')),
+                          ('F6 / Start+Select', _('Abre o menu de debug (com a opção acima ligada)',
+                                   'Opens the debug menu (with the option above on)')),
+                          ('F9', _('Recarrega todas as texturas da memória do jogo (com "Comparar DLSS" ligado: troca DLSS / FSR 1)',
+                                   'Reloads every texture from game memory (with "Compare DLSS" on: switches DLSS / FSR 1)'))):
+            self.row(f, key, self.ttk.Label(f, text=text))
 
     def build_advanced(self):
         ttk = self.ttk
@@ -2114,7 +2181,7 @@ class Launcher:
         self.output.put((code,))
 
     # Quick settings the in-game menu may have changed (it writes them to the settings file).
-    LIVE_KEYS = ('fps_mode', 'framegen', 'textures', 'shadow_reuse', 'volume', 'upscaler', 'sharpness')
+    LIVE_KEYS = ('fps_mode', 'framegen', 'textures', 'shadow_reuse', 'volume', 'upscaler', 'sharpness', 'rumble')
 
     def reload_live_settings(self):
         saved = load_json(CONFIG_FILE, {})

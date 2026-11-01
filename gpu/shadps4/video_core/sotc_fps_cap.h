@@ -48,8 +48,10 @@ inline int EffectiveRate() {
     if (uncapped.load(std::memory_order_relaxed)) {
         return 0;
     }
+    // sotc: capped means 30 FPS even when the game asks for no limit (rate 0: PS4 Pro mode, or its
+    // 60 FPS target): "30" in the menu or on F7 had no effect there (user, 27 Oct, 42 FPS at "30").
     const int rate = game_rate.load(std::memory_order_relaxed);
-    return rate >= 0 ? rate : 1;
+    return rate > 0 ? rate : 1;
 }
 
 /// fps60game mode (scripts/sotc_modes.py): where the engine keeps the pointer to its

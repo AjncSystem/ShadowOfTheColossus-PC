@@ -326,7 +326,8 @@ public:
     void InvalidateMemory(VAddr addr, size_t size);
 
     /// Marks an image as dirty if it exists at the provided address.
-    void InvalidateMemoryFromGPU(VAddr address, size_t max_size);
+    /// sotc: any_overlap marks every image overlapping the range (DMA copies and fills).
+    void InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool any_overlap = false);
 
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
@@ -640,6 +641,9 @@ private:
 
     /// sotc: image memory by class, every 5 s with SOTC_FPS (telemetry only).
     void Census();
+    /// sotc: SOTC_POOL_WATCH=1: logs game page pool pages freed under images still in use.
+    void PoolWatch();
+    static bool PoolWatchEnabled();
 
     /// sotc: mip-tail images (SOTC_MIP_TAIL), see DecideRebase.
     bool IsSafeToDelete(const Image& image) const;
@@ -699,6 +703,7 @@ private:
         u64 generation{~0ULL};
         ImageId image_id{};
         u64 gpu_epoch{};
+        u64 image_uid{}; ///< sotc: the image the slot held when memoized (slots are reused)
     };
     static constexpr size_t NumFindMemos = 1024;
     std::array<FindMemo, NumFindMemos> find_memos{};

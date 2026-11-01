@@ -130,6 +130,8 @@ struct Info : InfoPersistent {
     bool has_image_gather{};
     bool has_image_query{};
     bool has_flatbuf{};
+    /// sotc: implicit-LOD samples report their mip to the LOD feedback buffer (sotc_lod_stats.h)
+    bool uses_lod_feedback{};
     bool uses_buffer_atomic_float_min_max{};
     bool uses_image_atomic_float_min_max{};
     bool uses_lane_id{};
@@ -249,5 +251,9 @@ DECLARE_ENUM_FLAG_OPERATORS(Info::ReadConstType);
 
 /// Per-game dynamic_tsharp_array_size, clamped to 64 elements (0 = off)
 u32 DynamicTsharpArraySize();
+
+/// sotc: fragment shaders measure the mip their streamed textures are sampled at, as the
+/// hardware's LOD counters do (sotc_lod_stats.h). SOTC_LOD_FEEDBACK=1 turns it on.
+bool LodFeedbackEnabled();
 
 } // namespace Shader

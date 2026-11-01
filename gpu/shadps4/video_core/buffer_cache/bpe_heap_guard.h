@@ -69,7 +69,7 @@ private:
     bool Read(VAddr addr, void* out, u64 size) const;
     bool IsHeapPointer(VAddr addr) const;
     void AddFreeBlock(VAddr block);
-    void CollectFreeTree();
+    size_t CollectFreeTree(); // returns the blocks added before duplicates were removed
     void CollectHeaders(VAddr lo, VAddr hi, std::vector<Span>& spans) const;
     bool NextBlock(VAddr block, VAddr& next) const;
 
@@ -102,6 +102,10 @@ public:
 
     /// True when [addr, end) lies in the user area of a remembered block that is still in use
     bool Covers(VAddr heap, VAddr addr, VAddr end, int* why = nullptr);
+
+    /// sotc: true (and remembered) when addr is the user pointer of an in-use block that holds
+    /// [addr, end): its header right before addr, checked as Covers checks a remembered one
+    bool TryUserPointer(VAddr heap, VAddr addr, VAddr end);
 
     void Add(VAddr block, VAddr next);
 

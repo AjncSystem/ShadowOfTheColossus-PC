@@ -1,22 +1,98 @@
 # Changelog
 
-## 0.60.6-opt11 — 2026-10-24 (fork do Oussama268)
-- **+25% de FPS no Santuário e quadros mais estáveis:** as leituras antecipadas da GPU
-  ("hot readbacks", da fusão de 8/10) voltam ligadas por padrão (`SOTC_RB_HOT=1`; `=0` desliga).
-  Antes de escrever, cada página é conferida sob a trava da sua região: se o jogo já escreveu
-  nela, a cópia é pulada. Era a corrida que deixava o arco-íris nas texturas na 0.60.5.
-  Santuário 34,6 → 43,3 FPS, demonstração da tela título 54 → 60,7.
-- Descritores reaproveitados ligados por padrão (`SOTC_FAST_BIND`, `=0` desliga).
-- Correções do tabnul: grama, HDR, menu do DLSS, pular os logos (#91, #92, #94, #96).
-- Lançador: aviso de pouca memória (#95).
-- Do upstream #258 (JihedMrouki): o cache de shaders confere se o arquivo existe, dica de
-  trabalho na fila do Liverpool, posição invariante nos shaders de vértice (GTX 10xx).
-  **O cache de shaders é refeito na primeira abertura.**
-- Diagnóstico: `SOTC_PROFILE_SLOW_MS=<ms>` só guarda amostras dos quadros mais longos que isso.
-- A travada ao cavalgar continua: nos quadros lentos as threads do jogo esperam umas pelas
-  outras (mutex e event flags do próprio jogo) e há cópias de ~200 MB nas trocas de cena.
+## 0.70 — 2026-10-29
+> ⚠️ **Atenção: instale o jogo num SSD (de preferência NVMe).** Cada área nova lê centenas de MB
+> de texturas e modelos da pasta do jogo; num HD as trocas de área travam muito mais e podem
+> parar por segundos. Coloque a pasta do jogo (o dump) e, se puder, a pasta do port num SSD.
 
-### Versão americana (CUSA08034)
+- **Trocas de área sem o FPS cair perto de zero.** Antes, cada troca de área derrubava o FPS e às
+  vezes forçava telas de carregamento de 1–3 s; o pior quadro passava de meio segundo (534 ms).
+  Agora o pior fica em 58–75 ms, sem tela de carregamento forçada, e o final do jogo vai até os
+  créditos. Ainda se perdem 1–6 quadros em cada troca: é o próximo trabalho. As causas eram a
+  trava da tabela de memória do jogo, cópias de memória remapeando gigabytes, a busca de regiões
+  da GPU refeita a cada escrita, a proteção da memória do jogo percorrendo o mesmo trecho
+  milhares de vezes e muitas texturas novas num quadro só. Agora entram no máximo 32 MB de
+  texturas novas grandes por quadro, e as que ficam para o quadro seguinte aparecem pretas por
+  um instante. Cada correção tem uma chave para desligar (`SOTC_LOCK_WAKE=0`,
+  `SOTC_VIEW_CHUNK_MB=0`, `SOTC_REGION_LOG=0`, `SOTC_REGION_FAST=0`, `SOTC_PROTECT_FAST=0`,
+  `SOTC_WRITE_FAST=0`, `SOTC_BATCH_SPLIT=0`, `SOTC_GUARD_DEDUP=0`, `SOTC_UPLOAD_BUDGET_MB=0`).
+- **Queda rara no alocador do jogo depois de uma carga** (`0x49800`): dois atalhos da proteção da
+  memória do jogo podiam deixar a GPU escrever num bloco que o jogo acabava de liberar. Saem
+  desligados (`SOTC_GUARD_STALE=1` e `SOTC_GUARD_USER_POINTER=1` ligam). Uma sessão de 36 min com
+  6 carregamentos sem queda; se cair, mande o log.
+- **DLSS no modo PS4 Pro a 30 FPS sem a imagem tremer:** o quadro repetido mostrava a imagem sem
+  DLSS.
+- **Geração de quadros (F8) com FSR 1: o HUD fica parado.**
+- **LOD feedback** (`SOTC_LOD_FEEDBACK=1`, experimental) não custa mais ~7 FPS.
+- Diagnóstico: `SOTC_DRAW_SPLIT=1` (com o FPS na tela) mostra no log onde vai o tempo da thread
+  de desenho.
+
+## 0.60.6-C3 — 2026-10-27
+- **Barra de stamina com DLSS (correção da C2):** a área da barra passou a usar a largura de uma
+  tela de 1080 linhas na proporção da saída (1080 × L/A) em vez da largura de renderização. Com
+  DLSS a renderização é menor (1704x720 em 2560x1080) e a barra amarela voltava a parar longe do
+  círculo; em 16:9 com DLSS sem o modo PS4 Pro a C2 também a quebrava.
+- **Limite de 30 FPS:** "30" (menu F1 ou F7) segura 30 FPS mesmo quando o jogo pede para não
+  limitar (modo PS4 Pro); antes ficava em ~42.
+
+## 0.60.6-C2 — 2026-10-26
+- **Tela larga (21:9, 32:9): barras de vida e stamina certas (#301, #202).** A barra de vida
+  tinha um pedaço cinza a mais e a amarela da stamina parava longe do círculo e enchia ao
+  contrário. O aspecto do objeto de tela do jogo fica 16:9 (o jogo desenha a barra de vida com
+  ele) e dois retângulos de 1920 de largura da interface passam a usar a largura da tela.
+- **Vibração do controle pode ser desligada (#292, Lucas-blip-png):** no lançador (Controles) e
+  no menu F1 (seção Controle), na hora.
+- **Mais FPS no Santuário (Lucas-blip-png):** a barreira de imagens de armazenamento GENERAL é
+  feita uma vez por fence em vez de antes de cada desenho (cada uma encerrava o passe de
+  renderização, ~20 mil por segundo), e o buffer de profundidade lido enquanto o stencil é escrito
+  fica num layout só. `SOTC_GENERAL_SYNC=0` / `SOTC_DEPTH_RO=0` desligam.
+- **Geração de quadros sem a interface (opção do Lucas-blip-png, experimental):** Imagem e FPS →
+  "Geração de quadros sem a interface". As letras e as barras não tremem mais com o FSR 3
+  (funciona também no modo PS4 Pro). Pode desbotar o logo da tela de título.
+- **DLSS Ultra Desempenho (3×) (#306)**; o DLSS só amplia 2× + FSR 1 quando nenhum modo aceita a
+  escala (modo Pro em 4K).
+- Testes: `SOTC_RENDER_KEEP`, `SOTC_RENDER_EXTRA` e `SOTC_WIDE_ASPECT` (achar valores de tamanho
+  de tela do jogo).
+
+## 0.60.6-C1 — 2026-10-26
+Versão da comunidade: correções e recursos do tabnul, do Oussama268, do NathanMBR e do
+JihedMrouki, testados com texturas **Máxima + modo PS4 Pro + 60 FPS** (RTX 2060 SUPER).
+
+- **Correção do alocador de páginas do jogo (tabnul, PR #288 / fork #112):** o contador de
+  páginas livres do jogo se descolava do mapa real e o jogo lia antes do início do mapa (queda
+  `0x1a371`). Com a correção e a reserva de memória de texturas em 0 (também no modo PS4 Pro), o
+  streamer não derruba mais todas as texturas para o nível 3 a cada segundo. Resultado: **uma
+  hora em Máxima + Pro sem queda** e quase todo o lixo colorido depois dos carregamentos sumiu.
+- **Textura Máxima no modo PS4 Pro (experimental):** voltou a valer (o lançador trocava por Alta).
+  `SOTC_MAX_IN_PRO=0` volta ao comportamento antigo.
+- **NVIDIA DLSS (RTX 20 ou mais nova), do tabnul (fork PR #81):** o jogo renderiza menor e o
+  DLSS amplia; a interface é desenhada na resolução de saída, TAA do jogo desligado, vinheta
+  depois da ampliação. Novo aqui: **funciona no modo PS4 Pro** (a composição final do Pro tem a
+  cena e a interface em outra ordem e tamanho) e **em 4K** (o DLSS amplia 2x e o FSR 1 completa;
+  antes a tela ficava preta). No menu F1 o upscaler aparece como "NVIDIA DLSS" e só troca no
+  lançador (antes gravava "fsr1" por cima). Arquivos `sl.dlss.dll` e `nvngx_dlss.dll` (NVIDIA
+  Streamline 2.14.16) incluídos.
+- **Grama (tabnul):** distância, altura e detalhe da grama e do mato mudam na hora no menu F1;
+  sombras e esmaecimento da grama no lançador; buffers de grama 4x maiores (a grama distante não
+  some em faixas).
+- **Mais FPS: leituras rápidas da GPU (experimental),** nova opção nos Ajustes rápidos, com a
+  checagem final e o travamento por página do Oussama268 (`SOTC_RB_HOT=1`). Desligada por padrão.
+- **Reutilização de binds** ligada de novo por padrão (Oussama268; a correção do chão de areia
+  foi conferida). Do Oussama268 também: o processador de comandos não espera filas vazias e a
+  memória fria das arenas volta sem esperar a GPU.
+- **Versão americana CUSA08034 (NathanMBR, PR #270)** — detalhes abaixo.
+- **CPUs fracas e GTX 10xx (JihedMrouki, PR #258):** posição invariante nos pipelines com
+  emulação de baricêntricas (diferença de textura/profundidade no chão) e o cache de shaders não lê
+  do disco arquivos que não existem. O cache de shaders é refeito na primeira abertura.
+- **F7** passa por **30 → 60 → ilimitado** (antes só ligava/desligava o limite de 30).
+- **Aba Debug do lançador:** menu de debug da Bluepoint (**F6 ou Start+Select** no controle; o
+  Select sozinho continua abrindo o mapa), **pular os logotipos de abertura**, **ir direto para o
+  jogo** (`+nointro`, pula também a tela Start), vigia da memória de texturas, F5 (captura das
+  texturas do quadro, limitada a 1 GB) e F9 (recarrega as texturas; com "Comparar DLSS" ligado,
+  troca DLSS / FSR 1).
+- Menu F1: sombras e esmaecimento da grama mostram o valor do jogo quando ainda não foram salvos.
+
+### Versão americana (CUSA08034), NathanMBR
 - **O dump americano CUSA08034 (1.00, a única versão americana) funciona.** O executável é o
   mesmo da versão europeia 1.01 (código e dados idênticos byte a byte; os arquivos `.psarc`
   também), então todas as correções, os modos de patch (60 FPS, filtro 16x, tamanho de
@@ -36,6 +112,22 @@
 - Ferramentas (`tools/`) e o modelo de save dos benchmarks aceitam os dois seriais. Testes novos
   (`tests/test_games.py`) falham se algum código voltar a testar um serial só.
 - A versão americana não tem os 3 textos em árabe da atualização europeia 1.01.
+
+## 0.60.6-opt11 — 2026-10-24 (fork do Oussama268)
+- **+25% de FPS no Santuário e quadros mais estáveis:** as leituras antecipadas da GPU
+  ("hot readbacks", da fusão de 8/10) voltam ligadas por padrão (`SOTC_RB_HOT=1`; `=0` desliga).
+  Antes de escrever, cada página é conferida sob a trava da sua região: se o jogo já escreveu
+  nela, a cópia é pulada. Era a corrida que deixava o arco-íris nas texturas na 0.60.5.
+  Santuário 34,6 → 43,3 FPS, demonstração da tela título 54 → 60,7.
+- Descritores reaproveitados ligados por padrão (`SOTC_FAST_BIND`, `=0` desliga).
+- Correções do tabnul: grama, HDR, menu do DLSS, pular os logos (#91, #92, #94, #96).
+- Lançador: aviso de pouca memória (#95).
+- Do upstream #258 (JihedMrouki): o cache de shaders confere se o arquivo existe, dica de
+  trabalho na fila do Liverpool, posição invariante nos shaders de vértice (GTX 10xx).
+  **O cache de shaders é refeito na primeira abertura.**
+- Diagnóstico: `SOTC_PROFILE_SLOW_MS=<ms>` só guarda amostras dos quadros mais longos que isso.
+- A travada ao cavalgar continua: nos quadros lentos as threads do jogo esperam umas pelas
+  outras (mutex e event flags do próprio jogo) e há cópias de ~200 MB nas trocas de cena.
 
 ## 0.60.6 — 2026-10-22
 - **Fim do ruído arco-íris nas texturas e das quedas "do nada" (`0x49500`).** A causa eram as

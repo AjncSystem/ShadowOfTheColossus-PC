@@ -14,6 +14,7 @@
 #include <vector>
 #include <vector>
 #include <algorithm>
+#include <unordered_set>
 #include <filesystem>
 #include <xxhash.h>
 #include "common/path_util.h"
@@ -29,6 +30,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/sotc_guest_memory.h"
 #include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_shadow_scroll.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -72,10 +74,99 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
+    SotcGuestMemory::Init(instance); // sotc: SOTC_PC_MEMORY=1 (docs/sotc/MODELO-MEMORIA-PC.md)
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();
         buffer_cache.SubmitPendingArenaBinds(info);
+    });
+
+    if (Shader::LodFeedbackEnabled()) {
+        sotc_lod_feedback = std::make_unique<VideoCore::Buffer>(
+            instance, 0, SotcLodFeedbackBytes + sizeof(u32), VideoCore::MemoryType::DeviceLocal,
+            "SotC LOD Feedback");
+        runtime.FillBuffer(sotc_lod_feedback.get(), SotcLodFeedbackBytes, sizeof(u32), 1u);
+        sotc_lod_download = std::make_unique<VideoCore::Buffer>(
+            instance, 0, SotcLodFeedbackBytes * SotcLodFeedbackAreas,
+            VideoCore::MemoryType::HostCached, "SotC LOD Feedback Download");
+        runtime.FillBuffer(sotc_lod_feedback.get(), 0u, SotcLodFeedbackBytes, ~0u);
+    }
+}
+
+void Rasterizer::SotcLodFeedbackCycle() {
+    if (!sotc_lod_feedback) {
+        return;
+    }
+    // Every 8 ms is plenty: the game asks for the statistics about once a frame and the banks
+    // stay sampled for a while (SotcLod::Collect).
+    const auto now = std::chrono::steady_clock::now();
+    if (now - sotc_lod_last < std::chrono::milliseconds{8} ||
+        sotc_lod_pending[sotc_lod_area].load(std::memory_order_acquire)) {
+        return;
+    }
+    sotc_lod_last = now;
+    const u32 area = sotc_lod_area;
+    sotc_lod_area = (sotc_lod_area + 1) % SotcLodFeedbackAreas;
+    const vk::Buffer feedback = sotc_lod_feedback->Handle();
+    const auto barrier = [&](vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
+                             vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access) {
+        const vk::BufferMemoryBarrier2 buffer_barrier = {
+            .srcStageMask = src_stage,
+            .srcAccessMask = src_access,
+            .dstStageMask = dst_stage,
+            .dstAccessMask = dst_access,
+            .buffer = feedback,
+            .offset = 0,
+            .size = SotcLodFeedbackBytes + sizeof(u32),
+        };
+        scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
+            .bufferMemoryBarrierCount = 1,
+            .pBufferMemoryBarriers = &buffer_barrier,
+        });
+    };
+    scheduler.EndRendering();
+    const auto cmdbuf = scheduler.CommandBuffer();
+    barrier(vk::PipelineStageFlagBits2::eAllCommands,
+            vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+            vk::PipelineStageFlagBits2::eTransfer,
+            vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite);
+    const vk::BufferCopy copy = {
+        .srcOffset = 0,
+        .dstOffset = area * SotcLodFeedbackBytes,
+        .size = SotcLodFeedbackBytes,
+    };
+    cmdbuf.copyBuffer(feedback, sotc_lod_download->Handle(), copy);
+    barrier(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead,
+            vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite);
+    cmdbuf.fillBuffer(feedback, 0, SotcLodFeedbackBytes, ~0u);
+    // The next cycle measures only when this is the fourth (gate word, DefineLodFeedback).
+    // SOTC_LOD_FB_EVERY=<n>: one cycle in n (1: always).
+    static const u32 every = [] {
+        const char* v = std::getenv("SOTC_LOD_FB_EVERY");
+        const u32 n = v ? static_cast<u32>(std::strtoul(v, nullptr, 0)) : 4u;
+        return n ? n : 1u;
+    }();
+    cmdbuf.fillBuffer(feedback, SotcLodFeedbackBytes, sizeof(u32),
+                      ++sotc_lod_cycles % every == 0 ? 1u : 0u);
+    barrier(vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
+            vk::PipelineStageFlagBits2::eAllCommands,
+            vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+    const vk::MemoryBarrier2 host_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &host_barrier,
+    });
+    sotc_lod_pending[area].store(true, std::memory_order_release);
+    scheduler.DeferOperation([this, area] {
+        sotc_lod_download->Invalidate(area * SotcLodFeedbackBytes, SotcLodFeedbackBytes);
+        SotcLod::MergeGpu(reinterpret_cast<const u32*>(sotc_lod_download->mapped_data.data() +
+                                                       area * SotcLodFeedbackBytes));
+        sotc_lod_pending[area].store(false, std::memory_order_release);
     });
 }
 
@@ -1079,8 +1170,6 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
     if (Dlssg::CapturingInputs()) { // sotc: camera and inputs of DLSS (frame generation, SR)
         Dlssg::NoteDraw(regs, pipeline->GetGraphicsKey().mrt_mask, db_desc.first,
                         cb_descs[4].first, texture_cache, runtime, scheduler);
-    } else if (Dlssg::CameraLogOnly()) {
-        Dlssg::NoteCamera(regs, pipeline->GetGraphicsKey().mrt_mask);
     }
     if (!BindResources(pipeline)) {
         SotcStats::Drop(1, regs.color_buffers[0].Address(), 0);
@@ -1194,8 +1283,6 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (Dlssg::CapturingInputs()) { // sotc: camera and inputs of DLSS (frame generation, SR)
         Dlssg::NoteDraw(liverpool->DrawRegs(), pipeline->GetGraphicsKey().mrt_mask, db_desc.first,
                         cb_descs[4].first, texture_cache, runtime, scheduler);
-    } else if (Dlssg::CameraLogOnly()) {
-        Dlssg::NoteCamera(liverpool->DrawRegs(), pipeline->GetGraphicsKey().mrt_mask);
     }
     if (!BindResources(pipeline)) {
         SotcStats::Drop(1, liverpool->DrawRegs().color_buffers[0].Address(), 1);
@@ -1333,19 +1420,6 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     FlushPeriodic();
 }
 
-// sotc: while DLSS takes the jittered frame (or SOTC_TAA_OFF=1), the game's TAA resolve runs
-// with its history blend off: bit 0 of SRT dword 42. Its other work stays: exposure (the input
-// colour times a scalar from a buffer) and the stencil mask in the output's alpha.
-constexpr u64 kTaaResolveHash = 0xa402ddac;
-constexpr u32 kTaaEnableDword = 42;
-// sotc: the tonemap applies a screen space vignette: 1 + strength * (smoothstep(t) - 1),
-// t = (scale * |uv - 0.5| - start) / (end - start), from flatbuf dwords 51..54. DLSS would drag
-// it along with the scene (dark nested screen borders), so it is applied after upscaling.
-constexpr u64 kTonemapHash = 0x291dbcd0;
-// sotc: the game's HDR composite (UI over scene, ^k, Rec.2020, PQ at 300 nits).
-constexpr u64 kHdrCompositeHash = 0xdfd767b6;
-constexpr u32 kHdrCurveDword = 20; // its exponent k
-constexpr u32 kVignetteDword = 51;
 // sotc: the two grass compute shaders (grass blades; taller weeds). Their flatbufs hold the blade
 // height scale and 7 view distances that thin the grass out in bands.
 struct Vegetation {
@@ -1378,6 +1452,17 @@ static std::array<float, 5> VegetationScales() {
     }
     return s;
 }
+
+// sotc: while DLSS takes the jittered frame (or SOTC_TAA_OFF=1), the game's TAA resolve runs
+// with its history blend off: bit 0 of SRT dword 42. Its other work stays: exposure (the input
+// colour times a scalar from a buffer) and the stencil mask in the output's alpha.
+constexpr u64 kTaaResolveHash = 0xa402ddac;
+constexpr u32 kTaaEnableDword = 42;
+// sotc: the tonemap applies a screen space vignette: 1 + strength * (smoothstep(t) - 1),
+// t = (scale * |uv - 0.5| - start) / (end - start), from flatbuf dwords 51..54. DLSS would drag
+// it along with the scene (dark nested screen borders), so it is applied after upscaling.
+constexpr u64 kTonemapHash = 0x291dbcd0;
+constexpr u32 kVignetteDword = 51;
 
 bool Rasterizer::TaaOff() {
     static const int forced = [] { // SOTC_TAA_OFF=1/0 forces; unset follows DLSS
@@ -1561,6 +1646,8 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
+    SotcGuestMemory::Ready();
+    SotcLodFeedbackCycle();
     buffer_cache.TickFrame();
     texture_cache.ProcessDownloadImages();
     texture_cache.RunGarbageCollector();
@@ -1568,6 +1655,7 @@ void Rasterizer::OnSubmit() {
 }
 
 void Rasterizer::OnFence() {
+    ++VideoCore::g_sotc_fence_epoch;
     texture_cache.ProcessDownloadImages();
 }
 
@@ -1657,6 +1745,7 @@ void Rasterizer::CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dm
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
+    const SotcStats::SplitTimer bind_split{SotcStats::SplitBind};
     fast_bind_hit = false;
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
@@ -1726,6 +1815,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             fast_bind_hit = true;
             SotcStats::fast_bind_hits.fetch_add(1, std::memory_order_relaxed);
             if (fast_bind.uses_dma) {
+                const SotcStats::SplitTimer dma_split{SotcStats::SplitBindDma};
                 buffer_cache.SynchronizeDmaBuffers();
             }
             return true;
@@ -1743,12 +1833,19 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         }
         set_writes.resize(set_writes.size() + stage->buffers.size() + stage->images.size() +
                           stage->samplers.size());
-        BindBuffers(*stage, binding, push_data);
-        BindTextures(*stage, binding);
+        {
+            const SotcStats::SplitTimer buffers_split{SotcStats::SplitBindBuffers};
+            BindBuffers(*stage, binding, push_data);
+        }
+        {
+            const SotcStats::SplitTimer textures_split{SotcStats::SplitBindTextures};
+            BindTextures(*stage, binding);
+        }
         uses_dma |= stage->uses_dma;
     }
 
     if (uses_dma) {
+        const SotcStats::SplitTimer dma_split{SotcStats::SplitBindDma};
         buffer_cache.SynchronizeDmaBuffers();
     }
 
@@ -2071,7 +2168,73 @@ void Rasterizer::MaybeDumpImages(u64 pgm_hash) {
     ++seq;
 }
 
+// sotc: F5 (SotcStats::tex_capture): every sampled image of the next 30000 draws and dispatches
+// is saved once to user/log/texcap_N, named by guest address, size, format, mips and flags, to
+// find which texture shows garbage and where it lives.
+void Rasterizer::CaptureTextures() {
+    static u32 budget = 0, session = 0, count = 0;
+    static std::filesystem::path dir;
+    static std::set<u64> seen;
+    // SOTC_TEXCAP_AFTER=<seconds>: one capture that long after the first draw (tests).
+    static const auto first_draw = std::chrono::steady_clock::now();
+    static long after = [] {
+        const char* v = std::getenv("SOTC_TEXCAP_AFTER");
+        return v ? std::atol(v) : 0L;
+    }();
+    if (after > 0 && std::chrono::steady_clock::now() - first_draw > std::chrono::seconds{after}) {
+        after = 0;
+        SotcStats::tex_capture.store(true, std::memory_order_relaxed);
+    }
+    if (SotcStats::tex_capture.exchange(false, std::memory_order_relaxed)) {
+        budget = 30000;
+        count = 0;
+        seen.clear();
+        dir = Common::FS::GetUserPath(Common::FS::PathType::LogDir) /
+              fmt::format("texcap_{}", ++session);
+        std::filesystem::create_directories(dir);
+        std::fprintf(stderr, "SOTC TEXCAP %u started\n", session);
+    }
+    if (!budget) {
+        return;
+    }
+    if (--budget == 0) {
+        std::fprintf(stderr, "SOTC TEXCAP %u done: %u textures\n", session, count);
+    }
+    for (const auto image_id : bound_images) {
+        if (!image_id || count >= 600) {
+            continue;
+        }
+        auto& image = texture_cache.GetImage(image_id);
+        // At most 64 MiB per image and 1 GiB per capture: each one is downloaded through a
+        // host staging buffer, and 600 full chains filled the system heap (out of memory, 26 Oct).
+        static u64 captured_bytes = 0;
+        if (count == 0) {
+            captured_bytes = 0;
+        }
+        const u64 bytes = image.info.guest_size;
+        if (image.info.size.width < 64 || image.info.size.height < 64 || bytes > 64_MB ||
+            captured_bytes + bytes > 1_GB) {
+            continue;
+        }
+        captured_bytes += bytes;
+        const u64 key = (u64{image.info.guest_address} << 8) ^ u64(image.info.pixel_format);
+        if (!seen.insert(key).second) {
+            continue;
+        }
+        ++count;
+        texture_cache.DumpImage(image_id,
+                                dir / fmt::format("{:03}_{}_m{}f{}_fl{:x}_u{}{}{}", count,
+                                                  vk::to_string(image.info.pixel_format),
+                                                  image.info.resources.levels,
+                                                  image.info.sotc_first_mip, u32(image.flags),
+                                                  image.usage.render_target ? "R" : "",
+                                                  image.usage.storage ? "S" : "",
+                                                  image.usage.depth_target ? "D" : ""));
+    }
+}
+
 void Rasterizer::ResetBindings(bool is_compute) {
+    CaptureTextures();
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
     }
@@ -2329,10 +2492,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         std::bit_cast<u32>(std::bit_cast<float>(patch_flat[kGrassPatchLodDword]) * lod);
                     flat = patch_flat.data();
                 }
-                if (stage.pgm_hash == kHdrCompositeHash &&
-                    stage.FlatBuf().size() > kHdrCurveDword) {
-                    Dlssg::NoteHdrCurve(std::bit_cast<float>(flat[kHdrCurveDword]));
-                }
                 const u64 offset = vk_buffer.Copy(flat, ubo_size, alignment);
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
@@ -2360,6 +2519,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             } else if (desc.buffer_type == Shader::BufferType::FaultBuffer) {
                 const auto* fault_buffer = buffer_cache.GetFaultBuffer();
                 buffer_infos.emplace_back(fault_buffer->Handle(), 0, fault_buffer->SizeBytes());
+            } else if (desc.buffer_type == Shader::BufferType::LodFeedback) {
+                buffer_infos.emplace_back(sotc_lod_feedback->Handle(), 0,
+                                          SotcLodFeedbackBytes + sizeof(u32));
             } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
                 auto& lds_buffer = buffer_cache.GetStreamBuffer();
                 const auto& cs_program = liverpool->DrawCsRegs();
@@ -2457,6 +2619,41 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     }
 }
 
+// sotc: the final composite samples the UI layer and the scene: UI first in the base game's
+// shader, scene first in the PS4 Pro one (0x9e6767fc). The UI layer is the output-size sRGB image.
+u32 Rasterizer::CompositeUiIndex() {
+    const auto& first = texture_cache.GetImage(image_bindings[0].first);
+    return first.info.pixel_format == vk::Format::eR16G16B16A16Sfloat ? 1 : 0;
+}
+
+
+// sotc: DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL serves the depth target (stencil writes) and the
+// sampling of its depth aspect, so both uses ask for the same stages and accesses: the image state
+// does not change from one draw to the next and the render pass is not ended for it.
+static constexpr vk::PipelineStageFlags2 kDepthReadOnlyStencilStages =
+    vk::PipelineStageFlagBits2::eAllCommands;
+static constexpr vk::AccessFlags2 kDepthReadOnlyStencilAccess =
+    vk::AccessFlagBits2::eDepthStencilAttachmentRead | vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+    vk::AccessFlagBits2::eShaderRead;
+
+bool Rasterizer::DepthSampledAsAttachment(VideoCore::ImageId image_id, const VideoCore::Image& image,
+                                          const VideoCore::TextureCache::ImageDesc& desc,
+                                          bool compute) const {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_DEPTH_RO");
+        return !v || v[0] != '0';
+    }();
+    if (!on || compute || !image.info.props.has_stencil || image_id != db_desc.first) {
+        return false;
+    }
+    if (!liverpool->DrawRegs().depth_control.stencil_enable || db_desc.second.view_info.is_storage) {
+        return false;
+    }
+    const vk::Format fmt = desc.view_info.format;
+    return Vulkan::LiverpoolToVK::IsFormatDepthCompatible(fmt) &&
+           !Vulkan::LiverpoolToVK::IsFormatStencilCompatible(fmt);
+}
+
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the pass
     image_bindings.clear();
@@ -2530,6 +2727,31 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                              u32(tsharp.last_level), u32(tsharp.min_lod), tsharp.min_lod / 256.f,
                              u32(tsharp.min_lod_warn), u32(tsharp.lod_hw_cnt_en),
                              u32(tsharp.counter_bank_id));
+            }
+        }
+        // sotc: SOTC_POOL_WATCH: the T#s bound at an address whose pages the game freed while the
+        // texture was in use (TextureCache::PoolWatch), each distinct mip field set once.
+        if (const u32 watched = SotcStats::pool_watch_count.load(std::memory_order_relaxed)) {
+            const u64 addr = tsharp.Address();
+            for (u32 k = 0; k < std::min<u32>(watched, 64); ++k) {
+                if (SotcStats::pool_watch_addr[k].load(std::memory_order_relaxed) != addr) {
+                    continue;
+                }
+                static std::mutex m;
+                static std::set<std::tuple<u64, u32, u32, u32>> seen;
+                std::scoped_lock lk{m};
+                if (seen.size() < 400 &&
+                    seen.insert({addr, u32(tsharp.base_level), u32(tsharp.last_level),
+                                 u32(tsharp.min_lod)}).second) {
+                    std::fprintf(stderr,
+                                 "SOTC POOLWATCH tsharp %#llx %ux%u base %u last %u min_lod %.2f "
+                                 "bank %u hwcnt %u\n",
+                                 static_cast<unsigned long long>(addr), tsharp.width + 1,
+                                 tsharp.height + 1, u32(tsharp.base_level), u32(tsharp.last_level),
+                                 tsharp.min_lod / 256.f, u32(tsharp.counter_bank_id),
+                                 u32(tsharp.lod_hw_cnt_en));
+                }
+                break;
             }
         }
         // sotc: first few only (per-draw warning; see BufferCache::SynchronizeMemoryFromImage).
@@ -2633,12 +2855,25 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
                         desc.view_info.range);
                 } else {
-                    const auto new_layout = image.info.props.is_depth
-                                                ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-                                                : vk::ImageLayout::eShaderReadOnlyOptimal;
-                    needs_barrier |= runtime.Transit(
-                        &image, new_layout, vk::PipelineStageFlagBits2::eAllCommands,
-                        vk::AccessFlagBits2::eShaderRead, desc.view_info.range);
+                    // sotc: the depth buffer the draw writes stencil to is also sampled (depth
+                    // aspect only): DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL allows both, so the
+                    // image stays in the layout the render target needs. Moving it to
+                    // DEPTH_STENCIL_READ_ONLY here and back in BeginRendering ended the render
+                    // pass at every such draw (~350 per frame in the Shrine). SOTC_DEPTH_RO=0 off.
+                    if (DepthSampledAsAttachment(image_id, image, desc,
+                                                 stage.sw_stage == Shader::SwStage::Compute)) {
+                        needs_barrier |= runtime.Transit(
+                            &image, vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal,
+                            kDepthReadOnlyStencilStages, kDepthReadOnlyStencilAccess,
+                            desc.view_info.range);
+                    } else {
+                        const auto new_layout = image.info.props.is_depth
+                                                    ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+                                                    : vk::ImageLayout::eShaderReadOnlyOptimal;
+                        needs_barrier |= runtime.Transit(
+                            &image, new_layout, vk::PipelineStageFlagBits2::eAllCommands,
+                            vk::AccessFlagBits2::eShaderRead, desc.view_info.range);
+                    }
                 }
             }
             image.usage.storage |= is_storage;
@@ -2661,11 +2896,61 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     if (hudless_on && stage.sw_stage == Shader::SwStage::Fragment && image_bindings.size() == 2 &&
         image_bindings[0].first && image_bindings[1].first &&
         FrameGen::Current() != FrameGen::Mode::Off) {
-        const auto& ui = texture_cache.GetImage(image_bindings[0].first);
-        const auto& scene = texture_cache.GetImage(image_bindings[1].first);
+        const u32 ui_i = CompositeUiIndex();
+        const auto& ui = texture_cache.GetImage(image_bindings[ui_i].first);
+        const auto& scene = texture_cache.GetImage(image_bindings[ui_i ^ 1].first);
         if (ui.usage.render_target && ui.info.pixel_format == vk::Format::eR8G8B8A8Srgb &&
             scene.info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
-            hudless_ui_info = static_cast<s32>(first_image_idx);
+            hudless_ui_info = static_cast<s32>(first_image_idx + ui_i);
+        }
+    }
+
+    // sotc: SOTC_DLSS_PROBE=1 logs each fragment shader that draws into a video out surface once:
+    // its images (format, size, render target or not), to find the final composite.
+    static const bool dlss_probe = std::getenv("SOTC_DLSS_PROBE") != nullptr;
+    if (dlss_probe && stage.sw_stage == Shader::SwStage::Fragment && cb_descs[0].first &&
+        texture_cache.GetImage(cb_descs[0].first).usage.vo_surface) {
+        static std::unordered_set<std::string> seen;
+        std::string line = fmt::format("{:#x}", stage.pgm_hash);
+        {
+            for (const auto& [id, desc] : image_bindings) {
+                if (!id) {
+                    line += " [none]";
+                    continue;
+                }
+                const auto& img = texture_cache.GetImage(id);
+                line += fmt::format(" [{} {}x{}{}]", vk::to_string(img.info.pixel_format),
+                                    img.info.size.width, img.info.size.height,
+                                    img.usage.render_target ? " rt" : "");
+            }
+            const auto& out = texture_cache.GetImage(cb_descs[0].first);
+            if (seen.size() < 60 && seen.insert(line).second)
+            std::fprintf(stderr, "SOTC DLSS PROBE: shader %#llx -> %s %ux%u, %zu images:%s\n",
+                         static_cast<unsigned long long>(stage.pgm_hash),
+                         vk::to_string(out.info.pixel_format).c_str(), out.info.size.width,
+                         out.info.size.height, image_bindings.size(), line.c_str());
+        }
+    }
+
+    // sotc: DLSS super resolution: the game's final composite samples the UI layer (an sRGB render
+    // target) and the tonemapped fp16 scene, nothing else, into a video out surface.
+    if (Dlssg::SuperResolution() && stage.sw_stage == Shader::SwStage::Fragment &&
+        image_bindings.size() == 2 && image_bindings[0].first && image_bindings[1].first &&
+        cb_descs[0].first) {
+        const u32 ui_i = CompositeUiIndex();
+        const auto& ui = texture_cache.GetImage(image_bindings[ui_i].first);
+        const auto& scene = texture_cache.GetImage(image_bindings[ui_i ^ 1].first);
+        if (texture_cache.GetImage(cb_descs[0].first).usage.vo_surface &&
+            ui.usage.render_target && ui.info.pixel_format == vk::Format::eR8G8B8A8Srgb &&
+            scene.info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
+            Dlssg::NoteComposite(image_bindings[ui_i ^ 1].first, image_bindings[ui_i].first,
+                                 texture_cache);
+            NoteUiShadow();
+            static bool logged = false;
+            if (!std::exchange(logged, true)) {
+                std::fprintf(stderr, "SOTC DLSS: composite shader %#llx\n",
+                             static_cast<unsigned long long>(stage.pgm_hash));
+            }
         }
     }
 
@@ -2908,12 +3193,21 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                                     ? vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal
                                 : has_stencil ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
                                               : vk::ImageLayout::eDepthReadOnlyOptimal;
-        needs_barrier |= runtime.Transit(&image, new_layout,
-                                         vk::PipelineStageFlagBits2::eEarlyFragmentTests |
-                                             vk::PipelineStageFlagBits2::eLateFragmentTests,
-                                         vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
-                                             vk::AccessFlagBits2::eDepthStencilAttachmentRead,
-                                         desc.view_info.range);
+        static const bool depth_ro = [] {
+            const char* v = std::getenv("SOTC_DEPTH_RO");
+            return !v || v[0] != '0';
+        }();
+        if (depth_ro && new_layout == vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal) {
+            needs_barrier |= runtime.Transit(&image, new_layout, kDepthReadOnlyStencilStages,
+                                             kDepthReadOnlyStencilAccess, desc.view_info.range);
+        } else {
+            needs_barrier |= runtime.Transit(&image, new_layout,
+                                             vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                                                 vk::PipelineStageFlagBits2::eLateFragmentTests,
+                                             vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+                                                 vk::AccessFlagBits2::eDepthStencilAttachmentRead,
+                                             desc.view_info.range);
+        }
 
         state.width = std::min<u32>(state.width, image.info.size.width);
         state.height = std::min<u32>(state.height, image.info.size.height);
@@ -3008,6 +3302,9 @@ void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds
         }
         return buffer_cache.ObtainBuffer(address, num_bytes, true);
     }();
+    if (!is_gds) {
+        texture_cache.InvalidateMemoryFromGPU(address, num_bytes, true);
+    }
     runtime.FillBuffer(buffer, offset, num_bytes, value);
 }
 
@@ -3017,10 +3314,16 @@ void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, b
             !texture_cache.FindImageFromRange(src, num_bytes)) {
             // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
             std::memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
+            SotcStats::dma_cpu_copies.fetch_add(1, std::memory_order_relaxed);
+            SotcStats::dma_cpu_bytes.fetch_add(num_bytes, std::memory_order_relaxed);
             return;
         }
     }
-    texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);
+    if (!dst_gds) {
+        texture_cache.InvalidateMemoryFromGPU(dst, num_bytes, true);
+    }
+    SotcStats::dma_gpu_copies.fetch_add(1, std::memory_order_relaxed);
+    SotcStats::dma_gpu_bytes.fetch_add(num_bytes, std::memory_order_relaxed);
     const auto* gds_buffer = buffer_cache.GetGdsBuffer();
     const auto [src_buffer, src_offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {
         if (src_gds) {

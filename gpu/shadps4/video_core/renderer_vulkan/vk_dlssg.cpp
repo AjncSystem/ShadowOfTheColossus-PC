@@ -692,7 +692,31 @@ sl::Resource SlImage(vk::Image image, VkDeviceMemory memory, vk::ImageView view,
     return r;
 }
 
-bool sr_hdr = false; // presenter thread
+/// sotc: whether a DLSS mode takes this input height for this output (DLAA at 1:1 or more).
+bool SrModeFits(u32 in_w, u32 in_h, u32 out_w, u32 out_h) {
+    static u32 last[4]{};
+    static bool last_fits = false;
+    if (last[0] == in_w && last[1] == in_h && last[2] == out_w && last[3] == out_h) {
+        return last_fits;
+    }
+    bool fits = in_w >= out_w && in_h >= out_h;
+    sl::DLSSOptions options{};
+    options.outputWidth = out_w;
+    options.outputHeight = out_h;
+    for (const sl::DLSSMode mode :
+         {sl::DLSSMode::eMaxQuality, sl::DLSSMode::eBalanced, sl::DLSSMode::eMaxPerformance,
+          sl::DLSSMode::eUltraPerformance}) {
+        options.mode = mode;
+        sl::DLSSOptimalSettings optimal{};
+        if (!fits && api.dlss_optimal(options, optimal) == sl::Result::eOk &&
+            in_h >= optimal.renderHeightMin && in_h <= optimal.renderHeightMax) {
+            fits = true;
+        }
+    }
+    last[0] = in_w, last[1] = in_h, last[2] = out_w, last[3] = out_h;
+    last_fits = fits;
+    return fits;
+}
 
 /// DLSS options for this input and output size: DLAA at 1:1, else the mode whose optimal render
 /// height is closest to the input's.
@@ -704,8 +728,7 @@ bool SetSrOptions(u32 in_w, u32 in_h, u32 out_w, u32 out_h) {
     sl::DLSSOptions options{};
     options.outputWidth = out_w;
     options.outputHeight = out_h;
-    // Tonemapped, 0..1; with HDR output the game's scene goes above 1.0.
-    options.colorBuffersHDR = sr_hdr ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+    options.colorBuffersHDR = sl::Boolean::eFalse; // tonemapped, 0..1
     sl::DLSSMode best = sl::DLSSMode::eMaxQuality;
     if (in_w >= out_w && in_h >= out_h) {
         best = sl::DLSSMode::eDLAA;
@@ -864,14 +887,6 @@ void SetOptions(bool on) {
 }
 
 } // namespace
-
-void SetHdr(bool hdr) {
-    if (sr_hdr != hdr) {
-        sr_hdr = hdr;
-        sr_mode_in_w = 0; // new DLSS options
-        std::fprintf(stderr, "SOTC DLSS: %s colour input\n", hdr ? "HDR" : "tonemapped");
-    }
-}
 
 PFN_vkGetInstanceProcAddr LoadInterposer() {
     const char* u = std::getenv("SOTC_UPSCALER");
@@ -1061,41 +1076,6 @@ bool CapturingInputs() {
     return Capturing() || sr_supported;
 }
 
-bool CameraLogOnly() {
-    // sotc: tools/gameplay_bench.py --horse tells riding from walking by the camera speed; the
-    // camera came only from DLSS-G's inputs, so the riding benchmark needed an RTX 40 card.
-    static const bool cam_log = [] {
-        const char* v = std::getenv("SOTC_CAM_LOG");
-        return v && v[0] == '1';
-    }();
-    return cam_log && !CapturingInputs();
-}
-
-void NoteCamera(const AmdGpu::Regs& regs, u32 mrt_mask) {
-    if (!(mrt_mask & (1u << 4))) {
-        return;
-    }
-    const auto& cb4 = regs.color_buffers[4];
-    if (!cb4 || cb4.GetDataFmt() != AmdGpu::DataFormat::Format16_16 ||
-        cb4.GetNumberFmt() != AmdGpu::NumberFormat::Float || !regs.depth_buffer.DepthValid()) {
-        return;
-    }
-    static long long last_ms = 0;
-    LARGE_INTEGER t, f;
-    QueryPerformanceCounter(&t);
-    QueryPerformanceFrequency(&f);
-    const long long ms = static_cast<long long>(t.QuadPart * 1000 / f.QuadPart);
-    if (ms - last_ms < 160) {
-        return;
-    }
-    Camera cam{};
-    if (!ReadCamera(regs, cam)) {
-        return;
-    }
-    last_ms = ms;
-    std::fprintf(stderr, "SOTC CAM %lld %.2f %.2f %.2f\n", ms, cam.pos[0], cam.pos[1], cam.pos[2]);
-}
-
 std::mutex vignette_mutex;
 float vignette_params[4]{};
 bool vignette_valid = false;
@@ -1104,16 +1084,6 @@ void NoteVignette(const float params[4]) {
     std::scoped_lock lock{vignette_mutex};
     std::memcpy(vignette_params, params, sizeof(vignette_params));
     vignette_valid = true;
-}
-
-std::atomic<float> hdr_curve{1.0f};
-
-void NoteHdrCurve(float k) {
-    hdr_curve.store(k, std::memory_order_relaxed);
-}
-
-float HdrCurve() {
-    return hdr_curve.load(std::memory_order_relaxed);
 }
 
 bool Vignette(float out[4]) {
@@ -1178,7 +1148,6 @@ void SanitizeColor(vk::CommandBuffer cmdbuf) {
     }
     struct Params {
         u32 width, height, mark;
-        float limit;
     };
     static vk::DescriptorSetLayout set_layout;
     static vk::PipelineLayout layout;
@@ -1241,8 +1210,7 @@ void SanitizeColor(vk::CommandBuffer cmdbuf) {
                                        .descriptorCount = 1,
                                        .descriptorType = vk::DescriptorType::eStorageImage,
                                        .pImageInfo = &image};
-    const Params params{sr_color.width, sr_color.height, mode == 2 ? 1u : 0u,
-                        sr_hdr ? 64.0f : 1.0f};
+    const Params params{sr_color.width, sr_color.height, mode == 2 ? 1u : 0u};
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, write);
     cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(Params), &params);
@@ -1260,14 +1228,17 @@ void CopyComposite(vk::CommandBuffer cmdbuf, VideoCore::TextureCache& texture_ca
     composite.copy_ok = false;
     VideoCore::Image* scene = texture_cache.TryGetImage(composite.scene_id, composite.scene_uid);
     VideoCore::Image* ui = texture_cache.TryGetImage(composite.ui_id, composite.ui_uid);
-    if (!scene || !ui || scene->info.size.width != ui->info.size.width ||
-        scene->info.size.height != ui->info.size.height) {
+    if (!scene || !ui) {
         return;
     }
+    // sotc: the UI layer is the scene's size in the base game, the output size in PS4 Pro mode
+    // (scene 1600x900, UI 1920x1080 at 1080p); the post-process pass samples it either way.
     const u32 w = scene->info.size.width;
     const u32 h = scene->info.size.height;
+    const u32 uw = ui->info.size.width;
+    const u32 uh = ui->info.size.height;
     if (!EnsureSrImage(sr_color, scene->info.pixel_format, w, h) ||
-        !EnsureSrImage(sr_ui, vk::Format::eR8G8B8A8Srgb, w, h)) {
+        !EnsureSrImage(sr_ui, vk::Format::eR8G8B8A8Srgb, uw, uh)) {
         return;
     }
     using Stage = vk::PipelineStageFlagBits2;
@@ -1313,8 +1284,10 @@ void CopyComposite(vk::CommandBuffer cmdbuf, VideoCore::TextureCache& texture_ca
     };
     cmdbuf.copyImage(scene->GetImage(), Layout::eTransferSrcOptimal, sr_color.image,
                      Layout::eTransferDstOptimal, region);
+    vk::ImageCopy ui_region = region;
+    ui_region.extent = vk::Extent3D{uw, uh, 1};
     cmdbuf.copyImage(ui->GetImage(), Layout::eTransferSrcOptimal, sr_ui.image,
-                     Layout::eTransferDstOptimal, region);
+                     Layout::eTransferDstOptimal, ui_region);
     const std::array to_read{
         barrier(sr_color.image, Layout::eTransferDstOptimal, Layout::eShaderReadOnlyOptimal,
                 Stage::eCopy, Access::eTransferWrite, Stage::eAllCommands, Access::eShaderRead),
@@ -1382,9 +1355,12 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
         c = std::exchange(composite, Composite{});
     }
     const bool copied = c.copy_ok && sr_color.width == f.width && sr_color.height == f.height;
-    const bool ui_full = c.copy_ok && c.ui_full_ok && sr_ui_full.width == width &&
-                         sr_ui_full.height == height;
-    const vk::ImageView ui_view = ui_full ? sr_ui_full.view : sr_ui.view;
+    const bool ui_shadow = c.copy_ok && c.ui_full_ok && sr_ui_full.width == width &&
+                           sr_ui_full.height == height;
+    // sotc: PS4 Pro mode draws its UI layer at the output size already: no unsharp on it (it put
+    // dark fringes around the letters, 26 Oct)
+    const bool ui_full = ui_shadow || (c.copy_ok && sr_ui.width == width && sr_ui.height == height);
+    const vk::ImageView ui_view = ui_shadow ? sr_ui_full.view : sr_ui.view;
     if (ui_full && (!f.sl_valid || !copied)) {
         // No DLSS inputs (splash, menus): the scene at the render size, the UI at the output size.
         sr_prev = false;
@@ -1401,9 +1377,18 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
         sr_prev = false;
         return {};
     }
+    // sotc: when no DLSS mode takes this input height for the output, DLSS upscales 2x and the
+    // post-process pass scales the rest. PS4 Pro mode at 4K hands it 1600x900: to 2160p no mode
+    // takes that height, NGX refused every evaluate (0xbad00005) and the screen stayed black.
+    u32 out_w = width, out_h = height;
+    if (!SrModeFits(f.width, f.height, width, height) &&
+        (f.width * 2 < width || f.height * 2 < height)) {
+        out_w = f.width * 2;
+        out_h = f.height * 2;
+    }
     sl::FrameToken* token = Token(f.index);
-    if (!token || !SetSrOptions(f.width, f.height, width, height) ||
-        !EnsureSrImage(sr_out, vk::Format::eR16G16B16A16Sfloat, width, height)) {
+    if (!token || !SetSrOptions(f.width, f.height, out_w, out_h) ||
+        !EnsureSrImage(sr_out, vk::Format::eR16G16B16A16Sfloat, out_w, out_h)) {
         sr_prev = false;
         return {};
     }
@@ -1442,7 +1427,7 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
                               Layout::eShaderReadOnlyOptimal, sr_color.format, f.width, f.height,
                               true);
     sl::Resource out = SlImage(sr_out.image, sr_out.memory, sr_out.view, Layout::eGeneral,
-                               sr_out.format, width, height, true);
+                               sr_out.format, out_w, out_h, true);
     sl::Resource depth = SlImage(f.depth, f.depth_memory, f.depth_view,
                                  Layout::eShaderReadOnlyOptimal, f.depth_format, f.width, f.height,
                                  false);
@@ -1451,7 +1436,7 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
     sl::Resource bias = SlImage(f.bias, f.bias_memory, f.bias_view, Layout::eShaderReadOnlyOptimal,
                                 vk::Format::eR8G8B8A8Unorm, f.width, f.height, true);
     const sl::Extent in_extent{0, 0, f.width, f.height};
-    const sl::Extent out_extent{0, 0, width, height};
+    const sl::Extent out_extent{0, 0, out_w, out_h};
     constexpr auto life = sl::ResourceLifecycle::eValidUntilPresent;
     std::array tags{
         sl::ResourceTag{&in, sl::kBufferTypeScalingInputColor, life, &in_extent},
@@ -1495,8 +1480,8 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
     });
     static bool reported = false;
     if (!std::exchange(reported, true)) {
-        std::fprintf(stderr, "SOTC DLSS: upscaling %ux%u -> %ux%u\n", f.width, f.height, width,
-                     height);
+        std::fprintf(stderr, "SOTC DLSS: upscaling %ux%u -> %ux%u\n", f.width, f.height, out_w,
+                     out_h);
     }
     sr_prev = true;
     // Debug: SOTC_DLSS_VIEW=input shows DLSS's colour input (render size, stretched).
@@ -1507,7 +1492,8 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
     if (view_input) {
         return {sr_color.view, ui_view, {}, ui_full};
     }
-    return {sr_out.view, ui_view, sky_bias_written ? f.bias_view : vk::ImageView{}, ui_full};
+    return {sr_out.view, ui_view, sky_bias_written ? f.bias_view : vk::ImageView{}, ui_full, false,
+            out_w, out_h};
 }
 
 // Streamline asks for vsync off with Vulkan, but DLSS-G generates and paces its frames in

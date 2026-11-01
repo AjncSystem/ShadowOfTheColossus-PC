@@ -12,6 +12,7 @@
 #include "gpu/bbgpu.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <pthread.h>
 #include <time.h>
@@ -68,10 +69,47 @@ static uint8_t trigger(int16_t v) { int x=v>>7; return (uint8_t)(x<0 ? 0 : x>255
 static uint16_t touch_axis(float v, int max) {
     return (uint16_t)(v<=0.0f ? 0 : v>=1.0f ? max : (int)(v*max+0.5f));
 }
-static void touch_click(PadData *d, int right) {
+/* side: 0 left, 1 right, 2 upper left corner (the debug menu with +RetailBuild=0), 3 lower right. */
+static void touch_click(PadData *d, int side) {
     d->buttons|=BTN_TOUCHPAD;
     d->touch_count=1;
-    d->touches[0]=(PadTouch){.x=right ? 1440 : 480,.y=471,.id=0};
+    d->touches[0] = side==2 ? (PadTouch){.x=160,.y=80,.id=0}
+                  : side==3 ? (PadTouch){.x=1440,.y=800,.id=0}
+                            : (PadTouch){.x=side ? 1440 : 480,.y=471,.id=0};
+}
+
+/* sotc: with SOTC_DEBUG_MENU=1, Start+Select (Options+touchpad) together touch the debug menu
+ * corner instead (pads have no F6). Either button alone waits up to 150 ms for the other, so the
+ * pause menu or the map does not open first; a tap shorter than that is passed on after release. */
+static void debug_menu_combo(PadData *d) {
+    static int on=-1, combo;
+    static uint32_t held, tap; static uint64_t since, tap_until;
+    if (on<0) { const char *v=getenv("SOTC_DEBUG_MENU"); on=v && *v && strcmp(v,"0"); }
+    if (!on) return;
+    const uint32_t both=BTN_OPTIONS|BTN_TOUCHPAD, now=d->buttons & both;
+    if (combo || now==both) {
+        combo=now!=0; held=0; tap=0;
+        d->buttons&=~both; d->touch_count=0;
+        if (now) touch_click(d,2);
+        return;
+    }
+    if (tap) {
+        if (d->timestamp<tap_until) { d->buttons|=tap; if (tap & BTN_TOUCHPAD) touch_click(d,3); return; }
+        tap=0;
+    }
+    if (!now) {
+        if (held && d->timestamp-since<150000) {
+            tap=held; tap_until=d->timestamp+60000; d->buttons|=tap;
+            if (tap & BTN_TOUCHPAD) touch_click(d,3);
+        }
+        held=0;
+        return;
+    }
+    if (!held) { held=now; since=d->timestamp; }
+    if (d->timestamp-since<150000) { d->buttons&=~both; d->touch_count=0; }
+    /* The debug build opens its menu on a touch at the middle left too (user, 26 Oct): Select
+     * alone touches the lower right, away from it. */
+    else if ((d->buttons & BTN_TOUCHPAD) && !d->touch_count) touch_click(d,3);
 }
 
 /* BB_GAMEPAD (the launcher's controller choice): its SDL GUID, or part of its name. Issue #15:
@@ -268,6 +306,9 @@ static void apply_keyboard(PadData *d, const bool *k) {
         if (i!=IN_TOUCHPAD && i!=IN_TOUCHPAD_RIGHT && key_down(k,i)) d->buttons|=input_buttons[i];
     if (key_down(k,IN_TOUCHPAD)) touch_click(d,0);
     if (key_down(k,IN_TOUCHPAD_RIGHT)) touch_click(d,1);
+    /* sotc: F6 touches the upper left of the touchpad: the game's debug menu when gameversion.txt
+     * says +RetailBuild=0. */
+    if (k[SDL_SCANCODE_F6]) touch_click(d,2);
     if (key_down(k,IN_L2)) d->l2=255;
     if (key_down(k,IN_R2)) d->r2=255;
     d->left_x=key_axis(d->left_x,key_down(k,IN_MOVE_LEFT),key_down(k,IN_MOVE_RIGHT));
@@ -353,6 +394,7 @@ static void sample_host(PadData *d) {
                 }
             }
         }
+        debug_menu_combo(d);
         // Back/Select on pads without a touch surface is a left-side click.
         if ((d->buttons & BTN_TOUCHPAD) && !d->touch_count) touch_click(d,0);
         if (touch_right) touch_click(d,1);
@@ -408,6 +450,10 @@ static void read_inject(void) {
         if (!strcmp(token,"touchpad_left") || !strcmp(token,"touchpad_right")) {
             injected.buttons|=BTN_TOUCHPAD;
             injected.touch_side=!strcmp(token,"touchpad_right");
+        }
+        if (!strcmp(token,"touchpad_menu")) { /* the debug menu corner (F6) */
+            injected.buttons|=BTN_TOUCHPAD;
+            injected.touch_side=2;
         }
         for (size_t i=0;i<sizeof(names)/sizeof(*names);++i) if (!strcmp(token,names[i].name)) injected.buttons|=names[i].ps;
         for (int i=0;i<4;++i) if (!strncmp(token,sticks[i],3)) { int v=atoi(token+3); injected.stick[i]=v<0 ? 0 : v>255 ? 255 : v; }
@@ -563,9 +609,29 @@ static ABI int32_t pad_info(int32_t handle, ControllerInfo *info) {
     pthread_mutex_unlock(&lock);
     return 0;
 }
+/* sotc: the pad's vibration: SOTC_RUMBLE=0 (the launcher's option) starts with it off; the in-game
+ * menu switches it while playing (bbport_overlay.cpp). */
+static atomic_int rumble_on=-1;
+int runtime_rumble_enabled(void) {
+    int v=atomic_load(&rumble_on);
+    if (v<0) {
+        const char *e=getenv("SOTC_RUMBLE");
+        v=!(e && e[0]=='0');
+        atomic_store(&rumble_on,v);
+    }
+    return v;
+}
+void runtime_rumble_set(int on) {
+    atomic_store(&rumble_on,on ? 1 : 0);
+    pthread_mutex_lock(&lock);
+    if (!on && gamepad) SDL_RumbleGamepad(gamepad,0,0,0); /* stop a rumble in progress */
+    pthread_mutex_unlock(&lock);
+}
+
 static ABI int32_t pad_vibration(int32_t handle, const uint8_t *param) {
     if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
     if (!param) return ERR_INVALID_ARG;
+    if (!runtime_rumble_enabled()) return 0;
     pthread_mutex_lock(&lock);
     SDL_Gamepad *g=current_gamepad();
     if (g) SDL_RumbleGamepad(g,(uint16_t)(param[0]*257),(uint16_t)(param[1]*257),1000);

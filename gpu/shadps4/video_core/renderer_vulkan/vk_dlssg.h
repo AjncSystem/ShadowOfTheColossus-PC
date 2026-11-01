@@ -46,14 +46,6 @@ bool Enabled();
 /// DLSS super resolution is on: the rasterizer then calls NoteDraw.
 bool CapturingInputs();
 
-/// SOTC_CAM_LOG=1 while CapturingInputs() is false (no DLSS or frame generation, e.g. any card
-/// without DLSS-G): the rasterizer calls NoteCamera instead of NoteDraw.
-bool CameraLogOnly();
-
-/// Command processor thread, at each draw: logs the camera position of G-buffer draws
-/// ("SOTC CAM <ms> x y z", the line NoteDraw's frames print) at most every 160 ms.
-void NoteCamera(const AmdGpu::Regs& regs, u32 mrt_mask);
-
 /// The present mode DLSS-G needs (Vulkan: no vsync), when Enabled().
 bool WantsImmediatePresent();
 
@@ -81,11 +73,6 @@ bool SuperResolution();
 
 /// DLSS Super Resolution works on this device, also while F9 has it switched off.
 bool SuperResolutionAvailable();
-/// sotc: HDR output: the composite's scene keeps highlights above 1.0 (presenter thread).
-void SetHdr(bool hdr);
-/// sotc: the exponent of the game's HDR composite (1.0 on the splash and menus, 1.42 in game).
-void NoteHdrCurve(float k);
-float HdrCurve();
 
 /// SOTC_DLSS_COMPARE=1 (launcher debug option): F9 compares DLSS with FSR1, a label shows which.
 bool CompareMode();
@@ -121,7 +108,7 @@ struct Upscaled {
     vk::ImageView sky;   ///< render size, g = 1 in the sky; empty without camera motion fill
     bool ui_full{};      ///< ui is at the output size (UiTarget)
     bool scene_low{};    ///< scene is the render size scene (no DLSS inputs): scale it
-    u32 scene_width{}, scene_height{};
+    u32 scene_width{}, scene_height{}; ///< scene size (DLSS: below the output when it went 2x)
 };
 
 /// Command processor thread, in PrepareFrame after PrepareInputs: DLSS upscales this frame's

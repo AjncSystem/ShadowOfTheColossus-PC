@@ -717,6 +717,7 @@ bool SrModeFits(u32 in_w, u32 in_h, u32 out_w, u32 out_h) {
     last_fits = fits;
     return fits;
 }
+bool sr_hdr = false; // presenter thread
 
 /// DLSS options for this input and output size: DLAA at 1:1, else the mode whose optimal render
 /// height is closest to the input's.
@@ -728,7 +729,8 @@ bool SetSrOptions(u32 in_w, u32 in_h, u32 out_w, u32 out_h) {
     sl::DLSSOptions options{};
     options.outputWidth = out_w;
     options.outputHeight = out_h;
-    options.colorBuffersHDR = sl::Boolean::eFalse; // tonemapped, 0..1
+    // Tonemapped, 0..1; with HDR output the game's scene goes above 1.0.
+    options.colorBuffersHDR = sr_hdr ? sl::Boolean::eTrue : sl::Boolean::eFalse;
     sl::DLSSMode best = sl::DLSSMode::eMaxQuality;
     if (in_w >= out_w && in_h >= out_h) {
         best = sl::DLSSMode::eDLAA;
@@ -887,6 +889,14 @@ void SetOptions(bool on) {
 }
 
 } // namespace
+
+void SetHdr(bool hdr) {
+    if (sr_hdr != hdr) {
+        sr_hdr = hdr;
+        sr_mode_in_w = 0; // new DLSS options
+        std::fprintf(stderr, "SOTC DLSS: %s colour input\n", hdr ? "HDR" : "tonemapped");
+    }
+}
 
 PFN_vkGetInstanceProcAddr LoadInterposer() {
     const char* u = std::getenv("SOTC_UPSCALER");
@@ -1086,6 +1096,16 @@ void NoteVignette(const float params[4]) {
     vignette_valid = true;
 }
 
+std::atomic<float> hdr_curve{1.0f};
+
+void NoteHdrCurve(float k) {
+    hdr_curve.store(k, std::memory_order_relaxed);
+}
+
+float HdrCurve() {
+    return hdr_curve.load(std::memory_order_relaxed);
+}
+
 bool Vignette(float out[4]) {
     std::scoped_lock lock{vignette_mutex};
     std::memcpy(out, vignette_params, sizeof(vignette_params));
@@ -1148,6 +1168,7 @@ void SanitizeColor(vk::CommandBuffer cmdbuf) {
     }
     struct Params {
         u32 width, height, mark;
+        float limit;
     };
     static vk::DescriptorSetLayout set_layout;
     static vk::PipelineLayout layout;
@@ -1210,7 +1231,8 @@ void SanitizeColor(vk::CommandBuffer cmdbuf) {
                                        .descriptorCount = 1,
                                        .descriptorType = vk::DescriptorType::eStorageImage,
                                        .pImageInfo = &image};
-    const Params params{sr_color.width, sr_color.height, mode == 2 ? 1u : 0u};
+    const Params params{sr_color.width, sr_color.height, mode == 2 ? 1u : 0u,
+                        sr_hdr ? 64.0f : 1.0f};
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, write);
     cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(Params), &params);

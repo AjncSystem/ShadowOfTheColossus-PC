@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.70-opt12 — 2026-11-01 (fork do Oussama268)
+Tudo da 0.70, mais o trabalho contra as travadinhas (stutter):
+- **Quadros num ritmo regular (tabnul):** os quadros saem no ritmo em que o jogo os entrega, em
+  vez de esperar o próximo vblank. A variação entre quadros caiu de 5,2 ms para 1,2–1,8 ms e as
+  travadas acima de 100 ms de 15 para 2 por demo de 5 min. Também do tabnul: a varredura de
+  memória `SOTC MEM` saiu da thread de apresentação, leituras da GPU terminadas em partes e uma
+  swapchain mais funda contra a pausa periódica do driver NVIDIA.
+- **Modo 60 FPS com o mesmo ritmo:** abaixo de 60 os quadros alternavam 16,7 / 25 ms. Agora saem
+  quando estão prontos, sem passar de 60. Demo em 60 FPS: quadros acima de 50 ms 23 → 12, pior
+  quadro 194 → 113 ms, 1% low 22,3 → 26,3 FPS.
+- **Sem congelamentos de ~900 ms do cache de shaders da 0.70:** o pacote do cache ganhava dos
+  arquivos mais novos, e milhares de shaders eram traduzidos de novo a cada sessão. O arquivo
+  mais novo vence agora (correção do HiddenUserHere, PR #339 do repositório principal).
+- **Texturas pequenas velhas ou com manchas coloridas:** a textura inteira é conferida, não só os
+  primeiros 8x8 pixels; e o limite de envio de texturas por quadro não deixa mais texturas
+  pretas para trás (PR #339).
+- Travas do jogo esperam 20 µs antes de dormir (`SOTC_MUTEX_SPIN_US`, `0` desliga) e os buffers
+  grandes de envio ficam guardados entre quadros (`SOTC_STAGING_LARGE_POW2=0` desliga), do PR #339.
+- Santuário: 40,1 → 43,5 FPS. Sessão de 45 min sem falhas.
+- O cache de shaders é refeito na primeira abertura.
+
 ## 0.70 — 2026-10-29
 > ⚠️ **Atenção: instale o jogo num SSD (de preferência NVMe).** Cada área nova lê centenas de MB
 > de texturas e modelos da pasta do jogo; num HD as trocas de área travam muito mais e podem

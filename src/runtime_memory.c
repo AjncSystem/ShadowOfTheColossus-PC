@@ -1017,6 +1017,11 @@ static ABI int32_t direct_map(void **out, uint64_t size, int prot, int flags, in
     write_unlock();
     flush_hooks();
     if (!result) printf("Runtime: mapped direct memory %p, size=%" PRIu64 ", prot=0x%x\n", *out, size, prot);
+    else {
+        static unsigned long failed;
+        if (failed++<40) fprintf(stderr,"Runtime: MAP DIRECT failed (%#x): at %p +%#" PRIx64 " offset %#" PRIx64 " prot %#x flags %#x align %#" PRIx64 ", from %p\n",
+                                 (unsigned)result,out ? *out : NULL,size,(uint64_t)physical,prot,flags,alignment,__builtin_return_address(0));
+    }
     return result;
 }
 static ABI int32_t direct_map_named(void **out, uint64_t size, int prot, int flags, int64_t physical,
@@ -1046,6 +1051,10 @@ static ABI int32_t direct_unmap(void *address, uint64_t size) {
     int32_t result=unmap_locked((uintptr_t)address,size);
     pending_count=before; /* already notified above */
     write_unlock();
+    if (result) {
+        static unsigned long failed;
+        if (failed++<40) fprintf(stderr,"Runtime: MUNMAP failed (%#x): %p +%#" PRIx64 ", from %p\n",(unsigned)result,address,size,__builtin_return_address(0));
+    }
     return result;
 }
 static ABI int32_t direct_release(uint64_t start, uint64_t size) {
@@ -1209,7 +1218,16 @@ static ABI int32_t batch_map2(BatchEntry *entries, int count, int *processed, in
         case 4: result=protect_locked((uintptr_t)e->start,e->length,(uint8_t)e->prot,e->type); break;
         default: result=INVALID;
         }
-        if (result) break;
+        if (result) {
+            /* sotc: a failed entry leaves what was mapped there before: the game, which may not
+             * check, then writes and frees through the old pages (T38) */
+            static unsigned long failed;
+            if (failed++<40)
+                fprintf(stderr,"Runtime: BATCH MAP entry %d of %d failed (%#x): op %d at %p +%#" PRIx64 " offset %#" PRIx64 " prot %#x type %d flags %#x, from %p\n",
+                        done,count,(unsigned)result,e->operation,e->start,e->length,e->offset,(unsigned)(uint8_t)e->prot,e->type,flags,
+                        __builtin_return_address(0));
+            break;
+        }
     }
     write_unlock();
     flush_hooks();

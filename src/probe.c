@@ -1156,6 +1156,37 @@ static int release_hook_trap(EXCEPTION_POINTERS *info) {
         if (next<=fp) break;
         fp=next;
     }
+    { /* a page released while its bit already says free: a double free (or a release through a
+       * mapping that no longer holds the pages the game thinks) */
+        static LONG doubles, pages_double; static LONG64 pages_released;
+        const uint64_t pbase=*(const uint64_t *)(image+0x2dfca70);
+        const uint64_t *bits=*(const uint64_t *const *)(uintptr_t)(c->Rdi+0x50);
+        const uint64_t words=*(const uint64_t *)(uintptr_t)(c->Rdi+0x58);
+        uint64_t view=0; const unsigned char *backing=runtime_memory_backing_view(&view);
+        unsigned already=0, total=0; uint64_t first_phys=0;
+        for (uintptr_t at=(uintptr_t)c->Rdx; bits && backing && at<(uintptr_t)c->Rdx+(uintptr_t)c->Rcx; at+=0x10000, ++total) {
+            const unsigned char *p=runtime_memory_backing_pointer(at);
+            if (!p) continue;
+            const uint64_t phys=(uint64_t)(p-backing), bit=(phys-pbase)>>16;
+            if (phys<pbase || bit/64>=words) continue;
+            if (bits[bit/64]>>(bit%64)&1) { if (!already) first_phys=phys; ++already; }
+        }
+        InterlockedAdd64(&pages_released,total);
+        if (already) {
+            InterlockedAdd(&pages_double,(LONG)already);
+            if (InterlockedIncrement(&doubles)<=40) {
+                fprintf(stderr,"SOTC POOL DOUBLE FREE: pool %#llx range %#llx+%#llx: %u of %u pages already free (first physical %#llx); %ld pages so far of %lld released; stack:",
+                        (unsigned long long)c->Rdi,(unsigned long long)c->Rdx,(unsigned long long)c->Rcx,already,total,
+                        (unsigned long long)first_phys,(long)pages_double,(long long)pages_released);
+                for (int i=0;i<10 && e->stack[i];++i) {
+                    const uintptr_t r=e->stack[i];
+                    if (r-(uintptr_t)image<0x10000000) fprintf(stderr," eboot+%#llx",(unsigned long long)(r-(uintptr_t)image));
+                    else fprintf(stderr," %#llx",(unsigned long long)r);
+                }
+                fprintf(stderr,"\n");
+            }
+        }
+    }
     release_hook_write(release_hook_original);
     release_hook_rearm=1;
     c->EFlags|=0x100; /* put the breakpoint back after this instruction */

@@ -1054,6 +1054,60 @@ static void install_release_hook(void) {
     release_hook_on=1;
     fprintf(stderr,"Runtime: page pool release trace on (eboot+%#x)\n",POOL_RELEASE_OFFSET);
 }
+/* sotc: SOTC_WRITE_TRACE=1 (diagnostic, T38): every write fault (the first CPU write to a page
+ * the GPU watches, and with SOTC_ALIAS_SYNC=1 to its second address too) in a ring with its code
+ * address and stack; runtime_write_fault_dump prints the ones inside a range when a live
+ * texture's memory turned out to hold other content (texture_cache.cpp, SOTC_POOL_WATCH). */
+#define WRITE_RING 65536
+static struct { uintptr_t addr, also; DWORD tid; int guest; uint64_t when; uintptr_t stack[8]; } write_ring[WRITE_RING];
+static volatile LONG64 write_head;
+static int write_trace_on(void) {
+    static int on=-1;
+    if (on<0) { const char *v=getenv("SOTC_WRITE_TRACE"); on=v && v[0]=='1'; }
+    return on;
+}
+static void write_trace_note(const CONTEXT *c, uintptr_t addr, uintptr_t also) {
+    const LONG64 slot=InterlockedIncrement64(&write_head)-1;
+    __typeof__(write_ring[0]) *e=&write_ring[slot%WRITE_RING];
+    e->addr=addr; e->also=also; e->tid=GetCurrentThreadId(); e->guest=runtime_thread_is_guest();
+    e->when=GetTickCount64();
+    memset(e->stack,0,sizeof(e->stack));
+    e->stack[0]=(uintptr_t)c->Rip;
+    uintptr_t fp=(uintptr_t)c->Rbp;
+    for (int i=1;i<8;++i) {
+        if (fp<(uintptr_t)c->Rsp || fp>(uintptr_t)c->Rsp+0x40000 || (fp&7)) break;
+        e->stack[i]=((const uintptr_t *)fp)[1];
+        const uintptr_t next=((const uintptr_t *)fp)[0];
+        if (next<=fp) break;
+        fp=next;
+    }
+}
+void runtime_write_fault_dump(uintptr_t start, uint64_t size) {
+    if (!write_trace_on()) return;
+    static LONG dumps;
+    if (InterlockedIncrement(&dumps)>60) return;
+    const LONG64 head=write_head, n=head<WRITE_RING ? head : WRITE_RING;
+    const uint64_t now=GetTickCount64();
+    int shown=0;
+    for (LONG64 k=1; k<=n && shown<6; ++k) {
+        const __typeof__(write_ring[0]) *e=&write_ring[(head-k)%WRITE_RING];
+        const int in=(e->addr>=start && e->addr<start+size) || (e->also && e->also>=start && e->also<start+size);
+        if (!in) continue;
+        ++shown;
+        fprintf(stderr,"SOTC WRITE into %#llx+%#llx: at %#llx (other address %#llx), thread %lu (%s), %llu ms ago:",
+                (unsigned long long)start,(unsigned long long)size,(unsigned long long)e->addr,
+                (unsigned long long)e->also,e->tid,e->guest ? "guest" : "host",
+                (unsigned long long)(now-e->when));
+        for (int i=0;i<8 && e->stack[i];++i) {
+            const uintptr_t r=e->stack[i];
+            if (image && r-(uintptr_t)image<0x10000000) fprintf(stderr," eboot+%#llx",(unsigned long long)(r-(uintptr_t)image));
+            else fprintf(stderr," %#llx",(unsigned long long)r);
+        }
+        fprintf(stderr,"\n");
+    }
+    if (!shown) fprintf(stderr,"SOTC WRITE into %#llx+%#llx: no write fault there in the last %lld\n",
+                        (unsigned long long)start,(unsigned long long)size,(long long)n);
+}
 static int release_hook_trap(EXCEPTION_POINTERS *info) {
     CONTEXT *c=info->ContextRecord;
     if (!release_hook_on) return 0;
@@ -1205,6 +1259,7 @@ static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
          * writable here, which is what both believe after a write. */
         if (gpu_enabled && record->ExceptionInformation[0]==1) {
             const uintptr_t at=(uintptr_t)record->ExceptionInformation[1], other=runtime_memory_alias_of(at);
+            if (write_trace_on()) write_trace_note(info->ContextRecord,at,other);
             if (other) {
                 const int here=bbgpu_handle_fault(info,(void *)at), there=bbgpu_handle_fault(info,(void *)other);
                 if (runtime_memory_alias_release(at)) {

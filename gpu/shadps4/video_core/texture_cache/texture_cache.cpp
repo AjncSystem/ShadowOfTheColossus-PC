@@ -37,6 +37,9 @@
 #include "video_core/sotc_stats.h"
 #include "video_core/texture_cache/tile_manager.h"
 
+// sotc: src/probe.c (SOTC_WRITE_TRACE): the write faults recorded inside a range.
+extern "C" void runtime_write_fault_dump(uintptr_t start, uint64_t size) __attribute__((weak));
+
 namespace VideoCore {
 
 void ReentrantMutex::AsymmetricBarrier() {
@@ -1248,6 +1251,10 @@ void TextureCache::RefreshImage(Image& image) {
                                  vk::to_string(image.info.pixel_format).c_str(),
                                  image.info.resources.levels, image.info.sotc_first_mip,
                                  image.sotc_uploads, u32(image.flags));
+                    // sotc: SOTC_WRITE_TRACE=1: the CPU writes that reached it (src/probe.c)
+                    if (runtime_write_fault_dump) {
+                        runtime_write_fault_dump(image.info.guest_address, bytes);
+                    }
                 }
                 image.sotc_first_hash = h; // report each change once
             }

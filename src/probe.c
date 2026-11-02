@@ -1072,7 +1072,17 @@ static int release_hook_trap(EXCEPTION_POINTERS *info) {
                 (long long)slot,(unsigned long long)c->Rdi,(unsigned long long)c->Rsi,(unsigned long long)c->Rdx,
                 (unsigned long long)c->Rcx,(unsigned long long)c->R8,
                 (unsigned long long)(*(const uintptr_t *)(uintptr_t)c->Rsp-(uintptr_t)image));
-    if (slot<24) { /* the bit index is (VirtualQuery offset of rdx - this base) >> 16 */
+    { /* the bit index is (VirtualQuery offset of rdx - this base) >> 16 */
+        uint64_t view=0; const unsigned char *base=runtime_memory_backing_view(&view), *at=runtime_memory_backing_pointer((uintptr_t)c->Rdx);
+        /* SOTC_POOL_WATCH reads bit n as 0x1000300000 + n * 64 KiB: report releases off that map
+         * (pages the game remapped elsewhere) */
+        static LONG remapped;
+        if (at && base && c->Rdi==0x1000000140 && (uint64_t)(at-base)!=(uint64_t)c->Rdx-0x1000200000 &&
+            InterlockedIncrement(&remapped)<=40)
+            fprintf(stderr,"SOTC POOL RELEASE off the map: rdx %#llx +%#llx is physical %#llx\n",
+                    (unsigned long long)c->Rdx,(unsigned long long)c->Rcx,(unsigned long long)(at-base));
+    }
+    if (slot<24) {
         uint64_t view=0; const unsigned char *base=runtime_memory_backing_view(&view), *at=runtime_memory_backing_pointer((uintptr_t)c->Rdx);
         fprintf(stderr,"SOTC POOL RELEASE base %#llx, phys of rdx %#llx (rdx - 0x1000000000 = %#llx)\n",
                 (unsigned long long)*(const uint64_t *)(image+0x2dfca70),(unsigned long long)(at && base ? at-base : 0),

@@ -168,7 +168,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'fg_hudless': True,
                 'dlss_mode': 'quality', 'dlss_sharpen': '0', 'dlss_ui_sharpen': '3', 'dlss_sky_sharpen': '2',
                 'dlss_compare': False, 'hdr': False,
-                'check_updates': True, 'skip_version': ''}
+                'check_updates': True, 'skip_version': '', 'play_mode': 'custom'}
 # sotc: improvements that changed a default, by the version that changed it. Settings saved by an
 # older launcher get them once when this one first loads them (load_settings). Every release that
 # changes a default for the better adds its entry here.
@@ -249,6 +249,35 @@ GRASS_DETAIL = [('1', ('Como no PS4', 'As on PS4')),
 VOLUME = [('100', ('100% (original)', '100% (original)')), ('150', ('150%', '150%')),
           ('200', ('200%', '200%')), ('300', ('300% (máximo)', '300% (maximum)'))]
 VRAM_LIMITS = {'low': ('50', '1024'), 'normal': ('60', '1536'), 'high': ('75', '4096'), 'max': ('85', '0')}
+# Play modes (Jogar tab): each one sets the settings below; changing one of them by hand afterwards
+# makes the mode Custom. Extreme's upscaler is DLSS on an NVIDIA RTX card, FSR 1 on the others.
+PLAY_MODES = [('normal', ('Normal (PS4 puro)', 'Normal (plain PS4)')),
+              ('pro', ('Pro (PS4 Pro + qualidade)', 'Pro (PS4 Pro + quality)')),
+              ('extreme', ('Extremo (tudo no máximo)', 'Extreme (everything maxed)')),
+              ('custom', ('Personalizado', 'Custom'))]
+_PS4_GRASS = {'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1', 'weed_distance': '1',
+              'weed_height': '1', 'grass_fade': '1'}
+PLAY_MODE_VALUES = {
+    'normal': {'neo': False, 'fps_mode': '30', 'textures': 'high', 'af16': False, 'upscaler': 'fsr1',
+               'sharpness': '250', 'vram_use': 'normal', **_PS4_GRASS, 'grass_detail': '1'},
+    'pro': {'neo': True, 'fps_mode': '30', 'textures': 'high', 'af16': True, 'vram_use': 'high',
+            **_PS4_GRASS, 'grass_detail': '0.25'},
+    'extreme': {'neo': True, 'fps_mode': '60', 'textures': 'max', 'af16': True, 'vram_use': 'max',
+                'grass_shadows': '3', 'grass_distance': '2', 'grass_height': '1', 'weed_distance': '2',
+                'weed_height': '1', 'grass_fade': '1', 'grass_detail': '0.15', 'dlss_mode': 'quality'},
+}
+PLAY_MODE_HINTS = {
+    'normal': ('Como no PS4: 30 FPS, texturas altas, grama e sombras do console, sem o modo Pro.',
+               "As on PS4: 30 FPS, high textures, the console's grass and shadows, no Pro mode."),
+    'pro': ('Modo PS4 Pro a 30 FPS com texturas altas, filtro 16x e grama mais cheia.',
+            'PS4 Pro mode at 30 FPS with high textures, 16x filtering and fuller grass.'),
+    'extreme': ('Modo Pro a 60 FPS, texturas máximas, sombras e grama até mais longe, DLSS na RTX. '
+                'Pede uma placa forte (8 GB ou mais).',
+                'Pro mode at 60 FPS, maximum textures, shadows and grass farther out, DLSS on RTX. '
+                'Needs a strong card (8 GB or more).'),
+    'custom': ('Os ajustes abaixo e as outras abas ficam como você deixar.',
+               'The settings below and the other tabs stay as you set them.'),
+}
 
 
 def sdl_key_name(keysym):
@@ -1164,6 +1193,9 @@ class Launcher:
         quick.grid(row=0, column=1, sticky='nw')
         ttk.Label(quick, text=_('Ajustes rápidos', 'Quick settings'), style='Section.TLabel').grid(
             row=0, column=0, columnspan=2, sticky='w', pady=(0, 2))
+        self.row(quick, _('Modo de jogo', 'Play mode'), self.choice(quick, 'play_mode', PLAY_MODES, 24))
+        self.play_mode_hint = ttk.Label(quick, text='', style='Muted.TLabel', wraplength=self.px(300), justify='left')
+        self.play_mode_hint.grid(row=self.next_row(quick), column=0, columnspan=2, sticky='w', pady=(2, 2))
         self.row(quick, _('Saída', 'Output'), self.choice(quick, 'output_res', OUTPUTS, 24))
         self.row(quick, _('Upscaler', 'Upscaler'), self.choice(quick, 'upscaler', UPSCALERS, 24))
         self.row(quick, _('Nitidez (RCAS)', 'Sharpening (RCAS)'), self.choice(quick, 'sharpness', SHARPNESS, 24))
@@ -1177,6 +1209,46 @@ class Launcher:
                                       'More FPS: fast GPU readbacks (experimental)'))
         for key in ('af16', 'textures', 'fps_mode', 'fullscreen', 'neo', 'output_res', 'upscaler', 'sharpness', 'framegen'):
             self.vars[key].trace_add('write', lambda *_a: self.refresh_status())
+        self.applying_mode = False
+        self.var('play_mode').trace_add('write', lambda *_a: self.apply_play_mode())
+        for key in {k for values in PLAY_MODE_VALUES.values() for k in values} | {'upscaler'}:
+            self.var(key).trace_add('write', lambda *_a, k=key: self.play_mode_edited(k))
+        self.show_play_mode_hint()
+
+    def play_mode_values(self, mode):
+        values = dict(PLAY_MODE_VALUES.get(mode, {}))
+        if mode == 'extreme':
+            name = getattr(self, 'gpu_name', '').upper()
+            values['upscaler'] = 'dlss' if 'NVIDIA' in name and 'RTX' in name else 'fsr1'
+        return values
+
+    def show_play_mode_hint(self):
+        self.play_mode_hint.configure(text=_(*PLAY_MODE_HINTS.get(self.var('play_mode').get(), ('', ''))))
+
+    def apply_play_mode(self):
+        """The chosen mode's settings (Custom changes nothing)."""
+        self.show_play_mode_hint()
+        values = self.play_mode_values(self.var('play_mode').get())
+        self.applying_mode = True
+        try:
+            for key, value in values.items():
+                self.var(key).set(value)
+        finally:
+            self.applying_mode = False
+
+    def play_mode_edited(self, key):
+        """A setting of the mode changed by hand: the mode becomes Custom."""
+        if self.applying_mode:
+            return
+        mode = self.var('play_mode').get()
+        values = self.play_mode_values(mode)
+        if key in values and str(self.var(key).get()) != str(values[key]):
+            self.applying_mode = True
+            try:
+                self.var('play_mode').set('custom')
+                self.show_play_mode_hint()
+            finally:
+                self.applying_mode = False
 
     def draw_banner(self):
         """The dump's own art (sce_sys/pic1.png) under the title."""
@@ -1728,6 +1800,7 @@ class Launcher:
                                     env=env, creationflags=NO_WINDOW)
             names = [line[5:].split(':')[0] for line in result.stderr.splitlines() if line.startswith('GPU: ')]
             if names:
+                self.gpu_name = names[0]
                 text = _('✓ Placa de vídeo: {}', '✓ Graphics card: {}').format(names[0])
             elif result.returncode:
                 text = _('✗ Nenhuma placa com Vulkan 1.3 (atualize o driver)',

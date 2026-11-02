@@ -18,6 +18,11 @@
   letras) continuava desligada para quem já tinha a configuração gravada. Agora cada versão liga uma
   vez as melhorias dela: nesta, HUD sem tremer na geração de quadros, motion blur desligado (sem rastro
   da sombra em áreas escuras) e logotipos de abertura pulados.
+- **Lançador: "Modo de jogo" na aba Jogar.** Quatro modos: **Normal** (como no PS4: 30 FPS, texturas
+  altas, grama e sombras do console, sem o modo Pro), **Pro** (modo PS4 Pro a 30 FPS, texturas altas,
+  filtro 16x, grama mais cheia), **Extremo** (modo Pro a 60 FPS, texturas máximas, sombras e grama até
+  mais longe, memória de vídeo no máximo, DLSS na RTX e FSR 1 nas outras placas; pede uma placa forte)
+  e **Personalizado** (tudo como você deixar). Mudar à mão um ajuste do modo passa para Personalizado.
 - **Memória flexível:** ao dividir um mapeamento flexível, a metade direita apontava para o armazenamento
   da metade esquerda (não acontecia neste jogo nos testes, mas estava errado).
 - **Lançador: logotipos de abertura pulados por padrão** (instalações novas).

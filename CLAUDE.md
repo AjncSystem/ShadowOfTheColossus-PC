@@ -115,6 +115,10 @@ newer ones appear in `CHANGELOG.md` entries. Session log goes to `user/last_run.
   `launcher:`, `docs:`, `diagnostics:`, `lod stats:`; releases are `Release X.YY: <summary>`.
 - A release bumps `VERSION` in `launcher/sotc_launcher_win.py`, the version/table in `README.md`
   (both languages), and adds a Portuguese `CHANGELOG.md` entry.
+- **Every default changed for the better goes into `DEFAULT_UPGRADES`** (launcher, by version):
+  settings saved by an older version keep their old value otherwise, so existing installs never
+  get the fix. The launcher applies each entry once, when its version first loads older settings
+  (`settings_version`). User rule: an update turns all its improvements on automatically.
 - Changes to recompiler/shader output invalidate the user's shader cache; CHANGELOG entries note
   "O cache de shaders é refeito na primeira abertura" when that happens.
 - C code: C11, `-Wall -Wextra -Werror` on the Linux build; third-party decoders (LibAtrac9) are

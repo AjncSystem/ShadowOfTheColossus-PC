@@ -169,6 +169,14 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'dlss_mode': 'quality', 'dlss_sharpen': '0', 'dlss_ui_sharpen': '3', 'dlss_sky_sharpen': '2',
                 'dlss_compare': False, 'hdr': False,
                 'check_updates': True, 'skip_version': ''}
+# sotc: improvements that changed a default, by the version that changed it. Settings saved by an
+# older launcher get them once when this one first loads them (load_settings). Every release that
+# changes a default for the better adds its entry here.
+DEFAULT_UPGRADES = [
+    # HUD and letters stop shaking with frame generation; no shadow trail in dark areas (motion
+    # blur); straight to the game.
+    ('0.71', {'fg_hudless': True, 'fx_motionblur': False, 'skip_logos': True}),
+]
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
 KEY_INPUTS = [
     ('move_up', 'W', ('Andar para frente', 'Move forward')), ('move_down', 'S', ('Andar para trás', 'Move back')),
@@ -574,11 +582,14 @@ def load_settings():
         settings['fps_mode'] = '60' if saved.get('fps60') else '30'
     if 'textures' not in saved:  # before the levels: the "high quality textures" box
         settings['textures'] = 'high' if saved.get('hq_textures', True) else 'off'
-    if saved and 'fg_hudless_071' not in saved:
-        # 0.71 turned the HUD-less frame on by default (the HUD and letters stop shaking with
-        # frame generation), but older settings kept it saved off: turned on once.
-        settings['fg_hudless'] = True
-        settings['fg_hudless_071'] = True
+    # Rule: an update turns its improvements on in settings saved by an older version, once
+    # (DEFAULT_UPGRADES). A saved value would otherwise keep the old default for good.
+    if saved:
+        before = sotc_update.version_key(str(saved.get('settings_version') or '0'))
+        for version, values in DEFAULT_UPGRADES:
+            if before < sotc_update.version_key(version):
+                settings.update(values)
+    settings['settings_version'] = VERSION
     if 'framegen' not in saved:
         extra = str(settings.get('extra_env', '')).split()
         if 'SOTC_DLSSG=1' in extra:

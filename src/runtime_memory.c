@@ -806,6 +806,13 @@ static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
     printf("Runtime: direct allocation offset=0x%" PRIx64 ", size=%" PRIu64 " bytes, type=%d\n", start, size, type);
     return 0;
 }
+static uint64_t alias_ms(void) {
+#ifdef _WIN32
+    return GetTickCount64();
+#else
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000+(uint64_t)t.tv_nsec/1000000;
+#endif
+}
 static int32_t map_direct_locked(void **out, uint64_t size, int prot, int flags, int64_t physical, uint64_t alignment) {
     if (!alignment) alignment=PAGE;
     if (!out || physical < 0 || (uint64_t)physical % PAGE || !size || size % PAGE || !valid_alignment(alignment) ||
@@ -820,11 +827,41 @@ static int32_t map_direct_locked(void **out, uint64_t size, int prot, int flags,
     if (!result && alias_log) {
         static unsigned long aliases, logged;
         const uintptr_t at=(uintptr_t)*out; const uint64_t p=(uint64_t)physical;
+        /* Pairs seen, checked once a second: how long both addresses stay on the same pages. */
+        enum { PAIRS=4096 };
+        static struct { uintptr_t a, b; uint64_t phys, size, since; } pairs[PAIRS];
+        static size_t npairs; static uint64_t last_check, worst_ms;
+        const uint64_t now=alias_ms();
+        if (now-last_check>=1000) {
+            last_check=now;
+            size_t live=0; uint64_t live_bytes=0, oldest=0;
+            for (size_t k=0;k<npairs;) {
+                size_t ia=vma_index(pairs[k].a), ib=vma_index(pairs[k].b);
+                const int both=ia<vma_count && ib<vma_count && vmas[ia].kind==KIND_DIRECT && vmas[ib].kind==KIND_DIRECT &&
+                    vmas[ia].start<=pairs[k].a && vmas[ib].start<=pairs[k].b &&
+                    vmas[ia].phys+(pairs[k].a-vmas[ia].start)==pairs[k].phys &&
+                    vmas[ib].phys+(pairs[k].b-vmas[ib].start)==pairs[k].phys;
+                const uint64_t age=now-pairs[k].since;
+                if (!both) {
+                    if (age>worst_ms) worst_ms=age;
+                    pairs[k]=pairs[--npairs]; continue;
+                }
+                ++live; live_bytes+=pairs[k].size; if (age>oldest) oldest=age; ++k;
+            }
+            if (live || worst_ms)
+                fprintf(stderr,"Runtime: ALIAS live %zu pairs (%" PRIu64 " KiB), oldest %" PRIu64 " ms; longest ended %" PRIu64 " ms; %lu in all\n",
+                        live,live_bytes>>10,oldest,worst_ms,aliases);
+        }
         for (size_t i=0;i<vma_count;++i) {
             const Vma *v=&vmas[i];
             if (v->kind!=KIND_DIRECT || (v->start<at+size && at<v->end)) continue;
             if (v->phys<p+size && p<v->phys+(v->end-v->start)) {
                 ++aliases;
+                if (npairs<PAIRS) {
+                    const uint64_t lo=v->phys>p ? v->phys : p;
+                    const uint64_t hi=v->phys+(v->end-v->start)<p+size ? v->phys+(v->end-v->start) : p+size;
+                    pairs[npairs++]=(__typeof__(pairs[0])){at+(lo-p),v->start+(lo-v->phys),lo,hi-lo,now};
+                }
                 if (logged<60) {
                     ++logged;
                     fprintf(stderr,"Runtime: ALIAS physical %#" PRIx64 "+%#" PRIx64 " mapped at %p, already at %p-%p (physical %#" PRIx64 "), %lu so far\n",

@@ -25,6 +25,7 @@ import time
 import zipfile
 
 import sotc_frame
+import sotc_hardware
 import sotc_search
 import sotc_theme as theme
 import sotc_update
@@ -2445,76 +2446,315 @@ class Launcher(sotc_search.SearchMixin):
             self.import_save_folders(self.find_saves(temp))
 
     # ---- first start: the setup screen -------------------------------------------------------
+    # The guide's steps: (title, under the title), named after the game's journey.
+    SETUP_STEPS = [(('O Despertar', 'The Awakening'), ('Boas-vindas', 'Welcome')),
+                   (('O Santuário', 'The Shrine'), ('O seu jogo', 'Your game')),
+                   (('A Espada Antiga', 'The Ancient Sword'), ('O seu PC', 'Your PC')),
+                   (('Agro', 'Agro'), ('Controles', 'Controls')),
+                   (('A Terra Proibida', 'The Forbidden Land'), ('Pronto para jogar', 'Ready to play'))]
+
     def show_setup(self):
-        """A full-window welcome screen: asks for the game folder, then sets up DLC, saves and
-        sound on its own and shows what it found."""
-        tk, ttk = self.tk, self.ttk
+        """The first setup as a guide in five steps, as in the bloodborne_pc launcher: the steps on
+        the left, the step on the right, Back and Next at the bottom."""
+        tk, ttk, px = self.tk, self.ttk, self.px
         if getattr(self, 'setup_frame', None):
             self.setup_frame.destroy()
-        frame = self.setup_frame = tk.Frame(self.root, bg=BG)
-        frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+        top = self.titlebar.winfo_reqheight() if self.titlebar is not None and self.custom_frame is not False else 0
+        frame = self.setup_frame = tk.Frame(self.root, bg=PANEL)
+        frame.place(x=0, y=top, relwidth=1, relheight=1, height=-top)
         frame.lift()
-        # The launcher's language, first thing (names in their own language); the launcher opens
-        # again in it.
-        lang_box = tk.Frame(frame, bg=BG)
-        lang_box.place(relx=1.0, rely=0.0, anchor='ne', x=-self.px(20), y=self.px(16))
-        tk.Label(lang_box, text='🌐', bg=BG, fg=MUTED, font=(ui_font(), 13)).pack(side='left', padx=(0, 6))
-        names = [(code, labels[0]) for code, labels in UI_LANGUAGES if code]
-        lang_var = tk.StringVar(value=dict(names).get(LANG, 'English'))
-        lang_combo = ttk.Combobox(lang_box, textvariable=lang_var, values=[name for _c, name in names],
-                                  state='readonly', width=14, font=(ui_font(), 11))
-        lang_combo.pack(side='left')
-
-        def language_chosen(_event=None):
-            code = next((c for c, name in names if name == lang_var.get()), '')
-            if code and code != LANG:
-                self.var('ui_language').set(code)
-                self.collect()
-                self.restart()
-        lang_combo.bind('<<ComboboxSelected>>', language_chosen)
-        inner = tk.Frame(frame, bg=BG)
-        inner.place(relx=0.5, rely=0.45, anchor='center')
-        tk.Label(inner, text='SHADOW OF THE COLOSSUS', bg=BG, fg=GOLD, font=(title_font(), 26)).pack()
-        tk.Label(inner, text=_('Bem-vindo. Só falta dizer onde está o jogo.',
-                               'Welcome. Just tell us where the game is.'),
-                 bg=BG, fg=TEXT, font=(ui_font(), 13)).pack(pady=(8, 26))
-        self.setup_button = ttk.Button(inner, text=_('Escolher a pasta do jogo…', 'Choose the game folder…'),
-                                       style='Play.TButton', command=self.choose_game_for_setup)
-        self.setup_button.pack(ipadx=18)
-        tk.Label(inner, text=_('A pasta principal do jogo, como no shadPS4: as subpastas do jogo (CUSA08809 ou '
-                               'CUSA08034), da atualização (-UPDATE/-patch) e das DLCs são encontradas sozinhas.',
-                               "The game's main folder, as in shadPS4: the game (CUSA08809 or CUSA08034), update "
-                               '(-UPDATE/-patch) and DLC subfolders are found on their own.'),
-                 bg=BG, fg=MUTED, font=(ui_font(), 10), wraplength=self.px(560), justify='center').pack(pady=(10, 0))
-        self.setup_hint = tk.Label(inner, text='', bg=BG, fg=MUTED, font=(ui_font(), 10), cursor='hand2',
-                                   wraplength=self.px(640), justify='center')
-        self.setup_hint.pack(pady=(18, 0))
-        self.setup_results = tk.Frame(inner, bg=BG)
-        self.setup_results.pack(pady=(18, 0), fill='x')
-        self.setup_found_game = None
-        # Meanwhile look for the game on this PC, to offer it with one click.
+        rail = tk.Frame(frame, bg=BG, width=px(280))
+        rail.pack(side='left', fill='y')
+        rail.pack_propagate(False)
+        tk.Frame(frame, bg=LINE, width=1).pack(side='left', fill='y')
+        tk.Label(rail, text=_('PRIMEIRA JORNADA', 'FIRST JOURNEY'), bg=BG, fg=GOLD, font=(title_font(), 9)).pack(
+            anchor='w', padx=px(26), pady=(px(34), 0))
+        tk.Label(rail, text=_('Configuração inicial', 'First setup'), bg=BG, fg=theme.TEXT_STRONG,
+                 font=(title_font(), 14), wraplength=px(230), justify='left').pack(anchor='w', padx=px(26),
+                                                                                  pady=(px(2), px(26)))
+        self.setup_rail = []
+        for k, (title, sub) in enumerate(self.SETUP_STEPS):
+            c = tk.Canvas(rail, width=px(250), height=px(58), bg=BG, highlightthickness=0, bd=0)
+            c.pack(padx=px(14))
+            self.setup_rail.append((c, _(*title), _(*sub)))
+        tk.Frame(rail, bg=BG).pack(fill='both', expand=True)
+        skip = tk.Label(rail, text=_('Pular: eu configuro sozinho', 'Skip: I set it up myself'), bg=BG, fg=MUTED,
+                        font=(ui_font(), 9, 'underline'), cursor='hand2')
+        skip.pack(pady=(0, px(20)))
+        skip.bind('<Button-1>', lambda _e: self.finish_setup())
+        right = tk.Frame(frame, bg=PANEL)
+        right.pack(side='left', fill='both', expand=True)
+        bar = tk.Frame(right, bg=BG, height=px(72))
+        bar.pack(side='bottom', fill='x')
+        bar.pack_propagate(False)
+        tk.Frame(right, bg=LINE, height=1).pack(side='bottom', fill='x')
+        self.setup_counter = tk.Label(bar, text='', bg=BG, fg=MUTED, font=(title_font(), 10))
+        self.setup_counter.pack(side='left', padx=px(30))
+        self.setup_next = ttk.Button(bar, text='', style='Bar.Accent.TButton', command=lambda: self.setup_go(1))
+        self.setup_next.pack(side='right', padx=(px(8), px(26)))
+        self.setup_back = ttk.Button(bar, text=_('Voltar', 'Back'), style='Bar.TButton', command=lambda: self.setup_go(-1))
+        self.setup_back.pack(side='right')
+        head = tk.Frame(right, bg=PANEL)
+        head.pack(fill='x', padx=px(40), pady=(px(26), px(8)))
+        self.setup_kicker = tk.Label(head, text='', bg=PANEL, fg=GOLD, font=(title_font(), 9))
+        self.setup_kicker.pack(anchor='w')
+        self.setup_title = tk.Label(head, text='', bg=PANEL, fg=theme.TEXT_STRONG, font=(title_font(), 24))
+        self.setup_title.pack(anchor='w')
+        self.setup_lead = tk.Label(head, text='', bg=PANEL, fg=MUTED, font=(ui_font(), 10), justify='left',
+                                   wraplength=px(640))
+        self.setup_lead.pack(anchor='w', pady=(px(4), 0))
+        self.setup_body = tk.Frame(right, bg=PANEL)
+        self.setup_body.pack(fill='both', expand=True, padx=px(40), pady=(px(10), 0))
+        self.setup_step, self.setup_found_game, self.setup_hw = 0, None, None
+        self.setup_show(0)
+        # Meanwhile: the game on this PC (offered with one click) and the PC check.
         current = self.var('game_dir').get()
-        if game_info(current):
-            self.offer_game(current)
-        else:
-            self.setup_hint.configure(text=_('Procurando o jogo neste PC…', 'Looking for the game on this PC…'))
-
+        if not game_info(current):
             def work():
                 try:
                     from sotc_discovery import scan
                     games = scan(seconds=25, extra_roots=[str(PORT_DIR.parent)])['games']
                 except Exception:  # never stop the launcher over a search problem
                     games = []
-                self.ui_calls.put(lambda: self.offer_game(games[0]['path']) if games else
-                                  self.setup_hint.configure(text=''))
+                self.setup_found_game = games[0]['path'] if games else None
+                self.ui_calls.put(lambda: self.setup_step == 1 and self.setup_show(1))
             threading.Thread(target=work, daemon=True).start()
+
+    def setup_paint_rail(self):
+        px = self.px
+        for k, (c, title, sub) in enumerate(self.setup_rail):
+            c.delete('all')
+            on, done = k == self.setup_step, k < self.setup_step
+            mid = px(29)
+            if k < len(self.setup_rail) - 1:  # the path down to the next step
+                c.create_line(px(22), mid + px(14), px(22), px(58), fill=GOLD if done else LINE, width=max(1, px(1)))
+            ring = SIGIL if on else GOLD if done else theme.BORDER_STRONG
+            c.create_oval(px(8), mid - px(14), px(36), mid + px(14), outline=ring, width=max(1, px(1.5)),
+                          fill=theme.SIGIL if on else BG)
+            numeral = ('I', 'II', 'III', 'IV', 'V')[k]
+            c.create_text(px(22), mid, text='✓' if done else numeral, fill=theme.TEXT_STRONG if on else GOLD if done else MUTED,
+                          font=(title_font(), 9))
+            c.create_text(px(50), mid - px(8), text=title, anchor='w', font=(title_font(), 11),
+                          fill=theme.TEXT_STRONG if on else TEXT if done else theme.TEXT_SOFT)
+            c.create_text(px(50), mid + px(10), text=sub, anchor='w', font=(ui_font(), 9), fill=MUTED)
+
+    def setup_card(self, title=None, warning=False):
+        """A rounded card in the step's body."""
+        card = self.ttk.Frame(self.setup_body, style='Card.TFrame', padding=(self.px(20), self.px(16)))
+        card.pack(fill='x', pady=(0, self.px(12)))
+        if title:
+            self.ttk.Label(card, text=title, style='Card.Section.TLabel',
+                           foreground='#e07a6a' if warning else None).pack(anchor='w', pady=(0, self.px(6)))
+        return card
+
+    def setup_line(self, parent, mark, text):
+        color = GOLD if mark == '✓' else '#d9b441' if mark == '⚠' else '#d36b5c' if mark == '✗' else MUTED
+        row = self.ttk.Frame(parent, style='Inner.TFrame')
+        row.pack(anchor='w', pady=self.px(2), fill='x')
+        self.ttk.Label(row, text=mark, style='Card.TLabel', foreground=color, width=2).pack(side='left', anchor='n')
+        self.ttk.Label(row, text=text, style='Card.TLabel', wraplength=self.px(600), justify='left').pack(side='left')
+
+    def setup_show(self, step):
+        tk, ttk, px = self.tk, self.ttk, self.px
+        self.setup_step = step
+        for child in self.setup_body.winfo_children():
+            child.destroy()
+        title, sub = self.SETUP_STEPS[step]
+        numeral = ('I', 'II', 'III', 'IV', 'V')[step]
+        self.setup_kicker.configure(text=f'{numeral} · {_(*title).upper()}')
+        self.setup_counter.configure(text=_('Etapa {} de 5', 'Step {} of 5').format(step + 1))
+        self.setup_back.configure(state='normal' if step else 'disabled')
+        self.setup_next.configure(text=_('Começar a jornada  ›', 'Begin the journey  ›') if step == 4 else _('Avançar  ›', 'Next  ›'),
+                                  state='normal')
+        self.setup_paint_rail()
+        getattr(self, ('setup_welcome', 'setup_game', 'setup_pc', 'setup_controls', 'setup_ready')[step])()
+
+    def setup_go(self, step):
+        target = self.setup_step + step
+        if step > 0 and self.setup_step == 2 and getattr(self, 'setup_mode_var', None):
+            self.var('play_mode').set(self.setup_mode_var.get())  # the chosen mode sets its settings
+        if target > 4:
+            self.finish_setup()
+            return
+        self.collect()
+        self.setup_show(max(0, target))
+
+    # -- I · the awakening
+    def setup_welcome(self):
+        tk, ttk = self.tk, self.ttk
+        self.setup_title.configure(text=_('Bem-vindo, viajante', 'Welcome, wanderer'))
+        self.setup_lead.configure(text=_('Alguns passos até a Terra Proibida. Tudo pode ser mudado depois no launcher.',
+                                         'A few steps to the Forbidden Land. Everything can be changed later in the launcher.'))
+        card = self.setup_card()
+        row = ttk.Frame(card, style='Inner.TFrame')
+        row.pack(anchor='w')
+        ttk.Label(row, text=_('Idioma do launcher', 'Launcher language'), style='Card.TLabel').pack(side='left', padx=(0, self.px(14)))
+        names = [(code, labels[0]) for code, labels in UI_LANGUAGES if code]
+        lang_var = tk.StringVar(value=dict(names).get(LANG, 'English'))
+        combo = ttk.Combobox(row, textvariable=lang_var, values=[n for _c, n in names], state='readonly',
+                             width=16, style='Card.TCombobox')
+        combo.pack(side='left')
+
+        def chosen(_event=None):
+            code = next((c for c, n in names if n == lang_var.get()), '')
+            if code and code != LANG:
+                self.var('ui_language').set(code)
+                self.collect()
+                self.restart()
+        combo.bind('<<ComboboxSelected>>', chosen)
+        card = self.setup_card(_('Só com a sua própria cópia do jogo', 'Only with your own copy of the game'), warning=True)
+        ttk.Label(card, text=_('O port não vem com o jogo e não distribui arquivos dele. Use o dump do seu console '
+                               '(decriptado), como no shadPS4.',
+                               'The port does not come with the game and shares none of its files. Use the dump of your '
+                               'own console (decrypted), as with shadPS4.'),
+                  style='Card.TLabel', wraplength=self.px(640), justify='left').pack(anchor='w')
+        card = self.setup_card(_('O que você precisa', 'What you need'))
+        for mark, text in (('•', _('O dump do jogo: CUSA08809 (europeu, versão 1.01) ou CUSA08034 (americano, 1.00), '
+                                   'com a atualização ao lado.',
+                                   'The game dump: CUSA08809 (European, version 1.01) or CUSA08034 (American, 1.00), '
+                                   'with its update next to it.')),
+                           ('•', _('Os módulos de som do seu console (libSceNgs2, libSceUlt), para ter som.',
+                                   "Your console's sound modules (libSceNgs2, libSceUlt), for sound.")),
+                           ('•', _('Uma placa de vídeo com Vulkan 1.3 e o driver atualizado.',
+                                   'A video card with Vulkan 1.3 and an up-to-date driver.')),
+                           ('•', _('O jogo num SSD ou NVMe: num HD as trocas de área travam muito mais.',
+                                   'The game on an SSD or NVMe drive: on a hard disk area changes stutter far more.'))):
+            self.setup_line(card, mark, text)
+
+    # -- II · the shrine
+    def setup_game(self):
+        ttk = self.ttk
+        self.setup_title.configure(text=_('Onde está o seu jogo?', 'Where is your game?'))
+        self.setup_lead.configure(text=_('A pasta principal do jogo, como no shadPS4: as subpastas do jogo, da atualização '
+                                         '(-UPDATE/-patch) e das DLCs são encontradas sozinhas.',
+                                         "The game's main folder, as in shadPS4: the game, update (-UPDATE/-patch) and "
+                                         'DLC subfolders are found on their own.'))
+        card = self.setup_card()
+        row = ttk.Frame(card, style='Inner.TFrame')
+        row.pack(anchor='w')
+        self.setup_button = ttk.Button(row, text=_('Escolher a pasta do jogo…', 'Choose the game folder…'),
+                                       style='Card.Accent.TButton', command=self.choose_game_for_setup)
+        self.setup_button.pack(side='left')
+        self.setup_hint = ttk.Label(card, text='', style='Card.TLabel', cursor='hand2', wraplength=self.px(640))
+        self.setup_hint.pack(anchor='w', pady=(self.px(10), 0))
+        self.setup_results = ttk.Frame(self.setup_body, style='TFrame')
+        self.setup_results.pack(fill='x')
+        current = self.var('game_dir').get()
+        if game_info(current):
+            self.configure_from_game(current)
+        elif self.setup_found_game:
+            self.offer_game(self.setup_found_game)
+        else:
+            self.setup_hint.configure(text=_('Procurando o jogo neste PC…', 'Looking for the game on this PC…'),
+                                      foreground=MUTED)
+        if not game_info(current):
+            self.setup_next.configure(state='disabled')
+
+    # -- III · the ancient sword
+    def setup_pc(self):
+        ttk = self.ttk
+        self.setup_title.configure(text=_('A força da sua espada', "Your sword's strength"))
+        self.setup_lead.configure(text=_('O launcher olha o seu PC e escolhe o modo de jogo que ele aguenta. Você pode '
+                                         'trocar aqui ou depois na aba Jogar.',
+                                         'The launcher looks at your PC and picks the play mode it can hold. You can '
+                                         'change it here or later on the Play page.'))
+        self.setup_pc_card = self.setup_card(_('O seu PC', 'Your PC'))
+        ttk.Label(self.setup_pc_card, text=_('Verificando…', 'Checking…'), style='Card.TLabel').pack(anchor='w')
+        card = self.setup_card(_('Modo de jogo', 'Play mode'))
+        row = ttk.Frame(card, style='Inner.TFrame')
+        row.pack(anchor='w')
+        self.setup_mode_var = self.tk.StringVar(value=self.var('play_mode').get() or 'custom')
+        values = [v for v, _t in PLAY_MODES]
+        combo = ttk.Combobox(row, values=[_(*t) for _v, t in PLAY_MODES], state='readonly', width=30, style='Card.TCombobox')
+        combo.pack(side='left')
+        combo.current(values.index(self.setup_mode_var.get()) if self.setup_mode_var.get() in values else 3)
+        combo.bind('<<ComboboxSelected>>', lambda _e: self.setup_mode_var.set(values[combo.current()]))
+        self.setup_mode_combo, self.setup_mode_values = combo, values
+        self.setup_mode_hint = ttk.Label(card, text='', style='Card.TLabel', wraplength=self.px(640), justify='left',
+                                         foreground=MUTED)
+        self.setup_mode_hint.pack(anchor='w', pady=(self.px(8), 0))
+        self.setup_mode_var.trace_add('write', lambda *_a: self.setup_mode_hint.configure(
+            text=_(*PLAY_MODE_HINTS.get(self.setup_mode_var.get(), ('', '')))) if self.setup_mode_hint.winfo_exists() else None)
+        self.setup_mode_hint.configure(text=_(*PLAY_MODE_HINTS.get(self.setup_mode_var.get(), ('', ''))))
+        if self.setup_hw:
+            self.setup_pc_done(self.setup_hw)
+        else:
+            game, gpu = self.var('game_dir').get(), self.gpu_text
+
+            def work():
+                info = sotc_hardware.check(game, gpu)
+                self.ui_calls.put(lambda: self.setup_pc_done(info, fresh=True))
+            threading.Thread(target=work, daemon=True).start()
+
+    def setup_pc_done(self, info, fresh=False):
+        self.setup_hw = info
+        if self.setup_step != 2 or not self.setup_pc_card.winfo_exists():
+            return
+        for child in list(self.setup_pc_card.winfo_children())[1:]:
+            child.destroy()
+        threads, memory, video, disk = info['threads'], info['memory'], info['video_memory'], info['disk']
+        self.setup_line(self.setup_pc_card, '✓' if (threads or 0) >= 8 else '⚠',
+                        _('Processador: {} ({} threads)', 'Processor: {} ({} threads)').format(info['cpu'] or '?', threads or '?'))
+        self.setup_line(self.setup_pc_card, '✓' if (memory or 0) >= 12 else '⚠',
+                        _('Memória: {} GB', 'Memory: {} GB').format(memory or '?'))
+        self.setup_line(self.setup_pc_card, '✓' if (video or 0) >= 6 else '⚠',
+                        self.gpu_text.lstrip('✓✗• ') if video else _('Placa de vídeo: ainda verificando', 'Video card: still checking'))
+        self.setup_line(self.setup_pc_card, '✓' if disk in ('nvme', 'ssd') else '⚠' if disk == 'hdd' else '•',
+                        {'nvme': _('Disco do jogo: NVMe', 'Game disk: NVMe'), 'ssd': _('Disco do jogo: SSD', 'Game disk: SSD'),
+                         'hdd': _('Disco do jogo: HD — instale o jogo num SSD ou NVMe para trocas de área sem travar',
+                                  'Game disk: hard disk — install the game on an SSD or NVMe for smooth area changes')}
+                        .get(disk, _('Disco do jogo: não foi possível saber o tipo', 'Game disk: type unknown')))
+        if fresh or self.setup_mode_var.get() == 'custom':
+            mode = sotc_hardware.recommend(info)
+            self.setup_mode_var.set(mode)
+            self.setup_mode_combo.current(self.setup_mode_values.index(mode))
+            self.setup_line(self.setup_pc_card, '›', _('Recomendado para este PC: {}', 'Recommended for this PC: {}').format(
+                _(*dict(PLAY_MODES)[mode]).split(' (')[0]))
+
+    # -- IV · agro
+    def setup_controls(self):
+        self.setup_title.configure(text=_('Agro, sua companheira', 'Agro, your companion'))
+        self.setup_lead.configure(text=_('Controle ou teclado e mouse: os dois funcionam juntos. Conecte o controle antes '
+                                         'de abrir o jogo.', 'Controller or keyboard and mouse: both work together. Connect '
+                                         'the controller before starting the game.'))
+        card = self.setup_card(_('Controle', 'Controller'))
+        row = self.ttk.Frame(card, style='Inner.TFrame')
+        row.pack(anchor='w', pady=(0, self.px(6)))
+        self.ttk.Label(row, text=_('Ícones dos botões', 'Button icons'), style='Card.TLabel').pack(side='left', padx=(0, self.px(14)))
+        box = self.choice(row, 'button_icons', BUTTON_ICONS, 26)
+        box.configure(style='Card.TCombobox')
+        box.pack(side='left')
+        self.ttk.Checkbutton(card, text=_('Vibração do controle', 'Controller vibration'), variable=self.var('rumble'),
+                             style='Card.TCheckbutton').pack(anchor='w')
+        card = self.setup_card(_('Teclado e mouse', 'Keyboard and mouse'))
+        self.ttk.Checkbutton(card, text=_('Câmera no mouse', 'Mouse camera'), variable=self.var('mouse'),
+                             style='Card.TCheckbutton').pack(anchor='w')
+        self.ttk.Label(card, text=_('W A S D andam, as setas giram a câmera, Espaço é ✕. As teclas mudam na aba Controles.',
+                                    'W A S D move, the arrows turn the camera, Space is ✕. The keys change on the Controls page.'),
+                       style='Card.TLabel', wraplength=self.px(640), justify='left', foreground=MUTED).pack(anchor='w', pady=(self.px(6), 0))
+
+    # -- V · the forbidden land
+    def setup_ready(self):
+        self.setup_title.configure(text=_('A Terra Proibida espera', 'The Forbidden Land awaits'))
+        self.setup_lead.configure(text=_('Tudo pronto. A primeira abertura monta o cache de shaders: algumas travadas no '
+                                         'começo são normais.', 'All set. The first start builds the shader cache: a few '
+                                         'stutters at first are normal.'))
+        card = self.setup_card(_('Resumo', 'Summary'))
+        info = game_info(self.var('game_dir').get())
+        self.setup_line(card, '✓' if info else '✗', _('Jogo: {} (versão {})', 'Game: {} (version {})').format(*info)
+                        if info else _('Jogo: não escolhido', 'Game: not chosen'))
+        self.setup_line(card, '✓' if self.sound_ready() else '⚠', _('Som: pronto', 'Sound: ready') if self.sound_ready()
+                        else _('Som: sem os módulos, o jogo roda mudo', 'Sound: without the modules the game runs silent'))
+        mode = self.var('play_mode').get()
+        self.setup_line(card, '✓', _('Modo de jogo: {}', 'Play mode: {}').format(_(*dict(PLAY_MODES).get(mode, ('', '')))))
+        self.setup_line(card, '✓', self.summary())
 
     def offer_game(self, path):
         if not getattr(self, 'setup_hint', None) or not self.setup_hint.winfo_exists():
             return
         self.setup_found_game = path
         self.setup_hint.configure(text=_('Encontrado: {}   —   clique aqui para usar', 'Found: {}   —   click here to use it')
-                                  .format(path), fg=GOLD)
+                                  .format(path), foreground=GOLD)
         self.setup_hint.bind('<Button-1>', lambda _e: self.configure_from_game(path))
 
     def choose_game_for_setup(self):
@@ -2536,7 +2776,7 @@ class Launcher(sotc_search.SearchMixin):
         """Game chosen: DLC from the game folder, saves, sound — in the background."""
         self.setup_button.configure(state='disabled')
         self.setup_hint.unbind('<Button-1>')
-        self.setup_hint.configure(text=_('Configurando…', 'Setting up…'), fg=MUTED)
+        self.setup_hint.configure(text=_('Configurando…', 'Setting up…'), foreground=MUTED)
         user = user_dir({'user_dir': self.var('user_dir').get()})
 
         def work():
@@ -2591,6 +2831,9 @@ class Launcher(sotc_search.SearchMixin):
         folders = self.app.setdefault('library_dirs', [])
         if str(Path(result['game']).parent) not in folders:
             folders.append(str(Path(result['game']).parent))
+        if self.setup_step != 1 or not self.setup_results.winfo_exists():
+            self.collect()
+            return
         self.setup_hint.configure(text='')
         for child in self.setup_results.winfo_children():
             child.destroy()
@@ -2611,19 +2854,16 @@ class Launcher(sotc_search.SearchMixin):
              _('Som: pronto', 'Sound: ready') if result['sound'] else
              _('Som: módulos não encontrados — o jogo roda mudo', 'Sound: modules not found — the game runs silent')),
         ]
+        card = ttk.Frame(self.setup_results, style='Card.TFrame', padding=(self.px(20), self.px(16)))
+        card.pack(fill='x')
+        ttk.Label(card, text=_('Encontrado', 'Found'), style='Card.Section.TLabel').pack(anchor='w', pady=(0, self.px(6)))
         for mark, text in lines:
-            color = GOLD if mark == '✓' else '#d9b441' if mark == '⚠' else MUTED
-            row = tk.Frame(self.setup_results, bg=BG)
-            row.pack(anchor='w', pady=2)
-            tk.Label(row, text=mark, bg=BG, fg=color, font=(ui_font(), 12), width=2).pack(side='left')
-            tk.Label(row, text=text, bg=BG, fg=TEXT, font=(ui_font(), 11)).pack(side='left')
-        buttons = tk.Frame(self.setup_results, bg=BG)
-        buttons.pack(pady=(20, 0))
+            self.setup_line(card, mark, text)
         if not result['sound']:
-            ttk.Button(buttons, text=_('Escolher a pasta do som…', 'Choose the sound folder…'),
-                       command=self.choose_sound_for_setup).pack(side='left', padx=(0, 8))
-        ttk.Button(buttons, text=_('Começar', 'Start'), style='Play.TButton', command=self.finish_setup).pack(side='left')
+            ttk.Button(card, text=_('Escolher a pasta do som…', 'Choose the sound folder…'), style='Card.TButton',
+                       command=self.choose_sound_for_setup).pack(anchor='w', pady=(self.px(10), 0))
         self.setup_button.configure(state='normal', text=_('Trocar a pasta do jogo…', 'Change the game folder…'))
+        self.setup_next.configure(state='normal')
         self.collect()
 
     def choose_sound_for_setup(self):

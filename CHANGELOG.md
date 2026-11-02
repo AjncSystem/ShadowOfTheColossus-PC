@@ -46,6 +46,11 @@
   e issues), jogo que não abre, tela preta, sem som, travadas, FPS baixo, HUD tremendo, texturas coloridas
   ou borradas, controle, saves e atualização. Cada tópico tem botões que levam direto à opção certa, e a
   busca (Ctrl+F) acha os tópicos.
+- **Lançador: configuração inicial em cinco etapas** (I O Despertar, II O Santuário, III A Espada Antiga,
+  IV Agro, V A Terra Proibida), no estilo do assistente do bloodborne_pc: idioma e o que é preciso, o jogo
+  (achado sozinho, com atualização, DLC, saves e som), **a verificação do PC** (processador, memória, placa
+  de vídeo e se o jogo está num NVMe, SSD ou HD) que **escolhe o Modo de jogo** que o PC aguenta, controles
+  e o resumo. "Configurar de novo" no menu lateral abre o assistente.
 - **Memória flexível:** ao dividir um mapeamento flexível, a metade direita apontava para o armazenamento
   da metade esquerda (não acontecia neste jogo nos testes, mas estava errado).
 - **Lançador: logotipos de abertura pulados por padrão** (instalações novas).

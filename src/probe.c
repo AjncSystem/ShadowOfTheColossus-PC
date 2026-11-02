@@ -880,7 +880,7 @@ static int helper_single_step(EXCEPTION_POINTERS *info) {
 const unsigned char *runtime_memory_backing_pointer(uintptr_t address);
 const unsigned char *runtime_memory_backing_view(uint64_t *size);
 uintptr_t runtime_memory_alias_of(uintptr_t address);
-void runtime_memory_alias_release(uintptr_t address);
+int runtime_memory_alias_release(uintptr_t address);
 #define HEAP_HOOK_CALLS 2000
 static unsigned char heap_hook_original;
 static volatile LONG heap_hook_calls, heap_hook_done;
@@ -1200,28 +1200,27 @@ static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2) {
-        /* GPU page tracking (write-protected guest pages) is resolved first. */
-        if (gpu_enabled && bbgpu_handle_fault(info,(void *)record->ExceptionInformation[1])) { fault_path=4; return EXCEPTION_CONTINUE_EXECUTION; }
-        /* sotc: T38: the second address of a page the GPU watches at its first (runtime_memory.c,
-         * SOTC_ALIAS_SYNC): the GPU handles it there, then this page gets the guest's protection. */
-        if (gpu_enabled) {
-            const uintptr_t at=(uintptr_t)record->ExceptionInformation[1],
-                watched=record->ExceptionInformation[0]==1 ? runtime_memory_alias_of(at) : 0;
-            if (watched) {
-                const int handled=bbgpu_handle_fault(info,(void *)watched);
-                runtime_memory_alias_release(at);
-                /* diagnostic: the first ones, and the same page faulting again and again */
-                static LONG logged; static __thread uintptr_t last_page; static __thread unsigned repeats;
-                const uintptr_t page=at & ~(uintptr_t)0x3fff;
-                repeats=page==last_page ? repeats+1 : 0; last_page=page;
-                if (InterlockedIncrement(&logged)<=30 || repeats==1000)
-                    fprintf(stderr,"SOTC ALIAS fault %s at %p (watched %p) handled %d, rip %#llx, guest %d, repeats %u\n",
-                            record->ExceptionInformation[0] ? "write" : "read",(void *)at,(void *)watched,handled,
-                            (unsigned long long)(info->ContextRecord->Rip-(image ? (uintptr_t)image : 0)),runtime_thread_is_guest(),repeats);
-                fault_path=5;
-                return EXCEPTION_CONTINUE_EXECUTION;
+        /* sotc: T38: a write to a page mapped at two addresses (runtime_memory.c, SOTC_ALIAS_SYNC)
+         * goes to the GPU's trackers at both, which may each watch theirs; then the page is
+         * writable here, which is what both believe after a write. */
+        if (gpu_enabled && record->ExceptionInformation[0]==1) {
+            const uintptr_t at=(uintptr_t)record->ExceptionInformation[1], other=runtime_memory_alias_of(at);
+            if (other) {
+                const int here=bbgpu_handle_fault(info,(void *)at), there=bbgpu_handle_fault(info,(void *)other);
+                if (runtime_memory_alias_release(at)) {
+                    static LONG logged;
+                    if (InterlockedIncrement(&logged)<=30)
+                        fprintf(stderr,"SOTC ALIAS write at %p (also %p): trackers here %d there %d, rip %#llx, guest %d\n",
+                                (void *)at,(void *)other,here,there,
+                                (unsigned long long)(info->ContextRecord->Rip-(image ? (uintptr_t)image : 0)),runtime_thread_is_guest());
+                    fault_path=5;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+                if (here) { fault_path=4; return EXCEPTION_CONTINUE_EXECUTION; }
             }
         }
+        /* GPU page tracking (write-protected guest pages) is resolved first. */
+        if (gpu_enabled && bbgpu_handle_fault(info,(void *)record->ExceptionInformation[1])) { fault_path=4; return EXCEPTION_CONTINUE_EXECUTION; }
         fault_path=10; /* page tracking declined */
         if (runtime_fault_recover) {
             /* A speculative guest memory read (GPU draw preparation) faulted: the thread resumes
@@ -1354,11 +1353,15 @@ static void apply_sotc_cmdline(const char *path, uint64_t size) {
 #ifndef _WIN32
 static void fault(int sig, siginfo_t *info, void *context) {
     /* GPU page tracking (write-protected guest pages) is resolved first. */
-    if (gpu_enabled && sig == SIGSEGV && bbgpu_handle_fault(context, info->si_addr)) return;
-    if (gpu_enabled && sig == SIGSEGV) {
-        const uintptr_t at=(uintptr_t)info->si_addr, watched=runtime_memory_alias_of(at);
-        if (watched) { bbgpu_handle_fault(context,(void *)watched); runtime_memory_alias_release(at); return; }
+    if (gpu_enabled && sig == SIGSEGV) { /* T38: see the Windows handler */
+        const uintptr_t at=(uintptr_t)info->si_addr, other=runtime_memory_alias_of(at);
+        if (other) {
+            const int here=bbgpu_handle_fault(context,(void *)at);
+            bbgpu_handle_fault(context,(void *)other);
+            if (runtime_memory_alias_release(at) || here) return;
+        }
     }
+    if (gpu_enabled && sig == SIGSEGV && bbgpu_handle_fault(context, info->si_addr)) return;
     /* A speculative guest memory read (runtime_memory.c) failed: resume its recovery point. */
     if ((sig == SIGSEGV || sig == SIGBUS) && runtime_fault_recover) {
         sigjmp_buf *recover = runtime_fault_recover;

@@ -1473,14 +1473,20 @@ uintptr_t runtime_memory_alias_of(uintptr_t address) {
     read_unlock();
     return other;
 }
-/* The page at [address] back to the guest's own protection (its GPU watch went away). */
-void runtime_memory_alias_release(uintptr_t address) {
-    __atomic_add_fetch(&alias_faults,1,__ATOMIC_RELAXED);
+/* The 4 KiB page at [address] back to the guest's own protection after a write fault the
+ * trackers saw at both addresses; 0 when the guest itself does not allow writing there. */
+int runtime_memory_alias_release(uintptr_t address) {
+    int writable=0;
     read_lock();
     const size_t i=vma_index(address);
-    if (i<vma_count && vmas[i].start<=address && vmas[i].kind!=KIND_RESERVED)
-        host_protect(address & ~(uintptr_t)(PAGE-1),PAGE,host_prot(vmas[i].prot));
+    if (i<vma_count && vmas[i].start<=address && vmas[i].kind!=KIND_RESERVED) {
+        const int guest=host_prot(vmas[i].prot);
+        writable=(guest & PROT_WRITE)!=0;
+        if (writable) host_protect(address & ~(uintptr_t)4095,4096,guest);
+    }
     read_unlock();
+    if (writable) __atomic_add_fetch(&alias_faults,1,__ATOMIC_RELAXED);
+    return writable;
 }
 uint64_t runtime_memory_generation(void) {
     if (runtime_disabled_optimizations & 1) return 1;

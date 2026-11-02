@@ -215,6 +215,7 @@ inline std::atomic<uint64_t> cached_images{0}, cached_image_bytes{0};
 inline std::atomic<uint64_t> vram_emergency{0}; ///< emergency texture collections (allocation failed)
 inline std::atomic<uint64_t> write_fault_gpu_pending{0}; ///< write-fault readbacks left protected
 inline std::atomic<uint64_t> write_fault_stale_gpu{0};   ///< ... that cleared a stale GPU page bit
+inline std::atomic<uint64_t> read_fault_stale_gpu{0};    ///< read faults that cleared one
 inline std::atomic<uint64_t> arena_evicted{0};  ///< arena bytes given back by MaybeEvictCold
 inline std::atomic<uint64_t> arena_rebound{0};  ///< ... bound again afterwards
 inline std::atomic<uint64_t> arena_pinned{0};   ///< ... faulted back in by shaders (kept since)

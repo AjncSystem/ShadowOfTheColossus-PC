@@ -42,6 +42,10 @@
   continua movendo, encaixando e redimensionando a janela).
 - **Lançador: "Visão avançada"** no menu lateral: desligada, as abas Avançado e Debug ficam escondidas (a
   busca continua achando as opções delas).
+- **Lançador: aba Ajuda** com os problemas mais comuns e o que fazer, em cartões: pedir ajuda (relatório
+  e issues), jogo que não abre, tela preta, sem som, travadas, FPS baixo, HUD tremendo, texturas coloridas
+  ou borradas, controle, saves e atualização. Cada tópico tem botões que levam direto à opção certa, e a
+  busca (Ctrl+F) acha os tópicos.
 - **Memória flexível:** ao dividir um mapeamento flexível, a metade direita apontava para o armazenamento
   da metade esquerda (não acontecia neste jogo nos testes, mas estava errado).
 - **Lançador: logotipos de abertura pulados por padrão** (instalações novas).

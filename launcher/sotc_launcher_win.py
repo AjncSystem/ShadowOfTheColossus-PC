@@ -475,7 +475,7 @@ def user_dir(s):
 
 # Shown in the side bar only in the expert view (the search finds them in both).
 EXPERT_PAGES = ('advanced', 'debug')
-NAV_ICONS = {'play': 'play', 'game': 'gameplay', 'saves': 'saves', 'graphics': 'display', 'controls': 'controls',
+NAV_ICONS = {'help': 'help', 'play': 'play', 'game': 'gameplay', 'saves': 'saves', 'graphics': 'display', 'controls': 'controls',
              'advanced': 'advanced', 'debug': 'system'}
 SAVE_BACKUPS_KEPT = 10  # user/backups/saves-*.zip
 LOGS_KEPT = 5      # last_run.log and last_run.1.log ... last_run.4.log
@@ -1124,7 +1124,8 @@ class Launcher(sotc_search.SearchMixin):
         accent = self.theme.box(3, 18, 1.5, SIGIL, bg=CARD)
         for name, title in (('play', _('Jogar', 'Play')), ('game', _('Jogo', 'Game')), ('saves', _('Saves', 'Saves')),
                             ('graphics', _('Imagem e FPS', 'Display & FPS')), ('controls', _('Controles', 'Controls')),
-                            ('advanced', _('Avançado', 'Advanced')), ('debug', _('Debug', 'Debug'))):
+                            ('help', _('Ajuda', 'Help')), ('advanced', _('Avançado', 'Advanced')),
+                            ('debug', _('Debug', 'Debug'))):
             c = tk.Canvas(side, width=px(width), height=px(height), bg=BG, highlightthickness=0, bd=0, cursor='hand2')
             c.pack(padx=px(12), pady=(0, px(2)))
             mid = px(height / 2)
@@ -1175,6 +1176,7 @@ class Launcher(sotc_search.SearchMixin):
         self.build_saves()
         self.build_graphics()
         self.build_controls()
+        self.build_help()
         self.build_advanced()
         self.build_debug()
         self.build_log()
@@ -1972,6 +1974,116 @@ class Launcher(sotc_search.SearchMixin):
             return
         self.refresh_status()
         self.messagebox.showinfo('Shadow of the Colossus', _('Save importado para {}.', 'Save imported to {}.').format(target))
+
+    def build_help(self):
+        """The Help page: asking for help (the report, the issues page), then the problems any
+        installation can run into, each with what to do and buttons that lead there. After the
+        bloodborne_pc launcher's Help page."""
+        ttk = self.ttk
+        f = self.scrolled_page('help', _('Ajuda', 'Help'),
+                               _('Os problemas mais comuns e o que fazer. A busca (Ctrl+F) também acha estes tópicos.',
+                                 'The most common problems and what to do. The search (Ctrl+F) finds these topics too.'))
+        issues = 'https://github.com/AjncSystem/ShadowOfTheColossus-PC/issues'
+        topics = [
+            (_('Pedir ajuda', 'Asking for help'),
+             _('Gere um relatório (registros das últimas sessões, quedas e um resumo do PC) e anexe numa issue no '
+               'GitHub, dizendo o que aconteceu e onde no jogo.',
+               'Make a report (the last sessions\' logs, crashes and a summary of the PC) and attach it to a GitHub '
+               'issue, saying what happened and where in the game.'),
+             [(_('Gerar relatório', 'Make a report'), self.save_report, True),
+              (_('Abrir as issues', 'Open the issues'), lambda: self.open_url(issues), False)]),
+            (_('O jogo não abre ou fecha logo ao abrir', 'The game does not start or closes at once'),
+             _('Veja a Verificação na aba Jogar: o dump precisa estar decriptado (eboot.bin e sce_module), na versão '
+               'EU 1.01 ou US 1.00. Atualize o driver de vídeo (Vulkan 1.3). Um antivírus pode barrar bin\\bb-probe.exe: '
+               'ponha a pasta do port nas exceções. O registro do jogo mostra o motivo da queda.',
+               'See the ready check on the Play page: the dump must be decrypted (eboot.bin and sce_module), version '
+               'EU 1.01 or US 1.00. Update the graphics driver (Vulkan 1.3). An antivirus can block bin\\bb-probe.exe: '
+               'add the port folder to its exceptions. The game log tells why it closed.'),
+             [(_('Registro do jogo', 'Game log'), lambda: self.show('log'), False),
+              (_('Verificação', 'Ready check'), lambda: self.show('play'), False)]),
+            (_('Tela preta ou imagem congelada', 'Black screen or frozen picture'),
+             _('Teste com a geração de quadros desligada e o upscaler FSR 1. Atualize o driver de vídeo. Se começou '
+               'depois de atualizar o driver ou o port, limpe o cache de shaders (o jogo o refaz na próxima abertura, '
+               'com algumas travadas no começo).',
+               'Try with frame generation off and the FSR 1 upscaler. Update the graphics driver. If it began after a '
+               'driver or port update, clear the shader cache (the game builds it again next time, with a few stutters '
+               'at first).'),
+             [(_('Geração de quadros', 'Frame generation'), lambda: self.jump_key('framegen'), False),
+              (_('Limpar cache de shaders', 'Clear shader cache'), self.clear_cache, False)]),
+            (_('Sem som', 'No sound'),
+             _('O som do jogo precisa dos módulos libSceNgs2 e libSceUlt do seu próprio console (o port não os traz). '
+               'Escolha a pasta onde eles estão; a do shadPS4 serve.',
+               'The game\'s sound needs the libSceNgs2 and libSceUlt modules of your own console (the port does not '
+               'bring them). Choose the folder that holds them; shadPS4\'s works.'),
+             [(_('Módulos de som', 'Sound modules'), lambda: self.jump_key('sys_modules'), False)]),
+            (_('Travadas nas trocas de área ou na primeira vez', 'Stutters at area changes or the first time'),
+             _('Na primeira vez (e depois de atualizar) o cache de shaders é montado: as travadas somem com o tempo. '
+               'Instale o jogo num SSD ou NVMe: num HD as trocas de área travam muito mais.',
+               'The first time (and after an update) the shader cache is built: the stutters fade with play. Install '
+               'the game on an SSD or NVMe drive: on a hard disk area changes stutter far more.'), []),
+            (_('FPS baixo', 'Low frame rate'),
+             _('Escolha o Modo de jogo Normal ou Pro, ou 30 FPS. Feche programas por cima do jogo (OBS, RTSS, '
+               'Afterburner, gravação do Windows). Em placas com pouca memória, use "Uso de memória de vídeo" Econômico.',
+               'Choose the Normal or Pro play mode, or 30 FPS. Close programs over the game (OBS, RTSS, Afterburner, '
+               'Windows recording). On cards with little memory, set "Video memory use" to Economy.'),
+             [(_('Modo de jogo', 'Play mode'), lambda: self.jump_key('play_mode'), False),
+              (_('Memória de vídeo', 'Video memory'), lambda: self.jump_key('vram_use'), False)]),
+            (_('HUD, letras ou barras de vida tremendo', 'HUD, letters or health bars shaking'),
+             _('Com a geração de quadros (F8), ligue "Geração de quadros sem a interface": os quadros gerados ficam '
+               'só com a cena e a interface vai por cima.',
+               'With frame generation (F8), turn "Frame generation without the interface" on: the generated frames '
+               'hold the scene only and the interface goes on top.'),
+             [(_('Abrir a opção', 'Open the setting'), lambda: self.jump_key('fg_hudless'), False)]),
+            (_('Texturas coloridas (mosaico) ou borradas', 'Coloured (mosaic) or blurry textures'),
+             _('O mosaico depois das cargas foi corrigido na 0.71. Texturas borradas: use Texturas Alta ou Máxima e o '
+               'filtro 16x. Se o mosaico voltar, gere um relatório logo depois.',
+               'The mosaic after loads was fixed in 0.71. Blurry textures: use High or Maximum textures and 16x '
+               'filtering. If the mosaic comes back, make a report right after.'),
+             [(_('Texturas', 'Textures'), lambda: self.jump_key('textures'), False)]),
+            (_('O controle não responde', 'The controller does not respond'),
+             _('Conecte o controle antes de abrir o jogo. Com vários controles, escolha o preferido na aba Controles. '
+               'Pela Steam, desligue o Steam Input para o atalho do jogo.',
+               'Connect the controller before starting the game. With several, choose the preferred one on the '
+               'Controls page. Through Steam, turn Steam Input off for the game\'s shortcut.'),
+             [(_('Controles', 'Controls'), lambda: self.show('controls'), False)]),
+            (_('Um save sumiu ou estragou, ou quero levá-lo a outro PC', 'A save is gone or broken, or I want it on another PC'),
+             _('A aba Saves guarda um backup a cada vez que o jogo fecha: importe o .zip de antes do problema. Para '
+               'outro PC, exporte os saves e importe lá.',
+               'The Saves page keeps a backup every time the game closes: import the .zip from before the problem. '
+               'For another PC, export the saves and import them there.'),
+             [(_('Saves', 'Saves'), lambda: self.show('saves'), False)]),
+            (_('Atualizar o port', 'Updating the port'),
+             _('O launcher procura versões novas ao abrir. Saves, cache de shaders e sotc.ini são mantidos.',
+               'The launcher looks for new versions when it starts. Saves, shader cache and sotc.ini are kept.'),
+             [(_('Procurar atualização', 'Check for updates'), lambda: self.check_updates(True), False)]),
+        ]
+        f.columnconfigure(0, weight=1)
+        for k, (title, text, actions) in enumerate(topics):
+            card = ttk.Frame(f, style='Card.TFrame', padding=(self.px(18), self.px(14)))
+            card.grid(row=self.next_row(f), column=0, columnspan=2, sticky='we', pady=(self.px(4) if k else 0, self.px(6)))
+            card.columnconfigure(0, weight=1)
+            head = ttk.Label(card, text=title, style='Card.Section.TLabel')
+            head.grid(row=0, column=0, sticky='w')
+            ttk.Label(card, text=text, style='Card.TLabel', wraplength=self.px(720), justify='left').grid(
+                row=1, column=0, sticky='w', pady=(self.px(4), 0))
+            if actions:
+                buttons = ttk.Frame(card, style='Inner.TFrame')
+                buttons.grid(row=2, column=0, sticky='w', pady=(self.px(10), 0))
+                for label, command, accent in actions:
+                    ttk.Button(buttons, text=label, command=command,
+                               style='Card.Accent.TButton' if accent else 'Card.TButton').pack(side='left', padx=(0, self.px(6)))
+            self.index_entry(head, title, text, page='help')
+
+    def jump_key(self, key):
+        """The page of a setting (not the Play page's copy), scrolled to it and marked."""
+        entries = [e for e in getattr(self, 'search_index', []) if e.get('key') == key]
+        entry = next((e for e in entries if e['page'] != 'play'), entries[0] if entries else None)
+        if entry:
+            self.jump(entry)
+
+    def open_url(self, url):
+        import webbrowser
+        webbrowser.open(url)
 
     def build_saves(self):
         """The Saves page: the game's saves with their progress, export and import (.zip, a folder,

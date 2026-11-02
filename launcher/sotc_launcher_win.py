@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 
+import sotc_theme as theme
 import sotc_update
 
 FROZEN = getattr(sys, 'frozen', False)
@@ -138,12 +139,13 @@ def _(pt, en):
 
 
 def ui_font():
-    """Interface font: Segoe UI has no Chinese or Korean characters."""
-    return {'zh': 'Microsoft YaHei UI', 'ko': 'Malgun Gothic'}.get(LANG, 'Segoe UI')
+    """Interface font: Inter (sotc_theme), which, like Segoe UI, has no Chinese or Korean characters."""
+    return {'zh': 'Microsoft YaHei UI', 'ko': 'Malgun Gothic'}.get(LANG, theme.BODY)
 
 
 def title_font():
-    return {'zh': 'Microsoft YaHei UI', 'ko': 'Malgun Gothic'}.get(LANG, 'Georgia')
+    """Titles: Cinzel (sotc_theme) for Latin and Cyrillic-free text; Russian keeps Georgia."""
+    return {'zh': 'Microsoft YaHei UI', 'ko': 'Malgun Gothic', 'ru': 'Georgia'}.get(LANG, theme.HEAD)
 
 
 def windows_language():
@@ -853,8 +855,11 @@ def shadps4_saves(serial):
 # ---------------------------------------------------------------------------------------------
 # The window.
 
-BG, PANEL, CARD, LINE = '#0d0f10', '#14171a', '#1b1f23', '#2a3036'
-TEXT, MUTED, GOLD, ACCENT, ACCENT_HI = '#e6e2da', '#8f9499', '#d7c08a', '#3e5f73', '#4f7790'
+# Theme of the Forbidden Land: night stone, sunlight gold for titles, the sword's light (sigil blue)
+# for what is active.
+BG, PANEL, CARD, LINE = theme.DEEP, theme.BG, theme.CARD, theme.BORDER
+TEXT, MUTED, GOLD, ACCENT, ACCENT_HI = theme.TEXT, theme.MUTED, theme.GOLD_LIGHT, theme.SIGIL, theme.SIGIL_HOVER
+SIGIL, HOVER = theme.SIGIL_LIGHT, theme.SURFACE
 
 
 class Launcher:
@@ -875,6 +880,7 @@ class Launcher:
         root.geometry(f'{self.px(1080)}x{self.px(700)}')
         root.minsize(self.px(940), self.px(620))
         self.set_icon()
+        theme.load_fonts(root)
         self.style()
         self.build()
         self.show('play')
@@ -930,60 +936,17 @@ class Launcher:
             return None
 
     # ---- look --------------------------------------------------------------------------------
-    def check_images(self):
-        """16 px (DPI-scaled) check box images with a tick: the clam theme draws a cross."""
-        n = max(14, int(16 * self.dpi))
-        images = []
-        for checked in (False, True):
-            image = self.tk.PhotoImage(width=n + self.px(8), height=n)  # unset pixels stay transparent
-            image.put(GOLD if checked else '#4a535b', to=(0, 0, n, n))
-            image.put(ACCENT if checked else CARD, to=(1, 1, n - 1, n - 1))
-            if checked:
-                x0, y0, x1, y1, x2, y2 = .22 * n, .52 * n, .42 * n, .72 * n, .78 * n, .28 * n
-                width = max(1, round(n / 9))
-                for t in range(40):
-                    f = t / 39
-                    for x, y in ((x0 + (x1 - x0) * f, y0 + (y1 - y0) * f), (x1 + (x2 - x1) * f, y1 + (y2 - y1) * f)):
-                        image.put('#f4f1ea', to=(int(x), int(y), int(x) + width, int(y) + width))
-            images.append(image)
-        self.check_off, self.check_on = images
-
     def style(self):
+        """The theme's widgets (sotc_theme: rounded buttons and fields, switches, the Play button),
+        then the launcher's own labels."""
         ttk = self.ttk
         s = ttk.Style(self.root)
-        s.theme_use('clam')
-        self.check_images()
-        s.element_create('Sotc.indicator', 'image', self.check_off, ('selected', self.check_on), sticky='')
-        s.layout('TCheckbutton', [('Checkbutton.padding', {'sticky': 'nswe', 'children': [
-            ('Sotc.indicator', {'side': 'left', 'sticky': ''}),
-            ('Checkbutton.focus', {'side': 'left', 'sticky': 'w', 'children': [
-                ('Checkbutton.label', {'sticky': 'nswe'})]})]})])
-        base = (ui_font(), 10)
-        self.root.option_add('*TCombobox*Listbox.background', CARD)
-        self.root.option_add('*TCombobox*Listbox.foreground', TEXT)
-        self.root.option_add('*TCombobox*Listbox.selectBackground', ACCENT)
-        self.root.option_add('*TCombobox*Listbox.font', base)
-        s.configure('.', background=PANEL, foreground=TEXT, fieldbackground=CARD, bordercolor=LINE,
-                    lightcolor=LINE, darkcolor=LINE, troughcolor=CARD, focuscolor=GOLD, font=base)
-        s.configure('TFrame', background=PANEL)
-        s.configure('TLabel', background=PANEL, foreground=TEXT)
+        self.theme = theme.Theme(self.root, self.dpi)
+        self.theme.style(s)
+        s.configure('TLabel', background=PANEL, foreground=TEXT, font=(ui_font(), 10))
         s.configure('Muted.TLabel', background=PANEL, foreground=MUTED, font=(ui_font(), 9))
         s.configure('Section.TLabel', background=PANEL, foreground=GOLD, font=(title_font(), 13))
-        s.configure('TCheckbutton', background=PANEL, foreground=TEXT, padding=(0, 3), indicatorbackground=CARD,
-                    indicatorforeground=GOLD)
-        s.map('TCheckbutton', background=[('active', PANEL)], indicatorbackground=[('selected', ACCENT)])
-        s.configure('Warning.TLabel', background='#2a2312', foreground='#e3c25a', padding=(10, 6))
-        s.configure('TCombobox', arrowcolor=GOLD, foreground=TEXT, padding=4)
-        s.map('TCombobox', fieldbackground=[('readonly', CARD)], foreground=[('readonly', TEXT)],
-              selectbackground=[('readonly', CARD)], selectforeground=[('readonly', TEXT)])
-        s.configure('TEntry', foreground=TEXT, insertcolor=TEXT, padding=4)
-        s.configure('TButton', background=CARD, foreground=TEXT, padding=(12, 6), borderwidth=1)
-        s.map('TButton', background=[('active', LINE), ('disabled', PANEL)], foreground=[('disabled', MUTED)])
-        s.configure('Play.TButton', background=ACCENT, foreground='#f4f1ea', font=(title_font(), 15, 'bold'),
-                    padding=(36, 10), borderwidth=0)
-        s.map('Play.TButton', background=[('active', ACCENT_HI), ('disabled', '#263038')],
-              foreground=[('disabled', '#7d858c')])
-        s.configure('Vertical.TScrollbar', background=CARD, arrowcolor=GOLD, troughcolor=PANEL, bordercolor=PANEL)
+        s.configure('Warning.TLabel', background='#1e1a12', foreground='#e0b866', padding=(10, 6))
 
     # ---- widget helpers ----------------------------------------------------------------------
     def var(self, key):
@@ -1035,8 +998,10 @@ class Launcher:
             row=self.next_row(parent), column=0, columnspan=2, sticky='w', pady=(top, 0))
 
     def section(self, parent, title, top=18):
+        r = self.next_row(parent)
         self.ttk.Label(parent, text=title, style='Section.TLabel').grid(
-            row=self.next_row(parent), column=0, columnspan=2, sticky='w', pady=(top, 2))
+            row=r, column=0, columnspan=2, sticky='w', pady=(top, 2))
+        self.tk.Frame(parent, bg=LINE, height=1).grid(row=r + 1, column=0, columnspan=2, sticky='we', pady=(0, 4))
 
     def window_icon_row(self, parent):
         """The game window's icon: the game's (empty) or a picture of the player's choice."""
@@ -1084,8 +1049,9 @@ class Launcher:
         outer = ttk.Frame(self.content)
         head = ttk.Frame(outer, padding=(28, 22, 28, 6))
         head.pack(fill='x')
-        ttk.Label(head, text=title, background=PANEL, foreground=TEXT, font=(title_font(), 20)).pack(anchor='w')
-        ttk.Label(head, text=subtitle, style='Muted.TLabel').pack(anchor='w')
+        ttk.Label(head, text=title, background=PANEL, foreground=GOLD, font=(title_font(), 22)).pack(anchor='w')
+        ttk.Label(head, text=subtitle, style='Muted.TLabel').pack(anchor='w', pady=(2, 8))
+        tk.Frame(head, bg=LINE, height=1).pack(fill='x')
         canvas = tk.Canvas(outer, bg=PANEL, highlightthickness=0, bd=0)
         bar = ttk.Scrollbar(outer, orient='vertical', command=canvas.yview)
         inner = ttk.Frame(canvas, padding=(28, 0, 28, 24))
@@ -1106,21 +1072,31 @@ class Launcher:
         side = tk.Frame(self.root, bg=BG, width=self.px(220))
         side.pack(side='left', fill='y')
         side.pack_propagate(False)
-        tk.Label(side, text='SHADOW OF\nTHE COLOSSUS', bg=BG, fg=GOLD, font=(title_font(), 15), justify='left').pack(
-            anchor='w', padx=22, pady=(24, 0))
+        tk.Label(side, text='SHADOW OF\nTHE COLOSSUS', bg=BG, fg=GOLD, font=(title_font(), 16), justify='left').pack(
+            anchor='w', padx=22, pady=(26, 0))
+        tk.Frame(side, bg=GOLD, height=1, width=self.px(46)).pack(anchor='w', padx=22, pady=(10, 8))
         tk.Label(side, text=_('port nativo · Windows', 'native port · Windows') + f'  ·  v{VERSION}', bg=BG, fg=MUTED,
-                 font=(ui_font(), 9)).pack(anchor='w', padx=22, pady=(2, 20))
-        self.nav, self.current_page = {}, None
+                 font=(ui_font(), 9)).pack(anchor='w', padx=22, pady=(0, 22))
+        self.nav, self.nav_bars, self.current_page = {}, {}, None
         for name, title in (('play', _('Jogar', 'Play')), ('game', _('Jogo e saves', 'Game & saves')),
                             ('graphics', _('Imagem e FPS', 'Display & FPS')), ('controls', _('Controles', 'Controls')),
                             ('advanced', _('Avançado', 'Advanced')), ('debug', _('Debug', 'Debug'))):
-            item = tk.Label(side, text='    ' + title, bg=BG, fg=TEXT, anchor='w', font=(ui_font(), 11),
-                            pady=10, cursor='hand2')
-            item.pack(fill='x')
-            item.bind('<Button-1>', lambda _e, n=name: self.show(n))
-            item.bind('<Enter>', lambda _e, n=name: n != self.current_page and self.nav[n].configure(bg='#171b1f'))
-            item.bind('<Leave>', lambda _e, n=name: n != self.current_page and self.nav[n].configure(bg=BG))
-            self.nav[name] = item
+            holder = tk.Frame(side, bg=BG, cursor='hand2')
+            holder.pack(fill='x')
+            bar = tk.Frame(holder, bg=BG, width=3)  # the active page's mark: the sword's light
+            bar.pack(side='left', fill='y')
+            glyph = theme.ICON.get({'debug': 'system'}.get(name, name), '')
+            icon = tk.Label(holder, text=glyph, bg=BG, fg=MUTED, font=(theme.ICONS, 12), width=3, cursor='hand2')
+            icon.pack(side='left', padx=(12, 0))
+            item = tk.Label(holder, text=title, bg=BG, fg=TEXT, anchor='w', font=(ui_font(), 11),
+                            pady=11, cursor='hand2')
+            item.pack(side='left', fill='x', expand=True)
+            item.icon = icon
+            for widget in (holder, icon, item):
+                widget.bind('<Button-1>', lambda _e, n=name: self.show(n))
+                widget.bind('<Enter>', lambda _e, n=name: n != self.current_page and self.nav_color(n, HOVER))
+                widget.bind('<Leave>', lambda _e, n=name: n != self.current_page and self.nav_color(n, BG))
+            self.nav[name], self.nav_bars[name] = item, bar
         tk.Frame(side, bg=BG).pack(fill='both', expand=True)
         for text, command in ((_('Registro do jogo', 'Game log'), lambda: self.show('log')),
                               (_('Procurar atualização', 'Check for updates'), lambda: self.check_updates(True)),
@@ -1134,6 +1110,7 @@ class Launcher:
         right.pack(side='left', fill='both', expand=True)
         bar = tk.Frame(right, bg=BG, height=self.px(72))
         bar.pack(fill='x', side='bottom')
+        tk.Frame(right, bg=LINE, height=1).pack(fill='x', side='bottom')
         bar.pack_propagate(False)
         self.status = tk.Label(bar, text='', bg=BG, fg=MUTED, font=(ui_font(), 10), anchor='w', justify='left')
         self.status.pack(side='left', padx=24)
@@ -1167,9 +1144,17 @@ class Launcher:
         self.pages[name].pack(fill='both', expand=True)
         self.current_page = name
         for n, item in self.nav.items():
-            item.configure(bg=PANEL if n == name else BG, fg=GOLD if n == name else TEXT)
+            self.nav_color(n, PANEL if n == name else BG)
+            item.configure(fg=GOLD if n == name else TEXT)
+            item.icon.configure(fg=SIGIL if n == name else MUTED)
+            self.nav_bars[n].configure(bg=SIGIL if n == name else BG)
         if name == 'play':
             self.refresh_status()
+
+    def nav_color(self, name, color):
+        item = self.nav[name]
+        for widget in (item, item.icon, item.master):
+            widget.configure(bg=color)
 
     def build_play(self):
         tk, ttk = self.tk, self.ttk
@@ -1251,43 +1236,36 @@ class Launcher:
                 self.applying_mode = False
 
     def draw_banner(self):
-        """The dump's own art (sce_sys/pic1.png) under the title."""
-        tk, c = self.tk, self.banner
+        """The dump's own art (sce_sys/pic1.png), darker on the left and fading into the page
+        (sotc_theme.hero), the game and its version under the title."""
+        c = self.banner
         c.delete('all')
         w, h = max(c.winfo_width(), 400), int(c['height'])
         art = Path(self.var('game_dir').get() or '.') / 'sce_sys' / 'pic1.png'
         if self.banner_source != art:
-            self.banner_source, self.banner_image, self.banner_size = art, None, None
+            self.banner_source, self.banner_image = art, None
             try:
-                self.banner_image = tk.PhotoImage(file=str(art))
-            except (tk.TclError, OSError):
+                from PIL import Image
+                with Image.open(art) as image:
+                    self.banner_image = image.convert('RGBA')
+            except (ImportError, OSError):
                 pass
-        if self.banner_image:
-            if self.banner_size != w:
-                self.banner_size, self.banner_scaled = w, self.scaled_art(art, w)
-            c.create_image(w // 2, int(h * 0.5), image=self.banner_scaled)
-            for i, stipple in enumerate(('gray12', 'gray25', 'gray50', 'gray75')):
-                c.create_rectangle(0, h - 120 + i * 24, w, h - 96 + i * 24, fill=PANEL, outline='', stipple=stipple)
-            c.create_rectangle(0, h - 24, w, h, fill=PANEL, outline='')
+        if self.banner_image is not None:
+            self.banner_photo = self.theme.cached(('hero', str(art), w, h),
+                                                  lambda: theme.hero(self.banner_image, (w, h), PANEL))
+            c.create_image(0, 0, image=self.banner_photo, anchor='nw')
+            c.create_text(33, h - 74, text='Shadow of the Colossus', anchor='w', fill=theme.TEXT_STRONG,
+                          font=(title_font(), 26))
         else:
-            c.create_text(30, h - 80, text='Shadow of the Colossus', anchor='w', fill='#f2ead9', font=(title_font(), 32))
+            c.create_text(30, h - 80, text='Shadow of the Colossus', anchor='w', fill=theme.TEXT_STRONG,
+                          font=(title_font(), 30))
             c.create_text(w // 2, h // 2 - 40, text=_('Escolha a pasta do jogo (Jogo e saves)',
                                                        'Choose your game folder (Game & saves)'),
                           fill=MUTED, font=(ui_font(), 11))
         info = game_info(self.var('game_dir').get())
         sub = (_('{} · versão do jogo {}', '{} · game version {}').format(*info) if info
                else _('Pasta do jogo não escolhida', 'Game folder not set'))
-        c.create_text(33, h - 30, text=sub, anchor='w', fill=GOLD, font=(ui_font(), 11))
-
-    def scaled_art(self, path, width):
-        try:
-            from PIL import Image, ImageTk
-            with Image.open(path) as image:
-                height = round(image.height * width / image.width)
-                return ImageTk.PhotoImage(image.convert('RGB').resize((width, height), Image.LANCZOS))
-        except (ImportError, OSError):
-            factor = max(1, round(self.banner_image.width() / max(width, 1)))
-            return self.banner_image.subsample(factor) if factor > 1 else self.banner_image
+        c.create_text(35, h - 38, text=sub, anchor='w', fill=GOLD, font=(ui_font(), 11))
 
     def build_game(self):
         ttk = self.ttk

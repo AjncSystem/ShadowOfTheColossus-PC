@@ -164,6 +164,9 @@ Packaging refuses any `.sprx`/`.prx`: Sony firmware never goes into the package.
 
 - [bloodborne_pc](https://github.com/Supermedo/bloodborne_pc) (Supermedo, deadinside28 and
   forks): loader, native runtime and launcher. Original README: [docs/bbport](docs/bbport/README.md).
+  The launcher's look (`launcher/sotc_theme.py`) comes from its 1.9 launcher theme, with the
+  [Cinzel](https://github.com/NDISCOVER/Cinzel) and [Inter](https://github.com/rsms/inter) fonts
+  (SIL Open Font License).
 - [shadPS4](https://github.com/shadps4-emu/shadPS4) and the shadPS4 SotC fork: Vulkan video core.
 - [Pink-shadPS4](https://github.com/luizgustavs/Pink-shadPS4) (luizgustavs): culling cvars, BPE
   heap guard, periodic submission, command recording thread, shader fixes (fetch-shader

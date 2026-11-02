@@ -1,5 +1,46 @@
 # Changelog
 
+## Não lançado
+- **Lançador: padrão em 1080p nativo, sem upscaler** (Upscaler "Bilinear", modo PS4 Pro desligado):
+  o jogo renderiza direto em 1920x1080, sem DLSS nem FSR. DLSS e FSR 1 continuam disponíveis no lançador.
+- **Lançador: novos padrões de qualidade**: texturas e VRAM no máximo, grama com detalhe 1, DLSS (modo Qualidade) e
+  logotipos de abertura pulados. Quem tem placa de 4–6 GB deve escolher VRAM "Econômico" no lançador.
+- **Lançador: motion blur agora vem desligado por padrão** (Efeitos > "Motion blur", dá para religar). Era a
+  causa da sombra do personagem deixando rastro ao mover em áreas escuras; a correção só existia na
+  configuração local e não ia no pacote. Equivale a `r_motionBlurEnable=0`.
+- **Lançador: geração de quadros sem a interface agora vem ligada por padrão** (`fg_hudless`), para letras e
+  ícones não tremerem com o FSR 3 (F8). Antes só valia para quem marcava a opção, então o pacote novo
+  não levava a correção. Opção "HDR (experimental)" na seção Tela.
+- **Menos travadas ao trocar de área (do fork Oussama268, opt12):** o pacote de cache de shaders do v0.70
+  não vence mais os arquivos novos (milhares de shaders eram traduzidos de novo a cada sessão, ~900 ms de
+  travada), texturas pequenas escritas pela CPU passam a ser verificadas inteiras (texturas velhas/coloridas),
+  mutexes do jogo giram 20 µs antes de dormir (`SOTC_MUTEX_SPIN_US=0` desliga) e buffers de staging grandes
+  ficam guardados entre quadros (`SOTC_STAGING_LARGE_POW2=0` desliga). O cache de shaders é refeito na
+  primeira abertura.
+- **DLSS: viés de cor atual na cena toda (`SOTC_DLSS_BIAS`, padrão 0,4; 0 desliga).** A sombra do
+  personagem não tem vetor de movimento, então o DLSS a mantinha no histórico e deixava rastro em
+  áreas escuras, mesmo com o preset E. O DLSS agora favorece mais o quadro atual. Se ainda houver
+  rastro, teste `SOTC_DLSS_BIAS=0.7`; se a imagem ficar granulada, use um valor menor.
+- **DLSS: preset E por padrão (`SOTC_DLSS_PRESET`)**. Letras E a O forçam um preset do modelo do DLSS
+  em todos os modos; `default` volta ao preset padrão da NVIDIA por modo. Sem a chave, o jogo usa o
+  preset E.
+- **Sombra/personagem com rastro em áreas escuras (corrigido):** há duas causas. (1) O **motion blur do
+  próprio jogo**, visível em cenas escuras e com 60 FPS: desligado por padrão (`fx_motionblur`).
+  (2) O **modelo padrão do DLSS** deixava ghosting em cenas escuras, também em Qualidade; com o preset E
+  (modelo CNN) o rastro some e o DLSS segue ativo. Os presets K e J (transformer) não resolveram.
+  O modo DLSS padrão do lançador passou de Ultra Desempenho para Qualidade.
+
+- **HDR10 para o jogo SDR (#347), experimental:** `SOTC_HDR=1` mostra o jogo numa tela HDR10 (PQ,
+  Rec.2020), expandindo o SDR no passe final: o branco SDR fica em `SOTC_HDR_PAPER` nits (padrão 200)
+  e os realces ganham até `SOTC_HDR_GAIN` vezes (padrão 1,5; 1 = sem ganho). `SOTC_HDR_WHITE` é
+  aceito como outro nome de `SOTC_HDR_PAPER` (igual ao fork do Oussama). Precisa do HDR ligado
+  no Windows e de um monitor HDR; sem isso o jogo avisa no log e segue em SDR. **Ainda não testado em
+  tela HDR** (o monitor de desenvolvimento não tem HDR). No lançador: Vídeo > Tela > "HDR (experimental)".
+  O cache de shaders é refeito na primeira abertura.
+- **Docs: remapear teclas e botões do mouse (#333):** `key.<entrada>=` e `mouse.<entrada>=` no
+  `sotc.ini` já funcionavam (inclusive L1/R1); agora estão documentados com exemplos. Um menu de
+  remapeamento dentro do jogo não existe (o menu é do próprio jogo).
+
 ## 0.70 — 2026-10-29
 > ⚠️ **Atenção: instale o jogo num SSD (de preferência NVMe).** Cada área nova lê centenas de MB
 > de texturas e modelos da pasta do jogo; num HD as trocas de área travam muito mais e podem

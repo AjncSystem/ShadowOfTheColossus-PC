@@ -84,6 +84,14 @@ trocar de janela solta o mouse. Botão esquerdo = R1 (agarrar), direito = □ (a
 meio = L1. Sensibilidade e inversão ficam em **Controles** no lançador. Para remapear os botões
 do mouse, use `mouse.<entrada>=left,right,middle,x1,x2`.
 
+**Remapear (`sotc.ini`):** uma linha por entrada, com várias opções separadas por vírgula (vazio =
+sem tecla). `key.<entrada>=` troca as teclas (nomes do SDL, como `Q`, `Left Shift`, `Space`) e
+`mouse.<entrada>=` os botões do mouse. Entradas: `cross circle square triangle l1 r1 l2 r2 l3 r3
+options touchpad touchpad_right up down left right move_up move_down move_left move_right look_up
+look_down look_left look_right`. Exemplos: atacar com o botão esquerdo e o raio da espada com o
+direito: `mouse.square=left` e `mouse.l1=right` (e `mouse.r1=` para soltar o R1); L1/R1 em outras
+teclas: `key.l1=Q` e `key.r1=E`.
+
 Um controle (DualShock 4, DualSense, Xbox...) é usado automaticamente. Com vários conectados,
 escolha um em **Controles** no lançador (ou `BB_GAMEPAD=` no `sotc.ini`). O teclado funciona
 junto com o controle:

@@ -3,6 +3,7 @@
 #include "runtime.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <pthread.h>
 #include <errno.h>
@@ -85,11 +86,68 @@ static int32_t ensure_mutex(GuestMutex **mutex) {
     pthread_mutex_unlock(&static_init);
     return e;
 }
+/* sotc: SOTC_MUTEX_SPIN_US=<us> (default 20; 0 = off, the old path): a contended guest mutex retries
+ * trylock with a pause between tries for up to this many us before the kernel-timed wait. The game's job
+ * scheduler relocks in a loop without pausing and convoyed on the kernel wait (HiddenUserHere, upstream
+ * PR #339: 145 -> 17 thread-ms of mutex waits per slow frame). Clamped to MUTEX_SPIN_MAX_US; ignored on
+ * machines with 2 or fewer logical CPUs, where a spinning waiter can only delay the owner. */
+#define MUTEX_SPIN_MAX_US 1000
+#define MUTEX_SPIN_UNREAD UINT64_MAX
+#ifdef _WIN32
+static uint64_t spin_now(void) { LARGE_INTEGER c; QueryPerformanceCounter(&c); return (uint64_t)c.QuadPart; }
+static uint64_t spin_clock_hz(void) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f.QuadPart > 0 ? (uint64_t)f.QuadPart : 1; }
+static unsigned spin_cpu_count(void) { SYSTEM_INFO si; GetSystemInfo(&si); return si.dwNumberOfProcessors; }
+#else
+static uint64_t spin_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec; }
+static uint64_t spin_clock_hz(void) { return 1000000000u; }
+static unsigned spin_cpu_count(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n > 0 ? (unsigned)n : 1; }
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#define spin_relax() _mm_pause()
+#else
+#define spin_relax() ((void)0)
+#endif
+static uint64_t mutex_spin_us_cfg = MUTEX_SPIN_UNREAD; /* accessed with __atomic */
+static uint64_t mutex_spin_hz_cfg;
+static uint64_t mutex_spin_us_get(void) {
+    uint64_t us = __atomic_load_n(&mutex_spin_us_cfg, __ATOMIC_ACQUIRE);
+    if (us != MUTEX_SPIN_UNREAD) return us;
+    const char *env = getenv("SOTC_MUTEX_SPIN_US");
+    long long signed_v = env ? strtoll(env, NULL, 10) : 20; /* negative = off */
+    unsigned long long v = signed_v > 0 ? (unsigned long long)signed_v : 0;
+    if (v > MUTEX_SPIN_MAX_US) v = MUTEX_SPIN_MAX_US;
+    if (v && spin_cpu_count() <= 2) {
+        fprintf(stderr, "Runtime: SOTC_MUTEX_SPIN_US ignored on a machine with 2 or fewer CPUs\n");
+        v = 0;
+    }
+    us = (uint64_t)v;
+    __atomic_store_n(&mutex_spin_hz_cfg, spin_clock_hz(), __ATOMIC_RELAXED);
+    __atomic_store_n(&mutex_spin_us_cfg, us, __ATOMIC_RELEASE);
+    return us;
+}
+/* Returns 0 when the spin got the lock, EBUSY (or another host error) when the caller must wait. */
+static int mutex_spin(GuestMutex *m, uint64_t us) {
+    const uint64_t limit = us * __atomic_load_n(&mutex_spin_hz_cfg, __ATOMIC_RELAXED) / 1000000;
+    const uint64_t t0 = spin_now();
+    int native = EBUSY;
+    do {
+        for (int i = 0; i < 16 && native == EBUSY; ++i) {
+            spin_relax();
+            native = pthread_mutex_trylock(&m->native);
+        }
+    } while (native == EBUSY && spin_now() - t0 < limit); /* at most limit plus one batch of 16 tries */
+    return native;
+}
 static ABI int32_t mutex_lock(GuestMutex **mutex) {
     int32_t e = ensure_mutex(mutex);
     if (e) return e;
     GuestMutex *m = *mutex;
     int native = pthread_mutex_trylock(&m->native);
+    if (native == EBUSY) {
+        const uint64_t spin_us = mutex_spin_us_get();
+        if (spin_us) native = mutex_spin(m, spin_us);
+    }
     for (int waited = 0; native == EBUSY;) {
         struct timespec slice;
         clock_gettime(CLOCK_REALTIME, &slice);

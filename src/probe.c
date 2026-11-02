@@ -878,6 +878,7 @@ static int helper_single_step(EXCEPTION_POINTERS *info) {
  * the first calls, then is removed. SOTC_HEAP_GUARD=0 leaves it off. */
 #define HEAP_FREE_OFFSET 0x495e0
 const unsigned char *runtime_memory_backing_pointer(uintptr_t address);
+const unsigned char *runtime_memory_backing_view(uint64_t *size);
 #define HEAP_HOOK_CALLS 2000
 static unsigned char heap_hook_original;
 static volatile LONG heap_hook_calls, heap_hook_done;
@@ -1024,6 +1025,99 @@ static int pool_hook_trap(EXCEPTION_POINTERS *info) {
     c->EFlags|=0x100; /* put the breakpoint back after this instruction */
     return 1;
 }
+/* sotc: SOTC_POOL_FREE_TRACE=1 (diagnostic, T38): every call of the page pool's release function
+ * (eboot+0x1abf0: sets the free bits, raises the free tally; called by the allocator itself at
+ * 0x1a173/0x1a2f0 and by eboot+0x1b0e0) is kept in a ring with its range, thread and the game's
+ * frame-pointer call stack. When the GPU side sees a page of a texture still drawn handed out
+ * again (SOTC_POOL_WATCH), it asks for the release that freed that page
+ * (runtime_pool_release_dump): which part of the game decided to free it. */
+#define POOL_RELEASE_OFFSET 0x1abf0
+#define POOL_RING 16384
+static unsigned char release_hook_original;
+static volatile LONG release_hook_on, release_dumps;
+static volatile LONG64 release_head;
+static _Thread_local int release_hook_rearm;
+static struct { uintptr_t addr; uint64_t size; DWORD tid; uintptr_t stack[10]; } release_ring[POOL_RING];
+static void release_hook_write(unsigned char value) {
+    DWORD old;
+    unsigned char *at=image+POOL_RELEASE_OFFSET;
+    if (VirtualProtect(at,1,PAGE_EXECUTE_READWRITE,&old)) { *at=value; VirtualProtect(at,1,old,&old); FlushInstructionCache(GetCurrentProcess(),at,1); }
+}
+static void install_release_hook(void) {
+    static const unsigned char expected[8]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56};
+    const char *v=getenv("SOTC_POOL_FREE_TRACE");
+    if (!v || v[0]!='1' || memcmp(image+POOL_RELEASE_OFFSET,expected,sizeof(expected))) return;
+    release_hook_original=image[POOL_RELEASE_OFFSET];
+    image[POOL_RELEASE_OFFSET]=0xCC; /* the image is still writable here */
+    release_hook_on=1;
+    fprintf(stderr,"Runtime: page pool release trace on (eboot+%#x)\n",POOL_RELEASE_OFFSET);
+}
+static int release_hook_trap(EXCEPTION_POINTERS *info) {
+    CONTEXT *c=info->ContextRecord;
+    if (!release_hook_on) return 0;
+    if (info->ExceptionRecord->ExceptionCode==EXCEPTION_SINGLE_STEP) {
+        if (!release_hook_rearm) return 0;
+        release_hook_rearm=0;
+        release_hook_write(0xCC);
+        c->EFlags&=~(DWORD)0x100;
+        return 1;
+    }
+    if (!image || c->Rip!=(DWORD64)(uintptr_t)(image+POOL_RELEASE_OFFSET)) return 0;
+    if (image[POOL_RELEASE_OFFSET]!=0xCC) return 1; /* another thread restored it: just run it */
+    const LONG64 slot=InterlockedIncrement64(&release_head)-1;
+    __typeof__(release_ring[0]) *e=&release_ring[slot%POOL_RING];
+    e->addr=(uintptr_t)c->Rdx; e->size=(uint64_t)c->Rcx; e->tid=GetCurrentThreadId();
+    if (slot<24)
+        fprintf(stderr,"SOTC POOL RELEASE call %lld: rdi %#llx rsi %#llx rdx %#llx rcx %#llx r8 %#llx from eboot+%#llx\n",
+                (long long)slot,(unsigned long long)c->Rdi,(unsigned long long)c->Rsi,(unsigned long long)c->Rdx,
+                (unsigned long long)c->Rcx,(unsigned long long)c->R8,
+                (unsigned long long)(*(const uintptr_t *)(uintptr_t)c->Rsp-(uintptr_t)image));
+    if (slot<24) { /* the bit index is (VirtualQuery offset of rdx - this base) >> 16 */
+        uint64_t view=0; const unsigned char *base=runtime_memory_backing_view(&view), *at=runtime_memory_backing_pointer((uintptr_t)c->Rdx);
+        fprintf(stderr,"SOTC POOL RELEASE base %#llx, phys of rdx %#llx (rdx - 0x1000000000 = %#llx)\n",
+                (unsigned long long)*(const uint64_t *)(image+0x2dfca70),(unsigned long long)(at && base ? at-base : 0),
+                (unsigned long long)(c->Rdx-0x1000000000));
+    }
+    memset(e->stack,0,sizeof(e->stack));
+    /* At the entry the return address is at rsp and rbp is the caller's frame: walk the chain
+     * while it stays on this stack (guest stacks are committed; fibers' are 16-64 KiB). */
+    e->stack[0]=*(const uintptr_t *)(uintptr_t)c->Rsp;
+    uintptr_t fp=(uintptr_t)c->Rbp;
+    for (int i=1;i<10;++i) {
+        if (fp<(uintptr_t)c->Rsp || fp>(uintptr_t)c->Rsp+0x40000 || (fp&7)) break;
+        e->stack[i]=((const uintptr_t *)fp)[1];
+        const uintptr_t next=((const uintptr_t *)fp)[0];
+        if (next<=fp) break;
+        fp=next;
+    }
+    release_hook_write(release_hook_original);
+    release_hook_rearm=1;
+    c->EFlags|=0x100; /* put the breakpoint back after this instruction */
+    return 1;
+}
+/* The latest release that freed the 64 KiB page at page_addr, with its call stack (stderr). */
+void runtime_pool_release_dump(uintptr_t page_addr, uintptr_t image_addr) {
+    if (!release_hook_on || InterlockedIncrement(&release_dumps)>120) return;
+    const LONG64 head=release_head;
+    for (LONG64 i=head-1;i>=0 && i>head-POOL_RING;--i) {
+        const __typeof__(release_ring[0]) *e=&release_ring[i%POOL_RING];
+        /* rdx: the range's address, rcx: its size in bytes (the allocator passes a 1 MiB-rounded
+         * byte count, eboot+0x1a2c0) */
+        if (page_addr<e->addr || page_addr>=e->addr+e->size) continue;
+        fprintf(stderr,"SOTC POOL RELEASE of page %#llx (image %#llx): range %#llx+%#llx by thread %lu, %lld releases ago; stack:",
+                (unsigned long long)page_addr,(unsigned long long)image_addr,(unsigned long long)e->addr,
+                (unsigned long long)e->size,e->tid,(long long)(head-1-i));
+        for (int k=0;k<10 && e->stack[k];++k) {
+            const uintptr_t r=e->stack[k];
+            if (r-(uintptr_t)image<0x10000000) fprintf(stderr," eboot+%#llx",(unsigned long long)(r-(uintptr_t)image));
+            else fprintf(stderr," %#llx",(unsigned long long)r);
+        }
+        fprintf(stderr,"\n");
+        return;
+    }
+    fprintf(stderr,"SOTC POOL RELEASE of page %#llx (image %#llx): not in the last %d releases\n",
+            (unsigned long long)page_addr,(unsigned long long)image_addr,POOL_RING);
+}
 static LONG vectored_fault_impl(EXCEPTION_POINTERS *info);
 /* sotc (from the shadPS4 SotC fork, signals.cpp): Shadow of the Colossus runs its jobs on fibers
  * with 16-64 KiB stacks packed back to back without guard pages. The exception handler runs on
@@ -1087,6 +1181,7 @@ static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
     DWORD code=record->ExceptionCode;
     if ((code==EXCEPTION_BREAKPOINT || code==EXCEPTION_SINGLE_STEP) && heap_hook_trap(info)) { fault_path=1; return EXCEPTION_CONTINUE_EXECUTION; }
     if ((code==EXCEPTION_BREAKPOINT || code==EXCEPTION_SINGLE_STEP) && pool_hook_trap(info)) { fault_path=1; return EXCEPTION_CONTINUE_EXECUTION; }
+    if ((code==EXCEPTION_BREAKPOINT || code==EXCEPTION_SINGLE_STEP) && release_hook_trap(info)) { fault_path=1; return EXCEPTION_CONTINUE_EXECUTION; }
     if (code==EXCEPTION_SINGLE_STEP && helper_single_step(info)) { fault_path=2; return EXCEPTION_CONTINUE_EXECUTION; }
     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2 && gpu_enabled && helper_read_fault(info)) {
         fault_path=3;
@@ -1699,7 +1794,7 @@ int main(int argc, char **argv) {
 #endif
     if (sotc_cpu) apply_sotc_cpu_patches(sotc_cpu, segments, ns, size);
     if (sotc_cmdline) apply_sotc_cmdline(sotc_cmdline, size);
-    if (sotc_cpu) { install_heap_hook(); install_pool_hook(); }
+    if (sotc_cpu) { install_heap_hook(); install_pool_hook(); install_release_hook(); }
     protect(traps, round_page((import_count + 1) * 32), 5);
     protect(image, round_page(size), 0);
     int executable_entry = 0;

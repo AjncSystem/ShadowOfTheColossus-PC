@@ -674,7 +674,17 @@ static int split_at(uintptr_t a) {
     if (i==vma_count || vmas[i].start>=a) return 0;
     Vma right=vmas[i];
     right.start=a;
-    if (right.kind==KIND_DIRECT) right.phys+=a-vmas[i].start;
+    /* sotc: flexible pages have a backing offset too. Kept unchanged, the right half of a
+     * split flexible mapping pointed at the left half's storage: the runtime's copies went to
+     * the wrong pages and its release freed the left half's pages, still in use, which the
+     * next flexible map handed out again (T38: mosaic textures, heap crashes). */
+    if (right.kind!=KIND_RESERVED) {
+        right.phys+=a-vmas[i].start;
+        static unsigned long flex_splits;
+        if (right.kind==KIND_FLEXIBLE && flex_splits++ < 8)
+            fprintf(stderr,"Runtime: flexible mapping %p-%p split at %p\n",
+                    (void *)vmas[i].start,(void *)vmas[i].end,(void *)a);
+    }
     dirty(vmas[i].start,vmas[i].end);
     vma_seq_begin();
     vmas[i].end=a;

@@ -1990,6 +1990,10 @@ bool TextureCache::PoolWatchEnabled() {
     return on;
 }
 
+// sotc: src/probe.c (SOTC_POOL_FREE_TRACE): the game's release of a pool page, with its stack.
+extern "C" void runtime_pool_release_dump(uintptr_t page_addr, uintptr_t image_addr)
+    __attribute__((weak));
+
 void TextureCache::PoolWatch() {
     if (!PoolWatchEnabled()) {
         return;
@@ -2000,7 +2004,9 @@ void TextureCache::PoolWatch() {
         prev = std::move(now);
         return;
     }
-    constexpr VAddr PoolBase = 0x1000000000;
+    // Bit n is physical 0x100000 + n * 64 KiB (eboot 0x1abf0: VirtualQuery offset minus the
+    // base at eboot+0x2dfca70); the game maps physical p at 0x1000200000 + p.
+    constexpr VAddr PoolBase = 0x1000300000;
     constexpr u64 PageBytes = 64_KB;
     const u64 tick = scheduler.CurrentTick();
     static u64 freed_total = 0, alloc_total = 0, hits_total = 0, logged = 0, reused_total = 0;
@@ -2039,6 +2045,10 @@ void TextureCache::PoolWatch() {
                                  image.info.size.width, image.info.size.height,
                                  vk::to_string(image.info.pixel_format).c_str(),
                                  static_cast<unsigned long long>(tick - image.tick_accessed_last));
+                    // sotc: SOTC_POOL_FREE_TRACE=1: the game's call stack of that page's release
+                    if (runtime_pool_release_dump) {
+                        runtime_pool_release_dump(addr, image_addr);
+                    }
                 }
             });
         }

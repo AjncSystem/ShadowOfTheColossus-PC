@@ -1,10 +1,7 @@
 # Changelog
 
 ## Não lançado
-- **Lançador: padrão em 1080p nativo, sem upscaler** (Upscaler "Bilinear", modo PS4 Pro desligado):
-  o jogo renderiza direto em 1920x1080, sem DLSS nem FSR. DLSS e FSR 1 continuam disponíveis no lançador.
-- **Lançador: novos padrões de qualidade**: texturas e VRAM no máximo, grama com detalhe 1, DLSS (modo Qualidade) e
-  logotipos de abertura pulados. Quem tem placa de 4–6 GB deve escolher VRAM "Econômico" no lançador.
+- **Lançador: logotipos de abertura pulados por padrão** (instalações novas).
 - **Lançador: motion blur agora vem desligado por padrão** (Efeitos > "Motion blur", dá para religar). Era a
   causa da sombra do personagem deixando rastro ao mover em áreas escuras; a correção só existia na
   configuração local e não ia no pacote. Equivale a `r_motionBlurEnable=0`.

@@ -803,6 +803,32 @@ static void views_protect(uintptr_t address, uint64_t size, int read, int write)
     }
     if (run) host_protect(run,run_end-run,run_prot);
 }
+/* sotc: T38, SOTC_POOL_OWNER (default on; 0 off). The game's 64 KiB page pool (eboot 0x19e00)
+ * shrinks a texture's block by freeing pages without unmapping them (release eboot 0x1abf0 with
+ * no unmap); those pages go to another block, mapped at its address. When the first block is
+ * freed whole, the release asks sceKernelVirtualQuery for every page of the block's range and
+ * frees the physical page found there again: the page now has two owners (mosaic textures,
+ * heap blocks overwritten, the free tally drifting up until the 5th Time Attack). Each physical
+ * 64 KiB page keeps the address it was mapped at last; asked from the release, a page mapped
+ * elsewhere since reads as not committed, and the release skips it. */
+static uintptr_t *page_owner; static uint64_t page_owner_count, owner_skipped_pages, owner_skips;
+static uintptr_t release_site; /* return address of the release's VirtualQuery (probe.c) */
+static int pool_owner_on(void) {
+    static int on=-1;
+    if (on<0) { const char *v=getenv("SOTC_POOL_OWNER"); on=!(v && v[0]=='0'); }
+    return on;
+}
+void runtime_memory_set_release_site(uintptr_t site) { release_site=site; }
+static void owner_note(uint64_t phys, uintptr_t address, uint64_t size) {
+    if (!pool_owner_on()) return;
+    if (!page_owner) {
+        page_owner_count=POOL_SIZE>>16;
+        page_owner=calloc(page_owner_count,sizeof(*page_owner));
+        if (!page_owner) { page_owner_count=0; return; }
+    }
+    for (uint64_t p=(phys+0xffff)&~(uint64_t)0xffff; p+0x10000<=phys+size; p+=0x10000)
+        if ((p>>16)<page_owner_count) page_owner[p>>16]=address+(p-phys);
+}
 static void drop_range(uintptr_t start, uintptr_t end) {
     int error; size_t i=carve(start,end,&error), n=0;
     while (i+n<vma_count && vmas[i+n].end<=end && vmas[i+n].start>=start) {
@@ -836,6 +862,7 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
     if (vma_insert(vma_index(address),(Vma){address,address+size,kind,prot,type,phys})) return NO_MEMORY;
     if (kind==KIND_FLEXIBLE) flexible_bytes+=size;
     if (kind==KIND_DIRECT) {
+        owner_note(phys,address,size);
         views_add(phys,address,size);
 #ifdef _WIN32
         /* a new second address takes the GPU's protection of the first */
@@ -1182,6 +1209,27 @@ static ABI int32_t virtual_query(const void *address, int flags, VirtualQueryInf
     info->offset=v.kind==KIND_DIRECT ? v.phys : 0;
     info->protection=v.prot; info->memory_type=v.type;
     info->flags=(v.kind==KIND_FLEXIBLE ? 1u : 0) | (v.kind==KIND_DIRECT ? 2u : 0) | (v.kind!=KIND_RESERVED ? 16u : 0);
+    /* sotc: T38, the pool release asking about pages another block owns now (owner_note) */
+    if (release_site && page_owner && v.kind==KIND_DIRECT && (uintptr_t)__builtin_return_address(0)==release_site &&
+        (uintptr_t)address>=v.start) {
+        const uintptr_t page=(uintptr_t)address & ~(uintptr_t)0xffff;
+        uintptr_t at=page<v.start ? v.start : page;
+        uint64_t stale=0;
+        for (; at<v.end; at=(at & ~(uintptr_t)0xffff)+0x10000, ++stale) {
+            const uint64_t phys=v.phys+(at-v.start);
+            if ((phys>>16)>=page_owner_count || !page_owner[phys>>16] || page_owner[phys>>16]==(at & ~(uintptr_t)0xffff)) break;
+        }
+        if (stale) {
+            info->start=(uintptr_t)address; info->end=at;
+            info->offset=v.phys+((uintptr_t)address-v.start);
+            info->flags&=~16u; /* not committed: the release skips [address, at) */
+            __atomic_add_fetch(&owner_skipped_pages,stale,__ATOMIC_RELAXED);
+            const uint64_t n=__atomic_add_fetch(&owner_skips,1,__ATOMIC_RELAXED);
+            if (n<=20 || !(n&(n-1)))
+                fprintf(stderr,"Runtime: POOL OWNER release of %p skips %" PRIu64 " pages mapped at another block since (%" PRIu64 " skips, %" PRIu64 " pages so far)\n",
+                        address,stale,n,owner_skipped_pages);
+        }
+    }
     strcpy(info->name, v.kind==KIND_RESERVED ? "reserved" : v.kind==KIND_DIRECT ? "direct" : "flexible");
     __atomic_add_fetch(&queries,1,__ATOMIC_RELAXED);
     read_unlock();

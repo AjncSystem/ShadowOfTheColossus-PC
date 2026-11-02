@@ -881,6 +881,7 @@ const unsigned char *runtime_memory_backing_pointer(uintptr_t address);
 const unsigned char *runtime_memory_backing_view(uint64_t *size);
 uintptr_t runtime_memory_alias_of(uintptr_t address);
 int runtime_memory_alias_release(uintptr_t address);
+void runtime_memory_set_release_site(uintptr_t site);
 #define HEAP_HOOK_CALLS 2000
 static unsigned char heap_hook_original;
 static volatile LONG heap_hook_calls, heap_hook_done;
@@ -1943,6 +1944,8 @@ int main(int argc, char **argv) {
     if (sotc_cpu) apply_sotc_cpu_patches(sotc_cpu, segments, ns, size);
     if (sotc_cmdline) apply_sotc_cmdline(sotc_cmdline, size);
     if (sotc_cpu) { install_heap_hook(); install_pool_hook(); install_release_hook(); }
+    /* T38: the page pool release's VirtualQuery call (runtime_memory.c, SOTC_POOL_OWNER) */
+    if (sotc_cpu && image[0x1ac7d]==0xE8) runtime_memory_set_release_site((uintptr_t)(image+0x1ac82));
     protect(traps, round_page((import_count + 1) * 32), 5);
     protect(image, round_page(size), 0);
     int executable_entry = 0;

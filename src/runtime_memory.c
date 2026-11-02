@@ -1189,8 +1189,9 @@ void runtime_memory_cache_stats(uint64_t *misses, uint64_t *stale, uint64_t *fas
     *fast=__atomic_exchange_n(&region_fast_hits,0,__ATOMIC_RELAXED);
 }
 /* sotc: the VMA holding address, read without the lock (0: none there, or the array kept changing:
- * take the lock). A torn read is caught by vma_seq. */
-static int vma_lookup_fast(uintptr_t address, Vma *out) {
+ * take the lock). A torn read is caught by vma_seq. With gap_lo/gap_hi, an address in no VMA
+ * returns 2 and the unmapped range around it instead of 0. */
+static int vma_lookup_gap(uintptr_t address, Vma *out, uintptr_t *gap_lo, uintptr_t *gap_hi) {
     for (int tries=0; tries<4; ++tries) {
         const uint64_t s=__atomic_load_n(&vma_seq,__ATOMIC_ACQUIRE);
         if (s & 1) continue;
@@ -1202,6 +1203,7 @@ static int vma_lookup_fast(uintptr_t address, Vma *out) {
             if (__atomic_load_n(&v[mid].end,__ATOMIC_RELAXED)<=address) lo=mid+1; else hi=mid;
         }
         Vma e={0};
+        const uintptr_t before=lo ? __atomic_load_n(&v[lo-1].end,__ATOMIC_RELAXED) : 0;
         if (lo<n) {
             e.start=__atomic_load_n(&v[lo].start,__ATOMIC_RELAXED);
             e.end=__atomic_load_n(&v[lo].end,__ATOMIC_RELAXED);
@@ -1211,12 +1213,17 @@ static int vma_lookup_fast(uintptr_t address, Vma *out) {
         }
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         if (__atomic_load_n(&vma_seq,__ATOMIC_RELAXED)!=s) continue;
-        if (lo==n || e.start>address) return 0;
+        if (lo==n || e.start>address) {
+            if (!gap_lo) return 0;
+            *gap_lo=before; *gap_hi=lo==n ? UINTPTR_MAX : e.start;
+            return 2;
+        }
         *out=e;
         return 1;
     }
     return 0;
 }
+static int vma_lookup_fast(uintptr_t address, Vma *out) { return vma_lookup_gap(address,out,NULL,NULL); }
 static __thread CachedRegion region_scratch;
 static const CachedRegion *cached_region_q(uintptr_t address, uintptr_t qend) {
     uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
@@ -1338,18 +1345,50 @@ const unsigned char *runtime_memory_backing_pointer(uintptr_t address) {
 /* sotc: mapped length of [address, address+size) from the cached regions alone, walking
  * adjacent mappings (buffers that span two VMAs missed the one-region check every time and took
  * the read lock); 0 when a region on the way is not cached. */
-static uint64_t cached_mapped_length(uintptr_t address, uint64_t size) {
-    if (runtime_disabled_optimizations & 1) return 0;
-    uint64_t length=0;
-    for (unsigned hops=0; length<size && hops<4; ++hops) {
-        const CachedRegion *c=cached_region_q(address+length,address+size);
-        if (!c || c->kind==KIND_RESERVED) return 0;
-        length=c->end-address;
+/* sotc: SOTC_CLAMP_FAST=0 takes the read lock whenever the range is not mapped to its end. On a
+ * world-streaming ride the GPU's clamps waited ~6 s per 5 minutes for the game's map batches,
+ * nearly all of them for ranges that run into a reserved range or a gap (2.5M lookups), where
+ * the answer is just where the mapping stops. That end is read without the lock too: a reserved
+ * region the cache holds, or a gap seen in a consistent read of the VMAs that no write since
+ * touched (as for mapped regions in cached_region_q). 1: *length is the mapped length from
+ * address (capped at size); 0: unknown, take the lock. */
+static int mapped_length_fast(uintptr_t address, uint64_t size, uint64_t *length) {
+    static int on=-1;
+    if (on<0) { const char *v=getenv("SOTC_CLAMP_FAST"); on=!(v && v[0]=='0') && region_log_on(); }
+    if ((runtime_disabled_optimizations & 1) || size>UINTPTR_MAX-address) return 0;
+    uint64_t n=0;
+    int end_seen=0;
+    for (unsigned hops=0; n<size && hops<4 && !end_seen; ++hops) {
+        const uintptr_t at=address+n;
+        const CachedRegion *c=cached_region_q(at,address+size);
+        if (c) {
+            if (c->kind==KIND_RESERVED) {
+                if (!on) return 0;
+                end_seen=1;
+                continue;
+            }
+            n=c->end-address;
+            continue;
+        }
+        if (!on || !backing_base) return 0;
+        const uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
+        Vma e; uintptr_t lo=0, hi=0;
+        if (vma_lookup_gap(at,&e,&lo,&hi)!=2) return 0;
+        const uint64_t now=__atomic_load_n(&table_generation,__ATOMIC_SEQ_CST);
+        /* only the part of the gap this range covers: a gap that exists only during a write
+         * lies in that write's dirty range, which includes at */
+        const uintptr_t upto=hi<address+size ? hi : address+size;
+        (void)lo;
+        if (!((now==generation && !(now & 1)) || region_unchanged(at,upto,generation & ~(uint64_t)1,now))) return 0;
+        end_seen=1;
     }
-    return length>=size ? size : 0;
+    if (n<size && !end_seen) return 0;
+    *length=n<size ? n : size;
+    return 1;
 }
 uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size) {
-    if (size && cached_mapped_length(address,size)==size) return size;
+    uint64_t fast;
+    if (size && mapped_length_fast(address,size,&fast)) return fast;
     read_lock();
     uint64_t length=0;
     for (size_t i=vma_index(address); i<vma_count && length<size; ++i) {
@@ -1485,7 +1524,8 @@ void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int 
 }
 /* Host view of a guest range, for the GPU backend: the range must be mapped. */
 int runtime_memory_is_mapped(uintptr_t address, uint64_t size) {
-    if (size && cached_mapped_length(address,size)==size) return 1;
+    uint64_t fast;
+    if (size && mapped_length_fast(address,size,&fast)) return fast==size;
     read_lock();
     int result=covered(address,address+size,0);
     if (result) {

@@ -1084,17 +1084,16 @@ void TextureCache::RefreshImage(Image& image) {
         // sotc: mip tails are small enough to land here often, and the hash below only sees the
         // first texels of the first mip: a CPU write to another mip would be missed. Re-upload.
         SotcStats::rebase_maybe_dirty.fetch_add(1, std::memory_order_relaxed);
+    } else if (maybe_cpu_dirty && image.info.guest_size > 64_KB) {
+        // sotc: defensive. A MaybeCpuDirty image begins and ends inside one page, so this should
+        // not happen; if it does, re-upload instead of hashing an unexpectedly large range.
+        SotcStats::rebase_maybe_dirty.fetch_add(1, std::memory_order_relaxed);
     } else if (maybe_cpu_dirty) {
-        // The image size should be less than page size to be considered MaybeCpuDirty
-        // So this calculation should be very uncommon and reasonably fast
-        // For now we'll just check up to 64 first pixels
+        // sotc: hash the whole image, not just its first 8x8 texels. An image inside one page is
+        // untracked after the first fault, so a CPU write past the first texels would otherwise
+        // never be seen (colored patches on meshes; HiddenUserHere, upstream PR #339).
         const auto addr = std::bit_cast<u8*>(image.info.guest_address);
-        const u32 w = std::min(image.info.size.width, u32(8));
-        const u32 h = std::min(image.info.size.height, u32(8));
-
-        const u32 s_w = image.info.props.is_block ? Common::DivCeil(w, 4u) : w;
-        const u32 s_h = image.info.props.is_block ? Common::DivCeil(h, 4u) : h;
-        const u32 size = s_w * s_h * (image.info.num_bits / 8);
+        const size_t size = image.info.guest_size;
         const u64 hash = [&] {
             const SotcStats::FrameTimer hash_timer{SotcStats::FrameHash};
             const SotcStats::SplitTimer hash_split{SotcStats::SplitTexHash};
@@ -1161,6 +1160,10 @@ void TextureCache::RefreshImage(Image& image) {
     // budget, the first upload of a big colour texture waits for a later frame (the first upload
     // of each frame always goes through); meanwhile the image holds zeros, put in on the GPU once,
     // so it shows black, never stale memory, and it stays Dirty for the next use.
+    // sotc: an image is deferred for at most kMaxDeferFlips flips from its first deferral, then
+    // uploaded whatever the budget: when other uploads used the budget ahead of it in every frame,
+    // it stayed black for good (the Bluepoint logo and the autosave notice never showed, 29 Oct).
+    constexpr u64 kMaxDeferFlips = 2;
     static const u64 upload_budget = [] {
         const char* v = std::getenv("SOTC_UPLOAD_BUDGET_MB");
         return (v ? std::strtoull(v, nullptr, 10) : 32ull) << 20;
@@ -1175,7 +1178,9 @@ void TextureCache::RefreshImage(Image& image) {
     }
     if (upload_budget && !image.sotc_has_data && !is_gpu_modified && budget_used &&
         image.info.guest_size >= 256_KB && budget_used + image.info.guest_size > upload_budget &&
-        image.aspect_mask == vk::ImageAspectFlagBits::eColor) {
+        image.aspect_mask == vk::ImageAspectFlagBits::eColor &&
+        (image.sotc_deferred_flip == ~0ull ||
+         budget_flip - image.sotc_deferred_flip < kMaxDeferFlips)) {
         constexpr u64 ZeroBytes = 64_MB;
         bool fits = true;
         auto zero_copies = image_copies;
@@ -1205,6 +1210,9 @@ void TextureCache::RefreshImage(Image& image) {
                 image.flags |= ImageFlagBits::Dirty;
                 image.sotc_zero_filled = true;
                 SotcStats::upload_zero_filled.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (image.sotc_deferred_flip == ~0ull) {
+                image.sotc_deferred_flip = budget_flip; // sotc: see kMaxDeferFlips
             }
             SotcStats::upload_deferred.fetch_add(1, std::memory_order_relaxed);
             SotcStats::upload_deferred_bytes.fetch_add(image.info.guest_size,
@@ -1265,6 +1273,17 @@ void TextureCache::RefreshImage(Image& image) {
     {
         const SotcStats::SplitTimer record_split{SotcStats::SplitTexRecord};
         runtime.UploadImage(&image, buffer, image_copies);
+    }
+    // sotc: the MaybeCpuDirty check compares against image.hash, which only that branch used to
+    // set: after any other upload (CpuDirty, first upload) it described older contents, and a
+    // later rewrite of those older bytes was taken for "unchanged" (stale small textures). Keep
+    // it equal to what was just uploaded; 0 (never equal) for images the GPU writes or that do
+    // not fit in a page, which the MaybeCpuDirty path does not use.
+    if (image.info.guest_size <= 4_KB && False(image.flags & ImageFlagBits::GpuModified)) {
+        image.hash = XXH3_64bits(std::bit_cast<const u8*>(image.info.guest_address),
+                                 image.info.guest_size);
+    } else {
+        image.hash = 0;
     }
     SotcGlyphHook(image);
 }
@@ -2422,6 +2441,11 @@ void TextureCache::UnparkImage(ImageId image_id) {
     image.tick_accessed_last = 0;
     image.binding = {};
     image.usage = {};
+    // sotc: SOTC_UPLOAD_BUDGET_MB: a new image for the budget, and its texels are the old twin's,
+    // not zeros, so a deferral zero-fills it again.
+    image.sotc_has_data = false;
+    image.sotc_zero_filled = false;
+    image.sotc_deferred_flip = ~0ull;
     image.RenewIdentity();
     {
         std::unique_lock lk{download_images_mutex};

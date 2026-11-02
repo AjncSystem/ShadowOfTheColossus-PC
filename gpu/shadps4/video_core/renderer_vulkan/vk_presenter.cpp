@@ -527,6 +527,22 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
     fsr_pass_hudless.Create(device, instance.GetAllocator(), num_images);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
+    if (swapchain.GetHDR() && EmulatorSettings.IsSdrToHdr()) {
+        // sotc: SOTC_HDR_PAPER (nits of SDR white, default 200) and SOTC_HDR_GAIN (extra
+        // brightness of the highlights, 1 = none, default 1.5).
+        pp_settings.hdr = 2;
+        if (const char* v = std::getenv("SOTC_HDR_PAPER") ? std::getenv("SOTC_HDR_PAPER")
+                                                          : std::getenv("SOTC_HDR_WHITE")) {
+            pp_settings.paper_white = std::clamp(static_cast<float>(std::atof(v)), 80.0f, 1000.0f);
+        }
+        if (const char* v = std::getenv("SOTC_HDR_GAIN")) {
+            pp_settings.highlight_gain = std::clamp(static_cast<float>(std::atof(v)), 1.0f, 4.0f);
+        }
+        LOG_INFO(Render_Vulkan, "SOTC HDR: SDR game on HDR10, paper white {} nits, gain {}",
+                 pp_settings.paper_white, pp_settings.highlight_gain);
+    } else if (EmulatorSettings.IsSdrToHdr()) {
+        LOG_WARNING(Render_Vulkan, "SOTC HDR: the display has no HDR10 (turn HDR on in Windows)");
+    }
 
     // sotc: the pipeline cache is read here, once frames can be presented, and blank frames with
     // the loading screen (moving, with the shader bar) are shown meanwhile. It used to be read in
@@ -904,7 +920,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             }
         }
         image_view = fsr_pass.Render(cmdbuf, image_view, image_size,
-                                     {frame->width, frame->height}, fsr_settings, frame->is_hdr);
+                                     {frame->width, frame->height}, fsr_settings,
+                                     frame->is_hdr && pp_settings.hdr != 2);
 
         // Vulkan has no sRGB variant of the 10-bit format, so an A2R10G10B10Srgb buffer reaches
         // the post process pass still sRGB encoded and has to be decoded there instead.
@@ -941,7 +958,8 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         } else {
             const vk::ImageView scaled =
                 fsr_pass_hudless.Render(cmdbuf, hudless_view, image_size,
-                                        {frame->width, frame->height}, fsr_settings, frame->is_hdr);
+                                        {frame->width, frame->height}, fsr_settings,
+                                     frame->is_hdr && pp_settings.hdr != 2);
             pp_pass.Render(cmdbuf, scaled, image_size, hudless, pp_settings);
         }
         frame->hudless = &hudless;

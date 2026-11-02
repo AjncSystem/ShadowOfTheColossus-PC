@@ -73,7 +73,9 @@ public:
     bool IsNoInt64() const { return no_int64; }
     bool IsDumpShaders() { static const auto value = Flag("BB_DUMP_SHADERS", false); return value; }
     bool IsFsrEnabled() { static const auto value = Flag("BB_FSR1", false); return value; }
-    bool IsHdrAllowed() { static const auto value = Flag("BB_HDR", false); return value; }
+    // sotc: SOTC_HDR=1 shows the SDR game on an HDR10 (PQ) swapchain, expanded in post_process.frag.
+    bool IsSdrToHdr() { static const auto value = Flag("SOTC_HDR", false); return value; }
+    bool IsHdrAllowed() { static const auto value = Flag("BB_HDR", false) || IsSdrToHdr(); return value; }
     bool IsNullGPU() { static const auto value = Flag("BB_NULL_GPU", false); return value; }
     bool IsPatchShaders() { return false; }
     bool IsInlineFetchShader() { return false; }

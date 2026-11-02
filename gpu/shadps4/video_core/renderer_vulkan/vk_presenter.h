@@ -5,6 +5,7 @@
 
 #include <condition_variable>
 
+#include "core/emulator_settings.h"
 #include "core/libraries/videoout/buffer.h"
 #include <imgui.h> // sotc port: ImTextureID only
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
@@ -77,6 +78,11 @@ public:
 
     void SetHDR(bool enable) {
         if (!IsHDRSupported()) {
+            return;
+        }
+        if (EmulatorSettings.IsSdrToHdr()) {
+            // sotc: the swapchain stays HDR10; an SDR game frame (hdr 2) is expanded by the pp pass.
+            pp_settings.hdr = enable ? 1 : 2;
             return;
         }
         swapchain.SetHDR(enable);

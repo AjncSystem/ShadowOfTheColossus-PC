@@ -23,6 +23,14 @@
   filtro 16x, grama mais cheia), **Extremo** (modo Pro a 60 FPS, texturas máximas, sombras e grama até
   mais longe, memória de vídeo no máximo, DLSS na RTX e FSR 1 nas outras placas; pede uma placa forte)
   e **Personalizado** (tudo como você deixar). Mudar à mão um ajuste do modo passa para Personalizado.
+- **Lançador com visual novo**, no estilo do lançador do bloodborne_pc e com a cara de Shadow of the
+  Colossus: pedra escura, títulos dourados em Cinzel, o azul da luz da espada no que está ativo, chaves
+  no lugar das caixas de marcar, campos arredondados, ícones no menu e o banner do jogo com degradê suave.
+- **Lançador: aba Saves.** Lista os saves com o progresso (área, colossos derrotados, tempo de jogo) e a
+  data; exporta os escolhidos ou todos para um .zip (para guardar ou levar a outro PC); importa de .zip,
+  de uma pasta (um save, a pasta savedata de outra instalação) ou do shadPS4; faz backup com um clique em
+  `user/backups` (ficam os 10 mais novos), e sempre antes de substituir um save na importação. A antiga
+  aba "Jogo e saves" virou "Jogo".
 - **Memória flexível:** ao dividir um mapeamento flexível, a metade direita apontava para o armazenamento
   da metade esquerda (não acontecia neste jogo nos testes, mas estava errado).
 - **Lançador: logotipos de abertura pulados por padrão** (instalações novas).

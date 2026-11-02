@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+import zipfile
 
 import sotc_theme as theme
 import sotc_update
@@ -445,6 +446,17 @@ def supported_games():
     return ', '.join(f'{serial} {version}' for serial, (_region, version) in GAMES.items())
 
 
+def save_param(path):
+    """The title, subtitle and detail the port keeps for a save (<name>.sce_sys/param.bin, the
+    PS4 SaveDataParam: 128, 128 and 1024 bytes of UTF-8), or {}."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return {}
+    text = lambda a, b: data[a:b].split(b'\0')[0].decode('utf-8', 'replace').strip()
+    return {'MAINTITLE': text(0, 128), 'SUBTITLE': text(128, 256), 'DETAIL': text(256, 1280)} if len(data) >= 1280 else {}
+
+
 def user_dir(s):
     """The data folder (saves in savedata/1/<title id> below it: CUSA08809 EU, CUSA08034 US). A
     folder picked one level too deep (savedata itself, or a save folder) is taken back up to the
@@ -456,6 +468,7 @@ def user_dir(s):
     return folder
 
 
+SAVE_BACKUPS_KEPT = 10  # user/backups/saves-*.zip
 LOGS_KEPT = 5      # last_run.log and last_run.1.log ... last_run.4.log
 CRASH_LOGS_KEPT = 20
 
@@ -1078,7 +1091,7 @@ class Launcher:
         tk.Label(side, text=_('port nativo · Windows', 'native port · Windows') + f'  ·  v{VERSION}', bg=BG, fg=MUTED,
                  font=(ui_font(), 9)).pack(anchor='w', padx=22, pady=(0, 22))
         self.nav, self.nav_bars, self.current_page = {}, {}, None
-        for name, title in (('play', _('Jogar', 'Play')), ('game', _('Jogo e saves', 'Game & saves')),
+        for name, title in (('play', _('Jogar', 'Play')), ('game', _('Jogo', 'Game')), ('saves', _('Saves', 'Saves')),
                             ('graphics', _('Imagem e FPS', 'Display & FPS')), ('controls', _('Controles', 'Controls')),
                             ('advanced', _('Avançado', 'Advanced')), ('debug', _('Debug', 'Debug'))):
             holder = tk.Frame(side, bg=BG, cursor='hand2')
@@ -1124,6 +1137,7 @@ class Launcher:
         self.pages = {}
         self.build_play()
         self.build_game()
+        self.build_saves()
         self.build_graphics()
         self.build_controls()
         self.build_advanced()
@@ -1269,9 +1283,9 @@ class Launcher:
 
     def build_game(self):
         ttk = self.ttk
-        f = self.scrolled_page('game', _('Jogo e saves', 'Game & saves'),
-                               _('O seu dump do jogo, os módulos de som do seu console e a pasta dos saves.',
-                                 'Your game dump, your console\'s sound modules and the saves folder.'))
+        f = self.scrolled_page('game', _('Jogo', 'Game'),
+                               _('O seu dump do jogo, a atualização, as DLCs e os módulos de som do seu console.',
+                                 'Your game dump, the update, the DLC and your console\'s sound modules.'))
         self.section(f, _('Biblioteca de jogos', 'Game library'), top=4)
         self.note(f, _('Como no shadPS4: adicione as pastas onde ficam os seus jogos e escolha o Shadow of the '
                        'Colossus na lista (duplo clique).',
@@ -1334,17 +1348,6 @@ class Launcher:
                       "shadPS4's addcont folder (which holds the CUSA08809 or CUSA08034 subfolder). Only DLC of the "
                       "game's region counts. Empty = no DLC."),
                     on_change=self.refresh_status)
-        self.section(f, _('Saves', 'Saves'))
-        self.folder(f, 'user_dir', _('Pasta de dados', 'Data folder'), _('Pasta dos saves', 'Saves folder'),
-                    _('Saves, cache de shaders e capturas. Vazio = a pasta user ao lado do port.',
-                      'Saves, shader cache and screenshots. Empty = the user folder next to the port.'),
-                    on_change=self.refresh_status)
-        holder = ttk.Frame(f)
-        holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(10, 0))
-        ttk.Button(holder, text=_('Importar save do shadPS4…', 'Import a shadPS4 save…'), command=self.import_save).pack(side='left')
-        ttk.Label(holder, text=_('Copia a pasta savedata/CUSA08809 (ou CUSA08034) do shadPS4 para cá.',
-                                 'Copies shadPS4\'s savedata/CUSA08809 (or CUSA08034) folder here.'),
-                  style='Muted.TLabel').pack(side='left', padx=10)
         self.section(f, _('Sistema', 'System'))
         self.row(f, _('Idioma do sistema', 'System language'), self.choice(f, 'language', LANGUAGES),
                  _('O idioma que o jogo vê no "console".', 'The language the game sees on the "console".'))
@@ -1842,6 +1845,239 @@ class Launcher:
             return
         self.refresh_status()
         self.messagebox.showinfo('Shadow of the Colossus', _('Save importado para {}.', 'Save imported to {}.').format(target))
+
+    def build_saves(self):
+        """The Saves page: the game's saves with their progress, export and import (.zip, a folder,
+        shadPS4), backups, the data folder."""
+        ttk = self.ttk
+        f = self.scrolled_page('saves', _('Saves', 'Saves'),
+                               _('Os seus jogos salvos: exportar para guardar ou levar a outro PC, importar, fazer backup.',
+                                 'Your saved games: export to keep them or take them to another PC, import, back up.'))
+        self.section(f, _('Seus saves', 'Your saves'), top=4)
+        holder = ttk.Frame(f)
+        holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='we', pady=(6, 0))
+        self.save_list = ttk.Treeview(holder, columns=('detail', 'date'), height=7, style='Library.Treeview',
+                                      selectmode='extended')
+        for column, title, width in (('#0', _('Save', 'Save'), 430), ('detail', _('Tempo de jogo', 'Play time'), 260),
+                                     ('date', _('Gravado em', 'Saved'), 130)):
+            self.save_list.heading(column, text=title, anchor='w')
+            self.save_list.column(column, width=self.px(width), anchor='w', stretch=column == '#0')
+        self.save_list.pack(side='left', fill='x', expand=True)
+        self.save_label = ttk.Label(f, text='', style='Muted.TLabel')
+        self.save_label.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(4, 0))
+        buttons = ttk.Frame(f)
+        buttons.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(8, 0))
+        ttk.Button(buttons, text=_('Exportar selecionados…', 'Export selected…'),
+                   command=lambda: self.export_saves(selected=True)).pack(side='left')
+        ttk.Button(buttons, text=_('Exportar todos…', 'Export all…'),
+                   command=lambda: self.export_saves(selected=False)).pack(side='left', padx=(6, 0))
+        ttk.Button(buttons, text=_('Atualizar lista', 'Refresh'), command=self.refresh_saves).pack(side='left', padx=(6, 0))
+        ttk.Button(buttons, text=_('Abrir pasta', 'Open folder'),
+                   command=lambda: self.open_path(self.saves_folder() if self.saves_folder().is_dir()
+                                                  else user_dir({'user_dir': self.var('user_dir').get()}))).pack(
+            side='left', padx=(6, 0))
+
+        self.section(f, _('Importar', 'Import'))
+        self.note(f, _('Os saves com o mesmo nome são substituídos; antes disso o launcher faz um backup de todos.',
+                       'Saves with the same name are replaced; the launcher backs them all up first.'), top=0)
+        buttons = ttk.Frame(f)
+        buttons.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(8, 0))
+        ttk.Button(buttons, text=_('Importar .zip…', 'Import a .zip…'), command=self.import_saves_zip).pack(side='left')
+        ttk.Button(buttons, text=_('Importar pasta…', 'Import a folder…'),
+                   command=self.import_saves_folder).pack(side='left', padx=(6, 0))
+        ttk.Button(buttons, text=_('Importar do shadPS4…', 'Import from shadPS4…'),
+                   command=self.import_save).pack(side='left', padx=(6, 0))
+        self.note(f, _('.zip: um arquivo exportado por este launcher. Pasta: um save (com sce_sys/param.sfo), a pasta '
+                       'savedata/CUSA08809 de outra instalação ou um backup. shadPS4: a pasta savedata do shadPS4.',
+                       '.zip: a file this launcher exported. Folder: one save (with sce_sys/param.sfo), the '
+                       'savedata/CUSA08809 folder of another install or a backup. shadPS4: shadPS4\'s savedata folder.'))
+
+        self.section(f, _('Backup', 'Backup'))
+        buttons = ttk.Frame(f)
+        buttons.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(4, 0))
+        ttk.Button(buttons, text=_('Fazer backup agora', 'Back up now'), style='Accent.TButton',
+                   command=lambda: self.backup_saves(notify=True)).pack(side='left')
+        ttk.Button(buttons, text=_('Abrir pasta de backups', 'Open the backups folder'),
+                   command=lambda: self.open_path(self.backups_folder())).pack(side='left', padx=(6, 0))
+        self.note(f, _('Um .zip com todos os saves em user/backups (os {} mais novos ficam). Para restaurar, use '
+                       '"Importar .zip…".', 'A .zip of every save in user/backups (the {} newest are kept). To '
+                       'restore one, use "Import a .zip…".').format(SAVE_BACKUPS_KEPT))
+
+        self.section(f, _('Pasta de dados', 'Data folder'))
+        self.folder(f, 'user_dir', _('Pasta de dados', 'Data folder'), _('Pasta dos saves', 'Saves folder'),
+                    _('Saves, cache de shaders e capturas. Vazio = a pasta user ao lado do port.',
+                      'Saves, shader cache and screenshots. Empty = the user folder next to the port.'),
+                    on_change=lambda: (self.refresh_status(), self.refresh_saves()))
+        self.refresh_saves()
+
+    def save_entries(self):
+        """The game's saves: (folder name, title, play time, saved at) newest first."""
+        folder = self.saves_folder()
+        entries = []
+        try:
+            from prepare import sfo
+        except ImportError:
+            sfo = None
+        for path in (folder.iterdir() if folder.is_dir() else ()):
+            name = path.name
+            if not path.is_dir() or name.startswith('.') or name.endswith(('.sce_sys', '.sce_backup', '.bak')):
+                continue
+            values = save_param(folder / (name + '.sce_sys') / 'param.bin')
+            if not values.get('SUBTITLE'):
+                try:
+                    values = sfo((path / 'sce_sys' / 'param.sfo').read_bytes()) if sfo else {}
+                except (OSError, ValueError):
+                    pass
+            title = str(values.get('SUBTITLE') or values.get('MAINTITLE') or name)
+            stamp = max((p.stat().st_mtime for p in path.rglob('*') if p.is_file()), default=path.stat().st_mtime)
+            detail = ' · '.join(line.strip() for line in str(values.get('DETAIL') or '').splitlines() if line.strip())
+            entries.append((name, title, detail, stamp))
+        return sorted(entries, key=lambda e: -e[3])
+
+    def refresh_saves(self):
+        if not getattr(self, 'save_list', None):
+            return
+        self.save_list.delete(*self.save_list.get_children())
+        entries = self.save_entries()
+        for name, title, detail, stamp in entries:
+            self.save_list.insert('', 'end', iid=name, text='  ' + title,
+                                  values=(detail, time.strftime('%d/%m/%Y %H:%M', time.localtime(stamp))))
+        self.save_label.configure(text=_('{} save(s) em {}', '{} save(s) in {}').format(len(entries), self.saves_folder())
+                                  if entries else _('Nenhum save ainda em {}', 'No saves yet in {}').format(self.saves_folder()))
+
+    def save_parts(self, name):
+        """A save's folder and the port's folders beside it (<name>.sce_sys, <name>.sce_backup)."""
+        folder = self.saves_folder()
+        return [folder / n for n in (name, name + '.sce_sys', name + '.sce_backup') if (folder / n).exists()]
+
+    def write_saves_zip(self, target, names):
+        """`names` with their port folders into the .zip `target`, below <title id>/."""
+        serial = self.saves_folder().name
+        with zipfile.ZipFile(target, 'w', zipfile.ZIP_DEFLATED) as archive:
+            for name in names:
+                for part in self.save_parts(name):
+                    for file in part.rglob('*'):
+                        if file.is_file():
+                            archive.write(file, f'{serial}/{file.relative_to(part.parent).as_posix()}')
+
+    def export_saves(self, selected):
+        names = list(self.save_list.selection()) if selected else [e[0] for e in self.save_entries()]
+        if not names:
+            self.messagebox.showinfo('Shadow of the Colossus', _('Escolha um ou mais saves na lista.',
+                                                                 'Choose one or more saves in the list.'))
+            return
+        default = f'SotC-saves-{time.strftime("%Y-%m-%d")}.zip' if len(names) > 1 else f'SotC-{names[0]}.zip'
+        target = self.filedialog.asksaveasfilename(title=_('Exportar saves', 'Export saves'), defaultextension='.zip',
+                                                   initialfile=default, filetypes=[('ZIP', '*.zip')])
+        if not target:
+            return
+        try:
+            self.write_saves_zip(target, names)
+        except OSError as error:
+            self.messagebox.showerror('Shadow of the Colossus', _('Não foi possível exportar: {}',
+                                                                 'Could not export: {}').format(error))
+            return
+        self.messagebox.showinfo('Shadow of the Colossus', _('{} save(s) exportado(s) para\n{}',
+                                                             '{} save(s) exported to\n{}').format(len(names), target))
+
+    def backups_folder(self):
+        folder = user_dir({'user_dir': self.var('user_dir').get()}) / 'backups'
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    def backup_saves(self, notify=False):
+        """Every save into user/backups/saves-<title id>-<date>.zip; the newest SAVE_BACKUPS_KEPT stay."""
+        names = [e[0] for e in self.save_entries()]
+        if not names:
+            if notify:
+                self.messagebox.showinfo('Shadow of the Colossus', _('Ainda não há saves.', 'There are no saves yet.'))
+            return None
+        folder = self.backups_folder()
+        target = folder / f'saves-{self.saves_folder().name}-{time.strftime("%Y-%m-%d_%H-%M-%S")}.zip'
+        self.write_saves_zip(target, names)
+        for old in sorted(folder.glob('saves-*.zip'), key=lambda p: p.stat().st_mtime)[:-SAVE_BACKUPS_KEPT]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        if notify:
+            self.messagebox.showinfo('Shadow of the Colossus', _('Backup de {} save(s) em\n{}',
+                                                                 'Backup of {} save(s) in\n{}').format(len(names), target))
+        return target
+
+    def import_save_folders(self, saves):
+        """Copies save folders (each with sce_sys/param.sfo) into the game's saves, with their port
+        folders when they come along; backs up everything first."""
+        if not saves:
+            self.messagebox.showerror('Shadow of the Colossus', _(
+                'Nenhum save encontrado aí (um save é uma pasta com sce_sys/param.sfo).',
+                'No save found there (a save is a folder with sce_sys/param.sfo).'))
+            return
+        target = self.saves_folder()
+        existing = [p.name for p in saves if (target / p.name).exists()]
+        if existing and not self.messagebox.askyesno('Shadow of the Colossus', _(
+                'Substituir {} save(s) com o mesmo nome? Um backup de todos é feito antes.',
+                'Replace {} save(s) with the same name? Everything is backed up first.').format(len(existing))):
+            return
+        try:
+            if existing:
+                self.backup_saves()
+            target.mkdir(parents=True, exist_ok=True)
+            for save in saves:
+                for part in (save, save.with_name(save.name + '.sce_sys'), save.with_name(save.name + '.sce_backup')):
+                    if part.is_dir():
+                        shutil.rmtree(target / part.name, ignore_errors=True)
+                        shutil.copytree(part, target / part.name)
+        except OSError as error:
+            self.messagebox.showerror('Shadow of the Colossus', _('Não foi possível importar o save: {}',
+                                                                 'Could not import the save: {}').format(error))
+            return
+        self.refresh_saves()
+        self.refresh_status()
+        self.messagebox.showinfo('Shadow of the Colossus', _('{} save(s) importado(s).', '{} save(s) imported.').format(len(saves)))
+
+    @staticmethod
+    def find_saves(folder):
+        """The save folders in `folder` or below it: with sce_sys/param.sfo inside (PS4, shadPS4) or
+        the port's <name>.sce_sys beside them; not the port's own folders and backups."""
+        def is_save(d):
+            return (d / 'sce_sys' / 'param.sfo').is_file() or d.with_name(d.name + '.sce_sys').is_dir()
+        folder = Path(folder)
+        if is_save(folder):
+            return [folder]
+        skip = ('.sce_sys', '.sce_backup', '.bak')
+        found = set()
+        for d in folder.rglob('*'):
+            if d.is_dir() and not any(part.endswith(skip) for part in d.relative_to(folder).parts) and is_save(d):
+                found.add(d)
+        # a save's own subfolders (its sce_sys) are not saves
+        return sorted(d for d in found if not any(o != d and o in d.parents for o in found))
+
+    def import_saves_folder(self):
+        chosen = self.filedialog.askdirectory(title=_('Pasta com os saves', 'Folder with the saves'),
+                                              initialdir=str(PORT_DIR.parent))
+        if chosen:
+            self.import_save_folders(self.find_saves(chosen))
+
+    def import_saves_zip(self):
+        chosen = self.filedialog.askopenfilename(title=_('Saves exportados (.zip)', 'Exported saves (.zip)'),
+                                                 initialdir=str(self.backups_folder()), filetypes=[('ZIP', '*.zip')])
+        if not chosen:
+            return
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix='sotc-saves-') as temp:
+            try:
+                with zipfile.ZipFile(chosen) as archive:
+                    root = Path(temp).resolve()
+                    for member in archive.namelist():  # nothing written outside the temporary folder
+                        if not (root / member).resolve().is_relative_to(root):
+                            raise zipfile.BadZipFile(member)
+                    archive.extractall(temp)
+            except (OSError, zipfile.BadZipFile) as error:
+                self.messagebox.showerror('Shadow of the Colossus', _('Arquivo .zip inválido: {}',
+                                                                     'Invalid .zip file: {}').format(error))
+                return
+            self.import_save_folders(self.find_saves(temp))
 
     # ---- first start: the setup screen -------------------------------------------------------
     def show_setup(self):

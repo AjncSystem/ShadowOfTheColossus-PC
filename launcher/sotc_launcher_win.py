@@ -574,6 +574,11 @@ def load_settings():
         settings['fps_mode'] = '60' if saved.get('fps60') else '30'
     if 'textures' not in saved:  # before the levels: the "high quality textures" box
         settings['textures'] = 'high' if saved.get('hq_textures', True) else 'off'
+    if saved and 'fg_hudless_071' not in saved:
+        # 0.71 turned the HUD-less frame on by default (the HUD and letters stop shaking with
+        # frame generation), but older settings kept it saved off: turned on once.
+        settings['fg_hudless'] = True
+        settings['fg_hudless_071'] = True
     if 'framegen' not in saved:
         extra = str(settings.get('extra_env', '')).split()
         if 'SOTC_DLSSG=1' in extra:

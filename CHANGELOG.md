@@ -36,6 +36,12 @@
 - **Lançador: botão "Relatório"** na barra de baixo: um .zip com os registros das últimas sessões, as últimas
   quedas (com o dump), as configurações (sem o nome do jogador) e um resumo do PC, para anexar numa issue.
 - **Lançador: janela "Novidades"** na primeira abertura de cada versão nova, com o que mudou.
+- **Lançador: busca (Ctrl+F)** no topo do menu lateral: acha qualquer opção pelo nome, pela explicação ou
+  por palavras do dia a dia ("hud tremendo", "sem som", "vsync"), abre a página, rola até ela e a destaca.
+- **Lançador: barra de título própria** no tema, com os botões de minimizar, maximizar e fechar (o Windows
+  continua movendo, encaixando e redimensionando a janela).
+- **Lançador: "Visão avançada"** no menu lateral: desligada, as abas Avançado e Debug ficam escondidas (a
+  busca continua achando as opções delas).
 - **Memória flexível:** ao dividir um mapeamento flexível, a metade direita apontava para o armazenamento
   da metade esquerda (não acontecia neste jogo nos testes, mas estava errado).
 - **Lançador: logotipos de abertura pulados por padrão** (instalações novas).

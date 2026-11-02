@@ -24,6 +24,8 @@ import threading
 import time
 import zipfile
 
+import sotc_frame
+import sotc_search
 import sotc_theme as theme
 import sotc_update
 
@@ -139,6 +141,9 @@ def _(pt, en):
     return table.get(pt, en) if table else en
 
 
+sotc_search._ = _  # the search's texts in the launcher's language
+
+
 def ui_font():
     """Interface font: Inter (sotc_theme), which, like Segoe UI, has no Chinese or Korean characters."""
     return {'zh': 'Microsoft YaHei UI', 'ko': 'Malgun Gothic'}.get(LANG, theme.BODY)
@@ -171,7 +176,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'fg_hudless': True,
                 'dlss_mode': 'quality', 'dlss_sharpen': '0', 'dlss_ui_sharpen': '3', 'dlss_sky_sharpen': '2',
                 'dlss_compare': False, 'hdr': False,
-                'check_updates': True, 'skip_version': '', 'play_mode': 'custom', 'exit_backup': True, 'news_seen': ''}
+                'check_updates': True, 'skip_version': '', 'play_mode': 'custom', 'exit_backup': True, 'news_seen': '', 'expert_view': False, 'windows_title_bar': False}
 # sotc: improvements that changed a default, by the version that changed it. Settings saved by an
 # older launcher get them once when this one first loads them (load_settings). Every release that
 # changes a default for the better adds its entry here.
@@ -468,6 +473,8 @@ def user_dir(s):
     return folder
 
 
+# Shown in the side bar only in the expert view (the search finds them in both).
+EXPERT_PAGES = ('advanced', 'debug')
 NAV_ICONS = {'play': 'play', 'game': 'gameplay', 'saves': 'saves', 'graphics': 'display', 'controls': 'controls',
              'advanced': 'advanced', 'debug': 'system'}
 SAVE_BACKUPS_KEPT = 10  # user/backups/saves-*.zip
@@ -877,7 +884,7 @@ TEXT, MUTED, GOLD, ACCENT, ACCENT_HI = theme.TEXT, theme.MUTED, theme.GOLD_LIGHT
 SIGIL = theme.SIGIL_LIGHT
 
 
-class Launcher:
+class Launcher(sotc_search.SearchMixin):
     def __init__(self, root, tk, ttk, filedialog, messagebox):
         self.tk, self.ttk, self.filedialog, self.messagebox = tk, ttk, filedialog, messagebox
         self.root = root
@@ -987,6 +994,7 @@ class Launcher:
         show()
         box.bind('<<ComboboxSelected>>', lambda _e: var.set(values[box.current()]))
         var.trace_add('write', show)
+        box.sotc_key = key  # the search's words for the setting (row)
         return box
 
     def next_row(self, parent):
@@ -995,8 +1003,10 @@ class Launcher:
     def row(self, parent, title, widget, hint=None):
         ttk = self.ttk
         r = self.next_row(parent)
-        ttk.Label(parent, text=title).grid(row=r, column=0, sticky='nw', padx=(0, 18), pady=(8, 0))
+        label = ttk.Label(parent, text=title)
+        label.grid(row=r, column=0, sticky='nw', padx=(0, 18), pady=(8, 0))
         widget.grid(row=r, column=1, sticky='w', pady=(5, 0))
+        self.index_entry(label, title, hint or '', getattr(widget, 'sotc_key', None))
         if hint:
             ttk.Label(parent, text=hint, style='Muted.TLabel', wraplength=self.px(560), justify='left').grid(
                 row=r + 1, column=1, sticky='w', pady=(2, 2))
@@ -1005,7 +1015,9 @@ class Launcher:
     def check(self, parent, key, title, hint=None):
         ttk = self.ttk
         r = self.next_row(parent)
-        ttk.Checkbutton(parent, text=title, variable=self.var(key)).grid(row=r, column=0, columnspan=2, sticky='w', pady=(4, 0))
+        box = ttk.Checkbutton(parent, text=title, variable=self.var(key))
+        box.grid(row=r, column=0, columnspan=2, sticky='w', pady=(4, 0))
+        self.index_entry(box, title, hint or '', key)
         if hint:
             ttk.Label(parent, text=hint, style='Muted.TLabel', wraplength=self.px(640), justify='left').grid(
                 row=r + 1, column=0, columnspan=2, sticky='w', padx=(26, 0))
@@ -1016,8 +1028,9 @@ class Launcher:
 
     def section(self, parent, title, top=18):
         r = self.next_row(parent)
-        self.ttk.Label(parent, text=title, style='Section.TLabel').grid(
-            row=r, column=0, columnspan=2, sticky='w', pady=(top, 2))
+        label = self.ttk.Label(parent, text=title, style='Section.TLabel')
+        label.grid(row=r, column=0, columnspan=2, sticky='w', pady=(top, 2))
+        self.index_entry(label, title)
         self.tk.Frame(parent, bg=LINE, height=1).grid(row=r + 1, column=0, columnspan=2, sticky='we', pady=(0, 4))
 
     def window_icon_row(self, parent):
@@ -1059,6 +1072,7 @@ class Launcher:
             user_dir(self.app) if key == 'user_dir' else PORT_DIR))).pack(side='left', padx=(6, 0))
         if on_change:
             var.trace_add('write', lambda *_a: on_change())
+        holder.sotc_key = key
         return self.row(parent, title, holder, hint)
 
     def scrolled_page(self, name, title, subtitle):
@@ -1080,12 +1094,17 @@ class Launcher:
         bar.pack(side='right', fill='y')
         canvas.pack(side='left', fill='both', expand=True)
         outer.scroll = lambda units: canvas.yview_scroll(units, 'units') if inner.winfo_height() > canvas.winfo_height() else None
+        outer.canvas, outer.inner = canvas, inner  # the search scrolls to a setting (jump)
         self.pages[name] = outer
+        self.building_page = name
+        self.page_titles[name] = title
         return inner
 
     # ---- layout ------------------------------------------------------------------------------
     def build(self):
         tk, ttk = self.tk, self.ttk
+        self.custom_frame = None
+        self.titlebar = None if self.app.get('windows_title_bar') else self.build_titlebar()
         side = tk.Frame(self.root, bg=BG, width=self.px(220))
         side.pack(side='left', fill='y')
         side.pack_propagate(False)
@@ -1093,7 +1112,9 @@ class Launcher:
             anchor='w', padx=22, pady=(26, 0))
         tk.Frame(side, bg=GOLD, height=1, width=self.px(46)).pack(anchor='w', padx=22, pady=(10, 8))
         tk.Label(side, text=_('port nativo · Windows', 'native port · Windows') + f'  ·  v{VERSION}', bg=BG, fg=MUTED,
-                 font=(ui_font(), 9)).pack(anchor='w', padx=22, pady=(0, 22))
+                 font=(ui_font(), 9)).pack(anchor='w', padx=22, pady=(0, 14))
+        self.page_titles = {}
+        self.build_search(side)
         # The pages as in the bloodborne_pc launcher: a thin line icon, a card behind the current
         # page with the sword's light at its left edge, a softer card under the mouse.
         self.nav, self.current_page = {}, None
@@ -1117,7 +1138,11 @@ class Launcher:
             c.bind('<Leave>', lambda _e, n=name: self.nav_paint(n))
             self.nav[name] = (c, items)
             self.nav_paint(name)
+        self.nav_end = tk.Frame(side, bg=BG)  # the entries are packed above it (apply_view)
+        self.nav_end.pack(fill='x')
         tk.Frame(side, bg=BG).pack(fill='both', expand=True)
+        ttk.Checkbutton(side, text=_('Visão avançada', 'Expert view'), variable=self.var('expert_view'),
+                        style='Bar.TCheckbutton', command=self.apply_view).pack(anchor='w', padx=22, pady=(0, 10))
         for text, command in ((_('Registro do jogo', 'Game log'), lambda: self.show('log')),
                               (_('Procurar atualização', 'Check for updates'), lambda: self.check_updates(True)),
                               (_('Configurar de novo', 'Set up again'), self.show_setup)):
@@ -1154,6 +1179,9 @@ class Launcher:
         self.build_debug()
         self.build_log()
         self.root.bind_all('<MouseWheel>', self.wheel)
+        self.page_titles['log'] = _('Registro do jogo', 'Game log')
+        self.search_ready(self.page_titles)
+        self.apply_view()
         self.refresh_status()
 
     def wheel(self, event):
@@ -1169,8 +1197,93 @@ class Launcher:
         self.current_page = name
         for n in self.nav:
             self.nav_paint(n)
+        if hasattr(self, 'nav_end'):  # an expert page found by the search shows its entry meanwhile
+            self.apply_view()
         if name == 'play':
             self.refresh_status()
+
+    TITLE_ICONS = {'minimize': '\ue921', 'maximize': '\ue922', 'restore': '\ue923', 'close': '\ue8bb'}
+
+    def build_titlebar(self):
+        """The launcher's own title bar, as in the bloodborne_pc launcher: a drag area in the side
+        bar's colour and the window's three buttons. Windows' caption goes once the window exists
+        (window_chrome, sotc_frame)."""
+        tk, px = self.tk, self.px
+        bar = tk.Frame(self.root, bg=BG, height=px(32))
+        bar.pack(side='top', fill='x')
+        bar.pack_propagate(False)
+        self.title_buttons = {}
+        for name, command, hover in (('close', self.close, '#8a1c1c'),
+                                     ('maximize', self.toggle_maximized, theme.SURFACE),
+                                     ('minimize', self.root.iconify, theme.SURFACE)):
+            cell = tk.Frame(bar, bg=BG, width=px(46), height=px(32))
+            cell.pack(side='right')
+            cell.pack_propagate(False)
+            glyph = tk.Label(cell, text=self.TITLE_ICONS[name], bg=BG, fg=theme.TEXT_SOFT, font=(theme.ICONS, 9))
+            glyph.pack(fill='both', expand=True)
+
+            def paint(on, cell=cell, glyph=glyph, hover=hover, name=name):
+                cell.configure(bg=hover if on else BG)
+                glyph.configure(bg=hover if on else BG,
+                                fg=theme.TEXT_STRONG if on and name == 'close' else TEXT if on else theme.TEXT_SOFT)
+            for widget in (cell, glyph):
+                widget.bind('<Enter>', lambda _e, paint=paint: paint(True))
+                widget.bind('<Leave>', lambda _e, paint=paint: paint(False))
+                widget.bind('<ButtonRelease-1>', lambda e, command=command, cell=cell, glyph=glyph:
+                            command() if e.widget.winfo_containing(e.x_root, e.y_root) in (cell, glyph) else None)
+            self.title_buttons[name] = glyph
+        self.root.bind('<Configure>', lambda e: self.title_state() if e.widget is self.root else None, add='+')
+        self.root.after(100, self.window_chrome)
+        return bar
+
+    def toggle_maximized(self):
+        self.root.state('normal' if self.root.state() == 'zoomed' else 'zoomed')
+
+    def title_state(self):
+        """The maximize button follows the window's state; Windows learns where the bar is."""
+        if not getattr(self, 'title_buttons', None):
+            return
+        glyph = self.TITLE_ICONS['restore' if self.root.state() == 'zoomed' else 'maximize']
+        if self.title_buttons['maximize'].cget('text') != glyph:
+            self.title_buttons['maximize'].configure(text=glyph)
+        if self.custom_frame:  # where Windows finds the caption and the buttons (physical pixels)
+            self.custom_frame.bar = self.titlebar.winfo_height()
+            self.custom_frame.buttons = sum(cell.master.winfo_width() for cell in self.title_buttons.values())
+            self.custom_frame.edge, self.custom_frame.corner = self.px(5), self.px(10)
+
+    def window_chrome(self):
+        """Windows' caption off (sotc_frame), the frame dark; Windows' caption back when that fails."""
+        try:
+            hwnd = int(self.root.wm_frame(), 16)
+            if hwnd == self.root.winfo_id() and getattr(self, 'chrome_waits', 0) < 100:
+                self.chrome_waits = getattr(self, 'chrome_waits', 0) + 1  # not wrapped by Tk yet
+                self.root.after(50, self.window_chrome)
+                return
+            dwm = ctypes.windll.dwmapi
+
+            def attribute(number, value):
+                v = ctypes.c_int(value)
+                return dwm.DwmSetWindowAttribute(hwnd, number, ctypes.byref(v), ctypes.sizeof(v))
+            if attribute(20, 1):  # DWMWA_USE_IMMERSIVE_DARK_MODE; 19 before Windows 10 20H1
+                attribute(19, 1)
+            attribute(34, 0x000e0c0a)  # DWMWA_BORDER_COLOR (Windows 11): the side bar's dark
+            if self.titlebar is not None and self.custom_frame is None:
+                frame = sotc_frame.Frame(hwnd, [self.root.winfo_id(), self.titlebar.winfo_id()])
+                self.custom_frame = frame if frame.install() else False
+                if not self.custom_frame:
+                    self.titlebar.pack_forget()
+                self.title_state()
+        except (AttributeError, OSError, ValueError, self.tk.TclError):
+            pass
+
+    def apply_view(self):
+        """The side bar's entries: the expert pages only in the expert view."""
+        expert = self.var('expert_view').get()
+        for name, (c, _items) in self.nav.items():
+            c.pack_forget()
+        for name, (c, _items) in self.nav.items():
+            if expert or name not in EXPERT_PAGES or name == self.current_page:
+                c.pack(padx=self.px(12), pady=(0, self.px(2)), before=self.nav_end)
 
     def nav_paint(self, name, hover=False):
         """A side bar entry: a card behind the current page, a softer one under the mouse."""
@@ -1186,6 +1299,8 @@ class Launcher:
         tk, ttk = self.tk, self.ttk
         page = tk.Frame(self.content, bg=PANEL)
         self.pages['play'] = page
+        self.building_page = 'play'
+        self.page_titles['play'] = _('Jogar', 'Play')
         self.banner = tk.Canvas(page, height=self.px(290), bg=BG, highlightthickness=0, bd=0)
         self.banner.pack(fill='x')
         self.banner.bind('<Configure>', lambda _e: self.draw_banner())

@@ -914,6 +914,42 @@ static uint64_t alias_ms(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000+(uint64_t)t.tv_nsec/1000000;
 #endif
 }
+/* sotc: SOTC_VIEW_CHECK=1 (diagnostic, T38): the host views against the region table, once a
+ * second during maps. A view whose section offset is not the one the table gives its guest
+ * address means the CPU writes one physical page and the GPU (which reads the backing by the
+ * table) another. */
+static void views_check(void) {
+#ifdef _WIN32
+    static int on=-1;
+    if (on<0) { const char *v=getenv("SOTC_VIEW_CHECK"); on=v && v[0]=='1'; }
+    if (!on) return;
+    static uint64_t last; static unsigned long bad_total, checks;
+    const uint64_t now=alias_ms();
+    if (now-last<1000) return;
+    last=now; ++checks;
+    unsigned long bad=0;
+    for (size_t r=0; r<region_count; ++r) {
+        if (!regions[r].mapped) continue;
+        for (uintptr_t at=regions[r].start; at<regions[r].end;) {
+            const size_t i=vma_index(at);
+            if (i==vma_count || vmas[i].start>at) { /* a view where the table has nothing */
+                if (bad++<8 && bad_total<200) fprintf(stderr,"Runtime: VIEW CHECK view %p-%p (offset %#" PRIx64 ") over no mapping at %p\n",
+                    (void *)regions[r].start,(void *)regions[r].end,regions[r].phys,(void *)at);
+                break;
+            }
+            const uintptr_t stop=vmas[i].end<regions[r].end ? vmas[i].end : regions[r].end;
+            const uint64_t view_phys=regions[r].phys+(at-regions[r].start);
+            const uint64_t table_phys=vmas[i].phys+(at-vmas[i].start);
+            if (vmas[i].kind!=KIND_RESERVED && view_phys!=table_phys && bad++<8 && bad_total<200)
+                fprintf(stderr,"Runtime: VIEW CHECK %p-%p: view offset %#" PRIx64 ", table %#" PRIx64 " (kind %d, mapping %p-%p)\n",
+                        (void *)at,(void *)stop,view_phys,table_phys,vmas[i].kind,(void *)vmas[i].start,(void *)vmas[i].end);
+            at=stop;
+        }
+    }
+    bad_total+=bad;
+    if (bad || checks%30==1) fprintf(stderr,"Runtime: VIEW CHECK %lu wrong now, %lu in all (%zu views, %zu mappings)\n",bad,bad_total,region_count,vma_count);
+#endif
+}
 static int32_t map_direct_locked(void **out, uint64_t size, int prot, int flags, int64_t physical, uint64_t alignment) {
     if (!alignment) alignment=PAGE;
     if (!out || physical < 0 || (uint64_t)physical % PAGE || !size || size % PAGE || !valid_alignment(alignment) ||
@@ -921,6 +957,7 @@ static int32_t map_direct_locked(void **out, uint64_t size, int prot, int flags,
     if (!direct_range_allocated((uint64_t)physical,size)) return INVALID;
     int32_t result=place(out,size,prot,flags,alignment,KIND_DIRECT,block_type((uint64_t)physical),(uint64_t)physical);
     if (!result) ++maps;
+    views_check();
     /* sotc: SOTC_ALIAS_LOG=1 (diagnostic, T38): physical pages mapped at a second address while
      * still mapped at the first. The GPU caches go by address and do not see one through the other. */
     static int alias_log=-1;

@@ -171,7 +171,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'fg_hudless': True,
                 'dlss_mode': 'quality', 'dlss_sharpen': '0', 'dlss_ui_sharpen': '3', 'dlss_sky_sharpen': '2',
                 'dlss_compare': False, 'hdr': False,
-                'check_updates': True, 'skip_version': '', 'play_mode': 'custom'}
+                'check_updates': True, 'skip_version': '', 'play_mode': 'custom', 'exit_backup': True, 'news_seen': ''}
 # sotc: improvements that changed a default, by the version that changed it. Settings saved by an
 # older launcher get them once when this one first loads them (load_settings). Every release that
 # changes a default for the better adds its entry here.
@@ -904,6 +904,8 @@ class Launcher:
         if not self.app.get('setup_done') or not game_info(self.var('game_dir').get()):
             root.after(50, self.show_setup)
         root.protocol('WM_DELETE_WINDOW', self.close)
+        if self.app.get('setup_done') and self.app.get('news_seen') != VERSION:
+            root.after(600, self.show_news)
         root.after(100, self.drain_output)
         threading.Thread(target=self.detect_gpu, daemon=True).start()
         # sotc: self-update (sotc_update.py): the result of an update that just ran, then a check.
@@ -1130,12 +1132,15 @@ class Launcher:
         bar.pack(fill='x', side='bottom')
         tk.Frame(right, bg=LINE, height=1).pack(fill='x', side='bottom')
         bar.pack_propagate(False)
-        self.status = tk.Label(bar, text='', bg=BG, fg=MUTED, font=(ui_font(), 10), anchor='w', justify='left')
-        self.status.pack(side='left', padx=24)
         self.play_button = ttk.Button(bar, text=_('JOGAR', 'PLAY'), style='Play.TButton', command=self.play)
         self.play_button.pack(side='right', padx=(10, 24), pady=11)
         self.stop_button = ttk.Button(bar, text=_('Parar', 'Stop'), command=self.stop, state='disabled')
         self.stop_button.pack(side='right', pady=11)
+        ttk.Button(bar, text=_('Relatório', 'Report'), command=self.save_report).pack(side='right', padx=(0, 8), pady=11)
+        # Packed after the buttons: on a narrow window the summary wraps instead of pushing them out.
+        self.status = tk.Label(bar, text='', bg=BG, fg=MUTED, font=(ui_font(), 10), anchor='w', justify='left')
+        self.status.pack(side='left', fill='x', expand=True, padx=(24, 12))
+        self.status.bind('<Configure>', lambda e: self.status.configure(wraplength=max(self.px(120), e.width)))
         self.content = tk.Frame(right, bg=PANEL)
         self.content.pack(fill='both', expand=True)
 
@@ -1909,6 +1914,10 @@ class Launcher:
         self.note(f, _('Um .zip com todos os saves em user/backups (os {} mais novos ficam). Para restaurar, use '
                        '"Importar .zip…".', 'A .zip of every save in user/backups (the {} newest are kept). To '
                        'restore one, use "Import a .zip…".').format(SAVE_BACKUPS_KEPT))
+        self.check(f, 'exit_backup', _('Backup automático quando o jogo fecha', 'Automatic backup when the game closes'),
+                   _('Depois de cada sessão, também quando o jogo cai: um save estragado por uma queda volta pelo '
+                     'backup anterior.', 'After every session, also when the game crashes: a save a crash spoiled '
+                     'comes back from the backup before.'))
 
         self.section(f, _('Pasta de dados', 'Data folder'))
         self.folder(f, 'user_dir', _('Pasta de dados', 'Data folder'), _('Pasta dos saves', 'Saves folder'),
@@ -1992,7 +2001,129 @@ class Launcher:
         folder.mkdir(parents=True, exist_ok=True)
         return folder
 
-    def backup_saves(self, notify=False):
+    def news_items(self):
+        """This version's entry of CHANGELOG.md: one text per item (its continuation lines joined),
+        **bold** kept as markers."""
+        try:
+            text = (PORT_DIR / 'CHANGELOG.md').read_text(encoding='utf-8')
+        except OSError:
+            return []
+        items, inside = [], False
+        for line in text.splitlines():
+            if line.startswith('## '):
+                if inside:
+                    break
+                inside = line[3:].split(' ')[0] == VERSION
+                continue
+            if not inside or not line.strip():
+                continue
+            if line.startswith('- '):
+                items.append(line[2:].strip())
+            elif items:
+                items[-1] += ' ' + line.strip()
+        return [item.replace('`', '') for item in items]
+
+    def show_news(self):
+        """What's new, once per version (news_seen)."""
+        tk, ttk = self.tk, self.ttk
+        items = self.news_items()
+        self.var('news_seen').set(VERSION)
+        self.collect()
+        if not items:
+            return
+        win = tk.Toplevel(self.root, bg=PANEL)
+        win.title(_('Novidades', "What's new"))
+        win.transient(self.root)
+        win.geometry(f'{self.px(720)}x{self.px(560)}')
+        ttk.Label(win, text=_('Novidades da v{}', "What's new in v{}").format(VERSION), background=PANEL, foreground=GOLD,
+                  font=(title_font(), 20)).pack(anchor='w', padx=self.px(24), pady=(self.px(20), self.px(4)))
+        tk.Frame(win, bg=LINE, height=1).pack(fill='x', padx=self.px(24), pady=(0, self.px(8)))
+        bar = ttk.Frame(win)
+        bar.pack(side='bottom', fill='x', padx=self.px(24), pady=self.px(14))
+        ttk.Button(bar, text=_('Continuar', 'Continue'), style='Accent.TButton', command=win.destroy).pack(side='right')
+        holder = ttk.Frame(win)
+        holder.pack(fill='both', expand=True, padx=(self.px(24), self.px(8)))
+        body = tk.Text(holder, wrap='word', bg=PANEL, fg=TEXT, relief='flat', bd=0, highlightthickness=0, height=8,
+                       font=(ui_font(), 10), spacing1=self.px(6), spacing3=self.px(2), cursor='arrow')
+        scroll = ttk.Scrollbar(holder, orient='vertical', command=body.yview)
+        body.configure(yscrollcommand=scroll.set)
+        scroll.pack(side='right', fill='y')
+        body.pack(side='left', fill='both', expand=True)
+        body.tag_configure('item', lmargin1=0, lmargin2=self.px(18))
+        body.tag_configure('bold', font=(theme.BODY_SEMI if LANG not in ('zh', 'ko') else ui_font(), 10),
+                           foreground=theme.TEXT_STRONG)
+        body.tag_configure('mark', foreground=SIGIL)
+        for item in items:
+            body.insert('end', '•  ', ('item', 'mark'))
+            for k, part in enumerate(item.split('**')):
+                body.insert('end', part, ('item', 'bold') if k % 2 else ('item',))
+            body.insert('end', '\n', 'item')
+        body.configure(state='disabled')
+        win.after(80, lambda: body.yview_moveto(0))  # once the text is laid out at the window's width
+        body.bind('<MouseWheel>', lambda e: (body.yview_scroll(int(-e.delta / 120), 'units'), 'break')[1])
+        win.bind('<Escape>', lambda _e: win.destroy())
+        win.grab_set()
+
+    def save_report(self):
+        """A .zip to attach to an issue: the last sessions' logs and events, the newest crashes with
+        their dump, the launcher settings (the player name left out) and a summary of this PC."""
+        default = Path.home() / 'Desktop' / f'SotC-relatorio-{time.strftime("%Y-%m-%d_%H-%M")}.zip'
+        target = self.filedialog.asksaveasfilename(
+            title=_('Salvar relatório', 'Save report'), defaultextension='.zip', filetypes=[('ZIP', '*.zip')],
+            initialdir=str(default.parent if default.parent.is_dir() else Path.home()), initialfile=default.name)
+        if not target:
+            return
+        self.collect()
+        data = user_dir(self.app)
+        files = [data / n for n in ('last_run.log', 'last_run.1.log', 'events.log', 'events.1.log')]
+        crashes = data / 'crashes'
+        if crashes.is_dir():
+            logs = sorted(crashes.glob('*.log'), key=lambda p: p.stat().st_mtime)[-6:]
+            dumps = sorted(crashes.glob('*.dmp'), key=lambda p: p.stat().st_mtime)[-1:]
+            files += logs + dumps
+        settings = dict(self.app, player_name='')
+        info = game_info(self.app.get('game_dir'))
+        summary = '\n'.join([
+            f'SotC-PC launcher {VERSION}',
+            f'Windows {platform.version()} ({platform.machine()})',
+            f'CPU: {platform.processor()}, {os.cpu_count()} threads',
+            self.gpu_text.lstrip('✓✗• '),
+            'Game: ' + ('{} {}'.format(*info) if info else 'not set'),
+            'Summary: ' + self.summary(),
+        ])
+        try:
+            with zipfile.ZipFile(target, 'w', zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr('report.txt', summary + '\n')
+                archive.writestr('launcher_settings.json', json.dumps(settings, indent=2, ensure_ascii=False))
+                for file in files:
+                    if file.is_file():
+                        archive.write(file, file.relative_to(data).as_posix())
+        except OSError as error:
+            self.messagebox.showerror('Shadow of the Colossus', _('Não foi possível salvar o relatório: {}',
+                                                                 'Could not save the report: {}').format(error))
+            return
+        self.messagebox.showinfo('Shadow of the Colossus', _(
+            'Relatório salvo em\n{}\n\nAnexe este arquivo na issue do GitHub. Ele tem os registros das últimas '
+            'sessões e as pastas do jogo e do port (sem o nome do jogador).',
+            'Report saved to\n{}\n\nAttach this file to the GitHub issue. It holds the last sessions\' logs and '
+            'the game and port folders (without the player name).').format(target))
+        self.open_path(Path(target).parent)
+
+    def exit_backup(self):
+        """After the game closed (a crash too): the saves into user/backups (Saves > Backup when the
+        game closes), the newest SAVE_BACKUPS_KEPT kept as for the manual ones."""
+        if not self.var('exit_backup').get():
+            return
+        try:
+            target = self.backup_saves(suffix='-exit')
+        except OSError as error:
+            self.append(_('Backup dos saves ao fechar falhou: {}', 'Saves backup on exit failed: {}').format(error) + '\n')
+            return
+        if target:
+            self.append(_('Backup dos saves: {}', 'Saves backup: {}').format(target) + '\n')
+        self.refresh_saves()
+
+    def backup_saves(self, notify=False, suffix=''):
         """Every save into user/backups/saves-<title id>-<date>.zip; the newest SAVE_BACKUPS_KEPT stay."""
         names = [e[0] for e in self.save_entries()]
         if not names:
@@ -2000,7 +2131,7 @@ class Launcher:
                 self.messagebox.showinfo('Shadow of the Colossus', _('Ainda não há saves.', 'There are no saves yet.'))
             return None
         folder = self.backups_folder()
-        target = folder / f'saves-{self.saves_folder().name}-{time.strftime("%Y-%m-%d_%H-%M-%S")}.zip'
+        target = folder / f'saves-{self.saves_folder().name}-{time.strftime("%Y-%m-%d_%H-%M-%S")}{suffix}.zip'
         self.write_saves_zip(target, names)
         for old in sorted(folder.glob('saves-*.zip'), key=lambda p: p.stat().st_mtime)[:-SAVE_BACKUPS_KEPT]:
             try:
@@ -2527,6 +2658,7 @@ class Launcher:
                         self.job.close()
                     self.stop_button.configure(state='disabled')
                     self.refresh_status()
+                    self.exit_backup()
                 else:
                     if 'Entering original x86-64 code' in item:
                         self.status.configure(text=_('O jogo está rodando.', 'The game is running.'), fg=GOLD)

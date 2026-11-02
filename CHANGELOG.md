@@ -31,6 +31,11 @@
   de uma pasta (um save, a pasta savedata de outra instalação) ou do shadPS4; faz backup com um clique em
   `user/backups` (ficam os 10 mais novos), e sempre antes de substituir um save na importação. A antiga
   aba "Jogo e saves" virou "Jogo".
+- **Lançador: backup automático dos saves quando o jogo fecha**, também depois de uma queda (aba Saves,
+  ligado por padrão; os 10 mais novos ficam em `user/backups`).
+- **Lançador: botão "Relatório"** na barra de baixo: um .zip com os registros das últimas sessões, as últimas
+  quedas (com o dump), as configurações (sem o nome do jogador) e um resumo do PC, para anexar numa issue.
+- **Lançador: janela "Novidades"** na primeira abertura de cada versão nova, com o que mudou.
 - **Memória flexível:** ao dividir um mapeamento flexível, a metade direita apontava para o armazenamento
   da metade esquerda (não acontecia neste jogo nos testes, mas estava errado).
 - **Lançador: logotipos de abertura pulados por padrão** (instalações novas).

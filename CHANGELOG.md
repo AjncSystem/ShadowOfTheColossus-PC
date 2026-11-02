@@ -51,6 +51,11 @@
   (achado sozinho, com atualização, DLC, saves e som), **a verificação do PC** (processador, memória, placa
   de vídeo e se o jogo está num NVMe, SSD ou HD) que **escolhe o Modo de jogo** que o PC aguenta, controles
   e o resumo. "Configurar de novo" no menu lateral abre o assistente.
+- **Lançador: teste do controle** na aba Controles: o desenho do controle (PlayStation, Xbox ou Switch) com
+  os botões acendendo, os gatilhos enchendo e os analógicos mexendo, lido pelo mesmo SDL do jogo.
+- **Monitor do jogo** (Imagem e FPS > Tela, com dois monitores ou mais): a janela e a tela cheia abrem no
+  monitor escolhido (`SOTC_MONITOR_AT`), e o ritmo de quadros segue a taxa dele.
+- **Lançador: minimizar para a bandeja do Windows** (Avançado): um ícone perto do relógio, com Abrir e Sair.
 - **Memória flexível:** ao dividir um mapeamento flexível, a metade direita apontava para o armazenamento
   da metade esquerda (não acontecia neste jogo nos testes, mas estava errado).
 - **Lançador: logotipos de abertura pulados por padrão** (instalações novas).

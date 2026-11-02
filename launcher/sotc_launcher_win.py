@@ -26,6 +26,7 @@ import zipfile
 
 import sotc_frame
 import sotc_hardware
+import sotc_pad
 import sotc_search
 import sotc_theme as theme
 import sotc_update
@@ -142,7 +143,7 @@ def _(pt, en):
     return table.get(pt, en) if table else en
 
 
-sotc_search._ = _  # the search's texts in the launcher's language
+sotc_search._ = sotc_pad._ = _  # their texts in the launcher's language
 
 
 def ui_font():
@@ -177,7 +178,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'fg_hudless': True,
                 'dlss_mode': 'quality', 'dlss_sharpen': '0', 'dlss_ui_sharpen': '3', 'dlss_sky_sharpen': '2',
                 'dlss_compare': False, 'hdr': False,
-                'check_updates': True, 'skip_version': '', 'play_mode': 'custom', 'exit_backup': True, 'news_seen': '', 'expert_view': False, 'windows_title_bar': False}
+                'check_updates': True, 'skip_version': '', 'play_mode': 'custom', 'exit_backup': True, 'news_seen': '', 'expert_view': False, 'windows_title_bar': False, 'game_monitor': '', 'minimize_to_tray': False}
 # sotc: improvements that changed a default, by the version that changed it. Settings saved by an
 # older launcher get them once when this one first loads them (load_settings). Every release that
 # changes a default for the better adds its entry here.
@@ -682,6 +683,34 @@ def window_icon_file(s):
         return None
 
 
+def monitors():
+    """This PC's monitors: [(device name, label, (x, y) of its centre, primary)], the primary first."""
+    from ctypes import wintypes
+
+    class MONITORINFOEXW(ctypes.Structure):
+        _fields_ = [('size', wintypes.DWORD), ('monitor', wintypes.RECT), ('work', wintypes.RECT),
+                    ('flags', wintypes.DWORD), ('device', wintypes.WCHAR * 32)]
+    found = []
+    PROC = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(wintypes.RECT), ctypes.c_void_p)
+
+    def one(handle, _dc, _rect, _data):
+        info = MONITORINFOEXW()
+        info.size = ctypes.sizeof(info)
+        if ctypes.windll.user32.GetMonitorInfoW(ctypes.c_void_p(handle), ctypes.byref(info)):
+            r = info.monitor
+            found.append((info.device, r.right - r.left, r.bottom - r.top, ((r.left + r.right) // 2, (r.top + r.bottom) // 2),
+                          bool(info.flags & 1)))
+        return 1
+    try:
+        ctypes.windll.user32.EnumDisplayMonitors(None, None, PROC(one), None)
+    except (AttributeError, OSError):
+        return []
+    found.sort(key=lambda m: (not m[4], m[0]))
+    return [(device, '{} — {} × {}{}'.format(device.replace('\\\\.\\', '').replace('DISPLAY', _('Monitor ', 'Monitor ')),
+                                          w, h, _(' (principal)', ' (primary)') if primary else ''), centre, primary)
+            for device, w, h, centre, primary in found]
+
+
 def game_environment(s):
     env = dict(os.environ)
     info = game_info(s['game_dir'])
@@ -712,6 +741,11 @@ def game_environment(s):
     env['SOTC_FPS_LIMIT'] = '60' if fps_mode == '60' else '0'
     env['BB_VBLANK_HZ'] = '120'
     env['BB_FULLSCREEN'] = '1' if s['fullscreen'] else '0'
+    # The monitor the game window opens on (window.cpp): the centre of the chosen one, found again now
+    # (the monitors may have moved since it was chosen).
+    chosen = next((m for m in monitors() if m[0] == s.get('game_monitor')), None)
+    if chosen and not chosen[3]:
+        env['SOTC_MONITOR_AT'] = f'{chosen[2][0]},{chosen[2][1]}'
     env['BB_PRESENT_MODE'] = s['present_mode']
     if s['language']:
         env['BB_LANGUAGE'] = s['language']
@@ -885,7 +919,7 @@ TEXT, MUTED, GOLD, ACCENT, ACCENT_HI = theme.TEXT, theme.MUTED, theme.GOLD_LIGHT
 SIGIL = theme.SIGIL_LIGHT
 
 
-class Launcher(sotc_search.SearchMixin):
+class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
     def __init__(self, root, tk, ttk, filedialog, messagebox):
         self.tk, self.ttk, self.filedialog, self.messagebox = tk, ttk, filedialog, messagebox
         self.root = root
@@ -1104,8 +1138,9 @@ class Launcher(sotc_search.SearchMixin):
     # ---- layout ------------------------------------------------------------------------------
     def build(self):
         tk, ttk = self.tk, self.ttk
-        self.custom_frame = None
+        self.custom_frame, self.tray = None, None
         self.titlebar = None if self.app.get('windows_title_bar') else self.build_titlebar()
+        self.root.bind('<Unmap>', self.minimized, add='+')
         side = tk.Frame(self.root, bg=BG, width=self.px(220))
         side.pack(side='left', fill='y')
         side.pack_propagate(False)
@@ -1200,6 +1235,10 @@ class Launcher(sotc_search.SearchMixin):
         self.current_page = name
         for n in self.nav:
             self.nav_paint(n)
+        if name == 'controls':  # the controller test reads only while its page is shown
+            self.pad_start()
+        else:
+            self.pad_stop()
         if hasattr(self, 'nav_end'):  # an expert page found by the search shows its entry meanwhile
             self.apply_view()
         if name == 'play':
@@ -1238,6 +1277,36 @@ class Launcher(sotc_search.SearchMixin):
         self.root.bind('<Configure>', lambda e: self.title_state() if e.widget is self.root else None, add='+')
         self.root.after(100, self.window_chrome)
         return bar
+
+    def minimized(self, event):
+        """Minimized, with "Minimize to the system tray" on: off the task bar, an icon in the tray."""
+        if event.widget is self.root and self.var('minimize_to_tray').get():
+            self.root.after(1, self.to_tray)
+
+    def to_tray(self):
+        if self.root.state() != 'iconic':
+            return
+        try:
+            if self.tray is None:
+                import sotc_tray
+                self.tray = sotc_tray.Tray(PORT_DIR / 'launcher' / 'sotc.ico', 'Shadow of the Colossus', self.bring_back,
+                                           self.quit_from_tray, (_('Abrir', 'Open'), _('Sair', 'Quit')), root=self.root)
+            if self.tray.show():
+                self.root.withdraw()
+        except OSError:
+            pass  # no tray: it stays on the task bar
+
+    def bring_back(self):
+        if self.tray:
+            self.tray.hide()
+        self.root.deiconify()
+        self.root.state('normal')
+        self.root.lift()
+        self.root.focus_force()
+
+    def quit_from_tray(self):
+        self.bring_back()
+        self.close()
 
     def toggle_maximized(self):
         self.root.state('normal' if self.root.state() == 'zoomed' else 'zoomed')
@@ -1649,6 +1718,11 @@ class Launcher(sotc_search.SearchMixin):
         self.note(f, _('O motion blur, o brilho e os filtros ficam no menu do próprio jogo (Opções > Apresentação).',
                        "Motion blur, brightness and filters are in the game's own menu (Options > Presentation)."), top=4)
         self.section(f, _('Tela', 'Display'))
+        screens = [('', (_('Principal', 'Primary'),) * 2)] + [(m[0], (m[1],) * 2) for m in monitors() if not m[3]]
+        if len(screens) > 1 or self.var('game_monitor').get():
+            self.row(f, _('Monitor do jogo', 'Game monitor'), self.choice(f, 'game_monitor', screens),
+                     _('Em qual monitor a janela do jogo abre (e a tela cheia). Vale na próxima vez que o jogo abrir.',
+                       'Which monitor the game window opens on (fullscreen too). Applies the next time the game starts.'))
         self.check(f, 'fullscreen', _('Tela cheia', 'Fullscreen'))
         self.row(f, _('Apresentação', 'Presentation'), self.choice(f, 'present_mode', PRESENT_MODES))
         self.check(f, 'hdr', _('HDR (experimental)', 'HDR (experimental)'),
@@ -1662,7 +1736,10 @@ class Launcher(sotc_search.SearchMixin):
         f = self.scrolled_page('controls', _('Controles', 'Controls'),
                                _('Um controle (DualShock 4, DualSense, Xbox…) é usado automaticamente.',
                                  'A gamepad (DualShock 4, DualSense, Xbox…) is used automatically.'))
-        self.section(f, _('Controle', 'Gamepad'), top=4)
+        self.section(f, _('Teste do controle', 'Controller test'), top=4)
+        self.controller_card(f, PORT_DIR).grid(row=self.next_row(f), column=0, columnspan=2, sticky='we',
+                                              pady=(self.px(4), self.px(6)))
+        self.section(f, _('Controle', 'Gamepad'))
         self.row(f, _('Ícones dos botões', 'Button icons'), self.choice(f, 'button_icons', BUTTON_ICONS),
                  _('Os ícones que o jogo mostra nas dicas: os do PlayStation ou os do Xbox (A B X Y, LB/RB, '
                    'LT/RT, Menu, View), desenhados para o port. Vale na próxima vez que o jogo abrir.',
@@ -1795,6 +1872,11 @@ class Launcher(sotc_search.SearchMixin):
         self.row(f, _('Idioma do lançador', 'Launcher language'), self.choice(f, 'ui_language', UI_LANGUAGES),
                  _('Vale na próxima vez que o lançador abrir.', 'Applies when the launcher opens again.'))
         self.check(f, 'close_on_play', _('Fechar o lançador quando o jogo abrir', 'Close the launcher when the game starts'))
+        self.check(f, 'minimize_to_tray', _('Minimizar para a bandeja do Windows', 'Minimize to the system tray'),
+                   _('Minimizado, o lançador sai da barra de tarefas e fica como um ícone perto do relógio: um clique '
+                     'o traz de volta, o botão direito tem Abrir e Sair.',
+                     'Minimized, the launcher leaves the task bar for an icon by the clock: a click brings it back, the '
+                     'right button has Open and Quit.'))
         self.check(f, 'check_updates', _('Procurar atualizações ao abrir', 'Check for updates at startup'),
                    _('Pergunta antes de baixar. Saves, cache de shaders e sotc.ini são mantidos.',
                      'Asks before downloading. Saves, shader cache and sotc.ini are kept.'))
@@ -3061,6 +3143,7 @@ class Launcher(sotc_search.SearchMixin):
             self.append(_('Não foi possível iniciar: {}', 'Could not start: {}').format(error) + '\n')
             self.process = None
             return
+        self.pad_stop()  # the controllers are the game's now
         self.job = GameJob(self.process)
         threading.Thread(target=self.read_output, args=(self.process,), daemon=True).start()
         self.play_button.configure(state='disabled')

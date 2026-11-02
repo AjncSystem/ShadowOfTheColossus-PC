@@ -724,12 +724,12 @@ static uintptr_t find_free(uintptr_t hint, uint64_t size, uint64_t alignment) {
  * the other address went unseen: textures kept the old contents (mosaic) and readback-protected
  * pages were read stale. Each direct physical page keeps the addresses it is mapped at (two);
  * the GPU's protections are copied to the other address and its faults handed to the GPU at the
- * watched one. SOTC_ALIAS_SYNC=0 turns it off. */
+ * watched one. SOTC_ALIAS_SYNC=1 turns it on (02/11: mosaic and crashes unchanged with it). */
 static uintptr_t (*phys_views)[2];
 static uint64_t phys_view_pages, alias_pages, alias_overflow, alias_faults;
 static int alias_sync_on(void) {
     static int on=-1;
-    if (on<0) { const char *v=getenv("SOTC_ALIAS_SYNC"); on=!(v && v[0]=='0'); }
+    if (on<0) { const char *v=getenv("SOTC_ALIAS_SYNC"); on=v && v[0]=='1'; }
     return on;
 }
 static void views_add(uint64_t phys, uintptr_t address, uint64_t size) {

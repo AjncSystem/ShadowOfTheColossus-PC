@@ -1355,7 +1355,7 @@ const unsigned char *runtime_memory_backing_pointer(uintptr_t address) {
 static int mapped_length_fast(uintptr_t address, uint64_t size, uint64_t *length) {
     static int on=-1;
     if (on<0) { const char *v=getenv("SOTC_CLAMP_FAST"); on=!(v && v[0]=='0') && region_log_on(); }
-    if (runtime_disabled_optimizations & 1) return 0;
+    if ((runtime_disabled_optimizations & 1) || size>UINTPTR_MAX-address) return 0;
     uint64_t n=0;
     int end_seen=0;
     for (unsigned hops=0; n<size && hops<4 && !end_seen; ++hops) {
@@ -1375,7 +1375,11 @@ static int mapped_length_fast(uintptr_t address, uint64_t size, uint64_t *length
         Vma e; uintptr_t lo=0, hi=0;
         if (vma_lookup_gap(at,&e,&lo,&hi)!=2) return 0;
         const uint64_t now=__atomic_load_n(&table_generation,__ATOMIC_SEQ_CST);
-        if (!((now==generation && !(now & 1)) || region_unchanged(lo,hi,generation & ~(uint64_t)1,now))) return 0;
+        /* only the part of the gap this range covers: a gap that exists only during a write
+         * lies in that write's dirty range, which includes at */
+        const uintptr_t upto=hi<address+size ? hi : address+size;
+        (void)lo;
+        if (!((now==generation && !(now & 1)) || region_unchanged(at,upto,generation & ~(uint64_t)1,now))) return 0;
         end_seen=1;
     }
     if (n<size && !end_seen) return 0;

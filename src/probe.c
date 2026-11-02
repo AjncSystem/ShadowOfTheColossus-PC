@@ -952,6 +952,78 @@ static int heap_hook_trap(EXCEPTION_POINTERS *info) {
     }
     return 1;
 }
+/* sotc: SOTC_POOL_LOCK_CHECK=1 (diagnostic, T38): the game's 64 KiB page pool (textures and the
+ * world's heaps) hands out pages still under live textures after loads, and its heaps break in the
+ * same moments. Its allocator (eboot+0x19e00) runs under a spinlock (eboot+0x2dfc8a0, cmpxchg -1,
+ * freed by xchg), but eboot+0x19660, which it calls, is also called from the free path
+ * (eboot+0x18aa0) with no lock taken nearby. A breakpoint on 0x19660 counts the calls made while
+ * that spinlock is free, by caller and thread: calls from two threads outside the lock would race
+ * on the pool's bitmap and free-page tally (the drift POOL_FIX works around). */
+#define POOL_FN_OFFSET 0x19660
+#define POOL_LOCK_OFFSET 0x2dfc8a0
+static unsigned char pool_hook_original;
+static volatile LONG pool_hook_on, pool_calls, pool_unlocked;
+static _Thread_local int pool_hook_rearm;
+static struct { uintptr_t ret; volatile LONG count; } pool_callers[16];
+static struct { DWORD tid; volatile LONG count; } pool_threads[16];
+static void pool_hook_write(unsigned char value) {
+    DWORD old;
+    unsigned char *at=image+POOL_FN_OFFSET;
+    if (VirtualProtect(at,1,PAGE_EXECUTE_READWRITE,&old)) { *at=value; VirtualProtect(at,1,old,&old); FlushInstructionCache(GetCurrentProcess(),at,1); }
+}
+static void install_pool_hook(void) {
+    static const unsigned char expected[8]={0x55,0x48,0x89,0xe5,0x41,0x56,0x53,0x48};
+    const char *v=getenv("SOTC_POOL_LOCK_CHECK");
+    if (!v || v[0]!='1' || memcmp(image+POOL_FN_OFFSET,expected,sizeof(expected))) return;
+    pool_hook_original=image[POOL_FN_OFFSET];
+    image[POOL_FN_OFFSET]=0xCC; /* the image is still writable here */
+    pool_hook_on=1;
+    fprintf(stderr,"Runtime: page pool lock check on (eboot+%#x)\n",POOL_FN_OFFSET);
+}
+static void pool_hook_report(void) {
+    fprintf(stderr,"SOTC POOL LOCK: %ld calls, %ld with the pool lock free; by caller:",pool_calls,pool_unlocked);
+    for (int i=0;i<16 && pool_callers[i].ret;++i)
+        fprintf(stderr," eboot+%#llx %ld",(unsigned long long)(pool_callers[i].ret-(uintptr_t)image),pool_callers[i].count);
+    fprintf(stderr,"; by thread:");
+    for (int i=0;i<16 && pool_threads[i].tid;++i) fprintf(stderr," %lu %ld",pool_threads[i].tid,pool_threads[i].count);
+    fprintf(stderr,"\n");
+}
+static int pool_hook_trap(EXCEPTION_POINTERS *info) {
+    CONTEXT *c=info->ContextRecord;
+    if (!pool_hook_on) return 0;
+    if (info->ExceptionRecord->ExceptionCode==EXCEPTION_SINGLE_STEP) {
+        if (!pool_hook_rearm) return 0;
+        pool_hook_rearm=0;
+        pool_hook_write(0xCC);
+        c->EFlags&=~(DWORD)0x100;
+        return 1;
+    }
+    if (!image || c->Rip!=(DWORD64)(uintptr_t)(image+POOL_FN_OFFSET)) return 0;
+    if (image[POOL_FN_OFFSET]!=0xCC) return 1; /* another thread restored it: just run it */
+    const LONG calls=InterlockedIncrement(&pool_calls);
+    if (!*(volatile uint64_t *)(image+POOL_LOCK_OFFSET)) {
+        InterlockedIncrement(&pool_unlocked);
+        const uintptr_t ret=*(const uintptr_t *)(uintptr_t)c->Rsp;
+        for (int i=0;i<16;++i) {
+            if (pool_callers[i].ret==ret) { InterlockedIncrement(&pool_callers[i].count); break; }
+            if (!pool_callers[i].ret && !InterlockedCompareExchangePointer((void *volatile *)&pool_callers[i].ret,(void *)ret,NULL)) {
+                InterlockedIncrement(&pool_callers[i].count); break;
+            }
+        }
+        const DWORD tid=GetCurrentThreadId();
+        for (int i=0;i<16;++i) {
+            if (pool_threads[i].tid==tid) { InterlockedIncrement(&pool_threads[i].count); break; }
+            if (!pool_threads[i].tid && !InterlockedCompareExchange((volatile LONG *)&pool_threads[i].tid,(LONG)tid,0)) {
+                InterlockedIncrement(&pool_threads[i].count); break;
+            }
+        }
+    }
+    if (calls<=4096 ? !(calls&(calls-1)) : !(calls%20000)) pool_hook_report();
+    pool_hook_write(pool_hook_original);
+    pool_hook_rearm=1;
+    c->EFlags|=0x100; /* put the breakpoint back after this instruction */
+    return 1;
+}
 static LONG vectored_fault_impl(EXCEPTION_POINTERS *info);
 /* sotc (from the shadPS4 SotC fork, signals.cpp): Shadow of the Colossus runs its jobs on fibers
  * with 16-64 KiB stacks packed back to back without guard pages. The exception handler runs on
@@ -1014,6 +1086,7 @@ static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record=info->ExceptionRecord;
     DWORD code=record->ExceptionCode;
     if ((code==EXCEPTION_BREAKPOINT || code==EXCEPTION_SINGLE_STEP) && heap_hook_trap(info)) { fault_path=1; return EXCEPTION_CONTINUE_EXECUTION; }
+    if ((code==EXCEPTION_BREAKPOINT || code==EXCEPTION_SINGLE_STEP) && pool_hook_trap(info)) { fault_path=1; return EXCEPTION_CONTINUE_EXECUTION; }
     if (code==EXCEPTION_SINGLE_STEP && helper_single_step(info)) { fault_path=2; return EXCEPTION_CONTINUE_EXECUTION; }
     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2 && gpu_enabled && helper_read_fault(info)) {
         fault_path=3;
@@ -1626,7 +1699,7 @@ int main(int argc, char **argv) {
 #endif
     if (sotc_cpu) apply_sotc_cpu_patches(sotc_cpu, segments, ns, size);
     if (sotc_cmdline) apply_sotc_cmdline(sotc_cmdline, size);
-    if (sotc_cpu) install_heap_hook();
+    if (sotc_cpu) { install_heap_hook(); install_pool_hook(); }
     protect(traps, round_page((import_count + 1) * 32), 5);
     protect(image, round_page(size), 0);
     int executable_entry = 0;

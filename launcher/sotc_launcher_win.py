@@ -934,7 +934,9 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         root.title('Shadow of the Colossus — ' + _('port nativo', 'native port'))
         root.configure(bg=BG)
         self.dpi = root.winfo_fpixels('1i') / 96.0
-        root.geometry(f'{self.px(1080)}x{self.px(700)}')
+        # Tall enough for every quick setting when the screen has the room (the Play page scrolls otherwise).
+        height = min(self.px(820), root.winfo_screenheight() - self.px(80))
+        root.geometry(f'{self.px(1080)}x{max(self.px(620), height)}')
         root.minsize(self.px(940), self.px(620))
         self.set_icon()
         theme.load_fonts(root)
@@ -1373,10 +1375,22 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         self.pages['play'] = page
         self.building_page = 'play'
         self.page_titles['play'] = _('Jogar', 'Play')
-        self.banner = tk.Canvas(page, height=self.px(290), bg=BG, highlightthickness=0, bd=0)
+        # The banner and the settings scroll together when the window is shorter than them.
+        canvas = tk.Canvas(page, bg=PANEL, highlightthickness=0, bd=0)
+        bar = ttk.Scrollbar(page, orient='vertical', command=canvas.yview)
+        inner = tk.Frame(canvas, bg=PANEL)
+        window = canvas.create_window(0, 0, window=inner, anchor='nw')
+        inner.bind('<Configure>', lambda _e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>', lambda e: canvas.itemconfigure(window, width=e.width))
+        canvas.configure(yscrollcommand=bar.set)
+        bar.pack(side='right', fill='y')
+        canvas.pack(side='left', fill='both', expand=True)
+        page.scroll = lambda units: canvas.yview_scroll(units, 'units') if inner.winfo_height() > canvas.winfo_height() else None
+        page.canvas, page.inner = canvas, inner  # the search scrolls to a setting (jump)
+        self.banner = tk.Canvas(inner, height=self.px(290), bg=BG, highlightthickness=0, bd=0)
         self.banner.pack(fill='x')
         self.banner.bind('<Configure>', lambda _e: self.draw_banner())
-        body = ttk.Frame(page, padding=(28, 12, 28, 8))
+        body = ttk.Frame(inner, padding=(28, 12, 28, 8))
         body.pack(fill='both', expand=True)
         body.columnconfigure(0, weight=3)
         body.columnconfigure(1, weight=2)

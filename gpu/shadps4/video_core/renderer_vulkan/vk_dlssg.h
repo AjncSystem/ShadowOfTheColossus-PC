@@ -70,6 +70,9 @@ void NoteHudless(u32 frame_id, vk::Image image, vk::ImageView view, vk::Format f
 
 /// DLSS Super Resolution (SOTC_UPSCALER=dlss) is supported on this device.
 bool SuperResolution();
+/// sotc: super resolution is on and takes the game's frames (not when their input is as large as
+/// the output: PS4 Pro Cinematic mode at 1080p).
+bool SuperResolutionUpscaling();
 
 /// DLSS Super Resolution works on this device, also while F9 has it switched off.
 bool SuperResolutionAvailable();

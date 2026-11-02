@@ -1067,6 +1067,13 @@ bool SuperResolution() {
     return sr_supported && !sr_user_off.load(std::memory_order_relaxed);
 }
 
+// sotc: the last frame's input was not smaller than the output (Upscale), so DLSS took no frame.
+std::atomic<bool> sr_declined{false};
+
+bool SuperResolutionUpscaling() {
+    return SuperResolution() && !sr_declined.load(std::memory_order_relaxed);
+}
+
 bool SuperResolutionAvailable() {
     return sr_supported;
 }
@@ -1401,6 +1408,7 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
     // for a 1080p window) is not upscaled: NGX refused every evaluate (0xbad00005), turned super
     // resolution off for the session after three, and the frame repeat showed the last DLSS
     // picture for good (frozen screen, 2 Nov). The plain path scales it down.
+    sr_declined.store(f.width >= width && f.height >= height, std::memory_order_relaxed);
     if (f.width >= width && f.height >= height) {
         static u32 logged = 0;
         if (logged++ < 3) {

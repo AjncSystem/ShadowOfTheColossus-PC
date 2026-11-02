@@ -1938,6 +1938,50 @@ void TextureCache::GarbageCollectSamplers() {
 // over it was used a moment ago means the game gave away memory a texture on screen still
 // reads: that texture shows whatever lands there next. Logged with the image (SOTC_POOL_WATCH=1;
 // =2 also counts allocations).
+bool TextureCache::ReadbackWatchEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_RB_TEX_WATCH");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
+void TextureCache::NoteReadbackOverTexture(VAddr addr, u64 size, bool hot) {
+    static u64 hits = 0, bytes = 0;
+    std::scoped_lock lock{mutex};
+    const u64 tick = scheduler.CurrentTick();
+    ForEachImageInRegion(addr, size, [&](ImageId, Image& image) {
+        if (!image.info.props.is_block || True(image.flags & ImageFlagBits::GpuModified)) {
+            return;
+        }
+        const VAddr lo = std::max<VAddr>(addr, image.info.guest_address);
+        const VAddr hi = std::min<VAddr>(addr + size, image.info.guest_address + image.info.guest_size);
+        if (lo >= hi) {
+            return;
+        }
+        ++hits;
+        bytes += hi - lo;
+        if (hits <= 300 || hits % 1000 == 0) {
+            std::fprintf(stderr,
+                         "SOTC RB OVER TEXTURE #%llu: readback %#llx+%#llx%s writes %#llx bytes of "
+                         "image %#llx+%#llx %ux%u %s mips %u (flags %#x, used %llu ticks ago); "
+                         "%llu KiB in all\n",
+                         static_cast<unsigned long long>(hits),
+                         static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size),
+                         hot ? " (hot)" : "", static_cast<unsigned long long>(hi - lo),
+                         static_cast<unsigned long long>(image.info.guest_address),
+                         static_cast<unsigned long long>(image.info.guest_size),
+                         image.info.size.width, image.info.size.height,
+                         vk::to_string(image.info.pixel_format).c_str(), image.info.resources.levels,
+                         u32(image.flags),
+                         static_cast<unsigned long long>(image.tick_accessed_last
+                                                             ? tick - image.tick_accessed_last
+                                                             : 0),
+                         static_cast<unsigned long long>(bytes >> 10));
+        }
+    });
+}
+
 bool TextureCache::PoolWatchEnabled() {
     static const bool on = [] {
         const char* v = std::getenv("SOTC_POOL_WATCH");

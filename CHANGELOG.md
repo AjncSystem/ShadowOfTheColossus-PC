@@ -1,6 +1,20 @@
 # Changelog
 
-## Não lançado
+## 0.71 — 2026-11-02
+- **Texturas em mosaico colorido e quedas depois das cargas (T38, corrigido):** o problema existia em todas
+  as versões e era muito pior no **Time Attack**, onde o jogo sempre fechava por volta do 5º colosso. Causa:
+  o reservatório de páginas de 64 KiB do jogo liberava algumas páginas duas vezes. Ao encolher uma textura
+  (descartar mips), o jogo devolve as páginas sem tirá-las do endereço dela; outra textura (ou o heap) as
+  pega; quando a primeira textura é descartada inteira, o jogo pergunta ao sistema (`sceKernelVirtualQuery`)
+  que página está em cada endereço e libera de novo as que já são da outra. Cada página dessas ficava com
+  dois donos: pedaços de outras texturas na tela, heap estourado (quedas `0x490a0`, `0x490e0`, `0x1d8bf`,
+  `0x5fc064`), descritores de textura lixo (`data_fmt` 36/54) e a contagem de páginas livres subindo a cada
+  carga. Agora o port lembra o último endereço em que cada página física foi mapeada, e a liberação pula as
+  páginas que já foram para outro bloco. Teste: todos os colossos do Time Attack na Máxima, sem mosaico e
+  sem queda. `SOTC_POOL_OWNER=0` desliga. Ferramentas novas de diagnóstico (desligadas):
+  `SOTC_POOL_FREE_TRACE=1`, `SOTC_WRITE_TRACE=1`, `SOTC_ALIAS_LOG=1`, `SOTC_VIEW_CHECK=1`.
+- **Memória flexível:** ao dividir um mapeamento flexível, a metade direita apontava para o armazenamento
+  da metade esquerda (não acontecia neste jogo nos testes, mas estava errado).
 - **Lançador: logotipos de abertura pulados por padrão** (instalações novas).
 - **Lançador: motion blur agora vem desligado por padrão** (Efeitos > "Motion blur", dá para religar). Era a
   causa da sombra do personagem deixando rastro ao mover em áreas escuras; a correção só existia na

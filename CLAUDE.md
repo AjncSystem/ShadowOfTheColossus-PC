@@ -97,6 +97,18 @@ documented in `packaging/windows/README.md`; `src/compat_win.c` holds the Window
 here), set by the launcher or `sotc.ini`. Diagnostic ones are listed in `docs/sotc/README-SotC.md`;
 newer ones appear in `CHANGELOG.md` entries. Session log goes to `user/last_run.log`.
 
+## Known pitfalls
+
+- **The game's 64 KiB page pool (eboot 0x19e00 allocator, 0x1abf0 release) double-frees by design
+  on PC unless `SOTC_POOL_OWNER` is on (default).** Shrinking a block frees pages without unmapping
+  them; another block maps them elsewhere; the first block's whole release reads each page back with
+  `sceKernelVirtualQuery` and frees it again (two owners: mosaic textures, heap crashes, free tally
+  drifting up until the 5th Time Attack). `runtime_memory.c` keeps each physical page's last mapped
+  address and answers "not committed" to the release (return address eboot+0x1ac82) for pages that
+  moved. Do not remove it; `POOL_FIX` in `sotc_modes.py` only hides the tally drift. Pool bitmap bit
+  n is guest address 0x1000300000 + n * 64 KiB (physical 0x100000 + n * 64 KiB). Diagnostics:
+  `SOTC_POOL_FREE_TRACE=1` (double frees with both stacks), `SOTC_POOL_WATCH=1`.
+
 ## Conventions
 
 - Commit subjects are prefixed by area: `shader:`, `shader_recompiler:`, `vulkan:`, `sotc:`,

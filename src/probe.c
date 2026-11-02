@@ -1205,10 +1205,19 @@ static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
         /* sotc: T38: the second address of a page the GPU watches at its first (runtime_memory.c,
          * SOTC_ALIAS_SYNC): the GPU handles it there, then this page gets the guest's protection. */
         if (gpu_enabled) {
-            const uintptr_t at=(uintptr_t)record->ExceptionInformation[1], watched=runtime_memory_alias_of(at);
+            const uintptr_t at=(uintptr_t)record->ExceptionInformation[1],
+                watched=record->ExceptionInformation[0]==1 ? runtime_memory_alias_of(at) : 0;
             if (watched) {
-                bbgpu_handle_fault(info,(void *)watched);
+                const int handled=bbgpu_handle_fault(info,(void *)watched);
                 runtime_memory_alias_release(at);
+                /* diagnostic: the first ones, and the same page faulting again and again */
+                static LONG logged; static __thread uintptr_t last_page; static __thread unsigned repeats;
+                const uintptr_t page=at & ~(uintptr_t)0x3fff;
+                repeats=page==last_page ? repeats+1 : 0; last_page=page;
+                if (InterlockedIncrement(&logged)<=30 || repeats==1000)
+                    fprintf(stderr,"SOTC ALIAS fault %s at %p (watched %p) handled %d, rip %#llx, guest %d, repeats %u\n",
+                            record->ExceptionInformation[0] ? "write" : "read",(void *)at,(void *)watched,handled,
+                            (unsigned long long)(info->ContextRecord->Rip-(image ? (uintptr_t)image : 0)),runtime_thread_is_guest(),repeats);
                 fault_path=5;
                 return EXCEPTION_CONTINUE_EXECUTION;
             }

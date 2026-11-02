@@ -779,7 +779,10 @@ static void views_protect(uintptr_t address, uint64_t size, int read, int write)
         int prot=0;
         if (j<vma_count && vmas[j].start<=other) {
             const int guest=host_prot(vmas[j].prot);
-            const int want=(read ? PROT_READ : 0)|(write ? PROT_WRITE|PROT_READ : 0)|(guest & PROT_EXEC);
+            /* writes only: a read of the other address is never stopped (GPU threads read guest
+             * memory by address, and a read fault there waited for the GPU itself) */
+            const int want=PROT_READ|(write ? PROT_WRITE : 0)|(guest & PROT_EXEC);
+            (void)read;
             prot=guest & want;
         } else j=vma_count;
         if (run && (j==vma_count || other!=run_end || prot!=run_prot)) { host_protect(run,run_end-run,run_prot); run=0; }
@@ -831,8 +834,8 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
                 MEMORY_BASIC_INFORMATION m;
                 if (!other || !VirtualQuery((void *)other,&m,sizeof(m))) continue;
                 const int guest=host_prot(prot);
-                if (m.Protect==PAGE_NOACCESS) host_protect(at,PAGE,guest & PROT_EXEC);
-                else if (m.Protect==PAGE_READONLY || m.Protect==PAGE_EXECUTE_READ) host_protect(at,PAGE,guest & (PROT_READ|PROT_EXEC));
+                if (m.Protect==PAGE_NOACCESS || m.Protect==PAGE_READONLY || m.Protect==PAGE_EXECUTE_READ)
+                    host_protect(at,PAGE,guest & (PROT_READ|PROT_EXEC));
             }
 #endif
     }

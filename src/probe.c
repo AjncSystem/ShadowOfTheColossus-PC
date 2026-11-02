@@ -1163,13 +1163,23 @@ static int release_hook_trap(EXCEPTION_POINTERS *info) {
         const uint64_t *bits=*(const uint64_t *const *)(uintptr_t)(c->Rdi+0x50);
         const uint64_t words=*(const uint64_t *)(uintptr_t)(c->Rdi+0x58);
         uint64_t view=0; const unsigned char *backing=runtime_memory_backing_view(&view);
-        unsigned already=0, total=0; uint64_t first_phys=0;
+        unsigned already=0, total=0; uint64_t first_phys=0; uintptr_t first_at=0; LONG64 first_prev=-1; uintptr_t first_prev_at=0;
+        /* per pool page: the release that last freed it (ring slot + 1, and the address used) */
+        static struct { LONG64 slot; uintptr_t at; } *last_free; static uint64_t last_free_pages;
+        if (!last_free && words) { last_free_pages=words*64; last_free=calloc(last_free_pages,sizeof(*last_free)); }
         for (uintptr_t at=(uintptr_t)c->Rdx; bits && backing && at<(uintptr_t)c->Rdx+(uintptr_t)c->Rcx; at+=0x10000, ++total) {
             const unsigned char *p=runtime_memory_backing_pointer(at);
             if (!p) continue;
             const uint64_t phys=(uint64_t)(p-backing), bit=(phys-pbase)>>16;
             if (phys<pbase || bit/64>=words) continue;
-            if (bits[bit/64]>>(bit%64)&1) { if (!already) first_phys=phys; ++already; }
+            if (bits[bit/64]>>(bit%64)&1) {
+                if (!already) {
+                    first_phys=phys; first_at=at;
+                    if (last_free && bit<last_free_pages) { first_prev=last_free[bit].slot-1; first_prev_at=last_free[bit].at; }
+                }
+                ++already;
+            }
+            if (last_free && bit<last_free_pages) { last_free[bit].slot=slot+1; last_free[bit].at=at; }
         }
         InterlockedAdd64(&pages_released,total);
         if (already) {
@@ -1184,6 +1194,19 @@ static int release_hook_trap(EXCEPTION_POINTERS *info) {
                     else fprintf(stderr," %#llx",(unsigned long long)r);
                 }
                 fprintf(stderr,"\n");
+                if (first_prev>=0 && slot-first_prev<POOL_RING) {
+                    const __typeof__(release_ring[0]) *p=&release_ring[first_prev%POOL_RING];
+                    fprintf(stderr,"SOTC POOL DOUBLE FREE: page at %#llx was freed before through %#llx (range %#llx+%#llx, thread %lu, %lld releases ago); stack:",
+                            (unsigned long long)first_at,(unsigned long long)first_prev_at,(unsigned long long)p->addr,(unsigned long long)p->size,
+                            p->tid,(long long)(slot-first_prev));
+                    for (int i=0;i<10 && p->stack[i];++i) {
+                        const uintptr_t r=p->stack[i];
+                        if (r-(uintptr_t)image<0x10000000) fprintf(stderr," eboot+%#llx",(unsigned long long)(r-(uintptr_t)image));
+                        else fprintf(stderr," %#llx",(unsigned long long)r);
+                    }
+                    fprintf(stderr,"\n");
+                } else fprintf(stderr,"SOTC POOL DOUBLE FREE: page at %#llx: earlier release not seen (slot %lld)\n",
+                               (unsigned long long)first_at,(long long)first_prev);
             }
         }
     }

@@ -26,7 +26,21 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
-| **0.71** | **Fix for the colour mosaic textures and the crashes after loads** (worst in Time Attack, where the game always closed around the 5th fight): the game's 64 KiB page pool freed some pages twice, so two textures (or a texture and the game's heap) shared them. Every Time Attack fight at Maximum without mosaic or crash in testing. **New launcher** in the style of the bloodborne_pc one with a Shadow of the Colossus look: play modes (Normal, Pro, Extreme, Custom), a Saves page (export/import, backups, a backup every time the game closes), search (Ctrl+F), a Help page, a five-step first setup with a PC check that picks the play mode, a controller test, game monitor choice, a Report button and a What's new window. Also: motion blur off by default (shadow trail in dark areas), DLSS preset E and a current-frame bias, frame generation without the HUD by default, fewer stutters at area changes (shader cache, staging buffers), HDR10 (experimental). |
+| **0.71** |
+🔧 Critical Fixes & Performance
+
+• No More Texture Mosaics & Crashes: Fixed a critical memory bug where the game's 64 KiB page pool freed pages twice, causing textures and the heap to conflict. Tested through every Time Attack colossus on Maximum settings with zero crashes and perfect textures.
+• Stutter Reduction: Smoother transitions between areas thanks to optimized staging buffers and a rebuilt shader cache.
+• Visual Cleaning: Native motion blur is now disabled by default to fix the "shadow trail" artifact in dark areas. Optimized DLSS with Preset E and a current-frame bias for sharper imagery. Includes HUD-less frame generation by default.
+• Experimental HDR10: Added a new experimental HDR10 output mode for the base SDR game.
+
+🎮 All-New Custom Launcher
+
+Redesigned with a Shadow of the Colossus aesthetic (night stone, golden typography, and reactive sword-light highlights) inspired by the bloodborne_pc launcher.
+• Play Modes: Quick presets for Normal, Pro, Extreme (60 FPS, max textures, extended grass/shadow distance, DLSS), and Custom.
+• First-Time Setup Guide: A thematic 5-step hardware wizard that benchmarks your PC (CPU, GPU, RAM, Storage) and picks your ideal play mode.
+• Advanced Save Manager: Import/export your progress via .zip or shadPS4, with manual and automatic backups upon game close or crash.
+• Quality of Life: Global settings search (Ctrl+F), an interactive controller button tester, multi-monitor selection, a one-click bug report tool, and a dedicated help section. |
 | **0.70** | **Area changes no longer drop to near zero FPS** (worst frame 534 ms → 58–75 ms, no forced loading screens; 1–6 frames are still lost per change), **fix for a rare crash in the game's allocator after a load** (`0x49800`), **DLSS no longer shakes** in PS4 Pro mode at 30 FPS, **the HUD stays still with frame generation** on FSR 1, a cheaper LOD feedback, new draw thread diagnostics. **Install the game on an SSD.** |
 | **0.60.6-C3** | Fix for the C2 stamina bar with DLSS (wide screens, and 16:9 outside PS4 Pro mode); the 30 FPS cap holds in PS4 Pro mode too. |
 | **0.60.6-C2** | **Widescreen health and stamina bars fixed** (21:9 / 32:9, #301), **controller vibration toggle** (launcher and in-game menu, #292), **more FPS at the Shrine** (Lucas-blip-png's barrier change), **frame generation without the interface** (no shaking text, experimental), **DLSS Ultra Performance**. |

@@ -468,6 +468,8 @@ def user_dir(s):
     return folder
 
 
+NAV_ICONS = {'play': 'play', 'game': 'gameplay', 'saves': 'saves', 'graphics': 'display', 'controls': 'controls',
+             'advanced': 'advanced', 'debug': 'system'}
 SAVE_BACKUPS_KEPT = 10  # user/backups/saves-*.zip
 LOGS_KEPT = 5      # last_run.log and last_run.1.log ... last_run.4.log
 CRASH_LOGS_KEPT = 20
@@ -872,7 +874,7 @@ def shadps4_saves(serial):
 # for what is active.
 BG, PANEL, CARD, LINE = theme.DEEP, theme.BG, theme.CARD, theme.BORDER
 TEXT, MUTED, GOLD, ACCENT, ACCENT_HI = theme.TEXT, theme.MUTED, theme.GOLD_LIGHT, theme.SIGIL, theme.SIGIL_HOVER
-SIGIL, HOVER = theme.SIGIL_LIGHT, theme.SURFACE
+SIGIL = theme.SIGIL_LIGHT
 
 
 class Launcher:
@@ -1090,26 +1092,29 @@ class Launcher:
         tk.Frame(side, bg=GOLD, height=1, width=self.px(46)).pack(anchor='w', padx=22, pady=(10, 8))
         tk.Label(side, text=_('port nativo · Windows', 'native port · Windows') + f'  ·  v{VERSION}', bg=BG, fg=MUTED,
                  font=(ui_font(), 9)).pack(anchor='w', padx=22, pady=(0, 22))
-        self.nav, self.nav_bars, self.current_page = {}, {}, None
+        # The pages as in the bloodborne_pc launcher: a thin line icon, a card behind the current
+        # page with the sword's light at its left edge, a softer card under the mouse.
+        self.nav, self.current_page = {}, None
+        px, width, height = self.px, 196, 38
+        self.nav_pills = {'on': self.theme.box(width, height, 8, CARD, LINE, bg=BG),
+                          'hover': self.theme.box(width, height, 8, theme.SURFACE, bg=BG)}
+        accent = self.theme.box(3, 18, 1.5, SIGIL, bg=CARD)
         for name, title in (('play', _('Jogar', 'Play')), ('game', _('Jogo', 'Game')), ('saves', _('Saves', 'Saves')),
                             ('graphics', _('Imagem e FPS', 'Display & FPS')), ('controls', _('Controles', 'Controls')),
                             ('advanced', _('Avançado', 'Advanced')), ('debug', _('Debug', 'Debug'))):
-            holder = tk.Frame(side, bg=BG, cursor='hand2')
-            holder.pack(fill='x')
-            bar = tk.Frame(holder, bg=BG, width=3)  # the active page's mark: the sword's light
-            bar.pack(side='left', fill='y')
-            glyph = theme.ICON.get({'debug': 'system'}.get(name, name), '')
-            icon = tk.Label(holder, text=glyph, bg=BG, fg=MUTED, font=(theme.ICONS, 12), width=3, cursor='hand2')
-            icon.pack(side='left', padx=(12, 0))
-            item = tk.Label(holder, text=title, bg=BG, fg=TEXT, anchor='w', font=(ui_font(), 11),
-                            pady=11, cursor='hand2')
-            item.pack(side='left', fill='x', expand=True)
-            item.icon = icon
-            for widget in (holder, icon, item):
-                widget.bind('<Button-1>', lambda _e, n=name: self.show(n))
-                widget.bind('<Enter>', lambda _e, n=name: n != self.current_page and self.nav_color(n, HOVER))
-                widget.bind('<Leave>', lambda _e, n=name: n != self.current_page and self.nav_color(n, BG))
-            self.nav[name], self.nav_bars[name] = item, bar
+            c = tk.Canvas(side, width=px(width), height=px(height), bg=BG, highlightthickness=0, bd=0, cursor='hand2')
+            c.pack(padx=px(12), pady=(0, px(2)))
+            mid = px(height / 2)
+            items = {'pill': c.create_image(0, 0, anchor='nw', state='hidden'),
+                     'bar': c.create_image(px(1), mid, anchor='w', image=accent, state='hidden'),
+                     'icon': c.create_text(px(22), mid, text=theme.ICON[NAV_ICONS[name]], font=(theme.ICONS, 12)),
+                     'label': c.create_text(px(44), mid, text=title, anchor='w',
+                                              font=(theme.BODY_MEDIUM if LANG not in ('zh', 'ko') else ui_font(), 10))}
+            c.bind('<Button-1>', lambda _e, n=name: self.show(n))
+            c.bind('<Enter>', lambda _e, n=name: self.nav_paint(n, hover=True))
+            c.bind('<Leave>', lambda _e, n=name: self.nav_paint(n))
+            self.nav[name] = (c, items)
+            self.nav_paint(name)
         tk.Frame(side, bg=BG).pack(fill='both', expand=True)
         for text, command in ((_('Registro do jogo', 'Game log'), lambda: self.show('log')),
                               (_('Procurar atualização', 'Check for updates'), lambda: self.check_updates(True)),
@@ -1157,18 +1162,20 @@ class Launcher:
             page.pack_forget()
         self.pages[name].pack(fill='both', expand=True)
         self.current_page = name
-        for n, item in self.nav.items():
-            self.nav_color(n, PANEL if n == name else BG)
-            item.configure(fg=GOLD if n == name else TEXT)
-            item.icon.configure(fg=SIGIL if n == name else MUTED)
-            self.nav_bars[n].configure(bg=SIGIL if n == name else BG)
+        for n in self.nav:
+            self.nav_paint(n)
         if name == 'play':
             self.refresh_status()
 
-    def nav_color(self, name, color):
-        item = self.nav[name]
-        for widget in (item, item.icon, item.master):
-            widget.configure(bg=color)
+    def nav_paint(self, name, hover=False):
+        """A side bar entry: a card behind the current page, a softer one under the mouse."""
+        c, items = self.nav[name]
+        on = name == self.current_page
+        pill = self.nav_pills['on'] if on else self.nav_pills['hover'] if hover else ''
+        c.itemconfigure(items['pill'], image=pill, state='normal' if pill else 'hidden')
+        c.itemconfigure(items['bar'], state='normal' if on else 'hidden')
+        c.itemconfigure(items['icon'], fill=GOLD if on else theme.TEXT_SOFT if hover else MUTED)
+        c.itemconfigure(items['label'], fill=theme.TEXT_STRONG if on else TEXT if hover else theme.TEXT_SOFT)
 
     def build_play(self):
         tk, ttk = self.tk, self.ttk

@@ -755,8 +755,19 @@ static void views_remove(uint64_t phys, uintptr_t address, uint64_t size) {
         const uint64_t page=phys/PAGE+k;
         if (page>=phys_view_pages) break;
         uintptr_t *v=phys_views[page]; const uintptr_t at=address+k*PAGE;
-        if (v[1]==at) { v[1]=0; __atomic_sub_fetch(&alias_pages,1,__ATOMIC_RELAXED); }
-        else if (v[0]==at) { v[0]=v[1]; if (v[1]) { v[1]=0; __atomic_sub_fetch(&alias_pages,1,__ATOMIC_RELAXED); } }
+        uintptr_t left=0;
+        if (v[1]==at) { left=v[0]; v[1]=0; }
+        else if (v[0]==at) { left=v[1]; v[0]=v[1]; v[1]=0; }
+        if (!left) continue;
+        __atomic_sub_fetch(&alias_pages,1,__ATOMIC_RELAXED);
+        /* The address left may carry a protection copied from the one going away, which no
+         * tracker there would lift (writes then faulted forever): the guest's protection again,
+         * and the GPU rereads the page. */
+        const size_t j=vma_index(left);
+        if (j<vma_count && vmas[j].start<=left && vmas[j].kind==KIND_DIRECT) {
+            host_protect(left,PAGE,host_prot(vmas[j].prot));
+            queue_hook(HOOK_INVALIDATE,left,PAGE);
+        }
     }
 }
 /* The other guest address of the direct page at [address], or 0. Under the lock. */

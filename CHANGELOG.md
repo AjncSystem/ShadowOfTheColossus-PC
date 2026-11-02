@@ -13,6 +13,11 @@
   páginas que já foram para outro bloco. Teste: todos os colossos do Time Attack na Máxima, sem mosaico e
   sem queda. `SOTC_POOL_OWNER=0` desliga. Ferramentas novas de diagnóstico (desligadas):
   `SOTC_POOL_FREE_TRACE=1`, `SOTC_WRITE_TRACE=1`, `SOTC_ALIAS_LOG=1`, `SOTC_VIEW_CHECK=1`.
+- **Lançador: atualizar liga as melhorias também em instalações antigas.** Antes, uma opção que
+  passou a vir ligada (como "Geração de quadros sem a interface", que tira o tremido do HUD e das
+  letras) continuava desligada para quem já tinha a configuração gravada. Agora cada versão liga uma
+  vez as melhorias dela: nesta, HUD sem tremer na geração de quadros, motion blur desligado (sem rastro
+  da sombra em áreas escuras) e logotipos de abertura pulados.
 - **Memória flexível:** ao dividir um mapeamento flexível, a metade direita apontava para o armazenamento
   da metade esquerda (não acontecia neste jogo nos testes, mas estava errado).
 - **Lançador: logotipos de abertura pulados por padrão** (instalações novas).

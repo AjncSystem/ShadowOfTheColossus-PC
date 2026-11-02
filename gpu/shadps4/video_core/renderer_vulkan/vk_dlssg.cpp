@@ -1397,6 +1397,20 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
         sr_prev = false;
         return {};
     }
+    // sotc: an input as large as the output or larger (PS4 Pro Cinematic mode renders 2560x1440
+    // for a 1080p window) is not upscaled: NGX refused every evaluate (0xbad00005), turned super
+    // resolution off for the session after three, and the frame repeat showed the last DLSS
+    // picture for good (frozen screen, 2 Nov). The plain path scales it down.
+    if (f.width >= width && f.height >= height) {
+        static u32 logged = 0;
+        if (logged++ < 3) {
+            std::fprintf(stderr, "SOTC DLSS: input %ux%u not smaller than the output %ux%u: "
+                                 "not upscaled\n",
+                         f.width, f.height, width, height);
+        }
+        sr_prev = false;
+        return {};
+    }
     // sotc: when no DLSS mode takes this input height for the output, DLSS upscales 2x and the
     // post-process pass scales the rest. PS4 Pro mode at 4K hands it 1600x900: to 2160p no mode
     // takes that height, NGX refused every evaluate (0xbad00005) and the screen stayed black.

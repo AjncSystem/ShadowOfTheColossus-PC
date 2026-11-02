@@ -845,10 +845,15 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     }();
     static Dlssg::Upscaled dlss_last{};
     static VAddr dlss_last_address = 0;
+    // sotc: once per DLSS picture: a buffer flipped again and again with no new DLSS output
+    // (inputs refused, super resolution off) showed the same picture for good (frozen screen in
+    // PS4 Pro Cinematic mode, 2 Nov).
     if (!upscaled.scene && dlss_repeat && dlss_last.scene && cpu_address == dlss_last_address) {
         upscaled = dlss_last;
+        dlss_last = Dlssg::Upscaled{};
+    } else {
+        dlss_last = upscaled.scene && !upscaled.scene_low ? upscaled : Dlssg::Upscaled{};
     }
-    dlss_last = upscaled.scene && !upscaled.scene_low ? upscaled : Dlssg::Upscaled{};
     dlss_last_address = cpu_address;
     if (Dlssg::SuperResolutionAvailable() && Dlssg::CompareMode()) {
         BbOverlay::SetUpscalerLabel(upscaled.scene && !upscaled.scene_low ? Dlssg::ModeName()

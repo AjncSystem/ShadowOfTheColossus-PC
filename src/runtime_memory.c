@@ -813,6 +813,27 @@ static int32_t map_direct_locked(void **out, uint64_t size, int prot, int flags,
     if (!direct_range_allocated((uint64_t)physical,size)) return INVALID;
     int32_t result=place(out,size,prot,flags,alignment,KIND_DIRECT,block_type((uint64_t)physical),(uint64_t)physical);
     if (!result) ++maps;
+    /* sotc: SOTC_ALIAS_LOG=1 (diagnostic, T38): physical pages mapped at a second address while
+     * still mapped at the first. The GPU caches go by address and do not see one through the other. */
+    static int alias_log=-1;
+    if (alias_log<0) { const char *v=getenv("SOTC_ALIAS_LOG"); alias_log=v && v[0]=='1'; }
+    if (!result && alias_log) {
+        static unsigned long aliases, logged;
+        const uintptr_t at=(uintptr_t)*out; const uint64_t p=(uint64_t)physical;
+        for (size_t i=0;i<vma_count;++i) {
+            const Vma *v=&vmas[i];
+            if (v->kind!=KIND_DIRECT || (v->start<at+size && at<v->end)) continue;
+            if (v->phys<p+size && p<v->phys+(v->end-v->start)) {
+                ++aliases;
+                if (logged<60) {
+                    ++logged;
+                    fprintf(stderr,"Runtime: ALIAS physical %#" PRIx64 "+%#" PRIx64 " mapped at %p, already at %p-%p (physical %#" PRIx64 "), %lu so far\n",
+                            p,size,(void *)at,(void *)v->start,(void *)v->end,v->phys,aliases);
+                }
+                break;
+            }
+        }
+    }
     return result;
 }
 static ABI int32_t direct_map(void **out, uint64_t size, int prot, int flags, int64_t physical, uint64_t alignment) {

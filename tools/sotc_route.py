@@ -6,6 +6,7 @@ BB_PAD_REPLAY), from the same save and the same moment every run.
     python tools/sotc_route.py --install DIR --record out/routes/walk.txt
     python tools/sotc_route.py --install DIR --replay out/routes/walk.txt [--env NAME=VALUE ...]
     python tools/sotc_route.py --install DIR --measure 60 --boss 6
+    python tools/sotc_route.py --install DIR --plan plan.txt
 
 --record copies the install's save next to the route (walk.save/), starts the game through the
 launcher (--play), gets past the title by itself and starts recording 1 s after gameplay begins
@@ -23,6 +24,9 @@ measured). --outro skips the fight entirely: it marks the boss defeated and play
 encounter that long (the colossus comes to you) and leaves the frame log for spike_report.py /
 the bench skill - launch-into-boss performance analysis with no hands. --measure uses the
 install's current save as it is (the jump makes the spawn deterministic regardless of progress).
+--plan FILE runs an engine automation plan of your own (console commands such as setPlayerPos x y z,
+wait, printPlayerPos; it must start with waitForGameToStart) and closes the game when the plan
+has completed (tools/sotc_ride_bench.py builds one). The log is kept as user/plan-*.log.
 --play hands the game over once the jump is done: nothing is killed or closed, so you can fight
 the boss yourself (killBoss only ever runs when --kill is given).
 """
@@ -74,6 +78,8 @@ def main():
     mode.add_argument('--measure', type=float, help='just sit in the game that many seconds')
     mode.add_argument('--play', action='store_true',
                       help='leave the game running for you to play (the boss stays alive)')
+    mode.add_argument('--plan', help='run this automation plan file (engine console commands, e.g. '
+                                     'setPlayerPos) once gameplay begins and close the game when it ends')
     parser.add_argument('--boss', type=int, choices=range(1, 17), metavar='1-16',
                         help='jump into this boss encounter first')
     parser.add_argument('--outro', action='store_true',
@@ -123,13 +129,19 @@ def main():
                SOTC_SAVE_PROMPT='auto')
     if args.record or args.replay:
         env['BB_PAD_RECORD' if args.record else 'BB_PAD_REPLAY'] = str(route)
-    if args.boss:
+    if args.plan and args.boss:
+        print('INVALID: --plan and --boss are separate plans')
+        return 1
+    if args.boss or args.plan:
         # The plan file must sit in the game dump (the engine loads it from app0).
         game_dir = Path(json.loads((user / 'launcher_settings.json').read_text(encoding='utf-8'))['game_dir'])
         # No hyphen in the name: the boot cvar parser rejects it (usage error on automate_loadfile).
         plan = game_dir / 'route_bossjump.txt'
-        plan_text = BOSS_PLAN.format(command='boss_outro' if args.outro else 'shadow_jumpToBoss',
-                                     index=args.boss - 1)
+        if args.plan:
+            plan_text = Path(args.plan).read_text()
+        else:
+            plan_text = BOSS_PLAN.format(command='boss_outro' if args.outro else 'shadow_jumpToBoss',
+                                         index=args.boss - 1)
         if args.boss in (7, 12):
             # Water arenas (Eel, Poseidon): no place for the horse, and the warp there crashed.
             plan_text = plan_text[:plan_text.index('*stage "Horse"')]
@@ -160,6 +172,20 @@ def main():
             shutil.copytree(restore, saves)
             shutil.rmtree(restore)
             print('your save is restored')
+
+
+def run_plan(args, wait, invalid, log, launcher):
+    print('plan running', flush=True)
+    t = wait(args.timeout, lambda t: AUTOMATION_DONE in t or AUTOMATION_FAIL in t)
+    ok = t is not None and AUTOMATION_DONE in t
+    if not ok:
+        return invalid('the plan did not finish')
+    subprocess.run(['taskkill', '/F', '/IM', 'bb-probe.exe'], capture_output=True)
+    launcher.wait(30)
+    keep = log.with_name(f'plan-{time.strftime("%Y%m%d-%H%M%S")}.log')
+    shutil.copy2(log, keep)
+    print(f'plan done, log {keep}')
+    return 0
 
 
 def running():
@@ -221,6 +247,11 @@ def drive(args, pad, log, launched, launcher):
             t = wait(1.5, lambda t: starts(t) >= 1)
     if t is None or starts(t) < 1:
         return invalid('the save did not load')
+    if args.plan:
+        # The plan holds itself with waitForGameToStart; some saves start gameplay at the first
+        # start already, so do not wait for a second one here.
+        pad.write_text('')
+        return run_plan(args, wait, invalid, log, launcher)
     # Gameplay begins at the second start; a cutscene before it is skipped with X held.
     t = wait(25, lambda t: starts(t) >= 2)
     while t is not None and starts(t) < 2 and time.monotonic() - start < 360:

@@ -879,6 +879,8 @@ static int helper_single_step(EXCEPTION_POINTERS *info) {
 #define HEAP_FREE_OFFSET 0x495e0
 const unsigned char *runtime_memory_backing_pointer(uintptr_t address);
 const unsigned char *runtime_memory_backing_view(uint64_t *size);
+uintptr_t runtime_memory_alias_of(uintptr_t address);
+void runtime_memory_alias_release(uintptr_t address);
 #define HEAP_HOOK_CALLS 2000
 static unsigned char heap_hook_original;
 static volatile LONG heap_hook_calls, heap_hook_done;
@@ -1200,6 +1202,17 @@ static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2) {
         /* GPU page tracking (write-protected guest pages) is resolved first. */
         if (gpu_enabled && bbgpu_handle_fault(info,(void *)record->ExceptionInformation[1])) { fault_path=4; return EXCEPTION_CONTINUE_EXECUTION; }
+        /* sotc: T38: the second address of a page the GPU watches at its first (runtime_memory.c,
+         * SOTC_ALIAS_SYNC): the GPU handles it there, then this page gets the guest's protection. */
+        if (gpu_enabled) {
+            const uintptr_t at=(uintptr_t)record->ExceptionInformation[1], watched=runtime_memory_alias_of(at);
+            if (watched) {
+                bbgpu_handle_fault(info,(void *)watched);
+                runtime_memory_alias_release(at);
+                fault_path=5;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
         fault_path=10; /* page tracking declined */
         if (runtime_fault_recover) {
             /* A speculative guest memory read (GPU draw preparation) faulted: the thread resumes
@@ -1333,6 +1346,10 @@ static void apply_sotc_cmdline(const char *path, uint64_t size) {
 static void fault(int sig, siginfo_t *info, void *context) {
     /* GPU page tracking (write-protected guest pages) is resolved first. */
     if (gpu_enabled && sig == SIGSEGV && bbgpu_handle_fault(context, info->si_addr)) return;
+    if (gpu_enabled && sig == SIGSEGV) {
+        const uintptr_t at=(uintptr_t)info->si_addr, watched=runtime_memory_alias_of(at);
+        if (watched) { bbgpu_handle_fault(context,(void *)watched); runtime_memory_alias_release(at); return; }
+    }
     /* A speculative guest memory read (runtime_memory.c) failed: resume its recovery point. */
     if ((sig == SIGSEGV || sig == SIGBUS) && runtime_fault_recover) {
         sigjmp_buf *recover = runtime_fault_recover;

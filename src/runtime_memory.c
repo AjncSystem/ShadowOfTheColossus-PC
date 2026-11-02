@@ -718,6 +718,77 @@ static uintptr_t find_free(uintptr_t hint, uint64_t size, uint64_t alignment) {
     }
     return 0;
 }
+/* sotc: T38. The game keeps the same physical pages mapped at two guest addresses for minutes
+ * (Time Attack: up to ~1600 pages, 350 MB; it writes them through one and draws them through the
+ * other). The GPU caches go by address and watch writes by protecting pages, so a write through
+ * the other address went unseen: textures kept the old contents (mosaic) and readback-protected
+ * pages were read stale. Each direct physical page keeps the addresses it is mapped at (two);
+ * the GPU's protections are copied to the other address and its faults handed to the GPU at the
+ * watched one. SOTC_ALIAS_SYNC=0 turns it off. */
+static uintptr_t (*phys_views)[2];
+static uint64_t phys_view_pages, alias_pages, alias_overflow, alias_faults;
+static int alias_sync_on(void) {
+    static int on=-1;
+    if (on<0) { const char *v=getenv("SOTC_ALIAS_SYNC"); on=!(v && v[0]=='0'); }
+    return on;
+}
+static void views_add(uint64_t phys, uintptr_t address, uint64_t size) {
+    if (!alias_sync_on()) return;
+    if (!phys_views) {
+        phys_view_pages=POOL_SIZE/PAGE;
+        phys_views=calloc(phys_view_pages,sizeof(*phys_views));
+        if (!phys_views) { phys_view_pages=0; return; }
+    }
+    for (uint64_t k=0; k<size/PAGE; ++k) {
+        const uint64_t page=phys/PAGE+k;
+        if (page>=phys_view_pages) break;
+        uintptr_t *v=phys_views[page]; const uintptr_t at=address+k*PAGE;
+        if (v[0]==at || v[1]==at) continue;
+        if (!v[0]) v[0]=at;
+        else if (!v[1]) { v[1]=at; __atomic_add_fetch(&alias_pages,1,__ATOMIC_RELAXED); }
+        else if (alias_overflow++<4) fprintf(stderr,"Runtime: physical %#" PRIx64 " mapped at a third address %p (not kept)\n",page*PAGE,(void *)at);
+    }
+}
+static void views_remove(uint64_t phys, uintptr_t address, uint64_t size) {
+    if (!phys_views) return;
+    for (uint64_t k=0; k<size/PAGE; ++k) {
+        const uint64_t page=phys/PAGE+k;
+        if (page>=phys_view_pages) break;
+        uintptr_t *v=phys_views[page]; const uintptr_t at=address+k*PAGE;
+        if (v[1]==at) { v[1]=0; __atomic_sub_fetch(&alias_pages,1,__ATOMIC_RELAXED); }
+        else if (v[0]==at) { v[0]=v[1]; if (v[1]) { v[1]=0; __atomic_sub_fetch(&alias_pages,1,__ATOMIC_RELAXED); } }
+    }
+}
+/* The other guest address of the direct page at [address], or 0. Under the lock. */
+static uintptr_t view_other(uintptr_t address, size_t *vma) {
+    size_t i=vma_index(address);
+    if (i==vma_count || vmas[i].start>address || vmas[i].kind!=KIND_DIRECT) return 0;
+    if (vma) *vma=i;
+    const uint64_t off=(address-vmas[i].start) & ~(PAGE-1), phys=vmas[i].phys+off, page=phys/PAGE;
+    if (page>=phys_view_pages) return 0;
+    const uintptr_t at=vmas[i].start+off, *v=phys_views[page];
+    const uintptr_t other=v[0]==at ? v[1] : v[1]==at ? v[0] : 0;
+    return other ? other+((address-vmas[i].start)-off) : 0;
+}
+/* Gives the other addresses of [address,address+size) the GPU's protection (read/write wanted). */
+static void views_protect(uintptr_t address, uint64_t size, int read, int write) {
+    uintptr_t run=0, run_end=0; int run_prot=0;
+    for (uintptr_t at=address & ~(uintptr_t)(PAGE-1); at<address+size; at+=PAGE) {
+        const uintptr_t other=view_other(at,NULL);
+        size_t j=other ? vma_index(other) : vma_count;
+        int prot=0;
+        if (j<vma_count && vmas[j].start<=other) {
+            const int guest=host_prot(vmas[j].prot);
+            const int want=(read ? PROT_READ : 0)|(write ? PROT_WRITE|PROT_READ : 0)|(guest & PROT_EXEC);
+            prot=guest & want;
+        } else j=vma_count;
+        if (run && (j==vma_count || other!=run_end || prot!=run_prot)) { host_protect(run,run_end-run,run_prot); run=0; }
+        if (j==vma_count) continue;
+        if (!run) { run=other; run_prot=prot; }
+        run_end=other+PAGE;
+    }
+    if (run) host_protect(run,run_end-run,run_prot);
+}
 static void drop_range(uintptr_t start, uintptr_t end) {
     int error; size_t i=carve(start,end,&error), n=0;
     while (i+n<vma_count && vmas[i+n].end<=end && vmas[i+n].start>=start) {
@@ -725,6 +796,7 @@ static void drop_range(uintptr_t start, uintptr_t end) {
             flexible_bytes-=vmas[i+n].end-vmas[i+n].start;
             flex_free(vmas[i+n].phys,vmas[i+n].end-vmas[i+n].start);
         }
+        if (vmas[i+n].kind==KIND_DIRECT) views_remove(vmas[i+n].phys,vmas[i+n].start,vmas[i+n].end-vmas[i+n].start);
         ++n;
     }
     vma_erase(i,n);
@@ -749,6 +821,21 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
     drop_range(address,address+size);
     if (vma_insert(vma_index(address),(Vma){address,address+size,kind,prot,type,phys})) return NO_MEMORY;
     if (kind==KIND_FLEXIBLE) flexible_bytes+=size;
+    if (kind==KIND_DIRECT) {
+        views_add(phys,address,size);
+#ifdef _WIN32
+        /* a new second address takes the GPU's protection of the first */
+        if (__atomic_load_n(&alias_pages,__ATOMIC_RELAXED))
+            for (uintptr_t at=address; at<address+size; at+=PAGE) {
+                const uintptr_t other=view_other(at,NULL);
+                MEMORY_BASIC_INFORMATION m;
+                if (!other || !VirtualQuery((void *)other,&m,sizeof(m))) continue;
+                const int guest=host_prot(prot);
+                if (m.Protect==PAGE_NOACCESS) host_protect(at,PAGE,guest & PROT_EXEC);
+                else if (m.Protect==PAGE_READONLY || m.Protect==PAGE_EXECUTE_READ) host_protect(at,PAGE,guest & (PROT_READ|PROT_EXEC));
+            }
+#endif
+    }
     if (kind!=KIND_RESERVED) queue_hook(HOOK_MAP,address,size);
     *inout=mapped;
     return 0;
@@ -849,8 +936,8 @@ static int32_t map_direct_locked(void **out, uint64_t size, int prot, int flags,
                 ++live; live_bytes+=pairs[k].size; if (age>oldest) oldest=age; ++k;
             }
             if (live || worst_ms)
-                fprintf(stderr,"Runtime: ALIAS live %zu pairs (%" PRIu64 " KiB), oldest %" PRIu64 " ms; longest ended %" PRIu64 " ms; %lu in all\n",
-                        live,live_bytes>>10,oldest,worst_ms,aliases);
+                fprintf(stderr,"Runtime: ALIAS live %zu pairs (%" PRIu64 " KiB), oldest %" PRIu64 " ms; longest ended %" PRIu64 " ms; %lu in all; %" PRIu64 " pages in two views, %" PRIu64 " faults handed over\n",
+                        live,live_bytes>>10,oldest,worst_ms,aliases,alias_pages,alias_faults);
         }
         for (size_t i=0;i<vma_count;++i) {
             const Vma *v=&vmas[i];
@@ -1375,6 +1462,23 @@ static void cache_region(size_t i, uintptr_t address) {
  * obtained while it was even stays valid until it changes (the invariant cached_region relies
  * on: only write_lock/write_unlock bump it; page protection takes the read lock). Odd (never
  * cache) while the table changes or when the GPU caches are disabled. */
+/* sotc: T38. A fault at the second address of a page: the GPU's watched address, or 0. */
+uintptr_t runtime_memory_alias_of(uintptr_t address) {
+    if (!__atomic_load_n(&alias_pages,__ATOMIC_RELAXED)) return 0;
+    read_lock();
+    const uintptr_t other=view_other(address,NULL);
+    read_unlock();
+    return other;
+}
+/* The page at [address] back to the guest's own protection (its GPU watch went away). */
+void runtime_memory_alias_release(uintptr_t address) {
+    __atomic_add_fetch(&alias_faults,1,__ATOMIC_RELAXED);
+    read_lock();
+    const size_t i=vma_index(address);
+    if (i<vma_count && vmas[i].start<=address && vmas[i].kind!=KIND_RESERVED)
+        host_protect(address & ~(uintptr_t)(PAGE-1),PAGE,host_prot(vmas[i].prot));
+    read_unlock();
+}
 uint64_t runtime_memory_generation(void) {
     if (runtime_disabled_optimizations & 1) return 1;
     return __atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
@@ -1537,8 +1641,12 @@ static int protect_fast(uintptr_t address, uint64_t size, int read, int write) {
 }
 #endif
 void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int write) {
-    if (protect_fast(address,size,read,write)) return;
+    if (protect_fast(address,size,read,write)) {
+        if (__atomic_load_n(&alias_pages,__ATOMIC_RELAXED)) { read_lock(); views_protect(address,size,read,write); read_unlock(); }
+        return;
+    }
     read_lock();
+    if (__atomic_load_n(&alias_pages,__ATOMIC_RELAXED)) views_protect(address,size,read,write);
     for (size_t i=vma_index(address); i<vma_count && vmas[i].start<address+size; ++i) {
         if (vmas[i].kind==KIND_RESERVED) continue;
         uintptr_t a=vmas[i].start>address ? vmas[i].start : address;

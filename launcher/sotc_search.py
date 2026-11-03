@@ -108,7 +108,8 @@ class SearchMixin:
         self.search_entry = ttk.Entry(holder, textvariable=self.search_var, style='Bar.TEntry')
         self.search_entry.pack(fill='x')
         hint = _('Buscar…  Ctrl+F', 'Search…  Ctrl+F')
-        self.search_hint = tk.Label(holder, text='  ' + hint, bg=theme.SURFACE, fg=theme.MUTED,
+        glyph = '  ' if theme.HAS_ICONS else ''  # Segoe's magnifier
+        self.search_hint = tk.Label(holder, text=glyph + hint, bg=theme.SURFACE, fg=theme.MUTED,
                                     font=(theme.BODY, 9), cursor='xterm')
         self.search_hint.bind('<Button-1>', lambda _e: self.search_entry.focus_set())
 

@@ -294,6 +294,17 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
             // Emulates GCN's factor-scaled min/max blend: min/max(src*src, dst*dst).
             value = ctx.OpFMul(ctx.F32[1], value, value);
         }
+        // sotc: SOTC_NAN_GUARD=1 (test, AMD GCN legacy driver: footstep dust drawn as a flashing
+        // white ball): a colour output that is NaN or infinite is written as 0. Shaders are
+        // translated again only after "Clear shader cache".
+        static const bool nan_guard = [] {
+            const char* v = std::getenv("SOTC_NAN_GUARD");
+            return v && v[0] == '1';
+        }();
+        if (nan_guard && !OutputAttrComponentType(ctx, attr).second) {
+            const Id bad = ctx.OpLogicalOr(ctx.U1[1], ctx.OpIsNan(ctx.U1[1], value), ctx.OpIsInf(ctx.U1[1], value));
+            value = ctx.OpSelect(ctx.F32[1], bad, ctx.ConstF32(0.f), value);
+        }
         if (info.num_components == 1) {
             return op_store(info.id);
         } else {

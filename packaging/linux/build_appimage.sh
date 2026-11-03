@@ -15,8 +15,9 @@ set -euo pipefail
 cd -- "$(dirname -- "$0")/../.."
 [[ -f out/bb-probe && -f out/gpu/libbbgpu.so ]] || { echo 'Build first: ./build.sh' >&2; exit 1; }
 command -v patchelf >/dev/null || { echo 'Need patchelf (dnf/apt install patchelf).' >&2; exit 1; }
-python3 -c 'import tkinter' 2>/dev/null ||
-    { echo 'Need python3 with Tk for the launcher (apt install python3-tk, dnf install python3-tkinter).' >&2; exit 1; }
+python3 -c 'import tkinter, PIL.ImageTk' 2>/dev/null ||
+    { echo 'Need python3 with Tk and Pillow for the launcher (apt install python3-tk python3-pil python3-pil.imagetk,' \
+           'dnf install python3-tkinter python3-pillow-tk).' >&2; exit 1; }
 version=$(sed -n 's/^## \([0-9][0-9.]*\).*/\1/p' CHANGELOG.md | head -1)
 output=dist/SotC-PC-${version:-dev}-linux-x86_64.AppImage
 
@@ -26,12 +27,12 @@ appdir=$work/AppDir
 app=$appdir/usr/share/sotc-pc
 mkdir -p "$app/bin/gpu" "$app/lib"
 install -m755 packaging/linux/AppRun "$appdir/AppRun"
-install -m644 sotc.py LICENSE "$app/"
+install -m644 sotc.py LICENSE CHANGELOG.md "$app/"
 cp -r scripts "$app/"
 find "$app/scripts" -name __pycache__ -prune -exec rm -rf {} +
 mkdir -p "$app/launcher"
-install -m644 launcher/sotc_launcher_win.py launcher/sotc_discovery.py launcher/sotc_i18n.py launcher/sotc_update.py \
-    launcher/sotc.png "$app/launcher/"
+install -m644 launcher/sotc_*.py launcher/sotc.png launcher/window_icon.png "$app/launcher/"
+cp -r launcher/assets "$app/launcher/"
 install -m755 out/bb-probe out/bb-gpu-capabilities "$app/bin/"
 install -m755 out/gpu/libbbgpu.so "$app/bin/gpu/"
 strip --strip-debug "$app/bin/bb-probe" "$app/bin/bb-gpu-capabilities" "$app/bin/gpu/libbbgpu.so"
@@ -59,6 +60,12 @@ tk_dir=$(dirname "$tcl_dir")/tk$tk_version
 [[ -f $tcl_dir/init.tcl && -f $tk_dir/tk.tcl ]] || { echo "Tcl/Tk scripts not found in $tcl_dir, $tk_dir" >&2; exit 1; }
 cp -a "$tcl_dir" "$python/tcl"
 cp -a "$tk_dir" "$python/tk"
+# Pillow with ImageTk: the launcher's theme draws its rounded images with it. Debian's site.py looks
+# for it in lib/python3/dist-packages next to the standard library.
+pil_dir=$(python3 -c 'import os, PIL; print(os.path.dirname(PIL.__file__))')
+pil=$python/lib/python3/dist-packages/PIL
+mkdir -p "$(dirname "$pil")"
+cp -a "$pil_dir" "$pil"
 
 # Every library the given binaries load, except the base system, the port's own GPU library and
 # what loads the host's own plugins or is loaded by them into the same process: the Vulkan
@@ -80,7 +87,7 @@ if (( count > 25 )); then
     echo "Warning: $count bundled libraries; the system FFmpeg pulls in many. For a small, portable" >&2
     echo "AppImage build the minimal one: bash packaging/linux/build_ffmpeg.sh, rm -rf out/gpu, ./build.sh" >&2
 fi
-bundle "$python/bin/python3" "$stdlib"/lib-dynload/*.so
+bundle "$python/bin/python3" "$stdlib"/lib-dynload/*.so "$pil"/*.so
 count=$(find "$app/lib" -type f | wc -l)
 strip --strip-unneeded "$app"/lib/*
 patchelf --set-rpath '$ORIGIN/gpu:$ORIGIN/../lib' "$app/bin/bb-probe"
@@ -88,6 +95,7 @@ patchelf --set-rpath '$ORIGIN/../lib' "$app/bin/bb-gpu-capabilities"
 patchelf --set-rpath '$ORIGIN/../../lib' "$app/bin/gpu/libbbgpu.so"
 patchelf --set-rpath '$ORIGIN/../../lib' "$python/bin/python3"
 for module in "$stdlib"/lib-dynload/*.so; do patchelf --set-rpath '$ORIGIN/../../../../lib' "$module"; done
+for module in "$pil"/*.so; do patchelf --set-rpath '$ORIGIN/../../../../../lib' "$module"; done
 for library in "$app"/lib/*; do patchelf --set-rpath '$ORIGIN' "$library"; done
 
 install -m644 launcher/sotc.png "$appdir/sotc-pc.png"

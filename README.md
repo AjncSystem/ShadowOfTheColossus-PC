@@ -27,8 +27,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 | Version | Improvements and fixes |
 |---|---|
 | **0.72** | **Improvements the 0.71 page pool fix made safe, now on by default:** fast GPU readbacks (~25% more FPS at the Shrine), sharper textures (finer mips: High mip 1, Maximum mip 0, with measured mips) and Maximum keeping texture banks 3 s, the heap guard shortcuts. **New upscaler: AMD FSR 4.1** (official AMD FSR SDK 2.4, Vulkan; FSR 4.1 on Radeon RX 6000/7000/9000, FSR 3.1 on other cards; experimental). **Play modes keep the grass as on PS4.** Fewer stutters at area changes (staging reserve, texture copies with fewer page faults), the right video memory budget on integrated GPUs, launcher fixes. |---|---|
-| **0.71** |
-🔧 Critical Fixes & Performance
+| **0.71** |🔧 Critical Fixes & Performance
 • No More Texture Mosaics & Crashes: Fixed a critical memory bug where the game's 64 KiB page pool freed pages twice, causing textures and the heap to conflict. Tested through every Time Attack colossus on Maximum settings with zero crashes and perfect textures.
 • Stutter Reduction: Smoother transitions between areas thanks to optimized staging buffers and a rebuilt shader cache.
 • Visual Cleaning: Native motion blur is now disabled by default to fix the "shadow trail" artifact in dark areas. Optimized DLSS with Preset E and a current-frame bias for sharper imagery. Includes HUD-less frame generation by default.

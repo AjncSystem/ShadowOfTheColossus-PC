@@ -862,9 +862,11 @@ def game_environment(s):
         env['SOTC_RUMBLE'] = '0'
     env['BB_CONFIG'] = str(PORT_DIR / 'sotc.ini')
     for item in str(s['extra_env']).split():
+        item = item.strip().lstrip('=')  # "=KEY=1" typed by mistake still sets KEY
         if '=' in item:
             key, value = item.split('=', 1)
-            env[key] = value
+            if key:
+                env[key] = value
     env['PYTHONUNBUFFERED'] = '1'
     env['PYTHONIOENCODING'] = 'utf-8'
     return env
@@ -3263,6 +3265,9 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
 
     def clear_cache(self):
         if self.process:
+            self.messagebox.showwarning('Shadow of the Colossus', _(
+                'Feche o jogo primeiro: o cache de shaders só pode ser limpo com o jogo fechado.',
+                'Close the game first: the shader cache can only be cleared while the game is closed.'))
             return
         for name in ('cache', 'shader'):
             shutil.rmtree(user_dir(self.app) / name, ignore_errors=True)

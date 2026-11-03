@@ -28,6 +28,8 @@ public:
         float sky_sharpen = 0.0f; ///< sotc: sharpening where Render's sky mask is set
         float hdr_white = 200.0f; ///< sotc: HDR paper white in nits (SOTC_HDR_WHITE)
         float hdr_curve = 1.0f; ///< sotc: exponent of the game's HDR composite
+        float paper_white = 200.0f; ///< sotc: hdr 2 (SDR game on HDR10): nits of SDR white
+        float highlight_gain = 1.5f; ///< sotc: hdr 2: brightness gain of the highlights
     };
 
     void Create(vk::Device device, vk::Format surface_format);

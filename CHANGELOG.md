@@ -1,5 +1,100 @@
 # Changelog
 
+## 0.71 — 2026-11-02
+- **Texturas em mosaico colorido e quedas depois das cargas (T38, corrigido):** o problema existia em todas
+  as versões e era muito pior no **Time Attack**, onde o jogo sempre fechava por volta do 5º colosso. Causa:
+  o reservatório de páginas de 64 KiB do jogo liberava algumas páginas duas vezes. Ao encolher uma textura
+  (descartar mips), o jogo devolve as páginas sem tirá-las do endereço dela; outra textura (ou o heap) as
+  pega; quando a primeira textura é descartada inteira, o jogo pergunta ao sistema (`sceKernelVirtualQuery`)
+  que página está em cada endereço e libera de novo as que já são da outra. Cada página dessas ficava com
+  dois donos: pedaços de outras texturas na tela, heap estourado (quedas `0x490a0`, `0x490e0`, `0x1d8bf`,
+  `0x5fc064`), descritores de textura lixo (`data_fmt` 36/54) e a contagem de páginas livres subindo a cada
+  carga. Agora o port lembra o último endereço em que cada página física foi mapeada, e a liberação pula as
+  páginas que já foram para outro bloco. Teste: todos os colossos do Time Attack na Máxima, sem mosaico e
+  sem queda. `SOTC_POOL_OWNER=0` desliga. Ferramentas novas de diagnóstico (desligadas):
+  `SOTC_POOL_FREE_TRACE=1`, `SOTC_WRITE_TRACE=1`, `SOTC_ALIAS_LOG=1`, `SOTC_VIEW_CHECK=1`.
+- **Lançador: atualizar liga as melhorias também em instalações antigas.** Antes, uma opção que
+  passou a vir ligada (como "Geração de quadros sem a interface", que tira o tremido do HUD e das
+  letras) continuava desligada para quem já tinha a configuração gravada. Agora cada versão liga uma
+  vez as melhorias dela: nesta, HUD sem tremer na geração de quadros, motion blur desligado (sem rastro
+  da sombra em áreas escuras) e logotipos de abertura pulados.
+- **Lançador: "Modo de jogo" na aba Jogar.** Quatro modos: **Normal** (como no PS4: 30 FPS, texturas
+  altas, grama e sombras do console, sem o modo Pro), **Pro** (modo PS4 Pro a 30 FPS, texturas altas,
+  filtro 16x, grama mais cheia), **Extremo** (modo Pro a 60 FPS, texturas máximas, sombras e grama até
+  mais longe, memória de vídeo no máximo, DLSS na RTX e FSR 1 nas outras placas; pede uma placa forte)
+  e **Personalizado** (tudo como você deixar). Mudar à mão um ajuste do modo passa para Personalizado.
+- **Lançador com visual novo**, no estilo do lançador do bloodborne_pc e com a cara de Shadow of the
+  Colossus: pedra escura, títulos dourados em Cinzel, o azul da luz da espada no que está ativo, chaves
+  no lugar das caixas de marcar, campos arredondados, ícones no menu e o banner do jogo com degradê suave.
+- **Lançador: aba Saves.** Lista os saves com o progresso (área, colossos derrotados, tempo de jogo) e a
+  data; exporta os escolhidos ou todos para um .zip (para guardar ou levar a outro PC); importa de .zip,
+  de uma pasta (um save, a pasta savedata de outra instalação) ou do shadPS4; faz backup com um clique em
+  `user/backups` (ficam os 10 mais novos), e sempre antes de substituir um save na importação. A antiga
+  aba "Jogo e saves" virou "Jogo".
+- **Lançador: backup automático dos saves quando o jogo fecha**, também depois de uma queda (aba Saves,
+  ligado por padrão; os 10 mais novos ficam em `user/backups`).
+- **Lançador: botão "Relatório"** na barra de baixo: um .zip com os registros das últimas sessões, as últimas
+  quedas (com o dump), as configurações (sem o nome do jogador) e um resumo do PC, para anexar numa issue.
+- **Lançador: janela "Novidades"** na primeira abertura de cada versão nova, com o que mudou.
+- **Lançador: busca (Ctrl+F)** no topo do menu lateral: acha qualquer opção pelo nome, pela explicação ou
+  por palavras do dia a dia ("hud tremendo", "sem som", "vsync"), abre a página, rola até ela e a destaca.
+- **Lançador: barra de título própria** no tema, com os botões de minimizar, maximizar e fechar (o Windows
+  continua movendo, encaixando e redimensionando a janela).
+- **Lançador: "Visão avançada"** no menu lateral: desligada, as abas Avançado e Debug ficam escondidas (a
+  busca continua achando as opções delas).
+- **Lançador: aba Ajuda** com os problemas mais comuns e o que fazer, em cartões: pedir ajuda (relatório
+  e issues), jogo que não abre, tela preta, sem som, travadas, FPS baixo, HUD tremendo, texturas coloridas
+  ou borradas, controle, saves e atualização. Cada tópico tem botões que levam direto à opção certa, e a
+  busca (Ctrl+F) acha os tópicos.
+- **Lançador: configuração inicial em cinco etapas** (I O Despertar, II O Santuário, III A Espada Antiga,
+  IV Agro, V A Terra Proibida), no estilo do assistente do bloodborne_pc: idioma e o que é preciso, o jogo
+  (achado sozinho, com atualização, DLC, saves e som), **a verificação do PC** (processador, memória, placa
+  de vídeo e se o jogo está num NVMe, SSD ou HD) que **escolhe o Modo de jogo** que o PC aguenta, controles
+  e o resumo. "Configurar de novo" no menu lateral abre o assistente.
+- **Lançador: teste do controle** na aba Controles: o desenho do controle (PlayStation, Xbox ou Switch) com
+  os botões acendendo, os gatilhos enchendo e os analógicos mexendo, lido pelo mesmo SDL do jogo.
+- **Monitor do jogo** (Imagem e FPS > Tela, com dois monitores ou mais): a janela e a tela cheia abrem no
+  monitor escolhido (`SOTC_MONITOR_AT`), e o ritmo de quadros segue a taxa dele.
+- **Lançador: minimizar para a bandeja do Windows** (Avançado): um ícone perto do relógio, com Abrir e Sair.
+- **Memória flexível:** ao dividir um mapeamento flexível, a metade direita apontava para o armazenamento
+  da metade esquerda (não acontecia neste jogo nos testes, mas estava errado).
+- **Lançador: logotipos de abertura pulados por padrão** (instalações novas).
+- **Lançador: motion blur agora vem desligado por padrão** (Efeitos > "Motion blur", dá para religar). Era a
+  causa da sombra do personagem deixando rastro ao mover em áreas escuras; a correção só existia na
+  configuração local e não ia no pacote. Equivale a `r_motionBlurEnable=0`.
+- **Lançador: geração de quadros sem a interface agora vem ligada por padrão** (`fg_hudless`), para letras e
+  ícones não tremerem com o FSR 3 (F8). Antes só valia para quem marcava a opção, então o pacote novo
+  não levava a correção. Opção "HDR (experimental)" na seção Tela.
+- **Menos travadas ao trocar de área (do fork Oussama268, opt12):** o pacote de cache de shaders do v0.70
+  não vence mais os arquivos novos (milhares de shaders eram traduzidos de novo a cada sessão, ~900 ms de
+  travada), texturas pequenas escritas pela CPU passam a ser verificadas inteiras (texturas velhas/coloridas),
+  mutexes do jogo giram 20 µs antes de dormir (`SOTC_MUTEX_SPIN_US=0` desliga) e buffers de staging grandes
+  ficam guardados entre quadros (`SOTC_STAGING_LARGE_POW2=0` desliga). O cache de shaders é refeito na
+  primeira abertura.
+- **DLSS: viés de cor atual na cena toda (`SOTC_DLSS_BIAS`, padrão 0,4; 0 desliga).** A sombra do
+  personagem não tem vetor de movimento, então o DLSS a mantinha no histórico e deixava rastro em
+  áreas escuras, mesmo com o preset E. O DLSS agora favorece mais o quadro atual. Se ainda houver
+  rastro, teste `SOTC_DLSS_BIAS=0.7`; se a imagem ficar granulada, use um valor menor.
+- **DLSS: preset E por padrão (`SOTC_DLSS_PRESET`)**. Letras E a O forçam um preset do modelo do DLSS
+  em todos os modos; `default` volta ao preset padrão da NVIDIA por modo. Sem a chave, o jogo usa o
+  preset E.
+- **Sombra/personagem com rastro em áreas escuras (corrigido):** há duas causas. (1) O **motion blur do
+  próprio jogo**, visível em cenas escuras e com 60 FPS: desligado por padrão (`fx_motionblur`).
+  (2) O **modelo padrão do DLSS** deixava ghosting em cenas escuras, também em Qualidade; com o preset E
+  (modelo CNN) o rastro some e o DLSS segue ativo. Os presets K e J (transformer) não resolveram.
+  O modo DLSS padrão do lançador passou de Ultra Desempenho para Qualidade.
+
+- **HDR10 para o jogo SDR (#347), experimental:** `SOTC_HDR=1` mostra o jogo numa tela HDR10 (PQ,
+  Rec.2020), expandindo o SDR no passe final: o branco SDR fica em `SOTC_HDR_PAPER` nits (padrão 200)
+  e os realces ganham até `SOTC_HDR_GAIN` vezes (padrão 1,5; 1 = sem ganho). `SOTC_HDR_WHITE` é
+  aceito como outro nome de `SOTC_HDR_PAPER` (igual ao fork do Oussama). Precisa do HDR ligado
+  no Windows e de um monitor HDR; sem isso o jogo avisa no log e segue em SDR. **Ainda não testado em
+  tela HDR** (o monitor de desenvolvimento não tem HDR). No lançador: Vídeo > Tela > "HDR (experimental)".
+  O cache de shaders é refeito na primeira abertura.
+- **Docs: remapear teclas e botões do mouse (#333):** `key.<entrada>=` e `mouse.<entrada>=` no
+  `sotc.ini` já funcionavam (inclusive L1/R1); agora estão documentados com exemplos. Um menu de
+  remapeamento dentro do jogo não existe (o menu é do próprio jogo).
+
 ## 0.70-opt12 — 2026-11-01 (fork do Oussama268)
 Tudo da 0.70, mais o trabalho contra as travadinhas (stutter):
 - **Quadros num ritmo regular (tabnul):** os quadros saem no ritmo em que o jogo os entrega, em

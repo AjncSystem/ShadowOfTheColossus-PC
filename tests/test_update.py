@@ -4,9 +4,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import ssl
 import sys
 import tempfile
 import unittest
+import unittest.mock
+import urllib.error
 import zipfile
 
 sys.path.insert(0, str(ROOT / 'launcher'))
@@ -31,6 +34,44 @@ class VersionTests(unittest.TestCase):
         self.assertTrue(sotc_update.is_newer({'version': '0.57-opt6'}, '0.57-opt5'))
         self.assertFalse(sotc_update.is_newer({'version': '0.57-opt5'}, '0.57-opt5'))
         self.assertFalse(sotc_update.is_newer(None, '0.57-opt5'))
+
+
+class SslTests(unittest.TestCase):
+    def setUp(self):
+        sotc_update._context = None
+        self.addCleanup(setattr, sotc_update, '_context', None)
+
+    def test_context_verifies(self):
+        context = sotc_update._ssl_context()
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+        self.assertIs(sotc_update._ssl_context(), context)
+
+    def test_without_certifi(self):
+        with unittest.mock.patch.dict(sys.modules, {'certifi': None}):
+            context = sotc_update._ssl_context()
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+
+    def test_cert_error(self):
+        failure = ssl.SSLCertVerificationError(1, 'CERTIFICATE_VERIFY_FAILED')
+        self.assertTrue(sotc_update.is_cert_error(failure))
+        self.assertTrue(sotc_update.is_cert_error(urllib.error.URLError(failure)))
+        self.assertFalse(sotc_update.is_cert_error(urllib.error.URLError(OSError('offline'))))
+        self.assertFalse(sotc_update.is_cert_error(ValueError('x')))
+
+    def test_https_gets_context(self):
+        with unittest.mock.patch('urllib.request.urlopen') as urlopen:
+            sotc_update._open('https://example.invalid/x', 5)
+            self.assertIs(urlopen.call_args.kwargs['context'], sotc_update._ssl_context())
+            sotc_update._open('http://example.invalid/x', 5)
+            self.assertIsNone(urlopen.call_args.kwargs['context'])
+
+    def test_file_url(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'a.json'
+            path.write_text('{}')
+            with sotc_update._open(path.as_uri(), 5) as response:
+                self.assertEqual(response.read(), b'{}')
 
 
 class DownloadTests(unittest.TestCase):
@@ -125,6 +166,38 @@ class ApplyTests(unittest.TestCase):
         self.assertFalse((self.port / 'bin' / 'b.dll').exists())
         self.assertIn('', sotc_update.cleanup(self.port))  # the error is reported once
         self.assertIsNone(sotc_update.cleanup(self.port))
+
+
+class NotesTests(unittest.TestCase):
+    def test_no_english_section(self):
+        body = '  Correções de áudio.\n\n## Detalhes\nMais texto.  '
+        self.assertEqual(sotc_update.notes_for(body, True), body.strip())
+        self.assertEqual(sotc_update.notes_for(body, False), body.strip())
+        self.assertEqual(sotc_update.notes_for('', True), '')
+
+    def test_english_at_end(self):
+        body = 'Correções.\n- item\n\n## English\nFixes.\n- item\n'
+        self.assertEqual(sotc_update.notes_for(body, False), 'Correções.\n- item')
+        self.assertEqual(sotc_update.notes_for(body, True), 'Fixes.\n- item')
+
+    def test_english_then_portuguese(self):
+        body = 'Intro\n## English\nFixes.\n### Details\nMore.\n## Português\nCorreções.'
+        self.assertEqual(sotc_update.notes_for(body, True), 'Fixes.\n### Details\nMore.')
+        self.assertEqual(sotc_update.notes_for(body, False), 'Intro')
+
+    def test_heading_variants(self):
+        for heading in ('## English', '## english:', '## In English  ', '## English version:', '##  ENGLISH'):
+            body = f'PT\n{heading}\nEN'
+            self.assertEqual(sotc_update.notes_for(body, True), 'EN', heading)
+            self.assertEqual(sotc_update.notes_for(body, False), 'PT', heading)
+        for heading in ('# English', '### English', '## English fixes', 'Text ## English'):
+            body = f'PT\n{heading}\nEN'
+            self.assertEqual(sotc_update.notes_for(body, True), body, heading)
+
+    def test_empty_portuguese_part(self):
+        body = '\n## English\nFixes.'
+        self.assertEqual(sotc_update.notes_for(body, False), body.strip())
+        self.assertEqual(sotc_update.notes_for(body, True), 'Fixes.')
 
 
 if __name__ == '__main__':

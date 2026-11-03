@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstdlib>
 
+#include "core/emulator_settings.h"
 #include "core/libraries/videoout/buffer.h"
 #include <imgui.h> // sotc port: ImTextureID only
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
@@ -80,11 +81,16 @@ public:
         if (!IsHDRSupported()) {
             return;
         }
-        swapchain.SetHDR(enable);
-        pp_settings.hdr = enable ? 1 : 0;
         if (const char* white = std::getenv("SOTC_HDR_WHITE"); white && std::atof(white) > 0) {
             pp_settings.hdr_white = static_cast<float>(std::atof(white));
         }
+        if (EmulatorSettings.IsSdrToHdr()) {
+            // sotc: the swapchain stays HDR10; an SDR game frame (hdr 2) is expanded by the pp pass.
+            pp_settings.hdr = enable ? 1 : 2;
+            return;
+        }
+        swapchain.SetHDR(enable);
+        pp_settings.hdr = enable ? 1 : 0;
     }
 
     VideoCore::Image& RegisterVideoOutSurface(

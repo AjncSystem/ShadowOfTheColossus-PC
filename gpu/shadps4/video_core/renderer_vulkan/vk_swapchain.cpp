@@ -24,9 +24,11 @@ Swapchain::Swapchain(const Instance& instance_, const Frontend::WindowSDL& windo
     : instance{instance_}, window{window_}, surface{CreateSurface(instance.GetInstance(), window)} {
     FindPresentFormat();
     FindPresentMode();
+    // sotc: the SDR-to-HDR mode starts on the HDR10 swapchain, so every pass is built for its format.
+    needs_hdr = supports_hdr && EmulatorSettings.IsSdrToHdr();
 
     Create(window.GetWidth(), window.GetHeight());
-    ImGui::Core::Initialize(instance, window, image_count, surface_format.format);
+    ImGui::Core::Initialize(instance, window, image_count, GetSurfaceFormat().format);
 }
 
 Swapchain::~Swapchain() {

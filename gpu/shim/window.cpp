@@ -76,8 +76,18 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     }
     SDL_PropertiesID props = SDL_CreateProperties();
     SDL_SetStringProperty(props, SDL_PROP_WINDOW_CREATE_TITLE_STRING, title);
-    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, SDL_WINDOWPOS_CENTERED);
-    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, SDL_WINDOWPOS_CENTERED);
+    // sotc: SOTC_MONITOR_AT=x,y (the launcher's "Game monitor"): centred on the display holding
+    // that desktop point; the primary display without it.
+    SDL_DisplayID display = 0;
+    if (const char* at = std::getenv("SOTC_MONITOR_AT")) {
+        SDL_Point point{};
+        if (std::sscanf(at, "%d,%d", &point.x, &point.y) == 2) {
+            display = SDL_GetDisplayForPoint(&point);
+        }
+    }
+    const int position = display ? int(SDL_WINDOWPOS_CENTERED_DISPLAY(display)) : int(SDL_WINDOWPOS_CENTERED);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_X_NUMBER, position);
+    SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_Y_NUMBER, position);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_WIDTH_NUMBER, width_);
     SDL_SetNumberProperty(props, SDL_PROP_WINDOW_CREATE_HEIGHT_NUMBER, height_);
     SDL_SetBooleanProperty(props, SDL_PROP_WINDOW_CREATE_RESIZABLE_BOOLEAN, true);

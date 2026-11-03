@@ -1018,6 +1018,9 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
             };
             write_pages(dst_addr, copy.size, [&](VAddr part_addr, u64 part_size) {
             ForEachNonStackRange(part_addr, part_size, [&](VAddr addr, u64 size) {
+                if (VideoCore::TextureCache::ReadbackWatchEnabled()) {
+                    texture_cache.NoteReadbackOverTexture(addr, size, item.hot);
+                }
                 BpeHeapGuard* heap_guard = nullptr;
                 if (Active* a = active_for(addr, size)) {
                     BpeUsedBlocks& used = *a->slot->used;

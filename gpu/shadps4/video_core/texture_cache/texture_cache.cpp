@@ -37,6 +37,9 @@
 #include "video_core/sotc_stats.h"
 #include "video_core/texture_cache/tile_manager.h"
 
+// sotc: src/probe.c (SOTC_WRITE_TRACE): the write faults recorded inside a range.
+extern "C" void runtime_write_fault_dump(uintptr_t start, uint64_t size) __attribute__((weak));
+
 namespace VideoCore {
 
 void ReentrantMutex::AsymmetricBarrier() {
@@ -1248,6 +1251,10 @@ void TextureCache::RefreshImage(Image& image) {
                                  vk::to_string(image.info.pixel_format).c_str(),
                                  image.info.resources.levels, image.info.sotc_first_mip,
                                  image.sotc_uploads, u32(image.flags));
+                    // sotc: SOTC_WRITE_TRACE=1: the CPU writes that reached it (src/probe.c)
+                    if (runtime_write_fault_dump) {
+                        runtime_write_fault_dump(image.info.guest_address, bytes);
+                    }
                 }
                 image.sotc_first_hash = h; // report each change once
             }
@@ -1943,6 +1950,50 @@ void TextureCache::GarbageCollectSamplers() {
 // over it was used a moment ago means the game gave away memory a texture on screen still
 // reads: that texture shows whatever lands there next. Logged with the image (SOTC_POOL_WATCH=1;
 // =2 also counts allocations).
+bool TextureCache::ReadbackWatchEnabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("SOTC_RB_TEX_WATCH");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+
+void TextureCache::NoteReadbackOverTexture(VAddr addr, u64 size, bool hot) {
+    static u64 hits = 0, bytes = 0;
+    std::scoped_lock lock{mutex};
+    const u64 tick = scheduler.CurrentTick();
+    ForEachImageInRegion(addr, size, [&](ImageId, Image& image) {
+        if (!image.info.props.is_block || True(image.flags & ImageFlagBits::GpuModified)) {
+            return;
+        }
+        const VAddr lo = std::max<VAddr>(addr, image.info.guest_address);
+        const VAddr hi = std::min<VAddr>(addr + size, image.info.guest_address + image.info.guest_size);
+        if (lo >= hi) {
+            return;
+        }
+        ++hits;
+        bytes += hi - lo;
+        if (hits <= 300 || hits % 1000 == 0) {
+            std::fprintf(stderr,
+                         "SOTC RB OVER TEXTURE #%llu: readback %#llx+%#llx%s writes %#llx bytes of "
+                         "image %#llx+%#llx %ux%u %s mips %u (flags %#x, used %llu ticks ago); "
+                         "%llu KiB in all\n",
+                         static_cast<unsigned long long>(hits),
+                         static_cast<unsigned long long>(addr), static_cast<unsigned long long>(size),
+                         hot ? " (hot)" : "", static_cast<unsigned long long>(hi - lo),
+                         static_cast<unsigned long long>(image.info.guest_address),
+                         static_cast<unsigned long long>(image.info.guest_size),
+                         image.info.size.width, image.info.size.height,
+                         vk::to_string(image.info.pixel_format).c_str(), image.info.resources.levels,
+                         u32(image.flags),
+                         static_cast<unsigned long long>(image.tick_accessed_last
+                                                             ? tick - image.tick_accessed_last
+                                                             : 0),
+                         static_cast<unsigned long long>(bytes >> 10));
+        }
+    });
+}
+
 bool TextureCache::PoolWatchEnabled() {
     static const bool on = [] {
         const char* v = std::getenv("SOTC_POOL_WATCH");
@@ -1950,6 +2001,10 @@ bool TextureCache::PoolWatchEnabled() {
     }();
     return on;
 }
+
+// sotc: src/probe.c (SOTC_POOL_FREE_TRACE): the game's release of a pool page, with its stack.
+extern "C" void runtime_pool_release_dump(uintptr_t page_addr, uintptr_t image_addr)
+    __attribute__((weak));
 
 void TextureCache::PoolWatch() {
     if (!PoolWatchEnabled()) {
@@ -1961,7 +2016,9 @@ void TextureCache::PoolWatch() {
         prev = std::move(now);
         return;
     }
-    constexpr VAddr PoolBase = 0x1000000000;
+    // Bit n is physical 0x100000 + n * 64 KiB (eboot 0x1abf0: VirtualQuery offset minus the
+    // base at eboot+0x2dfca70); the game maps physical p at 0x1000200000 + p.
+    constexpr VAddr PoolBase = 0x1000300000;
     constexpr u64 PageBytes = 64_KB;
     const u64 tick = scheduler.CurrentTick();
     static u64 freed_total = 0, alloc_total = 0, hits_total = 0, logged = 0, reused_total = 0;
@@ -2000,6 +2057,10 @@ void TextureCache::PoolWatch() {
                                  image.info.size.width, image.info.size.height,
                                  vk::to_string(image.info.pixel_format).c_str(),
                                  static_cast<unsigned long long>(tick - image.tick_accessed_last));
+                    // sotc: SOTC_POOL_FREE_TRACE=1: the game's call stack of that page's release
+                    if (runtime_pool_release_dump) {
+                        runtime_pool_release_dump(addr, image_addr);
+                    }
                 }
             });
         }

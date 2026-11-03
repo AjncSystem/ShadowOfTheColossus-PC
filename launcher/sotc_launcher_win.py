@@ -22,7 +22,13 @@ import subprocess
 import sys
 import threading
 import time
+import zipfile
 
+import sotc_frame
+import sotc_hardware
+import sotc_pad
+import sotc_search
+import sotc_theme as theme
 import sotc_update
 
 FROZEN = getattr(sys, 'frozen', False)
@@ -41,7 +47,7 @@ CONFIG_FILE = CONFIG_DIR / 'launcher_settings.json'
 from sotc_modes import GAMES  # noqa: E402
 GAME_ID = 'CUSA08809'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.70-opt12'
+VERSION = '0.71-opt13'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -137,13 +143,17 @@ def _(pt, en):
     return table.get(pt, en) if table else en
 
 
+sotc_search._ = sotc_pad._ = _  # their texts in the launcher's language
+
+
 def ui_font():
-    """Interface font: Segoe UI has no Chinese or Korean characters."""
-    return {'zh': 'Microsoft YaHei UI', 'ko': 'Malgun Gothic'}.get(LANG, 'Segoe UI')
+    """Interface font: Inter (sotc_theme), which, like Segoe UI, has no Chinese or Korean characters."""
+    return {'zh': 'Microsoft YaHei UI', 'ko': 'Malgun Gothic'}.get(LANG, theme.BODY)
 
 
 def title_font():
-    return {'zh': 'Microsoft YaHei UI', 'ko': 'Malgun Gothic'}.get(LANG, 'Georgia')
+    """Titles: Cinzel (sotc_theme) for Latin and Cyrillic-free text; Russian keeps Georgia."""
+    return {'zh': 'Microsoft YaHei UI', 'ko': 'Malgun Gothic', 'ru': 'Georgia'}.get(LANG, theme.HEAD)
 
 
 def windows_language():
@@ -160,15 +170,23 @@ def windows_language():
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
                 'user_dir': '', 'af16': True, 'textures': 'high', 'hdr': False, 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
-                'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'rb_hot': True, 'skip_logos': False, 'skip_film': False, 'close_on_play': False, 'gamepad': '', 'rumble': True,
+                'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'rb_hot': True, 'skip_logos': True, 'skip_film': False, 'close_on_play': False, 'gamepad': '', 'rumble': True,
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
-                'fx_fog': True, 'fx_ssao': True, 'engine_cvars': '', 'perf_culling': True,
+                'fx_fog': True, 'fx_ssao': True, 'fx_motionblur': False, 'engine_cvars': '', 'perf_culling': True,
                 'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'volume': '100', 'shadow_reuse': '0', 'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1', 'weed_distance': '1', 'weed_height': '1', 'grass_fade': '1', 'grass_detail': '0.25', 'library_dirs': [], 'keys': {},
-                'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'fg_hudless': False,
+                'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'fg_hudless': True,
                 'dlss_mode': 'quality', 'dlss_sharpen': '0', 'dlss_ui_sharpen': '3', 'dlss_sky_sharpen': '2',
-                'dlss_compare': False,
-                'check_updates': True, 'skip_version': ''}
+                'dlss_compare': False, 'hdr_sdr': False,
+                'check_updates': True, 'skip_version': '', 'play_mode': 'custom', 'exit_backup': True, 'news_seen': '', 'expert_view': False, 'windows_title_bar': False, 'game_monitor': '', 'minimize_to_tray': False}
+# sotc: improvements that changed a default, by the version that changed it. Settings saved by an
+# older launcher get them once when this one first loads them (load_settings). Every release that
+# changes a default for the better adds its entry here.
+DEFAULT_UPGRADES = [
+    # HUD and letters stop shaking with frame generation; no shadow trail in dark areas (motion
+    # blur); straight to the game.
+    ('0.71', {'fg_hudless': True, 'fx_motionblur': False, 'skip_logos': True}),
+]
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
 KEY_INPUTS = [
     ('move_up', 'W', ('Andar para frente', 'Move forward')), ('move_down', 'S', ('Andar para trás', 'Move back')),
@@ -241,6 +259,35 @@ GRASS_DETAIL = [('1', ('Como no PS4', 'As on PS4')),
 VOLUME = [('100', ('100% (original)', '100% (original)')), ('150', ('150%', '150%')),
           ('200', ('200%', '200%')), ('300', ('300% (máximo)', '300% (maximum)'))]
 VRAM_LIMITS = {'low': ('50', '1024'), 'normal': ('60', '1536'), 'high': ('75', '4096'), 'max': ('85', '0')}
+# Play modes (Jogar tab): each one sets the settings below; changing one of them by hand afterwards
+# makes the mode Custom. Extreme's upscaler is DLSS on an NVIDIA RTX card, FSR 1 on the others.
+PLAY_MODES = [('normal', ('Normal (PS4 puro)', 'Normal (plain PS4)')),
+              ('pro', ('Pro (PS4 Pro + qualidade)', 'Pro (PS4 Pro + quality)')),
+              ('extreme', ('Extremo (tudo no máximo)', 'Extreme (everything maxed)')),
+              ('custom', ('Personalizado', 'Custom'))]
+_PS4_GRASS = {'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1', 'weed_distance': '1',
+              'weed_height': '1', 'grass_fade': '1'}
+PLAY_MODE_VALUES = {
+    'normal': {'neo': False, 'fps_mode': '30', 'textures': 'high', 'af16': False, 'upscaler': 'fsr1',
+               'sharpness': '250', 'vram_use': 'normal', **_PS4_GRASS, 'grass_detail': '1'},
+    'pro': {'neo': True, 'fps_mode': '30', 'textures': 'high', 'af16': True, 'vram_use': 'high',
+            **_PS4_GRASS, 'grass_detail': '0.25'},
+    'extreme': {'neo': True, 'fps_mode': '60', 'textures': 'max', 'af16': True, 'vram_use': 'max',
+                'grass_shadows': '3', 'grass_distance': '2', 'grass_height': '1', 'weed_distance': '2',
+                'weed_height': '1', 'grass_fade': '1', 'grass_detail': '0.15', 'dlss_mode': 'quality'},
+}
+PLAY_MODE_HINTS = {
+    'normal': ('Como no PS4: 30 FPS, texturas altas, grama e sombras do console, sem o modo Pro.',
+               "As on PS4: 30 FPS, high textures, the console's grass and shadows, no Pro mode."),
+    'pro': ('Modo PS4 Pro a 30 FPS com texturas altas, filtro 16x e grama mais cheia.',
+            'PS4 Pro mode at 30 FPS with high textures, 16x filtering and fuller grass.'),
+    'extreme': ('Modo Pro a 60 FPS, texturas máximas, sombras e grama até mais longe, DLSS na RTX. '
+                'Pede uma placa forte (8 GB ou mais).',
+                'Pro mode at 60 FPS, maximum textures, shadows and grass farther out, DLSS on RTX. '
+                'Needs a strong card (8 GB or more).'),
+    'custom': ('Os ajustes abaixo e as outras abas ficam como você deixar.',
+               'The settings below and the other tabs stay as you set them.'),
+}
 
 
 def sdl_key_name(keysym):
@@ -274,7 +321,8 @@ def write_key_bindings(keys):
 EFFECTS = [('fx_vignette', ('Vinheta (cantos escurecidos)', 'Vignette (darkened corners)'),
             'r_vignetteOverrideEnable=1 r_vignetteEnable=0'),
            ('fx_fog', ('Névoa atmosférica', 'Atmospheric fog'), 'fog_enable=0'),
-           ('fx_ssao', ('Oclusão ambiente (SSAO)', 'Ambient occlusion (SSAO)'), 'AO_Mode=0')]
+           ('fx_ssao', ('Oclusão ambiente (SSAO)', 'Ambient occlusion (SSAO)'), 'AO_Mode=0'),
+           ('fx_motionblur', ('Motion blur (borrão de movimento)', 'Motion blur'), 'r_motionBlurEnable=0')]
 # Common screen sizes: 16:9, 16:10, 21:9 (ultrawide) and 32:9 (super ultrawide).
 # 5120x2160 is left out: the game faults at start (memory), 3840x2160 runs.
 SCREENS = [('1920x1080', '16:9, 1080p'), ('2560x1440', '16:9, 1440p'), ('3840x2160', '16:9, 4K'),
@@ -405,6 +453,17 @@ def supported_games():
     return ', '.join(f'{serial} {version}' for serial, (_region, version) in GAMES.items())
 
 
+def save_param(path):
+    """The title, subtitle and detail the port keeps for a save (<name>.sce_sys/param.bin, the
+    PS4 SaveDataParam: 128, 128 and 1024 bytes of UTF-8), or {}."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return {}
+    text = lambda a, b: data[a:b].split(b'\0')[0].decode('utf-8', 'replace').strip()
+    return {'MAINTITLE': text(0, 128), 'SUBTITLE': text(128, 256), 'DETAIL': text(256, 1280)} if len(data) >= 1280 else {}
+
+
 def user_dir(s):
     """The data folder (saves in savedata/1/<title id> below it: CUSA08809 EU, CUSA08034 US). A
     folder picked one level too deep (savedata itself, or a save folder) is taken back up to the
@@ -416,6 +475,11 @@ def user_dir(s):
     return folder
 
 
+# Shown in the side bar only in the expert view (the search finds them in both).
+EXPERT_PAGES = ('advanced', 'debug')
+NAV_ICONS = {'help': 'help', 'play': 'play', 'game': 'gameplay', 'saves': 'saves', 'graphics': 'display', 'controls': 'controls',
+             'advanced': 'advanced', 'debug': 'system'}
+SAVE_BACKUPS_KEPT = 10  # user/backups/saves-*.zip
 LOGS_KEPT = 5      # last_run.log and last_run.1.log ... last_run.4.log
 CRASH_LOGS_KEPT = 20
 
@@ -526,6 +590,29 @@ def short_path(path):
         return str(path)
 
 
+def _ps_quote(value):
+    """A PowerShell single-quoted string literal (no $ expansion; every quote PowerShell accepts doubled)."""
+    return "'" + ''.join(c * 2 if c in "'\u2018\u2019\u201a\u201b" else c for c in str(value)) + "'"
+
+
+def _shortcut_script(play, frozen, executable, port_dir, game_icon):
+    """PowerShell that creates the desktop shortcut: the launcher window, or with play the game directly
+    (--play, also usable as a non-Steam game in Steam)."""
+    if frozen:
+        target, arguments, icon = executable, '--play' if play else '', game_icon or f'{executable},0'
+    else:
+        pythonw = Path(executable).with_name('pythonw.exe')
+        target = pythonw if pythonw.exists() else executable
+        arguments = f'"{Path(port_dir) / "launcher" / "sotc_launcher_win.py"}"' + (' --play' if play else '')
+        icon = Path(port_dir) / 'launcher' / 'sotc.ico'
+    name = '\\Shadow of the Colossus (play).lnk' if play else '\\Shadow of the Colossus.lnk'
+    return ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath('Desktop')"
+            f"+{_ps_quote(name)});"
+            f'$s.TargetPath={_ps_quote(target)};$s.WorkingDirectory={_ps_quote(port_dir)};'
+            f'$s.IconLocation={_ps_quote(icon)};'
+            + (f'$s.Arguments={_ps_quote(arguments)};' if arguments else '') + '$s.Save()')
+
+
 def load_settings():
     """Saved settings over the defaults. Older settings that turned DLSS-G on with SOTC_DLSSG=1 in
     the extra variables get the frame generation setting instead."""
@@ -550,6 +637,14 @@ def load_settings():
         settings['fps_mode'] = '60' if saved.get('fps60') else '30'
     if 'textures' not in saved:  # before the levels: the "high quality textures" box
         settings['textures'] = 'high' if saved.get('hq_textures', True) else 'off'
+    # Rule: an update turns its improvements on in settings saved by an older version, once
+    # (DEFAULT_UPGRADES). A saved value would otherwise keep the old default for good.
+    if saved:
+        before = sotc_update.version_key(str(saved.get('settings_version') or '0'))
+        for version, values in DEFAULT_UPGRADES:
+            if before < sotc_update.version_key(version):
+                settings.update(values)
+    settings['settings_version'] = VERSION
     if 'framegen' not in saved:
         extra = str(settings.get('extra_env', '')).split()
         if 'SOTC_DLSSG=1' in extra:
@@ -588,6 +683,34 @@ def window_icon_file(s):
         return None
 
 
+def monitors():
+    """This PC's monitors: [(device name, label, (x, y) of its centre, primary)], the primary first."""
+    from ctypes import wintypes
+
+    class MONITORINFOEXW(ctypes.Structure):
+        _fields_ = [('size', wintypes.DWORD), ('monitor', wintypes.RECT), ('work', wintypes.RECT),
+                    ('flags', wintypes.DWORD), ('device', wintypes.WCHAR * 32)]
+    found = []
+    PROC = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(wintypes.RECT), ctypes.c_void_p)
+
+    def one(handle, _dc, _rect, _data):
+        info = MONITORINFOEXW()
+        info.size = ctypes.sizeof(info)
+        if ctypes.windll.user32.GetMonitorInfoW(ctypes.c_void_p(handle), ctypes.byref(info)):
+            r = info.monitor
+            found.append((info.device, r.right - r.left, r.bottom - r.top, ((r.left + r.right) // 2, (r.top + r.bottom) // 2),
+                          bool(info.flags & 1)))
+        return 1
+    try:
+        ctypes.windll.user32.EnumDisplayMonitors(None, None, PROC(one), None)
+    except (AttributeError, OSError):
+        return []
+    found.sort(key=lambda m: (not m[4], m[0]))
+    return [(device, '{} — {} × {}{}'.format(device.replace('\\\\.\\', '').replace('DISPLAY', _('Monitor ', 'Monitor ')),
+                                          w, h, _(' (principal)', ' (primary)') if primary else ''), centre, primary)
+            for device, w, h, centre, primary in found]
+
+
 def game_environment(s):
     env = dict(os.environ)
     info = game_info(s['game_dir'])
@@ -620,6 +743,11 @@ def game_environment(s):
     env['SOTC_FPS_LIMIT'] = '60' if fps_mode == '60' else '0'
     env['BB_VBLANK_HZ'] = '120'
     env['BB_FULLSCREEN'] = '1' if s['fullscreen'] else '0'
+    # The monitor the game window opens on (window.cpp): the centre of the chosen one, found again now
+    # (the monitors may have moved since it was chosen).
+    chosen = next((m for m in monitors() if m[0] == s.get('game_monitor')), None)
+    if chosen and not chosen[3]:
+        env['SOTC_MONITOR_AT'] = f'{chosen[2][0]},{chosen[2][1]}'
     env['BB_PRESENT_MODE'] = s['present_mode']
     if s['language']:
         env['BB_LANGUAGE'] = s['language']
@@ -712,6 +840,9 @@ def game_environment(s):
         env['SOTC_DLSS_SKY_SHARPEN'] = str(s.get('dlss_sky_sharpen') or '2')
         if s.get('dlss_compare'):
             env['SOTC_DLSS_COMPARE'] = '1'
+    # Upstream's SDR-to-HDR10 output (post_process.frag hdr 2); 'hdr' is the game's own HDR rendering.
+    if s.get('hdr_sdr'):
+        env['SOTC_HDR'] = '1'
     if s.get('sharpness') == 'off':
         env['BB_RCAS'] = '0'
     else:
@@ -785,11 +916,14 @@ def shadps4_saves(serial):
 # ---------------------------------------------------------------------------------------------
 # The window.
 
-BG, PANEL, CARD, LINE = '#0d0f10', '#14171a', '#1b1f23', '#2a3036'
-TEXT, MUTED, GOLD, ACCENT, ACCENT_HI = '#e6e2da', '#8f9499', '#d7c08a', '#3e5f73', '#4f7790'
+# Theme of the Forbidden Land: night stone, sunlight gold for titles, the sword's light (sigil blue)
+# for what is active.
+BG, PANEL, CARD, LINE = theme.DEEP, theme.BG, theme.CARD, theme.BORDER
+TEXT, MUTED, GOLD, ACCENT, ACCENT_HI = theme.TEXT, theme.MUTED, theme.GOLD_LIGHT, theme.SIGIL, theme.SIGIL_HOVER
+SIGIL = theme.SIGIL_LIGHT
 
 
-class Launcher:
+class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
     def __init__(self, root, tk, ttk, filedialog, messagebox):
         self.tk, self.ttk, self.filedialog, self.messagebox = tk, ttk, filedialog, messagebox
         self.root = root
@@ -804,9 +938,12 @@ class Launcher:
         root.title('Shadow of the Colossus — ' + _('port nativo', 'native port'))
         root.configure(bg=BG)
         self.dpi = root.winfo_fpixels('1i') / 96.0
-        root.geometry(f'{self.px(1080)}x{self.px(700)}')
+        # Tall enough for every quick setting when the screen has the room (the Play page scrolls otherwise).
+        height = min(self.px(820), root.winfo_screenheight() - self.px(80))
+        root.geometry(f'{self.px(1080)}x{max(self.px(620), height)}')
         root.minsize(self.px(940), self.px(620))
         self.set_icon()
+        theme.load_fonts(root)
         self.style()
         self.build()
         self.show('play')
@@ -815,6 +952,8 @@ class Launcher:
         if not self.app.get('setup_done') or not game_info(self.var('game_dir').get()):
             root.after(50, self.show_setup)
         root.protocol('WM_DELETE_WINDOW', self.close)
+        if self.app.get('setup_done') and self.app.get('news_seen') != VERSION:
+            root.after(600, self.show_news)
         root.after(100, self.drain_output)
         threading.Thread(target=self.detect_gpu, daemon=True).start()
         # sotc: self-update (sotc_update.py): the result of an update that just ran, then a check.
@@ -862,60 +1001,17 @@ class Launcher:
             return None
 
     # ---- look --------------------------------------------------------------------------------
-    def check_images(self):
-        """16 px (DPI-scaled) check box images with a tick: the clam theme draws a cross."""
-        n = max(14, int(16 * self.dpi))
-        images = []
-        for checked in (False, True):
-            image = self.tk.PhotoImage(width=n + self.px(8), height=n)  # unset pixels stay transparent
-            image.put(GOLD if checked else '#4a535b', to=(0, 0, n, n))
-            image.put(ACCENT if checked else CARD, to=(1, 1, n - 1, n - 1))
-            if checked:
-                x0, y0, x1, y1, x2, y2 = .22 * n, .52 * n, .42 * n, .72 * n, .78 * n, .28 * n
-                width = max(1, round(n / 9))
-                for t in range(40):
-                    f = t / 39
-                    for x, y in ((x0 + (x1 - x0) * f, y0 + (y1 - y0) * f), (x1 + (x2 - x1) * f, y1 + (y2 - y1) * f)):
-                        image.put('#f4f1ea', to=(int(x), int(y), int(x) + width, int(y) + width))
-            images.append(image)
-        self.check_off, self.check_on = images
-
     def style(self):
+        """The theme's widgets (sotc_theme: rounded buttons and fields, switches, the Play button),
+        then the launcher's own labels."""
         ttk = self.ttk
         s = ttk.Style(self.root)
-        s.theme_use('clam')
-        self.check_images()
-        s.element_create('Sotc.indicator', 'image', self.check_off, ('selected', self.check_on), sticky='')
-        s.layout('TCheckbutton', [('Checkbutton.padding', {'sticky': 'nswe', 'children': [
-            ('Sotc.indicator', {'side': 'left', 'sticky': ''}),
-            ('Checkbutton.focus', {'side': 'left', 'sticky': 'w', 'children': [
-                ('Checkbutton.label', {'sticky': 'nswe'})]})]})])
-        base = (ui_font(), 10)
-        self.root.option_add('*TCombobox*Listbox.background', CARD)
-        self.root.option_add('*TCombobox*Listbox.foreground', TEXT)
-        self.root.option_add('*TCombobox*Listbox.selectBackground', ACCENT)
-        self.root.option_add('*TCombobox*Listbox.font', base)
-        s.configure('.', background=PANEL, foreground=TEXT, fieldbackground=CARD, bordercolor=LINE,
-                    lightcolor=LINE, darkcolor=LINE, troughcolor=CARD, focuscolor=GOLD, font=base)
-        s.configure('TFrame', background=PANEL)
-        s.configure('TLabel', background=PANEL, foreground=TEXT)
+        self.theme = theme.Theme(self.root, self.dpi)
+        self.theme.style(s)
+        s.configure('TLabel', background=PANEL, foreground=TEXT, font=(ui_font(), 10))
         s.configure('Muted.TLabel', background=PANEL, foreground=MUTED, font=(ui_font(), 9))
         s.configure('Section.TLabel', background=PANEL, foreground=GOLD, font=(title_font(), 13))
-        s.configure('TCheckbutton', background=PANEL, foreground=TEXT, padding=(0, 3), indicatorbackground=CARD,
-                    indicatorforeground=GOLD)
-        s.map('TCheckbutton', background=[('active', PANEL)], indicatorbackground=[('selected', ACCENT)])
-        s.configure('Warning.TLabel', background='#2a2312', foreground='#e3c25a', padding=(10, 6))
-        s.configure('TCombobox', arrowcolor=GOLD, foreground=TEXT, padding=4)
-        s.map('TCombobox', fieldbackground=[('readonly', CARD)], foreground=[('readonly', TEXT)],
-              selectbackground=[('readonly', CARD)], selectforeground=[('readonly', TEXT)])
-        s.configure('TEntry', foreground=TEXT, insertcolor=TEXT, padding=4)
-        s.configure('TButton', background=CARD, foreground=TEXT, padding=(12, 6), borderwidth=1)
-        s.map('TButton', background=[('active', LINE), ('disabled', PANEL)], foreground=[('disabled', MUTED)])
-        s.configure('Play.TButton', background=ACCENT, foreground='#f4f1ea', font=(title_font(), 15, 'bold'),
-                    padding=(36, 10), borderwidth=0)
-        s.map('Play.TButton', background=[('active', ACCENT_HI), ('disabled', '#263038')],
-              foreground=[('disabled', '#7d858c')])
-        s.configure('Vertical.TScrollbar', background=CARD, arrowcolor=GOLD, troughcolor=PANEL, bordercolor=PANEL)
+        s.configure('Warning.TLabel', background='#1e1a12', foreground='#e0b866', padding=(10, 6))
 
     # ---- widget helpers ----------------------------------------------------------------------
     def var(self, key):
@@ -939,6 +1035,7 @@ class Launcher:
         show()
         box.bind('<<ComboboxSelected>>', lambda _e: var.set(values[box.current()]))
         var.trace_add('write', show)
+        box.sotc_key = key  # the search's words for the setting (row)
         return box
 
     def next_row(self, parent):
@@ -947,8 +1044,10 @@ class Launcher:
     def row(self, parent, title, widget, hint=None):
         ttk = self.ttk
         r = self.next_row(parent)
-        ttk.Label(parent, text=title).grid(row=r, column=0, sticky='nw', padx=(0, 18), pady=(8, 0))
+        label = ttk.Label(parent, text=title)
+        label.grid(row=r, column=0, sticky='nw', padx=(0, 18), pady=(8, 0))
         widget.grid(row=r, column=1, sticky='w', pady=(5, 0))
+        self.index_entry(label, title, hint or '', getattr(widget, 'sotc_key', None))
         if hint:
             ttk.Label(parent, text=hint, style='Muted.TLabel', wraplength=self.px(560), justify='left').grid(
                 row=r + 1, column=1, sticky='w', pady=(2, 2))
@@ -957,7 +1056,9 @@ class Launcher:
     def check(self, parent, key, title, hint=None):
         ttk = self.ttk
         r = self.next_row(parent)
-        ttk.Checkbutton(parent, text=title, variable=self.var(key)).grid(row=r, column=0, columnspan=2, sticky='w', pady=(4, 0))
+        box = ttk.Checkbutton(parent, text=title, variable=self.var(key))
+        box.grid(row=r, column=0, columnspan=2, sticky='w', pady=(4, 0))
+        self.index_entry(box, title, hint or '', key)
         if hint:
             ttk.Label(parent, text=hint, style='Muted.TLabel', wraplength=self.px(640), justify='left').grid(
                 row=r + 1, column=0, columnspan=2, sticky='w', padx=(26, 0))
@@ -967,8 +1068,11 @@ class Launcher:
             row=self.next_row(parent), column=0, columnspan=2, sticky='w', pady=(top, 0))
 
     def section(self, parent, title, top=18):
-        self.ttk.Label(parent, text=title, style='Section.TLabel').grid(
-            row=self.next_row(parent), column=0, columnspan=2, sticky='w', pady=(top, 2))
+        r = self.next_row(parent)
+        label = self.ttk.Label(parent, text=title, style='Section.TLabel')
+        label.grid(row=r, column=0, columnspan=2, sticky='w', pady=(top, 2))
+        self.index_entry(label, title)
+        self.tk.Frame(parent, bg=LINE, height=1).grid(row=r + 1, column=0, columnspan=2, sticky='we', pady=(0, 4))
 
     def window_icon_row(self, parent):
         """The game window's icon: the game's (empty) or a picture of the player's choice."""
@@ -1009,6 +1113,7 @@ class Launcher:
             user_dir(self.app) if key == 'user_dir' else PORT_DIR))).pack(side='left', padx=(6, 0))
         if on_change:
             var.trace_add('write', lambda *_a: on_change())
+        holder.sotc_key = key
         return self.row(parent, title, holder, hint)
 
     def scrolled_page(self, name, title, subtitle):
@@ -1016,8 +1121,9 @@ class Launcher:
         outer = ttk.Frame(self.content)
         head = ttk.Frame(outer, padding=(28, 22, 28, 6))
         head.pack(fill='x')
-        ttk.Label(head, text=title, background=PANEL, foreground=TEXT, font=(title_font(), 20)).pack(anchor='w')
-        ttk.Label(head, text=subtitle, style='Muted.TLabel').pack(anchor='w')
+        ttk.Label(head, text=title, background=PANEL, foreground=GOLD, font=(title_font(), 22)).pack(anchor='w')
+        ttk.Label(head, text=subtitle, style='Muted.TLabel').pack(anchor='w', pady=(2, 8))
+        tk.Frame(head, bg=LINE, height=1).pack(fill='x')
         canvas = tk.Canvas(outer, bg=PANEL, highlightthickness=0, bd=0)
         bar = ttk.Scrollbar(outer, orient='vertical', command=canvas.yview)
         inner = ttk.Frame(canvas, padding=(28, 0, 28, 24))
@@ -1029,31 +1135,57 @@ class Launcher:
         bar.pack(side='right', fill='y')
         canvas.pack(side='left', fill='both', expand=True)
         outer.scroll = lambda units: canvas.yview_scroll(units, 'units') if inner.winfo_height() > canvas.winfo_height() else None
+        outer.canvas, outer.inner = canvas, inner  # the search scrolls to a setting (jump)
         self.pages[name] = outer
+        self.building_page = name
+        self.page_titles[name] = title
         return inner
 
     # ---- layout ------------------------------------------------------------------------------
     def build(self):
         tk, ttk = self.tk, self.ttk
+        self.custom_frame, self.tray = None, None
+        self.titlebar = None if self.app.get('windows_title_bar') else self.build_titlebar()
+        self.root.bind('<Unmap>', self.minimized, add='+')
         side = tk.Frame(self.root, bg=BG, width=self.px(220))
         side.pack(side='left', fill='y')
         side.pack_propagate(False)
-        tk.Label(side, text='SHADOW OF\nTHE COLOSSUS', bg=BG, fg=GOLD, font=(title_font(), 15), justify='left').pack(
-            anchor='w', padx=22, pady=(24, 0))
+        tk.Label(side, text='SHADOW OF\nTHE COLOSSUS', bg=BG, fg=GOLD, font=(title_font(), 16), justify='left').pack(
+            anchor='w', padx=22, pady=(26, 0))
+        tk.Frame(side, bg=GOLD, height=1, width=self.px(46)).pack(anchor='w', padx=22, pady=(10, 8))
         tk.Label(side, text=_('port nativo · Windows', 'native port · Windows') + f'  ·  v{VERSION}', bg=BG, fg=MUTED,
-                 font=(ui_font(), 9)).pack(anchor='w', padx=22, pady=(2, 20))
+                 font=(ui_font(), 9)).pack(anchor='w', padx=22, pady=(0, 14))
+        self.page_titles = {}
+        self.build_search(side)
+        # The pages as in the bloodborne_pc launcher: a thin line icon, a card behind the current
+        # page with the sword's light at its left edge, a softer card under the mouse.
         self.nav, self.current_page = {}, None
-        for name, title in (('play', _('Jogar', 'Play')), ('game', _('Jogo e saves', 'Game & saves')),
+        px, width, height = self.px, 196, 38
+        self.nav_pills = {'on': self.theme.box(width, height, 8, CARD, LINE, bg=BG),
+                          'hover': self.theme.box(width, height, 8, theme.SURFACE, bg=BG)}
+        accent = self.theme.box(3, 18, 1.5, SIGIL, bg=CARD)
+        for name, title in (('play', _('Jogar', 'Play')), ('game', _('Jogo', 'Game')), ('saves', _('Saves', 'Saves')),
                             ('graphics', _('Imagem e FPS', 'Display & FPS')), ('controls', _('Controles', 'Controls')),
-                            ('advanced', _('Avançado', 'Advanced')), ('debug', _('Debug', 'Debug'))):
-            item = tk.Label(side, text='    ' + title, bg=BG, fg=TEXT, anchor='w', font=(ui_font(), 11),
-                            pady=10, cursor='hand2')
-            item.pack(fill='x')
-            item.bind('<Button-1>', lambda _e, n=name: self.show(n))
-            item.bind('<Enter>', lambda _e, n=name: n != self.current_page and self.nav[n].configure(bg='#171b1f'))
-            item.bind('<Leave>', lambda _e, n=name: n != self.current_page and self.nav[n].configure(bg=BG))
-            self.nav[name] = item
+                            ('help', _('Ajuda', 'Help')), ('advanced', _('Avançado', 'Advanced')),
+                            ('debug', _('Debug', 'Debug'))):
+            c = tk.Canvas(side, width=px(width), height=px(height), bg=BG, highlightthickness=0, bd=0, cursor='hand2')
+            c.pack(padx=px(12), pady=(0, px(2)))
+            mid = px(height / 2)
+            items = {'pill': c.create_image(0, 0, anchor='nw', state='hidden'),
+                     'bar': c.create_image(px(1), mid, anchor='w', image=accent, state='hidden'),
+                     'icon': c.create_text(px(22), mid, text=theme.ICON[NAV_ICONS[name]], font=(theme.ICONS, 12)),
+                     'label': c.create_text(px(44), mid, text=title, anchor='w',
+                                              font=(theme.BODY_MEDIUM if LANG not in ('zh', 'ko') else ui_font(), 10))}
+            c.bind('<Button-1>', lambda _e, n=name: self.show(n))
+            c.bind('<Enter>', lambda _e, n=name: self.nav_paint(n, hover=True))
+            c.bind('<Leave>', lambda _e, n=name: self.nav_paint(n))
+            self.nav[name] = (c, items)
+            self.nav_paint(name)
+        self.nav_end = tk.Frame(side, bg=BG)  # the entries are packed above it (apply_view)
+        self.nav_end.pack(fill='x')
         tk.Frame(side, bg=BG).pack(fill='both', expand=True)
+        ttk.Checkbutton(side, text=_('Visão avançada', 'Expert view'), variable=self.var('expert_view'),
+                        style='Bar.TCheckbutton', command=self.apply_view).pack(anchor='w', padx=22, pady=(0, 10))
         for text, command in ((_('Registro do jogo', 'Game log'), lambda: self.show('log')),
                               (_('Procurar atualização', 'Check for updates'), lambda: self.check_updates(True)),
                               (_('Configurar de novo', 'Set up again'), self.show_setup)):
@@ -1066,25 +1198,34 @@ class Launcher:
         right.pack(side='left', fill='both', expand=True)
         bar = tk.Frame(right, bg=BG, height=self.px(72))
         bar.pack(fill='x', side='bottom')
+        tk.Frame(right, bg=LINE, height=1).pack(fill='x', side='bottom')
         bar.pack_propagate(False)
-        self.status = tk.Label(bar, text='', bg=BG, fg=MUTED, font=(ui_font(), 10), anchor='w', justify='left')
-        self.status.pack(side='left', padx=24)
         self.play_button = ttk.Button(bar, text=_('JOGAR', 'PLAY'), style='Play.TButton', command=self.play)
         self.play_button.pack(side='right', padx=(10, 24), pady=11)
         self.stop_button = ttk.Button(bar, text=_('Parar', 'Stop'), command=self.stop, state='disabled')
         self.stop_button.pack(side='right', pady=11)
+        ttk.Button(bar, text=_('Relatório', 'Report'), command=self.save_report).pack(side='right', padx=(0, 8), pady=11)
+        # Packed after the buttons: on a narrow window the summary wraps instead of pushing them out.
+        self.status = tk.Label(bar, text='', bg=BG, fg=MUTED, font=(ui_font(), 10), anchor='w', justify='left')
+        self.status.pack(side='left', fill='x', expand=True, padx=(24, 12))
+        self.status.bind('<Configure>', lambda e: self.status.configure(wraplength=max(self.px(120), e.width)))
         self.content = tk.Frame(right, bg=PANEL)
         self.content.pack(fill='both', expand=True)
 
         self.pages = {}
         self.build_play()
         self.build_game()
+        self.build_saves()
         self.build_graphics()
         self.build_controls()
+        self.build_help()
         self.build_advanced()
         self.build_debug()
         self.build_log()
         self.root.bind_all('<MouseWheel>', self.wheel)
+        self.page_titles['log'] = _('Registro do jogo', 'Game log')
+        self.search_ready(self.page_titles)
+        self.apply_view()
         self.refresh_status()
 
     def wheel(self, event):
@@ -1098,19 +1239,162 @@ class Launcher:
             page.pack_forget()
         self.pages[name].pack(fill='both', expand=True)
         self.current_page = name
-        for n, item in self.nav.items():
-            item.configure(bg=PANEL if n == name else BG, fg=GOLD if n == name else TEXT)
+        for n in self.nav:
+            self.nav_paint(n)
+        if name == 'controls':  # the controller test reads only while its page is shown
+            self.pad_start()
+        else:
+            self.pad_stop()
+        if hasattr(self, 'nav_end'):  # an expert page found by the search shows its entry meanwhile
+            self.apply_view()
         if name == 'play':
             self.refresh_status()
+
+    TITLE_ICONS = {'minimize': '\ue921', 'maximize': '\ue922', 'restore': '\ue923', 'close': '\ue8bb'}
+
+    def build_titlebar(self):
+        """The launcher's own title bar, as in the bloodborne_pc launcher: a drag area in the side
+        bar's colour and the window's three buttons. Windows' caption goes once the window exists
+        (window_chrome, sotc_frame)."""
+        tk, px = self.tk, self.px
+        bar = tk.Frame(self.root, bg=BG, height=px(32))
+        bar.pack(side='top', fill='x')
+        bar.pack_propagate(False)
+        self.title_buttons = {}
+        for name, command, hover in (('close', self.close, '#8a1c1c'),
+                                     ('maximize', self.toggle_maximized, theme.SURFACE),
+                                     ('minimize', self.root.iconify, theme.SURFACE)):
+            cell = tk.Frame(bar, bg=BG, width=px(46), height=px(32))
+            cell.pack(side='right')
+            cell.pack_propagate(False)
+            glyph = tk.Label(cell, text=self.TITLE_ICONS[name], bg=BG, fg=theme.TEXT_SOFT, font=(theme.ICONS, 9))
+            glyph.pack(fill='both', expand=True)
+
+            def paint(on, cell=cell, glyph=glyph, hover=hover, name=name):
+                cell.configure(bg=hover if on else BG)
+                glyph.configure(bg=hover if on else BG,
+                                fg=theme.TEXT_STRONG if on and name == 'close' else TEXT if on else theme.TEXT_SOFT)
+            for widget in (cell, glyph):
+                widget.bind('<Enter>', lambda _e, paint=paint: paint(True))
+                widget.bind('<Leave>', lambda _e, paint=paint: paint(False))
+                widget.bind('<ButtonRelease-1>', lambda e, command=command, cell=cell, glyph=glyph:
+                            command() if e.widget.winfo_containing(e.x_root, e.y_root) in (cell, glyph) else None)
+            self.title_buttons[name] = glyph
+        self.root.bind('<Configure>', lambda e: self.title_state() if e.widget is self.root else None, add='+')
+        self.root.after(100, self.window_chrome)
+        return bar
+
+    def minimized(self, event):
+        """Minimized, with "Minimize to the system tray" on: off the task bar, an icon in the tray."""
+        if event.widget is self.root and self.var('minimize_to_tray').get():
+            self.root.after(1, self.to_tray)
+
+    def to_tray(self):
+        if self.root.state() != 'iconic':
+            return
+        try:
+            if self.tray is None:
+                import sotc_tray
+                self.tray = sotc_tray.Tray(PORT_DIR / 'launcher' / 'sotc.ico', 'Shadow of the Colossus', self.bring_back,
+                                           self.quit_from_tray, (_('Abrir', 'Open'), _('Sair', 'Quit')), root=self.root)
+            if self.tray.show():
+                self.root.withdraw()
+        except OSError:
+            pass  # no tray: it stays on the task bar
+
+    def bring_back(self):
+        if self.tray:
+            self.tray.hide()
+        self.root.deiconify()
+        self.root.state('normal')
+        self.root.lift()
+        self.root.focus_force()
+
+    def quit_from_tray(self):
+        self.bring_back()
+        self.close()
+
+    def toggle_maximized(self):
+        self.root.state('normal' if self.root.state() == 'zoomed' else 'zoomed')
+
+    def title_state(self):
+        """The maximize button follows the window's state; Windows learns where the bar is."""
+        if not getattr(self, 'title_buttons', None):
+            return
+        glyph = self.TITLE_ICONS['restore' if self.root.state() == 'zoomed' else 'maximize']
+        if self.title_buttons['maximize'].cget('text') != glyph:
+            self.title_buttons['maximize'].configure(text=glyph)
+        if self.custom_frame:  # where Windows finds the caption and the buttons (physical pixels)
+            self.custom_frame.bar = self.titlebar.winfo_height()
+            self.custom_frame.buttons = sum(cell.master.winfo_width() for cell in self.title_buttons.values())
+            self.custom_frame.edge, self.custom_frame.corner = self.px(5), self.px(10)
+
+    def window_chrome(self):
+        """Windows' caption off (sotc_frame), the frame dark; Windows' caption back when that fails."""
+        try:
+            hwnd = int(self.root.wm_frame(), 16)
+            if hwnd == self.root.winfo_id() and getattr(self, 'chrome_waits', 0) < 100:
+                self.chrome_waits = getattr(self, 'chrome_waits', 0) + 1  # not wrapped by Tk yet
+                self.root.after(50, self.window_chrome)
+                return
+            dwm = ctypes.windll.dwmapi
+
+            def attribute(number, value):
+                v = ctypes.c_int(value)
+                return dwm.DwmSetWindowAttribute(hwnd, number, ctypes.byref(v), ctypes.sizeof(v))
+            if attribute(20, 1):  # DWMWA_USE_IMMERSIVE_DARK_MODE; 19 before Windows 10 20H1
+                attribute(19, 1)
+            attribute(34, 0x000e0c0a)  # DWMWA_BORDER_COLOR (Windows 11): the side bar's dark
+            if self.titlebar is not None and self.custom_frame is None:
+                frame = sotc_frame.Frame(hwnd, [self.root.winfo_id(), self.titlebar.winfo_id()])
+                self.custom_frame = frame if frame.install() else False
+                if not self.custom_frame:
+                    self.titlebar.pack_forget()
+                self.title_state()
+        except (AttributeError, OSError, ValueError, self.tk.TclError):
+            pass
+
+    def apply_view(self):
+        """The side bar's entries: the expert pages only in the expert view."""
+        expert = self.var('expert_view').get()
+        for name, (c, _items) in self.nav.items():
+            c.pack_forget()
+        for name, (c, _items) in self.nav.items():
+            if expert or name not in EXPERT_PAGES or name == self.current_page:
+                c.pack(padx=self.px(12), pady=(0, self.px(2)), before=self.nav_end)
+
+    def nav_paint(self, name, hover=False):
+        """A side bar entry: a card behind the current page, a softer one under the mouse."""
+        c, items = self.nav[name]
+        on = name == self.current_page
+        pill = self.nav_pills['on'] if on else self.nav_pills['hover'] if hover else ''
+        c.itemconfigure(items['pill'], image=pill, state='normal' if pill else 'hidden')
+        c.itemconfigure(items['bar'], state='normal' if on else 'hidden')
+        c.itemconfigure(items['icon'], fill=GOLD if on else theme.TEXT_SOFT if hover else MUTED)
+        c.itemconfigure(items['label'], fill=theme.TEXT_STRONG if on else TEXT if hover else theme.TEXT_SOFT)
 
     def build_play(self):
         tk, ttk = self.tk, self.ttk
         page = tk.Frame(self.content, bg=PANEL)
         self.pages['play'] = page
-        self.banner = tk.Canvas(page, height=self.px(290), bg=BG, highlightthickness=0, bd=0)
+        self.building_page = 'play'
+        self.page_titles['play'] = _('Jogar', 'Play')
+        # The banner and the settings scroll together when the window is shorter than them.
+        canvas = tk.Canvas(page, bg=PANEL, highlightthickness=0, bd=0)
+        bar = ttk.Scrollbar(page, orient='vertical', command=canvas.yview)
+        inner = tk.Frame(canvas, bg=PANEL)
+        window = canvas.create_window(0, 0, window=inner, anchor='nw')
+        inner.bind('<Configure>', lambda _e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>', lambda e: canvas.itemconfigure(window, width=e.width))
+        canvas.configure(yscrollcommand=bar.set)
+        bar.pack(side='right', fill='y')
+        canvas.pack(side='left', fill='both', expand=True)
+        page.scroll = lambda units: canvas.yview_scroll(units, 'units') if inner.winfo_height() > canvas.winfo_height() else None
+        page.canvas, page.inner = canvas, inner  # the search scrolls to a setting (jump)
+        self.banner = tk.Canvas(inner, height=self.px(290), bg=BG, highlightthickness=0, bd=0)
         self.banner.pack(fill='x')
         self.banner.bind('<Configure>', lambda _e: self.draw_banner())
-        body = ttk.Frame(page, padding=(28, 12, 28, 8))
+        body = ttk.Frame(inner, padding=(28, 12, 28, 8))
         body.pack(fill='both', expand=True)
         body.columnconfigure(0, weight=3)
         body.columnconfigure(1, weight=2)
@@ -1125,6 +1409,9 @@ class Launcher:
         quick.grid(row=0, column=1, sticky='nw')
         ttk.Label(quick, text=_('Ajustes rápidos', 'Quick settings'), style='Section.TLabel').grid(
             row=0, column=0, columnspan=2, sticky='w', pady=(0, 2))
+        self.row(quick, _('Modo de jogo', 'Play mode'), self.choice(quick, 'play_mode', PLAY_MODES, 24))
+        self.play_mode_hint = ttk.Label(quick, text='', style='Muted.TLabel', wraplength=self.px(300), justify='left')
+        self.play_mode_hint.grid(row=self.next_row(quick), column=0, columnspan=2, sticky='w', pady=(2, 2))
         self.row(quick, _('Saída', 'Output'), self.choice(quick, 'output_res', OUTPUTS, 24))
         self.row(quick, _('Upscaler', 'Upscaler'), self.choice(quick, 'upscaler', UPSCALERS, 24))
         self.row(quick, _('Nitidez (RCAS)', 'Sharpening (RCAS)'), self.choice(quick, 'sharpness', SHARPNESS, 24))
@@ -1139,51 +1426,84 @@ class Launcher:
                                       'More FPS: fast GPU readbacks (experimental)'))
         for key in ('af16', 'textures', 'fps_mode', 'hdr', 'fullscreen', 'neo', 'output_res', 'upscaler', 'sharpness', 'framegen'):
             self.vars[key].trace_add('write', lambda *_a: self.refresh_status())
+        self.applying_mode = False
+        self.var('play_mode').trace_add('write', lambda *_a: self.apply_play_mode())
+        for key in {k for values in PLAY_MODE_VALUES.values() for k in values} | {'upscaler'}:
+            self.var(key).trace_add('write', lambda *_a, k=key: self.play_mode_edited(k))
+        self.show_play_mode_hint()
+
+    def play_mode_values(self, mode):
+        values = dict(PLAY_MODE_VALUES.get(mode, {}))
+        if mode == 'extreme':
+            name = getattr(self, 'gpu_name', '').upper()
+            values['upscaler'] = 'dlss' if 'NVIDIA' in name and 'RTX' in name else 'fsr1'
+        return values
+
+    def show_play_mode_hint(self):
+        self.play_mode_hint.configure(text=_(*PLAY_MODE_HINTS.get(self.var('play_mode').get(), ('', ''))))
+
+    def apply_play_mode(self):
+        """The chosen mode's settings (Custom changes nothing)."""
+        self.show_play_mode_hint()
+        values = self.play_mode_values(self.var('play_mode').get())
+        self.applying_mode = True
+        try:
+            for key, value in values.items():
+                self.var(key).set(value)
+        finally:
+            self.applying_mode = False
+
+    def play_mode_edited(self, key):
+        """A setting of the mode changed by hand: the mode becomes Custom."""
+        if self.applying_mode:
+            return
+        mode = self.var('play_mode').get()
+        values = self.play_mode_values(mode)
+        if key in values and str(self.var(key).get()) != str(values[key]):
+            self.applying_mode = True
+            try:
+                self.var('play_mode').set('custom')
+                self.show_play_mode_hint()
+            finally:
+                self.applying_mode = False
 
     def draw_banner(self):
-        """The dump's own art (sce_sys/pic1.png) under the title."""
-        tk, c = self.tk, self.banner
+        """The dump's own art (sce_sys/pic1.png), darker on the left and fading into the page
+        (sotc_theme.hero), the game and its version under the title."""
+        c = self.banner
         c.delete('all')
         w, h = max(c.winfo_width(), 400), int(c['height'])
         art = Path(self.var('game_dir').get() or '.') / 'sce_sys' / 'pic1.png'
         if self.banner_source != art:
-            self.banner_source, self.banner_image, self.banner_size = art, None, None
+            self.banner_source, self.banner_image = art, None
             try:
-                self.banner_image = tk.PhotoImage(file=str(art))
-            except (tk.TclError, OSError):
+                from PIL import Image
+                with Image.open(art) as image:
+                    self.banner_image = image.convert('RGBA')
+            except (ImportError, OSError):
                 pass
-        if self.banner_image:
-            if self.banner_size != w:
-                self.banner_size, self.banner_scaled = w, self.scaled_art(art, w)
-            c.create_image(w // 2, int(h * 0.5), image=self.banner_scaled)
-            for i, stipple in enumerate(('gray12', 'gray25', 'gray50', 'gray75')):
-                c.create_rectangle(0, h - 120 + i * 24, w, h - 96 + i * 24, fill=PANEL, outline='', stipple=stipple)
-            c.create_rectangle(0, h - 24, w, h, fill=PANEL, outline='')
+        if self.banner_image is not None:
+            self.banner_photo = self.theme.cached(('hero', str(art), w, h),
+                                                  lambda: theme.hero(self.banner_image, (w, h), PANEL))
+            c.create_image(0, 0, image=self.banner_photo, anchor='nw')
+            c.create_text(33, h - 74, text='Shadow of the Colossus', anchor='w', fill=theme.TEXT_STRONG,
+                          font=(title_font(), 26))
         else:
-            c.create_text(30, h - 80, text='Shadow of the Colossus', anchor='w', fill='#f2ead9', font=(title_font(), 32))
+            c.create_text(30, h - 80, text='Shadow of the Colossus', anchor='w', fill=theme.TEXT_STRONG,
+                          font=(title_font(), 30))
             c.create_text(w // 2, h // 2 - 40, text=_('Escolha a pasta do jogo (Jogo e saves)',
                                                        'Choose your game folder (Game & saves)'),
                           fill=MUTED, font=(ui_font(), 11))
         info = game_info(self.var('game_dir').get())
         sub = (_('{} · versão do jogo {}', '{} · game version {}').format(*info) if info
                else _('Pasta do jogo não escolhida', 'Game folder not set'))
-        c.create_text(33, h - 30, text=sub, anchor='w', fill=GOLD, font=(ui_font(), 11))
-
-    def scaled_art(self, path, width):
-        try:
-            from PIL import Image, ImageTk
-            with Image.open(path) as image:
-                height = round(image.height * width / image.width)
-                return ImageTk.PhotoImage(image.convert('RGB').resize((width, height), Image.LANCZOS))
-        except (ImportError, OSError):
-            factor = max(1, round(self.banner_image.width() / max(width, 1)))
-            return self.banner_image.subsample(factor) if factor > 1 else self.banner_image
+        c.create_text(35, h - 38, text=sub, anchor='w', fill=GOLD, font=(ui_font(), 11))
 
     def build_game(self):
         ttk = self.ttk
-        f = self.scrolled_page('game', _('Jogo e saves', 'Game & saves'),
-                               _('O seu dump do jogo, os módulos de som do seu console e a pasta dos saves.',
-                                 'Your game dump, your console\'s sound modules and the saves folder.'))
+        f = self.scrolled_page('game', _('Jogo', 'Game'),
+                               _('O seu dump do jogo, a atualização, as DLCs e os módulos de som do seu console.',
+                                 'Your game dump, the update, the DLC and your console\'s sound modules.'))
         self.section(f, _('Biblioteca de jogos', 'Game library'), top=4)
         self.note(f, _('Como no shadPS4: adicione as pastas onde ficam os seus jogos e escolha o Shadow of the '
                        'Colossus na lista (duplo clique).',
@@ -1246,17 +1566,6 @@ class Launcher:
                       "shadPS4's addcont folder (which holds the CUSA08809 or CUSA08034 subfolder). Only DLC of the "
                       "game's region counts. Empty = no DLC."),
                     on_change=self.refresh_status)
-        self.section(f, _('Saves', 'Saves'))
-        self.folder(f, 'user_dir', _('Pasta de dados', 'Data folder'), _('Pasta dos saves', 'Saves folder'),
-                    _('Saves, cache de shaders e capturas. Vazio = a pasta user ao lado do port.',
-                      'Saves, shader cache and screenshots. Empty = the user folder next to the port.'),
-                    on_change=self.refresh_status)
-        holder = ttk.Frame(f)
-        holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(10, 0))
-        ttk.Button(holder, text=_('Importar save do shadPS4…', 'Import a shadPS4 save…'), command=self.import_save).pack(side='left')
-        ttk.Label(holder, text=_('Copia a pasta savedata/CUSA08809 (ou CUSA08034) do shadPS4 para cá.',
-                                 'Copies shadPS4\'s savedata/CUSA08809 (or CUSA08034) folder here.'),
-                  style='Muted.TLabel').pack(side='left', padx=10)
         self.section(f, _('Sistema', 'System'))
         self.row(f, _('Idioma do sistema', 'System language'), self.choice(f, 'language', LANGUAGES),
                  _('O idioma que o jogo vê no "console".', 'The language the game sees on the "console".'))
@@ -1440,15 +1749,28 @@ class Launcher:
         self.note(f, _('O motion blur, o brilho e os filtros ficam no menu do próprio jogo (Opções > Apresentação).',
                        "Motion blur, brightness and filters are in the game's own menu (Options > Presentation)."), top=4)
         self.section(f, _('Tela', 'Display'))
+        screens = [('', (_('Principal', 'Primary'),) * 2)] + [(m[0], (m[1],) * 2) for m in monitors() if not m[3]]
+        if len(screens) > 1 or self.var('game_monitor').get():
+            self.row(f, _('Monitor do jogo', 'Game monitor'), self.choice(f, 'game_monitor', screens),
+                     _('Em qual monitor a janela do jogo abre (e a tela cheia). Vale na próxima vez que o jogo abrir.',
+                       'Which monitor the game window opens on (fullscreen too). Applies the next time the game starts.'))
         self.check(f, 'fullscreen', _('Tela cheia', 'Fullscreen'))
         self.row(f, _('Apresentação', 'Presentation'), self.choice(f, 'present_mode', PRESENT_MODES))
+        self.check(f, 'hdr_sdr', _('HDR da imagem SDR (experimental)', 'HDR from the SDR image (experimental)'),
+                   _('Saída HDR10 a partir da imagem do jogo. Precisa de HDR ligado no Windows e de um monitor '
+                     'HDR; sem isso nada muda. Ajustes: SOTC_HDR_PAPER e SOTC_HDR_GAIN em "Variáveis extras".',
+                     'HDR10 output from the game image. Needs HDR on in Windows and an HDR monitor; otherwise '
+                     'nothing changes. Tuning: SOTC_HDR_PAPER and SOTC_HDR_GAIN in "Extra variables".'))
 
     def build_controls(self):
         ttk = self.ttk
         f = self.scrolled_page('controls', _('Controles', 'Controls'),
                                _('Um controle (DualShock 4, DualSense, Xbox…) é usado automaticamente.',
                                  'A gamepad (DualShock 4, DualSense, Xbox…) is used automatically.'))
-        self.section(f, _('Controle', 'Gamepad'), top=4)
+        self.section(f, _('Teste do controle', 'Controller test'), top=4)
+        self.controller_card(f, PORT_DIR).grid(row=self.next_row(f), column=0, columnspan=2, sticky='we',
+                                              pady=(self.px(4), self.px(6)))
+        self.section(f, _('Controle', 'Gamepad'))
         self.row(f, _('Ícones dos botões', 'Button icons'), self.choice(f, 'button_icons', BUTTON_ICONS),
                  _('Os ícones que o jogo mostra nas dicas: os do PlayStation ou os do Xbox (A B X Y, LB/RB, '
                    'LT/RT, Menu, View), desenhados para o port. Vale na próxima vez que o jogo abrir.',
@@ -1581,12 +1903,19 @@ class Launcher:
         self.row(f, _('Idioma do lançador', 'Launcher language'), self.choice(f, 'ui_language', UI_LANGUAGES),
                  _('Vale na próxima vez que o lançador abrir.', 'Applies when the launcher opens again.'))
         self.check(f, 'close_on_play', _('Fechar o lançador quando o jogo abrir', 'Close the launcher when the game starts'))
+        self.check(f, 'minimize_to_tray', _('Minimizar para a bandeja do Windows', 'Minimize to the system tray'),
+                   _('Minimizado, o lançador sai da barra de tarefas e fica como um ícone perto do relógio: um clique '
+                     'o traz de volta, o botão direito tem Abrir e Sair.',
+                     'Minimized, the launcher leaves the task bar for an icon by the clock: a click brings it back, the '
+                     'right button has Open and Quit.'))
         self.check(f, 'check_updates', _('Procurar atualizações ao abrir', 'Check for updates at startup'),
                    _('Pergunta antes de baixar. Saves, cache de shaders e sotc.ini são mantidos.',
                      'Asks before downloading. Saves, shader cache and sotc.ini are kept.'))
         holder = ttk.Frame(f)
         holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(10, 0))
         ttk.Button(holder, text=_('Atalho na área de trabalho', 'Desktop shortcut'), command=self.shortcut).pack(side='left')
+        ttk.Button(holder, text=_('Atalho para jogar direto', 'Shortcut that starts the game'),
+                   command=lambda: self.shortcut(play=True)).pack(side='left', padx=(6, 0))
         ttk.Button(holder, text=_('Pasta do port', 'Port folder'), command=lambda: self.open_path(PORT_DIR)).pack(side='left', padx=6)
         ttk.Button(holder, text=_('Limpar cache de shaders', 'Clear shader cache'), command=self.clear_cache).pack(side='left')
         self.section(f, _('Diagnóstico', 'Diagnostics'))
@@ -1697,6 +2026,7 @@ class Launcher:
                                     env=env, creationflags=NO_WINDOW)
             names = [line[5:].split(':')[0] for line in result.stderr.splitlines() if line.startswith('GPU: ')]
             if names:
+                self.gpu_name = names[0]
                 text = _('✓ Placa de vídeo: {}', '✓ Graphics card: {}').format(names[0])
             elif result.returncode:
                 text = _('✗ Nenhuma placa com Vulkan 1.3 (atualize o driver)',
@@ -1761,77 +2091,785 @@ class Launcher:
         self.refresh_status()
         self.messagebox.showinfo('Shadow of the Colossus', _('Save importado para {}.', 'Save imported to {}.').format(target))
 
-    # ---- first start: the setup screen -------------------------------------------------------
-    def show_setup(self):
-        """A full-window welcome screen: asks for the game folder, then sets up DLC, saves and
-        sound on its own and shows what it found."""
+    def build_help(self):
+        """The Help page: asking for help (the report, the issues page), then the problems any
+        installation can run into, each with what to do and buttons that lead there. After the
+        bloodborne_pc launcher's Help page."""
+        ttk = self.ttk
+        f = self.scrolled_page('help', _('Ajuda', 'Help'),
+                               _('Os problemas mais comuns e o que fazer. A busca (Ctrl+F) também acha estes tópicos.',
+                                 'The most common problems and what to do. The search (Ctrl+F) finds these topics too.'))
+        issues = 'https://github.com/AjncSystem/ShadowOfTheColossus-PC/issues'
+        topics = [
+            (_('Pedir ajuda', 'Asking for help'),
+             _('Gere um relatório (registros das últimas sessões, quedas e um resumo do PC) e anexe numa issue no '
+               'GitHub, dizendo o que aconteceu e onde no jogo.',
+               'Make a report (the last sessions\' logs, crashes and a summary of the PC) and attach it to a GitHub '
+               'issue, saying what happened and where in the game.'),
+             [(_('Gerar relatório', 'Make a report'), self.save_report, True),
+              (_('Abrir as issues', 'Open the issues'), lambda: self.open_url(issues), False)]),
+            (_('O jogo não abre ou fecha logo ao abrir', 'The game does not start or closes at once'),
+             _('Veja a Verificação na aba Jogar: o dump precisa estar decriptado (eboot.bin e sce_module), na versão '
+               'EU 1.01 ou US 1.00. Atualize o driver de vídeo (Vulkan 1.3). Um antivírus pode barrar bin\\bb-probe.exe: '
+               'ponha a pasta do port nas exceções. O registro do jogo mostra o motivo da queda.',
+               'See the ready check on the Play page: the dump must be decrypted (eboot.bin and sce_module), version '
+               'EU 1.01 or US 1.00. Update the graphics driver (Vulkan 1.3). An antivirus can block bin\\bb-probe.exe: '
+               'add the port folder to its exceptions. The game log tells why it closed.'),
+             [(_('Registro do jogo', 'Game log'), lambda: self.show('log'), False),
+              (_('Verificação', 'Ready check'), lambda: self.show('play'), False)]),
+            (_('Tela preta ou imagem congelada', 'Black screen or frozen picture'),
+             _('Teste com a geração de quadros desligada e o upscaler FSR 1. Atualize o driver de vídeo. Se começou '
+               'depois de atualizar o driver ou o port, limpe o cache de shaders (o jogo o refaz na próxima abertura, '
+               'com algumas travadas no começo).',
+               'Try with frame generation off and the FSR 1 upscaler. Update the graphics driver. If it began after a '
+               'driver or port update, clear the shader cache (the game builds it again next time, with a few stutters '
+               'at first).'),
+             [(_('Geração de quadros', 'Frame generation'), lambda: self.jump_key('framegen'), False),
+              (_('Limpar cache de shaders', 'Clear shader cache'), self.clear_cache, False)]),
+            (_('Sem som', 'No sound'),
+             _('O som do jogo precisa dos módulos libSceNgs2 e libSceUlt do seu próprio console (o port não os traz). '
+               'Escolha a pasta onde eles estão; a do shadPS4 serve.',
+               'The game\'s sound needs the libSceNgs2 and libSceUlt modules of your own console (the port does not '
+               'bring them). Choose the folder that holds them; shadPS4\'s works.'),
+             [(_('Módulos de som', 'Sound modules'), lambda: self.jump_key('sys_modules'), False)]),
+            (_('Travadas nas trocas de área ou na primeira vez', 'Stutters at area changes or the first time'),
+             _('Na primeira vez (e depois de atualizar) o cache de shaders é montado: as travadas somem com o tempo. '
+               'Instale o jogo num SSD ou NVMe: num HD as trocas de área travam muito mais.',
+               'The first time (and after an update) the shader cache is built: the stutters fade with play. Install '
+               'the game on an SSD or NVMe drive: on a hard disk area changes stutter far more.'), []),
+            (_('FPS baixo', 'Low frame rate'),
+             _('Escolha o Modo de jogo Normal ou Pro, ou 30 FPS. Feche programas por cima do jogo (OBS, RTSS, '
+               'Afterburner, gravação do Windows). Em placas com pouca memória, use "Uso de memória de vídeo" Econômico.',
+               'Choose the Normal or Pro play mode, or 30 FPS. Close programs over the game (OBS, RTSS, Afterburner, '
+               'Windows recording). On cards with little memory, set "Video memory use" to Economy.'),
+             [(_('Modo de jogo', 'Play mode'), lambda: self.jump_key('play_mode'), False),
+              (_('Memória de vídeo', 'Video memory'), lambda: self.jump_key('vram_use'), False)]),
+            (_('HUD, letras ou barras de vida tremendo', 'HUD, letters or health bars shaking'),
+             _('Com a geração de quadros (F8), ligue "Geração de quadros sem a interface": os quadros gerados ficam '
+               'só com a cena e a interface vai por cima.',
+               'With frame generation (F8), turn "Frame generation without the interface" on: the generated frames '
+               'hold the scene only and the interface goes on top.'),
+             [(_('Abrir a opção', 'Open the setting'), lambda: self.jump_key('fg_hudless'), False)]),
+            (_('Texturas coloridas (mosaico) ou borradas', 'Coloured (mosaic) or blurry textures'),
+             _('O mosaico depois das cargas foi corrigido na 0.71. Texturas borradas: use Texturas Alta ou Máxima e o '
+               'filtro 16x. Se o mosaico voltar, gere um relatório logo depois.',
+               'The mosaic after loads was fixed in 0.71. Blurry textures: use High or Maximum textures and 16x '
+               'filtering. If the mosaic comes back, make a report right after.'),
+             [(_('Texturas', 'Textures'), lambda: self.jump_key('textures'), False)]),
+            (_('O controle não responde', 'The controller does not respond'),
+             _('Conecte o controle antes de abrir o jogo. Com vários controles, escolha o preferido na aba Controles. '
+               'Pela Steam, desligue o Steam Input para o atalho do jogo.',
+               'Connect the controller before starting the game. With several, choose the preferred one on the '
+               'Controls page. Through Steam, turn Steam Input off for the game\'s shortcut.'),
+             [(_('Controles', 'Controls'), lambda: self.show('controls'), False)]),
+            (_('Um save sumiu ou estragou, ou quero levá-lo a outro PC', 'A save is gone or broken, or I want it on another PC'),
+             _('A aba Saves guarda um backup a cada vez que o jogo fecha: importe o .zip de antes do problema. Para '
+               'outro PC, exporte os saves e importe lá.',
+               'The Saves page keeps a backup every time the game closes: import the .zip from before the problem. '
+               'For another PC, export the saves and import them there.'),
+             [(_('Saves', 'Saves'), lambda: self.show('saves'), False)]),
+            (_('Atualizar o port', 'Updating the port'),
+             _('O launcher procura versões novas ao abrir. Saves, cache de shaders e sotc.ini são mantidos.',
+               'The launcher looks for new versions when it starts. Saves, shader cache and sotc.ini are kept.'),
+             [(_('Procurar atualização', 'Check for updates'), lambda: self.check_updates(True), False)]),
+        ]
+        f.columnconfigure(0, weight=1)
+        for k, (title, text, actions) in enumerate(topics):
+            card = ttk.Frame(f, style='Card.TFrame', padding=(self.px(18), self.px(14)))
+            card.grid(row=self.next_row(f), column=0, columnspan=2, sticky='we', pady=(self.px(4) if k else 0, self.px(6)))
+            card.columnconfigure(0, weight=1)
+            head = ttk.Label(card, text=title, style='Card.Section.TLabel')
+            head.grid(row=0, column=0, sticky='w')
+            ttk.Label(card, text=text, style='Card.TLabel', wraplength=self.px(720), justify='left').grid(
+                row=1, column=0, sticky='w', pady=(self.px(4), 0))
+            if actions:
+                buttons = ttk.Frame(card, style='Inner.TFrame')
+                buttons.grid(row=2, column=0, sticky='w', pady=(self.px(10), 0))
+                for label, command, accent in actions:
+                    ttk.Button(buttons, text=label, command=command,
+                               style='Card.Accent.TButton' if accent else 'Card.TButton').pack(side='left', padx=(0, self.px(6)))
+            self.index_entry(head, title, text, page='help')
+
+    def jump_key(self, key):
+        """The page of a setting (not the Play page's copy), scrolled to it and marked."""
+        entries = [e for e in getattr(self, 'search_index', []) if e.get('key') == key]
+        entry = next((e for e in entries if e['page'] != 'play'), entries[0] if entries else None)
+        if entry:
+            self.jump(entry)
+
+    def open_url(self, url):
+        import webbrowser
+        webbrowser.open(url)
+
+    def build_saves(self):
+        """The Saves page: the game's saves with their progress, export and import (.zip, a folder,
+        shadPS4), backups, the data folder."""
+        ttk = self.ttk
+        f = self.scrolled_page('saves', _('Saves', 'Saves'),
+                               _('Os seus jogos salvos: exportar para guardar ou levar a outro PC, importar, fazer backup.',
+                                 'Your saved games: export to keep them or take them to another PC, import, back up.'))
+        self.section(f, _('Seus saves', 'Your saves'), top=4)
+        holder = ttk.Frame(f)
+        holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='we', pady=(6, 0))
+        self.save_list = ttk.Treeview(holder, columns=('detail', 'date'), height=7, style='Library.Treeview',
+                                      selectmode='extended')
+        for column, title, width in (('#0', _('Save', 'Save'), 430), ('detail', _('Tempo de jogo', 'Play time'), 260),
+                                     ('date', _('Gravado em', 'Saved'), 130)):
+            self.save_list.heading(column, text=title, anchor='w')
+            self.save_list.column(column, width=self.px(width), anchor='w', stretch=column == '#0')
+        self.save_list.pack(side='left', fill='x', expand=True)
+        self.save_label = ttk.Label(f, text='', style='Muted.TLabel')
+        self.save_label.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(4, 0))
+        buttons = ttk.Frame(f)
+        buttons.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(8, 0))
+        ttk.Button(buttons, text=_('Exportar selecionados…', 'Export selected…'),
+                   command=lambda: self.export_saves(selected=True)).pack(side='left')
+        ttk.Button(buttons, text=_('Exportar todos…', 'Export all…'),
+                   command=lambda: self.export_saves(selected=False)).pack(side='left', padx=(6, 0))
+        ttk.Button(buttons, text=_('Atualizar lista', 'Refresh'), command=self.refresh_saves).pack(side='left', padx=(6, 0))
+        ttk.Button(buttons, text=_('Abrir pasta', 'Open folder'),
+                   command=lambda: self.open_path(self.saves_folder() if self.saves_folder().is_dir()
+                                                  else user_dir({'user_dir': self.var('user_dir').get()}))).pack(
+            side='left', padx=(6, 0))
+
+        self.section(f, _('Importar', 'Import'))
+        self.note(f, _('Os saves com o mesmo nome são substituídos; antes disso o launcher faz um backup de todos.',
+                       'Saves with the same name are replaced; the launcher backs them all up first.'), top=0)
+        buttons = ttk.Frame(f)
+        buttons.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(8, 0))
+        ttk.Button(buttons, text=_('Importar .zip…', 'Import a .zip…'), command=self.import_saves_zip).pack(side='left')
+        ttk.Button(buttons, text=_('Importar pasta…', 'Import a folder…'),
+                   command=self.import_saves_folder).pack(side='left', padx=(6, 0))
+        ttk.Button(buttons, text=_('Importar do shadPS4…', 'Import from shadPS4…'),
+                   command=self.import_save).pack(side='left', padx=(6, 0))
+        self.note(f, _('.zip: um arquivo exportado por este launcher. Pasta: um save (com sce_sys/param.sfo), a pasta '
+                       'savedata/CUSA08809 de outra instalação ou um backup. shadPS4: a pasta savedata do shadPS4.',
+                       '.zip: a file this launcher exported. Folder: one save (with sce_sys/param.sfo), the '
+                       'savedata/CUSA08809 folder of another install or a backup. shadPS4: shadPS4\'s savedata folder.'))
+
+        self.section(f, _('Backup', 'Backup'))
+        buttons = ttk.Frame(f)
+        buttons.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(4, 0))
+        ttk.Button(buttons, text=_('Fazer backup agora', 'Back up now'), style='Accent.TButton',
+                   command=lambda: self.backup_saves(notify=True)).pack(side='left')
+        ttk.Button(buttons, text=_('Abrir pasta de backups', 'Open the backups folder'),
+                   command=lambda: self.open_path(self.backups_folder())).pack(side='left', padx=(6, 0))
+        self.note(f, _('Um .zip com todos os saves em user/backups (os {} mais novos ficam). Para restaurar, use '
+                       '"Importar .zip…".', 'A .zip of every save in user/backups (the {} newest are kept). To '
+                       'restore one, use "Import a .zip…".').format(SAVE_BACKUPS_KEPT))
+        self.check(f, 'exit_backup', _('Backup automático quando o jogo fecha', 'Automatic backup when the game closes'),
+                   _('Depois de cada sessão, também quando o jogo cai: um save estragado por uma queda volta pelo '
+                     'backup anterior.', 'After every session, also when the game crashes: a save a crash spoiled '
+                     'comes back from the backup before.'))
+
+        self.section(f, _('Pasta de dados', 'Data folder'))
+        self.folder(f, 'user_dir', _('Pasta de dados', 'Data folder'), _('Pasta dos saves', 'Saves folder'),
+                    _('Saves, cache de shaders e capturas. Vazio = a pasta user ao lado do port.',
+                      'Saves, shader cache and screenshots. Empty = the user folder next to the port.'),
+                    on_change=lambda: (self.refresh_status(), self.refresh_saves()))
+        self.refresh_saves()
+
+    def save_entries(self):
+        """The game's saves: (folder name, title, play time, saved at) newest first."""
+        folder = self.saves_folder()
+        entries = []
+        try:
+            from prepare import sfo
+        except ImportError:
+            sfo = None
+        for path in (folder.iterdir() if folder.is_dir() else ()):
+            name = path.name
+            if not path.is_dir() or name.startswith('.') or name.endswith(('.sce_sys', '.sce_backup', '.bak')):
+                continue
+            values = save_param(folder / (name + '.sce_sys') / 'param.bin')
+            if not values.get('SUBTITLE'):
+                try:
+                    values = sfo((path / 'sce_sys' / 'param.sfo').read_bytes()) if sfo else {}
+                except (OSError, ValueError):
+                    pass
+            title = str(values.get('SUBTITLE') or values.get('MAINTITLE') or name)
+            stamp = max((p.stat().st_mtime for p in path.rglob('*') if p.is_file()), default=path.stat().st_mtime)
+            detail = ' · '.join(line.strip() for line in str(values.get('DETAIL') or '').splitlines() if line.strip())
+            entries.append((name, title, detail, stamp))
+        return sorted(entries, key=lambda e: -e[3])
+
+    def refresh_saves(self):
+        if not getattr(self, 'save_list', None):
+            return
+        self.save_list.delete(*self.save_list.get_children())
+        entries = self.save_entries()
+        for name, title, detail, stamp in entries:
+            self.save_list.insert('', 'end', iid=name, text='  ' + title,
+                                  values=(detail, time.strftime('%d/%m/%Y %H:%M', time.localtime(stamp))))
+        self.save_label.configure(text=_('{} save(s) em {}', '{} save(s) in {}').format(len(entries), self.saves_folder())
+                                  if entries else _('Nenhum save ainda em {}', 'No saves yet in {}').format(self.saves_folder()))
+
+    def save_parts(self, name):
+        """A save's folder and the port's folders beside it (<name>.sce_sys, <name>.sce_backup)."""
+        folder = self.saves_folder()
+        return [folder / n for n in (name, name + '.sce_sys', name + '.sce_backup') if (folder / n).exists()]
+
+    def write_saves_zip(self, target, names):
+        """`names` with their port folders into the .zip `target`, below <title id>/."""
+        serial = self.saves_folder().name
+        with zipfile.ZipFile(target, 'w', zipfile.ZIP_DEFLATED) as archive:
+            for name in names:
+                for part in self.save_parts(name):
+                    for file in part.rglob('*'):
+                        if file.is_file():
+                            archive.write(file, f'{serial}/{file.relative_to(part.parent).as_posix()}')
+
+    def export_saves(self, selected):
+        names = list(self.save_list.selection()) if selected else [e[0] for e in self.save_entries()]
+        if not names:
+            self.messagebox.showinfo('Shadow of the Colossus', _('Escolha um ou mais saves na lista.',
+                                                                 'Choose one or more saves in the list.'))
+            return
+        default = f'SotC-saves-{time.strftime("%Y-%m-%d")}.zip' if len(names) > 1 else f'SotC-{names[0]}.zip'
+        target = self.filedialog.asksaveasfilename(title=_('Exportar saves', 'Export saves'), defaultextension='.zip',
+                                                   initialfile=default, filetypes=[('ZIP', '*.zip')])
+        if not target:
+            return
+        try:
+            self.write_saves_zip(target, names)
+        except OSError as error:
+            self.messagebox.showerror('Shadow of the Colossus', _('Não foi possível exportar: {}',
+                                                                 'Could not export: {}').format(error))
+            return
+        self.messagebox.showinfo('Shadow of the Colossus', _('{} save(s) exportado(s) para\n{}',
+                                                             '{} save(s) exported to\n{}').format(len(names), target))
+
+    def backups_folder(self):
+        folder = user_dir({'user_dir': self.var('user_dir').get()}) / 'backups'
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    def news_items(self):
+        """This version's entry of CHANGELOG.md: one text per item (its continuation lines joined),
+        **bold** kept as markers."""
+        try:
+            text = (PORT_DIR / 'CHANGELOG.md').read_text(encoding='utf-8')
+        except OSError:
+            return []
+        items, inside = [], False
+        for line in text.splitlines():
+            if line.startswith('## '):
+                if inside:
+                    break
+                inside = line[3:].split(' ')[0] == VERSION
+                continue
+            if not inside or not line.strip():
+                continue
+            if line.startswith('- '):
+                items.append(line[2:].strip())
+            elif items:
+                items[-1] += ' ' + line.strip()
+        return [item.replace('`', '') for item in items]
+
+    def show_news(self):
+        """What's new, once per version (news_seen)."""
         tk, ttk = self.tk, self.ttk
+        items = self.news_items()
+        self.var('news_seen').set(VERSION)
+        self.collect()
+        if not items:
+            return
+        win = tk.Toplevel(self.root, bg=PANEL)
+        win.title(_('Novidades', "What's new"))
+        win.transient(self.root)
+        win.geometry(f'{self.px(720)}x{self.px(560)}')
+        ttk.Label(win, text=_('Novidades da v{}', "What's new in v{}").format(VERSION), background=PANEL, foreground=GOLD,
+                  font=(title_font(), 20)).pack(anchor='w', padx=self.px(24), pady=(self.px(20), self.px(4)))
+        tk.Frame(win, bg=LINE, height=1).pack(fill='x', padx=self.px(24), pady=(0, self.px(8)))
+        bar = ttk.Frame(win)
+        bar.pack(side='bottom', fill='x', padx=self.px(24), pady=self.px(14))
+        ttk.Button(bar, text=_('Continuar', 'Continue'), style='Accent.TButton', command=win.destroy).pack(side='right')
+        holder = ttk.Frame(win)
+        holder.pack(fill='both', expand=True, padx=(self.px(24), self.px(8)))
+        body = tk.Text(holder, wrap='word', bg=PANEL, fg=TEXT, relief='flat', bd=0, highlightthickness=0, height=8,
+                       font=(ui_font(), 10), spacing1=self.px(6), spacing3=self.px(2), cursor='arrow')
+        scroll = ttk.Scrollbar(holder, orient='vertical', command=body.yview)
+        body.configure(yscrollcommand=scroll.set)
+        scroll.pack(side='right', fill='y')
+        body.pack(side='left', fill='both', expand=True)
+        body.tag_configure('item', lmargin1=0, lmargin2=self.px(18))
+        body.tag_configure('bold', font=(theme.BODY_SEMI if LANG not in ('zh', 'ko') else ui_font(), 10),
+                           foreground=theme.TEXT_STRONG)
+        body.tag_configure('mark', foreground=SIGIL)
+        for item in items:
+            body.insert('end', '•  ', ('item', 'mark'))
+            for k, part in enumerate(item.split('**')):
+                body.insert('end', part, ('item', 'bold') if k % 2 else ('item',))
+            body.insert('end', '\n', 'item')
+        body.configure(state='disabled')
+        win.after(80, lambda: body.yview_moveto(0))  # once the text is laid out at the window's width
+        body.bind('<MouseWheel>', lambda e: (body.yview_scroll(int(-e.delta / 120), 'units'), 'break')[1])
+        win.bind('<Escape>', lambda _e: win.destroy())
+        win.grab_set()
+
+    def save_report(self):
+        """A .zip to attach to an issue: the last sessions' logs and events, the newest crashes with
+        their dump, the launcher settings (the player name left out) and a summary of this PC."""
+        default = Path.home() / 'Desktop' / f'SotC-relatorio-{time.strftime("%Y-%m-%d_%H-%M")}.zip'
+        target = self.filedialog.asksaveasfilename(
+            title=_('Salvar relatório', 'Save report'), defaultextension='.zip', filetypes=[('ZIP', '*.zip')],
+            initialdir=str(default.parent if default.parent.is_dir() else Path.home()), initialfile=default.name)
+        if not target:
+            return
+        self.collect()
+        data = user_dir(self.app)
+        files = [data / n for n in ('last_run.log', 'last_run.1.log', 'events.log', 'events.1.log')]
+        crashes = data / 'crashes'
+        if crashes.is_dir():
+            logs = sorted(crashes.glob('*.log'), key=lambda p: p.stat().st_mtime)[-6:]
+            dumps = sorted(crashes.glob('*.dmp'), key=lambda p: p.stat().st_mtime)[-1:]
+            files += logs + dumps
+        settings = dict(self.app, player_name='')
+        info = game_info(self.app.get('game_dir'))
+        summary = '\n'.join([
+            f'SotC-PC launcher {VERSION}',
+            f'Windows {platform.version()} ({platform.machine()})',
+            f'CPU: {platform.processor()}, {os.cpu_count()} threads',
+            self.gpu_text.lstrip('✓✗• '),
+            'Game: ' + ('{} {}'.format(*info) if info else 'not set'),
+            'Summary: ' + self.summary(),
+        ])
+        try:
+            with zipfile.ZipFile(target, 'w', zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr('report.txt', summary + '\n')
+                archive.writestr('launcher_settings.json', json.dumps(settings, indent=2, ensure_ascii=False))
+                for file in files:
+                    if file.is_file():
+                        archive.write(file, file.relative_to(data).as_posix())
+        except OSError as error:
+            self.messagebox.showerror('Shadow of the Colossus', _('Não foi possível salvar o relatório: {}',
+                                                                 'Could not save the report: {}').format(error))
+            return
+        self.messagebox.showinfo('Shadow of the Colossus', _(
+            'Relatório salvo em\n{}\n\nAnexe este arquivo na issue do GitHub. Ele tem os registros das últimas '
+            'sessões e as pastas do jogo e do port (sem o nome do jogador).',
+            'Report saved to\n{}\n\nAttach this file to the GitHub issue. It holds the last sessions\' logs and '
+            'the game and port folders (without the player name).').format(target))
+        self.open_path(Path(target).parent)
+
+    def exit_backup(self):
+        """After the game closed (a crash too): the saves into user/backups (Saves > Backup when the
+        game closes), the newest SAVE_BACKUPS_KEPT kept as for the manual ones."""
+        if not self.var('exit_backup').get():
+            return
+        try:
+            target = self.backup_saves(suffix='-exit')
+        except OSError as error:
+            self.append(_('Backup dos saves ao fechar falhou: {}', 'Saves backup on exit failed: {}').format(error) + '\n')
+            return
+        if target:
+            self.append(_('Backup dos saves: {}', 'Saves backup: {}').format(target) + '\n')
+        self.refresh_saves()
+
+    def backup_saves(self, notify=False, suffix=''):
+        """Every save into user/backups/saves-<title id>-<date>.zip; the newest SAVE_BACKUPS_KEPT stay."""
+        names = [e[0] for e in self.save_entries()]
+        if not names:
+            if notify:
+                self.messagebox.showinfo('Shadow of the Colossus', _('Ainda não há saves.', 'There are no saves yet.'))
+            return None
+        folder = self.backups_folder()
+        target = folder / f'saves-{self.saves_folder().name}-{time.strftime("%Y-%m-%d_%H-%M-%S")}{suffix}.zip'
+        self.write_saves_zip(target, names)
+        for old in sorted(folder.glob('saves-*.zip'), key=lambda p: p.stat().st_mtime)[:-SAVE_BACKUPS_KEPT]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        if notify:
+            self.messagebox.showinfo('Shadow of the Colossus', _('Backup de {} save(s) em\n{}',
+                                                                 'Backup of {} save(s) in\n{}').format(len(names), target))
+        return target
+
+    def import_save_folders(self, saves):
+        """Copies save folders (each with sce_sys/param.sfo) into the game's saves, with their port
+        folders when they come along; backs up everything first."""
+        if not saves:
+            self.messagebox.showerror('Shadow of the Colossus', _(
+                'Nenhum save encontrado aí (um save é uma pasta com sce_sys/param.sfo).',
+                'No save found there (a save is a folder with sce_sys/param.sfo).'))
+            return
+        target = self.saves_folder()
+        existing = [p.name for p in saves if (target / p.name).exists()]
+        if existing and not self.messagebox.askyesno('Shadow of the Colossus', _(
+                'Substituir {} save(s) com o mesmo nome? Um backup de todos é feito antes.',
+                'Replace {} save(s) with the same name? Everything is backed up first.').format(len(existing))):
+            return
+        try:
+            if existing:
+                self.backup_saves()
+            target.mkdir(parents=True, exist_ok=True)
+            for save in saves:
+                for part in (save, save.with_name(save.name + '.sce_sys'), save.with_name(save.name + '.sce_backup')):
+                    if part.is_dir():
+                        shutil.rmtree(target / part.name, ignore_errors=True)
+                        shutil.copytree(part, target / part.name)
+        except OSError as error:
+            self.messagebox.showerror('Shadow of the Colossus', _('Não foi possível importar o save: {}',
+                                                                 'Could not import the save: {}').format(error))
+            return
+        self.refresh_saves()
+        self.refresh_status()
+        self.messagebox.showinfo('Shadow of the Colossus', _('{} save(s) importado(s).', '{} save(s) imported.').format(len(saves)))
+
+    @staticmethod
+    def find_saves(folder):
+        """The save folders in `folder` or below it: with sce_sys/param.sfo inside (PS4, shadPS4) or
+        the port's <name>.sce_sys beside them; not the port's own folders and backups."""
+        def is_save(d):
+            return (d / 'sce_sys' / 'param.sfo').is_file() or d.with_name(d.name + '.sce_sys').is_dir()
+        folder = Path(folder)
+        if is_save(folder):
+            return [folder]
+        skip = ('.sce_sys', '.sce_backup', '.bak')
+        found = set()
+        for d in folder.rglob('*'):
+            if d.is_dir() and not any(part.endswith(skip) for part in d.relative_to(folder).parts) and is_save(d):
+                found.add(d)
+        # a save's own subfolders (its sce_sys) are not saves
+        return sorted(d for d in found if not any(o != d and o in d.parents for o in found))
+
+    def import_saves_folder(self):
+        chosen = self.filedialog.askdirectory(title=_('Pasta com os saves', 'Folder with the saves'),
+                                              initialdir=str(PORT_DIR.parent))
+        if chosen:
+            self.import_save_folders(self.find_saves(chosen))
+
+    def import_saves_zip(self):
+        chosen = self.filedialog.askopenfilename(title=_('Saves exportados (.zip)', 'Exported saves (.zip)'),
+                                                 initialdir=str(self.backups_folder()), filetypes=[('ZIP', '*.zip')])
+        if not chosen:
+            return
+        import tempfile
+        with tempfile.TemporaryDirectory(prefix='sotc-saves-') as temp:
+            try:
+                with zipfile.ZipFile(chosen) as archive:
+                    root = Path(temp).resolve()
+                    for member in archive.namelist():  # nothing written outside the temporary folder
+                        if not (root / member).resolve().is_relative_to(root):
+                            raise zipfile.BadZipFile(member)
+                    archive.extractall(temp)
+            except (OSError, zipfile.BadZipFile) as error:
+                self.messagebox.showerror('Shadow of the Colossus', _('Arquivo .zip inválido: {}',
+                                                                     'Invalid .zip file: {}').format(error))
+                return
+            self.import_save_folders(self.find_saves(temp))
+
+    # ---- first start: the setup screen -------------------------------------------------------
+    # The guide's steps: (title, under the title), named after the game's journey.
+    SETUP_STEPS = [(('O Despertar', 'The Awakening'), ('Boas-vindas', 'Welcome')),
+                   (('O Santuário', 'The Shrine'), ('O seu jogo', 'Your game')),
+                   (('A Espada Antiga', 'The Ancient Sword'), ('O seu PC', 'Your PC')),
+                   (('Agro', 'Agro'), ('Controles', 'Controls')),
+                   (('A Terra Proibida', 'The Forbidden Land'), ('Pronto para jogar', 'Ready to play'))]
+
+    def show_setup(self):
+        """The first setup as a guide in five steps, as in the bloodborne_pc launcher: the steps on
+        the left, the step on the right, Back and Next at the bottom."""
+        tk, ttk, px = self.tk, self.ttk, self.px
         if getattr(self, 'setup_frame', None):
             self.setup_frame.destroy()
-        frame = self.setup_frame = tk.Frame(self.root, bg=BG)
-        frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+        top = self.titlebar.winfo_reqheight() if self.titlebar is not None and self.custom_frame is not False else 0
+        frame = self.setup_frame = tk.Frame(self.root, bg=PANEL)
+        frame.place(x=0, y=top, relwidth=1, relheight=1, height=-top)
         frame.lift()
-        # The launcher's language, first thing (names in their own language); the launcher opens
-        # again in it.
-        lang_box = tk.Frame(frame, bg=BG)
-        lang_box.place(relx=1.0, rely=0.0, anchor='ne', x=-self.px(20), y=self.px(16))
-        tk.Label(lang_box, text='🌐', bg=BG, fg=MUTED, font=(ui_font(), 13)).pack(side='left', padx=(0, 6))
-        names = [(code, labels[0]) for code, labels in UI_LANGUAGES if code]
-        lang_var = tk.StringVar(value=dict(names).get(LANG, 'English'))
-        lang_combo = ttk.Combobox(lang_box, textvariable=lang_var, values=[name for _c, name in names],
-                                  state='readonly', width=14, font=(ui_font(), 11))
-        lang_combo.pack(side='left')
-
-        def language_chosen(_event=None):
-            code = next((c for c, name in names if name == lang_var.get()), '')
-            if code and code != LANG:
-                self.var('ui_language').set(code)
-                self.collect()
-                self.restart()
-        lang_combo.bind('<<ComboboxSelected>>', language_chosen)
-        inner = tk.Frame(frame, bg=BG)
-        inner.place(relx=0.5, rely=0.45, anchor='center')
-        tk.Label(inner, text='SHADOW OF THE COLOSSUS', bg=BG, fg=GOLD, font=(title_font(), 26)).pack()
-        tk.Label(inner, text=_('Bem-vindo. Só falta dizer onde está o jogo.',
-                               'Welcome. Just tell us where the game is.'),
-                 bg=BG, fg=TEXT, font=(ui_font(), 13)).pack(pady=(8, 26))
-        self.setup_button = ttk.Button(inner, text=_('Escolher a pasta do jogo…', 'Choose the game folder…'),
-                                       style='Play.TButton', command=self.choose_game_for_setup)
-        self.setup_button.pack(ipadx=18)
-        tk.Label(inner, text=_('A pasta principal do jogo, como no shadPS4: as subpastas do jogo (CUSA08809 ou '
-                               'CUSA08034), da atualização (-UPDATE/-patch) e das DLCs são encontradas sozinhas.',
-                               "The game's main folder, as in shadPS4: the game (CUSA08809 or CUSA08034), update "
-                               '(-UPDATE/-patch) and DLC subfolders are found on their own.'),
-                 bg=BG, fg=MUTED, font=(ui_font(), 10), wraplength=self.px(560), justify='center').pack(pady=(10, 0))
-        self.setup_hint = tk.Label(inner, text='', bg=BG, fg=MUTED, font=(ui_font(), 10), cursor='hand2',
-                                   wraplength=self.px(640), justify='center')
-        self.setup_hint.pack(pady=(18, 0))
-        self.setup_results = tk.Frame(inner, bg=BG)
-        self.setup_results.pack(pady=(18, 0), fill='x')
-        self.setup_found_game = None
-        # Meanwhile look for the game on this PC, to offer it with one click.
+        rail = tk.Frame(frame, bg=BG, width=px(280))
+        rail.pack(side='left', fill='y')
+        rail.pack_propagate(False)
+        tk.Frame(frame, bg=LINE, width=1).pack(side='left', fill='y')
+        tk.Label(rail, text=_('PRIMEIRA JORNADA', 'FIRST JOURNEY'), bg=BG, fg=GOLD, font=(title_font(), 9)).pack(
+            anchor='w', padx=px(26), pady=(px(34), 0))
+        tk.Label(rail, text=_('Configuração inicial', 'First setup'), bg=BG, fg=theme.TEXT_STRONG,
+                 font=(title_font(), 14), wraplength=px(230), justify='left').pack(anchor='w', padx=px(26),
+                                                                                  pady=(px(2), px(26)))
+        self.setup_rail = []
+        for k, (title, sub) in enumerate(self.SETUP_STEPS):
+            c = tk.Canvas(rail, width=px(250), height=px(58), bg=BG, highlightthickness=0, bd=0)
+            c.pack(padx=px(14))
+            self.setup_rail.append((c, _(*title), _(*sub)))
+        tk.Frame(rail, bg=BG).pack(fill='both', expand=True)
+        skip = tk.Label(rail, text=_('Pular: eu configuro sozinho', 'Skip: I set it up myself'), bg=BG, fg=MUTED,
+                        font=(ui_font(), 9, 'underline'), cursor='hand2')
+        skip.pack(pady=(0, px(20)))
+        skip.bind('<Button-1>', lambda _e: self.finish_setup())
+        right = tk.Frame(frame, bg=PANEL)
+        right.pack(side='left', fill='both', expand=True)
+        bar = tk.Frame(right, bg=BG, height=px(72))
+        bar.pack(side='bottom', fill='x')
+        bar.pack_propagate(False)
+        tk.Frame(right, bg=LINE, height=1).pack(side='bottom', fill='x')
+        self.setup_counter = tk.Label(bar, text='', bg=BG, fg=MUTED, font=(title_font(), 10))
+        self.setup_counter.pack(side='left', padx=px(30))
+        self.setup_next = ttk.Button(bar, text='', style='Bar.Accent.TButton', command=lambda: self.setup_go(1))
+        self.setup_next.pack(side='right', padx=(px(8), px(26)))
+        self.setup_back = ttk.Button(bar, text=_('Voltar', 'Back'), style='Bar.TButton', command=lambda: self.setup_go(-1))
+        self.setup_back.pack(side='right')
+        head = tk.Frame(right, bg=PANEL)
+        head.pack(fill='x', padx=px(40), pady=(px(26), px(8)))
+        self.setup_kicker = tk.Label(head, text='', bg=PANEL, fg=GOLD, font=(title_font(), 9))
+        self.setup_kicker.pack(anchor='w')
+        self.setup_title = tk.Label(head, text='', bg=PANEL, fg=theme.TEXT_STRONG, font=(title_font(), 24))
+        self.setup_title.pack(anchor='w')
+        self.setup_lead = tk.Label(head, text='', bg=PANEL, fg=MUTED, font=(ui_font(), 10), justify='left',
+                                   wraplength=px(640))
+        self.setup_lead.pack(anchor='w', pady=(px(4), 0))
+        self.setup_body = tk.Frame(right, bg=PANEL)
+        self.setup_body.pack(fill='both', expand=True, padx=px(40), pady=(px(10), 0))
+        self.setup_step, self.setup_found_game, self.setup_hw = 0, None, None
+        self.setup_show(0)
+        # Meanwhile: the game on this PC (offered with one click) and the PC check.
         current = self.var('game_dir').get()
-        if game_info(current):
-            self.offer_game(current)
-        else:
-            self.setup_hint.configure(text=_('Procurando o jogo neste PC…', 'Looking for the game on this PC…'))
-
+        if not game_info(current):
             def work():
                 try:
                     from sotc_discovery import scan
                     games = scan(seconds=25, extra_roots=[str(PORT_DIR.parent)])['games']
                 except Exception:  # never stop the launcher over a search problem
                     games = []
-                self.ui_calls.put(lambda: self.offer_game(games[0]['path']) if games else
-                                  self.setup_hint.configure(text=''))
+                self.setup_found_game = games[0]['path'] if games else None
+                self.ui_calls.put(lambda: self.setup_step == 1 and self.setup_show(1))
             threading.Thread(target=work, daemon=True).start()
+
+    def setup_paint_rail(self):
+        px = self.px
+        for k, (c, title, sub) in enumerate(self.setup_rail):
+            c.delete('all')
+            on, done = k == self.setup_step, k < self.setup_step
+            mid = px(29)
+            if k < len(self.setup_rail) - 1:  # the path down to the next step
+                c.create_line(px(22), mid + px(14), px(22), px(58), fill=GOLD if done else LINE, width=max(1, px(1)))
+            ring = SIGIL if on else GOLD if done else theme.BORDER_STRONG
+            c.create_oval(px(8), mid - px(14), px(36), mid + px(14), outline=ring, width=max(1, px(1.5)),
+                          fill=theme.SIGIL if on else BG)
+            numeral = ('I', 'II', 'III', 'IV', 'V')[k]
+            c.create_text(px(22), mid, text='✓' if done else numeral, fill=theme.TEXT_STRONG if on else GOLD if done else MUTED,
+                          font=(title_font(), 9))
+            c.create_text(px(50), mid - px(8), text=title, anchor='w', font=(title_font(), 11),
+                          fill=theme.TEXT_STRONG if on else TEXT if done else theme.TEXT_SOFT)
+            c.create_text(px(50), mid + px(10), text=sub, anchor='w', font=(ui_font(), 9), fill=MUTED)
+
+    def setup_card(self, title=None, warning=False):
+        """A rounded card in the step's body."""
+        card = self.ttk.Frame(self.setup_body, style='Card.TFrame', padding=(self.px(20), self.px(16)))
+        card.pack(fill='x', pady=(0, self.px(12)))
+        if title:
+            self.ttk.Label(card, text=title, style='Card.Section.TLabel',
+                           foreground='#e07a6a' if warning else None).pack(anchor='w', pady=(0, self.px(6)))
+        return card
+
+    def setup_line(self, parent, mark, text):
+        color = GOLD if mark == '✓' else '#d9b441' if mark == '⚠' else '#d36b5c' if mark == '✗' else MUTED
+        row = self.ttk.Frame(parent, style='Inner.TFrame')
+        row.pack(anchor='w', pady=self.px(2), fill='x')
+        self.ttk.Label(row, text=mark, style='Card.TLabel', foreground=color, width=2).pack(side='left', anchor='n')
+        self.ttk.Label(row, text=text, style='Card.TLabel', wraplength=self.px(600), justify='left').pack(side='left')
+
+    def setup_show(self, step):
+        tk, ttk, px = self.tk, self.ttk, self.px
+        self.setup_step = step
+        for child in self.setup_body.winfo_children():
+            child.destroy()
+        title, sub = self.SETUP_STEPS[step]
+        numeral = ('I', 'II', 'III', 'IV', 'V')[step]
+        self.setup_kicker.configure(text=f'{numeral} · {_(*title).upper()}')
+        self.setup_counter.configure(text=_('Etapa {} de 5', 'Step {} of 5').format(step + 1))
+        self.setup_back.configure(state='normal' if step else 'disabled')
+        self.setup_next.configure(text=_('Começar a jornada  ›', 'Begin the journey  ›') if step == 4 else _('Avançar  ›', 'Next  ›'),
+                                  state='normal')
+        self.setup_paint_rail()
+        getattr(self, ('setup_welcome', 'setup_game', 'setup_pc', 'setup_controls', 'setup_ready')[step])()
+
+    def setup_go(self, step):
+        target = self.setup_step + step
+        if step > 0 and self.setup_step == 2 and getattr(self, 'setup_mode_var', None):
+            self.var('play_mode').set(self.setup_mode_var.get())  # the chosen mode sets its settings
+        if target > 4:
+            self.finish_setup()
+            return
+        self.collect()
+        self.setup_show(max(0, target))
+
+    # -- I · the awakening
+    def setup_welcome(self):
+        tk, ttk = self.tk, self.ttk
+        self.setup_title.configure(text=_('Bem-vindo, viajante', 'Welcome, wanderer'))
+        self.setup_lead.configure(text=_('Alguns passos até a Terra Proibida. Tudo pode ser mudado depois no launcher.',
+                                         'A few steps to the Forbidden Land. Everything can be changed later in the launcher.'))
+        card = self.setup_card()
+        row = ttk.Frame(card, style='Inner.TFrame')
+        row.pack(anchor='w')
+        ttk.Label(row, text=_('Idioma do launcher', 'Launcher language'), style='Card.TLabel').pack(side='left', padx=(0, self.px(14)))
+        names = [(code, labels[0]) for code, labels in UI_LANGUAGES if code]
+        lang_var = tk.StringVar(value=dict(names).get(LANG, 'English'))
+        combo = ttk.Combobox(row, textvariable=lang_var, values=[n for _c, n in names], state='readonly',
+                             width=16, style='Card.TCombobox')
+        combo.pack(side='left')
+
+        def chosen(_event=None):
+            code = next((c for c, n in names if n == lang_var.get()), '')
+            if code and code != LANG:
+                self.var('ui_language').set(code)
+                self.collect()
+                self.restart()
+        combo.bind('<<ComboboxSelected>>', chosen)
+        card = self.setup_card(_('Só com a sua própria cópia do jogo', 'Only with your own copy of the game'), warning=True)
+        ttk.Label(card, text=_('O port não vem com o jogo e não distribui arquivos dele. Use o dump do seu console '
+                               '(decriptado), como no shadPS4.',
+                               'The port does not come with the game and shares none of its files. Use the dump of your '
+                               'own console (decrypted), as with shadPS4.'),
+                  style='Card.TLabel', wraplength=self.px(640), justify='left').pack(anchor='w')
+        card = self.setup_card(_('O que você precisa', 'What you need'))
+        for mark, text in (('•', _('O dump do jogo: CUSA08809 (europeu, versão 1.01) ou CUSA08034 (americano, 1.00), '
+                                   'com a atualização ao lado.',
+                                   'The game dump: CUSA08809 (European, version 1.01) or CUSA08034 (American, 1.00), '
+                                   'with its update next to it.')),
+                           ('•', _('Os módulos de som do seu console (libSceNgs2, libSceUlt), para ter som.',
+                                   "Your console's sound modules (libSceNgs2, libSceUlt), for sound.")),
+                           ('•', _('Uma placa de vídeo com Vulkan 1.3 e o driver atualizado.',
+                                   'A video card with Vulkan 1.3 and an up-to-date driver.')),
+                           ('•', _('O jogo num SSD ou NVMe: num HD as trocas de área travam muito mais.',
+                                   'The game on an SSD or NVMe drive: on a hard disk area changes stutter far more.'))):
+            self.setup_line(card, mark, text)
+
+    # -- II · the shrine
+    def setup_game(self):
+        ttk = self.ttk
+        self.setup_title.configure(text=_('Onde está o seu jogo?', 'Where is your game?'))
+        self.setup_lead.configure(text=_('A pasta principal do jogo, como no shadPS4: as subpastas do jogo, da atualização '
+                                         '(-UPDATE/-patch) e das DLCs são encontradas sozinhas.',
+                                         "The game's main folder, as in shadPS4: the game, update (-UPDATE/-patch) and "
+                                         'DLC subfolders are found on their own.'))
+        card = self.setup_card()
+        row = ttk.Frame(card, style='Inner.TFrame')
+        row.pack(anchor='w')
+        self.setup_button = ttk.Button(row, text=_('Escolher a pasta do jogo…', 'Choose the game folder…'),
+                                       style='Card.Accent.TButton', command=self.choose_game_for_setup)
+        self.setup_button.pack(side='left')
+        self.setup_hint = ttk.Label(card, text='', style='Card.TLabel', cursor='hand2', wraplength=self.px(640))
+        self.setup_hint.pack(anchor='w', pady=(self.px(10), 0))
+        self.setup_results = ttk.Frame(self.setup_body, style='TFrame')
+        self.setup_results.pack(fill='x')
+        current = self.var('game_dir').get()
+        if game_info(current):
+            self.configure_from_game(current)
+        elif self.setup_found_game:
+            self.offer_game(self.setup_found_game)
+        else:
+            self.setup_hint.configure(text=_('Procurando o jogo neste PC…', 'Looking for the game on this PC…'),
+                                      foreground=MUTED)
+        if not game_info(current):
+            self.setup_next.configure(state='disabled')
+
+    # -- III · the ancient sword
+    def setup_pc(self):
+        ttk = self.ttk
+        self.setup_title.configure(text=_('A força da sua espada', "Your sword's strength"))
+        self.setup_lead.configure(text=_('O launcher olha o seu PC e escolhe o modo de jogo que ele aguenta. Você pode '
+                                         'trocar aqui ou depois na aba Jogar.',
+                                         'The launcher looks at your PC and picks the play mode it can hold. You can '
+                                         'change it here or later on the Play page.'))
+        self.setup_pc_card = self.setup_card(_('O seu PC', 'Your PC'))
+        ttk.Label(self.setup_pc_card, text=_('Verificando…', 'Checking…'), style='Card.TLabel').pack(anchor='w')
+        card = self.setup_card(_('Modo de jogo', 'Play mode'))
+        row = ttk.Frame(card, style='Inner.TFrame')
+        row.pack(anchor='w')
+        self.setup_mode_var = self.tk.StringVar(value=self.var('play_mode').get() or 'custom')
+        values = [v for v, _t in PLAY_MODES]
+        combo = ttk.Combobox(row, values=[_(*t) for _v, t in PLAY_MODES], state='readonly', width=30, style='Card.TCombobox')
+        combo.pack(side='left')
+        combo.current(values.index(self.setup_mode_var.get()) if self.setup_mode_var.get() in values else 3)
+        combo.bind('<<ComboboxSelected>>', lambda _e: self.setup_mode_var.set(values[combo.current()]))
+        self.setup_mode_combo, self.setup_mode_values = combo, values
+        self.setup_mode_hint = ttk.Label(card, text='', style='Card.TLabel', wraplength=self.px(640), justify='left',
+                                         foreground=MUTED)
+        self.setup_mode_hint.pack(anchor='w', pady=(self.px(8), 0))
+        self.setup_mode_var.trace_add('write', lambda *_a: self.setup_mode_hint.configure(
+            text=_(*PLAY_MODE_HINTS.get(self.setup_mode_var.get(), ('', '')))) if self.setup_mode_hint.winfo_exists() else None)
+        self.setup_mode_hint.configure(text=_(*PLAY_MODE_HINTS.get(self.setup_mode_var.get(), ('', ''))))
+        if self.setup_hw:
+            self.setup_pc_done(self.setup_hw)
+        else:
+            game, gpu = self.var('game_dir').get(), self.gpu_text
+
+            def work():
+                info = sotc_hardware.check(game, gpu)
+                self.ui_calls.put(lambda: self.setup_pc_done(info, fresh=True))
+            threading.Thread(target=work, daemon=True).start()
+
+    def setup_pc_done(self, info, fresh=False):
+        self.setup_hw = info
+        if self.setup_step != 2 or not self.setup_pc_card.winfo_exists():
+            return
+        for child in list(self.setup_pc_card.winfo_children())[1:]:
+            child.destroy()
+        threads, memory, video, disk = info['threads'], info['memory'], info['video_memory'], info['disk']
+        self.setup_line(self.setup_pc_card, '✓' if (threads or 0) >= 8 else '⚠',
+                        _('Processador: {} ({} threads)', 'Processor: {} ({} threads)').format(info['cpu'] or '?', threads or '?'))
+        self.setup_line(self.setup_pc_card, '✓' if (memory or 0) >= 12 else '⚠',
+                        _('Memória: {} GB', 'Memory: {} GB').format(memory or '?'))
+        self.setup_line(self.setup_pc_card, '✓' if (video or 0) >= 6 else '⚠',
+                        self.gpu_text.lstrip('✓✗• ') if video else _('Placa de vídeo: ainda verificando', 'Video card: still checking'))
+        self.setup_line(self.setup_pc_card, '✓' if disk in ('nvme', 'ssd') else '⚠' if disk == 'hdd' else '•',
+                        {'nvme': _('Disco do jogo: NVMe', 'Game disk: NVMe'), 'ssd': _('Disco do jogo: SSD', 'Game disk: SSD'),
+                         'hdd': _('Disco do jogo: HD — instale o jogo num SSD ou NVMe para trocas de área sem travar',
+                                  'Game disk: hard disk — install the game on an SSD or NVMe for smooth area changes')}
+                        .get(disk, _('Disco do jogo: não foi possível saber o tipo', 'Game disk: type unknown')))
+        if fresh or self.setup_mode_var.get() == 'custom':
+            mode = sotc_hardware.recommend(info)
+            self.setup_mode_var.set(mode)
+            self.setup_mode_combo.current(self.setup_mode_values.index(mode))
+            self.setup_line(self.setup_pc_card, '›', _('Recomendado para este PC: {}', 'Recommended for this PC: {}').format(
+                _(*dict(PLAY_MODES)[mode]).split(' (')[0]))
+
+    # -- IV · agro
+    def setup_controls(self):
+        self.setup_title.configure(text=_('Agro, sua companheira', 'Agro, your companion'))
+        self.setup_lead.configure(text=_('Controle ou teclado e mouse: os dois funcionam juntos. Conecte o controle antes '
+                                         'de abrir o jogo.', 'Controller or keyboard and mouse: both work together. Connect '
+                                         'the controller before starting the game.'))
+        card = self.setup_card(_('Controle', 'Controller'))
+        row = self.ttk.Frame(card, style='Inner.TFrame')
+        row.pack(anchor='w', pady=(0, self.px(6)))
+        self.ttk.Label(row, text=_('Ícones dos botões', 'Button icons'), style='Card.TLabel').pack(side='left', padx=(0, self.px(14)))
+        box = self.choice(row, 'button_icons', BUTTON_ICONS, 26)
+        box.configure(style='Card.TCombobox')
+        box.pack(side='left')
+        self.ttk.Checkbutton(card, text=_('Vibração do controle', 'Controller vibration'), variable=self.var('rumble'),
+                             style='Card.TCheckbutton').pack(anchor='w')
+        card = self.setup_card(_('Teclado e mouse', 'Keyboard and mouse'))
+        self.ttk.Checkbutton(card, text=_('Câmera no mouse', 'Mouse camera'), variable=self.var('mouse'),
+                             style='Card.TCheckbutton').pack(anchor='w')
+        self.ttk.Label(card, text=_('W A S D andam, as setas giram a câmera, Espaço é ✕. As teclas mudam na aba Controles.',
+                                    'W A S D move, the arrows turn the camera, Space is ✕. The keys change on the Controls page.'),
+                       style='Card.TLabel', wraplength=self.px(640), justify='left', foreground=MUTED).pack(anchor='w', pady=(self.px(6), 0))
+
+    # -- V · the forbidden land
+    def setup_ready(self):
+        self.setup_title.configure(text=_('A Terra Proibida espera', 'The Forbidden Land awaits'))
+        self.setup_lead.configure(text=_('Tudo pronto. A primeira abertura monta o cache de shaders: algumas travadas no '
+                                         'começo são normais.', 'All set. The first start builds the shader cache: a few '
+                                         'stutters at first are normal.'))
+        card = self.setup_card(_('Resumo', 'Summary'))
+        info = game_info(self.var('game_dir').get())
+        self.setup_line(card, '✓' if info else '✗', _('Jogo: {} (versão {})', 'Game: {} (version {})').format(*info)
+                        if info else _('Jogo: não escolhido', 'Game: not chosen'))
+        self.setup_line(card, '✓' if self.sound_ready() else '⚠', _('Som: pronto', 'Sound: ready') if self.sound_ready()
+                        else _('Som: sem os módulos, o jogo roda mudo', 'Sound: without the modules the game runs silent'))
+        mode = self.var('play_mode').get()
+        self.setup_line(card, '✓', _('Modo de jogo: {}', 'Play mode: {}').format(_(*dict(PLAY_MODES).get(mode, ('', '')))))
+        self.setup_line(card, '✓', self.summary())
 
     def offer_game(self, path):
         if not getattr(self, 'setup_hint', None) or not self.setup_hint.winfo_exists():
             return
         self.setup_found_game = path
         self.setup_hint.configure(text=_('Encontrado: {}   —   clique aqui para usar', 'Found: {}   —   click here to use it')
-                                  .format(path), fg=GOLD)
+                                  .format(path), foreground=GOLD)
         self.setup_hint.bind('<Button-1>', lambda _e: self.configure_from_game(path))
 
     def choose_game_for_setup(self):
@@ -1853,7 +2891,7 @@ class Launcher:
         """Game chosen: DLC from the game folder, saves, sound — in the background."""
         self.setup_button.configure(state='disabled')
         self.setup_hint.unbind('<Button-1>')
-        self.setup_hint.configure(text=_('Configurando…', 'Setting up…'), fg=MUTED)
+        self.setup_hint.configure(text=_('Configurando…', 'Setting up…'), foreground=MUTED)
         user = user_dir({'user_dir': self.var('user_dir').get()})
 
         def work():
@@ -1908,6 +2946,9 @@ class Launcher:
         folders = self.app.setdefault('library_dirs', [])
         if str(Path(result['game']).parent) not in folders:
             folders.append(str(Path(result['game']).parent))
+        if self.setup_step != 1 or not self.setup_results.winfo_exists():
+            self.collect()
+            return
         self.setup_hint.configure(text='')
         for child in self.setup_results.winfo_children():
             child.destroy()
@@ -1928,19 +2969,16 @@ class Launcher:
              _('Som: pronto', 'Sound: ready') if result['sound'] else
              _('Som: módulos não encontrados — o jogo roda mudo', 'Sound: modules not found — the game runs silent')),
         ]
+        card = ttk.Frame(self.setup_results, style='Card.TFrame', padding=(self.px(20), self.px(16)))
+        card.pack(fill='x')
+        ttk.Label(card, text=_('Encontrado', 'Found'), style='Card.Section.TLabel').pack(anchor='w', pady=(0, self.px(6)))
         for mark, text in lines:
-            color = GOLD if mark == '✓' else '#d9b441' if mark == '⚠' else MUTED
-            row = tk.Frame(self.setup_results, bg=BG)
-            row.pack(anchor='w', pady=2)
-            tk.Label(row, text=mark, bg=BG, fg=color, font=(ui_font(), 12), width=2).pack(side='left')
-            tk.Label(row, text=text, bg=BG, fg=TEXT, font=(ui_font(), 11)).pack(side='left')
-        buttons = tk.Frame(self.setup_results, bg=BG)
-        buttons.pack(pady=(20, 0))
+            self.setup_line(card, mark, text)
         if not result['sound']:
-            ttk.Button(buttons, text=_('Escolher a pasta do som…', 'Choose the sound folder…'),
-                       command=self.choose_sound_for_setup).pack(side='left', padx=(0, 8))
-        ttk.Button(buttons, text=_('Começar', 'Start'), style='Play.TButton', command=self.finish_setup).pack(side='left')
+            ttk.Button(card, text=_('Escolher a pasta do som…', 'Choose the sound folder…'), style='Card.TButton',
+                       command=self.choose_sound_for_setup).pack(anchor='w', pady=(self.px(10), 0))
         self.setup_button.configure(state='normal', text=_('Trocar a pasta do jogo…', 'Change the game folder…'))
+        self.setup_next.configure(state='normal')
         self.collect()
 
     def choose_sound_for_setup(self):
@@ -2143,6 +3181,7 @@ class Launcher:
             self.append(_('Não foi possível iniciar: {}', 'Could not start: {}').format(error) + '\n')
             self.process = None
             return
+        self.pad_stop()  # the controllers are the game's now
         self.job = GameJob(self.process)
         threading.Thread(target=self.read_output, args=(self.process,), daemon=True).start()
         self.play_button.configure(state='disabled')
@@ -2207,6 +3246,7 @@ class Launcher:
                         self.job.close()
                     self.stop_button.configure(state='disabled')
                     self.refresh_status()
+                    self.exit_backup()
                 else:
                     if 'Entering original x86-64 code' in item:
                         self.status.configure(text=_('O jogo está rodando.', 'The game is running.'), fg=GOLD)
@@ -2254,24 +3294,18 @@ class Launcher:
             'Cache de shaders limpo. A próxima partida engasga alguns minutos enquanto ele é refeito.',
             'Shader cache cleared. The next start stutters for a few minutes while it is rebuilt.'))
 
-    def shortcut(self):
+    def shortcut(self, play=False):
         self.collect()
-        game_icon = self.game_icon_file()
-        if FROZEN:
-            target, arguments, icon = sys.executable, '', game_icon or f'{sys.executable},0'
-        else:
-            pythonw = Path(sys.executable).with_name('pythonw.exe')
-            target = str(pythonw if pythonw.exists() else sys.executable)
-            arguments, icon = Path(__file__).resolve(), PORT_DIR / 'launcher' / 'sotc.ico'
-        script = ('$s=(New-Object -ComObject WScript.Shell).CreateShortcut([Environment]::GetFolderPath("Desktop")'
-                  '+"\\Shadow of the Colossus.lnk");'
-                  f'$s.TargetPath="{target}";$s.WorkingDirectory="{PORT_DIR}";$s.IconLocation="{icon}";'
-                  + (f"$s.Arguments='\"{arguments}\"';" if arguments else '') + '$s.Save()')
+        script = _shortcut_script(play, FROZEN, sys.executable, PORT_DIR, self.game_icon_file())
         result = subprocess.run(['powershell', '-NoProfile', '-Command', script], capture_output=True,
                                 creationflags=NO_WINDOW)
         if result.returncode == 0:
-            self.messagebox.showinfo('Shadow of the Colossus', _('Atalho criado na área de trabalho.',
-                                                                 'Shortcut created on the desktop.'))
+            self.messagebox.showinfo('Shadow of the Colossus', _(
+                'Atalho criado na área de trabalho. Ele abre o jogo direto e pode ser adicionado ao Steam como '
+                'jogo não-Steam.',
+                'Shortcut created on the desktop. It starts the game directly and can be added to Steam as a '
+                'non-Steam game.') if play else _('Atalho criado na área de trabalho.',
+                                                  'Shortcut created on the desktop.'))
         else:
             self.messagebox.showerror('Shadow of the Colossus', result.stderr.decode(errors='replace')[:400])
 
@@ -2296,7 +3330,13 @@ class Launcher:
         if manual:
             self.refresh_status()
         if error or not sotc_update.is_newer(release, VERSION):
-            if manual and error:
+            if manual and error and sotc_update.is_cert_error(error):
+                self.messagebox.showwarning('Shadow of the Colossus', _(
+                    'Não foi possível verificar a conexão com o GitHub (certificado não reconhecido).\n'
+                    'Baixe a versão nova manualmente em:\n{}',
+                    'The connection to GitHub could not be verified (certificate not trusted).\n'
+                    'You can download the new version manually from:\n{}').format(sotc_update.RELEASES_PAGE))
+            elif manual and error:
                 self.messagebox.showwarning('Shadow of the Colossus', _(
                     'Não foi possível procurar atualização:\n{}', 'Could not check for updates:\n{}').format(error))
             elif manual:
@@ -2305,7 +3345,7 @@ class Launcher:
             return
         if not manual and release['version'] == self.app.get('skip_version'):
             return
-        notes = release['notes'].strip()
+        notes = sotc_update.notes_for(release['notes'], LANG != 'pt')  # other languages fall back to English
         if len(notes) > 900:
             notes = notes[:900].rsplit('\n', 1)[0] + '\n…'
         question = _('Há uma versão nova: v{new} (você tem v{cur}).\n\n{notes}\n\n',
@@ -2351,6 +3391,10 @@ class Launcher:
                 sotc_update.start_applier(new_root, PORT_DIR)
             except Exception as problem:
                 error = problem
+        if error and sotc_update.is_cert_error(error):
+            error = _('não foi possível verificar a conexão com o GitHub. Baixe manualmente em:\n{}',
+                      'the connection to GitHub could not be verified. Download it manually from:\n{}').format(
+                sotc_update.RELEASES_PAGE)
         if error:
             self.updating = False
             self.refresh_status()
@@ -2452,12 +3496,19 @@ def main():
         sys.exit(0 if sotc_update.apply_update(args[1], args[2], int(args[3])) else 1)
     if args and args[0] == '--update-now':
         attach_stdio()
-        release = sotc_update.latest_release()
-        if not sotc_update.is_newer(release, VERSION):
-            print(f'up to date (v{VERSION}, latest {release and release["version"]})')
-            sys.exit(0)
-        print(f'updating v{VERSION} -> v{release["version"]}')
-        new_root = sotc_update.download(release, PORT_DIR / 'update')
+        try:
+            release = sotc_update.latest_release()
+            if not sotc_update.is_newer(release, VERSION):
+                print(f'up to date (v{VERSION}, latest {release and release["version"]})')
+                sys.exit(0)
+            print(f'updating v{VERSION} -> v{release["version"]}')
+            new_root = sotc_update.download(release, PORT_DIR / 'update')
+        except OSError as error:
+            if not sotc_update.is_cert_error(error):
+                raise
+            print(f'the connection to GitHub could not be verified ({error}); '
+                  f'download the release manually from {sotc_update.RELEASES_PAGE}')
+            sys.exit(1)
         if FROZEN:
             sotc_update.start_applier(new_root, PORT_DIR)
         sys.exit(0)

@@ -37,7 +37,19 @@ Na primeira vez a imagem do jogo é preparada, o que leva alguns segundos. Isso 
 quando o jogo ou os módulos mudam. Os saves e o cache de shaders ficam em `user/`.
 
 Sem o lançador, `SotC.bat` faz o mesmo lendo `sotc.ini`. `SotC.exe --play` abre o jogo direto
-com as últimas opções do lançador, o que serve para atalhos e para o Steam.
+com as últimas opções do lançador, o que serve para atalhos e para o Steam. O botão "Atalho para
+jogar direto" do lançador (Avançado) cria esse atalho na área de trabalho, que pode ser adicionado
+ao Steam como jogo não-Steam.
+
+O lançador procura versões novas no GitHub ao abrir. Se a conexão com o GitHub não puder ser
+verificada (erro de certificado, comum com antivírus ou proxy que inspecionam HTTPS, ou com o
+Windows sem os certificados raiz atualizados), ele avisa e mostra o endereço para baixar a versão
+nova manualmente: https://github.com/AjncSystem/ShadowOfTheColossus-PC/releases
+
+Ao procurar atualização, o lançador mostra as notas da versão do GitHub. Quem publica uma versão
+pode incluir uma seção `## English` no texto: o lançador em português mostra só o que vem antes dela,
+e em outros idiomas mostra só essa seção (até um `## Português`, se houver). Sem essa seção, o texto
+aparece inteiro.
 
 ## Imagem e desempenho
 
@@ -73,6 +85,14 @@ ou `CUSA08034`) e só usa DLCs da mesma região.
 trocar de janela solta o mouse. Botão esquerdo = R1 (agarrar), direito = □ (atacar),
 meio = L1. Sensibilidade e inversão ficam em **Controles** no lançador. Para remapear os botões
 do mouse, use `mouse.<entrada>=left,right,middle,x1,x2`.
+
+**Remapear (`sotc.ini`):** uma linha por entrada, com várias opções separadas por vírgula (vazio =
+sem tecla). `key.<entrada>=` troca as teclas (nomes do SDL, como `Q`, `Left Shift`, `Space`) e
+`mouse.<entrada>=` os botões do mouse. Entradas: `cross circle square triangle l1 r1 l2 r2 l3 r3
+options touchpad touchpad_right up down left right move_up move_down move_left move_right look_up
+look_down look_left look_right`. Exemplos: atacar com o botão esquerdo e o raio da espada com o
+direito: `mouse.square=left` e `mouse.l1=right` (e `mouse.r1=` para soltar o R1); L1/R1 em outras
+teclas: `key.l1=Q` e `key.r1=E`.
 
 Um controle (DualShock 4, DualSense, Xbox...) é usado automaticamente. Com vários conectados,
 escolha um em **Controles** no lançador (ou `BB_GAMEPAD=` no `sotc.ini`). O teclado funciona

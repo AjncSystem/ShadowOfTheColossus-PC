@@ -21,6 +21,7 @@ layout(push_constant) uniform Params {
     uint inverted;     // depth 0 at the far plane
     float sky_bias;    // bias hint for the sky (0..1)
     float sky_depth;   // the sky's depth is this near the far plane
+    float scene_bias;  // bias hint for everything else: a moving shadow has no motion vector
 } pc;
 
 void main() {
@@ -31,7 +32,7 @@ void main() {
     const vec2 mv = imageLoad(mvec, p).xy;
     const float depth = texelFetch(depth_tex, p, 0).x;
     const bool sky = pc.inverted != 0u ? depth <= pc.sky_depth : depth >= 1.0 - pc.sky_depth;
-    const float b = sky ? pc.sky_bias : 0.0;
+    const float b = sky ? pc.sky_bias : pc.scene_bias;
     imageStore(bias, p, vec4(b, sky ? 1.0 : 0.0, 0.0, 0.0)); // g: sky mask (post process)
     if (pc.fill_all == 0u && (mv.x != 0.0 || mv.y != 0.0)) {
         return;

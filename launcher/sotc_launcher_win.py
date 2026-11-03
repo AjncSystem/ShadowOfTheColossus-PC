@@ -362,6 +362,8 @@ UPSCALERS = [('fsr1', ('FSR 1 (AMD, qualquer placa)', 'FSR 1 (AMD, any GPU)')),
              ('fsr4', ('AMD FSR 4.1 (RX 6000+; FSR 3.1 nas outras, experimental)',
                        'AMD FSR 4.1 (RX 6000+; FSR 3.1 on others, experimental)')),
              ('bilinear', ('Bilinear (simples)', 'Bilinear (plain)'))]
+if not IS_WINDOWS:  # AMD's SDK ships as Windows DLLs only (vk_fsr4.cpp)
+    UPSCALERS = [upscaler for upscaler in UPSCALERS if upscaler[0] != 'fsr4']
 # Button icons in the game: the PlayStation prompts, or Xbox ones drawn for the port
 # (tools/make_button_icons.py, glyphs/xbox) put in place of the game's textures.
 BUTTON_ICONS = [('ps', ('PlayStation (do jogo)', 'PlayStation (the game\'s)')),

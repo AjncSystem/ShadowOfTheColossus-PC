@@ -1468,8 +1468,22 @@ void runtime_memory_cache_stats(uint64_t *misses, uint64_t *stale, uint64_t *fas
 /* sotc: the VMA holding address, read without the lock (0: none there, or the array kept changing:
  * take the lock). A torn read is caught by vma_seq. With gap_lo/gap_hi, an address in no VMA
  * returns 2 and the unmapped range around it instead of 0. */
+/* sotc: SOTC_SEQ_SPIN (default 256): reads retried while a writer is inside a vma_seq section,
+ * with a short pause between them (~25 us at most). Those sections last a memmove of the VMA
+ * array; with 4 immediate tries the read gave up nearly every time it met one, and the GPU then
+ * took the read lock and waited for the writer's whole map entry (~0.4 ms): ~14k waits per ride. */
+static int seq_spin_tries(void) {
+    static int v=-1;
+    if (v<0) { const char *e=getenv("SOTC_SEQ_SPIN"); v=e ? atoi(e) : 256; if (v<4) v=4; }
+    return v;
+}
+static inline void seq_pause(int tries) {
+    if (tries<4) return;
+    for (int i=0;i<8;++i) __builtin_ia32_pause();
+}
 static int vma_lookup_gap(uintptr_t address, Vma *out, uintptr_t *gap_lo, uintptr_t *gap_hi) {
-    for (int tries=0; tries<4; ++tries) {
+    const int max_tries=seq_spin_tries();
+    for (int tries=0; tries<max_tries; seq_pause(++tries)) {
         const uint64_t s=__atomic_load_n(&vma_seq,__ATOMIC_ACQUIRE);
         if (s & 1) continue;
         const Vma *v=__atomic_load_n(&vmas,__ATOMIC_ACQUIRE);

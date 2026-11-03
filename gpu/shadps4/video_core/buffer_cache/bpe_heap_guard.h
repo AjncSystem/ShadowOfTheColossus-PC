@@ -87,6 +87,10 @@ private:
         const u8* ptr;
     };
     mutable std::vector<Run> runs;
+    /// sotc: index of the run the last Read hit (the walk reads node after node in one run)
+    mutable size_t last_run = 0;
+    /// sotc: starts loading the cache line of addr when a known run holds it (CollectFreeTree)
+    void Prefetch(VAddr addr) const;
 };
 
 /**

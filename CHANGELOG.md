@@ -19,6 +19,9 @@
   upscaler, texturas, controles, saves...), com Python e Tk próprios dentro dela, sem instalar
   nada. Na primeira abertura ele lê o `sotc.ini` que já existir. `--play` joga com os ajustes
   salvos sem abrir a janela (opções de inicialização da Steam).
+- **Só no Windows:** o AMD FSR 4.1 (a AMD distribui o upscaler do SDK apenas como DLLs do Windows; a
+  opção não aparece no lançador do Linux) e a pré-leitura de páginas nas cópias de textura
+  (`SOTC_COPY_PREFETCH`).
 
 ## 0.75 — 2026-11-12
 - 🔊 **Som sem os módulos do console: os arquivos do PS4 deixam de ser obrigatórios** (Oussama268, a partir do HayatoG/tlg_pc, GPL-2.0): quando faltam o `libSceNgs2.sprx` e o `libSceUlt.sprx`, um mixer NGS2 embutido toca o som do jogo (ATRAC9 pela LibAtrac9). **Ele é o padrão para todos**; quem preferir o som do firmware marca "Usar os módulos de som do meu console" em Jogo e saves. No teste, som normal e o mesmo FPS nos dois casos (69,7 com o mixer, 69,5 com os módulos). `SOTC_NGS2=native` volta ao comportamento antigo.

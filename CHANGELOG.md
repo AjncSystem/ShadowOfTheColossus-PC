@@ -19,6 +19,9 @@
   upscaler, texturas, controles, saves...), com Python e Tk próprios dentro dela, sem instalar
   nada. Na primeira abertura ele lê o `sotc.ini` que já existir. `--play` joga com os ajustes
   salvos sem abrir a janela (opções de inicialização da Steam).
+- **Só no Windows:** o AMD FSR 4.1 (a AMD distribui o upscaler do SDK apenas como DLLs do Windows; a
+  opção não aparece no lançador do Linux) e a pré-leitura de páginas nas cópias de textura
+  (`SOTC_COPY_PREFETCH`).
 
 ## 0.72 — 2026-11-03
 - **Melhorias que a correção do T38 liberou, agora ligadas por padrão** (testadas em todos os colossos do

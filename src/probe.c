@@ -209,6 +209,10 @@ __asm__(".text\n.globl enter_on_stack\nenter_on_stack:\n"
         " mov %rbp,%rsp\n pop %rbp\n ret\n");
 #endif
 static ABI void guest_exit(void) { puts("Runtime: process finalizer callback reached"); }
+/* T38 (runtime_memory.c): the aliases of a physical page and the page pool release's call site. */
+uintptr_t runtime_memory_alias_of(uintptr_t address);
+int runtime_memory_alias_release(uintptr_t address);
+void runtime_memory_set_release_site(uintptr_t site);
 /* sotc: with the user's own libSceNgs2/libSceUlt linked (link_modules.py --sys-modules) their
  * native code replaces the runtime's silent audio stand-ins. */
 static int prefer_native(const char *name, int bound) {
@@ -879,9 +883,6 @@ static int helper_single_step(EXCEPTION_POINTERS *info) {
 #define HEAP_FREE_OFFSET 0x495e0
 const unsigned char *runtime_memory_backing_pointer(uintptr_t address);
 const unsigned char *runtime_memory_backing_view(uint64_t *size);
-uintptr_t runtime_memory_alias_of(uintptr_t address);
-int runtime_memory_alias_release(uintptr_t address);
-void runtime_memory_set_release_site(uintptr_t site);
 #define HEAP_HOOK_CALLS 2000
 static unsigned char heap_hook_original;
 static volatile LONG heap_hook_calls, heap_hook_done;
@@ -2088,7 +2089,13 @@ int main(int argc, char **argv) {
 #endif
     if (sotc_cpu) apply_sotc_cpu_patches(sotc_cpu, segments, ns, size);
     if (sotc_cmdline) apply_sotc_cmdline(sotc_cmdline, size);
-    if (sotc_cpu) { install_heap_hook(); install_pool_hook(); install_release_hook(); }
+    if (sotc_cpu) {
+        install_heap_hook();
+#ifdef _WIN32  /* diagnostics (SOTC_POOL_LOCK_CHECK, SOTC_POOL_FREE_TRACE) on the Windows exception path */
+        install_pool_hook();
+        install_release_hook();
+#endif
+    }
     /* T38: the page pool release's VirtualQuery call (runtime_memory.c, SOTC_POOL_OWNER) */
     if (sotc_cpu && image[0x1ac7d]==0xE8) runtime_memory_set_release_site((uintptr_t)(image+0x1ac82));
     { void bb_set_guest_image(uintptr_t base); bb_set_guest_image((uintptr_t)image); }

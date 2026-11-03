@@ -28,7 +28,6 @@ import threading
 import time
 import zipfile
 
-import sotc_frame
 import sotc_hardware
 import sotc_pad
 import sotc_search
@@ -37,6 +36,8 @@ import sotc_update
 
 FROZEN = getattr(sys, 'frozen', False)
 IS_WINDOWS = os.name == 'nt'
+if IS_WINDOWS:  # the own title bar (Windows' window procedure); Linux keeps the window manager's
+    import sotc_frame
 PORT_DIR = Path(sys.executable).resolve().parent if FROZEN else Path(__file__).resolve().parent.parent
 # Writable data (sotc.ini, user/), as sotc.py: the port's folder unless SOTC_DATA_DIR names another.
 DATA_DIR = Path(os.environ.get('SOTC_DATA_DIR') or PORT_DIR)
@@ -834,7 +835,10 @@ def window_icon_file(s):
 
 
 def monitors():
-    """This PC's monitors: [(device name, label, (x, y) of its centre, primary)], the primary first."""
+    """This PC's monitors: [(device name, label, (x, y) of its centre, primary)], the primary first.
+    Windows only (EnumDisplayMonitors); elsewhere none, and the game opens on the primary one."""
+    if not IS_WINDOWS:
+        return []
     from ctypes import wintypes
 
     class MONITORINFOEXW(ctypes.Structure):
@@ -1393,7 +1397,7 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
     def build(self):
         tk, ttk = self.tk, self.ttk
         self.custom_frame, self.tray = None, None
-        self.titlebar = None if self.app.get('windows_title_bar') else self.build_titlebar()
+        self.titlebar = None if self.app.get('windows_title_bar') or not IS_WINDOWS else self.build_titlebar()
         self.root.bind('<Unmap>', self.minimized, add='+')
         side = tk.Frame(self.root, bg=BG, width=self.px(220))
         side.pack(side='left', fill='y')
@@ -1913,8 +1917,7 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                      'Generates the in-between frames from the scene only and draws the interface on top, '
                      'uninterpolated: removes the shaking health/stamina bars and text. It can fade the '
                      'logo on the title screen and show the old scene behind loading screens.'))
-        if IS_WINDOWS:  # Pillow makes the icon (window_icon_file); the AppImage's Python has none
-            self.window_icon_row(f)
+        self.window_icon_row(f)
         self.section(f, _('Resolução', 'Resolution'))
         self.row(f, _('Saída', 'Output'), self.choice(f, 'output_res', OUTPUTS),
                  _('O jogo renderiza nesse tamanho. '

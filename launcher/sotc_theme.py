@@ -56,9 +56,18 @@ def load_fonts(root):
     """Registers the bundled fonts for this process only and picks the families Tk sees."""
     global HEAD, HEAD_BOLD, BODY, BODY_MEDIUM, BODY_SEMI, ICONS
     import tkinter.font as tkfont
+    fontconfig = None
+    if not hasattr(ctypes, 'windll'):  # Linux: fontconfig, which Tk's Xft fonts come from
+        try:
+            fontconfig = ctypes.CDLL('libfontconfig.so.1')
+        except OSError:
+            pass
     for path in sorted((ASSETS / 'fonts').glob('*.ttf')):
         try:
-            ctypes.windll.gdi32.AddFontResourceExW(str(path), 0x10, 0)  # FR_PRIVATE
+            if fontconfig is not None:
+                fontconfig.FcConfigAppFontAddFile(None, str(path).encode())
+            else:
+                ctypes.windll.gdi32.AddFontResourceExW(str(path), 0x10, 0)  # FR_PRIVATE
         except (AttributeError, OSError):
             pass
     families = set(tkfont.families(root))

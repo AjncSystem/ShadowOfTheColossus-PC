@@ -220,7 +220,7 @@ bibliotecas para a AppImage / drags ~100 libraries into the AppImage. O
 **Fedora (43+):**
 
 ```
-sudo dnf install gcc gcc-c++ make cmake ninja-build pkgconf-pkg-config python3 python3-tkinter git nasm patchelf \
+sudo dnf install gcc gcc-c++ make cmake ninja-build pkgconf-pkg-config python3 python3-tkinter python3-pillow-tk git nasm patchelf \
     vulkan-headers vulkan-loader-devel glslang VulkanMemoryAllocator-devel SDL3-devel \
     fmt-devel boost-devel robin-map-devel xxhash-devel zydis-devel libX11-devel
 git submodule update --init --recursive
@@ -234,7 +234,7 @@ bash packaging/linux/build_appimage.sh      # dist/SotC-PC-<versão>-linux-x86_6
 GCC 13, SDL and Vulkan headers are too old:
 
 ```
-sudo apt install build-essential gcc-14 g++-14 cmake ninja-build pkg-config python3 python3-tk git nasm \
+sudo apt install build-essential gcc-14 g++-14 cmake ninja-build pkg-config python3 python3-tk python3-pil python3-pil.imagetk git nasm \
     patchelf libvulkan-dev glslang-tools libvulkan-memory-allocator-dev libfmt-dev libboost-dev \
     libxxhash-dev libzydis-dev libx11-dev libxext-dev libwayland-dev libxkbcommon-dev \
     libpulse-dev libasound2-dev
@@ -249,10 +249,10 @@ bash packaging/linux/build_appimage.sh
 **NixOS:** `./build.sh` entra sozinho no / enters `shell.nix` by itself (FFmpeg do Nix / Nix's FFmpeg).
 
 Testes / tests: `./build.sh --test`. A AppImage leva o loader, a biblioteca de GPU, os scripts, o
-lançador com o Python e o Tcl/Tk da máquina de build e as bibliotecas que eles usam, menos o
+lançador com o Python, o Tcl/Tk e o Pillow da máquina de build e as bibliotecas que eles usam, menos o
 sistema base (glibc, libstdc++, loader do Vulkan, fontconfig, freetype) e as que o driver de vídeo
 e o servidor de som do sistema carregam (Wayland, X11/xcb, libdrm, gbm, expat, zlib, zstd, PipeWire, ALSA) / The AppImage carries the
-loader, GPU library, scripts, the launcher with the build machine's Python and Tcl/Tk, and their
+loader, GPU library, scripts, the launcher with the build machine's Python, Tcl/Tk and Pillow, and their
 libraries except the base system (glibc, libstdc++, Vulkan loader, fontconfig, freetype) and those
 the host's graphics driver and sound server load (Wayland, X11/xcb, libdrm, gbm, expat, zlib, zstd,
 PipeWire, ALSA). Precisa de / needs `patchelf`; o `appimagetool` é baixado em /

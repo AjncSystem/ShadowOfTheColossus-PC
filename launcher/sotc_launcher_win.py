@@ -47,7 +47,7 @@ CONFIG_FILE = CONFIG_DIR / 'launcher_settings.json'
 from sotc_modes import GAMES  # noqa: E402
 GAME_ID = 'CUSA08809'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.71'
+VERSION = '0.72'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -170,11 +170,11 @@ def windows_language():
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
                 'user_dir': '', 'af16': True, 'textures': 'high', 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
-                'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'rb_hot': False, 'skip_logos': True, 'skip_film': False, 'close_on_play': False, 'gamepad': '', 'rumble': True,
+                'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'rb_hot': True, 'skip_logos': True, 'skip_film': False, 'close_on_play': False, 'gamepad': '', 'rumble': True,
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'fx_motionblur': False, 'engine_cvars': '', 'perf_culling': True,
-                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'volume': '100', 'shadow_reuse': '0', 'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1', 'weed_distance': '1', 'weed_height': '1', 'grass_fade': '1', 'grass_detail': '0.25', 'library_dirs': [], 'keys': {},
+                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'volume': '100', 'shadow_reuse': '0', 'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1', 'weed_distance': '1', 'weed_height': '1', 'grass_fade': '1', 'grass_detail': '1', 'library_dirs': [], 'keys': {},
                 'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'fg_hudless': True,
                 'dlss_mode': 'quality', 'dlss_sharpen': '0', 'dlss_ui_sharpen': '3', 'dlss_sky_sharpen': '2',
                 'dlss_compare': False, 'hdr': False,
@@ -186,6 +186,9 @@ DEFAULT_UPGRADES = [
     # HUD and letters stop shaking with frame generation; no shadow trail in dark areas (motion
     # blur); straight to the game.
     ('0.71', {'fg_hudless': True, 'fx_motionblur': False, 'skip_logos': True}),
+    # Fast GPU readbacks; the grass back as on PS4 (the play modes no longer change it).
+    ('0.72', {'rb_hot': True, 'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1',
+              'weed_distance': '1', 'weed_height': '1', 'grass_fade': '1', 'grass_detail': '1'}),
 ]
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
 KEY_INPUTS = [
@@ -265,25 +268,25 @@ PLAY_MODES = [('normal', ('Normal (PS4 puro)', 'Normal (plain PS4)')),
               ('pro', ('Pro (PS4 Pro + qualidade)', 'Pro (PS4 Pro + quality)')),
               ('extreme', ('Extremo (tudo no máximo)', 'Extreme (everything maxed)')),
               ('custom', ('Personalizado', 'Custom'))]
+# The play modes keep the grass as on PS4 (user's choice, 3 Nov): the grass options are left to Custom.
 _PS4_GRASS = {'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1', 'weed_distance': '1',
-              'weed_height': '1', 'grass_fade': '1'}
+              'weed_height': '1', 'grass_fade': '1', 'grass_detail': '1'}
 PLAY_MODE_VALUES = {
     'normal': {'neo': False, 'fps_mode': '30', 'textures': 'high', 'af16': False, 'upscaler': 'fsr1',
-               'sharpness': '250', 'vram_use': 'normal', **_PS4_GRASS, 'grass_detail': '1'},
+               'sharpness': '250', 'vram_use': 'normal', **_PS4_GRASS},
     'pro': {'neo': True, 'fps_mode': '30', 'textures': 'high', 'af16': True, 'vram_use': 'high',
-            **_PS4_GRASS, 'grass_detail': '0.25'},
+            **_PS4_GRASS},
     'extreme': {'neo': True, 'fps_mode': '60', 'textures': 'max', 'af16': True, 'vram_use': 'max',
-                'grass_shadows': '3', 'grass_distance': '2', 'grass_height': '1', 'weed_distance': '2',
-                'weed_height': '1', 'grass_fade': '1', 'grass_detail': '0.15', 'dlss_mode': 'quality'},
+                **_PS4_GRASS, 'dlss_mode': 'quality'},
 }
 PLAY_MODE_HINTS = {
     'normal': ('Como no PS4: 30 FPS, texturas altas, grama e sombras do console, sem o modo Pro.',
                "As on PS4: 30 FPS, high textures, the console's grass and shadows, no Pro mode."),
-    'pro': ('Modo PS4 Pro a 30 FPS com texturas altas, filtro 16x e grama mais cheia.',
-            'PS4 Pro mode at 30 FPS with high textures, 16x filtering and fuller grass.'),
-    'extreme': ('Modo Pro a 60 FPS, texturas máximas, sombras e grama até mais longe, DLSS na RTX. '
+    'pro': ('Modo PS4 Pro a 30 FPS com texturas altas e filtro 16x; grama como no PS4.',
+            'PS4 Pro mode at 30 FPS with high textures and 16x filtering; grass as on PS4.'),
+    'extreme': ('Modo Pro a 60 FPS, texturas máximas, DLSS na RTX; grama como no PS4. '
                 'Pede uma placa forte (8 GB ou mais).',
-                'Pro mode at 60 FPS, maximum textures, shadows and grass farther out, DLSS on RTX. '
+                'Pro mode at 60 FPS, maximum textures, DLSS on RTX; grass as on PS4. '
                 'Needs a strong card (8 GB or more).'),
     'custom': ('Os ajustes abaixo e as outras abas ficam como você deixar.',
                'The settings below and the other tabs stay as you set them.'),
@@ -333,6 +336,10 @@ OUTPUTS = [('1280x720', ('1280 × 720 (16:9, 720p)', '1280 × 720 (16:9, 720p)')
     (size, (f"{size.replace('x', ' × ')} ({label})",) * 2) for size, label in SCREENS]
 UPSCALERS = [('fsr1', ('FSR 1 (AMD, qualquer placa)', 'FSR 1 (AMD, any GPU)')),
              ('dlss', ('NVIDIA DLSS (experimental)', 'NVIDIA DLSS (experimental)')),
+             # AMD FSR SDK 2.4 (bb-probe: SOTC_UPSCALER=fsr4, vk_fsr4.cpp): FSR 4.1 on Radeon RX
+             # 6000/7000/9000, FSR 3.1 on the other cards; render sizes as DLSS's.
+             ('fsr4', ('AMD FSR 4.1 (RX 6000+; FSR 3.1 nas outras, experimental)',
+                       'AMD FSR 4.1 (RX 6000+; FSR 3.1 on others, experimental)')),
              ('bilinear', ('Bilinear (simples)', 'Bilinear (plain)'))]
 # Button icons in the game: the PlayStation prompts, or Xbox ones drawn for the port
 # (tools/make_button_icons.py, glyphs/xbox) put in place of the game's textures.
@@ -807,6 +814,18 @@ def game_environment(s):
     textures = s.get('textures') or 'high'
     if textures != 'off':
         env.setdefault('SOTC_LOD_LINGER', '1')
+        # sotc: what the page pool's double free (fixed in 0.71, SOTC_POOL_OWNER) had held back,
+        # tested on 3 Nov (Time Attack, every colossus, Maximum + PS4 Pro, no crash nor mosaic):
+        # the measured mips, finer mips (High 1, Maximum 0, both were 2) and, on Maximum, banks
+        # kept sampled for 3 s (they had exhausted the pool, 0x1a371).
+        env.setdefault('SOTC_LOD_FEEDBACK', '1')
+        env.setdefault('SOTC_LOD_LEVEL', '0' if textures == 'max' else '1')
+        if textures == 'max':
+            env['SOTC_LOD_LINGER'] = env.get('SOTC_LOD_LINGER') if env.get('SOTC_LOD_LINGER') != '1' else '180'
+    # sotc: the heap guard's two shortcuts, off since 0.70 for the 0x49800 crash, which came from
+    # the same double free: on again (tested with the above).
+    env.setdefault('SOTC_GUARD_STALE', '1')
+    env.setdefault('SOTC_GUARD_USER_POINTER', '1')
     # sotc: "Maximum" in PS4 Pro mode exhausted the game's page pool within minutes at the Shrine
     # (0x1a371, 22 Oct) until tabnul's page allocator fix (PR #288, sotc_modes.py POOL_FIX): an
     # hour without a crash with it (26 Oct). Experimental there; SOTC_MAX_IN_PRO=0 brings back High.
@@ -822,15 +841,15 @@ def game_environment(s):
     # its own sizes.
     output = env['SOTC_OUTPUT_RES']
     upscaler = s.get('upscaler', 'fsr1')
-    if upscaler == 'dlss' and env['SOTC_NEO'] == '0':
+    if upscaler in ('dlss', 'fsr4') and env['SOTC_NEO'] == '0':
         env['SOTC_RENDER_RES'] = dlss_render(output, s.get('dlss_mode'))
     elif output not in ('1280x720', '1920x1080') and env['SOTC_NEO'] == '0':
         env['SOTC_RENDER_RES'] = output
     # DLSS: FSR 1 stays the upscaler of frames without the game's scene (menus) and the fallback
     # without an RTX card or the NVIDIA DLLs.
-    env['BB_FSR1'] = '1' if upscaler in ('fsr1', 'dlss') else '0'
-    if upscaler == 'dlss':
-        env['SOTC_UPSCALER'] = 'dlss'
+    env['BB_FSR1'] = '1' if upscaler in ('fsr1', 'dlss', 'fsr4') else '0'
+    if upscaler in ('dlss', 'fsr4'):
+        env['SOTC_UPSCALER'] = upscaler
         env['SOTC_DLSS_SHARPEN'] = str(s.get('dlss_sharpen') or '0')
         env['SOTC_DLSS_UI_SHARPEN'] = str(s.get('dlss_ui_sharpen') or '3')
         env['SOTC_DLSS_SKY_SHARPEN'] = str(s.get('dlss_sky_sharpen') or '2')
@@ -846,8 +865,9 @@ def game_environment(s):
     env['SOTC_MOUSE'] = '1' if s.get('mouse', True) else '0'
     env['SOTC_MOUSE_SENS'] = str(s.get('mouse_sens') or '1.0')
     env['SOTC_MOUSE_INVERT'] = '1' if s.get('mouse_invert') else '0'
-    # Hot readbacks (buffer_cache.cpp GatherDownloads): ~25% more FPS at the Shrine; off by
-    # default since they put rainbow garbage and crashes on reused memory before the late check.
+    # Hot readbacks (buffer_cache.cpp GatherDownloads): ~25% more FPS at the Shrine. Off from
+    # 22 Oct (rainbow garbage and crashes on memory with two owners, the page pool's double free
+    # fixed in 0.71); on by default again since 0.72 (tested on 3 Nov).
     if s.get('rb_hot'):
         env['SOTC_RB_HOT'] = '1'
     # Bluepoint's debug menu (+RetailBuild=0 served by the port; the game files are not touched).
@@ -1419,8 +1439,8 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         self.check(quick, 'af16', _('Texturas nítidas (filtro 16x)', 'Sharp textures (16x filtering)'))
         self.check(quick, 'fullscreen', _('Tela cheia', 'Fullscreen'))
         self.check(quick, 'neo', _('Modo PS4 Pro', 'PS4 Pro mode'))
-        self.check(quick, 'rb_hot', _('Mais FPS: leituras rápidas da GPU (experimental)',
-                                      'More FPS: fast GPU readbacks (experimental)'))
+        self.check(quick, 'rb_hot', _('Mais FPS: leituras rápidas da GPU',
+                                      'More FPS: fast GPU readbacks'))
         for key in ('af16', 'textures', 'fps_mode', 'fullscreen', 'neo', 'output_res', 'upscaler', 'sharpness', 'framegen'):
             self.vars[key].trace_add('write', lambda *_a: self.refresh_status())
         self.applying_mode = False
@@ -1621,13 +1641,16 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         self.row(f, _('Upscaler', 'Upscaler'), self.choice(f, 'upscaler', UPSCALERS),
                  _('FSR 1 amplia com bordas nítidas (quando o jogo renderiza menor que a saída).', 'FSR 1 upscales with sharp edges (when the game renders smaller than the output).'))
         self.row(f, _('Nitidez (RCAS)', 'Sharpening (RCAS)'), self.choice(f, 'sharpness', SHARPNESS))
-        self.section(f, _('NVIDIA DLSS', 'NVIDIA DLSS'))
-        self.note(f, _('Com o upscaler DLSS (placas RTX): o jogo renderiza menor e o DLSS amplia com detalhe '
-                       'reconstruído dos quadros anteriores. Sem placa RTX ou sem os arquivos da NVIDIA, o FSR 1 '
-                       'amplia a mesma imagem menor.',
-                       'With the DLSS upscaler (RTX cards): the game renders smaller and DLSS enlarges it with '
-                       'detail rebuilt from earlier frames. Without an RTX card or the NVIDIA files, FSR 1 '
-                       'enlarges the same smaller image.'), top=2)
+        self.section(f, _('NVIDIA DLSS e AMD FSR 4', 'NVIDIA DLSS and AMD FSR 4'))
+        self.note(f, _('Com o upscaler DLSS (placas RTX) ou AMD FSR 4.1: o jogo renderiza menor e o upscaler amplia '
+                       'com detalhe reconstruído dos quadros anteriores. O FSR 4.1 (inteligência artificial) roda nas '
+                       'Radeon RX 6000, 7000 e 9000; nas outras placas o mesmo item usa o FSR 3.1. Sem a placa ou '
+                       'sem os arquivos, o FSR 1 amplia a mesma imagem menor. Os ajustes abaixo valem para os dois.',
+                       'With the DLSS upscaler (RTX cards) or AMD FSR 4.1: the game renders smaller and the upscaler '
+                       'enlarges it with detail rebuilt from earlier frames. FSR 4.1 (machine learning) runs on '
+                       'Radeon RX 6000, 7000 and 9000; on other cards the same item uses FSR 3.1. Without the card '
+                       'or the files, FSR 1 enlarges the same smaller image. The settings below apply to both.'),
+                  top=2)
         self.row(f, _('Modo', 'Mode'), self.choice(f, 'dlss_mode', DLSS_MODES),
                  _('Fator entre a saída e o tamanho renderizado. O jogo renderiza no máximo 1080 linhas: '
                    'acima de 1620p (Qualidade) ou 1860p (Equilibrado) o DLSS amplia mais que o fator.',
@@ -1985,7 +2008,7 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
     def summary(self):
         parts = [dict((k, _(*v)) for k, v in FPS_MODES).get(self.var('fps_mode').get(), '30 FPS'),
                  self.var('output_res').get().replace('x', ' × '),
-                 {'fsr1': 'FSR 1', 'dlss': 'DLSS'}.get(self.var('upscaler').get(), 'bilinear')]
+                 {'fsr1': 'FSR 1', 'dlss': 'DLSS', 'fsr4': 'FSR 4'}.get(self.var('upscaler').get(), 'bilinear')]
         framegen = self.var('framegen').get()
         if framegen != 'off':
             parts.append({'auto': _('geração de quadros', 'frame generation'), 'dlss': 'DLSS-G',

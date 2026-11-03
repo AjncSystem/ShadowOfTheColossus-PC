@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <mutex>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -313,10 +314,59 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     if (split) {
         SotcStats::split_ticks[SotcStats::SplitRbCount].fetch_add(1, std::memory_order_relaxed);
     }
+    const auto age_start = SotcStats::kRbAge ? SotcStats::NowNs() : 0;
     scheduler.WaitSubmitted(readback.tick, false);
     split_part(SotcStats::SplitRbSubmit);
     scheduler.GetWorkSemaphore()->Wait(readback.tick);
     split_part(SotcStats::SplitRbGpu);
+    if (SotcStats::kRbAge && !readback.dependent) {
+        const int age = readback.data_ready ? 0 : 1;
+        SotcStats::rb_age_count[age].fetch_add(1, std::memory_order_relaxed);
+        const u64 waited = SotcStats::NowNs() - age_start;
+        SotcStats::rb_age_ns[age].fetch_add(waited, std::memory_order_relaxed);
+        // The readbacks of data still being written, by guest instruction and 64 KiB page: the
+        // session's top 16 by wait every 30 s ("SOTC RB TOP").
+        struct Agg {
+            u64 count, ns, bytes;
+        };
+        static std::mutex top_mutex;
+        static std::map<std::pair<u64, u64>, Agg> top;
+        static u64 top_printed = SotcStats::NowNs();
+        std::scoped_lock lock{top_mutex};
+        if (age == 1) {
+            Agg& a = top[{SotcStats::fault_rip, device_addr >> 16}];
+            a.count++;
+            a.ns += waited;
+            a.bytes += readback.window_size;
+        }
+        if (SotcStats::NowNs() - top_printed > 30'000'000'000ull) {
+            top_printed = SotcStats::NowNs();
+            std::vector<std::pair<std::pair<u64, u64>, Agg>> items(top.begin(), top.end());
+            std::ranges::sort(items, [](const auto& x, const auto& y) {
+                return x.second.ns > y.second.ns;
+            });
+            u64 total = 0;
+            for (const auto& item : items) {
+                total += item.second.ns;
+            }
+            std::fprintf(stderr, "SOTC RB TOP (still written, %zu places, %.0f ms):\n",
+                         items.size(), total / 1e6);
+            for (size_t i = 0; i < std::min<size_t>(items.size(), 16); ++i) {
+                const auto& [key, a] = items[i];
+                const WriteMark mark = LastWriteMark(key.second << 16);
+                std::fprintf(stderr,
+                             "SOTC RB TOP   rip %#llx page %#llx: %llu reads, %.0f ms, %.1f KiB "
+                             "each; marked by %#llx+%#llx, program %#llx\n",
+                             static_cast<unsigned long long>(key.first),
+                             static_cast<unsigned long long>(key.second << 16),
+                             static_cast<unsigned long long>(a.count), a.ns / 1e6,
+                             a.bytes / 1024.0 / a.count,
+                             static_cast<unsigned long long>(mark.addr),
+                             static_cast<unsigned long long>(mark.size),
+                             static_cast<unsigned long long>(mark.program));
+            }
+        }
+    }
     liverpool->SendCommand<true>([this, &readback] { FinishAsyncReadback(readback); });
     split_part(SotcStats::SplitRbFinish);
 }
@@ -382,6 +432,21 @@ void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
     readback.download_offset = download.offset;
     readback.download_mapped = download.mapped;
     readback.tick = scheduler.CurrentTick();
+    if (SotcStats::kRbAge) {
+        u64 last_write = 0;
+        {
+            std::shared_lock lock{gpu_modified_mutex};
+            for (const auto& item : readback.pending) {
+                for (u64 page = item.addr >> 16; item.size && page <= (item.addr + item.size - 1) >> 16;
+                     ++page) {
+                    if (const auto it = write_ticks.find(page); it != write_ticks.end()) {
+                        last_write = std::max(last_write, it->second.tick);
+                    }
+                }
+            }
+        }
+        readback.data_ready = last_write < readback.tick && scheduler.IsFree(last_write);
+    }
     scheduler.Flush();
     readback.waiting = true;
     inflight_readbacks.push_back(&readback);
@@ -1097,6 +1162,13 @@ void BufferCache::AddGpuModified(VAddr addr, u64 size) {
     {
         std::unique_lock gpu_modified_lock{gpu_modified_mutex};
         grew = gpu_modified_ranges.Add(addr, size);
+        if (SotcStats::kRbAge && size != 0) {
+            const WriteMark mark{scheduler.CurrentTick(), addr, size,
+                                 SotcStats::current_program.load(std::memory_order_relaxed)};
+            for (u64 page = addr >> 16; page <= (addr + size - 1) >> 16; ++page) {
+                write_ticks[page] = mark;
+            }
+        }
     }
     if (!clean_pages_used || size == 0 || (!grew && nogrow_skip)) {
         return;

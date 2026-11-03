@@ -3,6 +3,7 @@
 
 #include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_framegen.h"
+#include "video_core/renderer_vulkan/vk_fsr4.h"
 #include "video_core/renderer_vulkan/vk_fsrfg.h"
 
 #include <windows.h>
@@ -119,6 +120,9 @@ bool loaded = false;    // sl.interposer.dll loaded, slInit done
 bool supported = false; // DLSS-G supported on the device
 bool fg_wanted = false;    // FrameGen::WantStreamline() (SOTC_FRAMEGEN, SOTC_DLSSG=1)
 bool sr_wanted = false;    // SOTC_UPSCALER=dlss
+// sotc: SOTC_UPSCALER=fsr4: super resolution by the AMD FSR SDK (vk_fsr4.cpp) in place of DLSS,
+// on the same inputs; no Streamline for it.
+bool sr_fsr = false;
 // DLSS super resolution supported on the device (atomic: F9 reads it on the window thread)
 std::atomic<bool> sr_supported{false};
 bool vsync_off = true;  // eVSyncOffRequired
@@ -912,6 +916,7 @@ PFN_vkGetInstanceProcAddr LoadInterposer() {
     const char* u = std::getenv("SOTC_UPSCALER");
     fg_wanted = FrameGen::WantStreamline();
     sr_wanted = u && std::strcmp(u, "dlss") == 0;
+    sr_fsr = u && std::strcmp(u, "fsr4") == 0;
     // sotc: like frame generation, Streamline only on NVIDIA systems; elsewhere FSR 1 upscales.
     if (sr_wanted && !fg_wanted && !FrameGen::HasNvidia()) {
         std::fprintf(stderr, "SOTC DLSS: no NVIDIA GPU, super resolution unavailable (FSR 1)\n");
@@ -1002,6 +1007,12 @@ void OnDeviceCreated(const Instance& instance) {
             FrameGen::SetAvailable(supported, FsrFg::Supported());
         }
     } resolve_mode; // on every return
+    if (sr_fsr) {
+        sr_supported = Fsr4::Init(instance);
+        if (sr_supported) {
+            sr_mode_name.store(Fsr4::Name(), std::memory_order_relaxed);
+        }
+    }
     if (!loaded) {
         return;
     }
@@ -1362,6 +1373,94 @@ void CopyComposite(vk::CommandBuffer cmdbuf, VideoCore::TextureCache& texture_ca
     composite.ui_full_ok = true;
 }
 
+namespace {
+
+/// Upscale's AMD FSR path (SOTC_UPSCALER=fsr4): the same images and camera as DLSS.
+Upscaled UpscaleFsr(const FrameSlot& f, vk::CommandBuffer cmdbuf, Scheduler& scheduler,
+                    vk::ImageView ui_view, bool ui_full, u32 out_w, u32 out_h) {
+    if (!EnsureSrImage(sr_out, vk::Format::eR16G16B16A16Sfloat, out_w, out_h)) {
+        sr_prev = false;
+        return {};
+    }
+    const auto barrier = [](vk::ImageLayout from, vk::ImageLayout to,
+                            vk::PipelineStageFlags2 dst, vk::AccessFlags2 dst_access) {
+        return vk::ImageMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+            .dstStageMask = dst,
+            .dstAccessMask = dst_access,
+            .oldLayout = from,
+            .newLayout = to,
+            .image = sr_out.image,
+            .subresourceRange{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                              .baseMipLevel = 0,
+                              .levelCount = 1,
+                              .baseArrayLayer = 0,
+                              .layerCount = 1},
+        };
+    };
+    const auto to_general =
+        barrier(vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral,
+                vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderWrite);
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &to_general,
+    });
+    const sl::Constants& c = f.constants;
+    // SOTC_FSR_JITTER (tests): 0 none, 2 x negated, 3 y negated, 4 both; else as DLSS has it.
+    static const int jitter_mode = [] {
+        const char* v = std::getenv("SOTC_FSR_JITTER");
+        return v ? std::atoi(v) : 1;
+    }();
+    Fsr4::Params p{};
+    p.color = {sr_color.image, sr_color.format, f.width, f.height};
+    p.depth = {f.depth, f.depth_format, f.width, f.height};
+    p.mvec = {f.mvec, f.mvec_format, f.width, f.height};
+    p.output = {sr_out.image, sr_out.format, out_w, out_h};
+    p.render_width = f.width;
+    p.render_height = f.height;
+    p.out_width = out_w;
+    p.out_height = out_h;
+    p.jitter_x = jitter_mode == 0 ? 0.0f : c.jitterOffset.x;
+    p.jitter_y = jitter_mode == 0 ? 0.0f : c.jitterOffset.y;
+    if (jitter_mode == 2 || jitter_mode == 4) {
+        p.jitter_x = -p.jitter_x;
+    }
+    if (jitter_mode == 3 || jitter_mode == 4) {
+        p.jitter_y = -p.jitter_y;
+    }
+    // Streamline's scale takes the vectors to UV units; FSR wants pixels.
+    p.mvec_scale_x = c.mvecScale.x * static_cast<float>(f.width);
+    p.mvec_scale_y = c.mvecScale.y * static_cast<float>(f.height);
+    p.z_near = c.cameraNear;
+    p.z_far = c.cameraFar;
+    p.fov_y = c.cameraFOV;
+    p.depth_inverted = c.depthInverted == sl::Boolean::eTrue;
+    p.reset = c.reset == sl::Boolean::eTrue || !sr_prev;
+    // The SDK records into the real command buffer (the recorder's cmdbuf is a fake handle).
+    scheduler.RecordDeferred([p](vk::CommandBuffer real) {
+        if (!Fsr4::Dispatch(static_cast<VkCommandBuffer>(real), p)) {
+            const u32 errors = ++sr_errors;
+            if (errors == 3) {
+                std::fprintf(stderr, "SOTC FSR: 3 failures, super resolution off (FSR 1)\n");
+            }
+        }
+    });
+    const auto done = barrier(vk::ImageLayout::eGeneral, vk::ImageLayout::eShaderReadOnlyOptimal,
+                              vk::PipelineStageFlagBits2::eFragmentShader,
+                              vk::AccessFlagBits2::eShaderRead);
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &done,
+    });
+    sr_mode_name.store(Fsr4::Name(), std::memory_order_relaxed);
+    sr_prev = true;
+    return {sr_out.view, ui_view, sky_bias_written ? f.bias_view : vk::ImageView{}, ui_full, false,
+            out_w, out_h};
+}
+
+} // namespace
+
 Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& texture_cache,
                  Runtime& runtime, u32 width, u32 height) {
     Composite c = std::exchange(composite, Composite{});
@@ -1382,20 +1481,21 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
         c = std::exchange(composite, Composite{});
     }
     const bool copied = c.copy_ok && sr_color.width == f.width && sr_color.height == f.height;
+    const bool inputs_ok = sr_fsr ? f.valid : f.sl_valid;
     const bool ui_shadow = c.copy_ok && c.ui_full_ok && sr_ui_full.width == width &&
                            sr_ui_full.height == height;
     // sotc: PS4 Pro mode draws its UI layer at the output size already: no unsharp on it (it put
     // dark fringes around the letters, 26 Oct)
     const bool ui_full = ui_shadow || (c.copy_ok && sr_ui.width == width && sr_ui.height == height);
     const vk::ImageView ui_view = ui_shadow ? sr_ui_full.view : sr_ui.view;
-    if (ui_full && (!f.sl_valid || !copied)) {
+    if (ui_full && (!inputs_ok || !copied)) {
         // No DLSS inputs (splash, menus): the scene at the render size, the UI at the output size.
         sr_prev = false;
         return {sr_color.view, ui_view, {}, true, true, sr_color.width, sr_color.height};
     }
-    if (!f.sl_valid || !copied) {
+    if (!inputs_ok || !copied) {
         static u32 skipped = 0;
-        if (c.captured && f.sl_valid && skipped++ < 5) {
+        if (c.captured && inputs_ok && skipped++ < 5) {
             std::fprintf(stderr,
                          "SOTC DLSS: composite %ux%u, UI %ux%u, inputs %ux%u: not upscaled\n",
                          sr_color.width, sr_color.height, sr_ui.width, sr_ui.height, f.width,
@@ -1423,6 +1523,9 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
     // post-process pass scales the rest. PS4 Pro mode at 4K hands it 1600x900: to 2160p no mode
     // takes that height, NGX refused every evaluate (0xbad00005) and the screen stayed black.
     u32 out_w = width, out_h = height;
+    if (sr_fsr) {
+        return UpscaleFsr(f, cmdbuf, scheduler, ui_view, ui_full, width, height);
+    }
     if (!SrModeFits(f.width, f.height, width, height) &&
         (f.width * 2 < width || f.height * 2 < height)) {
         out_w = f.width * 2;
@@ -1948,8 +2051,8 @@ void PrepareInputs(u32 frame_id, vk::CommandBuffer cmdbuf, VideoCore::TextureCac
         FsrFg::ConvertDepth(frame_id, cmdbuf, f.depth_view, width, height,
                             constants.depthInverted == sl::Boolean::eTrue);
     }
-    // Streamline needs the constants for DLSS-G and for super resolution.
-    if (!(supported && FrameGen::Current() == FrameGen::Mode::Dlss) && !sr_supported) {
+    // Streamline needs the constants for DLSS-G and for DLSS super resolution (not for FSR's).
+    if (!(supported && FrameGen::Current() == FrameGen::Mode::Dlss) && (!sr_supported || sr_fsr)) {
         return;
     }
     if (sl::FrameToken* token = Token(f.index)) {

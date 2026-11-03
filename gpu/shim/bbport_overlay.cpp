@@ -554,20 +554,24 @@ void QuickSettings() {
     const int up_mode = (live_fsr1 >= 0 ? live_fsr1 : env_fsr1) ? 0 : 1;
     const char* up_names[] = {T("FSR 1 (AMD, qualquer placa)", "FSR 1 (AMD, any GPU)"),
                               T("Bilinear (simples)", "Bilinear (plain)")};
-    // sotc: DLSS (SOTC_UPSCALER=dlss) is chosen at start, its render size with it: shown, not
-    // switchable here (picking FSR 1 here saved "fsr1" over the launcher's DLSS, 26 Oct).
-    static const bool dlss_start = [] {
+    // sotc: DLSS and AMD FSR 4 (SOTC_UPSCALER=dlss / fsr4) are chosen at start, their render
+    // size with them: shown, not switchable here (picking FSR 1 here saved "fsr1" over the
+    // launcher's DLSS, 26 Oct).
+    static const char* start_upscaler = [] {
         const char* v = std::getenv("SOTC_UPSCALER");
-        return v && std::strcmp(v, "dlss") == 0;
+        return !v ? nullptr
+               : std::strcmp(v, "dlss") == 0 ? "NVIDIA DLSS"
+               : std::strcmp(v, "fsr4") == 0 ? "AMD FSR 4"
+                                             : nullptr;
     }();
-    if (dlss_start) {
+    if (start_upscaler) {
         ImGui::BeginDisabled();
-        if (ImGui::BeginCombo("Upscaler", "NVIDIA DLSS")) {
+        if (ImGui::BeginCombo("Upscaler", start_upscaler)) {
             ImGui::EndCombo();
         }
         ImGui::EndDisabled();
-        Hint(T("DLSS troca no lançador (vale ao abrir o jogo de novo).",
-               "DLSS is switched in the launcher (applies when the game starts again)."));
+        Hint(T("Este upscaler troca no lançador (vale ao abrir o jogo de novo).",
+               "This upscaler is switched in the launcher (applies when the game starts again)."));
     } else if (ImGui::BeginCombo("Upscaler", up_names[up_mode])) {
         for (int i = 0; i < 2; ++i) {
             if (ImGui::Selectable(up_names[i], i == up_mode) && i != up_mode) {

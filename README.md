@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC native port · v0.71
+# Shadow of the Colossus — PC native port · v0.72
 
 [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
@@ -26,6 +26,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.72** | **Improvements the 0.71 page pool fix made safe, now on by default:** fast GPU readbacks (~25% more FPS at the Shrine), sharper textures (finer mips: High mip 1, Maximum mip 0, with measured mips) and Maximum keeping texture banks 3 s, the heap guard shortcuts. **New upscaler: AMD FSR 4.1** (official AMD FSR SDK 2.4, Vulkan; FSR 4.1 on Radeon RX 6000/7000/9000, FSR 3.1 on other cards; experimental). **Play modes keep the grass as on PS4.** Fewer stutters at area changes (staging reserve, texture copies with fewer page faults), the right video memory budget on integrated GPUs, launcher fixes. |
 | **0.71** |
 🔧 Critical Fixes & Performance
 

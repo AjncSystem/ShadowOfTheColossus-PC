@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.72 — 2026-11-03
+- **Melhorias que a correção do T38 liberou, agora ligadas por padrão** (testadas em todos os colossos do
+  Time Attack, na Máxima com o modo PS4 Pro, sem queda e sem mosaico). Elas ficavam desligadas porque
+  derrubavam o jogo ou punham mosaico, e a causa era a mesma liberação dupla de páginas:
+  - **Leituras rápidas da GPU** (`rb_hot`): cerca de 25% mais FPS no Santuário (a atualização liga
+    também em instalações antigas).
+  - **Texturas mais nítidas:** os mips medidos na tela (`SOTC_LOD_FEEDBACK`) e mips mais finos,
+    mip 1 na Alta e mip 0 na Máxima (antes, 2 nas duas).
+  - **Máxima:** os bancos de textura ficam 3 s amostrados antes de sair (`SOTC_LOD_LINGER=180`).
+  - **Atalhos do guarda do heap** de volta (`SOTC_GUARD_STALE`, `SOTC_GUARD_USER_POINTER`).
+- **Upscaler novo: AMD FSR 4.1 (experimental).** Pelo SDK oficial da AMD (FSR SDK 2.4.0, Vulkan), com as
+  DLLs assinadas da AMD junto do `bb-probe.exe` (`amd_fidelityfx_loader_vk.dll`,
+  `amd_fidelityfx_upscaler_vk.dll`; licença em `bin/licenses-amd`). O SDK escolhe a versão que a placa
+  roda: **FSR 4.1** (inteligência artificial) nas Radeon RX 6000, 7000 e 9000 e nos Ryzen AI recentes;
+  **FSR 3.1.6** nas outras placas (NVIDIA, Intel, Radeon antigas). Usa as mesmas entradas do DLSS (cena
+  antes do HUD, profundidade, vetores de movimento, câmera), os mesmos modos de resolução e a mesma
+  nitidez. Lançador: Upscaler > "AMD FSR 4.1". Testado na RTX 2060 Super (FSR 3.1.6, 1280×720 → 1080p,
+  ~57 FPS no Santuário, sem erros); falta testar numa Radeon RX 6000 ou mais nova. `SOTC_FSR_VERSION=3`
+  força o FSR 3.1 numa Radeon (comparação); `SOTC_FSR_JITTER` e `SOTC_FSR_DEBUG=1` para testes.
+- **Troca de área: menos um travamento.** A área temporária de envio para a GPU agora guarda uma reserva
+  (128 MB na memória do sistema, 64 MB na de vídeo), criada aos poucos no início do jogo. Antes ela era
+  liberada depois de alguns segundos sem uso e recriada no meio da troca de área: com a memória de vídeo
+  perto do limite, isso custou 95 ms num quadro. `SOTC_STAGING_KEEP_MB` / `SOTC_STAGING_KEEP_VRAM_MB` (0 =
+  como antes).
+- **Troca de área: cópias de textura com menos faltas de página.** Antes de copiar um bloco grande de textura,
+  o port pede ao Windows as páginas de uma vez (`PrefetchVirtualMemory`) em vez de uma falta por página de
+  4 KiB. Na entrada da floresta, 311 MB passaram com 6,5 mil faltas (antes 175 MB com 59 mil). Melhora
+  pequena. `SOTC_COPY_PREFETCH=0` desliga.
+- **Modos de jogo deixam a grama como no PS4.** Pro e Extremo não mudam mais a grama, o mato e as
+  sombras da grama (agora isso fica só para o Personalizado). A atualização volta a grama de quem já tinha
+  a configuração gravada para "Como no PS4".
+- **GPU integrada (AMD/Intel): orçamento de memória de vídeo certo.** Antes ficava em 2 GB (a fórmula das
+  placas dedicadas); agora é pelo menos a memória local que o driver anuncia (`SOTC_IGPU_BUDGET_MB` define à
+  mão). Num Ryzen 7 5700U: 3,9 GB em vez de 2 GB, sem as limpezas de texturas a cada carga.
+- **Lançador:** os botões da aba Avançado ficam em duas linhas ("Limpar cache de shaders" sumia numa janela
+  estreita); variável extra escrita com `=` na frente ainda vale; "Limpar cache" avisa se o jogo está aberto.
+- **Diagnóstico (desligados por padrão):** `SOTC_FORMAT_LOG=1` (formatos não suportados pela placa),
+  `SOTC_FORMAT_FALLBACK=1`, `SOTC_NAN_GUARD=1`, `SOTC_AMD_AS_NV=1` e suas partes (cada chave de teste de
+  shader ganha uma pasta de cache própria, sem precisar limpar o cache), `SOTC_RB_AGE=1` (quais instruções do
+  jogo esperam leituras da GPU e quem escreveu a página), `SOTC_CLEAN_GUEST_READS=1` (leituras simples do jogo
+  em bytes que a GPU não escreveu saem direto da memória, sem esperar a GPU; experimental).
+
 ## 0.71 — 2026-11-02
 - **Texturas em mosaico colorido e quedas depois das cargas (T38, corrigido):** o problema existia em todas
   as versões e era muito pior no **Time Attack**, onde o jogo sempre fechava por volta do 5º colosso. Causa:

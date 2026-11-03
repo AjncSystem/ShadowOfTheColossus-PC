@@ -588,6 +588,24 @@ void VideoOutDriver::Flip(const Request& req) {
                          static_cast<unsigned long long>(SotcStats::vram_budget.load() >> 20),
                          static_cast<unsigned long long>(SotcStats::arena_allocs.load()),
                          static_cast<unsigned long long>(SotcStats::arena_bytes.load() >> 20));
+            if (SotcStats::kRbAge) {
+                const auto c0 = SotcStats::rb_age_count[0].exchange(0);
+                const auto c1 = SotcStats::rb_age_count[1].exchange(0);
+                const auto n0 = SotcStats::rb_age_ns[0].exchange(0);
+                const auto n1 = SotcStats::rb_age_ns[1].exchange(0);
+                ReportPrintf(report,
+                             "SOTC RB AGE: data ready %llu (GPU wait %.1f ms), still written %llu "
+                             "(GPU wait %.1f ms); clean guest reads %llu, stale %llu "
+                             "(refreshed %llu)\n",
+                             static_cast<unsigned long long>(c0), n0 / 1e6,
+                             static_cast<unsigned long long>(c1), n1 / 1e6,
+                             static_cast<unsigned long long>(
+                                 SotcStats::clean_guest_reads.exchange(0)),
+                             static_cast<unsigned long long>(
+                                 SotcStats::stale_guest_reads.exchange(0)),
+                             static_cast<unsigned long long>(
+                                 SotcStats::stale_refreshes.exchange(0)));
+            }
             ReportPrintf(report, "SOTC readback finish: %llu for bytes the guest asked\n",
                          static_cast<unsigned long long>(
                              SotcStats::readback_finish_asked.exchange(0)));

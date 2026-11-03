@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <unordered_map>
 #include <tuple>
 #include <vector>
 #include <utility>
@@ -65,6 +66,12 @@ static u64 ImageBaseAddress() {
 #else
 #include "common/spin_lock.h"
 #endif
+
+// sotc: the game image's base (probe.c), for SOTC_STALE_READS' eboot offsets.
+static std::atomic<uint64_t> guest_image{0};
+extern "C" void bb_set_guest_image(uintptr_t base) {
+    guest_image.store(base, std::memory_order_relaxed);
+}
 
 namespace VideoCore {
 
@@ -876,6 +883,9 @@ struct SignalImpl : public PageManager::Impl {
     static bool HandleGuestFault(void* context, void* fault_address, bool is_gpu_thread) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
+        if (!Common::IsWriteError(context) && !is_gpu_thread && TryCleanGuestLoad(context)) {
+            return true;
+        }
         if (!Common::IsWriteError(context) && is_gpu_thread && TryCleanWalkerLoad(context)) {
             if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer
                 SotcStats::fault_walker.fetch_add(1, std::memory_order_relaxed);
@@ -889,6 +899,7 @@ struct SignalImpl : public PageManager::Impl {
                 SotcStats::fault_writes.fetch_add(1, std::memory_order_relaxed);
             }
             NoteReadFault(context, addr, is_gpu_thread, true);
+            SotcStats::fault_rip = reinterpret_cast<u64>(Common::GetRip(context));
             const bool handled = is_gpu_thread
                                      ? rasterizer->InvalidateMemory(addr, size, true)
                                      : rasterizer->InvalidateMemoryOnGuestFault(addr, size);
@@ -903,6 +914,7 @@ struct SignalImpl : public PageManager::Impl {
                 SotcStats::fault_gpu_reads.fetch_add(1, std::memory_order_relaxed);
             }
             NoteReadFault(context, addr, is_gpu_thread);
+            SotcStats::fault_rip = reinterpret_cast<u64>(Common::GetRip(context));
             return rasterizer->ReadMemory(addr, size, is_gpu_thread);
         }
         return false;
@@ -949,6 +961,134 @@ struct SignalImpl : public PageManager::Impl {
     /// did not write: complete such a load from the backing instead of a full GPU readback. The
     /// page stays protected, so reads of the GPU-written bytes still fault and read back.
     /// Idea from srt_walker_clean_reads of Pink-shadPS4 (luizgustavs). SOTC_CLEAN_READS=0 = off.
+    /// sotc: SOTC_CLEAN_GUEST_READS=1: the same for plain loads of the game's own threads (mov of
+    /// 4 or 8 bytes). At area changes (forest entrance, 3 Nov) the game's allocators scan their
+    /// free-block bitmaps (eboot 0x1a6d60, 0x1a8b38) in 64 KiB pages where compute shaders wrote
+    /// a few hundred bytes elsewhere: each scan waited for the GPU to finish the frame (6.6 of
+    /// 10.6 s of readback waits). Bytes the GPU wrote, or whose readback is in flight (they stay
+    /// GPU-modified until applied), still fault and read back.
+    /// sotc: SOTC_STALE_READS (eboot offsets, e.g. 0x1a6d60,0x1a6d3a; none by default): these
+    /// loads also read GPU-written bytes without waiting for the GPU. Tested on 3 Nov with the
+    /// visibility bitmap scans: the whole scene flickered (the game needs this frame's bits), so
+    /// it stays off; kept for experiments. The bitmap they scan (0x1a6d20: find
+    /// the set bits) is rewritten by compute shaders every frame, so each scan waited for the GPU
+    /// to finish the frame (84% of the readback waits at the forest entrance). The value is the
+    /// one of the last readback of its 64 KiB window, at most SOTC_STALE_MS (default 100) old:
+    /// past that, the load reads back as before.
+    static bool StaleSite(u64 rip) {
+        static const std::vector<u64> sites = [] {
+            std::vector<u64> out;
+            const char* v = std::getenv("SOTC_STALE_READS");
+            std::string list = v ? v : "";
+            size_t pos = 0;
+            while (pos < list.size()) {
+                const size_t comma = list.find(',', pos);
+                const std::string item =
+                    list.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                if (const u64 offset = std::strtoull(item.c_str(), nullptr, 0)) {
+                    out.push_back(offset);
+                }
+                if (comma == std::string::npos) {
+                    break;
+                }
+                pos = comma + 1;
+            }
+            return out;
+        }();
+        const u64 image = guest_image.load(std::memory_order_relaxed);
+        return image && rip >= image &&
+               std::find(sites.begin(), sites.end(), rip - image) != sites.end();
+    }
+
+    /// The last time a stale site's 64 KiB window was read back (any thread).
+    static bool StaleFresh(VAddr address) {
+        static const u64 max_ns = [] {
+            const char* v = std::getenv("SOTC_STALE_MS");
+            return (v ? std::strtoull(v, nullptr, 10) : 100ull) * 1'000'000ull;
+        }();
+        static std::mutex mutex;
+        static std::unordered_map<VAddr, u64> refreshed;
+        const VAddr window = address >> 16;
+        const u64 now = SotcStats::NowNs();
+        std::scoped_lock lock{mutex};
+        auto [it, added] = refreshed.try_emplace(window, now);
+        if (added || now - it->second > max_ns) {
+            it->second = now; // this load reads back: the next ones use its value
+            return false;
+        }
+        return true;
+    }
+
+    static bool TryCleanGuestLoad(void* context) {
+#ifdef _WIN32
+        static const bool enabled = [] {
+            const char* v = std::getenv("SOTC_CLEAN_GUEST_READS");
+            return v && v[0] == '1';
+        }();
+        if (!enabled) {
+            return false;
+        }
+        const void* rip = Common::GetRip(context);
+        ZydisDecodedInstruction instruction;
+        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+        const auto status = Common::Decoder::Instance()->decodeInstruction(
+            instruction, operands, const_cast<void*>(rip), 15);
+        const bool movzx = instruction.mnemonic == ZYDIS_MNEMONIC_MOVZX;
+        if (!ZYAN_SUCCESS(status) || (instruction.mnemonic != ZYDIS_MNEMONIC_MOV && !movzx) ||
+            operands[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+            operands[1].type != ZYDIS_OPERAND_TYPE_MEMORY) {
+            return false;
+        }
+        auto* ctx = static_cast<EXCEPTION_POINTERS*>(context)->ContextRecord;
+        const auto& mem = operands[1].mem;
+        const u32 dst_size = operands[0].size / 8;
+        const u32 size = movzx ? operands[1].size / 8 : dst_size;
+        DWORD64* dst = ContextRegister(ctx, operands[0].reg.value);
+        const bool size_ok = movzx ? ((size == 1 || size == 2) && (dst_size == 4 || dst_size == 8))
+                                   : (size == 4 || size == 8);
+        if (!dst || !size_ok || mem.segment != ZYDIS_REGISTER_DS ||
+            mem.base == ZYDIS_REGISTER_NONE || mem.base == ZYDIS_REGISTER_RIP) {
+            return false;
+        }
+        const DWORD64* base = ContextRegister(ctx, mem.base);
+        if (!base) {
+            return false;
+        }
+        VAddr address = *base + static_cast<u64>(mem.disp.value);
+        if (mem.index != ZYDIS_REGISTER_NONE) {
+            const DWORD64* index = ContextRegister(ctx, mem.index);
+            if (!index) {
+                return false;
+            }
+            address += *index * mem.scale;
+        }
+        bool stale = false;
+        if (rasterizer->GetBufferCache().IsRangeGpuWrittenLocked(address, size)) {
+            if (!StaleSite(reinterpret_cast<u64>(rip))) {
+                return false;
+            }
+            if (!StaleFresh(address)) {
+                SotcStats::stale_refreshes.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            stale = true;
+        }
+        u64 value = 0;
+        if (!Core::Memory::Instance()->TryCopySparseMemory(address, reinterpret_cast<u8*>(&value),
+                                                           size)) {
+            return false;
+        }
+        // A 32-bit destination zero-extends into the full register, as the mov would.
+        *dst = value;
+        ctx->Rip += instruction.length;
+        (stale ? SotcStats::stale_guest_reads : SotcStats::clean_guest_reads)
+            .fetch_add(1, std::memory_order_relaxed);
+        return true;
+#else
+        return false;
+#endif
+    }
+
     static bool TryCleanWalkerLoad(void* context) {
 #ifdef _WIN32
         static const bool enabled = [] {

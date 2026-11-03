@@ -39,6 +39,37 @@ std::mutex m_request{};
 mz_zip_archive zip_ar{};
 bool ar_is_read_only{true};
 
+// sotc: the test switches that change how shaders are translated, which the cache keys do not
+// see: with any of them set the cache goes to a folder of its own ("_t" and a hash of their
+// values), so switching a test on or off never reuses shaders of the other setting and needs no
+// "Clear shader cache".
+std::string ShaderTestTag() {
+    static constexpr const char* switches[] = {
+        "SOTC_NAN_GUARD", "SOTC_AMD_AS_NV", "SOTC_MANUAL_INTERP", "SOTC_NO_EXPLICIT_VERTEX",
+        "SOTC_NO_RTZ", "SOTC_CLIP_EMU", "SOTC_WAVE64_UNIFORM", "SOTC_WAVE64_IDENTITY",
+        "SOTC_LDS_BARRIERS", "SOTC_LDS_SMALL", "SOTC_AMD64_LDS", "SHADPS4_IEEE_MINMAX", "SOTC_WQM_COPY"};
+    u64 hash = 1469598103934665603ULL;
+    bool any = false;
+    for (const char* name : switches) {
+        const char* value = std::getenv(name);
+        if (!value) {
+            continue;
+        }
+        any = true;
+        for (const char* p : {name, "=", value, ";"}) {
+            for (; *p; ++p) {
+                hash = (hash ^ u8(*p)) * 1099511628211ULL;
+            }
+        }
+    }
+    if (!any) {
+        return {};
+    }
+    char tag[24];
+    std::snprintf(tag, sizeof(tag), "_t%08x", static_cast<u32>(hash ^ (hash >> 32)));
+    return tag;
+}
+
 } // namespace
 
 namespace Storage {
@@ -126,7 +157,7 @@ void DataBase::Open() {
                      (std::string{game_info.GameSerial()} +
                       (EmulatorSettings.IsDirectMemoryAccessEnabled() ? "" : "_nodma") +
                       (EmulatorSettings.IsNoInt64() ? "_noi64" : "") +
-                      (Libraries::Kernel::sceKernelIsNeoMode() ? "_neo" : ""));
+                      (Libraries::Kernel::sceKernelIsNeoMode() ? "_neo" : "") + ShaderTestTag());
         if (!std::filesystem::exists(cache_path)) {
             std::filesystem::create_directories(cache_path);
         }

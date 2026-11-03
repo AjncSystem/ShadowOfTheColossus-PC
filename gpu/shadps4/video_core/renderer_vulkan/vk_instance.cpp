@@ -3,6 +3,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <set>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -980,8 +982,40 @@ vk::Format Instance::GetSupportedFormat(const vk::Format format,
                 return vk::Format::eR8G8Unorm;
             }
             break;
+        // sotc: SOTC_FORMAT_FALLBACK=1 (experimental, AMD GCN on the legacy driver 2.0.279: Wander
+        // white, Agro black): the 10:10:10:2 signed formats it cannot sample nor render to, as
+        // 16 bits per channel. Right for images the GPU writes and reads; an image filled from
+        // guest memory would need its texels converted (4 -> 8 bytes), which is not done.
+        case vk::Format::eA2B10G10R10SnormPack32:
+        case vk::Format::eA2B10G10R10SintPack32: {
+            static const bool fallback = [] {
+                const char* v = std::getenv("SOTC_FORMAT_FALLBACK");
+                return v && v[0] == '1';
+            }();
+            const auto wide = format == vk::Format::eA2B10G10R10SnormPack32 ? vk::Format::eR16G16B16A16Snorm
+                                                                          : vk::Format::eR16G16B16A16Sint;
+            if (fallback && IsFormatSupported(wide, flags)) {
+                return wide;
+            }
+            break;
+        }
         default:
             break;
+        }
+        // sotc: SOTC_FORMAT_LOG=1: each unsupported format the game uses, once per feature set
+        static const bool log = [] {
+            const char* v = std::getenv("SOTC_FORMAT_LOG");
+            return v && v[0] == '1';
+        }();
+        if (log) {
+            static std::mutex mutex;
+            static std::set<std::pair<u32, u64>> seen;
+            std::scoped_lock lock{mutex};
+            if (seen.emplace(u32(format), u64(flags)).second) {
+                std::fprintf(stderr, "SOTC FORMAT unsupported: %s for %s (missing %s)\n",
+                             vk::to_string(format).c_str(), vk::to_string(flags).c_str(),
+                             vk::to_string(flags & ~GetFormatFeatureFlags(format)).c_str());
+            }
         }
     }
     return format;

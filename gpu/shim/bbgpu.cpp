@@ -148,6 +148,8 @@ static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
         // readbacks GPU-written pages are read-protected, and a fault on a copy thread or the
         // recording thread would wait for the command processor, which waits for them.
         const u8* backing = mapped ? runtime_memory_backing_pointer(source) : nullptr;
+#ifdef _WIN32
+        // TRADEOFF: Windows only; MADV_POPULATE_READ is the Linux counterpart if these faults matter there.
         // sotc: the backing view's pages are mapped in one call before a large copy
         // (SOTC_COPY_PREFETCH=0: one fault per page as before). At an area change (forest
         // entrance, 3 Nov) texture copies of 175-215 MB per frame took 10-59 thousand page faults,
@@ -160,6 +162,7 @@ static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
             WIN32_MEMORY_RANGE_ENTRY range{const_cast<u8*>(backing), static_cast<SIZE_T>(n)};
             PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
         }
+#endif
         if (backing) std::memcpy(dest, backing, n);
         else if (mapped) std::memcpy(dest, reinterpret_cast<const void*>(source), n);
         else std::memset(dest, 0, n);

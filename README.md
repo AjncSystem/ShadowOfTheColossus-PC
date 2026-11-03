@@ -26,6 +26,21 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.71** |
+🔧 Critical Fixes & Performance
+
+• No More Texture Mosaics & Crashes: Fixed a critical memory bug where the game's 64 KiB page pool freed pages twice, causing textures and the heap to conflict. Tested through every Time Attack colossus on Maximum settings with zero crashes and perfect textures.
+• Stutter Reduction: Smoother transitions between areas thanks to optimized staging buffers and a rebuilt shader cache.
+• Visual Cleaning: Native motion blur is now disabled by default to fix the "shadow trail" artifact in dark areas. Optimized DLSS with Preset E and a current-frame bias for sharper imagery. Includes HUD-less frame generation by default.
+• Experimental HDR10: Added a new experimental HDR10 output mode for the base SDR game.
+
+🎮 All-New Custom Launcher
+
+Redesigned with a Shadow of the Colossus aesthetic (night stone, golden typography, and reactive sword-light highlights) inspired by the bloodborne_pc launcher.
+• Play Modes: Quick presets for Normal, Pro, Extreme (60 FPS, max textures, extended grass/shadow distance, DLSS), and Custom.
+• First-Time Setup Guide: A thematic 5-step hardware wizard that benchmarks your PC (CPU, GPU, RAM, Storage) and picks your ideal play mode.
+• Advanced Save Manager: Import/export your progress via .zip or shadPS4, with manual and automatic backups upon game close or crash.
+• Quality of Life: Global settings search (Ctrl+F), an interactive controller button tester, multi-monitor selection, a one-click bug report tool, and a dedicated help section. |
 | **0.70-opt12** | **Much less stutter:** frames are shown at an even rhythm (tabnul's flip pacer; frame-time jitter 5.2 → 1.2 ms), **in 60 FPS mode too** (no more 17/25 ms judder below 60), hitches over 100 ms down from 15 to 2 per 5-minute demo, worst frame 194 → 113 ms, **no more 900 ms freezes from the v0.70 shader cache** (it translated thousands of shaders again every session), stale or colored small textures fixed, Shrine 40 → 43.5 FPS. Everything from v0.70. The shader cache is rebuilt on first start. |
 | **0.70** | **Area changes no longer drop to near zero FPS** (worst frame 534 ms → 58–75 ms, no forced loading screens; 1–6 frames are still lost per change), **fix for a rare crash in the game's allocator after a load** (`0x49800`), **DLSS no longer shakes** in PS4 Pro mode at 30 FPS, **the HUD stays still with frame generation** on FSR 1, a cheaper LOD feedback, new draw thread diagnostics. **Install the game on an SSD.** |
 | **0.60.6-C3** | Fix for the C2 stamina bar with DLSS (wide screens, and 16:9 outside PS4 Pro mode); the 30 FPS cap holds in PS4 Pro mode too. |
@@ -165,6 +180,9 @@ Packaging refuses any `.sprx`/`.prx`: Sony firmware never goes into the package.
 
 - [bloodborne_pc](https://github.com/Supermedo/bloodborne_pc) (Supermedo, deadinside28 and
   forks): loader, native runtime and launcher. Original README: [docs/bbport](docs/bbport/README.md).
+  The launcher's look (`launcher/sotc_theme.py`) comes from its 1.9 launcher theme, with the
+  [Cinzel](https://github.com/NDISCOVER/Cinzel) and [Inter](https://github.com/rsms/inter) fonts
+  (SIL Open Font License).
 - [shadPS4](https://github.com/shadps4-emu/shadPS4) and the shadPS4 SotC fork: Vulkan video core.
 - [Pink-shadPS4](https://github.com/luizgustavs/Pink-shadPS4) (luizgustavs): culling cvars, BPE
   heap guard, periodic submission, command recording thread, shader fixes (fetch-shader

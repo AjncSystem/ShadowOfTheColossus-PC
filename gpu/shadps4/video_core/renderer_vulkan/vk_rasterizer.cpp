@@ -1476,8 +1476,10 @@ bool Rasterizer::TaaOff() {
         const char* v = std::getenv("SOTC_TAA_OFF");
         return v && *v ? (v[0] == '1' ? 1 : 0) : -1;
     }();
-    // TAA comes back if super resolution is switched or turns itself off
-    return forced < 0 ? Dlssg::SuperResolution() : forced == 1;
+    // TAA comes back if super resolution is switched or turns itself off, and while DLSS takes
+    // no frames (PS4 Pro Cinematic mode at 1080p: neither TAA nor DLSS left the raw jittered
+    // frames, 2 Nov)
+    return forced < 0 ? Dlssg::SuperResolutionUpscaling() : forced == 1;
 }
 
 void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
@@ -2457,7 +2459,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     return !v || v[0] != '0';
                 }();
                 if (stage.pgm_hash == kTonemapHash && stage.FlatBuf().size() > kVignetteDword + 3 &&
-                    vignette_after && Dlssg::SuperResolution()) {
+                    vignette_after && Dlssg::SuperResolutionUpscaling()) {
                     tonemap_flat.assign(stage.FlatBuf().begin(), stage.FlatBuf().end());
                     float params[4];
                     std::memcpy(params, &tonemap_flat[kVignetteDword], sizeof(params));

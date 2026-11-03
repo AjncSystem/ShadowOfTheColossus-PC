@@ -681,7 +681,17 @@ static int split_at(uintptr_t a) {
     if (i==vma_count || vmas[i].start>=a) return 0;
     Vma right=vmas[i];
     right.start=a;
-    if (right.kind==KIND_DIRECT) right.phys+=a-vmas[i].start;
+    /* sotc: flexible pages have a backing offset too. Kept unchanged, the right half of a
+     * split flexible mapping pointed at the left half's storage: the runtime's copies went to
+     * the wrong pages and its release freed the left half's pages, still in use, which the
+     * next flexible map handed out again (T38: mosaic textures, heap crashes). */
+    if (right.kind!=KIND_RESERVED) {
+        right.phys+=a-vmas[i].start;
+        static unsigned long flex_splits;
+        if (right.kind==KIND_FLEXIBLE && flex_splits++ < 8)
+            fprintf(stderr,"Runtime: flexible mapping %p-%p split at %p\n",
+                    (void *)vmas[i].start,(void *)vmas[i].end,(void *)a);
+    }
     dirty(vmas[i].start,vmas[i].end);
     vma_seq_begin();
     vmas[i].end=a;
@@ -715,6 +725,117 @@ static uintptr_t find_free(uintptr_t hint, uint64_t size, uint64_t alignment) {
     }
     return 0;
 }
+/* sotc: T38. The game keeps the same physical pages mapped at two guest addresses for minutes
+ * (Time Attack: up to ~1600 pages, 350 MB; it writes them through one and draws them through the
+ * other). The GPU caches go by address and watch writes by protecting pages, so a write through
+ * the other address went unseen: textures kept the old contents (mosaic) and readback-protected
+ * pages were read stale. Each direct physical page keeps the addresses it is mapped at (two);
+ * the GPU's protections are copied to the other address and its faults handed to the GPU at the
+ * watched one. SOTC_ALIAS_SYNC=1 turns it on (02/11: mosaic and crashes unchanged with it). */
+static uintptr_t (*phys_views)[2];
+static uint64_t phys_view_pages, alias_pages, alias_overflow, alias_faults;
+static int alias_sync_on(void) {
+    static int on=-1;
+    if (on<0) { const char *v=getenv("SOTC_ALIAS_SYNC"); on=v && v[0]=='1'; }
+    return on;
+}
+static void views_add(uint64_t phys, uintptr_t address, uint64_t size) {
+    if (!alias_sync_on()) return;
+    if (!phys_views) {
+        phys_view_pages=POOL_SIZE/PAGE;
+        phys_views=calloc(phys_view_pages,sizeof(*phys_views));
+        if (!phys_views) { phys_view_pages=0; return; }
+    }
+    for (uint64_t k=0; k<size/PAGE; ++k) {
+        const uint64_t page=phys/PAGE+k;
+        if (page>=phys_view_pages) break;
+        uintptr_t *v=phys_views[page]; const uintptr_t at=address+k*PAGE;
+        if (v[0]==at || v[1]==at) continue;
+        if (!v[0]) v[0]=at;
+        else if (!v[1]) { v[1]=at; __atomic_add_fetch(&alias_pages,1,__ATOMIC_RELAXED); }
+        else if (alias_overflow++<4) fprintf(stderr,"Runtime: physical %#" PRIx64 " mapped at a third address %p (not kept)\n",page*PAGE,(void *)at);
+    }
+}
+static void views_remove(uint64_t phys, uintptr_t address, uint64_t size) {
+    if (!phys_views) return;
+    for (uint64_t k=0; k<size/PAGE; ++k) {
+        const uint64_t page=phys/PAGE+k;
+        if (page>=phys_view_pages) break;
+        uintptr_t *v=phys_views[page]; const uintptr_t at=address+k*PAGE;
+        uintptr_t left=0;
+        if (v[1]==at) { left=v[0]; v[1]=0; }
+        else if (v[0]==at) { left=v[1]; v[0]=v[1]; v[1]=0; }
+        if (!left) continue;
+        __atomic_sub_fetch(&alias_pages,1,__ATOMIC_RELAXED);
+        /* The address left may carry a protection copied from the one going away, which no
+         * tracker there would lift (writes then faulted forever): the guest's protection again,
+         * and the GPU rereads the page. */
+        const size_t j=vma_index(left);
+        if (j<vma_count && vmas[j].start<=left && vmas[j].kind==KIND_DIRECT) {
+            host_protect(left,PAGE,host_prot(vmas[j].prot));
+            queue_hook(HOOK_INVALIDATE,left,PAGE);
+        }
+    }
+}
+/* The other guest address of the direct page at [address], or 0. Under the lock. */
+static uintptr_t view_other(uintptr_t address, size_t *vma) {
+    size_t i=vma_index(address);
+    if (i==vma_count || vmas[i].start>address || vmas[i].kind!=KIND_DIRECT) return 0;
+    if (vma) *vma=i;
+    const uint64_t off=(address-vmas[i].start) & ~(PAGE-1), phys=vmas[i].phys+off, page=phys/PAGE;
+    if (page>=phys_view_pages) return 0;
+    const uintptr_t at=vmas[i].start+off, *v=phys_views[page];
+    const uintptr_t other=v[0]==at ? v[1] : v[1]==at ? v[0] : 0;
+    return other ? other+((address-vmas[i].start)-off) : 0;
+}
+/* Gives the other addresses of [address,address+size) the GPU's protection (read/write wanted). */
+static void views_protect(uintptr_t address, uint64_t size, int read, int write) {
+    uintptr_t run=0, run_end=0; int run_prot=0;
+    for (uintptr_t at=address & ~(uintptr_t)(PAGE-1); at<address+size; at+=PAGE) {
+        const uintptr_t other=view_other(at,NULL);
+        size_t j=other ? vma_index(other) : vma_count;
+        int prot=0;
+        if (j<vma_count && vmas[j].start<=other) {
+            const int guest=host_prot(vmas[j].prot);
+            /* writes only: a read of the other address is never stopped (GPU threads read guest
+             * memory by address, and a read fault there waited for the GPU itself) */
+            const int want=PROT_READ|(write ? PROT_WRITE : 0)|(guest & PROT_EXEC);
+            (void)read;
+            prot=guest & want;
+        } else j=vma_count;
+        if (run && (j==vma_count || other!=run_end || prot!=run_prot)) { host_protect(run,run_end-run,run_prot); run=0; }
+        if (j==vma_count) continue;
+        if (!run) { run=other; run_prot=prot; }
+        run_end=other+PAGE;
+    }
+    if (run) host_protect(run,run_end-run,run_prot);
+}
+/* sotc: T38, SOTC_POOL_OWNER (default on; 0 off). The game's 64 KiB page pool (eboot 0x19e00)
+ * shrinks a texture's block by freeing pages without unmapping them (release eboot 0x1abf0 with
+ * no unmap); those pages go to another block, mapped at its address. When the first block is
+ * freed whole, the release asks sceKernelVirtualQuery for every page of the block's range and
+ * frees the physical page found there again: the page now has two owners (mosaic textures,
+ * heap blocks overwritten, the free tally drifting up until the 5th Time Attack). Each physical
+ * 64 KiB page keeps the address it was mapped at last; asked from the release, a page mapped
+ * elsewhere since reads as not committed, and the release skips it. */
+static uintptr_t *page_owner; static uint64_t page_owner_count, owner_skipped_pages, owner_skips;
+static uintptr_t release_site; /* return address of the release's VirtualQuery (probe.c) */
+static int pool_owner_on(void) {
+    static int on=-1;
+    if (on<0) { const char *v=getenv("SOTC_POOL_OWNER"); on=!(v && v[0]=='0'); }
+    return on;
+}
+void runtime_memory_set_release_site(uintptr_t site) { release_site=site; }
+static void owner_note(uint64_t phys, uintptr_t address, uint64_t size) {
+    if (!pool_owner_on()) return;
+    if (!page_owner) {
+        page_owner_count=POOL_SIZE>>16;
+        page_owner=calloc(page_owner_count,sizeof(*page_owner));
+        if (!page_owner) { page_owner_count=0; return; }
+    }
+    for (uint64_t p=(phys+0xffff)&~(uint64_t)0xffff; p+0x10000<=phys+size; p+=0x10000)
+        if ((p>>16)<page_owner_count) page_owner[p>>16]=address+(p-phys);
+}
 static void drop_range(uintptr_t start, uintptr_t end) {
     int error; size_t i=carve(start,end,&error), n=0;
     while (i+n<vma_count && vmas[i+n].end<=end && vmas[i+n].start>=start) {
@@ -722,6 +843,7 @@ static void drop_range(uintptr_t start, uintptr_t end) {
             flexible_bytes-=vmas[i+n].end-vmas[i+n].start;
             flex_free(vmas[i+n].phys,vmas[i+n].end-vmas[i+n].start);
         }
+        if (vmas[i+n].kind==KIND_DIRECT) views_remove(vmas[i+n].phys,vmas[i+n].start,vmas[i+n].end-vmas[i+n].start);
         ++n;
     }
     vma_erase(i,n);
@@ -746,6 +868,22 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
     drop_range(address,address+size);
     if (vma_insert(vma_index(address),(Vma){address,address+size,kind,prot,type,phys})) return NO_MEMORY;
     if (kind==KIND_FLEXIBLE) flexible_bytes+=size;
+    if (kind==KIND_DIRECT) {
+        owner_note(phys,address,size);
+        views_add(phys,address,size);
+#ifdef _WIN32
+        /* a new second address takes the GPU's protection of the first */
+        if (__atomic_load_n(&alias_pages,__ATOMIC_RELAXED))
+            for (uintptr_t at=address; at<address+size; at+=PAGE) {
+                const uintptr_t other=view_other(at,NULL);
+                MEMORY_BASIC_INFORMATION m;
+                if (!other || !VirtualQuery((void *)other,&m,sizeof(m))) continue;
+                const int guest=host_prot(prot);
+                if (m.Protect==PAGE_NOACCESS || m.Protect==PAGE_READONLY || m.Protect==PAGE_EXECUTE_READ)
+                    host_protect(at,PAGE,guest & (PROT_READ|PROT_EXEC));
+            }
+#endif
+    }
     if (kind!=KIND_RESERVED) queue_hook(HOOK_MAP,address,size);
     *inout=mapped;
     return 0;
@@ -803,6 +941,49 @@ static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
     printf("Runtime: direct allocation offset=0x%" PRIx64 ", size=%" PRIu64 " bytes, type=%d\n", start, size, type);
     return 0;
 }
+static uint64_t alias_ms(void) {
+#ifdef _WIN32
+    return GetTickCount64();
+#else
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000+(uint64_t)t.tv_nsec/1000000;
+#endif
+}
+/* sotc: SOTC_VIEW_CHECK=1 (diagnostic, T38): the host views against the region table, once a
+ * second during maps. A view whose section offset is not the one the table gives its guest
+ * address means the CPU writes one physical page and the GPU (which reads the backing by the
+ * table) another. */
+static void views_check(void) {
+#ifdef _WIN32
+    static int on=-1;
+    if (on<0) { const char *v=getenv("SOTC_VIEW_CHECK"); on=v && v[0]=='1'; }
+    if (!on) return;
+    static uint64_t last; static unsigned long bad_total, checks;
+    const uint64_t now=alias_ms();
+    if (now-last<1000) return;
+    last=now; ++checks;
+    unsigned long bad=0;
+    for (size_t r=0; r<region_count; ++r) {
+        if (!regions[r].mapped) continue;
+        for (uintptr_t at=regions[r].start; at<regions[r].end;) {
+            const size_t i=vma_index(at);
+            if (i==vma_count || vmas[i].start>at) { /* a view where the table has nothing */
+                if (bad++<8 && bad_total<200) fprintf(stderr,"Runtime: VIEW CHECK view %p-%p (offset %#" PRIx64 ") over no mapping at %p\n",
+                    (void *)regions[r].start,(void *)regions[r].end,regions[r].phys,(void *)at);
+                break;
+            }
+            const uintptr_t stop=vmas[i].end<regions[r].end ? vmas[i].end : regions[r].end;
+            const uint64_t view_phys=regions[r].phys+(at-regions[r].start);
+            const uint64_t table_phys=vmas[i].phys+(at-vmas[i].start);
+            if (vmas[i].kind!=KIND_RESERVED && view_phys!=table_phys && bad++<8 && bad_total<200)
+                fprintf(stderr,"Runtime: VIEW CHECK %p-%p: view offset %#" PRIx64 ", table %#" PRIx64 " (kind %d, mapping %p-%p)\n",
+                        (void *)at,(void *)stop,view_phys,table_phys,vmas[i].kind,(void *)vmas[i].start,(void *)vmas[i].end);
+            at=stop;
+        }
+    }
+    bad_total+=bad;
+    if (bad || checks%30==1) fprintf(stderr,"Runtime: VIEW CHECK %lu wrong now, %lu in all (%zu views, %zu mappings)\n",bad,bad_total,region_count,vma_count);
+#endif
+}
 static int32_t map_direct_locked(void **out, uint64_t size, int prot, int flags, int64_t physical, uint64_t alignment) {
     if (!alignment) alignment=PAGE;
     if (!out || physical < 0 || (uint64_t)physical % PAGE || !size || size % PAGE || !valid_alignment(alignment) ||
@@ -810,6 +991,58 @@ static int32_t map_direct_locked(void **out, uint64_t size, int prot, int flags,
     if (!direct_range_allocated((uint64_t)physical,size)) return INVALID;
     int32_t result=place(out,size,prot,flags,alignment,KIND_DIRECT,block_type((uint64_t)physical),(uint64_t)physical);
     if (!result) ++maps;
+    views_check();
+    /* sotc: SOTC_ALIAS_LOG=1 (diagnostic, T38): physical pages mapped at a second address while
+     * still mapped at the first. The GPU caches go by address and do not see one through the other. */
+    static int alias_log=-1;
+    if (alias_log<0) { const char *v=getenv("SOTC_ALIAS_LOG"); alias_log=v && v[0]=='1'; }
+    if (!result && alias_log) {
+        static unsigned long aliases, logged;
+        const uintptr_t at=(uintptr_t)*out; const uint64_t p=(uint64_t)physical;
+        /* Pairs seen, checked once a second: how long both addresses stay on the same pages. */
+        enum { PAIRS=4096 };
+        static struct { uintptr_t a, b; uint64_t phys, size, since; } pairs[PAIRS];
+        static size_t npairs; static uint64_t last_check, worst_ms;
+        const uint64_t now=alias_ms();
+        if (now-last_check>=1000) {
+            last_check=now;
+            size_t live=0; uint64_t live_bytes=0, oldest=0;
+            for (size_t k=0;k<npairs;) {
+                size_t ia=vma_index(pairs[k].a), ib=vma_index(pairs[k].b);
+                const int both=ia<vma_count && ib<vma_count && vmas[ia].kind==KIND_DIRECT && vmas[ib].kind==KIND_DIRECT &&
+                    vmas[ia].start<=pairs[k].a && vmas[ib].start<=pairs[k].b &&
+                    vmas[ia].phys+(pairs[k].a-vmas[ia].start)==pairs[k].phys &&
+                    vmas[ib].phys+(pairs[k].b-vmas[ib].start)==pairs[k].phys;
+                const uint64_t age=now-pairs[k].since;
+                if (!both) {
+                    if (age>worst_ms) worst_ms=age;
+                    pairs[k]=pairs[--npairs]; continue;
+                }
+                ++live; live_bytes+=pairs[k].size; if (age>oldest) oldest=age; ++k;
+            }
+            if (live || worst_ms)
+                fprintf(stderr,"Runtime: ALIAS live %zu pairs (%" PRIu64 " KiB), oldest %" PRIu64 " ms; longest ended %" PRIu64 " ms; %lu in all; %" PRIu64 " pages in two views, %" PRIu64 " faults handed over\n",
+                        live,live_bytes>>10,oldest,worst_ms,aliases,alias_pages,alias_faults);
+        }
+        for (size_t i=0;i<vma_count;++i) {
+            const Vma *v=&vmas[i];
+            if (v->kind!=KIND_DIRECT || (v->start<at+size && at<v->end)) continue;
+            if (v->phys<p+size && p<v->phys+(v->end-v->start)) {
+                ++aliases;
+                if (npairs<PAIRS) {
+                    const uint64_t lo=v->phys>p ? v->phys : p;
+                    const uint64_t hi=v->phys+(v->end-v->start)<p+size ? v->phys+(v->end-v->start) : p+size;
+                    pairs[npairs++]=(__typeof__(pairs[0])){at+(lo-p),v->start+(lo-v->phys),lo,hi-lo,now};
+                }
+                if (logged<60) {
+                    ++logged;
+                    fprintf(stderr,"Runtime: ALIAS physical %#" PRIx64 "+%#" PRIx64 " mapped at %p, already at %p-%p (physical %#" PRIx64 "), %lu so far\n",
+                            p,size,(void *)at,(void *)v->start,(void *)v->end,v->phys,aliases);
+                }
+                break;
+            }
+        }
+    }
     return result;
 }
 static ABI int32_t direct_map(void **out, uint64_t size, int prot, int flags, int64_t physical, uint64_t alignment) {
@@ -818,6 +1051,11 @@ static ABI int32_t direct_map(void **out, uint64_t size, int prot, int flags, in
     write_unlock();
     flush_hooks();
     if (!result) printf("Runtime: mapped direct memory %p, size=%" PRIu64 ", prot=0x%x\n", *out, size, prot);
+    else {
+        static unsigned long failed;
+        if (failed++<40) fprintf(stderr,"Runtime: MAP DIRECT failed (%#x): at %p +%#" PRIx64 " offset %#" PRIx64 " prot %#x flags %#x align %#" PRIx64 ", from %p\n",
+                                 (unsigned)result,out ? *out : NULL,size,(uint64_t)physical,prot,flags,alignment,__builtin_return_address(0));
+    }
     return result;
 }
 static ABI int32_t direct_map_named(void **out, uint64_t size, int prot, int flags, int64_t physical,
@@ -847,6 +1085,10 @@ static ABI int32_t direct_unmap(void *address, uint64_t size) {
     int32_t result=unmap_locked((uintptr_t)address,size);
     pending_count=before; /* already notified above */
     write_unlock();
+    if (result) {
+        static unsigned long failed;
+        if (failed++<40) fprintf(stderr,"Runtime: MUNMAP failed (%#x): %p +%#" PRIx64 ", from %p\n",(unsigned)result,address,size,__builtin_return_address(0));
+    }
     return result;
 }
 static ABI int32_t direct_release(uint64_t start, uint64_t size) {
@@ -974,6 +1216,27 @@ static ABI int32_t virtual_query(const void *address, int flags, VirtualQueryInf
     info->offset=v.kind==KIND_DIRECT ? v.phys : 0;
     info->protection=v.prot; info->memory_type=v.type;
     info->flags=(v.kind==KIND_FLEXIBLE ? 1u : 0) | (v.kind==KIND_DIRECT ? 2u : 0) | (v.kind!=KIND_RESERVED ? 16u : 0);
+    /* sotc: T38, the pool release asking about pages another block owns now (owner_note) */
+    if (release_site && page_owner && v.kind==KIND_DIRECT && (uintptr_t)__builtin_return_address(0)==release_site &&
+        (uintptr_t)address>=v.start) {
+        const uintptr_t page=(uintptr_t)address & ~(uintptr_t)0xffff;
+        uintptr_t at=page<v.start ? v.start : page;
+        uint64_t stale=0;
+        for (; at<v.end; at=(at & ~(uintptr_t)0xffff)+0x10000, ++stale) {
+            const uint64_t phys=v.phys+(at-v.start);
+            if ((phys>>16)>=page_owner_count || !page_owner[phys>>16] || page_owner[phys>>16]==(at & ~(uintptr_t)0xffff)) break;
+        }
+        if (stale) {
+            info->start=(uintptr_t)address; info->end=at;
+            info->offset=v.phys+((uintptr_t)address-v.start);
+            info->flags&=~16u; /* not committed: the release skips [address, at) */
+            __atomic_add_fetch(&owner_skipped_pages,stale,__ATOMIC_RELAXED);
+            const uint64_t n=__atomic_add_fetch(&owner_skips,1,__ATOMIC_RELAXED);
+            if (n<=20 || !(n&(n-1)))
+                fprintf(stderr,"Runtime: POOL OWNER release of %p skips %" PRIu64 " pages mapped at another block since (%" PRIu64 " skips, %" PRIu64 " pages so far)\n",
+                        address,stale,n,owner_skipped_pages);
+        }
+    }
     strcpy(info->name, v.kind==KIND_RESERVED ? "reserved" : v.kind==KIND_DIRECT ? "direct" : "flexible");
     __atomic_add_fetch(&queries,1,__ATOMIC_RELAXED);
     read_unlock();
@@ -1010,7 +1273,16 @@ static ABI int32_t batch_map2(BatchEntry *entries, int count, int *processed, in
         case 4: result=protect_locked((uintptr_t)e->start,e->length,(uint8_t)e->prot,e->type); break;
         default: result=INVALID;
         }
-        if (result) break;
+        if (result) {
+            /* sotc: a failed entry leaves what was mapped there before: the game, which may not
+             * check, then writes and frees through the old pages (T38) */
+            static unsigned long failed;
+            if (failed++<40)
+                fprintf(stderr,"Runtime: BATCH MAP entry %d of %d failed (%#x): op %d at %p +%#" PRIx64 " offset %#" PRIx64 " prot %#x type %d flags %#x, from %p\n",
+                        done,count,(unsigned)result,e->operation,e->start,e->length,e->offset,(unsigned)(uint8_t)e->prot,e->type,flags,
+                        __builtin_return_address(0));
+            break;
+        }
     }
     write_unlock();
     flush_hooks();
@@ -1321,6 +1593,29 @@ static void cache_region(size_t i, uintptr_t address) {
  * obtained while it was even stays valid until it changes (the invariant cached_region relies
  * on: only write_lock/write_unlock bump it; page protection takes the read lock). Odd (never
  * cache) while the table changes or when the GPU caches are disabled. */
+/* sotc: T38. A fault at the second address of a page: the GPU's watched address, or 0. */
+uintptr_t runtime_memory_alias_of(uintptr_t address) {
+    if (!__atomic_load_n(&alias_pages,__ATOMIC_RELAXED)) return 0;
+    read_lock();
+    const uintptr_t other=view_other(address,NULL);
+    read_unlock();
+    return other;
+}
+/* The 4 KiB page at [address] back to the guest's own protection after a write fault the
+ * trackers saw at both addresses; 0 when the guest itself does not allow writing there. */
+int runtime_memory_alias_release(uintptr_t address) {
+    int writable=0;
+    read_lock();
+    const size_t i=vma_index(address);
+    if (i<vma_count && vmas[i].start<=address && vmas[i].kind!=KIND_RESERVED) {
+        const int guest=host_prot(vmas[i].prot);
+        writable=(guest & PROT_WRITE)!=0;
+        if (writable) host_protect(address & ~(uintptr_t)4095,4096,guest);
+    }
+    read_unlock();
+    if (writable) __atomic_add_fetch(&alias_faults,1,__ATOMIC_RELAXED);
+    return writable;
+}
 uint64_t runtime_memory_generation(void) {
     if (runtime_disabled_optimizations & 1) return 1;
     return __atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
@@ -1558,8 +1853,12 @@ static int protect_fast(uintptr_t address, uint64_t size, int read, int write) {
 }
 #endif
 void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int write) {
-    if (protect_fast(address,size,read,write)) return;
+    if (protect_fast(address,size,read,write)) {
+        if (__atomic_load_n(&alias_pages,__ATOMIC_RELAXED)) { read_lock(); views_protect(address,size,read,write); read_unlock(); }
+        return;
+    }
     read_lock();
+    if (__atomic_load_n(&alias_pages,__ATOMIC_RELAXED)) views_protect(address,size,read,write);
     for (size_t i=vma_index(address); i<vma_count && vmas[i].start<address+size; ++i) {
         if (vmas[i].kind==KIND_RESERVED) continue;
         uintptr_t a=vmas[i].start>address ? vmas[i].start : address;

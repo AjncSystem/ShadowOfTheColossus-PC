@@ -332,7 +332,15 @@ bool g_window_ready;
 
 u32 BbDisplayRefreshHz() {
     static const u32 hz = [] {
-        const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetPrimaryDisplay());
+        // sotc: the game monitor's rate (SOTC_MONITOR_AT, window.cpp), else the primary display's
+        SDL_DisplayID display = 0;
+        if (const char* at = std::getenv("SOTC_MONITOR_AT")) {
+            SDL_Point point{};
+            if (std::sscanf(at, "%d,%d", &point.x, &point.y) == 2) {
+                display = SDL_GetDisplayForPoint(&point);
+            }
+        }
+        const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(display ? display : SDL_GetPrimaryDisplay());
         const u32 rate = mode && mode->refresh_rate > 0 ? u32(mode->refresh_rate + 0.5f) : 60;
         std::printf("GPU: vblank follows the display refresh rate, %u Hz\n", rate);
         return std::max<u32>(rate, 60);

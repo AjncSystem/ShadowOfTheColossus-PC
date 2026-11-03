@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -754,6 +755,25 @@ bool SetSrOptions(u32 in_w, u32 in_h, u32 out_w, u32 out_h) {
         }
     }
     options.mode = best;
+    // sotc: SOTC_DLSS_PRESET=E..M forces one DLSS model preset in every mode (ghosting tests,
+    // e.g. shadows trailing in dark areas). Unset uses preset E (the CNN model: the default
+    // transformer presets ghost the character's shadow in dark scenes); SOTC_DLSS_PRESET=default
+    // keeps NVIDIA's default per mode.
+    static const sl::DLSSPreset preset = [] {
+        const char* v = std::getenv("SOTC_DLSS_PRESET");
+        if (v && *v && (v[0] == 'd' || v[0] == 'D')) {
+            return sl::DLSSPreset::eDefault;
+        }
+        const char c =
+            v && *v ? static_cast<char>(std::toupper(static_cast<unsigned char>(v[0]))) : 'E';
+        if (c < 'E' || c > 'O') {
+            return sl::DLSSPreset::eDefault;
+        }
+        std::fprintf(stderr, "SOTC DLSS: preset %c forced\n", c);
+        return static_cast<sl::DLSSPreset>(static_cast<u32>(sl::DLSSPreset::ePresetE) + (c - 'E'));
+    }();
+    options.dlaaPreset = options.qualityPreset = options.balancedPreset = preset;
+    options.performancePreset = options.ultraPerformancePreset = options.ultraQualityPreset = preset;
     sr_mode_name.store(best == sl::DLSSMode::eDLAA            ? "DLAA"
                        : best == sl::DLSSMode::eMaxQuality    ? "DLSS Quality"
                        : best == sl::DLSSMode::eBalanced      ? "DLSS Balanced"
@@ -1055,6 +1075,13 @@ bool Enabled() {
 
 bool SuperResolution() {
     return sr_supported && !sr_user_off.load(std::memory_order_relaxed);
+}
+
+// sotc: the last frame's input was not smaller than the output (Upscale), so DLSS took no frame.
+std::atomic<bool> sr_declined{false};
+
+bool SuperResolutionUpscaling() {
+    return SuperResolution() && !sr_declined.load(std::memory_order_relaxed);
 }
 
 bool SuperResolutionAvailable() {
@@ -1434,6 +1461,21 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
         sr_prev = false;
         return {};
     }
+    // sotc: an input as large as the output or larger (PS4 Pro Cinematic mode renders 2560x1440
+    // for a 1080p window) is not upscaled: NGX refused every evaluate (0xbad00005), turned super
+    // resolution off for the session after three, and the frame repeat showed the last DLSS
+    // picture for good (frozen screen, 2 Nov). The plain path scales it down.
+    sr_declined.store(f.width >= width && f.height >= height, std::memory_order_relaxed);
+    if (f.width >= width && f.height >= height) {
+        static u32 logged = 0;
+        if (logged++ < 3) {
+            std::fprintf(stderr, "SOTC DLSS: input %ux%u not smaller than the output %ux%u: "
+                                 "not upscaled\n",
+                         f.width, f.height, width, height);
+        }
+        sr_prev = false;
+        return {};
+    }
     // sotc: when no DLSS mode takes this input height for the output, DLSS upscales 2x and the
     // post-process pass scales the rest. PS4 Pro mode at 4K hands it 1600x900: to 2160p no mode
     // takes that height, NGX refused every evaluate (0xbad00005) and the screen stayed black.
@@ -1748,8 +1790,15 @@ void FillCameraMotion(vk::CommandBuffer cmdbuf, const FrameSlot& f, const sl::Co
     struct Params {
         sl::float4x4 clip_to_prev;
         u32 width, height, fill_all, inverted;
-        float sky_bias, sky_depth;
+        float sky_bias, sky_depth, scene_bias;
     };
+    // SOTC_DLSS_BIAS (0..1, default 0.4): current-colour bias for the whole scene, so the shadow
+    // of a moving character (no motion vector) does not trail in dark areas. 0 = off.
+    static const float scene_bias = [] {
+        const char* v = std::getenv("SOTC_DLSS_BIAS");
+        const float b = v && *v ? static_cast<float>(std::atof(v)) : 0.4f;
+        return std::min(std::max(b, 0.0f), 1.0f);
+    }();
     static vk::Sampler sampler;
     static vk::DescriptorSetLayout set_layout;
     static vk::PipelineLayout layout;
@@ -1867,7 +1916,8 @@ void FillCameraMotion(vk::CommandBuffer cmdbuf, const FrameSlot& f, const sl::Co
                         mode == 2 ? 1u : 0u,
                         c.depthInverted == sl::Boolean::eTrue ? 1u : 0u,
                         kSkyBias,
-                        kSkyDepth};
+                        kSkyDepth,
+                        scene_bias};
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, writes);
     cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(Params), &params);

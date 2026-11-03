@@ -565,6 +565,11 @@ public:
         }
     }
 
+    /// sotc: SOTC_RB_TEX_WATCH=1: a GPU readback about to be written over a block-compressed
+    /// texture the GPU never wrote (a material texture) is logged: the colour garbage after loads.
+    static bool ReadbackWatchEnabled();
+    void NoteReadbackOverTexture(VAddr addr, u64 size, bool hot);
+
 private:
     /// Iterate over all page indices in a range
     template <typename Func>

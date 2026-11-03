@@ -14,7 +14,7 @@ layout (binding = 2) uniform sampler2D skySampler;
 
 layout (push_constant) uniform settings {
     float gamma;
-    bool hdr;
+    uint hdr; // sotc: 0 = SDR, 1 = the game's own HDR10 (pass through), 2 = SDR game on HDR10
     bool srgb_input;
     // sotc: 1 = uiSampler over a DLSS upscaled scene; 2 = the same scene without it (the
     // HUD-less frame of frame generation); 0 = neither.
@@ -24,7 +24,24 @@ layout (push_constant) uniform settings {
     float sky_sharpen; // sotc: unsharp amount in the sky
     float hdr_white; // sotc: HDR paper white in nits
     float hdr_curve; // sotc: exponent of the game's HDR composite
+    float paper_white; // sotc: hdr 2: nits of SDR white
+    float highlight_gain; // sotc: hdr 2: gain of the highlights
 } pp;
+
+// sotc: linear Rec.709 -> HDR10 (Rec.2020 primaries, ST 2084 PQ) for an SDR game. SDR white sits at
+// paper_white nits; the highlights get up to highlight_gain times that, smoothly.
+vec3 sdrToHdr10(vec3 lin) {
+    lin = max(lin, 0.0);
+    const float peak = max(lin.r, max(lin.g, lin.b));
+    const float t = smoothstep(0.6, 1.0, peak);
+    lin *= 1.0 + (pp.highlight_gain - 1.0) * t * t;
+    const mat3 to2020 = mat3(0.6274, 0.0691, 0.0164,
+                             0.3293, 0.9195, 0.0880,
+                             0.0433, 0.0114, 0.8956);
+    const vec3 y = clamp(to2020 * lin * pp.paper_white / 10000.0, 0.0, 1.0);
+    const vec3 p = pow(y, vec3(0.1593017578125));
+    return pow((0.8359375 + 18.8515625 * p) / (1.0 + 18.6875 * p), vec3(78.84375));
+}
 
 const float cutoff = 0.0031308, a = 1.055, b = 0.055, d = 12.92;
 vec3 gamma(vec3 rgb) {
@@ -124,7 +141,7 @@ void main() {
             ui = clamp(ui + pp.ui_sharpen * (ui - 0.25 * (n + s + w + e)), lo, hi);
             ui.rgb = min(ui.rgb, vec3(ui.a));
         }
-        if (pp.hdr) {
+        if (pp.hdr == 1u) {
             // The game's HDR composite: UI over scene, ^k (its constant), Rec.2020, PQ with
             // 1.0 at 300 nits; scaled to the paper white like below.
             const vec3 c = abs(color_linear.rgb * (1.0 - ui.a) + ui.rgb);
@@ -134,11 +151,14 @@ void main() {
         }
         color_linear = vec4(clamp(color_linear.rgb, 0.0, 1.0) * (1.0 - ui.a) + ui.rgb, 1.0);
     }
-    if (pp.hdr) {
+    if (pp.hdr == 1u) {
         // The game's own BT.2020 PQ output has its white at about 100 nits, too dim next to
         // the desktop; scaled to the paper white.
         color = vec4(pqEncode(pqDecode(color_linear.rgb) * (pp.hdr_white / 100.0)),
                      color_linear.a);
+    } else if (pp.hdr == 2u) {
+        if (pp.srgb_input) color_linear.rgb = degamma(color_linear.rgb);
+        color = vec4(sdrToHdr10(color_linear.rgb), color_linear.a);
     } else {
         if (pp.srgb_input) color_linear.rgb = degamma(color_linear.rgb);
         color = vec4(gamma(color_linear.rgb), color_linear.a);

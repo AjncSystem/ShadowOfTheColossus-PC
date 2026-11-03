@@ -51,7 +51,7 @@ static const u64 rb_narrow_env = [] {
     if (kib == 0) {
         return u64{0};
     }
-    return std::bit_floor(kib == 1 ? u64{64} : std::clamp<u64>(kib, 4, 512)) * 1_KB;
+    return static_cast<u64>(std::bit_floor(kib == 1 ? u64{64} : std::clamp<u64>(kib, 4, 512)) * 1_KB);
 }();
 
 static constexpr auto ARENA_USAGE =
@@ -244,7 +244,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             return u64{0};
         }
         const char* v = std::getenv("SOTC_RB_STREAM_MAX_KB");
-        return (v ? std::strtoull(v, nullptr, 10) : 4096ULL) * 1_KB;
+        return static_cast<u64>((v ? std::strtoull(v, nullptr, 10) : 4096ULL) * 1_KB);
     }();
     u64 stream = 0;
     if (stream_max != 0) {
@@ -675,7 +675,7 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
                     }
                 };
                 for (VAddr page = address; page < range_end;) {
-                    const VAddr next = std::min(Common::AlignDown(page, 4_KB) + 4_KB, range_end);
+                    const VAddr next = std::min<VAddr>(Common::AlignDown(page, 4_KB) + 4_KB, range_end);
                     if (memory_tracker->IsRegionCpuModified(page, next - page)) {
                         flush_run(page);
                         run_start = next;

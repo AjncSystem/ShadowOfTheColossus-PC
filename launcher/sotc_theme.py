@@ -43,6 +43,7 @@ ICON = {'play': '', 'graphics': '', 'display': '', 'game': '', 'chea
         'folder': '', 'cpu': '', 'ram': '', 'pulse': '', 'help': '', 'picture': '', 'saves': '',
         'language': '', 'gameplay': ''}
 
+HAS_ICONS = True  # the icon font is there; load_fonts sets it
 SS = 4  # supersampling of the drawn images
 
 
@@ -54,11 +55,20 @@ def blend(a, b, t):
 
 def load_fonts(root):
     """Registers the bundled fonts for this process only and picks the families Tk sees."""
-    global HEAD, HEAD_BOLD, BODY, BODY_MEDIUM, BODY_SEMI, ICONS
+    global HEAD, HEAD_BOLD, BODY, BODY_MEDIUM, BODY_SEMI, ICONS, HAS_ICONS
     import tkinter.font as tkfont
+    fontconfig = None
+    if not hasattr(ctypes, 'windll'):  # Linux: fontconfig, which Tk's Xft fonts come from
+        try:
+            fontconfig = ctypes.CDLL('libfontconfig.so.1')
+        except OSError:
+            pass
     for path in sorted((ASSETS / 'fonts').glob('*.ttf')):
         try:
-            ctypes.windll.gdi32.AddFontResourceExW(str(path), 0x10, 0)  # FR_PRIVATE
+            if fontconfig is not None:
+                fontconfig.FcConfigAppFontAddFile(None, str(path).encode())
+            else:
+                ctypes.windll.gdi32.AddFontResourceExW(str(path), 0x10, 0)  # FR_PRIVATE
         except (AttributeError, OSError):
             pass
     families = set(tkfont.families(root))
@@ -69,6 +79,11 @@ def load_fonts(root):
     BODY_MEDIUM = pick('Inter Medium', 'Inter', 'Segoe UI')
     BODY_SEMI = pick('Inter SemiBold', 'Inter', 'Segoe UI Semibold')
     ICONS = pick('Segoe Fluent Icons', 'Segoe MDL2 Assets')
+    # Windows' own icon fonts; without them (Linux) the icons would show as empty boxes: none drawn.
+    HAS_ICONS = ICONS in families
+    if not HAS_ICONS:
+        for name in ICON:
+            ICON[name] = ''
 
 
 # ---- drawing --------------------------------------------------------------------------------

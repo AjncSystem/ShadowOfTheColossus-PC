@@ -107,6 +107,14 @@ BpeHeapGuard::BpeHeapGuard(Core::MemoryManager* memory_, VAddr heap_)
 }
 
 bool BpeHeapGuard::Read(VAddr addr, void* out, u64 size) const {
+    // sotc: the run of the previous read first: the walk reads node after node in one run.
+    if (last_run < runs.size()) {
+        const Run& run = runs[last_run];
+        if (addr - run.start < run.size && addr - run.start + size <= run.size) {
+            std::memcpy(out, run.ptr + (addr - run.start), size);
+            return true;
+        }
+    }
     auto it = std::upper_bound(runs.begin(), runs.end(), addr,
                                [](VAddr value, const Run& run) { return value < run.start; });
     if (it == runs.begin() || addr - std::prev(it)->start >= std::prev(it)->size) {
@@ -124,12 +132,22 @@ bool BpeHeapGuard::Read(VAddr addr, void* out, u64 size) const {
         it = std::next(runs.insert(it, run));
     }
     const Run& run = *std::prev(it);
+    last_run = static_cast<size_t>(std::prev(it) - runs.begin());
     if (addr - run.start + size > run.size) {
         // Crosses into the next physical area: take the general path
         return memory->TryReadBacking(addr, out, size);
     }
     std::memcpy(out, run.ptr + (addr - run.start), size);
     return true;
+}
+
+void BpeHeapGuard::Prefetch(VAddr addr) const {
+    if (last_run < runs.size()) {
+        const Run& run = runs[last_run];
+        if (addr - run.start + 64 <= run.size) {
+            __builtin_prefetch(run.ptr + (addr - run.start));
+        }
+    }
 }
 
 bool BpeHeapGuard::IsHeapPointer(VAddr addr) const {
@@ -187,6 +205,17 @@ size_t BpeHeapGuard::CollectFreeTree() {
             continue;
         }
         AddFreeBlock(node - HeaderSize);
+        // sotc: the walk is a chain of cache misses across the heap (~150 ns a node): the
+        // children's headers start loading now, while this node's ring is followed.
+        static const bool prefetch = [] {
+            const char* v = std::getenv("SOTC_GUARD_PREFETCH");
+            return !(v && v[0] == '0');
+        }();
+        if (prefetch) {
+            if (IsHeapPointer(words[2])) Prefetch(words[2] - HeaderSize);
+            if (IsHeapPointer(words[3])) Prefetch(words[3] - HeaderSize);
+            if (IsHeapPointer(words[4])) Prefetch(words[4]);
+        }
         // Blocks of equal size hang off the tree node in a ring through the list links
         VAddr member = words[4];
         for (size_t i = 0; i < MaxListNodes && IsHeapPointer(member) && member != node; ++i) {

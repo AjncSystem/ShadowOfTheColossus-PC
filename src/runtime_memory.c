@@ -509,7 +509,12 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
  * boundaries, so a split only remaps the chunks at its two ends. */
 static uint64_t view_chunk(void) {
     static int64_t v=-1;
-    if (v<0) { const char *e=getenv("SOTC_VIEW_CHUNK_MB"); v=(e ? atoll(e) : 2)<<20; if (v<0) v=0; }
+    if (v<0) {
+        /* SOTC_VIEW_CHUNK_KB overrides the MB value (multiple of the 64 KiB view granularity) */
+        const char *e=getenv("SOTC_VIEW_CHUNK_MB"), *k=getenv("SOTC_VIEW_CHUNK_KB");
+        v=k ? (atoll(k)<<10)&~(int64_t)0xFFFF : (e ? atoll(e) : 2)<<20;
+        if (v<0) v=0;
+    }
     return (uint64_t)v;
 }
 static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, uint64_t phys) {
@@ -1326,11 +1331,31 @@ const unsigned char *runtime_memory_backing_view(uint64_t *size) {
     if (size) *size=backing_base ? POOL_SIZE+FLEX_SPAN : 0;
     return backing_base;
 }
+/* sotc: SOTC_GAP_FAST=0: lookups of unmapped addresses take the read lock. At area changes the
+ * GPU's lookups that land in a gap waited for the game's map batches although the answer (nothing
+ * is mapped there) needs no lock: the gap is seen in a consistent (vma_seq) read and used when no
+ * write since the generation read first changed [check_lo,check_hi) - a gap that exists only
+ * during a write lies in its dirty range. 1: [*lo,*hi) is the gap around at (hi UINTPTR_MAX past
+ * the last VMA); 0: unknown, take the lock. check_hi 0: check the whole gap. */
+static int gap_fast(uintptr_t at, uintptr_t check_hi, uintptr_t *lo, uintptr_t *hi) {
+    static int on=-1;
+    if (on<0) { const char *v=getenv("SOTC_GAP_FAST"); on=!(v && v[0]=='0') && region_log_on(); }
+    if (!on || !backing_base || exclusive_depth || (runtime_disabled_optimizations & 1)) return 0;
+    const uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
+    Vma e;
+    if (vma_lookup_gap(at,&e,lo,hi)!=2) return 0;
+    const uint64_t now=__atomic_load_n(&table_generation,__ATOMIC_SEQ_CST);
+    const uintptr_t a=check_hi ? at : *lo, b=check_hi ? (check_hi<*hi ? check_hi : *hi) : *hi;
+    return (now==generation && !(now & 1)) || region_unchanged(a,b,generation & ~(uint64_t)1,now);
+}
 /* sotc: the GPU reads guest memory through the backing view on every upload; the per-thread
  * region cache spares it the table lock (a winpthread rwlock, slow) and the binary search. */
 const unsigned char *runtime_memory_backing_pointer(uintptr_t address) {
     const CachedRegion *c=(runtime_disabled_optimizations & 1) ? NULL : cached_region(address);
     if (c && c->backing) return c->backing+(address-c->start);
+    if (c && c->kind==KIND_RESERVED) return NULL;
+    uintptr_t gap_lo, gap_hi;
+    if (!c && gap_fast(address,address+1,&gap_lo,&gap_hi)) return NULL;
     read_lock();
     size_t i=vma_index(address);
     const unsigned char *p=NULL;
@@ -1370,16 +1395,8 @@ static int mapped_length_fast(uintptr_t address, uint64_t size, uint64_t *length
             n=c->end-address;
             continue;
         }
-        if (!on || !backing_base) return 0;
-        const uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
-        Vma e; uintptr_t lo=0, hi=0;
-        if (vma_lookup_gap(at,&e,&lo,&hi)!=2) return 0;
-        const uint64_t now=__atomic_load_n(&table_generation,__ATOMIC_SEQ_CST);
-        /* only the part of the gap this range covers: a gap that exists only during a write
-         * lies in that write's dirty range, which includes at */
-        const uintptr_t upto=hi<address+size ? hi : address+size;
-        (void)lo;
-        if (!((now==generation && !(now & 1)) || region_unchanged(at,upto,generation & ~(uint64_t)1,now))) return 0;
+        uintptr_t lo, hi;
+        if (!on || !gap_fast(at,address+size,&lo,&hi)) return 0;
         end_seen=1;
     }
     if (n<size && !end_seen) return 0;
@@ -1403,6 +1420,12 @@ uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size) {
 int runtime_memory_region(uintptr_t address, uintptr_t *start, uintptr_t *end, int *mapped) {
     const CachedRegion *c=(runtime_disabled_optimizations & 1) ? NULL : cached_region_q(address,0);
     if (c) { *start=c->start; *end=c->end; *mapped=c->kind!=KIND_RESERVED; return 1; }
+    uintptr_t gap_lo, gap_hi;
+    if (gap_fast(address,0,&gap_lo,&gap_hi)) {
+        if (gap_hi==UINTPTR_MAX) return 0;
+        *start=gap_lo; *end=gap_hi; *mapped=0;
+        return 1;
+    }
     read_lock();
     size_t i=vma_index(address);
     int found=i<vma_count;
@@ -1481,23 +1504,48 @@ void runtime_memory_describe(uintptr_t address, char *out, size_t capacity) {
  * first, dirty()) may have saved and restored the old protection: it is then set again under the
  * lock, after that write. */
 #ifdef _WIN32
+/* sotc: SOTC_PROTECT_SPAN=0: only a range inside one region is protected without the lock. GPU
+ * ranges that cross into another mapping, a reserved range or a gap (which the locked path skips)
+ * took the lock and waited for map batches on the ride benchmark. Up to 8 pieces are resolved
+ * first (cached regions, gaps seen consistently: gap_fast), then protected; the final check
+ * covers the whole range as before. */
 static int protect_fast(uintptr_t address, uint64_t size, int read, int write) {
-    static int on=-1;
+    static int on=-1, span=-1;
     if (on<0) { const char *v=getenv("SOTC_PROTECT_FAST"); on=!(v && v[0]=='0') && region_log_on(); }
-    if (!on || exclusive_depth || (runtime_disabled_optimizations & 1) || !size) return 0;
+    if (span<0) { const char *v=getenv("SOTC_PROTECT_SPAN"); span=!(v && v[0]=='0'); }
+    if (!on || exclusive_depth || (runtime_disabled_optimizations & 1) || !size || size>UINTPTR_MAX-address) return 0;
     const uint64_t before=__atomic_load_n(&table_generation,__ATOMIC_SEQ_CST);
-    const CachedRegion *c=cached_region_q(address,address+size);
-    if (!c || c->kind==KIND_RESERVED || address+size>c->end) return 0;
-    const int guest=host_prot(c->prot);
-    const int want=(read ? PROT_READ : 0)|(write ? PROT_WRITE|PROT_READ : 0)|(guest & PROT_EXEC);
-    const DWORD protect=win_prot(guest & want);
-    const uint64_t chunk=view_chunk();
+    struct { uintptr_t a, b; DWORD protect; } piece[8];
+    int pieces=0;
     for (uintptr_t at=address, end=address+size; at<end;) {
-        uintptr_t next=chunk ? (at/chunk+1)*chunk : end;
-        if (next>end) next=end;
-        DWORD old;
-        if (!VirtualProtect((void *)at,next-at,protect,&old)) return 0;
+        const CachedRegion *c=cached_region_q(at,end);
+        uintptr_t next;
+        if (c) {
+            next=c->end<end ? c->end : end;
+            if (c->kind!=KIND_RESERVED) {
+                if (pieces==8) return 0;
+                const int guest=host_prot(c->prot);
+                const int want=(read ? PROT_READ : 0)|(write ? PROT_WRITE|PROT_READ : 0)|(guest & PROT_EXEC);
+                piece[pieces].a=at; piece[pieces].b=next; piece[pieces].protect=win_prot(guest & want);
+                ++pieces;
+            }
+        } else {
+            uintptr_t lo, hi;
+            if (!gap_fast(at,end,&lo,&hi)) return 0;
+            next=hi<end ? hi : end;
+        }
+        if (!span && next<end) return 0;
         at=next;
+    }
+    const uint64_t chunk=view_chunk();
+    for (int i=0;i<pieces;++i) {
+        for (uintptr_t at=piece[i].a, end=piece[i].b; at<end;) {
+            uintptr_t next=chunk ? (at/chunk+1)*chunk : end;
+            if (next>end) next=end;
+            DWORD old;
+            if (!VirtualProtect((void *)at,next-at,piece[i].protect,&old)) return 0;
+            at=next;
+        }
     }
     /* an odd generation is a write under way, which may have reached this range since */
     const uint64_t now=__atomic_load_n(&table_generation,__ATOMIC_SEQ_CST);

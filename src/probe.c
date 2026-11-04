@@ -1369,7 +1369,37 @@ static struct fault_entry *fault_ring_add(const EXCEPTION_POINTERS *info) {
 }
 /* Which handler path resolved the current exception (fault ring diagnostics). */
 static _Thread_local int fault_path;
+/* sotc: faults raised while this thread is already handling one (nested in the handler). A
+ * handler that keeps faulting recursed until its stack ran out, and the process died without a
+ * report (once, 4 Nov, ride benchmark: a call at the top of the GPU fault path on a spent stack).
+ * The chain is logged at 12 levels and reported as a crash (fatal_exception: log, minidump) at 24;
+ * legitimate nesting stays at 2 or 3. */
+static _Thread_local int fault_depth;
+static _Thread_local struct { uint64_t code, addr, rip; } fault_chain[12];
+static LONG vectored_fault_body(EXCEPTION_POINTERS *info);
+static LONG fatal_exception(EXCEPTION_POINTERS *info);
 static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
+    const EXCEPTION_RECORD *record=info->ExceptionRecord;
+    if (fault_depth<12) {
+        fault_chain[fault_depth].code=record->ExceptionCode;
+        fault_chain[fault_depth].addr=record->NumberParameters>=2 ? record->ExceptionInformation[1] : 0;
+        fault_chain[fault_depth].rip=info->ContextRecord->Rip;
+    }
+    if (fault_depth==12 || fault_depth==24) {
+        fprintf(stderr,"SOTC NESTED FAULTS: %d levels in the exception handler (thread %lu), first ones:\n",fault_depth,GetCurrentThreadId());
+        for (int i=0;i<12;++i)
+            fprintf(stderr,"  #%d code %#llx addr %#llx rip %#llx (image+%#llx)\n",i,(unsigned long long)fault_chain[i].code,
+                    (unsigned long long)fault_chain[i].addr,(unsigned long long)fault_chain[i].rip,
+                    (unsigned long long)(fault_chain[i].rip-(uintptr_t)GetModuleHandleA(NULL)));
+        fflush(stderr);
+        if (fault_depth==24) return fatal_exception(info);
+    }
+    ++fault_depth;
+    const LONG result=vectored_fault_body(info);
+    --fault_depth;
+    return result;
+}
+static LONG vectored_fault_body(EXCEPTION_POINTERS *info) {
     NT_TIB *tib=(NT_TIB *)NtCurrentTeb();
     const uintptr_t sp=(uintptr_t)__builtin_frame_address(0);
     struct fault_entry *entry=fault_ring ? fault_ring_add(info) : NULL;

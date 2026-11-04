@@ -296,7 +296,30 @@ static void read_lock_at(const char *site) { if (!exclusive_depth) { lock_site_n
 #define read_lock() read_lock_at(__func__)
 static void read_unlock(void) { if (!exclusive_depth) rw_rdunlock(); }
 static Block blocks[LIMIT];
-static Vma *vmas; static size_t vma_count, vma_capacity;
+/* sotc: the VMAs, sorted, in blocks of at most VMA_BLOCK entries (indices stay global: V(i)).
+ * Riding the world keeps ~11k VMAs, and one sorted array moved ~440 KB at every insert and erase:
+ * ~3 s per riding benchmark under the write lock, inside the vma_seq sections the GPU's lock-free
+ * lookups wait out. The block index has a fixed capacity and blocks are never freed, so a
+ * lock-free read that races a change reads stale but valid memory (vma_seq then rejects it). */
+#define VMA_BLOCK 512
+#define VMA_BLOCKS_MAX 8192
+typedef struct { Vma *e; size_t n, first; } VmaBlock; /* first: global index of e[0] */
+static VmaBlock vblocks[VMA_BLOCKS_MAX];
+static size_t vblock_count, vma_count;
+static Vma *vspare[16]; static size_t vspare_count;
+static __thread size_t vblock_hint;
+static size_t vblock_of(size_t i) { /* the block holding global index i (i < vma_count) */
+    const size_t h=vblock_hint;
+    if (h<vblock_count && i-vblocks[h].first<vblocks[h].n) return h;
+    size_t lo=0, hi=vblock_count;
+    while (hi-lo>1) { size_t mid=(lo+hi)/2; if (vblocks[mid].first<=i) lo=mid; else hi=mid; }
+    return vblock_hint=lo;
+}
+static Vma *vreg(size_t i) {
+    const size_t b=vblock_of(i);
+    return &vblocks[b].e[i-vblocks[b].first];
+}
+#define V(i) (*vreg(i))
 #ifndef _WIN32
 static int pool_fd=-1;
 #endif
@@ -716,9 +739,15 @@ static void flex_free(uint64_t phys, uint64_t size) {
     host_discard(phys,size);
 }
 static size_t vma_index(uintptr_t a) { /* first VMA with end > a */
-    size_t lo=0, hi=vma_count;
-    while (lo<hi) { size_t mid=(lo+hi)/2; if (vmas[mid].end<=a) lo=mid+1; else hi=mid; }
-    return lo;
+    if (!vma_count) return 0;
+    size_t lo=0, hi=vblock_count;
+    while (lo<hi) { size_t mid=(lo+hi)/2; if (vblocks[mid].e[vblocks[mid].n-1].end<=a) lo=mid+1; else hi=mid; }
+    if (lo==vblock_count) return vma_count;
+    const VmaBlock *b=&vblocks[lo];
+    size_t l=0, h=b->n;
+    while (l<h) { size_t mid=(l+h)/2; if (b->e[mid].end<=a) l=mid+1; else h=mid; }
+    vblock_hint=lo;
+    return b->first+l;
 }
 /* sotc: odd while the VMA array is being changed in place (insert, erase, field writes). The
  * GPU's lookups read the array without the lock and retry when it changed meanwhile
@@ -726,49 +755,90 @@ static size_t vma_index(uintptr_t a) { /* first VMA with end > a */
 static uint64_t vma_seq;
 static void vma_seq_begin(void) { __atomic_add_fetch(&vma_seq,1,__ATOMIC_SEQ_CST); }
 static void vma_seq_end(void) { __atomic_add_fetch(&vma_seq,1,__ATOMIC_RELEASE); }
+static Vma *vblock_alloc(void) {
+    if (vspare_count) return vspare[--vspare_count];
+    return malloc(VMA_BLOCK*sizeof(Vma));
+}
+static void vblock_renumber(size_t from) {
+    for (size_t b=from; b<vblock_count; ++b)
+        vblocks[b].first=b ? vblocks[b-1].first+vblocks[b-1].n : 0;
+}
 static int vma_insert(size_t at, Vma v) {
-    if (vma_count==vma_capacity) {
-        size_t capacity=vma_capacity ? vma_capacity*2 : 256;
-        Vma *next=malloc(capacity*sizeof(*vmas));
-        if (!next) return -1;
-        if (vma_count) memcpy(next,vmas,vma_count*sizeof(*vmas));
+    if (!vblock_count) {
+        Vma *e=vblock_alloc();
+        if (!e) return -1;
         vma_seq_begin();
-        __atomic_store_n(&vmas,next,__ATOMIC_RELEASE); /* the old array stays: see vma_seq */
-        vma_capacity=capacity;
+        vblocks[0]=(VmaBlock){e,0,0};
+        vblock_count=1;
         vma_seq_end();
+    }
+    size_t b=at==vma_count ? vblock_count-1 : vblock_of(at);
+    Vma *spare=NULL;
+    if (vblocks[b].n==VMA_BLOCK) { /* split it: the new block before any change */
+        if (vblock_count==VMA_BLOCKS_MAX || !(spare=vblock_alloc())) return -1;
     }
     dirty(v.start,v.end);
     vma_seq_begin();
-    memmove(vmas+at+1,vmas+at,(vma_count-at)*sizeof(*vmas));
-    vmas[at]=v; ++vma_count;
+    if (spare) {
+        const size_t half=VMA_BLOCK/2;
+        memcpy(spare,vblocks[b].e+half,(VMA_BLOCK-half)*sizeof(*spare));
+        memmove(vblocks+b+2,vblocks+b+1,(vblock_count-b-1)*sizeof(*vblocks));
+        vblocks[b+1]=(VmaBlock){spare,VMA_BLOCK-half,vblocks[b].first+half};
+        vblocks[b].n=half;
+        ++vblock_count;
+        if (at-vblocks[b].first>half) ++b; /* at == first+half: the end of block b */
+    }
+    VmaBlock *k=&vblocks[b];
+    const size_t j=at-k->first;
+    memmove(k->e+j+1,k->e+j,(k->n-j)*sizeof(*k->e));
+    k->e[j]=v; ++k->n; ++vma_count;
+    vblock_renumber(b+1);
     vma_seq_end();
+    vblock_hint=b;
     return 0;
 }
 static void vma_erase(size_t at, size_t n) {
-    if (n) dirty(vmas[at].start,vmas[at+n-1].end);
+    if (!n) return;
+    dirty(V(at).start,V(at+n-1).end);
     vma_seq_begin();
-    memmove(vmas+at,vmas+at+n,(vma_count-at-n)*sizeof(*vmas)); vma_count-=n;
+    while (n) {
+        const size_t b=vblock_of(at);
+        VmaBlock *k=&vblocks[b];
+        const size_t j=at-k->first;
+        const size_t take=k->n-j<n ? k->n-j : n;
+        memmove(k->e+j,k->e+j+take,(k->n-j-take)*sizeof(*k->e));
+        k->n-=take; vma_count-=take; n-=take;
+        if (!k->n && vblock_count>1) { /* drop the empty block; never freed (lock-free reads) */
+            Vma *e=k->e;
+            memmove(vblocks+b,vblocks+b+1,(vblock_count-b-1)*sizeof(*vblocks));
+            --vblock_count;
+            vblocks[vblock_count]=(VmaBlock){e,0,0}; /* a stale slot keeps a valid block */
+            if (vspare_count<16) vspare[vspare_count++]=e; /* else left to the stale slot */
+        }
+        vblock_renumber(b);
+        vblock_hint=0;
+    }
     vma_seq_end();
 }
 static int split_at(uintptr_t a) {
     size_t i=vma_index(a);
-    if (i==vma_count || vmas[i].start>=a) return 0;
-    Vma right=vmas[i];
+    if (i==vma_count || V(i).start>=a) return 0;
+    Vma right=V(i);
     right.start=a;
     /* sotc: flexible pages have a backing offset too. Kept unchanged, the right half of a
      * split flexible mapping pointed at the left half's storage: the runtime's copies went to
      * the wrong pages and its release freed the left half's pages, still in use, which the
      * next flexible map handed out again (T38: mosaic textures, heap crashes). */
     if (right.kind!=KIND_RESERVED) {
-        right.phys+=a-vmas[i].start;
+        right.phys+=a-V(i).start;
         static unsigned long flex_splits;
         if (right.kind==KIND_FLEXIBLE && flex_splits++ < 8)
             fprintf(stderr,"Runtime: flexible mapping %p-%p split at %p\n",
-                    (void *)vmas[i].start,(void *)vmas[i].end,(void *)a);
+                    (void *)V(i).start,(void *)V(i).end,(void *)a);
     }
-    dirty(vmas[i].start,vmas[i].end);
+    dirty(V(i).start,V(i).end);
     vma_seq_begin();
-    vmas[i].end=a;
+    V(i).end=a;
     vma_seq_end();
     return vma_insert(i+1,right);
 }
@@ -780,22 +850,22 @@ static size_t carve(uintptr_t start, uintptr_t end, int *error) {
 static int covered(uintptr_t start, uintptr_t end, int allow_reserved) {
     size_t i=vma_index(start); uintptr_t at=start;
     for (; at<end; ++i) {
-        if (i==vma_count || vmas[i].start>at || (!allow_reserved && vmas[i].kind==KIND_RESERVED)) return 0;
-        at=vmas[i].end;
+        if (i==vma_count || V(i).start>at || (!allow_reserved && V(i).kind==KIND_RESERVED)) return 0;
+        at=V(i).end;
     }
     return 1;
 }
 static int overlaps(uintptr_t start, uintptr_t end, int ignore_reserved) {
-    for (size_t i=vma_index(start); i<vma_count && vmas[i].start<end; ++i)
-        if (!ignore_reserved || vmas[i].kind!=KIND_RESERVED) return 1;
+    for (size_t i=vma_index(start); i<vma_count && V(i).start<end; ++i)
+        if (!ignore_reserved || V(i).kind!=KIND_RESERVED) return 1;
     return 0;
 }
 /* First-fit search in the PS4 user range, starting from the hint. */
 static uintptr_t find_free(uintptr_t hint, uint64_t size, uint64_t alignment) {
     uintptr_t at=align_up(hint<USER_MIN ? USER_MIN : hint, alignment);
     for (size_t i=vma_index(at); at+size<=USER_MAX; ++i) {
-        if (i==vma_count || vmas[i].start>=at+size) return at;
-        at=align_up(vmas[i].end,alignment);
+        if (i==vma_count || V(i).start>=at+size) return at;
+        at=align_up(V(i).end,alignment);
     }
     return 0;
 }
@@ -845,8 +915,8 @@ static void views_remove(uint64_t phys, uintptr_t address, uint64_t size) {
          * tracker there would lift (writes then faulted forever): the guest's protection again,
          * and the GPU rereads the page. */
         const size_t j=vma_index(left);
-        if (j<vma_count && vmas[j].start<=left && vmas[j].kind==KIND_DIRECT) {
-            host_protect(left,PAGE,host_prot(vmas[j].prot));
+        if (j<vma_count && V(j).start<=left && V(j).kind==KIND_DIRECT) {
+            host_protect(left,PAGE,host_prot(V(j).prot));
             queue_hook(HOOK_INVALIDATE,left,PAGE);
         }
     }
@@ -854,13 +924,13 @@ static void views_remove(uint64_t phys, uintptr_t address, uint64_t size) {
 /* The other guest address of the direct page at [address], or 0. Under the lock. */
 static uintptr_t view_other(uintptr_t address, size_t *vma) {
     size_t i=vma_index(address);
-    if (i==vma_count || vmas[i].start>address || vmas[i].kind!=KIND_DIRECT) return 0;
+    if (i==vma_count || V(i).start>address || V(i).kind!=KIND_DIRECT) return 0;
     if (vma) *vma=i;
-    const uint64_t off=(address-vmas[i].start) & ~(PAGE-1), phys=vmas[i].phys+off, page=phys/PAGE;
+    const uint64_t off=(address-V(i).start) & ~(PAGE-1), phys=V(i).phys+off, page=phys/PAGE;
     if (page>=phys_view_pages) return 0;
-    const uintptr_t at=vmas[i].start+off, *v=phys_views[page];
+    const uintptr_t at=V(i).start+off, *v=phys_views[page];
     const uintptr_t other=v[0]==at ? v[1] : v[1]==at ? v[0] : 0;
-    return other ? other+((address-vmas[i].start)-off) : 0;
+    return other ? other+((address-V(i).start)-off) : 0;
 }
 /* Gives the other addresses of [address,address+size) the GPU's protection (read/write wanted). */
 static void views_protect(uintptr_t address, uint64_t size, int read, int write) {
@@ -869,8 +939,8 @@ static void views_protect(uintptr_t address, uint64_t size, int read, int write)
         const uintptr_t other=view_other(at,NULL);
         size_t j=other ? vma_index(other) : vma_count;
         int prot=0;
-        if (j<vma_count && vmas[j].start<=other) {
-            const int guest=host_prot(vmas[j].prot);
+        if (j<vma_count && V(j).start<=other) {
+            const int guest=host_prot(V(j).prot);
             /* writes only: a read of the other address is never stopped (GPU threads read guest
              * memory by address, and a read fault there waited for the GPU itself) */
             const int want=PROT_READ|(write ? PROT_WRITE : 0)|(guest & PROT_EXEC);
@@ -912,12 +982,12 @@ static void owner_note(uint64_t phys, uintptr_t address, uint64_t size) {
 }
 static void drop_range(uintptr_t start, uintptr_t end) {
     int error; size_t i=carve(start,end,&error), n=0;
-    while (i+n<vma_count && vmas[i+n].end<=end && vmas[i+n].start>=start) {
-        if (vmas[i+n].kind==KIND_FLEXIBLE) {
-            flexible_bytes-=vmas[i+n].end-vmas[i+n].start;
-            flex_free(vmas[i+n].phys,vmas[i+n].end-vmas[i+n].start);
+    while (i+n<vma_count && V(i+n).end<=end && V(i+n).start>=start) {
+        if (V(i+n).kind==KIND_FLEXIBLE) {
+            flexible_bytes-=V(i+n).end-V(i+n).start;
+            flex_free(V(i+n).phys,V(i+n).end-V(i+n).start);
         }
-        if (vmas[i+n].kind==KIND_DIRECT) views_remove(vmas[i+n].phys,vmas[i+n].start,vmas[i+n].end-vmas[i+n].start);
+        if (V(i+n).kind==KIND_DIRECT) views_remove(V(i+n).phys,V(i+n).start,V(i+n).end-V(i+n).start);
         ++n;
     }
     vma_erase(i,n);
@@ -1040,17 +1110,17 @@ static void views_check(void) {
         if (!R(r).mapped) continue;
         for (uintptr_t at=R(r).start; at<R(r).end;) {
             const size_t i=vma_index(at);
-            if (i==vma_count || vmas[i].start>at) { /* a view where the table has nothing */
+            if (i==vma_count || V(i).start>at) { /* a view where the table has nothing */
                 if (bad++<8 && bad_total<200) fprintf(stderr,"Runtime: VIEW CHECK view %p-%p (offset %#" PRIx64 ") over no mapping at %p\n",
                     (void *)R(r).start,(void *)R(r).end,R(r).phys,(void *)at);
                 break;
             }
-            const uintptr_t stop=vmas[i].end<R(r).end ? vmas[i].end : R(r).end;
+            const uintptr_t stop=V(i).end<R(r).end ? V(i).end : R(r).end;
             const uint64_t view_phys=R(r).phys+(at-R(r).start);
-            const uint64_t table_phys=vmas[i].phys+(at-vmas[i].start);
-            if (vmas[i].kind!=KIND_RESERVED && view_phys!=table_phys && bad++<8 && bad_total<200)
+            const uint64_t table_phys=V(i).phys+(at-V(i).start);
+            if (V(i).kind!=KIND_RESERVED && view_phys!=table_phys && bad++<8 && bad_total<200)
                 fprintf(stderr,"Runtime: VIEW CHECK %p-%p: view offset %#" PRIx64 ", table %#" PRIx64 " (kind %d, mapping %p-%p)\n",
-                        (void *)at,(void *)stop,view_phys,table_phys,vmas[i].kind,(void *)vmas[i].start,(void *)vmas[i].end);
+                        (void *)at,(void *)stop,view_phys,table_phys,V(i).kind,(void *)V(i).start,(void *)V(i).end);
             at=stop;
         }
     }
@@ -1083,10 +1153,10 @@ static int32_t map_direct_locked(void **out, uint64_t size, int prot, int flags,
             size_t live=0; uint64_t live_bytes=0, oldest=0;
             for (size_t k=0;k<npairs;) {
                 size_t ia=vma_index(pairs[k].a), ib=vma_index(pairs[k].b);
-                const int both=ia<vma_count && ib<vma_count && vmas[ia].kind==KIND_DIRECT && vmas[ib].kind==KIND_DIRECT &&
-                    vmas[ia].start<=pairs[k].a && vmas[ib].start<=pairs[k].b &&
-                    vmas[ia].phys+(pairs[k].a-vmas[ia].start)==pairs[k].phys &&
-                    vmas[ib].phys+(pairs[k].b-vmas[ib].start)==pairs[k].phys;
+                const int both=ia<vma_count && ib<vma_count && V(ia).kind==KIND_DIRECT && V(ib).kind==KIND_DIRECT &&
+                    V(ia).start<=pairs[k].a && V(ib).start<=pairs[k].b &&
+                    V(ia).phys+(pairs[k].a-V(ia).start)==pairs[k].phys &&
+                    V(ib).phys+(pairs[k].b-V(ib).start)==pairs[k].phys;
                 const uint64_t age=now-pairs[k].since;
                 if (!both) {
                     if (age>worst_ms) worst_ms=age;
@@ -1099,7 +1169,7 @@ static int32_t map_direct_locked(void **out, uint64_t size, int prot, int flags,
                         live,live_bytes>>10,oldest,worst_ms,aliases,alias_pages,alias_faults);
         }
         for (size_t i=0;i<vma_count;++i) {
-            const Vma *v=&vmas[i];
+            const Vma *v=&V(i);
             if (v->kind!=KIND_DIRECT || (v->start<at+size && at<v->end)) continue;
             if (v->phys<p+size && p<v->phys+(v->end-v->start)) {
                 ++aliases;
@@ -1139,13 +1209,13 @@ static ABI int32_t direct_map_named(void **out, uint64_t size, int prot, int fla
 static int32_t unmap_locked(uintptr_t start, uint64_t size) {
     if (start%PAGE || !size) return INVALID;
     uint64_t end=start+align_up(size,PAGE);
-    for (size_t i=vma_index(start); i<vma_count && vmas[i].start<end; ++i)
-        if (vmas[i].kind!=KIND_RESERVED) {
-            uintptr_t a=vmas[i].start>start ? vmas[i].start : start, b=vmas[i].end<end ? vmas[i].end : end;
+    for (size_t i=vma_index(start); i<vma_count && V(i).start<end; ++i)
+        if (V(i).kind!=KIND_RESERVED) {
+            uintptr_t a=V(i).start>start ? V(i).start : start, b=V(i).end<end ? V(i).end : end;
             queue_hook(HOOK_UNMAP,a,b-a);
         }
-    for (size_t i=vma_index(start); i<vma_count && vmas[i].start<end; ++i) {
-        uintptr_t a=vmas[i].start>start ? vmas[i].start : start, b=vmas[i].end<end ? vmas[i].end : end;
+    for (size_t i=vma_index(start); i<vma_count && V(i).start<end; ++i) {
+        uintptr_t a=V(i).start>start ? V(i).start : start, b=V(i).end<end ? V(i).end : end;
         if (host_unmap(a,b-a)) return INVALID;
     }
     drop_range(start,end);
@@ -1172,7 +1242,7 @@ static ABI int32_t direct_release(uint64_t start, uint64_t size) {
     if (!direct_range_allocated(start,size)) { write_unlock(); return INVALID; }
     /* Mappings of released physical pages disappear with them. */
     for (size_t i=0; i<vma_count;) {
-        Vma v=vmas[i];
+        Vma v=V(i);
         uint64_t length=v.end-v.start;
         if (v.kind==KIND_DIRECT && v.phys<start+size && start<v.phys+length) {
             uint64_t a=v.phys>start ? v.phys : start, b=v.phys+length<start+size ? v.phys+length : start+size;
@@ -1249,7 +1319,7 @@ static int32_t protect_locked(uintptr_t start, uint64_t size, int prot, int type
     int error; size_t i=carve(start,end,&error);
     if (error) return NO_MEMORY;
     vma_seq_begin();
-    for (; i<vma_count && vmas[i].start<end; ++i) { vmas[i].prot=prot; if (type>=0) vmas[i].type=type; }
+    for (; i<vma_count && V(i).start<end; ++i) { V(i).prot=prot; if (type>=0) V(i).type=type; }
     vma_seq_end();
     queue_hook(HOOK_INVALIDATE,start,end-start);
     ++protects;
@@ -1265,16 +1335,16 @@ static ABI int32_t kernel_mprotect(const void *address, uint64_t size, int prot)
 static ABI int32_t query_protection(void *address, void **start, void **end, uint32_t *prot) {
     read_lock();
     size_t i=vma_index((uintptr_t)address);
-    if (i==vma_count || vmas[i].start>(uintptr_t)address || vmas[i].kind==KIND_RESERVED) {
+    if (i==vma_count || V(i).start>(uintptr_t)address || V(i).kind==KIND_RESERVED) {
         read_unlock(); return ACCESS;
     }
     /* Report the whole contiguous run with identical protection. */
     size_t first=i, last=i;
-    while (first && vmas[first-1].end==vmas[first].start && vmas[first-1].kind!=KIND_RESERVED && vmas[first-1].prot==vmas[i].prot) --first;
-    while (last+1<vma_count && vmas[last+1].start==vmas[last].end && vmas[last+1].kind!=KIND_RESERVED && vmas[last+1].prot==vmas[i].prot) ++last;
-    if (start) *start=(void *)vmas[first].start;
-    if (end) *end=(void *)vmas[last].end;
-    if (prot) *prot=(uint32_t)vmas[i].prot;
+    while (first && V(first-1).end==V(first).start && V(first-1).kind!=KIND_RESERVED && V(first-1).prot==V(i).prot) --first;
+    while (last+1<vma_count && V(last+1).start==V(last).end && V(last+1).kind!=KIND_RESERVED && V(last+1).prot==V(i).prot) ++last;
+    if (start) *start=(void *)V(first).start;
+    if (end) *end=(void *)V(last).end;
+    if (prot) *prot=(uint32_t)V(i).prot;
     __atomic_add_fetch(&queries,1,__ATOMIC_RELAXED);
     read_unlock();
     return 0;
@@ -1283,8 +1353,8 @@ static ABI int32_t virtual_query(const void *address, int flags, VirtualQueryInf
     if (!info || info_size!=sizeof(*info)) return INVALID;
     read_lock();
     size_t i=vma_index((uintptr_t)address);
-    if (i==vma_count || (vmas[i].start>(uintptr_t)address && !(flags & 1))) { read_unlock(); return ACCESS; }
-    Vma v=vmas[i];
+    if (i==vma_count || (V(i).start>(uintptr_t)address && !(flags & 1))) { read_unlock(); return ACCESS; }
+    Vma v=V(i);
     memset(info,0,sizeof(*info));
     info->start=v.start; info->end=v.end;
     info->offset=v.kind==KIND_DIRECT ? v.phys : 0;
@@ -1492,7 +1562,7 @@ void runtime_memory_set_gpu_hooks(GpuRange map, GpuRange unmap, GpuRange invalid
     if (toggles && !watcher) pthread_create(&watcher,NULL,toggle_watcher,(void *)toggles);
     write_lock();
     hook_map=map; hook_unmap=unmap; hook_invalidate=invalidate;
-    for (size_t i=0;i<vma_count;++i) if (vmas[i].kind!=KIND_RESERVED) queue_hook(HOOK_MAP,vmas[i].start,vmas[i].end-vmas[i].start);
+    for (size_t i=0;i<vma_count;++i) if (V(i).kind!=KIND_RESERVED) queue_hook(HOOK_MAP,V(i).start,V(i).end-V(i).start);
     write_unlock();
     flush_hooks();
 }
@@ -1560,27 +1630,51 @@ static int vma_lookup_gap(uintptr_t address, Vma *out, uintptr_t *gap_lo, uintpt
     for (int tries=0; tries<max_tries; seq_pause(++tries)) {
         const uint64_t s=__atomic_load_n(&vma_seq,__ATOMIC_ACQUIRE);
         if (s & 1) continue;
-        const Vma *v=__atomic_load_n(&vmas,__ATOMIC_ACQUIRE);
-        const size_t n=__atomic_load_n(&vma_count,__ATOMIC_RELAXED);
-        size_t lo=0, hi=n;
+        const size_t nb=__atomic_load_n(&vblock_count,__ATOMIC_RELAXED);
+        if (nb>VMA_BLOCKS_MAX) continue;
+        /* the first block whose last VMA ends above address */
+        size_t lo=0, hi=nb; int torn=0;
         while (lo<hi) {
             size_t mid=(lo+hi)/2;
-            if (__atomic_load_n(&v[mid].end,__ATOMIC_RELAXED)<=address) lo=mid+1; else hi=mid;
+            const Vma *e=__atomic_load_n(&vblocks[mid].e,__ATOMIC_RELAXED);
+            const size_t k=__atomic_load_n(&vblocks[mid].n,__ATOMIC_RELAXED);
+            if (!e || !k || k>VMA_BLOCK) { torn=1; break; }
+            if (__atomic_load_n(&e[k-1].end,__ATOMIC_RELAXED)<=address) lo=mid+1; else hi=mid;
         }
+        if (torn) continue;
         Vma e={0};
-        const uintptr_t before=lo ? __atomic_load_n(&v[lo-1].end,__ATOMIC_RELAXED) : 0;
-        if (lo<n) {
-            e.start=__atomic_load_n(&v[lo].start,__ATOMIC_RELAXED);
-            e.end=__atomic_load_n(&v[lo].end,__ATOMIC_RELAXED);
-            e.kind=__atomic_load_n(&v[lo].kind,__ATOMIC_RELAXED);
-            e.prot=__atomic_load_n(&v[lo].prot,__ATOMIC_RELAXED);
-            e.phys=__atomic_load_n(&v[lo].phys,__ATOMIC_RELAXED);
+        uintptr_t before=0;
+        int found=0;
+        if (lo>0) {
+            const Vma *pe=__atomic_load_n(&vblocks[lo-1].e,__ATOMIC_RELAXED);
+            const size_t pk=__atomic_load_n(&vblocks[lo-1].n,__ATOMIC_RELAXED);
+            if (!pe || !pk || pk>VMA_BLOCK) continue;
+            before=__atomic_load_n(&pe[pk-1].end,__ATOMIC_RELAXED);
+        }
+        if (lo<nb) {
+            const Vma *be=__atomic_load_n(&vblocks[lo].e,__ATOMIC_RELAXED);
+            const size_t bk=__atomic_load_n(&vblocks[lo].n,__ATOMIC_RELAXED);
+            if (!be || !bk || bk>VMA_BLOCK) continue;
+            size_t l=0, h=bk;
+            while (l<h) {
+                size_t mid=(l+h)/2;
+                if (__atomic_load_n(&be[mid].end,__ATOMIC_RELAXED)<=address) l=mid+1; else h=mid;
+            }
+            if (l<bk) {
+                if (l) before=__atomic_load_n(&be[l-1].end,__ATOMIC_RELAXED);
+                e.start=__atomic_load_n(&be[l].start,__ATOMIC_RELAXED);
+                e.end=__atomic_load_n(&be[l].end,__ATOMIC_RELAXED);
+                e.kind=__atomic_load_n(&be[l].kind,__ATOMIC_RELAXED);
+                e.prot=__atomic_load_n(&be[l].prot,__ATOMIC_RELAXED);
+                e.phys=__atomic_load_n(&be[l].phys,__ATOMIC_RELAXED);
+                found=1;
+            }
         }
         __atomic_thread_fence(__ATOMIC_ACQUIRE);
         if (__atomic_load_n(&vma_seq,__ATOMIC_RELAXED)!=s) continue;
-        if (lo==n || e.start>address) {
+        if (!found || e.start>address) {
             if (!gap_lo) return 0;
-            *gap_lo=before; *gap_hi=lo==n ? UINTPTR_MAX : e.start;
+            *gap_lo=before; *gap_hi=!found ? UINTPTR_MAX : e.start;
             return 2;
         }
         *out=e;
@@ -1660,9 +1754,9 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
     int ok=1;
     for (uintptr_t at=address, end=address+size; at<end && ok;) {
         size_t i=vma_index(at);
-        if (i==vma_count || vmas[i].start>at || vmas[i].kind==KIND_RESERVED) { ok=0; break; }
-        uint64_t n=(vmas[i].end<end ? vmas[i].end : end)-at;
-        memcpy(backing_base+vmas[i].phys+(at-vmas[i].start),(const unsigned char *)data+(at-address),n);
+        if (i==vma_count || V(i).start>at || V(i).kind==KIND_RESERVED) { ok=0; break; }
+        uint64_t n=(V(i).end<end ? V(i).end : end)-at;
+        memcpy(backing_base+V(i).phys+(at-V(i).start),(const unsigned char *)data+(at-address),n);
         at+=n;
     }
     read_unlock();
@@ -1672,8 +1766,8 @@ int runtime_memory_write_backing(uintptr_t address, const void *data, uint64_t s
 static void cache_region(size_t i, uintptr_t address) {
     uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
     if (i==vma_count || (generation & 1)) return;
-    const unsigned char *backing=vmas[i].kind!=KIND_RESERVED && backing_base ? backing_base+vmas[i].phys : NULL;
-    const CachedRegion entry={generation,vmas[i].start,vmas[i].end,vmas[i].kind,vmas[i].prot,backing};
+    const unsigned char *backing=V(i).kind!=KIND_RESERVED && backing_base ? backing_base+V(i).phys : NULL;
+    const CachedRegion entry={generation,V(i).start,V(i).end,V(i).kind,V(i).prot,backing};
     region_cache[region_cache_next++ % 8]=entry;
     if (region_direct_on>0) region_direct[region_direct_slot(address)]=entry;
 }
@@ -1695,8 +1789,8 @@ int runtime_memory_alias_release(uintptr_t address) {
     int writable=0;
     read_lock();
     const size_t i=vma_index(address);
-    if (i<vma_count && vmas[i].start<=address && vmas[i].kind!=KIND_RESERVED) {
-        const int guest=host_prot(vmas[i].prot);
+    if (i<vma_count && V(i).start<=address && V(i).kind!=KIND_RESERVED) {
+        const int guest=host_prot(V(i).prot);
         writable=(guest & PROT_WRITE)!=0;
         if (writable) host_protect(address & ~(uintptr_t)4095,4096,guest);
     }
@@ -1742,9 +1836,9 @@ const unsigned char *runtime_memory_backing_pointer(uintptr_t address) {
     read_lock();
     size_t i=vma_index(address);
     const unsigned char *p=NULL;
-    if (i<vma_count && vmas[i].start<=address) {
+    if (i<vma_count && V(i).start<=address) {
         cache_region(i,address);
-        if (vmas[i].kind!=KIND_RESERVED && backing_base) p=backing_base+vmas[i].phys+(address-vmas[i].start);
+        if (V(i).kind!=KIND_RESERVED && backing_base) p=backing_base+V(i).phys+(address-V(i).start);
     }
     read_unlock();
     return p;
@@ -1792,9 +1886,9 @@ uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size) {
     read_lock();
     uint64_t length=0;
     for (size_t i=vma_index(address); i<vma_count && length<size; ++i) {
-        if (vmas[i].start>address+length || vmas[i].kind==KIND_RESERVED) break;
-        cache_region(i,vmas[i].start>address ? vmas[i].start : address);
-        length=vmas[i].end-address;
+        if (V(i).start>address+length || V(i).kind==KIND_RESERVED) break;
+        cache_region(i,V(i).start>address ? V(i).start : address);
+        length=V(i).end-address;
     }
     read_unlock();
     return length<size ? length : size;
@@ -1812,11 +1906,11 @@ int runtime_memory_region(uintptr_t address, uintptr_t *start, uintptr_t *end, i
     read_lock();
     size_t i=vma_index(address);
     int found=i<vma_count;
-    if (found && vmas[i].start<=address) {
+    if (found && V(i).start<=address) {
         cache_region(i,address);
-        *start=vmas[i].start; *end=vmas[i].end; *mapped=vmas[i].kind!=KIND_RESERVED;
+        *start=V(i).start; *end=V(i).end; *mapped=V(i).kind!=KIND_RESERVED;
     } else if (found) {
-        *start=i ? vmas[i-1].end : 0; *end=vmas[i].start; *mapped=0;
+        *start=i ? V(i-1).end : 0; *end=V(i).start; *mapped=0;
     }
     read_unlock();
     return found;
@@ -1847,13 +1941,13 @@ int runtime_memory_copy_out(uintptr_t source, unsigned char *dest, uint64_t size
     while (at<end) {
         const size_t i=vma_index(at);
         uintptr_t stop;
-        if (i<vma_count && vmas[i].start<=at) {
-            stop=vmas[i].end<end ? vmas[i].end : end;
+        if (i<vma_count && V(i).start<=at) {
+            stop=V(i).end<end ? V(i).end : end;
             cache_region(i,at);
-            if (vmas[i].kind==KIND_RESERVED) memset(dest+(at-source),0,stop-at);
-            else memcpy(dest+(at-source),backing_base+vmas[i].phys+(at-vmas[i].start),stop-at);
+            if (V(i).kind==KIND_RESERVED) memset(dest+(at-source),0,stop-at);
+            else memcpy(dest+(at-source),backing_base+V(i).phys+(at-V(i).start),stop-at);
         } else {
-            stop=i<vma_count && vmas[i].start<end ? vmas[i].start : end;
+            stop=i<vma_count && V(i).start<end ? V(i).start : end;
             memset(dest+(at-source),0,stop-at);
         }
         at=stop;
@@ -1869,7 +1963,7 @@ void runtime_memory_describe(uintptr_t address, char *out, size_t capacity) {
     const size_t i=vma_index(address);
     int kind=0, prot=-1;
     uintptr_t start=0, end=0;
-    if (i<vma_count && vmas[i].start<=address) { kind=vmas[i].kind; prot=vmas[i].prot; start=vmas[i].start; end=vmas[i].end; }
+    if (i<vma_count && V(i).start<=address) { kind=V(i).kind; prot=V(i).prot; start=V(i).start; end=V(i).end; }
     read_unlock();
     unsigned long host=0;
 #ifdef _WIN32
@@ -1947,11 +2041,11 @@ void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int 
     }
     read_lock();
     if (__atomic_load_n(&alias_pages,__ATOMIC_RELAXED)) views_protect(address,size,read,write);
-    for (size_t i=vma_index(address); i<vma_count && vmas[i].start<address+size; ++i) {
-        if (vmas[i].kind==KIND_RESERVED) continue;
-        uintptr_t a=vmas[i].start>address ? vmas[i].start : address;
-        uintptr_t b=vmas[i].end<address+size ? vmas[i].end : address+size;
-        int guest=host_prot(vmas[i].prot);
+    for (size_t i=vma_index(address); i<vma_count && V(i).start<address+size; ++i) {
+        if (V(i).kind==KIND_RESERVED) continue;
+        uintptr_t a=V(i).start>address ? V(i).start : address;
+        uintptr_t b=V(i).end<address+size ? V(i).end : address+size;
+        int guest=host_prot(V(i).prot);
         int want=(read ? PROT_READ : 0)|(write ? PROT_WRITE|PROT_READ : 0)|(guest & PROT_EXEC);
         host_protect(a,b-a,guest & want);
     }
@@ -1967,7 +2061,7 @@ int runtime_memory_is_mapped(uintptr_t address, uint64_t size) {
         uintptr_t at=address;
         for (size_t i=vma_index(address); i<vma_count && at<address+size; ++i) {
             cache_region(i,at);
-            at=vmas[i].end;
+            at=V(i).end;
         }
     }
     read_unlock();

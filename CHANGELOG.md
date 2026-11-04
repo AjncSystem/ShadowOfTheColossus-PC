@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.72.1 — 2026-11-03
+- **Placas com menos de 8 GB de memória de vídeo: perfil leve automático.** As melhorias de textura da 0.72
+  (Máxima no mip 0 com os bancos mantidos 3 s e sem a proteção de emergência do pool, Alta no mip 1) usavam
+  5–7 GB numa placa de 8 GB e estouravam as de 6 GB. Agora, com menos de 8 GB, a Máxima fica no mip 1 (sem os
+  3 s, com a proteção), a Alta volta ao mip 2 (como na 0.71), "Uso de memória de vídeo" Alto/Máximo (o do modo
+  Extremo) vira Padrão e não há reserva da área temporária na memória de vídeo. Placas de 8 GB ou mais
+  continuam com tudo.
+- **Lançador: "Memória da placa" nos Ajustes rápidos** (aba Jogar): Automático (pela placa, padrão), Leve ou
+  Completo, com uma linha dizendo o que vale para a placa encontrada. O registro da sessão mostra o perfil.
+
 ## 0.72 — 2026-11-03
 - **Melhorias que a correção do T38 liberou, agora ligadas por padrão** (testadas em todos os colossos do
   Time Attack, na Máxima com o modo PS4 Pro, sem queda e sem mosaico). Elas ficavam desligadas porque

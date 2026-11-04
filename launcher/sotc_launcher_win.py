@@ -16,6 +16,7 @@ import os
 import platform
 from pathlib import Path
 import queue
+import re
 import runpy
 import shutil
 import subprocess
@@ -47,7 +48,7 @@ CONFIG_FILE = CONFIG_DIR / 'launcher_settings.json'
 from sotc_modes import GAMES  # noqa: E402
 GAME_ID = 'CUSA08809'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.72'
+VERSION = '0.72.1'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -174,7 +175,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'fx_motionblur': False, 'engine_cvars': '', 'perf_culling': True,
-                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'volume': '100', 'shadow_reuse': '0', 'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1', 'weed_distance': '1', 'weed_height': '1', 'grass_fade': '1', 'grass_detail': '1', 'library_dirs': [], 'keys': {},
+                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'vram_profile': 'auto', 'gpu_vram_mb': 0, 'volume': '100', 'shadow_reuse': '0', 'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1', 'weed_distance': '1', 'weed_height': '1', 'grass_fade': '1', 'grass_detail': '1', 'library_dirs': [], 'keys': {},
                 'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'fg_hudless': True,
                 'dlss_mode': 'quality', 'dlss_sharpen': '0', 'dlss_ui_sharpen': '3', 'dlss_sky_sharpen': '2',
                 'dlss_compare': False, 'hdr': False,
@@ -223,6 +224,24 @@ VRAM_USE = [('low', ('Econômico (placas de 4–6 GB)', 'Economy (4–6 GB cards
             ('normal', ('Padrão', 'Default')),
             ('high', ('Alto (placas de 8–12 GB)', 'High (8–12 GB cards)')),
             ('max', ('Máximo (placas de 16 GB ou mais)', 'Maximum (16 GB cards or more)'))]
+# Video memory profile (game_environment): the 0.72 texture improvements (Maximum at mip 0 with
+# banks kept 3 s and no page pool switch, High at mip 1) used 5-7 GB on an 8 GB card; cards with
+# less than 8 GB get the lighter set. Auto decides from the card the launcher found (gpu_vram_mb).
+VRAM_PROFILES = [('auto', ('Automático (pela placa)', 'Automatic (by the card)')),
+                 ('light', ('Leve (placas de até 6 GB)', 'Light (cards up to 6 GB)')),
+                 ('full', ('Completo (placas de 8 GB ou mais)', 'Full (8 GB cards or more)'))]
+LIGHT_VRAM_BELOW_MB = 7500
+
+
+def light_vram(s):
+    """The lighter texture set: chosen, or Auto on a card with less than 8 GB."""
+    profile = s.get('vram_profile') or 'auto'
+    if profile != 'auto':
+        return profile == 'light'
+    mb = int(s.get('gpu_vram_mb') or 0)
+    return 0 < mb < LIGHT_VRAM_BELOW_MB
+
+
 # Far sun shadows drawn on alternate frames (SOTC_SHADOW_REUSE): more FPS, but they may blink (#178).
 SHADOW_REUSE = [('0', ('Desligado (sombras sem piscar)', 'Off (no blinking shadows)')),
                 ('1', ('Ligado (mais FPS; sombras distantes podem piscar)', 'On (more FPS; far shadows may blink)')),
@@ -545,9 +564,11 @@ def start_event_log(log_dir, settings, env):
         _('Windows {} | jogo: {}', 'Windows {} | game: {}').format(platform.version(), settings.get('game_dir') or '?'),
         _('Saída: {} | Upscaler: {} | Nitidez: {}', 'Output: {} | Upscaler: {} | Sharpening: {}').format(
             words(OUTPUTS, 'output_res', '1920x1080'), words(UPSCALERS, 'upscaler', 'fsr1'), words(SHARPNESS, 'sharpness', '250')),
-        _('FPS: {} | Texturas: {} | Filtro 16x: {} | Modo PS4 Pro: {}', 'FPS: {} | Textures: {} | 16x filtering: {} | PS4 Pro mode: {}').format(
+        _('FPS: {} | Texturas: {} | Filtro 16x: {} | Modo PS4 Pro: {} | Memória da placa: {} ({})',
+          'FPS: {} | Textures: {} | 16x filtering: {} | PS4 Pro mode: {} | Card memory: {} ({})').format(
             words(FPS_MODES, 'fps_mode', '30'), words(TEXTURES, 'textures', 'high'), on_off(settings.get('af16')),
-            on_off(env.get('SOTC_NEO') == '1')),
+            on_off(env.get('SOTC_NEO') == '1'), words(VRAM_PROFILES, 'vram_profile', 'auto'),
+            _('leve', 'light') if light_vram(settings) else _('completo', 'full')),
         _('Geração de quadros: {} | Memória de vídeo: {} | Sombras distantes: {} | Volume: {}%',
           'Frame generation: {} | Video memory use: {} | Far shadows: {} | Volume: {}%').format(
             words(FRAMEGEN, 'framegen', 'off'), words(VRAM_USE, 'vram_use', 'normal'),
@@ -795,7 +816,13 @@ def game_environment(s):
         env['SOTC_FLUSH_US'], env['SOTC_RB_AHEAD'] = '1000', '1'
     elif s.get('gpu_submit') == 'off':
         env['SOTC_FLUSH_EVERY'], env['SOTC_RB_AHEAD'] = '0', '0'
-    env['SOTC_VRAM_GC_PERCENT'], env['SOTC_ARENA_EVICT_MB'] = VRAM_LIMITS.get(s.get('vram_use'), VRAM_LIMITS['normal'])
+    light = light_vram(s)
+    vram_use = s.get('vram_use')
+    if light and vram_use in ('high', 'max'):
+        vram_use = 'normal'  # sotc: "High"/"Maximum" (Extreme mode) hold more than such a card has
+    env['SOTC_VRAM_GC_PERCENT'], env['SOTC_ARENA_EVICT_MB'] = VRAM_LIMITS.get(vram_use, VRAM_LIMITS['normal'])
+    if light:
+        env.setdefault('SOTC_STAGING_KEEP_VRAM_MB', '0')
     env['SOTC_VOLUME'] = str(s.get('volume') or '100')
     # The in-game menu's quick settings are written back here (bbport_overlay.cpp).
     env['SOTC_LAUNCHER_SETTINGS'] = str(CONFIG_FILE)
@@ -819,8 +846,13 @@ def game_environment(s):
         # the measured mips, finer mips (High 1, Maximum 0, both were 2) and, on Maximum, banks
         # kept sampled for 3 s (they had exhausted the pool, 0x1a371).
         env.setdefault('SOTC_LOD_FEEDBACK', '1')
-        env.setdefault('SOTC_LOD_LEVEL', '0' if textures == 'max' else '1')
-        if textures == 'max':
+        # Light video memory profile (cards under 8 GB): Maximum at mip 1 without the 3 s, High at
+        # mip 2 as in 0.71.
+        if light:
+            env.setdefault('SOTC_LOD_LEVEL', '1' if textures == 'max' else '2')
+        else:
+            env.setdefault('SOTC_LOD_LEVEL', '0' if textures == 'max' else '1')
+        if textures == 'max' and not light:
             env['SOTC_LOD_LINGER'] = env.get('SOTC_LOD_LINGER') if env.get('SOTC_LOD_LINGER') != '1' else '180'
     # sotc: the heap guard's two shortcuts, off since 0.70 for the 0x49800 crash, which came from
     # the same double free: on again (tested with the above).
@@ -832,7 +864,7 @@ def game_environment(s):
     if 'SOTC_MAX_IN_PRO=0' in str(s.get('extra_env', '')) and textures == 'max' and env['SOTC_NEO'] == '1':
         textures = 'high'
         env['SOTC_NOTE'] = 'Texture quality Maximum is not used in PS4 Pro mode: High'
-    if textures == 'max':  # sotc: without the page pool switch (sotc_lod_stats.h)
+    if textures == 'max' and not light:  # sotc: without the page pool switch (sotc_lod_stats.h)
         env.setdefault('SOTC_LOD_POOL_LOW', '0')
     if s.get('button_icons') == 'xbox' and (PORT_DIR / 'glyphs' / 'xbox').is_dir():
         env['SOTC_TEX_REPLACE'] = str(PORT_DIR / 'glyphs' / 'xbox')
@@ -1436,6 +1468,12 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         self.row(quick, _('Geração de quadros', 'Frame generation'), self.choice(quick, 'framegen', FRAMEGEN, 24))
         self.row(quick, _('FPS', 'FPS'), self.choice(quick, 'fps_mode', FPS_MODES, 24))
         self.row(quick, _('Texturas', 'Textures'), self.choice(quick, 'textures', TEXTURES, 24))
+        self.row(quick, _('Memória da placa', 'Card memory'), self.choice(quick, 'vram_profile', VRAM_PROFILES, 24))
+        self.vram_profile_hint = ttk.Label(quick, text='', style='Muted.TLabel', wraplength=self.px(300),
+                                           justify='left')
+        self.vram_profile_hint.grid(row=self.next_row(quick), column=0, columnspan=2, sticky='w', pady=(0, 2))
+        self.var('vram_profile').trace_add('write', lambda *_a: self.show_vram_profile_hint())
+        self.show_vram_profile_hint()
         self.check(quick, 'af16', _('Texturas nítidas (filtro 16x)', 'Sharp textures (16x filtering)'))
         self.check(quick, 'fullscreen', _('Tela cheia', 'Fullscreen'))
         self.check(quick, 'neo', _('Modo PS4 Pro', 'PS4 Pro mode'))
@@ -1455,6 +1493,22 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
             name = getattr(self, 'gpu_name', '').upper()
             values['upscaler'] = 'dlss' if 'NVIDIA' in name and 'RTX' in name else 'fsr1'
         return values
+
+    def show_vram_profile_hint(self):
+        """What the video memory profile does with the card found."""
+        if not hasattr(self, 'vram_profile_hint'):
+            return
+        mb = int(self.app.get('gpu_vram_mb') or 0)
+        card = (_('placa com {:.0f} GB', 'card with {:.0f} GB').format(mb / 1024) if mb
+                else _('placa ainda não verificada', 'card not checked yet'))
+        current = dict(self.app, vram_profile=self.var('vram_profile').get())
+        if light_vram(current):
+            text = _('Leve ({}): Máxima no mip 1, Alta no mip 2, memória de vídeo no máximo Padrão.',
+                     'Light ({}): Maximum at mip 1, High at mip 2, video memory at most Default.').format(card)
+        else:
+            text = _('Completo ({}): Máxima no mip 0 e todas as melhorias de textura.',
+                     'Full ({}): Maximum at mip 0 and every texture improvement.').format(card)
+        self.vram_profile_hint.configure(text=text)
 
     def show_play_mode_hint(self):
         self.play_mode_hint.configure(text=_(*PLAY_MODE_HINTS.get(self.var('play_mode').get(), ('', ''))))
@@ -2036,6 +2090,10 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
             names = [line[5:].split(':')[0] for line in result.stderr.splitlines() if line.startswith('GPU: ')]
             if names:
                 self.gpu_name = names[0]
+                found = re.search(r'(\d+)\s*MiB', names[0])
+                if found:
+                    self.app['gpu_vram_mb'] = int(found.group(1))
+                    self.ui_calls.put(self.show_vram_profile_hint)
                 text = _('✓ Placa de vídeo: {}', '✓ Graphics card: {}').format(names[0])
             elif result.returncode:
                 text = _('✗ Nenhuma placa com Vulkan 1.3 (atualize o driver)',
@@ -3448,6 +3506,17 @@ def play_without_window(settings):
         write_key_bindings(settings.get('keys'))
     except OSError:
         pass
+    if not settings.get('gpu_vram_mb'):
+        # sotc: the video memory profile's Auto needs the card (the window finds it in detect_gpu).
+        exe = PORT_DIR / 'bin' / 'bb-gpu-capabilities.exe'
+        try:
+            result = subprocess.run([str(exe), '--live-resolution'], capture_output=True, text=True,
+                                    timeout=30, creationflags=NO_WINDOW)
+            found = re.search(r'^GPU: .*?(\d+)\s*MiB', result.stderr, re.MULTILINE)
+            if found:
+                settings['gpu_vram_mb'] = int(found.group(1))
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     env = game_environment(settings)
     env['SOTC_EVENT_LOG'] = start_event_log(log_dir, settings, env)
     with open_session_log(log_dir) as log:

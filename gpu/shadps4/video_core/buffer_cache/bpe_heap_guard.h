@@ -167,6 +167,9 @@ public:
     std::pair<VAddr, VAddr> PieceOf(VAddr addr) const;
 
 private:
+    /// True when the piece at `piece` ends at `end` (its last block found right before end)
+    bool IsPieceEnd(VAddr piece, VAddr end) const;
+
     Core::MemoryManager* memory;
     VAddr head = 0;
     u64 count = 0;

@@ -354,12 +354,14 @@ FRAMEGEN = [('off', ('Desligada', 'Off')),
             ('dlss', ('NVIDIA DLSS-G (RTX 40/50)', 'NVIDIA DLSS-G (RTX 40/50)')),
             ('fsr', ('AMD FSR 3 (qualquer placa)', 'AMD FSR 3 (any GPU)'))]
 # DLSS super resolution (bb-probe: SOTC_UPSCALER=dlss): the game renders at the output size
-# divided by the mode's factor and DLSS picks its mode from that ratio (vk_dlssg.cpp).
-DLSS_MODES = [('quality', ('Qualidade (1,5×)', 'Quality (1.5×)')),
+# divided by the mode's factor and DLSS picks its mode from that ratio (vk_dlssg.cpp: DLAA at 1:1,
+# DLAA mode from tabnul's fork PR #112).
+DLSS_MODES = [('dlaa', ('DLAA (nativo)', 'DLAA (native)')),
+              ('quality', ('Qualidade (1,5×)', 'Quality (1.5×)')),
               ('balanced', ('Equilibrado (1,72×)', 'Balanced (1.72×)')),
               ('performance', ('Desempenho (2×)', 'Performance (2×)')),
               ('ultra', ('Ultra Desempenho (3×)', 'Ultra Performance (3×)'))]
-DLSS_FACTORS = {'quality': 1.5, 'balanced': 1.724, 'performance': 2.0, 'ultra': 3.0}
+DLSS_FACTORS = {'dlaa': 1.0, 'quality': 1.5, 'balanced': 1.724, 'performance': 2.0, 'ultra': 3.0}
 # RCAS after DLSS (SOTC_DLSS_SHARPEN, attenuation in stops: 0 = sharpest).
 DLSS_SHARPNESS = [('0', ('Alta (padrão)', 'High (default)')), ('0.5', ('Média', 'Medium')), ('1', ('Baixa', 'Low')),
                   ('off', ('Desligada', 'Off'))]
@@ -875,12 +877,14 @@ def game_environment(s):
 
 
 def dlss_render(output, mode):
-    """The render size for DLSS mode at output WxH: multiples of 8, at least 640x360 (sotc.py still
-    caps it at 1080 lines). The exact aspect when a size within 6% of the factor has it: the
+    """The render size for DLSS mode at output WxH: multiples of 8, at least 640x360 (DLAA: the
+    output size). The exact aspect when a size within 6% of the factor has it: the
     presenter keeps the render's aspect, so 2552x1064 for 3840x1600 gave a 3838 wide output."""
     try:
         w, h = map(int, output.split('x'))
     except ValueError:
+        return output
+    if mode == 'dlaa':
         return output
     target = h / DLSS_FACTORS.get(mode, 1.5)
     exact = [rh for rh in range(360, h + 1, 8) if rh * w % (h * 8) == 0 and abs(rh - target) <= target * 0.06]
@@ -1644,10 +1648,10 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                        'detail rebuilt from earlier frames. Without an RTX card or the NVIDIA files, FSR 1 '
                        'enlarges the same smaller image.'), top=2)
         self.row(f, _('Modo', 'Mode'), self.choice(f, 'dlss_mode', DLSS_MODES),
-                 _('Fator entre a saída e o tamanho renderizado. O jogo renderiza no máximo 1080 linhas: '
-                   'acima de 1620p (Qualidade) ou 1860p (Equilibrado) o DLSS amplia mais que o fator.',
-                   'Factor between the output and the render size. The game renders at most 1080 lines: '
-                   'above 1620p (Quality) or 1860p (Balanced) DLSS enlarges more than the factor.'))
+                 _('Fator entre a saída e o tamanho renderizado. DLAA: tamanho nativo com o anti-aliasing do '
+                   'DLSS (mais pesado, imagem mais nítida).',
+                   'Factor between the output and the render size. DLAA: native size with DLSS anti-aliasing '
+                   '(heavier, sharper image).'))
         self.row(f, _('Nitidez da cena', 'Scene sharpening'), self.choice(f, 'dlss_sharpen', DLSS_SHARPNESS))
         self.row(f, _('Nitidez do texto', 'Text sharpening'), self.choice(f, 'dlss_ui_sharpen', DLSS_UI_SHARPNESS))
         self.row(f, _('Nitidez do céu', 'Sky sharpening'), self.choice(f, 'dlss_sky_sharpen', DLSS_SKY_SHARPNESS))

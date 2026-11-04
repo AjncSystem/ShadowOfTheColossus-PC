@@ -796,6 +796,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
         std::chrono::steady_clock::time_point built{};
         std::optional<BpeHeapGuard> guard;
         std::optional<BpeUsedBlocks> used;
+        std::optional<BpeHeapPieces> pieces;
     };
     static std::array<GuardSlot, 8> slots;
     struct Active {
@@ -803,6 +804,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
         VAddr base;
         u64 size;
         bool checked; ///< the guard was checked against the heap's signature in this batch
+        bool pieces;  ///< slot->pieces holds the heap's checked piece list
     };
     std::array<Active, 8> active{};
     size_t active_count = 0;
@@ -845,6 +847,24 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
         }
         return nullptr;
     };
+    // sotc: SOTC_HEAP_PIECES=0 guards every write in the heap's range, as before; 1 skips only
+    // the writes outside the heap's pieces; 2 (default) also follows a piece's own block chain
+    // (BpeHeapPieces, BpeUsedBlocks::FindInPiece)
+    static const int use_pieces = [] {
+        const char* v = std::getenv("SOTC_HEAP_PIECES");
+        return v ? std::atoi(v) : 2;
+    }();
+    const auto pieces_of = [&](GuardSlot& slot) {
+        if (!use_pieces) {
+            return false;
+        }
+        if (!slot.pieces) {
+            slot.pieces.emplace(memory);
+        }
+        const bool ok = slot.pieces->Refresh(slot.heap);
+        SotcStats::hg_piece[ok ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+        return ok;
+    };
     const auto signature_of = [](VAddr heap) -> std::array<u64, 3> {
         return {*std::bit_cast<const u64*>(heap + 0x80), *std::bit_cast<const u64*>(heap + 0xa8),
                 *std::bit_cast<const u64*>(heap + 0xc0)};
@@ -885,6 +905,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                  (age > std::chrono::seconds(2) ||
                   (age > std::chrono::milliseconds(250) && outside_extent())))) {
                 SotcStats::heap_guard_builds.fetch_add(1, std::memory_order_relaxed);
+                SotcStats::hg_build_path[0].fetch_add(1, std::memory_order_relaxed);
                 known->guard.emplace(memory, heap);
                 known->signature = signature;
                 known->built = now;
@@ -921,7 +942,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
             if (!slot->used) {
                 slot->used.emplace(memory);
             }
-            active[active_count++] = {slot, heap_base, heap_size, false};
+            active[active_count++] = {slot, heap_base, heap_size, false, pieces_of(*slot)};
             continue;
         }
         for (auto& candidate : slots) {
@@ -949,7 +970,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
         if (!slot->used) {
             slot->used.emplace(memory);
         }
-        active[active_count++] = {slot, heap_base, heap_size, false};
+        active[active_count++] = {slot, heap_base, heap_size, false, pieces_of(*slot)};
     }
     // The heap's guard, built again when its free tree changed (signature) since the last build
     const auto guard_of = [&](Active& a) -> BpeHeapGuard* {
@@ -962,6 +983,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                                                    *std::bit_cast<const u64*>(heap + 0xc0)};
             if (!slot.guard || signature != slot.signature) {
                 SotcStats::heap_guard_builds.fetch_add(1, std::memory_order_relaxed);
+                SotcStats::hg_build_path[1].fetch_add(1, std::memory_order_relaxed);
                 slot.guard.emplace(memory, heap);
                 slot.signature = signature;
             }
@@ -1024,8 +1046,28 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                 BpeHeapGuard* heap_guard = nullptr;
                 if (Active* a = active_for(addr, size)) {
                     BpeUsedBlocks& used = *a->slot->used;
-                    if (heap_fast && (used.Covers(a->slot->heap, addr, addr + size) ||
-                                      used.TryUserPointer(a->slot->heap, addr, addr + size))) {
+                    const BpeHeapPieces* pieces = a->pieces ? &*a->slot->pieces : nullptr;
+                    if (pieces && !pieces->Overlaps(addr, addr + size)) {
+                        // sotc: not the heap's memory: another buffer between its pieces
+                        SotcStats::hg_piece[2].fetch_add(1, std::memory_order_relaxed);
+                        memory->TryWriteBacking(std::bit_cast<u8*>(addr), src + (addr - dst_addr),
+                                                size, 1);
+                        return;
+                    }
+                    int cover_why = 0;
+                    if (heap_fast &&
+                        (used.Covers(a->slot->heap, addr, addr + size, &cover_why, pieces) ||
+                         used.TryUserPointer(a->slot->heap, addr, addr + size))) {
+                        memory->TryWriteBacking(std::bit_cast<u8*>(addr), src + (addr - dst_addr),
+                                                size, 1);
+                        return;
+                    }
+                    if (const auto [piece, piece_end] = pieces && heap_fast && use_pieces >= 2
+                                                            ? pieces->PieceOf(addr)
+                                                            : std::pair<VAddr, VAddr>{0, 0};
+                        piece &&
+                        used.FindInPiece(a->slot->heap, piece, piece_end, addr, addr + size)) {
+                        SotcStats::hg_piece[4].fetch_add(1, std::memory_order_relaxed);
                         memory->TryWriteBacking(std::bit_cast<u8*>(addr), src + (addr - dst_addr),
                                                 size, 1);
                         return;
@@ -1058,13 +1100,17 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                             }
                         }
                     }
+                    SotcStats::hg_cover_why[cover_why & 3].fetch_add(1, std::memory_order_relaxed);
                     heap_guard = guard_of(*a);
                     int find = 0;
                     if (VAddr block = 0, next = 0;
                         heap_fast && heap_guard &&
                         heap_guard->FindUsedBlock(addr, block, next, &find)) {
                         used.Add(block, next);
-                    } else if (find == 6) {
+                        SotcStats::hg_find_why[0].fetch_add(1, std::memory_order_relaxed);
+                    } else if (SotcStats::hg_find_why[find > 0 && find < 7 ? find : 0].fetch_add(
+                                   1, std::memory_order_relaxed),
+                               find == 6) {
                         used.SetFence(block);
                     }
                 } else if (active_count == 1 && active[0].checked) {

@@ -92,7 +92,13 @@ inline std::atomic<uint64_t> heap_guard_ns{0};        ///< time of the guard bui
 inline std::atomic<uint64_t> heap_guard_worst_ns{0};
 inline std::atomic<uint64_t> heap_guard_worst_blocks{0}; ///< free blocks of the slowest build
 inline std::atomic<uint64_t> heap_guard_worst_adds{0};   ///< ... and the visits it made
-inline std::atomic<uint64_t> heap_guard_repeats{0};      ///< nodes and ring members seen again, skipped
+inline std::atomic<uint64_t> heap_guard_repeats{0};
+/// sotc: guard diagnostics: builds by path [0 world-heap refresh, 1 batch guard], Covers misses by why
+/// [0..3], FindUsedBlock results after a build [0 found, 1..6 why]
+inline std::atomic<uint64_t> hg_build_path[2]{}, hg_cover_why[4]{}, hg_find_why[7]{};
+/// sotc: heap pieces [0 batches with a valid piece list, 1 without, 2 writes outside every piece,
+/// 3 fence-tail writes that landed in a piece, 4 writes vouched by a piece chain]
+inline std::atomic<uint64_t> hg_piece[5]{};      ///< nodes and ring members seen again, skipped
 inline std::atomic<uint64_t> copy_guest_fallbacks{0}; ///< SOTC_COPY_GUEST_VIEW copies that faulted (backing view)
 inline std::atomic<uint64_t> readback_copies{0};          ///< ranges downloaded
 inline std::atomic<uint64_t> readback_copies_changed{0};  ///< ... whose bytes differed from memory

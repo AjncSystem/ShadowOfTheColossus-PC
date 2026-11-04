@@ -558,10 +558,33 @@ bool BpeHeapPieces::Refresh(VAddr heap) {
         if (starts[i] < initial_lo) {
             end = std::min(end, initial_lo);
         }
+        // sotc: the piece's own end when its last block is found there (a heap that has MiB to
+        // spare otherwise took each piece as the longest one possible, and guarded the writes to
+        // the buffers after its 1 MiB pieces: ~126k guard builds' worth per ride)
+        for (VAddr at = starts[i] + MiB; at < end; at += MiB) {
+            if (IsPieceEnd(starts[i], at)) {
+                end = at;
+                break;
+            }
+        }
         pieces.emplace_back(starts[i], end);
     }
     valid = true;
     return true;
+}
+
+bool BpeHeapPieces::IsPieceEnd(VAddr piece, VAddr end) const {
+    // The piece's last block: in use, size 0, right before end; the block before it ends there
+    const VAddr fence = end - HeaderSize;
+    u64 words[2] = {};
+    if (!memory->TryReadBacking(fence, words, sizeof(words)) || words[1] != InUse) {
+        return false;
+    }
+    const VAddr prev = words[0];
+    u64 prev_size = 0;
+    return prev >= piece + HeaderSize && prev < fence && (prev & 7) == 0 &&
+           memory->TryReadBacking(prev + 8, &prev_size, sizeof(prev_size)) &&
+           prev + (prev_size & SizeMask) + HeaderSize == fence;
 }
 
 bool BpeHeapPieces::Overlaps(VAddr addr, VAddr end) const {

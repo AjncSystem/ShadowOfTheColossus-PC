@@ -330,7 +330,15 @@ static int host_prot(int prot) {
  * range mapped again with the page protections they had (GPU page tracking included). */
 typedef struct { uintptr_t start, end; uint64_t phys; int mapped; } HostRegion;
 typedef struct { uintptr_t start, end; DWORD protect; } ProtRun;
-static HostRegion *regions; static size_t region_count, region_capacity;
+/* sotc: the host regions, sorted, in blocks of at most REGION_BLOCK entries. The game's mappings
+ * cut the address range into ~20k views and placeholders, and one sorted array moved ~600 KB at
+ * every insert and erase: ~4.8 s per riding benchmark under the memory write lock, two thirds of
+ * all carve time. A block moves at most REGION_BLOCK entries. Indices stay global (R(i)). */
+#define REGION_BLOCK 512
+typedef struct { HostRegion *e; size_t n, first; } RegionBlock; /* first: global index of e[0] */
+static RegionBlock *rblocks; static size_t rblock_count, rblock_capacity;
+static HostRegion *rspare[8]; static size_t rspare_count; /* blocks ready for splits */
+static size_t region_count, rblock_last;
 static HANDLE section;
 static DWORD win_prot(int prot) {
     if (prot & PROT_EXEC) return (prot & PROT_WRITE) ? PAGE_EXECUTE_READWRITE : (prot & PROT_READ) ? PAGE_EXECUTE_READ : PAGE_EXECUTE;
@@ -343,26 +351,92 @@ static void win_fail(const char *what, uintptr_t address, uint64_t size) {
     fprintf(stderr,"STOP: %s failed at %p (+0x%" PRIx64 "), error %lu\n",what,(void *)address,size,GetLastError());
     exit(21);
 }
-static size_t region_index(uintptr_t a) { /* first region with end > a */
-    size_t lo=0, hi=region_count;
-    while (lo<hi) { size_t mid=(lo+hi)/2; if (regions[mid].end<=a) lo=mid+1; else hi=mid; }
-    return lo;
+static size_t rblock_of(size_t i) { /* the block holding global index i (i < region_count) */
+    if (rblock_last<rblock_count && i-rblocks[rblock_last].first<rblocks[rblock_last].n) return rblock_last;
+    size_t lo=0, hi=rblock_count;
+    while (hi-lo>1) { size_t mid=(lo+hi)/2; if (rblocks[mid].first<=i) lo=mid; else hi=mid; }
+    return rblock_last=lo;
 }
+static HostRegion *reg(size_t i) {
+    const size_t b=rblock_of(i);
+    return &rblocks[b].e[i-rblocks[b].first];
+}
+#define R(i) (*reg(i))
+static size_t region_index(uintptr_t a) { /* first region with end > a */
+    if (!region_count) return 0;
+    size_t lo=0, hi=rblock_count;
+    while (lo<hi) { size_t mid=(lo+hi)/2; if (rblocks[mid].e[rblocks[mid].n-1].end<=a) lo=mid+1; else hi=mid; }
+    if (lo==rblock_count) return region_count;
+    const RegionBlock *b=&rblocks[lo];
+    size_t l=0, h=b->n;
+    while (l<h) { size_t mid=(l+h)/2; if (b->e[mid].end<=a) l=mid+1; else h=mid; }
+    return b->first+l;
+}
+static HostRegion *rblock_alloc(void) {
+    if (rspare_count) return rspare[--rspare_count];
+    HostRegion *e=malloc(REGION_BLOCK*sizeof(*e));
+    if (!e) { fputs("Out of memory (host regions)\n",stderr); exit(1); }
+    return e;
+}
+/* The next `extra` inserts allocate nothing (carve_host stops the other guest threads meanwhile,
+ * and one of them may hold the heap). */
 static void region_reserve(size_t extra) {
-    while (region_count+extra>region_capacity) {
-        size_t capacity=region_capacity ? region_capacity*2 : 256;
-        HostRegion *next=realloc(regions,capacity*sizeof(*regions));
+    if (extra>8) extra=8;
+    while (rspare_count<extra) {
+        HostRegion *e=malloc(REGION_BLOCK*sizeof(*e));
+        if (!e) { fputs("Out of memory (host regions)\n",stderr); exit(1); }
+        rspare[rspare_count++]=e;
+    }
+    while (rblock_count+extra+1>rblock_capacity) {
+        size_t capacity=rblock_capacity ? rblock_capacity*2 : 64;
+        RegionBlock *next=realloc(rblocks,capacity*sizeof(*rblocks));
         if (!next) { fputs("Out of memory (host regions)\n",stderr); exit(1); }
-        regions=next; region_capacity=capacity;
+        rblocks=next; rblock_capacity=capacity;
     }
 }
+static void rblock_renumber(size_t from) {
+    for (size_t b=from; b<rblock_count; ++b) rblocks[b].first=b ? rblocks[b-1].first+rblocks[b-1].n : 0;
+}
 static void region_insert(size_t at, HostRegion r) {
-    region_reserve(1);
-    memmove(regions+at+1,regions+at,(region_count-at)*sizeof(*regions));
-    regions[at]=r; ++region_count;
+    if (rblock_count+2>rblock_capacity) region_reserve(1);
+    if (!rblock_count) {
+        rblocks[0]=(RegionBlock){rblock_alloc(),0,0};
+        rblock_count=1;
+    }
+    size_t b=at==region_count ? rblock_count-1 : rblock_of(at);
+    if (rblocks[b].n==REGION_BLOCK) { /* split it in two halves */
+        memmove(rblocks+b+2,rblocks+b+1,(rblock_count-b-1)*sizeof(*rblocks));
+        HostRegion *e=rblock_alloc();
+        const size_t half=REGION_BLOCK/2;
+        memcpy(e,rblocks[b].e+half,(REGION_BLOCK-half)*sizeof(*e));
+        rblocks[b+1]=(RegionBlock){e,REGION_BLOCK-half,rblocks[b].first+half};
+        rblocks[b].n=half;
+        ++rblock_count;
+        if (at-rblocks[b].first>half) ++b; /* at == first+half stays in block b, at its end */
+    }
+    RegionBlock *k=&rblocks[b];
+    const size_t j=at-k->first;
+    memmove(k->e+j+1,k->e+j,(k->n-j)*sizeof(*k->e));
+    k->e[j]=r; ++k->n; ++region_count;
+    rblock_renumber(b+1);
+    rblock_last=b;
 }
 static void region_erase(size_t at, size_t n) {
-    memmove(regions+at,regions+at+n,(region_count-at-n)*sizeof(*regions)); region_count-=n;
+    while (n) {
+        const size_t b=rblock_of(at);
+        RegionBlock *k=&rblocks[b];
+        const size_t j=at-k->first;
+        const size_t take=k->n-j<n ? k->n-j : n;
+        memmove(k->e+j,k->e+j+take,(k->n-j-take)*sizeof(*k->e));
+        k->n-=take; region_count-=take; n-=take;
+        if (!k->n && rblock_count>1) { /* drop the empty block */
+            if (rspare_count<8) rspare[rspare_count++]=k->e; else free(k->e);
+            memmove(rblocks+b,rblocks+b+1,(rblock_count-b-1)*sizeof(*rblocks));
+            --rblock_count;
+        }
+        rblock_renumber(b);
+        rblock_last=0;
+    }
 }
 /* The guest range is reserved before anything else can be placed there (runtime_start). */
 void runtime_memory_reserve(void) {
@@ -432,11 +506,11 @@ static void carve_resume_on_fail(void) {
 /* Leaves [a,b) as exactly one unmapped placeholder; returns its region index. */
 static size_t carve_host(uintptr_t a, uintptr_t b) {
     size_t first=region_index(a), last=first;
-    if (first==region_count || regions[first].start>a) win_fail("guest range outside the reservation",a,b-a);
-    while (last<region_count && regions[last].start<b) ++last;
-    if (regions[last-1].end<b) win_fail("guest range outside the reservation",a,b-a);
-    uintptr_t lo=regions[first].start, hi=regions[last-1].end;
-    HostRegion left=regions[first], right=regions[last-1];
+    if (first==region_count || R(first).start>a) win_fail("guest range outside the reservation",a,b-a);
+    while (last<region_count && R(last).start<b) ++last;
+    if (R(last-1).end<b) win_fail("guest range outside the reservation",a,b-a);
+    uintptr_t lo=R(first).start, hi=R(last-1).end;
+    HostRegion left=R(first), right=R(last-1);
     int keep_left=left.mapped && lo<a, keep_right=right.mapped && b<hi;
     if (first==last-1 && !left.mapped && lo==a && hi==b) return first;
     const uint64_t carve_start=lock_ticks();
@@ -455,9 +529,9 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
         carve_stopping=1;
         __atomic_add_fetch(&carve_splits,1,__ATOMIC_RELAXED);
     }
-    for (size_t i=first;i<last;++i) if (regions[i].mapped) {
-        if (!UnmapViewOfFile2(GetCurrentProcess(),(void *)regions[i].start,MEM_PRESERVE_PLACEHOLDER))
-            win_fail("UnmapViewOfFile2",regions[i].start,regions[i].end-regions[i].start);
+    for (size_t i=first;i<last;++i) if (R(i).mapped) {
+        if (!UnmapViewOfFile2(GetCurrentProcess(),(void *)R(i).start,MEM_PRESERVE_PLACEHOLDER))
+            win_fail("UnmapViewOfFile2",R(i).start,R(i).end-R(i).start);
     }
     if (last-first>1 && !VirtualFree((void *)lo,hi-lo,MEM_RELEASE|MEM_COALESCE_PLACEHOLDERS))
         win_fail("coalescing placeholders",lo,hi-lo);
@@ -466,21 +540,21 @@ static size_t carve_host(uintptr_t a, uintptr_t b) {
     size_t at=first;
     if (lo<a) {
         if (!VirtualFree((void *)lo,a-lo,MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER)) win_fail("splitting a placeholder",lo,a-lo);
-        regions[at].end=a;
+        R(at).end=a;
         region_insert(at+1,(HostRegion){a,hi,0,0});
         if (keep_left) {
-            regions[at].phys=left.phys; regions[at].mapped=1;
-            view_map(&regions[at],PAGE_READWRITE);
+            R(at).phys=left.phys; R(at).mapped=1;
+            view_map(&R(at),PAGE_READWRITE);
         }
         ++at;
     }
     if (b<hi) {
         if (!VirtualFree((void *)a,b-a,MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER)) win_fail("splitting a placeholder",a,b-a);
-        regions[at].end=b;
+        R(at).end=b;
         region_insert(at+1,(HostRegion){b,hi,0,0});
         if (keep_right) {
-            regions[at+1].phys=right.phys+(b-right.start); regions[at+1].mapped=1;
-            view_map(&regions[at+1],PAGE_READWRITE);
+            R(at+1).phys=right.phys+(b-right.start); R(at+1).mapped=1;
+            view_map(&R(at+1),PAGE_READWRITE);
         }
     }
     for (size_t i=0;i<nruns;++i) {
@@ -525,14 +599,14 @@ static int host_map(uintptr_t address, uint64_t size, int prot, int reserved, ui
     for (uintptr_t at=address;; ++i) {
         uintptr_t next=chunk ? (at/chunk+1)*chunk : end;
         if (next>end) next=end;
-        if (next<end) { /* regions[i] is the placeholder [at,end): split off [at,next) */
+        if (next<end) { /* R(i) is the placeholder [at,end): split off [at,next) */
             if (!VirtualFree((void *)at,next-at,MEM_RELEASE|MEM_PRESERVE_PLACEHOLDER))
                 win_fail("splitting a placeholder",at,next-at);
-            regions[i].end=next;
+            R(i).end=next;
             region_insert(i+1,(HostRegion){next,end,0,0});
         }
-        regions[i].phys=phys+(at-address); regions[i].mapped=1;
-        view_map(&regions[i],win_prot(prot));
+        R(i).phys=phys+(at-address); R(i).mapped=1;
+        view_map(&R(i),win_prot(prot));
         if (next==end) break;
         at=next;
     }
@@ -542,9 +616,9 @@ static int host_unmap(uintptr_t address, uint64_t size) { carve_host(address,add
 static int host_protect(uintptr_t address, uint64_t size, int prot) {
     DWORD protect=win_prot(prot), old;
     uintptr_t end=address+size;
-    for (size_t i=region_index(address); i<region_count && regions[i].start<end; ++i) {
-        if (!regions[i].mapped) continue;
-        uintptr_t a=regions[i].start>address ? regions[i].start : address, b=regions[i].end<end ? regions[i].end : end;
+    for (size_t i=region_index(address); i<region_count && R(i).start<end; ++i) {
+        if (!R(i).mapped) continue;
+        uintptr_t a=R(i).start>address ? R(i).start : address, b=R(i).end<end ? R(i).end : end;
         if (!VirtualProtect((void *)a,b-a,protect,&old)) return -1;
     }
     return 0;
@@ -963,16 +1037,16 @@ static void views_check(void) {
     last=now; ++checks;
     unsigned long bad=0;
     for (size_t r=0; r<region_count; ++r) {
-        if (!regions[r].mapped) continue;
-        for (uintptr_t at=regions[r].start; at<regions[r].end;) {
+        if (!R(r).mapped) continue;
+        for (uintptr_t at=R(r).start; at<R(r).end;) {
             const size_t i=vma_index(at);
             if (i==vma_count || vmas[i].start>at) { /* a view where the table has nothing */
                 if (bad++<8 && bad_total<200) fprintf(stderr,"Runtime: VIEW CHECK view %p-%p (offset %#" PRIx64 ") over no mapping at %p\n",
-                    (void *)regions[r].start,(void *)regions[r].end,regions[r].phys,(void *)at);
+                    (void *)R(r).start,(void *)R(r).end,R(r).phys,(void *)at);
                 break;
             }
-            const uintptr_t stop=vmas[i].end<regions[r].end ? vmas[i].end : regions[r].end;
-            const uint64_t view_phys=regions[r].phys+(at-regions[r].start);
+            const uintptr_t stop=vmas[i].end<R(r).end ? vmas[i].end : R(r).end;
+            const uint64_t view_phys=R(r).phys+(at-R(r).start);
             const uint64_t table_phys=vmas[i].phys+(at-vmas[i].start);
             if (vmas[i].kind!=KIND_RESERVED && view_phys!=table_phys && bad++<8 && bad_total<200)
                 fprintf(stderr,"Runtime: VIEW CHECK %p-%p: view offset %#" PRIx64 ", table %#" PRIx64 " (kind %d, mapping %p-%p)\n",

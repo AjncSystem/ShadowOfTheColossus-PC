@@ -781,6 +781,23 @@ void VideoOutDriver::Flip(const Request& req) {
                              static_cast<unsigned long long>(
                                  SotcStats::heap_guard_stale_hits.exchange(0)));
             }
+            {
+                auto x = [](std::atomic<uint64_t>& v) {
+                    return static_cast<unsigned long long>(v.exchange(0));
+                };
+                ReportPrintf(report,
+                             "SOTC guard diag: builds world %llu batch %llu; cover miss %llu %llu %llu %llu; "
+                             "find ok %llu why %llu %llu %llu %llu %llu %llu; pieces ok %llu bad %llu out %llu fence-in %llu chain %llu\n",
+                             x(SotcStats::hg_build_path[0]), x(SotcStats::hg_build_path[1]),
+                             x(SotcStats::hg_cover_why[0]), x(SotcStats::hg_cover_why[1]),
+                             x(SotcStats::hg_cover_why[2]), x(SotcStats::hg_cover_why[3]),
+                             x(SotcStats::hg_find_why[0]), x(SotcStats::hg_find_why[1]),
+                             x(SotcStats::hg_find_why[2]), x(SotcStats::hg_find_why[3]),
+                             x(SotcStats::hg_find_why[4]), x(SotcStats::hg_find_why[5]),
+                             x(SotcStats::hg_find_why[6]), x(SotcStats::hg_piece[0]), x(SotcStats::hg_piece[1]),
+                             x(SotcStats::hg_piece[2]), x(SotcStats::hg_piece[3]),
+                             x(SotcStats::hg_piece[4]));
+            }
             if (grace_marks || grace_caps || grace_bytes || reg_spins || carves) {
                 ReportPrintf(report,
                              "SOTC fault grace: marks %llu, cap hits %llu, hot uploads %llu KiB; "

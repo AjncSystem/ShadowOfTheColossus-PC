@@ -392,12 +392,11 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
 void BufferCache::LiftStaleReadProtection(VAddr addr, u64 size) {
     // sotc: called when the window of a faulting access held nothing to download. A page bit with
     // no bound GPU-written bytes behind it can never be downloaded, and only a download clears the
-    // bit and lifts the read protection, so the thread faulted on that load forever while the game
-    // waited for it: a freeze about once in 30 rides (ride benchmark, 5 Nov; a job worker at eboot
-    // 0xf9c40 and the draw thread in the replicate HLE, 16 million faults on one load). Such a bit
-    // can outlive its bytes: DropGpuModified runs ahead of the draws already queued, one of them
-    // marks the range again, then ReleaseMemory, ordered after them, takes its bytes only, and the
-    // next map of the address applies the protection the bit implies. MarkWrittenByGuest does the
+    // bit and lifts the read protection, so the thread would fault on that load forever. Planted on
+    // purpose this freezes the game within seconds; not seen in ride benchmarks so far (the freeze
+    // they showed is RepairOutOfStepRead, page_manager.cpp). The bit can outlive its bytes:
+    // DropGpuModified runs ahead of the draws already queued, one of them can mark the range again,
+    // then ReleaseMemory, ordered after them, takes its bytes only. MarkWrittenByGuest does the
     // same for write faults. SOTC_STALE_READ_REPAIR=0: off.
     static const bool enabled = [] {
         const char* v = std::getenv("SOTC_STALE_READ_REPAIR");

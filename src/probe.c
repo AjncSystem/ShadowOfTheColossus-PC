@@ -956,9 +956,18 @@ static int helper_single_step(EXCEPTION_POINTERS *info) {
     if (!step_page) return 0;
     MEMORY_BASIC_INFORMATION m;
     DWORD old;
-    /* Only if nobody (the tracker) changed the page meanwhile. */
-    if (VirtualQuery((void *)step_page,&m,sizeof(m)) && m.Protect==PAGE_READONLY)
-        VirtualProtect((void *)step_page,4096,step_protect,&old);
+    /* Only if nobody (the tracker) changed the page meanwhile. Read-only does not prove that: it is
+     * also what the tracker leaves when a readback lifts the read protection of a page it still
+     * watches for writes. Restoring no-access then left a page no tracker change would ever touch
+     * again, and whoever read it next faulted forever (HandleGuestFault repairs that now). */
+    if (VirtualQuery((void *)step_page,&m,sizeof(m)) && m.Protect==PAGE_READONLY) {
+        if (step_protect!=PAGE_NOACCESS || bbgpu_page_read_watched(step_page))
+            VirtualProtect((void *)step_page,4096,step_protect,&old);
+        else {
+            static LONG logged;
+            if (InterlockedIncrement(&logged)<=32) fprintf(stderr,"SOTC helper read: the tracker lifted %p during the step, kept\n",(void *)step_page);
+        }
+    }
     step_page=0;
     info->ContextRecord->EFlags&=~(DWORD)0x100;
     return 1;

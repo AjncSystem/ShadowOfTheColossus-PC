@@ -248,7 +248,11 @@ void Swapchain::SetSurfaceProperties() {
     // the rest of the stall (a visible hitch at high fps). 8 bridge it (the frame pool sizes from
     // this too), and under Mailbox/Immediate they add no steady-state latency: the queue only
     // fills while a present is stuck. SOTC_SWAP_IMAGES overrides (=3 for the old behaviour).
-    u32 wanted_images = std::max(capabilities.minImageCount + 1, 8u);
+    // FIFO queues every image for the display: a game faster than the refresh would be shown up to
+    // 8 frames late, so it keeps the usual count (#128).
+    u32 wanted_images = present_mode == vk::PresentModeKHR::eFifo
+                            ? capabilities.minImageCount + 1
+                            : std::max(capabilities.minImageCount + 1, 8u);
     if (const char* env = std::getenv("SOTC_SWAP_IMAGES"); env && env[0]) {
         wanted_images = static_cast<u32>(std::strtoul(env, nullptr, 10));
     }

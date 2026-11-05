@@ -364,6 +364,10 @@ inline std::atomic<uint32_t> warmup_total{0}, warmup_done{0};
 /// on one hard disk made the loading screen last 2 minutes).
 inline std::atomic<bool> warmup_finished{false};
 inline std::atomic<uint64_t> flip_count{0};     ///< game flips (videoout/driver.cpp Flip)
+/// sotc: how long flips waited between the submit and the present thread taking them (input delay).
+inline std::atomic<uint64_t> flip_age_ns{0};
+inline std::atomic<uint64_t> flip_age_max_ns{0};
+inline std::atomic<uint64_t> flip_age_count{0};
 /// Game frames prepared by the command processor (vk_presenter.cpp PrepareFrame): unlike
 /// flip_count, in step with the draws the command processor is processing.
 inline std::atomic<uint64_t> cp_frame{0};

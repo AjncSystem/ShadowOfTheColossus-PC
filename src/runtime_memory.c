@@ -782,6 +782,13 @@ static size_t vma_index(uintptr_t a) { /* first VMA with end > a */
 static uint64_t vma_seq;
 static void vma_seq_begin(void) { __atomic_add_fetch(&vma_seq,1,__ATOMIC_SEQ_CST); }
 static void vma_seq_end(void) { __atomic_add_fetch(&vma_seq,1,__ATOMIC_RELEASE); }
+/* A lock-free reader follows .e before vma_seq can reject what it read, so .e is always stored
+ * whole: memmove's copy width belongs to the C library, and a torn pointer would be a wild read. */
+static void vblock_set(size_t at, Vma *e, size_t n, size_t first) {
+    __atomic_store_n(&vblocks[at].e,e,__ATOMIC_RELAXED);
+    __atomic_store_n(&vblocks[at].n,n,__ATOMIC_RELAXED);
+    __atomic_store_n(&vblocks[at].first,first,__ATOMIC_RELAXED);
+}
 static Vma *vblock_alloc(void) {
     if (vspare_count) return vspare[--vspare_count];
     return malloc(VMA_BLOCK*sizeof(Vma));
@@ -795,7 +802,7 @@ static int vma_insert(size_t at, Vma v) {
         Vma *e=vblock_alloc();
         if (!e) return -1;
         vma_seq_begin();
-        vblocks[0]=(VmaBlock){e,0,0};
+        vblock_set(0,e,0,0);
         vblock_count=1;
         vma_seq_end();
     }
@@ -809,8 +816,8 @@ static int vma_insert(size_t at, Vma v) {
     if (spare) {
         const size_t half=VMA_BLOCK/2;
         memcpy(spare,vblocks[b].e+half,(VMA_BLOCK-half)*sizeof(*spare));
-        memmove(vblocks+b+2,vblocks+b+1,(vblock_count-b-1)*sizeof(*vblocks));
-        vblocks[b+1]=(VmaBlock){spare,VMA_BLOCK-half,vblocks[b].first+half};
+        for (size_t x=vblock_count; x>b+1; --x) vblock_set(x,vblocks[x-1].e,vblocks[x-1].n,vblocks[x-1].first);
+        vblock_set(b+1,spare,VMA_BLOCK-half,vblocks[b].first+half);
         vblocks[b].n=half;
         ++vblock_count;
         if (at-vblocks[b].first>half) ++b; /* at == first+half: the end of block b */
@@ -837,9 +844,9 @@ static void vma_erase(size_t at, size_t n) {
         k->n-=take; vma_count-=take; n-=take;
         if (!k->n && vblock_count>1) { /* drop the empty block; never freed (lock-free reads) */
             Vma *e=k->e;
-            memmove(vblocks+b,vblocks+b+1,(vblock_count-b-1)*sizeof(*vblocks));
+            for (size_t x=b; x+1<vblock_count; ++x) vblock_set(x,vblocks[x+1].e,vblocks[x+1].n,vblocks[x+1].first);
             --vblock_count;
-            vblocks[vblock_count]=(VmaBlock){e,0,0}; /* a stale slot keeps a valid block */
+            vblock_set(vblock_count,e,0,0); /* a stale slot keeps a valid block */
             if (vspare_count<16) vspare[vspare_count++]=e; /* else left to the stale slot */
         }
         vblock_renumber(b);

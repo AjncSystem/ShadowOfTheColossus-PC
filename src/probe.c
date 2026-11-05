@@ -956,9 +956,18 @@ static int helper_single_step(EXCEPTION_POINTERS *info) {
     if (!step_page) return 0;
     MEMORY_BASIC_INFORMATION m;
     DWORD old;
-    /* Only if nobody (the tracker) changed the page meanwhile. */
-    if (VirtualQuery((void *)step_page,&m,sizeof(m)) && m.Protect==PAGE_READONLY)
-        VirtualProtect((void *)step_page,4096,step_protect,&old);
+    /* Only if nobody (the tracker) changed the page meanwhile. Read-only does not prove that: it is
+     * also what the tracker leaves when a readback lifts the read protection of a page it still
+     * watches for writes. Restoring no-access then left a page no tracker change would ever touch
+     * again, and whoever read it next faulted forever (HandleGuestFault repairs that now). */
+    if (VirtualQuery((void *)step_page,&m,sizeof(m)) && m.Protect==PAGE_READONLY) {
+        if (step_protect!=PAGE_NOACCESS || bbgpu_page_read_watched(step_page))
+            VirtualProtect((void *)step_page,4096,step_protect,&old);
+        else {
+            static LONG logged;
+            if (InterlockedIncrement(&logged)<=32) fprintf(stderr,"SOTC helper read: the tracker lifted %p during the step, kept\n",(void *)step_page);
+        }
+    }
     step_page=0;
     info->ContextRecord->EFlags&=~(DWORD)0x100;
     return 1;
@@ -1378,6 +1387,33 @@ static _Thread_local int fault_depth;
 static _Thread_local struct { uint64_t code, addr, rip; } fault_chain[12];
 static LONG vectored_fault_body(EXCEPTION_POINTERS *info);
 static LONG fatal_exception(EXCEPTION_POINTERS *info);
+/* sotc: the same access fault resolved over and over on one thread: the handler says it fixed the
+ * page and it did not, a freeze with one thread busy in the exception dispatcher (seen once in ~70
+ * rides, draw thread, nothing in the log). Names the place at 4096 repeats and at each 16x after; changes nothing. */
+void runtime_memory_describe(uintptr_t address, char *out, size_t capacity);
+static _Thread_local uintptr_t fault_loop_addr, fault_loop_rip;
+static _Thread_local unsigned long fault_loop_count;
+static void fault_loop_note(EXCEPTION_POINTERS *info, LONG result) {
+    const EXCEPTION_RECORD *record=info->ExceptionRecord;
+    if (record->ExceptionCode!=EXCEPTION_ACCESS_VIOLATION || record->NumberParameters<2 || result!=EXCEPTION_CONTINUE_EXECUTION) return;
+    const uintptr_t addr=(uintptr_t)record->ExceptionInformation[1], rip=(uintptr_t)info->ContextRecord->Rip;
+    if (addr!=fault_loop_addr || rip!=fault_loop_rip) {
+        fault_loop_addr=addr; fault_loop_rip=rip; fault_loop_count=0;
+        return;
+    }
+    const unsigned long count=++fault_loop_count;
+    if (count<4096 || (count & (count-1))) return;
+    if ((count & 0x11111111UL)==0) return; /* powers of 16 only */
+    char state[160]="";
+    runtime_memory_describe(addr,state,sizeof(state));
+    MEMORY_BASIC_INFORMATION m={0};
+    VirtualQuery((void *)addr,&m,sizeof(m));
+    fprintf(stderr,"SOTC FAULT LOOP: %lu times %s at %p, rip %#llx (exe+%#llx, image+%#llx), thread %lu, path %d, host protect %#lx; %s\n",
+            count,record->ExceptionInformation[0]==1 ? "write" : "read",(void *)addr,(unsigned long long)rip,
+            (unsigned long long)(rip-(uintptr_t)GetModuleHandleA(NULL)),(unsigned long long)(rip-(uintptr_t)image),
+            GetCurrentThreadId(),fault_path,(unsigned long)m.Protect,state);
+    fflush(stderr);
+}
 static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record=info->ExceptionRecord;
     if (fault_depth<12) {
@@ -1397,6 +1433,7 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     ++fault_depth;
     const LONG result=vectored_fault_body(info);
     --fault_depth;
+    fault_loop_note(info,result);
     return result;
 }
 static LONG vectored_fault_body(EXCEPTION_POINTERS *info) {

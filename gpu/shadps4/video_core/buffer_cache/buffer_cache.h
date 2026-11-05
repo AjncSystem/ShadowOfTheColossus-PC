@@ -238,6 +238,8 @@ private:
                         bool subtract = true);
     /// sotc: takes the downloaded ranges of items out of the GPU-modified set.
     void SubtractDownloaded(std::span<const ReadbackItem> items);
+    /// sotc: a read fault's readback found nothing to download (see the definition).
+    void LiftStaleReadProtection(VAddr addr, u64 size);
     /// Writes downloaded data (mapped, at the copies' destination offsets minus mapped_offset)
     /// into guest memory and unmarks the ranges as GPU-modified.
     void ApplyDownloads(std::span<const ReadbackItem> pending, const u8* mapped,

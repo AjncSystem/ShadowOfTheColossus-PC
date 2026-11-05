@@ -969,6 +969,7 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
         }
     }
     UpdateImage(image_id);
+    const SotcStats::SplitTimer make_view_split{SotcStats::SplitTexMakeView};
     return image.FindView(desc.view_info);
 }
 

@@ -247,6 +247,9 @@ enum SplitPart {
     SplitRbBegin, SplitRbBeginFlush, SplitRbApply,
     SplitRbDirty,   ///< inside the apply: a dirty readback read back again on the draw thread
     SplitRbRetries, ///< dirty readbacks handed back to their guest thread (a count)
+    /// Inside the texture view lookup (FindTexture): the texture cache lock wait, page tracking
+    /// of the image (TrackImage), the view itself (Image::FindView).
+    SplitTexLock, SplitTexTrack, SplitTexMakeView,
     SplitParts
 };
 inline std::atomic<uint64_t> split_ticks[SplitParts]{};

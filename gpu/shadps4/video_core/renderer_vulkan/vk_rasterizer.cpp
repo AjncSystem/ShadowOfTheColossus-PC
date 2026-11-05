@@ -3521,7 +3521,7 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
         // guest-thread command would run ahead of the draws already queued, which may still use
         // the range (review of #99).
         liverpool->SendOrderedCommand(
-            [this, addr, size] { buffer_cache.ReleaseMemory(addr, size); });
+            [this, addr, size] { buffer_cache.ReleaseMemory(addr, size); }, 5);
     }
     texture_cache.UnmapMemory(addr, size);
     {

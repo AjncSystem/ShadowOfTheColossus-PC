@@ -385,9 +385,15 @@ public:
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
         std::unique_lock lk{mutex, std::defer_lock};
-        LockCounted(lk);
+        {
+            const SotcStats::SplitTimer lock_split{SotcStats::SplitTexLock};
+            LockCounted(lk);
+        }
         Image& image = slot_images[image_id];
-        TrackImage(image_id);
+        {
+            const SotcStats::SplitTimer track_split{SotcStats::SplitTexTrack};
+            TrackImage(image_id);
+        }
         TouchImage(image);
         RefreshImage(image);
     }

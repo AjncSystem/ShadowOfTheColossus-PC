@@ -16,6 +16,7 @@
   à thread do jogo a releitura de uma leitura suja (experimental: uma queda em `0x94c71` numa das duas rodadas).
 - **Experimental (desligado): mapa de visibilidade direto na memória do jogo** (`SOTC_VIS_DIRECT=1` com `SOTC_PC_MEMORY=1`): os shaders que reescrevem o mapa que o jogo varre a cada quadro escrevem na memória do jogo, sem a leitura de volta da GPU. Com `SOTC_VIS_PROGRAMS=0x2e0f474b,0xf94d23d4,0x93aec24b,0x729c541e,0x4defcf7f` a entrada da floresta caiu de 31 para 14 quadros acima de 50 ms no teste do usuário. Diagnósticos `SOTC_SLOW_OPS=1` (shaders mais caros dos quadros lentos) e `tools/entry_report.py` (resumo do log por trecho).
 - **Experimental (desligado): texturas lidas pela GPU direto na memória do jogo** (`SOTC_TEX_DIRECT=1`, com `SOTC_PC_MEMORY=1` e `SOTC_PC_MEMORY_PREIMPORT=1`, que importa os 10 GB da memória do jogo no boot em ~2,6 s): sem a cópia pela CPU na primeira entrada de uma área. Entrada da floresta no teste do usuário: 14 → 9 quadros acima de 50 ms.
+- **Experimental (desligado): liberação de memória do unmap sem esperar a GPU inteira** (`SOTC_RELEASE_DEFER=1`): na troca de área cada liberação esperava todo o trabalho da GPU, 28–63 vezes por quadro (10–20 ms por quadro). **Corrigido também** o travamento ao carregar um save com `SOTC_VIS_DIRECT=1` (rótulos de fim de pipe escritos fora de ordem).
 
 ## 0.72.1 — 2026-11-03
 - **Placas com menos de 8 GB de memória de vídeo: perfil leve automático.** As melhorias de textura da 0.72

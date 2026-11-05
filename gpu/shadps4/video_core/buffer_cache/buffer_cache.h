@@ -170,6 +170,8 @@ public:
 
     /// Releases the arena memory backing a range the guest unmapped. GPU thread only.
     void ReleaseMemory(VAddr device_addr, u64 size);
+    /// sotc: SOTC_RELEASE_DEFER=1: releases whose GPU work is done (TickFrame, each release).
+    void ProcessPendingReleases();
 
     /// sotc: gives back arena allocations whose blocks were not bound for a while and hold no
     /// GPU-written data, once resident arena memory passes SOTC_ARENA_EVICT_MB. Called between
@@ -328,6 +330,18 @@ private:
         }
     };
     IntervalList<Backing> resident_ranges;
+    /// sotc: SOTC_RELEASE_DEFER: unmapped block ranges released once the GPU passed `tick`
+    /// (the work recorded before the unmap), or at once when a bind uses them again.
+    struct PendingRelease {
+        u64 first_block;
+        u64 end_block;
+        u64 tick;
+    };
+    std::vector<PendingRelease> pending_releases;
+    /// The release itself; finish: wait for all the GPU work first (the old way).
+    void ReleaseBlocks(u64 first_block, u64 end_block, bool finish);
+    /// Releases now the pending ones that overlap [first_block, end_block).
+    void ForcePendingReleases(u64 first_block, u64 end_block);
     /// sotc: bumped at every resident_ranges.Add/Subtract. SynchronizeDmaBuffers rebuilds its
     /// merged runs only when this (or the arena count) changed since the last rebuild.
     u64 resident_version{};

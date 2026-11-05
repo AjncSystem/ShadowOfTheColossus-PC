@@ -179,7 +179,8 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                 SotcStats::SplitBufObtain,  SotcStats::SplitBindTextures, SotcStats::SplitTexView,
                 SotcStats::SplitTexRefresh, SotcStats::SplitTexCopy,      SotcStats::SplitBindDma,
                 SotcStats::SplitWaitGpu,    SotcStats::SplitWaitSubmit,   SotcStats::SplitRbApply,
-                SotcStats::SplitCommands};
+                SotcStats::SplitCommands,   SotcStats::SplitTexLock,      SotcStats::SplitTexTrack,
+                SotcStats::SplitTexMakeView};
             u64 before[std::size(kDetail)]{};
             if (SotcStats::kSlowOps) {
                 for (size_t i = 0; i < std::size(kDetail); ++i) {
@@ -188,7 +189,9 @@ void Liverpool::BackLoop(std::stop_token stoken) {
             }
             ExecuteBackOp(op);
             if (SotcStats::kSlowOps) {
-                const u64 hash = op.num_stages ? op.stages[0].info->pgm_hash : 0;
+                // A Func op is keyed by the line that queued it.
+                const u64 hash = op.num_stages ? op.stages[0].info->pgm_hash
+                                               : (op.kind == BackOp::Kind::Func ? op.line : 0);
                 const u64 ticks = SotcStats::Ticks() - op_start;
                 SotcStats::NoteSlowOp((u64{static_cast<u8>(op.kind)} << 60) |
                                           (hash & ((u64{1} << 60) - 1)),
@@ -213,10 +216,12 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                                      "SOTC SLOW OP kind %u %#llx %.2f ms: bind %.2f [buffers %.2f "
                                      "(clamp %.2f, obtain %.2f), textures %.2f (view %.2f; uploads "
                                      "%.2f, copy %.2f), dma %.2f]; waits gpu %.2f, submit %.2f; "
-                                     "readback apply %.2f, commands %.2f; stages %u\n",
+                                     "readback apply %.2f, commands %.2f; stages %u; view: lock %.2f, "
+                                     "track %.2f, make %.2f\n",
                                      u32(op.kind), static_cast<unsigned long long>(hash),
                                      ticks / tpm, ms(0), ms(1), ms(2), ms(3), ms(4), ms(5), ms(6),
-                                     ms(7), ms(8), ms(9), ms(10), ms(11), ms(12), op.num_stages);
+                                     ms(7), ms(8), ms(9), ms(10), ms(11), ms(12), op.num_stages,
+                                     ms(13), ms(14), ms(15));
                     }
                 }
             }
@@ -303,9 +308,32 @@ void Liverpool::BackPublish(bool writes_memory) {
     }
 }
 
-void Liverpool::QueueBackFunc(Common::UniqueFunction<void>&& func, bool writes_memory) {
+namespace {
+// sotc: SOTC_VIS_DIRECT: labels written late (when the GPU got there) by address. A later label
+// to the same address must not be written before it: the late write would then put the older
+// value back and a game waiting for the newer one waits forever (hang on loading a save, 05/11).
+std::mutex g_late_labels_mutex;
+std::unordered_map<VAddr, u32> g_late_labels;
+bool LateLabelPending(VAddr label) {
+    std::scoped_lock lock{g_late_labels_mutex};
+    return g_late_labels.contains(label);
+}
+void LateLabelAdd(VAddr label) {
+    std::scoped_lock lock{g_late_labels_mutex};
+    ++g_late_labels[label];
+}
+void LateLabelDone(VAddr label) {
+    std::scoped_lock lock{g_late_labels_mutex};
+    if (const auto it = g_late_labels.find(label); it != g_late_labels.end() && --it->second == 0) {
+        g_late_labels.erase(it);
+    }
+}
+} // namespace
+
+void Liverpool::QueueBackFunc(Common::UniqueFunction<void>&& func, bool writes_memory, u32 line) {
     BackOp& op = BackAlloc();
     op.kind = BackOp::Kind::Func;
+    op.line = line;
     op.func = std::move(func);
     BackPublish(writes_memory);
 }
@@ -501,13 +529,16 @@ void Liverpool::ProcessCommands() {
         }
         while (num_ordered) {
             Common::UniqueFunction<void> callback{};
+            u32 tag = 3;
             {
                 std::scoped_lock lk{submit_mutex};
                 callback = std::move(ordered_queue.front());
                 ordered_queue.pop();
+                tag = ordered_tags.front();
+                ordered_tags.pop();
                 --num_ordered;
             }
-            QueueBackFunc(std::move(callback), back_strict);
+            QueueBackFunc(std::move(callback), back_strict, tag);
         }
         return;
     }
@@ -1288,14 +1319,20 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (vis_honest) {
                     SotcStats::vis_honest_labels.fetch_add(1, std::memory_order_relaxed);
                 }
-                if ((defer_eop || vis_honest) && rasterizer) {
+                const VAddr eop_label = reinterpret_cast<VAddr>(event_eop->Address<void>());
+                const bool after_late =
+                    SotcStats::kVisDirect && !vis_honest && LateLabelPending(eop_label);
+                if ((defer_eop || vis_honest || after_late) && rasterizer) {
                     const PM4CmdEventWriteEop eop = *event_eop;
-                    const VAddr label = reinterpret_cast<VAddr>(eop.Address<void>());
+                    const VAddr label = eop_label;
+                    if (SotcStats::kVisDirect) {
+                        LateLabelAdd(label);
+                    }
                     // A GPU copy of the label's page must not be reused with the old value.
                     if (eop.data_sel.Value() != DataSelect::None) {
                         rasterizer->InvalidateMemory(label, 8, true);
                     }
-                    rasterizer->GetScheduler().DeferPriorityOperation([eop] {
+                    rasterizer->GetScheduler().DeferPriorityOperation([eop, label] {
                         eop.SignalFence(
                             [](void* address, u64 data, u32 num_bytes) {
                                 ASSERT(Core::Memory::Instance()->TryWriteBacking(address, &data,
@@ -1304,6 +1341,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                             [] {
                                 Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
                             });
+                        if (SotcStats::kVisDirect) {
+                            LateLabelDone(label);
+                        }
                     });
                     // Submit that work now: the game may wait for the label before it sends
                     // anything else, and nothing else would submit it.
@@ -1823,18 +1863,22 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 }
                 // sotc: SOTC_VIS_DIRECT: as the end-of-pipe label above (not for a GDS store, whose
                 // copy must be recorded here).
+                const VAddr release_label = reinterpret_cast<VAddr>(release.Address<u8*>());
                 if (rasterizer && release.data_sel.Value() != DataSelect::GdsMemStore &&
-                    std::exchange(SotcStats::vis_label_pending, false)) {
+                    (std::exchange(SotcStats::vis_label_pending, false) ||
+                     (SotcStats::kVisDirect && LateLabelPending(release_label)))) {
                     SotcStats::vis_honest_labels.fetch_add(1, std::memory_order_relaxed);
-                    const VAddr label = reinterpret_cast<VAddr>(release.Address<u8*>());
+                    const VAddr label = release_label;
+                    LateLabelAdd(label);
                     rasterizer->InvalidateMemory(label, 8, true);
-                    rasterizer->GetScheduler().DeferPriorityOperation([release, pipe_id] {
+                    rasterizer->GetScheduler().DeferPriorityOperation([release, pipe_id, label] {
                         release.SignalFence(
                             [pipe_id] {
                                 Platform::IrqC::Instance()->Signal(
                                     static_cast<Platform::InterruptId>(pipe_id));
                             },
                             [](VAddr, u16, u16) {});
+                        LateLabelDone(label);
                     });
                     rasterizer->Flush();
                     return;

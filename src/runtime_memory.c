@@ -438,17 +438,44 @@ static void region_erase(size_t at, size_t n) {
         rblock_last=0;
     }
 }
+/* sotc: something got into a guest range before the reservation (issue #110: error 487, "spamming
+ * the play button and eventually it will launch": an overlay or security product placing memory at
+ * random). Says what is there and exits with RANGE_BUSY_EXIT: sotc.py starts the game again. */
+#define RANGE_BUSY_EXIT 87
+static void range_busy(const char *what, uintptr_t lo, uintptr_t hi) {
+    const DWORD error=GetLastError();
+    fprintf(stderr,"Runtime: cannot reserve %s at %p (+0x%" PRIx64 "), error %lu; already there:\n",what,(void *)lo,(uint64_t)(hi-lo),error);
+    int shown=0;
+    for (uintptr_t at=lo; at<hi && shown<8;) {
+        MEMORY_BASIC_INFORMATION m;
+        if (!VirtualQuery((void *)at,&m,sizeof(m)) || !m.RegionSize) break;
+        if (m.State!=MEM_FREE) {
+            char name[260]="";
+            if (m.Type==MEM_IMAGE && !GetModuleFileNameA((HMODULE)m.AllocationBase,name,sizeof(name))) name[0]=0;
+            fprintf(stderr,"Runtime:   %p +0x%" PRIx64 " %s %s\n",m.BaseAddress,(uint64_t)m.RegionSize,
+                    m.Type==MEM_IMAGE ? "module" : m.Type==MEM_MAPPED ? "mapped" : "private",name);
+            ++shown;
+        }
+        at=(uintptr_t)m.BaseAddress+m.RegionSize;
+    }
+    fflush(NULL);
+    exit(RANGE_BUSY_EXIT);
+}
 /* The guest range is reserved before anything else can be placed there (runtime_start). */
 void runtime_memory_reserve(void) {
     if (region_count) return;
+    /* SOTC_TEST_RANGE_BUSY=n: the first n starts find the range taken (tests sotc.py's retry). */
+    const char *busy_test=getenv("SOTC_TEST_RANGE_BUSY"), *attempt=getenv("SOTC_RANGE_RETRY");
+    if (busy_test && (attempt ? atoi(attempt) : 0)<atoi(busy_test))
+        VirtualAlloc((void *)(USER_MIN+(UINT64_C(1)<<32)),65536,MEM_RESERVE,PAGE_NOACCESS);
     if (!VirtualAlloc2(NULL,(void *)USER_MIN,USER_MAX-USER_MIN,MEM_RESERVE|MEM_RESERVE_PLACEHOLDER,PAGE_NOACCESS,NULL,0))
-        win_fail("reserving the PS4 address range (link with --disable-high-entropy-va)",USER_MIN,USER_MAX-USER_MIN);
+        range_busy("the PS4 address range",USER_MIN,USER_MAX);
     region_insert(0,(HostRegion){USER_MIN,USER_MAX,0,0});
     /* sotc: Shadow of the Colossus maps fixed ranges below the user area (0x7f0000000),
      * in the PS4 system-managed window. A second placeholder covers it; mappings never
      * span both reservations because the host's low maps lie between them. */
     if (!VirtualAlloc2(NULL,(void *)SYSTEM_LOW_MIN,SYSTEM_LOW_MAX-SYSTEM_LOW_MIN,MEM_RESERVE|MEM_RESERVE_PLACEHOLDER,PAGE_NOACCESS,NULL,0))
-        win_fail("reserving the PS4 system-managed window",SYSTEM_LOW_MIN,SYSTEM_LOW_MAX-SYSTEM_LOW_MIN);
+        range_busy("the PS4 system-managed window",SYSTEM_LOW_MIN,SYSTEM_LOW_MAX);
     region_insert(0,(HostRegion){SYSTEM_LOW_MIN,SYSTEM_LOW_MAX,0,0});
 }
 static void view_map(const HostRegion *r, DWORD protect) {

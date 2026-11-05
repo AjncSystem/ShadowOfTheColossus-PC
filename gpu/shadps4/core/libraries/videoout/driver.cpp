@@ -507,7 +507,20 @@ void VideoOutDriver::Flip(const Request& req) {
                                             key & ((u64{1} << 60) - 1), op.ticks / ticks_per_ms,
                                             op.count);
                     }
+                    const auto eop_ms = [&](SotcStats::EopPart part) {
+                        return SotcStats::eop_ticks[part].load(std::memory_order_relaxed) /
+                               ticks_per_ms;
+                    };
+                    line += fmt::format(
+                        " | labels {} ({} deferred): fence {:.1f}, invalidate {:.1f}, flush {:.1f} ms",
+                        SotcStats::eop_ticks[SotcStats::EopLabels].load(),
+                        SotcStats::eop_ticks[SotcStats::EopDeferred].load(),
+                        eop_ms(SotcStats::EopFence), eop_ms(SotcStats::EopInvalidate),
+                        eop_ms(SotcStats::EopFlush));
                     slow_ops_lines.push_back(std::move(line));
+                }
+                for (auto& part : SotcStats::eop_ticks) {
+                    part.store(0, std::memory_order_relaxed);
                 }
             }
         }

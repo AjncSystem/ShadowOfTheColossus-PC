@@ -221,6 +221,20 @@ inline double TicksPerMs() {
     }();
     return value;
 }
+/// SOTC_SLOW_OPS: inside the end-of-pipe label ops of the frame (ticks): OnFence, the label's
+/// invalidate, the deferred label's flush; and labels deferred (a count).
+enum EopPart { EopFence, EopInvalidate, EopFlush, EopDeferred, EopLabels, EopParts };
+inline std::atomic<uint64_t> eop_ticks[EopParts]{};
+struct EopTimer {
+    EopPart part;
+    uint64_t start;
+    explicit EopTimer(EopPart p) : part{p}, start{kSlowOps ? __builtin_ia32_rdtsc() : 0} {}
+    ~EopTimer() {
+        if (kSlowOps) {
+            eop_ticks[part].fetch_add(__builtin_ia32_rdtsc() - start, std::memory_order_relaxed);
+        }
+    }
+};
 inline void NoteSlowOp(uint64_t key, uint64_t ticks) {
     std::scoped_lock lock{slow_ops_mutex};
     SlowOp& op = slow_ops[key];

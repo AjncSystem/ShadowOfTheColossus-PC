@@ -497,6 +497,7 @@ void Liverpool::SubmitDispatch(bool indirect, VAddr address, u32 offset, u32 siz
 }
 
 void Liverpool::WriteFenceValue(void* address, u64 data, u32 num_bytes) {
+    const SotcStats::EopTimer invalidate_timer{SotcStats::EopInvalidate};
     // The value is written to the backing memory directly (the GPU may target pages the guest
     // mapped read-only), which the memory tracker cannot see. Invalidate first so a copy of the
     // page already uploaded to the GPU is not reused with the old value, and so GPU-written data
@@ -1298,7 +1299,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     *reinterpret_cast<const PM4CmdEventWriteEop*>(header);
                 BackOrRun([this, eop_packet] {
                 const auto* event_eop = &eop_packet;
+                if (SotcStats::kSlowOps) {
+                    SotcStats::eop_ticks[SotcStats::EopLabels].fetch_add(1, std::memory_order_relaxed);
+                }
                 if (rasterizer) {
+                    const SotcStats::EopTimer fence_timer{SotcStats::EopFence};
                     rasterizer->OnFence();
                 }
                 // sotc: an end-of-pipe label means "the GPU finished everything before it". It
@@ -1329,7 +1334,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         LateLabelAdd(label);
                     }
                     // A GPU copy of the label's page must not be reused with the old value.
+                    if (SotcStats::kSlowOps) {
+                        SotcStats::eop_ticks[SotcStats::EopDeferred].fetch_add(
+                            1, std::memory_order_relaxed);
+                    }
                     if (eop.data_sel.Value() != DataSelect::None) {
+                        const SotcStats::EopTimer invalidate_timer{SotcStats::EopInvalidate};
                         rasterizer->InvalidateMemory(label, 8, true);
                     }
                     rasterizer->GetScheduler().DeferPriorityOperation([eop, label] {
@@ -1347,6 +1357,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     });
                     // Submit that work now: the game may wait for the label before it sends
                     // anything else, and nothing else would submit it.
+                    const SotcStats::EopTimer flush_timer{SotcStats::EopFlush};
                     rasterizer->Flush();
                     return;
                 }

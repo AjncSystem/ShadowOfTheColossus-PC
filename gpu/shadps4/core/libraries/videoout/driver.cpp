@@ -358,10 +358,12 @@ void VideoOutDriver::Flip(const Request& req) {
         }
     }
     // Update HDR status before presenting, and present the frame.
+    present_since_ns.store(SotcStats::NowNs(), std::memory_order_relaxed);
     RunPresentJob([frame = req.frame, hdr = req.port->is_hdr] {
         presenter->SetHDR(hdr);
         presenter->Present(frame);
     });
+    present_since_ns.store(0, std::memory_order_relaxed);
     SotcStats::flip_count.fetch_add(1, std::memory_order_relaxed);
     {
         // sotc: a performance line in the event log every minute (average FPS, frames slower
@@ -1160,14 +1162,37 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         port->submit_prev_index = index;
     }
 
-    std::scoped_lock lock{mutex};
+    const auto arrival = std::chrono::steady_clock::now();
+    // sotc: at most SOTC_FLIP_QUEUE (default 1) flips wait for the present thread. The early label
+    // above lets the game run ahead of a frame limit, so the waiting flips filled the whole frame
+    // pool, which follows the swapchain: with its 8 images every frame was shown 8 frames late
+    // (measured 266 ms at the 30 FPS cap, issue #128, from 0.70-opt12). The command processor waits
+    // here instead, as the game does on the PS4. Not while a present is stuck (NVIDIA blocks one up
+    // to ~140 ms every ~11 s): the deep pool is there to bridge that without a hitch; the backlog
+    // is gone a few frames later. 0: no limit, as before.
+    static const size_t flip_queue = [] {
+        const char* v = std::getenv("SOTC_FLIP_QUEUE");
+        return v && v[0] ? size_t(std::strtoul(v, nullptr, 10)) : size_t{1};
+    }();
+    std::unique_lock lock{mutex};
+    if (flip_queue != 0 && requests.size() >= flip_queue) {
+        constexpr u64 stuck_ns = 20'000'000;
+        const auto give_up = arrival + std::chrono::milliseconds(200); // paused, or shutting down
+        while (requests.size() >= flip_queue && std::chrono::steady_clock::now() < give_up) {
+            const u64 since = present_since_ns.load(std::memory_order_relaxed);
+            if (since != 0 && SotcStats::NowNs() - since > stuck_ns) {
+                break;
+            }
+            flip_taken_cv.wait_for(lock, std::chrono::milliseconds(2));
+        }
+    }
     requests.push({
         .frame = frame,
         .port = port,
         .flip_arg = flip_arg,
         .index = index,
         .eop = is_eop,
-        .arrival = std::chrono::steady_clock::now(),
+        .arrival = arrival,
     });
 }
 
@@ -1242,6 +1267,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         if (!requests.empty()) {
             const auto request = requests.front();
             requests.pop();
+            flip_taken_cv.notify_all();
             return request;
         }
         return {};

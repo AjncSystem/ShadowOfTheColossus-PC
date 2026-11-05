@@ -655,6 +655,8 @@ private:
     /// sotc: SOTC_POOL_WATCH=1: logs game page pool pages freed under images still in use.
     void PoolWatch();
     static bool PoolWatchEnabled();
+    /// sotc: SOTC_POOL_WATCH: an image the game freed pages under is looked up again (drawn).
+    void PoolWatchLookup(ImageId image_id, const Image& image);
 
     /// sotc: mip-tail images (SOTC_MIP_TAIL), see DecideRebase.
     bool IsSafeToDelete(const Image& image) const;

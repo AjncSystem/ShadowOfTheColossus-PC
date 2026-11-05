@@ -642,6 +642,16 @@ void VideoOutDriver::Flip(const Request& req) {
                              static_cast<unsigned long long>(SotcStats::vis_honest_labels.exchange(0)),
                              static_cast<unsigned long long>(SotcStats::vis_fallbacks.exchange(0)));
             }
+            if (const u64 queued = SotcStats::release_queued.exchange(0)) {
+                ReportPrintf(report,
+                             "SOTC RELEASE DEFER: %llu queued, %llu after the GPU, %llu at once; "
+                             "%llu blocks waiting\n",
+                             static_cast<unsigned long long>(queued),
+                             static_cast<unsigned long long>(SotcStats::release_done.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::release_forced.exchange(0)),
+                             static_cast<unsigned long long>(
+                                 SotcStats::release_pending_blocks.load()));
+            }
             if (SotcStats::kTexDirect) {
                 ReportPrintf(report,
                              "SOTC TEX DIRECT: %llu uploads read by the GPU in the game's memory "

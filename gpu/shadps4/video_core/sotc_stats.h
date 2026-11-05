@@ -331,6 +331,10 @@ inline std::atomic<uint64_t> images_new{0}, image_ns{0};
 inline std::atomic<uint64_t> image_query_ns{0}, image_alloc_ns{0}, image_dedicated{0};
 /// Video memory: usage the driver reports (texture cache GC), budget the GC works with, and the
 /// sparse buffer arena memory (never released) as allocations and bytes.
+/// SOTC_RELEASE_DEFER: unmap releases queued, released after the GPU, released at once (a bind
+/// used the blocks again), and the blocks still waiting (a gauge).
+inline std::atomic<uint64_t> release_queued{0}, release_done{0}, release_forced{0},
+    release_pending_blocks{0};
 inline std::atomic<uint64_t> vram_used{0}, vram_budget{0}, arena_allocs{0}, arena_bytes{0};
 /// Texture cache collector: ticks (one per submit with a frame's work), images freed and those
 /// written back to memory first, and the images in the cache with their (guest) size.

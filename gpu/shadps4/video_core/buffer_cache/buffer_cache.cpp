@@ -2041,6 +2041,8 @@ void BufferCache::ReleaseMemory(VAddr device_addr, u64 size) {
     ProcessPendingReleases();
     // The work recorded so far may still use the range: released once the GPU did it.
     pending_releases.push_back({first_block, end_block, scheduler.CurrentTick()});
+    SotcStats::release_queued.fetch_add(1, std::memory_order_relaxed);
+    SotcStats::release_pending_blocks.fetch_add(end_block - first_block, std::memory_order_relaxed);
 }
 
 void BufferCache::ProcessPendingReleases() {
@@ -2053,6 +2055,9 @@ void BufferCache::ProcessPendingReleases() {
             return false;
         }
         ReleaseBlocks(pending.first_block, pending.end_block, false);
+        SotcStats::release_done.fetch_add(1, std::memory_order_relaxed);
+        SotcStats::release_pending_blocks.fetch_sub(pending.end_block - pending.first_block,
+                                                    std::memory_order_relaxed);
         released = true;
         return true;
     });
@@ -2069,6 +2074,9 @@ void BufferCache::ForcePendingReleases(u64 first_block, u64 end_block) {
             return false;
         }
         ReleaseBlocks(pending.first_block, pending.end_block, !released);
+        SotcStats::release_forced.fetch_add(1, std::memory_order_relaxed);
+        SotcStats::release_pending_blocks.fetch_sub(pending.end_block - pending.first_block,
+                                                    std::memory_order_relaxed);
         released = true;
         return true;
     });

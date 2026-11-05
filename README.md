@@ -26,6 +26,8 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.72.1** | **Cards with less than 8 GB of video memory get a light profile automatically:** Maximum textures at mip 1 (without the 3 s bank linger, with the page pool safety switch), High at mip 2 as in 0.71, video memory use capped at Default, no staging reserve in video memory. 8 GB cards and up keep everything. **"Card memory" in the launcher's quick settings** (Play page): Automatic (by the card), Light or Full. |
+| **0.72** | **Improvements the 0.71 page pool fix made safe, now on by default:** fast GPU readbacks (~25% more FPS at the Shrine), sharper textures (finer mips: High mip 1, Maximum mip 0, with measured mips) and Maximum keeping texture banks 3 s, the heap guard shortcuts. **New upscaler: AMD FSR 4.1** (official AMD FSR SDK 2.4, Vulkan; FSR 4.1 on Radeon RX 6000/7000/9000, FSR 3.1 on other cards; experimental). **Play modes keep the grass as on PS4.** Fewer stutters at area changes (staging reserve, texture copies with fewer page faults), the right video memory budget on integrated GPUs, launcher fixes. |---|---|
 | **0.71** |
 🔧 Critical Fixes & Performance
 

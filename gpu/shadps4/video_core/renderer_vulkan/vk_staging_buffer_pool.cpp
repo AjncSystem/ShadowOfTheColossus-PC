@@ -98,7 +98,10 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
             best_offset = 0;
         } else {
             const SotcStats::FrameTimer frame_timer{SotcStats::FrameAlloc};
-            const SotcStats::AllocTrace alloc_trace{SotcStats::AllocStagingBlock, BlockSize()};
+            const SotcStats::AllocTrace alloc_trace{type == MemoryType::DeviceLocal
+                                                        ? SotcStats::AllocStagingBlockDevice
+                                                        : SotcStats::AllocStagingBlock,
+                                                    BlockSize()};
             best = &ring.blocks.emplace_back(Block{
                 .buffer = std::make_unique<VideoCore::StreamBuffer>(instance, scheduler, type,
                                                                     BlockSize()),
@@ -191,16 +194,36 @@ void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
 
 void StagingBufferPool::TickFrame() {
     ++frame;
-    // sotc: the first SOTC_STAGING_KEEP_MB (default 0) of each host-memory ring stay allocated.
-    // Trimmed after 300 idle frames, they were allocated again (~2 ms each) by the next
-    // streaming burst, inside the frame that needed them: 115 allocations in a 6-minute attract
-    // run. The device-local ring is still trimmed (video memory is short on 6 GB cards).
+    // sotc: the first SOTC_STAGING_KEEP_MB (default 128) of each host-memory ring and the first
+    // SOTC_STAGING_KEEP_VRAM_MB (default 64; 0 on GPUs with a video memory budget under 4 GB) of
+    // the device-local one stay allocated. Trimmed after 300 idle frames, they were allocated
+    // again by the next area change inside the frames that needed them: 11 blocks in 95 ms in
+    // one 5 s window (3 Nov, Pro + Maximum, video memory near its budget). The reserve is also
+    // made ahead, one block per frame, so the first area change finds it too.
     static const size_t keep_host_blocks = [] {
         const char* v = std::getenv("SOTC_STAGING_KEEP_MB");
-        return static_cast<size_t>((v ? std::strtoull(v, nullptr, 10) : 0ull) / (BlockSize() >> 20));
+        return static_cast<size_t>((v ? std::strtoull(v, nullptr, 10) : 128ull) /
+                                   (BlockSize() >> 20));
+    }();
+    static const size_t keep_device_blocks = [this] {
+        const char* v = std::getenv("SOTC_STAGING_KEEP_VRAM_MB");
+        const u64 fallback = instance.GetTotalMemoryBudget() >= (4ull << 30) ? 64ull : 0ull;
+        return static_cast<size_t>((v ? std::strtoull(v, nullptr, 10) : fallback) /
+                                   (BlockSize() >> 20));
     }();
     for (size_t type = 0; type < rings.size(); ++type) {
-        TrimRing(rings[type], type == u32(MemoryType::DeviceLocal) ? 0 : keep_host_blocks);
+        const size_t keep =
+            type == u32(MemoryType::DeviceLocal) ? keep_device_blocks : keep_host_blocks;
+        TrimRing(rings[type], keep);
+        Ring& ring = rings[type];
+        if (ring.blocks.size() < keep && frame > 60) {
+            const SotcStats::AllocTrace alloc_trace{SotcStats::AllocStagingKept, BlockSize()};
+            ring.blocks.emplace_back(Block{
+                .buffer = std::make_unique<VideoCore::StreamBuffer>(instance, scheduler,
+                                                                    MemoryType(type), BlockSize()),
+                .last_used_frame = frame,
+            });
+        }
     }
     for (auto& cache : large_caches) {
         TrimLarge(cache);

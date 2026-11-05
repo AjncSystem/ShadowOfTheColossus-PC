@@ -817,7 +817,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
         image.tick_accessed_last = scheduler.CurrentTick();
         TouchImage(image);
         if (PoolWatchEnabled()) {
-            PoolWatchLookup(memo_id, image);
+            PoolWatchLookup(memo_id, image, desc.view_info);
         }
         if (tail_candidate) {
             SetMipTailView(desc, -1);
@@ -917,7 +917,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     image.tick_accessed_last = scheduler.CurrentTick();
     TouchImage(image);
     if (PoolWatchEnabled()) {
-        PoolWatchLookup(image_id, image);
+        PoolWatchLookup(image_id, image, desc.view_info);
     }
 
     // If the image requested is a subresource of the image from cache record its location.
@@ -2029,13 +2029,26 @@ struct FreedUnder {
     u32 uploads;
     VAddr address;
     bool reused; ///< a page of it was given out again since
+    u32 freed_mips; ///< bit m: mip m overlaps a freed page
 };
+u32 MipsInPage(const Image& image, VAddr page, u64 bytes) {
+    u32 mask = 0;
+    for (u32 m = 0; m < image.info.resources.levels && m < 16; ++m) {
+        const auto& mip = image.info.mips_layout[m];
+        const VAddr start = image.info.guest_address + mip.offset;
+        if (mip.size && start < page + bytes && page < start + mip.size) {
+            mask |= 1u << m;
+        }
+    }
+    return mask;
+}
 std::mutex g_freed_under_mutex;
 std::unordered_map<u32, FreedUnder> g_freed_under;
 std::atomic<u64> g_drawn_after_free{0}, g_drawn_after_reuse{0};
 } // namespace
 
-void TextureCache::PoolWatchLookup(ImageId image_id, const Image& image) {
+void TextureCache::PoolWatchLookup(ImageId image_id, const Image& image,
+                                   const ImageViewInfo& view) {
     std::scoped_lock lock{g_freed_under_mutex};
     if (g_freed_under.empty()) {
         return;
@@ -2056,12 +2069,16 @@ void TextureCache::PoolWatchLookup(ImageId image_id, const Image& image) {
     if (logged++ < 150) {
         std::fprintf(stderr,
                      "SOTC POOLWATCH DRAWN AFTER FREE image %#llx %ux%u %s: %llu ticks after the "
-                     "game freed pages under it, pages given out again %s, uploads since %u\n",
+                     "game freed pages under it, pages given out again %s, uploads since %u; "
+                     "mips %u (first %u), freed mips 0x%x, drawn mips %u..%u\n",
                      static_cast<unsigned long long>(image.info.guest_address),
                      image.info.size.width, image.info.size.height,
                      vk::to_string(image.info.pixel_format).c_str(),
                      static_cast<unsigned long long>(tick - it->second.tick),
-                     it->second.reused ? "yes" : "no", image.sotc_uploads - it->second.uploads);
+                     it->second.reused ? "yes" : "no", image.sotc_uploads - it->second.uploads,
+                     image.info.resources.levels, image.info.sotc_first_mip,
+                     it->second.freed_mips, u32(view.range.base.level),
+                     u32(view.range.base.level + view.range.extent.levels - 1));
     }
     g_freed_under.erase(it);
 }
@@ -2150,9 +2167,10 @@ void TextureCache::PoolWatch() {
                 {
                     std::scoped_lock freed_lock{g_freed_under_mutex};
                     if (g_freed_under.size() < 100000) {
-                        g_freed_under.try_emplace(id.index, FreedUnder{tick, image.sotc_uploads,
-                                                                       image.info.guest_address,
-                                                                       false});
+                        auto [f, fresh] = g_freed_under.try_emplace(
+                            id.index, FreedUnder{tick, image.sotc_uploads,
+                                                 image.info.guest_address, false, 0});
+                        f->second.freed_mips |= MipsInPage(image, addr, PageBytes);
                     }
                 }
                 {

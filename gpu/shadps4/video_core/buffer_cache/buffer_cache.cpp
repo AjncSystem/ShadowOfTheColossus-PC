@@ -2020,6 +2020,7 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateArenaBlocks(u64 blocks) {
         }
         return std::nullopt;
     };
+    vk::Result last_result = vk::Result::eSuccess;
     const auto grow = [&](u32 memory_type, bool exact = false)
         -> std::optional<std::pair<vk::DeviceMemory, u64>> {
         // exact: only the asked size, for a nearly full card that has no 64 MiB left (#137).
@@ -2030,6 +2031,7 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateArenaBlocks(u64 blocks) {
         };
         const auto [result, memory] = instance.GetDevice().allocateMemory(alloc_info);
         if (result != vk::Result::eSuccess) {
+            last_result = result;
             return std::nullopt;
         }
         SotcStats::arena_allocs.fetch_add(1, std::memory_order_relaxed);
@@ -2083,6 +2085,13 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateArenaBlocks(u64 blocks) {
             return *placed;
         }
     }
+    // sotc: why the driver refused (a 1.3 MB request with half the video memory free, 12 GB card,
+    // 15 GB of RAM: AjncSystem #385). Windows refuses allocations when the commit limit (RAM + page
+    // file) is reached, whatever the card has free.
+    LOG_CRITICAL(Render, "Arena allocation of {} KB refused: {}; in use {} MB of {} MB",
+                 (blocks << block_shift) >> 10, vk::to_string(last_result),
+                 instance.GetDeviceMemoryUsage() >> 20, SotcStats::vram_budget.load() >> 20);
+    SotcStats::LogSystemMemory();
     LOG_CRITICAL(Render, "Out of video and system memory for buffers; lower the video memory use "
                          "setting in the launcher (Economy)");
     ASSERT_MSG(false, "Failed to allocate buffer arena memory");

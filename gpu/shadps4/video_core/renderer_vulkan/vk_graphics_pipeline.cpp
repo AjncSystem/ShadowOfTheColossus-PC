@@ -484,10 +484,24 @@ void GraphicsPipeline::GetVertexInputs(
         const auto& attrib = fetch_shader.attributes[semantic];
         const auto step_rate = attrib.GetStepRate();
         const auto buffer = attrib.GetSharp(vs_info);
+        const auto format = LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt());
+        // sotc: SOTC_FORMAT_LOG=1: a vertex format the driver cannot fetch (AMD legacy driver)
+        static const bool format_log = [] {
+            const char* v = std::getenv("SOTC_FORMAT_LOG");
+            return v && v[0] == '1';
+        }();
+        if (format_log && !instance.IsFormatSupported(format, vk::FormatFeatureFlagBits2::eVertexBuffer)) {
+            static std::atomic<u32> logged{0};
+            if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+                std::fprintf(stderr, "SOTC FORMAT unsupported vertex attribute: %s (data %u, number %u, stride %u)\n",
+                             vk::to_string(format).c_str(), u32(buffer.GetDataFmt()),
+                             u32(buffer.GetNumberFmt()), u32(buffer.GetStride()));
+            }
+        }
         attributes.push_back(Attribute{
             .location = semantic,
             .binding = semantic,
-            .format = LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt()),
+            .format = format,
             .offset = 0,
         });
         bindings.push_back(Binding{

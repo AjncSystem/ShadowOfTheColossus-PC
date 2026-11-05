@@ -3,6 +3,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <set>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -882,6 +884,7 @@ void Instance::CollectPhysicalMemoryInfo() {
     total_memory_budget = 0;
     u64 device_initial_usage = 0;
     u64 local_memory = 0;
+    u64 local_budget = 0; // sotc: the device-local heaps' own budget (integrated GPUs below)
     for (size_t i = 0; i < num_props; ++i) {
         const bool is_device_local =
             (memory_props.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) !=
@@ -897,7 +900,13 @@ void Instance::CollectPhysicalMemoryInfo() {
         if (supports_memory_budget) {
             device_initial_usage += budget.heapUsage[i];
             total_memory_budget += budget.heapBudget[i];
+            if (is_device_local) {
+                local_budget += budget.heapBudget[i];
+            }
             continue;
+        }
+        if (is_device_local) {
+            local_budget += memory_props.memoryHeaps[i].size;
         }
         // If memory budget is not supported, use the size of the heap as the budget.
         total_memory_budget += memory_props.memoryHeaps[i].size;
@@ -912,6 +921,18 @@ void Instance::CollectPhysicalMemoryInfo() {
     const s64 available_memory = static_cast<s64>(total_memory_budget - device_initial_usage);
     total_memory_budget =
         static_cast<u64>(std::max<s64>(available_memory - 8_GB, static_cast<s64>(2_GB)));
+    // sotc: but never below the memory the BIOS set aside for the GPU (the device-local heap): it is
+    // the GPU's anyway, Windows does not get it. A Ryzen 7 5700U (16 GB, 4 GB for the GPU) got the
+    // 2 GB floor while the game holds 3.4-3.6 GB of textures: emergency collections all the time,
+    // 12-16 FPS, textures dropped and loaded again. SOTC_IGPU_BUDGET_MB=<n> sets it by hand.
+    const u64 reserved = local_budget > device_initial_usage ? local_budget - device_initial_usage : 0;
+    total_memory_budget = std::max<u64>(total_memory_budget, reserved);
+    if (const char* v = std::getenv("SOTC_IGPU_BUDGET_MB"); v && std::atoll(v) > 0) {
+        total_memory_budget = static_cast<u64>(std::atoll(v)) << 20;
+    }
+    std::fprintf(stderr, "GPU: integrated, video memory budget %llu MiB (GPU's own heap %llu MiB)\n",
+                 static_cast<unsigned long long>(total_memory_budget >> 20),
+                 static_cast<unsigned long long>(local_budget >> 20));
 }
 
 void Instance::CollectImageFormatInfo() {
@@ -1025,8 +1046,40 @@ vk::Format Instance::GetSupportedFormat(const vk::Format format,
                 return vk::Format::eR8G8Unorm;
             }
             break;
+        // sotc: SOTC_FORMAT_FALLBACK=1 (experimental, AMD GCN on the legacy driver 2.0.279: Wander
+        // white, Agro black): the 10:10:10:2 signed formats it cannot sample nor render to, as
+        // 16 bits per channel. Right for images the GPU writes and reads; an image filled from
+        // guest memory would need its texels converted (4 -> 8 bytes), which is not done.
+        case vk::Format::eA2B10G10R10SnormPack32:
+        case vk::Format::eA2B10G10R10SintPack32: {
+            static const bool fallback = [] {
+                const char* v = std::getenv("SOTC_FORMAT_FALLBACK");
+                return v && v[0] == '1';
+            }();
+            const auto wide = format == vk::Format::eA2B10G10R10SnormPack32 ? vk::Format::eR16G16B16A16Snorm
+                                                                          : vk::Format::eR16G16B16A16Sint;
+            if (fallback && IsFormatSupported(wide, flags)) {
+                return wide;
+            }
+            break;
+        }
         default:
             break;
+        }
+        // sotc: SOTC_FORMAT_LOG=1: each unsupported format the game uses, once per feature set
+        static const bool log = [] {
+            const char* v = std::getenv("SOTC_FORMAT_LOG");
+            return v && v[0] == '1';
+        }();
+        if (log) {
+            static std::mutex mutex;
+            static std::set<std::pair<u32, u64>> seen;
+            std::scoped_lock lock{mutex};
+            if (seen.emplace(u32(format), u64(flags)).second) {
+                std::fprintf(stderr, "SOTC FORMAT unsupported: %s for %s (missing %s)\n",
+                             vk::to_string(format).c_str(), vk::to_string(flags).c_str(),
+                             vk::to_string(flags & ~GetFormatFeatureFlags(format)).c_str());
+            }
         }
     }
     return format;

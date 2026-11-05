@@ -16,6 +16,7 @@ import os
 import platform
 from pathlib import Path
 import queue
+import re
 import runpy
 import shutil
 import subprocess
@@ -47,7 +48,7 @@ CONFIG_FILE = CONFIG_DIR / 'launcher_settings.json'
 from sotc_modes import GAMES  # noqa: E402
 GAME_ID = 'CUSA08809'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.71-opt13'
+VERSION = '0.72.1-opt13'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -174,7 +175,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'fx_motionblur': False, 'engine_cvars': '', 'perf_culling': True,
-                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'volume': '100', 'shadow_reuse': '0', 'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1', 'weed_distance': '1', 'weed_height': '1', 'grass_fade': '1', 'grass_detail': '0.25', 'library_dirs': [], 'keys': {},
+                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'vram_profile': 'auto', 'gpu_vram_mb': 0, 'volume': '100', 'shadow_reuse': '0', 'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1', 'weed_distance': '1', 'weed_height': '1', 'grass_fade': '1', 'grass_detail': '1', 'library_dirs': [], 'keys': {},
                 'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'fg_hudless': True,
                 'dlss_mode': 'quality', 'dlss_sharpen': '0', 'dlss_ui_sharpen': '3', 'dlss_sky_sharpen': '2',
                 'dlss_compare': False, 'hdr_sdr': False,
@@ -186,6 +187,9 @@ DEFAULT_UPGRADES = [
     # HUD and letters stop shaking with frame generation; no shadow trail in dark areas (motion
     # blur); straight to the game.
     ('0.71', {'fg_hudless': True, 'fx_motionblur': False, 'skip_logos': True}),
+    # Fast GPU readbacks; the grass back as on PS4 (the play modes no longer change it).
+    ('0.72', {'rb_hot': True, 'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1',
+              'weed_distance': '1', 'weed_height': '1', 'grass_fade': '1', 'grass_detail': '1'}),
 ]
 # Keyboard bindings (src/runtime_pad.c): PS4 input, its default SDL key name, label.
 KEY_INPUTS = [
@@ -220,6 +224,24 @@ VRAM_USE = [('low', ('Econômico (placas de 4–6 GB)', 'Economy (4–6 GB cards
             ('normal', ('Padrão', 'Default')),
             ('high', ('Alto (placas de 8–12 GB)', 'High (8–12 GB cards)')),
             ('max', ('Máximo (placas de 16 GB ou mais)', 'Maximum (16 GB cards or more)'))]
+# Video memory profile (game_environment): the 0.72 texture improvements (Maximum at mip 0 with
+# banks kept 3 s and no page pool switch, High at mip 1) used 5-7 GB on an 8 GB card; cards with
+# less than 8 GB get the lighter set. Auto decides from the card the launcher found (gpu_vram_mb).
+VRAM_PROFILES = [('auto', ('Automático (pela placa)', 'Automatic (by the card)')),
+                 ('light', ('Leve (placas de até 6 GB)', 'Light (cards up to 6 GB)')),
+                 ('full', ('Completo (placas de 8 GB ou mais)', 'Full (8 GB cards or more)'))]
+LIGHT_VRAM_BELOW_MB = 7500
+
+
+def light_vram(s):
+    """The lighter texture set: chosen, or Auto on a card with less than 8 GB."""
+    profile = s.get('vram_profile') or 'auto'
+    if profile != 'auto':
+        return profile == 'light'
+    mb = int(s.get('gpu_vram_mb') or 0)
+    return 0 < mb < LIGHT_VRAM_BELOW_MB
+
+
 # Far sun shadows drawn on alternate frames (SOTC_SHADOW_REUSE): more FPS, but they may blink (#178).
 SHADOW_REUSE = [('0', ('Desligado (sombras sem piscar)', 'Off (no blinking shadows)')),
                 ('1', ('Ligado (mais FPS; sombras distantes podem piscar)', 'On (more FPS; far shadows may blink)')),
@@ -265,25 +287,25 @@ PLAY_MODES = [('normal', ('Normal (PS4 puro)', 'Normal (plain PS4)')),
               ('pro', ('Pro (PS4 Pro + qualidade)', 'Pro (PS4 Pro + quality)')),
               ('extreme', ('Extremo (tudo no máximo)', 'Extreme (everything maxed)')),
               ('custom', ('Personalizado', 'Custom'))]
+# The play modes keep the grass as on PS4 (user's choice, 3 Nov): the grass options are left to Custom.
 _PS4_GRASS = {'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1', 'weed_distance': '1',
-              'weed_height': '1', 'grass_fade': '1'}
+              'weed_height': '1', 'grass_fade': '1', 'grass_detail': '1'}
 PLAY_MODE_VALUES = {
     'normal': {'neo': False, 'fps_mode': '30', 'textures': 'high', 'af16': False, 'upscaler': 'fsr1',
-               'sharpness': '250', 'vram_use': 'normal', **_PS4_GRASS, 'grass_detail': '1'},
+               'sharpness': '250', 'vram_use': 'normal', **_PS4_GRASS},
     'pro': {'neo': True, 'fps_mode': '30', 'textures': 'high', 'af16': True, 'vram_use': 'high',
-            **_PS4_GRASS, 'grass_detail': '0.25'},
+            **_PS4_GRASS},
     'extreme': {'neo': True, 'fps_mode': '60', 'textures': 'max', 'af16': True, 'vram_use': 'max',
-                'grass_shadows': '3', 'grass_distance': '2', 'grass_height': '1', 'weed_distance': '2',
-                'weed_height': '1', 'grass_fade': '1', 'grass_detail': '0.15', 'dlss_mode': 'quality'},
+                **_PS4_GRASS, 'dlss_mode': 'quality'},
 }
 PLAY_MODE_HINTS = {
     'normal': ('Como no PS4: 30 FPS, texturas altas, grama e sombras do console, sem o modo Pro.',
                "As on PS4: 30 FPS, high textures, the console's grass and shadows, no Pro mode."),
-    'pro': ('Modo PS4 Pro a 30 FPS com texturas altas, filtro 16x e grama mais cheia.',
-            'PS4 Pro mode at 30 FPS with high textures, 16x filtering and fuller grass.'),
-    'extreme': ('Modo Pro a 60 FPS, texturas máximas, sombras e grama até mais longe, DLSS na RTX. '
+    'pro': ('Modo PS4 Pro a 30 FPS com texturas altas e filtro 16x; grama como no PS4.',
+            'PS4 Pro mode at 30 FPS with high textures and 16x filtering; grass as on PS4.'),
+    'extreme': ('Modo Pro a 60 FPS, texturas máximas, DLSS na RTX; grama como no PS4. '
                 'Pede uma placa forte (8 GB ou mais).',
-                'Pro mode at 60 FPS, maximum textures, shadows and grass farther out, DLSS on RTX. '
+                'Pro mode at 60 FPS, maximum textures, DLSS on RTX; grass as on PS4. '
                 'Needs a strong card (8 GB or more).'),
     'custom': ('Os ajustes abaixo e as outras abas ficam como você deixar.',
                'The settings below and the other tabs stay as you set them.'),
@@ -333,6 +355,10 @@ OUTPUTS = [('1280x720', ('1280 × 720 (16:9, 720p)', '1280 × 720 (16:9, 720p)')
     (size, (f"{size.replace('x', ' × ')} ({label})",) * 2) for size, label in SCREENS]
 UPSCALERS = [('fsr1', ('FSR 1 (AMD, qualquer placa)', 'FSR 1 (AMD, any GPU)')),
              ('dlss', ('NVIDIA DLSS (experimental)', 'NVIDIA DLSS (experimental)')),
+             # AMD FSR SDK 2.4 (bb-probe: SOTC_UPSCALER=fsr4, vk_fsr4.cpp): FSR 4.1 on Radeon RX
+             # 6000/7000/9000, FSR 3.1 on the other cards; render sizes as DLSS's.
+             ('fsr4', ('AMD FSR 4.1 (RX 6000+; FSR 3.1 nas outras, experimental)',
+                       'AMD FSR 4.1 (RX 6000+; FSR 3.1 on others, experimental)')),
              ('bilinear', ('Bilinear (simples)', 'Bilinear (plain)'))]
 # Button icons in the game: the PlayStation prompts, or Xbox ones drawn for the port
 # (tools/make_button_icons.py, glyphs/xbox) put in place of the game's textures.
@@ -540,9 +566,11 @@ def start_event_log(log_dir, settings, env):
         _('Windows {} | jogo: {}', 'Windows {} | game: {}').format(platform.version(), settings.get('game_dir') or '?'),
         _('Saída: {} | Upscaler: {} | Nitidez: {}', 'Output: {} | Upscaler: {} | Sharpening: {}').format(
             words(OUTPUTS, 'output_res', '1920x1080'), words(UPSCALERS, 'upscaler', 'fsr1'), words(SHARPNESS, 'sharpness', '250')),
-        _('FPS: {} | Texturas: {} | Filtro 16x: {} | Modo PS4 Pro: {}', 'FPS: {} | Textures: {} | 16x filtering: {} | PS4 Pro mode: {}').format(
+        _('FPS: {} | Texturas: {} | Filtro 16x: {} | Modo PS4 Pro: {} | Memória da placa: {} ({})',
+          'FPS: {} | Textures: {} | 16x filtering: {} | PS4 Pro mode: {} | Card memory: {} ({})').format(
             words(FPS_MODES, 'fps_mode', '30'), words(TEXTURES, 'textures', 'high'), on_off(settings.get('af16')),
-            on_off(env.get('SOTC_NEO') == '1')),
+            on_off(env.get('SOTC_NEO') == '1'), words(VRAM_PROFILES, 'vram_profile', 'auto'),
+            _('leve', 'light') if light_vram(settings) else _('completo', 'full')),
         _('Geração de quadros: {} | Memória de vídeo: {} | Sombras distantes: {} | Volume: {}%',
           'Frame generation: {} | Video memory use: {} | Far shadows: {} | Volume: {}%').format(
             words(FRAMEGEN, 'framegen', 'off'), words(VRAM_USE, 'vram_use', 'normal'),
@@ -794,7 +822,13 @@ def game_environment(s):
         env['SOTC_FLUSH_US'], env['SOTC_RB_AHEAD'] = '1000', '1'
     elif s.get('gpu_submit') == 'off':
         env['SOTC_FLUSH_EVERY'], env['SOTC_RB_AHEAD'] = '0', '0'
-    env['SOTC_VRAM_GC_PERCENT'], env['SOTC_ARENA_EVICT_MB'] = VRAM_LIMITS.get(s.get('vram_use'), VRAM_LIMITS['normal'])
+    light = light_vram(s)
+    vram_use = s.get('vram_use')
+    if light and vram_use in ('high', 'max'):
+        vram_use = 'normal'  # sotc: "High"/"Maximum" (Extreme mode) hold more than such a card has
+    env['SOTC_VRAM_GC_PERCENT'], env['SOTC_ARENA_EVICT_MB'] = VRAM_LIMITS.get(vram_use, VRAM_LIMITS['normal'])
+    if light:
+        env.setdefault('SOTC_STAGING_KEEP_VRAM_MB', '0')
     env['SOTC_VOLUME'] = str(s.get('volume') or '100')
     # The in-game menu's quick settings are written back here (bbport_overlay.cpp).
     env['SOTC_LAUNCHER_SETTINGS'] = str(CONFIG_FILE)
@@ -813,13 +847,30 @@ def game_environment(s):
     textures = s.get('textures') or 'high'
     if textures != 'off':
         env.setdefault('SOTC_LOD_LINGER', '1')
+        # sotc: what the page pool's double free (fixed in 0.71, SOTC_POOL_OWNER) had held back,
+        # tested on 3 Nov (Time Attack, every colossus, Maximum + PS4 Pro, no crash nor mosaic):
+        # the measured mips, finer mips (High 1, Maximum 0, both were 2) and, on Maximum, banks
+        # kept sampled for 3 s (they had exhausted the pool, 0x1a371).
+        env.setdefault('SOTC_LOD_FEEDBACK', '1')
+        # Light video memory profile (cards under 8 GB): Maximum at mip 1 without the 3 s, High at
+        # mip 2 as in 0.71.
+        if light:
+            env.setdefault('SOTC_LOD_LEVEL', '1' if textures == 'max' else '2')
+        else:
+            env.setdefault('SOTC_LOD_LEVEL', '0' if textures == 'max' else '1')
+        if textures == 'max' and not light:
+            env['SOTC_LOD_LINGER'] = env.get('SOTC_LOD_LINGER') if env.get('SOTC_LOD_LINGER') != '1' else '180'
+    # sotc: the heap guard's two shortcuts, off since 0.70 for the 0x49800 crash, which came from
+    # the same double free: on again (tested with the above).
+    env.setdefault('SOTC_GUARD_STALE', '1')
+    env.setdefault('SOTC_GUARD_USER_POINTER', '1')
     # sotc: "Maximum" in PS4 Pro mode exhausted the game's page pool within minutes at the Shrine
     # (0x1a371, 22 Oct) until tabnul's page allocator fix (PR #288, sotc_modes.py POOL_FIX): an
     # hour without a crash with it (26 Oct). Experimental there; SOTC_MAX_IN_PRO=0 brings back High.
     if 'SOTC_MAX_IN_PRO=0' in str(s.get('extra_env', '')) and textures == 'max' and env['SOTC_NEO'] == '1':
         textures = 'high'
         env['SOTC_NOTE'] = 'Texture quality Maximum is not used in PS4 Pro mode: High'
-    if textures == 'max':  # sotc: without the page pool switch (sotc_lod_stats.h)
+    if textures == 'max' and not light:  # sotc: without the page pool switch (sotc_lod_stats.h)
         env.setdefault('SOTC_LOD_POOL_LOW', '0')
     if s.get('button_icons') == 'xbox' and (PORT_DIR / 'glyphs' / 'xbox').is_dir():
         env['SOTC_TEX_REPLACE'] = str(PORT_DIR / 'glyphs' / 'xbox')
@@ -828,15 +879,15 @@ def game_environment(s):
     # its own sizes.
     output = env['SOTC_OUTPUT_RES']
     upscaler = s.get('upscaler', 'fsr1')
-    if upscaler == 'dlss' and env['SOTC_NEO'] == '0':
+    if upscaler in ('dlss', 'fsr4') and env['SOTC_NEO'] == '0':
         env['SOTC_RENDER_RES'] = dlss_render(output, s.get('dlss_mode'))
     elif output not in ('1280x720', '1920x1080') and env['SOTC_NEO'] == '0':
         env['SOTC_RENDER_RES'] = output
     # DLSS: FSR 1 stays the upscaler of frames without the game's scene (menus) and the fallback
     # without an RTX card or the NVIDIA DLLs.
-    env['BB_FSR1'] = '1' if upscaler in ('fsr1', 'dlss') else '0'
-    if upscaler == 'dlss':
-        env['SOTC_UPSCALER'] = 'dlss'
+    env['BB_FSR1'] = '1' if upscaler in ('fsr1', 'dlss', 'fsr4') else '0'
+    if upscaler in ('dlss', 'fsr4'):
+        env['SOTC_UPSCALER'] = upscaler
         env['SOTC_DLSS_SHARPEN'] = str(s.get('dlss_sharpen') or '0')
         env['SOTC_DLSS_UI_SHARPEN'] = str(s.get('dlss_ui_sharpen') or '3')
         env['SOTC_DLSS_SKY_SHARPEN'] = str(s.get('dlss_sky_sharpen') or '2')
@@ -854,7 +905,7 @@ def game_environment(s):
     env['SOTC_MOUSE_SENS'] = str(s.get('mouse_sens') or '1.0')
     env['SOTC_MOUSE_INVERT'] = '1' if s.get('mouse_invert') else '0'
     # Hot readbacks (buffer_cache.cpp GatherDownloads): ~25% more FPS at the Shrine. On by default
-    # in this fork: the late check and per-page region locks keep them off reused memory.
+    # (in upstream too since 0.72): the late check and per-page region locks keep them off reused memory.
     env['SOTC_RB_HOT'] = '1' if s.get('rb_hot', True) else '0'
     # Bluepoint's debug menu (+RetailBuild=0 served by the port; the game files are not touched).
     if s.get('debug_menu'):
@@ -868,9 +919,11 @@ def game_environment(s):
         env['SOTC_RUMBLE'] = '0'
     env['BB_CONFIG'] = str(PORT_DIR / 'sotc.ini')
     for item in str(s['extra_env']).split():
+        item = item.strip().lstrip('=')  # "=KEY=1" typed by mistake still sets KEY
         if '=' in item:
             key, value = item.split('=', 1)
-            env[key] = value
+            if key:
+                env[key] = value
     env['PYTHONUNBUFFERED'] = '1'
     env['PYTHONIOENCODING'] = 'utf-8'
     return env
@@ -1422,12 +1475,18 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         self.row(quick, _('Geração de quadros', 'Frame generation'), self.choice(quick, 'framegen', FRAMEGEN, 24))
         self.row(quick, _('FPS', 'FPS'), self.choice(quick, 'fps_mode', FPS_MODES, 24))
         self.row(quick, _('Texturas', 'Textures'), self.choice(quick, 'textures', TEXTURES, 24))
+        self.row(quick, _('Memória da placa', 'Card memory'), self.choice(quick, 'vram_profile', VRAM_PROFILES, 24))
+        self.vram_profile_hint = ttk.Label(quick, text='', style='Muted.TLabel', wraplength=self.px(300),
+                                           justify='left')
+        self.vram_profile_hint.grid(row=self.next_row(quick), column=0, columnspan=2, sticky='w', pady=(0, 2))
+        self.var('vram_profile').trace_add('write', lambda *_a: self.show_vram_profile_hint())
+        self.show_vram_profile_hint()
         self.check(quick, 'af16', _('Texturas nítidas (filtro 16x)', 'Sharp textures (16x filtering)'))
         self.check(quick, 'hdr', _('HDR (HDR do Windows ligado)', 'HDR (Windows HDR on)'))
         self.check(quick, 'fullscreen', _('Tela cheia', 'Fullscreen'))
         self.check(quick, 'neo', _('Modo PS4 Pro', 'PS4 Pro mode'))
-        self.check(quick, 'rb_hot', _('Mais FPS: leituras rápidas da GPU (experimental)',
-                                      'More FPS: fast GPU readbacks (experimental)'))
+        self.check(quick, 'rb_hot', _('Mais FPS: leituras rápidas da GPU',
+                                      'More FPS: fast GPU readbacks'))
         for key in ('af16', 'textures', 'fps_mode', 'hdr', 'fullscreen', 'neo', 'output_res', 'upscaler', 'sharpness', 'framegen'):
             self.vars[key].trace_add('write', lambda *_a: self.refresh_status())
         self.applying_mode = False
@@ -1442,6 +1501,22 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
             name = getattr(self, 'gpu_name', '').upper()
             values['upscaler'] = 'dlss' if 'NVIDIA' in name and 'RTX' in name else 'fsr1'
         return values
+
+    def show_vram_profile_hint(self):
+        """What the video memory profile does with the card found."""
+        if not hasattr(self, 'vram_profile_hint'):
+            return
+        mb = int(self.app.get('gpu_vram_mb') or 0)
+        card = (_('placa com {:.0f} GB', 'card with {:.0f} GB').format(mb / 1024) if mb
+                else _('placa ainda não verificada', 'card not checked yet'))
+        current = dict(self.app, vram_profile=self.var('vram_profile').get())
+        if light_vram(current):
+            text = _('Leve ({}): Máxima no mip 1, Alta no mip 2, memória de vídeo no máximo Padrão.',
+                     'Light ({}): Maximum at mip 1, High at mip 2, video memory at most Default.').format(card)
+        else:
+            text = _('Completo ({}): Máxima no mip 0 e todas as melhorias de textura.',
+                     'Full ({}): Maximum at mip 0 and every texture improvement.').format(card)
+        self.vram_profile_hint.configure(text=text)
 
     def show_play_mode_hint(self):
         self.play_mode_hint.configure(text=_(*PLAY_MODE_HINTS.get(self.var('play_mode').get(), ('', ''))))
@@ -1640,13 +1715,16 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         self.row(f, _('Upscaler', 'Upscaler'), self.choice(f, 'upscaler', UPSCALERS),
                  _('FSR 1 amplia com bordas nítidas (quando o jogo renderiza menor que a saída).', 'FSR 1 upscales with sharp edges (when the game renders smaller than the output).'))
         self.row(f, _('Nitidez (RCAS)', 'Sharpening (RCAS)'), self.choice(f, 'sharpness', SHARPNESS))
-        self.section(f, _('NVIDIA DLSS', 'NVIDIA DLSS'))
-        self.note(f, _('Com o upscaler DLSS (placas RTX): o jogo renderiza menor e o DLSS amplia com detalhe '
-                       'reconstruído dos quadros anteriores. Sem placa RTX ou sem os arquivos da NVIDIA, o FSR 1 '
-                       'amplia a mesma imagem menor.',
-                       'With the DLSS upscaler (RTX cards): the game renders smaller and DLSS enlarges it with '
-                       'detail rebuilt from earlier frames. Without an RTX card or the NVIDIA files, FSR 1 '
-                       'enlarges the same smaller image.'), top=2)
+        self.section(f, _('NVIDIA DLSS e AMD FSR 4', 'NVIDIA DLSS and AMD FSR 4'))
+        self.note(f, _('Com o upscaler DLSS (placas RTX) ou AMD FSR 4.1: o jogo renderiza menor e o upscaler amplia '
+                       'com detalhe reconstruído dos quadros anteriores. O FSR 4.1 (inteligência artificial) roda nas '
+                       'Radeon RX 6000, 7000 e 9000; nas outras placas o mesmo item usa o FSR 3.1. Sem a placa ou '
+                       'sem os arquivos, o FSR 1 amplia a mesma imagem menor. Os ajustes abaixo valem para os dois.',
+                       'With the DLSS upscaler (RTX cards) or AMD FSR 4.1: the game renders smaller and the upscaler '
+                       'enlarges it with detail rebuilt from earlier frames. FSR 4.1 (machine learning) runs on '
+                       'Radeon RX 6000, 7000 and 9000; on other cards the same item uses FSR 3.1. Without the card '
+                       'or the files, FSR 1 enlarges the same smaller image. The settings below apply to both.'),
+                  top=2)
         self.row(f, _('Modo', 'Mode'), self.choice(f, 'dlss_mode', DLSS_MODES),
                  _('Fator entre a saída e o tamanho renderizado. DLAA: tamanho nativo com o anti-aliasing do '
                    'DLSS (mais pesado, imagem mais nítida).',
@@ -1920,8 +1998,11 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         ttk.Button(holder, text=_('Atalho na área de trabalho', 'Desktop shortcut'), command=self.shortcut).pack(side='left')
         ttk.Button(holder, text=_('Atalho para jogar direto', 'Shortcut that starts the game'),
                    command=lambda: self.shortcut(play=True)).pack(side='left', padx=(6, 0))
-        ttk.Button(holder, text=_('Pasta do port', 'Port folder'), command=lambda: self.open_path(PORT_DIR)).pack(side='left', padx=6)
-        ttk.Button(holder, text=_('Limpar cache de shaders', 'Clear shader cache'), command=self.clear_cache).pack(side='left')
+        # A second row: on a narrow window (a laptop) the fourth button fell off the window's edge.
+        holder = ttk.Frame(f)
+        holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(6, 0))
+        ttk.Button(holder, text=_('Pasta do port', 'Port folder'), command=lambda: self.open_path(PORT_DIR)).pack(side='left')
+        ttk.Button(holder, text=_('Limpar cache de shaders', 'Clear shader cache'), command=self.clear_cache).pack(side='left', padx=(6, 0))
         self.section(f, _('Diagnóstico', 'Diagnostics'))
         self.check(f, 'show_fps', _('FPS no registro (a cada 5 s)', 'FPS in the log (every 5 s)'))
         self.check(f, 'dlss_compare', _('Comparar DLSS com FSR 1 (F9)', 'Compare DLSS with FSR 1 (F9)'),
@@ -2001,7 +2082,7 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
     def summary(self):
         parts = [dict((k, _(*v)) for k, v in FPS_MODES).get(self.var('fps_mode').get(), '30 FPS'),
                  self.var('output_res').get().replace('x', ' × '),
-                 {'fsr1': 'FSR 1', 'dlss': 'DLSS'}.get(self.var('upscaler').get(), 'bilinear')]
+                 {'fsr1': 'FSR 1', 'dlss': 'DLSS', 'fsr4': 'FSR 4'}.get(self.var('upscaler').get(), 'bilinear')]
         framegen = self.var('framegen').get()
         if framegen != 'off':
             parts.append({'auto': _('geração de quadros', 'frame generation'), 'dlss': 'DLSS-G',
@@ -2031,6 +2112,10 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
             names = [line[5:].split(':')[0] for line in result.stderr.splitlines() if line.startswith('GPU: ')]
             if names:
                 self.gpu_name = names[0]
+                found = re.search(r'(\d+)\s*MiB', names[0])
+                if found:
+                    self.app['gpu_vram_mb'] = int(found.group(1))
+                    self.ui_calls.put(self.show_vram_profile_hint)
                 text = _('✓ Placa de vídeo: {}', '✓ Graphics card: {}').format(names[0])
             elif result.returncode:
                 text = _('✗ Nenhuma placa com Vulkan 1.3 (atualize o driver)',
@@ -3291,6 +3376,9 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
 
     def clear_cache(self):
         if self.process:
+            self.messagebox.showwarning('Shadow of the Colossus', _(
+                'Feche o jogo primeiro: o cache de shaders só pode ser limpo com o jogo fechado.',
+                'Close the game first: the shader cache can only be cleared while the game is closed.'))
             return
         for name in ('cache', 'shader'):
             shutil.rmtree(user_dir(self.app) / name, ignore_errors=True)
@@ -3468,6 +3556,17 @@ def play_without_window(settings):
         write_key_bindings(settings.get('keys'))
     except OSError:
         pass
+    if not settings.get('gpu_vram_mb'):
+        # sotc: the video memory profile's Auto needs the card (the window finds it in detect_gpu).
+        exe = PORT_DIR / 'bin' / 'bb-gpu-capabilities.exe'
+        try:
+            result = subprocess.run([str(exe), '--live-resolution'], capture_output=True, text=True,
+                                    timeout=30, creationflags=NO_WINDOW)
+            found = re.search(r'^GPU: .*?(\d+)\s*MiB', result.stderr, re.MULTILINE)
+            if found:
+                settings['gpu_vram_mb'] = int(found.group(1))
+        except (OSError, subprocess.TimeoutExpired):
+            pass
     env = game_environment(settings)
     env['SOTC_EVENT_LOG'] = start_event_log(log_dir, settings, env)
     with open_session_log(log_dir) as log:

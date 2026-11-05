@@ -70,6 +70,22 @@ inline std::atomic<uint64_t> watch_addr{0};     ///< SOTC_CS_WATCH: GPU writes t
 inline std::atomic<uint64_t> current_program{0}; ///< hash of the dispatch being recorded (1 = a draw)
 inline std::atomic<uint64_t> readback_ahead{0};   ///< downloads of already submitted work
 inline std::atomic<uint64_t> readback_finish{0};  ///< downloads that flushed the current work
+/// sotc: guest readback waits by the age of the data (SOTC_RB_AGE=1, "SOTC RB AGE" line):
+/// [0] its last GPU write had completed when asked, [1] it was still in flight; count and
+/// wait for the GPU (ns).
+inline std::atomic<uint64_t> rb_age_count[2]{}, rb_age_ns[2]{};
+/// sotc (SOTC_RB_AGE): the host address of the guest instruction whose fault asked the
+/// readback this thread is doing (page_manager.cpp HandleGuestFault), 0 none.
+inline thread_local uint64_t fault_rip = 0;
+/// sotc: guest loads completed from the backing without a readback (SOTC_CLEAN_GUEST_READS).
+inline std::atomic<uint64_t> clean_guest_reads{0};
+/// sotc: guest loads of GPU-written bytes answered with the last value read back
+/// (SOTC_STALE_READS), and those that read back again because it was too old.
+inline std::atomic<uint64_t> stale_guest_reads{0}, stale_refreshes{0};
+inline const bool kRbAge = [] {
+    const char* v = std::getenv("SOTC_RB_AGE");
+    return v && v[0] == '1';
+}();
 inline std::atomic<uint64_t> readback_finish_asked{0}; ///< ... for bytes the guest itself asked
 /// ... the ahead path was idle only because sparse binds were pending (data itself submitted)
 inline std::atomic<uint64_t> readback_finish_binds{0};
@@ -348,6 +364,10 @@ inline std::atomic<uint32_t> warmup_total{0}, warmup_done{0};
 /// on one hard disk made the loading screen last 2 minutes).
 inline std::atomic<bool> warmup_finished{false};
 inline std::atomic<uint64_t> flip_count{0};     ///< game flips (videoout/driver.cpp Flip)
+/// sotc: how long flips waited between the submit and the present thread taking them (input delay).
+inline std::atomic<uint64_t> flip_age_ns{0};
+inline std::atomic<uint64_t> flip_age_max_ns{0};
+inline std::atomic<uint64_t> flip_age_count{0};
 /// Game frames prepared by the command processor (vk_presenter.cpp PrepareFrame): unlike
 /// flip_count, in step with the draws the command processor is processing.
 inline std::atomic<uint64_t> cp_frame{0};
@@ -372,9 +392,16 @@ inline std::atomic<int> ov_fsr_state{0};
 inline std::atomic<uint64_t> compile_phase_ns[5]{};
 /// Memory allocations on the frame path per kind (SOTC_FPS, "SOTC ALLOC" line every 5 s):
 /// count, bytes and time.
-enum AllocKind { AllocArena, AllocStagingBlock, AllocStagingLarge, AllocKinds };
-inline constexpr const char* kAllocKindNames[AllocKinds] = {"arena", "staging-block",
-                                                            "staging-large"};
+enum AllocKind {
+    AllocArena,
+    AllocStagingBlock,
+    AllocStagingLarge,
+    AllocStagingBlockDevice, ///< ring blocks in video memory (the detiler's staging)
+    AllocStagingKept,        ///< ring blocks of the kept reserve, made ahead (one per frame)
+    AllocKinds
+};
+inline constexpr const char* kAllocKindNames[AllocKinds] = {
+    "arena", "staging-block", "staging-large", "staging-block-vram", "staging-reserve"};
 inline std::atomic<uint64_t> alloc_count[AllocKinds]{}, alloc_bytes[AllocKinds]{},
     alloc_ns[AllocKinds]{};
 struct AllocTrace {

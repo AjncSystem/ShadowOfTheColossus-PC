@@ -54,6 +54,20 @@ if [[ -f "$streamline/sl.interposer.dll" ]]; then
 else
     echo "DLSS-G: no Streamline runtime in $streamline (FSR 3 only)" >&2
 fi
+# AMD FSR 4.1 / 3.1 upscaling (vk_fsr4.cpp): the official signed AMD FSR SDK 2.4.0 DLLs next to
+# bb-probe.exe (redistributable in binary form under AMD's license, kept with them). Not in git:
+# AMD_FSR_DIR (default ../SotC-deps/amd-fsr-sdk-2.4.0) holds Kits/FidelityFX/signedbin's
+# amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll from
+# github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK tag v2.4.0. Without it, FSR 1 instead.
+amd_fsr=${AMD_FSR_DIR:-../SotC-deps/amd-fsr-sdk-2.4.0}
+if [[ -f "$amd_fsr/amd_fidelityfx_loader_vk.dll" ]]; then
+    cp "$amd_fsr"/amd_fidelityfx_loader_vk.dll "$amd_fsr"/amd_fidelityfx_upscaler_vk.dll "$dest/bin/"
+    mkdir -p "$dest/bin/licenses-amd"
+    cp "$amd_fsr"/licenses-amd/* "$dest/bin/licenses-amd/"
+    echo "AMD FSR: FSR SDK 2.4.0 upscaler included"
+else
+    echo "AMD FSR: no FSR SDK in $amd_fsr (FSR 1 instead of FSR 4)" >&2
+fi
 cp scripts/prepare.py scripts/link_libc.py scripts/link_modules.py scripts/content_profile.py \
    scripts/sotc_cpu.py scripts/sotc_modes.py "$dest/scripts/"
 cp sotc.py SotC.bat LICENSE CHANGELOG.md "$dest/"

@@ -349,7 +349,15 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     const auto& vk12_props = instance.GetVk12Properties();
     // NVIDIA's shader compiler (seen on 617.14) hits a breakpoint on any OpFDiv in a shader
     // with RoundingModeRTZ for that width, killing the process. Prefer default rounding there.
-    const bool rtz_usable = instance.GetDriverID() != vk::DriverId::eNvidiaProprietary;
+    // sotc: test switches for the AMD GCN dust flashes: translate the shaders as for NVIDIA, all at
+    // once (SOTC_AMD_AS_NV=1) or one by one (SOTC_NO_RTZ, SOTC_MANUAL_INTERP, SOTC_NO_EXPLICIT_VERTEX,
+    // SOTC_CLIP_EMU). Their cache goes to a folder of its own (cache_storage.cpp, ShaderTestTag).
+    const auto test_on = [](const char* name) {
+        const char* all = std::getenv("SOTC_AMD_AS_NV");
+        const char* v = std::getenv(name);
+        return (all && all[0] == '1') || (v && v[0] == '1');
+    };
+    const bool rtz_usable = instance.GetDriverID() != vk::DriverId::eNvidiaProprietary && !test_on("SOTC_NO_RTZ");
     // sotc: the LDS barriers are also needed on AMD running the shaders 64 wide. GCN (RX 470-590,
     // Vega) has no 32-wide waves, so the 32-wide path never engages there, and its compiler may
     // move LDS reads before other lanes' writes just the same: white, flickering characters and
@@ -382,8 +390,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     };
     const bool no_barycentric = env_is("SOTC_NO_BARYCENTRIC", "1");
     const bool khr_barycentric = instance_.IsFragmentShaderBarycentricSupported() && !no_barycentric;
-    const bool amd_explicit_vertex =
-        instance_.IsAmdShaderExplicitVertexParameterSupported() && !no_barycentric;
+    const bool amd_explicit_vertex = instance_.IsAmdShaderExplicitVertexParameterSupported() && !no_barycentric &&
+                                     !test_on("SOTC_NO_EXPLICIT_VERTEX");
     const bool barycentric_via_gs = !khr_barycentric && !amd_explicit_vertex &&
                                     instance.IsGeometryStageSupported() &&
                                     instance.GetDriverID() == vk::DriverId::eNvidiaProprietary &&
@@ -437,7 +445,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supports_fragment_shader_barycentric = khr_barycentric || barycentric_via_gs,
         .supports_shader_subgroup_clock = instance_.IsShaderSubgroupClockSupported(),
         .needs_manual_interpolation = khr_barycentric &&
-                                      instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
+                                      (instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
+                                       test_on("SOTC_MANUAL_INTERP")),
         // sotc: also whenever the shaders are lowered for fewer than 64 lanes (AMD on the 32-wide
         // path): without the barriers the GPU hung ~2 min into the intro (issue #7).
         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
@@ -445,10 +454,17 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                               instance.SubgroupSize() < 64 || amd64_lds,
         .needs_buffer_offsets = instance.StorageMinAlignment() > 4,
         .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
-        .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary,
+        .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
+                                         test_on("SOTC_CLIP_EMU"),
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
         .barycentric_via_gs = barycentric_via_gs,
     };
+    std::fprintf(stderr,
+                 "GPU: shader profile: round to zero %d, AMD explicit vertex %d, barycentrics %d, manual "
+                 "interpolation %d, clip distance emulation %d\n",
+                 int(profile.support_fp32_round_to_zero), int(profile.supports_amd_shader_explicit_vertex_parameter),
+                 int(profile.supports_fragment_shader_barycentric), int(profile.needs_manual_interpolation),
+                 int(profile.needs_clip_distance_emulation));
     // sotc: the cache is read by the Presenter once it can draw (Presenter::Presenter), with
     // the loading screen on meanwhile.
 

@@ -896,7 +896,9 @@ struct SignalImpl : public PageManager::Impl {
             const char* v = std::getenv("SOTC_STALE_READ_REPAIR");
             return !v || v[0] != '0';
         }();
-        if (!enabled || !self) {
+        // Any read fault of the process comes here, also at addresses past the guest's: the table
+        // only spans ADDRESS_BITS.
+        if (!enabled || !self || (addr >> Impl::ADDRESS_BITS) != 0) {
             return false;
         }
         const u64 page = addr >> PageManager::PM_PAGE_BITS;
@@ -1226,7 +1228,7 @@ PageManager::~PageManager() = default;
 
 /// sotc: does the tracker want this page read-protected? 1 when it does not know.
 extern "C" int bbgpu_page_read_watched(uintptr_t address) {
-    if (!SignalImpl::self) {
+    if (!SignalImpl::self || (address >> SignalImpl::ADDRESS_BITS) != 0) {
         return 1;
     }
     const auto* state = SignalImpl::self->cached_pages.find(address >> 12);

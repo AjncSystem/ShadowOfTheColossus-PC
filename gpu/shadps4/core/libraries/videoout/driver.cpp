@@ -347,6 +347,16 @@ void VideoOutDriver::PresentJobThread(std::stop_token token) {
 }
 
 void VideoOutDriver::Flip(const Request& req) {
+    {
+        const u64 age = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - req.arrival)
+                            .count();
+        SotcStats::flip_age_ns.fetch_add(age, std::memory_order_relaxed);
+        SotcStats::flip_age_count.fetch_add(1, std::memory_order_relaxed);
+        if (age > SotcStats::flip_age_max_ns.load(std::memory_order_relaxed)) {
+            SotcStats::flip_age_max_ns.store(age, std::memory_order_relaxed);
+        }
+    }
     // Update HDR status before presenting, and present the frame.
     RunPresentJob([frame = req.frame, hdr = req.port->is_hdr] {
         presenter->SetHDR(hdr);
@@ -627,6 +637,12 @@ void VideoOutDriver::Flip(const Request& req) {
                                  SotcStats::stale_guest_reads.exchange(0)),
                              static_cast<unsigned long long>(
                                  SotcStats::stale_refreshes.exchange(0)));
+            }
+            if (const u64 ages = SotcStats::flip_age_count.exchange(0)) {
+                ReportPrintf(report, "SOTC flip wait: %.1f ms average, %.1f ms worst (%llu flips)\n",
+                             SotcStats::flip_age_ns.exchange(0) / 1e6 / ages,
+                             SotcStats::flip_age_max_ns.exchange(0) / 1e6,
+                             static_cast<unsigned long long>(ages));
             }
             ReportPrintf(report,
                          "SOTC readback finish: %llu for bytes the guest asked, %llu binds, "

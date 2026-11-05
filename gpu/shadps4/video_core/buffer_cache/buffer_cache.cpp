@@ -273,6 +273,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         fault_size = size;
         DownloadMemory(arena, window_start, window_end - window_start);
         fault_size = 0;
+        LiftStaleReadProtection(device_addr, size); // after the download: no-op if it had any
         if (is_write) {
             MarkWrittenByGuest(device_addr, size);
         }
@@ -388,6 +389,40 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     }
 }
 
+void BufferCache::LiftStaleReadProtection(VAddr addr, u64 size) {
+    // sotc: called when the window of a faulting access held nothing to download. A page bit with
+    // no bound GPU-written bytes behind it can never be downloaded, and only a download clears the
+    // bit and lifts the read protection, so the thread faulted on that load forever while the game
+    // waited for it: a freeze about once in 30 rides (ride benchmark, 5 Nov; a job worker at eboot
+    // 0xf9c40 and the draw thread in the replicate HLE, 16 million faults on one load). Such a bit
+    // can outlive its bytes: DropGpuModified runs ahead of the draws already queued, one of them
+    // marks the range again, then ReleaseMemory, ordered after them, takes its bytes only, and the
+    // next map of the address applies the protection the bit implies. MarkWrittenByGuest does the
+    // same for write faults. SOTC_STALE_READ_REPAIR=0: off.
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_STALE_READ_REPAIR");
+        return !v || v[0] != '0';
+    }();
+    if (!enabled || !memory_tracker->IsRegionGpuModified(addr, size)) {
+        return;
+    }
+    const VAddr lo = Common::AlignDown(addr, VAddr{4096});
+    const VAddr hi = Common::AlignUp(addr + size, VAddr{4096});
+    const bool unbound_bytes = gpu_modified_ranges.Intersects(lo, hi - lo);
+    if (unbound_bytes) {
+        std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+        gpu_modified_ranges.Subtract(lo, hi - lo);
+    }
+    memory_tracker->UnmarkRegionAsGpuModified(lo, hi - lo, false);
+    SotcStats::read_fault_stale_gpu.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<u32> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+        std::fprintf(stderr, "SOTC stale GPU page lifted at %#llx (%s)\n",
+                     static_cast<unsigned long long>(addr),
+                     unbound_bytes ? "bytes no longer bound" : "no bytes");
+    }
+}
+
 void BufferCache::MarkWrittenByGuest(VAddr addr, u64 size) {
     // sotc: a page both CPU- and GPU-modified loses its write watcher but keeps its read
     // watcher: "write-only" protection, an assertion that ended the game (opt4, ~1 in 12 Shrine
@@ -430,6 +465,7 @@ void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
             readback.dependent = true;
             return;
         }
+        LiftStaleReadProtection(readback.device_addr, readback.size);
         if (readback.is_write) {
             MarkWrittenByGuest(readback.device_addr, readback.size);
         }

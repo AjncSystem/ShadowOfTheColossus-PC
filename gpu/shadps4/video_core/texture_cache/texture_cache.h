@@ -655,6 +655,9 @@ private:
     /// sotc: SOTC_POOL_WATCH=1: logs game page pool pages freed under images still in use.
     void PoolWatch();
     static bool PoolWatchEnabled();
+    /// sotc: SOTC_POOL_FREEZE=1: images the game freed pool pages under while drawing them keep
+    /// their uploaded contents for SOTC_POOL_FREEZE_TICKS (T51).
+    void PoolFreeze();
     /// sotc: SOTC_POOL_WATCH: an image the game freed pages under is looked up again (drawn).
     void PoolWatchLookup(ImageId image_id, const Image& image, const ImageViewInfo& view);
 

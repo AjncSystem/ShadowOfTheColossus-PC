@@ -1063,9 +1063,33 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
     return image.FindView(desc.view_info, false);
 }
 
+namespace {
+// sotc: T51. At the end of the game the texture streaming gives the page pool back pages under
+// textures it goes on drawing for 6-323 ticks (all their mips in ~1 in 5); once another texture
+// takes the pages, the CPU-dirty refresh uploads that one's bytes into the image still drawn:
+// stretched textures, flicker, and the game's memory spoilt soon after. SOTC_POOL_FREEZE=1 holds
+// such a refresh back for SOTC_POOL_FREEZE_TICKS (default 400); the image is refreshed after.
+const bool kPoolFreeze = [] {
+    const char* v = std::getenv("SOTC_POOL_FREEZE");
+    return v && v[0] == '1';
+}();
+const u64 kPoolFreezeTicks = [] {
+    const char* v = std::getenv("SOTC_POOL_FREEZE_TICKS");
+    return v ? std::strtoull(v, nullptr, 10) : u64{400};
+}();
+std::atomic<u64> g_freeze_marked{0}, g_freeze_held{0};
+} // namespace
+
 void TextureCache::RefreshImage(Image& image) {
     if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
         return;
+    }
+    if (image.sotc_freeze_until && False(image.flags & ImageFlagBits::GpuDirty)) {
+        if (scheduler.CurrentTick() < image.sotc_freeze_until) {
+            g_freeze_held.fetch_add(1, std::memory_order_relaxed);
+            return; // stays dirty: refreshed once the freeze ends
+        }
+        image.sotc_freeze_until = 0;
     }
     const SotcStats::FrameTimer frame_timer{SotcStats::FrameUpload};
     const SotcStats::SplitTimer refresh_split{SotcStats::SplitTexRefresh};
@@ -2083,6 +2107,55 @@ void TextureCache::PoolWatchLookup(ImageId image_id, const Image& image,
     g_freed_under.erase(it);
 }
 
+void TextureCache::PoolFreeze() {
+    if (!kPoolFreeze) {
+        return;
+    }
+    static std::vector<u64> prev;
+    std::vector<u64> now = SotcLod::PoolBitmap();
+    if (now.empty() || now.size() != prev.size()) {
+        prev = std::move(now);
+        return;
+    }
+    // As PoolWatch: bit n is the page at 0x1000300000 + n * 64 KiB.
+    constexpr VAddr PoolBase = 0x1000300000;
+    constexpr u64 PageBytes = 64_KB;
+    const u64 tick = scheduler.CurrentTick();
+    {
+        std::scoped_lock lock{mutex};
+        for (size_t w = 0; w < now.size(); ++w) {
+            for (u64 bits = now[w] & ~prev[w]; bits; bits &= bits - 1) {
+                const VAddr addr = PoolBase + (w * 64 + std::countr_zero(bits)) * PageBytes;
+                ForEachImageInRegion(addr, PageBytes, [&](ImageId, Image& image) {
+                    if (image.tick_accessed_last == 0 || tick - image.tick_accessed_last > 16 ||
+                        True(image.flags & ImageFlagBits::GpuModified)) {
+                        return;
+                    }
+                    if (image.sotc_freeze_until < tick + kPoolFreezeTicks) {
+                        if (image.sotc_freeze_until <= tick) {
+                            g_freeze_marked.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        image.sotc_freeze_until = tick + kPoolFreezeTicks;
+                    }
+                });
+            }
+        }
+    }
+    prev = std::move(now);
+    static auto last = std::chrono::steady_clock::now();
+    if (std::chrono::steady_clock::now() - last >= std::chrono::seconds{5}) {
+        last = std::chrono::steady_clock::now();
+        const u64 marked = g_freeze_marked.exchange(0), held = g_freeze_held.exchange(0);
+        if (marked || held) {
+            std::fprintf(stderr,
+                         "SOTC POOL FREEZE 5 s: %llu textures freed under use kept as uploaded, "
+                         "%llu refreshes held back\n",
+                         static_cast<unsigned long long>(marked),
+                         static_cast<unsigned long long>(held));
+        }
+    }
+}
+
 void TextureCache::PoolWatch() {
     if (!PoolWatchEnabled()) {
         return;
@@ -2558,6 +2631,7 @@ void TextureCache::RunGarbageCollector() {
     }
     Census();
     PoolWatch();
+    PoolFreeze();
     GarbageCollectImages();
     GarbageCollectSamplers();
 }

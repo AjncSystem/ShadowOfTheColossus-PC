@@ -197,6 +197,9 @@ public:
     /// sotc: SOTC_POOL_WATCH: hash of the first 64 KiB of guest memory at the first upload.
     u64 sotc_first_hash{};
     u32 sotc_uploads{};
+    /// sotc: SOTC_POOL_FREEZE: until this tick a CPU-dirty refresh is held back (the game freed
+    /// the pages under the image while still drawing it; T51).
+    u64 sotc_freeze_until{};
 
     struct {
         u32 texture : 1;

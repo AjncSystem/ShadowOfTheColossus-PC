@@ -1179,11 +1179,24 @@ void TextureCache::RefreshImage(Image& image) {
             budget_used = 0;
         }
     }
+    // sotc: SOTC_UPLOAD_EXPIRED_MB (default 128, 0 = no cap): images past kMaxDeferFlips went up
+    // all in the same frame: at the forest entrance (5 Nov) the deferred textures of one frame
+    // expired together and the next-but-one frame copied 1.1 GB (200 ms). Expired images now go
+    // up, in the order the draws ask for them, until the frame has uploaded this much; one that
+    // has waited kMaxDeferHard flips goes up whatever the cap.
+    constexpr u64 kMaxDeferHard = 8;
+    static const u64 expired_cap = [] {
+        const char* v = std::getenv("SOTC_UPLOAD_EXPIRED_MB");
+        return (v ? std::strtoull(v, nullptr, 10) : 128ull) << 20;
+    }();
+    const bool waiting = image.sotc_deferred_flip != ~0ull;
+    const u64 waited = waiting ? budget_flip - image.sotc_deferred_flip : 0;
+    const bool expired_held = waiting && waited >= kMaxDeferFlips && waited < kMaxDeferHard &&
+                              expired_cap && budget_used + image.info.guest_size > expired_cap;
     if (upload_budget && !image.sotc_has_data && !is_gpu_modified && budget_used &&
         image.info.guest_size >= 256_KB && budget_used + image.info.guest_size > upload_budget &&
         image.aspect_mask == vk::ImageAspectFlagBits::eColor &&
-        (image.sotc_deferred_flip == ~0ull ||
-         budget_flip - image.sotc_deferred_flip < kMaxDeferFlips)) {
+        (!waiting || waited < kMaxDeferFlips || expired_held)) {
         constexpr u64 ZeroBytes = 64_MB;
         bool fits = true;
         auto zero_copies = image_copies;

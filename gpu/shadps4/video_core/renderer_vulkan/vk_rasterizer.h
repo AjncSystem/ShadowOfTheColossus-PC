@@ -241,6 +241,17 @@ private:
         bool is_written;
     };
     boost::container::static_vector<BoundBuffer, Shader::NUM_BUFFERS> bound_buffers;
+    /// sotc: SOTC_VIS_DIRECT: bitmaps the dispatch being bound writes in the game's memory.
+    struct VisCopy {
+        VAddr address;
+        u64 size;
+        vk::Buffer buffer;
+        u64 offset;
+    };
+    std::vector<VisCopy> vis_copies;
+    bool BindVisDirect(VAddr address, u64 size, u64 alignment, Shader::Backend::Bindings& binding,
+                       Shader::PushData& push_data);
+    void AfterVisDirect();
     /// Vertex/index buffers read by fixed-function stages of the current draw. They are recorded
     /// as reads after the draw so later writes to the same ranges wait for it.
     std::vector<BoundBuffer> fixed_function_reads;

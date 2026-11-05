@@ -48,7 +48,7 @@ CONFIG_FILE = CONFIG_DIR / 'launcher_settings.json'
 from sotc_modes import GAMES  # noqa: E402
 GAME_ID = 'CUSA08809'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.72.1'
+VERSION = '0.72.2'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -846,14 +846,13 @@ def game_environment(s):
         # the measured mips, finer mips (High 1, Maximum 0, both were 2) and, on Maximum, banks
         # kept sampled for 3 s (they had exhausted the pool, 0x1a371).
         env.setdefault('SOTC_LOD_FEEDBACK', '1')
-        # Light video memory profile (cards under 8 GB): Maximum at mip 1 without the 3 s, High at
-        # mip 2 as in 0.71.
-        if light:
-            env.setdefault('SOTC_LOD_LEVEL', '1' if textures == 'max' else '2')
-        else:
-            env.setdefault('SOTC_LOD_LEVEL', '0' if textures == 'max' else '1')
-        if textures == 'max' and not light:
-            env['SOTC_LOD_LINGER'] = env.get('SOTC_LOD_LINGER') if env.get('SOTC_LOD_LINGER') != '1' else '180'
+        # sotc: 0.72.2: the finer mips (High 1, Maximum 0) and Maximum's 3 s linger without the
+        # page pool switch brought back the hard FPS drop at area changes that 0.70 had removed:
+        # texture copies of up to 1.1 GB in one frame, worst frames 134-293 ms at the forest
+        # entrance (5 Nov). Mip 1 alone dropped as hard; mip 2 with the 1-tick linger and the
+        # switch (as in 0.71) was "much smoother, 2-3 FPS for 2 s". Both qualities stay at mip 2
+        # (sotc_lod_stats.h default); SOTC_LOD_LEVEL / SOTC_LOD_LINGER / SOTC_LOD_POOL_LOW in the
+        # extra variables still choose otherwise.
     # sotc: the heap guard's two shortcuts, off since 0.70 for the 0x49800 crash, which came from
     # the same double free: on again (tested with the above).
     env.setdefault('SOTC_GUARD_STALE', '1')
@@ -864,8 +863,6 @@ def game_environment(s):
     if 'SOTC_MAX_IN_PRO=0' in str(s.get('extra_env', '')) and textures == 'max' and env['SOTC_NEO'] == '1':
         textures = 'high'
         env['SOTC_NOTE'] = 'Texture quality Maximum is not used in PS4 Pro mode: High'
-    if textures == 'max' and not light:  # sotc: without the page pool switch (sotc_lod_stats.h)
-        env.setdefault('SOTC_LOD_POOL_LOW', '0')
     if s.get('button_icons') == 'xbox' and (PORT_DIR / 'glyphs' / 'xbox').is_dir():
         env['SOTC_TEX_REPLACE'] = str(PORT_DIR / 'glyphs' / 'xbox')
     env['SOTC_UI_LANG'] = s.get('ui_language') or windows_language()  # overlay and F7/F8 texts
@@ -1503,11 +1500,11 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                 else _('placa ainda não verificada', 'card not checked yet'))
         current = dict(self.app, vram_profile=self.var('vram_profile').get())
         if light_vram(current):
-            text = _('Leve ({}): Máxima no mip 1, Alta no mip 2, memória de vídeo no máximo Padrão.',
-                     'Light ({}): Maximum at mip 1, High at mip 2, video memory at most Default.').format(card)
+            text = _('Leve ({}): uso de memória de vídeo no máximo Padrão, sem reserva de envio nela.',
+                     'Light ({}): video memory use at most Default, no upload reserve in it.').format(card)
         else:
-            text = _('Completo ({}): Máxima no mip 0 e todas as melhorias de textura.',
-                     'Full ({}): Maximum at mip 0 and every texture improvement.').format(card)
+            text = _('Completo ({}): uso de memória de vídeo como escolhido.',
+                     'Full ({}): video memory use as chosen.').format(card)
         self.vram_profile_hint.configure(text=text)
 
     def show_play_mode_hint(self):

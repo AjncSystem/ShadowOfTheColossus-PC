@@ -1641,8 +1641,71 @@ static uint64_t cached_mapped_length(uintptr_t address, uint64_t size) {
     }
     return length>=size ? size : 0;
 }
+/* sotc: SOTC_CLAMP_GAP=0 off. Whether no mapping holds [address, address+1) and the gap there is
+ * unchanged since the table generation read first, without the lock (as cached_region_q's fast
+ * path): the VMA array is read under vma_seq and the gap up to the next mapping is checked with
+ * region_unchanged. 0 when unsure (take the lock). */
+static int gap_fast(uintptr_t address) {
+    static int on=-1;
+    if (on<0) { const char *v=getenv("SOTC_CLAMP_GAP"); on=!(v && v[0]=='0'); }
+    if (!on || !region_log_on() || (runtime_disabled_optimizations & 1)) return 0;
+    const uint64_t generation=__atomic_load_n(&table_generation,__ATOMIC_ACQUIRE);
+    for (int tries=0; tries<4; ++tries) {
+        const uint64_t s=__atomic_load_n(&vma_seq,__ATOMIC_ACQUIRE);
+        if (s & 1) continue;
+        const Vma *v=__atomic_load_n(&vmas,__ATOMIC_ACQUIRE);
+        const size_t n=__atomic_load_n(&vma_count,__ATOMIC_RELAXED);
+        size_t lo=0, hi=n;
+        while (lo<hi) {
+            size_t mid=(lo+hi)/2;
+            if (__atomic_load_n(&v[mid].end,__ATOMIC_RELAXED)<=address) lo=mid+1; else hi=mid;
+        }
+        uintptr_t next=UINTPTR_MAX;
+        if (lo<n) next=__atomic_load_n(&v[lo].start,__ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);
+        if (__atomic_load_n(&vma_seq,__ATOMIC_RELAXED)!=s) continue;
+        if (next<=address) return 0; /* mapped there after all */
+        const uint64_t now=__atomic_load_n(&table_generation,__ATOMIC_SEQ_CST);
+        const uintptr_t end=next==UINTPTR_MAX ? address+1 : next;
+        return (now==generation && !(now & 1)) ||
+               region_unchanged(address,end,generation & ~(uint64_t)1,now);
+    }
+    return 0;
+}
+static uint64_t clamp_gap_hits;
+/* sotc: a range that runs past the mapped memory (buffers the game declares near 4 GB long, cut
+ * to what is mapped) always took the read lock: cached_mapped_length only answers whole ranges.
+ * The mapped part comes from the cached regions and the end is a gap confirmed without the lock
+ * (gap_fast). At area changes the binds waited 8-10 ms per frame for map batches here (forest
+ * entrance, 5 Nov). */
+static int clamp_fast_partial(uintptr_t address, uint64_t size, uint64_t *out) {
+    if (runtime_disabled_optimizations & 1) return 0;
+    uint64_t length=0;
+    for (unsigned hops=0; length<size && hops<4; ++hops) {
+        const CachedRegion *c=cached_region_q(address+length,address+size);
+        if (!c) {
+            if (!gap_fast(address+length)) return 0;
+            *out=length;
+            __atomic_add_fetch(&clamp_gap_hits,1,__ATOMIC_RELAXED);
+            return 1;
+        }
+        if (c->kind==KIND_RESERVED) {
+            *out=length;
+            __atomic_add_fetch(&clamp_gap_hits,1,__ATOMIC_RELAXED);
+            return 1;
+        }
+        length=c->end-address;
+    }
+    if (length>=size) { *out=size; return 1; }
+    return 0;
+}
+uint64_t runtime_memory_clamp_gap_hits(void) {
+    return __atomic_exchange_n(&clamp_gap_hits,0,__ATOMIC_RELAXED);
+}
 uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size) {
     if (size && cached_mapped_length(address,size)==size) return size;
+    uint64_t fast=0;
+    if (size && clamp_fast_partial(address,size,&fast)) return fast;
     read_lock();
     uint64_t length=0;
     for (size_t i=vma_index(address); i<vma_count && length<size; ++i) {

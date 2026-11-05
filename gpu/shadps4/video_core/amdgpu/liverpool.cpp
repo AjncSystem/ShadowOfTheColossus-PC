@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <utility>
+#include <unordered_map>
 #include <cstdlib>
 #include <deque>
 #include <mutex>
@@ -171,7 +172,54 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                 : op.kind == DrawIndirect ? SotcStats::SplitIndirect
                 : op.kind == Func         ? SotcStats::SplitFunc
                                           : SotcStats::SplitDispatch};
+            const u64 op_start = SotcStats::kSlowOps ? SotcStats::Ticks() : 0;
+            // sotc: SOTC_SLOW_OPS: the split counters around one op, for the detail of a slow one.
+            static constexpr SotcStats::SplitPart kDetail[] = {
+                SotcStats::SplitBind,       SotcStats::SplitBindBuffers, SotcStats::SplitBufClamp,
+                SotcStats::SplitBufObtain,  SotcStats::SplitBindTextures, SotcStats::SplitTexView,
+                SotcStats::SplitTexRefresh, SotcStats::SplitTexCopy,      SotcStats::SplitBindDma,
+                SotcStats::SplitWaitGpu,    SotcStats::SplitWaitSubmit,   SotcStats::SplitRbApply,
+                SotcStats::SplitCommands};
+            u64 before[std::size(kDetail)]{};
+            if (SotcStats::kSlowOps) {
+                for (size_t i = 0; i < std::size(kDetail); ++i) {
+                    before[i] = SotcStats::split_ticks[kDetail[i]].load(std::memory_order_relaxed);
+                }
+            }
             ExecuteBackOp(op);
+            if (SotcStats::kSlowOps) {
+                const u64 hash = op.num_stages ? op.stages[0].info->pgm_hash : 0;
+                const u64 ticks = SotcStats::Ticks() - op_start;
+                SotcStats::NoteSlowOp((u64{static_cast<u8>(op.kind)} << 60) |
+                                          (hash & ((u64{1} << 60) - 1)),
+                                      ticks);
+                // An op over ~1 ms (3 GHz TSC; the line prints its real ms): where it went, the
+                // first 3 times per shader, 60 lines per session.
+                if (ticks > 3'000'000) {
+                    static std::unordered_map<u64, u32> shown;
+                    static u32 lines = 0;
+                    u32& n = shown[hash];
+                    if (n < 3 && lines < 60) {
+                        ++n;
+                        ++lines;
+                        u64 d[std::size(kDetail)];
+                        for (size_t i = 0; i < std::size(kDetail); ++i) {
+                            d[i] = SotcStats::split_ticks[kDetail[i]].load(
+                                       std::memory_order_relaxed) - before[i];
+                        }
+                        const double tpm = SotcStats::TicksPerMs();
+                        const auto ms = [&](size_t i) { return d[i] / tpm; };
+                        std::fprintf(stderr,
+                                     "SOTC SLOW OP kind %u %#llx %.2f ms: bind %.2f [buffers %.2f "
+                                     "(clamp %.2f, obtain %.2f), textures %.2f (view %.2f; uploads "
+                                     "%.2f, copy %.2f), dma %.2f]; waits gpu %.2f, submit %.2f; "
+                                     "readback apply %.2f, commands %.2f; stages %u\n",
+                                     u32(op.kind), static_cast<unsigned long long>(hash),
+                                     ticks / tpm, ms(0), ms(1), ms(2), ms(3), ms(4), ms(5), ms(6),
+                                     ms(7), ms(8), ms(9), ms(10), ms(11), ms(12), op.num_stages);
+                    }
+                }
+            }
         }
         op.func = {};
         ++tail;
@@ -1234,7 +1282,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     const char* v = std::getenv("SOTC_EOP_DEFER");
                     return v && v[0] == '1';
                 }();
-                if (defer_eop && rasterizer) {
+                // sotc: SOTC_VIS_DIRECT: the label after a bitmap written in the game's memory waits
+                // for the GPU (the game reads the bitmap once it sees the label).
+                const bool vis_honest = std::exchange(SotcStats::vis_label_pending, false);
+                if (vis_honest) {
+                    SotcStats::vis_honest_labels.fetch_add(1, std::memory_order_relaxed);
+                }
+                if ((defer_eop || vis_honest) && rasterizer) {
                     const PM4CmdEventWriteEop eop = *event_eop;
                     const VAddr label = reinterpret_cast<VAddr>(eop.Address<void>());
                     // A GPU copy of the label's page must not be reused with the old value.
@@ -1766,6 +1820,24 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             BackOrRun([this, release, pipe_id = queue.pipe_id] {
                 if (rasterizer) {
                     rasterizer->OnFence();
+                }
+                // sotc: SOTC_VIS_DIRECT: as the end-of-pipe label above (not for a GDS store, whose
+                // copy must be recorded here).
+                if (rasterizer && release.data_sel.Value() != DataSelect::GdsMemStore &&
+                    std::exchange(SotcStats::vis_label_pending, false)) {
+                    SotcStats::vis_honest_labels.fetch_add(1, std::memory_order_relaxed);
+                    const VAddr label = reinterpret_cast<VAddr>(release.Address<u8*>());
+                    rasterizer->InvalidateMemory(label, 8, true);
+                    rasterizer->GetScheduler().DeferPriorityOperation([release, pipe_id] {
+                        release.SignalFence(
+                            [pipe_id] {
+                                Platform::IrqC::Instance()->Signal(
+                                    static_cast<Platform::InterruptId>(pipe_id));
+                            },
+                            [](VAddr, u16, u16) {});
+                    });
+                    rasterizer->Flush();
+                    return;
                 }
                 release.SignalFence(
                     [pipe_id] {

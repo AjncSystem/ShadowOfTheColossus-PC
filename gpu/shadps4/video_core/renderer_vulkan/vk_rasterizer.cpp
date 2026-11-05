@@ -1586,6 +1586,7 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
     pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     DebugState.IncDispatch();
+    AfterVisDirect(); // sotc: SOTC_VIS_DIRECT
     MaybeDumpImages(cs.pgm_hash);
 
     ResetBindings(true);
@@ -1628,6 +1629,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
     pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
     DebugState.IncDispatch();
+    AfterVisDirect(); // sotc: SOTC_VIS_DIRECT
     runtime.AccessBuffer(buffer, base, size, vk::PipelineStageFlagBits2::eDrawIndirect,
                          vk::AccessFlagBits2::eIndirectCommandRead);
     MaybeDumpImages(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash);
@@ -2551,6 +2553,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             u64 size = 0;
             if (clamp1) {
                 if (vsharp.base_address != 0 && vsharp.GetSize() != 0) {
+                    const SotcStats::SplitTimer clamp_split{SotcStats::SplitBufClamp};
                     size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
                 }
             } else if (vsharp.base_address != 0 && vsharp.GetSize() != 0 &&
@@ -2589,6 +2592,21 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     LOG_DEBUG(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
                 }
+                // sotc: SOTC_VIS_DIRECT: a visibility bitmap written in the game's memory.
+                if (desc.is_written && stage.sw_stage == Shader::SwStage::Compute &&
+                    SotcStats::kVisDirect && SotcStats::VisDirectProgram(stage.pgm_hash) &&
+                    BindVisDirect(vsharp.base_address, size, alignment, binding, push_data)) {
+                    auto& set_write = set_writes[set_write_index++];
+                    set_write.dstSet = VK_NULL_HANDLE;
+                    set_write.dstBinding = binding.unified++;
+                    set_write.dstArrayElement = 0;
+                    set_write.descriptorCount = 1;
+                    set_write.descriptorType = vk::DescriptorType::eStorageBuffer;
+                    set_write.pBufferInfo = &buffer_infos.back();
+                    ++binding.buffer;
+                    continue;
+                }
+                const SotcStats::SplitTimer obtain_split{SotcStats::SplitBufObtain};
                 const auto [buffer, offset] = buffer_cache.ObtainBuffer(
                     vsharp.base_address, size, desc.is_written, desc.is_formatted);
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
@@ -2619,6 +2637,71 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         set_write.pBufferInfo = &buffer_infos.back();
         ++binding.buffer;
     }
+}
+
+bool Rasterizer::BindVisDirect(VAddr address, u64 size, u64 alignment,
+                               Shader::Backend::Bindings& binding, Shader::PushData& push_data) {
+    if (!SotcGuestMemory::Enabled()) {
+        return false;
+    }
+    VAddr run_start = 0;
+    u64 run_size = 0;
+    const u8* run = memory->GetBackingRun(address, &run_start, &run_size);
+    if (!run || address + size > run_start + run_size) {
+        SotcStats::vis_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    const u8* host = run + (address - run_start);
+    const SotcGuestMemory::Span span = SotcGuestMemory::Get(host, size);
+    if (!span.buffer) {
+        SotcStats::vis_fallbacks.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    // Bytes the GPU wrote in the arena before (or another shader since) come back to the game's
+    // memory first: from now on the game's memory holds the bitmap and the arena follows it.
+    if (buffer_cache.IsRegionGpuModified(address, size)) {
+        buffer_cache.ReadMemory(address, size, false, true);
+    }
+    const u64 offset_aligned = Common::AlignDown(span.offset, alignment);
+    const u64 adjust = span.offset - offset_aligned;
+    push_data.AddOffset(binding.buffer, adjust);
+    buffer_infos.emplace_back(span.buffer, offset_aligned, size + adjust);
+    vis_copies.push_back({address, size, span.buffer, span.offset});
+    texture_cache.InvalidateMemoryFromGPU(address, size);
+    SotcStats::vis_direct_binds.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void Rasterizer::AfterVisDirect() {
+    if (vis_copies.empty()) {
+        return;
+    }
+    // The arena's copy of each bitmap follows the game's memory (GPU readers bind the arena).
+    const auto cmdbuf = scheduler.CommandBuffer();
+    const vk::MemoryBarrier2 written{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite |
+                         vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eHostRead,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &written});
+    for (const VisCopy& copy : vis_copies) {
+        const auto [arena, arena_offset] = buffer_cache.ObtainBuffer(copy.address, copy.size, false);
+        cmdbuf.copyBuffer(copy.buffer, arena->Handle(),
+                          vk::BufferCopy{.srcOffset = copy.offset, .dstOffset = arena_offset,
+                                         .size = copy.size});
+    }
+    const vk::MemoryBarrier2 copied{
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite |
+                         vk::AccessFlagBits2::eIndirectCommandRead,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &copied});
+    vis_copies.clear();
+    SotcStats::vis_label_pending = true;
 }
 
 // sotc: the final composite samples the UI layer and the scene: UI first in the base game's
@@ -2786,8 +2869,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const u32 num_bindings = image_desc.NumBindings(stage);
 
         for (auto i = 0; i < num_bindings; i++) {
-            auto& [image_id, desc] = image_bindings.emplace_back(
-                std::piecewise_construct, std::tuple{}, std::tuple{tsharp, image_desc});
+            auto& binding_entry = [&]() -> auto& {
+                const SotcStats::SplitTimer desc_split{SotcStats::SplitTexDesc};
+                return image_bindings.emplace_back(std::piecewise_construct, std::tuple{},
+                                                   std::tuple{tsharp, image_desc});
+            }();
+            auto& [image_id, desc] = binding_entry;
 
             if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
                 ASSERT(num_bindings == 1);
@@ -2798,7 +2885,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 desc.view_info.range.extent.levels = 1;
             }
 
-            image_id = texture_cache.FindImage(desc);
+            {
+                const SotcStats::SplitTimer find_split{SotcStats::SplitTexFind};
+                image_id = texture_cache.FindImage(desc);
+            }
             auto* image = &texture_cache.GetImage(image_id);
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.
@@ -2833,7 +2923,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             bound_images.emplace_back(image_id);
 
             auto& image = texture_cache.GetImage(image_id);
-            auto& image_view = texture_cache.FindTexture(image_id, desc);
+            auto& image_view = [&]() -> auto& {
+                const SotcStats::SplitTimer view_split{SotcStats::SplitTexView};
+                return texture_cache.FindTexture(image_id, desc);
+            }();
             const auto binding = image.binding;
 
             // The image is either bound as storage in a separate descriptor or bound as render

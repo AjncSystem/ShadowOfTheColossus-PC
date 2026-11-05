@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.72.2 — 2026-11-05
+- **A queda forte de FPS na troca de área voltou na 0.72; corrigido.** As texturas mais finas que a 0.72
+  ligou (Alta no mip 1, Máxima no mip 0 com os bancos mantidos 3 s e sem a proteção do pool) faziam o jogo
+  copiar até 1,1 GB de texturas num quadro ao entrar numa área nova: pior quadro de 134–293 ms na entrada da
+  floresta, contra 58–75 ms na 0.70. Com o mip 1 sozinho o tranco continuava. Alta e Máxima voltam ao
+  comportamento da 0.71 (mip 2, sem os 3 s, com a proteção do pool): "muito mais suave, queda de 2–3 FPS por
+  2 s" no teste do usuário. Quem quiser as texturas mais finas pode usar `SOTC_LOD_LEVEL=1` ou `0` nas
+  variáveis extras.
+- **Troca de área: consulta da tabela de memória sem trava** para buffers que passam da área mapeada
+  (`SOTC_CLAMP_GAP=0` desliga) e **teto de 128 MB por quadro** para as texturas cujo adiamento venceu, que antes
+  subiam todas no mesmo quadro (`SOTC_UPLOAD_EXPIRED_MB`, 0 = sem teto).
+- **Diagnóstico (desligados):** `SOTC_DRAW_SPLIT=1` separa os binds (clamp, busca de buffer, decodificação,
+  busca de imagem e de view) e as leituras do jogo feitas na thread de desenho; `SOTC_RB_DIRTY_RETRY=1` devolve
+  à thread do jogo a releitura de uma leitura suja (experimental: uma queda em `0x94c71` numa das duas rodadas).
+- **Experimental (desligado): mapa de visibilidade direto na memória do jogo** (`SOTC_VIS_DIRECT=1` com `SOTC_PC_MEMORY=1`): os shaders que reescrevem o mapa que o jogo varre a cada quadro escrevem na memória do jogo, sem a leitura de volta da GPU. Com `SOTC_VIS_PROGRAMS=0x2e0f474b,0xf94d23d4,0x93aec24b,0x729c541e,0x4defcf7f` a entrada da floresta caiu de 31 para 14 quadros acima de 50 ms no teste do usuário. Diagnósticos `SOTC_SLOW_OPS=1` (shaders mais caros dos quadros lentos) e `tools/entry_report.py` (resumo do log por trecho).
+
 ## 0.72.1 — 2026-11-03
 - **Placas com menos de 8 GB de memória de vídeo: perfil leve automático.** As melhorias de textura da 0.72
   (Máxima no mip 0 com os bancos mantidos 3 s e sem a proteção de emergência do pool, Alta no mip 1) usavam

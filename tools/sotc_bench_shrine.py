@@ -52,6 +52,10 @@ def main():
     parser.add_argument('--template', default='out/save-template', help='save folder holding CUSA08809/ or CUSA08034/')
     parser.add_argument('--record', help='hand over to the player with BB_PAD_RECORD=<file> (F9 stops)')
     parser.add_argument('--replay', help='measure a replay of a BB_PAD_RECORD file')
+    parser.add_argument('--after-load', type=float, metavar='SECONDS',
+                        help='for a save that does not start at the shrine (--template of a player): '
+                             'recording or replay starts SECONDS after the save began loading, '
+                             'without the shrine cutscene skip')
     parser.add_argument('--assist', default='auto',
                         help='during a replay, also tap BUTTON every 0.4 s between START and END seconds '
                              '(START:END:BUTTON; "" for none). Agro, an AI character, does not stop at '
@@ -139,6 +143,11 @@ def main():
                 break
             press('cross', 0.3)
             at += 3
+        if args.after_load is not None:
+            # A player's save: no shrine cutscene; control comes once the load is done.
+            wait_until(time.monotonic() - start + args.after_load)
+            state['gameplay_at'] = time.monotonic() - start
+            return
         # ...and once more when the shrine cutscene is skipped and gameplay begins. Hold X until
         # then; no input afterwards (X would make Wander act).
         at = time.monotonic() - start + 4

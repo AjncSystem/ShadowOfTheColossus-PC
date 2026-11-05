@@ -293,82 +293,94 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         return;
     }
     // The guest thread waits for the GPU, not the command processor.
-    AsyncReadback readback{
-        .device_addr = device_addr, .size = size, .stream = stream, .is_write = is_write};
-    // sotc: SOTC_DRAW_SPLIT: the four parts of the guest's wait (draw thread queue and the copy
-    // recorded there, the recorder submitting it, the GPU, the apply on the draw thread).
-    const bool split = SotcStats::kDrawSplit;
-    u64 split_mark = split ? SotcStats::Ticks() : 0;
-    const auto split_part = [&](SotcStats::SplitPart part) {
-        if (split) {
-            const u64 now = SotcStats::Ticks();
-            SotcStats::split_ticks[part].fetch_add(now - split_mark, std::memory_order_relaxed);
-            split_mark = now;
-        }
-    };
-    liverpool->SendCommand<true>([this, &readback] { BeginAsyncReadback(readback); });
-    split_part(SotcStats::SplitRbQueue);
-    if (!readback.waiting) {
-        return;
-    }
-    if (split) {
-        SotcStats::split_ticks[SotcStats::SplitRbCount].fetch_add(1, std::memory_order_relaxed);
-    }
-    const auto age_start = SotcStats::kRbAge ? SotcStats::NowNs() : 0;
-    scheduler.WaitSubmitted(readback.tick, false);
-    split_part(SotcStats::SplitRbSubmit);
-    scheduler.GetWorkSemaphore()->Wait(readback.tick);
-    split_part(SotcStats::SplitRbGpu);
-    if (SotcStats::kRbAge && !readback.dependent) {
-        const int age = readback.data_ready ? 0 : 1;
-        SotcStats::rb_age_count[age].fetch_add(1, std::memory_order_relaxed);
-        const u64 waited = SotcStats::NowNs() - age_start;
-        SotcStats::rb_age_ns[age].fetch_add(waited, std::memory_order_relaxed);
-        // The readbacks of data still being written, by guest instruction and 64 KiB page: the
-        // session's top 16 by wait every 30 s ("SOTC RB TOP").
-        struct Agg {
-            u64 count, ns, bytes;
+    // sotc: SOTC_RB_DIRTY_RETRY=1: up to 3 attempts end dirty and are asked again from here
+    // (FinishAsyncReadback); the last one rereads on the draw thread as before.
+    static const bool dirty_retry = [] {
+        const char* v = std::getenv("SOTC_RB_DIRTY_RETRY");
+        return v && v[0] == '1';
+    }();
+    for (int attempt = 0;; ++attempt) {
+        AsyncReadback readback{
+            .device_addr = device_addr, .size = size, .stream = stream, .is_write = is_write};
+        readback.allow_retry = dirty_retry && attempt < 3;
+        // sotc: SOTC_DRAW_SPLIT: the four parts of the guest's wait (draw thread queue and the copy
+        // recorded there, the recorder submitting it, the GPU, the apply on the draw thread).
+        const bool split = SotcStats::kDrawSplit;
+        u64 split_mark = split ? SotcStats::Ticks() : 0;
+        const auto split_part = [&](SotcStats::SplitPart part) {
+            if (split) {
+                const u64 now = SotcStats::Ticks();
+                SotcStats::split_ticks[part].fetch_add(now - split_mark, std::memory_order_relaxed);
+                split_mark = now;
+            }
         };
-        static std::mutex top_mutex;
-        static std::map<std::pair<u64, u64>, Agg> top;
-        static u64 top_printed = SotcStats::NowNs();
-        std::scoped_lock lock{top_mutex};
-        if (age == 1) {
-            Agg& a = top[{SotcStats::fault_rip, device_addr >> 16}];
-            a.count++;
-            a.ns += waited;
-            a.bytes += readback.window_size;
+        liverpool->SendCommand<true>([this, &readback] { BeginAsyncReadback(readback); });
+        split_part(SotcStats::SplitRbQueue);
+        if (!readback.waiting) {
+            return;
         }
-        if (SotcStats::NowNs() - top_printed > 30'000'000'000ull) {
-            top_printed = SotcStats::NowNs();
-            std::vector<std::pair<std::pair<u64, u64>, Agg>> items(top.begin(), top.end());
-            std::ranges::sort(items, [](const auto& x, const auto& y) {
-                return x.second.ns > y.second.ns;
-            });
-            u64 total = 0;
-            for (const auto& item : items) {
-                total += item.second.ns;
+        if (split) {
+            SotcStats::split_ticks[SotcStats::SplitRbCount].fetch_add(1, std::memory_order_relaxed);
+        }
+        const auto age_start = SotcStats::kRbAge ? SotcStats::NowNs() : 0;
+        scheduler.WaitSubmitted(readback.tick, false);
+        split_part(SotcStats::SplitRbSubmit);
+        scheduler.GetWorkSemaphore()->Wait(readback.tick);
+        split_part(SotcStats::SplitRbGpu);
+        if (SotcStats::kRbAge && !readback.dependent) {
+            const int age = readback.data_ready ? 0 : 1;
+            SotcStats::rb_age_count[age].fetch_add(1, std::memory_order_relaxed);
+            const u64 waited = SotcStats::NowNs() - age_start;
+            SotcStats::rb_age_ns[age].fetch_add(waited, std::memory_order_relaxed);
+            // The readbacks of data still being written, by guest instruction and 64 KiB page: the
+            // session's top 16 by wait every 30 s ("SOTC RB TOP").
+            struct Agg {
+                u64 count, ns, bytes;
+            };
+            static std::mutex top_mutex;
+            static std::map<std::pair<u64, u64>, Agg> top;
+            static u64 top_printed = SotcStats::NowNs();
+            std::scoped_lock lock{top_mutex};
+            if (age == 1) {
+                Agg& a = top[{SotcStats::fault_rip, device_addr >> 16}];
+                a.count++;
+                a.ns += waited;
+                a.bytes += readback.window_size;
             }
-            std::fprintf(stderr, "SOTC RB TOP (still written, %zu places, %.0f ms):\n",
-                         items.size(), total / 1e6);
-            for (size_t i = 0; i < std::min<size_t>(items.size(), 16); ++i) {
-                const auto& [key, a] = items[i];
-                const WriteMark mark = LastWriteMark(key.second << 16);
-                std::fprintf(stderr,
-                             "SOTC RB TOP   rip %#llx page %#llx: %llu reads, %.0f ms, %.1f KiB "
-                             "each; marked by %#llx+%#llx, program %#llx\n",
-                             static_cast<unsigned long long>(key.first),
-                             static_cast<unsigned long long>(key.second << 16),
-                             static_cast<unsigned long long>(a.count), a.ns / 1e6,
-                             a.bytes / 1024.0 / a.count,
-                             static_cast<unsigned long long>(mark.addr),
-                             static_cast<unsigned long long>(mark.size),
-                             static_cast<unsigned long long>(mark.program));
+            if (SotcStats::NowNs() - top_printed > 30'000'000'000ull) {
+                top_printed = SotcStats::NowNs();
+                std::vector<std::pair<std::pair<u64, u64>, Agg>> items(top.begin(), top.end());
+                std::ranges::sort(items, [](const auto& x, const auto& y) {
+                    return x.second.ns > y.second.ns;
+                });
+                u64 total = 0;
+                for (const auto& item : items) {
+                    total += item.second.ns;
+                }
+                std::fprintf(stderr, "SOTC RB TOP (still written, %zu places, %.0f ms):\n",
+                             items.size(), total / 1e6);
+                for (size_t i = 0; i < std::min<size_t>(items.size(), 16); ++i) {
+                    const auto& [key, a] = items[i];
+                    const WriteMark mark = LastWriteMark(key.second << 16);
+                    std::fprintf(stderr,
+                                 "SOTC RB TOP   rip %#llx page %#llx: %llu reads, %.0f ms, %.1f KiB "
+                                 "each; marked by %#llx+%#llx, program %#llx\n",
+                                 static_cast<unsigned long long>(key.first),
+                                 static_cast<unsigned long long>(key.second << 16),
+                                 static_cast<unsigned long long>(a.count), a.ns / 1e6,
+                                 a.bytes / 1024.0 / a.count,
+                                 static_cast<unsigned long long>(mark.addr),
+                                 static_cast<unsigned long long>(mark.size),
+                                 static_cast<unsigned long long>(mark.program));
+                }
             }
+        }
+        liverpool->SendCommand<true>([this, &readback] { FinishAsyncReadback(readback); });
+        split_part(SotcStats::SplitRbFinish);
+        if (!readback.retried) {
+            return;
         }
     }
-    liverpool->SendCommand<true>([this, &readback] { FinishAsyncReadback(readback); });
-    split_part(SotcStats::SplitRbFinish);
 }
 
 void BufferCache::MarkWrittenByGuest(VAddr addr, u64 size) {
@@ -392,6 +404,7 @@ void BufferCache::MarkWrittenByGuest(VAddr addr, u64 size) {
 }
 
 void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
+    const SotcStats::SplitTimer begin_split{SotcStats::SplitRbBegin};
     SotcStats::readbacks.fetch_add(1, std::memory_order_relaxed);
     NoteHotRead(readback.device_addr, readback.size);
     const u32 first_block = readback.device_addr >> block_shift;
@@ -447,7 +460,10 @@ void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
         }
         readback.data_ready = last_write < readback.tick && scheduler.IsFree(last_write);
     }
-    scheduler.Flush();
+    {
+        const SotcStats::SplitTimer flush_split{SotcStats::SplitRbBeginFlush};
+        scheduler.Flush();
+    }
     readback.waiting = true;
     inflight_readbacks.push_back(&readback);
     SotcStats::readback_finish.fetch_add(1, std::memory_order_relaxed);
@@ -479,6 +495,7 @@ BufferCache::AsyncReadback* BufferCache::FindInflightReadback(VAddr addr, u64 si
 }
 
 void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
+    const SotcStats::SplitTimer apply_split{SotcStats::SplitRbApply};
     if (readback.dependent) {
         // Finish the readbacks this one waited for (owners still blocked keep them alive).
         while (AsyncReadback* other = FindInflightReadback(readback.device_addr, readback.size)) {
@@ -504,10 +521,23 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
         .mapped = const_cast<u8*>(readback.download_mapped),
         .type = VideoCore::MemoryType::HostCached,
     };
-    if (readback.dirty) {
+    if (readback.dirty && readback.allow_retry) {
+        // sotc: SOTC_RB_DIRTY_RETRY=1: the guest thread asks again (ReadMemory), and waits for
+        // the GPU itself. The reread below makes the draw thread, the bottleneck at area
+        // changes, wait for the GPU: 8-15 ms per slow frame at the forest entrance (5 Nov; the
+        // visibility bitmaps are rewritten every frame, so their readbacks often turn dirty).
+        staging_pool.FreeDeferred(download);
+        readback.retried = true;
+        if (SotcStats::kDrawSplit) {
+            SotcStats::split_ticks[SotcStats::SplitRbRetries].fetch_add(1,
+                                                                        std::memory_order_relaxed);
+        }
+        return;
+    } else if (readback.dirty) {
         // A GPU write recorded after the copies (or another readback applied first and the
         // guest may have written since): the data may be stale. The ranges never left the
         // GPU-modified set; read the window back the usual way.
+        const SotcStats::SplitTimer dirty_split{SotcStats::SplitRbDirty};
         staging_pool.FreeDeferred(download);
         DownloadMemory(readback.arena, readback.window_start, readback.window_size);
     } else {

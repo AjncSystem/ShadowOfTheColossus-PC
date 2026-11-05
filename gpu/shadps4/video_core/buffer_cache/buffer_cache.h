@@ -256,6 +256,10 @@ private:
         Buffer* download_buffer{};
         u64 download_size{};
         bool data_ready{}; ///< sotc (SOTC_RB_AGE): its last GPU write had completed when asked
+        /// sotc (SOTC_RB_DIRTY_RETRY): a dirty readback hands the reread to its guest thread
+        /// instead of reading back on the draw thread; set when it did.
+        bool allow_retry{};
+        bool retried{};
         boost::container::small_vector<ReadbackItem, 16> pending;
     };
     void BeginAsyncReadback(AsyncReadback& readback);

@@ -1727,9 +1727,9 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                   top=2)
         self.row(f, _('Modo', 'Mode'), self.choice(f, 'dlss_mode', DLSS_MODES),
                  _('Fator entre a saída e o tamanho renderizado. DLAA: tamanho nativo com o anti-aliasing do '
-                   'DLSS (mais pesado, imagem mais nítida).',
+                   'DLSS (mais pesado, usa mais memória de vídeo; sem memória bastante, volta ao FSR 1).',
                    'Factor between the output and the render size. DLAA: native size with DLSS anti-aliasing '
-                   '(heavier, sharper image).'))
+                   '(heavier, uses more video memory; without enough of it, back to FSR 1).'))
         self.row(f, _('Nitidez da cena', 'Scene sharpening'), self.choice(f, 'dlss_sharpen', DLSS_SHARPNESS))
         self.row(f, _('Nitidez do texto', 'Text sharpening'), self.choice(f, 'dlss_ui_sharpen', DLSS_UI_SHARPNESS))
         self.row(f, _('Nitidez do céu', 'Sky sharpening'), self.choice(f, 'dlss_sky_sharpen', DLSS_SKY_SHARPNESS))

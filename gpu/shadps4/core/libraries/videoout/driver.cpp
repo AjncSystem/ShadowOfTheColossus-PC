@@ -629,6 +629,14 @@ void VideoOutDriver::Flip(const Request& req) {
                              static_cast<unsigned long long>(SotcStats::vis_honest_labels.exchange(0)),
                              static_cast<unsigned long long>(SotcStats::vis_fallbacks.exchange(0)));
             }
+            if (SotcStats::kTexDirect) {
+                ReportPrintf(report,
+                             "SOTC TEX DIRECT: %llu uploads read by the GPU in the game's memory "
+                             "(%llu MiB), %llu by copy\n",
+                             static_cast<unsigned long long>(SotcStats::tex_direct_uploads.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::tex_direct_bytes.exchange(0) >> 20),
+                             static_cast<unsigned long long>(SotcStats::tex_direct_fallbacks.exchange(0)));
+            }
             if (SotcStats::kRbAge) {
                 const auto c0 = SotcStats::rb_age_count[0].exchange(0);
                 const auto c1 = SotcStats::rb_age_count[1].exchange(0);

@@ -28,6 +28,7 @@ extern "C" uintptr_t runtime_sotc_heap_table(void);
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/sotc_guest_memory.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -1322,6 +1323,23 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
     if (IsRegionGpuModified(device_addr, size)) {
         const SotcStats::SplitTimer copy_split{SotcStats::SplitTexCopy};
         return ObtainBuffer(device_addr, size, false);
+    }
+    // sotc: SOTC_TEX_DIRECT: the GPU reads the texture in the game's memory itself.
+    if (SotcStats::kTexDirect && Vulkan::SotcGuestMemory::Enabled()) {
+        VAddr run_start = 0;
+        u64 run_size = 0;
+        const u8* run = memory->GetBackingRun(device_addr, &run_start, &run_size);
+        u64 offset = 0;
+        const Buffer* direct =
+            run && device_addr + size <= run_start + run_size
+                ? Vulkan::SotcGuestMemory::GetBuffer(run + (device_addr - run_start), size, &offset)
+                : nullptr;
+        if (direct && offset % std::max<u64>(instance.StorageMinAlignment(), 16) == 0) {
+            SotcStats::tex_direct_uploads.fetch_add(1, std::memory_order_relaxed);
+            SotcStats::tex_direct_bytes.fetch_add(size, std::memory_order_relaxed);
+            return {direct, offset};
+        }
+        SotcStats::tex_direct_fallbacks.fetch_add(1, std::memory_order_relaxed);
     }
     const auto staging = [&] {
         const SotcStats::SplitTimer staging_split{SotcStats::SplitTexStaging};

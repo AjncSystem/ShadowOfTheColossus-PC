@@ -16,6 +16,9 @@
 namespace Vulkan {
 class Instance;
 }
+namespace VideoCore {
+struct Buffer;
+}
 
 namespace Vulkan::SotcGuestMemory {
 
@@ -36,5 +39,11 @@ struct Span {
 
 /// The imported chunk holding [host, host + size) of the backing view.
 Span Get(const u8* host, u64 size);
+
+/// The same chunk as a buffer of the buffer cache's kind (for copies to images and the detiler);
+/// null where Get is. *offset receives the offset of host in it. Never imports on the caller's
+/// thread (an import pins 64 MiB and costs ~18 ms): a chunk not imported yet is handed to the
+/// importer thread and null is returned until it is ready.
+const VideoCore::Buffer* GetBuffer(const u8* host, u64 size, u64* offset);
 
 } // namespace Vulkan::SotcGuestMemory

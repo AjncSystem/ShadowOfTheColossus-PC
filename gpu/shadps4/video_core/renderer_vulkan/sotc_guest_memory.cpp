@@ -2,10 +2,15 @@
 // sotc: the game's memory for the GPU in place (sotc_guest_memory.h).
 
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <thread>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <vector>
 
+#include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/sotc_guest_memory.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 
@@ -21,6 +26,8 @@ struct Chunk {
     vk::DeviceMemory memory;
     vk::Buffer buffer;
     bool failed{}; ///< refused once: not asked again
+    const VideoCore::Buffer* wrapper{}; ///< GetBuffer's view of buffer, made once, never freed
+    bool queued{};                      ///< handed to the importer thread
 };
 
 const Instance* g_instance{};
@@ -77,6 +84,8 @@ bool Import(Chunk& chunk, u64 index) {
 } // namespace
 
 namespace {
+void QueueImport(Chunk& chunk, u64 index);
+void LogWhenAllIn();
 bool g_resolved{}; ///< the backing view was looked at (it exists only once the game maps memory)
 
 void Resolve() {
@@ -121,6 +130,15 @@ void Resolve() {
         return;
     }
     g_enabled = true;
+    // sotc: SOTC_PC_MEMORY_PREIMPORT=1: every chunk imported now, at boot, on the importer thread:
+    // an import while playing stalls the draw thread's own Vulkan calls (the driver locks while
+    // it pins 64 MiB), the first-entry hitch SOTC_TEX_DIRECT was meant to remove.
+    if (const char* v = std::getenv("SOTC_PC_MEMORY_PREIMPORT"); v && v[0] == '1') {
+        LogWhenAllIn();
+        for (u64 i = 1; i < g_chunks.size(); ++i) {
+            QueueImport(g_chunks[i], i);
+        }
+    }
     std::fprintf(stderr,
                  "SOTC PC memory: %llu MiB of game memory, %zu chunks of 64 MiB imported on use "
                  "(memory type %u); chunk 0 in %.1f ms\n",
@@ -169,6 +187,93 @@ Span Get(const u8* host, u64 size) {
         }
     }
     return {chunk.buffer, offset - index * kChunk};
+}
+
+namespace {
+std::mutex g_queue_mutex;
+std::chrono::steady_clock::time_point g_preimport_start;
+std::condition_variable g_queue_cv;
+std::deque<u64> g_queue;
+
+void ImporterLoop() {
+    for (;;) {
+        u64 index;
+        {
+            std::unique_lock lock{g_queue_mutex};
+            g_queue_cv.wait(lock, [] { return !g_queue.empty(); });
+            index = g_queue.front();
+            g_queue.pop_front();
+        }
+        // The import itself outside g_mutex: Get keeps answering for the chunks already in.
+        Chunk fresh;
+        const bool ok = Import(fresh, index);
+        std::scoped_lock lock{g_mutex};
+        Chunk& chunk = g_chunks[index];
+        if (chunk.buffer) { // imported meanwhile by Get (the visibility path imports in place)
+            if (ok) {
+                g_instance->GetDevice().destroyBuffer(fresh.buffer);
+                g_instance->GetDevice().freeMemory(fresh.memory);
+            }
+            continue;
+        }
+        if (ok) {
+            chunk.memory = fresh.memory;
+            chunk.buffer = fresh.buffer;
+        } else {
+            chunk.failed = true;
+        }
+        std::unique_lock queue_lock{g_queue_mutex};
+        if (g_queue.empty() && g_preimport_start.time_since_epoch().count()) {
+            std::fprintf(stderr, "SOTC PC memory: %llu MiB imported in %.1f s\n",
+                         static_cast<unsigned long long>(g_imported_bytes >> 20),
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                       g_preimport_start).count());
+            g_preimport_start = {};
+        }
+    }
+}
+
+void LogWhenAllIn() {
+    g_preimport_start = std::chrono::steady_clock::now();
+}
+
+void QueueImport(Chunk& chunk, u64 index) {
+    if (chunk.queued || chunk.failed) {
+        return;
+    }
+    chunk.queued = true;
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread{ImporterLoop}.detach(); });
+    {
+        std::scoped_lock lock{g_queue_mutex};
+        g_queue.push_back(index);
+    }
+    g_queue_cv.notify_one();
+}
+} // namespace
+
+const VideoCore::Buffer* GetBuffer(const u8* host, u64 size, u64* offset) {
+    if (!g_enabled || host < g_base || size == 0) {
+        return nullptr;
+    }
+    const u64 host_offset = static_cast<u64>(host - g_base);
+    if (host_offset + size > g_size || host_offset / kChunk != (host_offset + size - 1) / kChunk) {
+        return nullptr;
+    }
+    const u64 index = host_offset / kChunk;
+    std::scoped_lock lock{g_mutex};
+    Chunk& chunk = g_chunks[index];
+    if (!chunk.buffer) {
+        QueueImport(chunk, index);
+        return nullptr;
+    }
+    const Span span{chunk.buffer, host_offset - index * kChunk};
+    if (!chunk.wrapper) {
+        chunk.wrapper = new VideoCore::Buffer(g_instance->GetDevice(), chunk.buffer,
+                                              std::min(kChunk, g_size - index * kChunk));
+    }
+    *offset = span.offset;
+    return chunk.wrapper;
 }
 
 } // namespace Vulkan::SotcGuestMemory

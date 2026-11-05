@@ -180,6 +180,15 @@ inline bool VisDirectProgram(uint64_t hash) {
     }();
     return std::find(programs.begin(), programs.end(), hash) != programs.end();
 }
+/// sotc: SOTC_TEX_DIRECT=1 (needs SOTC_PC_MEMORY=1): textures uploaded from the game's memory
+/// are copied by the GPU straight from the imported backing view, with no CPU copy into a staging
+/// buffer (the first-entry hitch: 3-18 ms per draw of memcpy and page faults on the draw thread).
+inline const bool kTexDirect = [] {
+    const char* v = std::getenv("SOTC_TEX_DIRECT");
+    return v && v[0] == '1';
+}();
+inline std::atomic<uint64_t> tex_direct_uploads{0}, tex_direct_bytes{0}, tex_direct_fallbacks{0};
+
 /// A dispatch of one of those wrote the game's memory directly since the last label: the next
 /// end-of-pipe label waits for the GPU (draw thread only).
 inline bool vis_label_pending = false;

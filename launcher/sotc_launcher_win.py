@@ -641,6 +641,32 @@ def _shortcut_script(play, frozen, executable, port_dir, game_icon):
             + (f'$s.Arguments={_ps_quote(arguments)};' if arguments else '') + '$s.Save()')
 
 
+def clear_shader_cache_after_update(settings):
+    """sotc: 0.72.2: a port update clears the shader cache once. Shaders and pipelines built by the
+    previous port can conflict with the new one (wrong or missing effects, crashes when one is
+    loaded); the game builds them again, with some stutter at the start. The port version that
+    built the cache is kept next to it (user/cache/port_version.txt; the --play path never saves
+    the settings, so they cannot hold it)."""
+    data = user_dir(settings)
+    marker = data / 'cache' / 'port_version.txt'
+    try:
+        built_by = marker.read_text(encoding='utf-8').strip()
+    except OSError:
+        built_by = ''
+    if built_by == VERSION:
+        return
+    # A first start (no cache yet) has nothing to clear; an older cache without the marker was
+    # built by a port before 0.72.2.
+    if (data / 'cache').exists() or (data / 'shader').exists():
+        for name in ('cache', 'shader'):
+            shutil.rmtree(data / name, ignore_errors=True)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(VERSION + '\n', encoding='utf-8')
+    except OSError:
+        pass
+
+
 def load_settings():
     """Saved settings over the defaults. Older settings that turned DLSS-G on with SOTC_DLSSG=1 in
     the extra variables get the frame generation setting instead."""
@@ -673,6 +699,7 @@ def load_settings():
             if before < sotc_update.version_key(version):
                 settings.update(values)
     settings['settings_version'] = VERSION
+    clear_shader_cache_after_update(settings)
     if 'framegen' not in saved:
         extra = str(settings.get('extra_env', '')).split()
         if 'SOTC_DLSSG=1' in extra:

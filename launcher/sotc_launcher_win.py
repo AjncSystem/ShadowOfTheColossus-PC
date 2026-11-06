@@ -771,6 +771,7 @@ def game_environment(s):
     info = game_info(s['game_dir'])
     if info and info[1] != '?':
         env['SOTC_GAME_VERSION'] = info[1]  # window title (with the frame rate)
+    env['SOTC_PORT_VERSION'] = VERSION  # sotc: window title
     icon = window_icon_file(s)
     if icon:
         env['SOTC_WINDOW_ICON'] = str(icon)

@@ -1,5 +1,6 @@
 // bbport: SDL3 window for the Vulkan swapchain (X11 or Wayland).
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -118,6 +119,12 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     }
     if (const char* version = std::getenv("SOTC_GAME_VERSION"); version && *version) {
         title_suffix = std::string(" · v") + version;
+    }
+    // sotc: the port's version (SOTC_PORT_VERSION, from the launcher).
+    if (const char* port = std::getenv("SOTC_PORT_VERSION"); port && *port) {
+        title_suffix += std::string(" · Port v") + port;
+    }
+    if (!title_suffix.empty()) {
         UpdateTextTitle();
     }
 #ifdef _WIN32
@@ -180,7 +187,8 @@ int WindowSDL::PollTextInput(std::string& out) {
     return text_state;
 }
 
-// sotc: the window title shows the game version and the frame rate, refreshed once a second.
+// sotc: the window title shows the game and port versions, the frame rate and how long the game
+// has been open (h:mm:ss), refreshed once a second.
 void WindowSDL::UpdateTitleStats() {
     const u64 now = SDL_GetTicks();
     if (now - title_ticks < 1000) {
@@ -190,9 +198,15 @@ void WindowSDL::UpdateTitleStats() {
     if (title_ticks != 0) {
         const double fps = double(flips - title_flips) * 1000.0 / double(now - title_ticks);
         const char* version = std::getenv("SOTC_GAME_VERSION");
-        char suffix[64];
-        std::snprintf(suffix, sizeof(suffix), "%s%s · %.0f FPS",
-                      version && *version ? " · v" : "", version ? version : "", fps);
+        const char* port = std::getenv("SOTC_PORT_VERSION");
+        static const auto opened = std::chrono::steady_clock::now() - std::chrono::seconds{1};
+        const long long s = std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::steady_clock::now() - opened).count();
+        char suffix[128];
+        std::snprintf(suffix, sizeof(suffix), "%s%s%s%s · %.0f FPS · %lld:%02lld:%02lld",
+                      version && *version ? " · v" : "", version ? version : "",
+                      port && *port ? " · Port v" : "", port ? port : "", fps, s / 3600,
+                      s / 60 % 60, s % 60);
         title_suffix = suffix;
         UpdateTextTitle();
     }

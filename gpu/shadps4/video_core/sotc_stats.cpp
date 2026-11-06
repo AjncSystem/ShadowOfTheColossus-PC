@@ -52,4 +52,19 @@ uint64_t SplitProcessFaults() {
 }
 #endif
 
+void LogSystemMemory() {
+#ifdef _WIN32
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) {
+        std::fprintf(stderr,
+                     "SOTC system memory: commit %llu of %llu MiB in use, RAM %llu of %llu MiB free\n",
+                     static_cast<unsigned long long>((status.ullTotalPageFile - status.ullAvailPageFile) >> 20),
+                     static_cast<unsigned long long>(status.ullTotalPageFile >> 20),
+                     static_cast<unsigned long long>(status.ullAvailPhys >> 20),
+                     static_cast<unsigned long long>(status.ullTotalPhys >> 20));
+    }
+#endif
+}
+
 } // namespace SotcStats

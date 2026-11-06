@@ -204,6 +204,8 @@ void RegisterSplitThread(SplitThread which);
 uint64_t SplitThreadCycles(SplitThread which);
 /// Page faults of the whole process so far (GetProcessMemoryInfo), 0 where unknown.
 uint64_t SplitProcessFaults();
+/// Commit charge and free RAM, to stderr (session log); sotc_stats.cpp.
+void LogSystemMemory();
 /// A texture copy of `bytes` from guest memory: its wall time goes to SplitTexCopy and the counts
 /// to SplitTexBytes..SplitTexFaults (draw thread only, SOTC_DRAW_SPLIT).
 struct SplitTexCopyScope {

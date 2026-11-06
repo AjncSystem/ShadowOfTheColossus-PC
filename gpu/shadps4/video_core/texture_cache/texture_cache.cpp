@@ -1158,7 +1158,7 @@ void TextureCache::RefreshImage(Image& image) {
         return;
     }
 
-    // sotc: SOTC_UPLOAD_BUDGET_MB (default 32, 0 = off). Entering a new area, the game binds about
+    // sotc: SOTC_UPLOAD_BUDGET_MB (default 0 = off, see below). Entering a new area, the game binds about
     // 100 MB of new textures in one frame and that frame took 80-130 ms to upload them. Past the
     // budget, the first upload of a big colour texture waits for a later frame (the first upload
     // of each frame always goes through); meanwhile the image holds zeros, put in on the GPU once,
@@ -1166,10 +1166,13 @@ void TextureCache::RefreshImage(Image& image) {
     // sotc: an image is deferred for at most kMaxDeferFlips flips from its first deferral, then
     // uploaded whatever the budget: when other uploads used the budget ahead of it in every frame,
     // it stayed black for good (the Bluepoint logo and the autosave notice never showed, 29 Oct).
+    // sotc: off by default since 6 Nov. A/B of 32 / 0 / 64 on three boss jumps and the ride: no fewer
+    // slow frames with it, on area loads either, while a texture drawn only once into something
+    // kept (AjncSystem #380: black textures, gone with 0) stays black for good.
     constexpr u64 kMaxDeferFlips = 2;
     static const u64 upload_budget = [] {
         const char* v = std::getenv("SOTC_UPLOAD_BUDGET_MB");
-        return (v ? std::strtoull(v, nullptr, 10) : 32ull) << 20;
+        return (v ? std::strtoull(v, nullptr, 10) : 0ull) << 20;
     }();
     static u64 budget_flip = ~0ull, budget_used = 0;
     if (upload_budget) {

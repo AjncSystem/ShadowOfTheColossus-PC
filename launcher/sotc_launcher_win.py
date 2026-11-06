@@ -857,6 +857,10 @@ def game_environment(s):
     # the same double free: on again (tested with the above).
     env.setdefault('SOTC_GUARD_STALE', '1')
     env.setdefault('SOTC_GUARD_USER_POINTER', '1')
+    # sotc: 0.72.2 (T51): at the end of the game the game returns page pool pages under textures
+    # it goes on drawing; a refresh then uploaded another texture's bytes into them (stretched
+    # textures, flicker, the close between the ending and the intro). Two clean ending runs.
+    env.setdefault('SOTC_POOL_FREEZE', '1')
     # sotc: "Maximum" in PS4 Pro mode exhausted the game's page pool within minutes at the Shrine
     # (0x1a371, 22 Oct) until tabnul's page allocator fix (PR #288, sotc_modes.py POOL_FIX): an
     # hour without a crash with it (26 Oct). Experimental there; SOTC_MAX_IN_PRO=0 brings back High.

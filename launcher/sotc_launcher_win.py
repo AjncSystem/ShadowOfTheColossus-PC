@@ -861,6 +861,16 @@ def game_environment(s):
     # it goes on drawing; a refresh then uploaded another texture's bytes into them (stretched
     # textures, flicker, the close between the ending and the intro). Two clean ending runs.
     env.setdefault('SOTC_POOL_FREEZE', '1')
+    # sotc: 0.72.2 (T48): an unmap's arena release waited for all the GPU work, 28-63 times a
+    # frame at area changes (10-20 ms a frame); now once the GPU passed the unmap.
+    env.setdefault('SOTC_RELEASE_DEFER', '1')
+    # sotc: 0.72.2 (T48): new textures read by the GPU in the game's memory (no CPU copy at the
+    # first entry of an area; forest 14 -> 9-10 slow frames). The game's 10 GB are imported at
+    # boot (~2.6 s) and stay pinned in RAM: only with 24 GB or more.
+    if (sotc_hardware.memory_gb() or 0) >= 24:
+        env.setdefault('SOTC_PC_MEMORY', '1')
+        env.setdefault('SOTC_PC_MEMORY_PREIMPORT', '1')
+        env.setdefault('SOTC_TEX_DIRECT', '1')
     # sotc: "Maximum" in PS4 Pro mode exhausted the game's page pool within minutes at the Shrine
     # (0x1a371, 22 Oct) until tabnul's page allocator fix (PR #288, sotc_modes.py POOL_FIX): an
     # hour without a crash with it (26 Oct). Experimental there; SOTC_MAX_IN_PRO=0 brings back High.

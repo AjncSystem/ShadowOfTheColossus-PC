@@ -29,6 +29,14 @@ BENCH_SECONDS=330 bash tools/sotc_bench_attract.sh || true
 if [[ -d out/save-template/CUSA08809 || -d out/save-template/CUSA08034 ]]; then
     BENCH_MEASURE=60 bash tools/sotc_bench_shrine.sh --timeout 400 || true
 fi
+# World streaming: the ride benchmark's draw thread is where the open-world stutter is. It runs from
+# a port folder, PGO_RIDE_INSTALL (SotC-PC with launcher/ and user/), whose exe is swapped meanwhile.
+if [[ -n ${PGO_RIDE_INSTALL:-} ]]; then
+    cp "$PGO_RIDE_INSTALL/bin/bb-probe.exe" "$PGO_RIDE_INSTALL/bin/bb-probe.exe.pgo-backup"
+    cp out/gpu-pgogen/bb-probe.exe "$PGO_RIDE_INSTALL/bin/bb-probe.exe"
+    "${PY:-/c/PyBuild312/python.exe}" tools/sotc_ride_bench.py --install "$PGO_RIDE_INSTALL" || true
+    mv -f "$PGO_RIDE_INSTALL/bin/bb-probe.exe.pgo-backup" "$PGO_RIDE_INSTALL/bin/bb-probe.exe"
+fi
 ls pgo/*.profraw >/dev/null 2>&1 || { echo 'No profile was written' >&2; exit 1; }
 llvm-profdata merge -o pgo/bbgpu.profdata pgo/*.profraw
 rm -f pgo/*.profraw

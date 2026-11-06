@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.72.1-opt13 — 2026-11-06
+- **Muito menos engasgos ao percorrer o mundo.** No teste de percurso (RTX 3060 Laptop, 5 minutos, modo 60 FPS),
+  comparado ao código da 0.70-opt12: quadros acima de 33 ms 515 → 205, acima de 50 ms 141 → 34, p99 50 → 35 ms,
+  pior quadro 233 → 152 ms, 50,8 → 52,7 FPS. Os quadros acima de 100 ms caíram pouco (12 → 9). Vem de menos travas
+  de memória na thread de desenho, do guarda do heap do jogo e de tabelas de memória em blocos.
+- **Colossos em cenas pesadas:** alvos de renderização temporários são reaproveitados em vez de recriados a cada
+  quadro. Colosso 13: 41,1 → 43,8 FPS e cerca de 60% menos quadros acima de 33 ms. Colosso 3: 41,5 → 42,8 FPS e
+  cerca de 30% menos. No percurso o ganho disso é pequeno. `SOTC_RT_STASH=0` desliga.
+- **Congelamento corrigido:** o jogo podia parar para sempre numa leitura de memória que falhava sem fim. O registro
+  da sessão agora nomeia esse caso (`SOTC FAULT LOOP`).
+- **Texturas pretas:** o limite de envio de texturas por quadro agora vem desligado. Uma textura adiada podia ficar
+  preta de vez. Quem preferir o limite antigo usa `SOTC_UPLOAD_BUDGET_MB=32`.
+- **Atraso de controle em 30 FPS** (#128): os quadros não se acumulam mais atrás do limitador (espera 261 → 48 ms).
+- **Erro 487 ao abrir** (#110): o jogo tenta de novo sozinho quando outro programa ocupa o endereço de que precisa.
+- **DLAA** no lançador: DLSS na resolução nativa, de tabnul. Consome mais memória de vídeo.
+- **Quedas raras corrigidas:** um formato de shader impossível não encerra mais o jogo, e uma falha aninhada dentro
+  do tratador de exceções agora aparece no registro em vez de fechar o jogo sem aviso.
+- O cache de shaders é refeito na primeira abertura, então a primeira sessão engasga mais.
+
 ## 0.72.1 — 2026-11-03
 - **Placas com menos de 8 GB de memória de vídeo: perfil leve automático.** As melhorias de textura da 0.72
   (Máxima no mip 0 com os bancos mantidos 3 s e sem a proteção de emergência do pool, Alta no mip 1) usavam

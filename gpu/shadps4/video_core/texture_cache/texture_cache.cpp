@@ -1854,6 +1854,9 @@ void TextureCache::GarbageCollectImages() {
 
     const auto configure = [&](bool allow_aggressive) {
         pressured = total_used_memory >= pressure_gc_memory;
+        if (pressured) {
+            ClearImageStash();
+        }
         aggresive = allow_aggressive && total_used_memory >= critical_gc_memory;
         ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
         ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
@@ -2591,6 +2594,10 @@ void TextureCache::UnparkImage(ImageId image_id) {
     image.sotc_has_data = false;
     image.sotc_zero_filled = false;
     image.sotc_deferred_flip = ~0ull;
+    image.sotc_shadow_saving = 0;
+    image.sotc_first_hash = 0;
+    image.sotc_uploads = 0;
+    image.sotc_upload_from_guest = false;
     image.RenewIdentity();
     {
         std::unique_lock lk{download_images_mutex};

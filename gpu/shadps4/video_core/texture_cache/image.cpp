@@ -116,8 +116,23 @@ void UniqueImage::Destroy() {
 void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     this->image_ci = image_ci;
     ASSERT(!image);
+    // sotc: SOTC_IMAGE_DEDICATED=1: images of 2048x2048 texels and more (per layer, x layers)
+    // get memory of their own. Shared 64 MiB blocks kept up to 1.7 GB of free space after an
+    // area's textures went (blocks only go back to the driver when empty), over the budget on
+    // 8 GB cards (T48, 05/11). SOTC_IMAGE_DEDICATED_TEXELS sets the threshold.
+    static const u64 dedicated_texels = [] {
+        const char* v = std::getenv("SOTC_IMAGE_DEDICATED");
+        if (!v || v[0] != '1') {
+            return ~u64{0};
+        }
+        const char* t = std::getenv("SOTC_IMAGE_DEDICATED_TEXELS");
+        return t ? std::strtoull(t, nullptr, 10) : u64{2048} * 2048;
+    }();
+    const u64 texels = u64{image_ci.extent.width} * image_ci.extent.height *
+                       image_ci.extent.depth * image_ci.arrayLayers;
     const VmaAllocationCreateInfo alloc_ci = {
-        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
+        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT |
+                 (texels >= dedicated_texels ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0u),
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         .requiredFlags = 0,
         .preferredFlags = 0,

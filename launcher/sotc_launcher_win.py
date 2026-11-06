@@ -864,6 +864,9 @@ def game_environment(s):
     # sotc: 0.72.2 (T48): an unmap's arena release waited for all the GPU work, 28-63 times a
     # frame at area changes (10-20 ms a frame); now once the GPU passed the unmap.
     env.setdefault('SOTC_RELEASE_DEFER', '1')
+    # sotc: 0.72.2: images of 2048x2048 and more get memory of their own: the shared 64 MiB
+    # blocks kept up to 1.8 GB free after an area's textures went (over the budget on 8 GB cards).
+    env.setdefault('SOTC_IMAGE_DEDICATED', '1')
     # sotc: 0.72.2 (T48): new textures read by the GPU in the game's memory (no CPU copy at the
     # first entry of an area; forest 14 -> 9-10 slow frames). The game's 10 GB are imported at
     # boot (~2.6 s) and stay pinned in RAM: only with 24 GB or more.

@@ -18,6 +18,8 @@
 - **Experimental (desligado): texturas lidas pela GPU direto na memória do jogo** (`SOTC_TEX_DIRECT=1`, com `SOTC_PC_MEMORY=1` e `SOTC_PC_MEMORY_PREIMPORT=1`, que importa os 10 GB da memória do jogo no boot em ~2,6 s): sem a cópia pela CPU na primeira entrada de uma área. Entrada da floresta no teste do usuário: 14 → 9 quadros acima de 50 ms.
 - **Experimental (desligado): liberação de memória do unmap sem esperar a GPU inteira** (`SOTC_RELEASE_DEFER=1`): na troca de área cada liberação esperava todo o trabalho da GPU, 28–63 vezes por quadro (10–20 ms por quadro). **Corrigido também** o travamento ao carregar um save com `SOTC_VIS_DIRECT=1` (rótulos de fim de pipe escritos fora de ordem).
 - **Final do jogo sem texturas esticadas e sem fechar na passagem para a intro (ligado por padrão)** (`SOTC_POOL_FREEZE=1`, T51): no fim do jogo o jogo devolve a memória de texturas que ainda desenha; quando outra textura pega essa memória o port recarregava o conteúdo novo na textura ainda em uso (texturas esticadas, piscadas e a queda na passagem do final para a intro). Agora essas texturas ficam como estavam por 400 quadros.
+- **Menos memória de vídeo presa depois das trocas de área (ligado por padrão):** texturas de 2048×2048 ou mais têm memória própria e voltam ao driver quando saem; antes até 1,8 GB ficava reservado e vazio, passando do limite em placas de 8 GB (`SOTC_IMAGE_DEDICATED=0` desliga).
+- **Liberação de memória sem espera na troca de área e texturas lidas direto pela placa (ligados por padrão; as texturas diretas só com 24 GB de RAM ou mais).**
 
 ## 0.72.1 — 2026-11-03
 - **Placas com menos de 8 GB de memória de vídeo: perfil leve automático.** As melhorias de textura da 0.72

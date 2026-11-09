@@ -528,6 +528,13 @@ static ABI int32_t save_search(const SearchCond *cond, SearchResult *result) {
     }
     result->set_count=set;
     free(entries);
+    if (getenv("SOTC_SAVE_TRACE")) {
+        printf("Runtime: sceSaveDataDirNameSearch order=%u, capacity %u, params %s:",cond->order,
+               result->names_capacity,result->params ? "yes" : "no");
+        for (uint32_t i=0;i<set && result->names;++i)
+            printf(" %.32s(user_param %u)",result->names[i].data,result->params ? result->params[i].user_param : 0);
+        printf("\n");
+    }
     if (getenv("SOTC_SAVE_TRACE"))
         printf("Runtime: sceSaveDataDirNameSearch('%.32s', key=%u) -> %u hits\n",cond->dir ? cond->dir->data : "",
                cond->key,result->hits);

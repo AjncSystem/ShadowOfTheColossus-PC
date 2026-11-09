@@ -1,7 +1,6 @@
 # Changelog
 
 ## 0.73 — 2026-11-09
-- **"Continuar" da tela de título com o resumo zerado corrigido:** o jogo grava o perfil e o save no mesmo segundo, e o port ordenava os saves por data só em segundos: o perfil empatava com o save e às vezes vinha antes, e o "Continuar" mostrava lugar, 00:00:00 e 0 colossos até um save ser carregado. A ordem agora usa a hora exata da gravação.
 - **Final do jogo sem quedas:** os dois atalhos da guarda do heap (`SOTC_GUARD_STALE`, `SOTC_GUARD_USER_POINTER`), religados na 0.72, estragavam a memória do jogo no final (objetos zerados, alocador em `0x499cc`), como o T49 já suspeitava para a `0x49800`. Voltam a ficar desligados; com eles desligados o final e o pulo da intro passaram sem nenhuma queda e sem nada a reparar.
 - **Quedas no final do jogo (tela "Fim" e passagem para a intro) corrigidas do mesmo jeito que a `0x564d24`:** o jogo ia destruir um objeto cuja memória já estava zerada (`0x144c60`, `0x14934f`) ou soltar uma referência de um objeto inexistente (`0x14cce7`); o port pula esse objeto como o jogo faz quando ele não existe (`SOTC_FIX_NULL_OBJECTS=0` desliga).
 - **Mosaico no Time Attack corrigido** (vinha da correção do final, `SOTC_POOL_FREEZE`): ao entrar numa arena o jogo põe texturas novas onde estavam as antigas, e a correção mantinha o conteúdo antigo por 400 quadros. Agora um carregamento (save, área, arena) solta tudo o que ela segurava e ela não age nos 90 s seguintes; no final do jogo, onde ela é necessária, não há carregamento no meio.

@@ -1086,6 +1086,12 @@ const u64 kPoolFreezeTicks = [] {
     return v ? std::strtoull(v, nullptr, 10) : u64{400};
 }();
 std::atomic<u64> g_freeze_marked{0}, g_freeze_held{0};
+// sotc: a load (save, area, Time Attack arena) brings new textures at the addresses the old ones
+// had, and the game writes them at once: a freeze kept the old contents there (mosaic in the
+// Time Attack, 9 Nov). A load lifts every freeze and none starts for 90 s after it; the ending
+// (T51) has no load in between. The tick of the last load and its time.
+std::atomic<u64> g_freeze_load_tick{0};
+std::atomic<std::chrono::steady_clock::rep> g_freeze_load_time{0};
 } // namespace
 
 void TextureCache::RefreshImage(Image& image) {
@@ -1093,7 +1099,9 @@ void TextureCache::RefreshImage(Image& image) {
         return;
     }
     if (image.sotc_freeze_until && False(image.flags & ImageFlagBits::GpuDirty)) {
-        if (scheduler.CurrentTick() < image.sotc_freeze_until) {
+        if (scheduler.CurrentTick() < image.sotc_freeze_until &&
+            image.sotc_freeze_until - kPoolFreezeTicks >=
+                g_freeze_load_tick.load(std::memory_order_relaxed)) {
             g_freeze_held.fetch_add(1, std::memory_order_relaxed);
             return; // stays dirty: refreshed once the freeze ends
         }
@@ -2141,7 +2149,12 @@ void TextureCache::PoolFreeze() {
     constexpr VAddr PoolBase = 0x1000300000;
     constexpr u64 PageBytes = 64_KB;
     const u64 tick = scheduler.CurrentTick();
-    {
+    const auto since_load =
+        std::chrono::steady_clock::now().time_since_epoch() -
+        std::chrono::steady_clock::duration{g_freeze_load_time.load(std::memory_order_relaxed)};
+    const bool after_load = g_freeze_load_time.load(std::memory_order_relaxed) != 0 &&
+                            since_load < std::chrono::seconds{90};
+    if (!after_load) {
         std::scoped_lock lock{mutex};
         for (size_t w = 0; w < now.size(); ++w) {
             for (u64 bits = now[w] & ~prev[w]; bits; bits &= bits - 1) {
@@ -2612,6 +2625,10 @@ void TextureCache::RunGarbageCollector() {
     }
     if (SotcStats::load_flush.exchange(false, std::memory_order_relaxed)) {
         EmergencyCollect(2); // sotc: a load began (sotc_stats.h)
+        // sotc: SOTC_POOL_FREEZE: freezes end with a load (see g_freeze_load_tick).
+        g_freeze_load_tick.store(scheduler.CurrentTick(), std::memory_order_relaxed);
+        g_freeze_load_time.store(std::chrono::steady_clock::now().time_since_epoch().count(),
+                                 std::memory_order_relaxed);
     }
     if (SotcStats::reload_all.exchange(false, std::memory_order_relaxed)) {
         // Textures marked GPU-written although no draw targets them (copies, ExpandImage) are

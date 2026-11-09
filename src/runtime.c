@@ -252,6 +252,10 @@ uintptr_t runtime_resolve(const char *scoped, int is_data) {
     if (file) return file;
     uintptr_t fiber = runtime_fiber_resolve(name);
     if (fiber) return fiber;
+    /* sotc: the software NGS2 mixer (runtime_ngs2.c) before runtime_sotc.c's silent stand-ins;
+     * the player's own libSceNgs2.sprx still wins when it is linked (probe.c prefer_native). */
+    uintptr_t ngs2 = runtime_ngs2_resolve(name);
+    if (ngs2) return ngs2;
     uintptr_t sotc = runtime_sotc_resolve(name);
     if (sotc) return sotc;
     return bbgpu_resolve(name);

@@ -48,7 +48,7 @@ CONFIG_FILE = CONFIG_DIR / 'launcher_settings.json'
 from sotc_modes import GAMES  # noqa: E402
 GAME_ID = 'CUSA08809'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.72.2'
+VERSION = '0.73'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -880,13 +880,16 @@ def game_environment(s):
         # the measured mips, finer mips (High 1, Maximum 0, both were 2) and, on Maximum, banks
         # kept sampled for 3 s (they had exhausted the pool, 0x1a371).
         env.setdefault('SOTC_LOD_FEEDBACK', '1')
-        # sotc: 0.72.2: the finer mips (High 1, Maximum 0) and Maximum's 3 s linger without the
-        # page pool switch brought back the hard FPS drop at area changes that 0.70 had removed:
-        # texture copies of up to 1.1 GB in one frame, worst frames 134-293 ms at the forest
-        # entrance (5 Nov). Mip 1 alone dropped as hard; mip 2 with the 1-tick linger and the
-        # switch (as in 0.71) was "much smoother, 2-3 FPS for 2 s". Both qualities stay at mip 2
-        # (sotc_lod_stats.h default); SOTC_LOD_LEVEL / SOTC_LOD_LINGER / SOTC_LOD_POOL_LOW in the
-        # extra variables still choose otherwise.
+        # sotc: 0.72.2 had put both qualities back at mip 2: the finer mips with Maximum's 3 s
+        # linger and no page pool switch copied up to 1.1 GB of textures in a frame at the forest
+        # entrance (5 Nov). That left Maximum (the Extreme mode) blurry. Now the finer mips are
+        # back (High 1, Maximum 0, light profile Maximum 1 / High 2), without the 3 s linger and
+        # with the pool switch: the copies go through the GPU (SOTC_TEX_DIRECT) and the area
+        # change fixes since then (T48). SOTC_LOD_LEVEL / _LINGER / _POOL_LOW still override.
+        if light:
+            env.setdefault('SOTC_LOD_LEVEL', '1' if textures == 'max' else '2')
+        else:
+            env.setdefault('SOTC_LOD_LEVEL', '0' if textures == 'max' else '1')
     # sotc: the heap guard's two shortcuts, off since 0.70 for the 0x49800 crash, which came from
     # the same double free: on again (tested with the above).
     env.setdefault('SOTC_GUARD_STALE', '1')

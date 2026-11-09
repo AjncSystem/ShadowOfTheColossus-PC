@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.73 — 2026-11-09
+- **Junta a 0.72.1-opt13 do Oussama268:** muito menos engasgos ao percorrer o mundo (menos travas de memória na thread de desenho, guarda do heap do jogo e tabelas de memória em blocos), alvos de renderização temporários reaproveitados nos colossos pesados (`SOTC_RT_STASH`), leitura suja da GPU refeita pela própria thread do jogo (`SOTC_RB_REQUEUE`, no lugar do nosso `SOTC_RB_DIRTY_RETRY` experimental), limite de envio de texturas desligado (texturas pretas), quadros que não se acumulam atrás do limitador (atraso de controle a 30 FPS, #128), nova tentativa no erro 487 ao abrir (#110), DLAA no lançador e quedas raras corrigidas (formato SnormNz, falha aninhada no tratador de exceções). Nossa consulta de memória sem trava (`SOTC_CLAMP_GAP`) foi trocada pela dele (`SOTC_CLAMP_FAST`).
+- **Modo Extremo nítido de novo:** a 0.72.2 tinha posto Alta e Máxima no mip 2 e a Máxima (texturas do modo Extremo) ficou borrada. Voltam a Alta no mip 1 e a Máxima no mip 0 (perfil leve: Máxima 1, Alta 2), agora sem os 3 s de bancos mantidos e com a proteção do reservatório de páginas, que causavam as cópias de até 1,1 GB num quadro na floresta.
+
 ## 0.72.2 — 2026-11-05
 - **Título da janela com a versão do port e o tempo de jogo:** `SHADOW OF THE COLOSSUS™ · v01.01 · Port v0.72.2 · 60 FPS · 0:12:34`.
 - **Atualizar o port limpa o cache de shaders uma vez** (o lançador guarda a versão que montou o cache em `user/cache/port_version.txt`): shaders montados pela versão anterior podiam conflitar com a nova. A primeira partida depois da atualização engasga um pouco enquanto o cache é refeito. O botão "Limpar cache de shaders" continua nas configurações.

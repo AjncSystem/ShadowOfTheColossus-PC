@@ -462,8 +462,15 @@ GraphicsPipeline::GraphicsPipeline(
                     vk::to_string(pipeline_result));
         return;
     }
-    ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
-               vk::to_string(pipeline_result));
+    if (pipeline_result != vk::Result::eSuccess) {
+        // sotc: a driver that refuses a pipeline (ErrorUnknown on a Radeon RX 6750 XT near the
+        // 4th colossus, AjncSystem issue #397) ended the game here with an assertion. Left
+        // without a handle, its draws are skipped (PipelineCache::GetGraphicsPipeline) and it is
+        // not saved in the pipeline cache: a missing effect instead of a crash.
+        std::fprintf(stderr, "SOTC PIPELINE FAILED graphics %s: %s (its draws are skipped)\n",
+                     debug_str.c_str(), vk::to_string(pipeline_result).c_str());
+        return;
+    }
     pipeline = std::move(pipe);
     SetObjectName(device, *pipeline, "Graphics Pipeline {}", debug_str);
 }

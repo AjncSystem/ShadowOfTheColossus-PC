@@ -778,9 +778,14 @@ void PipelineCache::CollectAsyncPipelines() {
             }
             continue;
         }
+        // sotc: one the driver refused stays in the map without a handle (its draws are
+        // skipped, nothing builds it again) and is not saved in the cache.
+        const bool built = static_cast<bool>(job->pipeline->Handle());
         it.value() = std::move(job->pipeline);
-        RegisterPipelineData(job->key, job->hash, job->sdata);
-        ++num_new_pipelines;
+        if (built) {
+            RegisterPipelineData(job->key, job->hash, job->sdata);
+            ++num_new_pipelines;
+        }
     }
 }
 
@@ -1018,7 +1023,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                         sync_start, infos[3] ? infos[3]->pgm_hash : 0, // vertex
                         infos[0] ? infos[0]->pgm_hash : 0);              // fragment
 
-        if (!queued) { // a queued one registers when collected (or was preloaded)
+        // A queued one registers when collected (or was preloaded); a refused one never.
+        if (!queued && it.value()->Handle()) {
             RegisterPipelineData(graphics_key, pipeline_hash, sdata);
             ++num_new_pipelines;
         }
@@ -1031,6 +1037,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                 }
             }
         }
+    }
+    // sotc: a pipeline the driver refused has no handle: the draws that need it are skipped.
+    if (!it->second->Handle()) {
+        return nullptr;
     }
     std::memcpy(&last_graphics_key, &graphics_key, sizeof(graphics_key));
     last_graphics_pipeline = it->second.get();

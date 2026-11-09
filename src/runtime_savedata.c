@@ -6,6 +6,9 @@
  * A mounted directory appears to the guest as /savedata0../savedata15.
  * Metadata lives beside the directory so the guest's own files are untouched. */
 #define _GNU_SOURCE
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include "runtime.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -464,12 +467,26 @@ static int like(const char *s, const char *p) {
     if (*p=='%') { for (;;++s) { if (like(s,p+1)) return 1; if (!*s) return 0; } }
     return *s && (*p=='_' || *p==*s) && like(s+1,p+1);
 }
-typedef struct { char name[32]; Param param; uint64_t blocks, free_blocks; } Entry;
+typedef struct { char name[32]; Param param; uint64_t blocks, free_blocks; int64_t sort_time; } Entry;
+/* sotc: param.bin's modification time in 100 ns units for the time order (key 3). The game writes
+ * its profile and the progress save in the same second, and with whole seconds the two tied: the
+ * title screen's "Continue" then took the profile as the latest save and showed its summary as
+ * zeros (place, 00:00:00, 0 colossi) until a save was loaded (user, 9 Nov). */
+static int64_t precise_mtime(const char *meta) {
+    char path[700]; snprintf(path,sizeof(path),"%s/param.bin",meta);
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    if (GetFileAttributesExA(path,GetFileExInfoStandard,&a))
+        return (int64_t)(((uint64_t)a.ftLastWriteTime.dwHighDateTime<<32)|a.ftLastWriteTime.dwLowDateTime);
+#endif
+    struct stat st;
+    return stat(path,&st) ? 0 : (int64_t)st.st_mtime*10000000;
+}
 static uint32_t sort_key, sort_order;
 static int compare(const void *a, const void *b) {
     const Entry *x=a, *y=b;
     int c = sort_key==1 ? (x->param.user_param>y->param.user_param)-(x->param.user_param<y->param.user_param)
-          : sort_key==3 ? (x->param.mtime>y->param.mtime)-(x->param.mtime<y->param.mtime)
+          : sort_key==3 ? (x->sort_time>y->sort_time)-(x->sort_time<y->sort_time)
           : strcmp(x->name,y->name);
     return sort_order ? -c : c;
 }
@@ -492,6 +509,7 @@ static ABI int32_t save_search(const SearchCond *cond, SearchResult *result) {
         snprintf(entries[count].name,32,"%s",e->d_name);
         char meta[680]; snprintf(meta,sizeof(meta),"%s/%s.sce_sys",base,e->d_name);
         read_param(meta,&entries[count].param);
+        entries[count].sort_time=precise_mtime(meta);
         space(host,meta,&entries[count].blocks,&entries[count].free_blocks);
         ++count;
     }

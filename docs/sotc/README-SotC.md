@@ -60,11 +60,13 @@ Tudo isto está no lançador, na página **Imagem e FPS** (e os principais em **
   da tela; a tela cheia usa o monitor inteiro.
 - **60 FPS** (experimental): tira o limite de 30 FPS do jogo (patch GoldHEN de illusion), com
   vblank a 120 Hz. Mediu 38 FPS no campo aberto e ~25 no templo.
-- **Reutilização de binds** (desligada por padrão desde a 0.60.6; `SOTC_FAST_BIND=1` liga): pula
+- **Reutilização de binds** (ligada por padrão; `SOTC_FAST_BIND=0` desliga): pula
   a remontagem dos descritores quando o desenho seguinte usa o mesmo pipeline, recursos e
   uniforms. Medido no Santuário: ~25 → 30 FPS. Na 0.60.5 deixava pontos pretos em grade no chão de
-  areia; a correção aguarda teste.
+  areia; com a correção o chão de areia do demo ficou limpo.
 - **Texturas nítidas**: filtro anisotrópico 16x, quase sem custo.
+- **HDR**: saída HDR10 com a renderização HDR do próprio jogo; o HDR do Windows precisa estar
+  ligado. O branco fica em 200 nits (`SOTC_HDR_WHITE` muda). Funciona com FSR 1 e DLSS.
 - **Modo PS4 Pro**: o jogo se vê num PS4 Pro e oferece no próprio menu (Opções > Apresentação)
   o Modo Grafismo **Cinematográfico** (1440p, mais detalhe) ou **Desempenho**. É mais pesado:
   ~25 FPS no campo aberto.
@@ -160,10 +162,16 @@ Estas variáveis de ambiente ajudam a investigar problemas:
 | `BB_FAULT_RING=arquivo` | grava as últimas exceções (sobrevive a quedas) |
 | `BB_STACKS_TRIGGER=arquivo` | criar o arquivo despeja as pilhas das threads |
 | `BB_READBACKS=0/1/2` | leituras da GPU; o padrão 2 é o exigido pelo jogo |
-| `SOTC_FAST_BIND=1` | reaproveita binds de descritores entre desenhos iguais (padrão: desligado desde a 0.60.6) |
+| `SOTC_FAST_BIND=0` | desliga o reaproveitamento de binds de descritores entre desenhos iguais (padrão: ligado) |
 | `SOTC_RECORD_THREAD=0` | grava os comandos Vulkan na própria thread de comandos (padrão: thread própria) |
 | `SOTC_INDIRECT_DIRECT=0` | mantém indiretos os draws cujos argumentos estão na CPU |
 | `SOTC_WAIT_MARKER=1/2` | esperas pela GPU consultam um marcador escrito por ela (experimental) |
 | `SOTC_CMD_STATS=1/2` | draws e dispatches por quadro (2: shaders de compute mais usados) |
 | `SOTC_TSC=qpc/native` | relógio do jogo: `qpc` sempre usa o QPC do Windows, `native` sempre o TSC do processador (padrão: QPC só quando os núcleos discordam no TSC) |
+| `SOTC_HEAP_TRACK=arquivo` | só em builds com `-DBB_HEAP_TRACK=ON`: a cada minuto grava as pilhas de chamada que mais seguram memória do heap (vazamentos); `tools/heap_track_report.py` compara dois relatórios |
+| `SOTC_WS_DIAG=1` | linha `SOTC WS` a cada 5 s: quanto as cópias de buffers da GPU copiaram, quantas páginas de origem/staging estavam fora do working set (falhas de página), falhas de página do processo, heap de memória do host do Vulkan e memória zerada ao liberar |
+| `SOTC_AMD_WAVE32=1` | só AMD, para testar nas GCN (RX 470-590, Vega, integradas): os shaders são convertidos para 32 lanes, como faz a camada SotC-AMD-Fix (personagens piscando em branco). O cache de shaders é refeito; o log mostra `GPU: AMD wave32 on`. De Lucas-blip-png |
+| `SOTC_SLOW_BUILD_MS=500` | o log mostra `SOTC SLOW BUILD` para cada pipeline construído em segundo plano (ou esperado pela gravação de comandos) que levou esse tempo ou mais; `SOTC SYNC PIPELINE` mostra os construídos na thread de comandos acima de 30 ms (`SOTC_SYNC_PIPELINE_MS`). Para as travadas longas nas placas Intel Arc |
+| `SOTC_HDR_WHITE=nits` | com HDR: o branco do jogo em nits (padrão 200; a saída do próprio jogo tem ~100) |
+| `SOTC_EVICT_ASYNC=0` | a devolução de memória fria das arenas espera a GPU no processador de comandos, como antes (~44 ms por vez) |
 | `SOTC_UI_HIRES=0` | com DLSS, a interface (textos, logos, HUD) volta a ser desenhada na resolução de renderização e ampliada, em vez de na resolução de saída |

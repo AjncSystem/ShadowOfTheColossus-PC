@@ -18,6 +18,7 @@ Writes two files for the loader:
                    bb-probe --sotc-cmdline): cvars of the Bluepoint engine, e.g.
                    +r_motionBlurEnable=0. Modes that are only cvars:
                    af16   16x anisotropic filtering on every texture
+                   hdr    the game's HDR rendering (needs the HDR10 output: Windows HDR on)
 The original bytes are checked first: another game version gets neither file's changes.
 """
 import argparse
@@ -68,6 +69,9 @@ CVAR_MODES = {
     'fps60game': ['TargetFramesPerSeconds=1'],  # until the options code runs (MODES above)
     'af16': ['progSamplerAnisoLevel=16', 'progSamplerAnisoLevel_BasePS4=16', 'progSamplerAnisoLevel_Perf=16',
              'progSamplerAnisoLevel_Cinematic=16', 'linearSamplerAnisoLevel=16'],
+    # the game's HDR path (sotc.py also turns on the HDR10 output, BB_HDR): r_WantsHDR_Game is
+    # its menu option (2 = on); r_WantsHDR=0 leaves the switch to that menu
+    'hdr': ['r_WantsHDR=0', 'r_WantsHDR_Game=2'],
 }
 # Render size (PS4 mode; the PS4 Pro values next to them stay): (address, kind, original).
 # 'W'/'H' an integer immediate (the last 4 bytes of the instruction at address), 'w'/'h' a float
@@ -129,7 +133,7 @@ WIDE_ASPECT = (0x00495b3e, 'a', 'c74304398ee33f')  # the display object's aspect
 RT_POOL = 0x14280000
 # EU 1.01 / US 1.00: the command line lea and the fps60 site.
 VERSION_CHECKS = [(CMDLINE_LEA, bytes.fromhex('488d352debad00')), (0x01390090, bytes.fromhex('ff25a20567'))]
-CVAR = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*(=[-+.0-9A-Za-z_%]+)?$')  # NAME=VALUE or a flag such as nointro
+CVAR = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*((=[-+.0-9A-Za-z_%]+)|(\([-+.0-9A-Za-z_,% ]*\)))?$')  # NAME=VALUE, NAME(ARGS) or a flag such as nointro
 
 
 def image_bytes(elf, ph, vaddr, length):

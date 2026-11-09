@@ -372,6 +372,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     if (amd64_lds) {
         std::fprintf(stderr, "GPU: LDS barriers on for 64-wide AMD (SOTC_AMD64_LDS=0: off)\n");
     }
+    if (instance.IsAmdWave32Forced()) {
+        std::fprintf(stderr, "GPU: AMD wave32 on: shaders lowered for 32 lanes, LDS barriers on "
+                             "(SOTC_AMD_WAVE32)\n");
+    }
     // Wave64 uniform branches on every driver. Tested on a Radeon RX 6650 XT (32-wide path):
     // off, the shadows next to the Wander and Agro on grass get horizontal stripes; on, the
     // image is right and the characters are not black in the shade (save with 5 colossi).
@@ -607,6 +611,23 @@ static void LogSyncPipeline(const char* kind, const char* reason,
                  static_cast<unsigned long long>(hash_b), at);
 }
 
+// sotc: a pipeline built on a pipeline worker that took SOTC_SLOW_BUILD_MS (default 500) or longer
+// is logged: the recorder waits for compute pipelines at their dispatch, so on drivers that compile
+// slowly (Intel Arc users saw 13 s freezes on first visits) these are the freezes.
+void LogSlowBuild(const char* kind, std::chrono::steady_clock::time_point start) {
+    const double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+            .count();
+    static const double min_ms = [] {
+        const char* v = std::getenv("SOTC_SLOW_BUILD_MS");
+        return v ? std::atof(v) : 500.0;
+    }();
+    static std::atomic<int> logged{0};
+    if (ms >= min_ms && logged.fetch_add(1, std::memory_order_relaxed) < 500) {
+        std::fprintf(stderr, "SOTC SLOW BUILD %s %.0f ms\n", kind, ms);
+    }
+}
+
 bool PipelineCache::AsyncPipelineEligible() const {
     // Off the command processor the guest registers belong to later draws: only pipelines whose
     // construction reads nothing from them. Vertex inputs are dynamic state (otherwise they are
@@ -699,6 +720,7 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
         if (job->compute) {
             const auto start = std::chrono::steady_clock::now();
             job->compute->Build();
+            LogSlowBuild("compute", start);
             SotcStats::async_compute_built.fetch_add(1, std::memory_order_relaxed);
             SotcStats::async_compute_build_ns.fetch_add(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -707,10 +729,12 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
                 std::memory_order_relaxed);
             continue;
         }
+        const auto graphics_start = std::chrono::steady_clock::now();
         job->pipeline = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, job->key, *pipeline_cache, job->infos,
             job->runtime_infos, job->fetch_shader ? &*job->fetch_shader : nullptr, job->modules,
             job->sdata, job->preloaded, true);
+        LogSlowBuild("graphics", graphics_start);
         SotcStats::frame_compiles.fetch_add(1, std::memory_order_relaxed);
         std::scoped_lock lock{async_mutex};
         async_done.push_back(std::move(job));

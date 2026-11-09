@@ -722,6 +722,7 @@ bool SrModeFits(u32 in_w, u32 in_h, u32 out_w, u32 out_h) {
     last_fits = fits;
     return fits;
 }
+bool sr_hdr = false; // presenter thread
 
 /// DLSS options for this input and output size: DLAA at 1:1, else the mode whose optimal render
 /// height is closest to the input's.
@@ -733,7 +734,8 @@ bool SetSrOptions(u32 in_w, u32 in_h, u32 out_w, u32 out_h) {
     sl::DLSSOptions options{};
     options.outputWidth = out_w;
     options.outputHeight = out_h;
-    options.colorBuffersHDR = sl::Boolean::eFalse; // tonemapped, 0..1
+    // Tonemapped, 0..1; with HDR output the game's scene goes above 1.0.
+    options.colorBuffersHDR = sr_hdr ? sl::Boolean::eTrue : sl::Boolean::eFalse;
     sl::DLSSMode best = sl::DLSSMode::eMaxQuality;
     if (in_w >= out_w && in_h >= out_h) {
         best = sl::DLSSMode::eDLAA;
@@ -911,6 +913,14 @@ void SetOptions(bool on) {
 }
 
 } // namespace
+
+void SetHdr(bool hdr) {
+    if (sr_hdr != hdr) {
+        sr_hdr = hdr;
+        sr_mode_in_w = 0; // new DLSS options
+        std::fprintf(stderr, "SOTC DLSS: %s colour input\n", hdr ? "HDR" : "tonemapped");
+    }
+}
 
 PFN_vkGetInstanceProcAddr LoadInterposer() {
     const char* u = std::getenv("SOTC_UPSCALER");
@@ -1114,6 +1124,41 @@ bool CapturingInputs() {
     return Capturing() || sr_supported;
 }
 
+bool CameraLogOnly() {
+    // sotc: tools/gameplay_bench.py --horse tells riding from walking by the camera speed; the
+    // camera came only from DLSS-G's inputs, so the riding benchmark needed an RTX 40 card.
+    static const bool cam_log = [] {
+        const char* v = std::getenv("SOTC_CAM_LOG");
+        return v && v[0] == '1';
+    }();
+    return cam_log && !CapturingInputs();
+}
+
+void NoteCamera(const AmdGpu::Regs& regs, u32 mrt_mask) {
+    if (!(mrt_mask & (1u << 4))) {
+        return;
+    }
+    const auto& cb4 = regs.color_buffers[4];
+    if (!cb4 || cb4.GetDataFmt() != AmdGpu::DataFormat::Format16_16 ||
+        cb4.GetNumberFmt() != AmdGpu::NumberFormat::Float || !regs.depth_buffer.DepthValid()) {
+        return;
+    }
+    static long long last_ms = 0;
+    LARGE_INTEGER t, f;
+    QueryPerformanceCounter(&t);
+    QueryPerformanceFrequency(&f);
+    const long long ms = static_cast<long long>(t.QuadPart * 1000 / f.QuadPart);
+    if (ms - last_ms < 160) {
+        return;
+    }
+    Camera cam{};
+    if (!ReadCamera(regs, cam)) {
+        return;
+    }
+    last_ms = ms;
+    std::fprintf(stderr, "SOTC CAM %lld %.2f %.2f %.2f\n", ms, cam.pos[0], cam.pos[1], cam.pos[2]);
+}
+
 std::mutex vignette_mutex;
 float vignette_params[4]{};
 bool vignette_valid = false;
@@ -1122,6 +1167,16 @@ void NoteVignette(const float params[4]) {
     std::scoped_lock lock{vignette_mutex};
     std::memcpy(vignette_params, params, sizeof(vignette_params));
     vignette_valid = true;
+}
+
+std::atomic<float> hdr_curve{1.0f};
+
+void NoteHdrCurve(float k) {
+    hdr_curve.store(k, std::memory_order_relaxed);
+}
+
+float HdrCurve() {
+    return hdr_curve.load(std::memory_order_relaxed);
 }
 
 bool Vignette(float out[4]) {
@@ -1186,6 +1241,7 @@ void SanitizeColor(vk::CommandBuffer cmdbuf) {
     }
     struct Params {
         u32 width, height, mark;
+        float limit;
     };
     static vk::DescriptorSetLayout set_layout;
     static vk::PipelineLayout layout;
@@ -1248,7 +1304,8 @@ void SanitizeColor(vk::CommandBuffer cmdbuf) {
                                        .descriptorCount = 1,
                                        .descriptorType = vk::DescriptorType::eStorageImage,
                                        .pImageInfo = &image};
-    const Params params{sr_color.width, sr_color.height, mode == 2 ? 1u : 0u};
+    const Params params{sr_color.width, sr_color.height, mode == 2 ? 1u : 0u,
+                        sr_hdr ? 64.0f : 1.0f};
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, layout, 0, write);
     cmdbuf.pushConstants(layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(Params), &params);
@@ -1507,9 +1564,11 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
     // sotc: an input as large as the output or larger (PS4 Pro Cinematic mode renders 2560x1440
     // for a 1080p window) is not upscaled: NGX refused every evaluate (0xbad00005), turned super
     // resolution off for the session after three, and the frame repeat showed the last DLSS
-    // picture for good (frozen screen, 2 Nov). The plain path scales it down.
-    sr_declined.store(f.width >= width && f.height >= height, std::memory_order_relaxed);
-    if (f.width >= width && f.height >= height) {
+    // picture for good (frozen screen, 2 Nov). The plain path scales it down. An input exactly the
+    // output's size goes to DLSS as DLAA (the launcher's DLAA mode).
+    const bool larger = f.width >= width && f.height >= height && (f.width > width || f.height > height);
+    sr_declined.store(larger, std::memory_order_relaxed);
+    if (larger) {
         static u32 logged = 0;
         if (logged++ < 3) {
             std::fprintf(stderr, "SOTC DLSS: input %ux%u not smaller than the output %ux%u: "

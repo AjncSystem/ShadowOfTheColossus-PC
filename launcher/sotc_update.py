@@ -28,8 +28,8 @@ import time
 import urllib.request
 import zipfile
 
-RELEASES_URL = 'https://api.github.com/repos/AjncSystem/ShadowOfTheColossus-PC/releases/latest'
-RELEASES_PAGE = 'https://github.com/AjncSystem/ShadowOfTheColossus-PC/releases'
+RELEASES_URL = 'https://api.github.com/repos/Oussama268/ShadowOfTheColossus-PC/releases/latest'
+RELEASES_PAGE = 'https://github.com/Oussama268/ShadowOfTheColossus-PC/releases'
 ASSET_NAME = 'SotC-PC.zip'
 TOP = 'SotC-PC'
 KEEP = ('user', 'update')  # top-level names an update never writes into

@@ -170,6 +170,27 @@
   `sotc.ini` já funcionavam (inclusive L1/R1); agora estão documentados com exemplos. Um menu de
   remapeamento dentro do jogo não existe (o menu é do próprio jogo).
 
+## 0.70-opt12 — 2026-11-01 (fork do Oussama268)
+Tudo da 0.70, mais o trabalho contra as travadinhas (stutter):
+- **Quadros num ritmo regular (tabnul):** os quadros saem no ritmo em que o jogo os entrega, em
+  vez de esperar o próximo vblank. A variação entre quadros caiu de 5,2 ms para 1,2–1,8 ms e as
+  travadas acima de 100 ms de 15 para 2 por demo de 5 min. Também do tabnul: a varredura de
+  memória `SOTC MEM` saiu da thread de apresentação, leituras da GPU terminadas em partes e uma
+  swapchain mais funda contra a pausa periódica do driver NVIDIA.
+- **Modo 60 FPS com o mesmo ritmo:** abaixo de 60 os quadros alternavam 16,7 / 25 ms. Agora saem
+  quando estão prontos, sem passar de 60. Demo em 60 FPS: quadros acima de 50 ms 23 → 12, pior
+  quadro 194 → 113 ms, 1% low 22,3 → 26,3 FPS.
+- **Sem congelamentos de ~900 ms do cache de shaders da 0.70:** o pacote do cache ganhava dos
+  arquivos mais novos, e milhares de shaders eram traduzidos de novo a cada sessão. O arquivo
+  mais novo vence agora (correção do HiddenUserHere, PR #339 do repositório principal).
+- **Texturas pequenas velhas ou com manchas coloridas:** a textura inteira é conferida, não só os
+  primeiros 8x8 pixels; e o limite de envio de texturas por quadro não deixa mais texturas
+  pretas para trás (PR #339).
+- Travas do jogo esperam 20 µs antes de dormir (`SOTC_MUTEX_SPIN_US`, `0` desliga) e os buffers
+  grandes de envio ficam guardados entre quadros (`SOTC_STAGING_LARGE_POW2=0` desliga), do PR #339.
+- Santuário: 40,1 → 43,5 FPS. Sessão de 45 min sem falhas.
+- O cache de shaders é refeito na primeira abertura.
+
 ## 0.70 — 2026-10-29
 > ⚠️ **Atenção: instale o jogo num SSD (de preferência NVMe).** Cada área nova lê centenas de MB
 > de texturas e modelos da pasta do jogo; num HD as trocas de área travam muito mais e podem
@@ -282,6 +303,22 @@ JihedMrouki, testados com texturas **Máxima + modo PS4 Pro + 60 FPS** (RTX 2060
 - Ferramentas (`tools/`) e o modelo de save dos benchmarks aceitam os dois seriais. Testes novos
   (`tests/test_games.py`) falham se algum código voltar a testar um serial só.
 - A versão americana não tem os 3 textos em árabe da atualização europeia 1.01.
+
+## 0.60.6-opt11 — 2026-10-24 (fork do Oussama268)
+- **+25% de FPS no Santuário e quadros mais estáveis:** as leituras antecipadas da GPU
+  ("hot readbacks", da fusão de 8/10) voltam ligadas por padrão (`SOTC_RB_HOT=1`; `=0` desliga).
+  Antes de escrever, cada página é conferida sob a trava da sua região: se o jogo já escreveu
+  nela, a cópia é pulada. Era a corrida que deixava o arco-íris nas texturas na 0.60.5.
+  Santuário 34,6 → 43,3 FPS, demonstração da tela título 54 → 60,7.
+- Descritores reaproveitados ligados por padrão (`SOTC_FAST_BIND`, `=0` desliga).
+- Correções do tabnul: grama, HDR, menu do DLSS, pular os logos (#91, #92, #94, #96).
+- Lançador: aviso de pouca memória (#95).
+- Do upstream #258 (JihedMrouki): o cache de shaders confere se o arquivo existe, dica de
+  trabalho na fila do Liverpool, posição invariante nos shaders de vértice (GTX 10xx).
+  **O cache de shaders é refeito na primeira abertura.**
+- Diagnóstico: `SOTC_PROFILE_SLOW_MS=<ms>` só guarda amostras dos quadros mais longos que isso.
+- A travada ao cavalgar continua: nos quadros lentos as threads do jogo esperam umas pelas
+  outras (mutex e event flags do próprio jogo) e há cópias de ~200 MB nas trocas de cena.
 
 ## 0.60.6 — 2026-10-22
 - **Fim do ruído arco-íris nas texturas e das quedas "do nada" (`0x49500`).** A causa eram as

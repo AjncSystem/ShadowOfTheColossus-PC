@@ -21,6 +21,8 @@ Open-world routes recorded by a player (src/runtime_pad.c BB_PAD_RECORD / BB_PAD
                              close.
     --replay out/route.txt   gets to the idle scene, plays the recording back and measures the
                              whole replay (frames dumped every 15 s).
+    --turn SECONDS           at the idle scene, holds --turn-pad (default rx=255, the right
+                             stick) for SECONDS, then measures (e.g. Mono on the altar out of view).
 """
 import argparse
 import os
@@ -56,6 +58,10 @@ def main():
                         help='for a save that does not start at the shrine (--template of a player): '
                              'recording or replay starts SECONDS after the save began loading, '
                              'without the shrine cutscene skip')
+    parser.add_argument('--turn', type=float, default=0,
+                        help='at the idle scene, turn the camera (right stick) for this many seconds, then measure')
+    parser.add_argument('--turn-pad', default='rx=255',
+                        help='pad file tokens held during --turn (default rx=255: camera right; e.g. "ly=255" walks)')
     parser.add_argument('--assist', default='auto',
                         help='during a replay, also tap BUTTON every 0.4 s between START and END seconds '
                              '(START:END:BUTTON; "" for none). Agro, an AI character, does not stop at '
@@ -204,6 +210,18 @@ def main():
                       flush=True)
             time.sleep(0.5)
             continue
+        if idle_at is not None and args.turn and not state.get('turned'):
+            # Turn first; the measured window and the shots start once the stick is released.
+            now = time.monotonic() - start
+            if 'turn_end' not in state:
+                pad.write_text(args.turn_pad)
+                state['turn_end'] = now + args.turn
+            if now < state['turn_end']:
+                time.sleep(0.05)
+                continue
+            pad.write_text('')
+            state['turned'] = True
+            state['idle_at'] = idle_at = now
         if idle_at is not None and args.replay and not state.get('replaying'):
             state['replaying'] = True
             state['replay_at'] = time.monotonic() - start
@@ -279,7 +297,7 @@ def main():
     fps = [s[0] for s in window]
     cmds = sum(s[1] for s in window) / len(window)
     # The idle scene seen in every good run draws ~5900 commands per frame.
-    tag = '' if args.replay or IDLE_LOW <= cmds <= IDLE_HIGH else 'INVALID (unexpected scene): '
+    tag = '' if args.replay or args.turn or IDLE_LOW <= cmds <= IDLE_HIGH else 'INVALID (unexpected scene): '
     print(f'{tag}avg {sum(fps) / len(fps):.1f} FPS, min {min(fps):.1f} '
           f'({len(fps)} samples over {args.measure:.0f} s after idle at {idle_at:.0f} s, {cmds:.0f} cmds/frame)')
     return 0 if not tag else 1

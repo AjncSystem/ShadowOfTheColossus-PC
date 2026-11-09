@@ -646,6 +646,13 @@ private:
     /// reclaim of the slot and its Vulkan objects. Unpark: registers it again as if new.
     void ParkImage(ImageId image_id);
     void UnparkImage(ImageId image_id);
+    /// sotc: SOTC_RT_STASH. The game's transient allocator places render targets of one frame in
+    /// the same memory, so a target's next use finds another image there and each frame freed and
+    /// recreated the same targets. Stash: FreeImage for such an image, keeping its Vulkan objects
+    /// parked. Take: the parked image with exactly this layout, as new, or nothing.
+    void StashOrFreeImage(ImageId image_id);
+    ImageId TakeStashedImage(const ImageInfo& info);
+    void ClearImageStash();
     void ReclaimImage(ImageId image_id);
 
     void GarbageCollectImages();
@@ -681,6 +688,8 @@ private:
     TileManager tile_manager;
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;
+    std::vector<ImageId> image_stash; ///< sotc: oldest first, see StashOrFreeImage
+    u64 image_stash_bytes = 0;
     tsl::robin_map<u64, Sampler> samplers;
     std::unordered_set<ImageId> download_images;
     u64 total_used_memory = 0;

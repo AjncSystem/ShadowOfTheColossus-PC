@@ -1170,6 +1170,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
     if (Dlssg::CapturingInputs()) { // sotc: camera and inputs of DLSS (frame generation, SR)
         Dlssg::NoteDraw(regs, pipeline->GetGraphicsKey().mrt_mask, db_desc.first,
                         cb_descs[4].first, texture_cache, runtime, scheduler);
+    } else if (Dlssg::CameraLogOnly()) {
+        Dlssg::NoteCamera(regs, pipeline->GetGraphicsKey().mrt_mask);
     }
     if (!BindResources(pipeline)) {
         SotcStats::Drop(1, regs.color_buffers[0].Address(), 0);
@@ -1283,6 +1285,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (Dlssg::CapturingInputs()) { // sotc: camera and inputs of DLSS (frame generation, SR)
         Dlssg::NoteDraw(liverpool->DrawRegs(), pipeline->GetGraphicsKey().mrt_mask, db_desc.first,
                         cb_descs[4].first, texture_cache, runtime, scheduler);
+    } else if (Dlssg::CameraLogOnly()) {
+        Dlssg::NoteCamera(liverpool->DrawRegs(), pipeline->GetGraphicsKey().mrt_mask);
     }
     if (!BindResources(pipeline)) {
         SotcStats::Drop(1, liverpool->DrawRegs().color_buffers[0].Address(), 1);
@@ -1462,6 +1466,9 @@ constexpr u32 kTaaEnableDword = 42;
 // t = (scale * |uv - 0.5| - start) / (end - start), from flatbuf dwords 51..54. DLSS would drag
 // it along with the scene (dark nested screen borders), so it is applied after upscaling.
 constexpr u64 kTonemapHash = 0x291dbcd0;
+// sotc: the game's HDR composite (UI over scene, ^k, Rec.2020, PQ at 300 nits).
+constexpr u64 kHdrCompositeHash = 0xdfd767b6;
+constexpr u32 kHdrCurveDword = 20; // its exponent k
 constexpr u32 kVignetteDword = 51;
 
 bool Rasterizer::TaaOff() {
@@ -2496,6 +2503,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         std::bit_cast<u32>(std::bit_cast<float>(patch_flat[kGrassPatchLodDword]) * lod);
                     flat = patch_flat.data();
                 }
+                if (stage.pgm_hash == kHdrCompositeHash &&
+                    stage.FlatBuf().size() > kHdrCurveDword) {
+                    Dlssg::NoteHdrCurve(std::bit_cast<float>(flat[kHdrCurveDword]));
+                }
                 const u64 offset = vk_buffer.Copy(flat, ubo_size, alignment);
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
@@ -3040,6 +3051,26 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             scene.info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
             Dlssg::NoteComposite(image_bindings[ui_i ^ 1].first, image_bindings[ui_i].first,
                                  texture_cache);
+            NoteUiShadow();
+            static bool logged = false;
+            if (!std::exchange(logged, true)) {
+                std::fprintf(stderr, "SOTC DLSS: composite shader %#llx\n",
+                             static_cast<unsigned long long>(stage.pgm_hash));
+            }
+        }
+    }
+
+    // sotc: DLSS super resolution: the game's final composite samples the UI layer (an sRGB render
+    // target) and the tonemapped fp16 scene, nothing else, into a video out surface.
+    if (Dlssg::SuperResolution() && stage.sw_stage == Shader::SwStage::Fragment &&
+        image_bindings.size() == 2 && image_bindings[0].first && image_bindings[1].first &&
+        cb_descs[0].first) {
+        const auto& ui = texture_cache.GetImage(image_bindings[0].first);
+        const auto& scene = texture_cache.GetImage(image_bindings[1].first);
+        if (texture_cache.GetImage(cb_descs[0].first).usage.vo_surface &&
+            ui.usage.render_target && ui.info.pixel_format == vk::Format::eR8G8B8A8Srgb &&
+            scene.info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
+            Dlssg::NoteComposite(image_bindings[1].first, image_bindings[0].first, texture_cache);
             NoteUiShadow();
             static bool logged = false;
             if (!std::exchange(logged, true)) {

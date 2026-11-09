@@ -275,6 +275,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         fault_size = size;
         DownloadMemory(arena, window_start, window_end - window_start);
         fault_size = 0;
+        LiftStaleReadProtection(device_addr, size); // after the download: no-op if it had any
         if (is_write) {
             MarkWrittenByGuest(device_addr, size);
         }
@@ -295,27 +296,28 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         return;
     }
     // The guest thread waits for the GPU, not the command processor.
-    // sotc: SOTC_RB_DIRTY_RETRY=1: up to 3 attempts end dirty and are asked again from here
-    // (FinishAsyncReadback); the last one rereads on the draw thread as before.
-    static const bool dirty_retry = [] {
-        const char* v = std::getenv("SOTC_RB_DIRTY_RETRY");
-        return v && v[0] == '1';
+    // sotc: SOTC_RB_REQUEUE=0 re-reads a dirtied window synchronously at finish (submit and
+    // drain on the command processor, the old behavior). On (default), the finish hands the
+    // dirtied window back to this thread, which begins a fresh readback of it: another GPU
+    // round trip for the guest, no drain for the frame. Two retries, then the sync path.
+    static const int max_requeues = [] {
+        const char* v = std::getenv("SOTC_RB_REQUEUE");
+        return !v || v[0] != '0' ? 2 : 0;
     }();
-    for (int attempt = 0;; ++attempt) {
+    // sotc: SOTC_DRAW_SPLIT: the four parts of the guest's wait (draw thread queue and the copy
+    // recorded there, the recorder submitting it, the GPU, the apply on the draw thread).
+    const bool split = SotcStats::kDrawSplit;
+    u64 split_mark = split ? SotcStats::Ticks() : 0;
+    const auto split_part = [&](SotcStats::SplitPart part) {
+        if (split) {
+            const u64 now = SotcStats::Ticks();
+            SotcStats::split_ticks[part].fetch_add(now - split_mark, std::memory_order_relaxed);
+            split_mark = now;
+        }
+    };
+    for (int tries = 0;; ++tries) {
         AsyncReadback readback{
             .device_addr = device_addr, .size = size, .stream = stream, .is_write = is_write};
-        readback.allow_retry = dirty_retry && attempt < 3;
-        // sotc: SOTC_DRAW_SPLIT: the four parts of the guest's wait (draw thread queue and the copy
-        // recorded there, the recorder submitting it, the GPU, the apply on the draw thread).
-        const bool split = SotcStats::kDrawSplit;
-        u64 split_mark = split ? SotcStats::Ticks() : 0;
-        const auto split_part = [&](SotcStats::SplitPart part) {
-            if (split) {
-                const u64 now = SotcStats::Ticks();
-                SotcStats::split_ticks[part].fetch_add(now - split_mark, std::memory_order_relaxed);
-                split_mark = now;
-            }
-        };
         liverpool->SendCommand<true>([this, &readback] { BeginAsyncReadback(readback); });
         split_part(SotcStats::SplitRbQueue);
         if (!readback.waiting) {
@@ -377,11 +379,48 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
                 }
             }
         }
-        liverpool->SendCommand<true>([this, &readback] { FinishAsyncReadback(readback); });
+        bool requeue = false;
+        const bool allow = tries < max_requeues;
+        liverpool->SendCommand<true>(
+            [this, &readback, &requeue, allow] { requeue = FinishAsyncReadback(readback, allow); });
         split_part(SotcStats::SplitRbFinish);
-        if (!readback.retried) {
+        if (!requeue) {
             return;
         }
+        SotcStats::rb_requeues.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void BufferCache::LiftStaleReadProtection(VAddr addr, u64 size) {
+    // sotc: called when the window of a faulting access held nothing to download. A page bit with
+    // no bound GPU-written bytes behind it can never be downloaded, and only a download clears the
+    // bit and lifts the read protection, so the thread would fault on that load forever. Planted on
+    // purpose this freezes the game within seconds; not seen in ride benchmarks so far (the freeze
+    // they showed is RepairOutOfStepRead, page_manager.cpp). The bit can outlive its bytes:
+    // DropGpuModified runs ahead of the draws already queued, one of them can mark the range again,
+    // then ReleaseMemory, ordered after them, takes its bytes only. MarkWrittenByGuest does the
+    // same for write faults. SOTC_STALE_READ_REPAIR=0: off.
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_STALE_READ_REPAIR");
+        return !v || v[0] != '0';
+    }();
+    if (!enabled || !memory_tracker->IsRegionGpuModified(addr, size)) {
+        return;
+    }
+    const VAddr lo = Common::AlignDown(addr, VAddr{4096});
+    const VAddr hi = Common::AlignUp(addr + size, VAddr{4096});
+    const bool unbound_bytes = gpu_modified_ranges.Intersects(lo, hi - lo);
+    if (unbound_bytes) {
+        std::unique_lock gpu_modified_lock{gpu_modified_mutex};
+        gpu_modified_ranges.Subtract(lo, hi - lo);
+    }
+    memory_tracker->UnmarkRegionAsGpuModified(lo, hi - lo, false);
+    SotcStats::read_fault_stale_gpu.fetch_add(1, std::memory_order_relaxed);
+    static std::atomic<u32> logged{0};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+        std::fprintf(stderr, "SOTC stale GPU page lifted at %#llx (%s)\n",
+                     static_cast<unsigned long long>(addr),
+                     unbound_bytes ? "bytes no longer bound" : "no bytes");
     }
 }
 
@@ -428,6 +467,7 @@ void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
             readback.dependent = true;
             return;
         }
+        LiftStaleReadProtection(readback.device_addr, readback.size);
         if (readback.is_write) {
             MarkWrittenByGuest(readback.device_addr, readback.size);
         }
@@ -476,8 +516,11 @@ void BufferCache::MarkInflightReadbacksDirty(VAddr addr, u64 size) {
     // which the guest may write) changed these bytes: asynchronous readbacks of them in flight
     // hold stale data (FinishAsyncReadback reads them back again).
     for (AsyncReadback* readback : inflight_readbacks) {
-        for (const auto& item : readback->pending) {
-            readback->dirty |= addr < item.addr + item.size && item.addr < addr + size;
+        for (auto& item : readback->pending) {
+            if (addr < item.addr + item.size && item.addr < addr + size) {
+                item.dirty = true;
+                readback->dirty = true;
+            }
         }
     }
 }
@@ -496,23 +539,23 @@ BufferCache::AsyncReadback* BufferCache::FindInflightReadback(VAddr addr, u64 si
     return nullptr;
 }
 
-void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
-    const SotcStats::SplitTimer apply_split{SotcStats::SplitRbApply};
+bool BufferCache::FinishAsyncReadback(AsyncReadback& readback, bool allow_requeue) {
     if (readback.dependent) {
         // Finish the readbacks this one waited for (owners still blocked keep them alive).
+        // Their owner cannot retry a readback finished on its behalf: no requeue here.
         while (AsyncReadback* other = FindInflightReadback(readback.device_addr, readback.size)) {
             FinishAsyncReadback(*other);
         }
         if (readback.is_write) {
             MarkWrittenByGuest(readback.device_addr, readback.size);
         }
-        return;
+        return false;
     }
     if (readback.finished) {
         if (readback.is_write) {
             MarkWrittenByGuest(readback.device_addr, readback.size);
         }
-        return;
+        return false;
     }
     readback.finished = true;
     std::erase(inflight_readbacks, &readback);
@@ -523,23 +566,45 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
         .mapped = const_cast<u8*>(readback.download_mapped),
         .type = VideoCore::MemoryType::HostCached,
     };
-    if (readback.dirty && readback.allow_retry) {
-        // sotc: SOTC_RB_DIRTY_RETRY=1: the guest thread asks again (ReadMemory), and waits for
-        // the GPU itself. The reread below makes the draw thread, the bottleneck at area
-        // changes, wait for the GPU: 8-15 ms per slow frame at the forest entrance (5 Nov; the
-        // visibility bitmaps are rewritten every frame, so their readbacks often turn dirty).
-        staging_pool.FreeDeferred(download);
-        readback.retried = true;
-        if (SotcStats::kDrawSplit) {
-            SotcStats::split_ticks[SotcStats::SplitRbRetries].fetch_add(1,
-                                                                        std::memory_order_relaxed);
+    // sotc: SOTC_RB_PART=0 goes back to re-reading the whole window when any of it was
+    // re-written in flight. On: only the regions a GPU write actually landed on are stale.
+    // The clean ones are applied as usual; a stale hot bring-along is dropped (its ranges
+    // never left the GPU-modified set and its pages stay read-protected, so its own fault
+    // reads it back); the window is re-read only when it was hit itself.
+    static const bool partial_finish = [] {
+        const char* v = std::getenv("SOTC_RB_PART");
+        return !v || v[0] != '0';
+    }();
+    if (readback.dirty && partial_finish) {
+        download.buffer->Invalidate(download.offset, download.size);
+        boost::container::small_vector<ReadbackItem, 16> clean;
+        bool window_dirty = false;
+        for (auto& item : readback.pending) {
+            if (!item.dirty) {
+                clean.push_back(std::move(item));
+            } else if (!item.hot) {
+                window_dirty = true;
+            } else {
+                SotcStats::rb_dirty_hot_dropped.fetch_add(1, std::memory_order_relaxed);
+            }
         }
-        return;
+        ApplyDownloads(clean, download.mapped, download.offset);
+        SubtractDownloaded(clean);
+        staging_pool.FreeDeferred(download);
+        if (window_dirty) {
+            SotcStats::readback_dirty_retries.fetch_add(1, std::memory_order_relaxed);
+            if (allow_requeue) {
+                // The window's ranges never left the GPU-modified set and its pages stay
+                // protected: the guest begins a fresh readback of it instead of a sync drain.
+                return true;
+            }
+            DownloadMemory(readback.arena, readback.window_start, readback.window_size);
+        }
     } else if (readback.dirty) {
         // A GPU write recorded after the copies (or another readback applied first and the
         // guest may have written since): the data may be stale. The ranges never left the
         // GPU-modified set; read the window back the usual way.
-        const SotcStats::SplitTimer dirty_split{SotcStats::SplitRbDirty};
+        SotcStats::readback_dirty_retries.fetch_add(1, std::memory_order_relaxed);
         staging_pool.FreeDeferred(download);
         DownloadMemory(readback.arena, readback.window_start, readback.window_size);
     } else {
@@ -553,6 +618,7 @@ void BufferCache::FinishAsyncReadback(AsyncReadback& readback) {
     if (readback.is_write) {
         MarkWrittenByGuest(readback.device_addr, readback.size);
     }
+    return false;
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
@@ -571,10 +637,14 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         current_writes_tick = scheduler.CurrentTick();
     }
     bool written_by_current = false;
+    bool written_hot = false;
+    bool written_window = false;
     for (const auto& item : pending) {
         for (const auto& copy : item.copies) {
-            written_by_current |=
-                current_writes.Intersects(item.arena->cpu_addr + copy.srcOffset, copy.size);
+            if (current_writes.Intersects(item.arena->cpu_addr + copy.srcOffset, copy.size)) {
+                written_by_current = true;
+                (item.hot ? written_hot : written_window) = true;
+            }
         }
     }
     for (auto& item : pending) {
@@ -623,10 +693,16 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     } else {
         SotcStats::readback_finish.fetch_add(1, std::memory_order_relaxed);
         // Did the guest ask for bytes the command buffer being built writes, or only a neighbour
-        // in the window (or a hot region) did?
+        // in the window (or a hot region) did? The split names what keeps the ahead path idle.
         if (fault_size != 0 && written_by_current &&
             current_writes.Intersects(fault_addr, fault_size)) {
             SotcStats::readback_finish_asked.fetch_add(1, std::memory_order_relaxed);
+        } else if (!written_by_current) {
+            SotcStats::readback_finish_binds.fetch_add(1, std::memory_order_relaxed);
+        } else if (written_window) {
+            SotcStats::readback_finish_window.fetch_add(1, std::memory_order_relaxed);
+        } else if (written_hot) {
+            SotcStats::readback_finish_hot.fetch_add(1, std::memory_order_relaxed);
         }
         for (const auto& item : pending) {
             runtime.CopyBuffer(item.arena, download.buffer, item.copies);
@@ -662,8 +738,11 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
     // frame, one after another, so while the GPU is idle anyway also bring along the other
     // regions read back recently ("hot" readbacks) that the GPU has modified since. The reads
     // that follow then find their data already on the CPU instead of each needing a sync.
-    // SOTC_RB_HOT=0 (default): off, 1: same arena and small regions only, 2: any existing arena,
-    // any size. sotc: off since 22 Oct. Those speculative copies land on memory the game may have
+    // SOTC_RB_HOT=0: off, 1 (default): same arena and small regions only, 2: any existing arena,
+    // any size. sotc: off from 22 Oct, on again (mode 1) on 23 Oct with the late check in
+    // ApplyDownloads (pages the CPU wrote since the gather are skipped); the user's recipe (new
+    // area, reload the save, 3 times) stayed clean with it. Shrine idle 34.6 -> 43.3 FPS.
+    // Before that, without the check, those speculative copies landed on memory the game may have
     // reused since: rainbow, striped garbage on the Shrine's stones after loading a save again, and
     // heap free lists corrupted (0x49500, the game closing "out of nowhere", once after 23 min idle
     // in the title demo); with them off the user's recipe (a new area, then reload the save, 3
@@ -672,7 +751,7 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
     // than it saved (42.7 / 23.5): copying it on the command processor thread.
     static const int hot_mode = [] {
         const char* v = std::getenv("SOTC_RB_HOT");
-        return v ? std::atoi(v) : 0;
+        return v ? std::atoi(v) : 1;
     }();
     const bool hot_enabled = hot_mode != 0;
     const auto now = std::chrono::steady_clock::now();
@@ -823,6 +902,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
         std::chrono::steady_clock::time_point built{};
         std::optional<BpeHeapGuard> guard;
         std::optional<BpeUsedBlocks> used;
+        std::optional<BpeHeapPieces> pieces;
     };
     static std::array<GuardSlot, 8> slots;
     struct Active {
@@ -830,6 +910,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
         VAddr base;
         u64 size;
         bool checked; ///< the guard was checked against the heap's signature in this batch
+        bool pieces;  ///< slot->pieces holds the heap's checked piece list
     };
     std::array<Active, 8> active{};
     size_t active_count = 0;
@@ -872,6 +953,24 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
         }
         return nullptr;
     };
+    // sotc: SOTC_HEAP_PIECES=0 guards every write in the heap's range, as before; 1 skips only
+    // the writes outside the heap's pieces; 2 (default) also follows a piece's own block chain
+    // (BpeHeapPieces, BpeUsedBlocks::FindInPiece)
+    static const int use_pieces = [] {
+        const char* v = std::getenv("SOTC_HEAP_PIECES");
+        return v ? std::atoi(v) : 2;
+    }();
+    const auto pieces_of = [&](GuardSlot& slot) {
+        if (!use_pieces) {
+            return false;
+        }
+        if (!slot.pieces) {
+            slot.pieces.emplace(memory);
+        }
+        const bool ok = slot.pieces->Refresh(slot.heap);
+        SotcStats::hg_piece[ok ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+        return ok;
+    };
     const auto signature_of = [](VAddr heap) -> std::array<u64, 3> {
         return {*std::bit_cast<const u64*>(heap + 0x80), *std::bit_cast<const u64*>(heap + 0xa8),
                 *std::bit_cast<const u64*>(heap + 0xc0)};
@@ -912,6 +1011,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                  (age > std::chrono::seconds(2) ||
                   (age > std::chrono::milliseconds(250) && outside_extent())))) {
                 SotcStats::heap_guard_builds.fetch_add(1, std::memory_order_relaxed);
+                SotcStats::hg_build_path[0].fetch_add(1, std::memory_order_relaxed);
                 known->guard.emplace(memory, heap);
                 known->signature = signature;
                 known->built = now;
@@ -948,7 +1048,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
             if (!slot->used) {
                 slot->used.emplace(memory);
             }
-            active[active_count++] = {slot, heap_base, heap_size, false};
+            active[active_count++] = {slot, heap_base, heap_size, false, pieces_of(*slot)};
             continue;
         }
         for (auto& candidate : slots) {
@@ -976,7 +1076,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
         if (!slot->used) {
             slot->used.emplace(memory);
         }
-        active[active_count++] = {slot, heap_base, heap_size, false};
+        active[active_count++] = {slot, heap_base, heap_size, false, pieces_of(*slot)};
     }
     // The heap's guard, built again when its free tree changed (signature) since the last build
     const auto guard_of = [&](Active& a) -> BpeHeapGuard* {
@@ -989,6 +1089,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                                                    *std::bit_cast<const u64*>(heap + 0xc0)};
             if (!slot.guard || signature != slot.signature) {
                 SotcStats::heap_guard_builds.fetch_add(1, std::memory_order_relaxed);
+                SotcStats::hg_build_path[1].fetch_add(1, std::memory_order_relaxed);
                 slot.guard.emplace(memory, heap);
                 slot.signature = signature;
             }
@@ -1051,8 +1152,28 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                 BpeHeapGuard* heap_guard = nullptr;
                 if (Active* a = active_for(addr, size)) {
                     BpeUsedBlocks& used = *a->slot->used;
-                    if (heap_fast && (used.Covers(a->slot->heap, addr, addr + size) ||
-                                      used.TryUserPointer(a->slot->heap, addr, addr + size))) {
+                    const BpeHeapPieces* pieces = a->pieces ? &*a->slot->pieces : nullptr;
+                    if (pieces && !pieces->Overlaps(addr, addr + size)) {
+                        // sotc: not the heap's memory: another buffer between its pieces
+                        SotcStats::hg_piece[2].fetch_add(1, std::memory_order_relaxed);
+                        memory->TryWriteBacking(std::bit_cast<u8*>(addr), src + (addr - dst_addr),
+                                                size, 1);
+                        return;
+                    }
+                    int cover_why = 0;
+                    if (heap_fast &&
+                        (used.Covers(a->slot->heap, addr, addr + size, &cover_why, pieces) ||
+                         used.TryUserPointer(a->slot->heap, addr, addr + size))) {
+                        memory->TryWriteBacking(std::bit_cast<u8*>(addr), src + (addr - dst_addr),
+                                                size, 1);
+                        return;
+                    }
+                    if (const auto [piece, piece_end] = pieces && heap_fast && use_pieces >= 2
+                                                            ? pieces->PieceOf(addr)
+                                                            : std::pair<VAddr, VAddr>{0, 0};
+                        piece &&
+                        used.FindInPiece(a->slot->heap, piece, piece_end, addr, addr + size)) {
+                        SotcStats::hg_piece[4].fetch_add(1, std::memory_order_relaxed);
                         memory->TryWriteBacking(std::bit_cast<u8*>(addr), src + (addr - dst_addr),
                                                 size, 1);
                         return;
@@ -1085,13 +1206,17 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                             }
                         }
                     }
+                    SotcStats::hg_cover_why[cover_why & 3].fetch_add(1, std::memory_order_relaxed);
                     heap_guard = guard_of(*a);
                     int find = 0;
                     if (VAddr block = 0, next = 0;
                         heap_fast && heap_guard &&
                         heap_guard->FindUsedBlock(addr, block, next, &find)) {
                         used.Add(block, next);
-                    } else if (find == 6) {
+                        SotcStats::hg_find_why[0].fetch_add(1, std::memory_order_relaxed);
+                    } else if (SotcStats::hg_find_why[find > 0 && find < 7 ? find : 0].fetch_add(
+                                   1, std::memory_order_relaxed),
+                               find == 6) {
                         used.SetFence(block);
                     }
                 } else if (active_count == 1 && active[0].checked) {
@@ -1388,6 +1513,10 @@ bool BufferCache::TryReplaceFromCpu(VAddr addr, const void* data, u64 size) {
 }
 
 bool BufferCache::TryWriteThroughFromCpu(VAddr addr, const void* data, u64 size) {
+    return TryFillThroughFromCpu(addr, data, size, size);
+}
+
+bool BufferCache::TryFillThroughFromCpu(VAddr addr, const void* data, u64 size, u64 period) {
     if (size == 0) {
         return true;
     }
@@ -1425,11 +1554,33 @@ bool BufferCache::TryWriteThroughFromCpu(VAddr addr, const void* data, u64 size)
     }
     // The arena gets the same bytes now, in stream order, so the CPU bits stay as they are: a
     // clean page stays clean and write-protected, a dirty one uploads the same bytes later.
-    const auto staging = staging_pool.Request(size, MemoryType::HostUncached);
-    std::memcpy(staging.mapped, data, size);
-    staging.Flush();
-    const vk::BufferCopy copy{staging.offset, arena->Offset(addr), size};
-    runtime.CopyBuffer(staging.buffer, arena, std::span{&copy, 1});
+    const u64 dst = arena->Offset(addr);
+    const auto upload = [&](u64 bytes) {
+        const auto staging = staging_pool.Request(bytes, MemoryType::HostUncached);
+        std::memcpy(staging.mapped, data, bytes);
+        staging.Flush();
+        const vk::BufferCopy copy{staging.offset, dst, bytes};
+        runtime.CopyBuffer(staging.buffer, arena, std::span{&copy, 1});
+    };
+    if (period == 4 && (dst & 3) == 0 && (size & 3) == 0) {
+        u32 value;
+        std::memcpy(&value, data, sizeof(value));
+        runtime.FillBuffer(arena, dst, size, value);
+    } else if (period != 0 && period < size) {
+        // The seed is a whole number of periods, so each doubling copy repeats the pattern
+        // (Runtime::CopyBuffer places the barriers between the steps).
+        constexpr u64 SeedTarget = 1_MB;
+        const u64 seed = std::min(size, period * std::max<u64>(1, SeedTarget / period));
+        upload(seed);
+        for (u64 have = seed; have < size;) {
+            const u64 n = std::min(have, size - have);
+            const vk::BufferCopy copy{dst, dst + have, n};
+            runtime.CopyBuffer(arena, arena, std::span{&copy, 1});
+            have += n;
+        }
+    } else {
+        upload(size);
+    }
     RecordCurrentWrite(addr, size);
     return true;
 }
@@ -1897,6 +2048,7 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateArenaBlocks(u64 blocks) {
         }
         return std::nullopt;
     };
+    vk::Result last_result = vk::Result::eSuccess;
     const auto grow = [&](u32 memory_type, bool exact = false)
         -> std::optional<std::pair<vk::DeviceMemory, u64>> {
         // exact: only the asked size, for a nearly full card that has no 64 MiB left (#137).
@@ -1907,6 +2059,7 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateArenaBlocks(u64 blocks) {
         };
         const auto [result, memory] = instance.GetDevice().allocateMemory(alloc_info);
         if (result != vk::Result::eSuccess) {
+            last_result = result;
             return std::nullopt;
         }
         SotcStats::arena_allocs.fetch_add(1, std::memory_order_relaxed);
@@ -1960,6 +2113,13 @@ std::pair<vk::DeviceMemory, u64> BufferCache::AllocateArenaBlocks(u64 blocks) {
             return *placed;
         }
     }
+    // sotc: why the driver refused (a 1.3 MB request with half the video memory free, 12 GB card,
+    // 15 GB of RAM: AjncSystem #385). Windows refuses allocations when the commit limit (RAM + page
+    // file) is reached, whatever the card has free.
+    LOG_CRITICAL(Render, "Arena allocation of {} KB refused: {}; in use {} MB of {} MB",
+                 (blocks << block_shift) >> 10, vk::to_string(last_result),
+                 instance.GetDeviceMemoryUsage() >> 20, SotcStats::vram_budget.load() >> 20);
+    SotcStats::LogSystemMemory();
     LOG_CRITICAL(Render, "Out of video and system memory for buffers; lower the video memory use "
                          "setting in the launcher (Economy)");
     ASSERT_MSG(false, "Failed to allocate buffer arena memory");

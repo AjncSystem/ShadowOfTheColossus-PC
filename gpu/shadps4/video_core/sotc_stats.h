@@ -92,6 +92,18 @@ inline const bool kRbAge = [] {
     return v && v[0] == '1';
 }();
 inline std::atomic<uint64_t> readback_finish_asked{0}; ///< ... for bytes the guest itself asked
+/// ... the ahead path was idle only because sparse binds were pending (data itself submitted)
+inline std::atomic<uint64_t> readback_finish_binds{0};
+/// ... only the widened window of the asked bytes was written by the command buffer being built
+inline std::atomic<uint64_t> readback_finish_window{0};
+/// ... only a hot region brought along was written by the command buffer being built
+inline std::atomic<uint64_t> readback_finish_hot{0};
+/// async readbacks whose window was re-written in flight and re-read synchronously
+inline std::atomic<uint64_t> readback_dirty_retries{0};
+/// stale hot bring-alongs dropped instead of forcing that synchronous re-read (SOTC_RB_PART)
+inline std::atomic<uint64_t> rb_dirty_hot_dropped{0};
+/// Dirtied readback windows re-read asynchronously (another round trip) instead of synchronously.
+inline std::atomic<uint64_t> rb_requeues{0};
 inline std::atomic<uint64_t> heap_guard_builds{0}; ///< readbacks into the BPE heap
 inline std::atomic<uint64_t> heap_guard_stale_hits{0}; ///< writes the previous guard vouched for
 inline std::atomic<uint64_t> upload_deferred{0};        ///< first uploads put off to a later frame
@@ -101,7 +113,14 @@ inline std::atomic<uint64_t> heap_guard_ns{0};        ///< time of the guard bui
 inline std::atomic<uint64_t> heap_guard_worst_ns{0};
 inline std::atomic<uint64_t> heap_guard_worst_blocks{0}; ///< free blocks of the slowest build
 inline std::atomic<uint64_t> heap_guard_worst_adds{0};   ///< ... and the visits it made
-inline std::atomic<uint64_t> heap_guard_repeats{0};      ///< nodes and ring members seen again, skipped
+inline std::atomic<uint64_t> heap_guard_repeats{0};
+/// sotc: guard diagnostics: builds by path [0 world-heap refresh, 1 batch guard], Covers misses by why
+/// [0..3], FindUsedBlock results after a build [0 found, 1..6 why]
+inline std::atomic<uint64_t> hg_build_path[2]{}, hg_cover_why[4]{}, hg_find_why[7]{};
+/// sotc: heap pieces [0 batches with a valid piece list, 1 without, 2 writes outside every piece,
+/// 3 fence-tail writes that landed in a piece, 4 writes vouched by a piece chain]
+inline std::atomic<uint64_t> hg_piece[5]{};      ///< nodes and ring members seen again, skipped
+inline std::atomic<uint64_t> copy_guest_fallbacks{0}; ///< SOTC_COPY_GUEST_VIEW copies that faulted (backing view)
 inline std::atomic<uint64_t> readback_copies{0};          ///< ranges downloaded
 inline std::atomic<uint64_t> readback_copies_changed{0};  ///< ... whose bytes differed from memory
 inline std::atomic<uint64_t> readback_bytes{0};
@@ -293,6 +312,8 @@ void RegisterSplitThread(SplitThread which);
 uint64_t SplitThreadCycles(SplitThread which);
 /// Page faults of the whole process so far (GetProcessMemoryInfo), 0 where unknown.
 uint64_t SplitProcessFaults();
+/// Commit charge and free RAM, to stderr (session log); sotc_stats.cpp.
+void LogSystemMemory();
 /// A texture copy of `bytes` from guest memory: its wall time goes to SplitTexCopy and the counts
 /// to SplitTexBytes..SplitTexFaults (draw thread only, SOTC_DRAW_SPLIT).
 struct SplitTexCopyScope {
@@ -336,6 +357,8 @@ inline std::atomic<uint64_t> image_query_ns{0}, image_alloc_ns{0}, image_dedicat
 inline std::atomic<uint64_t> release_queued{0}, release_done{0}, release_forced{0},
     release_pending_blocks{0};
 inline std::atomic<uint64_t> vram_used{0}, vram_budget{0}, arena_allocs{0}, arena_bytes{0};
+/// sotc: host (not device-local) heaps: usage reported by the driver, and VMA's blocks in them.
+inline std::atomic<uint64_t> host_heap_usage{0}, host_vma_block_bytes{0};
 /// Texture cache collector: ticks (one per submit with a frame's work), images freed and those
 /// written back to memory first, and the images in the cache with their (guest) size.
 inline std::atomic<uint64_t> gc_ticks{0}, gc_freed{0}, gc_downloads{0};
@@ -343,6 +366,8 @@ inline std::atomic<uint64_t> cached_images{0}, cached_image_bytes{0};
 inline std::atomic<uint64_t> vram_emergency{0}; ///< emergency texture collections (allocation failed)
 inline std::atomic<uint64_t> write_fault_gpu_pending{0}; ///< write-fault readbacks left protected
 inline std::atomic<uint64_t> write_fault_stale_gpu{0};   ///< ... that cleared a stale GPU page bit
+inline std::atomic<uint64_t> read_fault_stale_gpu{0};    ///< sotc: the same for a read fault
+inline std::atomic<uint64_t> read_fault_out_of_step{0};  ///< sotc: host protection without a watcher
 inline std::atomic<uint64_t> arena_evicted{0};  ///< arena bytes given back by MaybeEvictCold
 inline std::atomic<uint64_t> arena_rebound{0};  ///< ... bound again afterwards
 inline std::atomic<uint64_t> arena_pinned{0};   ///< ... faulted back in by shaders (kept since)
@@ -455,6 +480,10 @@ inline std::atomic<uint32_t> warmup_total{0}, warmup_done{0};
 /// on one hard disk made the loading screen last 2 minutes).
 inline std::atomic<bool> warmup_finished{false};
 inline std::atomic<uint64_t> flip_count{0};     ///< game flips (videoout/driver.cpp Flip)
+/// sotc: how long flips waited between the submit and the present thread taking them (input delay).
+inline std::atomic<uint64_t> flip_age_ns{0};
+inline std::atomic<uint64_t> flip_age_max_ns{0};
+inline std::atomic<uint64_t> flip_age_count{0};
 /// Game frames prepared by the command processor (vk_presenter.cpp PrepareFrame): unlike
 /// flip_count, in step with the draws the command processor is processing.
 inline std::atomic<uint64_t> cp_frame{0};
@@ -534,6 +563,29 @@ struct FrameTimer {
         }
     }
 };
+
+/// sotc: SOTC_TICKWATCH=1 -- a watcher thread on the draw scheduler samples its timeline
+/// semaphore (vk_scheduler.cpp StartTickWatch); submits and GPU progress land in this ring and
+/// the FLIPGAP detector (videoout/driver.cpp) prints what the timeline did during a gap.
+/// Diagnostic: off by default, never on in benchmarks.
+inline const bool kTickWatch = [] {
+    const char* v = std::getenv("SOTC_TICKWATCH");
+    return v && v[0] == '1';
+}();
+struct TickEvent {
+    int64_t t_ns;  ///< steady_clock time_since_epoch (NowNs)
+    uint64_t gpu;  ///< kind 0: known GPU tick; kind 1/2: the tick submitted
+    uint64_t sub;  ///< kind 0: newest submitted tick; kind 1: (wait semas << 8) | cmd buffers;
+                   ///< kind 2: (submit_mutex wait us << 32) | vkQueueSubmit us
+    uint32_t kind; ///< 0 progress sample, 1 SubmitExecution, 2 put on the Vulkan queue
+};
+inline constexpr size_t kTickRing = 8192;
+inline TickEvent tick_ring[kTickRing];
+inline std::atomic<uint64_t> tick_ring_head{0};
+inline void PushTick(uint32_t kind, uint64_t gpu, uint64_t sub) {
+    const uint64_t i = tick_ring_head.fetch_add(1, std::memory_order_relaxed);
+    tick_ring[i % kTickRing] = {static_cast<int64_t>(NowNs()), gpu, sub, kind};
+}
 
 /// SOTC_DROP_TRACE=1: logs the first 80 draws/dispatches of each kind that are dropped.
 inline void Drop(int kind, unsigned long long a, unsigned long long b) {

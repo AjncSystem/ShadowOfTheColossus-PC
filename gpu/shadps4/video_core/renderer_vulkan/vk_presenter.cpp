@@ -42,6 +42,7 @@
 #include <iomanip>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <sstream>
 #include <system_error>
@@ -51,6 +52,10 @@
 #include <vk_mem_alloc.h>
 
 namespace Vulkan {
+
+// sotc: serializes vkQueuePresentKHR (both present sites) on the dedicated present queue; with a
+// shared queue the sites take Scheduler::submit_mutex as well.
+static std::mutex present_queue_mutex;
 
 bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format format) {
     const vk::FormatProperties props{physical_device.getFormatProperties(format)};
@@ -498,6 +503,8 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
       swapchain{instance, window}, runtime{instance, draw_scheduler},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
+    // sotc: SOTC_TICKWATCH samples the draw scheduler's timeline (FLIPGAP diagnosis).
+    draw_scheduler.StartTickWatch();
     const u32 num_images = swapchain.GetImageCount();
     const vk::Device device = instance.GetDevice();
 
@@ -832,6 +839,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // sotc: DLSS super resolution (SOTC_UPSCALER=dlss): the game's scene before its UI, upscaled
     // to the frame's size; the post process pass puts the UI layer back over it. Frames without
     // that scene (menus, loading screens) are presented as before.
+    Dlssg::SetHdr(pp_settings.hdr != 0);
     auto upscaled = Dlssg::Upscale(frame->id, draw_scheduler, texture_cache, runtime,
                                    frame->width, frame->height);
     // sotc: a buffer flipped again right after itself (PS4 Pro mode at the 30 FPS cap flips each
@@ -905,6 +913,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             pp_settings.vignette = {};
         }
         pp_settings.ui_sharpen = upscaled.ui_full ? 0.0f : ui_sharpen; // sotc: drawn at this size
+        pp_settings.hdr_curve = Dlssg::HdrCurve();
         pp_settings.sky_sharpen = sky_sharpen;
         pp_pass.Render(cmdbuf, scene, scene_size, *frame, pp_settings, upscaled.ui, upscaled.sky);
         upscaled_scene = upscaled.scene_low ? vk::ImageView{} : scene;
@@ -1315,9 +1324,12 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             // sceSaveDataDialog); draws nothing while it has nothing to show.
             static bool overlay_ready = false;
             if (!std::exchange(overlay_ready, true)) {
-                // Up to 2 overlay draws per game frame with FSR 3: a deeper buffer ring.
+                // Up to 2 overlay draws per game frame with FSR 3, and with 8 swapchain images
+                // that many presents really are in flight: the ImGui vertex-buffer ring must
+                // exceed the deepest possible in-flight count or the oldest entry is rewritten
+                // while the GPU still reads it (a flickering overlay).
                 BbOverlay::Init(instance, swapchain.GetSurfaceFormat().format,
-                                std::max(swapchain.GetImageCount(), 8u));
+                                std::max(swapchain.GetImageCount() * 2, 16u));
             }
             BbOverlay::Render(cmdbuf, swapchain_image_view, extent);
         }
@@ -1416,13 +1428,32 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         Dlssg::BeforePresent(frame->id,
                              FitImage(frame->width, frame->height, extent.width, extent.height),
                              extent);
-        std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        // sotc: vkQueuePresentKHR can block for tens of ms in the driver; on a dedicated present
+        // queue it only needs the present queue's own lock, so those stalls no longer starve the
+        // schedulers' submits (the ~11 s cadence hitch). Shared queue: submit_mutex as before.
+        const s64 tw0 = SotcStats::kTickWatch ? static_cast<s64>(SotcStats::NowNs()) : 0;
+        std::unique_lock submit_lock{Scheduler::submit_mutex, std::defer_lock};
+        if (!instance.HasDedicatedPresentQueue()) {
+            submit_lock.lock();
+        }
+        std::scoped_lock present_lock{present_queue_mutex};
+        const s64 tw1 = SotcStats::kTickWatch ? static_cast<s64>(SotcStats::NowNs()) : 0;
         const bool presented = swapchain.Present();
+        if (SotcStats::kTickWatch) {
+            const s64 tw2 = static_cast<s64>(SotcStats::NowNs());
+            SotcStats::PushTick(4, 0,
+                                (static_cast<u64>((tw1 - tw0) / 1000) << 32) |
+                                    static_cast<u64>((tw2 - tw1) / 1000));
+        }
         Dlssg::AfterPresent(frame->id);
         if (FrameGen::Current() == FrameGen::Mode::Fsr) {
             FsrFg::NotePresent();
         }
         if (!presented) {
+            // Recreate() waits for the whole device to go idle: no submits may race it.
+            if (!submit_lock.owns_lock()) {
+                submit_lock.lock();
+            }
             Dlssg::Suspend();
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
@@ -1467,17 +1498,20 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                                 SotcStats::image_query_ns.load(), SotcStats::image_alloc_ns.load(),
                                 SotcStats::image_dedicated.load()};
             if (last_us >= 0 && now_us - last_us > stall_us) {
+                // The 5 s stats printer resets these counters with exchange(0): a snapshot taken
+                // across a reset would underflow, so a shrunk counter reads as its new value.
+                const auto d = [&](int i) { return cur[i] >= last[i] ? cur[i] - last[i] : cur[i]; };
                 std::fprintf(stderr,
                              "SOTCSTALL frame %llu %.0f ms: pipelines %llu (%.0f ms), shaders %llu "
                              "(%.0f ms), images %llu (%.0f ms: query %.0f, alloc %.0f, %llu dedicated), "
                              "readbacks %llu (%.0f ms)\n",
                              static_cast<unsigned long long>(frames), (now_us - last_us) / 1e3,
-                             static_cast<unsigned long long>(cur[0] - last[0]), (cur[1] - last[1]) / 1e6,
-                             static_cast<unsigned long long>(cur[2] - last[2]), (cur[3] - last[3]) / 1e6,
-                             static_cast<unsigned long long>(cur[4] - last[4]), (cur[5] - last[5]) / 1e6,
-                             (cur[8] - last[8]) / 1e6, (cur[9] - last[9]) / 1e6,
-                             static_cast<unsigned long long>(cur[10] - last[10]),
-                             static_cast<unsigned long long>(cur[6] - last[6]), (cur[7] - last[7]) / 1e6);
+                             static_cast<unsigned long long>(d(0)), d(1) / 1e6,
+                             static_cast<unsigned long long>(d(2)), d(3) / 1e6,
+                             static_cast<unsigned long long>(d(4)), d(5) / 1e6,
+                             d(8) / 1e6, d(9) / 1e6,
+                             static_cast<unsigned long long>(d(10)),
+                             static_cast<unsigned long long>(d(6)), d(7) / 1e6);
             }
             last_us = now_us;
             std::copy(std::begin(cur), std::end(cur), std::begin(last));
@@ -1620,8 +1654,26 @@ bool Presenter::PresentGenerated(Frame* frame) {
     info.AddWait(swapchain.GetImageAcquiredSemaphore());
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     submit();
-    std::scoped_lock submit_lock{Scheduler::submit_mutex};
-    if (!swapchain.Present()) {
+    // sotc: same locking as the frame-path present above (dedicated present queue).
+    const s64 tw0 = SotcStats::kTickWatch ? static_cast<s64>(SotcStats::NowNs()) : 0;
+    std::unique_lock submit_lock{Scheduler::submit_mutex, std::defer_lock};
+    if (!instance.HasDedicatedPresentQueue()) {
+        submit_lock.lock();
+    }
+    std::scoped_lock present_lock{present_queue_mutex};
+    const s64 tw1 = SotcStats::kTickWatch ? static_cast<s64>(SotcStats::NowNs()) : 0;
+    const bool presented = swapchain.Present();
+    if (SotcStats::kTickWatch) {
+        const s64 tw2 = static_cast<s64>(SotcStats::NowNs());
+        SotcStats::PushTick(4, 1,
+                            (static_cast<u64>((tw1 - tw0) / 1000) << 32) |
+                                static_cast<u64>((tw2 - tw1) / 1000));
+    }
+    if (!presented) {
+        // Recreate() waits for the whole device to go idle: no submits may race it.
+        if (!submit_lock.owns_lock()) {
+            submit_lock.lock();
+        }
         Dlssg::Suspend();
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }

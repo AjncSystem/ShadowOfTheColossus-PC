@@ -537,6 +537,23 @@ void QuickSettings() {
         }
         ImGui::EndCombo();
     }
+    // sotc: flip pacing at 60 FPS and unlimited (videoout driver.cpp): the game's own rate or the vblank grid.
+    const bool paced = SotcFpsCap::flip_pacer.load(std::memory_order_relaxed);
+    const char* pace_names[] = {T("Grade do vblank (original)", "Vblank grid (original)"),
+                                T("Suave (ritmo do jogo)", "Smooth (game's rate)")};
+    if (ImGui::BeginCombo(T("Ritmo dos quadros  [F6]", "Frame pacing  [F6]"), pace_names[paced])) {
+        for (int i = 0; i < 2; ++i) {
+            if (ImGui::Selectable(pace_names[i], i == int(paced)) && i != int(paced)) {
+                SotcFpsCap::TogglePacer();
+            }
+        }
+        ImGui::EndCombo();
+    }
+    Hint(T("Em 60 FPS e ilimitado: solta cada quadro no ritmo do jogo em vez de na grade do "
+           "vblank (sem o tranco 8/17 ms ou 17/25 ms).",
+           "At 60 FPS and unlimited: releases each frame at the game's rate instead of on the "
+           "vblank grid (no 8/17 ms or 17/25 ms double-beat)."));
+
     // Started at 30 FPS the game is not in its own 60 FPS mode (fps60game, chosen at start):
     // uncapped it runs faster, but some physics may be off (the 2nd colossus' wall).
     if (uncapped && !SotcFpsCap::target_slot.load(std::memory_order_relaxed)) {
@@ -1228,6 +1245,16 @@ bool HandleEvent(const SDL_Event& event) {
         SetFpsMode((FpsMode() + 1) % 3);
         return true;
     }
+    // sotc: F6 switches uncapped flip pacing: the game's own rate or the vblank grid
+    // (sotc_fps_cap.h, videoout driver.cpp).
+    if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F6 && !event.key.repeat) {
+        const bool paced = SotcFpsCap::TogglePacer();
+        SotcEvent::Log("KEY", "%s",
+                       paced ? SotcUi::T("F6: ritmo dos quadros suave", "F6: smooth frame pacing")
+                             : SotcUi::T("F6: quadros na grade do vblank",
+                                         "F6: flips on the vblank grid"));
+        return true;
+    }
     // sotc: F8 switches the frame generation mode (off, DLSS-G, FSR 3; vk_framegen.h).
     // The new mode is shown at the next frame (Render).
     if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F8 && !event.key.repeat) {
@@ -1590,6 +1617,17 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
         shown_mode = mode;
         std::scoped_lock lock{imgui_mutex};
         toast_text = std::string(SotcUi::T("Geração de quadros: ", "Frame generation: ")) + Vulkan::FrameGen::Name(mode);
+        toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
+    }
+    // The flip pacing was switched (F6).
+    static bool shown_paced = SotcFpsCap::flip_pacer;
+    if (const bool paced = SotcFpsCap::flip_pacer; paced != shown_paced) {
+        shown_paced = paced;
+        std::scoped_lock lock{imgui_mutex};
+        toast_text = paced ? SotcUi::T("Ritmo dos quadros: suave (ritmo do jogo)",
+                                       "Frame pacing: smooth (game's rate)")
+                           : SotcUi::T("Ritmo dos quadros: grade do vblank (original)",
+                                       "Frame pacing: vblank grid (original)");
         toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
     }
     // The FPS mode was switched (F7 or the menu).

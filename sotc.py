@@ -21,6 +21,7 @@ Settings (environment variables, or sotc.ini beside this script as NAME=value li
                       fps60 (removes the 30 FPS cap; experimental, vblank at 120 Hz),
                       fps60game (the game's own 60 FPS target, as the PS4 Pro Performance mode;
                       with SOTC_FPS_CAP=off)
+                      hdr (HDR10 output and the game's HDR rendering; Windows HDR must be on)
     SOTC_RENDER_RES   optional: the game renders at WxH instead of 1920x1080 (e.g. 2560x1080 for
                       21:9, a wider view); the output follows its aspect; PS4 mode only
     SOTC_CVARS        engine settings, NAME=VALUE separated by spaces (e.g. r_motionBlurEnable=0)
@@ -37,6 +38,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 
 PORT = Path(__file__).resolve().parent
 SCRIPTS = PORT / 'scripts'
@@ -214,6 +216,9 @@ def main():
     # up to 30 FPS. With the cap, 120 Hz only shows a late frame sooner (and SOTC_FPS_LIMIT counts
     # in 120 Hz vblanks).
     env.setdefault('BB_VBLANK_HZ', '120')
+    if 'hdr' in modes.lower():
+        # HDR10 swapchain (Rec.2020 PQ, when Windows HDR is on); the game then offers HDR too.
+        env.setdefault('BB_HDR', '1')
 
     probe = find_probe()
     # Development builds run from the MSYS2 tree: its CLANG64 DLLs (SDL3, FFmpeg, ...).
@@ -239,18 +244,43 @@ def main():
     # In a console the session also goes to user/last_run.log (as the launcher does; the launcher
     # reads this script's output into its own log, so a pipe means it is not written here).
     if not sys.stdout.isatty():
-        return subprocess.run(command, stdin=subprocess.DEVNULL, creationflags=no_console()).returncode
+        def play():
+            return subprocess.run(command, stdin=subprocess.DEVNULL, creationflags=no_console()).returncode
+        return with_range_retries(env, play)
     with open_session_log(user) as log:
-        game = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT)
-        try:
-            for line in game.stdout:
-                sys.stdout.buffer.write(line)
-                sys.stdout.buffer.flush()
-                log.write(line)
-        finally:
-            code = game.wait()
+        def play():
+            game = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT)
+            try:
+                for line in game.stdout:
+                    sys.stdout.buffer.write(line)
+                    sys.stdout.buffer.flush()
+                    log.write(line)
+            finally:
+                code = game.wait()
+            return code
+        code = with_range_retries(env, play)
     keep_crash_log(user, code)
+    return code
+
+
+RANGE_BUSY_EXIT = 87  # src/runtime_memory.c: the guest's address range was taken at start
+RANGE_RETRIES = 10
+
+
+def with_range_retries(env, play):
+    """Runs play() and starts it again while the game reports its address range taken (error 487,
+    issue #110). What sits there usually differs per process, so a new start gets through."""
+    for attempt in range(RANGE_RETRIES):
+        env['SOTC_RANGE_RETRY'] = str(attempt)
+        code = play()
+        if code != RANGE_BUSY_EXIT:
+            return code
+        print(f'sotc: address range taken, starting again ({attempt + 1}/{RANGE_RETRIES})', flush=True)
+        time.sleep(0.5)
+    print('sotc: the address range stayed taken. The lines above name what sits there; closing '
+          'overlays and hooking tools (recording, RGB, tuning, antivirus exceptions) should free it.',
+          flush=True)
     return code
 
 

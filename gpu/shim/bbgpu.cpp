@@ -3,6 +3,7 @@
 #include "bbport_overlay.h"
 #include "bbport_settings.h"
 #include "bbport_copy.h"
+#include "bbport_mem_report.h"
 #ifndef _WIN32
 #include <sys/resource.h>
 #endif
@@ -133,6 +134,45 @@ static const bool kCopyLockOnce = [] {
     const char* v = std::getenv("SOTC_COPY_LOCK_ONCE");
     return v && v[0] == '1';
 }();
+// sotc: SOTC_COPY_GUEST_VIEW (default on, =0 off; HiddenUserHere, upstream PR #339). Guest memory is one section
+// mapped twice, and each view has its own page-table entries: the first read through the backing
+// view of a page the guest just wrote through its own view is a soft page fault (~0.8 us per 4 KiB,
+// measured there), which held the upload memcpy at ~3 GB/s. With the switch a mapped run is copied
+// through the guest address under the loader's copy guard (src/probe.c bb_copy_guard_buf): a fault
+// in it (a page the GPU tracking read-protected, or one the guest unmapped) returns here before
+// page tracking sees it, and the run is copied through the backing view as before.
+extern "C" __thread std::uintptr_t bb_copy_guard_lo, bb_copy_guard_hi;
+extern "C" __thread unsigned long long* bb_copy_guard_buf;
+static const bool kCopyGuestView = [] {
+    const char* v = std::getenv("SOTC_COPY_GUEST_VIEW");
+    return !(v && v[0] == '0');
+}();
+// False when the read faulted (nothing about dest is promised then). No C++ object with a
+// destructor lives in this frame: the fault resumes in bb_longjmp, which unwinds nothing. A copy
+// can nest (the fault handler copies too): the outer guard is saved and put back on both exits.
+[[gnu::noinline]] static bool GuardedGuestCopy(u8* dest, const void* source, u64 n) {
+    const std::uintptr_t outer_lo = bb_copy_guard_lo;
+    const std::uintptr_t outer_hi = bb_copy_guard_hi;
+    unsigned long long* const outer_buf = bb_copy_guard_buf;
+    sigjmp_buf recovery;
+    if (bb_setjmp(recovery)) {
+        // The handler cleared bb_copy_guard_buf.
+        bb_copy_guard_lo = outer_lo;
+        bb_copy_guard_hi = outer_hi;
+        __atomic_store_n(&bb_copy_guard_buf, outer_buf, __ATOMIC_RELEASE);
+        return false;
+    }
+    __atomic_store_n(&bb_copy_guard_buf, nullptr, __ATOMIC_RELEASE);
+    bb_copy_guard_lo = reinterpret_cast<std::uintptr_t>(source);
+    bb_copy_guard_hi = bb_copy_guard_lo + n;
+    __atomic_store_n(&bb_copy_guard_buf, recovery, __ATOMIC_RELEASE);
+    std::memcpy(dest, source, n);
+    __atomic_store_n(&bb_copy_guard_buf, nullptr, __ATOMIC_RELEASE);
+    bb_copy_guard_lo = outer_lo;
+    bb_copy_guard_hi = outer_hi;
+    __atomic_store_n(&bb_copy_guard_buf, outer_buf, __ATOMIC_RELEASE);
+    return true;
+}
 static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
     if (kCopyLockOnce && size && runtime_memory_copy_out(source, dest, size)) {
         return;
@@ -157,10 +197,26 @@ static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
             return !v || v[0] != '0';
         }();
         if (backing && prefetch && n >= 256 * 1024) {
-            WIN32_MEMORY_RANGE_ENTRY range{const_cast<u8*>(backing), static_cast<SIZE_T>(n)};
+            // The copy reads the guest address with kCopyGuestView (fork): those PTEs matter.
+            void* const read_from = kCopyGuestView ? reinterpret_cast<void*>(source)
+                                                   : const_cast<u8*>(backing);
+            WIN32_MEMORY_RANGE_ENTRY range{read_from, static_cast<SIZE_T>(n)};
             PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
         }
-        if (backing) std::memcpy(dest, backing, n);
+        if (backing && BbMemReport::WsDiagEnabled()) {
+            const uint64_t before = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch())
+                    .count());
+            BbMemReport::WsDiagCopy(backing, reinterpret_cast<const void*>(source), dest, n);
+            std::memcpy(dest, backing, n);
+            BbMemReport::WsDiagCopyDone(before, n);
+        } else if (backing && kCopyGuestView) {
+            if (!GuardedGuestCopy(dest, reinterpret_cast<const void*>(source), n)) {
+                SotcStats::copy_guest_fallbacks.fetch_add(1, std::memory_order_relaxed);
+                std::memcpy(dest, backing, n);
+            }
+        } else if (backing) std::memcpy(dest, backing, n);
         else if (mapped) std::memcpy(dest, reinterpret_cast<const void*>(source), n);
         else std::memset(dest, 0, n);
         source += n; dest += n; size -= n;

@@ -32,6 +32,10 @@ constexpr size_t MaxChainSteps = 1 << 12;
 constexpr u64 InUse = 1; // size | flags bit 0: set on allocated blocks, clear on free ones
 constexpr size_t MaxUsedBlocks = 1 << 12;
 
+bool IsPieceAligned(VAddr addr) {
+    return addr >= HeapPointerLo && addr < HeapPointerHi && (addr & ((1ULL << 20) - 1)) == 0;
+}
+
 // sotc: the walk's set of nodes and ring members seen (open addressing on the draw thread, kept
 // between builds: about 500 builds per 5 s at an area change, ~7000 nodes each)
 class SeenSet {
@@ -107,6 +111,14 @@ BpeHeapGuard::BpeHeapGuard(Core::MemoryManager* memory_, VAddr heap_)
 }
 
 bool BpeHeapGuard::Read(VAddr addr, void* out, u64 size) const {
+    // sotc: the run of the previous read first: the walk reads node after node in one run.
+    if (last_run < runs.size()) {
+        const Run& run = runs[last_run];
+        if (addr - run.start < run.size && addr - run.start + size <= run.size) {
+            std::memcpy(out, run.ptr + (addr - run.start), size);
+            return true;
+        }
+    }
     auto it = std::upper_bound(runs.begin(), runs.end(), addr,
                                [](VAddr value, const Run& run) { return value < run.start; });
     if (it == runs.begin() || addr - std::prev(it)->start >= std::prev(it)->size) {
@@ -124,12 +136,22 @@ bool BpeHeapGuard::Read(VAddr addr, void* out, u64 size) const {
         it = std::next(runs.insert(it, run));
     }
     const Run& run = *std::prev(it);
+    last_run = static_cast<size_t>(std::prev(it) - runs.begin());
     if (addr - run.start + size > run.size) {
         // Crosses into the next physical area: take the general path
         return memory->TryReadBacking(addr, out, size);
     }
     std::memcpy(out, run.ptr + (addr - run.start), size);
     return true;
+}
+
+void BpeHeapGuard::Prefetch(VAddr addr) const {
+    if (last_run < runs.size()) {
+        const Run& run = runs[last_run];
+        if (addr - run.start + 64 <= run.size) {
+            __builtin_prefetch(run.ptr + (addr - run.start));
+        }
+    }
 }
 
 bool BpeHeapGuard::IsHeapPointer(VAddr addr) const {
@@ -187,6 +209,17 @@ size_t BpeHeapGuard::CollectFreeTree() {
             continue;
         }
         AddFreeBlock(node - HeaderSize);
+        // sotc: the walk is a chain of cache misses across the heap (~150 ns a node): the
+        // children's headers start loading now, while this node's ring is followed.
+        static const bool prefetch = [] {
+            const char* v = std::getenv("SOTC_GUARD_PREFETCH");
+            return !(v && v[0] == '0');
+        }();
+        if (prefetch) {
+            if (IsHeapPointer(words[2])) Prefetch(words[2] - HeaderSize);
+            if (IsHeapPointer(words[3])) Prefetch(words[3] - HeaderSize);
+            if (IsHeapPointer(words[4])) Prefetch(words[4]);
+        }
         // Blocks of equal size hang off the tree node in a ring through the list links
         VAddr member = words[4];
         for (size_t i = 0; i < MaxListNodes && IsHeapPointer(member) && member != node; ++i) {
@@ -370,7 +403,8 @@ bool BpeUsedBlocks::StillUsed(VAddr heap, VAddr block, VAddr next) const {
            memory->TryReadBacking(next, &prev, sizeof(prev)) && prev == block;
 }
 
-bool BpeUsedBlocks::Covers(VAddr heap, VAddr addr, VAddr end, int* why) {
+bool BpeUsedBlocks::Covers(VAddr heap, VAddr addr, VAddr end, int* why,
+                           const BpeHeapPieces* pieces) {
     int no_why = 0;
     why = why ? why : &no_why;
     // Only the unsplit tail right after the fence ([heap+0xd0], 1 MiB) is free of metadata: the
@@ -379,7 +413,10 @@ bool BpeUsedBlocks::Covers(VAddr heap, VAddr addr, VAddr end, int* why) {
     if (tail < (64ULL << 10) || tail > (16ULL << 20)) {
         tail = 1ULL << 20;
     }
-    if (fence && addr >= fence + HeaderSize && end <= fence + HeaderSize + tail) {
+    if (fence && addr >= fence + HeaderSize && end <= fence + HeaderSize + tail &&
+        pieces && pieces->Overlaps(addr, end)) {
+        SotcStats::hg_piece[3].fetch_add(1, std::memory_order_relaxed);
+    } else if (fence && addr >= fence + HeaderSize && end <= fence + HeaderSize + tail) {
         u64 size_flags = 0;
         if (memory->TryReadBacking(fence + 8, &size_flags, sizeof(size_flags)) && size_flags == InUse) {
             return true;
@@ -460,6 +497,154 @@ void BpeUsedBlocks::Add(VAddr block, VAddr next) {
     } else {
         blocks.insert(it, {block, next});
     }
+}
+
+bool BpeHeapPieces::Refresh(VAddr heap) {
+    const auto field = [&](u64 offset) { return *std::bit_cast<const volatile u64*>(heap + offset); };
+    const VAddr new_head = field(0xb8);
+    const u64 new_count = field(0x58);
+    const u64 new_unit = field(0xd0);
+    const u64 total = field(0x30);
+    if (new_head == head && new_count == count && new_unit == unit && total == heap_size) {
+        return valid;
+    }
+    head = new_head;
+    count = new_count;
+    unit = new_unit;
+    heap_size = total;
+    valid = false;
+    pieces.clear();
+    initial_lo = initial_hi = 0;
+    constexpr u64 MiB = 1ULL << 20;
+    if (new_unit != MiB || new_count > 4096 || total < new_count * MiB ||
+        (new_count != 0 && !IsPieceAligned(new_head))) {
+        return false;
+    }
+    if (const u64 initial = total - new_count * MiB; initial != 0) {
+        const VAddr base = field(0x28);
+        if (base < HeapPointerLo || initial > MaxBlockSize || base + initial > HeapPointerHi) {
+            return false;
+        }
+        // its list node (the sentinel) sits just below heap+0x28
+        initial_lo = base & ~(MiB - 1);
+        initial_hi = (base + initial + MiB - 1) & ~(MiB - 1);
+    }
+    std::vector<VAddr> starts;
+    VAddr piece = new_head;
+    for (u64 i = 0; piece != 0; ++i) {
+        u64 sentinel[2] = {};
+        if (i > new_count || !IsPieceAligned(piece) ||
+            !memory->TryReadBacking(piece, sentinel, sizeof(sentinel)) || sentinel[1] != 3) {
+            return false;
+        }
+        if (piece < initial_lo || piece >= initial_hi) {
+            starts.push_back(piece);
+        }
+        piece = sentinel[0];
+    }
+    // Each piece is at least 1 MiB; the heap must not have changed during the walk
+    if (starts.size() > new_count || field(0xb8) != new_head || field(0x58) != new_count ||
+        field(0x30) != total) {
+        head = 0; // read again next time
+        return false;
+    }
+    const u64 longest = (1 + new_count - starts.size()) * MiB;
+    std::sort(starts.begin(), starts.end());
+    for (size_t i = 0; i < starts.size(); ++i) {
+        VAddr end = starts[i] + longest;
+        if (i + 1 < starts.size()) {
+            end = std::min(end, starts[i + 1]);
+        }
+        if (starts[i] < initial_lo) {
+            end = std::min(end, initial_lo);
+        }
+        // sotc: the piece's own end when its last block is found there (a heap that has MiB to
+        // spare otherwise took each piece as the longest one possible, and guarded the writes to
+        // the buffers after its 1 MiB pieces: ~126k guard builds' worth per ride)
+        for (VAddr at = starts[i] + MiB; at < end; at += MiB) {
+            if (IsPieceEnd(starts[i], at)) {
+                end = at;
+                break;
+            }
+        }
+        pieces.emplace_back(starts[i], end);
+    }
+    valid = true;
+    return true;
+}
+
+bool BpeHeapPieces::IsPieceEnd(VAddr piece, VAddr end) const {
+    // The piece's last block: in use, size 0, right before end; the block before it ends there
+    const VAddr fence = end - HeaderSize;
+    u64 words[2] = {};
+    if (!memory->TryReadBacking(fence, words, sizeof(words)) || words[1] != InUse) {
+        return false;
+    }
+    const VAddr prev = words[0];
+    u64 prev_size = 0;
+    return prev >= piece + HeaderSize && prev < fence && (prev & 7) == 0 &&
+           memory->TryReadBacking(prev + 8, &prev_size, sizeof(prev_size)) &&
+           prev + (prev_size & SizeMask) + HeaderSize == fence;
+}
+
+bool BpeHeapPieces::Overlaps(VAddr addr, VAddr end) const {
+    if (addr < initial_hi && initial_lo < end) {
+        return true;
+    }
+    // the last piece starting before end
+    auto it = std::lower_bound(pieces.begin(), pieces.end(), std::pair{end, VAddr{0}});
+    return it != pieces.begin() && std::prev(it)->second > addr;
+}
+
+std::pair<VAddr, VAddr> BpeHeapPieces::PieceOf(VAddr addr) const {
+    auto it = std::upper_bound(pieces.begin(), pieces.end(), std::pair{addr, ~VAddr{0}});
+    if (it == pieces.begin() || addr >= std::prev(it)->second) {
+        return {0, 0};
+    }
+    return *std::prev(it);
+}
+
+bool BpeUsedBlocks::FindInPiece(VAddr heap, VAddr piece, VAddr piece_end, VAddr addr, VAddr end) {
+    if (end > piece_end) {
+        return false;
+    }
+    // The piece's first block follows its sentinel and points back to it
+    VAddr block = piece + HeaderSize;
+    VAddr prev = 0;
+    if (!memory->TryReadBacking(block, &prev, sizeof(prev)) || prev != piece) {
+        return false;
+    }
+    // A remembered block of this piece below addr, still in use, is a closer start
+    auto it = std::upper_bound(blocks.begin(), blocks.end(), std::pair{addr, ~VAddr{0}});
+    if (it != blocks.begin() && std::prev(it)->first >= block &&
+        StillUsed(heap, std::prev(it)->first, std::prev(it)->second)) {
+        block = std::prev(it)->first;
+    }
+    for (size_t step = 0; step < MaxChainSteps; ++step) {
+        u64 size_flags = 0;
+        if (!memory->TryReadBacking(block + 8, &size_flags, sizeof(size_flags))) {
+            return false;
+        }
+        const u64 size = size_flags & SizeMask;
+        if (size == 0 || size >= piece_end - piece) {
+            return false; // the piece's last block, or not a block
+        }
+        const VAddr next = block + size + HeaderSize;
+        if (next > piece_end || !memory->TryReadBacking(next, &prev, sizeof(prev)) ||
+            prev != block) {
+            return false;
+        }
+        if (addr < next) {
+            if (addr < block + HeaderSize || end > next || !(size_flags & InUse) ||
+                !StillUsed(heap, block, next)) {
+                return false;
+            }
+            Add(block, next);
+            return true;
+        }
+        block = next;
+    }
+    return false;
 }
 
 } // namespace VideoCore

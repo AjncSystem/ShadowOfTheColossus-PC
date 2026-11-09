@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
@@ -22,6 +23,10 @@ namespace Vulkan {
 class Instance;
 class Scheduler;
 class DescriptorHeap;
+
+/// sotc: prints "SOTC SLOW BUILD <kind> <ms> ms" when start was SOTC_SLOW_BUILD_MS (default 500)
+/// or more ago (vk_pipeline_cache.cpp).
+void LogSlowBuild(const char* kind, std::chrono::steady_clock::time_point start);
 
 struct ComputePipelineKey {
     size_t value;

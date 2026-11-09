@@ -139,6 +139,13 @@ public:
     /// (fill-shader tables written by the command processor). Not resident: TryReplaceFromCpu.
     bool TryWriteThroughFromCpu(VAddr addr, const void* data, u64 size);
 
+    /// sotc: SOTC_FILL_HLE_GPU (HiddenUserHere, upstream PR #339). TryWriteThroughFromCpu for a
+    /// table that repeats a pattern of `period` bytes (`period` == `size`: no repeat). The backing
+    /// gets `data` from the CPU; the arena is filled by the GPU (a fill when `period` is 4, else
+    /// one uploaded seed of at most ~1 MiB doubled by copies inside the arena), so the full table
+    /// is never copied through a staging buffer. Not resident: TryReplaceFromCpu.
+    bool TryFillThroughFromCpu(VAddr addr, const void* data, u64 size, u64 period);
+
     /// Byte-precise: true when a written binding covered any byte of the range since its last
     /// readback. Readbacks copy only these bytes, so the backing holds every other byte.
     /// Command processor thread only.
@@ -220,6 +227,8 @@ private:
         boost::container::small_vector<std::pair<VAddr, u64>, 4> gpu_ranges;
         /// sotc: brought along by the hot readbacks (SOTC_RB_HOT), not asked for.
         bool hot = false;
+        /// sotc: a GPU write landed on this region while the readback was in flight.
+        bool dirty = false;
     };
     /// Collects what a readback of [device_addr, +size) and the hot readbacks must copy. Returns
     /// the bytes to download. sotc: the ranges stay in the GPU-modified set until the caller
@@ -231,6 +240,8 @@ private:
                         bool subtract = true);
     /// sotc: takes the downloaded ranges of items out of the GPU-modified set.
     void SubtractDownloaded(std::span<const ReadbackItem> items);
+    /// sotc: a read fault's readback found nothing to download (see the definition).
+    void LiftStaleReadProtection(VAddr addr, u64 size);
     /// Writes downloaded data (mapped, at the copies' destination offsets minus mapped_offset)
     /// into guest memory and unmarks the ranges as GPU-modified.
     void ApplyDownloads(std::span<const ReadbackItem> pending, const u8* mapped,
@@ -258,17 +269,13 @@ private:
         Buffer* download_buffer{};
         u64 download_size{};
         bool data_ready{}; ///< sotc (SOTC_RB_AGE): its last GPU write had completed when asked
-        /// sotc (SOTC_RB_DIRTY_RETRY): a dirty readback hands the reread to its guest thread
-        /// instead of reading back on the draw thread; set when it did.
-        bool allow_retry{};
-        bool retried{};
         boost::container::small_vector<ReadbackItem, 16> pending;
     };
     void BeginAsyncReadback(AsyncReadback& readback);
     /// sotc: marks bytes a guest write fault asked for CPU-modified, unless pages of them
     /// still hold GPU data (see the definition).
     void MarkWrittenByGuest(VAddr addr, u64 size);
-    void FinishAsyncReadback(AsyncReadback& readback);
+    bool FinishAsyncReadback(AsyncReadback& readback, bool allow_requeue = false);
     AsyncReadback* FindInflightReadback(VAddr addr, u64 size);
     void MarkInflightReadbacksDirty(VAddr addr, u64 size);
     std::vector<AsyncReadback*> inflight_readbacks;

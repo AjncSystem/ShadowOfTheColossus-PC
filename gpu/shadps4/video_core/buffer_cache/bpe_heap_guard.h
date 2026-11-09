@@ -87,6 +87,10 @@ private:
         const u8* ptr;
     };
     mutable std::vector<Run> runs;
+    /// sotc: index of the run the last Read hit (the walk reads node after node in one run)
+    mutable size_t last_run = 0;
+    /// sotc: starts loading the cache line of addr when a known run holds it (CollectFreeTree)
+    void Prefetch(VAddr addr) const;
 };
 
 /**
@@ -101,11 +105,21 @@ public:
     explicit BpeUsedBlocks(Core::MemoryManager* memory_) : memory{memory_} {}
 
     /// True when [addr, end) lies in the user area of a remembered block that is still in use
-    bool Covers(VAddr heap, VAddr addr, VAddr end, int* why = nullptr);
+    /// sotc: pieces (a checked piece list, or null): the fence's tail is then trusted only when
+    /// it is not a piece (contiguous pieces follow each other right after a piece's fence)
+    bool Covers(VAddr heap, VAddr addr, VAddr end, int* why = nullptr,
+                const class BpeHeapPieces* pieces = nullptr);
 
     /// sotc: true (and remembered) when addr is the user pointer of an in-use block that holds
     /// [addr, end): its header right before addr, checked as Covers checks a remembered one
     bool TryUserPointer(VAddr heap, VAddr addr, VAddr end);
+
+    /// sotc: true (and remembered) when [addr, end) lies in the user area of an in-use block of the
+    /// heap piece at `piece`, found by following the physical chain from the piece's first block
+    /// (or from a remembered block of the piece below addr). Blocks are checked as Covers checks
+    /// a remembered one. The chain from the closest free block, the guard's start, ends at that
+    /// block's piece: writes into a piece with no free block below them built the guard each time.
+    bool FindInPiece(VAddr heap, VAddr piece, VAddr piece_end, VAddr addr, VAddr end);
 
     void Add(VAddr block, VAddr next);
 
@@ -124,6 +138,46 @@ private:
     Core::MemoryManager* memory;
     std::vector<std::pair<VAddr, VAddr>> blocks; // sorted [header, next header)
     VAddr fence = 0;
+};
+
+/**
+ * sotc: the pieces a BPE heap is made of. A heap grows piece by piece over direct memory, and its
+ * pieces are spread among other GPU buffers: the heap's guarded range (its free blocks' extent)
+ * spans hundreds of MiB that are not the heap's, and every readback there built the guard again
+ * (a walk of the whole free tree, ~1 ms) only to find no metadata. Each piece starts with a
+ * sentinel block (word 0: the previous piece, word 1: size 0, flags 3) and ends with an in-use
+ * block of size 0. The newest piece is at heap+0xb8; heap+0x58 counts the pieces' MiB (a piece
+ * is 1 MiB or more), heap+0xd0 is the 1 MiB unit and heap+0x30 the heap size: the pieces' MiB,
+ * plus, for the heap the game creates at boot, a first contiguous area (heap+0x28, also the last
+ * node of the list). Allocator metadata lies only inside those. A piece's end is not stored, so
+ * each piece is taken as long as the MiB left over allow (never past the next piece).
+ */
+class BpeHeapPieces {
+public:
+    explicit BpeHeapPieces(Core::MemoryManager* memory_) : memory{memory_} {}
+
+    /// Re-reads the piece list when the heap's newest piece, MiB count or size changed. False when
+    /// the list does not check out (the caller then guards as before)
+    bool Refresh(VAddr heap);
+
+    /// True when [addr, end) overlaps the heap's memory (valid only after Refresh returned true)
+    bool Overlaps(VAddr addr, VAddr end) const;
+
+    /// The piece holding addr as [start, end) (start 0: none, or the boot heap's first area)
+    std::pair<VAddr, VAddr> PieceOf(VAddr addr) const;
+
+private:
+    /// True when the piece at `piece` ends at `end` (its last block found right before end)
+    bool IsPieceEnd(VAddr piece, VAddr end) const;
+
+    Core::MemoryManager* memory;
+    VAddr head = 0;
+    u64 count = 0;
+    u64 unit = 0;
+    u64 heap_size = 0;
+    VAddr initial_lo = 0, initial_hi = 0; // the boot heap's first, contiguous area
+    bool valid = false;
+    std::vector<std::pair<VAddr, VAddr>> pieces; // sorted, [start, end) upper bounds
 };
 
 } // namespace VideoCore

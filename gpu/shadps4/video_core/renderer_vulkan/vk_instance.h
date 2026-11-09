@@ -66,7 +66,7 @@ public:
     }
 
     u32 GetPresentQueueFamilyIndex() const {
-        return queue_family_index;
+        return present_queue_family;
     }
 
     vk::Queue GetGraphicsQueue() const {
@@ -75,6 +75,12 @@ public:
 
     vk::Queue GetPresentQueue() const {
         return present_queue;
+    }
+
+    /// sotc: true when present_queue is its own vk::Queue (second queue in the graphics family),
+    /// so vkQueuePresentKHR does not need Scheduler::submit_mutex.
+    bool HasDedicatedPresentQueue() const {
+        return dedicated_present_queue;
     }
 
     TracyVkCtx GetProfilerContext() const {
@@ -263,9 +269,23 @@ public:
     /// sotc: true when compute shaders must be pinned to 32-wide subgroups: the device could run
     /// them wider, but the recompiler lowers wave64 code for 32 lanes (the NVIDIA path).
     bool IsComputeSubgroupSize32Required() const {
+        if (IsAmdWave32Forced()) {
+            return true;
+        }
         return !IsSubgroupSize64Supported() && vk13_features.subgroupSizeControl &&
                vk13_props.minSubgroupSize <= 32 && vk13_props.maxSubgroupSize > 32 &&
                (vk13_props.requiredSubgroupSizeStages & vk::ShaderStageFlagBits::eCompute);
+    }
+
+    /// sotc: SOTC_AMD_WAVE32=1 does what the SotC-AMD-Fix layer does on GCN cards (#152): the
+    /// shaders are lowered for 32 lanes and compute pipelines require 32, although the driver
+    /// reports 64 as the only size. Testers said the layer fixes the white flicker.
+    bool IsAmdWave32Forced() const {
+        static const bool force = [] {
+            const char* v = std::getenv("SOTC_AMD_WAVE32");
+            return v && std::atoi(v) != 0;
+        }();
+        return force && GetVendorID() == 0x1002;
     }
 
     /// sotc: whether a required subgroup size may be given for this stage.
@@ -279,6 +299,9 @@ public:
     /// while the recompiler lowered wave64 code for SubgroupSize() lanes anyway. Intel stages are
     /// pinned to that size; SOTC_INTEL_PIN_SUBGROUP=0 turns it off. From AjncSystem#81 (jownatan).
     u32 RequiredSubgroupSize(vk::ShaderStageFlagBits stage) const {
+        if (IsAmdWave32Forced()) {
+            return stage == vk::ShaderStageFlagBits::eCompute ? 32u : 0u;
+        }
         if (IsSubgroupSize64Supported()) {
             return CanRequireSubgroupSize(stage) ? 64u : 0u;
         }
@@ -417,6 +440,9 @@ public:
 
     /// Returns the subgroup size the recompiler targets (64 or 32 when it can be required).
     u32 SubgroupSize() const {
+        if (IsAmdWave32Forced()) {
+            return 32;
+        }
         if (IsSubgroupSize64Supported()) {
             return 64;
         }
@@ -595,6 +621,8 @@ private:
     std::string vendor_name;
     VmaAllocator allocator{};
     vk::Queue present_queue;
+    bool dedicated_present_queue{};
+    u32 present_queue_family{0};
     vk::Queue graphics_queue;
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;

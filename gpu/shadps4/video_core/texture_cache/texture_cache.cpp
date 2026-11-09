@@ -467,7 +467,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             lhs_block_size != rhs_block_size) {
             // Very likely this kind of overlap is caused by allocation from a pool.
             if (safe_to_delete) {
-                FreeImage(cache_image_id);
+                StashOrFreeImage(cache_image_id);
             }
             return {merged_image_id, -1, -1};
         }
@@ -692,7 +692,7 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 
         // Image isn't a subresource but a chance overlap.
         if (safe_to_delete) {
-            FreeImage(cache_image_id);
+            StashOrFreeImage(cache_image_id);
         }
 
         return {{}, -1, -1};
@@ -726,8 +726,11 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
 }
 
 ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
-    const auto new_image_id = slot_images.insert(instance, runtime, slot_image_views, info);
-    RegisterImage(new_image_id);
+    auto new_image_id = TakeStashedImage(info);
+    if (!new_image_id) {
+        new_image_id = slot_images.insert(instance, runtime, slot_image_views, info);
+        RegisterImage(new_image_id);
+    }
 
     auto& src_image = slot_images[image_id];
     auto& new_image = slot_images[new_image_id];
@@ -749,7 +752,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
         src_image.binding.needs_rebind = 1u;
     }
 
-    FreeImage(image_id);
+    StashOrFreeImage(image_id);
     TrackImage(new_image_id);
     return new_image_id;
 }
@@ -905,9 +908,14 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     // Create and register a new image
     if (!image_id) {
         const SotcStats::ScopedTimer stall_timer{SotcStats::image_ns};
-        SotcStats::images_new.fetch_add(1, std::memory_order_relaxed);
-        image_id = slot_images.insert(instance, runtime, slot_image_views, info);
-        RegisterImage(image_id);
+        if (!desc.rebase_mip) {
+            image_id = TakeStashedImage(info);
+        }
+        if (!image_id) {
+            SotcStats::images_new.fetch_add(1, std::memory_order_relaxed);
+            image_id = slot_images.insert(instance, runtime, slot_image_views, info);
+            RegisterImage(image_id);
+        }
         if (desc.rebase_mip) {
             MipTailCreated(image_id, desc);
         }
@@ -1189,7 +1197,7 @@ void TextureCache::RefreshImage(Image& image) {
         return;
     }
 
-    // sotc: SOTC_UPLOAD_BUDGET_MB (default 32, 0 = off). Entering a new area, the game binds about
+    // sotc: SOTC_UPLOAD_BUDGET_MB (default 0 = off, see below). Entering a new area, the game binds about
     // 100 MB of new textures in one frame and that frame took 80-130 ms to upload them. Past the
     // budget, the first upload of a big colour texture waits for a later frame (the first upload
     // of each frame always goes through); meanwhile the image holds zeros, put in on the GPU once,
@@ -1197,10 +1205,13 @@ void TextureCache::RefreshImage(Image& image) {
     // sotc: an image is deferred for at most kMaxDeferFlips flips from its first deferral, then
     // uploaded whatever the budget: when other uploads used the budget ahead of it in every frame,
     // it stayed black for good (the Bluepoint logo and the autosave notice never showed, 29 Oct).
+    // sotc: off by default since 6 Nov. A/B of 32 / 0 / 64 on three boss jumps and the ride: no fewer
+    // slow frames with it, on area loads either, while a texture drawn only once into something
+    // kept (AjncSystem #380: black textures, gone with 0) stays black for good.
     constexpr u64 kMaxDeferFlips = 2;
     static const u64 upload_budget = [] {
         const char* v = std::getenv("SOTC_UPLOAD_BUDGET_MB");
-        return (v ? std::strtoull(v, nullptr, 10) : 32ull) << 20;
+        return (v ? std::strtoull(v, nullptr, 10) : 0ull) << 20;
     }();
     static u64 budget_flip = ~0ull, budget_used = 0;
     if (upload_budget) {
@@ -1807,6 +1818,7 @@ void TextureCache::EmergencyCollect(u32 level) {
     const SotcStats::FrameTimer frame_timer{SotcStats::FrameGc};
     std::scoped_lock lock{mutex};
     // sotc: parked depth/colour twins are not in the LRU; under pressure they go first.
+    ClearImageStash();
     lru_cache.ForEachItemBelow(gc_tick + 1, [&](ImageId image_id) {
         auto& image = slot_images[image_id];
         if (const ImageId twin_id = image.parked_twin) {
@@ -1859,13 +1871,18 @@ void TextureCache::GarbageCollectImages() {
         VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
         vmaGetHeapBudgets(instance.GetAllocator(), budgets);
         const auto& memory_properties = instance.GetMemoryProperties();
-        u64 vma_blocks = 0, vma_allocations = 0;
+        u64 vma_blocks = 0, vma_allocations = 0, host_usage = 0, host_blocks = 0;
         for (u32 heap = 0; heap < memory_properties.memoryHeapCount; ++heap) {
             if (memory_properties.memoryHeaps[heap].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
                 vma_blocks += budgets[heap].statistics.blockBytes;
                 vma_allocations += budgets[heap].statistics.allocationBytes;
+            } else {
+                host_usage += budgets[heap].usage;
+                host_blocks += budgets[heap].statistics.blockBytes;
             }
         }
+        SotcStats::host_heap_usage.store(host_usage, std::memory_order_relaxed);
+        SotcStats::host_vma_block_bytes.store(host_blocks, std::memory_order_relaxed);
         SotcStats::vma_block_bytes.store(vma_blocks, std::memory_order_relaxed);
         SotcStats::vma_allocation_bytes.store(vma_allocations, std::memory_order_relaxed);
     }
@@ -1881,6 +1898,9 @@ void TextureCache::GarbageCollectImages() {
 
     const auto configure = [&](bool allow_aggressive) {
         pressured = total_used_memory >= pressure_gc_memory;
+        if (pressured) {
+            ClearImageStash();
+        }
         aggresive = allow_aggressive && total_used_memory >= critical_gc_memory;
         ticks_to_destroy = aggresive ? 160 : pressured ? 80 : 16;
         ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
@@ -2662,6 +2682,73 @@ void TextureCache::ParkImage(ImageId image_id) {
     download_images.erase(image_id);
 }
 
+// sotc: on boss 13 and at the save's start point, static scenes at about 41 FPS, 6 targets cost
+// about 100 image creations and frees per second, each with its page protection calls and a
+// generation bump that drops the cached lookups at that address. SOTC_RT_STASH=0: off.
+static bool ImageStashEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_RT_STASH");
+        return !v || v[0] != '0';
+    }();
+    return enabled;
+}
+
+void TextureCache::StashOrFreeImage(ImageId image_id) {
+    constexpr size_t kMaxImages = 32;
+    constexpr u64 kMaxBytes = 128_MB;
+    const Image& image = slot_images[image_id];
+    if (!ImageStashEnabled() || False(image.flags & ImageFlagBits::GpuModified) ||
+        image.parked_twin || image.binding.is_bound || image.binding.is_target || !image.backing ||
+        image.info.sotc_first_mip || image.info.guest_size > kMaxBytes) {
+        FreeImage(image_id);
+        return;
+    }
+    ParkImage(image_id);
+    image_stash.push_back(image_id);
+    image_stash_bytes += image.info.guest_size;
+    while (image_stash.size() > kMaxImages || image_stash_bytes > kMaxBytes) {
+        const ImageId oldest = image_stash.front();
+        image_stash.erase(image_stash.begin());
+        image_stash_bytes -= slot_images[oldest].info.guest_size;
+        ReclaimImage(oldest);
+    }
+}
+
+ImageId TextureCache::TakeStashedImage(const ImageInfo& info) {
+    for (auto it = image_stash.rbegin(); it != image_stash.rend(); ++it) {
+        Image& image = slot_images[*it];
+        const ImageInfo& old = image.info;
+        // Everything that shaped the Vulkan image, as for the depth twins.
+        if (old.guest_address != info.guest_address || old.guest_size != info.guest_size ||
+            old.pixel_format != info.pixel_format || old.type != info.type ||
+            old.size != info.size || old.pitch != info.pitch ||
+            old.resources < info.resources || info.resources < old.resources ||
+            old.num_samples != info.num_samples || old.num_bits != info.num_bits ||
+            old.tile_mode != info.tile_mode || old.alt_tile != info.alt_tile ||
+            old.props.is_depth != info.props.is_depth ||
+            old.props.has_stencil != info.props.has_stencil ||
+            old.props.is_tiled != info.props.is_tiled ||
+            image.backing->num_samples != info.num_samples) {
+            continue;
+        }
+        const ImageId image_id = *it;
+        image_stash.erase(std::next(it).base());
+        image_stash_bytes -= old.guest_size;
+        image.info = info;
+        UnparkImage(image_id);
+        return image_id;
+    }
+    return {};
+}
+
+void TextureCache::ClearImageStash() {
+    for (const ImageId image_id : image_stash) {
+        ReclaimImage(image_id);
+    }
+    image_stash.clear();
+    image_stash_bytes = 0;
+}
+
 void TextureCache::UnparkImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     // The state of a newly created image (Image::Image), with a new identity.
@@ -2681,6 +2768,10 @@ void TextureCache::UnparkImage(ImageId image_id) {
     image.sotc_has_data = false;
     image.sotc_zero_filled = false;
     image.sotc_deferred_flip = ~0ull;
+    image.sotc_shadow_saving = 0;
+    image.sotc_first_hash = 0;
+    image.sotc_uploads = 0;
+    image.sotc_upload_from_guest = false;
     image.RenewIdentity();
     {
         std::unique_lock lk{download_images_mutex};

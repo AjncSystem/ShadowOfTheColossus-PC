@@ -1472,6 +1472,29 @@ static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
     if ((code==EXCEPTION_BREAKPOINT || code==EXCEPTION_SINGLE_STEP) && pool_hook_trap(info)) { fault_path=1; return EXCEPTION_CONTINUE_EXECUTION; }
     if ((code==EXCEPTION_BREAKPOINT || code==EXCEPTION_SINGLE_STEP) && release_hook_trap(info)) { fault_path=1; return EXCEPTION_CONTINUE_EXECUTION; }
     if (code==EXCEPTION_SINGLE_STEP && helper_single_step(info)) { fault_path=2; return EXCEPTION_CONTINUE_EXECUTION; }
+    /* sotc: 0x564d24, the most frequent crash (4 times since 3 Nov, always 30-40 s after loading a
+     * save, same stack 0x566796 <- 0x39a73 <- 0x38ad2 <- 0x33586). The function at 0x564ce0 walks a
+     * list of 32-byte entries and asks eboot 0x660fc0 for each entry's component; that returns NULL
+     * for an object whose type byte is not a component kind or that was cleared (first qword 0),
+     * and the caller reads +0x1f0 of it without a check. Such an entry is skipped as the game
+     * skips a null object there: the first object's part resumes at 0x564d92 (the second object),
+     * the second's at 0x564d00 (the next entry). SOTC_FIX_564D24=0 off. */
+    if (code==EXCEPTION_ACCESS_VIOLATION && image) {
+        static int fix=-1;
+        if (fix<0) { const char *v=getenv("SOTC_FIX_564D24"); fix=!(v && v[0]=='0'); }
+        CONTEXT *c=info->ContextRecord;
+        const uintptr_t at=(uintptr_t)c->Rip-(uintptr_t)image;
+        if (fix && c->R12==0 && (at==0x564d24 || at==0x564da6)) {
+            c->Rip=(DWORD64)(uintptr_t)(image+(at==0x564d24 ? 0x564d92 : 0x564d00));
+            static volatile LONG skipped;
+            const LONG n=InterlockedIncrement(&skipped);
+            if (n<=8 || (n & (n-1))==0)
+                fprintf(stderr,"SOTC FIX 0x564d24: list entry without a component skipped (%ld so far, at %#llx)\n",
+                        (long)n,(unsigned long long)at);
+            fault_path=3;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2 && bb_copy_guard_buf &&
         (uintptr_t)record->ExceptionInformation[1]>=bb_copy_guard_lo &&
         (uintptr_t)record->ExceptionInformation[1]<bb_copy_guard_hi) {

@@ -169,7 +169,7 @@ def windows_language():
 # Settings, passed to sotc.py as environment variables.
 
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
-                'user_dir': '', 'af16': True, 'textures': 'high', 'hdr': False, 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'button_icons': 'ps', 'fullscreen': False,
+                'user_dir': '', 'af16': True, 'textures': 'high', 'hdr': False, 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'fps_dynamic': True, 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
                 'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'rb_hot': True, 'skip_logos': True, 'skip_film': False, 'close_on_play': False, 'gamepad': '', 'rumble': True,
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
@@ -188,6 +188,8 @@ DEFAULT_UPGRADES = [
     # blur); straight to the game.
     ('0.71', {'fg_hudless': True, 'fx_motionblur': False, 'skip_logos': True}),
     # Fast GPU readbacks; the grass back as on PS4 (the play modes no longer change it).
+    # Dynamic FPS in the 60 FPS mode (a steady step below 60 when the game cannot keep it).
+    ('0.73', {'fps_dynamic': True}),
     ('0.72', {'rb_hot': True, 'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1',
               'weed_distance': '1', 'weed_height': '1', 'grass_fade': '1', 'grass_detail': '1'}),
 ]
@@ -768,6 +770,24 @@ def monitors():
             for device, w, h, centre, primary in found]
 
 
+def screen_refresh_hz():
+    """The primary screen's refresh rate (60 when unknown)."""
+    class DEVMODEW(ctypes.Structure):
+        _fields_ = [('name', ctypes.c_wchar * 32), ('spec', ctypes.c_ushort), ('driver', ctypes.c_ushort),
+                    ('size', ctypes.c_ushort), ('extra', ctypes.c_ushort), ('fields', ctypes.c_ulong),
+                    ('pos', ctypes.c_byte * 16), ('color', ctypes.c_short * 5), ('form', ctypes.c_wchar * 32),
+                    ('logpixels', ctypes.c_ushort), ('bpp', ctypes.c_ulong), ('width', ctypes.c_ulong),
+                    ('height', ctypes.c_ulong), ('flags', ctypes.c_ulong), ('hz', ctypes.c_ulong)]
+    try:
+        mode = DEVMODEW()
+        mode.size = ctypes.sizeof(DEVMODEW)
+        if ctypes.windll.user32.EnumDisplaySettingsW(None, -1, ctypes.byref(mode)) and mode.hz > 1:
+            return int(mode.hz)
+    except (AttributeError, OSError):
+        pass
+    return 60
+
+
 def game_environment(s):
     env = dict(os.environ)
     info = game_info(s['game_dir'])
@@ -799,6 +819,13 @@ def game_environment(s):
     env['SOTC_MODES'] = ','.join(modes)
     env['SOTC_FPS_CAP'] = '30' if fps_mode == '30' else 'off'
     env['SOTC_FPS_LIMIT'] = '60' if fps_mode == '60' else '0'
+    # sotc: 0.73 dynamic FPS (videoout driver.cpp, SOTC_FPS_DYNAMIC): with the 60 FPS limit, frames
+    # that cannot keep 60 lower it to a step that divides the screen's refresh (48 at 144 Hz, 40 at
+    # 120/240 Hz, 30 at 60 Hz), steady instead of swinging; it tries 60 again every 10 s.
+    if fps_mode == '60' and s.get('fps_dynamic', True):
+        hz = screen_refresh_hz()
+        step = 48 if hz % 48 == 0 else 40 if hz % 40 == 0 else 45 if hz % 45 == 0 else 30
+        env.setdefault('SOTC_FPS_DYNAMIC', str(step))
     env['BB_VBLANK_HZ'] = '120'
     env['BB_FULLSCREEN'] = '1' if s['fullscreen'] else '0'
     # The monitor the game window opens on (window.cpp): the centre of the chosen one, found again now
@@ -1519,6 +1546,11 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         self.row(quick, _('Nitidez (RCAS)', 'Sharpening (RCAS)'), self.choice(quick, 'sharpness', SHARPNESS, 24))
         self.row(quick, _('Geração de quadros', 'Frame generation'), self.choice(quick, 'framegen', FRAMEGEN, 24))
         self.row(quick, _('FPS', 'FPS'), self.choice(quick, 'fps_mode', FPS_MODES, 24))
+        self.check(quick, 'fps_dynamic', _('FPS dinâmico (no modo 60)', 'Dynamic FPS (60 FPS mode)'),
+                   _('Quando o jogo não segura 60, trava num degrau estável que combina com a tela (48 em 144 Hz, '
+                     '40 em 120 Hz, 30 em 60 Hz) em vez de oscilar, e volta a 60 quando sobra folga.',
+                     'When the game cannot keep 60 it locks to a steady step that suits the screen (48 at '
+                     '144 Hz, 40 at 120 Hz, 30 at 60 Hz) instead of swinging, and goes back to 60 when it can.'))
         self.row(quick, _('Texturas', 'Textures'), self.choice(quick, 'textures', TEXTURES, 24))
         self.row(quick, _('Memória da placa', 'Card memory'), self.choice(quick, 'vram_profile', VRAM_PROFILES, 24))
         self.vram_profile_hint = ttk.Label(quick, text='', style='Muted.TLabel', wraplength=self.px(300),

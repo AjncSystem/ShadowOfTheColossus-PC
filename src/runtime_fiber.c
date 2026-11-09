@@ -31,6 +31,7 @@ typedef struct FiberContext {
     uint16_t fpucw; uint16_t pad; uint32_t mxcsr;                                /* 0x70, 0x74 */
     struct Fiber *current_fiber, *prev_fiber;
     uint64_t arg_on_run_to, arg_on_return, return_val;
+    void *host_limit, *host_base; /* the run point's thread stack (TEB limits, Windows) */
 } FiberContext;
 _Static_assert(__builtin_offsetof(FiberContext,fpucw)==0x70 && __builtin_offsetof(FiberContext,mxcsr)==0x74,"context layout");
 typedef struct {
@@ -83,6 +84,7 @@ ABI __attribute__((returns_twice)) int32_t fiber_setjmp(FiberContext *ctx) __asm
 ABI __attribute__((noreturn)) void fiber_longjmp(FiberContext *ctx) __asm__("sotc_fiber_longjmp");
 ABI __attribute__((noreturn)) void fiber_switch_entry(FiberData *data, int set_fpu) __asm__("sotc_fiber_switch_entry");
 ABI __attribute__((noreturn, used)) void fiber_force_quit(uint64_t value) __asm__("sotc_fiber_force_quit");
+static void use_host_limits(const FiberContext *g);
 
 __asm__(
     ".text\n"
@@ -176,10 +178,54 @@ ABI void fiber_force_quit(uint64_t value) {
     fprintf(stderr,"STOP: fiber entry function returned\n");
     if (!ctx) abort();
     ctx->return_val=value;
+    use_host_limits(ctx);
     fiber_longjmp(ctx);
 }
 
+/* sotc: Windows keeps the TEB stack limits of the stack that runs. A fiber runs on a stack the
+ * game allocated, outside the thread's limits; where Control Flow Guard is enforced for the
+ * process, ntdll ends it with a fail-fast (0xc0000409) when an exception was taken on such a
+ * stack, right after "Resource Loading" (AjncSystem issue #322, traced by leon-harper: always a
+ * BPE JobWorker fiber). Each switch now sets the limits of the stack it goes to, and the run
+ * point's own limits on the way back. bb_fiber_stack_lo/hi name the fiber stack in use (0 on the
+ * thread's stack): the fault handler still moves to its own stack there (probe.c). Off with
+ * SOTC_FIBER_TEB=0. */
+_Thread_local uintptr_t bb_fiber_stack_lo, bb_fiber_stack_hi;
+#ifdef _WIN32
+static int fiber_teb_enabled(void) {
+    static int enabled=-1;
+    if (enabled<0) { const char *v=getenv("SOTC_FIBER_TEB"); enabled=!(v && v[0]=='0'); }
+    return enabled;
+}
+typedef struct { void *exception_list, *stack_base, *stack_limit; } TebStack;
+static TebStack *teb_stack(void) { TebStack *t; __asm__("movq %%gs:0x30, %0" : "=r"(t)); return t; }
+static void save_host_limits(FiberContext *ctx) {
+    TebStack *t=teb_stack();
+    ctx->host_limit=t->stack_limit; ctx->host_base=t->stack_base;
+}
+/* Called right before the jump to the stack it describes: the jump may resume the fiber on
+ * another host thread later, so the TEB and TLS accesses stay in this opaque call. */
+static __attribute__((noinline)) void use_stack_limits(void *limit, void *base, int fiber) {
+    __asm__ volatile("");
+    if (!fiber_teb_enabled() || !limit || !base) return;
+    TebStack *t=teb_stack();
+    t->stack_limit=limit; t->stack_base=base;
+    bb_fiber_stack_lo=fiber ? (uintptr_t)limit : 0;
+    bb_fiber_stack_hi=fiber ? (uintptr_t)base : 0;
+}
+#else
+static void save_host_limits(FiberContext *ctx) { (void)ctx; }
+static void use_stack_limits(void *limit, void *base, int fiber) { (void)limit; (void)base; (void)fiber; }
+#endif
+/* The stack fiber f runs on: its own context, else the run point's thread stack. */
+static void use_fiber_limits(const struct Fiber *f, const FiberContext *g);
+static void use_host_limits(const FiberContext *g) { use_stack_limits(g->host_limit,g->host_base,0); }
+
 static int valid(const Fiber *f) { return f->magic_start==SIGNATURE0 && f->magic_end==SIGNATURE1; }
+static void use_fiber_limits(const struct Fiber *f, const FiberContext *g) {
+    if (f->addr_context) use_stack_limits(f->addr_context,(unsigned char *)f->addr_context+f->size_context,1);
+    else use_host_limits(g);
+}
 /* Fiber calls the game gets an error from are reported (the first 32): a refused run or switch
  * can lose a job. */
 static int32_t fiber_refused(const char *call, const Fiber *f, int32_t error) {
@@ -219,6 +265,7 @@ static __attribute__((noreturn)) void enter(Fiber *f, uint64_t arg, void *stack,
     fiber_switch_entry(&data,(f->flags & FLAG_SET_FPU_REGS)!=0);
 }
 static __attribute__((noreturn)) void switch_to_fiber(Fiber *f, uint64_t arg, FiberContext *ctx) {
+    use_fiber_limits(f,ctx);
     if (f->context) { ctx->arg_on_run_to=arg; fiber_longjmp(f->context); }
     _Atomic uint32_t *previous=NULL;
     if (ctx->prev_fiber) { previous=&ctx->prev_fiber->state; ctx->prev_fiber=NULL; }
@@ -229,6 +276,7 @@ static __attribute__((noreturn)) void switch_fiber(Fiber *current, Fiber *f, uin
     if (!f->addr_context) {
         /* A fiber without its own context runs on the thread's stack below the run point. */
         ctx->prev_fiber=NULL;
+        use_host_limits(ctx);
         enter(f,arg,(void *)(ctx->rsp & ~UINT64_C(15)),&current->state);
     }
     switch_to_fiber(f,arg,ctx);
@@ -288,6 +336,7 @@ static ABI int32_t fiber_run_impl(Fiber *f, void *addr, uint64_t size, uint64_t 
     atomic_fetch_add(&fibers_run,1);
     FiberContext ctx={0};
     ctx.current_fiber=f;
+    save_host_limits(&ctx);
     thread_fiber_set(&ctx);
     if (!fiber_setjmp(&ctx)) {
         if (f->addr_context) switch_to_fiber(f,arg,&ctx);
@@ -349,6 +398,7 @@ static ABI int32_t fiber_return_to_thread(uint64_t arg_on_return, uint64_t *arg_
         check_overflow(g);
     }
     g->arg_on_return=arg_on_return;
+    use_host_limits(g);
     fiber_longjmp(g);
 }
 static ABI int32_t fiber_get_info(Fiber *f, FiberInfo *info) {

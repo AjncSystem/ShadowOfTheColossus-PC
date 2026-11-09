@@ -1436,12 +1436,16 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     fault_loop_note(info,result);
     return result;
 }
+extern _Thread_local uintptr_t bb_fiber_stack_lo, bb_fiber_stack_hi; /* runtime_fiber.c */
 static LONG vectored_fault_body(EXCEPTION_POINTERS *info) {
     NT_TIB *tib=(NT_TIB *)NtCurrentTeb();
     const uintptr_t sp=(uintptr_t)__builtin_frame_address(0);
     struct fault_entry *entry=fault_ring ? fault_ring_add(info) : NULL;
     fault_path=0;
-    if (sp>=(uintptr_t)tib->StackLimit && sp<(uintptr_t)tib->StackBase) {
+    /* sotc: a fiber stack has the TEB limits now (runtime_fiber.c, issue #322) but stays too
+     * small for this handler: it moves to its own stack there as before. */
+    const int on_fiber=sp>=bb_fiber_stack_lo && sp<bb_fiber_stack_hi;
+    if (!on_fiber && sp>=(uintptr_t)tib->StackLimit && sp<(uintptr_t)tib->StackBase) {
         const LONG own=vectored_fault_impl(info);
         if (entry) entry->outcome=((uint64_t)fault_path<<8)|(own==EXCEPTION_CONTINUE_EXECUTION);
         return own;

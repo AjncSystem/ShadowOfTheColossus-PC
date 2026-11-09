@@ -25,6 +25,19 @@ inline std::atomic<bool> uncapped{[] {
 /// Uncapped frame limit set by the in-game menu: 60, 0 (unlimited), -1 the start's (SOTC_FPS_LIMIT).
 inline std::atomic<int> limit_fps{-1};
 
+/// sotc: SOTC_FPS_DYNAMIC=<fps> (dynamic FPS, as some emulators do for games with a 60/30 mode):
+/// with the 60 FPS limit, when the game cannot keep 60 for 1.5 s the limit drops to <fps> (40 on a
+/// 120 Hz screen, 30 on 60 Hz, any value with G-Sync/FreeSync), steady instead of swinging between
+/// 45 and 60; every 10 s it tries 60 again for 2 s and stays when the game keeps up. The game's
+/// logic follows the real time, so a lower limit does not slow it down. 0 or unset: off.
+inline const int dynamic_low = [] {
+    const char* v = std::getenv("SOTC_FPS_DYNAMIC");
+    const long n = v ? std::strtol(v, nullptr, 10) : 0;
+    return n > 0 && n < 60 ? int(n) : 0;
+}();
+/// The limit the dynamic FPS applies now: 0 = the normal limit (60), else dynamic_low.
+inline std::atomic<int> dynamic_limit{0};
+
 /// The flip rate the game asked, -1 while it asked none (with the fps60 code patch it never does).
 inline std::atomic<int> game_rate{-1};
 

@@ -1398,7 +1398,12 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             take_request = true;
         } else if (flip_rate <= 0) {
             const int live_limit = SotcFpsCap::limit_fps.load(std::memory_order_relaxed);
-            const u64 limit_vblanks = live_limit >= 0 ? vblanks_for(live_limit) : start_limit_vblanks;
+            u64 limit_vblanks = live_limit >= 0 ? vblanks_for(live_limit) : start_limit_vblanks;
+            // sotc: SOTC_FPS_DYNAMIC: the 60 FPS limit lowered while the game cannot keep it.
+            if (const int dyn = SotcFpsCap::dynamic_limit.load(std::memory_order_relaxed);
+                dyn > 0 && limit_vblanks == vblanks_for(60)) {
+                limit_vblanks = vblanks_for(dyn); // the vblank grid's rounding; paced: exact
+            }
             const bool paced = SotcFpsCap::flip_pacer.load(std::memory_order_relaxed);
             if (limit_vblanks != 0 && !paced) {
                 take_request = vblank_status.count - last_flip_vblank >= limit_vblanks;
@@ -1409,7 +1414,14 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                                (now + tick_period / 2 >= last_flip_time + arrival_ema ||
                                 now >= *arrival + vblank_period);
                 if (take_request) {
-                    const auto limit_period = vblank_period * limit_vblanks;
+                    // sotc: the dynamic FPS step at its exact period (48 on a 144 Hz screen is not
+                    // a whole number of 120 Hz vblanks).
+                    const int dyn = SotcFpsCap::dynamic_limit.load(std::memory_order_relaxed);
+                    const std::chrono::nanoseconds limit_period =
+                        dyn > 0 && limit_vblanks == vblanks_for(dyn)
+                            ? std::chrono::nanoseconds{1'000'000'000 / dyn}
+                            : std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  vblank_period * limit_vblanks);
                     limit_next = (now - limit_next < tick_period ? limit_next : now) + limit_period;
                 }
             } else if (!paced) {
@@ -1450,6 +1462,55 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             prev_arrival = request.arrival;
             arrival_ema += (delta - arrival_ema) / 8;
             flipped = true;
+            // sotc: SOTC_FPS_DYNAMIC (sotc_fps_cap.h): the game's own frame interval decides.
+            if (SotcFpsCap::dynamic_low > 0 && flip_rate <= 0) {
+                enum class Dyn { High, Low, Probe };
+                static Dyn state = Dyn::High;
+                static std::chrono::nanoseconds slow{0}, total{0};
+                static auto since = last_flip_time;
+                const int live = SotcFpsCap::limit_fps.load(std::memory_order_relaxed);
+                const bool at_60 = (live >= 0 ? vblanks_for(live) : start_limit_vblanks) ==
+                                   vblanks_for(60);
+                constexpr auto frame_60 = std::chrono::nanoseconds{1'000'000'000 / 57};
+                const auto set = [&](Dyn next, int limit) {
+                    state = next;
+                    since = last_flip_time;
+                    slow = total = std::chrono::nanoseconds{0};
+                    SotcFpsCap::dynamic_limit.store(limit, std::memory_order_relaxed);
+                    std::fprintf(stderr, "SOTC FPS DYNAMIC: %s\n",
+                                 next == Dyn::High   ? "60"
+                                 : next == Dyn::Low  ? "low"
+                                                     : "trying 60");
+                };
+                if (!at_60) {
+                    if (state != Dyn::High) {
+                        set(Dyn::High, 0);
+                    }
+                } else if (state == Dyn::High) {
+                    // Slow time builds up and drains back: a run of slow frames lowers it.
+                    slow = delta > frame_60 ? slow + delta
+                                            : std::max(std::chrono::nanoseconds{0}, slow - delta);
+                    if (slow > std::chrono::milliseconds{1500}) {
+                        set(Dyn::Low, SotcFpsCap::dynamic_low);
+                    }
+                } else if (state == Dyn::Low) {
+                    if (last_flip_time - since > std::chrono::seconds{10}) {
+                        set(Dyn::Probe, 0);
+                    }
+                } else { // Probe: 60 again for 2 s; back to low when over a quarter was slow
+                    total += delta;
+                    if (delta > frame_60) {
+                        slow += delta;
+                    }
+                    if (last_flip_time - since > std::chrono::seconds{2}) {
+                        if (slow * 4 > total) {
+                            set(Dyn::Low, SotcFpsCap::dynamic_low);
+                        } else {
+                            set(Dyn::High, 0);
+                        }
+                    }
+                }
+            }
             FRAME_END;
         }
 

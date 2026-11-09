@@ -1472,25 +1472,41 @@ static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
     if ((code==EXCEPTION_BREAKPOINT || code==EXCEPTION_SINGLE_STEP) && pool_hook_trap(info)) { fault_path=1; return EXCEPTION_CONTINUE_EXECUTION; }
     if ((code==EXCEPTION_BREAKPOINT || code==EXCEPTION_SINGLE_STEP) && release_hook_trap(info)) { fault_path=1; return EXCEPTION_CONTINUE_EXECUTION; }
     if (code==EXCEPTION_SINGLE_STEP && helper_single_step(info)) { fault_path=2; return EXCEPTION_CONTINUE_EXECUTION; }
-    /* sotc: 0x564d24, the most frequent crash (4 times since 3 Nov, always 30-40 s after loading a
-     * save, same stack 0x566796 <- 0x39a73 <- 0x38ad2 <- 0x33586). The function at 0x564ce0 walks a
-     * list of 32-byte entries and asks eboot 0x660fc0 for each entry's component; that returns NULL
-     * for an object whose type byte is not a component kind or that was cleared (first qword 0),
-     * and the caller reads +0x1f0 of it without a check. Such an entry is skipped as the game
-     * skips a null object there: the first object's part resumes at 0x564d92 (the second object),
-     * the second's at 0x564d00 (the next entry). SOTC_FIX_564D24=0 off. */
+    /* sotc: game objects found cleared (their first qword 0) where the game uses them: crashes
+     * after loading a save and at the ending, always under the frames 0x39a73/0x39ab6 <- 0x38ad2
+     * <- 0x33586. Each case resumes where the game itself goes when the object is absent:
+     *   0x564d24 / 0x564da6  eboot 0x660fc0 gave no component for a list entry (r12 = 0): the next
+     *                        object (0x564d92) or the next entry (0x564d00); the most frequent
+     *                        crash, 4 times since 3 Nov, 30-40 s after loading a save;
+     *   0x144c60 / 0x14934f  destroying an object whose vtable is gone (rax = 0): its slot is
+     *                        cleared without the destructor (0x144c71) / skipped (0x149360); the
+     *                        "Fim" screen of the ending, 9 Nov;
+     *   0x14cce7             a reference released on no object (r14 = 0): return (0x14ced6); the
+     *                        ending, 5 Nov.
+     * SOTC_FIX_NULL_OBJECTS=0 (or SOTC_FIX_564D24=0) off. */
     if (code==EXCEPTION_ACCESS_VIOLATION && image) {
         static int fix=-1;
-        if (fix<0) { const char *v=getenv("SOTC_FIX_564D24"); fix=!(v && v[0]=='0'); }
+        if (fix<0) {
+            const char *v=getenv("SOTC_FIX_NULL_OBJECTS"), *w=getenv("SOTC_FIX_564D24");
+            fix=!((v && v[0]=='0') || (w && w[0]=='0'));
+        }
         CONTEXT *c=info->ContextRecord;
         const uintptr_t at=(uintptr_t)c->Rip-(uintptr_t)image;
-        if (fix && c->R12==0 && (at==0x564d24 || at==0x564da6)) {
-            c->Rip=(DWORD64)(uintptr_t)(image+(at==0x564d24 ? 0x564d92 : 0x564d00));
+        uintptr_t resume=0;
+        if (fix) {
+            if (c->R12==0 && at==0x564d24) resume=0x564d92;
+            else if (c->R12==0 && at==0x564da6) resume=0x564d00;
+            else if (c->Rax==0 && at==0x144c60) resume=0x144c71;
+            else if (c->Rax==0 && at==0x14934f) resume=0x149360;
+            else if (c->R14==0 && at==0x14cce7) resume=0x14ced6;
+        }
+        if (resume) {
+            c->Rip=(DWORD64)(uintptr_t)(image+resume);
             static volatile LONG skipped;
             const LONG n=InterlockedIncrement(&skipped);
             if (n<=8 || (n & (n-1))==0)
-                fprintf(stderr,"SOTC FIX 0x564d24: list entry without a component skipped (%ld so far, at %#llx)\n",
-                        (long)n,(unsigned long long)at);
+                fprintf(stderr,"SOTC FIX null object at guest %#llx skipped (resumes at %#llx; %ld so far)\n",
+                        (unsigned long long)at,(unsigned long long)resume,(long)n);
             fault_path=3;
             return EXCEPTION_CONTINUE_EXECUTION;
         }

@@ -890,10 +890,10 @@ def game_environment(s):
             env.setdefault('SOTC_LOD_LEVEL', '1' if textures == 'max' else '2')
         else:
             env.setdefault('SOTC_LOD_LEVEL', '0' if textures == 'max' else '1')
-    # sotc: the heap guard's two shortcuts, off since 0.70 for the 0x49800 crash, which came from
-    # the same double free: on again (tested with the above).
-    env.setdefault('SOTC_GUARD_STALE', '1')
-    env.setdefault('SOTC_GUARD_USER_POINTER', '1')
+    # sotc: the heap guard's two shortcuts (SOTC_GUARD_STALE, SOTC_GUARD_USER_POINTER) stay off
+    # again (0.73): on since 0.72, they spoilt the game's heap at the ending (objects found cleared
+    # at 0x144c60 / 0x14cce7 / 0x564d24, the allocator at 0x499cc, 9 Nov), as T49 had suspected for
+    # 0x49800; with them off the ending and the intro skip went through with nothing to repair.
     # sotc: 0.72.2 (T51): at the end of the game the game returns page pool pages under textures
     # it goes on drawing; a refresh then uploaded another texture's bytes into them (stretched
     # textures, flicker, the close between the ending and the intro). Two clean ending runs.

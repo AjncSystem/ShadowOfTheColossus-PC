@@ -1471,7 +1471,9 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 const int live = SotcFpsCap::limit_fps.load(std::memory_order_relaxed);
                 const bool at_60 = (live >= 0 ? vblanks_for(live) : start_limit_vblanks) ==
                                    vblanks_for(60);
-                constexpr auto frame_60 = std::chrono::nanoseconds{1'000'000'000 / 57};
+                // A frame counts as slow below 50 FPS: 50-60 FPS stays at the 60 limit (the step only
+                // takes over where the game really cannot keep up).
+                constexpr auto frame_60 = std::chrono::nanoseconds{1'000'000'000 / 50};
                 const auto set = [&](Dyn next, int limit) {
                     state = next;
                     since = last_flip_time;

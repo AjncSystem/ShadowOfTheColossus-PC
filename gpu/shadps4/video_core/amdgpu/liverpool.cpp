@@ -1608,6 +1608,33 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     FIBER_EXIT;
 }
 
+// sotc: the compute queue's read pointer lives in guest memory and the command processor moved it
+// with plain stores. When the page was write-protected by the GPU page tracking and protected
+// again before the store retried, the store faulted forever (SOTC FAULT LOOP: 4096+ writes at the
+// read pointer from ProcessCompute, 9 Nov): the compute queue stopped and the game froze on the
+// same frame while flips went on. It is now written as fence values are (WriteFenceValue): the
+// GPU copy of those bytes invalidated, then the backing written directly, which no protection
+// stops. SOTC_RPTR_BACKING=0: plain stores.
+void Liverpool::AdvanceReadPointer(u32* read_addr, u32 dwords, u32 ring_size_dw) {
+    static const bool backing = [] {
+        const char* v = std::getenv("SOTC_RPTR_BACKING");
+        return !v || v[0] != '0';
+    }();
+    auto* memory = Core::Memory::Instance();
+    u32 value;
+    if (!backing || !memory->TryReadBacking(reinterpret_cast<VAddr>(read_addr), &value, 4)) {
+        *read_addr = (*read_addr + dwords) % ring_size_dw;
+        return;
+    }
+    value = (value + dwords) % ring_size_dw;
+    if (rasterizer) {
+        rasterizer->InvalidateMemory(reinterpret_cast<VAddr>(read_addr), 4, true);
+    }
+    if (!memory->TryWriteBacking(read_addr, &value, 4, 2)) {
+        *read_addr = value;
+    }
+}
+
 template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
@@ -1643,8 +1670,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             std::memcpy(queue.tmp_packet.data(), acb.data(), acb.size_bytes());
             queue.tmp_dwords = acb.size();
             if constexpr (!is_indirect) {
-                *queue.read_addr += acb.size();
-                *queue.read_addr %= queue.ring_size_dw;
+                AdvanceReadPointer(queue.read_addr, acb.size(), queue.ring_size_dw);
             }
             break;
         }
@@ -1654,8 +1680,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             next_dw_off = 1;
             acb = NextPacket(acb, next_dw_off);
             if constexpr (!is_indirect) {
-                *queue.read_addr += next_dw_off;
-                *queue.read_addr %= queue.ring_size_dw;
+                AdvanceReadPointer(queue.read_addr, next_dw_off, queue.ring_size_dw);
             }
             continue;
         }
@@ -1918,8 +1943,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         acb = NextPacket(acb, next_dw_off);
 
         if constexpr (!is_indirect) {
-            *queue.read_addr += next_dw_off;
-            *queue.read_addr %= queue.ring_size_dw;
+            AdvanceReadPointer(queue.read_addr, next_dw_off, queue.ring_size_dw);
         }
     }
 

@@ -1568,7 +1568,7 @@ void *runtime_low_map(size_t size, int prot) {
  * Colossus also waits there for labels its compute queues write: the frame then went ahead
  * without the compute results and the scene was never drawn (black screen in about half of
  * the boots). A BB_TOGGLE_FILE value replaces this default. */
-uint64_t runtime_disabled_optimizations=UINT64_C(1)<<39;
+uint64_t runtime_disabled_optimizations=UINT64_C(1)<<39 | UINT64_C(1)<<59 | UINT64_C(1)<<60; /* sotc: 59, 60 off as in Lukto02 #308 */
 /* Speculative readers of guest memory (GPU draw-preparation workers) register a recovery
  * point: a fault on that thread jumps back to it instead of terminating (probe.c). */
 __thread sigjmp_buf *runtime_fault_recover;

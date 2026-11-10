@@ -45,6 +45,11 @@ public:
         Attach(item);
     }
 
+    /// sotc: the tick the item was last touched with (idle-age census).
+    TickType TickOf(size_t id) const {
+        return item_pool[id].tick;
+    }
+
     void Free(size_t id) {
         auto& item = item_pool[id];
         Detach(item);
@@ -64,6 +69,8 @@ public:
             if (static_cast<s64>(tick) - static_cast<s64>(iterator->tick) < 0) {
                 return;
             }
+            // sotc: `next` is taken before the callback: a callback may Touch (move the current
+            // item to the tail) and the walk continues with the item that followed it.
             Item* next = iterator->next;
             if constexpr (RETURNS_BOOL) {
                 if (func(iterator->obj)) {

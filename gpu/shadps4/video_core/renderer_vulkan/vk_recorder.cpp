@@ -932,7 +932,10 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
             }
         }
         const bool perf = Common::PerfStats::Enabled();
-        const auto busy_start = perf ? Clock::now() : Clock::time_point{};
+        // sotc: with SOTC_FPS=1 the busy time (replaying commands, not waiting for them) also
+        // feeds the "SOTC threads per frame" line (SotcStats::recorder_busy_ns).
+        const bool fps = SotcStats::kFpsLog;
+        const auto busy_start = perf || fps ? Clock::now() : Clock::time_point{};
         while (pos < committed) {
             auto* header = reinterpret_cast<BlockHeader*>(chunk->data + pos);
             if (header->kind == BlockKind::End) {
@@ -953,11 +956,16 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
             }
             pos += header->size;
         }
-        if (perf) {
-            Common::PerfStats::Add(
-                Common::PerfStats::Id::RecorderBusyNs,
+        if (perf || fps) {
+            const u64 busy_ns = static_cast<u64>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - busy_start)
                     .count());
+            if (perf) {
+                Common::PerfStats::Add(Common::PerfStats::Id::RecorderBusyNs, busy_ns);
+            }
+            if (fps) {
+                SotcStats::recorder_busy_ns.fetch_add(busy_ns, std::memory_order_relaxed);
+            }
         }
     }
 }

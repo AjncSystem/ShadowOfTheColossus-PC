@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
 #include <boost/container/static_vector.hpp>
 
 #include "shader_recompiler/resource.h"
@@ -10,6 +12,10 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
 namespace Vulkan {
+
+namespace DrawPhase { // sotc: SOTC_DRAW_PHASES laps defined in vk_rasterizer.cpp
+void SubPipe(unsigned which);
+}
 
 Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorHeap& desc_heap_,
                    const Shader::Profile& profile_, vk::PipelineCache pipeline_cache,
@@ -26,7 +32,11 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
 
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
+    static const bool phases = std::getenv("SOTC_DRAW_PHASES") != nullptr;
     cmdbuf.pushConstants(*pipeline_layout, stage_flags, 0u, sizeof(push_data), &push_data);
+    if (phases) {
+        DrawPhase::SubPipe(0);
+    }
 
     // Bind descriptor set.
     if (set_writes.empty()) {
@@ -35,6 +45,9 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
 
     if (uses_push_descriptors) {
         cmdbuf.pushDescriptorSetKHR(bind_point, *pipeline_layout, 0, set_writes);
+        if (phases) {
+            DrawPhase::SubPipe(1);
+        }
         return;
     }
 

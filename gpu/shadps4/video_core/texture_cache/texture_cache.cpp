@@ -13,6 +13,7 @@
 #endif
 #include <xxhash.h>
 
+#include "bbport_toggles.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
@@ -972,9 +973,19 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
     return {};
 }
 
+void TextureCache::NoteFound(Image& image) {
+    image.tick_accessed_last = scheduler.CurrentTick();
+    TouchImage(image);
+}
+
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
+    return FindTexture(image_id, desc.type, desc.view_info);
+}
+
+ImageView& TextureCache::FindTexture(ImageId image_id, BindingType type,
+                                     const ImageViewInfo& view_info) {
     Image& image = slot_images[image_id];
-    if (desc.type == BindingType::Storage) {
+    if (type == BindingType::Storage) {
         MarkWritten(image);
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
             image.info.guest_address != 0) {
@@ -984,7 +995,7 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
     }
     UpdateImage(image_id);
     const SotcStats::SplitTimer make_view_split{SotcStats::SplitTexMakeView};
-    return image.FindView(desc.view_info);
+    return image.FindView(view_info);
 }
 
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc,
@@ -1013,14 +1024,20 @@ ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& des
 
     // Register meta data for this color buffer
     if (desc.info.meta_info.cmask_addr) {
-        surface_metas.emplace(desc.info.meta_info.cmask_addr,
-                              MetaDataInfo{.type = MetaType::CMask});
+        if (surface_metas
+                .emplace(desc.info.meta_info.cmask_addr, MetaDataInfo{.type = MetaType::CMask})
+                .second) {
+            meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: DepthFastPath
+        }
         image.info.meta_info.cmask_addr = desc.info.meta_info.cmask_addr;
     }
 
     if (desc.info.meta_info.fmask_addr) {
-        surface_metas.emplace(desc.info.meta_info.fmask_addr,
-                              MetaDataInfo{.type = MetaType::FMask});
+        if (surface_metas
+                .emplace(desc.info.meta_info.fmask_addr, MetaDataInfo{.type = MetaType::FMask})
+                .second) {
+            meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: DepthFastPath
+        }
         image.info.meta_info.fmask_addr = desc.info.meta_info.fmask_addr;
     }
 
@@ -1035,13 +1052,18 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
 
     // Register meta data for this depth buffer
     if (desc.info.meta_info.htile_addr) {
-        surface_metas.emplace(desc.info.meta_info.htile_addr,
-                              MetaDataInfo{.type = MetaType::HTile,
-                                           .clear_mask = image.info.meta_info.htile_clear_mask});
+        if (surface_metas
+                .emplace(desc.info.meta_info.htile_addr,
+                         MetaDataInfo{.type = MetaType::HTile,
+                                      .clear_mask = image.info.meta_info.htile_clear_mask})
+                .second) {
+            meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: DepthFastPath
+        }
         image.info.meta_info.htile_addr = desc.info.meta_info.htile_addr;
     }
 
     // If there is a stencil attachment, link depth and stencil.
+    last_depth_stencil_id = {}; // sotc: DepthFastPath replays the touch below
     if (desc.info.stencil_addr != 0) {
         // sotc: the lookup and RegisterImage need `mutex` like FindImage (only depth when the
         // caller's batch hold already has it; SOTC_TC_BATCH=0 has none).
@@ -1066,6 +1088,7 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
         Image& stencil_image = slot_images[stencil_id];
         TouchImage(stencil_image);
         stencil_image.AssociateDepth(image_id, image.image_uid);
+        last_depth_stencil_id = stencil_id;
     }
 
     return image.FindView(desc.view_info, false);
@@ -1659,6 +1682,19 @@ void TextureCache::RegisterImage(ImageId image_id) {
     SotcStats::cached_images.fetch_add(1, std::memory_order_relaxed);
     SotcStats::cached_image_bytes.fetch_add(Common::AlignUp(image.info.guest_size, 1024), std::memory_order_relaxed);
     image.lru_id = lru_cache.Insert(image_id, gc_tick);
+    if (!swept_images.empty()) {
+        // sotc: an image the cold sweep freed is needed again (a new one at its address).
+        if (const auto swept = swept_images.find(image.info.guest_address);
+            swept != swept_images.end()) {
+            SotcStats::sweep_recreated.fetch_add(1, std::memory_order_relaxed);
+            SotcStats::sweep_recreated_bytes.fetch_add(swept->second.bytes,
+                                                       std::memory_order_relaxed);
+            if (std::chrono::steady_clock::now() - swept->second.time < std::chrono::seconds{10}) {
+                SotcStats::sweep_recreated_fast.fetch_add(1, std::memory_order_relaxed);
+            }
+            swept_images.erase(swept);
+        }
+    }
     ForEachPage(image.info.guest_address, image.info.guest_size,
                 [this, image_id](u64 page) {
                     // Counted before TrackImage protects the pages (a system call: a barrier).
@@ -1927,12 +1963,28 @@ void TextureCache::GarbageCollectImages() {
         auto& image = slot_images[image_id];
         const bool download = image.SafeToDownload();
         const bool tiled = image.info.IsTiled();
+        // sotc: a kept image goes to the back of the LRU (BbToggle::GcLruAdvance, bit set: old
+        // behaviour, it stays in place). Only the order changes, not the budget: num_deletions is
+        // still charged above, so the pass frees as much as before, but it goes on with the
+        // next-oldest image instead of spending the whole budget on the same head every tick.
+        // Touch stamps the item with gc_tick (always >= its tick, so it never moves backwards) and
+        // does nothing when the item is already at the tail. ForEachItemBelow saves `next` before
+        // calling back, so moving the current item to the tail is safe (common/lru_cache.h); only
+        // registered images have a node.
+        const auto advance = [&] {
+            if (True(image.flags & ImageFlagBits::Registered) &&
+                !BbToggle::Disabled(BbToggle::GcLruAdvance)) {
+                lru_cache.Touch(image.lru_id, gc_tick);
+            }
+        };
         if (tiled && download) {
             // This is a workaround for now. We can't handle non-linear image downloads.
             SotcStats::gc_kept_tiled.fetch_add(1, std::memory_order_relaxed);
+            advance();
             return false;
         }
         if (download && !pressured) {
+            advance();
             return false;
         }
         if (download) {
@@ -2688,12 +2740,15 @@ void TextureCache::ParkImage(ImageId image_id) {
     const auto& meta_info = image.info.meta_info;
     if (meta_info.cmask_addr) {
         surface_metas.erase(meta_info.cmask_addr);
+        meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: DepthFastPath
     }
     if (meta_info.fmask_addr) {
         surface_metas.erase(meta_info.fmask_addr);
+        meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: DepthFastPath
     }
     if (meta_info.htile_addr) {
         surface_metas.erase(meta_info.htile_addr);
+        meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: DepthFastPath
     }
     std::unique_lock lk{download_images_mutex};
     download_images.erase(image_id);
@@ -2827,12 +2882,15 @@ void TextureCache::DeleteImage(ImageId image_id) {
     const auto& meta_info = image.info.meta_info;
     if (meta_info.cmask_addr) {
         surface_metas.erase(meta_info.cmask_addr);
+        meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: DepthFastPath
     }
     if (meta_info.fmask_addr) {
         surface_metas.erase(meta_info.fmask_addr);
+        meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: DepthFastPath
     }
     if (meta_info.htile_addr) {
         surface_metas.erase(meta_info.htile_addr);
+        meta_epoch.fetch_add(1, std::memory_order_relaxed); // sotc: DepthFastPath
     }
 
     {

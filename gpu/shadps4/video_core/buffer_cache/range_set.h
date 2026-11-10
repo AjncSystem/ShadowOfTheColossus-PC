@@ -46,12 +46,19 @@ struct RangeSet {
     void Subtract(VAddr base_address, size_t size) {
         const VAddr end_address = base_address + size;
         IntervalType interval{base_address, end_address};
+        // sotc: BbToggle::WriteMarkMemo: a counter of removals; while it is unchanged, what Add
+        // put into the set is still there.
+        __atomic_fetch_add(&generation, 1, __ATOMIC_RELEASE);
         m_ranges_set.subtract(interval);
     }
 
     void Clear() {
+        __atomic_fetch_add(&generation, 1, __ATOMIC_RELEASE);
         m_ranges_set.clear();
     }
+
+    /// sotc: removals (Subtract, Clear) so far; read with __atomic_load_n.
+    u64 generation{};
 
     bool Contains(VAddr base_address, size_t size) const {
         const VAddr end_address = base_address + size;

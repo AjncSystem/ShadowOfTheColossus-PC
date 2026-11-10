@@ -21,6 +21,18 @@ constexpr u64 HIGHER_PAGE_MASK = HIGHER_PAGE_SIZE - 1ULL;
 constexpr u64 NUM_REGION_PAGES = HIGHER_PAGE_SIZE / BYTES_PER_PAGE;
 constexpr u64 NUM_REGION_WORDS = HIGHER_PAGE_SIZE / BYTES_PER_WORD;
 
+class RegionManager;
+
+/// sotc: BbToggle::BufferBindMemo. The CPU-bit generation (RegionManager::CpuGenSum) of the 256 KiB
+/// words a range covers, remembered by a bind that found no CPU-modified page in it
+/// (MemoryTracker::SnapshotCpuGen / CpuGenUnchanged).
+struct CpuGenKey {
+    RegionManager* region{};
+    u32 first_word{};
+    u32 words{};
+    u64 sum{};
+};
+
 enum class Type : u8 {
     CPU = 1 << 0,
     GPU = 1 << 1,

@@ -202,6 +202,7 @@ typedef struct {
     /* Current block */
     int started;
     uint32_t byte, out_left, skip_left, repeated;
+    uint32_t ends_without_output; /* sotc: block ends with no frame in between (see block_end) */
     /* Decoders */
     float hist[MAX_CH][4];
     void *at9;
@@ -1035,6 +1036,9 @@ static ABI int32_t ngs2_system_create(const uint8_t *option, const Allocator *al
         memcpy(&v, option + 0x20, 4); if (v) s->grain = v;
         memcpy(&v, option + 0x24, 4); if (v) s->rate = v;
     }
+    /* sotc: the reverb sizes, 30 s summaries and delay lines divide by the rate. */
+    if (s->rate < 8000) s->rate = 8000;
+    if (s->rate > 192000) s->rate = 192000;
     if (s->grain > MAX_GRAIN) s->grain = MAX_GRAIN;
     if (allocator) { s->allocator = *allocator; guest_alloc(allocator, &s->buffer, CONTEXT_BUFFER_SIZE); s->allocated = 1; }
     pthread_mutex_lock(&lock);
@@ -1614,6 +1618,7 @@ static void fifo_push(Sampler *s, uint32_t channels, const float *frames, uint32
     if (count > s->out_left) count = s->out_left;
     s->out_left -= count;
     if (s->fifo_len + count > FIFO_FRAMES) count = FIFO_FRAMES - s->fifo_len;
+    if (count) s->ends_without_output = 0;
     float *dst = s->fifo + (size_t)s->fifo_len * MAX_CH;
     for (uint32_t i = 0; i < count; ++i) for (uint32_t c = 0; c < MAX_CH; ++c) dst[i * MAX_CH + c] = c < channels ? frames[i * MAX_CH + c] : 0.0f;
     s->fifo_len += count;
@@ -1635,6 +1640,16 @@ static void block_begin(Sampler *s, const Block *b, int restart) {
 /* The block finished: repeat it or move on. Calls the voice callback when one is set. */
 static void block_end(Voice *v) {
     Sampler *s = v->sampler;
+    /* sotc: a block that yields no frame (smaller than one frame, an ATRAC9 frame that never
+     * decodes, a skip over all of it) and repeats forever spun the audio thread with the lock
+     * held, which froze every VoiceControl caller: after 64 such ends the voice's queue ends. */
+    if (++s->ends_without_output > 64) {
+        ++stat_errors;
+        note("a block queue produced no audio after 64 block ends: voice ended");
+        s->count = 0;
+        s->started = 0;
+        return;
+    }
     Block *b = &s->blocks[s->head];
     int repeat = b->repeats != 0;
     if (v->callback && (v->callback_flags & (repeat ? 2u : 1u))) {
@@ -1648,7 +1663,7 @@ static void block_end(Voice *v) {
         return;
     }
     s->head = (s->head + 1) % MAX_BLOCKS;
-    --s->count;
+    if (s->count) --s->count; /* sotc: the callback above may have reset the queue */
     s->started = 0;
 }
 
@@ -1671,7 +1686,11 @@ static int decode_unit(Voice *v) {
         }
     } else if (s->wave == WAVE_ATRAC9) {
         const Atrac9CodecInfo *info = &s->at9_info;
-        if (s->at9_ok && s->byte < b->size) {
+        /* sotc: Atrac9Decode reads a whole frame: a block that ends inside one stops there. */
+        const uint32_t frame_bytes = info->framesInSuperframe > 0
+                                         ? (uint32_t)info->superframeSize / (uint32_t)info->framesInSuperframe
+                                         : (uint32_t)info->superframeSize;
+        if (s->at9_ok && frame_bytes && s->byte + frame_bytes <= b->size) {
             int16_t pcm[UNIT_FRAMES * MAX_CH];
             int bytes = 0;
             if (Atrac9Decode(s->at9, b->data + s->byte, pcm, &bytes) || bytes <= 0) {
@@ -1719,6 +1738,9 @@ static void fifo_fill(Voice *v, uint32_t need) {
             /* Keep one frame of history before the read position. */
             uint32_t drop = (uint32_t)s->pos;
             drop = drop > 1 ? drop - 1 : 0;
+            /* sotc: the read position can be past the end (a high pitch step): never drop more
+             * than the FIFO holds, or fifo_len - drop wraps and memmove runs off the heap. */
+            if (s->fifo_len && drop > s->fifo_len - 1) drop = s->fifo_len - 1;
             if (!drop) break;
             memmove(s->fifo, s->fifo + (size_t)drop * MAX_CH, (size_t)(s->fifo_len - drop) * MAX_CH * sizeof(float));
             s->fifo_len -= drop;

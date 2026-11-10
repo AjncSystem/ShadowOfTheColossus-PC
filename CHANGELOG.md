@@ -1,6 +1,7 @@
 # Changelog
 
 ## Próxima versão
+- **Thread de desenho mais leve: caminhos rápidos do Lukto02 (#308)** para os desenhos só de profundidade e os de G-buffer: quando nenhum registro de renderização, imagem ou estado mudou desde o último desenho, o preparo dos alvos, o início da renderização e o estado dinâmico são reaproveitados (99% de acerto no mapa aberto). Verificação: 0 diferenças em mais de 45 milhões de checagens. Demonstração com texturas Máximas e PS4 Pro: 83,0 → 85,4 FPS, mínimo 62,6 → 66,2; no mapa aberto o jogo fica em 60 FPS 40–50% do tempo (antes 23–32%). Desligáveis pelos bits 28 e 29 de `BB_TOGGLE_FILE`.
 - **Geração de quadros DLSS-G 3x, 4x, 6x e Dinâmica** (Lucas-blip-png, #314): opção "Multiplicador do DLSS-G" no lançador (padrão 2x, como antes); limitada ao que a placa aceita (RTX 50 até 6x, RTX 40 fica em 2x). `SOTC_DLSSG_FRAMES` / `SOTC_DLSSG_MODE=dynamic`.
 - **Prioridade de threads em CPUs com 4 threads ou menos** (Lucas-blip-png, #312, #267): workers do jogo abaixo do normal, som no máximo, leitura de arquivos acima do normal. CPUs maiores não mudam. `SOTC_JOB_PRIORITY=0` desliga.
 

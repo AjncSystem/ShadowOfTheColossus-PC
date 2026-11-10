@@ -83,6 +83,7 @@ uintptr_t runtime_pad_resolve(const char *name);
 uintptr_t runtime_sotc_resolve(const char *name);
 int runtime_thread_is_guest(void);
 uintptr_t runtime_fiber_resolve(const char *name);
+void runtime_fiber_thread_exit(void);
 void runtime_fiber_report(void);
 void runtime_pad_report(void);
 uintptr_t runtime_rtc_resolve(const char *name);

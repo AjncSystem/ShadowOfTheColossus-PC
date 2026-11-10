@@ -222,9 +222,20 @@ static void use_fiber_limits(const struct Fiber *f, const FiberContext *g);
 static void use_host_limits(const FiberContext *g) { use_stack_limits(g->host_limit,g->host_base,0); }
 
 static int valid(const Fiber *f) { return f->magic_start==SIGNATURE0 && f->magic_end==SIGNATURE1; }
+/* A fiber stack is only 16-byte aligned: StackLimit goes up to the next page, as __chkstk in
+ * the system libraries and drivers probes page by page down to a page-aligned limit. */
+static void *fiber_stack_limit(const struct Fiber *f) {
+    return (void *)(((uintptr_t)f->addr_context+4095) & ~(uintptr_t)4095);
+}
 static void use_fiber_limits(const struct Fiber *f, const FiberContext *g) {
-    if (f->addr_context) use_stack_limits(f->addr_context,(unsigned char *)f->addr_context+f->size_context,1);
+    if (f->addr_context) use_stack_limits(fiber_stack_limit(f),(unsigned char *)f->addr_context+f->size_context,1);
     else use_host_limits(g);
+}
+/* sotc: scePthreadExit from a fiber jumps back to the thread's start on its own stack: the
+ * thread's limits first (runtime_thread.c thread_exit). */
+void runtime_fiber_thread_exit(void) {
+    FiberContext *g=thread_fiber_get();
+    if (g) use_host_limits(g);
 }
 /* Fiber calls the game gets an error from are reported (the first 32): a refused run or switch
  * can lose a job. */
@@ -259,25 +270,30 @@ static int32_t attach_context(Fiber *f, void *addr, uint64_t size) {
     stack_prepare(f);
     return 0;
 }
-static __attribute__((noreturn)) void enter(Fiber *f, uint64_t arg, void *stack, _Atomic uint32_t *previous_state) {
+/* The guest's SceFiber fields are read before the stack limits change, so that no fault on
+ * them is taken while RSP and the limits disagree. */
+static __attribute__((noreturn)) void enter(Fiber *f, uint64_t arg, void *stack, _Atomic uint32_t *previous_state,
+                                            void *limit, void *base, int fiber) {
     FiberData data={.entry=f->entry,.arg_on_initialize=f->arg_on_initialize,.arg_on_run_to=arg,
                     .stack_addr=stack,.state=previous_state,.fpucw=0x037f,.mxcsr=0x9fc0};
-    fiber_switch_entry(&data,(f->flags & FLAG_SET_FPU_REGS)!=0);
+    const int set_fpu=(f->flags & FLAG_SET_FPU_REGS)!=0;
+    use_stack_limits(limit,base,fiber);
+    fiber_switch_entry(&data,set_fpu);
 }
 static __attribute__((noreturn)) void switch_to_fiber(Fiber *f, uint64_t arg, FiberContext *ctx) {
-    use_fiber_limits(f,ctx);
-    if (f->context) { ctx->arg_on_run_to=arg; fiber_longjmp(f->context); }
+    FiberContext *const target=f->context;
+    if (target) { ctx->arg_on_run_to=arg; use_fiber_limits(f,ctx); fiber_longjmp(target); }
     _Atomic uint32_t *previous=NULL;
     if (ctx->prev_fiber) { previous=&ctx->prev_fiber->state; ctx->prev_fiber=NULL; }
-    enter(f,arg,(unsigned char *)f->addr_context+f->size_context,previous);
+    unsigned char *const top=(unsigned char *)f->addr_context+f->size_context;
+    enter(f,arg,top,previous,fiber_stack_limit(f),top,1);
 }
 static __attribute__((noreturn)) void switch_fiber(Fiber *current, Fiber *f, uint64_t arg, FiberContext *ctx) {
     ctx->prev_fiber=current; ctx->current_fiber=f;
     if (!f->addr_context) {
         /* A fiber without its own context runs on the thread's stack below the run point. */
         ctx->prev_fiber=NULL;
-        use_host_limits(ctx);
-        enter(f,arg,(void *)(ctx->rsp & ~UINT64_C(15)),&current->state);
+        enter(f,arg,(void *)(ctx->rsp & ~UINT64_C(15)),&current->state,ctx->host_limit,ctx->host_base,0);
     }
     switch_to_fiber(f,arg,ctx);
 }
@@ -340,7 +356,7 @@ static ABI int32_t fiber_run_impl(Fiber *f, void *addr, uint64_t size, uint64_t 
     thread_fiber_set(&ctx);
     if (!fiber_setjmp(&ctx)) {
         if (f->addr_context) switch_to_fiber(f,arg,&ctx);
-        enter(f,arg,(void *)(ctx.rsp & ~UINT64_C(15)),NULL);
+        enter(f,arg,(void *)(ctx.rsp & ~UINT64_C(15)),NULL,ctx.host_limit,ctx.host_base,0);
     }
     /* Back from sceFiberReturnToThread (or a returning entry). */
     Fiber *current=ctx.current_fiber;

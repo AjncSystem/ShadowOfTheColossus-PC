@@ -1,5 +1,8 @@
 # Changelog
 
+## 0.74.1 — 2026-11-10
+- **Atualização pelo lançador corrigida:** na fusão da 0.72.1-opt13 do Oussama268 (v0.73) o endereço das releases do atualizador (`launcher/sotc_update.py`) passou a ser o do fork dele, então os lançadores da v0.73 e da v0.74 procuravam atualização lá e nunca ofereciam a versão nova. Volta a ser este repositório, com um teste (`tests/test_update_repo.py`) que impede a troca de novo. Quem está na v0.73 ou na v0.74 precisa baixar a v0.74.1 à mão uma vez.
+
 ## 0.74 — 2026-11-10
 - **Thread de desenho mais leve: caminhos rápidos do Lukto02 (#308)** para os desenhos só de profundidade e os de G-buffer: quando nenhum registro de renderização, imagem ou estado mudou desde o último desenho, o preparo dos alvos, o início da renderização e o estado dinâmico são reaproveitados (99% de acerto no mapa aberto). Verificação: 0 diferenças em mais de 45 milhões de checagens. Demonstração com texturas Máximas e PS4 Pro: 83,0 → 85,4 FPS, mínimo 62,6 → 66,2; no mapa aberto o jogo fica em 60 FPS 40–50% do tempo (antes 23–32%). Desligáveis pelos bits 28 e 29 de `BB_TOGGLE_FILE`.
 - **Geração de quadros DLSS-G 3x, 4x, 6x e Dinâmica** (Lucas-blip-png, #314): opção "Multiplicador do DLSS-G" no lançador (padrão 2x, como antes); limitada ao que a placa aceita (RTX 50 até 6x, RTX 40 fica em 2x). `SOTC_DLSSG_FRAMES` / `SOTC_DLSSG_MODE=dynamic`.

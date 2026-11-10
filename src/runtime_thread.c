@@ -413,6 +413,7 @@ static ABI __attribute__((noreturn)) void thread_exit(void *value) {
     GuestThread *t=runtime_thread_current();
     if (t->host_owned) { fputs("STOP: pthread_exit on host-owned/main thread\n",stderr); exit(21); }
     t->result=value;
+    runtime_fiber_thread_exit(); /* sotc: leaving a fiber: the thread's stack limits (#322) */
     /* No host unwinder: guest frames have no registered FDEs. */
     exit_longjmp(t);
 }

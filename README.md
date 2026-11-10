@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC native port · v0.73
+# Shadow of the Colossus — PC native port · v0.74
 
 [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
@@ -26,6 +26,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.74** | **Lighter draw thread:** Lukto02's draw-thread fast paths (#308) for depth-only and G-buffer draws: when no render register, image or state changed since the last draw, the render target setup, render pass start and dynamic state are reused (99% hit rate in the open world, 0 differences in verify mode). In the user's open-world rides the game stays at 60 FPS 40–50% of the time (23–32% before). **DLSS-G 3x/4x/6x and Dynamic** frame generation multiplier (RTX 50; #314). **Thread priorities on 4-thread CPUs** (#312). |
 | **0.73** | **Optimized build** (ThinLTO + PGO trained on the open world): FPS matches or beats Oussama268's fork. **Dynamic FPS** on by default in the 60 FPS mode (below 50 FPS it locks to a steady step that suits the screen: 48 at 144 Hz, 40 at 120 Hz, 30 at 60 Hz, and goes back to 60). **Oussama268's 0.72.1-opt13 merged** (less riding stutter, render target reuse, freeze and black textures fixed, DLAA). **Extreme mode sharp again** (Maximum mip 0, High mip 1). **Stability:** the ending, the intro skip and the Time Attack mosaic fixed (heap guard shortcuts off again), a frozen-picture fix, crash 0x564d24 fixed. Window title with the port version and play time. |
 | **0.72.2** | **Ending fixed:** no stretched textures or flicker at the end of the game and no close between the ending and the intro (textures the game freed while drawing them keep their contents for 400 frames). **Smoother area changes:** High/Maximum textures back at mip 2, area-change memory releases without a full GPU wait, and with 24 GB of RAM or more new textures read by the GPU straight from the game's memory. **Large textures get memory of their own** (no more 1.8 GB held empty after an area change). **Updating clears the shader cache once.** Window title with the port version and the play time. |
 | **0.72.1** | **Cards with less than 8 GB of video memory get a light profile automatically:** Maximum textures at mip 1 (without the 3 s bank linger, with the page pool safety switch), High at mip 2 as in 0.71, video memory use capped at Default, no staging reserve in video memory. 8 GB cards and up keep everything. **"Card memory" in the launcher's quick settings** (Play page): Automatic (by the card), Light or Full. |

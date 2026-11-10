@@ -72,6 +72,7 @@
 #define MAX_FILTERS 8
 #define FIFO_FRAMES 2048
 #define UNIT_FRAMES 256
+#define AT9_SUPERFRAME_MAX 8192   /* sotc: largest ATRAC9 superframe (2048-byte frames, 4 per superframe) */
 #define END_GRACE_RENDERS 2
 
 enum { RACK_SAMPLER = 0x1000, RACK_SUBMIXER = 0x2000, RACK_REVERB = 0x2001, RACK_MASTERING = 0x3000 };
@@ -207,8 +208,13 @@ typedef struct {
     float hist[MAX_CH][4];
     void *at9;
     Atrac9CodecInfo at9_info;
-    uint32_t at9_frame_in_superframe, at9_superframe_start;
+    uint32_t at9_frame_in_superframe;
     int at9_ok;
+    /* sotc: the superframe being decoded. Streamed sounds come in blocks that are not whole
+     * superframes (64 KiB blocks of 960-byte superframes): one superframe starts at the end of a
+     * block and ends in the next, so it is put together here; reset with the decoder. */
+    uint32_t at9_sf_fill, at9_sf_pos;
+    uint8_t *at9_sf;
     /* Decoded frames waiting for the resampler (interleaved, MAX_CH stride) */
     float *fifo;
     uint32_t fifo_len;
@@ -937,7 +943,9 @@ static void sampler_reset_decoder(Sampler *s) {
         if ((c & 0xff) == 0xfe) { config[0] = (unsigned char)c; config[1] = (unsigned char)(c >> 8); config[2] = (unsigned char)(c >> 16); config[3] = (unsigned char)(c >> 24); }
         else { config[0] = (unsigned char)(c >> 24); config[1] = (unsigned char)(c >> 16); config[2] = (unsigned char)(c >> 8); config[3] = (unsigned char)c; }
         if (s->at9 && !Atrac9InitDecoder(s->at9, config) && !Atrac9GetCodecInfo(s->at9, &s->at9_info) &&
-            s->at9_info.channels > 0 && s->at9_info.channels <= MAX_CH && s->at9_info.frameSamples <= UNIT_FRAMES)
+            s->at9_info.channels > 0 && s->at9_info.channels <= MAX_CH && s->at9_info.frameSamples <= UNIT_FRAMES &&
+            s->at9_info.superframeSize > 0 && s->at9_info.superframeSize <= AT9_SUPERFRAME_MAX &&
+            s->at9_info.framesInSuperframe > 0 && (s->at9_sf || (s->at9_sf = calloc(1, AT9_SUPERFRAME_MAX + 64))))
             s->at9_ok = 1;
         else {
             ++stat_errors;
@@ -945,6 +953,7 @@ static void sampler_reset_decoder(Sampler *s) {
         }
     }
     s->at9_frame_in_superframe = 0;
+    s->at9_sf_fill = s->at9_sf_pos = 0;
 }
 static void sampler_clear_blocks(Sampler *s) {
     s->head = s->count = 0;
@@ -995,6 +1004,7 @@ static void voice_free(Voice *v) {
     if (v->sampler) {
         if (v->sampler->at9) Atrac9ReleaseHandle(v->sampler->at9);
         free(v->sampler->fifo);
+        free(v->sampler->at9_sf);
         free(v->sampler);
     }
     free(v->matrices);
@@ -1076,10 +1086,15 @@ static ABI int32_t ngs2_system_destroy(uintptr_t handle, BufferInfo *out) {
     for (System **p = &systems; *p; p = &(*p)->next) if (*p == s) { *p = s->next; break; }
     while (s->racks) { Rack *r = s->racks; s->racks = r->next; rack_release(r); r->magic = 0; free(r); }
     if (out) *out = s->buffer;
-    if (s->allocated) guest_free(&s->allocator, &s->buffer);
+    /* sotc: the guest's free callback runs after the lock (a guest allocator that waits for
+     * a thread inside NGS2 would deadlock). */
+    const Allocator allocator = s->allocator;
+    BufferInfo buffer = s->buffer;
+    const int allocated = s->allocated;
     s->magic = 0;
     free(s);
     pthread_mutex_unlock(&lock);
+    if (allocated) guest_free(&allocator, &buffer);
     return NGS2_OK;
 }
 
@@ -1095,11 +1110,17 @@ static ABI int32_t ngs2_query_buffer(uint32_t rack_id, const void *option, Buffe
 static int32_t rack_create(uintptr_t system, uint32_t rack_id, const uint8_t *option, const BufferInfo *buffer,
                            const Allocator *allocator, uintptr_t *out) {
     if (!out) return NGS2_ERR_ARG;
+    /* sotc: the guest's alloc callback runs before the lock, its free callback after it. */
+    BufferInfo guest_buffer;
+    if (allocator) guest_alloc(allocator, &guest_buffer, CONTEXT_BUFFER_SIZE);
     pthread_mutex_lock(&lock);
     System *s = as_system(system);
-    if (!s) { pthread_mutex_unlock(&lock); return NGS2_ERR_HANDLE; }
-    Rack *r = calloc(1, sizeof(*r));
-    if (!r) { pthread_mutex_unlock(&lock); return NGS2_ERR_MEMORY; }
+    Rack *r = s ? calloc(1, sizeof(*r)) : NULL;
+    if (!r) {
+        pthread_mutex_unlock(&lock);
+        if (allocator) guest_free(allocator, &guest_buffer);
+        return s ? NGS2_ERR_MEMORY : NGS2_ERR_HANDLE;
+    }
     r->magic = MAGIC_RACK;
     r->system = s;
     r->id = rack_id;
@@ -1128,10 +1149,11 @@ static int32_t rack_create(uintptr_t system, uint32_t rack_id, const uint8_t *op
         if (r->voices) for (uint32_t i = 0; i < r->max_voices; ++i) if (r->voices[i]) { voice_free(r->voices[i]); free(r->voices[i]); }
         free(r->voices); free(r);
         pthread_mutex_unlock(&lock);
+        if (allocator) guest_free(allocator, &guest_buffer);
         return NGS2_ERR_MEMORY;
     }
     if (buffer) r->buffer = *buffer;
-    if (allocator) { r->allocator = *allocator; guest_alloc(allocator, &r->buffer, CONTEXT_BUFFER_SIZE); r->allocated = 1; }
+    if (allocator) { r->allocator = *allocator; r->buffer = guest_buffer; r->allocated = 1; }
     /* Appended: creation order is a reasonable tie-break for the render order. */
     Rack **tail = &s->racks;
     while (*tail) tail = &(*tail)->next;
@@ -1155,11 +1177,14 @@ static ABI int32_t ngs2_rack_destroy(uintptr_t handle, BufferInfo *out) {
     for (Rack **p = &s->racks; *p; p = &(*p)->next) if (*p == r) { *p = r->next; break; }
     unpatch_all(s, r);
     if (out) *out = r->buffer;
-    if (r->allocated) guest_free(&r->allocator, &r->buffer);
+    const Allocator allocator = r->allocator;
+    BufferInfo buffer = r->buffer;
+    const int allocated = r->allocated;
     rack_release(r);
     r->magic = 0;
     free(r);
     pthread_mutex_unlock(&lock);
+    if (allocated) guest_free(&allocator, &buffer);
     return NGS2_OK;
 }
 static ABI int32_t ngs2_voice_handle(uintptr_t rack, uint32_t index, uintptr_t *out) {
@@ -1632,8 +1657,6 @@ static void block_begin(Sampler *s, const Block *b, int restart) {
     s->started = 1;
     if (!restart) s->repeated = 0;
     if (s->wave == WAVE_ATRAC9 && (restart || b->skip)) sampler_reset_decoder(s);
-    s->at9_frame_in_superframe = 0;
-    s->at9_superframe_start = 0;
     s->user = b->user;
     s->waveform_pointer = b->data;
 }
@@ -1686,28 +1709,39 @@ static int decode_unit(Voice *v) {
         }
     } else if (s->wave == WAVE_ATRAC9) {
         const Atrac9CodecInfo *info = &s->at9_info;
-        /* sotc: Atrac9Decode reads a whole frame: a block that ends inside one stops there. */
-        const uint32_t frame_bytes = info->framesInSuperframe > 0
-                                         ? (uint32_t)info->superframeSize / (uint32_t)info->framesInSuperframe
-                                         : (uint32_t)info->superframeSize;
-        if (s->at9_ok && frame_bytes && s->byte + frame_bytes <= b->size) {
+        const uint32_t sf = (uint32_t)info->superframeSize;
+        if (s->at9_ok && s->at9_sf_fill < sf) {
+            /* sotc: fill the superframe from this block; one cut by the block's end is
+             * completed from the next block. */
+            uint32_t take = b->size > s->byte ? b->size - s->byte : 0;
+            if (take > sf - s->at9_sf_fill) take = sf - s->at9_sf_fill;
+            memcpy(s->at9_sf + s->at9_sf_fill, b->data + s->byte, take);
+            s->at9_sf_fill += take;
+            s->byte += take;
+            s->decoded_bytes += take;
+            s->at9_sf_pos = 0;
+            s->at9_frame_in_superframe = 0;
+        }
+        if (s->at9_ok && s->at9_sf_fill == sf) {
             int16_t pcm[UNIT_FRAMES * MAX_CH];
             int bytes = 0;
-            if (Atrac9Decode(s->at9, b->data + s->byte, pcm, &bytes) || bytes <= 0) {
+            if (s->at9_sf_pos >= sf || Atrac9Decode(s->at9, s->at9_sf + s->at9_sf_pos, pcm, &bytes) || bytes <= 0) {
                 ++stat_errors;
-                note("ATRAC9 decode error at byte %u of a %u-byte block", s->byte, b->size);
-                s->byte = b->size;
+                note("ATRAC9 decode error in frame %u of a %u-byte superframe", s->at9_frame_in_superframe, sf);
+                s->at9_sf_fill = 0;   /* the rest of the superframe is dropped */
+                produced = 0;
             } else {
                 uint32_t n = (uint32_t)info->frameSamples, c_in = (uint32_t)info->channels;
                 for (uint32_t i = 0; i < n; ++i)
                     for (uint32_t c = 0; c < MAX_CH; ++c) frames[i * MAX_CH + c] = c < c_in ? pcm[i * c_in + c] / 32768.0f : 0.0f;
                 produced = n;
-                used = (uint32_t)bytes;
-                if (++s->at9_frame_in_superframe == (uint32_t)info->framesInSuperframe) {
-                    s->at9_frame_in_superframe = 0;
-                    s->at9_superframe_start += (uint32_t)info->superframeSize;
-                    used = s->at9_superframe_start - s->byte; /* skip the superframe padding */
-                }
+                s->at9_sf_pos += (uint32_t)bytes;
+                if (++s->at9_frame_in_superframe == (uint32_t)info->framesInSuperframe) s->at9_sf_fill = 0;
+            }
+            if (!produced) {   /* a bad superframe: go on with the next one if the block has more */
+                s->waveform_pointer = b->data + s->byte;
+                if (s->byte >= b->size) block_end(v);
+                return 1;
             }
         }
     } else {

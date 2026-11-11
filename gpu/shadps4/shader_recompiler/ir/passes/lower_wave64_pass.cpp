@@ -211,45 +211,66 @@ bool Wave64UniformBranchesEnabled() {
     return sotc && wave64_uniform_default != 0;
 }
 
-void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info,
-                           const Profile& profile) {
-    if (program.info.hw_stage != HwStage::Compute || profile.subgroup_size == 64) {
-        return;
-    }
-
-    const auto [size_x, size_y, size_z] = runtime_info.hw.cs.workgroup_size;
-    const u32 num_threads = size_x * size_y * size_z;
-    if (num_threads <= 32) {
-        // The whole workgroup fits in one host subgroup, but the guest code was written for a
-        // wave64 whose upper half is inactive. Reads of a fixed lane in that upper half (e.g. the
-        // "readlane 32" that merges the two halves of a cross-lane reduction) index past the host
-        // subgroup, which is undefined for OpGroupNonUniformBroadcast. When the value read is a
-        // reduction step, the missing half contributes the reduction identity (folding it onto
-        // the lower half would count the lower lanes twice, e.g. double a sum). Other reads are
-        // folded into the lower half so they stay valid.
-        for (IR::Block* block : program.blocks) {
-            for (IR::Inst& inst : block->Instructions()) {
-                if (inst.GetOpcode() != IR::Opcode::ReadLane || !inst.Arg(1).IsImmediate()) {
-                    continue;
-                }
-                const u32 lane = inst.Arg(1).U32();
-                if (lane < profile.subgroup_size) {
-                    continue;
-                }
-                // SOTC_WAVE64_IDENTITY=0 restores the plain fold (for A/B comparisons).
-                static const bool identity_enabled = [] {
-                    const char* v = std::getenv("SOTC_WAVE64_IDENTITY");
-                    return v ? std::atoi(v) != 0 : true;
-                }();
-                const auto identity =
-                    identity_enabled ? ReductionIdentity(inst.Arg(0)) : std::optional<u32>{};
-                if (identity) {
-                    inst.ReplaceUsesWithAndRemove(IR::Value{*identity});
-                } else {
-                    inst.SetArg(1, IR::Value{lane % profile.subgroup_size});
-                }
+// Reads of a fixed lane that does not exist on the host (at or past `lanes`) are undefined for
+// OpGroupNonUniformBroadcast. When the value read is a reduction step, the missing lane contributes
+// the reduction identity (folding it onto an existing lane would count that lane twice, e.g.
+// double a sum). Other reads are folded onto an existing lane so they stay valid.
+static void FoldAbsentLaneReads(IR::Program& program, u32 lanes) {
+    for (IR::Block* block : program.blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() != IR::Opcode::ReadLane || !inst.Arg(1).IsImmediate()) {
+                continue;
+            }
+            const u32 lane = inst.Arg(1).U32();
+            if (lane < lanes) {
+                continue;
+            }
+            // SOTC_WAVE64_IDENTITY=0 restores the plain fold (for A/B comparisons).
+            static const bool identity_enabled = [] {
+                const char* v = std::getenv("SOTC_WAVE64_IDENTITY");
+                return v ? std::atoi(v) != 0 : true;
+            }();
+            const auto identity =
+                identity_enabled ? ReductionIdentity(inst.Arg(0)) : std::optional<u32>{};
+            if (identity) {
+                inst.ReplaceUsesWithAndRemove(IR::Value{*identity});
+            } else {
+                inst.SetArg(1, IR::Value{lane % lanes});
             }
         }
+    }
+}
+
+void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info,
+                           const Profile& profile) {
+    if (program.info.hw_stage != HwStage::Compute) {
+        return;
+    }
+    const auto [size_x, size_y, size_z] = runtime_info.hw.cs.workgroup_size;
+    const u32 num_threads = size_x * size_y * size_z;
+    if (profile.subgroup_size == 64) {
+        // sotc: a 64-wide host (AMD GCN: RX 470-590, Vega) runs a workgroup smaller than a wave
+        // in one subgroup whose upper lanes do not exist, as the PS4 does; but the guest's
+        // "readlane 32" that merges the two halves of a reduction then reads an absent lane.
+        // RADV returns a stale register there: cs 0x87cf9b8a (32 threads) took the minimum of
+        // garbage, and characters, fog, waterfall and particles got random colours (ROADMAP 0.28,
+        // issues #152/#158/#187). The same fold as the 32-wide path, past the workgroup size.
+        // SOTC_WAVE64_ABSENT_LANES=0 turns it off.
+        static const bool fold_absent = [] {
+            const char* v = std::getenv("SOTC_WAVE64_ABSENT_LANES");
+            return !v || v[0] != '0';
+        }();
+        if (fold_absent && num_threads < 64) {
+            FoldAbsentLaneReads(program, num_threads);
+        }
+        return;
+    }
+    if (num_threads <= 32) {
+        // The whole workgroup fits in one host subgroup, but the guest code was written for a
+        // wave64 whose upper half is inactive: reads of a fixed lane in that upper half (e.g. the
+        // "readlane 32" that merges the two halves of a cross-lane reduction) index past the host
+        // subgroup.
+        FoldAbsentLaneReads(program, profile.subgroup_size);
         return;
     }
 

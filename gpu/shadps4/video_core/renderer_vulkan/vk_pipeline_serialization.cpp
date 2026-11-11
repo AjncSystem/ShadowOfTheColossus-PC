@@ -24,7 +24,8 @@ namespace Serialization {
 // 37/135 = invariant position on barycentric-emulation pipelines (ground-level texture/depth
 // mismatch between the pipeline with the geometry shader and the one without; PR #258).
 // 38 = early fragment tests on the LOD feedback shaders (emit_spirv.cpp).
-static const u32 ShaderBinaryVersion = Shader::LodFeedbackEnabled() ? 38u : 135u;
+// 39/136 = reads of absent lanes folded on 64-wide hosts (AMD GCN; lower_wave64_pass.cpp).
+static const u32 ShaderBinaryVersion = Shader::LodFeedbackEnabled() ? 39u : 136u;
 static constexpr u32 ShaderMetaVersion = 21u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization

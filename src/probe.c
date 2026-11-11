@@ -220,6 +220,42 @@ static int prefer_native(const char *name, int bound) {
     const char *symbol=runtime_import_name(name);
     return !strncmp(symbol,"sceNgs2",7) || !strncmp(symbol,"sceUlt",6);
 }
+/* sotc: game objects found cleared (their first qword 0) where the game uses them: crashes
+ * after loading a save and at the ending, always under the frames 0x39a73/0x39ab6 <- 0x38ad2
+ * <- 0x33586. Each case resumes where the game itself goes when the object is absent:
+ *   0x564d24 / 0x564da6  eboot 0x660fc0 gave no component for a list entry (r12 = 0): the next
+ *                        object (0x564d92) or the next entry (0x564d00); the most frequent
+ *                        crash, 4 times since 3 Nov, 30-40 s after loading a save;
+ *   0x144c60 / 0x14934f  destroying an object whose vtable is gone (rax = 0): its slot is
+ *                        cleared without the destructor (0x144c71) / skipped (0x149360); the
+ *                        "Fim" screen of the ending, 9 Nov;
+ *   0x14cce7             a reference released on no object (r14 = 0): return (0x14ced6); the
+ *                        ending, 5 Nov.
+ * Returns the image offset to resume at, 0 for any other fault. SOTC_FIX_NULL_OBJECTS=0 (or
+ * SOTC_FIX_564D24=0) off. */
+static uintptr_t null_object_resume(uintptr_t at, uint64_t rax, uint64_t r12, uint64_t r14) {
+    static int fix=-1;
+    if (fix<0) {
+        const char *v=getenv("SOTC_FIX_NULL_OBJECTS"), *w=getenv("SOTC_FIX_564D24");
+        fix=!((v && v[0]=='0') || (w && w[0]=='0'));
+    }
+    uintptr_t resume;
+    if (!fix) resume=0;
+    else if (r12==0 && at==0x564d24) resume=0x564d92;
+    else if (r12==0 && at==0x564da6) resume=0x564d00;
+    else if (rax==0 && at==0x144c60) resume=0x144c71;
+    else if (rax==0 && at==0x14934f) resume=0x149360;
+    else if (r14==0 && at==0x14cce7) resume=0x14ced6;
+    else resume=0;
+    if (resume) {
+        static long skipped;
+        const long n=__atomic_add_fetch(&skipped,1,__ATOMIC_RELAXED);
+        if (n<=8 || (n & (n-1))==0)
+            fprintf(stderr,"SOTC FIX null object at guest %#llx skipped (resumes at %#llx; %ld so far)\n",
+                    (unsigned long long)at,(unsigned long long)resume,n);
+    }
+    return resume;
+}
 #ifdef _WIN32
 static void describe_address(char *out, size_t size, uintptr_t address) {
     HMODULE module=NULL;
@@ -1477,41 +1513,11 @@ static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
     if ((code==EXCEPTION_BREAKPOINT || code==EXCEPTION_SINGLE_STEP) && pool_hook_trap(info)) { fault_path=1; return EXCEPTION_CONTINUE_EXECUTION; }
     if ((code==EXCEPTION_BREAKPOINT || code==EXCEPTION_SINGLE_STEP) && release_hook_trap(info)) { fault_path=1; return EXCEPTION_CONTINUE_EXECUTION; }
     if (code==EXCEPTION_SINGLE_STEP && helper_single_step(info)) { fault_path=2; return EXCEPTION_CONTINUE_EXECUTION; }
-    /* sotc: game objects found cleared (their first qword 0) where the game uses them: crashes
-     * after loading a save and at the ending, always under the frames 0x39a73/0x39ab6 <- 0x38ad2
-     * <- 0x33586. Each case resumes where the game itself goes when the object is absent:
-     *   0x564d24 / 0x564da6  eboot 0x660fc0 gave no component for a list entry (r12 = 0): the next
-     *                        object (0x564d92) or the next entry (0x564d00); the most frequent
-     *                        crash, 4 times since 3 Nov, 30-40 s after loading a save;
-     *   0x144c60 / 0x14934f  destroying an object whose vtable is gone (rax = 0): its slot is
-     *                        cleared without the destructor (0x144c71) / skipped (0x149360); the
-     *                        "Fim" screen of the ending, 9 Nov;
-     *   0x14cce7             a reference released on no object (r14 = 0): return (0x14ced6); the
-     *                        ending, 5 Nov.
-     * SOTC_FIX_NULL_OBJECTS=0 (or SOTC_FIX_564D24=0) off. */
     if (code==EXCEPTION_ACCESS_VIOLATION && image) {
-        static int fix=-1;
-        if (fix<0) {
-            const char *v=getenv("SOTC_FIX_NULL_OBJECTS"), *w=getenv("SOTC_FIX_564D24");
-            fix=!((v && v[0]=='0') || (w && w[0]=='0'));
-        }
         CONTEXT *c=info->ContextRecord;
-        const uintptr_t at=(uintptr_t)c->Rip-(uintptr_t)image;
-        uintptr_t resume=0;
-        if (fix) {
-            if (c->R12==0 && at==0x564d24) resume=0x564d92;
-            else if (c->R12==0 && at==0x564da6) resume=0x564d00;
-            else if (c->Rax==0 && at==0x144c60) resume=0x144c71;
-            else if (c->Rax==0 && at==0x14934f) resume=0x149360;
-            else if (c->R14==0 && at==0x14cce7) resume=0x14ced6;
-        }
+        const uintptr_t resume=null_object_resume((uintptr_t)c->Rip-(uintptr_t)image,c->Rax,c->R12,c->R14);
         if (resume) {
             c->Rip=(DWORD64)(uintptr_t)(image+resume);
-            static volatile LONG skipped;
-            const LONG n=InterlockedIncrement(&skipped);
-            if (n<=8 || (n & (n-1))==0)
-                fprintf(stderr,"SOTC FIX null object at guest %#llx skipped (resumes at %#llx; %ld so far)\n",
-                        (unsigned long long)at,(unsigned long long)resume,(long)n);
             fault_path=3;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
@@ -1817,6 +1823,15 @@ static void apply_sotc_cmdline(const char *path, uint64_t size) {
 #ifndef _WIN32
 static void dump_frames(ucontext_t *uc);
 static void fault(int sig, siginfo_t *info, void *context) {
+    if (sig == SIGSEGV && image) {
+        greg_t *g = ((ucontext_t *)context)->uc_mcontext.gregs;
+        const uintptr_t resume = null_object_resume((uintptr_t)g[REG_RIP] - (uintptr_t)image,
+                                                    (uint64_t)g[REG_RAX], (uint64_t)g[REG_R12], (uint64_t)g[REG_R14]);
+        if (resume) {
+            g[REG_RIP] = (greg_t)(uintptr_t)(image + resume);
+            return;
+        }
+    }
     /* GPU page tracking (write-protected guest pages) is resolved first. */
     if (sig == SIGSEGV && gpu_enabled && helper_read_fault(info, context)) return;
     if (gpu_enabled && sig == SIGSEGV) { /* T38: see the Windows handler */

@@ -1189,10 +1189,9 @@ void NoteCamera(const AmdGpu::Regs& regs, u32 mrt_mask) {
         return;
     }
     static long long last_ms = 0;
-    LARGE_INTEGER t, f;
-    QueryPerformanceCounter(&t);
-    QueryPerformanceFrequency(&f);
-    const long long ms = static_cast<long long>(t.QuadPart * 1000 / f.QuadPart);
+    const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
     if (ms - last_ms < 160) {
         return;
     }

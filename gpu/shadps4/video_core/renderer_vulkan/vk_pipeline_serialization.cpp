@@ -26,7 +26,8 @@ namespace Serialization {
 // 38 = early fragment tests on the LOD feedback shaders (emit_spirv.cpp).
 // 39 = the LOD feedback buffer no longer depends on the textures bound when a permutation was
 // translated (resource_patching_pass.cpp).
-static const u32 ShaderBinaryVersion = Shader::LodFeedbackEnabled() ? 39u : 135u;
+// 40/136 = reads of absent lanes folded on 64-wide hosts (AMD GCN; lower_wave64_pass.cpp, #411).
+static const u32 ShaderBinaryVersion = Shader::LodFeedbackEnabled() ? 40u : 136u;
 static constexpr u32 ShaderMetaVersion = 21u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization

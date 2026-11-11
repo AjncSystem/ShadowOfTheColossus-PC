@@ -4194,6 +4194,18 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
     for (const auto& image_desc : stage.images) {
+        // sotc: an empty slot (no or invalid T#) keeps the shader's binding type. A default
+        // ImageDesc is a Texture, so a storage slot got a SAMPLED_IMAGE write into its
+        // STORAGE_IMAGE binding (validation: VUID-VkWriteDescriptorSet-descriptorType-00319).
+        // RADV's sampled descriptors are larger than its storage ones: the write could also
+        // spill into the next binding (AMD GCN colour faults on characters and particles).
+        const auto push_null_binding = [&] {
+            auto& entry = image_bindings.emplace_back(std::piecewise_construct, std::tuple{},
+                                                      std::tuple{});
+            if (image_desc.is_written) {
+                entry.second.type = VideoCore::TextureCache::BindingType::Storage;
+            }
+        };
         const auto tsharp = image_desc.GetSharp(stage);
         if (image_desc.array_size != 0) {
             // dynamic_tsharp_array_size (from Pink-shadPS4): one binding per table element, then a
@@ -4217,8 +4229,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                     AmdGpu::IsInteger(element_nfmt) == is_integer &&
                     element.GetNumberConversion() == tsharp.GetNumberConversion();
                 if (!bindable) {
-                    image_bindings.emplace_back(std::piecewise_construct, std::tuple{},
-                                                std::tuple{});
+                    push_null_binding();
                     continue;
                 }
                 if (element.lod_hw_cnt_en) {
@@ -4295,7 +4306,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
-            image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
+            push_null_binding();
             image_descriptor_array_sizes.push_back(1);
             continue;
         }
@@ -4307,7 +4318,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         "data_format={}, num_format={}",
                         tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
                         static_cast<u32>(num_fmt));
-            image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
+            push_null_binding();
             image_descriptor_array_sizes.push_back(1);
             continue;
         }

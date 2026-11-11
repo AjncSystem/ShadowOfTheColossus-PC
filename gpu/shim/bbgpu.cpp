@@ -141,6 +141,7 @@ static const bool kCopyLockOnce = [] {
 // through the guest address under the loader's copy guard (src/probe.c bb_copy_guard_buf): a fault
 // in it (a page the GPU tracking read-protected, or one the guest unmapped) returns here before
 // page tracking sees it, and the run is copied through the backing view as before.
+#ifdef _WIN32
 extern "C" __thread std::uintptr_t bb_copy_guard_lo, bb_copy_guard_hi;
 extern "C" __thread unsigned long long* bb_copy_guard_buf;
 static const bool kCopyGuestView = [] {
@@ -173,6 +174,14 @@ static const bool kCopyGuestView = [] {
     __atomic_store_n(&bb_copy_guard_buf, outer_buf, __ATOMIC_RELEASE);
     return true;
 }
+#else
+// TRADEOFF: the copy guard lives in the Windows exception handler only, so Linux copies through the
+// backing view; arming it in the Linux fault handler would let this switch work there.
+static constexpr bool kCopyGuestView = false;
+static bool GuardedGuestCopy(u8*, const void*, u64) {
+    return false;
+}
+#endif
 static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
     if (kCopyLockOnce && size && runtime_memory_copy_out(source, dest, size)) {
         return;

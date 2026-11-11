@@ -914,11 +914,27 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
     };
     std::array<Active, 8> active{};
     size_t active_count = 0;
+    // sotc: a heap's own fields are read through the backing view, never through the guest mapping.
+    // The tracker read-protects a GPU-modified page, and this runs inside a read fault's readback:
+    // a raw load of such a page faults into GuestFaultSignalHandler, whose readback re-enters here
+    // and loads the same still-protected page again before anything was applied or unprotected, so
+    // the nested SIGSEGV gets the default action (silent exit, no report, no core). Only a heap that
+    // is an eboot global has no backing view; its pages are not guest memory, so the tracker never
+    // protects them (the same split BpeHeapGuard::Read makes).
+    const auto heap_word = [this](VAddr addr) -> u64 {
+        u64 value = 0;
+        if (const u8* backing = memory->GetBackingPointer(addr)) {
+            std::memcpy(&value, backing, sizeof(value));
+        } else {
+            std::memcpy(&value, std::bit_cast<const void*>(addr), sizeof(value));
+        }
+        return value;
+    };
     std::array<VAddr, 8> heaps{};
     size_t heap_count = 0;
     if (const VAddr chosen = runtime_sotc_heap(); chosen != 0) {
         heaps[heap_count++] = chosen;
-        const u64 heap_class = *std::bit_cast<const u64*>(chosen);
+        const u64 heap_class = heap_word(chosen);
         if (const VAddr table = runtime_sotc_heap_table(); table != 0) {
             for (u32 id = 1; id < 48 && heap_count < heaps.size(); ++id) {
                 const VAddr other = std::bit_cast<const VAddr*>(table)[id];
@@ -929,7 +945,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                 if (!in_image && !memory->GetBackingPointer(other)) {
                     continue;
                 }
-                if (*std::bit_cast<const u64*>(other) == heap_class) {
+                if (heap_word(other) == heap_class) {
                     heaps[heap_count++] = other;
                 }
             }
@@ -971,9 +987,8 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
         SotcStats::hg_piece[ok ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
         return ok;
     };
-    const auto signature_of = [](VAddr heap) -> std::array<u64, 3> {
-        return {*std::bit_cast<const u64*>(heap + 0x80), *std::bit_cast<const u64*>(heap + 0xa8),
-                *std::bit_cast<const u64*>(heap + 0xc0)};
+    const auto signature_of = [&](VAddr heap) -> std::array<u64, 3> {
+        return {heap_word(heap + 0x80), heap_word(heap + 0xa8), heap_word(heap + 0xc0)};
     };
     for (size_t h = 0; h < heap_count; ++h) {
         const VAddr heap = heaps[h];
@@ -985,8 +1000,8 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
         // in their free lists (eboot+0x49500): their range comes from their own guard's free
         // blocks, refreshed every 2 s while their free tree changes, and after 250 ms already when
         // a readback lands outside the range (a piece the heap may have added since).
-        VAddr heap_base = *std::bit_cast<const VAddr*>(heap + 0x28);
-        u64 heap_size = *std::bit_cast<const u64*>(heap + 0x30);
+        VAddr heap_base = heap_word(heap + 0x28);
+        u64 heap_size = heap_word(heap + 0x30);
         GuardSlot* known = nullptr;
         if (h != 0) {
             known = find_slot(heap);
@@ -1084,9 +1099,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
         if (!a.checked) {
             a.checked = true;
             const VAddr heap = slot.heap;
-            const std::array<u64, 3> signature = {*std::bit_cast<const u64*>(heap + 0x80),
-                                                   *std::bit_cast<const u64*>(heap + 0xa8),
-                                                   *std::bit_cast<const u64*>(heap + 0xc0)};
+            const std::array<u64, 3> signature = signature_of(heap);
             if (!slot.guard || signature != slot.signature) {
                 SotcStats::heap_guard_builds.fetch_add(1, std::memory_order_relaxed);
                 SotcStats::hg_build_path[1].fetch_add(1, std::memory_order_relaxed);

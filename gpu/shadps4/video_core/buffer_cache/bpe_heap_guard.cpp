@@ -36,6 +36,21 @@ bool IsPieceAligned(VAddr addr) {
     return addr >= HeapPointerLo && addr < HeapPointerHi && (addr & ((1ULL << 20) - 1)) == 0;
 }
 
+/// sotc: reads a field of the heap object itself through the backing view. The heap is not always an
+/// eboot global outside guest memory: a world heap lives in guest memory the tracker read-protects,
+/// and a raw load of it faults into GuestFaultSignalHandler, whose readback re-enters
+/// ApplyDownloads -> BpeHeapPieces::Refresh and loads the same still-protected page again before
+/// anything was applied or unprotected. The nested SIGSEGV arrives with the first one still masked,
+/// so it takes the default action: no fault report, and sotc.py turns the -11 into exit 245.
+/// Falls back to the raw load only where there is no backing, i.e. a genuine eboot global.
+u64 HeapField(Core::MemoryManager* memory, VAddr addr) {
+    u64 value = 0;
+    if (!memory->TryReadBacking(addr, &value, sizeof(value))) {
+        std::memcpy(&value, std::bit_cast<const void*>(addr), sizeof(value));
+    }
+    return value;
+}
+
 // sotc: the walk's set of nodes and ring members seen (open addressing on the draw thread, kept
 // between builds: about 500 builds per 5 s at an area change, ~7000 nodes each)
 class SeenSet {
@@ -394,7 +409,7 @@ bool BpeHeapGuard::FindUsedBlock(VAddr addr, VAddr& block, VAddr& next, int* why
 
 bool BpeUsedBlocks::StillUsed(VAddr heap, VAddr block, VAddr next) const {
     // The block being freed is kept at [heap+0xc0] before it joins the tree
-    const VAddr pending = *std::bit_cast<const VAddr*>(heap + 0xc0);
+    const VAddr pending = static_cast<VAddr>(HeapField(memory, heap + 0xc0));
     u64 size_flags = 0;
     VAddr prev = 0;
     return pending != block && pending != block + HeaderSize &&
@@ -409,7 +424,7 @@ bool BpeUsedBlocks::Covers(VAddr heap, VAddr addr, VAddr end, int* why,
     why = why ? why : &no_why;
     // Only the unsplit tail right after the fence ([heap+0xd0], 1 MiB) is free of metadata: the
     // world heaps span many 1 MiB pieces, and the free blocks of the later ones lie above it too
-    u64 tail = *std::bit_cast<const u64*>(heap + 0xd0);
+    u64 tail = HeapField(memory, heap + 0xd0);
     if (tail < (64ULL << 10) || tail > (16ULL << 20)) {
         tail = 1ULL << 20;
     }
@@ -500,7 +515,7 @@ void BpeUsedBlocks::Add(VAddr block, VAddr next) {
 }
 
 bool BpeHeapPieces::Refresh(VAddr heap) {
-    const auto field = [&](u64 offset) { return *std::bit_cast<const volatile u64*>(heap + offset); };
+    const auto field = [&](u64 offset) { return HeapField(memory, heap + offset); };
     const VAddr new_head = field(0xb8);
     const u64 new_count = field(0x58);
     const u64 new_unit = field(0xd0);

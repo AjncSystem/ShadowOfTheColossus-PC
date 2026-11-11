@@ -2525,11 +2525,13 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                'The Saves page keeps a backup every time the game closes: import the .zip from before the problem. '
                'For another PC, export the saves and import them there.'),
              [(_('Saves', 'Saves'), lambda: self.show('saves'), False)]),
-            (_('Atualizar o port', 'Updating the port'),
-             _('O launcher procura versões novas ao abrir. Saves, cache de shaders e sotc.ini são mantidos.',
-               'The launcher looks for new versions when it starts. Saves, shader cache and sotc.ini are kept.'),
-             [(_('Procurar atualização', 'Check for updates'), lambda: self.check_updates(True), False)]),
         ]
+        # sotc_update.py installs the Windows release: the Linux AppImage is not updated by it.
+        if IS_WINDOWS:
+            topics.append((_('Atualizar o port', 'Updating the port'),
+                           _('O launcher procura versões novas ao abrir. Saves, cache de shaders e sotc.ini são mantidos.',
+                             'The launcher looks for new versions when it starts. Saves, shader cache and sotc.ini are kept.'),
+                           [(_('Procurar atualização', 'Check for updates'), lambda: self.check_updates(True), False)]))
         f.columnconfigure(0, weight=1)
         for k, (title, text, actions) in enumerate(topics):
             card = ttk.Frame(f, style='Card.TFrame', padding=(self.px(18), self.px(14)))

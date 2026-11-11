@@ -20,8 +20,16 @@
   nada. Na primeira abertura ele lê o `sotc.ini` que já existir. `--play` joga com os ajustes
   salvos sem abrir a janela (opções de inicialização da Steam).
 - **Só no Windows:** o AMD FSR 4.1 (a AMD distribui o upscaler do SDK apenas como DLLs do Windows; a
-  opção não aparece no lançador do Linux) e a pré-leitura de páginas nas cópias de textura
-  (`SOTC_COPY_PREFETCH`).
+  opção não aparece no lançador do Linux), a pré-leitura de páginas nas cópias de textura
+  (`SOTC_COPY_PREFETCH`), a cópia pelo endereço do jogo (`SOTC_COPY_GUEST_VIEW`; no Linux a cópia
+  segue pela segunda visão da memória, como antes) e as prioridades de thread em CPUs com 4 threads
+  ou menos (`SOTC_JOB_PRIORITY`).
+- **Quedas da 0.73 corrigidas também no Linux:** os objetos zerados que o jogo usa (`0x564d24`,
+  `0x144c60`, `0x14934f`, `0x14cce7`) são pulados pelo tratador de sinais do Linux como pelo do
+  Windows (`SOTC_FIX_NULL_OBJECTS=0` desliga).
+- **Queda silenciosa (código 245) corrigida** (mrgroeff, upstream #409): os campos do heap do jogo
+  são lidos pela segunda visão da memória, que o rastreamento de páginas da GPU nunca protege; a
+  leitura direta caía duas vezes na mesma página protegida e o jogo fechava sem relatório.
 
 ## 0.75 — 2026-11-12
 - 🔊 **Som sem os módulos do console: os arquivos do PS4 deixam de ser obrigatórios** (Oussama268, a partir do HayatoG/tlg_pc, GPL-2.0): quando faltam o `libSceNgs2.sprx` e o `libSceUlt.sprx`, um mixer NGS2 embutido toca o som do jogo (ATRAC9 pela LibAtrac9). **Ele é o padrão para todos**; quem preferir o som do firmware marca "Usar os módulos de som do meu console" em Jogo e saves. No teste, som normal e o mesmo FPS nos dois casos (69,7 com o mixer, 69,5 com os módulos). `SOTC_NGS2=native` volta ao comportamento antigo.

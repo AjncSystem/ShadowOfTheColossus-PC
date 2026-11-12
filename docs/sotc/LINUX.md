@@ -20,7 +20,7 @@ Without a display (terminal, SSH) or with `--setup`, only this file applies.
 | Opção / Option | Valor / Value |
 |---|---|
 | `SOTC_GAME_DIR` | pasta do dump / dump folder (`eboot.bin`, `sce_module`, `sce_sys`) |
-| `SOTC_SYS_MODULES` | pasta com / folder with `libSceNgs2.sprx` e / and `libSceUlt.sprx` (sem ela, sem som / without it, no sound) |
+| `SOTC_SYS_MODULES` | pasta com / folder with `libSceNgs2.sprx` e / and `libSceUlt.sprx` (opcional: sem ela, o mixer embutido toca o som / optional: without it, the built-in mixer plays the sound) |
 | `SOTC_UPDATE_DIR` | atualização do jogo / game update (padrão / default `<jogo>-UPDATE` ou / or `-patch`) |
 | `SOTC_DLC_DIR` | DLCs (`addcont` do shadPS4 ou uma subpasta por DLC / or one subfolder per DLC) |
 | `SOTC_USER_DIR` | saves e caches / saves and caches (padrão / default `~/.local/share/sotc-pc/user`) |

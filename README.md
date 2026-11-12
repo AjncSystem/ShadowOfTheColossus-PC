@@ -182,7 +182,7 @@ chmod +x SotC-PC-*-linux-x86_64.AppImage
   is read into the launcher on its first start.
 - Requirements: x86-64 Linux with glibc 2.38 or newer (Fedora 39+, Ubuntu 24.04+) and a Vulkan
   1.3 driver (Mesa or NVIDIA). Works on Wayland (the launcher through XWayland) and X11.
-- The sound modules are found automatically in shadPS4's folder (`~/.local/share/shadPS4/sys_modules`).
+- The sound modules are optional (the built-in mixer plays the sound); when shadPS4's folder has them (`~/.local/share/shadPS4/sys_modules`) they are found automatically.
 - Settings, saves and the logs live in `~/.local/share/sotc-pc/`. The `sotc.ini` options
   (resolution, FSR, fullscreen, language, 60 FPS, controls) are listed in
   [docs/sotc/LINUX.md](docs/sotc/LINUX.md); the launcher's settings take precedence over them.

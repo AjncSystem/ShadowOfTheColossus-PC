@@ -74,13 +74,13 @@ if (( setup )) || [[ -z $modules ]]; then
         fi
     done
     if [[ -z $found ]]; then
-        say 'Para ter som, escolha a pasta com libSceNgs2.sprx e libSceUlt.sprx do seu console (o user/sys_modules do shadPS4). Cancele para jogar sem som.'
+        say 'Opcional: escolha a pasta com libSceNgs2.sprx e libSceUlt.sprx do seu console (o user/sys_modules do shadPS4). Cancele para usar o mixer de som embutido.'
         found="$(pick_dir 'Pasta dos módulos de som (sys_modules)')" || found=''
     fi
     if [[ -n $found && -f $found/libSceNgs2.sprx && -f $found/libSceUlt.sprx ]]; then
         ini_set SOTC_SYS_MODULES "$found"
     elif [[ -n $found ]]; then
-        say "libSceNgs2.sprx e libSceUlt.sprx não estão em: $found. O jogo vai rodar sem som."
+        say "libSceNgs2.sprx e libSceUlt.sprx não estão em: $found. O mixer de som embutido toca o som."
     fi
 fi
 

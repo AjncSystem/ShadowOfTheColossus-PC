@@ -1228,6 +1228,26 @@ void TextureCache::RefreshImage(Image& image) {
         return;
     }
 
+    // sotc: a depth buffer whose format the driver does not have lives in a wider one (Z16 with
+    // stencil in D24S8 on NVIDIA, Instance::GetSupportedFormat). Its guest bytes are laid out
+    // for the guest format: the copy read 4 bytes per texel where the guest has 2, as depth
+    // values that mean nothing, and ran past the end of the staging buffer (colossus 8,
+    // VUID-vkCmdCopyBufferToImage-pRegions-00171). Not uploaded: the image keeps what the GPU
+    // drew into it.
+    if (image.info.props.is_depth &&
+        instance.GetSupportedFormat(image.info.pixel_format, image.format_features) !=
+            image.info.pixel_format) {
+        static bool logged = false;
+        if (!std::exchange(logged, true)) {
+            std::fprintf(stderr, "SOTC: guest bytes of a %s depth buffer (%ux%u) not uploaded, the "
+                                 "driver keeps it in another format%c",
+                         vk::to_string(image.info.pixel_format).c_str(), image.info.size.width,
+                         image.info.size.height, 10);
+        }
+        image.flags &= ~ImageFlagBits::Dirty;
+        return;
+    }
+
     // sotc: SOTC_UPLOAD_BUDGET_MB (default 0 = off, see below). Entering a new area, the game binds about
     // 100 MB of new textures in one frame and that frame took 80-130 ms to upload them. Past the
     // budget, the first upload of a big colour texture waits for a later frame (the first upload

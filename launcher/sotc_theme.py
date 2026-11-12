@@ -86,6 +86,30 @@ def load_fonts(root):
             ICON[name] = ''
 
 
+# Reference size for font_scale, large enough that pixel rounding stays under 1%.
+FONT_PROBE_PX = 100
+# Below this deviation the measured scale is hinting noise, not a scaling rule.
+FONT_SCALE_TOLERANCE = 0.05
+
+
+def font_scale(root):
+    """How much larger the fonts come out than Tk's DPI says. A fontconfig rule (dpi or scale in
+    fonts.conf) enlarges Tk's Xft fonts without changing Tk's DPI, so boxes sized by that DPI clip
+    their text. 1.0 on Windows, and when Tk does not draw with the bundled Inter."""
+    import tkinter.font as tkfont
+    if hasattr(ctypes, 'windll') or BODY != 'Inter':
+        return 1.0
+    from PIL import ImageFont
+    try:
+        ascent, descent = ImageFont.truetype(str(ASSETS / 'fonts' / 'Inter-Regular.ttf'), FONT_PROBE_PX).getmetrics()
+    except OSError:
+        return 1.0
+    scale = tkfont.Font(root, family=BODY, size=-FONT_PROBE_PX).metrics('linespace') / (ascent + descent)
+    if abs(scale - 1.0) < FONT_SCALE_TOLERANCE:
+        return 1.0
+    return scale
+
+
 # ---- drawing --------------------------------------------------------------------------------
 def rgba(color, alpha=255):
     color = color.lstrip('#')

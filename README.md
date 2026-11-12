@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC native port · v0.74.1
+# Shadow of the Colossus — PC native port · v0.74.2
 
 [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
@@ -26,6 +26,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.74.2** | **AMD Radeon crashes fixed** (Oussama268, #413): a graphics pipeline the driver refuses no longer closes the game (RX 6000 near the 4th colossus and on the bridge to the 9th), and two causes of the refusal fixed (a shader variant one binding short of its layout, guest bytes uploaded into a depth buffer kept in another format). **Random colours on AMD GCN** (RX 470–590, Vega) fixed (marko0905, #411). A silent crash in the heap guard fixed (mrgroeff, #409). The game no longer closes at "Resource Loading" with Control Flow Guard on (Oussama268, #414, #322). The shader cache is rebuilt once. |
 | **0.74.1** | **Launcher updates fixed:** the launchers of v0.73 and v0.74 looked for updates in Oussama268's fork (its release address came in with the opt13 merge) and never offered a new version. They now check this repository again. **Download v0.74.1 by hand once**; later versions update from the launcher. |
 | **0.74** | **Lighter draw thread:** Lukto02's draw-thread fast paths (#308) for depth-only and G-buffer draws: when no render register, image or state changed since the last draw, the render target setup, render pass start and dynamic state are reused (99% hit rate in the open world, 0 differences in verify mode). In the user's open-world rides the game stays at 60 FPS 40–50% of the time (23–32% before). **DLSS-G 3x/4x/6x and Dynamic** frame generation multiplier (RTX 50; #314). **Thread priorities on 4-thread CPUs** (#312). |
 | **0.73** | **Optimized build** (ThinLTO + PGO trained on the open world): FPS matches or beats Oussama268's fork. **Dynamic FPS** on by default in the 60 FPS mode (below 50 FPS it locks to a steady step that suits the screen: 48 at 144 Hz, 40 at 120 Hz, 30 at 60 Hz, and goes back to 60). **Oussama268's 0.72.1-opt13 merged** (less riding stutter, render target reuse, freeze and black textures fixed, DLAA). **Extreme mode sharp again** (Maximum mip 0, High mip 1). **Stability:** the ending, the intro skip and the Time Attack mosaic fixed (heap guard shortcuts off again), a frozen-picture fix, crash 0x564d24 fixed. Window title with the port version and play time. |

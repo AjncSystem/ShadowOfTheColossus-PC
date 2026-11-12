@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.74.2 — 2026-11-12
+- **Quedas nas AMD Radeon corrigidas** (Oussama268, #413): um pipeline gráfico que o driver recusa não fecha mais o jogo; os desenhos dele são pulados (`SOTC PIPELINE FAILED` no log). Era a queda das RX 6600/6700 XT/6750 XT perto da arena do 4º colosso e na ponte do 9º (#397, #408, #393). Duas causas da recusa achadas com as camadas de validação do Vulkan: uma variante de shader criada com um binding a menos que o seu layout (o buffer do LOD feedback das texturas Alta/Máxima) e bytes do jogo enviados para um buffer de profundidade guardado em outro formato.
+- **Cores aleatórias nas AMD GCN** (RX 470–590, Vega) corrigidas (marko0905, #411): um shader de compute lia uma "lane" que não existe em placas de 64 lanes. `SOTC_WAVE64_ABSENT_LANES=0` desliga.
+- **Queda silenciosa da guarda do heap** corrigida (mrgroeff, #409): os campos do heap do jogo passam a ser lidos pela vista de apoio, que nunca fica protegida.
+- **Jogo fechando ao carregar com o Control Flow Guard** do Windows ligado (Oussama268, #414, #322): as fibras do jogo levam os limites de pilha do TEB. `SOTC_FIBER_TEB=0` desliga.
+- **Atualizador blindado** (Oussama268, #415): o repositório de atualização fica num arquivo do pacote, então nenhuma fusão troca mais o endereço.
+- O cache de shaders é refeito uma vez (versão 40). Teste lado a lado no mapa aberto (mesmo trajeto, cache vazio nas duas): FPS igual à 0.74.1 (57,0 contra 57,8) e menos travadas (18 quadros acima de 50 ms contra 29).
+
 ## 0.74.1 — 2026-11-10
 - **Atualização pelo lançador corrigida:** na fusão da 0.72.1-opt13 do Oussama268 (v0.73) o endereço das releases do atualizador (`launcher/sotc_update.py`) passou a ser o do fork dele, então os lançadores da v0.73 e da v0.74 procuravam atualização lá e nunca ofereciam a versão nova. Volta a ser este repositório, com um teste (`tests/test_update_repo.py`) que impede a troca de novo. Quem está na v0.73 ou na v0.74 precisa baixar a v0.74.1 à mão uma vez.
 

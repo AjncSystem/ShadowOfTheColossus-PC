@@ -721,7 +721,7 @@ void QuickSettings() {
     }
 
     if (runtime_audio_volume_percent && runtime_audio_set_volume_percent) {
-        static const int volumes[] = {100, 150, 200, 300};
+        static const int volumes[] = {100, 150, 200, 300, 400, 500};
         const int now = runtime_audio_volume_percent();
         char label[16];
         std::snprintf(label, sizeof(label), "%d%%", now);

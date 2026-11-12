@@ -14,9 +14,10 @@ Este pacote **não contém o jogo nem firmware da Sony**. Você precisa ter os s
 - Python não é necessário para o `SotC.exe`; só o `SotC.bat` precisa de
   [Python 3](https://www.python.org/downloads/).
 - O **seu dump** do jogo CUSA08809 ou CUSA08034 (pasta com `eboot.bin`, `sce_module`, `sce_sys`...).
-- Para ter som, `libSceNgs2.sprx` e `libSceUlt.sprx` do **seu próprio console**, decriptados.
-  São os mesmos arquivos da pasta `user/sys_modules` do shadPS4; num PS4 com GoldHEN ficam em
-  `/system/common/lib/` (FTP na porta 2121). Sem eles o jogo funciona, mas sem som.
+- **Som:** desde a 0.75 o port tem um **mixer de som embutido**, e o jogo tem som sem nada do
+  console. Opcional: `libSceNgs2.sprx` e `libSceUlt.sprx` do **seu próprio console**, decriptados
+  (os mesmos da pasta `user/sys_modules` do shadPS4; num PS4 com GoldHEN ficam em
+  `/system/common/lib/`, FTP na porta 2121). Com eles, o som é o do firmware.
 
 ## Como jogar
 
@@ -140,8 +141,9 @@ normal o jogo roda travado em 30 FPS, como no PS4.
   sozinhas na NVIDIA (o envio periódico de trabalho à GPU e as leituras antecipadas).
   Em **Imagem e FPS > Envio de trabalho à GPU**, escolha **Ligado** para testá-las na AMD ou
   Intel; se a tela ficar preta, volte para **Automático**.
-- **Por que o som precisa de arquivos meus?** `libSceNgs2.sprx` e `libSceUlt.sprx` são firmware
-  da Sony e não podem ser distribuídos. Eles saem do seu PS4 (ou do shadPS4 que você já usa).
+- **Preciso de arquivos do console para ter som?** Não, desde a 0.75: o mixer embutido do port
+  toca o som. `libSceNgs2.sprx` e `libSceUlt.sprx` (firmware da Sony, que não pode ser
+  distribuído) continuam opcionais; com eles, o som é o do firmware.
 
 ## Créditos
 

@@ -1,10 +1,10 @@
-# Shadow of the Colossus — PC native port · v0.74.2
+# Shadow of the Colossus — PC native port · v0.75
 
 [Releases](../../releases) · [Changelog](CHANGELOG.md)
 
 > [!CAUTION]
-> *⚠️*No game or Sony files are included.** You need your own game dump and, for sound, two
-> modules from your own console. This project is not affiliated with Sony Interactive
+> *⚠️*No game or Sony files are included.** You need your own game dump. Since v0.75 the sound
+> plays without anything from your console (built-in mixer); your console's two sound modules are optional. This project is not affiliated with Sony Interactive
 > Entertainment or Bluepoint Games.
 
 > [!CAUTION]
@@ -26,6 +26,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.75** | 🔊 **Sound without the console's modules** (Oussama268, from HayatoG/tlg_pc): a built-in NGS2 mixer plays the game's sound, by default for everyone; your console's libSceNgs2.sprx / libSceUlt.sprx are optional (tick "Use my console's sound modules"). A new **Sound** page: Stereo 2.0 / Surround 5.1 / 7.1 output, the sound device, volume up to 500% and the sound engine. The "What's new" screen shows English notes in other languages than Portuguese (#410). |
 | **0.74.2** | **AMD Radeon crashes fixed** (Oussama268, #413): a graphics pipeline the driver refuses no longer closes the game (RX 6000 near the 4th colossus and on the bridge to the 9th), and two causes of the refusal fixed (a shader variant one binding short of its layout, guest bytes uploaded into a depth buffer kept in another format). **Random colours on AMD GCN** (RX 470–590, Vega) fixed (marko0905, #411). A silent crash in the heap guard fixed (mrgroeff, #409). The game no longer closes at "Resource Loading" with Control Flow Guard on (Oussama268, #414, #322). The shader cache is rebuilt once. |
 | **0.74.1** | **Launcher updates fixed:** the launchers of v0.73 and v0.74 looked for updates in Oussama268's fork (its release address came in with the opt13 merge) and never offered a new version. They now check this repository again. **Download v0.74.1 by hand once**; later versions update from the launcher. |
 | **0.74** | **Lighter draw thread:** Lukto02's draw-thread fast paths (#308) for depth-only and G-buffer draws: when no render register, image or state changed since the last draw, the render target setup, render pass start and dynamic state are reused (99% hit rate in the open world, 0 differences in verify mode). In the user's open-world rides the game stays at 60 FPS 40–50% of the time (23–32% before). **DLSS-G 3x/4x/6x and Dynamic** frame generation multiplier (RTX 50; #314). **Thread priorities on 4-thread CPUs** (#312). |
@@ -146,7 +147,7 @@ disk new areas stutter much more.
 | What | Where from | What for |
 |---|---|---|
 | CUSA08809 (EU 1.01) or CUSA08034 (US 1.00) game dump | your PS4, through GoldHEN | the game |
-| decrypted `libSceNgs2.sprx`, `libSceUlt.sprx` | your PS4 (`/system/common/lib/`, GoldHEN FTP), or shadPS4's `user/sys_modules` | sound (silent without them) |
+| decrypted `libSceNgs2.sprx`, `libSceUlt.sprx` (optional) | your PS4 (`/system/common/lib/`, GoldHEN FTP), or shadPS4's `user/sys_modules` | the firmware's sound mixer (since v0.75 the port's built-in mixer plays the sound without them) |
 
 The patch modes (60 FPS, 16x filtering) apply to EU 1.01 and US 1.00 (the same executable);
 other versions run at 30 FPS. Each release keeps its own saves (`user/savedata/1/<title ID>`),
@@ -163,8 +164,9 @@ In 60 FPS mode the title-screen attract demo averages ~67 FPS on an RTX 2060 SUP
 29–34 FPS in its heaviest section. Vulkan only (no DirectX). AMD and Intel can enable the
 NVIDIA-only submission options under **Image and FPS > GPU work submission**.
 
-**Why no sound files?** The two `.sprx` files are Sony firmware and may not be redistributed;
-the launcher finds and copies yours automatically. **The game closed by itself?** Open an issue
+**Do I need sound files?** Not since v0.75: the port's built-in mixer plays the sound. The two
+`.sprx` files are Sony firmware and may not be redistributed; if you have them, the launcher finds
+and copies yours automatically and the firmware plays the sound. **The game closed by itself?** Open an issue
 with `user/last_run.log`.
 
 ---

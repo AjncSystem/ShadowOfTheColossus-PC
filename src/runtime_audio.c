@@ -32,6 +32,7 @@
 
 typedef struct {
     int used, type, channels, is_float, frames, sample_bytes, std_layout;
+    int out_channels;               /* sotc: what the stream gets (SOTC_AUDIO_CHANNELS downmix) */
     int32_t volume[8];
     SDL_AudioStream *stream;
     uint64_t next_deadline_ns; /* next return of sceAudioOutOutput */
@@ -68,6 +69,46 @@ static int sdl_audio(void) {
         printf("Runtime: audio backend %s\n", sdl_ready ? SDL_GetCurrentAudioDriver() : "timer (silent)");
     }
     return sdl_ready;
+}
+/* sotc: SOTC_AUDIO_CHANNELS = auto (default: the 8 channels go to the device and Windows/SDL fit them
+ * to it), 2 (stereo), 6 (5.1) or 8 (7.1): with 2 or 6 the port mixes the game's 7.1 down itself (ITU
+ * coefficients, soft limiter). SOTC_AUDIO_LFE=0 leaves the subwoofer channel out of the stereo mix. */
+static int audio_channels_mode(void) {
+    static int mode=-1;
+    if (mode<0) {
+        const char *e=getenv("SOTC_AUDIO_CHANNELS");
+        int v=e ? atoi(e) : 0;
+        mode = v==2 || v==6 || v==8 ? v : 0;
+    }
+    return mode;
+}
+static float audio_lfe_gain(void) {
+    static float gain=-1.0f;
+    if (gain<0.0f) { const char *e=getenv("SOTC_AUDIO_LFE"); gain = e && e[0]=='0' ? 0.0f : 0.5f; }
+    return gain;
+}
+/* sotc: SOTC_AUDIO_DEVICE = (part of) a playback device's name; empty or not found: the Windows
+ * default. */
+static SDL_AudioDeviceID audio_device(void) {
+    static int done;
+    static SDL_AudioDeviceID chosen=SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK;
+    if (done) return chosen;
+    done=1;
+    const char *want=getenv("SOTC_AUDIO_DEVICE");
+    int count=0;
+    SDL_AudioDeviceID *devices=SDL_GetAudioPlaybackDevices(&count);
+    for (int i=0;devices && i<count;++i) {
+        const char *name=SDL_GetAudioDeviceName(devices[i]);
+        printf("Runtime: audio device %d: %s\n",i,name ? name : "?");
+        if (want && want[0] && name && SDL_strcasestr(name,want) && chosen==SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK) {
+            chosen=devices[i];
+            printf("Runtime: audio device chosen: %s (SOTC_AUDIO_DEVICE)\n",name);
+        }
+    }
+    if (want && want[0] && chosen==SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK)
+        printf("Runtime: audio device \"%s\" not found; the Windows default plays the sound\n",want);
+    SDL_free(devices);
+    return chosen;
 }
 static int port_range(int type, int *first, int *last) {
     switch (type) {
@@ -114,10 +155,12 @@ static ABI int32_t audio_open(int32_t user, int32_t type, int32_t index, uint32_
     pthread_mutex_init(&p->lock,NULL);
     p->used=1; p->type=type; p->channels=channels[format]; p->is_float=format>=3 && format!=6;
     p->sample_bytes=p->is_float ? 4 : 2; p->frames=(int)length; p->std_layout=format>=6;
+    p->out_channels=p->channels;
+    if (p->channels==8 && (audio_channels_mode()==2 || audio_channels_mode()==6)) p->out_channels=audio_channels_mode();
     for (int c=0;c<8;++c) p->volume[c]=VOLUME_0DB;
     if (sdl_audio()) {
-        SDL_AudioSpec spec={p->is_float ? SDL_AUDIO_F32 : SDL_AUDIO_S16, p->channels, 48000};
-        p->stream=SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK,&spec,NULL,NULL);
+        SDL_AudioSpec spec={p->is_float ? SDL_AUDIO_F32 : SDL_AUDIO_S16, p->out_channels, 48000};
+        p->stream=SDL_OpenAudioDeviceStream(audio_device(),&spec,NULL,NULL);
         if (p->stream) SDL_ResumeAudioStreamDevice(p->stream);
         else fprintf(stderr,"Runtime: SDL audio stream failed (%s); port %d uses the timer sink\n",SDL_GetError(),id);
     }
@@ -130,7 +173,7 @@ static ABI int32_t audio_open(int32_t user, int32_t type, int32_t index, uint32_
     }
     ++ports_opened;
     pthread_mutex_unlock(&table_lock);
-    printf("Runtime: audio port %d opened (type %d, %d ch, %s, %u frames)\n",id,type,p->channels,p->is_float ? "float" : "s16",length);
+    printf("Runtime: audio port %d opened (type %d, %d ch -> %d ch, %s, %u frames)\n",id,type,p->channels,p->out_channels,p->is_float ? "float" : "s16",length);
     return (type<<16) | id | 0x20000000;
 }
 static ABI int32_t audio_close(int32_t handle) {
@@ -148,7 +191,7 @@ static ABI int32_t audio_close(int32_t handle) {
     pthread_mutex_unlock(&table_lock);
     return p ? 0 : error;
 }
-/* SOTC_VOLUME: master volume in percent (default 100, 25-400; #95, the game is quiet). Above
+/* SOTC_VOLUME: master volume in percent (default 100, 25-500; #95, the game is quiet). Above
  * 100 the peaks go through a soft limiter instead of clipping hard. */
 static volatile float master_volume_value=-1.0f;
 static float master_volume(void) {
@@ -157,7 +200,7 @@ static float master_volume(void) {
         const char *e=getenv("SOTC_VOLUME");
         double pct=e && e[0] ? atof(e) : 100.0;
         if (pct<25.0) pct=25.0;
-        if (pct>400.0) pct=400.0;
+        if (pct>500.0) pct=500.0;
         v=(float)(pct/100.0);
         master_volume_value=v;
     }
@@ -168,7 +211,7 @@ void runtime_audio_set_volume_percent(int pct);
 int runtime_audio_volume_percent(void);
 void runtime_audio_set_volume_percent(int pct) {
     if (pct<25) pct=25;
-    if (pct>400) pct=400;
+    if (pct>500) pct=500;
     master_volume_value=(float)pct/100.0f;
 }
 int runtime_audio_volume_percent(void) { return (int)(master_volume()*100.0f+0.5f); }
@@ -189,7 +232,8 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
     pthread_mutex_unlock(&table_lock);
     if (!p) return error;
     pthread_mutex_lock(&p->lock);
-    size_t samples=(size_t)p->frames*(size_t)p->channels, bytes=samples*(size_t)p->sample_bytes;
+    size_t samples=(size_t)p->frames*(size_t)p->channels;
+    size_t bytes=(size_t)p->frames*(size_t)p->out_channels*(size_t)p->sample_bytes; /* what the stream gets */
     uint64_t period=(uint64_t)p->frames*1000000000u/48000u;
     if (data) {
         /* Apply per-channel volume and map PS4 8ch (L R C LFE SL SR BL BR) to SDL 7.1 order. */
@@ -197,6 +241,36 @@ static int32_t output_port(int32_t handle, const void *data, int pace) {
         static const int remap[8]={0,1,2,3,6,7,4,5};
         const float master=master_volume();
         const int limit=master>1.0f;
+        if (p->out_channels!=p->channels) {
+            /* sotc: SOTC_AUDIO_CHANNELS 2 / 6: the PS4 7.1 (L R C LFE SL SR BL BR) mixed down here. */
+            const float k=0.70710678f, lfe=audio_lfe_gain();
+            for (size_t f=0;f<(size_t)p->frames;++f) {
+                float in[8];
+                for (int c=0;c<8;++c) {
+                    size_t from=f*8u+(size_t)c;
+                    float v;
+                    if (p->is_float) memcpy(&v,(const char *)data+from*4,4);
+                    else { int16_t s16; memcpy(&s16,(const char *)data+from*2,2); v=(float)s16/32768.0f; }
+                    in[c]=v*(float)p->volume[c]/VOLUME_0DB*master;
+                }
+                float out[6]; int n;
+                if (p->out_channels==2) {
+                    out[0]=in[0]+k*in[2]+k*in[4]+k*in[6]+lfe*in[3];
+                    out[1]=in[1]+k*in[2]+k*in[5]+k*in[7]+lfe*in[3];
+                    n=2;
+                } else { /* SDL 5.1 order: FL FR FC LFE BL BR */
+                    out[0]=in[0]; out[1]=in[1]; out[2]=in[2]; out[3]=in[3];
+                    out[4]=in[4]+k*in[6]; out[5]=in[5]+k*in[7];
+                    n=6;
+                }
+                for (int c=0;c<n;++c) {
+                    float v=soft_limit(out[c]);
+                    size_t to=f*(size_t)n+(size_t)c;
+                    if (p->is_float) memcpy(converted+to*4,&v,4);
+                    else { int16_t s16=(int16_t)(v*32767.0f); memcpy(converted+to*2,&s16,2); }
+                }
+            }
+        } else
         for (size_t f=0;f<(size_t)p->frames;++f) for (int c=0;c<p->channels;++c) {
             int target=p->channels==8 && !p->std_layout ? remap[c] : c;
             size_t from=f*(size_t)p->channels+(size_t)c, to=f*(size_t)p->channels+(size_t)target;

@@ -48,7 +48,7 @@ CONFIG_FILE = CONFIG_DIR / 'launcher_settings.json'
 from sotc_modes import GAMES  # noqa: E402
 GAME_ID = 'CUSA08809'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.74.2'
+VERSION = '0.75'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -168,7 +168,7 @@ def windows_language():
 # ---------------------------------------------------------------------------------------------
 # Settings, passed to sotc.py as environment variables.
 
-APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '',
+APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '', 'sound_firmware': False, 'audio_channels': 'auto', 'audio_lfe': True, 'audio_device': '',
                 'user_dir': '', 'af16': True, 'textures': 'high', 'hdr': False, 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'fps_dynamic': True, 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
                 'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'rb_hot': True, 'skip_logos': True, 'skip_film': False, 'close_on_play': False, 'gamepad': '', 'rumble': True,
@@ -280,8 +280,15 @@ GRASS_DETAIL = [('1', ('Como no PS4', 'As on PS4')),
                 ('0.25', ('Alto', 'High')),
                 ('0.15', ('Mais alto', 'Higher')),
                 ('0.1', ('Muito alto', 'Very high'))]
+# sotc (0.75): SOTC_AUDIO_CHANNELS (runtime_audio.c): auto lets Windows fit the game's 7.1 to the device;
+# 2 and 6 are mixed down by the port, 8 sends the 7.1 as it is.
+AUDIO_CHANNELS = [('auto', ('Automático (como o Windows estiver configurado)', 'Automatic (as Windows is set up)')),
+                  ('2', ('Estéreo 2.0 (fones e duas caixas)', 'Stereo 2.0 (headphones and two speakers)')),
+                  ('6', ('Surround 5.1', 'Surround 5.1')),
+                  ('8', ('Surround 7.1', 'Surround 7.1'))]
 VOLUME = [('100', ('100% (original)', '100% (original)')), ('150', ('150%', '150%')),
-          ('200', ('200%', '200%')), ('300', ('300% (máximo)', '300% (maximum)'))]
+          ('200', ('200%', '200%')), ('300', ('300%', '300%')), ('400', ('400%', '400%')),
+          ('500', ('500% (máximo)', '500% (maximum)'))]
 VRAM_LIMITS = {'low': ('50', '1024'), 'normal': ('60', '1536'), 'high': ('75', '4096'), 'max': ('85', '0')}
 # Play modes (Jogar tab): each one sets the settings below; changing one of them by hand afterwards
 # makes the mode Custom. Extreme's upscaler is DLSS on an NVIDIA RTX card, FSR 1 on the others.
@@ -512,7 +519,7 @@ def user_dir(s):
 
 # Shown in the side bar only in the expert view (the search finds them in both).
 EXPERT_PAGES = ('advanced', 'debug')
-NAV_ICONS = {'help': 'help', 'play': 'play', 'game': 'gameplay', 'saves': 'saves', 'graphics': 'display', 'controls': 'controls',
+NAV_ICONS = {'help': 'help', 'play': 'play', 'game': 'gameplay', 'saves': 'saves', 'graphics': 'display', 'controls': 'controls', 'sound': 'sound',
              'advanced': 'advanced', 'debug': 'system'}
 SAVE_BACKUPS_KEPT = 10  # user/backups/saves-*.zip
 LOGS_KEPT = 5      # last_run.log and last_run.1.log ... last_run.4.log
@@ -804,7 +811,9 @@ def game_environment(s):
         env['SOTC_WINDOW_ICON'] = str(icon)
     env['SOTC_GAME_DIR'] = s['game_dir']
     env['SOTC_USER_DIR'] = str(user_dir(s))
-    if s['sys_modules']:
+    # sotc (0.75): the port's built-in NGS2 mixer plays the sound by default; the console's own modules
+    # (libSceNgs2/libSceUlt) only when the player ticks "Use my console's sound modules".
+    if s['sys_modules'] and s.get('sound_firmware'):
         env['SOTC_SYS_MODULES'] = s['sys_modules']
     if s.get('dlc_dir'):
         env['SOTC_DLC_DIR'] = s['dlc_dir']
@@ -890,6 +899,13 @@ def game_environment(s):
     if light:
         env.setdefault('SOTC_STAGING_KEEP_VRAM_MB', '0')
     env['SOTC_VOLUME'] = str(s.get('volume') or '100')
+    # sotc (0.75): the Sound page (runtime_audio.c).
+    if str(s.get('audio_channels') or 'auto') in ('2', '6', '8'):
+        env['SOTC_AUDIO_CHANNELS'] = str(s['audio_channels'])
+    if not s.get('audio_lfe', True):
+        env['SOTC_AUDIO_LFE'] = '0'
+    if str(s.get('audio_device') or '').strip():
+        env['SOTC_AUDIO_DEVICE'] = str(s['audio_device']).strip()
     # The in-game menu's quick settings are written back here (bbport_overlay.cpp).
     env['SOTC_LAUNCHER_SETTINGS'] = str(CONFIG_FILE)
     env['SOTC_SHADOW_REUSE'] = str(s.get('shadow_reuse') or '0')
@@ -1305,7 +1321,7 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                           'hover': self.theme.box(width, height, 8, theme.SURFACE, bg=BG)}
         accent = self.theme.box(3, 18, 1.5, SIGIL, bg=CARD)
         for name, title in (('play', _('Jogar', 'Play')), ('game', _('Jogo', 'Game')), ('saves', _('Saves', 'Saves')),
-                            ('graphics', _('Imagem e FPS', 'Display & FPS')), ('controls', _('Controles', 'Controls')),
+                            ('graphics', _('Imagem e FPS', 'Display & FPS')), ('controls', _('Controles', 'Controls')), ('sound', _('Som', 'Sound')),
                             ('help', _('Ajuda', 'Help')), ('advanced', _('Avançado', 'Advanced')),
                             ('debug', _('Debug', 'Debug'))):
             c = tk.Canvas(side, width=px(width), height=px(height), bg=BG, highlightthickness=0, bd=0, cursor='hand2')
@@ -1358,6 +1374,7 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         self.build_saves()
         self.build_graphics()
         self.build_controls()
+        self.build_sound()
         self.build_help()
         self.build_advanced()
         self.build_debug()
@@ -1714,16 +1731,12 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                     _('Pasta com libSceNgs2.sprx e libSceUlt.sprx', 'Folder with libSceNgs2.sprx and libSceUlt.sprx'),
                     _('libSceNgs2.sprx e libSceUlt.sprx do SEU console, decriptados. O lançador procura sozinho num '
                       'shadPS4 instalado no PC (user/sys_modules) e copia para a pasta de dados do port. São firmware '
-                      'da Sony e nunca vêm com o port. Sem eles o jogo roda sem som.',
+                      'da Sony e nunca vêm com o port. Sem eles o mixer de som embutido do port toca o som (desde a 0.75).',
                       'libSceNgs2.sprx and libSceUlt.sprx from YOUR console, decrypted. The launcher looks for them in '
                       'a shadPS4 installed on this PC (user/sys_modules) and copies them to the port\'s data folder. '
-                      'They are Sony firmware and never come with the port. Without them the game is silent.'),
+                      'They are Sony firmware and never come with the port. Without them the port\'s built-in sound mixer '
+                      'plays the sound (since 0.75).'),
                     on_change=self.refresh_status)
-        self.row(f, _('Volume', 'Volume'), self.choice(f, 'volume', VOLUME),
-                 _('Aumenta o som do jogo, que sai baixo. Acima de 100% os picos são suavizados em vez de '
-                   'estourar. No jogo, o modo de alto-falante "TV" também deixa o som mais alto.',
-                   'Raises the game sound, which is quiet. Above 100% the peaks are softened instead of '
-                   'clipping. In game, the "TV" speaker mode is louder too.'))
         self.section(f, _('DLC', 'DLC'))
         self.folder(f, 'dlc_dir', _('Pasta de DLC', 'DLC folder'), _('Pasta com as DLCs do jogo', "Folder with the game's DLC"),
                     _('Como no shadPS4: uma pasta com uma subpasta por DLC (cada uma com sce_sys/param.sfo), ou a '
@@ -1941,6 +1954,47 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                      'HDR10 output from the game image. Needs HDR on in Windows and an HDR monitor; otherwise '
                      'nothing changes. Tuning: SOTC_HDR_PAPER and SOTC_HDR_GAIN in "Extra variables".'))
 
+    def build_sound(self):
+        """sotc (0.75): sound output, volume and the sound engine (built-in mixer or the console's modules)."""
+        ttk = self.ttk
+        f = self.scrolled_page('sound', _('Som', 'Sound'),
+                               _('Como o som do jogo sai: canais, volume, dispositivo e o motor de som.',
+                                 "How the game's sound comes out: channels, volume, device and the sound engine."))
+        self.section(f, _('Saída', 'Output'), top=4)
+        self.row(f, _('Canais', 'Channels'), self.choice(f, 'audio_channels', AUDIO_CHANNELS),
+                 _('O jogo mistura o som em 7.1. Automático deixa o Windows adaptar ao seu dispositivo. Estéreo 2.0 '
+                   'e Surround 5.1 fazem a mistura no próprio port (padrão ITU, sem estourar); use Estéreo se o som '
+                   'sair baixo ou faltando vozes em fones e caixas comuns. 7.1 manda os 8 canais como estão. Vale na '
+                   'próxima vez que o jogo abrir.',
+                   "The game mixes its sound in 7.1. Automatic lets Windows fit it to your device. Stereo 2.0 and "
+                   "Surround 5.1 are mixed down by the port itself (ITU coefficients, no clipping); pick Stereo if "
+                   "the sound is quiet or voices are missing on headphones or ordinary speakers. 7.1 sends the 8 "
+                   "channels as they are. Applies the next time the game starts."))
+        self.check(f, 'audio_lfe', _('Graves do subwoofer no estéreo', 'Subwoofer bass in stereo'),
+                   _('No Estéreo 2.0, mistura o canal de graves (LFE) nas duas caixas. Desligue se o grave ficar '
+                     'forte demais nos fones.',
+                     'In Stereo 2.0, mixes the bass channel (LFE) into both speakers. Turn it off if the bass is '
+                     'too strong on headphones.'))
+        self.row(f, _('Dispositivo', 'Device'), ttk.Entry(f, textvariable=self.var('audio_device'), width=38),
+                 _('Nome (ou parte) do dispositivo de som, por exemplo "Headset" ou "TV"; vazio = o padrão do '
+                   'Windows. O registro do jogo lista os nomes (linhas "audio device").',
+                   'Name (or part of it) of the sound device, e.g. "Headset" or "TV"; empty = the Windows '
+                   'default. The game log lists the names ("audio device" lines).'))
+        self.section(f, _('Volume', 'Volume'))
+        self.row(f, _('Volume', 'Volume'), self.choice(f, 'volume', VOLUME),
+                 _('Aumenta o som do jogo, que sai baixo. Acima de 100% os picos são suavizados em vez de '
+                   'estourar. No jogo, o modo de alto-falante "TV" também deixa o som mais alto.',
+                   'Raises the game sound, which is quiet. Above 100% the peaks are softened instead of '
+                   'clipping. In game, the "TV" speaker mode is louder too.'))
+        self.section(f, _('Motor de som', 'Sound engine'))
+        self.check(f, 'sound_firmware', _('Usar os módulos de som do meu console', "Use my console's sound modules"),
+                   _('Desligado (padrão desde a 0.75): o mixer de som embutido do port toca o som. Ligado: o som sai '
+                     'pelos módulos libSceNgs2/libSceUlt da pasta Módulos de som (aba Jogo e saves), como antes. Vale na próxima vez que o jogo abrir.',
+                     "Off (the default since 0.75): the port's built-in sound mixer plays the sound. On: the sound "
+                     'goes through the libSceNgs2/libSceUlt modules of the Sound modules folder (Game & saves page), as before. Applies the next '
+                     'time the game starts.'))
+        self.vars['sound_firmware'].trace_add('write', lambda *_a: self.refresh_status())
+
     def build_controls(self):
         ttk = self.ttk
         f = self.scrolled_page('controls', _('Controles', 'Controls'),
@@ -2154,11 +2208,13 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
             game = _('⚠ {} versão {}: o port foi feito para {}; os modos não se aplicam',
                      '⚠ {} version {}: the port targets {}; the modes do not apply').format(*info, supported_games())
         modules = Path(self.var('sys_modules').get() or '.')
-        if self.var('sys_modules').get() and all((modules / m).is_file() for m in SYS_MODULES):
-            sound = _('✓ Módulos de som encontrados', '✓ Sound modules found')
+        if not self.var('sound_firmware').get():
+            sound = _('✓ Som pelo mixer embutido do port', "✓ Sound from the port's built-in mixer")
+        elif self.var('sys_modules').get() and all((modules / m).is_file() for m in SYS_MODULES):
+            sound = _('✓ Som pelos módulos do seu console', "✓ Sound from your console's modules")
         else:
-            sound = _('⚠ Sem os módulos de som do seu console: o jogo fica mudo (Jogo e saves)',
-                      '⚠ No sound modules from your console: the game is silent (Game & saves)')
+            sound = _('⚠ Módulos do console marcados mas não encontrados: o mixer embutido toca o som',
+                      "⚠ Console modules ticked but not found: the built-in mixer plays the sound")
         user = user_dir({'user_dir': self.var('user_dir').get()})
         serial = game_serial(self.var('game_dir').get())
         saves = user / 'savedata' / '1' / serial
@@ -2313,10 +2369,12 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
              [(_('Geração de quadros', 'Frame generation'), lambda: self.jump_key('framegen'), False),
               (_('Limpar cache de shaders', 'Clear shader cache'), self.clear_cache, False)]),
             (_('Sem som', 'No sound'),
-             _('O som do jogo precisa dos módulos libSceNgs2 e libSceUlt do seu próprio console (o port não os traz). '
-               'Escolha a pasta onde eles estão; a do shadPS4 serve.',
-               'The game\'s sound needs the libSceNgs2 and libSceUlt modules of your own console (the port does not '
-               'bring them). Choose the folder that holds them; shadPS4\'s works.'),
+             _('Desde a 0.75 o port tem um mixer de som embutido e o jogo tem som sem nada do console. Se mesmo '
+               'assim estiver mudo, confira o volume do jogo e do Windows e o dispositivo de saída. Os módulos '
+               'libSceNgs2 e libSceUlt do seu console continuam opcionais (com eles o som é o do firmware).',
+               'Since 0.75 the port has a built-in sound mixer and the game has sound without anything from the '
+               'console. If it is still silent, check the game\'s and Windows\' volume and the output device. Your '
+               'console\'s libSceNgs2 and libSceUlt modules stay optional (with them the firmware plays the sound).'),
              [(_('Módulos de som', 'Sound modules'), lambda: self.jump_key('sys_modules'), False)]),
             (_('Travadas nas trocas de área ou na primeira vez', 'Stutters at area changes or the first time'),
              _('Na primeira vez (e depois de atualizar) o cache de shaders é montado: as travadas somem com o tempo. '
@@ -2532,12 +2590,14 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
 
     def news_items(self):
         """This version's entry of CHANGELOG.md: one text per item (its continuation lines joined),
-        **bold** kept as markers."""
+        **bold** kept as markers. A '### English' heading inside the entry starts its English
+        items (#410): a launcher in another language than Portuguese shows those when they exist."""
         try:
             text = (PORT_DIR / 'CHANGELOG.md').read_text(encoding='utf-8')
         except OSError:
             return []
-        items, inside = [], False
+        portuguese, english = [], []
+        items, inside = portuguese, False
         for line in text.splitlines():
             if line.startswith('## '):
                 if inside:
@@ -2546,11 +2606,15 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                 continue
             if not inside or not line.strip():
                 continue
+            if line.startswith('### '):
+                items = english if line[4:].strip().lower() == 'english' else portuguese
+                continue
             if line.startswith('- '):
                 items.append(line[2:].strip())
             elif items:
                 items[-1] += ' ' + line.strip()
-        return [item.replace('`', '') for item in items]
+        chosen = english if LANG != 'pt' and english else portuguese
+        return [item.replace('`', '') for item in chosen]
 
     def show_news(self):
         """What's new, once per version (news_seen)."""
@@ -2914,8 +2978,10 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                                    'com a atualização ao lado.',
                                    'The game dump: CUSA08809 (European, version 1.01) or CUSA08034 (American, 1.00), '
                                    'with its update next to it.')),
-                           ('•', _('Os módulos de som do seu console (libSceNgs2, libSceUlt), para ter som.',
-                                   "Your console's sound modules (libSceNgs2, libSceUlt), for sound.")),
+                           ('•', _('Opcional: os módulos de som do seu console (libSceNgs2, libSceUlt); sem eles, '
+                                   'o mixer embutido toca o som.',
+                                   "Optional: your console's sound modules (libSceNgs2, libSceUlt); without them, "
+                                   'the built-in mixer plays the sound.')),
                            ('•', _('Uma placa de vídeo com Vulkan 1.3 e o driver atualizado.',
                                    'A video card with Vulkan 1.3 and an up-to-date driver.')),
                            ('•', _('O jogo num SSD ou NVMe: num HD as trocas de área travam muito mais.',

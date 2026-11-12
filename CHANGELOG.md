@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.75 — 2026-11-12
+- 🔊 **Som sem os módulos do console: os arquivos do PS4 deixam de ser obrigatórios** (Oussama268, a partir do HayatoG/tlg_pc, GPL-2.0): quando faltam o `libSceNgs2.sprx` e o `libSceUlt.sprx`, um mixer NGS2 embutido toca o som do jogo (ATRAC9 pela LibAtrac9). **Ele é o padrão para todos**; quem preferir o som do firmware marca "Usar os módulos de som do meu console" em Jogo e saves. No teste, som normal e o mesmo FPS nos dois casos (69,7 com o mixer, 69,5 com os módulos). `SOTC_NGS2=native` volta ao comportamento antigo.
+- 🎧 **Aba Som no lançador:** saída em **Estéreo 2.0**, **Surround 5.1**, **Surround 7.1** ou Automático (o jogo mistura em 7.1; no 2.0 e no 5.1 o próprio port faz a mistura, coeficientes ITU, sem estourar), graves do subwoofer no estéreo, escolha do **dispositivo de som** (fone, TV, caixas) sem mudar o padrão do Windows, **volume até 500%** (também no menu do jogo, F10; picos suavizados) e o motor de som. `SOTC_AUDIO_CHANNELS`, `SOTC_AUDIO_LFE`, `SOTC_AUDIO_DEVICE`.
+- **Tela "Novidades" em inglês** nos outros idiomas (#410): um `### English` dentro da versão no CHANGELOG traz os itens em inglês.
+
+### English
+- 🔊 **Sound without the console's modules: the PS4 files are no longer required** (Oussama268, from HayatoG/tlg_pc, GPL-2.0): when libSceNgs2.sprx and libSceUlt.sprx are missing, a built-in NGS2 mixer plays the game's sound (ATRAC9 through LibAtrac9). **It is the default for everyone**; to use the firmware's sound instead, tick "Use my console's sound modules" under Game & saves. Tested: normal sound and the same FPS either way (69.7 with the mixer, 69.5 with the modules). `SOTC_NGS2=native` restores the old behaviour.
+- 🎧 **Sound page in the launcher:** output in **Stereo 2.0**, **Surround 5.1**, **Surround 7.1** or Automatic (the game mixes in 7.1; for 2.0 and 5.1 the port mixes down itself, ITU coefficients, no clipping), subwoofer bass in stereo, the **sound device** (headset, TV, speakers) without changing the Windows default, **volume up to 500%** (also in the in-game menu, F10; peaks softened) and the sound engine.
+- **"What's new" in English** for launchers in other languages than Portuguese (#410).
+
 ## 0.74.2 — 2026-11-12
 - **Quedas nas AMD Radeon corrigidas** (Oussama268, #413): um pipeline gráfico que o driver recusa não fecha mais o jogo; os desenhos dele são pulados (`SOTC PIPELINE FAILED` no log). Era a queda das RX 6600/6700 XT/6750 XT perto da arena do 4º colosso e na ponte do 9º (#397, #408, #393). Duas causas da recusa achadas com as camadas de validação do Vulkan: uma variante de shader criada com um binding a menos que o seu layout (o buffer do LOD feedback das texturas Alta/Máxima) e bytes do jogo enviados para um buffer de profundidade guardado em outro formato.
 - **Cores aleatórias nas AMD GCN** (RX 470–590, Vega) corrigidas (marko0905, #411): um shader de compute lia uma "lane" que não existe em placas de 64 lanes. `SOTC_WAVE64_ABSENT_LANES=0` desliga.

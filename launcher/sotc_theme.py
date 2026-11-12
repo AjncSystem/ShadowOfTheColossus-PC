@@ -41,7 +41,7 @@ ICON = {'play': '', 'graphics': '', 'display': '', 'game': '', 'chea
         'advanced': '', 'log': '', 'ok': '', 'warn': '', 'error': '',
         'info': '', 'keyboard': '', 'link': '', 'system': '',
         'folder': '', 'cpu': '', 'ram': '', 'pulse': '', 'help': '', 'picture': '', 'saves': '',
-        'language': '', 'gameplay': ''}
+        'language': '', 'gameplay': '', 'sound': ''}
 
 SS = 4  # supersampling of the drawn images
 

@@ -453,6 +453,21 @@ GraphicsPipeline::GraphicsPipeline(
         .layout = *pipeline_layout,
     };
 
+    // sotc: SOTC_PIPE_TRACE=1: the resources the layout was made from, per stage, right before
+    // the pipeline is created (a validation error about the layout follows its own line).
+    static const bool pipe_trace = std::getenv("SOTC_PIPE_TRACE") != nullptr;
+    if (pipe_trace) {
+        std::string line;
+        for (const auto* stage : stages) {
+            if (stage) {
+                line += fmt::format(" [stage {} {:#x}: buffers {} images {} samplers {}]",
+                                    u32(stage->sw_stage), stage->pgm_hash, stage->buffers.size(),
+                                    stage->images.size(), stage->samplers.size());
+            }
+        }
+        std::fprintf(stderr, "SOTC PIPE TRACE pipeline%s%s\n", preloading ? " (preload)" : "",
+                     line.c_str());
+    }
     auto [pipeline_result, pipe] =
         device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
     if (pipeline_result != vk::Result::eSuccess && preloading) {

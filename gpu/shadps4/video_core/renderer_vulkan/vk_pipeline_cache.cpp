@@ -850,6 +850,41 @@ void PipelineCache::RunAsyncTranslate(AsyncPipelineJob::Translate& t) {
         std::memory_order_relaxed);
 }
 
+// sotc: the pipeline layout and the descriptor writes of every permutation come from the
+// program's first Info. A permutation whose module declares other resources is reported
+// (SOTC PERMUTATION lines): its pipeline is created against a layout that does not match it
+// (VUID-VkGraphicsPipelineCreateInfo-layout-07988/07990).
+static bool SameResourceShape(const Shader::Info& first, const Shader::Info& now, u64 hash,
+                              size_t perm_idx) {
+    bool same = first.buffers.size() == now.buffers.size() &&
+                first.images.size() == now.images.size() &&
+                first.samplers.size() == now.samplers.size() && first.fmasks.size() == now.fmasks.size();
+    for (size_t i = 0; same && i < now.images.size(); ++i) {
+        same = first.images[i].is_written == now.images[i].is_written &&
+               first.images[i].array_size == now.images[i].array_size;
+    }
+    if (!same) {
+        std::fprintf(stderr,
+                     "SOTC PERMUTATION %#llx #%zu declares other resources than the first: buffers "
+                     "%zu/%zu images %zu/%zu samplers %zu/%zu fmasks %zu/%zu\n",
+                     static_cast<unsigned long long>(hash), perm_idx, now.buffers.size(),
+                     first.buffers.size(), now.images.size(), first.images.size(),
+                     now.samplers.size(), first.samplers.size(), now.fmasks.size(),
+                     first.fmasks.size());
+        std::string line;
+        for (const auto* i : {&now, &first}) {
+            line += " |";
+            for (const auto& b : i->buffers) {
+                line += fmt::format(" {}", u32(b.buffer_type));
+            }
+            line += fmt::format(" lod {} dma {}", i->uses_lod_feedback, i->uses_dma);
+        }
+        std::fputs(("SOTC PERMUTATION buffer types" + line + "!").c_str(), stderr);
+        std::fputc(10, stderr);
+    }
+    return same;
+}
+
 void PipelineCache::TranslateOnWorker(AsyncPipelineJob::Translate& t,
                                       const Shader::ShaderParams& params,
                                       Shader::Backend::Bindings& binding,
@@ -869,6 +904,7 @@ void PipelineCache::TranslateOnWorker(AsyncPipelineJob::Translate& t,
         const Shader::StageSpecialization worker_spec{new_info, t.runtime_info, profile,
                                                       t.start};
         t.stale = !(worker_spec == *t.spec);
+        SameResourceShape(t.program->info, new_info, params.hash, t.perm_idx);
     }
 }
 
@@ -1363,6 +1399,13 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
     phase(1);
+    // sotc: SOTC_PIPE_TRACE=1: the resources each module declares (see GraphicsPipeline).
+    static const bool pipe_trace = std::getenv("SOTC_PIPE_TRACE") != nullptr;
+    if (pipe_trace) {
+        std::fprintf(stderr, "SOTC PIPE TRACE module %#llx #%zu stage %u: buffers %zu images %zu samplers %zu\n",
+                     static_cast<unsigned long long>(info.pgm_hash), perm_idx, u32(info.sw_stage),
+                     info.buffers.size(), info.images.size(), info.samplers.size());
+    }
 
     vk::ShaderModule module;
 
@@ -1451,6 +1494,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
         auto runtime_info = rt;
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
+        SameResourceShape(info, new_info, params.hash, perm_idx);
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
         program->AddPermut(module, std::move(spec));

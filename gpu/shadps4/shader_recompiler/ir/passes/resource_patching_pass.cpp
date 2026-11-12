@@ -1025,6 +1025,18 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
                                                  : IR::F32{};
     const IR::F32 lod_clamp = inst_info.has_lod_clamp ? get_addr_reg(addr_reg++) : IR::F32{};
 
+    // sotc: the LOD feedback buffer is declared from the instruction, not from what the bound
+    // texture made of it. A multisampled T# turns the sample into a read, so a permutation
+    // translated with one had no implicit LOD sample and no feedback buffer, while the next
+    // permutation had both: every permutation shares the first one's pipeline layout, and the
+    // second was created against a layout one binding short (colossus 4 and 9, fs 0xea0a2a97:
+    // VUID-VkGraphicsPipelineCreateInfo-layout-07988/07990, then draws with each texture one
+    // slot off). The info collection pass sets the same flag for the samples that remain.
+    if (!inst_info.is_gather && !inst_info.has_derivatives && !explicit_lod &&
+        info.sw_stage == SwStage::Fragment && LodFeedbackEnabled()) {
+        info.uses_lod_feedback = true;
+    }
+
     auto texel = [&] -> IR::Value {
         if (is_msaa) {
             return ir.ImageRead(handle, coords, {}, ir.Imm32(0U), inst_info);

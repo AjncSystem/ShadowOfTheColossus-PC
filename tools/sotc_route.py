@@ -205,6 +205,7 @@ def drive(args, pad, log, launched, launcher):
             return ''
 
     seen = [False]
+    gone = [0]
 
     def wait(seconds, until=lambda t: False):
         end = time.monotonic() + seconds
@@ -214,10 +215,15 @@ def drive(args, pad, log, launched, launcher):
                 return t
             if running():
                 seen[0] = True
+                gone[0] = 0
             elif time.monotonic() - start > 20 and (seen[0] or launcher.poll() is not None):
                 # Gone after it ran, or the launcher gave up. A launcher still preparing the
-                # image has no game yet: that is not a failure.
-                return None
+                # image has no game yet: that is not a failure. Three checks in a row: one
+                # tasklist answer without the game is not proof.
+                gone[0] += 1
+                if gone[0] >= 3:
+                    print(f'game gone (seen {seen[0]}, launcher exit {launcher.poll()})', flush=True)
+                    return None
             time.sleep(0.2)
         return text()
 

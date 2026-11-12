@@ -1182,13 +1182,13 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         self.banner_source = self.banner_image = None
         root.title('Shadow of the Colossus — ' + _('port nativo', 'native port'))
         root.configure(bg=BG)
-        self.dpi = root.winfo_fpixels('1i') / 96.0
+        theme.load_fonts(root)
+        self.dpi = root.winfo_fpixels('1i') / 96.0 * theme.font_scale(root)
         # Tall enough for every quick setting when the screen has the room (the Play page scrolls otherwise).
         height = min(self.px(820), root.winfo_screenheight() - self.px(80))
         root.geometry(f'{self.px(1080)}x{max(self.px(620), height)}')
         root.minsize(self.px(940), self.px(620))
         self.set_icon()
-        theme.load_fonts(root)
         self.style()
         self.build()
         self.show('play')

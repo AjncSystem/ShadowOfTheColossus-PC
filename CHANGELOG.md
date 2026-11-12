@@ -27,9 +27,11 @@
 - **Quedas da 0.73 corrigidas também no Linux:** os objetos zerados que o jogo usa (`0x564d24`,
   `0x144c60`, `0x14934f`, `0x14cce7`) são pulados pelo tratador de sinais do Linux como pelo do
   Windows (`SOTC_FIX_NULL_OBJECTS=0` desliga).
-- **Queda silenciosa (código 245) corrigida** (mrgroeff, upstream #409): os campos do heap do jogo
-  são lidos pela segunda visão da memória, que o rastreamento de páginas da GPU nunca protege; a
-  leitura direta caía duas vezes na mesma página protegida e o jogo fechava sem relatório.
+- **Lançador sem textos cortados com fontes aumentadas:** uma regra de DPI ou escala do fontconfig
+  (`fonts.conf`) aumentava as fontes do Tk sem mudar o DPI dele, e as caixas de largura fixa
+  cortavam o texto. O lançador mede o tamanho real da fonte e dimensiona as caixas por ele.
+- **Módulos de som opcionais** (0.75): sem `libSceNgs2.sprx`/`libSceUlt.sprx` o mixer embutido toca
+  o som; a AppImage sem o lançador também avisa isso em vez de "sem som".
 
 ## 0.76.1 — 2026-11-17
 - 🌌 **Linhas tracejadas no céu em placas AMD Radeon corrigidas** (#432, #433): um shader do céu trocava valores entre pixels vizinhos de um jeito que o driver da AMD não garante nas arestas dos triângulos, e desenhava uma grade de linhas sobre o céu (tela de título e jogo). Agora usa operações de quad, que todo driver garante. NVIDIA sem mudança. O cache de shaders é refeito na primeira abertura. `SOTC_QUAD_SWIZZLE=0` volta ao antigo.

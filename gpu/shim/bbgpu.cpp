@@ -141,6 +141,7 @@ static const bool kCopyLockOnce = [] {
 // through the guest address under the loader's copy guard (src/probe.c bb_copy_guard_buf): a fault
 // in it (a page the GPU tracking read-protected, or one the guest unmapped) returns here before
 // page tracking sees it, and the run is copied through the backing view as before.
+#ifdef _WIN32
 extern "C" __thread std::uintptr_t bb_copy_guard_lo, bb_copy_guard_hi;
 extern "C" __thread unsigned long long* bb_copy_guard_buf;
 static const bool kCopyGuestView = [] {
@@ -173,6 +174,14 @@ static const bool kCopyGuestView = [] {
     __atomic_store_n(&bb_copy_guard_buf, outer_buf, __ATOMIC_RELEASE);
     return true;
 }
+#else
+// TRADEOFF: the copy guard lives in the Windows exception handler only, so Linux copies through the
+// backing view; arming it in the Linux fault handler would let this switch work there.
+static constexpr bool kCopyGuestView = false;
+static bool GuardedGuestCopy(u8*, const void*, u64) {
+    return false;
+}
+#endif
 static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
     if (kCopyLockOnce && size && runtime_memory_copy_out(source, dest, size)) {
         return;
@@ -188,6 +197,8 @@ static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
         // readbacks GPU-written pages are read-protected, and a fault on a copy thread or the
         // recording thread would wait for the command processor, which waits for them.
         const u8* backing = mapped ? runtime_memory_backing_pointer(source) : nullptr;
+#ifdef _WIN32
+        // TRADEOFF: Windows only; MADV_POPULATE_READ is the Linux counterpart if these faults matter there.
         // sotc: the backing view's pages are mapped in one call before a large copy
         // (SOTC_COPY_PREFETCH=0: one fault per page as before). At an area change (forest
         // entrance, 3 Nov) texture copies of 175-215 MB per frame took 10-59 thousand page faults,
@@ -203,6 +214,7 @@ static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
             WIN32_MEMORY_RANGE_ENTRY range{read_from, static_cast<SIZE_T>(n)};
             PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
         }
+#endif
         if (backing && BbMemReport::WsDiagEnabled()) {
             const uint64_t before = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(

@@ -91,8 +91,12 @@ class Pads:
 
 
 def sdl_path(port_dir):
-    """The port's SDL3.dll (bin/, or out/ in a build; the MSYS2 tree for a run from the sources)."""
+    """The port's SDL3.dll (bin/, or out/ in a build; the MSYS2 tree for a run from the sources). On
+    Linux the AppImage's lib/libSDL3.so.0, else the system's."""
     import os
+    if os.name != 'nt':
+        bundled = Path(port_dir) / 'lib' / 'libSDL3.so.0'
+        return bundled if bundled.is_file() else 'libSDL3.so.0'
     candidates = [Path(port_dir) / folder / 'SDL3.dll' for folder in ('bin', 'out')]
     candidates.append(Path(os.environ.get('MSYS2_ROOT', r'I:\msys64')) / 'clang64' / 'bin' / 'SDL3.dll')
     return next((path for path in candidates if path.is_file()), None)

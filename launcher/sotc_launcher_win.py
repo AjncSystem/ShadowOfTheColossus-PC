@@ -900,6 +900,10 @@ def game_environment(s):
     # (libSceNgs2/libSceUlt) only when the player ticks "Use my console's sound modules".
     if s['sys_modules'] and s.get('sound_firmware'):
         env['SOTC_SYS_MODULES'] = s['sys_modules']
+    else:
+        # Empty, not unset: sotc.py would take a SOTC_SYS_MODULES line of sotc.ini instead (the Linux
+        # AppImage writes one on its first start).
+        env['SOTC_SYS_MODULES'] = ''
     if s.get('dlc_dir'):
         env['SOTC_DLC_DIR'] = s['dlc_dir']
     # The 30 FPS cap is applied or not by bb-probe (sotc_fps_cap.h), F7 switches it in game: no

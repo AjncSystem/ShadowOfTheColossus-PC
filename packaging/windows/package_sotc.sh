@@ -30,6 +30,12 @@ cp -r out/pyi-dist/SotC/. "$dest/"
 cp launcher/sotc.ico launcher/sotc.png launcher/window_icon.png "$dest/launcher/"
 # The launcher theme's fonts (Cinzel, Inter: SIL Open Font License, licences next to them).
 cp -r launcher/assets "$dest/launcher/"
+# A fork's package updates from the fork's releases: SOTC_UPDATE_REPO=owner/name writes the file
+# sotc_update.py reads. Unset (the main repository's package): no file, updates come from here.
+if [[ -n "${SOTC_UPDATE_REPO:-}" ]]; then
+    printf '%s\n' "$SOTC_UPDATE_REPO" > "$dest/launcher/update_repo.txt"
+    echo "Updates: from $SOTC_UPDATE_REPO"
+fi
 # Xbox-style button icons drawn for the port (tools/make_button_icons.py).
 cp -r glyphs "$dest/"
 # Without debug information (out/ keeps the symbols for crash reports).
@@ -91,6 +97,7 @@ rm -rf dist/SotC-PC.zip
 python -c 'import shutil, sys; shutil.make_archive("dist/SotC-PC", "zip", "out/stage", "SotC-PC")'
 # The playable copy keeps its settings and saves.
 mkdir -p dist/SotC-PC
+rm -f dist/SotC-PC/launcher/update_repo.txt
 cp -r "$dest/bin" "$dest/scripts" "$dest/launcher" "$dest/_internal" dist/SotC-PC/
 cp "$dest/SotC.exe" "$dest/sotc.py" "$dest/SotC.bat" "$dest/README.md" "$dest/LICENSE" "$dest/CHANGELOG.md" dist/SotC-PC/
 [[ -f dist/SotC-PC/sotc.ini ]] || cp "$dest/sotc.ini" dist/SotC-PC/

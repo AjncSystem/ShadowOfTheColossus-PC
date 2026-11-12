@@ -28,8 +28,32 @@ import time
 import urllib.request
 import zipfile
 
-RELEASES_URL = 'https://api.github.com/repos/AjncSystem/ShadowOfTheColossus-PC/releases/latest'
-RELEASES_PAGE = 'https://github.com/AjncSystem/ShadowOfTheColossus-PC/releases'
+REPOSITORY = 'AjncSystem/ShadowOfTheColossus-PC'
+
+
+def package_repository(folder=None):
+    """The repository a packaged copy updates from.
+
+    A fork's package carries launcher/update_repo.txt ("owner/name", written by package_sotc.sh
+    from SOTC_UPDATE_REPO), so its players get the fork's releases. The file is never in git:
+    the source always names this repository, and merging a fork cannot change it.
+    """
+    if folder is None:
+        frozen = getattr(sys, 'frozen', False)
+        folder = Path(sys.executable).resolve().parent / 'launcher' if frozen else Path(__file__).resolve().parent
+    try:
+        text = (Path(folder) / 'update_repo.txt').read_text(encoding='utf-8').strip()
+    except (OSError, ValueError):
+        return REPOSITORY
+    return text if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_][A-Za-z0-9_.-]*', text) else REPOSITORY
+
+
+def release_urls(repository):
+    return (f'https://api.github.com/repos/{repository}/releases/latest',
+            f'https://github.com/{repository}/releases')
+
+
+RELEASES_URL, RELEASES_PAGE = release_urls(package_repository())
 ASSET_NAME = 'SotC-PC.zip'
 TOP = 'SotC-PC'
 KEEP = ('user', 'update')  # top-level names an update never writes into

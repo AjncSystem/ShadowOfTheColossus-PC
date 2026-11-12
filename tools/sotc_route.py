@@ -204,13 +204,19 @@ def drive(args, pad, log, launched, launcher):
         except OSError:
             return ''
 
+    seen = [False]
+
     def wait(seconds, until=lambda t: False):
         end = time.monotonic() + seconds
         while time.monotonic() < end:
             t = text()
             if until(t):
                 return t
-            if time.monotonic() - start > 20 and not running():
+            if running():
+                seen[0] = True
+            elif time.monotonic() - start > 20 and (seen[0] or launcher.poll() is not None):
+                # Gone after it ran, or the launcher gave up. A launcher still preparing the
+                # image has no game yet: that is not a failure.
                 return None
             time.sleep(0.2)
         return text()
@@ -220,6 +226,10 @@ def drive(args, pad, log, launched, launcher):
 
     def invalid(why):
         # Keep the failed run's log too: the next launch overwrites last_run.log.
+        # The launcher goes first, with its children: one still preparing the image would start
+        # the game after this script has gone (no plan file, nobody to close it), and it holds
+        # the caller's output pipe open for as long as that game runs.
+        subprocess.run(['taskkill', '/F', '/T', '/PID', str(launcher.pid)], capture_output=True)
         subprocess.run(['taskkill', '/F', '/IM', 'bb-probe.exe'], capture_output=True)
         try:
             keep = log.with_name(f'invalid-{time.strftime("%Y%m%d-%H%M%S")}.log')
@@ -235,7 +245,8 @@ def drive(args, pad, log, launched, launcher):
         pad.write_text('')
         return t
 
-    t = wait(120, lambda t: 'pad opened' in t)
+    # A new launcher version prepares the image again before the game starts: allow for it.
+    t = wait(600, lambda t: 'pad opened' in t)
     if not t:
         return invalid('the game did not start')
     # Opening cinematic ("hold X to skip"), title, menu (Continue is selected): hold and tap X

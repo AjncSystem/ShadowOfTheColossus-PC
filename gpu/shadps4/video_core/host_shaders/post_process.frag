@@ -44,10 +44,18 @@ vec3 sdrToHdr10(vec3 lin) {
 }
 
 const float cutoff = 0.0031308, a = 1.055, b = 0.055, d = 12.92;
+// The game's brightness (sceVideoOutAdjustColor, 0.1..2.0) as a power on the linear colour, then
+// the standard sRGB encode. The upper branch is the same as before (a * rgb^(1/(3.4-gamma)) - b),
+// but the old lower branch divided by the gamma (d * rgb / gamma): away from gamma 1 the curve
+// jumped at the cutoff (at 0.1, 0.40 just below it and 0.13 just above), so each channel of a
+// dark pixel landed on a different side and dark areas turned red, green and blue.
 vec3 gamma(vec3 rgb) {
+    if (pp.gamma != 1.0) { // the default: exactly the plain sRGB encode, as before
+        rgb = pow(max(rgb, vec3(0.0)), vec3(2.4 / (2.4 + 1.0 - pp.gamma)));
+    }
     return mix(
-        a * pow(rgb, vec3(1.0 / (2.4 + 1.0 - pp.gamma))) - b,
-        d * rgb / pp.gamma,
+        a * pow(rgb, vec3(1.0 / 2.4)) - b,
+        d * rgb,
         lessThan(rgb, vec3(cutoff))
     );
 }

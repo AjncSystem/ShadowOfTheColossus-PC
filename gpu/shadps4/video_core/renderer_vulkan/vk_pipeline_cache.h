@@ -49,12 +49,16 @@ struct Program {
     struct Module {
         vk::ShaderModule module;
         Shader::StageSpecialization spec;
+        // Every variant binds the resources its own SPIR-V declares. The first variant
+        // can use Program::info; subsequent variants keep stable, separately owned Info.
+        std::unique_ptr<Shader::Info> info;
     };
     static constexpr size_t MaxPermutations = 8;
     using ModuleList = boost::container::small_vector<Module, MaxPermutations>;
 
     Shader::Info info;
     ModuleList modules{};
+    size_t last_module{};
     /// sotc: permutations being translated by a pipeline worker (SOTC_ASYNC_TRANSLATE).
     std::vector<Shader::StageSpecialization> pending_specs;
     /// sotc: a worker read other tables than the draw that asked (the game reused them before
@@ -65,14 +69,22 @@ struct Program {
     Program(Shader::HwStage stage, Shader::SwStage l_stage, Shader::ShaderParams params)
         : info{stage, l_stage, params} {}
 
-    void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec) {
-        modules.emplace_back(module, std::move(spec));
+    Shader::Info& ModuleInfo(size_t index) {
+        return modules[index].info ? *modules[index].info : info;
+    }
+
+    void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
+                   std::unique_ptr<Shader::Info> owned = {}) {
+        spec.info = owned ? owned.get() : &info;
+        modules.emplace_back(module, std::move(spec), std::move(owned));
+        last_module = modules.size() - 1;
     }
 
     void InsertPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
-                      size_t perm_idx) {
-        modules.resize(std::max(modules.size(), perm_idx + 1)); // <-- beware of realloc
-        modules[perm_idx] = {module, std::move(spec)};
+                      size_t perm_idx, std::unique_ptr<Shader::Info> owned = {}) {
+        modules.resize(std::max(modules.size(), perm_idx + 1));
+        spec.info = owned ? owned.get() : &info;
+        modules[perm_idx] = {module, std::move(spec), std::move(owned)};
     }
 };
 
@@ -182,6 +194,7 @@ private:
             size_t perm_idx{};  ///< provisional (patch file name only)
             std::optional<Shader::StageSpecialization> spec;
             std::unique_ptr<Program> new_program;
+            std::unique_ptr<Shader::Info> info;
             vk::ShaderModule module{};
             std::vector<u32> spv;
             bool stale{}; ///< the worker's specialization differs from spec (permutation)

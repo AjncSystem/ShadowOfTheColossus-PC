@@ -102,7 +102,15 @@ set(FFX_VK_PORTABLE_BUILD_PROBE OFF CACHE BOOL "" FORCE)
 set(FFX_VK_PORTABLE_BUILD_FSR3_HOST OFF CACHE BOOL "" FORCE)
 set(FFX_VK_PORTABLE_BUILD_FSR3_VK_BACKEND OFF CACHE BOOL "" FORCE)
 set(FFX_VK_PORTABLE_BUILD_FSR3_3_1_5_SCAFFOLD ON CACHE BOOL "" FORCE)
-set(FFX_VK_PORTABLE_BUILD_FSR4_V07_VULKAN OFF CACHE BOOL "" FORCE)
+# sotc: FSR 4 super resolution. AMD ships FSR 4.1 as Windows PE DLLs only, so on Windows the SDK
+# loader is used at run time (vk_fsr4.cpp) and this provider is not built; elsewhere the vendored
+# portable source-v07 INT8/DOT4 provider is the native implementation. Its .spv/.bin asset bundle
+# is loaded from SOTC_FSR4_ASSETS, <exe dir>/fsr4_shaders or ~/.local/share/sotc-pc/fsr4_shaders.
+if(WIN32)
+    set(FFX_VK_PORTABLE_BUILD_FSR4_V07_VULKAN OFF CACHE BOOL "" FORCE)
+else()
+    set(FFX_VK_PORTABLE_BUILD_FSR4_V07_VULKAN ON CACHE BOOL "" FORCE)
+endif()
 set(FFX_VK_PORTABLE_INSTALL OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/fsr-vulkan EXCLUDE_FROM_ALL)
 
@@ -185,6 +193,20 @@ target_include_directories(bbgpu PRIVATE third_party/streamline/include)
 # optical flow, natively on Vulkan (third_party/fsr-vulkan, MIT); any GPU with Vulkan 1.3.
 # (fsr-vulkan is added once above, with the frame generation options.)
 target_link_libraries(bbgpu PRIVATE ffx-vulkan::fsr3-vk-framegeneration-3.1.6)
+# sotc: FSR 4 super resolution (vk_fsr4.cpp) outside Windows: the vendored portable source-v07
+# INT8/DOT4 provider, natively on Vulkan. Needs shaderInt8/shaderFloat16/shaderIntegerDotProduct.
+if(NOT WIN32)
+    target_link_libraries(bbgpu PRIVATE ffx-vulkan::fsr4-v07-vulkan)
+    # The v07 provider declares FfxInterface, FfxEffect, FfxGpuJobType and FfxShaderModel with the
+    # same names but different layouts and enum values as the AMD 2.3.0 SDK headers the FSR 3 frame
+    # generation compiles against. LTO merges same-named types across translation units (and warns
+    # about every mismatch), which would put the two ABI islands in one sizeof(FfxInterface). Keep
+    # them out of LTO, as atrac9 below already is; the upscaler's hot work is in its shaders.
+    set_target_properties(ffx_vulkan_fsr4_v07_vulkan ffx_vulkan_fsr4_v07_assets
+        PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
+    set_source_files_properties(shadps4/video_core/renderer_vulkan/vk_fsr4.cpp
+        PROPERTIES COMPILE_OPTIONS "-fno-lto")
+endif()
 # The module's 3.1.6 frame generation never starts a frame on its bridge: the constant buffers
 # and descriptor sets of every dispatch are then kept until the context is destroyed (~3 MB of
 # video memory per frame, out of memory within a minute). Its source is built from a copy that

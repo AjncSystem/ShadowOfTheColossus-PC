@@ -1514,10 +1514,12 @@ Upscaled UpscaleFsr(const FrameSlot& f, vk::CommandBuffer cmdbuf, Scheduler& sch
         return v ? std::atoi(v) : 1;
     }();
     Fsr4::Params p{};
-    p.color = {sr_color.image, sr_color.format, f.width, f.height};
-    p.depth = {f.depth, f.depth_format, f.width, f.height};
-    p.mvec = {f.mvec, f.mvec_format, f.width, f.height};
-    p.output = {sr_out.image, sr_out.format, out_w, out_h};
+    // The v07 provider's resource ABI binds views, not images, so every slot carries the view the
+    // port already has (a depth/stencil view names the depth aspect only, as CreateImage makes it).
+    p.color = {sr_color.image, sr_color.view, sr_color.format, f.width, f.height};
+    p.depth = {f.depth, f.depth_view, f.depth_format, f.width, f.height};
+    p.mvec = {f.mvec, f.mvec_view, f.mvec_format, f.width, f.height};
+    p.output = {sr_out.image, sr_out.view, sr_out.format, out_w, out_h};
     p.render_width = f.width;
     p.render_height = f.height;
     p.out_width = out_w;
@@ -1538,6 +1540,11 @@ Upscaled UpscaleFsr(const FrameSlot& f, vk::CommandBuffer cmdbuf, Scheduler& sch
     p.fov_y = c.cameraFOV;
     p.depth_inverted = c.depthInverted == sl::Boolean::eTrue;
     p.reset = c.reset == sl::Boolean::eTrue || !sr_prev;
+    // Read here and not inside the deferred recording: the recorder may run after PrepareFrame has
+    // taken CurrentTick() for frame->ready_tick, and nothing flushes in between, so this is still
+    // the tick of the submission that carries the dispatch.
+    p.tick = scheduler.CurrentTick();
+    p.scheduler = &scheduler;
     // The SDK records into the real command buffer (the recorder's cmdbuf is a fake handle).
     scheduler.RecordDeferred([p](vk::CommandBuffer real) {
         if (!Fsr4::Dispatch(static_cast<VkCommandBuffer>(real), p)) {

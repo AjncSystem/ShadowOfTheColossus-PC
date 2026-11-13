@@ -1,0 +1,158 @@
+From: bbport
+Subject: [PATCH] FSR 4 v07 backend: transition imported images on their own aspects
+
+bbport: imgBarrier named VK_IMAGE_ASPECT_COLOR_BIT for every image. That is
+invalid for a depth import (VUID-VkImageMemoryBarrier-subresourceRange-09601)
+and leaves the depth aspect in its old layout while the descriptor set says
+GENERAL, so the pre-pass samples a layout the driver never prepared.
+
+FfxFsr4VkExternalImageState gains an aspectMask the host fills in: the FFX
+resource ABI hands the backend a VkImageView whose format it cannot query, and
+a depth image is described as R32_FLOAT (the enum has no depth members), so the
+aspects cannot be derived from it. Internal resources keep deriving theirs from
+their own VkFormat. 0 means colour, so existing hosts are unaffected.
+
+---
+diff --git a/include/ffx_vk_fsr4_v07.h b/include/ffx_vk_fsr4_v07.h
+--- a/include/ffx_vk_fsr4_v07.h
++++ b/include/ffx_vk_fsr4_v07.h
+@@ -72,6 +72,10 @@
+     VkImageLayout           restoreLayout;
+     VkPipelineStageFlags    restoreStageMask;
+     VkAccessFlags           restoreAccessMask;
++    /* Aspects the backend must transition.  The FFX resource ABI hands over a
++     * VkImageView whose format the backend cannot query, so a depth/stencil
++     * import has to declare its own aspects; 0 means VK_IMAGE_ASPECT_COLOR_BIT. */
++    VkImageAspectFlags      aspectMask;
+ } FfxFsr4VkExternalImageState;
+ 
+ // FSR4 has: pass0 (pre), pass1-12 (model), pass13 (post), rcas, spd_auto_exposure
+diff --git a/src/ffx_vk_fsr4_v07.c b/src/ffx_vk_fsr4_v07.c
+--- a/src/ffx_vk_fsr4_v07.c
++++ b/src/ffx_vk_fsr4_v07.c
+@@ -93,6 +93,7 @@
+     VkImage        img;
+     VkImageView    view;
+     VkFormat       fmt;
++    VkImageAspectFlags aspect;   /* aspects barriers must name (depth/stencil imports) */
+     uint32_t       w, h;
+     VkDeviceSize   allocationSize;
+     int            external;
+@@ -198,6 +199,8 @@
+ static FfxErrorCode restoreExternalImages(FfxFsr4VkContext* c,
+                                           VkCommandBuffer cmd);
+ 
++static VkImageAspectFlags aspectForFormat(VkFormat fmt);
++
+ static VkDescriptorType expectedDescriptorType(uint32_t passIdx, uint32_t binding)
+ {
+     if (passIdx >= FFX_FSR4_VK_PASS_COUNT) return VK_DESCRIPTOR_TYPE_MAX_ENUM;
+@@ -952,6 +955,7 @@
+                             &r->allocationSize);
+         if (vr) return FFX_ERROR_BACKEND_API_ERROR;
+         r->kind=RES_IMAGE; r->fmt=fmt; r->w=desc->width; r->h=desc->height>0?desc->height:1;
++        r->aspect=aspectForFormat(fmt);
+         r->needsInit=1;  /* needs UNDEFINED→GENERAL transition before first use */
+     } else {
+         if (desc->type != FFX_RESOURCE_TYPE_BUFFER)
+@@ -1049,6 +1053,11 @@
+         r->restoreLayout = state->restoreLayout;
+         r->restoreStageMask = state->restoreStageMask;
+         r->restoreAccessMask = state->restoreAccessMask;
++        /* The FfxSurfaceFormat carried by the ABI has no depth/stencil members,
++         * so an imported depth image is described as R32_FLOAT and its real
++         * aspects come from the state record instead. */
++        r->aspect = state->aspectMask ? state->aspectMask
++                                      : aspectForFormat(fmt);
+         r->externalStateKnown = 1;
+     } else if (in->description.type == FFX_RESOURCE_TYPE_BUFFER) {
+         if (!in->description.size) return FFX_ERROR_INVALID_SIZE;
+@@ -1268,7 +1277,28 @@
+ 
+ // ── image layout barrier ──────────────────────────────────────────────────────
+ 
+-static void imgBarrier(VkCommandBuffer cmd, VkImage img,
++/* Depth/stencil imports must be transitioned on their own aspects: naming
++ * VK_IMAGE_ASPECT_COLOR_BIT for a D32_SFLOAT[_S8_UINT] image is invalid and
++ * leaves the real aspects in their old layout. */
++static VkImageAspectFlags aspectForFormat(VkFormat fmt)
++{
++    switch (fmt) {
++    case VK_FORMAT_D16_UNORM:
++    case VK_FORMAT_D32_SFLOAT:
++    case VK_FORMAT_X8_D24_UNORM_PACK32:
++        return VK_IMAGE_ASPECT_DEPTH_BIT;
++    case VK_FORMAT_S8_UINT:
++        return VK_IMAGE_ASPECT_STENCIL_BIT;
++    case VK_FORMAT_D16_UNORM_S8_UINT:
++    case VK_FORMAT_D24_UNORM_S8_UINT:
++    case VK_FORMAT_D32_SFLOAT_S8_UINT:
++        return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
++    default:
++        return VK_IMAGE_ASPECT_COLOR_BIT;
++    }
++}
++
++static void imgBarrier(VkCommandBuffer cmd, VkImage img, VkImageAspectFlags aspect,
+     VkImageLayout from, VkImageLayout to,
+     VkAccessFlags sa, VkAccessFlags da,
+     VkPipelineStageFlags ss, VkPipelineStageFlags ds)
+@@ -1280,7 +1310,8 @@
+     b.oldLayout=from; b.newLayout=to;
+     b.srcQueueFamilyIndex=b.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+     b.image=img;
+-    b.subresourceRange=(VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
++    b.subresourceRange=(VkImageSubresourceRange){
++        aspect ? aspect : VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+     vkCmdPipelineBarrier(cmd,ss,ds,0,0,NULL,0,NULL,1,&b);
+ }
+ 
+@@ -1296,7 +1327,7 @@
+             ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT : r->stageMask;
+         VkAccessFlags srcAccess = r->layout == VK_IMAGE_LAYOUT_UNDEFINED
+             ? 0u : r->accessMask;
+-        imgBarrier(cmd, r->img, r->layout, VK_IMAGE_LAYOUT_GENERAL,
++        imgBarrier(cmd, r->img, r->aspect, r->layout, VK_IMAGE_LAYOUT_GENERAL,
+             srcAccess, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+             srcStage, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+         r->layout = VK_IMAGE_LAYOUT_GENERAL;
+@@ -1315,7 +1346,7 @@
+         if (!r->external || r->kind != RES_IMAGE || !r->img ||
+             !r->externalStateKnown || !r->externalTouched)
+             continue;
+-        imgBarrier(cmd, r->img, r->layout, r->restoreLayout,
++        imgBarrier(cmd, r->img, r->aspect, r->layout, r->restoreLayout,
+             r->accessMask, r->restoreAccessMask,
+             r->stageMask, r->restoreStageMask);
+         r->layout = r->restoreLayout;
+@@ -1565,7 +1596,7 @@
+         int init_count = 0;
+         for (uint32_t i = 0; i < c->resCount; i++) {
+             if (c->res[i].kind == RES_IMAGE && c->res[i].needsInit && c->res[i].img) {
+-                imgBarrier(cmd, c->res[i].img,
++                imgBarrier(cmd, c->res[i].img, c->res[i].aspect,
+                     VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                     0, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+@@ -1600,7 +1631,7 @@
+                     if (!r->buf) EXECUTE_FAIL(FFX_ERROR_INVALID_ARGUMENT);
+                     vkCmdFillBuffer(cmd,r->buf,0,VK_WHOLE_SIZE,0);
+                 } else if (r->kind==RES_IMAGE && r->img) {
+-                    imgBarrier(cmd,r->img,
++                    imgBarrier(cmd,r->img,r->aspect,
+                         VK_IMAGE_LAYOUT_GENERAL,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                         VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT,
+                         VK_ACCESS_TRANSFER_WRITE_BIT,
+@@ -1613,9 +1644,10 @@
+                     VkClearColorValue cv;
+                     memcpy(cv.float32, job->clearJobDescriptor.color,
+                            sizeof(cv.float32));
+-                    VkImageSubresourceRange sr={VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
++                    VkImageSubresourceRange sr={
++                        r->aspect ? r->aspect : VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1};
+                     vkCmdClearColorImage(cmd,r->img,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,&cv,1,&sr);
+-                    imgBarrier(cmd,r->img,
++                    imgBarrier(cmd,r->img,r->aspect,
+                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_GENERAL,
+                         VK_ACCESS_TRANSFER_WRITE_BIT,VK_ACCESS_SHADER_READ_BIT|VK_ACCESS_SHADER_WRITE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);

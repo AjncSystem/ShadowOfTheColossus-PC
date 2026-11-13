@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Builds dist/SotC-PC-<version>-linux-x86_64.AppImage from the current Linux build.
 #   bash packaging/linux/build_ffmpeg.sh   (once: minimal FFmpeg, see that script)
+#   bash tools/fetch_fsr4_assets.sh  (once: native FSR4 source-v07 assets)
 #   ./build.sh
 #   bash packaging/linux/build_appimage.sh
 # The AppImage carries the loader, the GPU library, the preparation scripts, the launcher with
@@ -18,6 +19,24 @@ command -v patchelf >/dev/null || { echo 'Need patchelf (dnf/apt install patchel
 python3 -c 'import tkinter, PIL.ImageTk' 2>/dev/null ||
     { echo 'Need python3 with Tk and Pillow for the launcher (apt install python3-tk python3-pil python3-pil.imagetk,' \
            'dnf install python3-tkinter python3-pillow-tk).' >&2; exit 1; }
+# Native FSR4 needs the complete source-v07 shader/model bundle beside bin/.
+# Check every preset: game-chosen Pro sizes can select one hidden by the Linux launcher.
+assets=(LICENSE-FSR4-v07.txt rcas.spv spd_auto_exposure.spv)
+for model in native quality balanced performance ultraperf drs; do
+    assets+=("fsr4_model_v07_i8_${model}_initializers.bin"
+             "fsr4_model_v07_i8_${model}_pre_weights.bin"
+             "fsr4_model_v07_i8_${model}_shader_manifest.json")
+    for tier in 1080 2160; do
+        assets+=("fsr4_model_v07_i8_${model}_${tier}_pre.spv"
+                 "fsr4_model_v07_i8_${model}_${tier}_post.spv")
+        for pass in {1..12}; do assets+=("fsr4_model_v07_i8_${model}_${tier}_pass${pass}.spv"); done
+    done
+done
+for asset in "${assets[@]}"; do
+    [[ -s fsr4_shaders/$asset ]] || {
+        echo "Missing FSR4 asset: $asset. Run: bash tools/fetch_fsr4_assets.sh" >&2; exit 1;
+    }
+done
 version=$(sed -n 's/^## \([0-9][0-9.]*\).*/\1/p' CHANGELOG.md | head -1)
 output=dist/SotC-PC-${version:-dev}-linux-x86_64.AppImage
 
@@ -28,7 +47,7 @@ app=$appdir/usr/share/sotc-pc
 mkdir -p "$app/bin/gpu" "$app/lib"
 install -m755 packaging/linux/AppRun "$appdir/AppRun"
 install -m644 sotc.py LICENSE CHANGELOG.md "$app/"
-cp -r scripts "$app/"
+cp -r scripts fsr4_shaders "$app/"
 find "$app/scripts" -name __pycache__ -prune -exec rm -rf {} +
 mkdir -p "$app/launcher"
 install -m644 launcher/sotc_*.py launcher/sotc.png launcher/window_icon.png "$app/launcher/"

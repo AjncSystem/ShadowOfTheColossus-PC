@@ -28,7 +28,9 @@ static float UpscalerMipBias() {
         if ((!r || !*r) && !(neo && neo[0] == '1')) { // PS4 Pro: its own sizes
             r = "1920x1080";
         }
-        if (!Vulkan::Dlssg::SuperResolutionAvailable() || !o ||
+        // PS4 Pro leaves SOTC_RENDER_RES unset (the launcher only sets it in PS4 mode), so r is
+        // null here and the bias stays 0 rather than being derived from an assumed 1080p render.
+        if (!Vulkan::Dlssg::SuperResolutionAvailable() || !r || !o ||
             std::sscanf(r, "%ux%u", &rw, &rh) != 2 || std::sscanf(o, "%ux%u", &ow, &oh) != 2 ||
             rh == 0 || oh <= rh) {
             return 0.0f;

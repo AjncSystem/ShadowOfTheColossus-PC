@@ -45,6 +45,10 @@ public:
         return physical_device;
     }
 
+    bool IsComputeDerivativeGroupLinearEnabled() const {
+        return compute_derivative_group_linear;
+    }
+
     /// Returns the Vulkan device
     vk::Device GetDevice() const {
         return *device;
@@ -606,6 +610,7 @@ private:
     vk::PhysicalDeviceVulkan12Properties vk12_props;
     vk::PhysicalDeviceVulkan13Properties vk13_props;
     vk::PhysicalDevicePushDescriptorPropertiesKHR push_descriptor_props;
+    bool compute_derivative_group_linear{};
     vk::PhysicalDeviceFeatures features;
     vk::PhysicalDeviceVulkan12Features vk12_features;
     vk::PhysicalDeviceVulkan13Features vk13_features;

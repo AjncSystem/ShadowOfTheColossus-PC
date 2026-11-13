@@ -362,6 +362,23 @@ bool Instance::CreateDevice() {
     ASSERT_MSG(robustness2_features.nullDescriptor,
                "Required Vulkan feature unavailable: nullDescriptor");
 
+    // source-v07 pre/post passes declare SPV_KHR_compute_shader_derivatives.
+    // A physical-device feature query is not enough: the logical device must enable it.
+#ifndef _WIN32
+    vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR fsr4_derivatives{};
+    if (std::ranges::find(available_extensions, VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME)
+        != available_extensions.end()) {
+        const auto chain = physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
+            vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>();
+        if (chain.get<vk::PhysicalDeviceComputeShaderDerivativesFeaturesKHR>()
+                .computeDerivativeGroupLinear &&
+            add_extension(VK_KHR_COMPUTE_SHADER_DERIVATIVES_EXTENSION_NAME)) {
+            fsr4_derivatives.computeDerivativeGroupLinear = vk::True;
+            compute_derivative_group_linear = true;
+        }
+    }
+#endif
+
     // Optional
     maintenance_5 = add_extension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
     maintenance_8 = add_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
@@ -603,6 +620,9 @@ bool Instance::CreateDevice() {
             .subgroupSizeControl = vk13_features.subgroupSizeControl,
             .synchronization2 = vk13_features.synchronization2,
             .dynamicRendering = vk13_features.dynamicRendering,
+            // sotc: the FSR 4 INT8 model passes are OpSDot/OpUDot; without this the pipelines
+            // are invalid even though shaderInt8 and 8-bit storage are on.
+            .shaderIntegerDotProduct = vk13_features.shaderIntegerDotProduct,
             .maintenance4 = vk13_features.maintenance4,
         },
         // Extensions
@@ -741,6 +761,14 @@ bool Instance::CreateDevice() {
         fault_features.pNext = features2.pNext;
         features2.pNext = &fault_features;
     }
+
+#ifndef _WIN32
+    if (compute_derivative_group_linear) {
+        auto& features2 = device_chain.get<vk::PhysicalDeviceFeatures2>();
+        fsr4_derivatives.pNext = features2.pNext;
+        features2.pNext = &fsr4_derivatives;
+    }
+#endif
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {

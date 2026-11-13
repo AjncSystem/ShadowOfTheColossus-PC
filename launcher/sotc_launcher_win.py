@@ -385,13 +385,12 @@ OUTPUTS = [('1280x720', ('1280 × 720 (16:9, 720p)', '1280 × 720 (16:9, 720p)')
     (size, (f"{size.replace('x', ' × ')} ({label})",) * 2) for size, label in SCREENS]
 UPSCALERS = [('fsr1', ('FSR 1 (AMD, qualquer placa)', 'FSR 1 (AMD, any GPU)')),
              ('dlss', ('NVIDIA DLSS (experimental)', 'NVIDIA DLSS (experimental)')),
-             # AMD FSR SDK 2.4 (bb-probe: SOTC_UPSCALER=fsr4, vk_fsr4.cpp): FSR 4.1 on Radeon RX
-             # 6000/7000/9000, FSR 3.1 on the other cards; render sizes as DLSS's.
+             # Native source-v07 on Linux; the AMD SDK DLL loader on Windows.
              ('fsr4', ('AMD FSR 4.1 (RX 6000+; FSR 3.1 nas outras, experimental)',
-                       'AMD FSR 4.1 (RX 6000+; FSR 3.1 on others, experimental)')),
+                       'AMD FSR 4.1 (RX 6000+; FSR 3.1 on others, experimental)')
+              if os.name == 'nt' else
+              ('AMD FSR 4 (Vulkan nativo, experimental)', 'AMD FSR 4 (native Vulkan, experimental)')),
              ('bilinear', ('Bilinear (simples)', 'Bilinear (plain)'))]
-if not IS_WINDOWS:  # AMD's SDK ships as Windows DLLs only (vk_fsr4.cpp)
-    UPSCALERS = [upscaler for upscaler in UPSCALERS if upscaler[0] != 'fsr4']
 # Button icons in the game: the PlayStation prompts, or Xbox ones drawn for the port
 # (tools/make_button_icons.py, glyphs/xbox) put in place of the game's textures.
 BUTTON_ICONS = [('ps', ('PlayStation (do jogo)', 'PlayStation (the game\'s)')),
@@ -425,6 +424,54 @@ DLSS_MODES = [('dlaa', ('DLAA (nativo)', 'DLAA (native)')),
               ('performance', ('Desempenho (2×)', 'Performance (2×)')),
               ('ultra', ('Ultra Desempenho (3×)', 'Ultra Performance (3×)'))]
 DLSS_FACTORS = {'dlaa': 1.0, 'quality': 1.5, 'balanced': 1.724, 'performance': 2.0, 'ultra': 3.0}
+# Balanced/Ultra labels often select a different network after render-size rounding.
+# Reuse the saved DLAA key for FSR's 1:1 mode, with its own Native AA label.
+FSR4_MODES = [item for item in DLSS_MODES if item[0] in ('quality', 'performance')] + [
+    ('dlaa', ('AA nativo (1×, sem ampliação)', 'Native AA (1×, no upscaling)'))]
+
+
+def upscaler_modes(upscaler):
+    return FSR4_MODES if upscaler == 'fsr4' and not IS_WINDOWS else DLSS_MODES
+
+
+def upscaler_mode(upscaler, mode):
+    return mode if mode in dict(upscaler_modes(upscaler)) else 'quality'
+
+
+def fsr4_model(render, output):
+    """The native v07 provider's ratio thresholds (ffx_vk_fsr4_v07_schedule.c)."""
+    rw = int(render.split('x')[0])
+    ow = int(output.split('x')[0])
+    for threshold, name in ((2.99, 'ultraperf'), (1.99, 'performance'),
+                            (1.69, 'balanced'), (1.50, 'quality')):
+        if ow / rw >= threshold:
+            return name
+    return 'native'
+
+
+def upscale_preview(settings):
+    """Show what the selected size and mode actually request, including Pro overrides."""
+    output = settings.get('output_res') or '1920x1080'
+    upscaler = settings.get('upscaler')
+    if upscaler not in ('dlss', 'fsr4'):
+        return _('Escolha DLSS ou FSR 4 para ajustar o tamanho renderizado.',
+                 'Choose DLSS or FSR 4 to adjust the render size.')
+    if settings.get('neo') and not is_wide(output):
+        return _('PS4 Pro: o jogo escolhe o tamanho renderizado; preset ignorado.',
+                 'PS4 Pro: the game chooses the render size; preset ignored.')
+    mode = upscaler_mode(upscaler, settings.get('dlss_mode'))
+    render = dlss_render(output, mode)
+    text = f'{render} → {output}'
+    if upscaler == 'fsr4' and os.name != 'nt':
+        model = fsr4_model(render, output)
+        text += _(' · modelo FSR 4: ', ' · FSR 4 model: ') + model
+        if model == 'native' and mode == 'dlaa':
+            text += _('\nAA temporal na resolução nativa; sem ampliação.',
+                      '\nTemporal AA at native resolution; no upscaling.')
+        elif model == 'native':
+            text += _('\nRazão abaixo de 1,5×: usa a rede nativa. Experimente Desempenho.',
+                      '\nRatio below 1.5×: uses the native network. Try Performance.')
+    return text
 # RCAS after DLSS (SOTC_DLSS_SHARPEN, attenuation in stops: 0 = sharpest).
 DLSS_SHARPNESS = [('0', ('Alta (padrão)', 'High (default)')), ('0.5', ('Média', 'Medium')), ('1', ('Baixa', 'Low')),
                   ('off', ('Desligada', 'Off'))]
@@ -743,9 +790,9 @@ def ini_settings():
         name, sep, value = line.partition('=')
         if sep and not line.lstrip().startswith('#'):
             ini[name.strip()] = value.strip()
-    # Only key bindings (which the launcher itself writes there): nothing chosen by hand.
+    # Key bindings alone do not choose any game settings.
     if not any(name in ini for name, _key in (*INI_PATHS, *INI_SWITCHES)) and 'SOTC_MODES' not in ini \
-            and 'SOTC_FPS_CAP' not in ini:
+            and 'SOTC_FPS_CAP' not in ini and 'SOTC_UPSCALER' not in ini:
         return {}
     settings = {key: ini[name] for name, key in INI_PATHS if ini.get(name)}
     settings.update({key: ini[name] == '1' for name, key in INI_SWITCHES if name in ini})
@@ -758,6 +805,13 @@ def ini_settings():
     else:  # no frame rate line: sotc.py's 30 FPS cap, the launcher's default too
         pass
     settings['textures'] = 'high' if ini.get('SOTC_LOD_LINGER') == '1' else 'off'
+    for key, name in (('upscaler', 'SOTC_UPSCALER'), ('output_res', 'SOTC_OUTPUT_RES'),
+                      ('framegen', 'SOTC_FRAMEGEN')):
+        if ini.get(name):
+            settings[key] = ini[name]
+    if (settings.get('upscaler') == 'fsr4' and ini.get('SOTC_OUTPUT_RES')
+            and ini.get('SOTC_RENDER_RES') == ini['SOTC_OUTPUT_RES']):
+        settings['dlss_mode'] = 'dlaa'
     if game_info(settings.get('game_dir')):
         settings['setup_done'] = True
     return settings
@@ -803,6 +857,7 @@ def load_settings():
         if 'SOTC_DLSSG=1' in extra:
             settings['framegen'] = 'auto'
             settings['extra_env'] = ' '.join(item for item in extra if item != 'SOTC_DLSSG=1')
+    settings['dlss_mode'] = upscaler_mode(settings['upscaler'], settings['dlss_mode'])
     return settings
 
 
@@ -1067,8 +1122,11 @@ def game_environment(s):
     # its own sizes.
     output = env['SOTC_OUTPUT_RES']
     upscaler = s.get('upscaler', 'fsr1')
+    # Explicitly override stale sotc.ini entries, including Pro's game-selected size.
+    env['SOTC_UPSCALER'] = upscaler
+    env['SOTC_RENDER_RES'] = ''
     if upscaler in ('dlss', 'fsr4') and env['SOTC_NEO'] == '0':
-        env['SOTC_RENDER_RES'] = dlss_render(output, s.get('dlss_mode'))
+        env['SOTC_RENDER_RES'] = dlss_render(output, upscaler_mode(upscaler, s.get('dlss_mode')))
     elif output not in ('1280x720', '1920x1080') and env['SOTC_NEO'] == '0':
         env['SOTC_RENDER_RES'] = output
     # DLSS: FSR 1 stays the upscaler of frames without the game's scene (menus) and the fallback
@@ -1293,8 +1351,40 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         show()
         box.bind('<<ComboboxSelected>>', lambda _e: var.set(values[box.current()]))
         var.trace_add('write', show)
+        def set_options(options):
+            values[:] = [value for value, _text in options]
+            box.configure(values=[_(*text) for _value, text in options])
+            if var.get() not in values:
+                var.set(values[0])
+            show()
+        box.sotc_options = set_options
         box.sotc_key = key  # the search's words for the setting (row)
         return box
+
+    def upscale_mode_choice(self, parent, width=38):
+        box = self.choice(parent, 'dlss_mode', upscaler_modes(self.var('upscaler').get()), width)
+
+        def refresh(*_args):
+            upscaler = self.var('upscaler').get()
+            box.sotc_options(upscaler_modes(upscaler))
+            pro = self.var('neo').get() and not is_wide(self.var('output_res').get())
+            box.configure(state='readonly' if upscaler in ('dlss', 'fsr4') and not pro else 'disabled')
+        for key in ('upscaler', 'neo', 'output_res'):
+            self.var(key).trace_add('write', refresh)
+        refresh()
+        return box
+
+    def upscale_size_note(self, parent, width=560):
+        note = self.ttk.Label(parent, style='Muted.TLabel', wraplength=self.px(width), justify='left')
+        note.grid(row=self.next_row(parent), column=0, columnspan=2, sticky='w', pady=(3, 5))
+
+        def refresh(*_args):
+            note.configure(text=upscale_preview({key: self.var(key).get() for key in
+                           ('upscaler', 'output_res', 'dlss_mode', 'neo', 'fps_mode')}))
+        for key in ('upscaler', 'output_res', 'dlss_mode', 'neo', 'fps_mode'):
+            self.var(key).trace_add('write', refresh)
+        refresh()
+        return note
 
     def next_row(self, parent):
         return parent.grid_size()[1]
@@ -1945,13 +2035,17 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                        'With the DLSS upscaler (RTX cards) or AMD FSR 4.1: the game renders smaller and the upscaler '
                        'enlarges it with detail rebuilt from earlier frames. FSR 4.1 (machine learning) runs on '
                        'Radeon RX 6000, 7000 and 9000; on other cards the same item uses FSR 3.1. Without the card '
-                       'or the files, FSR 1 enlarges the same smaller image. The settings below apply to both.'),
+                       'or the files, FSR 1 enlarges the same smaller image. The settings below apply to both.')
+                  if os.name == 'nt' else
+                  _('FSR 4 usa Vulkan nativo. AA nativo mantém a resolução de saída e aplica AA temporal; '
+                    'Qualidade e Desempenho renderizam menor. Desligue PS4 Pro para escolher o preset. '
+                    'A geração de quadros FSR 3 é uma opção separada.',
+                    'FSR 4 uses native Vulkan. Native AA keeps the output resolution and applies temporal AA; '
+                    'Quality and Performance render smaller. Turn off PS4 Pro to choose the preset. '
+                    'FSR 3 frame generation is a separate option.'),
                   top=2)
-        self.row(f, _('Modo', 'Mode'), self.choice(f, 'dlss_mode', DLSS_MODES),
-                 _('Fator entre a saída e o tamanho renderizado. DLAA: tamanho nativo com o anti-aliasing do '
-                   'DLSS (mais pesado, usa mais memória de vídeo; sem memória bastante, volta ao FSR 1).',
-                   'Factor between the output and the render size. DLAA: native size with DLSS anti-aliasing '
-                   '(heavier, uses more video memory; without enough of it, back to FSR 1).'))
+        self.row(f, _('Preset', 'Preset'), self.upscale_mode_choice(f))
+        self.graphics_upscale_note = self.upscale_size_note(f)
         self.row(f, _('Nitidez da cena', 'Scene sharpening'), self.choice(f, 'dlss_sharpen', DLSS_SHARPNESS))
         self.row(f, _('Nitidez do texto', 'Text sharpening'), self.choice(f, 'dlss_ui_sharpen', DLSS_UI_SHARPNESS))
         self.row(f, _('Nitidez do céu', 'Sky sharpening'), self.choice(f, 'dlss_sky_sharpen', DLSS_SKY_SHARPNESS))

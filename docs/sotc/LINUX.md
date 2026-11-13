@@ -38,6 +38,14 @@ Without a display (terminal, SSH) or with `--setup`, only this file applies.
 | `BB_PRESENT_MODE` | `Mailbox` (padrão / default), `Fifo` (VSync), `Immediate` |
 | `SOTC_FPS` | `1`: FPS no registro a cada 5 s / FPS in the log every 5 s |
 
+## FSR4 nativo / Native FSR4
+
+FSR4 no Linux usa o provider Vulkan source-v07, não as DLLs FSR4.1 do Windows /
+Linux FSR4 uses the source-v07 Vulkan provider, not the Windows FSR4.1 DLLs.
+No launcher, desligue PS4 Pro e escolha Qualidade, Desempenho ou AA nativo /
+In the launcher, turn PS4 Pro off and choose Quality, Performance or Native AA.
+[Build, assets, limitations and settings](FSR4_LINUX.md).
+
 ## Efeitos do motor / Engine effects (`SOTC_CVARS`)
 
 Cvars separadas por espaço / space-separated. Definir `SOTC_CVARS` substitui o padrão; mantenha

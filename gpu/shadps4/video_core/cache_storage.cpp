@@ -47,6 +47,7 @@ std::string ShaderTestTag() {
     static constexpr const char* switches[] = {
         "SOTC_NAN_GUARD", "SOTC_AMD_AS_NV", "SOTC_MANUAL_INTERP", "SOTC_NO_EXPLICIT_VERTEX",
         "SOTC_NO_RTZ", "SOTC_CLIP_EMU", "SOTC_WAVE64_UNIFORM", "SOTC_WAVE64_IDENTITY",
+        "SOTC_WAVE64_ABSENT_LANES",
         "SOTC_LDS_BARRIERS", "SOTC_LDS_SMALL", "SOTC_AMD64_LDS", "SHADPS4_IEEE_MINMAX", "SOTC_WQM_COPY"};
     u64 hash = 1469598103934665603ULL;
     bool any = false;
@@ -154,7 +155,8 @@ void DataBase::Open() {
         // do not tell them apart: the launcher's DMA switch gets its own cache folder. The same
         // for SOTC_NEO: a cache filled in PS4 Pro mode gave a black picture in the normal mode.
         cache_path = GetUserPath(PathType::CacheDir) /
-                     (std::string{game_info.GameSerial()} +
+                     // Meta 23 owns resource layouts per variant; never preload old poisoned pairs.
+                     (std::string{game_info.GameSerial()} + "_meta23" +
                       (EmulatorSettings.IsDirectMemoryAccessEnabled() ? "" : "_nodma") +
                       (EmulatorSettings.IsNoInt64() ? "_noi64" : "") +
                       (Libraries::Kernel::sceKernelIsNeoMode() ? "_neo" : "") + ShaderTestTag());

@@ -850,41 +850,6 @@ void PipelineCache::RunAsyncTranslate(AsyncPipelineJob::Translate& t) {
         std::memory_order_relaxed);
 }
 
-// sotc: the pipeline layout and the descriptor writes of every permutation come from the
-// program's first Info. A permutation whose module declares other resources is reported
-// (SOTC PERMUTATION lines): its pipeline is created against a layout that does not match it
-// (VUID-VkGraphicsPipelineCreateInfo-layout-07988/07990).
-static bool SameResourceShape(const Shader::Info& first, const Shader::Info& now, u64 hash,
-                              size_t perm_idx) {
-    bool same = first.buffers.size() == now.buffers.size() &&
-                first.images.size() == now.images.size() &&
-                first.samplers.size() == now.samplers.size() && first.fmasks.size() == now.fmasks.size();
-    for (size_t i = 0; same && i < now.images.size(); ++i) {
-        same = first.images[i].is_written == now.images[i].is_written &&
-               first.images[i].array_size == now.images[i].array_size;
-    }
-    if (!same) {
-        std::fprintf(stderr,
-                     "SOTC PERMUTATION %#llx #%zu declares other resources than the first: buffers "
-                     "%zu/%zu images %zu/%zu samplers %zu/%zu fmasks %zu/%zu\n",
-                     static_cast<unsigned long long>(hash), perm_idx, now.buffers.size(),
-                     first.buffers.size(), now.images.size(), first.images.size(),
-                     now.samplers.size(), first.samplers.size(), now.fmasks.size(),
-                     first.fmasks.size());
-        std::string line;
-        for (const auto* i : {&now, &first}) {
-            line += " |";
-            for (const auto& b : i->buffers) {
-                line += fmt::format(" {}", u32(b.buffer_type));
-            }
-            line += fmt::format(" lod {} dma {}", i->uses_lod_feedback, i->uses_dma);
-        }
-        std::fputs(("SOTC PERMUTATION buffer types" + line + "!").c_str(), stderr);
-        std::fputc(10, stderr);
-    }
-    return same;
-}
-
 void PipelineCache::TranslateOnWorker(AsyncPipelineJob::Translate& t,
                                       const Shader::ShaderParams& params,
                                       Shader::Backend::Bindings& binding,
@@ -896,15 +861,16 @@ void PipelineCache::TranslateOnWorker(AsyncPipelineJob::Translate& t,
                                  &worker_pools, &t.spv);
         t.spec.emplace(t.new_program->info, runtime_info, profile, t.start);
     } else {
-        auto new_info = Shader::Info(t.hw_stage, t.sw_stage, params);
-        t.module = CompileModule(new_info, runtime_info, params.code, t.perm_idx, binding,
+        t.info = std::make_unique<Shader::Info>(t.hw_stage, t.sw_stage, params);
+        t.module = CompileModule(*t.info, runtime_info, params.code, t.perm_idx, binding,
                                  &worker_pools, &t.spv);
         // The command processor made spec from the tables of its draw; the module was made from
         // what the tables hold now. Different: installing it under spec would bind wrong code.
-        const Shader::StageSpecialization worker_spec{new_info, t.runtime_info, profile,
-                                                      t.start};
+        Shader::StageSpecialization worker_spec{*t.info, t.runtime_info, profile, t.start};
         t.stale = !(worker_spec == *t.spec);
-        SameResourceShape(t.program->info, new_info, params.hash, t.perm_idx);
+        if (!t.stale) {
+            t.spec = std::move(worker_spec);
+        }
     }
 }
 
@@ -950,9 +916,11 @@ void PipelineCache::InstallTranslation(AsyncPipelineJob::Translate& t) {
     }
     const size_t perm_idx = program.modules.size();
     RegisterShaderBinary(std::move(t.spv), t.hash, perm_idx);
-    RegisterShaderMeta(program.info, t.spec->fetch_shader_data, *t.spec,
+    RegisterShaderMeta(*t.info, t.spec->fetch_shader_data, *t.spec,
                        HashCombine(t.hash, perm_idx), perm_idx);
-    program.AddPermut(t.module, std::move(*t.spec));
+    // The queue's user-data registers go away with the job; a lookup supplies its draw's copy.
+    t.info->UserData() = {};
+    program.AddPermut(t.module, std::move(*t.spec), std::move(t.info));
 }
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
@@ -1468,46 +1436,71 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         return std::make_tuple(&program->info, module, perm_hash);
     }
 
-    auto& program = it_pgm.value();
-    auto& info = program->info;
-    info.PgmBase() = params.Base(); // Needs to be actualized for inline cbuffer address fixup
-    info.UserData() = params.user_data;
-    info.RefreshFlatBuf();
-    auto spec = Shader::StageSpecialization(info, rt, profile, binding);
+    auto& program = *it_pgm.value();
+    const auto refresh = [&](Shader::Info& info) {
+        info.PgmBase() = params.Base();
+        info.UserData() = params.user_data;
+        info.RefreshFlatBuf();
+    };
+    const auto lookup = [&](size_t index) -> std::optional<Result> {
+        auto& mod = program.modules[index];
+        if (!mod.module || !mod.spec.Valid()) {
+            return {};
+        }
+        auto& info = program.ModuleInfo(index);
+        refresh(info);
+        const Shader::StageSpecialization spec{info, rt, profile, binding};
+        if (!(mod.spec == spec)) {
+            return {};
+        }
+        info.AddBindings(binding);
+        program.last_module = index;
+        if (!mod.spec.fetch_shader_data.Empty()) {
+            fetch_shader = &mod.spec.fetch_shader_data;
+        }
+        return Result{&info, mod.module, HashCombine(params.hash, index)};
+    };
+    // Most draws use the same variant as the preceding draw of this program.
+    const size_t last = program.last_module;
+    if (last < program.modules.size()) {
+        if (auto found = lookup(last)) {
+            return *found;
+        }
+    }
+    for (size_t index = 0; index < program.modules.size(); ++index) {
+        if (index != last) {
+            if (auto found = lookup(index)) {
+                return *found;
+            }
+        }
+    }
 
-    size_t perm_idx = program->modules.size();
-    u64 perm_hash = HashCombine(params.hash, perm_idx);
-
-    vk::ShaderModule module{};
-
-    const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
-    if (it == program->modules.end() && async_ok && !program->translate_in_place) {
-        if (std::ranges::find(program->pending_specs, spec) == program->pending_specs.end()) {
-            QueueAsyncTranslate(hw_stage, sw_stage, params, rt, binding, program.get(), &spec,
-                                perm_idx);
-            program->pending_specs.push_back(spec);
+    const size_t perm_idx = program.modules.size();
+    const u64 perm_hash = HashCombine(params.hash, perm_idx);
+    if (async_ok && !program.translate_in_place) {
+        refresh(program.info);
+        auto spec = Shader::StageSpecialization(program.info, rt, profile, binding);
+        if (std::ranges::find(program.pending_specs, spec) == program.pending_specs.end()) {
+            QueueAsyncTranslate(hw_stage, sw_stage, params, rt, binding, &program, &spec, perm_idx);
+            program.pending_specs.push_back(spec);
         }
         translation_pending = true;
         return {nullptr, vk::ShaderModule{}, 0};
     }
-    if (it == program->modules.end()) {
-        auto new_info = Shader::Info(hw_stage, sw_stage, params);
-        auto runtime_info = rt;
-        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
-        SameResourceShape(info, new_info, params.hash, perm_idx);
-
-        RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
-        program->AddPermut(module, std::move(spec));
-    } else {
-        info.AddBindings(binding);
-        module = it->module;
-        perm_idx = std::distance(program->modules.begin(), it);
-        perm_hash = HashCombine(params.hash, perm_idx);
+    // Resource discovery can differ between variants (e.g. an FMask T# becomes a constant).
+    // Keep the Info that generated this module for its layout, bindings and saved metadata.
+    auto info = std::make_unique<Shader::Info>(hw_stage, sw_stage, params);
+    const auto start = binding;
+    auto runtime_info = rt;
+    const auto module = CompileModule(*info, runtime_info, params.code, perm_idx, binding);
+    auto spec = Shader::StageSpecialization(*info, runtime_info, profile, start);
+    RegisterShaderMeta(*info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
+    program.AddPermut(module, std::move(spec), std::move(info));
+    auto& mod = program.modules.back();
+    if (!mod.spec.fetch_shader_data.Empty()) {
+        fetch_shader = &mod.spec.fetch_shader_data;
     }
-    if (auto& fetch = program->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
-        fetch_shader = &fetch;
-    }
-    return std::make_tuple(&program->info, module, perm_hash);
+    return Result{&program.ModuleInfo(perm_idx), module, perm_hash};
 }
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,

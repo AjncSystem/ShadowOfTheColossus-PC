@@ -209,12 +209,52 @@ __asm__(".text\n.globl enter_on_stack\nenter_on_stack:\n"
         " mov %rbp,%rsp\n pop %rbp\n ret\n");
 #endif
 static ABI void guest_exit(void) { puts("Runtime: process finalizer callback reached"); }
+/* T38 (runtime_memory.c): the aliases of a physical page and the page pool release's call site. */
+uintptr_t runtime_memory_alias_of(uintptr_t address);
+int runtime_memory_alias_release(uintptr_t address);
+void runtime_memory_set_release_site(uintptr_t site);
 /* sotc: with the user's own libSceNgs2/libSceUlt linked (link_modules.py --sys-modules) their
  * native code replaces the runtime's silent audio stand-ins. */
 static int prefer_native(const char *name, int bound) {
     if (!bound) return 0;
     const char *symbol=runtime_import_name(name);
     return !strncmp(symbol,"sceNgs2",7) || !strncmp(symbol,"sceUlt",6);
+}
+/* sotc: game objects found cleared (their first qword 0) where the game uses them: crashes
+ * after loading a save and at the ending, always under the frames 0x39a73/0x39ab6 <- 0x38ad2
+ * <- 0x33586. Each case resumes where the game itself goes when the object is absent:
+ *   0x564d24 / 0x564da6  eboot 0x660fc0 gave no component for a list entry (r12 = 0): the next
+ *                        object (0x564d92) or the next entry (0x564d00); the most frequent
+ *                        crash, 4 times since 3 Nov, 30-40 s after loading a save;
+ *   0x144c60 / 0x14934f  destroying an object whose vtable is gone (rax = 0): its slot is
+ *                        cleared without the destructor (0x144c71) / skipped (0x149360); the
+ *                        "Fim" screen of the ending, 9 Nov;
+ *   0x14cce7             a reference released on no object (r14 = 0): return (0x14ced6); the
+ *                        ending, 5 Nov.
+ * Returns the image offset to resume at, 0 for any other fault. SOTC_FIX_NULL_OBJECTS=0 (or
+ * SOTC_FIX_564D24=0) off. */
+static uintptr_t null_object_resume(uintptr_t at, uint64_t rax, uint64_t r12, uint64_t r14) {
+    static int fix=-1;
+    if (fix<0) {
+        const char *v=getenv("SOTC_FIX_NULL_OBJECTS"), *w=getenv("SOTC_FIX_564D24");
+        fix=!((v && v[0]=='0') || (w && w[0]=='0'));
+    }
+    uintptr_t resume;
+    if (!fix) resume=0;
+    else if (r12==0 && at==0x564d24) resume=0x564d92;
+    else if (r12==0 && at==0x564da6) resume=0x564d00;
+    else if (rax==0 && at==0x144c60) resume=0x144c71;
+    else if (rax==0 && at==0x14934f) resume=0x149360;
+    else if (r14==0 && at==0x14cce7) resume=0x14ced6;
+    else resume=0;
+    if (resume) {
+        static long skipped;
+        const long n=__atomic_add_fetch(&skipped,1,__ATOMIC_RELAXED);
+        if (n<=8 || (n & (n-1))==0)
+            fprintf(stderr,"SOTC FIX null object at guest %#llx skipped (resumes at %#llx; %ld so far)\n",
+                    (unsigned long long)at,(unsigned long long)resume,n);
+    }
+    return resume;
 }
 #ifdef _WIN32
 static void describe_address(char *out, size_t size, uintptr_t address) {
@@ -981,9 +1021,6 @@ static int helper_single_step(EXCEPTION_POINTERS *info) {
 #define HEAP_FREE_OFFSET 0x495e0
 const unsigned char *runtime_memory_backing_pointer(uintptr_t address);
 const unsigned char *runtime_memory_backing_view(uint64_t *size);
-uintptr_t runtime_memory_alias_of(uintptr_t address);
-int runtime_memory_alias_release(uintptr_t address);
-void runtime_memory_set_release_site(uintptr_t site);
 #define HEAP_HOOK_CALLS 2000
 static unsigned char heap_hook_original;
 static volatile LONG heap_hook_calls, heap_hook_done;
@@ -1476,41 +1513,11 @@ static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
     if ((code==EXCEPTION_BREAKPOINT || code==EXCEPTION_SINGLE_STEP) && pool_hook_trap(info)) { fault_path=1; return EXCEPTION_CONTINUE_EXECUTION; }
     if ((code==EXCEPTION_BREAKPOINT || code==EXCEPTION_SINGLE_STEP) && release_hook_trap(info)) { fault_path=1; return EXCEPTION_CONTINUE_EXECUTION; }
     if (code==EXCEPTION_SINGLE_STEP && helper_single_step(info)) { fault_path=2; return EXCEPTION_CONTINUE_EXECUTION; }
-    /* sotc: game objects found cleared (their first qword 0) where the game uses them: crashes
-     * after loading a save and at the ending, always under the frames 0x39a73/0x39ab6 <- 0x38ad2
-     * <- 0x33586. Each case resumes where the game itself goes when the object is absent:
-     *   0x564d24 / 0x564da6  eboot 0x660fc0 gave no component for a list entry (r12 = 0): the next
-     *                        object (0x564d92) or the next entry (0x564d00); the most frequent
-     *                        crash, 4 times since 3 Nov, 30-40 s after loading a save;
-     *   0x144c60 / 0x14934f  destroying an object whose vtable is gone (rax = 0): its slot is
-     *                        cleared without the destructor (0x144c71) / skipped (0x149360); the
-     *                        "Fim" screen of the ending, 9 Nov;
-     *   0x14cce7             a reference released on no object (r14 = 0): return (0x14ced6); the
-     *                        ending, 5 Nov.
-     * SOTC_FIX_NULL_OBJECTS=0 (or SOTC_FIX_564D24=0) off. */
     if (code==EXCEPTION_ACCESS_VIOLATION && image) {
-        static int fix=-1;
-        if (fix<0) {
-            const char *v=getenv("SOTC_FIX_NULL_OBJECTS"), *w=getenv("SOTC_FIX_564D24");
-            fix=!((v && v[0]=='0') || (w && w[0]=='0'));
-        }
         CONTEXT *c=info->ContextRecord;
-        const uintptr_t at=(uintptr_t)c->Rip-(uintptr_t)image;
-        uintptr_t resume=0;
-        if (fix) {
-            if (c->R12==0 && at==0x564d24) resume=0x564d92;
-            else if (c->R12==0 && at==0x564da6) resume=0x564d00;
-            else if (c->Rax==0 && at==0x144c60) resume=0x144c71;
-            else if (c->Rax==0 && at==0x14934f) resume=0x149360;
-            else if (c->R14==0 && at==0x14cce7) resume=0x14ced6;
-        }
+        const uintptr_t resume=null_object_resume((uintptr_t)c->Rip-(uintptr_t)image,c->Rax,c->R12,c->R14);
         if (resume) {
             c->Rip=(DWORD64)(uintptr_t)(image+resume);
-            static volatile LONG skipped;
-            const LONG n=InterlockedIncrement(&skipped);
-            if (n<=8 || (n & (n-1))==0)
-                fprintf(stderr,"SOTC FIX null object at guest %#llx skipped (resumes at %#llx; %ld so far)\n",
-                        (unsigned long long)at,(unsigned long long)resume,(long)n);
             fault_path=3;
             return EXCEPTION_CONTINUE_EXECUTION;
         }
@@ -1631,6 +1638,135 @@ static void choose_tsc(void) {
 #endif
 /* sotc: SSE4a and red-zone patches of the eboot (gpu/sotc), described by scripts/sotc_cpu.py. */
 #define SOTC_TRAMPOLINE_SIZE (UINT64_C(16) << 20)
+#ifndef _WIN32
+/* sotc (Linux): counterparts of the Windows exception paths above.
+ * The image below 2 GiB: Shadow of the Colossus packs pointers to its static data into 31 bits.
+ * The range is claimed at the start of main, top down from 2 GiB so the non-PIE loader's brk
+ * heap (growing up from just above 0x400000) keeps its room. */
+#define EBOOT_MIN UINT64_C(0x10000000)
+#define EBOOT_LIMIT UINT64_C(0x80000000)
+#define EBOOT_RESERVATION (UINT64_C(256) << 20)
+static void *eboot_reservation;
+static void reserve_eboot_range(void) {
+    for (uintptr_t at=EBOOT_LIMIT-EBOOT_RESERVATION; at>=EBOOT_MIN; at-=UINT64_C(16)<<20) {
+        void *p=mmap((void *)at,EBOOT_RESERVATION,PROT_NONE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_NORESERVE|MAP_FIXED_NOREPLACE,-1,0);
+        if (p!=MAP_FAILED) { eboot_reservation=p; return; }
+    }
+}
+static void *allocate_image(size_t size) {
+    if (!eboot_reservation) fail("no free 256 MiB range below 2 GiB for the eboot");
+    if (size > EBOOT_RESERVATION) fail("the image does not fit the eboot reservation");
+    if (mprotect(eboot_reservation,size,PROT_READ|PROT_WRITE)) fail("cannot commit the eboot range");
+    printf("Image at %p (below 2 GiB, as the game's 31-bit pointers need)\n",eboot_reservation);
+    return eboot_reservation;
+}
+/* BPE heap guard (see the Windows version): int3 on the heap's free function, single step to
+ * put it back. On Linux int3 reports RIP after the breakpoint byte. */
+#define HEAP_FREE_OFFSET 0x495e0
+#define HEAP_HOOK_CALLS 2000
+#define TRAP_FLAG 0x100
+const unsigned char *runtime_memory_backing_pointer(uintptr_t address);
+static unsigned char heap_hook_original;
+static int heap_hook_calls, heap_hook_done, heap_hook_lock;
+static __thread int heap_hook_rearm;
+static struct { uintptr_t heap; int count; } heap_seen[8];
+static volatile uintptr_t heap_chosen;
+static void heap_hook_write(unsigned char value) {
+    unsigned char *at=image+HEAP_FREE_OFFSET;
+    void *page=(void *)((uintptr_t)at&~(uintptr_t)(page_size-1));
+    while (__atomic_exchange_n(&heap_hook_lock,1,__ATOMIC_ACQUIRE)) __builtin_ia32_pause();
+    if (!mprotect(page,page_size,PROT_READ|PROT_WRITE|PROT_EXEC)) {
+        __atomic_store_n(at,value,__ATOMIC_SEQ_CST);
+        mprotect(page,page_size,PROT_READ|PROT_EXEC);
+    }
+    __atomic_store_n(&heap_hook_lock,0,__ATOMIC_RELEASE);
+}
+static void install_heap_hook(void) {
+    static const unsigned char expected[8]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56};
+    const char *v=getenv("SOTC_HEAP_GUARD");
+    if ((v && v[0]=='0') || memcmp(image+HEAP_FREE_OFFSET,expected,sizeof(expected))) return;
+    heap_hook_original=image[HEAP_FREE_OFFSET];
+    image[HEAP_FREE_OFFSET]=0xCC; /* the image is still writable here */
+}
+static void choose_heap(void) {
+    uintptr_t best=0; int best_count=0;
+    for (int i=0;i<8;++i) {
+        uint64_t size=0;
+        const unsigned char *backing=heap_seen[i].heap ? runtime_memory_backing_pointer(heap_seen[i].heap+0x30) : NULL;
+        if (backing) memcpy(&size,backing,8);
+        else if (heap_seen[i].heap-(uintptr_t)image<0x20000000) memcpy(&size,(const void *)(heap_seen[i].heap+0x30),8);
+        if (heap_seen[i].heap && size>=0x1000000 && size<0x100000000ull && heap_seen[i].count>best_count) {
+            best=heap_seen[i].heap; best_count=heap_seen[i].count;
+        }
+    }
+    heap_chosen=best;
+    fprintf(stderr,"Runtime: BPE heap guard on heap %p (%d of %d frees)\n",(void *)best,best_count,HEAP_HOOK_CALLS);
+}
+uintptr_t runtime_sotc_heap(void) { return heap_chosen; }
+/* The engine's heap table (#146, see the Windows version). */
+#define HEAP_TABLE_OFFSET 0x2dfaab0
+uintptr_t runtime_sotc_heap_table(void) { return heap_chosen ? (uintptr_t)(image+HEAP_TABLE_OFFSET) : 0; }
+static int heap_hook_trap(ucontext_t *uc) {
+    greg_t *g=uc->uc_mcontext.gregs;
+    /* The single step comes first: after the restored push rbp (1 byte) RIP is the hook + 1,
+     * exactly where an int3 would leave it. */
+    if (heap_hook_rearm) {
+        heap_hook_rearm=0;
+        if (!__atomic_load_n(&heap_hook_done,__ATOMIC_ACQUIRE)) heap_hook_write(0xCC);
+        g[REG_EFL]&=~(greg_t)TRAP_FLAG;
+        return 1;
+    }
+    if (image && (uintptr_t)g[REG_RIP]-1==(uintptr_t)(image+HEAP_FREE_OFFSET)) {
+        g[REG_RIP]-=1;
+        if (image[HEAP_FREE_OFFSET]!=0xCC) return 1; /* another thread restored it: just run it */
+        const uintptr_t heap=(uintptr_t)g[REG_RDI];
+        for (int i=0;i<8;++i) {
+            if (__atomic_load_n(&heap_seen[i].heap,__ATOMIC_ACQUIRE)==heap) { __atomic_add_fetch(&heap_seen[i].count,1,__ATOMIC_RELAXED); break; }
+            uintptr_t empty=0;
+            if (__atomic_compare_exchange_n(&heap_seen[i].heap,&empty,heap,0,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) {
+                __atomic_add_fetch(&heap_seen[i].count,1,__ATOMIC_RELAXED); break;
+            }
+        }
+        heap_hook_write(heap_hook_original);
+        if (__atomic_add_fetch(&heap_hook_calls,1,__ATOMIC_ACQ_REL)>=HEAP_HOOK_CALLS) {
+            if (!__atomic_exchange_n(&heap_hook_done,1,__ATOMIC_ACQ_REL)) choose_heap();
+        } else {
+            heap_hook_rearm=1;
+            g[REG_EFL]|=TRAP_FLAG; /* put the breakpoint back after this instruction */
+        }
+        return 1;
+    }
+    return 0;
+}
+/* Helper threads reading a page the tracker read-protected (precise readbacks): the page is
+ * opened for the one faulting instruction, as on Windows, and the tracker's own protection is
+ * put back on the single-step trap (the page manager decides it under its page lock). */
+static __thread uintptr_t step_page;
+static int helper_read_fault(siginfo_t *info, ucontext_t *uc) {
+    if ((uc->uc_mcontext.gregs[REG_ERR]&2) || info->si_code!=SEGV_ACCERR || step_page ||
+        runtime_thread_is_guest() || bbgpu_is_gpu_side_thread() || bbgpu_readbacks_mode()!=2) return 0;
+    const uintptr_t page=(uintptr_t)info->si_addr&~(uintptr_t)4095;
+    if (!bbgpu_page_read_tracked(page) || mprotect((void *)page,4096,PROT_READ)) return 0;
+    step_page=page;
+    uc->uc_mcontext.gregs[REG_EFL]|=TRAP_FLAG;
+    return 1;
+}
+static int helper_single_step(ucontext_t *uc) {
+    if (!step_page) return 0;
+    const uintptr_t page=step_page;
+    step_page=0;
+    if (!bbgpu_page_restore(page)) mprotect((void *)page,4096,PROT_NONE);
+    uc->uc_mcontext.gregs[REG_EFL]&=~(greg_t)TRAP_FLAG;
+    return 1;
+}
+static void trap(int sig, siginfo_t *info, void *context) {
+    (void)sig; (void)info;
+    if (heap_hook_trap(context) || helper_single_step(context)) return;
+    const char line[]="Unexpected SIGTRAP\n";
+    { ssize_t written_=write(2,line,sizeof(line)-1); (void)written_; }
+    _exit(128+SIGTRAP);
+}
+#endif
 static void apply_sotc_cpu_patches(const char *path, const Segment *segments, uint64_t count, uint64_t size) {
     FILE *f=fopen(path,"rb");
     char magic[8];
@@ -1685,8 +1821,19 @@ static void apply_sotc_cmdline(const char *path, uint64_t size) {
     printf("Engine command line: %s\n",text);
 }
 #ifndef _WIN32
+static void dump_frames(ucontext_t *uc);
 static void fault(int sig, siginfo_t *info, void *context) {
+    if (sig == SIGSEGV && image) {
+        greg_t *g = ((ucontext_t *)context)->uc_mcontext.gregs;
+        const uintptr_t resume = null_object_resume((uintptr_t)g[REG_RIP] - (uintptr_t)image,
+                                                    (uint64_t)g[REG_RAX], (uint64_t)g[REG_R12], (uint64_t)g[REG_R14]);
+        if (resume) {
+            g[REG_RIP] = (greg_t)(uintptr_t)(image + resume);
+            return;
+        }
+    }
     /* GPU page tracking (write-protected guest pages) is resolved first. */
+    if (sig == SIGSEGV && gpu_enabled && helper_read_fault(info, context)) return;
     if (gpu_enabled && sig == SIGSEGV) { /* T38: see the Windows handler */
         const uintptr_t at=(uintptr_t)info->si_addr, other=runtime_memory_alias_of(at);
         if (other) {
@@ -1696,6 +1843,8 @@ static void fault(int sig, siginfo_t *info, void *context) {
         }
     }
     if (gpu_enabled && sig == SIGSEGV && bbgpu_handle_fault(context, info->si_addr)) return;
+    /* sotc: an SSE4a site the load-time patchers could not rewrite is interpreted. */
+    if (sig == SIGILL && image && sotc_handle_illegal(context)) return;
     /* A speculative guest memory read (runtime_memory.c) failed: resume its recovery point. */
     if ((sig == SIGSEGV || sig == SIGBUS) && runtime_fault_recover) {
         sigjmp_buf *recover = runtime_fault_recover;
@@ -1720,7 +1869,20 @@ static void fault(int sig, siginfo_t *info, void *context) {
     else
         snprintf(line, sizeof(line), "Fault (signal %d) at RIP %p, address %p\n", sig, (void *)rip, info->si_addr);
     { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
+    const greg_t *r = uc->uc_mcontext.gregs;
+    snprintf(line, sizeof(line),
+             "  rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n  rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n"
+             "  r8=%016llx r9=%016llx r10=%016llx r11=%016llx\n  r12=%016llx r13=%016llx r14=%016llx r15=%016llx\n",
+             (unsigned long long)r[REG_RAX], (unsigned long long)r[REG_RBX], (unsigned long long)r[REG_RCX],
+             (unsigned long long)r[REG_RDX], (unsigned long long)r[REG_RSI], (unsigned long long)r[REG_RDI],
+             (unsigned long long)r[REG_RBP], (unsigned long long)r[REG_RSP], (unsigned long long)r[REG_R8],
+             (unsigned long long)r[REG_R9], (unsigned long long)r[REG_R10], (unsigned long long)r[REG_R11],
+             (unsigned long long)r[REG_R12], (unsigned long long)r[REG_R13], (unsigned long long)r[REG_R14],
+             (unsigned long long)r[REG_R15]);
+    { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
     if (gpu_enabled) bbgpu_dump_guest_writes(context);
+    /* Guest rbp chain (the game keeps frame pointers); the host backtrace below stops at guest frames. */
+    dump_frames(uc);
     /* Host call chain (frames with unwind info; guest frames end it). */
     void *frames[32];
     int depth = backtrace(frames, 32);
@@ -1880,9 +2042,7 @@ void runtime_restart(void) {
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
-#ifdef _WIN32
     reserve_eboot_range();
-#endif
 #ifndef _WIN32
     /* Keep host heap objects handed to the guest (thread handles, TLS) in the
        non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits. */
@@ -1968,9 +2128,14 @@ int main(int argc, char **argv) {
     (void)timeout_seconds; /* no watchdog on Windows */
 #else
     page_size = (size_t)sysconf(_SC_PAGESIZE);
-    struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO;
+    /* sotc: fiber stacks are packed back to back without guard pages; faults run on a
+     * per-thread alternate stack (runtime_thread_signal_stack, also called by guest threads). */
+    runtime_thread_signal_stack();
+    struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO|SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, NULL); sigaction(SIGILL, &sa, NULL); sigaction(SIGBUS, &sa, NULL);
+    struct sigaction trap_action = {0}; trap_action.sa_sigaction = trap; trap_action.sa_flags = SA_SIGINFO|SA_ONSTACK;
+    sigemptyset(&trap_action.sa_mask); sigaction(SIGTRAP, &trap_action, NULL);
     Dl_info self_info;
     if (dladdr((void *)main,&self_info)) exe_base=(uintptr_t)self_info.dli_fbase;
     struct sigaction dump = {0}; dump.sa_sigaction = thread_dump; dump.sa_flags = SA_SIGINFO|SA_RESTART;
@@ -2078,11 +2243,7 @@ int main(int argc, char **argv) {
         }
     }
     /* sotc: the CPU patch trampolines follow the image (rel32 jumps reach them). */
-#ifdef _WIN32
     image = allocate_image(round_page(size) + SOTC_TRAMPOLINE_SIZE);
-#else
-    image = allocate(round_page(size) + SOTC_TRAMPOLINE_SIZE);
-#endif
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
     if (!cpu_only) {
@@ -2168,7 +2329,13 @@ int main(int argc, char **argv) {
 #endif
     if (sotc_cpu) apply_sotc_cpu_patches(sotc_cpu, segments, ns, size);
     if (sotc_cmdline) apply_sotc_cmdline(sotc_cmdline, size);
-    if (sotc_cpu) { install_heap_hook(); install_pool_hook(); install_release_hook(); }
+    if (sotc_cpu) {
+        install_heap_hook();
+#ifdef _WIN32  /* diagnostics (SOTC_POOL_LOCK_CHECK, SOTC_POOL_FREE_TRACE) on the Windows exception path */
+        install_pool_hook();
+        install_release_hook();
+#endif
+    }
     /* T38: the page pool release's VirtualQuery call (runtime_memory.c, SOTC_POOL_OWNER) */
     if (sotc_cpu && image[0x1ac7d]==0xE8) runtime_memory_set_release_site((uintptr_t)(image+0x1ac82));
     { void bb_set_guest_image(uintptr_t base); bb_set_guest_image((uintptr_t)image); }

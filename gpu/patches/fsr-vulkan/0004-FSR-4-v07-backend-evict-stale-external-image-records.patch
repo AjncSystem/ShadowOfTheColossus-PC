@@ -1,0 +1,86 @@
+From: bbport
+Subject: [PATCH] FSR 4 v07 backend: evict stale external image state records
+
+bbport: the external image state table held at most eight records, never
+released one, and answered a ninth registration with VK_ERROR_OUT_OF_POOL_MEMORY
+- which permanently disables the effect in a host that treats registration
+failure as fatal.
+
+A real renderer does not keep one set of inputs for the whole session: it
+ping-pongs depth and motion vectors across a ring of frame slots and recreates
+them on every resize, so the live working set alone exceeds eight, and the
+records of images the host has since destroyed are never reclaimed.
+
+Raise the table to 64 and evict the least recently registered record when it is
+full. A host re-registers every image it is about to dispatch with before each
+frame, so the record that went longest without a registration belongs to an
+image this frame does not use.
+
+The limit is redefined next to the record type rather than edited in the tuneable
+limits block, so this patch stays independent of the profiling patch's hunk and
+build.sh can still test each patch with "git apply --reverse --check".
+
+---
+diff --git a/src/ffx_vk_fsr4_v07.c b/src/ffx_vk_fsr4_v07.c
+--- a/src/ffx_vk_fsr4_v07.c
++++ b/src/ffx_vk_fsr4_v07.c
+@@ -109,8 +109,16 @@
+     int            externalTouched;
+ } VkRes;
+ 
++/* Eight records is one frame's four imports plus slack, but a real renderer ping-pongs depth and
++ * motion vectors across a ring of frame slots and recreates them on every resize, so the table
++ * holds the live working set and evicts its least recently registered record when full (see
++ * ffxFsr4VkSetExternalImageState) instead of refusing every registration from the ninth on. */
++#undef  MAX_EXTERNAL_IMAGES
++#define MAX_EXTERNAL_IMAGES  64
++
+ typedef struct {
+     FfxFsr4VkExternalImageState state;
++    uint64_t registered;  /* registration counter: the lowest is the eviction candidate */
+ } ExternalImageState;
+ 
+ typedef enum { PIPE_MODEL=0, PIPE_FULL=1 } PipeKind;
+@@ -166,6 +174,7 @@
+     uint32_t resCount;
+     ExternalImageState externalImages[MAX_EXTERNAL_IMAGES];
+     uint32_t externalImageCount;
++    uint64_t externalImageClock;
+ 
+     VkPipe   pipe[MAX_PIPELINES];
+ 
+@@ -2023,15 +2032,31 @@
+         return VK_ERROR_VALIDATION_FAILED_EXT;
+ 
+     FfxFsr4VkContext* c = (FfxFsr4VkContext*)iface->device;
++    const uint64_t stamp = ++c->externalImageClock;
+     for (uint32_t i = 0; i < c->externalImageCount; ++i) {
+         if (c->externalImages[i].state.view == state->view) {
+             c->externalImages[i].state = *state;
++            c->externalImages[i].registered = stamp;
+             return VK_SUCCESS;
+         }
+     }
+-    if (c->externalImageCount >= MAX_EXTERNAL_IMAGES)
+-        return VK_ERROR_OUT_OF_POOL_MEMORY;
+-    c->externalImages[c->externalImageCount++].state = *state;
++    if (c->externalImageCount >= MAX_EXTERNAL_IMAGES) {
++        /* Refusing here wedges the effect for the rest of the session: the records of images a
++         * host destroyed are never reclaimed.  A host re-registers every image it is about to
++         * dispatch with, so the record that went longest without a registration belongs to an
++         * image this frame does not use, and giving up that slot is safe. */
++        uint32_t oldest = 0;
++        for (uint32_t i = 1; i < c->externalImageCount; ++i) {
++            if (c->externalImages[i].registered < c->externalImages[oldest].registered)
++                oldest = i;
++        }
++        c->externalImages[oldest].state = *state;
++        c->externalImages[oldest].registered = stamp;
++        return VK_SUCCESS;
++    }
++    c->externalImages[c->externalImageCount].state = *state;
++    c->externalImages[c->externalImageCount].registered = stamp;
++    c->externalImageCount++;
+     return VK_SUCCESS;
+ }
+ 

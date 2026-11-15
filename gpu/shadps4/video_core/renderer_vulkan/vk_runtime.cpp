@@ -337,7 +337,9 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                                   const VideoCore::Buffer* buffer, u64 offset) {
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
     const u32 num_layers = std::min(src->info.resources.layers, dst->info.resources.layers);
-    ASSERT(src->info.resources.layers == dst->info.resources.layers && num_mips == 1);
+    // sotc: the layers both have (a one-layer D32S8 buffer copied into a two-layer D32 one at
+    // colossus 6), as CopyImage does.
+    ASSERT(num_mips == 1);
 
     SetBackingSamples(dst, dst->info.num_samples, false);
     SetBackingSamples(src, src->info.num_samples);
@@ -459,8 +461,10 @@ void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
         const bool depth_format_mismatch = src->info.props.is_depth &&
                                            dst->info.props.is_depth &&
                                            src->info.pixel_format != dst->info.pixel_format;
+        // sotc: also when the layer counts differ: at colossus 6 a D32_SFLOAT_S8_UINT buffer of
+        // one layer is copied into a D32_SFLOAT one of two, and CopyImage was invalid for it
+        // (VUID-vkCmdCopyImage-srcImage-01548).
         const bool buffer_copy_possible =
-            src->info.resources.layers == dst->info.resources.layers &&
             std::min(src->info.resources.levels, dst->info.resources.levels) == 1;
         if (!(depth_format_mismatch && buffer_copy_possible) &&
             (instance.IsMaintenance8Supported() ||

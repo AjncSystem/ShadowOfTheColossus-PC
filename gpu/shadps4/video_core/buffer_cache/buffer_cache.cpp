@@ -885,6 +885,8 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
 
 void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8* mapped,
                                  u64 mapped_offset) {
+    // sotc: a copy still running must not read what this writes in place of what the guest had.
+    JoinAsyncUploads();
     // sotc (#146): every heap of the guarded heap's class, not only the one picked at boot: the
     // heaps a world creates when it loads (the last colossus' area) crashed the same way
     // (eboot+0x49500, freed blocks overwritten). They come from the engine's heap table.
@@ -1946,7 +1948,32 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             const char* v = std::getenv("SOTC_COPY_BATCH");
             return !v || v[0] != '0';
         }();
-        if (copy_batch && copies.size() > 1 && total_size_bytes >= 2_MB && BbCopy::Enabled()) {
+        // sotc: SOTC_BUF_ASYNC_KB (default 256, 0 off): an upload of that size or more is copied
+        // into its staging memory by the copy threads while this thread goes on with the frame;
+        // JoinAsyncUploads() waits for them before the commands reach the queue. A new area
+        // brings 120-230 MB of geometry in hundreds of ranges of under 2 MiB in one frame, which
+        // were copied here one after another (about 60 ms: the Shrine approach of the ride
+        // benchmark). The ranges were marked clean above: a guest write from now on is seen by
+        // page tracking and uploaded again, whichever bytes the copy read.
+        static const u64 async_min = [] {
+            const char* v = std::getenv("SOTC_BUF_ASYNC_KB");
+            return (v ? std::strtoull(v, nullptr, 10) : 256) << 10;
+        }();
+        if (async_min && total_size_bytes >= async_min && staging.buffer->is_coherent &&
+            BbCopy::Enabled()) {
+            constexpr u64 PieceSize = 512_KB;
+            for (const auto& copy : copies) {
+                for (u64 done = 0; done < copy.size; done += PieceSize) {
+                    BbCopy::Async([mem = memory, source = copy.dstOffset + done,
+                                   dest = staging.mapped + copy.srcOffset + done,
+                                   n = std::min(PieceSize, copy.size - done)] {
+                        mem->CopySparseMemory(source, dest, n);
+                    });
+                }
+            }
+            async_uploads.store(true, std::memory_order_release);
+        } else if (copy_batch && copies.size() > 1 && total_size_bytes >= 2_MB &&
+                   BbCopy::Enabled()) {
             struct Piece {
                 VAddr source;
                 u8* dest;
@@ -2567,7 +2594,17 @@ void BufferCache::NoteFaultRebind(VAddr addr, u64 size) {
     });
 }
 
+void BufferCache::JoinAsyncUploads() {
+    if (!async_uploads.load(std::memory_order_acquire)) {
+        return;
+    }
+    async_uploads.store(false, std::memory_order_release);
+    const SotcStats::FrameTimer frame_timer{SotcStats::FrameBuffer};
+    BbCopy::WaitAsync();
+}
+
 void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
+    JoinAsyncUploads();
     // sotc: binds stamp blocks with use_epoch; keep it current even when no eviction check runs.
     AdvanceUseEpoch(std::chrono::steady_clock::now());
     if (pending_binds.empty()) {

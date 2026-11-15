@@ -175,6 +175,10 @@ public:
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
 
+    /// sotc: waits for the upload copies handed to the copy threads (SOTC_BUF_ASYNC_KB); before
+    /// every submit and before the command processor writes guest memory.
+    void JoinAsyncUploads();
+
     /// Releases the arena memory backing a range the guest unmapped. GPU thread only.
     void ReleaseMemory(VAddr device_addr, u64 size);
     /// sotc: SOTC_RELEASE_DEFER=1: releases whose GPU work is done (TickFrame, each release).
@@ -399,6 +403,7 @@ private:
     std::array<CleanPage, NumCleanPages> clean_pages{};
     bool clean_pages_used = false;
     std::atomic<u64> clean_map_generation{};
+    std::atomic<bool> async_uploads{}; ///< sotc: copies into staging memory still running
     void AddGpuModified(VAddr addr, u64 size);
 
     /// GPU writes recorded into the command buffer still being built (tick current_writes_tick).

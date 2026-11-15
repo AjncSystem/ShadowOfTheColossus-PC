@@ -1,0 +1,38 @@
+{
+    "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+    "format": 1,
+    "name": "Shadow of the Colossus PC",
+    "repo": "AjncSystem/ShadowOfTheColossus-PC",
+    "requires": [
+        "start",
+        "files.folder"
+    ],
+    "game": {
+        "kind": "folder",
+        "label": "Your PS4 dump folder of Shadow of the Colossus: CUSA08809 (EU 1.01) or CUSA08034 (US 1.00), the folder with eboot.bin, sce_module and sce_sys.",
+        "check": {
+            "file": "eboot.bin"
+        }
+    },
+    "start": {
+        "program": [
+            "SotC.exe"
+        ],
+        "args": [
+            "--run"
+        ],
+        "env": {
+            "SOTC_GAME_DIR": "{game}"
+        }
+    },
+    "saves": [
+        "{install}/user/savedata"
+    ],
+    "folders": {
+        "logs": [
+            {
+                "path": "{install}/user"
+            }
+        ]
+    }
+}

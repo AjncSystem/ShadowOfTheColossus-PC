@@ -44,7 +44,12 @@ u64 RoundAllocationSize(u64 size) {
 // buffer and allocated a new one inside the frame that needed it (6 allocations, 240 MiB, 7-19 ms
 // per 5 s while an area loads). With the switch they get power-of-two size classes and reuse any
 // free buffer up to twice the request, and idle ones are kept up to SOTC_STAGING_LARGE_KEEP_MB
-// (default 256) per memory type instead of being freed after 120 idle frames.
+// per memory type instead of being freed after 120 idle frames.
+// sotc: the default keep is 768 MiB on a PC with 12 GB of RAM or more, 256 below (it was 256 for
+// all). An area's textures go up together: one draw binds four or five of 50-70 MB, each needs
+// a 64 or 128 MiB buffer of its own in the same frame, and 256 MiB kept two of them. The others
+// were allocated in that frame, and writing new memory faults page by page: 196 MB copied in
+// 83 ms with 22 thousand page faults; from kept buffers, 197 MB in 16 ms with none (ride, 15 Nov).
 bool StagingLargePow2() {
     static const bool enabled = [] {
         const char* v = std::getenv("SOTC_STAGING_LARGE_POW2");
@@ -56,7 +61,8 @@ bool StagingLargePow2() {
 u64 StagingLargeKeepBytes() {
     static const u64 bytes = [] {
         const char* v = std::getenv("SOTC_STAGING_LARGE_KEEP_MB");
-        return (v ? std::strtoull(v, nullptr, 10) : 256ULL) << 20;
+        const u64 fallback = SotcStats::SystemRamBytes() >= (12ULL << 30) - (512ULL << 20) ? 768 : 256;
+        return (v ? std::strtoull(v, nullptr, 10) : fallback) << 20;
     }();
     return bytes;
 }

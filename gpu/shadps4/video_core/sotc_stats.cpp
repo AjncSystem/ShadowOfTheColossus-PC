@@ -52,6 +52,16 @@ uint64_t SplitProcessFaults() {
 }
 #endif
 
+uint64_t SystemRamBytes() {
+#ifdef _WIN32
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    return GlobalMemoryStatusEx(&status) ? status.ullTotalPhys : 0;
+#else
+    return 0;
+#endif
+}
+
 void LogSystemMemory() {
 #ifdef _WIN32
     MEMORYSTATUSEX status{};

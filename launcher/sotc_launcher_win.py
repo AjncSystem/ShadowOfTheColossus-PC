@@ -3787,6 +3787,11 @@ def main():
         sys.exit(0)
     settings = load_settings()
     LANG = settings.get('ui_language') or windows_language()
+    # sotc: other launchers (RecompLauncher, PR #439) hand the player's game folder over in
+    # SOTC_GAME_DIR; it is used when the launcher has no valid game folder of its own.
+    handed = os.environ.get('SOTC_GAME_DIR', '')
+    if handed and not (Path(settings['game_dir'] or '.') / 'eboot.bin').is_file() and (Path(handed) / 'eboot.bin').is_file():
+        settings['game_dir'] = handed
     if '--play' in args and (Path(settings['game_dir'] or '.') / 'eboot.bin').is_file():
         sys.exit(play_without_window(settings))
     try:

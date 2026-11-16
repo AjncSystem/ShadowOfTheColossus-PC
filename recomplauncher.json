@@ -19,7 +19,7 @@
             "SotC.exe"
         ],
         "args": [
-            "--run"
+            "--play"
         ],
         "env": {
             "SOTC_GAME_DIR": "{game}"

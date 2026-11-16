@@ -422,6 +422,17 @@ inline thread_local bool t_draw_thread = false;
 inline uint64_t Ticks() {
     return __builtin_ia32_rdtsc();
 }
+/// SOTC_SLOW_OPS: a command another thread handed to the draw thread (kind 5, "command"): 1 GPU
+/// marks dropped for a range (DropGpuModified), 2 a guest read-back begins, 3 it finishes.
+struct SlowCommand {
+    uint64_t id, start;
+    explicit SlowCommand(uint64_t id_) : id{id_}, start{kSlowOps ? Ticks() : 0} {}
+    ~SlowCommand() {
+        if (kSlowOps) {
+            NoteSlowOp((uint64_t{5} << 60) | id, Ticks() - start);
+        }
+    }
+};
 struct SplitTimer {
     SplitPart part;
     bool on;

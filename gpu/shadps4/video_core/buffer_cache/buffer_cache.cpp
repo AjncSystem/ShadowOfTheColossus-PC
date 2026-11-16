@@ -167,6 +167,7 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
 
 void BufferCache::DropGpuModified(VAddr device_addr, u64 size) {
     liverpool->SendCommand<true>([this, device_addr, size] {
+        const SotcStats::SlowCommand slow_command{1};
         {
             std::unique_lock gpu_modified_lock{gpu_modified_mutex};
             gpu_modified_ranges.Subtract(device_addr, size);
@@ -318,7 +319,10 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     for (int tries = 0;; ++tries) {
         AsyncReadback readback{
             .device_addr = device_addr, .size = size, .stream = stream, .is_write = is_write};
-        liverpool->SendCommand<true>([this, &readback] { BeginAsyncReadback(readback); });
+        liverpool->SendCommand<true>([this, &readback] {
+            const SotcStats::SlowCommand slow_command{2};
+            BeginAsyncReadback(readback);
+        });
         split_part(SotcStats::SplitRbQueue);
         if (!readback.waiting) {
             return;
@@ -382,7 +386,10 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
         bool requeue = false;
         const bool allow = tries < max_requeues;
         liverpool->SendCommand<true>(
-            [this, &readback, &requeue, allow] { requeue = FinishAsyncReadback(readback, allow); });
+            [this, &readback, &requeue, allow] {
+                const SotcStats::SlowCommand slow_command{3};
+                requeue = FinishAsyncReadback(readback, allow);
+            });
         split_part(SotcStats::SplitRbFinish);
         if (!requeue) {
             return;

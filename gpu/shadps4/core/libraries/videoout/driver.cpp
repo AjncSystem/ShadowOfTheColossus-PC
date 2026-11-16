@@ -511,13 +511,14 @@ void VideoOutDriver::Flip(const Request& req) {
                     for (const auto& [key, op] : top) {
                         all += op.ticks;
                     }
-                    static constexpr const char* kinds[] = {"func", "draw", "indirect", "dispatch",
-                                                            "dispatch-indirect"};
+                    static constexpr const char* kinds[] = {"func",     "draw",
+                                                            "indirect", "dispatch",
+                                                            "dispatch-indirect", "command"};
                     std::string line = fmt::format("SOTC SLOW OPS frame {:.1f} ms, ops {:.1f} ms:",
                                                    interval_ms, all / ticks_per_ms);
                     for (size_t i = 0; i < top.size() && i < 8; ++i) {
                         const auto& [key, op] = top[i];
-                        line += fmt::format(" {} {:#x} {:.1f} ms/{}", kinds[std::min<u64>(key >> 60, 4)],
+                        line += fmt::format(" {} {:#x} {:.1f} ms/{}", kinds[std::min<u64>(key >> 60, 5)],
                                             key & ((u64{1} << 60) - 1), op.ticks / ticks_per_ms,
                                             op.count);
                     }

@@ -262,12 +262,12 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                                           (hash & ((u64{1} << 60) - 1)),
                                       ticks);
                 // An op over ~1 ms (3 GHz TSC; the line prints its real ms): where it went, the
-                // first 3 times per shader, 60 lines per session.
+                // first 4 times per shader, 300 lines per session.
                 if (ticks > 3'000'000) {
                     static std::unordered_map<u64, u32> shown;
                     static u32 lines = 0;
                     u32& n = shown[hash];
-                    if (n < 3 && lines < 60) {
+                    if (n < 4 && lines < 300) {
                         ++n;
                         ++lines;
                         u64 d[std::size(kDetail)];

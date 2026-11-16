@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.76 — 2026-11-16
+- 🎮 **Menu F1 novo**, organizado como o do ZooT-PC: abas Imagem, Desempenho, Grama, Som, Controles, Jogo e Debug (Q/E ou L1/R1), valor entre setas, ajuda da opção à direita e as cores do jogo. O que dá para mudar jogando muda na hora; o que só vale no próximo início (marcado com ◆) fica salvo nas configurações do lançador e uma faixa pede para reiniciar. Textos nos idiomas do lançador.
+- 🖥️ **CPUs antigas sem BMI1/LZCNT/MOVBE agora rodam o jogo** (Oussama268 e Lucas-blip-png, #49, #88, #200): essas instruções são emuladas no carregamento (Intel Sandy/Ivy Bridge, Xeon E5 v1/v2). Ainda é preciso AVX. FPS em mundo aberto é menor nessas CPUs.
+- 🔊 **Música no volume certo** (Oussama268, #426): o mixer embutido tocava a música e os sons 5.1 até 20–30 dB baixos. Comparado canal a canal com o módulo do console, agora fica a ~1 dB dele (filtros do som anterior presos na voz, side chain somado, efeitos do jogo desligados, LFE em dobro).
+- 🔊 **Volume acima de 100% sem esmagar o som**: um limitador de verdade (desce em ~1 ms, volta em ~250 ms) no lugar do corte amostra a amostra; nas lutas a música não some mais atrás dos impactos. `SOTC_AUDIO_LIMITER=0` volta ao antigo.
+- 🦅 **5º colosso (Avion) voando para cima sem parar** (#421, #425): em PS4 Pro + 60 FPS com o modo gráfico Cinematic o jogo rodava com o relógio de 30 FPS e a física dobrava. Agora o modo 60 FPS vale nesse caminho também.
+- ⚡ **Menos travadas na troca de área** (Oussama268): 768 MB de área temporária guardados em PCs com 12 GB de RAM ou mais (#435); envios grandes de buffer nas threads de cópia (#437); a comparação de memória ao devolver buffers frios numa thread própria (~40 ms a menos na chegada ao Santuário). Na demo: quadros > 50 ms de 7 para 2, pior quadro de 566 para 70 ms.
+- 🎨 **Cores em áreas escuras com brilho alto** (joaobatista235, #427): curva de gama contínua, sem o vermelho/verde nas sombras.
+- Correção de validação Vulkan na cópia de depth do colosso 6 (Oussama268, #436).
+- **RecompLauncher** (elripalda, #439): o port pode ser instalado e atualizado pelo RecompLauncher; o lançador aceita a pasta do jogo que ele passa.
+- Diagnóstico (desligado por padrão): motivos das cópias de textura, `SOTC_SLOW_OPS` com os comandos de outras threads, `BB_AUDIO_STATS` com os níveis de som.
+
+### English
+- 🎮 **New F1 menu**, laid out like ZooT-PC's: Display, Performance, Grass, Sound, Controls, Game and Debug tabs (Q/E or L1/R1), values between arrows, help for the chosen option on the right, in the game's colours. What can change while playing changes at once; what only applies on the next start (marked ◆) is saved in the launcher's settings and a band asks for a restart. Texts in the launcher's languages.
+- 🖥️ **Older CPUs without BMI1/LZCNT/MOVBE now run the game** (Oussama268 and Lucas-blip-png, #49, #88, #200): those instructions are emulated at load time (Intel Sandy/Ivy Bridge, Xeon E5 v1/v2). AVX is still required. Open-world FPS is lower on these CPUs.
+- 🔊 **Music at the right volume** (Oussama268, #426): the built-in mixer played music and 5.1 sounds up to 20-30 dB too quiet. Compared channel by channel with the console's module, it is now within ~1 dB (filters left over from the previous sound, side chain summed in, the game's effects off, LFE twice).
+- 🔊 **Volume above 100% no longer squashes the sound**: a real limiter (down in ~1 ms, back in ~250 ms) instead of clipping each sample; in fights the music no longer disappears behind the impacts. `SOTC_AUDIO_LIMITER=0` restores the old one.
+- 🦅 **5th colossus (Avion) flying up forever** (#421, #425): in PS4 Pro mode at 60 FPS with the Cinematic graphics mode the game ran on a 30 FPS clock and physics ran twice as fast. The 60 FPS mode now covers that path too.
+- ⚡ **Fewer hitches when an area loads** (Oussama268): 768 MB of staging buffers kept on PCs with 12 GB of RAM or more (#435); large buffer uploads on the copy threads (#437); the memory comparison when cold buffers are given back on its own thread (~40 ms less at the Shrine approach). On the demo: frames > 50 ms from 7 to 2, worst frame from 566 to 70 ms.
+- 🎨 **Colours in dark areas at high brightness** (joaobatista235, #427): a continuous gamma curve, no red/green in the shadows.
+- Vulkan validation fix in colossus 6's depth copy (Oussama268, #436).
+- **RecompLauncher** (elripalda, #439): the port can be installed and updated from RecompLauncher; the launcher takes the game folder it hands over.
+- Diagnostics (off by default): texture copy reasons, `SOTC_SLOW_OPS` with other threads' commands, `BB_AUDIO_STATS` with sound levels.
+
 ## 0.75 — 2026-11-12
 - 🔊 **Som sem os módulos do console: os arquivos do PS4 deixam de ser obrigatórios** (Oussama268, a partir do HayatoG/tlg_pc, GPL-2.0): quando faltam o `libSceNgs2.sprx` e o `libSceUlt.sprx`, um mixer NGS2 embutido toca o som do jogo (ATRAC9 pela LibAtrac9). **Ele é o padrão para todos**; quem preferir o som do firmware marca "Usar os módulos de som do meu console" em Jogo e saves. No teste, som normal e o mesmo FPS nos dois casos (69,7 com o mixer, 69,5 com os módulos). `SOTC_NGS2=native` volta ao comportamento antigo.
 - 🎧 **Aba Som no lançador:** saída em **Estéreo 2.0**, **Surround 5.1**, **Surround 7.1** ou Automático (o jogo mistura em 7.1; no 2.0 e no 5.1 o próprio port faz a mistura, coeficientes ITU, sem estourar), graves do subwoofer no estéreo, escolha do **dispositivo de som** (fone, TV, caixas) sem mudar o padrão do Windows, **volume até 500%** (também no menu do jogo, F10; picos suavizados) e o motor de som. `SOTC_AUDIO_CHANNELS`, `SOTC_AUDIO_LFE`, `SOTC_AUDIO_DEVICE`.

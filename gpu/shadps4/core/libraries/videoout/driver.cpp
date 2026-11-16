@@ -987,12 +987,13 @@ void VideoOutDriver::Flip(const Request& req) {
             if (const uint64_t runs = SotcStats::arena_evict_runs.load(std::memory_order_relaxed)) {
                 std::fprintf(
                     stderr,
-                    "SOTC ARENA evicted %llu MiB in %llu runs (%.1f ms), rebound %llu MiB, "
+                    "SOTC ARENA evicted %llu MiB in %llu runs (%.1f ms, compare %.1f ms), rebound %llu MiB, "
                     "faulted back %llu MiB, kept unequal %llu MiB\n",
                     static_cast<unsigned long long>(
                         SotcStats::arena_evicted.load(std::memory_order_relaxed) >> 20),
                     static_cast<unsigned long long>(runs),
                     SotcStats::arena_evict_ns.load(std::memory_order_relaxed) / 1e6,
+                    SotcStats::arena_compare_ns.load(std::memory_order_relaxed) / 1e6,
                     static_cast<unsigned long long>(
                         SotcStats::arena_rebound.load(std::memory_order_relaxed) >> 20),
                     static_cast<unsigned long long>(

@@ -540,6 +540,7 @@ inline std::atomic<uint64_t> arena_pinned{0};   ///< ... faulted back in by shad
 inline std::atomic<uint64_t> arena_evict_mismatch{0}; ///< read back unequal to guest memory: kept
 inline std::atomic<uint64_t> arena_evict_runs{0};
 inline std::atomic<uint64_t> arena_evict_ns{0}; ///< time in MaybeEvictCold (scan, GPU wait, unbind)
+inline std::atomic<uint64_t> arena_compare_ns{0}; ///< read-back comparisons, on their own thread
 // sotc (MEMORIA-PLAN.md): memory counters printed on the "SOTC MEM" line (SOTC_FPS=1). Telemetry only.
 /// Arena bytes in use (ArenaUsedBytes) and by class of the blocks' binds: image sources only
 /// (ObtainBufferForImage), other binds only, both, and "image only and idle for 30 s".

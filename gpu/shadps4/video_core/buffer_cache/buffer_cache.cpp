@@ -12,6 +12,7 @@
 #include "bbport_copy.h"
 #include "common/alignment.h"
 #include "common/scope_exit.h"
+#include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
@@ -142,6 +143,10 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 }
 
 BufferCache::~BufferCache() {
+    if (pending_eviction && pending_eviction->compare &&
+        pending_eviction->compare->thread.joinable()) {
+        pending_eviction->compare->thread.join();
+    }
     std::free(block_last_use);
 }
 
@@ -2502,19 +2507,50 @@ bool BufferCache::FinishEviction(std::chrono::steady_clock::time_point now, u16 
     // every command buffer submitted so far (the read-back's included) is done. The GPU catches
     // up within a frame or two at the benchmark scenes; after 5 s, or with `wait`, Finish() it.
     PendingEviction& pending = *pending_eviction;
-    if (!scheduler.IsFree(pending.tick) || !scheduler.IsFree(scheduler.CurrentTick() - 1)) {
-        if (!wait && now < pending.deadline) {
+    if (!pending.compare) {
+        if (!scheduler.IsFree(pending.tick) || !scheduler.IsFree(scheduler.CurrentTick() - 1)) {
+            if (!wait && now < pending.deadline) {
+                return false;
+            }
+            scheduler.Finish();
+        }
+        const auto& read_back = pending.download;
+        read_back.buffer->Invalidate(read_back.offset, read_back.size);
+        // sotc: the read-back is compared with the game's memory on a thread of its own and
+        // the eviction ends at a later frame; SOTC_EVICT_COMPARE_ASYNC=0 compares here as
+        // before (~40 ms on the draw thread per 64 MiB run: one of the late frames where the
+        // arenas first pass SOTC_ARENA_EVICT_MB, the Shrine approach on the ride). What the
+        // comparison protects against, the GPU writing the range, is checked again below; a
+        // write by the game after it makes the game's memory the newer copy, and the range is
+        // uploaded from there when it is bound again.
+        static const bool async_compare = [] {
+            const char* v = std::getenv("SOTC_EVICT_COMPARE_ASYNC");
+            return !v || v[0] != '0';
+        }();
+        pending.compare = std::make_unique<EvictCompare>();
+        if (async_compare && !wait) {
+            pending.compare->thread =
+                std::thread([this, chosen = pending.chosen, mapped = read_back.mapped,
+                             compare = pending.compare.get()] {
+                    Common::SetCurrentThreadName("bb:EvictCompare");
+                    CompareEviction(chosen, mapped, *compare);
+                });
             return false;
         }
-        scheduler.Finish();
+        CompareEviction(pending.chosen, read_back.mapped, *pending.compare);
+    }
+    if (!pending.compare->done.load(std::memory_order_acquire) && !wait) {
+        return false;
+    }
+    if (pending.compare->thread.joinable()) {
+        pending.compare->thread.join();
     }
     const SotcStats::ScopedTimer evict_timer{SotcStats::arena_evict_ns};
     const auto& download = pending.download;
-    download.buffer->Invalidate(download.offset, download.size);
 
     std::vector<Backing> released;
-    std::array<u8, 4096> guest;
-    for (const EvictChoice& pick : pending.chosen) {
+    for (size_t choice = 0; choice < pending.chosen.size(); ++choice) {
+        const EvictChoice& pick = pending.chosen[choice];
         // Bound again, or written by the GPU, after the read-back was recorded: stays.
         bool keep = false;
         for (const Backing& range : pick.ranges) {
@@ -2532,21 +2568,7 @@ bool BufferCache::FinishEviction(std::chrono::steady_clock::time_point now, u16 
         if (keep) {
             continue;
         }
-        bool equal = true;
-        for (const EvictPiece& piece : pick.pieces) {
-            for (u64 at = 0; at < piece.size && equal; at += guest.size()) {
-                const VAddr addr = piece.addr + at;
-                if (memory_tracker->IsRegionCpuModified(addr, guest.size())) {
-                    continue; // uploaded at the next bind anyway
-                }
-                if (!memory->TryCopySparseMemory(addr, guest.data(), guest.size())) {
-                    continue; // unmapped: nothing can read it
-                }
-                equal = std::memcmp(download.mapped + piece.offset + at, guest.data(),
-                                    guest.size()) == 0;
-            }
-        }
-        if (!equal) {
+        if (!pending.compare->equal[choice]) {
             evict_retry.emplace(pick.key, now + std::chrono::seconds(60));
             SotcStats::arena_evict_mismatch.fetch_add(pick.bytes, std::memory_order_relaxed);
             continue;
@@ -2588,6 +2610,35 @@ bool BufferCache::FinishEviction(std::chrono::steady_clock::time_point now, u16 
     }
     SotcStats::arena_evict_runs.fetch_add(1, std::memory_order_relaxed);
     return true;
+}
+
+void BufferCache::CompareEviction(const std::vector<EvictChoice>& chosen, const u8* mapped,
+                                  EvictCompare& compare) const {
+    const auto start = std::chrono::steady_clock::now();
+    compare.equal.assign(chosen.size(), 1);
+    std::array<u8, 4096> guest;
+    for (size_t choice = 0; choice < chosen.size(); ++choice) {
+        bool equal = true;
+        for (const EvictPiece& piece : chosen[choice].pieces) {
+            for (u64 at = 0; at < piece.size && equal; at += guest.size()) {
+                const VAddr addr = piece.addr + at;
+                if (memory_tracker->IsRegionCpuModified(addr, guest.size())) {
+                    continue; // uploaded at the next bind anyway
+                }
+                if (!memory->TryCopySparseMemory(addr, guest.data(), guest.size())) {
+                    continue; // unmapped: nothing can read it
+                }
+                equal = std::memcmp(mapped + piece.offset + at, guest.data(), guest.size()) == 0;
+            }
+        }
+        compare.equal[choice] = equal;
+    }
+    SotcStats::arena_compare_ns.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                             start)
+            .count(),
+        std::memory_order_relaxed);
+    compare.done.store(true, std::memory_order_release);
 }
 
 void BufferCache::NoteFaultRebind(VAddr addr, u64 size) {

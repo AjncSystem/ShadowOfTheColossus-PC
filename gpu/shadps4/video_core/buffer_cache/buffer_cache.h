@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 
 #include <chrono>
 #include <shared_mutex>
@@ -12,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <thread>
 #include <vector>
 #include <unordered_map>
 #include <boost/container/small_vector.hpp>
@@ -471,12 +473,22 @@ private:
         std::vector<EvictPiece> pieces;
         boost::container::small_vector<Backing, 4> ranges;
     };
+    /// sotc: the comparison of an eviction's read-back with the game's memory, on its own
+    /// thread (64 MiB page by page is ~40 ms, a late frame when the draw thread did it).
+    struct EvictCompare {
+        std::vector<u8> equal; ///< per choice
+        std::atomic<bool> done{false};
+        std::thread thread;
+    };
     struct PendingEviction {
         std::vector<EvictChoice> chosen;
         Vulkan::StagingBufferRef download;
         u64 tick{};
         std::chrono::steady_clock::time_point deadline{};
+        std::unique_ptr<EvictCompare> compare;
     };
+    void CompareEviction(const std::vector<EvictChoice>& chosen, const u8* mapped,
+                         EvictCompare& compare) const;
     std::optional<PendingEviction> pending_eviction;
     bool FinishEviction(std::chrono::steady_clock::time_point now, u16 idle_epochs, bool wait);
 

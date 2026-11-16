@@ -62,6 +62,10 @@ MODES = {
         (0x00b0a7a6, bytes.fromhex('c745b802000000'), bytes.fromhex('c745b801000000')),
         (0x0089a47f, bytes.fromhex('c7458402000000'), bytes.fromhex('c7458401000000')),
         (0x0089a499, bytes.fromhex('c7458002000000'), bytes.fromhex('c7458001000000')),
+        # The PS4 Pro path of the same graphics mode code: Cinematic (mode 2) sets 2 there, so in
+        # Pro mode the game ran at 60 FPS on a 30 FPS clock and physics ran twice as fast: the 5th
+        # colossus (Avion) flew up forever (#421, #425); its Performance mode (1) was fine.
+        (0x00b0a886, bytes.fromhex('c745c802000000'), bytes.fromhex('c745c801000000')),
     ],
 }
 # Modes made of cvars only.

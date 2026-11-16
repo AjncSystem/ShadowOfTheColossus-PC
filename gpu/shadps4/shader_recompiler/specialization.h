@@ -46,6 +46,7 @@ struct BufferSpecialization {
 struct ImageSpecialization {
     AmdGpu::ImageType type = AmdGpu::ImageType::Color2D;
     bool is_integer = false;
+    bool is_fmask = false;
     bool is_storage = false;
     bool is_srgb = false;
     AmdGpu::CompMapping dst_select{};
@@ -57,8 +58,9 @@ struct ImageSpecialization {
 };
 
 struct FMaskSpecialization {
-    u32 width;
-    u32 height;
+    u32 width{};
+    u32 height{};
+    bool is_fmask{};
 
     bool operator==(const FMaskSpecialization&) const = default;
 };
@@ -133,6 +135,7 @@ struct StageSpecialization {
                      [&](auto& spec, const auto& desc, AmdGpu::Image sharp) {
                          spec.type = sharp.GetViewType(desc.is_array);
                          spec.is_integer = AmdGpu::IsInteger(sharp.GetNumberFmt());
+                         spec.is_fmask = AmdGpu::IsFmask(sharp.GetDataFmt());
                          spec.is_storage = desc.is_written;
                          if (spec.is_storage) {
                              spec.dst_select = sharp.DstSelect();
@@ -146,6 +149,7 @@ struct StageSpecialization {
                      [](auto& spec, const auto& desc, AmdGpu::Image sharp) {
                          spec.width = sharp.width;
                          spec.height = sharp.height;
+                         spec.is_fmask = AmdGpu::IsFmask(sharp.GetDataFmt());
                      });
         ForEachSharp(samplers, info->samplers,
                      [](auto& spec, const auto& desc, AmdGpu::Sampler sharp) {
@@ -192,6 +196,11 @@ struct StageSpecialization {
 
     bool operator==(const StageSpecialization& other) const {
         if (!Valid()) {
+            return false;
+        }
+
+        if (!other.Valid() || buffers.size() != other.buffers.size() ||
+            images.size() != other.images.size() || samplers.size() != other.samplers.size()) {
             return false;
         }
 

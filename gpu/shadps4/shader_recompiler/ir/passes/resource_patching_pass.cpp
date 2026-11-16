@@ -507,6 +507,12 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
         switch (inst.GetOpcode()) {
         case IR::Opcode::ImageRead:
         case IR::Opcode::ImageSampleRaw: {
+            // The read becomes a constant, but its descriptor type remains a specialization
+            // dependency. Otherwise a later ordinary texture at the same T# reuses this
+            // resource-free variant forever and its real image/sampler bindings disappear.
+            descriptors.Add(FMaskResource{
+                .sharp_idx = SharpLocationFromSource(resource.sharps[0].dwords[0].Inst()),
+            });
             IR::F32 fmaskx = ir.BitCast<IR::F32>(ir.Imm32(0x76543210));
             IR::F32 fmasky = ir.BitCast<IR::F32>(ir.Imm32(0xfedcba98));
             inst.ReplaceUsesWith(ir.CompositeConstruct(fmaskx, fmasky));

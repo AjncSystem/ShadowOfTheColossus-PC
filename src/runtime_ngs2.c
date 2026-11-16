@@ -36,6 +36,8 @@
  *   TLG_NGS2_LOG=1           unknown parameters, decoder errors, a summary every 30 s
  *   TLG_NGS2_WAV=<file>      writes render buffer 0 as float WAV (compare with the native mix)
  *   TLG_NGS2_USERFX=0        do not call the game's user FX handlers
+ *   TLG_NGS2_KEEP_FILTERS=1  sotc: a sampler setup keeps the voice's old filters (as before the #426 fix)
+ *   TLG_NGS2_DIAG=1          sotc: with LOG, every 5 s each playing voice and bus: levels, filters, ports
  *   TLG_NGS2_REVERB=pass     reverb racks pass their input through unprocessed (debug)
  *   TLG_NGS2_CUSTOM=mute     custom racks (chorus/delay) output silence (debug)
  *   TLG_NGS2_DELAY_TYPE=0    custom delay on a mono downmix instead of per channel (the default)
@@ -241,6 +243,7 @@ struct Voice {
     Port ports[MAX_PORTS];
     Matrix *matrices;
     float peak;
+    float diag_in[MAX_CH], diag_out[MAX_CH];   /* SOTC_NGS2_DIAG: channel peaks since the last dump */
     Biquad filters[MAX_FILTERS];
     UserFxHandler user_fx;
     uintptr_t user_fx_data[3];
@@ -249,8 +252,9 @@ struct Voice {
     uint32_t callback_flags;
     Sampler *sampler;
     /* Buses */
-    float *input;           /* MAX_CH planar channels of MAX_GRAIN */
+    float *input;           /* MAX_CH planar channels of MAX_GRAIN, then MAX_CH more: input 1 (side chain) */
     int has_input;
+    int has_side;           /* something was mixed into input 1 since it was last cleared */
     int fed;                /* something was mixed into the input this render */
     Dynamics compressor;
     Reverb *reverb;
@@ -877,7 +881,15 @@ static void delay_run(Delay *d, float data[MAX_CH][MAX_GRAIN], uint32_t channels
         for (uint32_t c = 0; c < channels; ++c) if (c != 3) for (uint32_t i = 0; i < n; ++i) mono[i] += data[c][i] * d->in_gain[c];
     }
     for (uint32_t c = 0; c < (d->type == 0 ? 1u : channels); ++c) {
-        if (d->type != 0 && (c == 3 || (d->mask >> c & 1))) continue;
+        if (d->type != 0 && (c == 3 || (d->mask >> c & 1))) {
+            /* sotc: a channel the delay skips (LFE, masked) has no delayed part, but it is still
+             * the module's output: dry level, not the input as it came. SotC's effect sends end in
+             * a delay with dry 0, wet 1; the LFE of every 5.1 stream went through it at full
+             * level and was added to the direct path a second time (+6 dB against the console,
+             * and still there when the game's own bus effect had muted the direct LFE). */
+            if (dry != 1.0f) for (uint32_t i = 0; i < n; ++i) data[c][i] *= dry;
+            continue;
+        }
         float *line = d->line + (size_t)c * len;
         const float *in = d->type == 0 ? mono : data[c];
         float g_in = d->type == 0 ? 1.0f : d->in_gain[c];
@@ -896,7 +908,7 @@ static void delay_run(Delay *d, float data[MAX_CH][MAX_GRAIN], uint32_t channels
         for (uint32_t i = 0; i < n; ++i) { line[w] = g_in * in[i] + fb * delayed[i]; if (++w == len) w = 0; }
         if (d->type == 0) {
             for (uint32_t o = 0; o < channels; ++o) {
-                if (o == 3 || (d->mask >> o & 1)) continue;
+                if (o == 3 || (d->mask >> o & 1)) { if (dry != 1.0f) for (uint32_t i = 0; i < n; ++i) data[o][i] *= dry; continue; }
                 for (uint32_t i = 0; i < n; ++i) data[o][i] = dry * mono[i] + wet * delayed[i];
             }
         } else for (uint32_t i = 0; i < n; ++i) data[c][i] = dry * data[c][i] + wet * delayed[i];
@@ -995,7 +1007,7 @@ static int voice_alloc_parts(Voice *v) {
         if (!v->sampler) return 0;
         v->sampler->pitch = 1.0f;
         v->sampler->env_level = 1.0f;
-    } else if (!(v->input = calloc((size_t)MAX_CH * MAX_GRAIN, sizeof(float)))) return 0;
+    } else if (!(v->input = calloc((size_t)2 * MAX_CH * MAX_GRAIN, sizeof(float)))) return 0;
     if (r->kind == KIND_REVERB && !(v->reverb = reverb_new(r->system->rate))) return 0;
     return 1;
 }
@@ -1291,6 +1303,14 @@ static void sampler_setup(Voice *v, const ParamHeader *p) {
     s->decoded_samples = s->decoded_bytes = s->user = 0;
     s->waveform_pointer = NULL;
     v->paused = 0;
+    /* sotc: a setup starts a new sound on the voice: the filters of the sound that used it
+     * before must not shape it. The game sets a sound's filters only after its setup and only
+     * the indexes that sound uses, so leftovers stayed in the chain (a 500 Hz high-pass and a
+     * 200 Hz low-pass of an earlier sound in series: the music of a colossus's death at -30 dB,
+     * AjncSystem #426). SOTC_NGS2_KEEP_FILTERS=1 keeps them as before. */
+    static int keep_filters = -1;
+    if (keep_filters < 0) keep_filters = env_flag("NGS2_KEEP_FILTERS", 0);
+    if (!keep_filters) memset(v->filters, 0, sizeof(v->filters));
     if (!s->fifo) s->fifo = calloc((size_t)FIFO_FRAMES * MAX_CH, sizeof(float));
     sampler_clear_blocks(s);
     sampler_reset_decoder(s);
@@ -1872,8 +1892,12 @@ static void mix_port(const Voice *src, Port *port, float in[MAX_CH][MAX_GRAIN], 
                           ? &src->matrices[port->matrix] : NULL;
     if (!port->primed) memset(port->last, 0, sizeof(port->last));
     int any = 0;
+    /* sotc: a patch names the destination's input. Input 1 is the side chain of the bus: the
+     * game's user FX (its ducking compressor) reads it as channels 8-15; it is not part of
+     * what the bus sends on. It was summed into input 0 before. */
+    const int side = port->input == 1;
     for (uint32_t o = 0; o < dc; ++o) {
-        float *acc = dst->input + (size_t)o * MAX_GRAIN;
+        float *acc = dst->input + (size_t)(side ? MAX_CH + o : o) * MAX_GRAIN;
         for (uint32_t i = 0; i < sc; ++i) {
             float level;
             if (m) {
@@ -1895,7 +1919,8 @@ static void mix_port(const Voice *src, Port *port, float in[MAX_CH][MAX_GRAIN], 
         }
     }
     port->primed = 1;
-    if (any) dst->has_input = dst->fed = 1;
+    if (any && side) dst->has_side = 1;
+    else if (any) dst->has_input = dst->fed = 1;
 }
 /* Sends through every patched port; filters at location 2 + p shape only what port p sends. */
 static float port_scratch[MAX_CH][MAX_GRAIN];
@@ -1911,13 +1936,21 @@ static void send_ports(Voice *v, float data[MAX_CH][MAX_GRAIN], uint32_t n) {
 }
 static void call_user_fx(Voice *v, float data[MAX_CH][MAX_GRAIN], uint32_t n) {
     static int enabled = -1;
-    /* sotc: off by default. SotC's user FX handler (guest 0x9a17e0) reads a null pointer from
-     * this context ~15 s after a save loads (its sndx build expects another layout); the voice
-     * then passes its input through. SOTC_NGS2_USERFX=1 calls it anyway. */
-    if (enabled < 0) enabled = env_flag("NGS2_USERFX", 0);
+    /* sotc: SotC's handlers (five thunks at eboot 0x954f60-0x9550e0 on 54 submix buses: the
+     * game's own bus effects) take 16 channel pointers, the 8 of the bus and the 8 of its side
+     * chain (input 1); the ducking compressor at eboot 0x9a17e0 reads channels 8-15. With 8
+     * pointers it read past the array and faulted ~15 s after a save loaded, so the handlers were
+     * off (SOTC_NGS2_USERFX=0 turns them off again) and the game's mix was not applied: music
+     * far too quiet under the effects (AjncSystem #426). */
+    static float silence[MAX_GRAIN];
+    if (enabled < 0) enabled = env_flag("NGS2_USERFX", 1);
     if (!v->user_fx || !enabled) return;
-    float *channels[MAX_CH];
-    for (int c = 0; c < MAX_CH; ++c) channels[c] = data[c];
+    float *channels[2 * MAX_CH];
+    const int bus = v->input && data == (float (*)[MAX_GRAIN])v->input;
+    for (int c = 0; c < MAX_CH; ++c) {
+        channels[c] = data[c];
+        channels[MAX_CH + c] = bus ? v->input + (size_t)(MAX_CH + c) * MAX_GRAIN : silence;
+    }
     UserFxContext context = {channels, v->user_fx_data[0], v->user_fx_data[1], v->user_fx_data[2], 0, v->channels, n, v->rack->system->rate};
     UserFxHandler handler = v->user_fx;
     ++stat_user_fx;
@@ -1933,6 +1966,16 @@ static float peak_of(float data[MAX_CH][MAX_GRAIN], uint32_t channels, uint32_t 
     return peak;
 }
 
+static int diag_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = log_enabled() && env_flag("NGS2_DIAG", 0);
+    return enabled;
+}
+static void diag_peaks(float *highest, float data[MAX_CH][MAX_GRAIN], uint32_t channels, uint32_t n) {
+    if (!diag_enabled()) return;
+    for (uint32_t c = 0; c < channels; ++c) { float a = peak_of(data + c, 1, n); if (a > highest[c]) highest[c] = a; }
+}
+
 static float scratch[MAX_CH][MAX_GRAIN];
 static float outputs[8][MAX_CH][MAX_GRAIN];
 static uint32_t output_channels[8];
@@ -1941,11 +1984,13 @@ static void process_sampler(Voice *v, uint32_t n) {
     if (v->state != ST_PLAYING || v->paused) { if (v->state != ST_PLAYING) v->peak = 0.0f; return; }
     uint32_t written = sampler_render(v, n, scratch);
     if (!written) { v->peak = 0.0f; return; }
+    diag_peaks(v->diag_in, scratch, v->channels, n);
     /* Console order: filters (location 0), envelope, user FX, filters (1), ports (2 + p). */
     filters_run(v, 0, scratch, scratch, v->channels, n);
     call_user_fx(v, scratch, n);
     filters_run(v, 1, scratch, scratch, v->channels, n);
     v->peak = peak_of(scratch, v->channels, n);
+    diag_peaks(v->diag_out, scratch, v->channels, n);
     send_ports(v, scratch, n);
 }
 
@@ -1984,6 +2029,7 @@ static void process_bus(Voice *v, uint32_t n) {
                 v->gain_last[c] = to;
             }
         v->peak = peak_of(data, v->channels, n);
+        diag_peaks(v->diag_out, data, MAX_CH, n);
         uint32_t o = v->output_id < 8 ? v->output_id : 0;
         for (uint32_t c = 0; c < v->channels; ++c) for (uint32_t k = 0; k < n; ++k) outputs[o][c][k] += data[c][k];
         if (v->channels > output_channels[o]) output_channels[o] = v->channels;
@@ -1997,6 +2043,7 @@ static void process_bus(Voice *v, uint32_t n) {
         break;
     }
     v->peak = peak_of(data, out_ch, n);
+    diag_peaks(v->diag_out, data, MAX_CH, n);
     uint32_t saved = v->channels;
     v->channels = out_ch;   /* ports see the bus output width */
     send_ports(v, data, n);
@@ -2076,6 +2123,59 @@ static void wav_update(void) {
     fflush(wav);
 }
 
+/* SOTC_NGS2_DIAG=1 (with SOTC_NGS2_LOG=1): every 5 s, one line per playing sampler voice (peak as
+ * decoded, peak after its filters, the filters, the ports, each channel's two peaks) and one per bus that
+ * carried sound (its delay or chorus settings, each channel). Peaks are the highest of the 5 s. */
+static int diag_append(char *out, int len, int size, const char *format, ...) __attribute__((format(printf, 4, 5)));
+static int diag_append(char *out, int len, int size, const char *format, ...) {
+    if (len >= size - 1) return len;
+    va_list args;
+    va_start(args, format);
+    int n = vsnprintf(out + len, (size_t)(size - len), format, args);
+    va_end(args);
+    return n < 0 ? len : len + n < size ? len + n : size - 1;
+}
+static void diag_dump(const System *s) {
+    for (const Rack *r = s->racks; r; r = r->next)
+        for (uint32_t i = 0; i < r->max_voices; ++i) {
+            Voice *v = r->voices[i];
+            if (!v) continue;
+            const int sampler = r->kind == KIND_SAMPLER;
+            const uint32_t channels = sampler ? v->channels : MAX_CH;
+            float in = 0.0f, out = 0.0f;
+            for (uint32_t c = 0; c < channels; ++c) { in = fmaxf(in, v->diag_in[c]); out = fmaxf(out, v->diag_out[c]); }
+            if (sampler ? v->state == ST_PLAYING : out != 0.0f) {
+                char text[900];
+                int len = 0;
+                text[0] = 0;
+                for (int k = 0; sampler && k < MAX_FILTERS; ++k) {
+                    const Biquad *f = &v->filters[k];
+                    if (f->used) len = diag_append(text, len, (int)sizeof(text), " F%d[loc %u type %#x fc %.0f q %.2f lvl %.3f mask %#x]", k, f->location, f->type, f->fc, f->q, f->level, f->mask);
+                }
+                for (uint32_t p = 0; p < MAX_PORTS; ++p) {
+                    const Port *port = &v->ports[p];
+                    if (!port->dest) continue;
+                    float highest = 0.0f;
+                    if (port->matrix >= 0 && (uint32_t)port->matrix < r->max_matrices) {
+                        const Matrix *m = &v->matrices[port->matrix];
+                        for (uint32_t k = 0; k < m->count; ++k) if (m->level[k] > highest) highest = m->level[k];
+                    }
+                    len = diag_append(text, len, (int)sizeof(text), " p%u->%#x:%p in%u vol %.3f mtx%d max %.3f;", p, port->dest->rack->id, (void *)port->dest, port->input, port->volume, port->matrix, highest);
+                }
+                if (v->delay && v->delay->used) len = diag_append(text, len, (int)sizeof(text), " DELAY type %d dry %.3f wet %.3f gain %.3f fb %.3f taps %u mask %#x flags %#x", v->delay->type, v->delay->dry, v->delay->wet, v->delay->gain, v->delay->feedback, v->delay->taps, v->delay->mask, v->delay->flags);
+                if (v->chorus && v->chorus->used) len = diag_append(text, len, (int)sizeof(text), " CHORUS dry %.3f wet %.3f gain %.3f mask %#x phases %u", v->chorus->dry, v->chorus->wet, v->chorus->gain, v->chorus->mask, v->chorus->phases);
+                len = diag_append(text, len, (int)sizeof(text), sampler ? " CH decoded/out" : " CH");
+                for (uint32_t c = 0; c < channels; ++c) {
+                    if (sampler) len = diag_append(text, len, (int)sizeof(text), " %.3f/%.3f", v->diag_in[c], v->diag_out[c]);
+                    else len = diag_append(text, len, (int)sizeof(text), " %.4f", v->diag_out[c]);
+                }
+                if (sampler) note("DIAG smp %p wave %#x ch %u pitch %.2f env %.3f decoded %.4f out %.4f%s", (void *)v, v->sampler->wave, v->sampler->wave_channels, v->sampler->pitch, v->sampler->env_level, in, out, text);
+                else note("DIAG bus %#x %p ch %u out %.4f fx %d%s", r->id, (void *)v, v->channels, out, v->user_fx != NULL, text);
+            }
+            memset(v->diag_in, 0, sizeof(v->diag_in));
+            memset(v->diag_out, 0, sizeof(v->diag_out));
+        }
+}
 static void summary(const System *s) {
     unsigned playing = 0, ready = 0;
     for (const Rack *r = s->racks; r; r = r->next)
@@ -2110,6 +2210,7 @@ static ABI int32_t ngs2_render(uintptr_t handle, const RenderBuffer *buffers, ui
             Voice *v = r->voices[i];
             v->fed = 0;
             if (v->has_input) { for (int c = 0; c < MAX_CH; ++c) memset(v->input + (size_t)c * MAX_GRAIN, 0, n * sizeof(float)); v->has_input = 0; }
+            if (v->has_side) { for (int c = MAX_CH; c < 2 * MAX_CH; ++c) memset(v->input + (size_t)c * MAX_GRAIN, 0, n * sizeof(float)); v->has_side = 0; }
         }
     }
     for (Rack *r = s->racks; r; r = r->next)
@@ -2132,6 +2233,10 @@ static ABI int32_t ngs2_render(uintptr_t handle, const RenderBuffer *buffers, ui
     stat_render_ns += ns;
     if (ns > stat_render_max_ns) stat_render_max_ns = ns;
     ++stat_render_count;
+    if (diag_enabled() && s->rate && !(s->renders % (5u * s->rate / n))) {
+        note("DIAG ---- render %llu", (unsigned long long)s->renders);
+        diag_dump(s);
+    }
     if (log_enabled() && s->rate && !(s->renders % (30u * s->rate / n))) summary(s);
     pthread_mutex_unlock(&lock);
     return NGS2_OK;

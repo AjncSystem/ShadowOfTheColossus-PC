@@ -3471,8 +3471,15 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         self.stopping = False
         self.output.put((code,))
 
-    # Quick settings the in-game menu may have changed (it writes them to the settings file).
-    LIVE_KEYS = ('fps_mode', 'framegen', 'textures', 'shadow_reuse', 'volume', 'upscaler', 'sharpness', 'rumble')
+    # Settings the in-game menu (F1) may have changed: it writes them to the settings file, the ones
+    # read at start for the next start (bbport_overlay.cpp BuildItems).
+    LIVE_KEYS = ('fps_mode', 'framegen', 'textures', 'shadow_reuse', 'volume', 'upscaler', 'sharpness', 'rumble',
+                 'fullscreen', 'show_fps', 'output_res', 'dlss_mode', 'dlss_sharpen', 'neo', 'hdr', 'af16',
+                 'present_mode', 'fx_fog', 'fx_vignette', 'fx_ssao', 'fx_motionblur', 'fps_dynamic', 'fg_mult',
+                 'fg_hudless', 'vram_use', 'grass_detail', 'grass_distance', 'grass_height', 'weed_distance',
+                 'weed_height', 'grass_shadows', 'grass_fade', 'audio_channels', 'audio_lfe', 'sound_firmware',
+                 'mouse', 'mouse_sens', 'mouse_invert', 'button_icons', 'ui_language', 'language', 'skip_logos',
+                 'skip_film', 'play_mode', 'debug_menu', 'debug_watch', 'dlss_compare')
 
     def reload_live_settings(self):
         saved = load_json(CONFIG_FILE, {})

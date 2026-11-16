@@ -12,9 +12,12 @@
 #include <array>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <mutex>
 #include <regex>
 #include <string>
+#include <string_view>
+#include <vector>
 
 
 #include <SDL3/SDL.h>
@@ -141,51 +144,6 @@ void SetOpen(bool value) {
     }
 }
 
-ImGuiKey KeyFromSdl(SDL_Keycode key) {
-    switch (key) {
-    case SDLK_TAB: return ImGuiKey_Tab;
-    case SDLK_LEFT: return ImGuiKey_LeftArrow;
-    case SDLK_RIGHT: return ImGuiKey_RightArrow;
-    case SDLK_UP: return ImGuiKey_UpArrow;
-    case SDLK_DOWN: return ImGuiKey_DownArrow;
-    case SDLK_PAGEUP: return ImGuiKey_PageUp;
-    case SDLK_PAGEDOWN: return ImGuiKey_PageDown;
-    case SDLK_HOME: return ImGuiKey_Home;
-    case SDLK_END: return ImGuiKey_End;
-    case SDLK_DELETE: return ImGuiKey_Delete;
-    case SDLK_BACKSPACE: return ImGuiKey_Backspace;
-    case SDLK_SPACE: return ImGuiKey_Space;
-    case SDLK_RETURN: return ImGuiKey_Enter;
-    case SDLK_KP_ENTER: return ImGuiKey_KeypadEnter;
-    case SDLK_ESCAPE: return ImGuiKey_Escape;
-    case SDLK_LCTRL: return ImGuiKey_LeftCtrl;
-    case SDLK_RCTRL: return ImGuiKey_RightCtrl;
-    case SDLK_LSHIFT: return ImGuiKey_LeftShift;
-    case SDLK_RSHIFT: return ImGuiKey_RightShift;
-    case SDLK_LALT: return ImGuiKey_LeftAlt;
-    case SDLK_RALT: return ImGuiKey_RightAlt;
-    default: return ImGuiKey_None;
-    }
-}
-
-ImGuiKey KeyFromGamepad(u8 button) {
-    switch (button) {
-    case SDL_GAMEPAD_BUTTON_SOUTH: return ImGuiKey_GamepadFaceDown;
-    case SDL_GAMEPAD_BUTTON_EAST: return ImGuiKey_GamepadFaceRight;
-    case SDL_GAMEPAD_BUTTON_WEST: return ImGuiKey_GamepadFaceLeft;
-    case SDL_GAMEPAD_BUTTON_NORTH: return ImGuiKey_GamepadFaceUp;
-    case SDL_GAMEPAD_BUTTON_DPAD_UP: return ImGuiKey_GamepadDpadUp;
-    case SDL_GAMEPAD_BUTTON_DPAD_DOWN: return ImGuiKey_GamepadDpadDown;
-    case SDL_GAMEPAD_BUTTON_DPAD_LEFT: return ImGuiKey_GamepadDpadLeft;
-    case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: return ImGuiKey_GamepadDpadRight;
-    case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: return ImGuiKey_GamepadL1;
-    case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: return ImGuiKey_GamepadR1;
-    case SDL_GAMEPAD_BUTTON_START: return ImGuiKey_GamepadStart;
-    case SDL_GAMEPAD_BUTTON_BACK: return ImGuiKey_GamepadBack;
-    default: return ImGuiKey_None;
-    }
-}
-
 // sotc: a short message at the top of the screen (F8: the frame generation mode): its text
 // (under imgui_mutex) and until when, in steady clock milliseconds.
 std::string toast_text;
@@ -251,39 +209,9 @@ float PixelDensity(SDL_WindowID id) {
     return density > 0.0f ? density : 1.0f;
 }
 
-// Marks the settings dirty when a widget changed them.
-template <typename T>
-void Store(std::atomic<T>& target, T value, bool changed) {
-    if (changed) {
-        target = value;
-        dirty = true;
-    }
-}
-
-void Checkbox(const char* label, std::atomic<bool>& value) {
-    bool v = value;
-    Store(value, v, ImGui::Checkbox(label, &v));
-}
-
-void Slider(const char* label, std::atomic<float>& value, float lo, float hi) {
-    float v = value;
-    Store(value, v, ImGui::SliderFloat(label, &v, lo, hi, "%.2f"));
-}
-
-void Hint(const char* text) {
-    ImGui::SameLine();
-    ImGui::TextDisabled("(?)");
-    if (ImGui::BeginItemTooltip()) {
-        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
-        ImGui::TextUnformatted(text);
-        ImGui::PopTextWrapPos();
-        ImGui::EndTooltip();
-    }
-}
-
-// sotc: the launcher's settings file (SOTC_LAUNCHER_SETTINGS, user/launcher_settings.json), so a
-// quick setting changed in the menu is also the launcher's choice next time. Only keys already in
-// the file are replaced.
+// sotc: the launcher's settings file (SOTC_LAUNCHER_SETTINGS, user/launcher_settings.json), so what
+// is changed in the menu is also the launcher's choice next time. Values are handled as raw JSON
+// ("\"60\"", true); a key the file does not have yet is added at its end.
 std::filesystem::path LauncherSettingsPath() {
 #ifdef _WIN32
     const wchar_t* wpath = _wgetenv(L"SOTC_LAUNCHER_SETTINGS");
@@ -310,24 +238,92 @@ std::regex LauncherSettingRegex(const char* key) {
     return std::regex("(\"" + std::string(key) + "\"\\s*:\\s*)(\"[^\"]*\"|true|false|-?[0-9.]+)");
 }
 
-// The value of a key (a string without its quotes), or "" when it is not in the file.
-std::string LoadLauncherSetting(const char* key) {
-    const std::string text = ReadLauncherSettings();
+std::mutex settings_mutex;                                  // the cache, the snapshot and the file
+std::unordered_map<std::string, std::string> setting_cache; // raw values, as last read or written
+std::string start_settings;                                 // the file as the game started
+bool start_read = false;
+
+std::string RawFrom(const std::string& text, const char* key) {
     std::smatch m;
-    if (!std::regex_search(text, m, LauncherSettingRegex(key))) {
-        return {};
+    return std::regex_search(text, m, LauncherSettingRegex(key)) ? m[2].str() : std::string{};
+}
+
+void SnapshotStartLocked() {
+    if (!start_read) {
+        start_settings = ReadLauncherSettings();
+        start_read = true;
     }
-    std::string v = m[2].str();
+}
+
+// The raw JSON value of a key now, or "" when the file does not have it.
+std::string SettingRaw(const char* key) {
+    std::scoped_lock lock{settings_mutex};
+    if (const auto it = setting_cache.find(key); it != setting_cache.end()) {
+        return it->second;
+    }
+    return setting_cache[key] = RawFrom(ReadLauncherSettings(), key);
+}
+
+// The raw JSON value the game started with: a ◆ setting differs from it until the game restarts.
+std::string StartRaw(const char* key) {
+    std::scoped_lock lock{settings_mutex};
+    SnapshotStartLocked();
+    return RawFrom(start_settings, key);
+}
+
+std::string Unquote(const std::string& v) {
     return v.size() >= 2 && v.front() == '"' ? v.substr(1, v.size() - 2) : v;
 }
 
-void SaveLauncherSetting(const char* key, const std::string& json_value) {
-    std::string text = ReadLauncherSettings();
+// The value of a key (a string without its quotes), or "" when it is not in the file.
+std::string LoadLauncherSetting(const char* key) {
+    return Unquote(SettingRaw(key));
+}
+
+// Settings the launcher's play modes set: changing one by hand makes the mode Custom, as in the
+// launcher (else the mode would put its own value back).
+bool PlayModeKey(std::string_view key) {
+    static constexpr std::string_view keys[] = {
+        "neo",           "fps_mode",       "textures",     "af16",          "upscaler",
+        "sharpness",     "vram_use",       "dlss_mode",    "grass_shadows", "grass_distance",
+        "grass_height",  "weed_distance",  "weed_height",  "grass_fade",    "grass_detail"};
+    return std::find(std::begin(keys), std::end(keys), key) != std::end(keys);
+}
+
+void WriteSetting(std::string& text, const std::string& key, const std::string& json_value) {
     std::smatch m;
-    if (text.empty() || !std::regex_search(text, m, LauncherSettingRegex(key))) {
+    if (std::regex_search(text, m, LauncherSettingRegex(key.c_str()))) {
+        text = m.prefix().str() + m[1].str() + json_value + m.suffix().str();
         return;
     }
-    text = m.prefix().str() + m[1].str() + json_value + m.suffix().str();
+    const size_t end = text.rfind('}');
+    if (end == std::string::npos || end == 0) {
+        return;
+    }
+    const size_t last = text.find_last_not_of(" \t\r\n", end - 1);
+    if (last == std::string::npos) {
+        return;
+    }
+    const bool empty = text[last] == '{';
+    text.insert(last + 1, std::string(empty ? "" : ",") + "\n  \"" + key + "\": " + json_value);
+}
+
+void SaveLauncherSetting(const char* key, const std::string& json_value) {
+    std::scoped_lock lock{settings_mutex};
+    SnapshotStartLocked();
+    setting_cache[key] = json_value;
+    std::string text = ReadLauncherSettings();
+    if (text.empty()) {
+        return;
+    }
+    WriteSetting(text, key, json_value);
+    if (PlayModeKey(key)) {
+        const std::string mode = RawFrom(text, "play_mode");
+        if (!mode.empty() && mode != "\"custom\"") {
+            WriteSetting(text, "play_mode", "\"custom\"");
+            setting_cache["play_mode"] = "\"custom\"";
+        }
+    }
     std::ofstream out(LauncherSettingsPath(), std::ios::binary | std::ios::trunc);
     out << text;
 }
@@ -407,431 +403,1330 @@ void SetRcas(int mode) {
     SotcEvent::Log("MENU", SotcUi::T("Nitidez (RCAS): %s", "Sharpening (RCAS): %s"), names[mode]);
 }
 
-// sotc: one of the launcher's grass choice lists as a combo. With a live value (SotcLive::grass)
-// a pick applies at once; without, it is only saved for the next start.
-struct GrassChoice {
-    const char* value;
+// ---- the settings menu (F1 / Insert / L3+R3) ------------------------------------------------------
+// sotc: laid out like ZooT-PC's menu: tabs at the top (Q/E, L1/R1), rows with their value between
+// arrows (up/down choose, left/right change), help for the chosen row on the right and the keys at
+// the bottom, in the game's colours (weathered stone, cloudy sky, sand, aged gold). What can change
+// while playing applies at once; what the game reads at start (marked ◆) is saved in the launcher's
+// settings and a band asks for a restart. SOTC_MENU_CLASSIC is not needed: every setting of the old
+// menu is here.
+
+// The menu's language: the launcher's (SOTC_UI_LANG), switchable in the Game tab.
+enum MenuLang { kLangPt, kLangEn, kLangEs, kLangZh, kLangKo, kLangRu, kLangCount };
+constexpr const char* kLangCodes[kLangCount] = {"pt", "en", "es", "zh", "ko", "ru"};
+std::atomic<int> menu_lang{-1};
+
+int LangFromCode(std::string_view code) {
+    for (int i = 0; i < kLangCount; ++i) {
+        if (code.substr(0, 2) == kLangCodes[i]) {
+            return i;
+        }
+    }
+    return kLangEn;
+}
+
+int MenuLanguage() {
+    int lang = menu_lang.load(std::memory_order_relaxed);
+    if (lang < 0) {
+        const char* v = std::getenv("SOTC_UI_LANG");
+        lang = LangFromCode(v ? v : "en");
+        menu_lang.store(lang, std::memory_order_relaxed);
+    }
+    return lang;
+}
+
+// Spanish, Chinese, Korean and Russian texts, looked up by the Portuguese one (as the launcher's
+// sotc_i18n.py); generated by tools/gen_menu_text.py, a missing one falls back to English.
+struct MenuText {
     const char* pt;
-    const char* en;
+    const char* es;
+    const char* zh;
+    const char* ko;
+    const char* ru;
 };
+#include "bbport_menu_text.inc"
 
-template <size_t N>
-void GrassCombo(const char* label, const char* key, const GrassChoice (&choices)[N],
-                std::atomic<float>* live, float env_value) {
-    using SotcUi::T;
-    static std::unordered_map<std::string, float> saved; // restart-only picks
-    float now;
-    if (live) {
-        const float v = live->load(std::memory_order_relaxed);
-        now = v >= 0.f ? v : env_value;
-    } else if (const auto it = saved.find(key); it != saved.end()) {
-        now = it->second;
-    } else {
-        // not saved yet (settings from before the grass options): the game's own value
-        const std::string v = LoadLauncherSetting(key);
-        now = saved[key] = v.empty() ? env_value : std::strtof(v.c_str(), nullptr);
+const char* L(const char* pt, const char* en) {
+    const int lang = MenuLanguage();
+    if (lang == kLangPt) {
+        return pt;
     }
-    char preview[16];
-    std::snprintf(preview, sizeof(preview), "%g", now);
-    const char* shown = preview;
-    for (const auto& c : choices) {
-        if (std::strtof(c.value, nullptr) == now) {
-            shown = T(c.pt, c.en);
+    if (lang == kLangEn) {
+        return en;
+    }
+    static const std::unordered_map<std::string_view, const MenuText*> table = [] {
+        std::unordered_map<std::string_view, const MenuText*> map;
+        for (const MenuText& t : kMenuText) {
+            map.emplace(t.pt, &t);
         }
+        return map;
+    }();
+    const auto it = table.find(pt);
+    if (it == table.end()) {
+        return en;
     }
-    if (ImGui::BeginCombo(label, shown)) {
-        for (const auto& c : choices) {
-            const float v = std::strtof(c.value, nullptr);
-            if (ImGui::Selectable(T(c.pt, c.en), v == now)) {
-                if (live) {
-                    live->store(v, std::memory_order_relaxed);
-                } else {
-                    saved[key] = v;
-                }
-                SaveLauncherSetting(key, "\"" + std::string(c.value) + "\"");
-            }
-        }
-        ImGui::EndCombo();
-    }
+    const char* text = lang == kLangEs   ? it->second->es
+                       : lang == kLangZh ? it->second->zh
+                       : lang == kLangKo ? it->second->ko
+                                         : it->second->ru;
+    return text && *text ? text : en;
 }
 
-// sotc: the launcher's grass options. Distance, height and detail are constants of the grass
-// compute shaders, so they apply at once; shadows and fade are engine settings read at start.
-void GrassSettings() {
-    using SotcUi::T;
-    static const std::array<float, 5> env = [] {
-        std::array<float, 5> s{1.f, 1.f, 1.f, 1.f, 1.f};
-        if (const char* v = std::getenv("SOTC_GRASS")) {
-            std::sscanf(v, "%f %f %f %f %f", &s[0], &s[1], &s[2], &s[3], &s[4]);
-        }
-        return s;
-    }();
-    static const GrassChoice detail[] = {{"1", "Como no PS4", "As on PS4"},
-                                         {"0.25", "Alto", "High"},
-                                         {"0.15", "Mais alto", "Higher"},
-                                         {"0.1", "Muito alto", "Very high"}};
-    static const GrassChoice distance[] = {{"1", "Como no PS4", "As on PS4"},
-                                           {"2", "2x mais longe", "2x farther"},
-                                           {"3", "3x mais longe", "3x farther"},
-                                           {"5", "5x mais longe", "5x farther"}};
-    static const GrassChoice weed_distance[] = {
-        {"1", "Como no PS4", "As on PS4"},
-        {"2", "2x mais longe", "2x farther"},
-        {"3", "3x mais longe", "3x farther"},
-        {"5", "5x mais longe", "5x farther"},
-        {"10", "10x mais longe (campo denso)", "10x farther (dense field)"}};
-    static const GrassChoice height[] = {{"0.75", "75%", "75%"},
-                                         {"1", "Como no PS4", "As on PS4"},
-                                         {"1.5", "150%", "150%"},
-                                         {"2", "200% (arbustos)", "200% (bushes)"}};
-    static const GrassChoice shadows[] = {
-        {"1", "Perto (~3 m, mais leve)", "Near (~3 m, lighter)"},
-        {"2", "Como no PS4 (~8 m)", "As on PS4 (~8 m)"},
-        {"3", "Longe (~24 m, mais pesado)", "Far (~24 m, heavier)"}};
-    static const GrassChoice fade[] = {{"0.5", "50%", "50%"},
-                                       {"0.75", "75%", "75%"},
-                                       {"1", "Como no PS4", "As on PS4"},
-                                       {"2", "200%", "200%"},
-                                       {"3", "300%", "300%"}};
-
-    ImGui::SeparatorText(T("Grama", "Grass"));
-    GrassCombo(T("Detalhe da grama", "Grass detail"), "grass_detail", detail, &SotcLive::grass[4],
-               env[4]);
-    Hint(T("Lâminas completas mais longe: a grama e a sombra perto de você não surgem tarde.",
-           "Full blades farther out: grass and its shadow near you no longer pop in late."));
-    GrassCombo(T("Distância da grama", "Grass distance"), "grass_distance", distance,
-               &SotcLive::grass[0], env[0]);
-    GrassCombo(T("Altura da grama", "Grass height"), "grass_height", height, &SotcLive::grass[1],
-               env[1]);
-    Hint(T("Recomendado: como no PS4, ou 150% se gosta de mais grama; 200% vira arbusto.",
-           "Recommended: as on PS4, or 150% if you like more grass; 200% turns it into bushes."));
-    GrassCombo(T("Distância do mato", "Weed distance"), "weed_distance", weed_distance,
-               &SotcLive::grass[2], env[2]);
-    GrassCombo(T("Altura do mato", "Weed height"), "weed_height", height, &SotcLive::grass[3],
-               env[3]);
-    GrassCombo(T("Sombras da grama (ao reiniciar)", "Grass shadows (on restart)"), "grass_shadows",
-               shadows, nullptr, 2.f);
-    GrassCombo(T("Esmaecimento da grama (ao reiniciar)", "Grass fade (on restart)"), "grass_fade",
-               fade, nullptr, 1.f);
-    Hint(T("Abaixo de 100% a sombra da grama também some (50%: quase sem sombra). Menos grama "
-           "alivia um pouco a GPU.",
-           "Below 100% the grass shadow fades too (50%: almost no shadow). Less grass is a little "
-           "lighter on the GPU."));
-}
-
-// sotc: "Quick settings": the launcher's quick settings that can change while playing.
-void QuickSettings() {
-    using SotcUi::T;
-    ImGui::SeparatorText(T("Ajuste rápido (vale na hora)", "Quick settings (apply at once)"));
-
-    // sotc: FPS as the launcher's: 30 (the game's cap), 60 or unlimited. F7 switches the cap.
-    const bool uncapped = SotcFpsCap::uncapped.load(std::memory_order_relaxed);
-    const int fps_mode = FpsMode();
-    const char* fps_names[] = {T("30 FPS (como no PS4)", "30 FPS (as on PS4)"), "60 FPS",
-                               T("Ilimitado", "Unlimited")};
-    if (ImGui::BeginCombo("FPS  [F7]", fps_names[fps_mode])) {
-        for (int i = 0; i < 3; ++i) {
-            if (ImGui::Selectable(fps_names[i], i == fps_mode) && i != fps_mode) {
-                SetFpsMode(i);
-            }
-        }
-        ImGui::EndCombo();
-    }
-    // sotc: flip pacing at 60 FPS and unlimited (videoout driver.cpp): the game's own rate or the vblank grid.
-    const bool paced = SotcFpsCap::flip_pacer.load(std::memory_order_relaxed);
-    const char* pace_names[] = {T("Grade do vblank (original)", "Vblank grid (original)"),
-                                T("Suave (ritmo do jogo)", "Smooth (game's rate)")};
-    if (ImGui::BeginCombo(T("Ritmo dos quadros  [F6]", "Frame pacing  [F6]"), pace_names[paced])) {
-        for (int i = 0; i < 2; ++i) {
-            if (ImGui::Selectable(pace_names[i], i == int(paced)) && i != int(paced)) {
-                SotcFpsCap::TogglePacer();
-            }
-        }
-        ImGui::EndCombo();
-    }
-    Hint(T("Em 60 FPS e ilimitado: solta cada quadro no ritmo do jogo em vez de na grade do "
-           "vblank (sem o tranco 8/17 ms ou 17/25 ms).",
-           "At 60 FPS and unlimited: releases each frame at the game's rate instead of on the "
-           "vblank grid (no 8/17 ms or 17/25 ms double-beat)."));
-
-    // Started at 30 FPS the game is not in its own 60 FPS mode (fps60game, chosen at start):
-    // uncapped it runs faster, but some physics may be off (the 2nd colossus' wall).
-    if (uncapped && !SotcFpsCap::target_slot.load(std::memory_order_relaxed)) {
-        Hint(T("Aberto em 30 FPS: o modo 60 do próprio jogo (física certa) só entra abrindo o jogo "
-               "com 60 FPS no lançador.",
-               "Started at 30 FPS: the game's own 60 FPS mode (right physics) only applies when the "
-               "game starts with 60 FPS in the launcher."));
-    }
-
-    // sotc: upscaler and sharpening, applied at the next frame (vk_presenter.cpp, sotc_live.h).
-    static const int env_fsr1 = [] {
-        const char* v = std::getenv("BB_FSR1");
-        return v && v[0] != '0' ? 1 : 0;
-    }();
-    const int live_fsr1 = SotcLive::fsr1.load(std::memory_order_relaxed);
-    const int up_mode = (live_fsr1 >= 0 ? live_fsr1 : env_fsr1) ? 0 : 1;
-    const char* up_names[] = {T("FSR 1 (AMD, qualquer placa)", "FSR 1 (AMD, any GPU)"),
-                              T("Bilinear (simples)", "Bilinear (plain)")};
-    // sotc: DLSS and AMD FSR 4 (SOTC_UPSCALER=dlss / fsr4) are chosen at start, their render
-    // size with them: shown, not switchable here (picking FSR 1 here saved "fsr1" over the
-    // launcher's DLSS, 26 Oct).
-    static const char* start_upscaler = [] {
-        const char* v = std::getenv("SOTC_UPSCALER");
-        return !v ? nullptr
-               : std::strcmp(v, "dlss") == 0 ? "NVIDIA DLSS"
-               : std::strcmp(v, "fsr4") == 0 ? "AMD FSR 4"
-                                             : nullptr;
-    }();
-    if (start_upscaler) {
-        ImGui::BeginDisabled();
-        if (ImGui::BeginCombo("Upscaler", start_upscaler)) {
-            ImGui::EndCombo();
-        }
-        ImGui::EndDisabled();
-        Hint(T("Este upscaler troca no lançador (vale ao abrir o jogo de novo).",
-               "This upscaler is switched in the launcher (applies when the game starts again)."));
-    } else if (ImGui::BeginCombo("Upscaler", up_names[up_mode])) {
-        for (int i = 0; i < 2; ++i) {
-            if (ImGui::Selectable(up_names[i], i == up_mode) && i != up_mode) {
-                SetUpscaler(i);
-            }
-        }
-        ImGui::EndCombo();
-    }
-    static const int env_rcas = [] {
-        const char* on = std::getenv("BB_RCAS");
-        if (on && on[0] == '0') {
-            return -2;
-        }
-        const char* v = std::getenv("BB_RCAS_ATTENUATION");
-        return v ? std::atoi(v) : 250;
-    }();
-    const int live_rcas = SotcLive::rcas.load(std::memory_order_relaxed);
-    const int rcas_now = live_rcas != -1 ? live_rcas : env_rcas;
-    const char* rcas_names[] = {T("Alta", "High"), T("Média (padrão)", "Medium (default)"),
-                                T("Baixa", "Low"), T("Desligada", "Off")};
-    int rcas_mode = 1;
-    for (int i = 0; i < 4; ++i) {
-        if (RcasValues[i] == rcas_now) {
-            rcas_mode = i;
-        }
-    }
-    if (ImGui::BeginCombo(T("Nitidez (RCAS)", "Sharpening (RCAS)"), rcas_names[rcas_mode])) {
-        for (int i = 0; i < 4; ++i) {
-            if (ImGui::Selectable(rcas_names[i], i == rcas_mode) && i != rcas_mode) {
-                SetRcas(i);
-            }
-        }
-        ImGui::EndCombo();
-    }
-    if (!(live_fsr1 >= 0 ? live_fsr1 : env_fsr1)) {
-        Hint(T("A nitidez vale com o FSR 1.", "Sharpening applies with FSR 1."));
-    }
-
-    using Vulkan::FrameGen::Mode;
-    const Mode fg = Vulkan::FrameGen::Current();
-    const char* fg_names[] = {T("Desligada", "Off"), "NVIDIA DLSS-G", "AMD FSR 3"};
-    const char* fg_keys[] = {"\"off\"", "\"dlss\"", "\"fsr\""};
-    if (ImGui::BeginCombo(T("Geração de quadros  [F8]", "Frame generation  [F8]"),
-                          fg_names[static_cast<int>(fg)])) {
-        for (int i = 0; i < 3; ++i) {
-            const Mode mode = static_cast<Mode>(i);
-            const bool available = Vulkan::FrameGen::Available(mode);
-            if (!available) {
-                ImGui::BeginDisabled();
-            }
-            if (ImGui::Selectable(fg_names[i], mode == fg) && available &&
-                Vulkan::FrameGen::Set(mode)) {
-                SaveLauncherSetting("framegen", fg_keys[i]);
-                SotcEvent::Log("MENU", SotcUi::T("Geração de quadros: %s", "Frame generation: %s"),
-                               fg_names[i]);
-            }
-            if (!available) {
-                ImGui::EndDisabled();
-            }
-        }
-        ImGui::EndCombo();
-    }
-
-    static const int env_linger = [] {
-        const char* v = std::getenv("SOTC_LOD_LINGER");
-        return v ? std::atoi(v) : 0;
-    }();
-    const int live_linger = SotcLive::lod_linger.load(std::memory_order_relaxed);
-    const int live_low = SotcLive::lod_pool_low.load(std::memory_order_relaxed);
-    const bool hq = (live_linger >= 0 ? live_linger : env_linger) > 0;
-    const int tex_level = !hq ? 0 : (live_low >= 0 ? live_low : EnvPoolLow()) > 0 ? 1 : 2;
-    const char* tex_names[] = {T("Desligada", "Off"), T("Alta (estável)", "High (stable)"),
-                               T("Máxima (nítida)", "Maximum (sharp)")};
-    // sotc: "Maximum" in PS4 Pro mode exhausted the game's page pool within minutes at the Shrine
-    // (0x1a371, 22 Oct) until tabnul's page allocator fix (PR #288); experimental there since.
-    // SOTC_MAX_IN_PRO=0 blocks it again.
-    static const bool neo = [] {
-        const char* v = std::getenv("SOTC_NEO");
-        const char* allow = std::getenv("SOTC_MAX_IN_PRO");
-        return v && v[0] == '1' && allow && allow[0] == '0';
-    }();
-    if (ImGui::BeginCombo(T("Qualidade das texturas", "Texture quality"), tex_names[tex_level])) {
-        for (int i = 0; i < 3; ++i) {
-            const bool blocked = neo && i == 2;
-            if (blocked) {
-                ImGui::BeginDisabled();
-            }
-            if (ImGui::Selectable(tex_names[i], i == tex_level) && i != tex_level && !blocked) {
-                SetTextureLevel(i);
-            }
-            if (blocked) {
-                ImGui::EndDisabled();
-                ImGui::SameLine();
-                ImGui::TextDisabled("%s", T("— não no modo PS4 Pro", "— not in PS4 Pro mode"));
-            }
-        }
-        ImGui::EndCombo();
-    }
-    Hint(T("Alta: folhas e pedras nítidas, um pouco menos em vistas amplas. Máxima: sempre "
-           "nítida, mas pode fechar em vistas muito amplas (fora do modo PS4 Pro, onde fechava "
-           "em minutos). Alta e Máxima valem na hora (o jogo leva alguns segundos para carregar "
-           "as texturas); Desligada só aparece ao abrir o jogo de novo (o jogo não descarta o "
-           "que já carregou).",
-           "High: sharp leaves and rocks, a little less in wide views. Maximum: always sharp, "
-           "but it may close in very wide views (not in PS4 Pro mode, where it closed within "
-           "minutes). High and Maximum apply at once (the game takes a few seconds to load the "
-           "textures); Off only shows when the game starts again (the game keeps what it already "
-           "loaded)."));
-
-    static const int env_reuse = [] {
-        const char* v = std::getenv("SOTC_SHADOW_REUSE");
-        if (!v) {
-            return 0;
-        }
-        if (v[0] == 'a') {
-            return s_instance && s_instance->GetVendorID() == 0x10DE ? 1 : 0;
-        }
-        return v[0] == '0' ? 0 : 1;
-    }();
-    const int live_reuse = SotcLive::shadow_reuse.load(std::memory_order_relaxed);
-    bool reuse = (live_reuse >= 0 ? live_reuse : env_reuse) > 0;
-    if (ImGui::Checkbox(T("Reaproveitar sombras distantes (podem piscar)",
-                          "Reuse far shadows (they may blink)"),
-                        &reuse)) {
-        SotcLive::shadow_reuse.store(reuse ? 1 : 0, std::memory_order_relaxed);
-        SaveLauncherSetting("shadow_reuse", reuse ? "\"1\"" : "\"0\"");
-        SotcEvent::Log("MENU", SotcUi::T("Reaproveitar sombras distantes: %s", "Reuse far shadows: %s"),
-                       reuse ? SotcUi::T("ligado", "on") : SotcUi::T("desligado", "off"));
-    }
-
-    if (runtime_audio_volume_percent && runtime_audio_set_volume_percent) {
-        static const int volumes[] = {100, 150, 200, 300, 400, 500};
-        const int now = runtime_audio_volume_percent();
-        char label[16];
-        std::snprintf(label, sizeof(label), "%d%%", now);
-        if (ImGui::BeginCombo(T("Volume", "Volume"), label)) {
-            for (const int v : volumes) {
-                char item[16];
-                std::snprintf(item, sizeof(item), "%d%%", v);
-                if (ImGui::Selectable(item, v == now)) {
-                    runtime_audio_set_volume_percent(v);
-                    SaveLauncherSetting("volume", "\"" + std::to_string(v) + "\"");
-                    SotcEvent::Log("MENU", "Volume: %d%%", v);
-                }
-            }
-            ImGui::EndCombo();
-        }
-    }
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-    ImGui::TextWrapped("%s", T("Resolução, efeitos (névoa, vinheta, SSAO), AF 16x, modo PS4 Pro e "
-                                "memória de vídeo: no lançador (valem ao abrir o jogo de novo).",
-                                "Resolution, effects (fog, vignette, SSAO), 16x AF, PS4 Pro mode and "
-                                "video memory use: in the launcher (they apply when the game starts "
-                                "again)."));
-    ImGui::PopStyleColor();
-    GrassSettings();
-}
-
-void Menu() {
-    auto& s = BbSettings::Get();
-    const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + 40.0f * base_scale,
-                                   viewport->WorkPos.y + 40.0f * base_scale),
-                            ImGuiCond_Appearing);
-    ImGui::SetNextWindowSize(ImVec2(660.0f * base_scale, 0.0f), ImGuiCond_Appearing);
-    bool keep_open = true;
-    const std::string title = std::string("Shadow of the Colossus — ") +
-                              SotcUi::T("Configurações", "Settings") + "  (Insert / F1 / L3+R3)###menu";
-    if (!ImGui::Begin(title.c_str(), &keep_open,
-                      ImGuiWindowFlags_NoCollapse)) {
-        ImGui::End();
+// Chinese and Korean need glyphs DejaVu Sans does not have: Windows' own fonts are merged into the
+// menu font when one of these languages is chosen (ImGui 1.92 loads glyphs as they are drawn).
+bool cjk_font_loaded = false;
+void EnsureCjkFont() {
+    const int lang = MenuLanguage();
+    if (cjk_font_loaded || (lang != kLangZh && lang != kLangKo)) {
         return;
     }
-
-    // --- Header: FPS, GPU & VRAM info ---
-    ImGui::Text("%.0f FPS  (%.1f ms)", frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f,
-                frame_ms_avg);
-    if (s_instance) {
-        const u64 budget_mb = s_instance->GetTotalMemoryBudget() / (1024 * 1024);
-        const u64 used_mb = s_instance->GetDeviceMemoryUsage() / (1024 * 1024);
-        ImGui::SameLine();
-        ImGui::TextDisabled(" |  %s (%lu / %lu MB VRAM)",
-                            std::string(s_instance->GetModelName()).c_str(),
-                            static_cast<unsigned long>(used_mb),
-                            static_cast<unsigned long>(budget_mb));
-    }
-
-    QuickSettings();
-
-    // sotc: only what the SotC port reads. Bloodborne's output resolution, temporal upscalers
-    // (FSR 3.1/4, DLSS, TAA, presets), RCAS strength and engine effects were shown here but never
-    // applied: those are the launcher's (environment and engine cvars at start).
-    ImGui::SeparatorText(SotcUi::T("Tela", "Display"));
-    bool fs = s.fullscreen.load();
-    if (ImGui::Checkbox(SotcUi::T("Tela cheia  [F11]", "Fullscreen  [F11]"), &fs)) {
-        Store(s.fullscreen, fs, true);
-        if (g_window) {
-            g_window->SetFullscreen(fs);
+    cjk_font_loaded = true;
+#ifdef _WIN32
+    const char* windir = std::getenv("WINDIR");
+    const std::string fonts = std::string(windir ? windir : "C:\\Windows") + "\\Fonts\\";
+    for (const char* file : {"msyh.ttc", "malgun.ttf", "simsun.ttc"}) {
+        std::error_code ec;
+        if (std::filesystem::exists(fonts + file, ec)) {
+            ImFontConfig config;
+            config.MergeMode = true;
+            ImGui::GetIO().Fonts->AddFontFromFileTTF((fonts + file).c_str(), 18.0f, &config);
         }
-        SotcEvent::Log("MENU", SotcUi::T("Tela cheia: %s", "Fullscreen: %s"),
-                       fs ? SotcUi::T("ligada", "on") : SotcUi::T("desligada", "off"));
     }
-    ImGui::SameLine();
-    Checkbox(SotcUi::T("Mostrar FPS  [F10]", "Show FPS  [F10]"), s.show_fps);
+#endif
+}
 
-    ImGui::SeparatorText(SotcUi::T("Câmera e mouse", "Camera & mouse"));
-    if (const bool was = s.mouse_enabled.load(); Checkbox(SotcUi::T("Câmera pelo mouse", "Mouse camera"), s.mouse_enabled), was != s.mouse_enabled.load()) {
-        SotcEvent::Log("MENU", SotcUi::T("Câmera pelo mouse: %s", "Mouse camera: %s"),
-                       s.mouse_enabled.load() ? SotcUi::T("ligada", "on") : SotcUi::T("desligada", "off"));
-    }
-    ImGui::BeginDisabled(!s.mouse_enabled);
-    Slider(SotcUi::T("Sensibilidade do mouse", "Mouse sensitivity"), s.mouse_sens, 0.1f, 3.0f);
-    if (const bool was = s.mouse_invert.load(); Checkbox(SotcUi::T("Inverter eixo vertical (Y)", "Invert vertical axis (Y)"), s.mouse_invert), was != s.mouse_invert.load()) {
-        SotcEvent::Log("MENU", SotcUi::T("Inverter eixo Y do mouse: %s", "Invert mouse Y axis: %s"),
-                       s.mouse_invert.load() ? SotcUi::T("ligado", "on") : SotcUi::T("desligado", "off"));
-    }
-    ImGui::EndDisabled();
+enum MenuTab { kTabDisplay, kTabPerf, kTabGrass, kTabSound, kTabControls, kTabGame, kTabDebug, kTabCount };
 
-    // sotc: the pad's vibration, at once and kept as the launcher's option (#292)
+struct MenuChoice {
+    std::string label;
+    std::string value; // raw JSON for the launcher's settings, or an index for live ones
+};
+
+struct MenuItem {
+    int tab = kTabDisplay;
+    std::string label, help, hotkey;
+    std::vector<MenuChoice> choices;
+    std::function<int()> get;              // the current choice (-1: none of them)
+    std::function<void(int)> set;          // pick a choice
+    std::function<bool()> restart_pending; // a change waits for the game to restart
+    std::function<bool(int)> choice_ok;    // a choice this PC cannot take (skipped, grey)
+    std::function<bool()> shown;           // rows that only matter with another setting
+    std::function<bool()> enabled;
+    bool restart = false;                  // ◆: read when the game starts
+    bool action = false;                   // a button (one choice that runs something)
+};
+
+std::vector<MenuItem> items;
+int items_lang = -1;
+std::atomic<int> pending_fullscreen{-1}; // the menu's choice, for the window thread (UpdateTextInput)
+int menu_tab = kTabDisplay;
+std::array<int, kTabCount> menu_row{};
+std::array<int, kTabCount> menu_first{};
+bool menu_pad = false;              // the last menu input came from a controller
+bool stick_x[2]{}, stick_y[2]{};    // the left stick's held directions (-, +)
+enum MenuInput { kInUp, kInDown, kInLeft, kInRight, kInActivate, kInTabPrev, kInTabNext };
+std::vector<int> menu_inputs;       // from HandleEvent, applied by DrawMenu (render thread)
+
+int IndexOf(const std::vector<MenuChoice>& choices, const std::string& value) {
+    for (size_t i = 0; i < choices.size(); ++i) {
+        if (choices[i].value == value) {
+            return int(i);
+        }
+    }
+    return -1;
+}
+
+std::vector<MenuChoice> OnOff() {
+    return {{L("Desligado", "Off"), "false"}, {L("Ligado", "On"), "true"}};
+}
+
+std::vector<MenuChoice> Quoted(std::initializer_list<std::pair<const char*, std::string>> list) {
+    std::vector<MenuChoice> out;
+    for (const auto& [value, label] : list) {
+        out.push_back({label, "\"" + std::string(value) + "\""});
+    }
+    return out;
+}
+
+// A setting the game reads at start: saved in the launcher's settings, applied at the restart.
+MenuItem& AddRestart(int tab, const char* key, const char* label, const char* help,
+                     std::vector<MenuChoice> choices, const char* fallback) {
+    MenuItem item;
+    item.tab = tab;
+    item.label = label;
+    item.help = help;
+    item.restart = true;
+    item.choices = std::move(choices);
+    const std::string k = key, fb = fallback;
+    std::vector<std::string> values;
+    for (const auto& c : item.choices) {
+        values.push_back(c.value);
+    }
+    item.get = [k, fb, values] {
+        std::string v = SettingRaw(k.c_str());
+        for (size_t i = 0; i < values.size(); ++i) {
+            if (values[i] == (v.empty() ? fb : v)) {
+                return int(i);
+            }
+        }
+        return -1;
+    };
+    item.set = [k, values](int i) { SaveLauncherSetting(k.c_str(), values[size_t(i)]); };
+    item.restart_pending = [k, fb] {
+        std::string now = SettingRaw(k.c_str()), start = StartRaw(k.c_str());
+        return (now.empty() ? fb : now) != (start.empty() ? fb : start);
+    };
+    items.push_back(std::move(item));
+    return items.back();
+}
+
+// A setting that applies at once.
+MenuItem& AddLive(int tab, const char* label, const char* help, std::vector<MenuChoice> choices,
+                  std::function<int()> get, std::function<void(int)> set) {
+    MenuItem item;
+    item.tab = tab;
+    item.label = label;
+    item.help = help;
+    item.choices = std::move(choices);
+    item.get = std::move(get);
+    item.set = std::move(set);
+    items.push_back(std::move(item));
+    return items.back();
+}
+
+std::vector<MenuChoice> Indexed(std::initializer_list<const char*> labels) {
+    std::vector<MenuChoice> out;
+    for (const char* l : labels) {
+        out.push_back({l, std::to_string(out.size())});
+    }
+    return out;
+}
+
+bool UpscalerAtStartIsTemporal() {
+    const std::string v = Unquote(StartRaw("upscaler"));
+    if (!v.empty()) {
+        return v == "dlss" || v == "fsr4";
+    }
+    const char* env = std::getenv("SOTC_UPSCALER");
+    return env && (std::strcmp(env, "dlss") == 0 || std::strcmp(env, "fsr4") == 0);
+}
+
+bool UpscalerIsTemporal() {
+    const std::string v = LoadLauncherSetting("upscaler");
+    return v.empty() ? UpscalerAtStartIsTemporal() : v == "dlss" || v == "fsr4";
+}
+
+void BuildItems() {
+    items.clear();
+    items_lang = MenuLanguage();
+    auto& s = BbSettings::Get();
+
+    // ---- Display
+    AddLive(kTabDisplay, L("Tela cheia", "Fullscreen"),
+            L("Alterna entre janela e tela cheia.", "Switches between a window and fullscreen."),
+            {{L("Janela", "Window"), "0"}, {L("Tela cheia", "Fullscreen"), "1"}},
+            [] {
+                const int pending = pending_fullscreen.load(std::memory_order_relaxed);
+                if (pending >= 0) {
+                    return pending;
+                }
+                return (g_window ? g_window->IsFullscreen() : BbSettings::Get().fullscreen.load()) ? 1 : 0;
+            },
+            [](int v) {
+                BbSettings::Get().fullscreen = v != 0;
+                dirty = true;
+                // sotc: the window thread switches it (UpdateTextInput): SDL's switch waits for
+                // that thread, which may be waiting for imgui_mutex held here (a hang, 16 Nov).
+                pending_fullscreen.store(v, std::memory_order_relaxed);
+                SaveLauncherSetting("fullscreen", v ? "true" : "false");
+            })
+        .hotkey = "F11";
+    {
+        std::vector<MenuChoice> outputs;
+        for (const char* size : {"1280x720", "1920x1080", "2560x1440", "3840x2160", "1920x1200",
+                                 "2560x1600", "2560x1080", "3440x1440", "3840x1600", "3840x1080",
+                                 "5120x1440"}) {
+            std::string label = size;
+            label.replace(label.find('x'), 1, " × ");
+            const std::string sz = size;
+            const char* aspect = sz == "1920x1200" || sz == "2560x1600"   ? "16:10"
+                                 : sz == "2560x1080" || sz == "3440x1440" ||
+                                         sz == "3840x1600"                 ? "21:9"
+                                 : sz == "3840x1080" || sz == "5120x1440" ? "32:9"
+                                                                          : "16:9";
+            outputs.push_back({label + "  (" + aspect + ")", "\"" + sz + "\""});
+        }
+        AddRestart(kTabDisplay, "output_res", L("Resolução de saída", "Output resolution"),
+                   L("O tamanho da imagem final. Com DLSS ou FSR 4 o jogo desenha menor e amplia até ela.",
+                     "The size of the final picture. With DLSS or FSR 4 the game renders smaller and scales up to it."),
+                   std::move(outputs), "\"1920x1080\"");
+    }
+    {
+        MenuItem& up = AddRestart(
+            kTabDisplay, "upscaler", L("Upscaler", "Upscaler"),
+            L("Como a imagem do jogo é ampliada para a tela. FSR 1 e Bilinear trocam na hora; DLSS e FSR 4 valem ao reiniciar o jogo.",
+              "How the game's picture is scaled to the screen. FSR 1 and Bilinear switch at once; DLSS and FSR 4 apply when the game restarts."),
+            Quoted({{"fsr1", L("FSR 1 (AMD, qualquer placa)", "FSR 1 (AMD, any GPU)")},
+                    {"dlss", "NVIDIA DLSS"},
+                    {"fsr4", "AMD FSR 4.1"},
+                    {"bilinear", L("Bilinear (simples)", "Bilinear (plain)")}}),
+            "\"fsr1\"");
+        // FSR 1 <-> Bilinear apply at the next frame when the game did not start with DLSS / FSR 4.
+        up.set = [](int i) {
+            const char* keys[] = {"fsr1", "dlss", "fsr4", "bilinear"};
+            if ((i == 0 || i == 3) && !UpscalerAtStartIsTemporal()) {
+                SetUpscaler(i == 0 ? 0 : 1);
+            } else {
+                SaveLauncherSetting("upscaler", "\"" + std::string(keys[i]) + "\"");
+            }
+        };
+        up.restart_pending = [] {
+            const std::string now = LoadLauncherSetting("upscaler");
+            return !now.empty() && (now == "dlss" || now == "fsr4" || UpscalerAtStartIsTemporal()) &&
+                   now != Unquote(StartRaw("upscaler"));
+        };
+    }
+    AddRestart(kTabDisplay, "dlss_mode", L("Modo do DLSS / FSR 4", "DLSS / FSR 4 mode"),
+               L("Quanto menor a imagem desenhada, mais FPS e menos nitidez.",
+                 "The smaller the rendered picture, the more FPS and the less sharpness."),
+               Quoted({{"dlaa", L("DLAA (nativo)", "DLAA (native)")},
+                       {"quality", L("Qualidade (1,5×)", "Quality (1.5×)")},
+                       {"balanced", L("Equilibrado (1,72×)", "Balanced (1.72×)")},
+                       {"performance", L("Desempenho (2×)", "Performance (2×)")},
+                       {"ultra", L("Ultra Desempenho (3×)", "Ultra Performance (3×)")}}),
+               "\"quality\"")
+        .shown = UpscalerIsTemporal;
+    {
+        static const int env_rcas = [] {
+            const char* on = std::getenv("BB_RCAS");
+            if (on && on[0] == '0') {
+                return -2;
+            }
+            const char* v = std::getenv("BB_RCAS_ATTENUATION");
+            return v ? std::atoi(v) : 250;
+        }();
+        AddLive(kTabDisplay, L("Nitidez (RCAS)", "Sharpening (RCAS)"),
+                L("O realce de nitidez do FSR 1. Vale na hora.", "FSR 1's sharpening. Applies at once."),
+                Indexed({L("Alta", "High"), L("Média (padrão)", "Medium (default)"), L("Baixa", "Low"),
+                         L("Desligada", "Off")}),
+                [] {
+                    const int live = SotcLive::rcas.load(std::memory_order_relaxed);
+                    const int now = live != -1 ? live : env_rcas;
+                    for (int i = 0; i < 4; ++i) {
+                        if (RcasValues[i] == now) {
+                            return i;
+                        }
+                    }
+                    return 1;
+                },
+                [](int i) { SetRcas(i); });
+    }
+    AddRestart(kTabDisplay, "dlss_sharpen", L("Nitidez do DLSS / FSR 4", "DLSS / FSR 4 sharpening"),
+               L("O realce de nitidez depois do DLSS ou do FSR 4.", "The sharpening after DLSS or FSR 4."),
+               Quoted({{"0", L("Alta (padrão)", "High (default)")}, {"0.5", L("Média", "Medium")},
+                       {"1", L("Baixa", "Low")}, {"off", L("Desligada", "Off")}}),
+               "\"0\"")
+        .shown = UpscalerIsTemporal;
+    AddRestart(kTabDisplay, "neo", L("Modo PS4 Pro", "PS4 Pro mode"),
+               L("Os gráficos do PS4 Pro: mais detalhe e sombras melhores. Em telas mais largas que 16:9 ele fica desligado.",
+                 "The PS4 Pro graphics: more detail and better shadows. On screens wider than 16:9 it stays off."),
+               OnOff(), "false");
+    AddRestart(kTabDisplay, "hdr", L("HDR do jogo", "Game HDR"),
+               L("A renderização HDR do próprio jogo (pede um monitor HDR ligado no Windows).",
+                 "The game's own HDR rendering (needs an HDR monitor turned on in Windows)."),
+               OnOff(), "false");
+    AddRestart(kTabDisplay, "af16", L("Filtro de texturas 16x", "16x texture filtering"),
+               L("Texturas nítidas no chão visto de lado (filtro anisotrópico 16x).",
+                 "Sharp textures on the ground seen at an angle (16x anisotropic filtering)."),
+               OnOff(), "false");
+    AddRestart(kTabDisplay, "present_mode", L("Sincronização (VSync)", "Sync (VSync)"),
+               L("FIFO segue o monitor, sem cortes. Mailbox tem menos atraso. Immediate pode cortar a imagem.",
+                 "FIFO follows the monitor, no tearing. Mailbox has less lag. Immediate may tear."),
+               Quoted({{"Fifo", "FIFO (VSync)"}, {"Mailbox", "Mailbox"}, {"Immediate", "Immediate"}}),
+               "\"Mailbox\"");
+    const char* fx_help = L("Um efeito do motor do jogo, lido quando o jogo abre.",
+                            "An effect of the game's engine, read when the game starts.");
+    AddRestart(kTabDisplay, "fx_fog", L("Névoa atmosférica", "Atmospheric fog"), fx_help, OnOff(), "true");
+    AddRestart(kTabDisplay, "fx_vignette", L("Vinheta (cantos escurecidos)", "Vignette (darkened corners)"),
+               fx_help, OnOff(), "true");
+    AddRestart(kTabDisplay, "fx_ssao", L("Oclusão ambiente (SSAO)", "Ambient occlusion (SSAO)"), fx_help,
+               OnOff(), "true");
+    AddRestart(kTabDisplay, "fx_motionblur", L("Borrão de movimento", "Motion blur"), fx_help, OnOff(),
+               "true");
+
+    // ---- Performance
+    {
+        MenuItem& fps = AddLive(
+            kTabPerf, "FPS",
+            L("O limite de quadros. Vale na hora; o modo 60 do próprio jogo (física certa) só entra ao reiniciar quando o jogo abriu em 30.",
+              "The frame rate cap. Applies at once; the game's own 60 FPS mode (right physics) only comes in at a restart when the game started at 30."),
+            Indexed({L("30 FPS (como no PS4)", "30 FPS (as on PS4)"), "60 FPS", L("Ilimitado", "Unlimited")}),
+            [] { return FpsMode(); }, [](int i) { SetFpsMode(i); });
+        fps.hotkey = "F7";
+        fps.restart_pending = [] {
+            return !SotcFpsCap::target_slot.load(std::memory_order_relaxed) && FpsMode() > 0;
+        };
+    }
+    AddRestart(kTabPerf, "fps_dynamic", L("FPS dinâmico", "Dynamic FPS"),
+               L("Em 60 FPS, quando o PC não segura 60 o jogo desce para um degrau estável (48 ou 40) em vez de oscilar.",
+                 "At 60 FPS, when the PC cannot hold 60 the game steps down to a steady rate (48 or 40) instead of swinging."),
+               OnOff(), "true");
+    AddLive(kTabPerf, L("Ritmo dos quadros", "Frame pacing"),
+            L("Em 60 FPS e ilimitado: solta cada quadro no ritmo do jogo em vez de na grade do vblank.",
+              "At 60 FPS and unlimited: releases each frame at the game's rate instead of on the vblank grid."),
+            Indexed({L("Grade do vblank (original)", "Vblank grid (original)"),
+                     L("Suave (ritmo do jogo)", "Smooth (game's rate)")}),
+            [] { return SotcFpsCap::flip_pacer.load(std::memory_order_relaxed) ? 1 : 0; },
+            [](int i) {
+                if ((i == 1) != SotcFpsCap::flip_pacer.load(std::memory_order_relaxed)) {
+                    SotcFpsCap::TogglePacer();
+                }
+            })
+        .hotkey = "F6";
+    {
+        MenuItem& fg = AddLive(
+            kTabPerf, L("Geração de quadros", "Frame generation"),
+            L("Cria quadros extras entre os do jogo. DLSS-G pede uma RTX 40 ou 50; FSR 3 roda em qualquer placa.",
+              "Adds frames between the game's. DLSS-G needs an RTX 40 or 50; FSR 3 runs on any GPU."),
+            Indexed({L("Desligada", "Off"), "NVIDIA DLSS-G", "AMD FSR 3"}),
+            [] { return int(Vulkan::FrameGen::Current()); },
+            [](int i) {
+                const char* keys[] = {"\"off\"", "\"dlss\"", "\"fsr\""};
+                if (Vulkan::FrameGen::Set(static_cast<Vulkan::FrameGen::Mode>(i))) {
+                    SaveLauncherSetting("framegen", keys[i]);
+                }
+            });
+        fg.hotkey = "F8";
+        fg.choice_ok = [](int i) {
+            return Vulkan::FrameGen::Available(static_cast<Vulkan::FrameGen::Mode>(i));
+        };
+    }
+    AddRestart(kTabPerf, "fg_mult", L("Multiplicador do DLSS-G", "DLSS-G multiplier"),
+               L("Quantos quadros o DLSS-G cria. Acima de 2x só nas RTX 50.",
+                 "How many frames DLSS-G makes. Above 2x on RTX 50 cards only."),
+               Quoted({{"2", L("2x (padrão)", "2x (default)")}, {"3", "3x (RTX 50)"}, {"4", "4x (RTX 50)"},
+                       {"6", "6x (RTX 50)"}, {"dynamic", L("Dinâmico", "Dynamic")}}),
+               "\"2\"");
+    AddRestart(kTabPerf, "fg_hudless", L("HUD firme na geração", "Steady HUD with frame generation"),
+               L("O HUD e as letras não tremem com a geração de quadros.",
+                 "The HUD and the letters do not shake with frame generation."),
+               OnOff(), "false");
+    {
+        static const int env_linger = [] {
+            const char* v = std::getenv("SOTC_LOD_LINGER");
+            return v ? std::atoi(v) : 0;
+        }();
+        // sotc: "Maximum" in PS4 Pro mode exhausted the game's page pool until PR #288;
+        // SOTC_MAX_IN_PRO=0 blocks it again.
+        static const bool neo_blocks_max = [] {
+            const char* v = std::getenv("SOTC_NEO");
+            const char* allow = std::getenv("SOTC_MAX_IN_PRO");
+            return v && v[0] == '1' && allow && allow[0] == '0';
+        }();
+        MenuItem& tex = AddLive(
+            kTabPerf, L("Qualidade das texturas", "Texture quality"),
+            L("Alta: folhas e pedras nítidas, estável. Máxima: sempre nítida, pede mais memória de vídeo. Desligada só aparece ao reiniciar.",
+              "High: sharp leaves and rocks, stable. Maximum: always sharp, needs more video memory. Off only shows after a restart."),
+            Indexed({L("Desligada", "Off"), L("Alta (estável)", "High (stable)"),
+                     L("Máxima (nítida)", "Maximum (sharp)")}),
+            [] {
+                const int linger = SotcLive::lod_linger.load(std::memory_order_relaxed);
+                const int low = SotcLive::lod_pool_low.load(std::memory_order_relaxed);
+                if ((linger >= 0 ? linger : env_linger) <= 0) {
+                    return 0;
+                }
+                return (low >= 0 ? low : EnvPoolLow()) > 0 ? 1 : 2;
+            },
+            [](int i) { SetTextureLevel(i); });
+        tex.choice_ok = [](int i) { return !(neo_blocks_max && i == 2); };
+        tex.restart_pending = [] {
+            return LoadLauncherSetting("textures") == "off" && Unquote(StartRaw("textures")) != "off";
+        };
+    }
+    {
+        static const int env_reuse = [] {
+            const char* v = std::getenv("SOTC_SHADOW_REUSE");
+            if (!v) {
+                return 0;
+            }
+            if (v[0] == 'a') {
+                return s_instance && s_instance->GetVendorID() == 0x10DE ? 1 : 0;
+            }
+            return v[0] == '0' ? 0 : 1;
+        }();
+        AddLive(kTabPerf, L("Reaproveitar sombras distantes", "Reuse far shadows"),
+                L("Desenha as sombras distantes em quadros alternados: mais FPS, mas elas podem piscar.",
+                  "Draws far shadows on alternate frames: more FPS, but they may blink."),
+                Indexed({L("Desligado", "Off"), L("Ligado", "On")}),
+                [] {
+                    const int live = SotcLive::shadow_reuse.load(std::memory_order_relaxed);
+                    return (live >= 0 ? live : env_reuse) > 0 ? 1 : 0;
+                },
+                [](int i) {
+                    SotcLive::shadow_reuse.store(i, std::memory_order_relaxed);
+                    SaveLauncherSetting("shadow_reuse", i ? "\"1\"" : "\"0\"");
+                });
+    }
+    AddRestart(kTabPerf, "vram_use", L("Memória de vídeo", "Video memory"),
+               L("Quanto da memória da placa o jogo usa antes de liberar texturas.",
+                 "How much of the card's memory the game uses before it frees textures."),
+               Quoted({{"low", L("Econômico (placas de 4–6 GB)", "Economy (4–6 GB cards)")},
+                       {"normal", L("Padrão", "Default")},
+                       {"high", L("Alto (placas de 8–12 GB)", "High (8–12 GB cards)")},
+                       {"max", L("Máximo (placas de 16 GB ou mais)", "Maximum (16 GB cards or more)")}}),
+               "\"normal\"");
+    AddLive(kTabPerf, L("Painel de desempenho", "Performance overlay"),
+            L("FPS, tempo de quadro e memória de vídeo no canto da tela.",
+              "FPS, frame time and video memory in the corner of the screen."),
+            Indexed({L("Escondido", "Hidden"), L("Mostrado", "Shown")}),
+            [] { return OverlayOn() ? 1 : 0; },
+            [](int i) {
+                BbSettings::Get().show_fps = false; // the ini setting only gives the initial state
+                overlay_on.store(i != 0, std::memory_order_relaxed);
+                SaveLauncherSetting("show_fps", i ? "true" : "false");
+            })
+        .hotkey = "F10";
+
+    // ---- Grass: distance, height and detail are constants of the grass compute shaders (at once);
+    // shadows and fade are engine settings read at start.
+    {
+        static const std::array<float, 5> env = [] {
+            std::array<float, 5> g{1.f, 1.f, 1.f, 1.f, 1.f};
+            if (const char* v = std::getenv("SOTC_GRASS")) {
+                std::sscanf(v, "%f %f %f %f %f", &g[0], &g[1], &g[2], &g[3], &g[4]);
+            }
+            return g;
+        }();
+        const auto grass = [](const char* key, int slot, const char* label, const char* help,
+                              std::vector<MenuChoice> choices) {
+            std::vector<float> values;
+            for (const auto& c : choices) {
+                values.push_back(std::strtof(Unquote(c.value).c_str(), nullptr));
+            }
+            const std::string k = key;
+            AddLive(kTabGrass, label, help, std::move(choices),
+                    [slot, values] {
+                        const float v = SotcLive::grass[slot].load(std::memory_order_relaxed);
+                        const float now = v >= 0.f ? v : env[size_t(slot)];
+                        for (size_t i = 0; i < values.size(); ++i) {
+                            if (values[i] == now) {
+                                return int(i);
+                            }
+                        }
+                        return -1;
+                    },
+                    [slot, values, k](int i) {
+                        SotcLive::grass[slot].store(values[size_t(i)], std::memory_order_relaxed);
+                        char text[16];
+                        std::snprintf(text, sizeof(text), "\"%g\"", values[size_t(i)]);
+                        SaveLauncherSetting(k.c_str(), text);
+                    });
+        };
+        const auto as_ps4 = L("Como no PS4", "As on PS4");
+        const auto farther = [&](bool weeds) {
+            auto c = Quoted({{"1", as_ps4},
+                             {"2", L("2x mais longe", "2x farther")},
+                             {"3", L("3x mais longe", "3x farther")},
+                             {"5", L("5x mais longe", "5x farther")}});
+            if (weeds) {
+                c.push_back({L("10x mais longe (campo denso)", "10x farther (dense field)"), "\"10\""});
+            }
+            return c;
+        };
+        const auto heights = [&] {
+            return Quoted({{"0.75", L("Mais baixa (75%)", "Lower (75%)")},
+                           {"1", as_ps4},
+                           {"1.5", L("Mais alta (150%)", "Taller (150%)")},
+                           {"2", L("Bem mais alta (200%)", "Much taller (200%)")}});
+        };
+        grass("grass_detail", 4, L("Detalhe da grama", "Grass detail"),
+              L("Lâminas completas mais longe: a grama e a sombra perto de você não surgem tarde.",
+                "Full blades farther out: grass and its shadow near you no longer pop in late."),
+              Quoted({{"1", as_ps4}, {"0.25", L("Alto", "High")}, {"0.15", L("Mais alto", "Higher")},
+                      {"0.1", L("Muito alto", "Very high")}}));
+        grass("grass_distance", 0, L("Distância da grama", "Grass distance"),
+              L("Até onde a grama aparece. Mais longe pesa mais na placa.",
+                "How far out the grass shows. Farther costs the GPU more."),
+              farther(false));
+        grass("grass_height", 1, L("Altura da grama", "Grass height"),
+              L("Recomendado: como no PS4, ou 150% se gosta de mais grama; 200% vira arbusto.",
+                "Recommended: as on PS4, or 150% if you like more grass; 200% turns it into bushes."),
+              heights());
+        grass("weed_distance", 2, L("Distância do mato", "Weed distance"),
+              L("Até onde o mato aparece; 10x deixa o campo denso.",
+                "How far out the weeds show; 10x makes a dense field."),
+              farther(true));
+        grass("weed_height", 3, L("Altura do mato", "Weed height"),
+              L("A altura do mato.", "The height of the weeds."), heights());
+        AddRestart(kTabGrass, "grass_shadows", L("Sombras da grama", "Grass shadows"),
+                   L("Até onde a grama projeta sombra.", "How far out the grass casts shadows."),
+                   Quoted({{"1", L("Perto (~3 m, mais leve)", "Near (~3 m, lighter)")},
+                           {"2", L("Como no PS4 (~8 m)", "As on PS4 (~8 m)")},
+                           {"3", L("Longe (~24 m, mais pesado)", "Far (~24 m, heavier)")}}),
+                   "\"2\"");
+        AddRestart(kTabGrass, "grass_fade", L("Esmaecimento da grama", "Grass fade"),
+                   L("Abaixo de 1 a grama fica rala e a sombra dela também some; acima de 1, menos grama.",
+                     "Below 1 the grass thins out and so does its shadow; above 1, less grass."),
+                   Quoted({{"0.5", "0.5"}, {"0.75", "0.75"}, {"1", as_ps4}, {"2", "2"}, {"3", "3"}}),
+                   "\"1\"");
+    }
+
+    // ---- Sound
+    if (runtime_audio_volume_percent && runtime_audio_set_volume_percent) {
+        static const int volumes[] = {100, 150, 200, 300, 400, 500};
+        std::vector<MenuChoice> choices;
+        for (const int v : volumes) {
+            choices.push_back({std::to_string(v) + "%" + (v == 100 ? std::string("  ") + L("(original)", "(original)") : ""),
+                               std::to_string(v)});
+        }
+        AddLive(kTabSound, L("Volume", "Volume"),
+                L("O volume do jogo; 100% é o original.", "The game's volume; 100% is the original."),
+                std::move(choices),
+                [] {
+                    const int now = runtime_audio_volume_percent();
+                    for (int i = 0; i < 6; ++i) {
+                        if (volumes[i] == now) {
+                            return i;
+                        }
+                    }
+                    return -1;
+                },
+                [](int i) {
+                    runtime_audio_set_volume_percent(volumes[i]);
+                    SaveLauncherSetting("volume", "\"" + std::to_string(volumes[i]) + "\"");
+                });
+    }
+    AddRestart(kTabSound, "audio_channels", L("Canais de áudio", "Audio channels"),
+               L("Automático deixa o Windows ajustar o 7.1 do jogo ao seu aparelho.",
+                 "Automatic lets Windows fit the game's 7.1 to your device."),
+               Quoted({{"auto", L("Automático (o do Windows)", "Automatic (Windows')")},
+                       {"2", L("Estéreo 2.0", "Stereo 2.0")},
+                       {"6", "Surround 5.1"},
+                       {"8", "Surround 7.1"}}),
+               "\"auto\"");
+    AddRestart(kTabSound, "audio_lfe", L("Subwoofer (LFE)", "Subwoofer (LFE)"),
+               L("Manda o canal de graves para o subwoofer.", "Sends the bass channel to the subwoofer."),
+               OnOff(), "true");
+    AddRestart(kTabSound, "sound_firmware", L("Módulos de som do console", "Console sound modules"),
+               L("Usa os módulos de som do seu PS4 em vez do mixer embutido do port.",
+                 "Uses your PS4's sound modules instead of the port's built-in mixer."),
+               OnOff(), "false");
+
+    // ---- Controls
     if (runtime_rumble_enabled && runtime_rumble_set) {
-        ImGui::SeparatorText(SotcUi::T("Controle", "Controller"));
-        bool rumble = runtime_rumble_enabled() != 0;
-        if (ImGui::Checkbox(SotcUi::T("Vibração do controle", "Controller vibration"), &rumble)) {
-            runtime_rumble_set(rumble ? 1 : 0);
-            SaveLauncherSetting("rumble", rumble ? "true" : "false");
-            SotcEvent::Log("MENU", SotcUi::T("Vibração do controle: %s", "Controller vibration: %s"),
-                           rumble ? SotcUi::T("ligada", "on") : SotcUi::T("desligada", "off"));
+        AddLive(kTabControls, L("Vibração do controle", "Controller vibration"),
+                L("Liga ou desliga a vibração do controle.", "Turns the controller's vibration on or off."),
+                Indexed({L("Desligada", "Off"), L("Ligada", "On")}),
+                [] { return runtime_rumble_enabled() ? 1 : 0; },
+                [](int i) {
+                    runtime_rumble_set(i);
+                    SaveLauncherSetting("rumble", i ? "true" : "false");
+                });
+    }
+    AddLive(kTabControls, L("Câmera pelo mouse", "Mouse camera"),
+            L("Move a câmera com o mouse.", "Moves the camera with the mouse."),
+            Indexed({L("Desligada", "Off"), L("Ligada", "On")}),
+            [] { return BbSettings::Get().mouse_enabled.load() ? 1 : 0; },
+            [](int i) {
+                BbSettings::Get().mouse_enabled = i != 0;
+                dirty = true;
+                SaveLauncherSetting("mouse", i ? "true" : "false");
+            });
+    {
+        static const float sens[] = {0.5f, 0.75f, 1.0f, 1.5f, 2.0f};
+        static const char* keys[] = {"\"0.5\"", "\"0.75\"", "\"1.0\"", "\"1.5\"", "\"2.0\""};
+        AddLive(kTabControls, L("Sensibilidade do mouse", "Mouse sensitivity"),
+                L("A velocidade da câmera pelo mouse.", "How fast the mouse turns the camera."),
+                Indexed({L("0,5 (lenta)", "0.5 (slow)"), L("0,75", "0.75"), L("1,0 (padrão)", "1.0 (default)"),
+                         L("1,5", "1.5"), L("2,0 (rápida)", "2.0 (fast)")}),
+                [] {
+                    const float now = BbSettings::Get().mouse_sens.load();
+                    int best = 0;
+                    for (int i = 1; i < 5; ++i) {
+                        if (std::abs(sens[i] - now) < std::abs(sens[best] - now)) {
+                            best = i;
+                        }
+                    }
+                    return best;
+                },
+                [](int i) {
+                    BbSettings::Get().mouse_sens = sens[i];
+                    dirty = true;
+                    SaveLauncherSetting("mouse_sens", keys[i]);
+                })
+            .enabled = [] { return BbSettings::Get().mouse_enabled.load(); };
+    }
+    AddLive(kTabControls, L("Inverter eixo vertical (Y)", "Invert vertical axis (Y)"),
+            L("Inverte a câmera pelo mouse para cima e para baixo.", "Inverts the mouse camera up and down."),
+            Indexed({L("Desligado", "Off"), L("Ligado", "On")}),
+            [] { return BbSettings::Get().mouse_invert.load() ? 1 : 0; },
+            [](int i) {
+                BbSettings::Get().mouse_invert = i != 0;
+                dirty = true;
+                SaveLauncherSetting("mouse_invert", i ? "true" : "false");
+            })
+        .enabled = [] { return BbSettings::Get().mouse_enabled.load(); };
+    AddRestart(kTabControls, "button_icons", L("Ícones dos botões", "Button icons"),
+               L("Os botões mostrados no jogo: os do PlayStation ou os do Xbox.",
+                 "The buttons the game shows: PlayStation's or Xbox's."),
+               Quoted({{"ps", L("PlayStation (do jogo)", "PlayStation (the game's)")},
+                       {"xbox", "Xbox (A B X Y)"}}),
+               "\"ps\"");
+
+    // ---- Game
+    AddLive(kTabGame, L("Idioma do menu", "Menu language"),
+            L("O idioma deste menu. Os avisos do jogo (F7, F8) mudam ao reiniciar.",
+              "This menu's language. The game's notices (F7, F8) change at the restart."),
+            Indexed({"Português", "English", "Español", "简体中文", "한국어", "Русский"}),
+            [] { return MenuLanguage(); },
+            [](int i) {
+                menu_lang.store(i, std::memory_order_relaxed);
+                SaveLauncherSetting("ui_language", "\"" + std::string(kLangCodes[i]) + "\"");
+            });
+    AddRestart(kTabGame, "language", L("Idioma do jogo", "Game language"),
+               L("O idioma dos textos e das legendas do jogo.", "The language of the game's texts and subtitles."),
+               Quoted({{"", L("Automático (o do jogo)", "Automatic (the game's)")},
+                       {"7", L("Português (Portugal)", "Portuguese (Portugal)")},
+                       {"15", L("Português (Brasil)", "Portuguese (Brazil)")},
+                       {"1", L("Inglês", "English")},
+                       {"3", L("Espanhol", "Spanish")},
+                       {"2", L("Francês", "French")},
+                       {"4", L("Alemão", "German")},
+                       {"5", L("Italiano", "Italian")},
+                       {"0", L("Japonês", "Japanese")}}),
+               "\"\"");
+    // ---- Debug: the launcher's Debug page (test tools read at start) and the F5 / F9 actions.
+    AddRestart(kTabDebug, "debug_menu", L("Menu de debug do jogo", "The game's debug menu"),
+               L("O menu de testes da Bluepoint (F6 ou Start+Select no jogo): carregador de áreas, câmera livre, estatísticas. O jogo pode ficar menos estável: desligue para jogar normalmente.",
+                 "Bluepoint's test menu (F6 or Start+Select in game): area loader, free camera, statistics. The game can be less stable: turn it off to play normally."),
+               OnOff(), "false");
+    AddRestart(kTabDebug, "skip_logos", L("Pular logos de abertura", "Skip opening logos"),
+               L("Sem os logos e o aviso de salvamento ao abrir.", "No logos and autosave notice at start."),
+               OnOff(), "false");
+    AddRestart(kTabDebug, "skip_film", L("Pular filme e tela de título", "Skip intro film and title screen"),
+               L("O jogo entra direto, sem o filme e a tela de título.", "The game goes straight in, without the film and the title screen."), OnOff(),
+               "false");
+    AddRestart(kTabDebug, "debug_watch", L("Vigia da memória de texturas", "Texture memory watch"),
+               L("Anota em user/events.log quando o jogo reaproveita memória de texturas ainda em uso. Útil para relatar texturas com lixo colorido.",
+                 "Writes to user/events.log when the game reuses memory of textures still in use. Useful when reporting colour garbage on textures."),
+               OnOff(), "false");
+    AddRestart(kTabDebug, "dlss_compare", L("Comparar DLSS com FSR 1 (F9)", "Compare DLSS with FSR 1 (F9)"),
+               L("Com DLSS ou FSR 4, a tecla F9 alterna entre ele e o FSR 1 para comparar a imagem.",
+                 "With DLSS or FSR 4, the F9 key switches between it and FSR 1 to compare the picture."),
+               OnOff(), "false");
+    {
+        MenuItem& cap = AddLive(kTabDebug, L("Capturar texturas", "Capture textures"),
+                                L("Salva as texturas do quadro atual em user/log/texcap_N.",
+                                  "Saves the textures of the current frame to user/log/texcap_N."),
+                                {{L("Executar", "Run"), "0"}}, [] { return -1; },
+                                [](int) {
+                                    SotcStats::tex_capture.store(true, std::memory_order_relaxed);
+                                    toast_text = L("Texturas capturadas", "Textures captured");
+                                    toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
+                                });
+        cap.hotkey = "F5";
+        cap.action = true;
+        MenuItem& reload = AddLive(kTabDebug, L("Recarregar texturas", "Reload textures"),
+                                   L("Envia de novo todas as texturas da memória do jogo para a placa (corrige texturas erradas na hora).",
+                                     "Uploads every texture again from game memory to the GPU (fixes wrong textures on the spot)."),
+                                   {{L("Executar", "Run"), "0"}}, [] { return -1; },
+                                   [](int) {
+                                       SotcStats::reload_all.store(true, std::memory_order_relaxed);
+                                       toast_text = L("Texturas recarregadas", "Textures reloaded");
+                                       toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
+                                   });
+        reload.hotkey = "F9";
+        reload.action = true;
+    }
+    (void)s;
+}
+
+std::vector<int> TabRows(int tab) {
+    std::vector<int> rows;
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (items[i].tab == tab && (!items[i].shown || items[i].shown())) {
+            rows.push_back(int(i));
+        }
+    }
+    return rows;
+}
+
+bool ItemEnabled(const MenuItem& item) {
+    return !item.enabled || item.enabled();
+}
+
+void PickChoice(MenuItem& item, int choice) {
+    if (!ItemEnabled(item) || choice < 0 || choice >= int(item.choices.size()) ||
+        (item.choice_ok && !item.choice_ok(choice)) || choice == item.get()) {
+        return;
+    }
+    item.set(choice);
+    SotcEvent::Log("MENU", "%s: %s", item.label.c_str(), item.choices[size_t(choice)].label.c_str());
+}
+
+void StepItem(MenuItem& item, int direction) {
+    const int n = int(item.choices.size());
+    if (n == 0 || !ItemEnabled(item)) {
+        return;
+    }
+    if (item.action) { // a button: any change runs it
+        item.set(0);
+        SotcEvent::Log("MENU", "%s", item.label.c_str());
+        return;
+    }
+    int at = std::max(item.get(), direction > 0 ? -1 : 0);
+    for (int tries = 0; tries < n; ++tries) {
+        at = (at + direction + n) % n;
+        if (!item.choice_ok || item.choice_ok(at)) {
+            PickChoice(item, at);
+            return;
+        }
+    }
+}
+
+void ApplyMenuInput(int input) {
+    if (input == kInTabPrev || input == kInTabNext) {
+        menu_tab = (menu_tab + (input == kInTabNext ? 1 : kTabCount - 1)) % kTabCount;
+        return;
+    }
+    const auto rows = TabRows(menu_tab);
+    if (rows.empty()) {
+        return;
+    }
+    int& row = menu_row[size_t(menu_tab)];
+    row = std::clamp(row, 0, int(rows.size()) - 1);
+    const int n = int(rows.size());
+    switch (input) {
+    case kInUp:
+        row = (row + n - 1) % n;
+        break;
+    case kInDown:
+        row = (row + 1) % n;
+        break;
+    case kInLeft:
+        StepItem(items[size_t(rows[size_t(row)])], -1);
+        break;
+    case kInRight:
+    case kInActivate:
+        StepItem(items[size_t(rows[size_t(row)])], +1);
+        break;
+    default:
+        break;
+    }
+}
+
+// The game's palette: weathered stone, cloudy sky, sand and aged gold.
+namespace Pal {
+constexpr ImU32 SkyTop = IM_COL32(58, 66, 76, 236);
+constexpr ImU32 SkyLow = IM_COL32(16, 18, 22, 246);
+constexpr ImU32 Haze = IM_COL32(120, 130, 140, 34);
+constexpr ImU32 StoneHi = IM_COL32(62, 66, 70, 245);
+constexpr ImU32 StoneLo = IM_COL32(40, 43, 47, 245);
+constexpr ImU32 Panel = IM_COL32(24, 27, 31, 220);
+constexpr ImU32 PanelSel = IM_COL32(48, 50, 51, 238);
+constexpr ImU32 ValueBox = IM_COL32(15, 17, 20, 232);
+constexpr ImU32 Gold = IM_COL32(200, 164, 98, 255);
+constexpr ImU32 GoldBright = IM_COL32(238, 210, 148, 255);
+constexpr ImU32 GoldDeep = IM_COL32(150, 122, 74, 255);
+constexpr ImU32 GoldFill = IM_COL32(190, 155, 94, 255);
+constexpr ImU32 Ink = IM_COL32(28, 24, 18, 255);
+constexpr ImU32 Sand = IM_COL32(214, 204, 184, 255);
+constexpr ImU32 SandDim = IM_COL32(150, 142, 126, 255);
+constexpr ImU32 Grey = IM_COL32(100, 100, 100, 255);
+constexpr ImU32 Amber = IM_COL32(218, 150, 72, 255);
+constexpr ImU32 AmberBand = IM_COL32(84, 56, 24, 238);
+constexpr ImU32 Moss = IM_COL32(150, 176, 132, 255);
+constexpr ImU32 Cap = IM_COL32(206, 194, 168, 255);
+} // namespace Pal
+
+ImVec2 MeasureText(float px, const char* text, float wrap = 0.0f) {
+    return ImGui::GetFont()->CalcTextSizeA(px, FLT_MAX, wrap, text);
+}
+
+void PutText(ImDrawList* d, float px, ImVec2 at, ImU32 color, const char* text, float wrap = 0.0f) {
+    d->AddText(ImGui::GetFont(), px, at, color, text, nullptr, wrap);
+}
+
+// A text cut to a width, with "…".
+std::string Fit(float px, const std::string& text, float width) {
+    if (MeasureText(px, text.c_str()).x <= width) {
+        return text;
+    }
+    std::string out = text;
+    while (!out.empty() && MeasureText(px, (out + "…").c_str()).x > width) {
+        out.pop_back();
+        while (!out.empty() && (static_cast<unsigned char>(out.back()) & 0xC0) == 0x80) {
+            out.pop_back(); // whole UTF-8 characters
+        }
+        if (!out.empty() && static_cast<unsigned char>(out.back()) >= 0xC0) {
+            out.pop_back();
+        }
+    }
+    return out + "…";
+}
+
+void DrawMenu() {
+    if (items_lang != MenuLanguage()) {
+        BuildItems();
+    }
+    for (const int input : menu_inputs) {
+        ApplyMenuInput(input);
+        if (items_lang != MenuLanguage()) {
+            BuildItems(); // the language changed: the texts are built again
+        }
+    }
+    menu_inputs.clear();
+
+    ImGuiIO& io = ImGui::GetIO();
+    const ImGuiViewport* vp = ImGui::GetMainViewport();
+    const ImVec2 o = vp->WorkPos;
+    const float W = vp->WorkSize.x, H = vp->WorkSize.y;
+    const float u = std::max(0.5f, std::min(W / 1920.0f, H / 1080.0f));
+    ImGui::SetNextWindowPos(o);
+    ImGui::SetNextWindowSize(vp->WorkSize);
+    ImGui::Begin("##sotc_menu", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings |
+                     ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollWithMouse);
+    ImDrawList* d = ImGui::GetWindowDrawList();
+    const bool click = ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+    const ImVec2 mouse = io.MousePos;
+    const auto inside = [&](ImVec2 a, ImVec2 b) {
+        return mouse.x >= a.x && mouse.x < b.x && mouse.y >= a.y && mouse.y < b.y;
+    };
+    const auto clicked = [&](ImVec2 a, ImVec2 b) { return click && inside(a, b); };
+    bool close = false;
+
+    // Backdrop: a cloudy sky fading into the dark, the game faint behind it.
+    d->AddRectFilledMultiColor(o, ImVec2(o.x + W, o.y + H), Pal::SkyTop, Pal::SkyTop, Pal::SkyLow,
+                               Pal::SkyLow);
+    d->AddRectFilledMultiColor(o, ImVec2(o.x + W, o.y + H * 0.30f), Pal::Haze, Pal::Haze,
+                               IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0));
+
+    // The content column: at most 1720 units wide, centred (21:9 and 32:9 screens).
+    const float cw = std::min(W - 80.0f * u, 1720.0f * u);
+    const float x0 = o.x + (W - cw) * 0.5f, x1 = x0 + cw;
+
+    // Header: the title, the port's version and the PC's numbers.
+    {
+        const float ty = o.y + 30.0f * u;
+        PutText(d, 30.0f * u, ImVec2(x0, ty), Pal::GoldBright, "SHADOW OF THE COLOSSUS");
+        static const std::string version = [] {
+            const char* v = std::getenv("SOTC_PORT_VERSION");
+            return v ? std::string("  ·  PC ") + v : std::string();
+        }();
+        const std::string sub = std::string(L("Configurações", "Settings")) + version;
+        PutText(d, 17.0f * u, ImVec2(x0 + 2.0f * u, ty + 38.0f * u), Pal::SandDim, sub.c_str());
+        char info[192];
+        int len = std::snprintf(info, sizeof(info), "%.0f FPS  ·  %.1f ms",
+                                frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f, frame_ms_avg);
+        if (s_instance && len > 0 && len < int(sizeof(info))) {
+            std::snprintf(info + len, sizeof(info) - size_t(len), "  ·  %s  ·  %llu / %llu MB",
+                          std::string(s_instance->GetModelName()).c_str(),
+                          static_cast<unsigned long long>(s_instance->GetDeviceMemoryUsage() >> 20),
+                          static_cast<unsigned long long>(s_instance->GetTotalMemoryBudget() >> 20));
+        }
+        const ImVec2 isz = MeasureText(16.0f * u, info);
+        PutText(d, 16.0f * u, ImVec2(x1 - isz.x, ty + 40.0f * u), Pal::SandDim, info);
+    }
+
+    // Tab bar on a band of stone, between the Q / E (L1 / R1) keys.
+    static const std::string button_icons = Unquote(SettingRaw("button_icons"));
+    const bool xbox = button_icons == "xbox";
+    const float bar_y = o.y + 112.0f * u, bar_h = 54.0f * u;
+    d->AddRectFilledMultiColor(ImVec2(o.x, bar_y), ImVec2(o.x + W, bar_y + bar_h), Pal::StoneHi,
+                               Pal::StoneHi, Pal::StoneLo, Pal::StoneLo);
+    d->AddLine(ImVec2(o.x, bar_y), ImVec2(o.x + W, bar_y), IM_COL32(90, 92, 94, 200), 1.0f * u);
+    d->AddLine(ImVec2(o.x, bar_y + bar_h), ImVec2(o.x + W, bar_y + bar_h), Pal::GoldDeep, 1.5f * u);
+    const auto key_cap = [&](float x, float y, const char* key, float h) {
+        const float px = h * 0.62f;
+        const ImVec2 ts = MeasureText(px, key);
+        const float w = std::max(h, ts.x + h * 0.5f);
+        d->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), Pal::Cap, 4.0f * u);
+        PutText(d, px, ImVec2(x + (w - ts.x) * 0.5f, y + (h - ts.y) * 0.5f), Pal::Ink, key);
+        return w;
+    };
+    {
+        const char* tab_names[kTabCount] = {L("Imagem", "Display"),   L("Desempenho", "Performance"),
+                                            L("Grama", "Grass"),       L("Som", "Sound"),
+                                            L("Controles", "Controls"), L("Jogo", "Game"),
+                                            "Debug"};
+        const float cap_h = 28.0f * u;
+        const char* prev_key = menu_pad ? (xbox ? "LB" : "L1") : "Q";
+        const char* next_key = menu_pad ? (xbox ? "RB" : "R1") : "E";
+        const float tab_px = 21.0f * u, pad = 30.0f * u;
+        float total = 0.0f;
+        for (const char* name : tab_names) {
+            total += MeasureText(tab_px, name).x + pad * 2.0f;
+        }
+        float x = x0 + (cw - total) * 0.5f;
+        const float cap_y = bar_y + (bar_h - cap_h) * 0.5f;
+        const float pw = key_cap(x - 54.0f * u, cap_y, prev_key, cap_h);
+        if (clicked(ImVec2(x - 54.0f * u, cap_y), ImVec2(x - 54.0f * u + pw, cap_y + cap_h))) {
+            ApplyMenuInput(kInTabPrev);
+        }
+        for (int i = 0; i < kTabCount; ++i) {
+            const ImVec2 ts = MeasureText(tab_px, tab_names[i]);
+            const float w = ts.x + pad * 2.0f;
+            const ImVec2 a(x, bar_y), b(x + w, bar_y + bar_h);
+            const bool on = i == menu_tab;
+            if (on) {
+                d->AddRectFilledMultiColor(a, b, IM_COL32(84, 80, 70, 250), IM_COL32(84, 80, 70, 250),
+                                           IM_COL32(60, 57, 50, 250), IM_COL32(60, 57, 50, 250));
+                d->AddRectFilled(ImVec2(a.x, b.y - 3.0f * u), b, Pal::Gold);
+            } else if (inside(a, b)) {
+                d->AddRectFilled(a, b, IM_COL32(255, 255, 255, 14));
+            }
+            PutText(d, tab_px, ImVec2(x + pad, bar_y + (bar_h - ts.y) * 0.5f),
+                    on ? Pal::GoldBright : Pal::SandDim, tab_names[i]);
+            if (clicked(a, b)) {
+                menu_tab = i;
+            }
+            x += w;
+        }
+        const float nw = key_cap(x + 26.0f * u, cap_y, next_key, cap_h);
+        if (clicked(ImVec2(x + 26.0f * u, cap_y), ImVec2(x + 26.0f * u + nw, cap_y + cap_h))) {
+            ApplyMenuInput(kInTabNext);
         }
     }
 
-    ImGui::Spacing();
-    ImGui::Separator();
-    if (ImGui::Button(SotcUi::T("Fechar", "Close"))) {
-        keep_open = false;
+    // Restart band and footer heights.
+    std::vector<std::string> waiting;
+    for (const MenuItem& item : items) {
+        if (item.restart_pending && item.restart_pending()) {
+            waiting.push_back(item.label);
+        }
     }
-    ImGui::SameLine();
-    ImGui::TextDisabled("%s", SotcUi::T("Esc / F1 fecha; tudo fica salvo",
-                                        "Esc / F1 closes; everything is kept"));
+    const float footer_h = 64.0f * u;
+    const float band_h = waiting.empty() ? 0.0f : 46.0f * u;
+    const float area_top = bar_y + bar_h + 26.0f * u;
+    const float area_bottom = o.y + H - footer_h - band_h - (band_h > 0 ? 16.0f * u : 0.0f) - 10.0f * u;
 
+    // Rows of the tab.
+    const auto rows = TabRows(menu_tab);
+    int& row = menu_row[size_t(menu_tab)];
+    row = rows.empty() ? 0 : std::clamp(row, 0, int(rows.size()) - 1);
+    const float list_w = cw * 0.63f;
+    const float label_w = list_w * 0.52f, value_w = list_w - label_w - 10.0f * u;
+    const float row_h = 48.0f * u, gap = 6.0f * u;
+    const int fit = std::max(1, int((area_bottom - area_top + gap) / (row_h + gap)));
+    int& first = menu_first[size_t(menu_tab)];
+    if (row < first) {
+        first = row;
+    } else if (row >= first + fit) {
+        first = row - fit + 1;
+    }
+    first = std::clamp(first, 0, std::max(0, int(rows.size()) - fit));
+    if (io.MouseWheel != 0.0f && inside(ImVec2(x0, area_top), ImVec2(x0 + list_w, area_bottom))) {
+        first = std::clamp(first - int(io.MouseWheel), 0, std::max(0, int(rows.size()) - fit));
+        row = std::clamp(row, first, first + fit - 1);
+    }
+    float y = area_top;
+    const float label_px = 20.0f * u, value_px = 18.5f * u;
+    for (int n = first; n < int(rows.size()) && n < first + fit; ++n) {
+        MenuItem& item = items[size_t(rows[size_t(n)])];
+        const bool on = n == row;
+        const bool enabled = ItemEnabled(item);
+        const ImVec2 ra(x0, y), rb(x0 + label_w, y + row_h);
+        d->AddRectFilled(ra, rb, on ? Pal::PanelSel : Pal::Panel, 3.0f * u);
+        if (on) {
+            d->AddRectFilled(ra, ImVec2(ra.x + 4.0f * u, rb.y), Pal::Gold, 2.0f * u);
+        }
+        if (clicked(ra, rb)) {
+            row = n;
+        }
+        // Label, its key and the ◆ of a setting read at start.
+        const ImU32 label_col = !enabled ? Pal::Grey : on ? Pal::GoldBright : Pal::Sand;
+        float lx = ra.x + 20.0f * u;
+        const float marks_w = (item.hotkey.empty() ? 0.0f : 52.0f * u) + (item.restart ? 24.0f * u : 0.0f);
+        const std::string label = Fit(label_px, item.label, label_w - 28.0f * u - marks_w);
+        const ImVec2 ls = MeasureText(label_px, label.c_str());
+        PutText(d, label_px, ImVec2(lx, y + (row_h - ls.y) * 0.5f), label_col, label.c_str());
+        lx += ls.x + 10.0f * u;
+        if (item.restart) {
+            const ImVec2 ds = MeasureText(13.0f * u, "◆");
+            PutText(d, 13.0f * u, ImVec2(lx, y + (row_h - ds.y) * 0.5f), Pal::Amber, "◆");
+            lx += ds.x + 10.0f * u;
+        }
+        if (!item.hotkey.empty()) {
+            const ImVec2 hs = MeasureText(14.0f * u, item.hotkey.c_str());
+            PutText(d, 14.0f * u, ImVec2(lx, y + (row_h - hs.y) * 0.5f), Pal::SandDim, item.hotkey.c_str());
+        }
+
+        // The value: two choices side by side, more between ◀ ▶.
+        const float vx = x0 + label_w + 10.0f * u;
+        const int now = item.get();
+        if (item.choices.size() == 2) {
+            const float half = value_w * 0.5f;
+            for (int c = 0; c < 2; ++c) {
+                const bool lit = c == now;
+                const bool ok = !item.choice_ok || item.choice_ok(c);
+                const ImVec2 a(vx + half * float(c) + (c ? 2.0f * u : 0.0f), y),
+                    b(vx + half * float(c + 1) - (c ? 0.0f : 2.0f * u), y + row_h);
+                const ImU32 fill = lit ? (on && enabled ? Pal::GoldFill : IM_COL32(86, 72, 48, 240)) : Pal::ValueBox;
+                d->AddRectFilled(a, b, fill, 3.0f * u);
+                const ImU32 ink = !enabled || !ok ? Pal::Grey
+                                  : lit ? (on ? Pal::Ink : Pal::GoldBright)
+                                        : Pal::SandDim;
+                const std::string text = Fit(value_px, item.choices[size_t(c)].label, half - 16.0f * u);
+                const ImVec2 ts = MeasureText(value_px, text.c_str());
+                PutText(d, value_px, ImVec2(a.x + (b.x - a.x - ts.x) * 0.5f, y + (row_h - ts.y) * 0.5f), ink,
+                        text.c_str());
+                if (clicked(a, b)) {
+                    row = n;
+                    PickChoice(item, c);
+                }
+            }
+            if (on) {
+                d->AddRect(ImVec2(vx - 2.0f * u, y - 2.0f * u), ImVec2(vx + value_w + 2.0f * u, y + row_h + 2.0f * u),
+                           Pal::GoldBright, 4.0f * u, 0, 1.5f * u);
+            }
+        } else {
+            const ImVec2 a(vx, y), b(vx + value_w, y + row_h);
+            d->AddRectFilled(a, b, on && enabled ? Pal::GoldFill : Pal::ValueBox, 3.0f * u);
+            if (on) {
+                d->AddRect(ImVec2(a.x - 2.0f * u, a.y - 2.0f * u), ImVec2(b.x + 2.0f * u, b.y + 2.0f * u),
+                           Pal::GoldBright, 4.0f * u, 0, 1.5f * u);
+            }
+            const ImU32 ink = !enabled ? Pal::Grey : on ? Pal::Ink : Pal::Sand;
+            const ImU32 arrow = !enabled ? Pal::Grey : on ? Pal::Ink : Pal::GoldDeep;
+            const std::string value =
+                item.action ? item.choices[0].label + "  ↵"
+                : now >= 0  ? item.choices[size_t(now)].label
+                            : std::string("—");
+            if (item.action && !on) {
+                d->AddRect(a, b, Pal::GoldDeep, 3.0f * u, 0, 1.0f * u); // a button
+            }
+            const std::string text = Fit(value_px, value, value_w - 80.0f * u);
+            const ImVec2 ts = MeasureText(value_px, text.c_str());
+            PutText(d, value_px, ImVec2(a.x + (value_w - ts.x) * 0.5f, y + (row_h - ts.y) * 0.5f), ink,
+                    text.c_str());
+            const float apx = 14.0f * u;
+            const ImVec2 as = MeasureText(apx, "◀");
+            if (!item.action) {
+                PutText(d, apx, ImVec2(a.x + 14.0f * u, y + (row_h - as.y) * 0.5f), arrow, "◀");
+                PutText(d, apx, ImVec2(b.x - 14.0f * u - as.x, y + (row_h - as.y) * 0.5f), arrow, "▶");
+            }
+            if (clicked(a, ImVec2(a.x + value_w * 0.5f, b.y))) {
+                row = n;
+                StepItem(item, -1);
+            } else if (clicked(ImVec2(a.x + value_w * 0.5f, a.y), b)) {
+                row = n;
+                StepItem(item, +1);
+            }
+        }
+        y += row_h + gap;
+    }
+    // More rows above or below.
+    if (first > 0) {
+        PutText(d, 14.0f * u, ImVec2(x0 + label_w * 0.5f, area_top - 20.0f * u), Pal::SandDim, "▲");
+    }
+    if (first + fit < int(rows.size())) {
+        PutText(d, 14.0f * u, ImVec2(x0 + label_w * 0.5f, y - 2.0f * u), Pal::SandDim, "▼");
+    }
+
+    // Help for the chosen row, on the right.
+    if (!rows.empty()) {
+        const MenuItem& item = items[size_t(rows[size_t(row)])];
+        const float hx = x0 + list_w + 40.0f * u, hw = x1 - hx;
+        const float pad = 22.0f * u;
+        const float title_px = 23.0f * u, body_px = 18.0f * u, note_px = 16.5f * u;
+        const float wrap = hw - pad * 2.0f;
+        const ImVec2 title = MeasureText(title_px, item.label.c_str(), wrap);
+        const ImVec2 body = MeasureText(body_px, item.help.c_str(), wrap);
+        const char* note = item.restart ? L("◆  Vale ao reiniciar o jogo", "◆  Applies when the game restarts")
+                                        : L("●  Vale na hora", "●  Applies at once");
+        const ImVec2 ns = MeasureText(note_px, note, wrap);
+        const float hh = pad + title.y + 14.0f * u + body.y + 24.0f * u + ns.y + pad;
+        const ImVec2 a(hx, area_top), b(x1, area_top + hh);
+        d->AddRectFilled(a, b, Pal::Panel, 4.0f * u);
+        d->AddRect(a, b, IM_COL32(110, 100, 80, 120), 4.0f * u, 0, 1.0f * u);
+        d->AddRectFilled(a, ImVec2(b.x, a.y + 3.0f * u), Pal::GoldDeep, 4.0f * u, ImDrawFlags_RoundCornersTop);
+        float hy = a.y + pad;
+        PutText(d, title_px, ImVec2(hx + pad, hy), Pal::GoldBright, item.label.c_str(), wrap);
+        hy += title.y + 14.0f * u;
+        PutText(d, body_px, ImVec2(hx + pad, hy), Pal::Sand, item.help.c_str(), wrap);
+        hy += body.y + 12.0f * u;
+        d->AddLine(ImVec2(hx + pad, hy), ImVec2(b.x - pad, hy), IM_COL32(110, 100, 80, 120), 1.0f * u);
+        hy += 12.0f * u;
+        PutText(d, note_px, ImVec2(hx + pad, hy), item.restart ? Pal::Amber : Pal::Moss, note, wrap);
+    }
+
+    // The restart band: what waits for the game to start again (kept in the launcher's settings).
+    if (!waiting.empty()) {
+        const float by = o.y + H - footer_h - band_h - 16.0f * u;
+        const ImVec2 a(x0, by), b(x1, by + band_h);
+        d->AddRectFilled(a, b, Pal::AmberBand, 4.0f * u);
+        d->AddRect(a, b, Pal::Amber, 4.0f * u, 0, 1.5f * u);
+        std::string list;
+        for (const auto& w : waiting) {
+            list += (list.empty() ? "" : ", ") + w;
+        }
+        const std::string head = std::string("⚠  ") + L("Reinicie o jogo para aplicar", "Restart the game to apply") + ":  ";
+        const float px = 18.5f * u;
+        const ImVec2 hs = MeasureText(px, head.c_str());
+        PutText(d, px, ImVec2(a.x + 18.0f * u, by + (band_h - hs.y) * 0.5f), Pal::GoldBright, head.c_str());
+        const std::string rest = Fit(px, list, cw - hs.x - 36.0f * u);
+        PutText(d, px, ImVec2(a.x + 18.0f * u + hs.x, by + (band_h - hs.y) * 0.5f), Pal::Sand, rest.c_str());
+    }
+
+    // Footer: "kept automatically" on the left, the keys on the right (keyboard or controller,
+    // whichever was used last).
+    {
+        const float fy = o.y + H - footer_h + (footer_h - 30.0f * u) * 0.5f;
+        d->AddLine(ImVec2(x0, o.y + H - footer_h), ImVec2(x1, o.y + H - footer_h), IM_COL32(110, 100, 80, 90),
+                   1.0f * u);
+        PutText(d, 16.0f * u, ImVec2(x0, fy + 5.0f * u), Pal::SandDim,
+                L("Tudo fica salvo automaticamente", "Everything is saved automatically"));
+        const float cap_h = 28.0f * u;
+        float kx = x1;
+        const auto group = [&](const char* label, std::initializer_list<const char*> keys, bool closes) {
+            const float right = kx;
+            const ImVec2 ls = MeasureText(17.0f * u, label);
+            kx -= ls.x;
+            PutText(d, 17.0f * u, ImVec2(kx, fy + (cap_h - ls.y) * 0.5f), Pal::Sand, label);
+            kx -= 10.0f * u;
+            for (auto it = std::rbegin(keys); it != std::rend(keys); ++it) {
+                const float w = std::max(cap_h, MeasureText(cap_h * 0.62f, *it).x + cap_h * 0.5f);
+                kx -= w;
+                key_cap(kx, fy, *it, cap_h);
+                kx -= 5.0f * u;
+            }
+            if (closes && clicked(ImVec2(kx, fy), ImVec2(right, fy + cap_h))) {
+                close = true;
+            }
+            kx -= 30.0f * u;
+        };
+        if (menu_pad) {
+            group(L("Fechar", "Close"), {xbox ? "B" : "○"}, true);
+            group(L("Abas", "Tabs"), {xbox ? "LB" : "L1", xbox ? "RB" : "R1"}, false);
+            group(L("Mudar", "Change"), {"◀", "▶"}, false);
+            group(L("Escolher", "Choose"), {"▲", "▼"}, false);
+        } else {
+            group(L("Fechar", "Close"), {"Esc"}, true);
+            group(L("Abas", "Tabs"), {"Q", "E"}, false);
+            group(L("Mudar", "Change"), {"◀", "▶"}, false);
+            group(L("Escolher", "Choose"), {"▲", "▼"}, false);
+        }
+    }
     ImGui::End();
-    if (!keep_open) {
+    if (close) {
         SetOpen(false);
+    }
+}
+
+// Menu input from the window thread (under imgui_mutex): keys, buttons and the left stick become
+// menu moves, applied at the next frame. Returns true when the event was the menu's.
+bool MenuEvent(const SDL_Event& event) {
+    switch (event.type) {
+    case SDL_EVENT_KEY_DOWN: {
+        menu_pad = false;
+        const bool repeat = event.key.repeat;
+        switch (event.key.key) {
+        case SDLK_UP:
+        case SDLK_W:
+            menu_inputs.push_back(kInUp);
+            break;
+        case SDLK_DOWN:
+        case SDLK_S:
+            menu_inputs.push_back(kInDown);
+            break;
+        case SDLK_LEFT:
+        case SDLK_A:
+            menu_inputs.push_back(kInLeft);
+            break;
+        case SDLK_RIGHT:
+        case SDLK_D:
+            menu_inputs.push_back(kInRight);
+            break;
+        case SDLK_RETURN:
+        case SDLK_KP_ENTER:
+        case SDLK_SPACE:
+            if (!repeat) {
+                menu_inputs.push_back(kInActivate);
+            }
+            break;
+        case SDLK_Q:
+        case SDLK_PAGEUP:
+            if (!repeat) {
+                menu_inputs.push_back(kInTabPrev);
+            }
+            break;
+        case SDLK_E:
+        case SDLK_PAGEDOWN:
+            if (!repeat) {
+                menu_inputs.push_back(kInTabNext);
+            }
+            break;
+        case SDLK_TAB:
+            if (!repeat) {
+                menu_inputs.push_back((event.key.mod & SDL_KMOD_SHIFT) ? kInTabPrev : kInTabNext);
+            }
+            break;
+        default:
+            break;
+        }
+        return true;
+    }
+    case SDL_EVENT_KEY_UP:
+    case SDL_EVENT_TEXT_INPUT:
+        return true;
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+        menu_pad = true;
+        switch (event.gbutton.button) {
+        case SDL_GAMEPAD_BUTTON_DPAD_UP:
+            menu_inputs.push_back(kInUp);
+            break;
+        case SDL_GAMEPAD_BUTTON_DPAD_DOWN:
+            menu_inputs.push_back(kInDown);
+            break;
+        case SDL_GAMEPAD_BUTTON_DPAD_LEFT:
+            menu_inputs.push_back(kInLeft);
+            break;
+        case SDL_GAMEPAD_BUTTON_DPAD_RIGHT:
+            menu_inputs.push_back(kInRight);
+            break;
+        case SDL_GAMEPAD_BUTTON_SOUTH:
+            menu_inputs.push_back(kInActivate);
+            break;
+        case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER:
+            menu_inputs.push_back(kInTabPrev);
+            break;
+        case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER:
+            menu_inputs.push_back(kInTabNext);
+            break;
+        case SDL_GAMEPAD_BUTTON_EAST:
+        case SDL_GAMEPAD_BUTTON_START:
+            SetOpen(false);
+            break;
+        default:
+            break;
+        }
+        return true;
+    case SDL_EVENT_GAMEPAD_BUTTON_UP:
+        return true;
+    case SDL_EVENT_GAMEPAD_AXIS_MOTION: {
+        const bool lx = event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX;
+        const bool ly = event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTY;
+        if (!lx && !ly) {
+            return true;
+        }
+        bool* held = lx ? stick_x : stick_y;
+        const bool neg = event.gaxis.value < -20000, pos = event.gaxis.value > 20000;
+        if (neg && !held[0]) {
+            menu_pad = true;
+            menu_inputs.push_back(lx ? kInLeft : kInUp);
+        }
+        if (pos && !held[1]) {
+            menu_pad = true;
+            menu_inputs.push_back(lx ? kInRight : kInDown);
+        }
+        held[0] = neg;
+        held[1] = pos;
+        return true;
+    }
+    default:
+        return false;
     }
 }
 
@@ -1215,10 +2110,16 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
         return;
     }
     initialized = true;
+    (void)StartRaw("fps_mode"); // sotc: the launcher's settings as the game starts (restart band)
     std::printf("Overlay: menu ready (Insert or L3+R3)\n");
 }
 
 void UpdateTextInput(SDL_Window* window) {
+    // sotc: the menu's fullscreen choice, switched here on the window thread without the lock.
+    if (const int fullscreen = pending_fullscreen.exchange(-1, std::memory_order_relaxed);
+        fullscreen >= 0 && g_window) {
+        g_window->SetFullscreen(fullscreen != 0);
+    }
     bool want = false;
     {
         std::scoped_lock lock{imgui_mutex};
@@ -1434,13 +2335,7 @@ bool HandleEvent(const SDL_Event& event) {
         if (!is_open) {
             return false;
         }
-        io.AddKeyEvent(ImGuiMod_Ctrl, (event.key.mod & SDL_KMOD_CTRL) != 0);
-        io.AddKeyEvent(ImGuiMod_Shift, (event.key.mod & SDL_KMOD_SHIFT) != 0);
-        io.AddKeyEvent(ImGuiMod_Alt, (event.key.mod & SDL_KMOD_ALT) != 0);
-        if (const ImGuiKey key = KeyFromSdl(event.key.key); key != ImGuiKey_None) {
-            io.AddKeyEvent(key, down);
-        }
-        return true;
+        return MenuEvent(event); // sotc: the menu's own navigation (DrawMenu)
     }
     case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
     case SDL_EVENT_GAMEPAD_BUTTON_UP: {
@@ -1458,11 +2353,10 @@ bool HandleEvent(const SDL_Event& event) {
         if (!is_open) {
             return false;
         }
-        if (const ImGuiKey key = KeyFromGamepad(button); key != ImGuiKey_None) {
-            io.AddKeyEvent(key, down);
-        }
-        return true;
+        return MenuEvent(event);
     }
+    case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+        return is_open && MenuEvent(event);
     case SDL_EVENT_TEXT_INPUT: {
         // Typed characters (Ctrl+click on a slider, a text field): key events alone erase but
         // do not type. SDL sends them while text input is on (UpdateTextInput).
@@ -1654,6 +2548,7 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
         base_scale = scale;
     }
 
+    EnsureCjkFont(); // sotc: Chinese / Korean glyphs, before the frame (fonts change between frames)
     ImGui_ImplVulkan_NewFrame();
     ImGui::NewFrame();
     const bool loading = LoadingShown() && !list_active && !text_entry_active;
@@ -1703,12 +2598,24 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
                 SetUpscaler(v == 'f' ? 0 : 1);
             } else if (key == "rcas") {
                 SetRcas(v == 'h' ? 0 : v == 'm' ? 1 : v == 'l' ? 2 : 3);
+            } else if (key == "tab" || key == "row" || key == "step" || key == "lang") {
+                // sotc: the menu's tab, row, a step of the chosen row (1 / -1) or its language
+                const std::string value = text.substr(key.size() + 1);
+                if (key == "tab") {
+                    menu_tab = std::clamp(std::atoi(value.c_str()), 0, kTabCount - 1);
+                } else if (key == "row") {
+                    menu_row[size_t(menu_tab)] = std::max(0, std::atoi(value.c_str()));
+                } else if (key == "step") {
+                    menu_inputs.push_back(std::atoi(value.c_str()) < 0 ? kInLeft : kInRight);
+                } else {
+                    menu_lang.store(LangFromCode(value), std::memory_order_relaxed);
+                }
             }
             std::fprintf(stderr, "SOTC SET: %s\n", line);
         }
     }
     if (menu_open) {
-        Menu();
+        DrawMenu();
     }
     float fps_bottom = 0.0f;
     if (OverlayOn() && !menu_open) {

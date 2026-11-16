@@ -182,6 +182,7 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 
 | 23 | Ícone próprio da janela do jogo (menino com a espada; ou o do jogo, ou imagem do jogador) | ✅ | `83ecb1c`. |
 | 24 | Release v0.58.1 | ✅ | Publicada em 19/10 (texturas em alta qualidade + ícone da janela). Releases públicas: 0.58.1, 0.58, 0.57 (0.56 removida; tag mantida). |
+| 25 | Menu F1 novo, no molde do ZooT-PC | ✅ (não commitado) | 16/11. Abas Imagem / Desempenho / Grama / Som / Controles / Jogo / Debug (Q/E ou L1/R1; Debug = menu de debug da Bluepoint, pular logos/filme, vigia de texturas, comparar DLSS, botões F5 capturar / F9 recarregar texturas), linhas ◀ valor ▶, ajuda à direita, cores do jogo. O que dá muda na hora; o lido ao abrir o jogo leva ◆, vai para `launcher_settings.json` e uma faixa pede "Reinicie o jogo para aplicar". 6 idiomas do lançador (`tools/gen_menu_text.py` → `gpu/shim/bbport_menu_text.inc`); chinês/coreano com as fontes do Windows. Corrigida a trava da Tela cheia pelo menu (a troca agora vai para a thread da janela). Lançador: `LIVE_KEYS` com todas as chaves do menu. |
 
 ## Fora do roteiro
 

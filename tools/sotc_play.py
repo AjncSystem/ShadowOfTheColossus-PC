@@ -8,7 +8,7 @@ Restores out/save-template (unless --keep-save), starts out/bb-probe.exe and pla
 
 An event is seconds:what[:hold_ms]. "what" is pad tokens joined by ',' (BB_PAD_FILE names of
 src/runtime_pad.c: cross, circle, options, up, lx=0..255, ...), "shot" (dump the presented frame
-to out/dump, converted to PNG at the end), "menu" (opens or closes the in-game menu), "tex=off|high|max", "fps=30|60|unlimited", "up=fsr1|bilinear", "rcas=high|medium|low|off" (quick settings, as the in-game menu sets them), "stacks" (thread stacks to the log) or "log:text" (a marker in the output). Times count
+to out/dump, converted to PNG at the end), "menu" (opens or closes the in-game menu), "tex=off|high|max", "fps=30|60|unlimited", "up=fsr1|bilinear", "rcas=high|medium|low|off" (quick settings, as the in-game menu sets them), "tab=N", "row=N", "step=1|-1", "lang=pt|en|es|zh|ko|ru" (the in-game menu's tab, row, a change of that row, its language), "stacks" (thread stacks to the log) or "log:text" (a marker in the output). Times count
 from the "Starting main loop" line when --from-main-loop is given, else from the start.
 """
 import argparse
@@ -102,7 +102,7 @@ def main():
                 (out / 'dump.trigger').touch()
             elif what == 'rdoc':
                 (out / 'rdoc.trigger').touch()
-            elif what.split('=')[0] in ('tex', 'fps', 'up', 'rcas'):
+            elif what.split('=')[0] in ('tex', 'fps', 'up', 'rcas', 'tab', 'row', 'step', 'lang'):
                 (out / 'set.trigger').write_text(what)
             elif what == 'menu':
                 (out / 'menu.trigger').touch()

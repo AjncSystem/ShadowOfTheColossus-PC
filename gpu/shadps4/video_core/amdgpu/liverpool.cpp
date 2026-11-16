@@ -1748,7 +1748,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }();
                 // sotc: SOTC_VIS_DIRECT: the label after a bitmap written in the game's memory waits
                 // for the GPU (the game reads the bitmap once it sees the label).
-                const bool vis_honest = std::exchange(SotcStats::vis_label_pending, false);
+                const bool vis_honest =
+                    SotcStats::kVisDirect && rasterizer && rasterizer->VisWritesInFlight();
                 if (vis_honest) {
                     SotcStats::vis_honest_labels.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -2338,8 +2339,8 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 // copy must be recorded here).
                 const VAddr release_label = reinterpret_cast<VAddr>(release.Address<u8*>());
                 if (rasterizer && release.data_sel.Value() != DataSelect::GdsMemStore &&
-                    (std::exchange(SotcStats::vis_label_pending, false) ||
-                     (SotcStats::kVisDirect && LateLabelPending(release_label)))) {
+                    SotcStats::kVisDirect &&
+                    (rasterizer->VisWritesInFlight() || LateLabelPending(release_label))) {
                     SotcStats::vis_honest_labels.fetch_add(1, std::memory_order_relaxed);
                     const VAddr label = release_label;
                     LateLabelAdd(label);

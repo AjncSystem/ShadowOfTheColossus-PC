@@ -301,7 +301,9 @@ inline bool VisDirectProgram(uint64_t hash) {
     static const std::vector<uint64_t> programs = [] {
         std::vector<uint64_t> out;
         const char* v = std::getenv("SOTC_VIS_PROGRAMS");
-        std::string list = v ? v : "0x2e0f474b,0xf94d23d4,0x93aec24b,0x729c541e";
+        // sotc: the list measured best at the forest entrance (05/11: 31 -> 14 frames over 50 ms);
+        // 0x50784801 and 0xc54081d1 made it worse.
+        std::string list = v ? v : "0x2e0f474b,0xf94d23d4,0x93aec24b,0x729c541e,0x4defcf7f";
         size_t pos = 0;
         while (pos < list.size()) {
             const size_t comma = list.find(',', pos);
@@ -326,11 +328,19 @@ inline const bool kTexDirect = [] {
     return v && v[0] == '1';
 }();
 inline std::atomic<uint64_t> tex_direct_uploads{0}, tex_direct_bytes{0}, tex_direct_fallbacks{0};
+/// sotc: why a texture upload went by copy instead of SOTC_TEX_DIRECT: 0 no single backing run,
+/// 1 outside the imported range, 2 across an import chunk boundary, 3 chunk not imported yet,
+/// 4 offset alignment; counts and bytes.
+inline std::atomic<uint64_t> tex_direct_why[5]{}, tex_direct_why_bytes[5]{};
 
-/// A dispatch of one of those wrote the game's memory directly since the last label: the next
-/// end-of-pipe label waits for the GPU (draw thread only).
-inline bool vis_label_pending = false;
-inline std::atomic<uint64_t> vis_direct_binds{0}, vis_honest_labels{0}, vis_fallbacks{0};
+/// sotc: SOTC_VIS_DIRECT v2. The scheduler tick of the newest command buffer with a dispatch that
+/// writes the game's memory directly. While the GPU has not finished that tick, every end-of-pipe
+/// and release label waits for the GPU (v1 delayed only the first label after the dispatch, through
+/// one flag shared by the graphics and compute queues: the others told the game the GPU was done
+/// while it still wrote the game's memory, and the game reused it: heap crash at the ending).
+inline std::atomic<uint64_t> vis_tick{0};
+inline std::atomic<uint64_t> vis_direct_binds{0}, vis_honest_labels{0}, vis_fallbacks{0},
+    vis_unmap_waits{0};
 
 /// sotc: SOTC_SLOW_OPS=1 (with SOTC_DRAW_SPLIT): the draw thread's operations of each frame summed
 /// by shader (kind and first stage's hash; Liverpool::BackLoop), and for each frame over 40 ms the

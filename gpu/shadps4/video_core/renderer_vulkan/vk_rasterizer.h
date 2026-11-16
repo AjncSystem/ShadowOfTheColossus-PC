@@ -336,6 +336,20 @@ private:
         u64 offset;
     };
     std::vector<VisCopy> vis_copies;
+    /// sotc: SOTC_VIS_DIRECT v2: ranges of the game's memory a dispatch wrote directly (an unmap
+    /// of one waits for the GPU first: a late write would land in memory given back).
+    boost::icl::interval_set<VAddr> vis_ranges;
+    std::mutex vis_ranges_mutex;
+
+public:
+    /// sotc: SOTC_VIS_DIRECT v2: true while a dispatch that writes the game's memory directly has not
+    /// finished on the GPU (labels must wait for the GPU then).
+    bool VisWritesInFlight() {
+        const u64 tick = SotcStats::vis_tick.load(std::memory_order_acquire);
+        return tick && !scheduler.IsFree(tick);
+    }
+
+private:
     bool BindVisDirect(VAddr address, u64 size, u64 alignment, Shader::Backend::Bindings& binding,
                        Shader::PushData& push_data);
     void AfterVisDirect();

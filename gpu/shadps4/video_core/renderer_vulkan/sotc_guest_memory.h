@@ -44,6 +44,8 @@ Span Get(const u8* host, u64 size);
 /// null where Get is. *offset receives the offset of host in it. Never imports on the caller's
 /// thread (an import pins 64 MiB and costs ~18 ms): a chunk not imported yet is handed to the
 /// importer thread and null is returned until it is ready.
-const VideoCore::Buffer* GetBuffer(const u8* host, u64 size, u64* offset);
+/// sotc: `why` (optional) gets the reason of a null result: 1 outside the imported range (or off),
+/// 2 across a chunk boundary, 3 chunk not imported yet.
+const VideoCore::Buffer* GetBuffer(const u8* host, u64 size, u64* offset, int* why = nullptr);
 
 } // namespace Vulkan::SotcGuestMemory

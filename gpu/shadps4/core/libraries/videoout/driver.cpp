@@ -671,10 +671,11 @@ void VideoOutDriver::Flip(const Request& req) {
             if (SotcStats::kVisDirect) {
                 ReportPrintf(report,
                              "SOTC VIS DIRECT: %llu bitmaps written in the game's memory, %llu honest "
-                             "labels, %llu fallbacks\n",
+                             "labels, %llu fallbacks, %llu unmaps that waited for the GPU\n",
                              static_cast<unsigned long long>(SotcStats::vis_direct_binds.exchange(0)),
                              static_cast<unsigned long long>(SotcStats::vis_honest_labels.exchange(0)),
-                             static_cast<unsigned long long>(SotcStats::vis_fallbacks.exchange(0)));
+                             static_cast<unsigned long long>(SotcStats::vis_fallbacks.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::vis_unmap_waits.exchange(0)));
             }
             if (const u64 queued = SotcStats::release_queued.exchange(0)) {
                 ReportPrintf(report,
@@ -693,6 +694,25 @@ void VideoOutDriver::Flip(const Request& req) {
                              static_cast<unsigned long long>(SotcStats::tex_direct_uploads.exchange(0)),
                              static_cast<unsigned long long>(SotcStats::tex_direct_bytes.exchange(0) >> 20),
                              static_cast<unsigned long long>(SotcStats::tex_direct_fallbacks.exchange(0)));
+                {
+                    using SotcStats::tex_direct_why;
+                    using SotcStats::tex_direct_why_bytes;
+                    const auto c = [](std::atomic<uint64_t>& v) {
+                        return static_cast<unsigned long long>(v.exchange(0));
+                    };
+                    const unsigned long long b0 = c(tex_direct_why_bytes[0]) >> 20,
+                                             b1 = c(tex_direct_why_bytes[1]) >> 20,
+                                             b2 = c(tex_direct_why_bytes[2]) >> 20,
+                                             b3 = c(tex_direct_why_bytes[3]) >> 20,
+                                             b4 = c(tex_direct_why_bytes[4]) >> 20;
+                    ReportPrintf(report,
+                                 "SOTC TEX DIRECT copies by reason: no run %llu (%llu MiB), outside %llu "
+                                 "(%llu MiB), across chunks %llu (%llu MiB), not imported %llu (%llu "
+                                 "MiB), alignment %llu (%llu MiB)\n",
+                                 c(tex_direct_why[0]), b0, c(tex_direct_why[1]), b1,
+                                 c(tex_direct_why[2]), b2, c(tex_direct_why[3]), b3,
+                                 c(tex_direct_why[4]), b4);
+                }
             }
             if (SotcStats::kRbAge) {
                 const auto c0 = SotcStats::rb_age_count[0].exchange(0);
@@ -1002,7 +1022,7 @@ void VideoOutDriver::Flip(const Request& req) {
                         "draw cpu %.1f ms (idle spin %.1f; idle %.1f), cp cpu %.1f, recorder cpu "
                         "%.1f; ops draw %.1f, indirect %.1f, dispatch %.1f, func %.1f, commands "
                         "%.1f; bind %.1f [buffers %.1f (clamp %.1f, obtain %.1f), textures %.1f "
-                        "(desc %.1f, find %.1f, view %.1f), dma %.1f]; texture uploads "
+                        "(desc %.1f, find %.1f, view %.1f [lock %.1f, track %.1f, make %.1f]), dma %.1f]; texture uploads "
                         "%.1f [hash %.1f, staging %.1f, copy %.1f (%.1f MB in %.0f copies, %.0f of "
                         "2 MB+, %.0f page faults), detile %.1f, record %.1f]; guest readbacks "
                         "on the draw thread [begin %.1f (submit %.1f), apply %.1f (dirty reread "
@@ -1015,7 +1035,8 @@ void VideoOutDriver::Flip(const Request& req) {
                         ms(SplitDraw), ms(SplitIndirect), ms(SplitDispatch), ms(SplitFunc),
                         ms(SplitCommands), ms(SplitBind), ms(SplitBindBuffers),
                         ms(SplitBufClamp), ms(SplitBufObtain), ms(SplitBindTextures),
-                        ms(SplitTexDesc), ms(SplitTexFind), ms(SplitTexView), ms(SplitBindDma),
+                        ms(SplitTexDesc), ms(SplitTexFind), ms(SplitTexView), ms(SplitTexLock),
+                        ms(SplitTexTrack), ms(SplitTexMakeView), ms(SplitBindDma),
                         ms(SplitTexRefresh),
                         ms(SplitTexHash), ms(SplitTexStaging), ms(SplitTexCopy),
                         v[SplitTexBytes] / 1048576.0 / frames, v[SplitTexCopies] / frames,

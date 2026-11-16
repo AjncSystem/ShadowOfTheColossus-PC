@@ -3818,6 +3818,10 @@ bool Rasterizer::BindVisDirect(VAddr address, u64 size, u64 alignment,
     push_data.AddOffset(binding.buffer, adjust);
     buffer_infos.emplace_back(span.buffer, offset_aligned, size + adjust);
     vis_copies.push_back({address, size, span.buffer, span.offset});
+    {
+        std::scoped_lock lock{vis_ranges_mutex};
+        vis_ranges += decltype(vis_ranges)::interval_type::right_open(address, address + size);
+    }
     texture_cache.InvalidateMemoryFromGPU(address, size);
     SotcStats::vis_direct_binds.fetch_add(1, std::memory_order_relaxed);
     return true;
@@ -3852,7 +3856,7 @@ void Rasterizer::AfterVisDirect() {
     };
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1, .pMemoryBarriers = &copied});
     vis_copies.clear();
-    SotcStats::vis_label_pending = true;
+    SotcStats::vis_tick.store(scheduler.CurrentTick(), std::memory_order_release);
 }
 
 // sotc: the final composite samples the UI layer and the scene: UI first in the base game's
@@ -5623,6 +5627,39 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges -= decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
+    }
+    // sotc: SOTC_VIS_DIRECT v2: memory a visibility dispatch wrote directly is given back only once
+    // the GPU finished the dispatches queued so far (a late write would land in memory the game
+    // then maps elsewhere).
+    if (SotcStats::kVisDirect) {
+        bool overlaps = false;
+        {
+            std::scoped_lock lock{vis_ranges_mutex};
+            const auto range = decltype(vis_ranges)::interval_type::right_open(addr, addr + size);
+            overlaps = boost::icl::intersects(vis_ranges, range);
+            if (overlaps) {
+                vis_ranges -= range;
+            }
+        }
+        if (overlaps) {
+            u64 tick = 0;
+            const auto take = [this, &tick] {
+                if (VisWritesInFlight()) {
+                    tick = SotcStats::vis_tick.load(std::memory_order_acquire);
+                    Flush();
+                }
+            };
+            if (liverpool->IsBackThreaded() && !liverpool->OnBackThread()) {
+                liverpool->SendCommand<true>(take); // after the dispatches already queued
+            } else {
+                take();
+            }
+            if (tick) {
+                SotcStats::vis_unmap_waits.fetch_add(1, std::memory_order_relaxed);
+                scheduler.WaitSubmitted(tick, false);
+                scheduler.GetWorkSemaphore()->Wait(tick);
+            }
+        }
     }
 }
 

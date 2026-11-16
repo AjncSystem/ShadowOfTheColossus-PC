@@ -252,12 +252,18 @@ void QueueImport(Chunk& chunk, u64 index) {
 }
 } // namespace
 
-const VideoCore::Buffer* GetBuffer(const u8* host, u64 size, u64* offset) {
+const VideoCore::Buffer* GetBuffer(const u8* host, u64 size, u64* offset, int* why) {
     if (!g_enabled || host < g_base || size == 0) {
+        if (why) *why = 1;
         return nullptr;
     }
     const u64 host_offset = static_cast<u64>(host - g_base);
-    if (host_offset + size > g_size || host_offset / kChunk != (host_offset + size - 1) / kChunk) {
+    if (host_offset + size > g_size) {
+        if (why) *why = 1;
+        return nullptr;
+    }
+    if (host_offset / kChunk != (host_offset + size - 1) / kChunk) {
+        if (why) *why = 2;
         return nullptr;
     }
     const u64 index = host_offset / kChunk;
@@ -265,6 +271,7 @@ const VideoCore::Buffer* GetBuffer(const u8* host, u64 size, u64* offset) {
     Chunk& chunk = g_chunks[index];
     if (!chunk.buffer) {
         QueueImport(chunk, index);
+        if (why) *why = 3;
         return nullptr;
     }
     const Span span{chunk.buffer, host_offset - index * kChunk};

@@ -1469,10 +1469,19 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
         u64 run_size = 0;
         const u8* run = memory->GetBackingRun(device_addr, &run_start, &run_size);
         u64 offset = 0;
+        int why = 0;
         const Buffer* direct =
             run && device_addr + size <= run_start + run_size
-                ? Vulkan::SotcGuestMemory::GetBuffer(run + (device_addr - run_start), size, &offset)
+                ? Vulkan::SotcGuestMemory::GetBuffer(run + (device_addr - run_start), size, &offset,
+                                                     &why)
                 : nullptr;
+        if (direct && offset % std::max<u64>(instance.StorageMinAlignment(), 16) != 0) {
+            why = 4;
+        }
+        if (!direct || why == 4) {
+            SotcStats::tex_direct_why[why].fetch_add(1, std::memory_order_relaxed);
+            SotcStats::tex_direct_why_bytes[why].fetch_add(size, std::memory_order_relaxed);
+        }
         if (direct && offset % std::max<u64>(instance.StorageMinAlignment(), 16) == 0) {
             SotcStats::tex_direct_uploads.fetch_add(1, std::memory_order_relaxed);
             SotcStats::tex_direct_bytes.fetch_add(size, std::memory_order_relaxed);

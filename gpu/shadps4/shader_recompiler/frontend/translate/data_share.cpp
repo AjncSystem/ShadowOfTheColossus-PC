@@ -313,8 +313,26 @@ void Translator::DS_SWIZZLE_B32(const GcnInst& inst) {
             const IR::U32 id_in_quad = ir.BitwiseAnd(lane_id, ir.Imm32(3));
             const IR::U32 base = ir.ShiftLeftLogical(id_in_quad, ir.Imm32(1));
             const IR::U32 sel = ir.BitFieldExtract(ir.Imm32(offset0), base, ir.Imm32(2));
-            const IR::U32 quad_base = ir.BitwiseAnd(lane_id, ir.Imm32(~3u));
-            SetDst(inst.dst[0], ir.Shuffle(src, ir.BitwiseOr(quad_base, sel)));
+            // sotc: the quad permutation from the four quad broadcasts. A plain shuffle may leave
+            // out helper invocations (Vulkan only promises them for quad operations): AMD's
+            // driver returns garbage there, so values read across a 2x2 quad were wrong wherever
+            // the quad straddles a triangle edge (dashed lines along the triangle edges over the
+            // whole sky, shader 0x985eb208, on AMD cards). SOTC_QUAD_SWIZZLE=0: the old shuffle.
+            static const bool quad_ops = [] {
+                const char* v = std::getenv("SOTC_QUAD_SWIZZLE");
+                return !v || v[0] != '0';
+            }();
+            if (quad_ops) {
+                IR::U32 result = ir.QuadBroadcast(src, ir.Imm32(0u));
+                for (u32 q = 1; q < 4; ++q) {
+                    result = IR::U32{ir.Select(ir.IEqual(sel, ir.Imm32(q)),
+                                               ir.QuadBroadcast(src, ir.Imm32(q)), result)};
+                }
+                SetDst(inst.dst[0], result);
+            } else {
+                const IR::U32 quad_base = ir.BitwiseAnd(lane_id, ir.Imm32(~3u));
+                SetDst(inst.dst[0], ir.Shuffle(src, ir.BitwiseOr(quad_base, sel)));
+            }
         }
     } else {
         const u8 and_mask = (offset0 & 0x1f) | (~u8{0} << 5);

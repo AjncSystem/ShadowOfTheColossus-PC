@@ -17,6 +17,9 @@
 #include <pthread.h>
 #include <time.h>
 #include <SDL3/SDL.h>
+#ifdef _WIN32
+#include <windows.h> /* ReadProcessMemory: the game aim state */
+#endif
 #include <sys/stat.h>
 
 #define ERR_INVALID_ARG ((int32_t)0x80920001)
@@ -362,6 +365,229 @@ static void apply_mouse(PadData *d) {
     }
 }
 
+/* sotc: gyro bow aiming, as in Zelda (Breath of the Wild): while the game aims (its aim camera,
+ * game_aim_state below: bow or sword light, in every control scheme), turning the gamepad moves
+ * the aim on top of the aiming stick (right; left in the Classic schemes). The stick makes the
+ * large turns, the gyro the fine aim. The PS4 game has no motion aiming: it never turns the
+ * pad's motion sensor on and ignores the motion fields of the pad data (tested with real gyro data).
+ * SOTC_GYRO=0/1 (the launcher's option) sets the start state, SOTC_GYRO_SENS (default 1.0) scales
+ * it, SOTC_GYRO_INVERT=1 inverts the vertical; the in-game menu changes all three while playing
+ * (bbport_overlay.cpp). SOTC_GYRO_DEBUG=1 logs samples. */
+#define GYRO_DEFAULT_ON 0 /* off, as on the PS4 (the game has no motion aiming) */
+static atomic_int gyro_on=-1;
+int runtime_gyro_enabled(void) {
+    int v=atomic_load(&gyro_on);
+    if (v<0) {
+        const char *e=getenv("SOTC_GYRO");
+        v=e && *e ? e[0]!='0' : GYRO_DEFAULT_ON;
+        atomic_store(&gyro_on,v);
+    }
+    return v;
+}
+void runtime_gyro_set(int on) { atomic_store(&gyro_on,on ? 1 : 0); }
+/* Sensitivity in percent (100 = 1.0) and the vertical invert: SOTC_GYRO_SENS / SOTC_GYRO_INVERT at
+ * start, the in-game menu while playing. */
+static atomic_int gyro_sens=-1, gyro_invert=-1;
+int runtime_gyro_sens_percent(void) {
+    int v=atomic_load(&gyro_sens);
+    if (v<0) {
+        const char *e=getenv("SOTC_GYRO_SENS");
+        const double f=e && *e ? atof(e) : 1.0;
+        v=f>0 ? (int)(f*100.0+0.5) : 100;
+        atomic_store(&gyro_sens,v);
+    }
+    return v;
+}
+void runtime_gyro_set_sens_percent(int pct) { atomic_store(&gyro_sens,pct<10 ? 10 : pct>500 ? 500 : pct); }
+int runtime_gyro_inverted(void) {
+    int v=atomic_load(&gyro_invert);
+    if (v<0) {
+        const char *e=getenv("SOTC_GYRO_INVERT");
+        v=e && e[0]=='1';
+        atomic_store(&gyro_invert,v);
+    }
+    return v;
+}
+void runtime_gyro_set_inverted(int on) { atomic_store(&gyro_invert,on ? 1 : 0); }
+
+/* The game's control scheme, from its profile save (SAVEDATA0ShadowProfile0/USR-DATA): a list of
+ * fields <name hash:4><ef be><type:2>...; the scheme is the string field with hash 0x6a83b721
+ * (type 0x0c, <size:4><length:1><chars>): "Default" (Modern), "ModernRemap", "Legacy" (Classic),
+ * "LegacyRemap". It decides which button aims (screenshots of the Controls page, 12 Nov):
+ *   Modern: R1 = Aim (R2 Grab); Modern Remapped: R2 = Aim (R1 Grab);
+ *   Classic / Classic Remapped: no Aim, holding Attack (Square) draws the bow, as on the PS2; the
+ *   aim then moves with the left stick (the right stick only turns the camera; user test, 12 Nov).
+ *   A button cannot gate it there (with the sword, Square attacks and the gyro on the left stick
+ *   walks Wander; the sword light is on Circle): only the game's aim camera (game_aim_state)
+ *   turns it on in these schemes; without it the gyro is off there.
+ * Read again when the file changes (checked once a second); without a profile: Modern. */
+enum { SCHEME_MODERN, SCHEME_MODERN_REMAP, SCHEME_CLASSIC };
+static int control_scheme(uint64_t now) {
+    static int scheme=SCHEME_MODERN; static uint64_t next_check; static time_t seen; static off_t seen_size=-1;
+    if (now<next_check) return scheme;
+    next_check=now+1000000;
+    char path[800];
+    runtime_savedata_user_root(path,sizeof path);
+    strncat(path,"/SAVEDATA0ShadowProfile0/USR-DATA",sizeof path-strlen(path)-1);
+    struct stat st;
+    if (stat(path,&st) || (st.st_mtime==seen && st.st_size==seen_size)) return scheme;
+    seen=st.st_mtime; seen_size=st.st_size;
+    FILE *f=fopen(path,"rb");
+    if (!f) return scheme;
+    uint8_t buf[65536];
+    const size_t n=fread(buf,1,sizeof buf,f);
+    fclose(f);
+    static const uint8_t key[8]={0x21,0xb7,0x83,0x6a,0xef,0xbe,0x0c,0x00};
+    char name[32]="";
+    for (size_t i=0;i+13<n;++i) {
+        if (memcmp(buf+i,key,sizeof key)) continue;
+        const size_t len=buf[i+12];
+        if (len<sizeof name && i+13+len<=n) { memcpy(name,buf+i+13,len); name[len]=0; }
+        break;
+    }
+    const int was=scheme;
+    if (!strcmp(name,"ModernRemap")) scheme=SCHEME_MODERN_REMAP;
+    else if (!strcmp(name,"Legacy") || !strcmp(name,"LegacyRemap")) scheme=SCHEME_CLASSIC;
+    else scheme=SCHEME_MODERN;
+    static int told;
+    if (!told || scheme!=was) {
+        told=1;
+        printf("Runtime: control scheme \"%s\": aim stick %s, Aim button %s\n",*name ? name : "(none)",
+               scheme==SCHEME_CLASSIC ? "left" : "right",
+               scheme==SCHEME_MODERN ? "R1" : scheme==SCHEME_MODERN_REMAP ? "R2" : "none (Square draws the bow)");
+    }
+    return scheme;
+}
+/* The game's own aim state: its camera's mode. The camera object (pointer at eboot+0x3259d00)
+ * holds the name of its current mode at +0x1238: "Aiming_rotation" (eboot+0x106eb49) while the
+ * player aims the bow or raises the sword for its light, in every control scheme; "Normal" and
+ * others otherwise (found by a memory scan labelled with the Aim button). -1: not usable (no image,
+ * or another eboot build: the string is not there), then the buttons decide. */
+static unsigned char *game_image;
+void runtime_pad_set_image(unsigned char *image) { game_image=image; }
+static int read_guest(uint64_t at, void *out, size_t size) {
+#ifdef _WIN32
+    SIZE_T done=0; /* the camera can be freed while a level loads: a failed read is harmless */
+    return ReadProcessMemory(GetCurrentProcess(),(const void *)(uintptr_t)at,out,size,&done) && done==size;
+#else
+    memcpy(out,(const void *)(uintptr_t)at,size);
+    return 1;
+#endif
+}
+static int game_aim_state(void) {
+    static int usable=-1;
+    if (usable<0) {
+        static const char name[]="Aiming_rotation";
+        usable=game_image && !memcmp(game_image+0x106eb49,name,sizeof name);
+        printf("Runtime: gyro aiming follows the %s\n",usable ? "game's aim camera" : "Aim button (unknown eboot build)");
+    }
+    if (!usable) return -1;
+    uint64_t camera=0, mode=0;
+    if (!read_guest((uint64_t)(uintptr_t)(game_image+0x3259d00),&camera,8) || !camera) return 0;
+    if (!read_guest(camera+0x1238,&mode,8)) return 0;
+    return mode==(uint64_t)(uintptr_t)(game_image+0x106eb49);
+}
+/* Does the player aim? *left_stick: the aim moves with the left stick (Classic schemes). */
+static int aiming(const PadData *d, int *left_stick) {
+    const int scheme=control_scheme(d->timestamp);
+    *left_stick=scheme==SCHEME_CLASSIC;
+    const int state=game_aim_state();
+    if (state>=0) {
+        static int was=-1;
+        if (state!=was && getenv("SOTC_GYRO_DEBUG")) printf("SOTC gyro: game aim camera %s\n",state ? "on" : "off");
+        was=state;
+        return state;
+    }
+    switch (scheme) {
+    case SCHEME_MODERN_REMAP: return (d->buttons & BTN_R2) || d->r2>30;
+    case SCHEME_CLASSIC: return 0; /* see control_scheme: the button alone is not enough */
+    default: return (d->buttons & BTN_R1)!=0;
+    }
+}
+
+static void apply_gyro(PadData *d, SDL_Gamepad *g) {
+    static SDL_Gamepad *sensor_pad; static int has_gyro, debug=-1, shown;
+    static float bias[3], up[3]={0,1,0}, still_for, smooth_x, smooth_y;
+    static uint64_t last_us;
+    if (!g || !runtime_gyro_enabled()) { sensor_pad=NULL; return; }
+    if (debug<0) debug=getenv("SOTC_GYRO_DEBUG")!=NULL;
+    if (sensor_pad!=g) { /* a new gamepad (or the option turned on again): sensors on */
+        sensor_pad=g; last_us=0; still_for=0;
+        has_gyro=SDL_GamepadHasSensor(g,SDL_SENSOR_GYRO) && SDL_SetGamepadSensorEnabled(g,SDL_SENSOR_GYRO,true);
+        if (SDL_GamepadHasSensor(g,SDL_SENSOR_ACCEL)) SDL_SetGamepadSensorEnabled(g,SDL_SENSOR_ACCEL,true);
+        printf("Runtime: gyro aiming: %s\n",has_gyro ? "on (while the game aims)"
+                                                     : "this gamepad has no gyro");
+    }
+    if (!has_gyro) return;
+    float w[3]={0}, a[3]={0};
+    if (!SDL_GetGamepadSensorData(g,SDL_SENSOR_GYRO,w,3)) return;
+    SDL_GetGamepadSensorData(g,SDL_SENSOR_ACCEL,a,3);
+    float dt=last_us ? (float)(d->timestamp-last_us)*1e-6f : 0.0f;
+    last_us=d->timestamp;
+    if (dt>0.1f) dt=0.1f;
+
+    /* "Up" in the gamepad's axes (SDL: x right, y up, z toward the player): the accelerometer,
+     * low-pass filtered over about 0.25 s. */
+    const float an=SDL_sqrtf(a[0]*a[0]+a[1]*a[1]+a[2]*a[2]);
+    if (an>1.0f) {
+        const float k=dt>0 ? SDL_min(1.0f,dt/0.25f) : 1.0f;
+        for (int i=0;i<3;++i) up[i]+=(a[i]/an-up[i])*k;
+    }
+    /* Gyro bias (about 0.004 rad/s on a DualSense at rest): learned while the gamepad lies still
+     * for 0.5 s and the player does not aim. */
+    const int still=SDL_fabsf(w[0]-bias[0])<0.06f && SDL_fabsf(w[1]-bias[1])<0.06f &&
+                    SDL_fabsf(w[2]-bias[2])<0.06f && an>8.8f && an<10.8f;
+    still_for=still ? still_for+dt : 0.0f;
+    int left_stick=0;
+    const int aim=aiming(d,&left_stick);
+    if (still_for>0.5f && !aim) {
+        const float k=SDL_min(1.0f,dt/1.0f);
+        for (int i=0;i<3;++i) bias[i]+=(w[i]-bias[i])*k;
+    }
+    if (!aim) { smooth_x=smooth_y=0; return; }
+    for (int i=0;i<3;++i) w[i]-=bias[i];
+
+    /* Player-space yaw (GyroWiki, Jibb Smart): the turn about the up axis, so turning works the
+     * same with the gamepad flat or upright; the 1.41 lets a turn about the roll axis help. */
+    const float un=SDL_sqrtf(up[0]*up[0]+up[1]*up[1]+up[2]*up[2]);
+    const float uy=un>0 ? up[1]/un : 1.0f, uz=un>0 ? up[2]/un : 0.0f;
+    const float world_yaw=uy*w[1]+uz*w[2];
+    const float yaw_max=SDL_sqrtf(w[1]*w[1]+w[2]*w[2]);
+    float yaw=(world_yaw<0 ? -1.0f : 1.0f)*SDL_min(SDL_fabsf(world_yaw)*1.41f,yaw_max);
+    float pitch=w[0];
+    yaw*=57.29578f; pitch*=57.29578f; /* deg/s */
+
+    /* Tightening: turns under 2 deg/s (hand tremor) are scaled down, so a still aim stays still. */
+    const float speed=SDL_sqrtf(yaw*yaw+pitch*pitch), tight=2.0f;
+    if (speed<tight) { yaw*=speed/tight; pitch*=speed/tight; }
+
+    /* deg/s to stick units on top of the aiming stick (right; left in the Classic schemes): the gamepad turns left (yaw > 0), the camera
+     * turns left (stick x < 128); the front tips up (pitch > 0), the aim goes up (stick y < 128).
+     * Averaged with the previous sample as the mouse is; past the game's dead zone (28) when the
+     * stick itself is in it. */
+    if (runtime_gyro_inverted()) pitch=-pitch;
+    const float gain=0.008f*(float)runtime_gyro_sens_percent(), dead=28.0f;
+    const float cx=-yaw*gain, cy=-pitch*gain;
+    const float add[2]={0.5f*(smooth_x+cx),0.5f*(smooth_y+cy)};
+    smooth_x=cx; smooth_y=cy;
+    uint8_t *axes[2]={left_stick ? &d->left_x : &d->right_x,left_stick ? &d->left_y : &d->right_y};
+    for (int i=0;i<2;++i) {
+        if (add[i]<0.5f && add[i]>-0.5f) continue;
+        const float base=(float)*axes[i];
+        const int in_dead=base>128.0f-dead && base<128.0f+dead;
+        const float v=in_dead ? 128.0f+(add[i]>0 ? dead : -dead)+add[i] : base+add[i];
+        *axes[i]=(uint8_t)(v<0 ? 0 : v>255 ? 255 : v);
+    }
+    if (debug && shown<400) {
+        static uint64_t next;
+        if (d->timestamp>=next) {
+            ++shown; next=d->timestamp+200000;
+            printf("SOTC gyro: yaw %+.1f pitch %+.1f deg/s -> %s stick %u,%u (bias %+.3f %+.3f %+.3f)\n",
+                   yaw,pitch,left_stick ? "left" : "right",*axes[0],*axes[1],bias[0],bias[1],bias[2]);
+        }
+    }
+}
+
 static void sample_host(PadData *d) {
     memset(d,0,sizeof(*d));
     d->left_x=d->left_y=d->right_x=d->right_y=128;
@@ -401,6 +627,7 @@ static void sample_host(PadData *d) {
     }
     if (k) apply_keyboard(d,k);
     apply_mouse(d);
+    apply_gyro(d,g); /* after the keyboard and mouse: the aim button from any of them counts */
 }
 
 /* BB_PAD_FILE=<file>: scripted input for automated runs. The file holds whitespace-separated

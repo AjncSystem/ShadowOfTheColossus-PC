@@ -171,7 +171,7 @@ def windows_language():
 APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), 'sys_modules': '', 'sound_firmware': False, 'audio_channels': 'auto', 'audio_lfe': True, 'audio_device': '',
                 'user_dir': '', 'af16': True, 'textures': 'high', 'hdr': False, 'window_icon_file': '', 'fps60': False, 'fps_mode': '30', 'fps_dynamic': True, 'button_icons': 'ps', 'fullscreen': False,
                 'present_mode': 'Mailbox', 'language': '', 'player_name': '', 'show_fps': False,
-                'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'rb_hot': True, 'skip_logos': True, 'skip_film': False, 'close_on_play': False, 'gamepad': '', 'rumble': True,
+                'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'rb_hot': True, 'skip_logos': True, 'skip_film': False, 'close_on_play': False, 'gamepad': '', 'rumble': True, 'gyro_aim': False, 'gyro_sens': '1.0', 'gyro_invert': False,
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'fx_motionblur': False, 'engine_cvars': '', 'perf_culling': True,
@@ -1016,6 +1016,10 @@ def game_environment(s):
         env['BB_GAMEPAD'] = str(s['gamepad']).strip()
     if not s.get('rumble', True):
         env['SOTC_RUMBLE'] = '0'
+    # Gyro bow aiming (src/runtime_pad.c): off by default, as on the PS4.
+    env['SOTC_GYRO'] = '1' if s.get('gyro_aim', False) else '0'
+    env['SOTC_GYRO_SENS'] = str(s.get('gyro_sens') or '1.0')
+    env['SOTC_GYRO_INVERT'] = '1' if s.get('gyro_invert') else '0'
     env['BB_CONFIG'] = str(PORT_DIR / 'sotc.ini')
     for item in str(s['extra_env']).split():
         item = item.strip().lstrip('=')  # "=KEY=1" typed by mistake still sets KEY
@@ -2015,6 +2019,15 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         self.check(f, 'rumble', _('Vibração do controle', 'Controller vibration'),
                    _('Desmarque para o controle não vibrar. Vale na próxima vez que o jogo abrir.',
                      'Clear it to stop the gamepad from rumbling. Applies the next time the game starts.'))
+        self.check(f, 'gyro_aim', _('Mira do arco com giroscópio', 'Controller gyro bow aiming'),
+                   _('Enquanto o jogo mira (arco ou luz da espada), girar o controle move a mira, em todos os '
+                     'esquemas de controle; o analógico continua valendo para os giros grandes. Precisa de um '
+                     'controle com giroscópio (DualSense, DualShock 4, Switch Pro). Também muda no menu do jogo (F1).',
+                     'While the game aims (bow or sword light), turning the gamepad moves the aim, in every control '
+                     'scheme; the stick still makes the large turns. Needs a gamepad with a gyro (DualSense, '
+                     'DualShock 4, Switch Pro). Also changes in the in-game menu (F1).'))
+        self.row(f, _('Sensibilidade do giroscópio', 'Gyro sensitivity'), self.choice(f, 'gyro_sens', MOUSE_SENS, 20))
+        self.check(f, 'gyro_invert', _('Inverter o giroscópio (eixo vertical)', 'Invert the gyro (vertical axis)'))
         self.section(f, _('Mouse', 'Mouse'))
         self.check(f, 'mouse', _('Câmera no mouse', 'Mouse camera'),
                    _('Clique na janela do jogo para capturar o mouse; Esc solta. Botão esquerdo = R1 (agarrar), '
@@ -3093,6 +3106,8 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         box.pack(side='left')
         self.ttk.Checkbutton(card, text=_('Vibração do controle', 'Controller vibration'), variable=self.var('rumble'),
                              style='Card.TCheckbutton').pack(anchor='w')
+        self.ttk.Checkbutton(card, text=_('Mira do arco com giroscópio', 'Controller gyro bow aiming'),
+                             variable=self.var('gyro_aim'), style='Card.TCheckbutton').pack(anchor='w')
         card = self.setup_card(_('Teclado e mouse', 'Keyboard and mouse'))
         self.ttk.Checkbutton(card, text=_('Câmera no mouse', 'Mouse camera'), variable=self.var('mouse'),
                              style='Card.TCheckbutton').pack(anchor='w')
@@ -3479,7 +3494,8 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                  'fg_hudless', 'vram_use', 'grass_detail', 'grass_distance', 'grass_height', 'weed_distance',
                  'weed_height', 'grass_shadows', 'grass_fade', 'audio_channels', 'audio_lfe', 'sound_firmware',
                  'mouse', 'mouse_sens', 'mouse_invert', 'button_icons', 'ui_language', 'language', 'skip_logos',
-                 'skip_film', 'play_mode', 'debug_menu', 'debug_watch', 'dlss_compare')
+                 'skip_film', 'play_mode', 'debug_menu', 'debug_watch', 'dlss_compare', 'gyro_aim',
+                 'gyro_sens', 'gyro_invert')
 
     def reload_live_settings(self):
         saved = load_json(CONFIG_FILE, {})

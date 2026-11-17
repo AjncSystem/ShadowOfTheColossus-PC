@@ -332,6 +332,15 @@ inline std::atomic<uint64_t> tex_direct_uploads{0}, tex_direct_bytes{0}, tex_dir
 /// 1 outside the imported range, 2 across an import chunk boundary, 3 chunk not imported yet,
 /// 4 offset alignment; counts and bytes.
 inline std::atomic<uint64_t> tex_direct_why[5]{}, tex_direct_why_bytes[5]{};
+/// sotc: SOTC_TEX_GATHER=1 (with SOTC_TEX_DIRECT): a texture whose bytes lie in several backing
+/// runs (the game's pool maps it 64 KiB at a time) or across two import chunks is gathered by the
+/// GPU, run by run, from the imported memory into video memory, instead of the CPU copy that was
+/// 30-60 ms per slow frame at area entries (17 Nov). Counts, bytes and copy regions.
+inline const bool kTexGather = [] {
+    const char* v = std::getenv("SOTC_TEX_GATHER");
+    return v && v[0] == '1';
+}();
+inline std::atomic<uint64_t> tex_gather_uploads{0}, tex_gather_bytes{0}, tex_gather_regions{0};
 
 /// sotc: SOTC_VIS_DIRECT v2. The scheduler tick of the newest command buffer with a dispatch that
 /// writes the game's memory directly. While the GPU has not finished that tick, every end-of-pipe

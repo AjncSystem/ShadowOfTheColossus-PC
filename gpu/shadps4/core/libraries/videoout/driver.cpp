@@ -714,6 +714,17 @@ void VideoOutDriver::Flip(const Request& req) {
                                  c(tex_direct_why[2]), b2, c(tex_direct_why[3]), b3,
                                  c(tex_direct_why[4]), b4);
                 }
+                if (SotcStats::kTexGather) {
+                    ReportPrintf(report,
+                                 "SOTC TEX GATHER: %llu uploads gathered by the GPU (%llu MiB, %llu "
+                                 "regions)\n",
+                                 static_cast<unsigned long long>(
+                                     SotcStats::tex_gather_uploads.exchange(0)),
+                                 static_cast<unsigned long long>(
+                                     SotcStats::tex_gather_bytes.exchange(0) >> 20),
+                                 static_cast<unsigned long long>(
+                                     SotcStats::tex_gather_regions.exchange(0)));
+                }
             }
             if (SotcStats::kRbAge) {
                 const auto c0 = SotcStats::rb_age_count[0].exchange(0);

@@ -965,6 +965,10 @@ def game_environment(s):
         env.setdefault('SOTC_PC_MEMORY', '1')
         env.setdefault('SOTC_PC_MEMORY_PREIMPORT', '1')
         env.setdefault('SOTC_TEX_DIRECT', '1')
+        # sotc: 0.77 (T48): textures in several backing runs (the game's pool maps them 64 KiB at
+        # a time) or across two import chunks are gathered by the GPU instead of copied by the
+        # CPU (~13 GB a session; user's route 17 Nov: area entry 7-9 frames over 50 ms -> 1).
+        env.setdefault('SOTC_TEX_GATHER', '1')
     # sotc: "Maximum" in PS4 Pro mode exhausted the game's page pool within minutes at the Shrine
     # (0x1a371, 22 Oct) until tabnul's page allocator fix (PR #288, sotc_modes.py POOL_FIX): an
     # hour without a crash with it (26 Oct). Experimental there; SOTC_MAX_IN_PRO=0 brings back High.

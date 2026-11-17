@@ -116,6 +116,8 @@ public:
 
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
+    /// sotc: SOTC_TEX_GATHER: the texture gathered by the GPU from the imported game memory.
+    [[nodiscard]] std::pair<const Buffer*, u64> GatherImageFromGuest(VAddr device_addr, u32 size);
     /// sotc: guest memory in a staging buffer, whatever the GPU copy holds (F9 diagnostic).
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainGuestCopyForImage(VAddr device_addr,
                                                                        u32 size);

@@ -1472,6 +1472,102 @@ std::pair<const Buffer*, u64> BufferCache::ObtainGuestCopyForImage(VAddr device_
     return {staging.buffer, staging.offset};
 }
 
+// sotc: SOTC_TEX_GATHER: the texture's bytes copied by the GPU from the imported game memory, one
+// region per backing run and import chunk, into video memory; {nullptr, 0} when any part is not
+// imported (the caller copies on the CPU as before). The copies go in the command buffer being
+// recorded, before the detiler or the image copy that read the result.
+std::pair<const Buffer*, u64> BufferCache::GatherImageFromGuest(VAddr device_addr, u32 size) {
+    struct Part {
+        const Buffer* source;
+        vk::BufferCopy copy;
+    };
+    static thread_local std::vector<Part> parts;
+    parts.clear();
+    VAddr at = device_addr;
+    const VAddr end = device_addr + size;
+    while (at < end) {
+        VAddr run_start = 0;
+        u64 run_size = 0;
+        const u8* run = memory->GetBackingRun(at, &run_start, &run_size);
+        if (!run || run_start + run_size <= at) {
+            return {};
+        }
+        const u8* host = run + (at - run_start);
+        u64 left = std::min<u64>(end, run_start + run_size) - at;
+        while (left) {
+            const u64 in_chunk = Vulkan::SotcGuestMemory::BytesToChunkEnd(host);
+            if (in_chunk == 0) {
+                return {};
+            }
+            const u64 n = std::min(left, in_chunk);
+            u64 offset = 0;
+            const Buffer* source = Vulkan::SotcGuestMemory::GetBuffer(host, n, &offset);
+            if (!source) {
+                return {};
+            }
+            const u64 dst = at - device_addr;
+            Part* last = parts.empty() ? nullptr : &parts.back();
+            if (last && last->source == source &&
+                last->copy.srcOffset + last->copy.size == offset &&
+                last->copy.dstOffset + last->copy.size == dst) {
+                last->copy.size += n;
+            } else {
+                parts.push_back({source, vk::BufferCopy{offset, dst, n}});
+            }
+            host += n;
+            at += n;
+            left -= n;
+        }
+    }
+    const auto staging = [&] {
+        const SotcStats::SplitTimer staging_split{SotcStats::SplitTexStaging};
+        return staging_pool.Request(size, VideoCore::MemoryType::DeviceLocal,
+                                    std::max<u64>(instance.StorageMinAlignment(), 16));
+    }();
+    if (!staging.buffer) {
+        return {};
+    }
+    scheduler.EndRendering();
+    const auto cmdbuf = scheduler.CommandBuffer();
+    // Game memory the GPU wrote in place earlier in this command buffer, then the copies.
+    const vk::MemoryBarrier2 pre_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &pre_barrier,
+    });
+    static thread_local std::vector<vk::BufferCopy> copies;
+    for (size_t i = 0; i < parts.size();) {
+        const Buffer* source = parts[i].source;
+        copies.clear();
+        for (; i < parts.size() && parts[i].source == source; ++i) {
+            vk::BufferCopy copy = parts[i].copy;
+            copy.dstOffset += staging.offset;
+            copies.push_back(copy);
+        }
+        cmdbuf.copyBuffer(source->Handle(), staging.buffer->Handle(), copies);
+    }
+    const vk::MemoryBarrier2 post_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eShaderRead |
+                         vk::AccessFlagBits2::eShaderStorageRead,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &post_barrier,
+    });
+    SotcStats::tex_gather_uploads.fetch_add(1, std::memory_order_relaxed);
+    SotcStats::tex_gather_bytes.fetch_add(size, std::memory_order_relaxed);
+    SotcStats::tex_gather_regions.fetch_add(parts.size(), std::memory_order_relaxed);
+    return {staging.buffer, staging.offset};
+}
+
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
     if (IsRegionGpuModified(device_addr, size)) {
         const SotcStats::SplitTimer copy_split{SotcStats::SplitTexCopy};
@@ -1500,6 +1596,11 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
             SotcStats::tex_direct_uploads.fetch_add(1, std::memory_order_relaxed);
             SotcStats::tex_direct_bytes.fetch_add(size, std::memory_order_relaxed);
             return {direct, offset};
+        }
+        if (SotcStats::kTexGather && size >= 64_KB) {
+            if (const auto gathered = GatherImageFromGuest(device_addr, size); gathered.first) {
+                return gathered;
+            }
         }
         SotcStats::tex_direct_fallbacks.fetch_add(1, std::memory_order_relaxed);
     }

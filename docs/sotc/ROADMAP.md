@@ -148,6 +148,7 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 | # | Item | Estado | Notas |
 |---|---|---|---|
 | 8 | AMD (#122, #87, #86, #82, #43), GTX 1060/1070 (#102, #68), Intel Arc (#16) | 🔧 | #98, #81 (partes) e xeodeo integrados; falta teste em AMD/Intel reais (pedir a jogadores). GTX 10xx sem trabalho ainda. |
+| T52 | **Linhas tracejadas no céu em AMD** (#432, #433; desde a 0.72) | ✅ | 17/11, achado pelo usuário no notebook Vega 8 (driver 2.0.279): shader `0x985eb208` (pintura por hash, `SOTC_FS_TINT_FILE`). `DS_SWIZZLE_B32` em modo quad virava `OpGroupNonUniformShuffle`, que pode deixar de fora os pixels ajudantes; a AMD devolve lixo onde o quad cruza a aresta do triângulo. Agora 4 `QuadBroadcast` + select (`78deb66d`), `SOTC_QUAD_SWIZZLE=0` volta o antigo (cache próprio). Vega limpa; RTX igual. Pendentes do relatório (`C:\Users\ajnc2\Desktop\ceu`): queda ao abrir em Vega no `amdvlk64.dll+0x1eeef7` que some sem `user\cache\sotc_vk_pipelines.bin`; testar a poeira branca dos passos (AMD) com este build; patch de diagnóstico (modo Vulkan 1.2 p/ RenderDoc, tint por hash) não integrado. |
 
 ## Fase 4 — Desempenho
 

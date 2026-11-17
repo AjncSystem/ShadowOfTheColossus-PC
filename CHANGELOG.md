@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.76.1 — 2026-11-17
+- 🌌 **Linhas tracejadas no céu em placas AMD Radeon corrigidas** (#432, #433): um shader do céu trocava valores entre pixels vizinhos de um jeito que o driver da AMD não garante nas arestas dos triângulos, e desenhava uma grade de linhas sobre o céu (tela de título e jogo). Agora usa operações de quad, que todo driver garante. NVIDIA sem mudança. O cache de shaders é refeito na primeira abertura. `SOTC_QUAD_SWIZZLE=0` volta ao antigo.
+
+### English
+- 🌌 **Dashed lines in the sky on AMD Radeon cards fixed** (#432, #433): one sky shader read values from neighbouring pixels in a way AMD's driver does not guarantee at triangle edges, and drew a grid of lines over the sky (title screen and in game). It now uses quad operations, which every driver guarantees. No change on NVIDIA. The shader cache is rebuilt on the first start. `SOTC_QUAD_SWIZZLE=0` restores the old behaviour.
+
 ## 0.76 — 2026-11-16
 - 🎮 **Menu F1 novo**, organizado como o do ZooT-PC: abas Imagem, Desempenho, Grama, Som, Controles, Jogo e Debug (Q/E ou L1/R1), valor entre setas, ajuda da opção à direita e as cores do jogo. O que dá para mudar jogando muda na hora; o que só vale no próximo início (marcado com ◆) fica salvo nas configurações do lançador e uma faixa pede para reiniciar. Textos nos idiomas do lançador.
 - 🖥️ **CPUs antigas sem BMI1/LZCNT/MOVBE agora rodam o jogo** (Oussama268 e Lucas-blip-png, #49, #88, #200): essas instruções são emuladas no carregamento (Intel Sandy/Ivy Bridge, Xeon E5 v1/v2). Ainda é preciso AVX. FPS em mundo aberto é menor nessas CPUs.

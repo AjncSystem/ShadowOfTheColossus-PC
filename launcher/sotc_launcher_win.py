@@ -377,7 +377,7 @@ EFFECTS = [('fx_vignette', ('Vinheta (cantos escurecidos)', 'Vignette (darkened 
            ('fx_motionblur', ('Motion blur (borrão de movimento)', 'Motion blur'), 'r_motionBlurEnable=0')]
 # Common screen sizes: 16:9, 16:10, 21:9 (ultrawide) and 32:9 (super ultrawide).
 # 5120x2160 is left out: the game faults at start (memory), 3840x2160 runs.
-SCREENS = [('1920x1080', '16:9, 1080p'), ('2560x1440', '16:9, 1440p'), ('3840x2160', '16:9, 4K'),
+SCREENS = [('1600x900', '16:9, 900p'), ('1920x1080', '16:9, 1080p'), ('2560x1440', '16:9, 1440p'), ('3840x2160', '16:9, 4K'),
            ('1920x1200', '16:10'), ('2560x1600', '16:10'),
            ('2560x1080', '21:9'), ('3440x1440', '21:9'), ('3840x1600', '21:9'),
            ('3840x1080', '32:9'), ('5120x1440', '32:9')]
@@ -425,6 +425,9 @@ DLSS_MODES = [('dlaa', ('DLAA (nativo)', 'DLAA (native)')),
               ('performance', ('Desempenho (2×)', 'Performance (2×)')),
               ('ultra', ('Ultra Desempenho (3×)', 'Ultra Performance (3×)'))]
 DLSS_FACTORS = {'dlaa': 1.0, 'quality': 1.5, 'balanced': 1.724, 'performance': 2.0, 'ultra': 3.0}
+# sotc_modes.py patches render sizes that are multiples of this, from this height up.
+RENDER_ALIGN = 8
+MIN_RENDER_HEIGHT = 360
 # RCAS after DLSS (SOTC_DLSS_SHARPEN, attenuation in stops: 0 = sharpest).
 DLSS_SHARPNESS = [('0', ('Alta (padrão)', 'High (default)')), ('0.5', ('Média', 'Medium')), ('1', ('Baixa', 'Low')),
                   ('off', ('Desligada', 'Off'))]
@@ -1070,7 +1073,7 @@ def game_environment(s):
     if upscaler in ('dlss', 'fsr4') and env['SOTC_NEO'] == '0':
         env['SOTC_RENDER_RES'] = dlss_render(output, s.get('dlss_mode'))
     elif output not in ('1280x720', '1920x1080') and env['SOTC_NEO'] == '0':
-        env['SOTC_RENDER_RES'] = output
+        env['SOTC_RENDER_RES'] = render_size(output)
     # DLSS: FSR 1 stays the upscaler of frames without the game's scene (menus) and the fallback
     # without an RTX card or the NVIDIA DLLs.
     env['BB_FSR1'] = '1' if upscaler in ('fsr1', 'dlss', 'fsr4') else '0'
@@ -1126,12 +1129,28 @@ def dlss_render(output, mode):
     except ValueError:
         return output
     if mode == 'dlaa':
-        return output
+        return render_size(output)
     target = h / DLSS_FACTORS.get(mode, 1.5)
     exact = [rh for rh in range(360, h + 1, 8) if rh * w % (h * 8) == 0 and abs(rh - target) <= target * 0.06]
     rh = min(exact, key=lambda rh: abs(rh - target)) if exact else max(360, round(target / 8) * 8)
     rw = max(640, round(rh * w / h / 8) * 8)
     return f'{rw}x{rh}'
+
+
+def render_size(output):
+    """Output WxH as a render size: one off the RENDER_ALIGN grid renders at the largest size of the
+    same aspect below it on the grid (1600x900: 1536x864), and the upscaler fills the output."""
+    try:
+        w, h = map(int, output.split('x'))
+    except ValueError:
+        return output
+    if w % RENDER_ALIGN == 0 and h % RENDER_ALIGN == 0:
+        return output
+    for rh in range(h - h % RENDER_ALIGN, MIN_RENDER_HEIGHT - 1, -RENDER_ALIGN):
+        if rh * w % (h * RENDER_ALIGN) == 0:
+            return f'{rh * w // h}x{rh}'
+    # No same-aspect size on the grid: the nearest one below, a little off the output's aspect.
+    return f'{w - w % RENDER_ALIGN}x{h - h % RENDER_ALIGN}'
 
 
 def is_wide(size):
@@ -1928,11 +1947,11 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         self.row(f, _('Saída', 'Output'), self.choice(f, 'output_res', OUTPUTS),
                  _('O jogo renderiza nesse tamanho. '
                    'Mais largo que 16:9 (21:9, 32:9) mostra mais dos lados (Hor+), sem esticar; menus e vídeos '
-                   'podem ficar esticados. 720p renderiza em 1080p; o modo PS4 Pro usa os tamanhos do Pro. '
+                   'podem ficar esticados. 720p renderiza em 1080p e 900p em 1536 × 864; o modo PS4 Pro usa os tamanhos do Pro. '
                    'Num monitor menor que a saída, a janela cabe na tela e a tela cheia usa o monitor todo.',
                    'The game renders at this size. Wider '
                    'than 16:9 (21:9, 32:9) shows more at the sides (Hor+), not stretched; menus and videos may '
-                   'look stretched. 720p renders at 1080p; PS4 Pro mode uses the Pro sizes. On a monitor smaller '
+                   'look stretched. 720p renders at 1080p and 900p at 1536 × 864; PS4 Pro mode uses the Pro sizes. On a monitor smaller '
                    'than the output the window fits the screen and fullscreen uses the whole monitor.'))
         self.row(f, _('Upscaler', 'Upscaler'), self.choice(f, 'upscaler', UPSCALERS),
                  _('FSR 1 amplia com bordas nítidas (quando o jogo renderiza menor que a saída).', 'FSR 1 upscales with sharp edges (when the game renders smaller than the output).'))

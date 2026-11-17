@@ -23,7 +23,7 @@ WORDS = {
     'framegen': 'geracao quadros frame generation fsr3 dlss-g dlssg f8 interpolacao',
     'fg_hudless': 'hud tremendo tremido letras barra vida stamina shaking',
     'upscaler': 'upscaler dlss fsr bilinear nitidez borrado blurry escala',
-    'output_res': 'resolucao resolution 1080p 1440p 4k 720p ultrawide 21:9 tela larga',
+    'output_res': 'resolucao resolution 1080p 1440p 4k 900p 720p ultrawide 21:9 tela larga',
     'textures': 'texturas texture qualidade borrada mip streaming maxima alta',
     'af16': 'anisotropico filtro nitido texturas sharp',
     'neo': 'ps4 pro modo pro cinematografico',

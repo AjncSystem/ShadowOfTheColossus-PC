@@ -126,7 +126,7 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
             return ~u64{0};
         }
         const char* t = std::getenv("SOTC_IMAGE_DEDICATED_TEXELS");
-        return t ? std::strtoull(t, nullptr, 10) : u64{2048} * 2048;
+        return t ? static_cast<u64>(std::strtoull(t, nullptr, 10)) : u64{2048} * 2048;
     }();
     const u64 texels = u64{image_ci.extent.width} * image_ci.extent.height *
                        image_ci.extent.depth * image_ci.arrayLayers;

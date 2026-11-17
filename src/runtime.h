@@ -86,6 +86,8 @@ uintptr_t runtime_ngs2_resolve(const char *name);
 int runtime_ngs2_native(void);
 void *runtime_ngs2_function(const char *symbol);
 int runtime_thread_is_guest(void);
+/* Alternate signal stack for the calling thread (Linux; no-op on Windows). */
+void runtime_thread_signal_stack(void);
 uintptr_t runtime_fiber_resolve(const char *name);
 void runtime_fiber_thread_exit(void);
 void runtime_fiber_report(void);

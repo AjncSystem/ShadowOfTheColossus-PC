@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.76.2 — 2026-11-17
+- 🛠️ **Processadores Intel: o herói caindo através do chão e a queda na tela de título corrigidos** (desde a 0.76). Na preparação do jogo, a lista de funções das bibliotecas lidas pela emulação de BMI1/LZCNT/MOVBE apagava a lista de funções do próprio jogo (55.790 viravam 731). Sem ela, a emulação de SSE4a (todo processador Intel) entrava sem a proteção da pilha em 3 funções do jogo: física quebrada e, com a geração de quadros desligada, o jogo fechava ~10 s depois de abrir (guest 0xf42ce0). Agora as listas se somam. Não é preciso preparar o jogo de novo.
+
+### English
+- 🛠️ **Intel CPUs: the hero falling through the floor and the crash at the title screen fixed** (since 0.76). When the game is prepared, the function list of the linked modules (read for the BMI1/LZCNT/MOVBE emulation) replaced the game's own (55,790 functions became 731). Without it, SSE4a emulation (every Intel CPU) went in without the stack protection of 3 game functions: broken physics and, with frame generation off, the game closed ~10 s after starting (guest 0xf42ce0). The lists now add up. The game does not need to be prepared again.
+
 ## 0.76.1 — 2026-11-17
 - 🌌 **Linhas tracejadas no céu em placas AMD Radeon corrigidas** (#432, #433): um shader do céu trocava valores entre pixels vizinhos de um jeito que o driver da AMD não garante nas arestas dos triângulos, e desenhava uma grade de linhas sobre o céu (tela de título e jogo). Agora usa operações de quad, que todo driver garante. NVIDIA sem mudança. O cache de shaders é refeito na primeira abertura. `SOTC_QUAD_SWIZZLE=0` volta ao antigo.
 

@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC native port · v0.76.1
+# Shadow of the Colossus — PC native port · v0.76.2
 
 <a href="https://recomplauncher.com/game/shadowofthecolossus-pc"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
 
@@ -28,6 +28,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.76.2** | 🛠️ **Intel CPUs: the hero falling through the floor and the crash at the title screen fixed** (since 0.76): the CPU patches lost the game's function list once the linked modules' lists were read, so a stack-protection patch was not applied. |
 | **0.76.1** | 🌌 **Dashed lines in the sky on AMD Radeon fixed** (#432, #433): one sky shader read values from neighbouring pixels in a way AMD's driver does not support at triangle edges. The shader cache is rebuilt once. |
 | **0.76** | 🎮 **New F1 menu** with tabs (changes apply live, or ask for a restart). 🖥️ **Older CPUs without BMI1/LZCNT/MOVBE run the game** (Oussama268, Lucas-blip-png; AVX still required). 🔊 **Music at the console's volume** with the built-in mixer (Oussama268, #426) and a real limiter above 100%. 🦅 The 5th colossus no longer flies up forever in PS4 Pro + 60 FPS (#421). ⚡ Fewer area-load hitches (Oussama268, #435, #437). 🎨 Gamma curve fix (joaobatista235). RecompLauncher support (elripalda). |
 | **0.75** | 🔊 **Sound without the console's modules** (Oussama268, from HayatoG/tlg_pc): a built-in NGS2 mixer plays the game's sound, by default for everyone; your console's libSceNgs2.sprx / libSceUlt.sprx are optional (tick "Use my console's sound modules"). A new **Sound** page: Stereo 2.0 / Surround 5.1 / 7.1 output, the sound device, volume up to 500% and the sound engine. The "What's new" screen shows English notes in other languages than Portuguese (#410). |

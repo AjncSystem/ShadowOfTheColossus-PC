@@ -7,6 +7,7 @@
 //    below rsp).
 //  - rdtsc redirected to a host clock when the cores disagree on the TSC (src/compat_win.c).
 // The first two come from the shadPS4 SotC fork (cpu_patches.cpp, module.cpp).
+#include <algorithm>
 #include <vector>
 #include "common/logging/log.h"
 #include "core/signals.h"
@@ -23,12 +24,22 @@ extern "C" int sotc_patch_eboot(const SotcPatchRequest* request, SotcPatchResult
     const auto base = reinterpret_cast<uintptr_t>(request->image);
 
     std::vector<uintptr_t> function_starts;
+    // sotc: each table is decoded on its own and appended. DecodeEHHdrTable starts by clearing
+    // its output, so decoding the modules' tables into the same vector (0.76) kept only the last
+    // module's functions: the eboot's 55790 were lost, its red-zone functions were never found and
+    // SSE4a was emulated without the red-zone protection (Intel CPUs: the hero falling through the
+    // floor, a crash at the title screen with frame generation off).
     const auto add_table = [&](uint64_t offset, uint64_t size) {
         const uintptr_t hdr_start = base + offset;
         const uintptr_t hdr_end = hdr_start + size;
         Dwarf::EHHeaderInfo info;
-        return Dwarf::DecodeEHHdr(hdr_start, hdr_end, info) &&
-               Dwarf::DecodeEHHdrTable(info, hdr_end, function_starts);
+        std::vector<uintptr_t> starts;
+        if (!Dwarf::DecodeEHHdr(hdr_start, hdr_end, info) ||
+            !Dwarf::DecodeEHHdrTable(info, hdr_end, starts)) {
+            return false;
+        }
+        function_starts.insert(function_starts.end(), starts.begin(), starts.end());
+        return true;
     };
     if (request->eh_frame_hdr_size && !add_table(request->eh_frame_hdr, request->eh_frame_hdr_size)) {
         return -1;
@@ -41,6 +52,9 @@ extern "C" int sotc_patch_eboot(const SotcPatchRequest* request, SotcPatchResult
                         request->module_tables[i].offset);
         }
     }
+    std::sort(function_starts.begin(), function_starts.end());
+    function_starts.erase(std::unique(function_starts.begin(), function_starts.end()),
+                          function_starts.end());
     result->function_starts = function_starts.size();
 
     std::vector<uintptr_t> selected;

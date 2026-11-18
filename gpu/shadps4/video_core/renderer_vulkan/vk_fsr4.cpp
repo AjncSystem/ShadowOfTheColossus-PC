@@ -79,7 +79,7 @@ FfxApiResource Resource(const Image& image, bool depth, bool output) {
                           : depth ? FFX_API_RESOURCE_USAGE_DEPTHTARGET
                                   : FFX_API_RESOURCE_USAGE_READ_ONLY;
     r.state = output ? FFX_API_RESOURCE_STATE_UNORDERED_ACCESS
-                     : FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ;
+                     : FFX_API_RESOURCE_STATE_COMPUTE_READ;
     return r;
 }
 
@@ -256,7 +256,7 @@ bool Dispatch(VkCommandBuffer cmdbuf, const Params& p) {
     d.header.type = FFX_API_DISPATCH_DESC_TYPE_UPSCALE;
     d.commandList = cmdbuf;
     d.color = Resource(p.color, false, false);
-    d.depth = Resource(p.depth, true, false);
+    d.depth = Resource(p.depth, p.depth.format != vk::Format::eR32Sfloat, false);
     d.motionVectors = Resource(p.mvec, false, false);
     d.output = Resource(p.output, false, true);
     d.jitterOffset = {p.jitter_x, p.jitter_y};

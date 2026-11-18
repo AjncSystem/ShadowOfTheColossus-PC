@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <set>
 #include <boost/container/static_vector.hpp>
@@ -403,7 +404,14 @@ bool Instance::CreateDevice() {
         LOG_INFO(Render_Vulkan, "- primitiveTopologyPatchListRestart: {}",
                  list_restart_features.primitiveTopologyPatchListRestart);
     }
+    const auto env_on = [](const char* name) {
+        const char* v = std::getenv(name);
+        return v && v[0] == '1';
+    };
+    const bool skip_amd_explicit_vertex =
+        env_on("SOTC_NO_EXPLICIT_VERTEX") || env_on("SOTC_MANUAL_INTERP") || env_on("SOTC_AMD_AS_NV");
     amd_shader_explicit_vertex_parameter =
+        !skip_amd_explicit_vertex &&
         add_extension(VK_AMD_SHADER_EXPLICIT_VERTEX_PARAMETER_EXTENSION_NAME);
     if (!amd_shader_explicit_vertex_parameter) {
         fragment_shader_barycentric =
@@ -466,6 +474,29 @@ bool Instance::CreateDevice() {
         device_fault = fault_features.deviceFault;
         device_fault_vendor_binary = fault_features.deviceFaultVendorBinary;
     }
+    bool maximal_reconvergence = add_extension(VK_KHR_SHADER_MAXIMAL_RECONVERGENCE_EXTENSION_NAME);
+    shader_quad_control =
+        maximal_reconvergence && add_extension(VK_KHR_SHADER_QUAD_CONTROL_EXTENSION_NAME);
+    if (maximal_reconvergence || shader_quad_control) {
+        const auto quad_chain =
+            physical_device.getFeatures2<vk::PhysicalDeviceFeatures2,
+                                         vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR,
+                                         vk::PhysicalDeviceShaderQuadControlFeaturesKHR>();
+        if (!quad_chain.get<vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR>()
+                 .shaderMaximalReconvergence) {
+            maximal_reconvergence = false;
+            if (shader_quad_control) {
+                enabled_extensions.pop_back();
+                shader_quad_control = false;
+            }
+            enabled_extensions.pop_back();
+        } else if (shader_quad_control &&
+                   !quad_chain.get<vk::PhysicalDeviceShaderQuadControlFeaturesKHR>()
+                        .shaderQuadControl) {
+            enabled_extensions.pop_back();
+            shader_quad_control = false;
+        }
+    }
 
     const auto family_properties = physical_device.getQueueFamilyProperties();
     if (family_properties.empty()) {
@@ -515,27 +546,62 @@ bool Instance::CreateDevice() {
             dedicated_present_queue = true; // second queue in the graphics family
         }
     }
+    async_compute_queue_family = queue_family_index;
+    has_async_compute_queue = false;
+    const char* acq = std::getenv("SOTC_ASYNC_COMPUTE_QUEUE");
+    if (!acq || acq[0] != '0') {
+        for (std::size_t i = 0; i < family_properties.size(); i++) {
+            const u32 index = static_cast<u32>(i);
+            if (index != queue_family_index && index != present_queue_family &&
+                (family_properties[i].queueFlags & vk::QueueFlagBits::eCompute) &&
+                !(family_properties[i].queueFlags & vk::QueueFlagBits::eGraphics) &&
+                family_properties[i].queueCount > 0) {
+                async_compute_queue_family = index;
+                has_async_compute_queue = true;
+                break;
+            }
+        }
+    }
     static constexpr std::array queue_priorities = {1.0f, 1.0f};
     const bool cross_family = present_queue_family != queue_family_index;
-    const std::array queue_infos = {
-        vk::DeviceQueueCreateInfo{
-            .queueFamilyIndex = queue_family_index,
-            .queueCount = !cross_family && dedicated_present_queue ? 2u : 1u,
-            .pQueuePriorities = queue_priorities.data(),
-        },
-        vk::DeviceQueueCreateInfo{
+    std::array<vk::DeviceQueueCreateInfo, 3> queue_infos{};
+    u32 queue_info_count = 0;
+    queue_infos[queue_info_count++] = vk::DeviceQueueCreateInfo{
+        .queueFamilyIndex = queue_family_index,
+        .queueCount = !cross_family && dedicated_present_queue ? 2u : 1u,
+        .pQueuePriorities = queue_priorities.data(),
+    };
+    if (cross_family) {
+        queue_infos[queue_info_count++] = vk::DeviceQueueCreateInfo{
             .queueFamilyIndex = present_queue_family,
             .queueCount = 1u,
             .pQueuePriorities = queue_priorities.data(),
-        },
-    };
+        };
+    }
+    if (has_async_compute_queue) {
+        queue_infos[queue_info_count++] = vk::DeviceQueueCreateInfo{
+            .queueFamilyIndex = async_compute_queue_family,
+            .queueCount = 1u,
+            .pQueuePriorities = queue_priorities.data(),
+        };
+    }
 
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
+    // The Vulkan FSR backend consumes these optional features on the port's device.
+    const char* upscaler = std::getenv("SOTC_UPSCALER");
+    const char* fsr_features = std::getenv("SOTC_FSR_VK_FEATURES");
+    const bool enable_fsr_features = upscaler && std::strcmp(upscaler, "fsr4") == 0 &&
+                                     (!fsr_features || fsr_features[0] != '0');
+    if (enable_fsr_features) {
+        std::fprintf(stderr, "SOTC FSR Vulkan features: integer dot product %u, partially bound descriptors %u\n",
+                     static_cast<unsigned>(vk13_features.shaderIntegerDotProduct),
+                     static_cast<unsigned>(vk12_features.descriptorBindingPartiallyBound));
+    }
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
-            .queueCreateInfoCount = cross_family ? 2u : 1u,
+            .queueCreateInfoCount = queue_info_count,
             .pQueueCreateInfos = queue_infos.data(),
             .enabledExtensionCount = static_cast<u32>(enabled_extensions.size()),
             .ppEnabledExtensionNames = enabled_extensions.data(),
@@ -589,6 +655,8 @@ bool Instance::CreateDevice() {
             .shaderSharedInt64Atomics = vk12_features.shaderSharedInt64Atomics,
             .shaderFloat16 = vk12_features.shaderFloat16,
             .shaderInt8 = vk12_features.shaderInt8,
+            .descriptorBindingPartiallyBound =
+                enable_fsr_features && vk12_features.descriptorBindingPartiallyBound,
             .scalarBlockLayout = vk12_features.scalarBlockLayout,
             .uniformBufferStandardLayout = vk12_features.uniformBufferStandardLayout,
             .separateDepthStencilLayouts = vk12_features.separateDepthStencilLayouts,
@@ -603,6 +671,7 @@ bool Instance::CreateDevice() {
             .subgroupSizeControl = vk13_features.subgroupSizeControl,
             .synchronization2 = vk13_features.synchronization2,
             .dynamicRendering = vk13_features.dynamicRendering,
+            .shaderIntegerDotProduct = enable_fsr_features && vk13_features.shaderIntegerDotProduct,
             .maintenance4 = vk13_features.maintenance4,
         },
         // Extensions
@@ -741,6 +810,22 @@ bool Instance::CreateDevice() {
         fault_features.pNext = features2.pNext;
         features2.pNext = &fault_features;
     }
+    vk::PhysicalDeviceShaderMaximalReconvergenceFeaturesKHR reconv_features{
+        .shaderMaximalReconvergence = vk::True,
+    };
+    if (maximal_reconvergence) {
+        auto& features2 = device_chain.get<vk::PhysicalDeviceFeatures2>();
+        reconv_features.pNext = features2.pNext;
+        features2.pNext = &reconv_features;
+    }
+    vk::PhysicalDeviceShaderQuadControlFeaturesKHR quad_control_features{
+        .shaderQuadControl = vk::True,
+    };
+    if (shader_quad_control) {
+        auto& features2 = device_chain.get<vk::PhysicalDeviceFeatures2>();
+        quad_control_features.pNext = features2.pNext;
+        features2.pNext = &quad_control_features;
+    }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {
@@ -760,6 +845,12 @@ bool Instance::CreateDevice() {
                  : dedicated_present_queue                  ? "second graphics-family queue"
                                                             : "shared with graphics",
                  present_queue_family, queue_family_index);
+    async_compute_queue = has_async_compute_queue
+                              ? device->getQueue(async_compute_queue_family, 0)
+                              : graphics_queue;
+    if (has_async_compute_queue) {
+        std::fprintf(stderr, "GPU async compute queue: family %u\n", async_compute_queue_family);
+    }
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =

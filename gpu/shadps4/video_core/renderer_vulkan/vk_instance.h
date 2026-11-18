@@ -83,6 +83,18 @@ public:
         return dedicated_present_queue;
     }
 
+    u32 GetAsyncComputeQueueFamilyIndex() const {
+        return async_compute_queue_family;
+    }
+
+    vk::Queue GetAsyncComputeQueue() const {
+        return async_compute_queue;
+    }
+
+    bool HasAsyncComputeQueue() const {
+        return has_async_compute_queue;
+    }
+
     TracyVkCtx GetProfilerContext() const {
         return profiler_context;
     }
@@ -551,6 +563,11 @@ public:
                image_2d_view_of_3d_features.sampler2DViewOf3D;
     }
 
+    /// Returns whether VK_KHR_shader_maximal_reconvergence and VK_KHR_shader_quad_control are enabled.
+    bool IsShaderQuadControlSupported() const {
+        return shader_quad_control;
+    }
+
     /// Returns whether VK_EXT_image_view_min_lod is supported.
     bool IsImageViewMinLodSupported() const {
         return image_view_min_lod;
@@ -624,6 +641,9 @@ private:
     bool dedicated_present_queue{};
     u32 present_queue_family{0};
     vk::Queue graphics_queue;
+    vk::Queue async_compute_queue;
+    u32 async_compute_queue_family{0};
+    bool has_async_compute_queue{false};
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;
@@ -655,6 +675,7 @@ private:
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
     bool shader_clock{};
+    bool shader_quad_control{};
     bool supports_memory_budget{};
     bool device_fault{};
     bool device_fault_vendor_binary{};

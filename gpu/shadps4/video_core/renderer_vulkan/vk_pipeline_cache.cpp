@@ -323,13 +323,14 @@ static bool AsyncShadersEnabled() {
     return enabled;
 }
 
-// sotc: SOTC_ASYNC_TRANSLATE=1 translates graphics shaders on a pipeline worker (see
-// AsyncPipelineJob::Translate); default off because synchronous translation is ~0.57 ms/pipeline
-// and deferring stages hides GraphicsPipelineKey for extra frames.
+// sotc: SOTC_ASYNC_TRANSLATE=0 translates every graphics shader on the command processor (see
+// AsyncPipelineJob::Translate). Default on so bursts of new geometry/camera turns do not stall the
+// command processor in CompileModule (~1.6 ms/shader). Tiny fullscreen passes (num_indices <= 6)
+// and initial frames still translate synchronously so screen composition never skips.
 static bool AsyncTranslateEnabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("SOTC_ASYNC_TRANSLATE");
-        return v && v[0] != '0' && v[0] != 'f' && v[0] != 'F';
+        return !v || v[0] != '0';
     }();
     return enabled;
 }
@@ -546,7 +547,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         const unsigned count = workers ? static_cast<unsigned>(std::clamp(std::atoi(workers), 1, 16))
                                        : std::clamp(threads > 4 ? threads - 4 : 2u, 4u, 10u);
         const char* gfx_workers = std::getenv("SOTC_GRAPHICS_WORKERS");
-        const unsigned default_gfx = std::clamp(count / 2, 2u, 4u);
+        const unsigned default_gfx = threads <= 12 ? 2u : std::clamp(count / 2, 2u, 4u);
         max_graphics_workers =
             gfx_workers
                 ? static_cast<unsigned>(std::clamp(std::atoi(gfx_workers), 1, static_cast<int>(count)))
@@ -732,8 +733,9 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
                     return true;
                 }
                 const size_t non_compute_limit =
-                    async_workers.size() <= 8 ? std::max<size_t>(4, async_workers.size() - 2)
-                                              : async_workers.size() - 2;
+                    std::thread::hardware_concurrency() <= 12 ? 2u
+                    : async_workers.size() <= 8               ? std::max<size_t>(4, async_workers.size() - 2)
+                                                              : async_workers.size() - 2;
                 if (front->translate) {
                     return async_non_compute_active < non_compute_limit;
                 }
@@ -766,7 +768,7 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
             }
         }
         if (job->translate) {
-            set_low_priority(SotcStats::warmup_total.load(std::memory_order_relaxed) == 0);
+            set_low_priority(false);
             RunAsyncTranslate(*job->translate);
             {
                 std::scoped_lock lock{async_mutex};
@@ -791,7 +793,7 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
             continue;
         }
         const auto graphics_start = std::chrono::steady_clock::now();
-        set_low_priority(!job->preloaded);
+        set_low_priority(false);
         job->pipeline = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, job->key, *pipeline_cache, job->infos,
             job->runtime_infos, job->fetch_shader ? &*job->fetch_shader : nullptr, job->modules,
@@ -1114,16 +1116,23 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         sync_tiny_draw || is_single_mrt_opaque || current_flip < 20;
     const bool high_priority = is_color_draw && !async_color_draw;
 
+    static const u64 color_wait_flips = [] {
+        const char* v = std::getenv("SOTC_COLOR_WAIT_FLIPS");
+        return v ? static_cast<u64>(std::max(0, std::atoi(v))) : 0ULL;
+    }();
     auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     // sotc: still being built by a pipeline worker (SOTC_ASYNC_SHADERS, SOTC_ASYNC_PRELOAD). A
     // full-screen / single-MRT opaque pass builds synchronously at once; multi-MRT color draws
-    // queue on their discovery frame (current_flip == queued_flip) and wait if still pending on
-    // subsequent frames so world/castle geometry cannot stay invisible and smear.
+    // queue with high priority ahead of non-color/preloaded jobs on capped Normal-priority workers
+    // so camera turns avoid driver priority inversion, never starve game/draw threads, and never
+    // stall CP waiting on async driver compilation (SOTC_COLOR_WAIT_FLIPS restores bounded wait).
     bool queued = !is_new && !it->second;
     if (queued) {
         const auto flip_it = graphics_queued_flip.find(graphics_key);
         const u64 queued_flip = flip_it != graphics_queued_flip.end() ? flip_it->second : 0;
-        const bool wait_ready = sync_immediate || (high_priority && current_flip > queued_flip);
+        const bool wait_ready =
+            sync_immediate ||
+            (color_wait_flips > 0 && high_priority && current_flip >= queued_flip + color_wait_flips);
         if (!wait_ready) {
             last_graphics_pipeline = nullptr; // sotc: key memo off until one is installed
             return nullptr;

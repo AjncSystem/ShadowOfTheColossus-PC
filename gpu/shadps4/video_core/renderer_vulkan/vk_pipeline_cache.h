@@ -58,7 +58,9 @@ struct Program {
     /// sotc: permutations being translated by a pipeline worker (SOTC_ASYNC_TRANSLATE).
     std::vector<Shader::StageSpecialization> pending_specs;
     /// sotc: a worker read other tables than the draw that asked (the game reused them before
-    /// the worker ran): this program's later permutations are translated in place.
+    /// the worker ran): this program's later permutations are translated in place once retries
+    /// exhaust stale_count.
+    u32 stale_count{};
     bool translate_in_place{};
 
     Program() = default;
@@ -67,6 +69,15 @@ struct Program {
 
     void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec) {
         modules.emplace_back(module, std::move(spec));
+    }
+
+    size_t NextPermutIndex() const {
+        for (size_t i = 0; i < modules.size(); ++i) {
+            if (!modules[i].module) {
+                return i;
+            }
+        }
+        return modules.size();
     }
 
     void InsertPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec,
@@ -165,6 +176,7 @@ private:
         /// sotc: a pipeline of the boot preload (SOTC_ASYNC_PRELOAD): built from the cached
         /// state, and already in the cache (not registered again).
         bool preloaded{};
+        bool high_priority{};
 
         /// sotc: SOTC_ASYNC_TRANSLATE (default on): a graphics shader stage seen for the first
         /// time (or a new permutation of one) is translated by a worker, queued after the compute
@@ -191,7 +203,8 @@ private:
     };
     bool AsyncPipelineEligible() const;
     void QueueAsyncPipeline(u64 hash,
-                            const GraphicsPipeline::SerializationSupport* preloaded = nullptr);
+                            const GraphicsPipeline::SerializationSupport* preloaded = nullptr,
+                            bool high_priority = false);
     bool AsyncPreloadEnabled() const;
     void QueueAsyncTranslate(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
                              const Shader::ShaderParams& params, const Shader::RuntimeInfo& rt,
@@ -222,6 +235,7 @@ private:
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     // sotc: any erase or clear must also null last_graphics_pipeline (see GetGraphicsPipeline).
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
+    tsl::robin_map<GraphicsPipelineKey, u64> graphics_queued_flip;
     GraphicsPipelineKey last_graphics_key{};
     const GraphicsPipeline* last_graphics_pipeline{};
     /// sotc: the indirect parameters last_graphics_pipeline was built for (PipelineKeyMemo).
@@ -253,6 +267,9 @@ private:
     /// worker job may still be queued (it returns at once, the pipeline being claimed).
     std::vector<std::unique_ptr<ComputePipeline>> preload_refused;
     size_t async_translate_queued{}; ///< translation jobs right after them, oldest first
+    unsigned async_graphics_active{};    ///< graphics pipeline builds currently in flight
+    unsigned async_non_compute_active{}; ///< translation + graphics jobs currently in flight
+    unsigned max_graphics_workers{};     ///< max concurrent graphics pipeline builds during gameplay
     std::unordered_set<u64> pending_programs; ///< new programs being translated (CP only)
     std::unordered_set<u64> in_place_programs; ///< failed on a worker: translated here (CP only)
     bool async_translate_ok{};  ///< this draw may queue its translations (CP only)

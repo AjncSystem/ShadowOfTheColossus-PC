@@ -1083,7 +1083,7 @@ struct SignalImpl : public PageManager::Impl {
 #ifdef _WIN32
         static const bool enabled = [] {
             const char* v = std::getenv("SOTC_CLEAN_GUEST_READS");
-            return v && v[0] == '1';
+            return !v || v[0] != '0';
         }();
         if (!enabled) {
             return false;

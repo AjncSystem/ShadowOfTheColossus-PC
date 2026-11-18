@@ -237,6 +237,9 @@ int VideoOutDriver::UnregisterBuffers(VideoOutPort* port, s32 attributeIndex) {
         if (buffer.group_index != attributeIndex) {
             continue;
         }
+        if (buffer.address_left != 0) {
+            presenter->UnregisterVideoOutSurface(buffer.address_left);
+        }
         buffer.group_index = -1;
     }
 
@@ -299,10 +302,21 @@ extern "C" uint64_t runtime_file_read_ns_take(void);
 // (its pacer presents on a thread of its own), so the vblank thread keeps presenting by default.
 // FSR 3 frame generation presents the game frame half a frame after the generated one: from
 // the first FSR 3 frame on, the presenter has a thread of its own (vblank thread only).
+// sotc: also with a FIFO swapchain (AMD's Windows driver has no Mailbox, so Mailbox falls back
+// to FIFO): there acquire/present block until the display's vblank, which stalled the emulated
+// 120 Hz vblanks the game paces itself on. RX 6600 logs held 18-20 FPS in the 30 FPS mode, with
+// 600-750 frames a minute slower than 50 ms. SOTC_ASYNC_PRESENT=0 keeps presenting here.
 bool VideoOutDriver::AsyncPresent() {
     static const bool async = [] {
         const char* v = std::getenv("SOTC_ASYNC_PRESENT");
-        return v && v[0] == '1';
+        if (v) {
+            return v[0] == '1';
+        }
+        const bool vsync = presenter && presenter->PresentWaitsForVsync();
+        if (vsync) {
+            std::fprintf(stderr, "SOTC PRESENT: FIFO swapchain, presenting on the presenter thread\n");
+        }
+        return vsync;
     }();
     static bool fsr = false;
     if (!fsr && Vulkan::FrameGen::Current() == Vulkan::FrameGen::Mode::Fsr) {
@@ -314,7 +328,9 @@ bool VideoOutDriver::AsyncPresent() {
 
 void VideoOutDriver::RunPresentJob(std::function<void()> job, bool droppable) {
     if (!AsyncPresent()) {
+        present_since_ns.store(SotcStats::NowNs(), std::memory_order_relaxed);
         job();
+        present_since_ns.store(0, std::memory_order_relaxed);
         return;
     }
     {
@@ -327,6 +343,7 @@ void VideoOutDriver::RunPresentJob(std::function<void()> job, bool droppable) {
                 std::jthread([this](std::stop_token token) { PresentJobThread(token); });
         }
         present_jobs.push(std::move(job));
+        present_jobs_pending.fetch_add(1, std::memory_order_relaxed);
     }
     present_job_cv.notify_one();
 }
@@ -343,7 +360,10 @@ void VideoOutDriver::PresentJobThread(std::stop_token token) {
             job = std::move(present_jobs.front());
             present_jobs.pop();
         }
+        present_since_ns.store(SotcStats::NowNs(), std::memory_order_relaxed);
         job();
+        present_since_ns.store(0, std::memory_order_relaxed);
+        present_jobs_pending.fetch_sub(1, std::memory_order_release);
     }
 }
 
@@ -359,12 +379,10 @@ void VideoOutDriver::Flip(const Request& req) {
         }
     }
     // Update HDR status before presenting, and present the frame.
-    present_since_ns.store(SotcStats::NowNs(), std::memory_order_relaxed);
     RunPresentJob([frame = req.frame, hdr = req.port->is_hdr] {
         presenter->SetHDR(hdr);
         presenter->Present(frame);
     });
-    present_since_ns.store(0, std::memory_order_relaxed);
     SotcStats::flip_count.fetch_add(1, std::memory_order_relaxed);
     {
         // sotc: a performance line in the event log every minute (average FPS, frames slower
@@ -1368,6 +1386,11 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     // limit_next advances by exactly one limit period while the game keeps up, so the cap stays
     // at 60 and is not rounded up to the tick grid.
     auto limit_next = last_flip_time;
+    auto cap_next = last_flip_time;
+    static const bool cap_subtick = [] {
+        const char* v = std::getenv("SOTC_CAP_SUBTICK");
+        return !v || v[0] != '0';
+    }();
 
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
@@ -1456,9 +1479,21 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             } else {
                 take_request = false;
             }
-        } else {
+        } else if (!cap_subtick) {
             const u64 interval = u64(flip_rate + 1) * vblanks_per_60hz;
             take_request = vblank_status.count - last_flip_vblank >= interval;
+        } else {
+            const auto now = std::chrono::steady_clock::now();
+            const auto arrival = peek_arrival();
+            const std::chrono::nanoseconds cap_period =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    vblank_period * (u64(flip_rate + 1) * vblanks_per_60hz));
+            const bool present_clear =
+                !AsyncPresent() || present_jobs_pending.load(std::memory_order_acquire) <= 1;
+            take_request = arrival && present_clear && now + tick_period / 2 >= cap_next;
+            if (take_request) {
+                cap_next = (now - cap_next < tick_period ? cap_next : now) + cap_period;
+            }
         }
         const auto request = take_request ? receive_request() : Request{};
         if (!request) {

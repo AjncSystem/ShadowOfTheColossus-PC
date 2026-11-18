@@ -168,7 +168,7 @@ public:
 
     /// sotc: BbToggle::BufferBindMemo. The CPU-bit generation (RegionManager::CpuGenSum) of the
     /// words a range covers, remembered by a bind that found no CPU-modified page in it.
-    static constexpr u64 MemoMaxWords = 16; // larger ranges are not remembered
+    static constexpr u64 MemoMaxWords = 64; // single-region ranges up to 16 MiB
 
     /// Reads the key of [cpu_addr, cpu_addr + size): false when the range spans two regions,
     /// covers more than MemoMaxWords words or lies in no region yet. Call it BEFORE looking for
@@ -191,6 +191,12 @@ public:
         key = {region, static_cast<u32>(first_word), static_cast<u32>(count),
                region->CpuGenSum(first_word, count)};
         return true;
+    }
+
+    /// Snapshots CpuGenKey and confirms no page in [cpu_addr, cpu_addr + size) is CPU-modified.
+    bool SnapshotCleanCpuGen(VAddr cpu_addr, u64 size, CpuGenKey& key) const noexcept {
+        return SnapshotCpuGen(cpu_addr, size, key) &&
+               key.region->IsRegionCpuCleanAtomic(cpu_addr & HIGHER_PAGE_MASK, size);
     }
 
     /// True while no CPU bit of the key's words has risen since SnapshotCpuGen.

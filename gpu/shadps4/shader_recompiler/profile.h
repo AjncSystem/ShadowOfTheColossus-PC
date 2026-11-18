@@ -56,6 +56,7 @@ struct Profile {
     /// (EmitBarycentricGeometryShader): per-vertex inputs and barycentrics become plain inputs.
     /// Last, so the profiles stored in older caches still compare equal.
     bool barycentric_via_gs{};
+    bool supports_shader_quad_control{};
 
     bool operator==(const Profile&) const = default;
 };

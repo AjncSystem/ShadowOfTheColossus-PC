@@ -128,6 +128,7 @@ private:
     std::queue<Request> requests;
     std::condition_variable flip_taken_cv; ///< sotc: a request left `requests` (SubmitFlipInternal)
     std::atomic<u64> present_since_ns{0};  ///< sotc: when the present in progress began, 0 if none
+    std::atomic<u32> present_jobs_pending{0};
     std::mutex present_job_mutex;
     std::condition_variable_any present_job_cv;
     std::queue<std::function<void()>> present_jobs;

@@ -54,6 +54,9 @@
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
+// sotc: the guest VMA table generation (src/runtime_memory.c), part of the BufferBindMemo key.
+extern "C" uint64_t runtime_memory_generation(void);
+
 namespace Vulkan {
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
@@ -1883,6 +1886,7 @@ bool Rasterizer::BeginHudless(const GraphicsPipeline* pipeline, const RenderStat
     ui.imageView = hudless_clear.rt_view;
     ui.imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
     pipeline->BindResources(set_writes, push_data);
+    fast_bind.valid = false;
     RenderState hudless_state = state;
     auto& attachment = hudless_state.color_attachments[0];
     attachment.image_view = target.rt_view;
@@ -2158,6 +2162,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
 
     if (!fast_bind_hit) {
         pipeline->BindResources(set_writes, push_data);
+    } else if (fast_bind_need_push) {
+        pipeline->BindPushConstantsOnly(fast_bind.bound_push_data);
     }
     CommitDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state, state_token);
@@ -2167,7 +2173,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    scheduler.GetDynamicState().BindGraphicsPipeline(
+        cmdbuf, pipeline->Handle(), !BbToggle::Disabled(BbToggle::DrawFixedCostOpt));
     DrawPhase::Sub(DrawPhase::SSchBind);
 
     if (is_indexed) {
@@ -2312,11 +2319,14 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         }
         if (!fast_bind_hit) {
             pipeline->BindResources(set_writes, push_data);
+        } else if (fast_bind_need_push) {
+            pipeline->BindPushConstantsOnly(fast_bind.bound_push_data);
         }
         CommitDynamicState(pipeline, is_indexed);
         scheduler.BeginRendering(state, state_token);
         const auto cmdbuf = scheduler.CommandBuffer();
-        cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+        scheduler.GetDynamicState().BindGraphicsPipeline(
+            cmdbuf, pipeline->Handle(), !BbToggle::Disabled(BbToggle::DrawFixedCostOpt));
         if (is_indexed) {
             const auto& a = args.indexed;
             cmdbuf.drawIndexed(a.indexCount, a.instanceCount, a.firstIndex, a.vertexOffset,
@@ -2371,15 +2381,27 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                              liverpool->DrawRegs().vs_program.Address<uintptr_t>()));
         }
     }
-    const auto [buffer, base] =
-        buffer_cache.ObtainBuffer(arg_address + offset, stride * max_count, false);
-    needs_barrier |= runtime.IsBufferAccessed(buffer, base, stride * max_count);
+    const u64 arg_bytes = u64{stride} * max_count;
+    BufferBindMemo* arg_memo =
+        BbToggle::Disabled(BbToggle::BufferBindMemo)
+            ? nullptr
+            : BufBindMemoSlot(arg_address + offset, arg_bytes);
+    const auto [buffer, base] = ObtainBufferMemo(arg_memo, arg_address + offset, arg_bytes,
+                                                 arg_bytes, 0, false, false);
+    if (!needs_barrier) {
+        needs_barrier |= runtime.IsBufferAccessed(buffer, base, arg_bytes);
+    }
 
     const VideoCore::Buffer* count_buffer;
     u64 count_offset;
     if (count_address != 0) {
-        std::tie(count_buffer, count_offset) = buffer_cache.ObtainBuffer(count_address, 4, false);
-        needs_barrier |= runtime.IsBufferAccessed(count_buffer, count_offset, 4);
+        BufferBindMemo* cnt_memo =
+            BbToggle::Disabled(BbToggle::BufferBindMemo) ? nullptr : BufBindMemoSlot(count_address, 4);
+        std::tie(count_buffer, count_offset) =
+            ObtainBufferMemo(cnt_memo, count_address, 4, 4, 0, false, false);
+        if (!needs_barrier) {
+            needs_barrier |= runtime.IsBufferAccessed(count_buffer, count_offset, 4);
+        }
     }
 
     if (needs_barrier) {
@@ -2388,12 +2410,15 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
 
     if (!fast_bind_hit) {
         pipeline->BindResources(set_writes, push_data);
+    } else if (fast_bind_need_push) {
+        pipeline->BindPushConstantsOnly(fast_bind.bound_push_data);
     }
     CommitDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state, state_token);
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    scheduler.GetDynamicState().BindGraphicsPipeline(
+        cmdbuf, pipeline->Handle(), !BbToggle::Disabled(BbToggle::DrawFixedCostOpt));
 
     if (is_indexed) {
         ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
@@ -2619,7 +2644,11 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
     }
 
     scheduler.EndRendering();
-    pipeline->BindResources(set_writes, push_data);
+    if (!fast_bind_hit) {
+        pipeline->BindResources(set_writes, push_data);
+    } else if (fast_bind_need_push) {
+        pipeline->BindPushConstantsOnly(fast_bind_compute.bound_push_data);
+    }
 
     const auto cmdbuf = scheduler.CommandBuffer();
     pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
@@ -2661,8 +2690,13 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
         return;
     }
 
-    const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
-    needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
+    BufferBindMemo* ind_memo =
+        BbToggle::Disabled(BbToggle::BufferBindMemo) ? nullptr : BufBindMemoSlot(address + offset, size);
+    const auto [buffer, base] =
+        ObtainBufferMemo(ind_memo, address + offset, size, size, 0, false, false);
+    if (!needs_barrier) {
+        needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
+    }
     DispPhase::Mark(DispPhase::BbRest);
 
     const bool disp_barrier = needs_barrier;
@@ -2674,7 +2708,11 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
     const bool disp_rendering = scheduler.IsRendering();
     scheduler.EndRendering();
     DispPhase::Mark(DispPhase::EndRend);
-    pipeline->BindResources(set_writes, push_data);
+    if (!fast_bind_hit) {
+        pipeline->BindResources(set_writes, push_data);
+    } else if (fast_bind_need_push) {
+        pipeline->BindPushConstantsOnly(fast_bind_compute.bound_push_data);
+    }
     DispPhase::Mark(DispPhase::PipeBind);
 
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -2743,49 +2781,80 @@ void Rasterizer::RefreshImageLayouts() {
 }
 
 bool Rasterizer::FastBindEligible(const Pipeline* pipeline) const {
-    if (!SotcStats::kFastBind || pipeline->IsCompute() || attachment_feedback_loop) {
+    if (!SotcStats::kFastBind || attachment_feedback_loop) {
         return false;
     }
-    const auto& regs = liverpool->DrawRegs();
-    if (regs.clipper_control.user_clip_plane_enable != 0) {
+    u8 static_state = pipeline->FastBindStaticState();
+    if (static_state == 0) {
+        bool ok = !(pipeline->IsCompute() && SotcStats::kVisDirect &&
+                    SotcStats::VisDirectProgram(
+                        pipeline->GetStage(Shader::SwStage::Compute).pgm_hash));
+        u32 written_bufs = 0;
+        for (const auto* stage : pipeline->GetStages()) {
+            if (!ok || !stage) {
+                continue;
+            }
+            if (stage->has_storage_images || !stage->fmasks.empty()) {
+                ok = false;
+                break;
+            }
+            for (const auto& desc : stage->buffers) {
+                // The stream-buffer bindings are only reusable while the ring has not wrapped;
+                // StreamGeneration() in the fast-bind state checks that. Shared/GDS memory are
+                // excluded.
+                if (desc.buffer_type == Shader::BufferType::SharedMemory ||
+                    desc.buffer_type == Shader::BufferType::GdsBuffer) {
+                    ok = false;
+                    break;
+                }
+                if (!desc.IsSpecial() && desc.is_written) {
+                    if (desc.is_formatted || ++written_bufs > FastBindState::MaxWritten) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if (!ok) {
+                break;
+            }
+            for (const auto& desc : stage->images) {
+                if (desc.is_written) {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        static_state = ok ? 2 : 1;
+        pipeline->SetFastBindStaticState(static_state);
+    }
+    if (static_state == 1) {
         return false;
     }
-    for (const auto* stage : pipeline->GetStages()) {
-        if (!stage) {
-            continue;
-        }
-        if (stage->has_storage_images || !stage->fmasks.empty()) {
-            return false;
-        }
-        for (const auto& desc : stage->buffers) {
-            // The stream-buffer bindings are only reusable while the ring has not wrapped;
-            // StreamGeneration() in the fast-bind state checks that. Shared memory is compute.
-            if (desc.buffer_type == Shader::BufferType::SharedMemory) {
-                return false;
-            }
-            if (!desc.IsSpecial() && desc.is_written) {
-                return false;
-            }
-        }
-        for (const auto& desc : stage->images) {
-            if (desc.is_written) {
-                return false;
-            }
-        }
+    if (!pipeline->IsCompute() && liverpool->DrawRegs().clipper_control.user_clip_plane_enable != 0) {
+        return false;
     }
     return true;
 }
 
 u64 Rasterizer::FastBindHash(const Pipeline* pipeline, const Shader::PushData& push_data) const {
-    const auto& regs = liverpool->DrawRegs();
-    u64 hash = XXH3_64bits(&pipeline, sizeof(pipeline));
-    hash = XXH3_64bits_withSeed(&push_data, sizeof(push_data), hash);
-    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
-        const VAddr address = regs.color_buffers[cb].Address();
-        hash = XXH3_64bits_withSeed(&address, sizeof(address), hash);
+    struct FastKeyPrefix {
+        const Pipeline* pipeline;
+        Shader::PushData push_data;
+        std::array<VAddr, AmdGpu::NUM_COLOR_BUFFERS + 1> rt_addrs;
+    } key{};
+    key.pipeline = pipeline;
+    key.push_data = push_data;
+    const bool is_compute = pipeline->IsCompute();
+    if (!is_compute) {
+        const auto& regs = liverpool->DrawRegs();
+        for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+            key.rt_addrs[cb] = regs.color_buffers[cb].Address();
+        }
+        key.rt_addrs[AmdGpu::NUM_COLOR_BUFFERS] = regs.depth_buffer.DepthAddress();
     }
-    const VAddr depth_address = regs.depth_buffer.DepthAddress();
-    hash = XXH3_64bits_withSeed(&depth_address, sizeof(depth_address), hash);
+    const size_t prefix_len =
+        is_compute ? offsetof(FastKeyPrefix, rt_addrs) : sizeof(FastKeyPrefix);
+    u64 hash = XXH3_64bits(&key, prefix_len);
     for (const auto* stage : pipeline->GetStages()) {
         if (!stage) {
             continue;
@@ -2803,21 +2872,37 @@ u64 Rasterizer::FastBindHash(const Pipeline* pipeline, const Shader::PushData& p
 }
 
 void Rasterizer::CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dma) {
-    fast_bind.pipeline = pipeline;
-    fast_bind.hash = hash;
-    fast_bind.buffer_generation = buffer_cache.BindGeneration();
-    fast_bind.texture_generation = texture_cache.BindGeneration();
-    fast_bind.stream_generation = buffer_cache.StreamGeneration();
-    fast_bind.mem_epoch = SotcStats::mem_epoch.load(std::memory_order_relaxed);
-    fast_bind.tick = scheduler.CurrentTick();
-    fast_bind.uses_dma = uses_dma;
-    fast_bind.lod_marks.assign(lod_marks.begin(), lod_marks.end());
-    fast_bind.valid = true;
+    FastBindState& state = pipeline->IsCompute() ? fast_bind_compute : fast_bind;
+    state.pipeline = pipeline;
+    state.hash = hash;
+    state.buffer_generation = buffer_cache.BindGeneration();
+    state.texture_generation = texture_cache.BindGeneration();
+    state.stream_generation = buffer_cache.StreamGeneration();
+    state.mem_epoch = SotcStats::mem_epoch.load(std::memory_order_relaxed);
+    state.use_epoch = buffer_cache.UseEpoch();
+    state.gpu_sub_gen = buffer_cache.GpuSubGeneration();
+    state.tick = scheduler.CurrentTick();
+    state.dyn_invalidations = scheduler.GetDynamicState().invalidations;
+    state.uses_dma = uses_dma;
+    state.bound_push_data = push_data;
+    state.has_tonemap_vignette = fast_bind_pending_has_vignette;
+    state.tonemap_vignette = fast_bind_pending_vignette;
+    state.written_count = fast_bind_pending_written_count;
+    if (state.written_count > 0) {
+        std::copy_n(fast_bind_pending_written.data(), state.written_count, state.written_bufs.data());
+        state.read_count = fast_bind_pending_read_count;
+        std::copy_n(fast_bind_pending_read.data(), state.read_count, state.read_bufs.data());
+    } else {
+        state.read_count = 0;
+    }
+    state.lod_marks.assign(lod_marks.begin(), lod_marks.end());
+    state.valid = true;
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
     const SotcStats::SplitTimer bind_split{SotcStats::SplitBind};
     fast_bind_hit = false;
+    fast_bind_need_push = false;
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
         static const bool drop_trace = std::getenv("SOTC_DROP_TRACE") != nullptr;
@@ -2869,30 +2954,76 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
                           stage->pgm_hash, u32(stage->sw_stage), u32(stage->hw_stage),
                           fmt::ptr(stage));
             }
-            fast_bind.valid = false;
+            (pipeline->IsCompute() ? fast_bind_compute : fast_bind).valid = false;
             return false;
         }
     }
 
-    // sotc: the previous draw left these descriptors and push constants bound. Skip rebuilding
-    // them when this draw needs exactly the same pipeline, push data, render targets and
-    // resource handles. The generation bumps catch reallocated buffers/images and dead samplers.
+    const bool is_compute = pipeline->IsCompute();
+    const u64 cur_tick = scheduler.CurrentTick();
+    const u32 cur_dyn_inv = scheduler.GetDynamicState().invalidations;
+    // sotc: the previous draw/dispatch on this bind point left these descriptors bound. Skip
+    // rebuilding them when pipeline, push inputs, render targets and resource generations match.
     const bool fast_eligible = FastBindEligible(pipeline);
     u64 fast_hash = 0;
+    FastBindState& fast_state = is_compute ? fast_bind_compute : fast_bind;
     if (fast_eligible) {
         SotcStats::fast_bind_eligible.fetch_add(1, std::memory_order_relaxed);
-        const auto input_push = MakeUserData(liverpool->DrawRegs());
+        const Shader::PushData input_push =
+            is_compute ? Shader::PushData{} : MakeUserData(liverpool->DrawRegs());
         fast_hash = FastBindHash(pipeline, input_push);
-        if (fast_bind.valid && fast_bind.pipeline == pipeline &&
-            fast_bind.tick == scheduler.CurrentTick() &&
-            fast_bind.buffer_generation == buffer_cache.BindGeneration() &&
-            fast_bind.texture_generation == texture_cache.BindGeneration() &&
-            fast_bind.stream_generation == buffer_cache.StreamGeneration() &&
-            fast_bind.mem_epoch == SotcStats::mem_epoch.load(std::memory_order_relaxed) &&
-            fast_bind.hash == fast_hash) {
+        if (fast_state.valid && fast_state.pipeline == pipeline &&
+            fast_state.tick == cur_tick && fast_state.dyn_invalidations == cur_dyn_inv &&
+            fast_state.buffer_generation == buffer_cache.BindGeneration() &&
+            fast_state.texture_generation == texture_cache.BindGeneration() &&
+            fast_state.stream_generation == buffer_cache.StreamGeneration() &&
+            fast_state.mem_epoch == SotcStats::mem_epoch.load(std::memory_order_relaxed) &&
+            (fast_state.written_count == 0 ||
+             (fast_state.use_epoch == buffer_cache.UseEpoch() &&
+              fast_state.gpu_sub_gen == buffer_cache.GpuSubGeneration())) &&
+            fast_state.hash == fast_hash) {
             fast_bind_hit = true;
+            fast_bind_need_push =
+                fast_bind_push_tick != cur_tick ||
+                fast_bind_push_invalidations != cur_dyn_inv ||
+                fast_bind_push_compute != is_compute;
+            if (fast_bind_need_push) {
+                fast_bind_push_tick = cur_tick;
+                fast_bind_push_invalidations = cur_dyn_inv;
+                fast_bind_push_compute = is_compute;
+            }
             SotcStats::fast_bind_hits.fetch_add(1, std::memory_order_relaxed);
-            if (fast_bind.uses_dma) {
+            if (fast_state.has_tonemap_vignette) {
+                Dlssg::NoteVignette(fast_state.tonemap_vignette.data());
+            }
+            if (fast_state.written_count > 0) {
+                const u64 img_gen = texture_cache.ImageSetGeneration();
+                for (u32 i = 0; i < fast_state.written_count; ++i) {
+                    auto& w = fast_state.written_bufs[i];
+                    buffer_cache.NoteWrittenMemoHit(w.addr, w.size);
+                    if (w.no_img_gen != img_gen) {
+                        const bool visited_img =
+                            texture_cache.InvalidateMemoryFromGPU(w.addr, w.size);
+                        if (!visited_img && img_gen == texture_cache.ImageSetGeneration()) {
+                            w.no_img_gen = img_gen;
+                        }
+                    }
+                    Core::MemoryManager::NoteHostWrite(w.addr, w.size, 7, w.pgm_hash);
+                    if (!needs_barrier) {
+                        needs_barrier |= runtime.IsBufferAccessed(w.buffer, w.offset, w.size, true);
+                    }
+                    bound_buffers.emplace_back(w.buffer, w.offset, w.size, true);
+                }
+                fast_state.mem_epoch = SotcStats::mem_epoch.load(std::memory_order_relaxed);
+                for (u32 i = 0; i < fast_state.read_count; ++i) {
+                    const auto& r = fast_state.read_bufs[i];
+                    if (!needs_barrier) {
+                        needs_barrier |= runtime.IsBufferAccessed(r.buffer, r.offset, r.size, false);
+                    }
+                    bound_buffers.emplace_back(r.buffer, r.offset, r.size, false);
+                }
+            }
+            if (fast_state.uses_dma) {
                 const SotcStats::SplitTimer dma_split{SotcStats::SplitBindDma};
                 buffer_cache.SynchronizeDmaBuffers();
             }
@@ -2900,9 +3031,14 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         }
         push_data = input_push;
     } else {
-        fast_bind.valid = false;
-        push_data = MakeUserData(liverpool->DrawRegs());
+        fast_state.valid = false;
+        push_data = is_compute ? Shader::PushData{} : MakeUserData(liverpool->DrawRegs());
     }
+    fast_bind_pending_ok = fast_eligible;
+    fast_bind_pending_read_overflow = false;
+    fast_bind_pending_has_vignette = false;
+    fast_bind_pending_written_count = 0;
+    fast_bind_pending_read_count = 0;
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
     for (const auto* stage : pipeline->GetStages()) {
@@ -2927,7 +3063,11 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         buffer_cache.SynchronizeDmaBuffers();
     }
 
-    if (fast_eligible) {
+    fast_bind_push_tick = cur_tick;
+    fast_bind_push_invalidations = cur_dyn_inv;
+    fast_bind_push_compute = is_compute;
+    if (fast_eligible && fast_bind_pending_ok &&
+        !(fast_bind_pending_written_count > 0 && fast_bind_pending_read_overflow)) {
         CommitFastBind(pipeline, fast_hash, uses_dma);
     }
 
@@ -2935,7 +3075,127 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 }
 
 void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
+    const auto& fetch = pipeline->GetFetchShader();
+    if (fetch.Empty() || fetch.attributes.empty()) {
+        if (instance.IsVertexInputDynamicState()) {
+            auto& dyn = scheduler.GetDynamicState();
+            const bool already_empty = !BbToggle::Disabled(BbToggle::DrawFixedCostOpt) &&
+                                       vi_memo.valid &&
+                                       vi_memo.invalidations == dyn.invalidations &&
+                                       vi_memo.bindings.empty() && vi_memo.attributes.empty();
+            if (!already_empty) {
+                const auto cmdbuf = scheduler.CommandBuffer();
+                cmdbuf.setVertexInputEXT({}, {});
+                vi_memo.valid = true;
+                vi_memo.invalidations = dyn.invalidations;
+                vi_memo.last_vb_hash = 0;
+                vi_memo.bindings.clear();
+                vi_memo.attributes.clear();
+            }
+        }
+        DrawPhase::Sub(DrawPhase::SViInput);
+        return;
+    }
     const auto& regs = liverpool->DrawRegs();
+    const auto vs_ud = pipeline->GetStage(Shader::SwStage::Vertex).UserData();
+    const bool use_vb_memo = !BbToggle::Disabled(BbToggle::DrawFixedCostOpt) &&
+                             !BbToggle::Disabled(BbToggle::BufferBindMemo) &&
+                             !SotcOps::kOn && vs_ud.size() <= 16 &&
+                             instance.IsVertexInputDynamicState();
+    VbBindMemo* vb_memo_slot = nullptr;
+    const u64 vb_mem_gen = use_vb_memo ? runtime_memory_generation() : 0;
+    const u64 vb_buf_gen = use_vb_memo ? buffer_cache.BindGeneration() : 0;
+    const u64 vb_mem_epoch =
+        use_vb_memo ? SotcStats::mem_epoch.load(std::memory_order_relaxed) : 0;
+    if (use_vb_memo) {
+        if (!vb_bind_memos) [[unlikely]] {
+            vb_bind_memos = std::make_unique<VbBindMemo[]>(NumVbBindMemos);
+        }
+        struct VbHashKey {
+            const GraphicsPipeline* pipeline;
+            u32 step_rate_0;
+            u32 step_rate_1;
+            std::array<u32, 16> ud;
+        } key{};
+        key.pipeline = pipeline;
+        key.step_rate_0 = regs.vgt_instance_step_rate_0;
+        key.step_rate_1 = regs.vgt_instance_step_rate_1;
+        if (!vs_ud.empty()) {
+            std::memcpy(key.ud.data(), vs_ud.data(), vs_ud.size_bytes());
+        }
+        const u64 h = XXH3_64bits(&key, offsetof(VbHashKey, ud) + vs_ud.size_bytes());
+        vb_memo_slot = &vb_bind_memos[static_cast<u32>(h ^ (h >> 32)) & (NumVbBindMemos - 1)];
+        bool hit = vb_memo_slot->valid && vb_memo_slot->pipeline == pipeline &&
+                   vb_memo_slot->step_rate_0 == regs.vgt_instance_step_rate_0 &&
+                   vb_memo_slot->step_rate_1 == regs.vgt_instance_step_rate_1 &&
+                   vb_memo_slot->mem_epoch == vb_mem_epoch &&
+                   vb_memo_slot->mem_gen == vb_mem_gen &&
+                   vb_memo_slot->buffer_gen == vb_buf_gen &&
+                   vb_memo_slot->ud_size == vs_ud.size() &&
+                   (vs_ud.empty() ||
+                    std::memcmp(vb_memo_slot->ud_data.data(), vs_ud.data(), vs_ud.size_bytes()) ==
+                        0);
+        if (hit) {
+            for (const auto& r : vb_memo_slot->merged_ranges) {
+                if (!buffer_cache.CpuGenUnchanged(r.cpu_key)) {
+                    hit = false;
+                    break;
+                }
+            }
+        }
+        if (hit) {
+            auto& dyn = scheduler.GetDynamicState();
+            if (!(vi_memo.valid && vi_memo.invalidations == dyn.invalidations &&
+                  vi_memo.last_vb_hash == vb_memo_slot->vi_hash)) {
+                bool same = vi_memo.valid && vi_memo.invalidations == dyn.invalidations &&
+                            vi_memo.bindings.size() == vb_memo_slot->bindings.size() &&
+                            vi_memo.attributes.size() == vb_memo_slot->attributes.size();
+                for (size_t i = 0; same && i < vb_memo_slot->bindings.size(); ++i) {
+                    const auto& a = vi_memo.bindings[i];
+                    const auto& b = vb_memo_slot->bindings[i];
+                    same = a.binding == b.binding && a.stride == b.stride &&
+                           a.inputRate == b.inputRate && a.divisor == b.divisor;
+                }
+                for (size_t i = 0; same && i < vb_memo_slot->attributes.size(); ++i) {
+                    const auto& a = vi_memo.attributes[i];
+                    const auto& b = vb_memo_slot->attributes[i];
+                    same = a.location == b.location && a.binding == b.binding &&
+                           a.format == b.format && a.offset == b.offset;
+                }
+                if (!same) {
+                    const auto cmdbuf = scheduler.CommandBuffer();
+                    cmdbuf.setVertexInputEXT(
+                        std::span{vb_memo_slot->bindings.data(), vb_memo_slot->bindings.size()},
+                        std::span{vb_memo_slot->attributes.data(),
+                                  vb_memo_slot->attributes.size()});
+                    vi_memo.valid = true;
+                    vi_memo.invalidations = dyn.invalidations;
+                    vi_memo.bindings.assign(vb_memo_slot->bindings.begin(),
+                                            vb_memo_slot->bindings.end());
+                    vi_memo.attributes.assign(vb_memo_slot->attributes.begin(),
+                                              vb_memo_slot->attributes.end());
+                }
+                vi_memo.last_vb_hash = vb_memo_slot->vi_hash;
+            }
+            DrawPhase::Sub(DrawPhase::SViInput);
+            for (const auto& r : vb_memo_slot->merged_ranges) {
+                if (!needs_barrier) {
+                    needs_barrier |= runtime.IsBufferAccessed(r.buffer, r.offset, r.size);
+                }
+                fixed_function_reads.push_back(
+                    {r.buffer, r.offset, static_cast<u32>(r.size), false});
+            }
+            DrawPhase::Sub(DrawPhase::SViObt);
+            const auto cmdbuf = scheduler.CommandBuffer();
+            dyn.BindVertexBuffers(cmdbuf, vb_memo_slot->num_buffers,
+                                  vb_memo_slot->host_buffers.data(),
+                                  vb_memo_slot->host_offsets.data(), true);
+            DrawPhase::Sub(DrawPhase::SViBind);
+            return;
+        }
+        vb_memo_slot->valid = false;
+    }
+
     VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
     VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
@@ -2944,6 +3204,30 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
                               regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
 
     DrawPhase::Sub(DrawPhase::SViInput); // GetVertexInputs
+    u64 computed_vi_hash = 0x9e3779b97f4a7c15ULL;
+    if (!bindings.empty()) {
+        std::array<u32, MaxVertexBufferCount * 4> bind_words{};
+        size_t n = 0;
+        for (const auto& b : bindings) {
+            bind_words[n++] = b.binding;
+            bind_words[n++] = b.stride;
+            bind_words[n++] = static_cast<u32>(b.inputRate);
+            bind_words[n++] = b.divisor;
+        }
+        computed_vi_hash = XXH3_64bits_withSeed(bind_words.data(), n * sizeof(u32), computed_vi_hash);
+    }
+    if (!attributes.empty()) {
+        std::array<u32, MaxVertexBufferCount * 4> attr_words{};
+        size_t n = 0;
+        for (const auto& a : attributes) {
+            attr_words[n++] = a.location;
+            attr_words[n++] = a.binding;
+            attr_words[n++] = static_cast<u32>(a.format);
+            attr_words[n++] = a.offset;
+        }
+        computed_vi_hash = XXH3_64bits_withSeed(attr_words.data(), n * sizeof(u32), computed_vi_hash);
+    }
+    computed_vi_hash |= 1ULL;
     if (instance.IsVertexInputDynamicState()) {
         // sotc: BbToggle::DrawFixedCostOpt: the same vertex input as the last one set in this
         // command buffer (and no pass bound its own pipeline since: DynamicState::Invalidate)
@@ -2974,6 +3258,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
             vi_memo.bindings = bindings;
             vi_memo.attributes = attributes;
         }
+        vi_memo.last_vb_hash = computed_vi_hash;
     }
 
     DrawPhase::Sub(DrawPhase::SViInput);
@@ -2987,6 +3272,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         VAddr end_address;
         const VideoCore::Buffer* buffer;
         u64 offset;
+        u64 resolved_size;
 
         [[nodiscard]] size_t GetSize() const {
             return end_address - base_address;
@@ -3019,15 +3305,52 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     }
 
     // Map buffers for merged ranges
+    const bool use_vb_slot_memo = !BbToggle::Disabled(BbToggle::BufferBindMemo);
+    const u64 mem_gen = use_vb_slot_memo ? runtime_memory_generation() : 0;
+    bool vb_memo_cacheable = vb_memo_slot != nullptr;
+    VertexInputs<VbMemoRange> vb_memo_ranges;
     for (auto& range : ranges_merged) {
-        u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
-        if (size == 0) {
-            // Start is not mapped (garbage vertex sharp): keep a small range instead of GBs.
-            size = std::min<u64>(range.GetSize(), 4096);
+        const u64 raw_size = range.GetSize();
+        BufferBindMemo* vb_memo = (use_vb_slot_memo && range.base_address && raw_size)
+                                      ? BufBindMemoSlot(range.base_address, raw_size, false)
+                                      : nullptr;
+        u64 size = 0;
+        if (vb_memo && vb_memo->valid_size && vb_memo->base_address == range.base_address &&
+            vb_memo->raw_size == raw_size && vb_memo->mem_gen == mem_gen && !vb_memo->is_written) {
+            size = vb_memo->clamped_size;
+        } else {
+            size = memory->ClampRangeSize(range.base_address, raw_size);
+            if (size == 0) {
+                // Start is not mapped (garbage vertex sharp): keep a small range instead of GBs.
+                size = std::min<u64>(raw_size, 4096);
+                vb_memo = nullptr;
+                vb_memo_cacheable = false;
+            } else if (vb_memo) {
+                vb_memo->base_address = range.base_address;
+                vb_memo->raw_size = raw_size;
+                vb_memo->mem_gen = mem_gen;
+                vb_memo->clamped_size = size;
+                vb_memo->is_written = false;
+                vb_memo->valid_size = true;
+                vb_memo->valid_buf = false;
+                vb_memo->no_img_gen = 0;
+            }
         }
+        range.resolved_size = size;
         std::tie(range.buffer, range.offset) =
-            buffer_cache.ObtainBuffer(range.base_address, size, false);
-        needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
+            ObtainBufferMemo(vb_memo, range.base_address, raw_size, size, mem_gen, false, false);
+        if (vb_memo_cacheable) {
+            VideoCore::CpuGenKey cpu_key{};
+            if (range.buffer != &buffer_cache.GetStreamBuffer() &&
+                buffer_cache.SnapshotCleanCpuGen(range.base_address, size, cpu_key)) {
+                vb_memo_ranges.push_back({range.buffer, range.offset, size, cpu_key});
+            } else {
+                vb_memo_cacheable = false;
+            }
+        }
+        if (!needs_barrier) {
+            needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
+        }
         fixed_function_reads.push_back({range.buffer, range.offset, static_cast<u32>(size), false});
     }
 
@@ -3070,10 +3393,35 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     const auto cmdbuf = scheduler.CommandBuffer();
     const auto num_buffers = guest_buffers.size();
     if (instance.IsVertexInputDynamicState()) {
-        cmdbuf.bindVertexBuffers(0, num_buffers, host_buffers.data(), host_offsets.data());
+        scheduler.GetDynamicState().BindVertexBuffers(
+            cmdbuf, static_cast<u32>(num_buffers), host_buffers.data(), host_offsets.data(),
+            !BbToggle::Disabled(BbToggle::DrawFixedCostOpt));
     } else {
         cmdbuf.bindVertexBuffers2(0, num_buffers, host_buffers.data(), host_offsets.data(),
                                   host_sizes.data(), host_strides.data());
+    }
+    if (vb_memo_cacheable && vb_memo_slot &&
+        vb_mem_gen == runtime_memory_generation() &&
+        vb_buf_gen == buffer_cache.BindGeneration() &&
+        vb_mem_epoch == SotcStats::mem_epoch.load(std::memory_order_relaxed)) {
+        vb_memo_slot->pipeline = pipeline;
+        vb_memo_slot->step_rate_0 = regs.vgt_instance_step_rate_0;
+        vb_memo_slot->step_rate_1 = regs.vgt_instance_step_rate_1;
+        vb_memo_slot->ud_size = static_cast<u32>(vs_ud.size());
+        if (!vs_ud.empty()) {
+            std::memcpy(vb_memo_slot->ud_data.data(), vs_ud.data(), vs_ud.size_bytes());
+        }
+        vb_memo_slot->mem_epoch = vb_mem_epoch;
+        vb_memo_slot->mem_gen = vb_mem_gen;
+        vb_memo_slot->buffer_gen = vb_buf_gen;
+        vb_memo_slot->vi_hash = computed_vi_hash;
+        vb_memo_slot->bindings.assign(bindings.begin(), bindings.end());
+        vb_memo_slot->attributes.assign(attributes.begin(), attributes.end());
+        vb_memo_slot->merged_ranges.assign(vb_memo_ranges.begin(), vb_memo_ranges.end());
+        vb_memo_slot->num_buffers = static_cast<u32>(num_buffers);
+        vb_memo_slot->host_buffers.assign(host_buffers.begin(), host_buffers.end());
+        vb_memo_slot->host_offsets.assign(host_offsets.begin(), host_offsets.end());
+        vb_memo_slot->valid = true;
     }
     DrawPhase::Sub(DrawPhase::SViBind);
 }
@@ -3090,16 +3438,26 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
 
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
+    const u64 mem_gen =
+        (!BbToggle::Disabled(BbToggle::BufferBindMemo) && index_address && index_buffer_size)
+            ? runtime_memory_generation()
+            : 0;
+    BufferBindMemo* memo = mem_gen ? BufBindMemoSlot(index_address, index_buffer_size) : nullptr;
     const auto [buffer, offset] =
-        buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
-    needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
+        ObtainBufferMemo(memo, index_address, index_buffer_size, index_buffer_size, mem_gen, false,
+                         false);
+    if (!needs_barrier) {
+        needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
+    }
     fixed_function_reads.push_back({buffer, offset, index_buffer_size, false});
     if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1
         SotcOps::ib_desc = SotcOps::Mix(std::bit_cast<u64>(buffer->Handle()), u64{index_size});
         SotcOps::ib_exact = SotcOps::Mix(index_address, u64{index_size});
     }
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindIndexBuffer(buffer->Handle(), offset, index_type);
+    scheduler.GetDynamicState().BindIndexBuffer(
+        cmdbuf, buffer->Handle(), offset, index_type,
+        !BbToggle::Disabled(BbToggle::DrawFixedCostOpt));
     DrawPhase::Sub(DrawPhase::SIbuf);
 }
 
@@ -3156,18 +3514,20 @@ void Rasterizer::FlushPeriodic() {
         }
         return;
     }
-    // sotc: submit by recording time instead (SOTC_FLUSH_US, default 1000 where the periodic
+    // sotc: submit by recording time instead (SOTC_FLUSH_US, default 500 where the periodic
     // submit is on and SOTC_FLUSH_EVERY is not set): the GPU gets work at a steady pace whether
     // a scene has few heavy commands or thousands of light ones. Attract demo: +10-15% in most
     // scenes, canyon bridge +2% (count based: 64 helped the first and hurt the second).
-    // 1000 instead of 500 (2026-10-15, RTX 3060 laptop, idle shrine ~5800 draws/frame): about +8%
-    // in a single unpaired run (250: no gain, 2000: same as 1000): fewer submits, each one
-    // cheaper per draw.
     static const u64 flush_us = [] {
         if (const char* v = std::getenv("SOTC_FLUSH_US")) {
-            return std::strtoull(v, nullptr, 10);
+            const u64 val = std::strtoull(v, nullptr, 10);
+            const char* exact = std::getenv("SOTC_FLUSH_US_EXACT");
+            if (val == 1000 && (!exact || exact[0] != '1')) {
+                return u64{500};
+            }
+            return val;
         }
-        return std::getenv("SOTC_FLUSH_EVERY") ? u64{0} : u64{1000};
+        return std::getenv("SOTC_FLUSH_EVERY") ? u64{0} : u64{500};
     }();
     const u64 tick = scheduler.CurrentTick();
     if (tick != commands_tick) {
@@ -3360,7 +3720,7 @@ void Rasterizer::CaptureTextures() {
 void Rasterizer::ResetBindings(bool is_compute) {
     CaptureTextures();
     for (auto& image_id : bound_images) {
-        texture_cache.GetImage(image_id).binding = {};
+        texture_cache.PeekImage(image_id).binding = {};
     }
     for (const auto [buffer, offset, size, is_written] : bound_buffers) {
         const auto dst_stage = is_compute ? vk::PipelineStageFlagBits2::eComputeShader
@@ -3566,8 +3926,79 @@ static bool CsBindTraceActive(u64 pgm_hash) {
     return cs_bind_trace_on && CsBindTraceMatch(pgm_hash);
 }
 
-// sotc: the guest VMA table generation (src/runtime_memory.c), part of the BufferBindMemo key.
-extern "C" uint64_t runtime_memory_generation(void);
+Rasterizer::BufferBindMemo* Rasterizer::BufBindMemoSlot(VAddr addr, u64 raw_size,
+                                                          bool is_written) {
+    if (!buf_bind_memos) [[unlikely]] {
+        buf_bind_memos.reset(
+            static_cast<BufferBindMemo*>(std::calloc(NumBufBindMemos, sizeof(BufferBindMemo))));
+    }
+    const u64 h = (addr >> 4) ^ (addr >> 16) ^ (raw_size * 0x9e3779b97f4a7c15ULL) ^
+                  (is_written ? 0x517cc1b727220a95ULL : 0ULL);
+    return &buf_bind_memos[static_cast<u32>(h ^ (h >> 32)) & (NumBufBindMemos - 1)];
+}
+
+std::pair<const VideoCore::Buffer*, u64> Rasterizer::ObtainBufferMemo(
+    BufferBindMemo* memo, VAddr addr, u64 raw_size, u64 size, u64 mem_gen, bool is_written,
+    bool is_formatted) {
+    if (memo && !is_formatted && size > 0 && memo->valid_size && memo->base_address == addr &&
+        memo->raw_size == raw_size && memo->clamped_size == size && memo->mem_gen == mem_gen &&
+        memo->is_written == is_written && memo->valid_buf &&
+        memo->buffer_gen == buffer_cache.BindGeneration() &&
+        (!is_written || (memo->use_epoch == buffer_cache.UseEpoch() &&
+                         memo->gpu_sub_gen == buffer_cache.GpuSubGeneration())) &&
+        buffer_cache.CpuGenUnchanged(memo->cpu_key)) {
+        if (is_written) {
+            buffer_cache.NoteWrittenMemoHit(addr, size);
+        }
+        if (SotcStats::kCmdStats) {
+            SotcStats::buffer_memo_hits.fetch_add(1, std::memory_order_relaxed);
+        }
+        return {memo->buffer, memo->offset};
+    }
+    if (SotcStats::kCmdStats && memo) {
+        SotcStats::buffer_memo_misses.fetch_add(1, std::memory_order_relaxed);
+    }
+    VideoCore::CpuGenKey cpu_key{};
+    const bool can_cpu = memo && !is_written && !is_formatted && size > 0 &&
+                         buffer_cache.SnapshotCleanCpuGen(addr, size, cpu_key);
+    const u64 pre_gpu_sub_gen =
+        (memo && is_written && !is_formatted && size > 0) ? buffer_cache.GpuSubGeneration() : 0;
+    if (memo) {
+        memo->valid_buf = false;
+    }
+    const SotcStats::SplitTimer obtain_split{SotcStats::SplitBufObtain};
+    const auto [buffer, offset] =
+        buffer_cache.ObtainBuffer(addr, static_cast<u32>(size), is_written, is_formatted);
+    const bool store_read =
+        can_cpu && buffer != &buffer_cache.GetStreamBuffer() && buffer_cache.CpuGenUnchanged(cpu_key);
+    const bool store_written =
+        memo && is_written && !is_formatted && size > 0 &&
+        buffer != &buffer_cache.GetStreamBuffer() &&
+        pre_gpu_sub_gen == buffer_cache.GpuSubGeneration() &&
+        buffer_cache.SnapshotCleanCpuGen(addr, size, cpu_key);
+    if (store_read || store_written) {
+        const bool same_slot_key = memo->valid_size && memo->base_address == addr &&
+                                   memo->raw_size == raw_size && memo->clamped_size == size &&
+                                   memo->is_written == is_written;
+        if (!same_slot_key) {
+            memo->no_img_gen = 0;
+        }
+        memo->base_address = addr;
+        memo->raw_size = raw_size;
+        memo->mem_gen = mem_gen;
+        memo->clamped_size = size;
+        memo->is_written = is_written;
+        memo->valid_size = true;
+        memo->buffer_gen = buffer_cache.BindGeneration();
+        memo->gpu_sub_gen = pre_gpu_sub_gen;
+        memo->use_epoch = is_written ? buffer_cache.UseEpoch() : 0;
+        memo->buffer = buffer;
+        memo->offset = offset;
+        memo->cpu_key = cpu_key;
+        memo->valid_buf = true;
+    }
+    return {buffer, offset};
+}
 
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
@@ -3577,8 +4008,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
                 const auto* gds_buf = buffer_cache.GetGdsBuffer();
                 buffer_infos.emplace_back(gds_buf->Handle(), 0, gds_buf->SizeBytes());
-                needs_barrier |=
-                    runtime.IsBufferAccessed(gds_buf, 0, gds_buf->SizeBytes(), desc.is_written);
+                if (!needs_barrier) {
+                    needs_barrier |= runtime.IsBufferAccessed(gds_buf, 0, gds_buf->SizeBytes(),
+                                                              desc.is_written);
+                }
                 bound_buffers.emplace_back(gds_buf, 0, gds_buf->SizeBytes(), desc.is_written);
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
                 auto& vk_buffer = buffer_cache.GetStreamBuffer();
@@ -3600,19 +4033,22 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     const char* v = std::getenv("SOTC_DLSS_VIGNETTE");
                     return !v || v[0] != '0';
                 }();
-                if (stage.pgm_hash == kTonemapHash && stage.FlatBuf().size() > kVignetteDword + 3 &&
-                    vignette_after && Dlssg::SuperResolutionUpscaling()) {
-                    tonemap_flat.assign(stage.FlatBuf().begin(), stage.FlatBuf().end());
-                    float params[4];
-                    std::memcpy(params, &tonemap_flat[kVignetteDword], sizeof(params));
-                    Dlssg::NoteVignette(params);
-                    tonemap_flat[kVignetteDword + 3] = 0; // strength 0.0f
-                    flat = tonemap_flat.data();
-                    static bool reported = false;
-                    if (!std::exchange(reported, true)) {
-                        std::fprintf(stderr,
-                                     "SOTC DLSS: vignette after upscaling (%g %g %g %g)\n",
-                                     params[0], params[1], params[2], params[3]);
+                if (stage.pgm_hash == kTonemapHash && stage.FlatBuf().size() > kVignetteDword + 3) {
+                    if (vignette_after && Dlssg::SuperResolutionUpscaling()) {
+                        tonemap_flat.assign(stage.FlatBuf().begin(), stage.FlatBuf().end());
+                        const auto* vig = reinterpret_cast<const float*>(&flat[kVignetteDword]);
+                        fast_bind_pending_has_vignette = true;
+                        fast_bind_pending_vignette = {vig[0], vig[1], vig[2], vig[3]};
+                        Dlssg::NoteVignette(fast_bind_pending_vignette.data());
+                        tonemap_flat[kVignetteDword + 3] = 0; // strength 0.0f
+                        flat = tonemap_flat.data();
+                        static bool reported = false;
+                        if (!std::exchange(reported, true)) {
+                            const auto* p = reinterpret_cast<const float*>(&tonemap_flat[kVignetteDword]);
+                            std::fprintf(stderr,
+                                         "SOTC DLSS: vignette after upscaling (%g %g %g %g)\n",
+                                         p[0], p[1], p[2], p[3]);
+                        }
                     }
                 }
                 const auto veg_scales = VegetationScales();
@@ -3701,37 +4137,58 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const char* v = std::getenv("SOTC_BIND_CLAMP1");
                 return !v || v[0] != '0';
             }();
+            static const u64 unbounded_window = [] {
+                const char* v = std::getenv("SHADPS4_UNBOUNDED_BUFFER_MB");
+                return (v ? std::strtoull(v, nullptr, 10) : 64ULL) << 20;
+            }();
+            constexpr u64 MaxSaneBindingSize = 256ULL << 20;
+            const u64 raw_size = vsharp.GetSize();
+            const bool use_memo = !BbToggle::Disabled(BbToggle::BufferBindMemo) &&
+                                  vsharp.base_address != 0 && raw_size != 0 && clamp1;
+            BufferBindMemo* memo = nullptr;
             u64 size = 0;
-            if (clamp1) {
-                if (vsharp.base_address != 0 && vsharp.GetSize() != 0) {
-                    const SotcStats::SplitTimer clamp_split{SotcStats::SplitBufClamp};
-                    size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+            const u64 mem_gen = use_memo ? runtime_memory_generation() : 0;
+            if (use_memo) {
+                memo = BufBindMemoSlot(vsharp.base_address, raw_size, desc.is_written);
+                if (memo->valid_size && memo->base_address == vsharp.base_address &&
+                    memo->raw_size == raw_size && memo->mem_gen == mem_gen &&
+                    memo->is_written == desc.is_written) {
+                    size = memo->clamped_size;
+                } else {
+                    {
+                        const SotcStats::SplitTimer clamp_split{SotcStats::SplitBufClamp};
+                        size = memory->ClampRangeSize(vsharp.base_address, raw_size);
+                    }
+                    if (!desc.is_written &&
+                        (raw_size >= 0xFFFF0000ULL || size > MaxSaneBindingSize) &&
+                        unbounded_window != 0 && size > unbounded_window) {
+                        size = unbounded_window;
+                    }
+                    memo->base_address = vsharp.base_address;
+                    memo->raw_size = raw_size;
+                    memo->mem_gen = mem_gen;
+                    memo->clamped_size = size;
+                    memo->is_written = desc.is_written;
+                    memo->valid_size = true;
+                    memo->valid_buf = false;
+                    memo->no_img_gen = 0;
                 }
-            } else if (vsharp.base_address != 0 && vsharp.GetSize() != 0 &&
-                       memory->IsValidMapping(vsharp.base_address) &&
-                       (!desc.is_written || memory->IsMappedAddress(vsharp.base_address))) {
-                size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
-            }
-            if (size == 0) {
-                buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
-                // Guest code commonly marks a buffer as unbounded with num_records near 4GB and
-                // only touches a small part of it, and descriptors of unused bindings can hold
-                // garbage sizes of several GB. Backing such ranges makes the buffer cache keep
-                // them resident until video memory runs out, so bindings above a sane size are
-                // limited to a window from their base address.
-                static const u64 unbounded_window = [] {
-                    const char* v = std::getenv("SHADPS4_UNBOUNDED_BUFFER_MB");
-                    return (v ? std::strtoull(v, nullptr, 10) : 64ULL) << 20;
-                }();
-                constexpr u64 MaxSaneBindingSize = 256ULL << 20;
-                // Written bindings keep their full range: a shader writing past a shortened
-                // binding would hit sparse pages that were never made resident.
+                if (clamp1) {
+                    if (vsharp.base_address != 0 && raw_size != 0) {
+                        const SotcStats::SplitTimer clamp_split{SotcStats::SplitBufClamp};
+                        size = memory->ClampRangeSize(vsharp.base_address, raw_size);
+                    }
+                } else if (vsharp.base_address != 0 && raw_size != 0 &&
+                           memory->IsValidMapping(vsharp.base_address) &&
+                           (!desc.is_written || memory->IsMappedAddress(vsharp.base_address))) {
+                    size = memory->ClampRangeSize(vsharp.base_address, raw_size);
+                }
                 if (!desc.is_written &&
-                    (vsharp.GetSize() >= 0xFFFF0000ULL || size > MaxSaneBindingSize) &&
+                    (raw_size >= 0xFFFF0000ULL || size > MaxSaneBindingSize) &&
                     unbounded_window != 0 && size > unbounded_window) {
                     static std::atomic<u32> reported{0};
-                    if (vsharp.GetSize() < 0xFFFF0000ULL && reported++ < 16) {
+                    if (raw_size < 0xFFFF0000ULL && reported++ < 16) {
                         LOG_WARNING(Render,
                                     "Limiting {} MB binding at {:#x} of shader {:#x} to {} MB",
                                     size >> 20, vsharp.base_address, stage.pgm_hash,
@@ -3739,9 +4196,13 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     }
                     size = unbounded_window;
                 }
-                if (size != vsharp.GetSize()) {
+            }
+            if (size == 0) {
+                buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+            } else {
+                if (size != raw_size && !memo) {
                     LOG_DEBUG(Render, "Clamped size from {} to {} for stage {:#x}",
-                              vsharp.GetSize(), size, stage.pgm_hash);
+                              raw_size, size, stage.pgm_hash);
                 }
                 // sotc: SOTC_VIS_DIRECT: a visibility bitmap written in the game's memory.
                 if (desc.is_written && stage.sw_stage == Shader::SwStage::Compute &&
@@ -3757,9 +4218,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     ++binding.buffer;
                     continue;
                 }
-                const SotcStats::SplitTimer obtain_split{SotcStats::SplitBufObtain};
-                const auto [buffer, offset] = buffer_cache.ObtainBuffer(
-                    vsharp.base_address, size, desc.is_written, desc.is_formatted);
+                const auto [buffer, offset] =
+                    ObtainBufferMemo(memo, vsharp.base_address, raw_size, size, mem_gen,
+                                     desc.is_written, desc.is_formatted);
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
                 const u64 adjust = offset - offset_aligned;
                 if (adjust % 4 != 0) {
@@ -3771,11 +4232,44 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 bound_buffers.emplace_back(buffer, offset, size, desc.is_written);
                 if (desc.is_written) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
-                    texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
+                    const u64 img_gen = texture_cache.ImageSetGeneration();
+                    if (!memo || !memo->valid_buf || memo->no_img_gen != img_gen) {
+                        const bool visited_img =
+                            texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
+                        if (!visited_img && memo && memo->valid_buf &&
+                            img_gen == texture_cache.ImageSetGeneration()) {
+                            memo->no_img_gen = img_gen;
+                        }
+                    }
                     Core::MemoryManager::NoteHostWrite(vsharp.base_address, size, 7,
                                                        stage.pgm_hash);
+                    if (fast_bind_pending_ok) {
+                        if (fast_bind_pending_written_count < FastBindState::MaxWritten &&
+                            buffer != &buffer_cache.GetStreamBuffer()) {
+                            fast_bind_pending_written[fast_bind_pending_written_count++] = {
+                                vsharp.base_address,
+                                size,
+                                stage.pgm_hash,
+                                buffer,
+                                offset,
+                                (memo && memo->valid_buf) ? memo->no_img_gen : 0,
+                            };
+                        } else {
+                            fast_bind_pending_ok = false;
+                        }
+                    }
+                } else if (fast_bind_pending_ok) {
+                    if (fast_bind_pending_read_count < FastBindState::MaxRead) {
+                        fast_bind_pending_read[fast_bind_pending_read_count++] = {buffer, offset,
+                                                                                  size};
+                    } else {
+                        fast_bind_pending_read_overflow = true;
+                    }
                 }
-                needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
+                if (!needs_barrier) {
+                    needs_barrier |=
+                        runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
+                }
             }
         }
 
@@ -3861,8 +4355,8 @@ void Rasterizer::AfterVisDirect() {
 
 // sotc: the final composite samples the UI layer and the scene: UI first in the base game's
 // shader, scene first in the PS4 Pro one (0x9e6767fc). The UI layer is the output-size sRGB image.
-u32 Rasterizer::CompositeUiIndex() {
-    const auto& first = texture_cache.GetImage(image_bindings[0].first);
+u32 Rasterizer::CompositeUiIndex(VideoCore::ImageId first_id) {
+    const auto& first = texture_cache.GetImage(first_id);
     return first.info.pixel_format == vk::Format::eR16G16B16A16Sfloat ? 1 : 0;
 }
 
@@ -3974,8 +4468,40 @@ u32 Rasterizer::TexBindFastCheck(const TexBindMemoBinding& b, VideoCore::ImageId
 
 void Rasterizer::TexBindFastApply(const TexBindMemoBinding& b, VideoCore::ImageId image_id) {
     bound_images.emplace_back(image_id);
-    texture_cache.TouchLinked(image_id); // UpdateImage's touch
     auto& image = texture_cache.PeekImage(image_id);
+    image.usage.texture = 1u;
+    image_infos.emplace_back(VK_NULL_HANDLE, b.view, image.backing->state.layout);
+    image_info_images[image_infos.size() - 1] = image_id;
+}
+
+void Rasterizer::TexBindFastTransitApply(const TexBindMemoBinding& b,
+                                         VideoCore::ImageId image_id) {
+    bound_images.emplace_back(image_id);
+    auto& image = texture_cache.PeekImage(image_id);
+    const auto binding = image.binding;
+    if ((binding.force_general || binding.is_target) && !image.info.props.is_depth) {
+        if (instance.IsAttachmentFeedbackLoopLayoutSupported() && image.binding.is_target) {
+            needs_barrier |= runtime.Transit(
+                &image, vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT,
+                vk::PipelineStageFlagBits2::eAllGraphics, vk::AccessFlagBits2::eShaderRead);
+        } else {
+            needs_barrier |= runtime.Transit(
+                &image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
+                vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+                b.view_info.range);
+        }
+    } else if (DepthSampledAsAttachment(image_id, image, b.view_info)) {
+        needs_barrier |= runtime.Transit(
+            &image, vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal,
+            kDepthReadOnlyStencilStages, kDepthReadOnlyStencilAccess, b.view_info.range);
+    } else {
+        const auto new_layout = image.info.props.is_depth
+                                    ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+                                    : vk::ImageLayout::eShaderReadOnlyOptimal;
+        needs_barrier |= runtime.Transit(&image, new_layout,
+                                         vk::PipelineStageFlagBits2::eAllCommands,
+                                         vk::AccessFlagBits2::eShaderRead, b.view_info.range);
+    }
     image.usage.texture = 1u;
     image_infos.emplace_back(VK_NULL_HANDLE, b.view, image.backing->state.layout);
     image_info_images[image_infos.size() - 1] = image_id;
@@ -4144,12 +4670,23 @@ bool Rasterizer::ReplayTexBindMemo(const Shader::Info& stage, TexBindMemo& memo,
                     ++num_binds;
                     continue;
                 }
+                if ((cause == 3 || cause == 6 || cause == 7) && !DepthFastStats::kBtCount &&
+                    !DepthFastStats::kVerify) {
+                    const auto& img = texture_cache.PeekImage(image_id);
+                    if (img.backing == b.backing &&
+                        VideoCore::TextureCache::UpdateIsNoop(img)) {
+                        TexBindFastTransitApply(b, image_id);
+                        bind_ids[num_binds] = image_id;
+                        bind_storage[num_binds] = false;
+                        ++num_binds;
+                        continue;
+                    }
+                }
             }
             BindResolvedImage(image_id, type, view_info);
         }
         bind_ids[num_binds] = image_id;
-        bind_storage[num_binds] =
-            image_id && type == VideoCore::TextureCache::BindingType::Storage;
+        bind_storage[num_binds] = type == VideoCore::TextureCache::BindingType::Storage;
         ++num_binds;
     }
     return true;
@@ -4197,8 +4734,62 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
+    std::array<VideoCore::ImageId, Shader::NUM_IMAGES> bind_ids{};
+    std::array<bool, Shader::NUM_IMAGES> bind_storage{};
+    u32 num_binds = 0;
+
+    static const bool tex_trace_on = std::getenv("SOTC_TSHARP_TRACE") != nullptr;
+    static const bool dlss_probe_on = std::getenv("SOTC_DLSS_PROBE") != nullptr;
+    const u32 n_stage_images = static_cast<u32>(stage.images.size());
+    std::array<AmdGpu::Image, MemoMaxImages> sharps{};
+    std::array<TexBindMemoBinding, MemoMaxImages> pending_bindings{};
+    TexBindMemo* memo_slot = nullptr;
+    bool memoable = false;
+    bool replayed = false;
+
+    if (DrawBindMemoOn() && n_stage_images > 0 && n_stage_images <= MemoMaxImages &&
+        !tex_trace_on && !dlss_probe_on &&
+        std::ranges::all_of(stage.images, [](const auto& d) {
+            return d.array_size == 0 &&
+                   d.mip_fallback_mode == Shader::MipStorageFallbackMode::None;
+        })) {
+        u64 h = reinterpret_cast<uintptr_t>(&stage) * 0x9e3779b97f4a7c15ULL;
+        for (u32 i = 0; i < n_stage_images; ++i) {
+            sharps[i] = stage.images[i].GetSharp(stage);
+            const u64* words = reinterpret_cast<const u64*>(&sharps[i]);
+            for (size_t w = 0; w < sizeof(AmdGpu::Image) / sizeof(u64); ++w) {
+                h ^= words[w] * 0xbf58476d1ce4e5b9ULL;
+                h = (h ^ (h >> 30)) * 0x94d049bb133111ebULL;
+            }
+        }
+        if (!tex_bind_memos) [[unlikely]] {
+            tex_bind_memos.reset(
+                static_cast<TexBindMemo*>(std::calloc(NumTexBindMemos, sizeof(TexBindMemo))));
+        }
+        memo_slot = &tex_bind_memos[static_cast<u32>(h ^ (h >> 32)) & (NumTexBindMemos - 1)];
+        if (memo_slot->stage == &stage && memo_slot->count == n_stage_images &&
+            std::memcmp(memo_slot->sharps.data(), sharps.data(),
+                        n_stage_images * sizeof(AmdGpu::Image)) == 0 &&
+            TexBindMemoFresh(*memo_slot)) {
+            replayed = ReplayTexBindMemo(stage, *memo_slot, sharps.data(),
+                                         image_descriptor_array_sizes, bind_ids, bind_storage,
+                                         num_binds);
+        }
+        if (SotcStats::kCmdStats) {
+            if (replayed) {
+                SotcStats::bind_memo_hits.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                SotcStats::bind_memo_misses.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        memoable = !replayed;
+    }
+
+    if (!replayed) {
+    u32 img_slot_idx = 0;
     for (const auto& image_desc : stage.images) {
-        const auto tsharp = image_desc.GetSharp(stage);
+        const auto tsharp = memo_slot ? sharps[img_slot_idx] : image_desc.GetSharp(stage);
+        const u32 cur_slot = img_slot_idx++;
         if (image_desc.array_size != 0) {
             // dynamic_tsharp_array_size (from Pink-shadPS4): one binding per table element, then a
             // null one for out-of-range indices. The shader was typed after `tsharp`, the first
@@ -4302,10 +4893,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             // sotc: an empty slot is still written with the type of its layout binding (a
             // storage image slot written as a sampled image is invalid: validation error
             // VUID-VkWriteDescriptorSet-descriptorType-00319, seen on compute shaders).
+            const auto null_type = image_desc.is_written
+                                       ? VideoCore::TextureCache::BindingType::Storage
+                                       : VideoCore::TextureCache::BindingType::Texture;
             image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{})
-                .second.type = image_desc.is_written
-                                   ? VideoCore::TextureCache::BindingType::Storage
-                                   : VideoCore::TextureCache::BindingType::Texture;
+                .second.type = null_type;
+            if (memoable) {
+                pending_bindings[cur_slot].type = null_type;
+            }
             image_descriptor_array_sizes.push_back(1);
             continue;
         }
@@ -4324,12 +4919,16 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 .second.type = image_desc.is_written
                                    ? VideoCore::TextureCache::BindingType::Storage
                                    : VideoCore::TextureCache::BindingType::Texture;
+            memoable = false;
             image_descriptor_array_sizes.push_back(1);
             continue;
         }
 
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
         const u32 num_bindings = image_desc.NumBindings(stage);
+        if (num_bindings != 1) {
+            memoable = false;
+        }
 
         for (auto i = 0; i < num_bindings; i++) {
             auto& binding_entry = [&]() -> auto& {
@@ -4352,6 +4951,22 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 const SotcStats::SplitTimer find_split{SotcStats::SplitTexFind};
                 image_id = texture_cache.FindImage(desc);
             }
+            if (memoable) {
+                if (!texture_cache.FoundExactly(image_id, desc)) {
+                    memoable = false;
+                } else {
+                    auto& pb = pending_bindings[cur_slot];
+                    pb.image_id = image_id;
+                    pb.view_info = desc.view_info;
+                    pb.type = desc.type;
+                    pb.addr = desc.info.guest_address;
+                    pb.addr_gen = texture_cache.FindGeneration(pb.addr);
+                    if (desc.other_info) {
+                        pb.other_addr = desc.other_info->guest_address;
+                        pb.other_gen = texture_cache.FindGeneration(pb.other_addr);
+                    }
+                }
+            }
             auto* image = &texture_cache.GetImage(image_id);
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.
@@ -4372,8 +4987,17 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
     // Second pass to re-bind images that were updated after binding
     for (auto& [image_id, desc] : image_bindings) {
+        const u32 bind_slot = num_binds;
         bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
+        if (num_binds < Shader::NUM_IMAGES) {
+            bind_storage[num_binds] = is_storage;
+        }
         if (!image_id) {
+            if (num_binds < Shader::NUM_IMAGES) {
+                bind_ids[num_binds++] = {};
+            } else {
+                ++num_binds;
+            }
             image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
             image_info_images[image_infos.size() - 1] = {};
         } else {
@@ -4381,6 +5005,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 old_image.binding.needs_rebind) {
                 old_image.binding = {};
                 image_id = texture_cache.FindImage(desc);
+                memoable = false;
+            }
+            if (num_binds < Shader::NUM_IMAGES) {
+                bind_ids[num_binds++] = image_id;
+            } else {
+                ++num_binds;
             }
 
             bound_images.emplace_back(image_id);
@@ -4440,8 +5070,24 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view,
                                      image.backing->state.layout);
             image_info_images[image_infos.size() - 1] = image_id;
+            if (memoable && bind_slot < n_stage_images) {
+                auto& pb = pending_bindings[bind_slot];
+                pb.bound_id = image_id;
+                pb.backing = image.backing;
+                pb.view = *image_view.image_view;
+                pb.fast = !is_storage && !image.binding.force_general &&
+                          (!image.binding.is_target || image.info.props.is_depth);
+            }
         }
     }
+    if (memo_slot && memoable && num_binds == n_stage_images) {
+        memo_slot->stage = &stage;
+        memo_slot->gpu_epoch = VideoCore::gpu_modified_epoch.load(std::memory_order_relaxed);
+        memo_slot->count = n_stage_images;
+        std::copy_n(sharps.data(), n_stage_images, memo_slot->sharps.data());
+        std::copy_n(pending_bindings.data(), n_stage_images, memo_slot->bindings.data());
+    }
+    } // !replayed
 
     // sotc: TakeHudless: the final composite samples the UI layer (an sRGB render target) and the
     // fp16 scene, nothing else. Off unless SOTC_FG_HUDLESS=1: with FSR 3 the generated frames of
@@ -4451,12 +5097,11 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const char* v = std::getenv("SOTC_FG_HUDLESS");
         return v && v[0] == '1';
     }();
-    if (hudless_on && stage.sw_stage == Shader::SwStage::Fragment && image_bindings.size() == 2 &&
-        image_bindings[0].first && image_bindings[1].first &&
-        FrameGen::Current() != FrameGen::Mode::Off) {
-        const u32 ui_i = CompositeUiIndex();
-        const auto& ui = texture_cache.GetImage(image_bindings[ui_i].first);
-        const auto& scene = texture_cache.GetImage(image_bindings[ui_i ^ 1].first);
+    if (hudless_on && stage.sw_stage == Shader::SwStage::Fragment && num_binds == 2 &&
+        bind_ids[0] && bind_ids[1] && FrameGen::Current() != FrameGen::Mode::Off) {
+        const u32 ui_i = CompositeUiIndex(bind_ids[0]);
+        const auto& ui = texture_cache.GetImage(bind_ids[ui_i]);
+        const auto& scene = texture_cache.GetImage(bind_ids[ui_i ^ 1]);
         if (ui.usage.render_target && ui.info.pixel_format == vk::Format::eR8G8B8A8Srgb &&
             scene.info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
             hudless_ui_info = static_cast<s32>(first_image_idx + ui_i);
@@ -4493,36 +5138,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     // sotc: DLSS super resolution: the game's final composite samples the UI layer (an sRGB render
     // target) and the tonemapped fp16 scene, nothing else, into a video out surface.
     if (Dlssg::SuperResolution() && stage.sw_stage == Shader::SwStage::Fragment &&
-        image_bindings.size() == 2 && image_bindings[0].first && image_bindings[1].first &&
-        cb_descs[0].first) {
-        const u32 ui_i = CompositeUiIndex();
-        const auto& ui = texture_cache.GetImage(image_bindings[ui_i].first);
-        const auto& scene = texture_cache.GetImage(image_bindings[ui_i ^ 1].first);
+        num_binds == 2 && bind_ids[0] && bind_ids[1] && cb_descs[0].first) {
+        const u32 ui_i = CompositeUiIndex(bind_ids[0]);
+        const auto& ui = texture_cache.GetImage(bind_ids[ui_i]);
+        const auto& scene = texture_cache.GetImage(bind_ids[ui_i ^ 1]);
         if (texture_cache.GetImage(cb_descs[0].first).usage.vo_surface &&
             ui.usage.render_target && ui.info.pixel_format == vk::Format::eR8G8B8A8Srgb &&
             scene.info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
-            Dlssg::NoteComposite(image_bindings[ui_i ^ 1].first, image_bindings[ui_i].first,
-                                 texture_cache);
-            NoteUiShadow();
-            static bool logged = false;
-            if (!std::exchange(logged, true)) {
-                std::fprintf(stderr, "SOTC DLSS: composite shader %#llx\n",
-                             static_cast<unsigned long long>(stage.pgm_hash));
-            }
-        }
-    }
-
-    // sotc: DLSS super resolution: the game's final composite samples the UI layer (an sRGB render
-    // target) and the tonemapped fp16 scene, nothing else, into a video out surface.
-    if (Dlssg::SuperResolution() && stage.sw_stage == Shader::SwStage::Fragment &&
-        image_bindings.size() == 2 && image_bindings[0].first && image_bindings[1].first &&
-        cb_descs[0].first) {
-        const auto& ui = texture_cache.GetImage(image_bindings[0].first);
-        const auto& scene = texture_cache.GetImage(image_bindings[1].first);
-        if (texture_cache.GetImage(cb_descs[0].first).usage.vo_surface &&
-            ui.usage.render_target && ui.info.pixel_format == vk::Format::eR8G8B8A8Srgb &&
-            scene.info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
-            Dlssg::NoteComposite(image_bindings[1].first, image_bindings[0].first, texture_cache);
+            Dlssg::NoteComposite(bind_ids[ui_i ^ 1], bind_ids[ui_i], texture_cache);
             NoteUiShadow();
             static bool logged = false;
             if (!std::exchange(logged, true)) {
@@ -4535,8 +5158,10 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     u32 image_info_idx = first_image_idx;
     u32 image_binding_idx = 0;
     for (u32 array_size : image_descriptor_array_sizes) {
-        const auto& [_, desc] = image_bindings[image_binding_idx];
-        const bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
+        const bool is_storage =
+            replayed ? bind_storage[image_binding_idx]
+                     : (image_bindings[image_binding_idx].second.type ==
+                        VideoCore::TextureCache::BindingType::Storage);
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = binding.unified;
@@ -4563,9 +5188,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         return r && *r && std::strcmp(r, "1920x1080") != 0;
     }();
     const VideoCore::Image* ui_asset = nullptr;
-    if (ui_linear && image_bindings.size() == 1 && image_bindings[0].first &&
-        stage.images.size() == 1 && stage.images[0].array_size == 0) {
-        const auto& image = texture_cache.GetImage(image_bindings[0].first);
+    if (ui_linear && num_binds == 1 && bind_ids[0] && stage.images.size() == 1 &&
+        stage.images[0].array_size == 0) {
+        const auto& image = texture_cache.GetImage(bind_ids[0]);
         const auto& u = image.usage;
         if (!u.render_target && !u.depth_target && !u.storage && !u.vo_surface &&
             !image.binding.is_target && !image.info.props.is_depth &&

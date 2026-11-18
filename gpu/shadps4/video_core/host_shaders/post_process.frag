@@ -110,6 +110,15 @@ vec4 sampleCatmullRom(sampler2D tex, vec2 p) {
     return clamp(r, 0.0, 1.0);
 }
 
+float vignetteFactor() {
+    if (pp.vignette.w == 0.0 || pp.vignette.y == pp.vignette.x) {
+        return 1.0;
+    }
+    const float r = pp.vignette.z * length(uv - 0.5);
+    const float t = clamp((r - pp.vignette.x) / (pp.vignette.y - pp.vignette.x), 0.0, 1.0);
+    return 1.0 + pp.vignette.w * (t * t * (3.0 - 2.0 * t) - 1.0);
+}
+
 void main() {
     vec4 color_linear = texture(texSampler, uv);
     if (pp.sky_sharpen != 0.0) {
@@ -130,11 +139,7 @@ void main() {
         }
     }
     if (pp.ui != 0u) {
-        if (pp.vignette.w != 0.0 && pp.vignette.y != pp.vignette.x) {
-            const float r = pp.vignette.z * length(uv - 0.5);
-            const float t = clamp((r - pp.vignette.x) / (pp.vignette.y - pp.vignette.x), 0.0, 1.0);
-            color_linear.rgb *= 1.0 + pp.vignette.w * (t * t * (3.0 - 2.0 * t) - 1.0);
-        }
+        color_linear.rgb *= vignetteFactor();
         vec4 ui = pp.ui == 1u ? sampleCatmullRom(uiSampler, uv) : vec4(0.0);
         if (pp.ui == 1u && pp.ui_sharpen > 0.0) {
             // Like RCAS on the FSR1 path: unsharp against the output-pixel neighbours, limited
@@ -162,13 +167,18 @@ void main() {
     if (pp.hdr == 1u) {
         // The game's own BT.2020 PQ output has its white at about 100 nits, too dim next to
         // the desktop; scaled to the paper white.
-        color = vec4(pqEncode(pqDecode(color_linear.rgb) * (pp.hdr_white / 100.0)),
-                     color_linear.a);
+        vec3 nits = pqDecode(color_linear.rgb) * (pp.hdr_white / 100.0);
+        if (pp.ui == 0u) {
+            nits *= pow(max(vignetteFactor(), 0.0), pp.hdr_curve);
+        }
+        color = vec4(pqEncode(nits), color_linear.a);
     } else if (pp.hdr == 2u) {
         if (pp.srgb_input) color_linear.rgb = degamma(color_linear.rgb);
+        if (pp.ui == 0u) color_linear.rgb *= vignetteFactor();
         color = vec4(sdrToHdr10(color_linear.rgb), color_linear.a);
     } else {
         if (pp.srgb_input) color_linear.rgb = degamma(color_linear.rgb);
+        if (pp.ui == 0u) color_linear.rgb *= vignetteFactor();
         color = vec4(gamma(color_linear.rgb), color_linear.a);
     }
 }

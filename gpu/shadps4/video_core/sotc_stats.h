@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // sotc: counters printed with the frame rate (SOTC_FPS=1, videoout/driver.cpp).
 #pragma once
+#include <array>
 #include <atomic>
 #include <algorithm>
 #include <vector>
@@ -298,18 +299,22 @@ inline const bool kVisDirect = [] {
     return v && v[0] == '1';
 }();
 inline bool VisDirectProgram(uint64_t hash) {
-    static const std::vector<uint64_t> programs = [] {
-        std::vector<uint64_t> out;
+    struct VisProgTable {
+        std::array<uint64_t, 16> hashes{};
+        uint32_t count{};
+    };
+    static const VisProgTable table = [] {
+        VisProgTable out{};
         const char* v = std::getenv("SOTC_VIS_PROGRAMS");
         // sotc: the list measured best at the forest entrance (05/11: 31 -> 14 frames over 50 ms);
         // 0x50784801 and 0xc54081d1 made it worse.
         std::string list = v ? v : "0x2e0f474b,0xf94d23d4,0x93aec24b,0x729c541e,0x4defcf7f";
         size_t pos = 0;
-        while (pos < list.size()) {
+        while (pos < list.size() && out.count < out.hashes.size()) {
             const size_t comma = list.find(',', pos);
             const std::string item = list.substr(pos, comma == std::string::npos ? comma : comma - pos);
             if (const uint64_t h = std::strtoull(item.c_str(), nullptr, 0)) {
-                out.push_back(h);
+                out.hashes[out.count++] = h;
             }
             if (comma == std::string::npos) {
                 break;
@@ -318,7 +323,12 @@ inline bool VisDirectProgram(uint64_t hash) {
         }
         return out;
     }();
-    return std::find(programs.begin(), programs.end(), hash) != programs.end();
+    for (uint32_t i = 0; i < table.count; ++i) {
+        if (table.hashes[i] == hash) {
+            return true;
+        }
+    }
+    return false;
 }
 /// sotc: SOTC_TEX_DIRECT=1 (needs SOTC_PC_MEMORY=1): textures uploaded from the game's memory
 /// are copied by the GPU straight from the imported backing view, with no CPU copy into a staging

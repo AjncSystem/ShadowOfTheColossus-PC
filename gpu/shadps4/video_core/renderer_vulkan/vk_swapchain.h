@@ -88,6 +88,13 @@ public:
         return supports_hdr;
     }
 
+    /// sotc: presentKHR/acquire block until the display's vblank (FIFO, e.g. the fallback when
+    /// Mailbox is missing, as on AMD's Windows driver). Set once, in the constructor.
+    bool PresentWaitsForVsync() const {
+        return present_mode == vk::PresentModeKHR::eFifo ||
+               present_mode == vk::PresentModeKHR::eFifoRelaxed;
+    }
+
     void SetHDR(bool hdr);
 
     bool GetHDR() const {

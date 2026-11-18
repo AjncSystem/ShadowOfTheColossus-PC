@@ -50,7 +50,7 @@ static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
 /// function-local guard in the fault paths); BufferCache::rb_narrow_window applies it.
 static const u64 rb_narrow_env = [] {
     const char* v = std::getenv("SOTC_RB_NARROW");
-    const u64 kib = v ? std::strtoull(v, nullptr, 10) : 1;
+    const u64 kib = v ? std::strtoull(v, nullptr, 10) : 0;
     if (kib == 0) {
         return u64{0};
     }
@@ -178,6 +178,7 @@ void BufferCache::DropGpuModified(VAddr device_addr, u64 size) {
             gpu_modified_ranges.Subtract(device_addr, size);
         }
         memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
+        gpu_unmark_gen.fetch_add(1, std::memory_order_release);
         MarkInflightReadbacksDirty(device_addr, size);
         memory_tracker->MarkRegionAsCpuModified(device_addr, size);
     });
@@ -249,7 +250,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     // (4096); a fault elsewhere starts over. Same data, same path, fewer waits.
     static const u64 stream_max = [] {
         const char* on = std::getenv("SOTC_RB_STREAM");
-        if (!on || on[0] != '1') {
+        if (on && on[0] == '0') {
             return u64{0};
         }
         const char* v = std::getenv("SOTC_RB_STREAM_MAX_KB");
@@ -336,10 +337,15 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             SotcStats::split_ticks[SotcStats::SplitRbCount].fetch_add(1, std::memory_order_relaxed);
         }
         const auto age_start = SotcStats::kRbAge ? SotcStats::NowNs() : 0;
-        scheduler.WaitSubmitted(readback.tick, false);
-        split_part(SotcStats::SplitRbSubmit);
-        scheduler.GetWorkSemaphore()->Wait(readback.tick);
-        split_part(SotcStats::SplitRbGpu);
+        if (readback.ahead_seq != 0) {
+            scheduler.WaitAsyncAhead(readback.ahead_seq);
+            split_part(SotcStats::SplitRbGpu);
+        } else {
+            scheduler.WaitSubmitted(readback.tick, false);
+            split_part(SotcStats::SplitRbSubmit);
+            scheduler.GetWorkSemaphore()->Wait(readback.tick);
+            split_part(SotcStats::SplitRbGpu);
+        }
         if (SotcStats::kRbAge && !readback.dependent) {
             const int age = readback.data_ready ? 0 : 1;
             SotcStats::rb_age_count[age].fetch_add(1, std::memory_order_relaxed);
@@ -427,6 +433,7 @@ void BufferCache::LiftStaleReadProtection(VAddr addr, u64 size) {
         gpu_modified_ranges.Subtract(lo, hi - lo);
     }
     memory_tracker->UnmarkRegionAsGpuModified(lo, hi - lo, false);
+    gpu_unmark_gen.fetch_add(1, std::memory_order_release);
     SotcStats::read_fault_stale_gpu.fetch_add(1, std::memory_order_relaxed);
     static std::atomic<u32> logged{0};
     if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
@@ -452,6 +459,7 @@ void BufferCache::MarkWrittenByGuest(VAddr addr, u64 size) {
         }
         SotcStats::write_fault_stale_gpu.fetch_add(1, std::memory_order_relaxed);
         memory_tracker->UnmarkRegionAsGpuModified(lo, hi - lo, false);
+        gpu_unmark_gen.fetch_add(1, std::memory_order_release);
     }
     memory_tracker->MarkRegionAsCpuModified(addr, size);
 }
@@ -475,6 +483,7 @@ void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
         // pages still protected): wait for that one and finish it if its thread has not yet.
         if (const AsyncReadback* other = FindInflightReadback(readback.device_addr, readback.size)) {
             readback.tick = other->tick;
+            readback.ahead_seq = other->ahead_seq;
             readback.waiting = true;
             readback.dependent = true;
             return;
@@ -488,11 +497,43 @@ void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
     // Held until FinishAsyncReadback: the pool must not hand it out again before.
     const auto download =
         staging_pool.Request(total, VideoCore::MemoryType::HostCached, 0, true);
+    if (current_writes_tick != scheduler.CurrentTick()) {
+        current_writes.Clear();
+        current_writes_tick = scheduler.CurrentTick();
+    }
+    bool written_by_current = false;
+    bool written_window = false;
+    for (const auto& item : readback.pending) {
+        for (const auto& copy : item.copies) {
+            if (current_writes.Intersects(item.arena->cpu_addr + copy.srcOffset, copy.size)) {
+                written_by_current = true;
+                if (!item.hot) {
+                    written_window = true;
+                }
+            }
+        }
+    }
+    if (written_by_current && !written_window) {
+        auto it = std::remove_if(readback.pending.begin(), readback.pending.end(),
+                                 [&](const ReadbackItem& item) {
+                                     if (!item.hot) {
+                                         return false;
+                                     }
+                                     for (const auto& copy : item.copies) {
+                                         if (current_writes.Intersects(
+                                                 item.arena->cpu_addr + copy.srcOffset, copy.size)) {
+                                             return true;
+                                         }
+                                     }
+                                     return false;
+                                 });
+        readback.pending.erase(it, readback.pending.end());
+        written_by_current = false;
+    }
     for (auto& item : readback.pending) {
         for (auto& copy : item.copies) {
             copy.dstOffset += download.offset;
         }
-        runtime.CopyBuffer(item.arena, download.buffer, item.copies);
     }
     readback.download_buffer = download.buffer;
     readback.download_size = download.size;
@@ -513,6 +554,36 @@ void BufferCache::BeginAsyncReadback(AsyncReadback& readback) {
             }
         }
         readback.data_ready = last_write < readback.tick && scheduler.IsFree(last_write);
+    }
+    static const bool async_ahead_enabled = [this] {
+        if (const char* v = std::getenv("SOTC_RB_ASYNC_AHEAD")) {
+            return std::atoi(v) != 0;
+        }
+        const char* ahead = std::getenv("SOTC_RB_AHEAD");
+        constexpr u32 VendorNvidia = 0x10DE;
+        constexpr u32 VendorAmd = 0x1002;
+        return ahead ? std::atoi(ahead) != 0
+                     : instance.GetVendorID() == VendorNvidia ||
+                           instance.GetVendorID() == VendorAmd;
+    }();
+    if (async_ahead_enabled && !written_by_current && pending_binds.empty()) {
+        std::vector<Vulkan::Scheduler::AsyncAheadCopy> copies;
+        copies.reserve(readback.pending.size());
+        for (const auto& item : readback.pending) {
+            copies.push_back({
+                .src = item.arena->Handle(),
+                .dst = download.buffer->Handle(),
+                .regions = {item.copies.begin(), item.copies.end()},
+            });
+        }
+        readback.ahead_seq = scheduler.EnqueueAsyncAhead(std::move(copies));
+        readback.waiting = true;
+        inflight_readbacks.push_back(&readback);
+        SotcStats::readback_ahead.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    for (const auto& item : readback.pending) {
+        runtime.CopyBuffer(item.arena, download.buffer, item.copies);
     }
     {
         const SotcStats::SplitTimer flush_split{SotcStats::SplitRbBeginFlush};
@@ -741,6 +812,7 @@ void BufferCache::SubtractDownloaded(std::span<const ReadbackItem> items) {
             gpu_modified_ranges.Subtract(address, range_size);
         }
     }
+    gpu_unmark_gen.fetch_add(1, std::memory_order_release);
 }
 
 u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 size,
@@ -1266,6 +1338,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
             });
         }
         memory_tracker->UnmarkRegionAsGpuModified(item.addr, item.size, false);
+        gpu_unmark_gen.fetch_add(1, std::memory_order_release);
         MarkInflightReadbacksDirty(item.addr, item.size);
     }
 }
@@ -1540,6 +1613,7 @@ bool BufferCache::TryReplaceFromCpu(VAddr addr, const void* data, u64 size) {
         gpu_modified_ranges.Subtract(addr, size);
     }
     memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
+    gpu_unmark_gen.fetch_add(1, std::memory_order_release);
     MarkInflightReadbacksDirty(addr, size);
     if (!memory->TryWriteBacking(std::bit_cast<void*>(addr), data, size, 10)) {
         return false;
@@ -1584,6 +1658,7 @@ bool BufferCache::TryFillThroughFromCpu(VAddr addr, const void* data, u64 size, 
         gpu_modified_ranges.Subtract(addr, size);
     }
     memory_tracker->UnmarkRegionAsGpuModified(addr, size, false);
+    gpu_unmark_gen.fetch_add(1, std::memory_order_release);
     MarkInflightReadbacksDirty(addr, size);
     if (!memory->TryWriteBacking(std::bit_cast<void*>(addr), data, size, 10)) {
         return false;
@@ -1623,6 +1698,14 @@ bool BufferCache::TryFillThroughFromCpu(VAddr addr, const void* data, u64 size, 
 
 bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
     return memory_tracker->IsRegionGpuModified(addr, size);
+}
+
+bool BufferCache::SnapshotCleanCpuGen(VAddr addr, u64 size, CpuGenKey& key) const noexcept {
+    return memory_tracker->SnapshotCleanCpuGen(addr, size, key);
+}
+
+bool BufferCache::CpuGenUnchanged(const CpuGenKey& key) noexcept {
+    return MemoryTracker::CpuGenUnchanged(key);
 }
 
 void BufferCache::SynchronizeDmaBuffers() {
@@ -2348,6 +2431,7 @@ void BufferCache::ReleaseBlocks(u64 first_block, u64 end_block, bool finish) {
         gpu_modified_ranges.Subtract(first_block << block_shift,
                                      (end_block - first_block) << block_shift);
     }
+    gpu_unmark_gen.fetch_add(1, std::memory_order_release);
     // sotc: a bind of the same blocks (the guest maps them again) must not share the unbind's
     // sparse bind batch: binds of one range within a batch are not ordered (the evicted blocks
     // of MaybeEvictCold came back unbound: black scenes). The caller flushes.

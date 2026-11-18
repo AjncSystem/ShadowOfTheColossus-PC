@@ -27,7 +27,8 @@ namespace Serialization {
 // 39 = the LOD feedback buffer no longer depends on the textures bound when a permutation was
 // translated (resource_patching_pass.cpp).
 // 40/136 = reads of absent lanes folded on 64-wide hosts (AMD GCN; lower_wave64_pass.cpp, #411).
-static const u32 ShaderBinaryVersion = Shader::LodFeedbackEnabled() ? 40u : 136u;
+// 41/137 = quad swizzles via QuadBroadcast + VK_KHR_shader_quad_control on fragment shaders (sky grid fix).
+static const u32 ShaderBinaryVersion = Shader::LodFeedbackEnabled() ? 41u : 137u;
 static constexpr u32 ShaderMetaVersion = 21u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization
@@ -59,8 +60,9 @@ long long Ms(std::chrono::steady_clock::duration d) {
 // shader: the driver refused them at the next start (ErrorUnknown on AMD). Such a permutation is
 // now left out of the cache, along with every pipeline that uses it; they compile each session.
 std::mutex collided_mutex;
+std::unordered_set<u64> valid_bins;         // BinaryId of valid current-version permutations loaded or saved
 std::unordered_set<u64> collided_bins;      // BinaryId of the permutations left out
-std::unordered_set<size_t> collided_perms; // perm hashes, as in the pipeline keys
+std::unordered_set<size_t> collided_perms;  // perm hashes, as in the pipeline keys
 
 u64 BinaryId(u64 pgm_hash, size_t perm_idx) {
     return pgm_hash ^ (u64(perm_idx) << 56);
@@ -151,22 +153,34 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
         return;
     }
 
+    const u64 bin_id = BinaryId(pgm_hash, perm_idx);
     const auto name = fmt::format("{:#018x}_{}", pgm_hash, perm_idx);
     if (!EmulatorSettings.IsPipelineCacheArchived()) {
-        std::vector<u32> stored;
-        Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary, name, stored);
-        if (!stored.empty() && stored != spv) {
-            static std::atomic<u32> reported{0};
-            if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
-                LOG_WARNING(Render_Vulkan,
-                            "Shader permutation {} is another one on disk: not cached", name);
-            }
+        bool already_valid = false;
+        {
             std::scoped_lock lock{collided_mutex};
-            collided_bins.insert(BinaryId(pgm_hash, perm_idx));
-            return;
+            already_valid = valid_bins.contains(bin_id);
+        }
+        if (already_valid) {
+            std::vector<u32> stored;
+            Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary, name, stored);
+            if (!stored.empty() && stored != spv) {
+                static std::atomic<u32> reported{0};
+                if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Shader permutation {} is another one on disk: not cached", name);
+                }
+                std::scoped_lock lock{collided_mutex};
+                collided_bins.insert(bin_id);
+                return;
+            }
         }
     }
     Storage::DataBase::Instance().Save(Storage::BlobType::ShaderBinary, name, std::move(spv));
+    {
+        std::scoped_lock lock{collided_mutex};
+        valid_bins.insert(bin_id);
+    }
 }
 
 bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
@@ -385,6 +399,18 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         return false;
     }
 
+    if (const auto it_existing = program_cache.find(program->info.pgm_hash);
+        it_existing != program_cache.end() && perm_idx < it_existing.value()->modules.size() &&
+        it_existing.value()->modules[perm_idx].module) {
+        infos[stage] = &it_existing.value()->info;
+        modules[stage] = it_existing.value()->modules[perm_idx].module;
+        if (auto& fetch = it_existing.value()->modules[perm_idx].spec.fetch_shader_data;
+            !fetch.Empty()) {
+            fetch_shader = &fetch;
+        }
+        return true;
+    }
+
     std::vector<u32> spv{};
     {
         WarmUpTimer timer{warmup_times.load};
@@ -411,36 +437,22 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         }
     }
 
+    {
+        WarmUpTimer timer{warmup_times.modules};
+        module = CompileSPV(spv, instance.GetDevice());
+    }
+
     auto [it_pgm, new_program] = program_cache.try_emplace(program->info.pgm_hash);
     if (new_program) {
-        {
-            WarmUpTimer timer{warmup_times.modules};
-            module = CompileSPV(spv, instance.GetDevice());
-        }
         it_pgm.value() = std::move(program);
-    } else {
-        const auto& it = std::ranges::find(it_pgm.value()->modules, spec, &Program::Module::spec);
-        if (it != it_pgm.value()->modules.end()) {
-            // A matching permutation is valid only at its original index. A different index means
-            // the store holds entries from more than one cache generation, so this pipeline is
-            // left to compile at runtime.
-            const auto idx = std::distance(it_pgm.value()->modules.begin(), it);
-            if (perm_idx != idx) {
-                LOG_WARNING(Render_Vulkan,
-                            "Cached permutation {} of {}_{:x} conflicts with index {}, skipping "
-                            "preload",
-                            perm_idx, program->info.hw_stage, program->info.pgm_hash, idx);
-                return false;
-            }
-            module = it->module;
-        } else {
-            WarmUpTimer timer{warmup_times.modules};
-            module = CompileSPV(spv, instance.GetDevice());
-        }
     }
     // The specialization must reference the cached program's info, not the temporary one.
     spec.info = &it_pgm.value()->info;
     it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
+    {
+        std::scoped_lock lock{collided_mutex};
+        valid_bins.insert(BinaryId(it_pgm.value()->info.pgm_hash, perm_idx));
+    }
 
     infos[stage] = &it_pgm.value()->info;
     modules[stage] = module;
@@ -492,6 +504,13 @@ void PipelineCache::WarmUp() {
         return;
     }
 
+    {
+        std::scoped_lock lock{collided_mutex};
+        valid_bins.clear();
+        collided_bins.clear();
+        collided_perms.clear();
+    }
+
     u32 num_pipelines{};
     u32 num_total_pipelines{};
     const auto warmup_start = std::chrono::steady_clock::now();
@@ -500,6 +519,21 @@ void PipelineCache::WarmUp() {
     SotcStats::warmup_total.store(
         static_cast<u32>(Storage::DataBase::Instance().CountBlobs(Storage::BlobType::PipelineKey)),
         std::memory_order_relaxed);
+
+    // Preload all valid ShaderMeta+ShaderBinary pairs at their saved perm_idx first so orphan
+    // shaders without a PipelineKey are still registered in program_cache and multi-permutation
+    // programs populate their exact slots without out-of-order conflicts.
+    Storage::DataBase::Instance().ForEachBlob(
+        Storage::BlobType::ShaderMeta, [&](std::vector<u8>&& data) {
+            try {
+                Serialization::Archive ar{std::move(data)};
+                LoadPipelineStage(ar, 0);
+            } catch (const Serialization::CorruptedData&) {
+            }
+            infos.fill(nullptr);
+            modules.fill(nullptr);
+            fetch_shader = nullptr;
+        });
 
     Storage::DataBase::Instance().ForEachBlob(
         Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {

@@ -1205,7 +1205,7 @@ void VideoOutDriver::Flip(const Request& req) {
     }
 
     // Reset prev flip label
-    if (!EarlyVoLabel() && port->prev_index != -1) {
+    if (!req.early_vo && port->prev_index != -1) {
         port->buffer_labels[port->prev_index] = 0;
         port->SignalVoLabel();
     }
@@ -1274,51 +1274,61 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         frame = presenter->PrepareFrame(group, buffer.address_left);
     }
 
-    // sotc: the buffer shown before this flip is free once the copy of this one is recorded:
-    // PrepareFrame read it on the GPU timeline, ahead of anything the game renders into the old
-    // buffer next. Upstream frees it only when the present thread takes this flip on a vblank
-    // tick, and the command processor waits for that in the VO label wait at the start of the
-    // next frame.
-    if (EarlyVoLabel()) {
-        if (port->submit_prev_index != -1) {
-            port->buffer_labels[port->submit_prev_index] = 0;
-            port->SignalVoLabel();
-        }
-        port->submit_prev_index = index;
-    }
-
     const auto arrival = std::chrono::steady_clock::now();
     // sotc: at most SOTC_FLIP_QUEUE (default 1) flips wait for the present thread. The early label
-    // above lets the game run ahead of a frame limit, so the waiting flips filled the whole frame
+    // below lets the game run ahead of a frame limit, so the waiting flips filled the whole frame
     // pool, which follows the swapchain: with its 8 images every frame was shown 8 frames late
     // (measured 266 ms at the 30 FPS cap, issue #128, from 0.70-opt12). The command processor waits
     // here instead, as the game does on the PS4. Not while a present is stuck (NVIDIA blocks one up
     // to ~140 ms every ~11 s): the deep pool is there to bridge that without a hitch; the backlog
     // is gone a few frames later. 0: no limit, as before.
+    // sotc: when AsyncPresent() runs on a FIFO swapchain, normal VSync waits in PresentJobThread
+    // routinely exceed 20 ms (16.7-33.3 ms), so use a higher stuck threshold (60 ms) there so
+    // normal VSync waits never leak a second frame onto requests; release the previous VO buffer
+    // only after the queue has room so the game stays at most 1 frame ahead instead of 2.
     static const size_t flip_queue = [] {
         const char* v = std::getenv("SOTC_FLIP_QUEUE");
         return v && v[0] ? size_t(std::strtoul(v, nullptr, 10)) : size_t{1};
     }();
-    std::unique_lock lock{mutex};
-    if (flip_queue != 0 && requests.size() >= flip_queue) {
-        constexpr u64 stuck_ns = 20'000'000;
-        const auto give_up = arrival + std::chrono::milliseconds(200); // paused, or shutting down
-        while (requests.size() >= flip_queue && std::chrono::steady_clock::now() < give_up) {
-            const u64 since = present_since_ns.load(std::memory_order_relaxed);
-            if (since != 0 && SotcStats::NowNs() - since > stuck_ns) {
-                break;
+    {
+        std::unique_lock lock{mutex};
+        if (flip_queue != 0 && requests.size() >= flip_queue) {
+            const u64 stuck_ns = AsyncPresent() ? 60'000'000ULL : 20'000'000ULL;
+            const auto give_up = arrival + std::chrono::milliseconds(200); // paused, or shutting down
+            while (requests.size() >= flip_queue && std::chrono::steady_clock::now() < give_up) {
+                const u64 since = present_since_ns.load(std::memory_order_relaxed);
+                if (since != 0 && SotcStats::NowNs() - since > stuck_ns) {
+                    break;
+                }
+                flip_taken_cv.wait_for(lock, std::chrono::milliseconds(2));
             }
-            flip_taken_cv.wait_for(lock, std::chrono::milliseconds(2));
         }
+        // sotc: release the previous VO buffer at submit time only when running uncapped / 60 FPS
+        // (EffectiveRate <= 0). Under a 30 FPS cap (EffectiveRate >= 1), early release makes the
+        // game render the next frame ~17 ms before the current flip can display, adding a full extra
+        // ~17-20 ms to input latency (SOTC flip wait ~42-50 ms instead of ~15-20 ms).
+        const bool early_vo = EarlyVoLabel() && SotcFpsCap::EffectiveRate() <= 0;
+        if (early_vo) {
+            if (port->submit_prev_index != -1) {
+                port->buffer_labels[port->submit_prev_index] = 0;
+                port->SignalVoLabel();
+            }
+            port->submit_prev_index = index;
+        } else if (port->submit_prev_index != -1) {
+            port->buffer_labels[port->submit_prev_index] = 0;
+            port->SignalVoLabel();
+            port->submit_prev_index = -1;
+        }
+        requests.push({
+            .frame = frame,
+            .port = port,
+            .flip_arg = flip_arg,
+            .index = index,
+            .eop = is_eop,
+            .early_vo = early_vo,
+            .arrival = arrival,
+        });
     }
-    requests.push({
-        .frame = frame,
-        .port = port,
-        .flip_arg = flip_arg,
-        .index = index,
-        .eop = is_eop,
-        .arrival = arrival,
-    });
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {
@@ -1488,8 +1498,11 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             const std::chrono::nanoseconds cap_period =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     vblank_period * (u64(flip_rate + 1) * vblanks_per_60hz));
+            // sotc: in 30 FPS cap mode (flip_rate >= 1) wait until the presenter finished the
+            // prior job so FIFO present queues don't stack an extra frame of input latency.
+            const size_t max_pending = flip_rate >= 1 ? size_t{0} : size_t{1};
             const bool present_clear =
-                !AsyncPresent() || present_jobs_pending.load(std::memory_order_acquire) <= 1;
+                !AsyncPresent() || present_jobs_pending.load(std::memory_order_acquire) <= max_pending;
             take_request = arrival && present_clear && now + tick_period / 2 >= cap_next;
             if (take_request) {
                 cap_next = (now - cap_next < tick_period ? cap_next : now) + cap_period;

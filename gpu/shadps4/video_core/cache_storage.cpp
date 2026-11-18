@@ -237,12 +237,17 @@ static void ReadCachePack(const std::filesystem::path& path,
 
 static void WriteCachePack(std::filesystem::path path,
                            std::vector<std::pair<std::string, std::vector<u8>>> files) {
+    Common::SetCurrentThreadName("shadPS4:CachePack");
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
     auto tmp = path;
     tmp += L".tmp";
     std::FILE* f = _wfopen(tmp.c_str(), L"wb");
     if (!f) {
         return;
     }
+    // sotc: use a 1 MiB stdio buffer so packing 12k+ shader files doesn't flush 48k small writes.
+    std::vector<char> stdio_buf(1ULL << 20);
+    std::setvbuf(f, stdio_buf.data(), _IOFBF, stdio_buf.size());
     bool ok = std::fwrite(PackMagic, 1, 8, f) == 8;
     const u32 count = static_cast<u32>(files.size());
     ok = ok && std::fwrite(&count, 4, 1, f) == 1;

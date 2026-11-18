@@ -20,7 +20,7 @@ namespace Vulkan::SotcGuestMemory {
 
 namespace {
 
-constexpr u64 kChunk = 64ULL << 20;
+u64 g_chunk_bytes = 64ULL << 20;
 
 struct Chunk {
     vk::DeviceMemory memory;
@@ -41,10 +41,10 @@ bool g_enabled{};
 
 bool Import(Chunk& chunk, u64 index) {
     const vk::Device device = g_instance->GetDevice();
-    const u64 size = std::min(kChunk, g_size - index * kChunk);
+    const u64 size = std::min(g_chunk_bytes, g_size - index * g_chunk_bytes);
     const vk::ImportMemoryHostPointerInfoEXT import_info{
         .handleType = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT,
-        .pHostPointer = const_cast<u8*>(g_base + index * kChunk),
+        .pHostPointer = const_cast<u8*>(g_base + index * g_chunk_bytes),
     };
     const auto [memory_result, memory] = device.allocateMemory(vk::MemoryAllocateInfo{
         .pNext = &import_info,
@@ -121,7 +121,15 @@ void Resolve() {
                      host_properties.memoryTypeBits);
         return;
     }
-    g_chunks.resize((g_size + kChunk - 1) / kChunk);
+    const bool preimport = [] {
+        const char* v = std::getenv("SOTC_PC_MEMORY_PREIMPORT");
+        return v && v[0] == '1';
+    }();
+    // sotc: with background preimport enabled and sufficient storage-buffer range, 128 MiB chunks
+    // fit 62-68 MiB texture uploads cleanly without hitting across-chunks staging copies.
+    const u64 max_ssbo = instance.GetPhysicalDevice().getProperties().limits.maxStorageBufferRange;
+    g_chunk_bytes = (preimport && max_ssbo >= (128ULL << 20)) ? (128ULL << 20) : (64ULL << 20);
+    g_chunks.resize((g_size + g_chunk_bytes - 1) / g_chunk_bytes);
     // The first chunk now: proves the import works on this driver before anything relies on it.
     const auto start = std::chrono::steady_clock::now();
     if (!Import(g_chunks[0], 0)) {
@@ -132,17 +140,18 @@ void Resolve() {
     g_enabled = true;
     // sotc: SOTC_PC_MEMORY_PREIMPORT=1: every chunk imported now, at boot, on the importer thread:
     // an import while playing stalls the draw thread's own Vulkan calls (the driver locks while
-    // it pins 64 MiB), the first-entry hitch SOTC_TEX_DIRECT was meant to remove.
-    if (const char* v = std::getenv("SOTC_PC_MEMORY_PREIMPORT"); v && v[0] == '1') {
+    // it pins a chunk), the first-entry hitch SOTC_TEX_DIRECT was meant to remove.
+    if (preimport) {
         LogWhenAllIn();
         for (u64 i = 1; i < g_chunks.size(); ++i) {
             QueueImport(g_chunks[i], i);
         }
     }
     std::fprintf(stderr,
-                 "SOTC PC memory: %llu MiB of game memory, %zu chunks of 64 MiB imported on use "
+                 "SOTC PC memory: %llu MiB of game memory, %zu chunks of %llu MiB imported on use "
                  "(memory type %u); chunk 0 in %.1f ms\n",
-                 static_cast<unsigned long long>(g_size >> 20), g_chunks.size(), g_memory_type,
+                 static_cast<unsigned long long>(g_size >> 20), g_chunks.size(),
+                 static_cast<unsigned long long>(g_chunk_bytes >> 20), g_memory_type,
                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
                                                            start)
                      .count());
@@ -174,10 +183,10 @@ Span Get(const u8* host, u64 size) {
         return {};
     }
     const u64 offset = static_cast<u64>(host - g_base);
-    if (offset + size > g_size || offset / kChunk != (offset + size - 1) / kChunk) {
+    if (offset + size > g_size || offset / g_chunk_bytes != (offset + size - 1) / g_chunk_bytes) {
         return {};
     }
-    const u64 index = offset / kChunk;
+    const u64 index = offset / g_chunk_bytes;
     std::scoped_lock lock{g_mutex};
     Chunk& chunk = g_chunks[index];
     if (!chunk.buffer) {
@@ -186,7 +195,7 @@ Span Get(const u8* host, u64 size) {
             return {};
         }
     }
-    return {chunk.buffer, offset - index * kChunk};
+    return {chunk.buffer, offset - index * g_chunk_bytes};
 }
 
 namespace {
@@ -262,11 +271,11 @@ const VideoCore::Buffer* GetBuffer(const u8* host, u64 size, u64* offset, int* w
         if (why) *why = 1;
         return nullptr;
     }
-    if (host_offset / kChunk != (host_offset + size - 1) / kChunk) {
+    if (host_offset / g_chunk_bytes != (host_offset + size - 1) / g_chunk_bytes) {
         if (why) *why = 2;
         return nullptr;
     }
-    const u64 index = host_offset / kChunk;
+    const u64 index = host_offset / g_chunk_bytes;
     std::scoped_lock lock{g_mutex};
     Chunk& chunk = g_chunks[index];
     if (!chunk.buffer) {
@@ -274,10 +283,10 @@ const VideoCore::Buffer* GetBuffer(const u8* host, u64 size, u64* offset, int* w
         if (why) *why = 3;
         return nullptr;
     }
-    const Span span{chunk.buffer, host_offset - index * kChunk};
+    const Span span{chunk.buffer, host_offset - index * g_chunk_bytes};
     if (!chunk.wrapper) {
         chunk.wrapper = new VideoCore::Buffer(g_instance->GetDevice(), chunk.buffer,
-                                              std::min(kChunk, g_size - index * kChunk));
+                                              std::min(g_chunk_bytes, g_size - index * g_chunk_bytes));
     }
     *offset = span.offset;
     return chunk.wrapper;

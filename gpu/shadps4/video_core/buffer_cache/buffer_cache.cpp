@@ -1545,7 +1545,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
     if (SotcStats::kTexDirect && Vulkan::SotcGuestMemory::Enabled()) {
         VAddr run_start = 0;
         u64 run_size = 0;
-        const u8* run = memory->GetBackingRun(device_addr, &run_start, &run_size);
+        const u8* run = memory->GetBackingRun(device_addr, &run_start, &run_size, size);
         u64 offset = 0;
         int why = 0;
         const Buffer* direct =

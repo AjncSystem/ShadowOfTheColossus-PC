@@ -728,14 +728,21 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
                     return false;
                 }
                 const auto& front = async_queue.front();
-                if (front->compute || front->preloaded ||
-                    SotcStats::warmup_total.load(std::memory_order_relaxed) != 0) {
+                const bool warming = SotcStats::warmup_total.load(std::memory_order_relaxed) != 0;
+                if (front->compute || warming) {
                     return true;
                 }
                 const size_t non_compute_limit =
                     std::thread::hardware_concurrency() <= 12 ? 2u
                     : async_workers.size() <= 8               ? std::max<size_t>(4, async_workers.size() - 2)
                                                               : async_workers.size() - 2;
+                // sotc: post-warmup preloaded graphics pipelines share CPU/driver locks with game
+                // boot; cap concurrency so workers don't thrash the driver cache (SLOW BUILD bursts).
+                if (front->preloaded) {
+                    const size_t preload_limit = std::clamp<size_t>(async_workers.size() / 2, 2u, 4u);
+                    return async_graphics_active < preload_limit &&
+                           async_non_compute_active < std::max(non_compute_limit, preload_limit);
+                }
                 if (front->translate) {
                     return async_non_compute_active < non_compute_limit;
                 }

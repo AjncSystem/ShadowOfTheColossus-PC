@@ -103,6 +103,7 @@ private:
         s64 flip_arg;
         s32 index;
         bool eop;
+        bool early_vo;
         // sotc: when the flip was submitted; the present thread paces flips from it.
         std::chrono::steady_clock::time_point arrival;
 

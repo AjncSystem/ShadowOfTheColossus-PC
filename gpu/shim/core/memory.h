@@ -27,7 +27,7 @@ public:
     bool TryCopySparseMemory(VAddr source, u8* dest, u64 size);
     const u8* GetBackingPointer(VAddr address) const;
     /// sotc (bpe_heap_guard): the backing view of the mapping holding address, as one run.
-    const u8* GetBackingRun(VAddr address, VAddr* run_start, u64* run_size) const;
+    const u8* GetBackingRun(VAddr address, VAddr* run_start, u64* run_size, u64 min_size = 0) const;
     bool TryReadBacking(VAddr address, void* out, u64 size) {
         return TryCopySparseMemory(address, static_cast<u8*>(out), size);
     }

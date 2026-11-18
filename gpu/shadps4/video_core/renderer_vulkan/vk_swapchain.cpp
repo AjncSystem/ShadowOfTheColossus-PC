@@ -205,6 +205,8 @@ void Swapchain::FindPresentMode() {
     const auto requested_mode = EmulatorSettings.GetPresentMode();
     if (requested_mode == "Mailbox") {
         present_mode = vk::PresentModeKHR::eMailbox;
+    } else if (requested_mode == "FifoRelaxed") {
+        present_mode = vk::PresentModeKHR::eFifoRelaxed;
     } else if (requested_mode == "Fifo") {
         present_mode = vk::PresentModeKHR::eFifo;
     } else if (requested_mode == "Immediate") {
@@ -218,8 +220,8 @@ void Swapchain::FindPresentMode() {
     if (std::ranges::find(modes, present_mode) == modes.cend()) {
         // FIFO is guaranteed to be supported by the Vulkan spec.
         constexpr auto fallback = vk::PresentModeKHR::eFifo;
-        LOG_WARNING(Render, "Requested present mode {} is not supported, falling back to {}.",
-                    vk::to_string(present_mode), vk::to_string(fallback));
+        LOG_INFO(Render, "Requested present mode {} is not supported on this surface, using {}.",
+                 vk::to_string(present_mode), vk::to_string(fallback));
         present_mode = fallback;
     }
     // sotc: DLSS Frame Generation on Vulkan needs vsync off (Streamline paces the frames).
@@ -250,7 +252,7 @@ void Swapchain::SetSurfaceProperties() {
     // fills while a present is stuck. SOTC_SWAP_IMAGES overrides (=3 for the old behaviour).
     // FIFO queues every image for the display: a game faster than the refresh would be shown up to
     // 8 frames late, so it keeps the usual count (#128).
-    u32 wanted_images = present_mode == vk::PresentModeKHR::eFifo
+    u32 wanted_images = PresentWaitsForVsync()
                             ? capabilities.minImageCount + 1
                             : std::max(capabilities.minImageCount + 1, 8u);
     if (const char* env = std::getenv("SOTC_SWAP_IMAGES"); env && env[0]) {

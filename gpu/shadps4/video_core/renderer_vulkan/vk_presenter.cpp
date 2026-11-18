@@ -533,6 +533,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
         static_cast<float>(EmulatorSettings.GetRcasAttenuation() / 1000.f);
 
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
+    fsr_pass_present.Create(device, instance.GetAllocator(), num_images);
     fsr_pass_hudless.Create(device, instance.GetAllocator(), num_images);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
     if (swapchain.GetHDR() && EmulatorSettings.IsSdrToHdr()) {
@@ -1154,16 +1155,25 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }
 
+    u64 pending_fsr_tick = 0;
     if (!is_reusing_frame && frame->async_fsr_tick != 0) {
-        Dlssg::WaitFsrComplete(frame->async_fsr_tick);
+        static const bool gpu_wait = [] {
+            const char* v = std::getenv("SOTC_FSR_ASYNC_GPU_WAIT");
+            return !v || v[0] != '0';
+        }();
+        if (gpu_wait && Dlssg::FsrSemaphore()) {
+            pending_fsr_tick = frame->async_fsr_tick;
+        } else {
+            Dlssg::WaitFsrComplete(frame->async_fsr_tick);
+        }
         frame->async_fsr_tick = 0;
 
         auto& scheduler = present_scheduler;
         const auto p_cmdbuf = scheduler.CommandBuffer();
         vk::ImageView scene = frame->async_upscaled.scene;
         if (frame->async_sharpness >= 0.0f) {
-            scene = fsr_pass.Sharpen(p_cmdbuf, scene, {frame->width, frame->height},
-                                     frame->async_sharpness);
+            scene = fsr_pass_present.Sharpen(p_cmdbuf, scene, {frame->width, frame->height},
+                                             frame->async_sharpness);
         }
         pp_pass.Render(p_cmdbuf, scene, {frame->width, frame->height}, *frame,
                        frame->async_pp_settings, frame->async_upscaled.ui,
@@ -1210,7 +1220,8 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         FrameGen::TestTick();
         SotcFpsCap::TestTick();
         FsrFg::NoteGameFrame();
-        if (FrameGen::Current() == FrameGen::Mode::Fsr && PresentGenerated(frame)) {
+        if (FrameGen::Current() == FrameGen::Mode::Fsr &&
+            PresentGenerated(frame, pending_fsr_tick)) {
             // SOTC_FSRFG_ONLY_GENERATED=1: the game frames are not shown (checking the others).
             static const bool only_generated = [] {
                 const char* v = std::getenv("SOTC_FSRFG_ONLY_GENERATED");
@@ -1220,6 +1231,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 Check(instance.GetDevice().resetFences(frame->present_done));
                 SubmitInfo info{};
                 info.AddWait(frame->ready_semaphore, frame->ready_tick);
+                if (pending_fsr_tick != 0 && Dlssg::FsrSemaphore()) {
+                    info.AddWait(Dlssg::FsrSemaphore(), pending_fsr_tick,
+                                 vk::PipelineStageFlagBits::eAllCommands);
+                    pending_fsr_tick = 0;
+                }
                 info.AddSignal(frame->present_done);
                 present_scheduler.Flush(info);
                 free_frame();
@@ -1235,6 +1251,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         if (!swapchain.AcquireNextImage()) {
             // User resizes the window too fast and GPU can't keep up. Skip this frame.
             LOG_WARNING(Render_Vulkan, "Skipping frame!");
+            if (pending_fsr_tick != 0) {
+                Dlssg::WaitFsrComplete(pending_fsr_tick);
+            }
             free_frame();
             return;
         }
@@ -1498,6 +1517,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     }
     info.AddWait(swapchain.GetImageAcquiredSemaphore());
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
+    if (pending_fsr_tick != 0 && Dlssg::FsrSemaphore()) {
+        info.AddWait(Dlssg::FsrSemaphore(), pending_fsr_tick,
+                     vk::PipelineStageFlagBits::eAllCommands);
+        pending_fsr_tick = 0;
+    }
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
     scheduler.Flush(info);
@@ -1602,7 +1626,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     }
 }
 
-bool Presenter::PresentGenerated(Frame* frame) {
+bool Presenter::PresentGenerated(Frame* frame, u64& pending_fsr_tick) {
     auto& scheduler = present_scheduler;
     const auto cmdbuf = scheduler.CommandBuffer();
     const vk::Image generated =
@@ -1615,6 +1639,11 @@ bool Presenter::PresentGenerated(Frame* frame) {
     }
     SubmitInfo info{};
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
+    if (pending_fsr_tick != 0 && Dlssg::FsrSemaphore()) {
+        info.AddWait(Dlssg::FsrSemaphore(), pending_fsr_tick,
+                     vk::PipelineStageFlagBits::eAllCommands);
+        pending_fsr_tick = 0;
+    }
     const auto submit = [&] {
         const u64 tick = scheduler.CurrentTick();
         scheduler.Flush(info);

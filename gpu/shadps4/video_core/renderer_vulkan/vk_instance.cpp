@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1006,6 +1007,24 @@ void Instance::CollectPhysicalMemoryInfo() {
         // We reserve some memory for the system.
         const u64 system_memory = std::min<u64>(total_memory_budget / 8, 1_GB);
         total_memory_budget -= system_memory;
+        u64 host_visible_local = 0;
+        std::array<bool, VK_MAX_MEMORY_HEAPS> counted_bar{};
+        constexpr auto bar_flags =
+            vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible;
+        for (u32 i = 0; i < memory_props.memoryTypeCount; ++i) {
+            const auto& type = memory_props.memoryTypes[i];
+            if ((type.propertyFlags & bar_flags) == bar_flags && type.heapIndex < num_props &&
+                !counted_bar[type.heapIndex]) {
+                counted_bar[type.heapIndex] = true;
+                host_visible_local += memory_props.memoryHeaps[type.heapIndex].size;
+            }
+        }
+        std::fprintf(stderr,
+                     "GPU: discrete, video memory budget %llu MiB (VRAM %llu MiB, host-visible "
+                     "BAR %llu MiB)\n",
+                     static_cast<unsigned long long>(total_memory_budget >> 20),
+                     static_cast<unsigned long long>(local_memory >> 20),
+                     static_cast<unsigned long long>(host_visible_local >> 20));
         return;
     }
     // Leave at least 8 GB for the system on integrated GPUs.

@@ -46,11 +46,14 @@ static bool DriverCacheEnabled() {
     return enabled;
 }
 
-static std::filesystem::path DriverCachePath() {
+static std::filesystem::path DriverCachePath(const Instance& instance) {
     const auto dir = Common::FS::GetUserPath(Common::FS::PathType::CacheDir);
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
-    return dir / "sotc_vk_pipelines.bin";
+    char filename[64];
+    std::snprintf(filename, sizeof(filename), "sotc_vk_pipelines_%04x_%04x.bin",
+                  instance.GetVendorID(), instance.GetDeviceID());
+    return dir / filename;
 }
 
 using Shader::HwStage;
@@ -479,7 +482,14 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     // SOTC_DRIVER_CACHE=0 turns it off.
     std::vector<u8> driver_cache_data;
     if (DriverCacheEnabled()) {
-        const auto path = DriverCachePath();
+        auto path = DriverCachePath(instance);
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec)) {
+            const auto legacy = path.parent_path() / "sotc_vk_pipelines.bin";
+            if (std::filesystem::exists(legacy, ec)) {
+                path = legacy;
+            }
+        }
         if (std::FILE* f = _wfopen(path.c_str(), L"rb")) {
             std::fseek(f, 0, SEEK_END);
             const long size = std::ftell(f);
@@ -584,7 +594,7 @@ void PipelineCache::SaveDriverCache() {
     }
     data.resize(size);
     // Written next to it and renamed: a crash while writing keeps the old copy.
-    const auto path = DriverCachePath();
+    const auto path = DriverCachePath(instance);
     auto tmp = path;
     tmp += L".tmp";
     std::FILE* f = _wfopen(tmp.c_str(), L"wb");

@@ -59,13 +59,24 @@ static_assert(std::has_unique_object_representations_v<RenderState>);
 struct SubmitInfo {
     std::array<vk::Semaphore, 4> wait_semas;
     std::array<u64, 4> wait_ticks;
+    // sotc: default stage masks per slot preserve legacy behavior; callers can pass an explicit
+    // stage when attaching a compute timeline wait (e.g. async FSR) into any slot.
+    std::array<vk::PipelineStageFlags, 4> wait_stages{
+        vk::PipelineStageFlagBits::eAllCommands,
+        vk::PipelineStageFlagBits::eColorAttachmentOutput,
+        vk::PipelineStageFlagBits::eAllCommands,
+        vk::PipelineStageFlagBits::eAllCommands,
+    };
     std::array<vk::Semaphore, 4> signal_semas;
     std::array<u64, 4> signal_ticks;
     vk::Fence fence;
     u32 num_wait_semas;
     u32 num_signal_semas;
 
-    void AddWait(vk::Semaphore semaphore, u64 tick = 1) {
+    void AddWait(vk::Semaphore semaphore, u64 tick = 1, vk::PipelineStageFlags stage = {}) {
+        if (stage) {
+            wait_stages[num_wait_semas] = stage;
+        }
         wait_semas[num_wait_semas] = semaphore;
         wait_ticks[num_wait_semas++] = tick;
     }

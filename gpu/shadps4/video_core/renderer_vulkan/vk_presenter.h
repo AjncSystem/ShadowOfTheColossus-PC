@@ -140,7 +140,7 @@ private:
 
     /// sotc: FSR 3 frame generation: presents the frame between the last game frame and
     /// `frame`. False when there is none.
-    bool PresentGenerated(Frame* frame);
+    bool PresentGenerated(Frame* frame, u64& pending_fsr_tick);
 
     void SetExpectedGameSize(s32 width, s32 height);
 
@@ -152,6 +152,9 @@ private:
     Frontend::WindowSDL& window;
     Instance instance;
     HostPasses::FsrPass fsr_pass;
+    /// sotc: dedicated Presenter-thread FSR pass for async FSR Sharpen so CP-thread FsrPass::Render
+    /// calls in menus/loading screens cannot race its ring state.
+    HostPasses::FsrPass fsr_pass_present;
     /// sotc: the same FSR 1 for the frame without the HUD (frame generation), with its own images:
     /// fsr_pass's ring holds the game frame's.
     HostPasses::FsrPass fsr_pass_hudless;

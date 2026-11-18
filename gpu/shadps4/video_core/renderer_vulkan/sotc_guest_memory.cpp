@@ -3,6 +3,7 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <deque>
 #include <thread>
 #include <cstdio>
@@ -129,6 +130,19 @@ void Resolve() {
     // fit 62-68 MiB texture uploads cleanly without hitting across-chunks staging copies.
     const u64 max_ssbo = instance.GetPhysicalDevice().getProperties().limits.maxStorageBufferRange;
     g_chunk_bytes = (preimport && max_ssbo >= (128ULL << 20)) ? (128ULL << 20) : (64ULL << 20);
+    const auto ext_props =
+        instance.GetPhysicalDevice()
+            .getProperties2<vk::PhysicalDeviceProperties2,
+                            vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>();
+    const u64 min_align =
+        ext_props.get<vk::PhysicalDeviceExternalMemoryHostPropertiesEXT>()
+            .minImportedHostPointerAlignment;
+    if (min_align > 0 && ((reinterpret_cast<std::uintptr_t>(g_base) % min_align) != 0 ||
+                          (g_chunk_bytes % min_align) != 0)) {
+        std::fprintf(stderr, "SOTC PC memory: host alignment mismatch (min %llu), off\n",
+                     static_cast<unsigned long long>(min_align));
+        return;
+    }
     g_chunks.resize((g_size + g_chunk_bytes - 1) / g_chunk_bytes);
     // The first chunk now: proves the import works on this driver before anything relies on it.
     const auto start = std::chrono::steady_clock::now();

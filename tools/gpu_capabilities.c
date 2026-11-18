@@ -93,9 +93,10 @@ int main(int argc, char **argv) {
         vkDestroyInstance(instance, NULL);
         return 1;
     }
-    /* Match vk_instance.cpp's default ranking or its explicit BB_GPU_ID index. */
+    /* Match vk_instance.cpp's default ranking, SOTC_GPU_VENDOR, or explicit BB_GPU_ID index. */
     VkPhysicalDevice selected = devices[0];
     const char *gpu_id = getenv("BB_GPU_ID");
+    const char *vendor_env = getenv("SOTC_GPU_VENDOR");
     if (gpu_id && atoi(gpu_id) >= 0) {
         const unsigned long index = strtoul(gpu_id, NULL, 10);
         if (index >= count) {
@@ -105,6 +106,22 @@ int main(int argc, char **argv) {
             return 1;
         }
         selected = devices[index];
+    } else if (vendor_env && vendor_env[0]) {
+        const uint32_t wanted_vendor = (uint32_t)strtoul(vendor_env, NULL, 16);
+        int matched = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            VkPhysicalDeviceProperties vp;
+            vkGetPhysicalDeviceProperties(devices[i], &vp);
+            if (vp.vendorID == wanted_vendor) {
+                selected = devices[i];
+                matched = 1;
+                break;
+            }
+        }
+        if (!matched) {
+            for (uint32_t i = 1; i < count; ++i)
+                if (better_device(devices[i], selected)) selected = devices[i];
+        }
     } else {
         for (uint32_t i = 1; i < count; ++i)
             if (better_device(devices[i], selected)) selected = devices[i];

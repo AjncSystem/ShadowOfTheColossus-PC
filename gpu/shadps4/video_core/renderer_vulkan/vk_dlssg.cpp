@@ -1705,6 +1705,7 @@ Upscaled UpscaleFsr(const FrameSlot& f, SrRingSlot& sr, u32 slot_idx, vk::Comman
     p.z_far = c.cameraFar;
     p.fov_y = c.cameraFOV;
     p.depth_inverted = c.depthInverted == sl::Boolean::eTrue;
+    p.is_hdr = sr_hdr;
     p.reset = c.reset == sl::Boolean::eTrue || !sr_prev;
 
     static const bool use_async_env = [] {

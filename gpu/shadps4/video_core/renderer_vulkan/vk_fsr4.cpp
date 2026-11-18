@@ -2,6 +2,8 @@
 
 #include "video_core/renderer_vulkan/vk_fsr4.h"
 
+#ifdef _WIN32
+
 #include <windows.h>
 
 #include <algorithm>
@@ -40,6 +42,7 @@ std::atomic<const char*> name_ptr{"FSR"};
 ffxContext context{};
 u32 ctx_render_w = 0, ctx_render_h = 0, ctx_out_w = 0, ctx_out_h = 0;
 bool ctx_inverted = false;
+bool ctx_hdr = false;
 bool ctx_failed = false; ///< the last create failed for this size: not retried every frame
 std::chrono::steady_clock::time_point last_dispatch{};
 
@@ -93,8 +96,8 @@ void DestroyContext() {
 bool CreateContext(const Params& p) {
     ffxCreateContextDescUpscale desc{};
     desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
-    // The scene is tonemapped (0..1, as DLSS gets it): no HDR, no auto exposure.
-    desc.flags = FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE;
+    desc.flags = p.is_hdr ? FFX_UPSCALE_ENABLE_HIGH_DYNAMIC_RANGE
+                          : FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE;
     if (p.depth_inverted) {
         desc.flags |= FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
     }
@@ -132,9 +135,16 @@ bool CreateContext(const Params& p) {
         name = ShortName(provider.versionName);
         name_ptr.store(name.c_str(), std::memory_order_relaxed);
     }
-    std::fprintf(stderr, "SOTC FSR: %s upscaling %ux%u -> %ux%u (depth %s)\n", name.c_str(),
-                 p.render_width, p.render_height, p.out_width, p.out_height,
-                 p.depth_inverted ? "inverted" : "normal");
+    FfxApiEffectMemoryUsage mem_usage{};
+    ffxQueryDescUpscaleGetGPUMemoryUsage mem_query{};
+    mem_query.header.type = FFX_API_QUERY_DESC_TYPE_UPSCALE_GPU_MEMORY_USAGE;
+    mem_query.gpuMemoryUsageUpscaler = &mem_usage;
+    const double vram_mib = api.query(&context, &mem_query.header) == FFX_API_RETURN_OK
+                                ? mem_usage.totalUsageInBytes / (1024.0 * 1024.0)
+                                : 0.0;
+    std::fprintf(stderr, "SOTC FSR: %s upscaling %ux%u -> %ux%u (depth %s, %s, VRAM %.1f MiB)\n",
+                 name.c_str(), p.render_width, p.render_height, p.out_width, p.out_height,
+                 p.depth_inverted ? "inverted" : "normal", p.is_hdr ? "HDR" : "SDR", vram_mib);
     return true;
 }
 
@@ -220,11 +230,13 @@ bool Dispatch(VkCommandBuffer cmdbuf, const Params& p) {
     }
     const bool same = context && ctx_render_w == p.render_width &&
                       ctx_render_h == p.render_height && ctx_out_w == p.out_width &&
-                      ctx_out_h == p.out_height && ctx_inverted == p.depth_inverted;
+                      ctx_out_h == p.out_height && ctx_inverted == p.depth_inverted &&
+                      ctx_hdr == p.is_hdr;
     if (!same) {
         const bool size_changed = ctx_render_w != p.render_width ||
                                   ctx_render_h != p.render_height || ctx_out_w != p.out_width ||
-                                  ctx_out_h != p.out_height || ctx_inverted != p.depth_inverted;
+                                  ctx_out_h != p.out_height || ctx_inverted != p.depth_inverted ||
+                                  ctx_hdr != p.is_hdr;
         if (ctx_failed && !size_changed) {
             return false;
         }
@@ -239,6 +251,7 @@ bool Dispatch(VkCommandBuffer cmdbuf, const Params& p) {
         ctx_out_w = p.out_width;
         ctx_out_h = p.out_height;
         ctx_inverted = p.depth_inverted;
+        ctx_hdr = p.is_hdr;
         ctx_failed = !CreateContext(p);
         if (ctx_failed) {
             return false;
@@ -272,7 +285,7 @@ bool Dispatch(VkCommandBuffer cmdbuf, const Params& p) {
     d.cameraFar = std::min(p.z_far, 1.0e6f);
     d.cameraFovAngleVertical = p.fov_y;
     d.viewSpaceToMetersFactor = 1.0f;
-    d.flags = FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;
+    d.flags = p.is_hdr ? 0u : static_cast<uint32_t>(FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB);
     const ffxReturnCode_t r = api.dispatch(&context, &d.header);
     if (r != FFX_API_RETURN_OK) {
         static u32 errors = 0;
@@ -285,3 +298,22 @@ bool Dispatch(VkCommandBuffer cmdbuf, const Params& p) {
 }
 
 } // namespace Vulkan::Fsr4
+
+#else
+
+namespace Vulkan::Fsr4 {
+bool Init(const Instance&) {
+    return false;
+}
+bool Available() {
+    return false;
+}
+const char* Name() {
+    return "FSR";
+}
+bool Dispatch(VkCommandBuffer, const Params&) {
+    return false;
+}
+} // namespace Vulkan::Fsr4
+
+#endif

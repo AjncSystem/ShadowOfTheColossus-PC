@@ -50,7 +50,7 @@ static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
 /// function-local guard in the fault paths); BufferCache::rb_narrow_window applies it.
 static const u64 rb_narrow_env = [] {
     const char* v = std::getenv("SOTC_RB_NARROW");
-    const u64 kib = v ? std::strtoull(v, nullptr, 10) : 0;
+    const u64 kib = v ? std::strtoull(v, nullptr, 10) : 1;
     if (kib == 0) {
         return u64{0};
     }
@@ -250,7 +250,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
     // (4096); a fault elsewhere starts over. Same data, same path, fewer waits.
     static const u64 stream_max = [] {
         const char* on = std::getenv("SOTC_RB_STREAM");
-        if (on && on[0] == '0') {
+        if (!on || on[0] != '1') {
             return u64{0};
         }
         const char* v = std::getenv("SOTC_RB_STREAM_MAX_KB");
@@ -1050,6 +1050,7 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
                 candidate.heap = heap;
                 candidate.guard.reset();
                 candidate.used.reset();
+                candidate.pieces.reset();
                 return &candidate;
             }
         }
@@ -1078,22 +1079,31 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
     };
     for (size_t h = 0; h < heap_count; ++h) {
         const VAddr heap = heaps[h];
-        // Only readbacks into the heap's own memory need it: building the guard walks the free
-        // tree, too costly for every readback. The heap picked at boot lives in [heap+0x28],
-        // [heap+0x30] bytes (flexible memory). sotc (#146): the heaps a world creates (the last
-        // colossus' area, after the ending) grow in 1 MiB pieces over direct memory and share that
-        // +0x28 pointer, so readbacks into them were never guarded and the ending still crashed
-        // in their free lists (eboot+0x49500): their range comes from their own guard's free
-        // blocks, refreshed every 2 s while their free tree changes, and after 250 ms already when
-        // a readback lands outside the range (a piece the heap may have added since).
+        // Guard every BPE heap across both its initial flexible region and all 1 MiB direct-memory
+        // pieces (both the boot heap h == 0 and world heaps grow in 1 MiB pieces via +0xb8/+0x58).
+        const u64 heap_total = heap_word(heap + 0x30);
+        if (heap_total < 0x1000000 || heap_total > 0x100000000ULL) {
+            continue;
+        }
+        GuardSlot* known = find_slot(heap);
+        if (!known) {
+            continue;
+        }
+        const bool pieces_ok = pieces_of(*known);
         VAddr heap_base = heap_word(heap + 0x28);
-        u64 heap_size = heap_word(heap + 0x30);
-        GuardSlot* known = nullptr;
-        if (h != 0) {
-            known = find_slot(heap);
-            if (!known) {
+        u64 heap_size = heap_total;
+        bool touches_heap = false;
+        if (pieces_ok) {
+            for (const auto& item : pending) {
+                if (known->pieces->Overlaps(item.addr, item.addr + item.size)) {
+                    touches_heap = true;
+                    break;
+                }
+            }
+            if (!touches_heap) {
                 continue;
             }
+        } else {
             const auto now = std::chrono::steady_clock::now();
             const auto signature = signature_of(heap);
             const auto outside_extent = [&] {
@@ -1119,65 +1129,42 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
             }
             const auto [lo, hi] = known->guard->IsValid() ? known->guard->FreeExtent()
                                                           : std::pair<VAddr, VAddr>{0, 0};
-            if (hi <= lo) {
+            if (hi > lo) {
+                constexpr u64 Margin = 1ULL << 20; // headers of the used blocks next to the free ones
+                const VAddr ext_base = lo > Margin ? lo - Margin : 0;
+                const VAddr ext_end = hi + Margin;
+                if (h == 0 && heap_size != 0) {
+                    const VAddr init_end = heap_base + heap_size;
+                    heap_base = std::min(heap_base, ext_base);
+                    heap_size = std::max(init_end, ext_end) - heap_base;
+                } else {
+                    heap_base = ext_base;
+                    heap_size = ext_end - ext_base;
+                }
+            } else if (h != 0 || heap_size == 0) {
                 continue;
             }
-            constexpr u64 Margin = 1ULL << 20; // headers of the used blocks next to the free ones
-            heap_base = lo > Margin ? lo - Margin : 0;
-            heap_size = hi - heap_base + Margin;
-            static std::array<VAddr, 16> reported{};
-            if (std::find(reported.begin(), reported.end(), heap) == reported.end()) {
-                if (auto free = std::find(reported.begin(), reported.end(), VAddr{0});
-                    free != reported.end()) {
-                    *free = heap;
-                    std::fprintf(stderr, "SOTC heap guard: heap %#llx guarded in %#llx..%#llx\n",
-                                 static_cast<unsigned long long>(heap),
-                                 static_cast<unsigned long long>(lo),
-                                 static_cast<unsigned long long>(hi));
-                }
+            for (const auto& item : pending) {
+                touches_heap |= item.addr < heap_base + heap_size && heap_base < item.addr + item.size;
+            }
+            if (!touches_heap) {
+                continue;
             }
         }
-        bool touches_heap = false;
-        for (const auto& item : pending) {
-            touches_heap |= item.addr < heap_base + heap_size && heap_base < item.addr + item.size;
-        }
-        if (!touches_heap) {
-            continue;
-        }
-        GuardSlot* slot = known;
-        if (slot) {
-            if (!slot->used) {
-                slot->used.emplace(memory);
-            }
-            active[active_count++] = {slot, heap_base, heap_size, false, pieces_of(*slot)};
-            continue;
-        }
-        for (auto& candidate : slots) {
-            if (candidate.heap == heap) {
-                slot = &candidate;
-                break;
+        static std::array<VAddr, 16> reported{};
+        if (std::find(reported.begin(), reported.end(), heap) == reported.end()) {
+            if (auto free = std::find(reported.begin(), reported.end(), VAddr{0});
+                free != reported.end()) {
+                *free = heap;
+                std::fprintf(stderr, "SOTC heap guard: heap %#llx guarded%s\n",
+                             static_cast<unsigned long long>(heap),
+                             pieces_ok ? " (pieces)" : " (extent)");
             }
         }
-        if (!slot) {
-            for (auto& candidate : slots) {  // a free slot, else one of a heap not seen now
-                if (candidate.heap == 0 ||
-                    std::find(heaps.begin(), heaps.begin() + heap_count, candidate.heap) ==
-                        heaps.begin() + heap_count) {
-                    slot = &candidate;
-                    slot->heap = heap;
-                    slot->guard.reset();
-                    slot->used.reset();
-                    break;
-                }
-            }
+        if (!known->used) {
+            known->used.emplace(memory);
         }
-        if (!slot) {
-            continue;
-        }
-        if (!slot->used) {
-            slot->used.emplace(memory);
-        }
-        active[active_count++] = {slot, heap_base, heap_size, false, pieces_of(*slot)};
+        active[active_count++] = {known, heap_base, heap_size, false, pieces_ok};
     }
     // The heap's guard, built again when its free tree changed (signature) since the last build
     const auto guard_of = [&](Active& a) -> BpeHeapGuard* {
@@ -1202,7 +1189,11 @@ void BufferCache::ApplyDownloads(std::span<const ReadbackItem> pending, const u8
     }
     const auto active_for = [&](VAddr addr, u64 size) -> Active* {
         for (size_t a = 0; a < active_count; ++a) {
-            if (addr < active[a].base + active[a].size && active[a].base < addr + size) {
+            if (active[a].pieces) {
+                if (active[a].slot->pieces->Overlaps(addr, addr + size)) {
+                    return &active[a];
+                }
+            } else if (addr < active[a].base + active[a].size && active[a].base < addr + size) {
                 return &active[a];
             }
         }

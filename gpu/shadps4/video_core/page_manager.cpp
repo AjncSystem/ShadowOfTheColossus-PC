@@ -943,7 +943,7 @@ struct SignalImpl : public PageManager::Impl {
         if (!Common::IsWriteError(context) && RepairOutOfStepRead(addr)) {
             return true;
         }
-        if (!Common::IsWriteError(context) && !is_gpu_thread && TryCleanGuestLoad(context)) {
+        if (!Common::IsWriteError(context) && !is_gpu_thread && TryCleanGuestLoad(context, addr)) {
             return true;
         }
         if (!Common::IsWriteError(context) && is_gpu_thread && TryCleanWalkerLoad(context)) {
@@ -1079,7 +1079,7 @@ struct SignalImpl : public PageManager::Impl {
         return true;
     }
 
-    static bool TryCleanGuestLoad(void* context) {
+    static bool TryCleanGuestLoad(void* context, VAddr fault_addr) {
 #ifdef _WIN32
         static const bool enabled = [] {
             const char* v = std::getenv("SOTC_CLEAN_GUEST_READS");
@@ -1121,6 +1121,9 @@ struct SignalImpl : public PageManager::Impl {
                 return false;
             }
             address += *index * mem.scale;
+        }
+        if (address != fault_addr) {
+            return false;
         }
         bool stale = false;
         if (rasterizer->GetBufferCache().IsRangeGpuWrittenLocked(address, size)) {

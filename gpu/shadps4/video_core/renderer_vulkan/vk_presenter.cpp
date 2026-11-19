@@ -110,6 +110,49 @@ static void RefreshHdrLevels(HostPasses::PostProcessingPass::Settings& s) {
     // At 10000 the EETF does nothing; 0 skips it in the shader.
     s.hdr_peak = peak >= 10000.0f ? 0.0f : std::max(peak, s.hdr_white);
     s.ui_white = live_ui >= 0.0f ? live_ui : start.ui;
+
+    // Picture controls: launcher key, env, neutral at start; the F1 menu's while playing. Menu
+    // units (sotc_live.h) map to the shader's: 50 is neutral, each side up to a power of 2^±0.5
+    // (contrast, shadows, highlights) or 0..2x (saturation).
+    struct Grade {
+        const char* key;
+        const char* env;
+        float neutral, lo, hi;
+    };
+    static constexpr Grade kGrades[SotcLive::kGradeCount] = {
+        {"hdr_exposure", "SOTC_HDR_EXPOSURE", 0.0f, -3.0f, 3.0f},
+        {"hdr_contrast", "SOTC_HDR_CONTRAST", 50.0f, 0.0f, 100.0f},
+        {"hdr_shadows", "SOTC_HDR_SHADOWS", 50.0f, 0.0f, 100.0f},
+        {"hdr_highlights", "SOTC_HDR_HIGHLIGHTS", 50.0f, 0.0f, 100.0f},
+        {"hdr_saturation", "SOTC_HDR_SATURATION", 50.0f, 0.0f, 100.0f},
+        {"hdr_blowout", "SOTC_HDR_BLOWOUT", 0.0f, 0.0f, 100.0f},
+    };
+    static const std::array<float, SotcLive::kGradeCount> grade_start = [] {
+        std::array<float, SotcLive::kGradeCount> g{};
+        for (int i = 0; i < SotcLive::kGradeCount; ++i) {
+            const Grade& d = kGrades[i];
+            g[i] = std::clamp(HdrLevel(d.key, d.env, d.neutral), d.lo, d.hi);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "SOTC HDR picture: exposure {} EV, contrast {}, shadows {}, highlights {}, "
+                 "saturation {}, highlight saturation loss {}",
+                 g[0], g[1], g[2], g[3], g[4], g[5]);
+        return g;
+    }();
+    float g[SotcLive::kGradeCount];
+    for (int i = 0; i < SotcLive::kGradeCount; ++i) {
+        const float live = SotcLive::hdr_grade[i].load(std::memory_order_relaxed);
+        g[i] = live > SotcLive::kGradeUnset
+                   ? std::clamp(live, kGrades[i].lo, kGrades[i].hi)
+                   : grade_start[size_t(i)];
+    }
+    const auto power = [](float v) { return v == 50.0f ? 1.0f : std::exp2((v - 50.0f) / 100.0f); };
+    s.exposure = g[SotcLive::kExposure] == 0.0f ? 1.0f : std::exp2(g[SotcLive::kExposure]);
+    s.contrast = power(g[SotcLive::kContrast]);
+    s.shadows = 1.0f / power(g[SotcLive::kShadows]); // more shadows: a power below 1 lifts them
+    s.highlights = power(g[SotcLive::kHighlights]);
+    s.saturation = g[SotcLive::kSaturation] / 50.0f;
+    s.blowout = g[SotcLive::kBlowout] / 100.0f;
 }
 
 bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format format) {
@@ -589,6 +632,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
     fsr_pass_hudless.Create(device, instance.GetAllocator(), num_images);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
+    pp_pass.CreateKey(instance); // sotc: the scene key for the HDR picture controls
     if (swapchain.GetHDR() && EmulatorSettings.IsSdrToHdr()) {
         // sotc: SOTC_HDR_PAPER (nits of SDR white, default 200) and SOTC_HDR_GAIN (extra
         // brightness of the highlights, 1 = none, default 1.5).
@@ -973,6 +1017,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         pp_settings.ui_sharpen = upscaled.ui_full ? 0.0f : ui_sharpen; // sotc: drawn at this size
         pp_settings.hdr_curve = Dlssg::HdrCurve();
         pp_settings.sky_sharpen = sky_sharpen;
+        if (pp_settings.hdr == 1) { // sotc: the picture controls' pivot (the HUD-less pass reuses it)
+            pp_pass.MeasureKey(cmdbuf, scene, false, pp_settings.hdr_curve);
+        }
         pp_pass.Render(cmdbuf, scene, scene_size, *frame, pp_settings, upscaled.ui, upscaled.sky);
         upscaled_scene = upscaled.scene_low ? vk::ImageView{} : scene;
     } else {
@@ -1001,6 +1048,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
         pp_settings.ui = 0;
         pp_settings.vignette = {};
+        if (pp_settings.hdr == 1) { // sotc: the picture controls' pivot (the HUD-less pass reuses it)
+            pp_pass.MeasureKey(cmdbuf, image_view, true, 1.0f);
+        }
         pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
     }
 

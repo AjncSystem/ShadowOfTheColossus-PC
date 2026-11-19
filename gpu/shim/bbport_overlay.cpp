@@ -754,10 +754,22 @@ void BuildItems() {
             const char* sdr_to_hdr = std::getenv("SOTC_HDR"); // the SDR expansion, not the game's
             return v && v[0] == '1' && !(sdr_to_hdr && sdr_to_hdr[0] == '1');
         };
+        // A level as the launcher keeps it: whole numbers as before ("200"), else one decimal.
+        const auto LevelText = [](float v) {
+            char buf[32];
+            if (v == std::floor(v)) {
+                std::snprintf(buf, sizeof(buf), "%d", int(v));
+            } else {
+                std::snprintf(buf, sizeof(buf), "%.1f", v);
+            }
+            return std::string(buf);
+        };
         // Choices in nits; `extra` is a first choice with its own label (auto / same / off).
+        // The live value below `unset_below` means "the one read at start".
         const auto add_level = [&](const char* label, const char* help, const char* key,
                                    std::atomic<float>& live, const char* env, float fallback,
-                                   std::vector<std::pair<float, std::string>> choices) -> MenuItem& {
+                                   std::vector<std::pair<float, std::string>> choices,
+                                   float unset_below = 0.0f) -> MenuItem& {
             std::vector<MenuChoice> labels;
             std::vector<float> values;
             for (auto& [v, name] : choices) {
@@ -766,9 +778,9 @@ void BuildItems() {
             }
             const std::string k = key, e = env;
             MenuItem& level = AddLive(kTabDisplay, label, help, std::move(labels),
-                    [&live, values, k, e, fallback] {
+                    [&live, values, k, e, fallback, unset_below] {
                         float now = live.load(std::memory_order_relaxed);
-                        if (now < 0.0f) {
+                        if (now < unset_below) {
                             std::string v = LoadLauncherSetting(k.c_str());
                             if (v.empty()) {
                                 const char* ev = std::getenv(e.c_str());
@@ -788,10 +800,10 @@ void BuildItems() {
                         }
                         return best;
                     },
-                    [&live, values, k](int i) { // PickChoice logs the change
+                    [&live, values, k, LevelText](int i) { // PickChoice logs the change
                         const float v = values[size_t(i)];
                         live.store(v, std::memory_order_relaxed);
-                        SaveLauncherSetting(k.c_str(), std::to_string(int(v)));
+                        SaveLauncherSetting(k.c_str(), LevelText(v));
                     });
             level.shown = hdr_on;
             return level;
@@ -827,6 +839,86 @@ void BuildItems() {
                     "The brightness of menus, subtitles and HUD in nits, apart from the world. Drag the bar or use ◀ ▶. DLSS only (the UI is a separate layer there)."),
                   "hdr_ui", SotcLive::hdr_ui, "SOTC_HDR_UI", 0.0f, uis)
             .slider = true;
+
+        // Picture controls (sotc_live.h hdr_grade): neutral by default, on the world only.
+        constexpr float kUnsetBelow = SotcLive::kGradeUnset + 1.0f;
+        std::vector<std::pair<float, std::string>> evs;
+        for (int t = -30; t <= 30; ++t) {
+            char buf[24];
+            std::snprintf(buf, sizeof(buf), "%+.1f EV", t / 10.0f);
+            evs.push_back({t / 10.0f, t == 0 ? std::string("0 EV") : std::string(buf)});
+        }
+        const auto percents = [] {
+            std::vector<std::pair<float, std::string>> v;
+            for (int p = 0; p <= 100; p += 2) {
+                v.push_back({float(p), std::to_string(p)});
+            }
+            return v;
+        };
+        add_level(L("HDR: exposição", "HDR: exposure"),
+                  L("Clareia ou escurece o mundo inteiro, em pontos de exposição. 0 é o original.",
+                    "Brightens or darkens the whole world, in stops. 0 is the original."),
+                  "hdr_exposure", SotcLive::hdr_grade[SotcLive::kExposure], "SOTC_HDR_EXPOSURE",
+                  0.0f, evs, kUnsetBelow)
+            .slider = true;
+        add_level(L("HDR: realces", "HDR: highlights"),
+                  L("O brilho das partes claras (céu, sol, água). 50 é o original.",
+                    "The brightness of the bright parts (sky, sun, water). 50 is the original."),
+                  "hdr_highlights", SotcLive::hdr_grade[SotcLive::kHighlights],
+                  "SOTC_HDR_HIGHLIGHTS", 50.0f, percents(), kUnsetBelow)
+            .slider = true;
+        add_level(L("HDR: sombras", "HDR: shadows"),
+                  L("Clareia (acima de 50) ou aprofunda (abaixo) as partes escuras. 50 é o original.",
+                    "Lifts (above 50) or deepens (below) the dark parts. 50 is the original."),
+                  "hdr_shadows", SotcLive::hdr_grade[SotcLive::kShadows], "SOTC_HDR_SHADOWS",
+                  50.0f, percents(), kUnsetBelow)
+            .slider = true;
+        add_level(L("HDR: contraste", "HDR: contrast"),
+                  L("A diferença entre claro e escuro, em volta do cinza médio. 50 é o original.",
+                    "The difference between light and dark, around mid grey. 50 is the original."),
+                  "hdr_contrast", SotcLive::hdr_grade[SotcLive::kContrast], "SOTC_HDR_CONTRAST",
+                  50.0f, percents(), kUnsetBelow)
+            .slider = true;
+        add_level(L("HDR: saturação", "HDR: saturation"),
+                  L("A força das cores. 50 é o original; 0 é preto e branco.",
+                    "Colour strength. 50 is the original; 0 is black and white."),
+                  "hdr_saturation", SotcLive::hdr_grade[SotcLive::kSaturation],
+                  "SOTC_HDR_SATURATION", 50.0f, percents(), kUnsetBelow)
+            .slider = true;
+        add_level(L("HDR: desbotar realces", "HDR: highlight desaturation"),
+                  L("Os realces mais fortes perdem a cor e vão para o branco perto do pico da tela. 0 é o original.",
+                    "The strongest highlights lose their colour and go to white near the display's peak. 0 is the original."),
+                  "hdr_blowout", SotcLive::hdr_grade[SotcLive::kBlowout], "SOTC_HDR_BLOWOUT",
+                  0.0f, percents(), kUnsetBelow)
+            .slider = true;
+        MenuItem& reset = AddLive(
+            kTabDisplay, L("HDR: restaurar imagem", "HDR: reset picture"),
+            L("Volta exposição, realces, sombras, contraste, saturação e desbotar ao original.",
+              "Puts exposure, highlights, shadows, contrast, saturation and highlight desaturation back to the original."),
+            {{L("Executar", "Run"), "0"}}, [] { return -1; },
+            [](int) {
+                struct Neutral {
+                    SotcLive::HdrGrade id;
+                    const char* key;
+                    float value;
+                };
+                static constexpr Neutral kNeutral[] = {
+                    {SotcLive::kExposure, "hdr_exposure", 0.0f},
+                    {SotcLive::kContrast, "hdr_contrast", 50.0f},
+                    {SotcLive::kShadows, "hdr_shadows", 50.0f},
+                    {SotcLive::kHighlights, "hdr_highlights", 50.0f},
+                    {SotcLive::kSaturation, "hdr_saturation", 50.0f},
+                    {SotcLive::kBlowout, "hdr_blowout", 0.0f},
+                };
+                for (const Neutral& n : kNeutral) {
+                    SotcLive::hdr_grade[n.id].store(n.value, std::memory_order_relaxed);
+                    SaveLauncherSetting(n.key, std::to_string(int(n.value)));
+                }
+                toast_text = L("Imagem HDR restaurada", "HDR picture reset");
+                toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
+            });
+        reset.action = true;
+        reset.shown = hdr_on;
     }
     AddRestart(kTabDisplay, "af16", L("Filtro de texturas 16x", "16x texture filtering"),
                L("Texturas nítidas no chão visto de lado (filtro anisotrópico 16x).",

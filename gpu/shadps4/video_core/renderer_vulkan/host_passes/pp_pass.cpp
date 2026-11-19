@@ -7,16 +7,21 @@
 #include "core/emulator_settings.h"
 #include "video_core/host_shaders/fs_tri_vert.h"
 #include "video_core/host_shaders/post_process_frag.h"
+#include "video_core/host_shaders/pp_key_comp.h"
+#include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
+
+#include <algorithm>
+#include <cmath>
 
 #include <boost/container/static_vector.hpp>
 
 namespace Vulkan::HostPasses {
 
 void PostProcessingPass::Create(vk::Device device, const vk::Format surface_format) {
-    boost::container::static_vector<vk::DescriptorSetLayoutBinding, 3> bindings{
+    boost::container::static_vector<vk::DescriptorSetLayoutBinding, 4> bindings{
         {
             .binding = 0,
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
@@ -32,6 +37,13 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
         {
             .binding = 2,
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eFragment,
+        },
+        {
+            // sotc: the scene key (pp_key.comp)
+            .binding = 3,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
             .descriptorCount = 1,
             .stageFlags = vk::ShaderStageFlagBits::eFragment,
         },
@@ -246,6 +258,13 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         settings.sky_sharpen = 0.0f;
     }
 
+    ASSERT_MSG(key_buffer, "pp pass: CreateKey not called");
+    const vk::DescriptorBufferInfo key_info{
+        .buffer = key_buffer->Handle(),
+        .offset = 0,
+        .range = 16,
+    };
+
     const std::array set_writes{
         vk::WriteDescriptorSet{
             .dstSet = VK_NULL_HANDLE,
@@ -270,6 +289,14 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
             .descriptorCount = 1,
             .descriptorType = vk::DescriptorType::eCombinedImageSampler,
             .pImageInfo = &sky_info,
+        },
+        vk::WriteDescriptorSet{
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 3,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &key_info,
         },
     };
 
@@ -319,6 +346,138 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
     if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.endDebugUtilsLabelEXT();
     }
+}
+
+// sotc: the scene key for the HDR picture controls (pp_key.comp, post_process.frag grade()).
+void PostProcessingPass::CreateKey(const Instance& instance) {
+    const vk::Device device = instance.GetDevice();
+    key_buffer = std::make_unique<VideoCore::Buffer>(instance, 0, 16,
+                                                     VideoCore::MemoryType::DeviceLocal,
+                                                     "pp scene key");
+    const std::array bindings{
+        vk::DescriptorSetLayoutBinding{
+            .binding = 0,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+        vk::DescriptorSetLayoutBinding{
+            .binding = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+    };
+    key_set_layout = Check<"create pp key descriptor set layout">(
+        device.createDescriptorSetLayoutUnique(vk::DescriptorSetLayoutCreateInfo{
+            .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+            .bindingCount = static_cast<u32>(bindings.size()),
+            .pBindings = bindings.data(),
+        }));
+    const vk::PushConstantRange range{
+        .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        .offset = 0,
+        .size = 16,
+    };
+    key_layout = Check<"create pp key pipeline layout">(
+        device.createPipelineLayoutUnique(vk::PipelineLayoutCreateInfo{
+            .setLayoutCount = 1,
+            .pSetLayouts = &*key_set_layout,
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = &range,
+        }));
+    const auto module = CompileSPV(PP_KEY_COMP, device);
+    ASSERT(module);
+    SetObjectName(device, module, "pp_key.comp");
+    key_pipeline = Check<"create pp key pipeline">(device.createComputePipelineUnique(
+        {}, vk::ComputePipelineCreateInfo{
+                .stage =
+                    {
+                        .stage = vk::ShaderStageFlagBits::eCompute,
+                        .module = module,
+                        .pName = "main",
+                    },
+                .layout = *key_layout,
+            }));
+    device.destroyShaderModule(module);
+}
+
+void PostProcessingPass::MeasureKey(vk::CommandBuffer cmdbuf, vk::ImageView input, bool pq,
+                                    float curve) {
+    if (!key_buffer || !key_pipeline) {
+        return;
+    }
+    // Smoothed like an eye adapting: about half a second to follow a change of scene, so the
+    // pivot does not jump with a flash or a camera cut.
+    const auto now = std::chrono::steady_clock::now();
+    float alpha = 1.0f;
+    if (key_measured) {
+        const float dt = std::chrono::duration<float>(now - key_last).count();
+        alpha = 1.0f - std::exp(-std::clamp(dt, 0.0f, 1.0f) / 0.5f);
+    }
+    key_last = now;
+    key_measured = true;
+
+    // The input was written by the game, DLSS or FSR; the key was read by the last frame's pass.
+    const vk::MemoryBarrier2 before{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderSampledRead |
+                         vk::AccessFlagBits2::eShaderStorageRead |
+                         vk::AccessFlagBits2::eShaderStorageWrite,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &before,
+    });
+
+    const vk::DescriptorImageInfo image_info{
+        .sampler = *sampler,
+        .imageView = input,
+        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
+    };
+    const vk::DescriptorBufferInfo key_info{
+        .buffer = key_buffer->Handle(),
+        .offset = 0,
+        .range = 16,
+    };
+    const std::array writes{
+        vk::WriteDescriptorSet{
+            .dstBinding = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+            .pImageInfo = &image_info,
+        },
+        vk::WriteDescriptorSet{
+            .dstBinding = 1,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &key_info,
+        },
+    };
+    struct {
+        u32 mode;
+        float curve;
+        float alpha;
+        float pad;
+    } params{pq ? 1u : 0u, curve, alpha, 0.0f};
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *key_pipeline);
+    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *key_layout, 0, writes);
+    cmdbuf.pushConstants(*key_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params),
+                         &params);
+    cmdbuf.dispatch(1, 1, 1);
+
+    const vk::MemoryBarrier2 after{
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderStorageWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+        .dstAccessMask = vk::AccessFlagBits2::eShaderStorageRead,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &after,
+    });
 }
 
 } // namespace Vulkan::HostPasses

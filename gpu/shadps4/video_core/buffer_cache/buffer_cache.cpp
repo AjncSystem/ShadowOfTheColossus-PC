@@ -3245,13 +3245,18 @@ bool BufferCache::FinishEviction(std::chrono::steady_clock::time_point now, u16 
         }();
         pending.compare = std::make_unique<EvictCompare>();
         if (async_compare && !wait) {
-            pending.compare->thread =
-                std::thread([this, chosen = pending.chosen, mapped = read_back.mapped,
-                             compare = pending.compare.get()] {
-                    Common::SetCurrentThreadName("bb:EvictCompare");
-                    CompareEviction(chosen, mapped, *compare);
-                });
-            return false;
+            // sotc: if the thread cannot be created (Windows out of commit) the comparison runs
+            // here, as with SOTC_EVICT_COMPARE_ASYNC=0.
+            try {
+                pending.compare->thread =
+                    std::thread([this, chosen = pending.chosen, mapped = read_back.mapped,
+                                 compare = pending.compare.get()] {
+                        Common::SetCurrentThreadName("bb:EvictCompare");
+                        CompareEviction(chosen, mapped, *compare);
+                    });
+                return false;
+            } catch (const std::system_error&) {
+            }
         }
         CompareEviction(pending.chosen, read_back.mapped, *pending.compare);
     }

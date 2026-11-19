@@ -558,6 +558,99 @@ static int thread_times_snapshot(ThreadTimeRow *rows, int max) {
     CloseHandle(snapshot);
     return n;
 }
+/* sotc: SOTC_PIN (default: on for CPUs with SMT and 6 or more cores; SOTC_PIN=0 off, =1 forces).
+ * The port's three heavy GPU threads (draw, command processor, recorder; each 55-80% of a core)
+ * share physical cores with the game's four busy job workers and the rest, and a thread on a busy
+ * SMT sibling runs far slower. Each of the three gets a physical core of its own (cores 1, 2, 3:
+ * core 0 takes the OS interrupts), the other thread of those cores stays empty, and every other
+ * thread of the process is kept on the remaining cores. On a Ryzen 5 5600X (Shrine of Worship,
+ * 5880 draws/frame, no frame generation) this is 59 -> 65 FPS; leaving the siblings open to other
+ * threads gives only 60.7. Re-applied every 2 s because threads come and go. */
+static DWORD WINAPI thread_placement(void *unused) {
+    (void)unused;
+    typedef HRESULT (WINAPI *Describe)(HANDLE, PWSTR *);
+    Describe describe=(Describe)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"),"GetThreadDescription");
+    const char *mode=getenv("SOTC_PIN");
+    if (!describe || (mode && mode[0]=='0')) return 0;
+    DWORD length=0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore,NULL,&length);
+    if (!length) return 0;
+    uint8_t *buffer=malloc(length);
+    if (!buffer || !GetLogicalProcessorInformationEx(RelationProcessorCore,(PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)buffer,&length)) { free(buffer); return 0; }
+    DWORD_PTR cores[64]; int core_count=0, smt=1;
+    for (DWORD at=0; at<length && core_count<64;) {
+        const PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX row=(PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)(buffer+at);
+        if (row->Relationship==RelationProcessorCore && row->Processor.GroupCount>=1 && row->Processor.GroupMask[0].Group==0) {
+            const DWORD_PTR mask=row->Processor.GroupMask[0].Mask;
+            if (__builtin_popcountll((unsigned long long)mask)<2) smt=0;
+            cores[core_count++]=mask;
+        }
+        at+=row->Size;
+    }
+    free(buffer);
+    DWORD_PTR process_mask=0, system_mask=0;
+    GetProcessAffinityMask(GetCurrentProcess(),&process_mask,&system_mask);
+    const int forced=mode && mode[0]=='1';
+    if (core_count<4 || (!forced && (!smt || core_count<6))) return 0;
+    /* One logical processor (the lowest) of cores 1-3 per heavy thread; the whole of those cores is
+     * closed to every other thread. */
+    DWORD_PTR pinned[3], closed=0;
+    for (int i=0;i<3;++i) {
+        pinned[i]=cores[i+1] & (~cores[i+1]+1);
+        closed|=cores[i+1];
+    }
+    const DWORD_PTR others=process_mask & ~closed;
+    if (!others) return 0;
+    static const wchar_t *wanted[3]={L"GpuDraw",L"GpuCommandProcessor",L"GpuRecorder"};
+    int told=0;
+    const int priority=getenv("SOTC_PIN_PRIO") ? atoi(getenv("SOTC_PIN_PRIO")) : 0;
+    /* Loading screens (no frames) use every thread at once (texture decompression, file reads,
+     * shader work): with the placement on, the first load took 6.6 s instead of 3.8 s and a
+     * new area about 8 s longer. So it only holds while the game shows 25 frames a second or more. */
+    uint64_t flips_before=bbgpu_flip_count();
+    ULONGLONG time_before=GetTickCount64();
+    int placed_mode=-1;
+    for (;;) {
+        Sleep(told ? 1000 : 2000);
+        const uint64_t flips_now=bbgpu_flip_count();
+        const ULONGLONG time_now=GetTickCount64();
+        const double fps=(double)(flips_now-flips_before)*1000.0/(double)(time_now>time_before ? time_now-time_before : 1);
+        flips_before=flips_now; time_before=time_now;
+        const int playing=fps>=25.0;
+        if (playing==placed_mode && playing==0) continue; /* already released */
+        placed_mode=playing;
+        HANDLE snapshot=CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD,0);
+        if (snapshot==INVALID_HANDLE_VALUE) continue;
+        THREADENTRY32 te={.dwSize=sizeof(te)};
+        int placed=0;
+        for (BOOL ok=Thread32First(snapshot,&te); ok; ok=Thread32Next(snapshot,&te)) {
+            if (te.th32OwnerProcessID!=GetCurrentProcessId() || te.th32ThreadID==GetCurrentThreadId()) continue;
+            HANDLE t=OpenThread(THREAD_QUERY_LIMITED_INFORMATION|THREAD_SET_INFORMATION,FALSE,te.th32ThreadID);
+            if (!t) continue;
+            DWORD_PTR mask=playing ? others : process_mask;
+            PWSTR text=NULL;
+            if (SUCCEEDED(describe(t,&text)) && text) {
+                for (int i=0;i<3;++i) if (wcsstr(text,wanted[i])) {
+                    if (playing) mask=pinned[i];
+                    ++placed;
+                    if (priority && playing) SetThreadPriority(t,THREAD_PRIORITY_HIGHEST);
+                }
+                if (priority>=2 && wcsstr(text,L"BPE JobWorker")) SetThreadPriority(t,THREAD_PRIORITY_BELOW_NORMAL);
+                LocalFree(text);
+            }
+            SetThreadAffinityMask(t,mask);
+            CloseHandle(t);
+        }
+        CloseHandle(snapshot);
+        if (!told && playing && placed==3) {
+            told=1;
+            fprintf(stderr,"Runtime: thread placement: GPU draw / command processor / recorder on logical CPUs %d, %d, %d (own cores); the rest on mask 0x%llx\n",
+                    __builtin_ctzll((unsigned long long)pinned[0]),__builtin_ctzll((unsigned long long)pinned[1]),
+                    __builtin_ctzll((unsigned long long)pinned[2]),(unsigned long long)others);
+        }
+    }
+    return 0;
+}
 static DWORD WINAPI thread_times(void *unused) {
     (void)unused;
     const char *delay=getenv("SOTC_PROFILE_DELAY"), *seconds=getenv("SOTC_PROFILE_SECONDS");
@@ -1542,6 +1635,12 @@ static LONG vectored_fault_impl(EXCEPTION_POINTERS *info) {
             else if (c->Rax==0 && at==0x144c60) resume=0x144c71;
             else if (c->Rax==0 && at==0x14934f) resume=0x149360;
             else if (c->R14==0 && at==0x14cce7) resume=0x14ced6;
+            /* 0x499cc: the allocator (0x49960..0x49a00) unlinking a heap block from its size list
+             * found the block's list links already zero (rax = rcx = 0: freed twice, or its memory
+             * cleared); 19 Nov, right after a 0x564d24 skip, saving the profile. Treated as "not
+             * in the list": skip both link writes and the count decrement (0x499e0 clears the
+             * block's fields as the normal path does). */
+            else if (c->Rax==0 && c->Rcx==0 && at==0x499cc) resume=0x499e0;
         }
         if (resume) {
             c->Rip=(DWORD64)(uintptr_t)(image+resume);
@@ -2009,6 +2108,7 @@ int main(int argc, char **argv) {
         CreateThread(NULL,0,strcmp(getenv("SOTC_PROFILE"),"*") ? profiler : profiler_all,
                      (void *)getenv("SOTC_PROFILE"),0,NULL);
     if (getenv("SOTC_THREAD_TIMES")) CreateThread(NULL,0,thread_times,NULL,0,NULL);
+    CloseHandle(CreateThread(NULL,0,thread_placement,NULL,0,NULL));
     SetUnhandledExceptionFilter(unhandled_fault);
     if (getenv("BB_STRICT_HANDLES")) {
         PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY strict={0};

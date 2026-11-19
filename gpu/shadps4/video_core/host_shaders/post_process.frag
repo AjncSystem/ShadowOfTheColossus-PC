@@ -26,6 +26,8 @@ layout (push_constant) uniform settings {
     float hdr_curve; // sotc: exponent of the game's HDR composite
     float paper_white; // sotc: hdr 2: nits of SDR white
     float highlight_gain; // sotc: hdr 2: gain of the highlights
+    float hdr_peak; // sotc: hdr 1: the display's peak in nits (0: no roll-off)
+    float ui_white; // sotc: hdr 1 with the UI layer: nits of the UI's white (0: hdr_white)
 } pp;
 
 // sotc: linear Rec.709 -> HDR10 (Rec.2020 primaries, ST 2084 PQ) for an SDR game. SDR white sits at
@@ -81,6 +83,40 @@ vec3 pqEncode(vec3 nits) {
     return pow((c1 + c2 * y) / (1.0 + c3 * y), vec3(m2));
 }
 const mat3 rec709to2020 = mat3(0.6274, 0.0691, 0.0164, 0.3293, 0.9195, 0.0880, 0.0433, 0.0114, 0.8956);
+
+// sotc: BT.2390 EETF on the brightest channel: the scene, scaled to the paper white, goes up to
+// 10000 nits and used to clip at the display's peak (blown-out sun, sky and water). Below the
+// knee (about half the peak in PQ) nothing changes; above it the highlights roll off smoothly into
+// hdr_peak. The RGB ratio is kept, so hues do not shift as they brighten.
+float pqEncode1(float nits) {
+    const float y = pow(clamp(nits / 10000.0, 0.0, 1.0), m1);
+    return pow((c1 + c2 * y) / (1.0 + c3 * y), m2);
+}
+float pqDecode1(float e) {
+    const float p = pow(clamp(e, 0.0, 1.0), 1.0 / m2);
+    return 10000.0 * pow(max(p - c1, 0.0) / (c2 - c3 * p), 1.0 / m1);
+}
+vec3 rollOff(vec3 nits) {
+    nits = max(nits, vec3(0.0));
+    if (pp.hdr_peak <= 0.0) {
+        return nits;
+    }
+    const float m = max(nits.r, max(nits.g, nits.b));
+    if (m <= 0.0) {
+        return nits;
+    }
+    const float e = pqEncode1(m);
+    const float max_lum = pqEncode1(pp.hdr_peak);
+    const float ks = 1.5 * max_lum - 0.5;
+    if (e <= ks) {
+        return nits;
+    }
+    const float t = (e - ks) / (1.0 - ks);
+    const float t2 = t * t, t3 = t2 * t;
+    const float e2 = (2.0 * t3 - 3.0 * t2 + 1.0) * ks + (t3 - 2.0 * t2 + t) * (1.0 - ks) +
+                     (-2.0 * t3 + 3.0 * t2) * max_lum;
+    return nits * (min(pqDecode1(e2), pp.hdr_peak) / m);
+}
 
 // sotc: the UI layer is at render size; Catmull-Rom (9 bilinear taps) keeps its text sharper
 // than a bilinear stretch. Clamped: the filter overshoots at hard edges.
@@ -152,8 +188,19 @@ void main() {
         if (pp.hdr == 1u) {
             // The game's HDR composite: UI over scene, ^k (its constant), Rec.2020, PQ with
             // 1.0 at 300 nits; scaled to the paper white like below.
+            // The scene part gets the paper white and the roll-off to the display's peak; the UI
+            // (where its alpha covers the scene) gets its own white, so menus and subtitles can
+            // be dimmer or brighter than the world.
             const vec3 c = abs(color_linear.rgb * (1.0 - ui.a) + ui.rgb);
-            const vec3 nits = 3.0 * pp.hdr_white * (rec709to2020 * pow(c, vec3(pp.hdr_curve)));
+            const vec3 lin = rec709to2020 * pow(c, vec3(pp.hdr_curve));
+            const vec3 scene_nits = rollOff(3.0 * pp.hdr_white * lin);
+            const float ui_white = pp.ui_white > 0.0 ? pp.ui_white : pp.hdr_white;
+            vec3 nits = scene_nits;
+            if (ui.a > 0.0) {
+                vec3 ui_nits = 3.0 * ui_white * lin;
+                if (pp.hdr_peak > 0.0) ui_nits = min(ui_nits, vec3(pp.hdr_peak));
+                nits = mix(scene_nits, ui_nits, clamp(ui.a, 0.0, 1.0));
+            }
             color = vec4(pqEncode(nits), 1.0);
             return;
         }
@@ -161,8 +208,9 @@ void main() {
     }
     if (pp.hdr == 1u) {
         // The game's own BT.2020 PQ output has its white at about 100 nits, too dim next to
-        // the desktop; scaled to the paper white.
-        color = vec4(pqEncode(pqDecode(color_linear.rgb) * (pp.hdr_white / 100.0)),
+        // the desktop; scaled to the paper white, highlights rolled off into the display's peak.
+        // (The UI is already in this picture here, so it follows the paper white.)
+        color = vec4(pqEncode(rollOff(pqDecode(color_linear.rgb) * (pp.hdr_white / 100.0))),
                      color_linear.a);
     } else if (pp.hdr == 2u) {
         if (pp.srgb_input) color_linear.rgb = degamma(color_linear.rgb);

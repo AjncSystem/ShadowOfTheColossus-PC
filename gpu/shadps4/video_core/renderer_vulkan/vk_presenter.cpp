@@ -23,6 +23,7 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/sotc_display_peak.h"
 #include "video_core/sotc_live.h"
 #include "video_core/texture_cache/image.h"
 #include "bbport_overlay.h"
@@ -56,6 +57,60 @@ namespace Vulkan {
 // sotc: serializes vkQueuePresentKHR (both present sites) on the dedicated present queue; with a
 // shared queue the sites take Scheduler::submit_mutex as well.
 static std::mutex present_queue_mutex;
+
+// sotc: game HDR levels, in nits. At start: the launcher's settings (hdr_white, hdr_peak, hdr_ui,
+// written by the F1 menu), else SOTC_HDR_WHITE / SOTC_HDR_PEAK / SOTC_HDR_UI, else 200 / auto /
+// the paper white. Peak 0 is auto (what Windows reports for the HDR display, 1000 when it reports
+// nothing); 10000 or more turns the roll-off off. While playing the F1 menu's values (sotc_live.h)
+// take their place.
+static float HdrLevel(const char* key, const char* env, float fallback) {
+    std::string v = BbOverlay::LauncherSetting(key);
+    if (v.empty()) {
+        const char* e = std::getenv(env);
+        v = e ? e : "";
+    }
+    if (v.empty()) {
+        return fallback;
+    }
+    if (v == "off") {
+        return 10000.0f;
+    }
+    if (v == "auto") {
+        return 0.0f;
+    }
+    return static_cast<float>(std::atof(v.c_str()));
+}
+
+static void RefreshHdrLevels(HostPasses::PostProcessingPass::Settings& s) {
+    struct Start {
+        float white, peak, ui, auto_peak;
+    };
+    static const Start start = [] {
+        Start st{};
+        st.white = std::clamp(HdrLevel("hdr_white", "SOTC_HDR_WHITE", 200.0f), 40.0f, 1000.0f);
+        st.peak = std::max(HdrLevel("hdr_peak", "SOTC_HDR_PEAK", 0.0f), 0.0f);
+        st.ui = std::max(HdrLevel("hdr_ui", "SOTC_HDR_UI", 0.0f), 0.0f);
+        const float reported = SotcDisplayPeakNits();
+        st.auto_peak = reported >= 200.0f ? reported : 1000.0f;
+        LOG_INFO(Render_Vulkan,
+                 "SOTC HDR: game brightness {} nits, peak {} (display reports {} nits), UI "
+                 "brightness {}",
+                 st.white, st.peak > 0.0f ? std::to_string(st.peak) : std::string("auto"), reported,
+                 st.ui > 0.0f ? std::to_string(st.ui) : std::string("= game brightness"));
+        return st;
+    }();
+    const float live_white = SotcLive::hdr_white.load(std::memory_order_relaxed);
+    const float live_peak = SotcLive::hdr_peak.load(std::memory_order_relaxed);
+    const float live_ui = SotcLive::hdr_ui.load(std::memory_order_relaxed);
+    s.hdr_white = live_white >= 0.0f ? live_white : start.white;
+    float peak = live_peak >= 0.0f ? live_peak : start.peak;
+    if (peak <= 0.0f) {
+        peak = start.auto_peak;
+    }
+    // At 10000 the EETF does nothing; 0 skips it in the shader.
+    s.hdr_peak = peak >= 10000.0f ? 0.0f : std::max(peak, s.hdr_white);
+    s.ui_white = live_ui >= 0.0f ? live_ui : start.ui;
+}
 
 bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format format) {
     const vk::FormatProperties props{physical_device.getFormatProperties(format)};
@@ -840,6 +895,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // to the frame's size; the post process pass puts the UI layer back over it. Frames without
     // that scene (menus, loading screens) are presented as before.
     Dlssg::SetHdr(pp_settings.hdr != 0);
+    if (pp_settings.hdr == 1) {
+        RefreshHdrLevels(pp_settings);
+    }
     auto upscaled = Dlssg::Upscale(frame->id, draw_scheduler, texture_cache, runtime,
                                    frame->width, frame->height);
     // sotc: a buffer flipped again right after itself (PS4 Pro mode at the 30 FPS cap flips each

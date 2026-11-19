@@ -30,6 +30,12 @@ public:
         float hdr_curve = 1.0f; ///< sotc: exponent of the game's HDR composite
         float paper_white = 200.0f; ///< sotc: hdr 2 (SDR game on HDR10): nits of SDR white
         float highlight_gain = 1.5f; ///< sotc: hdr 2: brightness gain of the highlights
+        /// sotc: hdr 1: the display's peak in nits; highlights roll off into it (BT.2390 EETF)
+        /// instead of clipping. 0: no roll-off (as before).
+        float hdr_peak = 0.0f;
+        /// sotc: hdr 1 with the UI layer (DLSS): nits of the UI's white, apart from the scene's
+        /// paper white. 0: the same as hdr_white.
+        float ui_white = 0.0f;
     };
 
     void Create(vk::Device device, vk::Format surface_format);

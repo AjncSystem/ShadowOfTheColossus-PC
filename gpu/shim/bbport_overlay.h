@@ -39,6 +39,10 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
 /// nullptr: none).
 void SetUpscalerLabel(const char* label);
 
+/// sotc: a value from the launcher's settings (SOTC_LAUNCHER_SETTINGS), a string without its
+/// quotes; "" when the file does not have the key. Any thread.
+std::string LauncherSetting(const char* key);
+
 /// The menu is open or a text entry is shown: the game's input is held neutral.
 bool CapturesInput();
 

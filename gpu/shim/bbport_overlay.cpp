@@ -735,6 +735,85 @@ void BuildItems() {
                L("A renderização HDR do próprio jogo (pede um monitor HDR ligado no Windows).",
                  "The game's own HDR rendering (needs an HDR monitor turned on in Windows)."),
                OnOff(), "false");
+    {
+        // sotc: game HDR levels (vk_presenter.cpp RefreshHdrLevels), live and kept in the
+        // launcher's settings. Shown when the game started with its HDR on.
+        const auto hdr_on = [] {
+            const char* v = std::getenv("BB_HDR");
+            const char* sdr_to_hdr = std::getenv("SOTC_HDR"); // the SDR expansion, not the game's
+            return v && v[0] == '1' && !(sdr_to_hdr && sdr_to_hdr[0] == '1');
+        };
+        // Choices in nits; `extra` is a first choice with its own label (auto / same / off).
+        const auto add_level = [&](const char* label, const char* help, const char* key,
+                                   std::atomic<float>& live, const char* env, float fallback,
+                                   std::vector<std::pair<float, std::string>> choices) {
+            std::vector<MenuChoice> labels;
+            std::vector<float> values;
+            for (auto& [v, name] : choices) {
+                labels.push_back({name, std::to_string(labels.size())});
+                values.push_back(v);
+            }
+            const std::string k = key, e = env;
+            AddLive(kTabDisplay, label, help, std::move(labels),
+                    [&live, values, k, e, fallback] {
+                        float now = live.load(std::memory_order_relaxed);
+                        if (now < 0.0f) {
+                            std::string v = LoadLauncherSetting(k.c_str());
+                            if (v.empty()) {
+                                const char* ev = std::getenv(e.c_str());
+                                v = ev ? ev : "";
+                            }
+                            now = v.empty() ? fallback
+                                  : v == "off" ? 10000.0f
+                                  : v == "auto" ? 0.0f
+                                                : static_cast<float>(std::atof(v.c_str()));
+                        }
+                        // The nearest choice (a hand-written value between steps).
+                        int best = 0;
+                        for (size_t i = 1; i < values.size(); ++i) {
+                            if (std::fabs(values[i] - now) < std::fabs(values[size_t(best)] - now)) {
+                                best = int(i);
+                            }
+                        }
+                        return best;
+                    },
+                    [&live, values, k, label](int i) {
+                        const float v = values[size_t(i)];
+                        live.store(v, std::memory_order_relaxed);
+                        SaveLauncherSetting(k.c_str(), std::to_string(int(v)));
+                        SotcEvent::Log("MENU", "%s: %d", label, int(v));
+                    })
+                .shown = hdr_on;
+        };
+        const char* nits = L("nits", "nits");
+        std::vector<std::pair<float, std::string>> whites;
+        for (int v = 80; v <= 400; v += 10) {
+            whites.push_back({float(v), std::to_string(v) + " " + nits});
+        }
+        add_level(L("HDR: brilho do jogo", "HDR: game brightness"),
+                  L("O brilho do mundo: o branco em nits. 200 é o padrão; o jogo puro tem ~100.",
+                    "The world's brightness: its white in nits. 200 is the default; the game itself has ~100."),
+                  "hdr_white", SotcLive::hdr_white, "SOTC_HDR_WHITE", 200.0f, whites);
+        std::vector<std::pair<float, std::string>> peaks{
+            {0.0f, L("Automático (do Windows)", "Auto (from Windows)")}};
+        for (int v = 400; v <= 2000; v += 50) {
+            peaks.push_back({float(v), std::to_string(v) + " " + nits});
+        }
+        peaks.push_back({10000.0f, L("Desligado (cortar)", "Off (clip)")});
+        add_level(L("HDR: pico da tela", "HDR: display peak"),
+                  L("O brilho máximo da tela. Os realces (sol, céu, água) descem suavemente até ele em vez de estourar.",
+                    "Your display's peak brightness. Highlights (sun, sky, water) roll off smoothly into it instead of clipping."),
+                  "hdr_peak", SotcLive::hdr_peak, "SOTC_HDR_PEAK", 0.0f, peaks);
+        std::vector<std::pair<float, std::string>> uis{
+            {0.0f, L("Igual ao brilho do jogo", "Same as game brightness")}};
+        for (int v = 80; v <= 400; v += 10) {
+            uis.push_back({float(v), std::to_string(v) + " " + nits});
+        }
+        add_level(L("HDR: brilho da interface", "HDR: UI brightness"),
+                  L("O branco de menus, legendas e HUD, separado do mundo. Só com DLSS (a interface é uma camada à parte).",
+                    "The white of menus, subtitles and HUD, apart from the world. DLSS only (the UI is a separate layer there)."),
+                  "hdr_ui", SotcLive::hdr_ui, "SOTC_HDR_UI", 0.0f, uis);
+    }
     AddRestart(kTabDisplay, "af16", L("Filtro de texturas 16x", "16x texture filtering"),
                L("Texturas nítidas no chão visto de lado (filtro anisotrópico 16x).",
                  "Sharp textures on the ground seen at an angle (16x anisotropic filtering)."),
@@ -2428,6 +2507,10 @@ bool Visible() {
 
 void SetUpscalerLabel(const char* label) {
     upscaler_label.store(label, std::memory_order_relaxed);
+}
+
+std::string LauncherSetting(const char* key) {
+    return LoadLauncherSetting(key);
 }
 
 bool CapturesInput() {

@@ -27,7 +27,9 @@ namespace Serialization {
 // 39 = the LOD feedback buffer no longer depends on the textures bound when a permutation was
 // translated (resource_patching_pass.cpp).
 // 40/136 = reads of absent lanes folded on 64-wide hosts (AMD GCN; lower_wave64_pass.cpp, #411).
-static const u32 ShaderBinaryVersion = Shader::LodFeedbackEnabled() ? 40u : 136u;
+// 41/137 = ReadConst through v_readfirstlane'd pointer adds flattened, dynamic window 2048 dwords
+// (capsule shadows/AO without DMA; flatten_extended_userdata_pass.cpp).
+static const u32 ShaderBinaryVersion = Shader::LodFeedbackEnabled() ? 41u : 137u;
 static constexpr u32 ShaderMetaVersion = 21u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization

@@ -971,6 +971,19 @@ void SimplifyReadConstAddressAdd(IR::Inst& inst) {
     IR::Inst* addr = inst.Arg(0).Inst();
     IR::Inst* hi = addr->Arg(1).TryInst();
     IR::Inst* lo = addr->Arg(0).TryInst();
+    // sotc: also when each half went through v_readfirstlane (the offset came from a VGPR, e.g. an
+    // LDS read): readfirstlane(base + offset) is base + readfirstlane(offset), the base being
+    // scalar. The capsule shadow/AO pass (cs 0x57bd9f27) reads each occluder's 112-byte record this
+    // way; without DMA (the AMD default) such a ReadConst was left at flattened dword 0, so every
+    // capsule took the low half of the per-frame table pointer as its transform: no capsule
+    // shadows or AO in most frames, and on alternate frames in some boots (flicker near Wander).
+    bool lo_readfirstlane = false;
+    if (lo && lo->GetOpcode() == IR::Opcode::ReadFirstLane && hi &&
+        hi->GetOpcode() == IR::Opcode::ReadFirstLane) {
+        lo = lo->Arg(0).TryInst();
+        hi = hi->Arg(0).TryInst();
+        lo_readfirstlane = true;
+    }
     if (!hi || !lo) {
         return;
     }
@@ -1007,10 +1020,13 @@ void SimplifyReadConstAddressAdd(IR::Inst& inst) {
         ASSERT(user->GetOpcode() == IR::Opcode::ReadConst && operand == 0);
         IR::IREmitter ir{*user->GetParent(), IR::Block::InstructionList::s_iterator_to(*user)};
         IR::U32 offset = IR::U32{user->Arg(1)};
-        IR::U32 dw_add_offset =
-            add_offset.IsImmediate()
-                ? ir.Imm32(add_offset.U32() >> 2u)
-                : IR::U32{ir.ShiftRightLogical(IR::U32{add_offset}, ir.Imm32(2u))};
+        const IR::U32 byte_offset =
+            add_offset.IsImmediate() || !lo_readfirstlane
+                ? IR::U32{add_offset}
+                : ir.ReadFirstLane(IR::U32{add_offset}); // sotc: see above
+        IR::U32 dw_add_offset = add_offset.IsImmediate()
+                                    ? ir.Imm32(add_offset.U32() >> 2u)
+                                    : IR::U32{ir.ShiftRightLogical(byte_offset, ir.Imm32(2u))};
         if (offset.IsImmediate() && dw_add_offset.IsImmediate()) {
             user->SetArg(1, ir.Imm32(offset.U32() + dw_add_offset.U32()));
         } else {

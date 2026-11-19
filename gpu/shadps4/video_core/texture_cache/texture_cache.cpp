@@ -691,8 +691,26 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             }
         }
 
+        // sotc: a GPU-written mip chain whose small mips run into the next image is not a chance
+        // overlap: the game sizes its allocations for fewer mips than some of its T#s describe
+        // (the light/ambient pass 0x79704cba writes a ping-pong pair of 8192x128 B10G11R11 images
+        // 0x550000 apart, 4 mips' worth, through T#s of 4 to 7 mips, 0x557000). Freeing the lower
+        // image whenever the upper one was bound recreated it and lost its contents every second
+        // frame, in the boots where IsSafeToDelete (scheduler ticks, so timing) allowed it. Keep
+        // it when the overlap starts past its mip 0.
+        // SOTC_TAIL_OVERLAP_KEEP=0: free it, as before.
+        static const bool tail_keep = [] {
+            const char* v = std::getenv("SOTC_TAIL_OVERLAP_KEEP");
+            return !v || v[0] != '0';
+        }();
+        const bool tail_overlap =
+            tail_keep && cache_image.info.resources.levels > 1 &&
+            True(cache_image.flags & ImageFlagBits::GpuModified) &&
+            image_info.guest_address >=
+                cache_image.info.guest_address + cache_image.info.mips_layout[1].offset;
+
         // Image isn't a subresource but a chance overlap.
-        if (safe_to_delete) {
+        if (safe_to_delete && !tail_overlap) {
             StashOrFreeImage(cache_image_id);
         }
 

@@ -40,7 +40,9 @@ using PFN_SrtWalker = void PS4_SYSV_ABI (*)(const u32* /*user_data*/, u32* /*fla
 /// loop counter). The SRT walker copies a window of the pointed-to memory into the flattened
 /// buffer; the low bits hold the window's first dword and the index is clamped to its size.
 constexpr u32 ReadConstDynamicWindowFlag = 1u << 31;
-constexpr u32 ReadConstDynamicWindowDwords = 512;
+// sotc: 2048 (8 KiB; was 512): the capsule shadow/AO pass indexes 112-byte occluder records, 24-28
+// at the Shrine and more on a colossus; 512 dwords held only the first 17.
+constexpr u32 ReadConstDynamicWindowDwords = 2048;
 PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size);
 /// True when code is inside the generated SRT walkers.
 bool IsSrtWalkerCode(const void* code);

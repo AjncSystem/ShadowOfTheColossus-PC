@@ -14,6 +14,7 @@
 #include <span>
 #include <boost/container/small_vector.hpp>
 #include <immintrin.h>
+#include "video_core/renderer_vulkan/sotc_gpu_times_note.h"
 
 namespace Vulkan {
 
@@ -54,10 +55,29 @@ void Scheduler::StartTickWatch() {
         Common::SetCurrentThreadName("shadPS4:SotcTickWatch");
         u64 last_gpu = ~0ull;
         u64 last_sub = ~0ull;
+        u64 last_ns = SotcStats::NowNs();
+        bool last_busy = false;
+        int last_who = 0; // GPU idle: 0 draw thread busy, 1 command processor busy, 2 game
         while (!stoken.stop_requested()) {
             work_semaphore.Refresh();
             const u64 gpu = work_semaphore.KnownGpuTick();
             const u64 sub = work_semaphore.CurrentTick();
+            // CurrentTick is the one being recorded: work is queued when the GPU is behind the
+            // last submitted one (sub - 1). The interval goes to the state seen at its start.
+            const u64 now_ns = SotcStats::NowNs();
+            (last_busy ? SotcStats::gpu_busy_ns : SotcStats::gpu_idle_ns)
+                .fetch_add(now_ns - last_ns, std::memory_order_relaxed);
+            if (!last_busy) {
+                (last_who == 0   ? SotcStats::gpu_idle_draw_ns
+                 : last_who == 1 ? SotcStats::gpu_idle_cp_ns
+                                 : SotcStats::gpu_idle_game_ns)
+                    .fetch_add(now_ns - last_ns, std::memory_order_relaxed);
+            }
+            last_ns = now_ns;
+            last_busy = gpu + 1 < sub;
+            last_who = !SotcStats::draw_idle_now.load(std::memory_order_relaxed)  ? 0
+                       : !SotcStats::cp_idle_now.load(std::memory_order_relaxed) ? 1
+                                                                                  : 2;
             if (gpu != last_gpu || sub != last_sub) {
                 SotcStats::PushTick(0, gpu, sub);
                 last_gpu = gpu;
@@ -78,6 +98,23 @@ void Scheduler::RecordDeferred(Common::UniqueFunction<void, vk::CommandBuffer>&&
     recorder->Run([this, cmdbuf, func = std::move(func)] {
         func(vk::CommandBuffer{recorder->Real(cmdbuf)});
     });
+}
+
+void Scheduler::RunCullHook() const {
+    // sotc: SOTC_CULL_QUEUE: once per open batch (the hook may record nothing graphical).
+    cull_batch_open = false;
+    if (cull_hook) {
+        cull_hook();
+    }
+}
+
+void Scheduler::RunAfterRecorded(Common::UniqueFunction<void>&& func) {
+    if (!recorder) {
+        func();
+        return;
+    }
+    recorder->Run([func = std::move(func)] { func(); });
+    recorder->Kick();
 }
 
 void Scheduler::BeginRecorded(vk::CommandBuffer fake) {
@@ -118,6 +155,7 @@ void Scheduler::BeginRendering(const RenderState& new_state, u64 token) {
         }
     }
     EndRendering();
+    SotcGpuTimes::Note(SotcGpuTimes::CPass); // sotc: SOTC_GPU_TIMES
     is_rendering = true;
     render_state = new_state;
     render_state_token = token;
@@ -166,7 +204,8 @@ void Scheduler::BeginRendering(const RenderState& new_state, u64 token) {
         .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
     };
 
-    CommandBuffer().beginRendering(rendering_info);
+    // sotc: the graphics command buffer even while a cull dispatch is recorded (SOTC_CULL_QUEUE).
+    sessions.back().primary.beginRendering(rendering_info);
 }
 
 void Scheduler::EndRendering() {
@@ -177,7 +216,8 @@ void Scheduler::EndRendering() {
         SotcStats::render_breaks.fetch_add(1, std::memory_order_relaxed);
     }
     is_rendering = false;
-    CommandBuffer().endRendering();
+    // sotc: the graphics command buffer even while a cull dispatch is recorded (SOTC_CULL_QUEUE).
+    sessions.back().primary.endRendering();
 }
 
 vk::CommandBuffer Scheduler::UploadCommandBuffer() {
@@ -422,14 +462,11 @@ void Scheduler::EndSession() {
 static u64 QueueSubmit(const Instance& instance, const SubmitInfo& info,
                        std::span<const vk::CommandBuffer> cmd_buffers) {
     // One stage mask per wait semaphore; SubmitInfo can carry up to 4 waits (it used to provide
-    // only 2 masks, so a third/fourth wait read past the array).
-    static constexpr std::array<vk::PipelineStageFlags, 4> wait_stage_masks = {
-        vk::PipelineStageFlagBits::eAllCommands,
-        vk::PipelineStageFlagBits::eColorAttachmentOutput,
-        vk::PipelineStageFlagBits::eAllCommands,
-        vk::PipelineStageFlagBits::eAllCommands,
-    };
-    static_assert(wait_stage_masks.size() >= std::tuple_size_v<decltype(info.wait_semas)>);
+    // only 2 masks, so a third/fourth wait read past the array). sotc: the masks now come with
+    // the SubmitInfo (same defaults; SOTC_CULL_QUEUE's waits block all commands).
+    const auto& wait_stage_masks = info.wait_stages;
+    static_assert(std::tuple_size_v<std::remove_cvref_t<decltype(info.wait_stages)>> >=
+                  std::tuple_size_v<decltype(info.wait_semas)>);
 
     const vk::TimelineSemaphoreSubmitInfo timeline_si = {
         .waitSemaphoreValueCount = info.num_wait_semas,

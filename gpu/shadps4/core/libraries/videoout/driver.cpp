@@ -25,6 +25,7 @@
 #include "bbport_mem_report.h"
 #include "bbport_overlay.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/sotc_gpu_times.h"
 #include "video_core/sotc_fps_cap.h"
 #include "video_core/sotc_event.h"
 #include "video_core/sotc_stats.h"
@@ -354,6 +355,9 @@ void VideoOutDriver::Flip(const Request& req) {
                             .count();
         SotcStats::flip_age_ns.fetch_add(age, std::memory_order_relaxed);
         SotcStats::flip_age_count.fetch_add(1, std::memory_order_relaxed);
+        if (SotcStats::kTickWatch) {
+            SotcStats::gpu_busy_frames.fetch_add(1, std::memory_order_relaxed);
+        }
         if (age > SotcStats::flip_age_max_ns.load(std::memory_order_relaxed)) {
             SotcStats::flip_age_max_ns.store(age, std::memory_order_relaxed);
         }
@@ -750,8 +754,44 @@ void VideoOutDriver::Flip(const Request& req) {
                              SotcStats::flip_age_max_ns.exchange(0) / 1e6,
                              static_cast<unsigned long long>(ages));
             }
+            if (const u64 grouped = SotcStats::rb_group_readbacks.exchange(0)) {
+                ReportPrintf(report,
+                             "SOTC RB GROUP: %llu readbacks brought along %llu ranges of the same "
+                             "visibility program (%llu KiB)\n",
+                             static_cast<unsigned long long>(grouped),
+                             static_cast<unsigned long long>(SotcStats::rb_group_regions.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::rb_group_bytes.exchange(0) >> 10));
+            }
+            if (const u64 served = SotcStats::rb_safepoint_finishes.exchange(0)) {
+                ReportPrintf(report, "SOTC RB SAFEPOINT: %llu readback finishes served inside long ops\n",
+                             static_cast<unsigned long long>(served));
+            }
+            if (const u64 idle_flushes = SotcStats::idle_flushes.exchange(0)) {
+                ReportPrintf(report, "SOTC IDLE FLUSH: %.0f submits/s when the draw thread ran dry\n",
+                             idle_flushes / seconds);
+            }
+            // sotc: SOTC_GPU_TIMES (sotc_gpu_times.h): where the sampled frames' GPU time went.
+            if (const auto gpu_times = Vulkan::SotcGpuTimes::Report(); !gpu_times.empty()) {
+                ReportPrintf(report, "%s", gpu_times.c_str());
+            }
+            if (SotcStats::kTickWatch) {
+                const u64 idle = SotcStats::gpu_idle_ns.exchange(0);
+                const u64 busy = SotcStats::gpu_busy_ns.exchange(0);
+                const u64 frames = std::max<u64>(SotcStats::gpu_busy_frames.exchange(0), 1);
+                ReportPrintf(report,
+                             "SOTC GPU BUSY: %.0f%% of the time with work queued (%.1f ms per "
+                             "frame busy, %.1f idle)\n",
+                             idle + busy ? 100.0 * busy / (idle + busy) : 0.0,
+                             busy / 1e6 / frames, idle / 1e6 / frames);
+                ReportPrintf(report,
+                             "SOTC GPU IDLE BY: draw thread busy %.1f ms, command processor busy "
+                             "%.1f ms, both idle (game) %.1f ms per frame\n",
+                             SotcStats::gpu_idle_draw_ns.exchange(0) / 1e6 / frames,
+                             SotcStats::gpu_idle_cp_ns.exchange(0) / 1e6 / frames,
+                             SotcStats::gpu_idle_game_ns.exchange(0) / 1e6 / frames);
+            }
             ReportPrintf(report,
-                         "SOTC readback finish: %llu for bytes the guest asked, %llu binds, "
+                         "SOTC readback finish:%llu for bytes the guest asked, %llu binds, "
                          "%llu window, %llu hot; dirty retries %llu, hot dropped %llu, "
                          "requeued %llu\n",
                          static_cast<unsigned long long>(
@@ -767,6 +807,25 @@ void VideoOutDriver::Flip(const Request& req) {
                          static_cast<unsigned long long>(
                              SotcStats::rb_dirty_hot_dropped.exchange(0)),
                          static_cast<unsigned long long>(SotcStats::rb_requeues.exchange(0)));
+            if (const u64 pushes = SotcStats::rb_push.exchange(0)) {
+                ReportPrintf(report,
+                             "SOTC RB PUSH: %llu copies (%.0f KiB), %llu faults served, %llu stale, "
+                             "%llu unused, %llu skipped, %llu unmaps waited for a copy\n",
+                             static_cast<unsigned long long>(pushes),
+                             SotcStats::rb_push_bytes.exchange(0) / 1024.0,
+                             static_cast<unsigned long long>(SotcStats::rb_push_hits.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::rb_push_stale.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::rb_push_unused.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::rb_push_skipped.exchange(0)),
+                             static_cast<unsigned long long>(
+                                 SotcStats::rb_push_release_waits.exchange(0)));
+                if (const u64 checked = SotcStats::rb_push_verify_bytes.exchange(0)) {
+                    ReportPrintf(report, "SOTC RB PUSH VERIFY: %llu bytes compared, %llu differ\n",
+                                 static_cast<unsigned long long>(checked),
+                                 static_cast<unsigned long long>(
+                                     SotcStats::rb_push_verify_differ.exchange(0)));
+                }
+            }
             if (const u64 streamed = SotcStats::rb_stream_windows.exchange(0)) {
                 ReportPrintf(report, "SOTC readback stream windows: %llu\n",
                              static_cast<unsigned long long>(streamed));
@@ -1113,6 +1172,21 @@ void VideoOutDriver::Flip(const Request& req) {
                                  SotcStats::async_translate_stale.load(std::memory_order_relaxed)),
                              static_cast<unsigned long long>(SotcStats::async_compute_self_built.load(
                                  std::memory_order_relaxed)));
+            }
+            // sotc: compute shaders translated ahead (SOTC_COMPUTE_PREFETCH), totals.
+            if (const uint64_t queued =
+                    SotcStats::prefetch_queued.load(std::memory_order_relaxed)) {
+                std::fprintf(stderr,
+                             "SOTC COMPUTE PREFETCH %llu queued: %llu ready, %llu waited (%.0f "
+                             "ms), %llu taken back\n",
+                             static_cast<unsigned long long>(queued),
+                             static_cast<unsigned long long>(
+                                 SotcStats::prefetch_ready.load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(
+                                 SotcStats::prefetch_waited.load(std::memory_order_relaxed)),
+                             SotcStats::prefetch_wait_ns.load(std::memory_order_relaxed) / 1e6,
+                             static_cast<unsigned long long>(
+                                 SotcStats::prefetch_taken_back.load(std::memory_order_relaxed)));
             }
             const bool cmd_stats = SotcStats::kCmdStats; // sotc: as the counters (sotc_stats.h)
             if (cmd_stats && flips) {
@@ -1508,6 +1582,20 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 // A frame counts as slow below 50 FPS: 50-60 FPS stays at the 60 limit (the step only
                 // takes over where the game really cannot keep up).
                 constexpr auto frame_60 = std::chrono::nanoseconds{1'000'000'000 / 50};
+                // sotc: 19/11: a 2-3 s dip of an area change (39-42 FPS) took the step, which then
+                // held 48 for 10-15 s after the PC could do 60 again (the player saw that as the
+                // drop). SOTC_FPS_DYNAMIC_SLOW_MS (default 5000, was 1500): slow time before the
+                // step; SOTC_FPS_DYNAMIC_HOLD_S (default 4, was 10): time at the step before trying
+                // 60, doubled after each failed try up to 10 s (heavy stretches do not swing).
+                static const auto slow_limit = std::chrono::milliseconds{[] {
+                    const char* v = std::getenv("SOTC_FPS_DYNAMIC_SLOW_MS");
+                    return v ? std::strtol(v, nullptr, 10) : 5000L;
+                }()};
+                static const auto hold_first = std::chrono::seconds{[] {
+                    const char* v = std::getenv("SOTC_FPS_DYNAMIC_HOLD_S");
+                    return v ? std::max(1L, std::strtol(v, nullptr, 10)) : 4L;
+                }()};
+                static auto hold = hold_first;
                 const auto set = [&](Dyn next, int limit) {
                     state = next;
                     since = last_flip_time;
@@ -1526,11 +1614,12 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                     // Slow time builds up and drains back: a run of slow frames lowers it.
                     slow = delta > frame_60 ? slow + delta
                                             : std::max(std::chrono::nanoseconds{0}, slow - delta);
-                    if (slow > std::chrono::milliseconds{1500}) {
+                    if (slow > slow_limit) {
+                        hold = hold_first;
                         set(Dyn::Low, SotcFpsCap::dynamic_low);
                     }
                 } else if (state == Dyn::Low) {
-                    if (last_flip_time - since > std::chrono::seconds{10}) {
+                    if (last_flip_time - since > hold) {
                         set(Dyn::Probe, 0);
                     }
                 } else { // Probe: 60 again for 2 s; back to low when over a quarter was slow
@@ -1540,8 +1629,10 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                     }
                     if (last_flip_time - since > std::chrono::seconds{2}) {
                         if (slow * 4 > total) {
+                            hold = std::min(hold * 2, std::chrono::seconds{10});
                             set(Dyn::Low, SotcFpsCap::dynamic_low);
                         } else {
+                            hold = hold_first;
                             set(Dyn::High, 0);
                         }
                     }

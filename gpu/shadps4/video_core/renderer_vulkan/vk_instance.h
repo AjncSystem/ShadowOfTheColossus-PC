@@ -83,6 +83,12 @@ public:
         return dedicated_present_queue;
     }
 
+    /// sotc: SOTC_CULL_QUEUE: a queue of the graphics family of its own for the visibility
+    /// (cull) dispatches (sotc_cull_queue.h); null when off or the family has no queue left.
+    vk::Queue GetCullQueue() const {
+        return cull_queue;
+    }
+
     TracyVkCtx GetProfilerContext() const {
         return profiler_context;
     }
@@ -624,6 +630,8 @@ private:
     bool dedicated_present_queue{};
     u32 present_queue_family{0};
     vk::Queue graphics_queue;
+    vk::Queue cull_queue; ///< sotc: SOTC_CULL_QUEUE
+    u32 cull_queue_index{}; ///< sotc: its index in the graphics family (0: none)
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;

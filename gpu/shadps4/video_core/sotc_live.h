@@ -26,4 +26,20 @@ inline std::atomic<int> shadow_reuse{-1};
 /// grass detail. Below 0: the environment's.
 inline std::atomic<float> grass[5]{-1.f, -1.f, -1.f, -1.f, -1.f};
 
+/// Game HDR levels in nits (vk_presenter.cpp): the scene's paper white (SOTC_HDR_WHITE), the
+/// display's peak (SOTC_HDR_PEAK, 0 = the value Windows reports) and the UI's white
+/// (SOTC_HDR_UI, 0 = the paper white). Below 0: the value read at start.
+inline std::atomic<float> hdr_white{-1.f};
+inline std::atomic<float> hdr_peak{-1.f};
+inline std::atomic<float> hdr_ui{-1.f};
+
+/// Game HDR picture controls (vk_presenter.cpp), in the menu's units: exposure in EV (-3..3,
+/// neutral 0; SOTC_HDR_EXPOSURE), then contrast, shadows, highlights, saturation (0..100, neutral
+/// 50; SOTC_HDR_CONTRAST / _SHADOWS / _HIGHLIGHTS / _SATURATION) and highlight saturation loss
+/// (0..100, neutral 0; SOTC_HDR_BLOWOUT). kGradeUnset: the value read at start.
+inline constexpr float kGradeUnset = -1000.f;
+enum HdrGrade { kExposure, kContrast, kShadows, kHighlights, kSaturation, kBlowout, kGradeCount };
+inline std::atomic<float> hdr_grade[kGradeCount]{kGradeUnset, kGradeUnset, kGradeUnset,
+                                                 kGradeUnset, kGradeUnset, kGradeUnset};
+
 } // namespace SotcLive

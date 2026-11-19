@@ -12,6 +12,11 @@ layout (binding = 1) uniform sampler2D uiSampler;
 // sotc: render size, g = 1 in the sky (DLSS's camera motion fill).
 layout (binding = 2) uniform sampler2D skySampler;
 
+// sotc: the scene's key (pp_key.comp): log2 of its log-average luminance / the paper white.
+layout (binding = 3) readonly buffer SceneKey {
+    float log2_key;
+} scene_key;
+
 layout (push_constant) uniform settings {
     float gamma;
     uint hdr; // sotc: 0 = SDR, 1 = the game's own HDR10 (pass through), 2 = SDR game on HDR10
@@ -26,6 +31,15 @@ layout (push_constant) uniform settings {
     float hdr_curve; // sotc: exponent of the game's HDR composite
     float paper_white; // sotc: hdr 2: nits of SDR white
     float highlight_gain; // sotc: hdr 2: gain of the highlights
+    float hdr_peak; // sotc: hdr 1: the display's peak in nits (0: no roll-off)
+    float ui_white; // sotc: hdr 1 with the UI layer: nits of the UI's white (0: hdr_white)
+    // sotc: hdr 1: picture controls on the scene (grade()); the defaults are neutral.
+    float exposure;   // linear gain (1)
+    float contrast;   // power on luminance around mid grey (1)
+    float shadows;    // extra power below mid grey (1)
+    float highlights; // extra power above mid grey (1)
+    float saturation; // chroma scale (1)
+    float blowout;    // highlights towards white near the peak, 0..1 (0)
 } pp;
 
 // sotc: linear Rec.709 -> HDR10 (Rec.2020 primaries, ST 2084 PQ) for an SDR game. SDR white sits at
@@ -81,6 +95,79 @@ vec3 pqEncode(vec3 nits) {
     return pow((c1 + c2 * y) / (1.0 + c3 * y), vec3(m2));
 }
 const mat3 rec709to2020 = mat3(0.6274, 0.0691, 0.0164, 0.3293, 0.9195, 0.0880, 0.0433, 0.0114, 0.8956);
+
+// sotc: BT.2390 EETF on the brightest channel: the scene, scaled to the paper white, goes up to
+// 10000 nits and used to clip at the display's peak (blown-out sun, sky and water). Below the
+// knee (about half the peak in PQ) nothing changes; above it the highlights roll off smoothly into
+// hdr_peak. The RGB ratio is kept, so hues do not shift as they brighten.
+float pqEncode1(float nits) {
+    const float y = pow(clamp(nits / 10000.0, 0.0, 1.0), m1);
+    return pow((c1 + c2 * y) / (1.0 + c3 * y), m2);
+}
+float pqDecode1(float e) {
+    const float p = pow(clamp(e, 0.0, 1.0), 1.0 / m2);
+    return 10000.0 * pow(max(p - c1, 0.0) / (c2 - c3 * p), 1.0 / m1);
+}
+vec3 rollOff(vec3 nits) {
+    nits = max(nits, vec3(0.0));
+    if (pp.hdr_peak <= 0.0) {
+        return nits;
+    }
+    const float m = max(nits.r, max(nits.g, nits.b));
+    if (m <= 0.0) {
+        return nits;
+    }
+    const float e = pqEncode1(m);
+    const float max_lum = pqEncode1(pp.hdr_peak);
+    const float ks = 1.5 * max_lum - 0.5;
+    if (e <= ks) {
+        return nits;
+    }
+    const float t = (e - ks) / (1.0 - ks);
+    const float t2 = t * t, t3 = t2 * t;
+    const float e2 = (2.0 * t3 - 3.0 * t2 + 1.0) * ks + (t3 - 2.0 * t2 + t) * (1.0 - ks) +
+                     (-2.0 * t3 + 3.0 * t2) * max_lum;
+    return nits * (min(pqDecode1(e2), pp.hdr_peak) / m);
+}
+
+// sotc: picture controls on the scene in nits (linear Rec.2020), before rollOff(). Contrast,
+// shadows and highlights are powers on luminance pivoting at the scene's key (its log-average,
+// measured each frame and smoothed: pp_key.comp), the colour scaled by the luminance ratio so
+// hues stay. A fixed mid grey does not work here: SotC's frames go from ~3% of the paper white at
+// night to ~140% in the desert, so a fixed pivot sits above or below nearly every pixel and the
+// three controls only brighten or darken. Saturation scales the distance from grey; blowout fades
+// highlights towards white from two stops above the key to the display's peak. All neutral:
+// skipped, so the picture is unchanged bit for bit.
+const vec3 luma2020 = vec3(0.2627, 0.6780, 0.0593);
+vec3 grade(vec3 nits) {
+    if (pp.exposure == 1.0 && pp.contrast == 1.0 && pp.shadows == 1.0 && pp.highlights == 1.0 &&
+        pp.saturation == 1.0 && pp.blowout == 0.0) {
+        return nits;
+    }
+    nits = max(nits, vec3(0.0)) * pp.exposure;
+    float y = dot(nits, luma2020);
+    if (y <= 0.0) {
+        return nits;
+    }
+    float k = scene_key.log2_key;
+    if (!(k > -12.0 && k < 6.0)) { // not measured yet (or a bad value): 18% grey
+        k = -2.474;
+    }
+    const float mid = pp.hdr_white * exp2(clamp(k, -8.0, 1.0)) * pp.exposure;
+    const float yn = y / mid;
+    const float y2 = mid * pow(yn, pp.contrast * (yn < 1.0 ? pp.shadows : pp.highlights));
+    nits *= y2 / y;
+    y = y2;
+    nits = max(vec3(y) + (nits - vec3(y)) * pp.saturation, vec3(0.0));
+    if (pp.blowout > 0.0) {
+        const float peak = pp.hdr_peak > 0.0 ? pp.hdr_peak : 10000.0;
+        const float start = 4.0 * mid;
+        const float range = log2(max(peak / start, 1.01));
+        const float t = smoothstep(0.0, 1.0, log2(max(y / start, 1e-6)) / range);
+        nits = mix(nits, vec3(y), pp.blowout * t);
+    }
+    return nits;
+}
 
 // sotc: the UI layer is at render size; Catmull-Rom (9 bilinear taps) keeps its text sharper
 // than a bilinear stretch. Clamped: the filter overshoots at hard edges.
@@ -152,8 +239,21 @@ void main() {
         if (pp.hdr == 1u) {
             // The game's HDR composite: UI over scene, ^k (its constant), Rec.2020, PQ with
             // 1.0 at 300 nits; scaled to the paper white like below.
+            // The scene part gets the paper white and the roll-off to the display's peak; the UI
+            // (where its alpha covers the scene) gets its own white, so menus and subtitles can
+            // be dimmer or brighter than the world.
             const vec3 c = abs(color_linear.rgb * (1.0 - ui.a) + ui.rgb);
-            const vec3 nits = 3.0 * pp.hdr_white * (rec709to2020 * pow(c, vec3(pp.hdr_curve)));
+            const vec3 lin = rec709to2020 * pow(c, vec3(pp.hdr_curve));
+            // The picture controls grade the scene part only; where the UI covers the scene, its
+            // own (ungraded) level takes over below by the UI's alpha.
+            const vec3 scene_nits = rollOff(grade(3.0 * pp.hdr_white * lin));
+            const float ui_white = pp.ui_white > 0.0 ? pp.ui_white : pp.hdr_white;
+            vec3 nits = scene_nits;
+            if (ui.a > 0.0) {
+                vec3 ui_nits = 3.0 * ui_white * lin;
+                if (pp.hdr_peak > 0.0) ui_nits = min(ui_nits, vec3(pp.hdr_peak));
+                nits = mix(scene_nits, ui_nits, clamp(ui.a, 0.0, 1.0));
+            }
             color = vec4(pqEncode(nits), 1.0);
             return;
         }
@@ -161,8 +261,10 @@ void main() {
     }
     if (pp.hdr == 1u) {
         // The game's own BT.2020 PQ output has its white at about 100 nits, too dim next to
-        // the desktop; scaled to the paper white.
-        color = vec4(pqEncode(pqDecode(color_linear.rgb) * (pp.hdr_white / 100.0)),
+        // the desktop; scaled to the paper white, highlights rolled off into the display's peak.
+        // (The UI is already in this picture here, so it follows the paper white.)
+        // The picture controls apply to the whole frame here (the UI is baked in).
+        color = vec4(pqEncode(rollOff(grade(pqDecode(color_linear.rgb) * (pp.hdr_white / 100.0)))),
                      color_linear.a);
     } else if (pp.hdr == 2u) {
         if (pp.srgb_input) color_linear.rgb = degamma(color_linear.rgb);

@@ -81,9 +81,7 @@ public:
         if (!IsHDRSupported()) {
             return;
         }
-        if (const char* white = std::getenv("SOTC_HDR_WHITE"); white && std::atof(white) > 0) {
-            pp_settings.hdr_white = static_cast<float>(std::atof(white));
-        }
+        // sotc: the paper white, peak and UI white are set every frame (RefreshHdrLevels).
         if (EmulatorSettings.IsSdrToHdr()) {
             // sotc: the swapchain stays HDR10; an SDR game frame (hdr 2) is expanded by the pp pass.
             pp_settings.hdr = enable ? 1 : 2;

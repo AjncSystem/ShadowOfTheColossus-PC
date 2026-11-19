@@ -23,6 +23,7 @@
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/sotc_display_peak.h"
 #include "video_core/sotc_live.h"
 #include "video_core/texture_cache/image.h"
 #include "bbport_overlay.h"
@@ -56,6 +57,103 @@ namespace Vulkan {
 // sotc: serializes vkQueuePresentKHR (both present sites) on the dedicated present queue; with a
 // shared queue the sites take Scheduler::submit_mutex as well.
 static std::mutex present_queue_mutex;
+
+// sotc: game HDR levels, in nits. At start: the launcher's settings (hdr_white, hdr_peak, hdr_ui,
+// written by the F1 menu), else SOTC_HDR_WHITE / SOTC_HDR_PEAK / SOTC_HDR_UI, else 200 / auto /
+// the paper white. Peak 0 is auto (what Windows reports for the HDR display, 1000 when it reports
+// nothing); 10000 or more turns the roll-off off. While playing the F1 menu's values (sotc_live.h)
+// take their place.
+static float HdrLevel(const char* key, const char* env, float fallback) {
+    std::string v = BbOverlay::LauncherSetting(key);
+    if (v.empty()) {
+        const char* e = std::getenv(env);
+        v = e ? e : "";
+    }
+    if (v.empty()) {
+        return fallback;
+    }
+    if (v == "off") {
+        return 10000.0f;
+    }
+    if (v == "auto") {
+        return 0.0f;
+    }
+    return static_cast<float>(std::atof(v.c_str()));
+}
+
+static void RefreshHdrLevels(HostPasses::PostProcessingPass::Settings& s) {
+    struct Start {
+        float white, peak, ui, auto_peak;
+    };
+    static const Start start = [] {
+        Start st{};
+        st.white = std::clamp(HdrLevel("hdr_white", "SOTC_HDR_WHITE", 200.0f), 40.0f, 1000.0f);
+        st.peak = std::max(HdrLevel("hdr_peak", "SOTC_HDR_PEAK", 0.0f), 0.0f);
+        st.ui = std::max(HdrLevel("hdr_ui", "SOTC_HDR_UI", 0.0f), 0.0f);
+        const float reported = SotcDisplayPeakNits();
+        st.auto_peak = reported >= 200.0f ? reported : 1000.0f;
+        LOG_INFO(Render_Vulkan,
+                 "SOTC HDR: game brightness {} nits, peak {} (display reports {} nits), UI "
+                 "brightness {}",
+                 st.white, st.peak > 0.0f ? std::to_string(st.peak) : std::string("auto"), reported,
+                 st.ui > 0.0f ? std::to_string(st.ui) : std::string("= game brightness"));
+        return st;
+    }();
+    const float live_white = SotcLive::hdr_white.load(std::memory_order_relaxed);
+    const float live_peak = SotcLive::hdr_peak.load(std::memory_order_relaxed);
+    const float live_ui = SotcLive::hdr_ui.load(std::memory_order_relaxed);
+    s.hdr_white = live_white >= 0.0f ? live_white : start.white;
+    float peak = live_peak >= 0.0f ? live_peak : start.peak;
+    if (peak <= 0.0f) {
+        peak = start.auto_peak;
+    }
+    // At 10000 the EETF does nothing; 0 skips it in the shader.
+    s.hdr_peak = peak >= 10000.0f ? 0.0f : std::max(peak, s.hdr_white);
+    s.ui_white = live_ui >= 0.0f ? live_ui : start.ui;
+
+    // Picture controls: launcher key, env, neutral at start; the F1 menu's while playing. Menu
+    // units (sotc_live.h) map to the shader's: 50 is neutral, each side up to a power of 2^±0.5
+    // (contrast, shadows, highlights) or 0..2x (saturation).
+    struct Grade {
+        const char* key;
+        const char* env;
+        float neutral, lo, hi;
+    };
+    static constexpr Grade kGrades[SotcLive::kGradeCount] = {
+        {"hdr_exposure", "SOTC_HDR_EXPOSURE", 0.0f, -3.0f, 3.0f},
+        {"hdr_contrast", "SOTC_HDR_CONTRAST", 50.0f, 0.0f, 100.0f},
+        {"hdr_shadows", "SOTC_HDR_SHADOWS", 50.0f, 0.0f, 100.0f},
+        {"hdr_highlights", "SOTC_HDR_HIGHLIGHTS", 50.0f, 0.0f, 100.0f},
+        {"hdr_saturation", "SOTC_HDR_SATURATION", 50.0f, 0.0f, 100.0f},
+        {"hdr_blowout", "SOTC_HDR_BLOWOUT", 0.0f, 0.0f, 100.0f},
+    };
+    static const std::array<float, SotcLive::kGradeCount> grade_start = [] {
+        std::array<float, SotcLive::kGradeCount> g{};
+        for (int i = 0; i < SotcLive::kGradeCount; ++i) {
+            const Grade& d = kGrades[i];
+            g[i] = std::clamp(HdrLevel(d.key, d.env, d.neutral), d.lo, d.hi);
+        }
+        LOG_INFO(Render_Vulkan,
+                 "SOTC HDR picture: exposure {} EV, contrast {}, shadows {}, highlights {}, "
+                 "saturation {}, highlight saturation loss {}",
+                 g[0], g[1], g[2], g[3], g[4], g[5]);
+        return g;
+    }();
+    float g[SotcLive::kGradeCount];
+    for (int i = 0; i < SotcLive::kGradeCount; ++i) {
+        const float live = SotcLive::hdr_grade[i].load(std::memory_order_relaxed);
+        g[i] = live > SotcLive::kGradeUnset
+                   ? std::clamp(live, kGrades[i].lo, kGrades[i].hi)
+                   : grade_start[size_t(i)];
+    }
+    const auto power = [](float v) { return v == 50.0f ? 1.0f : std::exp2((v - 50.0f) / 100.0f); };
+    s.exposure = g[SotcLive::kExposure] == 0.0f ? 1.0f : std::exp2(g[SotcLive::kExposure]);
+    s.contrast = power(g[SotcLive::kContrast]);
+    s.shadows = 1.0f / power(g[SotcLive::kShadows]); // more shadows: a power below 1 lifts them
+    s.highlights = power(g[SotcLive::kHighlights]);
+    s.saturation = g[SotcLive::kSaturation] / 50.0f;
+    s.blowout = g[SotcLive::kBlowout] / 100.0f;
+}
 
 bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format format) {
     const vk::FormatProperties props{physical_device.getFormatProperties(format)};
@@ -534,6 +632,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
     fsr_pass_hudless.Create(device, instance.GetAllocator(), num_images);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
+    pp_pass.CreateKey(instance); // sotc: the scene key for the HDR picture controls
     if (swapchain.GetHDR() && EmulatorSettings.IsSdrToHdr()) {
         // sotc: SOTC_HDR_PAPER (nits of SDR white, default 200) and SOTC_HDR_GAIN (extra
         // brightness of the highlights, 1 = none, default 1.5).
@@ -840,6 +939,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // to the frame's size; the post process pass puts the UI layer back over it. Frames without
     // that scene (menus, loading screens) are presented as before.
     Dlssg::SetHdr(pp_settings.hdr != 0);
+    if (pp_settings.hdr == 1) {
+        RefreshHdrLevels(pp_settings);
+    }
     auto upscaled = Dlssg::Upscale(frame->id, draw_scheduler, texture_cache, runtime,
                                    frame->width, frame->height);
     // sotc: a buffer flipped again right after itself (PS4 Pro mode at the 30 FPS cap flips each
@@ -915,6 +1017,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         pp_settings.ui_sharpen = upscaled.ui_full ? 0.0f : ui_sharpen; // sotc: drawn at this size
         pp_settings.hdr_curve = Dlssg::HdrCurve();
         pp_settings.sky_sharpen = sky_sharpen;
+        if (pp_settings.hdr == 1) { // sotc: the picture controls' pivot (the HUD-less pass reuses it)
+            pp_pass.MeasureKey(cmdbuf, scene, false, pp_settings.hdr_curve);
+        }
         pp_pass.Render(cmdbuf, scene, scene_size, *frame, pp_settings, upscaled.ui, upscaled.sky);
         upscaled_scene = upscaled.scene_low ? vk::ImageView{} : scene;
     } else {
@@ -943,6 +1048,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
         pp_settings.ui = 0;
         pp_settings.vignette = {};
+        if (pp_settings.hdr == 1) { // sotc: the picture controls' pivot (the HUD-less pass reuses it)
+            pp_pass.MeasureKey(cmdbuf, image_view, true, 1.0f);
+        }
         pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
     }
 

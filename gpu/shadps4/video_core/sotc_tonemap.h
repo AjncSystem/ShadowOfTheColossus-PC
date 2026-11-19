@@ -41,6 +41,8 @@ inline std::atomic<float> grading{1.0f};
 inline std::atomic<float> bloom{1.0f};
 inline std::atomic<float> vignette{1.0f};
 inline std::atomic<float> fog{1.0f};
+/// Motion blur length (kMotionBlurHash dwords 40 and 41), 1 = the game's.
+inline std::atomic<float> motion_blur{1.0f};
 
 /// kVanillaPlusHue: set at the tonemap draw (rasterizer) for the final pass: on when this frame's
 /// tonemap got kNone's line for it, and Vanilla+'s A..E (the curve the final pass applies).

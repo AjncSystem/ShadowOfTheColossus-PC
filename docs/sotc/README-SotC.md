@@ -86,8 +86,9 @@ Tudo isto está no lançador, na página **Imagem e FPS** (e os principais em **
   o Modo Grafismo **Cinematográfico** (1440p, mais detalhe) ou **Desempenho**. É mais pesado:
   ~25 FPS no campo aberto.
 - **Efeitos**: vinheta, névoa atmosférica e oclusão ambiente (SSAO) podem ser desligados.
-  A força do brilho difuso (bloom), da vinheta e da névoa vai de 0 a 200% ao vivo (F1 > Imagem,
-  em SDR e HDR); a névoa em 0% deixa a distância nítida, em 200% ela junta o dobro com a distância. O bloom do jogo é um véu largo que clareia as sombras: no deserto, 400% sobe a parte mais
+  A força do brilho difuso (bloom), da vinheta, da névoa e do borrão de movimento vai de 0 a 200%
+  ao vivo (F1 > Imagem, em SDR e HDR); a névoa em 0% deixa a distância nítida, em 200% ela junta o
+  dobro com a distância. O bloom do jogo é um véu largo que clareia as sombras: no deserto, 400% sobe a parte mais
   escura da imagem em ~30%; 0% deixa a imagem mais nítida e as sombras mais fundas.
   A nitidez depois do DLSS / FSR 4 também muda ao vivo (F1 > Imagem, seis níveis).
   O motion blur, o brilho e os filtros ficam no menu do próprio jogo.
@@ -216,8 +217,10 @@ Estas variáveis de ambiente ajudam a investigar problemas:
 | `SOTC_FX_BLOOM=0..400` | a força do bloom em porcentagem (padrão 100 = o do jogo) |
 | `SOTC_FX_VIGNETTE=0..400` | a força da vinheta em porcentagem (padrão 100); com a vinheta desligada não faz nada |
 | `SOTC_FX_FOG=0..400` | a força da névoa atmosférica em porcentagem (padrão 100); com a névoa desligada não faz nada |
+| `SOTC_FX_MOTION_BLUR=0..400` | o comprimento do borrão de movimento em porcentagem (padrão 100); com o borrão desligado não faz nada |
+| `SOTC_FLAT_DUMP=0x<hash>,...` | diagnóstico: as constantes (flatbuf) desses shaders como floats, a cada 300 quadros |
 | `SOTC_FX_CYCLE=s` | teste: os efeitos em 0%, 100% e 300% a cada `s` segundos |
-| `SOTC_FX_CYCLE_WHAT=bloom,vignette,fog` | teste: quais efeitos o `SOTC_FX_CYCLE` alterna (padrão todos) |
+| `SOTC_FX_CYCLE_WHAT=bloom,vignette,fog,motion` | teste: quais efeitos o `SOTC_FX_CYCLE` alterna (padrão todos) |
 | `SOTC_FX_TRACE=1\|n` | diagnóstico: a cada 600 quadros (ou a cada `n`), quatro quadros seguidos: os shaders em ordem, com as texturas lidas e escritas e os formatos (`dados.número`; o do alvo de cor como `dados*100+número`) |
 | `SOTC_EVICT_ASYNC=0` | a devolução de memória fria das arenas espera a GPU no processador de comandos, como antes (~44 ms por vez) |
 | `SOTC_UI_HIRES=0` | com DLSS, a interface (textos, logos, HUD) volta a ser desenhada na resolução de renderização e ampliada, em vez de na resolução de saída |

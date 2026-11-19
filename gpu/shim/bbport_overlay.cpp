@@ -944,8 +944,8 @@ void BuildItems() {
                   {{0.0f, L("Desligado", "Off")}, {100.0f, L("Ligado", "On")}}, kUnsetBelow);
         MenuItem& reset = AddLive(
             kTabDisplay, L("HDR: restaurar imagem", "HDR: reset picture"),
-            L("Volta todos os controles de imagem, a curva de tons, a correção de cor do jogo e a força do bloom, da vinheta e da névoa ao original. O brilho e o pico ficam.",
-              "Puts every picture control, the tone mapper, the game's colour grading and the bloom, vignette and fog strengths back to the original. Brightness and peak stay."),
+            L("Volta todos os controles de imagem, a curva de tons, a correção de cor do jogo e a força do bloom, da vinheta, da névoa e do borrão de movimento ao original. O brilho e o pico ficam.",
+              "Puts every picture control, the tone mapper, the game's colour grading and the bloom, vignette, fog and motion blur strengths back to the original. Brightness and peak stay."),
             {{L("Executar", "Run"), "0"}}, [] { return -1; },
             [](int) {
                 struct Neutral {
@@ -973,12 +973,14 @@ void BuildItems() {
                 SaveLauncherSetting("hdr_grading", "100");
                 SotcLive::hdr_tonemap.store(SotcTonemap::kVanilla, std::memory_order_relaxed);
                 SaveLauncherSetting("hdr_tonemap", "\"vanilla\"");
-                for (auto* fx : {&SotcLive::fx_bloom, &SotcLive::fx_vignette, &SotcLive::fx_fog}) {
+                for (auto* fx : {&SotcLive::fx_bloom, &SotcLive::fx_vignette, &SotcLive::fx_fog,
+                                 &SotcLive::fx_motion_blur}) {
                     fx->store(100.0f, std::memory_order_relaxed);
                 }
                 SaveLauncherSetting("fx_bloom_strength", "100");
                 SaveLauncherSetting("fx_vignette_strength", "100");
                 SaveLauncherSetting("fx_fog_strength", "100");
+                SaveLauncherSetting("fx_motion_blur_strength", "100");
                 toast_text = L("Imagem HDR restaurada", "HDR picture reset");
                 toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
             });
@@ -1064,6 +1066,14 @@ void BuildItems() {
             "fx_fog_strength", SotcLive::fx_fog, "SOTC_FX_FOG", 100.0f, strengths);
         fog.slider = true;
         fog.shown = [] { return true; };
+        MenuItem& motion = add_level(
+            L("Força do borrão de movimento", "Motion blur strength"),
+            L("O comprimento do borrão quando a câmera ou algo se move. 100% é o original; 200% dobra. Só com o borrão de movimento ligado.",
+              "How long the blur is when the camera or something moves. 100% is the original; 200% doubles it. Only with motion blur switched on."),
+            "fx_motion_blur_strength", SotcLive::fx_motion_blur, "SOTC_FX_MOTION_BLUR", 100.0f,
+            strengths);
+        motion.slider = true;
+        motion.shown = [] { return true; };
     }
     AddRestart(kTabDisplay, "af16", L("Filtro de texturas 16x", "16x texture filtering"),
                L("Texturas nítidas no chão visto de lado (filtro anisotrópico 16x).",

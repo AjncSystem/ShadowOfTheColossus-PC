@@ -2490,6 +2490,12 @@ constexpr u32 kBloomScaleDword = 24;
 // materials add themselves (transparents) stays the game's.
 constexpr u64 kFogApplyHash = 0x059b9591;
 constexpr u32 kFogDistanceDword = 31;
+// sotc: the motion blur's first pass (velocity tiles, only with r_motionBlurEnable=1): the blur
+// vector in pixels is the velocity times dwords 40 and 41 (render width and height times the
+// game's amount, r_motionBlurAmount 0.11, which the game resets over a command line value), capped
+// at 32 pixels by the shader. Scaling both scales the blur length (SOTC_FX_MOTION_BLUR).
+constexpr u64 kMotionBlurHash = 0x5bb232e8;
+constexpr u32 kMotionBlurDword = 40;
 
 // sotc: the game's colour grading in the tonemap's constants at a strength 0..1 (SOTC_HDR_GRADING):
 // saturation and contrast towards 1, the tint and the per channel gamma towards grey (their
@@ -3675,6 +3681,33 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         bloom_flat[kBloomScaleDword] = std::bit_cast<u32>(
                             std::bit_cast<float>(bloom_flat[kBloomScaleDword]) * bloom);
                         flat = bloom_flat.data();
+                    }
+                }
+                // sotc: SOTC_FLAT_DUMP=<hash>[,<hash>...] (diagnostics): the flatbuf of those
+                // shaders as floats, every 300th frame (finding an effect's constants).
+                static const std::string flat_dump = [] {
+                    const char* v = std::getenv("SOTC_FLAT_DUMP");
+                    return std::string(v ? v : "");
+                }();
+                if (!flat_dump.empty() &&
+                    SotcStats::flip_count.load(std::memory_order_relaxed) % 300 == 0 &&
+                    flat_dump.find(fmt::format("{:#010x}", stage.pgm_hash)) != std::string::npos) {
+                    std::string line = fmt::format("SOTC FLAT {:#010x}:", stage.pgm_hash);
+                    for (size_t d = 0; d < stage.FlatBuf().size(); ++d) {
+                        line += fmt::format(" {}={:g}", d, std::bit_cast<float>(stage.FlatBuf()[d]));
+                    }
+                    std::fprintf(stderr, "%s\n", line.c_str());
+                }
+                static std::vector<u32> mb_flat;
+                if (stage.pgm_hash == kMotionBlurHash &&
+                    stage.FlatBuf().size() > kMotionBlurDword + 1) {
+                    const float mb = SotcTonemap::motion_blur.load(std::memory_order_relaxed);
+                    if (mb != 1.0f) {
+                        mb_flat.assign(stage.FlatBuf().begin(), stage.FlatBuf().end());
+                        for (u32 d = kMotionBlurDword; d <= kMotionBlurDword + 1; ++d) {
+                            mb_flat[d] = std::bit_cast<u32>(std::bit_cast<float>(mb_flat[d]) * mb);
+                        }
+                        flat = mb_flat.data();
                     }
                 }
                 static std::vector<u32> fog_flat;

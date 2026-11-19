@@ -239,6 +239,8 @@ static void RefreshEffectLevels() {
     static const float vignette_start =
         HdrLevel("fx_vignette_strength", "SOTC_FX_VIGNETTE", 100.0f);
     static const float fog_start = HdrLevel("fx_fog_strength", "SOTC_FX_FOG", 100.0f);
+    static const float mb_start =
+        HdrLevel("fx_motion_blur_strength", "SOTC_FX_MOTION_BLUR", 100.0f);
     const auto level = [](std::atomic<float>& live, float start) {
         const float v = live.load(std::memory_order_relaxed);
         return std::clamp(v >= 0.0f ? v : start, 0.0f, 400.0f) / 100.0f;
@@ -246,15 +248,16 @@ static void RefreshEffectLevels() {
     float bloom = level(SotcLive::fx_bloom, bloom_start);
     float vignette = level(SotcLive::fx_vignette, vignette_start);
     float fog = level(SotcLive::fx_fog, fog_start);
+    float motion_blur = level(SotcLive::fx_motion_blur, mb_start);
     // SOTC_FX_CYCLE=<seconds> (testing): the effects at 0%, 100% and 300% in turn, each for that
-    // long; SOTC_FX_CYCLE_WHAT picks them (bloom, vignette, fog; all when unset).
+    // long; SOTC_FX_CYCLE_WHAT picks them (bloom, vignette, fog, motion; all when unset).
     static const float cycle = [] {
         const char* v = std::getenv("SOTC_FX_CYCLE");
         return v ? static_cast<float>(std::atof(v)) : 0.0f;
     }();
     static const std::string cycle_what = [] {
         const char* v = std::getenv("SOTC_FX_CYCLE_WHAT");
-        return std::string(v ? v : "bloom,vignette,fog");
+        return std::string(v ? v : "bloom,vignette,fog,motion");
     }();
     if (cycle > 0.0f) {
         static const auto t0 = std::chrono::steady_clock::now();
@@ -270,6 +273,9 @@ static void RefreshEffectLevels() {
         if (cycle_what.find("fog") != std::string::npos) {
             fog = v;
         }
+        if (cycle_what.find("motion") != std::string::npos) {
+            motion_blur = v;
+        }
         static int last = -1;
         if (step != last) {
             last = step;
@@ -280,11 +286,12 @@ static void RefreshEffectLevels() {
         }
     }
     if (SotcLive::compare_vanilla.load(std::memory_order_relaxed)) { // F3: the game's
-        bloom = vignette = fog = 1.0f;
+        bloom = vignette = fog = motion_blur = 1.0f;
     }
     SotcTonemap::bloom.store(bloom, std::memory_order_relaxed);
     SotcTonemap::vignette.store(vignette, std::memory_order_relaxed);
     SotcTonemap::fog.store(fog, std::memory_order_relaxed);
+    SotcTonemap::motion_blur.store(motion_blur, std::memory_order_relaxed);
 }
 
 bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format format) {

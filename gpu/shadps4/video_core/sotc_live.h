@@ -73,6 +73,7 @@ inline std::atomic<float> hdr_grading{-1.f};
 inline std::atomic<float> fx_bloom{-1.f};
 inline std::atomic<float> fx_vignette{-1.f};
 inline std::atomic<float> fx_fog{-1.f};
+inline std::atomic<float> fx_motion_blur{-1.f};
 
 /// F3: the game's own picture (tone mapper, grading, picture controls and effect strengths at
 /// the game's), brightness and peak kept, to compare with the user's settings.

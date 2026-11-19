@@ -29,6 +29,12 @@ enum Mode : int {
 inline std::atomic<int> wanted{kVanilla};
 inline std::atomic<float> grading{1.0f};
 
+/// Effect strengths (presenter RefreshEffectLevels, every frame), 1 = the game's: the bloom the
+/// tonemap adds (its img6; the first bloom upsample's scale, kBloomUpsampleHash dword 24) and
+/// the vignette (tonemap dword 54).
+inline std::atomic<float> bloom{1.0f};
+inline std::atomic<float> vignette{1.0f};
+
 /// Vanilla+'s ceiling (the curve's limit A / C). With the game's scale 0.556 it stays under the
 /// pass's min 10 cap (16 * 0.556 = 8.9), so the final pass's roll-off shapes the highlights.
 inline constexpr float kPlusCeiling = 16.0f;

@@ -2479,6 +2479,11 @@ constexpr u64 kTonemapHash = 0x291dbcd0;
 constexpr u64 kHdrCompositeHash = 0xdfd767b6;
 constexpr u32 kHdrCurveDword = 20; // its exponent k
 constexpr u32 kVignetteDword = 51;
+// sotc: the bloom's upsample chain (one 9-tap tent upsample per mip, output * dword 24), from the
+// bright pass (0x99288157) down to the tonemap's img6. Linear after the bright pass, so the scale
+// of the frame's first upsample scales the bloom (SOTC_FX_BLOOM).
+constexpr u64 kBloomUpsampleHash = 0x181538e7;
+constexpr u32 kBloomScaleDword = 24;
 
 // sotc: the game's colour grading in the tonemap's constants at a strength 0..1 (SOTC_HDR_GRADING):
 // saturation and contrast towards 1, the tint and the per channel gamma towards grey (their
@@ -3637,6 +3642,26 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         std::fprintf(stderr, "%s\n", line.c_str());
                     }
                 }
+                // sotc: bloom strength, on the first upsample of the frame (the tonemap draw
+                // starts the next frame's count).
+                static bool bloom_first = true;
+                static std::vector<u32> bloom_flat;
+                if (stage.pgm_hash == kBloomUpsampleHash &&
+                    stage.FlatBuf().size() > kBloomScaleDword && std::exchange(bloom_first, false)) {
+                    const float bloom = SotcTonemap::bloom.load(std::memory_order_relaxed);
+                    static float logged_bloom = -1.0f;
+                    if (tonemap_log && bloom != logged_bloom) {
+                        logged_bloom = bloom;
+                        std::fprintf(stderr, "SOTC BLOOM x%g (game scale %g)\n", bloom,
+                                     std::bit_cast<float>(stage.FlatBuf()[kBloomScaleDword]));
+                    }
+                    if (bloom != 1.0f) {
+                        bloom_flat.assign(stage.FlatBuf().begin(), stage.FlatBuf().end());
+                        bloom_flat[kBloomScaleDword] = std::bit_cast<u32>(
+                            std::bit_cast<float>(bloom_flat[kBloomScaleDword]) * bloom);
+                        flat = bloom_flat.data();
+                    }
+                }
                 static std::vector<u32> tonemap_flat;
                 static const bool vignette_after = [] {
                     const char* v = std::getenv("SOTC_DLSS_VIGNETTE");
@@ -3650,9 +3675,17 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     // sotc: the tone mapper of the user's choice, as the curve constants of the
                     // game's own pass (sotc_tonemap.h): any upscaler, the UI untouched.
                     const int tm = SotcTonemap::wanted.load(std::memory_order_relaxed);
-                    if (vignette || grading != 1.0f || tm != SotcTonemap::kVanilla) {
+                    const float vignette_scale =
+                        SotcTonemap::vignette.load(std::memory_order_relaxed);
+                    bloom_first = true;
+                    if (vignette || grading != 1.0f || tm != SotcTonemap::kVanilla ||
+                        vignette_scale != 1.0f) {
                         tonemap_flat.assign(stage.FlatBuf().begin(), stage.FlatBuf().end());
                         flat = tonemap_flat.data();
+                    }
+                    if (vignette_scale != 1.0f) { // sotc: SOTC_FX_VIGNETTE (also after DLSS)
+                        tonemap_flat[kVignetteDword + 3] = std::bit_cast<u32>(
+                            std::bit_cast<float>(tonemap_flat[kVignetteDword + 3]) * vignette_scale);
                     }
                     if (vignette) {
                         float params[4];

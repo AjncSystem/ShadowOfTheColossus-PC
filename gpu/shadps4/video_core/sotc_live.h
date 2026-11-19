@@ -48,4 +48,9 @@ inline std::atomic<float> hdr_grade[kGradeCount]{kGradeUnset, kGradeUnset, kGrad
 inline std::atomic<int> hdr_tonemap{-1};
 inline std::atomic<float> hdr_grading{-1.f};
 
+/// Effect strengths in percent, 100 = the game's (SOTC_FX_BLOOM, SOTC_FX_VIGNETTE; launcher
+/// fx_bloom_strength, fx_vignette_strength). -1: the value read at start.
+inline std::atomic<float> fx_bloom{-1.f};
+inline std::atomic<float> fx_vignette{-1.f};
+
 } // namespace SotcLive

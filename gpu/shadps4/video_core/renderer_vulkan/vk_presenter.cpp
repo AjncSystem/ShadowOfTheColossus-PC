@@ -203,6 +203,41 @@ static void RefreshHdrLevels(HostPasses::PostProcessingPass::Settings& s) {
         std::memory_order_relaxed);
 }
 
+// sotc: effect strengths for the rasterizer (sotc_tonemap.h), every frame, SDR or HDR: the F1
+// menu's live value, else the launcher's / the environment's at start; percent, 100 = the game's.
+static void RefreshEffectLevels() {
+    static const float bloom_start = HdrLevel("fx_bloom_strength", "SOTC_FX_BLOOM", 100.0f);
+    static const float vignette_start =
+        HdrLevel("fx_vignette_strength", "SOTC_FX_VIGNETTE", 100.0f);
+    const auto level = [](std::atomic<float>& live, float start) {
+        const float v = live.load(std::memory_order_relaxed);
+        return std::clamp(v >= 0.0f ? v : start, 0.0f, 400.0f) / 100.0f;
+    };
+    float bloom = level(SotcLive::fx_bloom, bloom_start);
+    float vignette = level(SotcLive::fx_vignette, vignette_start);
+    // SOTC_FX_CYCLE=<seconds> (testing): both at 0%, 100% and 300% in turn, each for that long.
+    static const float cycle = [] {
+        const char* v = std::getenv("SOTC_FX_CYCLE");
+        return v ? static_cast<float>(std::atof(v)) : 0.0f;
+    }();
+    if (cycle > 0.0f) {
+        static const auto t0 = std::chrono::steady_clock::now();
+        const float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - t0).count();
+        const int step = static_cast<int>(t / cycle) % 3;
+        bloom = vignette = step == 0 ? 0.0f : step == 1 ? 1.0f : 3.0f;
+        static int last = -1;
+        if (step != last) {
+            last = step;
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+            std::fprintf(stderr, "SOTC FX CYCLE %d at %lld\n", step, static_cast<long long>(ms));
+        }
+    }
+    SotcTonemap::bloom.store(bloom, std::memory_order_relaxed);
+    SotcTonemap::vignette.store(vignette, std::memory_order_relaxed);
+}
+
 bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format format) {
     const vk::FormatProperties props{physical_device.getFormatProperties(format)};
     return static_cast<bool>(props.optimalTilingFeatures & vk::FormatFeatureFlagBits::eBlitDst);
@@ -987,6 +1022,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // to the frame's size; the post process pass puts the UI layer back over it. Frames without
     // that scene (menus, loading screens) are presented as before.
     Dlssg::SetHdr(pp_settings.hdr != 0);
+    RefreshEffectLevels();
     if (pp_settings.hdr == 1) {
         RefreshHdrLevels(pp_settings);
     } else { // sotc: the game's tonemap as it is without game HDR (SDR clips above 1)

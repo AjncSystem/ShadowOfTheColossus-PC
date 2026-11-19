@@ -967,6 +967,26 @@ void BuildItems() {
                     "How strongly the game's per-place colour look applies (tint, saturation, contrast). 100% is the original; 0% removes the colour cast and keeps the brightness."),
                   "hdr_grading", SotcLive::hdr_grading, "SOTC_HDR_GRADING", 100.0f, gradings)
             .slider = true;
+
+        // Effect strengths (sotc_tonemap.h), live, SDR and HDR: 0..200% of the game's.
+        std::vector<std::pair<float, std::string>> strengths;
+        for (int p = 0; p <= 200; p += 10) {
+            strengths.push_back({float(p), std::to_string(p) + "%"});
+        }
+        MenuItem& bloom = add_level(
+            L("Brilho difuso (bloom)", "Bloom"),
+            L("A força do brilho que se espalha em volta das luzes e do céu. 100% é o original; 0% tira.",
+              "How strong the glow around lights and the sky is. 100% is the original; 0% removes it."),
+            "fx_bloom_strength", SotcLive::fx_bloom, "SOTC_FX_BLOOM", 100.0f, strengths);
+        bloom.slider = true;
+        bloom.shown = [] { return true; }; // SDR too
+        MenuItem& vignette = add_level(
+            L("Força da vinheta", "Vignette strength"),
+            L("Quanto os cantos da imagem escurecem. 100% é o original; 0% tira. Com a vinheta desligada acima, não faz nada.",
+              "How much the corners of the picture darken. 100% is the original; 0% removes it. Does nothing with the vignette switched off above."),
+            "fx_vignette_strength", SotcLive::fx_vignette, "SOTC_FX_VIGNETTE", 100.0f, strengths);
+        vignette.slider = true;
+        vignette.shown = [] { return true; };
     }
     AddRestart(kTabDisplay, "af16", L("Filtro de texturas 16x", "16x texture filtering"),
                L("Texturas nítidas no chão visto de lado (filtro anisotrópico 16x).",

@@ -44,16 +44,29 @@ layout (set = 0, binding = 0) uniform texture2D InputTexture;
 layout (set = 0, binding = 1, rgba16f) uniform image2D OutputTexture;
 layout (set = 0, binding = 2) uniform sampler InputSampler;
 
+// sotc: Sample.y bit 0: the input is linear HDR (above 1), compressed per channel by x / (1 + x)
+// as it is read; bit 1: the output expanded back by c / (1 - c). FSR 1 works in half precision
+// and its RCAS limiter assumes 0..1, so a linear HDR scene (the game's scene apart from its UI)
+// is filtered compressed, then restored.
+vec4 SotcCompress(vec4 v) { return (Sample.y & 1u) != 0u ? v / (1.0 + max(v, vec4(0.0))) : v; }
+vec3 SotcExpand(vec3 c) {
+    if ((Sample.y & 2u) == 0u) {
+        return c;
+    }
+    const vec3 f = clamp(c, vec3(0.0), vec3(0.999));
+    return f / (1.0 - f);
+}
+
 #if SAMPLE_EASU
 #define FSR_EASU_H 1
-AH4 FsrEasuRH(AF2 p) { AH4 res = AH4(textureGather(sampler2D(InputTexture, InputSampler), p, 0)); return res; }
-AH4 FsrEasuGH(AF2 p) { AH4 res = AH4(textureGather(sampler2D(InputTexture, InputSampler), p, 1)); return res; }
-AH4 FsrEasuBH(AF2 p) { AH4 res = AH4(textureGather(sampler2D(InputTexture, InputSampler), p, 2)); return res; }
+AH4 FsrEasuRH(AF2 p) { AH4 res = AH4(SotcCompress(textureGather(sampler2D(InputTexture, InputSampler), p, 0))); return res; }
+AH4 FsrEasuGH(AF2 p) { AH4 res = AH4(SotcCompress(textureGather(sampler2D(InputTexture, InputSampler), p, 1))); return res; }
+AH4 FsrEasuBH(AF2 p) { AH4 res = AH4(SotcCompress(textureGather(sampler2D(InputTexture, InputSampler), p, 2))); return res; }
 #endif// SAMPLE_EASU
 
 #if SAMPLE_RCAS
 #define FSR_RCAS_H
-AH4 FsrRcasLoadH(ASW2 p) { return AH4(texelFetch(sampler2D(InputTexture, InputSampler), ASU2(p), 0)); }
+AH4 FsrRcasLoadH(ASW2 p) { return AH4(SotcCompress(texelFetch(sampler2D(InputTexture, InputSampler), ASU2(p), 0))); }
 void FsrRcasInputH(inout AH1 r, inout AH1 g, inout AH1 b) { }
 #endif// SAMPLE_RCAS
 
@@ -66,14 +79,14 @@ void CurrFilter(AU2 pos)
     FsrEasuH(c, pos, Const0, Const1, Const2, Const3);
     if (Sample.x == 1)
     c *= c;
-    imageStore(OutputTexture, ASU2(pos), AH4(c, 1));
+    imageStore(OutputTexture, ASU2(pos), vec4(SotcExpand(vec3(c)), 1.0));
     #endif// SAMPLE_EASU
 #if SAMPLE_RCAS
     AH3 c;
     FsrRcasH(c.r, c.g, c.b, pos, Const0);
     if (Sample.x == 1)
     c *= c;
-    imageStore(OutputTexture, ASU2(pos), AH4(c, 1));
+    imageStore(OutputTexture, ASU2(pos), vec4(SotcExpand(vec3(c)), 1.0));
     #endif// SAMPLE_RCAS
 }
 

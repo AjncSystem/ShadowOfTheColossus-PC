@@ -1081,6 +1081,19 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         SotcTonemap::wanted.store(SotcTonemap::kVanilla, std::memory_order_relaxed);
         SotcTonemap::grading.store(1.0f, std::memory_order_relaxed);
     }
+    // sotc: with game HDR, the scene and the UI apart on FSR 1 too (Dlssg::SetSplitComposite).
+    Dlssg::SetSplitComposite(pp_settings.hdr == 1);
+    // sotc: upscaler and sharpening as the in-game menu set them (sotc_live.h)
+    if (const int live = SotcLive::fsr1.load(std::memory_order_relaxed); live >= 0) {
+        fsr_settings.enable = live != 0;
+    }
+    if (const int live = SotcLive::rcas.load(std::memory_order_relaxed); live != -1) {
+        fsr_settings.use_rcas = live >= 0;
+        if (live >= 0) {
+            fsr_settings.rcas_attenuation = static_cast<float>(live) / 1000.f;
+        }
+    }
+    fsr_settings.linear_hdr = false;
     auto upscaled = Dlssg::Upscale(frame->id, draw_scheduler, texture_cache, runtime,
                                    frame->width, frame->height);
     // sotc: a buffer flipped again right after itself (PS4 Pro mode at the 30 FPS cap flips each
@@ -1134,8 +1147,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             // sotc: no DLSS inputs (splash, menus): the scene as FSR1 would scale the frame, only
             // the UI layer is drawn at the output size.
             scene_size = {upscaled.scene_width, upscaled.scene_height};
+            auto scene_fsr = fsr_settings;
+            scene_fsr.linear_hdr = pp_settings.hdr == 1; // the fp16 scene goes above 1
             scene = fsr_pass.Render(cmdbuf, scene, scene_size, {frame->width, frame->height},
-                                    fsr_settings, false);
+                                    scene_fsr, false);
             if (DebugState.is_using_fsr) {
                 scene_size = {frame->width, frame->height};
             }
@@ -1143,8 +1158,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                    (upscaled.scene_width != frame->width || upscaled.scene_height != frame->height)) {
             // sotc: DLSS went 2x (PS4 Pro mode at 4K: 1600x900 -> 3200x1800): FSR 1 the rest
             scene_size = {upscaled.scene_width, upscaled.scene_height};
+            auto scene_fsr = fsr_settings;
+            scene_fsr.linear_hdr = pp_settings.hdr == 1;
             scene = fsr_pass.Render(cmdbuf, scene, scene_size, {frame->width, frame->height},
-                                    fsr_settings, false);
+                                    scene_fsr, false);
             if (DebugState.is_using_fsr) {
                 scene_size = {frame->width, frame->height};
             }
@@ -1170,16 +1187,6 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                         vk::AccessFlagBits2::eShaderRead);
         runtime.FlushBarriers();
 
-        // sotc: upscaler and sharpening as the in-game menu set them (sotc_live.h)
-        if (const int live = SotcLive::fsr1.load(std::memory_order_relaxed); live >= 0) {
-            fsr_settings.enable = live != 0;
-        }
-        if (const int live = SotcLive::rcas.load(std::memory_order_relaxed); live != -1) {
-            fsr_settings.use_rcas = live >= 0;
-            if (live >= 0) {
-                fsr_settings.rcas_attenuation = static_cast<float>(live) / 1000.f;
-            }
-        }
         image_view = fsr_pass.Render(cmdbuf, image_view, image_size,
                                      {frame->width, frame->height}, fsr_settings,
                                      frame->is_hdr && pp_settings.hdr != 2);

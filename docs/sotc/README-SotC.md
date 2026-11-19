@@ -68,10 +68,10 @@ Tudo isto está no lançador, na página **Imagem e FPS** (e os principais em **
 - **Texturas nítidas**: filtro anisotrópico 16x, quase sem custo.
 - **HDR**: saída HDR10 com a renderização HDR do próprio jogo; o HDR do Windows precisa estar
   ligado. O branco fica em 200 nits (`SOTC_HDR_WHITE` muda). Funciona com FSR 1 e DLSS. Os realces
-  descem suavemente até o pico da tela (lido do Windows) em vez de estourar; com DLSS a interface
-  tem brilho próprio. Controles de imagem no estilo RenoDX: exposição, realces, sombras,
-  contraste, saturação e desbotar realces, neutros por padrão e só no mundo (não na interface,
-  com DLSS); contraste, realces e sombras giram em torno do brilho médio da cena, medido a cada
+  descem suavemente até o pico da tela (lido do Windows) em vez de estourar; a interface
+  tem brilho próprio (com FSR 1 e DLSS). Controles de imagem no estilo RenoDX: exposição, realces,
+  sombras, contraste, saturação e desbotar realces, neutros por padrão e só no mundo (não na
+  interface); contraste, realces e sombras giram em torno do brilho médio da cena, medido a cada
   quadro. Também saturação dos realces, compensação de véu (pretos mais fundos) e correção de gama
   (a parte escura como numa tela SDR de gama 2.2). Curva de tons: **Original** (a do jogo),
   **Original+** (os mesmos tons médios e escuros, mas os realces continuam subindo até o pico da
@@ -197,7 +197,7 @@ Estas variáveis de ambiente ajudam a investigar problemas:
 | `SOTC_SLOW_BUILD_MS=500` | o log mostra `SOTC SLOW BUILD` para cada pipeline construído em segundo plano (ou esperado pela gravação de comandos) que levou esse tempo ou mais; `SOTC SYNC PIPELINE` mostra os construídos na thread de comandos acima de 30 ms (`SOTC_SYNC_PIPELINE_MS`). Para as travadas longas nas placas Intel Arc |
 | `SOTC_HDR_WHITE=nits` | com HDR: o branco do jogo em nits (padrão 200; a saída do próprio jogo tem ~100) |
 | `SOTC_HDR_PEAK=nits` | com HDR: o pico da tela; os realces descem suavemente até ele (BT.2390). Padrão `auto` (o valor do Windows, 1000 sem ele); `off` corta como antes |
-| `SOTC_HDR_UI=nits` | com HDR e DLSS: o brilho da interface (menus, legendas, HUD), separado do brilho do jogo. Padrão: igual ao `SOTC_HDR_WHITE` |
+| `SOTC_HDR_UI=nits` | com HDR: o brilho da interface (menus, legendas, HUD), separado do brilho do jogo. Padrão: igual ao `SOTC_HDR_WHITE` |
 | `SOTC_HDR_EXPOSURE=EV` | com HDR: exposição do mundo em pontos, -3 a 3 (padrão 0) |
 | `SOTC_HDR_CONTRAST=0..100` | com HDR: contraste em torno do brilho médio da cena (padrão 50 = original) |
 | `SOTC_HDR_SHADOWS=0..100` | com HDR: acima de 50 clareia as partes escuras, abaixo aprofunda (padrão 50) |
@@ -209,6 +209,7 @@ Estas variáveis de ambiente ajudam a investigar problemas:
 | `SOTC_HDR_GAMMA_CORRECTION=0\|100` | com HDR: a parte escura decodificada como gama 2.2 em vez de sRGB (padrão 0, desligado) |
 | `SOTC_HDR_HUE_CORRECTION=0..100` | com HDR e a curva `vanilla_plus_hue`: quanto o tom dos realces volta ao do jogo (padrão 100) |
 | `SOTC_HDR_TONEMAP=vanilla\|vanilla_plus\|vanilla_plus_hue\|none` | com HDR: a curva de tons do jogo (padrão `vanilla`); `vanilla_plus` mantém os tons médios e deixa os realces subirem até o pico; `vanilla_plus_hue` faz o mesmo no brilho, mantendo a cor; `none` tira a curva |
+| `SOTC_FSR1_SPLIT=0` | com HDR e FSR 1: volta a ampliar a imagem do jogo já com a interface (sem brilho próprio da interface; os controles de imagem valem para a interface também) |
 | `SOTC_HDR_GRADING=0..100` | com HDR: a força da correção de cor do jogo em porcentagem (padrão 100); 0 tira o tom de cor de cada lugar e mantém o brilho |
 | `SOTC_TONEMAP_LOG=1` | diagnóstico: as constantes do tonemap do jogo quando mudam e a curva aplicada |
 | `SOTC_HDR_TONEMAP_CYCLE=s` | teste: alterna as curvas de tons a cada `s` segundos (comparar capturas da mesma cena) |

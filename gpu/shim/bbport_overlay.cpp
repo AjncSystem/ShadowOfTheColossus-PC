@@ -868,8 +868,8 @@ void BuildItems() {
             uis.push_back({float(v), std::to_string(v) + " " + nits});
         }
         add_level(L("HDR: brilho da interface", "HDR: UI brightness"),
-                  L("O brilho de menus, legendas e HUD em nits, separado do mundo. Arraste a barra ou use ◀ ▶. Só com DLSS (a interface é uma camada à parte).",
-                    "The brightness of menus, subtitles and HUD in nits, apart from the world. Drag the bar or use ◀ ▶. DLSS only (the UI is a separate layer there)."),
+                  L("O brilho de menus, legendas e HUD em nits, separado do mundo. Arraste a barra ou use ◀ ▶.",
+                    "The brightness of menus, subtitles and HUD in nits, apart from the world. Drag the bar or use ◀ ▶."),
                   "hdr_ui", SotcLive::hdr_ui, "SOTC_HDR_UI", 0.0f, uis)
             .slider = true;
 

@@ -1510,7 +1510,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             // sotc: SOTC_FPS_DYNAMIC: the 60 FPS limit lowered while the game cannot keep it.
             if (const int dyn = SotcFpsCap::dynamic_limit.load(std::memory_order_relaxed);
                 dyn > 0 && limit_vblanks == vblanks_for(60)) {
-                limit_vblanks = vblanks_for(dyn); // the vblank grid's rounding; paced: exact
+                limit_vblanks = vblanks_for(dyn / 100); // the vblank grid's rounding; paced: exact
             }
             const bool paced = SotcFpsCap::flip_pacer.load(std::memory_order_relaxed);
             if (limit_vblanks != 0 && !paced) {
@@ -1526,8 +1526,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                     // a whole number of 120 Hz vblanks).
                     const int dyn = SotcFpsCap::dynamic_limit.load(std::memory_order_relaxed);
                     const std::chrono::nanoseconds limit_period =
-                        dyn > 0 && limit_vblanks == vblanks_for(dyn)
-                            ? std::chrono::nanoseconds{1'000'000'000 / dyn}
+                        dyn > 0 && limit_vblanks == vblanks_for(dyn / 100)
+                            ? std::chrono::nanoseconds{100'000'000'000LL / dyn}
                             : std::chrono::duration_cast<std::chrono::nanoseconds>(
                                   vblank_period * limit_vblanks);
                     limit_next = (now - limit_next < tick_period ? limit_next : now) + limit_period;

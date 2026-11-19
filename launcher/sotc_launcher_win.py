@@ -824,6 +824,18 @@ def screen_refresh_hz():
     return 60
 
 
+def dynamic_fps_step(hz):
+    """sotc: the dynamic FPS step (SOTC_FPS_DYNAMIC): the refresh rate divided by the smallest whole
+    number that brings it to 50 or less, so every frame lasts the same number of refreshes (48 at
+    144 Hz, 40 at 120 Hz, 30 at 60 Hz, 50 at 100 Hz, 37.5 at 75 Hz, 41.25 at 165 Hz). Before #454 a
+    rate that 48, 40 and 45 do not divide fell to 30, which does not divide 75, 100 or 165 Hz."""
+    hz = hz if hz and hz >= 30 else 60
+    divisor = 2
+    while hz / divisor > 50:
+        divisor += 1
+    return f'{hz / divisor:.2f}'.rstrip('0').rstrip('.')
+
+
 def game_environment(s):
     env = dict(os.environ)
     info = game_info(s['game_dir'])
@@ -861,9 +873,7 @@ def game_environment(s):
     # that cannot keep 60 lower it to a step that divides the screen's refresh (48 at 144 Hz, 40 at
     # 120/240 Hz, 30 at 60 Hz), steady instead of swinging; it tries 60 again every 10 s.
     if fps_mode == '60' and s.get('fps_dynamic', True):
-        hz = screen_refresh_hz()
-        step = 48 if hz % 48 == 0 else 40 if hz % 40 == 0 else 45 if hz % 45 == 0 else 30
-        env.setdefault('SOTC_FPS_DYNAMIC', str(step))
+        env.setdefault('SOTC_FPS_DYNAMIC', dynamic_fps_step(screen_refresh_hz()))
     env['BB_VBLANK_HZ'] = '120'
     env['BB_FULLSCREEN'] = '1' if s['fullscreen'] else '0'
     # The monitor the game window opens on (window.cpp): the centre of the chosen one, found again now

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <mutex>
 #include <vector>
 #include "common/types.h"
@@ -94,6 +95,10 @@ public:
         return needs_hdr;
     }
 
+    /// sotc: HDR10 metadata for the display: the content's peak and frame average in nits.
+    /// Any thread; applied at the next Present when it changed (and after each recreation).
+    void SetHdrMetadata(float peak_nits, float average_nits);
+
 private:
     /// Selects the best available swapchain image format
     void FindPresentFormat();
@@ -112,6 +117,9 @@ private:
 
     /// Creates the image acquired and present ready semaphores
     void RefreshSemaphores();
+
+    /// sotc: vkSetHdrMetadataEXT with the values of SetHdrMetadata (present thread)
+    void ApplyHdrMetadata();
 
 private:
     const Instance& instance;
@@ -136,6 +144,9 @@ private:
     bool needs_recreation = true;
     bool needs_hdr = false;    // The game requested HDR swapchain
     bool supports_hdr = false; // SC supports HDR output
+    // sotc: SetHdrMetadata's values (bit patterns of floats) and what this swapchain has.
+    std::atomic<u64> hdr_meta_wanted{0};
+    u64 hdr_meta_applied = ~0ull;
 };
 
 } // namespace Vulkan

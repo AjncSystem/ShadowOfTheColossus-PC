@@ -48,6 +48,8 @@ public:
         float highlights = 1.0f; ///< extra power above mid grey (> 1 brightens)
         float saturation = 1.0f; ///< chroma scale
         float blowout = 0.0f;    ///< 0..1: highlights fade towards white near the peak
+        /// sotc: hdr 1: nits of the peak test pattern's inner square; 0: the game (no pattern)
+        float test_peak = 0.0f;
     };
 
     void Create(vk::Device device, vk::Format surface_format);

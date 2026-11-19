@@ -40,6 +40,7 @@ layout (push_constant) uniform settings {
     float highlights; // extra power above mid grey (1)
     float saturation; // chroma scale (1)
     float blowout;    // highlights towards white near the peak, 0..1 (0)
+    float test_peak;  // sotc: hdr 1: the peak test pattern's inner square in nits (0: off)
 } pp;
 
 // sotc: linear Rec.709 -> HDR10 (Rec.2020 primaries, ST 2084 PQ) for an SDR game. SDR white sits at
@@ -197,7 +198,22 @@ vec4 sampleCatmullRom(sampler2D tex, vec2 p) {
     return clamp(r, 0.0, 1.0);
 }
 
+// sotc: the peak test pattern (F1 > Image), like Windows HDR Calibration's: a dim surround, a
+// square at 10000 nits (the display clips it at its real peak) and in it a smaller one at the
+// peak setting, no roll-off. Raising the setting until the inner square disappears finds the
+// display's peak.
+float peakTestNits() {
+    const vec2 size = vec2(textureSize(texSampler, 0));
+    const vec2 p = (uv - 0.5) * vec2(size.x / max(size.y, 1.0), 1.0);
+    const float m = max(abs(p.x), abs(p.y));
+    return m < 0.07 ? pp.test_peak : m < 0.22 ? 10000.0 : 2.0;
+}
+
 void main() {
+    if (pp.hdr == 1u && pp.test_peak > 0.0) {
+        color = vec4(pqEncode(vec3(peakTestNits())), 1.0);
+        return;
+    }
     vec4 color_linear = texture(texSampler, uv);
     if (pp.sky_sharpen != 0.0) {
         // DLSS softens the drifting clouds more than FSR1: extra unsharp there, limited to the

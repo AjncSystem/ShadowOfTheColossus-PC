@@ -459,6 +459,8 @@ bool Instance::CreateDevice() {
     }
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
+    // sotc: HDR10 mastering metadata for the display (the peak the game's roll-off targets).
+    hdr_metadata = add_extension(VK_EXT_HDR_METADATA_EXTENSION_NAME);
     // Device fault reporting: lets us print the faulting address/type after a device loss.
     device_fault = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
     if (device_fault) {

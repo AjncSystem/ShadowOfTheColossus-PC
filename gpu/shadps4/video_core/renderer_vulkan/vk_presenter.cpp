@@ -154,10 +154,22 @@ static void RefreshHdrLevels(HostPasses::PostProcessingPass::Settings& s) {
     s.highlights = power(g[SotcLive::kHighlights]);
     s.saturation = g[SotcLive::kSaturation] / 50.0f;
     s.blowout = g[SotcLive::kBlowout] / 100.0f;
+    const bool compare = SotcLive::compare_vanilla.load(std::memory_order_relaxed);
+    if (compare) { // F3: the game's picture at the user's brightness and peak
+        s.exposure = s.contrast = s.shadows = s.highlights = s.saturation = 1.0f;
+        s.blowout = 0.0f;
+    }
+    // The peak test pattern: the F1 menu's switch, or SOTC_HDR_PEAK_TEST=1 from the start.
+    static const bool peak_test_env = [] {
+        const char* v = std::getenv("SOTC_HDR_PEAK_TEST");
+        return v && v[0] == '1';
+    }();
+    s.test_peak =
+        peak_test_env || SotcLive::hdr_peak_test.load(std::memory_order_relaxed) ? peak : 0.0f;
 
     // Tone mapper (launcher hdr_tonemap / SOTC_HDR_TONEMAP: vanilla, vanilla_plus, none) and the
-    // strength of the game's colour grading (hdr_grading / SOTC_HDR_GRADING, percent, 100 = the game's). The
-    // rasterizer reads them at the tonemap draw (sotc_tonemap.h).
+    // strength of the game's colour grading (hdr_grading / SOTC_HDR_GRADING, percent, 100 = the
+    // game's). The rasterizer reads them at the tonemap draw (sotc_tonemap.h).
     static const int tonemap_start = [] {
         std::string v = BbOverlay::LauncherSetting("hdr_tonemap");
         if (v.empty()) {
@@ -176,7 +188,8 @@ static void RefreshHdrLevels(HostPasses::PostProcessingPass::Settings& s) {
         std::clamp(HdrLevel("hdr_grading", "SOTC_HDR_GRADING", 100.0f), 0.0f, 100.0f);
     const int live_tm = SotcLive::hdr_tonemap.load(std::memory_order_relaxed);
     const float live_grading = SotcLive::hdr_grading.load(std::memory_order_relaxed);
-    // SOTC_HDR_TONEMAP_CYCLE=<seconds> (testing): vanilla, vanilla+ and none in turn, each for that long, so screenshots of one scene compare them.
+    // SOTC_HDR_TONEMAP_CYCLE=<seconds> (testing): vanilla, vanilla+ and none in turn, each for
+    // that long, so screenshots of one scene compare them.
     static const float cycle = [] {
         const char* v = std::getenv("SOTC_HDR_TONEMAP_CYCLE");
         return v ? static_cast<float>(std::atof(v)) : 0.0f;
@@ -196,11 +209,12 @@ static void RefreshHdrLevels(HostPasses::PostProcessingPass::Settings& s) {
                          static_cast<long long>(ms));
         }
     }
-    SotcTonemap::wanted.store(std::clamp(tm, 0, SotcTonemap::kModeCount - 1),
+    const float grading =
+        std::clamp(live_grading >= 0.0f ? live_grading : grading_start, 0.0f, 100.0f) / 100.0f;
+    SotcTonemap::wanted.store(compare ? SotcTonemap::kVanilla
+                                      : std::clamp(tm, 0, SotcTonemap::kModeCount - 1),
                               std::memory_order_relaxed);
-    SotcTonemap::grading.store(
-        std::clamp(live_grading >= 0.0f ? live_grading : grading_start, 0.0f, 100.0f) / 100.0f,
-        std::memory_order_relaxed);
+    SotcTonemap::grading.store(compare ? 1.0f : grading, std::memory_order_relaxed);
 }
 
 // sotc: effect strengths for the rasterizer (sotc_tonemap.h), every frame, SDR or HDR: the F1
@@ -209,22 +223,38 @@ static void RefreshEffectLevels() {
     static const float bloom_start = HdrLevel("fx_bloom_strength", "SOTC_FX_BLOOM", 100.0f);
     static const float vignette_start =
         HdrLevel("fx_vignette_strength", "SOTC_FX_VIGNETTE", 100.0f);
+    static const float fog_start = HdrLevel("fx_fog_strength", "SOTC_FX_FOG", 100.0f);
     const auto level = [](std::atomic<float>& live, float start) {
         const float v = live.load(std::memory_order_relaxed);
         return std::clamp(v >= 0.0f ? v : start, 0.0f, 400.0f) / 100.0f;
     };
     float bloom = level(SotcLive::fx_bloom, bloom_start);
     float vignette = level(SotcLive::fx_vignette, vignette_start);
-    // SOTC_FX_CYCLE=<seconds> (testing): both at 0%, 100% and 300% in turn, each for that long.
+    float fog = level(SotcLive::fx_fog, fog_start);
+    // SOTC_FX_CYCLE=<seconds> (testing): the effects at 0%, 100% and 300% in turn, each for that
+    // long; SOTC_FX_CYCLE_WHAT picks them (bloom, vignette, fog; all when unset).
     static const float cycle = [] {
         const char* v = std::getenv("SOTC_FX_CYCLE");
         return v ? static_cast<float>(std::atof(v)) : 0.0f;
+    }();
+    static const std::string cycle_what = [] {
+        const char* v = std::getenv("SOTC_FX_CYCLE_WHAT");
+        return std::string(v ? v : "bloom,vignette,fog");
     }();
     if (cycle > 0.0f) {
         static const auto t0 = std::chrono::steady_clock::now();
         const float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - t0).count();
         const int step = static_cast<int>(t / cycle) % 3;
-        bloom = vignette = step == 0 ? 0.0f : step == 1 ? 1.0f : 3.0f;
+        const float v = step == 0 ? 0.0f : step == 1 ? 1.0f : 3.0f;
+        if (cycle_what.find("bloom") != std::string::npos) {
+            bloom = v;
+        }
+        if (cycle_what.find("vignette") != std::string::npos) {
+            vignette = v;
+        }
+        if (cycle_what.find("fog") != std::string::npos) {
+            fog = v;
+        }
         static int last = -1;
         if (step != last) {
             last = step;
@@ -234,8 +264,12 @@ static void RefreshEffectLevels() {
             std::fprintf(stderr, "SOTC FX CYCLE %d at %lld\n", step, static_cast<long long>(ms));
         }
     }
+    if (SotcLive::compare_vanilla.load(std::memory_order_relaxed)) { // F3: the game's
+        bloom = vignette = fog = 1.0f;
+    }
     SotcTonemap::bloom.store(bloom, std::memory_order_relaxed);
     SotcTonemap::vignette.store(vignette, std::memory_order_relaxed);
+    SotcTonemap::fog.store(fog, std::memory_order_relaxed);
 }
 
 bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format format) {
@@ -1025,6 +1059,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     RefreshEffectLevels();
     if (pp_settings.hdr == 1) {
         RefreshHdrLevels(pp_settings);
+        // sotc: the display gets the peak the roll-off targets (10000: no roll-off).
+        swapchain.SetHdrMetadata(pp_settings.hdr_peak > 0.0f ? pp_settings.hdr_peak : 10000.0f,
+                                 pp_settings.hdr_white);
     } else { // sotc: the game's tonemap as it is without game HDR (SDR clips above 1)
         SotcTonemap::wanted.store(SotcTonemap::kVanilla, std::memory_order_relaxed);
         SotcTonemap::grading.store(1.0f, std::memory_order_relaxed);

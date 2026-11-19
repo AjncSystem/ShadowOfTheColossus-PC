@@ -2484,6 +2484,12 @@ constexpr u32 kVignetteDword = 51;
 // of the frame's first upsample scales the bloom (SOTC_FX_BLOOM).
 constexpr u64 kBloomUpsampleHash = 0x181538e7;
 constexpr u32 kBloomScaleDword = 24;
+// sotc: the volumetric fog's apply pass: the fog volume (img3: in-scatter, transmittance) at the
+// slice of the pixel's distance, slice = (distance * dword 31)^dword 32. Scaling dword 31 scales
+// the distance the fog gathers over: 0 none, 2 twice as thick (SOTC_FX_FOG). The fog that
+// materials add themselves (transparents) stays the game's.
+constexpr u64 kFogApplyHash = 0x059b9591;
+constexpr u32 kFogDistanceDword = 31;
 
 // sotc: the game's colour grading in the tonemap's constants at a strength 0..1 (SOTC_HDR_GRADING):
 // saturation and contrast towards 1, the tint and the per channel gamma towards grey (their
@@ -3660,6 +3666,16 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         bloom_flat[kBloomScaleDword] = std::bit_cast<u32>(
                             std::bit_cast<float>(bloom_flat[kBloomScaleDword]) * bloom);
                         flat = bloom_flat.data();
+                    }
+                }
+                static std::vector<u32> fog_flat;
+                if (stage.pgm_hash == kFogApplyHash && stage.FlatBuf().size() > kFogDistanceDword) {
+                    const float fog = SotcTonemap::fog.load(std::memory_order_relaxed);
+                    if (fog != 1.0f) {
+                        fog_flat.assign(stage.FlatBuf().begin(), stage.FlatBuf().end());
+                        fog_flat[kFogDistanceDword] = std::bit_cast<u32>(
+                            std::bit_cast<float>(fog_flat[kFogDistanceDword]) * fog);
+                        flat = fog_flat.data();
                     }
                 }
                 static std::vector<u32> tonemap_flat;

@@ -830,6 +830,14 @@ void BuildItems() {
                     "Your display's peak brightness. Highlights (sun, sky, water) roll off smoothly into it instead of clipping."),
                   "hdr_peak", SotcLive::hdr_peak, "SOTC_HDR_PEAK", 0.0f, peaks)
             .slider = true;
+        MenuItem& peak_test = AddLive(
+            kTabDisplay, L("HDR: teste do pico", "HDR: peak test pattern"),
+            L("Mostra um quadrado no brilho máximo e, dentro dele, outro no pico escolhido acima. Suba o pico até o quadrado de dentro sumir: esse é o pico real da tela. Desligue para voltar ao jogo.",
+              "Shows a square at full brightness with a smaller one inside at the peak chosen above. Raise the peak until the inner square disappears: that is your display's real peak. Switch it off to get back to the game."),
+            OnOff(),
+            [] { return SotcLive::hdr_peak_test.load(std::memory_order_relaxed) ? 1 : 0; },
+            [](int i) { SotcLive::hdr_peak_test.store(i == 1, std::memory_order_relaxed); });
+        peak_test.shown = hdr_on;
         std::vector<std::pair<float, std::string>> uis{
             {0.0f, L("Igual ao brilho do jogo", "Same as game brightness")}};
         for (int v = 50; v <= 500; v += 10) {
@@ -987,6 +995,13 @@ void BuildItems() {
             "fx_vignette_strength", SotcLive::fx_vignette, "SOTC_FX_VIGNETTE", 100.0f, strengths);
         vignette.slider = true;
         vignette.shown = [] { return true; };
+        MenuItem& fog = add_level(
+            L("Força da névoa", "Fog strength"),
+            L("Quanto a névoa atmosférica junta com a distância. 100% é o original; 0% tira; 200% dobra. Com a névoa desligada acima, não faz nada.",
+              "How much the atmospheric fog builds up with distance. 100% is the original; 0% removes it; 200% doubles it. Does nothing with the fog switched off above."),
+            "fx_fog_strength", SotcLive::fx_fog, "SOTC_FX_FOG", 100.0f, strengths);
+        fog.slider = true;
+        fog.shown = [] { return true; };
     }
     AddRestart(kTabDisplay, "af16", L("Filtro de texturas 16x", "16x texture filtering"),
                L("Texturas nítidas no chão visto de lado (filtro anisotrópico 16x).",
@@ -2360,6 +2375,21 @@ float FpsCounter() {
     return bottom;
 }
 
+// sotc: while F3 shows the game's original picture, a label at the top left says so.
+void CompareLabel() {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float pad = 12.0f * base_scale;
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + pad, viewport->WorkPos.y + pad),
+                            ImGuiCond_Always, ImVec2(0.0f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.5f);
+    ImGui::Begin("##compare", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoFocusOnAppearing);
+    ImGui::TextUnformatted("ORIGINAL (F3)");
+    ImGui::End();
+}
+
 void Toast() {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
@@ -2495,6 +2525,18 @@ bool HandleEvent(const SDL_Event& event) {
             toast_text = SotcUi::T("Geração de quadros: indisponível nesta placa", "Frame generation: not available on this GPU");
             toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
         }
+        return true;
+    }
+    // sotc: F3 switches between the user's picture and the game's own (tone mapper, grading,
+    // picture controls, effect strengths), brightness and peak kept; a label shows while on.
+    if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F3 && !event.key.repeat) {
+        const bool on = !SotcLive::compare_vanilla.load(std::memory_order_relaxed);
+        SotcLive::compare_vanilla.store(on, std::memory_order_relaxed);
+        const char* what = on ? SotcUi::T("F3: imagem original do jogo", "F3: the game's original picture")
+                              : SotcUi::T("F3: sua imagem", "F3: your picture");
+        SotcEvent::Log("KEY", "%s", what);
+        toast_text = what;
+        toast_until_ms.store(NowMs() + 2000, std::memory_order_relaxed);
         return true;
     }
     // sotc: F5 (diagnostic) saves the textures of the next frame (sotc_stats.h).
@@ -2749,7 +2791,8 @@ bool TriggerPending() {
 bool Visible() {
     return initialized && (menu_open || text_entry_active || list_active || OverlayOn() ||
                            ToastShown() || LoadingShown() || TriggerPending() ||
-                           upscaler_label.load(std::memory_order_relaxed));
+                           upscaler_label.load(std::memory_order_relaxed) ||
+                           SotcLive::compare_vanilla.load(std::memory_order_relaxed));
 }
 
 void SetUpscalerLabel(const char* label) {
@@ -2953,6 +2996,9 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
     }
     if (ToastShown()) {
         Toast();
+    }
+    if (SotcLive::compare_vanilla.load(std::memory_order_relaxed)) {
+        CompareLabel();
     }
     if (const char* label = upscaler_label.load(std::memory_order_relaxed)) {
         UpscalerLabel(label, fps_bottom);

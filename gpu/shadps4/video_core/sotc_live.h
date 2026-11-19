@@ -48,9 +48,17 @@ inline std::atomic<float> hdr_grade[kGradeCount]{kGradeUnset, kGradeUnset, kGrad
 inline std::atomic<int> hdr_tonemap{-1};
 inline std::atomic<float> hdr_grading{-1.f};
 
-/// Effect strengths in percent, 100 = the game's (SOTC_FX_BLOOM, SOTC_FX_VIGNETTE; launcher
-/// fx_bloom_strength, fx_vignette_strength). -1: the value read at start.
+/// Effect strengths in percent, 100 = the game's (SOTC_FX_BLOOM, SOTC_FX_VIGNETTE, SOTC_FX_FOG;
+/// launcher fx_bloom_strength, fx_vignette_strength, fx_fog_strength). -1: the value read at
+/// start.
 inline std::atomic<float> fx_bloom{-1.f};
 inline std::atomic<float> fx_vignette{-1.f};
+inline std::atomic<float> fx_fog{-1.f};
+
+/// F3: the game's own picture (tone mapper, grading, picture controls and effect strengths at
+/// the game's), brightness and peak kept, to compare with the user's settings.
+inline std::atomic<bool> compare_vanilla{false};
+/// F1 > Image: the peak brightness test pattern instead of the game (vk_presenter.cpp).
+inline std::atomic<bool> hdr_peak_test{false};
 
 } // namespace SotcLive

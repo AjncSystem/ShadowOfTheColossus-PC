@@ -72,7 +72,10 @@ Tudo isto está no lançador, na página **Imagem e FPS** (e os principais em **
   tem brilho próprio. Controles de imagem no estilo RenoDX: exposição, realces, sombras,
   contraste, saturação e desbotar realces, neutros por padrão e só no mundo (não na interface,
   com DLSS); contraste, realces e sombras giram em torno do brilho médio da cena, medido a cada
-  quadro. Tudo no menu F1 > Imagem.
+  quadro. Curva de tons: **Original** (a do jogo), **Original+** (os mesmos tons médios e escuros,
+  mas os realces continuam subindo até o pico da tela em vez de achatar) ou **Nenhuma**; e a força
+  da correção de cor do jogo (o tom de cada lugar), de 0 a 100%. Funcionam com FSR 1 e DLSS. Tudo
+  no menu F1 > Imagem.
 - **Modo PS4 Pro**: o jogo se vê num PS4 Pro e oferece no próprio menu (Opções > Apresentação)
   o Modo Grafismo **Cinematográfico** (1440p, mais detalhe) ou **Desempenho**. É mais pesado:
   ~25 FPS no campo aberto.
@@ -188,5 +191,10 @@ Estas variáveis de ambiente ajudam a investigar problemas:
 | `SOTC_HDR_HIGHLIGHTS=0..100` | com HDR: brilho das partes claras (padrão 50) |
 | `SOTC_HDR_SATURATION=0..100` | com HDR: força das cores; 0 é preto e branco (padrão 50) |
 | `SOTC_HDR_BLOWOUT=0..100` | com HDR: os realces mais fortes perdem a cor e vão para o branco perto do pico (padrão 0) |
+| `SOTC_HDR_TONEMAP=vanilla\|vanilla_plus\|none` | com HDR: a curva de tons do jogo (padrão `vanilla`); `vanilla_plus` mantém os tons médios e deixa os realces subirem até o pico; `none` tira a curva |
+| `SOTC_HDR_GRADING=0..100` | com HDR: a força da correção de cor do jogo em porcentagem (padrão 100); 0 tira o tom de cor de cada lugar e mantém o brilho |
+| `SOTC_TONEMAP_LOG=1` | diagnóstico: as constantes do tonemap do jogo quando mudam e a curva aplicada |
+| `SOTC_HDR_TONEMAP_CYCLE=s` | teste: alterna as curvas de tons a cada `s` segundos (comparar capturas da mesma cena) |
+| `SOTC_FX_TRACE=1` | diagnóstico: a cada 600 quadros, os shaders de um quadro em ordem, com as texturas lidas e escritas (achar as passadas de efeitos) |
 | `SOTC_EVICT_ASYNC=0` | a devolução de memória fria das arenas espera a GPU no processador de comandos, como antes (~44 ms por vez) |
 | `SOTC_UI_HIRES=0` | com DLSS, a interface (textos, logos, HUD) volta a ser desenhada na resolução de renderização e ampliada, em vez de na resolução de saída |

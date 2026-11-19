@@ -25,6 +25,7 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/sotc_display_peak.h"
 #include "video_core/sotc_live.h"
+#include "video_core/sotc_tonemap.h"
 #include "video_core/texture_cache/image.h"
 #include "bbport_overlay.h"
 
@@ -153,6 +154,53 @@ static void RefreshHdrLevels(HostPasses::PostProcessingPass::Settings& s) {
     s.highlights = power(g[SotcLive::kHighlights]);
     s.saturation = g[SotcLive::kSaturation] / 50.0f;
     s.blowout = g[SotcLive::kBlowout] / 100.0f;
+
+    // Tone mapper (launcher hdr_tonemap / SOTC_HDR_TONEMAP: vanilla, vanilla_plus, none) and the
+    // strength of the game's colour grading (hdr_grading / SOTC_HDR_GRADING, percent, 100 = the game's). The
+    // rasterizer reads them at the tonemap draw (sotc_tonemap.h).
+    static const int tonemap_start = [] {
+        std::string v = BbOverlay::LauncherSetting("hdr_tonemap");
+        if (v.empty()) {
+            const char* e = std::getenv("SOTC_HDR_TONEMAP");
+            v = e ? e : "";
+        }
+        if (v == "vanilla_plus" || v == "vanilla+") {
+            return int(SotcTonemap::kVanillaPlus);
+        }
+        if (v == "none") {
+            return int(SotcTonemap::kNone);
+        }
+        return int(SotcTonemap::kVanilla);
+    }();
+    static const float grading_start =
+        std::clamp(HdrLevel("hdr_grading", "SOTC_HDR_GRADING", 100.0f), 0.0f, 100.0f);
+    const int live_tm = SotcLive::hdr_tonemap.load(std::memory_order_relaxed);
+    const float live_grading = SotcLive::hdr_grading.load(std::memory_order_relaxed);
+    // SOTC_HDR_TONEMAP_CYCLE=<seconds> (testing): vanilla, vanilla+ and none in turn, each for that long, so screenshots of one scene compare them.
+    static const float cycle = [] {
+        const char* v = std::getenv("SOTC_HDR_TONEMAP_CYCLE");
+        return v ? static_cast<float>(std::atof(v)) : 0.0f;
+    }();
+    int tm = live_tm >= 0 ? live_tm : tonemap_start;
+    if (cycle > 0.0f) {
+        static const auto t0 = std::chrono::steady_clock::now();
+        const float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - t0).count();
+        tm = static_cast<int>(t / cycle) % SotcTonemap::kModeCount;
+        static int last = -1;
+        if (tm != last) {
+            last = tm;
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+            std::fprintf(stderr, "SOTC TONEMAP CYCLE %d at %lld\n", tm,
+                         static_cast<long long>(ms));
+        }
+    }
+    SotcTonemap::wanted.store(std::clamp(tm, 0, SotcTonemap::kModeCount - 1),
+                              std::memory_order_relaxed);
+    SotcTonemap::grading.store(
+        std::clamp(live_grading >= 0.0f ? live_grading : grading_start, 0.0f, 100.0f) / 100.0f,
+        std::memory_order_relaxed);
 }
 
 bool CanBlitToSwapchain(const vk::PhysicalDevice physical_device, vk::Format format) {
@@ -941,6 +989,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     Dlssg::SetHdr(pp_settings.hdr != 0);
     if (pp_settings.hdr == 1) {
         RefreshHdrLevels(pp_settings);
+    } else { // sotc: the game's tonemap as it is without game HDR (SDR clips above 1)
+        SotcTonemap::wanted.store(SotcTonemap::kVanilla, std::memory_order_relaxed);
+        SotcTonemap::grading.store(1.0f, std::memory_order_relaxed);
     }
     auto upscaled = Dlssg::Upscale(frame->id, draw_scheduler, texture_cache, runtime,
                                    frame->width, frame->height);

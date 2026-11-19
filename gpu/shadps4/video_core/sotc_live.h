@@ -42,4 +42,10 @@ enum HdrGrade { kExposure, kContrast, kShadows, kHighlights, kSaturation, kBlowo
 inline std::atomic<float> hdr_grade[kGradeCount]{kGradeUnset, kGradeUnset, kGradeUnset,
                                                  kGradeUnset, kGradeUnset, kGradeUnset};
 
+/// Game HDR tone mapper (sotc_tonemap.h Mode: 0 vanilla, 1 vanilla+, 2 none; SOTC_HDR_TONEMAP)
+/// and the strength of the game's colour grading in percent (SOTC_HDR_GRADING, 100 = the
+/// game's). -1: the value read at start.
+inline std::atomic<int> hdr_tonemap{-1};
+inline std::atomic<float> hdr_grading{-1.f};
+
 } // namespace SotcLive

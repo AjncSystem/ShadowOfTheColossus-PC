@@ -34,6 +34,7 @@
 #include "video_core/sotc_fps_cap.h"
 #include "video_core/sotc_event.h"
 #include "video_core/sotc_live.h"
+#include "video_core/sotc_tonemap.h"
 #include "video_core/sotc_ui_lang.h"
 #include "video_core/sotc_stats.h"
 
@@ -893,8 +894,8 @@ void BuildItems() {
             .slider = true;
         MenuItem& reset = AddLive(
             kTabDisplay, L("HDR: restaurar imagem", "HDR: reset picture"),
-            L("Volta exposição, realces, sombras, contraste, saturação e desbotar ao original.",
-              "Puts exposure, highlights, shadows, contrast, saturation and highlight desaturation back to the original."),
+            L("Volta exposição, realces, sombras, contraste, saturação, desbotar e a correção de cor do jogo ao original.",
+              "Puts exposure, highlights, shadows, contrast, saturation, highlight desaturation and the game's colour grading back to the original."),
             {{L("Executar", "Run"), "0"}}, [] { return -1; },
             [](int) {
                 struct Neutral {
@@ -914,11 +915,58 @@ void BuildItems() {
                     SotcLive::hdr_grade[n.id].store(n.value, std::memory_order_relaxed);
                     SaveLauncherSetting(n.key, std::to_string(int(n.value)));
                 }
+                SotcLive::hdr_grading.store(100.0f, std::memory_order_relaxed);
+                SaveLauncherSetting("hdr_grading", "100");
                 toast_text = L("Imagem HDR restaurada", "HDR picture reset");
                 toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
             });
         reset.action = true;
         reset.shown = hdr_on;
+
+        // Tone mapper (sotc_tonemap.h): the game's curve, extended, or none, as the curve of the
+        // game's own tonemap pass (any upscaler).
+        static const int kTonemapModes[] = {SotcTonemap::kVanilla, SotcTonemap::kVanillaPlus,
+                                            SotcTonemap::kNone};
+        static const char* kTonemapKeys[] = {"\"vanilla\"", "\"vanilla_plus\"", "\"none\""};
+        MenuItem& tonemap = AddLive(
+            kTabDisplay, L("HDR: curva de tons", "HDR: tone mapper"),
+            L("Original: a curva do jogo. Original+: a mesma curva, mas os realces continuam subindo até o pico da tela em vez de achatar. Nenhuma: sem curva, só a descida suave no pico.",
+              "Vanilla: the game's curve. Vanilla+: the same curve, but highlights keep rising to your display's peak instead of flattening. None: no curve, only the smooth roll-off at the peak."),
+            {{L("Original", "Vanilla"), "0"}, {L("Original+", "Vanilla+"), "1"},
+             {L("Nenhuma", "None"), "2"}},
+            [] {
+                int mode = SotcLive::hdr_tonemap.load(std::memory_order_relaxed);
+                if (mode < 0) {
+                    std::string v = LoadLauncherSetting("hdr_tonemap");
+                    if (v.empty()) {
+                        const char* e = std::getenv("SOTC_HDR_TONEMAP");
+                        v = e ? e : "";
+                    }
+                    mode = v == "vanilla_plus" || v == "vanilla+" ? SotcTonemap::kVanillaPlus
+                           : v == "none"                          ? SotcTonemap::kNone
+                                                                  : SotcTonemap::kVanilla;
+                }
+                for (int i = 0; i < 3; ++i) {
+                    if (kTonemapModes[i] == mode) {
+                        return i;
+                    }
+                }
+                return 0;
+            },
+            [](int i) {
+                SotcLive::hdr_tonemap.store(kTonemapModes[i], std::memory_order_relaxed);
+                SaveLauncherSetting("hdr_tonemap", kTonemapKeys[i]);
+            });
+        tonemap.shown = hdr_on;
+        std::vector<std::pair<float, std::string>> gradings;
+        for (int p = 0; p <= 100; p += 5) {
+            gradings.push_back({float(p), std::to_string(p) + "%"});
+        }
+        add_level(L("HDR: correção de cor do jogo", "HDR: game colour grading"),
+                  L("A força das cores que o jogo dá a cada lugar (tom, saturação, contraste). 100% é o original; 0% tira o tom de cor, mantendo o brilho.",
+                    "How strongly the game's per-place colour look applies (tint, saturation, contrast). 100% is the original; 0% removes the colour cast and keeps the brightness."),
+                  "hdr_grading", SotcLive::hdr_grading, "SOTC_HDR_GRADING", 100.0f, gradings)
+            .slider = true;
     }
     AddRestart(kTabDisplay, "af16", L("Filtro de texturas 16x", "16x texture filtering"),
                L("Texturas nítidas no chão visto de lado (filtro anisotrópico 16x).",

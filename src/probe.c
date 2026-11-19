@@ -2271,6 +2271,7 @@ int main(int argc, char **argv) {
         heap_watch_image=image;
         CloseHandle(CreateThread(NULL,0,heap_watch,NULL,0,NULL));
     }
+    runtime_pad_set_image(image); /* the gyro aiming reads the game's aim camera */
 #endif
     struct { uint64_t argc; const char *argv[2]; } params = {1, {"/app0/eboot.bin", NULL}};
 #ifdef _WIN32

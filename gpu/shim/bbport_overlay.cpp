@@ -45,6 +45,12 @@ extern "C" __attribute__((weak)) void runtime_audio_set_volume_percent(int pct);
 extern "C" __attribute__((weak)) int runtime_audio_volume_percent(void);
 extern "C" __attribute__((weak)) int runtime_rumble_enabled(void);
 extern "C" __attribute__((weak)) void runtime_rumble_set(int on);
+extern "C" __attribute__((weak)) int runtime_gyro_enabled(void);
+extern "C" __attribute__((weak)) void runtime_gyro_set(int on);
+extern "C" __attribute__((weak)) int runtime_gyro_sens_percent(void);
+extern "C" __attribute__((weak)) void runtime_gyro_set_sens_percent(int pct);
+extern "C" __attribute__((weak)) int runtime_gyro_inverted(void);
+extern "C" __attribute__((weak)) void runtime_gyro_set_inverted(int on);
 
 // DejaVu Sans (Cyrillic), embedded (third_party/fonts, Bitstream Vera license).
 #ifdef _WIN32
@@ -1022,6 +1028,54 @@ void BuildItems() {
                     runtime_rumble_set(i);
                     SaveLauncherSetting("rumble", i ? "true" : "false");
                 });
+    }
+    // sotc: gyro bow aiming (src/runtime_pad.c), at once and kept as the launcher's option
+    if (runtime_gyro_enabled && runtime_gyro_set) {
+        AddLive(kTabControls, L("Mira do arco com giroscópio", "Controller gyro bow aiming"),
+                L("Enquanto o jogo mira (arco ou luz da espada), girar o controle move a mira, em todos os "
+                  "esquemas de controle. O analógico continua valendo para os giros grandes.",
+                  "While the game aims (bow or sword light), turning the gamepad moves the aim, in every "
+                  "control scheme. The stick still makes the large turns."),
+                Indexed({L("Desligada", "Off"), L("Ligada", "On")}),
+                [] { return runtime_gyro_enabled() ? 1 : 0; },
+                [](int i) {
+                    runtime_gyro_set(i);
+                    SaveLauncherSetting("gyro_aim", i ? "true" : "false");
+                });
+    }
+    if (runtime_gyro_sens_percent && runtime_gyro_set_sens_percent) {
+        static const int sens[] = {50, 75, 100, 150, 200};
+        static const char* keys[] = {"\"0.5\"", "\"0.75\"", "\"1.0\"", "\"1.5\"", "\"2.0\""};
+        AddLive(kTabControls, L("Sensibilidade do giroscópio", "Gyro sensitivity"),
+                L("A velocidade da mira ao girar o controle.", "How fast the aim moves when you turn the gamepad."),
+                Indexed({L("0,5 (lenta)", "0.5 (slow)"), L("0,75", "0.75"), L("1,0 (padrão)", "1.0 (default)"),
+                         L("1,5", "1.5"), L("2,0 (rápida)", "2.0 (fast)")}),
+                [] {
+                    const int now = runtime_gyro_sens_percent();
+                    int best = 0;
+                    for (int i = 1; i < 5; ++i) {
+                        if (std::abs(sens[i] - now) < std::abs(sens[best] - now)) {
+                            best = i;
+                        }
+                    }
+                    return best;
+                },
+                [](int i) {
+                    runtime_gyro_set_sens_percent(sens[i]);
+                    SaveLauncherSetting("gyro_sens", keys[i]);
+                })
+            .enabled = [] { return runtime_gyro_enabled() != 0; };
+    }
+    if (runtime_gyro_inverted && runtime_gyro_set_inverted) {
+        AddLive(kTabControls, L("Inverter giroscópio (Y)", "Invert gyro (Y)"),
+                L("Inverte a mira pelo giroscópio para cima e para baixo.", "Inverts the gyro aim up and down."),
+                Indexed({L("Desligado", "Off"), L("Ligado", "On")}),
+                [] { return runtime_gyro_inverted() ? 1 : 0; },
+                [](int i) {
+                    runtime_gyro_set_inverted(i);
+                    SaveLauncherSetting("gyro_invert", i ? "true" : "false");
+                })
+            .enabled = [] { return runtime_gyro_enabled() != 0; };
     }
     AddLive(kTabControls, L("Câmera pelo mouse", "Mouse camera"),
             L("Move a câmera com o mouse.", "Moves the camera with the mouse."),

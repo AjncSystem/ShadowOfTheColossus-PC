@@ -83,6 +83,10 @@ void runtime_savedata_configure(const char *title) {
     if (title && *title) snprintf(title_id,sizeof(title_id),"%s",title);
     repair_all_meta();
 }
+/* sotc: the folder of user 1's saves (runtime_pad.c reads the control scheme from the profile). */
+void runtime_savedata_user_root(char *out, size_t size) {
+    snprintf(out,size,"%s/savedata/1/%s",runtime_file_user_dir(),title_id);
+}
 
 static int make_dirs(const char *path) {
     char buffer[700];

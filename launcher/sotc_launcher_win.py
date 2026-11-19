@@ -2272,7 +2272,7 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         try:
             result = subprocess.run([str(exe), '--live-resolution'], capture_output=True, text=True, timeout=30,
                                     env=env, creationflags=NO_WINDOW)
-            names = [line[5:].split(':')[0] for line in result.stderr.splitlines() if line.startswith('GPU: ')]
+            names = [line[5:].rsplit(':', 1)[0] for line in result.stderr.splitlines() if line.startswith('GPU: ')]
             if names:
                 self.gpu_name = names[0]
                 self.app['gpu_integrated'] = 'integrated' in names[0].lower()
@@ -3751,8 +3751,9 @@ def play_without_window(settings):
                                     timeout=30, env=probe_env, creationflags=NO_WINDOW)
             line = next((ln for ln in result.stderr.splitlines() if ln.startswith('GPU: ')), '')
             if line:
-                settings['gpu_integrated'] = 'integrated' in line.split(':')[1].lower()
-                found = re.search(r'(\d+)\s*MiB', line)
+                gpu_desc = line[5:].rsplit(':', 1)[0]
+                settings['gpu_integrated'] = 'integrated' in gpu_desc.lower()
+                found = re.search(r'(\d+)\s*MiB', gpu_desc)
                 if found:
                     settings['gpu_vram_mb'] = int(found.group(1))
         except (OSError, subprocess.TimeoutExpired):

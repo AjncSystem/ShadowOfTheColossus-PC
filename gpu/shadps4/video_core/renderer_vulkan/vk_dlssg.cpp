@@ -670,6 +670,7 @@ struct AsyncFsrState {
     std::array<vk::CommandBuffer, kSrRingSize> cmdbufs{};
     vk::Semaphore sema;
     std::atomic<u64> next_tick{0};
+    std::atomic<u64> submitted_tick{0};
     std::array<u64, kSrRingSize> slot_ticks{};
     bool ready = false;
     bool failed = false;
@@ -1725,11 +1726,20 @@ Upscaled UpscaleFsr(const FrameSlot& f, SrRingSlot& sr, u32 slot_idx, vk::Comman
         const vk::Image out_img = sr.out.image;
         const vk::ImageView out_view = sr.out.view;
         scheduler.RunAfterSubmit([ac, draw_sema, draw_tick, fsr_tick, out_img, depth_job, p] {
+            const auto finish_tick = [&](bool signal_host) {
+                if (signal_host) {
+                    static_cast<void>(g_instance->GetDevice().signalSemaphore(
+                        vk::SemaphoreSignalInfo{.semaphore = async_fsr.sema, .value = fsr_tick}));
+                }
+                async_fsr.submitted_tick.store(fsr_tick, std::memory_order_release);
+                async_fsr.submitted_tick.notify_all();
+            };
             if (ac.reset() != vk::Result::eSuccess ||
                 ac.begin(vk::CommandBufferBeginInfo{
                     .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit}) !=
                     vk::Result::eSuccess) {
                 ++sr_errors;
+                finish_tick(true);
                 return;
             }
             const auto barrier = [&](vk::ImageLayout from, vk::ImageLayout to,
@@ -1770,6 +1780,7 @@ Upscaled UpscaleFsr(const FrameSlot& f, SrRingSlot& sr, u32 slot_idx, vk::Comman
                     vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
             if (ac.end() != vk::Result::eSuccess) {
                 ++sr_errors;
+                finish_tick(true);
                 return;
             }
             const vk::TimelineSemaphoreSubmitInfo tl_info{
@@ -1796,7 +1807,10 @@ Upscaled UpscaleFsr(const FrameSlot& f, SrRingSlot& sr, u32 slot_idx, vk::Comman
                 if (sr_res == vk::Result::eErrorDeviceLost) {
                     g_instance->ReportDeviceFault();
                 }
+                finish_tick(true);
+                return;
             }
+            finish_tick(false);
         });
         sr_mode_name.store(Fsr4::Name(), std::memory_order_relaxed);
         sr_prev = true;
@@ -1861,6 +1875,17 @@ Upscaled UpscaleFsr(const FrameSlot& f, SrRingSlot& sr, u32 slot_idx, vk::Comman
 
 vk::Semaphore FsrSemaphore() {
     return async_fsr.ready ? async_fsr.sema : vk::Semaphore{};
+}
+
+void WaitFsrSubmitted(u64 tick) {
+    if (!tick || !async_fsr.ready) {
+        return;
+    }
+    u64 submitted = async_fsr.submitted_tick.load(std::memory_order_acquire);
+    while (submitted < tick) {
+        async_fsr.submitted_tick.wait(submitted, std::memory_order_acquire);
+        submitted = async_fsr.submitted_tick.load(std::memory_order_acquire);
+    }
 }
 
 void WaitFsrComplete(u64 tick) {

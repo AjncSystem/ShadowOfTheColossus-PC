@@ -852,7 +852,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // sotc: DLSS super resolution (SOTC_UPSCALER=dlss): the game's scene before its UI, upscaled
     // to the frame's size; the post process pass puts the UI layer back over it. Frames without
     // that scene (menus, loading screens) are presented as before.
-    Dlssg::SetHdr(pp_settings.hdr != 0);
+    Dlssg::SetHdr(pp_settings.hdr == 1);
     auto upscaled = Dlssg::Upscale(frame->id, draw_scheduler, texture_cache, runtime,
                                    frame->width, frame->height);
     // sotc: a buffer flipped again right after itself (PS4 Pro mode at the 30 FPS cap flips each
@@ -1232,6 +1232,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 SubmitInfo info{};
                 info.AddWait(frame->ready_semaphore, frame->ready_tick);
                 if (pending_fsr_tick != 0 && Dlssg::FsrSemaphore()) {
+                    Dlssg::WaitFsrSubmitted(pending_fsr_tick);
                     info.AddWait(Dlssg::FsrSemaphore(), pending_fsr_tick,
                                  vk::PipelineStageFlagBits::eAllCommands);
                     pending_fsr_tick = 0;
@@ -1518,6 +1519,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     info.AddWait(swapchain.GetImageAcquiredSemaphore());
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
     if (pending_fsr_tick != 0 && Dlssg::FsrSemaphore()) {
+        Dlssg::WaitFsrSubmitted(pending_fsr_tick);
         info.AddWait(Dlssg::FsrSemaphore(), pending_fsr_tick,
                      vk::PipelineStageFlagBits::eAllCommands);
         pending_fsr_tick = 0;
@@ -1640,6 +1642,7 @@ bool Presenter::PresentGenerated(Frame* frame, u64& pending_fsr_tick) {
     SubmitInfo info{};
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
     if (pending_fsr_tick != 0 && Dlssg::FsrSemaphore()) {
+        Dlssg::WaitFsrSubmitted(pending_fsr_tick);
         info.AddWait(Dlssg::FsrSemaphore(), pending_fsr_tick,
                      vk::PipelineStageFlagBits::eAllCommands);
         pending_fsr_tick = 0;

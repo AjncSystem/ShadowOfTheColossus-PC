@@ -132,6 +132,9 @@ struct Upscaled {
 /// Timeline semaphore signalled when an async FSR frame finishes.
 vk::Semaphore FsrSemaphore();
 
+/// Waits until the async FSR compute submission for tick has been queued on Vulkan.
+void WaitFsrSubmitted(u64 tick);
+
 /// Host wait until the async FSR compute submission for tick completes (no-op for tick == 0).
 void WaitFsrComplete(u64 tick);
 

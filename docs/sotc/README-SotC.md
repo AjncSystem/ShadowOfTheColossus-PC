@@ -72,11 +72,16 @@ Tudo isto está no lançador, na página **Imagem e FPS** (e os principais em **
   tem brilho próprio. Controles de imagem no estilo RenoDX: exposição, realces, sombras,
   contraste, saturação e desbotar realces, neutros por padrão e só no mundo (não na interface,
   com DLSS); contraste, realces e sombras giram em torno do brilho médio da cena, medido a cada
-  quadro. Curva de tons: **Original** (a do jogo), **Original+** (os mesmos tons médios e escuros,
-  mas os realces continuam subindo até o pico da tela em vez de achatar) ou **Nenhuma**; e a força
+  quadro. Também saturação dos realces, compensação de véu (pretos mais fundos) e correção de gama
+  (a parte escura como numa tela SDR de gama 2.2). Curva de tons: **Original** (a do jogo),
+  **Original+** (os mesmos tons médios e escuros, mas os realces continuam subindo até o pico da
+  tela em vez de achatar), **Original+ (cor)** (a mesma curva aplicada ao brilho e não a cada cor:
+  as cores claras não puxam para o amarelo e o branco; a correção de matiz devolve aos poucos o
+  tom do jogo) ou **Nenhuma**; e a força
   da correção de cor do jogo (o tom de cada lugar), de 0 a 100%. Funcionam com FSR 1 e DLSS. Tudo
-  no menu F1 > Imagem, com um padrão de teste para achar o pico da tela. O pico escolhido vai
-  para a tela como metadado HDR10, para ela não aplicar o próprio tone mapping por cima.
+  no menu F1 > Imagem; "HDR: restaurar imagem" volta tudo (e os efeitos) ao original. O pico
+  escolhido vai para a tela como metadado HDR10, para ela não aplicar o próprio tone mapping por
+  cima. O pico automático vem do Windows: calibre com o app Calibração de HDR do Windows.
 - **Modo PS4 Pro**: o jogo se vê num PS4 Pro e oferece no próprio menu (Opções > Apresentação)
   o Modo Grafismo **Cinematográfico** (1440p, mais detalhe) ou **Desempenho**. É mais pesado:
   ~25 FPS no campo aberto.
@@ -84,6 +89,7 @@ Tudo isto está no lançador, na página **Imagem e FPS** (e os principais em **
   A força do brilho difuso (bloom), da vinheta e da névoa vai de 0 a 200% ao vivo (F1 > Imagem,
   em SDR e HDR); a névoa em 0% deixa a distância nítida, em 200% ela junta o dobro com a distância. O bloom do jogo é um véu largo que clareia as sombras: no deserto, 400% sobe a parte mais
   escura da imagem em ~30%; 0% deixa a imagem mais nítida e as sombras mais fundas.
+  A nitidez depois do DLSS / FSR 4 também muda ao vivo (F1 > Imagem, seis níveis).
   O motion blur, o brilho e os filtros ficam no menu do próprio jogo.
 - **Comparar com o original (F3)**: com o menu F1 fechado, F3 mostra a imagem como o jogo a faz
   (curva de tons e cores do jogo, controles de imagem do HDR neutros, efeitos em 100%), com
@@ -198,16 +204,19 @@ Estas variáveis de ambiente ajudam a investigar problemas:
 | `SOTC_HDR_HIGHLIGHTS=0..100` | com HDR: brilho das partes claras (padrão 50) |
 | `SOTC_HDR_SATURATION=0..100` | com HDR: força das cores; 0 é preto e branco (padrão 50) |
 | `SOTC_HDR_BLOWOUT=0..100` | com HDR: os realces mais fortes perdem a cor e vão para o branco perto do pico (padrão 0) |
-| `SOTC_HDR_TONEMAP=vanilla\|vanilla_plus\|none` | com HDR: a curva de tons do jogo (padrão `vanilla`); `vanilla_plus` mantém os tons médios e deixa os realces subirem até o pico; `none` tira a curva |
+| `SOTC_HDR_HIGHLIGHT_SATURATION=0..100` | com HDR: a força das cores só nas partes claras (padrão 50 = original) |
+| `SOTC_HDR_FLARE=0..100` | com HDR: compensação de véu, pretos mais fundos (padrão 0) |
+| `SOTC_HDR_GAMMA_CORRECTION=0\|100` | com HDR: a parte escura decodificada como gama 2.2 em vez de sRGB (padrão 0, desligado) |
+| `SOTC_HDR_HUE_CORRECTION=0..100` | com HDR e a curva `vanilla_plus_hue`: quanto o tom dos realces volta ao do jogo (padrão 100) |
+| `SOTC_HDR_TONEMAP=vanilla\|vanilla_plus\|vanilla_plus_hue\|none` | com HDR: a curva de tons do jogo (padrão `vanilla`); `vanilla_plus` mantém os tons médios e deixa os realces subirem até o pico; `vanilla_plus_hue` faz o mesmo no brilho, mantendo a cor; `none` tira a curva |
 | `SOTC_HDR_GRADING=0..100` | com HDR: a força da correção de cor do jogo em porcentagem (padrão 100); 0 tira o tom de cor de cada lugar e mantém o brilho |
 | `SOTC_TONEMAP_LOG=1` | diagnóstico: as constantes do tonemap do jogo quando mudam e a curva aplicada |
-| `SOTC_HDR_PEAK_TEST=1` | com HDR: troca a imagem por um padrão de teste do pico (também em F1 > Imagem): um quadrado no pico escolhido dentro de um em 10000 nits, sobre cinza escuro. Ajuste o pico até o quadrado sumir no fundo claro |
 | `SOTC_HDR_TONEMAP_CYCLE=s` | teste: alterna as curvas de tons a cada `s` segundos (comparar capturas da mesma cena) |
 | `SOTC_FX_BLOOM=0..400` | a força do bloom em porcentagem (padrão 100 = o do jogo) |
 | `SOTC_FX_VIGNETTE=0..400` | a força da vinheta em porcentagem (padrão 100); com a vinheta desligada não faz nada |
 | `SOTC_FX_FOG=0..400` | a força da névoa atmosférica em porcentagem (padrão 100); com a névoa desligada não faz nada |
 | `SOTC_FX_CYCLE=s` | teste: os efeitos em 0%, 100% e 300% a cada `s` segundos |
 | `SOTC_FX_CYCLE_WHAT=bloom,vignette,fog` | teste: quais efeitos o `SOTC_FX_CYCLE` alterna (padrão todos) |
-| `SOTC_FX_TRACE=1` | diagnóstico: a cada 600 quadros, os shaders de um quadro em ordem, com as texturas lidas e escritas (achar as passadas de efeitos) |
+| `SOTC_FX_TRACE=1\|n` | diagnóstico: a cada 600 quadros (ou a cada `n`), quatro quadros seguidos: os shaders em ordem, com as texturas lidas e escritas e os formatos (`dados.número`; o do alvo de cor como `dados*100+número`) |
 | `SOTC_EVICT_ASYNC=0` | a devolução de memória fria das arenas espera a GPU no processador de comandos, como antes (~44 ms por vez) |
 | `SOTC_UI_HIRES=0` | com DLSS, a interface (textos, logos, HUD) volta a ser desenhada na resolução de renderização e ampliada, em vez de na resolução de saída |

@@ -48,9 +48,16 @@ public:
         float highlights = 1.0f; ///< extra power above mid grey (> 1 brightens)
         float saturation = 1.0f; ///< chroma scale
         float blowout = 0.0f;    ///< 0..1: highlights fade towards white near the peak
-        /// sotc: hdr 1: nits of the peak test pattern's inner square; 0: the game (no pattern)
-        float test_peak = 0.0f;
+        float flare = 0.0f;      ///< 0..1: flare compensation (deeper near-blacks)
+        float gamma_correction = 0.0f;     ///< 0..1: SDR range decoded as 2.2, not sRGB
+        float highlight_saturation = 1.0f; ///< chroma scale of the highlights
+        /// sotc: hdr 1, sotc_tonemap.h kVanillaPlusHue: Vanilla+'s A..E applied to luminance
+        /// (hue_e 0: off) and how far its hue goes back to the per-channel curve's (0..1).
+        float hue_a = 0.0f, hue_b = 0.0f, hue_c = 0.0f, hue_d = 0.0f, hue_e = 0.0f;
+        float hue_correction = 1.0f;
     };
+    // sotc: 128 bytes is the push constant size every Vulkan device must take.
+    static_assert(sizeof(Settings) <= 128);
 
     void Create(vk::Device device, vk::Format surface_format);
 

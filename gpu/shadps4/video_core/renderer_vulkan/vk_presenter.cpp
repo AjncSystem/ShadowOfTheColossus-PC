@@ -127,6 +127,10 @@ static void RefreshHdrLevels(HostPasses::PostProcessingPass::Settings& s) {
         {"hdr_highlights", "SOTC_HDR_HIGHLIGHTS", 50.0f, 0.0f, 100.0f},
         {"hdr_saturation", "SOTC_HDR_SATURATION", 50.0f, 0.0f, 100.0f},
         {"hdr_blowout", "SOTC_HDR_BLOWOUT", 0.0f, 0.0f, 100.0f},
+        {"hdr_hue_correction", "SOTC_HDR_HUE_CORRECTION", 100.0f, 0.0f, 100.0f},
+        {"hdr_flare", "SOTC_HDR_FLARE", 0.0f, 0.0f, 100.0f},
+        {"hdr_gamma_correction", "SOTC_HDR_GAMMA_CORRECTION", 0.0f, 0.0f, 100.0f},
+        {"hdr_highlight_saturation", "SOTC_HDR_HIGHLIGHT_SATURATION", 50.0f, 0.0f, 100.0f},
     };
     static const std::array<float, SotcLive::kGradeCount> grade_start = [] {
         std::array<float, SotcLive::kGradeCount> g{};
@@ -136,8 +140,9 @@ static void RefreshHdrLevels(HostPasses::PostProcessingPass::Settings& s) {
         }
         LOG_INFO(Render_Vulkan,
                  "SOTC HDR picture: exposure {} EV, contrast {}, shadows {}, highlights {}, "
-                 "saturation {}, highlight saturation loss {}",
-                 g[0], g[1], g[2], g[3], g[4], g[5]);
+                 "saturation {}, highlight saturation loss {}, hue correction {}, flare {}, "
+                 "gamma correction {}, highlight saturation {}",
+                 g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7], g[8], g[9]);
         return g;
     }();
     float g[SotcLive::kGradeCount];
@@ -154,18 +159,25 @@ static void RefreshHdrLevels(HostPasses::PostProcessingPass::Settings& s) {
     s.highlights = power(g[SotcLive::kHighlights]);
     s.saturation = g[SotcLive::kSaturation] / 50.0f;
     s.blowout = g[SotcLive::kBlowout] / 100.0f;
+    s.hue_correction = g[SotcLive::kHueCorrection] / 100.0f;
+    s.flare = g[SotcLive::kFlare] / 100.0f;
+    s.gamma_correction = g[SotcLive::kGammaCorrection] / 100.0f;
+    s.highlight_saturation = g[SotcLive::kHighlightSaturation] / 50.0f;
     const bool compare = SotcLive::compare_vanilla.load(std::memory_order_relaxed);
     if (compare) { // F3: the game's picture at the user's brightness and peak
         s.exposure = s.contrast = s.shadows = s.highlights = s.saturation = 1.0f;
-        s.blowout = 0.0f;
+        s.highlight_saturation = 1.0f;
+        s.blowout = s.flare = s.gamma_correction = 0.0f;
     }
-    // The peak test pattern: the F1 menu's switch, or SOTC_HDR_PEAK_TEST=1 from the start.
-    static const bool peak_test_env = [] {
-        const char* v = std::getenv("SOTC_HDR_PEAK_TEST");
-        return v && v[0] == '1';
-    }();
-    s.test_peak =
-        peak_test_env || SotcLive::hdr_peak_test.load(std::memory_order_relaxed) ? peak : 0.0f;
+    // The hue-preserving tone mapper's curve, when this frame's tonemap drew its line.
+    s.hue_e = 0.0f;
+    if (!compare && SotcTonemap::hue_curve_on.load(std::memory_order_acquire)) {
+        s.hue_a = SotcTonemap::hue_curve[0].load(std::memory_order_relaxed);
+        s.hue_b = SotcTonemap::hue_curve[1].load(std::memory_order_relaxed);
+        s.hue_c = SotcTonemap::hue_curve[2].load(std::memory_order_relaxed);
+        s.hue_d = SotcTonemap::hue_curve[3].load(std::memory_order_relaxed);
+        s.hue_e = SotcTonemap::hue_curve[4].load(std::memory_order_relaxed);
+    }
 
     // Tone mapper (launcher hdr_tonemap / SOTC_HDR_TONEMAP: vanilla, vanilla_plus, none) and the
     // strength of the game's colour grading (hdr_grading / SOTC_HDR_GRADING, percent, 100 = the
@@ -181,6 +193,9 @@ static void RefreshHdrLevels(HostPasses::PostProcessingPass::Settings& s) {
         }
         if (v == "none") {
             return int(SotcTonemap::kNone);
+        }
+        if (v == "vanilla_plus_hue") {
+            return int(SotcTonemap::kVanillaPlusHue);
         }
         return int(SotcTonemap::kVanilla);
     }();
@@ -1107,7 +1122,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             }
             return v[0] == 'o' ? -1.0f : static_cast<float>(std::atof(v));
         };
-        static const float sharpness = env("SOTC_DLSS_SHARPEN", 0.0f);
+        static const float sharpness_start = env("SOTC_DLSS_SHARPEN", 0.0f);
+        const float sharpness_live = SotcLive::dlss_sharpen.load(std::memory_order_relaxed);
+        const float sharpness =
+            sharpness_live > SotcLive::kSharpenUnset ? sharpness_live : sharpness_start;
         static const float ui_sharpen = std::max(env("SOTC_DLSS_UI_SHARPEN", 3.0f), 0.0f);
         static const float sky_sharpen = std::max(env("SOTC_DLSS_SKY_SHARPEN", 2.0f), 0.0f);
         vk::ImageView scene = upscaled.scene;

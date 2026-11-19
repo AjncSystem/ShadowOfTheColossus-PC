@@ -21,7 +21,12 @@ enum Mode : int {
     kVanilla = 0,     ///< the game's curve (flattens towards A / C = 3.3)
     kVanillaPlus = 1, ///< the same toe and mid tones, highlights rising towards kPlusCeiling
     kNone = 2,        ///< a straight line through the game's curve at mid grey
-    kModeCount = 3,
+    /// Vanilla+ on luminance instead of per channel, so hues hold as they brighten: the game's
+    /// pass gets kNone's line and the final pass (post_process.frag hueCurve) applies Vanilla+'s
+    /// curve to the luminance, the hue pulled back towards the per-channel one by the hue
+    /// correction control.
+    kVanillaPlusHue = 3,
+    kModeCount = 4,
 };
 
 /// Set by the presenter every frame (vk_presenter.cpp RefreshHdrLevels): the tone mapper wanted
@@ -37,13 +42,19 @@ inline std::atomic<float> bloom{1.0f};
 inline std::atomic<float> vignette{1.0f};
 inline std::atomic<float> fog{1.0f};
 
+/// kVanillaPlusHue: set at the tonemap draw (rasterizer) for the final pass: on when this frame's
+/// tonemap got kNone's line for it, and Vanilla+'s A..E (the curve the final pass applies).
+inline std::atomic<bool> hue_curve_on{false};
+inline std::atomic<float> hue_curve[5]{};
+
 /// Vanilla+'s ceiling (the curve's limit A / C). With the game's scale 0.556 it stays under the
 /// pass's min 10 cap (16 * 0.556 = 8.9), so the final pass's roll-off shapes the highlights.
 inline constexpr float kPlusCeiling = 16.0f;
 
 /// The curve of `mode` in place of the game's, in a copy of the tonemap's flatbuf. Only for the
-/// game's curve mode 5; returns false (flatbuf unchanged) otherwise.
-inline bool ApplyCurve(std::vector<unsigned>& flat, int mode) {
+/// game's curve mode 5; returns false (flatbuf unchanged) otherwise. kVanillaPlusHue writes
+/// kNone's line and gives Vanilla+'s A..E in `plus`.
+inline bool ApplyCurve(std::vector<unsigned>& flat, int mode, float* plus = nullptr) {
     if (mode == kVanilla || flat.size() <= 32 || flat[20] != 5u) {
         return false;
     }
@@ -54,12 +65,15 @@ inline bool ApplyCurve(std::vector<unsigned>& flat, int mode) {
     if (!(E > 0.0) || !(B > 0.0)) {
         return false;
     }
-    if (mode == kNone) {
+    const auto line = [&] {
         // y = x * f(0.18) / 0.18: A = C = D = 0, B / E the slope.
         put(28, 0.0f);
         put(29, static_cast<float>(E * f(0.18) / 0.18));
         put(30, 0.0f);
         put(31, 0.0f);
+    };
+    if (mode == kNone) {
+        line();
         return true;
     }
     // Vanilla+: B and E kept (the same toe), A' = H C', and C', D' so the curve goes through the
@@ -76,6 +90,18 @@ inline bool ApplyCurve(std::vector<unsigned>& flat, int mode) {
     const double d = (a11 * b2 - b1 * a21) / det;
     if (!(c > 0.0) || !(d >= 0.0)) {
         return false; // not a rising curve with these constants: keep the game's
+    }
+    if (mode == kVanillaPlusHue) {
+        if (!plus) {
+            return false;
+        }
+        plus[0] = static_cast<float>(H * c);
+        plus[1] = static_cast<float>(B);
+        plus[2] = static_cast<float>(c);
+        plus[3] = static_cast<float>(d);
+        plus[4] = static_cast<float>(E);
+        line();
+        return true;
     }
     put(28, static_cast<float>(H * c));
     put(30, static_cast<float>(c));

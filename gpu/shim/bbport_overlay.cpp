@@ -733,12 +733,44 @@ void BuildItems() {
                 },
                 [](int i) { SetRcas(i); });
     }
-    AddRestart(kTabDisplay, "dlss_sharpen", L("Nitidez do DLSS / FSR 4", "DLSS / FSR 4 sharpening"),
-               L("O realce de nitidez depois do DLSS ou do FSR 4.", "The sharpening after DLSS or FSR 4."),
-               Quoted({{"0", L("Alta (padrão)", "High (default)")}, {"0.5", L("Média", "Medium")},
-                       {"1", L("Baixa", "Low")}, {"off", L("Desligada", "Off")}}),
-               "\"0\"")
-        .shown = UpscalerIsTemporal;
+    {
+        // Live (presenter reads SotcLive::dlss_sharpen each frame): RCAS attenuation in stops.
+        static const char* kSharpenKeys[] = {"off", "2", "1.5", "1", "0.5", "0"};
+        static const float kSharpenValues[] = {SotcLive::kSharpenOff, 2.0f, 1.5f, 1.0f, 0.5f, 0.0f};
+        MenuItem& sharpen = AddLive(
+            kTabDisplay, L("Nitidez do DLSS / FSR 4", "DLSS / FSR 4 sharpening"),
+            L("O realce de nitidez depois do DLSS ou do FSR 4, ao vivo. Máxima é o padrão.",
+              "The sharpening after DLSS or FSR 4, live. Highest is the default."),
+            {{L("Desligada", "Off"), "0"}, {L("Mínima", "Lowest"), "1"}, {L("Baixa", "Low"), "2"},
+             {L("Média", "Medium"), "3"}, {L("Alta", "High"), "4"},
+             {L("Máxima (padrão)", "Highest (default)"), "5"}},
+            [] {
+                float now = SotcLive::dlss_sharpen.load(std::memory_order_relaxed);
+                if (now <= SotcLive::kSharpenUnset) {
+                    std::string v = LoadLauncherSetting("dlss_sharpen");
+                    if (v.empty()) {
+                        const char* e = std::getenv("SOTC_DLSS_SHARPEN");
+                        v = e ? e : "0";
+                    }
+                    now = v.empty() || v[0] == 'o' ? SotcLive::kSharpenOff
+                                                   : static_cast<float>(std::atof(v.c_str()));
+                }
+                int best = 0;
+                for (int i = 1; i < 6; ++i) {
+                    if (std::fabs(kSharpenValues[i] - now) <
+                        std::fabs(kSharpenValues[best] - now)) {
+                        best = i;
+                    }
+                }
+                return best;
+            },
+            [](int i) {
+                SotcLive::dlss_sharpen.store(kSharpenValues[i], std::memory_order_relaxed);
+                SaveLauncherSetting("dlss_sharpen", std::string("\"") + kSharpenKeys[i] + "\"");
+            });
+        sharpen.slider = true;
+        sharpen.shown = UpscalerIsTemporal;
+    }
     AddRestart(kTabDisplay, "neo", L("Modo PS4 Pro", "PS4 Pro mode"),
                L("Os gráficos do PS4 Pro: mais detalhe e sombras melhores. Em telas mais largas que 16:9 ele fica desligado.",
                  "The PS4 Pro graphics: more detail and better shadows. On screens wider than 16:9 it stays off."),
@@ -830,14 +862,6 @@ void BuildItems() {
                     "Your display's peak brightness. Highlights (sun, sky, water) roll off smoothly into it instead of clipping."),
                   "hdr_peak", SotcLive::hdr_peak, "SOTC_HDR_PEAK", 0.0f, peaks)
             .slider = true;
-        MenuItem& peak_test = AddLive(
-            kTabDisplay, L("HDR: teste do pico", "HDR: peak test pattern"),
-            L("Mostra um quadrado no brilho máximo e, dentro dele, outro no pico escolhido acima. Suba o pico até o quadrado de dentro sumir: esse é o pico real da tela. Desligue para voltar ao jogo.",
-              "Shows a square at full brightness with a smaller one inside at the peak chosen above. Raise the peak until the inner square disappears: that is your display's real peak. Switch it off to get back to the game."),
-            OnOff(),
-            [] { return SotcLive::hdr_peak_test.load(std::memory_order_relaxed) ? 1 : 0; },
-            [](int i) { SotcLive::hdr_peak_test.store(i == 1, std::memory_order_relaxed); });
-        peak_test.shown = hdr_on;
         std::vector<std::pair<float, std::string>> uis{
             {0.0f, L("Igual ao brilho do jogo", "Same as game brightness")}};
         for (int v = 50; v <= 500; v += 10) {
@@ -900,10 +924,28 @@ void BuildItems() {
                   "hdr_blowout", SotcLive::hdr_grade[SotcLive::kBlowout], "SOTC_HDR_BLOWOUT",
                   0.0f, percents(), kUnsetBelow)
             .slider = true;
+        add_level(L("HDR: saturação dos realces", "HDR: highlight saturation"),
+                  L("A força das cores só nas partes claras (céu, sol, fogo), mais quanto mais claras. 50 é o original.",
+                    "Colour strength in the bright parts only (sky, sun, fire), more the brighter. 50 is the original."),
+                  "hdr_highlight_saturation", SotcLive::hdr_grade[SotcLive::kHighlightSaturation],
+                  "SOTC_HDR_HIGHLIGHT_SATURATION", 50.0f, percents(), kUnsetBelow)
+            .slider = true;
+        add_level(L("HDR: compensar véu (flare)", "HDR: flare compensation"),
+                  L("Tira o véu acinzentado das partes quase pretas, deixando o preto mais fundo. 0 é o original.",
+                    "Takes the grey veil out of the near-black parts for deeper blacks. 0 is the original."),
+                  "hdr_flare", SotcLive::hdr_grade[SotcLive::kFlare], "SOTC_HDR_FLARE", 0.0f,
+                  percents(), kUnsetBelow)
+            .slider = true;
+        add_level(L("HDR: correção de gama", "HDR: gamma correction"),
+                  L("Mostra a parte escura como uma tela SDR comum (gama 2.2) em vez da curva sRGB: sombras um pouco mais fundas, como o jogo em SDR. Desligado é o original.",
+                    "Shows the dark range like a typical SDR display (gamma 2.2) instead of the sRGB curve: slightly deeper shadows, as the game looks in SDR. Off is the original."),
+                  "hdr_gamma_correction", SotcLive::hdr_grade[SotcLive::kGammaCorrection],
+                  "SOTC_HDR_GAMMA_CORRECTION", 0.0f,
+                  {{0.0f, L("Desligado", "Off")}, {100.0f, L("Ligado", "On")}}, kUnsetBelow);
         MenuItem& reset = AddLive(
             kTabDisplay, L("HDR: restaurar imagem", "HDR: reset picture"),
-            L("Volta exposição, realces, sombras, contraste, saturação, desbotar e a correção de cor do jogo ao original.",
-              "Puts exposure, highlights, shadows, contrast, saturation, highlight desaturation and the game's colour grading back to the original."),
+            L("Volta todos os controles de imagem, a curva de tons, a correção de cor do jogo e a força do bloom, da vinheta e da névoa ao original. O brilho e o pico ficam.",
+              "Puts every picture control, the tone mapper, the game's colour grading and the bloom, vignette and fog strengths back to the original. Brightness and peak stay."),
             {{L("Executar", "Run"), "0"}}, [] { return -1; },
             [](int) {
                 struct Neutral {
@@ -918,6 +960,10 @@ void BuildItems() {
                     {SotcLive::kHighlights, "hdr_highlights", 50.0f},
                     {SotcLive::kSaturation, "hdr_saturation", 50.0f},
                     {SotcLive::kBlowout, "hdr_blowout", 0.0f},
+                    {SotcLive::kHueCorrection, "hdr_hue_correction", 100.0f},
+                    {SotcLive::kFlare, "hdr_flare", 0.0f},
+                    {SotcLive::kGammaCorrection, "hdr_gamma_correction", 0.0f},
+                    {SotcLive::kHighlightSaturation, "hdr_highlight_saturation", 50.0f},
                 };
                 for (const Neutral& n : kNeutral) {
                     SotcLive::hdr_grade[n.id].store(n.value, std::memory_order_relaxed);
@@ -925,6 +971,14 @@ void BuildItems() {
                 }
                 SotcLive::hdr_grading.store(100.0f, std::memory_order_relaxed);
                 SaveLauncherSetting("hdr_grading", "100");
+                SotcLive::hdr_tonemap.store(SotcTonemap::kVanilla, std::memory_order_relaxed);
+                SaveLauncherSetting("hdr_tonemap", "\"vanilla\"");
+                for (auto* fx : {&SotcLive::fx_bloom, &SotcLive::fx_vignette, &SotcLive::fx_fog}) {
+                    fx->store(100.0f, std::memory_order_relaxed);
+                }
+                SaveLauncherSetting("fx_bloom_strength", "100");
+                SaveLauncherSetting("fx_vignette_strength", "100");
+                SaveLauncherSetting("fx_fog_strength", "100");
                 toast_text = L("Imagem HDR restaurada", "HDR picture reset");
                 toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
             });
@@ -934,14 +988,15 @@ void BuildItems() {
         // Tone mapper (sotc_tonemap.h): the game's curve, extended, or none, as the curve of the
         // game's own tonemap pass (any upscaler).
         static const int kTonemapModes[] = {SotcTonemap::kVanilla, SotcTonemap::kVanillaPlus,
-                                            SotcTonemap::kNone};
-        static const char* kTonemapKeys[] = {"\"vanilla\"", "\"vanilla_plus\"", "\"none\""};
+                                            SotcTonemap::kVanillaPlusHue, SotcTonemap::kNone};
+        static const char* kTonemapKeys[] = {"\"vanilla\"", "\"vanilla_plus\"",
+                                             "\"vanilla_plus_hue\"", "\"none\""};
         MenuItem& tonemap = AddLive(
             kTabDisplay, L("HDR: curva de tons", "HDR: tone mapper"),
-            L("Original: a curva do jogo. Original+: a mesma curva, mas os realces continuam subindo até o pico da tela em vez de achatar. Nenhuma: sem curva, só a descida suave no pico.",
-              "Vanilla: the game's curve. Vanilla+: the same curve, but highlights keep rising to your display's peak instead of flattening. None: no curve, only the smooth roll-off at the peak."),
+            L("Original: a curva do jogo. Original+: a mesma curva, mas os realces continuam subindo até o pico da tela em vez de achatar. Original+ (cor): a mesma, no brilho e não em cada cor, então as cores claras não puxam para o amarelo e o branco. Nenhuma: sem curva, só a descida suave no pico.",
+              "Vanilla: the game's curve. Vanilla+: the same curve, but highlights keep rising to your display's peak instead of flattening. Vanilla+ (hue): the same on brightness rather than per colour channel, so bright colours do not drift to yellow and white. None: no curve, only the smooth roll-off at the peak."),
             {{L("Original", "Vanilla"), "0"}, {L("Original+", "Vanilla+"), "1"},
-             {L("Nenhuma", "None"), "2"}},
+             {L("Original+ (cor)", "Vanilla+ (hue)"), "2"}, {L("Nenhuma", "None"), "3"}},
             [] {
                 int mode = SotcLive::hdr_tonemap.load(std::memory_order_relaxed);
                 if (mode < 0) {
@@ -951,10 +1006,11 @@ void BuildItems() {
                         v = e ? e : "";
                     }
                     mode = v == "vanilla_plus" || v == "vanilla+" ? SotcTonemap::kVanillaPlus
+                           : v == "vanilla_plus_hue"              ? SotcTonemap::kVanillaPlusHue
                            : v == "none"                          ? SotcTonemap::kNone
                                                                   : SotcTonemap::kVanilla;
                 }
-                for (int i = 0; i < 3; ++i) {
+                for (int i = 0; i < 4; ++i) {
                     if (kTonemapModes[i] == mode) {
                         return i;
                     }
@@ -966,6 +1022,12 @@ void BuildItems() {
                 SaveLauncherSetting("hdr_tonemap", kTonemapKeys[i]);
             });
         tonemap.shown = hdr_on;
+        add_level(L("HDR: correção de matiz", "HDR: hue correction"),
+                  L("Só com Original+ (cor): quanto a cor dos realces volta à do jogo (o fogo amarelando, por exemplo). 100 é a do jogo; 0 mantém a cor de cada coisa ao clarear.",
+                    "Vanilla+ (hue) only: how far the hue of highlights goes back to the game's (fire turning yellow, for one). 100 is the game's; 0 keeps each colour's hue as it brightens."),
+                  "hdr_hue_correction", SotcLive::hdr_grade[SotcLive::kHueCorrection],
+                  "SOTC_HDR_HUE_CORRECTION", 100.0f, percents(), kUnsetBelow)
+            .slider = true;
         std::vector<std::pair<float, std::string>> gradings;
         for (int p = 0; p <= 100; p += 5) {
             gradings.push_back({float(p), std::to_string(p) + "%"});

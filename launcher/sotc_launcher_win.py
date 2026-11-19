@@ -403,8 +403,8 @@ DLSS_MODES = [('dlaa', ('DLAA (nativo)', 'DLAA (native)')),
               ('ultra', ('Ultra Desempenho (3×)', 'Ultra Performance (3×)'))]
 DLSS_FACTORS = {'dlaa': 1.0, 'quality': 1.5, 'balanced': 1.724, 'performance': 2.0, 'ultra': 3.0}
 # RCAS after DLSS (SOTC_DLSS_SHARPEN, attenuation in stops: 0 = sharpest).
-DLSS_SHARPNESS = [('0', ('Alta (padrão)', 'High (default)')), ('0.5', ('Média', 'Medium')), ('1', ('Baixa', 'Low')),
-                  ('off', ('Desligada', 'Off'))]
+DLSS_SHARPNESS = [('0', ('Máxima (padrão)', 'Highest (default)')), ('0.5', ('Alta', 'High')), ('1', ('Média', 'Medium')),
+                  ('1.5', ('Baixa', 'Low')), ('2', ('Mínima', 'Lowest')), ('off', ('Desligada', 'Off'))]
 # Unsharp amounts of the upscaled text/UI and of the sky (SOTC_DLSS_UI_SHARPEN / _SKY_SHARPEN).
 DLSS_UI_SHARPNESS = [('3', ('Alta (padrão)', 'High (default)')), ('1.5', ('Média', 'Medium')), ('0', ('Desligada', 'Off'))]
 DLSS_SKY_SHARPNESS = [('2', ('Alta (padrão)', 'High (default)')), ('1', ('Média', 'Medium')), ('0', ('Desligada', 'Off'))]

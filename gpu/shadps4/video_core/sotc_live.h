@@ -36,13 +36,32 @@ inline std::atomic<float> hdr_ui{-1.f};
 /// Game HDR picture controls (vk_presenter.cpp), in the menu's units: exposure in EV (-3..3,
 /// neutral 0; SOTC_HDR_EXPOSURE), then contrast, shadows, highlights, saturation (0..100, neutral
 /// 50; SOTC_HDR_CONTRAST / _SHADOWS / _HIGHLIGHTS / _SATURATION) and highlight saturation loss
-/// (0..100, neutral 0; SOTC_HDR_BLOWOUT). kGradeUnset: the value read at start.
+/// (0..100, neutral 0; SOTC_HDR_BLOWOUT), hue correction of the hue-preserving tone mapper
+/// (0..100, default 100; SOTC_HDR_HUE_CORRECTION), flare compensation (0..100, neutral 0;
+/// SOTC_HDR_FLARE), gamma correction (0 or 100, neutral 0; SOTC_HDR_GAMMA_CORRECTION) and
+/// highlight saturation (0..100, neutral 50; SOTC_HDR_HIGHLIGHT_SATURATION). kGradeUnset: the
+/// value read at start.
 inline constexpr float kGradeUnset = -1000.f;
-enum HdrGrade { kExposure, kContrast, kShadows, kHighlights, kSaturation, kBlowout, kGradeCount };
+enum HdrGrade {
+    kExposure,
+    kContrast,
+    kShadows,
+    kHighlights,
+    kSaturation,
+    kBlowout,
+    kHueCorrection,
+    kFlare,
+    kGammaCorrection,
+    kHighlightSaturation,
+    kGradeCount
+};
 inline std::atomic<float> hdr_grade[kGradeCount]{kGradeUnset, kGradeUnset, kGradeUnset,
-                                                 kGradeUnset, kGradeUnset, kGradeUnset};
+                                                 kGradeUnset, kGradeUnset, kGradeUnset,
+                                                 kGradeUnset, kGradeUnset, kGradeUnset,
+                                                 kGradeUnset};
 
-/// Game HDR tone mapper (sotc_tonemap.h Mode: 0 vanilla, 1 vanilla+, 2 none; SOTC_HDR_TONEMAP)
+/// Game HDR tone mapper (sotc_tonemap.h Mode: 0 vanilla, 1 vanilla+, 2 none, 3 vanilla+ hue
+/// preserving; SOTC_HDR_TONEMAP)
 /// and the strength of the game's colour grading in percent (SOTC_HDR_GRADING, 100 = the
 /// game's). -1: the value read at start.
 inline std::atomic<int> hdr_tonemap{-1};
@@ -58,7 +77,11 @@ inline std::atomic<float> fx_fog{-1.f};
 /// F3: the game's own picture (tone mapper, grading, picture controls and effect strengths at
 /// the game's), brightness and peak kept, to compare with the user's settings.
 inline std::atomic<bool> compare_vanilla{false};
-/// F1 > Image: the peak brightness test pattern instead of the game (vk_presenter.cpp).
-inline std::atomic<bool> hdr_peak_test{false};
+
+/// RCAS after DLSS / FSR 4 (SOTC_DLSS_SHARPEN; launcher dlss_sharpen): attenuation in stops, 0 =
+/// sharpest; kSharpenOff: none. kSharpenUnset: the value read at start.
+inline constexpr float kSharpenUnset = -2.f;
+inline constexpr float kSharpenOff = -1.f;
+inline std::atomic<float> dlss_sharpen{kSharpenUnset};
 
 } // namespace SotcLive

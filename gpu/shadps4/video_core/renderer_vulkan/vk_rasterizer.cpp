@@ -2848,9 +2848,18 @@ void Rasterizer::CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dm
     fast_bind.valid = true;
 }
 
+static void FxTrace(const Shader::Info& stage, VAddr color0, u32 color0_fmt);
+
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
     const SotcStats::SplitTimer bind_split{SotcStats::SplitBind};
     fast_bind_hit = false;
+    for (const auto* stage : pipeline->GetStages()) {
+        if (stage) {
+            const auto& cb = liverpool->DrawRegs().color_buffers[0];
+            FxTrace(*stage, cb.Address(),
+                    static_cast<u32>(cb.GetDataFmt()) * 100 + static_cast<u32>(cb.GetNumberFmt()));
+        }
+    }
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
         IsComputeImageClear(pipeline)) {
         static const bool drop_trace = std::getenv("SOTC_DROP_TRACE") != nullptr;
@@ -3718,8 +3727,16 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     if (grading != 1.0f) {
                         TonemapGrading(tonemap_flat, grading);
                     }
+                    float plus[5]{};
                     const bool curved = tm != SotcTonemap::kVanilla &&
-                                        SotcTonemap::ApplyCurve(tonemap_flat, tm);
+                                        SotcTonemap::ApplyCurve(tonemap_flat, tm, plus);
+                    const bool hue_curve = curved && tm == SotcTonemap::kVanillaPlusHue;
+                    if (hue_curve) {
+                        for (int i = 0; i < 5; ++i) {
+                            SotcTonemap::hue_curve[i].store(plus[i], std::memory_order_relaxed);
+                        }
+                    }
+                    SotcTonemap::hue_curve_on.store(hue_curve, std::memory_order_release);
                     static int logged_tm = -1;
                     const int now_tm = curved ? tm : SotcTonemap::kVanilla;
                     if (tonemap_log && now_tm != logged_tm) {
@@ -4308,18 +4325,20 @@ bool Rasterizer::DepthSampledAsAttachment(VideoCore::ImageId image_id, const Vid
 // sotc: SOTC_FX_TRACE=1: every 600 flips, each shader stage of one frame in order: its hash, the
 // addresses of the textures it reads (w: written), and for pixel shaders colour target 0. For
 // finding the passes behind post effects (bloom, fog) and their constants.
-static void FxTrace(const Shader::Info& stage, VAddr color0) {
-    static const bool on = [] {
+static void FxTrace(const Shader::Info& stage, VAddr color0, u32 color0_fmt) {
+    // SOTC_FX_TRACE=1: every 600th frame; a larger value is the period.
+    static const u64 period = [] {
         const char* v = std::getenv("SOTC_FX_TRACE");
-        return v && v[0] == '1';
+        const long long n = v ? std::atoll(v) : 0;
+        return n <= 0 ? u64{0} : n == 1 ? u64{600} : static_cast<u64>(n);
     }();
-    if (!on) {
+    if (period == 0) {
         return;
     }
     static u64 frame_seen = ~0ull;
     static u32 lines = 0;
     const u64 frame = SotcStats::flip_count.load(std::memory_order_relaxed);
-    if (frame % 600 != 0) {
+    if (frame % period > 3) {
         return;
     }
     if (frame != frame_seen) {
@@ -4327,26 +4346,27 @@ static void FxTrace(const Shader::Info& stage, VAddr color0) {
         lines = 0;
         std::fprintf(stderr, "SOTC FX frame %llu\n", static_cast<unsigned long long>(frame));
     }
-    if (++lines > 4000) {
+    if (++lines > 40000) {
         return;
     }
     std::string line = fmt::format("SOTC FX {} {:#010x}", static_cast<int>(stage.hw_stage),
                                    stage.pgm_hash);
     if (stage.hw_stage == Shader::HwStage::Fragment) {
-        line += fmt::format(" rt {:#x}", color0);
+        line += fmt::format(" rt {:#x}/{}", color0, color0_fmt);
     }
     for (const auto& image_desc : stage.images) {
         if (image_desc.array_size != 0) {
             continue;
         }
         const auto tsharp = image_desc.GetSharp(stage);
-        line += fmt::format(" {}{:#x}", image_desc.is_written ? "w" : "", tsharp.Address());
+        line += fmt::format(" {}{:#x}/{}.{}", image_desc.is_written ? "w" : "", tsharp.Address(),
+                            static_cast<u32>(tsharp.GetDataFmt()),
+                            static_cast<u32>(tsharp.GetNumberFmt()));
     }
     std::fprintf(stderr, "%s\n", line.c_str());
 }
 
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
-    FxTrace(stage, liverpool->DrawRegs().color_buffers[0].Address());
     const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the pass
     image_bindings.clear();
     const u32 first_image_idx = image_infos.size();

@@ -40,7 +40,13 @@ layout (push_constant) uniform settings {
     float highlights; // extra power above mid grey (1)
     float saturation; // chroma scale (1)
     float blowout;    // highlights towards white near the peak, 0..1 (0)
-    float test_peak;  // sotc: hdr 1: the peak test pattern's inner square in nits (0: off)
+    float flare;      // flare compensation, 0..1 (0)
+    float gamma_correction;     // SDR range decoded as gamma 2.2 instead of sRGB, 0..1 (0)
+    float highlight_saturation; // chroma scale of the highlights (1)
+    // sotc: hdr 1, the hue-preserving tone mapper (sotc_tonemap.h kVanillaPlusHue): Vanilla+'s
+    // A..E (hue_e 0: off) and the hue correction towards the per-channel curve, 0..1.
+    float hue_a, hue_b, hue_c, hue_d, hue_e;
+    float hue_correction;
 } pp;
 
 // sotc: linear Rec.709 -> HDR10 (Rec.2020 primaries, ST 2084 PQ) for an SDR game. SDR white sits at
@@ -95,8 +101,6 @@ vec3 pqEncode(vec3 nits) {
     const vec3 y = pow(clamp(nits / 10000.0, 0.0, 1.0), vec3(m1));
     return pow((c1 + c2 * y) / (1.0 + c3 * y), vec3(m2));
 }
-const mat3 rec709to2020 = mat3(0.6274, 0.0691, 0.0164, 0.3293, 0.9195, 0.0880, 0.0433, 0.0114, 0.8956);
-
 // sotc: BT.2390 EETF on the brightest channel: the scene, scaled to the paper white, goes up to
 // 10000 nits and used to clip at the display's peak (blown-out sun, sky and water). Below the
 // knee (about half the peak in PQ) nothing changes; above it the highlights roll off smoothly into
@@ -131,6 +135,65 @@ vec3 rollOff(vec3 nits) {
     return nits * (min(pqDecode1(e2), pp.hdr_peak) / m);
 }
 
+// sotc: OkLab (Ottosson) from linear Rec.2020, for the hue correction.
+const mat3 rec2020to709 = mat3(1.6605, -0.1246, -0.0182, -0.5876, 1.1329, -0.1006, -0.0728,
+                               -0.0083, 1.1187);
+const mat3 rec709to2020 = mat3(0.6274, 0.0691, 0.0164, 0.3293, 0.9195, 0.0880, 0.0433, 0.0114, 0.8956);
+const mat3 okM1 = mat3(0.4122214708, 0.2119034982, 0.0883024619, 0.5363325363, 0.6806995451,
+                       0.2817188376, 0.0514459929, 0.1073969566, 0.6299787005);
+const mat3 okM2 = mat3(0.2104542553, 1.9779984951, 0.0259040371, 0.7936177850, -2.4285922050,
+                       0.7827717662, -0.0040720468, 0.4505937099, -0.8086757660);
+const mat3 okM2i = mat3(1.0, 1.0, 1.0, 0.3963377774, -0.1055613458, -0.0894841775, 0.2158037573,
+                        -0.0638541728, -1.2914855480);
+const mat3 okM1i = mat3(4.0767416621, -1.2684380046, -0.0041960863, -3.3077115913, 2.6097574011,
+                        -0.7034186147, 0.2309699292, -0.3413193965, 1.7076147010);
+vec3 toOkLab(vec3 c2020) {
+    const vec3 lms = okM1 * (rec2020to709 * c2020);
+    return okM2 * (sign(lms) * pow(abs(lms), vec3(1.0 / 3.0)));
+}
+vec3 fromOkLab(vec3 lab) {
+    const vec3 lms = okM2i * lab;
+    return rec709to2020 * (okM1i * (lms * lms * lms));
+}
+
+// sotc: the hue-preserving tone mapper (sotc_tonemap.h kVanillaPlusHue). The game's pass drew a
+// straight line (slope s, the game's curve at mid grey); here Vanilla+'s curve goes on the
+// luminance and the colour is scaled with it, so a bright colour keeps its hue and saturation
+// instead of drifting towards yellow and white per channel. hue_correction takes the hue (OkLab
+// a/b direction, chroma kept) back towards the per-channel curve's. `u` in the game's linear
+// units (Rec.2020).
+float hueCurve1(float x) {
+    return x * (pp.hue_a * x + pp.hue_b) / (x * (pp.hue_c * x + pp.hue_d) + pp.hue_e);
+}
+vec3 hueCurve(vec3 u) {
+    if (pp.hue_e <= 0.0) {
+        return u;
+    }
+    const float s = hueCurve1(0.18) / 0.18;
+    u = max(u, vec3(0.0));
+    const float y = dot(u, vec3(0.2627, 0.6780, 0.0593));
+    if (y <= 0.0 || s <= 0.0) {
+        return u;
+    }
+    vec3 r = u * (hueCurve1(y / s) / y);
+    if (pp.hue_correction > 0.0) {
+        const vec3 x = u / s;
+        const vec3 ref = x * (pp.hue_a * x + pp.hue_b) / (x * (pp.hue_c * x + pp.hue_d) + pp.hue_e);
+        const vec3 lab = toOkLab(r);
+        const vec3 lab_ref = toOkLab(ref);
+        const float chroma = length(lab.yz);
+        const float chroma_ref = length(lab_ref.yz);
+        if (chroma > 1e-5 && chroma_ref > 1e-5) {
+            const vec2 dir = mix(lab.yz / chroma, lab_ref.yz / chroma_ref, pp.hue_correction);
+            const float len = length(dir);
+            if (len > 1e-5) {
+                r = max(fromOkLab(vec3(lab.x, dir / len * chroma)), vec3(0.0));
+            }
+        }
+    }
+    return r;
+}
+
 // sotc: picture controls on the scene in nits (linear Rec.2020), before rollOff(). Contrast,
 // shadows and highlights are powers on luminance pivoting at the scene's key (its log-average,
 // measured each frame and smoothed: pp_key.comp), the colour scaled by the luminance ratio so
@@ -140,16 +203,35 @@ vec3 rollOff(vec3 nits) {
 // highlights towards white from two stops above the key to the display's peak. All neutral:
 // skipped, so the picture is unchanged bit for bit.
 const vec3 luma2020 = vec3(0.2627, 0.6780, 0.0593);
+// Gamma correction (RenoDX's): the SDR range (up to the paper white) as a 2.2 display shows an
+// sRGB-encoded picture, darker near black; on luminance, so hues stay. Flare compensation takes
+// the veiling glare out of the near-blacks (y^2 / (y + f)), absolute, a few nits at most.
+// Highlight saturation scales the chroma of what is brighter than the key, more the brighter.
 vec3 grade(vec3 nits) {
     if (pp.exposure == 1.0 && pp.contrast == 1.0 && pp.shadows == 1.0 && pp.highlights == 1.0 &&
-        pp.saturation == 1.0 && pp.blowout == 0.0) {
+        pp.saturation == 1.0 && pp.blowout == 0.0 && pp.flare == 0.0 &&
+        pp.gamma_correction == 0.0 && pp.highlight_saturation == 1.0) {
         return nits;
     }
-    nits = max(nits, vec3(0.0)) * pp.exposure;
+    nits = max(nits, vec3(0.0));
     float y = dot(nits, luma2020);
     if (y <= 0.0) {
         return nits;
     }
+    if (pp.gamma_correction > 0.0) {
+        const float w = y / pp.hdr_white;
+        if (w < 1.0) {
+            const float e = w <= 0.0031308 ? 12.92 * w : 1.055 * pow(w, 1.0 / 2.4) - 0.055;
+            const float y2 = pp.hdr_white * mix(w, pow(e, 2.2), pp.gamma_correction);
+            nits *= y2 / y;
+            y = y2;
+            if (y <= 0.0) {
+                return nits;
+            }
+        }
+    }
+    nits *= pp.exposure;
+    y *= pp.exposure;
     float k = scene_key.log2_key;
     if (!(k > -12.0 && k < 6.0)) { // not measured yet (or a bad value): 18% grey
         k = -2.474;
@@ -159,7 +241,17 @@ vec3 grade(vec3 nits) {
     const float y2 = mid * pow(yn, pp.contrast * (yn < 1.0 ? pp.shadows : pp.highlights));
     nits *= y2 / y;
     y = y2;
-    nits = max(vec3(y) + (nits - vec3(y)) * pp.saturation, vec3(0.0));
+    if (pp.flare > 0.0) {
+        const float y2 = y * y / (y + pp.flare * 0.02 * pp.hdr_white);
+        nits *= y2 / y;
+        y = y2;
+    }
+    float sat = pp.saturation;
+    if (pp.highlight_saturation != 1.0 && y > mid) {
+        const float t = smoothstep(0.0, 1.0, log2(y / mid) / 3.0);
+        sat *= mix(1.0, pp.highlight_saturation, t);
+    }
+    nits = max(vec3(y) + (nits - vec3(y)) * sat, vec3(0.0));
     if (pp.blowout > 0.0) {
         const float peak = pp.hdr_peak > 0.0 ? pp.hdr_peak : 10000.0;
         const float start = 4.0 * mid;
@@ -198,22 +290,7 @@ vec4 sampleCatmullRom(sampler2D tex, vec2 p) {
     return clamp(r, 0.0, 1.0);
 }
 
-// sotc: the peak test pattern (F1 > Image), like Windows HDR Calibration's: a dim surround, a
-// square at 10000 nits (the display clips it at its real peak) and in it a smaller one at the
-// peak setting, no roll-off. Raising the setting until the inner square disappears finds the
-// display's peak.
-float peakTestNits() {
-    const vec2 size = vec2(textureSize(texSampler, 0));
-    const vec2 p = (uv - 0.5) * vec2(size.x / max(size.y, 1.0), 1.0);
-    const float m = max(abs(p.x), abs(p.y));
-    return m < 0.07 ? pp.test_peak : m < 0.22 ? 10000.0 : 2.0;
-}
-
 void main() {
-    if (pp.hdr == 1u && pp.test_peak > 0.0) {
-        color = vec4(pqEncode(vec3(peakTestNits())), 1.0);
-        return;
-    }
     vec4 color_linear = texture(texSampler, uv);
     if (pp.sky_sharpen != 0.0) {
         // DLSS softens the drifting clouds more than FSR1: extra unsharp there, limited to the
@@ -262,7 +339,7 @@ void main() {
             const vec3 lin = rec709to2020 * pow(c, vec3(pp.hdr_curve));
             // The picture controls grade the scene part only; where the UI covers the scene, its
             // own (ungraded) level takes over below by the UI's alpha.
-            const vec3 scene_nits = rollOff(grade(3.0 * pp.hdr_white * lin));
+            const vec3 scene_nits = rollOff(grade(3.0 * pp.hdr_white * hueCurve(lin)));
             const float ui_white = pp.ui_white > 0.0 ? pp.ui_white : pp.hdr_white;
             vec3 nits = scene_nits;
             if (ui.a > 0.0) {
@@ -280,8 +357,9 @@ void main() {
         // the desktop; scaled to the paper white, highlights rolled off into the display's peak.
         // (The UI is already in this picture here, so it follows the paper white.)
         // The picture controls apply to the whole frame here (the UI is baked in).
-        color = vec4(pqEncode(rollOff(grade(pqDecode(color_linear.rgb) * (pp.hdr_white / 100.0)))),
-                     color_linear.a);
+        // The game's PQ has 1.0 of its linear units at 300 nits (hueCurve's units).
+        const vec3 u = hueCurve(pqDecode(color_linear.rgb) / 300.0);
+        color = vec4(pqEncode(rollOff(grade(u * (3.0 * pp.hdr_white)))), color_linear.a);
     } else if (pp.hdr == 2u) {
         if (pp.srgb_input) color_linear.rgb = degamma(color_linear.rgb);
         color = vec4(sdrToHdr10(color_linear.rgb), color_linear.a);

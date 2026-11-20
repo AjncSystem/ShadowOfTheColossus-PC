@@ -42,8 +42,9 @@ inline std::atomic<float> hdr_ui{-1.f};
 /// highlight saturation (0..100, neutral 50; SOTC_HDR_HIGHLIGHT_SATURATION), film grain (0..100,
 /// neutral 0; SOTC_HDR_GRAIN; SDR too) and gamut expansion (0..100, neutral 0;
 /// SOTC_HDR_GAMUT_EXPANSION). Gamma correction: 0 off, 100 gamma 2.2, 200 gamma 2.4 (BT.1886).
-/// Exposure to highlight saturation and grain also work in SDR. kGradeUnset: the value read at
-/// start.
+/// Grain size in percent (50..200, neutral 100; SOTC_HDR_GRAIN_SIZE) of a grain cell that
+/// follows the output resolution (1 pixel at 1080p, 2 at 2160p). Exposure to highlight saturation
+/// and grain also work in SDR. kGradeUnset: the value read at start.
 inline constexpr float kGradeUnset = -1000.f;
 enum HdrGrade {
     kExposure,
@@ -58,12 +59,40 @@ enum HdrGrade {
     kHighlightSaturation,
     kGrain,
     kGamutExpansion,
+    kGrainSize,
     kGradeCount
 };
-inline std::atomic<float> hdr_grade[kGradeCount]{kGradeUnset, kGradeUnset, kGradeUnset,
-                                                 kGradeUnset, kGradeUnset, kGradeUnset,
-                                                 kGradeUnset, kGradeUnset, kGradeUnset,
-                                                 kGradeUnset, kGradeUnset, kGradeUnset};
+inline std::atomic<float> hdr_grade[kGradeCount]{
+    kGradeUnset, kGradeUnset, kGradeUnset, kGradeUnset, kGradeUnset, kGradeUnset, kGradeUnset,
+    kGradeUnset, kGradeUnset, kGradeUnset, kGradeUnset, kGradeUnset, kGradeUnset};
+/// The launcher's settings keys of the grades, in HdrGrade order.
+inline constexpr const char* kGradeKeys[kGradeCount] = {
+    "hdr_exposure",    "hdr_contrast",       "hdr_shadows",
+    "hdr_highlights",  "hdr_saturation",     "hdr_blowout",
+    "hdr_hue_correction", "hdr_flare",       "hdr_gamma_correction",
+    "hdr_highlight_saturation", "hdr_grain", "hdr_gamut_expansion",
+    "hdr_grain_size"};
+
+/// Picture presets (the F1 menu's "Picture: preset"; the launcher's HDR_PRESETS has the same
+/// values): the tone mapper (sotc_tonemap.h Mode) and every grade in the menu's units. The game's
+/// colour grading goes back to 100%; brightness, peak, UI and effect strengths stay.
+struct PicturePreset {
+    const char* key;
+    int tonemap;
+    float grade[kGradeCount];
+};
+inline constexpr PicturePreset kPicturePresets[] = {
+    // exposure, contrast, shadows, highlights, saturation, blowout, hue correction, flare,
+    // gamma correction, highlight saturation, grain, gamut expansion, grain size
+    {"original", 0, {0, 50, 50, 50, 50, 0, 100, 0, 0, 50, 0, 0, 100}},
+    // RenoDX's defaults: RenoDRT, SDR range at gamma 2.2, the rest neutral.
+    {"renodx", 4, {0, 50, 50, 50, 50, 0, 100, 0, 100, 50, 0, 0, 100}},
+    // Richer colour: hue-keeping Vanilla+, saturated colours out towards P3, a little contrast.
+    {"vivid", 3, {0, 54, 50, 50, 56, 0, 100, 0, 100, 58, 0, 36, 100}},
+    // Film: RenoDRT, more contrast, slightly deeper blacks, softer highlight colour, grain. (Gamma
+    // 2.4 with deeper shadows lost night scenes: Wander's horse went into the black.)
+    {"film", 4, {0, 54, 50, 50, 50, 0, 100, 10, 100, 46, 30, 10, 100}},
+};
 
 /// Game HDR tone mapper (sotc_tonemap.h Mode: 0 vanilla, 1 vanilla+, 2 none, 3 vanilla+ hue
 /// preserving, 4 RenoDRT; SOTC_HDR_TONEMAP)

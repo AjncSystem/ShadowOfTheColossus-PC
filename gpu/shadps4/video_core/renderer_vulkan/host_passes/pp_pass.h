@@ -64,6 +64,9 @@ public:
         /// HDR; `seed` changes every presented frame so the grain moves.
         float grain = 0.0f;
         u32 seed = 0;
+        /// sotc: grain cell size, 1 = one pixel at 1080p (scaled with the output's height, so the
+        /// grain looks the same at any resolution).
+        float grain_size = 1.0f;
         /// sotc: hdr 1: gamut expansion 0..1 (saturated colours pushed out towards P3 inside
         /// Rec.2020; 0: none).
         float gamut_expansion = 0.0f;

@@ -903,6 +903,67 @@ void BuildItems() {
             }
             return v;
         };
+        // Presets (sotc_live.h kPicturePresets): the tone mapper and every picture control at
+        // once. The choice shown is the preset the current values match, else Custom.
+        {
+            static const char* kPresetTonemapKeys[] = {"\"vanilla\"", "\"vanilla_plus\"",
+                                                       "\"none\"", "\"vanilla_plus_hue\"",
+                                                       "\"renodrt\""};
+            constexpr int kPresets = int(std::size(SotcLive::kPicturePresets));
+            MenuItem& preset = AddLive(
+                kTabDisplay, L("Imagem: predefinição", "Picture: preset"),
+                L("Ajusta a curva de tons e todos os controles de imagem de uma vez. Original: o jogo. RenoDX: como os padrões dos mods RenoDX (RenoDRT, gama 2.2). Vívido: cores mais ricas, rumo ao P3. Filme: mais contraste, pretos um pouco mais fundos e granulação. O brilho, o pico e a interface ficam. Mexer num controle torna Personalizado.",
+                  "Sets the tone mapper and every picture control at once. Original: the game. RenoDX: like the RenoDX mods' defaults (RenoDRT, gamma 2.2). Vivid: richer colour, towards P3. Film: more contrast, slightly deeper blacks and grain. Brightness, peak and UI stay. Changing a control makes it Custom."),
+                {{L("Original", "Original"), "0"}, {"RenoDX", "1"}, {L("Vívido", "Vivid"), "2"},
+                 {L("Filme", "Film"), "3"}, {L("Personalizado", "Custom"), "4"}},
+                [kUnsetBelow] {
+                    float now[SotcLive::kGradeCount];
+                    for (int i = 0; i < SotcLive::kGradeCount; ++i) {
+                        now[i] = SotcLive::hdr_grade[i].load(std::memory_order_relaxed);
+                        if (now[i] < kUnsetBelow) {
+                            const std::string v = LoadLauncherSetting(SotcLive::kGradeKeys[i]);
+                            now[i] = v.empty() ? SotcLive::kPicturePresets[0].grade[i]
+                                               : static_cast<float>(std::atof(v.c_str()));
+                        }
+                    }
+                    int tm = SotcLive::hdr_tonemap.load(std::memory_order_relaxed);
+                    if (tm < 0) {
+                        const std::string v = LoadLauncherSetting("hdr_tonemap");
+                        tm = v == "vanilla_plus" || v == "vanilla+" ? 1
+                             : v == "none"                          ? 2
+                             : v == "vanilla_plus_hue"              ? 3
+                             : v == "renodrt"                       ? 4
+                                                                    : 0;
+                    }
+                    for (int p = 0; p < kPresets; ++p) {
+                        const SotcLive::PicturePreset& pr = SotcLive::kPicturePresets[p];
+                        bool same = pr.tonemap == tm;
+                        for (int i = 0; same && i < SotcLive::kGradeCount; ++i) {
+                            same = std::fabs(now[i] - pr.grade[i]) < 0.5f;
+                        }
+                        if (same) {
+                            return p;
+                        }
+                    }
+                    return kPresets; // Custom
+                },
+                [kPresets](int p) {
+                    if (p < 0 || p >= kPresets) {
+                        return; // Custom: the values stay as they are
+                    }
+                    const SotcLive::PicturePreset& pr = SotcLive::kPicturePresets[p];
+                    for (int i = 0; i < SotcLive::kGradeCount; ++i) {
+                        SotcLive::hdr_grade[i].store(pr.grade[i], std::memory_order_relaxed);
+                        SaveLauncherSetting(SotcLive::kGradeKeys[i],
+                                            std::to_string(int(pr.grade[i])));
+                    }
+                    SotcLive::hdr_tonemap.store(pr.tonemap, std::memory_order_relaxed);
+                    SaveLauncherSetting("hdr_tonemap", kPresetTonemapKeys[pr.tonemap]);
+                    SotcLive::hdr_grading.store(100.0f, std::memory_order_relaxed);
+                    SaveLauncherSetting("hdr_grading", "100");
+                });
+            preset.shown = picture_on;
+        }
         {
             MenuItem& item = add_level(L("Imagem: exposição", "Picture: exposure"),
                   L("Clareia ou escurece o mundo inteiro, em pontos de exposição. 0 é o original.",
@@ -998,34 +1059,31 @@ void BuildItems() {
             grain.slider = true;
             grain.shown = picture_on;
         }
+        {
+            std::vector<std::pair<float, std::string>> sizes;
+            for (int p = 50; p <= 200; p += 10) {
+                sizes.push_back({float(p), std::to_string(p) + "%"});
+            }
+            MenuItem& size = add_level(
+                L("Imagem: tamanho da granulação", "Picture: grain size"),
+                L("O tamanho dos grãos. 100% é um pixel em 1080p e cresce com a resolução (dois pixels em 4K), então a granulação parece a mesma em qualquer tela.",
+                  "The size of the grain. 100% is one pixel at 1080p and grows with the resolution (two pixels at 4K), so the grain looks the same on any screen."),
+                "hdr_grain_size", SotcLive::hdr_grade[SotcLive::kGrainSize], "SOTC_HDR_GRAIN_SIZE",
+                100.0f, sizes, kUnsetBelow);
+            size.slider = true;
+            size.shown = picture_on;
+        }
         MenuItem& reset = AddLive(
             kTabDisplay, L("Imagem: restaurar", "Picture: reset"),
             L("Volta todos os controles de imagem (granulação e expansão de gama inclusive), a curva de tons, a correção de cor do jogo e a força do bloom, da vinheta, da névoa e do borrão de movimento ao original. O brilho e o pico ficam.",
               "Puts every picture control (grain and gamut expansion included), the tone mapper, the game's colour grading and the bloom, vignette, fog and motion blur strengths back to the original. Brightness and peak stay."),
             {{L("Executar", "Run"), "0"}}, [] { return -1; },
             [](int) {
-                struct Neutral {
-                    SotcLive::HdrGrade id;
-                    const char* key;
-                    float value;
-                };
-                static constexpr Neutral kNeutral[] = {
-                    {SotcLive::kExposure, "hdr_exposure", 0.0f},
-                    {SotcLive::kContrast, "hdr_contrast", 50.0f},
-                    {SotcLive::kShadows, "hdr_shadows", 50.0f},
-                    {SotcLive::kHighlights, "hdr_highlights", 50.0f},
-                    {SotcLive::kSaturation, "hdr_saturation", 50.0f},
-                    {SotcLive::kBlowout, "hdr_blowout", 0.0f},
-                    {SotcLive::kHueCorrection, "hdr_hue_correction", 100.0f},
-                    {SotcLive::kFlare, "hdr_flare", 0.0f},
-                    {SotcLive::kGammaCorrection, "hdr_gamma_correction", 0.0f},
-                    {SotcLive::kHighlightSaturation, "hdr_highlight_saturation", 50.0f},
-                    {SotcLive::kGrain, "hdr_grain", 0.0f},
-                    {SotcLive::kGamutExpansion, "hdr_gamut_expansion", 0.0f},
-                };
-                for (const Neutral& n : kNeutral) {
-                    SotcLive::hdr_grade[n.id].store(n.value, std::memory_order_relaxed);
-                    SaveLauncherSetting(n.key, std::to_string(int(n.value)));
+                const SotcLive::PicturePreset& neutral = SotcLive::kPicturePresets[0];
+                for (int i = 0; i < SotcLive::kGradeCount; ++i) {
+                    SotcLive::hdr_grade[i].store(neutral.grade[i], std::memory_order_relaxed);
+                    SaveLauncherSetting(SotcLive::kGradeKeys[i],
+                                        std::to_string(int(neutral.grade[i])));
                 }
                 SotcLive::hdr_grading.store(100.0f, std::memory_order_relaxed);
                 SaveLauncherSetting("hdr_grading", "100");

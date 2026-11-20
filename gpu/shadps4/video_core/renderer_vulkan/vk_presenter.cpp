@@ -136,6 +136,7 @@ static void RefreshHdrLevels(HostPasses::PostProcessingPass::Settings& s) {
         {"hdr_highlight_saturation", "SOTC_HDR_HIGHLIGHT_SATURATION", 50.0f, 0.0f, 100.0f},
         {"hdr_grain", "SOTC_HDR_GRAIN", 0.0f, 0.0f, 100.0f},
         {"hdr_gamut_expansion", "SOTC_HDR_GAMUT_EXPANSION", 0.0f, 0.0f, 100.0f},
+        {"hdr_grain_size", "SOTC_HDR_GRAIN_SIZE", 100.0f, 50.0f, 200.0f},
     };
     static const std::array<float, SotcLive::kGradeCount> grade_start = [] {
         std::array<float, SotcLive::kGradeCount> g{};
@@ -172,6 +173,7 @@ static void RefreshHdrLevels(HostPasses::PostProcessingPass::Settings& s) {
     s.highlight_saturation = g[SotcLive::kHighlightSaturation] / 50.0f;
     s.grain = g[SotcLive::kGrain] / 100.0f;
     s.gamut_expansion = g[SotcLive::kGamutExpansion] / 100.0f;
+    s.grain_size = g[SotcLive::kGrainSize] / 100.0f;
     const bool compare = SotcLive::compare_vanilla.load(std::memory_order_relaxed);
     if (compare) { // F3: the game's picture at the user's brightness and peak
         s.exposure = s.contrast = s.shadows = s.highlights = s.saturation = 1.0f;

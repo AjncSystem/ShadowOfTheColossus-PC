@@ -210,10 +210,12 @@ Estas variáveis de ambiente ajudam a investigar problemas:
 | `SOTC_HDR_FLARE=0..100` | em HDR e SDR: compensação de véu, pretos mais fundos (padrão 0) |
 | `SOTC_HDR_GAMMA_CORRECTION=0\|100\|200` | com HDR: a parte escura decodificada como gama 2.2 (100) ou 2.4, BT.1886 (200), em vez de sRGB (padrão 0, desligado) |
 | `SOTC_HDR_GRAIN=0..100` | em HDR e SDR: granulação de filme fina e em movimento, mais nos tons médios (padrão 0, desligada; o jogo não tem) |
+| `SOTC_HDR_GRAIN_SIZE=50..200` | em HDR e SDR: o tamanho dos grãos em %; 100 (padrão) é um pixel em 1080p e cresce com a resolução (dois pixels em 4K), então a granulação parece a mesma em qualquer tela |
 | `SOTC_HDR_GAMUT_EXPANSION=0..100` | com HDR: leva as cores já saturadas além do sRGB, rumo ao P3 (padrão 0) |
 | `SOTC_DITHER=0` | tira o pontilhado (dithering) de um passo antes dos 8 bits (SDR) ou 10 bits (HDR) da tela, que evita faixas no céu e na névoa (padrão ligado) |
 | `SOTC_HDR_HUE_CORRECTION=0..100` | com HDR e as curvas `vanilla_plus_hue` e `renodrt`: quanto o tom dos realces volta ao do jogo (padrão 100) |
 | `SOTC_HDR_TONEMAP=vanilla\|vanilla_plus\|vanilla_plus_hue\|renodrt\|none` | com HDR: a curva de tons do jogo (padrão `vanilla`); `vanilla_plus` mantém os tons médios e deixa os realces subirem até o pico; `vanilla_plus_hue` faz o mesmo no brilho, mantendo a cor; `renodrt` (como os mods RenoDX) mantém as sombras e os tons médios do jogo, tira a curva dos realces e desce o brilho suavemente até o pico mantendo cor e saturação; `none` tira a curva. Com `none`, `vanilla_plus_hue` e `renodrt` o passe do jogo não corta mais os realces em 18x (sol, céu e água chegam inteiros à curva final) |
+| (menu F1 e launcher) | **Imagem: predefinição**: Original, RenoDX (RenoDRT e gama 2.2, como os padrões dos mods RenoDX), Vívido (Original+ (cor), cores rumo ao P3) e Filme (RenoDRT, mais contraste, granulação) ajustam a curva de tons e todos os controles de imagem de uma vez; o brilho, o pico e a interface ficam. O launcher tem a mesma seção em Imagem e FPS |
 | `SOTC_FSR1_SPLIT=0` | com HDR e FSR 1: volta a ampliar a imagem do jogo já com a interface (sem brilho próprio da interface; os controles de imagem valem para a interface também) |
 | `SOTC_HDR_GRADING=0..100` | em HDR e SDR: a força da correção de cor do jogo em porcentagem (padrão 100); 0 tira o tom de cor de cada lugar e mantém o brilho |
 | `SOTC_TONEMAP_LOG=1` | diagnóstico: as constantes do tonemap do jogo quando mudam e a curva aplicada |

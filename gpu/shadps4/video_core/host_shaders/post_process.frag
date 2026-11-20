@@ -67,12 +67,32 @@ uint pcg(uint v) {
     const uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
     return (word >> 22u) ^ word;
 }
-float rand01(uint salt) {
-    const uvec2 p = uvec2(gl_FragCoord.xy);
+float rand01At(uvec2 p, uint salt) {
     return float(pcg(p.x + pcg(p.y + pcg(pp.seed ^ salt)))) * (1.0 / 4294967295.0);
 }
+float triNoiseAt(uvec2 p, uint salt) {
+    return rand01At(p, salt) + rand01At(p, salt ^ 0x68bc21ebu) - 1.0;
+}
 float triNoise(uint salt) {
-    return rand01(salt) + rand01(salt ^ 0x68bc21ebu) - 1.0;
+    return triNoiseAt(uvec2(gl_FragCoord.xy), salt);
+}
+// sotc: the film grain's noise on cells of (flags >> 8) / 16 output pixels (pp_pass.cpp Pack: the
+// size follows the output resolution): smooth value noise between the cells' corners, its
+// strength kept as the interpolation would lower it.
+float grainNoise(uint salt) {
+    const float cell = float((pp.flags >> 8) & 255u) / 16.0;
+    if (cell <= 1.0) {
+        return triNoise(salt);
+    }
+    const vec2 g = gl_FragCoord.xy / cell;
+    const vec2 i = floor(g);
+    const vec2 f = g - i;
+    const vec2 w = f * f * (3.0 - 2.0 * f);
+    const uvec2 c = uvec2(ivec2(i) + 65536);
+    const float n00 = triNoiseAt(c, salt), n10 = triNoiseAt(c + uvec2(1, 0), salt);
+    const float n01 = triNoiseAt(c + uvec2(0, 1), salt), n11 = triNoiseAt(c + uvec2(1, 1), salt);
+    const vec4 k = vec4((1.0 - w.x) * (1.0 - w.y), w.x * (1.0 - w.y), (1.0 - w.x) * w.y, w.x * w.y);
+    return dot(k, vec4(n00, n10, n01, n11)) / sqrt(dot(k, k));
 }
 
 // sotc: linear Rec.709 -> HDR10 (Rec.2020 primaries, ST 2084 PQ) for an SDR game. SDR white sits at
@@ -381,7 +401,7 @@ vec3 filmGrain(vec3 c, float white) {
     }
     const float l = (log2(y / white) + 1.5) / 2.5;
     const float weight = exp2(-0.5 * l * l);
-    return c * exp2(pp.grain * 0.3 * weight * triNoise(0x9e3779b9u));
+    return c * exp2(pp.grain * 0.3 * weight * grainNoise(0x9e3779b9u));
 }
 
 // sotc: the scene in nits (linear Rec.2020, the game's HDR): gamut expansion, picture controls,

@@ -24,7 +24,7 @@ namespace Vulkan::HostPasses {
 
 // sotc: Settings as post_process.frag reads them. 128 bytes is the push constant size every
 // Vulkan device must take, so the switches share one word (bits 0-1 hdr, 2 srgb_input, 3-4 ui,
-// 5 drt, 6 dither at 8 bits, 7 dither at 10 bits).
+// 5 drt, 6 dither at 8 bits, 7 dither at 10 bits, 8-15 the grain cell in 1/16 pixels).
 struct GpuSettings {
     float gamma;
     u32 flags;
@@ -42,9 +42,13 @@ struct GpuSettings {
 static_assert(sizeof(GpuSettings) == 128);
 static_assert(offsetof(GpuSettings, vignette) == 16);
 
-static GpuSettings Pack(const PostProcessingPass::Settings& s) {
+static GpuSettings Pack(const PostProcessingPass::Settings& s, u32 output_height) {
     u32 flags = (s.hdr & 3u) | ((s.srgb_input ? 1u : 0u) << 2) | ((s.ui & 3u) << 3) |
                 ((s.drt ? 1u : 0u) << 5);
+    // The grain cell: a pixel at 1080p, 2 at 2160p (white noise per pixel was half as coarse at
+    // 4K as at 1080p), times the size setting.
+    const float cell = std::max(1.0f, float(output_height) / 1080.0f * s.grain_size);
+    flags |= u32(std::clamp(cell * 16.0f + 0.5f, 16.0f, 255.0f)) << 8;
     if (s.dither_bits == 8) {
         flags |= 1u << 6;
     } else if (s.dither_bits == 10) {
@@ -384,7 +388,7 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                          });
 
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, set_writes);
-    const GpuSettings gpu = Pack(settings);
+    const GpuSettings gpu = Pack(settings, frame.height);
     cmdbuf.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(gpu),
                          &gpu);
 

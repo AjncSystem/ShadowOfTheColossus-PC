@@ -49,6 +49,11 @@ from sotc_modes import GAMES  # noqa: E402
 GAME_ID = 'CUSA08809'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
 VERSION = '0.76.2'
+# sotc: the port version whose shader translation the cache holds (clear_shader_cache_after_update).
+# Raise it to the new VERSION in a release that changes how shaders are translated or stored
+# (shader_recompiler/, the SPIR-V emitters, vk_pipeline_serialization.cpp versions, cache_storage
+# folders); a release that does not keeps the players' caches.
+SHADER_CACHE_VERSION = '0.76.2'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -663,23 +668,42 @@ def clear_shader_cache_after_update(settings):
     previous port can conflict with the new one (wrong or missing effects, crashes when one is
     loaded); the game builds them again, with some stutter at the start. The port version that
     built the cache is kept next to it (user/cache/port_version.txt; the --play path never saves
-    the settings, so they cannot hold it)."""
+    the settings, so they cannot hold it).
+
+    0.77: only an update that changes the shaders clears it (SHADER_CACHE_VERSION, the second line
+    of the marker; a marker without it names the port that built the cache). Clearing on every
+    update made each player translate every shader again, a stall at each new area for a whole
+    play-through. SOTC_CACHE_CLEAR_EVERY_UPDATE=1 (environment) clears on every update again."""
     data = user_dir(settings)
     marker = data / 'cache' / 'port_version.txt'
     try:
-        built_by = marker.read_text(encoding='utf-8').strip()
+        lines = marker.read_text(encoding='utf-8').split()
     except OSError:
-        built_by = ''
-    if built_by == VERSION:
-        return
+        lines = []
+    built_by = lines[0] if lines else ''
+    every_update = os.environ.get('SOTC_CACHE_CLEAR_EVERY_UPDATE', '') == '1'
+    if every_update:
+        if built_by == VERSION:
+            return
+    else:
+        shaders = lines[1].removeprefix('shaders=') if len(lines) > 1 else built_by
+        if shaders == SHADER_CACHE_VERSION:
+            if built_by != VERSION:
+                _write_cache_marker(marker)
+            return
     # A first start (no cache yet) has nothing to clear; an older cache without the marker was
     # built by a port before 0.72.2.
     if (data / 'cache').exists() or (data / 'shader').exists():
         for name in ('cache', 'shader'):
             shutil.rmtree(data / name, ignore_errors=True)
+    _write_cache_marker(marker)
+
+
+def _write_cache_marker(marker):
+    """The port version now using the cache, then the shader version it holds."""
     try:
         marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(VERSION + '\n', encoding='utf-8')
+        marker.write_text(f'{VERSION}\nshaders={SHADER_CACHE_VERSION}\n', encoding='utf-8')
     except OSError:
         pass
 
@@ -967,6 +991,10 @@ def game_environment(s):
         env.setdefault('SOTC_PC_MEMORY', '1')
         env.setdefault('SOTC_PC_MEMORY_PREIMPORT', '1')
         env.setdefault('SOTC_TEX_DIRECT', '1')
+        # sotc: 0.77 (T48): textures in several backing runs (the game's pool maps them 64 KiB at
+        # a time) or across two import chunks are gathered by the GPU instead of copied by the
+        # CPU (~13 GB a session; user's route 17 Nov: area entry 7-9 frames over 50 ms -> 1).
+        env.setdefault('SOTC_TEX_GATHER', '1')
     # sotc: "Maximum" in PS4 Pro mode exhausted the game's page pool within minutes at the Shrine
     # (0x1a371, 22 Oct) until tabnul's page allocator fix (PR #288, sotc_modes.py POOL_FIX): an
     # hour without a crash with it (26 Oct). Experimental there; SOTC_MAX_IN_PRO=0 brings back High.

@@ -9,6 +9,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <variant>
 #include <tsl/robin_map.h>
@@ -113,6 +114,11 @@ public:
 
     const ComputePipeline* GetComputePipeline();
 
+    /// sotc: SOTC_COMPUTE_PREFETCH (Liverpool::PrefetchComputeShaders): a compute shader that a
+    /// dispatch further on will need and that is not translated yet goes to a pipeline worker
+    /// now; GetProgram waits for that job instead of translating it again (command processor).
+    void PrefetchCompute(const AmdGpu::ComputeProgram& cs);
+
     using Result = std::tuple<const Shader::Info*, vk::ShaderModule, u64>;
     /// sotc: async_ok: a stage that needs translating is queued for a pipeline worker instead
     /// (SOTC_ASYNC_TRANSLATE); it returns a null Info and sets translation_pending meanwhile.
@@ -152,6 +158,9 @@ private:
                                    Shader::Pools* worker_pools = nullptr,
                                    std::vector<u32>* spv_out = nullptr);
     const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::HwStage stage, Shader::SwStage l_stage);
+    /// sotc: waits for the worker translating the prefetched compute program `hash`, or takes
+    /// its job back when no worker has started it (the caller then translates it itself).
+    void WaitPrefetchedCompute(u64 hash);
 
     [[nodiscard]] bool IsPipelineCacheDirty() const {
         return num_new_pipelines > 0;
@@ -272,6 +281,13 @@ private:
     unsigned max_graphics_workers{};     ///< max concurrent graphics pipeline builds during gameplay
     std::unordered_set<u64> pending_programs; ///< new programs being translated (CP only)
     std::unordered_set<u64> in_place_programs; ///< failed on a worker: translated here (CP only)
+    /// sotc: SOTC_COMPUTE_PREFETCH: compute programs queued ahead (CP only), and the shader
+    /// addresses already looked at, with their first code dwords (other code may be loaded
+    /// there later).
+    std::unordered_set<u64> prefetched_computes;
+    std::unordered_map<u64, u64> prefetch_seen;
+    const AmdGpu::ComputeProgram* cs_override{}; ///< BuildRuntimeInfo reads these registers
+    std::condition_variable_any async_done_cv;   ///< a job was moved to async_done
     bool async_translate_ok{};  ///< this draw may queue its translations (CP only)
     bool translation_pending{}; ///< a stage of this draw is being translated (CP only)
     std::vector<std::unique_ptr<AsyncPipelineJob>> async_done;

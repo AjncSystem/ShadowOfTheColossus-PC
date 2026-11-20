@@ -306,4 +306,15 @@ const VideoCore::Buffer* GetBuffer(const u8* host, u64 size, u64* offset, int* w
     return chunk.wrapper;
 }
 
+u64 BytesToChunkEnd(const u8* host) {
+    if (!g_enabled || host < g_base) {
+        return 0;
+    }
+    const u64 host_offset = static_cast<u64>(host - g_base);
+    if (host_offset >= g_size) {
+        return 0;
+    }
+    return std::min((host_offset / g_chunk_bytes + 1) * g_chunk_bytes, g_size) - host_offset;
+}
+
 } // namespace Vulkan::SotcGuestMemory

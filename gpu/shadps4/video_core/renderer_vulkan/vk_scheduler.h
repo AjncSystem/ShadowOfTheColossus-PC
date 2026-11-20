@@ -60,7 +60,8 @@ struct SubmitInfo {
     std::array<vk::Semaphore, 4> wait_semas;
     std::array<u64, 4> wait_ticks;
     // sotc: default stage masks per slot preserve legacy behavior; callers can pass an explicit
-    // stage when attaching a compute timeline wait (e.g. async FSR) into any slot.
+    // stage when attaching a compute timeline wait (e.g. async FSR) into any slot;
+    // SOTC_CULL_QUEUE passes all commands via AddWaitAll.
     std::array<vk::PipelineStageFlags, 4> wait_stages{
         vk::PipelineStageFlagBits::eAllCommands,
         vk::PipelineStageFlagBits::eColorAttachmentOutput,
@@ -79,6 +80,12 @@ struct SubmitInfo {
         }
         wait_semas[num_wait_semas] = semaphore;
         wait_ticks[num_wait_semas++] = tick;
+    }
+
+    /// sotc: a wait that blocks every command of the submission.
+    void AddWaitAll(vk::Semaphore semaphore, u64 tick) {
+        wait_stages[num_wait_semas] = vk::PipelineStageFlagBits::eAllCommands;
+        AddWait(semaphore, tick);
     }
 
     void AddSignal(vk::Semaphore semaphore, u64 tick = 1) {
@@ -521,8 +528,43 @@ public:
 
     /// Returns the current command buffer.
     vk::CommandBuffer CommandBuffer() const {
+        // sotc: SOTC_CULL_QUEUE (sotc_cull_queue.h): while a cull dispatch is recorded, its
+        // commands go to the cull queue's command buffer; the first graphics command after a
+        // batch of them sends that batch to the GPU.
+        if (cull_override) [[unlikely]] {
+            return cull_override;
+        }
+        if (cull_batch_open) [[unlikely]] {
+            RunCullHook();
+        }
         return sessions.back().primary;
     }
+
+    /// sotc: SOTC_CULL_QUEUE: commands recorded through CommandBuffer() go to cmdbuf (a real
+    /// command buffer of the cull queue) until it is set back to null.
+    void SetCullOverride(vk::CommandBuffer cmdbuf) noexcept {
+        cull_override = cmdbuf;
+    }
+
+    /// sotc: SOTC_CULL_QUEUE: hook run once by the next graphics CommandBuffer() call after
+    /// SetCullBatchOpen(true) (the cull queue submits its open batch there).
+    void SetCullHook(Common::UniqueFunction<void>&& hook) {
+        cull_hook = std::move(hook);
+    }
+    void SetCullBatchOpen(bool open) noexcept {
+        cull_batch_open = open;
+    }
+
+    /// sotc: newest tick whose submit the recording thread has put on the queue (every one
+    /// without the recording thread).
+    [[nodiscard]] u64 RecordedSubmitTick() const noexcept {
+        return recorder ? recorded_submit_tick.load(std::memory_order_acquire)
+                        : CurrentTick() - 1;
+    }
+
+    /// sotc: runs func on the recording thread after everything queued there so far (right
+    /// away without it), and kicks it.
+    void RunAfterRecorded(Common::UniqueFunction<void>&& func);
 
     /// sotc: calls func with the real current command buffer at this point of the command
     /// stream: on the recording thread when there is one (func may wait there without holding
@@ -596,7 +638,14 @@ private:
 
     void PriorityPendingOpsThread(std::stop_token stoken);
 
+    void RunCullHook() const;
+
 private:
+    // sotc: SOTC_CULL_QUEUE (see CommandBuffer)
+    vk::CommandBuffer cull_override{};
+    mutable bool cull_batch_open{};
+    mutable Common::UniqueFunction<void> cull_hook{};
+
     const Instance& instance;
     Semaphore work_semaphore;
     CommandPool command_pool;

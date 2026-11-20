@@ -754,6 +754,26 @@ static DWORD WINAPI profiler_all(void *unused) {
     Describe describe=(Describe)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"),"GetThreadDescription");
     const char *delay=getenv("SOTC_PROFILE_DELAY"), *seconds=getenv("SOTC_PROFILE_SECONDS");
     Sleep((delay ? atoi(delay) : 20)*1000);
+    /* sotc: SOTC_PROFILE_TRIGGER_FPS=<fps>: after the delay, wait until the frame rate over half a
+     * second (what the on-screen counter shows) drops under <fps> while frames still come (not a
+     * loading screen), then sample for SOTC_PROFILE_SECONDS: the dip itself, wherever it falls. */
+    if (getenv("SOTC_PROFILE_TRIGGER_FPS")) {
+        const double limit=atof(getenv("SOTC_PROFILE_TRIGGER_FPS"));
+        uint64_t window_flips=bbgpu_flip_count();
+        ULONGLONG window_start=GetTickCount64();
+        for (;;) {
+            Sleep(50);
+            const ULONGLONG now=GetTickCount64();
+            if (now-window_start<500) continue;
+            const uint64_t flips=bbgpu_flip_count();
+            const double fps=(double)(flips-window_flips)*1000.0/(double)(now-window_start);
+            window_flips=flips; window_start=now;
+            if (fps>=5.0 && fps<limit) {
+                fprintf(stderr,"SOTC profile: triggered at %.1f FPS\n",fps);
+                break;
+            }
+        }
+    }
     all_slots=calloc(ALL_SLOTS,sizeof(*all_slots));
     if (!all_slots) return 0;
     uint32_t count=0;

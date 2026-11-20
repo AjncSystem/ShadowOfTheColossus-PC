@@ -155,6 +155,48 @@ public:
         }
     }
 
+    /// sotc: SOTC_RB_SAFEPOINT=1 (plan PLANO-TROCA-DE-AREA etapa 3): the finish of a guest
+    /// readback (applying data the GPU already copied) waits in a queue of its own that the draw
+    /// thread serves between ops, like the commands, and also at safe points inside long ops
+    /// (between the buffers and the textures of a bind: Safepoint). func(at_safepoint) returns
+    /// false to stay queued (a finish that would record GPU work waits for the normal point).
+    /// Blocks until it ran. Off, or from the command processor: SendCommand<true> as before.
+    static bool SafepointEnabled() {
+        static const bool on = [] {
+            const char* v = std::getenv("SOTC_RB_SAFEPOINT");
+            return v && v[0] == '1';
+        }();
+        return on;
+    }
+    void SendFinish(Common::UniqueFunction<bool, bool>&& func) {
+        if (!SafepointEnabled() || !back_threaded || std::this_thread::get_id() == gpu_id) {
+            SendCommand<true>([&func] { func(false); });
+            return;
+        }
+        std::binary_semaphore sem{0};
+        {
+            std::scoped_lock lk{finish_mutex};
+            finish_queue.emplace_back([&sem, &func](bool at_safepoint) {
+                if (!func(bool{at_safepoint})) {
+                    return false;
+                }
+                sem.release();
+                return true;
+            });
+            num_finishes.fetch_add(1, std::memory_order_release);
+        }
+        WakeBack();
+        sem.acquire();
+    }
+    /// Draw thread: runs the queued finishes (at_safepoint: only the ones that accept it).
+    void ServeFinishes(bool at_safepoint);
+    /// A safe point inside a long op (draw thread only; nothing to do off the draw thread).
+    void Safepoint() {
+        if (num_finishes.load(std::memory_order_acquire) != 0 && OnBackThread()) {
+            ServeFinishes(true);
+        }
+    }
+
     /// sotc: a command that must run at the command processor's point of the command stream,
     /// after the work it queued so far (SendCommand runs before that work with the draw thread:
     /// readbacks for guest threads do not wait for the queue).
@@ -377,7 +419,12 @@ private:
 
     using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
-    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb);
+    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb, bool nested = false);
+    /// sotc: SOTC_COMPUTE_PREFETCH (default on): before a submission runs, its packets (and its
+    /// indirect buffers) are walked for compute dispatches whose shader was never seen, and those
+    /// are handed to the translation workers. The dispatch then takes the worker's result instead
+    /// of translating on the command processor (new areas: ~150 compute shaders, ~1 ms each).
+    void PrefetchComputeShaders(std::span<const u32> cb, ComputeProgram& cs, int depth);
     Task ProcessCeUpdate(std::span<const u32> ccb);
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
@@ -442,6 +489,9 @@ private:
     std::jthread process_thread{};
     std::atomic<u32> num_submits{};
     std::atomic<u32> num_commands{};
+    std::atomic<u32> num_finishes{}; ///< sotc: SOTC_RB_SAFEPOINT finish_queue size
+    std::mutex finish_mutex;
+    std::deque<Common::UniqueFunction<bool, bool>> finish_queue;
     std::atomic<bool> submit_done{};
     std::mutex submit_mutex;
     std::condition_variable_any submit_cv;

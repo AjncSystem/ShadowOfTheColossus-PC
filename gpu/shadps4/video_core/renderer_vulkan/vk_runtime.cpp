@@ -8,6 +8,8 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
+#include "video_core/renderer_vulkan/sotc_cull_queue.h"
+#include "video_core/renderer_vulkan/sotc_gpu_times_note.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
@@ -118,6 +120,7 @@ void Runtime::TickFrame() {
 
 void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* dst,
                          std::span<const vk::BufferCopy> copies) {
+    SotcGpuTimes::Note(SotcGpuTimes::CBufCopy); // sotc: SOTC_GPU_TIMES
     scheduler.EndRendering();
 
     bool needs_flush{};
@@ -141,6 +144,7 @@ void Runtime::CopyBuffer(const VideoCore::Buffer* src, const VideoCore::Buffer* 
 }
 
 void Runtime::FillBuffer(const VideoCore::Buffer* dst, u64 offset, u64 size, u32 value) {
+    SotcGpuTimes::Note(SotcGpuTimes::CFill); // sotc: SOTC_GPU_TIMES
     scheduler.EndRendering();
 
     if (IsBufferAccessed(dst, offset, size, true)) {
@@ -178,6 +182,7 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
 
 void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                           std::span<const vk::BufferImageCopy> upload_copies) {
+    SotcGpuTimes::Note(SotcGpuTimes::CTexUpload); // sotc: SOTC_GPU_TIMES
     SetBackingSamples(dst, dst->info.num_samples, false);
     scheduler.EndRendering();
 
@@ -233,6 +238,7 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
 }
 
 void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
+    SotcGpuTimes::Note(SotcGpuTimes::CImageCopy); // sotc: SOTC_GPU_TIMES
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
 
     // Format mismatch warning (safe but useful)
@@ -335,6 +341,7 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
 
 void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
                                   const VideoCore::Buffer* buffer, u64 offset) {
+    SotcGpuTimes::Note(SotcGpuTimes::CImageCopy); // sotc: SOTC_GPU_TIMES
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
     const u32 num_layers = std::min(src->info.resources.layers, dst->info.resources.layers);
     // sotc: the layers both have (a one-layer D32S8 buffer copied into a two-layer D32 one at
@@ -746,8 +753,42 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 
     return has_access;
 }
 
+void Runtime::SwapBarrierState(BarrierState& state) {
+    std::swap(resources, state.resources);
+    std::swap(active_resources, state.active_resources);
+    std::swap(resource, state.resource);
+    std::swap(memory_barrier, state.memory_barrier);
+    std::swap(image_barriers, state.image_barriers);
+    ++access_epoch; // the access memos belong to the state swapped out
+}
+
+void Runtime::ResetBarrierState() {
+    memory_barrier.srcStageMask = vk::PipelineStageFlagBits2::eNone;
+    memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;
+    image_barriers.clear();
+    for (std::size_t i = 0; i < active_resources; ++i) {
+        resources[i].read_ranges.Clear();
+        resources[i].write_ranges.Clear();
+        resources[i].handle = nullptr;
+    }
+    active_resources = 0;
+    resource = nullptr;
+    ++access_epoch;
+}
+
 void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
                            vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access) {
+    // sotc: SOTC_CULL_QUEUE: graphics accesses to the ranges cull dispatches use (before the
+    // memo below: a repeated access still stamps the current tick).
+    if (g_cull_queue && !g_cull_queue->Recording()) [[unlikely]] {
+        constexpr vk::AccessFlags2 write_mask =
+            vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eColorAttachmentWrite |
+            vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+            vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eMemoryWrite |
+            vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
+        g_cull_queue->NoteGraphicsAccess(handle, offset, size,
+                                         static_cast<bool>(src_access & write_mask));
+    }
     // sotc: BbToggle::DrawBindMemo (SOTC_ACCESS_MEMO=0 off): the same access again within one
     // barrier epoch is a no-op (see access_memos).
     static const bool memo_enabled = [] {
@@ -806,6 +847,7 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
 }
 
 void Runtime::FlushBarriers() {
+    SotcGpuTimes::Note(SotcGpuTimes::CBarrier); // sotc: SOTC_GPU_TIMES
     vk::DependencyInfo dep_info{};
 
     if (memory_barrier.srcStageMask) {

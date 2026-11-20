@@ -563,14 +563,43 @@ bool Instance::CreateDevice() {
             }
         }
     }
-    static constexpr std::array queue_priorities = {1.0f, 1.0f};
     const bool cross_family = present_queue_family != queue_family_index;
+    // sotc: SOTC_CULL_QUEUE=1: one more queue of the graphics family for the visibility (cull)
+    // dispatches (sotc_cull_queue.h). Off: the queues are created exactly as before.
+    // SOTC_CULL_QUEUE_PRIORITY=1 gives it a higher priority than the others (they drop to 0.5).
+    const u32 graphics_family_queues = !cross_family && dedicated_present_queue ? 2u : 1u;
+    {
+        const char* cq = std::getenv("SOTC_CULL_QUEUE");
+        cull_queue_index = 0;
+        if (cq && cq[0] != '0') {
+            if (family_queue_count > graphics_family_queues) {
+                cull_queue_index = graphics_family_queues;
+            } else {
+                std::fprintf(stderr, "SOTC CULL QUEUE: the graphics family has %u queues, none "
+                                     "left: off\n", family_queue_count);
+            }
+        }
+    }
+    const bool cull_priority = [] {
+        const char* v = std::getenv("SOTC_CULL_QUEUE_PRIORITY");
+        return v && v[0] != '0';
+    }();
+    const std::array<float, 3> queue_priorities = {
+        cull_queue_index && cull_priority ? 0.5f : 1.0f,
+        cull_queue_index && cull_priority ? 0.5f : 1.0f, 1.0f};
+    const std::array<float, 3> cull_family_priorities = [&] {
+        std::array<float, 3> p = queue_priorities;
+        if (cull_queue_index) {
+            p[cull_queue_index] = 1.0f;
+        }
+        return p;
+    }();
     std::array<vk::DeviceQueueCreateInfo, 3> queue_infos{};
     u32 queue_info_count = 0;
     queue_infos[queue_info_count++] = vk::DeviceQueueCreateInfo{
         .queueFamilyIndex = queue_family_index,
-        .queueCount = !cross_family && dedicated_present_queue ? 2u : 1u,
-        .pQueuePriorities = queue_priorities.data(),
+        .queueCount = graphics_family_queues + (cull_queue_index ? 1u : 0u),
+        .pQueuePriorities = cull_family_priorities.data(),
     };
     if (cross_family) {
         queue_infos[queue_info_count++] = vk::DeviceQueueCreateInfo{
@@ -851,6 +880,12 @@ bool Instance::CreateDevice() {
                               : graphics_queue;
     if (has_async_compute_queue) {
         std::fprintf(stderr, "GPU async compute queue: family %u\n", async_compute_queue_family);
+    }
+    if (cull_queue_index) {
+        cull_queue = device->getQueue(queue_family_index, cull_queue_index);
+        std::fprintf(stderr, "SOTC CULL QUEUE: queue %u of graphics family %u%s\n",
+                     cull_queue_index, queue_family_index,
+                     cull_priority ? ", higher priority" : "");
     }
 
     if (calibrated_timestamps) {

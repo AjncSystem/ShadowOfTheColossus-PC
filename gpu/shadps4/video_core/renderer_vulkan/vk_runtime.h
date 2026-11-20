@@ -95,6 +95,25 @@ private:
         AccessList read_ranges;
         AccessList write_ranges;
     };
+public:
+    /// sotc: SOTC_CULL_QUEUE: the barrier tracking of another command stream (the cull queue's);
+    /// swapped in while its commands are recorded so the graphics tracking stays untouched.
+    struct BarrierState {
+        std::vector<BufferBarriers> resources;
+        std::size_t active_resources{};
+        BufferBarriers* resource{};
+        vk::MemoryBarrier2 memory_barrier{};
+        VideoCore::Image::Barriers image_barriers;
+    };
+    void SwapBarrierState(BarrierState& state);
+    /// sotc: forgets the pending accesses without recording a barrier (a new command buffer
+    /// that starts with a full barrier of its own).
+    void ResetBarrierState();
+    [[nodiscard]] bool HasPendingImageBarriers() const {
+        return !image_barriers.empty();
+    }
+
+private:
     BufferBarriers* resource{};
     std::vector<BufferBarriers> resources;
     // sotc: entries [0, active_resources) are live. With access_reuse the rest keep their list

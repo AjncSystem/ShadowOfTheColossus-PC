@@ -218,6 +218,7 @@ Estas variáveis de ambiente ajudam a investigar problemas:
 | `SOTC_TONEMAP_LOG=1` | diagnóstico: as constantes do tonemap do jogo quando mudam e a curva aplicada |
 | `SOTC_HDR_TONEMAP_CYCLE=s` | teste: alterna as curvas de tons a cada `s` segundos (comparar capturas da mesma cena) |
 | `SOTC_COMPARE_CYCLE=s` | teste: liga e desliga a imagem original (F3) a cada `s` segundos; com `SOTC_SHOT_OVERLAY=1` as capturas comparam os ajustes com o original na mesma cena |
+| `SOTC_SHOT_RAW=1` | diagnóstico: com HDR, cada captura também grava os pixels PQ como foram mostrados (`<png>.raw`: `SOTCRAW1`, largura, altura e formato em u32, depois os pixels de 10 bits), para medir os nits dos realces que o PNG corta |
 | `SOTC_FX_BLOOM=0..400` | a força do bloom em porcentagem (padrão 100 = o do jogo) |
 | `SOTC_FX_VIGNETTE=0..400` | a força da vinheta em porcentagem (padrão 100); com a vinheta desligada não faz nada |
 | `SOTC_FX_FOG=0..400` | a força da névoa atmosférica em porcentagem (padrão 100); com a névoa desligada não faz nada |

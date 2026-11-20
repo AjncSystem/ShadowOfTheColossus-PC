@@ -369,9 +369,17 @@ vec3 filmGrain(vec3 c, float white) {
 vec3 hdrScene(vec3 nits) {
     nits = grade(expandGamut(nits));
     if (PP_DRT) {
+        // The luminance is in the peak already; a saturated colour's brightest channel may still
+        // be above it: scaled down to it (hue kept), not rolled off a second time from the knee.
         nits = renoDrt(nits);
+        const float m = max(nits.r, max(nits.g, nits.b));
+        if (pp.hdr_peak > 0.0 && m > pp.hdr_peak) {
+            nits *= pp.hdr_peak / m;
+        }
+    } else {
+        nits = rollOff(nits);
     }
-    nits = filmGrain(rollOff(nits), pp.hdr_white);
+    nits = filmGrain(nits, pp.hdr_white);
     return pp.hdr_peak > 0.0 ? min(nits, vec3(pp.hdr_peak)) : nits;
 }
 
@@ -462,17 +470,22 @@ vec4 shade() {
             // The scene part gets the paper white and the roll-off to the display's peak; the UI
             // (where its alpha covers the scene) gets its own white, so menus and subtitles can
             // be dimmer or brighter than the world.
-            const vec3 c = abs(color_linear.rgb * (1.0 - ui.a) + ui.rgb);
-            const vec3 lin = rec709to2020 * pow(c, vec3(pp.hdr_curve));
-            // The picture controls grade the scene part only; where the UI covers the scene, its
-            // own (ungraded) level takes over below by the UI's alpha.
-            const vec3 scene_nits = hdrScene(3.0 * pp.hdr_white * hueCurve(lin));
-            const float ui_white = pp.ui_white > 0.0 ? pp.ui_white : pp.hdr_white;
-            vec3 nits = scene_nits;
+            const vec3 scene_part = abs(color_linear.rgb) * (1.0 - clamp(ui.a, 0.0, 1.0));
+            const vec3 c = scene_part + abs(ui.rgb);
+            const vec3 lin_all = pow(c, vec3(pp.hdr_curve));
+            // The composite's light split by each layer's share (exact with the game's exponent
+            // at 1): the scene's share gets the paper white, the tone mapper, the picture controls
+            // and grain; the UI's share its own white. Mixing the whole composite by the UI's
+            // alpha instead showed part of a translucent UI (the pause menu's white veil, alpha
+            // ~0.7) at the scene's brightness and through the scene's grading: at UI brightness
+            // 80 the menu still sat at the game brightness (190 nits).
+            const vec3 ui_share = clamp(abs(ui.rgb) / max(c, vec3(1e-6)), 0.0, 1.0);
+            const vec3 lin_scene = rec709to2020 * (lin_all * (1.0 - ui_share));
+            vec3 nits = hdrScene(3.0 * pp.hdr_white * hueCurve(lin_scene));
             if (ui.a > 0.0) {
-                vec3 ui_nits = 3.0 * ui_white * lin;
-                if (pp.hdr_peak > 0.0) ui_nits = min(ui_nits, vec3(pp.hdr_peak));
-                nits = mix(scene_nits, ui_nits, clamp(ui.a, 0.0, 1.0));
+                const float ui_white = pp.ui_white > 0.0 ? pp.ui_white : pp.hdr_white;
+                nits += 3.0 * ui_white * (rec709to2020 * (lin_all * ui_share));
+                if (pp.hdr_peak > 0.0) nits = min(nits, vec3(pp.hdr_peak));
             }
             return vec4(pqEncode(nits), 1.0);
         }

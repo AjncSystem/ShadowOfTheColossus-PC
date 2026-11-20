@@ -705,6 +705,22 @@ static void SavePendingScreenshot(const ScreenshotReadback& readback) {
 
     LOG_INFO(Render_Vulkan, "Saved screenshot: {}", primary_path.string());
 
+    // sotc: SOTC_SHOT_RAW=1 (diagnostics): an HDR screenshot also keeps its PQ pixels as they
+    // were presented (<png>.raw: "SOTCRAW1", u32 width, u32 height, u32 Vulkan format, then
+    // the packed 10-bit pixels), since the PNG is tone mapped to SDR and clips the highlights.
+    static const bool shot_raw = [] {
+        const char* v = std::getenv("SOTC_SHOT_RAW");
+        return v && v[0] == '1';
+    }();
+    if (shot_raw && readback.hdr_encoded) {
+        std::ofstream raw(primary_path.string() + ".raw", std::ios::binary);
+        const u32 header[3] = {readback.width, readback.height, static_cast<u32>(readback.format)};
+        raw.write("SOTCRAW1", 8);
+        raw.write(reinterpret_cast<const char*>(header), sizeof(header));
+        raw.write(reinterpret_cast<const char*>(readback.buffer.mapped_data.data()),
+                  static_cast<std::streamsize>(u64(readback.width) * readback.height * 4));
+    }
+
     std::ifstream file(primary_path, std::ios::binary);
     std::vector<u8> imgdata;
     if (file) {

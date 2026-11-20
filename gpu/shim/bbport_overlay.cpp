@@ -28,6 +28,7 @@
 #include "stb_image.h"
 #include <unordered_map>
 #include "imgui_impl_vulkan.h"
+#include "video_core/host_shaders/overlay_hdr_frag.h"
 #include "video_core/renderer_vulkan/vk_framegen.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -2535,6 +2536,10 @@ void Toast() {
 
 } // namespace
 
+static u32 s_image_count = 2;
+static vk::Format s_format = vk::Format::eUndefined;
+static bool InitBackend(vk::Format format);
+
 void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) {
     s_instance = &instance;
     std::scoped_lock lock{imgui_mutex};
@@ -2570,10 +2575,28 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
         },
         const_cast<vk::Instance*>(&vk_instance));
 
-    const VkFormat color_format = static_cast<VkFormat>(format);
+    s_image_count = image_count;
+    if (!InitBackend(format)) {
+        std::printf("Overlay: ImGui Vulkan backend init failed\n");
+        ImGui::DestroyContext();
+        return;
+    }
+    initialized = true;
+    (void)StartRaw("fps_mode"); // sotc: the launcher's settings as the game starts (restart band)
+    std::printf("Overlay: menu ready (Insert or L3+R3)\n");
+}
+
+// sotc: the ImGui Vulkan backend for the swapchain's `format` (its pipeline and, on the HDR10
+// swapchain, overlay_hdr.frag).
+static bool InitBackend(vk::Format format) {
+    const Vulkan::Instance& instance = *s_instance;
+    const u32 image_count = s_image_count;
+    static VkFormat color_format;
+    color_format = static_cast<VkFormat>(format);
+    s_format = format;
     ImGui_ImplVulkan_InitInfo info{};
     info.ApiVersion = instance.ApiVersion();
-    info.Instance = vk_instance;
+    info.Instance = instance.GetInstance();
     info.PhysicalDevice = instance.GetPhysicalDevice();
     info.Device = instance.GetDevice();
     info.QueueFamily = instance.GetGraphicsQueueFamilyIndex();
@@ -2587,14 +2610,33 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
         .colorAttachmentCount = 1,
         .pColorAttachmentFormats = &color_format,
     };
-    if (!ImGui_ImplVulkan_Init(&info)) {
-        std::printf("Overlay: ImGui Vulkan backend init failed\n");
-        ImGui::DestroyContext();
+    // sotc: on the HDR10 swapchain (PQ) the menu's sRGB colours are encoded at 203 nits
+    // (overlay_hdr.frag) instead of landing at up to 10000 nits.
+    if (format == vk::Format::eA2B10G10R10UnormPack32) {
+        info.CustomShaderFragCreateInfo = VkShaderModuleCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .codeSize = sizeof(OVERLAY_HDR_FRAG),
+            .pCode = OVERLAY_HDR_FRAG,
+        };
+    }
+    return ImGui_ImplVulkan_Init(&info);
+}
+
+void OnSurfaceFormatChange(vk::Format format) {
+    std::scoped_lock lock{imgui_mutex};
+    if (!initialized || format == s_format) {
         return;
     }
-    initialized = true;
-    (void)StartRaw("fps_mode"); // sotc: the launcher's settings as the game starts (restart band)
-    std::printf("Overlay: menu ready (Insert or L3+R3)\n");
+    // The caller waited for the device to be idle; ImGui recreates its textures on the next
+    // frame (the backend destroyed them).
+    ImGui_ImplVulkan_Shutdown();
+    if (!InitBackend(format)) {
+        std::printf("Overlay: ImGui Vulkan backend re-init failed\n");
+        initialized = false;
+        return;
+    }
+    std::printf("Overlay: swapchain format %d, menu %s\n", int(format),
+                format == vk::Format::eA2B10G10R10UnormPack32 ? "in HDR10 (203 nits)" : "in SDR");
 }
 
 void UpdateTextInput(SDL_Window* window) {

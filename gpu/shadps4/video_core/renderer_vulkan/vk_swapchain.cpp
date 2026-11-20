@@ -10,6 +10,7 @@
 #include "core/emulator_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
+#include "bbport_overlay.h"
 #include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
@@ -106,6 +107,8 @@ void Swapchain::SetHDR(bool hdr) {
     Recreate(width, height);
     ImGui::Core::OnSurfaceFormatChange(needs_hdr ? SURFACE_FORMAT_HDR.format
                                                  : surface_format.format);
+    // sotc: the in-game menu's pipeline and colour encoding follow the swapchain.
+    BbOverlay::OnSurfaceFormatChange(GetSurfaceFormat().format);
 }
 
 bool Swapchain::AcquireNextImage() {

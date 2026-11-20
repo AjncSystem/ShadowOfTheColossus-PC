@@ -22,6 +22,10 @@ namespace BbOverlay {
 /// Present thread, once: the ImGui context and its Vulkan backend.
 void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count);
 
+/// sotc: the swapchain changed format (SDR <-> HDR10), the device idle: the backend is made
+/// again for it, so the menu is encoded for that swapchain.
+void OnSurfaceFormatChange(vk::Format format);
+
 /// Window thread, for every SDL event: true when the menu consumed it.
 bool HandleEvent(const SDL_Event& event);
 /// Turns SDL text input on while the menu edits a value (window thread, once per poll).

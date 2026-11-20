@@ -39,8 +39,11 @@ inline std::atomic<float> hdr_ui{-1.f};
 /// (0..100, neutral 0; SOTC_HDR_BLOWOUT), hue correction of the hue-preserving tone mapper
 /// (0..100, default 100; SOTC_HDR_HUE_CORRECTION), flare compensation (0..100, neutral 0;
 /// SOTC_HDR_FLARE), gamma correction (0 or 100, neutral 0; SOTC_HDR_GAMMA_CORRECTION) and
-/// highlight saturation (0..100, neutral 50; SOTC_HDR_HIGHLIGHT_SATURATION). kGradeUnset: the
-/// value read at start.
+/// highlight saturation (0..100, neutral 50; SOTC_HDR_HIGHLIGHT_SATURATION), film grain (0..100,
+/// neutral 0; SOTC_HDR_GRAIN; SDR too) and gamut expansion (0..100, neutral 0;
+/// SOTC_HDR_GAMUT_EXPANSION). Gamma correction: 0 off, 100 gamma 2.2, 200 gamma 2.4 (BT.1886).
+/// Exposure to highlight saturation and grain also work in SDR. kGradeUnset: the value read at
+/// start.
 inline constexpr float kGradeUnset = -1000.f;
 enum HdrGrade {
     kExposure,
@@ -53,15 +56,17 @@ enum HdrGrade {
     kFlare,
     kGammaCorrection,
     kHighlightSaturation,
+    kGrain,
+    kGamutExpansion,
     kGradeCount
 };
 inline std::atomic<float> hdr_grade[kGradeCount]{kGradeUnset, kGradeUnset, kGradeUnset,
                                                  kGradeUnset, kGradeUnset, kGradeUnset,
                                                  kGradeUnset, kGradeUnset, kGradeUnset,
-                                                 kGradeUnset};
+                                                 kGradeUnset, kGradeUnset, kGradeUnset};
 
 /// Game HDR tone mapper (sotc_tonemap.h Mode: 0 vanilla, 1 vanilla+, 2 none, 3 vanilla+ hue
-/// preserving; SOTC_HDR_TONEMAP)
+/// preserving, 4 RenoDRT; SOTC_HDR_TONEMAP)
 /// and the strength of the game's colour grading in percent (SOTC_HDR_GRADING, 100 = the
 /// game's). -1: the value read at start.
 inline std::atomic<int> hdr_tonemap{-1};

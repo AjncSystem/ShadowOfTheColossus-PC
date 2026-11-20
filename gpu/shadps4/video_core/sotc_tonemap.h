@@ -26,7 +26,13 @@ enum Mode : int {
     /// curve to the luminance, the hue pulled back towards the per-channel one by the hue
     /// correction control.
     kVanillaPlusHue = 3,
-    kModeCount = 4,
+    /// RenoDRT-style (RenoDX's): kNone's line in the game's pass; the final pass puts the game's
+    /// own curve back on luminance below mid grey (the game's shadows and mid tones), the line
+    /// above it (highlights untonemapped), then a peak-aware roll-off on luminance (BT.2390 in
+    /// PQ), so hues and saturation hold up to the display's peak. The hue correction control
+    /// takes the hue towards the per-channel curves'.
+    kRenoDrt = 4,
+    kModeCount = 5,
 };
 
 /// Set by the presenter every frame (vk_presenter.cpp RefreshHdrLevels): the tone mapper wanted
@@ -48,6 +54,9 @@ inline std::atomic<float> motion_blur{1.0f};
 /// tonemap got kNone's line for it, and Vanilla+'s A..E (the curve the final pass applies).
 inline std::atomic<bool> hue_curve_on{false};
 inline std::atomic<float> hue_curve[5]{};
+/// kRenoDrt: set at the tonemap draw: on when this frame's tonemap got kNone's line for it
+/// (hue_curve then holds the game's own A..E).
+inline std::atomic<bool> drt_on{false};
 
 /// Vanilla+'s ceiling (the curve's limit A / C). With the game's scale 0.556 it stays under the
 /// pass's min 10 cap (16 * 0.556 = 8.9), so the final pass's roll-off shapes the highlights.
@@ -75,6 +84,16 @@ inline bool ApplyCurve(std::vector<unsigned>& flat, int mode, float* plus = null
         put(31, 0.0f);
     };
     if (mode == kNone) {
+        line();
+        return true;
+    }
+    if (mode == kRenoDrt) {
+        if (!plus) {
+            return false;
+        }
+        for (unsigned i = 0; i < 5; ++i) {
+            plus[i] = get(28 + i);
+        }
         line();
         return true;
     }

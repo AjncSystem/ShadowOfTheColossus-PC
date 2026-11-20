@@ -787,6 +787,11 @@ void BuildItems() {
             const char* sdr_to_hdr = std::getenv("SOTC_HDR"); // the SDR expansion, not the game's
             return v && v[0] == '1' && !(sdr_to_hdr && sdr_to_hdr[0] == '1');
         };
+        // Picture controls that work in SDR too: shown unless the SDR-to-HDR expansion runs.
+        const auto picture_on = [] {
+            const char* sdr_to_hdr = std::getenv("SOTC_HDR");
+            return !(sdr_to_hdr && sdr_to_hdr[0] == '1');
+        };
         // A level as the launcher keeps it: whole numbers as before ("200"), else one decimal.
         const auto LevelText = [](float v) {
             char buf[32];
@@ -888,64 +893,105 @@ void BuildItems() {
             }
             return v;
         };
-        add_level(L("HDR: exposição", "HDR: exposure"),
+        {
+            MenuItem& item = add_level(L("Imagem: exposição", "Picture: exposure"),
                   L("Clareia ou escurece o mundo inteiro, em pontos de exposição. 0 é o original.",
                     "Brightens or darkens the whole world, in stops. 0 is the original."),
                   "hdr_exposure", SotcLive::hdr_grade[SotcLive::kExposure], "SOTC_HDR_EXPOSURE",
-                  0.0f, evs, kUnsetBelow)
-            .slider = true;
-        add_level(L("HDR: realces", "HDR: highlights"),
+                  0.0f, evs, kUnsetBelow);
+            item.slider = true;
+            item.shown = picture_on;
+        }
+        {
+            MenuItem& item = add_level(L("Imagem: realces", "Picture: highlights"),
                   L("O brilho das partes claras (céu, sol, água). 50 é o original.",
                     "The brightness of the bright parts (sky, sun, water). 50 is the original."),
                   "hdr_highlights", SotcLive::hdr_grade[SotcLive::kHighlights],
-                  "SOTC_HDR_HIGHLIGHTS", 50.0f, percents(), kUnsetBelow)
-            .slider = true;
-        add_level(L("HDR: sombras", "HDR: shadows"),
+                  "SOTC_HDR_HIGHLIGHTS", 50.0f, percents(), kUnsetBelow);
+            item.slider = true;
+            item.shown = picture_on;
+        }
+        {
+            MenuItem& item = add_level(L("Imagem: sombras", "Picture: shadows"),
                   L("Clareia (acima de 50) ou aprofunda (abaixo) as partes escuras. 50 é o original.",
                     "Lifts (above 50) or deepens (below) the dark parts. 50 is the original."),
                   "hdr_shadows", SotcLive::hdr_grade[SotcLive::kShadows], "SOTC_HDR_SHADOWS",
-                  50.0f, percents(), kUnsetBelow)
-            .slider = true;
-        add_level(L("HDR: contraste", "HDR: contrast"),
+                  50.0f, percents(), kUnsetBelow);
+            item.slider = true;
+            item.shown = picture_on;
+        }
+        {
+            MenuItem& item = add_level(L("Imagem: contraste", "Picture: contrast"),
                   L("A diferença entre claro e escuro, em volta do cinza médio. 50 é o original.",
                     "The difference between light and dark, around mid grey. 50 is the original."),
                   "hdr_contrast", SotcLive::hdr_grade[SotcLive::kContrast], "SOTC_HDR_CONTRAST",
-                  50.0f, percents(), kUnsetBelow)
-            .slider = true;
-        add_level(L("HDR: saturação", "HDR: saturation"),
+                  50.0f, percents(), kUnsetBelow);
+            item.slider = true;
+            item.shown = picture_on;
+        }
+        {
+            MenuItem& item = add_level(L("Imagem: saturação", "Picture: saturation"),
                   L("A força das cores. 50 é o original; 0 é preto e branco.",
                     "Colour strength. 50 is the original; 0 is black and white."),
                   "hdr_saturation", SotcLive::hdr_grade[SotcLive::kSaturation],
-                  "SOTC_HDR_SATURATION", 50.0f, percents(), kUnsetBelow)
-            .slider = true;
-        add_level(L("HDR: desbotar realces", "HDR: highlight desaturation"),
+                  "SOTC_HDR_SATURATION", 50.0f, percents(), kUnsetBelow);
+            item.slider = true;
+            item.shown = picture_on;
+        }
+        {
+            MenuItem& item = add_level(L("Imagem: desbotar realces", "Picture: highlight desaturation"),
                   L("Os realces mais fortes perdem a cor e vão para o branco perto do pico da tela. 0 é o original.",
                     "The strongest highlights lose their colour and go to white near the display's peak. 0 is the original."),
                   "hdr_blowout", SotcLive::hdr_grade[SotcLive::kBlowout], "SOTC_HDR_BLOWOUT",
-                  0.0f, percents(), kUnsetBelow)
-            .slider = true;
-        add_level(L("HDR: saturação dos realces", "HDR: highlight saturation"),
+                  0.0f, percents(), kUnsetBelow);
+            item.slider = true;
+            item.shown = picture_on;
+        }
+        {
+            MenuItem& item = add_level(L("Imagem: saturação dos realces", "Picture: highlight saturation"),
                   L("A força das cores só nas partes claras (céu, sol, fogo), mais quanto mais claras. 50 é o original.",
                     "Colour strength in the bright parts only (sky, sun, fire), more the brighter. 50 is the original."),
                   "hdr_highlight_saturation", SotcLive::hdr_grade[SotcLive::kHighlightSaturation],
-                  "SOTC_HDR_HIGHLIGHT_SATURATION", 50.0f, percents(), kUnsetBelow)
-            .slider = true;
-        add_level(L("HDR: compensar véu (flare)", "HDR: flare compensation"),
+                  "SOTC_HDR_HIGHLIGHT_SATURATION", 50.0f, percents(), kUnsetBelow);
+            item.slider = true;
+            item.shown = picture_on;
+        }
+        {
+            MenuItem& item = add_level(L("Imagem: compensar véu (flare)", "Picture: flare compensation"),
                   L("Tira o véu acinzentado das partes quase pretas, deixando o preto mais fundo. 0 é o original.",
                     "Takes the grey veil out of the near-black parts for deeper blacks. 0 is the original."),
                   "hdr_flare", SotcLive::hdr_grade[SotcLive::kFlare], "SOTC_HDR_FLARE", 0.0f,
-                  percents(), kUnsetBelow)
-            .slider = true;
+                  percents(), kUnsetBelow);
+            item.slider = true;
+            item.shown = picture_on;
+        }
         add_level(L("HDR: correção de gama", "HDR: gamma correction"),
-                  L("Mostra a parte escura como uma tela SDR comum (gama 2.2) em vez da curva sRGB: sombras um pouco mais fundas, como o jogo em SDR. Desligado é o original.",
-                    "Shows the dark range like a typical SDR display (gamma 2.2) instead of the sRGB curve: slightly deeper shadows, as the game looks in SDR. Off is the original."),
+                  L("Mostra a parte escura como uma tela SDR mostraria em vez da curva sRGB: 2.2 como um monitor comum (sombras um pouco mais fundas, como o jogo em SDR), 2.4 como uma TV calibrada (BT.1886, ainda mais fundas). Desligado é o original.",
+                    "Shows the dark range as an SDR display would instead of the sRGB curve: 2.2 like a typical monitor (slightly deeper shadows, as the game looks in SDR), 2.4 like a calibrated TV (BT.1886, deeper still). Off is the original."),
                   "hdr_gamma_correction", SotcLive::hdr_grade[SotcLive::kGammaCorrection],
                   "SOTC_HDR_GAMMA_CORRECTION", 0.0f,
-                  {{0.0f, L("Desligado", "Off")}, {100.0f, L("Ligado", "On")}}, kUnsetBelow);
+                  {{0.0f, L("Desligado", "Off")}, {100.0f, "2.2"}, {200.0f, "2.4 (BT.1886)"}},
+                  kUnsetBelow);
+        add_level(L("HDR: expansão de gama de cores", "HDR: gamut expansion"),
+                  L("Leva as cores já saturadas (céu, grama, fogo) além do sRGB, rumo ao P3 que as telas HDR mostram; cinzas e pele quase não mudam. 0 é o original.",
+                    "Takes already saturated colours (sky, grass, fire) beyond sRGB, towards the P3 that HDR displays show; greys and skin barely move. 0 is the original."),
+                  "hdr_gamut_expansion", SotcLive::hdr_grade[SotcLive::kGamutExpansion],
+                  "SOTC_HDR_GAMUT_EXPANSION", 0.0f, percents(), kUnsetBelow)
+            .slider = true;
+        {
+            MenuItem& grain = add_level(
+                L("Imagem: granulação de filme", "Picture: film grain"),
+                L("Uma granulação fina e em movimento, como em filme, mais nos tons médios. Também esconde faixas no céu e na névoa. 0 é o original (o jogo não tem).",
+                  "A fine, moving grain like film, strongest in the mid tones. It also hides banding in the sky and fog. 0 is the original (the game has none)."),
+                "hdr_grain", SotcLive::hdr_grade[SotcLive::kGrain], "SOTC_HDR_GRAIN", 0.0f,
+                percents(), kUnsetBelow);
+            grain.slider = true;
+            grain.shown = picture_on;
+        }
         MenuItem& reset = AddLive(
-            kTabDisplay, L("HDR: restaurar imagem", "HDR: reset picture"),
-            L("Volta todos os controles de imagem, a curva de tons, a correção de cor do jogo e a força do bloom, da vinheta, da névoa e do borrão de movimento ao original. O brilho e o pico ficam.",
-              "Puts every picture control, the tone mapper, the game's colour grading and the bloom, vignette, fog and motion blur strengths back to the original. Brightness and peak stay."),
+            kTabDisplay, L("Imagem: restaurar", "Picture: reset"),
+            L("Volta todos os controles de imagem (granulação e expansão de gama inclusive), a curva de tons, a correção de cor do jogo e a força do bloom, da vinheta, da névoa e do borrão de movimento ao original. O brilho e o pico ficam.",
+              "Puts every picture control (grain and gamut expansion included), the tone mapper, the game's colour grading and the bloom, vignette, fog and motion blur strengths back to the original. Brightness and peak stay."),
             {{L("Executar", "Run"), "0"}}, [] { return -1; },
             [](int) {
                 struct Neutral {
@@ -964,6 +1010,8 @@ void BuildItems() {
                     {SotcLive::kFlare, "hdr_flare", 0.0f},
                     {SotcLive::kGammaCorrection, "hdr_gamma_correction", 0.0f},
                     {SotcLive::kHighlightSaturation, "hdr_highlight_saturation", 50.0f},
+                    {SotcLive::kGrain, "hdr_grain", 0.0f},
+                    {SotcLive::kGamutExpansion, "hdr_gamut_expansion", 0.0f},
                 };
                 for (const Neutral& n : kNeutral) {
                     SotcLive::hdr_grade[n.id].store(n.value, std::memory_order_relaxed);
@@ -981,24 +1029,27 @@ void BuildItems() {
                 SaveLauncherSetting("fx_vignette_strength", "100");
                 SaveLauncherSetting("fx_fog_strength", "100");
                 SaveLauncherSetting("fx_motion_blur_strength", "100");
-                toast_text = L("Imagem HDR restaurada", "HDR picture reset");
+                toast_text = L("Imagem restaurada", "Picture reset");
                 toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
             });
         reset.action = true;
-        reset.shown = hdr_on;
+        reset.shown = picture_on;
 
         // Tone mapper (sotc_tonemap.h): the game's curve, extended, or none, as the curve of the
         // game's own tonemap pass (any upscaler).
         static const int kTonemapModes[] = {SotcTonemap::kVanilla, SotcTonemap::kVanillaPlus,
-                                            SotcTonemap::kVanillaPlusHue, SotcTonemap::kNone};
+                                            SotcTonemap::kVanillaPlusHue, SotcTonemap::kRenoDrt,
+                                            SotcTonemap::kNone};
         static const char* kTonemapKeys[] = {"\"vanilla\"", "\"vanilla_plus\"",
-                                             "\"vanilla_plus_hue\"", "\"none\""};
+                                             "\"vanilla_plus_hue\"", "\"renodrt\"",
+                                             "\"none\""};
         MenuItem& tonemap = AddLive(
             kTabDisplay, L("HDR: curva de tons", "HDR: tone mapper"),
-            L("Original: a curva do jogo. Original+: a mesma curva, mas os realces continuam subindo até o pico da tela em vez de achatar. Original+ (cor): a mesma, no brilho e não em cada cor, então as cores claras não puxam para o amarelo e o branco. Nenhuma: sem curva, só a descida suave no pico.",
-              "Vanilla: the game's curve. Vanilla+: the same curve, but highlights keep rising to your display's peak instead of flattening. Vanilla+ (hue): the same on brightness rather than per colour channel, so bright colours do not drift to yellow and white. None: no curve, only the smooth roll-off at the peak."),
+            L("Original: a curva do jogo. Original+: a mesma curva, mas os realces continuam subindo até o pico da tela em vez de achatar. Original+ (cor): a mesma, no brilho e não em cada cor, então as cores claras não puxam para o amarelo e o branco. RenoDRT: sem a curva do jogo, o brilho desce suavemente até o pico da tela mantendo cor e saturação (como os mods RenoDX). Nenhuma: sem curva, só a descida suave no pico.",
+              "Vanilla: the game's curve. Vanilla+: the same curve, but highlights keep rising to your display's peak instead of flattening. Vanilla+ (hue): the same on brightness rather than per colour channel, so bright colours do not drift to yellow and white. RenoDRT: without the game's curve, brightness rolls off smoothly into your display's peak keeping hue and saturation (as RenoDX mods do). None: no curve, only the smooth roll-off at the peak."),
             {{L("Original", "Vanilla"), "0"}, {L("Original+", "Vanilla+"), "1"},
-             {L("Original+ (cor)", "Vanilla+ (hue)"), "2"}, {L("Nenhuma", "None"), "3"}},
+             {L("Original+ (cor)", "Vanilla+ (hue)"), "2"}, {"RenoDRT", "3"},
+             {L("Nenhuma", "None"), "4"}},
             [] {
                 int mode = SotcLive::hdr_tonemap.load(std::memory_order_relaxed);
                 if (mode < 0) {
@@ -1009,10 +1060,11 @@ void BuildItems() {
                     }
                     mode = v == "vanilla_plus" || v == "vanilla+" ? SotcTonemap::kVanillaPlus
                            : v == "vanilla_plus_hue"              ? SotcTonemap::kVanillaPlusHue
+                           : v == "renodrt"                       ? SotcTonemap::kRenoDrt
                            : v == "none"                          ? SotcTonemap::kNone
                                                                   : SotcTonemap::kVanilla;
                 }
-                for (int i = 0; i < 4; ++i) {
+                for (int i = 0; i < 5; ++i) {
                     if (kTonemapModes[i] == mode) {
                         return i;
                     }
@@ -1024,17 +1076,20 @@ void BuildItems() {
                 SaveLauncherSetting("hdr_tonemap", kTonemapKeys[i]);
             });
         tonemap.shown = hdr_on;
-        add_level(L("HDR: correção de matiz", "HDR: hue correction"),
-                  L("Só com Original+ (cor): quanto a cor dos realces volta à do jogo (o fogo amarelando, por exemplo). 100 é a do jogo; 0 mantém a cor de cada coisa ao clarear.",
-                    "Vanilla+ (hue) only: how far the hue of highlights goes back to the game's (fire turning yellow, for one). 100 is the game's; 0 keeps each colour's hue as it brightens."),
+        {
+            MenuItem& item = add_level(L("HDR: correção de matiz", "HDR: hue correction"),
+                  L("Só com Original+ (cor) e RenoDRT: quanto a cor dos realces volta à do jogo (o fogo amarelando, por exemplo). 100 é a do jogo; 0 mantém a cor de cada coisa ao clarear.",
+                    "Vanilla+ (hue) and RenoDRT only: how far the hue of highlights goes back to the game's (fire turning yellow, for one). 100 is the game's; 0 keeps each colour's hue as it brightens."),
                   "hdr_hue_correction", SotcLive::hdr_grade[SotcLive::kHueCorrection],
-                  "SOTC_HDR_HUE_CORRECTION", 100.0f, percents(), kUnsetBelow)
-            .slider = true;
+                  "SOTC_HDR_HUE_CORRECTION", 100.0f, percents(), kUnsetBelow);
+            item.slider = true;
+            item.shown = picture_on;
+        }
         std::vector<std::pair<float, std::string>> gradings;
         for (int p = 0; p <= 100; p += 5) {
             gradings.push_back({float(p), std::to_string(p) + "%"});
         }
-        add_level(L("HDR: correção de cor do jogo", "HDR: game colour grading"),
+        add_level(L("Imagem: correção de cor do jogo", "Picture: game colour grading"),
                   L("A força das cores que o jogo dá a cada lugar (tom, saturação, contraste). 100% é o original; 0% tira o tom de cor, mantendo o brilho.",
                     "How strongly the game's per-place colour look applies (tint, saturation, contrast). 100% is the original; 0% removes the colour cast and keeps the brightness."),
                   "hdr_grading", SotcLive::hdr_grading, "SOTC_HDR_GRADING", 100.0f, gradings)

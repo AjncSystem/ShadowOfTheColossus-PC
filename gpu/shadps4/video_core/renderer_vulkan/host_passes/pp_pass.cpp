@@ -3,6 +3,8 @@
 
 #include "video_core/renderer_vulkan/host_passes/pp_pass.h"
 
+#include <cstddef>
+
 #include "common/assert.h"
 #include "core/emulator_settings.h"
 #include "video_core/host_shaders/fs_tri_vert.h"
@@ -19,6 +21,67 @@
 #include <boost/container/static_vector.hpp>
 
 namespace Vulkan::HostPasses {
+
+// sotc: Settings as post_process.frag reads them. 128 bytes is the push constant size every
+// Vulkan device must take, so the switches share one word (bits 0-1 hdr, 2 srgb_input, 3-4 ui,
+// 5 drt, 6 dither at 8 bits, 7 dither at 10 bits).
+struct GpuSettings {
+    float gamma;
+    u32 flags;
+    float grain;
+    u32 seed;
+    std::array<float, 4> vignette;
+    float ui_sharpen, sky_sharpen, hdr_white, hdr_curve, paper_white, highlight_gain, hdr_peak,
+        ui_white;
+    float exposure, contrast, shadows, highlights, saturation, blowout, flare, gamma_correction,
+        highlight_saturation;
+    float hue_b, hue_c, hue_d, hue_e, hue_correction;
+    float gamut_expansion;
+    float hue_a;
+};
+static_assert(sizeof(GpuSettings) == 128);
+static_assert(offsetof(GpuSettings, vignette) == 16);
+
+static GpuSettings Pack(const PostProcessingPass::Settings& s) {
+    u32 flags = (s.hdr & 3u) | ((s.srgb_input ? 1u : 0u) << 2) | ((s.ui & 3u) << 3) |
+                ((s.drt ? 1u : 0u) << 5);
+    if (s.dither_bits == 8) {
+        flags |= 1u << 6;
+    } else if (s.dither_bits == 10) {
+        flags |= 1u << 7;
+    }
+    return GpuSettings{
+        .gamma = s.gamma,
+        .flags = flags,
+        .grain = s.grain,
+        .seed = s.seed,
+        .vignette = s.vignette,
+        .ui_sharpen = s.ui_sharpen,
+        .sky_sharpen = s.sky_sharpen,
+        .hdr_white = s.hdr_white,
+        .hdr_curve = s.hdr_curve,
+        .paper_white = s.paper_white,
+        .highlight_gain = s.highlight_gain,
+        .hdr_peak = s.hdr_peak,
+        .ui_white = s.ui_white,
+        .exposure = s.exposure,
+        .contrast = s.contrast,
+        .shadows = s.shadows,
+        .highlights = s.highlights,
+        .saturation = s.saturation,
+        .blowout = s.blowout,
+        .flare = s.flare,
+        .gamma_correction = s.gamma_correction,
+        .highlight_saturation = s.highlight_saturation,
+        .hue_b = s.hue_b,
+        .hue_c = s.hue_c,
+        .hue_d = s.hue_d,
+        .hue_e = s.hue_e,
+        .hue_correction = s.hue_correction,
+        .gamut_expansion = s.gamut_expansion,
+        .hue_a = s.hue_a,
+    };
+}
 
 void PostProcessingPass::Create(vk::Device device, const vk::Format surface_format) {
     boost::container::static_vector<vk::DescriptorSetLayoutBinding, 4> bindings{
@@ -61,7 +124,7 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
     const vk::PushConstantRange push_constants{
         .stageFlags = vk::ShaderStageFlagBits::eFragment,
         .offset = 0,
-        .size = sizeof(Settings),
+        .size = sizeof(GpuSettings),
     };
 
     const auto& vs_module = CompileSPV(FS_TRI_VERT, device);
@@ -320,8 +383,9 @@ void PostProcessingPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                          });
 
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, set_writes);
-    cmdbuf.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(Settings),
-                         &settings);
+    const GpuSettings gpu = Pack(settings);
+    cmdbuf.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eFragment, 0, sizeof(gpu),
+                         &gpu);
 
     cmdbuf.beginRendering(rendering_info);
     cmdbuf.draw(3, 1, 0, 0);
@@ -402,8 +466,8 @@ void PostProcessingPass::CreateKey(const Instance& instance) {
     device.destroyShaderModule(module);
 }
 
-void PostProcessingPass::MeasureKey(vk::CommandBuffer cmdbuf, vk::ImageView input, bool pq,
-                                    float curve) {
+void PostProcessingPass::MeasureKey(vk::CommandBuffer cmdbuf, vk::ImageView input,
+                                    KeyInput mode, float curve) {
     if (!key_buffer || !key_pipeline) {
         return;
     }
@@ -461,7 +525,7 @@ void PostProcessingPass::MeasureKey(vk::CommandBuffer cmdbuf, vk::ImageView inpu
         float curve;
         float alpha;
         float pad;
-    } params{pq ? 1u : 0u, curve, alpha, 0.0f};
+    } params{static_cast<u32>(mode), curve, alpha, 0.0f};
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *key_pipeline);
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *key_layout, 0, writes);
     cmdbuf.pushConstants(*key_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(params),

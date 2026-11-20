@@ -199,21 +199,25 @@ Estas variáveis de ambiente ajudam a investigar problemas:
 | `SOTC_HDR_WHITE=nits` | com HDR: o branco do jogo em nits (padrão 200; a saída do próprio jogo tem ~100) |
 | `SOTC_HDR_PEAK=nits` | com HDR: o pico da tela; os realces descem suavemente até ele (BT.2390). Padrão `auto` (o valor do Windows, 1000 sem ele); `off` corta como antes |
 | `SOTC_HDR_UI=nits` | com HDR: o brilho da interface (menus, legendas, HUD), separado do brilho do jogo. Padrão: igual ao `SOTC_HDR_WHITE` |
-| `SOTC_HDR_EXPOSURE=EV` | com HDR: exposição do mundo em pontos, -3 a 3 (padrão 0) |
-| `SOTC_HDR_CONTRAST=0..100` | com HDR: contraste em torno do brilho médio da cena (padrão 50 = original) |
-| `SOTC_HDR_SHADOWS=0..100` | com HDR: acima de 50 clareia as partes escuras, abaixo aprofunda (padrão 50) |
-| `SOTC_HDR_HIGHLIGHTS=0..100` | com HDR: brilho das partes claras (padrão 50) |
-| `SOTC_HDR_SATURATION=0..100` | com HDR: força das cores; 0 é preto e branco (padrão 50) |
-| `SOTC_HDR_BLOWOUT=0..100` | com HDR: os realces mais fortes perdem a cor e vão para o branco perto do pico (padrão 0) |
-| `SOTC_HDR_HIGHLIGHT_SATURATION=0..100` | com HDR: a força das cores só nas partes claras (padrão 50 = original) |
-| `SOTC_HDR_FLARE=0..100` | com HDR: compensação de véu, pretos mais fundos (padrão 0) |
-| `SOTC_HDR_GAMMA_CORRECTION=0\|100` | com HDR: a parte escura decodificada como gama 2.2 em vez de sRGB (padrão 0, desligado) |
-| `SOTC_HDR_HUE_CORRECTION=0..100` | com HDR e a curva `vanilla_plus_hue`: quanto o tom dos realces volta ao do jogo (padrão 100) |
-| `SOTC_HDR_TONEMAP=vanilla\|vanilla_plus\|vanilla_plus_hue\|none` | com HDR: a curva de tons do jogo (padrão `vanilla`); `vanilla_plus` mantém os tons médios e deixa os realces subirem até o pico; `vanilla_plus_hue` faz o mesmo no brilho, mantendo a cor; `none` tira a curva |
+| `SOTC_HDR_EXPOSURE=EV` | em HDR e SDR: exposição do mundo em pontos, -3 a 3 (padrão 0) |
+| `SOTC_HDR_CONTRAST=0..100` | em HDR e SDR: contraste em torno do brilho médio da cena (padrão 50 = original) |
+| `SOTC_HDR_SHADOWS=0..100` | em HDR e SDR: acima de 50 clareia as partes escuras, abaixo aprofunda (padrão 50) |
+| `SOTC_HDR_HIGHLIGHTS=0..100` | em HDR e SDR: brilho das partes claras (padrão 50) |
+| `SOTC_HDR_SATURATION=0..100` | em HDR e SDR: força das cores; 0 é preto e branco (padrão 50) |
+| `SOTC_HDR_BLOWOUT=0..100` | em HDR e SDR: os realces mais fortes perdem a cor e vão para o branco perto do pico (padrão 0) |
+| `SOTC_HDR_HIGHLIGHT_SATURATION=0..100` | em HDR e SDR: a força das cores só nas partes claras (padrão 50 = original) |
+| `SOTC_HDR_FLARE=0..100` | em HDR e SDR: compensação de véu, pretos mais fundos (padrão 0) |
+| `SOTC_HDR_GAMMA_CORRECTION=0\|100\|200` | com HDR: a parte escura decodificada como gama 2.2 (100) ou 2.4, BT.1886 (200), em vez de sRGB (padrão 0, desligado) |
+| `SOTC_HDR_GRAIN=0..100` | em HDR e SDR: granulação de filme fina e em movimento, mais nos tons médios (padrão 0, desligada; o jogo não tem) |
+| `SOTC_HDR_GAMUT_EXPANSION=0..100` | com HDR: leva as cores já saturadas além do sRGB, rumo ao P3 (padrão 0) |
+| `SOTC_DITHER=0` | tira o pontilhado (dithering) de um passo antes dos 8 bits (SDR) ou 10 bits (HDR) da tela, que evita faixas no céu e na névoa (padrão ligado) |
+| `SOTC_HDR_HUE_CORRECTION=0..100` | com HDR e as curvas `vanilla_plus_hue` e `renodrt`: quanto o tom dos realces volta ao do jogo (padrão 100) |
+| `SOTC_HDR_TONEMAP=vanilla\|vanilla_plus\|vanilla_plus_hue\|renodrt\|none` | com HDR: a curva de tons do jogo (padrão `vanilla`); `vanilla_plus` mantém os tons médios e deixa os realces subirem até o pico; `vanilla_plus_hue` faz o mesmo no brilho, mantendo a cor; `renodrt` (como os mods RenoDX) mantém as sombras e os tons médios do jogo, tira a curva dos realces e desce o brilho suavemente até o pico mantendo cor e saturação; `none` tira a curva |
 | `SOTC_FSR1_SPLIT=0` | com HDR e FSR 1: volta a ampliar a imagem do jogo já com a interface (sem brilho próprio da interface; os controles de imagem valem para a interface também) |
-| `SOTC_HDR_GRADING=0..100` | com HDR: a força da correção de cor do jogo em porcentagem (padrão 100); 0 tira o tom de cor de cada lugar e mantém o brilho |
+| `SOTC_HDR_GRADING=0..100` | em HDR e SDR: a força da correção de cor do jogo em porcentagem (padrão 100); 0 tira o tom de cor de cada lugar e mantém o brilho |
 | `SOTC_TONEMAP_LOG=1` | diagnóstico: as constantes do tonemap do jogo quando mudam e a curva aplicada |
 | `SOTC_HDR_TONEMAP_CYCLE=s` | teste: alterna as curvas de tons a cada `s` segundos (comparar capturas da mesma cena) |
+| `SOTC_COMPARE_CYCLE=s` | teste: liga e desliga a imagem original (F3) a cada `s` segundos; com `SOTC_SHOT_OVERLAY=1` as capturas comparam os ajustes com o original na mesma cena |
 | `SOTC_FX_BLOOM=0..400` | a força do bloom em porcentagem (padrão 100 = o do jogo) |
 | `SOTC_FX_VIGNETTE=0..400` | a força da vinheta em porcentagem (padrão 100); com a vinheta desligada não faz nada |
 | `SOTC_FX_FOG=0..400` | a força da névoa atmosférica em porcentagem (padrão 100); com a névoa desligada não faz nada |

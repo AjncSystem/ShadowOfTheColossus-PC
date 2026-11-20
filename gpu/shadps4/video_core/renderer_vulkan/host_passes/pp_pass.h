@@ -52,12 +52,24 @@ public:
         float gamma_correction = 0.0f;     ///< 0..1: SDR range decoded as 2.2, not sRGB
         float highlight_saturation = 1.0f; ///< chroma scale of the highlights
         /// sotc: hdr 1, sotc_tonemap.h kVanillaPlusHue: Vanilla+'s A..E applied to luminance
-        /// (hue_e 0: off) and how far its hue goes back to the per-channel curve's (0..1).
+        /// (hue_e 0: off) and how far its hue goes back to the per-channel curve's (0..1);
+        /// kRenoDrt (drt): the game's own A..E for the shadows and mid tones.
         float hue_a = 0.0f, hue_b = 0.0f, hue_c = 0.0f, hue_d = 0.0f, hue_e = 0.0f;
         float hue_correction = 1.0f;
+        /// sotc: RenoDX-style extras. Film grain strength 0..1 (0: none), on the scene in SDR and
+        /// HDR; `seed` changes every presented frame so the grain moves.
+        float grain = 0.0f;
+        u32 seed = 0;
+        /// sotc: hdr 1: gamut expansion 0..1 (saturated colours pushed out towards P3 inside
+        /// Rec.2020; 0: none).
+        float gamut_expansion = 0.0f;
+        /// sotc: hdr 1, sotc_tonemap.h kRenoDrt: the peak-aware curve on luminance instead of the
+        /// roll-off on the brightest channel.
+        u32 drt = 0;
+        /// sotc: output dithering against banding: the swapchain's bits per channel (8, 10), 0
+        /// none.
+        u32 dither_bits = 0;
     };
-    // sotc: 128 bytes is the push constant size every Vulkan device must take.
-    static_assert(sizeof(Settings) <= 128);
 
     void Create(vk::Device device, vk::Format surface_format);
 
@@ -68,10 +80,12 @@ public:
     /// sotc: the scene key buffer and its compute pipeline (pp_key.comp), after Create.
     void CreateKey(const Instance& instance);
 
-    /// sotc: measures the scene's key for the HDR picture controls, once per presented frame
-    /// before Render (hdr 1 only). `input` in shader read layout; pq: the game's own PQ frame
-    /// (else the DLSS scene, linear with the composite's exponent `curve`).
-    void MeasureKey(vk::CommandBuffer cmdbuf, vk::ImageView input, bool pq, float curve);
+    /// sotc: measures the scene's key for the picture controls, once per presented frame before
+    /// Render. `input` in shader read layout. Modes: the DLSS scene with game HDR (linear with
+    /// the composite's exponent `curve`), the game's own PQ frame, an SDR frame (linear, white
+    /// 1) and an SDR frame still sRGB encoded.
+    enum class KeyInput : u32 { HdrScene = 0, Pq = 1, Sdr = 2, SdrEncoded = 3 };
+    void MeasureKey(vk::CommandBuffer cmdbuf, vk::ImageView input, KeyInput mode, float curve);
 
 private:
     vk::UniquePipeline pipeline{};

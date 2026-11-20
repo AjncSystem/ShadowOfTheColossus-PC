@@ -129,8 +129,10 @@ static void RefreshHdrLevels(HostPasses::PostProcessingPass::Settings& s) {
         {"hdr_blowout", "SOTC_HDR_BLOWOUT", 0.0f, 0.0f, 100.0f},
         {"hdr_hue_correction", "SOTC_HDR_HUE_CORRECTION", 100.0f, 0.0f, 100.0f},
         {"hdr_flare", "SOTC_HDR_FLARE", 0.0f, 0.0f, 100.0f},
-        {"hdr_gamma_correction", "SOTC_HDR_GAMMA_CORRECTION", 0.0f, 0.0f, 100.0f},
+        {"hdr_gamma_correction", "SOTC_HDR_GAMMA_CORRECTION", 0.0f, 0.0f, 200.0f},
         {"hdr_highlight_saturation", "SOTC_HDR_HIGHLIGHT_SATURATION", 50.0f, 0.0f, 100.0f},
+        {"hdr_grain", "SOTC_HDR_GRAIN", 0.0f, 0.0f, 100.0f},
+        {"hdr_gamut_expansion", "SOTC_HDR_GAMUT_EXPANSION", 0.0f, 0.0f, 100.0f},
     };
     static const std::array<float, SotcLive::kGradeCount> grade_start = [] {
         std::array<float, SotcLive::kGradeCount> g{};
@@ -141,8 +143,8 @@ static void RefreshHdrLevels(HostPasses::PostProcessingPass::Settings& s) {
         LOG_INFO(Render_Vulkan,
                  "SOTC HDR picture: exposure {} EV, contrast {}, shadows {}, highlights {}, "
                  "saturation {}, highlight saturation loss {}, hue correction {}, flare {}, "
-                 "gamma correction {}, highlight saturation {}",
-                 g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7], g[8], g[9]);
+                 "gamma correction {}, highlight saturation {}, grain {}, gamut expansion {}",
+                 g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7], g[8], g[9], g[10], g[11]);
         return g;
     }();
     float g[SotcLive::kGradeCount];
@@ -161,13 +163,18 @@ static void RefreshHdrLevels(HostPasses::PostProcessingPass::Settings& s) {
     s.blowout = g[SotcLive::kBlowout] / 100.0f;
     s.hue_correction = g[SotcLive::kHueCorrection] / 100.0f;
     s.flare = g[SotcLive::kFlare] / 100.0f;
-    s.gamma_correction = g[SotcLive::kGammaCorrection] / 100.0f;
+    // Gamma correction: the exponent the SDR range is decoded with (0: off, as sRGB).
+    const float gc = g[SotcLive::kGammaCorrection];
+    s.gamma_correction = gc < 50.0f ? 0.0f : gc < 150.0f ? 2.2f : 2.4f;
     s.highlight_saturation = g[SotcLive::kHighlightSaturation] / 50.0f;
+    s.grain = g[SotcLive::kGrain] / 100.0f;
+    s.gamut_expansion = g[SotcLive::kGamutExpansion] / 100.0f;
     const bool compare = SotcLive::compare_vanilla.load(std::memory_order_relaxed);
     if (compare) { // F3: the game's picture at the user's brightness and peak
         s.exposure = s.contrast = s.shadows = s.highlights = s.saturation = 1.0f;
         s.highlight_saturation = 1.0f;
         s.blowout = s.flare = s.gamma_correction = 0.0f;
+        s.grain = s.gamut_expansion = 0.0f;
     }
     // The hue-preserving tone mapper's curve, when this frame's tonemap drew its line.
     s.hue_e = 0.0f;
@@ -178,6 +185,8 @@ static void RefreshHdrLevels(HostPasses::PostProcessingPass::Settings& s) {
         s.hue_d = SotcTonemap::hue_curve[3].load(std::memory_order_relaxed);
         s.hue_e = SotcTonemap::hue_curve[4].load(std::memory_order_relaxed);
     }
+    // The RenoDRT-style curve, when this frame's tonemap drew its line.
+    s.drt = !compare && SotcTonemap::drt_on.load(std::memory_order_acquire) ? 1u : 0u;
 
     // Tone mapper (launcher hdr_tonemap / SOTC_HDR_TONEMAP: vanilla, vanilla_plus, none) and the
     // strength of the game's colour grading (hdr_grading / SOTC_HDR_GRADING, percent, 100 = the
@@ -196,6 +205,9 @@ static void RefreshHdrLevels(HostPasses::PostProcessingPass::Settings& s) {
         }
         if (v == "vanilla_plus_hue") {
             return int(SotcTonemap::kVanillaPlusHue);
+        }
+        if (v == "renodrt") {
+            return int(SotcTonemap::kRenoDrt);
         }
         return int(SotcTonemap::kVanilla);
     }();
@@ -1078,16 +1090,54 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // to the frame's size; the post process pass puts the UI layer back over it. Frames without
     // that scene (menus, loading screens) are presented as before.
     Dlssg::SetHdr(pp_settings.hdr != 0);
+    // sotc: SOTC_COMPARE_CYCLE=<seconds> (testing): F3's original picture on and off in turn, so
+    // screenshots of one scene compare the user's settings with the game's.
+    static const float compare_cycle = [] {
+        const char* v = std::getenv("SOTC_COMPARE_CYCLE");
+        return v ? static_cast<float>(std::atof(v)) : 0.0f;
+    }();
+    if (compare_cycle > 0.0f) {
+        static const auto t0 = std::chrono::steady_clock::now();
+        const float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - t0).count();
+        const bool original = static_cast<int>(t / compare_cycle) % 2 == 1;
+        if (SotcLive::compare_vanilla.exchange(original, std::memory_order_relaxed) != original) {
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+            std::fprintf(stderr, "SOTC COMPARE CYCLE %d at %lld\n", original ? 1 : 0,
+                         static_cast<long long>(ms));
+        }
+    }
     RefreshEffectLevels();
     if (pp_settings.hdr == 1) {
         RefreshHdrLevels(pp_settings);
         // sotc: the display gets the peak the roll-off targets (10000: no roll-off).
         swapchain.SetHdrMetadata(pp_settings.hdr_peak > 0.0f ? pp_settings.hdr_peak : 10000.0f,
                                  pp_settings.hdr_white);
-    } else { // sotc: the game's tonemap as it is without game HDR (SDR clips above 1)
+    } else if (pp_settings.hdr == 0) {
+        // sotc: SDR: the same picture controls, grain and game colour grading strength, in SDR
+        // units (white = peak = 100, so blowout and flare work alike); the tone mapper stays the
+        // game's (SDR clips above 1), and gamma correction and gamut expansion are HDR only.
+        RefreshHdrLevels(pp_settings);
+        pp_settings.hdr_white = pp_settings.hdr_peak = 100.0f;
+        pp_settings.ui_white = 0.0f;
+        pp_settings.gamma_correction = pp_settings.gamut_expansion = 0.0f;
+        pp_settings.hue_e = 0.0f;
+        pp_settings.drt = 0;
+        SotcTonemap::wanted.store(SotcTonemap::kVanilla, std::memory_order_relaxed);
+    } else { // sotc: the game's tonemap as it is (SDR expanded to HDR10)
         SotcTonemap::wanted.store(SotcTonemap::kVanilla, std::memory_order_relaxed);
         SotcTonemap::grading.store(1.0f, std::memory_order_relaxed);
     }
+    // sotc: grain and dither move every frame; dithering to the swapchain's depth (SOTC_DITHER=0:
+    // none).
+    static const bool dither = [] {
+        const char* v = std::getenv("SOTC_DITHER");
+        return !v || v[0] != '0';
+    }();
+    static u32 present_seed = 0;
+    pp_settings.seed = ++present_seed;
+    pp_settings.dither_bits = dither ? (frame->is_hdr ? 10u : 8u) : 0u;
     // sotc: with game HDR, the scene and the UI apart on FSR 1 too (Dlssg::SetSplitComposite).
     Dlssg::SetSplitComposite(pp_settings.hdr == 1);
     // sotc: upscaler and sharpening as the in-game menu set them (sotc_live.h)
@@ -1183,8 +1233,12 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         pp_settings.ui_sharpen = upscaled.ui_full ? 0.0f : ui_sharpen; // sotc: drawn at this size
         pp_settings.hdr_curve = Dlssg::HdrCurve();
         pp_settings.sky_sharpen = sky_sharpen;
-        if (pp_settings.hdr == 1) { // sotc: the picture controls' pivot (the HUD-less pass reuses it)
-            pp_pass.MeasureKey(cmdbuf, scene, false, pp_settings.hdr_curve);
+        if (pp_settings.hdr != 2) { // sotc: the picture controls' pivot (the HUD-less pass reuses it)
+            pp_pass.MeasureKey(cmdbuf, scene,
+                               pp_settings.hdr == 1
+                                   ? HostPasses::PostProcessingPass::KeyInput::HdrScene
+                                   : HostPasses::PostProcessingPass::KeyInput::Sdr,
+                               pp_settings.hdr_curve);
         }
         pp_pass.Render(cmdbuf, scene, scene_size, *frame, pp_settings, upscaled.ui, upscaled.sky);
         upscaled_scene = upscaled.scene_low ? vk::ImageView{} : scene;
@@ -1204,8 +1258,13 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
         pp_settings.ui = 0;
         pp_settings.vignette = {};
-        if (pp_settings.hdr == 1) { // sotc: the picture controls' pivot (the HUD-less pass reuses it)
-            pp_pass.MeasureKey(cmdbuf, image_view, true, 1.0f);
+        if (pp_settings.hdr != 2) { // sotc: the picture controls' pivot (the HUD-less pass reuses it)
+            using KeyInput = HostPasses::PostProcessingPass::KeyInput;
+            pp_pass.MeasureKey(cmdbuf, image_view,
+                               pp_settings.hdr == 1        ? KeyInput::Pq
+                               : pp_settings.srgb_input    ? KeyInput::SdrEncoded
+                                                           : KeyInput::Sdr,
+                               1.0f);
         }
         pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
     }

@@ -17,13 +17,16 @@ layout (binding = 3) readonly buffer SceneKey {
     float log2_key;
 } scene_key;
 
+// sotc: pp_pass.cpp GpuSettings (128 bytes, the push constant size every device takes).
 layout (push_constant) uniform settings {
     float gamma;
-    uint hdr; // sotc: 0 = SDR, 1 = the game's own HDR10 (pass through), 2 = SDR game on HDR10
-    bool srgb_input;
-    // sotc: 1 = uiSampler over a DLSS upscaled scene; 2 = the same scene without it (the
-    // HUD-less frame of frame generation); 0 = neither.
-    uint ui;
+    // sotc: bits 0-1 hdr (0 = SDR, 1 = the game's own HDR10, 2 = SDR game on HDR10), bit 2
+    // srgb_input, bits 3-4 ui (1 = uiSampler over a DLSS upscaled scene; 2 = the same scene
+    // without it, the HUD-less frame of frame generation), bit 5 the RenoDRT-style curve
+    // (renoDrt()), bit 6 / 7 dithering for an 8 / 10 bit swapchain.
+    uint flags;
+    float grain; // sotc: film grain strength, 0..1 (0: none)
+    uint seed;   // sotc: changes every presented frame (grain and dither move)
     vec4 vignette; // sotc: start, end, radius scale, strength (the game's tonemap, after DLSS)
     float ui_sharpen; // sotc: unsharp amount for the upscaled ui
     float sky_sharpen; // sotc: unsharp amount in the sky
@@ -41,13 +44,36 @@ layout (push_constant) uniform settings {
     float saturation; // chroma scale (1)
     float blowout;    // highlights towards white near the peak, 0..1 (0)
     float flare;      // flare compensation, 0..1 (0)
-    float gamma_correction;     // SDR range decoded as gamma 2.2 instead of sRGB, 0..1 (0)
+    float gamma_correction;     // SDR range decoded with this gamma instead of sRGB (0: off)
     float highlight_saturation; // chroma scale of the highlights (1)
     // sotc: hdr 1, the hue-preserving tone mapper (sotc_tonemap.h kVanillaPlusHue): Vanilla+'s
-    // A..E (hue_e 0: off) and the hue correction towards the per-channel curve, 0..1.
-    float hue_a, hue_b, hue_c, hue_d, hue_e;
+    // B..E (hue_e 0: off; A last) and the hue correction towards the per-channel curve, 0..1.
+    // With the RenoDRT bit: the game's own A..E (hueCurve1()).
+    float hue_b, hue_c, hue_d, hue_e;
     float hue_correction;
+    float gamut_expansion; // sotc: hdr 1: 0..1, saturated colours towards P3 (0: none)
+    float hue_a;
 } pp;
+
+#define PP_HDR (pp.flags & 3u)
+#define PP_SRGB_INPUT ((pp.flags & 4u) != 0u)
+#define PP_UI ((pp.flags >> 3) & 3u)
+#define PP_DRT ((pp.flags & 32u) != 0u)
+
+// sotc: noise for the film grain and the dithering: PCG hash of the pixel, the frame and a salt,
+// triangular in -1..1.
+uint pcg(uint v) {
+    const uint state = v * 747796405u + 2891336453u;
+    const uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+float rand01(uint salt) {
+    const uvec2 p = uvec2(gl_FragCoord.xy);
+    return float(pcg(p.x + pcg(p.y + pcg(pp.seed ^ salt)))) * (1.0 / 4294967295.0);
+}
+float triNoise(uint salt) {
+    return rand01(salt) + rand01(salt ^ 0x68bc21ebu) - 1.0;
+}
 
 // sotc: linear Rec.709 -> HDR10 (Rec.2020 primaries, ST 2084 PQ) for an SDR game. SDR white sits at
 // paper_white nits; the highlights get up to highlight_gain times that, smoothly.
@@ -113,16 +139,11 @@ float pqDecode1(float e) {
     const float p = pow(clamp(e, 0.0, 1.0), 1.0 / m2);
     return 10000.0 * pow(max(p - c1, 0.0) / (c2 - c3 * p), 1.0 / m1);
 }
-vec3 rollOff(vec3 nits) {
-    nits = max(nits, vec3(0.0));
-    if (pp.hdr_peak <= 0.0) {
-        return nits;
+float eetf1(float nits) {
+    if (pp.hdr_peak <= 0.0 || nits <= 0.0) {
+        return max(nits, 0.0);
     }
-    const float m = max(nits.r, max(nits.g, nits.b));
-    if (m <= 0.0) {
-        return nits;
-    }
-    const float e = pqEncode1(m);
+    const float e = pqEncode1(nits);
     const float max_lum = pqEncode1(pp.hdr_peak);
     const float ks = 1.5 * max_lum - 0.5;
     if (e <= ks) {
@@ -132,7 +153,18 @@ vec3 rollOff(vec3 nits) {
     const float t2 = t * t, t3 = t2 * t;
     const float e2 = (2.0 * t3 - 3.0 * t2 + 1.0) * ks + (t3 - 2.0 * t2 + t) * (1.0 - ks) +
                      (-2.0 * t3 + 3.0 * t2) * max_lum;
-    return nits * (min(pqDecode1(e2), pp.hdr_peak) / m);
+    return min(pqDecode1(e2), pp.hdr_peak);
+}
+vec3 rollOff(vec3 nits) {
+    nits = max(nits, vec3(0.0));
+    if (pp.hdr_peak <= 0.0) {
+        return nits;
+    }
+    const float m = max(nits.r, max(nits.g, nits.b));
+    if (m <= 0.0) {
+        return nits;
+    }
+    return nits * (eetf1(m) / m);
 }
 
 // sotc: OkLab (Ottosson) from linear Rec.2020, for the hue correction.
@@ -156,14 +188,43 @@ vec3 fromOkLab(vec3 lab) {
     return rec709to2020 * (okM1i * (lms * lms * lms));
 }
 
+// sotc: `r` with its OkLab hue (a/b direction) moved towards `ref`'s by `amount`, its lightness
+// and chroma kept.
+vec3 hueTowards(vec3 r, vec3 ref, float amount) {
+    const vec3 lab = toOkLab(r);
+    const vec3 lab_ref = toOkLab(ref);
+    const float chroma = length(lab.yz);
+    const float chroma_ref = length(lab_ref.yz);
+    if (chroma > 1e-5 && chroma_ref > 1e-5) {
+        const vec2 dir = mix(lab.yz / chroma, lab_ref.yz / chroma_ref, amount);
+        const float len = length(dir);
+        if (len > 1e-5) {
+            return max(fromOkLab(vec3(lab.x, dir / len * chroma)), vec3(0.0));
+        }
+    }
+    return r;
+}
+
 // sotc: the hue-preserving tone mapper (sotc_tonemap.h kVanillaPlusHue). The game's pass drew a
 // straight line (slope s, the game's curve at mid grey); here Vanilla+'s curve goes on the
 // luminance and the colour is scaled with it, so a bright colour keeps its hue and saturation
 // instead of drifting towards yellow and white per channel. hue_correction takes the hue (OkLab
 // a/b direction, chroma kept) back towards the per-channel curve's. `u` in the game's linear
 // units (Rec.2020).
-float hueCurve1(float x) {
+float gameCurve1(float x) {
     return x * (pp.hue_a * x + pp.hue_b) / (x * (pp.hue_c * x + pp.hue_d) + pp.hue_e);
+}
+// RenoDRT: the game's curve (its toe: shadows and mid tones as the game shows them) blended over
+// two stops around mid grey into the straight line through it (highlights untonemapped, for
+// renoDrt()'s roll-off into the peak). Both meet at mid grey and rise, so the blend does too.
+float hueCurve1(float x) {
+    const float f = gameCurve1(x);
+    if (!PP_DRT) {
+        return f;
+    }
+    const float s = gameCurve1(0.18) / 0.18;
+    const float t = smoothstep(-1.0, 1.0, log2(max(x, 1e-6) / 0.18));
+    return mix(f, s * x, t);
 }
 vec3 hueCurve(vec3 u) {
     if (pp.hue_e <= 0.0) {
@@ -178,18 +239,8 @@ vec3 hueCurve(vec3 u) {
     vec3 r = u * (hueCurve1(y / s) / y);
     if (pp.hue_correction > 0.0) {
         const vec3 x = u / s;
-        const vec3 ref = x * (pp.hue_a * x + pp.hue_b) / (x * (pp.hue_c * x + pp.hue_d) + pp.hue_e);
-        const vec3 lab = toOkLab(r);
-        const vec3 lab_ref = toOkLab(ref);
-        const float chroma = length(lab.yz);
-        const float chroma_ref = length(lab_ref.yz);
-        if (chroma > 1e-5 && chroma_ref > 1e-5) {
-            const vec2 dir = mix(lab.yz / chroma, lab_ref.yz / chroma_ref, pp.hue_correction);
-            const float len = length(dir);
-            if (len > 1e-5) {
-                r = max(fromOkLab(vec3(lab.x, dir / len * chroma)), vec3(0.0));
-            }
-        }
+        const vec3 ref = vec3(hueCurve1(x.r), hueCurve1(x.g), hueCurve1(x.b));
+        r = hueTowards(r, ref, pp.hue_correction);
     }
     return r;
 }
@@ -222,7 +273,7 @@ vec3 grade(vec3 nits) {
         const float w = y / pp.hdr_white;
         if (w < 1.0) {
             const float e = w <= 0.0031308 ? 12.92 * w : 1.055 * pow(w, 1.0 / 2.4) - 0.055;
-            const float y2 = pp.hdr_white * mix(w, pow(e, 2.2), pp.gamma_correction);
+            const float y2 = pp.hdr_white * pow(e, pp.gamma_correction);
             nits *= y2 / y;
             y = y2;
             if (y <= 0.0) {
@@ -262,6 +313,82 @@ vec3 grade(vec3 nits) {
     return nits;
 }
 
+// sotc: gamut expansion (RenoDX's): the game's colours are Rec.709; on an HDR display the
+// saturated ones may go further, towards the P3 primaries (inside Rec.2020), the more the more
+// saturated they already are, so greys and skin barely move. `nits` in linear Rec.2020.
+const mat3 p3to2020 = mat3(0.753833, 0.045744, -0.001210, 0.198597, 0.941777, 0.017601, 0.047570,
+                           0.012479, 0.983608);
+vec3 expandGamut(vec3 nits) {
+    if (pp.gamut_expansion <= 0.0) {
+        return nits;
+    }
+    const vec3 c = max(rec2020to709 * nits, vec3(0.0));
+    const float mx = max(c.r, max(c.g, c.b));
+    if (mx <= 0.0) {
+        return nits;
+    }
+    const float s = (mx - min(c.r, min(c.g, c.b))) / mx;
+    return max(mix(nits, p3to2020 * c, pp.gamut_expansion * s * s), vec3(0.0));
+}
+
+// sotc: the RenoDRT-style tone mapper (sotc_tonemap.h kRenoDrt). The game's pass drew a straight
+// line; here the luminance goes through the BT.2390 curve into the display's peak and the colour
+// is scaled with it, so hues and saturation hold as they brighten. The hue correction control
+// takes the hue towards the per-channel curve's (bright fire towards yellow, as film does).
+vec3 renoDrt(vec3 nits) {
+    nits = max(nits, vec3(0.0));
+    const float y = dot(nits, luma2020);
+    if (y <= 0.0 || pp.hdr_peak <= 0.0) {
+        return nits;
+    }
+    vec3 r = nits * (eetf1(y) / y);
+    if (pp.hue_correction > 0.0) {
+        r = hueTowards(r, vec3(eetf1(nits.r), eetf1(nits.g), eetf1(nits.b)), pp.hue_correction);
+    }
+    return r;
+}
+
+// sotc: film grain (RenoDX's kind, the game has none): a fine, moving grain on luminance, the
+// strongest in the mid tones and fading into black and the brightest highlights, as on film.
+// Multiplicative, so black stays black. `white`: the paper white in the units of `c`.
+vec3 filmGrain(vec3 c, float white) {
+    if (pp.grain <= 0.0) {
+        return c;
+    }
+    const float y = dot(max(c, vec3(0.0)), luma2020);
+    if (y <= 0.0) {
+        return c;
+    }
+    const float l = (log2(y / white) + 1.5) / 2.5;
+    const float weight = exp2(-0.5 * l * l);
+    return c * exp2(pp.grain * 0.3 * weight * triNoise(0x9e3779b9u));
+}
+
+// sotc: the scene in nits (linear Rec.2020, the game's HDR): gamut expansion, picture controls,
+// tone mapper (RenoDRT or the roll-off into the peak), grain.
+vec3 hdrScene(vec3 nits) {
+    nits = grade(expandGamut(nits));
+    if (PP_DRT) {
+        nits = renoDrt(nits);
+    }
+    nits = filmGrain(rollOff(nits), pp.hdr_white);
+    return pp.hdr_peak > 0.0 ? min(nits, vec3(pp.hdr_peak)) : nits;
+}
+
+// sotc: the scene in SDR (linear Rec.709, white 1): the same picture controls (the presenter
+// gives hdr_white = hdr_peak = 100 here and no gamma correction) and grain. All neutral:
+// unchanged bit for bit.
+vec3 sdrScene(vec3 lin) {
+    if (pp.grain <= 0.0 && pp.exposure == 1.0 && pp.contrast == 1.0 && pp.shadows == 1.0 &&
+        pp.highlights == 1.0 && pp.saturation == 1.0 && pp.blowout == 0.0 && pp.flare == 0.0 &&
+        pp.highlight_saturation == 1.0) {
+        return lin;
+    }
+    const vec3 c = rec709to2020 * max(lin, vec3(0.0));
+    const vec3 g = filmGrain(grade(c * pp.hdr_white) / pp.hdr_white, 1.0);
+    return max(rec2020to709 * g, vec3(0.0));
+}
+
 // sotc: the UI layer is at render size; Catmull-Rom (9 bilinear taps) keeps its text sharper
 // than a bilinear stretch. Clamped: the filter overshoots at hard edges.
 vec4 sampleCatmullRom(sampler2D tex, vec2 p) {
@@ -290,7 +417,7 @@ vec4 sampleCatmullRom(sampler2D tex, vec2 p) {
     return clamp(r, 0.0, 1.0);
 }
 
-void main() {
+vec4 shade() {
     vec4 color_linear = texture(texSampler, uv);
     if (pp.sky_sharpen != 0.0) {
         // DLSS softens the drifting clouds more than FSR1: extra unsharp there, limited to the
@@ -309,14 +436,14 @@ void main() {
                 clamp(c + sky * pp.sky_sharpen * (c - 0.25 * (n + s + w + e)), lo, hi);
         }
     }
-    if (pp.ui != 0u) {
+    if (PP_UI != 0u) {
         if (pp.vignette.w != 0.0 && pp.vignette.y != pp.vignette.x) {
             const float r = pp.vignette.z * length(uv - 0.5);
             const float t = clamp((r - pp.vignette.x) / (pp.vignette.y - pp.vignette.x), 0.0, 1.0);
             color_linear.rgb *= 1.0 + pp.vignette.w * (t * t * (3.0 - 2.0 * t) - 1.0);
         }
-        vec4 ui = pp.ui == 1u ? sampleCatmullRom(uiSampler, uv) : vec4(0.0);
-        if (pp.ui == 1u && pp.ui_sharpen > 0.0) {
+        vec4 ui = PP_UI == 1u ? sampleCatmullRom(uiSampler, uv) : vec4(0.0);
+        if (PP_UI == 1u && pp.ui_sharpen > 0.0) {
             // Like RCAS on the FSR1 path: unsharp against the output-pixel neighbours, limited
             // to their range so edges do not ring. Premultiplied, so rgb and alpha alike.
             const vec2 px = 1.0 / vec2(textureSize(texSampler, 0));
@@ -329,7 +456,7 @@ void main() {
             ui = clamp(ui + pp.ui_sharpen * (ui - 0.25 * (n + s + w + e)), lo, hi);
             ui.rgb = min(ui.rgb, vec3(ui.a));
         }
-        if (pp.hdr == 1u) {
+        if (PP_HDR == 1u) {
             // The game's HDR composite: UI over scene, ^k (its constant), Rec.2020, PQ with
             // 1.0 at 300 nits; scaled to the paper white like below.
             // The scene part gets the paper white and the roll-off to the display's peak; the UI
@@ -339,7 +466,7 @@ void main() {
             const vec3 lin = rec709to2020 * pow(c, vec3(pp.hdr_curve));
             // The picture controls grade the scene part only; where the UI covers the scene, its
             // own (ungraded) level takes over below by the UI's alpha.
-            const vec3 scene_nits = rollOff(grade(3.0 * pp.hdr_white * hueCurve(lin)));
+            const vec3 scene_nits = hdrScene(3.0 * pp.hdr_white * hueCurve(lin));
             const float ui_white = pp.ui_white > 0.0 ? pp.ui_white : pp.hdr_white;
             vec3 nits = scene_nits;
             if (ui.a > 0.0) {
@@ -347,24 +474,39 @@ void main() {
                 if (pp.hdr_peak > 0.0) ui_nits = min(ui_nits, vec3(pp.hdr_peak));
                 nits = mix(scene_nits, ui_nits, clamp(ui.a, 0.0, 1.0));
             }
-            color = vec4(pqEncode(nits), 1.0);
-            return;
+            return vec4(pqEncode(nits), 1.0);
+        }
+        if (PP_HDR == 0u) {
+            color_linear.rgb = sdrScene(color_linear.rgb);
         }
         color_linear = vec4(clamp(color_linear.rgb, 0.0, 1.0) * (1.0 - ui.a) + ui.rgb, 1.0);
     }
-    if (pp.hdr == 1u) {
+    if (PP_HDR == 1u) {
         // The game's own BT.2020 PQ output has its white at about 100 nits, too dim next to
         // the desktop; scaled to the paper white, highlights rolled off into the display's peak.
         // (The UI is already in this picture here, so it follows the paper white.)
         // The picture controls apply to the whole frame here (the UI is baked in).
         // The game's PQ has 1.0 of its linear units at 300 nits (hueCurve's units).
         const vec3 u = hueCurve(pqDecode(color_linear.rgb) / 300.0);
-        color = vec4(pqEncode(rollOff(grade(u * (3.0 * pp.hdr_white)))), color_linear.a);
-    } else if (pp.hdr == 2u) {
-        if (pp.srgb_input) color_linear.rgb = degamma(color_linear.rgb);
-        color = vec4(sdrToHdr10(color_linear.rgb), color_linear.a);
-    } else {
-        if (pp.srgb_input) color_linear.rgb = degamma(color_linear.rgb);
-        color = vec4(gamma(color_linear.rgb), color_linear.a);
+        return vec4(pqEncode(hdrScene(u * (3.0 * pp.hdr_white))), color_linear.a);
+    }
+    if (PP_SRGB_INPUT) color_linear.rgb = degamma(color_linear.rgb);
+    if (PP_HDR == 2u) {
+        return vec4(sdrToHdr10(color_linear.rgb), color_linear.a);
+    }
+    if (PP_UI == 0u) { // with the UI layer the scene was graded above, apart from the UI
+        color_linear.rgb = sdrScene(color_linear.rgb);
+    }
+    return vec4(gamma(color_linear.rgb), color_linear.a);
+}
+
+void main() {
+    color = shade();
+    // sotc: dithering before the swapchain's 8 or 10 bits: smooth gradients (sky, fog, the dark)
+    // instead of bands. A triangular noise of one step, invisible as noise.
+    if ((pp.flags & 0xc0u) != 0u) {
+        const float steps = (pp.flags & 64u) != 0u ? 255.0 : 1023.0;
+        color.rgb += vec3(triNoise(0x1b873593u), triNoise(0xcc9e2d51u), triNoise(0xe6546b64u)) /
+                     steps;
     }
 }

@@ -59,6 +59,12 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
     cmdbuf.bindDescriptorSets(bind_point, *pipeline_layout, 0, desc_set, {});
 }
 
+void Pipeline::BindPushConstantsOnly(const Shader::PushData& push_data) const {
+    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
+    cmdbuf.pushConstants(*pipeline_layout, stage_flags, 0u, sizeof(push_data), &push_data);
+}
+
 std::string Pipeline::GetDebugString() const {
     std::string stage_desc;
     for (const auto& stage : stages) {

@@ -11,6 +11,7 @@
 #include <imgui.h> // sotc port: ImTextureID only
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
 #include "video_core/renderer_vulkan/host_passes/pp_pass.h"
+#include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -40,6 +41,13 @@ struct Frame {
     u8 id{};
     /// sotc: this frame without the HUD (Rasterizer::TakeHudless) for frame generation, or null.
     Frame* hudless{};
+
+    /// sotc: deferred post-process work when FSR4 runs on the async compute queue.
+    u64 async_fsr_tick{};
+    Dlssg::Upscaled async_upscaled{};
+    float async_sharpness{-1.0f};
+    HostPasses::PostProcessingPass::Settings async_pp_settings{};
+    vk::ImageView async_hudless_view{};
 
     ImTextureID imgui_texture;
 };
@@ -77,6 +85,11 @@ public:
         return swapchain.HasHDR();
     }
 
+    /// sotc: presenting waits for the display's vblank (FIFO swapchain).
+    bool PresentWaitsForVsync() const {
+        return swapchain.PresentWaitsForVsync();
+    }
+
     void SetHDR(bool enable) {
         if (!IsHDRSupported()) {
             return;
@@ -96,11 +109,18 @@ public:
     VideoCore::Image& RegisterVideoOutSurface(
         const Libraries::VideoOut::BufferAttributeGroup& attribute, VAddr cpu_address) {
         vo_buffers_addr.emplace_back(cpu_address);
+        texture_cache.RegisterVoSurface(cpu_address, attribute.attrib.width,
+                                        attribute.attrib.height);
         auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
         const auto image_id = texture_cache.FindImage(desc);
         auto& image = texture_cache.GetImage(image_id);
         image.usage.vo_surface = 1u;
         return image;
+    }
+
+    void UnregisterVideoOutSurface(VAddr cpu_address) {
+        std::erase(vo_buffers_addr, cpu_address);
+        texture_cache.UnregisterVoSurface(cpu_address);
     }
 
     bool IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const;
@@ -120,7 +140,7 @@ private:
 
     /// sotc: FSR 3 frame generation: presents the frame between the last game frame and
     /// `frame`. False when there is none.
-    bool PresentGenerated(Frame* frame);
+    bool PresentGenerated(Frame* frame, u64& pending_fsr_tick);
 
     void SetExpectedGameSize(s32 width, s32 height);
 
@@ -132,6 +152,9 @@ private:
     Frontend::WindowSDL& window;
     Instance instance;
     HostPasses::FsrPass fsr_pass;
+    /// sotc: dedicated Presenter-thread FSR pass for async FSR Sharpen so CP-thread FsrPass::Render
+    /// calls in menus/loading screens cannot race its ring state.
+    HostPasses::FsrPass fsr_pass_present;
     /// sotc: the same FSR 1 for the frame without the HUD (frame generation), with its own images:
     /// fsr_pass's ring holds the game frame's.
     HostPasses::FsrPass fsr_pass_hudless;

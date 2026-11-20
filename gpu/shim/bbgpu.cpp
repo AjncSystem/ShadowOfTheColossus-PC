@@ -49,6 +49,8 @@ uint64_t runtime_memory_clamp(uintptr_t address, uint64_t size);
 int runtime_memory_region(uintptr_t address, uintptr_t* start, uintptr_t* end, int* mapped);
 void runtime_memory_gpu_protect(uintptr_t address, uint64_t size, int read, int write);
 const unsigned char* runtime_memory_backing_pointer(uintptr_t address);
+const unsigned char* runtime_memory_backing_run(uintptr_t address, uint64_t min_size,
+                                                uintptr_t* start, uintptr_t* end);
 int runtime_memory_copy_out(uintptr_t source, unsigned char* dest, uint64_t size);
 typedef void (*RuntimeGpuRange)(uintptr_t address, uint64_t size);
 // runtime_kernel.c: one clock for guest and GPU timestamps
@@ -259,14 +261,11 @@ bool MemoryManager::TryCopySparseMemory(VAddr source, u8* dest, u64 size) {
     }
     return true;
 }
-const u8* MemoryManager::GetBackingRun(VAddr address, VAddr* run_start, u64* run_size) const {
+const u8* MemoryManager::GetBackingRun(VAddr address, VAddr* run_start, u64* run_size,
+                                       u64 min_size) const {
     uintptr_t start = 0, end = 0;
-    int mapped = 0;
-    if (!runtime_memory_region(address, &start, &end, &mapped) || !mapped) {
-        return nullptr;
-    }
-    const u8* backing = runtime_memory_backing_pointer(start);
-    if (!backing) {
+    const u8* backing = runtime_memory_backing_run(address, min_size, &start, &end);
+    if (!backing || end <= start) {
         return nullptr;
     }
     *run_start = start;

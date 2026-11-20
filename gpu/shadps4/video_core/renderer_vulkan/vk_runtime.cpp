@@ -731,10 +731,24 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
 
 bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                                bool check_read_access) {
-    MakeCurrent(handle);
-    bool has_access = resource->write_ranges.Overlaps(offset, offset + size);
+    if (active_resources == 0 || (!check_read_access && !memory_barrier.srcAccessMask)) {
+        return false;
+    }
+    BufferBarriers* entry = nullptr;
+    if (resource && resource->handle == handle) {
+        entry = resource;
+    } else {
+        const auto live_end = resources.begin() + static_cast<std::ptrdiff_t>(active_resources);
+        const auto it = std::find_if(resources.begin(), live_end,
+                                     [handle](const BufferBarriers& b) { return b.handle == handle; });
+        if (it == live_end) {
+            return false;
+        }
+        entry = std::addressof(*it);
+    }
+    bool has_access = entry->write_ranges.Overlaps(offset, offset + size);
     if (check_read_access && !has_access) {
-        has_access |= resource->read_ranges.Overlaps(offset, offset + size);
+        has_access |= entry->read_ranges.Overlaps(offset, offset + size);
     }
     return has_access;
 }

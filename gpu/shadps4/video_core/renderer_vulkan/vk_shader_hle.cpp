@@ -280,11 +280,26 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
         const bool overlap = src.base_address < address + count * 4 &&
                              address < src.base_address + period;
         if (in_run && page_replace && !overlap && (src_count == count || period <= 64_KB)) {
-            TableData table{};
+            const u8* current = run + (address - run_start);
+            const u64 bytes = count * 4;
             if (src_count == count) {
-                table.direct = reinterpret_cast<const u8*>(source);
-            } else {
-                static std::vector<u8> pattern;
+                if (std::memcmp(current, source, bytes) == 0) {
+                    return true;
+                }
+                return ReplaceChangedPages(
+                    rasterizer, address, current,
+                    TableData{reinterpret_cast<const u8*>(source), nullptr, 0}, bytes);
+            }
+            const u64 head = std::min<u64>(bytes, period);
+            if (std::memcmp(current, source, head) == 0 &&
+                (bytes <= period ||
+                 std::memcmp(current, current + period, bytes - period) == 0)) {
+                return true;
+            }
+            static std::vector<u8> pattern;
+            static u64 cached_period = 0;
+            if (cached_period != period || pattern.size() < period + 4096 ||
+                std::memcmp(pattern.data(), source, period) != 0) {
                 pattern.resize(period + 4096);
                 std::memcpy(pattern.data(), source, period);
                 for (u64 done = period; done < pattern.size();) {
@@ -292,11 +307,10 @@ static bool ExecuteReplicateShaderHLE(const Shader::Info& info,
                     std::memcpy(pattern.data() + done, pattern.data(), chunk);
                     done += chunk;
                 }
-                table.pattern = pattern.data();
-                table.period = period;
+                cached_period = period;
             }
-            return ReplaceChangedPages(rasterizer, address, run + (address - run_start), table,
-                                       count * 4);
+            return ReplaceChangedPages(rasterizer, address, current,
+                                       TableData{nullptr, pattern.data(), period}, bytes);
         }
         BuildTable(source, src_count, count);
         if (in_run) {

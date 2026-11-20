@@ -877,26 +877,23 @@ void CommandRecorder::ConsumerLoop(std::stop_token stoken) {
 #endif
         return count;
     }();
-    static const bool few_cpus = logical && logical <= 8;
+    static const bool few_cpus = logical && logical <= 12;
     // sotc: SOTC_REC_SPIN_US overrides the spin (A/B: on a power-limited laptop the spinning
     // recorder took a whole core, ~2/3 of it waiting, next to the command processor it waits on).
-    // With 8 logical processors or fewer it does not spin: attract demo, Ryzen 7 5700X held to
-    // 2 cores / 4 threads 66.9 FPS against 64.3 spinning 250 us, 4 cores 81.8 against 79.9, 4 cores
-    // / 8 threads even (82.1 both).
+    // With 12 logical processors or fewer (up to 6C/12T), keep the spin brief (50 us) instead of
+    // burning a full core between frames.
     static const auto SpinTime = [] {
         const char* v = std::getenv("SOTC_REC_SPIN_US");
-        return std::chrono::microseconds{v ? std::strtol(v, nullptr, 10) : (few_cpus ? 0 : 250)};
+        return std::chrono::microseconds{v ? std::strtol(v, nullptr, 10) : (few_cpus ? 50 : 250)};
     }();
-    // sotc: SOTC_REC_SLEEP_US sets the idle wait. On Windows the default 500 us rounds to 0 and the
-    // thread spins: 61.1 vs 57.7 FPS on the attract demo (i9-13900K + RTX 2060 SUPER) against a
-    // 2 ms sleep (PR #81, jownatan), which frees the core on laptops and APUs (set 2000 there).
-    // With 8 logical processors or fewer the default is that 2 ms sleep: the spinning recorder took
-    // a whole core the game needs. Attract demo on a Ryzen 7 5700X held to 4 logical processors:
-    // stuck loading while it spun, 77 FPS sleeping; at 8 and 16 the two were even.
+    // sotc: SOTC_REC_SLEEP_US sets the idle wait. On Windows, waits below 1 ms round down to 0 ms
+    // in condition_variable::wait_for, spinning the High-priority thread at 100% CPU even when idle.
+    // Default to 2 ms (2000 us; or 1 ms above 12 threads) so wait_for actually sleeps until
+    // WakeIfSleeping() notifies wake_cv.
     static const auto SleepTime = [] {
         const char* v = std::getenv("SOTC_REC_SLEEP_US");
         const auto sleep =
-            std::chrono::microseconds{v ? std::strtol(v, nullptr, 10) : (few_cpus ? 2000 : 500)};
+            std::chrono::microseconds{v ? std::strtol(v, nullptr, 10) : (few_cpus ? 2000 : 1000)};
         LOG_WARNING(Render_Vulkan, "GPU recorder: {} logical processors, spin {} us, idle wait {} us",
                     logical, SpinTime.count(), sleep.count());
         return sleep;

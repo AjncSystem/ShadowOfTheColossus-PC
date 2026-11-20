@@ -33,6 +33,7 @@
 #include "video_core/amdgpu/regs.h"
 #include "video_core/host_shaders/dlss_color_sanitize_comp.h"
 #include "video_core/host_shaders/dlss_mvec_fill_comp.h"
+#include "video_core/host_shaders/fsr_depth_copy_comp.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -550,6 +551,12 @@ bool CreateImage(vk::Format format, u32 width, u32 height, bool depth, vk::Image
     if (!depth && format != vk::Format::eR8G8B8A8Srgb) {
         usage |= vk::ImageUsageFlagBits::eStorage;
     }
+    const u32 queue_families[2] = {
+        g_instance->GetGraphicsQueueFamilyIndex(),
+        g_instance->GetAsyncComputeQueueFamilyIndex(),
+    };
+    const bool concurrent =
+        g_instance->HasAsyncComputeQueue() && queue_families[0] != queue_families[1];
     const VkImageCreateInfo info = static_cast<VkImageCreateInfo>(vk::ImageCreateInfo{
         .imageType = vk::ImageType::e2D,
         .format = format,
@@ -559,6 +566,9 @@ bool CreateImage(vk::Format format, u32 width, u32 height, bool depth, vk::Image
         .samples = vk::SampleCountFlagBits::e1,
         .tiling = vk::ImageTiling::eOptimal,
         .usage = usage,
+        .sharingMode = concurrent ? vk::SharingMode::eConcurrent : vk::SharingMode::eExclusive,
+        .queueFamilyIndexCount = concurrent ? 2u : 0u,
+        .pQueueFamilyIndices = concurrent ? queue_families : nullptr,
         .initialLayout = vk::ImageLayout::eUndefined,
     });
     const VmaAllocationCreateInfo alloc_info = {
@@ -643,9 +653,101 @@ struct SrImage {
     vk::Format format{};
     u32 width{}, height{};
 };
-Composite composite;            // command processor thread
-SrImage sr_color, sr_ui, sr_out; // command processor thread
-SrImage sr_ui_full;              // the UI layer at the output size (UiTarget)
+struct SrRingSlot {
+    SrImage color;
+    SrImage ui;
+    SrImage out;
+    SrImage ui_full;
+    SrImage depth_r32;
+};
+constexpr u32 kSrRingSize = 6;
+Composite composite;                 // command processor thread
+std::array<SrRingSlot, kSrRingSize> sr_ring;
+u32 sr_ring_idx = 0;
+
+struct AsyncFsrState {
+    vk::CommandPool pool;
+    std::array<vk::CommandBuffer, kSrRingSize> cmdbufs{};
+    vk::Semaphore sema;
+    std::atomic<u64> next_tick{0};
+    std::atomic<u64> submitted_tick{0};
+    std::array<u64, kSrRingSize> slot_ticks{};
+    bool ready = false;
+    bool failed = false;
+};
+AsyncFsrState async_fsr;
+
+bool EnsureAsyncFsr() {
+    if (async_fsr.ready) {
+        return true;
+    }
+    if (async_fsr.failed || !g_instance->HasAsyncComputeQueue()) {
+        return false;
+    }
+    const vk::Device device = g_instance->GetDevice();
+    const auto [pool_res, pool] = device.createCommandPool({
+        .flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+        .queueFamilyIndex = g_instance->GetAsyncComputeQueueFamilyIndex(),
+    });
+    if (pool_res != vk::Result::eSuccess) {
+        std::fprintf(stderr, "SOTC FSR: async command pool creation failed (%d)\n",
+                     static_cast<int>(pool_res));
+        async_fsr.failed = true;
+        return false;
+    }
+    const auto [cmd_res, cmdbufs] = device.allocateCommandBuffers({
+        .commandPool = pool,
+        .level = vk::CommandBufferLevel::ePrimary,
+        .commandBufferCount = kSrRingSize,
+    });
+    if (cmd_res != vk::Result::eSuccess) {
+        std::fprintf(stderr, "SOTC FSR: async command buffer alloc failed (%d)\n",
+                     static_cast<int>(cmd_res));
+        device.destroyCommandPool(pool);
+        async_fsr.failed = true;
+        return false;
+    }
+    vk::StructureChain<vk::SemaphoreCreateInfo, vk::SemaphoreTypeCreateInfo> sema_chain{
+        vk::SemaphoreCreateInfo{},
+        vk::SemaphoreTypeCreateInfo{
+            .semaphoreType = vk::SemaphoreType::eTimeline,
+            .initialValue = 0,
+        },
+    };
+    const auto [sema_res, sema] = device.createSemaphore(sema_chain.get<vk::SemaphoreCreateInfo>());
+    if (sema_res != vk::Result::eSuccess) {
+        std::fprintf(stderr, "SOTC FSR: async timeline semaphore creation failed (%d)\n",
+                     static_cast<int>(sema_res));
+        device.destroyCommandPool(pool);
+        async_fsr.failed = true;
+        return false;
+    }
+    async_fsr.pool = pool;
+    for (u32 i = 0; i < kSrRingSize; ++i) {
+        async_fsr.cmdbufs[i] = cmdbufs[i];
+    }
+    async_fsr.sema = sema;
+    async_fsr.ready = true;
+    std::fprintf(stderr, "SOTC FSR: async compute queue enabled (family %u)\n",
+                 g_instance->GetAsyncComputeQueueFamilyIndex());
+    return true;
+}
+
+void WaitFsrTick(u64 tick) {
+    if (!tick || !async_fsr.ready) {
+        return;
+    }
+    const vk::SemaphoreWaitInfo wait_info{
+        .semaphoreCount = 1,
+        .pSemaphores = &async_fsr.sema,
+        .pValues = &tick,
+    };
+    const vk::Result r = g_instance->GetDevice().waitSemaphores(wait_info, ~u64{0});
+    if (r != vk::Result::eSuccess) {
+        std::fprintf(stderr, "SOTC FSR: async waitSemaphores failed (%d)\n", static_cast<int>(r));
+    }
+}
+
 std::array<VAddr, 2> ui_addresses{}; // of the composite's UI layer (it may alternate)
 u32 ui_width{}, ui_height{};    // of the composite's UI layer
 u32 out_width{}, out_height{};  // of the last upscale
@@ -1191,11 +1293,13 @@ void NoteCamera(const AmdGpu::Regs& regs, u32 mrt_mask) {
 std::mutex vignette_mutex;
 float vignette_params[4]{};
 bool vignette_valid = false;
+bool vignette_frame_fresh = false;
 
 void NoteVignette(const float params[4]) {
     std::scoped_lock lock{vignette_mutex};
     std::memcpy(vignette_params, params, sizeof(vignette_params));
     vignette_valid = true;
+    vignette_frame_fresh = true;
 }
 
 std::atomic<float> hdr_curve{1.0f};
@@ -1212,6 +1316,12 @@ bool Vignette(float out[4]) {
     std::scoped_lock lock{vignette_mutex};
     std::memcpy(out, vignette_params, sizeof(vignette_params));
     return vignette_valid;
+}
+
+bool TakeVignette(float out[4]) {
+    std::scoped_lock lock{vignette_mutex};
+    std::memcpy(out, vignette_params, sizeof(vignette_params));
+    return std::exchange(vignette_frame_fresh, false);
 }
 
 void NoteComposite(VideoCore::ImageId scene_id, VideoCore::ImageId ui_id,
@@ -1258,7 +1368,7 @@ void NoteUiShadow(vk::Image image, u32 width, u32 height) {
 
 /// sr_color in place (shader read layout): NaN/Inf -> 0, clamp to 0..1 (dlss_color_sanitize.comp).
 /// SOTC_DLSS_SANITIZE=0 off, 2 marks bad pixels (debug).
-void SanitizeColor(vk::CommandBuffer cmdbuf) {
+void SanitizeColor(vk::CommandBuffer cmdbuf, SrImage& sr_color) {
     static const int mode = [] {
         const char* v = std::getenv("SOTC_DLSS_SANITIZE");
         const int m = v && *v ? std::atoi(v) : 1;
@@ -1344,7 +1454,7 @@ void SanitizeColor(vk::CommandBuffer cmdbuf) {
             vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
 }
 
-/// The scene and UI of the final composite -> sr_color, sr_ui. Right after the composite draw:
+/// The scene and UI of the final composite -> sr.color, sr.ui. Right after the composite draw:
 /// by present the game may draw its next frame into the same memory.
 void CopyComposite(vk::CommandBuffer cmdbuf, VideoCore::TextureCache& texture_cache,
                    Runtime& runtime) {
@@ -1355,14 +1465,17 @@ void CopyComposite(vk::CommandBuffer cmdbuf, VideoCore::TextureCache& texture_ca
     if (!scene || !ui) {
         return;
     }
+    WaitFsrTick(async_fsr.slot_ticks[sr_ring_idx]);
+    async_fsr.slot_ticks[sr_ring_idx] = 0;
+    SrRingSlot& sr = sr_ring[sr_ring_idx];
     // sotc: the UI layer is the scene's size in the base game, the output size in PS4 Pro mode
     // (scene 1600x900, UI 1920x1080 at 1080p); the post-process pass samples it either way.
     const u32 w = scene->info.size.width;
     const u32 h = scene->info.size.height;
     const u32 uw = ui->info.size.width;
     const u32 uh = ui->info.size.height;
-    if (!EnsureSrImage(sr_color, scene->info.pixel_format, w, h) ||
-        !EnsureSrImage(sr_ui, vk::Format::eR8G8B8A8Srgb, uw, uh)) {
+    if (!EnsureSrImage(sr.color, scene->info.pixel_format, w, h) ||
+        !EnsureSrImage(sr.ui, vk::Format::eR8G8B8A8Srgb, uw, uh)) {
         return;
     }
     using Stage = vk::PipelineStageFlagBits2;
@@ -1390,9 +1503,9 @@ void CopyComposite(vk::CommandBuffer cmdbuf, VideoCore::TextureCache& texture_ca
         };
     };
     const std::array to_dst{
-        barrier(sr_color.image, Layout::eUndefined, Layout::eTransferDstOptimal,
+        barrier(sr.color.image, Layout::eUndefined, Layout::eTransferDstOptimal,
                 Stage::eAllCommands, Access::eNone, Stage::eCopy, Access::eTransferWrite),
-        barrier(sr_ui.image, Layout::eUndefined, Layout::eTransferDstOptimal, Stage::eAllCommands,
+        barrier(sr.ui.image, Layout::eUndefined, Layout::eTransferDstOptimal, Stage::eAllCommands,
                 Access::eNone, Stage::eCopy, Access::eTransferWrite),
     };
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
@@ -1406,16 +1519,16 @@ void CopyComposite(vk::CommandBuffer cmdbuf, VideoCore::TextureCache& texture_ca
         .dstOffset = {0, 0, 0},
         .extent = {w, h, 1},
     };
-    cmdbuf.copyImage(scene->GetImage(), Layout::eTransferSrcOptimal, sr_color.image,
+    cmdbuf.copyImage(scene->GetImage(), Layout::eTransferSrcOptimal, sr.color.image,
                      Layout::eTransferDstOptimal, region);
     vk::ImageCopy ui_region = region;
     ui_region.extent = vk::Extent3D{uw, uh, 1};
-    cmdbuf.copyImage(ui->GetImage(), Layout::eTransferSrcOptimal, sr_ui.image,
+    cmdbuf.copyImage(ui->GetImage(), Layout::eTransferSrcOptimal, sr.ui.image,
                      Layout::eTransferDstOptimal, ui_region);
     const std::array to_read{
-        barrier(sr_color.image, Layout::eTransferDstOptimal, Layout::eShaderReadOnlyOptimal,
+        barrier(sr.color.image, Layout::eTransferDstOptimal, Layout::eShaderReadOnlyOptimal,
                 Stage::eCopy, Access::eTransferWrite, Stage::eAllCommands, Access::eShaderRead),
-        barrier(sr_ui.image, Layout::eTransferDstOptimal, Layout::eShaderReadOnlyOptimal,
+        barrier(sr.ui.image, Layout::eTransferDstOptimal, Layout::eShaderReadOnlyOptimal,
                 Stage::eCopy, Access::eTransferWrite, Stage::eFragmentShader, Access::eShaderRead),
     };
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
@@ -1423,13 +1536,13 @@ void CopyComposite(vk::CommandBuffer cmdbuf, VideoCore::TextureCache& texture_ca
         .pImageMemoryBarriers = to_read.data(),
     });
 
-    SanitizeColor(cmdbuf);
+    SanitizeColor(cmdbuf, sr.color);
     composite.copy_ok = true;
 
     // The UI layer drawn at the output size, left in TransferSrcOptimal (its next draw starts
     // from Undefined).
     composite.ui_full_ok = false;
-    if (!composite.ui_shadow || !EnsureSrImage(sr_ui_full, vk::Format::eR8G8B8A8Srgb,
+    if (!composite.ui_shadow || !EnsureSrImage(sr.ui_full, vk::Format::eR8G8B8A8Srgb,
                                                composite.shadow_width, composite.shadow_height)) {
         return;
     }
@@ -1437,7 +1550,7 @@ void CopyComposite(vk::CommandBuffer cmdbuf, VideoCore::TextureCache& texture_ca
         barrier(composite.ui_shadow, Layout::eColorAttachmentOptimal, Layout::eTransferSrcOptimal,
                 Stage::eColorAttachmentOutput, Access::eColorAttachmentWrite, Stage::eCopy,
                 Access::eTransferRead),
-        barrier(sr_ui_full.image, Layout::eUndefined, Layout::eTransferDstOptimal,
+        barrier(sr.ui_full.image, Layout::eUndefined, Layout::eTransferDstOptimal,
                 Stage::eAllCommands, Access::eNone, Stage::eCopy, Access::eTransferWrite),
     };
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
@@ -1449,10 +1562,10 @@ void CopyComposite(vk::CommandBuffer cmdbuf, VideoCore::TextureCache& texture_ca
         .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
         .extent = {composite.shadow_width, composite.shadow_height, 1},
     };
-    cmdbuf.copyImage(composite.ui_shadow, Layout::eTransferSrcOptimal, sr_ui_full.image,
+    cmdbuf.copyImage(composite.ui_shadow, Layout::eTransferSrcOptimal, sr.ui_full.image,
                      Layout::eTransferDstOptimal, full_region);
     const auto full_to_read =
-        barrier(sr_ui_full.image, Layout::eTransferDstOptimal, Layout::eShaderReadOnlyOptimal,
+        barrier(sr.ui_full.image, Layout::eTransferDstOptimal, Layout::eShaderReadOnlyOptimal,
                 Stage::eCopy, Access::eTransferWrite, Stage::eFragmentShader, Access::eShaderRead);
     cmdbuf.pipelineBarrier2(
         vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &full_to_read});
@@ -1461,37 +1574,104 @@ void CopyComposite(vk::CommandBuffer cmdbuf, VideoCore::TextureCache& texture_ca
 
 namespace {
 
+struct FsrDepthJob {
+    bool needed{};
+    vk::Sampler sampler;
+    vk::PipelineLayout layout;
+    vk::Pipeline pipeline;
+    vk::ImageView src_view;
+    vk::Image dst_image;
+    vk::ImageView dst_view;
+    u32 width{}, height{};
+};
+
+// sotc: the FSR Vulkan backend makes a D32 view of the depth resource described by the
+// FidelityFX format. A D32+stencil snapshot cannot be viewed as D32. Sample its original
+// depth aspect and provide the same depth values in a sampled single-channel color image.
+bool PrepareFsrDepthCopy(const FrameSlot& frame, SrRingSlot& sr, Fsr4::Image& input,
+                         FsrDepthJob& job) {
+    job = {};
+    input = {frame.depth, frame.depth_format, frame.width, frame.height};
+    if (frame.depth_format != vk::Format::eD32SfloatS8Uint) {
+        return true;
+    }
+    if (!EnsureSrImage(sr.depth_r32, vk::Format::eR32Sfloat, frame.width, frame.height)) {
+        return false;
+    }
+
+    const auto device = g_instance->GetDevice();
+    static const vk::Sampler sampler = device.createSampler({.magFilter = vk::Filter::eNearest,
+                                                             .minFilter = vk::Filter::eNearest,
+                                                             .maxLod = 0.f}).value;
+    static constexpr vk::DescriptorSetLayoutBinding bindings[] = {
+        {.binding = 0, .descriptorType = vk::DescriptorType::eCombinedImageSampler,
+         .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        {.binding = 1, .descriptorType = vk::DescriptorType::eStorageImage,
+         .descriptorCount = 1, .stageFlags = vk::ShaderStageFlagBits::eCompute},
+    };
+    static const auto set_layout = device.createDescriptorSetLayout(
+        {.flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptor,
+         .bindingCount = 2, .pBindings = bindings}).value;
+    static const auto layout = device.createPipelineLayout(
+        {.setLayoutCount = 1, .pSetLayouts = &set_layout}).value;
+    static const auto pipeline = [&] {
+        const auto module = CompileSPV(FSR_DEPTH_COPY_COMP, device);
+        const auto result = device.createComputePipeline(
+            {}, {.stage = {.stage = vk::ShaderStageFlagBits::eCompute,
+                           .module = module, .pName = "main"}, .layout = layout});
+        device.destroyShaderModule(module);
+        return result.value;
+    }();
+
+    job = {true, sampler, layout, pipeline, frame.depth_view, sr.depth_r32.image, sr.depth_r32.view,
+           frame.width, frame.height};
+    input = {sr.depth_r32.image, sr.depth_r32.format, sr.depth_r32.width, sr.depth_r32.height};
+    return true;
+}
+
+void RecordFsrDepthCopy(const FsrDepthJob& job, vk::CommandBuffer cmdbuf) {
+    if (!job.needed) {
+        return;
+    }
+    const auto transition = [&](vk::ImageLayout from, vk::ImageLayout to,
+                                vk::AccessFlags2 src, vk::AccessFlags2 dst) {
+        const vk::ImageMemoryBarrier2 barrier{
+            .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader, .srcAccessMask = src,
+            .dstStageMask = vk::PipelineStageFlagBits2::eComputeShader, .dstAccessMask = dst,
+            .oldLayout = from, .newLayout = to, .image = job.dst_image,
+            .subresourceRange = {.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                 .levelCount = 1, .layerCount = 1},
+        };
+        cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier});
+    };
+    transition(vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral,
+               vk::AccessFlagBits2::eNone, vk::AccessFlagBits2::eShaderStorageWrite);
+
+    const vk::DescriptorImageInfo depth{.sampler = job.sampler, .imageView = job.src_view,
+                                        .imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal};
+    const vk::DescriptorImageInfo output{.imageView = job.dst_view,
+                                         .imageLayout = vk::ImageLayout::eGeneral};
+    const vk::WriteDescriptorSet writes[] = {
+        {.dstBinding = 0, .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eCombinedImageSampler, .pImageInfo = &depth},
+        {.dstBinding = 1, .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eStorageImage, .pImageInfo = &output},
+    };
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, job.pipeline);
+    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, job.layout, 0, writes);
+    cmdbuf.dispatch((job.width + 7) / 8, (job.height + 7) / 8, 1);
+    transition(vk::ImageLayout::eGeneral, vk::ImageLayout::eShaderReadOnlyOptimal,
+               vk::AccessFlagBits2::eShaderStorageWrite, vk::AccessFlagBits2::eShaderSampledRead);
+}
+
 /// Upscale's AMD FSR path (SOTC_UPSCALER=fsr4): the same images and camera as DLSS.
-Upscaled UpscaleFsr(const FrameSlot& f, vk::CommandBuffer cmdbuf, Scheduler& scheduler,
-                    vk::ImageView ui_view, bool ui_full, u32 out_w, u32 out_h) {
-    if (!EnsureSrImage(sr_out, vk::Format::eR16G16B16A16Sfloat, out_w, out_h)) {
+Upscaled UpscaleFsr(const FrameSlot& f, SrRingSlot& sr, u32 slot_idx, vk::CommandBuffer cmdbuf,
+                    Scheduler& scheduler, vk::ImageView ui_view, bool ui_full, u32 out_w,
+                    u32 out_h) {
+    if (!EnsureSrImage(sr.out, vk::Format::eR16G16B16A16Sfloat, out_w, out_h)) {
         sr_prev = false;
         return {};
     }
-    const auto barrier = [](vk::ImageLayout from, vk::ImageLayout to,
-                            vk::PipelineStageFlags2 dst, vk::AccessFlags2 dst_access) {
-        return vk::ImageMemoryBarrier2{
-            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-            .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
-            .dstStageMask = dst,
-            .dstAccessMask = dst_access,
-            .oldLayout = from,
-            .newLayout = to,
-            .image = sr_out.image,
-            .subresourceRange{.aspectMask = vk::ImageAspectFlagBits::eColor,
-                              .baseMipLevel = 0,
-                              .levelCount = 1,
-                              .baseArrayLayer = 0,
-                              .layerCount = 1},
-        };
-    };
-    const auto to_general =
-        barrier(vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral,
-                vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderWrite);
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .imageMemoryBarrierCount = 1,
-        .pImageMemoryBarriers = &to_general,
-    });
     const sl::Constants& c = f.constants;
     // SOTC_FSR_JITTER (tests): 0 none, 2 x negated, 3 y negated, 4 both; else as DLSS has it.
     static const int jitter_mode = [] {
@@ -1499,10 +1679,14 @@ Upscaled UpscaleFsr(const FrameSlot& f, vk::CommandBuffer cmdbuf, Scheduler& sch
         return v ? std::atoi(v) : 1;
     }();
     Fsr4::Params p{};
-    p.color = {sr_color.image, sr_color.format, f.width, f.height};
-    p.depth = {f.depth, f.depth_format, f.width, f.height};
+    p.color = {sr.color.image, sr.color.format, f.width, f.height};
+    FsrDepthJob depth_job{};
+    if (!PrepareFsrDepthCopy(f, sr, p.depth, depth_job)) {
+        sr_prev = false;
+        return {};
+    }
     p.mvec = {f.mvec, f.mvec_format, f.width, f.height};
-    p.output = {sr_out.image, sr_out.format, out_w, out_h};
+    p.output = {sr.out.image, sr.out.format, out_w, out_h};
     p.render_width = f.width;
     p.render_height = f.height;
     p.out_width = out_w;
@@ -1522,8 +1706,148 @@ Upscaled UpscaleFsr(const FrameSlot& f, vk::CommandBuffer cmdbuf, Scheduler& sch
     p.z_far = c.cameraFar;
     p.fov_y = c.cameraFOV;
     p.depth_inverted = c.depthInverted == sl::Boolean::eTrue;
+    p.is_hdr = sr_hdr;
     p.reset = c.reset == sl::Boolean::eTrue || !sr_prev;
+
+    static const bool use_async_env = [] {
+        const char* v = std::getenv("SOTC_FSR_ASYNC");
+        return !v || v[0] != '0';
+    }();
+    if (use_async_env && EnsureAsyncFsr()) {
+        const vk::Semaphore draw_sema = scheduler.GetWorkSemaphore()->Handle();
+        const u64 draw_tick = scheduler.CurrentTick();
+        scheduler.MarkGpuFrameEnd();
+        SubmitInfo draw_submit{};
+        scheduler.Flush(draw_submit);
+
+        const u64 fsr_tick = ++async_fsr.next_tick;
+        async_fsr.slot_ticks[slot_idx] = fsr_tick;
+        const vk::CommandBuffer ac = async_fsr.cmdbufs[slot_idx];
+        const vk::Image out_img = sr.out.image;
+        const vk::ImageView out_view = sr.out.view;
+        scheduler.RunAfterSubmit([ac, draw_sema, draw_tick, fsr_tick, out_img, depth_job, p] {
+            const auto finish_tick = [&](bool signal_host) {
+                if (signal_host) {
+                    static_cast<void>(g_instance->GetDevice().signalSemaphore(
+                        vk::SemaphoreSignalInfo{.semaphore = async_fsr.sema, .value = fsr_tick}));
+                }
+                async_fsr.submitted_tick.store(fsr_tick, std::memory_order_release);
+                async_fsr.submitted_tick.notify_all();
+            };
+            if (ac.reset() != vk::Result::eSuccess ||
+                ac.begin(vk::CommandBufferBeginInfo{
+                    .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit}) !=
+                    vk::Result::eSuccess) {
+                ++sr_errors;
+                finish_tick(true);
+                return;
+            }
+            const auto barrier = [&](vk::ImageLayout from, vk::ImageLayout to,
+                                     vk::PipelineStageFlags2 src, vk::AccessFlags2 src_access,
+                                     vk::PipelineStageFlags2 dst, vk::AccessFlags2 dst_access) {
+                const vk::ImageMemoryBarrier2 b{
+                    .srcStageMask = src,
+                    .srcAccessMask = src_access,
+                    .dstStageMask = dst,
+                    .dstAccessMask = dst_access,
+                    .oldLayout = from,
+                    .newLayout = to,
+                    .image = out_img,
+                    .subresourceRange{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                                      .baseMipLevel = 0,
+                                      .levelCount = 1,
+                                      .baseArrayLayer = 0,
+                                      .layerCount = 1},
+                };
+                ac.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &b});
+            };
+            barrier(vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral,
+                    vk::PipelineStageFlagBits2::eNone, vk::AccessFlagBits2::eNone,
+                    vk::PipelineStageFlagBits2::eComputeShader |
+                        vk::PipelineStageFlagBits2::eTransfer,
+                    vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite);
+            RecordFsrDepthCopy(depth_job, ac);
+            if (!Fsr4::Dispatch(static_cast<VkCommandBuffer>(ac), p)) {
+                const u32 errors = ++sr_errors;
+                if (errors == 3) {
+                    std::fprintf(stderr, "SOTC FSR: 3 failures, super resolution off (FSR 1)\n");
+                }
+            }
+            barrier(vk::ImageLayout::eGeneral, vk::ImageLayout::eShaderReadOnlyOptimal,
+                    vk::PipelineStageFlagBits2::eComputeShader |
+                        vk::PipelineStageFlagBits2::eTransfer,
+                    vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eTransferWrite,
+                    vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderRead);
+            if (ac.end() != vk::Result::eSuccess) {
+                ++sr_errors;
+                finish_tick(true);
+                return;
+            }
+            const vk::TimelineSemaphoreSubmitInfo tl_info{
+                .waitSemaphoreValueCount = 1,
+                .pWaitSemaphoreValues = &draw_tick,
+                .signalSemaphoreValueCount = 1,
+                .pSignalSemaphoreValues = &fsr_tick,
+            };
+            const vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eAllCommands;
+            const vk::SubmitInfo submit_info{
+                .pNext = &tl_info,
+                .waitSemaphoreCount = 1,
+                .pWaitSemaphores = &draw_sema,
+                .pWaitDstStageMask = &wait_stage,
+                .commandBufferCount = 1,
+                .pCommandBuffers = &ac,
+                .signalSemaphoreCount = 1,
+                .pSignalSemaphores = &async_fsr.sema,
+            };
+            const vk::Result sr_res = g_instance->GetAsyncComputeQueue().submit(submit_info);
+            if (sr_res != vk::Result::eSuccess) {
+                std::fprintf(stderr, "SOTC FSR: async compute queue submit failed (%d)\n",
+                             static_cast<int>(sr_res));
+                if (sr_res == vk::Result::eErrorDeviceLost) {
+                    g_instance->ReportDeviceFault();
+                }
+                finish_tick(true);
+                return;
+            }
+            finish_tick(false);
+        });
+        sr_mode_name.store(Fsr4::Name(), std::memory_order_relaxed);
+        sr_prev = true;
+        sr_ring_idx = (sr_ring_idx + 1) % kSrRingSize;
+        return {out_view, ui_view, sky_bias_written ? f.bias_view : vk::ImageView{}, ui_full, false,
+                out_w, out_h, fsr_tick};
+    }
+
+    const auto barrier = [&](vk::ImageLayout from, vk::ImageLayout to,
+                             vk::PipelineStageFlags2 dst, vk::AccessFlags2 dst_access) {
+        return vk::ImageMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+            .dstStageMask = dst,
+            .dstAccessMask = dst_access,
+            .oldLayout = from,
+            .newLayout = to,
+            .image = sr.out.image,
+            .subresourceRange{.aspectMask = vk::ImageAspectFlagBits::eColor,
+                              .baseMipLevel = 0,
+                              .levelCount = 1,
+                              .baseArrayLayer = 0,
+                              .layerCount = 1},
+        };
+    };
+    const auto to_general =
+        barrier(vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral,
+                vk::PipelineStageFlagBits2::eAllCommands, vk::AccessFlagBits2::eShaderWrite);
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &to_general,
+    });
+    const u32 depth_query = scheduler.BeginGpuSpan(cmdbuf, "fsr_depth");
+    RecordFsrDepthCopy(depth_job, cmdbuf);
+    scheduler.EndGpuSpan(cmdbuf, depth_query);
     // The SDK records into the real command buffer (the recorder's cmdbuf is a fake handle).
+    const u32 dispatch_query = scheduler.BeginGpuSpan(cmdbuf, "fsr_dispatch");
     scheduler.RecordDeferred([p](vk::CommandBuffer real) {
         if (!Fsr4::Dispatch(static_cast<VkCommandBuffer>(real), p)) {
             const u32 errors = ++sr_errors;
@@ -1532,6 +1856,7 @@ Upscaled UpscaleFsr(const FrameSlot& f, vk::CommandBuffer cmdbuf, Scheduler& sch
             }
         }
     });
+    scheduler.EndGpuSpan(cmdbuf, dispatch_query);
     const auto done = barrier(vk::ImageLayout::eGeneral, vk::ImageLayout::eShaderReadOnlyOptimal,
                               vk::PipelineStageFlagBits2::eFragmentShader,
                               vk::AccessFlagBits2::eShaderRead);
@@ -1541,11 +1866,31 @@ Upscaled UpscaleFsr(const FrameSlot& f, vk::CommandBuffer cmdbuf, Scheduler& sch
     });
     sr_mode_name.store(Fsr4::Name(), std::memory_order_relaxed);
     sr_prev = true;
-    return {sr_out.view, ui_view, sky_bias_written ? f.bias_view : vk::ImageView{}, ui_full, false,
+    sr_ring_idx = (sr_ring_idx + 1) % kSrRingSize;
+    return {sr.out.view, ui_view, sky_bias_written ? f.bias_view : vk::ImageView{}, ui_full, false,
             out_w, out_h};
 }
 
 } // namespace
+
+vk::Semaphore FsrSemaphore() {
+    return async_fsr.ready ? async_fsr.sema : vk::Semaphore{};
+}
+
+void WaitFsrSubmitted(u64 tick) {
+    if (!tick || !async_fsr.ready) {
+        return;
+    }
+    u64 submitted = async_fsr.submitted_tick.load(std::memory_order_acquire);
+    while (submitted < tick) {
+        async_fsr.submitted_tick.wait(submitted, std::memory_order_acquire);
+        submitted = async_fsr.submitted_tick.load(std::memory_order_acquire);
+    }
+}
+
+void WaitFsrComplete(u64 tick) {
+    WaitFsrTick(tick);
+}
 
 Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& texture_cache,
                  Runtime& runtime, u32 width, u32 height) {
@@ -1566,25 +1911,28 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
         CopyComposite(cmdbuf, texture_cache, runtime);
         c = std::exchange(composite, Composite{});
     }
-    const bool copied = c.copy_ok && sr_color.width == f.width && sr_color.height == f.height;
+    SrRingSlot& sr = sr_ring[sr_ring_idx];
+    const u32 slot_idx = sr_ring_idx;
+    const bool copied = c.copy_ok && sr.color.width == f.width && sr.color.height == f.height;
     const bool inputs_ok = sr_fsr ? f.valid : f.sl_valid;
-    const bool ui_shadow = c.copy_ok && c.ui_full_ok && sr_ui_full.width == width &&
-                           sr_ui_full.height == height;
+    const bool ui_shadow = c.copy_ok && c.ui_full_ok && sr.ui_full.width == width &&
+                           sr.ui_full.height == height;
     // sotc: PS4 Pro mode draws its UI layer at the output size already: no unsharp on it (it put
     // dark fringes around the letters, 26 Oct)
-    const bool ui_full = ui_shadow || (c.copy_ok && sr_ui.width == width && sr_ui.height == height);
-    const vk::ImageView ui_view = ui_shadow ? sr_ui_full.view : sr_ui.view;
+    const bool ui_full =
+        ui_shadow || (c.copy_ok && sr.ui.width == width && sr.ui.height == height);
+    const vk::ImageView ui_view = ui_shadow ? sr.ui_full.view : sr.ui.view;
     if (ui_full && (!inputs_ok || !copied)) {
         // No DLSS inputs (splash, menus): the scene at the render size, the UI at the output size.
         sr_prev = false;
-        return {sr_color.view, ui_view, {}, true, true, sr_color.width, sr_color.height};
+        return {sr.color.view, ui_view, {}, true, true, sr.color.width, sr.color.height};
     }
     if (!inputs_ok || !copied) {
         static u32 skipped = 0;
         if (c.captured && inputs_ok && skipped++ < 5) {
             std::fprintf(stderr,
                          "SOTC DLSS: composite %ux%u, UI %ux%u, inputs %ux%u: not upscaled\n",
-                         sr_color.width, sr_color.height, sr_ui.width, sr_ui.height, f.width,
+                         sr.color.width, sr.color.height, sr.ui.width, sr.ui.height, f.width,
                          f.height);
         }
         sr_prev = false;
@@ -1612,7 +1960,7 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
     // takes that height, NGX refused every evaluate (0xbad00005) and the screen stayed black.
     u32 out_w = width, out_h = height;
     if (sr_fsr) {
-        return UpscaleFsr(f, cmdbuf, scheduler, ui_view, ui_full, width, height);
+        return UpscaleFsr(f, sr, slot_idx, cmdbuf, scheduler, ui_view, ui_full, width, height);
     }
     if (!SrModeFits(f.width, f.height, width, height) &&
         (f.width * 2 < width || f.height * 2 < height)) {
@@ -1621,7 +1969,7 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
     }
     sl::FrameToken* token = Token(f.index);
     if (!token || !SetSrOptions(f.width, f.height, out_w, out_h) ||
-        !EnsureSrImage(sr_out, vk::Format::eR16G16B16A16Sfloat, out_w, out_h)) {
+        !EnsureSrImage(sr.out, vk::Format::eR16G16B16A16Sfloat, out_w, out_h)) {
         sr_prev = false;
         return {};
     }
@@ -1648,7 +1996,7 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
         };
     };
     const std::array to_general{
-        barrier(sr_out.image, Layout::eUndefined, Layout::eGeneral, Stage::eAllCommands,
+        barrier(sr.out.image, Layout::eUndefined, Layout::eGeneral, Stage::eAllCommands,
                 Access::eNone, Stage::eAllCommands, Access::eShaderWrite),
     };
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
@@ -1656,11 +2004,11 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
         .pImageMemoryBarriers = to_general.data(),
     });
 
-    sl::Resource in = SlImage(sr_color.image, sr_color.memory, sr_color.view,
-                              Layout::eShaderReadOnlyOptimal, sr_color.format, f.width, f.height,
+    sl::Resource in = SlImage(sr.color.image, sr.color.memory, sr.color.view,
+                              Layout::eShaderReadOnlyOptimal, sr.color.format, f.width, f.height,
                               true);
-    sl::Resource out = SlImage(sr_out.image, sr_out.memory, sr_out.view, Layout::eGeneral,
-                               sr_out.format, out_w, out_h, true);
+    sl::Resource out = SlImage(sr.out.image, sr.out.memory, sr.out.view, Layout::eGeneral,
+                               sr.out.format, out_w, out_h, true);
     sl::Resource depth = SlImage(f.depth, f.depth_memory, f.depth_view,
                                  Layout::eShaderReadOnlyOptimal, f.depth_format, f.width, f.height,
                                  false);
@@ -1704,7 +2052,7 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
                          errors >= 3 ? ", super resolution off" : "");
         }
     });
-    const auto done = barrier(sr_out.image, Layout::eGeneral, Layout::eShaderReadOnlyOptimal,
+    const auto done = barrier(sr.out.image, Layout::eGeneral, Layout::eShaderReadOnlyOptimal,
                               Stage::eAllCommands, Access::eShaderWrite | Access::eShaderRead,
                               Stage::eFragmentShader, Access::eShaderRead);
     cmdbuf.pipelineBarrier2(vk::DependencyInfo{
@@ -1717,15 +2065,16 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
                      out_h);
     }
     sr_prev = true;
+    sr_ring_idx = (sr_ring_idx + 1) % kSrRingSize;
     // Debug: SOTC_DLSS_VIEW=input shows DLSS's colour input (render size, stretched).
     static const bool view_input = [] {
         const char* v = std::getenv("SOTC_DLSS_VIEW");
         return v && v[0] == 'i';
     }();
     if (view_input) {
-        return {sr_color.view, ui_view, {}, ui_full};
+        return {sr.color.view, ui_view, {}, ui_full};
     }
-    return {sr_out.view, ui_view, sky_bias_written ? f.bias_view : vk::ImageView{}, ui_full, false,
+    return {sr.out.view, ui_view, sky_bias_written ? f.bias_view : vk::ImageView{}, ui_full, false,
             out_w, out_h};
 }
 
@@ -2346,6 +2695,7 @@ void AfterPresent(u32 frame_id) {
 }
 
 void Suspend() {
+    WaitFsrTick(async_fsr.next_tick.load(std::memory_order_relaxed));
     if (supported && fg_on) {
         SetOptions(false);
     }

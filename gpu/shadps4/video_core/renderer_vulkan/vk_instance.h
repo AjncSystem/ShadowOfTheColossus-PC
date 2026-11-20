@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <span>
@@ -81,6 +82,18 @@ public:
     /// so vkQueuePresentKHR does not need Scheduler::submit_mutex.
     bool HasDedicatedPresentQueue() const {
         return dedicated_present_queue;
+    }
+
+    u32 GetAsyncComputeQueueFamilyIndex() const {
+        return async_compute_queue_family;
+    }
+
+    vk::Queue GetAsyncComputeQueue() const {
+        return async_compute_queue;
+    }
+
+    bool HasAsyncComputeQueue() const {
+        return has_async_compute_queue;
     }
 
     /// sotc: SOTC_CULL_QUEUE: a queue of the graphics family of its own for the visibility
@@ -291,7 +304,28 @@ public:
             const char* v = std::getenv("SOTC_AMD_WAVE32");
             return v && std::atoi(v) != 0;
         }();
-        return force && GetVendorID() == 0x1002;
+        if (!force || GetVendorID() != 0x1002) {
+            return false;
+        }
+        // sotc: honour SOTC_AMD_WAVE32 only when the driver can validly require 32 in compute.
+        const bool can_pin32 =
+            vk13_features.subgroupSizeControl && vk13_props.minSubgroupSize <= 32 &&
+            vk13_props.maxSubgroupSize >= 32 &&
+            bool(vk13_props.requiredSubgroupSizeStages & vk::ShaderStageFlagBits::eCompute);
+        if (!can_pin32) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                std::fprintf(stderr,
+                             "SOTC: SOTC_AMD_WAVE32 ignored (device cannot require 32 in compute: "
+                             "control=%d, min=%u, max=%u, stages=%#x)\n",
+                             int(vk13_features.subgroupSizeControl), vk13_props.minSubgroupSize,
+                             vk13_props.maxSubgroupSize,
+                             u32(vk13_props.requiredSubgroupSizeStages));
+            }
+            return false;
+        }
+        return true;
     }
 
     /// sotc: whether a required subgroup size may be given for this stage.
@@ -483,9 +517,19 @@ public:
         return vk11_props.maxMemoryAllocationSize;
     }
 
+    /// Returns the vulkan 1.1 physical device properties.
+    const vk::PhysicalDeviceVulkan11Properties& GetVk11Properties() const noexcept {
+        return vk11_props;
+    }
+
     /// Returns the vulkan 1.2 physical device properties.
     const vk::PhysicalDeviceVulkan12Properties& GetVk12Properties() const noexcept {
         return vk12_props;
+    }
+
+    /// Returns true if timeline semaphores are supported.
+    bool IsTimelineSemaphoreSupported() const {
+        return vk12_features.timelineSemaphore;
     }
 
     /// Returns the memory properties of the physical device.
@@ -555,6 +599,11 @@ public:
     bool Is2dViewOf3dSupported() const {
         return image_2d_view_of_3d && image_2d_view_of_3d_features.image2DViewOf3D &&
                image_2d_view_of_3d_features.sampler2DViewOf3D;
+    }
+
+    /// Returns whether VK_KHR_shader_maximal_reconvergence and VK_KHR_shader_quad_control are enabled.
+    bool IsShaderQuadControlSupported() const {
+        return shader_quad_control;
     }
 
     /// Returns whether VK_EXT_image_view_min_lod is supported.
@@ -630,6 +679,9 @@ private:
     bool dedicated_present_queue{};
     u32 present_queue_family{0};
     vk::Queue graphics_queue;
+    vk::Queue async_compute_queue;
+    u32 async_compute_queue_family{0};
+    bool has_async_compute_queue{false};
     vk::Queue cull_queue; ///< sotc: SOTC_CULL_QUEUE
     u32 cull_queue_index{}; ///< sotc: its index in the graphics family (0: none)
     std::vector<vk::PhysicalDevice> physical_devices;
@@ -663,6 +715,7 @@ private:
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
     bool shader_clock{};
+    bool shader_quad_control{};
     bool supports_memory_budget{};
     bool device_fault{};
     bool device_fault_vendor_binary{};

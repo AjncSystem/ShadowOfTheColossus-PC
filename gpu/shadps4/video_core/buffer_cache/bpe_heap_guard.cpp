@@ -428,15 +428,19 @@ bool BpeUsedBlocks::Covers(VAddr heap, VAddr addr, VAddr end, int* why,
     if (tail < (64ULL << 10) || tail > (16ULL << 20)) {
         tail = 1ULL << 20;
     }
-    if (fence && addr >= fence + HeaderSize && end <= fence + HeaderSize + tail &&
-        pieces && pieces->Overlaps(addr, end)) {
-        SotcStats::hg_piece[3].fetch_add(1, std::memory_order_relaxed);
-    } else if (fence && addr >= fence + HeaderSize && end <= fence + HeaderSize + tail) {
-        u64 size_flags = 0;
-        if (memory->TryReadBacking(fence + 8, &size_flags, sizeof(size_flags)) && size_flags == InUse) {
-            return true;
+    if (fence && addr >= fence + HeaderSize && end <= fence + HeaderSize + tail) {
+        if (!pieces) {
+            // Do not trust the unsplit tail shortcut if piece tracking is unavailable.
+        } else if (pieces->Overlaps(addr, end)) {
+            SotcStats::hg_piece[3].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            u64 size_flags = 0;
+            if (memory->TryReadBacking(fence + 8, &size_flags, sizeof(size_flags)) &&
+                size_flags == InUse) {
+                return true;
+            }
+            fence = 0;
         }
-        fence = 0;
     }
     auto it = std::upper_bound(blocks.begin(), blocks.end(), std::pair{addr, ~VAddr{0}});
     // why: 1 no block remembered there, 2 the write leaves the block, 3 block no longer in use
@@ -520,13 +524,9 @@ bool BpeHeapPieces::Refresh(VAddr heap) {
     const u64 new_count = field(0x58);
     const u64 new_unit = field(0xd0);
     const u64 total = field(0x30);
-    if (new_head == head && new_count == count && new_unit == unit && total == heap_size) {
-        return valid;
+    if (valid && new_head == head && new_count == count && new_unit == unit && total == heap_size) {
+        return true;
     }
-    head = new_head;
-    count = new_count;
-    unit = new_unit;
-    heap_size = total;
     valid = false;
     pieces.clear();
     initial_lo = initial_hi = 0;
@@ -563,6 +563,10 @@ bool BpeHeapPieces::Refresh(VAddr heap) {
         head = 0; // read again next time
         return false;
     }
+    head = new_head;
+    count = new_count;
+    unit = new_unit;
+    heap_size = total;
     const u64 longest = (1 + new_count - starts.size()) * MiB;
     std::sort(starts.begin(), starts.end());
     for (size_t i = 0; i < starts.size(); ++i) {

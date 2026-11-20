@@ -105,6 +105,7 @@ void ToggleSuperResolution();
 /// sotc: the tonemap's vignette (start, end, radius scale, strength), applied after DLSS instead.
 void NoteVignette(const float params[4]);
 bool Vignette(float out[4]);
+bool TakeVignette(float out[4]);
 
 void NoteComposite(VideoCore::ImageId scene_id, VideoCore::ImageId ui_id,
                    VideoCore::TextureCache& texture_cache);
@@ -125,7 +126,17 @@ struct Upscaled {
     bool ui_full{};      ///< ui is at the output size (UiTarget)
     bool scene_low{};    ///< scene is the render size scene (no DLSS inputs): scale it
     u32 scene_width{}, scene_height{}; ///< scene size (DLSS: below the output when it went 2x)
+    u64 async_fsr_tick{};              ///< non-zero when FSR runs on the async compute queue
 };
+
+/// Timeline semaphore signalled when an async FSR frame finishes.
+vk::Semaphore FsrSemaphore();
+
+/// Waits until the async FSR compute submission for tick has been queued on Vulkan.
+void WaitFsrSubmitted(u64 tick);
+
+/// Host wait until the async FSR compute submission for tick completes (no-op for tick == 0).
+void WaitFsrComplete(u64 tick);
 
 /// Command processor thread, in PrepareFrame after PrepareInputs: DLSS upscales this frame's
 /// scene to width x height. Empty when this frame has no composite or no inputs (menus,

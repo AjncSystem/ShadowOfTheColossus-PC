@@ -285,8 +285,7 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
     });
 }
 
-void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool any_overlap) {
-    std::scoped_lock lock{mutex};
+bool TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool any_overlap) {
     // sotc: SOTC_IMG_GPU_OVERLAP=1 also reuploads images inside a range a shader wrote as a
     // buffer, not only an image at its exact base (test for the empty 960x540 A2B10G10R10
     // lighting input behind the black shadows; it did not change the image, 2026-10-12).
@@ -301,15 +300,31 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool 
         const char* v = std::getenv("SOTC_DMA_OVERLAP");
         return !v || v[0] != '0';
     }();
+    if (!any_overlap && !overlap && max_size > 0 && max_size <= 4_MB) {
+        const auto pages_start = PageManager::GetPageAddr(address);
+        const auto pages_end = PageManager::GetNextPageAddr(address + max_size - 1);
+        bool any = false;
+        ForEachPage(pages_start, pages_end - pages_start, [&](u64 page) {
+            any = page >= NumImagePages || page_images[page].load(std::memory_order_acquire) != 0;
+            return any;
+        });
+        if (!any) {
+            return false;
+        }
+    }
+    std::scoped_lock lock{mutex};
+    bool visited = false;
     if (any_overlap && dma_overlap) {
         ForEachImageInRegion(address, max_size, [&](ImageId, Image& image) {
+            visited = true;
             if (image.Overlaps(address, max_size)) {
                 image.flags |= ImageFlagBits::GpuDirty;
             }
         });
-        return;
+        return visited;
     }
     ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
+        visited = true;
         // Only consider images that match base address.
         // sotc: a mip tail counts as written when its chain's base address is.
         if (image.info.guest_address != address &&
@@ -321,6 +336,7 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool 
         // Ensure image is reuploaded when accessed again.
         image.flags |= ImageFlagBits::GpuDirty;
     });
+    return visited;
 }
 
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {
@@ -735,6 +751,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
 
     auto& src_image = slot_images[image_id];
     auto& new_image = slot_images[new_image_id];
+    new_image.usage.vo_surface |= src_image.usage.vo_surface;
 
     // sotc: from upstream shadPS4 #5444. The old contents are carried over only when they hold
     // GPU-written data guest memory lacks. A CPU-dirty source is stale (a streamed texture
@@ -1691,11 +1708,41 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     return it->second.Handle();
 }
 
+void TextureCache::RegisterVoSurface(VAddr address, u32 width, u32 height) {
+    std::scoped_lock lock{mutex};
+    const auto it = std::ranges::find_if(
+        vo_surfaces, [address](const VoSurface& vo) { return vo.address == address; });
+    if (it != vo_surfaces.end()) {
+        it->width = width;
+        it->height = height;
+    } else {
+        vo_surfaces.push_back(VoSurface{address, width, height});
+    }
+    ForEachImageInRegion(address, 1, [&](ImageId, Image& image) {
+        if (image.info.guest_address == address && image.info.size.width == width &&
+            image.info.size.height == height) {
+            image.usage.vo_surface = 1u;
+        }
+    });
+}
+
+void TextureCache::UnregisterVoSurface(VAddr address) {
+    std::scoped_lock lock{mutex};
+    std::erase_if(vo_surfaces, [address](const VoSurface& vo) { return vo.address == address; });
+}
+
 void TextureCache::RegisterImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    for (const auto& vo : vo_surfaces) {
+        if (image.info.guest_address == vo.address && image.info.size.width == vo.width &&
+            image.info.size.height == vo.height) {
+            image.usage.vo_surface = 1u;
+            break;
+        }
+    }
     ++image_set_generation;
     ++addr_gens[AddrGenSlot(image.info.guest_address)]; // sotc: FindMemo per-address gen
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);
@@ -1899,6 +1946,9 @@ void TextureCache::EmergencyCollect(u32 level) {
             return true;
         }
         auto& image = slot_images[image_id];
+        if (image.usage.vo_surface) {
+            return false;
+        }
         if (image.SafeToDownload()) {
             if (image.info.IsTiled()) {
                 return false; // Can't download non-linear images yet

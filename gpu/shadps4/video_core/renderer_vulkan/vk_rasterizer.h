@@ -3,9 +3,12 @@
 
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <unordered_map>
+
+#include <boost/container/small_vector.hpp>
 
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
@@ -235,10 +238,37 @@ private:
     struct ViMemo {
         bool valid{};
         u32 invalidations{};
+        u64 last_vb_hash{};
         VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
         VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
     };
     ViMemo vi_memo;
+    struct VbMemoRange {
+        const VideoCore::Buffer* buffer{};
+        u64 offset{};
+        u64 size{};
+        VideoCore::CpuGenKey cpu_key{};
+    };
+    struct VbBindMemo {
+        bool valid{};
+        const GraphicsPipeline* pipeline{};
+        u32 step_rate_0{};
+        u32 step_rate_1{};
+        u32 ud_size{};
+        std::array<u32, 16> ud_data{};
+        u64 mem_epoch{};
+        u64 mem_gen{};
+        u64 buffer_gen{};
+        u64 vi_hash{};
+        boost::container::small_vector<vk::VertexInputBindingDescription2EXT, 8> bindings;
+        boost::container::small_vector<vk::VertexInputAttributeDescription2EXT, 8> attributes;
+        boost::container::small_vector<VbMemoRange, 8> merged_ranges;
+        u32 num_buffers{};
+        boost::container::small_vector<vk::Buffer, 8> host_buffers;
+        boost::container::small_vector<vk::DeviceSize, 8> host_offsets;
+    };
+    static constexpr u32 NumVbBindMemos = 256;
+    std::unique_ptr<VbBindMemo[]> vb_bind_memos;
     std::vector<u16> dyn_chunks; ///< register chunks UpdateDynamicState reads (built on first use)
     void UpdateViewportScissorState() const;
     void UpdateDepthStencilState() const;
@@ -266,6 +296,7 @@ private:
     /// only add the descriptor the memo remembers (no upload, no barrier, same view); else why not.
     u32 TexBindFastCheck(const TexBindMemoBinding& b, VideoCore::ImageId image_id);
     void TexBindFastApply(const TexBindMemoBinding& b, VideoCore::ImageId image_id);
+    void TexBindFastTransitApply(const TexBindMemoBinding& b, VideoCore::ImageId image_id);
     bool ReplayTexBindMemo(const Shader::Info& stage, TexBindMemo& memo,
                            const AmdGpu::Image* sharps,
                            boost::container::small_vector<u32, 8>& array_sizes,
@@ -282,7 +313,7 @@ private:
     void ResetBindings(bool is_compute);
     void CaptureTextures();
     static bool TaaOff(); ///< sotc: DLSS on or SOTC_TAA_OFF=1, vk_rasterizer.cpp
-    u32 CompositeUiIndex(); ///< sotc: which of the composite's two images is the UI layer
+    u32 CompositeUiIndex(VideoCore::ImageId first_id); ///< sotc: which of the composite's two images is the UI layer
     void MaybeDumpImages(u64 pgm_hash);
     void FlushPeriodic();
     u64 commands_tick{};
@@ -506,12 +537,34 @@ private:
     u64 df_next_token{1};
     bool df_rel_built{};
     static constexpr u32 NumTexBindMemos = 4096;
+    static constexpr u32 NumBufBindMemos = 16384;
     struct FreeDeleter {
         void operator()(void* p) const noexcept {
             std::free(p);
         }
     };
+    struct BufferBindMemo {
+        VAddr base_address{};
+        u64 raw_size{};
+        u64 mem_gen{};
+        u64 buffer_gen{};
+        u64 clamped_size{};
+        u64 gpu_sub_gen{};
+        u64 use_epoch{};
+        u64 no_img_gen{};
+        const VideoCore::Buffer* buffer{};
+        u64 offset{};
+        VideoCore::CpuGenKey cpu_key{};
+        bool is_written{};
+        bool valid_size{};
+        bool valid_buf{};
+    };
     std::unique_ptr<TexBindMemo[], FreeDeleter> tex_bind_memos; ///< zeroed pages, committed on use
+    std::unique_ptr<BufferBindMemo[], FreeDeleter> buf_bind_memos; ///< sotc: BbToggle::BufferBindMemo
+    BufferBindMemo* BufBindMemoSlot(VAddr addr, u64 raw_size, bool is_written = false);
+    std::pair<const VideoCore::Buffer*, u64> ObtainBufferMemo(
+        BufferBindMemo* memo, VAddr addr, u64 raw_size, u64 size, u64 mem_gen, bool is_written,
+        bool is_formatted);
     bool attachment_feedback_loop{};
     bool needs_barrier{};
     /// sotc: SOTC_DEPTH_RO. The depth buffer of this draw is sampled (depth aspect) while its
@@ -542,23 +595,62 @@ private:
     VAddr hudless_vo{};          ///< this draw: the video out image it renders to, 0 none
     vk::Format hudless_vo_format{};
     u32 hudless_vo_width{}, hudless_vo_height{};
-    /// sotc: descriptor state of the previous graphics draw (SOTC_FAST_BIND). Valid only while
-    /// the same command buffer, pipeline, push data and resource generations are current.
+    /// sotc: descriptor state of the previous graphics draw or compute dispatch (SOTC_FAST_BIND).
+    /// Graphics and Compute keep independent descriptor bindings on Vulkan; push constants track
+    /// which bind point last wrote them so interleaved draws/dispatches only refresh push data.
+    struct FastBindWritten {
+        VAddr addr{};
+        u64 size{};
+        u64 pgm_hash{};
+        const VideoCore::Buffer* buffer{};
+        u64 offset{};
+        u64 no_img_gen{};
+    };
+    struct FastBindRead {
+        const VideoCore::Buffer* buffer{};
+        u64 offset{};
+        u64 size{};
+    };
     struct FastBindState {
+        static constexpr u32 MaxWritten = 8;
+        static constexpr u32 MaxRead = 16;
         const Pipeline* pipeline{};
         u64 hash{};
         u64 buffer_generation{};
         u64 texture_generation{};
         u64 stream_generation{};
         u64 mem_epoch{}; ///< SotcStats::mem_epoch: guest memory unchanged since
+        u64 use_epoch{};
+        u64 gpu_sub_gen{};
         u64 tick{};
+        u32 dyn_invalidations{};
         bool uses_dma{};
         bool valid{};
+        bool has_tonemap_vignette{};
+        std::array<float, 4> tonemap_vignette{};
+        u32 written_count{};
+        u32 read_count{};
+        Shader::PushData bound_push_data{};
+        std::array<FastBindWritten, MaxWritten> written_bufs{};
+        std::array<FastBindRead, MaxRead> read_bufs{};
         boost::container::small_vector<u32, 8> lod_marks{}; ///< SotcLod banks the bind marked
     };
     boost::container::small_vector<u32, 8> lod_marks; ///< banks marked by the bind in progress
     FastBindState fast_bind{};
+    FastBindState fast_bind_compute{};
     bool fast_bind_hit{};
+    bool fast_bind_need_push{};
+    u64 fast_bind_push_tick{};
+    u32 fast_bind_push_invalidations{};
+    bool fast_bind_push_compute{};
+    u32 fast_bind_pending_written_count{};
+    u32 fast_bind_pending_read_count{};
+    std::array<FastBindWritten, FastBindState::MaxWritten> fast_bind_pending_written{};
+    std::array<FastBindRead, FastBindState::MaxRead> fast_bind_pending_read{};
+    bool fast_bind_pending_ok{};
+    bool fast_bind_pending_read_overflow{};
+    bool fast_bind_pending_has_vignette{};
+    std::array<float, 4> fast_bind_pending_vignette{};
 
     /// sotc: DLSS super resolution draws the game's UI layer at the output size: each draw into
     /// it (Dlssg::UiTarget) is drawn again into ui_shadow with its viewport and scissor scaled,

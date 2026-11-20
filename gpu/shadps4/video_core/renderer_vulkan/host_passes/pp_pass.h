@@ -37,9 +37,13 @@ public:
         /// sotc: hdr 1: the display's peak in nits; highlights roll off into it (BT.2390 EETF)
         /// instead of clipping. 0: no roll-off (as before).
         float hdr_peak = 0.0f;
-        /// sotc: hdr 1 with the UI layer (DLSS): nits of the UI's white, apart from the scene's
-        /// paper white. 0: the same as hdr_white.
+        /// sotc: hdr 1 with the UI layer: nits of the UI's white (pure white in menus and
+        /// subtitles), apart from the scene's paper white. 0: the game's own, 3 x hdr_white.
         float ui_white = 0.0f;
+        /// sotc: hdr 1: the brightest the scene can be in nits, from the game's tonemap limits
+        /// (vk_presenter.cpp SourcePeak); the roll-off compresses from it into hdr_peak instead
+        /// of from 10000 nits. 0: 10000.
+        float source_peak = 0.0f;
         /// sotc: hdr 1: picture controls on the scene, before the roll-off (RefreshHdrLevels).
         /// Each value here is neutral; all neutral leaves the picture as it was.
         float exposure = 1.0f;   ///< linear gain (2^EV)

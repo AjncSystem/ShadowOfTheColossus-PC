@@ -3,16 +3,20 @@
 //
 // The tonemap pass, before the HDR composite: scene (+ fog, depth of field, bloom) -> vignette ->
 // tint (flatbuf dwords 37..39) -> saturation (35) -> contrast (40) -> curve (mode in dword 20;
-// the game uses 5, x (A x + B) / (x (C x + D) + E) with A..E in dwords 28..32, then min 300) ->
-// gamma (36) and scale (44) -> per channel gamma (45..47), min 10 -> lift (41..43) to gain
-// (48..50) -> / scale.
+// the game uses 5, x (A x + B) / (x (C x + D) + E) with A..E in dwords 28..32, then min dword 33,
+// 300) -> gamma (36) and scale (44) -> per channel gamma (45..47), min 10 (a constant in the
+// shader) -> lift (41..43) to gain (48..50) -> / scale. So the pass outputs at most 10 / scale
+// (18 with the game's 0.556).
 //
 // The tone mapper choice only changes A..E, so it works on every upscaler path: the pass stays
 // the game's own, only its curve differs.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cmath>
+#include <limits>
 #include <vector>
 
 namespace SotcTonemap {
@@ -57,6 +61,63 @@ inline std::atomic<float> hue_curve[5]{};
 /// kRenoDrt: set at the tonemap draw: on when this frame's tonemap got kNone's line for it
 /// (hue_curve then holds the game's own A..E).
 inline std::atomic<bool> drt_on{false};
+
+/// Set at the tonemap draw: the most this frame's pass can output (its curve's limit and both
+/// caps, through its gamma and gain), in the HDR composite's units before its exponent; 0 unknown.
+/// The presenter turns it into the roll-off's source peak in nits.
+inline std::atomic<float> source_limit{0.0f};
+
+/// The pass's output cap for the tone mappers that draw kNone's line (kNone, kVanillaPlusHue,
+/// kRenoDrt), in place of 10 / scale = 18: the line's highlights were clipped there per channel
+/// (the sun, sky and water flat and their hues shifted) before the final pass's peak-aware curve
+/// ever saw them. 50 is past PQ's 10000 nits at any paper white from 67 nits.
+inline constexpr float kRaisedLimit = 50.0f;
+
+/// Raises the pass's caps to kRaisedLimit in a copy of its flatbuf. The min 10 is a constant in
+/// the shader but sits between `* scale` and `/ scale`: a smaller scale lifts it and, with
+/// per-channel gamma 1 and lift 0 (the game's values), leaves everything below it unchanged.
+inline bool RaiseCaps(std::vector<unsigned>& flat) {
+    if (flat.size() <= 50) {
+        return false;
+    }
+    const auto get = [&](unsigned d) { return std::bit_cast<float>(flat[d]); };
+    const auto put = [&](unsigned d, float v) { flat[d] = std::bit_cast<unsigned>(v); };
+    for (unsigned d = 45; d <= 47; ++d) {
+        if (get(d) != 1.0f) {
+            return false;
+        }
+    }
+    for (unsigned d = 41; d <= 43; ++d) {
+        if (get(d) != 0.0f) {
+            return false;
+        }
+    }
+    const float scale = get(44), gain = std::max({get(48), get(49), get(50)});
+    if (!(scale > 0.0f) || !(gain > 0.0f)) {
+        return false;
+    }
+    put(44, std::min(scale, 10.0f * gain / kRaisedLimit));
+    put(33, std::max(get(33), 1.0e4f)); // the curve's own cap (300)
+    return true;
+}
+
+/// The most the pass outputs with these constants (see source_limit). Tint, saturation and
+/// contrast are left out (the game's tint lowers it).
+inline float OutputLimit(const unsigned* flat, size_t size) {
+    if (size <= 50 || flat[20] != 5u) {
+        return 0.0f;
+    }
+    const auto get = [&](unsigned d) { return std::bit_cast<float>(flat[d]); };
+    const float A = get(28), C = get(30);
+    float lim = C > 0.0f ? A / C : std::numeric_limits<float>::infinity();
+    lim = std::min(lim, get(33));
+    const float scale = get(44), gain = std::max({get(48), get(49), get(50)});
+    if (!(scale > 0.0f) || !std::isfinite(lim)) {
+        return 0.0f;
+    }
+    lim = std::min(10.0f, scale * std::pow(lim, get(36))) * gain / scale;
+    return std::isfinite(lim) ? lim : 0.0f;
+}
 
 /// Vanilla+'s ceiling (the curve's limit A / C). With the game's scale 0.556 it stays under the
 /// pass's min 10 cap (16 * 0.556 = 8.9), so the final pass's roll-off shapes the highlights.

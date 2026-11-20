@@ -59,9 +59,10 @@ namespace Vulkan {
 // shared queue the sites take Scheduler::submit_mutex as well.
 static std::mutex present_queue_mutex;
 
-// sotc: game HDR levels, in nits. At start: the launcher's settings (hdr_white, hdr_peak, hdr_ui,
-// written by the F1 menu), else SOTC_HDR_WHITE / SOTC_HDR_PEAK / SOTC_HDR_UI, else 200 / auto /
-// the paper white. Peak 0 is auto (what Windows reports for the HDR display, 1000 when it reports
+// sotc: game HDR levels, in nits. At start: the launcher's settings (hdr_white, hdr_peak,
+// hdr_ui_nits, written by the F1 menu), else SOTC_HDR_WHITE / SOTC_HDR_PEAK / SOTC_HDR_UI_NITS,
+// else 200 / auto / the game's UI white (3x the paper white). The old hdr_ui / SOTC_HDR_UI
+// multiplied the game's UI (white at 3x it), so its value counts 3x as nits. Peak 0 is auto (what Windows reports for the HDR display, 1000 when it reports
 // nothing); 10000 or more turns the roll-off off. While playing the F1 menu's values (sotc_live.h)
 // take their place.
 static float HdrLevel(const char* key, const char* env, float fallback) {
@@ -90,14 +91,16 @@ static void RefreshHdrLevels(HostPasses::PostProcessingPass::Settings& s) {
         Start st{};
         st.white = std::clamp(HdrLevel("hdr_white", "SOTC_HDR_WHITE", 200.0f), 40.0f, 1000.0f);
         st.peak = std::max(HdrLevel("hdr_peak", "SOTC_HDR_PEAK", 0.0f), 0.0f);
-        st.ui = std::max(HdrLevel("hdr_ui", "SOTC_HDR_UI", 0.0f), 0.0f);
+        st.ui = std::max(HdrLevel("hdr_ui_nits", "SOTC_HDR_UI_NITS",
+                                  3.0f * HdrLevel("hdr_ui", "SOTC_HDR_UI", 0.0f)),
+                         0.0f);
         const float reported = SotcDisplayPeakNits();
         st.auto_peak = reported >= 200.0f ? reported : 1000.0f;
         LOG_INFO(Render_Vulkan,
                  "SOTC HDR: game brightness {} nits, peak {} (display reports {} nits), UI "
                  "brightness {}",
                  st.white, st.peak > 0.0f ? std::to_string(st.peak) : std::string("auto"), reported,
-                 st.ui > 0.0f ? std::to_string(st.ui) : std::string("= game brightness"));
+                 st.ui > 0.0f ? std::to_string(st.ui) : std::string("the game's (3x)"));
         return st;
     }();
     const float live_white = SotcLive::hdr_white.load(std::memory_order_relaxed);
@@ -187,6 +190,27 @@ static void RefreshHdrLevels(HostPasses::PostProcessingPass::Settings& s) {
     }
     // The RenoDRT-style curve, when this frame's tonemap drew its line.
     s.drt = !compare && SotcTonemap::drt_on.load(std::memory_order_acquire) ? 1u : 0u;
+    // The roll-off's source peak: the brightest the tonemap outputs, through the composite's
+    // exponent (and Vanilla+'s ceiling for the hue-preserving curve), at the paper white and the
+    // exposure. 0 (unknown): the shader assumes 10000 nits.
+    s.source_peak = 0.0f;
+    if (const float limit = SotcTonemap::source_limit.load(std::memory_order_relaxed);
+        limit > 0.0f) {
+        float units = std::pow(limit, std::max(Dlssg::HdrCurve(), 0.1f));
+        if (s.hue_e > 0.0f && !s.drt && s.hue_c > 0.0f) {
+            units = std::min(units, s.hue_a / s.hue_c);
+        }
+        const float nits = 3.0f * s.hdr_white * units * std::max(s.exposure, 1.0f);
+        s.source_peak = std::isfinite(nits) ? std::min(nits, 10000.0f) : 0.0f;
+    }
+    static float logged_source = -1.0f;
+    if (std::fabs(s.source_peak - logged_source) > 0.05f * std::max(logged_source, 1.0f)) {
+        logged_source = s.source_peak;
+        std::fprintf(stderr, "SOTC HDR: roll-off from %g nits into %g (tonemap limit %g), UI white %g\n",
+                     s.source_peak > 0.0f ? s.source_peak : 10000.0f, s.hdr_peak,
+                     SotcTonemap::source_limit.load(std::memory_order_relaxed),
+                     s.ui_white > 0.0f ? s.ui_white : 3.0f * s.hdr_white);
+    }
 
     // Tone mapper (launcher hdr_tonemap / SOTC_HDR_TONEMAP: vanilla, vanilla_plus, none) and the
     // strength of the game's colour grading (hdr_grading / SOTC_HDR_GRADING, percent, 100 = the

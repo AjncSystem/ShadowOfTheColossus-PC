@@ -31,7 +31,7 @@ struct GpuSettings {
     float grain;
     u32 seed;
     std::array<float, 4> vignette;
-    float ui_sharpen, sky_sharpen, hdr_white, hdr_curve, paper_white, highlight_gain, hdr_peak,
+    float ui_sharpen, sky_sharpen, hdr_white, hdr_curve, source_peak, highlight_gain, hdr_peak,
         ui_white;
     float exposure, contrast, shadows, highlights, saturation, blowout, flare, gamma_correction,
         highlight_saturation;
@@ -58,9 +58,10 @@ static GpuSettings Pack(const PostProcessingPass::Settings& s) {
         .vignette = s.vignette,
         .ui_sharpen = s.ui_sharpen,
         .sky_sharpen = s.sky_sharpen,
-        .hdr_white = s.hdr_white,
+        // hdr 2 (SDR game on HDR10) has its SDR white in the paper white's place.
+        .hdr_white = s.hdr == 2 ? s.paper_white : s.hdr_white,
         .hdr_curve = s.hdr_curve,
-        .paper_white = s.paper_white,
+        .source_peak = s.source_peak,
         .highlight_gain = s.highlight_gain,
         .hdr_peak = s.hdr_peak,
         .ui_white = s.ui_white,

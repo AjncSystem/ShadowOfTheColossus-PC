@@ -869,14 +869,23 @@ void BuildItems() {
                   "hdr_peak", SotcLive::hdr_peak, "SOTC_HDR_PEAK", 0.0f, peaks)
             .slider = true;
         std::vector<std::pair<float, std::string>> uis{
-            {0.0f, L("Igual ao brilho do jogo", "Same as game brightness")}};
-        for (int v = 50; v <= 500; v += 10) {
+            {0.0f, L("O do jogo (3x o brilho do jogo)", "The game's (3x game brightness)")}};
+        for (int v = 50; v <= 1000; v += 10) {
             uis.push_back({float(v), std::to_string(v) + " " + nits});
         }
+        // The old hdr_ui / SOTC_HDR_UI scaled the game's UI (white at 3x it): 3x as nits.
+        const float legacy_ui = [] {
+            std::string v = LoadLauncherSetting("hdr_ui");
+            if (v.empty()) {
+                const char* e = std::getenv("SOTC_HDR_UI");
+                v = e ? e : "";
+            }
+            return v.empty() ? 0.0f : 3.0f * std::max(0.0f, static_cast<float>(std::atof(v.c_str())));
+        }();
         add_level(L("HDR: brilho da interface", "HDR: UI brightness"),
-                  L("O brilho de menus, legendas e HUD em nits, separado do mundo. Arraste a barra ou use ◀ ▶.",
-                    "The brightness of menus, subtitles and HUD in nits, apart from the world. Drag the bar or use ◀ ▶."),
-                  "hdr_ui", SotcLive::hdr_ui, "SOTC_HDR_UI", 0.0f, uis)
+                  L("O branco de menus, legendas e HUD em nits, separado do mundo. Arraste a barra ou use ◀ ▶.",
+                    "The white of menus, subtitles and HUD in nits, apart from the world. Drag the bar or use ◀ ▶."),
+                  "hdr_ui_nits", SotcLive::hdr_ui, "SOTC_HDR_UI_NITS", legacy_ui, uis)
             .slider = true;
 
         // Picture controls (sotc_live.h hdr_grade): neutral by default, on the world only.

@@ -28,7 +28,7 @@ inline std::atomic<float> grass[5]{-1.f, -1.f, -1.f, -1.f, -1.f};
 
 /// Game HDR levels in nits (vk_presenter.cpp): the scene's paper white (SOTC_HDR_WHITE), the
 /// display's peak (SOTC_HDR_PEAK, 0 = the value Windows reports) and the UI's white
-/// (SOTC_HDR_UI, 0 = the paper white). Below 0: the value read at start.
+/// (SOTC_HDR_UI_NITS, 0 = the game's, 3x the paper white). Below 0: the value read at start.
 inline std::atomic<float> hdr_white{-1.f};
 inline std::atomic<float> hdr_peak{-1.f};
 inline std::atomic<float> hdr_ui{-1.f};

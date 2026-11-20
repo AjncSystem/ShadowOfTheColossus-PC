@@ -3773,6 +3773,13 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     SotcTonemap::hue_curve_on.store(hue_curve, std::memory_order_release);
                     SotcTonemap::drt_on.store(curved && tm == SotcTonemap::kRenoDrt,
                                               std::memory_order_release);
+                    // sotc: the line's highlights reach the final pass's curve uncut.
+                    if (curved && (tm == SotcTonemap::kNone || hue_curve)) {
+                        SotcTonemap::RaiseCaps(tonemap_flat);
+                    }
+                    SotcTonemap::source_limit.store(
+                        SotcTonemap::OutputLimit(flat, stage.FlatBuf().size()),
+                        std::memory_order_relaxed);
                     static int logged_tm = -1;
                     const int now_tm = curved ? tm : SotcTonemap::kVanilla;
                     if (tonemap_log && now_tm != logged_tm) {

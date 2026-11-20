@@ -32,10 +32,10 @@ layout (push_constant) uniform settings {
     float sky_sharpen; // sotc: unsharp amount in the sky
     float hdr_white; // sotc: HDR paper white in nits
     float hdr_curve; // sotc: exponent of the game's HDR composite
-    float paper_white; // sotc: hdr 2: nits of SDR white
+    float source_peak; // sotc: hdr 1: the scene's brightest in nits (0: 10000)
     float highlight_gain; // sotc: hdr 2: gain of the highlights
     float hdr_peak; // sotc: hdr 1: the display's peak in nits (0: no roll-off)
-    float ui_white; // sotc: hdr 1 with the UI layer: nits of the UI's white (0: hdr_white)
+    float ui_white; // sotc: hdr 1 with the UI layer: nits of the UI's white (0: the game's, 3 hdr_white)
     // sotc: hdr 1: picture controls on the scene (grade()); the defaults are neutral.
     float exposure;   // linear gain (1)
     float contrast;   // power on luminance around mid grey (1)
@@ -76,7 +76,7 @@ float triNoise(uint salt) {
 }
 
 // sotc: linear Rec.709 -> HDR10 (Rec.2020 primaries, ST 2084 PQ) for an SDR game. SDR white sits at
-// paper_white nits; the highlights get up to highlight_gain times that, smoothly.
+// hdr_white nits; the highlights get up to highlight_gain times that, smoothly.
 vec3 sdrToHdr10(vec3 lin) {
     lin = max(lin, 0.0);
     const float peak = max(lin.r, max(lin.g, lin.b));
@@ -85,7 +85,7 @@ vec3 sdrToHdr10(vec3 lin) {
     const mat3 to2020 = mat3(0.6274, 0.0691, 0.0164,
                              0.3293, 0.9195, 0.0880,
                              0.0433, 0.0114, 0.8956);
-    const vec3 y = clamp(to2020 * lin * pp.paper_white / 10000.0, 0.0, 1.0);
+    const vec3 y = clamp(to2020 * lin * pp.hdr_white / 10000.0, 0.0, 1.0);
     const vec3 p = pow(y, vec3(0.1593017578125));
     return pow((0.8359375 + 18.8515625 * p) / (1.0 + 18.6875 * p), vec3(78.84375));
 }
@@ -127,10 +127,15 @@ vec3 pqEncode(vec3 nits) {
     const vec3 y = pow(clamp(nits / 10000.0, 0.0, 1.0), vec3(m1));
     return pow((c1 + c2 * y) / (1.0 + c3 * y), vec3(m2));
 }
-// sotc: BT.2390 EETF on the brightest channel: the scene, scaled to the paper white, goes up to
-// 10000 nits and used to clip at the display's peak (blown-out sun, sky and water). Below the
-// knee (about half the peak in PQ) nothing changes; above it the highlights roll off smoothly into
-// hdr_peak. The RGB ratio is kept, so hues do not shift as they brighten.
+// sotc: BT.2390 EETF on the brightest channel: the scene, scaled to the paper white, used to clip
+// at the display's peak (blown-out sun, sky and water). Below the knee nothing changes; above it
+// the highlights roll off smoothly into hdr_peak. The RGB ratio is kept, so hues do not shift as
+// they brighten. The curve spans the scene's real range (source_peak: the game's tonemap limits
+// it to ~2000 nits at the default brightness), not all of PQ's 10000 nits: assuming 10000 put the
+// knee at ~290 nits on a 1000-nit display and ~80 on a 400-nit one, compressing mid tones the
+// display could show. The knee also never goes below the paper white (or half the peak): where
+// BT.2390's would, a rational shoulder from there replaces its Hermite spline (which overshoots
+// with a higher knee).
 float pqEncode1(float nits) {
     const float y = pow(clamp(nits / 10000.0, 0.0, 1.0), m1);
     return pow((c1 + c2 * y) / (1.0 + c3 * y), m2);
@@ -143,17 +148,32 @@ float eetf1(float nits) {
     if (pp.hdr_peak <= 0.0 || nits <= 0.0) {
         return max(nits, 0.0);
     }
-    const float e = pqEncode1(nits);
-    const float max_lum = pqEncode1(pp.hdr_peak);
-    const float ks = 1.5 * max_lum - 0.5;
-    if (e <= ks) {
-        return nits;
+    const float src = pqEncode1(pp.source_peak > 0.0 ? max(pp.source_peak, pp.hdr_peak) : 10000.0);
+    const float max_lum = pqEncode1(pp.hdr_peak) / src;
+    if (max_lum >= 0.9999) { // the display shows the whole range: nothing to roll off
+        return min(nits, pp.hdr_peak);
     }
-    const float t = (e - ks) / (1.0 - ks);
-    const float t2 = t * t, t3 = t2 * t;
-    const float e2 = (2.0 * t3 - 3.0 * t2 + 1.0) * ks + (t3 - 2.0 * t2 + t) * (1.0 - ks) +
-                     (-2.0 * t3 + 3.0 * t2) * max_lum;
-    return min(pqDecode1(e2), pp.hdr_peak);
+    const float e = min(pqEncode1(nits) / src, 1.0);
+    const float ks = 1.5 * max_lum - 0.5;
+    const float floor_ks = pqEncode1(min(pp.hdr_white, 0.5 * pp.hdr_peak)) / src;
+    float e2;
+    if (ks >= floor_ks) {
+        if (e <= ks) {
+            return nits;
+        }
+        const float t = (e - ks) / (1.0 - ks);
+        const float t2 = t * t, t3 = t2 * t;
+        e2 = (2.0 * t3 - 3.0 * t2 + 1.0) * ks + (t3 - 2.0 * t2 + t) * (1.0 - ks) +
+             (-2.0 * t3 + 3.0 * t2) * max_lum;
+    } else {
+        if (e <= floor_ks) {
+            return nits;
+        }
+        // x / (1 + a x): slope 1 at the knee, max_lum exactly at the source's peak, monotonic.
+        const float x = e - floor_ks, w = 1.0 - floor_ks, d = max_lum - floor_ks;
+        e2 = floor_ks + x / (1.0 + (1.0 / d - 1.0 / w) * x);
+    }
+    return min(pqDecode1(e2 * src), pp.hdr_peak);
 }
 vec3 rollOff(vec3 nits) {
     nits = max(nits, vec3(0.0));
@@ -483,8 +503,9 @@ vec4 shade() {
             const vec3 lin_scene = rec709to2020 * (lin_all * (1.0 - ui_share));
             vec3 nits = hdrScene(3.0 * pp.hdr_white * hueCurve(lin_scene));
             if (ui.a > 0.0) {
-                const float ui_white = pp.ui_white > 0.0 ? pp.ui_white : pp.hdr_white;
-                nits += 3.0 * ui_white * (rec709to2020 * (lin_all * ui_share));
+                // The UI's white in nits; the game's own puts it at 3x the paper white.
+                const float ui_white = pp.ui_white > 0.0 ? pp.ui_white : 3.0 * pp.hdr_white;
+                nits += ui_white * (rec709to2020 * (lin_all * ui_share));
                 if (pp.hdr_peak > 0.0) nits = min(nits, vec3(pp.hdr_peak));
             }
             return vec4(pqEncode(nits), 1.0);

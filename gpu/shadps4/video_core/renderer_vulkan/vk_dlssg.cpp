@@ -1117,6 +1117,20 @@ bool SuperResolution() {
     return sr_supported && !sr_user_off.load(std::memory_order_relaxed);
 }
 
+std::atomic<bool> split_wanted{false};
+
+void SetSplitComposite(bool on) {
+    static const bool allowed = [] {
+        const char* v = std::getenv("SOTC_FSR1_SPLIT");
+        return !v || v[0] != '0';
+    }();
+    split_wanted.store(on && allowed, std::memory_order_relaxed);
+}
+
+bool CompositeWanted() {
+    return SuperResolution() || split_wanted.load(std::memory_order_relaxed);
+}
+
 // sotc: the last frame's input was not smaller than the output (Upscale), so DLSS took no frame.
 std::atomic<bool> sr_declined{false};
 
@@ -1216,7 +1230,7 @@ bool Vignette(float out[4]) {
 
 void NoteComposite(VideoCore::ImageId scene_id, VideoCore::ImageId ui_id,
                    VideoCore::TextureCache& texture_cache) {
-    if (!SuperResolution()) {
+    if (!CompositeWanted()) {
         return;
     }
     composite.captured = true;
@@ -1555,6 +1569,20 @@ Upscaled Upscale(u32 frame_id, Scheduler& scheduler, VideoCore::TextureCache& te
     }
     if (!SuperResolution() || frame_id >= kMaxFrames) {
         sr_prev = false;
+        // sotc: SetSplitComposite: the scene (render size, linear fp16) and the UI layer apart,
+        // for the presenter's FSR 1 and its own UI composite.
+        if (!SuperResolution() && split_wanted.load(std::memory_order_relaxed) && c.captured) {
+            if (!c.copied) {
+                composite = c;
+                CopyComposite(scheduler.CommandBuffer(), texture_cache, runtime);
+                c = std::exchange(composite, Composite{});
+            }
+            if (c.copy_ok) {
+                const bool ui_full = sr_ui.width == width && sr_ui.height == height;
+                return {sr_color.view, sr_ui.view, {}, ui_full, true, sr_color.width,
+                        sr_color.height};
+            }
+        }
         return {};
     }
     out_width = width;

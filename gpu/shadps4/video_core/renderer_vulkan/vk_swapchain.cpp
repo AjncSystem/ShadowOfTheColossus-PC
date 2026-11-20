@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <bit>
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
@@ -9,6 +10,7 @@
 #include "core/emulator_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
+#include "bbport_overlay.h"
 #include "video_core/renderer_vulkan/vk_dlssg.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
@@ -81,6 +83,7 @@ void Swapchain::Create(u32 width_, u32 height_) {
 
     SetupImages();
     RefreshSemaphores();
+    hdr_meta_applied = ~0ull; // sotc: a new swapchain has no metadata yet
 }
 
 void Swapchain::Recreate(u32 width_, u32 height_) {
@@ -104,6 +107,8 @@ void Swapchain::SetHDR(bool hdr) {
     Recreate(width, height);
     ImGui::Core::OnSurfaceFormatChange(needs_hdr ? SURFACE_FORMAT_HDR.format
                                                  : surface_format.format);
+    // sotc: the in-game menu's pipeline and colour encoding follow the swapchain.
+    BbOverlay::OnSurfaceFormatChange(GetSurfaceFormat().format);
 }
 
 bool Swapchain::AcquireNextImage() {
@@ -131,7 +136,48 @@ bool Swapchain::AcquireNextImage() {
     return !needs_recreation;
 }
 
+// sotc: the game HDR's mastering metadata (HDR10 static metadata): Rec.2020 primaries, D65, the
+// peak the roll-off targets as max luminance and max content light level, the game brightness as
+// the frame average. Displays that tone map by themselves (not HGIG) then leave our range alone.
+void Swapchain::SetHdrMetadata(float peak_nits, float average_nits) {
+    const u64 packed =
+        (u64(std::bit_cast<u32>(peak_nits)) << 32) | std::bit_cast<u32>(average_nits);
+    hdr_meta_wanted.store(packed, std::memory_order_relaxed);
+}
+
+void Swapchain::ApplyHdrMetadata() {
+    const u64 wanted = hdr_meta_wanted.load(std::memory_order_relaxed);
+    if (!needs_hdr || wanted == 0 || wanted == hdr_meta_applied) {
+        return;
+    }
+    if (!instance.IsHdrMetadataSupported()) {
+        static bool reported = false;
+        if (!std::exchange(reported, true)) {
+            std::fprintf(stderr, "SOTC HDR metadata: VK_EXT_hdr_metadata unavailable\n");
+        }
+        hdr_meta_applied = wanted;
+        return;
+    }
+    hdr_meta_applied = wanted;
+    const float peak = std::bit_cast<float>(u32(wanted >> 32));
+    const float average = std::bit_cast<float>(u32(wanted));
+    const vk::HdrMetadataEXT metadata{
+        .displayPrimaryRed = {0.708f, 0.292f},
+        .displayPrimaryGreen = {0.170f, 0.797f},
+        .displayPrimaryBlue = {0.131f, 0.046f},
+        .whitePoint = {0.3127f, 0.3290f},
+        .maxLuminance = peak,
+        .minLuminance = 0.0f,
+        .maxContentLightLevel = peak,
+        .maxFrameAverageLightLevel = std::min(average, peak),
+    };
+    instance.GetDevice().setHdrMetadataEXT(swapchain, metadata);
+    std::fprintf(stderr, "SOTC HDR metadata: peak %g nits, frame average %g nits\n", peak,
+                 std::min(average, peak));
+}
+
 bool Swapchain::Present() {
+    ApplyHdrMetadata();
     const vk::PresentInfoKHR present_info = {
         .waitSemaphoreCount = 1,
         .pWaitSemaphores = &present_ready[image_index],

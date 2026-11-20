@@ -28,12 +28,14 @@
 #include "stb_image.h"
 #include <unordered_map>
 #include "imgui_impl_vulkan.h"
+#include "video_core/host_shaders/overlay_hdr_frag.h"
 #include "video_core/renderer_vulkan/vk_framegen.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/sotc_fps_cap.h"
 #include "video_core/sotc_event.h"
 #include "video_core/sotc_live.h"
+#include "video_core/sotc_tonemap.h"
 #include "video_core/sotc_ui_lang.h"
 #include "video_core/sotc_stats.h"
 
@@ -514,11 +516,13 @@ struct MenuItem {
     std::function<bool()> enabled;
     bool restart = false;                  // ◆: read when the game starts
     bool action = false;                   // a button (one choice that runs something)
+    bool slider = false;                   // a range: a bar, no wrap-around, click or drag to set
 };
 
 std::vector<MenuItem> items;
 int items_lang = -1;
 std::atomic<int> pending_fullscreen{-1}; // the menu's choice, for the window thread (UpdateTextInput)
+int slider_drag = -1;               // the slider row (index in items) the mouse is dragging
 int menu_tab = kTabDisplay;
 std::array<int, kTabCount> menu_row{};
 std::array<int, kTabCount> menu_first{};
@@ -526,6 +530,15 @@ bool menu_pad = false;              // the last menu input came from a controlle
 bool stick_x[2]{}, stick_y[2]{};    // the left stick's held directions (-, +)
 enum MenuInput { kInUp, kInDown, kInLeft, kInRight, kInActivate, kInTabPrev, kInTabNext };
 std::vector<int> menu_inputs;       // from HandleEvent, applied by DrawMenu (render thread)
+// A controller's left / right held down (d-pad or stick): on a slider row it repeats, as a held key
+// does, after a pause. -1 left, +1 right, 0 none.
+int pad_hold = 0;
+std::chrono::steady_clock::time_point pad_hold_next{};
+
+void PadHold(int direction) {
+    pad_hold = direction;
+    pad_hold_next = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+}
 
 int IndexOf(const std::vector<MenuChoice>& choices, const std::string& value) {
     for (size_t i = 0; i < choices.size(); ++i) {
@@ -721,12 +734,44 @@ void BuildItems() {
                 },
                 [](int i) { SetRcas(i); });
     }
-    AddRestart(kTabDisplay, "dlss_sharpen", L("Nitidez do DLSS / FSR 4", "DLSS / FSR 4 sharpening"),
-               L("O realce de nitidez depois do DLSS ou do FSR 4.", "The sharpening after DLSS or FSR 4."),
-               Quoted({{"0", L("Alta (padrão)", "High (default)")}, {"0.5", L("Média", "Medium")},
-                       {"1", L("Baixa", "Low")}, {"off", L("Desligada", "Off")}}),
-               "\"0\"")
-        .shown = UpscalerIsTemporal;
+    {
+        // Live (presenter reads SotcLive::dlss_sharpen each frame): RCAS attenuation in stops.
+        static const char* kSharpenKeys[] = {"off", "2", "1.5", "1", "0.5", "0"};
+        static const float kSharpenValues[] = {SotcLive::kSharpenOff, 2.0f, 1.5f, 1.0f, 0.5f, 0.0f};
+        MenuItem& sharpen = AddLive(
+            kTabDisplay, L("Nitidez do DLSS / FSR 4", "DLSS / FSR 4 sharpening"),
+            L("O realce de nitidez depois do DLSS ou do FSR 4, ao vivo. Máxima é o padrão.",
+              "The sharpening after DLSS or FSR 4, live. Highest is the default."),
+            {{L("Desligada", "Off"), "0"}, {L("Mínima", "Lowest"), "1"}, {L("Baixa", "Low"), "2"},
+             {L("Média", "Medium"), "3"}, {L("Alta", "High"), "4"},
+             {L("Máxima (padrão)", "Highest (default)"), "5"}},
+            [] {
+                float now = SotcLive::dlss_sharpen.load(std::memory_order_relaxed);
+                if (now <= SotcLive::kSharpenUnset) {
+                    std::string v = LoadLauncherSetting("dlss_sharpen");
+                    if (v.empty()) {
+                        const char* e = std::getenv("SOTC_DLSS_SHARPEN");
+                        v = e ? e : "0";
+                    }
+                    now = v.empty() || v[0] == 'o' ? SotcLive::kSharpenOff
+                                                   : static_cast<float>(std::atof(v.c_str()));
+                }
+                int best = 0;
+                for (int i = 1; i < 6; ++i) {
+                    if (std::fabs(kSharpenValues[i] - now) <
+                        std::fabs(kSharpenValues[best] - now)) {
+                        best = i;
+                    }
+                }
+                return best;
+            },
+            [](int i) {
+                SotcLive::dlss_sharpen.store(kSharpenValues[i], std::memory_order_relaxed);
+                SaveLauncherSetting("dlss_sharpen", std::string("\"") + kSharpenKeys[i] + "\"");
+            });
+        sharpen.slider = true;
+        sharpen.shown = UpscalerIsTemporal;
+    }
     AddRestart(kTabDisplay, "neo", L("Modo PS4 Pro", "PS4 Pro mode"),
                L("Os gráficos do PS4 Pro: mais detalhe e sombras melhores. Em telas mais largas que 16:9 ele fica desligado.",
                  "The PS4 Pro graphics: more detail and better shadows. On screens wider than 16:9 it stays off."),
@@ -735,6 +780,424 @@ void BuildItems() {
                L("A renderização HDR do próprio jogo (pede um monitor HDR ligado no Windows).",
                  "The game's own HDR rendering (needs an HDR monitor turned on in Windows)."),
                OnOff(), "false");
+    {
+        // sotc: game HDR levels (vk_presenter.cpp RefreshHdrLevels), live and kept in the
+        // launcher's settings. Shown when the game started with its HDR on.
+        const auto hdr_on = [] {
+            const char* v = std::getenv("BB_HDR");
+            const char* sdr_to_hdr = std::getenv("SOTC_HDR"); // the SDR expansion, not the game's
+            return v && v[0] == '1' && !(sdr_to_hdr && sdr_to_hdr[0] == '1');
+        };
+        // Picture controls that work in SDR too: shown unless the SDR-to-HDR expansion runs.
+        const auto picture_on = [] {
+            const char* sdr_to_hdr = std::getenv("SOTC_HDR");
+            return !(sdr_to_hdr && sdr_to_hdr[0] == '1');
+        };
+        // A level as the launcher keeps it: whole numbers as before ("200"), else one decimal.
+        const auto LevelText = [](float v) {
+            char buf[32];
+            if (v == std::floor(v)) {
+                std::snprintf(buf, sizeof(buf), "%d", int(v));
+            } else {
+                std::snprintf(buf, sizeof(buf), "%.1f", v);
+            }
+            return std::string(buf);
+        };
+        // Choices in nits; `extra` is a first choice with its own label (auto / same / off).
+        // The live value below `unset_below` means "the one read at start".
+        const auto add_level = [&](const char* label, const char* help, const char* key,
+                                   std::atomic<float>& live, const char* env, float fallback,
+                                   std::vector<std::pair<float, std::string>> choices,
+                                   float unset_below = 0.0f) -> MenuItem& {
+            std::vector<MenuChoice> labels;
+            std::vector<float> values;
+            for (auto& [v, name] : choices) {
+                labels.push_back({name, std::to_string(labels.size())});
+                values.push_back(v);
+            }
+            const std::string k = key, e = env;
+            MenuItem& level = AddLive(kTabDisplay, label, help, std::move(labels),
+                    [&live, values, k, e, fallback, unset_below] {
+                        float now = live.load(std::memory_order_relaxed);
+                        if (now < unset_below) {
+                            std::string v = LoadLauncherSetting(k.c_str());
+                            if (v.empty()) {
+                                const char* ev = std::getenv(e.c_str());
+                                v = ev ? ev : "";
+                            }
+                            now = v.empty() ? fallback
+                                  : v == "off" ? 10000.0f
+                                  : v == "auto" ? 0.0f
+                                                : static_cast<float>(std::atof(v.c_str()));
+                        }
+                        // The nearest choice (a hand-written value between steps).
+                        int best = 0;
+                        for (size_t i = 1; i < values.size(); ++i) {
+                            if (std::fabs(values[i] - now) < std::fabs(values[size_t(best)] - now)) {
+                                best = int(i);
+                            }
+                        }
+                        return best;
+                    },
+                    [&live, values, k, LevelText](int i) { // PickChoice logs the change
+                        const float v = values[size_t(i)];
+                        live.store(v, std::memory_order_relaxed);
+                        SaveLauncherSetting(k.c_str(), LevelText(v));
+                    });
+            level.shown = hdr_on;
+            return level;
+        };
+        const char* nits = L("nits", "nits");
+        std::vector<std::pair<float, std::string>> whites;
+        for (int v = 80; v <= 400; v += 10) {
+            whites.push_back({float(v), std::to_string(v) + " " + nits});
+        }
+        add_level(L("HDR: brilho do jogo", "HDR: game brightness"),
+                  L("O brilho do mundo: o branco em nits. 200 é o padrão; o jogo puro tem ~100.",
+                    "The world's brightness: its white in nits. 200 is the default; the game itself has ~100."),
+                  "hdr_white", SotcLive::hdr_white, "SOTC_HDR_WHITE", 200.0f, whites)
+            .slider = true;
+        std::vector<std::pair<float, std::string>> peaks{
+            {0.0f, L("Automático (do Windows)", "Auto (from Windows)")}};
+        for (int v = 400; v <= 2000; v += 50) {
+            peaks.push_back({float(v), std::to_string(v) + " " + nits});
+        }
+        peaks.push_back({10000.0f, L("Desligado (cortar)", "Off (clip)")});
+        add_level(L("HDR: pico da tela", "HDR: display peak"),
+                  L("O brilho máximo da tela. Os realces (sol, céu, água) descem suavemente até ele em vez de estourar.",
+                    "Your display's peak brightness. Highlights (sun, sky, water) roll off smoothly into it instead of clipping."),
+                  "hdr_peak", SotcLive::hdr_peak, "SOTC_HDR_PEAK", 0.0f, peaks)
+            .slider = true;
+        std::vector<std::pair<float, std::string>> uis{
+            {0.0f, L("O do jogo (3x o brilho do jogo)", "The game's (3x game brightness)")}};
+        for (int v = 50; v <= 1000; v += 10) {
+            uis.push_back({float(v), std::to_string(v) + " " + nits});
+        }
+        // The old hdr_ui / SOTC_HDR_UI scaled the game's UI (white at 3x it): 3x as nits.
+        const float legacy_ui = [] {
+            std::string v = LoadLauncherSetting("hdr_ui");
+            if (v.empty()) {
+                const char* e = std::getenv("SOTC_HDR_UI");
+                v = e ? e : "";
+            }
+            return v.empty() ? 0.0f : 3.0f * std::max(0.0f, static_cast<float>(std::atof(v.c_str())));
+        }();
+        add_level(L("HDR: brilho da interface", "HDR: UI brightness"),
+                  L("O branco de menus, legendas e HUD em nits, separado do mundo. Arraste a barra ou use ◀ ▶.",
+                    "The white of menus, subtitles and HUD in nits, apart from the world. Drag the bar or use ◀ ▶."),
+                  "hdr_ui_nits", SotcLive::hdr_ui, "SOTC_HDR_UI_NITS", legacy_ui, uis)
+            .slider = true;
+
+        // Picture controls (sotc_live.h hdr_grade): neutral by default, on the world only.
+        constexpr float kUnsetBelow = SotcLive::kGradeUnset + 1.0f;
+        std::vector<std::pair<float, std::string>> evs;
+        for (int t = -30; t <= 30; ++t) {
+            char buf[24];
+            std::snprintf(buf, sizeof(buf), "%+.1f EV", t / 10.0f);
+            evs.push_back({t / 10.0f, t == 0 ? std::string("0 EV") : std::string(buf)});
+        }
+        const auto percents = [] {
+            std::vector<std::pair<float, std::string>> v;
+            for (int p = 0; p <= 100; p += 2) {
+                v.push_back({float(p), std::to_string(p)});
+            }
+            return v;
+        };
+        // Presets (sotc_live.h kPicturePresets): the tone mapper and every picture control at
+        // once. The choice shown is the preset the current values match, else Custom.
+        {
+            static const char* kPresetTonemapKeys[] = {"\"vanilla\"", "\"vanilla_plus\"",
+                                                       "\"none\"", "\"vanilla_plus_hue\"",
+                                                       "\"renodrt\""};
+            constexpr int kPresets = int(std::size(SotcLive::kPicturePresets));
+            MenuItem& preset = AddLive(
+                kTabDisplay, L("Imagem: predefinição", "Picture: preset"),
+                L("Ajusta a curva de tons e todos os controles de imagem de uma vez. Original: o jogo. RenoDX: como os padrões dos mods RenoDX (RenoDRT, gama 2.2). Vívido: cores mais ricas, rumo ao P3. Filme: mais contraste, pretos um pouco mais fundos e granulação. O brilho, o pico e a interface ficam. Mexer num controle torna Personalizado.",
+                  "Sets the tone mapper and every picture control at once. Original: the game. RenoDX: like the RenoDX mods' defaults (RenoDRT, gamma 2.2). Vivid: richer colour, towards P3. Film: more contrast, slightly deeper blacks and grain. Brightness, peak and UI stay. Changing a control makes it Custom."),
+                {{L("Original", "Original"), "0"}, {"RenoDX", "1"}, {L("Vívido", "Vivid"), "2"},
+                 {L("Filme", "Film"), "3"}, {L("Personalizado", "Custom"), "4"}},
+                [kUnsetBelow] {
+                    float now[SotcLive::kGradeCount];
+                    for (int i = 0; i < SotcLive::kGradeCount; ++i) {
+                        now[i] = SotcLive::hdr_grade[i].load(std::memory_order_relaxed);
+                        if (now[i] < kUnsetBelow) {
+                            const std::string v = LoadLauncherSetting(SotcLive::kGradeKeys[i]);
+                            now[i] = v.empty() ? SotcLive::kPicturePresets[0].grade[i]
+                                               : static_cast<float>(std::atof(v.c_str()));
+                        }
+                    }
+                    int tm = SotcLive::hdr_tonemap.load(std::memory_order_relaxed);
+                    if (tm < 0) {
+                        const std::string v = LoadLauncherSetting("hdr_tonemap");
+                        tm = v == "vanilla_plus" || v == "vanilla+" ? 1
+                             : v == "none"                          ? 2
+                             : v == "vanilla_plus_hue"              ? 3
+                             : v == "renodrt"                       ? 4
+                                                                    : 0;
+                    }
+                    for (int p = 0; p < kPresets; ++p) {
+                        const SotcLive::PicturePreset& pr = SotcLive::kPicturePresets[p];
+                        bool same = pr.tonemap == tm;
+                        for (int i = 0; same && i < SotcLive::kGradeCount; ++i) {
+                            same = std::fabs(now[i] - pr.grade[i]) < 0.5f;
+                        }
+                        if (same) {
+                            return p;
+                        }
+                    }
+                    return kPresets; // Custom
+                },
+                [kPresets](int p) {
+                    if (p < 0 || p >= kPresets) {
+                        return; // Custom: the values stay as they are
+                    }
+                    const SotcLive::PicturePreset& pr = SotcLive::kPicturePresets[p];
+                    for (int i = 0; i < SotcLive::kGradeCount; ++i) {
+                        SotcLive::hdr_grade[i].store(pr.grade[i], std::memory_order_relaxed);
+                        SaveLauncherSetting(SotcLive::kGradeKeys[i],
+                                            std::to_string(int(pr.grade[i])));
+                    }
+                    SotcLive::hdr_tonemap.store(pr.tonemap, std::memory_order_relaxed);
+                    SaveLauncherSetting("hdr_tonemap", kPresetTonemapKeys[pr.tonemap]);
+                    SotcLive::hdr_grading.store(100.0f, std::memory_order_relaxed);
+                    SaveLauncherSetting("hdr_grading", "100");
+                });
+            preset.shown = picture_on;
+        }
+        {
+            MenuItem& item = add_level(L("Imagem: exposição", "Picture: exposure"),
+                  L("Clareia ou escurece o mundo inteiro, em pontos de exposição. 0 é o original.",
+                    "Brightens or darkens the whole world, in stops. 0 is the original."),
+                  "hdr_exposure", SotcLive::hdr_grade[SotcLive::kExposure], "SOTC_HDR_EXPOSURE",
+                  0.0f, evs, kUnsetBelow);
+            item.slider = true;
+            item.shown = picture_on;
+        }
+        {
+            MenuItem& item = add_level(L("Imagem: realces", "Picture: highlights"),
+                  L("O brilho das partes claras (céu, sol, água). 50 é o original.",
+                    "The brightness of the bright parts (sky, sun, water). 50 is the original."),
+                  "hdr_highlights", SotcLive::hdr_grade[SotcLive::kHighlights],
+                  "SOTC_HDR_HIGHLIGHTS", 50.0f, percents(), kUnsetBelow);
+            item.slider = true;
+            item.shown = picture_on;
+        }
+        {
+            MenuItem& item = add_level(L("Imagem: sombras", "Picture: shadows"),
+                  L("Clareia (acima de 50) ou aprofunda (abaixo) as partes escuras. 50 é o original.",
+                    "Lifts (above 50) or deepens (below) the dark parts. 50 is the original."),
+                  "hdr_shadows", SotcLive::hdr_grade[SotcLive::kShadows], "SOTC_HDR_SHADOWS",
+                  50.0f, percents(), kUnsetBelow);
+            item.slider = true;
+            item.shown = picture_on;
+        }
+        {
+            MenuItem& item = add_level(L("Imagem: contraste", "Picture: contrast"),
+                  L("A diferença entre claro e escuro, em volta do cinza médio. 50 é o original.",
+                    "The difference between light and dark, around mid grey. 50 is the original."),
+                  "hdr_contrast", SotcLive::hdr_grade[SotcLive::kContrast], "SOTC_HDR_CONTRAST",
+                  50.0f, percents(), kUnsetBelow);
+            item.slider = true;
+            item.shown = picture_on;
+        }
+        {
+            MenuItem& item = add_level(L("Imagem: saturação", "Picture: saturation"),
+                  L("A força das cores. 50 é o original; 0 é preto e branco.",
+                    "Colour strength. 50 is the original; 0 is black and white."),
+                  "hdr_saturation", SotcLive::hdr_grade[SotcLive::kSaturation],
+                  "SOTC_HDR_SATURATION", 50.0f, percents(), kUnsetBelow);
+            item.slider = true;
+            item.shown = picture_on;
+        }
+        {
+            MenuItem& item = add_level(L("Imagem: desbotar realces", "Picture: highlight desaturation"),
+                  L("Os realces mais fortes perdem a cor e vão para o branco perto do pico da tela. 0 é o original.",
+                    "The strongest highlights lose their colour and go to white near the display's peak. 0 is the original."),
+                  "hdr_blowout", SotcLive::hdr_grade[SotcLive::kBlowout], "SOTC_HDR_BLOWOUT",
+                  0.0f, percents(), kUnsetBelow);
+            item.slider = true;
+            item.shown = picture_on;
+        }
+        {
+            MenuItem& item = add_level(L("Imagem: saturação dos realces", "Picture: highlight saturation"),
+                  L("A força das cores só nas partes claras (céu, sol, fogo), mais quanto mais claras. 50 é o original.",
+                    "Colour strength in the bright parts only (sky, sun, fire), more the brighter. 50 is the original."),
+                  "hdr_highlight_saturation", SotcLive::hdr_grade[SotcLive::kHighlightSaturation],
+                  "SOTC_HDR_HIGHLIGHT_SATURATION", 50.0f, percents(), kUnsetBelow);
+            item.slider = true;
+            item.shown = picture_on;
+        }
+        {
+            MenuItem& item = add_level(L("Imagem: compensar véu (flare)", "Picture: flare compensation"),
+                  L("Tira o véu acinzentado das partes quase pretas, deixando o preto mais fundo. 0 é o original.",
+                    "Takes the grey veil out of the near-black parts for deeper blacks. 0 is the original."),
+                  "hdr_flare", SotcLive::hdr_grade[SotcLive::kFlare], "SOTC_HDR_FLARE", 0.0f,
+                  percents(), kUnsetBelow);
+            item.slider = true;
+            item.shown = picture_on;
+        }
+        add_level(L("HDR: correção de gama", "HDR: gamma correction"),
+                  L("Mostra a parte escura como uma tela SDR mostraria em vez da curva sRGB: 2.2 como um monitor comum (sombras um pouco mais fundas, como o jogo em SDR), 2.4 como uma TV calibrada (BT.1886, ainda mais fundas). Desligado é o original.",
+                    "Shows the dark range as an SDR display would instead of the sRGB curve: 2.2 like a typical monitor (slightly deeper shadows, as the game looks in SDR), 2.4 like a calibrated TV (BT.1886, deeper still). Off is the original."),
+                  "hdr_gamma_correction", SotcLive::hdr_grade[SotcLive::kGammaCorrection],
+                  "SOTC_HDR_GAMMA_CORRECTION", 0.0f,
+                  {{0.0f, L("Desligado", "Off")}, {100.0f, "2.2"}, {200.0f, "2.4 (BT.1886)"}},
+                  kUnsetBelow);
+        add_level(L("HDR: expansão de gama de cores", "HDR: gamut expansion"),
+                  L("Leva as cores já saturadas (céu, grama, fogo) além do sRGB, rumo ao P3 que as telas HDR mostram; cinzas e pele quase não mudam. 0 é o original.",
+                    "Takes already saturated colours (sky, grass, fire) beyond sRGB, towards the P3 that HDR displays show; greys and skin barely move. 0 is the original."),
+                  "hdr_gamut_expansion", SotcLive::hdr_grade[SotcLive::kGamutExpansion],
+                  "SOTC_HDR_GAMUT_EXPANSION", 0.0f, percents(), kUnsetBelow)
+            .slider = true;
+        {
+            MenuItem& grain = add_level(
+                L("Imagem: granulação de filme", "Picture: film grain"),
+                L("Uma granulação fina e em movimento, como em filme, mais nos tons médios. Também esconde faixas no céu e na névoa. 0 é o original (o jogo não tem).",
+                  "A fine, moving grain like film, strongest in the mid tones. It also hides banding in the sky and fog. 0 is the original (the game has none)."),
+                "hdr_grain", SotcLive::hdr_grade[SotcLive::kGrain], "SOTC_HDR_GRAIN", 0.0f,
+                percents(), kUnsetBelow);
+            grain.slider = true;
+            grain.shown = picture_on;
+        }
+        {
+            std::vector<std::pair<float, std::string>> sizes;
+            for (int p = 50; p <= 200; p += 10) {
+                sizes.push_back({float(p), std::to_string(p) + "%"});
+            }
+            MenuItem& size = add_level(
+                L("Imagem: tamanho da granulação", "Picture: grain size"),
+                L("O tamanho dos grãos. 100% é um pixel em 1080p e cresce com a resolução (dois pixels em 4K), então a granulação parece a mesma em qualquer tela.",
+                  "The size of the grain. 100% is one pixel at 1080p and grows with the resolution (two pixels at 4K), so the grain looks the same on any screen."),
+                "hdr_grain_size", SotcLive::hdr_grade[SotcLive::kGrainSize], "SOTC_HDR_GRAIN_SIZE",
+                100.0f, sizes, kUnsetBelow);
+            size.slider = true;
+            size.shown = picture_on;
+        }
+        MenuItem& reset = AddLive(
+            kTabDisplay, L("Imagem: restaurar", "Picture: reset"),
+            L("Volta todos os controles de imagem (granulação e expansão de gama inclusive), a curva de tons, a correção de cor do jogo e a força do bloom, da vinheta, da névoa e do borrão de movimento ao original. O brilho e o pico ficam.",
+              "Puts every picture control (grain and gamut expansion included), the tone mapper, the game's colour grading and the bloom, vignette, fog and motion blur strengths back to the original. Brightness and peak stay."),
+            {{L("Executar", "Run"), "0"}}, [] { return -1; },
+            [](int) {
+                const SotcLive::PicturePreset& neutral = SotcLive::kPicturePresets[0];
+                for (int i = 0; i < SotcLive::kGradeCount; ++i) {
+                    SotcLive::hdr_grade[i].store(neutral.grade[i], std::memory_order_relaxed);
+                    SaveLauncherSetting(SotcLive::kGradeKeys[i],
+                                        std::to_string(int(neutral.grade[i])));
+                }
+                SotcLive::hdr_grading.store(100.0f, std::memory_order_relaxed);
+                SaveLauncherSetting("hdr_grading", "100");
+                SotcLive::hdr_tonemap.store(SotcTonemap::kVanilla, std::memory_order_relaxed);
+                SaveLauncherSetting("hdr_tonemap", "\"vanilla\"");
+                for (auto* fx : {&SotcLive::fx_bloom, &SotcLive::fx_vignette, &SotcLive::fx_fog,
+                                 &SotcLive::fx_motion_blur}) {
+                    fx->store(100.0f, std::memory_order_relaxed);
+                }
+                SaveLauncherSetting("fx_bloom_strength", "100");
+                SaveLauncherSetting("fx_vignette_strength", "100");
+                SaveLauncherSetting("fx_fog_strength", "100");
+                SaveLauncherSetting("fx_motion_blur_strength", "100");
+                toast_text = L("Imagem restaurada", "Picture reset");
+                toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
+            });
+        reset.action = true;
+        reset.shown = picture_on;
+
+        // Tone mapper (sotc_tonemap.h): the game's curve, extended, or none, as the curve of the
+        // game's own tonemap pass (any upscaler).
+        static const int kTonemapModes[] = {SotcTonemap::kVanilla, SotcTonemap::kVanillaPlus,
+                                            SotcTonemap::kVanillaPlusHue, SotcTonemap::kRenoDrt,
+                                            SotcTonemap::kNone};
+        static const char* kTonemapKeys[] = {"\"vanilla\"", "\"vanilla_plus\"",
+                                             "\"vanilla_plus_hue\"", "\"renodrt\"",
+                                             "\"none\""};
+        MenuItem& tonemap = AddLive(
+            kTabDisplay, L("HDR: curva de tons", "HDR: tone mapper"),
+            L("Original: a curva do jogo. Original+: a mesma curva, mas os realces continuam subindo até o pico da tela em vez de achatar. Original+ (cor): a mesma, no brilho e não em cada cor, então as cores claras não puxam para o amarelo e o branco. RenoDRT: sem a curva do jogo, o brilho desce suavemente até o pico da tela mantendo cor e saturação (como os mods RenoDX). Nenhuma: sem curva, só a descida suave no pico.",
+              "Vanilla: the game's curve. Vanilla+: the same curve, but highlights keep rising to your display's peak instead of flattening. Vanilla+ (hue): the same on brightness rather than per colour channel, so bright colours do not drift to yellow and white. RenoDRT: without the game's curve, brightness rolls off smoothly into your display's peak keeping hue and saturation (as RenoDX mods do). None: no curve, only the smooth roll-off at the peak."),
+            {{L("Original", "Vanilla"), "0"}, {L("Original+", "Vanilla+"), "1"},
+             {L("Original+ (cor)", "Vanilla+ (hue)"), "2"}, {"RenoDRT", "3"},
+             {L("Nenhuma", "None"), "4"}},
+            [] {
+                int mode = SotcLive::hdr_tonemap.load(std::memory_order_relaxed);
+                if (mode < 0) {
+                    std::string v = LoadLauncherSetting("hdr_tonemap");
+                    if (v.empty()) {
+                        const char* e = std::getenv("SOTC_HDR_TONEMAP");
+                        v = e ? e : "";
+                    }
+                    mode = v == "vanilla_plus" || v == "vanilla+" ? SotcTonemap::kVanillaPlus
+                           : v == "vanilla_plus_hue"              ? SotcTonemap::kVanillaPlusHue
+                           : v == "renodrt"                       ? SotcTonemap::kRenoDrt
+                           : v == "none"                          ? SotcTonemap::kNone
+                                                                  : SotcTonemap::kVanilla;
+                }
+                for (int i = 0; i < 5; ++i) {
+                    if (kTonemapModes[i] == mode) {
+                        return i;
+                    }
+                }
+                return 0;
+            },
+            [](int i) {
+                SotcLive::hdr_tonemap.store(kTonemapModes[i], std::memory_order_relaxed);
+                SaveLauncherSetting("hdr_tonemap", kTonemapKeys[i]);
+            });
+        tonemap.shown = hdr_on;
+        {
+            MenuItem& item = add_level(L("HDR: correção de matiz", "HDR: hue correction"),
+                  L("Só com Original+ (cor) e RenoDRT: quanto a cor dos realces volta à do jogo (o fogo amarelando, por exemplo). 100 é a do jogo; 0 mantém a cor de cada coisa ao clarear.",
+                    "Vanilla+ (hue) and RenoDRT only: how far the hue of highlights goes back to the game's (fire turning yellow, for one). 100 is the game's; 0 keeps each colour's hue as it brightens."),
+                  "hdr_hue_correction", SotcLive::hdr_grade[SotcLive::kHueCorrection],
+                  "SOTC_HDR_HUE_CORRECTION", 100.0f, percents(), kUnsetBelow);
+            item.slider = true;
+            item.shown = picture_on;
+        }
+        std::vector<std::pair<float, std::string>> gradings;
+        for (int p = 0; p <= 100; p += 5) {
+            gradings.push_back({float(p), std::to_string(p) + "%"});
+        }
+        add_level(L("Imagem: correção de cor do jogo", "Picture: game colour grading"),
+                  L("A força das cores que o jogo dá a cada lugar (tom, saturação, contraste). 100% é o original; 0% tira o tom de cor, mantendo o brilho.",
+                    "How strongly the game's per-place colour look applies (tint, saturation, contrast). 100% is the original; 0% removes the colour cast and keeps the brightness."),
+                  "hdr_grading", SotcLive::hdr_grading, "SOTC_HDR_GRADING", 100.0f, gradings)
+            .slider = true;
+
+        // Effect strengths (sotc_tonemap.h), live, SDR and HDR: 0..200% of the game's.
+        std::vector<std::pair<float, std::string>> strengths;
+        for (int p = 0; p <= 200; p += 10) {
+            strengths.push_back({float(p), std::to_string(p) + "%"});
+        }
+        MenuItem& bloom = add_level(
+            L("Brilho difuso (bloom)", "Bloom"),
+            L("A força do brilho que se espalha em volta das luzes e do céu. 100% é o original; 0% tira.",
+              "How strong the glow around lights and the sky is. 100% is the original; 0% removes it."),
+            "fx_bloom_strength", SotcLive::fx_bloom, "SOTC_FX_BLOOM", 100.0f, strengths);
+        bloom.slider = true;
+        bloom.shown = [] { return true; }; // SDR too
+        MenuItem& vignette = add_level(
+            L("Força da vinheta", "Vignette strength"),
+            L("Quanto os cantos da imagem escurecem. 100% é o original; 0% tira. Com a vinheta desligada acima, não faz nada.",
+              "How much the corners of the picture darken. 100% is the original; 0% removes it. Does nothing with the vignette switched off above."),
+            "fx_vignette_strength", SotcLive::fx_vignette, "SOTC_FX_VIGNETTE", 100.0f, strengths);
+        vignette.slider = true;
+        vignette.shown = [] { return true; };
+        MenuItem& fog = add_level(
+            L("Força da névoa", "Fog strength"),
+            L("Quanto a névoa atmosférica junta com a distância. 100% é o original; 0% tira; 200% dobra. Com a névoa desligada acima, não faz nada.",
+              "How much the atmospheric fog builds up with distance. 100% is the original; 0% removes it; 200% doubles it. Does nothing with the fog switched off above."),
+            "fx_fog_strength", SotcLive::fx_fog, "SOTC_FX_FOG", 100.0f, strengths);
+        fog.slider = true;
+        fog.shown = [] { return true; };
+        MenuItem& motion = add_level(
+            L("Força do borrão de movimento", "Motion blur strength"),
+            L("O comprimento do borrão quando a câmera ou algo se move. 100% é o original; 200% dobra. Só com o borrão de movimento ligado.",
+              "How long the blur is when the camera or something moves. 100% is the original; 200% doubles it. Only with motion blur switched on."),
+            "fx_motion_blur_strength", SotcLive::fx_motion_blur, "SOTC_FX_MOTION_BLUR", 100.0f,
+            strengths);
+        motion.slider = true;
+        motion.shown = [] { return true; };
+    }
     AddRestart(kTabDisplay, "af16", L("Filtro de texturas 16x", "16x texture filtering"),
                L("Texturas nítidas no chão visto de lado (filtro anisotrópico 16x).",
                  "Sharp textures on the ground seen at an angle (16x anisotropic filtering)."),
@@ -1174,6 +1637,10 @@ void StepItem(MenuItem& item, int direction) {
         SotcEvent::Log("MENU", "%s", item.label.c_str());
         return;
     }
+    if (item.slider) { // stops at the ends: a brightness must not jump from its top to its bottom
+        PickChoice(item, std::clamp(item.get() + direction, 0, n - 1));
+        return;
+    }
     int at = std::max(item.get(), direction > 0 ? -1 : 0);
     for (int tries = 0; tries < n; ++tries) {
         at = (at + direction + n) % n;
@@ -1276,6 +1743,18 @@ void DrawMenu() {
         }
     }
     menu_inputs.clear();
+    if (pad_hold != 0) {
+        // A held controller direction repeats on a slider row (every 60 ms after 400 ms).
+        const auto now = std::chrono::steady_clock::now();
+        const auto rows = TabRows(menu_tab);
+        const int r = menu_row[size_t(menu_tab)];
+        const bool slider =
+            r >= 0 && r < int(rows.size()) && items[size_t(rows[size_t(r)])].slider;
+        if (slider && now >= pad_hold_next) {
+            ApplyMenuInput(pad_hold < 0 ? kInLeft : kInRight);
+            pad_hold_next = now + std::chrono::milliseconds(60);
+        }
+    }
 
     ImGuiIO& io = ImGui::GetIO();
     const ImGuiViewport* vp = ImGui::GetMainViewport();
@@ -1499,15 +1978,57 @@ void DrawMenu() {
             }
             const std::string text = Fit(value_px, value, value_w - 80.0f * u);
             const ImVec2 ts = MeasureText(value_px, text.c_str());
-            PutText(d, value_px, ImVec2(a.x + (value_w - ts.x) * 0.5f, y + (row_h - ts.y) * 0.5f), ink,
-                    text.c_str());
+            const float lift = item.slider ? 4.0f * u : 0.0f; // room for the bar below
+            PutText(d, value_px, ImVec2(a.x + (value_w - ts.x) * 0.5f, y + (row_h - ts.y) * 0.5f - lift),
+                    ink, text.c_str());
             const float apx = 14.0f * u;
             const ImVec2 as = MeasureText(apx, "◀");
             if (!item.action) {
-                PutText(d, apx, ImVec2(a.x + 14.0f * u, y + (row_h - as.y) * 0.5f), arrow, "◀");
-                PutText(d, apx, ImVec2(b.x - 14.0f * u - as.x, y + (row_h - as.y) * 0.5f), arrow, "▶");
+                const int last = int(item.choices.size()) - 1;
+                // A slider's arrow at its end is dimmed: it goes no further.
+                const ImU32 left = item.slider && now <= 0 ? Pal::Grey : arrow;
+                const ImU32 right = item.slider && now >= last ? Pal::Grey : arrow;
+                PutText(d, apx, ImVec2(a.x + 14.0f * u, y + (row_h - as.y) * 0.5f), left, "◀");
+                PutText(d, apx, ImVec2(b.x - 14.0f * u - as.x, y + (row_h - as.y) * 0.5f), right, "▶");
             }
-            if (clicked(a, ImVec2(a.x + value_w * 0.5f, b.y))) {
+            if (item.slider) {
+                // The bar along the bottom of the box, filled up to the value, with a handle.
+                const int last = std::max(int(item.choices.size()) - 1, 1);
+                const float bx0 = a.x + 40.0f * u, bx1 = b.x - 40.0f * u;
+                const float by = b.y - 7.0f * u;
+                const float t = float(std::clamp(now, 0, last)) / float(last);
+                const float hx = bx0 + (bx1 - bx0) * t;
+                d->AddRectFilled(ImVec2(bx0, by - 1.5f * u), ImVec2(bx1, by + 1.5f * u),
+                                 on && enabled ? IM_COL32(60, 48, 30, 200) : IM_COL32(40, 36, 30, 200),
+                                 1.5f * u);
+                d->AddRectFilled(ImVec2(bx0, by - 1.5f * u), ImVec2(hx, by + 1.5f * u),
+                                 !enabled ? Pal::Grey : on ? Pal::Ink : Pal::Gold, 1.5f * u);
+                d->AddCircleFilled(ImVec2(hx, by), 4.5f * u,
+                                   !enabled ? Pal::Grey : on ? Pal::Ink : Pal::GoldBright);
+                // Click on the box and drag: the value follows the pointer (between the arrows).
+                const int index = rows[size_t(n)];
+                if (clicked(ImVec2(bx0 - 12.0f * u, a.y), ImVec2(bx1 + 12.0f * u, b.y)) && enabled) {
+                    slider_drag = index;
+                    row = n;
+                }
+                if (slider_drag == index) {
+                    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                        slider_drag = -1;
+                    } else {
+                        const float f = std::clamp((mouse.x - bx0) / (bx1 - bx0), 0.0f, 1.0f);
+                        PickChoice(item, int(std::lround(f * float(last))));
+                    }
+                }
+                if (slider_drag != index) {
+                    if (clicked(a, ImVec2(bx0 - 12.0f * u, b.y))) {
+                        row = n;
+                        StepItem(item, -1);
+                    } else if (clicked(ImVec2(bx1 + 12.0f * u, a.y), b)) {
+                        row = n;
+                        StepItem(item, +1);
+                    }
+                }
+            } else if (clicked(a, ImVec2(a.x + value_w * 0.5f, b.y))) {
                 row = n;
                 StepItem(item, -1);
             } else if (clicked(ImVec2(a.x + value_w * 0.5f, a.y), b)) {
@@ -1682,9 +2203,11 @@ bool MenuEvent(const SDL_Event& event) {
             break;
         case SDL_GAMEPAD_BUTTON_DPAD_LEFT:
             menu_inputs.push_back(kInLeft);
+            PadHold(-1);
             break;
         case SDL_GAMEPAD_BUTTON_DPAD_RIGHT:
             menu_inputs.push_back(kInRight);
+            PadHold(+1);
             break;
         case SDL_GAMEPAD_BUTTON_SOUTH:
             menu_inputs.push_back(kInActivate);
@@ -1704,6 +2227,10 @@ bool MenuEvent(const SDL_Event& event) {
         }
         return true;
     case SDL_EVENT_GAMEPAD_BUTTON_UP:
+        if ((event.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_LEFT && pad_hold < 0) ||
+            (event.gbutton.button == SDL_GAMEPAD_BUTTON_DPAD_RIGHT && pad_hold > 0)) {
+            pad_hold = 0;
+        }
         return true;
     case SDL_EVENT_GAMEPAD_AXIS_MOTION: {
         const bool lx = event.gaxis.axis == SDL_GAMEPAD_AXIS_LEFTX;
@@ -1716,10 +2243,19 @@ bool MenuEvent(const SDL_Event& event) {
         if (neg && !held[0]) {
             menu_pad = true;
             menu_inputs.push_back(lx ? kInLeft : kInUp);
+            if (lx) {
+                PadHold(-1);
+            }
         }
         if (pos && !held[1]) {
             menu_pad = true;
             menu_inputs.push_back(lx ? kInRight : kInDown);
+            if (lx) {
+                PadHold(+1);
+            }
+        }
+        if (lx && !neg && !pos) {
+            pad_hold = 0;
         }
         held[0] = neg;
         held[1] = pos;
@@ -2034,6 +2570,21 @@ float FpsCounter() {
     return bottom;
 }
 
+// sotc: while F3 shows the game's original picture, a label at the top left says so.
+void CompareLabel() {
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const float pad = 12.0f * base_scale;
+    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + pad, viewport->WorkPos.y + pad),
+                            ImGuiCond_Always, ImVec2(0.0f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.5f);
+    ImGui::Begin("##compare", nullptr,
+                 ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoFocusOnAppearing);
+    ImGui::TextUnformatted("ORIGINAL (F3)");
+    ImGui::End();
+}
+
 void Toast() {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + viewport->WorkSize.x * 0.5f,
@@ -2051,6 +2602,10 @@ void Toast() {
 }
 
 } // namespace
+
+static u32 s_image_count = 2;
+static vk::Format s_format = vk::Format::eUndefined;
+static bool InitBackend(vk::Format format);
 
 void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) {
     s_instance = &instance;
@@ -2087,10 +2642,28 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
         },
         const_cast<vk::Instance*>(&vk_instance));
 
-    const VkFormat color_format = static_cast<VkFormat>(format);
+    s_image_count = image_count;
+    if (!InitBackend(format)) {
+        std::printf("Overlay: ImGui Vulkan backend init failed\n");
+        ImGui::DestroyContext();
+        return;
+    }
+    initialized = true;
+    (void)StartRaw("fps_mode"); // sotc: the launcher's settings as the game starts (restart band)
+    std::printf("Overlay: menu ready (Insert or L3+R3)\n");
+}
+
+// sotc: the ImGui Vulkan backend for the swapchain's `format` (its pipeline and, on the HDR10
+// swapchain, overlay_hdr.frag).
+static bool InitBackend(vk::Format format) {
+    const Vulkan::Instance& instance = *s_instance;
+    const u32 image_count = s_image_count;
+    static VkFormat color_format;
+    color_format = static_cast<VkFormat>(format);
+    s_format = format;
     ImGui_ImplVulkan_InitInfo info{};
     info.ApiVersion = instance.ApiVersion();
-    info.Instance = vk_instance;
+    info.Instance = instance.GetInstance();
     info.PhysicalDevice = instance.GetPhysicalDevice();
     info.Device = instance.GetDevice();
     info.QueueFamily = instance.GetGraphicsQueueFamilyIndex();
@@ -2104,14 +2677,33 @@ void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count) 
         .colorAttachmentCount = 1,
         .pColorAttachmentFormats = &color_format,
     };
-    if (!ImGui_ImplVulkan_Init(&info)) {
-        std::printf("Overlay: ImGui Vulkan backend init failed\n");
-        ImGui::DestroyContext();
+    // sotc: on the HDR10 swapchain (PQ) the menu's sRGB colours are encoded at 203 nits
+    // (overlay_hdr.frag) instead of landing at up to 10000 nits.
+    if (format == vk::Format::eA2B10G10R10UnormPack32) {
+        info.CustomShaderFragCreateInfo = VkShaderModuleCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+            .codeSize = sizeof(OVERLAY_HDR_FRAG),
+            .pCode = OVERLAY_HDR_FRAG,
+        };
+    }
+    return ImGui_ImplVulkan_Init(&info);
+}
+
+void OnSurfaceFormatChange(vk::Format format) {
+    std::scoped_lock lock{imgui_mutex};
+    if (!initialized || format == s_format) {
         return;
     }
-    initialized = true;
-    (void)StartRaw("fps_mode"); // sotc: the launcher's settings as the game starts (restart band)
-    std::printf("Overlay: menu ready (Insert or L3+R3)\n");
+    // The caller waited for the device to be idle; ImGui recreates its textures on the next
+    // frame (the backend destroyed them).
+    ImGui_ImplVulkan_Shutdown();
+    if (!InitBackend(format)) {
+        std::printf("Overlay: ImGui Vulkan backend re-init failed\n");
+        initialized = false;
+        return;
+    }
+    std::printf("Overlay: swapchain format %d, menu %s\n", int(format),
+                format == vk::Format::eA2B10G10R10UnormPack32 ? "in HDR10 (203 nits)" : "in SDR");
 }
 
 void UpdateTextInput(SDL_Window* window) {
@@ -2169,6 +2761,18 @@ bool HandleEvent(const SDL_Event& event) {
             toast_text = SotcUi::T("Geração de quadros: indisponível nesta placa", "Frame generation: not available on this GPU");
             toast_until_ms.store(NowMs() + 2500, std::memory_order_relaxed);
         }
+        return true;
+    }
+    // sotc: F3 switches between the user's picture and the game's own (tone mapper, grading,
+    // picture controls, effect strengths), brightness and peak kept; a label shows while on.
+    if (event.type == SDL_EVENT_KEY_DOWN && event.key.key == SDLK_F3 && !event.key.repeat) {
+        const bool on = !SotcLive::compare_vanilla.load(std::memory_order_relaxed);
+        SotcLive::compare_vanilla.store(on, std::memory_order_relaxed);
+        const char* what = on ? SotcUi::T("F3: imagem original do jogo", "F3: the game's original picture")
+                              : SotcUi::T("F3: sua imagem", "F3: your picture");
+        SotcEvent::Log("KEY", "%s", what);
+        toast_text = what;
+        toast_until_ms.store(NowMs() + 2000, std::memory_order_relaxed);
         return true;
     }
     // sotc: F5 (diagnostic) saves the textures of the next frame (sotc_stats.h).
@@ -2423,11 +3027,16 @@ bool TriggerPending() {
 bool Visible() {
     return initialized && (menu_open || text_entry_active || list_active || OverlayOn() ||
                            ToastShown() || LoadingShown() || TriggerPending() ||
-                           upscaler_label.load(std::memory_order_relaxed));
+                           upscaler_label.load(std::memory_order_relaxed) ||
+                           SotcLive::compare_vanilla.load(std::memory_order_relaxed));
 }
 
 void SetUpscalerLabel(const char* label) {
     upscaler_label.store(label, std::memory_order_relaxed);
+}
+
+std::string LauncherSetting(const char* key) {
+    return LoadLauncherSetting(key);
 }
 
 bool CapturesInput() {
@@ -2639,6 +3248,9 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
     }
     if (ToastShown()) {
         Toast();
+    }
+    if (SotcLive::compare_vanilla.load(std::memory_order_relaxed)) {
+        CompareLabel();
     }
     if (const char* label = upscaler_label.load(std::memory_order_relaxed)) {
         UpscalerLabel(label, fps_bottom);

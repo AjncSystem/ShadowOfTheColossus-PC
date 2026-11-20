@@ -22,6 +22,10 @@ namespace BbOverlay {
 /// Present thread, once: the ImGui context and its Vulkan backend.
 void Init(const Vulkan::Instance& instance, vk::Format format, u32 image_count);
 
+/// sotc: the swapchain changed format (SDR <-> HDR10), the device idle: the backend is made
+/// again for it, so the menu is encoded for that swapchain.
+void OnSurfaceFormatChange(vk::Format format);
+
 /// Window thread, for every SDL event: true when the menu consumed it.
 bool HandleEvent(const SDL_Event& event);
 /// Turns SDL text input on while the menu edits a value (window thread, once per poll).
@@ -38,6 +42,10 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
 /// sotc: any thread, every frame: the upscaler label in the top right corner (a static string;
 /// nullptr: none).
 void SetUpscalerLabel(const char* label);
+
+/// sotc: a value from the launcher's settings (SOTC_LAUNCHER_SETTINGS), a string without its
+/// quotes; "" when the file does not have the key. Any thread.
+std::string LauncherSetting(const char* key);
 
 /// The menu is open or a text entry is shown: the game's input is held neutral.
 bool CapturesInput();

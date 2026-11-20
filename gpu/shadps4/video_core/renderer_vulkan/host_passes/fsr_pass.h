@@ -15,6 +15,8 @@ public:
         bool enable{true};
         bool use_rcas{true};
         float rcas_attenuation{0.25f};
+        /// sotc: the input is linear HDR (values above 1): filtered compressed (fsr.comp).
+        bool linear_hdr{false};
     };
 
     void Create(vk::Device device, VmaAllocator allocator, u32 num_images);

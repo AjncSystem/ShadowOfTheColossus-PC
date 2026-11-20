@@ -78,6 +78,14 @@ void NoteHudless(u32 frame_id, vk::Image image, vk::ImageView view, vk::Format f
 
 /// DLSS Super Resolution (SOTC_UPSCALER=dlss) is supported on this device.
 bool SuperResolution();
+
+/// sotc: game HDR without super resolution (FSR 1): the presenter asks each frame for the final
+/// composite's scene and UI layer apart (Upscale gives them as a scene_low result), so the UI
+/// gets its own brightness and the picture controls work on the fp16 scene, not on the game's
+/// 10-bit PQ frame. SOTC_FSR1_SPLIT=0: as before (the composite as the game drew it).
+void SetSplitComposite(bool on);
+/// The final composite is captured (super resolution, or SetSplitComposite).
+bool CompositeWanted();
 /// sotc: super resolution is on and takes the game's frames (not when their input is as large as
 /// the output: PS4 Pro Cinematic mode at 1080p).
 bool SuperResolutionUpscaling();

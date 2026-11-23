@@ -43,17 +43,38 @@ LEGACY_CONFIG_DIR = Path(os.environ.get('APPDATA', Path.home())) / 'sotc-launche
 LEGACY_CONFIG_FILE = LEGACY_CONFIG_DIR / 'settings.json'
 CONFIG_DIR = PORT_DIR / 'user'
 CONFIG_FILE = CONFIG_DIR / 'launcher_settings.json'
+_SETTINGS_FILE = None
+
+
+def settings_file():
+    """sotc (#467): the one settings file this copy reads and writes. Its user folder, or the shared
+    %APPDATA% file when that folder cannot be written (Program Files, OneDrive, started from inside
+    the .zip). Before, a read-only copy saved to the shared file but loaded user/launcher_settings.json
+    again, and the in-game menu wrote to the user folder: the changes looked lost at every start."""
+    global _SETTINGS_FILE
+    if _SETTINGS_FILE is None:
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            probe = CONFIG_DIR / '.settings-write-test'
+            probe.write_text('', encoding='utf-8')
+            probe.unlink()
+            if CONFIG_FILE.exists() and not os.access(CONFIG_FILE, os.W_OK):
+                raise OSError('read-only settings file')
+            _SETTINGS_FILE = CONFIG_FILE
+        except OSError:
+            _SETTINGS_FILE = LEGACY_CONFIG_FILE
+    return _SETTINGS_FILE
 # The supported releases (title ID -> region, version) share one eboot build; scripts/ is on
 # sys.path above. The EU one (CUSA08809) is the default game folder.
 from sotc_modes import GAMES  # noqa: E402
 GAME_ID = 'CUSA08809'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.76.2'
+VERSION = '0.77'
 # sotc: the port version whose shader translation the cache holds (clear_shader_cache_after_update).
 # Raise it to the new VERSION in a release that changes how shaders are translated or stored
 # (shader_recompiler/, the SPIR-V emitters, vk_pipeline_serialization.cpp versions, cache_storage
 # folders); a release that does not keeps the players' caches.
-SHADER_CACHE_VERSION = '0.76.2'
+SHADER_CACHE_VERSION = '0.77'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -710,7 +731,7 @@ def _write_cache_marker(marker):
 def load_settings():
     """Saved settings over the defaults. Older settings that turned DLSS-G on with SOTC_DLSSG=1 in
     the extra variables get the frame generation setting instead."""
-    saved = load_json(CONFIG_FILE, {})
+    saved = load_json(CONFIG_FILE, {}) if settings_file() == CONFIG_FILE else load_json(LEGACY_CONFIG_FILE, {})
     if not saved and LEGACY_CONFIG_FILE.is_file():
         # First start of this copy: the shared settings of older versions, but its own data
         # folder when the old one is another copy's user folder.
@@ -941,7 +962,7 @@ def game_environment(s):
     if str(s.get('audio_device') or '').strip():
         env['SOTC_AUDIO_DEVICE'] = str(s['audio_device']).strip()
     # The in-game menu's quick settings are written back here (bbport_overlay.cpp).
-    env['SOTC_LAUNCHER_SETTINGS'] = str(CONFIG_FILE)
+    env['SOTC_LAUNCHER_SETTINGS'] = str(settings_file())
     env['SOTC_SHADOW_REUSE'] = str(s.get('shadow_reuse') or '0')
     env['SOTC_OUTPUT_RES'] = s.get('output_res') or '1920x1080'
     # The PS4 Pro path keeps its 16:9 sizes: a wider screen (21:9, 32:9) wins over it (#142).
@@ -2329,10 +2350,14 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         for key, var in self.vars.items():
             self.app[key] = var.get()
         text = json.dumps(self.app, indent=2, ensure_ascii=False)
+        global _SETTINGS_FILE
         try:
+            if settings_file() != CONFIG_FILE:
+                raise OSError('read-only port folder')
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             CONFIG_FILE.write_text(text, encoding='utf-8')
         except OSError:  # a read-only port folder (Program Files): the shared settings
+            _SETTINGS_FILE = LEGACY_CONFIG_FILE
             LEGACY_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             LEGACY_CONFIG_FILE.write_text(text, encoding='utf-8')
 
@@ -3520,7 +3545,7 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                  'skip_film', 'play_mode', 'debug_menu', 'debug_watch', 'dlss_compare')
 
     def reload_live_settings(self):
-        saved = load_json(CONFIG_FILE, {})
+        saved = load_json(settings_file(), {})
         for key in self.LIVE_KEYS:
             if key in saved and key in self.vars and saved[key] != self.vars[key].get():
                 try:

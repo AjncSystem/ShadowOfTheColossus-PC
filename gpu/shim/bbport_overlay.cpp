@@ -326,6 +326,16 @@ void SaveLauncherSetting(const char* key, const std::string& json_value) {
     }
     std::ofstream out(LauncherSettingsPath(), std::ios::binary | std::ios::trunc);
     out << text;
+    out.close();
+    // sotc (#467): a read-only settings file used to fail here silently; say so once.
+    static bool warned = false;
+    if (!out && !warned) {
+        warned = true;
+        SotcEvent::Log("MENU",
+                       SotcUi::T("Não foi possível salvar a configuração em %s (pasta somente leitura?)",
+                                 "Could not save the setting to %s (read-only folder?)"),
+                       LauncherSettingsPath().string().c_str());
+    }
 }
 
 // sotc: SOTC_LOD_POOL_LOW at start (8 when unset): the page pool switch of texture level "High".

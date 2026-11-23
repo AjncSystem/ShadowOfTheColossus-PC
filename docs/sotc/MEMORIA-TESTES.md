@@ -186,6 +186,34 @@ barrier+texupload 0,34, barrier+pass 0,17/43.
 | 50b ⏳ | **etapa 1 do `PLANO-FILA-COPIA.md`**: guarda completa (linha `SOTC BUF GUARD (full)`): por página de 64 KiB, o tick mais novo que a tocou (binds, origem de textura, escritas da GPU) e o tick do último shader com DMA (lê qualquer memória); passa só sem acesso em voo nem no envio atual. Parceira (16:20): fila só-transferência com arenas `eConcurrent`, lotes de 1–2 MB mandados cedo; a 2ª fila gráfica não sobrepõe na NVIDIA | ≥ 70% dos bytes do denso passando → implementar; < 50% → parar | **16:10 (exe 4f6c4cdc): ➖ passa só 11–15% no denso** (90–105 s: 194–297 MB passam × 1,58–1,81 GB barrados a cada 5 s); **a barreira é o shader com DMA em voo** (lê qualquer memória, quase sempre há um na GPU); usados no envio atual 18–32 MB, em voo 75–114 MB. Pela regra, **linha da fila de cópia encerrada**. Atenção: com esse contador o jogo caiu para 29–47 FPS (o contador por página pesa na thread de desenho): tirado do lançador |
 | 51 | A: layout GENERAL em todas as imagens + barreiras globais mínimas | ganho 0,3–0,6 ms; **risco alto** (NVIDIA pode desligar a compressão de cor/profundidade e subir os ~14 ms de GPU) | descartado por ora |
 
+### Observação do usuário (23/11, fim do dia)
+"Não tem nada a ver com grama: tem locais que só têm pedra e a queda continua." Hipótese "carga de grama/mato"
+descartada pelo usuário; não propor teste de distância da grama. A queda acompanha a troca de área e o trecho
+seguinte mesmo sem vegetação (coerente com a cadeia de esperas do jogo, não com número de desenhos de grama).
+
+### Hipótese H5 — suavizar o que não dá para acelerar (23/11, escolha do usuário)
+Monitor do usuário: **144 Hz** (RTX 2060 SUPER, janela, FIFO). O degrau do FPS dinâmico é 48 = 3 vblanks (ritmo
+perfeito). Na floresta densa o jogo roda 50–53 (quadros de 19–20 ms → 2 ou 3 vblanks alternados = tranco) e o FPS
+dinâmico nunca entra, porque só conta como lento o quadro abaixo de 50 FPS.
+
+| # | Mudança | Aprovação | Estado |
+|---|---|---|---|
+| 52 | `SOTC_FPS_DYNAMIC_SLOW_FPS=57 SOTC_FPS_DYNAMIC_SLOW_MS=2000` (novo limite ajustável em `driver.cpp`; padrão 50 = como antes): o degrau 48 entra quando o jogo passa 2 s abaixo de 57 | na floresta, `SCREEN FPS` estável em 48 (±1) sem oscilar; `SOTC FRAMES` p99 ≤ 25 ms no trecho; caminho a 60 sem trava fora das trocas; o usuário sente mais liso | **16:20 (exe eb71730f): agiu.** Troca de área aos 88 s (40–46), degrau 48 aos 90 s; depois a tela fica **47–48** (91–94, 97–104, 107–109 s), p50 20,2–20,9 ms, p99 23,1–27,4. Caminho 57–60, sem trava fora da floresta. **Sobra:** cada "trying 60" (95 s e 104 s; espera 4 s, depois 8 s) dá ~2 s de oscilação 44–56 antes de voltar a 48. **Usuário: "não senti diferença" → ➖.** Ajuste tirado do lançador; o código fica (padrão 50 = como antes). Suavizar o ritmo não resolve a sensação: o que ele sente é o FPS cair, não a irregularidade |
+
+### PR #464 (SotC-Work, 23/11) — retoma a H4 (núcleos)
+Três mudanças: (1) `SOTC_PIN`: as 3 threads da GPU (GpuDraw, GpuCommandProcessor, GpuRecorder) cada uma num núcleo
+físico próprio (núcleos 1–3, o irmão SMT vazio), o resto nos outros; solta abaixo de 25 FPS (cargas); +6–11% no
+Santuário num Ryzen 5600X. (2) Guarda do alocador `0x499cc` (rax=rcx=0 → retoma em `0x499e0`, sob
+`SOTC_FIX_NULL_OBJECTS`). (3) Falha ao criar thread não derruba o jogo (relatório de 5 s e comparação de despejo).
+**No i9-13900K do usuário fica DESLIGADO por padrão**: o teste de SMT exige 2 threads em todo núcleo, e os 16 núcleos E
+têm 1 (medido: 8×2 classe 1 + 16×1 classe 0). Com `SOTC_PIN=1` as 3 threads vão para os núcleos P 1–3 (lógicos 2, 4, 6).
+Revisão: o laço reaplica a afinidade a todas as threads a cada 1 s (custo pequeno); não usa `EfficiencyClass` (num
+híbrido, o ideal é garantir núcleos P — aqui calha porque os P vêm primeiro).
+
+| # | Mudança | Aprovação | Estado |
+|---|---|---|---|
+| 53 | PR #464 aplicado + `SOTC_PIN=1` (exe novo), sem medições | **2 partidas** (parceira): linha "thread placement" com máscara `0x...FFFFFF03`; média ≥ 6 mil comandos ≥ 53,5 nas duas; caminho ≥ 58; sem quadros > 50 ms a mais que o #44; carga do save não mais lenta | **16:35 e 16:41 (exe 57adf18a, `SOTC_PIN=1`, placement "2, 4, 6 ... mask 0xffffff03" no log). 16:35: só tela de título (não vale). 16:41 (23 min de jogo): janelas ≥ 6 mil comandos na floresta 47,3 · 51,2 · 53,3 · 51,2 · 52,2 · 54,7 · 56,2 · 54,4 · 49,6 = média 52,2 (ref. ~50–52; critério 53,5 ✗); quadros > 50 ms raros (0–2 por janela); cargas iguais (1,2–1,3 s). Trechos de 4–5 mil comandos a 50–57 (341–461 s; noutras partidas 58–60 nessa carga, mas outra área: não comparável). ➖ no 13900K** (como a parceira previu); `SOTC_PIN` tirado do lançador, PR desaplicado do working tree (o exe instalado ainda o tem, mas no híbrido fica desligado sozinho). ⏳ Parceira: expectativa **0 ou negativa** no 13900K (o ganho do 5600X vinha da disputa de SMT; aqui os workers do jogo perdem 3 núcleos P e transbordam para os E; a thread de desenho não é o limite). Riscos: afinidade num lógico só (tranco se o irmão SMT for usado por outro processo); a máscara também prende as threads do driver; a guarda `0x499cc` esconde lista corrompida (pedir contador no log) |
+
 ## Estado agora (23/11, 10:45)
 - E:: exe `fa5edfc3`; lançador com variáveis extras vazias (estado do jogador comum).
 - Sobra o **mergulho da floresta**: 40–50 FPS por ~2–3 s, 1 quadro de 66 ms (sem medições, #39); e um quadro de ~100–145 ms depois da carga do save.

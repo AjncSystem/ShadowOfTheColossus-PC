@@ -1385,6 +1385,10 @@ void TextureCache::RefreshImage(Image& image) {
 
     {
         const SotcStats::SplitTimer record_split{SotcStats::SplitTexRecord};
+        // sotc: SOTC_UPLOAD_PREPASS: the bytes are on the host only if they came straight from
+        // ObtainBufferForImage (staging or the game's memory) and no GPU detile pass ran on them.
+        runtime.upload_source_host_ready =
+            !from_guest && buffer == in_buffer && buffer_cache.last_image_source_host_ready;
         runtime.UploadImage(&image, buffer, image_copies);
     }
     // sotc: the MaybeCpuDirty check compares against image.hash, which only that branch used to

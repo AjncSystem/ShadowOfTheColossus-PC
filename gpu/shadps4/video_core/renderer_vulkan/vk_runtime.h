@@ -47,6 +47,11 @@ public:
 
     void UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                      std::span<const vk::BufferImageCopy> upload_copies);
+    /// sotc: SOTC_UPLOAD_PREPASS=1: set right before UploadImage when its source bytes are already
+    /// on the host (staging written by the CPU, or the game's memory read directly). A never-used
+    /// image is then uploaded in the submission's upload command buffer, which runs before the
+    /// primary one, instead of ending the render pass in the middle of the frame.
+    bool upload_source_host_ready = false;
     void DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
                        std::span<const vk::BufferImageCopy> download_copies);
 

@@ -368,6 +368,24 @@ inline const bool kVisDirectOrder = [] {
     const char* v = std::getenv("SOTC_VIS_DIRECT_ORDER");
     return v && v[0] == '1';
 }();
+/// sotc: SOTC_INDIRECT_MERGE_STATS=1 (test #48 of docs/sotc/MEMORIA-TESTES.md): of the indirect
+/// draws with GPU-written arguments, how many could join the previous one in a single
+/// vkCmdDraw*Indirect (same pipeline, same bindings and user data, same rendering state, arguments
+/// right after the previous ones in the same buffer); the others by the first reason they could not.
+inline const bool kIndirectMergeStats = [] {
+    const char* v = std::getenv("SOTC_INDIRECT_MERGE_STATS");
+    return v && v[0] == '1';
+}();
+/// sotc: SOTC_UPLOAD_PREPASS=1 (test #49): uploads of never-used images whose source is already on
+/// the host go to the upload command buffer (before the primary one): no render pass break mid-frame.
+inline const bool kUploadPrepass = [] {
+    const char* v = std::getenv("SOTC_UPLOAD_PREPASS");
+    return v && v[0] == '1';
+}();
+inline std::atomic<uint64_t> prepass_uploads{0}, prepass_bytes{0}, prepass_used{0},
+    prepass_source{0};
+inline std::atomic<uint64_t> imerge_total{0}, imerge_ok{0}, imerge_pipeline{0}, imerge_bind{0},
+    imerge_state{0}, imerge_args{0}, imerge_count{0}, imerge_longest{0};
 inline std::atomic<uint64_t> vis_held_labels{0};   ///< labels held while their order needed it
 inline std::atomic<uint64_t> vis_held_flushes{0};  ///< submissions forced for the dispatch's tick
 inline std::atomic<int64_t> vis_labels_pending{0}; ///< held labels not written yet

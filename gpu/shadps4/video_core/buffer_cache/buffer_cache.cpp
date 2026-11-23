@@ -2162,6 +2162,7 @@ std::pair<const Buffer*, u64> BufferCache::GatherImageFromGuest(VAddr device_add
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
+    last_image_source_host_ready = false;
     if (IsRegionGpuModified(device_addr, size)) {
         const SotcStats::SplitTimer copy_split{SotcStats::SplitTexCopy};
         return ObtainBuffer(device_addr, size, false);
@@ -2188,6 +2189,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
         if (direct && offset % std::max<u64>(instance.StorageMinAlignment(), 16) == 0) {
             SotcStats::tex_direct_uploads.fetch_add(1, std::memory_order_relaxed);
             SotcStats::tex_direct_bytes.fetch_add(size, std::memory_order_relaxed);
+            last_image_source_host_ready = true;
             return {direct, offset};
         }
         if (SotcStats::kTexGather && size >= 64_KB) {
@@ -2205,6 +2207,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
     const SotcStats::SplitTexCopyScope copy_split{staging.size};
     memory->CopySparseMemory(device_addr, staging.mapped, staging.size);
     staging.Flush();
+    last_image_source_host_ready = true;
     return {staging.buffer, staging.offset};
 }
 

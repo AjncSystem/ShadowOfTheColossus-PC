@@ -1,5 +1,60 @@
 # Queda de FPS: estado em 17/11/2026 e o caminho daqui
 
+## 0. Revisão de tudo (23/11/2026) — ler antes de qualquer teste novo
+
+Meta do usuário: **60 FPS estável e nenhuma travada na troca de área** (no PS5 não parece travar).
+São dois sintomas diferentes, com causas diferentes:
+
+- **Travada** = quadros de 100–320 ms (a imagem para). Sente-se como "travou".
+- **Mergulho** = alguns segundos com quadros de 20–55 ms (contador da tela 37–45). Sente-se como "caiu o FPS".
+
+### Estado agora (exe fa5edfc3 no E:, commit a0328659)
+| Trecho (partida do usuário) | 23/11 09:33 | 23/11 10:20 |
+|---|---|---|
+| Depois da carga do save | mínimo 30, quadros 150–320 ms | **mínimo 43, um quadro de 95 ms** |
+| Troca de área da floresta | 40–48 | **37–45 por ~4 s, pior quadro 55 ms** |
+| Resto do caminho | 58–60 | 58–60 |
+
+As travadas grandes acabaram (leitura antecipada dos arquivos só em HD). **Sobra o mergulho da floresta.**
+
+### O que já foi tentado, por hipótese (não repetir)
+**H1 — o jogo espera a GPU devolver o mapa de visibilidade (leituras de volta).** Medido: 48–68 ms de espera
+por quadro no pior quadro do mergulho; a GPU não está cheia (~13 ms de trabalho). **14 tentativas, nenhuma
+tirou o mergulho:** `SOTC_CLEAN_GUEST_READS` (pequena melhora, ruído), `SOTC_STALE_READS` (cena piscando),
+`SOTC_RB_STREAM`, `SOTC_RB_EARLY`, Mailbox no lugar de FIFO, `SOTC_RB_HOT=2`, `SOTC_RB_GROUP` (etapa 1),
+`SOTC_RB_PUSH` (etapa 2), `SOTC_RB_SAFEPOINT` (etapa 3), `SOTC_RB_NARROW=256`, `SOTC_CULL_QUEUE` (2 versões),
+`SOTC_VIS_DIRECT` v1 (quedas), v2 (41 FPS), **v3 `SOTC_VIS_DIRECT_ORDER` (23/11 10:26: espera 20 → 12 ms, mas o
+resto do caminho caiu para 50–55 e o mergulho seguiu em 37)**. **Linha esgotada** enquanto a causa for a
+mesma: encurtar ou adiantar a leitura não muda o mergulho.
+
+**H2 — a thread de desenho do port é o limite.** Testado: envio de texturas (etapa 1 do plano da thread, sem
+ganho), `SOTC_COPY_LOCK_ONCE` (sem ganho), `SOTC_IDLE_FLUSH` (sem ganho), `SOTC_FLIP_QUEUE=2` (sem ganho).
+Ganharam: `SOTC_TEX_DIRECT`/`SOTC_TEX_GATHER`, `SOTC_RELEASE_DEFER`, `SOTC_CLAMP_GAP` (trancos), e **tirar as
+medições do lançador** (18/11: resto 54–57 → 59–60, troca de área 40–47 → 49–55). No pior quadro de 23/11 a
+thread trabalha ~17 ms de 55 (o resto é espera). **Nunca feito, com pista medida:** juntar as chamadas de
+proteção de páginas (`Protect`/`VirtualProtect`, ~16% da thread nos quadros lentos, 18/11 22:10).
+
+**H3 — o que o port põe em cima do jogo (configuração).** Ganharam: FPS dinâmico ajustado (sem 10–15 s presos
+em 48), cache de shaders mantido, pré-tradução de compute, leitura antecipada só em HD (23/11). Sem diferença:
+sem modo Pro (o mergulho é igual: não depende de resolução).
+
+### Armadilhas que já custaram horas
+- Harness `idle.py`, `bench_shrine` e a demo não chegam ao trecho: números inválidos.
+- O teste do final pelo harness (`I:/tmp/endrun/end.py`, menu de debug) cai em `0x1a2c0` **também sem
+  mudança nenhuma** (23/11, 3 de 3 rodadas): não serve para provar estabilidade.
+- Média de 5 s esconde o mergulho: comparar pela linha `SOTC SCREEN FPS` (lowest) e pelo pior quadro.
+- **Medições ligadas pesam no jogo** (`SOTC_DRAW_SPLIT`, `SOTC_SLOW_OPS`, `SOTC_GPU_TIMES`, `SOTC_TICKWATCH`):
+  só na partida que mede, depois tirar. As partidas de 23/11 tiveram `DRAW_SPLIT`/`SLOW_OPS`/`SYNC_COMPILE_LOG`
+  ligados: o "resto do caminho" real pode estar melhor que o medido.
+- Editar `launcher_settings.json` com o lançador aberto: ele regrava por cima ao fechar.
+
+### Caminho daqui (em ordem, uma partida cada)
+1. **Partida limpa** (só o padrão do lançador, sem medições) para saber o estado real do mergulho com a
+   correção de hoje. Barato e evita otimizar o que já não existe.
+2. **H2: juntar a proteção de páginas** (a única pista medida e nunca feita na thread de desenho).
+3. Só se 1–2 não bastarem: a parte estrutural (gravar em várias threads, `PLANO-THREAD-DESENHO.md` opção C),
+   cara e arriscada.
+
 O problema, nas palavras do usuário: **o FPS cai bruscamente** na troca de área da floresta (correção do usuário em 18/11: o trecho que eu
 chamava de "floresta" é a entrada da floresta).
 Enquanto ele cair, nada melhorou. O único critério que vale: **na partida do usuário, nesses trechos, o FPS

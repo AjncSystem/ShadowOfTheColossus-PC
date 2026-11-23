@@ -862,6 +862,29 @@ void VideoOutDriver::Flip(const Request& req) {
                              static_cast<unsigned long long>(
                                  SotcStats::rb_hot_entries.load(std::memory_order_relaxed)));
             }
+            if (SotcStats::kUploadPrepass) { // sotc: test #49
+                ReportPrintf(report,
+                             "SOTC UPLOAD PREPASS: %llu texture uploads before the frame (%.1f MiB); "
+                             "in the frame: %llu image already used, %llu source not on the host\n",
+                             static_cast<unsigned long long>(SotcStats::prepass_uploads.exchange(0)),
+                             SotcStats::prepass_bytes.exchange(0) / 1048576.0,
+                             static_cast<unsigned long long>(SotcStats::prepass_used.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::prepass_source.exchange(0)));
+            }
+            if (SotcStats::kIndirectMergeStats) { // sotc: test #48
+                ReportPrintf(report,
+                             "SOTC INDIRECT MERGE: %llu GPU-argument draws, %llu could join the "
+                             "previous (longest run %llu); not: pipeline %llu, bindings %llu, state "
+                             "%llu, args not contiguous %llu, count/multi %llu\n",
+                             static_cast<unsigned long long>(SotcStats::imerge_total.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::imerge_ok.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::imerge_longest.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::imerge_pipeline.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::imerge_bind.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::imerge_state.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::imerge_args.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::imerge_count.exchange(0)));
+            }
             if (SotcStats::kFastBind) {
                 const uint64_t eligible = SotcStats::fast_bind_eligible.exchange(0);
                 const uint64_t hits = SotcStats::fast_bind_hits.exchange(0);

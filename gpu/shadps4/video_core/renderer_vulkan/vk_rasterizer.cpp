@@ -58,6 +58,77 @@
 
 namespace Vulkan {
 
+namespace {
+// sotc: SOTC_WATCH_PROGRAMS=hash,hash,... (test #41 of docs/sotc/MEMORIA-TESTES.md): one log line
+// per dispatch of those compute shaders, with the op's time on the draw thread, its DMA sweep and
+// buffer upload time, bytes copied from guest memory, process page faults, and how long the
+// command processor had waited for the game so far in the frame. Nothing else is timed.
+std::vector<u64> WatchedPrograms() {
+    std::vector<u64> out;
+    const char* v = std::getenv("SOTC_WATCH_PROGRAMS");
+    if (!v) {
+        return out;
+    }
+    const std::string list = v;
+    size_t pos = 0;
+    while (pos < list.size()) {
+        const size_t comma = list.find(',', pos);
+        const std::string item =
+            list.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        if (const u64 h = std::strtoull(item.c_str(), nullptr, 0)) {
+            out.push_back(h);
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        pos = comma + 1;
+    }
+    return out;
+}
+struct WatchOp {
+    u64 hash = 0;
+    std::chrono::steady_clock::time_point t0{};
+    u64 dma0 = 0, buf0 = 0, copy0 = 0, faults0 = 0;
+    explicit WatchOp(u64 pgm_hash) {
+        static const std::vector<u64> programs = WatchedPrograms();
+        if (programs.empty() ||
+            std::find(programs.begin(), programs.end(), pgm_hash) == programs.end()) {
+            return;
+        }
+        hash = pgm_hash;
+        dma0 = SotcStats::frame_ns[SotcStats::FrameDma].load(std::memory_order_relaxed);
+        buf0 = SotcStats::frame_ns[SotcStats::FrameBuffer].load(std::memory_order_relaxed);
+        copy0 = SotcStats::frame_copy_bytes.load(std::memory_order_relaxed);
+        faults0 = SotcStats::SplitProcessFaults();
+        t0 = std::chrono::steady_clock::now();
+    }
+    ~WatchOp() {
+        if (!hash) {
+            return;
+        }
+        static const auto start = std::chrono::steady_clock::now();
+        static std::atomic<u32> lines{0};
+        const auto now = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - t0).count();
+        const auto delta = [](u64 now_v, u64 before) { return now_v >= before ? now_v - before : now_v; };
+        const u64 dma = delta(SotcStats::frame_ns[SotcStats::FrameDma].load(), dma0);
+        const u64 buf = delta(SotcStats::frame_ns[SotcStats::FrameBuffer].load(), buf0);
+        const u64 copy = delta(SotcStats::frame_copy_bytes.load(), copy0);
+        const u64 faults = delta(SotcStats::SplitProcessFaults(), faults0);
+        const double idle = SotcStats::frame_ns[SotcStats::FrameIdle].load() / 1e6;
+        if (lines.fetch_add(1, std::memory_order_relaxed) < 20000) {
+            std::fprintf(stderr,
+                         "SOTC WATCH %#llx at %.2fs: %.2f ms (dma %.2f, buffer %.2f), copied %llu KiB, "
+                         "%llu page faults; command processor idle so far this frame %.1f ms\n",
+                         static_cast<unsigned long long>(hash),
+                         std::chrono::duration<double>(now - start).count(), ms, dma / 1e6,
+                         buf / 1e6, static_cast<unsigned long long>(copy >> 10),
+                         static_cast<unsigned long long>(faults), idle);
+        }
+    }
+};
+} // namespace
+
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
     // is encountered and implemented in the recompiler.
@@ -2411,6 +2482,50 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
+    if (SotcStats::kIndirectMergeStats) [[unlikely]] { // sotc: test #48, counting only
+        struct Prev {
+            const GraphicsPipeline* pipeline = nullptr;
+            VkBuffer buffer = VK_NULL_HANDLE;
+            u64 end = 0;
+            u32 stride = 0;
+            u64 state_token = 0;
+            VkCommandBuffer cmdbuf = VK_NULL_HANDLE;
+            u64 run = 0;
+        };
+        static thread_local Prev prev;
+        const VkBuffer handle = buffer->Handle();
+        const VkCommandBuffer cb = cmdbuf;
+        SotcStats::imerge_total.fetch_add(1, std::memory_order_relaxed);
+        std::atomic<uint64_t>* why = nullptr;
+        if (count_address != 0 || max_count != 1) {
+            why = &SotcStats::imerge_count;
+        } else if (prev.pipeline != pipeline || prev.cmdbuf != cb) {
+            why = &SotcStats::imerge_pipeline;
+        } else if (!fast_bind_hit) {
+            why = &SotcStats::imerge_bind;
+        } else if (prev.state_token != state_token || needs_barrier) {
+            why = &SotcStats::imerge_state;
+        } else if (prev.buffer != handle || prev.end != base || prev.stride != stride) {
+            why = &SotcStats::imerge_args;
+        }
+        if (why) {
+            why->fetch_add(1, std::memory_order_relaxed);
+            prev.run = 1;
+        } else {
+            SotcStats::imerge_ok.fetch_add(1, std::memory_order_relaxed);
+            ++prev.run;
+            u64 longest = SotcStats::imerge_longest.load(std::memory_order_relaxed);
+            while (prev.run > longest &&
+                   !SotcStats::imerge_longest.compare_exchange_weak(longest, prev.run)) {
+            }
+        }
+        prev.pipeline = pipeline;
+        prev.buffer = handle;
+        prev.end = base + u64{stride} * max_count;
+        prev.stride = stride;
+        prev.state_token = state_token;
+        prev.cmdbuf = cb;
+    }
     GpuTimesBefore(cmdbuf, SotcGpuTimes::KDrawIndirect, pipeline); // sotc: SOTC_GPU_TIMES
     if (is_indexed) {
         ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
@@ -2544,6 +2659,7 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     SotcStats::current_program.store(cs.pgm_hash, std::memory_order_relaxed);
+    const WatchOp watch{cs.pgm_hash}; // sotc: SOTC_WATCH_PROGRAMS
     if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1
         SotcOps::NoteDispatch(cs.pgm_hash, u64{cs_program.dim_x} * cs_program.dim_y * cs_program.dim_z);
     }
@@ -2824,6 +2940,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
     if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1
         SotcOps::NoteDispatch(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash, 0);
     }
+    const WatchOp watch{pipeline->GetStage(Shader::SwStage::Compute).pgm_hash}; // sotc
     DispPhase::Mark(DispPhase::Pre);
     // sotc: the program being bound (ObtainBuffer's SOTC_GPU_TIMES dependency notes).
     SotcStats::current_program.store(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash,

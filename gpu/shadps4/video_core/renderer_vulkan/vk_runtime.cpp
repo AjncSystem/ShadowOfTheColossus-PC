@@ -13,6 +13,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
+#include "video_core/sotc_stats.h"
 
 #include <vulkan/vulkan_format_traits.hpp>
 
@@ -182,8 +183,45 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
 
 void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                           std::span<const vk::BufferImageCopy> upload_copies) {
-    SotcGpuTimes::Note(SotcGpuTimes::CTexUpload); // sotc: SOTC_GPU_TIMES
     SetBackingSamples(dst, dst->info.num_samples, false);
+    const bool host_ready = std::exchange(upload_source_host_ready, false);
+    if (SotcStats::kUploadPrepass) {
+        // sotc: SOTC_UPLOAD_PREPASS: a never-used image (no state yet) whose bytes are on the host
+        // is uploaded in the upload command buffer, which the submit puts before the primary one.
+        // The image's state becomes transfer-written, so its first use in the primary one gets the
+        // usual barrier from the copy stage; the source range is marked read the same way, so a
+        // later GPU write to it waits for the copy.
+        const bool fresh = dst->backing->state.layout == vk::ImageLayout::eUndefined &&
+                           dst->backing->subresource_states.empty();
+        if (fresh && host_ready) {
+            VideoCore::Image::Barriers barriers;
+            dst->GetBarriers(barriers, vk::ImageLayout::eTransferDstOptimal,
+                             vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eCopy);
+            const auto upload_cmdbuf = scheduler.UploadCommandBuffer();
+            if (!barriers.empty()) {
+                upload_cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                    .imageMemoryBarrierCount = static_cast<u32>(barriers.size()),
+                    .pImageMemoryBarriers = barriers.data(),
+                });
+            }
+            upload_cmdbuf.copyBufferToImage(src->Handle(), dst->GetImage(),
+                                            vk::ImageLayout::eTransferDstOptimal, upload_copies);
+            u64 bytes = 0;
+            for (const auto& copy : upload_copies) {
+                const auto copy_size = BufferImageCopySize(copy, dst->info.pixel_format);
+                bytes += copy_size;
+                AccessBuffer(src, copy.bufferOffset, copy_size, vk::PipelineStageFlagBits2::eCopy,
+                             vk::AccessFlagBits2::eTransferRead);
+            }
+            dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
+            SotcStats::prepass_uploads.fetch_add(1, std::memory_order_relaxed);
+            SotcStats::prepass_bytes.fetch_add(bytes, std::memory_order_relaxed);
+            return;
+        }
+        (fresh ? SotcStats::prepass_source : SotcStats::prepass_used)
+            .fetch_add(1, std::memory_order_relaxed);
+    }
+    SotcGpuTimes::Note(SotcGpuTimes::CTexUpload); // sotc: SOTC_GPU_TIMES
     scheduler.EndRendering();
 
     bool needs_flush =

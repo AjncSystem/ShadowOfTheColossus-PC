@@ -53,8 +53,12 @@ void AddMotion(std::atomic<float>& total, float delta) {
 // The window icon from launcher/sotc.png (on Windows the executable's icon resource gives it).
 void SetWindowIcon(SDL_Window* window) {
     const char* base = SDL_GetBasePath(); // out/ in a source tree
-    const std::string paths[] = {std::string(base ? base : "") + "../launcher/sotc.png",
-                                 "launcher/sotc.png"};
+    const std::string paths[] = {
+        std::string(base ? base : "") + "../launcher/window_icon.png",
+        std::string(base ? base : "") + "../launcher/sotc.png",
+        "launcher/window_icon.png",
+        "launcher/sotc.png",
+    };
     for (const std::string& path : paths) {
         if (SDL_Surface* icon = SDL_LoadPNG(path.c_str())) {
             SDL_SetWindowIcon(window, icon);
@@ -71,6 +75,7 @@ void SetWindowIcon(SDL_Window*) {}
 WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}, height{height_} {
     // sotc: the click that brings the window to the front also reaches the game (mouse capture).
     SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
+    SDL_SetHint("SDL_APP_ID", "sotc");
     // Gamepads are sampled by runtime_pad.c; their events are pumped here with the window's.
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         UNREACHABLE_MSG("Failed to initialize SDL video: {}", SDL_GetError());

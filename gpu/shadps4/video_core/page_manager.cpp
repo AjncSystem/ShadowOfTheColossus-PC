@@ -764,7 +764,7 @@ struct SignalImpl : public PageManager::Impl {
         std::fprintf(stderr, "SOTC readback faults in 10 s: %llu\n", static_cast<unsigned long long>(total));
         for (size_t i = 0; i < sorted.size() && i < 12; ++i) {
             const auto& [count, key] = sorted[i];
-            char where[MAX_PATH] = "?";
+            char where[512] = "?";
 #ifdef _WIN32
             HMODULE module = nullptr;
             if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |

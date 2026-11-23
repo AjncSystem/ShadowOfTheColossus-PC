@@ -41,6 +41,7 @@ import sys
 import time
 
 PORT = Path(__file__).resolve().parent
+DATA = Path(os.environ.get('SOTC_DATA_DIR', PORT)).resolve()
 SCRIPTS = PORT / 'scripts'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
 
@@ -51,7 +52,7 @@ def fail(message):
 
 
 def load_ini():
-    ini = PORT / 'sotc.ini'
+    ini = DATA / 'sotc.ini'
     if ini.is_file():
         for line in ini.read_text(encoding='utf-8', errors='replace').splitlines():
             line = line.strip()
@@ -60,17 +61,151 @@ def load_ini():
                 os.environ.setdefault(name.strip(), value.strip())
 
 
+def load_launcher_settings():
+    """Apply settings saved by the in-game F1 menu (launcher_settings.json) when present."""
+    import json
+    user_dir = Path(os.environ.get('SOTC_USER_DIR', DATA / 'user')).resolve()
+    cfg_path = Path(os.environ.get('SOTC_LAUNCHER_SETTINGS') or (user_dir / 'launcher_settings.json'))
+    if not cfg_path.is_file():
+        return
+    try:
+        s = json.loads(cfg_path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return
+    if not isinstance(s, dict):
+        return
+    os.environ.setdefault('SOTC_LAUNCHER_SETTINGS', str(cfg_path))
+    env = os.environ
+    if 'fullscreen' in s:
+        env['BB_FULLSCREEN'] = '1' if s['fullscreen'] else '0'
+    output_res = str(s.get('output_res') or '')
+    if output_res:
+        env['SOTC_OUTPUT_RES'] = output_res
+    neo = bool(s.get('neo')) and output_res not in ('2560x1080', '3440x1440', '3840x1080', '5120x1440')
+    if 'neo' in s:
+        env['SOTC_NEO'] = '1' if neo else '0'
+    if s.get('render_res'):
+        env['SOTC_RENDER_RES'] = str(s['render_res'])
+    elif output_res and output_res not in ('1280x720', '1920x1080') and not neo:
+        env['SOTC_RENDER_RES'] = output_res
+    if 'fps_mode' in s or 'af16' in s or 'hdr' in s:
+        fps_mode = str(s.get('fps_mode') or '60')
+        modes = ['af16'] if s.get('af16', True) else []
+        if fps_mode != '30':
+            modes.append('fps60game')
+        modes.append('grassbuf')
+        if s.get('hdr'):
+            modes.append('hdr')
+        env['SOTC_MODES'] = ','.join(modes)
+        env['SOTC_FPS_CAP'] = '30' if fps_mode == '30' else 'off'
+        env['SOTC_FPS_LIMIT'] = '60' if fps_mode == '60' else '0'
+        if fps_mode == '60':
+            if s.get('fps_dynamic', True):
+                env.setdefault('SOTC_FPS_DYNAMIC', '48')
+            else:
+                env['SOTC_FPS_DYNAMIC'] = '0'
+    if s.get('present_mode'):
+        env['BB_PRESENT_MODE'] = str(s['present_mode'])
+    if s.get('language'):
+        env['BB_LANGUAGE'] = str(s['language'])
+    if s.get('ui_language'):
+        env['SOTC_UI_LANG'] = str(s['ui_language'])
+    if 'show_fps' in s:
+        if s['show_fps']:
+            env['SOTC_FPS'] = '1'
+        else:
+            env.pop('SOTC_FPS', None)
+    upscaler = str(s.get('upscaler') or '')
+    if upscaler:
+        env['BB_FSR1'] = '1' if upscaler in ('fsr1', 'dlss', 'fsr4') else '0'
+        if upscaler in ('dlss', 'fsr4'):
+            env['SOTC_UPSCALER'] = upscaler
+        else:
+            env.pop('SOTC_UPSCALER', None)
+    if s.get('sharpness'):
+        sharp_rcas = {'high': '0.00', 'medium': '0.30', 'low': '0.60', 'off': '1.00'}
+        sharp_dlss = {'high': '1.0', 'medium': '0.6', 'low': '0.3', 'off': '-1'}
+        val = str(s['sharpness'])
+        env['BB_FSR_SHARPEN'] = '0' if val == 'off' else '1'
+        if val in sharp_rcas:
+            env['BB_FSR_SHARPNESS'] = sharp_rcas[val]
+        env['SOTC_DLSS_SHARPEN'] = sharp_dlss.get(val, val)
+    if s.get('framegen'):
+        env['SOTC_FRAMEGEN'] = str(s['framegen'])
+    if 'textures' in s:
+        tex = str(s['textures'] or 'high')
+        if tex != 'off':
+            env.setdefault('SOTC_LOD_LINGER', '1')
+            env.setdefault('SOTC_LOD_FEEDBACK', '1')
+            tex_map = {'low': '3', 'medium': '2', 'high': '1', 'max': '0'}
+            if tex in tex_map:
+                env['SOTC_LOD_LEVEL'] = tex_map[tex]
+        else:
+            env['SOTC_LOD_FEEDBACK'] = '0'
+    env.setdefault('SOTC_POOL_FREEZE', '1')
+    env.setdefault('SOTC_RELEASE_DEFER', '1')
+    env.setdefault('SOTC_IMAGE_DEDICATED', '1')
+    if 'perf_record_thread' in s:
+        env['SOTC_RECORD_THREAD'] = '1' if s['perf_record_thread'] else '0'
+    if 'shadow_reuse' in s:
+        env['SOTC_SHADOW_REUSE'] = str(s['shadow_reuse'])
+    if 'volume' in s:
+        env['SOTC_AUDIO_VOLUME'] = str(s['volume'])
+    if str(s.get('audio_channels') or '') in ('2', '6', '8'):
+        env['SOTC_AUDIO_CHANNELS'] = str(s['audio_channels'])
+    if 'audio_lfe' in s and not s['audio_lfe']:
+        env['SOTC_AUDIO_LFE'] = '0'
+    if str(s.get('audio_device') or '').strip():
+        env['SOTC_AUDIO_DEVICE'] = str(s['audio_device']).strip()
+    if 'mouse' in s:
+        env['SOTC_MOUSE'] = '1' if s['mouse'] else '0'
+    if 'mouse_sens' in s:
+        env['SOTC_MOUSE_SENS'] = str(s['mouse_sens'])
+    if 'mouse_invert' in s:
+        env['SOTC_MOUSE_INVERT'] = '1' if s['mouse_invert'] else '0'
+    if 'rumble' in s:
+        env['SOTC_RUMBLE'] = '1' if s['rumble'] else '0'
+    if s.get('button_icons') == 'xbox' and (PORT / 'glyphs' / 'xbox').is_dir():
+        env['SOTC_TEX_REPLACE'] = str(PORT / 'glyphs' / 'xbox')
+    elif s.get('button_icons') == 'ps':
+        env.pop('SOTC_TEX_REPLACE', None)
+    if any(k in s for k in ('grass_distance', 'grass_height', 'weed_distance', 'weed_height', 'grass_detail')):
+        env['SOTC_GRASS'] = ' '.join(str(s.get(k) or '1') for k in (
+            'grass_distance', 'grass_height', 'weed_distance', 'weed_height', 'grass_detail'))
+    culling = ['doIndexBufferCulling=0', 'doSunShadowIndexBufferCulling=0'] if s.get('perf_culling', True) else []
+    cvars = [c for c in env.get('SOTC_CVARS', '').split()
+             if c not in ('skipSplash=1', 'nointro', 'doIndexBufferCulling=0', 'doSunShadowIndexBufferCulling=0')
+             and not c.startswith(('r_virtualGeometryNumShadowCascades', 'r_virtualGeometryFadeMultiplier='))]
+    cvars = culling + cvars
+    if s.get('skip_logos'):
+        cvars.append('skipSplash=1')
+    if s.get('skip_film'):
+        cvars.append('nointro')
+    grass = str(s.get('grass_shadows') or '2')
+    if grass in ('3', '4'):
+        cvars += [f'r_virtualGeometryNumShadowCascades{m}={grass}' for m in ('', '_BasePS4', '_Perf', '_Cinematic')]
+    fade = str(s.get('grass_fade') or '1')
+    if fade in ('0.5', '0.75', '2', '3'):
+        cvars.append(f'r_virtualGeometryFadeMultiplier={fade}')
+    env['SOTC_CVARS'] = ' '.join(cvars)
+
+
 def no_console():
     """Started without a console (the launcher): console programs must not open their own."""
+    if sys.platform != 'win32':
+        return 0
     import ctypes
     return 0 if ctypes.windll.kernel32.GetConsoleWindow() else subprocess.CREATE_NO_WINDOW
 
 
 def find_probe():
-    for candidate in (PORT / 'bin' / 'bb-probe.exe', PORT / 'out' / 'bb-probe.exe'):
-        if candidate.is_file():
-            return candidate
-    fail('bb-probe.exe not found: build it with build.sh (MSYS2 CLANG64) or use a packaged build.')
+    names = ('bb-probe.exe',) if sys.platform == 'win32' else ('bb-probe', 'bb-probe.exe')
+    for folder in (PORT / 'bin', PORT / 'out'):
+        for name in names:
+            candidate = folder / name
+            if candidate.is_file():
+                return candidate
+    fail('bb-probe not found: build it with build.sh or use a packaged build.')
 
 
 def run_script(name, *args):
@@ -128,13 +263,14 @@ def merged_source(game, update, out):
 
 def main():
     load_ini()
+    load_launcher_settings()
     env = os.environ
-    os.chdir(PORT)
-    out = PORT / 'out'
+    os.chdir(DATA)
+    out = DATA / 'out'
     out.mkdir(exist_ok=True)
     # The EU dump (CUSA08809) next to the port, else the US one (CUSA08034).
-    default = next((PORT.parent / g for g in ('CUSA08809', 'CUSA08034') if (PORT.parent / g / 'eboot.bin').is_file()),
-                   PORT.parent / 'CUSA08809')
+    default = next((DATA.parent / g for g in ('CUSA08809', 'CUSA08034') if (DATA.parent / g / 'eboot.bin').is_file()),
+                   DATA.parent / 'CUSA08809')
     game = Path(env.get('SOTC_GAME_DIR', default)).resolve()
     if not (game / 'eboot.bin').is_file():
         fail(f'No eboot.bin in {game}: set SOTC_GAME_DIR (environment or sotc.ini) to the CUSA08809 (EU) '
@@ -166,7 +302,8 @@ def main():
     stamp = out / 'prepared.txt'
     wanted = fingerprint(source, modules)
     images = [out / name for name in ('boot-linked.bin', 'content.bin', 'sotc-cpu.bin')]
-    if not stamp.is_file() or stamp.read_text().strip() != wanted or not all(p.is_file() for p in images):
+    prebuilt = env.get('SOTC_PREBUILT') == '1' and all(p.is_file() for p in images)
+    if not prebuilt and (not stamp.is_file() or stamp.read_text().strip() != wanted or not all(p.is_file() for p in images)):
         print('Preparing the game image...')
         run_script('prepare.py', source, '--out', out)
         link = ['link_modules.py', source, '--out', out]
@@ -226,15 +363,15 @@ def main():
         clang64 = Path(env.get('MSYS2_ROOT', r'C:\msys64')) / 'clang64' / 'bin'
         if clang64.is_dir():
             env['PATH'] = f'{clang64}{os.pathsep}{env.get("PATH", "")}'
-    user = Path(env.get('SOTC_USER_DIR', PORT / 'user')).resolve()
+    user = Path(env.get('SOTC_USER_DIR', DATA / 'user')).resolve()
     user.mkdir(parents=True, exist_ok=True)
     env.setdefault('BB_GPU_USER_DIR', str(user))
     # Controls: key.<input>= / pad.<input>= lines of sotc.ini remap keys and buttons (src/runtime_pad.c).
-    env.setdefault('BB_CONFIG', str(PORT / 'sotc.ini'))
+    env.setdefault('BB_CONFIG', str(DATA / 'sotc.ini'))
     command = [str(probe), str(out / 'boot-linked.bin'), '--content-profile', str(out / 'content.bin'),
                '--sotc-cpu', str(out / 'sotc-cpu.bin'), '--patches', str(out / 'patches.bin'),
                *(['--sotc-cmdline', str(out / 'cmdline.bin')] if (out / 'cmdline.bin').is_file() else []),
-               '--app0', str(game), '--user', str(user), *sys.argv[1:]]
+               '--app0', str(game), '--user', str(user), '--timeout', '0', *sys.argv[1:]]
     # SOTC_WRAP: a JSON list put in front of the game, e.g. RenderDoc
     # ["C:/Program Files/RenderDoc/renderdoccmd.exe", "capture", "-w", "-c", "<file>"]; F12 then
     # captures the frame (SOTC_RDOC_SUBMITS submissions).

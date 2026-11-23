@@ -2,6 +2,17 @@
 
 #include "video_core/renderer_vulkan/vk_fsr4.h"
 
+#ifndef _WIN32
+
+namespace Vulkan::Fsr4 {
+bool Init(const Instance&) { return false; }
+bool Available() { return false; }
+const char* Name() { return "FSR"; }
+bool Dispatch(VkCommandBuffer, const Params&) { return false; }
+} // namespace Vulkan::Fsr4
+
+#else
+
 #include <windows.h>
 
 #include <algorithm>
@@ -285,3 +296,5 @@ bool Dispatch(VkCommandBuffer cmdbuf, const Params& p) {
 }
 
 } // namespace Vulkan::Fsr4
+
+#endif

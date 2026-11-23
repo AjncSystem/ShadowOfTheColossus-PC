@@ -4,6 +4,7 @@
 // (driver allocations, stacks) by allocation size. Diagnostic only; Windows only.
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 namespace BbMemReport {

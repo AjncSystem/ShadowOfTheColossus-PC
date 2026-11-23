@@ -6,7 +6,25 @@
 #include "video_core/renderer_vulkan/vk_fsr4.h"
 #include "video_core/renderer_vulkan/vk_fsrfg.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <chrono>
+using HMODULE = void*;
+union LARGE_INTEGER {
+    long long QuadPart;
+};
+inline bool QueryPerformanceCounter(LARGE_INTEGER* lpPerformanceCount) {
+    lpPerformanceCount->QuadPart = std::chrono::steady_clock::now().time_since_epoch().count();
+    return true;
+}
+inline bool QueryPerformanceFrequency(LARGE_INTEGER* lpFrequency) {
+    lpFrequency->QuadPart =
+        static_cast<long long>(std::chrono::steady_clock::period::den) /
+        static_cast<long long>(std::chrono::steady_clock::period::num);
+    return true;
+}
+#endif
 
 #include <algorithm>
 #include <array>
@@ -168,11 +186,17 @@ void OnApiError(const sl::APIError& e) {
 
 template <typename T>
 bool Resolve(T*& out, const char* name) {
+#ifdef _WIN32
     out = reinterpret_cast<T*>(GetProcAddress(api.dll, name));
     if (!out) {
         std::fprintf(stderr, "SOTC DLSSG: %s missing in sl.interposer.dll\n", name);
     }
     return out != nullptr;
+#else
+    (void)name;
+    out = nullptr;
+    return false;
+#endif
 }
 
 template <typename T>
@@ -822,6 +846,7 @@ bool Capturing() {
 // is not the foreground window. The scripted benchmarks keep their window behind the user's
 // (it must never take the focus), so Streamline's GetForegroundWindow import is pointed at a
 // function returning the game window.
+#ifdef _WIN32
 HWND game_window{};
 
 BOOL CALLBACK FindGameWindow(HWND hwnd, LPARAM) {
@@ -880,6 +905,7 @@ void PatchForegroundWindow(const wchar_t* module_name) {
         }
     }
 }
+#endif
 
 void SetOptions(bool on) {
     sl::DLSSGOptions options{};
@@ -964,6 +990,9 @@ PFN_vkGetInstanceProcAddr LoadInterposer() {
     if (!fg_wanted && !sr_wanted) {
         return nullptr;
     }
+#ifndef _WIN32
+    return nullptr;
+#else
     if (const char* l = std::getenv("SOTC_DLSSG_LOG")) {
         log_level = std::atoi(l);
     }
@@ -1036,6 +1065,7 @@ PFN_vkGetInstanceProcAddr LoadInterposer() {
     std::fprintf(stderr, "SOTC DLSSG: Streamline %d.%d.%d loaded\n", SL_VERSION_MAJOR,
                  SL_VERSION_MINOR, SL_VERSION_PATCH);
     return gipa;
+#endif
 }
 
 void OnDeviceCreated(const Instance& instance) {

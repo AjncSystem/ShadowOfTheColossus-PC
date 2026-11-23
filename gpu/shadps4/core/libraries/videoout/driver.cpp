@@ -862,6 +862,25 @@ void VideoOutDriver::Flip(const Request& req) {
                              static_cast<unsigned long long>(
                                  SotcStats::rb_hot_entries.load(std::memory_order_relaxed)));
             }
+            if (SotcStats::kBufHoistStats) { // sotc: test #50
+                ReportPrintf(report,
+                             "SOTC BUF HOIST: %llu uploads could move to the submission start "
+                             "(%.1f MiB), %llu could not (%.1f MiB, range already used); while "
+                             "binding 0x79704cba: %.1f MiB could, %.1f MiB could not\n",
+                             static_cast<unsigned long long>(SotcStats::hoist_free_n.exchange(0)),
+                             SotcStats::hoist_free_bytes.exchange(0) / 1048576.0,
+                             static_cast<unsigned long long>(SotcStats::hoist_used_n.exchange(0)),
+                             SotcStats::hoist_used_bytes.exchange(0) / 1048576.0,
+                             SotcStats::hoist_free_79.exchange(0) / 1048576.0,
+                             SotcStats::hoist_used_79.exchange(0) / 1048576.0);
+                ReportPrintf(report,
+                             "SOTC BUF GUARD (full): %.1f MiB pass; fail: %.1f MiB DMA shader in "
+                             "flight, %.1f MiB used in this command buffer, %.1f MiB used in flight\n",
+                             SotcStats::guard_pass_bytes.exchange(0) / 1048576.0,
+                             SotcStats::guard_dma_bytes.exchange(0) / 1048576.0,
+                             SotcStats::guard_current_bytes.exchange(0) / 1048576.0,
+                             SotcStats::guard_inflight_bytes.exchange(0) / 1048576.0);
+            }
             if (SotcStats::kUploadPrepass) { // sotc: test #49
                 ReportPrintf(report,
                              "SOTC UPLOAD PREPASS: %llu texture uploads before the frame (%.1f MiB); "

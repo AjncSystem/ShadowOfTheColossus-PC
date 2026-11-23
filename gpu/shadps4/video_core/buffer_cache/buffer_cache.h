@@ -462,6 +462,9 @@ private:
     /// GPU writes recorded into the command buffer still being built (tick current_writes_tick).
     RangeSet current_writes;
     u64 current_writes_tick{};
+    /// sotc: SOTC_BUF_HOIST_STATS (test #50): ranges bound in the command buffer still being built.
+    RangeSet hoist_used;
+    u64 hoist_used_tick{};
     void RecordCurrentWrite(VAddr addr, u64 size);
     /// sotc: the range the guest touched, during the DownloadMemory of its window (size 0 else).
     VAddr fault_addr{};

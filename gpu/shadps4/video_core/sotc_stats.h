@@ -384,6 +384,54 @@ inline const bool kUploadPrepass = [] {
 }();
 inline std::atomic<uint64_t> prepass_uploads{0}, prepass_bytes{0}, prepass_used{0},
     prepass_source{0};
+/// sotc: SOTC_BUF_HOIST_STATS=1 (test #50): CPU buffer uploads (staging -> arena) by whether their
+/// range was already bound or GPU-written in the command buffer being built ("used": the upload
+/// cannot move to the start of the submission) or not ("free"); counts, bytes, and bytes of uploads
+/// made while binding the 0x79704cba dispatch.
+inline const bool kBufHoistStats = [] {
+    const char* v = std::getenv("SOTC_BUF_HOIST_STATS");
+    return v && v[0] == '1';
+}();
+inline std::atomic<uint64_t> hoist_free_n{0}, hoist_used_n{0}, hoist_free_bytes{0},
+    hoist_used_bytes{0}, hoist_free_79{0}, hoist_used_79{0};
+/// sotc: the full guard of docs/sotc/PLANO-FILA-COPIA.md step 1 (with SOTC_BUF_HOIST_STATS): the
+/// newest scheduler tick that touched each 64 KiB page (binds, texture sources, GPU writes), in a
+/// direct-mapped table (a collision keeps the newer tick: conservative), and the newest tick that
+/// bound a DMA shader (which may read any memory). Draw thread only; diagnostics.
+struct GuardSlot {
+    uint64_t page;
+    uint64_t tick;
+};
+inline constexpr uint64_t kGuardSlots = uint64_t{1} << 20;
+inline GuardSlot* GuardTable() {
+    static GuardSlot* table = new GuardSlot[kGuardSlots]();
+    return table;
+}
+inline void GuardNote(uint64_t addr, uint64_t size, uint64_t tick) {
+    if (!size) {
+        return;
+    }
+    GuardSlot* t = GuardTable();
+    for (uint64_t p = addr >> 16, last = (addr + size - 1) >> 16; p <= last; ++p) {
+        GuardSlot& s = t[p & (kGuardSlots - 1)];
+        s.page = p;
+        s.tick = std::max(s.tick, tick);
+    }
+}
+inline uint64_t GuardTick(uint64_t addr, uint64_t size) {
+    if (!size) {
+        return 0;
+    }
+    const GuardSlot* t = GuardTable();
+    uint64_t newest = 0;
+    for (uint64_t p = addr >> 16, last = (addr + size - 1) >> 16; p <= last; ++p) {
+        newest = std::max(newest, t[p & (kGuardSlots - 1)].tick);
+    }
+    return newest;
+}
+inline uint64_t guard_dma_tick = 0;
+inline std::atomic<uint64_t> guard_pass_bytes{0}, guard_dma_bytes{0}, guard_current_bytes{0},
+    guard_inflight_bytes{0};
 inline std::atomic<uint64_t> imerge_total{0}, imerge_ok{0}, imerge_pipeline{0}, imerge_bind{0},
     imerge_state{0}, imerge_args{0}, imerge_count{0}, imerge_longest{0};
 inline std::atomic<uint64_t> vis_held_labels{0};   ///< labels held while their order needed it

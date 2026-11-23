@@ -153,6 +153,39 @@ emular a GPU.**
 | 45 | `SOTC_VIS_DIRECT=1 SOTC_VIS_DIRECT_ORDER=1`, sem medições, julgado no trecho denso | média ≥ 53 nas janelas ≥ 6 mil comandos (ref. 47,8–52,2), mediana ≤ 18 ms, 0 quadros > 50 ms após a troca, resto ≥ 57 (se cair a 50–55 como em #16: ❌). Risco: estabilidade no final do jogo não provada | proposto (parceira) |
 | 43b | núcleos P pelo próprio exe (`SOTC_PCORES=1`) | média ≥ 51 nas janelas ≥ 6 mil comandos (ref. ~49,8), mediana ≤ 18,5 ms | segunda opção (ganho esperado pequeno) |
 
+## Referência externa: GOW3rehooked (github.com/cuesta4/GOW3rehooked, GPL-2.0+, lido em 23/11)
+Port de God of War III Remastered (PS4) do autor do build de GOW3 no shadPS4; 403 FPS a 480p / 150 a 4K (Ryzen 5600 +
+RTX 3060). **Não usa o `video_core` do shadPS4**: renderizador próprio, só para esse jogo. O que explica o FPS:
+1. **Espelho único da memória do jogo na VRAM** (um buffer esparso de até 32 GB): os shaders traduzidos leem a memória
+   pelo endereço + um deslocamento em push constant; não há cache de buffers nem `ObtainBuffer`/bind por recurso.
+2. **Escritas da CPU**: páginas protegidas contra escrita; a falta reabre uma sequência de páginas de uma vez (16, dobrando
+   até 256) e as páginas sujas são copiadas para o espelho em lote uma vez por quadro.
+3. **Escritas da GPU para a CPU**: sem falta de página de leitura. As faixas que a GPU escreveu no quadro são copiadas em
+   lote (espelho → host, numa fila de cópia própria) quando o quadro termina.
+4. **Rótulos honestos**: a thread da GPU desenha cada envio, **espera a GPU terminar** e só então percorre os pacotes e
+   escreve rótulos/interrupções. Funciona porque o GOW3 só confere o progresso da GPU no meio do quadro seguinte (rótulo
+   F−2): o jogo trabalha dois quadros atrás. No SotC o jogo lê o mapa de visibilidade **no mesmo quadro** — por isso o
+   nosso `SOTC_EOP_DEFER` (o mesmo modelo) corta o FPS pela metade.
+5. **Ganchos no código do jogo** (só a versão 1.02): ele mexe no laço de quadro do jogo em endereços fixos
+   (`FlipArenas`, `AwaitCopies`) para sincronizar as arenas com as cópias.
+6. Shaders AOT com receitas de uma jogatina completa (nós temos o cache mantido + pré-tradução de compute).
+Aplicável a nós: (1) cortaria custo de bind/obtain (mas a thread de desenho não é o limite no denso); (4) só funciona se o
+jogo ler o resultado da GPU um quadro depois — no SotC isso foi tentado como "máscara do quadro anterior" (fork
+HiddenUserHere: objetos piscando). O que sobra de novo: **(5) gancho no laço do jogo** e **a qualidade do tradutor de
+shaders** (o GPU deles faz 4K em 6,5 ms num jogo mais leve; comparar custo por shader exigiria medir).
+
+### Ideias do GOW3 avaliadas pela parceira (23/11 16:05)
+Dados do denso (15:41, janela 90 s, "between by what was recorded"): barrier+upload+bufcopy 0,97 ms/13 (quase todo
+antes do `0x79704cba`, 1,28 ms/2 por quadro), barrier+texupload+imagecopy 0,95, barreira solta 0,51 ms/293,
+barrier+texupload 0,34, barrier+pass 0,17/43.
+
+| # | Mudança | Medida antes / aprovação | Estado |
+|---|---|---|---|
+| 50 | **B: envios de buffer da CPU agrupados no início da submissão** (no upload command buffer), só quando a faixa não foi usada antes na mesma submissão; junto, proteção de páginas em lote uma vez por quadro (o #40) | **antes**: contador (5 s) de envios de buffer da CPU — quantos, bytes, se a faixa já foi usada pela GPU nesta submissão, se cai antes do `0x79704cba`; seguir só se ≥ 70% dos ~13/quadro do denso puderem ir para o início e somarem ≥ 0,6 ms; < 50% → abandonar. **Aprovação**: barrier+upload+bufcopy ≤ 0,4 ms/quadro, "antes do 0x79704cba" ≤ 0,5, entre ops ≤ 2,7, média ≥ 6 mil comandos ≥ 53,5 em 2 partidas, sem erro de imagem e uma partida até o final sem queda. Ganho esperado 0,5–0,9 ms (~54–55 FPS) | proposto |
+| 50a ⏳ | contador `SOTC_BUF_HOIST_STATS=1` (linha `SOTC BUF HOIST` a cada 5 s): cada envio de buffer da CPU (staging → arena) classificado como "free" (a faixa não foi ligada nem escrita pela GPU no command buffer em gravação: poderia ir para o início) ou "used"; bytes também durante o bind do `0x79704cba`. Limite: só conta como uso os binds via `ObtainBuffer` e as escritas da GPU | seguir para o #50 só se ≥ 70% dos bytes do denso forem "free" (e a parte do `0x79704cba` também) | **16:02 (exe 0f9fcd64): ✅ critério atingido.** A cada 5 s, 27–54 mil envios de buffer da CPU = **2,5–3,4 GB (500–680 MB/s, ~10 MB por quadro)**; **96–98% dos bytes "free"** (usados: 43–110 MB). Denso (95–100 s, 6,7–8,6 mil comandos): 2,5–2,8 GB free contra 68–77 MB usados. Durante o bind do `0x79704cba` só 1,8–6 MB/5 s no denso (o pico de 200–700 MB é na carga). Limite da conta: "uso" só conta binds via `ObtainBuffer` e escritas da GPU. **Parceira:** contador otimista (fora dele: texturas TEX DIRECT ~1,1 GB/5 s, varredura de DMA, argumentos de indiretos, destinos de leitura de volta; e risco de inverter quem escreve por último). Guarda mínima: só mover se nenhuma página da faixa teve acesso da GPU por qualquer caminho desde o início da submissão (tick por página do rastreador). **O custo é banda de cópia, não barreira** (~10 MB/quadro em ~0,97 ms ≈ 10 GB/s, PCIe): adiantar na mesma fila gráfica rende só ~0,1–0,3 ms (ruído) → **não implementar assim**. Só vale com **fila de transferência** (copy engine, como o GOW3) sobreposta aos ~5 ms de parada, com semáforo no início da submissão; critério: barrier+upload+bufcopy na fila gráfica ≤ 0,3 ms, entre ops ≤ 2,7, média ≥ 6 mil comandos ≥ 53,5 em 2 partidas, sem erro de imagem, final sem queda. O 1,28 ms "antes do `0x79704cba`" não é envio de buffer (só 1,8–8 MB/5 s ali) |
+| 50b ⏳ | **etapa 1 do `PLANO-FILA-COPIA.md`**: guarda completa (linha `SOTC BUF GUARD (full)`): por página de 64 KiB, o tick mais novo que a tocou (binds, origem de textura, escritas da GPU) e o tick do último shader com DMA (lê qualquer memória); passa só sem acesso em voo nem no envio atual. Parceira (16:20): fila só-transferência com arenas `eConcurrent`, lotes de 1–2 MB mandados cedo; a 2ª fila gráfica não sobrepõe na NVIDIA | ≥ 70% dos bytes do denso passando → implementar; < 50% → parar | **16:10 (exe 4f6c4cdc): ➖ passa só 11–15% no denso** (90–105 s: 194–297 MB passam × 1,58–1,81 GB barrados a cada 5 s); **a barreira é o shader com DMA em voo** (lê qualquer memória, quase sempre há um na GPU); usados no envio atual 18–32 MB, em voo 75–114 MB. Pela regra, **linha da fila de cópia encerrada**. Atenção: com esse contador o jogo caiu para 29–47 FPS (o contador por página pesa na thread de desenho): tirado do lançador |
+| 51 | A: layout GENERAL em todas as imagens + barreiras globais mínimas | ganho 0,3–0,6 ms; **risco alto** (NVIDIA pode desligar a compressão de cor/profundidade e subir os ~14 ms de GPU) | descartado por ora |
+
 ## Estado agora (23/11, 10:45)
 - E:: exe `fa5edfc3`; lançador com variáveis extras vazias (estado do jogador comum).
 - Sobra o **mergulho da floresta**: 40–50 FPS por ~2–3 s, 1 quadro de 66 ms (sem medições, #39); e um quadro de ~100–145 ms depois da carga do save.

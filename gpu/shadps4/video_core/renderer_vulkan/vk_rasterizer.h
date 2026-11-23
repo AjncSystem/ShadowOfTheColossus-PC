@@ -359,6 +359,19 @@ public:
         const u64 tick = SotcStats::vis_tick.load(std::memory_order_acquire);
         return tick && !scheduler.IsFree(tick);
     }
+    /// sotc: SOTC_VIS_DIRECT_ORDER: the tick of the newest direct dispatch while the GPU has not
+    /// finished it (0 otherwise); submits it first when it is still being recorded.
+    u64 VisTickToWait() {
+        const u64 tick = SotcStats::vis_tick.load(std::memory_order_acquire);
+        if (!tick || scheduler.IsFree(tick)) {
+            return 0;
+        }
+        if (tick >= scheduler.CurrentTick()) {
+            SotcStats::vis_held_flushes.fetch_add(1, std::memory_order_relaxed);
+            Flush();
+        }
+        return tick;
+    }
 
 private:
     bool BindVisDirect(VAddr address, u64 size, u64 alignment, Shader::Backend::Bindings& binding,

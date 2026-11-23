@@ -545,6 +545,16 @@ public:
         priority_pending_ops_cv.notify_one();
     }
 
+    /// sotc: SOTC_VIS_DIRECT_ORDER: as DeferPriorityOperation, but runs once the GPU reached tick
+    /// (0: no GPU wait), still in order after every operation deferred before it.
+    void DeferPriorityOperationAt(Common::UniqueFunction<void>&& func, u64 tick) {
+        {
+            std::unique_lock lk(priority_pending_ops_mutex);
+            priority_pending_ops.emplace(std::move(func), tick);
+        }
+        priority_pending_ops_cv.notify_one();
+    }
+
     static std::mutex submit_mutex;
 
 private:

@@ -681,6 +681,14 @@ void VideoOutDriver::Flip(const Request& req) {
                              static_cast<unsigned long long>(SotcStats::vis_honest_labels.exchange(0)),
                              static_cast<unsigned long long>(SotcStats::vis_fallbacks.exchange(0)),
                              static_cast<unsigned long long>(SotcStats::vis_unmap_waits.exchange(0)));
+                if (SotcStats::kVisDirectOrder) {
+                    ReportPrintf(report,
+                                 "SOTC VIS ORDER: %llu labels held for a direct dispatch or behind "
+                                 "one, %llu submissions for it, %lld still held\n",
+                                 static_cast<unsigned long long>(SotcStats::vis_held_labels.exchange(0)),
+                                 static_cast<unsigned long long>(SotcStats::vis_held_flushes.exchange(0)),
+                                 static_cast<long long>(SotcStats::vis_labels_pending.load()));
+                }
             }
             if (const u64 queued = SotcStats::release_queued.exchange(0)) {
                 ReportPrintf(report,

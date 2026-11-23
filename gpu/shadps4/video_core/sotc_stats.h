@@ -358,6 +358,19 @@ inline std::atomic<uint64_t> tex_gather_uploads{0}, tex_gather_bytes{0}, tex_gat
 inline std::atomic<uint64_t> vis_tick{0};
 inline std::atomic<uint64_t> vis_direct_binds{0}, vis_honest_labels{0}, vis_fallbacks{0},
     vis_unmap_waits{0};
+/// sotc: SOTC_VIS_DIRECT_ORDER=1 (with SOTC_VIS_DIRECT; v3). v2 made every label wait for all the
+/// GPU work recorded before it while a direct dispatch was in flight (58.8 -> 41.8 FPS); v1 let
+/// later labels out before the GPU finished the dispatch (the game reused the memory: heap crash at
+/// the ending). Now a label after a direct dispatch waits only for that dispatch's tick, and a label
+/// while earlier ones are still held waits behind them (no GPU wait), so no label after a direct
+/// dispatch is seen before the dispatch finished and labels never overtake each other.
+inline const bool kVisDirectOrder = [] {
+    const char* v = std::getenv("SOTC_VIS_DIRECT_ORDER");
+    return v && v[0] == '1';
+}();
+inline std::atomic<uint64_t> vis_held_labels{0};   ///< labels held while their order needed it
+inline std::atomic<uint64_t> vis_held_flushes{0};  ///< submissions forced for the dispatch's tick
+inline std::atomic<int64_t> vis_labels_pending{0}; ///< held labels not written yet
 
 /// sotc: SOTC_SLOW_OPS=1 (with SOTC_DRAW_SPLIT): the draw thread's operations of each frame summed
 /// by shader (kind and first stage's hash; Liverpool::BackLoop), and for each frame over 40 ms the

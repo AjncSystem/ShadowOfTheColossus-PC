@@ -89,6 +89,7 @@ static ABI int32_t param_int(uint32_t id,int32_t *out) {
 typedef struct { char label[17]; char padding[3]; uint32_t status; } AddonInfo; /* 24 bytes */
 static AddonInfo addons[MAX_ADDONS];
 static unsigned addons_scanned;
+#ifdef _WIN32
 /* The string value of key in a param.sfo image, or NULL. */
 static const char *sfo_string(const unsigned char *data, size_t size, const char *key) {
     if (size<20 || memcmp(data,"\0PSF",4)) return NULL;
@@ -111,6 +112,7 @@ static int addon_known(const char *content) {
     for (unsigned i=0;i<addon_count;++i) if (!strncmp(addons[i].label,content+20,16)) return 1;
     return 0;
 }
+#endif
 static void scan_addons(void) {
     if (addons_scanned) return;
     addons_scanned=1;

@@ -141,16 +141,23 @@ static const bool kCopyLockOnce = [] {
 // through the guest address under the loader's copy guard (src/probe.c bb_copy_guard_buf): a fault
 // in it (a page the GPU tracking read-protected, or one the guest unmapped) returns here before
 // page tracking sees it, and the run is copied through the backing view as before.
+#ifdef _WIN32
 extern "C" __thread std::uintptr_t bb_copy_guard_lo, bb_copy_guard_hi;
 extern "C" __thread unsigned long long* bb_copy_guard_buf;
+#endif
 static const bool kCopyGuestView = [] {
+#ifdef _WIN32
     const char* v = std::getenv("SOTC_COPY_GUEST_VIEW");
     return !(v && v[0] == '0');
+#else
+    return false;
+#endif
 }();
 // False when the read faulted (nothing about dest is promised then). No C++ object with a
 // destructor lives in this frame: the fault resumes in bb_longjmp, which unwinds nothing. A copy
 // can nest (the fault handler copies too): the outer guard is saved and put back on both exits.
 [[gnu::noinline]] static bool GuardedGuestCopy(u8* dest, const void* source, u64 n) {
+#ifdef _WIN32
     const std::uintptr_t outer_lo = bb_copy_guard_lo;
     const std::uintptr_t outer_hi = bb_copy_guard_hi;
     unsigned long long* const outer_buf = bb_copy_guard_buf;
@@ -172,6 +179,12 @@ static const bool kCopyGuestView = [] {
     bb_copy_guard_hi = outer_hi;
     __atomic_store_n(&bb_copy_guard_buf, outer_buf, __ATOMIC_RELEASE);
     return true;
+#else
+    (void)dest;
+    (void)source;
+    (void)n;
+    return false;
+#endif
 }
 static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
     if (kCopyLockOnce && size && runtime_memory_copy_out(source, dest, size)) {
@@ -196,6 +209,7 @@ static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
             const char* v = std::getenv("SOTC_COPY_PREFETCH");
             return !v || v[0] != '0';
         }();
+#ifdef _WIN32
         if (backing && prefetch && n >= 256 * 1024) {
             // The copy reads the guest address with kCopyGuestView (fork): those PTEs matter.
             void* const read_from = kCopyGuestView ? reinterpret_cast<void*>(source)
@@ -203,6 +217,9 @@ static void CopySparseSerial(VAddr source, u8* dest, u64 size) {
             WIN32_MEMORY_RANGE_ENTRY range{read_from, static_cast<SIZE_T>(n)};
             PrefetchVirtualMemory(GetCurrentProcess(), 1, &range, 0);
         }
+#else
+        (void)prefetch;
+#endif
         if (backing && BbMemReport::WsDiagEnabled()) {
             const uint64_t before = static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(

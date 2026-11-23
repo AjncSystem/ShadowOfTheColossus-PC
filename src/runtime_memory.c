@@ -2113,4 +2113,7 @@ void runtime_memory_report(void) {
     printf("Runtime: flexible maps=%zu, in use=%" PRIu64 ", protects=%zu, queries=%zu, regions=%zu\n",
            flexible_maps, flexible_bytes, protects, queries, vma_count);
 }
+#ifndef _WIN32
+uint64_t runtime_memory_carve_splits(void) { return 0; }
+#endif
 

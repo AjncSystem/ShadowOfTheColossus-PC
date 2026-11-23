@@ -105,7 +105,7 @@ void runtime_file_configure(const char *app0,const char *user) {
         for (int i=0;i<2 && !update_root[0];++i) {
             snprintf(path,sizeof(path),"%s%s",app0,suffixes[i]);
             HostStat st;
-            if (!host_stat(path,&st) && S_ISDIR(st.st_mode)) snprintf(update_root,sizeof(update_root),"%s",path);
+            if (!host_stat(path,&st) && S_ISDIR(st.st_mode)) snprintf(update_root,sizeof(update_root),"%.*s",(int)(sizeof(update_root)-1),path);
         }
     }
     if (update_root[0]) printf("Runtime: game update overlaid from %s\n",update_root);
@@ -118,6 +118,55 @@ void runtime_file_configure(const char *app0,const char *user) {
         runtime_file_mount(guest,path);
     }
 }
+#ifndef _WIN32
+#include <strings.h>
+static void resolve_case_linux(size_t root_len, char *out, size_t size) {
+    if (access(out, F_OK) == 0) return;
+    char cur[1024];
+    if (root_len >= sizeof(cur) || root_len >= size) return;
+    memcpy(cur, out, root_len);
+    size_t cur_len = root_len;
+    cur[cur_len] = '\0';
+    const char *p = out + root_len;
+    while (*p == '/') ++p;
+    while (*p) {
+        const char *slash = strchr(p, '/');
+        size_t len = slash ? (size_t)(slash - p) : strlen(p);
+        if (cur_len + 1 + len >= sizeof(cur)) return;
+        cur[cur_len] = '/';
+        memcpy(cur + cur_len + 1, p, len);
+        cur[cur_len + 1 + len] = '\0';
+        if (access(cur, F_OK) == 0) {
+            cur_len += 1 + len;
+        } else {
+            cur[cur_len] = '\0';
+            DIR *d = opendir(cur);
+            if (!d) return;
+            struct dirent *e;
+            int found = 0;
+            while ((e = readdir(d))) {
+                if (strlen(e->d_name) == len && strncasecmp(e->d_name, p, len) == 0) {
+                    cur[cur_len] = '/';
+                    memcpy(cur + cur_len + 1, e->d_name, len);
+                    cur_len += 1 + len;
+                    cur[cur_len] = '\0';
+                    found = 1;
+                    break;
+                }
+            }
+            closedir(d);
+            if (!found) {
+                snprintf(out, size, "%s/%s", cur, p);
+                return;
+            }
+        }
+        if (!slash) break;
+        p = slash + 1;
+        while (*p == '/') ++p;
+    }
+    snprintf(out, size, "%s", cur);
+}
+#endif
 /* Resolve a guest path to a host path; returns 0 or a host errno. */
 static int translate(const char *guest,char *out,size_t size) {
     if (!guest || !*guest) return ENOENT;
@@ -133,16 +182,26 @@ static int translate(const char *guest,char *out,size_t size) {
         if (!strncmp(buffer,mounts[i].guest,n) && (buffer[n]=='/' || !buffer[n]) && n>best) { best=n; m=&mounts[i]; }
     }
     int result=0;
+    size_t root_len=0;
     if (!m) result=ENOENT;
-    else if ((size_t)snprintf(out,size,"%s%s",m->host,buffer+best)>=size) result=ENAMETOOLONG;
+    else {
+        root_len=strlen(m->host);
+        if ((size_t)snprintf(out,size,"%s%s",m->host,buffer+best)>=size) result=ENAMETOOLONG;
+    }
     const int game_path=m && (!strcmp(m->guest,"/app0") || !strcmp(m->guest,"/hostapp"));
     pthread_mutex_unlock(&lock);
     if (!result && game_path && update_root[0] && buffer[best]) {
         char updated[1100];
         HostStat st;
         if ((size_t)snprintf(updated,sizeof(updated),"%s%s",update_root,buffer+best)<sizeof(updated) &&
-            !host_stat(updated,&st) && (size_t)snprintf(out,size,"%s",updated)>=size) result=ENAMETOOLONG;
+            !host_stat(updated,&st)) {
+            if ((size_t)snprintf(out,size,"%s",updated)>=size) result=ENAMETOOLONG;
+            else root_len=strlen(update_root);
+        }
     }
+#ifndef _WIN32
+    if (!result && root_len) resolve_case_linux(root_len, out, size);
+#endif
     if (result==ENOENT) fprintf(stderr,"Runtime: no mount for guest path %s\n",guest);
     return result;
 }

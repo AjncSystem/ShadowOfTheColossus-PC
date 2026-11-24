@@ -34,8 +34,12 @@ jobs:
             build-essential gcc g++ cmake ninja-build pkg-config nasm patchelf \
             python3 python3-tk python3-pil python3-pil.imagetk \
             libvulkan-dev glslang-tools libvulkan-memory-allocator-dev libfmt-dev libboost-dev \
-            libxxhash-dev libzydis-dev libtsl-robin-map-dev libsdl3-dev \
+            libxxhash-dev libzydis-dev libsdl3-dev \
             libx11-dev libxext-dev libwayland-dev libxkbcommon-dev libpulse-dev libasound2-dev gh
+          # robin-map (header only) is not packaged in Debian 13: from its source (README.md).
+          git clone --quiet --depth 1 --branch v1.4.0 https://github.com/Tessil/robin-map.git /tmp/robin-map
+          cmake -S /tmp/robin-map -B /tmp/robin-map/build -G Ninja >/dev/null
+          cmake --install /tmp/robin-map/build >/dev/null
 
       - uses: actions/checkout@v4
         with:

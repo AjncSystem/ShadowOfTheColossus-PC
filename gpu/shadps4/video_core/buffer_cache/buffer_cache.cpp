@@ -1201,7 +1201,7 @@ void BufferCache::SubtractDownloaded(std::span<const ReadbackItem> items) {
             const VAddr end = address + range_size;
             for (VAddr page = address; page < end;) {
                 const VAddr page_lo = Common::AlignDown(page, 4_KB);
-                const VAddr next = std::min(page_lo + 4_KB, end);
+                const VAddr next = std::min<VAddr>(page_lo + 4_KB, end);
                 if (!memory_tracker->IsRegionCpuModified(page, next - page)) {
                     gpu_modified_ranges.Subtract(page, next - page);
                     if (!gpu_modified_ranges.Intersects(page_lo, 4_KB)) {

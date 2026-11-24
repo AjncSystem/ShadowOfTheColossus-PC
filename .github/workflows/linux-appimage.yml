@@ -58,7 +58,8 @@ jobs:
           bash packaging/linux/build_ffmpeg.sh
 
       - name: Build
-        run: ./build.sh
+        # CPATH: the newer Vulkan headers in /usr/local/include before the system's (README.md).
+        run: CPATH=/usr/local/include ./build.sh
 
       - name: AppImage
         run: |

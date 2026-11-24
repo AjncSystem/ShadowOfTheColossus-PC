@@ -1,16 +1,26 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Will it run, and how well: this PC's processor, memory, video card and the disk of the game
 folder, and the play mode they suit (Normal, Pro, Extreme). After the bloodborne_pc launcher's
-hardware check (bbport_hardware.py). Windows only; every probe answers None when it cannot tell."""
+hardware check (bbport_hardware.py). Windows, and Linux through /proc and /sys; every probe answers
+None when it cannot tell."""
 import ctypes
 import os
 import re
 import subprocess
 
 NO_WINDOW = 0x08000000
+IS_WINDOWS = os.name == 'nt'
+BYTES_PER_GIB = 2 ** 30
 
 
 def cpu_name():
+    if not IS_WINDOWS:
+        try:
+            with open('/proc/cpuinfo', encoding='utf-8', errors='replace') as info:
+                return next((' '.join(line.split(':', 1)[1].split()) for line in info
+                             if line.startswith('model name')), None)
+        except OSError:
+            return None
     try:
         import winreg
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'HARDWARE\DESCRIPTION\System\CentralProcessor\0') as key:
@@ -20,6 +30,12 @@ def cpu_name():
 
 
 def memory_gb():
+    if not IS_WINDOWS:
+        try:
+            return round(os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') / BYTES_PER_GIB)
+        except (OSError, ValueError):
+            return None
+
     class MEMORYSTATUSEX(ctypes.Structure):
         _fields_ = [('length', ctypes.c_ulong), ('load', ctypes.c_ulong), ('total', ctypes.c_ulonglong),
                     ('avail', ctypes.c_ulonglong), ('page_total', ctypes.c_ulonglong),
@@ -29,7 +45,7 @@ def memory_gb():
     status.length = ctypes.sizeof(status)
     try:
         if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
-            return round(status.total / 2 ** 30)
+            return round(status.total / BYTES_PER_GIB)
     except (AttributeError, OSError):
         pass
     return None
@@ -41,8 +57,29 @@ def video_memory_gb(gpu_text):
     return round(int(found.group(1)) / 1024) if found else None
 
 
+def linux_disk_kind(path):
+    """The disk under `path` from sysfs: its block device, up to the whole disk a partition is on."""
+    try:
+        device = os.stat(os.path.abspath(path or '.')).st_dev
+        block = os.path.realpath(f'/sys/dev/block/{os.major(device)}:{os.minor(device)}')
+    except OSError:
+        return None
+    if os.path.exists(os.path.join(block, 'partition')):
+        block = os.path.dirname(block)
+    name = os.path.basename(block)
+    if name.startswith('nvme'):
+        return 'nvme'
+    try:
+        with open(os.path.join(block, 'queue', 'rotational'), encoding='ascii') as rotational:
+            return 'hdd' if rotational.read().strip() == '1' else 'ssd'
+    except OSError:  # a virtual device (LVM, dm-crypt, btrfs over several disks): not told apart
+        return None
+
+
 def disk_kind(path):
     """'nvme', 'ssd' or 'hdd' for the drive holding `path`, or None."""
+    if not IS_WINDOWS:
+        return linux_disk_kind(path)
     drive = os.path.splitdrive(os.path.abspath(path or '.'))[0].rstrip(':')
     if len(drive) != 1:
         return None

@@ -36,10 +36,10 @@ jobs:
             libvulkan-dev glslang-tools libvulkan-memory-allocator-dev libfmt-dev libboost-dev \
             libxxhash-dev libzydis-dev libsdl3-dev \
             libx11-dev libxext-dev libwayland-dev libxkbcommon-dev libpulse-dev libasound2-dev gh
-          # Vulkan headers newer than Debian 13's (vk::DriverId::eMesaKosmickrisp): from their source,
-          # into /usr/local/include, which the compiler searches before /usr/include (README.md).
-          git clone --quiet --depth 1 --branch v1.4.328 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers
-          cmake -S /tmp/vulkan-headers -B /tmp/vulkan-headers/build -G Ninja >/dev/null
+          # The Vulkan headers of the Windows build (MSYS2: 1.4.363), over Debian 13's (1.4.309): the
+          # recorder dispatches commands of newer extensions (vk_recorder_cmds.inc).
+          git clone --quiet --depth 1 --branch vulkan-sdk-1.4.363.0 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers
+          cmake -S /tmp/vulkan-headers -B /tmp/vulkan-headers/build -G Ninja -DCMAKE_INSTALL_PREFIX=/usr >/dev/null
           cmake --install /tmp/vulkan-headers/build >/dev/null
           # robin-map (header only) is not packaged in Debian 13: from its source (README.md).
           git clone --quiet --depth 1 --branch v1.4.0 https://github.com/Tessil/robin-map.git /tmp/robin-map

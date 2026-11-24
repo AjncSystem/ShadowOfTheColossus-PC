@@ -59,7 +59,7 @@ static const u64 rb_narrow_env = [] {
     if (kib == 0) {
         return u64{0};
     }
-    return std::bit_floor(kib == 1 ? u64{64} : std::clamp<u64>(kib, 4, 512)) * 1_KB;
+    return static_cast<u64>(std::bit_floor(kib == 1 ? u64{64} : std::clamp<u64>(kib, 4, 512)) * 1_KB);
 }();
 
 static constexpr auto ARENA_USAGE =
@@ -259,7 +259,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             return u64{0};
         }
         const char* v = std::getenv("SOTC_RB_STREAM_MAX_KB");
-        return (v ? std::strtoull(v, nullptr, 10) : 4096ULL) * 1_KB;
+        return static_cast<u64>((v ? std::strtoull(v, nullptr, 10) : 4096ULL) * 1_KB);
     }();
     u64 stream = 0;
     if (stream_max != 0) {
@@ -1276,7 +1276,7 @@ void BufferCache::SubtractDownloaded(std::span<const ReadbackItem> items) {
             const VAddr end = address + range_size;
             for (VAddr page = address; page < end;) {
                 const VAddr page_lo = Common::AlignDown(page, 4_KB);
-                const VAddr next = std::min(page_lo + 4_KB, end);
+                const VAddr next = std::min<VAddr>(page_lo + 4_KB, end);
                 if (!memory_tracker->IsRegionCpuModified(page, next - page)) {
                     gpu_modified_ranges.Subtract(page, next - page);
                     if (!gpu_modified_ranges.Intersects(page_lo, 4_KB)) {
@@ -1512,7 +1512,7 @@ u64 BufferCache::GatherDownloads(const Buffer* arena, VAddr device_addr, u64 siz
                     }
                 };
                 for (VAddr page = address; page < range_end;) {
-                    const VAddr next = std::min(Common::AlignDown(page, 4_KB) + 4_KB, range_end);
+                    const VAddr next = std::min<VAddr>(Common::AlignDown(page, 4_KB) + 4_KB, range_end);
                     if (memory_tracker->IsRegionCpuModified(page, next - page)) {
                         flush_run(page);
                         run_start = next;
@@ -1944,6 +1944,14 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     // SynchronizeMemory also syncs read-only texel buffers from an aliasing image (sotc: a second
     // SynchronizeMemoryFromImage call here repeated that work, re-tiling the image twice).
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+    if (SotcStats::kBufHoistStats) [[unlikely]] { // sotc: test #50, counting only
+        if (hoist_used_tick != scheduler.CurrentTick()) {
+            hoist_used.Clear();
+            hoist_used_tick = scheduler.CurrentTick();
+        }
+        hoist_used.Add(device_addr, size);
+        SotcStats::GuardNote(device_addr, size, scheduler.CurrentTick());
+    }
     if (SotcStats::OptOff() && is_texel_buffer && !is_written) {
         SynchronizeMemoryFromImage(arena, device_addr, size);
     }
@@ -2101,6 +2109,9 @@ void BufferCache::NoteHotRead(VAddr addr, u64 size) {
 }
 
 void BufferCache::RecordCurrentWrite(VAddr addr, u64 size) {
+    if (SotcStats::kBufHoistStats) [[unlikely]] { // sotc: the full guard (test #50 step 1)
+        SotcStats::GuardNote(addr, size, scheduler.CurrentTick());
+    }
     // sotc: SOTC_CULL_QUEUE: a graphics write to a range cull dispatches use.
     if (Vulkan::g_cull_queue && !Vulkan::g_cull_queue->Recording()) [[unlikely]] {
         Vulkan::g_cull_queue->NoteGraphicsAccess(addr, size, true);
@@ -2230,6 +2241,10 @@ std::pair<const Buffer*, u64> BufferCache::GatherImageFromGuest(VAddr device_add
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
+    last_image_source_host_ready = false;
+    if (SotcStats::kBufHoistStats) [[unlikely]] { // sotc: the full guard (test #50 step 1)
+        SotcStats::GuardNote(device_addr, size, scheduler.CurrentTick());
+    }
     if (IsRegionGpuModified(device_addr, size)) {
         const SotcStats::SplitTimer copy_split{SotcStats::SplitTexCopy};
         return ObtainBuffer(device_addr, size, false);
@@ -2256,6 +2271,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
         if (direct && offset % std::max<u64>(instance.StorageMinAlignment(), 16) == 0) {
             SotcStats::tex_direct_uploads.fetch_add(1, std::memory_order_relaxed);
             SotcStats::tex_direct_bytes.fetch_add(size, std::memory_order_relaxed);
+            last_image_source_host_ready = true;
             return {direct, offset};
         }
         if (SotcStats::kTexGather && size >= 64_KB) {
@@ -2273,6 +2289,7 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
     const SotcStats::SplitTexCopyScope copy_split{staging.size};
     memory->CopySparseMemory(device_addr, staging.mapped, staging.size);
     staging.Flush();
+    last_image_source_host_ready = true;
     return {staging.buffer, staging.offset};
 }
 
@@ -2398,6 +2415,9 @@ bool BufferCache::CpuGenUnchanged(const CpuGenKey& key) noexcept {
 }
 
 void BufferCache::SynchronizeDmaBuffers() {
+    if (SotcStats::kBufHoistStats) [[unlikely]] { // sotc: a DMA shader may read any memory
+        SotcStats::guard_dma_tick = scheduler.CurrentTick();
+    }
     // sotc: SOTC_CULL_QUEUE: a shader reading memory through pointers (scalar loads: reads
     // only, shader_info_collection_pass) may read any range.
     if (Vulkan::g_cull_queue && !Vulkan::g_cull_queue->Recording()) [[unlikely]] {
@@ -2790,6 +2810,45 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             copy.dstOffset -= arena->cpu_addr;
         }
         staging.Flush();
+        if (SotcStats::kBufHoistStats) [[unlikely]] { // sotc: test #50, counting only
+            if (hoist_used_tick != scheduler.CurrentTick()) {
+                hoist_used.Clear();
+                hoist_used_tick = scheduler.CurrentTick();
+            }
+            if (current_writes_tick != scheduler.CurrentTick()) {
+                current_writes.Clear();
+                current_writes_tick = scheduler.CurrentTick();
+            }
+            const bool before_79 = SotcStats::current_program.load(std::memory_order_relaxed) ==
+                                   0x79704cbaULL;
+            for (const auto& copy : copies) {
+                const VAddr addr = arena->cpu_addr + copy.dstOffset;
+                const bool used =
+                    hoist_used.Intersects(addr, copy.size) || current_writes.Intersects(addr, copy.size);
+                (used ? SotcStats::hoist_used_n : SotcStats::hoist_free_n)
+                    .fetch_add(1, std::memory_order_relaxed);
+                (used ? SotcStats::hoist_used_bytes : SotcStats::hoist_free_bytes)
+                    .fetch_add(copy.size, std::memory_order_relaxed);
+                if (before_79) {
+                    (used ? SotcStats::hoist_used_79 : SotcStats::hoist_free_79)
+                        .fetch_add(copy.size, std::memory_order_relaxed);
+                }
+                // The full guard (PLANO-FILA-COPIA.md step 1): no GPU access to the range in flight
+                // or in the command buffer being built, by any path.
+                const u64 now = scheduler.CurrentTick();
+                const u64 dma = SotcStats::guard_dma_tick;
+                const u64 page_tick = SotcStats::GuardTick(addr, copy.size);
+                if (dma && (dma == now || !scheduler.IsFree(dma))) {
+                    SotcStats::guard_dma_bytes.fetch_add(copy.size, std::memory_order_relaxed);
+                } else if (page_tick == now || used) {
+                    SotcStats::guard_current_bytes.fetch_add(copy.size, std::memory_order_relaxed);
+                } else if (page_tick && !scheduler.IsFree(page_tick)) {
+                    SotcStats::guard_inflight_bytes.fetch_add(copy.size, std::memory_order_relaxed);
+                } else {
+                    SotcStats::guard_pass_bytes.fetch_add(copy.size, std::memory_order_relaxed);
+                }
+            }
+        }
         Vulkan::SotcGpuTimes::Note(Vulkan::SotcGpuTimes::CUpload); // sotc: SOTC_GPU_TIMES
         runtime.CopyBuffer(staging.buffer, arena, copies);
         for (const auto& copy : copies) {

@@ -137,6 +137,10 @@ public:
 
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
+    /// sotc: SOTC_UPLOAD_PREPASS: true when the last ObtainBufferForImage returned bytes the host
+    /// already holds (a staging copy made by the CPU, or the game's memory read directly), not a
+    /// buffer the GPU still fills in this submission (GPU-written arena, texture gather).
+    bool last_image_source_host_ready = false;
     /// sotc: SOTC_TEX_GATHER: the texture gathered by the GPU from the imported game memory.
     [[nodiscard]] std::pair<const Buffer*, u64> GatherImageFromGuest(VAddr device_addr, u32 size);
     /// sotc: guest memory in a staging buffer, whatever the GPU copy holds (F9 diagnostic).
@@ -485,6 +489,9 @@ private:
     /// GPU writes recorded into the command buffer still being built (tick current_writes_tick).
     RangeSet current_writes;
     u64 current_writes_tick{};
+    /// sotc: SOTC_BUF_HOIST_STATS (test #50): ranges bound in the command buffer still being built.
+    RangeSet hoist_used;
+    u64 hoist_used_tick{};
     void RecordCurrentWrite(VAddr addr, u64 size);
     /// sotc: the range the guest touched, during the DownloadMemory of its window (size 0 else).
     VAddr fault_addr{};

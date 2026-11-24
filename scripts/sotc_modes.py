@@ -91,7 +91,10 @@ POOL_FIX = (0x41a321, bytes.fromhex('eb34666666662e0f1f840000000000'),
 # Above this many rendered pixels the larger render target pool pushes the game's free system
 # memory figure under texturePoolReserveSystemMemMiBs (220), and the texture streamer drops every
 # texture to mip 3 every second or so (fine textures flicker). Reserve 0 there; it needs POOL_FIX.
-LOW_MEM_PIXELS = 4_200_000
+# sotc: #455: any render size above 1920x1080 (it was 4.2 million pixels): the render target pool
+# grows with the size, and at 2560x1080 (21:9, which turns PS4 Pro mode off) the reserve held the
+# textures back; with it at 0 they reached the finest level in ~4 min, FPS and stability unchanged.
+LOW_MEM_PIXELS = 1920 * 1080
 RENDER_SITES = [
     # display init (0x495a90): back buffer, display targets, scene size. The display object's
     # aspect (0x495b3e, WIDE_ASPECT) is added in render_patches: the 3D scene and the HUD's health

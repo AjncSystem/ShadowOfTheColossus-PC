@@ -1,10 +1,68 @@
 # Changelog
 
+## 0.77 — 2026-11-23
+- ⚡ **Sem as travadas longas logo depois de carregar o save (PCs com SSD)**: a leitura antecipada dos arquivos do jogo (13,7 GB) corria por cima da carga do save e deixava quadros de 150–320 ms. Agora ela só liga quando a pasta do jogo está num HD mecânico (`SOTC_PREFETCH=1` força, `=0` desliga). Na rota de teste o menor FPS logo após a carga subiu de 30 para ~43.
+- 🌑 **Sombras suaves e oclusão em volta do Wander piscando ou faltando em placas AMD** (#461, marko0905): o tradutor de shaders lia o endereço errado para os dados das cápsulas dos personagens. Conferido sem diferença na NVIDIA. **O cache de shaders é refeito na primeira abertura.**
+- ⚙️ **Configurações que voltavam ao padrão** (#467): com a pasta do port somente leitura (Program Files, OneDrive, aberto de dentro do .zip), o lançador salvava num arquivo e lia de outro, e o menu F1 não salvava. Agora os dois usam o mesmo arquivo (o da pasta `user` ou, se ela não aceita gravação, o de `%APPDATA%`), e o menu F1 avisa no log se não conseguir salvar.
+- ⚡ **Menos travadas na troca de área**:
+  - **Texturas juntadas pela GPU** (`SOTC_TEX_GATHER`, PCs com 24 GB de RAM ou mais, junto da leitura direta): as texturas guardadas em vários pedaços de memória ou cruzando dois blocos (~13 GB por sessão) eram copiadas pela CPU no meio do desenho. Agora a GPU junta os pedaços. Na rota de teste, a entrada de área caiu de 7–9 quadros acima de 50 ms para 1.
+  - **Shaders de compute traduzidos antes** (`SOTC_COMPUTE_PREFETCH`): um shader novo vai para as threads de tradução antes de o quadro precisar dele, em vez de travar o processador de comandos. Com o cache vazio, quadros acima de 50 ms de 94 para 67.
+  - **O cache de shaders não é mais apagado a cada atualização**: só quando a tradução dos shaders muda. Antes, cada atualização fazia todo mundo recompilar tudo e travar em cada área nova. `SOTC_CACHE_CLEAR_EVERY_UPDATE=1` volta ao antigo.
+  - **FPS dinâmico**: só desce para o degrau depois de 5 s abaixo de 50 FPS (era 1,5 s) e tenta 60 de novo depois de 4 s (era 10 s), dobrando a cada tentativa até 10 s. A queda curta de uma troca de área não vira mais 10–15 s presos em 48.
+- 🖥️ **FPS dinâmico em telas de 75/100/165 Hz** (#454): o degrau agora divide a taxa da tela (75 Hz → 37,5, 100 Hz → 50, 165 Hz → 41,25; 60/120/144/240 Hz iguais). Antes caía para 30, com ritmo irregular.
+- 🖼️ **Texturas em 21:9 e acima de 1080p** (#455): a reserva do reservatório de texturas fica em 0 em qualquer resolução acima de 1920×1080 (era só acima de 4,2 milhões de pixels). Em 2560×1080 as texturas chegam ao detalhe máximo.
+- Diagnóstico (desligado por padrão): `SOTC SCREEN FPS` (o menor FPS da tela a cada segundo), `SOTC_GPU_TIMES`, `SOTC_TICKWATCH`, `SOTC_SYNC_COMPILE_LOG`, `SOTC_PROFILE_TRIGGER_FPS`. Testes sem ganho ficam desligados atrás das chaves (`SOTC_CULL_QUEUE`, `SOTC_RB_GROUP`, `SOTC_RB_PUSH`, `SOTC_RB_SAFEPOINT`, `SOTC_IDLE_FLUSH`).
+
+### English
+- ⚡ **No more long hitches right after loading a save (PCs with an SSD)**: the read-ahead of the game archives (13.7 GB) ran on top of the save's load and left frames of 150-320 ms. It now starts only when the game folder is on a hard disk (`SOTC_PREFETCH=1` forces it, `=0` turns it off). On the test route the lowest FPS right after the load went from 30 to ~43.
+- 🌑 **Soft shadows and ambient occlusion around Wander flickering or missing on AMD cards** (#461, marko0905): the shader translator read the wrong address for the characters' capsule records. Checked with no difference on NVIDIA. **The shader cache is rebuilt on the first start.**
+- ⚙️ **Settings that went back to their defaults** (#467): with a read-only port folder (Program Files, OneDrive, started from inside the .zip), the launcher saved to one file and loaded another, and the F1 menu could not save. Both now use the same file (the `user` folder, or `%APPDATA%` when it cannot be written), and the F1 menu logs it if a save fails.
+- ⚡ **Fewer hitches at area changes**:
+  - **Textures gathered by the GPU** (`SOTC_TEX_GATHER`, PCs with 24 GB of RAM or more, with direct reads): textures stored in several memory pieces or across two blocks (~13 GB a session) were copied by the CPU in the middle of drawing. The GPU now gathers the pieces. On the test route, an area entry went from 7-9 frames over 50 ms to 1.
+  - **Compute shaders translated ahead** (`SOTC_COMPUTE_PREFETCH`): a new shader goes to the translation threads before the frame needs it, instead of stalling the command processor. With an empty cache, frames over 50 ms went from 94 to 67.
+  - **The shader cache is no longer cleared by every update**: only when shader translation changes. Before, every update made everyone translate every shader again and stutter at each new area. `SOTC_CACHE_CLEAR_EVERY_UPDATE=1` restores the old behaviour.
+  - **Dynamic FPS**: it steps down only after 5 s under 50 FPS (was 1.5 s) and tries 60 again after 4 s (was 10 s), doubled after each try up to 10 s. A short area-change dip no longer turns into 10-15 s held at 48.
+- 🖥️ **Dynamic FPS on 75/100/165 Hz screens** (#454): the step now divides the refresh rate (75 Hz → 37.5, 100 Hz → 50, 165 Hz → 41.25; 60/120/144/240 Hz unchanged). It used to fall to 30, with uneven pacing.
+- 🖼️ **Textures at 21:9 and above 1080p** (#455): the texture pool reserve is 0 at any render size above 1920×1080 (it was only above 4.2 million pixels). At 2560×1080 textures reach the finest level.
+- Diagnostics (off by default): `SOTC SCREEN FPS` (the lowest on-screen FPS each second), `SOTC_GPU_TIMES`, `SOTC_TICKWATCH`, `SOTC_SYNC_COMPILE_LOG`, `SOTC_PROFILE_TRIGGER_FPS`. Tests without a gain stay off behind their switches (`SOTC_CULL_QUEUE`, `SOTC_RB_GROUP`, `SOTC_RB_PUSH`, `SOTC_RB_SAFEPOINT`, `SOTC_IDLE_FLUSH`).
+
 ## 0.76.2 — 2026-11-17
 - 🛠️ **Processadores Intel: o herói caindo através do chão e a queda na tela de título corrigidos** (desde a 0.76). Na preparação do jogo, a lista de funções das bibliotecas lidas pela emulação de BMI1/LZCNT/MOVBE apagava a lista de funções do próprio jogo (55.790 viravam 731). Sem ela, a emulação de SSE4a (todo processador Intel) entrava sem a proteção da pilha em 3 funções do jogo: física quebrada e, com a geração de quadros desligada, o jogo fechava ~10 s depois de abrir (guest 0xf42ce0). Agora as listas se somam. Não é preciso preparar o jogo de novo.
 
 ### English
 - 🛠️ **Intel CPUs: the hero falling through the floor and the crash at the title screen fixed** (since 0.76). When the game is prepared, the function list of the linked modules (read for the BMI1/LZCNT/MOVBE emulation) replaced the game's own (55,790 functions became 731). Without it, SSE4a emulation (every Intel CPU) went in without the stack protection of 3 game functions: broken physics and, with frame generation off, the game closed ~10 s after starting (guest 0xf42ce0). The lists now add up. The game does not need to be prepared again.
+## Linux (não lançado)
+- **Port nativo para Linux** (sem Wine/Proton). **Testado numa placa AMD** (Fedora): o jogo abre e
+  renderiza a abertura. **NVIDIA e Intel ainda precisam de teste.**
+- Loader: imagem abaixo de 2 GiB também no Linux (ponteiros de 31 bits do jogo); guarda do heap
+  BPE com `int3`/passo único via `SIGTRAP`; janela de leitura das threads auxiliares com leituras
+  precisas (a proteção volta pelo estado do rastreador de páginas); SSE4a interpretado no
+  `SIGILL`; pilha alternativa de sinal de 512 KiB por thread (pilhas das fibras sem página de
+  guarda); watchdog de diagnóstico desligado por padrão (`BB_TIMEOUT`).
+- Arquivos do jogo achados sem diferenciar maiúsculas e minúsculas (o jogo pede em minúsculas, o
+  dump tem nomes mistos). DLCs lidas com `opendir`. Leituras limpas dos *walkers* no Linux.
+- Build: `build.sh` com LF (`.gitattributes`), correções de portabilidade (GCC 14), xbyak em todas
+  as plataformas, FFmpeg mínimo em `out/ffmpeg` (`packaging/linux/build_ffmpeg.sh`).
+- `sotc.py` multiplataforma e com `SOTC_DATA_DIR`; `sotc.sh`; AppImage
+  (`packaging/linux/build_appimage.sh`) que pede a pasta do jogo na primeira abertura e acha os
+  módulos de som do shadPS4. Opções: `docs/sotc/LINUX.md`.
+- **Lançador na AppImage:** a AppImage abre o mesmo lançador do Windows (FPS, modo PS4 Pro,
+  upscaler, texturas, controles, saves...), com Python e Tk próprios dentro dela, sem instalar
+  nada. Na primeira abertura ele lê o `sotc.ini` que já existir. `--play` joga com os ajustes
+  salvos sem abrir a janela (opções de inicialização da Steam).
+- **Só no Windows:** o AMD FSR 4.1 (a AMD distribui o upscaler do SDK apenas como DLLs do Windows; a
+  opção não aparece no lançador do Linux), a pré-leitura de páginas nas cópias de textura
+  (`SOTC_COPY_PREFETCH`), a cópia pelo endereço do jogo (`SOTC_COPY_GUEST_VIEW`; no Linux a cópia
+  segue pela segunda visão da memória, como antes) e as prioridades de thread em CPUs com 4 threads
+  ou menos (`SOTC_JOB_PRIORITY`).
+- **Quedas da 0.73 corrigidas também no Linux:** os objetos zerados que o jogo usa (`0x564d24`,
+  `0x144c60`, `0x14934f`, `0x14cce7`) são pulados pelo tratador de sinais do Linux como pelo do
+  Windows (`SOTC_FIX_NULL_OBJECTS=0` desliga).
+- **Lançador sem textos cortados com fontes aumentadas:** uma regra de DPI ou escala do fontconfig
+  (`fonts.conf`) aumentava as fontes do Tk sem mudar o DPI dele, e as caixas de largura fixa
+  cortavam o texto. O lançador mede o tamanho real da fonte e dimensiona as caixas por ele.
+- **Módulos de som opcionais** (0.75): sem `libSceNgs2.sprx`/`libSceUlt.sprx` o mixer embutido toca
+  o som; a AppImage sem o lançador também avisa isso em vez de "sem som".
 
 ## 0.76.1 — 2026-11-17
 - 🌌 **Linhas tracejadas no céu em placas AMD Radeon corrigidas** (#432, #433): um shader do céu trocava valores entre pixels vizinhos de um jeito que o driver da AMD não garante nas arestas dos triângulos, e desenhava uma grade de linhas sobre o céu (tela de título e jogo). Agora usa operações de quad, que todo driver garante. NVIDIA sem mudança. O cache de shaders é refeito na primeira abertura. `SOTC_QUAD_SWIZZLE=0` volta ao antigo.

@@ -1877,6 +1877,40 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     const char* v = std::getenv("SOTC_EOP_DEFER");
                     return v && v[0] == '1';
                 }();
+                // sotc: SOTC_VIS_DIRECT_ORDER (v3): wait only for the direct dispatch, in order.
+                if (SotcStats::kVisDirect && SotcStats::kVisDirectOrder && !defer_eop &&
+                    rasterizer) {
+                    const u64 wait_tick = rasterizer->VisTickToWait();
+                    if (wait_tick ||
+                        SotcStats::vis_labels_pending.load(std::memory_order_acquire) > 0) {
+                        const PM4CmdEventWriteEop eop = *event_eop;
+                        const VAddr label = reinterpret_cast<VAddr>(eop.Address<void>());
+                        SotcStats::vis_held_labels.fetch_add(1, std::memory_order_relaxed);
+                        SotcStats::vis_labels_pending.fetch_add(1, std::memory_order_acq_rel);
+                        if (eop.data_sel.Value() != DataSelect::None) {
+                            rasterizer->InvalidateMemory(label, 8, true);
+                        }
+                        rasterizer->GetScheduler().DeferPriorityOperationAt([eop] {
+                            eop.SignalFence(
+                                [](void* address, u64 data, u32 num_bytes) {
+                                    ASSERT(Core::Memory::Instance()->TryWriteBacking(
+                                        address, &data, num_bytes, 2));
+                                },
+                                [] {
+                                    Platform::IrqC::Instance()->Signal(
+                                        Platform::InterruptId::GfxEop);
+                                });
+                            SotcStats::vis_labels_pending.fetch_sub(1, std::memory_order_acq_rel);
+                        }, wait_tick);
+                        return;
+                    }
+                    event_eop->SignalFence(
+                        [this](void* address, u64 data, u32 num_bytes) {
+                            WriteFenceValue(address, data, num_bytes);
+                        },
+                        [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
+                    return;
+                }
                 // sotc: SOTC_VIS_DIRECT: the label after a bitmap written in the game's memory waits
                 // for the GPU (the game reads the bitmap once it sees the label).
                 const bool vis_honest =
@@ -2477,8 +2511,29 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 // sotc: SOTC_VIS_DIRECT: as the end-of-pipe label above (not for a GDS store, whose
                 // copy must be recorded here).
                 const VAddr release_label = reinterpret_cast<VAddr>(release.Address<u8*>());
+                // sotc: SOTC_VIS_DIRECT_ORDER (v3), as the end-of-pipe label.
                 if (rasterizer && release.data_sel.Value() != DataSelect::GdsMemStore &&
-                    SotcStats::kVisDirect &&
+                    SotcStats::kVisDirect && SotcStats::kVisDirectOrder) {
+                    const u64 wait_tick = rasterizer->VisTickToWait();
+                    if (wait_tick ||
+                        SotcStats::vis_labels_pending.load(std::memory_order_acquire) > 0) {
+                        SotcStats::vis_held_labels.fetch_add(1, std::memory_order_relaxed);
+                        SotcStats::vis_labels_pending.fetch_add(1, std::memory_order_acq_rel);
+                        rasterizer->InvalidateMemory(release_label, 8, true);
+                        rasterizer->GetScheduler().DeferPriorityOperationAt([release, pipe_id] {
+                            release.SignalFence(
+                                [pipe_id] {
+                                    Platform::IrqC::Instance()->Signal(
+                                        static_cast<Platform::InterruptId>(pipe_id));
+                                },
+                                [](VAddr, u16, u16) {});
+                            SotcStats::vis_labels_pending.fetch_sub(1, std::memory_order_acq_rel);
+                        }, wait_tick);
+                        return;
+                    }
+                }
+                if (rasterizer && release.data_sel.Value() != DataSelect::GdsMemStore &&
+                    SotcStats::kVisDirect && !SotcStats::kVisDirectOrder &&
                     (rasterizer->VisWritesInFlight() || LateLabelPending(release_label))) {
                     SotcStats::vis_honest_labels.fetch_add(1, std::memory_order_relaxed);
                     const VAddr label = release_label;

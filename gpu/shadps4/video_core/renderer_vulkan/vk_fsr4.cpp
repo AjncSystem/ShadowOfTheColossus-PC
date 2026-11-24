@@ -2,8 +2,9 @@
 
 #include "video_core/renderer_vulkan/vk_fsr4.h"
 
+// bbport: AMD ships the SDK's upscaler as Windows DLLs only; elsewhere Init fails and FSR 1
+// upscales instead.
 #ifdef _WIN32
-
 #include <windows.h>
 
 #include <algorithm>
@@ -302,18 +303,23 @@ bool Dispatch(VkCommandBuffer cmdbuf, const Params& p) {
 #else
 
 namespace Vulkan::Fsr4 {
+
 bool Init(const Instance&) {
     return false;
 }
+
 bool Available() {
     return false;
 }
+
 const char* Name() {
     return "FSR";
 }
+
 bool Dispatch(VkCommandBuffer, const Params&) {
     return false;
 }
+
 } // namespace Vulkan::Fsr4
 
 #endif

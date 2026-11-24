@@ -23,7 +23,7 @@ WORDS = {
     'framegen': 'geracao quadros frame generation fsr3 dlss-g dlssg f8 interpolacao',
     'fg_hudless': 'hud tremendo tremido letras barra vida stamina shaking',
     'upscaler': 'upscaler dlss fsr bilinear nitidez borrado blurry escala',
-    'output_res': 'resolucao resolution 1080p 1440p 4k 720p ultrawide 21:9 tela larga',
+    'output_res': 'resolucao resolution 1080p 1440p 4k 900p 720p ultrawide 21:9 tela larga',
     'textures': 'texturas texture qualidade borrada mip streaming maxima alta',
     'af16': 'anisotropico filtro nitido texturas sharp',
     'neo': 'ps4 pro modo pro cinematografico',
@@ -108,7 +108,8 @@ class SearchMixin:
         self.search_entry = ttk.Entry(holder, textvariable=self.search_var, style='Bar.TEntry')
         self.search_entry.pack(fill='x')
         hint = _('Buscar…  Ctrl+F', 'Search…  Ctrl+F')
-        self.search_hint = tk.Label(holder, text='  ' + hint, bg=theme.SURFACE, fg=theme.MUTED,
+        glyph = '  ' if theme.HAS_ICONS else ''  # Segoe's magnifier
+        self.search_hint = tk.Label(holder, text=glyph + hint, bg=theme.SURFACE, fg=theme.MUTED,
                                     font=(theme.BODY, 9), cursor='xterm')
         self.search_hint.bind('<Button-1>', lambda _e: self.search_entry.focus_set())
 

@@ -30,12 +30,15 @@ inline std::atomic<int> limit_fps{-1};
 /// 120 Hz screen, 30 on 60 Hz, any value with G-Sync/FreeSync), steady instead of swinging between
 /// 45 and 60; every 10 s it tries 60 again for 2 s and stays when the game keeps up. The game's
 /// logic follows the real time, so a lower limit does not slow it down. 0 or unset: off.
+/// sotc: in hundredths of FPS (#454): the step may be a fraction of the screen's refresh (37.5 on
+/// 75 Hz, 41.25 on 165 Hz), so "SOTC_FPS_DYNAMIC=37.5" works.
 inline const int dynamic_low = [] {
     const char* v = std::getenv("SOTC_FPS_DYNAMIC");
-    const long n = v ? std::strtol(v, nullptr, 10) : 0;
-    return n > 0 && n < 60 ? int(n) : 0;
+    const double n = v ? std::strtod(v, nullptr) : 0.0;
+    return n > 0.0 && n < 60.0 ? int(n * 100.0 + 0.5) : 0;
 }();
-/// The limit the dynamic FPS applies now: 0 = the normal limit (60), else dynamic_low.
+/// The limit the dynamic FPS applies now, in hundredths of FPS: 0 = the normal limit (60), else
+/// dynamic_low.
 inline std::atomic<int> dynamic_limit{0};
 
 /// The flip rate the game asked, -1 while it asked none (with the fps60 code patch it never does).

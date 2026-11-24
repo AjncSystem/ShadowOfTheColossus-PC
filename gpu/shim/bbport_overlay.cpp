@@ -326,6 +326,16 @@ void SaveLauncherSetting(const char* key, const std::string& json_value) {
     }
     std::ofstream out(LauncherSettingsPath(), std::ios::binary | std::ios::trunc);
     out << text;
+    out.close();
+    // sotc (#467): a read-only settings file used to fail here silently; say so once.
+    static bool warned = false;
+    if (!out && !warned) {
+        warned = true;
+        SotcEvent::Log("MENU",
+                       SotcUi::T("Não foi possível salvar a configuração em %s (pasta somente leitura?)",
+                                 "Could not save the setting to %s (read-only folder?)"),
+                       LauncherSettingsPath().string().c_str());
+    }
 }
 
 // sotc: SOTC_LOD_POOL_LOW at start (8 when unset): the page pool switch of texture level "High".
@@ -643,9 +653,9 @@ void BuildItems() {
         .hotkey = "F11";
     {
         std::vector<MenuChoice> outputs;
-        for (const char* size : {"1280x720", "1920x1080", "2560x1440", "3840x2160", "1920x1200",
-                                 "2560x1600", "2560x1080", "3440x1440", "3840x1600", "3840x1080",
-                                 "5120x1440"}) {
+        for (const char* size : {"1280x720", "1600x900", "1920x1080", "2560x1440", "3840x2160",
+                                 "1920x1200", "2560x1600", "2560x1080", "3440x1440", "3840x1600",
+                                 "3840x1080", "5120x1440"}) {
             std::string label = size;
             label.replace(label.find('x'), 1, " × ");
             const std::string sz = size;

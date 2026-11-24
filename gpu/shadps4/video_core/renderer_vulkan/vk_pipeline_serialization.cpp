@@ -28,7 +28,9 @@ namespace Serialization {
 // translated (resource_patching_pass.cpp).
 // 40/136 = reads of absent lanes folded on 64-wide hosts (AMD GCN; lower_wave64_pass.cpp, #411).
 // 41/137 = quad swizzles via QuadBroadcast + VK_KHR_shader_quad_control on fragment shaders (sky grid fix).
-static const u32 ShaderBinaryVersion = Shader::LodFeedbackEnabled() ? 41u : 137u;
+// 42/138 = also ReadConst through v_readfirstlane'd pointer adds flattened, dynamic window 2048 dwords
+// (capsule shadows/AO without DMA; flatten_extended_userdata_pass.cpp). Bumped when both changes met.
+static const u32 ShaderBinaryVersion = Shader::LodFeedbackEnabled() ? 42u : 138u;
 static constexpr u32 ShaderMetaVersion = 21u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization

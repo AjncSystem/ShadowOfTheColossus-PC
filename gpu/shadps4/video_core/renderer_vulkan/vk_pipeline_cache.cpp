@@ -21,6 +21,7 @@
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
+#include "core/memory.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/passes/ir_passes.h"
@@ -267,7 +268,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         break;
     }
     case HwStage::Compute: {
-        const auto& cs_pgm = liverpool->GetCsRegs();
+        const auto& cs_pgm = cs_override ? *cs_override : liverpool->GetCsRegs();
         info.props.num_user_data = cs_pgm.settings.num_user_regs;
         info.props.num_allocated_vgprs = cs_pgm.settings.num_vgprs * 4;
         info.props.fp_denorm_mode32 = cs_pgm.settings.fp_denorm_mode32;
@@ -713,9 +714,12 @@ void PipelineCache::AsyncPipelineWorker(std::stop_token token) {
         }
         if (job->translate) {
             RunAsyncTranslate(*job->translate);
-            std::scoped_lock lock{async_mutex};
-            async_done.push_back(std::move(job));
-            async_done_count.fetch_add(1, std::memory_order_release);
+            {
+                std::scoped_lock lock{async_mutex};
+                async_done.push_back(std::move(job));
+                async_done_count.fetch_add(1, std::memory_order_release);
+            }
+            async_done_cv.notify_all(); // a dispatch may wait for it (WaitPrefetchedCompute)
             continue;
         }
         if (job->compute) {
@@ -1084,6 +1088,103 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     return it->second.get();
 }
 
+void PipelineCache::PrefetchCompute(const AmdGpu::ComputeProgram& cs) {
+    if (async_workers.empty() || EmulatorSettings.IsShaderCollect()) {
+        return;
+    }
+    const VAddr address = cs.Address<VAddr>();
+    if (address == 0) {
+        return;
+    }
+    const u8* backing = Core::Memory::Instance()->GetBackingPointer(address);
+    if (!backing) {
+        return;
+    }
+    u64 head;
+    std::memcpy(&head, backing, sizeof(head));
+    const auto [seen, is_new] = prefetch_seen.try_emplace(address, head);
+    if (!is_new) {
+        if (seen->second == head) {
+            return;
+        }
+        seen->second = head;
+    }
+    const auto params = AmdGpu::GetParams(cs);
+    if (params.code.empty() || program_cache.contains(params.hash) ||
+        pending_programs.contains(params.hash) || in_place_programs.contains(params.hash)) {
+        return;
+    }
+    // The runtime info of the dispatch further on, from the walk's registers. The command
+    // processor's own copy of the compute slot is put back (a dispatch may be being bound).
+    auto& slot = runtime_infos[static_cast<u32>(SwStage::Compute)];
+    const Shader::RuntimeInfo saved = slot;
+    cs_override = &cs;
+    const Shader::RuntimeInfo rt = BuildRuntimeInfo(HwStage::Compute, SwStage::Compute);
+    cs_override = nullptr;
+    slot = saved;
+    pending_programs.insert(params.hash);
+    prefetched_computes.insert(params.hash);
+    QueueAsyncTranslate(HwStage::Compute, SwStage::Compute, params, rt, Shader::Backend::Bindings{},
+                        nullptr, nullptr, 0);
+    SotcStats::prefetch_queued.fetch_add(1, std::memory_order_relaxed);
+}
+
+void PipelineCache::WaitPrefetchedCompute(u64 hash) {
+    prefetched_computes.erase(hash);
+    if (async_done_count.load(std::memory_order_acquire) != 0) {
+        CollectAsyncPipelines();
+        last_graphics_pipeline = nullptr; // sotc: as after any change of graphics_pipelines
+    }
+    if (!pending_programs.contains(hash)) {
+        SotcStats::prefetch_ready.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    // Counted as shader time of the frame, as the translation it replaces.
+    const SotcStats::FrameTimer frame_timer{SotcStats::FrameCompile};
+    const auto start = std::chrono::steady_clock::now();
+    for (;;) {
+        {
+            std::unique_lock lock{async_mutex};
+            const auto queued = std::ranges::find_if(async_queue, [hash](const auto& job) {
+                return job->translate && !job->translate->program && job->translate->hash == hash;
+            });
+            if (queued != async_queue.end()) {
+                // No worker has started it: translating it here is faster than waiting for
+                // the jobs in front of it.
+                async_queue.erase(queued);
+                --async_translate_queued;
+                lock.unlock();
+                pending_programs.erase(hash);
+                SotcStats::prefetch_taken_back.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+            // Running on a worker: wait until it (or another job) is done. Bounded, so a job
+            // dropped by stopping workers cannot hold the command processor.
+            async_done_cv.wait_for(lock, std::chrono::milliseconds(50), [this] {
+                return async_done_count.load(std::memory_order_relaxed) != 0;
+            });
+        }
+        if (async_done_count.load(std::memory_order_acquire) != 0) {
+            CollectAsyncPipelines();
+            last_graphics_pipeline = nullptr;
+        }
+        if (!pending_programs.contains(hash)) {
+            break;
+        }
+        if (std::chrono::steady_clock::now() - start > std::chrono::seconds(2)) {
+            // The worker's result, when it comes, finds the program built and is dropped.
+            pending_programs.erase(hash);
+            break;
+        }
+    }
+    SotcStats::prefetch_waited.fetch_add(1, std::memory_order_relaxed);
+    SotcStats::prefetch_wait_ns.fetch_add(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() -
+                                                             start)
+            .count(),
+        std::memory_order_relaxed);
+}
+
 const ComputePipeline* PipelineCache::GetComputePipeline() {
     if (!RefreshComputeKey()) {
         return nullptr;
@@ -1384,6 +1485,7 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     SotcStats::shaders_compiled.fetch_add(1, std::memory_order_relaxed);
 
     auto phase_start = std::chrono::steady_clock::now();
+    const auto sync_start = phase_start;
     const auto phase = [&](int i) {
         if (SotcStats::kFpsLog) {
             const auto now = std::chrono::steady_clock::now();
@@ -1427,6 +1529,25 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     }
     phase(4);
 
+    // sotc: SOTC_SYNC_COMPILE_LOG=1: translations done on the command processor itself (they hold
+    // the frame), with their stage and time, first 200.
+    static const bool sync_log = std::getenv("SOTC_SYNC_COMPILE_LOG") != nullptr;
+    if (sync_log && !worker_pools) {
+        static std::atomic<u32> shown{0};
+        if (shown.fetch_add(1, std::memory_order_relaxed) < 200) {
+            const double ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
+                                                          sync_start)
+                    .count();
+            std::fprintf(stderr,
+                         "SOTC SYNC COMPILE stage %u/%u %#llx perm %zu %.1f ms (indices %u, in "
+                         "place %d)\n",
+                         u32(info.hw_stage), u32(info.sw_stage),
+                         static_cast<unsigned long long>(info.pgm_hash), perm_idx, ms,
+                         liverpool ? u32(liverpool->regs.num_indices) : 0u,
+                         in_place_programs.contains(info.pgm_hash) ? 1 : 0);
+        }
+    }
     const auto name = GetShaderName(info.hw_stage, info.pgm_hash, perm_idx);
     Vulkan::SetObjectName(instance.GetDevice(), module, name);
     if (EmulatorSettings.IsShaderCollect()) {
@@ -1442,6 +1563,10 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
                                                 bool async_ok) {
     // sotc: copied only where CompileModule needs a mutable one (it was copied on every call).
     const auto& rt = BuildRuntimeInfo(hw_stage, sw_stage);
+    if (!async_ok && hw_stage == HwStage::Compute && !prefetched_computes.empty() &&
+        prefetched_computes.contains(params.hash)) {
+        WaitPrefetchedCompute(params.hash);
+    }
     if (async_ok && !program_cache.contains(params.hash) &&
         !in_place_programs.contains(params.hash)) {
         if (pending_programs.insert(params.hash).second) {

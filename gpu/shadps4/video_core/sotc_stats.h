@@ -88,6 +88,9 @@ inline std::atomic<uint64_t> gc_downloads_skipped{0}; ///< SOTC_GC_DOWNLOAD=0
 inline std::atomic<uint64_t> f9_gpu_copies{0}; ///< F9 uploads whose memory the GPU had written
 /// sotc: bytes of hot readbacks not applied because the guest may have written them since.
 inline std::atomic<uint64_t> rb_hot_cpu_skipped{0};
+/// sotc: SOTC_RB_GROUP: readbacks that brought along a cull program's other ranges, the ranges
+/// and bytes they added.
+inline std::atomic<uint64_t> rb_group_readbacks{0}, rb_group_regions{0}, rb_group_bytes{0};
 /// sotc: bytes of hot readbacks not applied because the guest wrote them during the GPU wait.
 inline std::atomic<uint64_t> rb_hot_late_skipped{0};
 inline std::atomic<uint64_t> readbacks{0};    ///< BufferCache::DownloadMemory calls
@@ -125,6 +128,11 @@ inline std::atomic<uint64_t> readback_dirty_retries{0};
 inline std::atomic<uint64_t> rb_dirty_hot_dropped{0};
 /// Dirtied readback windows re-read asynchronously (another round trip) instead of synchronously.
 inline std::atomic<uint64_t> rb_requeues{0};
+/// sotc (SOTC_RB_PUSH): copies recorded after a cull dispatch, their bytes, guest faults served by
+/// one (no copy of their own), pushes a later GPU write made stale, pushes no fault asked for.
+inline std::atomic<uint64_t> rb_push{0}, rb_push_bytes{0}, rb_push_hits{0}, rb_push_stale{0},
+    rb_push_unused{0}, rb_push_skipped{0}, rb_push_verify_bytes{0}, rb_push_verify_differ{0},
+    rb_push_release_waits{0}; ///< unmaps that waited for a pushed copy before unbinding
 // sotc: metadata-clipped non-stack readback ranges and bytes, per SOTC_FPS report.
 inline std::atomic<uint64_t> heap_guard_clipped_writes{0}, heap_guard_clipped_bytes{0};
 inline std::atomic<uint64_t> heap_guard_builds{0}; ///< readbacks into the BPE heap
@@ -332,6 +340,15 @@ inline std::atomic<uint64_t> tex_direct_uploads{0}, tex_direct_bytes{0}, tex_dir
 /// 1 outside the imported range, 2 across an import chunk boundary, 3 chunk not imported yet,
 /// 4 offset alignment; counts and bytes.
 inline std::atomic<uint64_t> tex_direct_why[5]{}, tex_direct_why_bytes[5]{};
+/// sotc: SOTC_TEX_GATHER=1 (with SOTC_TEX_DIRECT): a texture whose bytes lie in several backing
+/// runs (the game's pool maps it 64 KiB at a time) or across two import chunks is gathered by the
+/// GPU, run by run, from the imported memory into video memory, instead of the CPU copy that was
+/// 30-60 ms per slow frame at area entries (17 Nov). Counts, bytes and copy regions.
+inline const bool kTexGather = [] {
+    const char* v = std::getenv("SOTC_TEX_GATHER");
+    return v && v[0] == '1';
+}();
+inline std::atomic<uint64_t> tex_gather_uploads{0}, tex_gather_bytes{0}, tex_gather_regions{0};
 
 /// sotc: SOTC_VIS_DIRECT v2. The scheduler tick of the newest command buffer with a dispatch that
 /// writes the game's memory directly. While the GPU has not finished that tick, every end-of-pipe
@@ -341,6 +358,85 @@ inline std::atomic<uint64_t> tex_direct_why[5]{}, tex_direct_why_bytes[5]{};
 inline std::atomic<uint64_t> vis_tick{0};
 inline std::atomic<uint64_t> vis_direct_binds{0}, vis_honest_labels{0}, vis_fallbacks{0},
     vis_unmap_waits{0};
+/// sotc: SOTC_VIS_DIRECT_ORDER=1 (with SOTC_VIS_DIRECT; v3). v2 made every label wait for all the
+/// GPU work recorded before it while a direct dispatch was in flight (58.8 -> 41.8 FPS); v1 let
+/// later labels out before the GPU finished the dispatch (the game reused the memory: heap crash at
+/// the ending). Now a label after a direct dispatch waits only for that dispatch's tick, and a label
+/// while earlier ones are still held waits behind them (no GPU wait), so no label after a direct
+/// dispatch is seen before the dispatch finished and labels never overtake each other.
+inline const bool kVisDirectOrder = [] {
+    const char* v = std::getenv("SOTC_VIS_DIRECT_ORDER");
+    return v && v[0] == '1';
+}();
+/// sotc: SOTC_INDIRECT_MERGE_STATS=1 (test #48 of docs/sotc/MEMORIA-TESTES.md): of the indirect
+/// draws with GPU-written arguments, how many could join the previous one in a single
+/// vkCmdDraw*Indirect (same pipeline, same bindings and user data, same rendering state, arguments
+/// right after the previous ones in the same buffer); the others by the first reason they could not.
+inline const bool kIndirectMergeStats = [] {
+    const char* v = std::getenv("SOTC_INDIRECT_MERGE_STATS");
+    return v && v[0] == '1';
+}();
+/// sotc: SOTC_UPLOAD_PREPASS=1 (test #49): uploads of never-used images whose source is already on
+/// the host go to the upload command buffer (before the primary one): no render pass break mid-frame.
+inline const bool kUploadPrepass = [] {
+    const char* v = std::getenv("SOTC_UPLOAD_PREPASS");
+    return v && v[0] == '1';
+}();
+inline std::atomic<uint64_t> prepass_uploads{0}, prepass_bytes{0}, prepass_used{0},
+    prepass_source{0};
+/// sotc: SOTC_BUF_HOIST_STATS=1 (test #50): CPU buffer uploads (staging -> arena) by whether their
+/// range was already bound or GPU-written in the command buffer being built ("used": the upload
+/// cannot move to the start of the submission) or not ("free"); counts, bytes, and bytes of uploads
+/// made while binding the 0x79704cba dispatch.
+inline const bool kBufHoistStats = [] {
+    const char* v = std::getenv("SOTC_BUF_HOIST_STATS");
+    return v && v[0] == '1';
+}();
+inline std::atomic<uint64_t> hoist_free_n{0}, hoist_used_n{0}, hoist_free_bytes{0},
+    hoist_used_bytes{0}, hoist_free_79{0}, hoist_used_79{0};
+/// sotc: the full guard of docs/sotc/PLANO-FILA-COPIA.md step 1 (with SOTC_BUF_HOIST_STATS): the
+/// newest scheduler tick that touched each 64 KiB page (binds, texture sources, GPU writes), in a
+/// direct-mapped table (a collision keeps the newer tick: conservative), and the newest tick that
+/// bound a DMA shader (which may read any memory). Draw thread only; diagnostics.
+struct GuardSlot {
+    uint64_t page;
+    uint64_t tick;
+};
+inline constexpr uint64_t kGuardSlots = uint64_t{1} << 20;
+inline GuardSlot* GuardTable() {
+    static GuardSlot* table = new GuardSlot[kGuardSlots]();
+    return table;
+}
+inline void GuardNote(uint64_t addr, uint64_t size, uint64_t tick) {
+    if (!size) {
+        return;
+    }
+    GuardSlot* t = GuardTable();
+    for (uint64_t p = addr >> 16, last = (addr + size - 1) >> 16; p <= last; ++p) {
+        GuardSlot& s = t[p & (kGuardSlots - 1)];
+        s.page = p;
+        s.tick = std::max(s.tick, tick);
+    }
+}
+inline uint64_t GuardTick(uint64_t addr, uint64_t size) {
+    if (!size) {
+        return 0;
+    }
+    const GuardSlot* t = GuardTable();
+    uint64_t newest = 0;
+    for (uint64_t p = addr >> 16, last = (addr + size - 1) >> 16; p <= last; ++p) {
+        newest = std::max(newest, t[p & (kGuardSlots - 1)].tick);
+    }
+    return newest;
+}
+inline uint64_t guard_dma_tick = 0;
+inline std::atomic<uint64_t> guard_pass_bytes{0}, guard_dma_bytes{0}, guard_current_bytes{0},
+    guard_inflight_bytes{0};
+inline std::atomic<uint64_t> imerge_total{0}, imerge_ok{0}, imerge_pipeline{0}, imerge_bind{0},
+    imerge_state{0}, imerge_args{0}, imerge_count{0}, imerge_longest{0};
+inline std::atomic<uint64_t> vis_held_labels{0};   ///< labels held while their order needed it
+inline std::atomic<uint64_t> vis_held_flushes{0};  ///< submissions forced for the dispatch's tick
+inline std::atomic<int64_t> vis_labels_pending{0}; ///< held labels not written yet
 
 /// sotc: SOTC_SLOW_OPS=1 (with SOTC_DRAW_SPLIT): the draw thread's operations of each frame summed
 /// by shader (kind and first stage's hash; Liverpool::BackLoop), and for each frame over 40 ms the
@@ -484,6 +580,10 @@ struct SplitTexCopyScope {
 /// empty), dispatches, indirect dispatches.
 inline std::atomic<uint64_t> cmd_kinds[6]{};
 inline std::atomic<uint64_t> early_flushes{0}; ///< submits right after a write to a read-back page
+/// sotc: SOTC_RB_SAFEPOINT: readback finishes served at safe points inside long ops.
+inline std::atomic<uint64_t> rb_safepoint_finishes{0};
+/// sotc: SOTC_IDLE_FLUSH: submits of recorded commands when the draw thread ran out of work.
+inline std::atomic<uint64_t> idle_flushes{0};
 /// Suspects of long frames, printed for each frame over SOTC_STALL_MS (SOTC_FRAME_LOG runs):
 /// pipelines created, shaders recompiled and images created during the frame, and their time.
 inline std::atomic<uint64_t> pipelines_new{0}, pipeline_ns{0};
@@ -570,6 +670,11 @@ inline std::atomic<uint64_t> async_translate_stale{0}; ///< permutations whose t
 inline std::atomic<uint64_t> async_translate_built{0};
 inline std::atomic<uint64_t> async_translate_ns{0};    ///< worker time translating them
 inline std::atomic<uint64_t> async_translate_skips{0}; ///< draws skipped while waiting for one
+// sotc: SOTC_COMPUTE_PREFETCH (Liverpool::PrefetchComputeShaders), totals: compute shaders queued
+// ahead, dispatches that found theirs ready, that waited for a worker (and how long), and jobs
+// taken back from the queue because no worker had started them.
+inline std::atomic<uint64_t> prefetch_queued{0}, prefetch_ready{0}, prefetch_waited{0},
+    prefetch_wait_ns{0}, prefetch_taken_back{0};
 /// sotc: SRT walker loads that faulted (null or unmapped table pointer) and read zero, total.
 inline std::atomic<uint64_t> srt_walker_faults{0};
 inline std::atomic<uint64_t> image_bytes{0};    ///< live texture cache and host pass images
@@ -764,6 +869,15 @@ struct TickEvent {
                    ///< kind 2: (submit_mutex wait us << 32) | vkQueueSubmit us
     uint32_t kind; ///< 0 progress sample, 1 SubmitExecution, 2 put on the Vulkan queue
 };
+/// sotc: with SOTC_TICKWATCH, time the draw scheduler had submitted work the GPU had not finished
+/// (busy: includes semaphore waits) and time it had none (idle), sampled every ~0.5 ms; per flip
+/// in the report ("SOTC GPU BUSY"): near 100% busy means the GPU is the limit.
+inline std::atomic<uint64_t> gpu_busy_ns{0}, gpu_idle_ns{0}, gpu_busy_frames{0};
+/// sotc: SOTC_TICKWATCH: who the GPU waits for while it has no work: the draw thread busy
+/// (recording), else the command processor busy, else both idle (the game sent nothing). The
+/// flags are set by the threads themselves around their idle waits.
+inline std::atomic<bool> draw_idle_now{false}, cp_idle_now{false};
+inline std::atomic<uint64_t> gpu_idle_draw_ns{0}, gpu_idle_cp_ns{0}, gpu_idle_game_ns{0};
 inline constexpr size_t kTickRing = 8192;
 inline TickEvent tick_ring[kTickRing];
 inline std::atomic<uint64_t> tick_ring_head{0};

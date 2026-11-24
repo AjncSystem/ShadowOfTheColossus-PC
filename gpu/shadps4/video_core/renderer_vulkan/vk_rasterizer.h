@@ -83,6 +83,15 @@ public:
     /// PrimitiveType::None would not even build).
     bool IsDrawFilteredOut() const;
     const Pipeline* LookupComputePipeline();
+    /// sotc: SOTC_COMPUTE_PREFETCH: a dispatch further on in a submission (command processor).
+    void PrefetchComputeShader(const AmdGpu::ComputeProgram& cs);
+    /// sotc: SOTC_GPU_TIMES (sotc_gpu_times.h): timestamps around a draw or dispatch.
+    void GpuTimesBefore(vk::CommandBuffer cmdbuf, u8 kind, const Pipeline* pipeline);
+    void GpuTimesAfter(vk::CommandBuffer cmdbuf);
+    /// sotc: SOTC_IDLE_FLUSH: the draw thread ran out of work; submits what it recorded.
+    void FlushIdle();
+    /// sotc: SOTC_GPU_TIMES: GPU writes and the cull programs' dependencies of a dispatch.
+    void GpuTimesDeps(const Shader::Info& cs);
     bool IsGpuSideThread() const;
     void PrepareGpuSideFault();
     bool RunsGpuWorkElsewhere() const;
@@ -344,15 +353,46 @@ private:
 public:
     /// sotc: SOTC_VIS_DIRECT v2: true while a dispatch that writes the game's memory directly has not
     /// finished on the GPU (labels must wait for the GPU then).
+    /// sotc: SOTC_RB_PUSH: after a cull dispatch, the copies of what it wrote (buffer_cache.h).
+    void PushCullReadbacks(u64 pgm_hash);
     bool VisWritesInFlight() {
         const u64 tick = SotcStats::vis_tick.load(std::memory_order_acquire);
         return tick && !scheduler.IsFree(tick);
+    }
+    /// sotc: SOTC_VIS_DIRECT_ORDER: the tick of the newest direct dispatch while the GPU has not
+    /// finished it (0 otherwise); submits it first when it is still being recorded.
+    u64 VisTickToWait() {
+        const u64 tick = SotcStats::vis_tick.load(std::memory_order_acquire);
+        if (!tick || scheduler.IsFree(tick)) {
+            return 0;
+        }
+        if (tick >= scheduler.CurrentTick()) {
+            SotcStats::vis_held_flushes.fetch_add(1, std::memory_order_relaxed);
+            Flush();
+        }
+        return tick;
     }
 
 private:
     bool BindVisDirect(VAddr address, u64 size, u64 alignment, Shader::Backend::Bindings& binding,
                        Shader::PushData& push_data);
     void AfterVisDirect();
+    /// sotc: SOTC_CULL_QUEUE (sotc_cull_queue.h): the second queue for the cull dispatches, and
+    /// its SOTC_CULL_QUEUE_VERIFY run on the graphics queue (CullVerifyCapture before the
+    /// dispatch is recorded on the cull queue, CullVerifyRun after its session ended).
+    std::unique_ptr<class CullQueue> cull_queue;
+    struct CullVerify {
+        void* slot{}; ///< CullQueue::VerifySlot
+        bool armed{};
+        vk::Buffer arena{};
+        u64 offset{};
+        u64 range{};
+        std::vector<vk::DescriptorBufferInfo> infos;
+        std::vector<vk::WriteDescriptorSet> writes;
+        Shader::PushData push{};
+    } cull_verify;
+    void CullVerifyCapture(vk::CommandBuffer cull_cmdbuf);
+    void CullVerifyRun(const class ComputePipeline* pipeline, u32 x, u32 y, u32 z);
     /// Vertex/index buffers read by fixed-function stages of the current draw. They are recorded
     /// as reads after the draw so later writes to the same ranges wait for it.
     std::vector<BoundBuffer> fixed_function_reads;

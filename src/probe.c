@@ -346,6 +346,8 @@ static DWORD WINAPI peek_thread(void *list) {
     fflush(stderr);
     return 0;
 }
+/* sotc: 1 when the game's folder is on a hard disk (seek penalty), 0 on an SSD, -1 unknown. */
+static int game_disk_hdd=-1;
 /* sotc: the session's system in the event log: CPU, RAM, threads and whether the game's folder is
  * on a hard disk (seek penalty: new areas stall on scattered reads there) or an SSD. */
 static void event_session_start(const char *app0) {
@@ -371,9 +373,11 @@ static void event_session_start(const char *app0) {
             DEVICE_SEEK_PENALTY_DESCRIPTOR seek={0};
             DWORD got=0;
             if (DeviceIoControl(h,IOCTL_STORAGE_QUERY_PROPERTY,&query,sizeof(query),&seek,sizeof(seek),&got,NULL) &&
-                got>=sizeof(seek))
+                got>=sizeof(seek)) {
                 disk=seek.IncursSeekPenalty ? SOTC_T("HD (disco mecânico: lugares novos podem travar)",
                                                      "HDD (spinning disk: new areas may stall)") : "SSD";
+                game_disk_hdd=seek.IncursSeekPenalty ? 1 : 0;
+            }
             CloseHandle(h);
         }
     }
@@ -747,6 +751,26 @@ static DWORD WINAPI profiler_all(void *unused) {
     Describe describe=(Describe)(void *)GetProcAddress(GetModuleHandleA("kernel32.dll"),"GetThreadDescription");
     const char *delay=getenv("SOTC_PROFILE_DELAY"), *seconds=getenv("SOTC_PROFILE_SECONDS");
     Sleep((delay ? atoi(delay) : 20)*1000);
+    /* sotc: SOTC_PROFILE_TRIGGER_FPS=<fps>: after the delay, wait until the frame rate over half a
+     * second (what the on-screen counter shows) drops under <fps> while frames still come (not a
+     * loading screen), then sample for SOTC_PROFILE_SECONDS: the dip itself, wherever it falls. */
+    if (getenv("SOTC_PROFILE_TRIGGER_FPS")) {
+        const double limit=atof(getenv("SOTC_PROFILE_TRIGGER_FPS"));
+        uint64_t window_flips=bbgpu_flip_count();
+        ULONGLONG window_start=GetTickCount64();
+        for (;;) {
+            Sleep(50);
+            const ULONGLONG now=GetTickCount64();
+            if (now-window_start<500) continue;
+            const uint64_t flips=bbgpu_flip_count();
+            const double fps=(double)(flips-window_flips)*1000.0/(double)(now-window_start);
+            window_flips=flips; window_start=now;
+            if (fps>=5.0 && fps<limit) {
+                fprintf(stderr,"SOTC profile: triggered at %.1f FPS\n",fps);
+                break;
+            }
+        }
+    }
     all_slots=calloc(ALL_SLOTS,sizeof(*all_slots));
     if (!all_slots) return 0;
     uint32_t count=0;
@@ -2243,7 +2267,15 @@ int main(int argc, char **argv) {
     if (gpu_enabled && !(getenv("SOTC_WATCHDOG") && getenv("SOTC_WATCHDOG")[0]=='0'))
         CloseHandle(CreateThread(NULL,0,hang_watchdog,NULL,0,NULL));
     if (getenv("SOTC_PEEK")) CloseHandle(CreateThread(NULL,0,peek_thread,(void *)getenv("SOTC_PEEK"),0,NULL));
-    if (app0 && !(getenv("SOTC_PREFETCH") && getenv("SOTC_PREFETCH")[0]=='0')) {
+    /* sotc: the read-ahead only on a hard disk (or an unknown one). On the user's NVMe (23 Nov) it
+     * read 13.7 GB from 28 s to 45 s, right over the save's load, and the frames there were
+     * 150-320 ms with up to 267 ms of game file reads each (lowest 30 FPS); without it the worst
+     * was 62 ms (lowest 43). SOTC_PREFETCH=1 forces it on, =0 off. */
+    const char *prefetch_env=getenv("SOTC_PREFETCH");
+    const int prefetch_on=prefetch_env ? prefetch_env[0]!='0' : game_disk_hdd!=0;
+    if (!prefetch_on && !prefetch_env)
+        fprintf(stderr,"SOTC prefetch: off (the game's folder is on an SSD; SOTC_PREFETCH=1 turns it on)\n");
+    if (app0 && prefetch_on) {
         snprintf(prefetch_dir,sizeof(prefetch_dir),"%s",app0);
         CloseHandle(CreateThread(NULL,0,prefetch_thread,NULL,0,NULL));
     }

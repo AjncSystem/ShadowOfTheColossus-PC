@@ -43,12 +43,38 @@ LEGACY_CONFIG_DIR = Path(os.environ.get('APPDATA', Path.home())) / 'sotc-launche
 LEGACY_CONFIG_FILE = LEGACY_CONFIG_DIR / 'settings.json'
 CONFIG_DIR = PORT_DIR / 'user'
 CONFIG_FILE = CONFIG_DIR / 'launcher_settings.json'
+_SETTINGS_FILE = None
+
+
+def settings_file():
+    """sotc (#467): the one settings file this copy reads and writes. Its user folder, or the shared
+    %APPDATA% file when that folder cannot be written (Program Files, OneDrive, started from inside
+    the .zip). Before, a read-only copy saved to the shared file but loaded user/launcher_settings.json
+    again, and the in-game menu wrote to the user folder: the changes looked lost at every start."""
+    global _SETTINGS_FILE
+    if _SETTINGS_FILE is None:
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            probe = CONFIG_DIR / '.settings-write-test'
+            probe.write_text('', encoding='utf-8')
+            probe.unlink()
+            if CONFIG_FILE.exists() and not os.access(CONFIG_FILE, os.W_OK):
+                raise OSError('read-only settings file')
+            _SETTINGS_FILE = CONFIG_FILE
+        except OSError:
+            _SETTINGS_FILE = LEGACY_CONFIG_FILE
+    return _SETTINGS_FILE
 # The supported releases (title ID -> region, version) share one eboot build; scripts/ is on
 # sys.path above. The EU one (CUSA08809) is the default game folder.
 from sotc_modes import GAMES  # noqa: E402
 GAME_ID = 'CUSA08809'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.76.2'
+VERSION = '0.77'
+# sotc: the port version whose shader translation the cache holds (clear_shader_cache_after_update).
+# Raise it to the new VERSION in a release that changes how shaders are translated or stored
+# (shader_recompiler/, the SPIR-V emitters, vk_pipeline_serialization.cpp versions, cache_storage
+# folders); a release that does not keeps the players' caches.
+SHADER_CACHE_VERSION = '0.77'
 MAX_LOG_LINES = 6000
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 
@@ -705,23 +731,42 @@ def clear_shader_cache_after_update(settings):
     previous port can conflict with the new one (wrong or missing effects, crashes when one is
     loaded); the game builds them again, with some stutter at the start. The port version that
     built the cache is kept next to it (user/cache/port_version.txt; the --play path never saves
-    the settings, so they cannot hold it)."""
+    the settings, so they cannot hold it).
+
+    0.77: only an update that changes the shaders clears it (SHADER_CACHE_VERSION, the second line
+    of the marker; a marker without it names the port that built the cache). Clearing on every
+    update made each player translate every shader again, a stall at each new area for a whole
+    play-through. SOTC_CACHE_CLEAR_EVERY_UPDATE=1 (environment) clears on every update again."""
     data = user_dir(settings)
     marker = data / 'cache' / 'port_version.txt'
     try:
-        built_by = marker.read_text(encoding='utf-8').strip()
+        lines = marker.read_text(encoding='utf-8').split()
     except OSError:
-        built_by = ''
-    if built_by == VERSION:
-        return
+        lines = []
+    built_by = lines[0] if lines else ''
+    every_update = os.environ.get('SOTC_CACHE_CLEAR_EVERY_UPDATE', '') == '1'
+    if every_update:
+        if built_by == VERSION:
+            return
+    else:
+        shaders = lines[1].removeprefix('shaders=') if len(lines) > 1 else built_by
+        if shaders == SHADER_CACHE_VERSION:
+            if built_by != VERSION:
+                _write_cache_marker(marker)
+            return
     # A first start (no cache yet) has nothing to clear; an older cache without the marker was
     # built by a port before 0.72.2.
     if (data / 'cache').exists() or (data / 'shader').exists():
         for name in ('cache', 'shader'):
             shutil.rmtree(data / name, ignore_errors=True)
+    _write_cache_marker(marker)
+
+
+def _write_cache_marker(marker):
+    """The port version now using the cache, then the shader version it holds."""
     try:
         marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text(VERSION + '\n', encoding='utf-8')
+        marker.write_text(f'{VERSION}\nshaders={SHADER_CACHE_VERSION}\n', encoding='utf-8')
     except OSError:
         pass
 
@@ -729,7 +774,7 @@ def clear_shader_cache_after_update(settings):
 def load_settings():
     """Saved settings over the defaults. Older settings that turned DLSS-G on with SOTC_DLSSG=1 in
     the extra variables get the frame generation setting instead."""
-    saved = load_json(CONFIG_FILE, {})
+    saved = load_json(CONFIG_FILE, {}) if settings_file() == CONFIG_FILE else load_json(LEGACY_CONFIG_FILE, {})
     if not saved and LEGACY_CONFIG_FILE.is_file():
         # First start of this copy: the shared settings of older versions, but its own data
         # folder when the old one is another copy's user folder.
@@ -848,6 +893,18 @@ def screen_refresh_hz():
     return 60
 
 
+def dynamic_fps_step(hz):
+    """sotc: the dynamic FPS step (SOTC_FPS_DYNAMIC): the refresh rate divided by the smallest whole
+    number that brings it to 50 or less, so every frame lasts the same number of refreshes (48 at
+    144 Hz, 40 at 120 Hz, 30 at 60 Hz, 50 at 100 Hz, 37.5 at 75 Hz, 41.25 at 165 Hz). Before #454 a
+    rate that 48, 40 and 45 do not divide fell to 30, which does not divide 75, 100 or 165 Hz."""
+    hz = hz if hz and hz >= 30 else 60
+    divisor = 2
+    while hz / divisor > 50:
+        divisor += 1
+    return f'{hz / divisor:.2f}'.rstrip('0').rstrip('.')
+
+
 def game_environment(s):
     env = dict(os.environ)
     info = game_info(s['game_dir'])
@@ -885,9 +942,7 @@ def game_environment(s):
     # that cannot keep 60 lower it to a step that divides the screen's refresh (48 at 144 Hz, 40 at
     # 120/240 Hz, 30 at 60 Hz), steady instead of swinging; it tries 60 again every 10 s.
     if fps_mode == '60' and s.get('fps_dynamic', True):
-        hz = screen_refresh_hz()
-        step = 48 if hz % 48 == 0 else 40 if hz % 40 == 0 else 45 if hz % 45 == 0 else 30
-        env.setdefault('SOTC_FPS_DYNAMIC', str(step))
+        env.setdefault('SOTC_FPS_DYNAMIC', dynamic_fps_step(screen_refresh_hz()))
     env['BB_VBLANK_HZ'] = '120'
     env['BB_FULLSCREEN'] = '1' if s['fullscreen'] else '0'
     # The monitor the game window opens on (window.cpp): the centre of the chosen one, found again now
@@ -955,7 +1010,7 @@ def game_environment(s):
     if str(s.get('audio_device') or '').strip():
         env['SOTC_AUDIO_DEVICE'] = str(s['audio_device']).strip()
     # The in-game menu's quick settings are written back here (bbport_overlay.cpp).
-    env['SOTC_LAUNCHER_SETTINGS'] = str(CONFIG_FILE)
+    env['SOTC_LAUNCHER_SETTINGS'] = str(settings_file())
     env['SOTC_SHADOW_REUSE'] = str(s.get('shadow_reuse') or '0')
     env['SOTC_OUTPUT_RES'] = s.get('output_res') or '1920x1080'
     # The PS4 Pro path keeps its 16:9 sizes: a wider screen (21:9, 32:9) wins over it (#142).
@@ -1013,6 +1068,10 @@ def game_environment(s):
         env.setdefault('SOTC_PC_MEMORY', '1')
         env.setdefault('SOTC_PC_MEMORY_PREIMPORT', '1')
         env.setdefault('SOTC_TEX_DIRECT', '1')
+        # sotc: 0.77 (T48): textures in several backing runs (the game's pool maps them 64 KiB at
+        # a time) or across two import chunks are gathered by the GPU instead of copied by the
+        # CPU (~13 GB a session; user's route 17 Nov: area entry 7-9 frames over 50 ms -> 1).
+        env.setdefault('SOTC_TEX_GATHER', '1')
     # sotc: "Maximum" in PS4 Pro mode exhausted the game's page pool within minutes at the Shrine
     # (0x1a371, 22 Oct) until tabnul's page allocator fix (PR #288, sotc_modes.py POOL_FIX): an
     # hour without a crash with it (26 Oct). Experimental there; SOTC_MAX_IN_PRO=0 brings back High.
@@ -2462,10 +2521,14 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         for key, var in self.vars.items():
             self.app[key] = var.get()
         text = json.dumps(self.app, indent=2, ensure_ascii=False)
+        global _SETTINGS_FILE
         try:
+            if settings_file() != CONFIG_FILE:
+                raise OSError('read-only port folder')
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             CONFIG_FILE.write_text(text, encoding='utf-8')
         except OSError:  # a read-only port folder (Program Files): the shared settings
+            _SETTINGS_FILE = LEGACY_CONFIG_FILE
             LEGACY_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             LEGACY_CONFIG_FILE.write_text(text, encoding='utf-8')
 
@@ -3654,7 +3717,7 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                  'hdr_tonemap', 'hdr_white', 'hdr_peak', 'hdr_ui_nits', 'hdr_grading') + HDR_GRADE_KEYS
 
     def reload_live_settings(self):
-        saved = load_json(CONFIG_FILE, {})
+        saved = load_json(settings_file(), {})
         for key in self.LIVE_KEYS:
             if key in saved and key in self.vars and saved[key] != self.vars[key].get():
                 try:

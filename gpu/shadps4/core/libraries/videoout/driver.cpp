@@ -25,6 +25,7 @@
 #include "bbport_mem_report.h"
 #include "bbport_overlay.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/sotc_gpu_times.h"
 #include "video_core/sotc_fps_cap.h"
 #include "video_core/sotc_event.h"
 #include "video_core/sotc_stats.h"
@@ -354,6 +355,9 @@ void VideoOutDriver::Flip(const Request& req) {
                             .count();
         SotcStats::flip_age_ns.fetch_add(age, std::memory_order_relaxed);
         SotcStats::flip_age_count.fetch_add(1, std::memory_order_relaxed);
+        if (SotcStats::kTickWatch) {
+            SotcStats::gpu_busy_frames.fetch_add(1, std::memory_order_relaxed);
+        }
         if (age > SotcStats::flip_age_max_ns.load(std::memory_order_relaxed)) {
             SotcStats::flip_age_max_ns.store(age, std::memory_order_relaxed);
         }
@@ -677,6 +681,14 @@ void VideoOutDriver::Flip(const Request& req) {
                              static_cast<unsigned long long>(SotcStats::vis_honest_labels.exchange(0)),
                              static_cast<unsigned long long>(SotcStats::vis_fallbacks.exchange(0)),
                              static_cast<unsigned long long>(SotcStats::vis_unmap_waits.exchange(0)));
+                if (SotcStats::kVisDirectOrder) {
+                    ReportPrintf(report,
+                                 "SOTC VIS ORDER: %llu labels held for a direct dispatch or behind "
+                                 "one, %llu submissions for it, %lld still held\n",
+                                 static_cast<unsigned long long>(SotcStats::vis_held_labels.exchange(0)),
+                                 static_cast<unsigned long long>(SotcStats::vis_held_flushes.exchange(0)),
+                                 static_cast<long long>(SotcStats::vis_labels_pending.load()));
+                }
             }
             if (const u64 queued = SotcStats::release_queued.exchange(0)) {
                 ReportPrintf(report,
@@ -714,6 +726,17 @@ void VideoOutDriver::Flip(const Request& req) {
                                  c(tex_direct_why[2]), b2, c(tex_direct_why[3]), b3,
                                  c(tex_direct_why[4]), b4);
                 }
+                if (SotcStats::kTexGather) {
+                    ReportPrintf(report,
+                                 "SOTC TEX GATHER: %llu uploads gathered by the GPU (%llu MiB, %llu "
+                                 "regions)\n",
+                                 static_cast<unsigned long long>(
+                                     SotcStats::tex_gather_uploads.exchange(0)),
+                                 static_cast<unsigned long long>(
+                                     SotcStats::tex_gather_bytes.exchange(0) >> 20),
+                                 static_cast<unsigned long long>(
+                                     SotcStats::tex_gather_regions.exchange(0)));
+                }
             }
             if (SotcStats::kRbAge) {
                 const auto c0 = SotcStats::rb_age_count[0].exchange(0);
@@ -739,8 +762,44 @@ void VideoOutDriver::Flip(const Request& req) {
                              SotcStats::flip_age_max_ns.exchange(0) / 1e6,
                              static_cast<unsigned long long>(ages));
             }
+            if (const u64 grouped = SotcStats::rb_group_readbacks.exchange(0)) {
+                ReportPrintf(report,
+                             "SOTC RB GROUP: %llu readbacks brought along %llu ranges of the same "
+                             "visibility program (%llu KiB)\n",
+                             static_cast<unsigned long long>(grouped),
+                             static_cast<unsigned long long>(SotcStats::rb_group_regions.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::rb_group_bytes.exchange(0) >> 10));
+            }
+            if (const u64 served = SotcStats::rb_safepoint_finishes.exchange(0)) {
+                ReportPrintf(report, "SOTC RB SAFEPOINT: %llu readback finishes served inside long ops\n",
+                             static_cast<unsigned long long>(served));
+            }
+            if (const u64 idle_flushes = SotcStats::idle_flushes.exchange(0)) {
+                ReportPrintf(report, "SOTC IDLE FLUSH: %.0f submits/s when the draw thread ran dry\n",
+                             idle_flushes / seconds);
+            }
+            // sotc: SOTC_GPU_TIMES (sotc_gpu_times.h): where the sampled frames' GPU time went.
+            if (const auto gpu_times = Vulkan::SotcGpuTimes::Report(); !gpu_times.empty()) {
+                ReportPrintf(report, "%s", gpu_times.c_str());
+            }
+            if (SotcStats::kTickWatch) {
+                const u64 idle = SotcStats::gpu_idle_ns.exchange(0);
+                const u64 busy = SotcStats::gpu_busy_ns.exchange(0);
+                const u64 frames = std::max<u64>(SotcStats::gpu_busy_frames.exchange(0), 1);
+                ReportPrintf(report,
+                             "SOTC GPU BUSY: %.0f%% of the time with work queued (%.1f ms per "
+                             "frame busy, %.1f idle)\n",
+                             idle + busy ? 100.0 * busy / (idle + busy) : 0.0,
+                             busy / 1e6 / frames, idle / 1e6 / frames);
+                ReportPrintf(report,
+                             "SOTC GPU IDLE BY: draw thread busy %.1f ms, command processor busy "
+                             "%.1f ms, both idle (game) %.1f ms per frame\n",
+                             SotcStats::gpu_idle_draw_ns.exchange(0) / 1e6 / frames,
+                             SotcStats::gpu_idle_cp_ns.exchange(0) / 1e6 / frames,
+                             SotcStats::gpu_idle_game_ns.exchange(0) / 1e6 / frames);
+            }
             ReportPrintf(report,
-                         "SOTC readback finish: %llu for bytes the guest asked, %llu binds, "
+                         "SOTC readback finish:%llu for bytes the guest asked, %llu binds, "
                          "%llu window, %llu hot; dirty retries %llu, hot dropped %llu, "
                          "requeued %llu\n",
                          static_cast<unsigned long long>(
@@ -756,6 +815,25 @@ void VideoOutDriver::Flip(const Request& req) {
                          static_cast<unsigned long long>(
                              SotcStats::rb_dirty_hot_dropped.exchange(0)),
                          static_cast<unsigned long long>(SotcStats::rb_requeues.exchange(0)));
+            if (const u64 pushes = SotcStats::rb_push.exchange(0)) {
+                ReportPrintf(report,
+                             "SOTC RB PUSH: %llu copies (%.0f KiB), %llu faults served, %llu stale, "
+                             "%llu unused, %llu skipped, %llu unmaps waited for a copy\n",
+                             static_cast<unsigned long long>(pushes),
+                             SotcStats::rb_push_bytes.exchange(0) / 1024.0,
+                             static_cast<unsigned long long>(SotcStats::rb_push_hits.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::rb_push_stale.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::rb_push_unused.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::rb_push_skipped.exchange(0)),
+                             static_cast<unsigned long long>(
+                                 SotcStats::rb_push_release_waits.exchange(0)));
+                if (const u64 checked = SotcStats::rb_push_verify_bytes.exchange(0)) {
+                    ReportPrintf(report, "SOTC RB PUSH VERIFY: %llu bytes compared, %llu differ\n",
+                                 static_cast<unsigned long long>(checked),
+                                 static_cast<unsigned long long>(
+                                     SotcStats::rb_push_verify_differ.exchange(0)));
+                }
+            }
             if (const u64 streamed = SotcStats::rb_stream_windows.exchange(0)) {
                 ReportPrintf(report, "SOTC readback stream windows: %llu\n",
                              static_cast<unsigned long long>(streamed));
@@ -783,6 +861,48 @@ void VideoOutDriver::Flip(const Request& req) {
                              SotcStats::rb_narrow_kept_bytes.exchange(0) / 1024.0 / seconds,
                              static_cast<unsigned long long>(
                                  SotcStats::rb_hot_entries.load(std::memory_order_relaxed)));
+            }
+            if (SotcStats::kBufHoistStats) { // sotc: test #50
+                ReportPrintf(report,
+                             "SOTC BUF HOIST: %llu uploads could move to the submission start "
+                             "(%.1f MiB), %llu could not (%.1f MiB, range already used); while "
+                             "binding 0x79704cba: %.1f MiB could, %.1f MiB could not\n",
+                             static_cast<unsigned long long>(SotcStats::hoist_free_n.exchange(0)),
+                             SotcStats::hoist_free_bytes.exchange(0) / 1048576.0,
+                             static_cast<unsigned long long>(SotcStats::hoist_used_n.exchange(0)),
+                             SotcStats::hoist_used_bytes.exchange(0) / 1048576.0,
+                             SotcStats::hoist_free_79.exchange(0) / 1048576.0,
+                             SotcStats::hoist_used_79.exchange(0) / 1048576.0);
+                ReportPrintf(report,
+                             "SOTC BUF GUARD (full): %.1f MiB pass; fail: %.1f MiB DMA shader in "
+                             "flight, %.1f MiB used in this command buffer, %.1f MiB used in flight\n",
+                             SotcStats::guard_pass_bytes.exchange(0) / 1048576.0,
+                             SotcStats::guard_dma_bytes.exchange(0) / 1048576.0,
+                             SotcStats::guard_current_bytes.exchange(0) / 1048576.0,
+                             SotcStats::guard_inflight_bytes.exchange(0) / 1048576.0);
+            }
+            if (SotcStats::kUploadPrepass) { // sotc: test #49
+                ReportPrintf(report,
+                             "SOTC UPLOAD PREPASS: %llu texture uploads before the frame (%.1f MiB); "
+                             "in the frame: %llu image already used, %llu source not on the host\n",
+                             static_cast<unsigned long long>(SotcStats::prepass_uploads.exchange(0)),
+                             SotcStats::prepass_bytes.exchange(0) / 1048576.0,
+                             static_cast<unsigned long long>(SotcStats::prepass_used.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::prepass_source.exchange(0)));
+            }
+            if (SotcStats::kIndirectMergeStats) { // sotc: test #48
+                ReportPrintf(report,
+                             "SOTC INDIRECT MERGE: %llu GPU-argument draws, %llu could join the "
+                             "previous (longest run %llu); not: pipeline %llu, bindings %llu, state "
+                             "%llu, args not contiguous %llu, count/multi %llu\n",
+                             static_cast<unsigned long long>(SotcStats::imerge_total.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::imerge_ok.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::imerge_longest.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::imerge_pipeline.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::imerge_bind.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::imerge_state.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::imerge_args.exchange(0)),
+                             static_cast<unsigned long long>(SotcStats::imerge_count.exchange(0)));
             }
             if (SotcStats::kFastBind) {
                 const uint64_t eligible = SotcStats::fast_bind_eligible.exchange(0);
@@ -1102,6 +1222,21 @@ void VideoOutDriver::Flip(const Request& req) {
                                  SotcStats::async_translate_stale.load(std::memory_order_relaxed)),
                              static_cast<unsigned long long>(SotcStats::async_compute_self_built.load(
                                  std::memory_order_relaxed)));
+            }
+            // sotc: compute shaders translated ahead (SOTC_COMPUTE_PREFETCH), totals.
+            if (const uint64_t queued =
+                    SotcStats::prefetch_queued.load(std::memory_order_relaxed)) {
+                std::fprintf(stderr,
+                             "SOTC COMPUTE PREFETCH %llu queued: %llu ready, %llu waited (%.0f "
+                             "ms), %llu taken back\n",
+                             static_cast<unsigned long long>(queued),
+                             static_cast<unsigned long long>(
+                                 SotcStats::prefetch_ready.load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(
+                                 SotcStats::prefetch_waited.load(std::memory_order_relaxed)),
+                             SotcStats::prefetch_wait_ns.load(std::memory_order_relaxed) / 1e6,
+                             static_cast<unsigned long long>(
+                                 SotcStats::prefetch_taken_back.load(std::memory_order_relaxed)));
             }
             const bool cmd_stats = SotcStats::kCmdStats; // sotc: as the counters (sotc_stats.h)
             if (cmd_stats && flips) {
@@ -1425,7 +1560,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             // sotc: SOTC_FPS_DYNAMIC: the 60 FPS limit lowered while the game cannot keep it.
             if (const int dyn = SotcFpsCap::dynamic_limit.load(std::memory_order_relaxed);
                 dyn > 0 && limit_vblanks == vblanks_for(60)) {
-                limit_vblanks = vblanks_for(dyn); // the vblank grid's rounding; paced: exact
+                limit_vblanks = vblanks_for(dyn / 100); // the vblank grid's rounding; paced: exact
             }
             const bool paced = SotcFpsCap::flip_pacer.load(std::memory_order_relaxed);
             if (limit_vblanks != 0 && !paced) {
@@ -1441,8 +1576,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                     // a whole number of 120 Hz vblanks).
                     const int dyn = SotcFpsCap::dynamic_limit.load(std::memory_order_relaxed);
                     const std::chrono::nanoseconds limit_period =
-                        dyn > 0 && limit_vblanks == vblanks_for(dyn)
-                            ? std::chrono::nanoseconds{1'000'000'000 / dyn}
+                        dyn > 0 && limit_vblanks == vblanks_for(dyn / 100)
+                            ? std::chrono::nanoseconds{100'000'000'000LL / dyn}
                             : std::chrono::duration_cast<std::chrono::nanoseconds>(
                                   vblank_period * limit_vblanks);
                     limit_next = (now - limit_next < tick_period ? limit_next : now) + limit_period;
@@ -1496,7 +1631,29 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                                    vblanks_for(60);
                 // A frame counts as slow below 50 FPS: 50-60 FPS stays at the 60 limit (the step only
                 // takes over where the game really cannot keep up).
-                constexpr auto frame_60 = std::chrono::nanoseconds{1'000'000'000 / 50};
+                // sotc: SOTC_FPS_DYNAMIC_SLOW_FPS (default 50; test #52 of MEMORIA-TESTES.md): the
+                // rate under which a frame counts as slow. At 50-53 FPS (the dense forest) a 144 Hz
+                // screen shows frames for 2 or 3 vblanks in turn (judder) and the step (48 = 3
+                // vblanks, even) never engaged; 57 lets it take those stretches.
+                static const auto frame_60 = std::chrono::nanoseconds{[] {
+                    const char* v = std::getenv("SOTC_FPS_DYNAMIC_SLOW_FPS");
+                    const long fps = v ? std::clamp(std::strtol(v, nullptr, 10), 30L, 59L) : 50L;
+                    return 1'000'000'000LL / fps;
+                }()};
+                // sotc: 19/11: a 2-3 s dip of an area change (39-42 FPS) took the step, which then
+                // held 48 for 10-15 s after the PC could do 60 again (the player saw that as the
+                // drop). SOTC_FPS_DYNAMIC_SLOW_MS (default 5000, was 1500): slow time before the
+                // step; SOTC_FPS_DYNAMIC_HOLD_S (default 4, was 10): time at the step before trying
+                // 60, doubled after each failed try up to 10 s (heavy stretches do not swing).
+                static const auto slow_limit = std::chrono::milliseconds{[] {
+                    const char* v = std::getenv("SOTC_FPS_DYNAMIC_SLOW_MS");
+                    return v ? std::strtol(v, nullptr, 10) : 5000L;
+                }()};
+                static const auto hold_first = std::chrono::seconds{[] {
+                    const char* v = std::getenv("SOTC_FPS_DYNAMIC_HOLD_S");
+                    return v ? std::max(1L, std::strtol(v, nullptr, 10)) : 4L;
+                }()};
+                static auto hold = hold_first;
                 const auto set = [&](Dyn next, int limit) {
                     state = next;
                     since = last_flip_time;
@@ -1515,11 +1672,12 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                     // Slow time builds up and drains back: a run of slow frames lowers it.
                     slow = delta > frame_60 ? slow + delta
                                             : std::max(std::chrono::nanoseconds{0}, slow - delta);
-                    if (slow > std::chrono::milliseconds{1500}) {
+                    if (slow > slow_limit) {
+                        hold = hold_first;
                         set(Dyn::Low, SotcFpsCap::dynamic_low);
                     }
                 } else if (state == Dyn::Low) {
-                    if (last_flip_time - since > std::chrono::seconds{10}) {
+                    if (last_flip_time - since > hold) {
                         set(Dyn::Probe, 0);
                     }
                 } else { // Probe: 60 again for 2 s; back to low when over a quarter was slow
@@ -1529,8 +1687,10 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                     }
                     if (last_flip_time - since > std::chrono::seconds{2}) {
                         if (slow * 4 > total) {
+                            hold = std::min(hold * 2, std::chrono::seconds{10});
                             set(Dyn::Low, SotcFpsCap::dynamic_low);
                         } else {
+                            hold = hold_first;
                             set(Dyn::High, 0);
                         }
                     }

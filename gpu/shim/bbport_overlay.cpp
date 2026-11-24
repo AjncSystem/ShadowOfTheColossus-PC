@@ -328,6 +328,16 @@ void SaveLauncherSetting(const char* key, const std::string& json_value) {
     }
     std::ofstream out(LauncherSettingsPath(), std::ios::binary | std::ios::trunc);
     out << text;
+    out.close();
+    // sotc (#467): a read-only settings file used to fail here silently; say so once.
+    static bool warned = false;
+    if (!out && !warned) {
+        warned = true;
+        SotcEvent::Log("MENU",
+                       SotcUi::T("Não foi possível salvar a configuração em %s (pasta somente leitura?)",
+                                 "Could not save the setting to %s (read-only folder?)"),
+                       LauncherSettingsPath().string().c_str());
+    }
 }
 
 // sotc: SOTC_LOD_POOL_LOW at start (8 when unset): the page pool switch of texture level "High".
@@ -3108,6 +3118,22 @@ void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent,
         last_present = now;
         if (ms > 0.0f && ms < 1000.0f) {
             frame_ms_avg = frame_ms_avg == 0.0f ? ms : frame_ms_avg * 0.95f + ms * 0.05f;
+        }
+        // sotc: the on-screen FPS counter in the log: each second, the lowest and the last value
+        // it showed ("SOTC SCREEN FPS"), so the log has what the player sees (the 5 s averages of
+        // "SOTC FPS" hide a 1 s dip to 32).
+        if (frame_ms_avg > 0.0f) {
+            static const auto start = now;
+            static auto second_start = now;
+            static float lowest = 1e9f;
+            const float shown = 1000.0f / frame_ms_avg;
+            lowest = std::min(lowest, shown);
+            if (now - second_start >= std::chrono::seconds(1)) {
+                std::fprintf(stderr, "SOTC SCREEN FPS %.0fs: lowest %.0f, now %.0f\n",
+                             std::chrono::duration<float>(now - start).count(), lowest, shown);
+                second_start = now;
+                lowest = 1e9f;
+            }
         }
         if (ms > 0.0f && ms < 5000.0f) {
             RecordFrame(ms);

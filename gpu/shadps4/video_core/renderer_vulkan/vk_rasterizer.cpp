@@ -38,6 +38,8 @@
 #include "video_core/renderer_vulkan/vk_shadow_scroll.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/sotc_gpu_times.h"
+#include "video_core/renderer_vulkan/sotc_cull_queue.h"
 #include "video_core/buffer_cache/region_manager.h"
 #include "video_core/sotc_live.h"
 #include "video_core/sotc_tonemap.h"
@@ -56,6 +58,77 @@
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace Vulkan {
+
+namespace {
+// sotc: SOTC_WATCH_PROGRAMS=hash,hash,... (test #41 of docs/sotc/MEMORIA-TESTES.md): one log line
+// per dispatch of those compute shaders, with the op's time on the draw thread, its DMA sweep and
+// buffer upload time, bytes copied from guest memory, process page faults, and how long the
+// command processor had waited for the game so far in the frame. Nothing else is timed.
+std::vector<u64> WatchedPrograms() {
+    std::vector<u64> out;
+    const char* v = std::getenv("SOTC_WATCH_PROGRAMS");
+    if (!v) {
+        return out;
+    }
+    const std::string list = v;
+    size_t pos = 0;
+    while (pos < list.size()) {
+        const size_t comma = list.find(',', pos);
+        const std::string item =
+            list.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+        if (const u64 h = std::strtoull(item.c_str(), nullptr, 0)) {
+            out.push_back(h);
+        }
+        if (comma == std::string::npos) {
+            break;
+        }
+        pos = comma + 1;
+    }
+    return out;
+}
+struct WatchOp {
+    u64 hash = 0;
+    std::chrono::steady_clock::time_point t0{};
+    u64 dma0 = 0, buf0 = 0, copy0 = 0, faults0 = 0;
+    explicit WatchOp(u64 pgm_hash) {
+        static const std::vector<u64> programs = WatchedPrograms();
+        if (programs.empty() ||
+            std::find(programs.begin(), programs.end(), pgm_hash) == programs.end()) {
+            return;
+        }
+        hash = pgm_hash;
+        dma0 = SotcStats::frame_ns[SotcStats::FrameDma].load(std::memory_order_relaxed);
+        buf0 = SotcStats::frame_ns[SotcStats::FrameBuffer].load(std::memory_order_relaxed);
+        copy0 = SotcStats::frame_copy_bytes.load(std::memory_order_relaxed);
+        faults0 = SotcStats::SplitProcessFaults();
+        t0 = std::chrono::steady_clock::now();
+    }
+    ~WatchOp() {
+        if (!hash) {
+            return;
+        }
+        static const auto start = std::chrono::steady_clock::now();
+        static std::atomic<u32> lines{0};
+        const auto now = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - t0).count();
+        const auto delta = [](u64 now_v, u64 before) { return now_v >= before ? now_v - before : now_v; };
+        const u64 dma = delta(SotcStats::frame_ns[SotcStats::FrameDma].load(), dma0);
+        const u64 buf = delta(SotcStats::frame_ns[SotcStats::FrameBuffer].load(), buf0);
+        const u64 copy = delta(SotcStats::frame_copy_bytes.load(), copy0);
+        const u64 faults = delta(SotcStats::SplitProcessFaults(), faults0);
+        const double idle = SotcStats::frame_ns[SotcStats::FrameIdle].load() / 1e6;
+        if (lines.fetch_add(1, std::memory_order_relaxed) < 20000) {
+            std::fprintf(stderr,
+                         "SOTC WATCH %#llx at %.2fs: %.2f ms (dma %.2f, buffer %.2f), copied %llu KiB, "
+                         "%llu page faults; command processor idle so far this frame %.1f ms\n",
+                         static_cast<unsigned long long>(hash),
+                         std::chrono::duration<double>(now - start).count(), ms, dma / 1e6,
+                         buf / 1e6, static_cast<unsigned long long>(copy >> 10),
+                         static_cast<unsigned long long>(faults), idle);
+        }
+    }
+};
+} // namespace
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -904,8 +977,17 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();
+        if (cull_queue) { // sotc: SOTC_CULL_QUEUE: its open batch first, then wait for it
+            cull_queue->OnGraphicsSubmit(info);
+        }
         buffer_cache.SubmitPendingArenaBinds(info);
     });
+    // sotc: SOTC_CULL_QUEUE=1 (sotc_cull_queue.h); off: nothing of it exists.
+    if (CullQueue::Enabled() && instance.GetCullQueue()) {
+        cull_queue = std::make_unique<CullQueue>(instance, scheduler, runtime, buffer_cache,
+                                                 texture_cache, memory);
+        g_cull_queue = cull_queue.get();
+    }
 
     if (Shader::LodFeedbackEnabled()) {
         sotc_lod_feedback = std::make_unique<VideoCore::Buffer>(
@@ -997,6 +1079,7 @@ void Rasterizer::SotcLodFeedbackCycle() {
 }
 
 Rasterizer::~Rasterizer() {
+    g_cull_queue = nullptr; // sotc: SOTC_CULL_QUEUE
     for (auto& [address, image] : hudless_images) {
         DestroyHudless(image);
     }
@@ -2171,6 +2254,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
     DrawPhase::Sub(DrawPhase::SSchBind);
 
+    GpuTimesBefore(cmdbuf, SotcGpuTimes::KDraw, pipeline); // sotc: SOTC_GPU_TIMES
     if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
                            s32(vertex_offset), instance_offset);
@@ -2178,6 +2262,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const Pipeline* resolve
         cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
                     instance_offset);
     }
+    GpuTimesAfter(cmdbuf);
     // sotc: the final composite again, without the UI layer (TakeHudless).
     if (hudless_ui_info >= 0 && hudless_vo && BeginHudless(pipeline, state)) {
         const auto hudless_cmdbuf = scheduler.CommandBuffer();
@@ -2318,6 +2403,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         scheduler.BeginRendering(state, state_token);
         const auto cmdbuf = scheduler.CommandBuffer();
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+        GpuTimesBefore(cmdbuf, SotcGpuTimes::KDrawIndirect, pipeline); // sotc: SOTC_GPU_TIMES
         if (is_indexed) {
             const auto& a = args.indexed;
             cmdbuf.drawIndexed(a.indexCount, a.instanceCount, a.firstIndex, a.vertexOffset,
@@ -2326,6 +2412,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             const auto& a = args.plain;
             cmdbuf.draw(a.vertexCount, a.instanceCount, a.firstVertex, a.firstInstance);
         }
+        GpuTimesAfter(cmdbuf);
         DebugState.IncDrawCall();
         DrawPhase::Sub(DrawPhase::SSchDraw);
         DrawPhase::Mark(DrawPhase::Sched);
@@ -2396,6 +2483,51 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
+    if (SotcStats::kIndirectMergeStats) [[unlikely]] { // sotc: test #48, counting only
+        struct Prev {
+            const GraphicsPipeline* pipeline = nullptr;
+            VkBuffer buffer = VK_NULL_HANDLE;
+            u64 end = 0;
+            u32 stride = 0;
+            u64 state_token = 0;
+            VkCommandBuffer cmdbuf = VK_NULL_HANDLE;
+            u64 run = 0;
+        };
+        static thread_local Prev prev;
+        const VkBuffer handle = buffer->Handle();
+        const VkCommandBuffer cb = cmdbuf;
+        SotcStats::imerge_total.fetch_add(1, std::memory_order_relaxed);
+        std::atomic<uint64_t>* why = nullptr;
+        if (count_address != 0 || max_count != 1) {
+            why = &SotcStats::imerge_count;
+        } else if (prev.pipeline != pipeline || prev.cmdbuf != cb) {
+            why = &SotcStats::imerge_pipeline;
+        } else if (!fast_bind_hit) {
+            why = &SotcStats::imerge_bind;
+        } else if (prev.state_token != state_token || needs_barrier) {
+            why = &SotcStats::imerge_state;
+        } else if (prev.buffer != handle || prev.end != base || prev.stride != stride) {
+            why = &SotcStats::imerge_args;
+        }
+        if (why) {
+            why->fetch_add(1, std::memory_order_relaxed);
+            prev.run = 1;
+        } else {
+            SotcStats::imerge_ok.fetch_add(1, std::memory_order_relaxed);
+            ++prev.run;
+            u64 longest = SotcStats::imerge_longest.load(std::memory_order_relaxed);
+            while (prev.run > longest &&
+                   !SotcStats::imerge_longest.compare_exchange_weak(longest, prev.run)) {
+            }
+        }
+        prev.pipeline = pipeline;
+        prev.buffer = handle;
+        prev.end = base + u64{stride} * max_count;
+        prev.stride = stride;
+        prev.state_token = state_token;
+        prev.cmdbuf = cb;
+    }
+    GpuTimesBefore(cmdbuf, SotcGpuTimes::KDrawIndirect, pipeline); // sotc: SOTC_GPU_TIMES
     if (is_indexed) {
         ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
 
@@ -2417,6 +2549,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         }
         DebugState.IncDrawCall();
     }
+    GpuTimesAfter(cmdbuf);
 
     // Record the indirect argument reads so a later write to the same range (e.g. a WRITE_DATA
     // packet uploading the next draw's arguments) waits for this draw instead of racing it.
@@ -2565,6 +2698,7 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     SotcStats::current_program.store(cs.pgm_hash, std::memory_order_relaxed);
+    const WatchOp watch{cs.pgm_hash}; // sotc: SOTC_WATCH_PROGRAMS
     if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1
         SotcOps::NoteDispatch(cs.pgm_hash, u64{cs_program.dim_x} * cs_program.dim_y * cs_program.dim_z);
     }
@@ -2648,6 +2782,29 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
         return;
     }
 
+    // sotc: SOTC_CULL_QUEUE: a cull dispatch is recorded into the cull queue's command buffer
+    // (its uploads, barriers, bind and dispatch), from here to cull_session.Finish().
+    struct CullSession {
+        CullQueue* queue{};
+        ~CullSession() {
+            Finish();
+        }
+        void Finish() {
+            if (queue) {
+                std::exchange(queue, nullptr)->End();
+            }
+        }
+    } cull_session;
+    cull_verify.armed = false;
+    if (cull_queue && CullQueue::IsCandidate(cs.pgm_hash)) {
+        if (CullQueue::VerifyEnabled()) {
+            cull_verify.slot = cull_queue->VerifyAcquire(); // before Begin: it may wait
+        }
+        if (cull_queue->Begin(cs)) {
+            cull_session.queue = cull_queue.get();
+        }
+    }
+
     if (!BindResources(pipeline)) {
         SotcStats::Drop(3, cs_program.Address<uintptr_t>(), 0);
         return;
@@ -2657,18 +2814,147 @@ void Rasterizer::DispatchDirect(const Pipeline* resolved, bool use_resolved) {
         runtime.FlushBarriers();
     }
 
-    scheduler.EndRendering();
+    if (!cull_session.queue) {
+        scheduler.EndRendering(); // sotc: the cull queue leaves the render pass alone
+    }
     pipeline->BindResources(set_writes, push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
+    if (cull_session.queue && CullQueue::VerifyEnabled()) {
+        CullVerifyCapture(cmdbuf); // sotc: SOTC_CULL_QUEUE_VERIFY
+    }
     pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
+    GpuTimesDeps(cs);                                          // sotc: SOTC_GPU_TIMES
+    GpuTimesBefore(cmdbuf, SotcGpuTimes::KDispatch, pipeline); // sotc: SOTC_GPU_TIMES
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    GpuTimesAfter(cmdbuf);
     DebugState.IncDispatch();
     AfterVisDirect(); // sotc: SOTC_VIS_DIRECT
+    PushCullReadbacks(cs.pgm_hash); // sotc: SOTC_RB_PUSH
     MaybeDumpImages(cs.pgm_hash);
 
     ResetBindings(true);
+    cull_session.Finish();
+    if (cull_verify.armed) {
+        CullVerifyRun(pipeline, cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    }
     FlushPeriodic();
+}
+
+void Rasterizer::CullVerifyCapture(vk::CommandBuffer cull_cmdbuf) {
+    // sotc: SOTC_CULL_QUEUE_VERIFY. The written binding's range is copied (on the cull queue,
+    // before the dispatch) into a scratch buffer: the output as the dispatch finds it. The
+    // descriptors are kept for the graphics run (CullVerifyRun).
+    auto* slot = static_cast<CullQueue::VerifySlot*>(cull_verify.slot);
+    const BoundBuffer* written = nullptr;
+    for (const auto& bound : bound_buffers) {
+        if (bound.is_written) {
+            if (written) {
+                cull_queue->VerifySkip(); // more than one written buffer: not compared
+                return;
+            }
+            written = &bound;
+        }
+    }
+    if (!slot || !written) {
+        cull_queue->VerifySkip();
+        return;
+    }
+    const vk::Buffer handle = written->buffer->Handle();
+    int found = -1;
+    cull_verify.infos.assign(buffer_infos.begin(), buffer_infos.end());
+    cull_verify.writes.assign(set_writes.begin(), set_writes.end());
+    for (auto& write : cull_verify.writes) {
+        if (!write.pBufferInfo) {
+            continue;
+        }
+        const ptrdiff_t index = write.pBufferInfo - buffer_infos.data();
+        if (index < 0 || index >= static_cast<ptrdiff_t>(buffer_infos.size())) {
+            continue;
+        }
+        write.pBufferInfo = &cull_verify.infos[index];
+        const auto& info = buffer_infos[index];
+        if (info.buffer == handle && info.offset <= written->offset &&
+            written->offset < info.offset + info.range) {
+            found = static_cast<int>(index);
+        }
+    }
+    if (found < 0 || cull_verify.infos[found].range > CullQueue::VerifySlotBytes) {
+        cull_queue->VerifySkip();
+        return;
+    }
+    auto& info = cull_verify.infos[found];
+    cull_verify.arena = handle;
+    cull_verify.offset = info.offset;
+    cull_verify.range = info.range;
+    cull_verify.push = push_data;
+    info.buffer = slot->scratch->Handle();
+    info.offset = 0;
+    const vk::MemoryBarrier2 barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+    };
+    const vk::DependencyInfo dep{.memoryBarrierCount = 1, .pMemoryBarriers = &barrier};
+    cull_cmdbuf.pipelineBarrier2(dep);
+    const vk::BufferCopy copy{.srcOffset = cull_verify.offset, .dstOffset = 0,
+                              .size = cull_verify.range};
+    cull_cmdbuf.copyBuffer(handle, slot->scratch->Handle(), copy);
+    cull_cmdbuf.pipelineBarrier2(dep);
+    cull_verify.armed = true;
+}
+
+void Rasterizer::CullVerifyRun(const ComputePipeline* pipeline, u32 x, u32 y, u32 z) {
+    // sotc: SOTC_CULL_QUEUE_VERIFY. The same dispatch on the graphics queue at the place it had
+    // before, writing into the scratch copy of its output; then both results go to the host and
+    // are compared once the graphics queue got there (it waited for the cull queue).
+    cull_verify.armed = false;
+    auto* slot = static_cast<CullQueue::VerifySlot*>(cull_verify.slot);
+    const u64 range = cull_verify.range;
+    scheduler.EndRendering();
+    runtime.FlushBarriers();
+    const vk::MemoryBarrier2 barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+    };
+    const vk::DependencyInfo dep{.memoryBarrierCount = 1, .pMemoryBarriers = &barrier};
+    const auto cmdbuf = scheduler.CommandBuffer();
+    cmdbuf.pipelineBarrier2(dep);
+    pipeline->BindResources(cull_verify.writes, cull_verify.push);
+    pipeline->BindWhenReady();
+    cmdbuf.dispatch(x, y, z);
+    cmdbuf.pipelineBarrier2(dep);
+    auto& pool = runtime.GetStagingPool();
+    const auto truth = pool.Request(range, VideoCore::MemoryType::HostCached, 0, true);
+    const auto queued = pool.Request(range, VideoCore::MemoryType::HostCached, 0, true);
+    cmdbuf.copyBuffer(slot->scratch->Handle(), truth.buffer->Handle(),
+                      vk::BufferCopy{.srcOffset = 0, .dstOffset = truth.offset, .size = range});
+    cmdbuf.copyBuffer(cull_verify.arena, queued.buffer->Handle(),
+                      vk::BufferCopy{.srcOffset = cull_verify.offset,
+                                     .dstOffset = queued.offset,
+                                     .size = range});
+    const vk::MemoryBarrier2 host_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands | vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite |
+                         vk::AccessFlagBits2::eHostRead,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{.memoryBarrierCount = 1,
+                                               .pMemoryBarriers = &host_barrier});
+    slot->tick = scheduler.CurrentTick();
+    scheduler.DeferOperation([this, slot, range, truth, queued, &pool] {
+        truth.buffer->Invalidate(truth.offset, range);
+        queued.buffer->Invalidate(queued.offset, range);
+        if (g_cull_queue) {
+            g_cull_queue->VerifyCompare(slot, range, truth.mapped, queued.mapped);
+        }
+        pool.FreeDeferred(truth);
+        pool.FreeDeferred(queued);
+    });
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pipeline* resolved,
@@ -2693,7 +2979,11 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
     if (SotcOps::kOn) [[unlikely]] { // sotc: SOTC_OP_STATS=1
         SotcOps::NoteDispatch(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash, 0);
     }
+    const WatchOp watch{pipeline->GetStage(Shader::SwStage::Compute).pgm_hash}; // sotc
     DispPhase::Mark(DispPhase::Pre);
+    // sotc: the program being bound (ObtainBuffer's SOTC_GPU_TIMES dependency notes).
+    SotcStats::current_program.store(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash,
+                                     std::memory_order_relaxed);
     if (!BindResources(pipeline)) {
         SotcStats::Drop(3, cs_program.Address<uintptr_t>(), 1);
         DispPhase::Abort();
@@ -2718,11 +3008,15 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, const Pip
 
     const auto cmdbuf = scheduler.CommandBuffer();
     pipeline->BindWhenReady(); // sotc: may still be built by a worker (SOTC_ASYNC_COMPUTE)
+    GpuTimesDeps(pipeline->GetStage(Shader::SwStage::Compute));         // sotc: SOTC_GPU_TIMES
+    GpuTimesBefore(cmdbuf, SotcGpuTimes::KDispatchIndirect, pipeline); // sotc: SOTC_GPU_TIMES
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
+    GpuTimesAfter(cmdbuf);
     DebugState.IncDispatch();
     AfterVisDirect(); // sotc: SOTC_VIS_DIRECT
     runtime.AccessBuffer(buffer, base, size, vk::PipelineStageFlagBits2::eDrawIndirect,
                          vk::AccessFlagBits2::eIndirectCommandRead);
+    PushCullReadbacks(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash); // sotc: SOTC_RB_PUSH
     MaybeDumpImages(pipeline->GetStage(Shader::SwStage::Compute).pgm_hash);
     DispPhase::Mark(DispPhase::Issue);
 
@@ -2761,6 +3055,48 @@ void Rasterizer::OnSubmit() {
 void Rasterizer::OnFence() {
     ++VideoCore::g_sotc_fence_epoch;
     texture_cache.ProcessDownloadImages();
+    // sotc: SOTC_RB_PUSH: the game reads the masks once it sees this label: submit their copies
+    // now (one submit per label that follows cull dispatches, not one per dispatch).
+    if (buffer_cache.TakePushPending()) {
+        Flush();
+    }
+}
+
+void Rasterizer::PushCullReadbacks(u64 pgm_hash) {
+    if (!VideoCore::BufferCache::PushEnabled()) {
+        return;
+    }
+    // The cull shaders whose output the game's CPU reads in the same frame (SOTC_RB_AGE "RB TOP"
+    // and the 05/11 VIS_DIRECT measurements). SOTC_RB_PUSH_PROGRAMS=<hex,hex,...> replaces them.
+    static const std::vector<u64> programs = [] {
+        std::vector<u64> list;
+        const char* v = std::getenv("SOTC_RB_PUSH_PROGRAMS");
+        std::string text = v ? v : "0x50784801,0x93aec24b,0x2e0f474b,0x4defcf7f,0xf94d23d4,0x729c541e";
+        size_t start = 0;
+        while (start < text.size()) {
+            const size_t end = std::min(text.find(',', start), text.size());
+            if (end > start) {
+                list.push_back(std::strtoull(text.substr(start, end - start).c_str(), nullptr, 16));
+            }
+            start = end + 1;
+        }
+        return list;
+    }();
+    if (std::find(programs.begin(), programs.end(), pgm_hash) == programs.end()) {
+        return;
+    }
+    for (const BoundBuffer& bound : bound_buffers) {
+        if (bound.is_written && bound.buffer) {
+            // The dispatch's write is registered with the barrier tracker only in ResetBindings,
+            // after this: register it now, so the copy below waits for the shader's writes (a
+            // copy without that barrier read the masks half written).
+            runtime.AccessBuffer(bound.buffer, bound.offset, bound.size,
+                                 vk::PipelineStageFlagBits2::eComputeShader,
+                                 vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
+            buffer_cache.PushReadback(bound.buffer, bound.buffer->cpu_addr + bound.offset, bound.size,
+                                      pgm_hash);
+        }
+    }
 }
 
 // sotc: the descriptors take each image's layout when its texture is bound, but BeginRendering may
@@ -2963,6 +3299,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             const SotcStats::SplitTimer buffers_split{SotcStats::SplitBindBuffers};
             BindBuffers(*stage, binding, push_data);
         }
+        liverpool->Safepoint(); // sotc: SOTC_RB_SAFEPOINT (before the texture cache lock)
         {
             const SotcStats::SplitTimer textures_split{SotcStats::SplitBindTextures};
             BindTextures(*stage, binding);
@@ -3621,6 +3958,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                              Shader::PushData& push_data) {
     const u64 alignment = instance.StorageMinAlignment();
     for (const auto& desc : stage.buffers) {
+        liverpool->Safepoint(); // sotc: SOTC_RB_SAFEPOINT (no lock held here)
         if (desc.IsSpecial()) {
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
                 const auto* gds_buf = buffer_cache.GetGdsBuffer();
@@ -5450,6 +5788,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         runtime.SetBackingSamples(image, key.color_samples[cb]);
         DrawPhase::Lap(1);
         const auto& image_view = texture_cache.FindRenderTarget(image_id, desc, !rt_fast);
+        SotcGpuTimes::NoteGpuWrite(image->info.guest_address, image->info.guest_size);
         DrawPhase::Lap(2);
         const auto slice = image_view.info.range.base.layer;
         const auto mip = image_view.info.range.base.level;
@@ -5525,6 +5864,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         const auto& image_view = texture_cache.FindDepthTarget(image_id, desc);
         auto& image = texture_cache.GetImage(image_id);
+        SotcGpuTimes::NoteGpuWrite(image.info.guest_address, image.info.guest_size);
         DrawPhase::SubBeg(DrawPhase::SBegFind);
 
         const auto slice = image_view.info.range.base.layer;
@@ -6413,6 +6753,114 @@ const Pipeline* Rasterizer::LookupGraphicsPipeline(u16 vertex_sgpr_offset,
 
 const Pipeline* Rasterizer::LookupComputePipeline() {
     return pipeline_cache.GetComputePipeline();
+}
+
+void Rasterizer::PrefetchComputeShader(const AmdGpu::ComputeProgram& cs) {
+    pipeline_cache.PrefetchCompute(cs);
+}
+
+void Rasterizer::GpuTimesBefore(vk::CommandBuffer cmdbuf, u8 kind, const Pipeline* pipeline) {
+    if (!SotcGpuTimes::kOn) [[likely]] {
+        return;
+    }
+    // The pixel shader names a draw (the vertex shader without one), the compute shader a
+    // dispatch.
+    u64 hash = 0;
+    if (pipeline) {
+        const auto stages = pipeline->GetStages();
+        if (pipeline->IsCompute()) {
+            hash = stages[0] ? stages[0]->pgm_hash : 0;
+        } else if (const auto* fs = stages[u32(Shader::SwStage::Fragment)]) {
+            hash = fs->pgm_hash;
+        } else if (const auto* vs = stages[u32(Shader::SwStage::Vertex)]) {
+            hash = vs->pgm_hash;
+        }
+    }
+    SotcGpuTimes::Before(instance, scheduler, cmdbuf, static_cast<SotcGpuTimes::Kind>(kind), hash,
+                         SotcStats::flip_count.load(std::memory_order_relaxed));
+}
+
+void Rasterizer::GpuTimesDeps(const Shader::Info& cs) {
+    if (!SotcGpuTimes::kDeps) [[likely]] {
+        return;
+    }
+    // Storage images it writes (written buffers are marked by ObtainBuffer); for a cull program,
+    // the newest GPU write among what it reads.
+    const bool dep = SotcGpuTimes::IsDepProgram(cs.pgm_hash);
+    if (dep) {
+        // Once per cull program: what it binds (a second queue has to carry all of it).
+        static std::set<u64> shown;
+        if (shown.insert(cs.pgm_hash).second) {
+            std::string kinds;
+            u32 written = 0;
+            for (const auto& desc : cs.buffers) {
+                kinds += fmt::format(" {}{}", u32(desc.buffer_type), desc.is_written ? "w" : "");
+                written += desc.is_written ? 1 : 0;
+            }
+            u32 images_written = 0;
+            for (const auto& desc : cs.images) {
+                images_written += desc.is_written ? 1 : 0;
+            }
+            std::fprintf(stderr,
+                         "SOTC CULL RESOURCES %#llx: buffers %zu (written %u; types%s), images "
+                         "%zu (written %u), samplers %zu (buffer types: 0 guest, 1 flatbuf, 4 gds)\n",
+                         static_cast<unsigned long long>(cs.pgm_hash), cs.buffers.size(), written,
+                         kinds.c_str(), cs.images.size(), images_written, cs.samplers.size());
+        }
+    }
+    u64 newest = ~0ull;
+    const auto take = [&](u64 w) {
+        if (w != ~0ull) {
+            newest = newest == ~0ull ? w : std::max(newest, w);
+        }
+    };
+    for (const auto& desc : cs.buffers) {
+        if (!dep || desc.IsSpecial() || desc.is_written) {
+            continue;
+        }
+        const auto sharp = desc.GetSharp(cs);
+        take(SotcGpuTimes::LastGpuWrite(sharp.base_address, sharp.GetSize()));
+    }
+    for (const auto& desc : cs.images) {
+        const auto tsharp = desc.GetSharp(cs);
+        if (tsharp.Address() == 0) {
+            continue;
+        }
+        if (desc.is_written) {
+            SotcGpuTimes::NoteGpuWrite(tsharp.Address(), 1);
+        } else if (dep) {
+            take(SotcGpuTimes::LastGpuWrite(tsharp.Address(), 1));
+        }
+    }
+    if (dep) {
+        SotcGpuTimes::pending_dep = newest;
+    }
+}
+
+void Rasterizer::FlushIdle() {
+    if (cull_queue) { // sotc: SOTC_CULL_QUEUE: out of work, the open cull batch goes out
+        cull_queue->SubmitOpen();
+    }
+    static const int mode = [] {
+        const char* v = std::getenv("SOTC_IDLE_FLUSH");
+        return v ? std::atoi(v) : 0; // no gain measured (ROADMAP T48, 17/11)
+    }();
+    // Commands recorded since the last submit (FlushPeriodic counts them; any submit moves the
+    // tick on, so a stale count is not taken for pending work).
+    if (mode == 0 || commands_since_submit == 0 || scheduler.CurrentTick() != commands_tick) {
+        return;
+    }
+    if (mode == 1 && scheduler.IsRendering()) {
+        return;
+    }
+    scheduler.Flush();
+    SotcStats::idle_flushes.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Rasterizer::GpuTimesAfter(vk::CommandBuffer cmdbuf) {
+    if (SotcGpuTimes::kOn) [[unlikely]] {
+        SotcGpuTimes::After(cmdbuf);
+    }
 }
 
 bool Rasterizer::IsGpuSideThread() const {

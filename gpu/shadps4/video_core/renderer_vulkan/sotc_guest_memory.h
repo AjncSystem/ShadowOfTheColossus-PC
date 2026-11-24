@@ -48,4 +48,8 @@ Span Get(const u8* host, u64 size);
 /// 2 across a chunk boundary, 3 chunk not imported yet.
 const VideoCore::Buffer* GetBuffer(const u8* host, u64 size, u64* offset, int* why = nullptr);
 
+/// sotc: bytes from host to the end of its import chunk (0 outside the imported range or off), so
+/// a range across chunks can be asked for one chunk at a time (SOTC_TEX_GATHER).
+u64 BytesToChunkEnd(const u8* host);
+
 } // namespace Vulkan::SotcGuestMemory

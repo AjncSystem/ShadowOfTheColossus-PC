@@ -180,6 +180,33 @@ static inline void CpuRelax() {
 #endif
 }
 
+void Liverpool::ServeFinishes(bool at_safepoint) {
+    // Taken out under the lock, run outside it (a finish may take the buffer cache's locks); the
+    // ones a safe point may not run go back to the front, in order.
+    std::deque<Common::UniqueFunction<bool, bool>> work;
+    {
+        std::scoped_lock lk{finish_mutex};
+        work.swap(finish_queue);
+    }
+    std::deque<Common::UniqueFunction<bool, bool>> keep;
+    u32 done = 0;
+    for (auto& func : work) {
+        if (func(bool{at_safepoint})) {
+            ++done;
+        } else {
+            keep.push_back(std::move(func));
+        }
+    }
+    if (at_safepoint && done) {
+        SotcStats::rb_safepoint_finishes.fetch_add(done, std::memory_order_relaxed);
+    }
+    std::scoped_lock lk{finish_mutex};
+    num_finishes.fetch_sub(done, std::memory_order_release);
+    for (auto it = keep.rbegin(); it != keep.rend(); ++it) {
+        finish_queue.push_front(std::move(*it));
+    }
+}
+
 void Liverpool::BackLoop(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuDraw");
     // sotc: MicroCostSweep, see Liverpool::OnBackThread.
@@ -195,7 +222,17 @@ void Liverpool::BackLoop(std::stop_token stoken) {
         if (num_commands.load(std::memory_order_acquire)) {
             ProcessCommands();
         }
+        if (num_finishes.load(std::memory_order_acquire)) {
+            ServeFinishes(false); // sotc: SOTC_RB_SAFEPOINT
+        }
         if (back_head.load(std::memory_order_acquire) == tail) {
+            // sotc: SOTC_TICKWATCH: who the GPU waits for ("SOTC GPU IDLE BY").
+            SotcStats::draw_idle_now.store(true, std::memory_order_relaxed);
+            struct DrawIdleEnd {
+                ~DrawIdleEnd() {
+                    SotcStats::draw_idle_now.store(false, std::memory_order_relaxed);
+                }
+            } draw_idle_end;
             const u64 idle_start = SotcStats::NowNs();
             const SotcStats::SplitTimer idle_split{SotcStats::SplitIdle};
             struct IdleTime {
@@ -210,12 +247,23 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                 const SotcStats::SplitTimer spin_split{SotcStats::SplitIdleSpin};
                 for (u32 spin = 0; spin < back_spin; ++spin) {
                     if (back_head.load(std::memory_order_acquire) != tail ||
-                        num_commands.load(std::memory_order_acquire)) {
+                        num_commands.load(std::memory_order_acquire) ||
+                        num_finishes.load(std::memory_order_acquire)) {
                         ready = true;
                         break;
                     }
                     CpuRelax();
                 }
+            }
+            // sotc: SOTC_IDLE_FLUSH (2: on; 1: outside a render pass only; default 0, no gain): out of
+            // work after the spin, the commands recorded since the last submit go to the GPU now.
+            // They waited for the next op (the periodic submit is only checked then), the GPU
+            // idling meanwhile: 5-9 ms per frame of the dense temple areas went to GPU idle
+            // between submissions (SOTC_GPU_TIMES).
+            if (!ready && rasterizer) {
+                rasterizer->FlushIdle();
+                ready = back_head.load(std::memory_order_acquire) != tail ||
+                        num_commands.load(std::memory_order_acquire);
             }
             if (!ready) {
                 std::unique_lock lk{back_mutex};
@@ -223,6 +271,7 @@ void Liverpool::BackLoop(std::stop_token stoken) {
                 back_cv.wait_for(lk, std::chrono::milliseconds(1), [&] {
                     return back_head.load(std::memory_order_seq_cst) != tail ||
                            num_commands.load(std::memory_order_seq_cst) ||
+                           num_finishes.load(std::memory_order_seq_cst) ||
                            stoken.stop_requested();
                 });
                 back_sleeping.store(false, std::memory_order_relaxed);
@@ -930,6 +979,12 @@ void Liverpool::Process(std::stop_token stoken) {
     while (!stoken.stop_requested()) {
         {
             const SotcStats::FrameTimer idle_timer{SotcStats::FrameIdle};
+            SotcStats::cp_idle_now.store(true, std::memory_order_relaxed); // sotc: TICKWATCH
+            struct CpIdleEnd {
+                ~CpIdleEnd() {
+                    SotcStats::cp_idle_now.store(false, std::memory_order_relaxed);
+                }
+            } cp_idle_end;
             std::unique_lock lk{submit_mutex};
             Common::CondvarWait(submit_cv, lk, stoken,
                                 [this] {
@@ -967,12 +1022,18 @@ void Liverpool::Process(std::stop_token stoken) {
         const auto progress = [&] {
             stalled = 0;
             stall_since_ns = 0;
+            SotcStats::cp_idle_now.store(false, std::memory_order_relaxed); // sotc: TICKWATCH
         };
         const auto no_progress = [&] {
             if (BbToggle::Disabled(BbToggle::CpPollBackoff)) {
                 return;
             }
             const u32 queues = std::max(num_mapped_queues, 1u);
+            // sotc: SOTC_TICKWATCH: every queue polled without progress: the command processor
+            // waits for the game (a label or register it has not written yet).
+            if (stalled + 1 >= queues) {
+                SotcStats::cp_idle_now.store(true, std::memory_order_relaxed);
+            }
             if (++stalled < queues || stalled % queues != 0) {
                 return;
             }
@@ -1217,8 +1278,78 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
-Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
+static bool ComputePrefetchEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("SOTC_COMPUTE_PREFETCH");
+        return !v || v[0] != '0';
+    }();
+    return enabled;
+}
+
+void Liverpool::PrefetchComputeShaders(std::span<const u32> cb, ComputeProgram& cs, int depth) {
+    // Only the compute registers are followed (a copy: the real state is untouched); anything
+    // the walk does not understand ends it. A wrong guess costs a wasted translation at worst:
+    // the dispatch checks the worker's result against its own state.
+    while (!cb.empty()) {
+        const auto* header = reinterpret_cast<const PM4Header*>(cb.data());
+        if (header->type == 2) {
+            cb = cb.subspan(1);
+            continue;
+        }
+        if (header->type != 3) {
+            return;
+        }
+        const u32 count = header->type3.NumWords();
+        if (count + 1 > cb.size()) {
+            return;
+        }
+        switch (header->type3.opcode) {
+        case PM4ItOpcode::SetShReg: {
+            const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+            const u32 words = count - 1;
+            if (count >= 1 && set_data->reg_offset >= 0x200 &&
+                set_data->reg_offset - 0x200 + words <= sizeof(ComputeProgram) / 4) {
+                std::memcpy(reinterpret_cast<u32*>(&cs) + (set_data->reg_offset - 0x200),
+                            header + 2, words * sizeof(u32));
+            }
+            break;
+        }
+        case PM4ItOpcode::DispatchDirect: {
+            const auto* dispatch = reinterpret_cast<const PM4CmdDispatchDirect*>(header);
+            cs.dispatch_initiator = dispatch->dispatch_initiator; // as the real one sets it
+            if (dispatch->dispatch_initiator & 1) {
+                rasterizer->PrefetchComputeShader(cs);
+            }
+            break;
+        }
+        case PM4ItOpcode::DispatchIndirect:
+            if (cs.dispatch_initiator & 1) {
+                rasterizer->PrefetchComputeShader(cs);
+            }
+            break;
+        case PM4ItOpcode::IndirectBuffer: {
+            const auto* ib = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
+            if (depth < 4 && ib->Address<const u32>() && ib->ib_size != 0) {
+                PrefetchComputeShaders({ib->Address<const u32>(), ib->ib_size}, cs, depth + 1);
+            }
+            break;
+        }
+        default:
+            break;
+        }
+        cb = cb.subspan(count + 1);
+    }
+}
+
+Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
+                                           bool nested) {
     FIBER_ENTER(dcb_task_name);
+
+    // sotc: SOTC_COMPUTE_PREFETCH (liverpool.h). Nested buffers were walked with their parent.
+    if (!nested && rasterizer && ComputePrefetchEnabled()) {
+        ComputeProgram cs = mapped_queues[GfxQueueId].cs_state;
+        PrefetchComputeShaders(dcb, cs, 0);
+    }
 
     cblock.Reset();
 
@@ -1746,6 +1877,40 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     const char* v = std::getenv("SOTC_EOP_DEFER");
                     return v && v[0] == '1';
                 }();
+                // sotc: SOTC_VIS_DIRECT_ORDER (v3): wait only for the direct dispatch, in order.
+                if (SotcStats::kVisDirect && SotcStats::kVisDirectOrder && !defer_eop &&
+                    rasterizer) {
+                    const u64 wait_tick = rasterizer->VisTickToWait();
+                    if (wait_tick ||
+                        SotcStats::vis_labels_pending.load(std::memory_order_acquire) > 0) {
+                        const PM4CmdEventWriteEop eop = *event_eop;
+                        const VAddr label = reinterpret_cast<VAddr>(eop.Address<void>());
+                        SotcStats::vis_held_labels.fetch_add(1, std::memory_order_relaxed);
+                        SotcStats::vis_labels_pending.fetch_add(1, std::memory_order_acq_rel);
+                        if (eop.data_sel.Value() != DataSelect::None) {
+                            rasterizer->InvalidateMemory(label, 8, true);
+                        }
+                        rasterizer->GetScheduler().DeferPriorityOperationAt([eop] {
+                            eop.SignalFence(
+                                [](void* address, u64 data, u32 num_bytes) {
+                                    ASSERT(Core::Memory::Instance()->TryWriteBacking(
+                                        address, &data, num_bytes, 2));
+                                },
+                                [] {
+                                    Platform::IrqC::Instance()->Signal(
+                                        Platform::InterruptId::GfxEop);
+                                });
+                            SotcStats::vis_labels_pending.fetch_sub(1, std::memory_order_acq_rel);
+                        }, wait_tick);
+                        return;
+                    }
+                    event_eop->SignalFence(
+                        [this](void* address, u64 data, u32 num_bytes) {
+                            WriteFenceValue(address, data, num_bytes);
+                        },
+                        [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
+                    return;
+                }
                 // sotc: SOTC_VIS_DIRECT: the label after a bitmap written in the game's memory waits
                 // for the GPU (the game reads the bitmap once it sees the label).
                 const bool vis_honest =
@@ -1924,7 +2089,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
                 auto task = ProcessGraphics(
-                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {}, true);
                 RESUME_GFX(task);
 
                 while (!task.handle.done()) {
@@ -2071,6 +2236,14 @@ template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
     auto& queue = asc_queues[{vqid}];
+
+    // sotc: SOTC_COMPUTE_PREFETCH (liverpool.h), for the compute queues too.
+    if constexpr (!is_indirect) {
+        if (rasterizer && ComputePrefetchEnabled()) {
+            ComputeProgram cs = mapped_queues[vqid + 1].cs_state;
+            PrefetchComputeShaders(acb, cs, 0);
+        }
+    }
 
     struct IndirectPatch {
         const PM4Header* header;
@@ -2338,8 +2511,29 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 // sotc: SOTC_VIS_DIRECT: as the end-of-pipe label above (not for a GDS store, whose
                 // copy must be recorded here).
                 const VAddr release_label = reinterpret_cast<VAddr>(release.Address<u8*>());
+                // sotc: SOTC_VIS_DIRECT_ORDER (v3), as the end-of-pipe label.
                 if (rasterizer && release.data_sel.Value() != DataSelect::GdsMemStore &&
-                    SotcStats::kVisDirect &&
+                    SotcStats::kVisDirect && SotcStats::kVisDirectOrder) {
+                    const u64 wait_tick = rasterizer->VisTickToWait();
+                    if (wait_tick ||
+                        SotcStats::vis_labels_pending.load(std::memory_order_acquire) > 0) {
+                        SotcStats::vis_held_labels.fetch_add(1, std::memory_order_relaxed);
+                        SotcStats::vis_labels_pending.fetch_add(1, std::memory_order_acq_rel);
+                        rasterizer->InvalidateMemory(release_label, 8, true);
+                        rasterizer->GetScheduler().DeferPriorityOperationAt([release, pipe_id] {
+                            release.SignalFence(
+                                [pipe_id] {
+                                    Platform::IrqC::Instance()->Signal(
+                                        static_cast<Platform::InterruptId>(pipe_id));
+                                },
+                                [](VAddr, u16, u16) {});
+                            SotcStats::vis_labels_pending.fetch_sub(1, std::memory_order_acq_rel);
+                        }, wait_tick);
+                        return;
+                    }
+                }
+                if (rasterizer && release.data_sel.Value() != DataSelect::GdsMemStore &&
+                    SotcStats::kVisDirect && !SotcStats::kVisDirectOrder &&
                     (rasterizer->VisWritesInFlight() || LateLabelPending(release_label))) {
                     SotcStats::vis_honest_labels.fetch_add(1, std::memory_order_relaxed);
                     const VAddr label = release_label;

@@ -116,6 +116,12 @@ public:
 
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
+    /// sotc: SOTC_UPLOAD_PREPASS: true when the last ObtainBufferForImage returned bytes the host
+    /// already holds (a staging copy made by the CPU, or the game's memory read directly), not a
+    /// buffer the GPU still fills in this submission (GPU-written arena, texture gather).
+    bool last_image_source_host_ready = false;
+    /// sotc: SOTC_TEX_GATHER: the texture gathered by the GPU from the imported game memory.
+    [[nodiscard]] std::pair<const Buffer*, u64> GatherImageFromGuest(VAddr device_addr, u32 size);
     /// sotc: guest memory in a staging buffer, whatever the GPU copy holds (F9 diagnostic).
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainGuestCopyForImage(VAddr device_addr,
                                                                        u32 size);
@@ -177,6 +183,14 @@ public:
     /// Commits pending sparse buffer memory binds. Must be called before every scheduler submit.
     void SubmitPendingArenaBinds(Vulkan::SubmitInfo& info);
 
+    /// sotc: SOTC_CULL_QUEUE: submits the pending sparse binds on their own (and waits for the
+    /// asynchronous upload copies). Returns the memory semaphore tick another queue waits for
+    /// (0: none); the next graphics submit waits for it too.
+    u64 SubmitArenaBindsNow();
+    [[nodiscard]] vk::Semaphore MemorySemaphore() const noexcept {
+        return memory_semaphore.Handle();
+    }
+
     /// sotc: waits for the upload copies handed to the copy threads (SOTC_BUF_ASYNC_KB); before
     /// every submit and before the command processor writes guest memory.
     void JoinAsyncUploads();
@@ -233,6 +247,9 @@ private:
         boost::container::small_vector<std::pair<VAddr, u64>, 4> gpu_ranges;
         /// sotc: brought along by the hot readbacks (SOTC_RB_HOT), not asked for.
         bool hot = false;
+        /// sotc: SOTC_RB_PUSH: only its gathered ranges (gpu_ranges) leave the GPU-modified state
+        /// when applied, minus the pages the guest wrote meanwhile.
+        bool pushed = false;
         /// sotc: a GPU write landed on this region while the readback was in flight.
         bool dirty = false;
     };
@@ -243,7 +260,7 @@ private:
     /// to copy leave the set right away.
     u64 GatherDownloads(const Buffer* arena, VAddr device_addr, u64 size,
                         boost::container::small_vector<ReadbackItem, 16>& pending,
-                        bool subtract = true);
+                        bool subtract = true, bool with_hot = true, bool first_hot = false);
     /// sotc: takes the downloaded ranges of items out of the GPU-modified set.
     void SubtractDownloaded(std::span<const ReadbackItem> items);
     /// sotc: a read fault's readback found nothing to download (see the definition).
@@ -275,8 +292,27 @@ private:
         Buffer* download_buffer{};
         u64 download_size{};
         bool data_ready{}; ///< sotc (SOTC_RB_AGE): its last GPU write had completed when asked
+        bool cull{}; ///< sotc: SOTC_CULL_QUEUE: tick is the cull queue's
+        bool pushed{};     ///< sotc (SOTC_RB_PUSH): recorded after its dispatch, no guest asked yet
+        bool superseded{}; ///< sotc: another readback gathered its bytes (never served then)
+        u64 map_generation{}; ///< sotc: clean_map_generation when pushed (served only if equal)
+        u64 program{};        ///< sotc: the dispatch's shader (SOTC_RB_PUSH learning)
+        std::chrono::steady_clock::time_point pushed_at{};
         boost::container::small_vector<ReadbackItem, 16> pending;
     };
+    /// sotc (SOTC_RB_PUSH): readbacks recorded right after a cull dispatch, before any guest read.
+    std::deque<std::unique_ptr<AsyncReadback>> pushed_readbacks;
+    bool push_pending{};
+    void RetirePushedReadbacks(bool all);
+    void DropPushedReadback(AsyncReadback& readback);
+    /// sotc: another readback gathered these bytes: a push of them must not apply its older copy.
+    void MarkPushesStale(std::span<const ReadbackItem> items, const AsyncReadback* self = nullptr);
+    void MarkPushesStaleRange(VAddr addr, u64 size);
+    /// sotc: newest tick of a pushed copy, still on the GPU, that reads [addr, addr + size); 0: none.
+    u64 PushTickInRange(VAddr addr, u64 size);
+    static bool PushVerify();
+    static bool PushWholeGather();
+    void VerifyPushes(std::span<const ReadbackItem> items, const u8* mapped, u64 mapped_offset);
     void BeginAsyncReadback(AsyncReadback& readback);
     /// sotc: marks bytes a guest write fault asked for CPU-modified, unless pages of them
     /// still hold GPU data (see the definition).
@@ -326,6 +362,8 @@ private:
     std::unique_ptr<FaultManager> fault_manager;
     std::unique_ptr<Buffer> bda_pagetable_buffer;
     bool fault_process_pending{};
+    u64 unwaited_bind_tick{}; ///< sotc: SubmitArenaBindsNow's tick the graphics queue owes a wait
+    bool gather_hot_off{};    ///< sotc: GatherDownloads without hot regions (cull readbacks)
 
     std::array<const Buffer*, NUM_ARENA_PAGES> address_space{};
     std::deque<Buffer> arenas;
@@ -385,6 +423,19 @@ private:
     u64 rb_narrow_window{};
     static constexpr auto HotReadbackLifetime = std::chrono::seconds(2);
     std::vector<HotReadback> hot_readbacks;
+    /// sotc: SOTC_RB_GROUP (plan PLANO-TROCA-DE-AREA etapa 1): ranges written by the visibility
+    /// (cull) programs, with the program and the command buffer tick. A readback that faults on
+    /// one brings along the ranges that program wrote in this and the previous command buffer,
+    /// as hot regions (pages the CPU wrote since are skipped): one wait instead of one per page.
+    struct CullWrite {
+        VAddr addr;
+        u64 size;
+        u64 program;
+        u64 tick;
+    };
+    std::vector<CullWrite> cull_writes;
+    std::mutex cull_writes_mutex;
+    void NoteCullWrite(VAddr addr, u64 size);
     /// sotc: pages the guest read back recently (the faulting ranges, not the windows). A GPU
     /// write into one of them asks for an early submit (TakeHotWrite).
     static constexpr size_t NumHotReads = 32;
@@ -411,6 +462,9 @@ private:
     /// GPU writes recorded into the command buffer still being built (tick current_writes_tick).
     RangeSet current_writes;
     u64 current_writes_tick{};
+    /// sotc: SOTC_BUF_HOIST_STATS (test #50): ranges bound in the command buffer still being built.
+    RangeSet hoist_used;
+    u64 hoist_used_tick{};
     void RecordCurrentWrite(VAddr addr, u64 size);
     /// sotc: the range the guest touched, during the DownloadMemory of its window (size 0 else).
     VAddr fault_addr{};
@@ -420,6 +474,28 @@ public:
     /// sotc: true once after the command buffer being built wrote a page the guest reads back:
     /// submitting it now lets the GPU finish it before the guest asks for it.
     bool TakeHotWrite() noexcept;
+
+    /// sotc: SOTC_RB_PUSH=1. The game's CPU reads the visibility masks the cull compute shaders
+    /// write in the same frame. Instead of waiting for the guest's read fault to record the copy
+    /// (then a queue round trip and a wait for everything ahead on the GPU), the copy of what the
+    /// dispatch wrote is recorded right after it; the fault finds it in flight and waits for that
+    /// one tick. Nothing is written into guest memory before a fault asks: the data and the path
+    /// that applies it are the usual ones. Draw thread only.
+    void PushReadback(const Buffer* arena, VAddr addr, u64 size, u64 program);
+    /// sotc: SOTC_RB_PUSH learning: false for a shader whose copies the guest almost never reads.
+    bool PushWorthIt(u64 program);
+    struct PushProgram {
+        u64 program{};
+        u64 pushes{}, served{}, window_pushes{}, window_served{};
+        bool off{};
+    };
+    std::array<PushProgram, 16> push_programs{};
+    PushProgram* FindPushProgram(u64 program);
+    /// sotc: true once after PushReadback recorded copies: the next label submits them.
+    bool TakePushPending() noexcept {
+        return std::exchange(push_pending, false);
+    }
+    static bool PushEnabled();
 
 private:
 

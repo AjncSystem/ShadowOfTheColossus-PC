@@ -452,10 +452,10 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         // sotc: also whenever the shaders are lowered for fewer than 64 lanes (AMD on the 32-wide
         // path): without the barriers the GPU hung ~2 min into the intro (issue #7).
         .needs_lds_barriers = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
-                              instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp ||
+                              instance.GetDriverID() == kDriverIdKosmicKrisp ||
                               instance.SubgroupSize() < 64 || amd64_lds,
         .needs_buffer_offsets = instance.StorageMinAlignment() > 4,
-        .needs_unorm_fixup = instance.GetDriverID() == vk::DriverId::eMesaKosmickrisp,
+        .needs_unorm_fixup = instance.GetDriverID() == kDriverIdKosmicKrisp,
         .needs_clip_distance_emulation = instance.GetDriverID() == vk::DriverId::eNvidiaProprietary ||
                                          test_on("SOTC_CLIP_EMU"),
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),

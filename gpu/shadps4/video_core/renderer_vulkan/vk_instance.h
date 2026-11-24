@@ -21,6 +21,10 @@ VK_DEFINE_HANDLE(VmaAllocator)
 
 namespace Vulkan {
 
+/// sotc: VK_DRIVER_ID_MESA_KOSMICKRISP (28) by value: Vulkan headers before 1.4.329 (Debian 13's, the
+/// Linux AppImage build) do not name it.
+inline constexpr vk::DriverId kDriverIdKosmicKrisp = static_cast<vk::DriverId>(28);
+
 class Instance {
 public:
     explicit Instance(bool validation = false, bool crash_diagnostic = false);
@@ -520,9 +524,7 @@ public:
 
     /// Returns the maximum number of samplers that can be allocated at once.
     u32 GetMaxSamplerAllocationCount() const {
-        // sotc: VK_DRIVER_ID_MESA_KOSMICKRISP (28) by value: headers before 1.4.329 (Debian 13's,
-        // the Linux AppImage build) do not name it.
-        if (driver_id == static_cast<vk::DriverId>(28)) {
+        if (driver_id == kDriverIdKosmicKrisp) {
             // FIXME: KosmicKrisp has an internal 1024 unique sampler limit before
             // vkCreateSampler starts returning VK_ERROR_OUT_OF_HOST_MEMORY. Work
             // around this for now by reducing the value to 1024.

@@ -1,0 +1,70 @@
+# sotc: builds the Linux AppImage (packaging/linux/build_appimage.sh) and attaches it to a release as
+# SotC-PC-linux-x86_64.AppImage, the name the launcher's self-update looks for (launcher/sotc_update.py).
+# Runs when a release is published, or by hand (Actions > Linux AppImage > Run workflow) with the
+# release tag to attach to and the commit to build (default: main).
+# Debian 13: its GCC 14, SDL3 and Vulkan headers are new enough (Ubuntu 24.04's are not, README.md).
+# The AppImage then needs glibc 2.41 or newer on the player's system.
+name: Linux AppImage
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to attach the AppImage to (e.g. v0.77)
+        required: true
+      ref:
+        description: Commit, branch or tag to build
+        required: false
+        default: main
+
+permissions:
+  contents: write
+
+jobs:
+  appimage:
+    runs-on: ubuntu-24.04
+    container: debian:trixie
+    steps:
+      - name: Build tools and libraries
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git file xz-utils \
+            build-essential gcc g++ cmake ninja-build pkg-config nasm patchelf \
+            python3 python3-tk python3-pil python3-pil.imagetk \
+            libvulkan-dev glslang-tools libvulkan-memory-allocator-dev libfmt-dev libboost-dev \
+            libxxhash-dev libzydis-dev libtsl-robin-map-dev libsdl3-dev \
+            libx11-dev libxext-dev libwayland-dev libxkbcommon-dev libpulse-dev libasound2-dev gh
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.ref }}
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Minimal FFmpeg
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          bash packaging/linux/build_ffmpeg.sh
+
+      - name: Build
+        run: ./build.sh
+
+      - name: AppImage
+        run: |
+          bash packaging/linux/build_appimage.sh
+          cp dist/SotC-PC-*-linux-x86_64.AppImage SotC-PC-linux-x86_64.AppImage
+          ls -la SotC-PC-linux-x86_64.AppImage
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SotC-PC-linux-x86_64
+          path: SotC-PC-linux-x86_64.AppImage
+          if-no-files-found: error
+
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
+        run: gh release upload "$TAG" SotC-PC-linux-x86_64.AppImage --clobber --repo "$GITHUB_REPOSITORY"

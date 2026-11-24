@@ -1291,7 +1291,7 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                 root.after(500, lambda: messagebox.showerror('Shadow of the Colossus', _(
                     'A atualização falhou e a versão anterior foi mantida:\n{}',
                     'The update failed and the previous version was kept:\n{}').format(error)))
-        if self.app.get('check_updates', True) and (FROZEN or os.environ.get('SOTC_UPDATE_URL')):
+        if self.app.get('check_updates', True) and (sotc_update.can_update() or os.environ.get('SOTC_UPDATE_URL')):
             root.after(2000, lambda: self.check_updates(False))
 
     def px(self, size):
@@ -1527,8 +1527,8 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         ttk.Checkbutton(side, text=_('Visão avançada', 'Expert view'), variable=self.var('expert_view'),
                         style='Bar.TCheckbutton', command=self.apply_view).pack(anchor='w', padx=22, pady=(0, 10))
         links = [(_('Registro do jogo', 'Game log'), lambda: self.show('log'))]
-        # sotc_update.py installs the Windows release: the Linux AppImage is not updated by it.
-        if IS_WINDOWS:
+        # sotc_update.py installs the Windows release, and on Linux replaces the AppImage it runs from.
+        if IS_WINDOWS or sotc_update.running_appimage():
             links.append((_('Procurar atualização', 'Check for updates'), lambda: self.check_updates(True)))
         links.append((_('Configurar de novo', 'Set up again'), self.show_setup))
         for text, command in links:
@@ -2612,8 +2612,8 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                'For another PC, export the saves and import them there.'),
              [(_('Saves', 'Saves'), lambda: self.show('saves'), False)]),
         ]
-        # sotc_update.py installs the Windows release: the Linux AppImage is not updated by it.
-        if IS_WINDOWS:
+        # sotc_update.py installs the Windows release, and on Linux replaces the AppImage it runs from.
+        if IS_WINDOWS or sotc_update.running_appimage():
             topics.append((_('Atualizar o port', 'Updating the port'),
                            _('O launcher procura versões novas ao abrir. Saves, cache de shaders e sotc.ini são mantidos.',
                              'The launcher looks for new versions when it starts. Saves, shader cache and sotc.ini are kept.'),
@@ -3842,7 +3842,8 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
 
         def work():
             try:
-                new_root, error = sotc_update.download(release, PORT_DIR / 'update', progress), None
+                new_root, error = sotc_update.download(release, sotc_update.update_dir_for(PORT_DIR),
+                                                       progress), None
             except Exception as problem:
                 new_root, error = None, problem
             self.ui_calls.put(lambda: self.finish_update(new_root, error))
@@ -3851,7 +3852,10 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
     def finish_update(self, new_root, error):
         if not error:
             try:
-                sotc_update.start_applier(new_root, PORT_DIR)
+                if sotc_update.running_appimage():  # Linux: the new AppImage replaces this one
+                    sotc_update.apply_appimage(new_root)
+                else:
+                    sotc_update.start_applier(new_root, PORT_DIR)
             except Exception as problem:
                 error = problem
         if error and sotc_update.is_cert_error(error):
@@ -3990,14 +3994,16 @@ def main():
                 print(f'up to date (v{VERSION}, latest {release and release["version"]})')
                 sys.exit(0)
             print(f'updating v{VERSION} -> v{release["version"]}')
-            new_root = sotc_update.download(release, PORT_DIR / 'update')
+            new_root = sotc_update.download(release, sotc_update.update_dir_for(PORT_DIR))
         except OSError as error:
             if not sotc_update.is_cert_error(error):
                 raise
             print(f'the connection to GitHub could not be verified ({error}); '
                   f'download the release manually from {sotc_update.RELEASES_PAGE}')
             sys.exit(1)
-        if FROZEN:
+        if sotc_update.running_appimage():
+            sotc_update.apply_appimage(new_root)
+        elif FROZEN:
             sotc_update.start_applier(new_root, PORT_DIR)
         sys.exit(0)
     settings = load_settings()

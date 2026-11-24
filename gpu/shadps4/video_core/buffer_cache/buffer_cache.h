@@ -23,6 +23,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
+#include "video_core/buffer_cache/region_definitions.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 
@@ -97,6 +98,26 @@ public:
         return stream_buffer.WrapGeneration();
     }
 
+    /// sotc: generation bumped whenever any GPU-modified bit or interval is cleared/subtracted.
+    [[nodiscard]] u64 GpuSubGeneration() const noexcept {
+        return gpu_unmark_gen.load(std::memory_order_acquire);
+    }
+
+    /// sotc: current seconds-resolution arena eviction stamp.
+    [[nodiscard]] u64 UseEpoch() const noexcept {
+        return use_epoch;
+    }
+
+    /// sotc: BufferBindMemo hit for a written non-formatted binding that is already resident,
+    /// CPU-clean, and marked GPU-modified since gpu_sub_gen.
+    void NoteWrittenMemoHit(VAddr device_addr, u64 size) {
+        NoteCullWrite(device_addr, size);
+        if (!inflight_readbacks.empty()) {
+            MarkInflightReadbacksDirty(device_addr, size);
+        }
+        RecordCurrentWrite(device_addr, size);
+    }
+
     void TickFrame();
 
     /// Invalidates any buffer in the logical page range.
@@ -128,6 +149,11 @@ public:
 
     /// Return true when a region is modified from the CPU
     [[nodiscard]] bool IsRegionCpuModified(VAddr addr, size_t size);
+
+    /// sotc: BbToggle::BufferBindMemo. Snapshots CpuGenKey when single-region and CPU-clean.
+    [[nodiscard]] bool SnapshotCleanCpuGen(VAddr addr, u64 size, CpuGenKey& key) const noexcept;
+
+    [[nodiscard]] static bool CpuGenUnchanged(const CpuGenKey& key) noexcept;
 
     /// Return true when a region is modified from the GPU
     [[nodiscard]] bool IsRegionGpuModified(VAddr addr, size_t size);
@@ -284,6 +310,7 @@ private:
         bool dependent{};
         bool finished{};
         u64 tick{};
+        u64 ahead_seq{};
         const Buffer* arena{};
         VAddr window_start{};
         u64 window_size{};
@@ -528,6 +555,7 @@ private:
     std::unordered_map<u64, std::chrono::steady_clock::time_point> evict_retry;
     /// sotc: arena memory in use (blocks handed out of the chunks), in bytes.
     u64 ArenaUsedBytes() const noexcept;
+    std::atomic<u64> gpu_unmark_gen{1};
     u16 use_epoch{1};
     /// sotc: sets use_epoch from the clock (once per submit and per eviction check).
     void AdvanceUseEpoch(std::chrono::steady_clock::time_point now) noexcept {

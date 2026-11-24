@@ -49,7 +49,15 @@ typedef struct {
 _Static_assert(sizeof(GuestStat)==120,"FreeBSD stat layout");
 
 typedef struct { char *names; size_t count, *offsets; unsigned char *types; } Listing;
-typedef struct { int used, host; Listing *dir; size_t position; char path[512]; } File;
+typedef struct {
+    int used, host;
+#ifdef _WIN32
+    HANDLE ov_handle;
+#endif
+    Listing *dir;
+    size_t position;
+    char path[512];
+} File;
 typedef struct { char guest[64]; char host[512]; } Mount;
 static File files[MAX_FILES];
 static Mount mounts[MAX_MOUNTS];
@@ -62,8 +70,36 @@ static uint64_t read_clock_ns(void) {
     clock_gettime(CLOCK_MONOTONIC,&ts);
     return (uint64_t)ts.tv_sec*1000000000u+(uint64_t)ts.tv_nsec;
 }
-#define TIMED_READ(expr) ({ uint64_t t0_=read_clock_ns(); ssize_t r_=(expr); \
-    __atomic_add_fetch(&read_ns,read_clock_ns()-t0_,__ATOMIC_RELAXED); r_; })
+static uint64_t slow_io_threshold_ns(void) {
+    static int64_t cached=-1;
+    if (cached<0) {
+        const char *v=getenv("SOTC_IO_SLOW_MS");
+        if (v && v[0]) cached=(int64_t)(atof(v)*1000000.0);
+        else {
+            const char *fps=getenv("SOTC_FPS");
+            cached=(fps && fps[0]=='1') ? 40000000LL : 0LL;
+        }
+    }
+    return (uint64_t)cached;
+}
+static void note_slow_io(const char *op,int fd,uint64_t size,int64_t offset,uint64_t elapsed_ns) {
+    const uint64_t thresh=slow_io_threshold_ns();
+    if (!thresh || elapsed_ns<thresh) return;
+    static unsigned logged;
+    if (__atomic_fetch_add(&logged,1,__ATOMIC_RELAXED)>=64) return;
+    File *f=(fd>=3 && fd<MAX_FILES && files[fd].used) ? &files[fd] : NULL;
+    const char *path=f ? f->path : "?";
+    if (offset>=0)
+        fprintf(stderr,"SOTC SLOW IO %s %.1f ms: %s (%llu B @ %lld)\n",op,elapsed_ns/1e6,path,
+                (unsigned long long)size,(long long)offset);
+    else
+        fprintf(stderr,"SOTC SLOW IO %s %.1f ms: %s (%llu B)\n",op,elapsed_ns/1e6,path,
+                (unsigned long long)size);
+}
+#define TIMED_READ_LOG(op,fd,sz,off,expr) ({ uint64_t t0_=read_clock_ns(); ssize_t r_=(expr); \
+    uint64_t dt_=read_clock_ns()-t0_; \
+    __atomic_add_fetch(&read_ns,dt_,__ATOMIC_RELAXED); \
+    note_slow_io((op),(fd),(sz),(off),dt_); r_; })
 uint64_t runtime_file_read_ns_take(void) { return __atomic_exchange_n(&read_ns,0,__ATOMIC_RELAXED); }
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 
@@ -342,6 +378,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     HostStat s;
     Listing *dir=NULL;
     int host=-1;
+    HANDLE ov_h=INVALID_HANDLE_VALUE;
     if (!host_stat(path,&s) && S_ISDIR(s.st_mode)) {
         if (flags&3) return -EISDIR;
         if (!(dir=list_directory(path))) return -EACCES;
@@ -360,6 +397,14 @@ static int64_t do_open(const char *guest,int flags,int mode) {
             return -e;
         }
         if (host_fstat(host,&s)) memset(&s,0,sizeof(s));
+        /* sotc: overlapped random-access handle for lock-free parallel pread() across pak archives. */
+        if ((flags & 3) == 0) {
+            HANDLE orig=(HANDLE)_get_osfhandle(host);
+            if (orig!=INVALID_HANDLE_VALUE) {
+                ov_h=ReOpenFile(orig,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                                FILE_FLAG_OVERLAPPED|FILE_FLAG_RANDOM_ACCESS);
+            }
+        }
     }
 #else
     int host=open(path,host_flags(flags),mode ? mode : 0644);
@@ -375,8 +420,20 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     pthread_mutex_lock(&lock);
     int fd=-1;
     for (int i=3;i<MAX_FILES;++i) if (!files[i].used) { fd=i; break; }
-    if (fd<0) { pthread_mutex_unlock(&lock); if (host>=0) close(host); free_listing(dir); return -EMFILE; }
+    if (fd<0) {
+        pthread_mutex_unlock(&lock);
+#ifdef _WIN32
+        if (ov_h!=INVALID_HANDLE_VALUE && ov_h!=NULL) CloseHandle(ov_h);
+#endif
+        if (host>=0) close(host);
+        free_listing(dir);
+        return -EMFILE;
+    }
+#ifdef _WIN32
+    files[fd]=(File){.used=1,.host=host,.ov_handle=ov_h,.dir=dir};
+#else
     files[fd]=(File){.used=1,.host=host,.dir=dir};
+#endif
     snprintf(files[fd].path,sizeof(files[fd].path),"%s",guest);
     ++opens;
     pthread_mutex_unlock(&lock);
@@ -399,6 +456,9 @@ static int64_t do_close(int fd) {
     pthread_mutex_lock(&lock);
     File *f=get(fd);
     if (!f) { pthread_mutex_unlock(&lock); return -EBADF; }
+#ifdef _WIN32
+    if (f->ov_handle!=INVALID_HANDLE_VALUE && f->ov_handle!=NULL) CloseHandle(f->ov_handle);
+#endif
     if (f->host>=0) close(f->host);
     free_listing(f->dir);
     *f=(File){0};
@@ -411,6 +471,41 @@ static int host_fd(int fd) {
     return f ? f->host : -1;
 }
 #ifdef _WIN32
+static HANDLE host_ov_handle(int fd) {
+    File *f=get(fd);
+    return (f && f->ov_handle!=INVALID_HANDLE_VALUE && f->ov_handle!=NULL) ? f->ov_handle : INVALID_HANDLE_VALUE;
+}
+static ssize_t win_ov_pread(HANDLE h,void *buffer,uint64_t size,int64_t offset) {
+    if (offset<0) { errno=EINVAL; return -1; }
+    static _Thread_local HANDLE tls_event;
+    if (!tls_event) tls_event=CreateEventA(NULL,FALSE,FALSE,NULL);
+    size_t done=0;
+    while (done<size) {
+        DWORD chunk=size-done>0x40000000u ? 0x40000000u : (DWORD)(size-done), n=0;
+        OVERLAPPED ov={0};
+        uint64_t pos=(uint64_t)offset+done;
+        ov.Offset=(DWORD)pos;
+        ov.OffsetHigh=(DWORD)(pos>>32);
+        ov.hEvent=tls_event;
+        BOOL ok=ReadFile(h,(char *)buffer+done,chunk,&n,&ov);
+        if (!ok) {
+            DWORD err=GetLastError();
+            if (err==ERROR_IO_PENDING) {
+                ok=GetOverlappedResult(h,&ov,&n,TRUE);
+                if (!ok) err=GetLastError();
+            }
+            if (!ok) {
+                if (err==ERROR_HANDLE_EOF) break;
+                if (done) return (ssize_t)done;
+                errno=compat_errno_from_win32(err);
+                return -1;
+            }
+        }
+        done+=n;
+        if (n<chunk) break;
+    }
+    return (ssize_t)done;
+}
 /* The CRT reads and writes at most INT_MAX bytes per call. */
 static ssize_t host_read(int h,void *buffer,uint64_t size) { return read(h,buffer,(unsigned)(size>0x7ffff000 ? 0x7ffff000 : size)); }
 static ssize_t host_write(int h,const void *buffer,uint64_t size) { return write(h,buffer,(unsigned)(size>0x7ffff000 ? 0x7ffff000 : size)); }
@@ -452,31 +547,40 @@ static int64_t do_read(int fd,void *buffer,uint64_t size) {
     if (h<0) return -EBADF;
     unsigned char *staging=bounce_buffer(size);
     if (staging) {
-        ssize_t n=TIMED_READ(host_read(h,staging,size));
+        ssize_t n=TIMED_READ_LOG("read",fd,size,-1,host_read(h,staging,size));
         if (n<0) return -errno;
         memcpy(buffer,staging,(size_t)n);
         __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
         return n;
     }
     touch_for_write(buffer,size);
-    ssize_t n=TIMED_READ(host_read(h,buffer,size));
+    ssize_t n=TIMED_READ_LOG("read",fd,size,-1,host_read(h,buffer,size));
     if (n<0) { if (audio_trace()) printf("Audio trace: read(fd %d, %llu) failed, errno %d\n",fd,(unsigned long long)size,errno); return -errno; }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;
+}
+static ssize_t pos_read(int fd,int h,void *buffer,uint64_t size,int64_t offset) {
+#ifdef _WIN32
+    HANDLE ov=host_ov_handle(fd);
+    if (ov!=INVALID_HANDLE_VALUE) return win_ov_pread(ov,buffer,size,offset);
+#else
+    (void)fd;
+#endif
+    return pread(h,buffer,size,offset);
 }
 static int64_t do_pread(int fd,void *buffer,uint64_t size,int64_t offset) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
     unsigned char *staging=bounce_buffer(size);
     if (staging) {
-        ssize_t n=TIMED_READ(pread(h,staging,size,offset));
+        ssize_t n=TIMED_READ_LOG("pread",fd,size,offset,pos_read(fd,h,staging,size,offset));
         if (n<0) return -errno;
         memcpy(buffer,staging,(size_t)n);
         __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
         return n;
     }
     touch_for_write(buffer,size);
-    ssize_t n=TIMED_READ(pread(h,buffer,size,offset));
+    ssize_t n=TIMED_READ_LOG("pread",fd,size,offset,pos_read(fd,h,buffer,size,offset));
     if (n<0) { if (audio_trace()) printf("Audio trace: pread(fd %d, %llu @%lld) failed, errno %d\n",fd,(unsigned long long)size,(long long)offset,errno); return -errno; }
     __atomic_add_fetch(&reads,1,__ATOMIC_RELAXED); __atomic_add_fetch(&bytes_read,(uint64_t)n,__ATOMIC_RELAXED);
     return n;

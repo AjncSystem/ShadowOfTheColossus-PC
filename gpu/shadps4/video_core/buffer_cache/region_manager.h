@@ -224,6 +224,15 @@ public:
         return sum;
     }
 
+    /// sotc: BbToggle::BufferBindMemo. Unlocked acquire check that no CPU-modified bit is set.
+    bool IsRegionCpuCleanAtomic(u64 offset, u64 size) const noexcept {
+        bool clean = true;
+        IterateWords(GetBounds(offset, size), [&](u64 index, u64 mask) {
+            clean &= (__atomic_load_n(&cpu[index], __ATOMIC_ACQUIRE) & mask) == 0;
+        });
+        return clean;
+    }
+
     template <Type type, StateOp cpu_op, StateOp gpu_op, bool locked = true>
     void ForEachModifiedRange(u64 offset, s64 size, auto&& func) {
         // sotc: CPU bits rise only in ChangeRegionState (it marks sweep_words).

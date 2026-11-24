@@ -43,6 +43,7 @@ struct Params {
     float mvec_scale_x{}, mvec_scale_y{}; ///< motion vector -> pixels
     float z_near{}, z_far{}, fov_y{}; ///< fov in radians
     bool depth_inverted{};
+    bool is_hdr{};
     bool reset{};
 };
 

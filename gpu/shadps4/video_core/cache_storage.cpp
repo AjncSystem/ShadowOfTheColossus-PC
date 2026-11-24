@@ -47,8 +47,10 @@ std::string ShaderTestTag() {
     static constexpr const char* switches[] = {
         "SOTC_NAN_GUARD", "SOTC_AMD_AS_NV", "SOTC_MANUAL_INTERP", "SOTC_NO_EXPLICIT_VERTEX",
         "SOTC_NO_RTZ", "SOTC_CLIP_EMU", "SOTC_WAVE64_UNIFORM", "SOTC_WAVE64_IDENTITY",
-        "SOTC_LDS_BARRIERS", "SOTC_LDS_SMALL", "SOTC_AMD64_LDS", "SHADPS4_IEEE_MINMAX", "SOTC_WQM_COPY",
-        "SOTC_QUAD_SWIZZLE"};
+        "SOTC_LDS_BARRIERS", "SOTC_LDS_SMALL", "SOTC_AMD64_LDS", "SHADPS4_IEEE_MINMAX",
+        "SOTC_WQM_COPY", "SOTC_NO_BARYCENTRIC", "SOTC_QUAD_SWIZZLE", "SOTC_QUAD_CTRL",
+        "SOTC_WAVE64_ABSENT_LANES", "SHADPS4_LOOP_LIMIT", "SHADPS4_LOOP_LIMIT_PER_LOOP",
+        "SHADPS4_ABSOLUTE_INSTANCE_ID", "SOTC_TSHARP_ARRAY"};
     u64 hash = 1469598103934665603ULL;
     bool any = false;
     for (const char* name : switches) {
@@ -237,12 +239,17 @@ static void ReadCachePack(const std::filesystem::path& path,
 
 static void WriteCachePack(std::filesystem::path path,
                            std::vector<std::pair<std::string, std::vector<u8>>> files) {
+    Common::SetCurrentThreadName("shadPS4:CachePack");
+    Common::SetCurrentThreadPriority(Common::ThreadPriority::Low);
     auto tmp = path;
     tmp += L".tmp";
     std::FILE* f = Common::FS::OpenCFile(tmp, Common::FS::FileAccessMode::Create);
     if (!f) {
         return;
     }
+    // sotc: use a 1 MiB stdio buffer so packing 12k+ shader files doesn't flush 48k small writes.
+    std::vector<char> stdio_buf(1ULL << 20);
+    std::setvbuf(f, stdio_buf.data(), _IOFBF, stdio_buf.size());
     bool ok = std::fwrite(PackMagic, 1, 8, f) == 8;
     const u32 count = static_cast<u32>(files.size());
     ok = ok && std::fwrite(&count, 4, 1, f) == 1;

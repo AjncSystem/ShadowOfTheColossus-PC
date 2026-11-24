@@ -426,20 +426,15 @@ static void event_session_start(const char *app0) {
                cpu,(unsigned long)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS),
                (unsigned long long)((mem.ullTotalPhys+(1ull<<29))>>30),app0 ? app0 : "?",disk);
 }
-/* sotc: read-ahead of the game's archives (SOTC_PREFETCH=0 turns it off). A new area makes the
- * game read many scattered pieces of pakN.psarc (12 GB); on a hard disk each waits for a seek and
- * the frame stalls (54 ms of 83 in "io" on the user's HDD, FPS down to 5). Once the game has
- * shown 20 s of frames the *.psarc files are read once, in order (~150 MB/s on a HDD), with a low
- * I/O priority hint so the game's own reads go first; Windows keeps them in its file cache (RAM), and later
- * reads of the game come from memory. Skipped when they are more than half the RAM. */
+/* sotc: read-ahead of the game's archives (SOTC_PREFETCH=0 off, 1 force, default HDD only).
+ * A new area reads many scattered pieces of pakN.psarc (12 GB); on a spinning HDD seeks stall
+ * frames, whereas on an SSD reading 13.7 GB sequentially evicts Standby RAM and causes 100+ ms
+ * controller/queue stalls during save loads. Wait ~25 s after warmup before starting on HDD. */
 static char prefetch_dir[1024];
 static DWORD WINAPI prefetch_thread(void *unused) {
     (void)unused;
-    /* Not while the shader cache loads (thousands of small files, on the same disk as a rule: the
-     * boot's loading screen took 2 minutes instead of 2 s with both; the game's logos already
-     * flip then): once the preload is over and 20 s of game frames came after it. */
     while (!bbgpu_warmup_finished()) Sleep(500);
-    const uint64_t after=bbgpu_flip_count()+1200;
+    const uint64_t after=bbgpu_flip_count()+800;
     while (bbgpu_flip_count()<after) Sleep(1000);
     char pattern[1100];
     snprintf(pattern,sizeof(pattern),"%s\\*.psarc",prefetch_dir);
@@ -472,10 +467,17 @@ static DWORD WINAPI prefetch_thread(void *unused) {
     void *buffer=VirtualAlloc(NULL,chunk,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE);
     if (!buffer) return 0;
     const DWORD start=GetTickCount();
+    const char *upd_dir=runtime_file_update_dir();
     unsigned long long done=0;
     for (int i=0;i<count;++i) {
         char path[1400];
-        snprintf(path,sizeof(path),"%s\\%s",prefetch_dir,names[i]);
+        if (upd_dir && upd_dir[0]) {
+            snprintf(path,sizeof(path),"%s\\%s",upd_dir,names[i]);
+            if (GetFileAttributesA(path)==INVALID_FILE_ATTRIBUTES)
+                snprintf(path,sizeof(path),"%s\\%s",prefetch_dir,names[i]);
+        } else {
+            snprintf(path,sizeof(path),"%s\\%s",prefetch_dir,names[i]);
+        }
         HANDLE f=CreateFileA(path,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,
                              OPEN_EXISTING,FILE_FLAG_SEQUENTIAL_SCAN,NULL);
         if (f==INVALID_HANDLE_VALUE) continue;

@@ -222,7 +222,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
                 'fx_fog': True, 'fx_ssao': True, 'fx_motionblur': False, 'engine_cvars': '', 'perf_culling': True,
-                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'vram_profile': 'auto', 'gpu_vram_mb': 0, 'volume': '100', 'shadow_reuse': '0', 'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1', 'weed_distance': '1', 'weed_height': '1', 'grass_fade': '1', 'grass_detail': '1', 'library_dirs': [], 'keys': {},
+                'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'vram_profile': 'auto', 'gpu_vram_mb': 0, 'gpu_integrated': None, 'volume': '100', 'shadow_reuse': '0', 'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1', 'weed_distance': '1', 'weed_height': '1', 'grass_fade': '1', 'grass_detail': '1', 'library_dirs': [], 'keys': {},
                 'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'fg_hudless': True, 'fg_mult': '2',
                 'dlss_mode': 'quality', 'dlss_sharpen': '0', 'dlss_ui_sharpen': '3', 'dlss_sky_sharpen': '2',
                 'dlss_compare': False, 'hdr_sdr': False,
@@ -466,6 +466,7 @@ MOUSE_SENS = [('0.5', ('0,5 (lenta)', '0.5 (slow)')), ('0.75', ('0,75', '0.75'))
               ('1.5', ('1,5', '1.5')), ('2.0', ('2,0 (rápida)', '2.0 (fast)'))]
 PRESENT_MODES = [('Mailbox', ('Mailbox (baixa latência, sem cortes)', 'Mailbox (low latency, no tearing)')),
                  ('Fifo', ('FIFO (VSync)', 'FIFO (VSync)')),
+                 ('FifoRelaxed', ('FIFO Relaxed (VSync adaptativo)', 'FIFO Relaxed (adaptive VSync)')),
                  ('Immediate', ('Immediate (pode cortar a imagem)', 'Immediate (tearing)'))]
 # System language (BB_LANGUAGE, PS4 ids); '' keeps the game's own choice.
 LANGUAGES = [('', ('Automático (o do jogo)', 'Automatic (the game\'s)')),
@@ -1107,8 +1108,9 @@ def game_environment(s):
     env.setdefault('SOTC_IMAGE_DEDICATED', '1')
     # sotc: 0.72.2 (T48): new textures read by the GPU in the game's memory (no CPU copy at the
     # first entry of an area; forest 14 -> 9-10 slow frames). The game's 10 GB are imported at
-    # boot (~2.6 s) and stay pinned in RAM: only with 24 GB or more.
-    if (sotc_hardware.memory_gb() or 0) >= 24:
+    # boot (~2.6 s) and stay pinned in RAM: only with 24 GB or more on a discrete GPU (an APU
+    # shares system RAM with the GPU, so pinning 10 GB can starve VRAM/system memory).
+    if (sotc_hardware.memory_gb() or 0) >= 24 and not s.get('gpu_integrated'):
         env.setdefault('SOTC_PC_MEMORY', '1')
         env.setdefault('SOTC_PC_MEMORY_PREIMPORT', '1')
         env.setdefault('SOTC_TEX_DIRECT', '1')
@@ -1794,7 +1796,15 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         values = dict(PLAY_MODE_VALUES.get(mode, {}))
         if mode == 'extreme':
             name = getattr(self, 'gpu_name', '').upper()
-            values['upscaler'] = 'dlss' if 'NVIDIA' in name and 'RTX' in name else 'fsr1'
+            vram_mb = int(self.app.get('gpu_vram_mb') or 0)
+            has_fsr4 = ((PORT_DIR / 'bin' / 'amd_fidelityfx_upscaler_vk.dll').is_file()
+                        or (PORT_DIR / 'out' / 'amd_fidelityfx_upscaler_vk.dll').is_file())
+            if 'NVIDIA' in name and 'RTX' in name:
+                values['upscaler'] = 'dlss'
+            elif has_fsr4 and not self.app.get('gpu_integrated') and vram_mb >= LIGHT_VRAM_BELOW_MB:
+                values['upscaler'] = 'fsr4'
+            else:
+                values['upscaler'] = 'fsr1'
         return values
 
     def show_vram_profile_hint(self):
@@ -2457,9 +2467,10 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         try:
             result = subprocess.run([str(exe), '--live-resolution'], capture_output=True, text=True, timeout=30,
                                     env=env, creationflags=NO_WINDOW)
-            names = [line[5:].split(':')[0] for line in result.stderr.splitlines() if line.startswith('GPU: ')]
+            names = [line[5:].rsplit(':', 1)[0] for line in result.stderr.splitlines() if line.startswith('GPU: ')]
             if names:
                 self.gpu_name = names[0]
+                self.app['gpu_integrated'] = 'integrated' in names[0].lower()
                 found = re.search(r'(\d+)\s*MiB', names[0])
                 if found:
                     self.app['gpu_vram_mb'] = int(found.group(1))
@@ -3945,15 +3956,25 @@ def play_without_window(settings):
         write_key_bindings(settings.get('keys'))
     except OSError:
         pass
-    if not settings.get('gpu_vram_mb'):
+    if not settings.get('gpu_vram_mb') or settings.get('gpu_integrated') is None:
         # sotc: the video memory profile's Auto needs the card (the window finds it in detect_gpu).
         exe = PORT_DIR / 'bin' / 'bb-gpu-capabilities.exe'
+        if not exe.is_file():
+            exe = PORT_DIR / 'out' / 'bb-gpu-capabilities.exe'
+        probe_env = dict(os.environ)
+        if not (exe.parent / 'SDL3.dll').is_file():
+            clang64 = Path(os.environ.get('MSYS2_ROOT', r'C:\msys64')) / 'clang64' / 'bin'
+            probe_env['PATH'] = f'{clang64}{os.pathsep}{probe_env.get("PATH", "")}'
         try:
             result = subprocess.run([str(exe), '--live-resolution'], capture_output=True, text=True,
-                                    timeout=30, creationflags=NO_WINDOW)
-            found = re.search(r'^GPU: .*?(\d+)\s*MiB', result.stderr, re.MULTILINE)
-            if found:
-                settings['gpu_vram_mb'] = int(found.group(1))
+                                    timeout=30, env=probe_env, creationflags=NO_WINDOW)
+            line = next((ln for ln in result.stderr.splitlines() if ln.startswith('GPU: ')), '')
+            if line:
+                gpu_desc = line[5:].rsplit(':', 1)[0]
+                settings['gpu_integrated'] = 'integrated' in gpu_desc.lower()
+                found = re.search(r'(\d+)\s*MiB', gpu_desc)
+                if found:
+                    settings['gpu_vram_mb'] = int(found.group(1))
         except (OSError, subprocess.TimeoutExpired):
             pass
     env = game_environment(settings)

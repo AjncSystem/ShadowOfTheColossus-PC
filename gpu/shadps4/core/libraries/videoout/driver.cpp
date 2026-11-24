@@ -238,6 +238,9 @@ int VideoOutDriver::UnregisterBuffers(VideoOutPort* port, s32 attributeIndex) {
         if (buffer.group_index != attributeIndex) {
             continue;
         }
+        if (buffer.address_left != 0) {
+            presenter->UnregisterVideoOutSurface(buffer.address_left);
+        }
         buffer.group_index = -1;
     }
 
@@ -300,10 +303,21 @@ extern "C" uint64_t runtime_file_read_ns_take(void);
 // (its pacer presents on a thread of its own), so the vblank thread keeps presenting by default.
 // FSR 3 frame generation presents the game frame half a frame after the generated one: from
 // the first FSR 3 frame on, the presenter has a thread of its own (vblank thread only).
+// sotc: also with a FIFO swapchain (AMD's Windows driver has no Mailbox, so Mailbox falls back
+// to FIFO): there acquire/present block until the display's vblank, which stalled the emulated
+// 120 Hz vblanks the game paces itself on. RX 6600 logs held 18-20 FPS in the 30 FPS mode, with
+// 600-750 frames a minute slower than 50 ms. SOTC_ASYNC_PRESENT=0 keeps presenting here.
 bool VideoOutDriver::AsyncPresent() {
     static const bool async = [] {
         const char* v = std::getenv("SOTC_ASYNC_PRESENT");
-        return v && v[0] == '1';
+        if (v) {
+            return v[0] == '1';
+        }
+        const bool vsync = presenter && presenter->PresentWaitsForVsync();
+        if (vsync) {
+            std::fprintf(stderr, "SOTC PRESENT: FIFO swapchain, presenting on the presenter thread\n");
+        }
+        return vsync;
     }();
     static bool fsr = false;
     if (!fsr && Vulkan::FrameGen::Current() == Vulkan::FrameGen::Mode::Fsr) {
@@ -315,7 +329,9 @@ bool VideoOutDriver::AsyncPresent() {
 
 void VideoOutDriver::RunPresentJob(std::function<void()> job, bool droppable) {
     if (!AsyncPresent()) {
+        present_since_ns.store(SotcStats::NowNs(), std::memory_order_relaxed);
         job();
+        present_since_ns.store(0, std::memory_order_relaxed);
         return;
     }
     {
@@ -328,6 +344,7 @@ void VideoOutDriver::RunPresentJob(std::function<void()> job, bool droppable) {
                 std::jthread([this](std::stop_token token) { PresentJobThread(token); });
         }
         present_jobs.push(std::move(job));
+        present_jobs_pending.fetch_add(1, std::memory_order_relaxed);
     }
     present_job_cv.notify_one();
 }
@@ -344,7 +361,10 @@ void VideoOutDriver::PresentJobThread(std::stop_token token) {
             job = std::move(present_jobs.front());
             present_jobs.pop();
         }
+        present_since_ns.store(SotcStats::NowNs(), std::memory_order_relaxed);
         job();
+        present_since_ns.store(0, std::memory_order_relaxed);
+        present_jobs_pending.fetch_sub(1, std::memory_order_release);
     }
 }
 
@@ -363,12 +383,10 @@ void VideoOutDriver::Flip(const Request& req) {
         }
     }
     // Update HDR status before presenting, and present the frame.
-    present_since_ns.store(SotcStats::NowNs(), std::memory_order_relaxed);
     RunPresentJob([frame = req.frame, hdr = req.port->is_hdr] {
         presenter->SetHDR(hdr);
         presenter->Present(frame);
     });
-    present_since_ns.store(0, std::memory_order_relaxed);
     SotcStats::flip_count.fetch_add(1, std::memory_order_relaxed);
     {
         // sotc: a performance line in the event log every minute (average FPS, frames slower
@@ -1322,7 +1340,7 @@ void VideoOutDriver::Flip(const Request& req) {
     }
 
     // Reset prev flip label
-    if (!EarlyVoLabel() && port->prev_index != -1) {
+    if (!req.early_vo && port->prev_index != -1) {
         port->buffer_labels[port->prev_index] = 0;
         port->SignalVoLabel();
     }
@@ -1391,51 +1409,61 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         frame = presenter->PrepareFrame(group, buffer.address_left);
     }
 
-    // sotc: the buffer shown before this flip is free once the copy of this one is recorded:
-    // PrepareFrame read it on the GPU timeline, ahead of anything the game renders into the old
-    // buffer next. Upstream frees it only when the present thread takes this flip on a vblank
-    // tick, and the command processor waits for that in the VO label wait at the start of the
-    // next frame.
-    if (EarlyVoLabel()) {
-        if (port->submit_prev_index != -1) {
-            port->buffer_labels[port->submit_prev_index] = 0;
-            port->SignalVoLabel();
-        }
-        port->submit_prev_index = index;
-    }
-
     const auto arrival = std::chrono::steady_clock::now();
     // sotc: at most SOTC_FLIP_QUEUE (default 1) flips wait for the present thread. The early label
-    // above lets the game run ahead of a frame limit, so the waiting flips filled the whole frame
+    // below lets the game run ahead of a frame limit, so the waiting flips filled the whole frame
     // pool, which follows the swapchain: with its 8 images every frame was shown 8 frames late
     // (measured 266 ms at the 30 FPS cap, issue #128, from 0.70-opt12). The command processor waits
     // here instead, as the game does on the PS4. Not while a present is stuck (NVIDIA blocks one up
     // to ~140 ms every ~11 s): the deep pool is there to bridge that without a hitch; the backlog
     // is gone a few frames later. 0: no limit, as before.
+    // sotc: when AsyncPresent() runs on a FIFO swapchain, normal VSync waits in PresentJobThread
+    // routinely exceed 20 ms (16.7-33.3 ms), so use a higher stuck threshold (60 ms) there so
+    // normal VSync waits never leak a second frame onto requests; release the previous VO buffer
+    // only after the queue has room so the game stays at most 1 frame ahead instead of 2.
     static const size_t flip_queue = [] {
         const char* v = std::getenv("SOTC_FLIP_QUEUE");
         return v && v[0] ? size_t(std::strtoul(v, nullptr, 10)) : size_t{1};
     }();
-    std::unique_lock lock{mutex};
-    if (flip_queue != 0 && requests.size() >= flip_queue) {
-        constexpr u64 stuck_ns = 20'000'000;
-        const auto give_up = arrival + std::chrono::milliseconds(200); // paused, or shutting down
-        while (requests.size() >= flip_queue && std::chrono::steady_clock::now() < give_up) {
-            const u64 since = present_since_ns.load(std::memory_order_relaxed);
-            if (since != 0 && SotcStats::NowNs() - since > stuck_ns) {
-                break;
+    {
+        std::unique_lock lock{mutex};
+        if (flip_queue != 0 && requests.size() >= flip_queue) {
+            const u64 stuck_ns = AsyncPresent() ? 60'000'000ULL : 20'000'000ULL;
+            const auto give_up = arrival + std::chrono::milliseconds(200); // paused, or shutting down
+            while (requests.size() >= flip_queue && std::chrono::steady_clock::now() < give_up) {
+                const u64 since = present_since_ns.load(std::memory_order_relaxed);
+                if (since != 0 && SotcStats::NowNs() - since > stuck_ns) {
+                    break;
+                }
+                flip_taken_cv.wait_for(lock, std::chrono::milliseconds(2));
             }
-            flip_taken_cv.wait_for(lock, std::chrono::milliseconds(2));
         }
+        // sotc: release the previous VO buffer at submit time only when running uncapped / 60 FPS
+        // (EffectiveRate <= 0). Under a 30 FPS cap (EffectiveRate >= 1), early release makes the
+        // game render the next frame ~17 ms before the current flip can display, adding a full extra
+        // ~17-20 ms to input latency (SOTC flip wait ~42-50 ms instead of ~15-20 ms).
+        const bool early_vo = EarlyVoLabel() && SotcFpsCap::EffectiveRate() <= 0;
+        if (early_vo) {
+            if (port->submit_prev_index != -1) {
+                port->buffer_labels[port->submit_prev_index] = 0;
+                port->SignalVoLabel();
+            }
+            port->submit_prev_index = index;
+        } else if (port->submit_prev_index != -1) {
+            port->buffer_labels[port->submit_prev_index] = 0;
+            port->SignalVoLabel();
+            port->submit_prev_index = -1;
+        }
+        requests.push({
+            .frame = frame,
+            .port = port,
+            .flip_arg = flip_arg,
+            .index = index,
+            .eop = is_eop,
+            .early_vo = early_vo,
+            .arrival = arrival,
+        });
     }
-    requests.push({
-        .frame = frame,
-        .port = port,
-        .flip_arg = flip_arg,
-        .index = index,
-        .eop = is_eop,
-        .arrival = arrival,
-    });
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {
@@ -1503,6 +1531,11 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
     // limit_next advances by exactly one limit period while the game keeps up, so the cap stays
     // at 60 and is not rounded up to the tick grid.
     auto limit_next = last_flip_time;
+    auto cap_next = last_flip_time;
+    static const bool cap_subtick = [] {
+        const char* v = std::getenv("SOTC_CAP_SUBTICK");
+        return !v || v[0] != '0';
+    }();
 
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
@@ -1591,9 +1624,24 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             } else {
                 take_request = false;
             }
-        } else {
+        } else if (!cap_subtick) {
             const u64 interval = u64(flip_rate + 1) * vblanks_per_60hz;
             take_request = vblank_status.count - last_flip_vblank >= interval;
+        } else {
+            const auto now = std::chrono::steady_clock::now();
+            const auto arrival = peek_arrival();
+            const std::chrono::nanoseconds cap_period =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    vblank_period * (u64(flip_rate + 1) * vblanks_per_60hz));
+            // sotc: in 30 FPS cap mode (flip_rate >= 1) wait until the presenter finished the
+            // prior job so FIFO present queues don't stack an extra frame of input latency.
+            const size_t max_pending = flip_rate >= 1 ? size_t{0} : size_t{1};
+            const bool present_clear =
+                !AsyncPresent() || present_jobs_pending.load(std::memory_order_acquire) <= max_pending;
+            take_request = arrival && present_clear && now + tick_period / 2 >= cap_next;
+            if (take_request) {
+                cap_next = (now - cap_next < tick_period ? cap_next : now) + cap_period;
+            }
         }
         const auto request = take_request ? receive_request() : Request{};
         if (!request) {

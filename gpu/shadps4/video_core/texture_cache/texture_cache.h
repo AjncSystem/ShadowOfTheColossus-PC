@@ -330,8 +330,9 @@ public:
     void InvalidateMemory(VAddr addr, size_t size);
 
     /// Marks an image as dirty if it exists at the provided address.
-    /// sotc: any_overlap marks every image overlapping the range (DMA copies and fills).
-    void InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool any_overlap = false);
+    /// sotc: any_overlap marks every image overlapping the range (DMA copies and fills);
+    /// returns true if any registered image overlapped the queried range.
+    bool InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool any_overlap = false);
 
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
@@ -372,6 +373,10 @@ public:
     [[nodiscard]] Image& PeekImage(ImageId id) {
         return slot_images[id];
     }
+
+    /// sotc: keep vo_surface across overlap/stash/GC replacements of registered Video-Out scanouts.
+    void RegisterVoSurface(VAddr address, u32 width, u32 height);
+    void UnregisterVoSurface(VAddr address);
 
     /// sotc: moves on every RegisterImage/UnregisterImage: while it stays, a lookup that found an
     /// image for the same descriptor finds it again (see the draw bind memo, vk_rasterizer.cpp).
@@ -866,6 +871,12 @@ private:
         s32 clear_mask = -1;
     };
     tsl::robin_map<VAddr, MetaDataInfo> surface_metas;
+    struct VoSurface {
+        VAddr address{};
+        u32 width{};
+        u32 height{};
+    };
+    std::vector<VoSurface> vo_surfaces;
 };
 
 } // namespace VideoCore

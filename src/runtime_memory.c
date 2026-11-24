@@ -1957,6 +1957,36 @@ int runtime_memory_region(uintptr_t address, uintptr_t *start, uintptr_t *end, i
     read_unlock();
     return found;
 }
+/* sotc: contiguous backing-view run holding address (coalesces adjacent VMAs whose physical offsets
+ * in backing_base are contiguous so zero-copy texture uploads don't fall back on split protections). */
+const unsigned char *runtime_memory_backing_run(uintptr_t address, uint64_t min_size,
+                                                uintptr_t *start, uintptr_t *end) {
+    if (!backing_base) return NULL;
+    if (!(runtime_disabled_optimizations & 1) && min_size<=UINTPTR_MAX-address) {
+        const uintptr_t qend=min_size ? address+min_size : address+1;
+        const CachedRegion *c=cached_region_q(address,qend);
+        if (c && c->kind!=KIND_RESERVED && c->backing && (!min_size || qend<=c->end)) {
+            *start=c->start; *end=c->end;
+            return c->backing;
+        }
+    }
+    read_lock();
+    const size_t i=vma_index(address);
+    const unsigned char *p=NULL;
+    if (i<vma_count && V(i).start<=address && V(i).kind!=KIND_RESERVED) {
+        cache_region(i,address);
+        uintptr_t s=V(i).start, e=V(i).end;
+        const uint64_t phys=V(i).phys;
+        p=backing_base+phys;
+        for (size_t j=i+1; j<vma_count; ++j) {
+            if (V(j).start!=e || V(j).kind==KIND_RESERVED || V(j).phys!=phys+(e-s)) break;
+            e=V(j).end;
+        }
+        *start=s; *end=e;
+    }
+    read_unlock();
+    return p;
+}
 /* sotc: SOTC_COPY_LOCK_ONCE=1 (bbgpu CopySparseMemory): guest memory copied out through the
  * backing view in one call, for the GPU's texture and buffer uploads. They looked up the region
  * and then the backing pointer of every mapping run, and at an area change each lookup the region

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <deque>
 #include <limits>
 #include "common/assert.h"
 #include "common/debug.h"
@@ -19,6 +21,123 @@
 namespace Vulkan {
 
 std::mutex Scheduler::submit_mutex;
+
+struct Scheduler::GpuTiming {
+    static constexpr u32 SpanCount = 512;
+    static constexpr u64 FrameStride = 16;
+
+    struct Span {
+        u64 frame;
+        u64 tick;
+        u32 query;
+        const char* label;
+    };
+
+    vk::UniqueQueryPool pool;
+    std::deque<Span> pending;
+    u64 frame = 1;
+    u32 next_slot = 0;
+    u32 lost = 0;
+    bool ending_frame = false;
+};
+
+void Scheduler::StartGpuTiming() {
+    const char* flag = std::getenv("SOTC_GPU_TIMING");
+    if (!flag || flag[0] != '1') {
+        return;
+    }
+    const auto physical = instance.GetPhysicalDevice();
+    const u32 bits = physical.getQueueFamilyProperties()[instance.GetGraphicsQueueFamilyIndex()]
+                         .timestampValidBits;
+    if (!bits) {
+        std::fprintf(stderr, "SOTC GPU TIMING unsupported on graphics queue\n");
+        return;
+    }
+    const vk::QueryPoolCreateInfo info{
+        .queryType = vk::QueryType::eTimestamp,
+        .queryCount = GpuTiming::SpanCount * 2,
+    };
+    auto [result, pool] = instance.GetDevice().createQueryPoolUnique(info);
+    if (result != vk::Result::eSuccess) {
+        std::fprintf(stderr, "SOTC GPU TIMING query pool unavailable (%d)\n", int(result));
+        return;
+    }
+    gpu_timing = std::make_unique<GpuTiming>();
+    gpu_timing->pool = std::move(pool);
+    std::fprintf(stderr, "SOTC GPU TIMING period_ns=%.9g bits=%u stride=%llu\n",
+                 double(physical.getProperties().limits.timestampPeriod), bits,
+                 static_cast<unsigned long long>(GpuTiming::FrameStride));
+}
+
+void Scheduler::MarkGpuFrameEnd() {
+    if (gpu_timing) {
+        gpu_timing->ending_frame = true;
+    }
+}
+
+u32 Scheduler::BeginGpuSpan(vk::CommandBuffer cmdbuf, const char* label) {
+    if (!gpu_timing || gpu_timing->frame % GpuTiming::FrameStride != 0) {
+        return ~0u;
+    }
+    auto& timing = *gpu_timing;
+    if (timing.pending.size() == GpuTiming::SpanCount) {
+        ++timing.lost;
+        return ~0u;
+    }
+    const u32 query = timing.next_slot * 2;
+    timing.next_slot = (timing.next_slot + 1) % GpuTiming::SpanCount;
+    timing.pending.push_back({timing.frame, CurrentTick(), query, label});
+    WriteGpuTimestamp(cmdbuf, query, true);
+    return query;
+}
+
+void Scheduler::EndGpuSpan(vk::CommandBuffer cmdbuf, u32 query) {
+    if (query != ~0u) {
+        WriteGpuTimestamp(cmdbuf, query, false);
+    }
+}
+
+void Scheduler::WriteGpuTimestamp(vk::CommandBuffer cmdbuf, u32 query, bool begin) {
+    auto record = [pool = *gpu_timing->pool, query, begin](vk::CommandBuffer real) {
+        if (begin) {
+            real.resetQueryPool(pool, query, 2);
+            real.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, pool, query);
+        } else {
+            real.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe, pool, query + 1);
+        }
+    };
+    if (recorder && CommandRecorder::IsFake(cmdbuf)) {
+        recorder->Run([this, cmdbuf, record] { record(recorder->Real(cmdbuf)); });
+    } else {
+        record(cmdbuf);
+    }
+}
+
+void Scheduler::CollectGpuTiming() {
+    if (!gpu_timing) {
+        return;
+    }
+    auto& timing = *gpu_timing;
+    const u64 complete = work_semaphore.KnownGpuTick();
+    while (!timing.pending.empty() && timing.pending.front().tick <= complete) {
+        const auto span = timing.pending.front();
+        std::array<u64, 2> values{};
+        const auto result = instance.GetDevice().getQueryPoolResults(
+            *timing.pool, span.query, 2, sizeof(values), values.data(), sizeof(u64),
+            vk::QueryResultFlagBits::e64);
+        if (result == vk::Result::eSuccess) {
+            std::fprintf(stderr, "SOTC GPU SPAN %llu %llu %s %llu %llu\n",
+                         static_cast<unsigned long long>(span.frame),
+                         static_cast<unsigned long long>(span.tick), span.label,
+                         static_cast<unsigned long long>(values[0]),
+                         static_cast<unsigned long long>(values[1]));
+        } else {
+            std::fprintf(stderr, "SOTC GPU TIMING query %u failed (%d)\n", span.query,
+                         int(result));
+        }
+        timing.pending.pop_front();
+    }
+}
 
 Scheduler::Scheduler(const Instance& instance, bool record_thread)
     : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
@@ -98,6 +217,15 @@ void Scheduler::RecordDeferred(Common::UniqueFunction<void, vk::CommandBuffer>&&
     recorder->Run([this, cmdbuf, func = std::move(func)] {
         func(vk::CommandBuffer{recorder->Real(cmdbuf)});
     });
+}
+
+void Scheduler::RunAfterSubmit(Common::UniqueFunction<void>&& func) {
+    if (!recorder) {
+        func();
+        return;
+    }
+    recorder->Run(std::move(func));
+    recorder->Kick();
 }
 
 void Scheduler::RunCullHook() const {
@@ -228,6 +356,7 @@ vk::CommandBuffer Scheduler::UploadCommandBuffer() {
     if (recorder) {
         upload_cmdbuf = recorder->NewFakeHandle();
         recorder->Run([this, fake = upload_cmdbuf] { BeginRecorded(fake); });
+        sessions.back().upload_query = BeginGpuSpan(upload_cmdbuf, "upload");
         return upload_cmdbuf;
     }
     const vk::CommandBufferBeginInfo begin_info = {
@@ -235,6 +364,7 @@ vk::CommandBuffer Scheduler::UploadCommandBuffer() {
     };
     upload_cmdbuf = command_pool.Commit();
     Check(upload_cmdbuf.begin(begin_info));
+    sessions.back().upload_query = BeginGpuSpan(upload_cmdbuf, "upload");
     return upload_cmdbuf;
 }
 
@@ -311,6 +441,7 @@ vk::CommandBuffer Scheduler::BeginAhead() {
     Check(ahead_cmdbuf.begin(vk::CommandBufferBeginInfo{
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
     }));
+    ahead_query = BeginGpuSpan(ahead_cmdbuf, "readback");
     return ahead_cmdbuf;
 }
 
@@ -319,6 +450,7 @@ void Scheduler::SubmitAheadAndWait() {
         work_semaphore.RecordMarker(ahead_cmdbuf, Semaphore::MarkerSlot::Ahead,
                                     static_cast<u32>(++ahead_sequence));
     }
+    EndGpuSpan(ahead_cmdbuf, ahead_query);
     Check(ahead_cmdbuf.end());
     // With the recorder, the earlier submits must have reached the queue first.
     WaitSubmitted(CurrentTick() - 1);
@@ -426,6 +558,7 @@ void Scheduler::BeginSession() {
         Check(session.primary.begin(begin_info));
     }
 
+    session.primary_query = BeginGpuSpan(session.primary, "graphics");
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
 
@@ -450,10 +583,12 @@ void Scheduler::EndSession() {
 
     const auto& session = sessions.back();
     if (session.upload) {
+        EndGpuSpan(session.upload, session.upload_query);
         Check(session.upload.end());
     }
 
     EndRendering();
+    EndGpuSpan(session.primary, session.primary_query);
     Check(session.primary.end());
 }
 
@@ -570,6 +705,18 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     }
 
     work_semaphore.Refresh();
+    CollectGpuTiming();
+    if (gpu_timing && std::exchange(gpu_timing->ending_frame, false)) {
+        auto& timing = *gpu_timing;
+        if (timing.frame % GpuTiming::FrameStride == 0) {
+            std::fprintf(stderr, "SOTC GPU FRAME %llu %llu %llu %u\n",
+                         static_cast<unsigned long long>(timing.frame),
+                         static_cast<unsigned long long>(signal_value),
+                         static_cast<unsigned long long>(SotcStats::NowNs()), timing.lost);
+            timing.lost = 0;
+        }
+        ++timing.frame;
+    }
     BeginSession();
 
     // Apply pending operations
@@ -759,6 +906,144 @@ void DynamicState::Commit(const Instance& instance, const vk::CommandBuffer& cmd
                                                       ? vk::ImageAspectFlagBits::eColor
                                                       : vk::ImageAspectFlagBits::eNone);
     }
+}
+
+u64 Scheduler::EnqueueAsyncAhead(std::vector<AsyncAheadCopy> copies) {
+    const u64 seq = async_ahead_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (recorder) {
+        recorder->Run(
+            [this, seq, copies = std::move(copies)] { ExecuteAsyncAhead(seq, copies); });
+        recorder->Kick();
+    } else {
+        ExecuteAsyncAhead(seq, copies);
+    }
+    return seq;
+}
+
+void Scheduler::ExecuteAsyncAhead(u64 seq, const std::vector<AsyncAheadCopy>& copies) {
+    const vk::Device device = instance.GetDevice();
+    if (!async_ahead_pool) {
+        const vk::CommandPoolCreateInfo pool_info = {
+            .flags = vk::CommandPoolCreateFlagBits::eTransient |
+                     vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+            .queueFamilyIndex = instance.GetGraphicsQueueFamilyIndex(),
+        };
+        auto [pool_res, pool] = device.createCommandPoolUnique(pool_info);
+        ASSERT_MSG(pool_res == vk::Result::eSuccess, "Failed to create async ahead pool: {}",
+                   vk::to_string(pool_res));
+        async_ahead_pool = std::move(pool);
+        const vk::CommandBufferAllocateInfo alloc_info = {
+            .commandPool = *async_ahead_pool,
+            .level = vk::CommandBufferLevel::ePrimary,
+            .commandBufferCount = NumAsyncAheadCmds,
+        };
+        auto [alloc_res, cmdbufs] = device.allocateCommandBuffers(alloc_info);
+        ASSERT_MSG(alloc_res == vk::Result::eSuccess,
+                   "Failed to allocate async ahead command buffers: {}", vk::to_string(alloc_res));
+        std::copy_n(cmdbufs.begin(), NumAsyncAheadCmds, async_ahead_cmdbufs.begin());
+        const vk::StructureChain sem_chain = {
+            vk::SemaphoreCreateInfo{},
+            vk::SemaphoreTypeCreateInfo{
+                .semaphoreType = vk::SemaphoreType::eTimeline,
+                .initialValue = 0,
+            },
+        };
+        auto [sem_res, sem] = device.createSemaphoreUnique(sem_chain.get());
+        ASSERT_MSG(sem_res == vk::Result::eSuccess,
+                   "Failed to create async ahead semaphore: {}", vk::to_string(sem_res));
+        async_ahead_sem = std::move(sem);
+    }
+    const u32 slot = static_cast<u32>((seq - 1) & (NumAsyncAheadCmds - 1));
+    if (const u64 prev_seq = async_ahead_cmdbuf_seqs[slot]; prev_seq != 0) {
+        const auto [cnt_res, cnt] = device.getSemaphoreCounterValue(*async_ahead_sem);
+        if (cnt_res != vk::Result::eSuccess || cnt < prev_seq) {
+            const vk::SemaphoreWaitInfo wait_info = {
+                .semaphoreCount = 1,
+                .pSemaphores = &*async_ahead_sem,
+                .pValues = &prev_seq,
+            };
+            Check(device.waitSemaphores(wait_info, std::numeric_limits<u64>::max()));
+        }
+    }
+    const vk::CommandBuffer cmdbuf = async_ahead_cmdbufs[slot];
+    Check(cmdbuf.reset());
+    Check(cmdbuf.begin(vk::CommandBufferBeginInfo{
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    }));
+    const vk::MemoryBarrier2 pre_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &pre_barrier,
+    });
+    for (const auto& c : copies) {
+        cmdbuf.copyBuffer(c.src, c.dst, c.regions);
+    }
+    const vk::MemoryBarrier2 post_barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &post_barrier,
+    });
+    Check(cmdbuf.end());
+    const vk::TimelineSemaphoreSubmitInfo timeline_si = {
+        .signalSemaphoreValueCount = 1,
+        .pSignalSemaphoreValues = &seq,
+    };
+    const vk::SubmitInfo submit_info = {
+        .pNext = &timeline_si,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmdbuf,
+        .signalSemaphoreCount = 1,
+        .pSignalSemaphores = &*async_ahead_sem,
+    };
+    {
+        std::scoped_lock lk{submit_mutex};
+        const auto submit_result = instance.GetGraphicsQueue().submit(submit_info);
+        if (submit_result == vk::Result::eErrorDeviceLost) {
+            instance.ReportDeviceFault();
+            UNREACHABLE_MSG("Device lost during async ahead submit");
+        }
+        ASSERT_MSG(submit_result == vk::Result::eSuccess, "Async ahead submit failed: {}",
+                   vk::to_string(submit_result));
+    }
+    async_ahead_cmdbuf_seqs[slot] = seq;
+    async_ahead_submitted.store(seq, std::memory_order_release);
+    async_ahead_submitted.notify_all();
+}
+
+void Scheduler::WaitAsyncAhead(u64 seq) {
+    u64 sub = async_ahead_submitted.load(std::memory_order_acquire);
+    while (sub < seq) {
+        async_ahead_submitted.wait(sub, std::memory_order_acquire);
+        sub = async_ahead_submitted.load(std::memory_order_acquire);
+    }
+    const vk::Device device = instance.GetDevice();
+    const auto [cnt_res, cnt] = device.getSemaphoreCounterValue(*async_ahead_sem);
+    if (cnt_res == vk::Result::eSuccess && cnt >= seq) {
+        return;
+    }
+    const vk::SemaphoreWaitInfo wait_info = {
+        .semaphoreCount = 1,
+        .pSemaphores = &*async_ahead_sem,
+        .pValues = &seq,
+    };
+    const vk::Result wait_result =
+        device.waitSemaphores(wait_info, std::numeric_limits<u64>::max());
+    if (wait_result == vk::Result::eErrorDeviceLost) {
+        instance.ReportDeviceFault();
+        UNREACHABLE_MSG("Device lost during async ahead wait");
+    }
+    ASSERT_MSG(wait_result == vk::Result::eSuccess, "Async ahead wait failed: {}",
+               vk::to_string(wait_result));
 }
 
 } // namespace Vulkan

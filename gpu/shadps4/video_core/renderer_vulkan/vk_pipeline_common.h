@@ -57,8 +57,16 @@ public:
         return is_compute;
     }
 
+    u8 FastBindStaticState() const noexcept {
+        return fast_bind_static_state;
+    }
+    void SetFastBindStaticState(u8 s) const noexcept {
+        fast_bind_static_state = s;
+    }
+
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
     void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data) const;
+    void BindPushConstantsOnly(const Shader::PushData& push_data) const;
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;
@@ -73,6 +81,7 @@ protected:
     std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
     bool uses_push_descriptors{};
     bool is_compute;
+    mutable u8 fast_bind_static_state{0};
 };
 
 } // namespace Vulkan

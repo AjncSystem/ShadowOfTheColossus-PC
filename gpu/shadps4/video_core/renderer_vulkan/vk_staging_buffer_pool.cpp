@@ -20,8 +20,8 @@ using VideoCore::MemoryType;
 
 namespace {
 
-constexpr u64 RING_IDLE_FRAMES = 300;
-constexpr u64 LARGE_IDLE_FRAMES = 120;
+constexpr u64 RING_IDLE_FRAMES = 1800;
+constexpr u64 LARGE_IDLE_FRAMES = 3600;
 constexpr u64 LARGE_MIN_GRANULARITY = 64_KB;
 // sotc: ring blocks of SOTC_STAGING_BLOCK_MB (default 16 as upstream). An allocation costs about
 // the same at any size (~2 ms), and a streaming burst asks for 200+ MB in one frame.
@@ -211,6 +211,11 @@ void StagingBufferPool::TickFrame() {
         return static_cast<size_t>((v ? std::strtoull(v, nullptr, 10) : 128ull) /
                                    (BlockSize() >> 20));
     }();
+    static const size_t keep_cached_blocks = [] {
+        const char* v = std::getenv("SOTC_STAGING_KEEP_CACHED_MB");
+        return static_cast<size_t>((v ? std::strtoull(v, nullptr, 10) : 32ull) /
+                                   (BlockSize() >> 20));
+    }();
     static const size_t keep_device_blocks = [this] {
         const char* v = std::getenv("SOTC_STAGING_KEEP_VRAM_MB");
         const u64 fallback = instance.GetTotalMemoryBudget() >= (4ull << 30) ? 64ull : 0ull;
@@ -218,8 +223,10 @@ void StagingBufferPool::TickFrame() {
                                    (BlockSize() >> 20));
     }();
     for (size_t type = 0; type < rings.size(); ++type) {
-        const size_t keep =
-            type == u32(MemoryType::DeviceLocal) ? keep_device_blocks : keep_host_blocks;
+        const size_t keep = type == u32(MemoryType::DeviceLocal)
+                                ? keep_device_blocks
+                                : (type == u32(MemoryType::HostCached) ? keep_cached_blocks
+                                                                       : keep_host_blocks);
         TrimRing(rings[type], keep);
         Ring& ring = rings[type];
         if (ring.blocks.size() < keep && frame > 60) {
@@ -259,19 +266,25 @@ void StagingBufferPool::TrimRing(Ring& ring, size_t keep_blocks) {
 
 void StagingBufferPool::TrimLarge(std::vector<LargeBuffer>& cache) {
     // sotc: SOTC_STAGING_LARGE_POW2: idle buffers are kept up to SOTC_STAGING_LARGE_KEEP_MB,
-    // the most recently used first.
+    // the most recently used first. Keep a separate small-buffer budget so large texture
+    // uploads never evict small deferred readback buffers.
     u64 keep = StagingLargePow2() ? StagingLargeKeepBytes() : 0;
+    u64 keep_small = StagingLargePow2() ? 64_MB : 0;
     if (keep != 0) {
         std::ranges::sort(cache, [](const LargeBuffer& a, const LargeBuffer& b) {
             return a.last_used_frame > b.last_used_frame;
         });
     }
-    std::erase_if(cache, [this, &keep](const LargeBuffer& entry) {
+    std::erase_if(cache, [this, &keep, &keep_small](const LargeBuffer& entry) {
         if (entry.held || frame - entry.last_used_frame < LARGE_IDLE_FRAMES ||
             !scheduler.IsFree(entry.tick)) {
             return false;
         }
         const u64 bytes = entry.buffer->SizeBytes();
+        if (bytes <= 4_MB && bytes <= keep_small) {
+            keep_small -= bytes;
+            return false;
+        }
         if (bytes <= keep) {
             keep -= bytes;
             return false;

@@ -1,0 +1,15 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform sampler2D depth_in;
+layout(binding = 1, r32f) uniform writeonly image2D depth_out;
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(pixel, imageSize(depth_out)))) {
+        return;
+    }
+    imageStore(depth_out, pixel, texelFetch(depth_in, pixel, 0));
+}

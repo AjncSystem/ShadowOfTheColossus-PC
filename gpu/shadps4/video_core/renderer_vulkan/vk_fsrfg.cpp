@@ -307,16 +307,38 @@ void Init(const Instance& instance) {
     }
     const vk::PhysicalDevice gpu = instance.GetPhysicalDevice();
     const auto features = gpu.getFeatures();
+    const auto& vk11_props = instance.GetVk11Properties();
     const auto can = [&](vk::Format format, vk::FormatFeatureFlags needed) {
         return (gpu.getFormatProperties(format).optimalTilingFeatures & needed) == needed;
     };
-    const vk::FormatFeatureFlags storage =
-        vk::FormatFeatureFlagBits::eStorageImage | vk::FormatFeatureFlagBits::eSampledImage;
-    if (instance.ApiVersion() < VK_API_VERSION_1_3 || !features.shaderStorageImageWriteWithoutFormat ||
-        !can(kColorFormat, storage | vk::FormatFeatureFlagBits::eBlitDst) ||
-        !can(vk::Format::eR32Sfloat, storage) || !can(vk::Format::eR16G16Sfloat, storage)) {
-        std::fprintf(stderr, "SOTC FSR3 FG: not supported by this GPU (Vulkan 1.3 and storage "
-                             "image formats needed)\n");
+    const vk::FormatFeatureFlags sampled =
+        vk::FormatFeatureFlagBits::eSampledImage | vk::FormatFeatureFlagBits::eTransferDst;
+    const vk::FormatFeatureFlags storage = sampled | vk::FormatFeatureFlagBits::eStorageImage |
+                                           vk::FormatFeatureFlagBits::eTransferSrc;
+    const vk::FormatFeatureFlags color_storage =
+        storage | vk::FormatFeatureFlagBits::eColorAttachment;
+    const auto required_subgroups =
+        vk::SubgroupFeatureFlagBits::eBasic | vk::SubgroupFeatureFlagBits::eVote |
+        vk::SubgroupFeatureFlagBits::eArithmetic | vk::SubgroupFeatureFlagBits::eBallot |
+        vk::SubgroupFeatureFlagBits::eShuffle | vk::SubgroupFeatureFlagBits::eQuad;
+    const bool subgroups_ok =
+        bool(vk11_props.subgroupSupportedStages & vk::ShaderStageFlagBits::eCompute) &&
+        (vk11_props.subgroupSupportedOperations & required_subgroups) == required_subgroups;
+    const bool formats_ok =
+        can(kColorFormat, storage | vk::FormatFeatureFlagBits::eBlitDst) &&
+        can(vk::Format::eR8Unorm, color_storage) && can(vk::Format::eR8G8Unorm, storage) &&
+        can(vk::Format::eR16Snorm, sampled) && can(vk::Format::eR16Sfloat, color_storage) &&
+        can(vk::Format::eR16G16Sfloat, color_storage) &&
+        can(vk::Format::eR16G16B16A16Sfloat, color_storage) &&
+        can(vk::Format::eR16G16Sint, storage) && can(vk::Format::eR32Sfloat, color_storage) &&
+        can(vk::Format::eR32G32Sfloat, sampled) &&
+        can(vk::Format::eR32G32B32A32Sfloat, storage) &&
+        can(vk::Format::eR32Uint, storage | vk::FormatFeatureFlagBits::eStorageImageAtomic);
+    if (instance.ApiVersion() < VK_API_VERSION_1_3 ||
+        !instance.IsTimelineSemaphoreSupported() ||
+        !features.shaderStorageImageWriteWithoutFormat || !subgroups_ok || !formats_ok) {
+        std::fprintf(stderr, "SOTC FSR3 FG: not supported by this GPU (Vulkan 1.3, timeline "
+                             "semaphores, compute subgroups and storage image formats needed)\n");
         return;
     }
     const vk::Device device = instance.GetDevice();

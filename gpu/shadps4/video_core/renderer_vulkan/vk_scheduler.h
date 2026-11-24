@@ -59,18 +59,25 @@ static_assert(std::has_unique_object_representations_v<RenderState>);
 struct SubmitInfo {
     std::array<vk::Semaphore, 4> wait_semas;
     std::array<u64, 4> wait_ticks;
+    // sotc: default stage masks per slot preserve legacy behavior; callers can pass an explicit
+    // stage when attaching a compute timeline wait (e.g. async FSR) into any slot;
+    // SOTC_CULL_QUEUE passes all commands via AddWaitAll.
+    std::array<vk::PipelineStageFlags, 4> wait_stages{
+        vk::PipelineStageFlagBits::eAllCommands,
+        vk::PipelineStageFlagBits::eColorAttachmentOutput,
+        vk::PipelineStageFlagBits::eAllCommands,
+        vk::PipelineStageFlagBits::eAllCommands,
+    };
     std::array<vk::Semaphore, 4> signal_semas;
     std::array<u64, 4> signal_ticks;
     vk::Fence fence;
     u32 num_wait_semas;
     u32 num_signal_semas;
-    /// sotc: the stage each wait blocks (by default the first two as before: all commands, then
-    /// color attachment output). SOTC_CULL_QUEUE passes all commands for its own waits.
-    std::array<vk::PipelineStageFlags, 4> wait_stages{
-        vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eColorAttachmentOutput,
-        vk::PipelineStageFlagBits::eAllCommands, vk::PipelineStageFlagBits::eAllCommands};
 
-    void AddWait(vk::Semaphore semaphore, u64 tick = 1) {
+    void AddWait(vk::Semaphore semaphore, u64 tick = 1, vk::PipelineStageFlags stage = {}) {
+        if (stage) {
+            wait_stages[num_wait_semas] = stage;
+        }
         wait_semas[num_wait_semas] = semaphore;
         wait_ticks[num_wait_semas++] = tick;
     }
@@ -184,11 +191,57 @@ struct DynamicState {
     void Invalidate() {
         std::memset(&dirty_state, 0xFF, sizeof(dirty_state));
         ++invalidations;
+        bound_gfx_pipeline = VK_NULL_HANDLE;
+        bound_index_buffer = VK_NULL_HANDLE;
+        bound_index_offset = 0;
+        bound_vertex_buffer_count = ~0u;
+    }
+
+    void BindGraphicsPipeline(vk::CommandBuffer cmdbuf, vk::Pipeline pipeline, bool dedup) {
+        if (!dedup || bound_gfx_pipeline != pipeline) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+            bound_gfx_pipeline = pipeline;
+        }
+    }
+
+    void BindIndexBuffer(vk::CommandBuffer cmdbuf, vk::Buffer buffer, vk::DeviceSize offset,
+                         vk::IndexType type, bool dedup) {
+        if (!dedup || bound_index_buffer != buffer || bound_index_offset != offset ||
+            bound_index_type != type) {
+            cmdbuf.bindIndexBuffer(buffer, offset, type);
+            bound_index_buffer = buffer;
+            bound_index_offset = offset;
+            bound_index_type = type;
+        }
+    }
+
+    void BindVertexBuffers(vk::CommandBuffer cmdbuf, u32 count, const vk::Buffer* buffers,
+                           const vk::DeviceSize* offsets, bool dedup) {
+        if (dedup && count <= bound_vertex_buffers.size() && bound_vertex_buffer_count == count &&
+            std::memcmp(bound_vertex_buffers.data(), buffers, count * sizeof(vk::Buffer)) == 0 &&
+            std::memcmp(bound_vertex_offsets.data(), offsets, count * sizeof(vk::DeviceSize)) == 0) {
+            return;
+        }
+        cmdbuf.bindVertexBuffers(0, count, buffers, offsets);
+        if (count <= bound_vertex_buffers.size()) {
+            bound_vertex_buffer_count = count;
+            std::memcpy(bound_vertex_buffers.data(), buffers, count * sizeof(vk::Buffer));
+            std::memcpy(bound_vertex_offsets.data(), offsets, count * sizeof(vk::DeviceSize));
+        } else {
+            bound_vertex_buffer_count = ~0u;
+        }
     }
 
     /// sotc: how many times the state was invalidated (a new command buffer, or a pass that bound
     /// its own pipeline): memos of per-command-buffer state (vertex input) drop with it.
     u32 invalidations{};
+    vk::Pipeline bound_gfx_pipeline{};
+    vk::Buffer bound_index_buffer{};
+    vk::DeviceSize bound_index_offset{};
+    vk::IndexType bound_index_type{};
+    u32 bound_vertex_buffer_count{~0u};
+    std::array<vk::Buffer, 32> bound_vertex_buffers{};
+    std::array<vk::DeviceSize, 32> bound_vertex_offsets{};
 
     void SetViewports(const Viewports& viewports_) {
         if (!std::ranges::equal(viewports, viewports_)) {
@@ -382,6 +435,13 @@ public:
     /// (the presenter starts it on the draw scheduler; the FLIPGAP detector prints it).
     void StartTickWatch();
 
+    // Opt-in GPU timestamps for a subset of frames. Results are read after the submit timeline
+    // advances, so profiling never waits for an incomplete query.
+    void StartGpuTiming();
+    void MarkGpuFrameEnd();
+    u32 BeginGpuSpan(vk::CommandBuffer cmdbuf, const char* label);
+    void EndGpuSpan(vk::CommandBuffer cmdbuf, u32 query);
+
     /// Waits until the recording thread has put the submit of tick on the queue. Another
     /// thread that queues work waiting for tick on the same queue must call this first: a wait
     /// queued before its signal blocks the queue for good. kick: the recording thread only.
@@ -411,6 +471,17 @@ public:
 
     /// Submits the command buffer from BeginAhead after all submitted work and waits for it.
     void SubmitAheadAndWait();
+
+    /// sotc: non-blocking ahead copy for BeginAsyncReadback (`SOTC_RB_ASYNC_AHEAD`): submits a
+    /// standalone copy command buffer on the graphics queue (via the recorder when active) without
+    /// breaking the current graphics command buffer or render pass, and returns its timeline seq.
+    struct AsyncAheadCopy {
+        vk::Buffer src{};
+        vk::Buffer dst{};
+        std::vector<vk::BufferCopy> regions;
+    };
+    u64 EnqueueAsyncAhead(std::vector<AsyncAheadCopy> copies);
+    void WaitAsyncAhead(u64 seq);
 
     /// Attempts to execute operations whose tick the GPU has caught up with.
     void PopPendingOperations();
@@ -499,6 +570,7 @@ public:
     /// stream: on the recording thread when there is one (func may wait there without holding
     /// up the command processor), otherwise right away.
     void RecordDeferred(Common::UniqueFunction<void, vk::CommandBuffer>&& func);
+    void RunAfterSubmit(Common::UniqueFunction<void>&& func);
 
     /// sotc: true when Vulkan commands are recorded on a thread of their own.
     [[nodiscard]] bool HasRecordThread() const noexcept {
@@ -535,14 +607,19 @@ public:
         pending_ops.emplace(std::move(func), tick);
     }
 
+    /// Defers an operation until the given GPU tick has completed.
+    void DeferPriorityOperationAt(u64 tick, Common::UniqueFunction<void>&& func) {
+        {
+            std::unique_lock lk(priority_pending_ops_mutex);
+            priority_pending_ops.emplace(std::move(func), tick);
+        }
+        priority_pending_ops_cv.notify_one();
+    }
+
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Runs as soon as possible in another thread.
     void DeferPriorityOperation(Common::UniqueFunction<void>&& func) {
-        {
-            std::unique_lock lk(priority_pending_ops_mutex);
-            priority_pending_ops.emplace(std::move(func), CurrentTick());
-        }
-        priority_pending_ops_cv.notify_one();
+        DeferPriorityOperationAt(CurrentTick(), std::move(func));
     }
 
     /// sotc: SOTC_VIS_DIRECT_ORDER: as DeferPriorityOperation, but runs once the GPU reached tick
@@ -561,9 +638,12 @@ private:
     void EndSession();
 
     void SubmitExecution(SubmitInfo& info);
+    void CollectGpuTiming();
+    void WriteGpuTimestamp(vk::CommandBuffer cmdbuf, u32 query, bool begin);
 
     /// Recording thread: a real command buffer for the fake handle the producer uses.
     void BeginRecorded(vk::CommandBuffer fake);
+    void ExecuteAsyncAhead(u64 seq, const std::vector<AsyncAheadCopy>& copies);
 
 
     void PriorityPendingOpsThread(std::stop_token stoken);
@@ -585,6 +665,8 @@ private:
     struct Session {
         vk::CommandBuffer upload{};
         vk::CommandBuffer primary{};
+        u32 upload_query = ~0u;
+        u32 primary_query = ~0u;
     };
     std::vector<Session> sessions;
     std::condition_variable_any event_cv;
@@ -609,12 +691,22 @@ private:
     vk::UniqueFence ahead_fence;
     u64 ahead_sequence{};
     bool ahead_unfinished{};
+    static constexpr u32 NumAsyncAheadCmds = 32;
+    vk::UniqueCommandPool async_ahead_pool;
+    std::array<vk::CommandBuffer, NumAsyncAheadCmds> async_ahead_cmdbufs{};
+    std::array<u64, NumAsyncAheadCmds> async_ahead_cmdbuf_seqs{};
+    vk::UniqueSemaphore async_ahead_sem;
+    std::atomic<u64> async_ahead_seq{0};
+    std::atomic<u64> async_ahead_submitted{0};
     tracy::VkCtxScope* profiler_scope{};
     /// Newest tick the recording thread has put on the queue.
     std::atomic<u64> recorded_submit_tick{0};
     /// sotc: SOTC_TICKWATCH (StartTickWatch); the thread uses work_semaphore, declared above.
     bool tickwatch{};
     std::jthread tickwatch_thread;
+    struct GpuTiming;
+    std::unique_ptr<GpuTiming> gpu_timing;
+    u32 ahead_query = ~0u;
     /// Last member: stops (after running everything queued) before the rest is destroyed.
     std::unique_ptr<CommandRecorder> recorder;
 };

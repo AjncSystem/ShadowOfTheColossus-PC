@@ -505,6 +505,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
       texture_cache{rasterizer->GetTextureCache()} {
     // sotc: SOTC_TICKWATCH samples the draw scheduler's timeline (FLIPGAP diagnosis).
     draw_scheduler.StartTickWatch();
+    draw_scheduler.StartGpuTiming();
     const u32 num_images = swapchain.GetImageCount();
     const vk::Device device = instance.GetDevice();
 
@@ -532,6 +533,7 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
         static_cast<float>(EmulatorSettings.GetRcasAttenuation() / 1000.f);
 
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
+    fsr_pass_present.Create(device, instance.GetAllocator(), num_images);
     fsr_pass_hudless.Create(device, instance.GetAllocator(), num_images);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
     if (swapchain.GetHDR() && EmulatorSettings.IsSdrToHdr()) {
@@ -745,6 +747,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);
+    texture_cache.GetImage(image_id).usage.vo_surface = 1u;
 
     Frame* frame = GetRenderFrame();
 
@@ -834,12 +837,22 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         runtime.DownloadImage(&image, &readback.buffer, std::span{&copy_region, 1});
     }
 
+    if (pending_screenshot) {
+        draw_scheduler.DeferPriorityOperation(
+            [deferred_screenshot = std::move(pending_screenshot)]() {
+                SavePendingScreenshot(deferred_screenshot.value());
+            });
+    }
+
     // Continue with host-side passes that draw the displayed (scaled) frame.
+
+    // sotc: consume HUD-less before Upscale so its layout transition flushes with draw_scheduler.
+    const vk::ImageView hudless_view = rasterizer->TakeHudless(cpu_address, view_info.format);
 
     // sotc: DLSS super resolution (SOTC_UPSCALER=dlss): the game's scene before its UI, upscaled
     // to the frame's size; the post process pass puts the UI layer back over it. Frames without
     // that scene (menus, loading screens) are presented as before.
-    Dlssg::SetHdr(pp_settings.hdr != 0);
+    Dlssg::SetHdr(pp_settings.hdr == 1);
     auto upscaled = Dlssg::Upscale(frame->id, draw_scheduler, texture_cache, runtime,
                                    frame->width, frame->height);
     // sotc: a buffer flipped again right after itself (PS4 Pro mode at the 30 FPS cap flips each
@@ -852,15 +865,26 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         return !v || v[0] != '0';
     }();
     static Dlssg::Upscaled dlss_last{};
+    static std::array<float, 4> dlss_last_vignette{};
+    static bool dlss_last_has_vignette = false;
     static VAddr dlss_last_address = 0;
+    std::array<float, 4> frame_vignette{};
+    bool has_frame_vignette = Dlssg::TakeVignette(frame_vignette.data());
     // sotc: once per DLSS picture: a buffer flipped again and again with no new DLSS output
     // (inputs refused, super resolution off) showed the same picture for good (frozen screen in
     // PS4 Pro Cinematic mode, 2 Nov).
     if (!upscaled.scene && dlss_repeat && dlss_last.scene && cpu_address == dlss_last_address) {
+        Dlssg::WaitFsrComplete(dlss_last.async_fsr_tick);
+        dlss_last.async_fsr_tick = 0;
         upscaled = dlss_last;
-        dlss_last = Dlssg::Upscaled{};
+        if (!has_frame_vignette && dlss_last_has_vignette) {
+            frame_vignette = dlss_last_vignette;
+            has_frame_vignette = true;
+        }
     } else {
-        dlss_last = upscaled.scene && !upscaled.scene_low ? upscaled : Dlssg::Upscaled{};
+        dlss_last = upscaled.scene ? upscaled : Dlssg::Upscaled{};
+        dlss_last_vignette = has_frame_vignette ? frame_vignette : std::array<float, 4>{};
+        dlss_last_has_vignette = has_frame_vignette;
     }
     dlss_last_address = cpu_address;
     if (Dlssg::SuperResolutionAvailable() && Dlssg::CompareMode()) {
@@ -884,6 +908,27 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         static const float sharpness = env("SOTC_DLSS_SHARPEN", 0.0f);
         static const float ui_sharpen = std::max(env("SOTC_DLSS_UI_SHARPEN", 3.0f), 0.0f);
         static const float sky_sharpen = std::max(env("SOTC_DLSS_SKY_SHARPEN", 2.0f), 0.0f);
+        pp_settings.srgb_input = 0;
+        pp_settings.ui = 1;
+        pp_settings.vignette = has_frame_vignette ? frame_vignette : std::array<float, 4>{};
+        pp_settings.ui_sharpen = upscaled.ui_full ? 0.0f : ui_sharpen; // sotc: drawn at this size
+        pp_settings.hdr_curve = Dlssg::HdrCurve();
+        pp_settings.sky_sharpen = sky_sharpen;
+
+        if (upscaled.async_fsr_tick != 0 && !upscaled.scene_low &&
+            (!upscaled.scene_width ||
+             (upscaled.scene_width == frame->width && upscaled.scene_height == frame->height))) {
+            frame->async_fsr_tick = upscaled.async_fsr_tick;
+            frame->async_upscaled = upscaled;
+            frame->async_sharpness = sharpness;
+            frame->async_pp_settings = pp_settings;
+            frame->async_hudless_view = hudless_view;
+            frame->ready_semaphore = draw_scheduler.GetWorkSemaphore()->Handle();
+            frame->ready_tick = draw_scheduler.CurrentTick() - 1;
+            Dlssg::FrameSubmitted(frame->id);
+            return frame;
+        }
+
         vk::ImageView scene = upscaled.scene;
         vk::Extent2D scene_size{frame->width, frame->height};
         if (upscaled.scene_low) {
@@ -907,14 +952,6 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         } else if (sharpness >= 0.0f) {
             scene = fsr_pass.Sharpen(cmdbuf, scene, {frame->width, frame->height}, sharpness);
         }
-        pp_settings.srgb_input = 0;
-        pp_settings.ui = 1;
-        if (!Dlssg::Vignette(pp_settings.vignette.data())) {
-            pp_settings.vignette = {};
-        }
-        pp_settings.ui_sharpen = upscaled.ui_full ? 0.0f : ui_sharpen; // sotc: drawn at this size
-        pp_settings.hdr_curve = Dlssg::HdrCurve();
-        pp_settings.sky_sharpen = sky_sharpen;
         pp_pass.Render(cmdbuf, scene, scene_size, *frame, pp_settings, upscaled.ui, upscaled.sky);
         upscaled_scene = upscaled.scene_low ? vk::ImageView{} : scene;
     } else {
@@ -942,7 +979,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         pp_settings.srgb_input =
             attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
         pp_settings.ui = 0;
-        pp_settings.vignette = {};
+        pp_settings.vignette =
+            (Dlssg::SuperResolutionUpscaling() && has_frame_vignette) ? frame_vignette
+                                                                      : std::array<float, 4>{};
         pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
     }
 
@@ -952,7 +991,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // HUD interpolated with FSR 1 on (letters shook, 27 Oct). With DLSS super resolution the DLSS
     // output is the frame without its HUD (the UI layer is only put over it here), so it is used
     // instead.
-    if (const vk::ImageView hudless_view = rasterizer->TakeHudless(cpu_address, view_info.format)) {
+    if (hudless_view) {
         Frame& hudless = hudless_frames[frame->id];
         if (hudless.width != frame->width || hudless.height != frame->height ||
             hudless.is_hdr != frame->is_hdr || !hudless.image) {
@@ -1015,18 +1054,11 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         }
     }
 
-
-    if (pending_screenshot) {
-        draw_scheduler.DeferPriorityOperation(
-            [deferred_screenshot = std::move(pending_screenshot)]() {
-                SavePendingScreenshot(deferred_screenshot.value());
-            });
-    }
-
     // Flush frame creation commands.
     frame->ready_semaphore = draw_scheduler.GetWorkSemaphore()->Handle();
     frame->ready_tick = draw_scheduler.CurrentTick();
     SubmitInfo info{};
+    draw_scheduler.MarkGpuFrameEnd();
     draw_scheduler.Flush(info);
     Dlssg::FrameSubmitted(frame->id);
     return frame;
@@ -1123,13 +1155,73 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         swapchain.Recreate(window.GetWidth(), window.GetHeight());
     }
 
+    u64 pending_fsr_tick = 0;
+    if (!is_reusing_frame && frame->async_fsr_tick != 0) {
+        static const bool gpu_wait = [] {
+            const char* v = std::getenv("SOTC_FSR_ASYNC_GPU_WAIT");
+            return !v || v[0] != '0';
+        }();
+        if (gpu_wait && Dlssg::FsrSemaphore()) {
+            pending_fsr_tick = frame->async_fsr_tick;
+        } else {
+            Dlssg::WaitFsrComplete(frame->async_fsr_tick);
+        }
+        frame->async_fsr_tick = 0;
+
+        auto& scheduler = present_scheduler;
+        const auto p_cmdbuf = scheduler.CommandBuffer();
+        vk::ImageView scene = frame->async_upscaled.scene;
+        if (frame->async_sharpness >= 0.0f) {
+            scene = fsr_pass_present.Sharpen(p_cmdbuf, scene, {frame->width, frame->height},
+                                             frame->async_sharpness);
+        }
+        pp_pass.Render(p_cmdbuf, scene, {frame->width, frame->height}, *frame,
+                       frame->async_pp_settings, frame->async_upscaled.ui,
+                       frame->async_upscaled.sky);
+        if (frame->async_hudless_view) {
+            Frame& hudless = hudless_frames[frame->id];
+            if (hudless.width != frame->width || hudless.height != frame->height ||
+                hudless.is_hdr != frame->is_hdr || !hudless.image) {
+                RecreateFrame(&hudless, frame->width, frame->height);
+            }
+            const vk::ImageMemoryBarrier2 hudless_barrier{
+                .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentRead,
+                .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+                .oldLayout = vk::ImageLayout::eUndefined,
+                .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+                .image = hudless.image,
+                .subresourceRange{
+                    .aspectMask = vk::ImageAspectFlagBits::eColor,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = VK_REMAINING_ARRAY_LAYERS,
+                },
+            };
+            p_cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+                .imageMemoryBarrierCount = 1,
+                .pImageMemoryBarriers = &hudless_barrier,
+            });
+            auto scene_only = frame->async_pp_settings;
+            scene_only.ui = 2; // the vignette, without the UI layer
+            pp_pass.Render(p_cmdbuf, scene, {frame->width, frame->height}, hudless, scene_only,
+                           frame->async_upscaled.ui, frame->async_upscaled.sky);
+            frame->hudless = &hudless;
+            Dlssg::NoteHudless(frame->id, hudless.image, hudless.image_view,
+                               swapchain.GetSurfaceFormat().format, hudless.width, hudless.height);
+        }
+    }
+
     // sotc: FSR 3 frame generation: the frame between the last game frame and this one first,
     // this one half a frame later.
     if (is_game_frame && !is_reusing_frame) {
         FrameGen::TestTick();
         SotcFpsCap::TestTick();
         FsrFg::NoteGameFrame();
-        if (FrameGen::Current() == FrameGen::Mode::Fsr && PresentGenerated(frame)) {
+        if (FrameGen::Current() == FrameGen::Mode::Fsr &&
+            PresentGenerated(frame, pending_fsr_tick)) {
             // SOTC_FSRFG_ONLY_GENERATED=1: the game frames are not shown (checking the others).
             static const bool only_generated = [] {
                 const char* v = std::getenv("SOTC_FSRFG_ONLY_GENERATED");
@@ -1139,6 +1231,12 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                 Check(instance.GetDevice().resetFences(frame->present_done));
                 SubmitInfo info{};
                 info.AddWait(frame->ready_semaphore, frame->ready_tick);
+                if (pending_fsr_tick != 0 && Dlssg::FsrSemaphore()) {
+                    Dlssg::WaitFsrSubmitted(pending_fsr_tick);
+                    info.AddWait(Dlssg::FsrSemaphore(), pending_fsr_tick,
+                                 vk::PipelineStageFlagBits::eAllCommands);
+                    pending_fsr_tick = 0;
+                }
                 info.AddSignal(frame->present_done);
                 present_scheduler.Flush(info);
                 free_frame();
@@ -1154,6 +1252,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         if (!swapchain.AcquireNextImage()) {
             // User resizes the window too fast and GPU can't keep up. Skip this frame.
             LOG_WARNING(Render_Vulkan, "Skipping frame!");
+            if (pending_fsr_tick != 0) {
+                Dlssg::WaitFsrComplete(pending_fsr_tick);
+            }
             free_frame();
             return;
         }
@@ -1417,6 +1518,12 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     }
     info.AddWait(swapchain.GetImageAcquiredSemaphore());
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
+    if (pending_fsr_tick != 0 && Dlssg::FsrSemaphore()) {
+        Dlssg::WaitFsrSubmitted(pending_fsr_tick);
+        info.AddWait(Dlssg::FsrSemaphore(), pending_fsr_tick,
+                     vk::PipelineStageFlagBits::eAllCommands);
+        pending_fsr_tick = 0;
+    }
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
     scheduler.Flush(info);
@@ -1521,7 +1628,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     }
 }
 
-bool Presenter::PresentGenerated(Frame* frame) {
+bool Presenter::PresentGenerated(Frame* frame, u64& pending_fsr_tick) {
     auto& scheduler = present_scheduler;
     const auto cmdbuf = scheduler.CommandBuffer();
     const vk::Image generated =
@@ -1534,6 +1641,12 @@ bool Presenter::PresentGenerated(Frame* frame) {
     }
     SubmitInfo info{};
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
+    if (pending_fsr_tick != 0 && Dlssg::FsrSemaphore()) {
+        Dlssg::WaitFsrSubmitted(pending_fsr_tick);
+        info.AddWait(Dlssg::FsrSemaphore(), pending_fsr_tick,
+                     vk::PipelineStageFlagBits::eAllCommands);
+        pending_fsr_tick = 0;
+    }
     const auto submit = [&] {
         const u64 tick = scheduler.CurrentTick();
         scheduler.Flush(info);
@@ -1718,6 +1831,9 @@ Frame* Presenter::GetRenderFrame() {
         RecreateFrame(frame, expected_frame_width, expected_frame_height);
     }
     frame->hudless = nullptr;
+    frame->async_fsr_tick = 0;
+    frame->async_upscaled = {};
+    frame->async_hudless_view = vk::ImageView{};
 
     return frame;
 }

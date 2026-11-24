@@ -554,6 +554,7 @@ private:
     // iterations before blocking (clamped to [0, 65536]). The defaults (512, 4096) are the
     // behaviour from before the knobs; the backing array is sized for the maximum capacity.
     static constexpr u64 BackRingMin = 512;
+    static constexpr u64 BackRingDefault = 4096;
     static constexpr u64 BackRingMax = 8192;
     static constexpr u32 BackSpinDefault = 4096;
     static constexpr u32 BackSpinMax = 65536;
@@ -640,8 +641,8 @@ private:
     bool back_threaded{};
     bool back_strict{};
     std::thread::id back_id{};
-    u64 back_ring_capacity{BackRingMin}; ///< sotc: SOTC_BACK_RING (power of two)
-    u64 back_ring_mask{BackRingMin - 1}; ///< sotc: back_ring_capacity - 1, the wrap-around mask
+    u64 back_ring_capacity{BackRingDefault}; ///< sotc: SOTC_BACK_RING (power of two)
+    u64 back_ring_mask{BackRingDefault - 1}; ///< sotc: back_ring_capacity - 1, the wrap-around mask
     u32 back_spin{BackSpinDefault};      ///< sotc: SOTC_BACK_SPIN, iterations before blocking
     std::vector<BackOp> back_ring;       ///< sotc: sized to the capacity read at startup
     std::atomic<u64> back_head{0};

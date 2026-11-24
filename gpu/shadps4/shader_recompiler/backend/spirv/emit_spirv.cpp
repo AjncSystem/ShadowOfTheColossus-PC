@@ -535,6 +535,17 @@ void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
         if (info.has_discard) {
             ctx.AddCapability(spv::Capability::DemoteToHelperInvocation);
         }
+        static const bool quad_ctrl = [] {
+            const char* v = std::getenv("SOTC_QUAD_CTRL");
+            return !v || v[0] != '0';
+        }();
+        if (quad_ctrl && ctx.profile.supports_shader_quad_control && info.uses_group_quad) {
+            ctx.AddExtension("SPV_KHR_maximal_reconvergence");
+            ctx.AddExtension("SPV_KHR_quad_control");
+            ctx.AddCapability(spv::Capability::QuadControlKHR);
+            ctx.AddExecutionMode(main, spv::ExecutionMode::MaximallyReconvergesKHR);
+            ctx.AddExecutionMode(main, spv::ExecutionMode::QuadDerivativesKHR);
+        }
         if (info.stores.GetAny(IR::Attribute::Depth)) {
             ctx.AddExecutionMode(main, spv::ExecutionMode::DepthReplacing);
         }

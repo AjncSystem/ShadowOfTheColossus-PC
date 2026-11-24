@@ -520,7 +520,9 @@ public:
 
     /// Returns the maximum number of samplers that can be allocated at once.
     u32 GetMaxSamplerAllocationCount() const {
-        if (driver_id == vk::DriverId::eMesaKosmickrisp) {
+        // sotc: VK_DRIVER_ID_MESA_KOSMICKRISP (28) by value: headers before 1.4.329 (Debian 13's,
+        // the Linux AppImage build) do not name it.
+        if (driver_id == static_cast<vk::DriverId>(28)) {
             // FIXME: KosmicKrisp has an internal 1024 unique sampler limit before
             // vkCreateSampler starts returning VK_ERROR_OUT_OF_HOST_MEMORY. Work
             // around this for now by reducing the value to 1024.

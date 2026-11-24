@@ -34,8 +34,9 @@ class HdrPictureTests(unittest.TestCase):
     def test_old_ui_brightness_in_nits(self):
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / 'launcher_settings.json'
-            saved = (launcher.CONFIG_FILE, launcher.LEGACY_CONFIG_FILE)
+            saved = (launcher.CONFIG_FILE, launcher.LEGACY_CONFIG_FILE, launcher._SETTINGS_FILE)
             launcher.CONFIG_FILE, launcher.LEGACY_CONFIG_FILE = config, Path(tmp) / 'none.json'
+            launcher._SETTINGS_FILE = config  # v0.77 (#467): the settings file is chosen once and kept
             try:
                 config.write_text(json.dumps({'hdr_ui': 160}), encoding='utf-8')
                 self.assertEqual(launcher.load_settings()['hdr_ui_nits'], '480')
@@ -44,7 +45,7 @@ class HdrPictureTests(unittest.TestCase):
                 config.write_text(json.dumps({'hdr_white': 200}), encoding='utf-8')
                 self.assertEqual(launcher.load_settings()['hdr_ui_nits'], '0')
             finally:
-                launcher.CONFIG_FILE, launcher.LEGACY_CONFIG_FILE = saved
+                launcher.CONFIG_FILE, launcher.LEGACY_CONFIG_FILE, launcher._SETTINGS_FILE = saved
 
     def test_level_text_as_the_menu_writes_it(self):
         self.assertEqual([launcher.level_text(v) for v in (200, 200.0, -0.5, 0)], ['200', '200', '-0.5', '0'])

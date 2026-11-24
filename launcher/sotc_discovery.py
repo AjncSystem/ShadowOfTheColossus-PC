@@ -207,9 +207,16 @@ def library_games(folders, depth=3):
     return sorted(games, key=lambda g: (g['id'] not in GAME_IDS, g['title'].lower()))
 
 
+# Linux: where other disks are mounted. The root itself is not walked (/proc, /sys, /usr).
+MOUNT_ROOTS = ('/media', '/run/media', '/mnt')
+
+
 def local_drives():
-    """Fixed drive roots (no network, CD or removable media: too slow to walk)."""
+    """Fixed drive roots (no network, CD or removable media: too slow to walk). On Linux, the
+    folders other disks are mounted in."""
     roots = []
+    if os.name != 'nt':
+        return [root for root in MOUNT_ROOTS if os.path.isdir(root)]
     try:
         mask = ctypes.windll.kernel32.GetLogicalDrives()
         get_type = ctypes.windll.kernel32.GetDriveTypeW
@@ -232,8 +239,11 @@ def scan(seconds=25.0, depth=5, extra_roots=()):
     deadline = time.monotonic() + seconds
     home = Path.home()
     appdata = Path(os.environ.get('APPDATA', home))
-    likely = [*extra_roots, appdata / 'shadPS4', home / 'Desktop', home / 'Downloads', home / 'Documents',
-              home / 'Games', home]
+    # Linux: shadPS4's data folder and its Flatpak's (hidden folders, skipped from the home walk).
+    xdg_data = Path(os.environ.get('XDG_DATA_HOME') or home / '.local' / 'share')
+    likely = [*extra_roots, appdata / 'shadPS4', xdg_data / 'shadPS4',
+              home / '.var' / 'app' / 'net.shadps4.shadPS4' / 'data' / 'shadPS4',
+              home / 'Desktop', home / 'Downloads', home / 'Documents', home / 'Games', home]
     roots = [str(p) for p in likely if Path(p).is_dir()] + local_drives()
 
     def visit(path, level):

@@ -666,9 +666,9 @@ void BuildItems() {
         .hotkey = "F11";
     {
         std::vector<MenuChoice> outputs;
-        for (const char* size : {"1280x720", "1920x1080", "2560x1440", "3840x2160", "1920x1200",
-                                 "2560x1600", "2560x1080", "3440x1440", "3840x1600", "3840x1080",
-                                 "5120x1440"}) {
+        for (const char* size : {"1280x720", "1600x900", "1920x1080", "2560x1440", "3840x2160",
+                                 "1920x1200", "2560x1600", "2560x1080", "3440x1440", "3840x1600",
+                                 "3840x1080", "5120x1440"}) {
             std::string label = size;
             label.replace(label.find('x'), 1, " × ");
             const std::string sz = size;

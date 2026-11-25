@@ -156,6 +156,7 @@ fiz no branch `sotc` ficam de fora quando a comunidade já as tem (e testou em h
 |---|---|---|---|
 | 9 | Processador de comandos (meta 40–60 FPS estáveis) | 🔧 | #59/#83/#103 integradas (+10% no demo); falta 0.5 (#69). |
 | 10 | FPS baixo em PCs fortes (#129), templo (#14) | ⏳ | |
+| T53 | **Threads da GPU em núcleos próprios em CPUs com SMT** (#464, SotC-Work; issues #469/#470) | ✅ | 25/11, PR #464 juntado (`432ec822`), reaplicado sobre o main com o conflito do `probe.c` resolvido: `SOTC_PIN` (padrão ligado só em CPUs com SMT e 6+ núcleos, desligado nas híbridas como o i9) põe draw / command processor / recorder em núcleos físicos próprios (+6–11% no 5600X do autor; no i9 do usuário sem ganho medido); proteção do alocador `0x499cc` dentro de `null_object_resume` (log `SOTC FIX null object` conta cada vez); falha ao criar thread não derruba o jogo. Pendente: medição do B0D0PAD (i5-12400F) numa build com o PR. |
 
 ## Fase 5 — Extras
 

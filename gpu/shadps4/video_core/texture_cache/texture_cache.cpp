@@ -301,12 +301,19 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool 
         const char* v = std::getenv("SOTC_DMA_OVERLAP");
         return !v || v[0] != '0';
     }();
+    // sotc: a reused descriptor bind (SOTC_FAST_BIND) skips BindTextures, so it would not refresh
+    // an image marked here: the epoch moves after the marks when any image was marked.
+    bool marked = false;
     if (any_overlap && dma_overlap) {
         ForEachImageInRegion(address, max_size, [&](ImageId, Image& image) {
             if (image.Overlaps(address, max_size)) {
                 image.flags |= ImageFlagBits::GpuDirty;
+                marked = true;
             }
         });
+        if (marked) {
+            SotcStats::mem_epoch.fetch_add(1, std::memory_order_release);
+        }
         return;
     }
     ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
@@ -320,7 +327,11 @@ void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool 
         }
         // Ensure image is reuploaded when accessed again.
         image.flags |= ImageFlagBits::GpuDirty;
+        marked = true;
     });
+    if (marked) {
+        SotcStats::mem_epoch.fetch_add(1, std::memory_order_release);
+    }
 }
 
 void TextureCache::UnmapMemory(VAddr cpu_addr, size_t size) {

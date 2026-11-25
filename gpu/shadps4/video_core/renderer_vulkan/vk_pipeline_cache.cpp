@@ -1096,6 +1096,9 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     }
     // sotc: a pipeline the driver refused has no handle: the draws that need it are skipped.
     if (!it->second->Handle()) {
+        // sotc: the key memo must not hand the next draw the previous key's pipeline (the key
+        // was just rebuilt and KeyDirty cleared, so the memo would hit without these registers).
+        last_graphics_pipeline = nullptr;
         return nullptr;
     }
     std::memcpy(&last_graphics_key, &graphics_key, sizeof(graphics_key));

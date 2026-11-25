@@ -2381,6 +2381,9 @@ bool Rasterizer::BeginHudless(const GraphicsPipeline* pipeline, const RenderStat
     };
     cmdbuf.pipelineBarrier2(
         vk::DependencyInfo{.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_target});
+    // sotc: this pass pushes the pipeline's descriptors again with the UI slot replaced and edits
+    // image_infos in place: the next draw must not reuse the bind (SOTC_FAST_BIND).
+    fast_bind.valid = false;
     auto& ui = image_infos[hudless_ui_info];
     ui.imageView = hudless_clear.rt_view;
     ui.imageLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
@@ -3708,11 +3711,6 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     // issued merged when the scope ends, and before any upload copy (see ProtectBatchScope).
     // Off by default (SOTC_PROTECT_BATCH=1): the ranges were almost never adjacent.
 
-    set_write_index = 0;
-    set_writes.clear();
-    buffer_infos.clear();
-    image_infos.clear();
-
     bool uses_dma = false;
     const u64 pre_epoch = SotcStats::mem_epoch.load(std::memory_order_acquire);
     const u64 pre_clobbers = SotcStats::push_clobbers.load(std::memory_order_relaxed);
@@ -3837,6 +3835,16 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         fast_bind.valid = false;
         push_data = MakeUserData(liverpool->DrawRegs());
     }
+    // sotc: cleared here, after the reusable-bind check, not before it: a hit keeps the previous
+    // bind's writes (they equal this draw's: same pipeline, push data, targets and data, nothing
+    // reallocated). When a helper pass then overwrites the pushed descriptors before the draw
+    // records (push_clobbers moved during BeginRendering: SetBackingSamples, an MSAA blit), Draw /
+    // DrawIndirect drop the hit and push these writes again; cleared first, they pushed nothing
+    // and the draw ran with the helper's descriptors.
+    set_write_index = 0;
+    set_writes.clear();
+    buffer_infos.clear();
+    image_infos.clear();
     // Bind resource buffers and textures.
     Shader::Backend::Bindings binding{};
     for (const auto* stage : pipeline->GetStages()) {

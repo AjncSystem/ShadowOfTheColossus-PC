@@ -416,8 +416,12 @@ UPSCALERS = [('fsr1', ('FSR 1 (AMD, qualquer placa)', 'FSR 1 (AMD, any GPU)')),
              ('fsr4', ('AMD FSR 4.1 (RX 6000+; FSR 3.1 nas outras, experimental)',
                        'AMD FSR 4.1 (RX 6000+; FSR 3.1 on others, experimental)')),
              ('bilinear', ('Bilinear (simples)', 'Bilinear (plain)'))]
-if not IS_WINDOWS:  # AMD's SDK ships as Windows DLLs only (vk_fsr4.cpp)
-    UPSCALERS = [upscaler for upscaler in UPSCALERS if upscaler[0] != 'fsr4']
+if not IS_WINDOWS:
+    # AMD's SDK ships as Windows DLLs only; elsewhere SOTC_UPSCALER=fsr4 is FSR-Vulkan's native
+    # FSR 3.1 upscaler (vk_fsr4.cpp), on any GPU, with the same render sizes.
+    UPSCALERS = [('fsr4', ('AMD FSR 3.1 (qualquer placa, experimental)',
+                           'AMD FSR 3.1 (any GPU, experimental)')) if upscaler[0] == 'fsr4' else upscaler
+                 for upscaler in UPSCALERS]
 # Button icons in the game: the PlayStation prompts, or Xbox ones drawn for the port
 # (tools/make_button_icons.py, glyphs/xbox) put in place of the game's textures.
 BUTTON_ICONS = [('ps', ('PlayStation (do jogo)', 'PlayStation (the game\'s)')),
@@ -2429,7 +2433,8 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
     def summary(self):
         parts = [dict((k, _(*v)) for k, v in FPS_MODES).get(self.var('fps_mode').get(), '30 FPS'),
                  self.var('output_res').get().replace('x', ' × '),
-                 {'fsr1': 'FSR 1', 'dlss': 'DLSS', 'fsr4': 'FSR 4'}.get(self.var('upscaler').get(), 'bilinear')]
+                 {'fsr1': 'FSR 1', 'dlss': 'DLSS', 'fsr4': 'FSR 4' if IS_WINDOWS else 'FSR 3.1'}.get(
+                     self.var('upscaler').get(), 'bilinear')]
         framegen = self.var('framegen').get()
         if framegen != 'off':
             parts.append({'auto': _('geração de quadros', 'frame generation'), 'dlss': 'DLSS-G',

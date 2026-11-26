@@ -43,6 +43,7 @@ WORDS = {
     'mouse': 'mouse camera rato',
     'skip_logos': 'logos abertura pular intro',
     'fx_motionblur': 'motion blur borrao rastro sombra',
+    'fx_sunshadows': 'sombras sol shadows sun cascata fps cpu desempenho performance',
     'check_updates': 'atualizacao update versao',
     'page:saves': 'saves save exportar importar backup jogo salvo',
     'page:controls': 'controle teclado gamepad dualshock dualsense xbox teclas',

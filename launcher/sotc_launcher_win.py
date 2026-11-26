@@ -221,7 +221,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'readbacks': '', 'extra_env': '', 'debug_menu': False, 'debug_watch': False, 'rb_hot': True, 'skip_logos': True, 'skip_film': False, 'close_on_play': False, 'gamepad': '', 'rumble': True,
                 'output_res': '1920x1080', 'upscaler': 'fsr1', 'sharpness': '250', 'mouse': True,
                 'mouse_sens': '1.0', 'mouse_invert': False, 'neo': False, 'fx_vignette': True,
-                'fx_fog': True, 'fx_ssao': True, 'fx_motionblur': False, 'engine_cvars': '', 'perf_culling': True,
+                'fx_fog': True, 'fx_ssao': True, 'fx_motionblur': False, 'fx_sunshadows': True, 'engine_cvars': '', 'perf_culling': True,
                 'perf_record_thread': True, 'perf_dma': True, 'gpu_submit': 'auto', 'vram_use': 'normal', 'vram_profile': 'auto', 'gpu_vram_mb': 0, 'volume': '100', 'shadow_reuse': '0', 'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1', 'weed_distance': '1', 'weed_height': '1', 'grass_fade': '1', 'grass_detail': '1', 'library_dirs': [], 'keys': {},
                 'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'fg_hudless': True, 'fg_mult': '2',
                 'dlss_mode': 'quality', 'dlss_sharpen': '0', 'dlss_ui_sharpen': '3', 'dlss_sky_sharpen': '2',
@@ -400,7 +400,12 @@ EFFECTS = [('fx_vignette', ('Vinheta (cantos escurecidos)', 'Vignette (darkened 
             'r_vignetteOverrideEnable=1 r_vignetteEnable=0'),
            ('fx_fog', ('Névoa atmosférica', 'Atmospheric fog'), 'fog_enable=0'),
            ('fx_ssao', ('Oclusão ambiente (SSAO)', 'Ambient occlusion (SSAO)'), 'AO_Mode=0'),
-           ('fx_motionblur', ('Motion blur (borrão de movimento)', 'Motion blur'), 'r_motionBlurEnable=0')]
+           ('fx_motionblur', ('Motion blur (borrão de movimento)', 'Motion blur'), 'r_motionBlurEnable=0'),
+           # r_enableCascadeShadows=0 (4isaque4, #294): no sun shadows, ~28% fewer GPU commands per frame,
+           # the lever on CPU-bound PCs (+34% on a Ryzen 7 5700X, +9% on a Ryzen 5 5500 at 720p + FSR 3.1).
+           ('fx_sunshadows', ('Sombras do sol (desligar dá mais FPS em CPU fraca; o mundo fica sem as sombras)',
+                              'Sun shadows (off: more FPS on a slow CPU; the world loses its sun shadows)'),
+            'r_enableCascadeShadows=0')]
 # Common screen sizes: 16:9, 16:10, 21:9 (ultrawide) and 32:9 (super ultrawide).
 # 5120x2160 is left out: the game faults at start (memory), 3840x2160 runs.
 SCREENS = [('1600x900', '16:9, 900p'), ('1920x1080', '16:9, 1080p'), ('2560x1440', '16:9, 1440p'), ('3840x2160', '16:9, 4K'),

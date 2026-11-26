@@ -101,6 +101,12 @@ set(FFX_VK_PORTABLE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(FFX_VK_PORTABLE_BUILD_PROBE OFF CACHE BOOL "" FORCE)
 set(FFX_VK_PORTABLE_BUILD_FSR3_HOST OFF CACHE BOOL "" FORCE)
 set(FFX_VK_PORTABLE_BUILD_FSR3_VK_BACKEND OFF CACHE BOOL "" FORCE)
+if (NOT WIN32)
+    # sotc: SOTC_UPSCALER=fsr4 outside Windows (no AMD SDK DLLs there) is the module's native
+    # FSR 3.1.4 upscaler (ffx-vulkan::portable, vk_fsr4.cpp).
+    set(FFX_VK_PORTABLE_BUILD_FSR3_HOST ON CACHE BOOL "" FORCE)
+    set(FFX_VK_PORTABLE_BUILD_FSR3_VK_BACKEND ON CACHE BOOL "" FORCE)
+endif()
 set(FFX_VK_PORTABLE_BUILD_FSR3_3_1_5_SCAFFOLD ON CACHE BOOL "" FORCE)
 set(FFX_VK_PORTABLE_BUILD_FSR4_V07_VULKAN OFF CACHE BOOL "" FORCE)
 set(FFX_VK_PORTABLE_INSTALL OFF CACHE BOOL "" FORCE)
@@ -185,6 +191,14 @@ target_include_directories(bbgpu PRIVATE third_party/streamline/include)
 # optical flow, natively on Vulkan (third_party/fsr-vulkan, MIT); any GPU with Vulkan 1.3.
 # (fsr-vulkan is added once above, with the frame generation options.)
 target_link_libraries(bbgpu PRIVATE ffx-vulkan::fsr3-vk-framegeneration-3.1.6)
+if (NOT WIN32)
+    # sotc: the native FSR 3.1.4 upscaler (vk_fsr4.cpp). SDK 1.1.4 and the frame generation's SDK
+    # 2.3 have C++ types of the same names and other layouts: kept out of link-time optimization,
+    # as the module builds them for Q2RTX.
+    target_link_libraries(bbgpu PRIVATE ffx-vulkan::portable)
+    set_target_properties(ffx_vulkan_portable ffx_vulkan_fsr3_host_1_1_4
+                          ffx_vulkan_fsr3_vk_backend_1_1_4 PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
+endif()
 # The module's 3.1.6 frame generation never starts a frame on its bridge: the constant buffers
 # and descriptor sets of every dispatch are then kept until the context is destroyed (~3 MB of
 # video memory per frame, out of memory within a minute). Its source is built from a copy that

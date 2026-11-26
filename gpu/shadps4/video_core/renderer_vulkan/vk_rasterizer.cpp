@@ -3074,6 +3074,36 @@ constexpr u64 kHdrCompositeHash = 0xdfd767b6;
 constexpr u32 kHdrCurveDword = 20; // its exponent k
 constexpr u32 kVignetteDword = 51;
 
+// sotc: vignette diagnostics. A PS4 Pro + FSR 3.1 session on Linux showed a double vignette on
+// every other frame (corner luminance 141/122 alternating, the centre steady), not seen again
+// after a restart. Counted while upscaling and printed every 5 s only when something is off:
+// tonemap binds that kept their vignette, tonemap binds reused by the fast bind (no BindBuffers),
+// or another shader carrying the same vignette parameters (a second tonemap variant).
+namespace VignetteDiag {
+std::atomic<u32> tonemap{0}, stripped{0}, fast_hits{0}, other{0};
+std::atomic<u64> other_hash{0};
+u32 params[4]{};
+bool have_params = false;
+
+void Report() {
+    static std::atomic<s64> last_ms{0};
+    const s64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    s64 prev = last_ms.load(std::memory_order_relaxed);
+    if (now - prev < 5000 || !last_ms.compare_exchange_strong(prev, now)) {
+        return;
+    }
+    const u32 t = tonemap.exchange(0), s = stripped.exchange(0), h = fast_hits.exchange(0),
+              o = other.exchange(0);
+    if (prev != 0 && (t != s || h || o)) {
+        std::fprintf(stderr,
+                     "SOTC VIGNETTE: 5 s: tonemap binds %u, vignette moved after upscaling %u, "
+                     "fast-bind reuses %u, other shaders with its parameters %u (last %#llx)\n",
+                     t, s, h, o, static_cast<unsigned long long>(other_hash.load()));
+    }
+}
+} // namespace VignetteDiag
 bool Rasterizer::TaaOff() {
     static const int forced = [] { // SOTC_TAA_OFF=1/0 forces; unset follows DLSS
         const char* v = std::getenv("SOTC_TAA_OFF");
@@ -3811,6 +3841,15 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             static const bool verify = std::getenv("SOTC_FAST_BIND_VERIFY") != nullptr;
             if (!verify) {
                 fast_bind_hit = true;
+                if (Dlssg::SuperResolutionUpscaling()) {
+                    // sotc: VignetteDiag: a reused tonemap bind skips its vignette strip.
+                    for (const auto* stage : pipeline->GetStages()) {
+                        if (stage && stage->pgm_hash == kTonemapHash) {
+                            ++VignetteDiag::fast_hits;
+                            VignetteDiag::Report();
+                        }
+                    }
+                }
                 if (replay_key) {
                     if (SotcStats::kFpsLog) { // see fast_bind_eligible above
                         auto& c = SotcStats::fast_bind_hits;
@@ -4633,6 +4672,9 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     float params[4];
                     std::memcpy(params, &tonemap_flat[kVignetteDword], sizeof(params));
                     Dlssg::NoteVignette(params);
+                    std::memcpy(VignetteDiag::params, params, sizeof(params));
+                    VignetteDiag::have_params = params[3] != 0.0f;
+                    ++VignetteDiag::stripped;
                     tonemap_flat[kVignetteDword + 3] = 0; // strength 0.0f
                     flat = tonemap_flat.data();
                     static bool reported = false;
@@ -4640,6 +4682,18 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         std::fprintf(stderr,
                                      "SOTC DLSS: vignette after upscaling (%g %g %g %g)\n",
                                      params[0], params[1], params[2], params[3]);
+                    }
+                }
+                if (vignette_after && Dlssg::SuperResolutionUpscaling()) {
+                    if (stage.pgm_hash == kTonemapHash) {
+                        ++VignetteDiag::tonemap;
+                        VignetteDiag::Report();
+                    } else if (VignetteDiag::have_params &&
+                               stage.FlatBuf().size() > kVignetteDword + 3 &&
+                               std::memcmp(stage.FlatBuf().data() + kVignetteDword,
+                                           VignetteDiag::params, sizeof(VignetteDiag::params)) == 0) {
+                        ++VignetteDiag::other;
+                        VignetteDiag::other_hash.store(stage.pgm_hash, std::memory_order_relaxed);
                     }
                 }
                 const auto veg_scales = VegetationScales();

@@ -677,8 +677,15 @@ void BuildItems() {
             L("Como a imagem do jogo é ampliada para a tela. FSR 1 e Bilinear trocam na hora; DLSS e FSR 4 valem ao reiniciar o jogo.",
               "How the game's picture is scaled to the screen. FSR 1 and Bilinear switch at once; DLSS and FSR 4 apply when the game restarts."),
             Quoted({{"fsr1", L("FSR 1 (AMD, qualquer placa)", "FSR 1 (AMD, any GPU)")},
+#ifdef _WIN32
                     {"dlss", "NVIDIA DLSS"},
                     {"fsr4", "AMD FSR 4.1"},
+#else
+                    // sotc: elsewhere DLSS needs Streamline (Windows DLLs) and fsr4 is FSR-Vulkan's
+                    // native FSR 3.1 (vk_fsr4.cpp). Same entries, so the indices below hold.
+                    {"dlss", L("NVIDIA DLSS (só no Windows)", "NVIDIA DLSS (Windows only)")},
+                    {"fsr4", "AMD FSR 3.1"},
+#endif
                     {"bilinear", L("Bilinear (simples)", "Bilinear (plain)")}}),
             "\"fsr1\"");
         // FSR 1 <-> Bilinear apply at the next frame when the game did not start with DLSS / FSR 4.

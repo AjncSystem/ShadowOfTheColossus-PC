@@ -340,6 +340,7 @@ VRAM_LIMITS = {'low': ('50', '1024'), 'normal': ('60', '1536'), 'high': ('75', '
 # Play modes (Jogar tab): each one sets the settings below; changing one of them by hand afterwards
 # makes the mode Custom. Extreme's upscaler is DLSS on an NVIDIA RTX card, FSR 1 on the others.
 PLAY_MODES = [('normal', ('Normal (PS4 puro)', 'Normal (plain PS4)')),
+              ('light', ('Leve (PC modesto, 60 FPS)', 'Light (modest PC, 60 FPS)')),
               ('pro', ('Pro (PS4 Pro + qualidade)', 'Pro (PS4 Pro + quality)')),
               ('extreme', ('Extremo (tudo no máximo)', 'Extreme (everything maxed)')),
               ('custom', ('Personalizado', 'Custom'))]
@@ -349,6 +350,12 @@ _PS4_GRASS = {'grass_shadows': '2', 'grass_distance': '1', 'grass_height': '1', 
 PLAY_MODE_VALUES = {
     'normal': {'neo': False, 'fps_mode': '30', 'textures': 'high', 'af16': False, 'upscaler': 'fsr1',
                'sharpness': '250', 'vram_use': 'normal', **_PS4_GRASS},
+    # For CPU-bound PCs (the port's usual limit): the game renders at 2/3 of the output size and
+    # FSR 3.1 rebuilds it (720p -> 1080p: +9% real FPS on a Ryzen 5 5500 + GTX 1070, interleaved
+    # runs; lower sizes gain little more, #294), FSR 3 frame generation fills the rest to 60 on
+    # screen. No Pro mode: it adds GPU work.
+    'light': {'neo': False, 'fps_mode': '60', 'textures': 'high', 'af16': False, 'upscaler': 'fsr4',
+              'dlss_mode': 'quality', 'framegen': 'fsr', 'vram_use': 'normal', **_PS4_GRASS},
     'pro': {'neo': True, 'fps_mode': '30', 'textures': 'high', 'af16': True, 'vram_use': 'high',
             **_PS4_GRASS},
     'extreme': {'neo': True, 'fps_mode': '60', 'textures': 'max', 'af16': True, 'vram_use': 'max',
@@ -357,6 +364,12 @@ PLAY_MODE_VALUES = {
 PLAY_MODE_HINTS = {
     'normal': ('Como no PS4: 30 FPS, texturas altas, grama e sombras do console, sem o modo Pro.',
                "As on PS4: 30 FPS, high textures, the console's grass and shadows, no Pro mode."),
+    'light': ('Para PCs modestos: 60 FPS, o jogo desenha em 2/3 da resolução (720p para 1080p) e o AMD FSR 3.1 reconstrói a '
+              'imagem; a geração de quadros FSR 3 completa os 60 na tela. Mais FPS ainda: desligar as sombras '
+              'do sol (Ajustes > Efeitos).',
+              'For modest PCs: 60 FPS, the game renders at 2/3 of the resolution (720p for 1080p) and AMD FSR 3.1 rebuilds the image; '
+              'FSR 3 frame generation fills the 60 on screen. More FPS still: turn the sun shadows off '
+              '(Settings > Effects).'),
     'pro': ('Modo PS4 Pro a 30 FPS com texturas altas e filtro 16x; grama como no PS4.',
             'PS4 Pro mode at 30 FPS with high textures and 16x filtering; grass as on PS4.'),
     'extreme': ('Modo Pro a 60 FPS, texturas máximas, DLSS na RTX; grama como no PS4. '
@@ -416,8 +429,12 @@ UPSCALERS = [('fsr1', ('FSR 1 (AMD, qualquer placa)', 'FSR 1 (AMD, any GPU)')),
              ('fsr4', ('AMD FSR 4.1 (RX 6000+; FSR 3.1 nas outras, experimental)',
                        'AMD FSR 4.1 (RX 6000+; FSR 3.1 on others, experimental)')),
              ('bilinear', ('Bilinear (simples)', 'Bilinear (plain)'))]
-if not IS_WINDOWS:  # AMD's SDK ships as Windows DLLs only (vk_fsr4.cpp)
-    UPSCALERS = [upscaler for upscaler in UPSCALERS if upscaler[0] != 'fsr4']
+if not IS_WINDOWS:
+    # AMD's SDK ships as Windows DLLs only; elsewhere SOTC_UPSCALER=fsr4 is FSR-Vulkan's native
+    # FSR 3.1 upscaler (vk_fsr4.cpp), on any GPU, with the same render sizes.
+    UPSCALERS = [('fsr4', ('AMD FSR 3.1 (qualquer placa, experimental)',
+                           'AMD FSR 3.1 (any GPU, experimental)')) if upscaler[0] == 'fsr4' else upscaler
+                 for upscaler in UPSCALERS]
 # Button icons in the game: the PlayStation prompts, or Xbox ones drawn for the port
 # (tools/make_button_icons.py, glyphs/xbox) put in place of the game's textures.
 BUTTON_ICONS = [('ps', ('PlayStation (do jogo)', 'PlayStation (the game\'s)')),
@@ -2429,7 +2446,8 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
     def summary(self):
         parts = [dict((k, _(*v)) for k, v in FPS_MODES).get(self.var('fps_mode').get(), '30 FPS'),
                  self.var('output_res').get().replace('x', ' × '),
-                 {'fsr1': 'FSR 1', 'dlss': 'DLSS', 'fsr4': 'FSR 4'}.get(self.var('upscaler').get(), 'bilinear')]
+                 {'fsr1': 'FSR 1', 'dlss': 'DLSS', 'fsr4': 'FSR 4' if IS_WINDOWS else 'FSR 3.1'}.get(
+                     self.var('upscaler').get(), 'bilinear')]
         framegen = self.var('framegen').get()
         if framegen != 'off':
             parts.append({'auto': _('geração de quadros', 'frame generation'), 'dlss': 'DLSS-G',
@@ -3235,7 +3253,8 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         values = [v for v, _t in PLAY_MODES]
         combo = ttk.Combobox(row, values=[_(*t) for _v, t in PLAY_MODES], state='readonly', width=30, style='Card.TCombobox')
         combo.pack(side='left')
-        combo.current(values.index(self.setup_mode_var.get()) if self.setup_mode_var.get() in values else 3)
+        combo.current(values.index(self.setup_mode_var.get()) if self.setup_mode_var.get() in values
+                      else values.index('custom'))
         combo.bind('<<ComboboxSelected>>', lambda _e: self.setup_mode_var.set(values[combo.current()]))
         self.setup_mode_combo, self.setup_mode_values = combo, values
         self.setup_mode_hint = ttk.Label(card, text='', style='Card.TLabel', wraplength=self.px(640), justify='left',

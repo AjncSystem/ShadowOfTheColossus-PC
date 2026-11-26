@@ -1570,18 +1570,50 @@ void *runtime_low_map(size_t size, int prot) {
  * Colossus also waits there for labels its compute queues write: the frame then went ahead
  * without the compute results and the scene was never drawn (black screen in about half of
  * the boots). A BB_TOGGLE_FILE value replaces this default. */
-uint64_t runtime_disabled_optimizations=UINT64_C(1)<<39 | UINT64_C(1)<<59 | UINT64_C(1)<<60; /* sotc: 59, 60 off as in Lukto02 #308 */
+/* sotc: bit 20 (CpFastPaths, Lukto02) is SET = off by default: the command processor's Nop skip, per-packet poll
+ * guard and fine pipeline key memo are exact (SOTC_CP_VERIFY=1: 0 bad in 13 M checks) and take 0.4 ms of the
+ * command processor's ~11 ms in the heavy temple, but the draw thread is the limiter there and the frame time
+ * did not move measurably (docs/sotc/SIGUIENTE-LIMITE.md). SOTC_CP_FAST=1 turns it on (toggle_env_pins). */
+/* sotc: bit 41 (DrawReplay, Lukto02) is clear = on by default (set = the old path): unchanged flat buffers are not copied
+ * per op and the reusable-bind key of a draw is compared field by field instead of hashed. Exact
+ * (SOTC_DRAWREPLAY_VERIFY=1: 0 differences against the hash in >30 M comparisons); -1.2 +- 0.33 ms of draw thread and
+ * +2.7 +- 0.8 FPS in the heavy temple (docs/sotc/DRAW-REPLAY.md). SOTC_DRAWREPLAY=0 pins the old path (toggle_env_pins). */
+uint64_t runtime_disabled_optimizations=UINT64_C(1)<<20 | UINT64_C(1)<<39 | UINT64_C(1)<<59 | UINT64_C(1)<<60; /* sotc: 59, 60 off as in Lukto02 #308 */
 /* Speculative readers of guest memory (GPU draw-preparation workers) register a recovery
  * point: a fault on that thread jumps back to it instead of terminating (probe.c). */
 __thread sigjmp_buf *runtime_fault_recover;
+/* sotc: environment pins for single toggle bits (Lukto02's fast paths), applied to the compiled mask at start
+ * and to every BB_TOGGLE_FILE mask, so a bench that A/B toggles one of these bits in the file must leave its
+ * variable unset. SOTC_CP_FAST=1/0: bit 20 (CpFastPaths) clear/set;
+ * SOTC_DRAWREPLAY=1/0: bit 41 (DrawReplay) clear/set. */
+static uint64_t toggle_env_pins(uint64_t mask) {
+    static const struct { const char *name; unsigned bit; } pins[]={
+        {"SOTC_CP_FAST",20},
+        {"SOTC_DRAWREPLAY",41},
+    };
+    for (size_t i=0;i<sizeof pins/sizeof pins[0];++i) {
+        const char *v=getenv(pins[i].name);
+        if (v && v[0]=='1') mask&=~(UINT64_C(1)<<pins[i].bit);
+        else if (v && v[0]=='0') mask|=UINT64_C(1)<<pins[i].bit;
+    }
+    return mask;
+}
+__attribute__((constructor)) static void toggle_env_init(void) {
+    const uint64_t mask=toggle_env_pins(runtime_disabled_optimizations);
+    if (mask!=runtime_disabled_optimizations) {
+        __atomic_store_n(&runtime_disabled_optimizations,mask,__ATOMIC_RELEASE);
+        printf("Runtime: disabled optimizations mask=%llu (environment)\n",(unsigned long long)mask);
+    }
+}
 static void *toggle_watcher(void *path) {
     for (unsigned long long last=ULLONG_MAX;;) {
         FILE *f=fopen(path,"r");
         unsigned long long value=0;
         if (f) { if (fscanf(f,"%llu",&value)!=1) value=0; fclose(f); }
         if (value!=last) {
-            __atomic_store_n(&runtime_disabled_optimizations,(uint64_t)value,__ATOMIC_RELEASE);
-            printf("Runtime: disabled optimizations mask=%llu\n",value);
+            const uint64_t pinned=toggle_env_pins((uint64_t)value);
+            __atomic_store_n(&runtime_disabled_optimizations,pinned,__ATOMIC_RELEASE);
+            printf("Runtime: disabled optimizations mask=%llu\n",(unsigned long long)pinned);
             last=value;
         }
 #ifdef _WIN32

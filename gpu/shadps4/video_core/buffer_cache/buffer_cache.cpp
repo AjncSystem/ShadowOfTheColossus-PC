@@ -173,6 +173,7 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
             ReadMemory(device_addr, size, true, assume_locks);
         },
         guest_fault);
+    SotcStats::mem_epoch.fetch_add(1, std::memory_order_release); // after the marks (reused binds)
 }
 
 void BufferCache::DropGpuModified(VAddr device_addr, u64 size) {
@@ -2668,6 +2669,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
             SotcStats::frame_copy_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
         }
         SotcStats::uploads.fetch_add(1, std::memory_order_relaxed);
+        ++SotcStats::thread_data_events;
         if (SotcStats::kCmdStats) { // sotc: read only by the SOTC_CMD_STATS printer
             SotcStats::upload_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
         }
@@ -3304,13 +3306,18 @@ bool BufferCache::FinishEviction(std::chrono::steady_clock::time_point now, u16 
         }();
         pending.compare = std::make_unique<EvictCompare>();
         if (async_compare && !wait) {
-            pending.compare->thread =
-                std::thread([this, chosen = pending.chosen, mapped = read_back.mapped,
-                             compare = pending.compare.get()] {
-                    Common::SetCurrentThreadName("bb:EvictCompare");
-                    CompareEviction(chosen, mapped, *compare);
-                });
-            return false;
+            // sotc: if the thread cannot be created (Windows out of commit) the comparison runs
+            // here, as with SOTC_EVICT_COMPARE_ASYNC=0.
+            try {
+                pending.compare->thread =
+                    std::thread([this, chosen = pending.chosen, mapped = read_back.mapped,
+                                 compare = pending.compare.get()] {
+                        Common::SetCurrentThreadName("bb:EvictCompare");
+                        CompareEviction(chosen, mapped, *compare);
+                    });
+                return false;
+            } catch (const std::system_error&) {
+            }
         }
         CompareEviction(pending.chosen, read_back.mapped, *pending.compare);
     }

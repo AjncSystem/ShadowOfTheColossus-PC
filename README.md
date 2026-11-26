@@ -1,4 +1,4 @@
-# Shadow of the Colossus — PC native port · v0.77
+# Shadow of the Colossus — PC native port · v0.78
 
 <a href="https://recomplauncher.com/game/shadowofthecolossus-pc"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
 
@@ -28,6 +28,7 @@ game needs, in the style of [bloodborne_pc](https://github.com/Supermedo/bloodbo
 
 | Version | Improvements and fixes |
 |---|---|
+| **0.78** | ⚡ **Lighter draw thread** (Lukto02, from the Lucas-blip-png fork): draws that repeat the same state no longer hash their bind key or copy the shader data every time, and descriptor reuse got its safety review. ⚡ **GPU threads on their own cores on SMT CPUs with 6+ cores** (#464, SotC-Work; Ryzen 5 5600X +6-11%). 🧯 **Running out of video memory no longer closes the game right away** (#293, Lucas-blip-png). A rare allocator crash (`0x499cc`) avoided. |
 | **0.77** | ⚡ **No long hitches after loading a save on SSDs** (the archive read-ahead now runs only on hard disks). 🌑 **Soft shadows/AO around Wander no longer flicker on AMD** (#461, marko0905; the shader cache is rebuilt once). ⚙️ **Settings kept in read-only folders** (#467). ⚡ **Fewer hitches at area changes**: textures the CPU still copied (~13 GB a session) are gathered by the GPU (area entry 7-9 frames over 50 ms → 1 on the test route); compute shaders are translated before they are needed; the shader cache is no longer cleared by every update; the dynamic FPS no longer holds the lower step for 10-15 s after a short dip. 🖥️ Dynamic FPS steps that divide 75/100/165 Hz screens (#454); texture pool reserve off above 1080p, 21:9 included (#455). |
 | **0.76.2** | 🛠️ **Intel CPUs: the hero falling through the floor and the crash at the title screen fixed** (since 0.76): the CPU patches lost the game's function list once the linked modules' lists were read, so a stack-protection patch was not applied. |
 | **0.76.1** | 🌌 **Dashed lines in the sky on AMD Radeon fixed** (#432, #433): one sky shader read values from neighbouring pixels in a way AMD's driver does not support at triangle edges. The shader cache is rebuilt once. |

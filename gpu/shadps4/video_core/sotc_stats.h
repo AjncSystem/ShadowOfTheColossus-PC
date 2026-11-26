@@ -202,6 +202,12 @@ inline std::atomic<uint64_t> readback_bytes_changed{0};
 inline std::atomic<uint64_t> rb_narrow_kib{0}, rb_narrow_kept_bytes{0}, rb_hot_entries{0};
 /// sotc: readbacks with a streaming window (SOTC_RB_STREAM, BufferCache::ReadMemory)
 inline std::atomic<uint64_t> rb_stream_windows{0};
+/// graphics push descriptors / push constants overwritten by a helper pass (shadow scroll, blit, post
+/// process): a reused bind (SOTC_FAST_BIND) must push its descriptors again
+inline std::atomic<uint64_t> push_clobbers{0};
+inline std::atomic<uint64_t> image_refreshes{0}; ///< RefreshImage calls on a dirty image
+/// buffer uploads and dirty-image refreshes made by this thread (SOTC_FAST_BIND_VERIFY)
+inline thread_local uint64_t thread_data_events = 0;
 inline std::atomic<uint64_t> uploads{0};        ///< SynchronizeMemory copies (CPU data to GPU)
 /// DMA sweeps (SynchronizeDmaBuffers): count, resident ranges visited, sweeps that uploaded.
 inline std::atomic<uint64_t> dma_sweeps{0}, dma_sweep_ranges{0}, dma_sweep_uploading{0};
@@ -233,6 +239,16 @@ inline std::atomic<uint64_t> lock_slow_waits_draw{0}, lock_slow_ns_draw{0};
 /// loop around them, which spins while a queue waits).
 inline std::atomic<uint64_t> draw_idle_ns{0};
 inline std::atomic<uint64_t> cp_parse_ns{0};
+/// sotc: part of cp_parse_ns the command processor spends blocked inside a resume (SOTC_FPS=1 only):
+/// waiting for a free ring slot, for the draw thread to drain (WaitBackTail) and for a VO label.
+/// parse minus these = the parser's own work.
+inline std::atomic<uint64_t> draw_cmds_ns{0}; // draw thread: guest-queued commands (ProcessCommands)
+/// sotc: SOTC_FPS=1, CPU time (user + kernel, ms) of the draw thread (slot 0) and of the command
+/// processor (slot 1), and of the whole process (liverpool.cpp). 0 where unsupported.
+void RegisterThread(int slot);
+double ThreadCpuMs(int slot);
+double ProcessCpuMs();
+inline std::atomic<uint64_t> cp_ring_wait_ns{0}, cp_drain_wait_ns{0}, cp_label_wait_ns{0};
 /// sotc: busy time of the recorder thread (vk_recorder.cpp ConsumerLoop: time replaying commands,
 /// not waiting for them), accumulated with SOTC_FPS=1 only; the "threads per frame" line prints it.
 inline std::atomic<uint64_t> recorder_busy_ns{0};
@@ -598,6 +614,8 @@ inline std::atomic<uint64_t> fmt_sync_calls{0}, fmt_sync_meta{0}, fmt_sync_image
 /// sotc: BbToggle::PipelineKeyMemo: draws that returned the previous pipeline without building
 /// the key again, and draws that had to build it.
 inline std::atomic<uint64_t> pipe_key_memo_hits{0}, pipe_key_memo_misses{0};
+/// sotc: hits of the pipeline key memo that the old rule (any dirty register chunk) would have missed.
+inline std::atomic<uint64_t> pipe_key_memo_fine_hits{0};
 /// sotc: draws whose freshly built graphics key equaled the previous one (SOTC_PIPE_MEMO), the
 /// upper bound of what a register-content memo could skip.
 inline std::atomic<uint64_t> pipe_same_key_hits{0}, pipe_same_key_misses{0};

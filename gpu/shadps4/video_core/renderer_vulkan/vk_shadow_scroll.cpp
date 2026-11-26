@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // sotc: reuse of sun shadow cascades moved by whole texels, see vk_shadow_scroll.h.
 
+#include "video_core/sotc_stats.h"
 #include "video_core/renderer_vulkan/vk_shadow_scroll.h"
 
 #include <cstdio>
@@ -369,6 +370,7 @@ bool ShadowScroll::Scroll(VideoCore::Image& image, u32 layer, s32 sx, s32 sy, fl
         .descriptorType = vk::DescriptorType::eSampledImage,
         .pImageInfo = &image_info,
     };
+    SotcStats::push_clobbers.fetch_add(1, std::memory_order_relaxed); // sotc: reused binds repush
     cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, *pipeline_layout, 0, write);
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
     const PushConstants push{sx, sy, dz, empty};

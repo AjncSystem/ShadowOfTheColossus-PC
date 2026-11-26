@@ -26,6 +26,7 @@
 #include "bbport_overlay.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/sotc_gpu_times.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/sotc_fps_cap.h"
 #include "video_core/sotc_event.h"
 #include "video_core/sotc_stats.h"
@@ -1130,6 +1131,7 @@ void VideoOutDriver::Flip(const Request& req) {
                 std::fprintf(stderr, "SOTC threads per frame: draw busy %.2f ms, command parse %.2f ms\n",
                              (seconds * 1000.0 - idle_ms) / flips, parse_ms / flips);
             }
+            Vulkan::DrawPhase::ReplayReport(); // sotc: SOTC_DRAW_REPLAY_PROBE (no-op otherwise)
             if (SotcStats::kDrawSplit && split_frames && split_tick0) {
                 const double ns = double(SotcStats::NowNs() - split_ns0);
                 const double ticks_per_ms =
@@ -1281,14 +1283,24 @@ void VideoOutDriver::Flip(const Request& req) {
             flips = 0;
             // The flip thread does not wait for the log: one stderr write took 7-10 ms (bench log
             // file, Radeon RX 6650 XT session), ~15 of them a frame of 80-100 ms every 5 s.
-            std::thread([text = std::move(report), mem_line_due] {
-                std::fwrite(text.data(), 1, text.size(), stderr);
-                if (mem_line_due) {
-                    if (const std::string mem = BbMemReport::Line(); !mem.empty()) {
-                        std::fprintf(stderr, "SOTC MEM %s\n", mem.c_str());
+            // sotc: thread creation can fail when Windows is out of commit (std::system_error from
+            // __libcpp_thread_create, uncaught: the game died here after 2 h 49 min, 19 Nov). The
+            // report is diagnostics only: write it here instead, and never let it throw.
+            try {
+                std::thread([text = report, mem_line_due] {
+                    std::fwrite(text.data(), 1, text.size(), stderr);
+                    if (mem_line_due) {
+                        if (const std::string mem = BbMemReport::Line(); !mem.empty()) {
+                            std::fprintf(stderr, "SOTC MEM %s\n", mem.c_str());
+                        }
                     }
+                }).detach();
+            } catch (...) {
+                try {
+                    std::fwrite(report.data(), 1, report.size(), stderr);
+                } catch (...) {
                 }
-            }).detach();
+            }
             window_start = now;
         }
     }

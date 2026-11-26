@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <array>
 #include <numeric>
 
@@ -108,6 +109,37 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
             over_budget_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
             result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &over_budget_ci,
                                      &unsafe_buffer, &allocation, out_alloc_info);
+        }
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            // sotc: RX 9070 XT reports (#293) failed 24-96 MiB DeviceLocal buffers with 13 GiB of
+            // the budget free, even over budget. Try a block-suballocated buffer, then system
+            // memory, before the assertion ends the game (a slow buffer beats a crash).
+            VmaAllocationCreateInfo retry_ci = alloc_ci;
+            retry_ci.flags &= ~(VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT |
+                                VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT);
+            result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &retry_ci, &unsafe_buffer,
+                                     &allocation, out_alloc_info);
+            if (result != VK_SUCCESS) {
+                retry_ci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+                // sotc: VMA takes one host access flag; a HostCached buffer already had RANDOM,
+                // and both together made this last try fail (RX 7600, 256 MiB host-visible video
+                // heap full, 7 GB of system memory free: 64 KB HostCached buffer aborted, #319).
+                retry_ci.flags &= ~(VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                                    VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT);
+                retry_ci.flags |= mem_type == MemoryType::HostCached
+                                      ? VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT
+                                      : VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+                result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &retry_ci, &unsafe_buffer,
+                                         &allocation, out_alloc_info);
+            }
+            if (result == VK_SUCCESS) {
+                static std::atomic<int> logged{0};
+                if (logged.fetch_add(1) < 5) {
+                    LOG_CRITICAL(Render, "SOTC buffer fallback: {} KB {} buffer made without "
+                                         "the first choice (driver reported out of memory)",
+                                 buffer_ci.size >> 10, BufferTypeName(mem_type));
+                }
+            }
         }
         if (result != VK_SUCCESS) {
             const VkPhysicalDeviceMemoryProperties* props{};

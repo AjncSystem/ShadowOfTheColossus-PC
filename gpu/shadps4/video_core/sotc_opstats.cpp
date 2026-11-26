@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 // sotc: SOTC_OP_STATS=1 counters, see sotc_opstats.h.
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1605,3 +1608,42 @@ void NoteCpuAccess(bool write, uint64_t addr, uint64_t size) {
 }
 
 } // namespace SotcOps
+
+// sotc: CPU time of the draw thread, the command processor and the process (SOTC_FPS=1 line).
+namespace SotcStats {
+#ifdef _WIN32
+static HANDLE g_thread_handles[2];
+void RegisterThread(int slot) {
+    if (!kFpsLog) {
+        return;
+    }
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+                    &g_thread_handles[slot], THREAD_QUERY_INFORMATION, FALSE, 0);
+}
+static double FileTimeMs(const FILETIME& kernel, const FILETIME& user) {
+    const auto v = [](const FILETIME& t) {
+        return (static_cast<unsigned long long>(t.dwHighDateTime) << 32) | t.dwLowDateTime;
+    };
+    return static_cast<double>(v(kernel) + v(user)) / 1e4;
+}
+double ThreadCpuMs(int slot) {
+    FILETIME create, exit, kernel, user;
+    if (!g_thread_handles[slot] || !GetThreadTimes(g_thread_handles[slot], &create, &exit, &kernel, &user)) {
+        return 0.0;
+    }
+    return FileTimeMs(kernel, user);
+}
+double ProcessCpuMs() {
+    FILETIME create, exit, kernel, user;
+    if (!GetProcessTimes(GetCurrentProcess(), &create, &exit, &kernel, &user)) {
+        return 0.0;
+    }
+    return FileTimeMs(kernel, user);
+}
+#else
+void RegisterThread(int) {}
+double ThreadCpuMs(int) { return 0.0; }
+double ProcessCpuMs() { return 0.0; }
+#endif
+} // namespace SotcStats
+

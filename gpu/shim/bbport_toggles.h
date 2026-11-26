@@ -49,7 +49,22 @@ enum : std::uint64_t {
     PipelinedTasks = 1ull << 38,
     PendingFenceWaits = 1ull << 39,
     PipelinedDispatch = 1ull << 40,
-    RecorderFences = 1ull << 41,
+    // sotc (DRAW-REPLAY.md): bit 41 was RecorderFences (no reader left); reused.
+    DrawReplay = 1ull << 41,      ///< set: ExecuteBackOp copies every stage's flat buffer into the
+                                  ///< draw thread's InfoRuntime and a draw's reusable-bind key
+                                  ///< (Rasterizer::BindResources) is the XXH3 of its pipeline, push
+                                  ///< data, target addresses, user data and flat buffers; clear:
+                                  ///< an unchanged flat buffer is not copied (a changed one is
+                                  ///< swapped in), InfoRuntime::ud_gen counts the changes, and the
+                                  ///< key is compared field by field with the one the last bind
+                                  ///< stored (same equality, no hashing); the counters of the
+                                  ///< FASTBIND line are plain stores, and only with SOTC_FPS.
+                                  ///< CLEAR BY DEFAULT (accepted: -1.2 +- 0.33 ms of draw thread,
+                                  ///< +2.7 +- 0.8 FPS in the heavy temple, 0 differences against
+                                  ///< the hash: docs/sotc/DRAW-REPLAY.md); SOTC_DRAWREPLAY=0 pins
+                                  ///< the old path, SOTC_DRAWREPLAY_VERIFY=1 compares the key with
+                                  ///< the hash on every draw. Honoured live, read per op and per
+                                  ///< draw.
     PipelinedMemoryWrites = 1ull << 42,
     MultiCopyShader = 1ull << 43,
     RenderStateMemo = 1ull << 44,
@@ -61,6 +76,20 @@ enum : std::uint64_t {
     SceneHalfRes = 1ull << 50, ///< live scaling also reduces the 960x540 post targets
     // sotc (Lote 3, 2026-10-25): set = the old path, clear (default) = the optimization. Bits 20
     // (flat copy swap) and 22 (image destroy worker) were measured without gain and removed.
+    // sotc (SIGUIENTE-LIMITE.md): bit 20 is reused for the command processor fast paths.
+    CpFastPaths = 1u << 20,        ///< set: the command processor walks every PM4 Nop packet through
+                                   ///< ProcessCommands and the opcode switch, and a draw reuses the
+                                   ///< previous pipeline only when no register chunk at all was
+                                   ///< written since (PipelineKeyMemo); clear: a run of Nop packets
+                                   ///< that does nothing (empty or unknown payload) is skipped
+                                   ///< without them, and the pipeline memo ignores the registers a
+                                   ///< draw packet itself writes (index type, counts, base, draw
+                                   ///< initiator, instance count), which no pipeline key reads; the
+                                   ///< per-packet ProcessCommands call is skipped when no ordered
+                                   ///< command is queued. SET BY DEFAULT (off: it did not move the
+                                   ///< frame time, see SIGUIENTE-LIMITE.md); SOTC_CP_FAST=1 or a
+                                   ///< BB_TOGGLE_FILE mask without the bit turns it on. Honoured
+                                   ///< live (Nops per command buffer, memo per draw).
     BpeGuardDiff = 1u << 21,       ///< set: ApplyDownloads builds BPE heap guards for every copy of
                                    ///< the batch and writes them all; clear: copies whose bytes
                                    ///< already equal guest memory are dropped first (nothing to

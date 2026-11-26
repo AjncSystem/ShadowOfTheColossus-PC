@@ -76,7 +76,7 @@ def settings_file():
 from sotc_modes import GAMES  # noqa: E402
 GAME_ID = 'CUSA08809'
 SYS_MODULES = ('libSceUlt.sprx', 'libSceNgs2.sprx')
-VERSION = '0.77'
+VERSION = '0.78'
 # sotc: the port version whose shader translation the cache holds (clear_shader_cache_after_update).
 # Raise it to the new VERSION in a release that changes how shaders are translated or stored
 # (shader_recompiler/, the SPIR-V emitters, vk_pipeline_serialization.cpp versions, cache_storage

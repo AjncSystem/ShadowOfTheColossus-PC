@@ -30,7 +30,7 @@ WORDS = {
     'fullscreen': 'tela cheia fullscreen janela window',
     'present_mode': 'vsync tearing mailbox fifo cortes',
     'vram_use': 'memoria video vram placa gb falta',
-    'play_mode': 'modo normal pro extremo personalizado preset qualidade',
+    'play_mode': 'modo normal leve light pro extremo personalizado preset qualidade desempenho pc fraco',
     'game_dir': 'jogo pasta dump eboot cusa08809 cusa08034 folder',
     'dlc_dir': 'dlc conteudo adicional',
     'sys_modules': 'som audio mudo sem som ngs2 ult sound',

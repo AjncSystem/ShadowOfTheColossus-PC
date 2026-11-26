@@ -4,6 +4,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 
 #include "core/emulator_settings.h"
@@ -100,6 +101,8 @@ public:
         const auto image_id = texture_cache.FindImage(desc);
         auto& image = texture_cache.GetImage(image_id);
         image.usage.vo_surface = 1u;
+        // sotc: images made again at this buffer keep the mark (TextureCache::RegisterImage)
+        texture_cache.NoteVideoOutSurface(cpu_address, image.info.size.width, image.info.size.height);
         return image;
     }
 

@@ -5525,6 +5525,26 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const u32 ui_i = CompositeUiIndex();
         const auto& ui = texture_cache.GetImage(image_bindings[ui_i].first);
         const auto& scene = texture_cache.GetImage(image_bindings[ui_i ^ 1].first);
+        {
+            // sotc: a composite-like draw (sRGB UI + fp16 scene) into a target that is not marked
+            // as a video out surface: the composite is then not captured for that frame.
+            const auto& target = texture_cache.GetImage(cb_descs[0].first);
+            if (!target.usage.vo_surface && ui.usage.render_target &&
+                ui.info.pixel_format == vk::Format::eR8G8B8A8Srgb &&
+                scene.info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {
+                static u32 logged = 0;
+                if (logged++ < 6) {
+                    std::fprintf(stderr,
+                                 "SOTC VO miss: composite into %#llx (image %u, uid %llu, %ux%u, "
+                                 "fmt %d) not marked as video out\n",
+                                 static_cast<unsigned long long>(target.info.guest_address),
+                                 cb_descs[0].first.index,
+                                 static_cast<unsigned long long>(target.image_uid),
+                                 target.info.size.width, target.info.size.height,
+                                 static_cast<int>(target.info.pixel_format));
+                }
+            }
+        }
         if (texture_cache.GetImage(cb_descs[0].first).usage.vo_surface &&
             ui.usage.render_target && ui.info.pixel_format == vk::Format::eR8G8B8A8Srgb &&
             scene.info.pixel_format == vk::Format::eR16G16B16A16Sfloat) {

@@ -305,6 +305,10 @@ public:
                  PageManager& tracker);
     ~TextureCache();
 
+    /// sotc: a video out buffer (sceVideoOutRegisterBuffers). Images created later at that
+    /// address and size are video out surfaces too (see RegisterImage).
+    void NoteVideoOutSurface(VAddr address, u32 width, u32 height);
+
     TileManager& GetTileManager() noexcept {
         return tile_manager;
     }
@@ -819,6 +823,12 @@ private:
     static constexpr u64 NumImagePages = u64{1} << (Traits::ADDRESS_SPACE_BITS - Traits::PAGE_BITS);
     std::unique_ptr<std::atomic<u32>[]> page_images{new std::atomic<u32>[NumImagePages]()};
     ReentrantMutex mutex;
+    /// sotc: NoteVideoOutSurface (under `mutex`)
+    struct VideoOutSurface {
+        VAddr address;
+        u32 width, height;
+    };
+    std::vector<VideoOutSurface> video_out_surfaces;
     /// sotc: RefreshImage nesting on this thread (it runs under `mutex`).
     static inline thread_local u32 refresh_depth = 0;
     /// sotc: deferred EmergencyCollect level + 1 (0: none).

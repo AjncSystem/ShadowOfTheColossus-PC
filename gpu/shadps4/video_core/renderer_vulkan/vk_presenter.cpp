@@ -53,6 +53,37 @@
 
 namespace Vulkan {
 
+// sotc: what each present showed while a temporal upscaler is on, printed every 5 s: a new
+// upscaled picture, the last one repeated (the same buffer flipped again), the splash/menu path,
+// or no upscaled picture at all (the game's own frame through FSR 1, without the vignette that
+// was taken out of the tonemap). Printed only when frames without a picture come among upscaled
+// ones: the double vignette flicker after slow first starts was exactly that (half and half,
+// the composite into one of the two video out buffers not captured; TextureCache::RegisterImage).
+namespace PresentDiag {
+std::atomic<uint32_t> scene{0}, repeat{0}, low{0}, same_buffer{0}, none{0};
+void Report() {
+    static int64_t last_ms = 0;
+    const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count();
+    if (now - last_ms < 5000) {
+        return;
+    }
+    const bool first = last_ms == 0;
+    last_ms = now;
+    const uint32_t s = scene.exchange(0), r = repeat.exchange(0), l = low.exchange(0),
+              b = same_buffer.exchange(0), n = none.exchange(0);
+    // Only the symptom: frames without a picture among upscaled ones in the same 5 s (a menu or
+    // loading screen has none upscaled; a normal session has none without).
+    if (!first && s && b + n) {
+        std::fprintf(stderr,
+                     "SOTC PRESENT 5 s: upscaled %u, repeated %u, menu path %u, "
+                     "same buffer without a picture %u, no picture %u\n",
+                     s, r, l, b, n);
+    }
+}
+} // namespace PresentDiag
+
 // sotc: serializes vkQueuePresentKHR (both present sites) on the dedicated present queue; with a
 // shared queue the sites take Scheduler::submit_mutex as well.
 static std::mutex present_queue_mutex;
@@ -859,9 +890,16 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     if (!upscaled.scene && dlss_repeat && dlss_last.scene && cpu_address == dlss_last_address) {
         upscaled = dlss_last;
         dlss_last = Dlssg::Upscaled{};
+        ++PresentDiag::repeat;
     } else {
         dlss_last = upscaled.scene && !upscaled.scene_low ? upscaled : Dlssg::Upscaled{};
+        if (Dlssg::SuperResolutionUpscaling()) {
+            ++(upscaled.scene ? (upscaled.scene_low ? PresentDiag::low : PresentDiag::scene)
+                              : (cpu_address == dlss_last_address ? PresentDiag::same_buffer
+                                                                  : PresentDiag::none));
+        }
     }
+    PresentDiag::Report();
     dlss_last_address = cpu_address;
     if (Dlssg::SuperResolutionAvailable() && Dlssg::CompareMode()) {
         BbOverlay::SetUpscalerLabel(upscaled.scene && !upscaled.scene_low ? Dlssg::ModeName()

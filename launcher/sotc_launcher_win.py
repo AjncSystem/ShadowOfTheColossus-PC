@@ -226,6 +226,11 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'auto_setup': True, 'dlc_dir': '', 'framegen': 'off', 'fg_hudless': True, 'fg_mult': '2',
                 'dlss_mode': 'quality', 'dlss_sharpen': '0', 'dlss_ui_sharpen': '3', 'dlss_sky_sharpen': '2',
                 'dlss_compare': False, 'hdr_sdr': False,
+                'hdr_tonemap': 'vanilla', 'hdr_white': '200', 'hdr_peak': '0', 'hdr_ui_nits': '0',
+                'hdr_exposure': '0', 'hdr_contrast': '50', 'hdr_shadows': '50', 'hdr_highlights': '50',
+                'hdr_saturation': '50', 'hdr_blowout': '0', 'hdr_hue_correction': '100', 'hdr_flare': '0',
+                'hdr_gamma_correction': '0', 'hdr_highlight_saturation': '50', 'hdr_grain': '0',
+                'hdr_gamut_expansion': '0', 'hdr_grain_size': '100', 'hdr_grading': '100', 'dither': True,
                 'check_updates': True, 'skip_version': '', 'play_mode': 'custom', 'exit_backup': True, 'news_seen': '', 'expert_view': False, 'windows_title_bar': False, 'game_monitor': '', 'minimize_to_tray': False}
 # sotc: improvements that changed a default, by the version that changed it. Settings saved by an
 # older launcher get them once when this one first loads them (load_settings). Every release that
@@ -336,6 +341,44 @@ AUDIO_CHANNELS = [('auto', ('Automático (como o Windows estiver configurado)', 
 VOLUME = [('100', ('100% (original)', '100% (original)')), ('150', ('150%', '150%')),
           ('200', ('200%', '200%')), ('300', ('300%', '300%')), ('400', ('400%', '400%')),
           ('500', ('500% (máximo)', '500% (maximum)'))]
+# Game HDR picture (vk_presenter.cpp RefreshHdrLevels reads these keys; the in-game F1 menu writes
+# the same ones while playing). Numbers are kept as the menu writes them: whole numbers bare.
+HDR_TONEMAPS = [('vanilla', ('Original (a curva do jogo)', "Vanilla (the game's curve)")),
+                ('vanilla_plus', ('Original+ (realces até o pico)', 'Vanilla+ (highlights to the peak)')),
+                ('vanilla_plus_hue', ('Original+ (cor): no brilho, mantendo a cor', 'Vanilla+ (hue): on brightness, keeping hue')),
+                ('renodrt', ('RenoDRT (como os mods RenoDX)', 'RenoDRT (as RenoDX mods)')),
+                ('none', ('Nenhuma (só a descida no pico)', 'None (only the roll-off at the peak)'))]
+HDR_GRADE_KEYS = ('hdr_exposure', 'hdr_contrast', 'hdr_shadows', 'hdr_highlights', 'hdr_saturation',
+                  'hdr_blowout', 'hdr_hue_correction', 'hdr_flare', 'hdr_gamma_correction',
+                  'hdr_highlight_saturation', 'hdr_grain', 'hdr_gamut_expansion', 'hdr_grain_size')
+# The F1 menu's presets, same values (gpu/shadps4/video_core/sotc_live.h kPicturePresets): the
+# tone mapper and HDR_GRADE_KEYS in order. Brightness, peak and UI stay.
+HDR_PRESETS = [
+    ('original', ('Original', 'Original'), 'vanilla', (0, 50, 50, 50, 50, 0, 100, 0, 0, 50, 0, 0, 100)),
+    ('renodx', ('RenoDX (RenoDRT, gama 2.2)', 'RenoDX (RenoDRT, gamma 2.2)'), 'renodrt',
+     (0, 50, 50, 50, 50, 0, 100, 0, 100, 50, 0, 0, 100)),
+    ('vivid', ('Vívido (cores mais ricas, rumo ao P3)', 'Vivid (richer colour, towards P3)'), 'vanilla_plus_hue',
+     (0, 54, 50, 50, 56, 0, 100, 0, 100, 58, 0, 36, 100)),
+    ('film', ('Filme (mais contraste, granulação)', 'Film (more contrast, grain)'), 'renodrt',
+     (0, 54, 50, 50, 50, 0, 100, 10, 100, 46, 30, 10, 100)),
+]
+
+
+def level_text(value):
+    """A level as the F1 menu writes it (bbport_overlay.cpp LevelText): 200, 0.5, -1."""
+    return str(int(value)) if float(value) == int(value) else f'{float(value):.1f}'
+
+
+def level_options(values, label=None, first=None):
+    """Choices for a numeric HDR setting: [(text, (pt, en))], `first` a labelled first choice."""
+    options = [first] if first else []
+    for v in values:
+        text = level_text(v)
+        name = label(v) if label else text
+        options.append((text, (name, name)))
+    return options
+
+
 VRAM_LIMITS = {'low': ('50', '1024'), 'normal': ('60', '1536'), 'high': ('75', '4096'), 'max': ('85', '0')}
 # Play modes (Jogar tab): each one sets the settings below; changing one of them by hand afterwards
 # makes the mode Custom. Extreme's upscaler is DLSS on an NVIDIA RTX card, FSR 1 on the others.
@@ -455,8 +498,10 @@ DLSS_FACTORS = {'dlaa': 1.0, 'quality': 1.5, 'balanced': 1.724, 'performance': 2
 RENDER_ALIGN = 8
 MIN_RENDER_HEIGHT = 360
 # RCAS after DLSS (SOTC_DLSS_SHARPEN, attenuation in stops: 0 = sharpest).
+# The labels of 0, 0.5 and 1 are the ones they had before 1.5 and 2 were added, so a saved choice
+# keeps its name.
 DLSS_SHARPNESS = [('0', ('Alta (padrão)', 'High (default)')), ('0.5', ('Média', 'Medium')), ('1', ('Baixa', 'Low')),
-                  ('off', ('Desligada', 'Off'))]
+                  ('1.5', ('Muito baixa', 'Very low')), ('2', ('Mínima', 'Lowest')), ('off', ('Desligada', 'Off'))]
 # Unsharp amounts of the upscaled text/UI and of the sky (SOTC_DLSS_UI_SHARPEN / _SKY_SHARPEN).
 DLSS_UI_SHARPNESS = [('3', ('Alta (padrão)', 'High (default)')), ('1.5', ('Média', 'Medium')), ('0', ('Desligada', 'Off'))]
 DLSS_SKY_SHARPNESS = [('2', ('Alta (padrão)', 'High (default)')), ('1', ('Média', 'Medium')), ('0', ('Desligada', 'Off'))]
@@ -833,6 +878,11 @@ def load_settings():
     if not saved:
         saved = ini_settings()
     settings = {**APP_DEFAULTS, **saved}
+    if 'hdr_ui_nits' not in saved and str(saved.get('hdr_ui', '')).strip() not in ('', '0'):
+        try:  # before 0.77 UI brightness scaled the game's UI, whose white is 3x it: in nits
+            settings['hdr_ui_nits'] = level_text(round(3 * float(saved['hdr_ui'])))
+        except ValueError:
+            pass
     if 'fps_mode' not in saved:  # before the choice: the "uncapped FPS" box
         settings['fps_mode'] = '60' if saved.get('fps60') else '30'
     if 'textures' not in saved:  # before the levels: the "high quality textures" box
@@ -1409,6 +1459,133 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         label.grid(row=r, column=0, columnspan=2, sticky='w', pady=(top, 2))
         self.index_entry(label, title)
         self.tk.Frame(parent, bg=LINE, height=1).grid(row=r + 1, column=0, columnspan=2, sticky='we', pady=(0, 4))
+
+    def level(self, parent, key, options):
+        """choice() for a numeric HDR setting: a value written by hand or by the F1 menu between
+        the listed steps is kept (added to the list) instead of jumping to the first choice."""
+        current = str(self.var(key).get())
+        if current not in [v for v, _t in options]:
+            try:
+                x = float(current)
+                at = next((i for i, (v, _t) in enumerate(options)
+                           if v.lstrip('-').replace('.', '', 1).isdigit() and float(v) > x), len(options))
+                options = options[:at] + [(current, (current, current))] + options[at:]
+            except ValueError:
+                pass
+        return self.choice(parent, key, options, 30)
+
+    def build_hdr_picture(self, f):
+        """The game HDR levels and picture controls, as in the in-game menu (F1, Display)."""
+        self.section(f, _('Imagem (HDR e SDR)', 'Picture (HDR and SDR)'))
+        self.note(f, _('Os mesmos ajustes do menu do jogo (F1, Tela), que muda e guarda estes valores enquanto você '
+                       'joga. Curva de tons, brilho, pico, interface, gama e expansão de cores só valem com HDR; '
+                       'os outros também em SDR.',
+                       "The same settings as the in-game menu (F1, Display), which changes and keeps these values "
+                       'while you play. Tone mapper, brightness, peak, UI, gamma and gamut expansion apply with '
+                       'HDR only; the others in SDR too.'), top=2)
+        presets = [(key, label) for key, label, _tm, _g in HDR_PRESETS] + [
+            ('custom', ('Personalizado', 'Custom'))]
+        preset_box = self.ttk.Combobox(f, values=[_(*label) for _k, label in presets], state='readonly', width=30)
+        self.row(f, _('Predefinição', 'Preset'), preset_box,
+                 _('Ajusta a curva de tons e todos os controles abaixo de uma vez. O brilho, o pico e a interface '
+                   'ficam.', 'Sets the tone mapper and every control below at once. Brightness, peak and UI stay.'))
+        self.row(f, _('Curva de tons (HDR)', 'Tone mapper (HDR)'), self.choice(f, 'hdr_tonemap', HDR_TONEMAPS, 30),
+                 _('RenoDRT e Original+ (cor) mantêm a cor e a saturação dos realces até o pico da tela.',
+                   'RenoDRT and Vanilla+ (hue) keep the hue and saturation of highlights up to the display peak.'))
+        nits = _('nits', 'nits')
+        self.row(f, _('Brilho do jogo (HDR)', 'Game brightness (HDR)'),
+                 self.level(f, 'hdr_white', level_options(range(80, 410, 10), lambda v: f'{v} {nits}')),
+                 _('O branco do mundo em nits. 200 é o padrão; o jogo puro tem ~100.',
+                   "The world's white in nits. 200 is the default; the game itself has ~100."))
+        self.row(f, _('Pico da tela (HDR)', 'Display peak (HDR)'),
+                 self.level(f, 'hdr_peak', level_options(range(400, 2050, 50), lambda v: f'{v} {nits}',
+                                                         ('0', ('Automático (do Windows)', 'Auto (from Windows)')))
+                            + [('10000', ('Desligado (cortar)', 'Off (clip)'))]),
+                 _('Os realces (sol, céu, água) descem suavemente até o pico em vez de estourar.',
+                   'Highlights (sun, sky, water) roll off smoothly into the peak instead of clipping.'))
+        self.row(f, _('Brilho da interface (HDR)', 'UI brightness (HDR)'),
+                 self.level(f, 'hdr_ui_nits', level_options(range(50, 1010, 10), lambda v: f'{v} {nits}',
+                                                            ('0', ("O do jogo (3x o brilho do jogo)",
+                                                                   "The game's (3x game brightness)")))),
+                 _('O branco de menus, legendas e HUD em nits.', 'The white of menus, subtitles and HUD in nits.'))
+        # The F1 menu's steps, so whatever it wrote is one of the choices.
+        percents = level_options(range(0, 101, 2))
+        ev = level_options([x / 10 for x in range(-30, 31)], lambda v: f'{v:+.1f} EV' if v else '0 EV')
+        rows = [
+            ('hdr_exposure', ('Exposição', 'Exposure'), ev, ('0 é o original.', '0 is the original.')),
+            ('hdr_highlights', ('Realces', 'Highlights'), percents, ('50 é o original.', '50 is the original.')),
+            ('hdr_shadows', ('Sombras', 'Shadows'), percents,
+             ('Acima de 50 clareia, abaixo aprofunda.', 'Above 50 lifts, below deepens.')),
+            ('hdr_contrast', ('Contraste', 'Contrast'), percents, ('50 é o original.', '50 is the original.')),
+            ('hdr_saturation', ('Saturação', 'Saturation'), percents,
+             ('50 é o original; 0 é preto e branco.', '50 is the original; 0 is black and white.')),
+            ('hdr_highlight_saturation', ('Saturação dos realces', 'Highlight saturation'), percents,
+             ('50 é o original.', '50 is the original.')),
+            ('hdr_blowout', ('Desbotar realces', 'Highlight desaturation'), percents,
+             ('Os realces mais fortes vão para o branco perto do pico. 0 é o original.',
+              'The strongest highlights go to white near the peak. 0 is the original.')),
+            ('hdr_flare', ('Compensar véu (flare)', 'Flare compensation'), percents,
+             ('Pretos mais fundos. 0 é o original.', 'Deeper blacks. 0 is the original.')),
+            ('hdr_hue_correction', ('Correção de matiz (HDR)', 'Hue correction (HDR)'), percents,
+             ('Só com Original+ (cor) e RenoDRT: quanto a cor dos realces volta à do jogo. 100 é a do jogo.',
+              "Vanilla+ (hue) and RenoDRT only: how far the highlights' hue goes back to the game's. 100 is "
+              "the game's.")),
+            ('hdr_gamma_correction', ('Correção de gama (HDR)', 'Gamma correction (HDR)'),
+             [('0', ('Desligado', 'Off')), ('100', ('2.2', '2.2')), ('200', ('2.4 (BT.1886)', '2.4 (BT.1886)'))],
+             ('A parte escura como numa tela SDR: 2.2 como um monitor comum, 2.4 como uma TV calibrada.',
+              'The dark range as on an SDR display: 2.2 like a typical monitor, 2.4 like a calibrated TV.')),
+            ('hdr_gamut_expansion', ('Expansão de cores (HDR)', 'Gamut expansion (HDR)'), percents,
+             ('Cores saturadas além do sRGB, rumo ao P3. 0 é o original.',
+              'Saturated colours beyond sRGB, towards P3. 0 is the original.')),
+            ('hdr_grain', ('Granulação de filme', 'Film grain'), percents,
+             ('Também esconde faixas no céu e na névoa. 0 é o original.',
+              'It also hides banding in the sky and fog. 0 is the original.')),
+            ('hdr_grain_size', ('Tamanho da granulação', 'Grain size'),
+             level_options(range(50, 210, 10), lambda v: f'{v}%'),
+             ('100% é um pixel em 1080p e cresce com a resolução.',
+              '100% is one pixel at 1080p and grows with the resolution.')),
+            ('hdr_grading', ('Correção de cor do jogo', 'Game colour grading'),
+             level_options(range(0, 101, 5), lambda v: f'{v}%'),
+             ('A força do tom de cor de cada lugar. 100% é o original.',
+              "How strongly each place's colour look applies. 100% is the original.")),
+        ]
+        for key, title, options, hint in rows:
+            self.row(f, _(*title), self.level(f, key, options), _(*hint))
+        self.check(f, 'dither', _('Pontilhado (dithering)', 'Dithering'),
+                   _('Um ruído fino antes dos 8 bits (SDR) ou 10 bits (HDR) da tela: tira as faixas no céu e na '
+                     'névoa. Desligado é o original.',
+                     "A fine noise before the display's 8 bits (SDR) or 10 bits (HDR): it removes banding in "
+                     'the sky and fog. Off is the original.'))
+
+        def matching():
+            tm = self.var('hdr_tonemap').get()
+            now = []
+            for key in HDR_GRADE_KEYS:
+                try:
+                    now.append(float(self.var(key).get()))
+                except ValueError:
+                    return len(HDR_PRESETS)
+            for i, (_k, _l, p_tm, grades) in enumerate(HDR_PRESETS):
+                if p_tm == tm and all(abs(a - b) < 0.5 for a, b in zip(now, grades)):
+                    return i
+            return len(HDR_PRESETS)
+
+        def show(*_args):
+            preset_box.current(matching())
+
+        def pick(_event):
+            i = preset_box.current()
+            if i < len(HDR_PRESETS):
+                _k, _l, tm, grades = HDR_PRESETS[i]
+                self.var('hdr_tonemap').set(tm)
+                for key, value in zip(HDR_GRADE_KEYS, grades):
+                    self.var(key).set(level_text(value))
+                self.var('hdr_grading').set('100')
+            show()
+        preset_box.bind('<<ComboboxSelected>>', pick)
+        for key in HDR_GRADE_KEYS + ('hdr_tonemap',):
+            self.var(key).trace_add('write', show)
+        show()
 
     def window_icon_row(self, parent):
         """The game window's icon: the game's (empty) or a picture of the player's choice."""
@@ -2002,6 +2179,7 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                      'uninterpolated: removes the shaking health/stamina bars and text. It can fade the '
                      'logo on the title screen and show the old scene behind loading screens.'))
         self.window_icon_row(f)
+        self.build_hdr_picture(f)
         self.section(f, _('Resolução', 'Resolution'))
         self.row(f, _('Saída', 'Output'), self.choice(f, 'output_res', OUTPUTS),
                  _('O jogo renderiza nesse tamanho. '
@@ -3680,7 +3858,8 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                  'fg_hudless', 'vram_use', 'grass_detail', 'grass_distance', 'grass_height', 'weed_distance',
                  'weed_height', 'grass_shadows', 'grass_fade', 'audio_channels', 'audio_lfe', 'sound_firmware',
                  'mouse', 'mouse_sens', 'mouse_invert', 'button_icons', 'ui_language', 'language', 'skip_logos',
-                 'skip_film', 'play_mode', 'debug_menu', 'debug_watch', 'dlss_compare')
+                 'skip_film', 'play_mode', 'debug_menu', 'debug_watch', 'dlss_compare',
+                 'hdr_tonemap', 'hdr_white', 'hdr_peak', 'hdr_ui_nits', 'hdr_grading', 'dither') + HDR_GRADE_KEYS
 
     def reload_live_settings(self):
         saved = load_json(settings_file(), {})

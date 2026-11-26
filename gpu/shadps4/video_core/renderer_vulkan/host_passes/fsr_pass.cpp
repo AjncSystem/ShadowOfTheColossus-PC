@@ -267,6 +267,8 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
                static_cast<AF1>(input_size.width), static_cast<AF1>(input_size.height), (AF1)width,
                (AF1)height);
     consts.Sample[0] = 0; // sotc: not squared for HDR, see the rcas pass
+    // sotc: linear HDR: compress on read; expand here unless RCAS follows (it expands).
+    consts.Sample[1] = settings.linear_hdr ? (settings.use_rcas ? 1u : 3u) : 0u;
 
     if (settings.use_rcas) {
 
@@ -344,6 +346,7 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         { // rcas
             consts = {};
             FsrRcasCon(reinterpret_cast<AU1*>(&consts.Const0), settings.rcas_attenuation);
+            consts.Sample[1] = settings.linear_hdr ? 2u : 0u; // the EASU output is compressed
             // sotc: no squaring of the output for HDR (AMD's sample assumes gamma 2 input); the game's
             // HDR buffer is PQ encoded and squaring it made the picture far too dark.
             consts.Sample[0] = 0;

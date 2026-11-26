@@ -43,6 +43,7 @@
 #include "video_core/renderer_vulkan/sotc_cull_queue.h"
 #include "video_core/buffer_cache/region_manager.h"
 #include "video_core/sotc_live.h"
+#include "video_core/sotc_tonemap.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "bbport_toggles.h"
 #include "video_core/sotc_stats.h"
@@ -3073,6 +3074,44 @@ constexpr u64 kTonemapHash = 0x291dbcd0;
 constexpr u64 kHdrCompositeHash = 0xdfd767b6;
 constexpr u32 kHdrCurveDword = 20; // its exponent k
 constexpr u32 kVignetteDword = 51;
+// sotc: the bloom's upsample chain (one 9-tap tent upsample per mip, output * dword 24), from the
+// bright pass (0x99288157) down to the tonemap's img6. Linear after the bright pass, so the scale
+// of the frame's first upsample scales the bloom (SOTC_FX_BLOOM).
+constexpr u64 kBloomUpsampleHash = 0x181538e7;
+constexpr u32 kBloomScaleDword = 24;
+// sotc: the volumetric fog's apply pass: the fog volume (img3: in-scatter, transmittance) at the
+// slice of the pixel's distance, slice = (distance * dword 31)^dword 32. Scaling dword 31 scales
+// the distance the fog gathers over: 0 none, 2 twice as thick (SOTC_FX_FOG). The fog that
+// materials add themselves (transparents) stays the game's.
+constexpr u64 kFogApplyHash = 0x059b9591;
+constexpr u32 kFogDistanceDword = 31;
+// sotc: the motion blur's first pass (velocity tiles, only with r_motionBlurEnable=1): the blur
+// vector in pixels is the velocity times dwords 40 and 41 (render width and height times the
+// game's amount, r_motionBlurAmount 0.11, which the game resets over a command line value), capped
+// at 32 pixels by the shader. Scaling both scales the blur length (SOTC_FX_MOTION_BLUR).
+constexpr u64 kMotionBlurHash = 0x5bb232e8;
+constexpr u32 kMotionBlurDword = 40;
+
+// sotc: the game's colour grading in the tonemap's constants at a strength 0..1 (SOTC_HDR_GRADING):
+// saturation and contrast towards 1, the tint and the per channel gamma towards grey (their
+// brightness kept), the lift towards 0 and the gain towards its mean. The overall gamma (36) is
+// left alone: it is the scene's brightness more than its colour.
+static void TonemapGrading(std::vector<u32>& flat, float s) {
+    const auto get = [&](u32 d) { return std::bit_cast<float>(flat[d]); };
+    const auto put = [&](u32 d, float v) { flat[d] = std::bit_cast<u32>(v); };
+    const auto towards = [&](u32 d, float neutral) { put(d, neutral + (get(d) - neutral) * s); };
+    towards(35, 1.0f);
+    towards(40, 1.0f);
+    const float tint = 0.3f * get(37) + 0.59f * get(38) + 0.11f * get(39);
+    const float ch = (get(45) + get(46) + get(47)) / 3.0f;
+    const float gain = (get(48) + get(49) + get(50)) / 3.0f;
+    for (u32 c = 0; c < 3; ++c) {
+        towards(37 + c, tint);
+        towards(45 + c, ch);
+        towards(41 + c, 0.0f);
+        towards(48 + c, gain);
+    }
+}
 
 bool Rasterizer::TaaOff() {
     static const int forced = [] { // SOTC_TAA_OFF=1/0 forces; unset follows DLSS
@@ -3675,9 +3714,25 @@ void Rasterizer::CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dm
     }
 }
 
+static u64 FxTracePeriod();
+static void FxTrace(const Shader::Info& stage, VAddr color0, u32 color0_fmt);
+
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
     const SotcStats::SplitTimer bind_split{SotcStats::SplitBind};
     fast_bind_hit = false;
+    // sotc: SOTC_FX_TRACE only; the default path reads no registers here.
+    static const bool fx_trace = FxTracePeriod() != 0;
+    if (fx_trace) {
+        const auto& cb = liverpool->DrawRegs().color_buffers[0];
+        const VAddr color0 = cb.Address();
+        const u32 color0_fmt =
+            static_cast<u32>(cb.GetDataFmt()) * 100 + static_cast<u32>(cb.GetNumberFmt());
+        for (const auto* stage : pipeline->GetStages()) {
+            if (stage) {
+                FxTrace(*stage, color0, color0_fmt);
+            }
+        }
+    }
     if (pipeline->IsCompute() && // sotc: the three tests return false at once for a graphics pipeline
         (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
          IsComputeImageClear(pipeline))) {
@@ -4622,24 +4677,151 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         std::fprintf(stderr, "SOTC TAA off: resolve without history blend\n");
                     }
                 }
+                // sotc: SOTC_TONEMAP_LOG=1: the tonemap's constants (dwords 20..54: curve mode,
+                // its parameters, saturation, contrast, tint, gamma, lift / gain, vignette) each
+                // time they change, as `SOTC TONEMAP` lines.
+                static const bool tonemap_log = [] {
+                    const char* v = std::getenv("SOTC_TONEMAP_LOG");
+                    return v && v[0] == '1';
+                }();
+                if (tonemap_log && stage.pgm_hash == kTonemapHash && stage.FlatBuf().size() > 54) {
+                    static std::array<u32, 35> last{};
+                    std::array<u32, 35> now{};
+                    std::memcpy(now.data(), &stage.FlatBuf()[20], sizeof(now));
+                    if (now != last) {
+                        last = now;
+                        std::string line = fmt::format("SOTC TONEMAP mode {}", now[0]);
+                        for (size_t i = 1; i < now.size(); ++i) {
+                            line += fmt::format(" {}={:.4g}", 20 + i, std::bit_cast<float>(now[i]));
+                        }
+                        std::fprintf(stderr, "%s\n", line.c_str());
+                    }
+                }
+                // sotc: bloom strength, on the first upsample of the frame (the tonemap draw
+                // starts the next frame's count).
+                static bool bloom_first = true;
+                static std::vector<u32> bloom_flat;
+                if (stage.pgm_hash == kBloomUpsampleHash &&
+                    stage.FlatBuf().size() > kBloomScaleDword && std::exchange(bloom_first, false)) {
+                    const float bloom = SotcTonemap::bloom.load(std::memory_order_relaxed);
+                    static float logged_bloom = -1.0f;
+                    if (tonemap_log && bloom != logged_bloom) {
+                        logged_bloom = bloom;
+                        std::fprintf(stderr, "SOTC BLOOM x%g (game scale %g)\n", bloom,
+                                     std::bit_cast<float>(stage.FlatBuf()[kBloomScaleDword]));
+                    }
+                    if (bloom != 1.0f) {
+                        bloom_flat.assign(stage.FlatBuf().begin(), stage.FlatBuf().end());
+                        bloom_flat[kBloomScaleDword] = std::bit_cast<u32>(
+                            std::bit_cast<float>(bloom_flat[kBloomScaleDword]) * bloom);
+                        flat = bloom_flat.data();
+                    }
+                }
+                // sotc: SOTC_FLAT_DUMP=<hash>[,<hash>...] (diagnostics): the flatbuf of those
+                // shaders as floats, every 300th frame (finding an effect's constants).
+                static const std::string flat_dump = [] {
+                    const char* v = std::getenv("SOTC_FLAT_DUMP");
+                    return std::string(v ? v : "");
+                }();
+                if (!flat_dump.empty() &&
+                    SotcStats::flip_count.load(std::memory_order_relaxed) % 300 == 0 &&
+                    flat_dump.find(fmt::format("{:#010x}", stage.pgm_hash)) != std::string::npos) {
+                    std::string line = fmt::format("SOTC FLAT {:#010x}:", stage.pgm_hash);
+                    for (size_t d = 0; d < stage.FlatBuf().size(); ++d) {
+                        line += fmt::format(" {}={:g}", d, std::bit_cast<float>(stage.FlatBuf()[d]));
+                    }
+                    std::fprintf(stderr, "%s\n", line.c_str());
+                }
+                static std::vector<u32> mb_flat;
+                if (stage.pgm_hash == kMotionBlurHash &&
+                    stage.FlatBuf().size() > kMotionBlurDword + 1) {
+                    const float mb = SotcTonemap::motion_blur.load(std::memory_order_relaxed);
+                    if (mb != 1.0f) {
+                        mb_flat.assign(stage.FlatBuf().begin(), stage.FlatBuf().end());
+                        for (u32 d = kMotionBlurDword; d <= kMotionBlurDword + 1; ++d) {
+                            mb_flat[d] = std::bit_cast<u32>(std::bit_cast<float>(mb_flat[d]) * mb);
+                        }
+                        flat = mb_flat.data();
+                    }
+                }
+                static std::vector<u32> fog_flat;
+                if (stage.pgm_hash == kFogApplyHash && stage.FlatBuf().size() > kFogDistanceDword) {
+                    const float fog = SotcTonemap::fog.load(std::memory_order_relaxed);
+                    if (fog != 1.0f) {
+                        fog_flat.assign(stage.FlatBuf().begin(), stage.FlatBuf().end());
+                        fog_flat[kFogDistanceDword] = std::bit_cast<u32>(
+                            std::bit_cast<float>(fog_flat[kFogDistanceDword]) * fog);
+                        flat = fog_flat.data();
+                    }
+                }
                 static std::vector<u32> tonemap_flat;
                 static const bool vignette_after = [] {
                     const char* v = std::getenv("SOTC_DLSS_VIGNETTE");
                     return !v || v[0] != '0';
                 }();
-                if (stage.pgm_hash == kTonemapHash && stage.FlatBuf().size() > kVignetteDword + 3 &&
-                    vignette_after && Dlssg::SuperResolutionUpscaling()) {
-                    tonemap_flat.assign(stage.FlatBuf().begin(), stage.FlatBuf().end());
-                    float params[4];
-                    std::memcpy(params, &tonemap_flat[kVignetteDword], sizeof(params));
-                    Dlssg::NoteVignette(params);
-                    tonemap_flat[kVignetteDword + 3] = 0; // strength 0.0f
-                    flat = tonemap_flat.data();
-                    static bool reported = false;
-                    if (!std::exchange(reported, true)) {
-                        std::fprintf(stderr,
-                                     "SOTC DLSS: vignette after upscaling (%g %g %g %g)\n",
-                                     params[0], params[1], params[2], params[3]);
+                if (stage.pgm_hash == kTonemapHash && stage.FlatBuf().size() > kVignetteDword + 3) {
+                    const bool upscaled = Dlssg::SuperResolutionUpscaling();
+                    const bool vignette = vignette_after && upscaled;
+                    const float grading =
+                        SotcTonemap::grading.load(std::memory_order_relaxed);
+                    // sotc: the tone mapper of the user's choice, as the curve constants of the
+                    // game's own pass (sotc_tonemap.h): any upscaler, the UI untouched.
+                    const int tm = SotcTonemap::wanted.load(std::memory_order_relaxed);
+                    const float vignette_scale =
+                        SotcTonemap::vignette.load(std::memory_order_relaxed);
+                    bloom_first = true;
+                    if (vignette || grading != 1.0f || tm != SotcTonemap::kVanilla ||
+                        vignette_scale != 1.0f) {
+                        tonemap_flat.assign(stage.FlatBuf().begin(), stage.FlatBuf().end());
+                        flat = tonemap_flat.data();
+                    }
+                    if (vignette_scale != 1.0f) { // sotc: SOTC_FX_VIGNETTE (also after DLSS)
+                        tonemap_flat[kVignetteDword + 3] = std::bit_cast<u32>(
+                            std::bit_cast<float>(tonemap_flat[kVignetteDword + 3]) * vignette_scale);
+                    }
+                    if (vignette) {
+                        float params[4];
+                        std::memcpy(params, &tonemap_flat[kVignetteDword], sizeof(params));
+                        Dlssg::NoteVignette(params);
+                        tonemap_flat[kVignetteDword + 3] = 0; // strength 0.0f
+                        static bool reported = false;
+                        if (!std::exchange(reported, true)) {
+                            std::fprintf(stderr,
+                                         "SOTC DLSS: vignette after upscaling (%g %g %g %g)\n",
+                                         params[0], params[1], params[2], params[3]);
+                        }
+                    }
+                    if (grading != 1.0f) {
+                        TonemapGrading(tonemap_flat, grading);
+                    }
+                    float plus[5]{};
+                    const bool curved = tm != SotcTonemap::kVanilla &&
+                                        SotcTonemap::ApplyCurve(tonemap_flat, tm, plus);
+                    const bool hue_curve = curved && (tm == SotcTonemap::kVanillaPlusHue ||
+                                                      tm == SotcTonemap::kRenoDrt);
+                    if (hue_curve) {
+                        for (int i = 0; i < 5; ++i) {
+                            SotcTonemap::hue_curve[i].store(plus[i], std::memory_order_relaxed);
+                        }
+                    }
+                    SotcTonemap::hue_curve_on.store(hue_curve, std::memory_order_release);
+                    SotcTonemap::drt_on.store(curved && tm == SotcTonemap::kRenoDrt,
+                                              std::memory_order_release);
+                    // sotc: the line's highlights reach the final pass's curve uncut.
+                    if (curved && (tm == SotcTonemap::kNone || hue_curve)) {
+                        SotcTonemap::RaiseCaps(tonemap_flat);
+                    }
+                    SotcTonemap::source_limit.store(
+                        SotcTonemap::OutputLimit(flat, stage.FlatBuf().size()),
+                        std::memory_order_relaxed);
+                    static int logged_tm = -1;
+                    const int now_tm = curved ? tm : SotcTonemap::kVanilla;
+                    if (tonemap_log && now_tm != logged_tm) {
+                        logged_tm = now_tm;
+                        std::fprintf(stderr, "SOTC TONEMAP applied %d: A..E %g %g %g %g %g\n",
+                                     logged_tm, std::bit_cast<float>(flat[28]),
+                                     std::bit_cast<float>(flat[29]), std::bit_cast<float>(flat[30]),
+                                     std::bit_cast<float>(flat[31]), std::bit_cast<float>(flat[32]));
                     }
                 }
                 const auto veg_scales = VegetationScales();
@@ -5217,6 +5399,52 @@ bool Rasterizer::DepthSampledAsAttachment(VideoCore::ImageId image_id, const Vid
            !Vulkan::LiverpoolToVK::IsFormatStencilCompatible(fmt);
 }
 
+// sotc: SOTC_FX_TRACE=1: every 600 flips, each shader stage of one frame in order: its hash, the
+// addresses of the textures it reads (w: written), and for pixel shaders colour target 0. For
+// finding the passes behind post effects (bloom, fog) and their constants.
+static u64 FxTracePeriod() {
+    // SOTC_FX_TRACE=1: every 600th frame; a larger value is the period; 0 or unset: off.
+    static const u64 period = [] {
+        const char* v = std::getenv("SOTC_FX_TRACE");
+        const long long n = v ? std::atoll(v) : 0;
+        return n <= 0 ? u64{0} : n == 1 ? u64{600} : static_cast<u64>(n);
+    }();
+    return period;
+}
+
+static void FxTrace(const Shader::Info& stage, VAddr color0, u32 color0_fmt) {
+    const u64 period = FxTracePeriod();
+    static u64 frame_seen = ~0ull;
+    static u32 lines = 0;
+    const u64 frame = SotcStats::flip_count.load(std::memory_order_relaxed);
+    if (frame % period > 3) {
+        return;
+    }
+    if (frame != frame_seen) {
+        frame_seen = frame;
+        lines = 0;
+        std::fprintf(stderr, "SOTC FX frame %llu\n", static_cast<unsigned long long>(frame));
+    }
+    if (++lines > 40000) {
+        return;
+    }
+    std::string line = fmt::format("SOTC FX {} {:#010x}", static_cast<int>(stage.hw_stage),
+                                   stage.pgm_hash);
+    if (stage.hw_stage == Shader::HwStage::Fragment) {
+        line += fmt::format(" rt {:#x}/{}", color0, color0_fmt);
+    }
+    for (const auto& image_desc : stage.images) {
+        if (image_desc.array_size != 0) {
+            continue;
+        }
+        const auto tsharp = image_desc.GetSharp(stage);
+        line += fmt::format(" {}{:#x}/{}.{}", image_desc.is_written ? "w" : "", tsharp.Address(),
+                            static_cast<u32>(tsharp.GetDataFmt()),
+                            static_cast<u32>(tsharp.GetNumberFmt()));
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     const auto texture_lock = texture_cache.BatchLock(); // sotc: one lock for the pass
     image_bindings.clear();
@@ -5519,7 +5747,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
     // sotc: DLSS super resolution: the game's final composite samples the UI layer (an sRGB render
     // target) and the tonemapped fp16 scene, nothing else, into a video out surface.
-    if (Dlssg::SuperResolution() && stage.sw_stage == Shader::SwStage::Fragment &&
+    if (Dlssg::CompositeWanted() && stage.sw_stage == Shader::SwStage::Fragment &&
         image_bindings.size() == 2 && image_bindings[0].first && image_bindings[1].first &&
         cb_descs[0].first) {
         const u32 ui_i = CompositeUiIndex();
@@ -5541,7 +5769,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
     // sotc: DLSS super resolution: the game's final composite samples the UI layer (an sRGB render
     // target) and the tonemapped fp16 scene, nothing else, into a video out surface.
-    if (Dlssg::SuperResolution() && stage.sw_stage == Shader::SwStage::Fragment &&
+    if (Dlssg::CompositeWanted() && stage.sw_stage == Shader::SwStage::Fragment &&
         image_bindings.size() == 2 && image_bindings[0].first && image_bindings[1].first &&
         cb_descs[0].first) {
         const auto& ui = texture_cache.GetImage(image_bindings[0].first);

@@ -5,6 +5,11 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <psapi.h>
+#else
+#include <pthread.h>
+#include <sys/resource.h>
+#include <time.h>
+#include <unistd.h>
 #endif
 
 namespace SotcStats {
@@ -41,14 +46,39 @@ uint64_t SplitProcessFaults() {
                : 0;
 }
 #else
-void RegisterSplitThread(SplitThread) {}
+// sotc (Linux): the registered thread's own CPU clock (pthread_getcpuclockid), in nanoseconds,
+// converted to the TSC ticks of Ticks() so the SOTC_DRAW_SPLIT lines read the same as on Windows.
+static std::atomic<clockid_t> split_clocks[SplitThreads]{};
+static std::atomic<bool> split_registered[SplitThreads]{};
 
-uint64_t SplitThreadCycles(SplitThread) {
-    return 0;
+void RegisterSplitThread(SplitThread which) {
+    if (!kDrawSplit) {
+        return;
+    }
+    clockid_t clock{};
+    if (pthread_getcpuclockid(pthread_self(), &clock) == 0) {
+        split_clocks[which].store(clock, std::memory_order_relaxed);
+        split_registered[which].store(true, std::memory_order_release);
+    }
+}
+
+uint64_t SplitThreadCycles(SplitThread which) {
+    if (!split_registered[which].load(std::memory_order_acquire)) {
+        return 0;
+    }
+    timespec ts{};
+    if (clock_gettime(split_clocks[which].load(std::memory_order_relaxed), &ts) != 0) {
+        return 0;
+    }
+    const double ns = static_cast<double>(ts.tv_sec) * 1e9 + static_cast<double>(ts.tv_nsec);
+    return static_cast<uint64_t>(ns * TicksPerMs() / 1e6);
 }
 
 uint64_t SplitProcessFaults() {
-    return 0;
+    rusage usage{};
+    return getrusage(RUSAGE_SELF, &usage) == 0
+               ? static_cast<uint64_t>(usage.ru_minflt) + static_cast<uint64_t>(usage.ru_majflt)
+               : 0;
 }
 #endif
 
@@ -58,7 +88,8 @@ uint64_t SystemRamBytes() {
     status.dwLength = sizeof(status);
     return GlobalMemoryStatusEx(&status) ? status.ullTotalPhys : 0;
 #else
-    return 0;
+    const long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
+    return pages > 0 && page > 0 ? static_cast<uint64_t>(pages) * static_cast<uint64_t>(page) : 0;
 #endif
 }
 

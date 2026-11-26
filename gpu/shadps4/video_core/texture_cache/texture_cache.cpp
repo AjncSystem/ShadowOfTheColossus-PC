@@ -1726,11 +1726,35 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
     return it->second.Handle();
 }
 
+void TextureCache::NoteVideoOutSurface(VAddr address, u32 width, u32 height) {
+    std::scoped_lock lock{mutex};
+    for (const auto& vo : video_out_surfaces) {
+        if (vo.address == address && vo.width == width && vo.height == height) {
+            return;
+        }
+    }
+    video_out_surfaces.push_back({address, width, height});
+}
+
 void TextureCache::RegisterImage(ImageId image_id) {
     Image& image = slot_images[image_id];
     ASSERT_MSG(False(image.flags & ImageFlagBits::Registered),
                "Trying to register an already registered image");
     image.flags |= ImageFlagBits::Registered;
+    // sotc: the video out mark belonged to the image found at registration only. An image of a
+    // video out buffer freed and made again (the cold sweep during a slow first start, with the
+    // shader or pipeline cache cold) lost it, and the game's composite into that buffer was no
+    // longer captured: every other frame went out without FSR 3.1/DLSS and without the vignette
+    // (double vignette flicker, PS4 Pro mode). A new image at a registered buffer is one again.
+    if (!image.usage.vo_surface) {
+        for (const auto& vo : video_out_surfaces) {
+            if (vo.address == image.info.guest_address && vo.width == image.info.size.width &&
+                vo.height == image.info.size.height) {
+                image.usage.vo_surface = 1u;
+                break;
+            }
+        }
+    }
     ++image_set_generation;
     ++addr_gens[AddrGenSlot(image.info.guest_address)]; // sotc: FindMemo per-address gen
     total_used_memory += Common::AlignUp(image.info.guest_size, 1024);

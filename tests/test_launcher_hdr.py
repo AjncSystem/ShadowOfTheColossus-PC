@@ -50,6 +50,38 @@ class HdrPictureTests(unittest.TestCase):
     def test_level_text_as_the_menu_writes_it(self):
         self.assertEqual([launcher.level_text(v) for v in (200, 200.0, -0.5, 0)], ['200', '200', '-0.5', '0'])
 
+    def test_dither_on_by_default_and_reloaded_after_a_game(self):
+        self.assertIs(launcher.APP_DEFAULTS['dither'], True)
+        self.assertIn('dither', launcher.Launcher.LIVE_KEYS)
+
+    def test_dlss_sharpness_keeps_its_old_names(self):
+        # Before 1.5 and 2 were added, 0 was High, 0.5 Medium and 1 Low: a saved choice keeps its name.
+        names = {value: label[1] for value, label in launcher.DLSS_SHARPNESS}
+        self.assertEqual(names['0'], 'High (default)')
+        self.assertEqual(names['0.5'], 'Medium')
+        self.assertEqual(names['1'], 'Low')
+        # The F1 menu's slider, from off to the sharpest, has the launcher's names.
+        overlay = (ROOT / 'gpu/shim/bbport_overlay.cpp').read_text(encoding='utf-8')
+        item = overlay[overlay.index('"DLSS / FSR 4 sharpening"'):]
+        item = item[:item.index('[] {')]
+        menu = re.findall(r'L\("[^"]*", "([^"]*)"\), "\d"', item)
+        order = ['off', '2', '1.5', '1', '0.5', '0']
+        self.assertEqual(menu, [names[v] for v in order])
+
+
+class GradeNeutralTests(unittest.TestCase):
+    def test_neutral_check_matches_the_shader(self):
+        """The presenter skips the scene key when PostProcessingPass::GradeNeutral says grade() in
+        post_process.frag returns early: both must test the same controls at the same values."""
+        shader = (ROOT / 'gpu/shadps4/video_core/host_shaders/post_process.frag').read_text(encoding='utf-8')
+        early = re.search(r'vec3 grade\(vec3 nits\) \{.*?if \((.*?)\) \{', shader, re.S).group(1)
+        header = (ROOT / 'gpu/shadps4/video_core/renderer_vulkan/host_passes/pp_pass.h').read_text(encoding='utf-8')
+        neutral = re.search(r'GradeNeutral\(const Settings& s\) \{\s*return (.*?);', header, re.S).group(1)
+        in_shader = {k: float(v) for k, v in re.findall(r'pp\.(\w+) == ([\d.]+)', early)}
+        in_header = {k: float(v) for k, v in re.findall(r's\.(\w+) == ([\d.]+)f', neutral)}
+        self.assertTrue(in_shader)
+        self.assertEqual(in_header, in_shader)
+
 
 if __name__ == '__main__':
     unittest.main()

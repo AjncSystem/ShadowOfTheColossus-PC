@@ -83,19 +83,19 @@ static float HdrLevel(const char* key, const char* env, float fallback) {
     return static_cast<float>(std::atof(v.c_str()));
 }
 
-static void RefreshHdrLevels(HostPasses::PostProcessingPass::Settings& s) {
+// sotc: `native_window`: the game window, for the auto peak of the display it is on.
+static void RefreshHdrLevels(HostPasses::PostProcessingPass::Settings& s, void* native_window) {
     struct Start {
-        float white, peak, ui, auto_peak;
+        float white, peak, ui;
     };
-    static const Start start = [] {
+    static const Start start = [native_window] {
         Start st{};
         st.white = std::clamp(HdrLevel("hdr_white", "SOTC_HDR_WHITE", 200.0f), 40.0f, 1000.0f);
         st.peak = std::max(HdrLevel("hdr_peak", "SOTC_HDR_PEAK", 0.0f), 0.0f);
         st.ui = std::max(HdrLevel("hdr_ui_nits", "SOTC_HDR_UI_NITS",
                                   3.0f * HdrLevel("hdr_ui", "SOTC_HDR_UI", 0.0f)),
                          0.0f);
-        const float reported = SotcDisplayPeakNits();
-        st.auto_peak = reported >= 200.0f ? reported : 1000.0f;
+        const float reported = SotcDisplayPeakNits(native_window);
         LOG_INFO(Render_Vulkan,
                  "SOTC HDR: game brightness {} nits, peak {} (display reports {} nits), UI "
                  "brightness {}",
@@ -108,8 +108,9 @@ static void RefreshHdrLevels(HostPasses::PostProcessingPass::Settings& s) {
     const float live_ui = SotcLive::hdr_ui.load(std::memory_order_relaxed);
     s.hdr_white = live_white >= 0.0f ? live_white : start.white;
     float peak = live_peak >= 0.0f ? live_peak : start.peak;
-    if (peak <= 0.0f) {
-        peak = start.auto_peak;
+    if (peak <= 0.0f) { // auto: the display the window is on now (it may have moved)
+        const float reported = SotcDisplayPeakNits(native_window);
+        peak = reported >= 200.0f ? reported : 1000.0f;
     }
     // At 10000 the EETF does nothing; 0 skips it in the shader.
     s.hdr_peak = peak >= 10000.0f ? 0.0f : std::max(peak, s.hdr_white);
@@ -1152,7 +1153,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     }
     RefreshEffectLevels();
     if (pp_settings.hdr == 1) {
-        RefreshHdrLevels(pp_settings);
+        RefreshHdrLevels(pp_settings, window.GetWindowInfo().render_surface);
         // sotc: the display gets the peak the roll-off targets (10000: no roll-off).
         swapchain.SetHdrMetadata(pp_settings.hdr_peak > 0.0f ? pp_settings.hdr_peak : 10000.0f,
                                  pp_settings.hdr_white);
@@ -1160,7 +1161,7 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         // sotc: SDR: the same picture controls, grain and game colour grading strength, in SDR
         // units (white = peak = 100, so blowout and flare work alike); the tone mapper stays the
         // game's (SDR clips above 1), and gamma correction and gamut expansion are HDR only.
-        RefreshHdrLevels(pp_settings);
+        RefreshHdrLevels(pp_settings, window.GetWindowInfo().render_surface);
         pp_settings.hdr_white = pp_settings.hdr_peak = 100.0f;
         pp_settings.ui_white = 0.0f;
         pp_settings.gamma_correction = pp_settings.gamut_expansion = 0.0f;
@@ -1171,12 +1172,18 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         SotcTonemap::wanted.store(SotcTonemap::kVanilla, std::memory_order_relaxed);
         SotcTonemap::grading.store(1.0f, std::memory_order_relaxed);
     }
-    // sotc: grain and dither move every frame; dithering to the swapchain's depth (SOTC_DITHER=0:
-    // none).
-    static const bool dither = [] {
-        const char* v = std::getenv("SOTC_DITHER");
-        return !v || v[0] != '0';
+    // sotc: grain and dither move every frame; dithering to the swapchain's depth. On unless the
+    // launcher's dither (also the F1 menu's) or SOTC_DITHER=0 turns it off.
+    static const bool dither_start = [] {
+        std::string v = BbOverlay::LauncherSetting("dither");
+        if (v.empty()) {
+            const char* e = std::getenv("SOTC_DITHER");
+            v = e ? e : "";
+        }
+        return v.empty() || (v != "0" && v != "false");
     }();
+    const int dither_live = SotcLive::dither.load(std::memory_order_relaxed);
+    const bool dither = dither_live >= 0 ? dither_live != 0 : dither_start;
     static u32 present_seed = 0;
     pp_settings.seed = ++present_seed;
     pp_settings.dither_bits = dither ? (frame->is_hdr ? 10u : 8u) : 0u;
@@ -1275,12 +1282,16 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         pp_settings.ui_sharpen = upscaled.ui_full ? 0.0f : ui_sharpen; // sotc: drawn at this size
         pp_settings.hdr_curve = Dlssg::HdrCurve();
         pp_settings.sky_sharpen = sky_sharpen;
-        if (pp_settings.hdr != 2) { // sotc: the picture controls' pivot (the HUD-less pass reuses it)
+        // sotc: the picture controls' pivot (the HUD-less pass reuses it); only read by grade(),
+        // so not measured while every control is neutral.
+        if (pp_settings.hdr != 2 && !HostPasses::PostProcessingPass::GradeNeutral(pp_settings)) {
             pp_pass.MeasureKey(cmdbuf, scene,
                                pp_settings.hdr == 1
                                    ? HostPasses::PostProcessingPass::KeyInput::HdrScene
                                    : HostPasses::PostProcessingPass::KeyInput::Sdr,
                                pp_settings.hdr_curve);
+        } else {
+            pp_pass.SkipKey();
         }
         pp_pass.Render(cmdbuf, scene, scene_size, *frame, pp_settings, upscaled.ui, upscaled.sky);
         upscaled_scene = upscaled.scene_low ? vk::ImageView{} : scene;
@@ -1300,13 +1311,17 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
             attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
         pp_settings.ui = 0;
         pp_settings.vignette = {};
-        if (pp_settings.hdr != 2) { // sotc: the picture controls' pivot (the HUD-less pass reuses it)
+        // sotc: the picture controls' pivot (the HUD-less pass reuses it); not measured while
+        // every control is neutral.
+        if (pp_settings.hdr != 2 && !HostPasses::PostProcessingPass::GradeNeutral(pp_settings)) {
             using KeyInput = HostPasses::PostProcessingPass::KeyInput;
             pp_pass.MeasureKey(cmdbuf, image_view,
                                pp_settings.hdr == 1        ? KeyInput::Pq
                                : pp_settings.srgb_input    ? KeyInput::SdrEncoded
                                                            : KeyInput::Sdr,
                                1.0f);
+        } else {
+            pp_pass.SkipKey();
         }
         pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
     }

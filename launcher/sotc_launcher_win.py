@@ -230,7 +230,7 @@ APP_DEFAULTS = {'ui_language': '', 'game_dir': str(PORT_DIR.parent / GAME_ID), '
                 'hdr_exposure': '0', 'hdr_contrast': '50', 'hdr_shadows': '50', 'hdr_highlights': '50',
                 'hdr_saturation': '50', 'hdr_blowout': '0', 'hdr_hue_correction': '100', 'hdr_flare': '0',
                 'hdr_gamma_correction': '0', 'hdr_highlight_saturation': '50', 'hdr_grain': '0',
-                'hdr_gamut_expansion': '0', 'hdr_grain_size': '100', 'hdr_grading': '100',
+                'hdr_gamut_expansion': '0', 'hdr_grain_size': '100', 'hdr_grading': '100', 'dither': True,
                 'check_updates': True, 'skip_version': '', 'play_mode': 'custom', 'exit_backup': True, 'news_seen': '', 'expert_view': False, 'windows_title_bar': False, 'game_monitor': '', 'minimize_to_tray': False}
 # sotc: improvements that changed a default, by the version that changed it. Settings saved by an
 # older launcher get them once when this one first loads them (load_settings). Every release that
@@ -498,8 +498,10 @@ DLSS_FACTORS = {'dlaa': 1.0, 'quality': 1.5, 'balanced': 1.724, 'performance': 2
 RENDER_ALIGN = 8
 MIN_RENDER_HEIGHT = 360
 # RCAS after DLSS (SOTC_DLSS_SHARPEN, attenuation in stops: 0 = sharpest).
-DLSS_SHARPNESS = [('0', ('Máxima (padrão)', 'Highest (default)')), ('0.5', ('Alta', 'High')), ('1', ('Média', 'Medium')),
-                  ('1.5', ('Baixa', 'Low')), ('2', ('Mínima', 'Lowest')), ('off', ('Desligada', 'Off'))]
+# The labels of 0, 0.5 and 1 are the ones they had before 1.5 and 2 were added, so a saved choice
+# keeps its name.
+DLSS_SHARPNESS = [('0', ('Alta (padrão)', 'High (default)')), ('0.5', ('Média', 'Medium')), ('1', ('Baixa', 'Low')),
+                  ('1.5', ('Muito baixa', 'Very low')), ('2', ('Mínima', 'Lowest')), ('off', ('Desligada', 'Off'))]
 # Unsharp amounts of the upscaled text/UI and of the sky (SOTC_DLSS_UI_SHARPEN / _SKY_SHARPEN).
 DLSS_UI_SHARPNESS = [('3', ('Alta (padrão)', 'High (default)')), ('1.5', ('Média', 'Medium')), ('0', ('Desligada', 'Off'))]
 DLSS_SKY_SHARPNESS = [('2', ('Alta (padrão)', 'High (default)')), ('1', ('Média', 'Medium')), ('0', ('Desligada', 'Off'))]
@@ -1549,6 +1551,11 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         ]
         for key, title, options, hint in rows:
             self.row(f, _(*title), self.level(f, key, options), _(*hint))
+        self.check(f, 'dither', _('Pontilhado (dithering)', 'Dithering'),
+                   _('Um ruído fino antes dos 8 bits (SDR) ou 10 bits (HDR) da tela: tira as faixas no céu e na '
+                     'névoa. Desligado é o original.',
+                     "A fine noise before the display's 8 bits (SDR) or 10 bits (HDR): it removes banding in "
+                     'the sky and fog. Off is the original.'))
 
         def matching():
             tm = self.var('hdr_tonemap').get()
@@ -3852,7 +3859,7 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                  'weed_height', 'grass_shadows', 'grass_fade', 'audio_channels', 'audio_lfe', 'sound_firmware',
                  'mouse', 'mouse_sens', 'mouse_invert', 'button_icons', 'ui_language', 'language', 'skip_logos',
                  'skip_film', 'play_mode', 'debug_menu', 'debug_watch', 'dlss_compare',
-                 'hdr_tonemap', 'hdr_white', 'hdr_peak', 'hdr_ui_nits', 'hdr_grading') + HDR_GRADE_KEYS
+                 'hdr_tonemap', 'hdr_white', 'hdr_peak', 'hdr_ui_nits', 'hdr_grading', 'dither') + HDR_GRADE_KEYS
 
     def reload_live_settings(self):
         saved = load_json(settings_file(), {})

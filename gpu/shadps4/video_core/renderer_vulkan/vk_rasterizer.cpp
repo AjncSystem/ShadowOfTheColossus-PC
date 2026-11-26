@@ -3190,16 +3190,23 @@ void Rasterizer::CommitFastBind(const Pipeline* pipeline, u64 hash, bool uses_dm
     fast_bind.valid = true;
 }
 
+static u64 FxTracePeriod();
 static void FxTrace(const Shader::Info& stage, VAddr color0, u32 color0_fmt);
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
     const SotcStats::SplitTimer bind_split{SotcStats::SplitBind};
     fast_bind_hit = false;
-    for (const auto* stage : pipeline->GetStages()) {
-        if (stage) {
-            const auto& cb = liverpool->DrawRegs().color_buffers[0];
-            FxTrace(*stage, cb.Address(),
-                    static_cast<u32>(cb.GetDataFmt()) * 100 + static_cast<u32>(cb.GetNumberFmt()));
+    // sotc: SOTC_FX_TRACE only; the default path reads no registers here.
+    static const bool fx_trace = FxTracePeriod() != 0;
+    if (fx_trace) {
+        const auto& cb = liverpool->DrawRegs().color_buffers[0];
+        const VAddr color0 = cb.Address();
+        const u32 color0_fmt =
+            static_cast<u32>(cb.GetDataFmt()) * 100 + static_cast<u32>(cb.GetNumberFmt());
+        for (const auto* stage : pipeline->GetStages()) {
+            if (stage) {
+                FxTrace(*stage, color0, color0_fmt);
+            }
         }
     }
     if (IsComputeImageCopy(pipeline) || IsComputeMetaClear(pipeline) ||
@@ -4706,16 +4713,18 @@ bool Rasterizer::DepthSampledAsAttachment(VideoCore::ImageId image_id, const Vid
 // sotc: SOTC_FX_TRACE=1: every 600 flips, each shader stage of one frame in order: its hash, the
 // addresses of the textures it reads (w: written), and for pixel shaders colour target 0. For
 // finding the passes behind post effects (bloom, fog) and their constants.
-static void FxTrace(const Shader::Info& stage, VAddr color0, u32 color0_fmt) {
-    // SOTC_FX_TRACE=1: every 600th frame; a larger value is the period.
+static u64 FxTracePeriod() {
+    // SOTC_FX_TRACE=1: every 600th frame; a larger value is the period; 0 or unset: off.
     static const u64 period = [] {
         const char* v = std::getenv("SOTC_FX_TRACE");
         const long long n = v ? std::atoll(v) : 0;
         return n <= 0 ? u64{0} : n == 1 ? u64{600} : static_cast<u64>(n);
     }();
-    if (period == 0) {
-        return;
-    }
+    return period;
+}
+
+static void FxTrace(const Shader::Info& stage, VAddr color0, u32 color0_fmt) {
+    const u64 period = FxTracePeriod();
     static u64 frame_seen = ~0ull;
     static u32 lines = 0;
     const u64 frame = SotcStats::flip_count.load(std::memory_order_relaxed);

@@ -12,6 +12,7 @@
 #include "bbport_overlay.h"
 #include "bbport_settings.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/sotc_display_peak.h"
 #include "video_core/sotc_event.h"
 #include "video_core/sotc_stats.h"
 #include "video_core/sotc_ui_lang.h"
@@ -358,6 +359,10 @@ bool WindowSDL::PollEvents() {
             height = h;
             break;
         }
+        case SDL_EVENT_WINDOW_DISPLAY_CHANGED:
+        case SDL_EVENT_WINDOW_HDR_STATE_CHANGED:
+            Vulkan::SotcDisplayPeakChanged(); // sotc: the auto HDR peak is asked for again
+            break;
         case SDL_EVENT_QUIT:
         case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
             is_open = false;

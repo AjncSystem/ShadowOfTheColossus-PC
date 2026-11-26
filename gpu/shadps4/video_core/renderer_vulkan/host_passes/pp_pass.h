@@ -94,6 +94,21 @@ public:
     enum class KeyInput : u32 { HdrScene = 0, Pq = 1, Sdr = 2, SdrEncoded = 3 };
     void MeasureKey(vk::CommandBuffer cmdbuf, vk::ImageView input, KeyInput mode, float curve);
 
+    /// sotc: true when grade() in post_process.frag returns early (every picture control
+    /// neutral), so nothing reads the key and MeasureKey can be skipped. Keep in step with the
+    /// shader's check.
+    static bool GradeNeutral(const Settings& s) {
+        return s.exposure == 1.0f && s.contrast == 1.0f && s.shadows == 1.0f &&
+               s.highlights == 1.0f && s.saturation == 1.0f && s.blowout == 0.0f &&
+               s.flare == 0.0f && s.gamma_correction == 0.0f && s.highlight_saturation == 1.0f;
+    }
+
+    /// sotc: the key was not measured this frame; the next MeasureKey starts from the scene as
+    /// it is then instead of easing from a stale value.
+    void SkipKey() {
+        key_measured = false;
+    }
+
 private:
     vk::UniquePipeline pipeline{};
     vk::UniquePipelineLayout pipeline_layout{};

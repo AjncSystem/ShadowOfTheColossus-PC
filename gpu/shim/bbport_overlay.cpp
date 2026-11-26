@@ -750,11 +750,12 @@ void BuildItems() {
         static const float kSharpenValues[] = {SotcLive::kSharpenOff, 2.0f, 1.5f, 1.0f, 0.5f, 0.0f};
         MenuItem& sharpen = AddLive(
             kTabDisplay, L("Nitidez do DLSS / FSR 4", "DLSS / FSR 4 sharpening"),
-            L("O realce de nitidez depois do DLSS ou do FSR 4, ao vivo. Máxima é o padrão.",
-              "The sharpening after DLSS or FSR 4, live. Highest is the default."),
-            {{L("Desligada", "Off"), "0"}, {L("Mínima", "Lowest"), "1"}, {L("Baixa", "Low"), "2"},
-             {L("Média", "Medium"), "3"}, {L("Alta", "High"), "4"},
-             {L("Máxima (padrão)", "Highest (default)"), "5"}},
+            L("O realce de nitidez depois do DLSS ou do FSR 4, ao vivo. Alta é o padrão.",
+              "The sharpening after DLSS or FSR 4, live. High is the default."),
+            // The launcher's names (DLSS_SHARPNESS): 0, 0.5 and 1 keep the ones they always had.
+            {{L("Desligada", "Off"), "0"}, {L("Mínima", "Lowest"), "1"},
+             {L("Muito baixa", "Very low"), "2"}, {L("Baixa", "Low"), "3"},
+             {L("Média", "Medium"), "4"}, {L("Alta (padrão)", "High (default)"), "5"}},
             [] {
                 float now = SotcLive::dlss_sharpen.load(std::memory_order_relaxed);
                 if (now <= SotcLive::kSharpenUnset) {
@@ -1083,6 +1084,28 @@ void BuildItems() {
             size.slider = true;
             size.shown = picture_on;
         }
+        static const int env_dither = [] {
+            std::string v = LoadLauncherSetting("dither");
+            if (v.empty()) {
+                const char* e = std::getenv("SOTC_DITHER");
+                v = e ? e : "";
+            }
+            return v.empty() || (v != "0" && v != "false") ? 1 : 0;
+        }();
+        MenuItem& dither = AddLive(
+            kTabDisplay, L("Imagem: pontilhado (dithering)", "Picture: dithering"),
+            L("Um ruído fino, invisível de perto, antes dos 8 bits (SDR) ou 10 bits (HDR) da tela: tira as faixas no céu e na névoa. Desligado é o original.",
+              "A fine noise, invisible up close, before the display's 8 bits (SDR) or 10 bits (HDR): it removes banding in the sky and fog. Off is the original."),
+            Indexed({L("Desligado", "Off"), L("Ligado", "On")}),
+            [] {
+                const int live = SotcLive::dither.load(std::memory_order_relaxed);
+                return (live >= 0 ? live : env_dither) > 0 ? 1 : 0;
+            },
+            [](int i) {
+                SotcLive::dither.store(i, std::memory_order_relaxed);
+                SaveLauncherSetting("dither", i ? "true" : "false");
+            });
+        dither.shown = [] { return true; }; // SDR too
         MenuItem& reset = AddLive(
             kTabDisplay, L("Imagem: restaurar", "Picture: reset"),
             L("Volta todos os controles de imagem (granulação e expansão de gama inclusive), a curva de tons, a correção de cor do jogo e a força do bloom, da vinheta, da névoa e do borrão de movimento ao original. O brilho e o pico ficam.",

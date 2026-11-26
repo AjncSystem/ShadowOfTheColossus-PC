@@ -109,6 +109,10 @@ inline std::atomic<float> fx_vignette{-1.f};
 inline std::atomic<float> fx_fog{-1.f};
 inline std::atomic<float> fx_motion_blur{-1.f};
 
+/// Output dithering against banding (launcher dither, SOTC_DITHER): 1 on, 0 off. -1: the value
+/// read at start (on unless the launcher or SOTC_DITHER=0 turned it off).
+inline std::atomic<int> dither{-1};
+
 /// F3: the game's own picture (tone mapper, grading, picture controls and effect strengths at
 /// the game's), brightness and peak kept, to compare with the user's settings.
 inline std::atomic<bool> compare_vanilla{false};

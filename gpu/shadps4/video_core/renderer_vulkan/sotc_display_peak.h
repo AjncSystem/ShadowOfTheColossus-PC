@@ -4,8 +4,14 @@
 
 namespace Vulkan {
 
-/// The highest MaxLuminance among the outputs with HDR on (Rec.2020 PQ), in nits; 0 when none
-/// reports one (HDR off, not Windows, or the driver gives no value). Called once at start.
-float SotcDisplayPeakNits();
+/// MaxLuminance of the display the game window is on (`native_window`, an HWND), in nits, when
+/// that output has HDR on (Rec.2020 PQ); 0 when it reports none (HDR off there, not Windows, or
+/// the driver gives no value). Without a window: the highest among the HDR outputs. Cached: DXGI
+/// is only asked again after SotcDisplayPeakChanged, so it can be called every frame.
+float SotcDisplayPeakNits(void* native_window);
+
+/// The window moved to another display or the display's HDR changed (SDL window events, from the
+/// event thread): the next SotcDisplayPeakNits asks Windows again.
+void SotcDisplayPeakChanged();
 
 } // namespace Vulkan

@@ -1,6 +1,6 @@
 # Changelog
 
-## Não lançado
+## 0.78 — 2026-11-25
 - ⚡ **Threads da GPU em núcleos próprios em processadores com SMT** (#464, SotC-Work): em CPUs com SMT e 6 ou mais núcleos (Ryzen 5 5600X, i5-12400F...), o draw, o processador de comandos e o gravador ficam cada um num núcleo físico só deles, longe dos workers do jogo (+6–11% no 5600X do autor). Desligado em CPUs híbridas (Intel 12ª geração e acima com núcleos E); `SOTC_PIN=0` desliga, `=1` força. Também: queda rara no alocador do jogo (`0x499cc`) evitada, e o jogo não fecha mais quando o Windows recusa criar uma thread.
 - ⚡ **Thread de desenho mais leve** (Lukto02, do fork do Lucas-blip-png): desenhos que repetem o mesmo estado não calculam mais um hash nem copiam os dados do shader a cada operação (`SOTC_DRAWREPLAY=0` volta o antigo). Junto, a revisão do reaproveitamento de descritores (`SOTC_FAST_BIND`): ele não reaproveita mais um bind quando a memória mudou durante o bind ou quando um passo auxiliar trocou os descritores. Conferido em 45 milhões de comparações sem nenhuma diferença.
 - 🧯 **Memória de vídeo esgotada não fecha mais o jogo de cara** (#293, Lucas-blip-png): quando o driver diz que falta memória para um buffer, o port tenta de novo sem memória dedicada e, por último, na RAM do sistema (mais lento, mas sem queda).

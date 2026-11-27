@@ -280,15 +280,83 @@ VRAM_PROFILES = [('auto', ('Automático (pela placa)', 'Automatic (by the card)'
                  ('light', ('Leve (placas de até 6 GB)', 'Light (cards up to 6 GB)')),
                  ('full', ('Completo (placas de 8 GB ou mais)', 'Full (8 GB cards or more)'))]
 LIGHT_VRAM_BELOW_MB = 7500
+VRAM_AUTO_LIGHT_RATIO = 0.85
+VRAM_WARN_RATIO = 0.95
+
+
+def _res_pixels(res):
+    try:
+        w, h = map(int, str(res or '').lower().split('x', 1))
+        if w > 0 and h > 0:
+            return w, h
+    except ValueError:
+        pass
+    return 1920, 1080
+
+
+def estimate_vram_mb(s, force_light=None):
+    """Rough peak VRAM estimate (MiB) for the chosen resolution, textures, Pro, upscaler, and FG."""
+    light = light_vram(s) if force_light is None else bool(force_light)
+    output = s.get('output_res') or '1920x1080'
+    neo_active = bool(s.get('neo')) and not is_wide(output)
+    upscaler = s.get('upscaler') or 'fsr1'
+    textures = s.get('textures') or 'high'
+    vram_use = s.get('vram_use') or 'normal'
+    if light and vram_use in ('high', 'max'):
+        vram_use = 'normal'
+
+    total = 3300  # base game + shaders + Vulkan/desktop overhead
+    if textures == 'high':
+        total += 700 if light else 1100
+    elif textures == 'max':
+        total += 1400 if light else 2100
+    if neo_active:
+        total += 700
+
+    out_w, out_h = _res_pixels(output)
+    out_scale = (out_w * out_h) / (1920 * 1080)
+    if upscaler in ('dlss', 'fsr4') and not neo_active:
+        ren_res = dlss_render(output, s.get('dlss_mode'))
+    elif output not in ('1280x720', '1920x1080') and not neo_active:
+        ren_res = render_size(output)
+    else:
+        ren_res = output
+    ren_w, ren_h = _res_pixels(ren_res)
+    ren_scale = (ren_w * ren_h) / (1920 * 1080)
+    total += int(max(0.0, ren_scale - 1.0) * 650)
+    total += int(max(0.0, out_scale - 1.0) * 300)
+
+    if upscaler in ('dlss', 'fsr4'):
+        total += int(300 * max(1.0, out_scale))
+    if (s.get('framegen') or 'off') != 'off':
+        fg_base = 350 + (120 if s.get('fg_hudless') else 0)
+        total += int(fg_base * max(1.0, out_scale))
+
+    total += {'low': -350, 'normal': 0, 'high': 600, 'max': 1100}.get(vram_use, 0)
+    return max(1500, int(total))
 
 
 def light_vram(s):
-    """The lighter texture set: chosen, or Auto on a card with less than 8 GB."""
+    """The lighter texture set: chosen, or Auto on <8 GB cards or when estimated VRAM exceeds 85%."""
     profile = s.get('vram_profile') or 'auto'
     if profile != 'auto':
         return profile == 'light'
     mb = int(s.get('gpu_vram_mb') or 0)
-    return 0 < mb < LIGHT_VRAM_BELOW_MB
+    if mb <= 0:
+        return False
+    return mb < LIGHT_VRAM_BELOW_MB or estimate_vram_mb(s, force_light=False) > mb * VRAM_AUTO_LIGHT_RATIO
+
+
+def vram_warning_info(s):
+    """Return (est_mb, gpu_mb, can_lighten) when estimated VRAM exceeds 95% of card VRAM, else None."""
+    mb = int(s.get('gpu_vram_mb') or 0)
+    if mb <= 0:
+        return None
+    est = estimate_vram_mb(s)
+    if est <= mb * VRAM_WARN_RATIO:
+        return None
+    can_lighten = (s.get('vram_profile') != 'light') or (s.get('vram_use') != 'low')
+    return est, mb, can_lighten
 
 
 # Far sun shadows drawn on alternate frames (SOTC_SHADOW_REUSE): more FPS, but they may blink (#178).
@@ -354,8 +422,9 @@ PLAY_MODE_VALUES = {
     # FSR 3.1 rebuilds it (720p -> 1080p: +9% real FPS on a Ryzen 5 5500 + GTX 1070, interleaved
     # runs; lower sizes gain little more, #294), FSR 3 frame generation fills the rest to 60 on
     # screen. No Pro mode: it adds GPU work.
-    'light': {'neo': False, 'fps_mode': '60', 'textures': 'high', 'af16': False, 'upscaler': 'fsr4',
-              'dlss_mode': 'quality', 'framegen': 'fsr', 'vram_use': 'normal', **_PS4_GRASS},
+    'light': {'neo': False, 'fps_mode': '60', 'fps_dynamic': True, 'textures': 'high', 'af16': False,
+              'upscaler': 'fsr4', 'dlss_mode': 'quality', 'framegen': 'fsr', 'vram_use': 'normal',
+              **_PS4_GRASS},
     'pro': {'neo': True, 'fps_mode': '30', 'textures': 'high', 'af16': True, 'vram_use': 'high',
             **_PS4_GRASS},
     'extreme': {'neo': True, 'fps_mode': '60', 'textures': 'max', 'af16': True, 'vram_use': 'max',
@@ -364,12 +433,12 @@ PLAY_MODE_VALUES = {
 PLAY_MODE_HINTS = {
     'normal': ('Como no PS4: 30 FPS, texturas altas, grama e sombras do console, sem o modo Pro.',
                "As on PS4: 30 FPS, high textures, the console's grass and shadows, no Pro mode."),
-    'light': ('Para PCs modestos: 60 FPS, o jogo desenha em 2/3 da resolução (720p para 1080p) e o AMD FSR 3.1 reconstrói a '
-              'imagem; a geração de quadros FSR 3 completa os 60 na tela. Mais FPS ainda: desligar as sombras '
-              'do sol (Ajustes > Efeitos).',
-              'For modest PCs: 60 FPS, the game renders at 2/3 of the resolution (720p for 1080p) and AMD FSR 3.1 rebuilds the image; '
-              'FSR 3 frame generation fills the 60 on screen. More FPS still: turn the sun shadows off '
-              '(Settings > Effects).'),
+    'light': ('Para PCs modestos: 60 FPS, o jogo desenha em 2/3 da resolução (720p para 1080p) com AMD FSR 3.1, '
+              'trava os quadros reais num degrau firme (ex.: 30→60 em 60/120 Hz) e a geração de quadros FSR 3 '
+              'completa os 60 estáveis na tela. Mais FPS ainda: desligar as sombras do sol (Ajustes > Efeitos).',
+              'For modest PCs: 60 FPS, the game renders at 2/3 of the resolution (720p for 1080p) with AMD FSR 3.1, '
+              'locks real frames to a steady step (e.g. 30→60 at 60/120 Hz) and FSR 3 frame generation fills a '
+              'steady 60 on screen. More FPS still: turn the sun shadows off (Settings > Effects).'),
     'pro': ('Modo PS4 Pro a 30 FPS com texturas altas e filtro 16x; grama como no PS4.',
             'PS4 Pro mode at 30 FPS with high textures and 16x filtering; grass as on PS4.'),
     'extreme': ('Modo Pro a 60 FPS, texturas máximas, DLSS na RTX; grama como no PS4. '
@@ -950,16 +1019,50 @@ def screen_refresh_hz():
     return 60
 
 
-def dynamic_fps_step(hz):
+def effective_fg_mult(s):
+    """Frame-generation multiplier active for pacing (1 when off or dynamic)."""
+    fg = s.get('framegen') or 'off'
+    if fg == 'off':
+        return 1
+    if fg == 'fsr' or not IS_WINDOWS:
+        return 2
+    mult = str(s.get('fg_mult') or '2')
+    if mult == 'dynamic':
+        return 1
+    return int(mult) if mult in ('2', '3', '4', '6') else 2
+
+
+def dynamic_fps_step(hz, fg_mult=1):
     """sotc: the dynamic FPS step (SOTC_FPS_DYNAMIC): the refresh rate divided by the smallest whole
-    number that brings it to 50 or less, so every frame lasts the same number of refreshes (48 at
-    144 Hz, 40 at 120 Hz, 30 at 60 Hz, 50 at 100 Hz, 37.5 at 75 Hz, 41.25 at 165 Hz). Before #454 a
-    rate that 48, 40 and 45 do not divide fell to 30, which does not divide 75, 100 or 165 Hz."""
+    number that brings real FPS to 50 or less (accounting for frame generation multiplier when active),
+    so presented frames land evenly on refreshes (e.g. without FG: 48 at 144 Hz, 40 at 120 Hz,
+    30 at 60 Hz; with 2x FG: 30 at 60/120 Hz, 36 at 144 Hz, 37.5 at 75 Hz, 45 at 90 Hz)."""
     hz = hz if hz and hz >= 30 else 60
-    divisor = 2
-    while hz / divisor > 50:
-        divisor += 1
-    return f'{hz / divisor:.2f}'.rstrip('0').rstrip('.')
+    fg_mult = fg_mult if fg_mult and fg_mult >= 1 else 1
+    if fg_mult == 1:
+        divisor = 2
+        while hz / divisor > 50:
+            divisor += 1
+        step = hz / divisor
+    else:
+        k = 1
+        while hz / (k * fg_mult) > 50:
+            k += 1
+        step = hz / (k * fg_mult)
+    return f'{step:.2f}'.rstrip('0').rstrip('.')
+
+
+def fg_real_fps_cap(s, hz):
+    """Real-FPS cap (SOTC_FPS_FG_CAP) when FG is on in 60 FPS mode and locking beats probing."""
+    if s.get('fps_mode') != '60' or not s.get('fps_dynamic', True):
+        return ''
+    mult = effective_fg_mult(s)
+    if mult < 2:
+        return ''
+    hz = hz if hz and hz >= 30 else 60
+    if hz / mult <= 50 or s.get('play_mode') == 'light':
+        return dynamic_fps_step(hz, mult)
+    return ''
 
 
 def game_environment(s):
@@ -1003,7 +1106,11 @@ def game_environment(s):
     # that cannot keep 60 lower it to a step that divides the screen's refresh (48 at 144 Hz, 40 at
     # 120/240 Hz, 30 at 60 Hz), steady instead of swinging; it tries 60 again every 10 s.
     if fps_mode == '60' and s.get('fps_dynamic', True):
-        env.setdefault('SOTC_FPS_DYNAMIC', dynamic_fps_step(screen_refresh_hz()))
+        hz = screen_refresh_hz()
+        env.setdefault('SOTC_FPS_DYNAMIC', dynamic_fps_step(hz, effective_fg_mult(s)))
+        fg_cap = fg_real_fps_cap(s, hz)
+        if fg_cap:
+            env.setdefault('SOTC_FPS_FG_CAP', fg_cap)
     env['BB_VBLANK_HZ'] = '120'
     env['BB_FULLSCREEN'] = '1' if s['fullscreen'] else '0'
     # The monitor the game window opens on (window.cpp): the centre of the chosen one, found again now
@@ -1406,14 +1513,14 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                 row=r + 1, column=1, sticky='w', pady=(2, 2))
         return widget
 
-    def check(self, parent, key, title, hint=None):
+    def check(self, parent, key, title, hint=None, wrap=640):
         ttk = self.ttk
         r = self.next_row(parent)
         box = ttk.Checkbutton(parent, text=title, variable=self.var(key))
         box.grid(row=r, column=0, columnspan=2, sticky='w', pady=(4, 0))
         self.index_entry(box, title, hint or '', key)
         if hint:
-            ttk.Label(parent, text=hint, style='Muted.TLabel', wraplength=self.px(640), justify='left').grid(
+            ttk.Label(parent, text=hint, style='Muted.TLabel', wraplength=self.px(wrap), justify='left').grid(
                 row=r + 1, column=0, columnspan=2, sticky='w', padx=(26, 0))
 
     def note(self, parent, text, top=12):
@@ -1783,15 +1890,20 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         self.row(quick, _('FPS', 'FPS'), self.choice(quick, 'fps_mode', FPS_MODES, 24))
         self.check(quick, 'fps_dynamic', _('FPS dinâmico (no modo 60)', 'Dynamic FPS (60 FPS mode)'),
                    _('Quando o jogo não segura 60, trava num degrau estável que combina com a tela (48 em 144 Hz, '
-                     '40 em 120 Hz, 30 em 60 Hz) em vez de oscilar, e volta a 60 quando sobra folga.',
+                     '40 em 120 Hz, 30 em 60 Hz) em vez de oscilar, e volta a 60 quando sobra folga. Com geração de '
+                     'quadros ligada, escolhe o degrau para os quadros dobrados fecharem na tela (ex.: 30→60 em 60/120 Hz, '
+                     '36→72 em 144 Hz).',
                      'When the game cannot keep 60 it locks to a steady step that suits the screen (48 at '
-                     '144 Hz, 40 at 120 Hz, 30 at 60 Hz) instead of swinging, and goes back to 60 when it can.'))
+                     '144 Hz, 40 at 120 Hz, 30 at 60 Hz) instead of swinging, and goes back to 60 when it can. With '
+                     'frame generation on, it picks a step whose generated frames align with the screen (e.g. 30→60 at '
+                     '60/120 Hz, 36→72 at 144 Hz).'), wrap=360)
         self.row(quick, _('Texturas', 'Textures'), self.choice(quick, 'textures', TEXTURES, 24))
         self.row(quick, _('Memória da placa', 'Card memory'), self.choice(quick, 'vram_profile', VRAM_PROFILES, 24))
         self.vram_profile_hint = ttk.Label(quick, text='', style='Muted.TLabel', wraplength=self.px(300),
                                            justify='left')
         self.vram_profile_hint.grid(row=self.next_row(quick), column=0, columnspan=2, sticky='w', pady=(0, 2))
-        self.var('vram_profile').trace_add('write', lambda *_a: self.show_vram_profile_hint())
+        for key in ('vram_profile', 'vram_use', 'output_res', 'upscaler', 'dlss_mode', 'framegen', 'fg_hudless', 'textures', 'neo'):
+            self.var(key).trace_add('write', lambda *_a: self.show_vram_profile_hint())
         self.show_vram_profile_hint()
         self.check(quick, 'af16', _('Texturas nítidas (filtro 16x)', 'Sharp textures (16x filtering)'))
         self.check(quick, 'hdr', _('HDR (HDR do Windows ligado)', 'HDR (Windows HDR on)'))
@@ -1815,20 +1927,38 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         return values
 
     def show_vram_profile_hint(self):
-        """What the video memory profile does with the card found."""
+        """What the video memory profile does with the card found and the current settings."""
         if not hasattr(self, 'vram_profile_hint'):
             return
         mb = int(self.app.get('gpu_vram_mb') or 0)
         card = (_('placa com {:.0f} GB', 'card with {:.0f} GB').format(mb / 1024) if mb
                 else _('placa ainda não verificada', 'card not checked yet'))
-        current = dict(self.app, vram_profile=self.var('vram_profile').get())
+        current = dict(self.app)
+        for key in ('vram_profile', 'vram_use', 'output_res', 'upscaler', 'dlss_mode', 'framegen', 'fg_hudless', 'textures', 'neo'):
+            if key in self.vars:
+                current[key] = self.vars[key].get()
+        est = estimate_vram_mb(current)
+        if mb > 0 and est > mb * VRAM_WARN_RATIO:
+            text = _('⚠ Estimado ~{:.1f} / {:.1f} GB (risco de fechar por falta de VRAM): reduza resolução, texturas ou geração de quadros.',
+                     '⚠ Estimated ~{:.1f} / {:.1f} GB (risk of out-of-VRAM crash): lower resolution, textures or frame generation.').format(
+                         est / 1024, mb / 1024)
+            self.vram_profile_hint.configure(text=text, foreground='#d36b5c')
+            return
         if light_vram(current):
-            text = _('Leve ({}): uso de memória de vídeo no máximo Padrão, sem reserva de envio nela.',
-                     'Light ({}): video memory use at most Default, no upload reserve in it.').format(card)
+            if mb >= LIGHT_VRAM_BELOW_MB and (current.get('vram_profile') or 'auto') == 'auto':
+                text = _('Leve automático (placa com {:.0f} GB · estimado ~{:.1f} / {:.1f} GB): ajustes pesados para a VRAM; usando perfil Leve.',
+                         'Auto Light ({:.0f} GB card · estimated ~{:.1f} / {:.1f} GB): heavy settings for VRAM; using Light profile.').format(
+                             mb / 1024, est / 1024, mb / 1024)
+                self.vram_profile_hint.configure(text=text, foreground='#d9b441')
+                return
+            est_info = _(' · estimado ~{:.1f} GB', ' · estimated ~{:.1f} GB').format(est / 1024) if mb else ''
+            text = _('Leve ({}{}): uso de memória de vídeo no máximo Padrão, sem reserva de envio nela.',
+                     'Light ({}{}): video memory use at most Default, no upload reserve in it.').format(card, est_info)
         else:
-            text = _('Completo ({}): uso de memória de vídeo como escolhido.',
-                     'Full ({}): video memory use as chosen.').format(card)
-        self.vram_profile_hint.configure(text=text)
+            est_info = _(' · estimado ~{:.1f} GB', ' · estimated ~{:.1f} GB').format(est / 1024) if mb else ''
+            text = _('Completo ({}{}): uso de memória de vídeo como escolhido.',
+                     'Full ({}{}): video memory use as chosen.').format(card, est_info)
+        self.vram_profile_hint.configure(text=text, foreground=MUTED)
 
     def show_play_mode_hint(self):
         self.play_mode_hint.configure(text=_(*PLAY_MODE_HINTS.get(self.var('play_mode').get(), ('', ''))))
@@ -3637,6 +3767,34 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                 'Shadow of the Colossus', _('O Windows só tem {:.1f} GB livres para programas (RAM + arquivo de paginação). O jogo reserva cerca de 6 GB ao abrir e precisa de mais alguns GB depois; com menos, ele fecha logo no início (erro 1455 no log).\n\nPara resolver: Iniciar → "Ajustar a aparência e o desempenho do Windows" → Avançado → Memória virtual → Alterar… → marque "Gerenciar automaticamente o tamanho do arquivo de paginação" (ou defina pelo menos 16 GB) e reinicie o PC. Fechar navegadores e outros programas grandes também ajuda.\n\nAbrir o jogo mesmo assim?',
                                             'Windows has only {:.1f} GB free for programs (RAM + page file). The game reserves about 6 GB when it starts and needs a few GB more after that; with less it closes right at the start (error 1455 in the log).\n\nTo fix it: Start → "Adjust the appearance and performance of Windows" → Advanced → Virtual memory → Change… → tick "Automatically manage paging file size for all drives" (or set at least 16 GB) and restart the PC. Closing browsers and other big programs also helps.\n\nStart the game anyway?').format(free)):
             return
+        vram_warn = vram_warning_info(self.app)
+        if vram_warn:
+            est_mb, gpu_mb, can_lighten = vram_warn
+            if can_lighten:
+                ans = self.messagebox.askyesnocancel(
+                    'Shadow of the Colossus',
+                    _('A configuração atual pode passar da memória da sua placa de vídeo (estimado ~{:.1f} GB de {:.1f} GB disponíveis) e fechar o jogo ao carregar áreas ou em 4K.\n\n'
+                      '• Sim: ativar "Memória da placa: Leve" e "Uso de memória de vídeo: Econômico" agora e abrir o jogo.\n'
+                      '• Não: abrir o jogo mesmo assim sem mudar nada.\n'
+                      '• Cancelar: voltar ao lançador para ajustar resolução, texturas ou geração de quadros.',
+                      'The current settings may exceed your graphics card memory (estimated ~{:.1f} GB of {:.1f} GB available) and crash when loading areas or at 4K.\n\n'
+                      '• Yes: enable "Card memory: Light" and "Video memory use: Economy" now and start the game.\n'
+                      '• No: start the game anyway without changing settings.\n'
+                      '• Cancel: go back to the launcher to lower resolution, textures or frame generation.').format(
+                          est_mb / 1024, gpu_mb / 1024))
+                if ans is None:
+                    return
+                if ans:
+                    self.var('vram_profile').set('light')
+                    self.var('vram_use').set('low')
+                    self.collect()
+                    self.show_vram_profile_hint()
+            elif not self.messagebox.askyesno(
+                    'Shadow of the Colossus',
+                    _('A configuração atual pode passar da memória da sua placa de vídeo mesmo no modo econômico (estimado ~{:.1f} GB de {:.1f} GB disponíveis). Reduza a resolução, texturas ou geração de quadros para evitar quedas.\n\nAbrir o jogo mesmo assim?',
+                      'The current settings may exceed your graphics card memory even in economy mode (estimated ~{:.1f} GB of {:.1f} GB available). Lower resolution, textures or frame generation to avoid crashes.\n\nStart the game anyway?').format(
+                          est_mb / 1024, gpu_mb / 1024)):
+                return
         self.set_log('')
         try:
             write_key_bindings(self.app.get('keys'))

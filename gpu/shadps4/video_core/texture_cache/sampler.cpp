@@ -28,7 +28,9 @@ static float UpscalerMipBias() {
         if ((!r || !*r) && !(neo && neo[0] == '1')) { // PS4 Pro: its own sizes
             r = "1920x1080";
         }
-        if (!Vulkan::Dlssg::SuperResolutionAvailable() || !o ||
+        // PS4 Pro without SOTC_RENDER_RES: no size to compare. glibc's sscanf faults on NULL
+        // (Windows' returns an error), so check it first.
+        if (!Vulkan::Dlssg::SuperResolutionAvailable() || !r || !o ||
             std::sscanf(r, "%ux%u", &rw, &rh) != 2 || std::sscanf(o, "%ux%u", &ow, &oh) != 2 ||
             rh == 0 || oh <= rh) {
             return 0.0f;

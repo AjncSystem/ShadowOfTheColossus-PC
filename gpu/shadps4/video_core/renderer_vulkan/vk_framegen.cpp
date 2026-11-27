@@ -2,6 +2,7 @@
 // sotc: the frame generation mode, see vk_framegen.h.
 
 #include "video_core/renderer_vulkan/vk_framegen.h"
+#include "video_core/sotc_fps_cap.h"
 #include "video_core/sotc_ui_lang.h"
 
 #ifdef _WIN32
@@ -129,6 +130,7 @@ void SetAvailable(bool dlss, bool fsr) {
         break;
     }
     current = static_cast<int>(mode);
+    SotcFpsCap::fg_active.store(mode != Mode::Off, std::memory_order_relaxed);
     std::fprintf(stderr, "SOTC FRAMEGEN: %s (DLSS-G %s, FSR 3 %s; F8 switches)\n", Name(mode),
                  dlss ? "available" : "unavailable", fsr ? "available" : "unavailable");
 }
@@ -158,6 +160,7 @@ bool Set(Mode mode) {
         return false;
     }
     current = static_cast<int>(mode);
+    SotcFpsCap::fg_active.store(mode != Mode::Off, std::memory_order_relaxed);
     std::fprintf(stderr, "SOTC FRAMEGEN: switched to %s\n", Name(mode));
     return true;
 }
@@ -171,6 +174,7 @@ Mode Cycle() {
         }
     }
     current = static_cast<int>(mode);
+    SotcFpsCap::fg_active.store(mode != Mode::Off, std::memory_order_relaxed);
     std::fprintf(stderr, "SOTC FRAMEGEN: switched to %s\n", Name(mode));
     return mode;
 }

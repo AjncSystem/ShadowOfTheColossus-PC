@@ -41,6 +41,18 @@ inline const int dynamic_low = [] {
 /// dynamic_low.
 inline std::atomic<int> dynamic_limit{0};
 
+/// sotc: SOTC_FPS_FG_CAP=<fps> (hundredths of FPS): while frame generation is active in 60 FPS
+/// mode, pace real frames at <fps> (e.g. 30 -> 60 presented on 60/120 Hz, 36 -> 72 on 144 Hz)
+/// so generated frames land on exact display refreshes without 60 FPS probe spikes. Released
+/// immediately if frame generation is turned off (F8). 0 or unset: off.
+inline const int fg_cap = [] {
+    const char* v = std::getenv("SOTC_FPS_FG_CAP");
+    const double n = v ? std::strtod(v, nullptr) : 0.0;
+    return n > 0.0 && n < 60.0 ? int(n * 100.0 + 0.5) : 0;
+}();
+/// Updated by Vulkan::FrameGen when frame generation turns on or off (startup and F8).
+inline std::atomic<bool> fg_active{false};
+
 /// The flip rate the game asked, -1 while it asked none (with the fps60 code patch it never does).
 inline std::atomic<int> game_rate{-1};
 

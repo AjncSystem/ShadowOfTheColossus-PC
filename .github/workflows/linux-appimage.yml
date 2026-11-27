@@ -28,7 +28,6 @@ jobs:
   linux:
     runs-on: ubuntu-24.04
     env:
-      DEPS_DIR: ${{ runner.temp }}/sotc-deps
       CC: gcc-14
       CXX: g++-14
     steps:
@@ -58,6 +57,8 @@ jobs:
 
       - name: Build source dependencies
         if: steps.cache-deps.outputs.cache-hit != 'true'
+        env:
+          DEPS_DIR: ${{ runner.temp }}/sotc-deps
         run: |
           mkdir -p "$DEPS_DIR"
           git clone --quiet --depth 1 --branch vulkan-sdk-1.4.363.0 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers

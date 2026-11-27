@@ -7,6 +7,7 @@
 #include "common/thread.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/process.h"
+#include "shader_recompiler/info.h"
 
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -151,14 +152,15 @@ void DataBase::Open() {
             mz_zip_writer_init_file(&zip_ar, cache_path.string().c_str(), 0);
         }
     } else {
-        // sotc: shaders compiled with and without direct memory access differ, and the cache keys
-        // do not tell them apart: the launcher's DMA switch gets its own cache folder. The same
-        // for SOTC_NEO: a cache filled in PS4 Pro mode gave a black picture in the normal mode.
+        // sotc: shaders compiled with and without direct memory access, int64, Neo mode, or LOD
+        // feedback differ (ShaderBinaryVersion 41 vs 137): separate folders prevent cross-mode
+        // stale pipelines and binary collisions.
         cache_path = GetUserPath(PathType::CacheDir) /
                      (std::string{game_info.GameSerial()} +
                       (EmulatorSettings.IsDirectMemoryAccessEnabled() ? "" : "_nodma") +
                       (EmulatorSettings.IsNoInt64() ? "_noi64" : "") +
-                      (Libraries::Kernel::sceKernelIsNeoMode() ? "_neo" : "") + ShaderTestTag());
+                      (Libraries::Kernel::sceKernelIsNeoMode() ? "_neo" : "") +
+                      (Shader::LodFeedbackEnabled() ? "" : "_nolod") + ShaderTestTag());
         if (!std::filesystem::exists(cache_path)) {
             std::filesystem::create_directories(cache_path);
         }
@@ -424,9 +426,9 @@ void DataBase::Clear() {
     if (!opened || EmulatorSettings.IsPipelineCacheArchived()) {
         return;
     }
-    prefetched.clear();
     {
         std::scoped_lock lock{known_mutex};
+        prefetched.clear();
         known_files.clear();
     }
     std::error_code ec;
@@ -520,7 +522,13 @@ bool DataBase::Save(BlobType type, const std::string& name, std::vector<u8>&& da
     auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
                                                            : cache_path / name;
     if (!EmulatorSettings.IsPipelineCacheArchived()) {
-        AddKnown(std::filesystem::path{path}.replace_extension(GetBlobFileExtension(type)));
+        const auto fname =
+            std::filesystem::path{path}.replace_extension(GetBlobFileExtension(type)).filename().string();
+        std::scoped_lock lock{known_mutex};
+        known_files.insert(fname);
+        if (auto it = prefetched.find(fname); it != prefetched.end()) {
+            it->second = data;
+        }
     }
     return WriteVector(type, std::move(path), std::move(data));
 }
@@ -533,9 +541,33 @@ bool DataBase::Save(BlobType type, const std::string& name, std::vector<u32>&& d
     auto path = EmulatorSettings.IsPipelineCacheArchived() ? std::filesystem::path{name}
                                                            : cache_path / name;
     if (!EmulatorSettings.IsPipelineCacheArchived()) {
-        AddKnown(std::filesystem::path{path}.replace_extension(GetBlobFileExtension(type)));
+        const auto fname =
+            std::filesystem::path{path}.replace_extension(GetBlobFileExtension(type)).filename().string();
+        std::scoped_lock lock{known_mutex};
+        known_files.insert(fname);
+        if (auto it = prefetched.find(fname); it != prefetched.end()) {
+            it->second.resize(data.size() * sizeof(u32));
+            if (!it->second.empty()) {
+                std::memcpy(it->second.data(), data.data(), it->second.size());
+            }
+        }
     }
     return WriteVector(type, std::move(path), std::move(data));
+}
+
+void DataBase::Remove(BlobType type, const std::string& name) {
+    if (!opened || EmulatorSettings.IsPipelineCacheArchived()) {
+        return;
+    }
+    auto path = (cache_path / name).replace_extension(GetBlobFileExtension(type));
+    {
+        const auto fname = path.filename().string();
+        std::scoped_lock lock{known_mutex};
+        known_files.erase(fname);
+        prefetched.erase(fname);
+    }
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
 }
 
 void DataBase::Load(BlobType type, const std::string& name, std::vector<u8>& data) {
@@ -550,18 +582,19 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u8>& dat
         TakePrefetched(path, data);
         return;
     }
-    if (!prefetched.empty()) {
+    if (!EmulatorSettings.IsPipelineCacheArchived()) {
         auto file = path;
         file.replace_extension(GetBlobFileExtension(type));
-        if (const auto it = prefetched.find(file.filename().string()); it != prefetched.end()) {
+        const auto fname = file.filename().string();
+        std::scoped_lock lock{known_mutex};
+        if (const auto it = prefetched.find(fname); it != prefetched.end()) {
             data = it->second;
             return;
         }
-    }
-    if (!EmulatorSettings.IsPipelineCacheArchived() &&
-        !MayExist(std::filesystem::path{path}.replace_extension(GetBlobFileExtension(type)))) {
-        data.clear();
-        return;
+        if (known_valid && !known_files.contains(fname)) {
+            data.clear();
+            return;
+        }
     }
     return LoadVector(type, path, data);
 }
@@ -583,26 +616,35 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u32>& da
         }
         return;
     }
-    if (!prefetched.empty()) {
+    if (!EmulatorSettings.IsPipelineCacheArchived()) {
         auto file = path;
         file.replace_extension(GetBlobFileExtension(type));
-        if (const auto it = prefetched.find(file.filename().string()); it != prefetched.end()) {
+        const auto fname = file.filename().string();
+        std::scoped_lock lock{known_mutex};
+        if (const auto it = prefetched.find(fname); it != prefetched.end()) {
             data.resize(it->second.size() / sizeof(u32));
             if (!data.empty()) {
                 std::memcpy(data.data(), it->second.data(), data.size() * sizeof(u32));
             }
             return;
         }
-    }
-    if (!EmulatorSettings.IsPipelineCacheArchived() &&
-        !MayExist(std::filesystem::path{path}.replace_extension(GetBlobFileExtension(type)))) {
-        data.clear();
-        return;
+        if (known_valid && !known_files.contains(fname)) {
+            data.clear();
+            return;
+        }
     }
     return LoadVector(type, path, data);
 }
 
 void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u8>&& data)>& func) {
+    ForEachBlobWithName(type, [&](const std::string&, std::vector<u8>&& data) {
+        func(std::move(data));
+    });
+}
+
+void DataBase::ForEachBlobWithName(
+    BlobType type,
+    const std::function<void(const std::string& name, std::vector<u8>&& data)>& func) {
     const auto& ext = GetBlobFileExtension(type);
     if (EmulatorSettings.IsPipelineCacheArchived()) {
         const auto num_files = mz_zip_reader_get_num_files(&zip_ar);
@@ -615,13 +657,14 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
                 mz_zip_reader_file_stat(&zip_ar, index, &stat);
                 std::vector<u8> data(stat.m_uncomp_size);
                 mz_zip_reader_extract_to_mem(&zip_ar, index, data.data(), data.size(), 0);
-                func(std::move(data));
+                func(std::filesystem::path{file_name.data()}.stem().string(), std::move(data));
             }
         }
     } else if (prefetch_active) {
         for (const auto& [file_name, data] : prefetched) {
-            if (std::filesystem::path{file_name}.extension().string().ends_with(ext)) {
-                func(std::vector<u8>{data});
+            const auto path = std::filesystem::path{file_name};
+            if (path.extension().string().ends_with(ext)) {
+                func(path.stem().string(), std::vector<u8>{data});
             }
         }
     } else {
@@ -632,7 +675,7 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
                 if (file.IsOpen()) {
                     std::vector<u8> data(file.GetSize());
                     file.Read(data);
-                    func(std::move(data));
+                    func(file_name.path().stem().string(), std::move(data));
                 }
             }
         }

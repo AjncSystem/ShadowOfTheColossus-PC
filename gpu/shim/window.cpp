@@ -108,6 +108,9 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
     window = SDL_CreateWindowWithProperties(props);
     SDL_DestroyProperties(props);
     ASSERT_MSG(window, "Failed to create window: {}", SDL_GetError());
+    if (!behind) {
+        SDL_DisableScreenSaver();
+    }
     SetWindowIcon(window); // Linux: launcher/sotc.png (PR #118); the launcher's icon below wins
     // sotc: the game's own icon (sce_sys/icon0.png of the player's dump, as a BMP the launcher
     // writes: SOTC_WINDOW_ICON) instead of the executable's.
@@ -170,6 +173,7 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}
 }
 
 WindowSDL::~WindowSDL() {
+    SDL_EnableScreenSaver();
     SDL_DestroyWindow(window);
 }
 

@@ -590,6 +590,11 @@ public:
     /// Logs whatever the driver reports about a device loss (VK_EXT_device_fault).
     void ReportDeviceFault() const;
 
+    /// Returns whether VK_EXT_hdr_metadata is supported.
+    bool IsExtHdrMetadataSupported() const {
+        return ext_hdr_metadata;
+    }
+
 private:
     /// Creates the logical device opportunistically enabling extensions
     bool CreateDevice();
@@ -670,6 +675,7 @@ private:
     bool supports_memory_budget{};
     bool device_fault{};
     bool device_fault_vendor_binary{};
+    bool ext_hdr_metadata{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;

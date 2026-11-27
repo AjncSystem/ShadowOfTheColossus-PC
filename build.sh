@@ -47,6 +47,9 @@ esac
 if [[ -d out/ffmpeg/lib/pkgconfig ]]; then
     export PKG_CONFIG_PATH="$PWD/out/ffmpeg/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
 fi
+if [[ -d ${HOME:-}/.local/opt/sotc-deps ]]; then
+    export CMAKE_PREFIX_PATH="${HOME}/.local/opt/sotc-deps${CMAKE_PREFIX_PATH:+:$CMAKE_PREFIX_PATH}"
+fi
 if [[ -z ${CC:-} ]]; then
     CC=$(command -v cc || command -v gcc || true)
     if [[ -z $CC ]]; then
@@ -68,10 +71,21 @@ read -r -a includes <<< "$(pkg-config --cflags vulkan sdl3)"
 read -r -a libraries <<< "$(pkg-config --libs vulkan sdl3)"
 # GPU library (shadPS4 video core + drivers), built by CMake into out/gpu/libbbgpu.so.
 # BB_PGO: generate (instrumented build that writes pgo/ while the game runs), use, off.
-# Default: use the profile in pgo/ when there is one. BB_LTO=OFF disables link-time optimization.
+# Default: use the profile in pgo/ when there is one (Clang: pgo/bbgpu.profdata, GCC: pgo/*.gcda).
+# BB_LTO=OFF disables link-time optimization.
+is_clang=0
+case ${CXX:-$CC} in
+    *clang*) is_clang=1 ;;
+esac
 pgo=${BB_PGO:-}
 if [[ -z $pgo ]]; then
-    if [[ -n $(find pgo -name '*.gcda' -print -quit 2>/dev/null) ]]; then pgo=use; else pgo=off; fi
+    if (( is_clang )) && [[ -f pgo/bbgpu.profdata ]]; then
+        pgo=use
+    elif (( ! is_clang )) && [[ -n $(find pgo -name '*.gcda' -print -quit 2>/dev/null) ]]; then
+        pgo=use
+    else
+        pgo=off
+    fi
 fi
 mkdir -p pgo
 # Submodules (git clone --recursive, or: git submodule update --init) and this port's changes
@@ -84,8 +98,12 @@ for patch in gpu/patches/fsr-vulkan/*.patch; do
         git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
     fi
 done
+cmake_compiler_args=()
+if [[ -n ${CXX:-} ]]; then
+    cmake_compiler_args=(-DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX")
+fi
 cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO="$pgo" \
-    -DBB_LTO="${BB_LTO:-ON}" -DBB_PGO_DIR="$PWD/pgo" >/dev/null
+    -DBB_LTO="${BB_LTO:-ON}" -DBB_PGO_DIR="$PWD/pgo" "${cmake_compiler_args[@]}" >/dev/null
 echo "GPU library: PGO $pgo, LTO ${BB_LTO:-ON}"
 # A failed GPU build must stop here: an older libbbgpu.so would otherwise be used silently.
 if ! ninja -C out/gpu bbgpu > out/gpu-build.log 2>&1; then

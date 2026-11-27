@@ -4,6 +4,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <vulkan/vulkan.h>
+#ifndef _WIN32
+#include <SDL3/SDL.h>
+#endif
 
 static VkDeviceSize largest_local_heap(VkPhysicalDevice device) {
     VkPhysicalDeviceMemoryProperties memory;
@@ -64,7 +67,55 @@ static int live_resolution_suits(VkPhysicalDevice device) {
     return suits;
 }
 
+#ifndef _WIN32
+static int print_displays(void) {
+    if (!SDL_Init(SDL_INIT_VIDEO)) {
+        return 1;
+    }
+    SDL_DisplayID primary = SDL_GetPrimaryDisplay();
+    int count = 0;
+    SDL_DisplayID *ids = SDL_GetDisplays(&count);
+    if (!ids || count <= 0) {
+        SDL_free(ids);
+        SDL_Quit();
+        return 1;
+    }
+    if (primary == 0) {
+        primary = ids[0];
+    }
+    for (int i = 0; i < count; ++i) {
+        SDL_Rect bounds = {0};
+        SDL_GetDisplayBounds(ids[i], &bounds);
+        const SDL_DisplayMode *mode = SDL_GetCurrentDisplayMode(ids[i]);
+        const int w = bounds.w > 0 ? bounds.w : (mode ? mode->w : 0);
+        const int h = bounds.h > 0 ? bounds.h : (mode ? mode->h : 0);
+        const float hz = (mode && mode->refresh_rate > 1.0f) ? mode->refresh_rate : 0.0f;
+        const char *raw_name = SDL_GetDisplayName(ids[i]);
+        char clean[256];
+        size_t pos = 0;
+        if (raw_name) {
+            for (; raw_name[pos] && pos + 1 < sizeof(clean); ++pos) {
+                const char c = raw_name[pos];
+                clean[pos] = (c == '\t' || c == '\r' || c == '\n') ? ' ' : c;
+            }
+        }
+        clean[pos] = '\0';
+        printf("DISPLAY\t%u\t%d\t%d\t%d\t%d\t%d\t%.2f\t%s\n",
+               (unsigned)ids[i], ids[i] == primary ? 1 : 0,
+               bounds.x, bounds.y, w, h, (double)hz, clean);
+    }
+    SDL_free(ids);
+    SDL_Quit();
+    return 0;
+}
+#endif
+
 int main(int argc, char **argv) {
+#ifndef _WIN32
+    if (argc > 1 && !strcmp(argv[1], "--displays")) {
+        return print_displays();
+    }
+#endif
     const int live_mode = argc > 1 && !strcmp(argv[1], "--live-resolution");
     const VkApplicationInfo app = {
         .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,

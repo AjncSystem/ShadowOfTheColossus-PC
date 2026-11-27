@@ -100,14 +100,45 @@ def disk_kind(path):
     return None
 
 
+def is_steam_deck(env=None, cpu=None):
+    """True on Steam Deck hardware (Jupiter/Galileo DMI, Van Gogh/Sephiroth APU, or SteamDeck=1)."""
+    environ = os.environ if env is None else env
+    if environ.get('SteamDeck') == '1' or environ.get('STEAM_DECK') == '1':
+        return True
+    name = (cpu_name() if cpu is None else cpu) or ''
+    low = name.lower()
+    if any(token in low for token in ('amd custom apu 0405', 'amd custom apu 0932', 'van gogh', 'sephiroth')):
+        return True
+    if not IS_WINDOWS and env is None and cpu is None:
+        try:
+            with open('/sys/devices/virtual/dmi/id/product_name', encoding='utf-8', errors='replace') as dmi:
+                if dmi.read().strip().lower() in ('jupiter', 'galileo'):
+                    return True
+        except OSError:
+            pass
+    return False
+
+
+def in_gamescope(env=None):
+    """True when running inside a Gamescope compositor session (Steam Deck Gaming Mode or desktop)."""
+    environ = os.environ if env is None else env
+    if environ.get('GAMESCOPE_WAYLAND_DISPLAY'):
+        return True
+    return 'gamescope' in environ.get('XDG_CURRENT_DESKTOP', '').lower()
+
+
 def check(game_dir, gpu_text):
-    """Everything at once: a dict with cpu, threads, memory, video_memory, disk."""
-    return {'cpu': cpu_name(), 'threads': os.cpu_count(), 'memory': memory_gb(),
-            'video_memory': video_memory_gb(gpu_text), 'disk': disk_kind(game_dir)}
+    """Everything at once: a dict with cpu, threads, memory, video_memory, disk, steam_deck, gamescope."""
+    cpu = cpu_name()
+    return {'cpu': cpu, 'threads': os.cpu_count(), 'memory': memory_gb(),
+            'video_memory': video_memory_gb(gpu_text), 'disk': disk_kind(game_dir),
+            'steam_deck': is_steam_deck(cpu=cpu), 'gamescope': in_gamescope()}
 
 
 def recommend(info):
-    """The play mode this PC suits: 'extreme', 'pro' or 'normal' (unknown counts as little)."""
+    """The play mode this PC suits: 'deck', 'extreme', 'pro' or 'normal' (unknown counts as little)."""
+    if info.get('steam_deck'):
+        return 'deck'
     threads, memory, video = info.get('threads') or 0, info.get('memory') or 0, info.get('video_memory') or 0
     if video >= 8 and memory >= 16 and threads >= 12:
         return 'extreme'

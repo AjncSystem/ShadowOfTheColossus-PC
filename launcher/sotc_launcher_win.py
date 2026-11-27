@@ -409,6 +409,7 @@ VRAM_LIMITS = {'low': ('50', '1024'), 'normal': ('60', '1536'), 'high': ('75', '
 # makes the mode Custom. Extreme's upscaler is DLSS on an NVIDIA RTX card, FSR 1 on the others.
 PLAY_MODES = [('normal', ('Normal (PS4 puro)', 'Normal (plain PS4)')),
               ('light', ('Leve (PC modesto, 60 FPS)', 'Light (modest PC, 60 FPS)')),
+              ('deck', ('Steam Deck (800p, portátil)', 'Steam Deck (800p, handheld)')),
               ('pro', ('Pro (PS4 Pro + qualidade)', 'Pro (PS4 Pro + quality)')),
               ('extreme', ('Extremo (tudo no máximo)', 'Extreme (everything maxed)')),
               ('custom', ('Personalizado', 'Custom'))]
@@ -425,6 +426,10 @@ PLAY_MODE_VALUES = {
     'light': {'neo': False, 'fps_mode': '60', 'fps_dynamic': True, 'textures': 'high', 'af16': False,
               'upscaler': 'fsr4', 'dlss_mode': 'quality', 'framegen': 'fsr', 'vram_use': 'normal',
               **_PS4_GRASS},
+    'deck': {'neo': False, 'output_res': '1280x800', 'fullscreen': True,
+             'fps_mode': '60', 'fps_dynamic': True, 'textures': 'high', 'af16': True,
+             'upscaler': 'fsr4', 'dlss_mode': 'quality', 'framegen': 'fsr',
+             'fg_hudless': True, 'vram_profile': 'light', 'vram_use': 'normal', **_PS4_GRASS},
     'pro': {'neo': True, 'fps_mode': '30', 'textures': 'high', 'af16': True, 'vram_use': 'high',
             **_PS4_GRASS},
     'extreme': {'neo': True, 'fps_mode': '60', 'textures': 'max', 'af16': True, 'vram_use': 'max',
@@ -439,6 +444,10 @@ PLAY_MODE_HINTS = {
               'For modest PCs: 60 FPS, the game renders at 2/3 of the resolution (720p for 1080p) with AMD FSR 3.1, '
               'locks real frames to a steady step (e.g. 30→60 at 60/120 Hz) and FSR 3 frame generation fills a '
               'steady 60 on screen. More FPS still: turn the sun shadows off (Settings > Effects).'),
+    'deck': ('Para Steam Deck e Gamescope: 1280×800 em tela cheia, AMD FSR 3.1 Qualidade, geração de quadros '
+             'FSR 3 sem tremer a HUD, trava em degrau firme (30→60 no LCD ou 45→90 no OLED) e perfil Leve de VRAM.',
+             'For Steam Deck and Gamescope: 1280×800 fullscreen, AMD FSR 3.1 Quality, HUD-less FSR 3 frame '
+             'generation, steady step pacing (30→60 on LCD or 45→90 on OLED) and Light VRAM profile.'),
     'pro': ('Modo PS4 Pro a 30 FPS com texturas altas e filtro 16x; grama como no PS4.',
             'PS4 Pro mode at 30 FPS with high textures and 16x filtering; grass as on PS4.'),
     'extreme': ('Modo Pro a 60 FPS, texturas máximas, DLSS na RTX; grama como no PS4. '
@@ -486,7 +495,7 @@ EFFECTS = [('fx_vignette', ('Vinheta (cantos escurecidos)', 'Vignette (darkened 
 # Common screen sizes: 16:9, 16:10, 21:9 (ultrawide) and 32:9 (super ultrawide).
 # 5120x2160 is left out: the game faults at start (memory), 3840x2160 runs.
 SCREENS = [('1600x900', '16:9, 900p'), ('1920x1080', '16:9, 1080p'), ('2560x1440', '16:9, 1440p'), ('3840x2160', '16:9, 4K'),
-           ('1920x1200', '16:10'), ('2560x1600', '16:10'),
+           ('1280x800', '16:10, Steam Deck'), ('1920x1200', '16:10'), ('2560x1600', '16:10'),
            ('2560x1080', '21:9'), ('3440x1440', '21:9'), ('3840x1600', '21:9'),
            ('3840x1080', '32:9'), ('5120x1440', '32:9')]
 OUTPUTS = [('1280x720', ('1280 × 720 (16:9, 720p)', '1280 × 720 (16:9, 720p)'))] + [
@@ -1060,7 +1069,7 @@ def fg_real_fps_cap(s, hz):
     if mult < 2:
         return ''
     hz = hz if hz and hz >= 30 else 60
-    if hz / mult <= 50 or s.get('play_mode') == 'light':
+    if hz / mult <= 50 or s.get('play_mode') in ('light', 'deck'):
         return dynamic_fps_step(hz, mult)
     return ''
 

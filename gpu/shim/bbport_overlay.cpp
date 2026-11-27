@@ -654,12 +654,12 @@ void BuildItems() {
     {
         std::vector<MenuChoice> outputs;
         for (const char* size : {"1280x720", "1600x900", "1920x1080", "2560x1440", "3840x2160",
-                                 "1920x1200", "2560x1600", "2560x1080", "3440x1440", "3840x1600",
-                                 "3840x1080", "5120x1440"}) {
+                                 "1280x800", "1920x1200", "2560x1600", "2560x1080", "3440x1440",
+                                 "3840x1600", "3840x1080", "5120x1440"}) {
             std::string label = size;
             label.replace(label.find('x'), 1, " × ");
             const std::string sz = size;
-            const char* aspect = sz == "1920x1200" || sz == "2560x1600"   ? "16:10"
+            const char* aspect = sz == "1280x800" || sz == "1920x1200" || sz == "2560x1600" ? "16:10"
                                  : sz == "2560x1080" || sz == "3440x1440" ||
                                          sz == "3840x1600"                 ? "21:9"
                                  : sz == "3840x1080" || sz == "5120x1440" ? "32:9"

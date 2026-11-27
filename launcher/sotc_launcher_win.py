@@ -20,6 +20,7 @@ from pathlib import Path
 import queue
 import re
 import runpy
+import shlex
 import shutil
 import signal
 import subprocess
@@ -327,9 +328,10 @@ GRASS_DETAIL = [('1', ('Como no PS4', 'As on PS4')),
                 ('0.25', ('Alto', 'High')),
                 ('0.15', ('Mais alto', 'Higher')),
                 ('0.1', ('Muito alto', 'Very high'))]
-# sotc (0.75): SOTC_AUDIO_CHANNELS (runtime_audio.c): auto lets Windows fit the game's 7.1 to the device;
+# sotc (0.75): SOTC_AUDIO_CHANNELS (runtime_audio.c): auto lets the OS fit the game's 7.1 to the device;
 # 2 and 6 are mixed down by the port, 8 sends the 7.1 as it is.
-AUDIO_CHANNELS = [('auto', ('Automático (como o Windows estiver configurado)', 'Automatic (as Windows is set up)')),
+AUDIO_CHANNELS = [('auto', ('Automático (como o Windows estiver configurado)', 'Automatic (as Windows is set up)') if IS_WINDOWS
+                   else ('Automático (como o sistema estiver configurado)', 'Automatic (as the system is set up)')),
                   ('2', ('Estéreo 2.0 (fones e duas caixas)', 'Stereo 2.0 (headphones and two speakers)')),
                   ('6', ('Surround 5.1', 'Surround 5.1')),
                   ('8', ('Surround 7.1', 'Surround 7.1'))]
@@ -728,6 +730,38 @@ def _shortcut_script(play, frozen, executable, port_dir, game_icon):
             + (f'$s.Arguments={_ps_quote(arguments)};' if arguments else '') + '$s.Save()')
 
 
+def _linux_desktop_entry(play, appimage_path, executable, port_dir, icon_path):
+    """Freedesktop .desktop entry for Linux app menus and Steam (directly --play or launcher)."""
+    port = Path(port_dir)
+    if appimage_path:
+        exec_line = f'{shlex.quote(str(appimage_path))} ' + ('--play' if play else '--launcher')
+    else:
+        launcher_py = port / 'launcher' / 'sotc_launcher_win.py'
+        exec_line = f'{shlex.quote(str(executable))} {shlex.quote(str(launcher_py))}' + (' --play' if play else '')
+    name = 'Shadow of the Colossus (Play)' if play else 'Shadow of the Colossus'
+    icon = str(icon_path) if icon_path else str(port / 'launcher' / 'sotc.png')
+    return '\n'.join([
+        '[Desktop Entry]',
+        'Type=Application',
+        'Version=1.0',
+        f'Name={name}',
+        'Comment=Shadow of the Colossus PC Port',
+        f'Exec={exec_line}',
+        f'Path={port}',
+        f'Icon={icon}',
+        'Terminal=false',
+        'Categories=Game;',
+        'StartupWMClass=Shadow of the Colossus',
+        '',
+    ])
+
+
+def _linux_applications_dir():
+    xdg_data = os.environ.get('XDG_DATA_HOME', '')
+    base = Path(xdg_data) if xdg_data else Path.home() / '.local' / 'share'
+    return base / 'applications'
+
+
 def clear_shader_cache_after_update(settings):
     """sotc: 0.72.2: a port update clears the shader cache once. Shaders and pipelines built by the
     previous port can conflict with the new one (wrong or missing effects, crashes when one is
@@ -884,11 +918,70 @@ def window_icon_file(s):
         return None
 
 
+_LINUX_DISPLAYS = None
+
+
+def _gpu_capabilities_exe():
+    name = 'bb-gpu-capabilities.exe' if IS_WINDOWS else 'bb-gpu-capabilities'
+    exe = PORT_DIR / 'bin' / name
+    return exe if exe.is_file() else PORT_DIR / 'out' / name
+
+
+def _parse_linux_displays(text):
+    """Parse `bb-gpu-capabilities --displays` lines into [(device_id, label, (cx, cy), primary, hz)]."""
+    entries = []
+    for idx, line in enumerate((text or '').splitlines()):
+        if not line.startswith('DISPLAY\t'):
+            continue
+        fields = line.split('\t', 8)
+        if len(fields) < 9:
+            continue
+        try:
+            primary = fields[2] == '1'
+            x, y, w, h = int(fields[3]), int(fields[4]), int(fields[5]), int(fields[6])
+            hz_val = float(fields[7])
+        except ValueError:
+            continue
+        if w <= 0 or h <= 0:
+            continue
+        entries.append((primary, idx, x, y, w, h, hz_val, fields[8].strip()))
+    entries.sort(key=lambda item: (not item[0], item[1]))
+    seen = {}
+    parsed = []
+    for pos, (primary, _idx, x, y, w, h, hz_val, raw_name) in enumerate(entries, start=1):
+        base = raw_name or f'Monitor {pos}'
+        n = seen.get(base, 0) + 1
+        seen[base] = n
+        device_id = base if n == 1 else f'{base} #{n}'
+        hz_int = round(hz_val) if hz_val > 1 else 0
+        hz_part = f' ({hz_int} Hz)' if hz_int else ''
+        primary_part = _(' (principal)', ' (primary)') if primary else ''
+        label = f'{device_id} — {w} × {h}{hz_part}{primary_part}'
+        parsed.append((device_id, label, (x + w // 2, y + h // 2), primary, hz_int))
+    return parsed
+
+
+def _linux_displays():
+    global _LINUX_DISPLAYS
+    if _LINUX_DISPLAYS is not None:
+        return _LINUX_DISPLAYS
+    exe = _gpu_capabilities_exe()
+    if not exe.is_file():
+        _LINUX_DISPLAYS = []
+        return _LINUX_DISPLAYS
+    try:
+        result = subprocess.run([str(exe), '--displays'], capture_output=True, text=True, timeout=5)
+        parsed = _parse_linux_displays(result.stdout) if result.returncode == 0 else []
+    except (OSError, subprocess.TimeoutExpired):
+        parsed = []
+    _LINUX_DISPLAYS = parsed
+    return _LINUX_DISPLAYS
+
+
 def monitors():
-    """This PC's monitors: [(device name, label, (x, y) of its centre, primary)], the primary first.
-    Windows only (EnumDisplayMonitors); elsewhere none, and the game opens on the primary one."""
+    """This PC's monitors: [(device name, label, (x, y) of its centre, primary)], the primary first."""
     if not IS_WINDOWS:
-        return []
+        return [(d[0], d[1], d[2], d[3]) for d in _linux_displays()]
     from ctypes import wintypes
 
     class MONITORINFOEXW(ctypes.Structure):
@@ -915,8 +1008,16 @@ def monitors():
             for device, w, h, centre, primary in found]
 
 
-def screen_refresh_hz():
-    """The primary screen's refresh rate (60 when unknown)."""
+def screen_refresh_hz(monitor_device=''):
+    """The chosen or primary screen's refresh rate (60 when unknown)."""
+    if not IS_WINDOWS:
+        displays = _linux_displays()
+        chosen = next((d for d in displays if monitor_device and d[0] == monitor_device), None)
+        if chosen is None:
+            chosen = next((d for d in displays if d[3]), displays[0] if displays else None)
+        if chosen and chosen[4] >= 30:
+            return int(chosen[4])
+        return 60
     class DEVMODEW(ctypes.Structure):
         _fields_ = [('name', ctypes.c_wchar * 32), ('spec', ctypes.c_ushort), ('driver', ctypes.c_ushort),
                     ('size', ctypes.c_ushort), ('extra', ctypes.c_ushort), ('fields', ctypes.c_ulong),
@@ -986,7 +1087,7 @@ def game_environment(s):
     # that cannot keep 60 lower it to a step that divides the screen's refresh (48 at 144 Hz, 40 at
     # 120/240 Hz, 30 at 60 Hz), steady instead of swinging; it tries 60 again every 10 s.
     if fps_mode == '60' and s.get('fps_dynamic', True):
-        env.setdefault('SOTC_FPS_DYNAMIC', dynamic_fps_step(screen_refresh_hz()))
+        env.setdefault('SOTC_FPS_DYNAMIC', dynamic_fps_step(screen_refresh_hz(s.get('game_monitor', ''))))
     env['BB_VBLANK_HZ'] = '120'
     env['BB_FULLSCREEN'] = '1' if s['fullscreen'] else '0'
     # The monitor the game window opens on (window.cpp): the centre of the chosen one, found again now
@@ -1335,6 +1436,16 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
             return target
         except (ImportError, OSError):
             return None
+
+    def game_icon_png(self):
+        """icon0.png of the dump (or bundled sotc.png) for Linux .desktop shortcuts."""
+        game_dir = self.app.get('game_dir', '')
+        if game_dir:
+            icon0 = Path(game_dir) / 'sce_sys' / 'icon0.png'
+            if icon0.is_file():
+                return icon0
+        bundled = PORT_DIR / 'launcher' / 'sotc.png'
+        return bundled if bundled.is_file() else None
 
     # ---- look --------------------------------------------------------------------------------
     def style(self):
@@ -1777,7 +1888,9 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         self.var('vram_profile').trace_add('write', lambda *_a: self.show_vram_profile_hint())
         self.show_vram_profile_hint()
         self.check(quick, 'af16', _('Texturas nítidas (filtro 16x)', 'Sharp textures (16x filtering)'))
-        self.check(quick, 'hdr', _('HDR (HDR do Windows ligado)', 'HDR (Windows HDR on)'))
+        self.check(quick, 'hdr',
+                   _('HDR (HDR do Windows ligado)', 'HDR (Windows HDR on)') if IS_WINDOWS
+                   else _('HDR (HDR do sistema ligado)', 'HDR (system HDR on)'))
         self.check(quick, 'fullscreen', _('Tela cheia', 'Fullscreen'))
         self.check(quick, 'neo', _('Modo PS4 Pro', 'PS4 Pro mode'))
         self.check(quick, 'rb_hot', _('Mais FPS: leituras rápidas da GPU',
@@ -1992,7 +2105,9 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                    'not work with a frame limiter or V-Sync. Experimental: more generated frames mean more latency.'))
         self.check(f, 'hdr', _('HDR', 'HDR'),
                    _('Saída HDR10 e a renderização HDR do jogo. Ligue o HDR do Windows antes de jogar.',
-                     'HDR10 output and the game\'s HDR rendering. Turn on Windows HDR before playing.'))
+                     'HDR10 output and the game\'s HDR rendering. Turn on Windows HDR before playing.') if IS_WINDOWS
+                   else _('Saída HDR10 e a renderização HDR do jogo. Ligue o HDR nas configurações do sistema antes de jogar.',
+                          "HDR10 output and the game's HDR rendering. Turn on HDR in system settings before playing."))
         self.check(f, 'fg_hudless', _('Geração de quadros sem a interface (experimental)',
                                       'Frame generation without the interface (experimental)'),
                    _('Gera os quadros intermediários só com a cena e põe a interface por cima, sem interpolá-la: '
@@ -2142,7 +2257,11 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                    _('Saída HDR10 a partir da imagem do jogo. Precisa de HDR ligado no Windows e de um monitor '
                      'HDR; sem isso nada muda. Ajustes: SOTC_HDR_PAPER e SOTC_HDR_GAIN em "Variáveis extras".',
                      'HDR10 output from the game image. Needs HDR on in Windows and an HDR monitor; otherwise '
-                     'nothing changes. Tuning: SOTC_HDR_PAPER and SOTC_HDR_GAIN in "Extra variables".'))
+                     'nothing changes. Tuning: SOTC_HDR_PAPER and SOTC_HDR_GAIN in "Extra variables".') if IS_WINDOWS
+                   else _('Saída HDR10 a partir da imagem do jogo. Precisa de HDR ligado no sistema (Wayland/compositor) '
+                          'e de um monitor HDR; sem isso nada muda. Ajustes: SOTC_HDR_PAPER e SOTC_HDR_GAIN em "Variáveis extras".',
+                          'HDR10 output from the game image. Needs HDR on in the system (Wayland/compositor) and an '
+                          'HDR monitor; otherwise nothing changes. Tuning: SOTC_HDR_PAPER and SOTC_HDR_GAIN in "Extra variables".'))
 
     def build_sound(self):
         """sotc (0.75): sound output, volume and the sound engine (built-in mixer or the console's modules)."""
@@ -2159,7 +2278,15 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                    "The game mixes its sound in 7.1. Automatic lets Windows fit it to your device. Stereo 2.0 and "
                    "Surround 5.1 are mixed down by the port itself (ITU coefficients, no clipping); pick Stereo if "
                    "the sound is quiet or voices are missing on headphones or ordinary speakers. 7.1 sends the 8 "
-                   "channels as they are. Applies the next time the game starts."))
+                   "channels as they are. Applies the next time the game starts.") if IS_WINDOWS
+                 else _('O jogo mistura o som em 7.1. Automático deixa o sistema (PipeWire/PulseAudio) adaptar ao seu '
+                        'dispositivo. Estéreo 2.0 e Surround 5.1 fazem a mistura no próprio port (padrão ITU, sem estourar); '
+                        'use Estéreo se o som sair baixo ou faltando vozes em fones e caixas comuns. 7.1 manda os 8 canais '
+                        'como estão. Vale na próxima vez que o jogo abrir.',
+                        'The game mixes its sound in 7.1. Automatic lets the system (PipeWire/PulseAudio) fit it to your '
+                        'device. Stereo 2.0 and Surround 5.1 are mixed down by the port itself (ITU coefficients, no '
+                        'clipping); pick Stereo if the sound is quiet or voices are missing on headphones or ordinary '
+                        'speakers. 7.1 sends the 8 channels as they are. Applies the next time the game starts.'))
         self.check(f, 'audio_lfe', _('Graves do subwoofer no estéreo', 'Subwoofer bass in stereo'),
                    _('No Estéreo 2.0, mistura o canal de graves (LFE) nas duas caixas. Desligue se o grave ficar '
                      'forte demais nos fones.',
@@ -2169,7 +2296,11 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                  _('Nome (ou parte) do dispositivo de som, por exemplo "Headset" ou "TV"; vazio = o padrão do '
                    'Windows. O registro do jogo lista os nomes (linhas "audio device").',
                    'Name (or part of it) of the sound device, e.g. "Headset" or "TV"; empty = the Windows '
-                   'default. The game log lists the names ("audio device" lines).'))
+                   'default. The game log lists the names ("audio device" lines).') if IS_WINDOWS
+                 else _('Nome (ou parte) do dispositivo de som, por exemplo "Headset" ou "TV"; vazio = o padrão do '
+                        'sistema. O registro do jogo lista os nomes (linhas "audio device").',
+                        'Name (or part of it) of the sound device, e.g. "Headset" or "TV"; empty = the system '
+                        'default. The game log lists the names ("audio device" lines).'))
         self.section(f, _('Volume', 'Volume'))
         self.row(f, _('Volume', 'Volume'), self.choice(f, 'volume', VOLUME),
                  _('Aumenta o som do jogo, que sai baixo. Acima de 100% os picos são suavizados em vez de '
@@ -2326,26 +2457,29 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         self.row(f, _('Idioma do lançador', 'Launcher language'), self.choice(f, 'ui_language', UI_LANGUAGES),
                  _('Vale na próxima vez que o lançador abrir.', 'Applies when the launcher opens again.'))
         self.check(f, 'close_on_play', _('Fechar o lançador quando o jogo abrir', 'Close the launcher when the game starts'))
-        # The tray, updates and shortcuts are Windows ones (the notification area, the release zip, a
-        # .lnk); the AppImage has none of them.
+        # The tray icon is Windows-only; updates and shortcuts also work on Linux (.desktop / AppImage).
         if IS_WINDOWS:
             self.check(f, 'minimize_to_tray', _('Minimizar para a bandeja do Windows', 'Minimize to the system tray'),
                        _('Minimizado, o lançador sai da barra de tarefas e fica como um ícone perto do relógio: um clique '
                          'o traz de volta, o botão direito tem Abrir e Sair.',
                          'Minimized, the launcher leaves the task bar for an icon by the clock: a click brings it back, the '
                          'right button has Open and Quit.'))
-            self.check(f, 'check_updates', _('Procurar atualizações ao abrir', 'Check for updates at startup'),
-                       _('Pergunta antes de baixar. Saves, cache de shaders e sotc.ini são mantidos.',
-                         'Asks before downloading. Saves, shader cache and sotc.ini are kept.'))
+        self.check(f, 'check_updates', _('Procurar atualizações ao abrir', 'Check for updates at startup'),
+                   _('Pergunta antes de baixar. Saves, cache de shaders e sotc.ini são mantidos.',
+                     'Asks before downloading. Saves, shader cache and sotc.ini are kept.'))
         holder = ttk.Frame(f)
         holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(10, 0))
-        if IS_WINDOWS:
-            ttk.Button(holder, text=_('Atalho na área de trabalho', 'Desktop shortcut'), command=self.shortcut).pack(side='left')
-            ttk.Button(holder, text=_('Atalho para jogar direto', 'Shortcut that starts the game'),
-                       command=lambda: self.shortcut(play=True)).pack(side='left', padx=(6, 0))
-            # A second row: on a narrow window (a laptop) the fourth button fell off the window's edge.
-            holder = ttk.Frame(f)
-            holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(6, 0))
+        ttk.Button(
+            holder,
+            text=_('Atalho na área de trabalho', 'Desktop shortcut') if IS_WINDOWS
+            else _('Atalho no menu de aplicativos', 'Application menu shortcut'),
+            command=self.shortcut,
+        ).pack(side='left')
+        ttk.Button(holder, text=_('Atalho para jogar direto', 'Shortcut that starts the game'),
+                   command=lambda: self.shortcut(play=True)).pack(side='left', padx=(6, 0))
+        # A second row: on a narrow window (a laptop) the fourth button fell off the window's edge.
+        holder = ttk.Frame(f)
+        holder.grid(row=self.next_row(f), column=0, columnspan=2, sticky='w', pady=(6, 0))
         ttk.Button(holder, text=_('Pasta do port', 'Port folder'), command=lambda: self.open_path(DATA_DIR)).pack(side='left')
         ttk.Button(holder, text=_('Limpar cache de shaders', 'Clear shader cache'), command=self.clear_cache).pack(side='left', padx=(6, 0))
         self.section(f, _('Diagnóstico', 'Diagnostics'))
@@ -2445,10 +2579,7 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
         return '   ·   '.join(parts)
 
     def detect_gpu(self):
-        name = 'bb-gpu-capabilities.exe' if IS_WINDOWS else 'bb-gpu-capabilities'
-        exe = PORT_DIR / 'bin' / name
-        if not exe.is_file():
-            exe = PORT_DIR / 'out' / name
+        exe = _gpu_capabilities_exe()
         env = dict(os.environ)
         if IS_WINDOWS and not (exe.parent / 'SDL3.dll').is_file():
             clang64 = Path(os.environ.get('MSYS2_ROOT', r'C:\msys64')) / 'clang64' / 'bin'
@@ -2573,7 +2704,13 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
                'libSceNgs2 e libSceUlt do seu console continuam opcionais (com eles o som é o do firmware).',
                'Since 0.75 the port has a built-in sound mixer and the game has sound without anything from the '
                'console. If it is still silent, check the game\'s and Windows\' volume and the output device. Your '
-               'console\'s libSceNgs2 and libSceUlt modules stay optional (with them the firmware plays the sound).'),
+               'console\'s libSceNgs2 and libSceUlt modules stay optional (with them the firmware plays the sound).') if IS_WINDOWS
+             else _('Desde a 0.75 o port tem um mixer de som embutido e o jogo tem som sem nada do console. Se mesmo '
+                    'assim estiver mudo, confira o volume do jogo e do sistema e o dispositivo de saída. Os módulos '
+                    'libSceNgs2 e libSceUlt do seu console continuam opcionais (com eles o som é o do firmware).',
+                    "Since 0.75 the port has a built-in sound mixer and the game has sound without anything from the "
+                    "console. If it is still silent, check the game's and system's volume and the output device. Your "
+                    "console's libSceNgs2 and libSceUlt modules stay optional (with them the firmware plays the sound)."),
              [(_('Módulos de som', 'Sound modules'), lambda: self.jump_key('sys_modules'), False)]),
             (_('Travadas nas trocas de área ou na primeira vez', 'Stutters at area changes or the first time'),
              _('Na primeira vez (e depois de atualizar) o cache de shaders é montado: as travadas somem com o tempo. '
@@ -2584,7 +2721,11 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
              _('Escolha o Modo de jogo Normal ou Pro, ou 30 FPS. Feche programas por cima do jogo (OBS, RTSS, '
                'Afterburner, gravação do Windows). Em placas com pouca memória, use "Uso de memória de vídeo" Econômico.',
                'Choose the Normal or Pro play mode, or 30 FPS. Close programs over the game (OBS, RTSS, Afterburner, '
-               'Windows recording). On cards with little memory, set "Video memory use" to Economy.'),
+               'Windows recording). On cards with little memory, set "Video memory use" to Economy.') if IS_WINDOWS
+             else _('Escolha o Modo de jogo Normal ou Pro, ou 30 FPS. Feche programas por cima do jogo '
+                    '(OBS, gravação de tela, overlays extras). Em placas com pouca memória, use "Uso de memória de vídeo" Econômico.',
+                    'Choose the Normal or Pro play mode, or 30 FPS. Close programs over the game (OBS, '
+                    'screen recording, extra overlays). On cards with little memory, set "Video memory use" to Economy.'),
              [(_('Modo de jogo', 'Play mode'), lambda: self.jump_key('play_mode'), False),
               (_('Memória de vídeo', 'Video memory'), lambda: self.jump_key('vram_use'), False)]),
             (_('HUD, letras ou barras de vida tremendo', 'HUD, letters or health bars shaking'),
@@ -3614,10 +3755,23 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
             self.show('game')
             return
         free = free_commit_gb()
+        low_mem_msg = (
+            _('O Windows só tem {:.1f} GB livres para programas (RAM + arquivo de paginação). O jogo reserva cerca de 6 GB ao abrir e precisa de mais alguns GB depois; com menos, ele fecha logo no início (erro 1455 no log).\n\nPara resolver: Iniciar → "Ajustar a aparência e o desempenho do Windows" → Avançado → Memória virtual → Alterar… → marque "Gerenciar automaticamente o tamanho do arquivo de paginação" (ou defina pelo menos 16 GB) e reinicie o PC. Fechar navegadores e outros programas grandes também ajuda.\n\nAbrir o jogo mesmo assim?',
+              'Windows has only {:.1f} GB free for programs (RAM + page file). The game reserves about 6 GB when it starts and needs a few GB more after that; with less it closes right at the start (error 1455 in the log).\n\nTo fix it: Start → "Adjust the appearance and performance of Windows" → Advanced → Virtual memory → Change… → tick "Automatically manage paging file size for all drives" (or set at least 16 GB) and restart the PC. Closing browsers and other big programs also helps.\n\nStart the game anyway?')
+            if IS_WINDOWS else
+            _('O sistema só tem {:.1f} GB livres para programas (RAM disponível + swap). O jogo reserva cerca de 6 GB ao abrir e precisa de mais alguns GB depois; com menos, pode ser encerrado pelo sistema ao iniciar.\n\nPara evitar quedas: feche navegadores ou programas pesados e habilite um arquivo de swap ou zram (recomendado pelo menos 16 GB no total).\n\nAbrir o jogo mesmo assim?',
+              'The system has only {:.1f} GB free for programs (available RAM + swap). The game reserves about 6 GB when it starts and needs a few GB more after that; with less, it may be killed at startup.\n\nTo avoid crashes: close browsers or heavy programs and enable a swap file or zram (at least 16 GB total recommended).\n\nStart the game anyway?')
+        )
         if free is not None and free < MIN_FREE_COMMIT_GB and not self.messagebox.askyesno(
-                'Shadow of the Colossus', _('O Windows só tem {:.1f} GB livres para programas (RAM + arquivo de paginação). O jogo reserva cerca de 6 GB ao abrir e precisa de mais alguns GB depois; com menos, ele fecha logo no início (erro 1455 no log).\n\nPara resolver: Iniciar → "Ajustar a aparência e o desempenho do Windows" → Avançado → Memória virtual → Alterar… → marque "Gerenciar automaticamente o tamanho do arquivo de paginação" (ou defina pelo menos 16 GB) e reinicie o PC. Fechar navegadores e outros programas grandes também ajuda.\n\nAbrir o jogo mesmo assim?',
-                                            'Windows has only {:.1f} GB free for programs (RAM + page file). The game reserves about 6 GB when it starts and needs a few GB more after that; with less it closes right at the start (error 1455 in the log).\n\nTo fix it: Start → "Adjust the appearance and performance of Windows" → Advanced → Virtual memory → Change… → tick "Automatically manage paging file size for all drives" (or set at least 16 GB) and restart the PC. Closing browsers and other big programs also helps.\n\nStart the game anyway?').format(free)):
+                'Shadow of the Colossus', low_mem_msg.format(free)):
             return
+        if not IS_WINDOWS:
+            mmc = linux_max_map_count()
+            if mmc is not None and mmc < MIN_LINUX_MAX_MAP_COUNT and not self.messagebox.askyesno(
+                    'Shadow of the Colossus',
+                    _('O limite do kernel vm.max_map_count está em {} (recomendado: 262144 ou maior). Com um limite baixo, a reserva de memória do jogo pode falhar ao abrir ou durante o jogo.\n\nPara aumentar agora:\n  sudo sysctl -w vm.max_map_count=1048576\nPara tornar permanente:\n  echo "vm.max_map_count=1048576" | sudo tee /etc/sysctl.d/99-sotc.conf\n\nAbrir o jogo mesmo assim?',
+                      'The kernel limit vm.max_map_count is {} (recommended: 262144 or higher). With a low limit, the game memory allocation can fail at startup or while playing.\n\nTo raise it now:\n  sudo sysctl -w vm.max_map_count=1048576\nTo make it permanent:\n  echo "vm.max_map_count=1048576" | sudo tee /etc/sysctl.d/99-sotc.conf\n\nStart the game anyway?').format(mmc)):
+                return
         self.set_log('')
         try:
             write_key_bindings(self.app.get('keys'))
@@ -3759,6 +3913,24 @@ class Launcher(sotc_search.SearchMixin, sotc_pad.PadMixin):
 
     def shortcut(self, play=False):
         self.collect()
+        if not IS_WINDOWS:
+            entry = _linux_desktop_entry(play, os.environ.get('APPIMAGE', ''), sys.executable, PORT_DIR,
+                                         self.game_icon_png())
+            target = _linux_applications_dir() / ('sotc-pc-play.desktop' if play else 'sotc-pc.desktop')
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(entry, encoding='utf-8')
+                os.chmod(target, 0o755)
+            except OSError as error:
+                self.messagebox.showerror('Shadow of the Colossus', str(error))
+                return
+            self.messagebox.showinfo('Shadow of the Colossus', _(
+                'Atalho criado em {}. Ele aparece no menu de aplicativos e pode ser adicionado ao Steam como '
+                'jogo não-Steam.',
+                'Shortcut created at {}. It appears in the application menu and can be added to Steam as '
+                'a non-Steam game.').format(target) if play else _(
+                'Atalho criado em {}.', 'Shortcut created at {}.').format(target))
+            return
         script = _shortcut_script(play, FROZEN, sys.executable, PORT_DIR, self.game_icon_file())
         result = subprocess.run(['powershell', '-NoProfile', '-Command', script], capture_output=True,
                                 creationflags=NO_WINDOW)
@@ -3913,8 +4085,40 @@ class GameJob:
             self.handle = None
 
 
+def linux_free_memory_gb(meminfo_path='/proc/meminfo'):
+    """Available memory on Linux (MemAvailable + SwapFree), in GB; None if unreadable."""
+    try:
+        text = Path(meminfo_path).read_text(encoding='utf-8')
+    except OSError:
+        return None
+    avail_kb = None
+    swap_kb = 0
+    for line in text.splitlines():
+        if line.startswith('MemAvailable:'):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                avail_kb = int(parts[1])
+        elif line.startswith('SwapFree:'):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                swap_kb = int(parts[1])
+    if avail_kb is None:
+        return None
+    return (avail_kb + swap_kb) / 1e6
+
+
+def linux_max_map_count(path='/proc/sys/vm/max_map_count'):
+    """Current vm.max_map_count kernel limit on Linux; None if unreadable."""
+    try:
+        return int(Path(path).read_text(encoding='utf-8').strip())
+    except (OSError, ValueError):
+        return None
+
+
 def free_commit_gb():
-    """Commit memory Windows can still give programs (RAM + page file), in GB; None if unknown."""
+    """Memory Windows/Linux can still give programs (RAM + page/swap), in GB; None if unknown."""
+    if not IS_WINDOWS:
+        return linux_free_memory_gb()
     class MemoryStatus(ctypes.Structure):
         _fields_ = [('length', ctypes.c_uint32), ('load', ctypes.c_uint32),
                     ('total_phys', ctypes.c_uint64), ('avail_phys', ctypes.c_uint64),
@@ -3934,6 +4138,7 @@ def free_commit_gb():
 # The guest memory pool (~6 GB, committed at once when the game starts) plus the process itself:
 # below this the game stops at boot with error 1455 (issue #95).
 MIN_FREE_COMMIT_GB = 8.0
+MIN_LINUX_MAX_MAP_COUNT = 262144
 
 
 def play_without_window(settings):
@@ -3947,15 +4152,16 @@ def play_without_window(settings):
         pass
     if not settings.get('gpu_vram_mb'):
         # sotc: the video memory profile's Auto needs the card (the window finds it in detect_gpu).
-        exe = PORT_DIR / 'bin' / 'bb-gpu-capabilities.exe'
-        try:
-            result = subprocess.run([str(exe), '--live-resolution'], capture_output=True, text=True,
-                                    timeout=30, creationflags=NO_WINDOW)
-            found = re.search(r'^GPU: .*?(\d+)\s*MiB', result.stderr, re.MULTILINE)
-            if found:
-                settings['gpu_vram_mb'] = int(found.group(1))
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        exe = _gpu_capabilities_exe()
+        if exe.is_file():
+            try:
+                result = subprocess.run([str(exe), '--live-resolution'], capture_output=True, text=True,
+                                        timeout=30, creationflags=NO_WINDOW)
+                found = re.search(r'^GPU: .*?(\d+)\s*MiB', result.stderr, re.MULTILINE)
+                if found:
+                    settings['gpu_vram_mb'] = int(found.group(1))
+            except (OSError, subprocess.TimeoutExpired):
+                pass
     env = game_environment(settings)
     env['SOTC_EVENT_LOG'] = start_event_log(log_dir, settings, env)
     with open_session_log(log_dir) as log:

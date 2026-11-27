@@ -742,8 +742,13 @@ void BuildItems() {
                  "The PS4 Pro graphics: more detail and better shadows. On screens wider than 16:9 it stays off."),
                OnOff(), "false");
     AddRestart(kTabDisplay, "hdr", L("HDR do jogo", "Game HDR"),
+#ifdef _WIN32
                L("A renderização HDR do próprio jogo (pede um monitor HDR ligado no Windows).",
                  "The game's own HDR rendering (needs an HDR monitor turned on in Windows)."),
+#else
+               L("A renderização HDR do próprio jogo (pede um monitor HDR ligado no sistema).",
+                 "The game's own HDR rendering (needs an HDR monitor turned on in the system)."),
+#endif
                OnOff(), "false");
     AddRestart(kTabDisplay, "af16", L("Filtro de texturas 16x", "16x texture filtering"),
                L("Texturas nítidas no chão visto de lado (filtro anisotrópico 16x).",
@@ -1007,9 +1012,15 @@ void BuildItems() {
                 });
     }
     AddRestart(kTabSound, "audio_channels", L("Canais de áudio", "Audio channels"),
+#ifdef _WIN32
                L("Automático deixa o Windows ajustar o 7.1 do jogo ao seu aparelho.",
                  "Automatic lets Windows fit the game's 7.1 to your device."),
                Quoted({{"auto", L("Automático (o do Windows)", "Automatic (Windows')")},
+#else
+               L("Automático deixa o sistema ajustar o 7.1 do jogo ao seu aparelho.",
+                 "Automatic lets the system fit the game's 7.1 to your device."),
+               Quoted({{"auto", L("Automático (o do sistema)", "Automatic (system)")},
+#endif
                        {"2", L("Estéreo 2.0", "Stereo 2.0")},
                        {"6", "Surround 5.1"},
                        {"8", "Surround 7.1"}}),

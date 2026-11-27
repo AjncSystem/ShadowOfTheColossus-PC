@@ -357,3 +357,7 @@ add_executable(upscaler-support-test EXCLUDE_FROM_ALL ../tests/test_upscaler_sup
 target_include_directories(upscaler-support-test PRIVATE shim)
 target_compile_options(upscaler-support-test PRIVATE -UNDEBUG)
 
+add_executable(shader-profile-test EXCLUDE_FROM_ALL ../tests/test_shader_profile.cpp)
+target_include_directories(shader-profile-test PRIVATE shadps4)
+target_compile_options(shader-profile-test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+

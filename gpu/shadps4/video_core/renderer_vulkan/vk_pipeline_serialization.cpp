@@ -63,6 +63,7 @@ long long Ms(std::chrono::steady_clock::duration d) {
 std::mutex collided_mutex;
 std::unordered_set<u64> collided_bins;      // BinaryId of the permutations left out
 std::unordered_set<size_t> collided_perms; // perm hashes, as in the pipeline keys
+std::unordered_set<u64> preloaded_bins;    // BinaryId referenced by a live preloaded/saved pipeline
 
 u64 BinaryId(u64 pgm_hash, size_t perm_idx) {
     return pgm_hash ^ (u64(perm_idx) << 56);
@@ -154,7 +155,13 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
     }
 
     const auto name = fmt::format("{:#018x}_{}", pgm_hash, perm_idx);
-    if (!EmulatorSettings.IsPipelineCacheArchived()) {
+    const u64 bin_id = BinaryId(pgm_hash, perm_idx);
+    bool is_live = false;
+    {
+        std::scoped_lock lock{collided_mutex};
+        is_live = preloaded_bins.contains(bin_id);
+    }
+    if (is_live && !EmulatorSettings.IsPipelineCacheArchived()) {
         std::vector<u32> stored;
         Storage::DataBase::Instance().Load(Storage::BlobType::ShaderBinary, name, stored);
         if (!stored.empty() && stored != spv) {
@@ -164,9 +171,13 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
                             "Shader permutation {} is another one on disk: not cached", name);
             }
             std::scoped_lock lock{collided_mutex};
-            collided_bins.insert(BinaryId(pgm_hash, perm_idx));
+            collided_bins.insert(bin_id);
             return;
         }
+    }
+    {
+        std::scoped_lock lock{collided_mutex};
+        preloaded_bins.insert(bin_id);
     }
     Storage::DataBase::Instance().Save(Storage::BlobType::ShaderBinary, name, std::move(spv));
 }
@@ -236,7 +247,8 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
 
     Serialization::Archive meta_ar{std::move(meta_blob)};
 
-    if (!LoadPipelineStage(meta_ar, 0)) {
+    u64 bin_id{};
+    if (!LoadPipelineStage(meta_ar, 0, &bin_id)) {
         return false;
     }
 
@@ -271,6 +283,10 @@ bool PipelineCache::LoadComputePipeline(Serialization::Archive& ar) {
     if (!it.value()->Handle()) {
         compute_pipelines.erase(compute_key);
         return false;
+    }
+    {
+        std::scoped_lock lock{collided_mutex};
+        preloaded_bins.insert(bin_id);
     }
     return true;
 }
@@ -328,6 +344,8 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     GraphicsPipeline::SerializationSupport sdata{};
     sdata.Deserialize(ar);
 
+    std::array<u64, MaxShaderStages> stage_bins{};
+    size_t stage_bin_count = 0;
     for (int stage_idx = 0; stage_idx < MaxShaderStages; ++stage_idx) {
         const auto& hash = graphics_key.stage_hashes[stage_idx];
         if (!hash) {
@@ -343,9 +361,11 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
 
         Serialization::Archive meta_ar{std::move(meta_blob)};
 
-        if (!LoadPipelineStage(meta_ar, stage_idx)) {
+        u64 bin_id{};
+        if (!LoadPipelineStage(meta_ar, stage_idx, &bin_id)) {
             return false;
         }
+        stage_bins[stage_bin_count++] = bin_id;
     }
 
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
@@ -369,16 +389,26 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     fetch_shader = nullptr;
 
     if (async) {
+        std::scoped_lock lock{collided_mutex};
+        for (size_t i = 0; i < stage_bin_count; ++i) {
+            preloaded_bins.insert(stage_bins[i]);
+        }
         return true; // a refused one is dropped when collected (CollectAsyncPipelines)
     }
     if (!it.value()->Handle()) {
         graphics_pipelines.erase(graphics_key);
         return false;
     }
+    {
+        std::scoped_lock lock{collided_mutex};
+        for (size_t i = 0; i < stage_bin_count; ++i) {
+            preloaded_bins.insert(stage_bins[i]);
+        }
+    }
     return true;
 }
 
-bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) {
+bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage, u64* out_bin_id) {
     auto program = std::make_unique<Program>();
     Shader::StageSpecialization spec{};
     spec.info = &program->info;
@@ -449,6 +479,9 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     if (auto& fetch = it_pgm.value()->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
         fetch_shader = &fetch;
     }
+    if (out_bin_id) {
+        *out_bin_id = BinaryId(it_pgm.value()->info.pgm_hash, perm_idx);
+    }
 
     return true;
 }
@@ -456,6 +489,12 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
 void PipelineCache::WarmUp() {
     if (!EmulatorSettings.IsPipelineCacheEnabled()) {
         return;
+    }
+    {
+        std::scoped_lock lock{collided_mutex};
+        collided_bins.clear();
+        collided_perms.clear();
+        preloaded_bins.clear();
     }
 
     Storage::DataBase::Instance().Open();
@@ -467,35 +506,33 @@ void PipelineCache::WarmUp() {
     // used to be ignored and left in place, so every later run started without a cache and saved
     // nothing: it is set aside and a new one starts with this profile.
     bool compatible = true;
+    bool legacy_profile = false;
     if (!profile_data.empty()) {
         Shader::Profile cached_profile{};
-        if (profile_data.size() == sizeof(Shader::Profile)) {
-            // sotc: barycentric_via_gs, the last member, sits where older caches have a padding
-            // byte (seen 0xe3, 0x36): anything but 1 there is off, so those caches still match.
-            auto& via_gs = profile_data[offsetof(Shader::Profile, barycentric_via_gs)];
-            via_gs = via_gs == 1 ? 1 : 0;
-            std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
-        }
-        compatible = profile_data.size() == sizeof(Shader::Profile) && cached_profile == profile;
+        compatible = Shader::DeserializeProfile(profile_data, cached_profile, &legacy_profile) &&
+                     cached_profile == profile;
         if (!compatible) {
             LOG_WARNING(Render, "Pipeline cache isn't compatible with current system (profile of "
-                                "{} bytes, expected {}). Starting a new cache",
-                        profile_data.size(), sizeof(Shader::Profile));
+                                "{} bytes, expected {} or {}). Starting a new cache",
+                        profile_data.size(), Shader::kProfileSerializedSize, sizeof(Shader::Profile));
             Storage::DataBase::Instance().Reset();
         }
     }
     if (profile_data.empty() || !compatible) {
         Storage::DataBase::Instance().FinishPreload();
 
-        profile_data.resize(sizeof(profile));
-        std::memcpy(profile_data.data(), &profile, sizeof(profile));
         Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
-                                           std::move(profile_data));
+                                           Shader::SerializeProfile(profile));
         return;
+    }
+    if (legacy_profile) {
+        Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
+                                           Shader::SerializeProfile(profile));
     }
 
     u32 num_pipelines{};
     u32 num_total_pipelines{};
+    std::vector<std::string> stale_keys;
     const auto warmup_start = std::chrono::steady_clock::now();
     // sotc: progress for the loading screen's bar.
     SotcStats::warmup_done.store(0, std::memory_order_relaxed);
@@ -503,8 +540,8 @@ void PipelineCache::WarmUp() {
         static_cast<u32>(Storage::DataBase::Instance().CountBlobs(Storage::BlobType::PipelineKey)),
         std::memory_order_relaxed);
 
-    Storage::DataBase::Instance().ForEachBlob(
-        Storage::BlobType::PipelineKey, [&](std::vector<u8>&& data) {
+    Storage::DataBase::Instance().ForEachBlobWithName(
+        Storage::BlobType::PipelineKey, [&](const std::string& key_name, std::vector<u8>&& data) {
             ++num_total_pipelines;
             SotcStats::warmup_done.fetch_add(1, std::memory_order_relaxed);
 
@@ -516,6 +553,7 @@ void PipelineCache::WarmUp() {
                 u32 version{};
                 pldata.Read(version);
                 if (version != Serialization::PipelineKeyVersion) {
+                    stale_keys.push_back(key_name);
                     return;
                 }
 
@@ -536,8 +574,17 @@ void PipelineCache::WarmUp() {
 
             if (result) {
                 ++num_pipelines;
+            } else {
+                stale_keys.push_back(key_name);
             }
         });
+
+    if (!stale_keys.empty() && !EmulatorSettings.IsPipelineCacheArchived()) {
+        for (const auto& key_name : stale_keys) {
+            Storage::DataBase::Instance().Remove(Storage::BlobType::PipelineKey, key_name);
+        }
+        LOG_INFO(Render, "Cleaned {} stale pipeline keys from cache", stale_keys.size());
+    }
 
     // sotc: the compute pipelines the workers built (SOTC_ASYNC_PRELOAD); the graphics ones
     // are still being built while the game starts.

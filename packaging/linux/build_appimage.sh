@@ -33,6 +33,9 @@ find "$app/scripts" -name __pycache__ -prune -exec rm -rf {} +
 mkdir -p "$app/launcher"
 install -m644 launcher/sotc_*.py launcher/sotc.png launcher/window_icon.png "$app/launcher/"
 cp -r launcher/assets "$app/launcher/"
+if [[ -n ${SOTC_UPDATE_REPO:-} ]]; then
+    printf '%s\n' "$SOTC_UPDATE_REPO" > "$app/launcher/update_repo.txt"
+fi
 install -m755 out/bb-probe out/bb-gpu-capabilities "$app/bin/"
 install -m755 out/gpu/libbbgpu.so "$app/bin/gpu/"
 strip --strip-debug "$app/bin/bb-probe" "$app/bin/bb-gpu-capabilities" "$app/bin/gpu/libbbgpu.so"
@@ -125,6 +128,15 @@ if [[ -z $tool ]]; then
     fi
 fi
 mkdir -p dist
+if [[ ${SOTC_BUILD_TARBALL:-1} != 0 ]]; then
+    tar_output=dist/SotC-PC-${version:-dev}-linux-x86_64.tar.gz
+    tar_stage=$work/tar-stage/SotC-PC
+    mkdir -p "$tar_stage"
+    cp -a "$appdir"/. "$tar_stage"/
+    ln -sf AppRun "$tar_stage/SotC-PC"
+    tar -C "$work/tar-stage" -czf "$tar_output" SotC-PC
+    echo "Built $tar_output ($(du -h "$tar_output" | cut -f1))"
+fi
 # APPIMAGE_EXTRACT_AND_RUN: appimagetool itself runs without FUSE (containers, CI).
 APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 "$tool" --no-appstream "$appdir" "$output" >/dev/null
 echo "Built $output ($count bundled libraries, $(du -h "$output" | cut -f1))"

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Shadow of the Colossus PC (Linux AppImage).
-#   ./SotC-PC-x86_64.AppImage            the launcher (settings, then Play)
+#   ./SotC-PC-x86_64.AppImage            the launcher (or straight to the game in Steam Deck/Gamescope)
+#   ./SotC-PC-x86_64.AppImage --launcher the launcher window even in Steam Deck/Gamescope
 #   ./SotC-PC-x86_64.AppImage --play     the game with the launcher's settings, no window (Steam)
 #   ./SotC-PC-x86_64.AppImage --setup    without the launcher: chooses the game folder and the sound
 #                                        modules again, kept in sotc.ini (also the start without a display)
@@ -22,9 +23,27 @@ export TCL_LIBRARY="$APP/python/tcl" TK_LIBRARY="$APP/python/tk"
 
 case ${1:-} in
 --setup) ;;
+--launcher)
+   shift
+   if [[ -n ${DISPLAY:-} ]]; then
+       exec "$PYTHON" "$APP/launcher/sotc_launcher_win.py" "$@"
+   fi ;;
 --play) exec "$PYTHON" "$APP/launcher/sotc_launcher_win.py" "$@" ;;
 *) # Tk draws through X11 (XWayland on a Wayland desktop): without it, the start below.
    if [[ -n ${DISPLAY:-} ]]; then
+       if [[ $# -eq 0 && ${SOTC_AUTO_PLAY:-1} != 0 ]] &&
+          [[ -n ${GAMESCOPE_WAYLAND_DISPLAY:-} || ${SteamDeck:-0} == 1 ]] &&
+          "$PYTHON" -c '
+import json, os, sys
+p = os.path.join(sys.argv[1], "user", "launcher_settings.json")
+try:
+    g = json.load(open(p, encoding="utf-8")).get("game_dir", "")
+except Exception:
+    sys.exit(1)
+sys.exit(0 if g and os.path.isfile(os.path.join(g, "eboot.bin")) else 1)
+' "$SOTC_DATA_DIR" 2>/dev/null; then
+           exec "$PYTHON" "$APP/launcher/sotc_launcher_win.py" --play
+       fi
        exec "$PYTHON" "$APP/launcher/sotc_launcher_win.py" "$@"
    fi ;;
 esac

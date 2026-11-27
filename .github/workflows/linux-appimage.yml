@@ -1,9 +1,6 @@
-# sotc: builds the Linux AppImage (packaging/linux/build_appimage.sh) and attaches it to a release as
-# SotC-PC-linux-x86_64.AppImage, the name the launcher's self-update looks for (launcher/sotc_update.py).
-# Runs when a release is published, or by hand (Actions > Linux AppImage > Run workflow) with the
-# release tag to attach to and the commit to build (default: main).
-# Debian 13: its GCC 14, SDL3 and Vulkan headers are new enough (Ubuntu 24.04's are not, README.md).
-# The AppImage then needs glibc 2.41 or newer on the player's system.
+# sotc: builds and tests the Linux port on Ubuntu 24.04 (glibc 2.39 for broad distro and
+# SteamOS/Steam Deck compatibility), and on releases or manual dispatch packages both
+# SotC-PC-linux-x86_64.AppImage (expected by launcher/sotc_update.py) and a portable .tar.gz.
 name: Linux AppImage
 
 on:
@@ -12,69 +9,131 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to attach the AppImage to (e.g. v0.77)
-        required: true
+        description: Release tag to attach artifacts to (optional, e.g. v0.79)
+        required: false
+        default: ''
       ref:
         description: Commit, branch or tag to build
         required: false
         default: main
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: write
 
 jobs:
-  appimage:
+  linux:
     runs-on: ubuntu-24.04
-    container: debian:trixie
+    env:
+      DEPS_DIR: ${{ runner.temp }}/sotc-deps
+      CC: gcc-14
+      CXX: g++-14
     steps:
-      - name: Build tools and libraries
+      - name: Install build tools and libraries
         run: |
-          apt-get update
-          apt-get install -y --no-install-recommends ca-certificates curl git file xz-utils \
-            build-essential gcc g++ cmake ninja-build pkg-config nasm patchelf \
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ca-certificates curl git file xz-utils \
+            build-essential gcc-14 g++-14 cmake ninja-build pkg-config nasm patchelf \
             python3 python3-tk python3-pil python3-pil.imagetk \
             libvulkan-dev glslang-tools libvulkan-memory-allocator-dev libfmt-dev libboost-dev \
-            libxxhash-dev libzydis-dev libsdl3-dev \
-            libx11-dev libxext-dev libwayland-dev libxkbcommon-dev libpulse-dev libasound2-dev gh
-          # The Vulkan headers of the Windows build (MSYS2: 1.4.363), over Debian 13's (1.4.309): the
-          # recorder dispatches commands of newer extensions (vk_recorder_cmds.inc).
-          git clone --quiet --depth 1 --branch vulkan-sdk-1.4.363.0 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers
-          cmake -S /tmp/vulkan-headers -B /tmp/vulkan-headers/build -G Ninja -DCMAKE_INSTALL_PREFIX=/usr >/dev/null
-          cmake --install /tmp/vulkan-headers/build >/dev/null
-          # robin-map (header only) is not packaged in Debian 13: from its source (README.md).
-          git clone --quiet --depth 1 --branch v1.4.0 https://github.com/Tessil/robin-map.git /tmp/robin-map
-          cmake -S /tmp/robin-map -B /tmp/robin-map/build -G Ninja >/dev/null
-          cmake --install /tmp/robin-map/build >/dev/null
+            libxxhash-dev libzydis-dev \
+            libx11-dev libxext-dev libwayland-dev libxkbcommon-dev libpulse-dev libasound2-dev \
+            libpipewire-0.3-dev libdbus-1-dev libudev-dev libdecor-0-dev gh
 
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.ref }}
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || (github.event_name == 'workflow_dispatch' && inputs.ref) || '' }}
           submodules: recursive
           fetch-depth: 1
 
+      - name: Cache source dependencies (Vulkan-Headers, robin-map, SDL3)
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/sotc-deps
+          key: linux-deps-ubuntu2404-vk1.4.363.0-robin1.4.0-sdl3.2.16
+
+      - name: Build source dependencies
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$DEPS_DIR"
+          git clone --quiet --depth 1 --branch vulkan-sdk-1.4.363.0 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers
+          cmake -S /tmp/vulkan-headers -B /tmp/vulkan-headers/build -G Ninja -DCMAKE_INSTALL_PREFIX="$DEPS_DIR" >/dev/null
+          cmake --install /tmp/vulkan-headers/build >/dev/null
+
+          git clone --quiet --depth 1 --branch v1.4.0 https://github.com/Tessil/robin-map.git /tmp/robin-map
+          cmake -S /tmp/robin-map -B /tmp/robin-map/build -G Ninja -DCMAKE_INSTALL_PREFIX="$DEPS_DIR" >/dev/null
+          cmake --install /tmp/robin-map/build >/dev/null
+
+          git clone --quiet --depth 1 --branch release-3.2.16 https://github.com/libsdl-org/SDL.git /tmp/sdl3
+          cmake -S /tmp/sdl3 -B /tmp/sdl3/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$DEPS_DIR" \
+            -DSDL_TESTS=OFF -DSDL_EXAMPLES=OFF -DSDL_SHARED=ON -DSDL_STATIC=OFF >/dev/null
+          cmake --build /tmp/sdl3/build >/dev/null
+          cmake --install /tmp/sdl3/build >/dev/null
+
+      - name: Cache minimal FFmpeg
+        id: cache-ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: out/ffmpeg
+          key: linux-ffmpeg-ubuntu2404-${{ hashFiles('packaging/linux/build_ffmpeg.sh') }}
+
       - name: Minimal FFmpeg
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           bash packaging/linux/build_ffmpeg.sh
 
       - name: Build
-        # CPATH: the newer Vulkan headers in /usr/local/include before the system's (README.md).
-        run: CPATH=/usr/local/include ./build.sh
+        env:
+          CPATH: ${{ runner.temp }}/sotc-deps/include
+          LIBRARY_PATH: ${{ runner.temp }}/sotc-deps/lib
+          PKG_CONFIG_PATH: ${{ runner.temp }}/sotc-deps/lib/pkgconfig
+          CMAKE_PREFIX_PATH: ${{ runner.temp }}/sotc-deps
+        run: ./build.sh
 
-      - name: AppImage
+      - name: Test
+        env:
+          CPATH: ${{ runner.temp }}/sotc-deps/include
+          LIBRARY_PATH: ${{ runner.temp }}/sotc-deps/lib
+          PKG_CONFIG_PATH: ${{ runner.temp }}/sotc-deps/lib/pkgconfig
+          CMAKE_PREFIX_PATH: ${{ runner.temp }}/sotc-deps
+        run: |
+          python3 tools/gen_menu_text.py --check
+          if grep -q 'shader-profile-test' gpu/CMakeLists.txt; then
+            ninja -C out/gpu shader-profile-test
+            ./out/gpu/shader-profile-test
+          fi
+          python3 -m unittest discover -s tests
+
+      - name: Package AppImage and tarball
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+        env:
+          SOTC_UPDATE_REPO: ${{ github.repository }}
+          LD_LIBRARY_PATH: ${{ runner.temp }}/sotc-deps/lib
         run: |
           bash packaging/linux/build_appimage.sh
           cp dist/SotC-PC-*-linux-x86_64.AppImage SotC-PC-linux-x86_64.AppImage
-          ls -la SotC-PC-linux-x86_64.AppImage
+          cp dist/SotC-PC-*-linux-x86_64.tar.gz SotC-PC-linux-x86_64.tar.gz
+          ls -lh SotC-PC-linux-x86_64.AppImage SotC-PC-linux-x86_64.tar.gz
 
       - uses: actions/upload-artifact@v4
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
         with:
           name: SotC-PC-linux-x86_64
-          path: SotC-PC-linux-x86_64.AppImage
+          path: |
+            SotC-PC-linux-x86_64.AppImage
+            SotC-PC-linux-x86_64.tar.gz
           if-no-files-found: error
 
       - name: Attach to the release
+        if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.tag != '')
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.tag }}
-        run: gh release upload "$TAG" SotC-PC-linux-x86_64.AppImage --clobber --repo "$GITHUB_REPOSITORY"
+        run: gh release upload "$TAG" SotC-PC-linux-x86_64.AppImage SotC-PC-linux-x86_64.tar.gz --clobber --repo "$GITHUB_REPOSITORY"

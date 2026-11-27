@@ -1569,10 +1569,23 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         } else if (flip_rate <= 0) {
             const int live_limit = SotcFpsCap::limit_fps.load(std::memory_order_relaxed);
             u64 limit_vblanks = live_limit >= 0 ? vblanks_for(live_limit) : start_limit_vblanks;
-            // sotc: SOTC_FPS_DYNAMIC: the 60 FPS limit lowered while the game cannot keep it.
-            if (const int dyn = SotcFpsCap::dynamic_limit.load(std::memory_order_relaxed);
-                dyn > 0 && limit_vblanks == vblanks_for(60)) {
-                limit_vblanks = vblanks_for(dyn / 100); // the vblank grid's rounding; paced: exact
+            const bool is_60_limit = limit_vblanks == vblanks_for(60);
+            const bool fg_locked = is_60_limit && SotcFpsCap::fg_cap > 0 &&
+                                   SotcFpsCap::fg_active.load(std::memory_order_relaxed);
+            static bool last_fg_locked = false;
+            if (fg_locked != last_fg_locked) {
+                last_fg_locked = fg_locked;
+                std::fprintf(stderr, "SOTC FPS FG CAP: %s (%.2f real FPS)\n",
+                             fg_locked ? "on" : "off", double(SotcFpsCap::fg_cap) / 100.0);
+            }
+            // sotc: SOTC_FPS_FG_CAP locks real frames while FG is active; otherwise
+            // SOTC_FPS_DYNAMIC lowers the 60 FPS limit while the game cannot keep it.
+            const int effective_dyn =
+                fg_locked ? SotcFpsCap::fg_cap
+                          : (is_60_limit ? SotcFpsCap::dynamic_limit.load(std::memory_order_relaxed) : 0);
+            if (effective_dyn > 0) {
+                limit_vblanks =
+                    vblanks_for(effective_dyn / 100); // the vblank grid's rounding; paced: exact
             }
             const bool paced = SotcFpsCap::flip_pacer.load(std::memory_order_relaxed);
             if (limit_vblanks != 0 && !paced) {
@@ -1584,12 +1597,11 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                                (now + tick_period / 2 >= last_flip_time + arrival_ema ||
                                 now >= *arrival + vblank_period);
                 if (take_request) {
-                    // sotc: the dynamic FPS step at its exact period (48 on a 144 Hz screen is not
-                    // a whole number of 120 Hz vblanks).
-                    const int dyn = SotcFpsCap::dynamic_limit.load(std::memory_order_relaxed);
+                    // sotc: the dynamic/FG FPS step at its exact period (48 or 36 on a 144 Hz
+                    // screen is not a whole number of 120 Hz vblanks).
                     const std::chrono::nanoseconds limit_period =
-                        dyn > 0 && limit_vblanks == vblanks_for(dyn / 100)
-                            ? std::chrono::nanoseconds{100'000'000'000LL / dyn}
+                        effective_dyn > 0
+                            ? std::chrono::nanoseconds{100'000'000'000LL / effective_dyn}
                             : std::chrono::duration_cast<std::chrono::nanoseconds>(
                                   vblank_period * limit_vblanks);
                     limit_next = (now - limit_next < tick_period ? limit_next : now) + limit_period;
@@ -1639,8 +1651,11 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
                 static std::chrono::nanoseconds slow{0}, total{0};
                 static auto since = last_flip_time;
                 const int live = SotcFpsCap::limit_fps.load(std::memory_order_relaxed);
-                const bool at_60 = (live >= 0 ? vblanks_for(live) : start_limit_vblanks) ==
-                                   vblanks_for(60);
+                const bool fg_locked = SotcFpsCap::fg_cap > 0 &&
+                                       SotcFpsCap::fg_active.load(std::memory_order_relaxed);
+                const bool at_60 = !fg_locked &&
+                                   (live >= 0 ? vblanks_for(live) : start_limit_vblanks) ==
+                                       vblanks_for(60);
                 // A frame counts as slow below 50 FPS: 50-60 FPS stays at the 60 limit (the step only
                 // takes over where the game really cannot keep up).
                 // sotc: SOTC_FPS_DYNAMIC_SLOW_FPS (default 50; test #52 of MEMORIA-TESTES.md): the

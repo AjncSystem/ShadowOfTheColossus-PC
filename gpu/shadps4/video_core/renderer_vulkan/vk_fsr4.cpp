@@ -291,22 +291,220 @@ bool Dispatch(VkCommandBuffer cmdbuf, const Params& p) {
 
 #else
 
+// sotc: elsewhere the native Vulkan FSR 3.1 upscaler of FSR-Vulkan (third_party/fsr-vulkan, MIT,
+// ffx_vk_portable.h) takes the SDK's place: the same inputs, any GPU with Vulkan 1.3 and untyped
+// storage image writes. As the SDK does on cards without FSR 4, SOTC_UPSCALER=fsr4 runs FSR 3.1.
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
+#include <ffx_vk_portable.h>
+
+#include "video_core/renderer_vulkan/vk_instance.h"
+
 namespace Vulkan::Fsr4 {
 
-bool Init(const Instance&) {
-    return false;
+namespace {
+
+FfxVkPortableDeviceInfo device_info{};
+bool available = false;
+FfxVkPortableUpscaleContext* context = nullptr;
+FfxVkPortableUpscaleCreateInfo ctx_info{};
+bool ctx_inverted = false;
+bool ctx_failed = false; ///< the last create failed for this size: not retried every frame
+u64 frame_id = 0;
+std::chrono::steady_clock::time_point last_dispatch{};
+
+bool IsDepthFormat(vk::Format format) {
+    switch (format) {
+    case vk::Format::eD16Unorm:
+    case vk::Format::eX8D24UnormPack32:
+    case vk::Format::eD32Sfloat:
+    case vk::Format::eD16UnormS8Uint:
+    case vk::Format::eD24UnormS8Uint:
+    case vk::Format::eD32SfloatS8Uint:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/// The images come as Dlssg::Upscale leaves them: inputs ShaderReadOnlyOptimal, output General.
+FfxVkPortableImage PortableImage(const Image& image, bool output) {
+    FfxVkPortableImage r{};
+    r.structSize = sizeof(r);
+    r.image = static_cast<VkImage>(image.image);
+    r.format = static_cast<VkFormat>(image.format);
+    r.extent = {image.width, image.height};
+    r.mipCount = 1;
+    r.arrayLayers = 1;
+    const bool depth = IsDepthFormat(image.format);
+    r.usage = VK_IMAGE_USAGE_SAMPLED_BIT |
+              (output ? VK_IMAGE_USAGE_STORAGE_BIT : 0) |
+              (depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : 0);
+    r.aspect = depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
+    r.state = output ? FFX_VK_PORTABLE_RESOURCE_STATE_UNORDERED_ACCESS
+                     : FFX_VK_PORTABLE_RESOURCE_STATE_COMPUTE_READ;
+    return r;
+}
+
+void DestroyContext() {
+    if (context) {
+        ffxVkPortableUpscaleContextDestroy(context);
+        context = nullptr;
+    }
+}
+
+bool CreateContext(const Params& p) {
+    ctx_info = {};
+    ctx_info.structSize = sizeof(ctx_info);
+    // The scene is tonemapped (0..1, as DLSS gets it): no HDR, no auto exposure.
+    ctx_info.flags = p.depth_inverted ? FFX_VK_PORTABLE_CONTEXT_DEPTH_INVERTED : 0u;
+    if (const char* v = std::getenv("SOTC_FSR_DEBUG"); v && v[0] == '1') {
+        ctx_info.flags |= FFX_VK_PORTABLE_CONTEXT_DEBUG_CHECKING;
+    }
+    ctx_info.maxRenderSize = {p.render_width, p.render_height};
+    ctx_info.maxOutputSize = {p.out_width, p.out_height};
+    const FfxVkPortableResult r = ffxVkPortableUpscaleContextCreate(&device_info, &ctx_info, &context);
+    if (r != FFX_VK_PORTABLE_OK) {
+        context = nullptr;
+        std::fprintf(stderr, "SOTC FSR: native FSR 3.1 context %ux%u -> %ux%u failed (%d)\n",
+                     p.render_width, p.render_height, p.out_width, p.out_height, static_cast<int>(r));
+        return false;
+    }
+    FfxVkPortableMemoryUsage usage{};
+    usage.structSize = sizeof(usage);
+    ffxVkPortableUpscaleContextGetMemoryUsage(context, &usage);
+    std::fprintf(stderr, "SOTC FSR: FSR 3.1 (native Vulkan) upscaling %ux%u -> %ux%u (depth %s), %llu MB\n",
+                 p.render_width, p.render_height, p.out_width, p.out_height,
+                 p.depth_inverted ? "inverted" : "normal",
+                 static_cast<unsigned long long>(usage.totalUsageInBytes >> 20));
+    return true;
+}
+
+} // namespace
+
+bool Init(const Instance& instance) {
+    const auto physical = static_cast<VkPhysicalDevice>(instance.GetPhysicalDevice());
+    FfxVkPortableDeviceCapabilities caps{};
+    caps.structSize = sizeof(caps);
+    if (ffxVkPortableQueryDeviceCapabilities(physical, &caps) != FFX_VK_PORTABLE_OK ||
+        !caps.fsr3ComputePrerequisites) {
+        std::fprintf(stderr, "SOTC FSR: this GPU lacks FSR 3.1's compute features, FSR 1 instead\n");
+        return false;
+    }
+    // vk_instance.cpp enables each of these features whenever the GPU has it, so the GPU's
+    // support is what the device has on.
+    VkPhysicalDeviceVulkan13Features f13{};
+    f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+    VkPhysicalDeviceVulkan12Features f12{};
+    f12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+    f12.pNext = &f13;
+    VkPhysicalDeviceFeatures2 f{};
+    f.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    f.pNext = &f12;
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceFeatures2(physical, &f);
+    if (!f.features.shaderStorageImageWriteWithoutFormat) {
+        std::fprintf(stderr, "SOTC FSR: no untyped storage image writes on this GPU, FSR 1 instead\n");
+        return false;
+    }
+    device_info.structSize = sizeof(device_info);
+    device_info.instance = static_cast<VkInstance>(instance.GetInstance());
+    device_info.physicalDevice = physical;
+    device_info.device = static_cast<VkDevice>(instance.GetDevice());
+    device_info.getDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
+    device_info.queue = static_cast<VkQueue>(instance.GetGraphicsQueue());
+    device_info.queueFamilyIndex = instance.GetGraphicsQueueFamilyIndex();
+    device_info.shaderFloat16Enabled = f12.shaderFloat16;
+    device_info.subgroupSizeControlEnabled = f13.subgroupSizeControl;
+    device_info.synchronization2Enabled = f13.synchronization2;
+    device_info.shaderStorageImageWriteWithoutFormatEnabled = VK_TRUE;
+    available = true;
+    std::fprintf(stderr, "SOTC FSR: FSR 3.1 (native Vulkan, FSR-Vulkan) available%s\n",
+                 f12.shaderFloat16 ? "" : " (no FP16: full precision shaders)");
+    return true;
 }
 
 bool Available() {
-    return false;
+    return available;
 }
 
 const char* Name() {
-    return "FSR";
+    return "FSR 3.1";
 }
 
-bool Dispatch(VkCommandBuffer, const Params&) {
-    return false;
+bool Dispatch(VkCommandBuffer cmdbuf, const Params& p) {
+    if (!available) {
+        return false;
+    }
+    const bool same = context && ctx_info.maxRenderSize.width == p.render_width &&
+                      ctx_info.maxRenderSize.height == p.render_height &&
+                      ctx_info.maxOutputSize.width == p.out_width &&
+                      ctx_info.maxOutputSize.height == p.out_height && ctx_inverted == p.depth_inverted;
+    if (!same) {
+        if (ctx_failed && ctx_info.maxRenderSize.width == p.render_width &&
+            ctx_info.maxRenderSize.height == p.render_height &&
+            ctx_info.maxOutputSize.width == p.out_width &&
+            ctx_info.maxOutputSize.height == p.out_height && ctx_inverted == p.depth_inverted) {
+            return false;
+        }
+        if (context) {
+            // The old context may still be in use by submitted frames (a rare event: a size or
+            // depth layout change).
+            static_cast<void>(VULKAN_HPP_DEFAULT_DISPATCHER.vkDeviceWaitIdle(device_info.device));
+            DestroyContext();
+        }
+        ctx_inverted = p.depth_inverted;
+        ctx_failed = !CreateContext(p);
+        if (ctx_failed) {
+            return false;
+        }
+    }
+    const auto now = std::chrono::steady_clock::now();
+    float frame_ms = 16.7f;
+    if (last_dispatch.time_since_epoch().count() != 0) {
+        frame_ms = std::clamp(
+            std::chrono::duration<float, std::milli>(now - last_dispatch).count(), 1.0f, 100.0f);
+    }
+    last_dispatch = now;
+
+    FfxVkPortableUpscaleDispatchInfo d{};
+    d.structSize = sizeof(d);
+    d.commandBuffer = cmdbuf;
+    d.color = PortableImage(p.color, false);
+    d.depth = PortableImage(p.depth, false);
+    d.motionVectors = PortableImage(p.mvec, false);
+    d.exposure.structSize = sizeof(d.exposure);
+    d.reactiveMask.structSize = sizeof(d.reactiveMask);
+    d.transparencyAndCompositionMask.structSize = sizeof(d.transparencyAndCompositionMask);
+    d.output = PortableImage(p.output, true);
+    d.jitterOffset = {p.jitter_x, p.jitter_y};
+    d.motionVectorScale = {p.mvec_scale_x, p.mvec_scale_y};
+    d.renderSize = {p.render_width, p.render_height};
+    d.outputSize = {p.out_width, p.out_height};
+    d.frameTimeMilliseconds = frame_ms;
+    d.preExposure = 1.0f;
+    d.cameraNear = p.z_near;
+    d.cameraFar = std::min(p.z_far, 1.0e6f);
+    d.cameraVerticalFovRadians = p.fov_y;
+    d.viewSpaceToMeters = 1.0f;
+    d.enableSharpening = VK_FALSE; // the presenter's RCAS sharpens (SOTC_DLSS_SHARPEN)
+    d.sharpness = 0.0f;
+    d.reset = p.reset ? VK_TRUE : VK_FALSE;
+    d.frameId = ++frame_id;
+    const FfxVkPortableResult r = ffxVkPortableUpscaleContextRecordDispatch(context, &d);
+    if (r != FFX_VK_PORTABLE_OK) {
+        static u32 errors = 0;
+        if (errors++ < 5) {
+            const uint64_t issues = ffxVkPortableValidateUpscaleDispatchInfo(&ctx_info, &d);
+            std::fprintf(stderr, "SOTC FSR: native FSR 3.1 dispatch failed (%d, validation 0x%llx)\n",
+                         static_cast<int>(r), static_cast<unsigned long long>(issues));
+        }
+        return false;
+    }
+    return true;
 }
 
 } // namespace Vulkan::Fsr4

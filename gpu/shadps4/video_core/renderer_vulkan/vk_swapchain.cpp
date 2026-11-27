@@ -79,6 +79,41 @@ void Swapchain::Create(u32 width_, u32 height_) {
                vk::to_string(swapchain_result));
     swapchain = chain;
 
+    if (needs_hdr && instance.IsExtHdrMetadataSupported()) {
+        if (const auto set_hdr_metadata = reinterpret_cast<PFN_vkSetHdrMetadataEXT>(
+                VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr(instance.GetDevice(),
+                                                                  "vkSetHdrMetadataEXT"))) {
+            const auto env_float = [](const char* name, float fallback) -> float {
+                if (const char* v = std::getenv(name); v && *v) {
+                    char* end = nullptr;
+                    const float parsed = std::strtof(v, &end);
+                    if (end != v && parsed > 0.0f) {
+                        return parsed;
+                    }
+                }
+                return fallback;
+            };
+            const float max_lum = env_float("SOTC_HDR_MAX_NITS", 1000.0f);
+            const float max_fall = env_float("SOTC_HDR_MAX_FALL", 400.0f);
+            const VkHdrMetadataEXT metadata = {
+                .sType = VK_STRUCTURE_TYPE_HDR_METADATA_EXT,
+                .pNext = nullptr,
+                .displayPrimaryRed = {0.708f, 0.292f},
+                .displayPrimaryGreen = {0.170f, 0.797f},
+                .displayPrimaryBlue = {0.131f, 0.046f},
+                .whitePoint = {0.3127f, 0.3290f},
+                .maxLuminance = max_lum,
+                .minLuminance = 0.001f,
+                .maxContentLightLevel = max_lum,
+                .maxFrameAverageLightLevel = max_fall,
+            };
+            const VkSwapchainKHR raw_swapchain = swapchain;
+            set_hdr_metadata(instance.GetDevice(), 1, &raw_swapchain, &metadata);
+            LOG_INFO(Render_Vulkan, "Applied VK_EXT_hdr_metadata (max {} nits, MaxFALL {} nits)",
+                     max_lum, max_fall);
+        }
+    }
+
     SetupImages();
     RefreshSemaphores();
 }

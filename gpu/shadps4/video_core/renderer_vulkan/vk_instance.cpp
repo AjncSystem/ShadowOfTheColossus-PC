@@ -466,6 +466,7 @@ bool Instance::CreateDevice() {
         device_fault = fault_features.deviceFault;
         device_fault_vendor_binary = fault_features.deviceFaultVendorBinary;
     }
+    ext_hdr_metadata = add_extension(VK_EXT_HDR_METADATA_EXTENSION_NAME);
 
     const auto family_properties = physical_device.getQueueFamilyProperties();
     if (family_properties.empty()) {

@@ -37,7 +37,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends ca-certificates curl git file xz-utils \
             build-essential gcc-14 g++-14 cmake ninja-build pkg-config nasm patchelf \
             python3 python3-tk python3-pil python3-pil.imagetk \
-            libvulkan-dev glslang-tools libvulkan-memory-allocator-dev libfmt-dev libboost-dev \
+            libvulkan-dev glslang-tools libfmt-dev libboost-dev \
             libxxhash-dev libzydis-dev \
             libx11-dev libxext-dev libwayland-dev libxkbcommon-dev libpulse-dev libasound2-dev \
             libpipewire-0.3-dev libdbus-1-dev libudev-dev libdecor-0-dev gh
@@ -48,12 +48,12 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Cache source dependencies (Vulkan-Headers, robin-map, SDL3)
+      - name: Cache source dependencies (Vulkan-Headers, VMA, robin-map, SDL3)
         id: cache-deps
         uses: actions/cache@v4
         with:
           path: ${{ runner.temp }}/sotc-deps
-          key: linux-deps-ubuntu2404-vk1.4.363.0-robin1.4.0-sdl3.2.16
+          key: linux-deps-ubuntu2404-vk1.4.363.0-vma3.3.0-robin1.4.0-sdl3.2.16
 
       - name: Build source dependencies
         if: steps.cache-deps.outputs.cache-hit != 'true'
@@ -64,6 +64,10 @@ jobs:
           git clone --quiet --depth 1 --branch vulkan-sdk-1.4.363.0 https://github.com/KhronosGroup/Vulkan-Headers.git /tmp/vulkan-headers
           cmake -S /tmp/vulkan-headers -B /tmp/vulkan-headers/build -G Ninja -DCMAKE_INSTALL_PREFIX="$DEPS_DIR" >/dev/null
           cmake --install /tmp/vulkan-headers/build >/dev/null
+
+          git clone --quiet --depth 1 --branch v3.3.0 https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator.git /tmp/vma
+          cmake -S /tmp/vma -B /tmp/vma/build -G Ninja -DCMAKE_INSTALL_PREFIX="$DEPS_DIR" >/dev/null
+          cmake --install /tmp/vma/build >/dev/null
 
           git clone --quiet --depth 1 --branch v1.4.0 https://github.com/Tessil/robin-map.git /tmp/robin-map
           cmake -S /tmp/robin-map -B /tmp/robin-map/build -G Ninja -DCMAKE_INSTALL_PREFIX="$DEPS_DIR" >/dev/null

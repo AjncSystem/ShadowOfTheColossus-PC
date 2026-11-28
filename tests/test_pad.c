@@ -77,6 +77,23 @@ int main(void) {
     SDL_UpdateJoysticks();
     SDL_UpdateGamepads();
     assert(pad_read_state(1,&data)==0 && data.touch_count==1 && data.touches[0].x==480);
+
+    PadLightBar bar={.r=255,.g=64,.b=16};
+    assert(pad_set_lightbar(99,&bar)==ERR_INVALID_HANDLE);
+    assert(pad_set_lightbar(1,NULL)==ERR_INVALID_ARG);
+    assert(pad_set_lightbar(1,&bar)==0 && led_set==1 && led_r==255 && led_g==64 && led_b==16);
+    assert(pad_reset_lightbar(99)==ERR_INVALID_HANDLE);
+    assert(pad_reset_lightbar(1)==0 && led_set==0 && led_b==255);
+
+    assert(pad_set_motion_sensor(99,1)==ERR_INVALID_HANDLE);
+    assert(pad_set_motion_sensor(1,1)==0 && motion_sensor_enabled==1);
+    const float gyro[3]={1.5f,-0.5f,0.25f};
+    integrate_orientation(orientation,gyro,0.016f);
+    const float norm2=orientation[0]*orientation[0]+orientation[1]*orientation[1]+
+                      orientation[2]*orientation[2]+orientation[3]*orientation[3];
+    assert(fabsf(norm2-1.0f)<1e-4f && orientation[0]>0.0f && orientation[3]<1.0f);
+    assert(pad_reset_orientation(1)==0 && orientation[0]==0.0f && orientation[3]==1.0f);
+
     SDL_CloseJoystick(joystick);
     if (gamepad) SDL_CloseGamepad(gamepad);
     gamepad=NULL;

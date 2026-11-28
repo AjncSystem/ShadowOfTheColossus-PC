@@ -455,7 +455,7 @@ static const RuntimeExport exports[]={
     {"sceGameLiveStreamingEnableLiveStreaming",ok_args}, {"sceVideoRecordingSetInfo",ok_args},
     {"sceNetCtlInit",ok_ignored}, {"sceNetCtlTerm",ok_ignored},
     {"sceNpTrophyDestroyContext",ok_args}, {"sceNpTrophyDestroyHandle",ok_args},
-    {"scePadSetLightBar",ok_args}, {"sceAudioOutSetMixLevelPadSpk",ok_args},
+    {"sceAudioOutSetMixLevelPadSpk",ok_args},
     {"sceImeKeyboardOpen",ok_args}, {"sceImeUpdate",ok_args}, {"sceImeKeyboardClose",ok_args},
     {"sceSystemServiceLoadExec",system_load_exec}, {"sceSystemServiceGetDisplaySafeAreaInfo",display_safe_area},
     {"sceSystemGestureOpen",gesture_open}, {"sceSystemGestureClose",ok_args},

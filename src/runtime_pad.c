@@ -10,6 +10,7 @@
 #include "runtime.h"
 #include "runtime_event.h"
 #include "gpu/bbgpu.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdatomic.h>
@@ -62,6 +63,43 @@ static int initialized, opened, sdl_ready;
 static SDL_Gamepad *gamepad;
 static size_t reads;
 static uint8_t connected_count;
+static int led_set, motion_sensor_enabled;
+static uint8_t led_r, led_g, led_b;
+static float orientation[4]={0.0f,0.0f,0.0f,1.0f};
+static uint64_t last_motion_us;
+
+typedef struct { uint8_t r, g, b, reserve; } PadLightBar;
+
+static int lightbar_enabled(void) {
+    static int enabled=-1;
+    if (enabled<0) { const char *v=getenv("SOTC_LIGHTBAR"); enabled=!(v && v[0]=='0'); }
+    return enabled;
+}
+
+/* Sync cached LED colour and motion sensor activation when a gamepad opens or reconnects. */
+static void apply_pad_features(SDL_Gamepad *g) {
+    if (!g) return;
+    if (led_set && lightbar_enabled()) SDL_SetGamepadLED(g,led_r,led_g,led_b);
+    if (motion_sensor_enabled) {
+        if (SDL_GamepadHasSensor(g,SDL_SENSOR_GYRO)) SDL_SetGamepadSensorEnabled(g,SDL_SENSOR_GYRO,true);
+        if (SDL_GamepadHasSensor(g,SDL_SENSOR_ACCEL)) SDL_SetGamepadSensorEnabled(g,SDL_SENSOR_ACCEL,true);
+    }
+}
+
+static void integrate_orientation(float q[4], const float gyro[3], float dt) {
+    if (dt<=0.0f || dt>0.1f) return;
+    const float hx=0.5f*gyro[0]*dt, hy=0.5f*gyro[1]*dt, hz=0.5f*gyro[2]*dt;
+    const float x=q[0], y=q[1], z=q[2], w=q[3];
+    float nx=x + w*hx + y*hz - z*hy;
+    float ny=y + w*hy - x*hz + z*hx;
+    float nz=z + w*hz + x*hy - y*hx;
+    float nw=w - x*hx - y*hy - z*hz;
+    const float len=sqrtf(nx*nx + ny*ny + nz*nz + nw*nw);
+    if (len>1e-6f) {
+        const float inv=1.0f/len;
+        q[0]=nx*inv; q[1]=ny*inv; q[2]=nz*inv; q[3]=nw*inv;
+    }
+}
 
 static uint64_t now_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000u+(uint64_t)t.tv_nsec/1000u; }
 static uint8_t axis(int16_t v) { int x=(v+32768)>>8; return (uint8_t)(x<0 ? 0 : x>255 ? 255 : x); }
@@ -154,6 +192,7 @@ static SDL_Gamepad *current_gamepad(void) {
                                                      : SOTC_T(" (o escolhido não está conectado)"," (the chosen one is not connected)"));
                 printf("Runtime: gamepad connected: %s%s\n",SDL_GetGamepadName(gamepad),
                        !want ? "" : on_preferred ? " (the chosen one)" : " (the chosen one is not connected)");
+                apply_pad_features(gamepad);
             }
         }
         SDL_free(ids);
@@ -398,6 +437,19 @@ static void sample_host(PadData *d) {
         // Back/Select on pads without a touch surface is a left-side click.
         if ((d->buttons & BTN_TOUCHPAD) && !d->touch_count) touch_click(d,0);
         if (touch_right) touch_click(d,1);
+        if (motion_sensor_enabled) {
+            float accel[3]={0}, gyro[3]={0};
+            if (SDL_GamepadSensorEnabled(g,SDL_SENSOR_ACCEL) && SDL_GetGamepadSensorData(g,SDL_SENSOR_ACCEL,accel,3)) {
+                for (int i=0;i<3;++i) d->acceleration[i]=accel[i]/9.80665f;
+            }
+            if (SDL_GamepadSensorEnabled(g,SDL_SENSOR_GYRO) && SDL_GetGamepadSensorData(g,SDL_SENSOR_GYRO,gyro,3)) {
+                for (int i=0;i<3;++i) d->angular_velocity[i]=gyro[i];
+                const float dt=last_motion_us ? (float)(d->timestamp-last_motion_us)*1e-6f : 0.0f;
+                integrate_orientation(orientation,gyro,dt);
+                last_motion_us=d->timestamp;
+            }
+            for (int i=0;i<4;++i) d->orientation[i]=orientation[i];
+        }
     }
     if (k) apply_keyboard(d,k);
     apply_mouse(d);
@@ -638,16 +690,57 @@ static ABI int32_t pad_vibration(int32_t handle, const uint8_t *param) {
     pthread_mutex_unlock(&lock);
     return 0;
 }
-static ABI int32_t pad_ok_handle(int32_t handle) { return handle==PAD_HANDLE && opened ? 0 : ERR_INVALID_HANDLE; }
-static ABI int32_t pad_ok_handle_flag(int32_t handle, uint8_t flag) { (void)flag; return pad_ok_handle(handle); }
+static ABI int32_t pad_set_lightbar(int32_t handle, const PadLightBar *param) {
+    if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
+    if (!param) return ERR_INVALID_ARG;
+    pthread_mutex_lock(&lock);
+    led_set=1; led_r=param->r; led_g=param->g; led_b=param->b;
+    SDL_Gamepad *g=current_gamepad();
+    if (g && lightbar_enabled()) SDL_SetGamepadLED(g,led_r,led_g,led_b);
+    pthread_mutex_unlock(&lock);
+    return 0;
+}
+static ABI int32_t pad_reset_lightbar(int32_t handle) {
+    if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
+    pthread_mutex_lock(&lock);
+    led_set=0; led_r=0; led_g=0; led_b=255;
+    SDL_Gamepad *g=current_gamepad();
+    if (g && lightbar_enabled()) SDL_SetGamepadLED(g,0,0,255);
+    pthread_mutex_unlock(&lock);
+    return 0;
+}
+static ABI int32_t pad_reset_orientation(int32_t handle) {
+    if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
+    pthread_mutex_lock(&lock);
+    orientation[0]=0.0f; orientation[1]=0.0f; orientation[2]=0.0f; orientation[3]=1.0f;
+    last_motion_us=0;
+    pthread_mutex_unlock(&lock);
+    return 0;
+}
+static ABI int32_t pad_set_motion_sensor(int32_t handle, uint8_t enable) {
+    if (handle!=PAD_HANDLE || !opened) return ERR_INVALID_HANDLE;
+    pthread_mutex_lock(&lock);
+    motion_sensor_enabled=enable ? 1 : 0;
+    last_motion_us=0;
+    SDL_Gamepad *g=current_gamepad();
+    if (g) {
+        const bool on=motion_sensor_enabled!=0;
+        if (SDL_GamepadHasSensor(g,SDL_SENSOR_GYRO)) SDL_SetGamepadSensorEnabled(g,SDL_SENSOR_GYRO,on);
+        if (SDL_GamepadHasSensor(g,SDL_SENSOR_ACCEL)) SDL_SetGamepadSensorEnabled(g,SDL_SENSOR_ACCEL,on);
+    }
+    pthread_mutex_unlock(&lock);
+    return 0;
+}
+static ABI int32_t pad_ok_handle_flag(int32_t handle, uint8_t flag) { (void)flag; return handle==PAD_HANDLE && opened ? 0 : ERR_INVALID_HANDLE; }
 
 static const RuntimeExport exports[]={
     {"scePadInit",pad_init}, {"scePadOpen",pad_open}, {"scePadClose",pad_close},
     {"scePadReadState",pad_read_state}, {"scePadRead",pad_read},
     {"scePadGetControllerInformation",pad_info}, {"scePadSetVibration",pad_vibration},
-    {"scePadResetOrientation",pad_ok_handle},
+    {"scePadSetLightBar",pad_set_lightbar}, {"scePadResetLightBar",pad_reset_lightbar},
+    {"scePadResetOrientation",pad_reset_orientation},
     {"scePadSetAngularVelocityDeadbandState",pad_ok_handle_flag}, {"scePadSetTiltCorrectionState",pad_ok_handle_flag},
-    {"scePadSetMotionSensorState",pad_ok_handle_flag},
+    {"scePadSetMotionSensorState",pad_set_motion_sensor},
 };
 uintptr_t runtime_pad_resolve(const char *name) { return RUNTIME_LOOKUP(exports,name); }
 void runtime_pad_report(void) { printf("Runtime: pad reads=%zu, gamepad=%s\n",reads,gamepad ? SDL_GetGamepadName(gamepad) : "none"); }
